@@ -2,6 +2,8 @@
 by its installation and built once, by the builder a checkout's own environment is built by. uv stands in
 on PATH, writing what it was asked."""
 
+import hashlib
+import json
 import os
 import subprocess
 import sys
@@ -85,3 +87,39 @@ def test_the_command_line_takes_a_references_installation_whole_after_the_separa
                              text=True)
         assert ran.returncode == 2, ran.stderr
     assert len(asked.read_text().splitlines()) == 2
+
+
+def test_a_references_python_and_its_literal_arguments_are_its_own(tmp_path, monkeypatch):
+    """Two Pythons asked for one installation are two environments (3.12's keeps the name it always had), and
+    an installation's arguments reach uv as written, whatever they hold."""
+    asked, env = standing_in_uv(tmp_path)
+    monkeypatch.setenv("PATH", env["PATH"])
+    cache = tmp_path / "envs"
+    default = environments.reference("x", ["numpy"], cache=cache)
+    other = environments.reference("x", ["numpy"], python="3.13", cache=cache)
+    assert default != other
+    # The name every node's reference environments already have.
+    assert default.parents[1].name == "x-" + hashlib.sha256(json.dumps(["numpy"]).encode()).hexdigest()[:12]
+    braced = tmp_path / "{python}" / "requirements.txt"
+    braced.parent.mkdir()
+    braced.write_text("numpy\n")
+    python = environments.reference("y", ["-r", str(braced)], cache=cache)
+    assert installs(asked)[-1] == f"pip install -q --python {python} -r {braced}"
+
+
+def test_a_checkout_named_after_the_separator_is_built(tmp_path):
+    """`--` before TREE is argparse's own for a checkout, as it always was: the tree after it is built."""
+    asked, env = standing_in_uv(tmp_path)
+    tree = tmp_path / "tree"
+    (tree / "locks").mkdir(parents=True)
+    (tree / "tools").mkdir()
+    (tree / "locks" / "cpu.txt").write_text("numpy\n")
+    (tree / "tools" / "install_environment.sh").write_text(f"echo installed \"$@\" >> {asked}\n")
+    (tree / ".python-version").write_text("3.12\n")
+    printed = subprocess.run([sys.executable, str(REPO_ROOT / "tools" / "environments.py"), "--lock", "cpu",
+                              "--cache", str(tmp_path / "envs"), "--", str(tree)],
+                             env=env, capture_output=True, text=True, check=True).stdout
+    python = Path(printed.strip())
+    assert python.parents[1].name.startswith("cpu-")
+    assert asked.read_text().splitlines()[-1] == f"installed cpu -q --python {python}"
+
