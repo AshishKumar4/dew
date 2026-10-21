@@ -438,12 +438,13 @@ def declared_seeds(path) -> dict[str, int]:
                 if name.endswith(".seeds")}
 
 
-def indexed_recording(stored, site: str, seeds: int):
+def indexed_recording(stored, site: str, seeds: int, *, inputs_of=None):
     """`assert_as_exact`'s draw, reference and truth for a reference recorded over seeds, where it cannot
-    run in the test (a CUDA-only library, a fetched source): `stored` holds `<site>.input.<name>`,
-    `<site>.reference.<name>` and `<site>.truth.<name>`, every array stacked over the seeds on its first
-    axis, the truth in float64. A draw is `(index, inputs)`, the index an integer `widened` keeps; the
-    reference and the truth read the recorded outputs at it, and Dew's function takes the same two
+    run in the test (a CUDA-only library, a fetched source): `stored` holds `<site>.reference.<name>` and
+    `<site>.truth.<name>`, and `<site>.input.<name>` unless `inputs_of(seed)` draws a seed's inputs again
+    (a seeded NumPy or torch draw the generator made them by), every array stacked over the seeds on its
+    first axis, the truth in float64. A draw is `(index, inputs)`, the index an integer `widened` keeps;
+    the reference and the truth read the recorded outputs at it, and Dew's function takes the same two
     arguments and ignores the index. The recording covers check 1's redraw, (1 + REDRAW) times the
     declared seeds, so a numerical failure stays a finding rather than running out of recorded seeds."""
     def tree(kind):
@@ -457,11 +458,15 @@ def indexed_recording(stored, site: str, seeds: int):
         raise AssertionError(f"{site}: the recorded truth {narrow} is not float64; record it in float64, as "
                              f"no later widening recovers what a narrower recording dropped")
     count = min(len(value) for part in (inputs, reference, truth) for value in part.values())
+    if inputs_of is None and not inputs:
+        raise AssertionError(f"{site}: no inputs recorded and no `inputs_of` to draw them again")
     if count < (1 + REDRAW) * seeds:
         raise AssertionError(f"{site}: {count} recorded seeds, and check 1 over {seeds} may draw "
                              f"{(1 + REDRAW) * seeds}; record (1 + REDRAW) times the declared seeds")
 
     def draw(seed):
+        if inputs_of is not None:
+            return np.int32(seed), inputs_of(seed)
         return np.int32(seed), {name: value[seed] for name, value in inputs.items()}
 
     def lookup(values):
