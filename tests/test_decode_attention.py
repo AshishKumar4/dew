@@ -327,8 +327,9 @@ def test_the_decode_kernels_launches_are_the_tuners():
 
 def test_a_launch_without_a_pick_takes_a_config_of_its_keys_space():
     """33 rows of 2 key heads over 1024 keys, traced as on an A100 (108 multiprocessors) on any host:
-    the key counts 64 rows, whose 128 programs fill most of the GPU, so its space holds one slice
-    alone, and the launch takes it without a pick, though its own 66 programs would have taken 8."""
+    the key counts 64 rows, whose 128 programs fill each multiprocessor about once, so its space holds
+    slices, and the launch takes the heuristic's for those 128 (4), though its own 66 programs would have
+    taken 8."""
     from tuned import launches
 
     from dew.nn.kernels import decode_attention
@@ -341,28 +342,29 @@ def test_a_launch_without_a_pick_takes_a_config_of_its_keys_space():
         (ba,) = launches(lambda *a: decode_attention.attend(*a, interpret=not ON_GPU), query, cache, cache,
                          lengths)
         keyed = ba.op.keyed(ba)
-        assert keyed.autotuning_configs == {decode_attention.Split(1)}
-        assert ba.heuristics_config in keyed.autotuning_configs
+        assert decode_attention.Split(4) in keyed.autotuning_configs
+        assert ba.heuristics_config == decode_attention.Split(4)
     assert decode_attention._heuristic(66, 32, 108) == decode_attention.Split(8)
 
 
 @pytest.mark.parametrize("processors, programs, steps, splits", [
-    (None, 2, 128, 1), (108, 128, 128, 1), (108, 2, 128, 32), (132, 16, 128, 32), (132, 32, 4096, 16),
-    (132, 64, 4096, 8), (108, 2, 4, 4)])
+    (None, 2, 128, 1), (108, 128, 128, 4), (108, 1024, 128, 1), (108, 2, 128, 32), (132, 16, 128, 32),
+    (132, 32, 4096, 16), (132, 64, 4096, 8), (108, 2, 4, 4)])
 def test_a_launch_without_a_measurement_fills_six_programs_a_multiprocessor(processors, programs, steps,
                                                                             splits):
     """The heuristic (`_heuristic`): no slices on a device of no known multiprocessors or where the
-    programs fill most of them; else the most whose programs fill at most six a multiprocessor, at most
-    one a step: two programs over 108 multiprocessors take 32, sixteen over 132 take 32, and 32 and 64
-    take 16 and 8, the H100's fastest for Qwen3-0.6B's 4 and 8 rows over 131072 keys; four steps take
-    at most 4."""
+    programs fill every one six deep; else the most whose programs fill at most six a multiprocessor,
+    at most one a step: two programs over 108 multiprocessors take 32, 128 (16 rows of 8 key heads)
+    take 4 and 1024 none, sixteen over 132 take 32, and 32 and 64 take 16 and 8, the H100's fastest for
+    Qwen3-0.6B's 4 and 8 rows over 131072 keys; four steps take at most 4."""
     from dew.nn.kernels import decode_attention
 
     assert decode_attention._heuristic(programs, steps, processors) == decode_attention.Split(splits)
-    # The space holds the heuristic's pick, and no slices where the programs fill the GPU.
+    # The space holds the heuristic's pick, and no slices where the programs fill the GPU six deep.
     space = decode_attention._space(programs, steps, processors)
     assert decode_attention.Split(splits) in space
-    assert (space == {decode_attention.Split(1)}) == (not processors or programs >= 0.8 * processors)
+    assert (space == {decode_attention.Split(1)}) == (
+        not processors or programs >= decode_attention.RESIDENT * processors)
 
 
 def decode_step(lengths):

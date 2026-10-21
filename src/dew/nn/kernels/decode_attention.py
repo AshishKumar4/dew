@@ -246,10 +246,12 @@ def _outputs(shape: tuple[int, ...], dtype, splits: int, at: int, spec, specs):
 def _space(programs: int, steps: int, processors: int | None) -> set[Split]:
     """The slices a launch of `programs` programs a slice over `steps` steps of the loop may take on a
     GPU of `processors` multiprocessors (`GpuTarget.multiprocessors`): one where the programs already
-    fill most of them or none are known, as FlashAttention 2 rules (csrc/flash_attn/flash_api.cpp,
-    `num_splits_heuristic`), else any of `SPLITS` up to one a step. A pick measured where few programs
-    ran is never reused where many do (`KernelOp._stored_nearest`)."""
-    if not processors or programs >= 0.8 * processors:
+    fill every multiprocessor `RESIDENT` deep or none are known, else any of `SPLITS` up to one a step.
+    (FlashAttention 2's rule, one slice once the programs fill most multiprocessors once,
+    csrc/flash_attn/flash_api.cpp `num_splits_heuristic`, left an A100's 108 multiprocessors one program
+    deep at 16 rows of 8 key heads, where cuDNN ran 1.07 to 1.18x faster.) A pick measured where few
+    programs ran is never reused where many do (`KernelOp._stored_nearest`)."""
+    if not processors or programs >= RESIDENT * processors:
         return {Split(1)}
     return {Split(splits) for splits in SPLITS if splits <= min(steps, processors)}
 
