@@ -19,7 +19,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
-from reference_error import assert_as_exact_as_the_reference, distance
+from reference_error import assert_as_exact_as_the_reference, distance, with_gradients
 from test_attention_splash import attention_terms
 
 from dew.nn import kernels
@@ -416,7 +416,7 @@ def test_flash_keeps_the_kernel_contract_on_a_mesh(axis, split, without_determin
     gradients on par with one device's over the site's draws, no operand moved between devices and
     no copy or transpose at the kernel's edge."""
     from jax.sharding import Mesh, PartitionSpec
-    from sharded import assert_runs_per_shard, with_gradients
+    from sharded import assert_runs_per_shard
 
     flash_here()
 

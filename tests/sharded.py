@@ -94,16 +94,6 @@ def placed(tree, mesh: jax.sharding.Mesh, *spec):
     return jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=sharding), tree)
 
 
-def with_gradients(fn):
-    """`fn`'s output and its inputs' gradients against a cotangent passed after them, `run(*inputs,
-    cotangent)`: what `assert_runs_per_shard` compares for a differentiated kernel."""
-    def run(*args):
-        out, pull = jax.vjp(fn, *args[:-1])
-        return out, *pull(args[-1])
-
-    return run
-
-
 def assert_runs_per_shard(fn, draw, specs, mesh, label: str, *, seeds: int, truth_fn, moves=(),
                           donate=()) -> None:
     """The custom-kernel contract (module docstring): `fn` on `draw(seed)`'s arguments placed on `mesh`
