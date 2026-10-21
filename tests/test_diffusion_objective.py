@@ -44,6 +44,14 @@ def make_batch(count=8):
             "text": encoder.tokenize(["a bird", "cat", "", "two dogs", "x", "y", "zz", "w"][:count])}
 
 
+def make_batch_of(count: int):
+    """`count` rows of drawn images and captions, as `make_batch` makes eight."""
+    images = np.random.default_rng(count).integers(0, 256, (count, RES, RES, 3), dtype=np.uint8)
+    captions = ["a bird", "cat", "", "two dogs", "x", "y", "zz", "w"]
+    return {"image": images,
+            "text": StubText.from_pretrained("stub").tokenize([captions[row % 8] for row in range(count)])}
+
+
 def test_the_steps_blank_is_its_own_towers_encoding_of_the_configured_prompt():
     """The unconditional branch a step reads is the configured prompt encoded by the towers in the
     step's own variables, cast to the conditional branch's dtypes: move the towers and it moves."""
@@ -383,3 +391,57 @@ def test_each_example_draws_its_own_times_noise_and_dropout_on_every_layout():
     third = jax.random.fold_in(jax.random.fold_in(update, stream("noise")), 3)
     np.testing.assert_array_equal(np.asarray(whole["noise"])[3],
                                   np.asarray(jax.random.normal(third, (RES, RES, 3), jnp.float32)))
+
+
+def test_an_accumulated_update_of_a_diffusion_objective_is_its_batch_whole_on_one_device():
+    """Two microbatches pooled by the trainer step as their batch whole does: each example draws its
+    time, noise and dropped condition by its place among the update's examples, which the halves
+    give as the whole gives them, so the pooled update is the whole batch's to its sums' rounding,
+    held by the float64 rule against the whole batch's float32 step, its float64 twin the truth.
+    Drawn by the attempt, the halves read other noise than the whole, and the step another update."""
+    import copy
+
+    import optax
+    from reference_error import assert_as_exact_as_the_reference, widened
+
+    from dew.training import Trainer
+    from dew.training.transaction import example_fields
+
+    objective = make_objective(unconditional_prob=0.5)
+    rows = 4 * jax.device_count()
+    whole = make_batch_of(2 * rows)
+    halves = [jax.tree.map(lambda value, part=part: value[part * rows:(part + 1) * rows], whole)
+              for part in (0, 1)]
+    trainer = Trainer(objective, optax.sgd(1.0), key=jax.random.PRNGKey(3), accumulation=2)
+    initial = trainer.initial_state()
+    run = trainer.compile(initial, halves[0])
+    start = jax.tree.map(np.asarray, initial.variables)
+    fields = example_fields(initial, 0, 1, whole)
+    info = Step(jnp.asarray(0), jax.random.fold_in(initial.key, 0), None, **fields)
+    partial, *_ = run(initial, halves[0])
+    pooled, *_ = run(partial, halves[1])
+    assert int(pooled.updates) == 1
+    # sgd(1): the update applied is the pooled gradient.
+    def moved(before, after):
+        return np.asarray(before, np.float64) - np.asarray(after, np.float64)
+
+    applied = jax.tree.map(moved, start["params"], jax.tree.map(np.asarray, pooled.variables["params"]))
+
+    def gradient(objective, variables, batch):
+        def loss(params):
+            return objective.scalar_loss({**variables, "params": params}, batch, info)[0]
+
+        return jax.grad(loss)(variables["params"])
+
+    # The whole batch's step, its update applied in float32 as the trainer applies it.
+    reference = jax.jit(lambda variables: gradient(objective, variables, whole))(start)
+    reference = jax.tree.map(lambda before, grad: moved(before, np.asarray(before - grad, np.float32)),
+                             start["params"], jax.tree.map(np.asarray, reference))
+    twin = copy.copy(objective)
+    twin.substitute([objective.model.clone(dtype=jnp.float64)])
+    with jax.enable_x64(new_val=True):
+        truth = jax.tree.map(np.asarray, gradient(twin, widened(start), widened(whole)))
+    leaves = zip(jax.tree_util.tree_leaves_with_path(applied), jax.tree.leaves(reference),
+                 jax.tree.leaves(truth), strict=True)
+    for (path, got), want, exact in leaves:
+        assert_as_exact_as_the_reference(got, want, exact, f"pooled {jax.tree_util.keystr(path)}")
