@@ -237,7 +237,8 @@ class Flow:
         return Process(
             schedule=FlowMatchingScheduler(
                 shift=shift, logit_mean=self.logit_mean, logit_std=self.logit_std,
-                density=self.density, mode_scale=self.mode_scale),
+                density=self.density, mode_scale=self.mode_scale,
+                dynamic=self.resolution_shift is not None),
             prediction=FlowMatchPredictionTransform(),
             weighting=_weighting(self.min_snr_gamma))
 

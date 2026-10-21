@@ -138,7 +138,11 @@ def test_one_step_is_the_papers_equations_on_stylegan_ts_heads():
         student[name] = {"kernel": student[name]}
     params = {**student, DISCRIMINATOR: unflattened("heads")}
     variables = {**variables, SPECTRAL: unflattened("initial")}
-    step = Step(step=jnp.asarray(0), key=jax.random.key(settings["key"]), ema=None)
+    # The step reads the oracle's own draws (`Step.tape`): each row's student time, its noise, its
+    # renoising level and noise.
+    tape = {"student times": STEP["draws/indices"], "noise": STEP["draws/noise"],
+            "renoise times": STEP["draws/level"], "renoise": STEP["draws/renoise"]}
+    step = Step(step=jnp.asarray(0), key=jax.random.key(settings["key"]), ema=None, tape=tape)
 
     def loss(params):
         return task.scalar_loss({**variables, "params": params}, {"image": pixels}, step)
@@ -205,9 +209,11 @@ def test_validation_does_not_advance_the_spectral_statistics(runs):
     task = config.build()
     variables = task.init(jax.random.key(1))
     step = Step(jnp.asarray(0), jax.random.key(2), None)
-    validation, aux = task.validation_loss(variables, batch, step)
-    training, trained = task.loss(variables, batch, step)
-    assert validation.mean()[0] != training.mean()[0]
+    _, aux = task.validation_loss(variables, batch, step)
+    _, trained = task.loss(variables, batch, step)
+    # The heads' spectral norms enter the discriminator's hinge; the total hides them, the generator's
+    # hinge on the same scores cancelling the discriminator's fake term wherever both are linear.
+    assert aux.metrics["discriminator"] != trained.metrics["discriminator"]
     assert aux.variables is None
     assert any(not np.array_equal(before, after) for before, after in zip(
         jax.tree.leaves(variables[SPECTRAL]), jax.tree.leaves(trained.variables[SPECTRAL]), strict=True))

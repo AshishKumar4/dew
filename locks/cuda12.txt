@@ -569,7 +569,7 @@ jaraco-functools==4.6.0
     # via
     #   cheroot
     #   keyring
-jax==0.11.2.post10
+jax==0.11.2.post11
     # via
     #   -c constraints.txt
     #   dewml (pyproject.toml)
@@ -1530,8 +1530,6 @@ transformers==5.16.1
     #   peft
 treescope==0.1.10
     # via flax
-triton==3.8.0
-    # via dewml (pyproject.toml)
 truststore==0.10.4
     # via
     #   httpcore2

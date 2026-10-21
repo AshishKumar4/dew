@@ -111,7 +111,7 @@ class _KeepAccepted:
                 reason = "zero_targets"
         if reason is None:
             self.counts.accepted += 1
-            if not isinstance(element, Rejected):
+            if isinstance(element, Mapping):
                 self.counts.truncated += int(bool(element.get("_dew_truncated", False)))
             self.consecutive = 0
             return True

@@ -21,6 +21,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from data_support import CAPTION_TEMPLATES, FLIP_JITTER, keep_captions, listed
+from reader_support import assert_resumes_where_it_stopped
 
 from dew.config.data import Augment, HoldOut, ImageData, RecordsData, VideoData, loader
 from dew.data import Loading, Memory, images
@@ -310,13 +312,6 @@ def _by_hand(source, *, seed, batch, count):
             for start in range(0, count * batch, batch)]
 
 
-def _fields(iterator, count):
-    """`count` batches as plain lists, so a comparison covers every field of
-    every record rather than one of them."""
-    return [{field: np.asarray(rows).tolist() for field, rows in batch.items()}
-            for batch in itertools.islice(iterator, count)]
-
-
 @pytest.mark.parametrize("workers", [0, pytest.param(1, marks=pytest.mark.slow),
                                      pytest.param(2, marks=pytest.mark.slow),
                                      pytest.param(3, marks=pytest.mark.slow)])
@@ -330,7 +325,7 @@ def test_which_records_a_batch_holds_does_not_depend_on_who_stacked_it(workers):
     stream = compile(Pipeline(Memory(source)).shuffle(5).repeat().batch(4), seed=5, loading=Loading(
         workers=workers, threads=2, read_buffer=4, worker_buffer=2)).train(DataPartition())
 
-    read = _fields(stream, 12)
+    read = listed(stream, 12)
     stream.close()
 
     assert read == _by_hand(source, seed=5, batch=4, count=12)
@@ -366,13 +361,13 @@ def test_an_offset_stays_a_bound_on_the_slice_this_process_reads(workers):
     data = compile(Pipeline(Memory(_Indexed(30))).repeat().batch(4), loading=Loading(
         workers=workers, threads=2, read_buffer=4, worker_buffer=2))
     interrupted = data.train(DataPartition())
-    _fields(interrupted, 2)
+    listed(interrupted, 2)
     offset = interrupted.get_state()
     interrupted.close()
 
     stream = data.train(DataPartition())
     stream.set_state(offset)
-    first = _fields(stream, 1)
+    first = listed(stream, 1)
     stream.close()
 
     assert first == [{"index": [8, 9, 10, 11]}]
@@ -658,17 +653,6 @@ def test_a_video_recipe_reads_the_same_batches_at_any_worker_count_and_after_a_r
     resumed, _ = read(0, 2, saved)
     for expected, found in zip(single[2:], resumed, strict=True):
         np.testing.assert_array_equal(expected["audio"], found["audio"])
-
-
-def keep_captions(captions):
-    """A caption reader that hands the words back, so a test reads what the
-    dataset wrote before a run's encoder tokenizes it."""
-    return {"caption": np.asarray(captions)}
-
-
-CAPTION_TEMPLATES = ("a photo of a {}", "a photo of a {} flower", "This is a photo of a {}")
-
-FLIP_JITTER = Augment(flip=True, jitter=True, backend="host")
 
 
 # ---------------------------------------------------------------------------------
@@ -1309,23 +1293,10 @@ def test_a_torch_dataset_streams_the_records_it_indexes_and_resumes():
         return loader(RecordsData(source=source), batch=4, seed=0, read="streamed", loading=reading).train(
             DataPartition())
 
-    whole = opened()
-    try:
-        expected = [np.asarray(next(whole)["index"]).tolist() for _ in range(6)]
-    finally:
-        whole.close()
-    stopped = opened()
-    try:
-        head = [np.asarray(next(stopped)["index"]).tolist() for _ in range(2)]
-        saved = stopped.get_state()
-    finally:
-        stopped.close()
-    resumed = opened()
-    try:
-        resumed.set_state(saved)
-        assert head + [np.asarray(next(resumed)["index"]).tolist() for _ in range(4)] == expected
-    finally:
-        resumed.close()
+    def indices(reader, count):
+        return [np.asarray(next(reader)["index"]).tolist() for _ in range(count)]
+
+    assert_resumes_where_it_stopped(opened, indices, 2, 4)
 
 
 def test_a_torchvision_style_dataset_reads_its_tuples_as_named_fields():
