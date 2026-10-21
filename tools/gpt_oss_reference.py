@@ -155,12 +155,14 @@ def tiny_gpt_oss() -> GptOssForCausalLM:
 def write_exchange_cases() -> None:
     """Tiny fp32 full-MLP VJPs from the pinned transformers implementation."""
     import json
-    from importlib.metadata import version
 
-    reference = {'transformers': '5.16.1', 'torch': '2.14.0+cpu'}
-    for package, expected in reference.items():
-        if version(package) != expected:
-            raise RuntimeError(f"exchange fixtures require {package}=={expected}")
+    from reference_releases import require
+
+    pins = require("transformers", "torch")
+    if not torch.__version__.endswith("+cpu"):
+        raise RuntimeError(f"the exchange fixtures are recorded on torch's CPU build, not "
+                           f"{torch.__version__}")
+    reference = {**pins, "torch": torch.__version__}
     for skewed in (False, True):
         config = GptOssConfig(hidden_size=8, intermediate_size=12, num_local_experts=4,
                              num_experts_per_tok=2)
