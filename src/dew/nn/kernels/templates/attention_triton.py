@@ -74,6 +74,10 @@ def _power(width: int) -> int:
     return max(16, 1 << (width - 1).bit_length())
 
 
+LOG2E = 1.4426950408889634
+"""log2(e), which turns a natural exponent into a base-2 one."""
+
+
 def _whole(count: int, block: int) -> int:
     return -(-count // block) * block
 
@@ -167,7 +171,7 @@ def _tile_param(ref, kind: Kind, head, queries: jax.Array, keys: jax.Array | Non
 
 def _forward_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tuple[Kind, ...],
                     output_kinds: tuple[Kind, ...], initial: bool, residuals: bool, score_mod, output_mod,
-                    scale: float, block_k: int, interpret: bool):
+                    scale: float, block_k: int, interpret: bool, loops: str = "split", base2: bool = False):
     refs = list(refs)
     query_ids_ref, key_ids_ref = (refs.pop(0), refs.pop(0)) if ids else (None, None)
     query_ref, key_ref, value_ref = refs.pop(0), refs.pop(0), refs.pop(0)
@@ -187,7 +191,8 @@ def _forward_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kind
         acc, peak, total = carry
         keys = pl.ds(index * block_k, block_k)
         key, value = key_ref[keys, :], value_ref[keys, :]
-        logits = _dot(query, key.T, interpret) * scale
+        # Base 2 (`base2`, no score hook): log2(e) folded into the scale, the weights by exp2.
+        logits = _dot(query, key.T, interpret) * (scale * LOG2E if base2 else scale)
         k_pos = index * block_k + jnp.arange(block_k)[None, :]
         if score_mod is not None:
             params = [_tile_param(ref, kind, head, q_pos, keys) for ref, kind in zip(score_refs, score_kinds,
@@ -203,8 +208,9 @@ def _forward_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kind
             logits = jnp.where(seen, logits, -jnp.inf)
         new_peak = jnp.maximum(peak, logits.max(axis=-1))
         safe = jnp.where(new_peak == -jnp.inf, 0.0, new_peak)
-        correction = jnp.exp(peak - safe)
-        weights = jnp.exp(logits - safe[:, None])
+        power = jnp.exp2 if base2 else jnp.exp
+        correction = power(peak - safe)
+        weights = power(logits - safe[:, None])
         acc = correction[:, None] * acc + _dot(weights.astype(value.dtype), value, interpret)
         return acc, new_peak, correction * total + weights.sum(axis=-1)
 
@@ -216,9 +222,16 @@ def _forward_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kind
         carry = (jnp.zeros((block_q, width), jnp.float32), jnp.full((block_q,), -jnp.inf, jnp.float32),
                  jnp.zeros((block_q,), jnp.float32))
     lo, hi, full_lo, full_hi = bounds_ref[0], bounds_ref[1], bounds_ref[2], bounds_ref[3]
-    carry = jax.lax.fori_loop(lo, full_lo, functools.partial(step, masked=True), carry)
-    carry = jax.lax.fori_loop(full_lo, full_hi, functools.partial(step, masked=False), carry)
-    acc, peak, total = jax.lax.fori_loop(full_hi, hi, functools.partial(step, masked=True), carry)
+    if base2 and initial:
+        carry = (carry[0], carry[1] * LOG2E, carry[2])
+    if loops == "one":
+        acc, peak, total = jax.lax.fori_loop(lo, hi, functools.partial(step, masked=True), carry)
+    else:
+        carry = jax.lax.fori_loop(lo, full_lo, functools.partial(step, masked=True), carry)
+        carry = jax.lax.fori_loop(full_lo, full_hi, functools.partial(step, masked=False), carry)
+        acc, peak, total = jax.lax.fori_loop(full_hi, hi, functools.partial(step, masked=True), carry)
+    if base2:
+        peak = peak / LOG2E
     out = jnp.where(total[:, None] > 0, acc / jnp.where(total > 0, total, 1.0)[:, None], 0.0)
     if output_mod is not None:
         params = [_tile_param(ref, kind, head, q_pos, None) for ref, kind in zip(output_refs, output_kinds,
@@ -245,6 +258,8 @@ class TritonForward(Template[Tiles]):
     config_cls = Tiles
     score_mod: Callable | None = None
     output_mod: Callable | None = None
+    loops: str = "split"
+    base2: bool = False
     score_kinds: tuple[Kind, ...] = ()
     output_kinds: tuple[Kind, ...] = ()
     score_dtypes: tuple[str, ...] = ()
@@ -292,7 +307,8 @@ class TritonForward(Template[Tiles]):
         kernel = functools.partial(
             _forward_kernel, ids=ids, score_kinds=self.score_kinds, output_kinds=self.output_kinds,
             initial=initial, residuals=residuals, score_mod=self.score_mod, output_mod=self.output_mod,
-            scale=self.scale, block_k=block_k, interpret=interpret)
+            scale=self.scale, block_k=block_k, interpret=interpret, loops=self.loops,
+            base2=self.base2 and self.score_mod is None)
         out = pl.pallas_call(
             kernel, grid=(queries // block_q, batch, heads), in_specs=in_specs, out_specs=out_specs,
             out_shape=out_shape, interpret=interpret, name="attention_forward",
@@ -435,7 +451,8 @@ def _padded_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeyS
 
 
 def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None,
-            *, scale: float | None = None, residuals: bool = False, interpret: bool = False):
+            *, scale: float | None = None, residuals: bool = False, interpret: bool = False,
+            loops: str = "split", base2: bool = False):
     """The template's forward (`TritonForward`) on `query` `[B, Q, H, D]` over `key` and `value`
     `[B, K, Hk, D]` and `[B, K, Hk, Dv]` and the keys `spans` leaves each query: as
     `dew.nn.kernels.templates.attention.reference` computes it, with `residuals` its running maxima and
@@ -455,7 +472,7 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
                        score_dtypes=tuple(_kept_dtype(param.value.dtype) for param in hooks.score_params),
                        output_dtypes=tuple(_kept_dtype(param.value.dtype) for param in hooks.output_params),
                        output_width=call.value.shape[-1],
-                       scale=query.shape[3] ** -0.5 if scale is None else scale)
+                       scale=query.shape[3] ** -0.5 if scale is None else scale, loops=loops, base2=base2)
     out = op(call.query, call.key, call.value, call.start, call.end, call.query_ids, call.key_ids,
              call.score_params, call.output_params, m0, total0, acc0, residuals=residuals,
              interpret=interpret)
