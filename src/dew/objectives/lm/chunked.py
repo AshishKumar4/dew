@@ -946,7 +946,10 @@ def logits_cross_entropy(logits, targets, *, predict: bool = True, temperature: 
     # Not `_row_terms`: its variadic `jax.lax.reduce` has no derivative, which
     # the tiled head's own backward never needs, and these losses are
     # differentiated (a distilled student's prediction, a whole-logit model).
-    peak = jax.lax.stop_gradient(jnp.max(logits, axis=-1))
+    # A finite shift, as `jax.nn.logsumexp` takes one: an infinite maximum shifts by 0, so a row
+    # holding +inf scores +inf, and an all -inf row's partition is -inf, never inf - inf.
+    largest = jnp.max(logits, axis=-1)
+    peak = jax.lax.stop_gradient(jnp.where(jnp.isfinite(largest), largest, 0))
     mass = jnp.sum(jnp.exp(logits - peak[..., None]), axis=-1)
     loss = token_loss(peak, mass, _target_logits(logits, targets))
     return loss, jnp.argmax(logits, axis=-1) if predict else None, peak + jnp.log(mass)
