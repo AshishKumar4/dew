@@ -1010,7 +1010,8 @@ def test_a_layer_choosing_the_fused_step_decodes_on_a_mesh_as_on_one_device(axis
         truth = np.asarray(module.clone(dtype=jnp.float64).apply(widened(variables), widened(hidden)))
     with chosen(delta_decode="fused"):
         alone = np.asarray(decode_through(module, variables, hidden, prefill=3)[0])
-        mesh = MeshSpec(**{axis: 2}).build(jax.devices()[:2])
+        # The data axis takes the devices the others leave.
+        mesh = MeshSpec(**({} if axis == 'data' else {axis: 2})).build(jax.devices()[:2])
         with jax.set_mesh(mesh):
             placed = jax.device_put(hidden, NamedSharding(mesh, PartitionSpec()))
             split = np.asarray(decode_through(module, variables, placed, prefill=3)[0])
