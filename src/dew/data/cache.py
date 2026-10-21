@@ -37,6 +37,7 @@ from dew.data.generation import (
     _json,
     _publish,
     _row_key,
+    _rule,
 )
 from dew.data.pipeline import Record, Rejected, Volatile
 from dew.data.retention import LocalRetention
@@ -406,6 +407,7 @@ class _Writer:
                     "payload_sha256": fingerprint(outputs),
                     "lengths": [_fact(value, "_dew_length") for value in accepted],
                     "valid_targets": [_fact(value, "_dew_valid_targets") for value in accepted],
+                    "rules": [_rule(value) for value in accepted],
                     "rejections": [value.reason for value in outputs if isinstance(value, Rejected)],
                 }
             )
