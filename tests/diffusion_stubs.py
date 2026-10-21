@@ -8,6 +8,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew.inputs import CharTable, ConditionEncoder
+from dew.inputs.encoders import char_codes
 from dew.nn.dit import TextContext
 from dew.objectives.base import Variables
 
@@ -39,13 +40,7 @@ class StubText(ConditionEncoder[str]):
         return cls(checkpoint=checkpoint, params=params, tokens=tokens, vocab=vocab)
 
     def tokenize(self, data):
-        ids = np.zeros((len(data), self.tokens), np.int32)
-        mask = np.zeros((len(data), self.tokens), np.int32)
-        for row, text in enumerate(data):
-            codes = [1] + [2 + (ord(char) % (self.vocab - 2)) for char in text[:self.tokens - 1]]
-            ids[row, :len(codes)] = codes
-            mask[row, :len(codes)] = 1
-        return {"input_ids": ids, "attention_mask": mask}
+        return char_codes(data, self.tokens, self.vocab)
 
     def encode(self, params, tokens):
         return TextContext(hidden=params["table"][jnp.asarray(tokens["input_ids"])],

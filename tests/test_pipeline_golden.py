@@ -8,6 +8,7 @@ loaders pin 66beb5305.
 
 import gzip
 import hashlib
+import importlib.util
 import itertools
 import json
 from pathlib import Path
@@ -37,6 +38,7 @@ from dew.data.sources.files import Files
 from dew.data.sources.tfds import TFDS
 
 GOLD = Path(__file__).parent / "fixtures/golden/loaders-66beb5305.json.gz"
+ORACLE = Path(__file__).parents[1] / "tools/measurements/data-pipeline/data_oracle_legacy.py"
 CASES = ("text_windows", "text_packed", "text_phases", "chat", "prompts", "preferences", "images_memory",
          "images_arrayrecord", "images_hf", "images_tfds", "hub_records", "tfds_records")
 """The recipes the old loaders read alike. Decision rows are not among them: they pack into windows,
@@ -56,18 +58,14 @@ def _digest(batch):
     return {"tree": str(jax.tree.structure(batch)), "leaves": leaves}
 
 
-def _token_files(root, name, shift):
-    directory = root / name
-    directory.mkdir()
-    train = np.asarray([token for index in range(100)
-                        for token in [*((np.arange(5 + index % 15) + index + shift) % 200), 255]], np.uint16)
-    held = train[:180]
-    (directory / "train.bin").write_bytes(train.tobytes())
-    (directory / "val.bin").write_bytes(held.tobytes())
-    (directory / "meta.json").write_text(json.dumps({"tokenizer": "byte", "vocab_size": 256,
-                                                   "dtype": "uint16", "train_tokens": len(train),
-                                                   "val_tokens": len(held), "eos_id": 255}))
-    return str(directory)
+def _oracle():
+    """The frozen reference's capture script, whose token stores the reference read: the stores this
+    test reads are the ones it wrote (`token_store`)."""
+    spec = importlib.util.spec_from_file_location("data_oracle_legacy", ORACLE)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _image_sources(root, pixels):
@@ -90,7 +88,8 @@ def _image_sources(root, pixels):
 @pytest.fixture(scope="module")
 def recipes(tmp_path_factory):
     root = tmp_path_factory.mktemp("pipeline-golden")
-    tokens, other = _token_files(root, "tokens", 0), _token_files(root, "other", 10)
+    token_store = _oracle().token_store
+    tokens, other = token_store(root, "tokens", 0), token_store(root, "other", 10)
     conversations = tuple({"messages": [{"role": "user", "content": f"question {index}"},
                                         {"role": "assistant", "content": f"answer {index % 5}"}]}
                           for index in range(40))

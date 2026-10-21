@@ -230,6 +230,36 @@ def _conversation_windows(rendered: Dataset, pack: Pack, *,
     return (rendered.filter_map(fitted) if long == "drop" else rendered.map(fitted))._then(pack)
 
 
+def prompts(dataset: Dataset, tokenizer: str | PreTrainedTokenizerBase, *, max_prompt_len: int, batch: int,
+            pad_id: int = 0, long: Literal["drop", "truncate"] = "truncate", thinking: bool | None = None,
+            reward_bytes: int | None = None, records: int | None = None,
+            host: tuple[HostStep, ...] = ()) -> Pipeline:
+    """Prompt rows (verl's columns: "prompt", "data_source", "ground_truth", ...) rendered to
+    `max_prompt_len` left-padded ids, keeping a longer prompt's tail, or dropping it (`long="drop"`),
+    with their reward columns padded to `reward_bytes`, in batches of `batch` (`records` and `host`
+    as `images` takes them). Without `reward_bytes`, a memory read measures it over each store, the
+    widest reward string it holds, so every row fits whole; another read needs it given, or stated
+    by the store's metadata."""
+    rendered = _rendered_prompts(dataset, tokenizer, max_prompt_len, pad_id=pad_id, long=long,
+                                 thinking=thinking, reward_bytes=reward_bytes)
+    return _finished(rendered, batch=batch, records=records, host=host)
+
+
+def _rendered_prompts(dataset: Dataset, tokenizer: str | PreTrainedTokenizerBase, max_prompt_len: int, *,
+                      pad_id: int, long: Literal["drop", "truncate"], thinking: bool | None,
+                      reward_bytes: int | None) -> Pipeline:
+    """Prompt rows rendered with their reward columns `reward_bytes` wide, or as wide as measured over
+    each store (`prompts`). `prompts` and the prompt recipe (`dew.config.data.PromptData`) share it."""
+    from dew.data.prompts import RewardWidth
+    from dew.data.steps.chat import ConfigurePrompt
+    from dew.data.text import tokenizer_name
+
+    configure = ConfigurePrompt(tokenizer_name(tokenizer), max_prompt_len, pad_id, long, thinking)
+    if reward_bytes is not None:
+        return dataset.filter_map(configure({"reward_bytes": reward_bytes}))
+    return dataset.map(Configured(configure, needs=("reward_bytes",), measures=RewardWidth()))
+
+
 def preferences(dataset: Dataset, *, seq_len: int, batch: int, pad_id: int = 0, records: int | None = None,
                 host: tuple[HostStep, ...] = ()) -> Pipeline:
     """Preference pairs of token ids, chosen and rejected, each laid out in `seq_len` tokens with
