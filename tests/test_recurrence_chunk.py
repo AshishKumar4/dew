@@ -28,8 +28,10 @@ attentions), with and without the skip."""
 PACKED = (False, True)
 """A row of one sequence, and of packed documents."""
 
-SEEDS = {(hooks, packed): 32 for hooks in HOOKS for packed in PACKED}
-"""Each site's declared seeds."""
+SEEDS = dict(zip(((hooks, packed) for hooks in HOOKS for packed in PACKED), (
+    8, 8, 8, 8, 8, 8, 8, 8, 16, 16, 64, 64, 16, 16, 16, 16, 8, 8, 64, 64, 8, 8, 8, 8), strict=True))
+"""Each site's declared seeds (hooks in `HOOKS`' order, one sequence then packed), sized independently by
+`seeds_for` on armada (2026-10-21)."""
 
 
 def draw(hooks: recurrence.Hooks, packed: bool, seed: int) -> tuple[Chunk]:
