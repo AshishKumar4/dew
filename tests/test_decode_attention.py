@@ -11,8 +11,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from attention_oracle import attention_terms, exact_attention, float64_weights
 from reference_error import assert_as_exact_as_the_reference, assert_fp32_reduction_bound
-from test_attention_splash import attention_terms
 
 from dew.nn.attention import attention_case, scaled_dot_product_attention, with_key_lengths
 from dew.nn.attention_kernels import DECODE, kernel_refusals
@@ -46,10 +46,9 @@ def test_folded_attention_is_jax_nn_attention(dtype, heads):
 
     q, k, v = (np.asarray(x, np.float64) for x in (q, k, v))
     read = np.arange(40)[None, None, None, :] < np.asarray(lengths)[:, None, None, None]
-    logits = np.where(read, np.einsum('btnd,bsnd->bnts', q, k) / 16.0, -np.inf)
-    probs = np.exp(logits - logits.max(-1, keepdims=True))
-    probs /= probs.sum(-1, keepdims=True)
-    truth = np.einsum('bnts,bsnd->btnd', probs, v)
+    with jax.enable_x64(new_val=True):
+        probs = np.asarray(float64_weights(jnp.asarray(q), jnp.asarray(k), read, None, None)[0])
+        truth = np.asarray(exact_attention(*(jnp.asarray(x) for x in (q, k, v)), keep=read))
     if dtype == jnp.float32:
         spread = np.where(read, np.einsum('btnd,bsnd->bnts', np.abs(q), np.abs(k)) / 16.0, 0).max(-1)
         carried = 1 + 2 * spread.transpose(0, 2, 1)[..., None]
@@ -90,9 +89,8 @@ def dense_case(dtype, windowed=False):
     q, k, v = (np.asarray(x, np.float64) for x in (query, key, value))
     starts = jnp.asarray([0, 3, 1, 40, capacity - 300] if windowed else [0] * rows, jnp.int32)
     read = spanned(starts, lengths, capacity)
-    logits = np.where(read, np.einsum('btnd,bsnd->bnts', q, k) / 16.0, -np.inf)
-    probs = np.exp(logits - logits.max(-1, keepdims=True))
-    truth = np.einsum('bnts,bsnd->btnd', probs / probs.sum(-1, keepdims=True), v)
+    with jax.enable_x64(new_val=True):
+        truth = np.asarray(exact_attention(*(jnp.asarray(x) for x in (q, k, v)), keep=read))
     return (query, key, value, lengths, *((starts,) if windowed else ())), truth
 
 
@@ -170,7 +168,6 @@ def test_the_decode_kernel_applies_sinks_and_a_softcap_at_every_config(dtype, ho
     attention over the same keys, against float64 (`exact_attention`). The idle row of one key keeps
     its sink's share. The dispatch takes such a call to the decode kernel where it runs (`decodes`),
     and the tuner times its launch on the sinks too (`timed`)."""
-    from test_attention_splash import exact_attention
     from tuned import each_config, launches, timed
 
     from dew.nn.attention import reference_attention
@@ -218,7 +215,6 @@ def test_a_decode_steps_sinks_take_their_gradient_and_tangent_through_the_dispat
     to the decode kernel, the sinks an operand of its derivative: traced, the gradient and the tangent
     with respect to them take that route; on a GPU each is within tests/reference_error.py's rule of the
     reference path's against float64 (`exact_attention`)."""
-    from test_attention_splash import exact_attention
 
     from dew.nn.kernels import generation
 
@@ -317,10 +313,9 @@ def test_the_decode_kernels_launches_are_the_tuners():
             key, value = (jnp.moveaxis(pages[:, table].reshape(kv_heads, rows, -1, width), 0, 2)
                           for pages in (key_pages, value_pages))
             query, out = jnp.moveaxis(grouped, 2, 1), np.moveaxis(out, 2, 1)
-        q, k, v = (np.asarray(x, np.float64) for x in (query, key, value))
-        logits = np.einsum('btnd,bsnd->bnts', q, k) / np.sqrt(q.shape[-1])
-        probs = np.exp(logits - logits.max(-1, keepdims=True))
-        truth = np.einsum('bnts,bsnd->btnd', probs / probs.sum(-1, keepdims=True), v)
+        with jax.enable_x64(new_val=True):
+            wide = (jnp.asarray(np.asarray(x, np.float64)) for x in (query, key, value))
+            truth = np.asarray(exact_attention(*wide))
         plain = jax.nn.dot_product_attention(query, key, value, implementation='xla')
         assert_as_exact_as_the_reference(out, np.asarray(plain, np.float32), truth, type(ba.op).__name__)
 
@@ -687,10 +682,8 @@ def test_attention_the_decode_kernel_takes_differentiates_as_the_folded_attentio
     reference = jax.jit(lambda *a: derivatives(folded, *a))(query, key, value)
     def exact(query, key, value):
         # Each row over its first `lengths` keys, every step in the operands' float64.
-        logits = jnp.einsum('btnd,bsnd->bnts', query, key) / np.sqrt(query.shape[-1])
-        read = jnp.arange(key.shape[1]) < lengths[:, None, None, None]
-        weights = jax.nn.softmax(jnp.where(read, logits, -jnp.inf), axis=-1)
-        return jnp.einsum('bnts,bsnd->btnd', weights, value)
+        return exact_attention(query, key, value,
+                               keep=np.arange(key.shape[1]) < np.asarray(lengths)[:, None, None, None])
 
     with jax.enable_x64(new_val=True):
         truth = derivatives(exact, *(jnp.asarray(x, jnp.float64) for x in (query, key, value)))
@@ -766,14 +759,13 @@ def paged_case(page_size, windowed=False):
     value_pages = jnp.asarray(rng.normal(size=(kv_heads, count, page_size, width)), jnp.bfloat16)
     key, value = (jnp.moveaxis(pages[:, table].reshape(kv_heads, rows, capacity, width), 0, 2)
                   for pages in (key_pages, value_pages))
-    q = np.asarray(query, np.float64).reshape(rows, kv_heads, heads // kv_heads, width)
+    q = np.asarray(query, np.float64)[:, None]
     k, v = np.asarray(key, np.float64), np.asarray(value, np.float64)
     starts = jnp.asarray([0, 1, decode_attention.BLOCK + 1 - 2, capacity - 300] if windowed else [0] * rows,
                          jnp.int32)
     read = spanned(starts, lengths, capacity)
-    logits = np.where(read, np.einsum('bngd,bsnd->bngs', q, k) / np.sqrt(width), -np.inf)
-    probs = np.exp(logits - logits.max(-1, keepdims=True))
-    truth = np.einsum('bngs,bsnd->bngd', probs / probs.sum(-1, keepdims=True), v).reshape(rows, heads, width)
+    with jax.enable_x64(new_val=True):
+        truth = np.asarray(exact_attention(*(jnp.asarray(x) for x in (q, k, v)), keep=read))[:, 0]
     arrays = (query, key_pages, value_pages, table, lengths, *((starts,) if windowed else ()))
     return arrays, (key, value, starts, truth)
 
@@ -960,10 +952,7 @@ def test_flash_reads_a_cache_calls_documents_as_exactly_as_jax_nn_reads_its_mask
         return out * jnp.asarray(positions >= 0, out.dtype)[:, :, None, None]
 
     def truth(query, key, value):
-        logits = jnp.where(mask, jnp.einsum("btnd,bsnd->bnts", query, key) / 8.0, -jnp.inf)
-        seen = jnp.isfinite(logits).any(-1, keepdims=True)
-        probs = jnp.where(seen, jax.nn.softmax(jnp.where(seen, logits, 0.0), axis=-1), 0.0)
-        return jnp.einsum("bnts,bsnd->btnd", probs, value)
+        return exact_attention(query, key, value, keep=np.asarray(mask))
 
     with chosen(attention="flash", attention_packed="flash", attention_window="flash"):
         case = attention_case(query, key, causal=True, sliding_window=window, segment_ids=documents,
