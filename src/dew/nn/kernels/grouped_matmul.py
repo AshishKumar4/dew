@@ -132,19 +132,43 @@ def _routed(rows: int, groups: int) -> float:
 @dataclasses.dataclass(frozen=True)
 class Hooks:
     """A launch's prologue and epilogue (`templates.gemm`): each a JAX function of a tile and its side
-    tiles, or None, with each side operand's launch axes ('rows', 'depth', 'columns'), and the dtypes of
-    the epilogue's outputs where it returns several. The side operands themselves are the launch's
-    `prologue_operands` and `epilogue_operands`. A measured pick stores a module-level hook
+    tiles, or None, with each side operand's launch axes ('rows', 'depth', 'columns'), the positions of
+    each side operand's dimensions of one the launch squeezed out (the hook gets them back), and the
+    dtypes of the epilogue's outputs where it returns several. The side operands themselves are the
+    launch's `prologue_operands` and `epilogue_operands`. A measured pick stores a module-level hook
     (`tuning.encoded`)."""
     prologue: object = None
     prologue_axes: tuple = ()
     epilogue: object = None
     epilogue_axes: tuple = ()
     out_dtypes: tuple | None = None
+    prologue_broadcast: tuple = ()
+    epilogue_broadcast: tuple = ()
+
+    def before(self):
+        """The prologue as a kernel traces it: on the squeezed side tiles."""
+        return _unsqueezing(self.prologue, self.prologue_broadcast)
+
+    def after(self):
+        """The epilogue as a kernel traces it: on the squeezed side tiles."""
+        return _unsqueezing(self.epilogue, self.epilogue_broadcast)
 
     def kernel_options(self) -> dict:
-        return {'prologue': self.prologue, 'prologue_axes': self.prologue_axes, 'epilogue': self.epilogue,
+        return {'prologue': self.before(), 'prologue_axes': self.prologue_axes, 'epilogue': self.after(),
                 'epilogue_axes': self.epilogue_axes, 'out_dtypes': self.out_dtypes}
+
+
+def _unsqueezing(hook, positions: tuple):
+    """`hook` given its side tiles' dimensions of one back at `positions` (one tuple per side operand)."""
+    if hook is None or not any(positions):
+        return hook
+    return functools.partial(_unsqueezed, hook, positions)
+
+
+def _unsqueezed(hook, positions: tuple, tile, *sides):
+    """`hook` on `tile` and its side tiles with their dimensions of one back at `positions`."""
+    return hook(tile, *(jnp.expand_dims(side, where) if where else side
+                        for side, where in zip(sides, positions, strict=True)))
 
 
 NO_HOOKS = Hooks()
@@ -166,9 +190,10 @@ def _transcendentals(hook, tile, sides) -> float:
 
 
 def _equations(jaxpr):
-    """Every equation of `jaxpr` and of the programs nested in it."""
-    for inner in (jaxpr, *jax_core.subjaxprs(jaxpr)):
-        yield from inner.eqns
+    """Every equation of `jaxpr` and of the programs nested in it, at any depth."""
+    yield from jaxpr.eqns
+    for inner in jax_core.subjaxprs(jaxpr):
+        yield from _equations(inner)
 
 
 def _lowers_on_mosaic(hook, tile, sides) -> bool:
@@ -234,9 +259,9 @@ def _triton_staged(rows: int, columns: int, depth: int, warps: int, wgmma: bool)
 
 
 def _sizes(specs: list[jax.ShapeDtypeStruct], seed: int, rows: int) -> jax.Array:
-    """Group sizes summing to `rows` over the groups `specs` name, drawn
-    unevenly, one group left empty, as a step routes them."""
-    groups = next(spec.shape[0] for spec in specs if jnp.issubdtype(spec.dtype, jnp.integer))
+    """Group sizes summing to `rows` over the groups the third spec (the launch's group sizes) names,
+    drawn unevenly, one group left empty, as a step routes them."""
+    groups = specs[2].shape[0]
     shares = np.random.default_rng(seed).dirichlet(np.ones(groups))
     shares[0] = 0.0
     sizes = np.floor(shares / shares.sum() * rows).astype(np.int32)
@@ -267,10 +292,11 @@ class _GroupedLaunch[Config: Hashable](base.Template[Config]):
         return type(keyed)(keyed.op, arguments)
 
     def operands(self, specs: list[jax.ShapeDtypeStruct], seed: int) -> list[jax.Array]:
+        """`tuning.KernelOp.operands`, the group sizes (every launch's third argument) drawn as a step
+        routes them, an integer side operand drawn as any other operand."""
         arrays = super().operands(specs, seed)
-        sizes = _sizes(specs, seed, specs[0].shape[0])
-        return [sizes if jnp.issubdtype(spec.dtype, jnp.integer) else array
-                for spec, array in zip(specs, arrays, strict=True)]
+        arrays[2] = _sizes(specs, seed, specs[0].shape[0])
+        return arrays
 
 
 class _Triton(_GroupedLaunch[Tile]):
@@ -389,10 +415,10 @@ class Gmm(_Triton):
         extents = self.extents(config)
         exponentials = (
             steps * config.block_m * config.block_k * _hook_work(
-                hooks.prologue, tokens.dtype, prologue_sides, hooks.prologue_axes,
+                hooks.before(), tokens.dtype, prologue_sides, hooks.prologue_axes,
                 (config.block_m, config.block_k), extents)
             + tiles / chunks * config.block_m * config.block_n * _hook_work(
-                hooks.epilogue, jnp.float32, epilogue_sides, hooks.epilogue_axes,
+                hooks.after(), jnp.float32, epilogue_sides, hooks.epilogue_axes,
                 (config.block_m, config.block_n), extents))
         return cost.seconds(cost.Cost(
             programs=chunks * columns, device_bytes=moved,
@@ -457,7 +483,7 @@ class Tgmm(_Triton):
         moved = ((blocks[1] * rows * depth + blocks[0] * rows * width) * size + groups * depth * width * out
                  + _side_bytes(sides, hooks.prologue_axes, rereads))
         exponentials = steps * config.block_m * config.block_k * _hook_work(
-            hooks.prologue, tokens.dtype, sides, hooks.prologue_axes, (config.block_m, config.block_k),
+            hooks.before(), tokens.dtype, sides, hooks.prologue_axes, (config.block_m, config.block_k),
             self.extents(config))
         return cost.seconds(cost.Cost(
             programs=programs, device_bytes=moved, program_flops=flops, program_staged=staged,
@@ -471,7 +497,7 @@ class Tgmm(_Triton):
         return ragged_dot.tgmm(tokens, cotangent, sizes, block_m=config.block_m, block_k=config.block_k,
                                block_n=config.block_n, num_warps=config.warps, num_stages=config.stages,
                                interpret=interpret, compute_dtype=tokens.dtype,
-                               out_dtype=jnp.dtype(out_dtype), prologue=hooks.prologue,
+                               out_dtype=jnp.dtype(out_dtype), prologue=hooks.before(),
                                prologue_operands=prologue_operands, prologue_axes=hooks.prologue_axes,
                                exact_sums=exact_sums), None
 
@@ -507,9 +533,9 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
             return [jax.ShapeDtypeStruct((64,) * len(axes), side.dtype)
                     for side, axes in zip(ba.arguments.get(name, ()), axes_of, strict=True)]
 
-        return (_lowers_on_mosaic(hooks.prologue, jax.ShapeDtypeStruct((64, 64), dtype),
+        return (_lowers_on_mosaic(hooks.before(), jax.ShapeDtypeStruct((64, 64), dtype),
                                   tiles('prologue_operands', hooks.prologue_axes))
-                and _lowers_on_mosaic(hooks.epilogue, jax.ShapeDtypeStruct((64, 64), jnp.float32),
+                and _lowers_on_mosaic(hooks.after(), jax.ShapeDtypeStruct((64, 64), jnp.float32),
                                       tiles('epilogue_operands', hooks.epilogue_axes)))
 
     def staged_bytes(self, ba, config: mosaic_gpu.Tiles) -> int:
@@ -544,10 +570,10 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         if hooks.prologue is not None:
             sides = _side_tile_bytes(prologue_sides, hooks.prologue_axes, extents)
             step += 2 * math.prod(lhs) * size + 2 * sides
-        exponentials = (steps * math.prod(lhs) * _hook_work(hooks.prologue, tokens.dtype, prologue_sides,
+        exponentials = (steps * math.prod(lhs) * _hook_work(hooks.before(), tokens.dtype, prologue_sides,
                                                             hooks.prologue_axes, lhs, extents)
                         + config.block_m * config.block_n * _hook_work(
-                            hooks.epilogue, jnp.float32, epilogue_sides, hooks.epilogue_axes,
+                            hooks.after(), jnp.float32, epilogue_sides, hooks.epilogue_axes,
                             (config.block_m, config.block_n), extents))
         return cost.seconds(cost.Cost(
             programs=tiles, device_bytes=moved,
@@ -662,7 +688,7 @@ class MosaicTgmm(_Mosaic):
              exact_sums: bool = False, config: mosaic_gpu.Tiles, return_residuals: bool = False):
         return mosaic_gpu.tgmm(tokens, cotangent, sizes, tiles=config, out_dtype=out_dtype,
                                multiprocessors=self._multiprocessors(interpret),
-                               interpret=INTERPRETED if interpret else False, prologue=hooks.prologue,
+                               interpret=INTERPRETED if interpret else False, prologue=hooks.before(),
                                prologue_operands=prologue_operands, prologue_axes=hooks.prologue_axes,
                                exact_sums=exact_sums), None
 

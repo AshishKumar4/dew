@@ -24,7 +24,6 @@ import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import fuser
-from jax.extend import core as jax_core
 
 from dew.nn.kernels.templates.gemm import template
 
@@ -72,14 +71,19 @@ def _product(transpose_rhs: bool, interpret_on_cpu: bool, dense: bool, *fusions)
 
 def _axes(consumer, values, acc) -> tuple | None:
     """The launch axes each captured array follows, one per dimension, from its block spec at a probe
-    tile; None where one follows none, its block is not the tile's, or the consumer reads the tile's
-    position."""
+    tile; None where the product's own block is not the tile at its place (a transpose), a captured
+    array follows no launch axis (a scalar) or its block is not the tile's, or the consumer reads the
+    tile's position."""
     probe = (_probe(acc.shape[0]), _probe(acc.shape[1]))
-    tiled, (value_specs, _), _ = fuser.pull_block_spec(consumer, _specs(consumer, values, acc, probe),
-                                                       grid_len=2)(values, acc)
+    tiled, (value_specs, acc_spec), _ = fuser.pull_block_spec(consumer, _specs(consumer, values, acc, probe),
+                                                              grid_len=2)(values, acc)
+    if not _is_tile(acc_spec, probe):
+        return None
     axes = []
     specs = jax.tree.leaves(value_specs, is_leaf=_is_spec)
     for leaf, leaf_spec in zip(jax.tree.leaves(values), specs, strict=True):
+        if not isinstance(leaf_spec, pl.BlockSpec) or leaf_spec.index_map is None:
+            return None
         named = []
         indices = leaf_spec.index_map(1, 2)
         for block, index, size in zip(leaf_spec.block_shape, indices, leaf.shape, strict=True):
@@ -96,6 +100,12 @@ def _specs(consumer, values, acc, block: tuple):
     """One block spec of `block` at the tile's (row, column) for each of the consumer's outputs."""
     spec = pl.BlockSpec(block, lambda row, column: (row, column))
     return jax.tree.map(lambda _: spec, jax.eval_shape(consumer, values, acc))
+
+
+def _is_tile(spec, probe: tuple) -> bool:
+    """Whether `spec` is the probe tile at its own place: a block of `probe` at (row, column)."""
+    return (isinstance(spec, pl.BlockSpec) and spec.index_map is not None
+            and tuple(spec.block_shape) == probe and tuple(spec.index_map(1, 2)) == (1, 2))
 
 
 def _probe(size: int) -> int:
@@ -118,10 +128,7 @@ def _reads_position(tiled, value_specs, values, probe) -> bool:
     tile = jax.ShapeDtypeStruct(probe, jnp.float32)
     closed = jax.make_jaxpr(lambda ids, tiles, tile: tiled(ids, (), tiles, tile))(
         (jnp.int32(0), jnp.int32(0)), tiles, tile)
-    needed = {var for var in closed.jaxpr.outvars if isinstance(var, jax_core.Var)}
-    for equation in reversed(closed.jaxpr.eqns):
-        if needed.intersection(equation.outvars):
-            needed.update(var for var in equation.invars if isinstance(var, jax_core.Var))
+    needed = template._needed(closed.jaxpr, closed.jaxpr.outvars)
     return any(var in needed for var in closed.jaxpr.invars[:2])
 
 

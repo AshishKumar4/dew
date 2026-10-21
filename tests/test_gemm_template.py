@@ -14,7 +14,7 @@ from jax.experimental.pallas import fuser
 from jax.sharding import Mesh
 from reference_error import assert_as_exact
 
-from dew.nn.kernels import generation, grouped_matmul
+from dew.nn.kernels import generation, grouped_matmul, tuning
 from dew.nn.kernels.templates.gemm import fused, mosaic_gpu, template
 
 pytestmark = pytest.mark.kernel
@@ -555,3 +555,101 @@ def test_the_exact_mosaic_kernel_gradient_lowers_for_an_h100():
         for config in sorted(covering, key=repr):
             jax.jit(functools.partial(launch.replace(config=config), **options)).trace(*args).lower(
                 lowering_platforms=("cuda",))
+
+
+def selected(x, mask):
+    """A prologue keeping the rows an integer mask selects."""
+    return jnp.where(mask[:, None] > 0, x, jnp.zeros_like(x))
+
+
+def transposed_twice_nested(x, side):
+    """`shifted`, its transpose two jitted calls deep."""
+    return (_wide(x) + jax.jit(jax.jit(lambda s: s.T))(side)).astype(x.dtype)
+
+
+def test_an_fp32_product_above_the_default_precision_runs_xla():
+    """fp32 products are TF32 in the kernels, which only the default precision asks for: an explicit
+    'highest' runs XLA's portable program whatever the configured precision, the default the kernels."""
+    x, w = jnp.ones((64, DEPTH), jnp.float32), jnp.ones((1, DEPTH, WIDTH), jnp.float32)
+
+    def launches(precision):
+        program = jax.make_jaxpr(lambda x, w: template.gemm(x, w, jnp.asarray([64]), out_dtype=jnp.float32,
+                                                            precision=precision, interpret_on_cpu=True))(x, w)
+        return "pallas_call" in str(program)
+
+    with generation.assumed("sm80"), jax.default_matmul_precision("default"):
+        assert not launches("highest")
+        assert launches("default")
+
+
+def test_an_integer_side_operand_takes_no_gradient():
+    """A prologue selecting rows by an integer mask differentiates as JAX's plain program does: the
+    rows' gradient through the kernels, the mask's float0."""
+    x, w, *_ = _draw(5)
+    mask = jnp.asarray(np.arange(ROWS) % 3 == 0, jnp.int32)
+
+    def loss(x, *, interpret):
+        out = template.gemm(x, w, jnp.asarray(SIZES), prologue=selected,
+                            prologue_operands=((mask, ("rows",)),), out_dtype=jnp.float32,
+                            interpret_on_cpu=interpret)
+        return jnp.sum(out)
+
+    with generation.assumed("sm80"):
+        got = jax.jit(jax.grad(functools.partial(loss, interpret=True)))(x)
+        portable = jax.jit(jax.grad(functools.partial(loss, interpret=False)))(x)
+    np.testing.assert_array_equal(np.asarray(got, np.float32), np.asarray(portable, np.float32))
+
+
+@pytest.mark.parametrize("consumer", [lambda p, s: p * s, lambda p, s: (p.T * s).astype(jnp.bfloat16)],
+                         ids=["scalar", "transpose"])
+def test_a_consumer_the_kernels_cannot_tile_runs_after_the_product(consumer):
+    """A consumer of a captured scalar (no launch axis) or of the product transposed (its block not the
+    tile's) runs in XLA after the template's product, with the unfused program's value."""
+    x, w, *_ = _draw(6)
+    scale = jnp.asarray(1.5, jnp.float32)
+    sizes = jnp.asarray(SIZES)
+    with generation.assumed("sm80"):
+        def fusing(x, w, s):
+            return consumer(fused.fusible_gemm(x, w, sizes, interpret_on_cpu=True), s)
+
+        got = jax.jit(fuser.fuse(fusing))(x, w, scale)
+        want = jax.jit(lambda x, w, s: consumer(template.gemm(x, w, sizes, out_dtype=jnp.float32,
+                                                               interpret_on_cpu=True), s))(x, w, scale)
+    np.testing.assert_array_equal(np.asarray(got, np.float32), np.asarray(want, np.float32))
+
+
+def test_mosaic_reads_a_hooks_primitives_at_any_depth():
+    """A transpose two jitted calls deep is a primitive Mosaic GPU's lowering has no rule for: the
+    Hopper launch leaves the hook to Triton's."""
+    rows = 256
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    sizes = jax.ShapeDtypeStruct((2,), jnp.int32)
+    launch = grouped_matmul.MosaicTgmm()
+    with generation.assumed("sm90"):
+        ba = launch.bind(bf16((rows, DEPTH)), bf16((rows, WIDTH)), sizes,
+                         (jax.ShapeDtypeStruct((DEPTH, rows), jnp.float32),), out_dtype="float32",
+                         hooks=grouped_matmul.Hooks(transposed_twice_nested, (("depth", "rows"),)),
+                         interpret=False)
+        assert not launch.eligible(ba, generation.gpu_target())
+
+
+def test_a_broadcast_hooks_launch_stores_and_reads_back():
+    """A launch whose side operand has a dimension of one keeps its module-level hook and the dimension's
+    place as data: the launches a trace records store as JSON and read back."""
+    x, w, ms, nw, b, u, s, ct = _draw(7)
+    with generation.assumed("sm80"), tuning.seen() as launches:
+        jax.jit(_drop(_dew(CASES["broadcast axes"], interpret_on_cpu=True))).lower(x, w, ms, nw, b, u, s, ct)
+    hooked = [launch for launch in launches if launch.arguments.get("hooks", grouped_matmul.NO_HOOKS).prologue]
+    assert hooked
+    assert tuning.loads_launches(tuning.dumps_launches(hooked))
+
+
+def test_a_measured_launch_draws_its_integer_side_operands_as_operands():
+    """Measuring a launch draws group sizes for its group sizes alone: an integer side operand keeps its
+    own shape."""
+    bf16, int32 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16), functools.partial(
+        jax.ShapeDtypeStruct, dtype=jnp.int32)
+    specs = [bf16((128, 64)), bf16((2, 64, 64)), int32((2,)), int32((128,))]
+    arrays = grouped_matmul.Gmm().operands(specs, seed=0)
+    assert [a.shape for a in arrays] == [spec.shape for spec in specs]
+    assert int(jnp.sum(arrays[2])) == 128
