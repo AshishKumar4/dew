@@ -130,6 +130,11 @@ def test_flash_through_dews_attention_refuses_rows_it_would_misread(without_dete
                                              f"{name} {'packed' if packed else 'dense'}", terms=terms[index])
 
 
+SHARDED_SEEDS = 8
+"""The per-shard contract's declared draws (check 1, `sharded.assert_runs_per_shard`), sized by
+`seeds_for`: the fewest for which one device compared with itself resolves the factor."""
+
+
 def qkv(shape, seed=0):
     keys = jax.random.split(jax.random.PRNGKey(seed), 3)
     return tuple(jax.random.normal(key, shape, jnp.bfloat16) for key in keys)
@@ -408,15 +413,17 @@ def test_queries_packed_against_keys_of_their_own_lengths_attend_their_own_docum
 def test_flash_keeps_the_kernel_contract_on_a_mesh(axis, split, without_deterministic_ops):
     """FlashAttention-2 over rows split two ways, or query heads split two ways with the key heads
     they read, runs per shard (`sharded.assert_runs_per_shard`): the output and the three input
-    gradients within the float64 gate of one device's, no operand moved between devices and no
-    copy or transpose at the kernel's edge."""
+    gradients on par with one device's over the site's draws, no operand moved between devices and
+    no copy or transpose at the kernel's edge."""
     from jax.sharding import Mesh, PartitionSpec
     from sharded import assert_runs_per_shard
 
     flash_here()
-    query, _, _ = qkv((2, 256, 4, 64))
-    _, key, value = qkv((2, 256, 2, 64), seed=1)
-    cotangent = qkv((2, 256, 4, 64), seed=2)[0]
+
+    def draw(seed):
+        query, _, _ = qkv((2, 256, 4, 64), seed=3 * seed)
+        _, key, value = qkv((2, 256, 2, 64), seed=3 * seed + 1)
+        return query, key, value, qkv((2, 256, 4, 64), seed=3 * seed + 2)[0]
 
     def gradients(attend):
         def run(q, k, v, do):
@@ -425,14 +432,12 @@ def test_flash_keeps_the_kernel_contract_on_a_mesh(axis, split, without_determin
 
         return run
 
-    with jax.enable_x64(new_val=True):
-        wide = [jnp.asarray(np.asarray(x, np.float64)) for x in (query, key, value, cotangent)]
-        attend = jax.vmap(functools.partial(float64_attention, causal=True))
-        truth = jax.tree.map(np.asarray, gradients(attend)(*wide))
     spec = PartitionSpec(*(axis if dim in split else None for dim in range(3)))
     mesh = Mesh(np.asarray(jax.devices()[:2]), (axis,))
     flash = functools.partial(scaled_dot_product_attention, implementation='flash', causal=True)
-    assert_runs_per_shard(gradients(flash), (query, key, value, cotangent), [spec] * 4, mesh, truth)
+    assert_runs_per_shard(gradients(flash), draw, [spec] * 4, mesh, f"flash split over {axis}",
+                          seeds=SHARDED_SEEDS,
+                          truth_fn=gradients(jax.vmap(functools.partial(float64_attention, causal=True))))
 
 
 @on_gpu
