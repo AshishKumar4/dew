@@ -778,8 +778,21 @@ class Coverage:
     over: list[str]
 
 
-def _interpreted(function, inputs) -> tuple[list[Bounded], dict[str, int]]:
-    closed = jax.make_jaxpr(function)(*inputs)
+UNTRACEABLE = (jax.errors.ConcretizationTypeError, jax.errors.TracerArrayConversionError,
+               jax.errors.TracerBoolConversionError, jax.errors.TracerIntegerConversionError)
+"""A function that reads its arguments' values in Python is no program to interpret: its elements
+are not certified, and named so."""
+
+
+def _interpreted(function, inputs, outputs: list[np.ndarray]) -> tuple[list[Bounded], dict[str, int]]:
+    """`function`'s program interpreted at `inputs`; where it cannot be traced, its `outputs` (as it ran)
+    each not certified, the cause named."""
+    try:
+        closed = jax.make_jaxpr(function)(*inputs)
+    except UNTRACEABLE as error:
+        name = f"not a traceable program ({type(error).__name__})"
+        return [Bounded(out, np.zeros(out.shape), *(np.zeros(out.shape, bool) for _ in range(2)))
+                for out in outputs], {name: sum(int(out.size) for out in outputs)}
     interpreter = Interpreter()
     return interpreter.run(closed, *jax.tree_util.tree_leaves(inputs)), interpreter.blocked
 
@@ -806,12 +819,12 @@ def zero_elements(dew_fn, reference_fn, inputs, label: str, truth_fn=None) -> Co
     the truth's are certified and each reproduces its native execution bit for bit, held to
     `|dew - truth| <= e + τ`; `inputs` the tuple of the functions' arguments. Its coverage; an element
     past its bound is listed in `over`."""
-    mine, blocked = _interpreted(dew_fn, inputs)
     native = [np.asarray(out) for out in jax.tree_util.tree_leaves(dew_fn(*inputs))]
+    mine, blocked = _interpreted(dew_fn, inputs, native)
     with jax.enable_x64(new_val=True):
         wide = jax.tree.map(_widened, inputs)
-        truths, blocked_truth = _interpreted(truth_fn or reference_fn, wide)
         executed = [np.asarray(out) for out in jax.tree_util.tree_leaves((truth_fn or reference_fn)(*wide))]
+        truths, blocked_truth = _interpreted(truth_fn or reference_fn, wide, executed)
     causes = {"Dew's interpretation not certified": 0, "the truth's interpretation not certified": 0,
               "Dew's execution not the interpretation": 0, "the truth's execution not the interpretation": 0}
     certified = 0

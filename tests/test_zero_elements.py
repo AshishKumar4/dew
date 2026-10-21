@@ -457,3 +457,12 @@ def test_a_branch_rounding_decides_is_not_certified_and_a_decided_one_is():
 
     out, _ = _interpreted(decided, *inputs)
     assert out.certified.all() and out.exact.all()
+
+
+def test_a_function_that_reads_its_arguments_in_python_is_named_and_not_certified():
+    def numpy_side(x):
+        return {"y": jnp.asarray(np.asarray(x) * 0)}
+
+    coverage = zero_elements(numpy_side, numpy_side, (jnp.ones(3, jnp.float32),), "numpy")
+    assert (coverage.certified, coverage.uncertified, coverage.over) == (0, 3, [])
+    assert any(name.startswith("not a traceable program") for name in coverage.blocked)
