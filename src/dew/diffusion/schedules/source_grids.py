@@ -53,16 +53,19 @@ class TabulatedVP(DiscreteNoiseScheduler):
         self.stride = stride
 
     def rates(self, t):
-        t = jnp.asarray(t, jnp.float32)
-        index = jnp.clip(t.astype(jnp.int32), 0, self.T - 1)
-        return (jnp.where(t < 0, self.final_rates[0], rows_taken(self.sqrt_alpha_cumprod, index)),
-                jnp.where(t < 0, self.final_rates[1], rows_taken(self.sqrt_one_minus_alpha_cumprod, index)))
+        return self._tabulated(t, self.final_rates, self.sqrt_alpha_cumprod,
+                               self.sqrt_one_minus_alpha_cumprod)
 
     def variances(self, t):
+        return self._tabulated(t, self.final_variances, self.alpha_cumprod, self.one_minus_alpha_cumprod)
+
+    def _tabulated(self, t, final, signal, noise):
+        """The tables' rows at each time's step, read where the time is (`rows_taken`), and `final`'s
+        pair past the grid's last step (a negative time)."""
         t = jnp.asarray(t, jnp.float32)
         index = jnp.clip(t.astype(jnp.int32), 0, self.T - 1)
-        return (jnp.where(t < 0, self.final_variances[0], rows_taken(self.alpha_cumprod, index)),
-                jnp.where(t < 0, self.final_variances[1], rows_taken(self.one_minus_alpha_cumprod, index)))
+        return (jnp.where(t < 0, final[0], rows_taken(signal, index)),
+                jnp.where(t < 0, final[1], rows_taken(noise, index)))
 
     def model_time(self, t):
         return jnp.maximum(jnp.asarray(t, jnp.float32), 0.0)
