@@ -304,7 +304,7 @@ def test_a_distilled_inpainting_step_reads_no_draw_of_its_attempt():
     from test_autoencoder import tiny_vae
 
     from dew.diffusion.process import DenoisingCondition
-    from dew.objectives.diffusion import GuidanceDistillationObjective
+    from dew.objectives.diffusion import DiffusionObjective, GuidanceDistillationObjective
 
     @dataclass(frozen=True, eq=False)
     class GuidedText(StubText):
@@ -322,9 +322,13 @@ def test_a_distilled_inpainting_step_reads_no_draw_of_its_attempt():
 
     text = {"textcontext": Condition(GuidedText.from_pretrained("stub"))}
     inputs = InputSpec(Field("image", (8, 8, 3)), text, mask=Field("mask", (8, 8, 1)))
+    autoencoder = tiny_vae()
+    # The teacher is the model a plain run of it starts from, which the student starts as.
+    started = DiffusionObjective(GuidedInpainting(), presets.Flow()(), inputs, autoencoder=autoencoder,
+                                 ema_decay=None).init(jax.random.PRNGKey(3))
     objective = GuidanceDistillationObjective(GuidedInpainting(), presets.Flow()(), inputs,
-                                              autoencoder=tiny_vae(), scales=(1.0, 6.0), ema_decay=None,
-                                              unconditional_prob=0.5)
+                                              autoencoder=autoencoder, scales=(1.0, 6.0), ema_decay=None,
+                                              unconditional_prob=0.5, variables=started)
     params = objective.init(jax.random.PRNGKey(0))
     rows = 4
     mask = np.zeros((rows, 8, 8, 1), np.float32)
