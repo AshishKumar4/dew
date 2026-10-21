@@ -29,7 +29,9 @@ a power-of-two ladder of TMA stores. Changed for Dew, each marked `# Dew:`:
 - each writes the output dtype it is asked for (fp32 for a kernel gradient), not the operands';
 - `tgmm` zeroes the neighbouring groups' rows of both operands by selection, where upstream
   multiplied one operand by a mask, which kept a neighbour's NaN or infinity (NaN * 0);
-- the program count is the device's multiprocessors, where `ragged_dot` fixed an H100 SXM's 132.
+- the program count is the device's multiprocessors, where `ragged_dot` fixed an H100 SXM's 132;
+- `tgmm`'s shared-memory tiling and swizzle are the warpgroup lowering's inference, as `gmm`'s are
+  upstream, where upstream stated them with transforms whose type JAX leaves abstract.
 
 Each sums exact products of its 16-bit operands in fp32 (wgmma's accumulator) and rounds once to the
 output dtype.
@@ -113,7 +115,7 @@ def _compiler_params():
 
 
 def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles, transpose_rhs: bool,
-        out_dtype, multiprocessors: int, interpret=False) -> jax.Array:
+        out_dtype, multiprocessors: int, interpret: bool | plgpu.InterpretGPUParams = False) -> jax.Array:
     """Each group's rows of `lhs` `[rows, depth]` times its matrix of `rhs`, `[groups, depth, width]` or
     with `transpose_rhs` `[groups, width, depth]`: `[rows, width]` in `out_dtype`, the rows past the
     routed ones zero. The depth must divide by `tiles.block_k` and the width by `tiles.block_n`."""
@@ -199,7 +201,7 @@ def _store_rows(o_smem, o_gmem, group_info: GroupInfo, smem_start, rows: int, co
 
 
 def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles, out_dtype,
-         multiprocessors: int, interpret=False) -> jax.Array:
+         multiprocessors: int, interpret: bool | plgpu.InterpretGPUParams = False) -> jax.Array:
     """Each group's rows of `lhs` `[rows, depth]` transposed times its rows of `rhs` `[rows, width]`:
     `[groups, depth, width]` in `out_dtype`, an empty group's zero. The depth must divide by
     `tiles.block_m` and the width by `tiles.block_n`; `tiles.block_k` is the rows a step takes."""
@@ -217,13 +219,7 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles
     group_block_ends = -(group_ends // -block_k) * block_k
     group_num_blocks = (group_block_ends - group_block_starts) // block_k
 
-    swizzle = plgpu.find_swizzle(block_k * jnp.dtype(lhs.dtype).itemsize * 8)
-    swizzle_elems = swizzle // jnp.dtype(lhs.dtype).itemsize
-    transforms = (plgpu.TilingTransform((8, swizzle_elems)), plgpu.SwizzleTransform(swizzle))
     out_dtype = jnp.dtype(out_dtype)
-    out_swizzle = plgpu.find_swizzle(block_n * out_dtype.itemsize * 8)
-    out_transforms = (plgpu.TilingTransform((8, out_swizzle // out_dtype.itemsize)),
-                      plgpu.SwizzleTransform(out_swizzle))
 
     def body(group_sizes_gmem, group_starts_gmem, group_ends_gmem, group_num_blocks_gmem,
              group_block_starts_gmem, lhs_gmem, rhs_gmem, o_gmem):
@@ -272,9 +268,9 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles
                         grid=(group_num_blocks_gmem[g_i],),
                         in_specs=[
                             plgpu.BlockSpec((block_k, block_m), lambda k_i: (k_i, m_i),
-                                            delay_release=int(tiles.stages > 1), transforms=transforms),
+                                            delay_release=int(tiles.stages > 1)),
                             plgpu.BlockSpec((block_k, block_n), lambda k_i: (k_i, n_i),
-                                            delay_release=int(tiles.stages > 1), transforms=transforms),
+                                            delay_release=int(tiles.stages > 1)),
                         ],
                         max_concurrent_steps=tiles.stages,
                     )(lhs_gmem.at[gmem_slice, :], rhs_gmem.at[gmem_slice, :])
@@ -283,9 +279,8 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles
 
             acc = pl.run_scoped(acc_scope, plgpu.ACC((block_m, block_n)))
 
-            # Dew: the output in its own dtype and swizzle, an fp32 gradient above all.
-            @functools.partial(pl.run_scoped, o_smem=plgpu.SMEM((block_m, block_n), dtype=o_gmem.dtype,
-                                                                transforms=out_transforms))
+            # Dew: the output in its own dtype, an fp32 gradient above all.
+            @functools.partial(pl.run_scoped, o_smem=plgpu.SMEM((block_m, block_n), dtype=o_gmem.dtype))
             def store_scope(o_smem):
                 o_smem[...] = acc.astype(o_smem.dtype)
                 plgpu.commit_smem()

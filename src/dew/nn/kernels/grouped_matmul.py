@@ -21,6 +21,7 @@ import dataclasses
 import functools
 import itertools
 import math
+from collections.abc import Hashable
 from typing import ClassVar
 
 import jax
@@ -152,7 +153,7 @@ def _sizes(specs: list[jax.ShapeDtypeStruct], seed: int, rows: int) -> jax.Array
     return jnp.asarray(sizes)
 
 
-class _GroupedLaunch(base.Template):
+class _GroupedLaunch[Config: Hashable](base.Template[Config]):
     """A grouped launch: its space is a declared tuple, its group sizes drawn as a step routes them."""
     # Annotations stay evaluated (no postponed annotations in this module):
     # tokamax serializes a launch's arguments into the program by their types.
@@ -164,7 +165,7 @@ class _GroupedLaunch(base.Template):
                 for spec, array in zip(specs, arrays, strict=True)]
 
 
-class _Triton(_GroupedLaunch):
+class _Triton(_GroupedLaunch[Tile]):
     """JAX's Pallas Triton kernels (`ragged_dot`), on every CUDA GPU from sm80, and on a CPU where the
     call interprets them."""
     name: ClassVar[str] = 'triton'
@@ -308,7 +309,7 @@ class Tgmm(_Triton):
                                out_dtype=jnp.dtype(out_dtype)), None
 
 
-class _Mosaic(_GroupedLaunch):
+class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
     """JAX's Pallas Mosaic GPU kernels (`templates.gemm.mosaic_gpu`): Hopper's warpgroup MMA, one 16-bit
     dtype, and widths the space's tiles divide. Each runs one warpgroup a multiprocessor, persistent over
     the output tiles in a planar snake, so the rows a band of `grid_block_n` column tiles shares and the
@@ -329,21 +330,27 @@ class _Mosaic(_GroupedLaunch):
         return (config.stages * (config.block_m + config.block_n) * config.block_k * size
                 + config.block_m * config.block_n * out)
 
-    def _cost(self, ba, config: mosaic_gpu.Tiles, target, items: float, steps: float, moved: float) -> float:
-        """`items` output tiles of `steps` contraction steps each, `moved` device bytes."""
+    def _cost(self, ba, config: mosaic_gpu.Tiles, target, tiles: float, steps: float, moved: float) -> float:
+        """`tiles` output tiles of `steps` contraction steps each, `moved` device bytes."""
         size = jnp.dtype(ba.arguments['tokens'].dtype).itemsize
         out = jnp.dtype(ba.arguments['out_dtype']).itemsize
         # Each step's blocks are written by TMA and read once by the warpgroup's MMA.
         staged = steps * 2 * (config.block_m + config.block_n) * config.block_k * size
         return cost.seconds(cost.Cost(
-            programs=items, device_bytes=moved,
+            programs=tiles, device_bytes=moved,
             program_flops=2 * steps * config.block_m * config.block_n * config.block_k,
             program_staged=staged + config.block_m * config.block_n * out,
             mode=_mode(ba.arguments['tokens'].dtype)), target)
 
     def _multiprocessors(self, interpret: bool) -> int:
         # The interpreter runs one block (jax/_src/pallas/mosaic_gpu/interpret).
-        return 1 if interpret else generation.gpu_target().multiprocessors
+        if interpret:
+            return 1
+        target = generation.gpu_target()
+        if target.multiprocessors is None:
+            raise ValueError(f"{target.generation} states no multiprocessors, which the persistent "
+                             "Mosaic GPU launches spread their tiles over")
+        return target.multiprocessors
 
 
 @dataclasses.dataclass(frozen=True)
