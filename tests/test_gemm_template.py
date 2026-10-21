@@ -539,7 +539,8 @@ def test_exact_sums_go_to_fp32_outputs_at_a_precision_above_the_default():
                             interpret=False)
         assert launch.eligible(exact, target)
         kept = launch.fitting(exact, target)
-        assert kept and all(2 * tile.block_m * tile.block_n // 128 < 255 for tile in kept)
+        # Two accumulators a consumer warpgroup: its 128 threads hold its share of the tile's columns.
+        assert kept and all(2 * tile.block_m * tile.block_n // (128 * tile.warpgroups) < 255 for tile in kept)
         assert set(kept) < set(launch.fitting(plain, target))
         # Triton's kernel gradient with exact sums takes at most EXACT_STEP rows a step.
         triton = grouped_matmul.Tgmm()
