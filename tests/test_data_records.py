@@ -197,7 +197,7 @@ def test_fitted_reads_training_and_validation_with_the_runs_data_seed():
     """A chain with a random step, fitted for a run under two data seeds: the training draws and
     the validation draws each follow the seed, and the same seed draws the same."""
     from dew.data.compile import fitted
-    from dew.objectives.base import ObjectiveData
+    from dew.data.pipeline import ObjectiveData
 
     def draws(seed):
         chain = _documents().map(Tagged(1)).random_map(Drawn()).batch(2).workers(0)
