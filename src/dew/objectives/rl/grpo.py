@@ -16,7 +16,6 @@ perplexity, since a validation pass never samples.
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import replace
 from typing import NamedTuple
 
 import jax
@@ -163,6 +162,9 @@ class GRPOObjective(TokenScorer):
     """Rollout/packing geometry is supplied by its own objective count, not inherited LM rows."""
 
     keeps_whole_logits = False
+
+    scored_fields = (PROMPT_KEY, LENGTH_KEY)
+    """Validation scores the prompts alone, for their perplexity under the policy."""
 
     def __init__(self, model, seq_len: int, beta: float = 0.0,
                  epsilon_low: float = 0.2, epsilon_high: float = 0.2,
@@ -360,12 +362,6 @@ class GRPOObjective(TokenScorer):
         return Ratio(self.row_mean(scores.losses * scores.weights, batch).total,
                      self.row_mean(scores.weights, batch).total), scores
 
-    def evaluate(self, params, batch, step):
-        """Return the per-token scores of the prompts under the policy, for their perplexity,
-        compiled for the current modules over the prompts alone (`_evaluation_scores`)."""
-        prompts = {PROMPT_KEY: batch[PROMPT_KEY], LENGTH_KEY: batch[LENGTH_KEY]}
-        return self._compiled_scores(self.evaluation_variables(params, step), prompts,
-                                     replace(step, ema=None))
 
     def _evaluation_scores(self, params, batch, step) -> TokenScores:
         """The prompts' per-token scores.
