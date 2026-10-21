@@ -336,6 +336,40 @@ def test_a_wide_parameter_computes_as_its_fp32_value_and_its_gradient_returns_wi
     np.testing.assert_array_equal(np.asarray(grads[0].query), np.asarray(grads[1].query))
 
 
+def test_an_integer_parameter_keys_and_runs():
+    """A hook reading an int32 key parameter (a bucket's low bit) keys its launches at that dtype and
+    runs, forward and backward, on par with the reference arithmetic from float64."""
+    case = CASES["causal-window"]
+    queries, keys = geometry(case)
+    spans = template.spans(queries, keys, ROWS, **arguments(case))
+    buckets = jnp.broadcast_to(jnp.arange(keys, dtype=jnp.int32), (ROWS, 4, keys))
+
+    def score_mod(s, q_pos, k_pos, bucket):
+        return s + (bucket & 1).astype(s.dtype)
+
+    hooks = template.Hooks(score_mod, (template.Param(buckets, template.Kind.KEY),))
+    draw_qkv = drawing(queries, keys, jnp.float32)
+
+    def draw(seed):
+        query, key, value = draw_qkv(seed)
+        return query, key, value, jax.random.normal(jax.random.key(seed + 1000), query.shape, jnp.float32)
+
+    pins = tuning.pinned({attention_triton.TritonForward: PINNED[1],
+                          attention_triton.TritonBackward: joint(PINNED[0])})
+
+    def ours(query, key, value, dout):
+        with pins:
+            out = attention_triton.forward(query, key, value, spans, hooks, interpret=not ON_GPU)
+            grads = attention_triton.backward(query, key, value, spans, hooks, dout, interpret=not ON_GPU)
+        return out, grads.query, grads.key, grads.value
+
+    def xla(query, key, value, dout):
+        out, pull = jax.vjp(lambda q, k, v: template.reference(q, k, v, spans, hooks), query, key, value)
+        return out, *pull(dout)
+
+    assert_as_exact(jax.jit(ours), jax.jit(xla), draw, "triton integer parameter", seeds=SEEDS)
+
+
 def test_an_fp16_weight_too_small_once_normalized_still_reaches_dv():
     """fp16, one query over keys whose third weight is about 5.3e-8 before its denominator of 2 and
     2.7e-8 after it, which fp16's least subnormal (6e-8) holds only before: dV's third row takes it, as
@@ -367,10 +401,11 @@ def test_the_backward_is_on_par_at_head_widths_padded_to_powers_of_two(width, va
 
 
 @pytest.mark.gpu(reason="every config compiles for the GPU")
-@pytest.mark.parametrize("config", attention_triton.SPACE, ids=str)
+@pytest.mark.parametrize("config", attention_triton.BACKWARD_SPACE, ids=str)
 def test_every_backward_config_on_a_gpu(config):
     """Every config of the backward's space, bf16, causal documents under a window, a softcap, sinks and
     ALiBi."""
-    other = attention_triton.Tiles(config.block_q, config.block_k, 12 - config.warps, 5 - config.stages)
-    check_backward(CASES["causal-documents-window"], SCORE_HOOKS["softcap-sinks-alibi"], jnp.bfloat16, config,
-                   other)
+    tiles = attention_triton.Tiles
+    check_backward(CASES["causal-documents-window"], SCORE_HOOKS["softcap-sinks-alibi"], jnp.bfloat16,
+                   tiles(config.block_q, config.block_k, config.dq_warps, config.dq_stages),
+                   tiles(config.block_q, config.block_k, config.dkv_warps, config.dkv_stages))

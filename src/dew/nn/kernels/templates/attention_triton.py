@@ -82,21 +82,43 @@ TRACED_TILE = 16
 """The tile a hook is traced at for its picks' key (`_hook_program`)."""
 
 
-def _hook_program(name: str, hook, kinds: tuple[Kind, ...]) -> str | None:
+def _kept_dtype(dtype) -> str:
+    """A hook parameter's dtype in the kernels: fp32 for a floating one (`_padded`), else its own."""
+    return "float32" if jnp.issubdtype(dtype, jnp.floating) else jnp.dtype(dtype).name
+
+
+def _hook_program(name: str, hook, kinds: tuple[Kind, ...], dtypes: tuple[str, ...], *,
+                  differentiated: bool = False) -> str | None:
     """What a score or output hook computes, as its launch's picks key it (`tuning.program`): traced at
     a `TRACED_TILE` square fp32 tile, the entries' indices and each parameter as its kind lays it out
-    there. None or an already traced key as it is."""
+    there, in its dtype in the kernels (`dtypes`); `differentiated`, its pullback too, so a hook whose
+    derivative is its own rule (`jax.custom_vjp`) keys by that rule. None or an already traced key as
+    it is."""
     if hook is None or isinstance(hook, str):
         return hook
     tile = TRACED_TILE
     layouts = {Kind.HEAD: (), Kind.QUERY: (tile, 1), Kind.KEY: (1, tile), Kind.TILE: (tile, tile),
                Kind.OUTPUT: (tile, tile)}
-    params = [jax.ShapeDtypeStruct(layouts[kind], jnp.float32) for kind in kinds]
+    params = [jax.ShapeDtypeStruct(layouts[kind], dtype) for kind, dtype in zip(kinds, dtypes, strict=True)]
     square = jax.ShapeDtypeStruct((tile, tile), jnp.float32)
     if name == "output_mod":
         return tuning.program(hook, square, *params)
-    return tuning.program(hook, square, jax.ShapeDtypeStruct((tile, 1), jnp.int32),
-                          jax.ShapeDtypeStruct((1, tile), jnp.int32), *params)
+    positions = (jax.ShapeDtypeStruct((tile, 1), jnp.int32), jax.ShapeDtypeStruct((1, tile), jnp.int32))
+    if not differentiated:
+        return tuning.program(hook, square, *positions, *params)
+    floating = [index for index, param in enumerate(params) if jnp.issubdtype(param.dtype, jnp.floating)]
+
+    def pulled(s, q_pos, k_pos, *values):
+        def scored(s, *wide):
+            merged = list(values)
+            for index, value in zip(floating, wide, strict=True):
+                merged[index] = value
+            return hook(s, q_pos, k_pos, *merged)
+
+        out, pull = jax.vjp(scored, s, *(values[index] for index in floating))
+        return out, pull(jnp.ones_like(out))
+
+    return tuning.program(pulled, square, *positions, *params)
 
 
 def _spanned(specs: list[jax.ShapeDtypeStruct], arrays: list[jax.Array]) -> list[jax.Array]:
@@ -209,6 +231,8 @@ class TritonForward(Template[Tiles]):
     output_mod: Callable | None = None
     score_kinds: tuple[Kind, ...] = ()
     output_kinds: tuple[Kind, ...] = ()
+    score_dtypes: tuple[str, ...] = ()
+    output_dtypes: tuple[str, ...] = ()
     scale: float = 1.0
 
     def _fwd(self, query, key, value, start, end, query_ids, key_ids, score_params, output_params, m0, total0,
@@ -274,18 +298,21 @@ class TritonForward(Template[Tiles]):
     def cost(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget) -> float:
         """Every key tile of the call (a bound: the spans are traced, so a sparse call visits fewer),
         each staging its key and value tiles once and taking a `block_q` by `block_k` product of the
-        queries with the keys and of the weights with the values, and as many exponentials; the
-        operands read once, the output written once in their dtype and the residuals in fp32."""
+        queries with the keys and of the weights with the values, and as many exponentials; its inputs
+        read once, the output written once in their dtype and the residuals in fp32."""
         query, key, value = (ba.arguments[name] for name in ("query", "key", "value"))
         batch, queries, heads, width = query.shape
         keys, value_width = key.shape[1], value.shape[-1]
         tiles = keys // config.block_k
         size = jnp.dtype(query.dtype).itemsize
         rows = 2 * batch * heads * queries * 4 if ba.arguments.get("residuals") else 0
+        # Every array it reads at its dtype (operands, spans, hook parameters, initial state), and the
+        # output and residuals it writes.
+        read = sum(leaf.size * jnp.dtype(leaf.dtype).itemsize for leaf in jax.tree.leaves(dict(ba.arguments))
+                   if hasattr(leaf, "dtype"))
         return costs.seconds(costs.Cost(
             programs=batch * heads * (queries // config.block_q),
-            device_bytes=(query.size + key.size + value.size + batch * queries * heads * value_width) * size
-            + rows,
+            device_bytes=read + batch * queries * heads * value_width * size + rows,
             program_flops=tiles * 2.0 * config.block_q * config.block_k * (width + value_width),
             program_staged=float(config.block_q * width * size
                                  + tiles * config.block_k * (width + value_width) * size),
@@ -299,7 +326,9 @@ class TritonForward(Template[Tiles]):
         return _spanned(specs, super().operands(specs, seed))
 
     def traced(self, name: str, value: object) -> object:
-        return _hook_program(name, value, self.output_kinds if name == "output_mod" else self.score_kinds)
+        if name == "output_mod":
+            return _hook_program(name, value, self.output_kinds, self.output_dtypes)
+        return _hook_program(name, value, self.score_kinds, self.score_dtypes)
 
 
 def _param_spec(kind: Kind, param: jax.Array, block_q: int, keys: int) -> pl.BlockSpec:
@@ -406,6 +435,8 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
     op = TritonForward(score_mod=hooks.score_mod, output_mod=hooks.output_mod,
                        score_kinds=tuple(param.kind for param in hooks.score_params),
                        output_kinds=tuple(param.kind for param in hooks.output_params),
+                       score_dtypes=tuple(_kept_dtype(param.value.dtype) for param in hooks.score_params),
+                       output_dtypes=tuple(_kept_dtype(param.value.dtype) for param in hooks.output_params),
                        scale=query.shape[3] ** -0.5 if scale is None else scale)
     out = op(call.query, call.key, call.value, call.start, call.end, call.query_ids, call.key_ids,
              call.score_params, call.output_params, m0, total0, acc0, residuals=residuals,
@@ -706,6 +737,7 @@ class TritonBackward(Template[BackwardTiles]):
     config_cls = BackwardTiles
     score_mod: Callable | None = None
     score_kinds: tuple[Kind, ...] = ()
+    score_dtypes: tuple[str, ...] = ()
     scale: float = 1.0
 
     def _fwd(self, query, key, value, dout, peak, total, initial_term, start, end, query_ids, key_ids,
@@ -746,7 +778,7 @@ class TritonBackward(Template[BackwardTiles]):
         return _spanned(specs, super().operands(specs, seed))
 
     def traced(self, name: str, value: object) -> object:
-        return _hook_program(name, value, self.score_kinds)
+        return _hook_program(name, value, self.score_kinds, self.score_dtypes, differentiated=True)
 
 
 def _launch_cost(ba: tokamax.BoundArguments, config: BackwardTiles, target: generation.GpuTarget,
@@ -773,6 +805,8 @@ def _launch_cost(ba: tokamax.BoundArguments, config: BackwardTiles, target: gene
     else:
         programs, tiles = batch * heads * (keys // config.block_k), queries // config.block_q
         products, exponentials = 2 * width + 2 * value_width, 1
+        # Its row statistics are the dQ launch's four outputs, one more than that launch's inputs.
+        read += 4 * batch * heads * queries
         walked = config.block_q * (width + value_width)
         written = 4 * batch * keys * heads * (width + value_width)
         written += 4 * sum(param.size for param, kind in zip(ba.arguments["score_params"], kinds, strict=True)
@@ -965,7 +999,8 @@ def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
     operands = (call.query, call.key, call.value, padded_dout)
     rows = (call.start, call.end, call.query_ids, call.key_ids, call.score_params)
     kinds = tuple(param.kind for param in hooks.score_params)
-    outputs = TritonBackward(score_mod=hooks.score_mod, score_kinds=kinds, scale=scale)(
+    dtypes = tuple(_kept_dtype(param.value.dtype) for param in hooks.score_params)
+    outputs = TritonBackward(score_mod=hooks.score_mod, score_kinds=kinds, scale=scale, score_dtypes=dtypes)(
         *operands, *(call.rows(start) for start in starts), *rows, interpret=interpret)
     dq, softmax = outputs[0], outputs[1:6]
     grads_out = list(outputs[6:])
