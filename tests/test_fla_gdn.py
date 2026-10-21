@@ -33,9 +33,10 @@ pytestmark = pytest.mark.kernel
 
 INTERPRETED = jax.default_backend() != "gpu"
 
-SHARDED_SEEDS = 8
-"""The per-shard contract's declared draws (check 1, `sharded.assert_runs_per_shard`), sized by
-`seeds_for`: the fewest for which one device compared with itself resolves the factor."""
+SHARDED_SEEDS = {False: 64, True: 8}
+"""The per-shard contract's declared draws (check 1, `sharded.assert_runs_per_shard`) with a decay per
+head and per key dimension, sized by `seeds_for`: the fewest for which one device compared with itself
+resolves the factor."""
 
 
 def relative(got, want) -> float:
@@ -861,7 +862,7 @@ def test_the_port_keeps_the_kernel_contract_on_a_mesh(axis, split, per_key):
     mesh = Mesh(np.asarray(jax.devices()[:2]), (axis,))
     assert_runs_per_shard(through(fla_rule, do, every), draw, [spec] * 5, mesh,
                           f"fla rule split over {axis}, {'per key' if per_key else 'per head'}",
-                          seeds=SHARDED_SEEDS, truth_fn=exact)
+                          seeds=SHARDED_SEEDS[per_key], truth_fn=exact)
 
 
 @pytest.mark.gpu(reason="the port's kernels lower to Triton calls only on a GPU")
