@@ -6,8 +6,6 @@ kernel as the gather reads it; and a pool nobody hands out refuses to alias
 rows.
 """
 
-
-
 import jax
 import jax.numpy as jnp
 import numpy as np
