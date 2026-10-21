@@ -71,7 +71,6 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import deepseek_v41_reference as v41
 from decoder_export_reference import lower_index_ties
-from reference_releases import require
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -293,6 +292,8 @@ def transformers_logits(directory: Path, ids: torch.Tensor, dtype: torch.dtype):
 
 
 def write(seed: int):
+    from reference_releases import require
+
     from dew.interop.safetensors_io import write_file
 
     pins = require("transformers")

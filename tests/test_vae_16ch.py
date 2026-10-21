@@ -44,16 +44,18 @@ def autoencoder():
     return StableDiffusionVAE(str(TINY), dtype=np.float32)
 
 
-@pytest.mark.parametrize(("walk", "given", "output"), [("encode_batch", "sample", "latent"),
-                                                      ("decode_batch", "latent", "decoded")])
-def test_each_walk_matches_the_reference(autoencoder, walk, given, output):
+@pytest.mark.parametrize(("walk", "given", "output", "what"), [
+    ("encode_batch", "sample", "latent", "latent"),
+    ("decode_batch", "latent", "decoded", "reconstruction"),
+], ids=("encode", "decode"))
+def test_each_walk_matches_the_reference(autoencoder, walk, given, output, what):
     """The encoder's posterior mean from the reference's pixels, before the latent normalization
     the seam applies, and the decoder's reconstruction of the reference's latent."""
     expected = reference()
     result = getattr(autoencoder, walk)(autoencoder.params, np.asarray(expected[given], np.float32))
 
     difference = largest_difference(result, expected[output])
-    assert difference < TOLERANCE, f"max |{output} difference| {difference:.3e}"
+    assert difference < TOLERANCE, f"max |{what} difference| {difference:.3e}"
 
 
 def test_the_normalized_latent_round_trips(autoencoder):
