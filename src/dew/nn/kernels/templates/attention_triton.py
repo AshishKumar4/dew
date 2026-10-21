@@ -199,8 +199,7 @@ def _forward_kernel(*refs, form: str, keys: int, ids: bool, score_kinds: tuple[K
     def step(index, carry):
         acc, peak, total = carry
         tile = pl.ds(index * block_k, block_k)
-        key, value = key_ref[tile, :], value_ref[tile, :]
-        logits = _dot(query, key.T, interpret) * (scale * LOG2E if base2 else scale)
+        logits = _dot(query, key_ref[tile, :].T, interpret) * (scale * LOG2E if base2 else scale)
         k_pos = index * block_k + jnp.arange(block_k)[None, :]
         if score_mod is not None:
             params = [_tile_param(ref, kind, head, q_pos, tile) for ref, kind in zip(score_refs, score_kinds,
@@ -223,8 +222,11 @@ def _forward_kernel(*refs, form: str, keys: int, ids: bool, score_kinds: tuple[K
         power = jnp.exp2 if base2 else jnp.exp
         correction = power(peak - safe)
         weights = power(logits - safe[:, None])
+        total = correction * total + weights.sum(axis=-1)
+        # The values load after the softmax, where jax's mha loads them.
+        value = value_ref[tile, :]
         acc = correction[:, None] * acc + _dot(weights.astype(value.dtype), value, interpret)
-        return acc, new_peak, correction * total + weights.sum(axis=-1)
+        return acc, new_peak, total
 
     width = value_ref.shape[-1]
     if initial:
