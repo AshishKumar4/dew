@@ -129,8 +129,11 @@ def _slots(stated: Mapping[str, object]) -> dict[str, int]:
 
 @dataclass(frozen=True)
 class ParseExample:
+    """A row of an example's fields as its `Example`, or a row that holds its `Example` already as it is."""
+
     def __call__(self, row: Mapping[str, object]) -> Mapping[str, object]:
-        return {"example": Example.of(row)}
+        held = row.get("example")
+        return {"example": held if isinstance(held, Example) else Example.of(row)}
 
 
 @dataclass(frozen=True)
