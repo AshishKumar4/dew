@@ -27,6 +27,7 @@ import pytest
 from affine_run import BATCH, FEATURES, Counting, Features, Regression, Spread, dataset, raw_leaf, val_batches
 from recording import Preempting, RecordingTracker
 from steady_state import steady_state
+from token_support import write_token_corpus
 
 from dew import position
 from dew.artifacts import Representations
@@ -612,9 +613,7 @@ def test_overlapping_token_windows_resume_in_a_fresh_trainer_bit_exactly(tmp_pat
     from dew.data.dataset import Forwarding
     from dew.data.sources.tokens import TokenFiles
 
-    tokens = np.arange(29, dtype=np.uint16)
-    tokens.tofile(tmp_path / "train.bin")
-    tokens.tofile(tmp_path / "val.bin")
+    corpus = write_token_corpus(tmp_path / "tokens", np.arange(29))
 
     class WindowsRegression(Regression):
         def loss(self, variables, batch, step):
@@ -640,7 +639,7 @@ def test_overlapping_token_windows_resume_in_a_fresh_trainer_bit_exactly(tmp_pat
             self._source.set_state(state)
 
     def dataset(seen):
-        windows = TokenFiles(str(tmp_path)).pipe(presets.token_windows, seq_len=4, batch=BATCH, stride=1)
+        windows = TokenFiles(corpus.train).pipe(presets.token_windows, seq_len=4, batch=BATCH, stride=1)
         windows = windows.read("memory").loading(Loading(workers=0, threads=1, read_buffer=1))
         data = compile(windows, seed=7)
         return dataclasses.replace(data, train=lambda partition: Observed(data.train(partition), seen))
@@ -691,14 +690,9 @@ def test_a_cuda_lm_repeats_and_resumes_bit_exactly_with_deterministic_ops(tmp_pa
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives.lm import LMObjective
 
-    tokens = np.tile(np.arange(8, dtype=np.uint8), 256)
-    tokens.tofile(tmp_path / "train.bin")
-    tokens[:128].tofile(tmp_path / "val.bin")
-    (tmp_path / "meta.json").write_text(json.dumps({
-        "tokenizer": "symbols", "vocab_size": 8, "dtype": "uint8",
-        "train_tokens": len(tokens), "val_tokens": 128, "eos_id": None,
-    }))
-    data = compile(TokenFiles(str(tmp_path)).pipe(presets.token_windows, seq_len=16, batch=8).read(
+    corpus = write_token_corpus(tmp_path / "tokens", np.tile(np.arange(8), 256), tokenizer="symbols",
+                                vocab_size=8)
+    data = compile(TokenFiles(corpus.train).pipe(presets.token_windows, seq_len=16, batch=8).read(
         "memory").loading(Loading(workers=0)))
     model = CausalTransformer(vocab_size=8, emb_features=16, num_layers=1,
                               num_heads=2, mlp_features=32, max_seq_len=32, dtype=dtype)
