@@ -27,7 +27,6 @@ Run with the Dew test environment's torch, diffusers and jax, on CPU:
     python tools/autoencoder_contract_reference.py OUTPUT.npz
 """
 
-import json
 import sys
 from pathlib import Path
 from unittest import mock
@@ -38,6 +37,7 @@ import torch
 from diffusers import AutoencoderKL
 from diffusers.models.autoencoders import vae as diffusers_vae
 from diffusers_wan_reference import widened
+from reference_source import saved_fixture
 
 ROOT = Path(__file__).resolve().parents[1]
 TINY = ROOT / "tests" / "fixtures" / "vae" / "sd3-tiny"
@@ -105,8 +105,7 @@ def main():
     arrays.update({f"fp64.{key}": value for key, value in truth.items()})
     meta = {"diffusers": __import__("diffusers").__version__, "torch": torch.__version__,
             "jax": jax.__version__, "clip": CLIP, "key": KEY}
-    arrays["meta"] = np.frombuffer(json.dumps(meta).encode(), np.uint8)
-    np.savez_compressed(sys.argv[1], **arrays)
+    saved_fixture(Path(sys.argv[1]), arrays, meta)
     clamped = int((np.abs(moments[..., 4:]) > 20).sum())
     print(f"{sys.argv[1]}: {Path(sys.argv[1]).stat().st_size / 1e6:.2f} MB, {len(arrays)} arrays, "
           f"{clamped} log-variances past the clamp")
