@@ -371,9 +371,11 @@ def test_a_resumed_partial_is_on_par_with_one_pass_over_its_keys(case, hooks, dt
     query that saw nothing resuming from no state), gives the output, maxima and denominators of one
     pass over every key, on par from float64 over the site's draws: the keys parted at a tile's edge
     into two arrays, as a split-KV launch parts them, or parted at their half by the spans over the
-    whole arrays. (Sliced into arrays of 50 or 64 of these 100 keys, XLA:CPU's product rounds the
-    logits 1.55 times as far from float64 as the whole call's product does on the same entries, and of
-    48 alike: a rounding of the product's shape, which the spanned half keeps the whole call's.)"""
+    whole arrays. The resume's contract is at the cuts launches make, tile edges. (Sliced into arrays of
+    50 or 64 of these 100 keys, XLA:CPU's fp32 product of the queries with the keys rounds the logits
+    1.555 times as far from float64 as the whole 100-key product does on the same entries, over 20
+    draws; sliced at 48 or 100, alike: the reference's own dot rounding by its shape, which the
+    spanned half keeps the whole call's. Recorded 2026-10-21.)"""
     queries, keys = geometry(case)
     spans = template.spans(queries, keys, ROWS, **arguments(case))
     start = hooks_of(hooks, queries)
@@ -545,14 +547,16 @@ def test_cross_documents_of_ids_wider_than_int32_align_apart():
                                       np.tril(np.ones((4, 4), bool)) & np.asarray(document_mask(ids)[0]))
 
 
-def test_a_chunk_wider_than_int32_holds_every_place():
-    """A chunk wider than int32 counts holds the largest places together, as `chunk_mask` does."""
+def test_a_chunk_wider_than_its_places_dtype_holds_every_place_of_one_sign():
+    """A chunk wider than int32 counts, over int32 places, holds the largest places together and the
+    negative ones apart, as `chunk_mask` does (over int64 places, an ordinary chunk)."""
+    ids = jnp.asarray([[1, 1, 1]], jnp.int32)
+    places = jnp.asarray([[-1, 2 ** 31 - 2, 2 ** 31 - 1]], jnp.int32)
+    spans = template.spans(3, 3, 1, chunk=2 ** 31, positions=(places, places), segment_ids=ids)
     with jax.enable_x64(new_val=True):
-        ids = jnp.asarray([[1, 1]], jnp.int32)
-        places = jnp.asarray([[2 ** 31 - 2, 2 ** 31 - 1]], jnp.int64)
-        spans = template.spans(2, 2, 1, chunk=2 ** 31, positions=(places, places), segment_ids=ids)
-        expected = document_mask(ids) & chunk_mask(places, places, 2 ** 31)[:, 0]
-        np.testing.assert_array_equal(np.asarray(template.dense(spans)), np.asarray(expected))
+        wide = places.astype(jnp.int64)
+        expected = document_mask(ids) & chunk_mask(wide, wide, 2 ** 31)[:, 0]
+    np.testing.assert_array_equal(np.asarray(template.dense(spans)), np.asarray(expected))
 
 
 def test_a_block_of_unsigned_ids_is_whole_only_within_one_document():
@@ -567,6 +571,21 @@ def test_a_block_of_unsigned_ids_is_whole_only_within_one_document():
         for tile in range(int(blocks.full_lo[0, block]), int(blocks.full_hi[0, block])):
             if blocks.query_doc[0, block] == blocks.key_doc[0, tile] != 0:
                 assert seen[0, 2 * block:2 * block + 2, 2 * tile:2 * tile + 2].all()
+
+
+def test_a_wider_initial_state_is_read_in_its_own_dtype():
+    """Under x64, a state whose denominator and numerator are float64 and maximum float32 starts a
+    float32 query's softmax in float64: a call of no keys reads `acc / total` unrounded."""
+    with jax.enable_x64(new_val=True):
+        state = template.Initial(jnp.zeros((1, 1, 1), jnp.float32), jnp.full((1, 1, 1), 1 + 2 ** -24),
+                                 jnp.ones((1, 1, 1, 1), jnp.float64))
+        query = jnp.ones((1, 1, 1, 1), jnp.float32)
+        empty = jnp.zeros((1, 0, 1, 1), jnp.float32)
+        spans = template.spans(1, 0, 1)
+        out, _, total = template.reference(query, empty, empty, spans, template.Hooks(initial=state),
+                                           residuals=True)
+        assert float(total[0, 0, 0]) == 1 + 2 ** -24
+        assert float(out[0, 0, 0, 0]) == np.float32(1 / (1 + 2 ** -24))
 
 
 def test_sinks_keep_their_own_wider_dtype():
