@@ -15,7 +15,7 @@ from .iterator import Iterated, from_iter
 from .memory import DataFrame, Memory
 from .pytorch import Torch, from_torch
 from .tfds import TFDS
-from .tokens import TokenFiles
+from .tokens import _SPLIT as _ONE_SPLIT, TokenFiles
 
 
 def source(
@@ -50,6 +50,9 @@ def source(
         resolved = Memory(value)
     else:
         raise TypeError(f"a source is a filesystem URL, named store, or records; got {type(value).__name__}")
+    if split not in (None, _ONE_SPLIT) and isinstance(resolved, TokenFiles):
+        raise ValueError(f"{resolved.describe()} is a token export, which holds one split; split={split!r} "
+                         "is an export of its own, its TokenFiles(url)")
     if provision and isinstance(resolved, (Files, Hub, TFDS, TokenFiles)):
         resolved.provision()
     return resolved

@@ -367,7 +367,31 @@ def test_a_chain_over_stores_not_present_here_is_recorded_and_read_back(tmp_path
 
     split = TFDS("never_prepared", path=str(tmp_path / "tfds"))
     clips = Files(str(tmp_path / "clips"), format="files")
-    for chain in (split.shuffle(0).repeat().pipe(presets.images, 16, batch=4),
-                  clips.pipe(presets.video, 4 / FPS, frames=4, fps=FPS, size=16, batch=2)):
-        again = _read_back(chain)
-        assert encode(again) == encode(chain)
+    images = _read_back(split.shuffle(0).repeat().pipe(presets.images, 16, batch=4))._chain().source
+    assert (images.name, images.path) == ("never_prepared", str(tmp_path / "tfds"))
+    listing = clips.pipe(presets.video, 4 / FPS, frames=4, fps=FPS, size=16, batch=2)
+    media = _read_back(listing)._chain().source
+    assert (media.url, media.kind, media.suffixes) == (str(tmp_path / "clips"), "files",
+                                                       (".mp4", ".avi", ".mov", ".webm"))
+
+
+def test_a_store_that_reads_other_records_by_the_time_it_is_recorded_is_unrecorded(tmp_path):
+    """A directory's files listed when its chain was read, and a file added before the record is
+    written: the record would read the new listing, not the records the run read, so it is
+    unrecorded rather than written as the same chain."""
+    from dew.data import Files
+
+    (tmp_path / "a.jsonl").write_text('{"text": "a"}\n')
+    rows = Files(str(tmp_path), format="jsonl")
+    assert len(rows.paths) == 1 and rows.fingerprint()
+    (tmp_path / "b.jsonl").write_text('{"text": "b"}\n')
+    assert isinstance(encode(rows.batch(1)), Unrecorded)
+
+
+def test_a_concatenation_of_stores_in_memory_is_recorded_and_read_back():
+    """Two stores in memory read one after the other: each reads back as the store it was, its rows
+    held in whichever sequence, inside the concatenation as on its own."""
+    from dew.data import concat
+
+    chain = _lm(concat([_documents(0), _documents(8)]).shuffle(0).repeat())
+    assert _batches(_read_back(chain)) == _batches(chain)

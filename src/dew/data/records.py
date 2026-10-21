@@ -232,13 +232,16 @@ def _invocation(entry: Piped, input: Pipeline, pipeline: Pipeline) -> dict[str, 
 
 def _makes(entry: Piped, made: Pipeline, pipeline: Pipeline) -> bool:
     """Whether `made`, `entry`'s call made again, is what it made in `pipeline`: the same stages from
-    the same store, or, where it made another store, an equal one, its settings the same, so it is
-    compared without opening either."""
+    the same store, or, where it made another store, an equal one that reads the same records
+    (`_reads_alike`)."""
     if entry.input is None:
         return (made.source is pipeline.source and len(made.stages) == entry.end
                 and _same(made.stages[entry.start:], pipeline.stages[entry.start:entry.end], "call") is None)
-    return (_same(made.source, pipeline.source, "call", sequences=True) is None
-            and len(made.stages) == entry.end
+    again, had = made.source, pipeline.source
+    same_store = _same(again, had, "call", sequences=True) is None
+    if same_store and isinstance(again, Source) and isinstance(had, Source):
+        same_store = _reads_alike(had, again, "call") is None
+    return (same_store and len(made.stages) == entry.end
             and _same(made.stages, pipeline.stages[:entry.end], "call") is None)
 
 
@@ -251,26 +254,39 @@ def _source(source: Source | Mixture | Phases) -> dict[str, JSON]:
     if isinstance(source, Phases):
         return {"phases": [_chain(child) for child in source.pipelines],
                 "until_steps": list(source.until_steps)}
-    written = _typed(source, Source, "store", store=True)
+    written = _typed(source, Source, "store")
     if not isinstance(written, dict):
         raise _Unrecordable(f"the store ({type(source).__name__}) is written as no record of its class")
     return written
 
 
-def _typed(value: object, annotation: Annotation, where: str, *, store: bool = False) -> JSON:
+def _typed(value: object, annotation: Annotation, where: str) -> JSON:
     """`value` as the registry writes it against `annotation`, refused where reading that back
     through JSON builds anything but the same value (`_same`): a store is the same where its
-    settings are, whichever sequence holds them, compared without opening it, since a run's record
-    is written where its data may not be."""
+    settings are, whichever sequence holds them, and it reads the same records (`_reads_alike`)."""
     try:
         written = to_record(value, annotation)
         rebuilt = from_record(_annotated(annotation), json.loads(json.dumps(written)))
     except (TypeError, ValueError, NameError) as refused:
         raise _Unrecordable(f"the {where} ({type(value).__name__}) can't be recorded: {refused}") from None
-    difference = _same(value, rebuilt, where, sequences=store)
+    difference = _same(value, rebuilt, where, sequences=isinstance(value, Source))
+    if difference is None and isinstance(value, Source) and isinstance(rebuilt, Source):
+        difference = _reads_alike(value, rebuilt, where)
     if difference is not None:
         raise _Unrecordable(f"the {where} ({type(value).__name__}) reads back otherwise: {difference}")
     return written
+
+
+def _reads_alike(original: Source, rebuilt: Source, where: str) -> str | None:
+    """Where `rebuilt`, read back from `original`'s record, reads other records than `original` read,
+    by their fingerprints: a store that resolved its files, revision or version as it was read
+    reads what it resolved, which its settings alone don't say. A store not here records by its
+    settings, as a run's record is written where its data may not be."""
+    try:
+        same = json_value(original.fingerprint(), where) == json_value(rebuilt.fingerprint(), where)
+    except FileNotFoundError:
+        return None
+    return None if same else f"{where} reads back other records"
 
 
 def _annotated(annotation: Annotation) -> type | types.UnionType | typing.TypeAliasType:
@@ -287,9 +303,12 @@ def _counts(value: Configured) -> TypeGuard[Callable[[Batch], int]]:
 
 def _same(original: object, rebuilt: object, where: str, *, sequences: bool = False) -> str | None:
     """Where `rebuilt` differs from `original`, None where it is the same value: of the same type at
-    every level, a tuple a tuple and a list a list (any sequence the other with `sequences`), an
-    array of the same dtype and values, a function of the same code over the same values, a class
-    or a method of the same object. A value no record carries is refused."""
+    every level, a tuple a tuple and a list a list, an array of the same dtype and values, a
+    function of the same code over the same values, a class or a method of the same object. With
+    `sequences`, a value or a dataclass's field may be any sequence where it was another, as a
+    store's settings may, and so may the settings of the dataclasses a sequence or mapping holds
+    (`_settings`), but anything else they hold keeps its own types. A value no record carries is
+    refused."""
     alike = sequences and isinstance(original, (list, tuple)) and isinstance(rebuilt, (list, tuple))
     if type(original) is not type(rebuilt) and not alike:
         return f"{where} is a {type(original).__name__} and reads back a {type(rebuilt).__name__}"
@@ -319,18 +338,24 @@ def _same(original: object, rebuilt: object, where: str, *, sequences: bool = Fa
     if isinstance(original, Mapping) and isinstance(rebuilt, Mapping):
         if list(original) != list(rebuilt):
             return f"{where} reads back other keys"
-        differences = (_same(value, rebuilt[key], f"{where}[{key!r}]", sequences=sequences)
-                       for key, value in original.items())
+        differences = (_same(value, rebuilt[key], f"{where}[{key!r}]",
+                             sequences=sequences and _settings(value)) for key, value in original.items())
         return next((difference for difference in differences if difference is not None), None)
     if isinstance(original, (list, tuple)) and isinstance(rebuilt, (list, tuple)):
         if len(original) != len(rebuilt):
             return f"{where} reads back {len(rebuilt)} entries, not {len(original)}"
-        differences = (_same(left, right, f"{where}[{index}]", sequences=sequences)
+        differences = (_same(left, right, f"{where}[{index}]", sequences=sequences and _settings(left))
                        for index, (left, right) in enumerate(zip(original, rebuilt, strict=True)))
         return next((difference for difference in differences if difference is not None), None)
     if isinstance(original, (str, bytes, int, float, complex, bool, Enum, np.generic)) or original is None:
         return None if original == rebuilt else f"{where} reads back {rebuilt!r}, not {original!r}"
     raise _Unrecordable(f"{where} holds a {type(original).__name__}, which no record carries")
+
+
+def _settings(value: object) -> bool:
+    """Whether `value` is a dataclass instance, whose fields are settings a record may hold in any
+    sequence, as a concatenation's stores are."""
+    return dataclasses.is_dataclass(value) and not isinstance(value, type)
 
 
 def _read_chain(written: Mapping[str, object]) -> Pipeline:
