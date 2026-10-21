@@ -285,6 +285,37 @@ def test_check_one_holds_a_row_of_float64_zero_to_the_references_own():
     assert raised.type is AssertionError
 
 
+def _tiny_row(dew_ulps):
+    """A product's rows and one row of inputs scaled by 2^-60, about 1e-18 of the product: exact in float32
+    and float64 alike, so the reference holds it exactly and float64 to its own precision. Dew moves it
+    by `dew_ulps` float32 units relative."""
+    unit = float(np.finfo(np.float32).eps)
+
+    def run(ulps):
+        def product(x, w):
+            y = jnp.dot(x, w, precision="highest")
+            tiny = x[:1, :w.shape[1]] * 2.0 ** -60
+            if ulps:
+                tiny = (tiny.astype(jnp.float64) * (1 + ulps * unit)).astype(tiny.dtype)
+            return {"y": jnp.concatenate([y, tiny])}
+        return product
+
+    return jax.jit(run(dew_ulps)), jax.jit(run(0))
+
+
+def test_a_small_row_the_reference_resolves_is_judged_at_its_own_size():
+    """A row 1e-18 of its leaf, which float64 holds to its own precision, lies below RESOLUTION of the
+    leaf; the reference carries it exactly, so it is no row of float64 zero: Dew four float32 units off
+    there is ordinary rounding judged at the row's own size, as at every row, and passes; four thousand
+    units off fails the worst-row rule."""
+    dew, reference = _tiny_row(4)
+    assert_as_exact(dew, reference, _draw, "tiny row", seeds=8)
+    further, reference = _tiny_row(4000)
+    with pytest.raises(AssertionError) as raised:
+        assert_as_exact(further, reference, _draw, "tiny row", seeds=8)
+    assert raised.type is AssertionError
+
+
 def test_a_recorded_reference_is_drawn_by_its_index_and_covers_the_redraw(tmp_path):
     """A reference recorded over (1 + REDRAW)·K seeds: each draw reads its seed's inputs, the reference
     and truth read their recorded outputs at it, and check 1 judges Dew against them; a recording too
