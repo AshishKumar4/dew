@@ -45,19 +45,18 @@ def fingerprint(value: JSON | Mapping[str, object] | np.ndarray) -> str:
     return hashlib.sha256(_canonical(value)).hexdigest()
 
 
-def _identified_sources(value: dict[str, JSON] | list[JSON] | str | int | float | bool | None) -> None:
-    """Require declared content identities throughout a source snapshot."""
+def identified(value: dict[str, JSON] | list[JSON] | str | int | float | bool | None) -> bool:
+    """Whether a source snapshot states the content of every store in it: a store that holds no
+    version of its own (a Grain dataset, an iterator, a torch dataset) states it by the name it was
+    given, and one given none can't say a later run reads the same records."""
     if isinstance(value, dict):
         identity = value.get("identity")
-        if value.get("identity_required") is True and (not isinstance(identity, str) or not identity):
-            raise ValueError(
-                f"source {value.get('store', 'adapter')} needs an explicit content identity"
-            )
-        for child in value.values():
-            _identified_sources(child)
-    elif isinstance(value, list):
-        for child in value:
-            _identified_sources(child)
+        if value.get("identity_required") is True and not (isinstance(identity, str) and identity):
+            return False
+        return all(identified(child) for child in value.values())
+    if isinstance(value, list):
+        return all(identified(child) for child in value)
+    return True
 
 
 @dataclasses.dataclass(frozen=True)
@@ -255,9 +254,6 @@ class Manifest:
     schema: int = 1
     clean: bool = True
 
-    def __post_init__(self) -> None:
-        _identified_sources(json_value(self.source, "source"))
-
     @classmethod
     def of(
         cls,
@@ -346,7 +342,10 @@ class Manifest:
 
     @property
     def exact(self) -> bool:
-        return all(step.exact for step in (*self.ran, *self.steps))
+        """Whether a later run can tell it makes these rows again: every step has a stable identity
+        and every store states its content (`identified`)."""
+        return all(step.exact for step in (*self.ran, *self.steps)) and identified(
+            json_value(self.source, "source"))
 
 
 def _digests(value: dict[str, JSON] | list[JSON] | str | int | float | bool | None) -> JSON:
@@ -455,7 +454,8 @@ class Plan:
             )
         if (not self.manifest.exact or not saved.get("exact", False)) and resume != "non-exact":
             raise ValueError(
-                "data plan contains a step without stable identity; resume='non-exact' is required"
+                "data plan contains a step without stable identity or a store given no name "
+                "(from_grain(..., name=), from_iter(..., name=)); resume='non-exact' is required"
             )
         edited = self._edited_members(saved)
         # A mix whose members changed is compared member by member (`_edited_members`): each kept
