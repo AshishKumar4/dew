@@ -407,7 +407,11 @@ def main(arguments: Sequence[str]) -> int:
             top = Path(git(top, "rev-parse", "--show-toplevel").strip()).resolve()
             merged = merge_base(top, options.base)
         except subprocess.CalledProcessError:
-            print(f"cannot hold this checkout to the base {options.base} (git's reason on stderr)")
+            # An armada or CI checkout is shallow and has no remote branches: lint-gate.sh and CI's lint job
+            # fetch main first, and a checkout run by hand fetches it as below.
+            print(f"cannot hold this checkout to the base {options.base} (git's reason on stderr); a shallow"
+                  " checkout fetches it first: git fetch --unshallow https://github.com/AshishKumar4/dew.git"
+                  " main:refs/remotes/origin/main")
             return 2
     started = time.monotonic()
     # pylint reads a directory as a package; the files, as files.

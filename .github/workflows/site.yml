@@ -13,7 +13,8 @@ on:
   push:
     # ci/** is where a branch goes for its own run before it lands.
     branches: [ "ci/**" ]
-    paths: &paths [ "site/**", "docs/**", "tutorials/**", "src/dew/**", "examples/**", "CONTRIBUTING.md", "pyproject.toml", ".github/workflows/site.yml" ]
+    paths: &paths [ "site/**", "docs/**", "tutorials/**", "src/dew/**", "examples/**", "CONTRIBUTING.md", "pyproject.toml", ".github/workflows/site.yml",
+             ".github/actions/site/**" ]
   pull_request:
     branches: [ "main" ]
     paths: *paths
@@ -43,16 +44,8 @@ jobs:
     - uses: actions/checkout@v4
       with:
         fetch-depth: 0  # the pages' last-updated dates come from git
-    - uses: pnpm/action-setup@v4
-      with:
-        package_json_file: site/package.json
-    - uses: actions/setup-node@v4
-      with:
-        node-version: 22
-        cache: pnpm
-        cache-dependency-path: site/pnpm-lock.yaml
+    - uses: ./.github/actions/site
     - uses: astral-sh/setup-uv@v6
-    - run: pnpm install --frozen-lockfile
     - run: pnpm build
     - run: pnpm live:check
     - run: pnpm live:test
@@ -82,15 +75,7 @@ jobs:
         working-directory: site
     steps:
     - uses: actions/checkout@v4
-    - uses: pnpm/action-setup@v4
-      with:
-        package_json_file: site/package.json
-    - uses: actions/setup-node@v4
-      with:
-        node-version: 22
-        cache: pnpm
-        cache-dependency-path: site/pnpm-lock.yaml
-    - run: pnpm install --frozen-lockfile
+    - uses: ./.github/actions/site
     - run: node scripts/run-cells.mjs "$URL" cells
       env:
         URL: ${{ inputs.run_cells }}

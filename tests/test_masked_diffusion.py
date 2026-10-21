@@ -51,10 +51,12 @@ def test_biased_masked_objective_scores_the_same_affine_logits_as_its_forward():
     process = MDLM(mask_id=31)()
     objective = MaskedDiffusionObjective(model, process, seq_len=4, head_chunks=4,
                                          variables=variables, ema_decay=None)
-    key = jax.random.key(1)
-    _, losses, _, _, predicted, _ = objective._token_losses(variables, {'text': tokens}, key, train=False)
-    time_key, mask_key, _ = jax.random.split(key, 3)
-    corrupted, _ = process.corrupt(mask_key, tokens, process.sample_t(time_key, tokens.shape[0]))
+    time_key, mask_key, _ = jax.random.split(jax.random.key(1), 3)
+    times = process.sample_t(time_key, tokens.shape[0])
+    corrupted, is_masked = process.corrupt(mask_key, tokens, times)
+    # The objective reads this corruption (`Step.tape`).
+    step = Step(jnp.asarray(0), jax.random.key(1), None, tape={"times": times, "mask": is_masked})
+    _, losses, _, _, predicted, _ = objective._token_losses(variables, {'text': tokens}, step, train=False)
     logits = model.apply(variables, corrupted).at[..., 31].set(-jnp.inf)
     expected = optax.softmax_cross_entropy_with_integer_labels(logits, tokens)
     # The same 1e-5 relative loss contract as the bias-free chunked head.
@@ -87,8 +89,9 @@ def test_a_media_slot_reaches_the_model_and_is_never_masked_or_scored():
     params = objective.init(jax.random.key(0))
     params["params"]["media"] = jnp.ones(8)
     media = {"text": ModelInputs(tokens, {"image_indices": slots})}
-    _, losses, _, counted, _, real = objective._token_losses(params, media, jax.random.key(1), train=False)
-    plain = objective._token_losses(params, {"text": tokens}, jax.random.key(1), train=False)[1]
+    step = Step(jnp.asarray(0), jax.random.key(1), None)
+    _, losses, _, counted, _, real = objective._token_losses(params, media, step, train=False)
+    plain = objective._token_losses(params, {"text": tokens}, step, train=False)[1]
 
     np.testing.assert_array_equal(real, slots < 0)
     assert not counted[:, :2].any() and counted[:, 2:].any()
@@ -115,7 +118,8 @@ def test_padding_that_holds_the_mask_token_scores_nothing(given):
         batch = ({"text": ModelInputs(tokens, {"attention_mask": mask})} if given == "attention_mask"
                  else {"text": tokens, "text_coordinates": coordinates(valid=mask)})
         loss, grads = jax.value_and_grad(lambda v: objective.scalar_loss(v, batch, step)[0])(variables)
-        return loss, grads, objective._evaluation_scores(variables, batch, jax.random.key(2))
+        scoring = Step(jnp.asarray(0), jax.random.key(2), None)
+        return loss, grads, objective._evaluation_scores(variables, batch, scoring)
 
     mask_padded, other_padded = scored(31), scored(7)
     assert np.isfinite(float(mask_padded[0]))

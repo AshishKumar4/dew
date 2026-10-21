@@ -148,27 +148,27 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         return self.model.init(key, jnp.zeros((1, self.seq_len), jnp.int32))
 
     def loss(self, variables, batch, step: Step):
-        nelbo, aux, _ = self._scored(variables, batch, step.key, train=step.training)
+        nelbo, aux, _ = self._scored(variables, batch, step, train=step.training)
         return nelbo, aux
 
-    def _evaluation_scores(self, params, batch, key) -> TokenScores:
+    def _evaluation_scores(self, params, batch, step) -> TokenScores:
         """Return the negative ELBO of every token in the batch.
 
-        One noise level and one masking are drawn from the pass's key, as in
-        training, with dropout off. Every real token counts: a masked token
+        One noise level and one masking are drawn by each example, as in
+        training (`Step.sample`), with dropout off. Every real token counts: a masked token
         scores its weighted cross entropy, a visible one scores zero, and a
         packed window's padding has no weight. So `perplexity` over a
         validation pass is the exponential of the ELBO bound per token, the
         number MDLM reports."""
-        return self._scored(params, batch, key, train=False)[2]
+        return self._scored(params, batch, step, train=False)[2]
 
     def _validation_scores(self, params, batch, step: Step) -> tuple[Ratio, TokenScores]:
-        nelbo, _, scores = self._scored(params, batch, step.key, train=False)
+        nelbo, _, scores = self._scored(params, batch, step, train=False)
         return nelbo, scores
 
-    def _scored(self, params, batch, key, *, train: bool) -> tuple[Ratio, Aux, TokenScores]:
+    def _scored(self, params, batch, step: Step, *, train: bool) -> tuple[Ratio, Aux, TokenScores]:
         """The negative ELBO, its reports and the per-token scores, from one corruption of the batch."""
-        tokens, losses, weights, counted, predicted, real = self._token_losses(params, batch, key,
+        tokens, losses, weights, counted, predicted, real = self._token_losses(params, batch, step,
                                                                                train=train)
         nelbo = Ratio(self.row_mean(losses * weights, batch).total,
                       self.row_mean(real.astype(jnp.float32), batch).total)
@@ -179,8 +179,9 @@ class MaskedDiffusionObjective(Objective[Ratio]):
             "masked_fraction": jnp.sum(counted) / jnp.maximum(jnp.sum(real, dtype=losses.dtype), 1.0),
         }), TokenScores(losses * weights, real.astype(losses.dtype), correct)
 
-    def _token_losses(self, params, batch, key, *, train: bool):
-        """Corrupt the batch once and score it.
+    def _token_losses(self, params, batch, step: Step, *, train: bool):
+        """Corrupt the batch once, each row's noise level and mask its example's own (`Step.sample`),
+        and score it.
 
         Returns the rows, their per-token cross entropies under that
         corruption, the time weight of each masked token, the mask itself,
@@ -209,11 +210,17 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         for media in ("image_indices", "audio_indices"):
             if media in fields:
                 real &= fields[media] < 0
-        time_key, mask_key, dropout_key = jax.random.split(key, 3)
-        t = self.process.sample_t(time_key, tokens.shape[0])
-        masked, is_masked = self.process.corrupt(mask_key, tokens, t)
-        is_masked = is_masked & real
-        masked = jnp.where(is_masked, masked, tokens)
+        rows = tokens.shape[0]
+        # MDLM's antithetic times: each example a point in its own stratum of the update's examples.
+        places, count = step.places(rows)
+        uniforms = step.sample("time uniforms", jax.random.uniform, (), dtype=jnp.float32, rows=rows)
+        t = step.boundary("times", self.process.stratified(uniforms, places, count))
+        draws = step.sample("mask uniforms", jax.random.uniform, tokens.shape[1:], dtype=jnp.float32,
+                            rows=rows)
+        _, is_masked = self.process.masked(draws, tokens, t)
+        is_masked = step.boundary("mask", is_masked & real)
+        dropout_key = jax.random.fold_in(step.key, 2)
+        masked = jnp.where(is_masked, self.process.mask_id, tokens)
 
         read = final_read(self.model, params, masked, train=train,
                           rngs=model_rngs(dropout_key, training=train), mutable=False,
@@ -227,7 +234,8 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         # leaves out, and its +inf times a zero weight would be NaN.
         losses = jnp.where(real, losses, 0.0)
         counted = is_masked.astype(losses.dtype)
-        return tokens, losses, counted * self.process.weight(t)[:, None], counted, predicted, real
+        weights = step.boundary("loss weights", self.process.weight(t))
+        return tokens, losses, counted * weights[:, None], counted, predicted, real
 
     def _sample_impl(self, params, key, *, count: int):
         denoise = self.process.denoiser(self.model, thaw(params))
