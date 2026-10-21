@@ -30,24 +30,32 @@ MISSES = {
     ("sm80", "triton", "qwen3-30b-a3b gate_up", "kernel_gradient"): TRANSPOSED_READS,
     ("sm80", "triton", "kimi-linear gate_up", "kernel_gradient"): TRANSPOSED_READS,
     ("sm80", "triton", "kimi-linear down", "kernel_gradient"): TRANSPOSED_READS,
-    ("sm80", "triton", "targets-comment", "forward"): LOADED_LATENCY,
-    ("sm80", "triton", "targets-comment", "input_gradient"): LOADED_LATENCY,
     ("sm80", "triton", "targets-comment", "kernel_gradient"): TRANSPOSED_READS,
     ("sm80", "triton", "targets-comment", "kernel_gradient_fp32"): TRANSPOSED_READS,
+    ("sm80", "triton", "mixtral up", "kernel_gradient"): TRANSPOSED_READS,
+    ("sm80", "triton", "mixtral up", "kernel_gradient_fp32"): TRANSPOSED_READS,
+    ("sm80", "triton", "mixtral down", "kernel_gradient"): TRANSPOSED_READS,
+    ("sm80", "triton", "mixtral down", "kernel_gradient_fp32"): TRANSPOSED_READS,
+    ("sm80", "triton", "targets-comment", "forward"): LOADED_LATENCY,
+    ("sm80", "triton", "targets-comment", "input_gradient"): LOADED_LATENCY,
     ("sm80", "triton", "mixtral up", "forward"): L2_REUSE,
     ("sm80", "triton", "mixtral up", "input_gradient"): L2_REUSE,
-    ("sm80", "triton", "mixtral up", "kernel_gradient"): L2_REUSE,
-    ("sm80", "triton", "mixtral up", "kernel_gradient_fp32"): L2_REUSE,
     ("sm80", "triton", "mixtral down", "forward"): L2_REUSE,
-    ("sm80", "triton", "mixtral down", "kernel_gradient"): L2_REUSE,
-    ("sm80", "triton", "mixtral down", "kernel_gradient_fp32"): L2_REUSE,
-    ("sm90", "mosaic_gpu", "qwen3-30b-a3b gate_up", "kernel_gradient"): ACCUMULATOR_REGISTERS,
+    ("sm90", "mosaic_gpu", "qwen3-30b-a3b gate_up", "kernel_gradient_fp32"): ACCUMULATOR_REGISTERS,
+    ("sm90", "mosaic_gpu", "targets-comment", "forward"): LOADED_LATENCY,
+    ("sm90", "triton", "targets-comment", "forward"): LOADED_LATENCY,
+    ("sm90", "triton", "targets-comment", "input_gradient"): LOADED_LATENCY,
     ("sm90", "mosaic_gpu", "mixtral up", "forward"): L2_REUSE,
     ("sm90", "triton", "mixtral up", "forward"): L2_REUSE,
+    ("sm90", "mosaic_gpu", "mixtral up", "input_gradient"): L2_REUSE,
     ("sm90", "triton", "mixtral up", "input_gradient"): L2_REUSE,
+    ("sm90", "mosaic_gpu", "mixtral down", "forward"): L2_REUSE,
+    ("sm90", "triton", "mixtral down", "forward"): L2_REUSE,
+    ("sm90", "mosaic_gpu", "mixtral down", "input_gradient"): L2_REUSE,
+    ("sm90", "triton", "mixtral down", "input_gradient"): L2_REUSE,
 }
-"""Each case the model misranks past 10%, by generation, implementation, shape and product, with the term
-it lacks (2026-10-21, both sweeps)."""
+"""Each case whose pick runs past 10% of the best, by generation, implementation, shape and product, with
+the term the model lacks: 26 of the 84 swept (2026-10-21; GMMT-a100, GMMT-h100)."""
 
 
 def _launch(record):
