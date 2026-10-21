@@ -1243,11 +1243,13 @@ def test_a_rejected_dynamic_scale_step_leaves_no_trace(accum):
     state, _, _, finite, accepted, _ = step(state, bad)
     assert bool(finite) and not bool(accepted)
     assert int(state.step) == counted + 1
-    assert int(state.microstep) == advanced
+    # The rejection drops its window, the accepted microbatch before it with it (`dropped_window`).
+    assert int(state.microstep) == advanced - advanced % accum
     assert float(state.scale.scale) == scaled / 2
     np.testing.assert_array_equal(state.variables["params"]["w"], w)
     np.testing.assert_array_equal(state.ema["params"]["w"], ema)
-    state, *_ = step(state, good)
+    for _ in range(accum):
+        state, *_ = step(state, good)
     w, ema = host(state)
     np.testing.assert_allclose(w, .64, rtol=1e-6)
     np.testing.assert_allclose(ema, .77, rtol=1e-6)
