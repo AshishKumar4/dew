@@ -753,6 +753,11 @@ def test_a_bf16_layer_with_wide_keys_hands_the_port_its_narrowed_operands():
         assert query.dtype == key.dtype == value.dtype == jnp.bfloat16
 
 
+REMAT_ROWS, REMAT_LENGTH = 4, 256
+"""Each remat draw's rows and tokens: at one row of 64 with the parameters held fixed, the reference
+compared with itself did not resolve within 512 seeds on an A100 (`in_proj_b`'s and the norm's
+gradients, a few sums over one draw's few tokens)."""
+
 SEEDS = {(1, 1): 8, (2, 1): 8, (2, 2): 8}
 """Each remat policy's declared seeds for check 1 (`assert_as_exact`), keyed by the
 (`fla_chunk_fwd_h`, `fla_chunk_fwd_o`) launches its gradient is held to, sized by `seeds_for`: the
@@ -777,16 +782,18 @@ def test_a_remat_policy_saves_the_ports_named_residuals_and_changes_no_gradient(
     where it is saved and again in the backward where it is recomputed; the output's
     (`fla_chunk_fwd_o`) once, but where the policy recomputes the memory, whose recompute re-runs the
     rule's forward, output and all. Each computes the gradients the layer computes without remat, on
-    par with it by check 1 (`assert_as_exact`) over fresh inputs drawn from each seed with the
-    parameters held fixed, truth the float64 layer's gradient; off a GPU, bitwise. A GPU compiles
+    par with it by check 1 (`assert_as_exact`) over fresh parameters and inputs drawn from each seed
+    (`REMAT_ROWS` rows of `REMAT_LENGTH` tokens), truth the float64 layer's gradient; off a GPU,
+    bitwise. A GPU compiles
     the remat step as another program, whose roundings differ: on an H100 even the XLA math's A_log
     gradient moved by 5.4e-5 relative between the two, the remat one nearer float64."""
     from dew.nn.backbones.decoder_block import remat_policy
     from dew.nn.linear import recomputing
 
     layer = GatedDeltaNet(emb_features=64, num_k_heads=1, num_v_heads=2, head_k_dim=64, head_v_dim=64)
-    x = jax.random.normal(jax.random.key(71), (1, 64, 64))
-    params = layer.init(jax.random.key(73), x)
+    x = jax.random.normal(jax.random.key(71), (REMAT_ROWS, REMAT_LENGTH, 64))
+    initialize = jax.jit(layer.init)
+    params = initialize(jax.random.key(73), x)
 
     def loss(params, x):
         return jnp.sum(layer.apply(params, x) ** 2)
@@ -809,7 +816,9 @@ def test_a_remat_policy_saves_the_ports_named_residuals_and_changes_no_gradient(
     want, got = reference_grad(params, x), remat_grad(params, x)
 
     def draw(seed):
-        return params, jax.random.normal(jax.random.key(seed), x.shape)
+        keys = jax.random.split(jax.random.key(seed))
+        x = jax.random.normal(keys[0], (REMAT_ROWS, REMAT_LENGTH, 64))
+        return initialize(keys[1], x), x
 
     wide = layer.clone(dtype=jnp.float64)
 
