@@ -35,7 +35,7 @@ import tyro
 
 import dew
 from dew.config import ModelConfig, ObjectiveConfig, OptimConfig, RunConfig, TrainerConfig
-from dew.data import ByteTokenizer, Dataset, Files, Hub, Loading, Source, concat, images, presets
+from dew.data import ByteTokenizer, Concatenate, Dataset, Files, Hub, Loading, Source, images, presets
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition, Loader
 from dew.interop.diffusion_gemma import build
@@ -213,7 +213,7 @@ def image_data(config: Config, parts: dict[str, Source]) -> tuple[Dataset, Datas
     run on the host, before the caption layout reads their pixels into the model's inputs; a device
     augment would run after it, on the batch the layout already made."""
     crop = images.RandomCrop(config.image_size, scale=(0.6, 1.0), flip=True)
-    train = (concat((parts["train"], parts["validation"])).shuffle(seed=0).repeat()
+    train = (Concatenate((parts["train"], parts["validation"])).shuffle(seed=0).repeat()
              .pipe(presets.images, config.image_size, batch=config.batch_size,
                    staging_size=config.staging_size, augment=crop))
     test = parts["test"].pipe(presets.images, config.image_size, batch=config.batch_size)
