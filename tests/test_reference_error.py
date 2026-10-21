@@ -14,6 +14,8 @@ from reference_error import (
     assert_as_exact,
     assert_as_exact_as_the_reference,
     assert_leaves_as_exact,
+    assert_moves,
+    assert_same_artifact,
     declared_seeds,
     distance,
     indexed_recording,
@@ -118,6 +120,40 @@ def test_check_one_passes_an_equally_exact_sum_over_the_seeds_its_own_reference_
     seeds = seeds_for(_product, _draw, "product")
     assert_as_exact(_reordered, _product, _draw, "reordered", seeds=seeds)
     assert_as_exact(_reordered, _product, _draw, "reordered", seeds=seeds)
+
+
+def test_a_committed_fixture_is_its_references_output_within_twice_a_fresh_runs_error():
+    """An artifact check, not a parity (`assert_same_artifact`): a committed fixture whose largest error
+    from float64 is up to twice a fresh run's is the reference's output; one further is not, even where
+    only one element moves, which an RMS would let through."""
+    f64 = np.linspace(-1, 1, 101)
+    fresh = f64 + 1e-7
+    assert_same_artifact(fresh, f64 - 2e-7, f64, "twice as far")
+    with pytest.raises(AssertionError):
+        assert_same_artifact(fresh, f64 + 3e-7, f64, "three times as far")
+    corrupted = f64.copy()
+    corrupted[50] += 5e-7
+    assert np.sqrt(np.mean(np.square(corrupted - f64))) < 1e-7
+    with pytest.raises(AssertionError):
+        assert_same_artifact(fresh, corrupted, f64, "one element moved")
+
+
+def test_a_runs_learning_rates_part_from_the_base_at_any_float32_difference(monkeypatch):
+    """compare.py's conditions read each run's learning rates as float32s, which must be the base run's
+    exactly: a float64 schedule that rounds to the base's float32 matches it, and a value at the next
+    float32 parts, which a relative 1e-6 let through."""
+    from tool_support import REPO_ROOT, load
+
+    monkeypatch.syspath_prepend(str(REPO_ROOT / "tools" / "reference_runs"))
+    compare = load("reference_runs/compare")
+    config = dict.fromkeys(compare.CONDITIONS, 1)
+    base = np.float32([1e-3, 5e-3, 1e-2])
+    rounding = base.astype(np.float64) + 1e-12
+    next_up = np.nextafter(base, np.float32(1)).astype(np.float64)
+    records = {"base": {"config": config, "lr": base.tolist()}}
+    assert not compare.conditions({**records, "run": {"config": config, "lr": rounding.tolist()}})
+    [found] = compare.conditions({**records, "run": {"config": config, "lr": next_up.tolist()}})
+    assert found.startswith("lr of run parts from base at 3 of 3 steps, first at step 0")
 
 
 @pytest.mark.parametrize("wrong", [_lost_term, _bf16_operands], ids=["lost term", "bf16 operands"])
@@ -520,3 +556,55 @@ def test_the_procedure_before_the_two_stages_draws_again_as_it_did():
         assert _staged(law(np.inf), 8, "infinite", two_stage=False)[2] == 2
         assert _staged(law(np.inf), 8, "infinite")[2] == 2
     assert _staged(law(1.0), 8, "equal", two_stage=False)[2] == 1
+
+
+def test_a_change_moves_the_result_only_past_rounding():
+    """`assert_moves`: a product scaled by 1 + 2^-10 moves it far past its rounding and passes; the same
+    product summed in another order, a change rounding accounts for, does not; a leaf the original holds
+    exactly moves on any departure."""
+    def scaled(x, w):
+        return {"y": jnp.dot(x, w, precision="highest") * (1 + 2.0 ** -10)}
+
+    assert_moves(_product, jax.jit(scaled), _draw, "scaled", seeds=8)
+    with pytest.raises(AssertionError):
+        assert_moves(_product, _reordered, _draw, "reordered", seeds=8)
+
+    def zero(x, w):
+        return {"y": jnp.zeros(3, jnp.float32)}
+
+    def off_zero(x, w):
+        return {"y": jnp.full(3, 1e-30, jnp.float32)}
+
+    assert_moves(jax.jit(zero), jax.jit(off_zero), _draw, "off zero", seeds=8)
+
+
+def test_a_change_moves_by_its_intervals_lower_end_and_one_leaf_is_enough():
+    """Errors set seed by seed: a changed RMS error of 1.51 times the original's on every seed (its
+    interval that one value) moves; 1.49 does not, and is no move however its seeds are drawn; with two
+    leaves, one moved is enough; a leaf not finite moves nothing."""
+    for factor, moves in ((1.51, True), (1.49, False)):
+        changed, original, errors, truth = _set_errors(factor ** 2, factor ** 2)
+        if moves:
+            assert_moves(original, changed, errors, "constant", seeds=8, truth_fn=truth)
+        else:
+            with pytest.raises(AssertionError):
+                assert_moves(original, changed, errors, "constant", seeds=8, truth_fn=truth)
+
+    dew, reference, errors, truth = _set_errors(4.0, 4.0)
+
+    def two(x, mine, theirs):
+        return {"moved": dew(x, mine, theirs)["y"], "kept": reference(x, mine, theirs)["y"]}
+
+    def two_original(x, mine, theirs):
+        return {"moved": reference(x, mine, theirs)["y"], "kept": reference(x, mine, theirs)["y"]}
+
+    def two_truth(x, mine, theirs):
+        return {"moved": x, "kept": x}
+
+    assert_moves(two_original, two, errors, "one leaf", seeds=8, truth_fn=two_truth)
+
+    def infinite(x, mine, theirs):
+        return {"y": x + jnp.inf}
+
+    with pytest.raises(AssertionError):
+        assert_moves(reference, infinite, errors, "infinite", seeds=8, truth_fn=truth)

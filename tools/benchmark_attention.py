@@ -42,7 +42,7 @@ import tokamax
 import tyro
 
 from dew.nn.attention_kernels import ATTENTION
-from dew.telemetry.benchmark import samples
+from dew.telemetry.benchmark import largest_difference, samples
 
 IMPLEMENTATIONS = (*(kernel.name for kernel in ATTENTION.kernels), 'jax_cudnn', 'tokamax_triton')
 """Dew's attention kernels as the selector names them, each through the production entry, then two
@@ -123,11 +123,6 @@ def lowering_target(implementation: str, config: BenchmarkConfig):
 
 def failure(error: BaseException) -> str:
     return f"{type(error).__name__}: {str(error).splitlines()[0][:160]}"
-
-
-def largest_difference(left, right) -> float:
-    return max(float(jnp.max(jnp.abs(a.astype(jnp.float32) - b.astype(jnp.float32))))
-               for a, b in zip(jax.tree.leaves(left), jax.tree.leaves(right), strict=True))
 
 
 def measure(case: dict, config: BenchmarkConfig) -> dict:
