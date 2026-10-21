@@ -572,12 +572,11 @@ def test_local_videos_lists_every_file_under_the_directory(tmp_path):
     clips = _voxceleb_tree(tmp_path)
     (tmp_path / "extra.webm").write_bytes(b"")
 
-    from dew.config.data import _VideoRow
-    from dew.data import Files
+    from dew.data import Files, video
 
     patterns = (str(tmp_path / "**" / "*.avi"), str(tmp_path / "**" / "*.webm"))
     rows = Files(patterns, format="files").records("memory")
-    records = [_VideoRow(caption="a clip")(row) for row in rows]
+    records = [video.Row(caption="a clip").map(row) for row in rows]
 
     assert sorted(r["mp4"] for r in records) == sorted(
         [c.as_uri() for c in clips] + [(tmp_path / "extra.webm").as_uri()]

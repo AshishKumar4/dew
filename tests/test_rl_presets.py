@@ -97,6 +97,37 @@ def test_the_clips_preset_prepares_what_the_video_recipe_does(tmp_path, monkeypa
     same_batches(expected, built, 3)
 
 
+def test_the_video_preset_reads_a_directorys_media_as_the_video_recipe(tmp_path, monkeypatch):
+    """A directory of clips and a note beside them, listed and read through the video preset: an
+    epoch of the rows the video recipe reads, the note passed over, and facts saying the frames and
+    the sound's length."""
+    from test_data_av import _mux
+    from transformers import AutoFeatureExtractor, Wav2Vec2FeatureExtractor
+
+    from dew.data import Files
+    from dew.data.sources.av_utils import FPS
+
+    (tmp_path / "train").mkdir()
+    for index in range(6):
+        _mux(tmp_path / "train" / f"{index}.avi")
+    (tmp_path / "train" / "notes.txt").write_text("not a clip")
+    monkeypatch.setattr(AutoFeatureExtractor, "from_pretrained",
+                        lambda name: Wav2Vec2FeatureExtractor(sampling_rate=16000))
+    recipe = VideoData(source=str(tmp_path / "train"), caption="a speaker", frames=4, frame_size=16,
+                       audio_padding=1)
+    expected = loader(recipe, batch=2, read="indexed", loading=LOADING)
+    listing = Files(str(tmp_path / "train"), format="files")
+    chain = listing.shuffle(0).repeat().pipe(presets.video, 4 / FPS, frames=4, fps=FPS, size=16, batch=2,
+                                             caption="a speaker", sample_rate=16000, margin=1 / FPS,
+                                             context=1 / FPS, missing="reject", rejects=False)
+    facts = chain.facts()
+    assert facts["fields"]["video"] == [4, 16, 16, 3]
+    assert facts["audio_seconds"] == 6 / FPS
+    built = compile(chain, read="indexed", loading=LOADING, host=recipe.pipelines()[2])
+    # Six clips, two a batch: an epoch is three batches.
+    assert _epoch(built, 3) == _epoch(expected, 3)
+
+
 @pytest.mark.parametrize("missing", ["silence", "reject"])
 def test_clips_fill_or_drop_media_without_sound_and_drop_or_stop_on_media_too_short(tmp_path, missing):
     """A clip with no sound beside one with sound: filled with silence marked invalid, or dropped and
