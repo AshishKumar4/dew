@@ -185,7 +185,6 @@ Keep the existing gateway interface. Miles would currently duplicate it: its tra
 - Run one bounded image lifecycle qualification at a meaningful resolution. [295]
 - Extend low-coverage sampling, source and publication modules through scenario settings; run device-only code under device coverage. [580]
 - Keep numerical results keyed by CPU model and qualify CPU-dependent rounding against the reference on that same class. [478]
-- Reuse test results at executed-function and fixture-dependency granularity. [515]
 - Establish and triage a daily GPU baseline before it replaces batch qualification. Reproduce reference autotune picks in their recorders and qualify FP8 on suitable hardware. [558, 568, TTC-1]
 - Qualify H100, newer-GPU, TPU and paged-decode shard routes at runtime; compile and interpret checks leave those obligations open.
 - Audit upstream reproductions and fixes. [306]
