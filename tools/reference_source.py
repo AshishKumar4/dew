@@ -12,7 +12,7 @@ takes single lines out of a published function. `verified` keeps a
 reference file on disk, fetched once and checked against its pinned SHA-256
 on every use. `stub_torch_utils` stands in for the two `torch_utils` names
 NVIDIA's EDM and EDM2 networks import. `saved_fixture` writes a generator's
-arrays with its provenance as the suite reads them.
+arrays with its provenance as the suite reads them, and `recipe_images` draws the images a recipe names.
 """
 
 from __future__ import annotations
@@ -58,6 +58,14 @@ def saved_fixture(path: Path, arrays: dict, meta: dict) -> None:
     arrays["meta"] = np.frombuffer(json.dumps(meta).encode(), np.uint8)
     path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(path, **arrays)
+
+
+def recipe_images(recipe: dict):
+    """The uint8 images a fixture's recipe names (`{"seed", "shape"}`): NumPy's legacy generator at its
+    seed, which a test reproduces from the recipe the fixture records."""
+    import numpy as np
+
+    return np.random.RandomState(recipe["seed"]).randint(0, 256, tuple(recipe["shape"]), dtype=np.uint8)
 
 
 def fetched(url: str) -> str:

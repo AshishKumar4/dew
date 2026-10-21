@@ -87,11 +87,14 @@ class AutoEncoder(ABC):
         return wrapper(model=model, params=params, **fields)
 
     @abstractmethod
-    def encode_batch(self, params, x: jnp.ndarray,
-                     key: jax.Array | None = None) -> jnp.ndarray:
+    def encode_batch(self, params, x: jnp.ndarray, key: jax.Array | None = None,
+                     noise: jnp.ndarray | None = None) -> jnp.ndarray:
         """Encode frames `[B, H, W, C]` to raw latents `[B, h, w, c]`.
 
         `key` draws a stochastic encoder's sample, and None takes its mean.
+        `noise`, a standard normal draw of the latents' shape, is the sample's
+        in place of one from `key` (`posterior_latent`); a deterministic
+        encoder reads neither.
         """
 
     @abstractmethod
@@ -102,6 +105,13 @@ class AutoEncoder(ABC):
     @abstractmethod
     def downscale_factor(self) -> int:
         """H / h, the spatial factor between a frame and its latent."""
+
+    @property
+    def stochastic(self) -> bool:
+        """Whether encoding samples its latent, so a training step draws each example's `noise`
+        (`encode_batch`). A deterministic encoder (DC-AE, RAE) is False and refuses noise, raising
+        TypeError naming itself."""
+        return True
 
     @property
     @abstractmethod
@@ -132,10 +142,12 @@ class AutoEncoder(ABC):
         factor = self.downscale_factor
         return (*lead, height // factor, width // factor, self.latent_channels)
 
-    def encode_video(self, params, x: jnp.ndarray, key: jax.Array | None = None) -> jnp.ndarray:
+    def encode_video(self, params, x: jnp.ndarray, key: jax.Array | None = None,
+                     noise: jnp.ndarray | None = None) -> jnp.ndarray:
         """Encode video `[B, T, H, W, C]` to raw latents, frame by frame."""
         batch_size, seq_len, height, width, channels = x.shape
-        latent = self.encode_batch(params, x.reshape(-1, height, width, channels), key=key)
+        frames = None if noise is None else noise.reshape(-1, *noise.shape[2:])
+        latent = self.encode_batch(params, x.reshape(-1, height, width, channels), key=key, noise=frames)
         return latent.reshape(batch_size, seq_len, *latent.shape[1:])
 
     def decode_video(self, params, z: jnp.ndarray) -> jnp.ndarray:
@@ -144,10 +156,12 @@ class AutoEncoder(ABC):
         decoded = self.decode_batch(params, z.reshape(-1, height, width, channels))
         return decoded.reshape(batch_size, seq_len, *decoded.shape[1:])
 
-    def encode(self, params, x: jnp.ndarray,
-               key: jax.Array | None = None) -> jnp.ndarray:
-        """Encode images `[B, H, W, C]` or video `[B, T, H, W, C]` to normalized latents."""
-        latent = self.encode_video(params, x, key) if x.ndim == 5 else self.encode_batch(params, x, key=key)
+    def encode(self, params, x: jnp.ndarray, key: jax.Array | None = None,
+               noise: jnp.ndarray | None = None) -> jnp.ndarray:
+        """Encode images `[B, H, W, C]` or video `[B, T, H, W, C]` to normalized latents, a stochastic
+        encoder's sample drawn from `key` or read off `noise` (`encode_batch`)."""
+        latent = (self.encode_video(params, x, key, noise) if x.ndim == 5
+                  else self.encode_batch(params, x, key=key, noise=noise))
         shift, scale = (jnp.asarray(value, latent.dtype) for value in (self.latent_shift, self.latent_scale))
         return (latent - shift) * scale
 
@@ -171,13 +185,13 @@ class ModuleAutoEncoder[M: nn.Module](AutoEncoder):
     def __init__(self, model: M, params: Variables):
         self.model = model
         self.params = params
-        self.encode_single_frame = jax.jit(lambda params, image, key=None: model.apply(
-            {"params": params}, image, key, method=model.encode))
+        self.encode_single_frame = jax.jit(lambda params, image, key=None, noise=None: model.apply(
+            {"params": params}, image, key, noise, method=model.encode))
         self.decode_single_frame = jax.jit(lambda params, latent: model.apply(
             {"params": params}, latent, method=model.decode))
 
-    def encode_batch(self, params, x, key=None):
-        return self.encode_single_frame(params, x, key)
+    def encode_batch(self, params, x, key=None, noise=None):
+        return self.encode_single_frame(params, x, key, noise)
 
     def decode_batch(self, params, z):
         return self.decode_single_frame(params, z)
