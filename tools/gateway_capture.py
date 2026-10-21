@@ -23,7 +23,9 @@ ends on its own EOS: under a policy with no stop, one that stops at the model's 
 stops at a token the model draws after its EOS (the first such seed's). Write them as
 `{engine}_stops.json` with the model's EOS ids and what each draw gave: its ids and whether it
 ended on a stop, or the error Dew raised. It also records the engine's raw answer to a draw from
-the same seed that stops at a string its answer reaches (`stop_strings`), and on SGLang, which Dew
+the same seed that stops at a string its answer reaches (`stop_strings`), Dew's own draws from that
+seed under a policy with that stop string, with the model's EOS and without an EOS
+(`string_draws`), and on SGLang, which Dew
 streams, how many ids the engine generated for a draw under a long budget that Dew's server cut at
 an early stop (`release`).
 """
@@ -213,9 +215,10 @@ def capture_stops(name: str, bin: Path, out: Path) -> None:
     client = openai.OpenAI(base_url=f"http://{PROXY[0]}:{PROXY[1]}/v1", api_key="capture", max_retries=0)
     completion = OpenAICompletion(MODEL, client, provider=name)
 
-    def draw(eos: int | None, seed: int) -> dict:
+    def draw(eos: int | None, seed: int, stop: str | None = None) -> dict:
         proxy.exchanges.clear()
-        server = OpenAIRolloutServer(completion, Sampling(temperature=1.0, eos_token_ids=eos), published)
+        sampling = Sampling(temperature=1.0, eos_token_ids=eos, stop=() if stop is None else (stop,))
+        server = OpenAIRolloutServer(completion, sampling, published, decode=tokenizer.decode)
         try:
             drawn = server.submit(prompt, STOPS_BUDGET, key=seed).result()
             outcome = {"tokens": list(drawn.tokens), "terminated": drawn.terminated}
@@ -223,7 +226,8 @@ def capture_stops(name: str, bin: Path, out: Path) -> None:
             outcome = {"refused": f"{type(error).__name__}: {error}"}
         finally:
             server.close()
-        return {"eos": eos, "seed": seed, "exchanges": list(proxy.exchanges), **outcome}
+        return {"eos": eos, "seed": seed, **({} if stop is None else {"stop": stop}),
+                "exchanges": list(proxy.exchanges), **outcome}
 
     def raw(seed: int, stop: str) -> dict:
         """The engine's own answer, through the proxy, to a draw from the same seed that stops at the
@@ -258,6 +262,7 @@ def capture_stops(name: str, bin: Path, out: Path) -> None:
 
     draws: list[dict] = []
     stopped: list[dict] = []
+    strings: list[dict] = []
     release: dict | None = None
     with served(name, bin, out):
         try:
@@ -282,13 +287,15 @@ def capture_stops(name: str, bin: Path, out: Path) -> None:
             stop = next((piece for piece in pieces if piece), None)
             if stop is not None:
                 stopped.append(raw(seed, stop))
+                strings.extend((draw(native[0], seed, stop), draw(None, seed, stop)))
             if name == "sglang":
                 release = released(seed, later[0])
         finally:
             proxy.shutdown()
             (out / f"{name}_stops.json").write_text(json.dumps(
                 {"engine": name, "model": MODEL, "native_eos": native, "prompt": prompt, "budget": STOPS_BUDGET,
-                 "draws": draws, "stop_strings": stopped, "release": release}, indent=1))
+                 "draws": draws, "stop_strings": stopped, "string_draws": strings, "release": release},
+                indent=1))
 
 
 def _metric(name: str) -> float:

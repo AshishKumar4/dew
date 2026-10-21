@@ -43,7 +43,7 @@ EOS = 7
 def engine(provider, answer):
     """An OpenAI client for `provider` whose transport answers each completion with `answer(request)`,
     a request that streams as SGLang streams it: an event a sampled id, the last with the choice's
-    finish reason."""
+    finish reason and the stop it matched."""
     calls = []
 
     def network(request):
@@ -56,6 +56,7 @@ def engine(provider, answer):
         events = [{"id": "fixture", "model": "tiny", "created": 1, "object": "text_completion", "choices": [{
             "index": 0, "text": "", "token_ids": [token],
             "finish_reason": whole["finish_reason"] if index == last else None,
+            **({"matched_stop": whole["matched_stop"]} if index == last and "matched_stop" in whole else {}),
             "logprobs": {"tokens": [logprobs["tokens"][index]], "top_logprobs": [], "text_offset": [-1],
                          "token_logprobs": [logprobs["token_logprobs"][index]]}}]}
             for index, token in enumerate(whole["token_ids"])]
@@ -314,6 +315,62 @@ def test_an_engine_that_cannot_serve_fails_the_draw_with_an_infrastructure_error
         for server in servers:
             server.close()
     assert isinstance(caught.value.__cause__, openai.APIStatusError)
+
+
+@pytest.mark.parametrize("provider", ["vllm", "sglang"])
+def test_a_draw_a_stop_string_ends_is_cut_at_the_id_completing_it(provider):
+    """Both engines take the policy's stop strings as the request's `stop`, match them on the text they
+    decode, and say which one matched (vLLM's `stop_reason`, SGLang's `matched_stop`). vLLM keeps a
+    speculative block's ids past the one completing the string (vllm/v1/engine/detokenizer.py:118-131
+    at v0.30.0), so the draw ends at the first id whose text, by the policy's tokenizer, completes it:
+    terminated, with the likelihoods of the ids it keeps. Without the tokenizer that id is unknown."""
+    pieces = {3: "Hel", 5: "lo", 6: "!", 7: " How", 8: " are"}
+
+    def decode(ids):
+        return "".join(pieces[token] for token in ids)
+
+    drawn = [3, 5, 6, 7, 8] if provider == "vllm" else [3, 5, 6]
+    matched = {"stop_reason": "lo!"} if provider == "vllm" else {"matched_stop": "lo!"}
+    completion, calls = engine(provider, lambda _: {
+        **choice(provider, drawn, [-.5, -1., -.25, -2., -3.][:len(drawn)], "stop"), **matched})
+    sampling = Sampling(temperature=1.0, eos_token_ids=EOS, stop=("lo!",))
+    with pytest.raises(ValueError):
+        OpenAIRolloutServer(completion, sampling, pushed)
+    server = OpenAIRolloutServer(completion, sampling, pushed, decode=decode)
+    try:
+        draw = server.submit([1, 2], 8, key=11).result()
+    finally:
+        server.close()
+    assert (draw.tokens, draw.behavior_log_probs, draw.terminated) == ((3, 5, 6), (-.5, -1., -.25), True)
+    assert calls[0]["stop"] == ["lo!"]
+
+
+def test_a_stop_strings_id_is_found_where_a_longer_prefix_does_not_extend_a_shorter_ones_text():
+    """A tokenizer's text for a longer prefix need not extend a shorter one's: Transformers' cleanup
+    writes "a" "." as "a." where "a" " " alone is "a ". A stop string the second id completes ends the
+    draw there, though the whole draw's text no longer holds it, and ids that decode to nothing may sit
+    inside a string; ids that don't decode to the string the engine named are refused."""
+    pieces = {3: "a", 4: " ", 5: ".", 6: "", 7: "b"}
+
+    def decode(ids):
+        return "".join(pieces[token] for token in ids).replace(" .", ".")
+
+    # Ids that decode to nothing (a special token, skipped) may sit inside the string they complete.
+    for drawn, stop, kept in (([3, 4, 5], "a ", (3, 4)), ([3, 4, 5, 3, 4], "a ", (3, 4)),
+                              ([3, *[6] * 20, 7, 5], "ab", (3, *[6] * 20, 7)), ([3, 5, 5], "a ", None)):
+        completion, _ = engine("vllm", lambda _, drawn=drawn, stop=stop: {
+            **choice("vllm", drawn, [-.5] * len(drawn), "stop"), "stop_reason": stop})
+        server = OpenAIRolloutServer(completion, Sampling(temperature=1.0, eos_token_ids=EOS, stop=(stop,)),
+                                     pushed, decode=decode)
+        try:
+            pending = server.submit([1, 2], 8, key=11)
+            if kept is None:
+                with pytest.raises(ValueError):
+                    pending.result()
+            else:
+                assert pending.result().tokens == kept
+        finally:
+            server.close()
 
 
 def test_sglang_ids_are_read_without_likelihoods():
