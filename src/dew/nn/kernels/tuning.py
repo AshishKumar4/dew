@@ -64,6 +64,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import tokamax
+from jax.extend import core as jax_core
 from jax.extend.backend import get_default_device
 
 from dew import cache, coordination, records
@@ -478,8 +479,12 @@ def _traced(value: object) -> object:
 def _computation(function: Callable) -> str:
     """A digest of what `function` computes, the same in every process: its code, through nested code
     objects, with the names and constants it reads, and what it closes over or is partial in, a number
-    or string by value, an array by its shape and dtype, a function by its own digest. Two closures over
-    equal values digest alike; other code or other captured values digest apart."""
+    or string by value, an array or an abstract value by its shape and dtype, a jaxpr (a fused
+    consumer's) or a pytree's structure by its printed form, a function by its own digest. Two closures
+    over equal values digest alike; other code or other captured values digest apart. A capture of
+    another kind enters by its type and, where it prints no memory address, its printed form: every
+    process must key a launch alike to take process 0's config, so no capture keys by its address, and
+    two hooks that differ only in such a capture share a pick, which costs speed and never results."""
     digest = hashlib.sha256()
     visited: set[int] = set()
 
@@ -506,8 +511,11 @@ def _computation(function: Callable) -> str:
             static(item.__defaults__)
             for cell in item.__closure__ or ():
                 static(cell.cell_contents)
-        elif isinstance(item, (jax.Array, np.ndarray)):
-            digest.update(repr((item.shape, str(item.dtype))).encode())
+        elif isinstance(item, (jax_core.Jaxpr, jax_core.ClosedJaxpr, jax.tree_util.PyTreeDef)):
+            digest.update(str(item).encode())
+        elif hasattr(item, "shape") and hasattr(item, "dtype"):
+            # An array, a ShapeDtypeStruct or an abstract value: its shape and dtype.
+            digest.update(repr((tuple(item.shape), str(item.dtype))).encode())
         elif isinstance(item, (tuple, list)):
             for entry in item:
                 static(entry)
@@ -517,8 +525,9 @@ def _computation(function: Callable) -> str:
         elif item is None or isinstance(item, (bool, int, float, complex, str, bytes)):
             digest.update(repr(item).encode())
         else:
-            digest.update(f"{type(item).__module__}:{type(item).__qualname__}:"
-                          f"{getattr(item, '__name__', '')}".encode())
+            printed = repr(item)
+            kind = f"{type(item).__module__}:{type(item).__qualname__}:{getattr(item, '__name__', '')}"
+            digest.update(f"{kind}:{'' if ' at 0x' in printed else printed}".encode())
 
     static(function)
     return digest.hexdigest()[:16]
