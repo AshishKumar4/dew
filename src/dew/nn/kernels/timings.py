@@ -5,8 +5,8 @@ config, how it was measured, its samples, its lowering and compile times, its ou
 estimate where the launch has one. Where the environment variable `DEW_TIMINGS` names a directory
 (`directory`), `record` appends rows to `timings.jsonl` there; a caller builds rows only then, so with it
 unset or empty nothing is built, imported or written. The tuner's measurement loop is that caller
-(`tuning.observed`); logging only observes: it never tunes, never runs another config and never changes
-a pick or an error.
+(`tuning.observed`); logging only observes: it never tunes, never runs another config and changes no
+pick. A failure to log raises: logging was asked for.
 
 A row carries three kinds of field, so a ranker trained on them can only read the first:
 - predictors, which a trace has: the call, the config and the estimate (features join them);
