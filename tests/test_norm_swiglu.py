@@ -438,6 +438,27 @@ def test_stream_seam_takes_the_add_and_the_stream_cotangent(joined, dtype, shape
                           draw, leaves, "stream seam", SEEDS[shape])
 
 
+def assert_gated_norm_holds(draw, activation, output, name, seeds):
+    """The fused gated norm runs its forward and backward kernels on `draw(0)`, keeps XLA's output and
+    gradient dtypes, and holds check 1 for its output and its input, gate and weight gradients, in
+    `output`, over `seeds` draws."""
+    def gated(implementation, dtype):
+        return lambda x, gate, scale: gated_rms_normalized(x, gate, scale, 1e-6, dtype, activation,
+                                                           implementation=implementation)
+
+    def leaves(result):
+        return dict(zip(("y", "x", "gate", "scale"), result, strict=True))
+
+    operands, dy = draw(0)
+    fused = gated("pallas", output)
+    assert "rms_norm_forward" in kernels(fused, *operands)
+    assert "rms_norm_backward" in kernels(functools.partial(evaluated, fused), operands, dy)
+    actual = jax.jit(functools.partial(evaluated, fused))(operands, dy)
+    reference = jax.jit(functools.partial(evaluated, gated("xla", output)))(operands, dy)
+    assert [value.dtype for value in actual] == [value.dtype for value in reference]
+    assert_drawn_as_exact(fused, gated("xla", output), gated("xla", jnp.float64), draw, leaves, name, seeds)
+
+
 @pytest.mark.parametrize("activation", ["silu", "sigmoid"])
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
 @pytest.mark.parametrize("shape", [(2, 3, 4, 31), (2, 64, 16, 128)])
@@ -446,28 +467,13 @@ def test_gated_norm_and_every_gradient_hold_the_float64_gate(activation, dtype, 
     """Qwen3-Next's gated norm: the kernel's output and its input, gate and weight gradients on par
     with XLA's over the shape's seeds (check 1), its gate in the input's dtype or in bf16 beside an
     fp32 input, as a decode step's recurrence hands it over."""
-    def gated(implementation, output_dtype):
-        return lambda x, gate, scale: gated_rms_normalized(x, gate, scale, 1e-6, output_dtype, activation,
-                                                           implementation=implementation)
-
     def draw(seed):
         keys = jax.random.split(jax.random.fold_in(jax.random.key(51), seed), 4)
         x, gate, dy = (jax.random.normal(key, shape).astype(dtype) for key in keys[:3])
         gate = gate if gate_dtype == "same" else gate.astype(gate_dtype)
         return (x, gate, 0.7 + 0.2 * jax.random.normal(keys[3], shape[-1:])), dy
 
-    def leaves(result):
-        return dict(zip(("y", "x", "gate", "scale"), result, strict=True))
-
-    operands, dy = draw(0)
-    fused = gated("pallas", dtype)
-    assert "rms_norm_forward" in kernels(fused, *operands)
-    assert "rms_norm_backward" in kernels(functools.partial(evaluated, fused), operands, dy)
-    actual = jax.jit(functools.partial(evaluated, fused))(operands, dy)
-    reference = jax.jit(functools.partial(evaluated, gated("xla", dtype)))(operands, dy)
-    assert [value.dtype for value in actual] == [value.dtype for value in reference]
-    assert_drawn_as_exact(fused, gated("xla", dtype), gated("xla", jnp.float64), draw, leaves, "gated norm",
-                          SEEDS[shape])
+    assert_gated_norm_holds(draw, activation, dtype, "gated norm", SEEDS[shape])
 
 
 @pytest.mark.parametrize("activation", ["silu", "sigmoid"])
@@ -484,22 +490,7 @@ def test_a_decode_steps_gated_norm_of_an_fp32_input_by_a_bf16_gate_holds_the_flo
         scale = 0.7 + 0.2 * jax.random.normal(keys[3], shape[-1:])
         return (x, gate.astype(jnp.bfloat16), scale), dy.astype(output)
 
-    def gated(implementation, dtype):
-        return lambda x, gate, scale: gated_rms_normalized(x, gate, scale, 1e-6, dtype, activation,
-                                                           implementation=implementation)
-
-    def leaves(result):
-        return dict(zip(("y", "x", "gate", "scale"), result, strict=True))
-
-    operands, dy = draw(0)
-    fused = gated("pallas", output)
-    assert "rms_norm_forward" in kernels(fused, *operands)
-    assert "rms_norm_backward" in kernels(functools.partial(evaluated, fused), operands, dy)
-    actual = jax.jit(functools.partial(evaluated, fused))(operands, dy)
-    reference = jax.jit(functools.partial(evaluated, gated("xla", output)))(operands, dy)
-    assert [value.dtype for value in actual] == [value.dtype for value in reference]
-    assert_drawn_as_exact(fused, gated("xla", output), gated("xla", jnp.float64), draw, leaves,
-                          "decode gated norm", SEEDS[shape])
+    assert_gated_norm_holds(draw, activation, output, "decode gated norm", SEEDS[shape])
 
 
 def test_a_decode_steps_gated_norm_takes_the_fused_kernel_where_its_row_names_it():

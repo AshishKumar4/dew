@@ -239,7 +239,7 @@ def test_router_reductions_preserve_float64_scores(seq_aux):
         np.testing.assert_allclose(gradient, expected_gradient, rtol=0, atol=1e-15)
 
 
-def test_optimizer_dtype_overflow_backs_off_without_losing_the_prefix():
+def test_optimizer_dtype_overflow_backs_off_and_drops_its_window():
     import dataclasses
 
     class Cancellation(Objective):
@@ -267,14 +267,14 @@ def test_optimizer_dtype_overflow_backs_off_without_losing_the_prefix():
     prefix, _, _, _, accepted, _ = step(initial, batch)
     assert bool(accepted)
     # The step consumes the state, so the prefix is read before the rejected step.
-    prefix_accumulation = jax.tree.map(np.asarray, prefix.accumulation)
     prefix_params = jax.tree.map(np.asarray, prefix.variables)
-    # Each finalized contribution fits fp16; their fp32 sum does not.
+    # Each finalized contribution fits fp16; their fp32 sum does not. The rejection drops the window,
+    # its accepted first microbatch with it (`dropped_window`).
     rejected, loss, _, finite, accepted, _ = step(prefix, {"first": jnp.zeros((), dtype=bool)})
     assert bool(finite) and float(loss) == 0 and not bool(accepted)
-    assert int(rejected.step) == 2 and int(rejected.microstep) == 1 and int(rejected.updates) == 0
+    assert int(rejected.step) == 2 and int(rejected.microstep) == 0 and int(rejected.updates) == 0
     assert float(rejected.scale.scale) == .5
-    compare(rejected.accumulation, prefix_accumulation, exact=True)
+    assert all(not np.any(np.asarray(leaf)) for leaf in rejected.accumulation.statistics)
     compare(rejected.variables, prefix_params, exact=True)
 
 

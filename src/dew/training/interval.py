@@ -33,23 +33,16 @@ COMMITTED_TOKENS = "committed_tokens"
 """The checkpoint control field that holds a run's tokens, those its committed updates trained on."""
 
 
-def committed_tokens(control: dict, budget: int | None) -> int | None:
+def committed_tokens(control: dict) -> int:
     """The tokens a checkpoint's `control` says its run's committed updates trained on, taken out of
-    it, 0 where it counted none, and None where it cannot say: a checkpoint that counted every
-    step's tokens (`tokens`, before runs counted commits), a rejected attempt's and an unfinished
-    window's among them, or one resumed from such a checkpoint, which keeps the count unknown. A
-    run of steps resumes from it and keeps the count unknown in its own checkpoints; a run whose
-    length is its tokens (`budget`) cannot, and is refused."""
-    legacy = control.pop("tokens", None)
-    if COMMITTED_TOKENS in control:
-        return int(control.pop(COMMITTED_TOKENS))
-    if legacy is None:
-        return 0
-    if budget is not None:
-        raise ValueError(f"this checkpoint's run counted every step's tokens, not those its committed "
-                         f"updates trained on, so a run of tokens={budget} cannot resume from it; resume "
-                         "it by steps, or train afresh")
-    return None
+    it, 0 where it counted none. A checkpoint whose control counts every step's tokens under
+    `tokens`, a field runs wrote before they counted commits, is refused by name: its count holds
+    rejected attempts and unfinished windows, and no count of this Dew's reads it."""
+    if "tokens" in control:
+        raise ValueError("this checkpoint counts every step's tokens under 'tokens', a field runs wrote "
+                         f"before they counted their committed updates' ({COMMITTED_TOKENS!r}); resume it "
+                         "under the Dew release that wrote it, or train afresh from its weights")
+    return int(control.pop(COMMITTED_TOKENS, 0))
 
 
 class Book(NamedTuple):
@@ -126,7 +119,6 @@ class Interval:
     last_log_time: float
     last_saved: int | None
     tokens_before_log: int = 0
-    tokens_known: bool = True
     logged_tokens: jax.Array | None = None
     book: Book | None = None
     fresh: Book | None = None
@@ -177,19 +169,16 @@ class Interval:
             checked_streak(int(on_host(streak, step)), step, display)
 
     @classmethod
-    def resumed(cls, control: dict, budget: int | None, *, last_saved: int | None) -> Interval:
+    def resumed(cls, control: dict, *, last_saved: int | None) -> Interval:
         """An interval from now on, its token clock read off a checkpoint's `control`
-        (`committed_tokens`), which it takes the clock's fields out of."""
-        counted = committed_tokens(control, budget)
-        return cls(time.time(), last_saved=last_saved, tokens_before_log=counted or 0,
-                   tokens_known=counted is not None)
+        (`committed_tokens`), which it takes the clock's field out of."""
+        return cls(time.time(), last_saved=last_saved, tokens_before_log=committed_tokens(control))
 
     @property
     def token_control(self) -> dict[str, int]:
         """The token clock a checkpoint keeps (`Checkpoints.control`): the committed updates' real
-        tokens, or, where the run resumed a checkpoint that could not say (`committed_tokens`), the
-        count under the field that says so, so every checkpoint after it keeps saying so."""
-        return {COMMITTED_TOKENS if self.tokens_known else "tokens": self.real_tokens}
+        tokens."""
+        return {COMMITTED_TOKENS: self.real_tokens}
 
     @property
     def real_tokens(self) -> int:

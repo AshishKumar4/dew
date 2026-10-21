@@ -174,7 +174,7 @@ def torch_record(scheduler, grid, *, source=False):
 def main():
     from reference_releases import require
 
-    require("diffusers-limits")
+    pins = require("diffusers-limits")
     arrays = {}
     configs = {}
 
@@ -215,7 +215,7 @@ def main():
         save("target.kdpm2_" + str(ancestral).lower(), dict(sigma=sigma, ancestral=ancestral), [1, 0],
              (latent.detach().numpy()[None], gradient.numpy()))
     np.savez(FIXTURES / "limits.npz", **arrays)
-    (FIXTURES / "limits.json").write_text(json.dumps(dict(diffusers="0.34.0", mpmath="1.3.0", cases=configs), indent=1) + "\n")
+    (FIXTURES / "limits.json").write_text(json.dumps({**pins, "cases": configs}, indent=1) + "\n")
     print(f"{len(configs)} endpoint trajectories and VJPs written")
 
 

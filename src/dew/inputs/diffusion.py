@@ -59,7 +59,7 @@ def _row_guidance(record: Mapping[str, object], default: float | None) -> float:
     return float(value)
 
 
-def latent_image_conditions(autoencoder, params, pixels, mask, key):
+def latent_image_conditions(autoencoder, params, pixels, mask, key, noise=None):
     """Turns normalized pixels and a binary pixel mask into native UNet inputs.
 
     Returns mask [B,h,w,1] and masked_image [B,h,w,C] under the model keyword
@@ -71,7 +71,7 @@ def latent_image_conditions(autoencoder, params, pixels, mask, key):
     if mask.shape != (*pixels.shape[:-1], 1):
         raise ValueError("Image and mask geometry must match, with one mask channel")
     mask = (mask >= 0.5).astype(jnp.float32)
-    latent = autoencoder.encode(params, pixels * (mask < 0.5), key)
+    latent = autoencoder.encode(params, pixels * (mask < 0.5), key, noise=noise)
     mask = torch_nearest_resize(mask, *latent.shape[1:3])
     return {"mask": mask, "masked_image": latent}
 

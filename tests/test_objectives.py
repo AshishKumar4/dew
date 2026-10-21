@@ -166,17 +166,31 @@ def test_a_supplied_gradient_is_what_the_trainer_steps_with():
     np.testing.assert_allclose(stepped["params"]["w"], expected, rtol=1e-6)
 
 
-def test_a_loss_mean_is_as_exact_as_numpys_float32_mean():
-    """Each of 64 rows' mean over 6144 squares, a small JEPA loss's count, within the float64 gate:
-    one reduction over every element left such a sum a float32 step from the correctly rounded one,
-    and the JEPA loss a float32 ulp from float64 on some weights, several times numpy's distance."""
-    from reference_error import assert_as_exact_as_the_reference
+ROW_MEAN_SEEDS = 8
+"""Check 1's declared seeds for the row means, sized by `seeds_for` (2026-10-21, on armada)."""
 
-    squares = np.square(np.random.default_rng(0).normal(1.2, 1.0, size=(64, 6144))).astype(np.float32)
+
+def squared_rows(seed: int) -> tuple[np.ndarray]:
+    """64 rows of 6144 squares, a small JEPA loss's count."""
+    return (np.square(np.random.default_rng(seed).normal(1.2, 1.0, size=(64, 6144))).astype(np.float32),)
+
+
+def row_means(squares):
     ratio = Objective.row_mean(jnp.asarray(squares), {}, axis=1)
-    rows = np.asarray(ratio.total / ratio.mass)
-    assert_as_exact_as_the_reference(rows, squares.mean(axis=1), squares.astype(np.float64).mean(axis=1),
-                                     "row means")
+    return ratio.total / ratio.mass
+
+
+def test_a_loss_mean_is_as_exact_as_numpys_float32_mean():
+    """Each of 64 rows' mean over 6144 squares, a small JEPA loss's count, on par with numpy's mean
+    (check 1): one reduction over every element left such a sum a float32 step from the correctly
+    rounded one, and the JEPA loss a float32 ulp from float64 on some weights, several times numpy's
+    distance."""
+    from reference_error import assert_as_exact
+
+    assert_as_exact(jax.jit(row_means), lambda squares: squares.mean(axis=1), squared_rows, "row means",
+                    seeds=ROW_MEAN_SEEDS)
+    (squares,) = squared_rows(0)
+    ratio = Objective.row_mean(jnp.asarray(squares), {}, axis=1)
     # Each row's sum is the correctly rounded one, compiled too, and its derivative is the plain
     # sum's, ones.
     correct = squares.astype(np.float64).sum(axis=1).astype(np.float32)

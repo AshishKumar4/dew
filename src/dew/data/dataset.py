@@ -79,8 +79,15 @@ class DataPartition:
     """This process's place among the share's readers, in process order (0 for the first)."""
     row_multiple: int = 1
     """Number of distinct row shards this reader feeds within its host."""
+    window: int = 1
+    """The steps an update pools (`Trainer`'s accumulation): a batch ramp changes stage only where an
+    update begins (`Ramp.stages`). It cuts the stream into steps and names no data, so it is no part
+    of what a share reads."""
 
     def __post_init__(self):
+        if self.window < 1:
+            raise ValueError(f"a data partition's window is the steps an update pools, at least 1; got "
+                             f"{self.window}")
         if not 0 <= self.index < self.count or not 0 <= self.reader < self.readers:
             raise ValueError(
                 f"a data partition is share index of count, 0 <= index < count, read "
@@ -90,7 +97,7 @@ class DataPartition:
             )
 
     @classmethod
-    def of(cls, mesh: Mesh) -> DataPartition:
+    def of(cls, mesh: Mesh, window: int = 1) -> DataPartition:
         """Return the share of every global batch this process reads on `mesh`.
 
         A batch's rows split over the row axes and no others: those the rules
@@ -107,7 +114,7 @@ class DataPartition:
         being the same rows. No share can then be read whole by each group, so
         such a mesh is refused.
         """
-        return _partition(mesh, batch_axes(mesh))
+        return dataclasses.replace(_partition(mesh, batch_axes(mesh)), window=window)
 
     def rows(self, batch: int) -> int:
         """Return how many rows of a `batch`-row global batch one share holds.
@@ -437,6 +444,32 @@ class Stage:
     records: int
 
 
+def _update_aligned(stages: tuple[Stage, ...], window: int) -> tuple[Stage, ...]:
+    """`stages` each beginning at the first multiple of `window` steps at or after the step it begins
+    at, counted from the run's first: every start is taken from the given schedule, not from the
+    stage before it moved, so no stage drifts past its own end, and a stage left with no step is
+    dropped. Each start's record is what the stages before it read up to it. A window is at least one
+    step."""
+    if window < 1:
+        raise ValueError(f"a ramp aligns its stages to updates of at least one step; got a window of "
+                         f"{window}")
+    starts, step = [], 0
+    for stage, after in itertools.pairwise(stages):
+        starts.append(step)
+        step += (after.records - stage.records) // stage.batch
+    starts.append(step)
+    moved = [-(-start // window) * window for start in starts]
+    aligned, records = [], 0
+    for index, (stage, start) in enumerate(zip(stages, moved, strict=True)):
+        end = moved[index + 1] if index + 1 < len(stages) else None
+        if end == start:
+            continue
+        if aligned:
+            records += (start - aligned[-1][1]) * aligned[-1][0].batch
+        aligned.append((Stage(batch=stage.batch, records=records), start))
+    return tuple(stage for stage, _ in aligned)
+
+
 @dataclasses.dataclass(frozen=True)
 class Ramp:
     """Grows the global batch over the run's first records.
@@ -456,9 +489,15 @@ class Ramp:
     the ramp with nothing else saved. A stage lasts
     `ceil(samples / increments / batch)` steps, computed as one integer ratio
     instead of MaxText's two floating-point divisions, so the boundaries are
-    exact. Where the ramp ends, MaxText's loader drops what is left of its
-    buffered batch while Dew keeps reading, so from then on MaxText reads
-    later records than Dew in each step, although the batch sizes match.
+    exact. A run whose updates pool several steps (`DataPartition.window`)
+    begins each stage where an update does, at the first update boundary at or
+    after the step it would begin at, as MaxText and torchtitan apply a batch
+    schedule per optimizer step: no update pools two stages' batches, and a
+    boundary moves by less than one update. The records stay the position, so a
+    run resumed under another window cuts its stages again. Where the ramp
+    ends, MaxText's loader drops what is left of its buffered batch while Dew
+    keeps reading, so from then on MaxText reads later records than Dew in each
+    step, although the batch sizes match.
     """
 
     # MaxText reference: configs/base.yml:755-765 and
@@ -468,8 +507,9 @@ class Ramp:
     increment: int
     samples: int
 
-    def stages(self, final: int) -> tuple[Stage, ...]:
-        """Return every stage of the ramp up to `final`, the run's own global batch.
+    def stages(self, final: int, window: int = 1) -> tuple[Stage, ...]:
+        """Return every stage of the ramp up to `final`, the run's own global batch, each beginning
+        where an update of `window` steps does.
 
         Each stage's batch has to split evenly into the mesh's rows, and so
         into the shares its readers read; the trainer checks every stage
@@ -499,15 +539,16 @@ class Ramp:
             records += -(-self.samples // (increments * batch)) * batch
             batch += self.increment
         stages.append(Stage(batch=final, records=records))
-        return tuple(stages)
+        return _update_aligned(tuple(stages), window)
 
-    def steps_for(self, records: int, final: int) -> int:
-        """Return the number of steps a run takes to read `records` records under this ramp.
+    def steps_for(self, records: int, final: int, window: int = 1) -> int:
+        """Return the number of steps a run of updates of `window` steps takes to read `records`
+        records under this ramp.
 
         Early steps read fewer records, so a pass over a corpus takes more
         steps than it would with the final batch from the start.
         """
-        stages = self.stages(final)
+        stages = self.stages(final, window)
         steps = 0
         for stage, next_stage in itertools.pairwise(stages):
             if records < next_stage.records:
@@ -580,9 +621,9 @@ class Loader:
             return self.records // self.batch
         return self.ramp.steps_for(self.records, self.batch)
 
-    def epoch_steps(self, epochs: int = 1) -> int:
-        """Return the number of steps that `epochs` passes over the records take, refusing passes
-        too short to fill a batch.
+    def epoch_steps(self, epochs: int = 1, window: int = 1) -> int:
+        """Return the number of steps that `epochs` passes over the records take, in updates of
+        `window` steps (`Ramp.stages`), refusing passes too short to fill a batch.
 
         A batch ramp grows the batch over the run's first records once, so its
         smaller early steps count once across all the passes, not once a pass.
@@ -595,7 +636,8 @@ class Loader:
                 "without one, so give the run length in steps"
             )
         records = epochs * self.records
-        steps = records // self.batch if self.ramp is None else self.ramp.steps_for(records, self.batch)
+        steps = (records // self.batch if self.ramp is None
+                 else self.ramp.steps_for(records, self.batch, window))
         if steps == 0:
             raise ValueError(f"{records} records do not fill one batch of {self.batch}, so {epochs} epochs "
                              "are no steps at all: read more data, lower the batch, or count the run in "
@@ -1371,7 +1413,9 @@ def ramped(dataset: Loader, ramp: Ramp) -> Loader:
     records it handed over. A stream that batches its own records reports a
     shard offset and is refused, by name.
     """
-    stages = ramp.stages(dataset.batch)  # An impossible schedule fails here, not mid-run.
+    # An impossible schedule fails here, not mid-run. Moving its stages to update boundaries
+    # (`Ramp.stages`' window) cannot make one impossible, so this checks the schedule as given.
+    ramp.stages(dataset.batch)
 
     def train(partition: DataPartition) -> Iterator[Batch]:
         stream = dataset.train(partition)
@@ -1384,7 +1428,7 @@ def ramped(dataset: Loader, ramp: Ramp) -> Loader:
         if isinstance(stream, Resumable):
             state = stream.get_state()
             if isinstance(state, bytes) and position.translates(state):
-                return RampedStream(stream, stages, partition)
+                return RampedStream(stream, ramp.stages(dataset.batch, partition.window), partition)
         if isinstance(stream, Closeable):
             stream.close()
         raise TypeError(

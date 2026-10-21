@@ -39,6 +39,9 @@ class DPOObjective(TokenScorer):
 
     keeps_whole_logits = False
 
+    scored_fields = (IDS_KEY, MASK_KEY)
+    """Validation scores the chosen responses of the pairs alone, for their perplexity."""
+
     def __init__(self, model, seq_len: int, beta: float = 0.1, **options):
         if beta <= 0:
             raise ValueError(f"beta scales the KL term, so it is positive, got {beta}")
@@ -106,13 +109,7 @@ class DPOObjective(TokenScorer):
             "accuracy": accuracy,
         }, qk_stats=policy.qk), policy
 
-    def evaluate(self, params, batch, step):
-        """Return per-token scores of the chosen responses under the policy, for their perplexity,
-        compiled for the current modules over the pairs alone (`_evaluation_scores`)."""
-        pairs = {IDS_KEY: batch[IDS_KEY], MASK_KEY: batch[MASK_KEY]}
-        return self._compiled_scores(self.evaluation_variables(params, step), pairs, step.key)
-
-    def _evaluation_scores(self, params, batch, key) -> TokenScores:
+    def _evaluation_scores(self, params, batch, step) -> TokenScores:
         """The chosen responses' per-token cross entropies, with the shifted
         completion mask as weights."""
         chosen_ids, _, _, _ = self._halves(batch)
