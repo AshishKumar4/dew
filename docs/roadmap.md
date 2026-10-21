@@ -35,6 +35,7 @@ Correctness, contract gaps and duplicated paths come first. After those close, m
 - Stream a pretrained start onto the trainer's mesh, one device shard at a time, with no whole copy on the host. [848]
 - Keep a merged FP8 base finite through training on H100's FP8 tensor cores. [841]
 - Settle whether a remat rung's step is bitwise its plain step on an sm86 GPU, or held by the float64 gate. [847]
+- Hold the Triton grouped GEMM's gradient to XLA's error under the fp32-master tile gate. [863]
 - Hold the full suite to ten minutes of wall time when it runs as more tasks than containers. [826]
 - Prove a counted first-fit or concatenating pack resumes with loader workers as it does without. [845]
 - Make the live kernel's preparation smoke deterministic about the contexts a closed page leaves open. [843]
