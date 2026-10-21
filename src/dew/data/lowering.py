@@ -134,6 +134,16 @@ class _Materialized(Protocol):
     ran: tuple[Stage, ...]
 
 
+def _cache_inputs(source: Source, records: Records) -> pygrain.MapDataset:
+    """The records a cache over `source` reads by index, the rows a memory read made each at the
+    source position it came from (`_Placed`), where a step among the cached ones that reads its
+    record's index (`map_with_index`) reads it, as it does without the cache."""
+    stored = pygrain.MapDataset.source(records)
+    if isinstance(source, _Materialized) and source.identifiers:
+        return stored.map_with_index(_Placed(identifiers=source.identifiers))
+    return stored
+
+
 def _threads(stages: Sequence[Stage]) -> int | None:
     """The most records a fetch among `stages` runs at once on a pool of its own (`Fetch.threads`),
     or None where none has one."""
@@ -915,7 +925,7 @@ class _Build:
             # A memory read that ran no step before the cache holds the rows of the source it keys,
             # which the cache reads by their places there, its missing inputs among them.
             records = keyed.records(self.read)
-            stored = pygrain.MapDataset.source(records)
+        stored = _cache_inputs(keyed, records)
         filled, manifest, prefix = _fill(pipeline, keyed, cache, self.read)
         # Read by input, as the source's own rows are: its missing inputs skipped, as the uncached
         # root skips them, and written by the fill; one record for each input reads by index and in
