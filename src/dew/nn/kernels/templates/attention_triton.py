@@ -106,16 +106,11 @@ def _hook_program(name: str, hook, kinds: tuple[Kind, ...], dtypes: tuple[str, .
     positions = (jax.ShapeDtypeStruct((tile, 1), jnp.int32), jax.ShapeDtypeStruct((1, tile), jnp.int32))
     if not differentiated:
         return tuning.program(hook, square, *positions, *params)
-    floating = [index for index, param in enumerate(params) if jnp.issubdtype(param.dtype, jnp.floating)]
+    floating = algebra.floating_params(params)
 
     def pulled(s, q_pos, k_pos, *values):
-        def scored(s, *wide):
-            merged = list(values)
-            for index, value in zip(floating, wide, strict=True):
-                merged[index] = value
-            return hook(s, q_pos, k_pos, *merged)
-
-        out, pull = jax.vjp(scored, s, *(values[index] for index in floating))
+        hooked = algebra.differentiable(hook, q_pos, k_pos, values, floating)
+        out, pull = jax.vjp(hooked, s, *(values[index] for index in floating))
         return out, pull(jnp.ones_like(out))
 
     return tuning.program(pulled, square, *positions, *params)
@@ -133,7 +128,7 @@ def _spanned(specs: list[jax.ShapeDtypeStruct], arrays: list[jax.Array]) -> list
     return arrays
 
 
-def _tile_param(ref, kind: Kind, head, queries: jax.Array, keys: jax.Array | None):
+def _tile_param(ref, kind: Kind, head, queries: jax.Array, keys: pl.Slice | None):
     """A hook parameter's values for a tile, as `kind` lays them out: the head's scalar, the tile's
     queries' `[block_q, 1]`, its keys' `[1, block_k]`, its entries' or its output rows'."""
     match kind:
@@ -156,64 +151,71 @@ def _forward_kernel(*refs, spec: algebra.Forward, score_kinds: tuple[Kind, ...],
     gives it (every tile, the causal diagonal's, or the spans' block map), issuing the tile's two
     products and calling the algebra between them (`attention_algebra`)."""
     refs = list(refs)
-    spanned = spec.form == "spans"
-    bounds_ref, start_ref, end_ref = (refs.pop(0), refs.pop(0), refs.pop(0)) if spanned else (None,) * 3
-    query_ids_ref, key_ids_ref = (refs.pop(0), refs.pop(0)) if spec.ids else (None, None)
+    narrowing, bounds, key_ids = {}, None, {}
+    if spec.form == "spans":
+        # Only spans read their block map's bounds and their queries' intervals.
+        bounds_ref = refs.pop(0)
+        bounds = bounds_ref[0], bounds_ref[1]
+        narrowing = {"start": refs.pop(0)[...], "end": refs.pop(0)[...]}
+    if spec.ids:
+        narrowing["query_ids"] = refs.pop(0)[...]
+        key_ids["ref"] = refs.pop(0)
     query_ref, key_ref, value_ref = refs.pop(0), refs.pop(0), refs.pop(0)
     score_refs = [refs.pop(0) for _ in score_kinds]
     output_refs = [refs.pop(0) for _ in output_kinds]
-    initial_refs = (refs.pop(0), refs.pop(0), refs.pop(0)) if initial else ()
+    initial_refs = [refs.pop(0) for _ in range(3 if initial else 0)]
     out_ref, *residual_refs = refs
     block_q = query_ref.shape[0]
     head = pl.program_id(2)
     first_query = pl.program_id(0) * block_q
+    tiles = -(-spec.keys // block_k)
+    if bounds is not None:
+        lo, hi = bounds
+    elif spec.form == "causal":
+        lo, hi = 0, jnp.minimum(-(-(first_query + block_q) // block_k), tiles)
+    else:
+        lo, hi = 0, tiles
     query = query_ref[...]
     q_pos = first_query + jnp.arange(block_q)[:, None]
-    narrowing = {"start": start_ref[...], "end": end_ref[...]} if spanned else {}
-    if spec.ids:
-        narrowing["query_ids"] = query_ids_ref[...]
 
-    def step(index, carry):
-        state, arg = carry if residuals else (carry, None)
+    def advance(index, state: algebra.Partial):
         tile = pl.ds(index * block_k, block_k)
         coords = algebra.Coords(q_pos, index * block_k + jnp.arange(block_k)[None, :], **narrowing,
-                                key_ids=key_ids_ref[tile] if spec.ids else None)
+                                key_ids=key_ids["ref"][tile] if spec.ids else None)
         params = tuple(_tile_param(ref, kind, head, q_pos, tile)
                        for ref, kind in zip(score_refs, score_kinds, strict=True))
         logits = algebra.modify(spec, _dot(query, key_ref[tile, :].T, interpret), coords, params)
-        if residuals:
-            arg = algebra.argmax(arg, logits, coords.k_pos)
         m, alpha = algebra.peak(spec, state.m, logits)
         weights = algebra.weights(spec, logits, m)
         denominator = algebra.total(state.total, alpha, weights)
         # The values load after the softmax, where jax's mha loads them.
         value = value_ref[tile, :]
         acc = algebra.rescale(state.acc, alpha) + _dot(algebra.narrow(weights, value.dtype), value, interpret)
-        state = algebra.Partial(acc, m, denominator)
-        return (state, arg) if residuals else state
+        return algebra.Partial(acc, m, denominator), logits, coords
+
+    def step(index, state: algebra.Partial) -> algebra.Partial:
+        return advance(index, state)[0]
+
+    def tracked(index, carry: tuple[algebra.Partial, algebra.Argmax]):
+        # A training forward's step: the anchor key too, for the backward.
+        state, logits, coords = advance(index, carry[0])
+        return state, algebra.argmax(carry[1], logits, coords.k_pos)
 
     start = (algebra.resumed(spec, *(ref[...] for ref in initial_refs)) if initial
              else algebra.empty(block_q, value_ref.shape[-1]))
+    output_params = tuple(_tile_param(ref, kind, head, q_pos, None)
+                          for ref, kind in zip(output_refs, output_kinds, strict=True))
     if residuals:
-        start = start, algebra.no_argmax(block_q)
-    tiles = -(-spec.keys // block_k)
-    if spanned:
-        lo, hi = bounds_ref[0], bounds_ref[1]
-    elif spec.form == "causal":
-        lo, hi = 0, jnp.minimum(-(-(first_query + block_q) // block_k), tiles)
+        state, arg = jax.lax.fori_loop(lo, hi, tracked, (start, algebra.no_argmax(block_q)))
+        residual_refs[2][...] = arg.key
     else:
-        lo, hi = 0, tiles
-    state = jax.lax.fori_loop(lo, hi, step, start)
-    state, arg = state if residuals else (state, None)
-    out, m, denominator = algebra.finish(
-        spec, state, initial=initial, output_mod=output_mod,
-        output_params=tuple(_tile_param(ref, kind, head, q_pos, None)
-                            for ref, kind in zip(output_refs, output_kinds, strict=True)))
+        state = jax.lax.fori_loop(lo, hi, step, start)
+    out, m, denominator = algebra.finish(spec, state, initial=initial, output_mod=output_mod,
+                                         output_params=output_params)
     out_ref[...] = out.astype(out_ref.dtype)
     if residuals:
         residual_refs[0][...] = m
         residual_refs[1][...] = denominator
-        residual_refs[2][...] = arg.index
 
 
 @dataclasses.dataclass(frozen=True)
@@ -294,8 +296,7 @@ class TritonForward(Template[Tiles]):
         return (tuple(out) if residuals else out[0]), None
 
     def space(self, ba: tokamax.BoundArguments) -> Sequence[Tiles]:
-        queries, keys = ba.arguments["query"].shape[1], ba.arguments["key"].shape[1]
-        return tuple(tiles for tiles in SPACE if queries % tiles.block_q == 0 and keys % tiles.block_k == 0)
+        return _dividing(SPACE, ba)
 
     def staged_bytes(self, ba: tokamax.BoundArguments, config: Tiles) -> int:
         """The shared memory a program holds: the query tile, and each pipeline stage's key and value
@@ -335,10 +336,16 @@ class TritonForward(Template[Tiles]):
     def operands(self, specs: list[jax.ShapeDtypeStruct], seed: int) -> list[jax.Array]:
         return _spanned(specs, super().operands(specs, seed))
 
-    def traced(self, name: str, value: object) -> object:
+    def traced(self, name: str, value: Callable | str | None) -> str | None:
         if name == "output_mod":
             return _hook_program(name, value, self.output_kinds, self.output_dtypes, width=self.output_width)
         return _hook_program(name, value, self.score_kinds, self.score_dtypes)
+
+
+def _dividing[T: (Tiles, BackwardTiles)](space: tuple[T, ...], ba: tokamax.BoundArguments) -> tuple[T, ...]:
+    """The configs of `space` whose tiles divide the launch's padded queries and keys."""
+    queries, keys = ba.arguments["query"].shape[1], ba.arguments["key"].shape[1]
+    return tuple(tiles for tiles in space if queries % tiles.block_q == 0 and keys % tiles.block_k == 0)
 
 
 def _param_spec(kind: Kind, param: jax.Array, block_q: int, keys: int) -> pl.BlockSpec:
@@ -635,9 +642,7 @@ class TritonBackward(Template[BackwardTiles]):
         return (*dq_out, *dkv_out), None
 
     def space(self, ba: tokamax.BoundArguments) -> Sequence[BackwardTiles]:
-        queries, keys = ba.arguments["query"].shape[1], ba.arguments["key"].shape[1]
-        return tuple(tiles for tiles in BACKWARD_SPACE
-                     if queries % tiles.block_q == 0 and keys % tiles.block_k == 0)
+        return _dividing(BACKWARD_SPACE, ba)
 
     def staged_bytes(self, ba: tokamax.BoundArguments, config: BackwardTiles) -> int:
         """The shared memory a program of either launch holds, the larger, in the operands' dtype: a dQ
@@ -661,7 +666,7 @@ class TritonBackward(Template[BackwardTiles]):
     def operands(self, specs: list[jax.ShapeDtypeStruct], seed: int) -> list[jax.Array]:
         return _spanned(specs, super().operands(specs, seed))
 
-    def traced(self, name: str, value: object) -> object:
+    def traced(self, name: str, value: Callable | str | None) -> str | None:
         return _hook_program(name, value, self.score_kinds, self.score_dtypes, differentiated=True)
 
 
@@ -714,6 +719,15 @@ def _launch_cost(ba: tokamax.BoundArguments, config: BackwardTiles, target: gene
     return seconds
 
 
+def _geometry(query, key, value, start, end, query_ids, key_ids, block_q: int, block_k: int):
+    """A backward launch's sizes (rows, padded queries, query heads, widths, padded keys, a key head's
+    group) and the spans' block map at its tiles."""
+    batch, queries, heads, width = query.shape
+    keys, kv_heads, value_width = key.shape[1], key.shape[2], value.shape[-1]
+    blocks = block_map(KeySpans(start, end, query_ids, key_ids, keys), block_q, block_k)
+    return batch, queries, heads, width, keys, value_width, heads // kv_heads, blocks
+
+
 def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_index, anchor_value, start,
                end, query_ids, key_ids, score_params, *, score_mod, score_kinds: tuple[Kind, ...],
                scale: float, block_q: int, block_k: int, warps: int, stages: int,
@@ -729,10 +743,8 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
     partials), query (`[B, H, Qp]`) and tile (`[B, H, Qp, Kp]`) parameters."""
     from jax.experimental.pallas import triton as plgpu
 
-    batch, queries, heads, width = query.shape
-    keys, kv_heads, value_width = key.shape[1], key.shape[2], value.shape[-1]
-    group = heads // kv_heads
-    blocks = block_map(KeySpans(start, end, query_ids, key_ids, keys), block_q, block_k)
+    batch, queries, heads, width, keys, value_width, group, blocks = _geometry(
+        query, key, value, start, end, query_ids, key_ids, block_q, block_k)
     bounds = jnp.stack([blocks.lo, blocks.hi], axis=-1).astype(jnp.int32)
     ids = query_ids is not None
     per_query = pl.BlockSpec((None, block_q), lambda i, b, h: (b, i))
@@ -793,10 +805,8 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
     each key head's group, and the gradients of the score hook's key parameters (`[B, H, Kp]`)."""
     from jax.experimental.pallas import triton as plgpu
 
-    batch, queries, heads, width = query.shape
-    keys, kv_heads, value_width = key.shape[1], key.shape[2], value.shape[-1]
-    group = heads // kv_heads
-    blocks = block_map(KeySpans(start, end, query_ids, key_ids, keys), block_q, block_k)
+    batch, queries, heads, width, keys, value_width, group, blocks = _geometry(
+        query, key, value, start, end, query_ids, key_ids, block_q, block_k)
     ranges = jnp.stack([blocks.q_lo, blocks.q_hi], axis=-1).astype(jnp.int32)
     ids = query_ids is not None
     whole_queries = pl.BlockSpec((None, queries), lambda j, b, h: (b, 0))

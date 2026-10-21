@@ -172,7 +172,7 @@ def spans(queries: int, keys: int, batch: int, *, causal: bool = False, sliding_
     if starts is not None:
         start = jnp.maximum(start, starts.astype(jnp.int32)[:, None])
     narrowed = (sliding_window, chunk, segment_ids, lengths, starts)
-    form = "spans" if any(item is not None for item in narrowed) else "causal" if causal else "full"
+    form = "spans" if any(narrowing is not None for narrowing in narrowed) else "causal" if causal else "full"
     return KeySpans(start, end, query_ids, key_ids, keys, form)
 
 
@@ -464,13 +464,16 @@ def padded_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySp
     def pad(array, rows, columns):
         return jnp.pad(array, ((0, 0), (0, rows - array.shape[1]), (0, 0), (0, columns - array.shape[3])))
 
-    def pad_rows(array, rows):
-        return None if array is None else jnp.pad(array, ((0, 0), (0, rows - array.shape[1])))
+    def pad_rows(array: jax.Array, rows: int) -> jax.Array:
+        return jnp.pad(array, ((0, 0), (0, rows - array.shape[1])))
+
+    def pad_ids(array: jax.Array | None, rows: int) -> jax.Array | None:
+        return None if array is None else pad_rows(array, rows)
 
     return PaddedCall(pad(query, padded_q, padded_d), pad(key, padded_k, padded_d),
                    pad(value, padded_k, padded_dv), pad_rows(spans.start, padded_q),
-                   pad_rows(spans.end, padded_q), pad_rows(spans.query_ids, padded_q),
-                   pad_rows(spans.key_ids, padded_k),
+                   pad_rows(spans.end, padded_q), pad_ids(spans.query_ids, padded_q),
+                   pad_ids(spans.key_ids, padded_k),
                    tuple(_padded(param, padded_q, padded_k, padded_dv) for param in hooks.score_params),
                    tuple(_padded(param, padded_q, padded_k, padded_dv) for param in hooks.output_params),
                    queries, keys)

@@ -280,9 +280,11 @@ def _located(name: str) -> type:
 def _launch_json(ba: tokamax.BoundArguments) -> dict[str, JSON]:
     """A launch as JSON: its op as its picks name it (`_identity`) and its arguments, a hook among them
     by its presence (`_traced`)."""
-    hooks = getattr(ba.op, "HOOKS", ())
-    return {"op": encoded(_identity(ba.op)),
-            "arguments": {name: encoded(ba.op.traced(name, value) if name in hooks else value)
+    op = ba.op
+    hooks = op.HOOKS if isinstance(op, KernelOp) else ()
+    return {"op": encoded(_identity(op)),
+            "arguments": {name: encoded(op.traced(name, value) if isinstance(op, KernelOp) and name in hooks
+                                        else value)
                           for name, value in ba.arguments.items()}}
 
 
@@ -505,7 +507,7 @@ class KernelOp(tokamax.Op):
                           else self.traced(name, spec) if name in self.HOOKS else spec
                           for name, spec in key.items()})
 
-    def traced(self, name: str, value: object) -> object:
+    def traced(self, name: str, value: Callable | str | None) -> str | None:
         """The hook field or argument `name`'s value as this op's picks key it: what each function in it
         computes (`program`, at the arguments the template traces it at), the rest of it as it is. An op
         naming `HOOKS` defines it."""
@@ -555,8 +557,9 @@ def program(function: Callable, *arguments: jax.ShapeDtypeStruct) -> str:
 def _identity(op: tokamax.Op) -> tokamax.Op:
     """`op` as its picks name it: without the config, the vjp and the device
     check a call sets, its hook fields by what they compute (`KernelOp.traced`)."""
-    fields = {field.name for field in dataclasses.fields(op)}
-    hooks = {name: op.traced(name, getattr(op, name)) for name in getattr(op, "HOOKS", ()) if name in fields}
+    fields = {field.name: field for field in dataclasses.fields(op)}
+    hooks = ({name: op.traced(name, getattr(op, name)) for name in op.HOOKS if name in fields}
+             if isinstance(op, KernelOp) else {})
     return op.replace(config=None, vjp=None, bypass_device_check=False, **hooks)
 
 
