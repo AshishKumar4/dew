@@ -1032,11 +1032,6 @@
    "lane": "Training",
    "by": "2026-11-20"
   },
-  "tests/test_tread.py": {
-   "comparisons": 1,
-   "lane": "Models, Serving & RL",
-   "by": "2026-11-13"
-  },
   "tests/test_vae.py": {
    "comparisons": 1,
    "lane": "Models, Serving & RL",
