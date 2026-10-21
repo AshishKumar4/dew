@@ -107,6 +107,13 @@ class AutoEncoder(ABC):
         """H / h, the spatial factor between a frame and its latent."""
 
     @property
+    def stochastic(self) -> bool:
+        """Whether encoding samples its latent, so a training step draws each example's `noise`
+        (`encode_batch`). A deterministic encoder (DC-AE, RAE) is False and refuses noise, raising
+        TypeError naming itself."""
+        return True
+
+    @property
     @abstractmethod
     def latent_channels(self) -> int:
         """c, the number of channels in a latent."""

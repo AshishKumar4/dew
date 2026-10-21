@@ -707,8 +707,8 @@ class DiffusionObjective(Objective[Ratio]):
 
     def _posterior_noise(self, step: Step | None, name: str, pixels) -> jax.Array | None:
         """Each example's standard normal draw for its latent's posterior (`posterior_latent`), None
-        outside a step."""
-        if step is None or self.autoencoder is None:
+        outside a step or for a deterministic encoder (`AutoEncoder.stochastic`)."""
+        if step is None or self.autoencoder is None or not self.autoencoder.stochastic:
             return None
         shape = self.autoencoder.latent_shape(tuple(pixels.shape[1:]))
         return step.sample(name, jax.random.normal, shape, dtype=jnp.float32, rows=pixels.shape[0])

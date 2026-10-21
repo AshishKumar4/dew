@@ -104,6 +104,10 @@ class TunedAutoEncoder(AutoEncoder):
         return self.autoencoder.downscale_factor
 
     @property
+    def stochastic(self) -> bool:
+        return self.autoencoder.stochastic
+
+    @property
     def latent_channels(self) -> int:
         return self.autoencoder.latent_channels
 

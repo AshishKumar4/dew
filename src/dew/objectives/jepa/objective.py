@@ -243,7 +243,7 @@ class JepaObjective(Objective[Ratio]):
         predictions = self.predictor.apply(
             thaw(part(variables, PREDICTOR)),
             repeated,
-            jnp.repeat(context_idx, num_targets, axis=0),
+            jnp.repeat(context_idx, num_targets, axis=0, out_sharding=explicit_spec(context_idx)),
             target_idx.reshape(batch_size * num_targets, -1),
             train=step.training, rngs=model_rngs(dropout_key, training=step.training),
         )

@@ -398,12 +398,13 @@ def _repae_step(tmp_path: Path, dtype) -> SimpleNamespace:
                                                   "var": STEPPED[f"bn/running_var_before{tail}"]})}
     batch = {"image": jnp.asarray(STEPPED["pixels"], dtype),
              **inputs.tokenize([str(label) for label in STEPPED["classes"]])}
-    # The step reads train_repae's own times, noise and dropped labels by name (`Step.tape`), drawn as
-    # tools/repae_reference.py draws them; the autoencoder's posterior draw is the attempt's key's.
+    # The step reads train_repae's own posterior draw, times, noise and dropped labels by name
+    # (`Step.tape`), drawn as tools/repae_reference.py draws them.
     keys = jax.random.split(jax.random.key(int(STEPPED["key"])), 5)
     rows = len(STEPPED["classes"])
     latents = (rows, *task.latent_shape)
-    tape = {"times": presets.Flow(density="uniform")().schedule.sample_t(keys[2], rows),
+    tape = {"posterior": jax.random.normal(keys[0], latents, jnp.float32),
+            "times": presets.Flow(density="uniform")().schedule.sample_t(keys[2], rows),
             "noise": jax.random.normal(keys[3], latents, jnp.float32),
             "condition dropout": jnp.asarray(STEPPED["dropped"])}
     step = Step(step=jnp.asarray(0), key=jax.random.key(int(STEPPED["key"])), ema=None, tape=tape)

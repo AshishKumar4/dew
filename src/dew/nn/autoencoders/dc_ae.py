@@ -391,7 +391,10 @@ class DCAE(nn.Module):
                                 self.decoder_norms, self.decoder_activations, self.interpolate, self.dtype)
 
     def encode(self, image, key=None, noise=None):
-        """The latent of `image`; the encoder is deterministic, so `key` and `noise` are unused."""
+        """The latent of `image`. The encoder is deterministic: `key` is unused, and a posterior's
+        `noise` raises TypeError, since it has none to draw."""
+        if noise is not None:
+            raise TypeError(f"{type(self).__name__} encodes deterministically and draws no posterior noise")
         return self.encoder(image)
 
     def decode(self, latents):
@@ -499,6 +502,10 @@ class DCAutoencoder(ModuleAutoEncoder[DCAE]):
         super().__init__(model, params)
         self.latent_scale = latent_scale
         self.latent_shift = latent_shift
+
+    @property
+    def stochastic(self) -> bool:
+        return False
 
     def record_arguments(self) -> dict:
         return {'latent_scale': self.latent_scale, 'latent_shift': self.latent_shift}

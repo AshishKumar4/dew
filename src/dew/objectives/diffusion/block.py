@@ -366,11 +366,12 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         """
         rows, length = response.shape
         low, high = self.safety_epsilon, 1 - self.safety_epsilon
-        time = step.sample("times", lambda key: jax.random.uniform(key, (1,), minval=low, maxval=high),
+        time = step.sample("times", lambda key: jax.random.uniform(key, (1,), jnp.float32, low, high),
                            rows=rows)
         keep = step.sample("kept", jax.random.uniform, (length,), dtype=jnp.float32, rows=rows) < 1 - time
         vocab = self.model.vocab_size
-        noise = step.sample("noise", lambda key: jax.random.randint(key, (length,), 0, vocab), rows=rows)
+        noise = step.sample("noise", lambda key: jax.random.randint(key, (length,), 0, vocab, jnp.int32),
+                            rows=rows)
         noisy = step.boundary("noised input", jnp.where(keep, response, noise))
         eligible = canvas_mask.reshape(rows, self.num_canvases, self.canvas_size).any(axis=-1)
         valid_canvases = eligible.sum(axis=-1)
