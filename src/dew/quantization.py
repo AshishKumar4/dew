@@ -1191,6 +1191,48 @@ def _providers() -> tuple[type, type]:
     return QtProvider, PtqProvider
 
 
+def split_columns(leaf, widths: Sequence[int], *, axis: int = -1) -> list:
+    """`leaf` split into one leaf a member along `axis` by `widths`, a packed projection's kernel
+    taken back into its members' (`dew.inference.projections.unpacked`): a plain array, host or
+    device, as `np.split` or `jnp.split` would; a Qwix QArray with its values split and each scale
+    and zero point split as its own axis is, shared (one entry) kept whole by every member, per
+    channel split at the same columns, per tile at the tiles' (a member that would cut a tile is
+    refused); and the serving tree's wrapper of one (Qwix's annotated array, `array` its field) as
+    the QArray inside it, its recipe kept. A JAX array that no device of this process holds whole
+    splits where it lives; any other on the host."""
+    edges = np.cumsum(widths)[:-1].tolist()
+
+    def arrays(value, ratio: int = 1):
+        if value is None:
+            return [None] * len(widths)
+        if isinstance(value, jax.Array) and not (value.is_fully_addressable or (
+                value.is_fully_replicated and value.sharding.has_addressable_devices)):
+            return jnp.split(value, [edge // ratio for edge in edges], axis=axis)
+        return np.split(np.asarray(value), [edge // ratio for edge in edges], axis=axis)
+
+    if isinstance(leaf, (jax.Array, np.ndarray)):
+        return arrays(leaf)
+    qwix = _qwix()
+    if isinstance(leaf, qwix.QArray):
+        total = leaf.qvalue.shape[axis]
+
+        def scaled(value):
+            if value is None or value.shape[axis] == 1:
+                return [value] * len(widths)
+            tile = total // value.shape[axis]
+            if any(width % tile for width in widths):
+                raise ValueError(f"members {list(widths)} cut the scales' tiles of {tile} columns")
+            return arrays(value, tile)
+
+        parts = zip(arrays(leaf.qvalue), scaled(leaf.scale), scaled(leaf.zero_point), strict=True)
+        return [dataclasses.replace(leaf, qvalue=value, scale=scale, zero_point=zero)
+                for value, scale, zero in parts]
+    if dataclasses.is_dataclass(leaf) and isinstance(getattr(leaf, "array", None), qwix.QArray):
+        return [dataclasses.replace(leaf, array=part)
+                for part in split_columns(leaf.array, widths, axis=axis)]
+    raise TypeError(f"a {type(leaf).__name__} is not a packed kernel this splits")
+
+
 def _rules(spec: Quantization, training: bool) -> list:
     """One Qwix rule per pattern of `spec`, in its order: quantized-training
     rules with the backward fields, or serving rules. A weight-only rule
@@ -1265,4 +1307,4 @@ def quantize_for_serving(model: nn.Module, variables: Variables, spec: Quantizat
     return served, {**variables, "params": parameters}
 
 
-__all__ = ["InputQuantization", "Quantization"]
+__all__ = ["InputQuantization", "Quantization", "split_columns"]

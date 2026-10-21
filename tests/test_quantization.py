@@ -1299,3 +1299,36 @@ def assert_step_moves_by_the_hosts_gradient():
         with jax.enable_x64(new_val=True):
             truth = flat(jax.tree.map(lambda leaf: np.asarray(leaf, np.float64), gradient(jnp.float64)))
     assert_as_exact_as_the_reference(flat(moved), reference, truth, "an int8 training step's gradient")
+
+
+@pytest.mark.parametrize("tile", [None, 16], ids=["per channel", "tiled"])
+def test_a_quantized_packed_kernel_splits_into_its_members_bit_for_bit(tile):
+    """A served task's packed query, key and value kernel, Qwix's quantized array in its serving wrapper,
+    split by its members' widths (`split_columns`): each member dequantizes to exactly the packed
+    kernel's dequantized columns, with the wrapper's recipe kept, per-channel scales and tiled ones
+    alike; a split that would cut a tile is refused."""
+    import json
+    from pathlib import Path
+
+    import dew
+    from dew.quantization import split_columns
+
+    qwix = pytest.importorskip("qwix")
+    directory = Path(__file__).parent / "fixtures/hf/llama-tiny"
+    served = dew.pipeline(str(directory), dtype="float32").quantized(
+        Quantization(weight_only=True, patterns=(".*_proj",), tile_size=tile))
+    packed = served.variables["params"]["layers_0"]["self_attn"]["qkv_proj"]["kernel"]
+    config = json.loads((directory / "config.json").read_text())
+    width = packed.array.qvalue.shape[-1]
+    heads, kv_heads = config["num_attention_heads"], config["num_key_value_heads"]
+    head = width // (heads + 2 * kv_heads)
+    widths = (heads * head, kv_heads * head, kv_heads * head)
+    members = split_columns(packed, widths)
+    whole = np.asarray(qwix.dequantize(packed.array))
+    edges = np.cumsum((0, *widths))
+    for member, start, stop in zip(members, edges[:-1], edges[1:], strict=True):
+        assert member.how == packed.how
+        np.testing.assert_array_equal(np.asarray(qwix.dequantize(member.array)), whole[..., start:stop])
+    if tile is not None:
+        with pytest.raises(ValueError):
+            split_columns(packed, (tile // 2, width - tile // 2))
