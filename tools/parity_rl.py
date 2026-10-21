@@ -224,8 +224,14 @@ def write_advantage_recording(verl, tunix, command: str, out: Path) -> None:
                 "rloo_advantage": rloo_advantage(inputs["rewards"], GROUP),
                 "gae_advantage": advantages, "gae_return": returns}
 
+    def tunix_float32(inputs):
+        # The recording runs where x64 is enabled, where a constant Tunix makes without a dtype (its
+        # scan's carry) would be float64; its float32 run is the one without x64.
+        with jax.enable_x64(new_val=False):
+            return tunix_advantages(tunix, inputs, jnp.float32)
+
     evaluations = {"verl": lambda inputs: (verl_advantages(verl, inputs, torch.float32), truth(inputs)),
-                   "tunix": lambda inputs: (tunix_advantages(tunix, inputs, jnp.float32), truth(inputs))}
+                   "tunix": lambda inputs: (tunix_float32(inputs), truth(inputs))}
     for name, evaluate in evaluations.items():
         with jax.enable_x64(new_val=True):
             recorded = record_case(name, advantage_inputs, evaluate, proxy, truth_proxy=proxy,
