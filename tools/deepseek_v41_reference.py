@@ -279,11 +279,13 @@ def reset(net):
 
 
 def forward(net, ids, start_pos=0):
-    """Transformer.forward (model.py:1241-1272) under autograd, full logits."""
+    """The release's Transformer.forward (V4.1's model.py:1241-1272) under autograd, every
+    position's logits."""
     return type(net).forward.__wrapped__(net, ids, start_pos)
 
 
 def draft(net, ids, main_hidden, start_pos):
+    """The release's Transformer.forward_spec, DSpark's draft."""
     return type(net).forward_spec.__wrapped__(net, ids, main_hidden, start_pos)
 
 
@@ -498,14 +500,15 @@ def stepped(net, gradients, ids) -> np.ndarray:
     return logits.numpy()
 
 
-def cached(net, ids) -> dict[str, np.ndarray]:
-    """The prefill of the first PROMPT tokens, the teacher-forced steps after
-    it and DSpark's draft after each."""
+def cached(net, ids, *, reset=reset, prompt=PROMPT, length=LENGTH) -> dict[str, np.ndarray]:
+    """The prefill of the first `prompt` tokens after the release's `reset`, the
+    teacher-forced steps after it to `length` and DSpark's draft after each: the
+    driver every DSpark release's reference runs (deepseek_v4_dspark_reference.py)."""
     decode_logits, draft_ids, draft_logits, draft_confidence = [], [], [], []
     reset(net)
-    next_ids, prompt_logits, main_hidden = forward(net, ids[:, :PROMPT])
+    next_ids, prompt_logits, main_hidden = forward(net, ids[:, :prompt])
     draft(net, next_ids[:, -1], main_hidden, 0)
-    for position in range(PROMPT, LENGTH):
+    for position in range(prompt, length):
         next_ids, step_logits, main_hidden = forward(net, ids[:, position:position + 1], position)
         decode_logits.append(step_logits[:, 0])
         drafted = draft(net, next_ids[:, -1], main_hidden, position)
