@@ -21,9 +21,14 @@ from uuid import uuid4
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax.experimental import multihost_utils
 
-from dew.coordination import PeerFailure, agree_process_phase, agreed, broadcast_from_process_zero
+from dew.coordination import (
+    PeerFailure,
+    agree_process_phase,
+    agreed,
+    agreed_same,
+    broadcast_from_process_zero,
+)
 from dew.data.dataset import DataPartition
 from dew.inference.rollouts import check_ending
 from dew.nn.inputs import ModelInputs, mesh_of
@@ -681,13 +686,11 @@ class EpisodeRollout:
             signature = (tasks.size, self.groups, self.max_turns, self.max_prompt_tokens,
                          self.max_new_tokens, self.sampling, int(state.step), int(state.updates),
                          tuple(np.asarray(jax.random.key_data(key)).tolist()), self.journal is not None)
-            return tasks, policy, np.frombuffer(hashlib.sha256(repr(signature).encode()).digest(), np.uint8)
-        tasks, policy, signature = agreed("episode preparation", prepare)
+            return tasks, policy, repr(signature)
+        tasks, policy, described = agreed("episode preparation", prepare)
+        described = agreed_same("episode task counts, budgets, sampling and clocks", lambda: described)
+        signature = np.frombuffer(hashlib.sha256(described.encode()).digest(), np.uint8)
         processes, rank = jax.process_count(), jax.process_index()
-        if processes > 1:
-            multihost_utils.assert_equal(
-                signature, "episode task counts, budgets, sampling and clocks must agree"
-            )
         binding_id = broadcast_from_process_zero(uuid4().hex if rank == 0 else None)
         policy_step = int(state.updates)
         slots = self._slots(tasks, state, key, rank)
