@@ -27,7 +27,8 @@ There are three templates: attention, linear recurrence and GEMM. Each one meets
   structure   per call, data          Splash-style block info, Megablox group metadata, chunk indices, pages
   toolkit     per generation, shared  pipeline, tile scheduler, machine primitives JAX lacks, cost features
   mainloop    per template x gen.     which products, where accumulators live, the overlap, the launch DAG
-  choice      one                     legality prune, then measured picks, and later a learned ranker on evidence
+  choice      per template, inside    the config chooser: legality, then a model over device facts picking
+                                      tiles and formulations; opt-in measured tuning; no routing, no tables
 ```
 
 The rule: a lower layer contains no decision an upper one owns. A mainloop never masks, applies a hook, narrows a dtype or does softmax or recurrence math. The algebra never issues a product or knows its GPU.
@@ -193,7 +194,7 @@ Rule 0 applies: use Splash's MaskInfo, with its empty/partial/full classes and p
 - the epilogue overlap;
 - for recurrence, its launch DAG: a fused or split solve (FlashQLA's fused prologue and fused scan against fla's four launches), and sequential or parallel state passing, chosen by B·H. Its sm90 shape includes a compute-producer warpgroup role, like FA4's correction warpgroup.
 
-**Every accelerator.** The templates target every accelerator Dew runs on, on par with the best framework on each. Each mainloop claims the generations below. A claim holds only with a measured scoreboard row on one GPU of that generation (booked through the GPU lane), in one session against the best kernel there. A generation without a measured row routes to XLA or the best external kernel (§9), never to an unmeasured mainloop.
+**Every accelerator.** The templates target every accelerator Dew runs on, on par with the best framework on each. Each mainloop claims the generations below. A claim holds only with a measured scoreboard row on one GPU of that generation (booked through the GPU lane), in one session against the best kernel there. Until a generation has its measured row, its calls stay on today's routes (the interim selector, §7) or XLA, never on an unmeasured mainloop; a generation the template never claims runs XLA by a fixed capability rule.
 
 | Mainloop | Backend | Claims | Instructions it relies on | One GPU per claim |
 |---|---|---|---|---|
@@ -256,8 +257,12 @@ A second copy of the algebra written in triton.language is not an acceptable ans
 
    Today's A100 forward meets this at the best configuration (template 1.730 ms vs jax 1.709 ms, causal). It misses at some configurations: V loaded early stays live through the softmax, and the fix is being measured.
 
-## 7. Choice: one chooser
+## 7. Choice: the config chooser inside each template
 
+**No kernel tables and, in the end, no selector.** The end state is one implementation per operation, the template. What stays is the config chooser inside each template: legality, then a model over device facts that picks tiles and formulations (§3), like any kernel's heuristics, with no per-GPU entries. Measured tuning is opt-in, cached per device kind, and the user's choice. Scoreboards are evidence, never routing data: no runtime table of measured routes is built.
+
+- **Interim:** today's typed selector (`selection`, `generation.route`) keeps serving the hand-kernel and external routes until each is deleted (§9). It isn't extended, and it goes with the last route.
+- **A generation the template doesn't claim** (§6) runs XLA by a fixed capability rule, not a measured choice. Where XLA beats the template on a claimed generation, that's a template defect to fix (§6, "debug where XLA wins"), not a route.
 - **Legality prunes; predictions rank.** Only hard constraints remove a configuration: it fits shared memory, registers and TMEM, and respects layout and instruction rules. Residency, predicted spills and roofline estimates are predictions, so they rank the legal space and never prune it. Today's analytic model ties all 36 attention configurations and ties the dense pick with the best tile; pruning on it would keep an arbitrary subset.
 - **Rank with complete analytic features**, one schema for all templates:
   - work per pipe and bytes per memory level;
@@ -270,7 +275,7 @@ A second copy of the algebra written in triton.language is not an acceptable ans
   - the skip fraction from structure;
   - serial chain length and independent chains, since the recurrence scan is latency-bound at few heads;
   - the GPU's facts as dimensionless ratios.
-- **Measured top-k (opt-in)** through `tuning.py` and Tokamax's autotuner, cached per (template, shape bucket, dtype, layout, mainloop, architecture) and invalidated when the environment changes.
+- **Measured top-k (opt-in, the user's choice)** through `tuning.py` and Tokamax's autotuner, cached per device kind (template, shape bucket, dtype, layout, mainloop) and invalidated when the environment changes.
 - **The learned ranker, the owner's request, behind evidence.** Every timing is logged with its features from day one: autotuner runs, scoreboards and sweeps, including a few random configurations per job. Then:
   - a gradient-boosted residual over the analytic estimate is trained per template family;
   - it is selected by pairwise accuracy and peak@k, and validated on held-out models and on a third, cheaper GPU type (L4 or L40S);
@@ -278,7 +283,7 @@ A second copy of the algebra written in triton.language is not an acceptable ans
   - outside its training range, the analytic estimate decides alone.
 
   Budget: about 2,000 configurations timed per GPU-hour, shape diversity before configuration count, and active collection where the model is unsure.
-- **External kernels are not configurations.** Template against cuBLAS, FA3 or CUTLASS is a measured scoreboard row per shape bucket, a table that expires when the route is deleted. This one chooser replaces `templates/base.choose` and the per-template cost formulas.
+- **External kernels are not configurations.** The template against cuBLAS, FA3 or CUTLASS is scoreboard evidence for deleting a route, never a routing choice. Each template's chooser replaces `templates/base.choose` and the per-template cost formulas.
 
 ## 8. Determinism, D and the backward
 
@@ -307,7 +312,7 @@ A second copy of the algebra written in triton.language is not an acceptable ans
   - `fla_gdn.py`, `fla_kda.py`, `mamba_ssd.py`, `ssd.py`, and the portable chunk math as a separate algebra;
   - `ragged_dot.py`, `triton_dense.py`, `norm_swiglu.py` (once its callers outside GEMM move), and the per-template cost formulas;
   - `KeySpans`, when MaskInfo takes over;
-  - each external route when its row is met, and with the last of them, the choice among implementations.
+  - each external route when its row is met, and with the last of them the typed selector itself: one implementation per operation remains, the template, with XLA by a fixed capability rule on a generation it doesn't claim (§7).
 
 ## 10. Sharding, remat and compile
 
