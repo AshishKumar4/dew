@@ -149,20 +149,27 @@ def _invocation(entry: Piped, input: Pipeline, pipeline: Pipeline) -> dict[str, 
         settings = {name: _value(setting, name) for name, setting in entry.settings}
         made = entry.function(input, *(_read_value(arg) for arg in args),
                               **{name: _read_value(setting) for name, setting in settings.items()})
+        same = isinstance(made, Pipeline) and _makes(entry, made, pipeline)
     except (TypeError, ValueError) as refused:
         # `_Unrecordable` among them: the call is written as the stages it made instead.
         _log.info("the call of %s is recorded as the stages it made: %s", entry.function, refused)
         return None
-    if not isinstance(made, Pipeline):
-        return None
-    if entry.input is None:
-        same = (made.source is pipeline.source and len(made.stages) == entry.end
-                and _same(made.stages[entry.start:], pipeline.stages[entry.start:entry.end], "call") is None)
-    else:
-        same = (len(made.stages) == entry.end
-                and _same(made.source, pipeline.source, "call", sequences=True) is None
-                and _same(made.stages, pipeline.stages[:entry.end], "call") is None)
     return {"pipe": path, "args": args, "settings": settings} if same else None
+
+
+def _makes(entry: Piped, made: Pipeline, pipeline: Pipeline) -> bool:
+    """Whether `made`, `entry`'s call made again, is what it made in `pipeline`: the same stages from
+    the same store, or, where it made another store, a store reading the same records."""
+    if entry.input is None:
+        return (made.source is pipeline.source and len(made.stages) == entry.end
+                and _same(made.stages[entry.start:], pipeline.stages[entry.start:entry.end], "call") is None)
+    again, had = made.source, pipeline.source
+    if isinstance(again, Source) and isinstance(had, Source):
+        same_store = json_value(again.fingerprint(), "store") == json_value(had.fingerprint(), "store")
+    else:
+        same_store = _same(again, had, "call", sequences=True) is None
+    return (same_store and len(made.stages) == entry.end
+            and _same(made.stages, pipeline.stages[:entry.end], "call") is None)
 
 
 def _value(value: object, where: str) -> JSON:

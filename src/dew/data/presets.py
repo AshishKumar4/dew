@@ -30,7 +30,7 @@ from dew.data import (
     text as text_steps,
     video as video_steps,
 )
-from dew.data.pipeline import Configured, DeviceStep, Pack
+from dew.data.pipeline import Configured, DeviceStep, Limit, Pack, Repeat, Shuffle, Slice, Windows
 
 if TYPE_CHECKING:
     from collections.abc import Iterator
@@ -149,6 +149,30 @@ def lm(dataset: Dataset, tokenizer: str | PreTrainedTokenizerBase | None, *, seq
         if tokenizer is None:
             _documented(dataset)
         windows = _next_token_windows(documents, Pack(seq_len + 1, bins=bins, policy=pack))
+    return _finished(windows, batch=batch, records=records, host=host)
+
+
+def token_windows(dataset: Dataset, *, seq_len: int, batch: int, stride: int | None = None,
+                  records: int | None = None, host: tuple[HostStep, ...] = ()) -> Pipeline:
+    """A token store's stream of tokens (`TokenFiles`) cut into windows of `seq_len` inputs and their
+    targets, `stride` apart (`seq_len` where None), read by index: each window a record of the
+    store's, whose rows and valid targets it states, in batches of `batch` (`records` and `host` as
+    `images` takes them). A shuffle, repeat or take written before it orders and selects the
+    windows; its holdout takes the store's own split (`holdout(split="val")`)."""
+    from dew.data.sources.tokens import TokenFiles
+
+    chain = dataset._chain()
+    store = chain.source
+    if not isinstance(store, TokenFiles):
+        raise ValueError(f"token_windows reads a token store's stream (TokenFiles), not "
+                         f"{type(store).__name__}")
+    views = (Shuffle, Repeat, Slice, Limit)
+    stages = [type(stage).__name__ for stage in chain.stages if not isinstance(stage, views)]
+    if stages:
+        raise ValueError(f"token_windows orders the windows of {store.describe()}, which {stages} would "
+                         "change first; pipe the store itself, a shuffle, repeat or take of it at most")
+    # Windows written first on the store read its stream by index; the views then order them.
+    windows = dataclasses.replace(chain, stages=(Windows(seq_len, stride=stride), *chain.stages))
     return _finished(windows, batch=batch, records=records, host=host)
 
 
