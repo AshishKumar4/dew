@@ -34,11 +34,11 @@ forms, and `patterns` is its `quant_cfg_path`, written inline as the regexes
 Qwix matches. The backward fields are Qwix's finer-grained version of the
 same idea.
 
-Three MaxText settings have no equivalent, and `dtype` accepts neither of
-the first two. Static activation scaling (`fp8_full`) needs a calibration
-pass that Dew has no hook for, `nanoo_fp8` uses AMD-only kernels, and
-KV-cache quantization has nothing to read it here because the cache holds
-the compute dtype.
+Two MaxText settings have no equivalent, and `dtype` accepts neither.
+Static activation scaling (`fp8_full`) needs a calibration pass that Dew
+has no hook for, and `nanoo_fp8` uses AMD-only kernels. KV-cache
+quantization is not a weight quantization: the cache's own layout stores
+int8 or float8 keys and values (`dew.nn.kv_cache`).
 
 Qwix comes with the `quantization` extra (`pip install "dewml[quantization]"`).
 It is imported inside the calls that need it, and without the package those

@@ -1212,9 +1212,11 @@ def reference_attention(query, key, value, *, mask=None, bias=None, sinks=None, 
     (modeling_gemma2.py:192-208), and `sinks` `[H]` put one value-free logit
     per head in the softmax's denominator (`sink_softmax`). Keys and values
     may carry fewer heads. Without sinks they repeat to the query's, as flax
-    repeats them, which keeps flax's rounding; a sink layer decodes over its
-    whole cache here, since no fused kernel takes sinks, so there the query
-    heads group over their key head and no key or value repeats.
+    repeats them, which keeps flax's rounding; with sinks the query heads
+    group over their key head and no key or value repeats, as the decode
+    selector (`attention_kernels.decodes`) needs where it routes a sink
+    layer here rather than to the fused decode kernel, which takes sinks on a
+    GPU.
     """
     query, key, value = promote_dtype(query, key, value, dtype=dtype)
     dtype = query.dtype
