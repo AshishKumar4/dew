@@ -1023,7 +1023,9 @@ BOUNDARIES = jnp.asarray([0, 65535, 65536, 131071, 131072, 196608, 262143], jnp.
 def test_a_262144_vocabulary_computes_in_float64_and_picks_optaxs_top1_on_cpu(softcap):
     """Seven targets spanning chunk boundaries: a float64 head makes no float32 value in its
     forward or its backward, so it is the float64 truth the gate's other heads are measured from,
-    and its top-1 columns are Optax's full-vocabulary logits'."""
+    and its top-1 columns are Optax's full-vocabulary logits'. The losses and gradients of the same
+    boundary targets are held to the whole logits' in fp32 on a Gemma-sized head (check 1,
+    `test_a_gemma_sized_vocabulary_is_as_exact_as_the_whole_logits`)."""
     rng = np.random.default_rng(713)
     with jax.enable_x64(), jax.default_device(jax.devices("cpu")[0]):
         hidden = jnp.asarray(rng.normal(size=(7, 5)), jnp.float64)
@@ -1161,7 +1163,7 @@ def test_the_whole_logits_head_computes_what_the_tiled_one_does(dtype, softcap):
             return dict(zip(names, (losses, log_z, *gradients), strict=True))
         return scored
 
-    assert_as_exact(jax.jit(run(RAGGED)), jax.jit(run(None)), draw, f"{dtype} {softcap} whole logits",
+    assert_as_exact(jax.jit(run(None)), jax.jit(run(RAGGED)), draw, f"{dtype} {softcap} whole logits",
                     seeds=SEEDS["whole logits"])
     hidden, head, targets, _ = draw(0)
     table = OutputTable(head, vocab_major=False, softcap=softcap)
