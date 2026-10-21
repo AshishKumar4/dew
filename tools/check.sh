@@ -21,9 +21,10 @@ gate() {
   fi
 }
 # The duplicate-code scan takes as long as several gates together and reads nothing they write, so it
-# runs beside them and reports last.
+# runs beside them and reports last. Main still holds copies (ledger 896-950), so a checkout is held to
+# adding none to origin/main's (tools/duplicates.py); the scan needs that ref and its history.
 duplicates=$(mktemp)
-"$python" tools/duplicates.py src/dew tools tests > "$duplicates" 2>&1 &
+"$python" tools/duplicates.py --base=origin/main src/dew tools tests examples site > "$duplicates" 2>&1 &
 scan=$!
 gate locks sh -c 'sh tools/lock_environment.sh && git diff --exit-code --stat locks/'
 gate flake8 "$python" -m flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics \

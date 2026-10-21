@@ -5,17 +5,18 @@
 - As structure: two functions in different files whose bodies are equal once every name is renamed in the
   order it is first used, every constant is read as its type, and docstrings and annotations are dropped
   (at least `FUNCTION_NODES` syntax nodes), fail. So do six consecutive statements of two statement lists in
-  different files, equal the same way (at least `WINDOW_NODES` nodes). A class's annotated fields and a run
-  of calls to one function (a parser's arguments, a registry's entries) are declarations: no window, and
-  in a function one statement, as the data they declare is not logic.
+  different files, equal the same way (at least `WINDOW_NODES` nodes), each copy named once. Imports, stubs
+  (a protocol's members), a class's annotated fields and a run of calls to one function (a parser's
+  arguments, a registry's entries, a config's fields read one by one) are declarations: no window, and in
+  a function one statement, as the data they declare is not logic.
 
     python tools/duplicates.py [--base=REF] PATH...
 
 Every hit is printed, and any hit fails. With `--base`, a structural hit the merge-base of REF and HEAD
 already had, the same copies by file and enclosing function, is printed and does not fail: main still holds
-the duplicates its first run found (ledger 896-950), and a head is held to adding none. CI's lint job and
-the lanes' lint gate run it with main as the base until main's last one goes, when tools/check.sh runs it
-with none. tests/test_duplicates.py runs it on copied code.
+the copies its first run found (ledger 896-950), and a head is held to adding none. tools/check.sh (CI's
+lint job, the lanes' lint gate) runs it held to origin/main until main's last copy goes, then with no
+base. tests/test_duplicates.py runs it on copied code.
 
 It runs the test environment's pylint, which pyproject.toml's test extra pins.
 """
@@ -36,13 +37,15 @@ ARGUMENTS = ("--disable=all", "--enable=duplicate-code", "--min-similarity-lines
              "--ignore-signatures=y", "--ignore-docstrings=y", "--ignore-comments=y", "--score=n")
 """The text reading's one statement of the check, which the gate and its test both run."""
 
-FUNCTION_NODES = 40
+FUNCTION_NODES = 20
 """The fewest syntax nodes a function's body has for its copies to count: below it, a body says too little
-(a property, a one-line delegation) for two to be one logic."""
+(a property, a one-line delegation) for two to be one logic. The least that holds every copy the first run
+filed: the smallest, two classes' two-line constructors (ledger 934), has 21."""
 WINDOW = 6
 """Consecutive statements a window holds, as pylint's six lines."""
-WINDOW_NODES = 60
-"""The fewest syntax nodes six statements hold for their copies to count."""
+WINDOW_NODES = 28
+"""The fewest syntax nodes six statements hold for their copies to count; the first run's smallest copy of
+six statements (ledger 920) has 28."""
 
 BODIES = ("body", "orelse", "finalbody")
 DROPPED = {"ctx", "type_comment", "decorator_list", "returns", "annotation", "type_params", "kind"}
@@ -69,13 +72,23 @@ class Hit:
 
 
 def declaration(statement: ast.stmt) -> bool:
-    """A docstring, or a bare string standing as one."""
+    """A docstring or a bare string standing as one, an import, or a stub: a function whose body is only
+    `...` or `pass` (a protocol's member)."""
+    if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        body = [line for line in statement.body if not docstring(line)]
+        return len(body) <= 1 and all(
+            isinstance(line, ast.Pass) or (isinstance(line, ast.Expr) and isinstance(line.value, ast.Constant)
+                                           and line.value.value is Ellipsis) for line in body)
+    return docstring(statement) or isinstance(statement, (ast.Import, ast.ImportFrom))
+
+
+def docstring(statement: ast.stmt) -> bool:
     return (isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Constant)
             and isinstance(statement.value.value, str))
 
 
 def stripped(node: ast.AST, field: str, statements: list[ast.stmt]) -> list[ast.stmt]:
-    """`node`'s statement list without its docstrings, nor a class's annotated fields."""
+    """`node`'s statement list without its declarations, nor a class's annotated fields."""
     fields = isinstance(node, ast.ClassDef) and field == "body"
     return [statement for statement in statements
             if not declaration(statement) and not (fields and isinstance(statement, ast.AnnAssign))]
@@ -125,14 +138,15 @@ def digest(parts: Sequence[list[str]]) -> str:
 
 
 def callee(statement: ast.stmt) -> str | None:
-    """The function a statement that is only a call calls, as written."""
-    if isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Call):
+    """The function a statement that is only a call, or only names a call's result, calls, as written."""
+    if isinstance(statement, (ast.Expr, ast.Assign)) and isinstance(statement.value, ast.Call):
         return ast.dump(statement.value.func)
     return None
 
 
 def declarative(window: Sequence[ast.stmt]) -> bool:
-    """A run of calls to one function (a parser's arguments, a registry's entries): data, not logic."""
+    """A run of calls to one function (a parser's arguments, a registry's entries, a config's fields read
+    one by one): data, not logic."""
     called = {callee(statement) for statement in window}
     return len(called) == 1 and None not in called
 
@@ -189,12 +203,17 @@ def structural(sources: dict[str, str]) -> list[Hit]:
     for file, text in sorted(sources.items()):
         for kind, key, place, _ in units(file, ast.parse(text, filename=file)):
             found[kind, key].append(place)
-    hits = [Hit(kind, tuple(places)) for (kind, _), places in found.items()
-            if len({place.file for place in places}) > 1]
-    # A window inside copies a function hit already names is that hit.
+    hits = sorted((Hit(kind, tuple(places)) for (kind, _), places in found.items()
+                   if len({place.file for place in places}) > 1),
+                  key=lambda hit: [(place.file, place.line) for place in hit.places])
+    # A window inside copies a function hit already names is that hit, and the windows over the same copies
+    # (the same files and functions) are one copy, named at its first.
     functions = [hit.copies() for hit in hits if hit.kind == "function"]
-    return [hit for hit in hits
-            if hit.kind == "function" or not any(hit.copies() <= copies for copies in functions)]
+    windows: dict[frozenset[tuple[str, str]], Hit] = {}
+    for hit in hits:
+        if hit.kind == "statements" and not any(hit.copies() <= copies for copies in functions):
+            windows.setdefault(hit.copies(), hit)
+    return [hit for hit in hits if hit.kind == "function" or windows.get(hit.copies()) is hit]
 
 
 def python_files(paths: Sequence[str]) -> list[Path]:
