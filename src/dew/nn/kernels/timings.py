@@ -68,6 +68,7 @@ def observation(launch: str, call: str, config: str, *, device, method: dict, st
         'schema': SCHEMA, 'identity': IDENTITY, 'run': RUN, 'observation': uuid.uuid4().hex,
         'launch': _bounded(launch), 'call': _bounded(call), 'config': _bounded(config),
         'estimate_s': estimate_s, 'features': features,
+        'features_status': 'unsupported' if features is None else 'stated',
         'method': {key: _bounded(str(value)) for key, value in method.items()},
         'status': status, 'error': None if error is None else type(error).__name__,
         'samples_ms': [float(sample) for sample in samples_ms[:MAX_SAMPLES]],

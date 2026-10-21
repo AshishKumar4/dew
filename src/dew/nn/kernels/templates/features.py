@@ -71,11 +71,12 @@ def _predictions(costed: cost.Cost, facts: generation.GpuTarget) -> dict[str, fl
     - `flops`, the launch's tensor-core FLOPs; `intensity`, those per device byte;
     - `balance`, the target's tensor FLOPs per byte of memory bandwidth, and `ridge`, intensity over it
       (above one, the launch is the tensor cores' to bound, below, memory's);
-    - `waves`, the programs over what the multiprocessors hold at once, and `tail`, the last wave's idle
-      share;
+    - `waves`, the programs over what the multiprocessors hold at once, and `tail`, the share of the
+      last wave's slots no program fills;
     - `staged_per_step`, shared-memory bytes a program moves per pipeline step;
     - `hidden_steps`, the steps a stage in flight covers (`stages - 1`) and `waiting_share`, the waiting
-      term's share of a program's compute time (Little's law, `cost.seconds`)."""
+      term's share beside the resident programs' service time (`cost.program_seconds`,
+      `cost.waiting_seconds`, as `cost.seconds` reads them)."""
     flops = costed.programs * costed.program_flops
     multiprocessors, clock, bandwidth = facts.multiprocessors, facts.clock_hz, facts.memory_bandwidth
     rate = facts.tensor_rate(costed.mode) if costed.program_flops else None
@@ -84,10 +85,12 @@ def _predictions(costed: cost.Cost, facts: generation.GpuTarget) -> dict[str, fl
     intensity = flops / costed.device_bytes if costed.device_bytes else None
     slots = multiprocessors * costed.resident if multiprocessors is not None else None
     waves = costed.programs / slots if slots else None
-    tail = (math.ceil(waves) - waves) / math.ceil(waves) if waves else None
-    program = (costed.program_flops / (rate * clock)
-               if rate is not None and clock is not None and costed.program_flops else None)
-    waiting = (costed.steps * facts.load_latency / max(costed.stages - 1, 1) / clock
+    tail = math.ceil(waves) - waves if waves else None
+    # A launch with no tensor work reads no rate, as `cost.seconds` does.
+    service = 1.0 if not costed.program_flops else rate
+    program = (cost.program_seconds(costed, service, clock)
+               if service is not None and clock is not None else None)
+    waiting = (cost.waiting_seconds(costed, facts.load_latency, clock)
                if facts.load_latency is not None and clock is not None else None)
     return {
         'flops': flops, 'intensity': intensity, 'balance': balance,
@@ -96,5 +99,5 @@ def _predictions(costed: cost.Cost, facts: generation.GpuTarget) -> dict[str, fl
         'staged_per_step': costed.program_staged / costed.steps if costed.steps else None,
         'hidden_steps': max(costed.stages - 1, 1),
         'waiting_share': (waiting / (waiting + costed.resident * program)
-                          if waiting is not None and program is not None else None),
+                          if waiting is not None and program is not None and waiting + program else None),
     }
