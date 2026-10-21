@@ -51,17 +51,14 @@ class Flux2Autoencoder(ModuleAutoEncoder[AutoencoderKL]):
         self.decode_single_frame = jax.jit(lambda params, latent: model.apply(
             {"params": params}, pixel_shuffle(latent), method=model.decode))
         mean, variance = np.asarray(mean, np.float32), np.asarray(variance, np.float32)
-        self.normalization = LatentNormalization(
-            {'mean': mean, 'variance': variance, 'epsilon': epsilon}, mean,
-            1.0 / np.sqrt(variance + np.float32(epsilon)))
-        if (
-            self.latent_shift.shape != (4 * model.latent_channels,)
-            or self.latent_scale.shape != self.latent_shift.shape
-        ):
+        scale = 1.0 / np.sqrt(variance + np.float32(epsilon))
+        if mean.shape != (4 * model.latent_channels,) or scale.shape != mean.shape:
             raise ValueError(
-                f"batch-norm statistics {self.latent_shift.shape} do not hold one value per folded "
+                f"batch-norm statistics {mean.shape} do not hold one value per folded "
                 f"channel ({4 * model.latent_channels},)"
             )
+        self.normalization = LatentNormalization({'mean': mean, 'variance': variance, 'epsilon': epsilon},
+                                                 mean, scale)
 
     def record_arguments(self) -> dict:
         return dict(self.normalization.record)
