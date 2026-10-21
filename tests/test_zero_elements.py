@@ -23,6 +23,13 @@ def _sequential(values):
     return summed, (jnp.asarray(values, jnp.float32),)
 
 
+def _fraction(value) -> fractions.Fraction:
+    """An mpmath number exactly, its sign included (its mantissa is unsigned)."""
+    mantissa, exponent = value.man_exp
+    magnitude = fractions.Fraction(mantissa) * fractions.Fraction(2) ** exponent
+    return -magnitude if value < 0 else magnitude
+
+
 def _interpreted(function, *inputs):
     interpreter = Interpreter()
     [out] = interpreter.run(jax.make_jaxpr(function)(*inputs), *inputs)
@@ -147,11 +154,11 @@ def test_4_a_selection_its_predicate_does_not_decide_is_not_certified():
 
 def test_5_a_primitive_without_a_contract_is_named_and_its_values_not_certified():
     def cancelled(x):
-        return {"y": jnp.sin(x) - jnp.sin(x)}
+        return {"y": jax.lax.erf(x) - jax.lax.erf(x)}
 
-    coverage = zero_elements(cancelled, cancelled, (jnp.ones(3, jnp.float32),), "sine")
+    coverage = zero_elements(cancelled, cancelled, (jnp.ones(3, jnp.float32),), "erf")
     assert coverage.certified == 0 and coverage.uncertified == 3
-    assert "sin" in coverage.blocked
+    assert "erf" in coverage.blocked
 
 
 def test_6_a_slot_routing_drops_is_exactly_zero_and_a_least_normal_there_fails():
@@ -201,14 +208,14 @@ def test_8_an_underflow_is_held_to_the_least_normal_and_a_defect_past_it_fails()
         assert_zero_elements(defective, halves, t, "underflow, defect")
 
 
-def test_9_a_square_counts_its_rounding_and_tanh_has_no_contract():
+def test_9_a_square_counts_its_rounding_and_erf_has_no_contract():
     x = jnp.asarray([1 + 2.0 ** -12], jnp.float32)
     out, _ = _interpreted(lambda v: v ** 2, x)
     exact = fractions.Fraction(float(x[0])) ** 2
     assert out.certified.all()
     assert fractions.Fraction(float(out.error[0])) >= abs(fractions.Fraction(float(out.value[0])) - exact) > 0
-    tanh, blocked = _interpreted(jnp.tanh, x)
-    assert not tanh.certified.any() and "tanh" in blocked
+    erf, blocked = _interpreted(jax.lax.erf, x)
+    assert not erf.certified.any() and "erf" in blocked
 
 
 def test_10_a_comparison_of_exact_operands_is_decided():
@@ -342,8 +349,7 @@ def test_exp_is_held_to_a_verified_enclosure_at_every_element_and_carries_its_op
         assert out.certified.all()
         for at in range(len(values)):
             with mpmath.workprec(200):
-                mantissa, exponent = mpmath.exp(mpmath.mpf(float(x[at]))).man_exp
-            exact = fractions.Fraction(mantissa) * fractions.Fraction(2) ** exponent
+                exact = _fraction(mpmath.exp(mpmath.mpf(float(x[at]))))
             apart = abs(exact - fractions.Fraction(float(out.value[at])))
             assert fractions.Fraction(float(out.error[at])) >= apart
     overflowing, _ = _interpreted(jnp.exp, jnp.asarray([100.0], jnp.float32))
@@ -392,9 +398,8 @@ def test_a_function_is_held_to_its_interval_enclosure_over_its_operands_bound():
         out, _ = _interpreted(lambda x, f=function: f(summed(x)), *inputs)
         assert out.certified.all(), function
         with mpmath.workprec(200):
-            argument = sum((mpmath.mpf(float(term)) for term in terms), mpmath.mpf(0))
-            mantissa, exponent = exact_function(argument).man_exp
-        exact = fractions.Fraction(mantissa) * fractions.Fraction(2) ** exponent
-        assert fractions.Fraction(float(out.error)) >= abs(exact - fractions.Fraction(float(out.value))), function
+            exact = _fraction(exact_function(sum((mpmath.mpf(float(term)) for term in terms), mpmath.mpf(0))))
+        apart = abs(exact - fractions.Fraction(float(out.value)))
+        assert fractions.Fraction(float(out.error)) >= apart, function
     negative, _ = _interpreted(jnp.log, jnp.asarray([-1.0], jnp.float32))
     assert not negative.certified.any()
