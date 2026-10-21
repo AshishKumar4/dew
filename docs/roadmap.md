@@ -45,6 +45,7 @@ Correctness, contract gaps and duplicated paths come first. After those close, m
 
 ## Kernels and performance
 
+- At each jax bump, check for openxla/xla#49498 (deterministic GPU scatter); then write the paged pool unmapped and drop linear.py's padded-row gather. [951]
 The kernel direction (approved 2026-10-19; kernel design 2026-10-20): each case runs whichever is faster, Dew's kernel or XLA's, and where XLA wins the template learns why. Three templates absorb every hand kernel and its variants through hooks; their configs, and the choice between a template and XLA, come from cost models over hardware facts and the problem shape, deterministic and right on GPUs never measured, with a shortfall fixed in the model rather than a table. Measured tuning is opt-in (`dew tune`, `tune_kernels=True`) and writes a persistent cache per device kind. At the end there is no hand-written per-GPU table and no selector: each hand kernel and the flash wheel are deleted once their template matches them, and anything new arrives as a template hook first.
 
 1. Select at the semantic operation boundary. Typed operations, cases and requirements describe support as data; validity travels as coordinates. The route test checks the implementation that ran.
