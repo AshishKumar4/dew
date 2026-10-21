@@ -22,7 +22,8 @@ from dew.objectives.diffusion import DiffusionRunConfig
 TEMPLATES = ("a photo of a {}", "a photo of a {} flower", "This is a photo of a {}",
              "This is a photo of a {} flower", "A photo of a {} flower")
 TRAIN, HELD = source("tfds://oxford_flowers102").holdout(records=128)
-FLOWERS = TRAIN.pipe(presets.images, 128, batch=32, augment=True, caption=images.caption(templates=TEMPLATES))
+FLOWERS = TRAIN.shuffle(seed=0).repeat().pipe(presets.images, 128, batch=32, augment=True,
+                                              caption=images.caption(templates=TEMPLATES))
 VALIDATION = HELD.pipe(presets.images, 128, batch=32, caption=images.caption(templates=TEMPLATES))
 
 if __name__ == "__main__":

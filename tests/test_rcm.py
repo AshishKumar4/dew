@@ -170,10 +170,10 @@ def test_a_run_config_distills_a_saved_flow_run_and_alternates_student_and_criti
     import dataclasses
 
     from diffusion_stubs import batch_for
+    from diffusion_support import images_of
 
     from dew.checkpoints import Checkpoints
     from dew.config import ModelConfig, ObjectiveConfig, TrainerConfig
-    from diffusion_support import images_of
     from dew.diffusion.presets import Flow
     from dew.lora import LoRA
     from dew.objectives.base import FROZEN, TEACHER, Step
@@ -272,10 +272,10 @@ def test_an_accumulated_distillation_alternates_its_networks_update_by_update(tm
     import dataclasses
 
     from diffusion_stubs import batch_for
+    from diffusion_support import images_of
 
     from dew.checkpoints import Checkpoints
     from dew.config import ModelConfig, ObjectiveConfig, TrainerConfig
-    from diffusion_support import images_of
     from dew.diffusion.presets import Flow
     from dew.objectives.base import Step
     from dew.objectives.diffusion import DiffusionRunConfig, TextCondition
@@ -337,10 +337,10 @@ def test_a_pretrained_run_distills_the_model_it_loads_without_a_teacher_run(tmp_
     import tarfile
     from pathlib import Path
 
+    from diffusion_support import images_of
     from test_diffusion_run_sources import precision
 
     from dew.config import ObjectiveConfig
-    from diffusion_support import images_of
     from dew.diffusion.presets import Flow
     from dew.interop.pretrained import load_diffusion_source
     from dew.objectives.base import TEACHER

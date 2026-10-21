@@ -19,10 +19,10 @@ import numpy as np
 import optax
 import pytest
 from diffusion_stubs import PROMPTS, batch_for
+from diffusion_support import images_of
 from reference_error import assert_as_exact_as_the_reference
 
 from dew.config import ModelConfig, ObjectiveConfig, TrainerConfig
-from diffusion_support import images_of
 from dew.diffusion.presets import Flow, ResolutionShift
 from dew.diffusion.process import Process
 from dew.diffusion.schedules import FlowMatchingScheduler

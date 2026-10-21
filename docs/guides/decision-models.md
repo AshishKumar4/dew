@@ -138,14 +138,31 @@ A run saves like any other: `Decide.from_run(run)` and `dew.pipeline(run)` rebui
 
 ## From a table, on the command line
 
-`recipes/decision/train.py` is `laya-train --data tickets.csv`:
+`recipes/decision/train.py` fine-tunes on BANKING77 by default:
 
 ```bash
-python recipes/decision/train.py --data.source tickets.csv --data.text text --data.label label \
-    --trainer.batch-size 32 --trainer.epochs 4
+python recipes/decision/train.py --trainer.epochs 3
 ```
 
-It starts from Laya's checkpoint, or from `--pretrained Qwen/Qwen3-0.6B --lora.rank 16 --lora.modules q_proj v_proj`. `Decisions` reads CSV, JSON, JSONL and parquet files and Hub datasets: each row's text is the state, and its label is the answer to one choice question. A tenth of the rows, at most 400, are held out. Validation scores them, and after training they are used to fit the temperatures saved into the run.
+It starts from Laya's checkpoint, or from `--pretrained Qwen/Qwen3-0.6B --lora.rank 16 --lora.modules q_proj v_proj`. A table of your own is a run file that names its chains, which `dew train` reads. `decisions` reads CSV, JSON, JSONL and parquet files and Hub datasets: each row's `text` is the state, and its `label` the answer to one choice question.
+
+<!-- not run: the file `dew train tickets.py` reads -->
+```python
+# tickets.py
+from dew.data import Files
+from dew.decision import decisions
+from dew.decision.config import DecisionRunConfig
+
+train, held = Files("tickets.csv").holdout(0.1)
+run = DecisionRunConfig(data=train.pipe(decisions, question="team").read("memory").shuffle().repeat().batch(32),
+                        validation=held.pipe(decisions, question="team").read("memory").batch(32))
+```
+
+```bash
+dew train tickets.py --set trainer.epochs=4
+```
+
+A tenth of the rows, by the hash of each, are held out. Validation scores them, and after training they are used to fit the temperatures saved into the run. A memory read takes the options from the whole table's labels; another read needs them given (`options=`) or a store's class names.
 
 ## How this relates to Laya
 

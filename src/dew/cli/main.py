@@ -63,8 +63,8 @@ class Export:
         return 0
 
 
-def chain_of(data: str, branch: Literal["train", "validation"], trust: tuple[str, ...] = ()):
-    """The chain `data` names as a `dew.data.compile` pipeline: a Python file's `data`, or with
+def chain_of(named: str, branch: Literal["train", "validation"], trust: tuple[str, ...] = ()):
+    """The chain `named` names as a `dew.data.compile` pipeline: a Python file's `data`, or with
     `branch="validation"` its `validation` (each a chain, or a function returning one); a chain's
     record (a `.json` file `dew.data.records` reads); or a store's URL (`dew.data.sources.source`).
     Raises ValueError for a file that holds no such chain, or a store asked for its validation."""
@@ -72,7 +72,7 @@ def chain_of(data: str, branch: Literal["train", "validation"], trust: tuple[str
     from dew.data.pipeline import Dataset
     from dew.data.sources import source
 
-    path = Path(data)
+    path = Path(named)
     if path.suffix == ".py":
         sys.path.insert(0, str(path.resolve().parent))
         module = importlib.import_module(path.stem)
@@ -81,12 +81,12 @@ def chain_of(data: str, branch: Literal["train", "validation"], trust: tuple[str
     elif path.suffix == ".json":
         chain = records.decode(json.loads(path.read_text()), trust=trust)
     elif branch == "validation":
-        raise ValueError(f"{data} is a store, which holds no validation chain; name a Python file's")
+        raise ValueError(f"{named} is a store, which holds no validation chain; name a Python file's")
     else:
-        chain = source(data)
+        chain = source(named)
     if not isinstance(chain, Dataset):
         name = "data" if branch == "train" else "validation"
-        raise ValueError(f"{data} holds no {name} chain, but {chain!r}")
+        raise ValueError(f"{named} holds no {name} chain, but {chain!r}")
     return chain._chain()
 
 

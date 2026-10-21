@@ -77,7 +77,7 @@ def test_a_named_validation_split_reads_the_source_s_own_split():
     held = tuple({"text": f"held {index}", "label": "a"} for index in range(2))
     named = _NamedSplits(train, splits={"train": train, "validation": held})
     _, evaluated = named.holdout(split="validation")
-    rows = iterate(evaluated.pipe(decisions, options=("a", "b"), question="team")._chain(), read="memory")
+    rows = iterate(evaluated.pipe(decisions, options=("a", "b"), question="team"), read="memory")
     assert [row["example"].state for row in rows] == [row["text"] for row in held]
     with pytest.raises(ValueError):
         Memory(train).holdout(split="validation")
