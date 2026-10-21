@@ -2,8 +2,10 @@
 record it drops as a marker, which the reading process drops, so a worker whose own inputs are
 all dropped never holds up the others' (row 883)."""
 
+import json
 from dataclasses import dataclass
 
+import grain.python as grain
 import numpy as np
 import pytest
 from reader_support import assert_resumes_where_it_stopped
@@ -12,6 +14,8 @@ from dew.data import Loading, Memory, Rejected, mix
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition
 from dew.data.pipeline import Pipeline
+from dew.data.sources.grain import from_grain
+from dew.records import record
 
 WORKERS = Loading(workers=3, threads=1, read_buffer=1, worker_buffer=1)
 
@@ -175,3 +179,102 @@ def test_a_grain_filter_in_workers_reads_on():
     chain = rows.grain(_grain_filter, identity="only-five@1")
     reader = compile(chain.batch(1), read="indexed", loading=WORKERS).train(DataPartition())
     assert _ids(reader, 4) == [5] * 4
+
+
+@dataclass(frozen=True)
+class Renamed:
+    """A Grain map of the caller's that reads its record's id."""
+
+    def map(self, row):
+        return {"id": int(row["id"]), "renamed": np.int32(1)}
+
+
+def _grain_rename(rows):
+    return rows.map(Renamed())
+
+
+@pytest.mark.parametrize("before", ["a filter", "a store missing inputs"])
+def test_a_grain_map_in_a_workers_read_reads_records_not_markers(before):
+    """A Grain map of the caller's after a filter of Dew's, or over a store missing some inputs, read
+    by three loading workers: the map reads only records, and the read delivers the kept ones."""
+    records = [None if index % 3 == 0 else {"id": index} for index in range(12)]
+    if before == "a filter":
+        rows = Pipeline(Memory([{"id": index} for index in range(12)])).filter_map(KeepsEven())
+        kept = set(range(0, 12, 2))
+    else:
+        rows = Pipeline(from_grain(grain.MapDataset.source(records), name="missing-thirds"))
+        kept = {index for index in range(12) if index % 3}
+    chain = rows.grain(_grain_rename, identity="renamed@1").repeat().batch(1)
+    reader = compile(chain, read="indexed", loading=WORKERS).train(DataPartition())
+    assert set(_ids(reader, 16)) == kept
+
+
+@dataclass(frozen=True)
+class Parsed:
+    """A record from its JSON bytes, kept where its id is even."""
+
+    identity = "parsed@1"
+    rejects = True
+
+    def __call__(self, row):
+        record = json.loads(row)
+        return record if record["id"] % 2 == 0 else Rejected("odd")
+
+
+def test_a_workers_read_of_bytes_hands_them_on_before_a_prefetch():
+    """A store of JSON bytes, prefetched and then parsed by a step that drops the odd ones, read by
+    three loading workers: the workers hand the bytes on as they are, and the read parses them."""
+    rows = from_grain(grain.MapDataset.source([json.dumps({"id": index}).encode() for index in range(12)]),
+                      name="json-bytes")
+    chain = Pipeline(rows).prefetch(1).filter_map(Parsed()).repeat().batch(1)
+    reader = compile(chain, read="indexed", loading=WORKERS).train(DataPartition())
+    assert set(_ids(reader, 12)) == set(range(0, 12, 2))
+
+
+def _kept(name: str) -> Pipeline:
+    rows = Pipeline(Memory([{"id": index} for index in range(12)]), name=name)
+    return rows.filter_map(KeepsEven()).repeat()
+
+
+def test_a_mixture_edit_that_moves_a_kept_corpus_to_other_workers_is_refused():
+    """A mixture of two corpora read by three loading workers, the first in two and the second in
+    one: a position saved there and restored where the second corpus leads, in two, is refused,
+    and one restored where a third corpus joins in none, the first two as they were, reads on."""
+    loading = Loading(workers=3, threads=1, read_buffer=1, worker_buffer=1)
+    saved_from = compile(mix([_kept("a"), _kept("b")]).batch(1), read="indexed", loading=loading)
+    reader = saved_from.train(DataPartition())
+    try:
+        next(reader)
+        saved = reader.get_state()
+    finally:
+        reader.close()
+    moved = compile(mix([_kept("b"), _kept("c")]).batch(1), read="indexed", loading=loading)
+    moved = moved.train(DataPartition())
+    try:
+        with pytest.raises(ValueError):
+            moved.set_state(saved)
+    finally:
+        moved.close()
+    joined = compile(mix([_kept("a"), _kept("b"), _kept("c")]).batch(1), read="indexed",
+                     loading=Loading(workers=2, threads=1, read_buffer=1, worker_buffer=1))
+    two = compile(mix([_kept("a"), _kept("b")]).batch(1), read="indexed",
+                  loading=Loading(workers=2, threads=1, read_buffer=1, worker_buffer=1))
+    before = two.train(DataPartition())
+    try:
+        next(before)
+        state = before.get_state()
+    finally:
+        before.close()
+    resumed = joined.train(DataPartition())
+    resumed.set_state(state)
+    assert set(_ids(resumed, 4)) <= set(range(0, 12, 2))
+
+
+def test_a_nested_mixture_reads_in_the_workers_it_writes():
+    """A mixture written to read in three workers, inside another, with the loading's own workers
+    none: its two corpora read in two and one of them, the other corpus in the reading process."""
+    inner = mix([_kept("a"), _kept("b")]).workers(3)
+    loading = Loading(workers=0, threads=1, read_buffer=1)
+    data = compile(mix([inner, _kept("c")]).batch(1), read="indexed", loading=loading)
+    assert sorted(record(data.plan.record()["topology"], "topology")["pools"].values()) == [0, 1, 2]
+    assert set(_ids(data.train(DataPartition()), 8)) <= set(range(0, 12, 2))
