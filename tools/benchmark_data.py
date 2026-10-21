@@ -42,6 +42,7 @@ os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
 import tyro
 from absl import flags
+from token_corpus import write_token_meta
 
 from dew.data import Loading
 from dew.data.dataset import Forwarding
@@ -227,8 +228,7 @@ def synthetic_inputs(config: Matrix) -> dict:
     held = np.full(129, 42, np.uint16)
     held[-1] = 255
     held.tofile(text / "val.bin")
-    (text / "meta.json").write_text(json.dumps({"tokenizer": "byte", "dtype": "uint16",
-        "vocab_size": 256, "eos_id": 255, "train_tokens": len(ids), "val_tokens": len(held)}) + "\n")
+    write_token_meta(text, len(ids), len(held), eos_id=255)
     from dew.data import Files
 
     Files(str(image), format="array_record").provision()

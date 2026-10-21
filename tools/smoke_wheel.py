@@ -28,15 +28,16 @@ import tempfile
 import venv
 from pathlib import Path
 
+from token_corpus import write_token_meta
+
 INDEX = runpy.run_path(str(Path(__file__).resolve().parents[1] / "src/dew/telemetry/builds.py"))[
     "PACKAGE_INDEX"]
 """Dew's package index, the one place Dew's JAX build is served (dew.telemetry.builds.PACKAGE_INDEX)."""
 
 TRAIN = """
-import json, sys
-from pathlib import Path
+import sys
 
-import jax, jax.numpy as jnp, numpy as np, optax
+import jax, jax.numpy as jnp, optax
 
 import dew
 from dew import Trainer
@@ -46,14 +47,7 @@ from dew.nn.backbones import CausalTransformer
 from dew.objectives.lm import LMObjective
 
 assert "site-packages" in dew.__file__, dew.__file__
-tokens = Path(sys.argv[1])
-tokens.mkdir()
-for split, repeats in (("train", 64), ("val", 16)):
-    np.tile(np.array([1, 2, 3, 4], dtype=np.uint8), repeats).tofile(tokens / f"{split}.bin")
-(tokens / "meta.json").write_text(json.dumps({
-    "tokenizer": "symbols", "vocab_size": 8, "dtype": "uint8", "train_tokens": 256, "val_tokens": 64,
-    "eos_id": None}))
-data = loader(TextData(source=str(tokens), seq_len=8), batch=4, read="memory", validation_records=4,
+data = loader(TextData(source=sys.argv[1], seq_len=8), batch=4, read="memory", validation_records=4,
             loading=Loading(workers=0, threads=1, read_buffer=2))
 model = CausalTransformer(vocab_size=8, emb_features=16, num_layers=1, num_heads=2, mlp_features=32,
                           max_seq_len=16, dtype=jnp.float32, attention_impl="xla")
@@ -90,7 +84,13 @@ def main() -> None:
                                  text=True).stdout.strip()
         run(python, "-m", "compileall", "-q", package, cwd=root)
         run(root / "env" / "bin" / "dew", "--help", cwd=root)
-        run(python, "-c", TRAIN, root / "tokens", cwd=root)
+        # The token files the model trains on, written here, before anything is importable from the wheel.
+        tokens = root / "tokens"
+        tokens.mkdir()
+        for split, repeats in (("train", 64), ("val", 16)):
+            (tokens / f"{split}.bin").write_bytes(bytes([1, 2, 3, 4]) * repeats)
+        write_token_meta(tokens, 256, 64, dtype="uint8", tokenizer="symbols", vocab_size=8)
+        run(python, "-c", TRAIN, tokens, cwd=root)
     print(f"{wheel.name}: installs, compiles, runs `dew --help` and trains")
 
 

@@ -22,13 +22,14 @@ import pyarrow.fs as pafs
 import pytest
 from reader_support import assert_a_rewrite_moves_the_identity, assert_resumes_where_it_stopped
 from storage_support import moto_bucket
-from token_support import export_byte_tokens, write_token_meta
+from token_support import export_byte_tokens
 
 from dew.data.dataset import DataPartition, Loading
 from dew.data.shards import streamed
 from dew.data.sinks import export
 from dew.data.sources import Files, Memory
 from dew.data.storage import Store
+from tools.token_corpus import write_token_meta
 
 
 def test_memory_columns_snapshot_changes_with_content():
