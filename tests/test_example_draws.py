@@ -416,18 +416,21 @@ def test_a_recording_step_returns_what_each_evaluation_drew_its_replays_each_the
     np.testing.assert_array_equal(np.concatenate([noise[1], noise[0]]), drawn)
 
 
-def test_a_recording_loss_flags_a_row_its_step_places_apart_from_its_column():
-    """A recording evaluation checks in its trace that each row's place (`Step.example_index`) is its
-    trainer column (`EXAMPLE_ROWS`) plus the step's one offset: two rows' places swapped fail it."""
-    from dew.objectives.base import RECORD
+def test_a_record_flags_rows_placed_apart_from_their_slot_and_column():
+    """A recording step holds each evaluation's places to the ones its window slot and its batch's column
+    give it (`recorded`): two rows' places swapped, or a microbatch read under another slot's places,
+    fail the check; the places its slot gives pass."""
+    from dew.objectives.base import Evaluated
+    from dew.training.transaction import recorded
 
-    batch = {"y": jnp.zeros((4,)), EXAMPLE_ROWS: jnp.arange(4, dtype=jnp.int32)}
-    params = Witnessed().init(jax.random.key(0))
+    column = jnp.arange(2, dtype=jnp.int32)
 
-    def flagged(index):
-        step = Step(jnp.asarray(0), jax.random.key(1), None, example_key=UPDATE,
-                    example_index=jnp.asarray(index, jnp.int32), example_count=8, record=True)
-        return bool(jax.jit(lambda: Witnessed()._loss(params, batch, step)[1].metrics[RECORD]["column_ok"])())
+    def flags(*indices):
+        evaluations = [(Evaluated(values={"noise": jnp.zeros((2,))},
+                                  example_index=jnp.asarray(index, jnp.int32), column=column),
+                        example_places(slot, 1, 2, column)) for slot, index in enumerate(indices)]
+        return np.asarray(recorded(evaluations, jnp.ones((len(indices),), bool))["column_ok"]).tolist()
 
-    assert flagged([4, 5, 6, 7])
-    assert not flagged([4, 6, 5, 7])
+    assert flags([0, 1], [2, 3]) == [True, True]
+    assert flags([1, 0], [2, 3]) == [False, True]
+    assert flags([2, 3], [0, 1]) == [False, False]
