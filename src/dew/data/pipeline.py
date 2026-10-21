@@ -5,6 +5,7 @@ from __future__ import annotations
 import dataclasses
 import itertools
 import math
+import sys
 import types
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING, Concatenate, Literal, Protocol, TypeGuard, runtime_checkable
@@ -742,9 +743,11 @@ class Dataset:
             reader.close()
 
     def show(self, count: int = 8) -> None:
-        """Print the first `count` records."""
+        """Print the chain, each verb and step a preset or function expanded to in order, then
+        its first `count` records."""
         from rich.pretty import pprint
 
+        sys.stdout.write("\n".join(_chain_lines(self._chain())) + "\n")
         for record in itertools.islice(self, count):
             pprint({name: _shown(value) for name, value in record.items()} if isinstance(record, Mapping)
                    else record)
@@ -776,6 +779,56 @@ def concat(datasets: Sequence[Dataset]) -> Pipeline:
     if len(stores) < len(datasets):
         raise ValueError("concat joins stores; add the steps after it, or mix datasets that have steps")
     return Pipeline(Concatenate(stores))
+
+
+_VERBS: Mapping[type, str] = {
+    Map: "map", RandomMap: "random_map", MapWithIndex: "map_with_index", Filter: "filter",
+    FlatMap: "flat_map", Configured: "map", Native: "grain", Batched: "map",
+}
+"""The verb that writes each kind of stage that carries a step, which `show` prints beside it."""
+
+
+def _chain_lines(chain: Pipeline, depth: int = 0) -> list[str]:
+    """The lines `show` prints of `chain`: its store, or the corpora a mix or phases read, each
+    with its own chain indented below, then each stage in order, one a line."""
+    indent = "  " * depth
+    source = chain.source
+    if isinstance(source, Mixture):
+        lines = [f"{indent}mix" if source.tokens is None else f"{indent}mix(by='tokens')"]
+        for weight, child in zip(source.weights, source.pipelines, strict=True):
+            lines += [f"{indent}  weight {weight:g}:", *_chain_lines(child._chain(), depth + 2)]
+    elif isinstance(source, Phases):
+        lines = [f"{indent}phases"]
+        for until, child in zip(source.until_steps, source.pipelines, strict=True):
+            lines += [f"{indent}  until step {until}:" if until is not None else f"{indent}  last:",
+                      *_chain_lines(child._chain(), depth + 2)]
+    else:
+        lines = [f"{indent}{type(source).__name__} {source.label()!r}"]
+    return lines + [f"{indent}.{_stage_line(stage)}" for stage in chain.stages]
+
+
+def _stage_line(stage: Stage) -> str:
+    """One stage as `show` prints it: its verb and the step it runs, or the stage's own settings."""
+    if isinstance(stage, MapBatch):
+        where = "device" if isinstance(stage.step, DeviceStep) else "host"
+        return f"map({_step_name(stage.step)}) on the {where}, per batch"
+    verb = _VERBS.get(type(stage))
+    if verb is None:
+        return _brief(repr(stage))
+    step = stage.factory if isinstance(stage, Configured) else getattr(stage, "step", None)
+    if step is None:
+        step = getattr(stage, "predicate", None) or getattr(stage, "function", None)
+    return f"{verb}({_step_name(step)})"
+
+
+def _step_name(step: object) -> str:
+    """A step as `show` prints it: a function by its name, any other step by its settings."""
+    name = getattr(step, "__qualname__", None)
+    return name if isinstance(name, str) and not isinstance(step, type) else _brief(repr(step))
+
+
+def _brief(text: str, width: int = 120) -> str:
+    return text if len(text) <= width else text[: width - 1] + "…"
 
 
 def _shown[Field](value: np.ndarray | bytes | Field) -> np.ndarray | bytes | Field | str:
