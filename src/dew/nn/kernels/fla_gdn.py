@@ -155,9 +155,7 @@ def _wide() -> bool:
     """Whether the GPU's block (its assumed generation's off a GPU) holds an A100's shared memory: a GPU
     the targets do not list takes the 99 KB picks, which every Triton GPU's block holds, and a CPU's
     interpretation an A100's."""
-    target = generation.gpu_target()
-    if generation.capability(target.generation) is None:
-        return True
+    target = generation.effective(generation.gpu_target())
     return (target.shared_limit or 0) >= (generation.TARGETS["sm80"].shared_limit or 0)
 
 

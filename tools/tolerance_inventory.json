@@ -68,7 +68,7 @@
    "by": "2026-11-13"
   },
   "tests/test_attention_splash.py": {
-   "comparisons": 4,
+   "comparisons": 3,
    "lane": "Kernels",
    "by": "2026-11-06"
   },
