@@ -28,7 +28,10 @@ Correctness, contract gaps and duplicated paths come first. After those close, m
 - Let Llama 4's mixer take any KV cache, its context derived from the caller's, not rebuilt. [784]
 - Let latent attention (MLA and its sparse pooling), DeepSeek V4's compressed cache and a bidirectional canvas's encoder prefix take paged and quantized KV cache layouts. [830, 831, 838]
 - Place a loaded pretrained model's variables on JAX's default device, as jnp arrays are; keeping them on the host is an explicit request. [832]
+- Stream a pretrained start onto the trainer's mesh, one device shard at a time, with no whole copy on the host. [848]
 - Keep a merged FP8 base finite through training on H100's FP8 tensor cores. [841]
+- Settle whether a remat rung's step is bitwise its plain step on an sm86 GPU, or held by the float64 gate. [847]
+- Hold the full suite to ten minutes of wall time when it runs as more tasks than containers. [826]
 - Prove a counted first-fit or concatenating pack resumes with loader workers as it does without. [845]
 - Make the live kernel's preparation smoke deterministic about the contexts a closed page leaves open. [843]
 - Update a live notebook's displays across its cells, as Jupyter does, once a notebook runs live. [846]
@@ -48,8 +51,6 @@ The kernel direction (approved 2026-10-19; kernel design 2026-10-20): each case 
    - GEMM with prologue and epilogue hooks, including grouped MoE products, bias and SwiGLU.
 
    Build on upstream Tokamax's public API, with no fork. A template replaces a kernel only when it matches or beats it on each target's numerical gate, step time and compile time. Until then the cut-down selector serves as the interim, and it is removed as the templates take over. Forward-mode AD is part of every template's acceptance, qualified through MeanFlow and consistency objectives. Follow the upstream issues while qualifying on public APIs: openxla/tokamax#1666 (serializing bound arguments, the autotuning data type and device-kind inference), #1667 (forward-mode differentiation through Ops), #1668 (registering third-party implementations, recording fallbacks and eligibility by device kind) and #1669 (exporting the Op classes, attention's Mask and residuals). [715, 716, 717]
-
-   Tuning's two private Tokamax imports, `dump_bound_args_to_json` and `AutotuningData`, move to `tokamax.autotuning` once a release carries openxla/tokamax#1676. [738]
 
    The templates' entry measurements, at main 5a761cb7b on A100 and H100: Tokamax attention against XLA, cuDNN, the flash wheel and Triton at 128- and 64-wide heads; packed documents; Mosaic GPU attention against FA3 on H100, where FA3 stays until the gap closes; ragged products; narrow heads on sm86, L4 and G4; and attention sinks.
 
@@ -104,11 +105,7 @@ The kernel direction (approved 2026-10-19; kernel design 2026-10-20): each case 
 - Compare augmentation policies on fixed data and measure worker scaling when a corpus has one physical shard. [234, 573]
 - Remove duplicated worker-shutdown policy by using Grain's lifecycle interface. [DAT-10]
 - Qualify URL-caption fetching through `images.fetch` and `video.fetch` against the previous online flow on CC3M and WebVid. [155]
-- Fingerprint a transform's arrays by their content, not their truncated repr. [768]
 - Cache automatically: the deterministic stages before the first random or cross-record step are fingerprinted by content and their output reused on a re-run, with no `cache=`, in a local cache directory with a size cap and eviction; `cache=url` stays for shared or remote caches, and there is an opt-out. [824]
-- Carry the caption tokenizer's content in the text conditioners' dependencies, so an exact resume refuses changed token ids. [769]
-- Let Windows and Pack resume with their row ids. [770]
-- Keep a concatenation's metadata, class names and the tokenizer contract included. [771]
 - Run DeviceAugment in the image pipeline benchmark's device-augment arms. [772]
 - The chain is the one data API; recipes, spec.load and the public loader are removed; run.json records the chain (213). [780]
 - Let the image, language-model and SFT presets take the documented `cache=`. [803]
@@ -194,7 +191,7 @@ Keep the existing gateway interface. Miles would currently duplicate it: its tra
 - Root-cause the gate census's ratios past 2 at one draw, in the code or the reference arm: layouts' first-step gradients and Z-Image's padded flow. [833, 837]
 - Replace test-policy violations with observable lifecycle and reference behavior:
 
-  - Training, sampling and objectives: [651, 652, 653, 654, 657, 658, 663, 667, 679, 680, 686, 687, 688, 692, 695, 698, 701, 702, 707, 708].
+  - Training, sampling and objectives: [651, 652, 653, 654, 657, 658, 667, 679, 680, 686, 687, 688, 692, 695, 698, 701, 702, 707, 708].
   - Model loading, adapters and exports: [675, 677, 681, 691, 699, 700, 703, 704].
   - Attention, convolution and tuning: [655, 656, 674, 689, 690, 696].
   - Recurrences and looped models: [659, 660, 661, 662, 664, 665, 678, 706, 711].
@@ -206,7 +203,6 @@ Keep the existing gateway interface. Miles would currently duplicate it: its tra
 - Judge an image model's layout parity under a sequence split, where its gradients' sums over spatial positions reassociate (edm2's sequence-split cell). [827]
 - Use JAX's supported persistent cache in the remote-cache tests, with handling narrowed to transport errors. [794]
 - Use JAX's own transfer guard on GPUs in place of the steady-state reimplementation, and guard CPU arrays' reads to numpy in JAX itself (jax-ml/jax#16602). [795, 801]
-- Check every family, target row and mode in the kernel-route test, an unexplained route failing, and drop the KV cache's unconditional GPU xfail. [798, 799]
+- Drop the KV cache test's unconditional GPU xfail. [799]
 - Hold MeanFlow's fused attention away from zero initialization, the delta rule's document isolation without exclusions, and the Mamba-2 TPU mesh by its numbers. [789, 790]
 - Delete the step benchmark's re-export facade. [800]
-- Hold the full suite to ten minutes of wall time: shards cut by the last full run's measured per-test times, no single case past a shard's budget, and a new environment warmed before its first full suite. [826]
