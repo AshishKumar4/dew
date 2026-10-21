@@ -599,7 +599,8 @@ class PretrainedDecoder(Pretrained):
         `tokenizer` is the vocabulary the weights were trained with, as an object or
         by name. `save` writes its files next to the weights, so the directory that
         `Pretrained.load` reads back includes its processor. `generation_config` is
-        what generation_config.json records, `GENERATION_DEFAULTS` when None.
+        what generation_config.json records; None uses the native defaults with
+        the exported model's cache mode.
         """
         try:
             decoder = from_record(CausalTransformer, model)
@@ -609,7 +610,8 @@ class PretrainedDecoder(Pretrained):
         built = {entry.name: getattr(decoder, entry.name) for entry in dataclasses.fields(decoder)
                  if entry.init and entry.name not in ("parent", "name")}
         return cls(decoder, variables, None, config, None, built,
-                   decoders.GENERATION_DEFAULTS if generation_config is None else generation_config,
+                   {**decoders.GENERATION_DEFAULTS, 'use_cache': config['use_cache']}
+                   if generation_config is None else generation_config,
                    export_adapter=decoders.export_decoder_weights, tokenizer=tokenizer)
 
     def text_generation(self, *, sampling: Sampling | None = None) -> TextGeneration:
