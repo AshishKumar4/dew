@@ -26,14 +26,16 @@ import functools
 import jax
 import jax.numpy as jnp
 from jax.custom_derivatives import linear_call
+from jax.sharding import PartitionSpec as P
 
-from dew.nn.attention import FORWARD_MODE
+from dew.nn.attention import FORWARD_MODE, repeat_kv_heads
 from dew.nn.inputs import cu_seqlens
 from dew.nn.precision import at_least_fp32, compensated_add, compensated_difference
 from dew.nn.sharding import grouped_heads, manual_map
 
-from . import fla_gdn, fla_kda, generation, recurrence
-from .generation import Refusal, measured_kernel, refused, route
+from . import fla_gdn, fla_kda, generation, mamba_ssd, recurrence
+from .generation import Refusal, first_refusal, measured_kernel, ran_kernel, refused, route, triton_runs
+from .ssd import ssd_chunk_scan, ssd_kernel_platform
 
 CHUNK_SIZE = 64
 """Tokens per chunk of the chunked form, the reference's default
@@ -378,8 +380,9 @@ class Chunk:
     value heads. `log_decay` is `[B, S, Hv]` (scalar) or `[B, S, Hv, Dk]` (vector), or with the gates
     `gate` `[B, S, Hv]`, `log_a` and `bias` `[Hv]`. `beta` `[B, S, Hv]` is the write gate (a raw beta
     with the gates), `skip` `[Hv]` the skip's `D`, `z` `[B, S, Hv, Dv]` and `weight` `[Dv]` the
-    epilogue's. `state` `[B, Hv, Dk, Dv]` is the memory entering, zero where None, and `starts`
-    `[B, S]` marks packed documents' first tokens, each from a zero memory."""
+    epilogue's, `rate` `[Hv]` a rated decay's. `state` `[B, Hv, Dk, Dv]` is the memory entering,
+    zero where None, and `starts` `[B, S]` marks packed documents' first tokens, each from a zero
+    memory."""
     query: jax.Array
     key: jax.Array
     value: jax.Array
@@ -391,31 +394,35 @@ class Chunk:
     skip: jax.Array | None = None
     z: jax.Array | None = None
     weight: jax.Array | None = None
+    rate: jax.Array | None = None
     state: jax.Array | None = None
     starts: jax.Array | None = None
 
 
 def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_SIZE,
-          ported: bool | None = None, max_segments: int | None = None):
+          ported: bool | None = None, max_segments: int | None = None, dtype=None):
     """`(output [B, S, Hv, Dv], final memory [B, Hv, Dk, Dv])` of a sequence through the recurrence of
-    `hooks` (`recurrence.Hooks`, the decode step's form), the output in the queries', keys' and
-    values' common dtype and the memory in at least fp32.
+    `hooks` (`recurrence.Hooks`, the decode step's form), the output in `dtype` (the queries', keys'
+    and values' common dtype where None) and the memory in at least fp32.
 
     The prologue (the l2 norm, the queries' scale, the gates' activations) and the epilogue (the
     skip, the gated RMS norm) are the decode step's arithmetic (`recurrence.step_reference`) on every
     token, in at least fp32. The recurrence between them runs on the port of fla's kernels
     (`fla_rule`) for the delta rule with a decay where `ported` (the caller's route, `on_the_port`,
-    decided here where None), else on the portable math (`chunk_delta_rule`, in `chunk_size` chunks,
-    which the port's 64 need not match). Packed documents (`starts`, at most `max_segments` a row)
-    each compute as they would alone. A conv runs before the op: it takes the conv's output."""
+    decided here where None); without the delta rule, a rated decay (Mamba2's SSD) runs on the port
+    of mamba_ssm's kernels where it takes the call (`ssd_port_refusal`), or on a TPU's Pallas scan
+    where its tiling covers the geometry (`ssd_kernel_platform`); else the portable math
+    (`chunk_delta_rule`, in `chunk_size` chunks, which a port's need not match). Packed documents
+    (`starts`, at most `max_segments` a row) each compute as they would alone. A conv runs before the
+    op: it takes the conv's output."""
     if hooks.conv is not None:
         raise ValueError("the chunked op takes the conv's output: its queries, keys and values")
     query, key, value = operands.query, operands.key, operands.value
     if value.shape[2] % key.shape[2]:
         raise ValueError(f"{value.shape[2]} value heads over {key.shape[2]} key heads: each key head serves "
                          "a whole number of value heads")
-    dtype = jnp.result_type(query, key, value)
-    work = at_least_fp32(dtype)
+    dtype = jnp.result_type(query, key, value) if dtype is None else jnp.dtype(dtype)
+    work = at_least_fp32(jnp.result_type(query, key, value))
     if hooks.l2norm:
         query, key = (x.astype(work) for x in (query, key))
         query, key = (x * jax.lax.rsqrt(jnp.sum(x * x, axis=-1, keepdims=True) + recurrence.L2NORM_EPS)
@@ -425,11 +432,20 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
         raw = operands.beta.astype(work) if hooks.gates.write == 'sigmoid' else None
         g, beta = recurrence.gated(hooks.gates, *(x.astype(work) for x in (operands.gate, operands.log_a,
                                                                            operands.bias)), raw)
+    elif hooks.rated:
+        beta = operands.beta.astype(work)
+        g = operands.rate.astype(work)[None, None, :] * beta
     else:
         g = (jnp.zeros(value.shape[:3], work) if hooks.decay == 'none'
              else operands.log_decay)
         beta = operands.beta if hooks.gated_write else jnp.ones(value.shape[:3], work)
     takes_port = hooks.delta and hooks.decay != 'none'
+    if hooks.rated and not hooks.delta and not hooks.l2norm and hooks.scale is None:
+        out, final = _rated_scan(hooks, query, key, beta, operands, chunk_size, work)
+        if hooks.output is not None:
+            out = recurrence.gated_rms(out, operands.z.astype(work), operands.weight.astype(work),
+                                       hooks.output)
+        return out.astype(dtype), final
     if takes_port and (on_the_port(query, key, value) if ported is None else ported):
         out, final = fla_rule(query, key, value, g, beta, operands.state, starts=operands.starts,
                               max_segments=max_segments, scale=scale)
@@ -641,3 +657,119 @@ def recurrent_delta_rule(query, key, value, g, beta, state=None, *, starts=None)
         {name: jnp.moveaxis(x, 1, 0) for name, x in
          (('q', query), ('k', key), ('v', value), ('g', g), ('beta', beta), ('start', starts))})
     return jnp.moveaxis(out, 0, 1).astype(dtype), state
+
+
+def _rated_scan(hooks: recurrence.Hooks, query, key, beta, operands: Chunk, chunk_size: int, work):
+    """`chunk` without the delta rule over a rated decay (Mamba2's SSD: `x` the values, `B` the keys,
+    `C` the queries, `dt` the write gate and `A` the rate): on the port of mamba_ssm's kernels where
+    it takes the call, which adds the skip itself; else on a TPU's Pallas scan where its tiling covers
+    the geometry, or the portable math, the skip added after. Returns the output in `work`, unrounded,
+    and the memory `[B, Hv, Dk, Dv]`."""
+    value = operands.value
+    rate = operands.rate.astype(work)
+    skip = (operands.skip if hooks.skip else jnp.zeros(rate.shape, work)).astype(work)
+    starts = operands.starts
+    operand = jnp.result_type(query, key, value)
+    x, B, C = (jnp.asarray(t, operand) for t in (value, key, query))
+    batch, _, heads, head_dim = x.shape
+    state_size = B.shape[-1]
+    # The SSD's memory is `[P, N]`, values by keys: the template's `[N, P]` transposed.
+    carried = (jnp.zeros_like(x, work, shape=(batch, heads, head_dim, state_size)) if operands.state is None
+               else jnp.swapaxes(operands.state, -1, -2).astype(work))
+    refusal = ssd_port_refusal(x, B, chunk_size)
+    if refusal is None:
+        out, final = _ssd_ported(x, beta, rate, B, C, skip, carried, chunk_size, starts)
+        return out.astype(work), jnp.swapaxes(final.astype(work), -1, -2)
+    ran_kernel('ssd', 'xla', refusal)
+    platform = ssd_kernel_platform(chunk_size, head_dim, state_size, dtype=work)
+    if platform is not None:
+        out, final = _ssd_tpu(x, beta, rate, B, C, skip, carried, chunk_size, starts, platform, work)
+        return out, jnp.swapaxes(final, -1, -2)
+    group = heads // key.shape[2]
+    if group > 1:
+        query, key = (jnp.repeat(t, group, axis=2) for t in (query, key))
+    out, final = chunk_delta_rule(query, key, value, (rate[None, None, :] * beta)[..., None], beta,
+                                  operands.state, chunk_size, starts=starts, delta=False, scale=1.0)
+    return out.astype(work) + skip[:, None] * value.astype(work), final
+
+
+RESET_DECAY = -1e4
+"""The log decay a document's first token takes in place of `A dt` in the TPU's Pallas scan: the
+state entering it is multiplied by `exp(-1e4)`, which is 0 in fp32. A step's own `A dt` is never
+positive, so every span containing a reset sums to at most this and decays to exactly 0, and a span
+without one never sees it. It stays finite because the kernel forms its segment sums as a matmul
+against a 0/1 triangle, where an infinity times 0 is a NaN; and it stays small enough that thousands
+of resets in one shard's total decay are nowhere near fp32's range."""
+
+
+def _ssd_tpu(x, dt, A, B, C, D, carried, chunk_size: int, starts, platform, work):
+    """The rated scan on a TPU's Pallas kernel (`dew.nn.kernels.ssd`), on its operands: `x`, `B` and
+    `C` in `work`, the groups expanded, the length padded to whole chunks, `x` scaled by `dt`, the
+    log decay `A dt` with `RESET_DECAY` at each document's first token; per shard of rows and heads
+    (`manual_map`). The skip `D x` is added after. Returns the output and the memory `[B, H, P, N]`."""
+    heads, length = x.shape[2], x.shape[1]
+    x, B, C = (jnp.asarray(t, work) for t in (x, B, C))
+    # The `H // G` heads of one group read the same B and C, the reference's `repeat_interleave`.
+    B, C = repeat_kv_heads(B, heads), repeat_kv_heads(C, heads)
+    pad = (chunk_size - length % chunk_size) % chunk_size
+    x, B, C = (jnp.pad(t, ((0, 0), (0, pad), (0, 0), (0, 0))) for t in (x, B, C))
+    dt = jnp.pad(dt, ((0, 0), (0, pad), (0, 0)))
+    skip = D[None, None, :, None] * x
+    a = A[None, None, :] * dt
+    if starts is not None:
+        a = jnp.where(jnp.pad(starts, ((0, 0), (0, pad)))[..., None], RESET_DECAY, a)
+
+    def kernel(x, B, C, a, carried):
+        return ssd_chunk_scan(x, B, C, a, carried, chunk_size, platform)
+
+    # The groups are expanded, so any split of the heads divides them.
+    rows, split = grouped_heads(x.shape, heads)
+    four, held = P(rows, None, split, None), P(rows, split, None, None)
+    scanned, final = manual_map(kernel, (four, four, four, P(rows, None, split), held),
+                                (four, held))(x * dt[..., None], B, C, a, carried)
+    return (scanned + skip)[:, :length], final
+
+
+def ssd_port_refusal(x, B, chunk_size: int) -> str | None:
+    """Why a chunked scan over these operands runs the XLA scan rather than
+    mamba_ssm's kernels (`mamba_ssd.ssd_scan`), or None where the port takes
+    it: on every GPU whose target row names it (`measured_kernel`), except
+    inside `jax.jvp`'s traces (`FORWARD_MODE`), which the port's custom VJP
+    gives no tangent; inside a caller's `shard_map` that checks varying axes
+    over operands that vary, where a Pallas call, which states no varying
+    type for its results, cannot run; float64 operands, whose scan is the
+    reference math itself; and head widths, state widths or chunks that are
+    not powers of two of at least 16, the smallest block Triton's dot takes."""
+    widths = (x.shape[-1], B.shape[-1], chunk_size)
+    return first_refusal(
+        (measured_kernel('ssd', 'xla') == 'pallas',
+         "the device's target row (generation.TARGETS) does not name the port"),
+        (not FORWARD_MODE.get(), "forward_mode_attention traces for jax.jvp, which the port's custom VJP "
+                                 "gives no tangent"),
+        (not jax.typeof(x).mat.varying,
+         "a shard_map that checks varying axes holds the operands, and a Pallas call states no "
+         "varying type for its results"),
+        (jnp.dtype(x.dtype) != jnp.float64, "float64 operands, whose scan is the reference math itself"),
+        (all(width >= 16 and width & (width - 1) == 0 for width in widths),
+         f"head width {widths[0]}, state {widths[1]} and chunk {widths[2]}; the port takes powers of "
+         "two of at least 16"),
+    )
+
+
+def _ssd_ported(x, dt, A, B, C, D, state, chunk_size: int, starts):
+    """The scan on mamba_ssm's kernels, each token's document counted from
+    `starts` (mamba_ssm's `seq_idx`). On a mesh it runs per shard
+    (`manual_map`): rows where the rules split them, and heads with their
+    groups where the head split divides the groups, the time axis whole;
+    off a GPU its kernels interpret, as the CPU suite runs them."""
+    interpret = not triton_runs()
+    seq = None if starts is None else jnp.cumsum(starts, axis=1, dtype=jnp.int32)
+
+    def scan(x, dt, A, B, C, D, state, *seq):
+        return mamba_ssd.ssd_scan(x, dt, A, B, C, D, state, *(seq or (None,)), chunk_size, interpret)
+
+    operands = (x, dt, A, B, C, D, state, *([] if seq is None else [seq]))
+    rows, heads = grouped_heads(x.shape, B.shape[2])
+    four, held = P(rows, None, heads, None), P(rows, heads, None, None)
+    specs = (four, P(rows, None, heads), P(heads), four, four, P(heads), held, P(rows, None))
+    return manual_map(scan, specs[:len(operands)], (four, held))(*operands)

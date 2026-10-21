@@ -25,7 +25,7 @@ fp32 as the reference casts its operands. The decode step is `mamba2_selective_s
 shapes so tests/test_mamba2.py can hold them to the reference's numbers.
 
 On a GPU whose target row names it the chunked scan is mamba_ssm's own
-kernels (`dew.nn.kernels.mamba_ssd`, `ssd_port_refusal` names where not),
+kernels (`dew.nn.kernels.mamba_ssd`, `recurrence_chunk.ssd_port_refusal` names where not),
 which multiply `x`, `B` and `C` in their own dtype into fp32 sums as
 mamba_ssm does; elsewhere the scan over the chunks is `xla_chunk_scan`, the
 oracle, or on a TPU whose tiling covers the geometry `dew.nn.kernels.ssd`'s
@@ -62,14 +62,14 @@ from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 from jax.sharding import PartitionSpec as P
 
-from dew.nn.attention import FORWARD_MODE, repeat_kv_heads, unweighted_rmsnorm
+from dew.nn.attention import repeat_kv_heads, unweighted_rmsnorm
 from dew.nn.blocks import normal_kernel
 from dew.nn.dense import Dense
 from dew.nn.flops import conv_flops, projection_flops, ssd_flops
 from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of
-from dew.nn.kernels import mamba_ssd
-from dew.nn.kernels.generation import first_refusal, measured_kernel, ran_kernel, triton_runs
-from dew.nn.kernels.ssd import ssd_chunk_scan, ssd_kernel_platform
+from dew.nn.kernels.generation import measured_kernel
+from dew.nn.kernels.recurrence import Hooks
+from dew.nn.kernels.recurrence_chunk import RESET_DECAY, Chunk, chunk
 from dew.nn.linear import DepthwiseConv1d, causal_conv1d, held_scan
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.mixers.mamba import inverse_softplus_step
@@ -77,28 +77,15 @@ from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import (
     SEQUENCE_AXIS,
     LayoutRefused,
-    grouped_heads,
     logical_axes,
     logical_spec,
     manual_map,
-    rows_like,
     sequence_shards,
 )
 
 CHUNK_SIZE = 256
 """The reference's default `chunk_size` (configuration_mamba2.py). The
 chunked and the recurrent form agree at any size."""
-
-RESET_DECAY = -1e4
-"""The log decay a document's first token takes in place of `A dt`: the
-state entering it is multiplied by `exp(-1e4)`, which is 0 in fp32. A step's
-own `A dt` is never positive, so every span containing a reset sums to at
-most this and decays to exactly 0, and a span without one never sees it.
-It stays finite because the Pallas kernel forms its segment sums as a
-matmul against a 0/1 triangle, where an infinity times 0 is a NaN; and it
-stays small enough that thousands of resets in one shard's total decay are
-nowhere near fp32's range."""
-
 
 def segment_sum(x):
     """`segment_sum` (modeling_mamba2.py:73-90): over the last axis of `x`,
@@ -195,102 +182,31 @@ def _entering_state(decay, write, axis: str):
 
 
 def chunk_ssd(x, dt, A, B, C, D, state=None, chunk_size: int = CHUNK_SIZE, starts=None):
-    """The chunked SSD scan, `mamba2_chunk_scan` (modeling_mamba2.py:254-357).
+    """The chunked SSD scan, `mamba2_chunk_scan` (modeling_mamba2.py:254-357), as the recurrence
+    template's chunked op (`recurrence_chunk.chunk`): no delta rule, a rated decay `A dt` with `dt`
+    the write gate, `x` the values, `B` the keys, `C` the queries and the skip `D x`.
 
-    `x` `[B, S, H, P]`, `dt` `[B, S, H]` through softplus and the limit, `A`
-    `[H]`, `B` and `C` `[B, S, G, N]`, `D` `[H]`; returns `(output [B, S, H, P],
-    state [B, H, P, N])` in `at_least_fp32` of the operands' common dtype, the
-    output unrounded for what a caller adds to it (the earlier shards' state,
-    `_ssd`). `starts` `[B, S]` marks packed documents' first tokens,
-    whose entering state drops. Where `ssd_port_refusal` takes the call the
-    whole scan is mamba_ssm's kernels (`_ported`), on `x`, `B` and `C` in
-    their common dtype; else the scan runs in `at_least_fp32` of it, the
-    chunk scan on the TPU's Pallas kernel where `ssd_kernel_platform` takes
-    the geometry, else `xla_chunk_scan` (tests/test_ssd_kernel.py).
+    `x` `[B, S, H, P]`, `dt` `[B, S, H]` through softplus and the limit, `A` `[H]`, `B` and `C`
+    `[B, S, G, N]`, `D` `[H]`; returns `(output [B, S, H, P], state [B, H, P, N])` in
+    `at_least_fp32` of the operands' common dtype, the output unrounded for what a caller adds to it
+    (the earlier shards' state, `_ssd`). `starts` `[B, S]` marks packed documents' first tokens,
+    whose entering state drops. The op runs it on mamba_ssm's kernels where their port takes the
+    call (`recurrence_chunk.ssd_port_refusal`), on `x`, `B` and `C` in their common dtype; else in
+    `at_least_fp32` of it, on the TPU's Pallas kernel where it takes the geometry, else the portable
+    math. `xla_chunk_scan` is the reference's order (tests/test_ssd_kernel.py).
     """
     operand = jnp.result_type(x, B, C)
     work = at_least_fp32(operand)
     x, B, C = (jnp.asarray(t, operand) for t in (x, B, C))
     dt, A, D = (jnp.asarray(t, work) for t in (dt, A, D))
-    batch, length, heads, head_dim = x.shape
-    state_size = B.shape[-1]
-    carried = (rows_like(jnp.zeros((batch, heads, head_dim, state_size), work), x) if state is None
-               else jnp.asarray(state, work))
-    refusal = ssd_port_refusal(x, B, chunk_size)
-    if refusal is None:
-        out, final = _ported(x, dt, A, B, C, D, carried, chunk_size, starts)
-        return out.astype(work), final.astype(work)
-    ran_kernel('ssd', 'xla', refusal)
-    x, B, C = (jnp.asarray(t, work) for t in (x, B, C))
-    # The `H // G` heads of one group read the same B and C, the reference's `repeat_interleave`.
-    B, C = repeat_kv_heads(B, heads), repeat_kv_heads(C, heads)
-    pad = (chunk_size - length % chunk_size) % chunk_size
-    x, B, C = (jnp.pad(t, ((0, 0), (0, pad), (0, 0), (0, 0))) for t in (x, B, C))
-    dt = jnp.pad(dt, ((0, 0), (0, pad), (0, 0)))
-    skip = D[None, None, :, None] * x                      # the reference's D_residual
-    x = x * dt[..., None]                                   # discretised input
-    a = A[None, None, :] * dt                               # [B, T, H] log decay per step
-    if starts is not None:
-        a = jnp.where(jnp.pad(starts, ((0, 0), (0, pad)))[..., None], RESET_DECAY, a)
-
-    platform = ssd_kernel_platform(chunk_size, head_dim, state_size, dtype=work)
-    if platform is None:
-        scanned, final = xla_chunk_scan(x, B, C, a, carried, chunk_size)
-    else:
-        def kernel(x, B, C, a, carried):
-            return ssd_chunk_scan(x, B, C, a, carried, chunk_size, platform)
-
-        # The groups are expanded, so any split of the heads divides them.
-        rows, split = grouped_heads(x.shape, heads)
-        four, held = P(rows, None, split, None), P(rows, split, None, None)
-        scanned, final = manual_map(kernel, (four, four, four, P(rows, None, split), held),
-                                    (four, held))(x, B, C, a, carried)
-    return (scanned + skip)[:, :length], final
+    held = None if state is None else jnp.swapaxes(jnp.asarray(state, work), -1, -2)
+    out, final = chunk(SSD, Chunk(C, B, x, beta=dt, rate=A, skip=D, state=held, starts=starts),
+                       chunk_size=chunk_size, dtype=work)
+    return out, jnp.swapaxes(final, -1, -2)
 
 
-def ssd_port_refusal(x, B, chunk_size: int) -> str | None:
-    """Why a chunked scan over these operands runs the XLA scan rather than
-    mamba_ssm's kernels (`mamba_ssd.ssd_scan`), or None where the port takes
-    it: on every GPU whose target row names it (`measured_kernel`), except
-    inside `jax.jvp`'s traces (`FORWARD_MODE`), which the port's custom VJP
-    gives no tangent; inside a caller's `shard_map` that checks varying axes
-    over operands that vary, where a Pallas call, which states no varying
-    type for its results, cannot run; float64 operands, whose scan is the
-    reference math itself; and head widths, state widths or chunks that are
-    not powers of two of at least 16, the smallest block Triton's dot takes."""
-    widths = (x.shape[-1], B.shape[-1], chunk_size)
-    return first_refusal(
-        (measured_kernel('ssd', 'xla') == 'pallas',
-         "the device's target row (generation.TARGETS) does not name the port"),
-        (not FORWARD_MODE.get(), "forward_mode_attention traces for jax.jvp, which the port's custom VJP "
-                                 "gives no tangent"),
-        (not jax.typeof(x).mat.varying,
-         "a shard_map that checks varying axes holds the operands, and a Pallas call states no "
-         "varying type for its results"),
-        (jnp.dtype(x.dtype) != jnp.float64, "float64 operands, whose scan is the reference math itself"),
-        (all(width >= 16 and width & (width - 1) == 0 for width in widths),
-         f"head width {widths[0]}, state {widths[1]} and chunk {widths[2]}; the port takes powers of "
-         "two of at least 16"),
-    )
-
-
-def _ported(x, dt, A, B, C, D, state, chunk_size: int, starts):
-    """The scan on mamba_ssm's kernels, each token's document counted from
-    `starts` (mamba_ssm's `seq_idx`). On a mesh it runs per shard
-    (`manual_map`): rows where the rules split them, and heads with their
-    groups where the head split divides the groups, the time axis whole;
-    off a GPU its kernels interpret, as the CPU suite runs them."""
-    interpret = not triton_runs()
-    seq = None if starts is None else jnp.cumsum(starts, axis=1, dtype=jnp.int32)
-
-    def scan(x, dt, A, B, C, D, state, *seq):
-        return mamba_ssd.ssd_scan(x, dt, A, B, C, D, state, *(seq or (None,)), chunk_size, interpret)
-
-    operands = (x, dt, A, B, C, D, state, *([] if seq is None else [seq]))
-    rows, heads = grouped_heads(x.shape, B.shape[2])
-    four, held = P(rows, None, heads, None), P(rows, heads, None, None)
-    specs = (four, P(rows, None, heads), P(heads), four, four, P(heads), held, P(rows, None))
-    return manual_map(scan, specs[:len(operands)], (four, held))(*operands)
+SSD = Hooks(decay='scalar', rated=True, delta=False, skip=True)
+"""The SSD as the recurrence template's form: a rated decay a head, no delta rule, the skip."""
 
 
 def recurrent_ssd(x, dt, A, B, C, D, state=None, starts=None):

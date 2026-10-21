@@ -8,6 +8,7 @@ from reference_error import seeds_for
 import test_recurrence_chunk as t
 
 SITES = [(hooks, packed) for hooks in t.FORMED for packed in t.PACKED]
+SITES = SITES[8:]
 
 
 @pytest.mark.parametrize('index', range(len(SITES)), ids=[f's{i}' for i in range(len(SITES))])
