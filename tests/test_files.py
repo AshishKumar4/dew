@@ -68,3 +68,14 @@ def test_what_is_published_has_the_mode_a_plain_write_gives(tmp_path):
         os.umask(previous)
     modes = {path.name: stat.S_IMODE(path.stat().st_mode) for path in tmp_path.iterdir()}
     assert modes == {"run.json": 0o640, "ledger.json": 0o644, "entry": 0o755, "plain": 0o644}
+
+
+def test_a_file_whose_name_is_the_longest_the_filesystem_allows_is_published(tmp_path):
+    """The temporary beside a target is named apart from the target's own name, so a target whose name
+    is as long as the directory allows (NAME_MAX) is still written, and so is such a directory."""
+    longest = os.pathconf(tmp_path, "PC_NAME_MAX")
+    write_atomically(tmp_path / ("f" * longest), "whole")
+    assert (tmp_path / ("f" * longest)).read_text() == "whole"
+    with staged(tmp_path / ("d" * longest)) as staging:
+        (staging / "inside").write_text("whole")
+    assert (tmp_path / ("d" * longest) / "inside").read_text() == "whole"

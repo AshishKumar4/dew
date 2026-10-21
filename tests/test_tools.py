@@ -427,28 +427,37 @@ def test_layout_parity_reaches_every_leaf_of_a_model_that_initializes_its_output
 # tools/benchmark_step.py
 # ---------------------------------------------------------------------------
 
-def composite_case(tool, architecture: str, **changes):
+def owners(monkeypatch):
+    """tools/benchmark_cases.py and tools/benchmark_models.py, the cases and the trainer, batches and
+    compiled step the step benchmark measures (benchmark_models imports benchmark_cases by name)."""
+    monkeypatch.syspath_prepend(str(REPO_ROOT / "tools"))
+    import benchmark_cases
+    import benchmark_models
+    return benchmark_cases, benchmark_models
+
+
+def composite_case(cases, architecture: str, **changes):
     """The cpu-smoke preset's case for one composite, in fp32 as the preset
     runs it, resized by `changes`."""
-    (case,) = [c for c in tool.cpu_smoke_cases() if c.architecture == architecture]
+    (case,) = [c for c in cases.cpu_smoke_cases() if c.architecture == architecture]
     return dataclasses.replace(case, **{"dtype": "float32", **changes})
 
 
-def parameter_movement(tool, case, steps: int = 2):
+def parameter_movement(models, case, steps: int = 2):
     """How far every parameter moved over `steps` of the case's real compiled
     step, by tree path, with the loss and the step's measured FLOPs.
 
-    The trainer, the batches and the compiled step are the tool's own: a
+    The trainer, the batches and the compiled step are the benchmark's own: a
     parameter that does not move here is one the measured step never trains.
     """
     def named(tree):
         return {jax.tree_util.keystr(path): leaf
                 for path, leaf in jax.tree_util.tree_flatten_with_path(tree)[0]}
 
-    trainer = tool.build_trainer(case, "reference")
-    with tool.compiled_step(case, trainer) as compiled:
+    trainer = models.build_trainer(case, "reference")
+    with models.compiled_step(case, trainer) as compiled:
         before = jax.tree.map(np.asarray, named(compiled.state.variables))  # the step consumes the state
-        state, loss, finite, _ = tool.timed_steps(compiled.step, compiled.state, steps)
+        state, loss, finite, _ = models.timed_steps(compiled.step, compiled.state, steps)
     after = named(state.variables)
     assert bool(finite) and np.isfinite(float(loss))
     moved = {name: float(jnp.max(jnp.abs(value - before[name])))
@@ -457,18 +466,18 @@ def parameter_movement(tool, case, steps: int = 2):
 
 
 @pytest.mark.parametrize("architecture", ["sd3_transformer", "flux_transformer"])
-def test_step_benchmark_native_diffusion_trains_text_and_pooled_conditioning(architecture):
-    tool = load("benchmark_step")
-    case = composite_case(tool, architecture)
-    trainer = tool.build_trainer(case, "reference")
+def test_step_benchmark_native_diffusion_trains_text_and_pooled_conditioning(architecture, monkeypatch):
+    cases, models = owners(monkeypatch)
+    case = composite_case(cases, architecture)
+    trainer = models.build_trainer(case, "reference")
     encoder = trainer.objective.inputs.conditions["conditioning"].encoder
-    encoded = encoder.encode(encoder.params, tool.global_batch(case)["text"])
-    assert encoded.context.shape == (case.batch_size, tool.TEXT_TOKENS,
+    encoded = encoder.encode(encoder.params, models.global_batch(case)["text"])
+    assert encoded.context.shape == (case.batch_size, cases.TEXT_TOKENS,
                                      trainer.objective.model.joint_attention_dim)
     assert encoded.pooled.shape == (case.batch_size, trainer.objective.model.pooled_projection_dim)
     if architecture == "flux_transformer":
         np.testing.assert_array_equal(encoded.guidance, np.full(case.batch_size, 3.5))
-    moved, flops = parameter_movement(tool, case)
+    moved, flops = parameter_movement(models, case)
     assert flops > 0
     for projection in ("context_embedder", "text_embedder_linear_1"):
         changes = [value for path, value in moved.items() if projection in path]
@@ -478,64 +487,64 @@ def test_step_benchmark_native_diffusion_trains_text_and_pooled_conditioning(arc
         assert changes and min(changes) > 0
 
 
-def test_step_benchmark_media_step_trains_the_image_tower():
+def test_step_benchmark_media_step_trains_the_image_tower(monkeypatch):
     """The measured step is the whole conditioned model's: the tower and the
     projector move under it, and a second image a row raises the FLOPs the
     row reports. A step that fed no pixels would leave both untouched."""
-    tool = load("benchmark_step")
-    case = composite_case(tool, "multimodal_transformer")
+    cases, models = owners(monkeypatch)
+    case = composite_case(cases, "multimodal_transformer")
 
-    moved, flops = parameter_movement(tool, case)
+    moved, flops = parameter_movement(models, case)
 
     media = {name: value for name, value in moved.items()
              if "tower" in name or "projector" in name}
     assert media and min(media.values()) > 0
     assert min(value for name, value in moved.items() if "language_model" in name) > 0
     _, wider = parameter_movement(
-        tool, dataclasses.replace(case, media={**case.media, "images": 2}), steps=1)
+        models, dataclasses.replace(case, media={**case.media, "images": 2}), steps=1)
     assert wider > flops
 
 
-def test_step_benchmark_canvas_step_trains_the_self_conditioning_decoder():
+def test_step_benchmark_canvas_step_trains_the_self_conditioning_decoder(monkeypatch):
     """The measured step is the official fine-tuning step: the
     self-conditioning MLP the second decoder pass feeds moves under it, and a
     wider response raises the FLOPs the row reports. A plain next-token step
     on the same trunk has no such parameter to move."""
-    tool = load("benchmark_step")
-    narrow = composite_case(tool, "diffusion_gemma",
+    cases, models = owners(monkeypatch)
+    narrow = composite_case(cases, "diffusion_gemma",
                             canvas={"prompt_length": 12, "canvas_size": 4})
 
-    moved, one_canvas = parameter_movement(tool, narrow)
+    moved, one_canvas = parameter_movement(models, narrow)
 
     conditioning = {name: value for name, value in moved.items()
                     if "self_conditioning" in name}
     assert conditioning and min(conditioning.values()) > 0
     assert min(value for name, value in moved.items() if "text" in name) > 0
     _, two_canvases = parameter_movement(
-        tool, composite_case(tool, "diffusion_gemma"), steps=1)
+        models, composite_case(cases, "diffusion_gemma"), steps=1)
     assert two_canvases > one_canvas
 
 
 
-def test_a_canvas_case_trains_with_the_head_chunks_and_objective_keywords_it_names():
+def test_a_canvas_case_trains_with_the_head_chunks_and_objective_keywords_it_names(monkeypatch):
     """A canvas case's head chunking and objective keywords reach the block objective its measured
     step trains, as a decoder case's reach its objective: with the canvas loss weighed at nothing,
     the self-conditioning MLP only the canvas pass feeds stays where it was while the trunk the
     encoder loss trains moves, over the head in the one chunk the case names (chunking changes no
     number, so that the step trains with it is what is asked). A case that names another decoder
     objective is refused: the canvas case would benchmark the block objective under its name."""
-    tool = load("benchmark_step")
+    cases, models = owners(monkeypatch)
     case = dataclasses.replace(
-        composite_case(tool, "diffusion_gemma", canvas={"prompt_length": 12, "canvas_size": 4}),
+        composite_case(cases, "diffusion_gemma", canvas={"prompt_length": 12, "canvas_size": 4}),
         head_chunks=1, objective={"decoder_loss_weight": 0.0})
 
-    moved, _ = parameter_movement(tool, case, steps=1)
+    moved, _ = parameter_movement(models, case, steps=1)
 
     conditioning = [value for name, value in moved.items() if "self_conditioning" in name]
     assert conditioning and max(conditioning) == 0
     assert max(value for name, value in moved.items() if "text" in name) > 0
     with pytest.raises(ValueError):
-        tool.build_objective(dataclasses.replace(case, decoder_objective="dpo"))
+        models.build_objective(dataclasses.replace(case, decoder_objective="dpo"))
 
 
 # ---------------------------------------------------------------------------
