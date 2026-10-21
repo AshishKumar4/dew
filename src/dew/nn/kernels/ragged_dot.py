@@ -208,8 +208,9 @@ def _gpu_ragged_dot_kernel(
           if not trans_rhs else
           (((1,), (1,)), ((), ()))  # transposed matmul product x @ y.T
       )
+      # Dew: the default precision named, so a configured one does not reach the kernel (TF32 for fp32).
       xA = lax.dot_general(
-          x, A, dimension_numbers=dim_nums, preferred_element_type=acc_dtype
+          x, A, dimension_numbers=dim_nums, precision=lax.Precision.DEFAULT, preferred_element_type=acc_dtype
       )
       return _summed(acc, xA.astype(acc_dtype), group_sz > 0, exact_sums=exact_sums)
 
@@ -435,7 +436,8 @@ def _tgmm_ragged_dot_kernel(
       y = plgpu.load(y_ref.at[xy_rows_idx, cols_idx], mask=mask, other=0)
       x, y = x.astype(compute_dtype), y.astype(compute_dtype)
       dim_nums = (((0,), (0,)), ((), ()))
-      partial_sum = lax.dot_general(x, y, dimension_numbers=dim_nums, preferred_element_type=acc_dtype)
+      partial_sum = lax.dot_general(x, y, dimension_numbers=dim_nums, precision=lax.Precision.DEFAULT,
+                                    preferred_element_type=acc_dtype)
       return _summed(acc, partial_sum.astype(acc.dtype), group_sz > 0, exact_sums=exact_sums)
 
     acc = jnp.zeros((block.k, block.n), dtype=acc_dtype)

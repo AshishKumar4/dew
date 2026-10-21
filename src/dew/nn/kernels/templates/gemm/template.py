@@ -109,8 +109,8 @@ def gemm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None = None, *
             d_lhs, d_prologue = _prologue_cotangents(prologue, lhs, prologue_arrays, prologue_axes,
                                                      group_sizes, d_operand)
         return (d_lhs.astype(lhs.dtype), d_rhs, np.zeros(group_sizes.shape, jax.dtypes.float0),
-                tuple(d.astype(a.dtype) for d, a in zip(d_prologue, prologue_arrays, strict=True)),
-                tuple(d.astype(a.dtype) for d, a in zip(d_epilogue, epilogue_arrays, strict=True)))
+                tuple(_as_cotangent(d, a) for d, a in zip(d_prologue, prologue_arrays, strict=True)),
+                tuple(_as_cotangent(d, a) for d, a in zip(d_epilogue, epilogue_arrays, strict=True)))
 
     differentiable = generation.linear_tangent(forward, backward, portable)
     return differentiable(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays)
@@ -126,10 +126,10 @@ def gemm_t(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, prologue=N
     prologue_arrays, prologue_axes = _split(prologue_operands, 'prologue')
 
     def kernel(lhs, rhs, group_sizes, prologue_arrays, *, interpret):
-        hook, sides, axes = _launchable(prologue, prologue_arrays, prologue_axes)
-        return grouped_matmul.launched_tgmm(lhs, rhs, group_sizes, sides, out_dtype=out_dtype,
-                                            hooks=grouped_matmul.Hooks(hook, axes), interpret=interpret,
-                                            exact=_exact(precision))
+        sides, axes, broadcast = _launchable(prologue_arrays, prologue_axes)
+        hooks = grouped_matmul.Hooks(prologue, axes, prologue_broadcast=broadcast)
+        return grouped_matmul.launched_tgmm(lhs, rhs, group_sizes, sides, out_dtype=out_dtype, hooks=hooks,
+                                            interpret=interpret, exact=_exact(precision))
 
     def portable(lhs, rhs, group_sizes, prologue_arrays):
         routed = _routed(group_sizes, lhs.shape[0])
@@ -141,6 +141,8 @@ def gemm_t(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, prologue=N
             lhs, matrix, group_sizes, precision=precision, preferred_element_type=jnp.float32), matrix)
         return pullback(rhs.astype(lhs.dtype).astype(jnp.float32))[0].astype(out_dtype)
 
+    if not _kernels_take(lhs.dtype, precision):
+        return portable(lhs, rhs, group_sizes, prologue_arrays)
     return _dispatched(kernel, portable, interpret_on_cpu, lhs, rhs, group_sizes, prologue_arrays)
 
 
@@ -149,10 +151,11 @@ def _gemm(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, epilo
           precision: PrecisionLike):
     """`gemm`'s value, on grouped operands."""
     def kernel(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays, *, interpret):
-        before, before_sides, before_axes = _launchable(prologue, prologue_arrays, prologue_axes)
-        after, after_sides, after_axes = _launchable(epilogue, epilogue_arrays, epilogue_axes)
-        hooks = grouped_matmul.Hooks(before, before_axes, after, after_axes,
-                                     tuple(dtype.name for dtype in dtypes) if several else None)
+        before_sides, before_axes, before_broadcast = _launchable(prologue_arrays, prologue_axes)
+        after_sides, after_axes, after_broadcast = _launchable(epilogue_arrays, epilogue_axes)
+        hooks = grouped_matmul.Hooks(prologue, before_axes, epilogue, after_axes,
+                                     tuple(dtype.name for dtype in dtypes) if several else None,
+                                     prologue_broadcast=before_broadcast, epilogue_broadcast=after_broadcast)
         return grouped_matmul.launched_gmm(lhs, rhs, group_sizes, before_sides, after_sides,
                                            out_dtype=dtypes[0], trans_rhs=transpose_rhs, hooks=hooks,
                                            interpret=interpret, exact=_exact(precision))
@@ -161,6 +164,8 @@ def _gemm(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, epilo
         return _portable_gemm(lhs, rhs, group_sizes, prologue, prologue_arrays, epilogue, epilogue_arrays,
                               dtypes, several, transpose_rhs, precision)
 
+    if not _kernels_take(lhs.dtype, precision):
+        return portable(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays)
     return _dispatched(kernel, portable, interpret_on_cpu, lhs, rhs, group_sizes, prologue_arrays,
                        epilogue_arrays)
 
@@ -197,8 +202,13 @@ def _prologue_cotangents(prologue, lhs, arrays, axes_of, group_sizes, d_operand)
     _, pull = jax.vjp(lambda x, *sides: prologue(x, *sides).astype(lhs.dtype), *inputs)
     d_lhs, *d_sides = pull(d_operand.astype(lhs.dtype))
     d_lhs = jnp.where(routed[:, None] & nonempty, d_lhs, 0)
-    d_sides = [jnp.where(nonempty, d, 0) for d in d_sides]
+    d_sides = [d if d.dtype == jax.dtypes.float0 else jnp.where(nonempty, d, 0) for d in d_sides]
     return d_lhs, tuple(d_sides)
+
+
+def _as_cotangent(cotangent, operand):
+    """`cotangent` in `operand`'s dtype; an integer or boolean operand's stays float0, its tangent space."""
+    return cotangent if cotangent.dtype == jax.dtypes.float0 else cotangent.astype(operand.dtype)
 
 
 def _reads_accumulator(epilogue, acc_shape: tuple, sides: tuple) -> bool:
@@ -250,6 +260,13 @@ def _exact(precision: PrecisionLike) -> bool:
     return not asks_default_precision(precision, configured=True)
 
 
+def _kernels_take(compute, precision: PrecisionLike) -> bool:
+    """Whether the kernels compute the products `precision` asks for in `compute`: 16-bit products are
+    exact at any precision; fp32's are TF32 in the kernels, which only the default precision asks for, so
+    a higher one runs XLA's portable program (`grouped_matmul.ragged_dot_refusal`)."""
+    return jnp.dtype(compute).itemsize == 2 or not _exact(precision)
+
+
 def _as_tuple(outs) -> tuple:
     return outs if isinstance(outs, tuple) else (outs,)
 
@@ -282,22 +299,14 @@ def _split(operands: tuple, hook: str) -> tuple[tuple, tuple]:
     return tuple(arrays), tuple(axes_of)
 
 
-def _launchable(hook, arrays: tuple, axes_of: tuple):
-    """The hook, side operands and axes a launch takes: each dimension of one squeezed out, and the
-    hook given its tiles back with those dimensions (`_unsqueezed`)."""
+def _launchable(arrays: tuple, axes_of: tuple) -> tuple[tuple, tuple, tuple]:
+    """The side operands and axes a launch takes, each dimension of one squeezed out, and each one's
+    positions of them, which the launch gives the hook back (`grouped_matmul.Hooks`)."""
     positions = tuple(tuple(i for i, axis in enumerate(axes) if axis is None) for axes in axes_of)
-    if hook is None or not any(positions):
-        return hook, arrays, axes_of
     squeezed = tuple(jnp.squeeze(array, where) if where else array
                      for array, where in zip(arrays, positions, strict=True))
     named = tuple(tuple(axis for axis in axes if axis is not None) for axes in axes_of)
-    return functools.partial(_unsqueezed, hook, positions), squeezed, named
-
-
-def _unsqueezed(hook, positions: tuple, tile, *sides):
-    """`hook` on `tile` and its side tiles with their dimensions of one back at `positions`."""
-    return hook(tile, *(jnp.expand_dims(side, where) if where else side
-                        for side, where in zip(sides, positions, strict=True)))
+    return squeezed, named, positions if any(positions) else ()
 
 
 def _routed(group_sizes: jax.Array, rows: int) -> jax.Array:
