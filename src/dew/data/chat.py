@@ -42,7 +42,7 @@ import grain.python as grain
 import numpy as np
 from jinja2 import TemplateError
 
-from dew.data.text import HFTokenizer, tokenizer_name
+from dew.data.text import HFTokenizer, SavedTokenizer, tokenizer_name
 
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
@@ -533,7 +533,7 @@ class RenderChat(grain.MapTransform):
         return {**kept, "text": ids, "text_roles": roles}
 
 
-def template(tokenizer: str | PreTrainedTokenizerBase, *, messages: str = "messages") -> RenderChat:
+def template(tokenizer: str | SavedTokenizer, *, messages: str = "messages") -> RenderChat:
     """A record step that renders the conversation in `messages` through the
     tokenizer's chat template to token ids under "text" and each token's
     speaker under "text_roles", which an assistant-only loss reads.

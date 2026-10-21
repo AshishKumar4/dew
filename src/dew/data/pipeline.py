@@ -19,9 +19,8 @@ from dew.data.dataset import Batch, Records
 if TYPE_CHECKING:
     import jax
 
-    from dew.data.cache import Cache
     from dew.data.dataset import Loading
-    from dew.data.generation import Generation
+    from dew.data.generation import DependencyManifest
     from dew.data.sources.base import Read, Source
 
 
@@ -356,9 +355,21 @@ class MapBatch:
     identity: str | None = None
 
 
+@runtime_checkable
+class Cached(Protocol):
+    """What a cache stage fills and reads, a `dew.data.cache.Cache`, or the published generation
+    it stands in for, a `dew.data.generation.Generation`: each says where it lives and which rows
+    a plan reads from it."""
+
+    @property
+    def url(self) -> str: ...
+
+    def reference(self, manifest: DependencyManifest, /) -> str: ...
+
+
 @dataclasses.dataclass(frozen=True)
 class Artifact:
-    cache: Cache | Generation
+    cache: Cached
 
 
 type Stage = (
@@ -700,7 +711,7 @@ class Dataset:
     def take(self, count: int) -> Pipeline:
         return self._then(Limit(count))
 
-    def cache(self, cache: str | Cache | Generation) -> Pipeline:
+    def cache(self, cache: str | Cached) -> Pipeline:
         """Fill `cache` with the deterministic record steps before it, or read a
         published `Generation` as the source in their place, with its published
         packing in place of a `pack` that follows."""

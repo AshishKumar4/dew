@@ -317,7 +317,15 @@ class HFTokenizer:
         return f"{self.__class__.__name__}(name={self.name!r})"
 
 
-def tokenizer_name(tokenizer: str | PreTrainedTokenizerBase) -> str:
+@runtime_checkable
+class SavedTokenizer(Protocol):
+    """A tokenizer object Dew names by the files it saves (`tokenizer_name`), such as a transformers
+    tokenizer: a preset or a step given one reads it by that name."""
+
+    def save_pretrained(self, save_directory: str, /) -> tuple[str, ...]: ...
+
+
+def tokenizer_name(tokenizer: str | SavedTokenizer) -> str:
     """A tokenizer as the name Dew's steps carry: a name as it is, and a
     transformers tokenizer object saved once to a directory named for its
     files' hash, which every worker reads and every run hashes alike."""
@@ -347,7 +355,7 @@ def tokenizer_name(tokenizer: str | PreTrainedTokenizerBase) -> str:
     return str(directory)
 
 
-def tokenize(tokenizer: str | PreTrainedTokenizerBase = "byte", *, field: str = "text",
+def tokenize(tokenizer: str | SavedTokenizer = "byte", *, field: str = "text",
              eos: bool | None = None) -> Tokenize:
     """A record step that encodes the text in `field` to token ids under
     "text", each document ended by the tokenizer's EOS with `eos`, or where
