@@ -16,7 +16,7 @@ import hashlib
 import json
 import threading
 import unicodedata
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 
@@ -31,6 +31,7 @@ if TYPE_CHECKING:
     from transformers import PreTrainedConfig, PreTrainedTokenizerBase
 
     from dew.data.dataset import Batch
+    from dew.data.pipeline import Dataset
 
 
 _load_lock = threading.Lock()
@@ -460,6 +461,31 @@ class MinChars:
 
     def __call__(self, element: Batch) -> bool:
         return len(str(element[self.field])) >= self.count
+
+
+def train_tokenizer(dataset: Dataset, base: str, path: str, *, vocab_size: int, field: str = "text",
+                    records: int | None = None) -> str:
+    """A tokenizer of `vocab_size` tokens trained on the text in `field` of `dataset`'s records, the
+    first `records` where given, by the algorithm, normalization and special tokens of `base` (a Hub
+    repo or directory: a BPE tokenizer's learns merges, a unigram's pieces), saved at `path`, which it
+    returns for `tokenize(path)` and the `lm` and `sft` presets to read."""
+    from transformers import AutoTokenizer
+
+    if vocab_size < 1:
+        raise ValueError("a trained tokenizer needs a positive vocab_size")
+    rows = iter(dataset if records is None else dataset.take(records))
+
+    def texts() -> Iterator[str]:
+        for row in rows:
+            text = row[field]
+            if not isinstance(text, str):
+                raise ValueError(f"train_tokenizer reads text from {field!r}, which holds "
+                                 f"{type(text).__name__}")
+            yield text
+
+    trained = AutoTokenizer.from_pretrained(base).train_new_from_iterator(texts(), vocab_size)
+    trained.save_pretrained(path)
+    return path
 
 
 def tokenizer_for(name: str, *, local_files_only: bool = False) -> ByteTokenizer | HFTokenizer:
