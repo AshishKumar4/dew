@@ -1949,15 +1949,15 @@
   },
   "hf/llada-moe-tiny": {
    "tool": "tools/llada_moe_reference.py",
-   "sources": [{"repo": "inclusionAI/LLaDA-MoE-7B-A1B-Base", "version": "daccaf1ccbf263a427bc9ac2a23b0b004fb275bf", "runs": "fetched"}, {"repo": "huggingface/transformers", "version": "4.57.1", "runs": "transformers"}]
+   "sources": [{"repo": "inclusionAI/LLaDA-MoE-7B-A1B-Base", "version": "daccaf1ccbf263a427bc9ac2a23b0b004fb275bf", "runs": "fetched"}, {"repo": "inclusionAI/LLaDA-MoE-7B-A1B-Instruct", "version": "783d3467f108d28ac0a78d3e41af16ab05cabd8d", "runs": "fetched"}, {"repo": "huggingface/transformers", "version": "4.57.1", "runs": "transformers"}]
   },
   "hf/llada-moe-v2-tiny": {
    "tool": "tools/llada_moe_reference.py",
-   "sources": [{"repo": "GSAI-ML/LLaDA-MoE-v2-30B-A3B-Base", "version": "2a513f7a4634e426b2ab030e6defb24001d0c847", "runs": "fetched"}, {"repo": "huggingface/transformers", "version": "4.57.1", "runs": "transformers"}]
+   "sources": [{"repo": "GSAI-ML/LLaDA-MoE-v2-30B-A3B-Base", "version": "2a513f7a4634e426b2ab030e6defb24001d0c847", "runs": "fetched"}, {"repo": "GSAI-ML/LLaDA-MoE-v2-30B-A3B-Instruct", "version": "97cfa32a580778df8d796c1faad72d22c8f8a6ba", "runs": "fetched"}, {"repo": "huggingface/transformers", "version": "4.57.1", "runs": "transformers"}]
   },
   "hf/llada2-tiny": {
    "tool": "tools/llada_moe_reference.py",
-   "sources": [{"repo": "inclusionAI/LLaDA2.0-mini", "version": "dad945cac317da394b390f82c7b40691d8a881ed", "runs": "fetched"}, {"repo": "huggingface/transformers", "version": "4.57.1", "runs": "transformers"}]
+   "sources": [{"repo": "inclusionAI/LLaDA2.0-mini", "version": "dad945cac317da394b390f82c7b40691d8a881ed", "runs": "fetched"}, {"repo": "inclusionAI/LLaDA2.0-flash", "version": "744c3f8c6c8317d2377d6d16d8a3d4be2caef563", "runs": "fetched"}, {"repo": "huggingface/transformers", "version": "4.57.1", "runs": "transformers"}]
   },
   "hf/llada21-tiny": {
    "tool": "tools/llada_moe_reference.py",
