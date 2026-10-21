@@ -411,6 +411,27 @@ def test_a_plan_with_no_second_point_to_fit_is_not_timed(monkeypatch, split):
                                                             else (1, "minimal", False))
 
 
+def asked(trainer) -> list[tuple[int, str | None, bool]]:
+    """The compiles a plan's search made, as (split, remat, fits)."""
+    return [(probe["split"], probe["remat"], probe["fits"]) for probe in trainer.plan["probes"]]
+
+
+def assert_searched(probes, chosen, below, frontier, *, half=None):
+    """`probes`, a search that settled on `chosen` (split, remat): the batch whole asked first, no
+    compile asked twice, every split that missed at no recomputation asked at the `half` rung next,
+    `below`, the largest split under the plan, asked and missed at each rung it may fit at, and the
+    `frontier` asked last. Which splits between are asked, and in what order, follows the memory
+    each compile measured, which differs between devices (`Forecast`)."""
+    assert probes[0][:2] == (1, None) and not probes[0][2]
+    assert len({probe[:2] for probe in probes}) == len(probes)
+    assert (*chosen, True) in probes and probes[-1] == (*frontier, False)
+    for index, (split, remat, fits) in enumerate(probes[:-1]):
+        if half is not None and remat is None and not fits:
+            assert probes[index + 1] == (split, half, probes[index + 1][2])
+    rungs = [None] if half is None else [None, half] if chosen[1] is None else [half]
+    assert all((below, remat, False) in probes for remat in rungs)
+
+
 DELTA = {"mixer": mixers.build("gated_delta_net", linear_num_key_heads=2, linear_num_value_heads=2,
                                linear_key_head_dim=8, linear_value_head_dim=8)}
 """A decoder of one gated delta net layer, whose ladder holds the half rung 'all_but_delta_memory'."""
@@ -429,37 +450,31 @@ def test_a_split_that_misses_tries_the_half_rung_before_the_batch_splits_further
     trainer.compile(state, BATCH, lambda steps: pytest.fail("the plan at its first split was timed"))
     assert (trainer.plan["split"], trainer.plan["remat"]) == (4, half)
     assert trainer.objective.model.remat == REMAT_POLICIES[half]
-    assert [(probe["split"], probe["remat"], probe["fits"]) for probe in trainer.plan["probes"]] == [
-        (1, None, False), (1, "all_but_delta_memory", False), (4, None, False),
-        (4, "all_but_delta_memory", True), (2, "all_but_delta_memory", False),
-        (1, "minimal_with_conv", False)]
+    assert_searched(asked(trainer), (4, half), 2, (1, "minimal_with_conv"), half=half)
 
 
 def test_a_plan_at_no_recomputation_times_its_frontier_past_the_half_rung(monkeypatch):
     """An A100's plan: no recomputation fits the batch at four microbatches and the half rung never
     fits it in fewer, so the plan is four at no recomputation, and the frontier, the batch whole one
-    rung up, is asked at the first rung past the half rung, whose every split asked missed. The split
-    the batch whole's compiles guess likely to fit is asked before the largest."""
+    rung up, is asked at the first rung past the half rung, whose every split asked missed."""
     free(monkeypatch, needs(monkeypatch, lm(split=4, **DELTA)))
     trainer = lm(**DELTA)
     state, _, _ = trainer.place()
     trainer.compile(state, BATCH, lambda steps: pytest.fail("a single plan was timed"))
     assert (trainer.plan["split"], trainer.plan["remat"]) == (4, None)
-    assert [(probe["split"], probe["remat"], probe["fits"]) for probe in trainer.plan["probes"]] == [
-        (1, None, False), (1, "all_but_delta_memory", False), (4, None, True), (2, None, False),
-        (2, "all_but_delta_memory", False), (1, "minimal_with_conv", False)]
+    assert_searched(asked(trainer), (4, None), 2, (1, "minimal_with_conv"), half="all_but_delta_memory")
 
 
-def test_a_decoder_without_a_half_rung_asks_the_likely_split_and_halves_below_it(monkeypatch):
-    """Without a delta rule no rung is a half rung: the search asks the batch whole, then the split its
-    miss guesses likely to fit, and halves the range below it, each at no recomputation, and the
-    frontier one rung up."""
+def test_a_decoder_without_a_half_rung_asks_its_splits_at_no_recomputation(monkeypatch):
+    """Without a delta rule no rung is a half rung: the search asks the batch whole and the splits
+    that find the fewest microbatches that fit, each at no recomputation, and the frontier one rung
+    up."""
     free(monkeypatch, needs(monkeypatch, lm(split=4)))
     trainer = lm()
     state, _, _ = trainer.place()
     trainer.compile(state, BATCH, lambda steps: pytest.fail("a single plan was timed"))
-    assert [(probe["split"], probe["remat"], probe["fits"]) for probe in trainer.plan["probes"]] == [
-        (1, None, False), (4, None, True), (2, None, False), (1, "minimal", False)]
+    assert_searched(asked(trainer), (4, None), 2, (1, "minimal"))
+    assert all(remat is None for _, remat, _ in asked(trainer)[:-1])
 
 
 def test_the_timer_steps_the_state_it_was_given_and_hands_back_a_fresh_copy():
