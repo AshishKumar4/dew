@@ -275,7 +275,7 @@ images = pipe(["a water lily", "a sunflower"], steps=40, guidance=4.0, sampler=s
 text = generate(model, params, prompt, 300, key=key, sampling=Sampling(temperature=0.8)).tokens
 ```
 
-A loaded model is ready to run. `Pretrained.load` without a mesh places its variables on JAX's
+A loaded model is ready to run. `Pretrained.load` without a mesh or layout places its variables on JAX's
 default device, as a `jnp` array is placed, one leaf at a time; with a mesh it places them there.
 Keeping them on the host is an explicit request (`on_host=True`), for a caller that places them
 itself, such as a training start or an export.

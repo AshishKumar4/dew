@@ -10,6 +10,7 @@ exists to avoid.
 """
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import pytest
 
@@ -182,13 +183,14 @@ def test_a_loaded_source_is_ready_to_run_on_the_default_device():
     from pathlib import Path
 
     from dew.interop import Pretrained
-    from dew.nn.inputs import default_placement
 
     fixture = Path(__file__).resolve().parent / "fixtures" / "hf" / "llama-tiny"
     loaded = Pretrained.load(fixture, dtype="float32", attention_impl="reference")
     leaves = jax.tree.leaves(loaded.variables)
-    assert leaves and all(isinstance(leaf, jax.Array) and leaf.devices() == default_placement().device_set
-                          and not leaf.committed for leaf in leaves)
+    # Where a jnp array goes: the default device, uncommitted.
+    native = jnp.zeros(())
+    assert leaves and all(isinstance(leaf, jax.Array) and leaf.devices() == native.devices()
+                          and leaf.committed == native.committed for leaf in leaves)
     # Uncommitted, as a jnp array is: a call placed on every device takes it where it is.
     mesh = jax.sharding.Mesh(np.array(jax.devices()), ("data",))
     spread = jax.jit(lambda leaf: leaf * 2, out_shardings=jax.sharding.NamedSharding(

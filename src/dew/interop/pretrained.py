@@ -169,11 +169,19 @@ def _share_quantized_aliases(tensors: dict[str, np.ndarray], aliases: tuple[tupl
 
 def on_default_device(variables: Variables) -> Variables:
     """`variables` with each host leaf on JAX's default device as a `jnp` array is, uncommitted, so a
-    jitted call reads it where it is and a placement moves it, one leaf at a time: each host leaf
-    is released once its device copy is written back in its place."""
+    jitted call reads it where it is and a placement moves it, one leaf at a time: a leaf's transfer
+    completes before the next starts, and its host copy is released (a memory-mapped one's pages
+    evicted, `dew.training.host.evict`) once its device copy is written back in its place."""
+    from dew.training.host import evict
+
     def placed(node):
         if not isinstance(node, Mapping):
-            return jax.device_put(node) if isinstance(node, (np.ndarray, np.generic)) else node
+            if not isinstance(node, (np.ndarray, np.generic)):
+                return node
+            landed = jax.block_until_ready(jax.device_put(node))
+            if isinstance(node, np.ndarray):
+                evict(node)
+            return landed
         # A freshly loaded tree's nodes are its own plain dicts, written in place so that no host leaf
         # outlives its device copy; any other mapping is rebuilt.
         held = node if type(node) is dict else dict(node)
@@ -368,16 +376,16 @@ class Pretrained:
         or integer dtypes.
 
         A loaded source is ready to run: without `mesh` or `layout` its variables are
-        placed on JAX's default device (`jax.default_device`), uncommitted, as a `jnp`
-        array is, so a call or a placement over other devices still takes them. With
-        either, they are placed on that mesh (the default `MeshSpec()` when only `layout`
-        is given) under that layout. Either way they are placed one leaf at a time.
+        built on the host and then placed on JAX's default device (`jax.default_device`)
+        one leaf at a time, uncommitted, as a `jnp` array is, so a call or a placement
+        over other devices still takes them. With either, they are placed on that mesh
+        (the default `MeshSpec()` when only `layout` is given) under that layout.
         `on_host=True` keeps them as host arrays instead, for a caller that places them
         itself, as a training start or an export does; a host tree passed to a jitted
-        call is copied to the device at each call. A decoder's or a diffusion pipeline's
-        leaves are read from the memory-mapped checkpoint one device shard at a time,
-        and cast and transposed there (`dew.interop.streaming`), so the host never
-        holds the whole translated model. Towers, projectors, a quantized source's
+        call is copied to the device at each call. With a mesh or layout, a decoder's or
+        a diffusion pipeline's leaves are read from the memory-mapped checkpoint one
+        device shard at a time, and cast and transposed there (`dew.interop.streaming`),
+        so the host never holds the whole translated model. Towers, projectors, a quantized source's
         dequantized tensors and a pipeline's convolution kernels are still built
         whole on the host first.
 
