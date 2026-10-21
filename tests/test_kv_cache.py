@@ -31,6 +31,7 @@ from dew.nn.kv_cache import (
     quantize,
     rotated,
     write_cache,
+    write_tokens,
 )
 from dew.nn.scatter import DROPPED
 
@@ -98,15 +99,17 @@ def test_a_cache_leaf_with_no_elements_moves_as_words_and_back_whole(dtype):
 
 
 def test_a_dropped_cache_write_leaves_the_next_rows_slot_to_its_own_write():
-    """A cache write whose dropped token (position -1) sits beside the next row's write to its slot 0
-    leaves that slot holding the next row's token. XLA's deterministic GPU scatter, which the cuda
-    lane's flags select, would write an index at the axis size onto the next row's first slot
+    """A mixed call's token write (`write_tokens`, one scatter over rows and slots) whose dropped token
+    (position -1) sits beside the next row's write to its slot 0 leaves that slot holding the next row's
+    token. XLA's deterministic GPU scatter, which the cuda lane's flags select, linearizes a row and
+    slot index and would write a slot at the axis size onto the next row's first slot
     (openxla/xla#49380); the write drops at `dew.nn.scatter.DROPPED` instead, so on every backend each
     row holds exactly its own tokens."""
     buffer = jnp.zeros((2, 4, 1, 1), jnp.int32)
-    values = jnp.asarray([[1, 2], [3, 4]], jnp.int32)[:, :, None, None]
-    positions = jnp.asarray([[0, -1], [0, -1]], jnp.int32)
-    written = np.asarray(jax.jit(write_cache)(buffer, values, positions))[..., 0, 0]
+    values = jnp.asarray([1, 2, 3, 4], jnp.int32)[:, None, None]
+    rows = jnp.asarray([0, 0, 1, 1], jnp.int32)
+    positions = jnp.asarray([0, -1, 0, -1], jnp.int32)
+    written = np.asarray(jax.jit(write_tokens)(buffer, values, rows, positions))[..., 0, 0]
     np.testing.assert_array_equal(written, [[1, 0, 0, 0], [3, 0, 0, 0]])
 
 
