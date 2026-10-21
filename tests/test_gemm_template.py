@@ -586,7 +586,8 @@ def test_an_fp32_product_above_the_default_precision_runs_xla():
             product("default")(x, w)
         with generation.chosen(grouped_matmul="triton"), pytest.raises(ValueError):
             product("highest").lower(x, w)
-    taken = [(route.kernel, route.refusal is not None) for route in highest if route.choice == "grouped_matmul"]
+    taken = [(route.kernel, route.refusal is not None) for route in highest
+             if route.choice == "grouped_matmul"]
     assert taken == [("xla", True)]
     assert {route.kernel for route in default if route.choice == "grouped_matmul"} == {"triton"}
     exact = np.asarray(x, np.float64) @ np.asarray(w[0], np.float64)
