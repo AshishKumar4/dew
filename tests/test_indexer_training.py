@@ -22,20 +22,13 @@ import optax
 import pytest
 from recording import RecordingTracker
 import reference_error as _gate
-from reference_error import declared_seeds, indexed_recording, recording
+from reference_error import assert_moves, declared_seeds, indexed_recording, recording
 
 
 def assert_as_exact(dew_fn, reference_fn, draw, label, *, seeds, truth_fn=None):
-    count = seeds if 'indexer loss' in label else _gate.seeds_for(reference_fn, draw, label, truth_fn=truth_fn)
+    count = _gate.seeds_for(reference_fn, draw, label, truth_fn=truth_fn) if 'per query' in label else seeds
     print(f"SIZED {label!r} {count}", flush=True)
     _gate.assert_as_exact(dew_fn, reference_fn, draw, label, seeds=count, truth_fn=truth_fn)
-    print(f"PASSED {label!r}", flush=True)
-
-
-def assert_moves(original_fn, changed_fn, draw, label, *, seeds, truth_fn=None):
-    count = _gate.seeds_for(original_fn, draw, label, truth_fn=truth_fn)
-    print(f"SIZED {label!r} {count}", flush=True)
-    _gate.assert_moves(original_fn, changed_fn, draw, label, seeds=count, truth_fn=truth_fn)
     print(f"PASSED {label!r}", flush=True)
 
 from dew.data.dataset import Loader
@@ -46,6 +39,7 @@ from dew.nn.sparse_selection import top_k_keys
 from dew.objectives.base import FROZEN, Step
 from dew.objectives.lm import IndexerTraining, LMObjective
 from dew.training import Layout, MeshSpec, Trainer
+from tools import indexer_reference as transcription
 from tools.indexer_reference import published_inputs, published_keep
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "indexer"
@@ -57,9 +51,10 @@ MLA_CONFIG = json.loads((MLA_FIXTURES / "config.json").read_text())
 SEQ = 16
 VOCAB = 64
 TINY_SHARD = 256
-SEEDS = {'covering': 8, 'covered positions': 8, 'dropped': 8, 'dropped positions': 8, 'packed': 8,
-         'packed alone': 8, 'total': 8, 'documents alone': 8, 'split tree': 8}
-"""Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada)."""
+SEEDS = {'covering': 256, 'covered positions': 512, 'dropped': 256, 'dropped positions': 256, 'packed': 64,
+         'packed alone': 128, 'total': 512, 'documents alone': 512, 'split tree': 8, 'per query': 8}
+"""Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada, 2026-10-21):
+the most any of a site's cases took."""
 
 
 def fixture() -> dict:
@@ -131,6 +126,36 @@ def test_the_loss_its_gradient_and_the_selection_are_maxtexts(name):
         assert bool(jnp.all(jnp.isfinite(jax.grad(
             lambda scores: jnp.sum(indexer_kl(scores, legacy["query"], legacy["key"],
                                               legacy_keep, float(legacy["scale"]))))(legacy["scores"]))))
+
+    # Each query's KL, which the published mean does not show, on par with the transcription's
+    # (tools/indexer_reference.py, the same steps in NumPy) from its float64 run.
+    scale_ = np.float32(transcription.HEAD_DIM ** -0.5)
+    additive = (transcription.causal_mask() if mask == "causal"
+                else transcription.packed_mask(np.asarray(legacy["segments"])))
+
+    def draw(seed):
+        rng = np.random.default_rng([23, seed])
+        shape = (transcription.BATCH, transcription.LENGTH, transcription.HEADS, transcription.HEAD_DIM)
+        query, key = (rng.normal(size=shape).astype(np.float32) for _ in range(2))
+        length = transcription.LENGTH
+        scores = np.maximum(rng.normal(scale=1.5, size=(transcription.BATCH, length, length)), 0)
+        return scores.astype(np.float32), query, key
+
+    def transcribed(scores, query, key):
+        dtype = np.asarray(scores).dtype
+        indexer_mask, masked_scores = transcription.indexer_call(np.asarray(scores), additive,
+                                                                 transcription.TOP_K)
+        scaled = np.asarray(query) * np.asarray(scale_, dtype)
+        per_query, _ = transcription.calculate_indexer_loss(
+            masked_scores, scaled, np.asarray(key), additive, indexer_mask, sparse_loss=phase == "sparse",
+            dtype=dtype)
+        return {"per query": per_query}
+
+    def ours(scores, query, key):
+        region = top_k_keys(scores, legacy_keep, transcription.TOP_K) if phase == "sparse" else legacy_keep
+        return {"per query": indexer_kl(scores, query, key, region, float(scale_))}
+
+    assert_as_exact(jax.jit(ours), transcribed, draw, f"{name} per query", seeds=SEEDS['per query'])
 
 
 # --------------------------------------------------------------------------
