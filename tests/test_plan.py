@@ -420,8 +420,9 @@ def assert_searched(probes, chosen, below, frontier, *, half=None):
     """`probes`, a search that settled on `chosen` (split, remat): the batch whole asked first, no
     compile asked twice, every split that missed at no recomputation asked at the `half` rung next,
     `below`, the largest split under the plan, asked and missed at each rung it may fit at, a plan at
-    the half rung missed at no recomputation before, and the `frontier` asked last. Which splits between are asked, and in what order, follows the memory
-    each compile measured, which differs between devices (`Forecast`)."""
+    the half rung missed at no recomputation before, and the `frontier` asked last. Which splits
+    between are asked, and in what order, follows the memory each compile measured, which differs
+    between devices (`Forecast`)."""
     assert probes[0][:2] == (1, None) and not probes[0][2]
     assert len({probe[:2] for probe in probes}) == len(probes)
     assert (*chosen, True) in probes and probes[-1] == (*frontier, False)
