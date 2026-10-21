@@ -640,6 +640,9 @@ class _Mapped(grain.MapDataset[CachedValue]):
     def record(self, index: int) -> CachedValue:
         return self.input_parent[index]
 
+    def start(self) -> None:
+        pass
+
     def close(self) -> None:
         pass
 
@@ -648,12 +651,6 @@ class _Mapped(grain.MapDataset[CachedValue]):
 
     def metrics(self) -> CacheStats:
         return _READING
-
-    def iterated(
-        self, view: grain.MapDataset[CachedValue], read_options: grain.ReadOptions | None = None
-    ) -> grain.IterDataset[CachedValue]:
-        """An indexed view read without a cache writer."""
-        return view.to_iter_dataset(read_options)
 
 
 class _CachedMap(_Mapped):
@@ -696,56 +693,12 @@ class _CachedMap(_Mapped):
     def metrics(self) -> CacheStats:
         return self.writer.metrics()
 
-    def to_iter_dataset(
-        self, read_options: grain.ReadOptions | None = None, *, allow_nones: bool = False
-    ) -> grain.IterDataset[CachedValue]:
-        return _ClosingCache(super().to_iter_dataset(read_options, allow_nones=allow_nones), self)
-
-    def iterated(
-        self, view: grain.MapDataset[CachedValue], read_options: grain.ReadOptions | None = None
-    ) -> grain.IterDataset[CachedValue]:
-        """A view of this map, such as one share of it, read as an iterator that
-        finishes the fill when it runs out and closes the cache with it."""
-        return _ClosingCache(view.to_iter_dataset(read_options), self)
-
     def __getstate__(self) -> dict:
         return {key: value for key, value in self.__dict__.items() if key not in ("_writer", "writer_lock")}
 
     def __setstate__(self, state: Mapping[str, object]) -> None:
         self.__dict__.update(state)
         self.writer_lock = threading.RLock()
-
-
-class _ClosingCache(grain.IterDataset[CachedValue]):
-    def __init__(self, parent: grain.IterDataset[CachedValue], owner: _CachedMap):
-        super().__init__(parent)
-        self.input_parent, self.owner = parent, owner
-
-    def __iter__(self) -> grain.DatasetIterator[CachedValue]:
-        return _ClosingCacheIterator(self.input_parent.__iter__(), self.owner)
-
-
-class _ClosingCacheIterator(grain.DatasetIterator[CachedValue]):
-    def __init__(self, parent: grain.DatasetIterator[CachedValue], owner: _CachedMap):
-        super().__init__(parent)
-        self.input_parent, self.owner = parent, owner
-
-    def __next__(self) -> CachedValue:
-        try:
-            return next(self.input_parent)
-        except StopIteration:
-            self.owner.finish()
-            raise
-
-    def get_state(self) -> Mapping[str, object]:
-        return self.input_parent.get_state()
-
-    def set_state(self, state: Mapping[str, object]) -> None:
-        self.input_parent.set_state(state)
-
-    def close(self) -> None:
-        self.input_parent.close()
-        self.owner.close()
 
 
 @dataclass(frozen=True)
