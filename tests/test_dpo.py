@@ -220,7 +220,7 @@ def records(*rows):
 def preference_rows(rows, pad_id, width):
     pairs = Memory([json.loads(row) for row in rows]).pipe(presets.preferences, seq_len=width, batch=None,
                                                            pad_id=pad_id)
-    return list(iterate(pairs._chain(), read="memory", loading=Loading(workers=0)))
+    return list(iterate(pairs, read="memory", loading=Loading(workers=0)))
 
 
 PAIR = {"chosen": [1, 2, 3, 4], "rejected": [1, 2, 5],

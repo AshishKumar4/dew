@@ -26,7 +26,7 @@ from dew.nn.autoencoders import AutoEncoder
 from dew.nn.protocols import IntervalModel, TimeScaled
 from dew.nn.text_encoders import DEFAULT_MODEL
 from dew.objectives.base import Variables, merge
-from dew.records import number
+from dew.records import number, record
 from dew.registry import (
     Configured,
     DtypeName,
@@ -276,7 +276,8 @@ class DiffusionRunConfig(RunConfig):
             raise ValueError(
                 "the models take one context under textcontext, and this run names both "
                 "text and audio; set text to None to condition on audio")
-        if self.audio is not None and self.data is not None and "audio" not in self.chain().facts()["fields"]:
+        if self.audio is not None and self.data is not None and "audio" not in record(
+                self.chain().facts()["fields"], "the chain's fields"):
             raise ValueError("audio conditioning reads its clips' audio, and this chain's clips carry none "
                              "(dew.data.presets.clips(sample_rate=))")
 

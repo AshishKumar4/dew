@@ -967,7 +967,8 @@ def _chain_label(chain: Dataset | None) -> str:
     """A run name's word for its data: the last preset its recorded chain calls (`lm`, `images`), or
     `data` where it calls none or was not recorded."""
     encoded = None if chain is None else records.encode(chain)
-    stages = encoded.get("stages", []) if isinstance(encoded, Mapping) else []
+    stages = encoded.get("stages") if isinstance(encoded, Mapping) else None
+    stages = stages if isinstance(stages, list) else []
     calls = [stage["pipe"] for stage in stages if isinstance(stage, Mapping) and "pipe" in stage]
     return str(calls[-1]).rpartition(":")[2].rpartition(".")[2] if calls else "data"
 
@@ -1008,7 +1009,7 @@ def _read_chain(name: str, written: object) -> Dataset | dict[str, Dataset] | No
             if (chain := _read_chain(f"{name}.{split}", value)) is not None and isinstance(chain, Dataset)}
 
 
-def _overridden(config: "RunConfig", path: str, value: JSON) -> "RunConfig":
+def _overridden[C: "RunConfig"](config: C, path: str, value: JSON) -> C:
     """`config` with one setting of a recorded chain set (`dew.data.records.override`): `path` is
     `data.<call>.<setting>`, or `validation[.<split>].<call>.<setting>`."""
     name, _, rest = path.partition(".")
