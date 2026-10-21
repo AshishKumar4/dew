@@ -22,3 +22,16 @@ export async function health(container: Container, port: number): Promise<Respon
 	try { return await container.getTcpPort(port).fetch('http://container/health', { signal: AbortSignal.timeout(5000) }); }
 	catch { return null; }
 }
+
+/**
+ * Waits until `ready` answers true for `container`, restored from its snapshot, asking every 500 ms: false
+ * once the container stops or `limitMs` passes first.
+ */
+export async function becameReady(container: Container, ready: () => Promise<boolean>, limitMs: number): Promise<boolean> {
+	const deadline = Date.now() + limitMs;
+	while (!(await ready())) {
+		if (Date.now() > deadline || !container.running) return false;
+		await scheduler.wait(500);
+	}
+	return true;
+}
