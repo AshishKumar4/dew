@@ -130,7 +130,8 @@ ENTRIES = (
         lambda fields: True,
         "llama",
         "LlamaForCausalLM",
-        lambda model: {},
+        # LlamaMLP's projections carry biases where mlp_bias says so.
+        lambda model: {"mlp_bias": True} if model.mlp_bias else {},
         preserve_source_layout=False,
     ),
 )

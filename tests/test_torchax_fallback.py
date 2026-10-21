@@ -44,8 +44,6 @@ from tools.diffusers_wan_reference import float64
 # CI runs this file in tasks of its own: torchax renames torch's privateuse1 backend process-wide.
 pytestmark = pytest.mark.torchax
 
-pytest.importorskip("torchax")
-
 SEQ = 16
 ROWS = 8
 TINY = {"num_hidden_layers": 2, "hidden_size": 64, "num_attention_heads": 4,
@@ -150,11 +148,13 @@ def test_trainer_steps_move_the_params_and_place_them_by_name(loaded, tokens):
     assert moved["gpt_neox.embed_in.weight"].sharding.spec == P(("fsdp", "tensor"))
 
 
-def test_a_frozen_torch_base_kept_whole_drops_fsdp_from_the_name_tables_placement(loaded, tokens):
+def test_a_frozen_torch_base_kept_whole_drops_fsdp_from_the_name_tables_placement(source, loaded, tokens):
     """`Layout.frozen_whole` reaches a torch-named tree: TorchLayout's name table picks each
     tensor's axes, and the one placement keeps the frozen tensors whole over fsdp, split over the
     tensor axis as the table splits them, while the trained ones, their moments and one step's
-    update lie as the split layout lays them."""
+    update lie as the split layout lays them. The step it takes is the split layout's: every
+    trained parameter as exact as the split step's, both from the same AdamW step taken in
+    float64 over transformers' float64 gradients (tests/reference_error.py)."""
     from dew.nn.sharding import mesh_axes
     from dew.objectives.base import FROZEN, freeze
     from dew.training.distributed import shard_batch
@@ -190,8 +190,22 @@ def test_a_frozen_torch_base_kept_whole_drops_fsdp_from_the_name_tables_placemen
             lambda placement: placement.opt_state)
         assert [sharding.spec for sharding in jax.tree.leaves(tree(whole))] == [
             sharding.spec for sharding in jax.tree.leaves(tree(split))]
-    for got, want in zip(jax.tree.leaves(whole_trained), jax.tree.leaves(split_trained), strict=True):
-        np.testing.assert_allclose(got, want, rtol=1e-5, atol=1e-6)
+    # The truth: optax.adamw(1e-2)'s first step, its defaults (b1 0.9, b2 0.999, eps 1e-8, weight
+    # decay 1e-4), in float64 over transformers' float64 gradients; the rows the batch repeats leave
+    # the mean loss, and so the gradient, the one of `tokens`.
+    with float64():
+        wide = transformers.AutoModelForCausalLM.from_config(source[1].config, dtype=torch.float64,
+                                                             attn_implementation="eager").eval()
+        wide.load_state_dict(source[1].state_dict())
+        gradients = torch_step(wide, tokens, torch.float64)
+    start = jax.device_get(loaded.variables["params"])
+    truth = {}
+    for name in split_trained:
+        first, gradient = np.asarray(start[name], np.float64), gradients[name]
+        truth[name] = first - 1e-2 * (gradient / (np.abs(gradient) + 1e-8) + 1e-4 * first)
+    for name, true in truth.items():
+        assert_as_exact_as_the_reference(np.asarray(whole_trained[name]), np.asarray(split_trained[name]),
+                                         true, name)
 
 
 GEMMA2 = {**TINY, "intermediate_size": 128, "num_key_value_heads": 2, "head_dim": 16, "sliding_window": 32,
