@@ -985,3 +985,17 @@ def test_flash_reads_a_cache_calls_documents_as_exactly_as_jax_nn_reads_its_mask
         assert_as_exact_as_the_reference(np.asarray(mine, np.float64), np.asarray(theirs, np.float64),
                                          np.asarray(true), f"window {window} {name}",
                                          terms=np.asarray(summed))
+
+
+@pytest.mark.parametrize("generation, kernel", [("sm80", "decode"), ("sm90", "cudnn")])
+def test_a_bf16_decode_step_prefers_the_kernel_its_generation_measured_fastest(generation, kernel):
+    """A bf16 decode step on an A100 prefers the decode kernel, 1.57x faster than cuDNN over Qwen3-0.6B's
+    decode shapes there (`generation.TARGETS`' sm80 row); on an H100, cuDNN, the default."""
+    from dew.nn.kernels.generation import assumed
+
+    query = jnp.zeros((2, 1, 16, 128), jnp.bfloat16)
+    key = jnp.zeros((2, 256, 8, 128), jnp.bfloat16)
+    case = attention_case(query, key, key_value_seq_lengths=jnp.asarray([3, 200], jnp.int32))
+    with assumed(generation):
+        assert DECODE.preferred(case) == kernel
+
