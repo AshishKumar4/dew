@@ -399,9 +399,10 @@ def split_delta(others: jax.Array, own: jax.Array, others_total: jax.Array, tota
 
 class DqSums(NamedTuple):
     """A dQ pass's sums over its keys against the unnormalized weights `exp(s - m)`: dQ `[bq, D]`, whose
-    operands alone are taken over a denominator before they narrow (`dq_prior`), so an fp16 one holds a
-    normalized weight's range; the score cotangents' and the weights' row sums, and the HEAD and QUERY
-    hook parameters' pullbacks of the cotangents (`grads`) and of the weights (`weighed`), fp32."""
+    operands alone are taken over a `prior` denominator (the forward's, or the first pass's) before
+    they narrow, so each holds a normalized weight's range; the score cotangents' and the weights' row
+    sums, and the HEAD and QUERY hook parameters' pullbacks of the cotangents (`grads`) and of the
+    weights (`weighed`), fp32."""
 
     dq: jax.Array
     residual: jax.Array
@@ -410,22 +411,13 @@ class DqSums(NamedTuple):
     weighed: tuple[jax.Array, ...]
 
 
-def dq_prior(prior: jax.Array, dtype) -> jax.Array:
-    """The denominator dQ's operands are taken over before they narrow to `dtype`: the `prior` one for
-    fp16, whose range an unnormalized cotangent can pass, and none (ones) for bf16 and fp32, whose range
-    is fp32's, so no small factor meets the scale before the product (a compiler free to reassociate
-    the two would let them underflow together)."""
-    return prior if jnp.dtype(dtype) == jnp.float16 else jnp.ones_like(prior)
-
-
 def dq_finish(sums: DqSums, prior: jax.Array, state_total: jax.Array, peak0: jax.Array,
               shares: tuple[jax.Array, jax.Array], peak: jax.Array, anchor: jax.Array, delta: jax.Array):
-    """A dQ pass's results from its sums: each taken to the pass's own denominator, the initial state's
-    `state_total` and its keys' weights (so the weights it differentiates sum to one over its own
-    logits, whichever pass gave D), dQ from the `prior` its operands were taken over (`dq_prior`), then
-    D refined once from its own sums (`refinement`) and the HEAD and QUERY gradients with it. Returns
-    dQ, the refined `D - c`, the denominator, the keys' share of the weights, and the hook
-    gradients."""
+    """A dQ pass's results from its sums: each taken from the `prior` denominator to the pass's own, the
+    initial state's `state_total` and its keys' weights (so the weights it differentiates sum to one over
+    its own logits, whichever pass gave D), then D refined once from its own sums (`refinement`) and the
+    HEAD and QUERY gradients with it. Returns dQ, the refined `D - c`, the denominator, the keys' share
+    of the weights, and the hook gradients."""
     total = state_total + sums.mass
     scale = inverse(total)
     mass, residual = sums.mass * scale, sums.residual * scale

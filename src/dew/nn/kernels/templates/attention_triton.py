@@ -544,7 +544,6 @@ def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tu
     index_out_ref[...] = key_index
     summed = tuple(kind in (Kind.HEAD, Kind.QUERY) for kind in score_kinds)
 
-    prior = algebra.dq_prior(prior, key_ref.dtype)
     over_prior = algebra.inverse(prior)
 
     def step(index, carry):
