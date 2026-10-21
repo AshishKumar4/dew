@@ -144,7 +144,7 @@ def test_masked_rollouts_take_no_rows_and_no_baseline():
     batch = pack(rollouts, 3)
     assert set(np.unique(batch[SESSION_INDEX_KEY])) == {0, 1}
     # One call a session: its advantage is the session's.
-    np.testing.assert_allclose(np.concatenate(advantages(rollouts, "mean")), [.5, -.5, 0, 0])
+    np.testing.assert_array_equal(np.concatenate(advantages(rollouts, "mean")), [.5, -.5, 0, 0])
     lonely = [rollouts[0], rollouts[2]]
     assert (np.concatenate(advantages(lonely)) == 0).all()
 
