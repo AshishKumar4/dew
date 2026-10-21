@@ -392,7 +392,7 @@ class DiffusionRunConfig(RunConfig):
         run = self.pinned()
         objective = run.build()
         # Compiled once: `train` reads the run's length and cadences off this loader and trains on it.
-        dataset, held = fitted(run.chain(), run.validation, objective=objective.data())
+        dataset, held = fitted(run.chain(), run.validation, objective=objective.data(), seed=run.data_seed)
         metrics = run.build_eval_metrics(bool(held))
         rollout = objective.rollout() if isinstance(objective, FlowGRPOObjective) else None
         return Prepared(run, lambda name: run.train(objective, dataset, name=name, metrics=metrics,

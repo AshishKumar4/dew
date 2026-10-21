@@ -142,7 +142,8 @@ class LMRunConfig(RunConfig):
                 model=model if source is None else source, seq_len=tokens.seq_len, variables=variables,
                 samples=samples, processor=self.processor(), qk_stats=self.optim.optimizer == "muonclip")
         # Compiled once: the run's length and its cadences are read off this loader, which `train` trains on.
-        loaded, held = fitted(self.chain(), self.validation, objective=objective.data())
+        loaded, held = fitted(self.chain(), self.validation, objective=objective.data(),
+                              seed=self.data_seed)
         if loaded.steps_per_epoch is None and self.trainer.steps is None:
             raise ValueError("this data has no epoch length, so a run cannot count epochs of it: online "
                              "packing or a filter over an indexed or streamed read cuts its order per share. "
