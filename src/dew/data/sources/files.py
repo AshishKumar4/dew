@@ -165,9 +165,9 @@ class Files(Dataset):
     limit, 128 KiB a field by default; a source with longer fields reads
     once its caller raises `csv.field_size_limit`.
 
-    `suffixes` keeps the files whose names end in one of them, any case, as
-    they are listed when the store is read: a directory's media, not the lists
-    and notes beside it (`dew.data.video.media`).
+    `suffixes` keeps the files whose names end in one of them, any case, with
+    or without the dot, as the store lists them when it is read: a directory's
+    media, not the lists and notes beside it (`dew.data.video.media`).
     """
 
     url: str | tuple[str, ...]
@@ -230,6 +230,22 @@ class Files(Dataset):
 
     @cached_property
     def paths(self) -> tuple[str, ...]:
+        kept = self._kept(self._listed)
+        if not kept:
+            raise FileNotFoundError(f"source {self.url!r} matched no {self.kind} files")
+        return kept
+
+    def _kept(self, paths: Sequence[str]) -> tuple[str, ...]:
+        """`paths` whose names end in one of `suffixes`, all of them where it names none."""
+        if self.suffixes is None:
+            return tuple(paths)
+        wanted = {"." + suffix.lower().removeprefix(".") for suffix in self.suffixes}
+        return tuple(path for path in paths if PurePosixPath(path).suffix.lower() in wanted)
+
+    @cached_property
+    def _listed(self) -> tuple[str, ...]:
+        """The files the store names, the published facts' or a committed manifest's, else those its
+        URL lists, none where it lists none."""
         if self.file_info is not None:
             urls = (self.url,) if isinstance(self.url, str) else self.url
             missing = [url for url in urls if url not in self.file_info]
@@ -261,10 +277,7 @@ class Files(Dataset):
                     names = [name for name in names if name.lower().endswith(_SUFFIXES[self.kind])]
             else:
                 names = [path]
-            found.extend(fs.unstrip_protocol(name) for name in names if fs.isfile(name)
-                         and (self.suffixes is None or PurePosixPath(name).suffix.lower() in self.suffixes))
-        if not found:
-            raise FileNotFoundError(f"source {self.url!r} matched no {self.kind} files")
+            found.extend(fs.unstrip_protocol(name) for name in names if fs.isfile(name))
         return tuple(found)
 
     def label(self) -> str:
@@ -651,10 +664,10 @@ class Files(Dataset):
 
     def stated(self) -> Mapping[str, object]:
         """What its committed manifest says, or a parquet or Arrow store's schema names (class
-        names), no record read."""
+        names), no record read; files not here state nothing."""
         if self.committed is not None:
             return self._metadata
-        if self.kind in ("parquet", "arrow"):
+        if self.kind in ("parquet", "arrow") and self._kept(self._listed):
             return {"class_names": self._metadata.get("class_names", {})}
         return {}
 
