@@ -443,7 +443,7 @@ def input_digest(inputs) -> np.uint64:
     """A seed's inputs (a dict of NumPy arrays, a torch draw's converted) as 64 bits of the SHA-256 of
     each array's name, dtype by name, shape and bytes in C order: what a recording of outputs alone
     keeps, so that inputs drawn again are checked to be the recorded ones. The dtype goes by its name, as
-    the narrow formats' byte codes do not tell them apart (every float8 is `|V1`), and the shape as the
+    some narrow formats share a byte code (float8_e4m3fn's and float8_e4m3fnuz's), and the shape as the
     array's own, a scalar's included."""
     digest = hashlib.sha256()
     for name in sorted(inputs):
