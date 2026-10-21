@@ -63,6 +63,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import tokamax
+from jax.extend import core as jax_core
 from jax.extend.backend import get_default_device
 
 from dew import cache, coordination, records
@@ -473,13 +474,29 @@ def program(function: Callable, *arguments: jax.ShapeDtypeStruct) -> str:
     the compiled launch reads, so it keys by its shape and dtype alone."""
     closed = jax.make_jaxpr(function)(*arguments)
     digest = hashlib.sha256(str(closed).encode())
-    for constant in closed.consts:
-        if isinstance(constant, jax.core.Tracer):
-            digest.update(repr((constant.shape, str(constant.dtype))).encode())
-        else:
-            value = np.asarray(constant)
-            digest.update(repr((value.shape, str(value.dtype))).encode())
-            digest.update(np.ascontiguousarray(value).tobytes())
+
+    def constants(values) -> None:
+        for constant in values:
+            if isinstance(constant, jax.core.Tracer):
+                digest.update(repr((constant.shape, str(constant.dtype))).encode())
+            else:
+                value = np.asarray(constant)
+                digest.update(repr((value.shape, str(value.dtype))).encode())
+                digest.update(np.ascontiguousarray(value).tobytes())
+
+    def nested(jaxpr) -> None:
+        # A nested computation's own constants (a jitted helper's, a branch's), in program order.
+        for equation in jaxpr.eqns:
+            for parameter in equation.params.values():
+                for inner in parameter if isinstance(parameter, (tuple, list)) else (parameter,):
+                    if isinstance(inner, jax_core.ClosedJaxpr):
+                        constants(inner.consts)
+                        nested(inner.jaxpr)
+                    elif isinstance(inner, jax_core.Jaxpr):
+                        nested(inner)
+
+    constants(closed.consts)
+    nested(closed.jaxpr)
     return "traced:" + digest.hexdigest()[:16]
 
 

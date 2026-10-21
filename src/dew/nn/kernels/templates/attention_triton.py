@@ -54,19 +54,19 @@ def _dot(a: jax.Array, b: jax.Array, interpret: bool) -> jax.Array:
     return plgpu.dot(a, b, precision=jax.lax.Precision.HIGHEST).astype(jnp.float32)
 
 
-def _scaled_dot(a: jax.Array, b: jax.Array, interpret: bool) -> jax.Array:
-    """`a @ b` for fp32 `b` taken in `a`'s dtype, accumulated in fp32: where that dtype's exponents
-    reach less far than fp32's (fp16), `b` is scaled by a power of two that brings its largest entry to
-    [1, 2) before it narrows and unscaled after, both exact, so no entry the sum needs underflows."""
-    if jnp.finfo(a.dtype).minexp <= jnp.finfo(jnp.float32).minexp:
+def _wide_enough(dtype) -> bool:
+    """Whether `dtype` reaches as far down as fp32 (bf16 does, fp16 does not), so a value fp32 holds
+    narrows to it without underflowing."""
+    return jnp.finfo(dtype).minexp <= jnp.finfo(jnp.float32).minexp
+
+
+def _cotangent_dot(a: jax.Array, b: jax.Array, interpret: bool) -> jax.Array:
+    """`a @ b` for fp32 `b`, as the reference's derivative takes it: in `a`'s dtype where that dtype
+    holds every fp32 value's range, else (fp16) in fp32, so each query's small share of a key's
+    gradient counts whatever the others' sizes."""
+    if _wide_enough(a.dtype):
         return _dot(a, b.astype(a.dtype), interpret)
-    largest = jnp.max(jnp.abs(b))
-    bits = jax.lax.bitcast_convert_type(largest, jnp.int32) & 0x7F800000
-    # 2^-e and 2^e from the largest's biased exponent e, exactly; no scaling for a zero or subnormal one.
-    normal = (bits > 0) & (bits < 0x7F000000)
-    down = jax.lax.bitcast_convert_type(jnp.where(normal, 0x7F000000 - bits, 0x3F800000), jnp.float32)
-    up = jax.lax.bitcast_convert_type(jnp.where(normal, bits, 0x3F800000), jnp.float32)
-    return _dot(a, (b * down).astype(a.dtype), interpret) * up
+    return _dot(a.astype(jnp.float32), b, interpret)
 
 
 def _power(width: int) -> int:
@@ -712,8 +712,8 @@ def _dkv_kernel(ranges_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: t
         # dV as the reference's derivative takes it: the unnormalized weights in the operands' dtype
         # against the output's cotangent over each query's denominator, so a weight fp16 holds only
         # before it is normalized still counts.
-        dv = dv + _scaled_dot(exponentials.astype(dout.dtype).T,
-                              dout.astype(jnp.float32) * _inverse(total_ref[rows])[:, None], interpret)
+        dv = dv + _cotangent_dot(exponentials.astype(dout.dtype).T,
+                                 dout.astype(jnp.float32) * _inverse(total_ref[rows])[:, None], interpret)
         # Scaled before it narrows to the operands' dtype, so fp16 holds what fp32 does.
         dk = dk + _dot((logits * scale).astype(query.dtype).T, query, interpret)
         updated = [grad + piece if kind == Kind.KEY else grad
@@ -840,13 +840,23 @@ def _launch_cost(ba: tokamax.BoundArguments, config: BackwardTiles, target: gene
         written = 4 * batch * keys * heads * (width + value_width)
         written += 4 * sum(param.size for param, kind in zip(ba.arguments["score_params"], kinds, strict=True)
                            if kind == Kind.KEY)
-    return costs.seconds(costs.Cost(
+    wide = 0
+    if not dq and not _wide_enough(query.dtype):
+        # fp16's dV product runs in fp32 (`_cotangent_dot`), after the launch's 16-bit work.
+        products, wide = products - value_width, value_width
+    seconds = costs.seconds(costs.Cost(
         programs=programs,
         device_bytes=read + written,
         program_flops=tiles * 2.0 * config.block_q * config.block_k * products,
         program_staged=float(tiles * walked * size),
         program_exponentials=float(tiles * config.block_q * config.block_k * exponentials),
         mode=_mode(query.dtype)), target)
+    if wide:
+        seconds += costs.seconds(costs.Cost(
+            programs=programs, device_bytes=0,
+            program_flops=tiles * 2.0 * config.block_q * config.block_k * wide, program_staged=0.0,
+            program_exponentials=0.0, mode='fp32'), target)
+    return seconds
 
 
 def _dq_launch(query, key, value, dout, peak, total, initial_term, start, end, query_ids, key_ids,

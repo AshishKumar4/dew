@@ -7,7 +7,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from reference_error import assert_as_exact
-from test_attention_template import CASES, ROWS, SINKS, SOFTCAP, arguments, geometry
+from test_attention_template import CASES, ROWS, SINKS, SOFTCAP, arguments, geometry as core_geometry
 
 from dew.nn.attention import alibi_bias
 from dew.nn.kernels import tuning
@@ -20,6 +20,18 @@ SEEDS = 8
 ALL_HOOKS_SEEDS = 32
 """The draws of a site with every hook at once, which `seeds_for` sizes at 32: the reference compared with
 itself resolves PARITY only there."""
+
+IRREGULAR = {"full-irregular": {"shape": (257, 385)},
+             "causal-irregular": {"causal": True, "shape": (257, 385)}}
+"""Calls of more tiles than the core's cases, of no whole multiple of any tile: every 128-key tile
+config walks several key tiles, a query's maximum moving across them, and the full call holds whole
+tiles every query of a block sees."""
+
+
+def geometry(case: dict) -> tuple[int, int]:
+    """`case`'s query and key counts: its own `shape`, or the core's (`test_attention_template`)."""
+    return case["shape"] if "shape" in case else core_geometry(case)
+
 
 PINNED = (attention_triton.Tiles(32, 32, 4, 2), attention_triton.Tiles(64, 32, 4, 2),
           attention_triton.Tiles(32, 64, 8, 3), attention_triton.Tiles(128, 128, 8, 2))
@@ -128,10 +140,19 @@ def test_the_forward_is_on_par_at_head_widths_padded_to_powers_of_two(width, val
 
 
 @pytest.mark.gpu(reason="every config compiles for the GPU")
+@pytest.mark.parametrize("case", ["causal-documents-window", *IRREGULAR])
 @pytest.mark.parametrize("config", attention_triton.SPACE, ids=str)
-def test_every_config_on_a_gpu(config):
-    """Every config of the space, bf16, causal documents under a window, every hook."""
-    check(CASES["causal-documents-window"], HOOKS["all"], jnp.bfloat16, config, residuals=True)
+def test_every_config_on_a_gpu(config, case):
+    """Every config of the space, bf16, every hook: over causal documents under a window, and over the
+    irregular full and causal calls (`IRREGULAR`)."""
+    check({**CASES, **IRREGULAR}[case], HOOKS["all"], jnp.bfloat16, config, residuals=True)
+
+
+@pytest.mark.parametrize("case", IRREGULAR)
+def test_the_forward_walks_many_tiles_of_128_keys(case):
+    """The irregular calls (`IRREGULAR`) at 128-key tiles, every hook, fp32: the maximum moves across
+    key tiles and whole tiles take the unmasked path."""
+    check(IRREGULAR[case], HOOKS["all"], jnp.float32, PINNED[3], residuals=True)
 
 
 def test_a_query_that_sees_no_key_reads_zero_and_a_sink_keeps_its_share():
@@ -410,6 +431,21 @@ def test_many_fp16_cotangents_too_small_once_normalized_still_sum_into_dv():
     np.testing.assert_array_equal(np.asarray(ours, np.float32), np.asarray(theirs, np.float32))
 
 
+def test_a_small_fp16_cotangent_beside_a_large_one_still_reaches_its_key():
+    """fp16, two queries each seeing only its own key, cotangents 65504 and 2^-24: each key's gradient
+    is its own query's, exactly, as the reference's derivative gives, the small beside the large."""
+    spans = template.spans(2, 2, 1, chunk=1)
+    zeros = jnp.zeros((1, 2, 1, 1), jnp.float16)
+    dout = jnp.asarray([65504.0, 2.0 ** -24], jnp.float16).reshape(1, 2, 1, 1)
+    with tuning.pinned({attention_triton.TritonBackward: joint(PINNED[0])}):
+        ours = attention_triton.backward(zeros, zeros, zeros, spans, None, dout, scale=1.0,
+                                         interpret=not ON_GPU).value
+    _, pull = jax.vjp(lambda value: template.reference(zeros, zeros, value, spans, scale=1.0), zeros)
+    [theirs] = pull(dout)
+    np.testing.assert_array_equal(np.asarray(theirs, np.float32).ravel(), [65504.0, 2.0 ** -24])
+    np.testing.assert_array_equal(np.asarray(ours, np.float32), np.asarray(theirs, np.float32))
+
+
 def test_an_fp16_weight_too_small_once_normalized_still_reaches_dv():
     """fp16, one query over keys whose third weight is about 5.3e-8 before its denominator of 2 and
     2.7e-8 after it, which fp16's least subnormal (6e-8) holds only before: dV's third row takes it, as
@@ -440,12 +476,20 @@ def test_the_backward_is_on_par_at_head_widths_padded_to_powers_of_two(width, va
     check_backward(CASES["causal-window"], (), jnp.bfloat16, PINNED[0], width=width, value_width=value_width)
 
 
+@pytest.mark.parametrize("case", IRREGULAR)
+def test_the_backward_walks_many_tiles_of_128_keys(case):
+    """The irregular calls (`IRREGULAR`) at 128-key tiles, a softcap, sinks and ALiBi, fp32: the first
+    pass's maximum and anchor move across key tiles."""
+    check_backward(IRREGULAR[case], SCORE_HOOKS["softcap-sinks-alibi"], jnp.float32, PINNED[3])
+
+
 @pytest.mark.gpu(reason="every config compiles for the GPU")
+@pytest.mark.parametrize("case", ["causal-documents-window", *IRREGULAR])
 @pytest.mark.parametrize("config", attention_triton.BACKWARD_SPACE, ids=str)
-def test_every_backward_config_on_a_gpu(config):
-    """Every config of the backward's space, bf16, causal documents under a window, a softcap, sinks and
-    ALiBi."""
+def test_every_backward_config_on_a_gpu(config, case):
+    """Every config of the backward's space, bf16, a softcap, sinks and ALiBi: over causal documents
+    under a window, and over the irregular full and causal calls (`IRREGULAR`)."""
     tiles = attention_triton.Tiles
-    check_backward(CASES["causal-documents-window"], SCORE_HOOKS["softcap-sinks-alibi"], jnp.bfloat16,
+    check_backward({**CASES, **IRREGULAR}[case], SCORE_HOOKS["softcap-sinks-alibi"], jnp.bfloat16,
                    tiles(config.block_q, config.block_k, config.dq_warps, config.dq_stages),
                    tiles(config.block_q, config.block_k, config.dkv_warps, config.dkv_stages))
