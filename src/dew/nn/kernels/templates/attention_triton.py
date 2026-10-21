@@ -13,6 +13,7 @@ and the call's queries and keys pad to whole blocks, which their spans leave unr
 import dataclasses
 import functools
 from collections.abc import Callable, Sequence
+from typing import ClassVar
 
 import jax
 import jax.numpy as jnp
@@ -295,9 +296,12 @@ def _param_spec(kind: Kind, param: jax.Array, block_q: int, keys: int) -> pl.Blo
 
 
 def _padded(param: Param, queries: int, keys: int, value_width: int) -> jax.Array:
-    """A hook parameter at the padded call's shape: zeros past its queries, keys and value width, and a
-    head vector at a power of two."""
+    """A hook parameter at the padded call's shape, in fp32 as the kernels compute (its gradient returns
+    in its own dtype): zeros past its queries, keys and value width, and a head vector at a power of
+    two."""
     value = param.value
+    if jnp.issubdtype(value.dtype, jnp.floating):
+        value = value.astype(jnp.float32)
     match param.kind:
         case Kind.HEAD:
             return jnp.pad(value, (0, _power(value.shape[0]) - value.shape[0]))
@@ -402,22 +406,25 @@ def _probabilities(logits: jax.Array, peak: jax.Array, total: jax.Array) -> jax.
 
 
 def _scored(score_mod, logits, q_pos, k_pos, params, *, slopes: bool):
-    """`score_mod` on the scaled logits and, with `slopes`, each entry's derivative of it along the
-    logits and along each parameter, a tile apiece: `score_mod` being pointwise in the entries, they are
-    the whole of its pullback (`_pulled`), each parameter in the layout its hook takes. Without a hook,
-    the logits and no slopes."""
+    """`score_mod` on the scaled logits, in fp32, and with `slopes` each entry's derivative of it along
+    the logits and along each parameter, a tile apiece: `score_mod` being pointwise in the entries, they
+    are the whole of its pullback (`_pulled`). Each entry's are taken by reverse mode on that entry alone
+    (`jax.grad` mapped over the tile), so a hook through a `jax.custom_vjp` differentiates as the
+    reference's does. Without a hook, the logits and no slopes."""
     if score_mod is None:
         return logits, None
+    out = score_mod(logits, q_pos, k_pos, *params).astype(jnp.float32)
     if not slopes:
-        return score_mod(logits, q_pos, k_pos, *params), None
-    inputs = (logits, *params)
-    out, linear = jax.linearize(lambda s, *values: score_mod(s, q_pos, k_pos, *values), *inputs)
+        return out, None
+    shape = logits.shape
+    entries = [jnp.broadcast_to(x, shape) for x in (logits, q_pos, k_pos, *params)]
 
-    def along(index):
-        return linear(*(jnp.ones_like(x) if place == index else jnp.zeros_like(x)
-                        for place, x in enumerate(inputs))).astype(jnp.float32)
+    def entry(s, query, key, *values):
+        return score_mod(s, query, key, *values)
 
-    return out, tuple(jnp.broadcast_to(along(index), logits.shape) for index in range(len(inputs)))
+    derivative = jax.grad(entry, argnums=(0, *range(3, len(entries))))
+    grads = jax.vmap(jax.vmap(derivative))(*entries)
+    return out, tuple(grad.astype(jnp.float32) for grad in grads)
 
 
 def _pulled(cotangents, slopes, seen, kinds: tuple[Kind, ...]):
@@ -672,12 +679,15 @@ class _Backward(Template[Tiles]):
         size = jnp.dtype(query.dtype).itemsize
         programs, tiles = self._programs(batch, heads, queries, keys, config)
         products, exponentials = self._work(width, value_width)
-        statistics = sum(array.size for name, array in ba.arguments.items()
-                         if name in ("peak", "total", "initial_term", "anchor", "delta")) * 4
+        # Every array the launch reads, at its own dtype: the operands, the output's cotangent, the row
+        # statistics, the spans and the hook's parameters; and what it writes, its gradients and theirs.
+        read = sum(leaf.size * jnp.dtype(leaf.dtype).itemsize for leaf in jax.tree.leaves(dict(ba.arguments))
+                   if hasattr(leaf, "dtype"))
+        parameters = sum(param.size for param, kind in zip(ba.arguments["score_params"], self.score_kinds,
+                                                           strict=True) if kind in self._grads) * 4
         return costs.seconds(costs.Cost(
             programs=programs,
-            device_bytes=(2 * query.size + key.size + value.size) * size + statistics
-            + self._written(batch, queries, keys, heads, width, value_width),
+            device_bytes=read + parameters + self._written(batch, queries, keys, heads, width, value_width),
             program_flops=tiles * 2.0 * config.block_q * config.block_k * products,
             program_staged=float(tiles * self._walked(config, width, value_width) * size),
             program_exponentials=float(tiles * config.block_q * config.block_k * exponentials),
@@ -700,6 +710,9 @@ class _Backward(Template[Tiles]):
         """The operand entries a program stages a tile."""
         raise NotImplementedError
 
+    _grads: ClassVar[tuple[Kind, ...]] = ()
+    """The parameter kinds whose gradients the launch writes."""
+
     def _written(self, batch: int, queries: int, keys: int, heads: int, width: int, value_width: int) -> int:
         """The bytes the launch writes, fp32."""
         raise NotImplementedError
@@ -716,6 +729,7 @@ class TritonDq(_Backward):
     the dK/dV launch reads, and the gradients of the score hook's head (`[nQb, B, H, 1]` partials),
     query (`[B, H, Qp]`) and tile (`[B, H, Qp, Kp]`) parameters."""
 
+    _grads = DQ_GRADS
     name = "triton"
     config_cls = Tiles
 
@@ -799,6 +813,7 @@ class TritonDkv(_Backward):
     (`block_q` by `block_k`), only its warps and stages its own: a product rounds by its shape, so the
     logits it weighs each entry by are the very ones the dQ launch normalized."""
 
+    _grads = (Kind.KEY,)
     name = "triton"
     config_cls = Tiles
     block_q: int = 0
