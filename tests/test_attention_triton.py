@@ -23,9 +23,12 @@ itself resolves PARITY only there."""
 
 IRREGULAR = {"full-irregular": {"shape": (257, 385)},
              "causal-irregular": {"causal": True, "shape": (257, 385)}}
-"""Calls of more tiles than the core's cases, of no whole multiple of any tile: every 128-key tile
-config walks several key tiles, a query's maximum moving across them, and the full call holds whole
-tiles every query of a block sees."""
+"""Calls of more tiles than the core's cases, of no whole multiple of any tile: every config walks
+several key tiles, a query's maximum moving across them, and the full call holds whole tiles every
+query of a block sees. The CPU walks them at 32-key tiles (13 of them); the GPU sweeps walk them at every
+config, 128-key tiles among them, with the real dot. (Interpreted, XLA:CPU's fp32 product over a
+128-by-128 tile rounds the same entries 1.554 times as far from float64 as the reference's whole
+257-by-385 product does, over 10 draws; recorded 2026-10-21, ledger 882.)"""
 
 
 def geometry(case: dict) -> tuple[int, int]:
@@ -149,10 +152,10 @@ def test_every_config_on_a_gpu(config, case):
 
 
 @pytest.mark.parametrize("case", IRREGULAR)
-def test_the_forward_walks_many_tiles_of_128_keys(case):
-    """The irregular calls (`IRREGULAR`) at 128-key tiles, every hook, fp32: the maximum moves across
+def test_the_forward_walks_many_key_tiles(case):
+    """The irregular calls (`IRREGULAR`) at 32-key tiles, every hook, fp32: the maximum moves across
     key tiles and whole tiles take the unmasked path."""
-    check(IRREGULAR[case], HOOKS["all"], jnp.float32, PINNED[3], residuals=True)
+    check(IRREGULAR[case], HOOKS["all"], jnp.float32, PINNED[0], residuals=True)
 
 
 def test_a_query_that_sees_no_key_reads_zero_and_a_sink_keeps_its_share():
@@ -508,10 +511,10 @@ def test_the_backward_is_on_par_at_head_widths_padded_to_powers_of_two(width, va
 
 
 @pytest.mark.parametrize("case", IRREGULAR)
-def test_the_backward_walks_many_tiles_of_128_keys(case):
-    """The irregular calls (`IRREGULAR`) at 128-key tiles, a softcap, sinks and ALiBi, fp32: the first
+def test_the_backward_walks_many_key_tiles(case):
+    """The irregular calls (`IRREGULAR`) at 32-key tiles, a softcap, sinks and ALiBi, fp32: the first
     pass's maximum and anchor move across key tiles."""
-    check_backward(IRREGULAR[case], SCORE_HOOKS["softcap-sinks-alibi"], jnp.float32, PINNED[3])
+    check_backward(IRREGULAR[case], SCORE_HOOKS["softcap-sinks-alibi"], jnp.float32, PINNED[0])
 
 
 @pytest.mark.gpu(reason="every config compiles for the GPU")
