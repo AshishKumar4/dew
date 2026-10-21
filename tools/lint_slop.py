@@ -1821,10 +1821,11 @@ def _inventory_at(checkout: Path, commit: str) -> dict | None:
 
 def _loosened(checkout: Path, commit: str, parent: str, mine: dict, theirs: dict,
               authorized: dict[str, int] | None = None,
-              grants: dict[str, int] | None = None) -> Iterator[tuple[str, str]]:
-    """How `commit`'s inventory `mine` is looser than `parent`'s `theirs`, each by what it loosens (a
-    file's name, or "empty_by") and how: a file added, a count raised, a date moved later, its empty_by
-    later; a file renamed between them carries its entry. Where the
+              grants: dict[str, int] | None = None) -> Iterator[tuple[tuple[str, str], str | None]]:
+    """How `commit`'s inventory `mine` is looser than `parent`'s `theirs`, each by what it loosens, a
+    (file, "count") for a file added or its count raised, a (file, "date") for its date moved later,
+    ("empty_by", "date") for the inventory's, and how; and a (file, "held") with no finding for each file
+    `theirs` holds an entry for. A file renamed between them carries its entry. Where the
     commit changes SLOP020's reading (`RULE`), a file it leaves unchanged may be added or raised: what
     the rule now reads there was in the file all along, and `grants` takes the count it reached. A file
     may also sit at a count `authorized` holds for it, one a commit between `parent` and `commit`
@@ -1838,7 +1839,7 @@ def _loosened(checkout: Path, commit: str, parent: str, mine: dict, theirs: dict
             renamed[paths[1]] = paths[0]
     reread = RULE in changed
     if mine["empty_by"] > theirs["empty_by"]:
-        yield "empty_by", "moves empty_by later"
+        yield ("empty_by", "date"), "moves empty_by later"
     for name, entry in mine["files"].items():
         kept = theirs["files"].get(name) or theirs["files"].get(renamed.get(name, ""))
         held = (authorized or {}).get(name, (authorized or {}).get(renamed.get(name, ""), -1))
@@ -1847,9 +1848,35 @@ def _loosened(checkout: Path, commit: str, parent: str, mine: dict, theirs: dict
             grants[name] = max(grants.get(name, 0), entry["comparisons"])
         if kept is None:
             if not grown:
-                yield name, f"adds {name}"
-        elif entry["by"] > kept["by"] or (entry["comparisons"] > kept["comparisons"] and not grown):
-            yield name, f"raises {name}'s count or moves its date"
+                yield (name, "count"), f"adds {name}"
+            continue
+        yield (name, "held"), None
+        if entry["by"] > kept["by"]:
+            yield (name, "date"), f"moves {name}'s date later"
+        if entry["comparisons"] > kept["comparisons"] and not grown:
+            yield (name, "count"), f"raises {name}'s count"
+
+
+def _duplicated(checkout: Path, parents: list[str], mine: dict) -> Iterator[str]:
+    """A merge keeping one entry its parents' common ancestor held under two names, its parents having
+    renamed it apart: each name's count is that one entry's allowance, so together they hold it twice."""
+    ancestor = _git(checkout, "merge-base", "--octopus", *parents).strip()
+    held = _inventory_at(checkout, ancestor) if ancestor else None
+    if not held:
+        return
+    origins: dict[str, list[str]] = {}
+    for parent in parents:
+        changes = _git(checkout, "diff", "--name-status", "-M", ancestor, parent, "--", "tests", "tools")
+        for change in changes.splitlines():
+            status, *paths = change.split("\t")
+            if status.startswith("R") and len(paths) == 2 and paths[1] in mine["files"]:
+                origins.setdefault(paths[0], [])
+                if paths[1] not in origins[paths[0]]:
+                    origins[paths[0]].append(paths[1])
+    for origin, names in sorted(origins.items()):
+        kept = names + ([origin] if origin in mine["files"] else [])
+        if origin in held["files"] and len(kept) > 1:
+            yield f"keeps {origin}'s entry as {' and '.join(kept)}, its parents having renamed it apart"
 
 
 def ratchet(checkout: Path, base: str | None = None) -> Iterator[Finding]:
@@ -1857,9 +1884,12 @@ def ratchet(checkout: Path, base: str | None = None) -> Iterator[Finding]:
     CI), and every commit in HEAD's history whose inventory differs from a parent's, merges included
     (`--full-history`, no simplification), to that parent's (`_loosened`), from the commit that first
     made it on, which has no parent's to keep, and no commit removes it once made. A merge is held to
-    its loosest parent, file by file: it loosens a file only past every parent's, each parent's own
-    change judged at its own commit, so a merge that brings a count another branch raised is no
-    loosening of its own. `--ratchet` runs it (CI's lint job, on its whole history); a shallow
+    its loosest parent, file by file: it raises or adds a file only past every parent's count, each
+    parent's own change judged at its own commit, so a merge that brings a count another branch raised
+    is no loosening of its own; it moves a date later past every parent that holds the entry; and it
+    keeps one entry its parents' common ancestor held only once, however its parents renamed it. Only a
+    reading of the rule HEAD's own history changed since `base` authorizes a count against it.
+    `--ratchet` runs it (CI's lint job, on its whole history); a shallow
     checkout, or one without git, cannot hold the inventory, and it says so rather than passing."""
     try:
         shallow = _git(checkout, "rev-parse", "--is-shallow-repository").strip() == "true"
@@ -1869,6 +1899,8 @@ def ratchet(checkout: Path, base: str | None = None) -> Iterator[Finding]:
         before = [f"^{parent}" for parent in (made[0].split() if made else [])]
         listed = _git(checkout, "rev-list", "--full-history", "--parents", "HEAD", *before, "--", INVENTORY)
         merged = _git(checkout, "merge-base", "HEAD", base).strip() if base else None
+        # The commits HEAD's history adds to the base's: only their rereadings of the rule authorize.
+        fresh = set(_git(checkout, "rev-list", "HEAD", f"^{merged}").split()) if merged else None
     except (subprocess.CalledProcessError, FileNotFoundError) as error:
         yield Finding(INVENTORY, 1, 1, "SLOP020", "holds the inventory to its history, which git cannot "
                       f"read here ({error}); run with the repository's history")
@@ -1885,8 +1917,8 @@ def ratchet(checkout: Path, base: str | None = None) -> Iterator[Finding]:
     for line in filter(None, listed.splitlines()):
         commit, *parents = line.split()
         mine = _inventory_at(checkout, commit)
-        # Per parent with an inventory, what the commit loosens against it; a merge loosens only what it
-        # loosens against them all.
+        # Per parent with an inventory, what the commit loosens against it; a merge loosens a count only
+        # past them all, a date past every parent holding the entry.
         loosened = []
         for parent in parents:
             theirs = _inventory_at(checkout, parent)
@@ -1897,20 +1929,38 @@ def ratchet(checkout: Path, base: str | None = None) -> Iterator[Finding]:
                                       f"its parent {parent[:9]} kept; an empty inventory stays, as "
                                       f"`files: {{}}`"))
                 continue
-            loosened.append((parent, dict(_loosened(checkout, commit, parent, mine, theirs, grants=grants))))
-        if loosened:
-            first = loosened[0][1]
-            against = ("its parent " if len(loosened) == 1 else "every parent, ") + ", ".join(
-                parent[:9] for parent, _ in loosened)
-            walked.extend(Finding(INVENTORY, 1, 1, "SLOP020", f"{commit[:9]} against {against} {first[key]}")
-                          for key in sorted(set(first).intersection(*(found for _, found in loosened[1:]))))
+            granting = grants if fresh is None or commit in fresh else None
+            found = _loosened(checkout, commit, parent, mine, theirs, grants=granting)
+            loosened.append((parent, dict(found)))
+        if not loosened:
+            continue
+        against = ("its parent " if len(loosened) == 1 else "every parent, ") + ", ".join(
+            parent[:9] for parent, _ in loosened)
+        keys = {key for _, found in loosened for key in found}
+        for key in sorted(keys):
+            if key[1] == "count":
+                hit = all(key in found for _, found in loosened)
+            elif key[1] == "date":
+                holding = [found for _, found in loosened
+                           if (key[0], "held") in found or key[0] == "empty_by"]
+                hit = bool(holding) and all(key in found for found in holding)
+            else:
+                continue
+            if hit:
+                why = next(found[key] for _, found in loosened if key in found)
+                walked.append(Finding(INVENTORY, 1, 1, "SLOP020", f"{commit[:9]} against {against} {why}"))
+        if len(loosened) > 1 and mine is not None:
+            walked += [Finding(INVENTORY, 1, 1, "SLOP020", f"{commit[:9]} {why}")
+                       for why in _duplicated(checkout, [parent for parent, _ in loosened], mine)]
     if merged is not None:
         kept = _inventory_at(checkout, merged)
         if kept is not None and head is None:
             yield Finding(INVENTORY, 1, 1, "SLOP020",
                           f"HEAD removes the inventory {base}'s {merged[:9]} keeps")
         elif kept is not None:
-            for _, why in _loosened(checkout, head_id, merged, head, kept, authorized=grants):
+            for (_, kind), why in _loosened(checkout, head_id, merged, head, kept, authorized=grants):
+                if kind == "held":
+                    continue
                 yield Finding(INVENTORY, 1, 1, "SLOP020", f"HEAD against {base}'s {merged[:9]} {why}")
     yield from walked
 

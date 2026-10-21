@@ -348,7 +348,7 @@ def test_a_change_of_the_rules_reading_grows_the_inventory_only_for_files_it_lea
     assert not any("tests/test_b.py" in message for message in messages)
     _commit(repo, _inventory({"tests/test_a.py": 3, "tests/test_b.py": 1, "tests/test_c.py": 1},
                              by="2026-11-21"), "a later date", {lint.RULE: "reading = 4\n"})
-    assert any("moves its date" in finding.message for finding in lint.ratchet(repo, "main"))
+    assert any("date later" in finding.message for finding in lint.ratchet(repo, "main"))
 
 
 def test_a_merge_bringing_a_count_its_other_parent_raised_by_rereading_is_no_loosening(lint, tmp_path):
@@ -370,6 +370,70 @@ def test_a_merge_bringing_a_count_its_other_parent_raised_by_rereading_is_no_loo
                    cwd=repo, check=True)
     _commit(repo, _inventory({"tests/test_a.py": 8}), "the lane merges main")
     assert list(lint.ratchet(repo, "main")) == []
+
+
+def _merged(repo, branch, into, inventory, message, files=None):
+    """`branch` merged into `into` without committing, then committed with `inventory` and `files`."""
+    subprocess.run(["git", "checkout", "-q", into], cwd=repo, check=True)
+    subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "merge", "-q", "--no-commit", branch],
+                   cwd=repo, check=False, capture_output=True)
+    _commit(repo, inventory, message, files)
+
+
+def test_a_merge_moves_no_date_past_its_parents_holding_the_entry_whatever_another_grants(lint, tmp_path):
+    """One parent inventories a file by rereading the rule, the other holds no entry for it; the merge
+    keeping that entry with a later date moves a date the first parent held, which the second's grant
+    to add the entry does not excuse."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
+    _commit(repo, _inventory({}), "made", {"tests/test_a.py": "a = 1\n", lint.RULE: "r = 1\n"})
+    subprocess.run(["git", "checkout", "-q", "-b", "lane"], cwd=repo, check=True)
+    _commit(repo, _inventory({}), "the lane works", {"tests/other.py": "o = 1\n"})
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=repo, check=True)
+    _commit(repo, _inventory({"tests/test_a.py": 1}), "the rule reads more", {lint.RULE: "r = 2\n"})
+    _merged(repo, "main", "lane", _inventory({"tests/test_a.py": 1}, by="2026-11-21"),
+            "the merge postpones")
+    assert any("test_a.py's date later" in finding.message for finding in lint.ratchet(repo))
+
+
+def test_a_merge_keeps_an_entry_its_parents_renamed_apart_only_once(lint, tmp_path):
+    """Two parents rename one inventoried file to two names; a merge keeping both holds its allowance
+    twice, though each name keeps its own parent's count."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
+    _commit(repo, _inventory({"tests/test_a.py": 1}), "made",
+            {"tests/test_a.py": "a = 1  # one comparison\n"})
+    subprocess.run(["git", "checkout", "-q", "-b", "lane"], cwd=repo, check=True)
+    subprocess.run(["git", "mv", "tests/test_a.py", "tests/test_b.py"], cwd=repo, check=True)
+    _commit(repo, _inventory({"tests/test_b.py": 1}), "the lane renames it")
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=repo, check=True)
+    subprocess.run(["git", "mv", "tests/test_a.py", "tests/test_c.py"], cwd=repo, check=True)
+    _commit(repo, _inventory({"tests/test_c.py": 1}), "main renames it")
+    _merged(repo, "main", "lane", _inventory({"tests/test_b.py": 1, "tests/test_c.py": 1}),
+            "the merge keeps both", {"tests/test_c.py": "a = 1  # one comparison\n"})
+    assert any("renamed it apart" in finding.message for finding in lint.ratchet(repo))
+
+
+def test_only_the_heads_own_rereadings_authorize_a_count_against_its_base(lint, tmp_path):
+    """A rule change before the base raised a file's count, which main later brought down; a stale lane
+    from before that merged back, keeping the old count, is held against main's lower one."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
+    _commit(repo, _inventory({"tests/test_a.py": 1}), "made",
+            {"tests/test_a.py": "a = 1\n", lint.RULE: "r = 1\n"})
+    _commit(repo, _inventory({"tests/test_a.py": 3}), "the rule reads more", {lint.RULE: "r = 2\n"})
+    subprocess.run(["git", "checkout", "-q", "-b", "lane"], cwd=repo, check=True)
+    _commit(repo, _inventory({"tests/test_a.py": 3}), "the lane works", {"tests/other.py": "o = 1\n"})
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=repo, check=True)
+    _commit(repo, _inventory({"tests/test_a.py": 1}), "main brings it down", {"tests/test_a.py": "a = 2\n"})
+    _merged(repo, "lane", "main", _inventory({"tests/test_a.py": 1}), "main merges the lane")
+    subprocess.run(["git", "checkout", "-q", "lane"], cwd=repo, check=True)
+    _merged(repo, "main", "lane", _inventory({"tests/test_a.py": 3}), "the lane keeps its 3",
+            {"tests/test_a.py": "a = 1\n"})
+    assert any("test_a.py's count" in finding.message for finding in lint.ratchet(repo, "main"))
 
 
 def test_the_ratchet_holds_a_branch_to_its_base_and_refuses_a_shallow_history(lint, tmp_path):
