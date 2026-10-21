@@ -138,11 +138,25 @@ class MixerContext:
         }
 
     def refuse(self, kind: str, asked: Mapping[str, object], why: str) -> None:
-        """Raise naming every entry of `asked` this layer sets (a truthy value:
-        a flag on, a field given), none of which mixer `kind` implements: `why`."""
+        """Raise `MixerRefused` naming every entry of `asked` this layer sets (a
+        truthy value: a flag on, a field given), none of which mixer `kind`
+        implements: `why`."""
         names = sorted(name for name, value in asked.items() if value)
         if names:
-            raise ValueError(f"the {kind} mixer has no {', '.join(names)}: {why}")
+            raise MixerRefused(kind, tuple(names), why)
+
+
+class MixerRefused(ValueError):
+    """A layer asking mixer `kind` for the context entries `names`, which it does not implement, and
+    `why` (`MixerContext.refuse`)."""
+
+    def __init__(self, kind: str, names: tuple[str, ...], why: str):
+        super().__init__(f"the {kind} mixer has no {', '.join(names)}: {why}")
+        self.kind, self.names, self.why = kind, names, why
+
+    def __reduce__(self):
+        # Rebuilt from its own fields, as a pickle or a process boundary carries it.
+        return type(self), (self.kind, self.names, self.why)
 
 
 class MixerBase:
