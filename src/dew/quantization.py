@@ -184,6 +184,14 @@ class Quantization:
                 "bwd_stochastic_rounding is 'uniform', 'low_bit_uniform' or "
                 f"unset, got {self.bwd_stochastic_rounding!r}")
 
+    def rule_for(self, scope: Sequence[str]) -> int | None:
+        """The index of the pattern that quantizes the module at `scope` (its path of names), the
+        first whose regex fully matches the `/`-joined path as Qwix matches it, or None for a module
+        no pattern selects."""
+        joined = "/".join(scope)
+        return next((index for index, pattern in enumerate(self.patterns) if re.fullmatch(pattern, joined)),
+                    None)
+
     def apply(self, model: nn.Module) -> nn.Module:
         """Return a copy of `model` whose trunk matmuls train in this spec's dtype.
 
@@ -708,7 +716,7 @@ def measured_fp8_sites(variables: Variables, sites: Sequence[str], tokens: int) 
 
     Each distinct `[in, out]` kernel shape among `sites` (scopes in the
     stored tree, `/`-joined) is timed both ways, forward and input
-    gradient, by `dew.nn.kernels.tuning.samples` on a GPU the process holds
+    gradient, by `dew.telemetry.benchmark.samples` on a GPU the process holds
     alone: bf16 operands as a bf16 Dense multiplies them, and the FP8
     products `frozen_fp8_dense` runs. On an H100 FP8 won from about 2048
     inputs and outputs and lost below: 0.70x at 1024 by 1024, 1.10x at 4096
@@ -727,7 +735,7 @@ def measured_fp8_sites(variables: Variables, sites: Sequence[str], tokens: int) 
     leaving them at the measurement's agreement.
     """
     from dew import cache, coordination
-    from dew.nn.kernels.generation import device_generation, gpu_target
+    from dew.nn.kernels.generation import device_generation, fp8_tensor_cores
 
     def planned() -> dict:
         return {"tokens": tokens,
@@ -740,7 +748,7 @@ def measured_fp8_sites(variables: Variables, sites: Sequence[str], tokens: int) 
         if jax.process_index() != 0:
             return None
         generation = device_generation()
-        if gpu_target(generation).fp8_peak is None:
+        if not fp8_tensor_cores(generation):
             raise ValueError(f"{generation} has no FP8 tensor cores to run a frozen base in FP8 on")
         if not cache.measures_picks():
             raise ValueError("frozen FP8 sites are measured on a GPU the process holds alone, and this "
@@ -759,7 +767,7 @@ def _fp8_faster(shape: tuple[int, ...], tokens: int) -> bool:
     `tokens` rows run faster as FP8 products than as bf16 ones on this GPU."""
     import statistics
 
-    from dew.nn.kernels.tuning import samples
+    from dew.telemetry.benchmark import samples
 
     inputs, outputs = shape
     keys = jax.random.split(jax.random.key(0), 3)

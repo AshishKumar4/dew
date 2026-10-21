@@ -151,8 +151,9 @@ caio==0.12.9
     # via aiofile
 cbor2==6.1.5
     # via modal
-certifi==2026.7.22
+certifi==2026.10.19
     # via
+    #   -c constraints.txt
     #   httpcore
     #   httpx
     #   modal

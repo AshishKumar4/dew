@@ -89,17 +89,33 @@ class _Launch(tuning.KernelOp):
 
     def operands(self, specs: list[jax.ShapeDtypeStruct], seed: int) -> list[jax.Array]:
         """Normal floats, and chunk and sequence descriptors (`Sequences`) a timed launch can run: the
-        rows' own where the descriptors count them, else as many even sequences over the tokens."""
+        rows' own where the descriptors count them, else as many sequences within the rows (`_even`)."""
         arrays = super().operands(specs, seed)
         batch, length = specs[0].shape[:2]
-        spans = {spec.shape[-1]: spec.shape[0] for spec in specs
-                 if spec.dtype == jnp.int32 and spec.ndim == 2}
-        own = spans[4] == batch * -(-length // 64) and spans[5] == batch
-        even = jnp.linspace(0, batch * length, spans[5] + 1).astype(jnp.int32)
-        drawn = sequences(batch, length, None if own else even)
+        rows = {spec.shape[-1]: spec.shape[0] for spec in specs if spec.dtype == jnp.int32 and spec.ndim == 2}
+        if not rows:
+            return arrays
+        # A launch reads chunk descriptors `[NT, 4]`, sequence ones `[N, 5]` or both: a packed call's
+        # NT is the tokens' chunks and one more for each of its N sequences (`sequences`).
+        chunks, count = rows.get(4), rows.get(5)
+        if chunks in (None, batch * -(-length // 64)) and count in (None, batch):
+            drawn = sequences(batch, length)
+        else:
+            count = chunks - -(-batch * length // 64) if count is None else count
+            drawn = sequences(batch, length, _even(batch, length, count))
         return [jnp.asarray(drawn.chunks if spec.shape[-1] == 4 else drawn.spans)
                 if spec.dtype == jnp.int32 and spec.ndim == 2 else array
                 for spec, array in zip(specs, arrays, strict=True)]
+
+
+def _even(batch: int, length: int, count: int) -> jax.Array:
+    """`cu_seqlens` of `count` sequences over `batch` rows of `length` tokens, at least one a row as
+    every packed call's, none crossing a row: each row cut as evenly as its share, the first rows'
+    shares one larger."""
+    shares = [count // batch + (row < count % batch) for row in range(batch)]
+    cuts = [row * length + piece * length // share
+            for row, share in enumerate(shares) for piece in range(share)]
+    return jnp.asarray([*cuts, batch * length], jnp.int32)
 
 
 def _tiles(blocks, warps, stages) -> frozenset[Tiles]:

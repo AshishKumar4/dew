@@ -160,8 +160,7 @@ class TextData(_Loadable):
         if self.token_holdout is not None and self.validation is None:
             if self.token_holdout.fraction is None:
                 raise ValueError("token_holdout needs fraction=")
-            held = train.token_split(self.token_holdout.fraction, held=True)
-            train = train.token_split(self.token_holdout.fraction, held=False)
+            train, held = (part._chain() for part in train.holdout(tokens=self.token_holdout.fraction))
         if self.pack is None:
             train = train.windows(self.seq_len, stride=self.stride)
             held = (
@@ -224,7 +223,7 @@ class ChatData(_Loadable):
     tokenizer: str
     seq_len: int = 256
     column: str = "messages"
-    long: Literal["truncate", "drop", "chunk"] = "truncate"
+    long: Literal["truncate", "drop", "chunk"] = "chunk"
     packing_bins: int = 8
     validation: Annotated[Validation, source_argument(Validation)] = None
     split: str = "train"
@@ -281,7 +280,7 @@ class PromptData(_Loadable):
     max_prompt_len: int = 256
     pad_id: int = 0
     reward_bytes: int | None = None
-    long: Literal["drop", "truncate"] = "drop"
+    long: Literal["drop", "truncate"] = "truncate"
     thinking: bool | None = None
     validation: Annotated[Validation, source_argument(Validation)] = None
     split: str = "train"
@@ -318,6 +317,9 @@ class _PromptFacts:
     def _measured(self) -> dict[str, int]:
         return {}
 
+    def label(self) -> str:
+        return self.source.label()
+
     def describe(self) -> str:
         return self.source.describe()
 
@@ -328,7 +330,7 @@ class _PromptFacts:
         return self.source.supports(read)
 
     def records(self, read: Read):
-        from dew.data.prompts import _ground_truth, _text
+        from dew.data.prompts import _extra_info, _ground_truth, _text
 
         rows = self.source.records(read)
         if read == "memory" and self.width is None and "reward_bytes" not in self._measured:
@@ -343,7 +345,7 @@ class _PromptFacts:
                         for text in (
                             _text(row.get("data_source")),
                             _ground_truth(row, "prompt"),
-                            _text(row.get("extra_info")),
+                            _text(_extra_info(row)),
                         )
                     ),
                     default=1,
@@ -458,7 +460,7 @@ class ImageData(_Loadable):
                 if augment.jitter:
                     train = train.random_map(images.ColorJitter())
         elif augment is not None:
-            train = train.random_map(images.AugmentationKey()).then(MapBatch(images.DeviceAugment(
+            train = train.random_map(images.AugmentationKey())._then(MapBatch(images.DeviceAugment(
                 self.image_size, crop_scale=augment.crop_scale, flip=augment.flip, jitter=augment.jitter)))
         held = None if held is None else prepared(held, self.image_size)
         return train, held, (EncodeCaptions(),)

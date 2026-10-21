@@ -15,7 +15,7 @@ import numpy as np
 import tyro
 
 from dew.data.dataset import Batch, Records
-from dew.data.pipeline import Dataset, Mixture, Phases, Pipeline, Rejected, Stage
+from dew.data.pipeline import Dataset, Mixture, Phases, Pipeline, Stage
 from dew.data.sources.base import Read, Shard, ShardManifest, Source, _consumed, _uncounted
 from dew.data.sources.codec import content_fingerprint
 from dew.records import integer
@@ -52,6 +52,9 @@ class _SliceRecords:
 
     def consumed(self, read: Read) -> _SliceRecords:
         return dataclasses.replace(self, source=_consumed(self.source, read))
+
+    def label(self) -> str:
+        return self.source.label()
 
     def describe(self) -> str:
         return f"{self.source.describe()}[{self.start}:{self.stop}]"
@@ -102,8 +105,10 @@ class _HashRows:
     held: bool
     key: str | None = None
 
-    def __call__(self, row: Batch) -> Batch | Rejected:
-        return row if _inside(row, self.low, self.high, self.key) == self.held else Rejected("holdout")
+    def __call__(self, row: Batch) -> bool:
+        """Whether `row` is in this part: the other part's rows are no rejection, as a memory read
+        holds none of them."""
+        return _inside(row, self.low, self.high, self.key) == self.held
 
 
 @dataclasses.dataclass(frozen=True)
@@ -132,6 +137,9 @@ class _HashSource:
 
     def consumed(self, read: Read) -> _HashSource:
         return dataclasses.replace(self, source=_consumed(self.source, read))
+
+    def label(self) -> str:
+        return self.source.label()
 
     def describe(self) -> str:
         part = f"[{self.low},{self.high}),held={self.held},key={self.key}"
@@ -167,10 +175,7 @@ class _HashSource:
                              None if subdivide is None else functools.partial(_unsized_parts, subdivide))
 
     def _reader(self, manifest: ShardManifest, shard: Shard):
-        from dew.data.mixing import Accepted
-
-        rows = manifest.reader(shard).map(_HashRows(self.low, self.high, self.held, self.key))
-        return Accepted(rows, self.describe())
+        return manifest.reader(shard).filter(_HashRows(self.low, self.high, self.held, self.key))
 
 
 def _unsized(shards: Sequence[Shard]) -> tuple[Shard, ...]:
@@ -183,7 +188,7 @@ def _unsized_parts(subdivide: Callable[[int], tuple[Shard, ...]], count: int) ->
 
 def _rebased(dataset: Dataset, store: Callable[[Source], Source]) -> Pipeline:
     """`dataset` with each of its stores read through `store`, its steps unchanged."""
-    chain = dataset.chain()
+    chain = dataset._chain()
     source = chain.source
     if isinstance(source, (Mixture, Phases)):
         children = tuple(_rebased(child, store) for child in source.pipelines)
@@ -294,6 +299,9 @@ class _RandomSource:
 
     def consumed(self, read: Read) -> _RandomSource:
         return dataclasses.replace(self, source=_consumed(self.source, read))
+
+    def label(self) -> str:
+        return self.source.label()
 
     def describe(self) -> str:
         return f"{self.source.describe()} random holdout={self.split!r},held={self.held}"

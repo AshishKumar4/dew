@@ -801,9 +801,10 @@ def fla_rule(query, key, value, g, beta, state=None, *, starts=None, max_segment
     documents' first tokens `starts` `[B, S]`, at most `max_segments` a row
     (the row length where None). Each document runs as a sequence of its own
     (fla's varlen `cu_seqlens`), its chunks from its first token and its
-    memory from zero, as it would alone; the row's first takes `state`. The
-    kernels' grids are sized by that bound, a chunk more for each document and
-    the row's padding; the memories they keep are not (`fla_gdn.Sequences`).
+    memory from zero, as it would alone; the row's first takes `state`, unless
+    its first token begins a document of its own. The kernels' grids are
+    sized by that bound, a chunk more for each document and the row's
+    padding; the memories they keep are not (`fla_gdn.Sequences`).
 
     The operands go to their common dtype, beta with them, as fla's layer
     holds them. On a mesh the rule runs per shard (`manual_map`): rows where
@@ -822,6 +823,9 @@ def fla_rule(query, key, value, g, beta, state=None, *, starts=None, max_segment
              else state.astype(jnp.float32))
     documents = None if starts is None else query.shape[1] if max_segments is None else max_segments
     starts = jnp.zeros(query.shape[:2], bool) if starts is None else jnp.asarray(starts, bool)
+    if documents is not None:
+        # The kernels start each row from its memory; a first token that begins a document drops it.
+        state = jnp.where(starts[:, 0, None, None, None], 0.0, state)
     rows, heads = grouped_heads(value.shape, key.shape[2])
     P = jax.sharding.PartitionSpec
     four, three, memory = P(rows, None, heads, None), P(rows, None, heads), P(rows, heads, None, None)
@@ -1267,9 +1271,12 @@ class GatedDeltaNet(nn.Module):
             state = None if held is None else held.astype(wide)
             if S > 1:
                 # fla's layer hands its rule the projections' dtype, the
-                # queries and keys on their own heads and beta beside them.
+                # queries and keys on their own heads and beta beside them. A
+                # held history can make the convolved operands vary where the
+                # projections did not, so the route is asked again of them.
                 return chunk_gated_delta_rule(query, key, value, g, beta, state, self.chunk_size,
-                                              ported=ported, starts=starts, max_segments=tokens.max_segments)
+                                              ported=ported and on_the_port(query, key, value),
+                                              starts=starts, max_segments=tokens.max_segments)
             # One key head serves `per_v` value heads, the reference's `repeat_interleave`.
             query, key = (repeat_kv_heads(x, self.num_v_heads) for x in (query, key))
             if stepped and held is not None:

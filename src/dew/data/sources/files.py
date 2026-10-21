@@ -32,7 +32,7 @@ from dew.data.pipeline import Dataset
 from dew.data.storage import Readable, Store, content_version, local
 from dew.records import integer, record
 
-from .base import Read, Shard, ShardManifest, preparing
+from .base import Read, Shard, ShardManifest, preparing, url_label
 from .index import ArrayIndex
 
 type Format = Literal["jsonl", "text", "csv", "parquet", "arrow", "array_record", "files", "webdataset"]
@@ -260,6 +260,9 @@ class Files(Dataset):
         if not found:
             raise FileNotFoundError(f"source {self.url!r} matched no {self.kind} files")
         return tuple(found)
+
+    def label(self) -> str:
+        return url_label(self.url if isinstance(self.url, str) else self.url[0])
 
     def describe(self) -> str:
         return f"files:{self.kind}:{self.url}"
@@ -646,7 +649,8 @@ class Files(Dataset):
             metadata = self.committed.get("metadata", {})
             if not isinstance(metadata, Mapping):
                 raise ValueError("export metadata must be a mapping")
-            return {**metadata, "rows": self.committed["rows"], "format": self.committed["format"]}
+            rules = {"count_rules": self.committed["count_rules"]} if "count_rules" in self.committed else {}
+            return {**metadata, **rules, "rows": self.committed["rows"], "format": self.committed["format"]}
         if self.kind in ("parquet", "arrow"):
             schema = self.arrow.schema.metadata or {}
             details = json.loads(schema[b"huggingface"]) if b"huggingface" in schema else {}
@@ -661,7 +665,9 @@ class Files(Dataset):
                 if self.where is None
                 else {}
             )
-            return {"class_names": names, **counts}
+            # Rows with no counted targets column hold no count of Dew's (`CountRule`).
+            rules = {} if "_dew_valid_targets" in self.arrow.schema.names else {"count_rules": []}
+            return {"class_names": names, **counts, **rules}
         if self.kind in ("jsonl", "text", "csv") and self.supports("indexed"):
             return {"rows": len(_IndexedLines(self))}
         if self.kind == "files":

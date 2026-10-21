@@ -153,6 +153,23 @@ def test_the_verl_rl_parquet_reads_its_nested_ground_truth():
         assert read(batch[TRUTH_KEY]) == expected["reward_model"]["ground_truth"]
         info = json.loads(read(batch[INFO_KEY]))
         assert info["tools_kwargs"] == expected["extra_info"]["tools_kwargs"]
+        # The row's task family reaches the reward with the rest of its context (P92).
+        assert info["ability"] == expected["ability"]
+
+
+def test_a_prompt_rows_ability_rides_beside_context_that_is_no_mapping():
+    """A row's `ability` joins a mapping `extra_info` as a field of it, and rides beside one that is
+    no mapping (a string) in an envelope that keeps both; a mapping that names another ability is
+    refused, since keeping either would lose the other."""
+    from dew.data.prompts import _extra_info
+
+    assert _extra_info({"extra_info": {"split": "train"}, "ability": "math"}) == {
+        "split": "train", "ability": "math"}
+    assert _extra_info({"extra_info": "suite-A", "ability": "math"}) == {
+        "extra_info": "suite-A", "ability": "math"}
+    assert _extra_info({"ability": "math"}) == {"ability": "math"}
+    with pytest.raises(ValueError):
+        _extra_info({"extra_info": {"ability": "code"}, "ability": "math"})
 
 
 def test_text_rows_with_the_empty_media_verls_loops_write_are_training_rows():

@@ -170,9 +170,12 @@ def test_a_sharded_pipeline_export_holds_a_few_shards_on_the_host(extracted, tmp
     """The tiny Flux pipeline with a 300 MB bfloat16 transformer, written by
     Diffusers in one process, then loaded onto a mesh and saved in 25 MB
     shards by a fresh one (tools/benchmark_streaming_export.py). Each
-    component's tensors are built as their shard is written, so RSS over the
-    save rises by four shards at most (measured 0.07-0.08 GB); building the
-    whole export first rose 0.33 GB."""
+    component's tensors are built as their shard is written, so the memory
+    the process allocates over the save rises by a few shards (measured
+    0.047-0.048 GB, 0.029-0.036 GB in 10 MB shards); building the whole
+    export first rose 0.30 GB. Its resident memory also holds the pages of the
+    source files it maps, which the host's page cache and load move, so the
+    bound reads its anonymous memory."""
     import json
     import os
     import subprocess
@@ -189,4 +192,4 @@ def test_a_sharded_pipeline_export_holds_a_few_shards_on_the_host(extracted, tmp
     assert run.returncode == 0, run.stderr[-2000:]
     measured = json.loads(run.stdout.splitlines()[-1])
     assert measured["shards"] > 8
-    assert measured["rise_gb"] < 4 * 25e6 / 2**30, measured
+    assert measured["anon_rise_gb"] < 4 * 25e6 / 2**30, measured
