@@ -22,9 +22,9 @@ observed. Run it with an interpreter that has torch and jax:
   ~/Desktop/dew/.venv/bin/python tools/parity_rl.py
 
 `recording` records the advantage estimators over check 1's seeds instead
-(tools/recorded_references.py), each reference's float32 run beside verl's
-float64 run, every float32 pin widened, each seed's inputs drawn again by
-tests/test_rl_advantage.py (`advantage_inputs`):
+(tools/recorded_references.py), each reference's float32 run's evidence from
+verl's float64 run, every float32 pin widened, with that run's sketch, each
+seed's inputs drawn again by tests/test_rl_advantage.py (`advantage_inputs`):
 
   PYTHONPATH=src:tools python tools/parity_rl.py recording
 
@@ -126,17 +126,24 @@ ESTIMATORS = ("masked_mean_rows", "masked_whiten", "group_advantage", "group_adv
 """The advantage recording's leaves, one per estimator output."""
 
 
+DRAWN_MASK = np.tile(RESPONSE_MASK, (16, 1))
+"""The recorded draws' response mask: the fixed fixture's three rows (one row cut short, one whole,
+one a single token) sixteen times over."""
+DRAWN_GROUPS = 64
+"""The recorded draws' groups of GROUP rewards."""
+
+
 def advantage_inputs(seed: int) -> dict[str, np.ndarray]:
-    """A seed's inputs to every estimator at the fixed fixture's shapes and masks: rewards in groups of
-    GROUP, the second group's equal (the case only the eps under the deviation divides), token rewards,
-    and values, large behind RESPONSE_MASK (which a recursion that reads them moves), the same on every
-    run. Check 1's draw for the recorded references."""
+    """A seed's inputs to every estimator, the same on every run: DRAWN_GROUPS groups of GROUP rewards,
+    the second group's equal (the case only the eps under the deviation divides), and token rewards and
+    values under DRAWN_MASK, the values large behind it (which a recursion that reads them moves).
+    Check 1's draw for the recorded references, each draw many rows, so a few seeds resolve it."""
     rng = np.random.default_rng([0xADB, seed])
-    rewards = rng.normal(size=REWARDS.shape).astype(np.float32)
+    rewards = rng.normal(size=DRAWN_GROUPS * GROUP).astype(np.float32)
     rewards[GROUP:2 * GROUP] = rewards[GROUP]
-    values = rng.normal(size=VALUES.shape)
-    values = np.where(RESPONSE_MASK > 0, values, 7 * values).astype(np.float32)
-    return {"rewards": rewards, "token_rewards": rng.normal(size=TOKEN_REWARDS.shape).astype(np.float32),
+    values = rng.normal(size=DRAWN_MASK.shape)
+    values = np.where(DRAWN_MASK > 0, values, 7 * values).astype(np.float32)
+    return {"rewards": rewards, "token_rewards": rng.normal(size=DRAWN_MASK.shape).astype(np.float32),
             "values": values}
 
 
@@ -150,14 +157,15 @@ def verl_advantages(verl, inputs: dict[str, np.ndarray], dtype) -> dict[str, np.
         return torch.tensor(np.asarray(x), dtype=dtype)
 
     rewards = inputs["rewards"]
+    uids = np.repeat(np.arange(rewards.shape[0] // GROUP), GROUP).astype(np.int64)
     token_level, ones = tensor(rewards[:, None]), tensor(np.ones((rewards.shape[0], 1)))
-    values, mask = tensor(inputs["values"]), tensor(RESPONSE_MASK)
+    values, mask = tensor(inputs["values"]), tensor(DRAWN_MASK)
     found = {"masked_mean_rows": reductions.masked_mean(values, mask, axis=-1),
              "masked_whiten": reductions.masked_whiten(values, mask)}
-    found["group_advantage"] = verl.compute_grpo_outcome_advantage(token_level.clone(), ones, UIDS)[0][:, 0]
+    found["group_advantage"] = verl.compute_grpo_outcome_advantage(token_level.clone(), ones, uids)[0][:, 0]
     found["group_advantage_unnormalised"] = verl.compute_grpo_outcome_advantage(
-        token_level.clone(), ones, UIDS, norm_adv_by_std_in_grpo=False)[0][:, 0]
-    found["rloo_advantage"] = verl.compute_rloo_outcome_advantage(token_level.clone(), ones, UIDS)[0][:, 0]
+        token_level.clone(), ones, uids, norm_adv_by_std_in_grpo=False)[0][:, 0]
+    found["rloo_advantage"] = verl.compute_rloo_outcome_advantage(token_level.clone(), ones, uids)[0][:, 0]
     found["gae_advantage"], found["gae_return"] = verl.compute_gae_advantage_return(
         tensor(inputs["token_rewards"]), values, mask, GAMMA, LAM)
     return {name: found[name].detach().numpy() for name in ESTIMATORS}
@@ -167,7 +175,7 @@ def tunix_advantages(tunix, inputs: dict[str, np.ndarray], dtype) -> dict[str, n
     """Tunix's estimators on `inputs` at the JAX `dtype`."""
     import jax.numpy as jnp
 
-    rewards, values, mask = (jnp.asarray(inputs.get(name, RESPONSE_MASK), dtype)
+    rewards, values, mask = (jnp.asarray(inputs.get(name, DRAWN_MASK), dtype)
                              for name in ("rewards", "values", "response_mask"))
     found = {"masked_mean_rows": tunix.masked_mean(values, mask, axis=-1),
              "masked_whiten": tunix.masked_whiten(values, mask),
@@ -181,8 +189,9 @@ def tunix_advantages(tunix, inputs: dict[str, np.ndarray], dtype) -> dict[str, n
 
 def write_advantage_recording(verl, tunix, command: str, out: Path) -> None:
     """recorded_advantage_<reference>.npz: each reference's estimators recorded over check 1's seeds
-    (`record_case`), its float32 run against verl's float64 run (every float32 pin widened,
-    tools/diffusers_wan_reference.py `float64`), the count planned on Dew's own estimators."""
+    (`record_case`'s summary), its float32 run's evidence from verl's float64 run (every float32 pin
+    widened, tools/diffusers_wan_reference.py `float64`) and that run's sketch, the count planned on
+    Dew's own estimators."""
     import jax
     import jax.numpy as jnp
     import torch
@@ -197,7 +206,7 @@ def write_advantage_recording(verl, tunix, command: str, out: Path) -> None:
             return verl_advantages(verl, inputs, torch.float64)
 
     def proxy(inputs):
-        mask = jnp.asarray(RESPONSE_MASK, inputs["values"].dtype)
+        mask = jnp.asarray(DRAWN_MASK, inputs["values"].dtype)
         advantages, returns = gae(inputs["token_rewards"], inputs["values"], mask, gamma=GAMMA, lam=LAM)
         return {"masked_mean_rows": masked_mean(inputs["values"], mask, axis=-1),
                 "masked_whiten": masked_whiten(inputs["values"], mask),
@@ -212,7 +221,7 @@ def write_advantage_recording(verl, tunix, command: str, out: Path) -> None:
     for name, evaluate in evaluations.items():
         with jax.enable_x64(new_val=True):
             recorded = record_case(name, advantage_inputs, evaluate, proxy, truth_proxy=proxy,
-                                   store_inputs=False)
+                                   store_inputs=False, summary=True)
         commit = {"verl": "896a9bb", "tunix": "b9f5e65"}[name]
         recorded[f"{name}.provenance"] = provenance(name, commit, "cpu", command, torch=torch.__version__,
                                                     truth="verl float64")
