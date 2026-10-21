@@ -68,7 +68,7 @@
    "by": "2026-11-13"
   },
   "tests/test_attention_splash.py": {
-   "comparisons": 4,
+   "comparisons": 3,
    "lane": "Kernels",
    "by": "2026-11-06"
   },
@@ -287,11 +287,6 @@
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
-  "tests/test_dsa_kpool.py": {
-   "comparisons": 12,
-   "lane": "Models, Serving & RL",
-   "by": "2026-11-13"
-  },
   "tests/test_edm2.py": {
    "comparisons": 2,
    "lane": "Models, Serving & RL",
@@ -432,11 +427,6 @@
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
-  "tests/test_hf_gpt_neox.py": {
-   "comparisons": 2,
-   "lane": "Models, Serving & RL",
-   "by": "2026-11-13"
-  },
   "tests/test_hf_lifecycle.py": {
    "comparisons": 1,
    "lane": "Models, Serving & RL",
@@ -574,11 +564,6 @@
   },
   "tests/test_local_attention.py": {
    "comparisons": 8,
-   "lane": "Models, Serving & RL",
-   "by": "2026-11-13"
-  },
-  "tests/test_loop.py": {
-   "comparisons": 12,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
