@@ -127,9 +127,18 @@ class _Locality(Protocol):
 @runtime_checkable
 class _Materialized(Protocol):
     """Rows a memory read holds, which state the source position each came
-    from (`dew.data.materialize`)."""
+    from (`dew.data.materialize`), the source it read and the steps it ran over them."""
 
     identifiers: tuple[tuple[int, ...], ...]
+    original: Source
+    ran: tuple[Stage, ...]
+
+
+def _keyed(source: Source) -> Source:
+    """The store a cache over `source` keys its inputs by: the source a memory read holds the rows
+    of, where it ran no step over them (it deferred the cache to a view of the inputs, `_VIEWS`), as
+    an indexed read and a publication key them; else `source` itself."""
+    return source.original if isinstance(source, _Materialized) and not source.ran else source
 
 
 def _outputs(
@@ -954,12 +963,18 @@ class _Build:
             placed = _Placed(identifiers=identifiers, rows=len(stored))
             rows = stored.map_with_index(placed) if last >= 0 else stored
             return self.shared(rows, pipeline, partition), 0
-        filled, manifest, prefix = _fill(pipeline, source, cache, self.read)
-        cached = filled.mapped(stored, manifest, transform=prefix, source=source)
+        keyed = _keyed(source)
+        if keyed is not source:
+            # A memory read that deferred its cache holds the source's rows; the cache reads them by
+            # their places in the source, as an indexed read does, its missing inputs among them.
+            records = keyed.records(self.read)
+            stored = pygrain.MapDataset.source(records)
+        filled, manifest, prefix = _fill(pipeline, keyed, cache, self.read)
+        cached = filled.mapped(stored, manifest, transform=prefix, source=keyed)
         if self.lowering.one_to_one:
             # One record for each input: read as the source's own rows, by index and in the
             # uncached chain's order, its missing inputs skipped as there.
-            present = _Present.of(records) if _in_memory(source) else None
+            present = _Present.of(records) if _in_memory(keyed) else None
             single = _Single(cached, None if present is None else present.positions)
             identifiers = () if present is None else tuple((int(position),) for position in present.positions)
             placed = (single.map_with_index(_Placed(identifiers=identifiers, rows=len(single)))
