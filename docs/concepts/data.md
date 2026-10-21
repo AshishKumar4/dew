@@ -117,7 +117,7 @@ held = Memory(records[:8]).batch(4)
 data = compile(train, validation=held, seed=7)
 ```
 
-Validation is finite and never inherits a training repeat or augmentation stage. `records=N` on a preset caps the accepted records a part reads, before the share cut. A training rejection is dropped before mixtures are weighted; attempted, accepted, truncated and rejected records are counted per corpus.
+`holdout` keeps the steps written before it on both parts, so write shared deterministic preparation before the split and add `shuffle`, `repeat` and augmentation only to the training part: validation is then finite and unaugmented. `records=N` on a preset caps the accepted records a part reads, before the share cut. A training rejection is dropped before mixtures are weighted; attempted, accepted, truncated and rejected records are counted per corpus.
 
 `map(step)` after `batch` runs in the training process after batching and workers. It forwards position and ownership. Steps on only one branch affect that branch; `compile(..., host=(step,))` applies a common host step to both branches.
 
@@ -162,7 +162,7 @@ Use a fresh output directory: exports commit immutable shards and a manifest, an
 
 ## Mixtures, objectives and order
 
-`mix(datasets, weights=..., by="records" | "tokens")` mixes accepted records before sharding and ends at its first exhausted member, as Grain's mix does; a member that repeats never ends. With `by="tokens"`, token stores' shares count valid targets, not padding. `schedule([(dataset, tokens), ...])` changes mixtures at token boundaries and continues each corpus where its earlier phase stopped.
+`mix(datasets, weights=..., by="records" | "tokens")` mixes accepted records before sharding and ends at its first exhausted member, as Grain's mix does; a member that repeats never ends. With `by="tokens"`, token stores' shares count valid targets, not padding. `phases((first, until_step), ..., (last, None))` reads datasets one after another, each until the training step it names and the last until the run ends; each phase is a whole chain of the same batch.
 
 ## Token-budget batches
 
