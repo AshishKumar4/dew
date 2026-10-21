@@ -861,16 +861,23 @@ def local_rows(leaf: jax.typing.ArrayLike, *, host: bool = True) -> jax.Array | 
     return np.concatenate(blocks, axis=0)
 
 
-def request_key(key: int | jax.Array | None, *, rows: int | None = None) -> jax.Array:
-    """Normalize a seed or JAX key; `rows` also admits one typed key per row."""
+def request_key(key: int | jax.Array | None) -> jax.Array:
+    """Normalize an integer seed or a single JAX key to one typed PRNG key."""
     if key is None or isinstance(key, bool):
         raise ValueError("key must be an integer seed or a single JAX PRNG key")
     if isinstance(key, (int, np.integer)):
         return jax.random.key(int(key))
     typed = jax.random.wrap_key_data(jax.random.key_data(key), impl=jax.random.key_impl(key))
-    if typed.shape != () and (rows is None or typed.shape != (rows,)):
-        raise ValueError("key must be a single JAX PRNG key" if rows is None else
-                         f"key must be one JAX PRNG key or {rows} row keys")
+    if typed.shape != ():
+        raise ValueError("key must be a single JAX PRNG key")
+    return typed
+
+
+def request_rows(keys: jax.Array) -> jax.Array:
+    """Normalize a vector of JAX keys, one a row (`dew.sampling.solvers.RowKeys`), to typed keys."""
+    typed = jax.random.wrap_key_data(jax.random.key_data(keys), impl=jax.random.key_impl(keys))
+    if typed.ndim != 1:
+        raise ValueError(f"row keys are a vector of JAX PRNG keys, got shape {typed.shape}")
     return typed
 
 

@@ -253,24 +253,30 @@ class Unmask:
         return ()
 
     def step(self, x, t, t_next, denoised, log_probs, state, key, process, denoise):
+        chance = self._reveal_chance(process, t, t_next)
+        reveal_key, token_key = jax.random.split(key)
+        reveal = jax.random.uniform(reveal_key, x.shape) < chance[:, None]
+        drawn = jax.random.categorical(token_key, log_probs, axis=-1)
+        return jnp.where(denoise.masked(x) & reveal, drawn, x), state
+
+    def step_rows(self, x, t, t_next, denoised, log_probs, state, keys, process, denoise):
+        """`step`, row `i` drawing its reveals and tokens from `keys[i]` alone (`RowSolver`), as the
+        row sampled by itself draws them."""
+        chance = self._reveal_chance(process, t, t_next)
+        split = jax.vmap(jax.random.split)(keys)
+        reveal = jax.vmap(lambda key: jax.random.uniform(key, x.shape[1:]))(split[:, 0]) < chance[:, None]
+        drawn = jax.vmap(jax.random.categorical)(split[:, 1], log_probs)
+        return jnp.where(denoise.masked(x) & reveal, drawn, x), state
+
+    @staticmethod
+    def _reveal_chance(process, t, t_next):
+        """Each row's chance of revealing a masked position from `t` to `t_next`."""
         if not isinstance(process, DiscreteProcess):
             raise ValueError(
                 f"Unmask reveals masked tokens, so it needs a DiscreteProcess and not "
                 f"{type(process).__name__}")
         alpha_t = process.schedule.alpha(t)
-        alpha_s = process.schedule.alpha(t_next)
-        reveal_chance = (alpha_s - alpha_t) / (1 - alpha_t)
-        masked = denoise.masked(x)
-        if jax.random.key_data(key).ndim == 1:
-            reveal_key, token_key = jax.random.split(key)
-            reveal = jax.random.uniform(reveal_key, x.shape)
-            drawn = jax.random.categorical(token_key, log_probs, axis=-1)
-        else:
-            split = jax.vmap(jax.random.split)(key)
-            reveal = jax.vmap(lambda row_key: jax.random.uniform(row_key, x.shape[1:]))(split[:, 0])
-            drawn = jax.vmap(jax.random.categorical)(split[:, 1], log_probs)
-        reveal = reveal < reveal_chance[:, None]
-        return jnp.where(masked & reveal, drawn, x), state
+        return (process.schedule.alpha(t_next) - alpha_t) / (1 - alpha_t)
 
 
 @dataclass(frozen=True)
@@ -367,6 +373,7 @@ def _generate(model: nn.Module, variables: Variables, inputs: ModelInputs, keys:
     keeps tokens up to its first EOS and reports the steps it took.
     """
     from dew.sampling.sample import sample
+    from dew.sampling.solvers import RowKeys
 
     batch, prompt = inputs.tokens.shape
     if budget == 0:
@@ -377,7 +384,7 @@ def _generate(model: nn.Module, variables: Variables, inputs: ModelInputs, keys:
     denoise = process.denoiser(model, variables, inputs=full, mutable_mask=mutable)
 
     def continued(draw_keys):
-        tokens = sample(denoise, full.tokens, steps, solver=solver, key=draw_keys)
+        tokens = sample(denoise, full.tokens, steps, solver=solver, key=RowKeys(draw_keys))
         active = jnp.any(mutable, axis=-1)
         response, length, ended = jax.vmap(
             lambda row, count: through_eos(row, count, eos_ids, pad_id))(
