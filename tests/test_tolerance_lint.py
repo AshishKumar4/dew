@@ -71,6 +71,7 @@ COMPARISONS = {
     "a time bounded on both sides": ("assert 2.25 <= long_seconds / short_seconds <= 3.75", 1),
     "a band written the other way": ("assert 3.75 >= ratio >= 2.25", 1),
     "a band about zero": ("assert -1e-6 <= residual <= 1e-6", 1),
+    "a band through names": ("low, high = 2.25, 3.75\nassert low <= ratio <= high", 1),
     "a target less and plus a fraction of it": ("assert c - c / 4 <= x <= c + c / 4", 1),
     "a target scaled both ways": ("assert 0.75 * c <= x <= 1.25 * c", 1),
     "a band as a conjunction": ("assert x >= 2.25 and x <= 3.75", 1),
