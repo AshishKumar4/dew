@@ -155,6 +155,27 @@ def rescale(acc: jax.Array, alpha: jax.Array) -> jax.Array:
     return alpha[..., None] * acc
 
 
+class Argmax(NamedTuple):
+    """The keys' running maximum logit `peak` `[bq]` (the initial state's apart) and `index`, the first
+    key that holds it `[bq]` int32: the backward's anchor key (`off_anchor`), a residual of the forward."""
+
+    peak: jax.Array
+    index: jax.Array
+
+
+def no_argmax(rows: int) -> Argmax:
+    """`Argmax` before any key."""
+    return Argmax(jnp.full((rows,), -jnp.inf, jnp.float32), jnp.zeros((rows,), jnp.int32))
+
+
+def argmax(state: Argmax, logits: jax.Array, k_pos: jax.Array) -> Argmax:
+    """`Argmax` after a tile's logits (-inf where unseen) at its keys' indices `k_pos` `[1, bk]`."""
+    tile_peak = logits.max(axis=-1)
+    first = jnp.min(jnp.where(logits == tile_peak[:, None], k_pos, jnp.iinfo(jnp.int32).max), axis=-1)
+    return Argmax(jnp.maximum(state.peak, tile_peak),
+                  jnp.where(tile_peak > state.peak, first.astype(jnp.int32), state.index))
+
+
 def merge(spec: Forward, first: Partial, second: Partial) -> Partial:
     """Two states over disjoint keys as one, `first`'s keys before `second`'s: each taken to the larger
     maximum and summed, in that order."""
@@ -243,39 +264,68 @@ def pulled(cotangents, slopes, seen, kinds: tuple[Kind, ...]):
     return logits, tuple(pieces)
 
 
-class Anchored(NamedTuple):
-    """The backward's first pass over a query block's keys, online as the forward's softmax: its maximum
-    `peak`, the `anchor` c (the product dP of a key that holds the running maximum), the denominator
-    `total` and D's numerator about the anchor, `sum_j exp(s_j - m) (dP_j - c)`, `[bq]` fp32."""
+class OffAnchor(NamedTuple):
+    """The backward's first pass weighed against the forward's maximum m, so no running maximum rescales
+    a sum: the denominator `total` `[bq]`, and of every key but the forward's maximum key c
+    (`Argmax.index`) the weighted values `others` `B = sum_{j != c} e_j v_j` `[bq, Dv]` (the mainloop's
+    product of `off_anchor_weights`' narrowed weights with the values), their weights' sum
+    `others_total`, and c's own weight `own`, each `e_j = exp(s_j - m)` rounded as the forward rounds it,
+    fp32."""
 
-    peak: jax.Array
-    anchor: jax.Array
     total: jax.Array
-    numerator: jax.Array
+    others: jax.Array
+    others_total: jax.Array
+    own: jax.Array
 
 
-def anchored(state: Anchored, logits: jax.Array, products: jax.Array) -> Anchored:
-    """The first pass after a tile's logits (-inf where unseen) and its products `dP = dO·Vᵀ`: the
-    weights exp(s - m) / T sum to one over these logits whatever tiles the forward took, and dP_j - D is
-    taken as (dP_j - c) - (D - c), so the key that holds a query's maximum enters it as exactly 0: a
-    query that keeps one key gets 0, and one whose other keys and initial state weigh less than fp32's
-    resolution beside it gets their share in full."""
-    tile_peak = logits.max(axis=-1)
-    peak = jnp.maximum(state.peak, tile_peak)
-    held = jnp.max(jnp.where(logits == tile_peak[:, None], products, -jnp.inf), axis=-1)
-    anchor = jnp.where(tile_peak > state.peak, held, state.anchor)
-    safe = jnp.where(peak == -jnp.inf, 0.0, peak)
-    correction = jnp.exp(state.peak - safe)
-    exponentials = jnp.exp(logits - safe[:, None])
-    numerator = (correction * (state.numerator + (state.anchor - anchor) * state.total)
-                 + jnp.sum(exponentials * (products - anchor[:, None]), axis=-1))
-    return Anchored(peak, anchor, correction * state.total + exponentials.sum(axis=-1), numerator)
+def off_anchor_start(peak0: jax.Array, total0: jax.Array, term0: jax.Array, maximum: jax.Array,
+                     width: int) -> tuple[OffAnchor, jax.Array, jax.Array]:
+    """The first pass from the softmax's initial state (its maximum, denominator and share of D's
+    numerator) weighed at the forward's `maximum`, and that state's denominator and share there."""
+    carried = jnp.where(peak0 == -jnp.inf, 0.0, jnp.exp(peak0 - maximum))
+    state_total, state_share = total0 * carried, term0 * carried
+    nothing = jnp.zeros_like(total0)
+    return OffAnchor(state_total, jnp.zeros((total0.shape[0], width), jnp.float32), nothing, nothing), \
+        state_total, state_share
 
 
-def anchored_delta(state: Anchored) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-    """The first pass's maximum (0 for a query that saw nothing), anchor, denominator and `D - c`."""
-    peak = jnp.where(state.peak == -jnp.inf, 0.0, state.peak)
-    return peak, state.anchor, state.total, state.numerator * inverse(state.total)
+def off_anchor_weights(logits: jax.Array, maximum: jax.Array, at_anchor: jax.Array,
+                       dtype) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """A tile's weights `exp(s - m)` at the forward's maximum, fp32; them narrowed to the values'
+    `dtype` as the forward rounds them, zero at the anchor key (`at_anchor`), the left operand of `B`'s
+    product; and the anchor key's narrowed weight, fp32."""
+    exponentials = jnp.exp(logits - maximum[:, None])
+    rounded = exponentials.astype(dtype)
+    rest = jnp.where(at_anchor, jnp.zeros_like(rounded), rounded)
+    own = jnp.where(at_anchor, rounded, jnp.zeros_like(rounded)).astype(jnp.float32).sum(axis=-1)
+    return exponentials, rest, own
+
+
+def off_anchor(state: OffAnchor, exponentials: jax.Array, rest: jax.Array, own: jax.Array,
+               others: jax.Array) -> OffAnchor:
+    """The first pass after a tile (`off_anchor_weights`), `others` the tile's `rest · V`."""
+    return OffAnchor(state.total + exponentials.sum(axis=-1), state.others + others,
+                     state.others_total + rest.astype(jnp.float32).sum(axis=-1), state.own + own)
+
+
+def off_anchor_delta(state: OffAnchor, anchor_value: jax.Array, dout: jax.Array, state_total: jax.Array,
+                     state_share: jax.Array, key_index: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Each query's anchor c (`v_c · dO`, or 0), `D - c`, and the anchor key's index (-1 where c is 0),
+    from the first pass. D's numerator two ways: about 0, `sum_j e_j v_j · dO`, as the output's own
+    product with dO rounds it, which suits a query whose weights spread over many keys; and about
+    `c = v_c · dO`, `sum_{j != c} e_j (v_j - v_c) · dO`, where c enters as exactly 0, which suits one
+    whose weight sits on c. Each query takes the one nearer its D, the one whose terms cancel less."""
+    cotangent = dout.astype(jnp.float32)
+    anchor_value = anchor_value.astype(jnp.float32)
+    anchor = jnp.sum(anchor_value * cotangent, axis=-1)
+    about_zero = (jnp.sum((state.others + state.own[:, None] * anchor_value) * cotangent, axis=-1)
+                  + state_share)
+    about_anchor = (jnp.sum((state.others - state.others_total[:, None] * anchor_value) * cotangent, axis=-1)
+                    + state_share - state_total * anchor)
+    anchored = jnp.abs(about_anchor) <= jnp.abs(about_zero)
+    numerator = jnp.where(anchored, about_anchor, about_zero)
+    return (jnp.where(anchored, anchor, 0.0), numerator * inverse(state.total),
+            jnp.where(anchored, key_index, -1))
 
 
 def normalized(logits: jax.Array, peak: jax.Array, total: jax.Array) -> tuple[jax.Array, jax.Array]:
@@ -285,10 +335,14 @@ def normalized(logits: jax.Array, peak: jax.Array, total: jax.Array) -> tuple[ja
 
 
 def grad_scores(weights: jax.Array, products: jax.Array, anchor: jax.Array, delta: jax.Array,
-                seen: jax.Array) -> jax.Array:
+                seen: jax.Array, at_anchor: jax.Array | None = None) -> jax.Array:
     """The score cotangents `p (dP - D)` of a tile, taken as `p ((dP - c) - (D - c))` about each query's
-    anchor c (`anchored`), zero where unseen."""
-    return jnp.where(seen, weights * ((products - anchor[:, None]) - delta[:, None]), 0.0)
+    anchor c (`off_anchor_delta`), zero where unseen; the anchor key's own `dP - c` is 0 by
+    definition where `at_anchor` names it, whatever its product's rounding."""
+    relative = products - anchor[:, None]
+    if at_anchor is not None:
+        relative = jnp.where(at_anchor, 0.0, relative)
+    return jnp.where(seen, weights * (relative - delta[:, None]), 0.0)
 
 
 def refinement(residual: jax.Array, mass: jax.Array, peak0: jax.Array, shares: tuple[jax.Array, jax.Array],

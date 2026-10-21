@@ -102,8 +102,11 @@ def check(case: dict, names: frozenset, dtype, config: attention_triton.Tiles, *
 
     def ours(query, key, value):
         with pin:
-            return attention_triton.forward(query, key, value, spans, hooks, residuals=residuals,
-                                            interpret=not ON_GPU)
+            out = attention_triton.forward(query, key, value, spans, hooks, residuals=residuals,
+                                           interpret=not ON_GPU)
+        # The maxima and denominators the reference keeps too; the anchor keys only the backward reads,
+        # held to its gradients (`check_backward`).
+        return out[:3] if residuals else out
 
     def xla(query, key, value):
         return template.reference(query, key, value, spans, hooks, residuals=residuals)
@@ -166,11 +169,11 @@ def test_a_query_that_sees_no_key_reads_zero_and_a_sink_keeps_its_share():
     spans = template.spans(queries, keys, ROWS, **arguments(case))
     query, key, value = drawing(queries, keys, jnp.float32)(0)
     with tuning.pinned({attention_triton.TritonForward: PINNED[0]}):
-        out, _, total = attention_triton.forward(query, key, value, spans, residuals=True,
-                                                 interpret=not ON_GPU)
+        out, _, total, _ = attention_triton.forward(query, key, value, spans, residuals=True,
+                                                    interpret=not ON_GPU)
         sinks = hooks_for(HOOKS["sinks"], queries, 32)
-        _, _, sunk = attention_triton.forward(query, key, value, spans, sinks, residuals=True,
-                                              interpret=not ON_GPU)
+        _, _, sunk, _ = attention_triton.forward(query, key, value, spans, sinks, residuals=True,
+                                                 interpret=not ON_GPU)
     padding = np.asarray(spans.query_ids) == 0
     assert padding.any()
     assert np.all(np.asarray(out)[padding] == 0)

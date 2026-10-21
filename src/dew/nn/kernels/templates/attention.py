@@ -500,23 +500,25 @@ class Gradients:
 
 
 def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
-              hooks: Hooks | None, dout: jax.Array, *, block: int, scale: float | None = None) -> Gradients:
-    """The template's backward of its forward under the output's cotangent `dout` `[B, Q, H, Dv]`, through a
-    mainloop's `launch` (the Triton one, `attention_triton.backward`; the plain-JAX one,
-    `attention_portable.backward`): the call padded to whole `block`s (`padded_call`), `launch(query, key,
-    value, dout, peak0, total0, initial_term, start, end, query_ids, key_ids, score_params, *, score_mod,
-    score_kinds, score_dtypes, scale)` giving dQ, the softmax's rows (`D - c`, `c`, `m`, `T`, the keys'
-    mass), the dQ program's hook gradients (`DQ_GRADS`), then dK, dV and the key parameters' gradients;
-    each gradient fp32, then rounded to its input's dtype. The dQ launch first takes each query's softmax
-    again, online over the tiles and products its main pass takes, to its maximum, denominator and `D =
-    sum_j p dP`, as the softmax's derivative takes it: the weights it differentiates sum to one over its
-    own logits, and each `dP - D` is taken about the product of the key that holds the query's maximum, so
-    no rounding of that key's product enters it; the main pass then refines `D` once from its own sums for
-    the dK/dV launch and the head, query and initial state's gradients (`attention_algebra.anchored`,
-    `refinement`). It reads none of the forward's residuals. The output hook is no part of it: a
-    differentiated call applies `output_mod` past the kernel, where its own derivative runs, and passes
-    `dout` before it. Deterministic: every gradient element is written by one program, a head parameter's
-    partial sums added in a fixed order and a key head's query heads summed in XLA."""
+              hooks: Hooks | None, dout: jax.Array, residuals: tuple[jax.Array, jax.Array], *, block: int,
+              scale: float | None = None) -> Gradients:
+    """The template's backward of its forward under the output's cotangent `dout` `[B, Q, H, Dv]`, from
+    the forward's `residuals` (each query's maximum `[B, H, Q]` and anchor key, the first holding the keys'
+    maximum, `[B, H, Q]` int32), through a mainloop's `launch` (the Triton one, `attention_triton.backward`;
+    the plain-JAX one, `attention_portable.backward`): the call padded to whole `block`s (`padded_call`),
+    `launch(query, key, value, dout, peak0, total0, initial_term, maximum, key_index, anchor_value, start,
+    end, query_ids, key_ids, score_params, *, score_mod, score_kinds, score_dtypes, scale)` giving dQ, the
+    softmax's rows (`D - c`, `c`, `m`, `T`, the keys' mass), each query's anchor key as it chose it, the dQ
+    program's hook gradients (`DQ_GRADS`), then dK, dV and the key parameters' gradients; each gradient
+    fp32, then rounded to its input's dtype. The dQ launch first weighs each query's keys at the forward's
+    maximum to its denominator and D's numerator two ways, about 0 and about the anchor key's `v_c · dO`,
+    and takes the nearer (`attention_algebra.off_anchor_delta`): the weights it differentiates sum to one
+    over its own logits, and the anchor key's `dP - c` enters as exactly 0; the main pass then refines D
+    once from its own sums for the dK/dV launch and the head, query and initial state's gradients
+    (`attention_algebra.refinement`). The output hook is no part of it: a differentiated call applies
+    `output_mod` past the kernel, where its own derivative runs, and passes `dout` before it.
+    Deterministic: every gradient element is written by one program, a head parameter's partial sums
+    added in a fixed order and a key head's query heads summed in XLA."""
     hooks = Hooks() if hooks is None else hooks
     if hooks.output_mod is not None:
         raise ValueError("the backward takes the output before the output hook (`backward`'s docstring)")
@@ -542,10 +544,16 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
     rows = (call.start, call.end, call.query_ids, call.key_ids, call.score_params)
     kinds = tuple(param.kind for param in hooks.score_params)
     dtypes = tuple(kept_dtype(param.value.dtype) for param in hooks.score_params)
-    outputs = launch(*operands, *(call.rows(start) for start in starts), *rows, score_mod=hooks.score_mod,
-                     score_kinds=kinds, score_dtypes=dtypes, scale=scale)
+    maxima, anchors = residuals
+    key_index = call.rows(anchors.astype(jnp.int32))
+    # The anchor key's value row for each query, `[B, Qp, H, Dvp]`, a key head's for its query heads.
+    anchor_value = jnp.take_along_axis(jnp.repeat(call.value, group, axis=2),
+                                       jnp.swapaxes(key_index, 1, 2)[..., None], axis=1)
+    maximum = call.rows(maxima.astype(jnp.float32))
+    outputs = launch(*operands, *(call.rows(start) for start in starts), maximum, key_index, anchor_value,
+                     *rows, score_mod=hooks.score_mod, score_kinds=kinds, score_dtypes=dtypes, scale=scale)
     dq, softmax = outputs[0], outputs[1:6]
-    grads_out = list(outputs[6:])
+    grads_out = list(outputs[7:])
     dq_grads = [grads_out.pop(0) for kind in kinds if kind in DQ_GRADS]
     dk, dv, *key_grads = grads_out
     delta, anchor, peak, total, mass = (array[:, :, :queries] for array in softmax)
