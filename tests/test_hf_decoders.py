@@ -892,22 +892,39 @@ def test_llada_moe_routing_limits_change_the_forward(llada_moe_source):
     """The expert bias, group limit and 2.2 block shortlist each bind on real hidden states."""
     from dataclasses import replace
 
-    _, source, ids, fields = llada_moe_source
+    name, source, ids, fields = llada_moe_source
     model, variables = source.model, source.variables
     mixture = model.mixture
-    original = np.asarray(model.apply(variables, ids[0], **fields))
+
+    def chosen(run_model, run_variables):
+        _, state = run_model.apply(run_variables, ids[0], **fields, mutable=['router'])
+        return {layer: np.sort(np.asarray(values['mlp']['gate']['indices'][0]), axis=-1)
+                for layer, values in state['router'].items()}
+
+    original = chosen(model, variables)
+
+    def differs(run_model, run_variables):
+        changed = chosen(run_model, run_variables)
+        return any(not np.array_equal(original[layer], changed[layer]) for layer in original)
+
     if mixture.bias:
         unbiased = {**variables, 'moe': jax.tree.map(jnp.zeros_like, variables['moe'])}
-        assert not np.array_equal(original, model.apply(unbiased, ids[0], **fields))
+        assert differs(model, unbiased)
     if mixture.groups > 1:
         unlimited = model.clone(mixture=replace(mixture, groups=1, groups_per_token=1))
-        assert not np.array_equal(original, unlimited.apply(variables, ids[0], **fields))
+        assert differs(unlimited, variables)
     if mixture.routing_block is not None:
         unlimited = model.clone(mixture=replace(mixture, block_experts=mixture.experts))
-        assert not np.array_equal(original, unlimited.apply(variables, ids[0], **fields))
+        assert differs(unlimited, variables)
     # Every fixture also distinguishes a causal decoder from the release's attention.
     causal = model.clone(causal=True)
-    assert not np.array_equal(original, causal.apply(variables, ids[0]))
+    forward = jax.jit(lambda tokens: causal.apply(variables, tokens))
+    reference = np.load(FIXTURES / name / 'probe_logits.npy')
+    truth = np.load(FIXTURES / name / 'probe_logits_f64.npy')
+    with pytest.raises(AssertionError):
+        assert_as_exact(lambda seed: forward(ids[int(seed)]), lambda seed: reference[int(seed)],
+                        lambda seed: (np.asarray(seed, np.int32),), name + ' causal negative control',
+                        truth_fn=lambda seed: truth[int(seed)], seeds=8)
 
 
 @pytest.mark.parametrize('derived', [False, True], ids=['source-layout', 'native-layout'])
@@ -919,8 +936,12 @@ def test_llada_moe_trained_exports_reload_and_run(llada_moe_source, tmp_path, de
     assert np.isfinite(loss) and all(np.isfinite(leaf).all() for leaf in jax.tree.leaves(gradients))
     trained = {**variables, 'params': jax.tree.map(lambda p, g: p - 0.01 * g,
                                                  variables['params'], gradients)}
-    assert not np.array_equal(model.apply(variables, ids[0], **fields),
-                              model.apply(trained, ids[0], **fields))
+    before = model.apply(variables, ids[0], **fields)
+    after = model.apply(trained, ids[0], **fields)
+    with pytest.raises(AssertionError):
+        assert_as_exact(lambda seed: after, lambda seed: before,
+                        lambda seed: (np.asarray(seed, np.int32),), name + ' update negative control',
+                        truth_fn=lambda seed: np.asarray(before, np.float64), seeds=8)
     if derived:
         PretrainedDecoder.from_model(model, trained).save(tmp_path)
     else:
