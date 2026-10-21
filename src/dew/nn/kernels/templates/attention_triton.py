@@ -63,6 +63,33 @@ def _whole(count: int, block: int) -> int:
     return -(-count // block) * block
 
 
+def _eligible(ba: tokamax.BoundArguments, target: generation.GpuTarget) -> bool:
+    """Whether a launch runs on `target`: a CUDA GPU, one dtype of `DTYPES` on the queries, keys and
+    values, and bf16 only from `generation.BF16_GPU` on, where Triton compiles its products."""
+    query, key, value = (ba.arguments[name] for name in ("query", "key", "value"))
+    capability = generation.capability(target.generation)
+    return (capability is not None and query.dtype == key.dtype == value.dtype and query.dtype in DTYPES
+            and (query.dtype != jnp.bfloat16 or 10 * capability[0] + capability[1] >= generation.BF16_GPU))
+
+
+def _mode(dtype) -> str:
+    """The arithmetic a launch's products take (`_dot`): IEEE fp32 for fp32 operands, else 16-bit
+    products summed in fp32."""
+    return 'fp32' if dtype == jnp.float32 else '16bit'
+
+
+def _spanned(specs: list[jax.ShapeDtypeStruct], arrays: list[jax.Array]) -> list[jax.Array]:
+    """A launch's timing operands with its spans whole: of its integer operands, the first two each
+    query's first key (0) and one past its last (every key, `specs[1]` being the keys), the rest its
+    documents' ids (one document), so a timed launch visits every tile a dense call does."""
+    integers = [index for index, spec in enumerate(specs) if jnp.issubdtype(spec.dtype, jnp.integer)]
+    keys = specs[1].shape[1]
+    for place, index in enumerate(integers):
+        if place:
+            arrays[index] = jnp.full(specs[index].shape, keys if place == 1 else 1, specs[index].dtype)
+    return arrays
+
+
 def _tile_param(ref, kind: Kind, head, queries: jax.Array, keys: jax.Array | None):
     """A hook parameter's values for a tile, as `kind` lays them out: the head's scalar, the tile's
     queries' `[block_q, 1]`, its keys' `[1, block_k]`, its entries' or its output rows'."""
@@ -216,33 +243,39 @@ class TritonForward(Template[Tiles]):
         return tuple(tiles for tiles in SPACE if queries % tiles.block_q == 0 and keys % tiles.block_k == 0)
 
     def staged_bytes(self, ba: tokamax.BoundArguments, config: Tiles) -> int:
-        """The query tile, and each pipeline stage's key and value tiles, in the operands' dtype."""
+        """The shared memory a program holds: the query tile, and each pipeline stage's key and value
+        tiles, in the operands' dtype."""
         query, value = ba.arguments["query"], ba.arguments["value"]
         size = jnp.dtype(query.dtype).itemsize
         width, value_width = query.shape[-1], value.shape[-1]
         return (config.block_q * width + config.stages * config.block_k * (width + value_width)) * size
 
     def cost(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget) -> float:
-        """Every key tile visited (the spans are traced), each a `block_q` by `block_k` product of the
-        queries with the keys and of the weights with the values, and as many exponentials; the operands
-        read once and the output written once."""
+        """Every key tile of the call (a bound: the spans are traced, so a sparse call visits fewer),
+        each staging its key and value tiles once and taking a `block_q` by `block_k` product of the
+        queries with the keys and of the weights with the values, and as many exponentials; the
+        operands read once, the output written once in their dtype and the residuals in fp32."""
         query, key, value = (ba.arguments[name] for name in ("query", "key", "value"))
         batch, queries, heads, width = query.shape
         keys, value_width = key.shape[1], value.shape[-1]
         tiles = keys // config.block_k
         size = jnp.dtype(query.dtype).itemsize
+        rows = 2 * batch * heads * queries * 4 if ba.arguments.get("residuals") else 0
         return costs.seconds(costs.Cost(
             programs=batch * heads * (queries // config.block_q),
-            device_bytes=(query.size + key.size + value.size + batch * queries * heads * value_width) * size,
+            device_bytes=(query.size + key.size + value.size + batch * queries * heads * value_width) * size
+            + rows,
             program_flops=tiles * 2.0 * config.block_q * config.block_k * (width + value_width),
-            program_staged=float(self.staged_bytes(ba, config)) * tiles,
+            program_staged=float(config.block_q * width * size
+                                 + tiles * config.block_k * (width + value_width) * size),
             program_exponentials=float(tiles * config.block_q * config.block_k),
-            mode='tf32' if query.dtype == jnp.float32 else '16bit'), target)
+            mode=_mode(query.dtype)), target)
 
     def eligible(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> bool:
-        query, key, value = (ba.arguments[name] for name in ("query", "key", "value"))
-        return (generation.capability(target.generation) is not None
-                and query.dtype == key.dtype == value.dtype and query.dtype in DTYPES)
+        return _eligible(ba, target)
+
+    def operands(self, specs: list[jax.ShapeDtypeStruct], seed: int) -> list[jax.Array]:
+        return _spanned(specs, super().operands(specs, seed))
 
 
 def _param_spec(kind: Kind, param: jax.Array, block_q: int, keys: int) -> pl.BlockSpec:
@@ -279,49 +312,81 @@ def _padded(param: Param, queries: int, keys: int, value_width: int) -> jax.Arra
                                    (0, value_width - value.shape[3])))
 
 
+@dataclasses.dataclass(frozen=True)
+class _Padded:
+    """A call at the launches' padded shapes (`_padded_call`): its queries and keys at whole blocks of
+    the largest tile (at least one, so a call of no keys still has a tile to trace), its head widths at
+    powers of two, its spans' rows and its score and output hooks' parameters alike; the padding is
+    unread and sliced off."""
+
+    query: jax.Array
+    key: jax.Array
+    value: jax.Array
+    start: jax.Array
+    end: jax.Array
+    query_ids: jax.Array | None
+    key_ids: jax.Array | None
+    score_params: tuple[jax.Array, ...]
+    output_params: tuple[jax.Array, ...]
+    queries: int
+    keys: int
+
+    def rows(self, array: jax.Array, fill: float = 0.0) -> jax.Array:
+        """A `[B, H, Q, ...]` row statistic at the padded queries."""
+        pad = [(0, 0), (0, 0), (0, self.query.shape[1] - array.shape[2]), *[(0, 0)] * (array.ndim - 3)]
+        return jnp.pad(array, pad, constant_values=fill)
+
+
+def _padded_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
+                 hooks: Hooks) -> _Padded:
+    """`forward`'s and `backward`'s one padding of a call (`_Padded`)."""
+    queries, width = query.shape[1], query.shape[3]
+    keys, value_width = key.shape[1], value.shape[-1]
+    block = max(max(tiles.block_q for tiles in SPACE), max(tiles.block_k for tiles in SPACE))
+    padded_q, padded_k = _whole(max(queries, 1), block), _whole(max(keys, 1), block)
+    padded_d, padded_dv = _power(width), _power(value_width)
+
+    def pad(array, rows, columns):
+        return jnp.pad(array, ((0, 0), (0, rows - array.shape[1]), (0, 0), (0, columns - array.shape[3])))
+
+    def pad_rows(array, rows):
+        return None if array is None else jnp.pad(array, ((0, 0), (0, rows - array.shape[1])))
+
+    return _Padded(pad(query, padded_q, padded_d), pad(key, padded_k, padded_d),
+                   pad(value, padded_k, padded_dv), pad_rows(spans.start, padded_q),
+                   pad_rows(spans.end, padded_q), pad_rows(spans.query_ids, padded_q),
+                   pad_rows(spans.key_ids, padded_k),
+                   tuple(_padded(param, padded_q, padded_k, padded_dv) for param in hooks.score_params),
+                   tuple(_padded(param, padded_q, padded_k, padded_dv) for param in hooks.output_params),
+                   queries, keys)
+
+
 def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None,
             *, scale: float | None = None, residuals: bool = False, interpret: bool = False):
     """The template's forward (`TritonForward`) on `query` `[B, Q, H, D]` over `key` and `value`
     `[B, K, Hk, D]` and `[B, K, Hk, Dv]` and the keys `spans` leaves each query: as
     `dew.nn.kernels.templates.attention.reference` computes it, with `residuals` its running maxima and
     denominators `[B, H, Q]` too. The operands pad to whole blocks of the largest tile and to power-of-two
-    head widths; the padding is unread and sliced off. `interpret` runs it on the CPU."""
+    head widths (`_padded_call`). `interpret` runs it on the CPU."""
     hooks = Hooks() if hooks is None else hooks
-    queries, width = query.shape[1], query.shape[3]
-    keys, value_width = key.shape[1], value.shape[-1]
-    block = max(max(tiles.block_q for tiles in SPACE), max(tiles.block_k for tiles in SPACE))
-    padded_q, padded_k = _whole(queries, block), _whole(keys, block)
-    padded_d, padded_dv = _power(width), _power(value_width)
-
-    def pad(array, rows, columns):
-        return jnp.pad(array, ((0, 0), (0, rows - array.shape[1]), (0, 0), (0, columns - array.shape[3])))
-
-    def pad_rows(array, rows, fill=0):
-        return None if array is None else jnp.pad(array, ((0, 0), (0, rows - array.shape[1])),
-                                                    constant_values=fill)
-
+    call = _padded_call(query, key, value, spans, hooks)
+    queries, value_width = call.queries, value.shape[-1]
     initial = hooks.initial
     m0 = total0 = acc0 = None
     if initial is not None:
-        m0 = jnp.pad(initial.m, ((0, 0), (0, 0), (0, padded_q - queries)), constant_values=-jnp.inf)
-        total0 = jnp.pad(initial.total, ((0, 0), (0, 0), (0, padded_q - queries)))
-        acc0 = jnp.pad(initial.acc, ((0, 0), (0, 0), (0, padded_q - queries), (0, padded_dv - value_width)))
+        m0, total0 = call.rows(initial.m, -jnp.inf), call.rows(initial.total)
+        acc0 = jnp.pad(call.rows(initial.acc), ((0, 0),) * 3 + ((0, call.value.shape[-1] - value_width),))
     op = TritonForward(score_mod=hooks.score_mod, output_mod=hooks.output_mod,
                        score_kinds=tuple(param.kind for param in hooks.score_params),
                        output_kinds=tuple(param.kind for param in hooks.output_params),
-                       scale=width ** -0.5 if scale is None else scale)
-    out = op(pad(query, padded_q, padded_d), pad(key, padded_k, padded_d), pad(value, padded_k, padded_dv),
-             pad_rows(spans.start, padded_q), pad_rows(spans.end, padded_q),
-             pad_rows(spans.query_ids, padded_q), pad_rows(spans.key_ids, padded_k),
-             tuple(_padded(param, padded_q, padded_k, padded_dv) for param in hooks.score_params),
-             tuple(_padded(param, padded_q, padded_k, padded_dv) for param in hooks.output_params),
-             m0, total0, acc0, residuals=residuals, interpret=interpret)
+                       scale=query.shape[3] ** -0.5 if scale is None else scale)
+    out = op(call.query, call.key, call.value, call.start, call.end, call.query_ids, call.key_ids,
+             call.score_params, call.output_params, m0, total0, acc0, residuals=residuals,
+             interpret=interpret)
     if not residuals:
         return out[:, :queries, :, :value_width]
     out, peak, total = out
     return out[:, :queries, :, :value_width], peak[:, :, :queries], total[:, :, :queries]
-
-
 
 
 DQ_GRADS = (Kind.HEAD, Kind.QUERY, Kind.TILE)
@@ -336,11 +401,40 @@ def _probabilities(logits: jax.Array, peak: jax.Array, total: jax.Array) -> jax.
     return jnp.exp(logits - peak[:, None]) * inverse[:, None]
 
 
-def _scored(score_mod, logits, q_pos, k_pos, params):
-    """`score_mod` on the scaled logits and its pullback, over the logits and each parameter."""
+def _scored(score_mod, logits, q_pos, k_pos, params, *, slopes: bool):
+    """`score_mod` on the scaled logits and, with `slopes`, each entry's derivative of it along the
+    logits and along each parameter, a tile apiece: `score_mod` being pointwise in the entries, they are
+    the whole of its pullback (`_pulled`), each parameter in the layout its hook takes. Without a hook,
+    the logits and no slopes."""
     if score_mod is None:
-        return logits, lambda cotangent: (cotangent,)
-    return jax.vjp(lambda s, *values: score_mod(s, q_pos, k_pos, *values), logits, *params)
+        return logits, None
+    if not slopes:
+        return score_mod(logits, q_pos, k_pos, *params), None
+    inputs = (logits, *params)
+    out, linear = jax.linearize(lambda s, *values: score_mod(s, q_pos, k_pos, *values), *inputs)
+
+    def along(index):
+        return linear(*(jnp.ones_like(x) if place == index else jnp.zeros_like(x)
+                        for place, x in enumerate(inputs))).astype(jnp.float32)
+
+    return out, tuple(jnp.broadcast_to(along(index), logits.shape) for index in range(len(inputs)))
+
+
+def _pulled(cotangents, slopes, seen, kinds: tuple[Kind, ...]):
+    """The score cotangents `cotangents` through `score_mod`, its entries' derivatives `slopes`
+    (`_scored`; None without a hook): the logits' tile, and each parameter's, a head's or a query's its
+    queries' sums `[block_q]`, a key's its keys' `[block_k]`, a tile's the tile. Each entry is masked
+    before any sum, so one the call never sees (padding, another document) adds nothing even where the
+    hook's derivative there is not finite. fp32."""
+    if slopes is None:
+        return cotangents, ()
+    logits = jnp.where(seen, cotangents * slopes[0], 0.0)
+    pieces = []
+    for slope, kind in zip(slopes[1:], kinds, strict=True):
+        entries = jnp.where(seen, cotangents * slope, 0.0)
+        pieces.append(entries.sum(axis=0) if kind == Kind.KEY else entries if kind == Kind.TILE
+                      else entries.sum(axis=-1))
+    return logits, tuple(pieces)
 
 
 def _key_param(ref, kind: Kind, head, rows):
@@ -359,30 +453,24 @@ def _key_param(ref, kind: Kind, head, rows):
             raise ValueError("an output hook's parameter has no score tile")
 
 
-def _tile_logits(score_mod, query, key, seen, q_pos, k_pos, params, *, scale: float, interpret: bool):
-    """A tile's scaled logits under `score_mod`, -inf where unseen, and the pullback through `score_mod`,
-    over the scaled logits and each parameter."""
-    logits, pull = _scored(score_mod, _dot(query, key.T, interpret) * scale, q_pos, k_pos, params)
-    return jnp.where(seen, logits, -jnp.inf), pull
-
-
-def _tile_products(score_mod, query, key, value, dout, peak, total, seen, q_pos, k_pos, params, *,
-                   scale: float, interpret: bool):
-    """A tile's weights `p`, the output gradient's products with its values `dP = dO V^T`, and the
-    pullback through `score_mod`, over the scaled logits and each parameter."""
-    logits, pull = _tile_logits(score_mod, query, key, seen, q_pos, k_pos, params, scale=scale,
-                                interpret=interpret)
-    return _probabilities(logits, peak, total), _dot(dout, value.T, interpret), pull
+def _tile_logits(score_mod, query, key, seen, q_pos, k_pos, params, *, scale: float, interpret: bool,
+                 slopes: bool = False):
+    """A tile's scaled logits under `score_mod`, -inf where unseen, and with `slopes` its entries'
+    derivatives (`_scored`)."""
+    logits, derivatives = _scored(score_mod, _dot(query, key.T, interpret) * scale, q_pos, k_pos, params,
+                                  slopes=slopes)
+    return jnp.where(seen, logits, -jnp.inf), derivatives
 
 
 def _tile_scores(score_mod, query, key, value, dout, peak, total, anchor, delta, seen, q_pos, k_pos, params,
                  *, scale: float, interpret: bool):
-    """A tile's backward through its scores: its weights, the masked score cotangents
-    `p * ((dP - c) - (D - c))`, `c` each query's `anchor` and `delta` its `D - c`, and the pullback
-    through `score_mod`, over the scaled logits and each parameter."""
-    weights, products, pull = _tile_products(score_mod, query, key, value, dout, peak, total, seen, q_pos,
-                                             k_pos, params, scale=scale, interpret=interpret)
-    return weights, jnp.where(seen, weights * ((products - anchor[:, None]) - delta[:, None]), 0.0), pull
+    """A tile's backward through its scores: its weights `p`, the masked score cotangents
+    `p * ((dP - c) - (D - c))`, `dP = dO V^T`, `c` each query's `anchor` and `delta` its `D - c`, and
+    the entries' derivatives through `score_mod` (`_scored`)."""
+    logits, slopes = _tile_logits(score_mod, query, key, seen, q_pos, k_pos, params, scale=scale,
+                                  interpret=interpret, slopes=True)
+    weights, products = _probabilities(logits, peak, total), _dot(dout, value.T, interpret)
+    return weights, jnp.where(seen, weights * ((products - anchor[:, None]) - delta[:, None]), 0.0), slopes
 
 
 def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tuple[Kind, ...], score_mod,
@@ -395,7 +483,7 @@ def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tu
     # A tile parameter's gradient enters as its zeros, aliased to its output (`TritonDq`).
     for _ in (kind for kind in score_kinds if kind == Kind.TILE):
         refs.pop(0)
-    dq_ref, delta_ref, anchor_ref, peak_out_ref, total_out_ref, *outputs = refs
+    dq_ref, delta_ref, anchor_ref, peak_out_ref, total_out_ref, shift_ref, *outputs = refs
     grad_refs = [outputs.pop(0) if kind in DQ_GRADS else None for kind in score_kinds]
     block_q = query_ref.shape[0]
     head = pl.program_id(2)
@@ -411,9 +499,7 @@ def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tu
         seen = (k_pos >= start[:, None]) & (k_pos < end[:, None])
         if ids:
             seen &= query_ids[:, None] == key_ids_ref[keys][None, :]
-        # A head's scalar over the tile's queries, so its pullbacks sum each query's own (`step`).
-        params = [jnp.broadcast_to(_tile_param(ref, kind, head, q_pos, keys), (block_q, 1))
-                  if kind == Kind.HEAD else _tile_param(ref, kind, head, q_pos, keys)
+        params = [_tile_param(ref, kind, head, q_pos, keys)
                   for ref, kind in zip(score_refs, score_kinds, strict=True)]
         return keys, k_pos, seen, params
 
@@ -453,19 +539,21 @@ def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tu
         dq, residual, mass, grads, weighed = carry
         keys, k_pos, seen, params = tile(index)
         key, value = key_ref[keys, :], value_ref[keys, :]
-        weights, cotangents, pull = _tile_scores(score_mod, query, key, value, dout, peak, total, anchor,
-                                                 delta, seen, q_pos, k_pos, params, scale=scale,
-                                                 interpret=interpret)
-        pulled = pull(cotangents)
-        dq = dq + _dot(pulled[0].astype(key.dtype), key, interpret) * scale
-        for kind, ref, piece in zip(score_kinds, grad_refs, pulled[1:], strict=True):
+        weights, cotangents, slopes = _tile_scores(score_mod, query, key, value, dout, peak, total, anchor,
+                                                   delta, seen, q_pos, k_pos, params, scale=scale,
+                                                   interpret=interpret)
+        logits, pieces = _pulled(cotangents, slopes, seen, score_kinds)
+        # Scaled before it narrows to the operands' dtype, so fp16 holds what fp32 does.
+        dq = dq + _dot((logits * scale).astype(key.dtype), key, interpret)
+        for kind, ref, piece in zip(score_kinds, grad_refs, pieces, strict=True):
             if kind == Kind.TILE:
                 ref[:, keys] = piece
-        grads = tuple(grad + jnp.sum(piece, axis=-1) if row else grad
-                      for grad, row, piece in zip(grads, summed, pulled[1:], strict=True))
+        grads = tuple(grad + piece if row else grad for grad, row, piece in zip(grads, summed, pieces,
+                                                                               strict=True))
         if any(summed):
-            weighed = tuple(sums + jnp.sum(piece, axis=-1) if row else sums
-                            for sums, row, piece in zip(weighed, summed, pull(weights)[1:], strict=True))
+            _, pieces = _pulled(weights, slopes, seen, score_kinds)
+            weighed = tuple(sums + piece if row else sums for sums, row, piece in zip(weighed, summed, pieces,
+                                                                                    strict=True))
         return (dq, residual + cotangents.sum(axis=-1), mass + weights.sum(axis=-1), grads, weighed)
 
     nothing = jnp.zeros((block_q,), jnp.float32)
@@ -480,9 +568,9 @@ def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tu
     # parameters' (by the pullbacks of the weights, `weighed`) take the D whose cotangents do.
     inverse = jnp.where(total > 0, 1.0 / jnp.where(total > 0, total, 1.0), 0.0)
     carried = jnp.where(peak0 == -jnp.inf, 0.0, jnp.exp(peak0 - peak)) * inverse
-    residual = residual + (shares[1] - shares[0] * (anchor + delta)) * carried
-    mass = mass + shares[0] * carried
-    refined = jnp.where(mass > 0, residual / jnp.where(mass > 0, mass, 1.0), 0.0)
+    whole_residual = residual + (shares[1] - shares[0] * (anchor + delta)) * carried
+    whole_mass = mass + shares[0] * carried
+    refined = jnp.where(whole_mass > 0, whole_residual / jnp.where(whole_mass > 0, whole_mass, 1.0), 0.0)
     delta = delta + refined
     grads = tuple(grad - refined * sums if row else grad
                   for grad, row, sums in zip(grads, summed, weighed, strict=True))
@@ -490,6 +578,9 @@ def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tu
     anchor_ref[...] = anchor
     peak_out_ref[...] = peak
     total_out_ref[...] = total
+    # The initial maximum's cotangent: by the softmax's shift, less the keys' score cotangents under the
+    # refined D, so a query that read no key leaves it exactly 0.
+    shift_ref[...] = refined * mass - residual
     for grad, kind, ref in zip(grads, score_kinds, grad_refs, strict=True):
         if kind == Kind.HEAD:
             ref[...] = jnp.broadcast_to(jnp.sum(grad), ref.shape)
@@ -522,14 +613,15 @@ def _dkv_kernel(ranges_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: t
             seen &= query_ids_ref[rows][:, None] == key_ids[None, :]
         params = [_key_param(ref, kind, head, rows)
                   for ref, kind in zip(score_refs, score_kinds, strict=True)]
-        weights, cotangents, pull = _tile_scores(score_mod, query, key, value, dout, peak_ref[rows],
-                                                 total_ref[rows], anchor_ref[rows], delta_ref[rows], seen,
-                                                 q_pos, k_pos, params, scale=scale, interpret=interpret)
-        pulled = pull(cotangents)
+        weights, cotangents, slopes = _tile_scores(score_mod, query, key, value, dout, peak_ref[rows],
+                                                   total_ref[rows], anchor_ref[rows], delta_ref[rows], seen,
+                                                   q_pos, k_pos, params, scale=scale, interpret=interpret)
+        logits, pieces = _pulled(cotangents, slopes, seen, score_kinds)
         dv = dv + _dot(weights.astype(dout.dtype).T, dout, interpret)
-        dk = dk + _dot(pulled[0].astype(query.dtype).T, query, interpret) * scale
-        updated = [grad + jnp.sum(piece, axis=0) if kind == Kind.KEY else grad
-                   for grad, kind, piece in zip(grads, score_kinds, pulled[1:], strict=True)]
+        # Scaled before it narrows to the operands' dtype, so fp16 holds what fp32 does.
+        dk = dk + _dot((logits * scale).astype(query.dtype).T, query, interpret)
+        updated = [grad + piece if kind == Kind.KEY else grad
+                   for grad, kind, piece in zip(grads, score_kinds, pieces, strict=True)]
         return dk, dv, *updated
 
     sums = [jnp.zeros((block_k,), jnp.float32) if kind == Kind.KEY else jnp.zeros((), jnp.float32)
@@ -562,40 +654,54 @@ class _Backward(Template[Tiles]):
         return tuple(tiles for tiles in SPACE if queries % tiles.block_q == 0 and keys % tiles.block_k == 0)
 
     def staged_bytes(self, ba: tokamax.BoundArguments, config: Tiles) -> int:
-        """Each stage's query, output-gradient, key and value tiles, in the operands' dtype."""
+        """The shared memory a program holds: each stage's query, output-gradient, key and value tiles,
+        in the operands' dtype."""
         query, value = ba.arguments["query"], ba.arguments["value"]
         size = jnp.dtype(query.dtype).itemsize
         width, value_width = query.shape[-1], value.shape[-1]
         return config.stages * (config.block_q + config.block_k) * (width + value_width) * size
 
     def cost(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget) -> float:
-        """Every tile visited, each taking the launch's products and exponentials (`_work`); the operands
-        read once and the gradients written once."""
+        """Every tile of the call (a bound: the spans are traced, so a sparse call visits fewer), each
+        staging the tiles it walks once (`_walked`) and taking the launch's products and exponentials
+        (`_work`); the operands and row statistics read once and the launch's outputs written once
+        (`_written`)."""
         query, key, value = (ba.arguments[name] for name in ("query", "key", "value"))
         batch, queries, heads, width = query.shape
         keys, value_width = key.shape[1], value.shape[-1]
         size = jnp.dtype(query.dtype).itemsize
         programs, tiles = self._programs(batch, heads, queries, keys, config)
         products, exponentials = self._work(width, value_width)
+        statistics = sum(array.size for name, array in ba.arguments.items()
+                         if name in ("peak", "total", "initial_term", "anchor", "delta")) * 4
         return costs.seconds(costs.Cost(
             programs=programs,
-            device_bytes=(2 * query.size + key.size + value.size
-                          + batch * queries * heads * value_width) * size,
+            device_bytes=(2 * query.size + key.size + value.size) * size + statistics
+            + self._written(batch, queries, keys, heads, width, value_width),
             program_flops=tiles * 2.0 * config.block_q * config.block_k * products,
-            program_staged=float(self.staged_bytes(ba, config)) * tiles,
+            program_staged=float(tiles * self._walked(config, width, value_width) * size),
             program_exponentials=float(tiles * config.block_q * config.block_k * exponentials),
-            mode='tf32' if query.dtype == jnp.float32 else '16bit'), target)
+            mode=_mode(query.dtype)), target)
 
     def eligible(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> bool:
-        query, key, value = (ba.arguments[name] for name in ("query", "key", "value"))
-        return (generation.capability(target.generation) is not None
-                and query.dtype == key.dtype == value.dtype and query.dtype in DTYPES)
+        return _eligible(ba, target)
+
+    def operands(self, specs: list[jax.ShapeDtypeStruct], seed: int) -> list[jax.Array]:
+        return _spanned(specs, super().operands(specs, seed))
 
     def _programs(self, batch: int, heads: int, queries: int, keys: int, config: Tiles) -> tuple[int, int]:
         raise NotImplementedError
 
     def _work(self, width: int, value_width: int) -> tuple[int, int]:
         """Each score entry's multiply-adds and exponentials over the launch's passes."""
+        raise NotImplementedError
+
+    def _walked(self, config: Tiles, width: int, value_width: int) -> int:
+        """The operand entries a program stages a tile."""
+        raise NotImplementedError
+
+    def _written(self, batch: int, queries: int, keys: int, heads: int, width: int, value_width: int) -> int:
+        """The bytes the launch writes, fp32."""
         raise NotImplementedError
 
 
@@ -619,6 +725,14 @@ class TritonDq(_Backward):
     def _work(self, width, value_width):
         # The first pass's logits and dP, then the main pass's again and dS K.
         return 3 * width + 2 * value_width, 2
+
+    def _walked(self, config, width, value_width):
+        # Each key and value tile, once a pass.
+        return 2 * config.block_k * (width + value_width)
+
+    def _written(self, batch, queries, keys, heads, width, value_width):
+        # dQ and five row statistics.
+        return 4 * batch * queries * heads * (width + 5)
 
     def _fwd(self, query, key, value, dout, peak, total, initial_term, start, end, query_ids, key_ids,
              score_params, *, interpret: bool, config: Tiles, return_residuals: bool = False):
@@ -646,9 +760,9 @@ class TritonDq(_Backward):
             in_specs.append(_param_spec(kind, param, block_q, keys))
             arrays.append(param)
         out_shape = [jax.ShapeDtypeStruct(query.shape, jnp.float32),
-                     *[jax.ShapeDtypeStruct((batch, heads, queries), jnp.float32)] * 4]
+                     *[jax.ShapeDtypeStruct((batch, heads, queries), jnp.float32)] * 5]
         out_specs = [pl.BlockSpec((None, block_q, None, width), lambda i, b, h: (b, i, h, 0)),
-                     *[per_head] * 4]
+                     *[per_head] * 5]
         aliases = {}
         for param, kind in zip(score_params, self.score_kinds, strict=True):
             match kind:
@@ -692,6 +806,14 @@ class TritonDkv(_Backward):
     def _work(self, width, value_width):
         # The logits, dP, P^T dO and dS^T Q.
         return 2 * width + 2 * value_width, 1
+
+    def _walked(self, config, width, value_width):
+        # Each query and output-gradient tile.
+        return config.block_q * (width + value_width)
+
+    def _written(self, batch, queries, keys, heads, width, value_width):
+        # dK and dV of every query head, before their groups sum.
+        return 4 * batch * keys * heads * (width + value_width)
 
     def _fwd(self, query, key, value, dout, peak, total, anchor, delta, start, end, query_ids, key_ids,
              score_params, *, interpret: bool, config: Tiles, return_residuals: bool = False):
@@ -785,43 +907,33 @@ def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
     batch, queries, heads, width = query.shape
     keys, kv_heads, value_width = key.shape[1], key.shape[2], value.shape[-1]
     group = heads // kv_heads
-    block = max(max(tiles.block_q for tiles in SPACE), max(tiles.block_k for tiles in SPACE))
-    padded_q, padded_k = _whole(queries, block), _whole(keys, block)
-    padded_d, padded_dv = _power(width), _power(value_width)
     scale = width ** -0.5 if scale is None else scale
+    # One cotangent for every part: the output's, in the operands' dtype as the reference takes it.
+    dout = dout.astype(query.dtype)
     cotangent = jnp.swapaxes(dout.astype(jnp.float32), 1, 2)
     state = hooks.initial
     if state is None:
         nothing = jnp.zeros((batch, heads, queries), jnp.float32)
         starts = nothing - jnp.inf, nothing, nothing
     else:
-        # The softmax's initial state: its maximum, denominator and share of D's numerator.
+        # The softmax's initial state: its maximum, denominator and share of D's numerator, in fp32.
         starts = (state.m.astype(jnp.float32), state.total.astype(jnp.float32),
-                  jnp.sum(state.acc * cotangent, axis=-1))
-
-    def pad(array, rows, columns):
-        return jnp.pad(array, ((0, 0), (0, rows - array.shape[1]), (0, 0), (0, columns - array.shape[3])))
-
-    def pad_rows(array, rows):
-        return None if array is None else jnp.pad(array, ((0, 0), (0, rows - array.shape[1])))
-
-    def pad_heads(array):
-        return jnp.pad(array, ((0, 0), (0, 0), (0, padded_q - queries)))
-
-    operands = (pad(query, padded_q, padded_d), pad(key, padded_k, padded_d), pad(value, padded_k, padded_dv),
-                pad(dout.astype(query.dtype), padded_q, padded_dv))
-    rows = (pad_rows(spans.start, padded_q), pad_rows(spans.end, padded_q),
-            pad_rows(spans.query_ids, padded_q), pad_rows(spans.key_ids, padded_k),
-            tuple(_padded(param, padded_q, padded_k, padded_dv) for param in hooks.score_params))
+                  jnp.sum(state.acc.astype(jnp.float32) * cotangent, axis=-1))
+    call = _padded_call(query, key, value, spans, hooks)
+    padded_dout = jnp.pad(dout, ((0, 0), (0, call.query.shape[1] - queries), (0, 0),
+                                 (0, call.value.shape[-1] - value_width)))
+    operands = (call.query, call.key, call.value, padded_dout)
+    rows = (call.start, call.end, call.query_ids, call.key_ids, call.score_params)
     kinds = tuple(param.kind for param in hooks.score_params)
     dq, *softmax = TritonDq(score_mod=hooks.score_mod, score_kinds=kinds, scale=scale)(
-        *operands, *(pad_heads(start) for start in starts), *rows, interpret=interpret)
-    softmax, dq_grads = softmax[:4], softmax[4:]
-    padded_delta, padded_anchor, padded_peak, padded_total = softmax
+        *operands, *(call.rows(start) for start in starts), *rows, interpret=interpret)
+    softmax, dq_grads = softmax[:5], softmax[5:]
+    padded_delta, padded_anchor, padded_peak, padded_total, _ = softmax
     dk, dv, *key_grads = TritonDkv(score_mod=hooks.score_mod, score_kinds=kinds, scale=scale)(
         *operands, padded_peak, padded_total, padded_anchor, padded_delta, *rows, interpret=interpret)
-    delta, anchor, peak, total = (array[:, :, :queries] for array in softmax)
+    delta, anchor, peak, total, shift = (array[:, :, :queries] for array in softmax)
     delta = anchor + delta
+    padded_k, padded_d, padded_dv = call.key.shape[1], call.key.shape[-1], call.value.shape[-1]
     dk = dk.reshape(batch, padded_k, kv_heads, group, padded_d).sum(axis=3)
     dv = dv.reshape(batch, padded_k, kv_heads, group, padded_dv).sum(axis=3)
     grads = []
@@ -840,10 +952,10 @@ def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
     initial = None
     if state is not None:
         # The initial state as one more softmax term: its weight exp(m0 - m) / T, its value acc0 / total0.
-        weight = jnp.where((total > 0) & jnp.isfinite(state.m),
-                           jnp.exp(state.m - peak) / jnp.where(total > 0, total, 1.0), 0.0)
-        initial = Initial(m=weight * (jnp.sum(state.acc * cotangent, axis=-1) - state.total * delta),
-                          total=-weight * delta, acc=weight[..., None] * cotangent)
+        weight = jnp.where((total > 0) & jnp.isfinite(starts[0]),
+                           jnp.exp(starts[0] - peak) / jnp.where(total > 0, total, 1.0), 0.0)
+        initial = Initial(m=shift.astype(state.m.dtype), total=(-weight * delta).astype(state.total.dtype),
+                          acc=(weight[..., None] * cotangent).astype(state.acc.dtype))
     return Gradients(dq[:, :queries, :, :width].astype(query.dtype),
                      dk[:, :keys, :, :width].astype(key.dtype),
                      dv[:, :keys, :, :value_width].astype(value.dtype),

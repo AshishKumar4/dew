@@ -96,7 +96,8 @@ class GpuTarget:
     canonical device's boost clock and device-memory bytes per second, and
     `tensor_rates` the generation's dense tensor-core FLOPs per clock per
     multiprocessor by arithmetic mode ('16bit': fp16 or bf16 operands summed in
-    fp32; 'tf32'), which a kernel's cost model reads
+    fp32; 'tf32'; 'fp32': IEEE fp32 on the CUDA cores, the rate a dot at
+    Precision.HIGHEST takes), which a kernel's cost model reads
     (`dew.nn.kernels.templates.cost`). This table is the one place a choice is
     keyed on the hardware generation; any other code reads its facts, a library's
     support rule the compute capability (`capability`), and a launch config the
@@ -141,11 +142,12 @@ class GpuTarget:
         """Dense tensor-core FLOPs per clock per multiprocessor in arithmetic `mode`, or None where
         the generation states none: the generation's, lowered where the SKU's catalogued dense bf16 peak
         is below what its multiprocessors and clock give at that rate, as a GeForce part's half-rate
-        fp32 accumulation reads. A part reporting fewer multiprocessors than its catalogue counts (a
-        MIG slice) keeps the generation's rate: the catalogue never raises it."""
+        fp32 accumulation reads; IEEE fp32 on the CUDA cores keeps its rate. A part reporting fewer
+        multiprocessors than its catalogue counts (a MIG slice) keeps the generation's rate: the
+        catalogue never raises it."""
         rate = self.tensor_rates.get(mode)
         peak = self.bf16_peak
-        if rate is None or not (peak and self.multiprocessors and self.clock_hz):
+        if rate is None or mode == 'fp32' or not (peak and self.multiprocessors and self.clock_hz):
             return rate
         return rate * min(1.0, peak / (self.tensor_rates['16bit'] * self.multiprocessors * self.clock_hz))
 
@@ -171,7 +173,10 @@ class GpuTarget:
 # boost clock: A100 312 TF bf16 -> 2048, TF32 156 -> 1024; A10 125/62.5 -> 1024/512; L4 121/60 ->
 # 1024/512; H100 SXM 989/495 -> 4096/2048; RTX PRO 6000 Blackwell Server 500/250 -> 1024/512.
 # GeForce parts of sm86 and sm89 sum 16-bit products in fp32 at half that rate (the GA102 and Ada
-# whitepapers); their generation's row states the data-center rate.
+# whitepapers); their generation's row states the data-center rate. IEEE fp32 runs an FMA a CUDA-core
+# lane a clock: 64 lanes an SM on GA100 -> 128 (A100 19.5 TF over 108 SMs x 1410 MHz), 128 on GA10x,
+# AD10x, GH100 and GB20x -> 256 (A10 31.2 TF over 72 x 1695 MHz, L4 30.3 TF over 58 x 2040 MHz; the
+# GH100 and Blackwell whitepapers' 128 fp32 lanes an SM).
 # Opted-in shared memory per block, in KiB: Turing64, A100163, Ampere/Ada/RTX
 # Blackwell99, Hopper227. The SM reservation is already excluded:
 # https://docs.nvidia.com/cuda/ampere-tuning-guide/index.html
@@ -200,17 +205,18 @@ TARGETS = {target.generation: target for target in (
                'gated_delta_rule': 'fla', 'ssd': 'pallas'},
               {'NVIDIA A100': {'bf16': 312e12}}, ('gpu:a100', 'a100'), head_tile=(4096, 8192),
               multiprocessors=108, clock_hz=1410e6, memory_bandwidth=2039e9,
-              tensor_rates={'16bit': 2048, 'tf32': 1024}),
+              tensor_rates={'16bit': 2048, 'tf32': 1024, 'fp32': 128}),
     GpuTarget('sm86', 'NVIDIA A10', 99 * 1024, {'attention_narrow': 'flash'},
               {'NVIDIA A10': {}, 'NVIDIA GeForce RTX 3090': {'bf16': 71e12}}, multiprocessors=72,
-              clock_hz=1695e6, memory_bandwidth=600e9, tensor_rates={'16bit': 1024, 'tf32': 512}),
+              clock_hz=1695e6, memory_bandwidth=600e9,
+              tensor_rates={'16bit': 1024, 'tf32': 512, 'fp32': 256}),
     GpuTarget('sm89', 'NVIDIA L4', 99 * 1024,
               {'attention': 'flash', 'attention_window': 'flash', 'attention_sinks': 'flash',
                'xla_triton_gemm': 'off', 'gated_delta_rule': 'fla'},
               {'NVIDIA L4': {'bf16': 121e12, 'fp8': 242.5e12},
                'NVIDIA GeForce RTX 4080': {'bf16': 97.5e12}}, ('gpu:l4', 'l4'), head_tile=(4096, 8192),
               multiprocessors=58, clock_hz=2040e6, memory_bandwidth=300e9,
-              tensor_rates={'16bit': 1024, 'tf32': 512}),
+              tensor_rates={'16bit': 1024, 'tf32': 512, 'fp32': 256}),
     GpuTarget('sm90', 'NVIDIA H100 80GB HBM3', 227 * 1024,
               {'attention': 'flash', 'attention_narrow': 'flash', 'attention_window': 'flash',
                'attention_sinks': 'flash', 'attention_packed': 'flash', 'xla_triton_gemm': 'off',
@@ -221,12 +227,13 @@ TARGETS = {target.generation: target for target in (
         'NVIDIA H100 NVL': {'bf16': 835e12, 'fp8': 1670.5e12},
         'NVIDIA H200': {'bf16': 989e12, 'fp8': 1979e12},
         'NVIDIA H200 NVL': {'bf16': 835e12, 'fp8': 1670.5e12}}, wgmma=True, multiprocessors=132,
-              clock_hz=1830e6, memory_bandwidth=3350e9, tensor_rates={'16bit': 4096, 'tf32': 2048}),
+              clock_hz=1830e6, memory_bandwidth=3350e9,
+              tensor_rates={'16bit': 4096, 'tf32': 2048, 'fp32': 256}),
     GpuTarget('sm120', 'NVIDIA RTX PRO 6000 Blackwell Server Edition', 99 * 1024,
               {'attention': 'flash', 'gated_delta_rule': 'fla'},
               dense_peaks={'NVIDIA RTX PRO 6000 Blackwell': {'bf16': 500e12, 'fp8': 1000e12}},
               aliases=('gpu:g4', 'g4'), multiprocessors=188, clock_hz=2617e6, memory_bandwidth=1792e9,
-              tensor_rates={'16bit': 1024, 'tf32': 512}),
+              tensor_rates={'16bit': 1024, 'tf32': 512, 'fp32': 256}),
     GpuTarget('v2', 'TPU v2', dense_peaks={'TPU v2': {'bf16': 22.5e12}}),
     GpuTarget('v3', 'TPU v3', dense_peaks={'TPU v3': {'bf16': 61.5e12}}),
     GpuTarget('v4', 'TPU v4', dense_peaks={'TPU v4': {'bf16': 275e12}}),
