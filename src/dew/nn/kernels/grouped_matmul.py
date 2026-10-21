@@ -146,12 +146,12 @@ class Hooks:
     epilogue_broadcast: tuple = ()
 
     def before(self):
-        """The prologue as a kernel traces it: on the squeezed side tiles."""
-        return _unsqueezing(self.prologue, self.prologue_broadcast)
+        """The prologue as a kernel traces it: on the squeezed side tiles, lowerable (`_lowerable`)."""
+        return _lowerable(_unsqueezing(self.prologue, self.prologue_broadcast))
 
     def after(self):
-        """The epilogue as a kernel traces it: on the squeezed side tiles."""
-        return _unsqueezing(self.epilogue, self.epilogue_broadcast)
+        """The epilogue as a kernel traces it: on the squeezed side tiles, lowerable (`_lowerable`)."""
+        return _lowerable(_unsqueezing(self.epilogue, self.epilogue_broadcast))
 
     def kernel_options(self) -> dict:
         return {'prologue': self.before(), 'prologue_axes': self.prologue_axes, 'epilogue': self.after(),
@@ -169,6 +169,62 @@ def _unsqueezed(hook, positions: tuple, tile, *sides):
     """`hook` on `tile` and its side tiles with their dimensions of one back at `positions`."""
     return hook(tile, *(jnp.expand_dims(side, where) if where else side
                         for side, where in zip(sides, positions, strict=True)))
+
+
+def _lowerable(hook):
+    """`hook` with each 16-bit float operation Pallas Triton lowers only for fp32 or wider computed in
+    fp32 and rounded once, as XLA computes a 16-bit one: its division (`_truediv`), `logistic` (lowered as
+    `1 / (1 + exp(-x))`), a negative power (a reciprocal) and `erf_inv`. A division so rounded is the
+    correctly rounded 16-bit quotient (fp32 holds more than twice a 16-bit float's significand). Other
+    operations, and any inside a hook's control flow, are traced as written."""
+    if hook is None:
+        return None
+
+    @functools.wraps(hook)
+    def lowered(*tiles):
+        closed, shape = jax.make_jaxpr(hook, return_shape=True)(*tiles)
+        out = _widened(closed.jaxpr, closed.consts, jax.tree.leaves(tiles))
+        return jax.tree.unflatten(jax.tree.structure(shape), out)
+
+    return lowered
+
+
+_FP32_ONLY = ('div', 'logistic', 'erf_inv')
+"""The primitives Pallas Triton lowers for no 16-bit float (`_lowerable`); a negative `integer_pow` too."""
+
+_CALLS = ('pjit', 'jit', 'closed_call', 'core_call', 'custom_jvp_call', 'custom_vjp_call')
+"""The primitives that call one jaxpr as written, which `_widened` enters (a kernel never differentiates
+a hook, so a custom rule's own derivative is not needed there)."""
+
+
+def _widened(jaxpr, consts, args) -> list:
+    """`jaxpr` evaluated on `args`, each of its 16-bit `_FP32_ONLY` operations (and negative powers) in
+    fp32 rounded once, entering the calls it makes."""
+    env = {}
+
+    def read(var):
+        return var.val if isinstance(var, jax_core.Literal) else env[var]
+
+    env.update(zip(jaxpr.constvars, consts, strict=True))
+    env.update(zip(jaxpr.invars, args, strict=True))
+    for equation in jaxpr.eqns:
+        values = [read(var) for var in equation.invars]
+        name, params = equation.primitive.name, equation.params
+        out = equation.outvars[0].aval
+        narrow = (jnp.issubdtype(out.dtype, jnp.floating) and jnp.dtype(out.dtype).itemsize == 2
+                  and (name in _FP32_ONLY or (name == 'integer_pow' and params['y'] < 0)))
+        inner = next((p for p in params.values() if isinstance(p, jax_core.ClosedJaxpr)), None)
+        if narrow:
+            wide = equation.primitive.bind(*(value.astype(jnp.float32) for value in values), **params)
+            outs = [wide.astype(out.dtype)]
+        elif name in _CALLS and inner is not None:
+            outs = _widened(inner.jaxpr, inner.consts, values)
+        else:
+            subfuns, bind_params = equation.primitive.get_bind_params(params)
+            outs = equation.primitive.bind(*subfuns, *values, **bind_params)
+            outs = outs if equation.primitive.multiple_results else [outs]
+        env.update(zip(equation.outvars, outs, strict=True))
+    return [read(var) for var in jaxpr.outvars]
 
 
 NO_HOOKS = Hooks()

@@ -10,7 +10,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from generation_support import generations
+from generation_support import INTERPRETS, SUMS_IN_IEEE, generations, lowers
 from jax.experimental.pallas import fuser
 from jax.sharding import Mesh
 from reference_error import assert_as_exact
@@ -58,8 +58,7 @@ def shifted(x, side):
 
 
 def reciprocal(x):
-    """The reciprocal in fp32 (Pallas Triton divides no 16-bit floats), rounded back."""
-    return (1 / _wide(x)).astype(x.dtype)
+    return 1 / x
 
 
 def biased(acc, bias):
@@ -407,6 +406,7 @@ def test_the_fused_epilogue_keeps_the_programs_value(generation_name, consumer):
                         seeds=SEEDS, truth_fn=truth)
 
 
+@lowers("sm90")
 @pytest.mark.parametrize("launch", [grouped_matmul.MosaicGmm(), grouped_matmul.MosaicTgmm()],
                          ids=lambda launch: type(launch).__name__)
 def test_the_hooked_mosaic_launches_lower_for_an_h100(launch):
@@ -472,6 +472,7 @@ def test_mosaic_takes_only_the_hooks_its_lowering_has_rules_for():
         assert launch.eligible(elementwise, target)
 
 
+@INTERPRETS
 def test_the_mosaic_kernels_load_a_side_operands_rows_from_any_dimension():
     """Interpreted, Mosaic GPU's kernels pad and slice a side operand along its rows wherever they sit:
     a `[depth, rows]` side gives the `[rows, depth]` one's products bit for bit."""
@@ -497,6 +498,7 @@ def test_the_mosaic_kernels_load_a_side_operands_rows_from_any_dimension():
     np.testing.assert_array_equal(np.asarray(gradients[0]), np.asarray(gradients[1]))
 
 
+@SUMS_IN_IEEE
 @pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))
 def test_exact_sums_add_each_steps_product_as_the_plain_sum_does(generation_name):
     """At the highest precision an fp32 kernel gradient adds each step's product apart (`exact_sums`):
@@ -551,6 +553,7 @@ def test_exact_sums_go_to_fp32_outputs_at_a_precision_above_the_default():
         assert steps and max(steps) <= grouped_matmul.EXACT_STEP
 
 
+@lowers("sm90")
 def test_the_exact_mosaic_kernel_gradient_lowers_for_an_h100():
     """Mosaic GPU's kernel gradient with `exact_sums`, its running sum the pipeline's carry, lowers for
     an H100 on the CPU at a fitting tile of every block shape."""
