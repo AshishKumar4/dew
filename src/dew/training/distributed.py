@@ -1184,15 +1184,16 @@ def taking_over[Held, Result](function: Callable[[Held, jax.Array], Result], tak
     return functools.partial(jax.jit(joined, out_shardings=shardings, donate_argnums=0), taken, kept)
 
 
-def prefetched_bytes(batch: Batch, shardings: Placement[Batch]) -> int:
+def prefetched_bytes(batch: Batch, shardings: Placement[Batch], depth: int = PREFETCH_DEPTH) -> int:
     """Return the bytes a device holds of the batches `fit` places while a step runs.
 
-    These are the batches next to the one the step reads: the `PREFETCH_DEPTH` it
-    queues and the one it is placing, each laid out as `shardings` places `batch`.
+    These are the batches next to the one the step reads: the `depth` it queues
+    (`fit(device_prefetch=)`) and the one it is placing, each laid out as
+    `shardings` places `batch`.
     """
     placed = jax.tree.map(lambda leaf, sharding: jax.ShapeDtypeStruct(np.shape(leaf), leaf.dtype,
                                                                       sharding=sharding), batch, shardings)
-    return (PREFETCH_DEPTH + 1) * placed_bytes(placed)
+    return (depth + 1) * placed_bytes(placed)
 
 
 class DevicePrefetchIterator:

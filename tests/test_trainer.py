@@ -126,11 +126,32 @@ def test_a_token_budget_counts_the_tokens_of_committed_updates(tmp_path):
     assert resumed.checkpoints.control(4)["committed_tokens"] == 80
 
 
-def test_a_checkpoint_that_counted_every_steps_tokens_cannot_resume_a_token_budget(tmp_path):
-    """A checkpoint whose control counts every step's tokens (`tokens`, as runs counted before they
-    counted commits) holds no committed count: a run whose length is its tokens refuses to resume
-    from it, and a run of steps resumes and keeps the count unknown in its own checkpoints, so a
-    token budget after it is refused too."""
+def test_a_fit_places_its_device_prefetch_and_plans_its_step_beside_them():
+    """`fit(device_prefetch=n)` queues n placed batches beside the step, and the step's memory plan holds
+    room for them and the one being placed: n + 1 batches, so a deeper queue grows the held bytes by a
+    batch's bytes a batch, and trains the same run."""
+    from dew.training.distributed import batch_shardings, placed_bytes
+
+    def run(depth: int):
+        trainer = make_trainer()
+        state = trainer.fit(dataset(), steps=2, log_every=1, device_prefetch=depth)
+        return trainer.memory["held"], jax.tree.map(np.asarray, state.variables)
+
+    (shallow, first), (deep, second) = run(1), run(3)
+    batch = next(iter(dataset().train(DataPartition())))
+    placement = batch_shardings(make_trainer().device_mesh, batch)
+    one = placed_bytes(jax.tree.map(
+        lambda leaf, sharding: jax.ShapeDtypeStruct(np.shape(leaf), leaf.dtype, sharding=sharding), batch,
+        placement))
+    assert deep - shallow == 2 * one
+    for left, right in zip(jax.tree.leaves(first), jax.tree.leaves(second), strict=True):
+        np.testing.assert_array_equal(left, right)
+
+
+def test_a_checkpoint_that_counted_every_steps_tokens_is_refused_by_name(tmp_path):
+    """A checkpoint whose control counts every step's tokens under `tokens`, the field runs wrote before
+    they counted commits, holds no count this Dew reads: a run resuming from it is refused, by steps
+    or by tokens, rather than counting from zero."""
     import json
     import pathlib
 
@@ -143,14 +164,9 @@ def test_a_checkpoint_that_counted_every_steps_tokens_cannot_resume_a_token_budg
     control = metadata["custom_metadata"]["control"]
     control["tokens"] = control.pop("committed_tokens")
     written.write_text(json.dumps(metadata))
-    with pytest.raises(ValueError):
-        make_trainer(tmp_path, objective=TokenRegression()).fit(dataset(), tokens=30)
-    resumed = make_trainer(tmp_path, objective=TokenRegression())
-    assert int(resumed.fit(dataset(), steps=3, log_every=1, checkpoint_every=1).step) == 3
-    assert "tokens" in resumed.checkpoints.control(3)
-    assert "committed_tokens" not in resumed.checkpoints.control(3)
-    with pytest.raises(ValueError):
-        make_trainer(tmp_path, objective=TokenRegression()).fit(dataset(), tokens=60)
+    for length in ({"steps": 3}, {"tokens": 60}):
+        with pytest.raises(ValueError):
+            make_trainer(tmp_path, objective=TokenRegression()).fit(dataset(), log_every=1, **length)
 
 
 def test_an_explicit_state_starts_a_token_count_with_its_own_reader(tmp_path):
