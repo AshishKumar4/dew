@@ -29,15 +29,15 @@ class Product:
 
 def declared(compute: Dtype, precision: PrecisionLike, *, outputs: tuple = ()) -> Product:
     """The product a caller asks for with `precision` (explicitly or through
-    `jax_default_matmul_precision`), multiplying in `compute` into `outputs`' dtypes. The kernels sum in fp32 and offset groups in int32, so x64 is refused, the one setting under
-    which an operand or master is wider than fp32; their fp32 products are TF32, which only the default
-    precision asks for."""
+    `jax_default_matmul_precision`), multiplying in `compute` into `outputs`' dtypes. The kernels sum in
+    fp32 and offset groups in int32, so x64 is refused, the one setting under which an operand or master
+    is wider than fp32; their fp32 products are TF32, which only the default precision asks for."""
     compute = jnp.dtype(compute)
     above = not asks_default_precision(precision, configured=True)
-    return Product(compute, promoted(above, outputs), _refusal(compute, above))
+    return Product(compute, promoted(above=above, outputs=outputs), _refusal(compute, above))
 
 
-def promoted(above: bool, outputs: tuple) -> bool:
+def promoted(*, above: bool, outputs: tuple) -> bool:
     """Whether a product asked for above the default precision (`above`) promotes each depth step's
     partial apart: where an output is fp32, whose IEEE sums a 16-bit output's one rounding hides."""
     return above and jnp.dtype(jnp.float32) in {jnp.dtype(dtype) for dtype in outputs}

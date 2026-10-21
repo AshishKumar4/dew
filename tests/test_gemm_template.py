@@ -734,13 +734,13 @@ def test_an_interpreted_launch_takes_no_pair():
 
 
 def test_exact_sums_go_to_fp32_outputs_at_a_precision_above_the_default():
-    """The declared product promotes (`exact_sums`) for an fp32 output at the highest precision, never for
-    a 16-bit output or the default precision; Mosaic's forward launches, which do not add apart, refuse it, Mosaic's kernel
-    gradient keeps only tiles whose two accumulators stay in registers, and Triton's only steps of at most
-    `EXACT_STEP` rows."""
-    assert product.promoted(True, ("float32",))
-    assert not product.promoted(True, ("bfloat16",))
-    assert not product.promoted(False, ("float32",))
+    """The declared product promotes (`exact_sums`) for an fp32 output at the highest precision, never
+    for a 16-bit output or the default precision; Mosaic's forward launches, which do not add apart,
+    refuse it, Mosaic's kernel gradient keeps only tiles whose two accumulators stay in registers, and
+    Triton's only steps of at most `EXACT_STEP` rows."""
+    assert product.promoted(above=True, outputs=("float32",))
+    assert not product.promoted(above=True, outputs=("bfloat16",))
+    assert not product.promoted(above=False, outputs=("float32",))
     rows = 2048
     bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
     sizes = jax.ShapeDtypeStruct((8,), jnp.int32)

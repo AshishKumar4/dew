@@ -942,9 +942,9 @@ def _forward(inputs, matrix, sizes, out_dtype, interpret_on_cpu):
 def _backward(inputs, matrix, sizes, cotangent, input_dtype, kernel_dtype, interpret_on_cpu, exact):
     def kernel(inputs, matrix, sizes, cotangent, *, interpret):
         return (launched_gmm(cotangent, matrix, sizes, out_dtype=input_dtype, trans_rhs=True,
-                             interpret=interpret, promoted=promoted(exact, (input_dtype,))),
+                             interpret=interpret, promoted=promoted(above=exact, outputs=(input_dtype,))),
                 launched_tgmm(inputs, cotangent, sizes, out_dtype=kernel_dtype, interpret=interpret,
-                              promoted=promoted(exact, (kernel_dtype,))))
+                              promoted=promoted(above=exact, outputs=(kernel_dtype,))))
 
     def fallback(inputs, matrix, sizes, cotangent):
         work = jnp.result_type(_summed(input_dtype), _summed(kernel_dtype))
