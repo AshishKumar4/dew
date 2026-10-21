@@ -240,8 +240,8 @@ def test_a_hooks_widened_16_bit_operations_round_as_xla_s():
     every = jax.lax.bitcast_convert_type(jnp.arange(-(2 ** 15), 2 ** 15, dtype=jnp.int32).astype(jnp.int16),
                                          jnp.bfloat16)
     for hook in (bf16_reciprocal, lambda x: x ** -2):
-        np.testing.assert_array_equal(np.asarray(jax.jit(grouped_matmul.Hooks(hook).before())(every)),
-                                      np.asarray(jax.jit(hook)(every)))
+        widened = jax.jit(grouped_matmul.Hooks(hook).before())(every)
+        np.testing.assert_array_equal(np.asarray(widened, np.float32), np.asarray(jax.jit(hook)(every), np.float32))
 
 
 def test_a_hooks_widened_sigmoid_holds_check_1():
