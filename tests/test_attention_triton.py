@@ -162,10 +162,13 @@ head's, a query's temperature (divided by, so padding's zeros would be infinite 
 a dense bias; and the softmax's initial state as sinks or as a resumed partial."""
 
 BACKWARD_SEEDS = {(("alibi",), "float32"): 64, (("alibi",), "bfloat16"): 128,
-                  (("sinks",), "bfloat16"): 16, (("softcap", "sinks", "alibi"), "float32"): 64,
-                  (("softcap", "sinks", "alibi"), "bfloat16"): 256}
+                  (("alibi",), "float16"): 128, (("sinks",), "bfloat16"): 16,
+                  (("resumed",), "float32"): 32, (("resumed",), "bfloat16"): 128,
+                  (("resumed",), "float16"): 32, (("softcap", "sinks", "alibi"), "float32"): 64,
+                  (("softcap", "sinks", "alibi"), "bfloat16"): 256,
+                  (("softcap", "sinks", "alibi"), "float16"): 256}
 """The backward sites' declared draws where `seeds_for` sizes them above `SEEDS`: a head's ALiBi slope
-is a gradient of four values a draw, and the sinks' bf16 state's of a few."""
+is a gradient of four values a draw, and an initial state's of a few a query."""
 
 
 def score_hooks(names: tuple, queries: int, keys: int, value_width: int = 32):
