@@ -64,7 +64,32 @@ def cross_entropy_columns():
     return jax.jit(reference), draw
 
 
-CLASSES = {"cross-entropy-columns": cross_entropy_columns}
+def decoder_residual_orders():
+    """tests/test_decoder_export.py's qwen3_next round trip, ordered by its residual stream
+    (tests/residual_orders.py): the trained model's logits on the trip's tokens, the model itself on
+    both sides, as equally exact as itself at any order."""
+    import tempfile
+
+    import jax
+    import numpy as np
+    from residual_orders import permuted, residual_width
+
+    from tools import decoder_export_reference as tool
+
+    case = next(case for case in tool.CASES if case.name == "qwen3_next")
+    trip = tool.round_trip(case, Path(tempfile.mkdtemp(prefix="null-runs-")))
+    width, apply = residual_width(trip.trained), jax.jit(trip.source.model.apply)
+
+    def forward(variables, ids):
+        return {"logits": apply(variables, ids)}
+
+    def draw(seed):
+        return permuted(trip.trained, np.random.default_rng(seed).permutation(width)), trip.ids
+
+    return forward, draw
+
+
+CLASSES = {"cross-entropy-columns": cross_entropy_columns, "decoder-residual-orders": decoder_residual_orders}
 
 
 def main(argv: list[str]) -> int:
