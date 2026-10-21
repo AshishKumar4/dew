@@ -6,6 +6,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+from data_support import keep_captions
 from PIL import Image
 
 from dew.config.data import Augment, ImageData, loader
@@ -16,10 +17,6 @@ from dew.objectives.base import VALID_ROWS
 
 SCALE = 8
 READ = Loading(workers=0, threads=1, read_buffer=2, worker_buffer=1)
-
-
-def keep_captions(captions):
-    return {"caption": np.asarray(captions)}
 
 
 def image_table(path, count=16, *, struct=False):
