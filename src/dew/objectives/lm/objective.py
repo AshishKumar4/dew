@@ -633,7 +633,6 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
             batch = {name: batch[name] for name in self.scored_fields}
         return super().evaluate(params, batch, step)
 
-
     def __init__(self, model, seq_len: int, *, head_chunks: int = 4,
                  head_tile: tuple[int, int] | Literal['whole', 'tiled'] | None = None,
                  samples: Samples | None = None, variables: Variables | None | Omitted = OMITTED,
