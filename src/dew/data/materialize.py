@@ -22,7 +22,7 @@ from collections.abc import Mapping, Sequence
 import grain.python as pygrain
 import numpy as np
 
-from dew.data.analysis import _analyzed, _identity, _label, _name
+from dew.data.analysis import _VIEWS, _analyzed, _identity, _label, _name
 from dew.data.dataset import Batch, Records
 from dew.data.lowering import _CachedOutputs, _fill, _Locality, _outputs, _packed, _TokenSplit
 from dew.data.mixing import CorpusCounts
@@ -141,7 +141,11 @@ def _memory_inputs(
 ) -> tuple[list[tuple[tuple[int, ...], Record]], int]:
     rows: list[tuple[tuple[int, ...], Record]] = []
     consumed = 0
-    if artifact_at is not None:
+    # A view of the inputs before the cache reads it by input, as the stages lowered over these
+    # rows do (`_Build.indexed`): the rows held are the source's own.
+    viewed = artifact_at is not None and any(isinstance(stage, _VIEWS)
+                                             for stage in pipeline.stages[:artifact_at])
+    if artifact_at is not None and not viewed:
         filled, manifest, prefix = _fill(pipeline, source, artifact_at, "memory")
         cached = filled.mapped(pygrain.MapDataset.source(stored), manifest, transform=prefix, source=source)
         try:

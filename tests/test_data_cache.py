@@ -693,6 +693,69 @@ def test_a_cache_read_by_two_loading_workers_seals_what_each_filled(tmp_path):
     assert publishing.calls == []
 
 
+@dataclass(frozen=True)
+class Keeps:
+    """Rejects a record whose id is a multiple of `every`, permanently: a record steps cannot make."""
+
+    every: int
+    identity = "keeps@1"
+
+    def __call__(self, row):
+        return Rejected("unkept") if int(row["id"]) % self.every == 0 else row
+
+
+@pytest.mark.parametrize("views", ["shuffled", "shuffled in windows", "repeated then shuffled", "taken"])
+@pytest.mark.parametrize("read", ["memory", "indexed"])
+def test_a_cache_after_views_of_the_inputs_reads_as_the_uncached_chain(tmp_path, read, views):
+    """Views of the inputs written before a cache (a shuffle, a window shuffle, a repeat, a take)
+    read it as they read the inputs: the batches are the uncached chain's, rejected records
+    dropped where they are. A view that reads every input completes the cache, so a later run
+    reads its published fill without running its steps; a take reads part of them, and the
+    cache, holding every input's, is filled again."""
+    from dew.data.compile import compile
+    from dew.data.dataset import DataPartition, Loading
+    from dew.data.pipeline import Pipeline
+
+    loading = Loading(workers=0, threads=1, read_buffer=1)
+
+    def chain(step, cache):
+        viewed = {"shuffled": lambda source: source.shuffle(3),
+                  "shuffled in windows": lambda source: source.shuffle(3, window=4),
+                  "repeated then shuffled": lambda source: source.repeat(2).shuffle(3),
+                  "taken": lambda source: source.shuffle(3).take(7)}[views](Pipeline(Memory(
+                      [{"id": index} for index in range(12)])))
+        stepped = viewed.map(step).filter_map(Keeps(5), identity="keeps@1")
+        return (stepped if cache is None else stepped.cache(cache)).repeat().batch(3)
+
+    def batches(step, cache):
+        reader = compile(chain(step, cache), read=read, loading=loading).train(DataPartition())
+        try:
+            return [[(int(row), int(value)) for row, value in zip(batch["id"], batch["value"], strict=True)]
+                    for batch in (next(reader) for _ in range(5))]
+        finally:
+            reader.close()
+
+    expected = batches(Offset(10), None)
+    cache = str(tmp_path / "cache")
+    filling, reading = Offset(10), Offset(10)
+    assert batches(filling, cache) == expected
+    assert batches(reading, cache) == expected
+    assert filling.calls
+    assert (reading.calls == []) == (views != "taken")
+
+
+def test_a_streamed_view_before_a_cache_is_refused_with_its_reason(tmp_path):
+    """A streamed read fills its cache shard by shard, so a shuffle written before the cache is
+    refused there, naming the reads that support it."""
+    from dew.data.compile import compile
+    from dew.data.dataset import Loading
+    from dew.data.pipeline import Pipeline
+
+    chain = Pipeline(Memory([{"id": index} for index in range(8)])).shuffle(3, window=4).map(Offset(1))
+    with pytest.raises(ValueError):
+        compile(chain.cache(str(tmp_path / "cache")).batch(2), read="streamed", loading=Loading(workers=0))
+
+
 def test_a_streamed_cache_reads_the_generation_published_under_its_key(tmp_path):
     """A streamed fill's shards are filled apart, so `publish` publishes them; a later streamed read
     of the same source and steps then reads the generation, and `publish` returns it as it is."""
