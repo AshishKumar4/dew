@@ -1,6 +1,6 @@
-"""Reads whose steps drop records: each loading worker reads every input of its share in turn, so
-one whose own inputs are all dropped reads on from the others' (row 883); a corpus or a share none
-of whose inputs is ever kept is refused as the read opens, not waited on forever."""
+"""Reads whose steps drop records under loading workers: a worker runs the steps and keeps each
+record it drops as a marker, which the reading process drops, so a worker whose own inputs are
+all dropped never holds up the others' (row 883)."""
 
 from dataclasses import dataclass
 
@@ -80,7 +80,7 @@ class Untouched:
         return row
 
 
-def test_a_repeated_read_by_rotating_workers_reads_each_kept_input_once_a_pass():
+def test_a_repeated_read_by_workers_reads_each_kept_input_once_a_pass():
     """Two passes over twelve inputs by three loading workers, a filter keeping the even ones:
     each kept input is read once a pass, and nothing else."""
     evens = Pipeline(Memory([{"id": index} for index in range(12)])).filter_map(KeepsEven())
@@ -93,40 +93,23 @@ def test_a_repeated_read_by_rotating_workers_reads_each_kept_input_once_a_pass()
     assert ids == sorted(2 * list(range(0, 12, 2)))
 
 
-@pytest.mark.parametrize("read", ["indexed", "memory", "streamed"])
-def test_a_corpus_none_of_whose_inputs_is_kept_is_refused_as_its_read_opens(read):
-    """A corpus whose filter keeps none of its inputs, mixed with one that keeps all: the read is
-    refused as it opens, naming the corpus, rather than waiting on it forever."""
-    kept = Pipeline(Memory([{"id": 2 * index} for index in range(6)], shard_rows=1), name="kept")
-    dropped = Pipeline(Memory([{"id": 2 * index + 1} for index in range(6)], shard_rows=1),
-                       name="dropped").filter_map(KeepsEven())
-    chain = mix([kept.repeat(), dropped.repeat()], weights=[0.5, 0.5]).batch(2)
-    reader = compile(chain, read=read, loading=Loading(workers=0, threads=1, read_buffer=1)).train(
-        DataPartition())
-    try:
-        with pytest.raises(ValueError):
-            next(reader)
-    finally:
-        reader.close()
+@pytest.mark.parametrize("read", ["indexed", "streamed"])
+def test_a_mixture_of_corpora_each_kept_in_one_workers_inputs_reads_on(read):
+    """Two corpora of twelve inputs each, read by three loading workers, the first keeping only its
+    sixth input and the second only its seventh, which fall to different workers: the mixture
+    reads on, delivering both."""
+    def corpus(name, kept):
+        rows = Memory([{"id": index} for index in range(12)], shard_rows=1)
+        return Pipeline(rows, name=name).filter_map(KeepsOne(kept)).repeat()
+
+    reader = compile(mix([corpus("fifth", 5), corpus("sixth", 6)]).batch(1), read=read,
+                     loading=WORKERS).train(DataPartition())
+    assert set(_ids(reader, 6)) == {5, 6}
 
 
-def test_a_share_none_of_whose_inputs_is_kept_is_refused_as_its_read_opens():
-    """Eight inputs in two shares and a filter keeping the even ones: the second share holds the
-    odd ones, none kept, so its read is refused as it opens; the first reads its own."""
-    chain = Pipeline(Memory([{"id": index} for index in range(8)])).filter_map(KeepsEven()).batch(1)
-    data = compile(chain, read="indexed", loading=Loading(workers=0, threads=1, read_buffer=1))
-    assert set(_ids(data.train(DataPartition(index=0, count=2)), 4)) <= {0, 2, 4, 6}
-    reader = data.train(DataPartition(index=1, count=2))
-    try:
-        with pytest.raises(ValueError):
-            next(reader)
-    finally:
-        reader.close()
-
-
-def test_a_rotating_workers_read_resumes_where_it_stopped():
-    """A read by three rotating loading workers saved after its workers' first passes resumes on the
-    records the uninterrupted read reads next."""
+def test_a_workers_read_of_a_dropping_corpus_resumes_where_it_stopped():
+    """A read by three loading workers of a corpus whose filter drops records, saved after its
+    workers' first passes, resumes on the records the uninterrupted read reads next."""
     evens = Pipeline(Memory([{"id": index} for index in range(12)])).filter_map(KeepsEven())
     chain = evens.repeat().batch(1)
     data = compile(chain, read="indexed", loading=WORKERS)
