@@ -603,14 +603,12 @@ def anchor_program(case, batch, state):
     """The same fp64 loss/gradient executable reused for each residual order."""
     import benchmark_models as bench
     import jax
-    import jax.numpy as jnp
 
     from dew.objectives.base import Step
     from dew.training.transaction import with_ema
 
-    def widened(tree):
-        return jax.tree.map(lambda leaf: leaf.astype(jnp.float64)
-                            if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf, tree)
+    sys.path.insert(0, str(REPO / "tests"))
+    from reference_error import widened
 
     wide = widened(state.variables)
     objective = bench.build_objective(case, widened=True)

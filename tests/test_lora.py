@@ -32,7 +32,7 @@ from affine_run import Replaying
 from flax import linen as nn
 from interop_support import extract_fixture, hub_cache
 from model_support import flat_tree
-from reference_error import assert_as_exact_as_the_reference
+from reference_error import assert_as_exact_as_the_reference, widened
 from safetensors.numpy import load_file
 from test_joined import row_joins
 
@@ -919,12 +919,6 @@ def _sampled(task) -> np.ndarray:
     return np.asarray(task(PROMPTS, steps=2, key=1).host().images)
 
 
-def _wider(tree):
-    """Every floating leaf of `tree` in float64."""
-    return jax.tree.map(
-        lambda leaf: leaf.astype(jnp.float64) if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf, tree)
-
-
 def _moved_b(tuned, seed: int):
     """The tuned variables with every B drawn away from zero, as a run leaves them."""
     keys = iter(jax.random.split(jax.random.key(seed), len(tuned.adapter.targets)))
@@ -964,8 +958,8 @@ def test_a_pipeline_adapts_its_denoiser_alone_and_starts_as_the_source(family, p
 
     with jax.enable_x64():
         wide = dataclasses.replace(source, model=source.model.clone(dtype=jnp.float64),
-                                   variables=_wider(source.variables))
-        truth = sampled(wide, _wider(prepared))
+                                   variables=widened(source.variables))
+        truth = sampled(wide, widened(prepared))
     assert_as_exact_as_the_reference(sampled(tuned, prepared), sampled(source, prepared), truth, family)
     with pytest.raises(ValueError):
         source.adapt(LoRA(rank=2, modules=("q_proj",)), key=0)
