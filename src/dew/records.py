@@ -16,6 +16,7 @@ JSON. The `JSON` alias both directions speak is declared here, once.
 from __future__ import annotations
 
 import datetime
+import functools
 import math
 import re
 from collections.abc import Callable, Mapping
@@ -107,7 +108,7 @@ def strings(value: object, key: str) -> tuple[str, ...]:
     return tuple(text(entry, key) for entry in value)
 
 
-def listed[ItemT](value: object, key: str, read: Callable[[object, str], ItemT],
+def listed[ItemT](value: object, key: str, *, read: Callable[[JSON, str], ItemT],
                   what: str) -> tuple[ItemT, ...]:
     """One list, each entry read by `read(entry, key)`; `what` names what the list holds, as a
     refusal of anything else says."""
@@ -116,14 +117,11 @@ def listed[ItemT](value: object, key: str, read: Callable[[object, str], ItemT],
     return tuple(read(entry, key) for entry in value)
 
 
-def integers(value: object, key: str) -> tuple[int, ...]:
-    """One list of integers: layer indices, token ids, per-layer widths."""
-    return listed(value, key, integer, "a list of integers")
+integers = functools.partial(listed, read=integer, what="a list of integers")
+"""One list of integers: layer indices, token ids, per-layer widths (`listed`)."""
 
-
-def numbers(value: object, key: str) -> tuple[float, ...]:
-    """One list of finite numbers: per-frequency rotary factors."""
-    return listed(value, key, number, "a list of numbers")
+numbers = functools.partial(listed, read=number, what="a list of numbers")
+"""One list of finite numbers: per-frequency rotary factors (`listed`)."""
 
 
 def json_value(value: object, key: str) -> JSON:
