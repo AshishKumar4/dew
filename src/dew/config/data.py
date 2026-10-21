@@ -3,11 +3,8 @@
 from __future__ import annotations
 
 import dataclasses
-import functools
 from collections.abc import Mapping
 from typing import TYPE_CHECKING, Annotated, Literal, Protocol, runtime_checkable
-
-import numpy as np
 
 from dew.data.analysis import _cache_at, _order_at, _preferred_read, _promoted, _serves, _until
 from dew.data.compile import compile
@@ -42,9 +39,16 @@ from dew.data import images
 from dew.data.chat import RenderChat
 from dew.data.images import ConfigureCaption, EncodeCaptions
 from dew.data.preferences import PreferencePair
-from dew.data.presets import _CHAT_FIELDS, _clips, _conversation_windows, _decoded_images, _next_token_windows
-from dew.data.sources.base import Read, ShardManifest, Source, _consumed
-from dew.data.steps.chat import ConfigurePrompt, ResponseCanvases
+from dew.data.presets import (
+    _CHAT_FIELDS,
+    _clips,
+    _conversation_windows,
+    _decoded_images,
+    _next_token_windows,
+    _rendered_prompts,
+)
+from dew.data.sources.base import Read
+from dew.data.steps.chat import ResponseCanvases
 from dew.data.steps.generic import Formatting
 from dew.data.text import Tokenize
 
@@ -286,85 +290,12 @@ class PromptData(_Loadable):
     split: str = "train"
 
     def pipelines(self) -> tuple[Pipeline, Pipeline | None, tuple[HostStep, ...]]:
-        source = _PromptFacts(_source(self.source, split=self.split), self.reward_bytes)
-        step = Configured(
-            ConfigurePrompt(self.tokenizer, self.max_prompt_len, self.pad_id, self.long, self.thinking),
-            needs=("reward_bytes",),
-        )
-        prefix = Pipeline(source).map(step).stages
-        validation = self.validation
-        if validation is not None and not isinstance(validation, (HoldOut, Split, Pipeline)):
-            validation = _PromptFacts(_source(validation), self.reward_bytes)
-        train, held = _branches(source, validation, split=self.split, prefix=prefix)
+        source = _source(self.source, split=self.split)
+        rendered = _rendered_prompts(Pipeline(source), self.tokenizer, self.max_prompt_len,
+                                     pad_id=self.pad_id, long=self.long, thinking=self.thinking,
+                                     reward_bytes=self.reward_bytes)
+        train, held = _branches(source, self.validation, split=self.split, prefix=rendered.stages)
         return train, held, ()
-
-
-@dataclasses.dataclass(frozen=True)
-class _PromptFacts:
-    source: Source
-    width: int | None
-
-    def with_split(self, name: str) -> _PromptFacts:
-        """These facts over the source's own split `name`, which a source without splits refuses."""
-        return dataclasses.replace(self, source=_named_split(self.source, name))
-
-    def consumed(self, read: Read) -> _PromptFacts:
-        consumed = dataclasses.replace(self, source=_consumed(self.source, read))
-        consumed._measured.update(self._measured)
-        return consumed
-
-    @functools.cached_property
-    def _measured(self) -> dict[str, int]:
-        return {}
-
-    def label(self) -> str:
-        return self.source.label()
-
-    def describe(self) -> str:
-        return self.source.describe()
-
-    def fingerprint(self) -> Mapping[str, object]:
-        return self.source.fingerprint()
-
-    def supports(self, read: Read) -> bool:
-        return self.source.supports(read)
-
-    def records(self, read: Read):
-        from dew.data.prompts import _extra_info, _ground_truth, _text
-
-        rows = self.source.records(read)
-        if read == "memory" and self.width is None and "reward_bytes" not in self._measured:
-            self._measured["reward_bytes"] = max(
-                1,
-                max(
-                    (
-                        len(text.encode("utf-8"))
-                        for index in range(len(rows))
-                        for row in (rows[index],)
-                        if isinstance(row, Mapping)
-                        for text in (
-                            _text(row.get("data_source")),
-                            _ground_truth(row, "prompt"),
-                            _text(_extra_info(row)),
-                        )
-                    ),
-                    default=1,
-                ),
-            )
-        return rows
-
-    def metadata(self) -> Mapping[str, object]:
-        return {
-            **self.source.metadata(),
-            **self._measured,
-            **({} if self.width is None else {"reward_bytes": self.width}),
-        }
-
-    def lengths(self) -> np.ndarray | None:
-        return self.source.lengths()
-
-    def manifest(self) -> ShardManifest:
-        return self.source.manifest()
 
 
 @dataclasses.dataclass(frozen=True)

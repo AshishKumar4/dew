@@ -26,7 +26,8 @@ from reference_error import assert_moves, declared_seeds, indexed_recording, rec
 
 
 def assert_as_exact(dew_fn, reference_fn, draw, label, *, seeds, truth_fn=None):
-    count = _gate.seeds_for(reference_fn, draw, label, truth_fn=truth_fn) if 'per query' in label else seeds
+    sized = 'documents alone' in label or 'sparse total' in label
+    count = _gate.seeds_for(reference_fn, draw, label, truth_fn=truth_fn) if sized else seeds
     print(f"SIZED {label!r} {count}", flush=True)
     _gate.assert_as_exact(dew_fn, reference_fn, draw, label, seeds=count, truth_fn=truth_fn)
     print(f"PASSED {label!r}", flush=True)
@@ -52,7 +53,7 @@ SEQ = 16
 VOCAB = 64
 TINY_SHARD = 256
 SEEDS = {'covering': 256, 'covered positions': 512, 'dropped': 256, 'dropped positions': 256, 'packed': 64,
-         'packed alone': 128, 'total': 512, 'documents alone': 512, 'split tree': 8, 'per query': 8}
+         'packed alone': 128, 'total': 512, 'documents alone': 512, 'split tree': 8, 'per query': 64}
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada, 2026-10-21):
 the most any of a site's cases took."""
 

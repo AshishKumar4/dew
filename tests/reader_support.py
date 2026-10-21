@@ -1,5 +1,5 @@
-"""What an exact reader owes the bytes it reads: a write that keeps a file's size changes its identity,
-and a position saved before the write is refused after it."""
+"""What an exact reader owes: a resumed reader reads on where the uninterrupted one does, and a write
+that keeps a file's size changes its identity, so a position saved before the write is refused after it."""
 
 from collections.abc import Callable
 from pathlib import Path
@@ -31,3 +31,29 @@ def assert_a_rewrite_moves_the_identity(reader: Callable, path: Path, patch: byt
             after.set_state(position)
     finally:
         after.close()
+
+
+def assert_resumes_where_it_stopped(opened: Callable, read: Callable, stopped: int,
+                                    rest: int) -> tuple[list, bytes]:
+    """Read `stopped + rest` steps of a reader `opened()` makes, uninterrupted; read `stopped` of a
+    second, save its position, and restore it in a third, whose next `rest` are the uninterrupted
+    reader's, each read as `read(reader, count)` reads `count` steps. Returns the uninterrupted
+    reads and the saved position."""
+    whole = opened()
+    try:
+        expected = read(whole, stopped + rest)
+    finally:
+        whole.close()
+    before = opened()
+    try:
+        head = read(before, stopped)
+        saved = before.get_state()
+    finally:
+        before.close()
+    resumed = opened()
+    try:
+        resumed.set_state(saved)
+        assert head + read(resumed, rest) == expected
+    finally:
+        resumed.close()
+    return expected, saved
