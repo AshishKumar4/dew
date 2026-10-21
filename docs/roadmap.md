@@ -8,7 +8,8 @@ Correctness, contract gaps and duplicated paths come first. After those close, m
 
 - Pass dense MLA visibility descriptors to the shared attention core. [41]
 - Bind native Flax forward methods explicitly, including the objective's choice of forward method. [171]
-- Inventory FlaxDiff capabilities with a receipt or an explicit gap for each, and publish workflow-level qualification against MaxText rather than inferring it from individual components. [230, 267]
+- Carry FlaxDiff's remaining capabilities, or record dropping them: the continuous and tangent cosine schedules and the exponential schedule's test, SimpleAutoEncoder, the learned-variance head and the old UViT and wrapper, the W&B sweep promotion and run loading, the older checkpoints, and the named datasets. [230, 864, 865, 866, 867, 868]
+- Publish workflow-level qualification against MaxText rather than inferring it from individual components. [267]
 - Load the requested families Dew does not load yet: Qwen4-Exp, MiniMax Text-01, M1 and M3, the LLaDA MoE variants and LLaDA 2.x, DiffuCoder, Kimi K2.5's and K3's vision, and MiniMax M2.5, M2.7 and H3. [266, 849, 850, 851, 852, 853, 854, 855, 856]
 - Carry the historical repair plan's RL tickets as rows: each likelihood and the weight version kept, methods composed from explicit choices, lossless episode records, and on-policy distillation. [857, 858, 859, 860]
 - Hold stage-local state in a pipeline and qualify its schedule. [861]
