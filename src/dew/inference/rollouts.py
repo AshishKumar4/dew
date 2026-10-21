@@ -7,6 +7,12 @@ weights while generation keeps running, so in-flight requests finish on
 whichever weights are resident when each token is drawn, and a draw's version
 is the oldest weights that may have produced any of its tokens.
 
+A draw ends where its policy ends one (`check_ending`): on one of the
+`Sampling`'s EOS ids, on the id that completes one of its stop strings, or
+at its budget. vLLM and SGLang both return the ids through the one that
+completes a stop string and say which string matched; Dew's own server keeps
+them too (`dew.sampling.decoding.StopStrings`).
+
 `NativeRolloutServer` drives Dew's continuous-batching `Server` on a
 background thread and loads weights in process. `OpenAIRolloutServer` posts
 token ids to a vLLM or SGLang completions endpoint, and `SafetensorsReload`
@@ -22,7 +28,7 @@ import math
 import os
 import shutil
 import threading
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from pathlib import Path
@@ -36,9 +42,17 @@ from dew.coordination import agreed, collective_host, stop_at_exit
 from dew.nn.inputs import key_seed, request_key, token_id
 from dew.objectives.base import Variables, thaw
 from dew.records import JSON
+from dew.sampling.decoding import EndOfSequence, StopStrings
 from dew.sampling.text import Generation, Sampling
 
-from .clients import OpenAICompletion, decode_routed_experts
+from .clients import (
+    OpenAICompletion,
+    _engine_stops,
+    decode_routed_experts,
+    listed_ids,
+    matched_stop,
+    reported_log_probs,
+)
 from .serving import Server, settled
 
 if TYPE_CHECKING:
@@ -65,8 +79,9 @@ class InfrastructureError(RuntimeError):
 class Draw:
     """One sampled continuation of one prompt.
 
-    `tokens` are the sampled actions, with EOS included when the draw
-    terminated on it. `behavior_log_probs` is the likelihood of each action
+    `tokens` are the sampled actions, with the id that ended the draw
+    included when it terminated: an EOS id, or the id completing a stop
+    string (`check_ending`). `behavior_log_probs` is the likelihood of each action
     under the distribution that drew it. `raw_log_probs` is the unmodified
     model's likelihood, or None when the backend cannot report it. `version`
     is the policy version the request was submitted under. When requested,
@@ -96,20 +111,60 @@ class Draw:
             if not all(math.isfinite(value) for value in probabilities):
                 raise ValueError("drawn likelihoods must be finite")
         if self.terminated and not self.tokens:
-            raise ValueError("a terminated draw ends on its EOS token")
+            raise ValueError("a terminated draw ends on the id that ended it")
         if self.support is not None and len(self.support) != len(self.tokens):
             raise ValueError("a draw's support holds one set of kept ids per drawn token")
 
-    def check_stops(self, stops: tuple[int, ...]) -> Draw:
-        """Return this draw after checking its EOS tokens against the stop ids `stops`.
-
-        Raises ValueError unless the draw ends on a stop id exactly when it
-        terminated, with no stop id before its last token.
-        """
-        if self.terminated != bool(self.tokens and self.tokens[-1] in stops) or any(
-                token in stops for token in self.tokens[:-1]):
-            raise ValueError("the draw's termination disagrees with its EOS tokens")
+    def checked(self, sampling: Sampling) -> Draw:
+        """Return this draw after checking that it ends as `sampling` ends one (`check_ending`)."""
+        check_ending(self.tokens, self.terminated, sampling)
         return self
+
+    def response(self, sampling: Sampling) -> tuple[int, ...]:
+        """The drawn ids a reward reads decoded (`response`)."""
+        return response(self.tokens, sampling)
+
+
+def response(tokens: Sequence[int], sampling: Sampling) -> tuple[int, ...]:
+    """A draw's ids without the EOS id it ended on, as a reward reads them decoded: a stop string's ids
+    stay, as the engines return them and Dew's own tasks keep them."""
+    ids = tuple(tokens)
+    return ids[:-1] if ids and ids[-1] in sampling.stops else ids
+
+
+def through_stop(tokens: Sequence[int], decode: Callable[[Sequence[int]], str],
+                 strings: Sequence[str]) -> int:
+    """The length of the shortest prefix of `tokens` whose decoded text holds one of `strings`: where a
+    draw that a stop string ended ends, as the engines end one in the step whose text first holds it.
+
+    Every prefix is decoded whole, from the first, since a tokenizer's text for a longer prefix need
+    not extend a shorter one's (Transformers' cleanup turns " ." into "."), and ids that decode to
+    nothing may sit inside a string. Raises ValueError where no prefix holds one: the engine and the
+    tokenizer disagree."""
+    for count in range(1, len(tokens) + 1):
+        text = decode(tokens[:count])
+        if any(string in text for string in strings):
+            return count
+    raise ValueError(f"the engine ended the draw on one of {list(strings)}, which no prefix of its "
+                     f"{len(tokens)} ids decodes to; is `decode` the served model's tokenizer?")
+
+def check_ending(tokens: Sequence[int], terminated: bool, sampling: Sampling) -> None:
+    """Raise ValueError unless a draw of `tokens` that `terminated` or not ends as `sampling` ends one.
+
+    An EOS id (`Sampling.stops`) ends a draw, so it is only ever the draw's last id, and a draw that
+    ends on one terminated. A stop string (`Sampling.stop`) ends a draw on the id that completes it,
+    which may be any id, so a terminated draw that ends on no EOS id needs a policy with stop
+    strings. A draw that did not terminate ran to its budget, or a criterion that truncates it cut it.
+    """
+    stops = sampling.stops
+    if any(token in stops for token in tokens[:-1]):
+        raise ValueError("a draw continues past one of its policy's EOS ids")
+    on_eos = bool(tokens) and tokens[-1] in stops
+    if on_eos and not terminated:
+        raise ValueError("a draw that ends on one of its policy's EOS ids terminated")
+    if terminated and not on_eos and not sampling.stop:
+        raise ValueError("a terminated draw ends on one of its policy's EOS ids or completes one of its "
+                         "stop strings, and this policy has no stop strings")
 
 
 class RolloutServer(Protocol):
@@ -166,16 +221,24 @@ class NativeRolloutServer:
     If the program ends without `close`, an exit hook stops the stepping after
     the step in progress.
 
-    A draw ends on one of the policy's EOS ids or at its budget, which is
-    what `Draw.terminated` tells apart. A server whose task adds stopping
-    criteria of its own (stop strings, `MaxNewTokens`) would end draws a
-    rollout cannot tell from a truncation, so it raises ValueError.
+    A draw ends on one of the policy's EOS ids or on the id completing one of
+    its stop strings, and `Draw.terminated` tells those from a draw cut at its
+    budget or by a criterion that truncates it (`MaxNewTokens`). A server
+    whose task ends rows on a criterion of its own besides those, which a
+    draw's policy cannot name, raises ValueError.
     """
 
     def __init__(self, server: Server, *, version: int = 0):
-        if len(server.stopping.ending) + len(server.stopping.truncating) != len(server.sampling.criteria()):
-            raise ValueError("a rollout's draws end on EOS or at their budget; serve a task without stop "
-                             "strings or stopping criteria of its own")
+        ending, sampling = server.stopping.ending, server.sampling
+        named = [criterion for criterion in ending if isinstance(criterion, EndOfSequence)
+                 and set(np.asarray(criterion.eos).reshape(-1).tolist()) == set(sampling.stops)]
+        strings = [criterion for criterion in ending if isinstance(criterion, StopStrings)]
+        # The policy's EOS criterion and the one its stop strings compile to, and nothing beside them.
+        if (len(named), len(strings)) != (len(sampling.criteria()), int(bool(sampling.stop))) or (
+                len(ending) != len(named) + len(strings)):
+            raise ValueError("a rollout's draws end on its policy's EOS ids or stop strings, or are cut "
+                             "short; this server's task also ends rows on criteria of its own, which no "
+                             "draw's policy names")
         self._server = server
         self._version = version
         # Reentrant, so a draw's callback may load weights from inside a step.
@@ -228,7 +291,7 @@ class NativeRolloutServer:
             if not self._claimed(future):  # failed with the stepping thread or by `close`
                 return
             try:
-                draw = _native_draw(ids, done.result(), version).check_stops(self.sampling.stops)
+                draw = _native_draw(ids, done.result(), version).checked(self.sampling)
             except BaseException as failure:
                 # The generation's own failure, or a draw that fails its checks, such as non-finite
                 # likelihoods: the claimed future takes it, since a done-callback's error reaches no one.
@@ -566,7 +629,15 @@ class OpenAIRolloutServer(_RequestServer):
     route, so use `VLLMGenerateServer` for a filtering policy. SGLang's
     `/v1/completions` reports the temperature-scaled distribution before its
     filters, so with SGLang any temperature works but no filter does, and
-    `SGLANG_RETURN_ORIGINAL_LOGPROB` must stay unset. The constructor raises
+    `SGLANG_RETURN_ORIGINAL_LOGPROB` must stay unset. An SGLang draw streams,
+    drawn as the policy without its EOS ids and cut at the first of them
+    (`_streamed`). Both engines end a draw on the policy's stop strings
+    themselves, matched on the text they decode, and return its ids through
+    the one completing the string, but vLLM keeps a speculative block's ids
+    past it (vllm/v1/engine/detokenizer.py:118-131 at v0.30.0). So a policy
+    with stop strings takes `decode`, the policy's tokenizer's, and its draws
+    are cut at the first id whose text completes one (`through_stop`). The
+    constructor raises
     ValueError for the combinations these rules exclude, and for a
     temperature of zero. SGLang honors a seed only under
     `--enable-deterministic-inference`.
@@ -578,7 +649,7 @@ class OpenAIRolloutServer(_RequestServer):
 
     def __init__(self, completion: OpenAICompletion, sampling: Sampling, weights: WeightSync, *,
                  version: int = 0, workers: int = 64, processed_logprobs: bool = False,
-                 routing: bool = False):
+                 routing: bool = False, decode: Callable[[Sequence[int]], str] | None = None):
         engine = completion.provider
         if engine not in _RETURN_IDS:
             raise ValueError("token rollouts need provider='vllm' or 'sglang': ids, seeds and EOS controls "
@@ -604,22 +675,29 @@ class OpenAIRolloutServer(_RequestServer):
             raise ValueError(
                 "routing reads vLLM's per-choice routed_experts (--enable-return-routed-experts)"
             )
+        if sampling.stop and decode is None:
+            raise ValueError("a stop string ends a draw where its decoded text completes it; pass "
+                             "decode=, the policy's tokenizer's, to find that id")
         super().__init__(sampling, weights, version, workers)
         self._completion = completion
         self._return_ids = _RETURN_IDS[engine]
         self._routing = routing
+        self._decode = decode
 
     def _draw(self, prompt: tuple[int, ...], budget: int, seed: int, version: int) -> Draw:
         import openai
 
         try:
+            if self._completion.provider == "sglang":
+                return self._streamed(prompt, budget, seed, version)
             completion = self._completion(
                 [list(prompt)],
                 budget,
                 key=seed,
-                sampling=self._sampling,
+                sampling=replace(self._sampling, stop=()),
                 logprobs=0,
                 extra_body=self._return_ids,
+                **self._strings(),
             )
         except (openai.APIConnectionError, openai.InternalServerError, openai.RateLimitError) as error:
             # Unreachable, timed out, or 5xx or 429 after the client's own retries.
@@ -627,18 +705,110 @@ class OpenAIRolloutServer(_RequestServer):
         tokens, probabilities = completion.tokens[0], completion.log_probs[0]
         if tokens is None or probabilities is None:
             raise ValueError(f"the engine reported no sampled token ids; is it {self._completion.provider}?")
-        stops = self._sampling.stops
-        terminated = bool(tokens) and tokens[-1] in stops
-        reason = completion.finish_reasons[0]
-        if reason != ("stop" if terminated else "length") or (not terminated and len(tokens) != budget):
-            raise ValueError(
-                f"finish reason {reason!r} disagrees with {len(tokens)} drawn ids ending {tokens[-1:]}"
-            )
+        (answer,) = completion.responses
+        assert isinstance(answer, openai.types.Completion)
+        (choice,) = answer.choices
+        matched = matched_stop(choice.to_dict())
+        terminated = _finished(completion.finish_reasons[0], matched, tokens, budget, self._sampling)
         routed = completion.routed_experts[0] if completion.routed_experts else None
         if self._routing and routed is None:
             raise ValueError("vLLM returned no routed_experts; start it with --enable-return-routed-experts")
+        if terminated and matched in self._sampling.stop:
+            assert self._decode is not None
+            # A speculative block's ids past the completing one (the class docstring) are dropped, with
+            # their likelihoods and the routing of the ids forwarded after it.
+            kept = through_stop(tokens, self._decode, self._sampling.stop)
+            tokens, probabilities = tokens[:kept], probabilities[:kept]
+            routed = None if routed is None else routed[:len(prompt) + kept - 1]
         return Draw(prompt, tokens, probabilities, None, terminated, version,
-                    routed if self._routing else None).check_stops(stops)
+                    routed if self._routing else None).checked(self._sampling)
+
+    def _strings(self) -> dict[str, JSON]:
+        """The request field that ends a draw on the policy's stop strings, which the engine matches on
+        the text it decodes. Dew's text completions refuse `Sampling.stop`, since the engine cuts the
+        string from the text it returns; a rollout reads the ids, which run through it."""
+        return {"stop": list(self._sampling.stop)} if self._sampling.stop else {}
+
+    def _streamed(self, prompt: tuple[int, ...], budget: int, seed: int, version: int) -> Draw:
+        """One SGLang draw, streamed, and cut at the policy's first EOS id.
+
+        SGLang ends a request that names stop ids on its model's EOS ids as
+        well, and its one field that turns those off, `ignore_eos`, turns off
+        the named stops too (sglang/srt/managers/schedule_batch.py:1707-1729
+        at v0.5.20). So the policy is drawn as one without EOS ids, which ends
+        on its budget or a stop string, and the draw is cut where the policy
+        stops: the same distribution, since no later id shapes an earlier one.
+        `ignore_eos` leaves the stop strings to end the request
+        (`_check_str_based_finish`, beside the token check it skips, at
+        v0.5.20). The draw is streamed so that closing the stream at the stop
+        ends the request there, rather than when the budget runs out: SGLang
+        aborts a request whose client disconnects.
+        """
+        import openai
+
+        stops = self._sampling.stops
+        tokens: list[int] = []
+        probabilities: list[float] = []
+        reason: str | None = None
+        matched: str | int | None = None
+        ended: int | None = None
+        unstopped = replace(self._sampling, eos_token_ids=None, stop=())
+        with self._completion.stream([list(prompt)], budget, key=seed, sampling=unstopped, logprobs=0,
+                                     extra_body=self._return_ids, **self._strings()) as chunks:
+            for chunk in _engine_chunks(chunks, openai.APIError):
+                # A chunk's ids may run ahead of its log-probabilities (SGLang slices the two apart),
+                # so each is read whole and they are matched by position.
+                for entry in chunk.choices:
+                    choice = entry.to_dict()
+                    ids, reported = listed_ids(choice), reported_log_probs(choice)
+                    if ids is None:
+                        raise ValueError("SGLang streamed no sampled token ids; is return_token_ids set?")
+                    if ended is None:
+                        stopped = next((index for index, token in enumerate(ids) if token in stops), None)
+                        ended = None if stopped is None else len(tokens) + stopped
+                    tokens.extend(ids)
+                    probabilities.extend(() if reported is None else reported[1])
+                    reason = entry.finish_reason or reason
+                    reported_stop = matched_stop(choice)
+                    matched = matched if reported_stop is None else reported_stop
+                if ended is not None and len(probabilities) > ended:
+                    break
+        if ended is not None:
+            tokens, probabilities = tokens[:ended + 1], probabilities[:ended + 1]
+        terminated = ended is not None or _finished(reason, matched, tokens, budget, self._sampling)
+        if ended is None and terminated:
+            # SGLang returns a string's ids through the completing one (`_locate_str_stop_finished_len`
+            # at v0.5.20); the cut holds it to the one rule all servers keep.
+            assert self._decode is not None
+            kept = through_stop(tokens, self._decode, self._sampling.stop)
+            tokens, probabilities = tokens[:kept], probabilities[:kept]
+        if len(probabilities) != len(tokens):
+            raise ValueError(f"SGLang streamed {len(tokens)} ids and {len(probabilities)} log-probabilities")
+        return Draw(prompt, tuple(tokens), tuple(probabilities), None, terminated,
+                    version).checked(self._sampling)
+
+
+def _finished(reason: str | None, matched: str | int | None, tokens: Sequence[int], budget: int,
+              sampling: Sampling) -> bool:
+    """Whether an engine's draw of `tokens` terminated, read from its finish reason and the stop it says
+    matched (vLLM's `stop_reason`, SGLang's `matched_stop`): a stopped draw ends on an EOS id of the
+    policy or on one of its stop strings, and a draw that did not stop ran to its budget."""
+    if reason == "length" and len(tokens) == budget:
+        return False
+    if reason == "stop" and ((tokens and tokens[-1] in sampling.stops) or matched in sampling.stop):
+        return True
+    raise ValueError(f"finish reason {reason!r}, matching {matched!r}, disagrees with {len(tokens)} drawn "
+                     f"ids ending {list(tokens[-1:])} under a budget of {budget}")
+
+
+def _engine_chunks[Chunk](chunks: Iterable[Chunk], failure: type[Exception]) -> Iterator[Chunk]:
+    """`chunks` as a stream yields them; a `failure` while it streams (its connection dropped, or
+    the engine's error event, which SGLang sends for an abort, a timeout or an out-of-memory) is
+    an infrastructure failure."""
+    try:
+        yield from chunks
+    except failure as error:
+        raise InfrastructureError(f"the stream failed: {type(error).__name__}: {error}") from error
 
 
 class VLLMGenerateServer(_RequestServer):
@@ -682,9 +852,8 @@ class VLLMGenerateServer(_RequestServer):
         sampling = self._sampling
         parameters: dict[str, JSON] = {"temperature": sampling.temperature, "top_p": sampling.top_p,
                                        "top_k": sampling.top_k, "min_p": sampling.min_p,
-                                       "max_tokens": budget, "seed": seed, "logprobs": 0}
-        if sampling.eos_token_ids is not None:
-            parameters["stop_token_ids"] = list(sampling.stops)
+                                       "max_tokens": budget, "seed": seed, "logprobs": 0,
+                                       **_engine_stops(sampling, "vllm")}
         response = _post(self._root, "/inference/v1/generate",
                          {"token_ids": list(prompt), "sampling_params": parameters}, self._timeout)
         (choice,) = response.json()["choices"]
@@ -697,10 +866,7 @@ class VLLMGenerateServer(_RequestServer):
         routed = choice.get("routed_experts")
         if self._routing and routed is None:
             raise ValueError("vLLM returned no routed_experts; start it with --enable-return-routed-experts")
-        stops = sampling.stops
-        terminated = bool(tokens) and tokens[-1] in stops
-        if choice["finish_reason"] != ("stop" if terminated else "length"):
-            raise ValueError(f"finish reason {choice['finish_reason']!r} disagrees with the drawn ids")
+        terminated = _finished(choice["finish_reason"], matched_stop(choice), tokens, budget, sampling)
         return Draw(prompt, tokens, probabilities, None, terminated, version,
                     decode_routed_experts(routed) if self._routing else None,
-                    tuple(tuple(kept) for kept in mask)).check_stops(stops)
+                    tuple(tuple(kept) for kept in mask)).checked(sampling)

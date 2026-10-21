@@ -20,10 +20,10 @@ imports and compiles), which is what armada measured the file at beyond its
 tests' times in tests/test_durations.json, at the cut its rows were last timed
 at and shared among that cut's groups (`measured_cut`), so the file takes the
 fewest groups whose heaviest, setup included, holds to `target` (`split`). A file weighs armada's
-median of its last green runs, else its tests' sum in
-tests/test_durations.json, else the mean. Each entry names its rows, one a
-file (or a file's group), so armada grades a task that leaves one out as not
-green, and armada queues the heaviest entries first.
+median of its last green runs, or its tests' sum in tests/test_durations.json where that is more
+(those runs may predate the file's current tests), else that sum scaled to armada, else the mean.
+Each entry names its rows, one a file (or a file's group), so armada grades a task that leaves
+one out as not green, and armada queues the heaviest entries first.
 
 A task runs its files under its Python's environment (tools/armada/install.sh)
 with CI's selection, and writes a verdict row for each. A row is red on a
@@ -300,16 +300,23 @@ def recorded_tests() -> dict[str, list[float]]:
 
 def weights(files: list[str], timings: dict, python: str = PYTHONS[0]) -> dict[str, float | None]:
     """Each file's seconds on armada under `python`: its median, which armada
-    sums over a split file's groups (`task`); else its tests' sum in
-    tests/test_durations.json, scaled by how much slower armada ran the files
-    measured both ways; else None, for a file nothing has timed."""
+    sums over a split file's groups (`task`), or its tests' sum in
+    tests/test_durations.json where that is more: each test's record is its
+    least time (`durations`), so a sum past the median may mean the measured
+    runs predate the file's current tests, and the sum is a floor on what it
+    takes. base/kernels' route census, 1,576 tests recorded at 2,654 s in a
+    file main ran in 6 s, was packed by that median with six other files into
+    one task, which ran past its deadline (train 18). Else the recorded sum, scaled by
+    how much slower armada ran the files measured both ways; else None, for a
+    file nothing has timed."""
     recorded = {name: sum(tests) for name, tests in recorded_tests().items()}
     measured = {name: timings.get("files", {})[row(python, name, "")] for name in files
                 if row(python, name, "") in timings.get("files", {})}
     ratios = sorted(measured[name] / recorded[name] for name in files
                     if name in measured and recorded.get(name, 0) > 1)
     slower = ratios[len(ratios) // 2] if ratios else 1.0
-    return {name: measured.get(name, recorded[name] * slower if name in recorded else None) for name in files}
+    return {name: max(measured[name], recorded.get(name, 0.0)) if name in measured
+            else recorded[name] * slower if name in recorded else None for name in files}
 
 
 def row(python: str, name: str, split: str) -> str:
@@ -523,6 +530,14 @@ the libraries offline, and the Hub's address a closed port for any that would as
 test that needs the Hub is marked network; one that reads a model or dataset otherwise brings it."""
 
 
+def apportioned(own_seconds: Mapping[str, float], wall: float, rows: int) -> dict[str, float]:
+    """Each file's share of a task's `wall` time, in proportion to its tests' own times (`task`), or an
+    even split over the task's `rows` (a file named twice is two) where no test recorded a time."""
+    total = sum(own_seconds.values())
+    pace = wall / total if total > 0 else 0.0
+    return {name: own * pace if pace else wall / rows for name, own in own_seconds.items()}
+
+
 def task(python: str, tests: list[str], split: str, out: Path, deadline: float, cache: bool = True,
          grace: float = 60.0, coverage: Path | None = None) -> int:
     """Run `tests` and write one verdict row a file, interrupting them past `deadline` seconds and
@@ -600,8 +615,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     ran = []
     own_seconds = {name: sum(float(case.get("time") or 0) for case in cases if file_of(case) == name)
                    for name in tests}
-    wall = time.monotonic() - began
-    pace = wall / sum(own_seconds.values()) if sum(own_seconds.values()) > 0 else 0.0
+    shares = apportioned(own_seconds, time.monotonic() - began, len(tests))
     for name in tests:
         own = [case for case in cases if file_of(case) == name]
         red = [f"{kind.upper()} {case.get('classname')}::{case.get('name')}: {node.get('message')}"
@@ -615,7 +629,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
             red.append(f"pytest exited {done.returncode}" + ("" if own else f" with no report of {name}"))
         if expired:
             red.append(f"the task ran past its deadline of {deadline:.0f} s and was interrupted")
-        seconds = own_seconds[name] * pace if pace else wall / len(tests)
+        seconds = shares[name]
         # armada times a file at the sum of its rows' timings, a split file's groups together, each
         # Python's apart.
         ran.append({"name": row(python, name, split), "exitCode": 1 if red else 0, "seconds": seconds,

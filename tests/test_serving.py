@@ -395,6 +395,20 @@ def test_submission_keeps_device_keys_on_device_until_admission():
     assert_same_generation(ticket.result(), bound(prompt[None], 5, key=key))
 
 
+def test_a_request_keyed_by_another_prng_implementation_is_refused_before_it_queues():
+    """A server makes each admission's keys with the default PRNG implementation, so a key of
+    another one (rbg) is refused at submission, before anything queues, and a request beside it
+    draws the sampled tokens and likelihoods the one-row task draws."""
+    bound = task(Sampling(temperature=1.0, top_k=5, eos_token_ids=None))
+    prompt = np.asarray([1, 2, 3], np.int32)
+    server = Server.from_task(bound, slots=2, capacity=128, admission=2)
+    with pytest.raises(ValueError):
+        server.submit(prompt, 5, key=jax.random.key(7, impl="rbg"))
+    ticket = server.submit(prompt, 5, key=3)
+    server.run()
+    assert_same_generation(ticket.result(), bound(prompt[None], 5, key=3))
+
+
 @pytest.mark.parametrize("seed", [7, 2**31, -1, 2**40 + 3])
 def test_a_request_with_an_integer_seed_launches_nothing_until_admission(seed):
     """Submitting with an integer seed moves nothing to the device, not even
@@ -883,6 +897,25 @@ def test_a_user_decoder_module_is_packed_where_it_names_its_groups():
                         bound.sampling, bound.processor)
     for actual, prompt in zip(server(PROMPTS[:2], 5, key=3), PROMPTS[:2], strict=True):
         assert_same_generation(actual, retrained(prompt, 5, key=3))
+
+
+def test_a_projection_quantized_apart_from_its_group_is_served_unpacked():
+    """A model quantized by its modules' paths (`Quantization.patterns`) selecting its query
+    projection alone keeps its query, key and value apart, each quantized as the pattern selects it,
+    and packs its gate and up projections, which no pattern selects: a server draws what the task
+    draws on its own. Packed, the query was served as `qkv_proj`, which the pattern does not
+    select, so unquantized."""
+    from dew.inference.projections import projection_groups
+    from dew.quantization import Quantization
+
+    bound = task(Sampling(temperature=0, eos_token_ids=None))
+    quantized = Quantization(patterns=(".*/q_proj",)).apply(bound.model)
+    groups = {group.packed for group in projection_groups(quantized, bound.variables)}
+    assert "qkv_proj" not in groups and "gate_up_proj" in groups
+    alone = TextGeneration(quantized, bound.variables, bound.processor, sampling=bound.sampling)
+    server = Server.from_task(alone, slots=2, capacity=128)
+    for actual, prompt in zip(server(PROMPTS[:2], 5, key=3), PROMPTS[:2], strict=True):
+        assert_same_generation(actual, alone(prompt, 5, key=3))
 
 
 @pytest.mark.parametrize("finished", [True, False], ids=["prefilled", "prefilling"])
