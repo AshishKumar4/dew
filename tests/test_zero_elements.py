@@ -297,8 +297,8 @@ def test_a_bound_survives_underflow_in_products_quotients_and_dots():
     for out in (quotient, dotted, flushed, amplified):
         assert not out.exact.any() and (out.error > 0).all()
     assert float(flushed.error) >= 2.0 ** -654
-    exact = fractions.Fraction(2) ** -74
-    assert fractions.Fraction(float(amplified.error)) >= abs(exact - fractions.Fraction(float(amplified.value)))
+    apart = abs(fractions.Fraction(2) ** -74 - fractions.Fraction(float(amplified.value)))
+    assert fractions.Fraction(float(amplified.error)) >= apart
 
 
 def test_a_correctly_rounded_float64_quotient_is_certified():
