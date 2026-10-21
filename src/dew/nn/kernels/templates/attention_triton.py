@@ -640,13 +640,15 @@ class TritonBackward(Template[BackwardTiles]):
                      if queries % tiles.block_q == 0 and keys % tiles.block_k == 0)
 
     def staged_bytes(self, ba: tokamax.BoundArguments, config: BackwardTiles) -> int:
-        """The shared memory a program of either launch holds, the larger: each stage's query,
-        output-gradient, key and value tiles, in the operands' dtype."""
+        """The shared memory a program of either launch holds, the larger, in the operands' dtype: a dQ
+        program its query and output-gradient tiles once and each stage's key and value tiles; a dK/dV
+        program its key and value tiles once and each stage's query and output-gradient tiles."""
         query, value = ba.arguments["query"], ba.arguments["value"]
         size = jnp.dtype(query.dtype).itemsize
         width, value_width = query.shape[-1], value.shape[-1]
-        return (max(config.dq_stages, config.dkv_stages) * (config.block_q + config.block_k)
-                * (width + value_width) * size)
+        rows = max(config.block_q + config.dq_stages * config.block_k,
+                   config.block_k + config.dkv_stages * config.block_q)
+        return rows * (width + value_width) * size
 
     def cost(self, ba: tokamax.BoundArguments, config: BackwardTiles, target: generation.GpuTarget) -> float:
         """Both launches' (`_launch_cost`): every tile of the call (a bound: the spans are traced, so a
