@@ -88,11 +88,15 @@ Where the cost model ties, the first wins: the deeper step, which synchronizes i
 a tile (at 128 x 256 on an H100, a step of 64 took 1.56 ms where 32 took 1.78, GMM-h100-2), and the
 more warps."""
 
-MOSAIC_TILES = tuple(mosaic_gpu.Tiles(*shape) for shape in itertools.product(
-    (128, 192, 64), (128, 192, 64), (64,), (4, 5, 2), (8, 4, 2, 1)))
-"""Every tile the Mosaic GPU launches may take: the sweep JAX ships with the kernels
-(`ragged_dot_mgpu.main`), where an H100's fastest lie (GMM-h100-3). Where the cost model ties, the first
-wins."""
+MOSAIC_TILES = tuple(
+    mosaic_gpu.Tiles(*shape, warpgroups=2, cluster=pair)
+    for *shape, pair in itertools.product((128,), (256, 128), (64,), (4, 3, 5), (8, 4, 2, 1), (2, 1))) + tuple(
+    mosaic_gpu.Tiles(*shape) for shape in itertools.product((128, 192, 64), (128, 192, 64), (64,), (4, 5, 2),
+                                                             (8, 4, 2, 1)))
+"""Every tile the Mosaic GPU launches may take: tiles two consumer warpgroups compute, CUTLASS's
+cooperative sm90 schedule (128 x 256, a pair of multiprocessors sharing each matrix block), first, then
+the sweep JAX ships with its one-warpgroup kernels (`ragged_dot_mgpu.main`), where an H100's fastest
+lay (GMM-h100-3). Where the cost model ties, the first wins."""
 
 INTERPRETED = plgpu.InterpretGPUParams(out_of_bounds_reads="uninitialized")
 """How a CPU interprets the Mosaic GPU launches: a read past an operand's rows, which a TMA load zeroes,
@@ -623,7 +627,10 @@ class MosaicGmm(_Mosaic):
     def space(self, ba) -> tuple[mosaic_gpu.Tiles, ...]:
         kernel = ba.arguments['kernel']
         depth, width = (kernel.shape[2], kernel.shape[1]) if ba.arguments['trans_rhs'] else kernel.shape[1:]
-        return tuple(tile for tile in MOSAIC_TILES if depth % tile.block_k == 0 and width % tile.block_n == 0)
+        # A prologue rewrites a stage one warpgroup owns: a tile two compute cannot take one.
+        alone = ba.arguments['hooks'].prologue is not None
+        return tuple(tile for tile in MOSAIC_TILES if depth % tile.block_k == 0 and width % tile.block_n == 0
+                     and not (alone and tile.warpgroups == 2))
 
     @staticmethod
     def extents(tile: mosaic_gpu.Tiles) -> dict:
@@ -674,7 +681,8 @@ class MosaicTgmm(_Mosaic):
 
     def space(self, ba) -> tuple[mosaic_gpu.Tiles, ...]:
         depth, width = ba.arguments['tokens'].shape[1], ba.arguments['cotangent'].shape[1]
-        return tuple(tile for tile in MOSAIC_TILES if depth % tile.block_m == 0 and width % tile.block_n == 0)
+        return tuple(tile for tile in MOSAIC_TILES if depth % tile.block_m == 0 and width % tile.block_n == 0
+                     and tile.warpgroups == 1)
 
     def fitting(self, ba, target) -> tuple[mosaic_gpu.Tiles, ...]:
         """The tiles that fit `target` (`Template.fitting`), with `exact_sums` those whose two fp32
