@@ -236,6 +236,8 @@ def _promoted(pipeline: Pipeline) -> Pipeline:
     rows arrive."""
     from dew.data.generation import Generation, _GenerationSource
     from dew.data.packing import PackedSource, chunks_for, plan_name
+    from dew.data.sources.tokens import TokenFiles
+    from dew.data.steps.windows import WindowSource
 
     def cutting(stages: Sequence[Stage]) -> int | None:
         """The overlap of a chunk step that cuts documents as the pack after it plans them
@@ -272,6 +274,11 @@ def _promoted(pipeline: Pipeline) -> Pipeline:
         and source.lengths() is not None
     ):
         source, stages = PackedSource.planned(source, pack, overlap=overlap), stages[at + 1 :]
+    first = stages[0] if stages else None
+    if isinstance(first, Windows) and first.fields == ("text",) and isinstance(source, TokenFiles):
+        # A token store's own stream, cut where the windows are written: read by index.
+        stride = first.seq_len if first.stride is None else first.stride
+        source, stages = WindowSource(source, source.tokens, first.seq_len, stride), stages[1:]
     return dataclasses.replace(pipeline, source=source, stages=stages)
 
 
