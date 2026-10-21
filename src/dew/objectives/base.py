@@ -197,21 +197,23 @@ class Step:
                              f"asked for {rows} rows")
         return self.example_index
 
-    def sample(self, name: str, draw: Callable[..., jax.Array], *shape: int, dtype=None,
-               rows: int) -> jax.Array:
-        """`draw(key, *shape, dtype=dtype)` for each of `rows` examples, under the example's own key
-        folded with `name` (`stream`): `[rows, *shape]`, the same values an example draws on any layout.
-        `dtype` is the draw's own, never a model's, so a float64 twin draws what the run drew; None
-        calls `draw(key, *shape)`, a draw that fixes its own. With a `tape` holding `name`, its rows for
-        these examples instead."""
+    def sample(self, name: str, draw: Callable[..., jax.Array], shape: tuple[int, ...] | None = None, *,
+               dtype=None, rows: int) -> jax.Array:
+        """`draw(key, shape, dtype=dtype)` for each of `rows` examples, under the example's own key
+        folded with `name` (`stream`): `[rows, *shape]`, the same values an example draws on any layout,
+        as `jax.random`'s draws take them. `dtype` is the draw's own, never a model's, so a float64 twin
+        draws what the run drew; None leaves it out, and `shape` None calls `draw(key)`, a draw that fixes
+        both. With a `tape` holding `name`, its rows for these examples instead."""
         examples = self.examples(rows)
         if self.tape is not None and name in self.tape:
             value = jnp.take(self.tape[name], examples, axis=0)
         else:
             key = jax.random.fold_in(self.key if self.example_key is None else self.example_key, stream(name))
+            given = () if shape is None else (shape,)
+            options = {} if dtype is None else {"dtype": dtype}
+
             def drawn(example):
-                example_key = jax.random.fold_in(key, example)
-                return draw(example_key, *shape) if dtype is None else draw(example_key, *shape, dtype=dtype)
+                return draw(jax.random.fold_in(key, example), *given, **options)
 
             value = jax.vmap(drawn)(examples)
         if self.recorder is not None:

@@ -765,7 +765,7 @@ class DiffusionObjective(Objective[Ratio]):
             samples = end_to_end.samples
         else:
             samples = self.clean_samples(variables, batch, encode_key)
-        noise = step.sample("noise", jax.random.normal, *samples.shape[1:], dtype=jnp.float32, rows=count)
+        noise = step.sample("noise", jax.random.normal, samples.shape[1:], dtype=jnp.float32, rows=count)
         # The times are drawn in float32 and read at the samples' precision,
         # so a float64 run interpolates in float64.
         t = t.astype(jnp.promote_types(samples.dtype, t.dtype))
