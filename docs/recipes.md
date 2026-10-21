@@ -168,7 +168,7 @@ A JEPA configuration adds predictor fields, target-mask settings and optional re
 from flax import linen as nn
 
 from dew.config import ModelConfig, ObjectiveConfig, RunConfig, TrainerConfig
-from dew.config.data import RecordsData
+from dew.data import Files
 from dew.inputs import Field, InputSpec
 from dew.objectives.supervised import Accuracy, CrossEntropy
 
@@ -183,10 +183,10 @@ class MLP(nn.Module):
 
 run = RunConfig(
     model=ModelConfig.from_model(MLP(hidden=32)),
-    data=RecordsData(source="rows.jsonl"),
+    data=Files("rows.jsonl").shuffle(seed=0).repeat().batch(64),
     objective=ObjectiveConfig("supervised", {
         "loss": CrossEntropy(), "metrics": (Accuracy(),), "inputs": InputSpec(Field("x", (2,)))}),
-    trainer=TrainerConfig(steps=300, batch_size=64))
+    trainer=TrainerConfig(steps=300))
 ```
 
 ```bash
