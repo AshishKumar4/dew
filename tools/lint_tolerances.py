@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import ast
 import re
-from collections.abc import Iterable, Iterator, Mapping, Set
+from collections.abc import Callable, Iterable, Iterator, Mapping, Set
 from dataclasses import dataclass, field
 from typing import Protocol
 
@@ -70,8 +70,9 @@ def _called(node: ast.Call, table: Mapping[str, str]) -> str:
 @dataclass
 class _Reading:
     """What SLOP020 knows of one file: each node's import table, its calls' definitions, and the ids of
-    its functions that may return an error or a difference, and of those that return only a margin; and,
-    for each function every return of which is a tuple, the places of it that may hold an error."""
+    its functions that may return an error or a difference, and of those that return only a margin or
+    only whole numbers; for each function every return of which is a tuple, the places of it that may
+    hold an error; and whether an imported function returns only whole numbers (`comparisons`)."""
     tables: Mapping[int, Mapping[str, str]]
     calls: Calls
     erring: set[int]
@@ -79,6 +80,7 @@ class _Reading:
     margining: set[int]
     counting: set[int] = field(default_factory=set)
     erring_at: dict[int, set[int]] = field(default_factory=dict)
+    whole_import: Callable[[str], bool] = field(default=lambda called: False)
 
 
 @dataclass
@@ -230,9 +232,9 @@ def _counted(value: ast.AST, scope: _Scope | None = None, reading: _Reading | No
     """Whether `value` is a whole number, or holds only whole numbers, by an explicit construction: an
     int literal, a truth value, an `int`, `len`, one-argument `round` or `.count` call, `range`, a
     `sum`, `max` or `min` of whole numbers, a container, comprehension or element of them, arithmetic
-    that keeps them whole, a name every binding of which is one, or a call of a function of the file
-    every return of which is one (`delivered` returning its token counts). Nothing is whole by its
-    name or its use."""
+    that keeps them whole, a name every binding of which is one, or a call of a function of the file, or
+    one it imports (`whole_import`), every return of which is one (`delivered` returning its token
+    counts). Nothing is whole by its name or its use."""
     def counted(part):
         return _counted(part, scope, reading, seen)
 
@@ -270,7 +272,10 @@ def _counted(value: ast.AST, scope: _Scope | None = None, reading: _Reading | No
     if isinstance(value.func, ast.Name) and value.func.id in {"sum", "max", "min", "range"} and value.args \
             and not value.keywords:
         return all(counted(argument) for argument in value.args)
-    return scope is not None and reading is not None and _returned(value, scope, reading, reading.counting)
+    if scope is None or reading is None:
+        return False
+    return _returned(value, scope, reading, reading.counting) or reading.whole_import(
+        _called(value, reading.tables.get(id(value), {})))
 
 
 def _measured(inner: ast.AST, scope: _Scope, reading: _Reading) -> tuple[bool, bool]:
@@ -472,17 +477,141 @@ def _relation(left: ast.AST, right: ast.AST, scope: _Scope, reading: _Reading) -
     return None
 
 
-def comparisons(tree: ast.Module, tables: Mapping[int, Mapping[str, str]], calls: Calls
-                ) -> Iterator[tuple[ast.AST, str]]:
-    """Each place a file compares floats within a tolerance, and what it is (its nodes' import tables
-    `tables`, its calls' definitions `calls`): a tolerance API not told to
-    compare exactly (`_exact`), `atol` or `rtol` handed to any call, an ordering relation that compares
-    within a tolerance (`_relation`), and a name bound to a tolerance. What is known of a value only
-    adds findings: nothing is exempted as whole or as a time, so a bound on a count, a time or a mask
-    of positions is written as a plain ordering (lo <= x <= hi, or x - y < w for a window). SLOP020
-    reads conventional code: it does not prove what an obfuscated one computes (a shadowed built-in, a
-    mutated alias), which review does."""
-    reading = _Reading(tables, calls, set(), set(), set())
+def _same(one: ast.AST, other: ast.AST) -> bool:
+    return ast.dump(one) == ast.dump(other)
+
+
+def _fractional(bound: ast.AST, scope: _Scope, reading: _Reading) -> bool:
+    """Whether a bound evidently holds a fraction: a nonzero float literal, a true division or a margin
+    (`_margin`: `tol`, `eps`) anywhere in it. Whole bounds (`16 <= hits <= 48`, `3 * batches`) bound a
+    count, as a count of unknown provenance is most often one."""
+    return any(_floating(part) or (isinstance(part, ast.BinOp) and isinstance(part.op, ast.Div))
+               or (isinstance(part, ast.Name | ast.Attribute) and _margin(part, scope, reading))
+               for part in ast.walk(bound))
+
+
+def _written(bound: ast.AST, scope: _Scope) -> ast.AST | None:
+    """A bound written out (`_literal`), as it is or through a name the scope binds only to it."""
+    if _literal(bound):
+        return bound
+    if isinstance(bound, ast.Name):
+        found = _bound_to(bound.id, scope)
+        if len(found) == 1 and _literal(found[0]):
+            return found[0]
+    return None
+
+
+def _number(bound: ast.AST | None) -> float | None:
+    """A written-out bound's value (`1 / 8`, `-1.0`), or None where it is not arithmetic of numbers."""
+    if isinstance(bound, ast.Constant) and type(bound.value) in (int, float):
+        return float(bound.value)
+    if isinstance(bound, ast.UnaryOp) and isinstance(bound.op, ast.USub | ast.UAdd):
+        operand = _number(bound.operand)
+        return None if operand is None else -operand if isinstance(bound.op, ast.USub) else operand
+    if isinstance(bound, ast.BinOp):
+        left, right = _number(bound.left), _number(bound.right)
+        operations = {ast.Add: float.__add__, ast.Sub: float.__sub__, ast.Mult: float.__mul__,
+                      ast.Div: float.__truediv__}
+        operation = operations.get(type(bound.op))
+        if left is not None and right is not None and operation is not None and (
+                right != 0 or not isinstance(bound.op, ast.Div)):
+            return operation(left, right)
+    return None
+
+
+def _band(lower: ast.AST, value: ast.AST, upper: ast.AST, scope: _Scope, reading: _Reading) -> bool:
+    """Whether `lower <= value <= upper` holds a float in a band around a target: a value neither whole
+    nor a duration, between bounds one of which holds a fraction (`_fractional`), both written out, as
+    they are or through names (`2.25 <= ratio <= 3.75`, `-1e-6 <= residual <= 1e-6`), a target less
+    and plus one width (`c - w <= value <= c + w`), or a target scaled by two written-out factors
+    (`0.75 * c <= value <= 1.25 * c`). A bound at a domain's edge leaves one side alone, which is no
+    band: zero either way asks a sign, and 1 above or -1 below is a share's or a cosine's edge (the
+    busiest of eight shares in [1 / 8, 1], a cosine in [-1, 1]). A duration's floor and timeout time
+    it, and a bound that is a reading (a task's wall time) is no target."""
+    low, high = _written(lower, scope), _written(upper, scope)
+    bounds = [bound for bound in (lower, upper, low, high) if bound is not None]
+    if _counted(value, scope, reading) or _clocked(value, scope, reading):
+        return False
+    if _number(low) in (0.0, -1.0) or _number(high) in (0.0, 1.0):
+        return False
+    if not any(_fractional(bound, scope, reading) for bound in bounds):
+        return False
+    if low is not None and high is not None:
+        return True
+    if not (isinstance(lower, ast.BinOp) and isinstance(upper, ast.BinOp)):
+        return False
+    if isinstance(lower.op, ast.Sub) and isinstance(upper.op, ast.Add):
+        return (_same(lower.left, upper.left) and _same(lower.right, upper.right)) or (
+            _same(lower.left, upper.right) and _same(lower.right, upper.left))
+    if isinstance(lower.op, ast.Mult) and isinstance(upper.op, ast.Mult):
+        return any(_same(target, other) and _literal(factor) and _literal(scale)
+                   for target, factor in ((lower.left, lower.right), (lower.right, lower.left))
+                   for other, scale in ((upper.left, upper.right), (upper.right, upper.left)))
+    return False
+
+
+def _chained_band(node: ast.Compare, scope: _Scope, reading: _Reading) -> bool:
+    """Whether a chain bounds a value on both sides in a band (`_band`), written either way round."""
+    sides = [node.left, *node.comparators]
+    for place, (first, second) in enumerate(zip(node.ops[:-1], node.ops[1:], strict=True)):
+        lower, value, upper = sides[place:place + 3]
+        if all(isinstance(op, ast.Lt | ast.LtE) for op in (first, second)) and _band(
+                lower, value, upper, scope, reading):
+            return True
+        if all(isinstance(op, ast.Gt | ast.GtE) for op in (first, second)) and _band(
+                upper, value, lower, scope, reading):
+            return True
+    return False
+
+
+def _conjunction(node: ast.AST) -> bool:
+    return (isinstance(node, ast.BoolOp) and isinstance(node.op, ast.And)) or (
+        isinstance(node, ast.BinOp) and isinstance(node.op, ast.BitAnd))
+
+
+def _bounds(node: ast.AST) -> Iterator[tuple[ast.AST, str, ast.AST, ast.Compare]]:
+    """Each one-relation ordering a conjunction holds (`and`, or `&` of masks), as (value, "lower" or
+    "upper", bound, the ordering) for both its sides."""
+    assert isinstance(node, ast.BoolOp | ast.BinOp)
+    parts = node.values if isinstance(node, ast.BoolOp) else [node.left, node.right]
+    for part in parts:
+        if _conjunction(part):
+            yield from _bounds(part)
+            continue
+        if not (isinstance(part, ast.Compare) and len(part.ops) == 1):
+            continue
+        left, op, right = part.left, part.ops[0], part.comparators[0]
+        if isinstance(op, ast.Gt | ast.GtE):
+            left, right = right, left
+        elif not isinstance(op, ast.Lt | ast.LtE):
+            continue
+        yield right, "lower", left, part
+        yield left, "upper", right, part
+
+
+def _conjoined_bands(node: ast.AST, scope: _Scope, reading: _Reading) -> int:
+    """How many values a conjunction bounds on both sides in a band (`_band`): `lo <= x and x <= hi`,
+    or `(x > lo) & (x < hi)`, each counted once. A band one of whose orderings is found a tolerance on
+    its own (`_relation`) is found there, not again."""
+    found: dict[str, dict[str, list[tuple[ast.AST, ast.Compare]]]] = {}
+    values: dict[str, ast.AST] = {}
+    for value, side, bound, part in _bounds(node):
+        key = ast.dump(value)
+        values.setdefault(key, value)
+        found.setdefault(key, {"lower": [], "upper": []})[side].append((bound, part))
+
+    def alone(part: ast.Compare) -> bool:
+        return not _relation(part.left, part.comparators[0], scope, reading)
+
+    return sum(any(_band(lower, values[key], upper, scope, reading) and alone(low) and alone(high)
+                   for lower, low in sides["lower"] for upper, high in sides["upper"])
+               for key, sides in found.items())
+
+
+def _read(tree: ast.Module, tables: Mapping[int, Mapping[str, str]], calls: Calls,
+          whole_import: Callable[[str], bool]) -> tuple[_Reading, list[ast.AST]]:
+    """What SLOP020 knows of a file's functions (`_Reading`), and the file's scopes."""
+    reading = _Reading(tables, calls, set(), set(), set(), whole_import=whole_import)
     nodes = [tree, *(node for node in ast.walk(tree) if isinstance(node, scopes.SCOPES))]
     functions = [node for node in nodes if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)]
     # Which functions return only tuples is read first, from their returns' shapes alone, so a call of one
@@ -514,6 +643,34 @@ def comparisons(tree: ast.Module, tables: Mapping[int, Mapping[str, str]], calls
                     grew = True
         if not grew:
             break
+    return reading, nodes
+
+
+def whole_functions(tree: ast.Module, tables: Mapping[int, Mapping[str, str]], calls: Calls) -> set[str]:
+    """The names of a file's module-level functions every return of which is whole (`_counted`), read
+    for a file that imports one; what they call through an import of their own is not followed."""
+    reading, _ = _read(tree, tables, calls, lambda called: False)
+    return {node.name for node in tree.body
+            if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and id(node) in reading.counting}
+
+
+def comparisons(tree: ast.Module, tables: Mapping[int, Mapping[str, str]], calls: Calls,
+                whole_import: Callable[[str], bool] = lambda called: False) -> Iterator[tuple[ast.AST, str]]:
+    """Each place a file compares floats within a tolerance, and what it is (its nodes' import tables
+    `tables`, its calls' definitions `calls`, and whether a function it imports returns only whole
+    numbers, `whole_import` of its dotted name): a tolerance API not told to
+    compare exactly (`_exact`), `atol` or `rtol` handed to any call, an ordering relation that compares
+    within a tolerance (`_relation`), and a name bound to a tolerance. What is known of a value only
+    adds findings: nothing is exempted as whole or as a time, so a bound on a count, a time or a mask
+    of positions is written as a plain ordering (lo <= x <= hi, or x - y < w for a window). SLOP020
+    reads conventional code: it does not prove what an obfuscated one computes (a shadowed built-in, a
+    mutated alias), which review does."""
+    reading, nodes = _read(tree, tables, calls, whole_import)
+    # A band is a test's claim: what an assertion holds, not a schedule's window in a test's helper.
+    asserted = {id(part) for statement in ast.walk(tree) if isinstance(statement, ast.Assert)
+                for part in ast.walk(statement.test)}
+    # The conjunctions a band was found in, the outermost first, so one held within it is not found again.
+    conjoined: set[int] = set()
     for scope_node in nodes:
         scope = _read_scope(scope_node, reading)
         for node in scope.nodes:
@@ -535,6 +692,15 @@ def comparisons(tree: ast.Module, tables: Mapping[int, Mapping[str, str]], calls
                 what = next((relation for relation in relations if relation), None)
                 if what:
                     yield node, what
+                elif id(node) in asserted and _chained_band(node, scope, reading):
+                    yield node, "a float held in a band around a target"
+            elif _conjunction(node) and id(node) in asserted and id(node) not in conjoined:
+                inner = [part for part in ast.walk(node) if isinstance(part, ast.BoolOp | ast.BinOp)]
+                bands = _conjoined_bands(node, scope, reading)
+                if bands:
+                    conjoined.update(id(part) for part in inner)
+                for _ in range(bands):
+                    yield node, "a float held in a band around a target"
             elif isinstance(node, ast.Assign | ast.AnnAssign):
                 targets = node.targets if isinstance(node, ast.Assign) else [node.target]
                 named = [target for target in targets

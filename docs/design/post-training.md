@@ -72,7 +72,7 @@ The objective reads the pair index explicitly and shifts the completion mask wit
 
 Here `W=seq_len+1`. Optional routing records and filtered sampling-support columns travel beside these arrays when an engine supplies them. Every likelihood refers to the same action as its mask and advantage. Prompt lengths remain input metadata; the loss uses packed coordinates. Rewards and completion lengths are reported as rollout metrics.
 
-EOS marks a completed session. Exhausting the generation budget marks it truncated; the explicit truncation policy decides its training mass and reward treatment. In `SampledRollout`, the text passed to the reward excludes EOS while the response mask includes it. Raw policy likelihoods and sampling likelihoods remain distinct.
+EOS, or the ID completing one of the policy's stop strings, marks a completed session. Exhausting the generation budget marks it truncated; the explicit truncation policy decides its training mass and reward treatment. The text passed to the reward excludes an EOS ID the draw ended on and keeps a stop string it ended on, while the response mask includes either ID. Raw policy likelihoods and sampling likelihoods remain distinct.
 
 The rollout reads each process's owned prompts and validates them before collective generation. A fixed padded prefill and decode program handles different prompt lengths and stopping outcomes without changing the collective schedule. The trainer places the returned learner batch on the training mesh.
 

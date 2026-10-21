@@ -21,6 +21,7 @@ from dew.data.dataset import Batch
 from dew.data.sources.base import Source
 from dew.data.sources.codec import encode
 from dew.data.sources.files import _arrow_filesystem
+from dew.data.steps.text import count_rules, stated_rules
 from dew.data.storage import ObjectRef, Store
 
 if TYPE_CHECKING:
@@ -191,9 +192,11 @@ def export(
     target = root.child(f"shards/{writer}")
     files = []
     count = 0
+    rules: set[tuple[int | None, int | None]] = set()
     try:
         for number, batch in enumerate(_chunks(rows, rows_per_shard)):
             count += len(batch)
+            rules.update(stated_rules(count_rules(batch)))
             index = _length_index(root, writer, number, batch, length_field)
             if format == "array_record":
                 files.append(_array_shard(root, writer, number, batch, index))
@@ -214,6 +217,9 @@ def export(
             "format": format,
             "codec": 1 if format == "array_record" else None,
             "rows": count,
+            # The rules other than every target's its rows were counted by, which a pack of them
+            # by a plan of their lengths could not count (`dew.data.analysis._ruled`).
+            "count_rules": [list(rule) for rule in sorted(rules, key=repr)],
             "partitioning": partitioning,
             "files": files,
             "metadata": metadata or {},
