@@ -33,9 +33,12 @@ from dew.data import (
 from dew.data.pipeline import Configured, DeviceStep, Pack
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     from transformers import PreTrainedTokenizerBase
 
-    from dew.data.pipeline import Dataset, HostStep, Pipeline, RandomStep
+    from dew.data.pipeline import Dataset, HostStep, Mixture, Phases, Pipeline, RandomStep
+    from dew.data.sources.base import Source
 
 
 def images(dataset: Dataset, size: int, *, batch: int,
@@ -103,29 +106,79 @@ def _finished(prepared: Dataset, *, batch: int, records: int | None, host: tuple
     return kept.batch(batch).map(*host, *device) if host or device else kept.batch(batch)
 
 
-def lm(dataset: Dataset, tokenizer: str | PreTrainedTokenizerBase, *, seq_len: int, batch: int,
-       field: str = "text", records: int | None = None, host: tuple[HostStep, ...] = ()) -> Pipeline:
-    """Documents in `field` tokenized, ended by the tokenizer's EOS where it
-    has one, cut into pieces that keep every next-token target, and packed
-    first-fit into rows of `seq_len + 1` tokens (the last a target), in
-    batches of `batch` rows (`records` and `host` as `images` takes them)."""
+def lm(dataset: Dataset, tokenizer: str | PreTrainedTokenizerBase | None, *, seq_len: int, batch: int,
+       field: str = "text", eos: bool | None = None,
+       pack: Literal["first-fit", "best-fit", "concat"] | None = "first-fit", bins: int = 32,
+       stride: int | None = None, records: int | None = None, host: tuple[HostStep, ...] = ()) -> Pipeline:
+    """Documents in `field` tokenized, ended by the tokenizer's EOS where it has one (`eos=True`
+    always, `False` never), cut into pieces that keep every next-token target, and packed into
+    rows of `seq_len + 1` tokens (the last a target) by `pack`, first-fit with `bins` open rows,
+    best-fit, or concatenated, in batches of `batch` rows (`records` and `host` as `images` takes
+    them). `pack=None` joins the documents into one stream of tokens instead and cuts it into
+    windows `stride` apart (`windows`), which carry no document coordinates. With
+    `tokenizer=None` the documents are token ids already, under "text", such as a token store's,
+    whose windows a store reads by index (`TokenFiles(url).pipe(presets.lm, None, seq_len=512,
+    batch=8, pack=None)`); a store packed must state where its documents end."""
 
-    documents = dataset.map(text_steps.tokenize(tokenizer, field=field))
-    windows = _next_token_windows(documents, Pack(seq_len + 1))
+    if pack is not None and stride is not None:
+        raise ValueError("stride places fixed windows, pack=None; a pack lays documents out whole")
+    documents = dataset if tokenizer is None else dataset.map(
+        text_steps.tokenize(tokenizer, field=field, eos=eos))
+    if pack is None:
+        windows = documents.windows(seq_len, stride=stride)
+    else:
+        if tokenizer is None:
+            _documented(dataset)
+        windows = _next_token_windows(documents, Pack(seq_len + 1, bins=bins, policy=pack))
     return _finished(windows, batch=batch, records=records, host=host)
 
 
 def sft(dataset: Dataset, tokenizer: str | PreTrainedTokenizerBase, *, seq_len: int, batch: int,
+        messages: str = "messages", long: Literal["chunk", "truncate", "drop"] = "chunk",
+        pack: Literal["first-fit", "best-fit", "concat"] = "first-fit", bins: int = 32,
         records: int | None = None, host: tuple[HostStep, ...] = ()) -> Pipeline:
     """Conversations in `messages` rendered through the tokenizer's chat
     template, each token's speaker kept beside it for an assistant-only loss,
-    a longer one cut into pieces of `seq_len + 1` tokens that keep every
-    turn, and packed first-fit into rows of that length, in batches of
-    `batch` rows (`records` and `host` as `images` takes them)."""
+    and packed into rows of `seq_len + 1` tokens by `pack`, as `lm` packs,
+    in batches of `batch` rows (`records` and `host` as `images` takes
+    them). A conversation longer than a row is cut into pieces that keep
+    every turn (`long="chunk"`), cut at its end (`"truncate"`), or dropped
+    and counted (`"drop"`)."""
 
-    windows = _conversation_windows(dataset.map(chat.template(tokenizer)), Pack(seq_len + 1, _CHAT_FIELDS),
-                                    long="chunk")
+    rendered = dataset.map(chat.template(tokenizer, messages=messages))
+    packing = Pack(seq_len + 1, _CHAT_FIELDS, bins=bins, policy=pack)
+    windows = _conversation_windows(rendered, packing, long=long)
     return _finished(windows, batch=batch, records=records, host=host)
+
+
+def _documented(dataset: Dataset) -> None:
+    """Refuse to pack token documents from a store that states no document ends (neither an index
+    of them nor an EOS token), wherever it sits in the chain's sources: its tokens would read as
+    one document, whose pieces no producer made."""
+    from dew.data.sources.tokens import TokenFiles
+
+    for source in _stores(dataset._chain().source):
+        if isinstance(source, TokenFiles) and not source.documented:
+            raise ValueError(f"packed text needs producer document boundaries or EOS: {source.describe()}")
+
+
+def _stores(source: Source | Mixture | Phases) -> Iterator[Source]:
+    """Every store under `source`: a mixture's or phases' corpora's, a concatenation's parts, and
+    the store each holdout selection selects from."""
+    from dew.data.holdout import selecting
+    from dew.data.pipeline import Mixture, Phases
+    from dew.data.sources.concatenate import Concatenate
+
+    if isinstance(source, (Mixture, Phases)):
+        for child in source.pipelines:
+            yield from _stores(child.source)
+        return
+    for selected in selecting(source):
+        if isinstance(selected, Concatenate):
+            for part in selected.sources:
+                yield from _stores(part)
+        elif not isinstance(selected, (Mixture, Phases)):
+            yield selected
 
 
 _CHAT_FIELDS = ("text", chat.ROLES_KEY)
@@ -151,23 +204,60 @@ def _conversation_windows(rendered: Dataset, pack: Pack, *,
     if long == "chunk":
         return _next_token_windows(rendered, pack)
     fitted = chat.fit_length(pack.seq_len, long=long)
+    # A concatenating pack cuts conversations where its rows end, so its cuts overlap by one token too.
+    pack = dataclasses.replace(pack, overlap=1) if pack.policy == "concat" else pack
     return (rendered.filter_map(fitted) if long == "drop" else rendered.map(fitted))._then(pack)
 
 
+def preferences(dataset: Dataset, *, seq_len: int, batch: int, pad_id: int = 0, records: int | None = None,
+                host: tuple[HostStep, ...] = ()) -> Pipeline:
+    """Preference pairs of token ids, chosen and rejected, each laid out in `seq_len` tokens with
+    its completion's mask, padded with `pad_id` (`preferences.PreferencePair`), in batches of
+    `batch` (`records` and `host` as `images` takes them). No tokenizer: a pair of raw text is
+    tokenized by a step before it."""
+    from dew.data.preferences import PreferencePair
+
+    return _finished(dataset.map(PreferencePair(seq_len, pad_id=pad_id)), batch=batch, records=records,
+                     host=host)
+
+
+def canvas(dataset: Dataset, tokenizer: str | PreTrainedTokenizerBase, *, prompt_length: int,
+           canvas_size: int, batch: int, canvases: int = 1, pad_id: int = 0, messages: str = "messages",
+           records: int | None = None, host: tuple[HostStep, ...] = ()) -> Pipeline:
+    """Conversations in `messages` rendered through the tokenizer's chat template, then each
+    assistant turn one row of a block-diffusion objective (`ResponseCanvases`): what comes before
+    it in `prompt_length` tokens, padded with `pad_id`, and its response in `canvases` canvases of
+    `canvas_size`, the tokenizer's EOS filling the rest of its last canvas and `pad_id` the canvases
+    after it; a longer prompt or response keeps its first tokens. Never packed, in batches of
+    `batch` (`records` and `host` as `images` takes them). A tokenizer with no EOS cannot fill a
+    canvas, and is refused."""
+    from dew.data.steps.chat import ResponseCanvases
+
+    renderer = chat.template(tokenizer, messages=messages)
+    eos = renderer.vocabulary.eos_id
+    if eos is None:
+        raise ValueError(f"tokenizer {renderer.tokenizer!r} declares no eos token to end a response's canvas")
+    layout = ResponseCanvases(prompt_length, canvas_size, canvases, eos, pad_id)
+    return _finished(dataset.map(renderer).flat_map(layout), batch=batch, records=records, host=host)
+
+
 def clips(dataset: Dataset, seconds: float, *, frames: int, fps: float, size: int, batch: int,
-          sample_rate: int | None = None, records: int | None = None,
+          sample_rate: int | None = None, margin: float = 0.0, context: float = 0.0,
+          missing: Literal["silence", "reject"] = "silence", rejects: bool = True, records: int | None = None,
           host: tuple[HostStep, ...] = ()) -> Pipeline:
     """Windows of `seconds` drawn from the media in `mp4`, each record's own
     on every read and resume (`video.PickClip`), as `frames` frames at `fps`
     fitted into `size` squares, in batches of `batch`. With `sample_rate`,
     the window's sound beside them, mono at that rate, filled with silence
-    marked invalid where the media has none (`audio.DecodeAudio`). Media shorter
-    than the window, or that does not decode, is counted and dropped; the
+    marked invalid where the media has none (`audio.DecodeAudio`), or with
+    `missing="reject"` dropped. Media shorter than the window, or that does not decode, is
+    counted and dropped, or with `rejects=False` stops the run. A window is drawn `margin`
+    seconds clear of the media's ends, and its sound is `context` seconds wider on each side. The
     media and its window are read here and leave the record. `records` and `host` as `images`
     takes them."""
 
-    windows = _clips(dataset, seconds, frames=frames, fps=fps, size=size, sample_rate=sample_rate,
-                     missing="silence")
+    windows = _clips(dataset, seconds, frames=frames, fps=fps, size=size, margin=margin,
+                     sample_rate=sample_rate, context=context, missing=missing, rejects=rejects)
     return _finished(windows, batch=batch, records=records, host=host)
 
 
