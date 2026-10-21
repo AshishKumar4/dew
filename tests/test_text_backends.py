@@ -88,3 +88,12 @@ def test_a_tokenizer_trained_on_a_corpus_reads_it_back(tmp_path):
     packed = Memory([{"text": passage} for passage in PASSAGES]).pipe(presets.lm, path, seq_len=16, batch=2)
     rows = list(packed)
     assert np.asarray(rows[0]["text"]).shape == (2, 17)
+
+
+def test_a_tokenizer_smaller_than_what_its_algorithm_keeps_is_refused(tmp_path):
+    """The chat tokenizer's algorithm keeps its byte alphabet and special tokens, more than a
+    hundred: a vocabulary of a hundred is refused, and nothing is saved."""
+    with pytest.raises(ValueError):
+        text.train_tokenizer(Memory([{"text": passage} for passage in PASSAGES]), str(CHAT),
+                             str(tmp_path / "trained"), vocab_size=100)
+    assert not (tmp_path / "trained").exists()
