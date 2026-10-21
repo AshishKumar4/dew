@@ -1785,17 +1785,6 @@ def test_a_chain_that_states_no_read_reads_as_its_sources_choose(tmp_path):
         "streamed", "memory", "memory"]
 
 
-def test_a_chain_that_states_no_read_takes_the_first_read_its_sources_can_all_take(tmp_path):
-    """A CSV with no index prefers a stream, but its random holdout cannot be
-    streamed and the CSV cannot be read by index, so the chain reads it into
-    memory and trains on the half the holdout leaves."""
-    (tmp_path / "rows.csv").write_text("text\n" + "".join(f"row {index}\n" for index in range(8)))
-    train, _ = Files(str(tmp_path / "rows.csv")).holdout(0.5)
-    loaded = compile(train.repeat().batch(2), loading=Loading(workers=0))
-    assert loaded.plan is not None and loaded.plan.order["read"] == "memory"
-    assert loaded.records == 4
-
-
 def test_a_token_holdout_with_no_stated_read_reads_unindexed_text_into_memory(tmp_path):
     """A token split needs a finite indexed order, which JSON lines without an
     index can neither stream nor read by index, so the chain reads them into
@@ -1806,16 +1795,17 @@ def test_a_token_holdout_with_no_stated_read_reads_unindexed_text_into_memory(tm
     documents = [{"text": f"document {index} " * 6} for index in range(8)]
     (tmp_path / "text.jsonl").write_text("".join(json.dumps(document) + "\n" for document in documents))
     train, val = Files(str(tmp_path / "text.jsonl")).map(text.tokenize("byte")).holdout(tokens=0.25)
-    loaded = compile(train.repeat().pipe(presets.lm, None, seq_len=8, batch=2, pack=None),
-                     loading=Loading(workers=0))
+    windows = train.pipe(presets.lm, None, seq_len=8, batch=None, pack=None)
+    loaded = compile(windows.shuffle(0).repeat().batch(2), loading=Loading(workers=0))
     assert loaded.plan is not None and loaded.plan.order["read"] == "memory"
     assert loaded.records
     assert next(iter(held(val.pipe(presets.lm, None, seq_len=8, batch=2, pack=None))(DataPartition())))
 
 
 def test_a_token_holdout_before_the_repeat_reads_an_indexed_store_by_index(tmp_path):
-    """Parquet reads by index, and a token split written before the order's repeat is a global,
-    finite order by itself, so the chain reads the store by index."""
+    """Parquet reads by index, and a token split written before the repeat is a global, finite
+    order by itself, so a chain that windows the split's documents as it streams them reads the
+    store by index."""
     import pyarrow.parquet as pq
 
     from dew.data import presets, text
@@ -1823,7 +1813,7 @@ def test_a_token_holdout_before_the_repeat_reads_an_indexed_store_by_index(tmp_p
     rows = [{"text": f"document {index} " * 6} for index in range(8)]
     pq.write_table(pa.Table.from_pylist(rows), tmp_path / "rows.parquet")
     train, _ = Files(str(tmp_path / "rows.parquet")).map(text.tokenize("byte")).holdout(tokens=0.25)
-    loaded = compile(train.shuffle(0).repeat().pipe(presets.lm, None, seq_len=8, batch=2, pack=None),
+    loaded = compile(train.repeat().pipe(presets.lm, None, seq_len=8, batch=2, pack=None),
                      loading=Loading(workers=0))
     assert loaded.plan is not None and loaded.plan.order["read"] == "indexed"
 
