@@ -55,6 +55,12 @@ def without_config_field(source: Path, directory: Path, *path: str) -> Path:
     return directory
 
 
+def fixture_with_meta(path: Path) -> tuple[dict[str, np.ndarray], dict]:
+    """A recorded fixture's arrays and its JSON `meta` record, which it stores as bytes."""
+    arrays = fixture_arrays(path)
+    return arrays, json.loads(arrays.pop("meta").tobytes())
+
+
 def fixture_arrays(path: Path) -> dict[str, np.ndarray]:
     with np.load(path, allow_pickle=False) as source:
         return dict(source)

@@ -20,7 +20,6 @@ must ignore. The MM-DiTs and the VideoDiT, which pool the real tokens, get
 no padding.
 """
 
-import json
 from pathlib import Path
 
 import jax
@@ -28,7 +27,7 @@ import jax.numpy as jnp
 import ml_dtypes
 import numpy as np
 import pytest
-from interop_support import recorded_gradients
+from interop_support import fixture_with_meta, recorded_gradients
 from reference_error import (
     assert_as_exact_as_the_reference,
     assert_as_exact_over_orders,
@@ -82,9 +81,7 @@ MODULATION_ORDER = (4, 3, 5, 1, 0, 2)
 
 @pytest.fixture(scope="module")
 def reference():
-    with np.load(FIXTURE) as loaded:
-        arrays = dict(loaded)
-    return arrays, json.loads(arrays.pop("meta").tobytes())
+    return fixture_with_meta(FIXTURE)
 
 
 def dew_model(cls: str, config: dict):
