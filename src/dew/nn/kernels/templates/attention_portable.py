@@ -66,9 +66,9 @@ def forward(spec: algebra.Forward, query: jax.Array, key: jax.Array, value: jax.
     """`TritonForward._fwd`'s outputs with its residuals from its operands (`query` `[B, Qp, H, Dp]`,
     `key` and `value` `[B, Kp, Hk, ...]`, the spans' rows and ids, the hooks' padded parameters, the
     initial state `(m0, total0, acc0)` or None), one query block and head at a time in sequence, its key
-    tiles walked as the Triton mainloop walks them: with `residuals` its training step (the split sums,
-    `algebra.split_accumulate`), else its plain one, so each rounds as the Triton launch it stands for;
-    the residuals are None where not asked for."""
+    tiles walked as the Triton mainloop walks them: the output, and with `residuals` its training step's
+    (the split sums, `algebra.split_accumulate`) maxima, denominators, anchor keys and split sums, else
+    its plain step's output and None, so each rounds as the Triton launch it stands for."""
     batch, queries, heads, _ = query.shape
     keys, kv_heads, value_width = key.shape[1], key.shape[2], value.shape[-1]
     group = heads // kv_heads
@@ -142,6 +142,7 @@ def forward(spec: algebra.Forward, query: jax.Array, key: jax.Array, value: jax.
             kept = arg.key, split.acc, own, others_total
         else:
             state = jax.lax.fori_loop(lo, hi, plain, state)
+            kept = ()
         out, m, denominator = algebra.finish(spec, state, initial=initial is not None, output_mod=output_mod,
                                              output_params=out_params)
         return (out.astype(query.dtype), m, denominator, *kept) if residuals else out.astype(query.dtype)
@@ -153,15 +154,15 @@ def forward(spec: algebra.Forward, query: jax.Array, key: jax.Array, value: jax.
     out = out.reshape(batch, queries, heads, value_width)
 
     if not residuals:
-        return out, None, None, None, None
+        return out, None
     _, m, denominator, anchors, others, own, others_total = mapped
 
     def rowwise(x):
         return x.reshape(blocks, batch, heads, block_q).transpose(1, 2, 0, 3).reshape(batch, heads, queries)
 
     others = others.reshape(blocks, batch, heads, block_q, value_width).transpose(1, 2, 0, 3, 4)
-    return (out, rowwise(m), rowwise(denominator), rowwise(anchors),
-            Split(others.reshape(batch, heads, queries, value_width), rowwise(own), rowwise(others_total)))
+    split = Split(others.reshape(batch, heads, queries, value_width), rowwise(own), rowwise(others_total))
+    return out, (rowwise(m), rowwise(denominator), rowwise(anchors), split)
 
 
 def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None,
@@ -180,13 +181,14 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, 
                    jnp.pad(call.rows(state.acc), ((0, 0),) * 3 + ((0, call.value.shape[-1] - value_width),)))
     spec = algebra.Forward(spans.form, spans.keys, call.query_ids is not None,
                            query.shape[3] ** -0.5 if scale is None else scale, hooks.score_mod)
-    out, m, denominator, anchors, split = forward(
+    out, kept = forward(
         spec, call.query, call.key, call.value, call.start, call.end, call.query_ids, call.key_ids,
         call.score_params, tuple(param.kind for param in hooks.score_params), call.output_params,
         tuple(param.kind for param in hooks.output_params), initial, block_q=block_q, block_k=block_k,
         output_mod=hooks.output_mod, residuals=residuals)
-    if split is None:
+    if kept is None:
         return out[:, :queries, :, :value_width]
+    m, denominator, anchors, split = kept
     sums = Split(split.others[:, :, :queries, :value_width], split.own[:, :, :queries],
                  split.others_total[:, :, :queries])
     return (out[:, :queries, :, :value_width], m[:, :, :queries], denominator[:, :, :queries],
