@@ -557,10 +557,9 @@ def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tu
                                                    delta, seen, q_pos, k_pos, params, key_index=key_index,
                                                    scale=scale, interpret=interpret)
         logits, pieces = algebra.pulled(cotangents, slopes, seen, score_kinds)
-        # Over the prior denominator in fp32 before it narrows to the operands' dtype, as the reference
-        # takes each cotangent over its denominator before the product with the keys; the scale waits for
-        # `dq_finish`, so no compiler folds it into the denominator's small factor.
-        dq = dq + _dot((logits * over_prior[:, None]).astype(key.dtype), key, interpret)
+        # Over the prior denominator in fp32 before the product with the keys, as the reference takes each
+        # cotangent over its denominator (`algebra.dq_operand`).
+        dq = dq + _dot(algebra.dq_operand(logits, over_prior, scale, key.dtype), key, interpret)
         grads = tuple(grad + piece if row else grad for grad, row, piece in zip(grads, summed, pieces,
                                                                                strict=True))
         if any(summed):
@@ -575,7 +574,7 @@ def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tu
                                              (jnp.zeros(query.shape, jnp.float32), nothing, nothing, rows,
                                               rows)))
     dq, delta, total, mass, grads = algebra.dq_finish(sums, prior, state_total, peak0, shares, peak, anchor,
-                                                      delta, scale)
+                                                      delta, algebra.dq_scale(scale, key_ref.dtype))
     dq_ref[...] = dq
     delta_ref[...] = delta
     anchor_ref[...] = anchor
