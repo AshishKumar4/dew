@@ -624,7 +624,7 @@ class PretrainedDecoder(Pretrained):
         built = {entry.name: getattr(decoder, entry.name) for entry in dataclasses.fields(decoder)
                  if entry.init and entry.name not in ("parent", "name")}
         return cls(decoder, variables, None, config, None, built,
-                   {**decoders.GENERATION_DEFAULTS, 'use_cache': config['use_cache']}
+                   {**decoders.GENERATION_DEFAULTS, 'use_cache': decoder.causal}
                    if generation_config is None else generation_config,
                    export_adapter=decoders.export_decoder_weights, tokenizer=tokenizer)
 

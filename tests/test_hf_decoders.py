@@ -951,7 +951,7 @@ def assert_released_logits(name, source, fields, recorded, forward, label):
     wide = jax.jit(lambda ids: {'logits': wide_model.apply(wide_variables, ids, **fields)})
     draw, reference, truth = indexed_recording(
         stored, name, seeds, inputs_of=lambda seed: llada_draw(seed, source.model.vocab_size),
-        truth_fn=lambda index, inputs: wide(inputs['ids']))
+        truth_fn=lambda inputs: wide(inputs['ids']))
     assert_as_exact(lambda index, inputs: {'logits': forward(inputs['ids'])}, reference, draw,
                     f'{name} {label}', seeds=seeds, truth_fn=truth)
 
