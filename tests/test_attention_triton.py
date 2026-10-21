@@ -151,6 +151,11 @@ SCORE_HOOKS = {"none": (), "softcap": ("softcap",), "sinks": ("sinks",), "alibi"
 """The score hooks the backward differentiates, each kind of parameter among them: ALiBi's slopes a
 head's, a per-key bias, a dense bias."""
 
+BACKWARD_SEEDS = {(("alibi",), "float32"): 64, (("alibi",), "bfloat16"): 128, (("sinks",), "bfloat16"): 16,
+                  (("softcap", "sinks", "alibi"), "float32"): 64, (("softcap", "sinks", "alibi"), "bfloat16"): 256}
+"""The backward sites' declared draws where `seeds_for` sizes them above `SEEDS`: a head's ALiBi slope
+is a gradient of four values a draw, and the sinks' bf16 state's of a few."""
+
 
 def score_hooks(names: tuple, queries: int, keys: int) -> template.Hooks:
     """The score hooks `names` asks for, their parameters fixed: a softcap, ALiBi, a per-key bias, a dense
@@ -220,7 +225,7 @@ def check_backward(case: dict, names: tuple, dtype, config):
 
     assert_as_exact(jax.jit(ours), jax.jit(xla), draw,
                     f"triton backward {case} {names} {jnp.dtype(dtype).name} {config}",
-                    seeds=ALL_HOOKS_SEEDS if len(names) > 1 else SEEDS)
+                    seeds=BACKWARD_SEEDS.get((names, jnp.dtype(dtype).name), SEEDS))
 
 
 BACKWARD_FORMS = ("full", "causal-window", "documents", "cross-causal-lengths-starts", "two-sided-window")
