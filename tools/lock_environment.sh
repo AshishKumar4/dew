@@ -32,7 +32,9 @@ lock() {
       echo --exclude-newer-package "$package=$ENVIRONMENTS"; done) \
     --python-version "$(tr -d '\n' < .python-version)" "$@" -o "locks/$name.txt"
 }
-lock cpu --universal --torch-backend cpu
+# A host with no GPU compiles kernels for one with the CUDA plugin of the kernel-compile extra; a GPU host's
+# own CUDA extra holds its plugin, and two CUDA plugins in one environment would both claim 'cuda'.
+lock cpu --universal --torch-backend cpu --extra kernel-compile
 gpu="--python-platform x86_64-manylinux_2_35"
 lock cuda12 --extra cuda12 --torch-backend cpu $gpu
 lock cuda13 --extra cuda13 --torch-backend cpu $gpu
