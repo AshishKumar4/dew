@@ -220,9 +220,9 @@ class QwenImageVAE(nn.Module):
             self.dtype,
         )
 
-    def encode(self, x, key=None):
-        """The posterior mean, or a draw from it when `key` is given."""
-        return posterior_latent(self.quant_conv(self.encoder(x)), key)
+    def encode(self, x, key=None, noise=None):
+        """The posterior mean, or a draw from it when `key` or `noise` is given."""
+        return posterior_latent(self.quant_conv(self.encoder(x)), key, noise)
 
     def decode(self, z):
         return jnp.clip(self.decoder(self.post_quant_conv(z)), -1.0, 1.0)
@@ -356,8 +356,8 @@ class QwenImageAutoencoder(ModuleAutoEncoder[QwenImageVAE]):
 
     # The base class's shift and scale stay 0 and 1, so its encode and decode
     # only flatten video around the batch calls here.
-    def encode(self, params, x, key=None):
-        latent = super().encode(params, x, key=key)
+    def encode(self, params, x, key=None, noise=None):
+        latent = super().encode(params, x, key=key, noise=noise)
         return (latent - self.latents_mean.astype(latent.dtype)) / self.latents_std.astype(latent.dtype)
 
     def decode(self, params, z):

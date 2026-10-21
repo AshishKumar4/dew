@@ -44,10 +44,10 @@ from dew.inference.banks import (
 )
 from dew.nn.backbones.layer_plan import group_name
 from dew.nn.kernels.options import compiler_options
-from dew.objectives.base import FROZEN, Step, merge, thaw
+from dew.objectives.base import FROZEN, merge, thaw
 from dew.training.distributed import batch_shardings
 from dew.training.host import transfer
-from dew.training.transaction import Realization
+from dew.training.transaction import Realization, placed_as_rows
 
 if TYPE_CHECKING:
     from dew.data.pipeline import DeviceStep
@@ -459,9 +459,12 @@ class HostExecution:
         layout = (treedef, held)
         with jax.set_mesh(self.accelerator):
             batch = transfer(batch, batch_shardings(self.accelerator, batch))
-            clock, key, updates = self.on_accelerator((step.step, step.key, step.updates))
+            # The step crosses whole, so its examples' draws are the resident step's (`Step.sample`);
+            # its averaged weights are the snapshot's, and its places the batch's rows'.
+            here = self.on_accelerator(step.replace(ema=None)).replace(ema=ema)
+            if here.example_index is not None:
+                here = here.replace(example_index=placed_as_rows(here.example_index, batch))
             rest = {name: tree for name, tree in store.items() if name != "params"}
-            here = Step(clock, key, ema, committed=updates)
             stats, back, aux = self.forward(primal, frozen, rest, batch, here, layout=layout)
         stats, aux = self.on_cpu((stats, aux))
         if aux.variables is not None:

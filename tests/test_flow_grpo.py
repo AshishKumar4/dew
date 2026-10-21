@@ -312,7 +312,7 @@ class Pooled(AutoEncoder):
     def __init__(self):
         self.params = {}
 
-    def encode_batch(self, params, x, key=None):
+    def encode_batch(self, params, x, key=None, noise=None):
         rows, height, width, _ = x.shape
         return x[..., :1].reshape(rows, height // 2, 2, width // 2, 2, 1).mean(axis=(2, 4))
 

@@ -857,25 +857,10 @@ def siglip_tiny_system(seed: int = 1234, text_width: int = 16, mm_tokens: int = 
         hidden_size=32, intermediate_size=64, num_hidden_layers=2,
         num_attention_heads=4, image_size=28, patch_size=14, num_channels=3,
         hidden_act="gelu_pytorch_tanh", layer_norm_eps=1e-6)
-    torch.manual_seed(seed)
-    tower = SiglipVisionModel(vconf)
-    scatter_weights(tower, seed)
-    tower = tower.float().eval()
-    pixels = np.random.RandomState(11).rand(BATCH, 3, 28, 28).astype(np.float32)
-    with torch.no_grad():
-        last = tower(pixel_values=torch.from_numpy(pixels),
-                     return_dict=True).last_hidden_state.to(torch.float32).numpy()
-    gconf = Gemma3Config(
+    system = run_vision_tiny(SiglipVisionModel, vconf, lambda: Gemma3MultiModalProjector(Gemma3Config(
         text_config=Gemma3TextConfig(hidden_size=text_width),
-        vision_config=vconf, mm_tokens_per_image=mm_tokens)
-    projector = Gemma3MultiModalProjector(gconf)
-    scatter_weights(projector, seed + 1)
-    projector = projector.float().eval()
-    with torch.no_grad():
-        soft = projector(torch.from_numpy(last)).to(torch.float32).numpy()
-    return {"tower": tower, "projector": projector, "vconf": vconf,
-            "pixels": pixels, "last": last, "soft": soft,
-            "text_width": text_width, "mm_tokens": mm_tokens}
+        vision_config=vconf, mm_tokens_per_image=mm_tokens)), seed)
+    return {**system, "text_width": text_width, "mm_tokens": mm_tokens}
 
 
 def llama4_vision_tiny_system(seed: int = 1234, text_width: int = 32):
@@ -890,65 +875,63 @@ def llama4_vision_tiny_system(seed: int = 1234, text_width: int = 32):
         pixel_shuffle_ratio=0.5, projector_input_dim=64, projector_output_dim=64,
         vision_output_dim=64, vision_feature_select_strategy="default",
         attention_dropout=0.0, projector_dropout=0.0)
+    system = run_vision_tiny(Llama4VisionModel, vconf, lambda: Llama4MultiModalProjector(SimpleNamespace(
+        vision_config=vconf, text_config=SimpleNamespace(hidden_size=text_width))), seed)
+    return {**system, "text_width": text_width}
+
+
+def run_vision_tiny(tower_class, vconf, projector_of, seed: int) -> dict:
+    """The tower `tower_class(vconf)` and the projector `projector_of()` builds, their weights
+    scattered from `seed` and `seed + 1`, in fp32 eval mode, with their fp32 outputs on the fixed
+    pixels: what the tiny vision systems above share."""
     torch.manual_seed(seed)
-    tower = Llama4VisionModel(vconf)
+    tower = tower_class(vconf)
     scatter_weights(tower, seed)
     tower = tower.float().eval()
     pixels = np.random.RandomState(11).rand(BATCH, 3, 28, 28).astype(np.float32)
     with torch.no_grad():
         last = tower(pixel_values=torch.from_numpy(pixels),
                      return_dict=True).last_hidden_state.to(torch.float32).numpy()
-    projector = Llama4MultiModalProjector(SimpleNamespace(
-        vision_config=vconf, text_config=SimpleNamespace(hidden_size=text_width)))
+    projector = projector_of()
     scatter_weights(projector, seed + 1)
     projector = projector.float().eval()
     with torch.no_grad():
         soft = projector(torch.from_numpy(last)).to(torch.float32).numpy()
     return {"tower": tower, "projector": projector, "vconf": vconf,
-            "pixels": pixels, "last": last, "soft": soft, "text_width": text_width}
+            "pixels": pixels, "last": last, "soft": soft}
+
+
+def write_vision_tiny(name: str, system: dict, projector: dict) -> None:
+    """A tiny vision system as Dew reads it, under FIXTURES / `name`: bare tensor names, the
+    tower config, the projector's knobs (`projector`), fixed pixels and both fp32 reference
+    outputs."""
+    from safetensors.torch import save_file
+
+    directory = FIXTURES / name
+    directory.mkdir(parents=True, exist_ok=True)
+    save_file(system["tower"].state_dict(), directory / "model.safetensors")
+    save_file(system["projector"].state_dict(), directory / "projector.safetensors")
+    (directory / "config.json").write_text(
+        json.dumps(system["vconf"].to_dict(), indent=1) + "\n")
+    (directory / "projector.json").write_text(json.dumps(projector, indent=1) + "\n")
+    np.save(directory / "pixels.npy", system["pixels"])
+    np.save(directory / "tower_ref.npy", system["last"])
+    np.save(directory / "projector_ref.npy", system["soft"])
+    size = sum(path.stat().st_size for path in directory.iterdir())
+    print(f"{directory}: {size / 1e3:.0f} kB, {sorted(p.name for p in directory.iterdir())}")
 
 
 def write_siglip_tiny() -> None:
-    """The SigLIP trunk and Gemma projector as Dew reads them: bare tensor
-    names, the tower config, the projector's two knobs, fixed pixels and both
-    fp32 reference outputs."""
-    from safetensors.torch import save_file
-
+    """The SigLIP trunk and Gemma projector, with the projector's two knobs."""
     system = siglip_tiny_system()
-    directory = FIXTURES / "siglip-tiny"
-    directory.mkdir(parents=True, exist_ok=True)
-    save_file(system["tower"].state_dict(), directory / "model.safetensors")
-    save_file(system["projector"].state_dict(), directory / "projector.safetensors")
-    (directory / "config.json").write_text(
-        json.dumps(system["vconf"].to_dict(), indent=1) + "\n")
-    (directory / "projector.json").write_text(json.dumps(
-        {"text_width": system["text_width"],
-         "mm_tokens_per_image": system["mm_tokens"]}, indent=1) + "\n")
-    np.save(directory / "pixels.npy", system["pixels"])
-    np.save(directory / "tower_ref.npy", system["last"])
-    np.save(directory / "projector_ref.npy", system["soft"])
-    size = sum(path.stat().st_size for path in directory.iterdir())
-    print(f"{directory}: {size / 1e3:.0f} kB, {sorted(p.name for p in directory.iterdir())}")
+    write_vision_tiny("siglip-tiny", system, {"text_width": system["text_width"],
+                                              "mm_tokens_per_image": system["mm_tokens"]})
 
 
 def write_llama4_vision_tiny() -> None:
-    """The Llama 4 trunk and outer projector, same layout."""
-    from safetensors.torch import save_file
-
+    """The Llama 4 trunk and outer projector, with the projector's width."""
     system = llama4_vision_tiny_system()
-    directory = FIXTURES / "llama4-vision-tiny"
-    directory.mkdir(parents=True, exist_ok=True)
-    save_file(system["tower"].state_dict(), directory / "model.safetensors")
-    save_file(system["projector"].state_dict(), directory / "projector.safetensors")
-    (directory / "config.json").write_text(
-        json.dumps(system["vconf"].to_dict(), indent=1) + "\n")
-    (directory / "projector.json").write_text(json.dumps(
-        {"text_width": system["text_width"]}, indent=1) + "\n")
-    np.save(directory / "pixels.npy", system["pixels"])
-    np.save(directory / "tower_ref.npy", system["last"])
-    np.save(directory / "projector_ref.npy", system["soft"])
-    size = sum(path.stat().st_size for path in directory.iterdir())
-    print(f"{directory}: {size / 1e3:.0f} kB, {sorted(p.name for p in directory.iterdir())}")
+    write_vision_tiny("llama4-vision-tiny", system, {"text_width": system["text_width"]})
 
 
 def write_gemma3_mm_tiny() -> None:
@@ -1249,6 +1232,18 @@ GEMMA4_MM_TEXT: Dict[str, Any] = dict(
                            "partial_rotary_factor": 0.25},
         "sliding_attention": {"rope_type": "default", "rope_theta": 1e4}})
 
+def wrapper_tensors(vision: dict[str, torch.nn.Module], text: torch.nn.Module) -> dict[str, torch.Tensor]:
+    """A wrapper's tensors as its release names them: each vision part's under the prefix its key
+    names, the decoder half's under model.language_model.* and the tied head top-level, as the
+    released layout carries it."""
+    merged = {f"{prefix}.{name}": tensor
+              for prefix, part in vision.items() for name, tensor in part.state_dict().items()}
+    merged.update({f"model.language_model.{name}": tensor
+                   for name, tensor in text.state_dict().items() if name != "lm_head.weight"})
+    merged["lm_head.weight"] = text.state_dict()["embed_tokens.weight"].clone()
+    return merged
+
+
 def write_gemma4_mm_tiny() -> None:
     """A Gemma 4 wrapper fixture: the vision and embedder halves under the
     released model.* prefixes beside a tiny dense decoder half, with the
@@ -1266,16 +1261,8 @@ def write_gemma4_mm_tiny() -> None:
         text_config=Gemma4TextConfig(**GEMMA4_MM_TEXT),
         vision_config=system["vconf"], audio_config=None)).model.language_model
     scatter_weights(text, seed=4321)
-    merged = {}
-    for name, tensor in system["tower"].state_dict().items():
-        merged[f"model.vision_tower.{name}"] = tensor
-    for name, tensor in system["projector"].state_dict().items():
-        merged[f"model.embed_vision.{name}"] = tensor
-    for name, tensor in text.state_dict().items():
-        if name == "lm_head.weight":
-            continue
-        merged[f"model.language_model.{name}"] = tensor
-    merged["lm_head.weight"] = text.state_dict()["embed_tokens.weight"].clone()
+    merged = wrapper_tensors({"model.vision_tower": system["tower"],
+                               "model.embed_vision": system["projector"]}, text)
     directory = FIXTURES / "gemma4-tiny-mm"
     directory.mkdir(parents=True, exist_ok=True)
     save_file(merged, directory / "model.safetensors")
@@ -1327,14 +1314,7 @@ def write_qwen35_mm_tiny() -> None:
     torch.manual_seed(4321)
     text = Qwen3_5ForCausalLM(Qwen3_5TextConfig(**QWEN35_MM_TEXT)).model
     scatter_weights(text, seed=4321)
-    merged = {}
-    for name, tensor in system["tower"].state_dict().items():
-        merged[f"model.visual.{name}"] = tensor
-    for name, tensor in text.state_dict().items():
-        if name == "lm_head.weight":
-            continue
-        merged[f"model.language_model.{name}"] = tensor
-    merged["lm_head.weight"] = text.state_dict()["embed_tokens.weight"].clone()
+    merged = wrapper_tensors({"model.visual": system["tower"]}, text)
     directory = FIXTURES / "qwen35-tiny-mm"
     directory.mkdir(parents=True, exist_ok=True)
     save_file(merged, directory / "model.safetensors")
@@ -1559,6 +1539,70 @@ def write_tiny(name: str, model: PreTrainedModel, seed: int = 1234, *, padded: b
                  logits=reference, logits_f64=truth)
     size = sum(path.stat().st_size for path in directory.iterdir())
     print(f"{directory}: {size / 1e3:.0f} kB, {sorted(p.name for p in directory.iterdir())}")
+
+
+def write_logits_recording(name: str, model: PreTrainedModel, command: str) -> None:
+    """The committed tiny fixture `name`'s transformers logits recorded over check 1's seeds
+    (tools/recorded_references.py): each seed's token grid (tests/interop_support.py `drawn_ids`), the
+    reference's fp32 eager logits on the CPU and their float64 truth (the model in float64, its float32
+    pins widened), its count planned on Dew's own load of the fixture and confirmed on the reference.
+    The ids are drawn again by the test, and the reference's evidence alone is kept with its truth's
+    sketch (`record_case`'s summary), which the test's float64 run of Dew's model is held to, in
+    recorded_logits.npz beside the fixture."""
+    import sys
+    from copy import deepcopy
+
+    import jax
+    from diffusers_wan_reference import float64
+    from fetched_fixtures import save
+    from recorded_references import provenance, record_case
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
+    from interop_support import drawn_ids, float64_logits
+
+    from dew.interop import Pretrained
+
+    directory = FIXTURES / name
+    model = model.float().eval()
+    model.set_attn_implementation("eager")
+    wide = deepcopy(model).double()
+    with float64():
+        # Rotary inverse frequencies are buffers built at construction in float32: rebuilt in float64.
+        for module in wide.modules():
+            build = (getattr(module, "rope_init_fn", None)
+                     or getattr(module, "compute_default_rope_parameters", None))
+            if hasattr(module, "inv_freq"):
+                if build is None:
+                    raise ValueError(f"{type(module).__name__} holds float32 inverse frequencies and no rule "
+                                     f"to rebuild them in float64")
+                inverse, _ = build(module.config, None)
+                module.inv_freq = inverse.double()
+                if hasattr(module, "original_inv_freq"):
+                    module.original_inv_freq = inverse.double()
+                print(f"{type(module).__name__}: inverse frequencies rebuilt in float64", flush=True)
+    vocab = model.config.vocab_size
+    native = Pretrained.load(directory, dtype="float32", attention_impl="reference")
+
+    def evaluate(inputs):
+        ids = torch.from_numpy(inputs["input_ids"].astype(np.int64))
+        with torch.no_grad():
+            reference = model(input_ids=ids, use_cache=False).logits.numpy()
+        with float64(), torch.no_grad():
+            truth = wide(input_ids=ids, use_cache=False).logits.numpy()
+        return {"logits": reference}, {"logits": truth}
+
+    def proxy(inputs):
+        return {"logits": native.model.apply(native.variables, inputs["input_ids"])}
+
+    with jax.enable_x64(new_val=True):
+        recording = record_case("logits", lambda seed: drawn_ids(vocab, seed), evaluate, proxy,
+                                truth_proxy=float64_logits(native), store_inputs=False, summary=True)
+    import transformers
+
+    record = provenance(f"transformers {type(model).__name__}", transformers.__version__, "cpu", command,
+                        torch=torch.__version__, dtype="float32", attention="eager")
+    save(directory / "recorded_logits.npz", {**recording, "logits.provenance": record},
+         reference=f"transformers {type(model).__name__}", license="Apache-2.0")
 
 
 def write_device_tiny(name: str, model: PreTrainedModel, device: str, command: str) -> None:
