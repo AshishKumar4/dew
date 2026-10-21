@@ -266,3 +266,71 @@ def test_a_bundle_holds_every_program_its_files_tests_used_however_they_ran(cach
         fresh = remote_cache.RemoteCache(Local(), url, "token", "jax/cpu")
         fresh.opened(f"tests/{name}.py")
         assert fresh.base.entries == {} and fresh.fetched == 0 and fresh.failures == 1
+
+
+def run_child(script: str, *arguments: str) -> list[str]:
+    """`script` run in a fresh Python with the tests' directory on its path and JAX on the CPU: its
+    printed words."""
+    import os
+    import subprocess
+    import sys
+
+    path = os.pathsep.join([os.path.dirname(__file__), os.environ.get("PYTHONPATH", "")])
+    done = subprocess.run([sys.executable, "-c", script, *arguments], capture_output=True, text=True,
+                          env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": path}, timeout=300)
+    assert done.returncode == 0, done.stderr[-3000:]
+    return done.stdout.split()
+
+
+def test_jaxs_own_cache_reset_works_under_the_shared_cache(cache_worker, tmp_path):
+    """JAX's public `reset_cache` (jax.experimental.compilation_cache), which a run calls to point the
+    cache elsewhere, works with the shared cache installed, and the program compiled before it is
+    read back from the local cache after it."""
+    url, _, _ = cache_worker
+    script = """
+import sys
+import jax
+from jax.experimental.compilation_cache import compilation_cache
+import remote_cache
+from dew.cache import enable_compilation_cache
+from dew.telemetry.instrumentation import compilation_cache_counts, count_compilation_cache
+enable_compilation_cache(sys.argv[1])
+remote = remote_cache.install(sys.argv[2], "token")
+remote.opened("tests/test_reset.py")
+step = lambda x: (x * 3.0).sum()
+jax.jit(step)(jax.numpy.arange(4.0))
+compilation_cache.reset_cache()
+jax.clear_caches()
+count_compilation_cache()
+value = float(jax.jit(step)(jax.numpy.arange(4.0)))
+print(value, int(compilation_cache_counts().get("train/cache_misses", 0)))
+"""
+    assert run_child(script, str(tmp_path / "cache"), url) == ["18.0", "0"]
+
+
+def test_a_program_fetched_and_not_used_again_stays_in_its_bundle(cache_worker, tmp_path):
+    """A process that fetches a file's bundle and compiles only a new program writes back the new one
+    with the fetched ones: a test that ran in one partition and not in this one keeps its programs."""
+    url, stored, _ = cache_worker
+    script = """
+import sys
+import jax
+import remote_cache
+from dew.cache import enable_compilation_cache
+enable_compilation_cache(sys.argv[1])
+remote = remote_cache.install(sys.argv[2], "token")
+remote.opened("tests/test_kept.py")
+if sys.argv[3] == "first":
+    jax.jit(lambda x: (x * 3.0).sum())(jax.numpy.arange(4.0))
+else:
+    jax.jit(lambda x: (x - 7.0).max())(jax.numpy.arange(5.0))
+remote.closed("tests/test_kept.py")
+remote.drain()
+print(remote.uploaded)
+"""
+    assert run_child(script, str(tmp_path / "first"), url, "first") == ["1"]
+    [key] = [key for key in stored if key.endswith("/bundles/tests/test_kept.py")]
+    first = dict(remote_cache.unpacked(stored[key]))
+    assert run_child(script, str(tmp_path / "second"), url, "second") == ["1"]
+    second = dict(remote_cache.unpacked(stored[key]))
+    assert set(first) < set(second) and all(second[name] == first[name] for name in first)
