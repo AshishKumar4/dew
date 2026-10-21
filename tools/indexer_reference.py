@@ -49,9 +49,6 @@ from pathlib import Path
 
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
-from reference_source import defined_in, definitions, fetched
-
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "indexer"
 COMMIT = "538fe7a3f3376d94cf3f04e77741aa6d7e8efa45"
 MAXTEXT = f"https://raw.githubusercontent.com/AI-Hypercomputer/maxtext/{COMMIT}/src/maxtext/"
@@ -102,25 +99,26 @@ def indexer_call(indexer_score: np.ndarray, attention_mask: np.ndarray, top_k: i
 
 def calculate_indexer_loss(indexer_score: np.ndarray, query: np.ndarray, key: np.ndarray,
                            attention_mask: np.ndarray, indexer_mask: np.ndarray,
-                           sparse_loss: bool) -> tuple[np.ndarray, np.ndarray]:
+                           sparse_loss: bool, dtype=np.float32) -> tuple[np.ndarray, np.ndarray]:
     """`MLA.calculate_indexer_loss` (:1117-1229) at scaling factor 1, the
     native (unchunked) head path; returns the per-query KL sum with the
-    mean the reference reports."""
+    mean the reference reports. `dtype` is the precision its softmaxes are
+    cast to, float32 as published, float64 for its float64 run."""
     if sparse_loss:
         indexer_score = indexer_score + indexer_mask
-    indexer_probs = softmax(indexer_score.astype(np.float32), axis=-1)
+    indexer_probs = softmax(indexer_score.astype(dtype), axis=-1)
     attention_scores = np.einsum("bthd,bshd->bhts", query, key)
     if sparse_loss:
         attention_scores = attention_scores + indexer_mask[:, None, :, :]
     else:
         attention_scores = attention_scores + attention_mask[:, None, :, :]
-    attention_probs = np.sum(softmax(attention_scores.astype(np.float32), axis=-1), axis=1)
+    attention_probs = np.sum(softmax(attention_scores.astype(dtype), axis=-1), axis=1)
     attention_probs = attention_probs / (np.sum(attention_probs, axis=-1, keepdims=True) + EPS)
     log_attention_probs = np.log(attention_probs + EPS)
     log_indexer_probs = np.log(indexer_probs + EPS)
     kl_per_token = attention_probs * (log_attention_probs - log_indexer_probs)
     per_query = np.sum(kl_per_token, axis=-1)
-    return per_query, np.asarray(np.mean(per_query), np.float32)
+    return per_query, np.asarray(np.mean(per_query), dtype)
 
 
 def causal_mask() -> np.ndarray:
@@ -206,6 +204,8 @@ def published_methods(dtype) -> tuple[dict, float]:
     attention_mla.py, with the module scope they read, at `dtype`."""
     import jax
     from jax.ad_checkpoint import checkpoint_name
+
+    from reference_source import defined_in, definitions, fetched
 
     scope = {"jax": jax, "jnp": Numpy(dtype), "checkpoint_name": checkpoint_name, "np": np,
              "Array": jax.Array, "Optional": __import__("typing").Optional}
