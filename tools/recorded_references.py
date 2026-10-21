@@ -32,7 +32,8 @@ def record_case(label: str, draw, evaluate, proxy, *, truth_proxy=None) -> dict[
     """`label`'s recording: `draw(seed)` gives a seed's inputs (a dict of arrays), `evaluate(inputs)` the
     reference's outputs and their float64 truth (dicts), and `proxy(inputs)` (with `truth_proxy`) a
     function that can run here, which plans the count. The recorded reference then confirms it,
-    recording further seeds as `seeds_for` asks, and the confirmed count's whole redraw is recorded."""
+    recording further seeds as `seeds_for` asks, and the recording keeps exactly the confirmed count's
+    draws and their redraw, (1 + REDRAW) times it."""
     planned = seeds_for(jax.jit(proxy), lambda seed: (draw(seed),), label,
                         truth_fn=None if truth_proxy is None else jax.jit(truth_proxy))
     print(f"{label}: planned {planned} seeds on the proxy", flush=True)
@@ -51,11 +52,14 @@ def record_case(label: str, draw, evaluate, proxy, *, truth_proxy=None) -> dict[
     ensure((1 + REDRAW) * planned)
     confirmed = seeds_for(lambda index, inputs: records[int(index)][1], recorded_draw, label,
                           truth_fn=lambda index, inputs: records[int(index)][2])
-    ensure((1 + REDRAW) * confirmed)
+    # The recording is the confirmed count's draws and their redraw, no more: a proxy that planned more
+    # than the recorded reference confirms leaves draws the recording does not keep.
+    kept = (1 + REDRAW) * confirmed
+    ensure(kept)
     result = {}
     for index, kind in enumerate(("input", "reference", "truth")):
         for name in records[0][index]:
-            result[f"{label}.{kind}.{name}"] = np.stack([record[index][name] for record in records])
+            result[f"{label}.{kind}.{name}"] = np.stack([record[index][name] for record in records[:kept]])
     result.update({f"{label}.seeds": np.int32(confirmed), f"{label}.redraw": np.int32(REDRAW)})
-    print(f"{label}: declared {confirmed} seeds; recorded {len(records)} draws", flush=True)
+    print(f"{label}: declared {confirmed} seeds; recorded {kept} draws", flush=True)
     return result
