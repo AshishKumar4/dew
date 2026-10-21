@@ -318,7 +318,8 @@ def new(hits: list[Hit], merged: str, top: Path) -> list[Hit]:
     """The copies of `hits` (as `found` gives them, each file named from the repository's top `top`)
     written in more places than at the commit `merged`. A file the checkout leaves as `merged` has it holds
     the places it holds now; a changed, deleted or new one is read as `merged` has it."""
-    changed = set(git(top, "diff", "--name-only", merged, "--").splitlines()) | set(
+    # --no-renames: a moved file is named at both ends, so its old content is read as `merged` has it.
+    changed = set(git(top, "diff", "--no-renames", "--name-only", merged, "--").splitlines()) | set(
         git(top, "ls-files", "--others", "--exclude-standard", "--full-name").splitlines())
     present = set(git(top, "ls-tree", "-r", "--name-only", merged).splitlines())
     before: dict[tuple[str, str], list[Place]] = defaultdict(list)
