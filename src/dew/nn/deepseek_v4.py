@@ -89,6 +89,14 @@ amplitude of 1 and scales the slice by its square otherwise, as the
 reference's does."""
 
 
+def gated_sum(kv, gate, axis: int):
+    """A window's entry: `kv` summed over its `axis` of positions, each weighted by the softmax of
+    its `gate` there, taken in at least fp32 and cast to `kv`'s dtype (modeling_deepseek_v4.py's
+    compressor), cached or uncached alike."""
+    weights = jax.nn.softmax(gate.astype(at_least_fp32(gate.dtype)), axis=axis).astype(kv.dtype)
+    return jnp.sum(kv * weights, axis=axis)
+
+
 def pool_windows(kv, gate, position_bias, rate: int, overlap: bool):
     """The compressor's entries: one softmax-gated sum per window of `rate` tokens.
 
@@ -117,8 +125,7 @@ def pool_windows(kv, gate, position_bias, rate: int, overlap: bool):
             [jnp.full_like(gate[:, :1, :, :width], -jnp.inf), gate[:, :-1, :, :width]], axis=1)
         kv = jnp.concatenate([previous_kv, kv[..., width:]], axis=2)
         gate = jnp.concatenate([previous_gate, gate[..., width:]], axis=2)
-    weights = jax.nn.softmax(gate.astype(at_least_fp32(gate.dtype)), axis=2).astype(kv.dtype)
-    return jnp.sum(kv * weights, axis=2)
+    return gated_sum(kv, gate, axis=2)
 
 
 def real_first(x, valid):
@@ -173,9 +180,7 @@ def append_windows(kv, gate, slots, buffers, previous, rate: int, width: int):
             if old is not None:
                 window_key = jnp.concatenate([old[0], window_key[..., width:]], axis=1)
                 window_gate = jnp.concatenate([old[1], window_gate[..., width:]], axis=1)
-            weights = jax.nn.softmax(window_gate.astype(at_least_fp32(window_gate.dtype)),
-                                     axis=1).astype(window_key.dtype)
-            entry = jnp.sum(window_key * weights, axis=1)
+            entry = gated_sum(window_key, window_gate, axis=1)
             at = jnp.where(closed, count, -1)[:, None]
             values = write_cache(values, entry[:, None], at)
             indices = write_cache(
