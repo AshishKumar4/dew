@@ -1060,7 +1060,7 @@ def fitted[Entry](
     named = {"val": validation} if isinstance(validation, Dataset) else validation
     if named is None:
         return loader, None
-    return loader, {name: _held(entry._chain(), loader.batch, objective) if isinstance(entry, Dataset)
+    return loader, {name: held(entry, objective=objective, batch=loader.batch) if isinstance(entry, Dataset)
                     else entry for name, entry in named.items()}
 
 
@@ -1074,10 +1074,16 @@ def _endless(chain: Pipeline) -> Pipeline:
     return dataclasses.replace(chain, stages=(*chain.stages[:at], Repeat(None), *chain.stages[at:]))
 
 
-def _held(chain: Pipeline, batch: int, objective: ObjectiveData) -> Reader:
-    """`chain` read once to validate on, batched by `batch` where it states no
-    batch, read and loaded as it asks."""
-    return validation(chain, batch=batch, objective=objective, read=chain.mode,
+def held(dataset: Dataset, *, objective: ObjectiveData | None = None, batch: int | None = None) -> Reader:
+    """`dataset` read once to validate or evaluate on, in its own batches, else in batches of `batch`,
+    read and loaded as it asks; one that states neither is refused."""
+    chain = dataset._chain()
+    if not any(isinstance(stage, (BatchStage, TokenBudget)) for stage in chain.stages):
+        if batch is None:
+            raise ValueError(f"{_name(chain)} states no batch; batch it (`.batch(n)`) or give batch=")
+        chain = chain.batch(batch, drop_remainder=False)
+    # The chain's own batch is the one it is read in; validation's `batch` adds none to it.
+    return validation(chain, batch=1, objective=objective, read=chain.mode,
                       loading=chain._loading or _DEFAULT_LOADING, provision=True)
 
 
