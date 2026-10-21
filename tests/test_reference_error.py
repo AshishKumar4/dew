@@ -404,6 +404,25 @@ def test_null_runs_judge_the_reference_against_itself_on_draws_no_other_run_take
 
     verdicts = null_runs(_product, draw, "null", seeds=8, runs=3)
     assert [verdict for verdict, _ in verdicts] == ["pass"] * 3
+
+    # Draws of one truth (an orbit's) pair their rows of float64 zero: Dew's residue on a row the
+    # reference holds at zero is no pass for drawing the reference elsewhere.
+    def one_truth(seed):
+        return np.ones(4, np.float32), np.float32(seed % 2)
+
+    def exact(x, s):
+        return {"y": jnp.stack([x * (1 + 1e-7), 0 * x])}
+
+    def residue(x, s):
+        return {"y": jnp.stack([x * (1 + 1e-7), 1e-12 * s * x])}
+
+    def truth(x, s):
+        return {"y": jnp.stack([x, 0 * x])}
+
+    with pytest.raises(AssertionError):
+        assert_as_exact(residue, exact, one_truth, "orbit", seeds=8, truth_fn=truth)
+    [(verdict, _)] = null_runs(exact, one_truth, "orbit", seeds=8, runs=1, truth_fn=truth, dew_fn=residue)
+    assert verdict == "over"
     assert len(taken) == len(set(taken))
     assert null_rate_bound(0, 1400) == pytest.approx(1 - 0.001 ** (1 / 1400), rel=1e-9)
     assert null_rate_bound(0, 200) > 0.03
