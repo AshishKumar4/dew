@@ -46,13 +46,13 @@ from dew.nn.kernels.chunked_launch import (
     _headed,
     _Launch,
     _picks,
-    _read,
     _row,
     _rows,
     _spaces,
     _tiles,
-    _write,
+    read_rows,
     sequences,
+    write_rows,
 )
 from dew.nn.kernels.fla_gdn import RCP_LN2, _dot, _tril_inverse, _weighted_values
 
@@ -173,11 +173,11 @@ def _intra_solve_kernel(chunk_ref, aqkd_ref, akkd_ref, aqk_ref, akk_ref, *, chun
         zero = jnp.zeros((SUB, SUB), jnp.float32)
 
         def part(ref, i, j):
-            return _read(_rows(ref, start + i * SUB, SUB, pl.ds(j * SUB, SUB)), taken - i * SUB).astype(
+            return read_rows(_rows(ref, start + i * SUB, SUB, pl.ds(j * SUB, SUB)), taken - i * SUB).astype(
                 jnp.float32)
 
         def store(ref, i, j, value):
-            _write(_rows(ref, start + i * SUB, SUB, pl.ds(j * SUB, SUB)), taken - i * SUB, value)
+            write_rows(_rows(ref, start + i * SUB, SUB, pl.ds(j * SUB, SUB)), taken - i * SUB, value)
 
         for i in range(count):
             for j in range(count):
@@ -260,10 +260,10 @@ def _w_u_kernel(chunk_ref, k_ref, v_ref, beta_ref, a_ref, g_ref, *refs, chunk: i
     @pl.when(taken > 0)
     def _():
         def read(ref, *rest):
-            return _read(_rows(ref, start, chunk, *rest), taken)
+            return read_rows(_rows(ref, start, chunk, *rest), taken)
 
         def write(ref, columns, value):
-            _write(_rows(ref, start, chunk, columns), taken, value)
+            write_rows(_rows(ref, start, chunk, columns), taken, value)
 
         beta = read(beta_ref)
         inverse = read(a_ref)
@@ -349,7 +349,7 @@ def _o_kernel(chunk_ref, q_ref, v_ref, g_ref, h_ref, a_ref, o_ref, *, chunk: int
     @pl.when(taken > 0)
     def _():
         def read(ref, *rest):
-            return _read(_rows(ref, start, chunk, *rest), taken)
+            return read_rows(_rows(ref, start, chunk, *rest), taken)
 
         out = jnp.zeros((chunk, v_ref.shape[-1]), jnp.float32)
         for block in range(q_ref.shape[-1] // bk):
@@ -361,7 +361,7 @@ def _o_kernel(chunk_ref, q_ref, v_ref, g_ref, h_ref, a_ref, o_ref, *, chunk: int
         index = jnp.arange(chunk)
         value = read(v_ref)
         scores = jnp.where(index[:, None] >= index[None, :], read(a_ref), 0.0).astype(value.dtype)
-        _write(_rows(o_ref, start, chunk), taken, out + _dot(scores, value, exact=exact, ieee=True))
+        write_rows(_rows(o_ref, start, chunk), taken, out + _dot(scores, value, exact=exact, ieee=True))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -426,7 +426,7 @@ def _dav_kernel(chunk_ref, v_ref, do_ref, a_ref, dv_ref, da_ref, *, chunk: int, 
     @pl.when(taken > 0)
     def _():
         def read(ref, *rest):
-            return _read(_rows(ref, start, chunk, *rest), taken)
+            return read_rows(_rows(ref, start, chunk, *rest), taken)
 
         index = jnp.arange(chunk)
         out_grad_dtype = do_ref.dtype
@@ -436,9 +436,9 @@ def _dav_kernel(chunk_ref, v_ref, do_ref, a_ref, dv_ref, da_ref, *, chunk: int, 
             columns = pl.ds(block * bv, bv)
             out_grad = read(do_ref, columns)
             scores = scores + _dot(out_grad, read(v_ref, columns).T, exact=exact)
-            _write(_rows(dv_ref, start, chunk, columns), taken, _dot(transposed, out_grad, exact=exact))
+            write_rows(_rows(dv_ref, start, chunk, columns), taken, _dot(transposed, out_grad, exact=exact))
         causal = index[:, None] >= index[None, :]
-        _write(_rows(da_ref, start, chunk), taken, jnp.where(causal, scores * scale, 0.0))
+        write_rows(_rows(da_ref, start, chunk), taken, jnp.where(causal, scores * scale, 0.0))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -502,10 +502,10 @@ def _wy_dqkg_kernel(chunk_ref, q_ref, k_ref, v_ref, vn_ref, g_ref, beta_ref, a_r
     @pl.when(taken > 0)
     def _():
         def read(ref, *rest):
-            return _read(_rows(ref, start, chunk, *rest), taken)
+            return read_rows(_rows(ref, start, chunk, *rest), taken)
 
         def write(ref, value, *rest):
-            _write(_rows(ref, start, chunk, *rest), taken, value)
+            write_rows(_rows(ref, start, chunk, *rest), taken, value)
 
         width, columns = k_ref.shape[-1], v_ref.shape[-1]
         index = jnp.arange(chunk)
@@ -660,13 +660,13 @@ def _bwd_intra_kernel(chunk_ref, q_ref, k_ref, g_ref, beta_ref, daqk_ref, dakk_r
             return SUB if aligned else taken - at
 
         def tile(ref, at):
-            return _read(_rows(ref, start + at, SUB), left(at))
+            return read_rows(_rows(ref, start + at, SUB), left(at))
 
         def gates(at):
             return _gates(g_ref, start + at, left(at), SUB)
 
         def scores(ref, row, column):
-            return _read(_rows(ref, start + row, SUB, pl.ds(column, SUB)), left(row)).astype(jnp.float32)
+            return read_rows(_rows(ref, start + row, SUB, pl.ds(column, SUB)), left(row)).astype(jnp.float32)
 
         def row(ref, at):
             return ref[start + at].astype(jnp.float32)
@@ -696,15 +696,15 @@ def _bwd_intra_kernel(chunk_ref, q_ref, k_ref, g_ref, beta_ref, daqk_ref, dakk_r
             causal = (index >= j)[:, None]
             own = row(k_ref, token)[None, :] * decay
             column = pl.ds(token, 1)
-            qk = _read(_rows(daqk_ref, start + first, SUB, column), left(first))
-            kk = _read(_rows(dakk_ref, start + first, SUB, column), left(first))
+            qk = read_rows(_rows(daqk_ref, start + first, SUB, column), left(first))
+            kk = read_rows(_rows(dakk_ref, start + first, SUB, column), left(first))
             return (sums[0] + jnp.where(causal, qk * own, 0.0), sums[1] + jnp.where(causal, kk * own, 0.0))
 
         dq2, dk2 = jax.lax.fori_loop(0, own_tokens, diagonal, (dq2, dk2))
         beta_grad = jnp.sum(dk2 * key, axis=1)
         dk2 = dk2 * beta[:, None]
         dg2 = tile(q_ref, first).astype(jnp.float32) * dq2
-        _write(_rows(dq2_ref, start + first, SUB), left(first), dq2 + tile(dq_ref, first))
+        write_rows(_rows(dq2_ref, start + first, SUB), left(first), dq2 + tile(dq_ref, first))
         closing = decayed(first + own_tokens - 1)
 
         def after(j, dkt):
@@ -732,9 +732,9 @@ def _bwd_intra_kernel(chunk_ref, q_ref, k_ref, g_ref, beta_ref, daqk_ref, dakk_r
 
         dkt = jax.lax.fori_loop(0, own_tokens, own, dkt)
         dg2 = dg2 + (dk2 - dkt) * key + tile(dg_ref, first)
-        _write(_rows(dk2_ref, start + first, SUB), left(first), dk2 + tile(dk_ref, first) + dkt)
-        _write(_rows(dg2_ref, start + first, SUB), left(first), dg2)
-        _write(_rows(db2_ref, start + first, SUB), left(first), beta_grad)
+        write_rows(_rows(dk2_ref, start + first, SUB), left(first), dk2 + tile(dk_ref, first) + dkt)
+        write_rows(_rows(dg2_ref, start + first, SUB), left(first), dg2)
+        write_rows(_rows(db2_ref, start + first, SUB), left(first), beta_grad)
 
 
 @dataclasses.dataclass(frozen=True)

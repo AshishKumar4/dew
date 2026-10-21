@@ -213,7 +213,7 @@ def _aligned(spans: Sequences, batch: int, length: int, chunk: int) -> bool:
 def _chunk_of(chunk_ref, chunk: int, aligned: bool):
     """A chunk's first token and count (`Sequences.chunks`). Where `aligned` every chunk is whole and
     starts on a multiple of `chunk`, as fla's fixed-length chunks do: the count is the constant
-    `chunk`, so its loads and stores take no mask (`_read`), and Triton is told the alignment. A
+    `chunk`, so its loads and stores take no mask (`read_rows`), and Triton is told the alignment. A
     packed document's chunks start anywhere and end where it does, as fla's varlen ones."""
     start, taken = chunk_ref[0], chunk_ref[1]
     return (pl.multiple_of(start, chunk), chunk) if aligned else (start, taken)
@@ -229,7 +229,7 @@ def _row_mask(view, count):
     return jnp.broadcast_to(mask, view.shape)
 
 
-def _read(view, count):
+def read_rows(view, count):
     """`view`'s rows below `count`, zeros past them: fla's boundary-checked loads, none where `count`
     is a constant covering the view."""
     from jax.experimental.pallas import triton as plgpu
@@ -244,7 +244,7 @@ def _gates(g_ref, start, taken, size, offset=0, *rest):
     last real row's: it decays nothing further, so every causal pair's `exp2(g_t - g_s)` stays at most
     1 where fla's zero fill, which it masks, could overflow."""
     view = _rows(g_ref, start + offset, size, *rest)
-    values = _read(view, taken - offset).astype(jnp.float32)
+    values = read_rows(view, taken - offset).astype(jnp.float32)
     if isinstance(taken, int) and taken - offset >= size:
         return values
     last = g_ref[(start + taken - 1, *rest)].astype(jnp.float32)
@@ -256,7 +256,7 @@ def _row(g_ref, index):
     return g_ref[index].astype(jnp.float32)
 
 
-def _write(view, count, value):
+def write_rows(view, count, value):
     """`value` into `view`'s rows below `count`, none past them."""
     from jax.experimental.pallas import triton as plgpu
 

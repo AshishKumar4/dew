@@ -58,8 +58,8 @@ FORMED = [
 gates with a clipped step, a scale without the l2 norm and one under it, and a rated decay with the
 skip and the norm (`recurrence_chunk.chunk`'s SSD)."""
 
-FORMED_SEEDS = dict(zip(FORMED, (8, 8, 8, 8, 8), strict=True))
-"""The formed sites' seeds, sized by `seeds_for` on armada."""
+FORMED_SEEDS = dict(zip(FORMED, (8, 16, 8, 8, 16), strict=True))
+"""The formed sites' seeds, sized independently by `seeds_for` on armada (2026-10-21)."""
 
 BF16_SEEDS = {HOOKS[0]: 8, HOOKS[-1]: 16}
 """The bf16-state sites' seeds, sized by `seeds_for` on armada (2026-10-20), including every output."""

@@ -40,15 +40,15 @@ from dew.nn.kernels.chunked_launch import (
     _headed,
     _Launch,
     _picks,
-    _read,
     _row,
     _rows,
     _spaces,
     _span,
     _tiles,
-    _write,
+    read_rows,
     sequences,
     slots,
+    write_rows,
 )
 
 RCP_LN2 = 1.4426950216
@@ -75,9 +75,9 @@ def _weighted_values(v_ref, u_ref, beta, inverse, start, taken, *, chunk: int, b
     before the product (fla's recompute_w_u kernels' `b_u`), at IEEE fp32 where `ieee`."""
     for block in range(v_ref.shape[-1] // bv):
         columns = pl.ds(block * bv, bv)
-        value = _read(_rows(v_ref, start, chunk, columns), taken)
+        value = read_rows(_rows(v_ref, start, chunk, columns), taken)
         scaled = (value * beta[:, None]).astype(value.dtype)
-        _write(_rows(u_ref, start, chunk, columns), taken, _dot(inverse, scaled, exact=exact, ieee=ieee))
+        write_rows(_rows(u_ref, start, chunk, columns), taken, _dot(inverse, scaled, exact=exact, ieee=ieee))
 
 
 def _dot(a, b, *, exact: bool, ieee: bool = False, solve: jnp.dtype | None = None):
@@ -153,7 +153,7 @@ def _kkt_solve_chunk(k_ref, g_ref, beta_ref, a_ref, start, taken, *, chunk: int,
     count = chunk // sub
 
     def part(ref, i, *rest):
-        return _read(_rows(ref, start + i * sub, sub, *rest), taken - i * sub)
+        return read_rows(_rows(ref, start + i * sub, sub, *rest), taken - i * sub)
 
     gates = [_gates(g_ref, start, taken, sub, i * sub) for i in range(count)]
     betas = [part(beta_ref, i).astype(jnp.float32) for i in range(count)]
@@ -184,7 +184,7 @@ def _kkt_solve_chunk(k_ref, g_ref, beta_ref, a_ref, start, taken, *, chunk: int,
     for i in range(count):
         for j in range(count):
             found = inverse[i, j] if j <= i else jnp.zeros((sub, sub), jnp.float32)
-            _write(_rows(a_ref, start + i * sub, sub, pl.ds(j * sub, sub)), taken - i * sub, found)
+            write_rows(_rows(a_ref, start + i * sub, sub, pl.ds(j * sub, sub)), taken - i * sub, found)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -248,7 +248,7 @@ def _w_u_kernel(chunk_ref, k_ref, v_ref, beta_ref, a_ref, g_ref, w_ref, u_ref, *
     @pl.when(taken > 0)
     def _():
         def read(ref, *rest):
-            return _read(_rows(ref, start, chunk, *rest), taken)
+            return read_rows(_rows(ref, start, chunk, *rest), taken)
 
         beta = read(beta_ref)
         inverse = read(a_ref)
@@ -260,7 +260,7 @@ def _w_u_kernel(chunk_ref, k_ref, v_ref, beta_ref, a_ref, g_ref, w_ref, u_ref, *
             key = read(k_ref, columns)
             scaled = key * beta[:, None] * decay[:, None]
             product = _dot(inverse, scaled.astype(key.dtype), exact=exact)
-            _write(_rows(w_ref, start, chunk, columns), taken, product)
+            write_rows(_rows(w_ref, start, chunk, columns), taken, product)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -345,7 +345,7 @@ def _h_kernel(span_ref, k_ref, u_ref, w_ref, g_ref, h0_ref, h_ref, corrected_ref
             taken = chunk if aligned else jnp.minimum(chunk, count - n * chunk)
 
             def read(ref, *rest):
-                return _read(_rows(ref, begin, chunk, *rest), taken)
+                return read_rows(_rows(ref, begin, chunk, *rest), taken)
 
             slot = jnp.where(n > 0, base + n, entered)
             for i in range(slices):
@@ -353,7 +353,7 @@ def _h_kernel(span_ref, k_ref, u_ref, w_ref, g_ref, h0_ref, h_ref, corrected_ref
             predicted = sum(_dot(read(w_ref, pl.ds(i * 64, 64)), state[i].astype(w_ref.dtype), exact=exact)
                             for i in range(slices))
             corrected = read(u_ref).astype(jnp.float32) - predicted
-            _write(_rows(corrected_ref, begin, chunk), taken, corrected)
+            write_rows(_rows(corrected_ref, begin, chunk), taken, corrected)
             final = begin + taken - 1
 
             def written(i, values):
@@ -476,7 +476,7 @@ def _dhu_kernel(span_ref, q_ref, k_ref, w_ref, g_ref, dht_ref, do_ref, dv_ref, d
             taken = chunk if aligned else jnp.minimum(chunk, count - n * chunk)
 
             def read(ref, *rest):
-                return _read(_rows(ref, begin, chunk, *rest), taken)
+                return read_rows(_rows(ref, begin, chunk, *rest), taken)
 
             slot = jnp.where(r > 0, base + n + 1, left)
             for i in range(slices):
@@ -500,7 +500,7 @@ def _dhu_kernel(span_ref, q_ref, k_ref, w_ref, g_ref, dht_ref, do_ref, dv_ref, d
                 kept = [jnp.exp2(last)] * slices
                 read_out = [_split_dot((query.astype(jnp.float32) * decay).T, out_grad, exact=exact)
                             for query in queries]
-            _write(_rows(dv2_ref, begin, chunk), taken, dv)
+            write_rows(_rows(dv2_ref, begin, chunk), taken, dv)
 
             def moved(i):
                 written = read(w_ref, pl.ds(i * 64, 64))
@@ -602,7 +602,7 @@ def _dv_local_kernel(chunk_ref, q_ref, k_ref, g_ref, do_ref, dv_ref, *, chunk: i
     @pl.when(taken > 0)
     def _():
         def read(ref, *rest):
-            return _read(_rows(ref, start, chunk, *rest), taken)
+            return read_rows(_rows(ref, start, chunk, *rest), taken)
 
         scores = jnp.zeros((chunk, chunk), jnp.float32)
         for block in range(k_ref.shape[-1] // bk):
@@ -615,7 +615,7 @@ def _dv_local_kernel(chunk_ref, q_ref, k_ref, g_ref, do_ref, dv_ref, *, chunk: i
         for block in range(do_ref.shape[-1] // bv):
             columns = pl.ds(block * bv, bv)
             product = _dot(scores, read(do_ref, columns), exact=exact)
-            _write(_rows(dv_ref, start, chunk, columns), taken, product)
+            write_rows(_rows(dv_ref, start, chunk, columns), taken, product)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -709,7 +709,7 @@ def _dqkwg_kernel(chunk_ref, q_ref, k_ref, v_ref, g_ref, h_ref, do_ref, dh_ref, 
     @pl.when(taken > 0)
     def _():
         def read(ref, *rest):
-            return _read(_rows(ref, start, chunk, *rest), taken)
+            return read_rows(_rows(ref, start, chunk, *rest), taken)
 
         width = q_ref.shape[-1]
         queries, keys = read(q_ref), read(k_ref)
@@ -735,7 +735,7 @@ def _dqkwg_kernel(chunk_ref, q_ref, k_ref, v_ref, g_ref, h_ref, do_ref, dh_ref, 
                 dq += _dot(out_grad, memory.T.astype(out_grad.dtype), exact=exact)
                 dk += _dot(value, memory_grad.T.astype(value.dtype), exact=exact)
                 dw += _dot(local.astype(value.dtype), memory.T.astype(value.dtype), exact=exact)
-            _write(_rows(dw_ref, start, chunk, head), taken, -dw)
+            write_rows(_rows(dw_ref, start, chunk, head), taken, -dw)
             gate = _gates(g_ref, start, taken, chunk, 0, head)
             last = _row(g_ref, (start + taken - 1, head))
             dq = dq * jnp.exp2(gate)[:, None] * scale
@@ -748,7 +748,7 @@ def _dqkwg_kernel(chunk_ref, q_ref, k_ref, v_ref, g_ref, h_ref, do_ref, dh_ref, 
             # The queries' reads of the memory the chunk enters, and that memory's own decay to its end.
             after = (jnp.sum(dq * queries.astype(jnp.float32), axis=1)
                      + jnp.where(last_row, dg_last * jnp.exp2(last), 0.0))
-            _write(_rows(dg_ref, start, chunk, head), taken, _summed_back(index, pairs, after))
+            write_rows(_rows(dg_ref, start, chunk, head), taken, _summed_back(index, pairs, after))
             ds = ds.astype(keys.dtype)
             dq += _dot(ds, keys, exact=exact)
             dk += _dot(ds.T, queries, exact=exact)
@@ -756,8 +756,8 @@ def _dqkwg_kernel(chunk_ref, q_ref, k_ref, v_ref, g_ref, h_ref, do_ref, dh_ref, 
 
         zeros = jnp.zeros((chunk, width), jnp.float32)
         dq, dk = jax.lax.fori_loop(0, v_ref.shape[1], head_grads, (zeros, zeros))
-        _write(_rows(dq_ref, start, chunk), taken, dq)
-        _write(_rows(dk_ref, start, chunk), taken, dk)
+        write_rows(_rows(dq_ref, start, chunk), taken, dq)
+        write_rows(_rows(dk_ref, start, chunk), taken, dk)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -866,7 +866,7 @@ def _wy_bwd_kernel(chunk_ref, k_ref, v_ref, beta_ref, g_ref, a_ref, dw_ref, du_r
     @pl.when(taken > 0)
     def _():
         def read(ref, *rest):
-            return _read(_rows(ref, start, chunk, *rest), taken)
+            return read_rows(_rows(ref, start, chunk, *rest), taken)
 
         inverse_t = read(a_ref).T
         beta = read(beta_ref)
@@ -894,7 +894,7 @@ def _wy_bwd_kernel(chunk_ref, k_ref, v_ref, beta_ref, g_ref, a_ref, dw_ref, du_r
             scaled = (value * beta[:, None]).astype(value.dtype)
             u_grad = read(du_ref, columns)
             d_scaled = _dot(inverse_t, u_grad, exact=exact)
-            _write(_rows(dv_ref, start, chunk, columns), taken, d_scaled * beta[:, None])
+            write_rows(_rows(dv_ref, start, chunk, columns), taken, d_scaled * beta[:, None])
             return (d_x + _dot(u_grad, scaled.T, exact=exact), d_beta + jnp.sum(d_scaled * value, axis=1))
 
         empty = jnp.zeros((chunk,), jnp.float32)
@@ -923,14 +923,14 @@ def _wy_bwd_kernel(chunk_ref, k_ref, v_ref, beta_ref, g_ref, a_ref, dw_ref, du_r
             if earlier_ref is not None:
                 earlier = read(earlier_ref, columns).astype(jnp.float32)
                 full += jnp.where(first_of_group, earlier, 0.0)
-            _write(_rows(dk_ref, start, chunk, columns), taken, full)
+            write_rows(_rows(dk_ref, start, chunk, columns), taken, full)
             return products, d_beta + jnp.sum(d_key * key, axis=1)
 
         products, d_beta = jax.lax.fori_loop(0, width // bk, keys_grad,
                                              (jnp.zeros((chunk, chunk), jnp.float32), d_beta))
-        _write(_rows(db_ref, start, chunk), taken, d_beta)
+        write_rows(_rows(db_ref, start, chunk), taken, d_beta)
         weighted = d_l.astype(jnp.float32) * (products * beta[:, None])
-        _write(_rows(dg_ref, start, chunk), taken, _summed_back(index, weighted, d_gate))
+        write_rows(_rows(dg_ref, start, chunk), taken, _summed_back(index, weighted, d_gate))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1018,7 +1018,7 @@ def _o_kernel(chunk_ref, q_ref, k_ref, v_ref, h_ref, g_ref, o_ref, *, chunk: int
     @pl.when(taken > 0)
     def _():
         def read(ref, *rest):
-            return _read(_rows(ref, start, chunk, *rest), taken)
+            return read_rows(_rows(ref, start, chunk, *rest), taken)
 
         out = jnp.zeros((chunk, v_ref.shape[-1]), jnp.float32)
         scores = jnp.zeros((chunk, chunk), jnp.float32)
@@ -1034,7 +1034,7 @@ def _o_kernel(chunk_ref, q_ref, k_ref, v_ref, h_ref, g_ref, o_ref, *, chunk: int
         scores = jnp.where(index[:, None] >= index[None, :], scores, 0.0)
         value = read(v_ref)
         out = out * scale + _dot(scores.astype(value.dtype), value, exact=exact, ieee=True) * scale
-        _write(_rows(o_ref, start, chunk), taken, out)
+        write_rows(_rows(o_ref, start, chunk), taken, out)
 
 
 @dataclasses.dataclass(frozen=True)
