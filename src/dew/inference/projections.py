@@ -21,6 +21,7 @@ from flax import linen as nn
 from flax.core import unfreeze
 
 from dew.interop.streaming import SourceLeaf
+from dew.nn.inputs import mesh_of
 from dew.nn.kernels.options import QuantizedClass
 from dew.nn.protocols import ProjectionGroup, Serving
 from dew.objectives.base import Variables
@@ -148,16 +149,23 @@ def packed_layout(model: nn.Module, variables: Variables) -> tuple[tuple[Project
 
 
 def served(model: nn.Module, variables: Variables) -> Variables:
-    """`variables` as one compiled generation reads them: the groups `model` reads packed
-    (`projection_groups`) packed, once per call before its decode loop, out of the per-token step.
-    A task's own `variables` stay the canonical tree on every route, bound in place, so the call
-    always reads the current weights and the packed copy lives only in the call's program; a group
-    already packed (a server's constant weights) stays as it is. The packed tree is held as written
-    (`optimization_barrier`), so the decode loop reads packed kernels, not a concatenation XLA is
-    free to fuse into the products inside it."""
-    groups = tuple(group for group in projection_groups(model, variables)
-                   if group.packed not in _node(variables, "params", group.path))
-    return jax.lax.optimization_barrier(pack_projections(variables, groups)) if groups else variables
+    """`variables` as a task's generations and a server's steps read them: the groups `model` reads
+    packed (`projection_groups`) packed, once, outside any compiled call, so the scales a group's
+    members quantize their input with are compared on concrete values and no decode step re-gathers
+    its members. On a mesh each packed leaf is laid out as its first member is; a group already
+    packed stays as it is. A task's own `variables` stay the canonical tree (`TextGeneration.placed`
+    calls this), so an export and every route's weights read as trained."""
+    packed = inference_projections(model, variables)
+    if packed is variables or mesh_of(variables) is None:
+        return packed
+    for group in projection_groups(model, packed):
+        members = _node(variables, "params", group.path)
+        if group.members[0] not in members:
+            continue
+        node = _node(packed, "params", group.path)
+        node[group.packed] = {field: jax.device_put(leaf, members[group.members[0]][field].sharding)
+                              for field, leaf in node[group.packed].items()}
+    return packed
 
 
 def inference_projections(model: nn.Module, variables: Variables) -> Variables:
