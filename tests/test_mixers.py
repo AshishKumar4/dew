@@ -13,6 +13,7 @@ and values agree, and an unknown kind or field raises naming what was asked for.
 import dataclasses
 import functools
 import itertools
+import pickle
 from typing import ClassVar
 
 import jax
@@ -30,6 +31,7 @@ from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock
 from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.inputs import TOKENWISE, AttentionMetadata, MixerCall, coordinates
 from dew.nn.kernels.generation import chosen
+from dew.nn.mixer_base import MixerRefused
 from dew.nn.mixers import AttentionMixer, MixerBase, MixerContext
 from dew.nn.mixers.gated_delta_net import GatedDeltaNetMixer
 from dew.registry import mixers, models
@@ -347,6 +349,17 @@ def test_every_attention_mixer_implements_or_refuses_each_policy_it_is_asked(kin
     held = factory.keywords.get("ctx")
     taken = factory.keywords.get(policy) if held is None else getattr(held, policy)
     assert taken == POLICY_VALUES[policy]
+
+
+def test_a_mixers_refusal_names_its_kind_and_entries_across_a_process_boundary():
+    """`MixerContext.refuse` raises `MixerRefused`, a ValueError naming the mixer, the context entries
+    the layer set and why; pickled, as a process carries an exception across, it is the same refusal."""
+    context = MixerContext(emb_features=64, num_heads=4, num_kv_heads=2, head_dim=64, max_seq_len=32)
+    with pytest.raises(MixerRefused) as refused:
+        context.refuse("mla", {"kv_cache": True, "attention_sinks": False}, "its latents are its cache")
+    again = pickle.loads(pickle.dumps(refused.value))
+    assert type(again) is MixerRefused and again.args == refused.value.args
+    assert (again.kind, again.names, again.why) == ("mla", ("kv_cache",), "its latents are its cache")
 
 
 @pytest.mark.parametrize("kind, rungs", [

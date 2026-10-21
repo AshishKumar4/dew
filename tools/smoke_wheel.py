@@ -78,6 +78,8 @@ def main() -> None:
         root = Path(scratch)
         venv.create(root / "env", with_pip=True)
         python = root / "env" / "bin" / "python"
+        # tools/pip.txt's pip first: older pips trust the roots of eMudhra's compromised CAs (2026-10-20).
+        run(python, "-m", "pip", "install", "--quiet", "-r", Path(__file__).with_name("pip.txt"), cwd=root)
         run(python, "-m", "pip", "install", "--quiet", "--index-url", "https://pypi.org/simple",
             "--extra-index-url", INDEX, wheel, cwd=root)
         # find_spec locates the package without importing it, so a module

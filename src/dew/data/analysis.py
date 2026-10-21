@@ -233,9 +233,12 @@ def _promoted(pipeline: Pipeline) -> Pipeline:
     step that cuts documents as the plan does (`chunks_for`) may come between,
     and the plan then cuts them, which it otherwise refuses. A source read
     only as a stream, such as one filtered by a predicate, is packed as its
-    rows arrive."""
+    rows arrive, and so are documents counted by a role or a pad id (`_ruled`),
+    whose windows a plan of their lengths does not count."""
     from dew.data.generation import Generation, _GenerationSource
     from dew.data.packing import PackedSource, chunks_for, plan_name
+    from dew.data.sources.tokens import TokenFiles
+    from dew.data.steps.windows import WindowSource
 
     def cutting(stages: Sequence[Stage]) -> int | None:
         """The overlap of a chunk step that cuts documents as the pack after it plans them
@@ -256,7 +259,8 @@ def _promoted(pipeline: Pipeline) -> Pipeline:
             packing = stages[at] if len(stages) > at else None
             # A published plan cuts a document as a window-long chunk step without overlap does.
             if (isinstance(source, _GenerationSource) and isinstance(packing, Pack)
-                    and plan_name(packing, "accepted") in plans and overlap in (None, 0)):
+                    and plan_name(packing, "accepted") in plans and overlap in (None, 0)
+                    and not _ruled(source)):
                 source = PackedSource.published(source, stage.cache, packing, chunked=overlap is not None)
                 stages = stages[at + 1 :]
             break
@@ -270,9 +274,26 @@ def _promoted(pipeline: Pipeline) -> Pipeline:
         and not isinstance(source, (Mixture, Phases))
         and source.supports("indexed")
         and source.lengths() is not None
+        and not _ruled(source)
     ):
         source, stages = PackedSource.planned(source, pack, overlap=overlap), stages[at + 1 :]
+    first = stages[0] if stages else None
+    if isinstance(first, Windows) and first.fields == ("text",) and isinstance(source, TokenFiles):
+        # A token store's own stream, cut where the windows are written: read by index.
+        stride = first.seq_len if first.stride is None else first.stride
+        source, stages = WindowSource(source, source.tokens, first.seq_len, stride), stages[1:]
     return dataclasses.replace(pipeline, source=source, stages=stages)
+
+
+def _ruled(source: Source) -> bool:
+    """Whether `source`'s documents may have been counted by a role or a pad id (`CountRule`), whose
+    windows that rule counts and a plan of document lengths, counting every target, does not. A
+    store certifies the rules its rows were counted by (`count_rules`): a generation and an export
+    write them, a store held in memory reads them off its rows, a token store's spans hold none,
+    and a store made of others gathers theirs. A store that certifies none may hold any, and its
+    rows are counted as they arrive."""
+    stated = source.metadata()
+    return "count_rules" not in stated or bool(stated["count_rules"])
 
 
 def _preferred_read(compiled: Callable[[Read], Sequence[Pipeline]], *, provision: bool) -> Read:
