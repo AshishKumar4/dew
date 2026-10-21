@@ -51,9 +51,17 @@ class Tiles:
     stages: int
 
 
-SPACE = tuple(Tiles(block_q, block_k, warps, stages) for block_q in (32, 64, 128) for block_k in (32, 64, 128)
-              for warps in (4, 8) for stages in (2, 3))
-"""Every config the forward is proven over (tests/test_attention_triton.py pins each)."""
+FORWARD_DEFAULT = Tiles(128, 64, 4, 2)
+"""The forward config first in its space, which a pick of tied estimates takes (`Template.estimate`):
+within 6% of the fastest at Qwen3-8B, causal and full, on an A100 and an H100 (ATT-ZERO3-a100 and
+ATT-ZERO4-h100, 2026-10-21), where the space's first config otherwise, 32 by 32, ran 2-3 times it."""
+
+SPACE = (FORWARD_DEFAULT, *(tiles for tiles in (Tiles(block_q, block_k, warps, stages)
+                                                for block_q in (32, 64, 128) for block_k in (32, 64, 128)
+                                                for warps in (4, 8) for stages in (2, 3))
+                            if tiles != FORWARD_DEFAULT))
+"""Every config the forward is proven over (tests/test_attention_triton.py pins each), its default
+first."""
 
 BLOCK = max(max(tiles.block_q for tiles in SPACE), max(tiles.block_k for tiles in SPACE))
 """The largest tile of `SPACE`, the block a call pads to (`padded_call`)."""
@@ -658,10 +666,16 @@ class BackwardTiles:
     dkv_stages: int
 
 
-BACKWARD_SPACE = tuple(BackwardTiles(tiles.block_q, tiles.block_k, tiles.warps, tiles.stages, warps, stages)
-                       for tiles in SPACE for warps in (4, 8) for stages in (2, 3))
+BACKWARD_DEFAULT = BackwardTiles(64, 64, 4, 2, 4, 2)
+"""The backward config first in its space, which a pick of tied estimates takes: within 7% of the fastest
+joint config of both launches at a llama shape and at head width 64, causal, on an A100 and an H100
+(DPROF3-a100 and DPROF3-h100, 2026-10-21)."""
+
+BACKWARD_SPACE = (BACKWARD_DEFAULT, *(config for config in (
+    BackwardTiles(tiles.block_q, tiles.block_k, tiles.warps, tiles.stages, warps, stages)
+    for tiles in SPACE for warps in (4, 8) for stages in (2, 3)) if config != BACKWARD_DEFAULT))
 """Every config of the backward: each of `SPACE`'s tiles for its dQ launch, with each warps and stages of
-its dK/dV launch."""
+its dK/dV launch, its default first."""
 
 
 @dataclasses.dataclass(frozen=True)
