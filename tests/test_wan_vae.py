@@ -199,8 +199,8 @@ def test_the_published_vae_matches_the_source():
     """`Wan-AI/Wan2.1-T2V-1.3B-Diffusers`'s VAE, downloaded, encodes a smooth
     nine-frame 128x192 clip and decodes its posterior mean as diffusers'
     `AutoencoderKLWan` does."""
-    torch = pytest.importorskip("torch")
-    diffusers = pytest.importorskip("diffusers")
+    import diffusers
+    import torch
     from huggingface_hub import snapshot_download
 
     path = snapshot_download("Wan-AI/Wan2.1-T2V-1.3B-Diffusers", allow_patterns=["vae/*"])
