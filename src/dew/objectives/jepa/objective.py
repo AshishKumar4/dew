@@ -221,6 +221,10 @@ class JepaObjective(Objective[Ratio]):
         _, dropout_key = jax.random.split(step.key)
         drawn = [step.sample(f"mask {name}", draw, shape, rows=batch_size) for name, draw, shape in
                  zip(("shapes", "corners", "order"), self.mask.draws(), self.mask.draw_shapes(), strict=True)]
+        # Each device draws its own rows' masks; placed, their indices gather the grid's constants, which
+        # an Explicit axis splits nothing of, so the draws are gathered whole first, a few bytes a row.
+        drawn = [value if (whole := whole_spec(value, value.ndim)) is None
+                 else jax.sharding.reshard(value, whole) for value in drawn]
         context_idx, target_idx = self.mask.placed(*drawn)
         context_idx, target_idx = step.boundary("context", context_idx), step.boundary("targets", target_idx)
         num_targets = self.mask.num_targets
