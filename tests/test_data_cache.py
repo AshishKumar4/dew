@@ -619,7 +619,9 @@ class Keeps:
 def test_a_cache_after_views_of_the_inputs_reads_as_the_uncached_chain(tmp_path, read, views):
     """Views of the inputs written before a cache (a shuffle, a window shuffle, a repeat, a take)
     read it as they read the inputs: the batches are the uncached chain's, rejected records
-    dropped where they are, and a later run reads the published fill without running its steps."""
+    dropped where they are. A view that reads every input completes the cache, so a later run
+    reads its published fill without running its steps; a take reads part of them, and the
+    cache, holding every input's, is filled again."""
     from dew.data.compile import compile
     from dew.data.dataset import DataPartition, Loading
     from dew.data.pipeline import Pipeline
@@ -648,7 +650,8 @@ def test_a_cache_after_views_of_the_inputs_reads_as_the_uncached_chain(tmp_path,
     filling, reading = Offset(10), Offset(10)
     assert batches(filling, cache) == expected
     assert batches(reading, cache) == expected
-    assert filling.calls and reading.calls == []
+    assert filling.calls
+    assert (reading.calls == []) == (views != "taken")
 
 
 def test_a_streamed_view_before_a_cache_is_refused_with_its_reason(tmp_path):
