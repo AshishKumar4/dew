@@ -255,3 +255,10 @@ def test_check_one_holds_an_empty_leaf_exact_by_construction():
                                      "history": jnp.zeros((16, 0, 48), jnp.bfloat16)})
     with pytest.raises(AssertionError):
         assert_as_exact(narrower, tree(_product), _draw, "a narrower empty leaf", seeds=8)
+
+    def fuller(x, w):
+        return {"y": _product(x, w)["y"], "history": jnp.zeros((16, 1, 48), x.dtype)}
+
+    with pytest.raises(AssertionError):
+        assert_as_exact(tree(_reordered), tree(_product), _draw, "a truth that is not empty", seeds=8,
+                        truth_fn=fuller)

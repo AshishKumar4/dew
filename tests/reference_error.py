@@ -304,6 +304,8 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None) -> _Draws:
                 kept = (np.shape(leaf), jnp.dtype(leaf.dtype))
                 assert kept == (np.shape(their_leaf), jnp.dtype(their_leaf.dtype)), (
                     jax.tree_util.keystr(path), kept, np.shape(their_leaf))
+                # The truth empty alike (in float64, its dtype is its own).
+                assert np.shape(true) == np.shape(leaf), (jax.tree_util.keystr(path), np.shape(true))
                 row.append((0.0, 0.0, 0.0, 0.0, 0, True))
                 continue
             leaf, their_leaf, true = (np.asarray(value, np.float64) for value in (leaf, their_leaf, true))
