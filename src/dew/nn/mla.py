@@ -101,7 +101,8 @@ logarithms of the KL."""
 
 
 def indexer_kl(scores, query, key, keep, scale: float):
-    """Per query, KL of the indexer's softmax from the attention: `[B, S]`, fp32.
+    """Per query, KL of the indexer's softmax from the attention: `[B, S]`, at least fp32 (float64
+    for float64 inputs, so a float64 truth computes it in float64).
 
     The indexer's objective (arXiv 2512.02556, eq. 3 and 4; MaxText
     `calculate_indexer_loss`): the target is the main attention's distribution
@@ -115,11 +116,12 @@ def indexer_kl(scores, query, key, keep, scale: float):
     target gives no mass contributes zero, and the gradient is the
     reference's, which the epsilon moves beyond float32 rounding.
     """
-    masked = jnp.finfo(jnp.float32).min
+    wide = at_least_fp32(jnp.result_type(scores, query, key))
+    masked = jnp.finfo(wide).min
     batch, length, total = scores.shape
     keep = jnp.broadcast_to(keep, (batch, length, total))
-    query = jax.lax.stop_gradient(query).astype(jnp.float32) * scale
-    key = jax.lax.stop_gradient(key).astype(jnp.float32)
+    query = jax.lax.stop_gradient(query).astype(wide) * scale
+    key = jax.lax.stop_gradient(key).astype(wide)
 
     def head(summed, projections):
         q, k = projections
@@ -127,10 +129,10 @@ def indexer_kl(scores, query, key, keep, scale: float):
         return summed + jax.nn.softmax(logits, axis=-1), None
 
     summed, _ = jax.lax.scan(
-        head, jnp.zeros((batch, length, total), jnp.float32),
+        head, jnp.zeros((batch, length, total), wide),
         (jnp.moveaxis(query, 2, 0), jnp.moveaxis(key, 2, 0)))
     target = summed / (jnp.sum(summed, axis=-1, keepdims=True) + INDEXER_EPS)
-    indexer = jax.nn.softmax(jnp.where(keep, scores.astype(jnp.float32), masked), axis=-1)
+    indexer = jax.nn.softmax(jnp.where(keep, scores.astype(wide), masked), axis=-1)
     return jnp.sum(target * (jnp.log(target + INDEXER_EPS) - jnp.log(indexer + INDEXER_EPS)), axis=-1)
 
 

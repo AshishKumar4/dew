@@ -11,13 +11,16 @@ members concatenate, through `inference_projections`.
 
 from __future__ import annotations
 
-from collections.abc import Sequence
+import functools
+from collections.abc import Callable, Sequence
+from typing import TypeGuard
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from flax import linen as nn
-from flax.core import unfreeze
+from flax.core import FrozenDict, freeze, unfreeze
+from jax.sharding import SingleDeviceSharding
 
 from dew.interop.streaming import SourceLeaf
 from dew.nn.kernels.options import QuantizedClass
@@ -67,9 +70,22 @@ def projection_groups(model: nn.Module, variables: Variables) -> tuple[Projectio
     that selects modules by their paths (`Quantization.patterns`), a group packs
     only where the packed projection is selected as each member is, so a
     quantized member is not served unquantized, nor the reverse."""
+    return _projection_groups(model, unfreeze(dict(variables)))
+
+
+def _declares(model: nn.Module) -> TypeGuard[Serving]:
+    """Whether `model` names groups for a tree of its own: it serves them (`Serving`) and no adapter
+    wraps it. An adapter's LoRA branches bind the members' own paths, so an adapted model's tree
+    holds them unpacked, and its interceptor places the base weights only as it applies, so the model
+    binds over its tree for no declaration."""
     from dew.lora import AdaptedClass
 
-    if isinstance(type(model), AdaptedClass) or not isinstance(model, Serving):
+    return isinstance(model, Serving) and not isinstance(type(model), AdaptedClass)
+
+
+def _projection_groups(model: nn.Module, variables: dict) -> tuple[ProjectionGroup, ...]:
+    """`projection_groups` over a tree of plain dicts, which reading costs no copy."""
+    if not _declares(model):
         return ()
     layer = type(model)
     spec = layer._dew_quantization if isinstance(layer, QuantizedClass) else None
@@ -122,16 +138,52 @@ def pack_projections(variables: Variables, groups: Sequence[ProjectionGroup]) ->
     return packed
 
 
-def packed_layout(model: nn.Module, variables: Variables) -> tuple[tuple[ProjectionGroup, ...], Variables]:
-    """The groups `variables` hold packed, and the shapes of the tree they
-    were packed from, `pack_projections` undone: each packed kernel and bias
-    split back into its members by their widths, and the packed input
-    quantization each member's own again. A served model's reload takes
-    that tree and packs it again."""
-    shapes = unfreeze(dict(jax.tree.map(
-        lambda leaf: jax.ShapeDtypeStruct(np.shape(leaf), jnp.result_type(leaf)), variables)))
-    groups = tuple(group for group in projection_groups(model, variables)
-                   if group.packed in _node(variables, "params", group.path))
+def pending(model: nn.Module, variables: Variables) -> tuple[ProjectionGroup, ...]:
+    """The groups `model` reads packed that `variables` hold unpacked and can pack
+    (`projection_groups`), compared on these concrete values: what a generation over a borrowed
+    tree, a live objective's, packs inside its compiled call (`packed_in_call`)."""
+    variables = unfreeze(dict(variables))
+    return tuple(group for group in _projection_groups(model, variables)
+                 if group.packed not in _node(variables, "params", group.path))
+
+
+def packed_in_call(variables: Variables, groups: Sequence[ProjectionGroup]) -> Variables:
+    """`variables` with `groups` (`pending`'s) packed inside a compiled call, before its decode
+    loop: once per call, from the weights it is handed, the packed copy freed when it returns, so
+    a live objective's generation reads its current state packed without holding a second copy.
+    The packed tree is held as written (`optimization_barrier`), so the loop reads packed kernels,
+    not a concatenation XLA could fuse into the products inside it."""
+    return jax.lax.optimization_barrier(_joined(variables, groups)) if groups else variables
+
+
+def packed_owned(model: nn.Module, variables: Variables) -> Variables:
+    """`variables`, a tree its caller owns and gives up (a source's or a saved run's placed
+    weights), with its groups packed one at a time through the host (`_handed_over`): each packed
+    kernel and bias placed where its members were (`_placed_alike`), the members' buffers freed
+    first, so the devices hold one copy of the weights throughout. A host tree packs on the host."""
+    return _joined(variables, pending(model, variables), _handed_over)
+
+
+def _held_packed(model: nn.Module, variables: Variables) -> tuple[ProjectionGroup, ...]:
+    """The groups `model` declares (`Serving`) that `variables` hold packed: what the tree stores,
+    whatever a quantization would now let `projection_groups` pack anew. An adapted model's tree
+    holds none (`_declares`)."""
+    if not _declares(model):
+        return ()
+    variables = unfreeze(dict(variables))
+    return tuple(group for group in _declared(model, variables)
+                 if group.packed in _node(variables, "params", group.path))
+
+
+type _Leaf = jax.Array | np.ndarray | jax.ShapeDtypeStruct
+
+
+def _split(variables: Variables, groups: Sequence[ProjectionGroup],
+           parts: Callable[[_Leaf, tuple[int, ...]], Sequence[_Leaf]]) -> Variables:
+    """`variables` with each of `groups`, packed, split back into its members, `parts(leaf,
+    widths)` giving a packed kernel's or bias's members, and the packed input quantization each
+    member's own again: `pack_projections` undone, on values or on shapes alike."""
+    split = unfreeze(dict(variables))
     for group in groups:
         node = _node(shapes, "params", group.path)
         packed = node.pop(group.packed)
@@ -143,7 +195,44 @@ def packed_layout(model: nn.Module, variables: Variables) -> tuple[tuple[Project
             scale = quantized.pop(group.packed)
             for projection in group.members:
                 quantized[projection] = scale
-    return groups, shapes
+    return split
+
+
+def packed_layout(model: nn.Module, variables: Variables) -> tuple[tuple[ProjectionGroup, ...], Variables]:
+    """The groups `variables` hold packed, and the shapes of the tree they
+    were packed from (`_split`). A served model's reload takes that tree and
+    packs it again."""
+    shapes = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(np.shape(leaf), jnp.result_type(leaf)), variables)
+    groups = _held_packed(model, variables)
+    return groups, _split(shapes, groups, lambda leaf, widths: [
+        jax.ShapeDtypeStruct((*leaf.shape[:-1], width), leaf.dtype) for width in widths])
+
+
+def unpacked(model: nn.Module, variables: Variables) -> Variables:
+    """`variables` as training and an export read them, the model's own tree: each group they hold
+    packed (a loaded task's serving layout) split back into its members (`_split`), on the host one
+    group at a time, so the devices hold no second copy. A leaf this process holds on one of its
+    devices whole (fully addressable, or replicated on every device) splits on the host; any other
+    one, sharded across processes or over this process's own devices, splits where it lives. A
+    group stored quantized for serving (`TextGeneration.quantized`, Qwix's arrays in place of its
+    kernel) stays packed: such a tree computes only as the served model it was quantized for,
+    which reads it packed, and an export of it is refused where the source's layout reads the
+    members. A tree that holds no group to split is returned as it is."""
+    groups = tuple(group for group in _held_packed(model, variables) if all(
+        isinstance(leaf, (jax.Array, np.ndarray)) for leaf in _node(variables, "params", group.path)[
+            group.packed].values()))
+    if not groups:
+        return variables
+
+    def parts(leaf, widths):
+        edges = np.cumsum(widths)[:-1].tolist()
+        if isinstance(leaf, jax.Array) and not (leaf.is_fully_addressable or (
+                leaf.is_fully_replicated and leaf.sharding.has_addressable_devices)):
+            return jnp.split(leaf, edges, axis=-1)
+        return np.split(np.asarray(leaf), edges, axis=-1)
+
+    split = _split(variables, groups, parts)
+    return freeze(split) if isinstance(variables, FrozenDict) else split
 
 
 def inference_projections(model: nn.Module, variables: Variables) -> Variables:
