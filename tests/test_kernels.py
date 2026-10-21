@@ -416,7 +416,7 @@ def test_flash_keeps_the_kernel_contract_on_a_mesh(axis, split, without_determin
     gradients on par with one device's over the site's draws, no operand moved between devices and
     no copy or transpose at the kernel's edge."""
     from jax.sharding import Mesh, PartitionSpec
-    from sharded import assert_runs_per_shard
+    from sharded import assert_runs_per_shard, with_gradients
 
     flash_here()
 
@@ -425,19 +425,12 @@ def test_flash_keeps_the_kernel_contract_on_a_mesh(axis, split, without_determin
         _, key, value = qkv((2, 256, 2, 64), seed=3 * seed + 1)
         return query, key, value, qkv((2, 256, 4, 64), seed=3 * seed + 2)[0]
 
-    def gradients(attend):
-        def run(q, k, v, do):
-            out, pull = jax.vjp(attend, q, k, v)
-            return out, *pull(do)
-
-        return run
-
     spec = PartitionSpec(*(axis if dim in split else None for dim in range(3)))
     mesh = Mesh(np.asarray(jax.devices()[:2]), (axis,))
     flash = functools.partial(scaled_dot_product_attention, implementation='flash', causal=True)
-    assert_runs_per_shard(gradients(flash), draw, [spec] * 4, mesh, f"flash split over {axis}",
-                          seeds=SHARDED_SEEDS,
-                          truth_fn=gradients(jax.vmap(functools.partial(float64_attention, causal=True))))
+    assert_runs_per_shard(with_gradients(flash), draw, [spec] * 4, mesh, f"flash split over {axis}",
+                          seeds=SHARDED_SEEDS, truth_fn=with_gradients(
+                              jax.vmap(functools.partial(float64_attention, causal=True))))
 
 
 @on_gpu

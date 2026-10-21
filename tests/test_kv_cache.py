@@ -299,8 +299,7 @@ def test_a_paged_decode_step_lowers_for_a_tpu_on_a_mesh_that_splits_rows_or_head
     lowers with the kernel run per shard (`sharded.tpu_lowering`), each holding its rows and the
     pool's key heads its query heads read; a mesh splitting the query heads past the pool's two key
     heads reads the gathered rows instead."""
-    from jax.sharding import NamedSharding, PartitionSpec
-    from sharded import tpu_lowering, tpu_mesh
+    from sharded import placed, tpu_lowering, tpu_mesh
 
     mesh = tpu_mesh(**axes)
     model = CausalTransformer(vocab_size=32, emb_features=64, num_layers=1, num_heads=4, num_kv_heads=2,
@@ -311,15 +310,12 @@ def test_a_paged_decode_step_lowers_for_a_tpu_on_a_mesh_that_splits_rows_or_head
     cache = jax.eval_shape(lambda params: model.apply(params, 4, method=CausalTransformer.init_cache,
                                                       mutable=["cache"])[1]["cache"], params)
 
-    def placed(tree, *spec):
-        sharding = NamedSharding(mesh, PartitionSpec(*spec))
-        return jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=sharding), tree)
-
     def step(params, cache, tokens):
         return model.apply({**params, "cache": cache}, tokens, decode=True, mutable=["cache"])
 
     rows = "data" if "data" in axes else None
-    lowered = tpu_lowering(step, (placed(params), placed(cache), placed(tokens, rows)), mesh)
+    arguments = (placed(params, mesh), placed(cache, mesh), placed(tokens, mesh, rows))
+    lowered = tpu_lowering(step, arguments, mesh)
     assert ("tpu_custom_call" in lowered) is native
 
 
