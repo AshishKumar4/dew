@@ -22,7 +22,7 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from model_support import TINY_DECODER
-from reference_error import assert_as_exact, seeds_for
+from reference_error import assert_as_exact
 from residual_orders import orders, permuted, residual_width
 
 from dew.nn import linear
@@ -220,7 +220,7 @@ def packed_and_alone(model, variables, tokens, cotangent):
 
 KIND_FIELDS = {"mlp": ({"intermediate_size": 64}, {}), "llama4": ({}, {"qk_norm": False}),
                "deepseek_v4": ({"rope_head_dim": 8}, {"kinds": {"full_attention": LayerKind(window=8)}}),
-               "kimi_delta_attention": ({"linear_num_heads": 2, "linear_head_dim": 16}, {}),
+               "kimi_delta_attention": ({"linear_num_heads": 2, "linear_head_dim": 32}, {}),
                "gated_delta_net": ({"linear_num_key_heads": 2, "linear_num_value_heads": 4,
                                     "linear_key_head_dim": 16, "linear_value_head_dim": 16}, {})}
 """The fields a kind needs beyond its defaults to build in `tiny`: its own, then the model's. The
@@ -230,11 +230,15 @@ per-key pairwise decays alone take 134 MB a chunk in KDA's portable math."""
 REFUSED = {"kpool_sparse_attention"}
 """Kinds that refuse packed rows."""
 
-SEEDS = {"attention": 64, "deepseek_v4": 256, "gated_delta_net": 512, "llama4": 128,
-         "mamba": 32, "mamba2": 256, "mla": 64, "mlp": 64}
+SEEDS = {"attention": 64, "deepseek_v4": 256, "gated_delta_net": 512, "kimi_delta_attention": 512,
+         "llama4": 128, "mamba": 32, "mamba2": 256, "mla": 64, "mlp": 64}
 """Each kind's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for`: the fewest for
 which documents run alone compared with themselves resolve PARITY in every logit and parameter
-gradient (2026-10-20, on armada)."""
+gradient (2026-10-20, on armada; Kimi delta attention's 2026-10-21). Its heads are 32 wide
+(`KIND_FIELDS`): at 16 the reference compared with itself did not resolve within 2048 seeds, one seed
+carrying up to 68% of a leaf's summed error, near-collinear keys' erases in fp32; at 32 it carries at
+most 5%. 16 is no path of its own: the portable math this site runs has no width-specific code, and
+the port pads every key width below 64 to 64 (tests/test_fla_gdn.py's any-width site)."""
 
 
 @pytest.mark.parametrize("kind", sorted(mixers.paths))
@@ -245,11 +249,9 @@ def test_a_packed_row_computes_what_its_documents_compute_alone(kind):
     a recurrent state or attention across a document boundary, nor between the documents and the
     segment-0 padding after them. Each draw has fresh tokens, parameters and cotangents, with the
     residual channels consistently permuted (`residual_orders`). Both fp32 runs use IEEE products;
-    the float64 truth runs each document alone under the same order. KDA packs twelve documents,
-    DOCUMENTS repeated four times (328 real tokens), so its small summed gradients average more
-    roundings within each draw; the other kinds pack DOCUMENTS' three (82 real tokens)."""
+    the float64 truth runs each document alone under the same order."""
     fields, overrides = KIND_FIELDS.get(kind, ({}, {}))
-    documents = DOCUMENTS * 4 if kind == "kimi_delta_attention" else DOCUMENTS
+    documents = DOCUMENTS
     total = sum(documents)
     model = tiny(mixer=mixers.build(kind, **fields), max_seq_len=max(128, total + PADDING), **overrides)
     tokens = jax.random.randint(jax.random.key(3), (1, total), 0, VOCAB)
@@ -281,12 +283,7 @@ def test_a_packed_row_computes_what_its_documents_compute_alone(kind):
     dew = jax.jit(functools.partial(evaluated, model, packed=True))
     reference = jax.jit(functools.partial(evaluated, model, packed=False))
     truth = jax.jit(functools.partial(evaluated, model.clone(dtype=jnp.float64), packed=False))
-    label = f"packed {kind}"
-    seeds = SEEDS.get(kind)
-    if seeds is None:
-        seeds = seeds_for(reference, draw, label, truth_fn=truth)
-        print(f"SIZED {label}: {seeds}", flush=True)
-    assert_as_exact(dew, reference, draw, label, seeds=seeds, truth_fn=truth)
+    assert_as_exact(dew, reference, draw, f"packed {kind}", seeds=SEEDS[kind], truth_fn=truth)
 
 
 def embedded(module, tokens):
