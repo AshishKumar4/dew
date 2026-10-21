@@ -134,9 +134,16 @@ def build(name: str, case: Case, root: Path) -> dict[str, np.ndarray]:
     arrays = {**original, **narrow, **{f"fp64.{key}": value for key, value in wide.items()}}
     print(f"{name}: size {case.size} prompts {case.lengths} "
           f"|output| <= {float(np.abs(narrow['output']).max()):.4g} parameters {len(narrow) - 2 - batch}")
+
+    def channels_last(inputs):
+        # Keep the channel rows the original native comparison held, including its worst-row check.
+        return tuple({key: value[:, :, 0].transpose(0, 2, 3, 1)
+                      if key in ("output", "grad_latents") else value for key, value in values.items()}
+                     for values in evaluate(inputs))
+
     proxy, _ = transformer_walk(root, name, case.lengths, dtype=None)
     return {**{f"{name}.{key}": value for key, value in arrays.items()},
-            **record_case(name, draw, evaluate, proxy)}
+            **record_case(name, draw, channels_last, proxy)}
 
 
 PIPELINE = {**BASE, "cap_feat_dim": 16, "n_layers": 1}

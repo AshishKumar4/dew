@@ -65,7 +65,7 @@ def load(source, name, *, dtype="float32"):
 
 
 def transformer_walk(source, name, lengths, *, dtype="float32"):
-    """The native flow and gradients in source layout, plus the padded prompt gradient.
+    """The native flow and gradients, plus the padded prompt gradient.
 
     The recorder plans seeds on the same walk, inferring dtype for its widened proxy.
     """
@@ -87,8 +87,7 @@ def transformer_walk(source, name, lengths, *, dtype="float32"):
 
         (_, output), gradients = jax.value_and_grad(objective, argnums=(0, 1, 2), has_aux=True)(
             jax.tree.map(lambda value: jnp.asarray(value, latents.dtype), params), latents, context)
-        return {"output": -output.transpose(0, 3, 1, 2)[:, :, None],
-                "grad_latents": -gradients[1].transpose(0, 3, 1, 2)[:, :, None],
+        return {"output": -output, "grad_latents": -gradients[1],
                 **{f"grad_caption.{row}": -gradients[2][row, :length]
                    for row, length in enumerate(lengths)},
                 "grad_params": gradients[0], "grad_context": gradients[2]}
