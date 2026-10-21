@@ -431,6 +431,37 @@ def test_many_fp16_cotangents_too_small_once_normalized_still_sum_into_dv():
     np.testing.assert_array_equal(np.asarray(ours, np.float32), np.asarray(theirs, np.float32))
 
 
+@pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float16], ids=["bfloat16", "float16"])
+def test_cotangents_that_cancel_across_a_key_still_cancel_in_dv(dtype):
+    """Three queries over three equal keys, cotangents 1, 2 and -3: each key's gradient is the queries'
+    equal shares of them, which cancel, 0, as the reference's derivative gives."""
+    spans = template.spans(3, 3, 1)
+    zeros = jnp.zeros((1, 3, 1, 1), dtype)
+    dout = jnp.asarray([1.0, 2.0, -3.0], dtype).reshape(1, 3, 1, 1)
+    with tuning.pinned({attention_triton.TritonBackward: joint(PINNED[0])}):
+        ours = attention_triton.backward(zeros, zeros, zeros, spans, None, dout, scale=1.0,
+                                         interpret=not ON_GPU).value
+    _, pull = jax.vjp(lambda value: template.reference(zeros, zeros, value, spans, scale=1.0), zeros)
+    [theirs] = pull(dout)
+    np.testing.assert_array_equal(np.asarray(theirs, np.float32), 0)
+    np.testing.assert_array_equal(np.asarray(ours, np.float32), 0)
+
+
+def test_a_small_fp16_cotangent_channel_beside_a_large_one_still_sums_into_dv():
+    """fp16, 32 queries over 32 equal keys, cotangents 2 in one value channel and 2^-24 in the other:
+    the small channel's 32 shares of 2^-29 still sum to 2^-24, as the reference's derivative gives."""
+    spans = template.spans(32, 32, 1)
+    zeros = jnp.zeros((1, 32, 1, 2), jnp.float16)
+    dout = jnp.broadcast_to(jnp.asarray([2.0, 2.0 ** -24], jnp.float16), (1, 32, 1, 2))
+    with tuning.pinned({attention_triton.TritonBackward: joint(PINNED[0])}):
+        ours = attention_triton.backward(zeros, zeros, zeros, spans, None, dout, scale=1.0,
+                                         interpret=not ON_GPU).value
+    _, pull = jax.vjp(lambda value: template.reference(zeros, zeros, value, spans, scale=1.0), zeros)
+    [theirs] = pull(dout)
+    np.testing.assert_array_equal(np.asarray(theirs, np.float32)[0, :, 0], [[2.0, 2.0 ** -24]] * 32)
+    np.testing.assert_array_equal(np.asarray(ours, np.float32), np.asarray(theirs, np.float32))
+
+
 def test_a_small_fp16_cotangent_beside_a_large_one_still_reaches_its_key():
     """fp16, two queries each seeing only its own key, cotangents 65504 and 2^-24: each key's gradient
     is its own query's, exactly, as the reference's derivative gives, the small beside the large."""

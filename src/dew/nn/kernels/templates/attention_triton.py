@@ -60,13 +60,18 @@ def _wide_enough(dtype) -> bool:
     return jnp.finfo(dtype).minexp <= jnp.finfo(jnp.float32).minexp
 
 
-def _cotangent_dot(a: jax.Array, b: jax.Array, interpret: bool) -> jax.Array:
-    """`a @ b` for fp32 `b`, as the reference's derivative takes it: in `a`'s dtype where that dtype
-    holds every fp32 value's range, else (fp16) in fp32, so each query's small share of a key's
-    gradient counts whatever the others' sizes."""
-    if _wide_enough(a.dtype):
-        return _dot(a, b.astype(a.dtype), interpret)
-    return _dot(a.astype(jnp.float32), b, interpret)
+def _value_gradient(exponentials: jax.Array, weights: jax.Array, dout: jax.Array, total: jax.Array,
+                    interpret: bool) -> jax.Array:
+    """A tile's share of dV `[block_k, Dv]`, fp32. Where the operands' dtype reaches fp32's range (bf16,
+    fp32), the weights `p` narrowed to it against the output's cotangent as it is, FlashAttention's
+    form: no rounding of a cotangent of its own, so a query's cotangents that cancel across a key still
+    cancel. fp16 would underflow a small weight or a small share of a cotangent, so there the unnormalized
+    weights `exp(s - m)` narrowed to it as the reference's forward rounds them, against each query's
+    `dout / total` in fp32, the reference's derivative's own order."""
+    if _wide_enough(dout.dtype):
+        return _dot(weights.astype(dout.dtype).T, dout, interpret)
+    scaled = dout.astype(jnp.float32) * _inverse(total)[:, None]
+    return _dot(exponentials.astype(dout.dtype).astype(jnp.float32).T, scaled, interpret)
 
 
 def _power(width: int) -> int:
@@ -575,7 +580,7 @@ def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tu
     # A tile parameter's gradient enters as its zeros, aliased to its output (`_dq_launch`).
     for _ in (kind for kind in score_kinds if kind == Kind.TILE):
         refs.pop(0)
-    dq_ref, delta_ref, anchor_ref, peak_out_ref, total_out_ref, shift_ref, *outputs = refs
+    dq_ref, delta_ref, anchor_ref, peak_out_ref, total_out_ref, mass_ref, *outputs = refs
     grad_refs = [outputs.pop(0) if kind in DQ_GRADS else None for kind in score_kinds]
     block_q = query_ref.shape[0]
     head = pl.program_id(2)
@@ -670,9 +675,8 @@ def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tu
     anchor_ref[...] = anchor
     peak_out_ref[...] = peak
     total_out_ref[...] = total
-    # The initial maximum's cotangent: by the softmax's shift, less the keys' score cotangents under the
-    # refined D, so a query that read no key leaves it exactly 0.
-    shift_ref[...] = refined * mass - residual
+    # The keys' share of the weights, which tells a query that read only its initial state.
+    mass_ref[...] = mass
     for grad, kind, ref in zip(grads, score_kinds, grad_refs, strict=True):
         if kind == Kind.HEAD:
             ref[...] = jnp.broadcast_to(jnp.sum(grad), ref.shape)
@@ -705,15 +709,12 @@ def _dkv_kernel(ranges_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: t
             seen &= query_ids_ref[rows][:, None] == key_ids[None, :]
         params = [_key_param(ref, kind, head, rows)
                   for ref, kind in zip(score_refs, score_kinds, strict=True)]
-        exponentials, _, cotangents, slopes = _tile_scores(score_mod, query, key, value, dout, peak_ref[rows],
+        exponentials, weights, cotangents, slopes = _tile_scores(score_mod, query, key, value, dout,
+                                                                 peak_ref[rows],
                                                    total_ref[rows], anchor_ref[rows], delta_ref[rows], seen,
                                                    q_pos, k_pos, params, scale=scale, interpret=interpret)
         logits, pieces = _pulled(cotangents, slopes, seen, score_kinds)
-        # dV as the reference's derivative takes it: the unnormalized weights in the operands' dtype
-        # against the output's cotangent over each query's denominator, so a weight fp16 holds only
-        # before it is normalized still counts.
-        dv = dv + _cotangent_dot(exponentials.astype(dout.dtype).T,
-                                 dout.astype(jnp.float32) * _inverse(total_ref[rows])[:, None], interpret)
+        dv = dv + _value_gradient(exponentials, weights, dout, total_ref[rows], interpret)
         # Scaled before it narrows to the operands' dtype, so fp16 holds what fp32 does.
         dk = dk + _dot((logits * scale).astype(query.dtype).T, query, interpret)
         updated = [grad + piece if kind == Kind.KEY else grad
@@ -842,7 +843,7 @@ def _launch_cost(ba: tokamax.BoundArguments, config: BackwardTiles, target: gene
                            if kind == Kind.KEY)
     wide = 0
     if not dq and not _wide_enough(query.dtype):
-        # fp16's dV product runs in fp32 (`_cotangent_dot`), after the launch's 16-bit work.
+        # fp16's dV product runs in fp32 (`_value_gradient`), after the launch's 16-bit work.
         products, wide = products - value_width, value_width
     seconds = costs.seconds(costs.Cost(
         programs=programs,
@@ -1045,7 +1046,7 @@ def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
     grads_out = list(outputs[6:])
     dq_grads = [grads_out.pop(0) for kind in kinds if kind in DQ_GRADS]
     dk, dv, *key_grads = grads_out
-    delta, anchor, peak, total, shift = (array[:, :, :queries] for array in softmax)
+    delta, anchor, peak, total, mass = (array[:, :, :queries] for array in softmax)
     delta = anchor + delta
     padded_k, padded_d, padded_dv = call.key.shape[1], call.key.shape[-1], call.value.shape[-1]
     dk = dk.reshape(batch, padded_k, kv_heads, group, padded_d).sum(axis=3)
@@ -1068,7 +1069,12 @@ def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
         # The initial state as one more softmax term: its weight exp(m0 - m) / T, its value acc0 / total0.
         weight = jnp.where((total > 0) & jnp.isfinite(starts[0]),
                            jnp.exp(starts[0] - peak) / jnp.where(total > 0, total, 1.0), 0.0)
-        initial = Initial(m=shift.astype(state.m.dtype), total=(-weight * delta).astype(state.total.dtype),
+        # Its maximum's cotangent, that term's score cotangent, taken whole as the reference's derivative
+        # takes it, so a state that weighs little beside the keys keeps its relative precision; exactly 0
+        # for a query that read only its state, whose output its maximum leaves unmoved.
+        moved = jnp.where(mass > 0, weight * (jnp.sum(state.acc.astype(jnp.float32) * cotangent, axis=-1)
+                                              - state.total.astype(jnp.float32) * delta), 0.0)
+        initial = Initial(m=moved.astype(state.m.dtype), total=(-weight * delta).astype(state.total.dtype),
                           acc=(weight[..., None] * cotangent).astype(state.acc.dtype))
     return Gradients(dq[:, :queries, :, :width].astype(query.dtype),
                      dk[:, :keys, :, :width].astype(key.dtype),
