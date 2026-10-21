@@ -42,8 +42,7 @@ def features(launch, ba, config, target: generation.GpuTarget) -> Features | Non
     """The features of `launch` running `ba` at `config` on `target`, or None where the launch states no
     `costed` record of its own (`Template.costed`): any other kernel op, or a template still costing by
     an override of `cost`."""
-    stated = getattr(type(launch), 'costed', None)
-    if stated is None or stated is base.Template.costed:
+    if not isinstance(launch, base.Template) or type(launch).costed is base.Template.costed:
         return None
     costed = launch.costed(ba, config, target)
     facts = generation.effective(target)
@@ -81,7 +80,8 @@ def _predictions(costed: cost.Cost, facts: generation.GpuTarget) -> dict[str, fl
     multiprocessors, clock, bandwidth = facts.multiprocessors, facts.clock_hz, facts.memory_bandwidth
     rate = facts.tensor_rate(costed.mode) if costed.program_flops else None
     balance = (rate * multiprocessors * clock / bandwidth
-               if None not in (rate, multiprocessors, clock, bandwidth) else None)
+               if rate is not None and multiprocessors is not None and clock is not None and bandwidth
+               else None)
     intensity = flops / costed.device_bytes if costed.device_bytes else None
     slots = multiprocessors * costed.resident if multiprocessors is not None else None
     waves = costed.programs / slots if slots else None

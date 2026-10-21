@@ -651,18 +651,18 @@ def observed(op: KernelOp, ba: tokamax.BoundArguments, measured: Mapping[Hashabl
     target = generation.gpu_target()
     call = json.dumps(_launch_json(ba), sort_keys=True)
     rows = []
-    for config, result in measured.items():
+    for config, measurement in measured.items():
         found = features.features(op, ba, config, target)
-        timed = isinstance(result, tokamax.BenchmarkData)
+        timed = measurement if isinstance(measurement, tokamax.BenchmarkData) else None
         rows.append(log.observation(
             type(op).__name__, call, json.dumps(encoded(config), sort_keys=True), device=device,
-            method=log.CUPTI_EVICTED, status='timed' if timed else 'resource_exhausted',
-            samples_ms=tuple(result.evaluation_times_ms) if timed else (),
-            lower_ms=result.lower_time_ms if timed else None,
-            compile_ms=result.compile_time_ms if timed else None,
+            method=log.CUPTI_EVICTED, status='resource_exhausted' if timed is None else 'timed',
+            samples_ms=() if timed is None else tuple(timed.evaluation_times_ms),
+            lower_ms=None if timed is None else timed.lower_time_ms,
+            compile_ms=None if timed is None else timed.compile_time_ms,
             estimate_s=None if found is None else cost.seconds(found.legacy, target),
             features=None if found is None else found.row(),
-            error=None if timed else result))
+            error=measurement if isinstance(measurement, BaseException) else None))
     log.record(rows)
 
 
