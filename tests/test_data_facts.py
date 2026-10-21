@@ -52,7 +52,7 @@ def test_a_rectangular_resize_states_its_height_width_and_the_decoded_channels()
     them; resized without a decode, their channels are unknown, so their shape is."""
     from dew.data import images
 
-    decoded = _images().map(images.DecodeImage("image")).map(images.Resize((6, 10))).repeat().batch(2)
+    decoded = _images().filter_map(images.DecodeImage("image")).map(images.Resize((6, 10))).repeat().batch(2)
     assert decoded.facts()["fields"]["image"] == [6, 10, 3] == _first(decoded)["image"]
     resized = _images().map(images.Resize((6, 10))).repeat().batch(2)
     assert "image" not in resized.facts().get("fields", {})
