@@ -1300,21 +1300,51 @@ def test_torch_source_reads_every_way_and_refuses_a_cache_without_content_identi
         )
 
 
-@pytest.mark.parametrize("read", ["memory", "indexed"])
-@pytest.mark.parametrize("resume", ["exact", "non-exact"])
-def test_torch_compilation_requires_identity_even_for_equal_shapes(read, resume):
-    """Same-class, same-length datasets cannot name an exact position by their shape."""
+@pytest.mark.parametrize("kind,read", [("torch", "memory"), ("torch", "indexed"),
+                                       ("grain", "indexed"), ("grain", "streamed"), ("iterator", "streamed")])
+def test_an_unnamed_foreign_source_trains_and_resumes_only_where_told_its_content_is_unknown(
+        tmp_path, kind, read):
+    """A torch, Grain or iterator source given no name reads and trains; nothing says a later run
+    reads the same records, so an exact resume of its position is refused, one with
+    `resume="non-exact"` reads on from it, and no cache keys it."""
+    import grain.python as grain
     import torch
     from torch.utils.data import TensorDataset
 
-    from dew.data import from_torch
+    from dew.data import from_grain, from_iter, from_torch
     from dew.data.compile import compile
 
-    for offset in (0, 100):
-        source = from_torch(TensorDataset(torch.arange(32) + offset), fields=("id",))
+    rows = [{"id": index} for index in range(32)]
+
+    def source():
+        if kind == "torch":
+            return from_torch(TensorDataset(torch.arange(32)), fields=("id",))
+        if kind == "grain":
+            return from_grain(grain.MapDataset.source(rows))
+        return from_iter(lambda: iter(rows), replay=True)
+
+    def reader(resume):
+        return compile(source().repeat().batch(4), read=read, resume=resume,
+                       loading=Loading(workers=0)).train(DataPartition())
+
+    original = reader("exact")
+    try:
+        assert [next(original)["id"].tolist() for _ in range(2)] == [[0, 1, 2, 3], [4, 5, 6, 7]]
+        saved = original.get_state()
+        remaining = [next(original)["id"].tolist() for _ in range(2)]
+    finally:
+        original.close()
+    exact, loose = reader("exact"), reader("non-exact")
+    try:
         with pytest.raises(ValueError):
-            compile(source.shuffle(4).repeat().batch(4), read=read, resume=resume,
-                    loading=Loading(workers=0))
+            exact.set_state(saved)
+        loose.set_state(saved)
+        assert [next(loose)["id"].tolist() for _ in range(2)] == remaining
+    finally:
+        exact.close()
+        loose.close()
+    with pytest.raises(ValueError):
+        compile(source().cache(str(tmp_path / "cache")).batch(4), read=read, loading=Loading(workers=0))
 
 
 @pytest.mark.parametrize("kind,read", [("torch", "memory"), ("torch", "indexed"),
@@ -1483,20 +1513,19 @@ def test_from_iter_forwards_a_native_stop_request():
 
 
 @pytest.mark.parametrize("kind", ["grain", "iterator"])
-@pytest.mark.parametrize("resume", ["exact", "non-exact"])
-def test_foreign_sources_cannot_use_an_empty_content_identity(kind, resume):
-    """Grain and iterator adapters require a real source name, just as Torch requires identity."""
+def test_foreign_sources_cannot_use_an_empty_content_identity(kind):
+    """A Grain or iterator source given an empty name declares no content version, which is no
+    name at all said otherwise: it is refused as it is made."""
     import grain.python as grain
 
     from dew.data import from_grain, from_iter
-    from dew.data.compile import compile
 
     rows = [{"id": index} for index in range(8)]
-    source = (from_grain(grain.MapDataset.source(rows), "") if kind == "grain"
-              else from_iter(lambda: iter(rows), name=""))
     with pytest.raises(ValueError):
-        compile(source.repeat().batch(2), read="indexed" if kind == "grain" else "streamed",
-                resume=resume, loading=Loading(workers=0))
+        if kind == "grain":
+            from_grain(grain.MapDataset.source(rows), "")
+        else:
+            from_iter(lambda: iter(rows), name="")
 
 
 def test_delta_snapshot_pins_version_and_discovers_partition_columns(tmp_path):
