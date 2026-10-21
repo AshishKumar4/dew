@@ -20,9 +20,10 @@
 ragged_dot.py` in the jax-v0.11.2 source tree (tag jax-v0.11.2, 32544801;
 license header above), which no jax wheel ships: `DEFAULT_BLOCK_M` through
 `_hyperparam_selection_rule`, restyled to this tree's lint gate and moved
-from `jax._src` imports to their public equivalents, with two lines of logic
-changed and marked `# Dew:`: tgmm's output cast, and gmm's
-zeroing when every group is empty. The file's `ragged_dot_general`
+from `jax._src` imports to their public equivalents, with lines of logic
+changed and marked `# Dew:`: the prologue and epilogue hooks with their side
+operands (`_side_tile`), tgmm's output cast, and gmm's zeroing when every
+group is empty. The file's `ragged_dot_general`
 adapter is left out: Dew calls the kernels itself, through
 `dew.nn.moe.expert_projection`'s custom VJP, the way MaxText calls megablox.
 
@@ -126,13 +127,30 @@ def _make_gmm_group_metadata(
   )
 
 
+def _side_tile(ref, axes, origins: dict, masks: dict):
+  """Dew: a side operand's tile, loaded at the launch's own origins: each of its two dimensions follows
+  the launch axis `axes` names ('rows', 'depth', 'columns'), its start, extent and mask from `origins`
+  and `masks`, or is broadcast (None: extent 1, index 0)."""
+  index, dimension_masks = [], []
+  for axis in axes:
+    if axis is None:
+      index.append(pl.ds(0, 1))
+      dimension_masks.append(jnp.ones((1,), jnp.bool_))
+    else:
+      start, extent = origins[axis]
+      index.append(pl.ds(start, extent))
+      dimension_masks.append(masks[axis])
+  mask = dimension_masks[0][:, None] & dimension_masks[1][None, :]
+  return plgpu.load(ref.at[index[0], index[1]], mask=mask, other=0)
+
+
 def _gpu_ragged_dot_kernel(
   # inputs
   x_ref,  # [m, k]
   A_ref,  # [k, n] or [n, k]
   group_metadata_ref: GMMGroupLookupMetadata,
-  # outputs
-  y_ref,  # [k, n]
+  # Dew: the prologue's and the epilogue's side operands, then the outputs
+  *refs,
   # static problem shapes
   chunk_m: int,
   trans_rhs: bool,
@@ -140,7 +158,14 @@ def _gpu_ragged_dot_kernel(
   block: BlockSizes,  # hyperparameters
   compute_dtype: DTypeLike | None = None,
   acc_dtype: DTypeLike = np.float32,
+  prologue=None,
+  prologue_axes: tuple = (),
+  epilogue=None,
+  epilogue_axes: tuple = (),
 ):
+  prologue_refs = refs[:len(prologue_axes)]
+  epilogue_refs = refs[len(prologue_axes):len(prologue_axes) + len(epilogue_axes)]
+  out_refs = refs[len(prologue_axes) + len(epilogue_axes):]
   i, j = pl.program_id(0), pl.program_id(1)
   pid = SimpleNamespace(i=i, j=j, gi=group_metadata_ref.row_it2group[i])
   size = jax.tree.map(partial(np.array, dtype=np.int32), size)
@@ -169,6 +194,12 @@ def _gpu_ragged_dot_kernel(
       _load = partial(plgpu.load, other=0)
       mask = lhs_rows_mask[:, None] & inner_mask[None, :]
       x = _load(x_ref.at[lhs_rows_idx, inner_idx], mask=mask)
+      if prologue is not None:
+        # Dew: the prologue, on the loaded tile and its side operands' tiles.
+        tiles = [_side_tile(ref, axes, {'rows': (ridx, block.m), 'depth': (k * block.k, block.k)},
+                            {'rows': lhs_rows_mask, 'depth': inner_mask})
+                 for ref, axes in zip(prologue_refs, prologue_axes, strict=True)]
+        x = prologue(x, *tiles)
       if not trans_rhs:
         mask = inner_mask[:, None] & rhs_cols_mask[None, :]
         A = _load(A_ref.at[pid.gi, inner_idx, rhs_cols_idx], mask=mask)
@@ -188,9 +219,18 @@ def _gpu_ragged_dot_kernel(
 
     acc = jnp.zeros((block.m, block.n), dtype=acc_dtype)
     acc = lax.fori_loop(0, cdiv(size.k, block.k), inner_compute, acc)
-    acc = acc.astype(y_ref.dtype)
     mask = lhs_rows_mask[:, None] & rhs_cols_mask[None, :]
-    plgpu.store(y_ref.at[lhs_rows_idx, rhs_cols_idx], acc, mask=mask)
+    if epilogue is None:
+      outs = (acc,)
+    else:
+      # Dew: the epilogue, on the fp32 accumulator and its side operands' tiles; one or more outputs.
+      tiles = [_side_tile(ref, axes, {'rows': (ridx, block.m), 'columns': (pid.j * block.n, block.n)},
+                          {'rows': lhs_rows_mask, 'columns': rhs_cols_mask})
+               for ref, axes in zip(epilogue_refs, epilogue_axes, strict=True)]
+      outs = epilogue(acc, *tiles)
+      outs = outs if isinstance(outs, tuple) else (outs,)
+    for y_ref, out in zip(out_refs, outs, strict=True):
+      plgpu.store(y_ref.at[lhs_rows_idx, rhs_cols_idx], out.astype(y_ref.dtype), mask=mask)
     return
 
   lax.fori_loop(0, cdiv(group_sz, block.m), outer_compute, None)
@@ -214,13 +254,17 @@ def _gpu_ragged_dot_kernel(
       row_mask = (last_offset + i * block.m + arange(block.m)) < size.m
       window = (pl.ds(last_offset + i * block.m, block.m), pl.ds(0, block.n))
       mask = row_mask[:, None] & col_mask[None, :]
-      zero = jnp.zeros((block.m, block.n), dtype=y_ref.dtype)
-      plgpu.store(y_ref.at[*window], zero, mask=mask)
+      for y_ref in out_refs:
+        zero = jnp.zeros((block.m, block.n), dtype=y_ref.dtype)
+        plgpu.store(y_ref.at[*window], zero, mask=mask)
 
     lax.fori_loop(0, cdiv(size.m - last_offset, block.m), set_zero, None)
 
 
-@jax.jit(static_argnums=list(range(3, 14)))
+@partial(jax.jit, static_argnames=(
+  "block_m", "block_k", "block_n", "trans_rhs", "interpret", "compute_dtype", "acc_dtype", "num_warps",
+  "num_stages", "chunk_m", "out_dtype", "prologue", "prologue_axes", "epilogue", "epilogue_axes",
+  "out_dtypes"))
 def gmm(
   x: jax.Array,  # [m, k]
   A: jax.Array,  # [g, k, n]
@@ -236,8 +280,21 @@ def gmm(
   num_stages: int | None = None,
   chunk_m: int = CHUNK_M,
   out_dtype: DTypeLike | None = None,
-) -> jax.Array:
-  """Compute grouped matmul on GPU via a Pallas lowering."""
+  *,
+  prologue=None,
+  prologue_operands: tuple[jax.Array, ...] = (),
+  prologue_axes: tuple = (),
+  epilogue=None,
+  epilogue_operands: tuple[jax.Array, ...] = (),
+  epilogue_axes: tuple = (),
+  out_dtypes: tuple | None = None,
+) -> jax.Array | tuple[jax.Array, ...]:
+  """Compute grouped matmul on GPU via a Pallas lowering.
+
+  Dew: `prologue(tile, *side_tiles)` transforms each loaded `[block_m, block_k]` tile of `x` and
+  `epilogue(acc, *side_tiles)` each fp32 accumulator tile, returning one output or a tuple of them
+  (`out_dtypes`). Each side operand is 2-D, its dimensions following the launch axes its `*_axes`
+  entry names (`_side_tile`)."""
 
   msg = "This gmm kernel only supports either (m, k) x (g, k, n) -> (m, n) "
   msg += f"or (m, k) x (g, n, k) -> (m, n), but got {x.shape=} {A.shape=}"
@@ -266,6 +323,7 @@ def gmm(
   group_metadata = _make_gmm_group_metadata(
     group_sizes=group_sizes, m=size.m, chunk_m=chunk_m
   )
+  sides = (*prologue_operands, *epilogue_operands)
   in_specs = [
     pl.BlockSpec((size.m, size.k), lambda i, j: (0, 0)),
     A_spec,
@@ -273,10 +331,12 @@ def gmm(
       lambda x: pl.BlockSpec(x.shape, lambda *args: (0,) * x.ndim),
       group_metadata,
     ),
+    # Dew: each side operand whole; the kernel loads its tiles at its own origins.
+    *(pl.BlockSpec(side.shape, lambda i, j: (0, 0)) for side in sides),
   ]
-  out_shape = jax.ShapeDtypeStruct(
-    (size.m, size.n), dtype=out_dtype or x.dtype)
-  out_specs = pl.BlockSpec((size.m, block_n), lambda i, j: (0, j))
+  dtypes = out_dtypes or (out_dtype or x.dtype,)
+  out_shape = tuple(jax.ShapeDtypeStruct((size.m, size.n), dtype=dtype) for dtype in dtypes)
+  out_specs = tuple(pl.BlockSpec((size.m, block_n), lambda i, j: (0, j)) for _ in dtypes)
   grid_upper_bound = (size.m + chunk_m - 1) // chunk_m + size.g
   grid = (grid_upper_bound, pl.cdiv(size.n, block_n))
   block_sizes = BlockSizes(m=block_m, k=block_k, n=block_n)
@@ -285,9 +345,13 @@ def gmm(
     "acc_dtype": acc_dtype,
     "trans_rhs": trans_rhs,
     "chunk_m": chunk_m,
+    "prologue": prologue,
+    "prologue_axes": prologue_axes,
+    "epilogue": epilogue,
+    "epilogue_axes": epilogue_axes,
   }
   with jax.named_scope("pallas_triton_ragged_dot"):
-    return pl.pallas_call(
+    outs = pl.pallas_call(
       partial(
         _gpu_ragged_dot_kernel, size=size, block=block_sizes,
         **other_kws  # pyrefly: ignore[bad-argument-type]
@@ -301,7 +365,8 @@ def gmm(
         num_warps=num_warps, num_stages=num_stages
       ),
       name="pallas_triton_ragged_dot",
-    )(x, A, group_metadata)
+    )(x, A, group_metadata, *sides)
+  return outs if out_dtypes else outs[0]
 
 
 def _tgmm_ragged_dot_kernel(
@@ -310,14 +375,17 @@ def _tgmm_ragged_dot_kernel(
   y_ref,  # [k, n]
   group_sizes_ref,  # [g]
   group_offset_ref,  # [g]
-  # outputs
-  A_bar_ref,  # [g, k, n]
+  # Dew: the prologue's side operands, then the output [g, k, n]
+  *refs,
   # static problem shapes
   size: RaggedDotSizes,
   block: BlockSizes,  # hyperparameters
   compute_dtype: DTypeLike | None = None,
   acc_dtype: DTypeLike = np.float32,
+  prologue=None,
+  prologue_axes: tuple = (),
 ):
+  *prologue_refs, A_bar_ref = refs
   assert A_bar_ref.shape == (block.k, block.n)
   pid =  SimpleNamespace(gi=pl.program_id(0), r=pl.program_id(1),
                          c=pl.program_id(2))
@@ -343,6 +411,13 @@ def _tgmm_ragged_dot_kernel(
 
       mask = xy_rows_mask[:, None] & k_mask[None, :]
       x = plgpu.load(x_ref.at[xy_rows_idx, k_idx], mask=mask, other=0)
+      if prologue is not None:
+        # Dew: the prologue, on the loaded rows of `x` and its side operands' tiles, then the rows
+        # past the group zeroed again, which no hook may bring back.
+        tiles = [_side_tile(ref, axes, {'rows': (ridx, block.m), 'depth': (pid.r * block.k, block.k)},
+                            {'rows': xy_rows_mask, 'depth': k_mask})
+                 for ref, axes in zip(prologue_refs, prologue_axes, strict=True)]
+        x = jnp.where(mask, prologue(x, *tiles), 0)
       mask = xy_rows_mask[:, None] & cols_mask[None, :]
       y = plgpu.load(y_ref.at[xy_rows_idx, cols_idx], mask=mask, other=0)
       x, y = x.astype(compute_dtype), y.astype(compute_dtype)
@@ -367,7 +442,9 @@ def _tgmm_ragged_dot_kernel(
                 mask=rmask[:, None] & cmask[None, :])
 
 
-@jax.jit(static_argnums=list(range(3, 13)))
+@partial(jax.jit, static_argnames=(
+  "block_m", "block_n", "block_k", "interpret", "compute_dtype", "acc_dtype", "num_warps", "num_stages",
+  "chunk_m", "out_dtype", "prologue", "prologue_axes"))
 def tgmm(
   x: jax.Array,  # [m, k]
   y: jax.Array,  # [m, n]
@@ -382,8 +459,15 @@ def tgmm(
   num_stages: int | None = None,
   chunk_m: int = CHUNK_M,
   out_dtype: DTypeLike | None = None,
+  *,
+  prologue=None,
+  prologue_operands: tuple[jax.Array, ...] = (),
+  prologue_axes: tuple = (),
 ) -> jax.Array:
-  """Compute grouped matmul on GPU via a Pallas lowering."""
+  """Compute grouped matmul on GPU via a Pallas lowering.
+
+  Dew: `prologue(rows, *side_tiles)` transforms each loaded `[block_m, block_k]` tile of `x`'s rows
+  before its transposed product; side operands as `gmm`'s, along 'rows' and 'depth'."""
   del chunk_m
   msg = "This tgmm kernel only supports (m, k) x (m, n) -> (g, k, n), but got "
   msg += f"{x.shape=} {y.shape=}"
@@ -405,6 +489,7 @@ def tgmm(
     pl.BlockSpec((size.m, block_n), lambda i, r, c: (0, c)),
     pl.BlockSpec((size.g,), lambda i, r, c: (0,)),
     pl.BlockSpec((size.g,), lambda i, r, c: (0,)),
+    *(pl.BlockSpec(side.shape, lambda i, r, c: (0, 0)) for side in prologue_operands),
   ]
 
   out_shape = jax.ShapeDtypeStruct(
@@ -413,7 +498,8 @@ def tgmm(
   grid = (size.g, pl.cdiv(size.k, block_k), pl.cdiv(size.n, block_n))
 
   block_sizes = BlockSizes(m=block_m, k=block_k, n=block_n)
-  dtype_spec = {"compute_dtype": compute_dtype, "acc_dtype": acc_dtype}
+  dtype_spec = {"compute_dtype": compute_dtype, "acc_dtype": acc_dtype, "prologue": prologue,
+                "prologue_axes": prologue_axes}
   with jax.named_scope("tgmm_ragged_dot"):
     return pl.pallas_call(
       partial(_tgmm_ragged_dot_kernel, size=size, block=block_sizes,
@@ -427,7 +513,7 @@ def tgmm(
         num_warps=num_warps, num_stages=num_stages
       ),
       name="tgmm_ragged_dot",
-    )(x, y, group_sizes, group_offsets)
+    )(x, y, group_sizes, group_offsets, *prologue_operands)
 
 
 def _hyperparam_selection_rule(dtype: np.dtype):
