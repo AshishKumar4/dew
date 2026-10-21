@@ -8,7 +8,8 @@ input gradient; `tgmm` is `lhs` transposed times `rhs [rows, width]`, the kernel
 template's hooks as the ragged kernels do (`ragged_dot.gmm`, `ragged_dot.tgmm`): a prologue on each tile of
 `lhs`'s rows and its side tiles, an epilogue on the fp32 accumulator (`gmm`), side operands following the
 launch axes each names, brought in by the launch's block specs. Rows, depth or width the tiles do not
-divide are padded with zeros and dropped (rows `tgmm` contracts, zeroed again after the prologue).
+divide are padded with zeros and dropped; what each contracts (`gmm`'s depth, `tgmm`'s rows) is zeroed
+again after the prologue, which need not keep it zero.
 """
 
 import functools

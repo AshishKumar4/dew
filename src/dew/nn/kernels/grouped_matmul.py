@@ -359,7 +359,7 @@ class _Triton(_GroupedLaunch[Tile]):
         if not ba.arguments.get('dense'):
             return fitted
         # A dense call (`triton_dense`) prefers the fitting tiles dividing its depth and width, where any
-        # does: the kernel pads to one that does not, a copy the cost model does not price.
+        # does: the kernel pads to one that does not, a copy the cost model prices (`_padding_bytes`).
         depth, width = self._dense_extents(ba)
         dividing = tuple(tile for tile in fitted if depth % tile.block_k == 0 and width % tile.block_n == 0)
         return dividing or fitted
@@ -464,7 +464,9 @@ class Gmm(_Triton):
         if ba.arguments.get('dense'):
             moved += _padding_bytes((((rows, depth), ('rows', 'depth'), size),
                                      ((depth, width), ('depth', 'width'), size),
-                                     ((rows, width), ('rows', 'width'), _output_bytes(ba))), config)
+                                     ((rows, width), ('rows', 'width'), _output_bytes(ba)),
+                                     *_side_arrays(prologue_sides, hooks.prologue_axes),
+                                     *_side_arrays(epilogue_sides, hooks.epilogue_axes)), config)
         extents = self.extents(config)
         exponentials = (
             steps * config.block_m * config.block_k * _hook_work(
@@ -557,7 +559,8 @@ class Tgmm(_Triton):
         if ba.arguments.get('dense'):
             moved += _padding_bytes((((rows, depth), ('rows', 'depth'), size),
                                      ((rows, width), ('rows', 'width'), size),
-                                     ((depth, width), ('depth', 'width'), out)), config)
+                                     ((depth, width), ('depth', 'width'), out),
+                                     *_side_arrays(sides, hooks.prologue_axes)), config)
         exponentials = steps * config.block_m * config.block_k * _hook_work(
             hooks.before(), tokens.dtype, sides, hooks.prologue_axes, (config.block_m, config.block_k),
             self.extents(config))
@@ -800,16 +803,23 @@ class MosaicTgmm(_Mosaic):
 
 def _padding_bytes(arrays: tuple, config: Tile) -> int:
     """The bytes a dense call's copies move (`triton_dense`): each of `arrays` (its shape, the launch axes
-    'rows', 'depth' or 'width' its dimensions follow, its itemsize), read and written padded to
-    `config`'s tile (rows by `block_m`, depth by `block_k`, width by `block_n`) where it is not a multiple
-    of it."""
+    'rows', 'depth' or 'width' its dimensions follow, None for one it broadcasts along, its itemsize),
+    read and written padded to `config`'s tile (rows by `block_m`, depth by `block_k`, width by
+    `block_n`) where it is not a multiple of it."""
     block = {'rows': config.block_m, 'depth': config.block_k, 'width': config.block_n}
     moved = 0
     for shape, axes, itemsize in arrays:
-        grown = tuple(-(extent // -block[axis]) * block[axis]
+        grown = tuple(-(extent // -block.get(axis, 1)) * block.get(axis, 1)
                       for extent, axis in zip(shape, axes, strict=True))
         moved += 2 * math.prod(grown) * itemsize if grown != tuple(shape) else 0
     return moved
+
+
+def _side_arrays(sides: tuple, axes_of: tuple) -> tuple:
+    """Side operands as `_padding_bytes` takes arrays: their dimensions along launch axes, 'columns'
+    named 'width'."""
+    return tuple((side.shape, tuple('width' if axis == 'columns' else axis for axis in axes),
+                  jnp.dtype(side.dtype).itemsize) for side, axes in zip(sides, axes_of, strict=True))
 
 
 def _uncut(sides: tuple, axes_of: tuple, halved: str) -> tuple[tuple, tuple]:
