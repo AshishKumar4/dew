@@ -68,6 +68,9 @@ class HF(Dataset):
 
         return isinstance(self.dataset, IterableDataset)
 
+    def label(self) -> str:
+        return self.name or self.dataset.info.dataset_name or "hf"
+
     def describe(self) -> str:
         from datasets import Dataset as Arrow
 

@@ -24,7 +24,7 @@ from dew.data.dataset import (
     rows_of,
     take_batch,
 )
-from dew.data.mixing import CorpusCounts, state_counts
+from dew.data.mixing import CorpusCounts, data_metrics, state_counts
 from dew.data.pipeline import HostStep, Map
 from dew.data.plan import Plan
 from dew.records import record
@@ -118,7 +118,7 @@ class _CanonicalPass:
 class _PublishedCounts:
     """Reader-owned snapshots retained without retaining its Grain iterator."""
 
-    metrics: Mapping[str, float] = dataclasses.field(default_factory=lambda: MappingProxyType({}))
+    counts: Mapping[str, CorpusCounts] = dataclasses.field(default_factory=lambda: MappingProxyType({}))
 
 
 class _PerShare(Forwarding):
@@ -178,11 +178,7 @@ class _PerShare(Forwarding):
 
     def _publish(self, state: Mapping[str, object]) -> None:
         self._state = state
-        self._statistics.metrics = MappingProxyType({
-            key: value
-            for counts in state_counts(state).values()
-            for key, value in counts.metrics().items()
-        })
+        self._statistics.counts = MappingProxyType(state_counts(state))
 
     def get_state(self) -> bytes:
         state = self._state
@@ -197,7 +193,7 @@ class _PerShare(Forwarding):
         saved = record(decoded.get("iterator"), "saved Grain iterator")
         self.close()
         self._saved = saved
-        self._statistics.metrics = MappingProxyType({})
+        self._statistics.counts = MappingProxyType({})
 
     def identity(self) -> str:
         """What every share of the pool reads, which the pool agrees before it
@@ -206,8 +202,8 @@ class _PerShare(Forwarding):
         return self._plan.identity()
 
     def statistics(self) -> Mapping[str, float]:
-        """The immutable counters last published by the reading thread."""
-        return self._statistics.metrics
+        """The metrics of the counters last published by the reading thread."""
+        return data_metrics(self._statistics.counts.values())
 
     def close(self) -> None:
         if self._read is not None:
@@ -225,11 +221,13 @@ class _Statistics:
         self._published.append(stream._statistics)
 
     def __call__(self) -> Mapping[str, float]:
-        scalars = {key: value for counts in self._counts.values() for key, value in counts.metrics().items()}
-        for published in self._published:
-            for name, value in published.metrics.items():
-                scalars[name] = max(scalars.get(name, 0.0), value)
-        return scalars
+        """The metrics of every corpus: the counts of the prefix a memory read ran, followed by
+        those the latest reader published of the rest (`CorpusCounts.followed`), which a reader
+        restored from another's position carries on from."""
+        read = {name: counts for published in self._published for name, counts in published.counts.items()}
+        merged = {name: counts.followed(read.pop(name)) if name in read else counts
+                  for name, counts in self._counts.items()}
+        return data_metrics([*merged.values(), *read.values()])
 
 
 @dataclasses.dataclass(frozen=True)

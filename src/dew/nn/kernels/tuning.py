@@ -30,8 +30,8 @@ without a pick compiles on a thread pool and runs alone, its kernel's device
 time read by CUPTI after `FLUSH_BYTES` are read, and the fastest is kept.
 Any other compile measures nothing and says once how many launches lack a
 measurement. Picks persist per GPU model and jaxlib beside XLA's own
-(`dew.cache.kernel_picks_path`). `samples` is the wall-clock timing every
-benchmark tool in Dew measures with.
+(`dew.cache.kernel_picks_path`). Wall-clock timing is
+`dew.telemetry.benchmark.samples`, which every benchmark tool in Dew measures with.
 
 Tile choice changes a kernel's reduction order, and its error is not
 monotone in tiles, warps or programs, so the space is a declaration of
@@ -103,28 +103,6 @@ None for its heuristic (`_settle`): what every process launches there, whatever 
 _LOADED: set[str] = set()
 _LOADING = threading.Lock()
 _told: set[str] = set()
-
-
-def samples[T](fn: Callable[..., T], *args, warmup: int = 3, repeats: int = 10,
-               calls: int = 1) -> list[float]:
-    """Seconds per call of `fn(*args)`, one sample a synchronized group of
-    `calls` calls, after `warmup` groups. With one call a group each sample is
-    a call's latency, and its result is released before the next call starts,
-    so no two calls' outputs are ever held at once; more calls a group queue
-    their dispatches and synchronize once, which measures throughput. The
-    caller takes the statistic and units it reports."""
-    for _ in range(warmup):
-        jax.block_until_ready(fn(*args))
-    measured = []
-    for _ in range(repeats):
-        start = time.perf_counter()
-        outputs = fn(*args)
-        for _ in range(calls - 1):
-            outputs = fn(*args)
-        jax.block_until_ready(outputs)
-        measured.append((time.perf_counter() - start) / calls)
-        del outputs
-    return measured
 
 
 @dataclasses.dataclass(frozen=True)

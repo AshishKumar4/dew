@@ -211,7 +211,7 @@ def test_a_center_crop_cuts_a_large_image_s_central_square_and_grows_a_small_one
     smaller one bicubically until its shorter side is that size before cutting."""
     large = np.arange(6 * 9 * 3, dtype=np.uint8).reshape(6, 9, 3)
     small = np.arange(2 * 3 * 3, dtype=np.uint8).reshape(2, 3, 3) * 10
-    cropped = list(Memory([{"image": large}, {"image": small}]).map(images.CenterCrop(4)).iterate())
+    cropped = list(Memory([{"image": large}, {"image": small}]).map(images.CenterCrop(4)))
     np.testing.assert_array_equal(cropped[0]["image"], large[1:5, 2:6])
     grown = images.Resize((4, 6), "bicubic").map({"image": small})["image"]
     np.testing.assert_array_equal(cropped[1]["image"], grown[:, 1:5])
@@ -226,7 +226,7 @@ def test_an_image_processor_writes_its_pixel_values_beside_the_image_it_reads():
 
     processor = CLIPImageProcessorPil.from_pretrained(str(Path(__file__).parent / "fixtures/clip/tiny"))
     image = np.random.default_rng(0).integers(0, 256, (12, 10, 3), np.uint8)
-    (row,) = Memory([{"photo": image}]).map(images.Processor(processor, field="photo", to="pixels")).iterate()
+    (row,) = Memory([{"photo": image}]).map(images.Processor(processor, field="photo", to="pixels"))
     np.testing.assert_array_equal(row["photo"], image)
     expected = processor(images=image, return_tensors="np")["pixel_values"][0]
     np.testing.assert_array_equal(row["pixels"], expected)

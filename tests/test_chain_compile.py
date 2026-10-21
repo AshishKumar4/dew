@@ -63,7 +63,7 @@ def test_finite_token_budget_keeps_its_geometry_and_every_real_row(entry, read):
             for index, length in enumerate((3, 7, 14, 7, 3))]
     chain = Memory(rows).map(Tokens()).batch(tokens=64).read(read)
     reader = (validation(chain, batch=1, read=read, loading=READ)(DataPartition())
-              if entry == "validation" else chain.iterate())
+              if entry == "validation" else iter(chain))
     try:
         batches = list(reader)
         ids = []
