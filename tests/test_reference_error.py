@@ -232,7 +232,7 @@ def test_a_recording_declares_the_count_its_recorded_reference_resolves(tmp_path
 
     recorded = recorder.record_case("site", draw, evaluate, squared)
     seeds = int(recorded["site.seeds"])
-    assert seeds >= 8 and len(recorded["site.input.x"]) >= 5 * seeds
+    assert seeds >= 8 and len(recorded["site.input.x"]) == 5 * seeds
     path = tmp_path / "recorded.npz"
     np.savez(path, **recorded)
     assert declared_seeds(path) == {"site": seeds}
@@ -262,3 +262,26 @@ def test_check_one_holds_an_empty_leaf_exact_by_construction():
     with pytest.raises(AssertionError):
         assert_as_exact(tree(_reordered), tree(_product), _draw, "a truth that is not empty", seeds=8,
                         truth_fn=fuller)
+
+
+def test_a_recording_keeps_the_confirmed_count_where_the_proxy_planned_more():
+    """A proxy whose one element needs more seeds than the recorded reference's 64 do: the recording
+    keeps (1 + REDRAW) times the count the recorded reference confirms, not what the proxy planned."""
+    from tool_support import load
+
+    recorder = load("recorded_references")
+
+    def draw(seed):
+        return {"x": np.random.default_rng(200 + seed).normal(size=(64,)).astype(np.float32)}
+
+    def evaluate(inputs):
+        x = inputs["x"]
+        return {"y": x * x - np.float32(1)}, {"y": x.astype(np.float64) ** 2 - 1}
+
+    def one_element(inputs):
+        return {"y": jnp.sum(inputs["x"] * inputs["x"])[None]}
+
+    planned = seeds_for(jax.jit(lambda inputs: one_element(inputs)), lambda seed: (draw(seed),), "proxy")
+    recorded = recorder.record_case("site", draw, evaluate, one_element)
+    seeds = int(recorded["site.seeds"])
+    assert planned > seeds and len(recorded["site.input.x"]) == 5 * seeds
