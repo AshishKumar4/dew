@@ -64,6 +64,17 @@ fails is an OSError too."""
 logger = logging.getLogger(__name__)
 
 
+class Unredirected(urllib.request.HTTPRedirectHandler):
+    """No redirect followed: urllib's would resend the bearer token to wherever the answer points. A
+    redirect is an HTTPError, a failed request."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+OPENER = urllib.request.build_opener(Unredirected)
+
+
 class RemoteCache:
     """JAX's cache `directory`, each test file's programs also read from and written to `url`."""
 
@@ -123,7 +134,7 @@ class RemoteCache:
             return None
         request = urllib.request.Request(f"{self.url}/{self.prefix}/bundles/{urllib.parse.quote(file)}",
                                          data=data, method=method, headers=self.headers)
-        return urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS)
+        return OPENER.open(request, timeout=TIMEOUT_SECONDS)
 
     def _programs(self) -> set[str]:
         return {path.name.removesuffix(SUFFIX) for path in self.directory.glob(f"*{SUFFIX}")}
@@ -162,9 +173,12 @@ class RemoteCache:
         with self.state:
             try:
                 for key, value in entries:
-                    new += self._seeded(key, value)
                     keys.append(key)
-                    self.seen.add(key)
+                    # One the directory had already (another file's tests compiled it meanwhile) stays
+                    # among the programs the current file's run gained.
+                    if self._seeded(key, value):
+                        new += 1
+                        self.seen.add(key)
             except UNREACHABLE as error:
                 self.unrestored.add(file)
                 self._failed(error)
@@ -205,7 +219,8 @@ class RemoteCache:
 
     def closed(self, file: str) -> None:
         """Bundle `file` written back, where its tests compiled a program it lacked: the programs
-        compiled under it, then those fetched for it, up to `MAX_BYTES`."""
+        compiled under it, then those fetched for it, each that fits within `MAX_BYTES`; nothing sent
+        where none of those it lacked fits."""
         if not self.available or file in self.unrestored:
             return
         try:
@@ -221,17 +236,20 @@ class RemoteCache:
                 path = self.directory / f"{key}{SUFFIX}"
                 if not path.exists():
                     continue
+                cost = HEADER.size + len(key.encode()) + path.stat().st_size
+                if size + cost > MAX_BYTES:  # a program past what is left goes without; the rest may fit
+                    continue
                 value = path.read_bytes()
                 size += HEADER.size + len(key.encode()) + len(value)
-                if size > MAX_BYTES:
-                    break
                 entries.append((key, value))
         except UNREACHABLE as error:
             self._failed(error)
             return
         with self.state:
-            self.held[file] = {key for key, _ in entries}
             self.queued[file] = set(written)
+            if not {key for key, _ in entries} - self.held.get(file, set()):
+                return  # nothing new fits: the Worker's bundle stays as it is
+            self.held[file] = {key for key, _ in entries}
         self.uploads.put((file, packed(entries)))
 
     def _uploading(self) -> None:
