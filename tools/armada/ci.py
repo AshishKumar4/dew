@@ -21,9 +21,9 @@ tests' times in tests/test_durations.json, at the cut its rows were last timed
 at and shared among that cut's groups (`measured_cut`), so the file takes the
 fewest groups whose heaviest, setup included, holds to `target` (`split`). A file weighs armada's
 median of its last green runs, or its tests' sum in tests/test_durations.json where that is more
-(those runs may predate the file's current tests), else that sum scaled to armada, else the mean. Each entry names its rows, one a
-file (or a file's group), so armada grades a task that leaves one out as not
-green, and armada queues the heaviest entries first.
+(those runs may predate the file's current tests), else that sum scaled to armada, else the mean.
+Each entry names its rows, one a file (or a file's group), so armada grades a task that leaves
+one out as not green, and armada queues the heaviest entries first.
 
 A task runs its files under its Python's environment (tools/armada/install.sh)
 with CI's selection, and writes a verdict row for each. A row is red on a
