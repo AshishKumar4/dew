@@ -602,7 +602,7 @@ def _state_product(d_raw, table, precision, work, block: int | None) -> jax.Arra
     """The state gradient `d_raw @ table` over the vocabulary: one product, or with `block` the
     vocabulary cut into blocks of that many columns (`FP32_STATE_BLOCK`), every block's product taken
     at once (`[blocks, tokens, features]`) and the blocks summed as a double-float pair
-    (`compensated_add`)."""
+    (`compensated_sum`)."""
     if block is None or table.shape[0] <= block:
         return jnp.einsum('tv,vd->td', d_raw, table, precision=precision, preferred_element_type=work)
     count = -(-table.shape[0] // block)
@@ -610,13 +610,8 @@ def _state_product(d_raw, table, precision, work, block: int | None) -> jax.Arra
     blocks = jnp.pad(d_raw, ((0, 0), (0, pad))).reshape(d_raw.shape[0], count, block)
     rows = jnp.pad(table, ((0, pad), (0, 0))).reshape(count, block, table.shape[1])
     parts = jnp.einsum('tnb,nbd->ntd', blocks, rows, precision=precision, preferred_element_type=work)
-    zero = jnp.zeros(parts.shape[1:], work)
-
-    def add(pair, part):
-        return compensated_add(pair, (part, zero)), None
-
-    (high, low), _ = jax.lax.scan(add, (zero, zero), parts)
-    return high + low
+    # One reduction whose accumulator is a double-float pair, an overflowed block's infinity kept.
+    return compensated_sum(parts, (0,))
 
 
 _whole_head = jax.custom_vjp(_whole_head_impl, nondiff_argnums=(5, 6, 7, 8, 10, 11))
