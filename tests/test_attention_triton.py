@@ -549,3 +549,46 @@ def test_every_backward_config_on_a_gpu(config, case):
     check_backward({**CASES, **IRREGULAR}[case], SCORE_HOOKS["softcap-sinks-alibi"], jnp.bfloat16,
                    tiles(config.block_q, config.block_k, config.dq_warps, config.dq_stages),
                    tiles(config.block_q, config.block_k, config.dkv_warps, config.dkv_stages))
+
+
+SHARED_BYTES = (
+    # (launch, width, config, the bytes Triton asked for where it refused, or None where it compiled, GPU)
+    ("forward", 128, attention_triton.Tiles(128, 128, 8, 3), None, "sm80"),
+    ("forward", 128, attention_triton.Tiles(128, 128, 8, 3), 163840, "sm86"),
+    ("forward", 128, attention_triton.Tiles(32, 128, 4, 3), 147456, "sm86"),
+    ("forward", 128, attention_triton.Tiles(64, 128, 4, 3), 163840, "sm86"),
+    ("forward", 128, attention_triton.Tiles(128, 64, 4, 3), None, "sm86"),
+    ("forward", 256, attention_triton.Tiles(64, 32, 4, 3), 102400, "sm86"),
+    ("forward", 256, attention_triton.Tiles(128, 128, 4, 2), 229376, "sm86"),
+    ("backward", 256, attention_triton.Tiles(32, 32, 4, 2), None, "sm86"),
+    ("backward", 128, attention_triton.Tiles(128, 128, 4, 2), 167424, "sm80"),
+    ("backward", 64, attention_triton.Tiles(128, 128, 4, 2), 101888, "sm86"),
+)
+"""Configs Triton compiled or refused on an A100 (sm80) and an A10 (sm86), bf16, from
+bench_attention_smem.py's runs SMEM-a100 and SMEM-a10 (2026-10-21)."""
+
+
+@pytest.mark.parametrize("launch, width, tiles, requested, generation_name", SHARED_BYTES)
+def test_the_shared_memory_bound_keeps_what_triton_compiles_and_prunes_what_it_refuses(
+        launch, width, tiles, requested, generation_name):
+    """Each launch's shared-memory bound against what Triton did on a GPU: within the block's budget
+    where it compiled (an A100's 128 by 128 forward tile in three stages, jax's mha's fastest there),
+    and at or above the bytes it asked for, past the budget, where it refused."""
+    import tokamax
+
+    from dew.nn.kernels import generation
+
+    arrays = {"query": jax.ShapeDtypeStruct((1, 1024, 4, width), jnp.bfloat16),
+              "value": jax.ShapeDtypeStruct((1, 1024, 2, width), jnp.bfloat16)}
+    if launch == "forward":
+        op, config = attention_triton.TritonForward(), tiles
+    else:
+        op = attention_triton.TritonBackward()
+        config = attention_triton.BackwardTiles(tiles.block_q, tiles.block_k, tiles.warps, tiles.stages,
+                                                tiles.warps, tiles.stages)
+    staged = op.staged_bytes(tokamax.BoundArguments(op, arrays), config)
+    budget = generation.shared_budget(generation.TARGETS[generation_name])
+    if requested is None:
+        assert staged <= budget
+    else:
+        assert staged >= requested > budget

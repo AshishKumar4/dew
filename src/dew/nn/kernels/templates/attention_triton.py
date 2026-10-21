@@ -299,12 +299,18 @@ class TritonForward(Template[Tiles]):
         return _dividing(SPACE, ba)
 
     def staged_bytes(self, ba: tokamax.BoundArguments, config: Tiles) -> int:
-        """The shared memory a program holds: the query tile, and each pipeline stage's key and value
-        tiles, in the operands' dtype."""
+        """The shared memory Triton gives a program, in the operands' dtype: the key and value tiles of
+        every stage but the one in use, the query tile, and the weights' tile on its way to the second
+        product, which shares the query tile's memory where the block is 128 queries of heads at most
+        128 wide. Fitted to the bytes Triton asks for (SMEM-a100 and SMEM-a10, 2026-10-21: equal on all 48
+        configs it refused on either GPU, and every config it compiled within the budget)."""
         query, value = ba.arguments["query"], ba.arguments["value"]
         size = jnp.dtype(query.dtype).itemsize
         width, value_width = query.shape[-1], value.shape[-1]
-        return (config.block_q * width + config.stages * config.block_k * (width + value_width)) * size
+        streamed = (config.stages - 1) * config.block_k * (width + value_width) * size
+        query_tile, weights = config.block_q * width * size, config.block_q * config.block_k * size
+        shared = config.block_q >= 128 and width <= 128
+        return streamed + (max(query_tile, weights) if shared else query_tile + weights)
 
     def cost(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget) -> float:
         """Every key tile of the call (a bound: the spans are traced, so a sparse call visits fewer),
@@ -645,15 +651,19 @@ class TritonBackward(Template[BackwardTiles]):
         return _dividing(BACKWARD_SPACE, ba)
 
     def staged_bytes(self, ba: tokamax.BoundArguments, config: BackwardTiles) -> int:
-        """The shared memory a program of either launch holds, the larger, in the operands' dtype: a dQ
-        program its query and output-gradient tiles once and each stage's key and value tiles; a dK/dV
-        program its key and value tiles once and each stage's query and output-gradient tiles."""
+        """The shared memory Triton gives a program of either launch, the larger, in the operands' dtype: a
+        dQ program its query and output-gradient tiles and the key and value tiles of every stage but the
+        one in use; a dK/dV program its key and value tiles and the query and output-gradient tiles of
+        every stage but the one in use; and two `block_q` by `block_k` tiles on their way between
+        products. A bound fitted to the bytes Triton asks for (SMEM-a100 and SMEM-a10, 2026-10-21: at or
+        above them on every config it refused, within the budget on all but two of the A10's compiled
+        ones)."""
         query, value = ba.arguments["query"], ba.arguments["value"]
         size = jnp.dtype(query.dtype).itemsize
         width, value_width = query.shape[-1], value.shape[-1]
-        rows = max(config.block_q + config.dq_stages * config.block_k,
-                   config.block_k + config.dkv_stages * config.block_q)
-        return rows * (width + value_width) * size
+        rows = max(config.block_q + (config.dq_stages - 1) * config.block_k,
+                   config.block_k + (config.dkv_stages - 1) * config.block_q)
+        return (rows * (width + value_width) + 2 * config.block_q * config.block_k) * size
 
     def cost(self, ba: tokamax.BoundArguments, config: BackwardTiles, target: generation.GpuTarget) -> float:
         """Both launches' (`_launch_cost`): every tile of the call (a bound: the spans are traced, so a
