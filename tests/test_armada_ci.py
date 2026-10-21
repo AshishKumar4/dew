@@ -497,18 +497,14 @@ def test_the_plan_runs_as_one_wave_on_the_pool(ci, tmp_path, monkeypatch, capsys
     capsys.readouterr()
     assert ci.one_wave({}, 8) == 1500.0 and len(ci.plan(1500.0, {})) == 12
     assert "one wave cannot hold the plan" in capsys.readouterr().err
-    for name in records:
-        (tmp_path / name.split("::")[0]).unlink(missing_ok=True)
-    # Files nothing has timed alone, exactly filling the pool: one wave at whatever target.
-    assert len(ci.plan(ci.one_wave({}, 10), {})) == 10
-    for n in range(5):
-        (tmp_path / f"tests/test_new{n}.py").unlink()
-    for node in records:
-        (tmp_path / node.split("::")[0]).write_text("")
     (tmp_path / ".armada.json").write_text(json.dumps({"pool": 20}))
     command = [sys.executable, str(ROOT / "tools/armada/ci.py"), "plan", "--timings=none.json"]
     planned = subprocess.run(command, cwd=tmp_path, check=True, capture_output=True, text=True)
     assert json.loads(planned.stdout)["include"] == ci.plan(300.0, {})
+    for node in records:
+        (tmp_path / node.split("::")[0]).unlink()
+    # Files nothing has timed alone, exactly filling the pool: one wave at whatever target.
+    assert len(ci.plan(ci.one_wave({}, 10), {})) == 10
 
 
 def test_one_wave_holds_a_file_its_measured_cut_keeps_split(ci, tmp_path, monkeypatch):
