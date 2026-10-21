@@ -163,8 +163,9 @@ def test_a_stochastic_encoder_samples_at_its_given_noise_and_a_deterministic_one
         with pytest.raises(TypeError):
             autoencoder.encode(params, image, noise=noise)
         recorder = Recorder()
-        objective = DiffusionObjective(SimpleDiT(patch_size=1, emb_features=16, num_layers=1, num_heads=2,
-                                                 mlp_ratio=1), presets.EDM(regime="latent")(),
+        objective = DiffusionObjective(SimpleDiT(output_channels=autoencoder.latent_channels, patch_size=1,
+                                                 emb_features=16, num_layers=1, num_heads=2, mlp_ratio=1),
+                                       presets.EDM(regime="latent")(),
                                        InputSpec(Field("image", shape)), autoencoder=autoencoder)
         pixels = np.asarray(jax.random.randint(jax.random.key(2), image.shape, 0, 256), np.uint8)
         step = Step(jnp.asarray(0), jax.random.key(3), None, example_key=jax.random.key(4),
