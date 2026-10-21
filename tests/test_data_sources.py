@@ -1963,8 +1963,9 @@ def test_a_concatenation_states_what_its_stores_state_of_their_records():
                    facts=(*contract, ("valid_targets", 30), ("split", "train")))
     second = Stated([{"id": np.int32(index)} for index in range(2)],
                     facts=(*contract, ("valid_targets", 20), ("split", "validation"), ("shuffled", True)))
+    # Both are held in memory, whose rows carry no count of Dew's (`count_rules`).
     assert Concatenate((first, second)).metadata() == {
-        **dict(contract), "rows": 5, "valid_targets": 50}
+        **dict(contract), "rows": 5, "valid_targets": 50, "count_rules": []}
     other = Stated([{"id": np.int32(0)}], facts=(("tokenizer", "llama"),))
     with pytest.raises(ValueError):
         Concatenate((first, other)).metadata()
