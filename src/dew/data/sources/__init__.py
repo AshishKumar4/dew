@@ -43,6 +43,9 @@ def source(
         resolved = Memory(value)
     else:
         raise TypeError(f"a source is a filesystem URL, named store, or records; got {type(value).__name__}")
+    if split is not None and not (isinstance(value, (str, PathLike)) and isinstance(resolved, (TFDS, Hub))):
+        raise ValueError(f"split={split!r} names a split of a Hub or TFDS URL; {resolved.describe()} reads "
+                         "what it holds, so hold out of it with holdout(...) instead")
     if provision and isinstance(resolved, (Files, Hub, TFDS, TokenFiles)):
         resolved.provision()
     return resolved

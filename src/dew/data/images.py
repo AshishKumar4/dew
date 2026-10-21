@@ -573,7 +573,6 @@ class AugmentationKey(grain.RandomMapTransform):
 @dataclasses.dataclass(frozen=True)
 class EncodeCaptions:
     reader: Callable[[Sequence[str]], Batch] | None = dataclasses.field(default=None, repr=False)
-    binding = "captions"
 
     @property
     def identity(self) -> str:

@@ -1587,7 +1587,9 @@ def _epoch_records(train: Pipeline, build: _Build) -> int | None:
     """The records in one epoch of a global order: each corpus's indexed order
     up to its first repeat, as the lowering builds it, so a slice, a limit and
     a token split count exactly; a mixture, nested or not, reads until its
-    first part would come round."""
+    first part would come round. A repeat written before a cache counts the
+    inputs a pass reads where the cache keeps one record for each, and none
+    otherwise, ahead of reading them; phases are counted by none."""
     if not build.global_order:
         return None
 
