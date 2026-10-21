@@ -293,6 +293,124 @@ def tolerance_sites(relative: str):
             yield {"form": "no float64 truth", "class": _kind(node, owner, scope, parents), "line": node.lineno}
 
 
+def _exact_form(node: ast.AST, source: str) -> str | None:
+    """A tolerance's exact form, or None where none is regular: `assert_allclose(a, b, ...)` as
+    `assert_array_equal(a, b)`, `allclose`/`isclose` as `array_equal`, `a == approx(b, ...)` as
+    `a == b`, `abs(a - b) < tol` and its `max` as an equality."""
+    segment = ast.get_source_segment
+    if isinstance(node, ast.Call) and len(node.args) >= 2:
+        name = _call_name(node)
+        left, right = (segment(source, arg) for arg in node.args[:2])
+        if name == "assert_allclose":
+            return f"np.testing.assert_array_equal({left}, {right})"
+        if name in {"allclose", "isclose"}:
+            return f"np.array_equal(np.asarray({left}), np.asarray({right}))"
+        if name == "isclose" and isinstance(node.func, ast.Attribute) and _call_name(node.func.value) == "math":
+            return f"{left} == {right}"
+        return None
+    if isinstance(node, ast.Compare) and len(node.ops) == 1:
+        right = node.comparators[0]
+        if isinstance(node.ops[0], ast.Eq) and isinstance(right, ast.Call) and _call_name(right) == "approx" \
+                and right.args:
+            return f"{segment(source, node.left)} == {segment(source, right.args[0])}"
+        if isinstance(node.ops[0], ast.Lt | ast.LtE):
+            error = node.left
+            outer = _call_name(error) if isinstance(error, ast.Call) else ""
+            inner = error.args[0] if outer in {"max", "amax"} and isinstance(error, ast.Call) and error.args else error
+            if isinstance(inner, ast.Call) and _call_name(inner) == "abs" and inner.args and isinstance(
+                    inner.args[0], ast.BinOp) and isinstance(inner.args[0].op, ast.Sub):
+                a, b = (segment(source, side) for side in (inner.args[0].left, inner.args[0].right))
+                return f"np.array_equal(np.asarray({a}), np.asarray({b}))"
+    return None
+
+
+def _tolerance_named(node: ast.AST) -> bool:
+    """Whether a tolerance's allowance is a name (a parametrized or computed bound): the test then
+    means its tolerance, and no exact form is offered."""
+    if isinstance(node, ast.Call):
+        allowances = [*node.args[2:], *(keyword.value for keyword in node.keywords)]
+    elif isinstance(node, ast.Compare):
+        right = node.comparators[0]
+        allowances = ([*right.args[1:], *(keyword.value for keyword in right.keywords)]
+                      if isinstance(right, ast.Call) and _call_name(right) == "approx" else [right])
+    else:
+        return True
+    return any(isinstance(part, ast.Name) and part.id not in CONSTANT_NAMES
+               for allowance in allowances for part in ast.walk(allowance))
+
+
+def exact_pass(relative: str, classes: set[str]) -> list[dict]:
+    """Rewrite in place each tolerance of `relative` in `classes` that has a regular exact form, and
+    return the rewrites, each with its test function and original text, so one that fails reverts."""
+    import lint_slop
+
+    path = REPO / relative
+    source = path.read_text(encoding="utf-8")
+    [module] = list(lint_slop.collect([relative], REPO, "dew"))
+    functions = [node for node in ast.walk(module.tree) if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)]
+    parents = {id(child): parent for parent in ast.walk(module.tree) for child in ast.iter_child_nodes(parent)}
+    edits = []
+    for node, what in lint_slop._tolerance_comparisons(module):
+        if "one-draw rule" in what:
+            continue
+        owner = min((function for function in functions if node in ast.walk(function)),
+                    key=lambda function: len(list(ast.walk(function))), default=None)
+        if owner is None:
+            continue
+        scope = _Scope(module.tree, owner)
+        operands = (node.args[:2] if isinstance(node, ast.Call) else
+                    [node.left, *node.comparators] if isinstance(node, ast.Compare) else [node])
+        if any(_float64(operand, scope) for operand in operands):
+            continue
+        kind = _kind(node, owner, scope, parents)
+        replacement = _exact_form(node, source)
+        line = source.splitlines()[node.lineno - 1]
+        width = len(line) - (len(ast.get_source_segment(source, node).splitlines()[0]) if node.lineno ==
+                             node.end_lineno else 0) + len(replacement or "")
+        if kind[:3] in classes and replacement and not _tolerance_named(node) and (
+                node.lineno != node.end_lineno or width <= 110):
+            test = next((function.name for function in functions
+                         if function.name.startswith("test") and node in ast.walk(function)), owner.name)
+            edits.append({"file": relative, "line": node.lineno, "col": node.col_offset,
+                          "end_line": node.end_lineno, "end_col": node.end_col_offset, "test": test,
+                          "class": kind, "original": ast.get_source_segment(source, node),
+                          "replacement": replacement})
+    lines = source.splitlines(keepends=True)
+    offsets = [0]
+    for line in lines:
+        offsets.append(offsets[-1] + len(line))
+    text = source
+    for edit in sorted(edits, key=lambda edit: (edit["line"], edit["col"]), reverse=True):
+        start = offsets[edit["line"] - 1] + len(lines[edit["line"] - 1].encode()[:edit["col"]].decode())
+        end = offsets[edit["end_line"] - 1] + len(lines[edit["end_line"] - 1].encode()[:edit["end_col"]].decode())
+        text = text[:start] + edit["replacement"] + text[end:]
+    if edits:
+        path.write_text(text, encoding="utf-8")
+    return edits
+
+
+def revert(manifest: list[dict], refused: set[tuple[str, str]]) -> list[dict]:
+    """Undo each rewrite whose (file, test) or (file, line) is in `refused`, from the bottom of each
+    file up, so earlier rewrites' positions hold; return the rewrites kept."""
+    kept, undone = [], collections.defaultdict(list)
+    for edit in manifest:
+        if (edit["file"], edit["test"]) in refused or (edit["file"], str(edit["line"])) in refused:
+            undone[edit["file"]].append(edit)
+        else:
+            kept.append(edit)
+    for relative, edits in undone.items():
+        path = REPO / relative
+        text = path.read_text(encoding="utf-8")
+        lines = text.splitlines(keepends=True)
+        for edit in sorted(edits, key=lambda edit: (edit["line"], edit["col"]), reverse=True):
+            start = sum(len(line) for line in lines[:edit["line"] - 1]) + edit["col"]
+            assert text[start:start + len(edit["replacement"])] == edit["replacement"], edit
+            text = text[:start] + edit["original"] + text[start + len(edit["replacement"]):]
+            lines = text.splitlines(keepends=True)
+        path.write_text(text, encoding="utf-8")
+    return kept
+
+
 def survey(paths: list[str]) -> dict:
     listed = paths or subprocess.run(["git", "ls-files", "tests/*.py", "tools/*.py"], cwd=REPO,
                                      capture_output=True, text=True, check=True).stdout.split()
@@ -309,9 +427,26 @@ def survey(paths: list[str]) -> dict:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("command", choices=("survey",))
+    parser.add_argument("command", choices=("survey", "exact", "revert"))
     parser.add_argument("paths", nargs="*")
+    parser.add_argument("--manifest", type=Path, help="exact: where to write the rewrites made; revert: "
+                        "the rewrites to undo from, rewritten to those kept")
+    parser.add_argument("--refused", type=Path, help="revert: a file of `file::test` or `file:line` lines")
     options = parser.parse_args()
+    if options.command == "exact":
+        edits = [edit for relative in options.paths for edit in exact_pass(relative, {"(b)", "(c)"})]
+        options.manifest.write_text(json.dumps(edits, indent=1))
+        print(f"{len(edits)} rewrites in {len({edit['file'] for edit in edits})} files")
+        return 0
+    if options.command == "revert":
+        refused = set()
+        for line in options.refused.read_text().split():
+            relative, _, rest = line.partition("::") if "::" in line else line.partition(":")
+            refused.add((relative, rest.split("[")[0]))
+        kept = revert(json.loads(options.manifest.read_text()), refused)
+        options.manifest.write_text(json.dumps(kept, indent=1))
+        print(f"{len(kept)} rewrites kept")
+        return 0
     result = survey(options.paths)
     totals = collections.defaultdict(collections.Counter)
     for key, counter in result.items():
