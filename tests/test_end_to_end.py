@@ -174,7 +174,7 @@ def test_a_step_moves_the_running_statistics_and_the_task_decodes_with_them():
     for publication, statistics in ((published, after), (later, moved)):
         shift = np.asarray(statistics["mean"])
         scale = 1 / np.sqrt(np.asarray(statistics["var"]))
-        np.testing.assert_allclose(np.asarray(publication.autoencoder.normalization(
+        np.testing.assert_allclose(np.asarray(publication.autoencoder.running_normalization(
             publication.variables["autoencoder"])[1]), scale, rtol=1e-6)
         weights = tuned[TUNED_WEIGHTS]
         expected = task.autoencoder.decode_batch(weights, z / jnp.asarray(scale) + jnp.asarray(shift))
@@ -524,7 +524,7 @@ def test_a_repae_step_moves_the_running_statistics_as_train_repae_does(repae_ste
                                1 / np.sqrt(STEPPED["bn/running_var_f64"]), rtol=4 * np.finfo(np.float64).eps)
     decoder, decoding = task.published_autoencoder({**variables, "params": params, LATENT_STATS: statistics})
     assert isinstance(decoder, TunedAutoEncoder)
-    shift, scale = decoder.normalization(decoding["autoencoder"])
+    shift, scale = decoder.running_normalization(decoding["autoencoder"])
     np.testing.assert_array_equal(np.asarray(shift), np.asarray(statistics["mean"]))
     np.testing.assert_allclose(np.asarray(scale, np.float64),
                                1 / np.sqrt(np.asarray(statistics["var"], np.float64)), rtol=gamma(2), atol=0)
@@ -673,4 +673,15 @@ def test_the_running_statistics_start_by_normalizing_as_the_autoencoder_does():
 
     assert_as_exact(jax.jit(started), jax.jit(autoencoder.normalization.normalized), draw,
                     "end-to-end start", seeds=8)
+
+
+def test_a_tuned_autoencoder_has_no_fixed_normalization_to_read_or_replace():
+    """Its normalization is each call's running statistics: a fixed shift, scale or replacement is
+    refused, not the base's identity."""
+    autoencoder = objective(EndToEnd()).autoencoder
+    tuned = TunedAutoEncoder(autoencoder, {TUNED_WEIGHTS: autoencoder.params})
+    for read in (lambda: tuned.latent_shift, lambda: tuned.latent_scale,
+                 lambda: tuned.with_normalization(autoencoder.normalization)):
+        with pytest.raises(TypeError):
+            read()
 
