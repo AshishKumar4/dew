@@ -203,6 +203,20 @@ def test_two_files_evaluating_alike_fail(tmp_path):
     assert owners(copies(copied)) == [("function", ["dpo.py Dpo.evaluate", "grpo.py Grpo.evaluate"])]
 
 
+def test_two_files_closing_alike_on_exit_fail(tmp_path):
+    """Two context managers whose exits close the same way, the error noted on the one in flight: a small
+    function (21 nodes, training/distributed.py's and tracker.py's), written twice."""
+    exit_ = ("class {0}:\n    def close(self):\n        self.closed = True\n\n"
+             "    def __exit__(self, kind, {1}, traceback):\n        try:\n            self.close()\n"
+             "        except BaseException as {2}:\n            if {1} is None:\n                raise\n"
+             "            {1}.add_note(f'{0} cleanup failed: {{{2}!r}}')\n")
+    copied = tree(tmp_path, "copied", {"prefetch.py": exit_.format("Prefetch", "exc", "error"),
+                                       "tracker.py": exit_.format("Tracker", "pending", "failure")})
+    assert gate(copied).returncode == 1
+    assert owners(copies(copied)) == [
+        ("function", ["prefetch.py Prefetch.__exit__", "tracker.py Tracker.__exit__"])]
+
+
 def test_a_copied_run_of_one_call_fails(tmp_path):
     """Six calls to one function declare data: copied with their data, they are a copy, though no line reads
     alike as text."""
@@ -221,8 +235,9 @@ def test_a_copied_run_of_one_call_fails(tmp_path):
 
 def test_declarations_alike_are_no_copy(tmp_path):
     """Two records' annotated fields and two parsers' arguments, alike in shape, declare different things;
-    so do two modules' imports, two protocols' stubs and two runs of values one function reads. Two
-    functions threading a value through other numbers of one step are other logic."""
+    so do two modules' imports, two protocols' stubs, two runs of values one function reads and two
+    constructors that store their own fields. Two functions threading a value through other numbers of one
+    step are other logic."""
     record = "from dataclasses import dataclass\n\n\n@dataclass\nclass {0}:\n" + "".join(
         f"    {{1}}{index}: tuple[int, ...] | None = None\n" for index in range(8))
     parser = ("import argparse\n\n\ndef {0}():\n    parser = argparse.ArgumentParser()\n" + "".join(
@@ -233,6 +248,8 @@ def test_declarations_alike_are_no_copy(tmp_path):
     stubs = "class {0}:\n" + "".join(f"    @property\n    def {{1}}{index}(self) -> int: ...\n"
                                      for index in range(6))
     reads = "".join(f"{{0}}{index} = {{1}}('{{0}}{index}')\n" for index in range(6))
+    fields = ("class {0}:\n    def __init__(self, {1}, {2}):\n        self.{1}, self.{2} = {1}, {2}\n"
+              "        self.{3}, self.{4}, self.{5} = [], [], []\n")
     threading = ("def {0}(x):\n    y = normalize(x)\n    scale = y * 2\n"
                  + "    x = layer(x, depth=3)\n" * 8 + "    return x + scale\n")
     alike = tree(tmp_path, "alike", {
@@ -243,6 +260,8 @@ def test_declarations_alike_are_no_copy(tmp_path):
         "right_stubs.py": stubs.format("RightNames", "field"),
         "left_reads.py": "values = {}\n" + reads.format("width", "values.get"),
         "right_reads.py": "import re\n" + reads.format("PATTERN", "re.compile"),
+        "harness.py": fields.format("Harness", "failure", "paid", "opened", "closed", "calls"),
+        "artifact.py": fields.format("Artifact", "name", "kind", "dirs", "files", "references"),
         "deep.py": threading.format("deep"),
         "shallow.py": threading.format("shallow").replace("    x = layer(x, depth=3)\n" * 6, "")})
     assert copies(alike) == []
