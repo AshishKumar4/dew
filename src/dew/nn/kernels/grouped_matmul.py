@@ -72,7 +72,7 @@ class Tile:
 
 
 TILES = tuple(Tile(*shape) for shape in itertools.product((64, 128, 256), (128, 256), (128, 64, 32), (8, 4),
-                                                            (2, 3, 4)))
+                                                            (3, 4, 2)))
 """Every tile the Triton launches may take: the ones the A100 and H100 sweeps found fastest lie inside.
 Where the cost model ties, the first wins: the deeper step, which synchronizes its pipeline fewer times
 a tile (at 128 x 256 on an H100, a step of 64 took 1.56 ms where 32 took 1.78, GMM-h100-2), and the
@@ -279,6 +279,16 @@ class _Triton(_GroupedLaunch[Tile]):
     def extents(tile: Tile) -> dict:
         """The block each launch axis takes at `tile`."""
 
+    def _resident(self, ba, config: Tile, target) -> int:
+        """The programs a multiprocessor holds at `config`: by its shared memory, and by its registers,
+        each thread holding its share of the fp32 accumulator and of one step's operand fragments."""
+        rows, columns = self.output(config)
+        threads = 32 * config.warps
+        # One MMA's k of 16 of each operand fragment, the warps' shares together.
+        fragments = (rows + columns) * 16 // threads
+        return cost.resident(target, self.staged_bytes(ba, config), threads,
+                             rows * columns // threads + fragments)
+
     @staticmethod
     @abc.abstractmethod
     def loaded(tile: Tile) -> int:
@@ -341,7 +351,8 @@ class Gmm(_Triton):
         return cost.seconds(cost.Cost(
             programs=chunks * columns, device_bytes=moved,
             program_flops=flops / (chunks * columns), program_staged=staged,
-            program_exponentials=exponentials, mode=_mode(tokens.dtype)), target)
+            program_exponentials=exponentials, mode=_mode(tokens.dtype), steps=steps, stages=config.stages,
+            resident=self._resident(ba, config, target)), target)
 
     def _fwd(self, tokens: jax.Array, kernel: jax.Array, sizes: jax.Array,
              prologue_operands: tuple = (), epilogue_operands: tuple = (), *, out_dtype: str,
@@ -402,7 +413,8 @@ class Tgmm(_Triton):
             self.extents(config))
         return cost.seconds(cost.Cost(
             programs=programs, device_bytes=moved, program_flops=flops, program_staged=staged,
-            program_exponentials=exponentials, mode=_mode(tokens.dtype)), target)
+            program_exponentials=exponentials, mode=_mode(tokens.dtype), steps=steps, stages=config.stages,
+            resident=self._resident(ba, config, target)), target)
 
     def _fwd(self, tokens: jax.Array, cotangent: jax.Array, sizes: jax.Array,
              prologue_operands: tuple = (), *, out_dtype: str, interpret: bool, hooks: Hooks = NO_HOOKS,
@@ -473,7 +485,8 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
             programs=tiles, device_bytes=moved,
             program_flops=2 * steps * config.block_m * config.block_n * config.block_k,
             program_staged=steps * step + config.block_m * config.block_n * out,
-            program_exponentials=exponentials, mode=_mode(tokens.dtype)), target)
+            program_exponentials=exponentials, mode=_mode(tokens.dtype), steps=steps,
+            stages=config.stages), target)
 
     def _multiprocessors(self, interpret: bool) -> int:
         # The interpreter runs one block (jax/_src/pallas/mosaic_gpu/interpret).
