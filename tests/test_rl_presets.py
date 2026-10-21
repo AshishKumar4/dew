@@ -138,20 +138,34 @@ def _widths(loaded, count: int) -> set[int]:
 
 def test_the_prompts_preset_prepares_what_the_prompt_recipe_does_measuring_its_reward_width():
     """Prompt rows rendered to eight left-padded ids, long ones dropped, their reward columns as wide
-    as the widest the store holds, measured as a memory read reads it: the batches the recipe makes,
-    and those of the width given outright."""
+    as the widest the store holds, measured as a memory read reads it: an epoch of the rows the
+    recipe makes, which orders them after rendering, and the batches of the width given outright."""
     rows = _prompts(12)
     recipe = PromptData(rows, "byte", max_prompt_len=8, long="drop")
     expected = loader(recipe, batch=2, read="memory", loading=LOADING)
-    # A rendering that drops prompts reads in a window's order, as the recipe does.
-    measured = rows.shuffle(0, window=64).repeat().pipe(presets.prompts, "byte", max_prompt_len=8, batch=2,
-                                                         long="drop")
+    measured = rows.shuffle(0).repeat().pipe(presets.prompts, "byte", max_prompt_len=8, batch=2, long="drop")
     built = compile(measured, read="memory", loading=LOADING)
-    same_batches(expected, built, 3)
+    # Eight of the twelve prompts fit in eight bytes: an epoch is four batches.
+    assert _epoch(built, 4) == _epoch(expected, 4)
     assert _widths(built, 3) == {12}
-    given = rows.shuffle(0, window=64).repeat().pipe(presets.prompts, "byte", max_prompt_len=8, batch=2,
-                                                      long="drop", reward_bytes=12)
+    given = rows.shuffle(0).repeat().pipe(presets.prompts, "byte", max_prompt_len=8, batch=2, long="drop",
+                                          reward_bytes=12)
     same_batches(built, compile(given, read="memory", loading=LOADING), 3)
+
+
+def _epoch(loaded, batches: int) -> list[tuple[bytes, ...]]:
+    """The rows of a loader's first `batches` training batches, each its fields' bytes, sorted."""
+    reader = loaded.train(DataPartition())
+    try:
+        rows = []
+        for _ in range(batches):
+            batch = next(reader)
+            names = sorted(batch)
+            rows += [tuple(np.asarray(batch[name])[row].tobytes() for name in names)
+                     for row in range(len(np.asarray(batch[names[0]])))]
+        return sorted(rows)
+    finally:
+        reader.close()
 
 
 def test_a_measured_reward_width_is_the_whole_stores_in_both_parts_of_a_holdout():
