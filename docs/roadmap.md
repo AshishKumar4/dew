@@ -2,16 +2,16 @@
 
 Work to complete or qualify, grouped by area, as of 2026-10-21. Numbers and identifiers in brackets are stable finding references. They do not imply that a reviewed branch has landed or that a runtime path has been qualified.
 
-Correctness, contract gaps and duplicated paths come first. After those close, measure single-GPU training on A100 and H100, then newer targets and multiple GPUs. The target is 50–60% or more real-token MFU on each workload that matters; a result below 50% gets a profile and fixes for its three largest losses. Higher utilization targets and new model breadth follow that work. [Performance](performance.md) holds measurements; [design records](design/architecture.md) hold contracts.
+Correctness, contract gaps and duplicated paths come first. After those close, measure single-GPU training on every supported accelerator, then multiple GPUs and hosts. The target is 50–60% or more real-token MFU on each workload that matters; a result below 50% gets a profile and fixes for its three largest losses. Higher utilization targets and new model breadth follow that work. [Performance](performance.md) holds measurements; [design records](design/architecture.md) hold contracts.
 
 ## Models and interop
 
 - Pass dense MLA visibility descriptors to the shared attention core. [41]
 - Bind native Flax forward methods explicitly, including the objective's choice of forward method. [171]
-- Carry FlaxDiff's remaining capabilities, or record dropping them: the continuous and tangent cosine schedules and the exponential schedule's test, SimpleAutoEncoder, the learned-variance head and the old UViT and wrapper, the W&B sweep promotion and run loading, the older checkpoints. [864, 865, 866, 867]
-- Carry MaxText's workflows Dew lacks: the pretrain-to-RL chain, named LoRA directories, MaxText checkpoints, replica and live-slice recovery, a host prefix tier and disaggregated serving, DiLoCo, sparse indexed attention, GPT-3 and Engram, audio language models, and remote-topology compilation. [869, 870, 871, 872, 873, 874, 875, 876, 877, 878, 879, 881]
-- Load the requested families Dew does not load yet: Qwen4-Exp, MiniMax Text-01, M1 and M3, the LLaDA MoE variants and LLaDA 2.x, DiffuCoder, Kimi K2.5's and K3's vision, and MiniMax M2.5, M2.7 and H3. [849, 850, 851, 852, 853, 854, 855, 856]
-- Carry the historical repair plan's RL tickets as rows: each likelihood and the weight version kept, methods composed from explicit choices, lossless episode records, and on-policy distillation. [857, 858, 859, 860]
+- Carry FlaxDiff's remaining capabilities, or record dropping them: the continuous and tangent cosine schedules and the exponential schedule's test, SimpleAutoEncoder, the learned-variance head and the old UViT and wrapper, the W&B sweep promotion and run loading, the older checkpoints. [864–867]
+- Carry MaxText's workflows Dew lacks: the pretrain-to-RL chain, named LoRA directories, MaxText checkpoints, replica and live-slice recovery, a host prefix tier and disaggregated serving, DiLoCo, sparse indexed attention, GPT-3 and Engram, audio language models, and remote-topology compilation. [869–879, 881]
+- Load the requested families Dew does not load yet: Qwen4-Exp, MiniMax Text-01, M1 and M3, the LLaDA MoE variants and LLaDA 2.x, DiffuCoder, Kimi K2.5's and K3's vision, and MiniMax M2.5, M2.7 and H3. [849–856]
+- Carry the historical repair plan's RL tickets as rows: each likelihood and the weight version kept, methods composed from explicit choices, lossless episode records, and on-policy distillation. [857–860]
 - Hold stage-local state in a pipeline and qualify its schedule. [861]
 - Test Dew at its declared dependency bounds in a clean environment. [862]
 - Complete Nemotron 3 Ultra, MiMo-V2.6-Pro and Muse Glimmer on the shared family components. Current support covers only parts of their text and multimodal configurations. [357]
@@ -44,21 +44,19 @@ Correctness, contract gaps and duplicated paths come first. After those close, m
 
 ## Kernels and performance
 
-- At each jax bump, check for openxla/xla#49498 (deterministic GPU scatter); then write the paged pool unmapped and drop linear.py's padded-row gather. [951]
-The kernel direction (owner, 2026-10-21; [design](design/kernel-templates.md)): three templates, attention, linear recurrence and GEMM, absorb every hand kernel and its variants. Each template at every shape it serves, on A100 and H100 (later B200 and TPU), meets or beats the best existing kernel, ours or external, while passing both accuracy checks. A hand kernel or external route is deleted once its template beats it.
+The kernel direction (owner, 2026-10-21; [design](design/kernel-templates.md)): three templates, attention, linear recurrence and GEMM, absorb every hand kernel and its variants. Each template, at every shape it serves on every supported accelerator, meets or beats the best existing kernel there, ours or external, while passing both accuracy checks. A hand kernel or external route is deleted once its template beats it.
 
-1. One algorithm per template. The math is written once as tile functions between matrix products. Hooks are traced JAX callables, and an unused one emits no code. Block structure uses Splash's block info and Megablox's group metadata. A shared toolkit per GPU generation pipelines and schedules, and a thin mainloop per template per generation places the products. A bitwise test across mainloops and a zero-cost test against the plain best kernel hold the boundaries. [1293, 1294, 1295, 1296]
-2. Backends. sm90 and sm100 use Mosaic GPU. sm80 and sm86 stay on Pallas Triton under Dew's pinned JAX: upstream deprecated it in 0.11.0, and Mosaic GPU on A100 measured 1.16× slower on attention and 1.2–1.5× on GEMM (2026-10-21). Mosaic sm80 is re-measured at each JAX bump. TPU uses Mosaic TPU. [1297]
+1. One algorithm per template. The math is written once as tile functions between matrix products. Hooks are traced JAX callables, and an unused one emits no code. Block structure uses Splash's block info and Megablox's group metadata. A shared toolkit per GPU generation pipelines and schedules, and a thin mainloop per template per generation places the products. A bitwise test across mainloops and a zero-cost test against the plain best kernel hold the boundaries. [1293–1296]
+2. Backends, by what each accelerator supports and what measures fastest: Pallas Triton on every CUDA GPU from sm80 (Ampere, Ada and Blackwell's consumer parts), held under Dew's pinned JAX since upstream deprecated it; Mosaic GPU on Hopper and data-center Blackwell; Mosaic TPU on TPU. Mosaic GPU replaces Triton on a generation once it measures faster there. GPUs before sm80 and AMD GPUs run XLA until a backend is qualified on them. [1297]
 3. Defaults. The fastest form that passes both checks is the default, atomic where faster, and deterministic mode is one flag away. Attention's backward must beat FA2/FA3 while passing the gate; if no accurate form can, the fastest passing form wins, and the FA routes stay until the template beats them. RMSNorm may fold into a matmul if it passes both checks and measures faster. [1298, 1299]
-4. Coverage: every variant, none out of scope. Attention covers masks, windows, documents, sinks, softcap, ALiBi, MLA, NSA, DSA, MoBA, paged, split-KV and quantized caches, FP8, dropout, and fused and split backwards. Recurrence covers GDN, KDA, the delta rule, DeltaProduct, RWKV7, the GLA family, SSD, Mamba1 chunked, Mamba3 and Oja-style erase. GEMM covers dense, grouped and paired products with prologues and epilogues, FP8 scales, exact-sum promotion and fused LoRA. Then FLA's remaining families, as hooks or as orchestrators over the templates: log-linear, MesaNet, DeltaFormer, Momentum DeltaNet, MoM, TTT and Titans, and CAT. [1300, 1301, 1302, 1303, 1304]
+4. Coverage: every variant, none out of scope. Attention covers masks, windows, documents, sinks, softcap, ALiBi, MLA, NSA, DSA, MoBA, paged, split-KV and quantized caches, FP8, dropout, and fused and split backwards. Recurrence covers GDN, KDA, the delta rule, DeltaProduct, RWKV7, the GLA family, SSD, Mamba1 chunked, Mamba3 and Oja-style erase. GEMM covers dense, grouped and paired products with prologues and epilogues, FP8 scales, exact-sum promotion and fused LoRA. Then FLA's remaining families, as hooks or as orchestrators over the templates: log-linear, MesaNet, DeltaFormer, Momentum DeltaNet, MoM, TTT and Titans, and CAT. The hand kernels' open rows close as their templates replace them: fused decode convolution, document resets and decode regrouping, one dtype contract per operation, the norm and SwiGLU kernels' reach, and paged attention's eligibility. [276, 485, 597, 730, 742, 762, 820–823, NNK-4, NNK-8, 1300–1304]
 5. One config chooser for every template. Legality prunes and an analytic model over complete features ranks. Every timing is logged, and a learned ranker (gradient-boosted trees over dimensionless features) replaces the analytic order only where it measures better on held-out models and GPUs. Opt-in measured tuning goes through `tuning.py`.
 6. Scoreboards. Every GPU timing records the template, the hand kernel it replaces, the best external kernel and XLA, in one session on one GPU, in [performance](performance.md).
 7. Record compile time beside execution time, keep programs bounded in depth and remove measured split-KV compiler growth, and show the serving barrier that bounds nGPT's depth leaves its training step unchanged. The persistent compilation cache is on by default, with an opt-out. [635, 641, 829]
 
-- Close the grouped GEMM's gap to CUTLASS on H100 (1.1–2.1× on dW, 1.1–1.6× on forward and dx, 2026-10-21) through the GEMM template's cooperative mainloop. [153]
-- Tune fp32 paths and the ported fla kernels, retaining fusions only where measured. [276]
+- At each jax bump, check for openxla/xla#49498 (deterministic GPU scatter); then write the paged pool unmapped and drop linear.py's padded-row gather. [951]
+- Close the grouped GEMM's gap to CUTLASS on Hopper through the GEMM template's cooperative mainloop. [153]
 - Improve one-row decode: M=1 products, repeated output-weight layout conversion and launch overhead. [483]
-- Fuse decode short convolution and its weight cast into one shared GDN, KDA and Mamba kernel. [485]
 - Measure pairwise KDA decay gradients under the same accuracy and performance gates before changing their reduction. [551]
 - Revisit host dispatch and command-buffer address updates when device time approaches the currently hidden host cost. [569]
 - Fold shared-mean gradient accumulation into weight-gradient work where it pays. [563]
@@ -68,15 +66,10 @@ The kernel direction (owner, 2026-10-21; [design](design/kernel-templates.md)): 
 - Fix the persistent-cache metadata read failures in Dew's JAX fork and remove the containment. [356]
 - Revisit residual certification and Crouzeix bounds only if a profiled solve or accuracy defect needs them; no speedup has been established. [477]
 - Separate normalization and shared attention policy from `attention.py`. [NNK-11]
-- Measure joined QKV in the same A100 session before adopting it. For unbounded packing, evaluate a recurrence implementation that stores continuation state without one full chunk state per position.
+- Measure joined QKV against separate projections before adopting it. For unbounded packing, evaluate a recurrence implementation that stores continuation state without one full chunk state per position.
 - Use a single-rounding bias epilogue without a step-time regression. [634]
 - Profile first compilation separately through lowering and XLA passes. [629]
-- Keep document resets out of recurrence decay prefixes, move decode regrouping into the kernel boundary and finish shared tuner/template coverage. [NNK-4, NNK-8, 597]
-- Take paged attention through the typed kernel selector, so its eligibility is each kernel's own as every other operation's is. [742]
-- Give the chunked gated delta rule one dtype contract on every route. With mixed operands the port returns their common dtype, while the portable math returns the query's and casts its cotangent to it, so output dtype and gradient precision depend on the GPU row. [730]
-- Move rms_norm and swiglu onto the typed selector, so their routes report and their refusals classify. [762]
 - Let tuning take only the declared resource-exhaustion and profiler-subscription errors for an unusable config. [764]
-- Widen the fused norm and SwiGLU kernels' reach: norms past 8192 features, a norm with an activation epilogue, operands a mesh splits or a varying shard_map holds, and fp16 qualified against the float64 gate. [820, 821, 822, 823]
 
 ## Data
 
@@ -108,9 +101,9 @@ The kernel direction (owner, 2026-10-21; [design](design/kernel-templates.md)): 
 
 - Hold Shortcut's halves-against-whole outcome per example, before the batch reduction, against a float64 twin. [1020]
 - Stop a block-diffusion run's generation at its checkpoint's end-of-sequence ids, as a loaded model's does. [895]
-- Measure multi-GPU MFU at real sizes: FSDP, FSDP×TP and expert parallelism on 4×H100 and 8×A100. First numbers (2026-10-21, Qwen3-8B): A100 FSDP8 0.559 and FSDP4×TP2 0.510; H100 FSDP4 0.519 and FSDP2×TP2 0.401. [1306]
-- Raise H100 tensor-parallel MFU: XLA's rematerialization re-gathers 82 GiB of FSDP weights each step. Disable that pass as MaxText does, and overlap TP's collectives. [1307]
-- Raise Dory's MFU, 0.459 on A100 FSDP8 and 0.388 on H100 FSDP4, past 0.5: profile the looped block, the normalizations and the residual barrier. [1308, 648]
+- Measure multi-GPU MFU at real sizes: FSDP, FSDP×TP and expert parallelism. [1306]
+- Raise tensor-parallel MFU: stop XLA's rematerialization from re-gathering FSDP weights each step, as MaxText does, and overlap TP's collectives. [1307]
+- Raise Dory's MFU past 0.5: profile the looped block, its normalizations and the residual barrier. [1308, 648]
 - Shard persistent optimizer state on sequence-only meshes. [156]
 - Qualify loss, resume, failure handling and throughput on two physical hosts. [158]
 - Expand training and inference across supported parallelism combinations; replace restrictions with composed support where the mathematics permits it. [226, 245]
@@ -124,7 +117,7 @@ The kernel direction (owner, 2026-10-21; [design](design/kernel-templates.md)): 
 - Measure the sharded optimizer frontier on two GPUs before adoption. Restore a distilled run's student without reading unused teacher weights. [OBJ-9]
 - Add explicit continue/restart control beside automatic latest-checkpoint restore. In-memory state continuation was rejected. [208]
 - Match PNDM's multistep grouping and startup steps against Diffusers before remeasuring its parity margin. [647]
-- Find the tiled chunked head's residual: at token tile 2, about 40 of 8192 head-gradient elements sit more than twice as far from float64 as the whole-logits reference; at tile 20 there are none. [737]
+- Find the tiled chunked head's residual at small token tiles, where a few head-gradient elements sit further from float64 than the whole-logits reference. [737]
 - Compile a step lowered by `Trainer(lower_for=)` before allocating training time, carry its executable and tuning picks to the run, and measure the saved startup time. Lowering alone already works. [720]
 - Build the training design's remaining contracts: refusing a split leaf that declares no axes, `Layout.validate(mesh)`'s placement report, a token budget ending at the commit that reaches it, and kernel choices in a run's report. [design/training.md]
 
@@ -166,36 +159,36 @@ Keep the existing gateway interface. Miles would currently duplicate it: its tra
 
 ## CI and tooling
 
-- Give every duplicated function and statement run one owner its callers share. The duplicate-code gate (functions and six-statement runs equal up to renaming, no allowlist) holds each head to adding none, and runs with no base once main's last copy is gone. [896, 897, 898, 899, 900, 901, 902, 903, 904, 905, 906, 907, 908, 909, 910, 911, 912, 913, 914, 915, 916, 917, 918, 919, 920, 921, 922, 923, 924, 925, 926, 927, 928, 929, 930, 931, 932, 933, 935, 936, 937, 938, 939, 940, 941, 942, 943, 944, 945, 946, 947, 948, 949, 950]
-- Give each recurrence, attention, selection and grouped-GEMM rule one owner that kernels, tests and tools share: one chunk transition, decay-range and WY core for every recurrence port, one visibility predicate and softmax state for attention and decode, one selection engine with typed refusals, and one independent test oracle per operation. [952, 953, 954, 955, 956, 957, 958, 959, 960, 961, 962, 963, 964, 965, 966, 967, 968, 969, 970, 971, 972, 973, 974, 975, 976, 977, 978, 979, 980, 981, 982, 983]
-- Give inference, RL, LoRA, quantization, the registry, the CLI and the figures one owner per rule: one sampled-token step, one sampled-call payload, one saved-run resolution, one publication path, and one export manifest and theme. [984, 985, 986, 987, 988, 989, 990, 991, 992, 993, 994, 995, 996, 997, 998, 999, 1000, 1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008, 1009, 1010, 1011, 1012, 1013, 1014, 1015, 1016, 1017, 1018, 1019]
-- Give checkpoint interop one owner per rule (MoE aliases, packed tensors, orientation, rope and layer patterns, alias groups), and move the reference tools' remaining hand-written oracles onto the published releases' code. [1021, 1022, 1023, 1024, 1025, 1026, 1027, 1028, 1029, 1030, 1031, 1032, 1033, 1034, 1035, 1036, 1037, 1038, 1039, 1040, 1041, 1042, 1043, 1044, 1045, 1046, 1047, 1048, 1049, 1050, 1051, 1052, 1053, 1054, 1055, 1056, 1057, 1058, 1059, 1060]
-- Give the data pipeline one owner per job: the chain for preparation and loading, one selection policy for mixed reads, one first-fit placement, one stage descriptor and traversal, one augmentation semantics for host and device, one cache integrity schema, and shared data-test support. [1062, 1063, 1064, 1065, 1066, 1067, 1068, 1069, 1070, 1071, 1072, 1073, 1074, 1075, 1076, 1077, 1078, 1079, 1080, 1081, 1082, 1083, 1084, 1085, 1086, 1087, 1088, 1089, 1090, 1091, 1092, 1093, 1094, 1095, 1096, 1097, 1098, 1099, 1100, 1101, 1102, 1103, 1104, 1105, 1106, 1107, 1108]
-- Give the model library one owner per job: one attention primitive, decoder block and feed-forward for every family, one vision-family registration, one autoencoder loader, one token-layout representation, and one visibility predicate, rotary pipeline and sequence blocking. [1109, 1110, 1111, 1112, 1113, 1114, 1115, 1116, 1117, 1118, 1119, 1120, 1121, 1122, 1123, 1124, 1125, 1126, 1127, 1128, 1129, 1130, 1131, 1132, 1133, 1134, 1135, 1136, 1137, 1138, 1139, 1140, 1141, 1142, 1143, 1144, 1145, 1146, 1147, 1148, 1149, 1150, 1151, 1152, 1153, 1154, 1155]
-- Give the tools, tests, CI and site one owner per job: one lint verdict, one numerical gate for every acceptance check, one wheel smoke, one installer bootstrap and CUDA rule, one Worker transport, generated dependency facts and CLI tables, one test-lane settings module, and the live container's client contract and capacities declared once. [1156, 1157, 1158, 1159, 1160, 1162, 1163, 1164, 1165, 1166, 1167, 1168, 1169, 1170, 1171, 1172, 1173, 1175, 1176, 1177, 1179, 1180, 1181, 1184, 1185, 1186, 1187, 1188, 1189, 1190]
-- Give training, objectives, sampling, checkpoints, config, evaluation and decision one owner per job: one head calculus for every cross-entropy schedule, one bank topology, one image-sampling path, one checkpoint metadata record, one optimizer-rate field and one run-length policy, and the default identifiers and metric suites declared once. [1191, 1192, 1193, 1194, 1195, 1196, 1197, 1198, 1199, 1200, 1201, 1202, 1203, 1204, 1205, 1206, 1207, 1208, 1209, 1210, 1211, 1212, 1213, 1214, 1215, 1216, 1217, 1218, 1219, 1220, 1221, 1222, 1223, 1224, 1225, 1226, 1227, 1228, 1229, 1230, 1231, 1232, 1233, 1234, 1235, 1236, 1237, 1238, 1239, 1240, 1241, 1242, 1243, 1244, 1245, 1246, 1247, 1248]
-- Give the tests' and tools' remaining small copies the duplicate-code gate finds one owner each: fixtures, toy models, token batches, reference loaders and parity entry points. [1249, 1250, 1251, 1252, 1253, 1254, 1255, 1256, 1257, 1258, 1259, 1260, 1261, 1262]
-- Give the copies within one file the duplicate-code gate finds one owner each: test cases written twice as parametrized cases or helpers, and repeated code paths in codecs, pipeline assembly and device partitioning. [1263, 1264, 1265, 1266, 1267, 1268, 1269, 1270, 1271, 1272, 1273, 1274, 1275, 1276, 1277, 1278, 1279, 1280, 1281, 1282, 1283, 1284, 1285, 1286, 1287]
-- Delete Dew's remaining deprecated paths, with no compatibility path: the legacy `.bin` token store, the old checkpoint control field (a checkpoint that has only it is refused by name), and re-exports that only rename a canonical home. [1288, 1289, 1290, 1291, 1292]
+- Give every duplicated function and statement run one owner its callers share. The duplicate-code gate (functions and six-statement runs equal up to renaming, no allowlist) holds each head to adding none, and runs with no base once main's last copy is gone. [896–933, 935–950]
+- Give each recurrence, attention, selection and grouped-GEMM rule one owner that kernels, tests and tools share: one chunk transition, decay-range and WY core for every recurrence port, one visibility predicate and softmax state for attention and decode, one selection engine with typed refusals, and one independent test oracle per operation. [952–983]
+- Give inference, RL, LoRA, quantization, the registry, the CLI and the figures one owner per rule: one sampled-token step, one sampled-call payload, one saved-run resolution, one publication path, and one export manifest and theme. [984–1019]
+- Give checkpoint interop one owner per rule (MoE aliases, packed tensors, orientation, rope and layer patterns, alias groups), and move the reference tools' remaining hand-written oracles onto the published releases' code. [1021–1060]
+- Give the data pipeline one owner per job: the chain for preparation and loading, one selection policy for mixed reads, one first-fit placement, one stage descriptor and traversal, one augmentation semantics for host and device, one cache integrity schema, and shared data-test support. [1062–1108]
+- Give the model library one owner per job: one attention primitive, decoder block and feed-forward for every family, one vision-family registration, one autoencoder loader, one token-layout representation, and one visibility predicate, rotary pipeline and sequence blocking. [1109–1155]
+- Give the tools, tests, CI and site one owner per job: one lint verdict, one numerical gate for every acceptance check, one wheel smoke, one installer bootstrap and CUDA rule, one Worker transport, generated dependency facts and CLI tables, one test-lane settings module, and the live container's client contract and capacities declared once. [1156–1160, 1162–1173, 1175–1177, 1179–1181, 1184–1190]
+- Give training, objectives, sampling, checkpoints, config, evaluation and decision one owner per job: one head calculus for every cross-entropy schedule, one bank topology, one image-sampling path, one checkpoint metadata record, one optimizer-rate field and one run-length policy, and the default identifiers and metric suites declared once. [1191–1248]
+- Give the tests' and tools' remaining small copies the duplicate-code gate finds one owner each: fixtures, toy models, token batches, reference loaders and parity entry points. [1249–1262]
+- Give the copies within one file the duplicate-code gate finds one owner each: test cases written twice as parametrized cases or helpers, and repeated code paths in codecs, pipeline assembly and device partitioning. [1263–1287]
+- Delete Dew's remaining deprecated paths, with no compatibility path: the legacy `.bin` token store, the old checkpoint control field (a checkpoint that has only it is refused by name), and re-exports that only rename a canonical home. [1288–1292]
 - Derive executable training and generation qualification from the registries. Cover codec combinations with fusion, scan and pipeline stages. [176, 178]
 - Compare cached and full forwards on logits and likelihoods. [179]
 - Build registry-backed uninterrupted/resumed flows and extend them to compiled-program reuse. [182, 183]
 - Inventory every kernel's float64 gate and derive GPU obligations from `TARGETS`. Runtime qualification remains open until the named device runs it. [184, 185]
 - Replace implementation pins with compile, fit and numerical behavior. Restore DeepSeek lifecycle gates against an independent, unmodified oracle. [192, 354]
 - Run one bounded image lifecycle qualification at a meaningful resolution. [295]
-- Cover the least-covered modules' real flows: the sandbox child, NCCL weight pushes, terminal logging, the figures, the TPU CLI, device facts, OPT and BLOOM's refusals and export, weight sources and decision corpora; run device-only code under a GPU coverage pass; refuse a coverage pass with a task cut short. [885, 886, 887, 888, 889, 890, 891, 892, 893, 894]
+- Cover the least-covered modules' real flows: the sandbox child, NCCL weight pushes, terminal logging, the figures, the TPU CLI, device facts, OPT and BLOOM's refusals and export, weight sources and decision corpora; run device-only code under a GPU coverage pass; refuse a coverage pass with a task cut short. [885–894]
 - Keep numerical results keyed by CPU model and qualify CPU-dependent rounding against the reference on that same class. [478]
 - Establish and triage a daily GPU baseline before it replaces batch qualification. Reproduce reference autotune picks in their recorders and qualify FP8 on suitable hardware. [558, 568, TTC-1]
 - Qualify H100, newer-GPU, TPU and paged-decode shard routes at runtime; compile and interpret checks leave those obligations open.
 - The float64 gate is the owner's (2026-10-20): check 1 holds each leaf's RMS error and its worst row within 1.5× the reference's, both measured from float64 truth, over drawn seeds, with no floor. Check 2 holds every element within a certified roundoff bound for Dew's own operation. Both sit behind one assertion, `assert_as_exact`, with `assert_moves` for checks that a change has an effect. [560, 649, 719, 793, 827]
-- One gate generation. The one-draw rule moves to 1.5× on 2026-10-24. A conversion tool then moves the mechanical sites, and the lanes convert the rest. The old assertion families are then deleted, and the tolerance inventory goes to zero. [1305, 650, 668, 669, 670, 676, 682, 705, 712, 844]
+- One gate generation. The one-draw rule moves to 1.5× on 2026-10-24. A conversion tool then moves the mechanical sites, and the lanes convert the rest. The old assertion families are then deleted, and the tolerance inventory goes to zero. [650, 668–670, 676, 682, 705, 712, 844, 1305]
 - Root-cause the gate census's ratios past 2 at one draw, in the code or the reference arm: layouts' first-step gradients and Z-Image's padded flow. [833, 837]
 - Replace test-policy violations with observable lifecycle and reference behavior:
 
-  - Training, sampling and objectives: [651, 652, 653, 654, 657, 658, 667, 679, 680, 686, 687, 688, 692, 695, 698, 701, 702, 707, 708].
+  - Training, sampling and objectives: [651–654, 657, 658, 667, 679, 680, 686–688, 692, 695, 698, 701, 702, 707, 708].
   - Model loading, adapters and exports: [675, 677, 681, 691, 699, 700, 703, 704].
   - Attention, convolution and tuning: [655, 656, 674, 689, 690, 696].
-  - Recurrences and looped models: [659, 660, 661, 662, 664, 665, 678, 706, 711].
+  - Recurrences and looped models: [659–662, 664, 665, 678, 706, 711].
   - Data and packing: [694].
   - Printed programs and assertion-only pins in the remaining lanes' files, Training's done: [709, 710].
 - Make float32 numpy references independent of the worker's OpenBLAS kernels, which round differently on x86-64-v3 and v4, without pinning the weaker one. [744]
