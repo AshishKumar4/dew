@@ -141,6 +141,8 @@ class RemoteCache:
             entries = self._fetched(file)
             for key, value in entries:
                 self._seeded(key, value)
+            if entries:
+                self._answered()
         except UNREACHABLE as error:
             self._failed(error)
             return
@@ -155,7 +157,8 @@ class RemoteCache:
             self.programs_fetched += len(keys)
 
     def _fetched(self, file: str) -> list[tuple[str, bytes]]:
-        """The entries of `file`'s bundle on the Worker; none where it has none."""
+        """The entries of `file`'s bundle on the Worker; none where it has none or the remote was given
+        up. An answer counts as one only once its programs are in the directory (`opened`)."""
         try:
             answer = self._request(file, "GET")
         except urllib.error.HTTPError as error:
@@ -165,9 +168,7 @@ class RemoteCache:
         if answer is None:
             return []
         with answer as response:
-            entries = unpacked(response.read(MAX_BYTES + 1))
-        self._answered()
-        return entries
+            return unpacked(response.read(MAX_BYTES + 1))
 
     def _seeded(self, key: str, value: bytes) -> None:
         """`value` as program `key`'s file, unless the directory has it: written to a name of its own
