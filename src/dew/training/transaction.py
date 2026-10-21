@@ -241,10 +241,8 @@ def example_places(slot, split: int, rows: int, column: jax.Array | None = None,
     `slot % split`).
 
     A window pools its steps' microbatches in the order it accepts them, so a dynamic loss scale's
-    rejected microbatch leaves its slot to the next: places then repeat within the update, and the next
-    batch at a slot reads its rejected predecessor's draws. A window across a ramp's stage change
-    places each slot at its rows: its places stay distinct, its count is the slot's stage's, and an
-    update's examples are the same on every layout only within a stage."""
+    rejected microbatch leaves its slot to the next, which takes its places under a key that folds in
+    the rejection (`example_fields`): no two accepted microbatches of an update draw alike."""
     step = slot // split
     if column is None:
         part = slot % split if part is None else part
@@ -252,16 +250,18 @@ def example_places(slot, split: int, rows: int, column: jax.Array | None = None,
     return (step * rows * split + column).astype(jnp.int32)
 
 
-def example_fields(state, slot, split: int, batch, slots: int = 1, part=None) -> dict:
+def example_fields(state, slot, split: int, batch, slots: int = 1, part=None, rejected=0) -> dict:
     """The `Step` fields of the microbatch in window slot `slot` of the update `state` commits next, of
-    `slots` microbatches, its steps read in `split` microbatches each, this the `part`th: the update's
-    key (`Step.example_key`), each row's place among the update's examples (`example_places`), placed as
-    the batch's rows are, so each device draws its own rows' examples alone, and how many examples the
-    update pools. A batch with no rows has no examples."""
+    `slots` microbatches, its steps read in `split` microbatches each, this the `part`th, after the run
+    rejected `rejected` attempts: the update's key (`Step.example_key`), which folds in the rejections,
+    so the input a rejected one leaves its slot to draws afresh, each row's place among the update's
+    examples (`example_places`), placed as the batch's rows are, so each device draws its own rows'
+    examples alone, and how many examples the update pools. A batch with no rows has no examples."""
     rows = rows_of(batch)
     if not rows:
         return {}
-    key = jax.random.fold_in(jax.random.fold_in(state.key, EXAMPLE_STREAM), state.updates)
+    key = jax.random.fold_in(jax.random.fold_in(jax.random.fold_in(state.key, EXAMPLE_STREAM),
+                                                state.updates), rejected)
     index = example_places(slot, split, rows, batch.get(EXAMPLE_ROWS), part)
     return {"example_key": key, "example_index": placed_as_rows(index, batch), "example_count": slots * rows}
 
@@ -407,14 +407,15 @@ class Transaction:
         batch = jax.tree.map(lambda x: x[index], previous.batches)
         variables = state.variables if previous.variables is None else {
             **state.variables, **jax.tree.map(lambda x: x[index], previous.variables)}
-        step_info = Step((state.microstep - fill + index) // self.split,
+        accepted = state.microstep - fill + index
+        step_info = Step(accepted // self.split,
                     jax.random.fold_in(state.key, previous.attempts[index]),
                     with_ema(variables, state.ema), committed=state.updates,
-                    **self.examples(state, index, batch))
+                    **self.examples(state, index, batch, rejected=previous.attempts[index] - accepted))
         return self.read(variables, state.compute), batch, step_info
 
-    def examples(self, state, slot, batch, part=None) -> dict:
-        return example_fields(state, slot, self.split, batch, self.size, part)
+    def examples(self, state, slot, batch, part=None, rejected=0) -> dict:
+        return example_fields(state, slot, self.split, batch, self.size, part, rejected)
 
     def read(self, variables, compute):
         """The variables a step's forward reads: the narrow copies in place of
@@ -610,9 +611,11 @@ class Transaction:
             # is its real tokens, which the trainer reads off the accounting
             # columns the objective's batch no longer holds (`model_batch`).
             attempt = state.step * self.split + part
+            # Every attempt the run made and did not accept, so a rejected one's slot draws afresh.
+            rejected = attempt - state.microstep
             step_info = Step(state.microstep // self.split, jax.random.fold_in(state.key, attempt),
                              with_ema(state.variables, state.ema), committed=state.updates,
-                             **self.examples(state, state.microstep % self.size, batch, part))
+                             **self.examples(state, state.microstep % self.size, batch, part, rejected))
             factor = jnp.asarray(1., jnp.float32) if state.scale is None else state.scale.scale
             realized = realize(self.read(state.variables, state.compute), batch, step_info)
             loss, cotangent = reduce(realized.stats, factor)
