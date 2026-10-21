@@ -1570,11 +1570,13 @@ def write_logits_recording(name: str, model: PreTrainedModel, command: str) -> N
     with float64():
         # Rotary inverse frequencies are buffers built at construction in float32: rebuilt in float64.
         for module in wide.modules():
-            if hasattr(module, "rope_init_fn") and hasattr(module, "inv_freq"):
-                inverse, _ = module.rope_init_fn(module.config, None)
+            build = getattr(module, "rope_init_fn", None) or getattr(module, "compute_default_rope_parameters", None)
+            if build is not None and hasattr(module, "inv_freq"):
+                inverse, _ = build(module.config, None)
                 module.inv_freq = inverse.double()
                 if hasattr(module, "original_inv_freq"):
                     module.original_inv_freq = inverse.double()
+                print(f"{type(module).__name__}: inverse frequencies rebuilt in float64", flush=True)
     vocab = model.config.vocab_size
     native = Pretrained.load(directory, dtype="float32", attention_impl="reference")
     wide_model = native.model.clone(dtype=jnp.float64, attention_impl="reference")
