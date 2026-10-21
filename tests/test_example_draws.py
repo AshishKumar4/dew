@@ -13,7 +13,17 @@ from dew.data.dataset import DataPartition
 from dew.diffusion import presets
 from dew.inputs import CharTable, Condition, Field, InputSpec
 from dew.nn.backbones import SimpleDiT
-from dew.objectives.base import EXAMPLE_ROWS, Aux, Objective, Ratio, Recorder, Step, example_stream, stream
+from dew.objectives.base import (
+    EXAMPLE_ROWS,
+    EXAMPLE_STREAM,
+    Aux,
+    Objective,
+    Ratio,
+    Recorder,
+    Step,
+    example_stream,
+    stream,
+)
 from dew.objectives.diffusion.few_step import MeanFlowObjective, ShortcutObjective
 from dew.training.distributed import marked
 from dew.training.transaction import example_places
@@ -346,3 +356,78 @@ def test_a_distilled_inpainting_step_reads_no_draw_of_its_attempt():
         return np.asarray(stats.total)
 
     np.testing.assert_array_equal(loss(1), loss(2))
+
+
+class Witnessed(Objective):
+    """A loss of one weight against each row's own uniform draw and a boundary of its noised target,
+    whose statistics are a pair it reduces itself, which an accumulation window keeps by replaying
+    its batches at the commit."""
+
+    def fresh_variables(self, key, held):
+        return {"params": {"w": jnp.asarray(.2)}}
+
+    def loss(self, variables, batch, step):
+        w, rows = variables["params"]["w"], batch["y"].shape[0]
+        noise = step.sample("noise", jax.random.uniform, (), dtype=jnp.float32, rows=rows)
+        target = step.boundary("target", batch["y"] + noise)
+        return (jnp.sum((w - target) ** 2), jnp.asarray(rows, jnp.float32)), Aux({})
+
+    def reduce_loss(self, stats):
+        total, mass = stats
+        return total / mass, mass > 0
+
+
+@pytest.mark.parametrize("host", [False, True])
+def test_a_recording_step_returns_what_each_evaluation_drew_its_replays_each_their_own(host):
+    """`Trainer(record=True)` returns, under its metrics' `RECORD`, each evaluation's samples and
+    boundaries by name, its rows' places and its column check: an accepted microbatch's own, then at
+    the commit the window's other microbatches as replayed, each equal to what it drew when it ran
+    and to the example's own draw, resident and host-master alike."""
+    from dew.objectives.base import RECORD
+    from dew.training import Layout, MeshSpec, Trainer
+
+    layout = Layout(host=("variables",) if host else (), min_shard=1, tolerance=1.)
+    trainer = Trainer(Witnessed(), optax.sgd(.1), key=jax.random.key(4), accumulation=2, layout=layout,
+                      checkpoints=None, tracker=None, record=True)
+    trainer.device_mesh = MeshSpec().build(jax.devices()[:1])
+    state = trainer.initial_state()
+    first = {"y": jnp.arange(4, dtype=jnp.float32), EXAMPLE_ROWS: jnp.arange(4, dtype=jnp.int32)}
+    second = {"y": jnp.arange(4, 8, dtype=jnp.float32), EXAMPLE_ROWS: jnp.arange(4, dtype=jnp.int32)}
+    run = trainer.compile(state, first)
+    key = jax.random.fold_in(jax.random.fold_in(jax.random.fold_in(state.key, EXAMPLE_STREAM), 0), 0)
+    state, _, opened, *_ = run(state, first)
+    state, _, closed, *_ = run(state, second)
+    assert int(state.updates) == 1
+    opened, closed = jax.device_get(opened[RECORD]), jax.device_get(closed[RECORD])
+    # The first attempt: its own evaluation, and no replay (the window has not committed).
+    np.testing.assert_array_equal(opened["evaluated"], [True, False])
+    np.testing.assert_array_equal(opened["example_index"][0], np.arange(4))
+    # The commit: its own microbatch, the second slot's, then the first slot's replay.
+    np.testing.assert_array_equal(closed["evaluated"], [True, True])
+    np.testing.assert_array_equal(closed["example_index"], [np.arange(4, 8), np.arange(4)])
+    assert bool(np.all(opened["column_ok"][:1])) and bool(np.all(closed["column_ok"]))
+    np.testing.assert_array_equal(closed["values"]["noise"][1], opened["values"]["noise"][0])
+    np.testing.assert_array_equal(closed["values"]["target"][1], opened["values"]["target"][0])
+    # Each value is the example's own draw (`Step.sample`), by its place.
+    own = Step(jnp.asarray(0), jax.random.key(0), None, example_key=key,
+               example_index=jnp.arange(8, dtype=jnp.int32), example_count=8)
+    drawn = np.asarray(own.sample("noise", jax.random.uniform, (), dtype=jnp.float32, rows=8))
+    noise = closed["values"]["noise"]
+    np.testing.assert_array_equal(np.concatenate([noise[1], noise[0]]), drawn)
+
+
+def test_a_recording_loss_flags_a_row_its_step_places_apart_from_its_column():
+    """A recording evaluation checks in its trace that each row's place (`Step.example_index`) is its
+    trainer column (`EXAMPLE_ROWS`) plus the step's one offset: two rows' places swapped fail it."""
+    from dew.objectives.base import RECORD
+
+    batch = {"y": jnp.zeros((4,)), EXAMPLE_ROWS: jnp.arange(4, dtype=jnp.int32)}
+    params = Witnessed().init(jax.random.key(0))
+
+    def flagged(index):
+        step = Step(jnp.asarray(0), jax.random.key(1), None, example_key=UPDATE,
+                    example_index=jnp.asarray(index, jnp.int32), example_count=8, record=True)
+        return bool(jax.jit(lambda: Witnessed()._loss(params, batch, step)[1].metrics[RECORD]["column_ok"])())
+
+    assert flagged([4, 5, 6, 7])
+    assert not flagged([4, 6, 5, 7])

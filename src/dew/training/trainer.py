@@ -70,6 +70,7 @@ from dew.nn.sharding import (
 )
 from dew.objectives.base import (
     FROZEN,
+    RECORD,
     Aux,
     Batch,
     Initializer,
@@ -432,6 +433,7 @@ class Trainer(Generic[Loss, Effects]):
         profile: ProfileWindow | None = None,
         lower_for: str | None = None,
         tune_kernels: bool = False,
+        record: bool = False,
     ):
         """Hold everything a run needs, without opening any of it.
 
@@ -453,7 +455,10 @@ class Trainer(Generic[Loss, Effects]):
         the first step for it in place of compiling it (`dew.training._lowering.Lowered`).
         `tune_kernels` measures each Pallas launch of a step that has no config measured on this GPU,
         where the process has the GPU to itself (`dew.nn.kernels.tuning.tune`); without it such a
-        launch runs the nearest measured shape's config or its heuristic.
+        launch runs the nearest measured shape's config or its heuristic. `record` makes each compiled step
+        return, under its metrics' `RECORD`, what every evaluation's `Step.sample` and `Step.boundary`
+        calls produced, the commit's replays each its own (`transaction.recorded`), which `fit` keeps
+        in `records`, a step's a entry.
         """
         whole = _read_whole(accumulation, split, step, layout, rollout, mesh)
         self.objective = objective
@@ -474,13 +479,12 @@ class Trainer(Generic[Loss, Effects]):
         self.step = step
         self.rollout = rollout
         self.tune_kernels = tune_kernels
+        self.record, self.records = record, []
         self.profile = profile
         self.lower_for = lower_for
-        # Set by `compile`, for the batch shape it was called with. A ramped
-        # run has one value per stage; `fit` keeps them beside each step. The
-        # program is the step as handed to XLA, before GSPMD partitions it,
-        # and the executable the step as compiled, whose memory analysis a
-        # benchmark reads.
+        # Set by `compile`, for the batch shape it was called with. A ramped run has one value per stage;
+        # `fit` keeps them beside each step. The program is the step as handed to XLA, before GSPMD partitions
+        # it, and the executable the step as compiled, whose memory analysis a benchmark reads.
         self.step_flops: StepFlops | None = None
         self.program: jax.stages.Lowered | None = None
         self.executable: jax.stages.Compiled | None = None
@@ -498,10 +502,9 @@ class Trainer(Generic[Loss, Effects]):
         self._display = TrainingDisplay()
         self._count_work = False
         self._refusal: str | None = None
-        # The fit ladder's rung beyond the objective's own head and remat: a
-        # step that fit only under XLA's default options keeps them for later
-        # compiles. A resumed run starts at its checkpoint's rung, and says so
-        # if its first compile has to climb past it (`_climb_to`).
+        # The fit ladder's rung beyond the objective's own head and remat: a step that fit only under XLA's
+        # default options keeps them for later compiles. A resumed run starts at its checkpoint's rung, and
+        # says so if its first compile has to climb past it (`_climb_to`).
         self._xla_defaults = False
         # Why this run's checkpoints describe no model to load, said once.
         self._unrecorded: str | None = None
@@ -509,10 +512,9 @@ class Trainer(Generic[Loss, Effects]):
         # last trace of `initial_state` saw them (`_boxed_axes`).
         self._boxed: dict[tuple[str, ...], LogicalAxes] | None = None
         self._resumed_rung: JSON = None
-        # The rung each newly met shape starts from, as the first compile found
-        # the objective: its modules, head tile, XLA option choice and record
-        # (`_at_base_rung`); then the rung each shape compiled at, by layout,
-        # and the rungs a resumed checkpoint recorded for its shapes.
+        # The rung each newly met shape starts from, as the first compile found the objective: its modules,
+        # head tile, XLA option choice and record (`_at_base_rung`); then the rung each shape compiled at, by
+        # layout, and the rungs a resumed checkpoint recorded for its shapes.
         self._base_rung: tuple[tuple[nn.Module, ...], tuple[int, int] | None, bool, dict[str, JSON]] | None
         self._base_rung = None
         self._shape_rungs: dict[str, JSON] = {}
@@ -535,8 +537,7 @@ class Trainer(Generic[Loss, Effects]):
             raise ValueError("an OptimConfig is built over the run's length, which only fit(steps=...) gives")
         return self._optimizer
 
-    # ------------------------------------------------------------------
-    # The state
+    # ------------------------------------------------------------------ The state
     # ------------------------------------------------------------------
 
     def initial_state(self, initializer: Initializer | None = None,
@@ -916,8 +917,7 @@ class Trainer(Generic[Loss, Effects]):
         placed = transfer(rest, dataclasses.replace(shardings, variables=None, ema=None))
         return dataclasses.replace(placed, variables=params, ema=ema)
 
-    # ------------------------------------------------------------------
-    # The step
+    # ------------------------------------------------------------------ The step
     # ------------------------------------------------------------------
 
     def _model_batch(self, batch: Batch) -> Batch:
@@ -939,10 +939,9 @@ class Trainer(Generic[Loss, Effects]):
 
     def _loss_shape(self, state: TrainState, batch: Batch):
         batch = self._model_shapes(batch)
-        # Shapes and dtypes only: a resident frozen leaf sits in another
-        # memory space than the moving ones, and the loss the realization
-        # runs reads a snapshot in one space. The step's key is drawn inside
-        # the trace, so an abstract state compiles a step as a placed one does.
+        # Shapes and dtypes only: a resident frozen leaf sits in another memory space than the moving ones,
+        # and the loss the realization runs reads a snapshot in one space. The step's key is drawn inside the
+        # trace, so an abstract state compiles a step as a placed one does.
         params = jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), state.variables)
 
         def loss(params, batch, microstep, key, step, ema):
@@ -1044,7 +1043,7 @@ class Trainer(Generic[Loss, Effects]):
         custom step with no invented commit telemetry, which reads it whole."""
         if self.step is None:
             return Transaction(self.objective, self.optimizer, split * self.accumulation, shapes, copies,
-                               split=split).step()
+                               split=split, record=self.record).step()
         custom = self.step(self.objective, self.optimizer)
 
         def run(current, batch, part, tokens):
@@ -1326,7 +1325,8 @@ class Trainer(Generic[Loss, Effects]):
             prepared = self._initialize_accumulation(state, cpu_batch, shapes, window=self.accumulation,
                                                      shape_only=True)
             placement = self.shardings(prepared)
-            transaction = Transaction(self.objective, self.optimizer, self.accumulation, shapes)
+            transaction = Transaction(self.objective, self.optimizer, self.accumulation, shapes,
+                                      record=self.record)
             body = transaction.step(realize=execution.realize, host=True)
 
         def run(current, batch):
@@ -1343,8 +1343,7 @@ class Trainer(Generic[Loss, Effects]):
                 return transfer(advanced, placement), *stepped
         return run
 
-    # ------------------------------------------------------------------
-    # The loop
+    # ------------------------------------------------------------------ The loop
     # ------------------------------------------------------------------
 
     @ruled
@@ -1517,10 +1516,9 @@ class Trainer(Generic[Loss, Effects]):
                           if capturing else contextlib.nullcontext())
             with step_scope:
                 with region("input.wait"):
-                    # The first read restores the stream's position and opens
-                    # its reader on the prefetch worker, and a stream that may
-                    # run out can on any read: a process whose read failed
-                    # stops its peers before they compile or step without it.
+                    # The first read restores the stream's position and opens its reader on the prefetch
+                    # worker, and a stream that may run out can on any read: a process whose read failed stops
+                    # its peers before they compile or step without it.
                     asked = time.perf_counter()
                     batch = run.read() if seen and run.endless else agreed("training read", run.read)
                     interval.waited += time.perf_counter() - asked
@@ -1732,8 +1730,9 @@ class Trainer(Generic[Loss, Effects]):
         notice stops the run at this step, whose checkpoint is then written."""
         current, checkpoints = run.current, self.checkpoints
         ending = plan.finished(current, interval.real_tokens if plan.tokens is not None else 0)
-        aux = {name: value for name, value in aux.items()
-               if name not in (TRAINING_FLOPS, TOKENS)}
+        if RECORD in aux:
+            self.records.append(aux[RECORD])
+        aux = {name: value for name, value in aux.items() if name not in (TRAINING_FLOPS, TOKENS, RECORD)}
         run.training = {'train/loss': loss, **{f'train/{name}': value for name, value in aux.items()}}
         run.stepped = (loss, aux, accepted)
         if current % plan.log_every == 0:
