@@ -42,6 +42,7 @@ import grain.python as grain
 import numpy as np
 from jinja2 import TemplateError
 
+from dew.data.facts import unshaped
 from dew.data.text import HFTokenizer, SavedTokenizer, tokenizer_name
 
 if TYPE_CHECKING:
@@ -524,6 +525,12 @@ class RenderChat(grain.MapTransform):
 
     def dependencies(self) -> Mapping[str, object]:
         return {"tokenizer": self.vocabulary.dependencies()}
+
+    def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
+        """Token ids under "text" and their speakers under "text_roles", each conversation's
+        length, from `tokenizer`'s template, in place of its turns."""
+        rendered = unshaped(facts, self.column, "prompt", "tools", "text", ROLES_KEY)
+        return {**rendered, "tokenizer": self.tokenizer}
 
     def map(self, element: Batch) -> Batch:
         messages = element.get(self.column, element.get("prompt"))

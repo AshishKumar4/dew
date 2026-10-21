@@ -19,6 +19,7 @@ import numpy as np
 from dew.data.dataset import Batch
 from dew.data.facts import shaped
 from dew.data.pipeline import Rejected
+from dew.data.sources.files import Files
 
 if TYPE_CHECKING:
     from dew.data.sources.urls import Fetch
@@ -168,17 +169,12 @@ class Row(grain.MapTransform):
         return {"mp4": path, "caption": element.get("caption", self.caption)}
 
 
-@dataclasses.dataclass(frozen=True)
-class Extensions:
-    """Whether a listed file's path (`video_path`, else `path`) ends in one of `extensions`, any
-    case: a directory's media, not the lists and notes beside it (`Dataset.filter`)."""
+def media(listing: Files, extensions: Sequence[str] = (".mp4", ".avi", ".mov", ".webm")) -> Files:
+    """A listing of files (`Files(url, format="files")`) cut to those whose name ends in one of
+    `extensions`, any case: a directory's media, not the lists and notes beside it."""
+    from pathlib import PurePosixPath
 
-    extensions: Sequence[str] = (".mp4", ".avi", ".mov", ".webm")
-
-    def __call__(self, element: Batch) -> bool:
-        from pathlib import PurePosixPath
-
-        path = str(element.get("video_path", element.get("path", "")))
-        wanted = {extension.lower() if extension.startswith(".") else "." + extension.lower()
-                  for extension in self.extensions}
-        return PurePosixPath(path).suffix.lower() in wanted
+    wanted = tuple(extension.lower() if extension.startswith(".") else "." + extension.lower()
+                   for extension in extensions)
+    return dataclasses.replace(listing, url=tuple(path for path in listing.paths
+                                                  if PurePosixPath(path).suffix.lower() in wanted))

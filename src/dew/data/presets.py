@@ -41,11 +41,13 @@ from dew.data.pipeline import (
     Pack,
     Phases,
     Pipeline,
+    Prefetch,
     RandomStep,
     Repeat,
     Shuffle,
     Slice,
     Windows,
+    Workers,
 )
 from dew.data.sources.base import Source
 from dew.data.text import SavedTokenizer
@@ -183,7 +185,8 @@ def token_windows(dataset: Dataset, *, seq_len: int, batch: int | None, stride: 
     if not isinstance(store, TokenFiles):
         raise ValueError(f"token_windows reads a token store's stream (TokenFiles), not "
                          f"{type(store).__name__}")
-    views = (Shuffle, Repeat, Slice, Limit)
+    # Views order and select the windows; prefetch and workers say how they're read.
+    views = (Shuffle, Repeat, Slice, Limit, Prefetch, Workers)
     stages = [type(stage).__name__ for stage in chain.stages if not isinstance(stage, views)]
     if stages:
         raise ValueError(f"token_windows orders the windows of {store.describe()}, which {stages} would "
@@ -358,10 +361,15 @@ def video(dataset: Dataset, seconds: float, *, frames: int, fps: float, size: in
           sample_rate: int | None = None, margin: float = 0.0, context: float = 0.0,
           missing: Literal["silence", "reject"] = "silence", rejects: bool = True, records: int | None = None,
           host: tuple[HostStep, ...] = ()) -> Pipeline:
-    """A listing of media files (`Files(url, format="files")`, or rows with a `path` or
-    `video_path`), those whose name ends in one of `extensions`, each read as `clips` reads its
-    media, with its caption, `caption` where it states none. The other settings are `clips`'."""
-    listed = dataset.filter(video_steps.Extensions(extensions)).map(video_steps.Row(caption))
+    """A listing of media files (`Files(url, format="files")`, cut to those whose name ends in one
+    of `extensions`), or rows with a `path` or `video_path`, each read as `clips` reads its media,
+    with its caption, `caption` where it states none. The other settings are `clips`'."""
+    from dew.data.sources.files import Files
+
+    chain = dataset._chain()
+    if isinstance(chain.source, Files) and chain.source.kind == "files":
+        chain = dataclasses.replace(chain, source=video_steps.media(chain.source, extensions))
+    listed = chain.map(video_steps.Row(caption))
     return clips(listed, seconds, frames=frames, fps=fps, size=size, batch=batch, sample_rate=sample_rate,
                  margin=margin, context=context, missing=missing, rejects=rejects, records=records, host=host)
 
