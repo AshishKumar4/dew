@@ -50,9 +50,10 @@ clipped with the skip, the gated RMS norm after the l2 norm and after a plain sc
 `chunk_ssd` hands it over (a rated decay, the step its write gate), with its gated norm, a rated decay
 under the delta rule and the l2 norm, the norm after the skip, and a decay without any write gate."""
 
-COMPOSED_SEEDS = {(HOOKS[index], packed): 8 for index in (4, 8, 6) for packed in (False, True)}
+COMPOSED_SEEDS = {(HOOKS[4], False): 16, (HOOKS[4], True): 16, (HOOKS[8], False): 8, (HOOKS[8], True): 8,
+                  (HOOKS[6], False): 16, (HOOKS[6], True): 16}
 """The composed-chunks sites' declared seeds (the scalar and the vector decay with the delta rule, the
-scalar without; one sequence and packed), sized by `seeds_for` on armada."""
+scalar without; one sequence and packed), sized by `seeds_for` on armada (2026-10-21)."""
 
 PACKED = (False, True)
 """A row of one sequence, and of packed documents."""
