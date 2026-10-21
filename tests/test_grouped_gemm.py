@@ -90,11 +90,11 @@ def test_the_hopper_grouped_matmuls_sum_each_groups_rows_as_exactly_as_xla(sizes
         got = mosaic_gpu.gmm(arrays[0], matrix, group_sizes, tiles=tiles, transpose_rhs=transpose,
                              out_dtype=dtype, multiprocessors=1, interpret=grouped_matmul.INTERPRETED)
         check(got, reference[0], truth[0], group, f"forward {tiles} transpose={transpose}")
-    for block_k in (64, 128):
-        tiles = mosaic_gpu.Tiles(64, 64, block_k, 2, 1)
+    for tiles in (mosaic_gpu.Tiles(64, 64, 64, 2, 1), mosaic_gpu.Tiles(64, 64, 128, 2, 1),
+                  mosaic_gpu.Tiles(128, 128, 64, 2, 1, warpgroups=2)):
         got = mosaic_gpu.tgmm(arrays[0], arrays[2], group_sizes, tiles=tiles, out_dtype=jnp.float32,
                               multiprocessors=1, interpret=grouped_matmul.INTERPRETED)
-        check(got, reference[2], truth[2], None, f"kernel gradient block_k={block_k}")
+        check(got, reference[2], truth[2], None, f"kernel gradient {tiles}")
 
 
 def check(got, reference, truth, group, label):
