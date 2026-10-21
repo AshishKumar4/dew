@@ -344,18 +344,6 @@ class BlockWiring:
             raise ValueError("layer_scalar must be None, frozen or trainable")
 
 
-"""The values a block names as it runs, each after the projection that
-produced it: `kv_proj` is latent attention's fused `kv_b_proj`, `context`
-the attention kernel's or the gated delta rule's output before `o_proj`,
-`conv` a linear-attention or SSM mixer's short conv output (`causal_conv1d`,
-its queries, keys and values for a delta rule), `delta_decay`,
-`delta_inverse` and `delta_memory` the rule's cumulated decay, chunk inverse
-and memory (with `w` and the corrected values) the port saves for its
-backward (`dew.nn.kernels.fla_gdn`), and the MLP names cover the dense MLP
-and the routed experts alike. A remat policy picks from these; a
-name off the list is a typo that would otherwise recompute silently."""
-
-
 @dataclasses.dataclass(frozen=True)
 class RematPolicy:
     """What a recomputed block keeps for its backward pass, and where it keeps it.

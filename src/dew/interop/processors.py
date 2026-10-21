@@ -6,13 +6,11 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from functools import cached_property
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, Protocol, TypedDict, TypeGuard, Unpack, runtime_checkable
+from typing import TYPE_CHECKING, Literal, Protocol, TypedDict, TypeGuard, Unpack
 
 import jax
 import jax.numpy as jnp
-import ml_dtypes
 import numpy as np
-from typing_extensions import CapsuleType
 
 from dew import records
 from dew._model_types import QWEN35_TYPES
@@ -192,14 +190,6 @@ def _row_start(reference: HostProcessor) -> int | None:
     return None if bos is None else records.integer(bos, "bos_token_id")
 
 
-
-@runtime_checkable
-class _DLPack(Protocol):
-    """A framework's array that exports itself through DLPack (a PyTorch tensor among them), which
-    JAX reads without importing the framework."""
-
-    def __dlpack__(self, *args, **kwargs) -> CapsuleType: ...
-
 @dataclass(frozen=True)
 class Processor:
     """Runs a checkpoint's own processor on the host and arranges its outputs as native model inputs.
@@ -298,29 +288,34 @@ class Processor:
 
     @property
     def _media_tensors(self) -> Literal["np", "pt"]:
-        """The tensor type the media processor is asked for: NumPy, unless an image or video
-        processor of it computes in PyTorch (Transformers' torchvision backend, whose bfloat16
-        pixels NumPy cannot hold), whose own tensors are then read through DLPack
-        (`_from_arrays`), so Dew itself imports no PyTorch."""
+        """The tensor type the media processor is asked for: NumPy, so a processor that computes on
+        the host needs no PyTorch, unless an image or video processor of it computes in PyTorch
+        (Transformers' torchvision backend, whose bfloat16 pixels NumPy cannot hold), which
+        installs PyTorch itself and whose tensors `_from_arrays` reads."""
         from transformers.image_processing_backends import TorchvisionBackend
 
         parts = vars(self._media_reference).values()
         return "pt" if any(isinstance(part, TorchvisionBackend) for part in parts) else "np"
 
     def _from_arrays(self, values: Mapping[str, object]) -> ModelInputs:
-        """A media processor's fields on the host: NumPy arrays as they are, a framework's tensors read
-        through DLPack, and a bfloat16 field (Llama 4's pixels) widened to float32, which is exact. A
-        field neither is refused naming the processor."""
-        arrays = {}
+        """A media processor's fields on the host, in their own dtypes: NumPy arrays as they are, and
+        the tensors of a processor that computes in PyTorch (`_media_tensors`) read by PyTorch, which
+        that processor installs, a bfloat16 one (Llama 4's pixels) widened to float32, which is exact.
+        A field neither is refused naming the processor."""
+        arrays: dict[str, np.ndarray] = {}
         for name, value in values.items():
             if isinstance(value, np.ndarray):
-                array = value
-            elif isinstance(value, _DLPack):
-                array = np.asarray(jax.dlpack.from_dlpack(value))
-            else:
+                arrays[name] = value
+                continue
+            if self._media_tensors != "pt":
                 raise TypeError(f"{type(self._media_reference).__name__} returned {name!r} as "
-                                f"{type(value).__name__}, which is no array")
-            arrays[name] = array.astype(np.float32) if array.dtype == ml_dtypes.bfloat16 else array
+                                f"{type(value).__name__}, not the NumPy array Dew asks it for")
+            import torch
+
+            if not isinstance(value, torch.Tensor):
+                raise TypeError(f"{type(self._media_reference).__name__} returned {name!r} as "
+                                f"{type(value).__name__}, which is no tensor")
+            arrays[name] = (value.float() if value.dtype == torch.bfloat16 else value).numpy()
         return self.from_hf(arrays)
 
     def from_hf(self, values: Mapping[str, object]) -> ModelInputs:

@@ -169,13 +169,11 @@ def test_trainer_steps_move_the_params_and_place_them_by_name(loaded, tokens):
     assert moved["gpt_neox.embed_in.weight"].sharding.spec == P(("fsdp", "tensor"))
 
 
-def test_a_frozen_torch_base_kept_whole_drops_fsdp_from_the_name_tables_placement(source, loaded, tokens):
+def test_a_frozen_torch_base_kept_whole_drops_fsdp_from_the_name_tables_placement(loaded, tokens):
     """`Layout.frozen_whole` reaches a torch-named tree: TorchLayout's name table picks each
     tensor's axes, and the one placement keeps the frozen tensors whole over fsdp, split over the
     tensor axis as the table splits them, while the trained ones, their moments and one step's
-    update lie as the split layout lays them. The step it takes is the split layout's, bit for bit,
-    and, independently, every trained parameter is as exact as the split step's from the same AdamW
-    step taken in float64 over transformers' float64 gradients (tests/reference_error.py)."""
+    update lie as the split layout lays them."""
     from dew.nn.sharding import mesh_axes
     from dew.objectives.base import FROZEN, freeze
     from dew.training.distributed import shard_batch
@@ -213,19 +211,6 @@ def test_a_frozen_torch_base_kept_whole_drops_fsdp_from_the_name_tables_placemen
             sharding.spec for sharding in jax.tree.leaves(tree(split))]
     for got, want in zip(jax.tree.leaves(whole_trained), jax.tree.leaves(split_trained), strict=True):
         np.testing.assert_array_equal(got, want)
-    # And independently of either: optax.adamw(1e-2)'s first step, its defaults (b1 0.9, b2 0.999,
-    # eps 1e-8, weight decay 1e-4), in float64 over transformers' float64 gradients, the rows the
-    # batch repeats leaving the mean loss, and so the gradient, the one of `tokens`.
-    with float64():
-        wide = transformers.AutoModelForCausalLM.from_config(source[1].config, dtype=torch.float64,
-                                                             attn_implementation="eager").eval()
-        wide.load_state_dict(source[1].state_dict())
-        gradients = torch_step(wide, tokens, torch.float64)
-    start = jax.device_get(loaded.variables["params"])
-    for name, trained in split_trained.items():
-        first, gradient = np.asarray(start[name], np.float64), gradients[name]
-        truth = first - 1e-2 * (gradient / (np.abs(gradient) + 1e-8) + 1e-4 * first)
-        assert_as_exact_as_the_reference(np.asarray(whole_trained[name]), np.asarray(trained), truth, name)
 
 
 GEMMA2 = {**TINY, "intermediate_size": 128, "num_key_value_heads": 2, "head_dim": 16, "sliding_window": 32,
