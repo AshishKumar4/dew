@@ -1857,26 +1857,64 @@ def _loosened(checkout: Path, commit: str, parent: str, mine: dict, theirs: dict
             yield (name, "count"), f"raises {name}'s count"
 
 
-def _duplicated(checkout: Path, parents: list[str], mine: dict) -> Iterator[str]:
-    """A merge keeping one entry its parents' common ancestor held under two names, its parents having
-    renamed it apart: each name's count is that one entry's allowance, so together they hold it twice."""
-    ancestor = _git(checkout, "merge-base", "--octopus", *parents).strip()
-    held = _inventory_at(checkout, ancestor) if ancestor else None
-    if not held:
-        return
-    origins: dict[str, list[str]] = {}
-    for parent in parents:
-        changes = _git(checkout, "diff", "--name-status", "-M", ancestor, parent, "--", "tests", "tools")
-        for change in changes.splitlines():
-            status, *paths = change.split("\t")
-            if status.startswith("R") and len(paths) == 2 and paths[1] in mine["files"]:
-                origins.setdefault(paths[0], [])
-                if paths[1] not in origins[paths[0]]:
-                    origins[paths[0]].append(paths[1])
-    for origin, names in sorted(origins.items()):
-        kept = names + ([origin] if origin in mine["files"] else [])
-        if origin in held["files"] and len(kept) > 1:
-            yield f"keeps {origin}'s entry as {' and '.join(kept)}, its parents having renamed it apart"
+def _renamed(checkout: Path, parent: str, commit: str) -> dict[str, str]:
+    """The files `commit` renamed from `parent`'s, by their new names."""
+    renamed = {}
+    changes = _git(checkout, "diff", "--name-status", "-M", parent, commit, "--", "tests", "tools")
+    for change in changes.splitlines():
+        status, *paths = change.split("\t")
+        if status.startswith("R") and len(paths) == 2:
+            renamed[paths[1]] = paths[0]
+    return renamed
+
+
+def _lineage(checkout: Path, walk: list[tuple[str, list[str]]]) -> dict[str, dict[str, frozenset[str]]]:
+    """Each walked commit's inventoried files, each to the entries it descends from (a commit and a name,
+    where an entry was first made), composed commit by commit along `walk`, parents before children, so a
+    rename stays traced however its file is edited after."""
+    lineage: dict[str, dict[str, frozenset[str]]] = {}
+    for commit, parents in walk:
+        mine = _inventory_at(checkout, commit)
+        if mine is None:
+            lineage[commit] = {}
+            continue
+        traced = [(lineage[parent], _renamed(checkout, parent, commit))
+                  for parent in parents if parent in lineage]
+        lineage[commit] = {}
+        for name in mine["files"]:
+            inherited = [held.get(renamed.get(name, name), frozenset()) for held, renamed in traced]
+            lineage[commit][name] = frozenset().union(*inherited) or frozenset({f"{commit}:{name}"})
+    return lineage
+
+
+def _merge_loosens(name: str, per_parent: list[dict]) -> str | None:
+    """How a commit loosens `name` (a file, or "empty_by") against all its parents at once (`_loosened`
+    against each, `per_parent`), or None. Where a parent holds the entry, some parent holding it must
+    keep it whole, its count and its date both; where none does, one must allow its addition."""
+    keys = [key for key in ((name, "count"), (name, "date")) if any(key in found for found in per_parent)]
+    if name == "empty_by":
+        return per_parent[0][keys[0]] if keys and all(keys[0] in found for found in per_parent) else None
+    holding = [found for found in per_parent if (name, "held") in found]
+    if holding:
+        if any(not any(key in found for key in keys) for found in holding):
+            return None
+        return next(found[key] for found in holding for key in keys if key in found)
+    if all((name, "count") in found for found in per_parent):
+        return per_parent[0][(name, "count")]
+    return None
+
+
+def _duplicated(lineage: dict[str, frozenset[str]]) -> Iterator[str]:
+    """A merge keeping one entry under two names (its parents having renamed it apart): each name's
+    count is that one entry's allowance, so together they hold it twice."""
+    by_origin: dict[str, list[str]] = {}
+    for name, origins in sorted(lineage.items()):
+        for origin in origins:
+            by_origin.setdefault(origin, []).append(name)
+    for origin, names in sorted(by_origin.items()):
+        if len(names) > 1:
+            yield (f"keeps the entry made as {origin.split(':', 1)[1]} as {' and '.join(names)}, its parents "
+                   f"having renamed it apart")
 
 
 def ratchet(checkout: Path, base: str | None = None) -> Iterator[Finding]:
@@ -1884,10 +1922,10 @@ def ratchet(checkout: Path, base: str | None = None) -> Iterator[Finding]:
     CI), and every commit in HEAD's history whose inventory differs from a parent's, merges included
     (`--full-history`, no simplification), to that parent's (`_loosened`), from the commit that first
     made it on, which has no parent's to keep, and no commit removes it once made. A merge is held to
-    its loosest parent, file by file: it raises or adds a file only past every parent's count, each
-    parent's own change judged at its own commit, so a merge that brings a count another branch raised
-    is no loosening of its own; it moves a date later past every parent that holds the entry; and it
-    keeps one entry its parents' common ancestor held only once, however its parents renamed it. Only a
+    its loosest parent, file by file (`_merge_loosens`): a parent holding the entry keeps it whole, its
+    count and date, or one allows its addition, each parent's own change judged at its own commit, so a
+    merge that brings a count another branch raised is no loosening of its own; and it keeps one entry
+    only once, however its parents renamed it (`_lineage`). Only a
     reading of the rule HEAD's own history changed since `base` authorizes a count against it.
     `--ratchet` runs it (CI's lint job, on its whole history); a shallow
     checkout, or one without git, cannot hold the inventory, and it says so rather than passing."""
@@ -1898,6 +1936,8 @@ def ratchet(checkout: Path, base: str | None = None) -> Iterator[Finding]:
                     "--", INVENTORY).splitlines()
         before = [f"^{parent}" for parent in (made[0].split() if made else [])]
         listed = _git(checkout, "rev-list", "--full-history", "--parents", "HEAD", *before, "--", INVENTORY)
+        oldest_first = _git(checkout, "rev-list", "--full-history", "--topo-order", "--reverse", "--parents",
+                            "HEAD", *before, "--", INVENTORY)
         merged = _git(checkout, "merge-base", "HEAD", base).strip() if base else None
         # The commits HEAD's history adds to the base's: only their rereadings of the rule authorize.
         fresh = set(_git(checkout, "rev-list", "HEAD", f"^{merged}").split()) if merged else None
@@ -1914,6 +1954,8 @@ def ratchet(checkout: Path, base: str | None = None) -> Iterator[Finding]:
     # Each commit against its parents first, so the counts a change of the rule's reading reached
     # (`grants`) hold HEAD against its base too.
     walked, grants = [], {}
+    lineage = _lineage(checkout, [(line.split()[0], line.split()[1:])
+                                  for line in filter(None, oldest_first.splitlines())])
     for line in filter(None, listed.splitlines()):
         commit, *parents = line.split()
         mine = _inventory_at(checkout, commit)
@@ -1936,22 +1978,13 @@ def ratchet(checkout: Path, base: str | None = None) -> Iterator[Finding]:
             continue
         against = ("its parent " if len(loosened) == 1 else "every parent, ") + ", ".join(
             parent[:9] for parent, _ in loosened)
-        keys = {key for _, found in loosened for key in found}
-        for key in sorted(keys):
-            if key[1] == "count":
-                hit = all(key in found for _, found in loosened)
-            elif key[1] == "date":
-                holding = [found for _, found in loosened
-                           if (key[0], "held") in found or key[0] == "empty_by"]
-                hit = bool(holding) and all(key in found for found in holding)
-            else:
-                continue
-            if hit:
-                why = next(found[key] for _, found in loosened if key in found)
+        for name in sorted({key[0] for _, found in loosened for key in found if key[1] != "held"}):
+            why = _merge_loosens(name, [found for _, found in loosened])
+            if why:
                 walked.append(Finding(INVENTORY, 1, 1, "SLOP020", f"{commit[:9]} against {against} {why}"))
         if len(loosened) > 1 and mine is not None:
             walked += [Finding(INVENTORY, 1, 1, "SLOP020", f"{commit[:9]} {why}")
-                       for why in _duplicated(checkout, [parent for parent, _ in loosened], mine)]
+                       for why in _duplicated(lineage.get(commit, {}))]
     if merged is not None:
         kept = _inventory_at(checkout, merged)
         if kept is not None and head is None:
