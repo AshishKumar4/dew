@@ -27,8 +27,10 @@ from typing import (
     Generic,
     Literal,
     NamedTuple,
+    NotRequired,
     Protocol,
     Self,
+    TypedDict,
     runtime_checkable,
 )
 
@@ -156,8 +158,27 @@ class Recorder:
 
 
 RECORD = "record"
-"""The metrics key under which a recording step (`Step.record`, `Trainer(record=True)`) returns what its
-loss's `Step.sample` and `Step.boundary` calls produced (`Witness.report`)."""
+"""The metrics key under which a recording step (`Trainer(record=True)`) returns what its evaluations'
+`Step.sample` and `Step.boundary` calls produced (`Recorded`)."""
+
+
+class Evaluated(TypedDict):
+    """One evaluation's record (`Witness.report`): each kept value by name, `[rows, ...]`, the places
+    of its rows (`Step.example_index`), and the trainer column the loss saw (`EXAMPLE_ROWS`), where
+    its batch carried one."""
+    values: dict[str, jax.Array]
+    example_index: jax.Array
+    column: NotRequired[jax.Array]
+
+
+class Recorded(TypedDict):
+    """A recording step's record (`transaction.recorded`): its evaluations' values by name and places
+    stacked on a first axis, whether each row's place is the one its slot and column give it
+    (`column_ok`), and which evaluations ran (`evaluated`)."""
+    values: dict[str, jax.Array]
+    example_index: jax.Array
+    column_ok: jax.Array
+    evaluated: jax.Array
 
 
 @dataclass(eq=False)
@@ -177,17 +198,12 @@ class Witness:
                              "a recording holds one value a name")
         self.values[name], self.kinds[name] = value, kind
 
-    def report(self, batch: Batch, examples: jax.Array | None) -> dict[str, object]:
-        """The evaluation's record: every kept value by name, the places of the batch's rows
-        (`Step.example_index`), and whether each row's place is its trainer column's (`EXAMPLE_ROWS`)
-        plus one offset, the step's place in its window, which a row the step and the batch place
-        apart fails; True where the batch carries no column."""
-        rows = jax.tree.leaves(batch)[0].shape[0]
-        index = jnp.arange(rows, dtype=jnp.int32) if examples is None else examples
-        column = batch.get(EXAMPLE_ROWS)
-        offset = index if column is None else index - column.astype(jnp.int32)
-        agreed = jnp.min(offset) == jnp.max(offset) if column is not None else jnp.ones((), bool)
-        return {"values": dict(self.values), "example_index": index, "column_ok": agreed}
+    def report(self, batch: Batch, examples: jax.Array) -> Evaluated:
+        """The evaluation's record (`Evaluated`) of the batch the loss saw and its rows' places."""
+        evaluated = Evaluated(values=dict(self.values), example_index=examples)
+        if EXAMPLE_ROWS in batch:
+            evaluated["column"] = jnp.asarray(batch[EXAMPLE_ROWS], jnp.int32)
+        return evaluated
 
 
 EXAMPLE_STREAM = 0x6578616D
@@ -391,6 +407,10 @@ class Aux(Generic[Effects]):
     the clip does nothing."""
     effects: Effects | None = None
     """Additive observations that `Objective.apply_effects` applies once per optimizer commit."""
+    record: Evaluated | Recorded | None = None
+    """What a recording evaluation's `Step.sample` and `Step.boundary` calls produced (`Step.record`),
+    which `Objective._loss` fills (`Evaluated`) and a transaction stacks with its replays' (`Recorded`);
+    None otherwise."""
 
 
 def _has_aux(loss: Loss | tuple[Loss, Aux[Effects]]) -> TypeIs[tuple[Loss, Aux[Effects]]]:
@@ -1127,7 +1147,8 @@ class Objective(ABC, Generic[Loss, Effects]):
         loss = (self.validation_loss if validation else self.loss)(variables, batch, step)
         stats, aux = loss if _has_aux(loss) else (loss, Aux(metrics={}))
         if witness is not None:
-            aux = replace(aux, metrics={**aux.metrics, RECORD: witness.report(marked, step.example_index)})
+            assert step.example_index is not None, "a recording step is a run's, which places its rows"
+            aux = replace(aux, record=witness.report(marked, step.example_index))
         return stats, aux
 
     def reduce_loss(self, stats: Loss) -> tuple[jax.Array, jax.Array]:

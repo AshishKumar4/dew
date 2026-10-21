@@ -24,7 +24,7 @@ import time
 import types
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from itertools import accumulate, pairwise
-from typing import TYPE_CHECKING, Generic, Literal, Protocol
+from typing import TYPE_CHECKING, Generic, Literal, Protocol, cast
 
 import jax
 import jax.numpy as jnp
@@ -77,6 +77,7 @@ from dew.objectives.base import (
     Metric,
     Objective,
     Ratio,
+    Recorded,
     Shown,
     Step,
     TrainingScalar,
@@ -179,7 +180,7 @@ the loss and the objective's report out."""
 
 CompiledStep = Callable[
     [TrainState, Batch],
-    tuple[TrainState, jax.Array, dict[str, jax.Array], jax.Array, jax.Array, Committed | None]]
+    tuple[TrainState, jax.Array, dict[str, jax.Array | Recorded], jax.Array, jax.Array, Committed | None]]
 """A call returns the stepped state, the scalar loss, the objective's whole
 report (`Aux.metrics`), whether that loss was finite, and whether the
 step's microbatches were accepted, and the transaction's commit telemetry (None for a custom step)."""
@@ -479,7 +480,10 @@ class Trainer(Generic[Loss, Effects]):
         self.step = step
         self.rollout = rollout
         self.tune_kernels = tune_kernels
-        self.record, self.records = record, []
+        if record and step is not None:
+            raise ValueError("a custom step builds its own Steps, which Trainer(record=True) cannot reach: "
+                             "build them with Step(record=True)")
+        self.record, self.records = record, cast("list[Recorded]", [])
         self.profile = profile
         self.lower_for = lower_for
         # Set by `compile`, for the batch shape it was called with. A ramped run has one value per stage;

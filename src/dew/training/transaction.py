@@ -35,7 +35,9 @@ from dew.objectives.base import (
     RECORD,
     Aux,
     Batch,
+    Evaluated,
     Ratio,
+    Recorded,
     Step,
     Variables,
     merge,
@@ -118,21 +120,25 @@ def outcome(current: TrainState, advanced: TrainState, loss: jax.Array, aux: Aux
     `batch`, wherever it ran: the advanced state, its step counting `stepped`, the loss, the metrics
     with the batch's counts, and whether the loss is finite, the microbatch accepted and the window
     committed."""
-    return (dataclasses.replace(advanced, step=current.step + stepped), loss,
-            {**aux.metrics, **step_counts(batch)}, jnp.isfinite(loss), advanced.microstep > current.microstep,
-            committed)
+    metrics: dict[str, jax.Array | Recorded] = {**aux.metrics, **step_counts(batch)}
+    if aux.record is not None:
+        metrics[RECORD] = aux.record
+    return (dataclasses.replace(advanced, step=current.step + stepped), loss, metrics, jnp.isfinite(loss),
+            advanced.microstep > current.microstep, committed)
 
 
-def recorded(first, replays, replayed) -> dict:
-    """A recording step's record (`RECORD`): each evaluation's values by name, its rows' places and its
-    column check (`Witness.report`), stacked on a first axis, the attempt's own evaluation first and then
-    the window's other microbatches as the commit replayed them, each in its slot; `evaluated` says which
-    ran, the replays only where the commit replayed its window."""
-    if replays is None:
-        return {**jax.tree.map(lambda leaf: leaf[None], first), "evaluated": jnp.ones((1,), bool)}
-    stacked = jax.tree.map(lambda leaf, more: jnp.concatenate([leaf[None], more]), first, replays)
-    count = jax.tree.leaves(replays)[0].shape[0]
-    return {**stacked, "evaluated": jnp.concatenate([jnp.ones((1,), bool), jnp.full((count,), replayed)])}
+def recorded(evaluations: list[tuple[Evaluated, jax.Array]], ran: jax.Array) -> Recorded:
+    """A recording step's record (`Recorded`) of its `evaluations`, each with the places its slot and
+    column give its rows (`example_places`), stacked on a first axis: the attempt's own evaluation and
+    then the window's other microbatches as the commit replayed them, each in its slot, `ran` saying
+    which ran. `column_ok` holds where each row's place is its expected one, so rows a layout places
+    apart from their column, or a microbatch read under another's places, fail it."""
+    values = jax.tree.map(lambda *leaves: jnp.stack(leaves),
+                          *[evaluated["values"] for evaluated, _ in evaluations])
+    index = jnp.stack([evaluated["example_index"] for evaluated, _ in evaluations])
+    expected = jnp.stack([places for _, places in evaluations])
+    return Recorded(values=values, example_index=index, column_ok=jnp.all(index == expected, axis=1),
+                    evaluated=ran)
 
 
 def with_ema(params: Variables, ema: Variables | None) -> Variables | None:
@@ -464,6 +470,11 @@ class Transaction:
     def examples(self, state, slot, batch, part=None, rejected=0) -> dict:
         return example_fields(state, slot, self.split, batch, self.size, part, rejected)
 
+    def _places(self, slot, batch, part) -> jax.Array:
+        """The places the window's slot `slot` and the batch's column give its rows (`example_places`),
+        which a recording evaluation's own are held to (`recorded`)."""
+        return example_places(slot, self.split, rows_of(batch), batch.get(EXAMPLE_ROWS), part)
+
     def read(self, variables, compute):
         """The variables a step's forward reads: the narrow copies in place of
         their parameters (`forward_variables`), projected as the step's update
@@ -675,10 +686,10 @@ class Transaction:
             # widens it as it pools it, so the window sums in fp32.
             pending = prepare(state, realized.stats, realized.aux, loss, gradient)
 
-            # A replay's record, each of the window's other microbatches in its slot (`recorded`).
-            witnessed = realized.aux.metrics.get(RECORD)
-            unreplayed = None if witnessed is None else jax.tree.map(
-                lambda leaf: jnp.zeros((self.size - 1, *leaf.shape), leaf.dtype), witnessed)
+            # The record of each of the window's other microbatches the commit replays, in its slot.
+            own = realized.aux.record
+            unreplayed = None if own is None else [jax.tree.map(jnp.zeros_like, (own, self._places(
+                state, state.microstep % self.size, batch, part))) for _ in range(self.size - 1)]
 
             def replay(_):
                 cot = pooled(pending.pooled, realized.stats, factor)
@@ -687,8 +698,11 @@ class Transaction:
                     accumulated, kept = carried
                     replayed, records, step_info = self.replay_input(state, pending.fill, index)
                     realized = realize(replayed, records, step_info)
-                    kept = kept if kept is None else jax.tree.map(
-                        lambda held, leaf: held.at[index].set(leaf), kept, realized.aux.metrics[RECORD])
+                    if kept is not None:
+                        attempt = state.accumulation.attempts[index]
+                        evaluated = (realized.aux.record, self._places(index, records, attempt % self.split))
+                        kept = [jax.tree.map(lambda held, new, slot=slot: jnp.where(slot == index, new, held),
+                                             held, evaluated) for slot, held in enumerate(kept)]
                     return add(accumulated, realized.pullback(cot), factor), kept
                 if host:
                     carried = (combined, unreplayed)
@@ -699,18 +713,19 @@ class Transaction:
 
             replayed = jnp.zeros((), bool)
             if state.accumulation is not None and not self.shared:
+                replayed = pending.replay_required
                 if host:
-                    replayed = pending.replay_required
-                    gradient, replays = (replay(None) if bool(replayed) else (pending.gradient, unreplayed))
+                    gradient, replays = replay(None) if bool(replayed) else (pending.gradient, unreplayed)
                 else:
-                    replayed = pending.replay_required
                     gradient, replays = jax.lax.cond(
                         replayed, replay, lambda _: (pending.gradient, unreplayed), None)
             else:
-                gradient, replays = pending.gradient, None
-            if witnessed is not None:
-                realized = dataclasses.replace(realized, aux=dataclasses.replace(realized.aux, metrics={
-                    **realized.aux.metrics, RECORD: recorded(witnessed, replays, replayed)}))
+                gradient, replays = pending.gradient, []
+            if own is not None:
+                evaluations = [(own, self._places(state.microstep % self.size, batch, part)), *replays]
+                ran = jnp.concatenate([jnp.ones((1,), bool), jnp.full((len(replays),), replayed)])
+                realized = dataclasses.replace(realized, aux=dataclasses.replace(
+                    realized.aux, record=recorded(evaluations, ran)))
             if not host:
                 # The commit compiles as the host-master step's does, over values
                 # already computed: without the barrier XLA fuses the gradient's
