@@ -1116,7 +1116,7 @@ class Stamped:
 def test_a_step_reading_its_index_in_a_cache_after_a_memory_read_step_reads_the_source_position(tmp_path):
     """A store missing some inputs, a step a memory read runs over it, a shuffle, then a step that
     reads its record's index and a cache: the cached step reads each record's place in the store,
-    as the uncached one does."""
+    as the uncached one does, in each of two passes."""
     from dew.data.compile import compile
     from dew.data.dataset import DataPartition, Loading
     from dew.data.pipeline import Pipeline
@@ -1126,15 +1126,16 @@ def test_a_step_reading_its_index_in_a_cache_after_a_memory_read_step_reads_the_
 
     def batches(cache):
         stepped = Pipeline(source).map(Same()).shuffle(0).map_with_index(Stamped(), identity="stamped@1")
-        chain = (stepped if cache is None else stepped.cache(cache)).repeat(1).batch(1)
+        chain = (stepped if cache is None else stepped.cache(cache)).repeat(2).batch(1)
         reader = compile(chain, read="memory", loading=loading).train(DataPartition())
         try:
             return [(int(batch["id"][0]), int(batch["at"][0])) for batch in reader]
         finally:
             reader.close()
 
+    # Two passes, each of every record the store holds.
     expected = batches(None)
-    assert sorted(expected) == [(index, index) for index in range(8) if index not in (0, 4)]
+    assert sorted(expected) == sorted(2 * [(index, index) for index in range(8) if index not in (0, 4)])
     assert batches(str(tmp_path / "cache")) == expected
 
 
