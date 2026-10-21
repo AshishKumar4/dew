@@ -267,27 +267,29 @@ class AdversarialDistillationObjective(FlowDistillationObjective):
         return grids
 
     def loss(self, variables, batch, step: Step):
-        encode_key, drop_key, time_key, noise_key, renoise_key = jax.random.split(step.key, 5)
+        # Each example's times and noises are its own (`Step.sample`); the posterior draw is the attempt's.
+        encode_key, drop_key, _, _, _ = jax.random.split(step.key, 5)
         samples = self.clean_samples(variables, batch, encode_key)
         count = samples.shape[0]
         schedule = self.process.schedule
         assert self.process.prediction is not None
-        conditions = self._dropped(*self._conditions(variables, batch, drop_key), batch, drop_key)
-        indices = jax.random.randint(time_key, (count,), 0, len(self.student_times))
+        conditions = self._dropped(*self._conditions(variables, batch, drop_key), batch, step)
+        steps = len(self.student_times)
+        indices = step.sample("student times", lambda key: jax.random.randint(key, (), 0, steps), rows=count)
         t = jnp.asarray(self.student_times)[indices]
         # Float32 draws, as the step's others are, at any precision.
-        noise = jax.random.normal(noise_key, samples.shape, dtype=jnp.float32)
+        noise = step.sample("noise", jax.random.normal, *samples.shape[1:], dtype=jnp.float32, rows=count)
         noisy, _, _ = self.process.prediction.forward_diffusion(samples, noise,
                                                                  broadcast_rates(schedule, t, samples))
         student = self.process.denoiser(self.model, self.model_variables(variables), conditions,
                                         schedule=schedule)
         clean, _ = student(noisy, t)
 
-        level_key, renoise_noise = jax.random.split(renoise_key)
         mean, std = self.renoise_times
-        level = jax.nn.sigmoid(mean + std * jax.random.normal(level_key, (count,), dtype=jnp.float32))
+        level = jax.nn.sigmoid(mean + std * step.sample("renoise times", jax.random.normal, dtype=jnp.float32,
+                                                        rows=count))
         rates = broadcast_rates(schedule, level, samples)
-        renoise = jax.random.normal(renoise_noise, samples.shape, dtype=jnp.float32)
+        renoise = step.sample("renoise", jax.random.normal, *samples.shape[1:], dtype=jnp.float32, rows=count)
         teacher = jax.lax.stop_gradient(variables[TEACHER])
 
         def renoised(x):

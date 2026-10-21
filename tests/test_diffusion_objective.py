@@ -28,12 +28,12 @@ from dew.training import Trainer
 _DEFAULT_MAKE_OBJECTIVE_GUIDANCE = CFG(2.0)
 
 
-def make_objective(*, guidance: CFG | None = _DEFAULT_MAKE_OBJECTIVE_GUIDANCE):
+def make_objective(*, guidance: CFG | None = _DEFAULT_MAKE_OBJECTIVE_GUIDANCE, **fields):
     model = SimpleDiT(patch_size=4, emb_features=16, num_layers=1, num_heads=2, mlp_ratio=1)
     inputs = InputSpec(Field("image", (RES, RES, 3)),
                        {"textcontext": Condition(StubText.from_pretrained("stub"))})
     return DiffusionObjective(model, presets.EDM(P_mean=-0.4, P_std=1.0), inputs, steps=3, guidance=guidance,
-                              solver=Euler())
+                              solver=Euler(), **fields)
 
 
 def make_batch(count=8):
@@ -336,3 +336,42 @@ def test_guided_samples_use_bound_encoder_not_constructor_weights(conditional_mm
     expected = reconstructed.evaluate(variables, batch, step).images
     actual = objective.evaluate(variables, batch, step).images
     np.testing.assert_array_equal(actual, expected)
+
+
+def test_each_example_draws_its_own_times_noise_and_dropout_on_every_layout():
+    """A step's draws are each example's own (`Step.sample`): the batch whole on one device, its two
+    halves pooled in an accumulation window, and the batch read in two microbatches give every
+    example the same times, noise and dropped condition, and so the same noised input, target and
+    loss weight, bitwise, as the transaction places each microbatch's rows among the update's
+    examples (`example_places`). The model's dropout stays the attempt's (`Step.key`)."""
+    from dew.objectives.base import Recorder
+    from dew.training.distributed import microbatch
+    from dew.training.transaction import example_places
+
+    objective = make_objective(unconditional_prob=0.5)
+    params = objective.init(jax.random.PRNGKey(0))
+    batch = make_batch(8)
+    update = jax.random.key(7)
+
+    def taped(parts):
+        """The tape of the update's eight examples when the loss reads `parts`, (slot, split, rows) each."""
+        recorder = Recorder()
+        for slot, split, rows in parts:
+            index = example_places(slot, split, len(jax.tree.leaves(rows)[0]))
+            step = Step(jnp.asarray(0), jax.random.key(slot), None, example_key=update,
+                        example_index=index, recorder=recorder)
+            objective.loss(params, rows, step)
+        return recorder.tape(8)
+
+    halves = [jax.tree.map(lambda value, rows=rows: value[rows], batch) for rows in (slice(0, 4), slice(4, 8))]
+    microbatches = [microbatch(batch, jnp.asarray(part), 2) for part in range(2)]
+    whole = taped([(0, 1, batch)])
+    pooled = taped([(slot, 1, half) for slot, half in enumerate(halves)])
+    split = taped([(part, 2, rows) for part, rows in enumerate(microbatches)])
+    assert set(whole) == {"condition dropout", "times", "noise", "noised input", "target", "loss weights"}
+    for name in whole:
+        for layout in (pooled, split):
+            np.testing.assert_array_equal(np.asarray(layout[name]), np.asarray(whole[name]), err_msg=name)
+    # Both halves of the dropout draw occur: each example's draw is its own, not one for the batch.
+    assert 0 < int(np.sum(np.asarray(whole["condition dropout"]))) < 8
+    assert len({float(np.asarray(whole["times"])[row]) for row in range(8)}) == 8

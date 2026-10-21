@@ -16,9 +16,10 @@ from __future__ import annotations
 import enum
 import functools
 import math
+import zlib
 from abc import ABC, abstractmethod
 from collections.abc import Callable, Collection, Hashable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from typing import (
     TYPE_CHECKING,
     Any,
@@ -116,6 +117,37 @@ Loss = TypeVar("Loss", default=Ratio | jax.Array | float)
 Effects = TypeVar("Effects", default=None)
 
 
+@dataclass(eq=False)
+class Recorder:
+    """What a loss's `Step.sample` and `Step.boundary` calls produced, by name, each with the examples
+    (`Step.example_index`) its rows are: what one run records for others to replay (`Step.tape`). A
+    harness hands a step one and returns `values` from the same trace."""
+    values: dict[str, list[tuple[jax.Array, jax.Array]]] = field(default_factory=dict)
+
+    def record(self, name: str, examples: jax.Array, value: jax.Array) -> None:
+        self.values.setdefault(name, []).append((examples, value))
+
+    def tape(self, examples: int) -> dict[str, jax.Array]:
+        """Every recorded name's values placed at their examples, of `examples` in all: a `Step.tape`."""
+        def placed(records):
+            first = records[0][1]
+            tape = jnp.zeros((examples, *first.shape[1:]), first.dtype)
+            for index, value in records:
+                tape = tape.at[index].set(value)
+            return tape
+
+        return {name: placed(records) for name, records in self.values.items()}
+
+
+EXAMPLE_STREAM = 0x6578616D
+"""What a run folds its key with for its examples' draws (`Step.example_key`), apart from its attempts'."""
+
+
+def stream(name: str) -> int:
+    """The fold of a named draw (`Step.sample`): the same on every process and every run."""
+    return zlib.crc32(name.encode()) & 0x7FFFFFFF
+
+
 @struct.dataclass
 class Step:
     """What the trainer tells an objective about the current step.
@@ -124,7 +156,15 @@ class Step:
     step's batch is read in (`Trainer.compile`), which is what an objective's
     own schedules index by, however the trainer splits its batches. `key` is
     new for every attempt at a microbatch, and a replayed microbatch gets the
-    key of the attempt that first read it, so it draws the same randomness.
+    key of the attempt that first read it, so it draws the same randomness:
+    the key a model's own streams (dropout) take.
+
+    An example's draws are its own (`sample`): each row of the batch is an
+    example of the update (`example_index`), and its draws fold from the
+    update's key (`example_key`) and its place, so a step reads the same
+    noise, times and masks for an example however the batch is split, pooled,
+    sharded or resumed. A step built outside a run, with neither, reads its
+    rows as the examples 0, 1, ... under `key`.
     """
     step: jax.Array
     key: jax.Array
@@ -136,6 +176,58 @@ class Step:
     committed: jax.Array | None = None
     """The updates the run committed before this step's (`TrainState.updates`), or None for a
     step made outside a run (`updates`)."""
+    example_key: jax.Array | None = None
+    """The key every example of the update folds its draws from, the same for each microbatch the
+    update pools and each replay of one; None outside a run, where `key` is."""
+    example_index: jax.Array | None = None
+    """Each row's place among the update's examples, `[rows]` int32: its step's place in the window
+    times a step's rows, plus its row in the step's batch. None outside a run, where rows are 0, 1, ..."""
+    tape: Mapping[str, jax.Array] | None = None
+    """Values recorded by name, each indexed by example on its first axis, which `sample` and `boundary`
+    read in place of drawing or computing them (`Recorder.tape`)."""
+    recorder: Recorder | None = struct.field(pytree_node=False, default=None)
+    """Where `sample` and `boundary` record what they produce, or None."""
+
+    def examples(self, rows: int) -> jax.Array:
+        """The places among the update's examples of a batch's `rows` rows."""
+        if self.example_index is None:
+            return jnp.arange(rows, dtype=jnp.int32)
+        if self.example_index.shape != (rows,):
+            raise ValueError(f"this step's batch holds {self.example_index.shape[0]} examples, and a draw "
+                             f"asked for {rows} rows")
+        return self.example_index
+
+    def sample(self, name: str, draw: Callable[..., jax.Array], *shape: int, dtype=None,
+               rows: int) -> jax.Array:
+        """`draw(key, *shape, dtype=dtype)` for each of `rows` examples, under the example's own key
+        folded with `name` (`stream`): `[rows, *shape]`, the same values an example draws on any layout.
+        `dtype` is the draw's own, never a model's, so a float64 twin draws what the run drew; None
+        calls `draw(key, *shape)`, a draw that fixes its own. With a `tape` holding `name`, its rows for
+        these examples instead."""
+        examples = self.examples(rows)
+        if self.tape is not None and name in self.tape:
+            value = jnp.take(self.tape[name], examples, axis=0)
+        else:
+            key = jax.random.fold_in(self.key if self.example_key is None else self.example_key, stream(name))
+            def drawn(example):
+                example_key = jax.random.fold_in(key, example)
+                return draw(example_key, *shape) if dtype is None else draw(example_key, *shape, dtype=dtype)
+
+            value = jax.vmap(drawn)(examples)
+        if self.recorder is not None:
+            self.recorder.record(name, examples, value)
+        return value
+
+    def boundary(self, name: str, value: jax.Array) -> jax.Array:
+        """`value`, one row an example, where the model's computation starts from it (a noised input,
+        times, a mask, loss weights, a preprocessed target): a `tape` holding `name` replaces it with its
+        rows for these examples, at `value`'s dtype, and a `recorder` keeps it."""
+        examples = self.examples(value.shape[0])
+        if self.tape is not None and name in self.tape:
+            value = jnp.take(self.tape[name], examples, axis=0).astype(value.dtype)
+        if self.recorder is not None:
+            self.recorder.record(name, examples, value)
+        return value
 
     @property
     def updates(self) -> jax.Array:

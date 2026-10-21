@@ -733,12 +733,14 @@ class DiffusionObjective(Objective[Ratio]):
                                        unit_range(batch[self.inputs.sample.key]), batch[self.inputs.mask.key],
                                        jax.random.fold_in(key, 1))
 
-    def _dropped(self, given, blank, batch, key):
+    def _dropped(self, given, blank, batch, step: Step):
         """`given` with a drawn share of the batch's rows `blank`, classifier-free guidance's training
-        dropout."""
+        dropout, each example's own draw (`Step.sample`)."""
         count = batch[self.inputs.sample.key].shape[0]
         # A float32 draw, as the step's others are, at any precision.
-        dropped = jax.random.bernoulli(key, jnp.float32(self.unconditional_prob), (count,))
+        probability = jnp.float32(self.unconditional_prob)
+        dropped = step.sample("condition dropout", lambda key: jax.random.bernoulli(key, probability),
+                              rows=count)
         return jax.tree.map(lambda value, null: jnp.where(expand(dropped, value), null, value), given, blank)
 
     def _sampling_batch(self, batch):
@@ -749,19 +751,21 @@ class DiffusionObjective(Objective[Ratio]):
 
     def loss(self, variables, batch, step: Step):
         images = unit_range(batch[self.inputs.sample.key])
-        encode_key, drop_key, time_key, noise_key, dropout_key = jax.random.split(step.key, 5)
+        # The times, the noise and the dropped conditions are each example's own (`Step.sample`); the
+        # model's dropout, and the autoencoder's posterior draw, are the attempt's (`Step.key`).
+        encode_key, drop_key, _, _, dropout_key = jax.random.split(step.key, 5)
         given, blank = self._conditions(variables, batch, drop_key)
-        conditions = self._dropped(given, blank, batch, drop_key)
+        conditions = self._dropped(given, blank, batch, step)
         schedule = self.process.schedule
         count = images.shape[0]
-        t = schedule.sample_t(time_key, count)
+        t = step.sample("times", lambda key: schedule.sample_t(key, 1)[0], rows=count)
         end_to_end = None
         if self.end_to_end is not None:
             end_to_end = self._end_to_end_latents(variables, images, encode_key, step, batch)
             samples = end_to_end.samples
         else:
             samples = self.clean_samples(variables, batch, encode_key)
-        noise = jax.random.normal(noise_key, samples.shape, dtype=jnp.float32)
+        noise = step.sample("noise", jax.random.normal, *samples.shape[1:], dtype=jnp.float32, rows=count)
         # The times are drawn in float32 and read at the samples' precision,
         # so a float64 run interpolates in float64.
         t = t.astype(jnp.promote_types(samples.dtype, t.dtype))
@@ -771,8 +775,8 @@ class DiffusionObjective(Objective[Ratio]):
         targets = (None if self.alignment is None
                    else self.alignment.targets(variables[REPRESENTATION], images))
         losses, aligned = self._denoised(variables, self.model_variables(variables), samples, t, noise, call,
-                                         targets, batch)
-        weighted = losses * expand(self.process.weight(t), losses)
+                                         targets, batch, step)
+        weighted = losses * expand(step.boundary("loss weights", self.process.weight(t)), losses)
         if self.uncertainty is not None:
             head = {collection: variables[collection][UNCERTAINTY] for collection in ("params", "constants")}
             logvar = expand(self.uncertainty.apply(head, schedule.model_time(t)), losses)
@@ -795,7 +799,8 @@ class DiffusionObjective(Objective[Ratio]):
         latents = self.end_to_end.normalized(end_to_end.raw, variables[LATENT_STATS])
         frozen = jax.lax.stop_gradient(variables)
         _, through = self._denoised(frozen, self.model_variables(frozen), latents, t, noise,
-                                    {**given, "train": False}, targets, batch)
+                                    {**given, "train": False}, targets, batch,
+                                    Step(step.step, step.key, None))
         assert through is not None
         metrics.update(end_to_end.terms, autoencoder_alignment=through)
         autoencoder = end_to_end.regularizer + self.end_to_end.align_weight * through
@@ -803,13 +808,15 @@ class DiffusionObjective(Objective[Ratio]):
         updates = {LATENT_STATS: end_to_end.statistics} if step.training else None
         return Ratio(total, mass), Aux(metrics=metrics, variables=updates)
 
-    def _denoised(self, params, variables, samples, t, noise, call, targets, batch: Batch):
+    def _denoised(self, params, variables, samples, t, noise, call, targets, batch: Batch, step: Step):
         """The per-element denoising loss at `(t, noise)` and, under
         `alignment`, the REPA loss of the model's hidden tokens against the
-        representation's `targets`."""
+        representation's `targets`. The noised input and the target are where
+        the model's computation starts (`Step.boundary`)."""
         schedule = self.process.schedule
         rates = broadcast_rates(schedule, t, samples)
         noisy, c_in, target = self.process.prediction.forward_diffusion(samples, noise, rates)
+        noisy, target = step.boundary("noised input", noisy), step.boundary("target", target)
         inputs = (variables, noisy * c_in, schedule.model_time(t))
         aligned = None
         if self.alignment is None:
