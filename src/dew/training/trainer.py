@@ -103,6 +103,7 @@ from dew.telemetry.records import (
 from dew.training._lowering import Lowered
 from dew.training.display import TRAINER_SHOWN, TrainingDisplay, goodput
 from dew.training.distributed import (
+    PREFETCH_DEPTH,
     DevicePrefetchIterator,
     Layout,
     MeshSpec,
@@ -476,11 +477,9 @@ class Trainer(Generic[Loss, Effects]):
         self.tune_kernels = tune_kernels
         self.profile = profile
         self.lower_for = lower_for
-        # Set by `compile`, for the batch shape it was called with. A ramped
-        # run has one value per stage; `fit` keeps them beside each step. The
-        # program is the step as handed to XLA, before GSPMD partitions it,
-        # and the executable the step as compiled, whose memory analysis a
-        # benchmark reads.
+        # Set by `compile`, for the batch shape it was called with. A ramped run has one value per stage;
+        # `fit` keeps them beside each step. The program is the step as handed to XLA, before GSPMD partitions
+        # it, and the executable the step as compiled, whose memory analysis a benchmark reads.
         self.step_flops: StepFlops | None = None
         self.program: jax.stages.Lowered | None = None
         self.executable: jax.stages.Compiled | None = None
@@ -498,10 +497,9 @@ class Trainer(Generic[Loss, Effects]):
         self._display = TrainingDisplay()
         self._count_work = False
         self._refusal: str | None = None
-        # The fit ladder's rung beyond the objective's own head and remat: a
-        # step that fit only under XLA's default options keeps them for later
-        # compiles. A resumed run starts at its checkpoint's rung, and says so
-        # if its first compile has to climb past it (`_climb_to`).
+        # The fit ladder's rung beyond the objective's own head and remat: a step that fit only under XLA's
+        # default options keeps them for later compiles. A resumed run starts at its checkpoint's rung, and
+        # says so if its first compile has to climb past it (`_climb_to`).
         self._xla_defaults = False
         # Why this run's checkpoints describe no model to load, said once.
         self._unrecorded: str | None = None
@@ -509,10 +507,9 @@ class Trainer(Generic[Loss, Effects]):
         # last trace of `initial_state` saw them (`_boxed_axes`).
         self._boxed: dict[tuple[str, ...], LogicalAxes] | None = None
         self._resumed_rung: JSON = None
-        # The rung each newly met shape starts from, as the first compile found
-        # the objective: its modules, head tile, XLA option choice and record
-        # (`_at_base_rung`); then the rung each shape compiled at, by layout,
-        # and the rungs a resumed checkpoint recorded for its shapes.
+        # The rung each newly met shape starts from, as the first compile found the objective: its modules,
+        # head tile, XLA option choice and record (`_at_base_rung`); then the rung each shape compiled at, by
+        # layout, and the rungs a resumed checkpoint recorded for its shapes.
         self._base_rung: tuple[tuple[nn.Module, ...], tuple[int, int] | None, bool, dict[str, JSON]] | None
         self._base_rung = None
         self._shape_rungs: dict[str, JSON] = {}
@@ -528,6 +525,7 @@ class Trainer(Generic[Loss, Effects]):
         self._stage_starts: frozenset[int] = frozenset()
         # The training batch's device steps, which the compiled step runs (`Loader.device`).
         self._device: tuple[DeviceStep, ...] = ()
+        self._prefetch = PREFETCH_DEPTH
 
     @property
     def optimizer(self) -> optax.GradientTransformation:
@@ -939,10 +937,9 @@ class Trainer(Generic[Loss, Effects]):
 
     def _loss_shape(self, state: TrainState, batch: Batch):
         batch = self._model_shapes(batch)
-        # Shapes and dtypes only: a resident frozen leaf sits in another
-        # memory space than the moving ones, and the loss the realization
-        # runs reads a snapshot in one space. The step's key is drawn inside
-        # the trace, so an abstract state compiles a step as a placed one does.
+        # Shapes and dtypes only: a resident frozen leaf sits in another memory space than the moving ones,
+        # and the loss the realization runs reads a snapshot in one space. The step's key is drawn inside the
+        # trace, so an abstract state compiles a step as a placed one does.
         params = jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), state.variables)
 
         def loss(params, batch, microstep, key, step, ema):
@@ -1209,7 +1206,7 @@ class Trainer(Generic[Loss, Effects]):
         last = state.accumulation
         rebuilt = last is not None and not last.replays(prepared.accumulation)
         built = [(prepared.compute, state.compute), (prepared.accumulation, None if rebuilt else last)]
-        held = prefetched_bytes(batch, placement) + placed_bytes(
+        held = prefetched_bytes(batch, placement, self._prefetch) + placed_bytes(
             [field for field, kept in built if kept is None and field is not None])
         jitted = self._jitted(shapes, copies, shardings, placement, replicated, split)
         part = jax.ShapeDtypeStruct((), jnp.int32, sharding=replicated)
@@ -1367,6 +1364,7 @@ class Trainer(Generic[Loss, Effects]):
         restore_best: bool = False,
         state: TrainState | None = None,
         observe: Observe | None = None,
+        device_prefetch: int = PREFETCH_DEPTH,
     ) -> TrainState:
         """Train until the step or real-token cap is reached, resuming the latest checkpoint.
 
@@ -1412,7 +1410,8 @@ class Trainer(Generic[Loss, Effects]):
 
         Previews are generated only when `preview=True` and a tracker receives them;
         scalar reporting never triggers preview work. `observe` takes values of the
-        state at a cadence of its own while the run trains (`Observe`).
+        state at a cadence of its own while the run trains (`Observe`). `device_prefetch` training
+        batches are placed on the devices ahead of the step, which the step's memory plan holds room for.
 
         The process is readied first (`dew.training.runtime.ready_process`), as
         `prepare_process` readies it: a program that never called that gets Dew's
@@ -1424,7 +1423,7 @@ class Trainer(Generic[Loss, Effects]):
             raise ValueError("tokens= needs an objective that counts real tokens")
         ready_process()
         loader, validation = fitted(dataset, validation, objective=self.objective.data())
-        self._device = loader.device
+        self._device, self._prefetch = loader.device, device_prefetch
         if epochs is not None:
             steps = loader.epoch_steps(epochs, self.accumulation)
         count_compilation_cache()
@@ -1496,7 +1495,7 @@ class Trainer(Generic[Loss, Effects]):
             state = jax.device_put(initial, shardings)
             position = None
         run.last_checkpoint = time.perf_counter()
-        interval = Interval.resumed(run.stop_control, plan.tokens, last_saved=(
+        interval = Interval.resumed(run.stop_control, last_saved=(
             int(state.step) if checkpoints is not None and checkpoints.latest is not None else None))
         if self._opened(plan, run, interval, state, position,
                         resumed=initial is None and interval.last_saved is not None):
@@ -1517,10 +1516,9 @@ class Trainer(Generic[Loss, Effects]):
                           if capturing else contextlib.nullcontext())
             with step_scope:
                 with region("input.wait"):
-                    # The first read restores the stream's position and opens
-                    # its reader on the prefetch worker, and a stream that may
-                    # run out can on any read: a process whose read failed
-                    # stops its peers before they compile or step without it.
+                    # The first read restores the stream's position and opens its reader on the prefetch
+                    # worker, and a stream that may run out can on any read: a process whose read failed stops
+                    # its peers before they compile or step without it.
                     asked = time.perf_counter()
                     batch = run.read() if seen and run.endless else agreed("training read", run.read)
                     interval.waited += time.perf_counter() - asked
@@ -1688,8 +1686,9 @@ class Trainer(Generic[Loss, Effects]):
                     f"{plan.dataset.batch} records a step of {stream_identity(run.source)}"))
             run.endless = stream_endless(run.source)
             self._marked = marked(partition, self._counted_batch)
-            run.train = DevicePrefetchIterator(run.source, mesh, source_state=position, reads=run.reads,
-                                                prepare=self._marked if self.rollout is None else None)
+            prepare = self._marked if self.rollout is None else None
+            run.train = DevicePrefetchIterator(run.source, mesh, self._prefetch, source_state=position,
+                                               reads=run.reads, prepare=prepare)
             run.source = None  # Lifetime transferred to the prefetch worker.
 
         trained = [entry.module for entry in self.objective.program_key() if entry.trained]

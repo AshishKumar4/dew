@@ -2,7 +2,7 @@
 
 Each family's committed tiny config (tests/fixtures/hf/<name>/config.json, the fixture of fewest layers
 whose model_type is one of the family's, `fixtures`) is built in bf16 without weights and traced on a CPU
-within `generation.assumed(device)` for each of `DEVICES`: a training step's gradient, a
+within `generation.assumed(device)` for each of `audited()`: a training step's gradient, a
 64-token prefill, and one decode step on the dense cache and on a paged one. A bidirectional family
 (`causal` False) prefills through its causal view, as DiffusionGemma's encoder does, and decodes a canvas
 over that frozen prefix (`CausalSelfAttention._step_positions`); one whose layers keep a window on both
@@ -122,14 +122,16 @@ def published(config: dict) -> tuple[dict, bool]:
     return ({**config, "text_config": fixture} if nested else fixture), True
 
 
-DEVICES = ("sm80", "sm86", "sm89", "sm90", "sm100", "sm120", "v6e")
-"""The devices the report traces each family on (`generation.assumed`): every CUDA generation Dew's
-kernels take, Blackwell's datacenter part among them, and a TPU."""
-
-
 def audited() -> tuple[str, ...]:
-    """The devices the report audits (`DEVICES`)."""
-    return DEVICES
+    """The devices the report traces each family on (`generation.assumed`): every CUDA generation of
+    `generation.TARGETS` Dew's kernels take (from `generation.BF16_GPU`, `triton_runs`), then Blackwell's
+    datacenter part (sm100), while the targets do not list it, and a TPU (v6e)."""
+    from dew.nn.kernels import generation
+
+    taken = tuple(name for name in generation.TARGETS
+                  if (capability := generation.capability(name)) is not None
+                  and 10 * capability[0] + capability[1] >= generation.BF16_GPU)
+    return (*taken, *(name for name in ("sm100", "v6e") if name not in taken))
 
 
 LAYOUT_GAPS = {"mla": "ledger 830", "kpool_sparse_attention": "ledger 830",
@@ -167,15 +169,15 @@ def _supports(route) -> str | None:
 
 def verdict(route) -> str:
     """'kernel', 'gap: <row>', 'inherent', 'unclassified' or 'undeclared' (see the module docstring)."""
-    from dew.nn.kernels.generation import UNCLASSIFIED
+    from dew.nn.kernels.generation import INHERENT, UNCLASSIFIED
 
     if route.kernel == route.preferred:
         return "kernel"
     if route.refusal is not None and route.refusal.code == UNCLASSIFIED:
         return "unclassified"
     row = _supports(route)
-    if row == "inherent":
-        return "inherent"
+    if row == INHERENT:
+        return INHERENT
     return f"gap: {row}" if row else "undeclared"
 
 
