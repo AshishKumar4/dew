@@ -100,6 +100,8 @@ The kernel direction (approved 2026-10-19; kernel design 2026-10-20): each case 
 - Add language and scored quality filters with recorded models and thresholds. Existing length, image-size and aspect filters remain the simple predicates. [202]
 - Add a public `schedule([(dataset, tokens), ...])` on the committed-token clock. Step-based phases exist; named mixture draws are already stable. Keep schedule member state keyed by member identity. [216]
 - Translate per-share streamed, filtered and packed positions across host counts without changing their order. Global record-count positions already support host-count changes. [722]
+- Spread a filtered read across worker processes so none starves, and have a read that can never yield a row raise rather than spin. [883]
+- Select holdouts over a generation by input position, or refuse them above the published store. [884]
 - Fuse adjacent per-record stages without reordering them. [723]
 - Measure loader defaults against step time; memory-sized worker selection alone does not tune the training pipeline. [724]
 - Qualify NUMA-local data workers and memory on multi-socket GPU hosts; retain affinity only where measured. Add host-sized offline IO-thread and CPU-process stages with bounded backpressure through the existing publication path. Current publication drains the chain's own workers and read threads, writes shards serially and uploads cache shards on its writer pool.
