@@ -5,7 +5,7 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from functools import cached_property
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 import numpy as np
 
@@ -16,12 +16,16 @@ from .base import Read, ShardManifest, _indexed_manifest
 from .codec import fingerprint
 
 
-class ArrowTable(Protocol):
-    def to_pylist(self) -> list[Batch]: ...
+@runtime_checkable
+class DataFrame(Protocol):
+    """A table that hands itself over through the dataframe interchange protocol: a pandas or
+    polars DataFrame, or an Arrow table."""
+
+    def __dataframe__(self, nan_as_null: bool = False, allow_copy: bool = True) -> object: ...
 
 
 class SparkFrame(Protocol):
-    def toArrow(self) -> ArrowTable: ...
+    def toArrow(self) -> DataFrame: ...
 
 
 def _record(value: object) -> Batch | bytes | None:
@@ -30,6 +34,16 @@ def _record(value: object) -> Batch | bytes | None:
     if isinstance(value, Mapping) and all(isinstance(key, str) for key in value):
         return value
     raise TypeError(f"source feature record must have named fields or bytes, got {type(value).__name__}")
+
+
+def _table_records(table: DataFrame) -> list[Batch]:
+    """A table's rows as records of its columns, through Arrow's interchange reader."""
+    from pyarrow.interchange import from_dataframe
+
+    rows = from_dataframe(table, allow_copy=True).to_pylist()
+    for row in rows[:1]:
+        _record(row)
+    return rows
 
 
 @dataclass(frozen=True)
@@ -50,9 +64,10 @@ class _Columns:
 
 @dataclass(frozen=True)
 class Memory(Dataset):
-    """Records, column arrays or an Arrow table, with immutable positional IDs."""
+    """Records, column arrays, or a DataFrame or Arrow table (`DataFrame`), with immutable
+    positional IDs. A table's rows become records of its columns, its index none of them."""
 
-    values: Records | Sequence[Batch] | Mapping[str, Sequence]
+    values: Records | Sequence[Batch] | Mapping[str, Sequence] | DataFrame
     identity: str | None = None
     shard_rows: int = 1024
 
@@ -61,13 +76,9 @@ class Memory(Dataset):
             raise ValueError("memory shard_rows must be positive")
 
     @classmethod
-    def from_arrow(cls, table: ArrowTable) -> Memory:
-        return cls(table.to_pylist())
-
-    @classmethod
     def from_spark(cls, frame: SparkFrame) -> Memory:
         """Gather a small pyspark 4.0+ frame through its Arrow handoff."""
-        return cls.from_arrow(frame.toArrow())
+        return cls(frame.toArrow())
 
     def label(self) -> str:
         return self.identity or "memory"
@@ -89,6 +100,13 @@ class Memory(Dataset):
         return True
 
     def records(self, read: Read) -> Records:
+        return self._held
+
+    @cached_property
+    def _held(self) -> Records:
+        """Its records: the rows given, the rows of columns or a table's rows, read once."""
+        if isinstance(self.values, DataFrame):
+            return _table_records(self.values)
         if isinstance(self.values, Mapping):
             return _Columns(self.values)
         return self.values
