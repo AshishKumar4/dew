@@ -54,10 +54,15 @@ def _store(store: str | TokenFiles) -> TokenFiles:
 
 def _trained(store, seq_len, batch, *, stride=None, pack=None, bins=8, seed=0, read="memory",
              loading=LOADING):
-    """A token store as a run trains on it: shuffled by `seed`, repeated and laid out (`_laid`)."""
-    rows = _store(store).shuffle(seed).repeat()
-    return compile(_laid(rows, seq_len, batch, stride=stride, pack=pack, bins=bins), read=read,
-                   loading=loading, seed=seed)
+    """A token store as a run trains on it: its windows shuffled by `seed` and repeated, or its
+    documents packed in the store's order and the rows they make shuffled and repeated."""
+    stored = _store(store)
+    if pack is None:
+        chain = _laid(stored.shuffle(seed).repeat(), seq_len, batch, stride=stride)
+    else:
+        rows = stored.pipe(presets.lm, None, seq_len=seq_len, batch=None, pack=pack, bins=bins)
+        chain = rows.shuffle(seed).repeat().batch(batch)
+    return compile(chain, read=read, loading=loading, seed=seed)
 
 
 def _validated(store, seq_len, batch, *, pack=None, bins=8, read="memory", loading=LOADING):
