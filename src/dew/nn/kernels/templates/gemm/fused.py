@@ -24,6 +24,7 @@ import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import fuser
+from jax.extend import core as jax_core
 
 from dew.nn.kernels.templates.gemm import template
 
@@ -78,8 +79,8 @@ def _axes(consumer, values, acc) -> tuple | None:
     tile; None where one follows none, its block is not the tile's, or the consumer reads the tile's
     position."""
     probe = (_probe(acc.shape[0]), _probe(acc.shape[1]))
-    spec = pl.BlockSpec(probe, lambda row, column: (row, column))
-    tiled, (value_specs, _), _ = fuser.pull_block_spec(consumer, spec, grid_len=2)(values, acc)
+    tiled, (value_specs, _), _ = fuser.pull_block_spec(consumer, _specs(consumer, values, acc, probe),
+                                                       grid_len=2)(values, acc)
     axes = []
     specs = jax.tree.leaves(value_specs, is_leaf=_is_spec)
     for leaf, leaf_spec in zip(jax.tree.leaves(values), specs, strict=True):
@@ -93,6 +94,12 @@ def _axes(consumer, values, acc) -> tuple | None:
     if _reads_position(tiled, value_specs, values, probe):
         return None
     return tuple(axes)
+
+
+def _specs(consumer, values, acc, block: tuple):
+    """One block spec of `block` at the tile's (row, column) for each of the consumer's outputs."""
+    spec = pl.BlockSpec(block, lambda row, column: (row, column))
+    return jax.tree.map(lambda _: spec, jax.eval_shape(consumer, values, acc))
 
 
 def _probe(size: int) -> int:
@@ -115,10 +122,10 @@ def _reads_position(tiled, value_specs, values, probe) -> bool:
     tile = jax.ShapeDtypeStruct(probe, jnp.float32)
     closed = jax.make_jaxpr(lambda ids, tiles, tile: tiled(ids, (), tiles, tile))(
         (jnp.int32(0), jnp.int32(0)), tiles, tile)
-    needed = set(closed.jaxpr.outvars)
+    needed = {var for var in closed.jaxpr.outvars if isinstance(var, jax_core.Var)}
     for equation in reversed(closed.jaxpr.eqns):
         if needed.intersection(equation.outvars):
-            needed.update(equation.invars)
+            needed.update(var for var in equation.invars if isinstance(var, jax_core.Var))
     return any(var in needed for var in closed.jaxpr.invars[:2])
 
 
@@ -127,8 +134,8 @@ def _tiled(consumer, treedef, value_types: tuple, out_treedef, whole: tuple, acc
     block spec pulled at that block of the `whole` product it was traced at, so the same function serves
     every kernel tile and XLA's whole array."""
     values = jax.tree.unflatten(treedef, [jax.ShapeDtypeStruct(t.shape, t.dtype) for t in value_types])
-    spec = pl.BlockSpec(acc.shape, lambda row, column: (row, column))
     whole_acc = jax.ShapeDtypeStruct(whole, jnp.float32)
-    tiled, _, _ = fuser.pull_block_spec(consumer, spec, grid_len=2)(values, whole_acc)
+    tiled, _, _ = fuser.pull_block_spec(consumer, _specs(consumer, values, whole_acc, acc.shape),
+                                        grid_len=2)(values, whole_acc)
     outs = tiled((jnp.int32(0), jnp.int32(0)), (), jax.tree.unflatten(treedef, list(tiles)), acc)
     return tuple(jax.tree.leaves(outs)) if out_treedef.num_leaves > 1 else jax.tree.leaves(outs)[0]
