@@ -219,13 +219,13 @@ def _negated(node: ast.AST, parents: dict[int, ast.AST]) -> bool:
         if any(isinstance(op, ast.NotEq) for op in node.ops):
             return True
         if all(isinstance(op, ast.Gt | ast.GtE) for op in node.ops):
-            return any(isinstance(part, ast.BinOp) and isinstance(part.op, ast.Sub) or (
+            return any((isinstance(part, ast.BinOp) and isinstance(part.op, ast.Sub)) or (
                 isinstance(part, ast.Call) and _call_name(part) in {"abs", "norm", "distance", "max"})
                 for part in ast.walk(node.left))
     return False
 
 
-def _independent(sides: list[ast.AST], scope: "_Scope") -> bool:
+def _independent(sides: list[ast.AST], scope: _Scope) -> bool:
     """Whether a side comes from a recording or a reference implementation (a fixture, a torch or
     another library's run): the comparison is then a contract, whatever its test's name."""
     return any("recorded" in scope.sources(side) for side in sides) or any(
@@ -233,7 +233,7 @@ def _independent(sides: list[ast.AST], scope: "_Scope") -> bool:
         for side in sides for part in ast.walk(side))
 
 
-def _repeated(sides: list[ast.AST], scope: "_Scope") -> bool:
+def _repeated(sides: list[ast.AST], scope: _Scope) -> bool:
     """Whether the two sides are one call repeated: the same callee on the same arguments, followed
     through one binding each (a copy, a reload's read, a deterministic rerun)."""
     def origin(side):
@@ -244,7 +244,7 @@ def _repeated(sides: list[ast.AST], scope: "_Scope") -> bool:
     return isinstance(left, ast.Call) and isinstance(right, ast.Call) and ast.dump(left) == ast.dump(right)
 
 
-def _kind(node: ast.AST, function: ast.AST, scope: "_Scope", parents: dict[int, ast.AST]) -> str:
+def _kind(node: ast.AST, function: ast.AST, scope: _Scope, parents: dict[int, ast.AST]) -> str:
     """A tolerance without a float64 truth, by what it compares (Main's classes, 2026-10-21, and the
     audited rules: polarity first, then provenance, then kind)."""
     if _negated(node, parents):
