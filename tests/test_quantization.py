@@ -112,6 +112,15 @@ def test_quantized_and_plain_calls_of_one_shape_keep_their_own_products_in_one_p
     assert not np.array_equal(np.asarray(quantized.apply(variables, then)), plain(then))
 
 
+def test_qwix_refuses_an_unknown_calibration_where_it_first_quantizes_a_weight():
+    """Dew keeps no copy of Qwix's calibration grammar: a spec with a method Qwix does not know builds,
+    and the first forward that quantizes a matched weight raises, Qwix's own refusal."""
+    pytest.importorskip("qwix")
+    _, qmodel, variables, ids = quantized_forward(Quantization(calibration="not_a_method"))
+    with pytest.raises(ValueError):  # noqa: PT011 - Qwix's message, not Dew's
+        qmodel.apply(variables, ids)
+
+
 def test_a_pattern_that_matches_nothing_quantizes_nothing():
     """A narrowed pattern is selective: a regex no module path matches runs
     the fp32 numerics bitwise. A pattern that matched everything would move
