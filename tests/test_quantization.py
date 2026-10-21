@@ -22,6 +22,7 @@ import optax
 import pytest
 from flax import linen as nn
 from reference_error import assert_as_exact_as_the_reference, assert_fp32_reduction_bound
+from token_support import token_rows
 
 from dew.config import ObjectiveConfig, OptimConfig
 from dew.lora import _updated as lora_update
@@ -52,8 +53,7 @@ def tiny(**overrides):
 
 
 def token_batch():
-    rng = np.random.default_rng(0)
-    return {"text": rng.integers(0, VOCAB, size=(BATCH, SEQ_LEN + 1)).astype(np.int32)}
+    return token_rows(VOCAB, BATCH, SEQ_LEN + 1)
 
 
 def quantized_forward(spec, **overrides):

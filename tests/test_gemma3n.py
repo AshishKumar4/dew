@@ -15,6 +15,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
+from interop_support import fixture_arrays
 from reference_error import assert_as_exact, assert_leaves_as_exact
 
 from dew.nn.gemma3n import AltUp, AltUpLayer, LaurelBlock
@@ -29,8 +30,7 @@ armada)."""
 
 
 def fixture() -> dict:
-    with np.load(FIXTURES / "blocks.npz") as data:
-        return {key: np.asarray(value) for key, value in data.items()}
+    return fixture_arrays(FIXTURES / "blocks.npz")
 
 
 class Steps(nn.Module):

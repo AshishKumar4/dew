@@ -64,6 +64,18 @@ def test_the_scanned_stack_quantizes_each_layer_with_its_own_scales(case):
     assert_quantized(scanned.apply(loaded.variables, reference["ids"].astype(np.int32)), reference, "scanned")
 
 
+def quantized_apart(case):
+    """The case's loaded model, its scanned clone, its ids, and a copy of its variables whose second
+    layer's query projection is left unquantized: layers quantized apart, which one scanned body
+    cannot read alike."""
+    _, loaded, reference = case
+    variables = jax.tree.map(lambda leaf: leaf, dict(loaded.variables))
+    layer = variables[QUANTIZATION]["layers_1"]
+    mixer = next(name for name in layer if "q_proj" in layer[name] or "qkv" in layer[name])
+    layer[mixer] = {name: leaves for name, leaves in layer[mixer].items() if name != "q_proj"}
+    return loaded, loaded.model.clone(scan_layers=True), reference["ids"].astype(np.int32), variables
+
+
 def test_layers_quantized_apart_run_as_scanned_runs_of_their_own(case):
     """A checkpoint that quantizes two otherwise like layers differently, here
     one with a projection left unquantized, gives them different scale trees,
@@ -72,13 +84,7 @@ def test_layers_quantized_apart_run_as_scanned_runs_of_their_own(case):
     the plain loop of the same weights is, against their own float64
     forward. The stored tree stays one subtree per layer, so the scanned and
     the plain model read and init the same tree."""
-    _, loaded, reference = case
-    scanned = loaded.model.clone(scan_layers=True)
-    ids = reference["ids"].astype(np.int32)
-    variables = jax.tree.map(lambda leaf: leaf, dict(loaded.variables))
-    layer = variables[QUANTIZATION]["layers_1"]
-    mixer = next(name for name in layer if "q_proj" in layer[name] or "qkv" in layer[name])
-    layer[mixer] = {name: leaves for name, leaves in layer[mixer].items() if name != "q_proj"}
+    loaded, scanned, ids, variables = quantized_apart(case)
     plain = np.asarray(loaded.model.apply(variables, ids))
     truth, terms = float64_forward(loaded.model, variables, ids)
     assert_as_exact_as_the_reference(np.asarray(scanned.apply(variables, ids)), plain, truth,
@@ -93,13 +99,7 @@ def test_layers_quantized_apart_that_one_bank_holds_are_refused(case):
     rows are refused by name, rather than read as runs of their own the store does not hold."""
     from dew.nn.backbones.layer_plan import group_name
 
-    _, loaded, reference = case
-    scanned = loaded.model.clone(scan_layers=True)
-    ids = reference["ids"].astype(np.int32)
-    variables = jax.tree.map(lambda leaf: leaf, dict(loaded.variables))
-    layer = variables[QUANTIZATION]["layers_1"]
-    mixer = next(name for name in layer if "q_proj" in layer[name] or "qkv" in layer[name])
-    layer[mixer] = {name: leaves for name, leaves in layer[mixer].items() if name != "q_proj"}
+    loaded, scanned, ids, variables = quantized_apart(case)
     params = dict(variables["params"])
     for first, count in scanned.bind(loaded.variables).groups:
         if count > 1:

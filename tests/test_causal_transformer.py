@@ -121,6 +121,7 @@ def test_old_decoder_record_keeps_zero_dropout_and_bitwise_outputs():
     from jax import export
 
     from dew.config import ModelConfig
+    from tools.generate_decoder_dropout_fixture import forward_and_gradient
 
     config = {"vocab_size": 17, "emb_features": 8, "num_layers": 1, "num_heads": 2,
                   "mlp_features": 16, "max_seq_len": 8}
@@ -138,13 +139,8 @@ def test_old_decoder_record_keeps_zero_dropout_and_bitwise_outputs():
         params = unflatten_dict({tuple(name.split("/")[1:]): jnp.asarray(leaf)
                                  for name, leaf in held.items() if name.startswith("params/")})
 
-        def forward_and_gradient(params, ids):
-            forward = model.apply(params, ids, train=True)
-            gradient = jax.grad(lambda p: jnp.sum(model.apply(p, ids, train=True)))(params)
-            return forward, gradient
-
         expected = before.call(params, ids)
-        actual = jax.jit(forward_and_gradient)(params, ids)
+        actual = jax.jit(forward_and_gradient(model))(params, ids)
         assert jax.tree.structure(actual) == jax.tree.structure(expected)
         for left, right in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True):
             assert np.asarray(left).tobytes() == np.asarray(right).tobytes()

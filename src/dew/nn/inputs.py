@@ -68,9 +68,10 @@ def token_ids(values: object, *, where: str) -> list[int]:
 
 def pad_token_rows(rows: Sequence[Sequence[int]] | np.ndarray, *, pad_id: int = 0,
                    padding_side: Literal["left", "right"] = "left",
-                   fields: Mapping[str, Sequence[Sequence[int]] | np.ndarray] | None = None
-                   ) -> tuple[np.ndarray, dict[str, np.ndarray]]:
-    """Pad ragged token rows and their scalar token fields on the host.
+                   fields: Mapping[str, Sequence[Sequence[int]] | np.ndarray] | None = None,
+                   width: int | None = None) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    """Pad ragged token rows and their scalar token fields on the host, to `width` when given (a
+    fixed shape, which no row may exceed), else to the longest row.
 
     Filler IDs carry no content; attention_mask alone marks real slots. Rows
     that all fill the width come back without one: absent validity says every
@@ -89,7 +90,11 @@ def pad_token_rows(rows: Sequence[Sequence[int]] | np.ndarray, *, pad_id: int = 
         raise ValueError("each prompt must contain a nonempty integer token row")
     for row in arrays:
         _check_token_ids(row)
-    width = max(row.size for row in arrays)
+    longest = max(row.size for row in arrays)
+    if width is None:
+        width = longest
+    elif longest > width:
+        raise ValueError(f"a token row holds {longest} ids, more than the width {width}")
     tokens = np.full((len(arrays), width), pad_id, np.int32)
     valid = np.zeros(tokens.shape, bool)
     slots = [
@@ -418,10 +423,10 @@ def numbered_blocks(tokens: Coordinates, shape: tuple[int, int], block: int) -> 
     document's own, so a request routes as it does alone and padding votes for none."""
     counted = counted_places(tokens.segments, tokens.valid, tokens.positions)
     cut = jnp.broadcast_to(jnp.arange(shape[1]) if counted is None else counted, shape) // block
-    documents = jnp.zeros(shape, jnp.int32) if tokens.segments is None else jnp.broadcast_to(
-        jnp.asarray(tokens.segments), shape)
-    opens = jnp.concatenate([jnp.ones((shape[0], 1), bool),
-                             (cut[:, 1:] != cut[:, :-1]) | (documents[:, 1:] != documents[:, :-1])], axis=1)
+    opens = jnp.concatenate([jnp.ones((shape[0], 1), bool), cut[:, 1:] != cut[:, :-1]], axis=1)
+    if tokens.segments is not None:
+        real = jnp.ones(shape, bool) if tokens.valid is None else jnp.broadcast_to(tokens.valid, shape)
+        opens = opens | document_starts(jnp.broadcast_to(jnp.asarray(tokens.segments), shape), real)
     numbered = jnp.cumsum(opens, axis=1, dtype=jnp.int32) - 1
     if tokens.valid is None:
         return numbered
@@ -481,7 +486,9 @@ class AttentionMetadata:
     n-gram. `admitted` turns a cached call into a serving step's mixed call
     (`Admitted`). `position_bias` is added to every attention logit,
     `[B or 1, heads, S, keys]`: T5's relative position table, which its
-    encoder computes once for its layers.
+    encoder computes once for its layers. `blocks` `[B, S]` number each row's
+    routing blocks for a block router (`numbered_blocks`), which the model
+    computes once for its layers.
 
     `coordinates` are the tokens' documents, validity, positions and cache
     slots (`Coordinates`). Their `right_padded` says each row's real tokens
@@ -503,6 +510,7 @@ class AttentionMetadata:
     media: jax.Array | None = None
     admitted: Admitted | None = None
     position_bias: jax.Array | None = None
+    blocks: jax.Array | None = None
 
     @property
     def valid(self) -> jax.Array | None:
@@ -1128,3 +1136,19 @@ class Request:
 
 __all__ = ["RESPONSE_FIELDS", "AttentionMetadata", "FieldExtension", "LayerInputs", "ModelInputs",
            "ModelKwarg", "RowPlan"]
+
+
+def routing_blocks(feedforward, metadata: AttentionMetadata | None, shape: tuple[int, ...]) -> dict:
+    """The blocks a block-routed feed-forward (`dew.nn.moe.SparseMLP`'s `routing_block`) routes its
+    tokens in, over a call of `shape[:2]`: its metadata's, which the model numbers once for its
+    layers, else numbered from the call's coordinates (`numbered_blocks`); nothing for another
+    feed-forward."""
+    from dew.nn.protocols import RoutesBlocks
+
+    block = feedforward.routing_block if isinstance(feedforward, RoutesBlocks) else None
+    if block is None:
+        return {}
+    if metadata is not None and metadata.blocks is not None:
+        return {"blocks": metadata.blocks}
+    batch, length = shape[:2]
+    return {"blocks": numbered_blocks(coordinates_of(metadata, batch, length), (batch, length), block)}

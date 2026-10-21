@@ -84,6 +84,7 @@ from dew.quantization import (
     frozen_fp8_kernel,
     measured_fp8_sites,
 )
+from dew.records import finite
 from dew.registry import rebuilt, wrapper_layers
 
 PEFT_CONFIG = "adapter_config.json"
@@ -118,13 +119,6 @@ def _rank(owner: str, rank: object) -> int:
     if isinstance(rank, bool) or not isinstance(rank, int) or rank < 1:
         raise ValueError(f"{owner}: rank must be a positive integer, not {rank!r}")
     return rank
-
-
-def _alpha(owner: str, alpha: object) -> float:
-    """`alpha` as a float, refused unless a finite number."""
-    if isinstance(alpha, bool) or not isinstance(alpha, numbers.Real) or not math.isfinite(alpha):
-        raise ValueError(f"{owner}: alpha must be a finite number, not {alpha!r}")
-    return float(alpha)
 
 
 def _dropout(owner: str, dropout: object) -> float:
@@ -162,7 +156,7 @@ class LoRA:
         object.__setattr__(self, "modules", tuple(self.modules))
         _rank("LoRA", self.rank)
         if self.alpha is not None:
-            _alpha("LoRA", self.alpha)
+            finite(self.alpha, "LoRA: alpha")
         _dropout("LoRA", self.dropout)
         if not self.modules or any(not isinstance(module, str) or not module for module in self.modules):
             raise ValueError("modules names at least one projection")
@@ -787,7 +781,7 @@ class AdapterRecord:
     def __post_init__(self) -> None:
         for module, target in self.targets.items():
             _rank(f"the adapter record's {module}", target.rank)
-            _alpha(f"the adapter record's {module}", target.alpha)
+            finite(target.alpha, f"the adapter record's {module}: alpha")
         _dropout("the adapter record", self.dropout)
         if not self.targets or any(not name or name in ('.', '..')
                                    for module in self.targets for name in module.split('/')):
@@ -1023,10 +1017,10 @@ class _Config:
         name, revision = config.get("base_model_name_or_path"), config.get("revision")
         if not isinstance(name, str | None) or not isinstance(revision, str | None):
             raise ValueError(f"{where} names its base model and revision as strings or not at all")
-        return cls(_rank(where, rank), _alpha(where, alpha),
+        return cls(_rank(where, rank), finite(alpha, f"{where}: alpha"),
                    {module: _rank(f"{where} rank_pattern {module}", value)
                     for module, value in rank_pattern.items()},
-                   {module: _alpha(f"{where} alpha_pattern {module}", value)
+                   {module: finite(value, f"{where} alpha_pattern {module}: alpha")
                     for module, value in alpha_pattern.items()},
                    rslora, _dropout(where, dropout), None if name is None else AdapterBase(name, revision))
 

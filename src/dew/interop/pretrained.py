@@ -56,12 +56,7 @@ from dew.interop.pipeline_assembly import (
     pipeline_denoiser,
     text_components,
 )
-from dew.interop.processors import (
-    HostProcessor as HostProcessor,
-    Processor as Processor,
-    ProcessorCall as ProcessorCall,
-    hosts,
-)
+from dew.interop.processors import Processor, hosts
 from dew.interop.safetensors_io import MAX_SHARD_SIZE
 from dew.interop.streaming import WeightLayout
 from dew.interop.weights import AUTO, declared_dtype
@@ -622,7 +617,7 @@ class PretrainedDecoder(Pretrained):
         config = decoders.export_config(decoder)
         built = rebuilt(dict, decoder)
         return cls(decoder, variables, None, config, None, built,
-                   {**decoders.GENERATION_DEFAULTS, 'use_cache': decoder.causal}
+                   {**decoders.GENERATION_DEFAULTS, 'use_cache': config.get('use_cache', decoder.causal)}
                    if generation_config is None else generation_config,
                    export_adapter=decoders.export_decoder_weights, tokenizer=tokenizer)
 

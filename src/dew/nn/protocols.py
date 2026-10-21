@@ -540,6 +540,16 @@ top_k]` record (`CausalTransformer.hidden_states`)."""
 
 
 @runtime_checkable
+class RoutesBlocks(Protocol):
+    """A routed feed-forward that chooses experts block by block (LLaDA2.2's), each block of
+    `routing_block` places sharing a shortlist when that is set: its caller hands it each token's
+    block (`dew.nn.inputs.routing_blocks`)."""
+
+    @property
+    def routing_block(self) -> int | None: ...
+
+
+@runtime_checkable
 class RoutesExperts(Protocol):
     """A module whose call takes `routes`, a layer's replayed experts, because
     it routes over experts: a routed feed-forward, or a token mixer holding one

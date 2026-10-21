@@ -1,20 +1,15 @@
 """JSON-compatible episode records for interchange and turn-boundary recovery."""
 
 import functools
-import math
 from collections.abc import Mapping
 
-from dew.records import integer, integers, listed, record as section, text
+from dew.records import finite, integer, integers, listed, record as section, text
 from dew.sampling.text import Sampling
 
 from .episodes import Action, Episode, EpisodeId, EpisodeStatus, Observation, Transition
 
-
-def real(value: object, key: str) -> float:
-    """One score or likelihood, finite as no non-finite one is recorded."""
-    if not isinstance(value, (float, int)) or isinstance(value, bool) or not math.isfinite(value):
-        raise ValueError(f"{key}={value!r}: this field is a finite number")
-    return float(value)
+real = finite
+"""One score or likelihood, finite as no non-finite one is recorded (`dew.records.finite`)."""
 
 
 reals = functools.partial(listed, read=real, what="a list of finite numbers")

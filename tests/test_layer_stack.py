@@ -18,6 +18,7 @@ import numpy as np
 import pytest
 from reference_error import assert_as_exact, widened
 from sharded import assert_sharded
+from token_support import token_rows
 
 from dew.interop import Pretrained
 from dew.interop.hf_decoders import translate_config
@@ -341,8 +342,7 @@ def routed(**overrides):
 
 
 def token_batch(rows: int = BATCH):
-    rng = np.random.default_rng(0)
-    return {"text": rng.integers(0, VOCAB, size=(rows, SEQ_LEN + 1)).astype(np.int32)}
+    return token_rows(VOCAB, rows, SEQ_LEN + 1)
 
 
 # A pipeline of four microbatches over two stages beside a row axis of four

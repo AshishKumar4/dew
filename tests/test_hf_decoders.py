@@ -1050,6 +1050,19 @@ def test_llada22_block_routing_is_each_requests_own():
                                           err_msg=f'request {row}, {layer}')
 
 
+def test_a_block_router_refuses_a_cached_decode_by_name():
+    """A block's shortlist is chosen from every token in it, which a cached decode step holding one
+    token of its block cannot see, so a causal decoder with a block router refuses autoregressive
+    generation by name rather than route its steps unlike its full forward."""
+    from dew.sampling.text import generate
+
+    source = Pretrained.load(FIXTURES / 'llada22-tiny', dtype='float32', attention_impl='reference')
+    causal = source.model.clone(causal=True)
+    assert 'block routing' in causal.generation_refusal()
+    with pytest.raises(ValueError, match='block routing'):
+        generate(causal, source.variables, jnp.ones((1, 4), jnp.int32), 2, key=0)
+
+
 def test_llada22_block_routing_is_each_packed_documents_own():
     """Two documents packed in one row, 6 and 7 tokens, route every token to the experts it routes to
     alone: each document's blocks are counted from its own first token, so neither a block nor its
