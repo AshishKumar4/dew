@@ -623,6 +623,16 @@ class TokenScorer(Objective[Ratio | LMStatistics, Variables]):
     (`token_scores`' `z_loss`, `LMObjective`'s training loss): the fit ladder turns it off where the
     fused chunk does not fit (`LMObjective.unfuse_head`), and tiling the head turns it on."""
 
+    scored_fields: ClassVar[tuple[str, ...] | None] = None
+    """The batch fields `_evaluation_scores` reads, which alone enter its compiled program (`evaluate`),
+    so a batch's other fields (rollouts, rewards) neither enter it nor key it; None passes the batch whole."""
+
+    def evaluate(self, params, batch, step: Step):
+        """The base's scores (`Objective.evaluate`) over the `scored_fields` of `batch`."""
+        if self.scored_fields is not None:
+            batch = {name: batch[name] for name in self.scored_fields}
+        return super().evaluate(params, batch, step)
+
 
     def __init__(self, model, seq_len: int, *, head_chunks: int = 4,
                  head_tile: tuple[int, int] | Literal['whole', 'tiled'] | None = None,
