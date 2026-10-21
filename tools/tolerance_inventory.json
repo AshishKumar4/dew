@@ -568,7 +568,7 @@
    "by": "2026-11-13"
   },
   "tests/test_local_attention.py": {
-   "comparisons": 8,
+   "comparisons": 2,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
