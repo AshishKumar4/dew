@@ -8,6 +8,7 @@ from pathlib import Path
 import grain.python as grain
 import numpy as np
 import pytest
+from data_support import WideDraw
 
 from dew.config.data import HoldOut, RecordsData, loader
 from dew.data import TFDS, Files, Loading, Memory
@@ -24,12 +25,6 @@ PREPARED = Path(__file__).parent / "fixtures" / "tfds" / "dew_images" / "1.0.0"
 class Draw(grain.RandomMapTransform):
     def random_map(self, element, rng):
         return {**element, "draw": np.int32(rng.integers(1 << 20))}
-
-
-@dataclasses.dataclass(frozen=True)
-class WideDraw(grain.RandomMapTransform):
-    def random_map(self, element, rng):
-        return {**element, "draw": np.int64(rng.integers(0, 2**32))}
 
 
 def indices(iterator, count):
