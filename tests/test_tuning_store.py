@@ -7,6 +7,7 @@ import json
 
 import jax
 import jax.numpy as jnp
+import pytest
 import tokamax
 
 from dew.nn.kernels import norm_swiglu, tuning
@@ -187,3 +188,40 @@ def test_a_hook_keys_by_the_values_of_the_arrays_it_closes_over():
         assert keys[0] != keys[1]
         assert keys[0] == keys[2]
 
+
+def _scaled_hook(tile):
+    """A module-level hook, as a template's prologue is."""
+    return tile * 2
+
+
+_shadowed_hook = json.dumps
+"""Another module's function under this module's name: no hook of this module."""
+
+
+class _HookHolder:
+    """A function a class holds: its qualified name, dotted, is no module attribute's."""
+
+    @staticmethod
+    def hook(tile):
+        return tile
+
+
+def test_a_module_level_hook_round_trips_and_any_other_callable_is_refused():
+    """A template launch's hook enters its stored key by its module and name and comes back as that very
+    function; a lambda, a closure and a local function have no name to store; a stored name that a
+    module attribute, another module's function or nothing answers to is unreadable."""
+    stored = json.loads(json.dumps(tuning.encoded({"prologue": _scaled_hook})))
+    assert tuning.decoded(stored) == {"prologue": _scaled_hook}
+    assert tuning.decoded({"function": "json:dumps"}) is json.dumps
+
+    scale = 3.0
+
+    def local(tile):
+        return tile * scale
+
+    for hook in (lambda tile: tile, local, _HookHolder.hook):
+        with pytest.raises(TypeError):
+            tuning.encoded(hook)
+    for name in ("json", "_shadowed_hook", "_no_such_hook"):
+        with pytest.raises(tuning.Unreadable):
+            tuning.decoded({"function": f"{__name__}:{name}"})

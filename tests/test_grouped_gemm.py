@@ -123,6 +123,7 @@ def test_the_kernel_gradient_keeps_a_neighbours_non_finite_rows_out():
                                       "kernel gradient")
 
 
+@pytest.mark.skipif(jax.default_backend() != "cpu", reason="interprets the kernels in a CPU process")
 @pytest.mark.parametrize("generation_name,implementation", [("sm80", "triton"), ("sm90", "mosaic_gpu")])
 def test_an_expert_projection_runs_the_implementation_chosen_for_it_on_the_cpu(generation_name: str,
                                                                                implementation: str):
@@ -143,7 +144,13 @@ def test_an_expert_projection_runs_the_implementation_chosen_for_it_on_the_cpu(g
 
     with (generation.assumed(generation_name), generation.chosen(grouped_matmul=implementation),
           generation.routes() as routes):
-        y, dx, dw = jax.jit(products)(jnp.asarray(x, jnp.bfloat16), jnp.asarray(w, jnp.float32))
+        operands_ = (jnp.asarray(x, jnp.bfloat16), jnp.asarray(w, jnp.float32))
+        # The CPU's lowering is the interpreted kernels', not XLA's ragged dot compared with itself: an
+        # interpreter runs the grid in loops, Mosaic GPU's through host callbacks; XLA's has neither.
+        lowered = jax.jit(products).lower(*operands_).as_text()
+        assert "stablehlo.while" in lowered
+        assert ("callback" in lowered) == (implementation == "mosaic_gpu")
+        y, dx, dw = jax.jit(products)(*operands_)
     assert {route.kernel for route in routes if route.choice == "grouped_matmul"} == {implementation}
     assert (y.dtype, dx.dtype, dw.dtype) == (jnp.bfloat16, jnp.bfloat16, jnp.float32)
     for label, got, theirs, truth in zip(("y", "dx", "dw"), (y, dx, dw), reference,
@@ -197,9 +204,9 @@ def test_a_forced_implementation_runs_or_says_why_it_cannot():
 
 @pytest.mark.parametrize("generation_name", ["sm80", "sm90"])
 def test_the_kernels_write_each_product_in_its_own_dtype(generation_name):
-    """A bf16 projection over an fp32 master, through the implementations each generation picks: the
-    platform choice returns the forward and the input gradient in bf16 and the kernel gradient in fp32,
-    as the launches write them, with no fp32 `[rows, width]` product for a conversion pass after."""
+    """A bf16 projection over an fp32 master, through the implementations each generation picks: its
+    launches write the forward and the input gradient in bf16 and the kernel gradient in fp32, with no
+    fp32 `[rows, width]` product for a conversion pass after."""
     x = jax.ShapeDtypeStruct((ROWS, DEPTH), jnp.bfloat16)
     w = jax.ShapeDtypeStruct((4, DEPTH, WIDTH), jnp.float32)
     sizes = jax.ShapeDtypeStruct((4,), jnp.int32)
@@ -209,12 +216,13 @@ def test_the_kernels_write_each_product_in_its_own_dtype(generation_name):
 
     with generation.assumed(generation_name):
         jaxpr = jax.make_jaxpr(jax.grad(loss, (0, 1)))(x, w, sizes)
-    # The platform choice (`jax.lax.platform_dependent`) is a cond; a kernel body's own conds return scalars.
-    returned = {(var.aval.shape, var.aval.dtype) for equation in equations(jaxpr)
-                if equation.primitive.name == "cond" for var in equation.outvars}
-    assert ((ROWS, WIDTH), jnp.dtype(jnp.float32)) not in returned
+    # Each launch's own outputs: Triton's are a pallas_call's, Mosaic GPU's a custom_vmap_call's
+    # (`plgpu.kernel` wraps its call in `custom_vmap`).
+    written = {(var.aval.shape, var.aval.dtype) for equation in equations(jaxpr)
+               if equation.primitive.name in ("pallas_call", "custom_vmap_call") for var in equation.outvars}
+    assert ((ROWS, WIDTH), jnp.dtype(jnp.float32)) not in written
     assert {((ROWS, WIDTH), jnp.dtype(jnp.bfloat16)), ((ROWS, DEPTH), jnp.dtype(jnp.bfloat16)),
-            ((4, DEPTH, WIDTH), jnp.dtype(jnp.float32))} <= returned
+            ((4, DEPTH, WIDTH), jnp.dtype(jnp.float32))} <= written
 
 
 def test_the_cost_model_charges_each_multiprocessor_its_programs_in_turn():

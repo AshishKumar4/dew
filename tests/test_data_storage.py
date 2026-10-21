@@ -72,6 +72,33 @@ def test_a_versioned_s3_read_is_the_filesystems_own_request():
         server.stop()
 
 
+@pytest.mark.parametrize("publish", ["write", "put_if_absent"])
+def test_a_local_publication_has_a_plain_writes_mode_and_a_failed_one_leaves_nothing(tmp_path, monkeypatch,
+                                                                                       publish):
+    """A local write, plain or conditional, publishes by one rename (dew.files.write_atomically): the file
+    has the mode a plain write gives under the umask, not a temporary file's private one, and a write
+    that fails leaves no temporary beside its target."""
+    target = tmp_path / "value"
+    previous = os.umask(0o022)
+    try:
+        getattr(Store(str(target)), publish)(b"first")
+    finally:
+        os.umask(previous)
+    assert oct(target.stat().st_mode & 0o777) == oct(0o644)
+
+    full = OSError("disk full")
+
+    def interrupted(fd):
+        raise full
+
+    monkeypatch.setattr(os, "fsync", interrupted)
+    before = {path.name for path in tmp_path.iterdir()}
+    with pytest.raises(OSError) as raised:
+        getattr(Store(str(tmp_path / "other")), publish)(b"second")
+    assert raised.value is full
+    assert {path.name for path in tmp_path.iterdir()} - before <= {"other.cas.lock"}, "only a CAS lock"
+
+
 def test_compare_and_swap_rejects_stale_and_duplicate_publication(store):
     first = store.put_if_absent(b"first")
     assert store.get_versioned().data == b"first"

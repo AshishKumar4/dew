@@ -23,11 +23,23 @@ from filelock import FileLock
 from dew.cache import dew_cache_dir
 from dew.data.pipeline import Dataset
 
-from ..dataset import Records
+from ..dataset import Batch, Records
 from .base import Read, ShardManifest, _indexed_manifest, preparing
 
 if TYPE_CHECKING:  # tensorflow_datasets is imported on use, not at import
     from tensorflow_datasets import DecoderTree
+
+
+@dataclasses.dataclass(frozen=True)
+class _Texts:
+    """A TFDS record with its text features decoded from the utf-8 bytes TFDS hands over."""
+
+    fields: tuple[str, ...]
+
+    def __call__(self, row: Batch | bytes | None) -> Batch | bytes | None:
+        if not isinstance(row, Mapping):
+            return row
+        return {**row, **{name: row[name].decode() for name in self.fields if isinstance(row[name], bytes)}}
 
 
 def _decoder_record(value: object) -> Mapping[str, object] | None:
@@ -388,10 +400,17 @@ class TFDS(Dataset):
         self.fingerprint()
         rows = self.builder.as_data_source(self.split, decoders=self.decoders)
         import grain.python as grain
+        import tensorflow_datasets as tfds
 
         from .memory import _record
 
         indexed = grain.MapDataset.source(rows).map(_record)
+        features = self.builder.info.features
+        texts = (tuple(name for name, feature in features.items() if isinstance(feature, tfds.features.Text))
+                 if isinstance(features, tfds.features.FeaturesDict) else ())
+        if texts:
+            # TFDS hands its text features over as utf-8 bytes; a record holds them as text.
+            indexed = indexed.map(_Texts(texts))
         return tuple(indexed[index] for index in range(len(indexed))) if read == "memory" else indexed
 
     def manifest(self) -> ShardManifest:

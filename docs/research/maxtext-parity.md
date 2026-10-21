@@ -23,6 +23,37 @@ The table rows and the "What dew needs" list describe Dew at `65fd2f4`, and the 
 - The manifold-constrained hyper-connection rows say "nothing". `CausalTransformer.hyper_connections` adds mHC's residual streams with Sinkhorn-Knopp mixing (`src/dew/nn/backbones/causal_transformer.py:1438`; `src/dew/nn/hyper_connections.py:15-25,56`). Engram is still absent.
 - Item 8 of "What dew needs" lists DeepSeek V4 compressed attention, hash routing and mHC as missing. The `deepseek_v4` mixer (`src/dew/nn/deepseek_v4.py:535`), the router's `hash_vocab` (`src/dew/nn/moe.py:170-188`) and the hyper-connections above cover them.
 
+## Where each workflow stands, 2026-10-21
+
+This section is current, on main 84a421410; the inventory below it keeps the 2026-09-06 audit as written. "Runs" means a whole workflow runs under a test, not only its components. A number in brackets is the ledger row that tracks what is missing.
+
+| Workflow | On main |
+|---|---|
+| Pretraining with packed or unpacked input, evaluation and generation from the saved run | Runs (`tests/test_lm_recipe.py`) |
+| Chat SFT with completion-only targets | Runs (`examples/sft_gemma4.py`, `tests/test_examples.py`) |
+| Online RL (GRPO) with asynchronous collection, and DPO from a trained model | Run on Dew's own rollout server (`examples/train_rlvr.py`, `examples/readme_demo.py`); an external engine's weight publication waits on a two-engine receipt [579] |
+| One model through pretraining, SFT and RL in turn | Each stage runs alone; the chain does not yet [869] |
+| Distillation of logits and layer features; one PEFT LoRA adapter loaded, trained and exported | Run |
+| A directory of named LoRA adapters | Missing [870] |
+| Conversion to and from Hugging Face checkpoints | Runs for the families Dew implements; MaxText's own checkpoint trees are not read [871] |
+| Asynchronous checkpoints, local and persistent tiers, preemption save, restart at another process count | Run; per-share elastic resume [722], recovery from a surviving replica [872] and live slice loss or mesh resizing [873] are missing |
+| Cached decode and sampling, the native server with batching and weight reload, paged attention, chunked prefill and prefix caching | Run, for the mixers and layouts each admits [784, 830, 831, 838]; prefix reuse for per-row recurrent state [760], a host prefix-cache tier [874] and disaggregated prefill and decode [875] are missing |
+| int8 and FP8 training and serving, quantized checkpoints and KV cache | Run in the tested configurations; every codec composition [178] and an H100 FP8 base [841] are open |
+| Activation remat policies, optimizer and layer host offload, layer scanning | Run; remat rungs on sm86 [847] |
+| Pipeline training | GPipe runs; stage-local state and MaxText's circular schedules are missing [861] |
+| Data, FSDP, tensor, expert and sequence parallelism | Run; more combinations [226], sequence-sharded decode [245], two-node hardware [158] |
+| DiLoCo | Missing [876] |
+| Dropless MoE, fused attention with sinks and softcaps, multi-token prediction, speculative decode | Run; target-complete GPU qualification [185] |
+| Sparse indexed attention and its indexer's warmup phase | Dense top-k masking only [877] |
+| GPT-3 and Engram | Missing [878] |
+| Vision-language models | Run for the families with towers; served multimodal log-probabilities [828] |
+| Audio-conditioned language models, Qwen3-Omni audio | Missing [879] |
+| Weighted mixtures with phases and resume, batch ramp-up | Run; a pinned text, code and chat example [236] |
+| Every text backend and tokenizer training | Not each one [880] |
+| Ahead-of-time compilation for a remote topology, PGLE | Not yet [881, 433] |
+
+Not planned, by design: MaxText's legacy AQT controls, the `minimal_flash` family of remat names (Dew names its policies by what they save), Google's internal diagnostics, network and topology tools, and a pure-NNX rewrite (Dew stays on Linen).
+
 ## Complete base.yml inventory
 
 ### Run and model selection

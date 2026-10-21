@@ -310,6 +310,50 @@ def test_a_python_child_joins_its_files_record(ci, tmp_path, monkeypatch, cache_
                                    "tests/test_own_environment.py": ["changed"]}
 
 
+def fetcher(root: Path, *, due: bool = False) -> Path:
+    """A stand-in tools/fetched_fixtures.py under `root`: its fetch records that it ran, and with `due`
+    refuses as the real one does a pin whose upload is due."""
+    (root / "tools").mkdir(exist_ok=True)
+    (root / "tools/fetched_fixtures.py").write_text(
+        "import sys, time\nfrom pathlib import Path\n"
+        "assert sys.argv[1:] == ['fetch']\n"
+        "Path('fetched').write_text(str(time.monotonic()))\n"
+        + ("raise SystemExit('x.npz: pinned with no revision: its upload is due')\n" if due else ""))
+    return root / "fetched"
+
+
+def test_a_gpu_lane_fetches_the_pinned_fixtures_before_any_file_and_stops_where_one_is_due(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """The tests read pinned fixtures offline (CLOSED_HUB), so the lane fetches them first, while the Hub is
+    reachable; a pin whose upload is due stops the lane before any file runs."""
+    url, _, _ = cache_worker
+    monkeypatch.setenv("DEW_XLA_CACHE_URL", url)
+    monkeypatch.setenv("DEW_XLA_CACHE_TOKEN", "token")
+    monkeypatch.setenv("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.5")
+    tools = tmp_path / "bin"
+    tools.mkdir()
+    (tools / "nvidia-smi").write_text("#!/bin/sh\necho 81920\n")
+    (tools / "nvidia-smi").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tools}:{os.environ['PATH']}")
+    venv = tmp_path / ".venv-3.12/bin"
+    venv.mkdir(parents=True)
+    (venv / "python").write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
+    (venv / "python").chmod(0o755)
+    (tmp_path / "tests/test_reads.py").write_text(
+        "import time\nfrom pathlib import Path\n"
+        "def test_reads(): Path('read').write_text(str(time.monotonic()))\n")
+    out = tmp_path / "verdict.json"
+    fetched = fetcher(tmp_path)
+    assert ci.gpu_lane("3.12", ["tests/test_reads.py"], out, cache=True, processes=1, deadline=600.0) == 0
+    assert float(fetched.read_text()) < float((tmp_path / "read").read_text())
+    fetched.unlink()
+    (tmp_path / "read").unlink()
+    fetcher(tmp_path, due=True)
+    with pytest.raises(subprocess.CalledProcessError):
+        ci.gpu_lane("3.12", ["tests/test_reads.py"], out, cache=True, processes=1, deadline=600.0)
+    assert fetched.is_file() and not (tmp_path / "read").exists()
+
+
 def test_a_gpu_lane_runs_each_file_in_a_process_of_its_own_within_its_memory_share(
         ci, tmp_path, monkeypatch, cache_worker):
     """The GPU lane runs each file once, in a process of its own. A file no
@@ -352,6 +396,7 @@ def test_a_gpu_lane_runs_each_file_in_a_process_of_its_own_within_its_memory_sha
     venv.mkdir(parents=True)
     (venv / "python").write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
     (venv / "python").chmod(0o755)
+    fetcher(tmp_path)
 
     def ran(stem: str) -> list[list[str]]:
         return [path.read_text().split() for path in sorted(tmp_path.glob(f"ran-{stem}-*"),
@@ -462,16 +507,32 @@ def test_coverage_combines_each_tasks_branches_into_one_report_a_module_a_line(c
     venv.mkdir(parents=True)
     (venv / "python").write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
     (venv / "python").chmod(0o755)
-    for name in ("negative", "positive"):
-        (tmp_path / "runs" / name).mkdir(parents=True)
-        ci.task("3.12", [f"tests/test_{name}.py"], "", tmp_path / "runs" / name / "rows.json", 600.0,
-                cache=False, coverage=tmp_path / "runs" / name)
+    # armada keeps each task's artifacts under its index; a directory of another name is no task.
+    for index, name in enumerate(("negative", "positive")):
+        (tmp_path / "runs" / str(index)).mkdir(parents=True)
+        ci.task("3.12", [f"tests/test_{name}.py"], "", tmp_path / "runs" / str(index) / "rows.json", 600.0,
+                cache=False, coverage=tmp_path / "runs" / str(index))
+    (tmp_path / "runs/logs").mkdir()
     assert ci.coverage_report(tmp_path / "runs") == 0
     files = {Path(name).name: measured for name, measured in
              json.loads((tmp_path / "runs/coverage.json").read_text())["files"].items()}
     assert files["sign.py"]["summary"]["percent_covered"] == 100.0
     least = (tmp_path / "runs/coverage.md").read_text().splitlines()[2].split(" | ")
     assert Path(least[0].removeprefix("| ")).name == "unused.py" and least[-1] == "0.0% |"
+    # A task interrupted at its deadline leaves its later tests' coverage out: the pass is refused.
+    (tmp_path / "tests/test_slow.py").write_text("import time\ndef test_slow(): time.sleep(30)\n")
+    (tmp_path / "runs/2").mkdir()
+    ci.task("3.12", ["tests/test_slow.py"], "", tmp_path / "runs/2/rows.json", 1.0, cache=False, grace=5.0,
+            coverage=tmp_path / "runs/2")
+    assert ci.coverage_report(tmp_path / "runs") == 1
+
+
+def test_a_coverage_task_has_a_deadline_for_tracing(ci, tmp_path):
+    """Branch tracing slows a task several times over: each coverage item runs by COVERAGE_DEADLINE,
+    not a CI task's."""
+    (tmp_path / "tests/test_one.py").write_text("def test_one(): pass\n")
+    items = ci.coverage_items(300.0, {})
+    assert items and all(f"--deadline={ci.COVERAGE_DEADLINE:.0f}" in item for item in items)
 
 
 def test_a_file_whose_recorded_tests_outweigh_its_median_runs_split_by_them(ci, tmp_path):
@@ -778,10 +839,34 @@ def test_a_task_past_its_deadline_is_interrupted_and_every_row_it_holds_is_red(c
     out = tmp_path / "verdict.json"
     began = time.monotonic()
     ci.task("3.12", ["tests/test_quick.py", "tests/test_hangs.py"], "", out, 3.0, grace=2.0)
-    assert time.monotonic() - began < 60
+    # The deadline, the interrupt's grace, one settle budget and the reader's join, with room to spare.
+    assert time.monotonic() - began < 3.0 + 2.0 + ci.SETTLE + 10 + 15
     rows = {row["name"]: row for row in json.loads(out.read_text())["rows"]}
     assert {name: row["exitCode"] for name, row in rows.items()} == {
         "3.12:tests/test_quick.py": 1, "3.12:tests/test_hangs.py": 1}
+
+
+def test_stopping_a_group_spends_one_settle_budget_and_reports_a_leader_that_will_not_reap(monkeypatch):
+    """A group is stopped within one settle budget after SIGKILL, the leader's reaping and the other
+    members' ending together, and a leader still unreapable then is reported among the members that
+    outlived it, never raised: CI writes its verdict either way."""
+    groups = load("child_groups", "tools/armada")
+
+    class Stuck:
+        pid = 4242
+
+        def poll(self):
+            return None
+
+        def wait(self, timeout=None):
+            time.sleep(timeout)
+            raise subprocess.TimeoutExpired("stuck", timeout)
+
+    monkeypatch.setattr(groups, "signal_group", lambda leader, number: None)
+    monkeypatch.setattr(groups, "members", lambda group: [group])
+    began = time.monotonic()
+    assert groups.stop(Stuck(), settle=0.5) == [4242]
+    assert time.monotonic() - began < 0.9, "the leader's wait and the members' share one budget"
 
 
 def test_ci_gangs_run_every_multihost_case_in_exactly_one_gang(ci, tmp_path):

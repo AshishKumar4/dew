@@ -26,19 +26,19 @@ def gate(root: Path) -> int:
 
 
 def test_seven_lines_two_files_copy_fail_the_gate_and_six_or_one_owner_pass_it(tmp_path):
-    copied = tmp_path / "copied"
+    copied = tmp_path / "duplicates_copied"
     copied.mkdir()
     for name in ("first", "second"):
         (copied / f"{name}.py").write_text(f"def {name}(values, limit):\n{BLOCK}")
     # Refactor messages, duplicate-code among them, set bit 8.
     assert gate(copied) & 8
-    owned = tmp_path / "owned"
+    owned = tmp_path / "duplicates_owned"
     owned.mkdir()
     (owned / "first.py").write_text(f"def first(values, limit):\n{BLOCK}")
     (owned / "second.py").write_text("from first import first\n\n\ndef second(values, limit):\n"
                                      "    return first(values, limit)\n")
     assert gate(owned) == 0
-    sharing_six = tmp_path / "sharing_six"
+    sharing_six = tmp_path / "duplicates_sharing_six"
     sharing_six.mkdir()
     (sharing_six / "first.py").write_text(f"def first(values, limit):\n{BLOCK}")
     # The last line differs, so the two share six: not past the bar.
