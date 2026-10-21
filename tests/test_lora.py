@@ -742,6 +742,14 @@ REGISTRY_FIELDS = {"vocab_size": 256, "emb_features": 16, "num_layers": 2, "num_
                    "head_dim": 8, "mlp_features": 32, "max_seq_len": 16}
 
 
+
+def squared_output(model, variables, inputs):
+    """The mean squared output of `model` over `inputs`, in float32, as a loss's ratio."""
+    from dew.objectives.base import Ratio
+
+    outputs = model.apply(variables, inputs)
+    return Ratio(jnp.sum(outputs.astype(jnp.float32) ** 2), jnp.asarray(outputs.size, jnp.float32))
+
 def _registry_decoder():
     """A tiny causal transformer and its variables, built from the registry:
     no published checkpoint, so no weight layouts to resolve names through."""
@@ -798,7 +806,7 @@ def test_trained_factors_over_a_bf16_base_resume_on_the_rebuilt_model_as_an_unin
     bfloat16 would round the restored factors; a resume that drew afresh would start elsewhere."""
     from dew.config import ModelConfig
     from dew.inputs import Field, InputSpec
-    from dew.objectives.base import Objective, Ratio
+    from dew.objectives.base import Objective
 
     model = nn.Sequential([nn.Dense(8, param_dtype=jnp.bfloat16), nn.Dense(4, param_dtype=jnp.bfloat16)])
     rows = 2 * jax.device_count()
@@ -821,8 +829,7 @@ def test_trained_factors_over_a_bf16_base_resume_on_the_rebuilt_model_as_an_unin
             return self.model.init(key, inputs) if self.variables is None else self.variables
 
         def loss(self, variables, batch, step):
-            outputs = self.model.apply(variables, batch["x"])
-            return Ratio(jnp.sum(outputs.astype(jnp.float32) ** 2), jnp.asarray(outputs.size, jnp.float32))
+            return squared_output(self.model, variables, batch["x"])
 
     def data():
         # A stream that keeps its position, so a resume continues where the checkpoint left it;
@@ -1188,7 +1195,7 @@ def test_a_custom_objective_trains_only_an_adapters_factors(decoder, reference):
     itself, so the optimizer moves the factors alone and the base comes
     back bitwise."""
     from dew.inputs import Field, InputSpec
-    from dew.objectives.base import Objective, Ratio
+    from dew.objectives.base import Objective
 
     tokens = np.asarray(reference["input_ids"])
 
@@ -1204,8 +1211,7 @@ def test_a_custom_objective_trains_only_an_adapters_factors(decoder, reference):
             return self.variables if variables is None else variables
 
         def loss(self, variables, batch, step):
-            logits = self.model.apply(variables, batch["text"])
-            return Ratio(jnp.sum(logits.astype(jnp.float32) ** 2), jnp.asarray(logits.size, jnp.float32))
+            return squared_output(self.model, variables, batch["text"])
 
     adapter = LoRA(rank=2, modules=("q_proj", "v_proj")).apply(decoder.model, decoder.variables, key=0,
                                                                layouts=decoder.layouts)

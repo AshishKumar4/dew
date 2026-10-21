@@ -300,15 +300,6 @@ def test_deepseek_v2_logits_match_the_reference_implementation():
 KIMI_K25 = FIXTURES / "kimi-k25-tiny"
 
 
-def test_kimi_k25_logits_match_the_reference_implementation():
-    """fp32 parity of the text half against Kimi_K25ForConditionalGeneration
-    on input_ids alone: tolerance 1e-4, observed max |logit difference|
-    the bound applies to the complete vocabulary at every input position."""
-    model, variables = fp32_decoder(KIMI_K25)
-    difference = recorded_logit_difference(model, variables, KIMI_K25)
-    assert difference < 1e-4, f"max |logit difference| {difference:.3e}"
-
-
 def test_a_kimi_k25_export_writes_the_source_names_and_the_vision_bytes(tmp_path):
     """The whole checkpoint comes back out: the decoder from the parameter
     tree under the release's names, the tower and the projector from the
@@ -340,14 +331,6 @@ def test_a_kimi_k25_export_writes_the_source_names_and_the_vision_bytes(tmp_path
 # --------------------------------------------------------------------------
 
 GLM4_MOE = FIXTURES / "glm4-moe-tiny"
-
-
-def test_glm4_moe_logits_match_the_reference_implementation():
-    """fp32 parity of the trunk: tolerance 1e-4, observed max |logit
-    difference| 3.3e-06 with identical argmax."""
-    model, variables = fp32_decoder(GLM4_MOE)
-    difference = recorded_logit_difference(model, variables, GLM4_MOE)
-    assert difference < 1e-4, f"max |logit difference| {difference:.3e}"
 
 
 def test_the_glm4_moe_mtp_depth_matches_the_reference_composition():
@@ -448,15 +431,6 @@ def test_kimi_k25_text_only_placeholders_match_reference():
     np.testing.assert_array_equal(actual.argmax(-1), expected.argmax(-1))
 
 
-def test_glm_moe_dsa_logits_match_the_reference_implementation():
-    """fp32 parity of the trunk: tolerance 1e-4, observed max |logit
-    difference| 2.7e-05 with identical argmax, over four selecting layers
-    and four that share the previous full layer's top-k."""
-    model, variables = fp32_decoder(GLM_MOE_DSA)
-    difference = recorded_logit_difference(model, variables, GLM_MOE_DSA)
-    assert difference < 1e-4, f"max |logit difference| {difference:.3e}"
-
-
 def test_the_glm_moe_dsa_mtp_depth_matches_the_reference_composition():
     """The checkpoint's model.layers.8.* depth loads as mtp_0 with its own
     indexer and the trunk's routing, and computes what the engines running
@@ -503,11 +477,18 @@ def test_glm_moe_dsa_decodes_what_it_computes_in_one_pass():
 # --------------------------------------------------------------------------
 
 DEEPSEEK_V4 = FIXTURES / "deepseek-v4-tiny"
-def test_deepseek_v4_logits_match_the_reference_implementation():
-    """fp32 parity over all three attention kinds and both routers:
-    tolerance 1e-4 on logits of magnitude 4.4."""
-    model, variables = fp32_decoder(DEEPSEEK_V4)
-    difference = recorded_logit_difference(model, variables, DEEPSEEK_V4)
+
+
+@pytest.mark.parametrize("directory", [KIMI_K25, GLM4_MOE, GLM_MOE_DSA, DEEPSEEK_V4],
+                         ids=["kimi-k25", "glm4-moe", "glm-moe-dsa", "deepseek-v4"])
+def test_a_moe_decoders_logits_match_the_reference_implementation(directory):
+    """fp32 parity against each release's reference, the complete vocabulary at every input position
+    within 1e-4 with identical argmax: Kimi K2.5's text half on input_ids alone; GLM-4 MoE's trunk
+    (observed 3.3e-06); GLM MoE DSA's over four selecting layers and four that share the previous
+    full layer's top-k (observed 2.7e-05); DeepSeek V4's over all three attention kinds and both
+    routers, on logits of magnitude 4.4."""
+    model, variables = fp32_decoder(directory)
+    difference = recorded_logit_difference(model, variables, directory)
     assert difference < 1e-4, f"max |logit difference| {difference:.3e}"
 
 
