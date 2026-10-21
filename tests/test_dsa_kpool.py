@@ -28,7 +28,22 @@ import pytest
 import torch
 import torch.nn.functional as F
 from flax import linen as nn
-from reference_error import assert_as_exact, assert_moves, widened
+import reference_error as _gate
+from reference_error import widened
+
+
+def assert_as_exact(dew_fn, reference_fn, draw, label, *, seeds, truth_fn=None):
+    count = _gate.seeds_for(reference_fn, draw, label, truth_fn=truth_fn)
+    print(f"SIZED {label!r} {count}", flush=True)
+    _gate.assert_as_exact(dew_fn, reference_fn, draw, label, seeds=count, truth_fn=truth_fn)
+    print(f"PASSED {label!r}", flush=True)
+
+
+def assert_moves(original_fn, changed_fn, draw, label, *, seeds, truth_fn=None):
+    count = _gate.seeds_for(original_fn, draw, label, truth_fn=truth_fn)
+    print(f"SIZED {label!r} {count}", flush=True)
+    _gate.assert_moves(original_fn, changed_fn, draw, label, seeds=count, truth_fn=truth_fn)
+    print(f"PASSED {label!r}", flush=True)
 from transformers.models.glm5_next.configuration_glm5_next import Glm5NextTextConfig
 from transformers.models.glm5_next.modeling_glm5_next import Glm5NextTextAttention
 
