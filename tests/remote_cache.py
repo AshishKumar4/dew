@@ -98,6 +98,7 @@ class RemoteCache:
         self.uploader = threading.Thread(target=self._uploading, daemon=True, name="xla-cache")
         self.uploader.start()
         self.programs_fetched = self.uploaded = 0
+        """The programs the remote's bundles put in the directory, and the bundles it took."""
 
     @property
     def available(self) -> bool:
@@ -157,11 +158,11 @@ class RemoteCache:
         except ValueError as error:  # an answer that is no whole bundle is a miss
             self._failed(error)
             return
-        keys = []
+        keys, new = [], 0
         with self.state:
             try:
                 for key, value in entries:
-                    self._seeded(key, value)
+                    new += self._seeded(key, value)
                     keys.append(key)
                     self.seen.add(key)
             except UNREACHABLE as error:
@@ -172,7 +173,7 @@ class RemoteCache:
         if keys and file not in self.unrestored:
             self._answered()
         with self.lock:
-            self.programs_fetched += len(keys)
+            self.programs_fetched += new
 
     def _fetched(self, file: str) -> list[tuple[str, bytes]]:
         """The entries of `file`'s bundle on the Worker; none where it has none or the remote was given
@@ -188,18 +189,19 @@ class RemoteCache:
         with answer as response:
             return unpacked(response.read(MAX_BYTES + 1))
 
-    def _seeded(self, key: str, value: bytes) -> None:
-        """`value` as program `key`'s file, unless the directory has it: written to a name of its own
-        and linked in whole, so a reader sees all of it or none."""
+    def _seeded(self, key: str, value: bytes) -> bool:
+        """`value` as program `key`'s file, written to a name of its own and linked in whole, so a
+        reader sees all of it or none; False, writing nothing, where the directory has it already."""
         handle, staged = tempfile.mkstemp(prefix=".", suffix=".partial", dir=self.directory)
         try:
             with os.fdopen(handle, "wb") as written:
                 written.write(value)
             os.link(staged, self.directory / f"{key}{SUFFIX}")
         except FileExistsError:
-            pass
+            return False
         finally:
             os.unlink(staged)
+        return True
 
     def closed(self, file: str) -> None:
         """Bundle `file` written back, where its tests compiled a program it lacked: the programs
@@ -332,10 +334,11 @@ def install(url: str, token: str) -> RemoteCache | None:
         return None
     try:
         address = urllib.parse.urlparse(url)
-        address.port  # noqa: B018 -- a port that is no number raises here, not at the first request
+        # Reading the port raises here, not at the first request, where it is no number.
+        valid = address.scheme in ("http", "https") and bool(address.hostname) and address.port != 0
     except ValueError:
-        address = None
-    if address is None or address.scheme not in ("http", "https") or not address.netloc:
+        valid = False
+    if not valid:
         logger.warning("the shared XLA cache's URL %r is no http(s) address", url)
         return None
     return RemoteCache(Path(directory), url, token, prefix())
