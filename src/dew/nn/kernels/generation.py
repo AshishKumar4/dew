@@ -260,7 +260,7 @@ def gpu_target(identifier: str | None = None) -> GpuTarget:
         device = jax.local_devices()[0]
         generation, kind = device_generation(), device.device_kind
         real = device.platform == 'gpu' and ASSUMED.get() is None
-        if real:
+        if real and gpu_placed():
             _one_kind(jax.devices())
         target = gpu_target(kind)
         if target.generation != generation:
