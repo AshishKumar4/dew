@@ -115,6 +115,10 @@ class GpuTarget:
     clock_hz: float | None = None
     memory_bandwidth: float | None = None
     tensor_rates: Mapping[str, int] = dataclasses.field(default_factory=dict)
+    load_latency: float | None = None
+    """The generation's global-memory load latency in multiprocessor clocks, as a pointer chase measures
+    it (the kernel cost model's waiting term, `dew.nn.kernels.templates.cost`); None where no
+    measurement states it."""
     int8_triton_gemm: bool = False
     """Whether XLA's Triton GEMM fusion computes int8 dots right on this GPU: on none measured, an
     A100 and an RTX PRO 6000 Blackwell, at jaxlib 0.11.2 (openxla/xla#51016;
@@ -172,6 +176,9 @@ class GpuTarget:
 # 1024/512; H100 SXM 989/495 -> 4096/2048; RTX PRO 6000 Blackwell Server 500/250 -> 1024/512.
 # GeForce parts of sm86 and sm89 sum 16-bit products in fp32 at half that rate (the GA102 and Ada
 # whitepapers); their generation's row states the data-center rate.
+# Global-memory load latency in clocks, a pointer chase's (Luo et al., "Benchmarking and Dissecting the
+# Nvidia Hopper GPU Architecture", IPDPS 2024, arXiv 2402.13499, Table IV): A100 466.3, H800 478.8,
+# RTX 4090 541.5; sm86 and the Blackwell generations are unmeasured there.
 # Opted-in shared memory per block, in KiB: Turing64, A100163, Ampere/Ada/RTX
 # Blackwell99, Hopper227. The SM reservation is already excluded:
 # https://docs.nvidia.com/cuda/ampere-tuning-guide/index.html
@@ -200,7 +207,7 @@ TARGETS = {target.generation: target for target in (
                'gated_delta_rule': 'fla', 'ssd': 'pallas'},
               {'NVIDIA A100': {'bf16': 312e12}}, ('gpu:a100', 'a100'), head_tile=(4096, 8192),
               multiprocessors=108, clock_hz=1410e6, memory_bandwidth=2039e9,
-              tensor_rates={'16bit': 2048, 'tf32': 1024}),
+              tensor_rates={'16bit': 2048, 'tf32': 1024}, load_latency=466.3),
     GpuTarget('sm86', 'NVIDIA A10', 99 * 1024, {'attention_narrow': 'flash'},
               {'NVIDIA A10': {}, 'NVIDIA GeForce RTX 3090': {'bf16': 71e12}}, multiprocessors=72,
               clock_hz=1695e6, memory_bandwidth=600e9, tensor_rates={'16bit': 1024, 'tf32': 512}),
@@ -210,7 +217,7 @@ TARGETS = {target.generation: target for target in (
               {'NVIDIA L4': {'bf16': 121e12, 'fp8': 242.5e12},
                'NVIDIA GeForce RTX 4080': {'bf16': 97.5e12}}, ('gpu:l4', 'l4'), head_tile=(4096, 8192),
               multiprocessors=58, clock_hz=2040e6, memory_bandwidth=300e9,
-              tensor_rates={'16bit': 1024, 'tf32': 512}),
+              tensor_rates={'16bit': 1024, 'tf32': 512}, load_latency=541.5),
     GpuTarget('sm90', 'NVIDIA H100 80GB HBM3', 227 * 1024,
               {'attention': 'flash', 'attention_narrow': 'flash', 'attention_window': 'flash',
                'attention_sinks': 'flash', 'attention_packed': 'flash', 'xla_triton_gemm': 'off',
@@ -221,7 +228,8 @@ TARGETS = {target.generation: target for target in (
         'NVIDIA H100 NVL': {'bf16': 835e12, 'fp8': 1670.5e12},
         'NVIDIA H200': {'bf16': 989e12, 'fp8': 1979e12},
         'NVIDIA H200 NVL': {'bf16': 835e12, 'fp8': 1670.5e12}}, wgmma=True, multiprocessors=132,
-              clock_hz=1830e6, memory_bandwidth=3350e9, tensor_rates={'16bit': 4096, 'tf32': 2048}),
+              clock_hz=1830e6, memory_bandwidth=3350e9, tensor_rates={'16bit': 4096, 'tf32': 2048},
+              load_latency=478.8),
     GpuTarget('sm120', 'NVIDIA RTX PRO 6000 Blackwell Server Edition', 99 * 1024,
               {'attention': 'flash', 'gated_delta_rule': 'fla'},
               dense_peaks={'NVIDIA RTX PRO 6000 Blackwell': {'bf16': 500e12, 'fp8': 1000e12}},
