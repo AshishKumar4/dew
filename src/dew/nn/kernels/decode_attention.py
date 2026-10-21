@@ -50,7 +50,7 @@ from jax.experimental import pallas as pl
 
 from ..decode_geometry import grouped_query
 from . import tuning
-from .generation import gpu_target, triton_runs
+from .generation import INHERENT, gpu_target, triton_runs
 from .selection import Requirement
 
 if TYPE_CHECKING:
@@ -94,12 +94,12 @@ _Need = Requirement["AttentionCase"]
 
 SUPPORTS = (
     _Need('capability', lambda case: triton_runs(), "the decode kernel needs a GPU of sm80 or later",
-          inherent=True),
+          row=INHERENT),
     _Need('queries', lambda case: case.heads % case.kv_heads == 0
           and case.queries * (case.heads // case.kv_heads) <= QUERIES,
           lambda case: f"the call's {case.queries} query positions of {case.heads} query heads over "
                        f"{case.kv_heads} key heads are past the {QUERIES} rows a program holds",
-          inherent=True),
+          row=INHERENT),
     _Need('width', _power_width,
           lambda case: f"the heads are {case.head_dim} wide, not a power of two from 16 to 256",
           row='roadmap: decode kernel widths'),
@@ -108,9 +108,9 @@ SUPPORTS = (
           row='roadmap: decode kernel capacities'),
     _Need('dtype', lambda case: case.dtype == case.key_dtype and case.dtype in DTYPES,
           lambda case: f"the queries are {case.dtype} over {case.key_dtype} keys; the kernel takes one of "
-                       "fp32, bf16 and fp16 on both, float64 going to the reference path", inherent=True),
+                       "fp32, bf16 and fp16 on both, float64 going to the reference path", row=INHERENT),
     _Need('arithmetic', lambda case: not case.arithmetic,
-          "the call asks for arithmetic only the reference path computes", inherent=True),
+          "the call asks for arithmetic only the reference path computes", row=INHERENT),
 )
 """The decode kernel's requirements of a call the decode selector serves (`dew.nn.attention_kernels.DECODE`,
 over an `AttentionCase`): a GPU Dew's Triton kernels run on, at most `QUERIES` positions, a

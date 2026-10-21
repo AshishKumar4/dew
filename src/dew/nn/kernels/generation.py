@@ -431,7 +431,7 @@ class Refusal:
     code: str
     detail: str
     row: str | None = None
-    """The roadmap or ledger row that tracks lifting the limit, 'inherent' where no implementation of the
+    """The roadmap or ledger row that tracks lifting the limit, `INHERENT` where no implementation of the
     kernel lifts it, None where the site declares neither (`dew.nn.kernels.selection.Requirement`)."""
 
     def __str__(self) -> str:
@@ -440,6 +440,9 @@ class Refusal:
 
 UNCLASSIFIED = 'unclassified'
 """The code of a refusal its site gives as text alone, which no kernel's `SUPPORTS` declares."""
+
+INHERENT = 'inherent'
+"""The row of a limit no implementation of the kernel lifts (`Refusal.row`)."""
 
 
 def refused(*checks: tuple[bool, str, str]) -> Refusal | None:
