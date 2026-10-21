@@ -11,6 +11,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from generation_support import INTERPRETS, generations, lowers
 from jax.sharding import Mesh
 from reference_error import assert_as_exact_as_the_reference, equations
 
@@ -69,6 +70,7 @@ def xla_products(x, w, dy, sizes, dtype, kernel_dtype):
     return forward.astype(dtype), input_gradient.astype(dtype), kernel_gradient.astype(kernel_dtype)
 
 
+@INTERPRETS
 @pytest.mark.parametrize("sizes", list(SIZES), ids=list(SIZES))
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float16])
 def test_the_hopper_grouped_matmuls_sum_each_groups_rows_as_exactly_as_xla(sizes, dtype):
@@ -107,6 +109,7 @@ def check(got, reference, truth, group, label):
         assert not np.any(got), f"{label}: every group is empty and the product is not zero"
 
 
+@INTERPRETS
 def test_the_kernel_gradient_keeps_a_neighbours_non_finite_rows_out():
     """The rows of the next group and the unrouted tail hold NaN and inf; each group's kernel gradient
     sums its own rows alone, every one finite and as exact as XLA's over clean rows."""
@@ -126,7 +129,7 @@ def test_the_kernel_gradient_keeps_a_neighbours_non_finite_rows_out():
                                       "kernel gradient")
 
 
-@pytest.mark.skipif(jax.default_backend() != "cpu", reason="interprets the kernels in a CPU process")
+@INTERPRETS
 @pytest.mark.parametrize("generation_name,implementation", [("sm80", "triton"), ("sm90", "mosaic_gpu")])
 def test_an_expert_projection_runs_the_implementation_chosen_for_it_on_the_cpu(generation_name: str,
                                                                                implementation: str):
@@ -162,6 +165,7 @@ def test_an_expert_projection_runs_the_implementation_chosen_for_it_on_the_cpu(g
                                           label)
 
 
+@lowers("sm90")
 @pytest.mark.parametrize("launch", [grouped_matmul.MosaicGmm(), grouped_matmul.MosaicGmmTransposed(),
                                     grouped_matmul.MosaicTgmm()], ids=lambda launch: type(launch).__name__)
 def test_every_tile_of_the_hopper_grouped_matmuls_lowers_for_an_h100(launch):
@@ -207,7 +211,7 @@ def test_a_forced_implementation_runs_or_says_why_it_cannot():
         grouped_matmul_kernel("pallas", jnp.float32, (jnp.float32, jnp.float32), "highest")
 
 
-@pytest.mark.parametrize("generation_name", ["sm80", "sm90"])
+@pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))
 def test_the_kernels_write_each_product_in_its_own_dtype(generation_name):
     """A bf16 projection over an fp32 master, through the implementations each generation picks: its
     launches write the forward and the input gradient in bf16 and the kernel gradient in fp32, with no
