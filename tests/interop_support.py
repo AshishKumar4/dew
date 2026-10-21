@@ -105,6 +105,26 @@ def assert_layout_tensors(layouts, variables, tensors, prefix: str) -> None:
         {layout.name.removeprefix(prefix): layout.export(variables) for layout in layouts}, tensors)
 
 
+def source_transformer(source: Path, name: str, model_class, fields, path) -> tuple:
+    """A Diffusers case's transformer read from its source (`source`/`name`/transformer): the model
+    `fields(config)` builds, its parameters read through `path`, and their layouts."""
+    from dew.interop.diffusion import component_tensors, read_transformer
+
+    config = json.loads((source / name / "transformer" / "config.json").read_text())
+    model = model_class(**fields(config, dtype="float32", attention_impl="xla"))
+    params, layouts = read_transformer(component_tensors(source / name, "transformer"), path)
+    return model, params, layouts
+
+
+def assert_transformer_exports(source: Path, name: str, layouts, params) -> None:
+    """Every tensor a Diffusers case's transformer publishes maps to a layout that exports it bit
+    for bit (`assert_layout_tensors`)."""
+    from dew.interop.diffusion import component_tensors
+
+    assert_layout_tensors(layouts, {"params": params}, component_tensors(source / name, "transformer"),
+                          "transformer/")
+
+
 def scaled_gap(actual, expected) -> float:
     """Maximum float64 error, scaled by max(1, the reference's magnitude)."""
     expected = np.asarray(expected, np.float64)
