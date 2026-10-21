@@ -228,7 +228,6 @@ def test_windows_that_drop_the_roles_their_documents_were_counted_in_are_refused
             stream.close()
 
 
-@pytest.mark.parametrize("read", ["indexed", "streamed"])
 @dataclasses.dataclass(frozen=True)
 class Delivered:
     """A delivered row as its tokens and the role-1 targets the loss scores of it."""
@@ -237,6 +236,7 @@ class Delivered:
         return {"text": row["text"], **Scored(1)(row)}
 
 
+@pytest.mark.parametrize("read", ["indexed", "streamed"])
 @pytest.mark.parametrize(("layout", "workers"), [("windows", 0), ("first-fit", 2), ("concat", 2)])
 def test_a_laid_out_corpus_resumed_reads_its_windows_counted_as_the_uninterrupted_read(
         read, layout, workers):
