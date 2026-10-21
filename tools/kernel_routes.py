@@ -2,7 +2,7 @@
 
 Each family's committed tiny config (tests/fixtures/hf/<name>/config.json, the fixture of fewest layers
 whose model_type is one of the family's, `fixtures`) is built in bf16 without weights and traced on a CPU
-within `generation.assumed(device)` for each of `DEVICES`: a training step's gradient, a
+within `generation.assumed(device)` for each of `audited()`: a training step's gradient, a
 64-token prefill, and one decode step on the dense cache and on a paged one. A bidirectional family
 (`causal` False) prefills through its causal view, as DiffusionGemma's encoder does, and decodes a canvas
 over that frozen prefix (`CausalSelfAttention._step_positions`); one whose layers keep a window on both
@@ -122,14 +122,15 @@ def published(config: dict) -> tuple[dict, bool]:
     return ({**config, "text_config": fixture} if nested else fixture), True
 
 
-DEVICES = ("sm80", "sm86", "sm89", "sm90", "sm100", "sm120", "v6e")
-"""The devices the report traces each family on (`generation.assumed`): every CUDA generation Dew's
-kernels take, Blackwell's datacenter part among them, and a TPU."""
-
-
 def audited() -> tuple[str, ...]:
-    """The devices the report audits (`DEVICES`)."""
-    return DEVICES
+    """The devices the report traces each family on (`generation.assumed`): every CUDA generation of
+    `generation.TARGETS` Dew's kernels take (8.0 and later, `triton_runs`), then one the targets do not
+    list (Blackwell's datacenter part, sm100) and a TPU (v6e)."""
+    from dew.nn.kernels import generation
+
+    taken = (name for name in generation.TARGETS
+             if (capability := generation.capability(name)) is not None and capability >= (8, 0))
+    return (*taken, "sm100", "v6e")
 
 
 LAYOUT_GAPS = {"mla": "ledger 830", "kpool_sparse_attention": "ledger 830",
