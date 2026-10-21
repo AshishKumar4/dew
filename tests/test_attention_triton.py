@@ -216,10 +216,10 @@ def score_hooks(names: tuple, queries: int, keys: int, value_width: int = 32):
 def check_backward(case: dict, names: tuple, dtype, config, dkv_config=None, *, width: int = 32,
                    value_width: int = 32):
     """`attention_triton.backward` with its dQ launch at `config` and its dK/dV launch at `dkv_config`
-    (`config` too by default), its every gradient (queries, keys, values, each score parameter, the
-    initial state's) on par with `jax.vjp` of the template's XLA arithmetic, from float64: the hooks'
-    parameters and initial state are drawn with the operands, so their gradients' truth is float64
-    too."""
+    (`config` too by default; its tiles are always the dQ launch's), its every gradient (queries, keys,
+    values, each score parameter, the initial state's) on par with `jax.vjp` of the template's XLA
+    arithmetic, from float64: the hooks' parameters and initial state are drawn with the operands, so
+    their gradients' truth is float64 too."""
     queries, keys = geometry(case)
     spans = template.spans(queries, keys, ROWS, **arguments(case))
     score_mod, kinds, draw_hooks = score_hooks(names, queries, keys, value_width)
@@ -268,8 +268,8 @@ def test_the_backward_is_on_par_over_every_call_form(form, config):
 
 @pytest.mark.parametrize("form", [form for form in CASES if form not in BACKWARD_FORMS])
 def test_the_backward_is_on_par_over_the_core_s_other_call_forms(form):
-    """The rest of the template core's call forms, the dQ and dK/dV launches at configs of their own."""
-    check_backward(CASES[form], (), jnp.float32, PINNED[0], PINNED[2])
+    """The rest of the template core's call forms, the dK/dV launch at warps and stages of its own."""
+    check_backward(CASES[form], (), jnp.float32, PINNED[0], attention_triton.Tiles(32, 32, 8, 3))
 
 
 @pytest.mark.parametrize("dtype", attention_triton.DTYPES, ids=DTYPE_IDS)
@@ -297,5 +297,6 @@ def test_the_backward_is_on_par_at_head_widths_padded_to_powers_of_two(width, va
 def test_every_backward_config_on_a_gpu(config):
     """Every config of the backward's space, bf16, causal documents under a window, a softcap, sinks and
     ALiBi."""
+    other = attention_triton.Tiles(config.block_q, config.block_k, 12 - config.warps, 5 - config.stages)
     check_backward(CASES["causal-documents-window"], SCORE_HOOKS["softcap-sinks-alibi"], jnp.bfloat16, config,
-                   PINNED[1])
+                   other)

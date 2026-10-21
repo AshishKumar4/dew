@@ -795,10 +795,18 @@ class TritonDkv(_Backward):
     """The backward's dK/dV launch over padded operands: a program per key block and query head walks the
     query blocks the block map gives it, under the dQ launch's softmax (`TritonDq`); returns the query
     head's dK and dV `[B, Kp, H, Dp]` fp32, which `backward` sums over each key head's group, and the
-    gradients of the score hook's key parameters (`[B, H, Kp]`)."""
+    gradients of the score hook's key parameters (`[B, H, Kp]`). Its tiles are the dQ launch's
+    (`block_q` by `block_k`), only its warps and stages its own: a product rounds by its shape, so the
+    logits it weighs each entry by are the very ones the dQ launch normalized."""
 
     name = "triton"
     config_cls = Tiles
+    block_q: int = 0
+    block_k: int = 0
+
+    def space(self, ba: tokamax.BoundArguments) -> Sequence[Tiles]:
+        return tuple(tiles for tiles in super().space(ba)
+                     if (tiles.block_q, tiles.block_k) == (self.block_q, self.block_k))
 
     def _programs(self, batch, heads, queries, keys, config):
         return batch * heads * (keys // config.block_k), queries // config.block_q
@@ -925,11 +933,14 @@ def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
     operands = (call.query, call.key, call.value, padded_dout)
     rows = (call.start, call.end, call.query_ids, call.key_ids, call.score_params)
     kinds = tuple(param.kind for param in hooks.score_params)
-    dq, *softmax = TritonDq(score_mod=hooks.score_mod, score_kinds=kinds, scale=scale)(
-        *operands, *(call.rows(start) for start in starts), *rows, interpret=interpret)
+    dq_op = TritonDq(score_mod=hooks.score_mod, score_kinds=kinds, scale=scale)
+    dq_arguments = (*operands, *(call.rows(start) for start in starts), *rows)
+    tiles = dq_op.chosen(dq_op.bind(*dq_arguments, interpret=interpret))
+    dq, *softmax = dq_op(*dq_arguments, interpret=interpret)
     softmax, dq_grads = softmax[:5], softmax[5:]
     padded_delta, padded_anchor, padded_peak, padded_total, _ = softmax
-    dk, dv, *key_grads = TritonDkv(score_mod=hooks.score_mod, score_kinds=kinds, scale=scale)(
+    dk, dv, *key_grads = TritonDkv(score_mod=hooks.score_mod, score_kinds=kinds, scale=scale,
+                                   block_q=tiles.block_q, block_k=tiles.block_k)(
         *operands, padded_peak, padded_total, padded_anchor, padded_delta, *rows, interpret=interpret)
     delta, anchor, peak, total, shift = (array[:, :, :queries] for array in softmax)
     delta = anchor + delta
