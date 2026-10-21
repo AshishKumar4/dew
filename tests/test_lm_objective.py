@@ -19,7 +19,7 @@ import optax
 import pytest
 from affine_run import dataset
 from recording import RecordingTracker
-from reference_error import assert_as_exact_as_the_reference, assert_leaves_as_exact, widened
+from reference_error import assert_as_exact, assert_as_exact_as_the_reference, widened
 
 from dew.artifacts import TokenScores
 from dew.data.chat import ROLES_KEY, Role
@@ -652,37 +652,56 @@ def test_z_loss_adds_the_squared_log_partition_of_the_counted_targets():
     assert abs(float(loss) - float(without)) > 1e-4, "the term made no difference to check"
 
 
+Z_LOSS_SEEDS = 16
+"""Check 1's declared seeds for the z-loss gradient, sized by `seeds_for` (2026-10-21, on armada)."""
+
+
 def test_z_loss_gradient_carries_the_reference_factor():
     """The oracle's logit gradient, `(1 + 2 z log Z) softmax - onehot`, pulled
-    back through the model, holds the objective's parameter gradient as near
-    float64 as the oracle's own float32 run is (`assert_leaves_as_exact`):
-    the truth pulls the float64 oracle at the float64 forward's logits back
-    through that forward, the reference pulls the float32 oracle at the
-    float32 logits back in float32."""
+    back through the model, holds the objective's parameter gradient on par
+    with the oracle's own (check 1), over drawn parameters and tokens: the
+    reference pulls the oracle at the model's logits back through the model,
+    in float32, and in float64 for the truth, the model then widened too."""
     from tools.distillation_reference import z_loss_reference
 
     coefficient = 1e-2
-    batch = token_batch()
-    tokens = np.asarray(batch[TEXT_KEY])
     objective = make_objective(z_loss=coefficient)
-    params = objective.init(jax.random.key(0))
-    ids = jnp.asarray(tokens[:, :-1], jnp.int32)
     model = objective.model
-    logits, pullback = jax.vjp(lambda p: model.apply({"params": p}, ids), params["params"])
-    weights = np.ones(tokens[:, 1:].shape)
-    _, _, rounded = z_loss_reference(np.asarray(logits), tokens[:, 1:], weights, coefficient,
-                                     dtype=np.float32)
-    reference, = pullback(jnp.asarray(rounded))
-    with jax.enable_x64(new_val=True):
-        wide = model.clone(dtype=jnp.float64)
-        wide_logits, widened_pullback = jax.vjp(lambda p: wide.apply({"params": p}, ids),
-                                                widened(params["params"]))
-        _, _, cotangent = z_loss_reference(np.asarray(wide_logits), tokens[:, 1:], weights, coefficient)
-        truth, = widened_pullback(cotangent)
-        truth = jax.tree.map(np.asarray, truth)
-    actual = jax.grad(lambda p: objective.scalar_loss({"params": p}, batch, step_at())[0])(params["params"])
 
-    assert_leaves_as_exact(actual, reference, truth)
+    initialized = jax.jit(lambda key: objective.init(key)["params"])
+
+    def draw(seed):
+        # 32 rows: at the 4 of `token_batch`'s default the reference's own rounding of the embedding
+        # and norm gradients does not resolve its parity with itself within 512 seeds (`seeds_for`).
+        return initialized(jax.random.key(seed)), np.asarray(token_batch(batch=32, seed=seed)[TEXT_KEY])
+
+    def programs(forward):
+        # The forward and its pullback compiled once each, the oracle's cotangent between them.
+        apply = jax.jit(lambda p, ids: forward.apply({"params": p}, ids))
+        pull = jax.jit(lambda p, ids, cotangent: jax.vjp(lambda p: forward.apply({"params": p}, ids), p)[1](
+            cotangent)[0])
+        return apply, pull
+
+    compiled = {np.dtype(np.float32): programs(model),
+                np.dtype(np.float64): programs(model.clone(dtype=jnp.float64))}
+
+    def reference(params, tokens):
+        wide = jax.tree.leaves(params)[0].dtype == np.float64
+        apply, pull = compiled[np.dtype(np.float64 if wide else np.float32)]
+        ids = jnp.asarray(tokens[:, :-1], jnp.int32)
+        _, _, cotangent = z_loss_reference(np.asarray(apply(params, ids)), tokens[:, 1:],
+                                           np.ones(tokens[:, 1:].shape), coefficient,
+                                           dtype=None if wide else np.float32)
+        return pull(params, ids, jnp.asarray(cotangent))
+
+    @jax.jit
+    def dew(params, tokens):
+        def loss(p):
+            return objective.scalar_loss({"params": p}, {TEXT_KEY: tokens}, step_at())[0]
+
+        return jax.grad(loss)(params)
+
+    assert_as_exact(dew, reference, draw, "z-loss gradient", seeds=Z_LOSS_SEEDS)
 
 
 def test_router_z_loss_adds_each_routers_mean_squared_log_partition():
