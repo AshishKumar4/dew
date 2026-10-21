@@ -231,7 +231,7 @@ REFUSED = {"kpool_sparse_attention"}
 """Kinds that refuse packed rows."""
 
 SEEDS = {"attention": 64, "deepseek_v4": 256, "gated_delta_net": 512, "llama4": 128,
-         "mamba": 32, "mla": 64, "mlp": 64}
+         "mamba": 32, "mamba2": 256, "mla": 64, "mlp": 64}
 """Each kind's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for`: the fewest for
 which documents run alone compared with themselves resolve PARITY in every logit and parameter
 gradient (2026-10-20, on armada)."""
