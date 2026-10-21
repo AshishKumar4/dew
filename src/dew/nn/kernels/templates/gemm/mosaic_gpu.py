@@ -295,7 +295,7 @@ def _gmm_cooperative(lhs, rhs, lengths, shape: tuple, *, tiles: Tiles, transpose
             fixed_smems=[plgpu.SMEM((2, *(extent[axis] for axis in prologue_axes[i])),
                                     prologue_gmems[i].dtype) for i in fixed],
             fixed_barriers=[plgpu.Barrier(num_barriers=2) for _ in fixed],
-            halves=plgpu.Barrier(num_arrivals=2),
+            halves=plgpu.Barrier(num_arrivals=2, num_barriers=2),
             collective_axes="wg",
         )
         def scope(allocations, o_smems, side_smems, side_barriers, fixed_smems, fixed_barriers, halves):
@@ -358,8 +358,7 @@ def _gmm_cooperative(lhs, rhs, lengths, shape: tuple, *, tiles: Tiles, transpose
                                                  for axis in prologue_axes[i])][...]
                             for i in range(len(prologue_axes)))).astype(mine.dtype)
                         plgpu.commit_smem()
-                        plgpu.barrier_arrive(halves)
-                        plgpu.barrier_wait(halves)
+                        _meet(halves)
                     columns = pl.ds(wg * half, half)
                     matrix = (rhs_smem.at[columns].transpose((1, 0)) if transpose_rhs
                               else rhs_smem.at[:, columns])
@@ -427,6 +426,15 @@ def _gmm_pipeline(tiles: Tiles, transpose_rhs: bool, steps: int, side_axes: tupl
         max_concurrent_steps=tiles.stages,
         compute_context=context,
     )
+
+
+def _meet(halves) -> None:
+    """Dew: the two consumer warpgroups wait for each other at `halves`, two barriers of two arrivals, in
+    turn: neither arrives at a barrier's next phase before the other has seen its last, however the meets
+    fall (the interpreter's invariant, and the hardware's parity waits)."""
+    for barrier in (halves.at[0], halves.at[1]):
+        plgpu.barrier_arrive(barrier)
+        plgpu.barrier_wait(barrier)
 
 
 def _shared(tiles: Tiles) -> tuple[str, ...]:
@@ -617,7 +625,7 @@ def _tgmm_cooperative(operands: tuple, groups: tuple, shape: tuple, *, tiles: Ti
             fixed_smems=[plgpu.SMEM((2, *(extent[axis] for axis in prologue_axes[i])), side_gmems[i].dtype)
                          for i in fixed],
             fixed_barriers=[plgpu.Barrier(num_barriers=2) for _ in fixed],
-            halves=plgpu.Barrier(num_arrivals=2),
+            halves=plgpu.Barrier(num_arrivals=2, num_barriers=2),
             collective_axes="wg",
         )
         def scope(allocations, o_smem, fixed_smems, fixed_barriers, halves):
@@ -649,15 +657,10 @@ def _tgmm_cooperative(operands: tuple, groups: tuple, shape: tuple, *, tiles: Ti
                     boundary = _zero_neighbours_of((mine, rhs_smem.at[:, mine_columns]), step, start, end,
                                                    steps, block_k)
                     plgpu.commit_smem()
-
-                    def meet():
-                        plgpu.barrier_arrive(halves)
-                        plgpu.barrier_wait(halves)
-
                     if prologue is not None:
-                        meet()
+                        _meet(halves)
                     else:
-                        pl.when(boundary)(meet)
+                        pl.when(boundary)(lambda: _meet(halves))
 
                 def product(lhs_smem, rhs_smem, acc_ref):
                     plgpu.wgmma(acc_ref, lhs_smem.transpose((1, 0)), rhs_smem.at[:, mine_columns])
