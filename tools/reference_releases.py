@@ -35,6 +35,9 @@ RELEASES: Mapping[str, Mapping[str, str]] = {
     # Ouro's remote code imports names transformers 5 dropped.
     "ouro": {"transformers": "4.56.2"},
     "timm": {"timm": "1.0.29"},
+    "torch": {"torch": "2.14.0"},
+    # fla's kernels and Qwen3.5's fla path, in their own environment (joint_checkpoint_reference.on_fla).
+    "fla": {"torch": "2.8.0", "transformers": "5.16.1", "fla-core": "0.5.2"},
     "diffusers": {"diffusers": tested("diffusers")},
     # The pipelines diffusers 0.34.0 builds read transformers 4's text towers.
     "diffusers-pipelines": {"diffusers": tested("diffusers"), "transformers": "4.49.0"},

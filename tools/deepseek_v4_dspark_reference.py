@@ -71,6 +71,7 @@ import torch
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import deepseek_v41_reference as v41
 from decoder_export_reference import lower_index_ties
+from reference_releases import require
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -294,6 +295,7 @@ def transformers_logits(directory: Path, ids: torch.Tensor, dtype: torch.dtype):
 def write(seed: int):
     from dew.interop.safetensors_io import write_file
 
+    pins = require("transformers")
     module = import_reference()
     ids = inputs(seed)
     net, outputs, found = released_outputs(module, seed, ids)
@@ -330,7 +332,8 @@ def write(seed: int):
              draft_confidence=wide["draft_confidence"])
     (FIXTURE / "source.json").write_text(json.dumps({
         "release": {"repo": REPO, "revision": DEEPSEEK_V4_0731_REVISION, "path": "inference/model.py"},
-        "transformers": {"version": "5.16.1"}, "seed": seed, "tied_selections": ties}, indent=1) + "\n")
+        "transformers": {"version": pins["transformers"]}, "seed": seed, "tied_selections": ties},
+        indent=1) + "\n")
     print(f"{FIXTURE}: {len(tensors)} tensors, seed {seed}")
 
 
