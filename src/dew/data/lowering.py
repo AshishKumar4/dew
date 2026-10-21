@@ -140,7 +140,7 @@ def _cache_inputs(source: Source, records: Records) -> pygrain.MapDataset:
     record's index (`map_with_index`) reads it, as it does without the cache."""
     stored = pygrain.MapDataset.source(records)
     if isinstance(source, _Materialized) and source.identifiers:
-        return stored.map_with_index(_Placed(identifiers=source.identifiers))
+        return stored.map_with_index(_Placed(identifiers=source.identifiers, rows=len(stored)))
     return stored
 
 
