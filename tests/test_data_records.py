@@ -76,14 +76,15 @@ class Tagged(grain.MapTransform):
         return {**row, "text": row["text"] + " tag" * self.offset}
 
 
-def test_the_record_of_a_store_and_a_preset_is_json_of_classes_and_their_fields():
-    """The record of documents read through the lm preset: JSON naming the store and each stage by
-    its import path."""
-    written = encode(_documents().pipe(presets.lm, "byte", seq_len=8, batch=2))
+def test_the_record_of_a_store_and_its_stages_is_json_of_classes_and_their_fields():
+    """The record of documents shuffled and batched: JSON naming the store and each stage by its
+    import path."""
+    written = encode(_documents().shuffle(0).batch(2))
     assert not isinstance(written, Unrecorded)
     assert written["version"] == 1
     assert written["source"]["class"] == "dew.data.sources.memory:Memory"
-    assert [stage["class"] for stage in written["stages"]][-1] == "dew.data.pipeline:BatchStage"
+    assert [stage["class"] for stage in written["stages"]] == ["dew.data.pipeline:Shuffle",
+                                                               "dew.data.pipeline:BatchStage"]
     json.dumps(written)
 
 
