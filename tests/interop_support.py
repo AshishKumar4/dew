@@ -42,6 +42,19 @@ def hub_cache(cache: Path, repo_id: str, source: Path) -> str:
     return commit
 
 
+def without_config_field(source: Path, directory: Path, *path: str) -> Path:
+    """`source`'s checkpoint copied to `directory` with the config field at `path` (a key, nested
+    keys after it) left out, as a config that leaves it to its default writes it."""
+    shutil.copytree(source, directory)
+    config = json.loads((directory / "config.json").read_text())
+    section = config
+    for key in path[:-1]:
+        section = section[key]
+    del section[path[-1]]
+    (directory / "config.json").write_text(json.dumps(config))
+    return directory
+
+
 def fixture_arrays(path: Path) -> dict[str, np.ndarray]:
     with np.load(path, allow_pickle=False) as source:
         return dict(source)
