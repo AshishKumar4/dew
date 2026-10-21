@@ -45,3 +45,17 @@ def encoded_token_fixture(directory: Path, documents: Iterable[str], *, tokenize
     held = int(len(tokens) * val_fraction)
     return write_token_corpus(directory, tokens[held:], tokens[:held], tokenizer=tokenizer,
                               vocab_size=vocabulary.vocab_size, eos_id=vocabulary.eos_id if eos else None)
+
+
+def export_byte_tokens(root: Path, documents: Iterable[str], *flags: str) -> Path:
+    """`documents` written as records under `root` and exported by `dew data export records` as byte
+    tokens, each document ended by its EOS, into `root/tokens`, with the export's further `flags`."""
+    from dew.cli.main import main
+
+    records = root / "documents.jsonl"
+    records.write_text("".join(json.dumps({"text": text}) + "\n" for text in documents))
+    exported = root / "tokens"
+    fields = json.dumps({"source": str(records)})
+    assert main(["data", "export", "records", str(exported), "--fields", fields, "--tokenizer", "byte",
+                 "--eos", *flags]) == 0
+    return exported

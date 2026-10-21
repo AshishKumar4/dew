@@ -20,7 +20,7 @@ import optax
 import pytest
 from absl import flags
 from reader_support import assert_a_rewrite_moves_the_identity
-from token_support import write_token_corpus
+from token_support import export_byte_tokens, write_token_corpus
 
 from dew.config.data import TextData, loader
 from dew.data import ByteTokenizer, Loading
@@ -1119,14 +1119,8 @@ def test_a_token_mixture_validates_on_the_corpora_that_hold_a_validation_split(t
 def test_a_one_split_token_export_refuses_a_validation_split_it_does_not_hold(tmp_path):
     """A committed token export holds one split, so a validation split it lacks is refused by
     the store's own split selection, where the recipe once validated on the training tokens."""
-    from dew.cli.main import main
     from dew.data.holdout import Split
 
-    documents = tmp_path / "documents.jsonl"
-    documents.write_text("".join(json.dumps({"text": text}) + "\n" for text in ("first", "next")))
-    exported = tmp_path / "tokens"
-    fields = json.dumps({"source": str(documents)})
-    assert main(["data", "export", "records", str(exported), "--fields", fields, "--tokenizer", "byte",
-                 "--eos", "--format", "array_record"]) == 0
+    exported = export_byte_tokens(tmp_path, ("first", "next"), "--format", "array_record")
     with pytest.raises(ValueError):
         TextData(source=str(exported), seq_len=4, validation=Split("val")).pipelines()

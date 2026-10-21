@@ -20,7 +20,9 @@ import pyarrow as pa
 import pyarrow.dataset as ds
 import pyarrow.fs as pafs
 import pytest
-from reader_support import assert_a_rewrite_moves_the_identity
+from reader_support import assert_a_rewrite_moves_the_identity, assert_resumes_where_it_stopped
+from storage_support import moto_bucket
+from token_support import export_byte_tokens
 
 from dew.data.dataset import DataPartition, Loading
 from dew.data.shards import streamed
@@ -629,17 +631,11 @@ def test_each_token_document_is_checked_against_its_producer_length(token_span_s
 
 @pytest.mark.parametrize("format_args", [[], ["--format", "array_record"]])
 def test_cli_token_exports_are_readable_by_the_dispatched_token_source(tmp_path, format_args):
-    from dew.cli.main import main
     from dew.data.sources import TokenFiles, source
     from dew.data.text import ByteTokenizer
 
     documents = ["first café", "next document", "last"]
-    input = tmp_path / "documents.jsonl"
-    input.write_text("".join(json.dumps({"text": text}) + "\n" for text in documents))
-    destination = tmp_path / "tokens"
-    assert main(["data", "export", "records", str(destination),
-                 "--fields", json.dumps({"source": str(input)}), "--tokenizer", "byte", "--eos",
-                 "--rows-per-shard", "2", *format_args]) == 0
+    destination = export_byte_tokens(tmp_path, documents, "--rows-per-shard", "2", *format_args)
     stored = source(str(destination))
     assert isinstance(stored, TokenFiles)
     vocabulary = ByteTokenizer()
@@ -742,34 +738,19 @@ def test_a_token_export_reads_through_the_storage_options_it_is_given(tmp_path):
     """A committed token export that only its storage options reach, an S3 endpoint of its own,
     reads its manifest, metadata and tokens through them, as its shards and index do."""
     import fsspec
-    from moto.server import ThreadedMotoServer
 
-    from dew.cli.main import main
     from dew.data.sources import TokenFiles
     from dew.data.text import ByteTokenizer
 
-    input = tmp_path / "documents.jsonl"
-    input.write_text("".join(json.dumps({"text": text}) + "\n" for text in ("first", "next")))
-    destination = tmp_path / "tokens"
-    fields = json.dumps({"source": str(input)})
-    assert main(["data", "export", "records", str(destination), "--fields", fields, "--tokenizer", "byte",
-                 "--eos", "--format", "array_record"]) == 0
-    server = ThreadedMotoServer(ip_address="127.0.0.1", port=0, verbose=False)
-    server.start()
-    try:
-        _, port = server.get_host_and_port()
-        options = {"key": "testing", "secret": "testing", "endpoint_url": f"http://127.0.0.1:{port}"}
-        bucket = "tokens-" + uuid4().hex
+    destination = export_byte_tokens(tmp_path, ("first", "next"), "--format", "array_record")
+    with moto_bucket("tokens") as (bucket, options):
         remote = fsspec.filesystem("s3", **options)
-        remote.mkdir(bucket)
         remote.put(str(destination), f"{bucket}/export", recursive=True)
         stored = TokenFiles(f"s3://{bucket}/export", storage_options=options)
         vocabulary = ByteTokenizer()
         assert stored.meta["eos_id"] == vocabulary.eos_id
         assert stored.tokens[:].tolist() == [*vocabulary.encode("first"), vocabulary.eos_id,
                                              *vocabulary.encode("next"), vocabulary.eos_id]
-    finally:
-        server.stop()
 
 
 def test_cli_refuses_an_unsupported_token_export_format_before_writing(tmp_path):
@@ -2037,23 +2018,7 @@ def test_native_map_datasets_read_as_streams_and_mix_with_a_stream_only_member()
         finally:
             alone.close()
         data = compile(mix([native.repeat(), streamed.repeat()]).batch(2), read="streamed", loading=loading)
-        whole = data.train(DataPartition())
-        try:
-            expected = ids(whole, 6)
-        finally:
-            whole.close()
-        stopped = data.train(DataPartition())
-        try:
-            head = ids(stopped, 3)
-            state = stopped.get_state()
-        finally:
-            stopped.close()
-        resumed = data.train(DataPartition())
-        try:
-            resumed.set_state(state)
-            assert head + ids(resumed, 3) == expected
-        finally:
-            resumed.close()
+        assert_resumes_where_it_stopped(lambda data=data: data.train(DataPartition()), ids, 3, 3)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -2111,23 +2076,10 @@ def test_concatenated_stores_train_as_one_store_and_resume_where_they_stopped(re
     def opened():
         return loader(RecordsData(joined), batch=2, read=read, loading=loading, seed=3).train(DataPartition())
 
-    whole = opened()
-    try:
-        expected = [np.asarray(next(whole)["id"]).tolist() for _ in range(8)]
-    finally:
-        whole.close()
-    stopped = opened()
-    try:
-        head = [np.asarray(next(stopped)["id"]).tolist() for _ in range(2)]
-        saved = stopped.get_state()
-    finally:
-        stopped.close()
-    resumed = opened()
-    try:
-        resumed.set_state(saved)
-        assert head + [np.asarray(next(resumed)["id"]).tolist() for _ in range(6)] == expected
-    finally:
-        resumed.close()
+    def ids(reader, count):
+        return [np.asarray(next(reader)["id"]).tolist() for _ in range(count)]
+
+    assert_resumes_where_it_stopped(opened, ids, 2, 6)
 
 
 def test_a_directory_of_arrow_files_reads_its_feather_files_too(tmp_path):

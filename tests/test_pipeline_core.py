@@ -15,6 +15,7 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+from reader_support import assert_resumes_where_it_stopped
 
 from dew import position
 from dew.data.cache import Cache
@@ -207,23 +208,8 @@ def test_a_global_order_resumes_through_the_stages_after_its_batch(read, after):
              "random map": rows.repeat().batch(2).random_map(RowDraws()),
              "finite repeat": rows.take(6).batch(2).repeat(2)}[after]
     data = compile(chain, read=read, loading=READ, seed=3)
-    whole = data.train(DataPartition())
-    try:
-        expected = take(whole, 8)
-    finally:
-        whole.close()
-    stopped = data.train(DataPartition())
-    try:
-        head = take(stopped, 2)
-        saved = stopped.get_state()
-    finally:
-        stopped.close()
-    resumed = data.train(DataPartition())
-    try:
-        resumed.set_state(saved)
-        assert head + take(resumed, 6) == expected
-    finally:
-        resumed.close()
+    expected, saved = assert_resumes_where_it_stopped(lambda: data.train(DataPartition()), take, 2, 6)
+    head = expected[:2]
     shares, uninterrupted = [], []
     for index in range(2):
         reader = data.train(DataPartition(index, 2))
@@ -592,23 +578,7 @@ def test_a_native_step_draws_by_the_runs_seed_and_resumes(read):
 
     def draws(chain, seed):
         data = compile(chain.repeat().batch(2), read=read, loading=READ, seed=seed)
-        whole = data.train(DataPartition())
-        try:
-            expected = take(whole, 4)
-        finally:
-            whole.close()
-        stopped = data.train(DataPartition())
-        try:
-            head = take(stopped, 2)
-            saved = stopped.get_state()
-        finally:
-            stopped.close()
-        resumed = data.train(DataPartition())
-        try:
-            resumed.set_state(saved)
-            assert head + take(resumed, 2) == expected
-        finally:
-            resumed.close()
+        expected, _ = assert_resumes_where_it_stopped(lambda: data.train(DataPartition()), take, 2, 2)
         return [draw for batch in expected for draw in batch["draw"]]
 
     assert draws(rows, 5) != draws(rows, 6)
@@ -2335,23 +2305,7 @@ def test_an_endless_repeat_resumed_at_the_end_of_a_pass_reads_on(read, batched):
     def ids(stream, count: int) -> list[int]:
         return [int(value) for batch in itertools.islice(stream, count) for value in batch["id"]]
 
-    whole = data.train(DataPartition())
-    try:
-        expected = ids(whole, 3)
-    finally:
-        whole.close()
-    stopped = data.train(DataPartition())
-    try:
-        head = ids(stopped, 1)
-        state = stopped.get_state()
-    finally:
-        stopped.close()
-    resumed = data.train(DataPartition())
-    try:
-        resumed.set_state(state)
-        assert head + ids(resumed, 2) == expected
-    finally:
-        resumed.close()
+    assert_resumes_where_it_stopped(lambda: data.train(DataPartition()), ids, 1, 2)
 
 
 def test_a_random_step_after_an_endless_repeat_draws_as_after_a_finite_one():
