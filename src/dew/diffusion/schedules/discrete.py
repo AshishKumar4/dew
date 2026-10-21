@@ -61,7 +61,7 @@ class DiscreteNoiseScheduler(NoiseScheduler):
         return rows_taken(self.alpha_cumprod, index), rows_taken(self.one_minus_alpha_cumprod, index)
 
     def sample_t(self, key, n):
-        return jax.random.randint(key, (n,), 0, self.T)
+        return jax.random.randint(key, (n,), 0, self.T, jnp.int32)
 
     def weight(self, t):
         return rows_taken(self.p2_loss_weights, self.index(t))

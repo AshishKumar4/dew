@@ -288,7 +288,8 @@ class ShortcutObjective(DiffusionObjective):
         below its `grid`, an integer below `sections` reduced by the grid, which divides it, the noise,
         and whether a flow-matching row drops its condition."""
         sections = self.sections
-        drawn = step.sample("time index", lambda key: jax.random.randint(key, (), 0, sections), rows=count)
+        drawn = step.sample("time index", lambda key: jax.random.randint(key, (), 0, sections, jnp.int32),
+                            rows=count)
         probability = jnp.float32(self.unconditional_prob)
         return (drawn % grid.astype(jnp.int32),
                 step.sample("noise", jax.random.normal, shape[1:], dtype=jnp.float32, rows=count),

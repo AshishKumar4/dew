@@ -178,7 +178,7 @@ class _UniformGrid(_PairedGrid, NoiseScheduler):
     """
 
     def sample_t(self, key, n: int):
-        return jax.random.uniform(key, (n,), minval=0, maxval=self.T)
+        return jax.random.uniform(key, (n,), jnp.float32, 0, self.T)
 
     def weight(self, t):
         return jnp.ones_like(jnp.asarray(t, jnp.float32))

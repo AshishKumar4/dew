@@ -99,7 +99,7 @@ class GuidanceDistillationObjective(DiffusionObjective):
         samples = self.clean_samples(variables, batch, encode_key, step)
         count = samples.shape[0]
         low, high = self.scales
-        scale = step.sample("guidance scale", lambda key: jax.random.uniform(key, minval=low, maxval=high),
+        scale = step.sample("guidance scale", lambda key: jax.random.uniform(key, (), jnp.float32, low, high),
                             rows=count)
         schedule = self.process.schedule
         t = step.sample("times", lambda key: schedule.sample_t(key, 1)[0], rows=count)

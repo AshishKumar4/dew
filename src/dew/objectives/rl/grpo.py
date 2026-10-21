@@ -16,6 +16,7 @@ perplexity, since a validation pass never samples.
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import replace
 from typing import NamedTuple
 
 import jax
@@ -363,7 +364,8 @@ class GRPOObjective(TokenScorer):
         """Return the per-token scores of the prompts under the policy, for their perplexity,
         compiled for the current modules over the prompts alone (`_evaluation_scores`)."""
         prompts = {PROMPT_KEY: batch[PROMPT_KEY], LENGTH_KEY: batch[LENGTH_KEY]}
-        return self._compiled_scores(self.evaluation_variables(params, step), prompts, step.replace(ema=None))
+        return self._compiled_scores(self.evaluation_variables(params, step), prompts,
+                                     replace(step, ema=None))
 
     def _evaluation_scores(self, params, batch, step) -> TokenScores:
         """The prompts' per-token scores.

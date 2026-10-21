@@ -119,7 +119,7 @@ class ContinuousNoiseScheduler(NoiseScheduler):
     T = 1.0
 
     def sample_t(self, key, n):
-        return jax.random.uniform(key, (n,), minval=0.0, maxval=self.T)
+        return jax.random.uniform(key, (n,), jnp.float32, 0.0, self.T)
 
 
 class GeneralizedNoiseScheduler(ContinuousNoiseScheduler):

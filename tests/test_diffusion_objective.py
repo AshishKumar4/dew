@@ -471,13 +471,28 @@ def test_an_accumulated_update_of_a_diffusion_objective_is_its_batch_whole_on_on
 def test_a_host_master_step_draws_each_examples_noise_as_the_resident_step_does():
     """A step whose variables live on the host runs its loss on the accelerator with the examples'
     draws the step carries, so it takes the update a resident step takes: a host-master run's draws
-    by the attempt would read other times, noise and dropped conditions, and step elsewhere."""
+    by the attempt would read other times, noise and dropped conditions, and step elsewhere. Both are
+    held to the float64 twin's update at the step's draws (`example_fields`)."""
+    import copy
+
     import optax
+    from reference_error import assert_leaves_as_exact, widened
 
     from dew.training import Layout, Trainer
+    from dew.training.transaction import example_fields
 
     objective = make_objective(unconditional_prob=0.5)
     batch = make_batch_of(4 * jax.device_count())
+    initial = Trainer(objective, optax.sgd(0.1), key=jax.random.PRNGKey(3)).initial_state()
+    info = Step(jnp.asarray(0), jax.random.fold_in(initial.key, 0), None,
+                **example_fields(initial, 0, 1, batch))
+    twin = copy.copy(objective)
+    twin.substitute([objective.model.clone(dtype=jnp.float64)])
+    with jax.enable_x64(new_val=True):
+        wide = jax.tree.map(jnp.asarray, widened(jax.tree.map(np.asarray, initial.variables)))
+        grads = jax.grad(lambda params: twin.scalar_loss(
+            {**wide, "params": params}, widened(batch), info)[0])(wide["params"])
+        truth = jax.tree.map(lambda value, grad: np.asarray(value - 0.1 * grad), wide["params"], grads)
 
     def stepped(layout):
         trainer = Trainer(objective, optax.sgd(0.1), key=jax.random.PRNGKey(3), layout=layout)
@@ -488,6 +503,4 @@ def test_a_host_master_step_draws_each_examples_noise_as_the_resident_step_does(
 
     resident = stepped(Layout(min_shard=1, tolerance=1.))
     host = stepped(Layout(host=("variables",), min_shard=1, tolerance=1.))
-    for (path, got), want in zip(jax.tree_util.tree_leaves_with_path(host), jax.tree.leaves(resident),
-                                 strict=True):
-        np.testing.assert_allclose(got, want, rtol=1e-5, atol=1e-6, err_msg=jax.tree_util.keystr(path))
+    assert_leaves_as_exact(host, resident, truth)

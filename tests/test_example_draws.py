@@ -90,8 +90,15 @@ def few_step(kind, **fields):
 def test_a_few_step_update_gives_its_roles_by_place_on_every_layout(kind):
     """MeanFlow's instantaneous rows and dropped conditions and a shortcut model's bootstrapping rows
     are the update's first examples by place: an update read as two halves trains each example as
-    its whole batch does, so the halves' summed losses are the whole batch's, to rounding."""
+    its whole batch does, so the halves' summed gradients are as exact as the whole batch's, the
+    float64 twin's the truth."""
+    import copy
+
+    from reference_error import assert_leaves_as_exact, widened
+
     objective = few_step(kind)
+    twin = copy.copy(objective)
+    twin.substitute([objective.model.clone(dtype=jnp.float64)])
     params = objective.init(jax.random.PRNGKey(0))
     leaves, tree = jax.tree.flatten(params["params"])
     keys = jax.random.split(jax.random.PRNGKey(4), len(leaves))
@@ -102,16 +109,24 @@ def test_a_few_step_update_gives_its_roles_by_place_on_every_layout(kind):
     batch = {"image": np.asarray(images, np.uint8),
              **objective.inputs.tokenize([str(row) for row in range(rows)])}
 
-    def total(part: slice) -> float:
+    def gradient(objective, variables, part: slice):
         examples = np.arange(rows)[part]
         step = Step(jnp.asarray(0), jax.random.key(2), None, example_key=UPDATE,
                     example_index=jnp.asarray(examples, jnp.int32), example_count=rows)
-        stats, _ = objective.loss(params, jax.tree.map(lambda value: value[part], batch), step)
-        return float(stats.total)
+        rows_of = jax.tree.map(lambda value: value[part], batch)
 
-    whole = total(slice(0, rows))
-    halves = total(slice(0, rows // 2)) + total(slice(rows // 2, rows))
-    np.testing.assert_allclose(halves, whole, rtol=1e-5)
+        def total(trainable):
+            stats, _ = objective.loss({**variables, "params": trainable}, rows_of, step)
+            return stats.total
+
+        return jax.tree.map(np.asarray, jax.grad(total)(variables["params"]))
+
+    whole = gradient(objective, params, slice(0, rows))
+    halves = jax.tree.map(np.add, gradient(objective, params, slice(0, rows // 2)),
+                          gradient(objective, params, slice(rows // 2, rows)))
+    with jax.enable_x64(new_val=True):
+        truth = gradient(twin, jax.tree.map(jnp.asarray, widened(params)), slice(0, rows))
+    assert_leaves_as_exact(halves, whole, truth)
 
 
 def test_each_examples_posterior_draw_is_its_own():
