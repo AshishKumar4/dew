@@ -301,9 +301,11 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None) -> _Draws:
             if np.size(leaf) == 0:
                 # An empty leaf (a one-tap convolution's history) is exact by construction: held to the
                 # reference's shape and dtype, it adds no error and resolves nothing.
-                kept = (np.shape(leaf), np.result_type(leaf))
-                assert kept == (np.shape(their_leaf), np.result_type(their_leaf)), (
+                kept = (np.shape(leaf), jnp.dtype(leaf.dtype))
+                assert kept == (np.shape(their_leaf), jnp.dtype(their_leaf.dtype)), (
                     jax.tree_util.keystr(path), kept, np.shape(their_leaf))
+                # The truth empty alike (in float64, its dtype is its own).
+                assert np.shape(true) == np.shape(leaf), (jax.tree_util.keystr(path), np.shape(true))
                 row.append((0.0, 0.0, 0.0, 0.0, 0, True))
                 continue
             leaf, their_leaf, true = (np.asarray(value, np.float64) for value in (leaf, their_leaf, true))
