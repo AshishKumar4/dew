@@ -164,6 +164,10 @@ class Files(Dataset):
     CSV is parsed by Python's `csv` module under the process's field size
     limit, 128 KiB a field by default; a source with longer fields reads
     once its caller raises `csv.field_size_limit`.
+
+    `suffixes` keeps the files whose names end in one of them, any case, as
+    they are listed when the store is read: a directory's media, not the lists
+    and notes beside it (`dew.data.video.media`).
     """
 
     url: str | tuple[str, ...]
@@ -176,6 +180,7 @@ class Files(Dataset):
     storage_options: Mapping[str, object] | None = field(default=None, repr=False)
     spark: bool = False
     file_info: Mapping[str, Mapping[str, object]] | None = None
+    suffixes: tuple[str, ...] | None = None
 
     @cached_property
     def declared(self) -> Mapping[str, Mapping[str, object]]:
@@ -256,7 +261,8 @@ class Files(Dataset):
                     names = [name for name in names if name.lower().endswith(_SUFFIXES[self.kind])]
             else:
                 names = [path]
-            found.extend(fs.unstrip_protocol(name) for name in names if fs.isfile(name))
+            found.extend(fs.unstrip_protocol(name) for name in names if fs.isfile(name)
+                         and (self.suffixes is None or PurePosixPath(name).suffix.lower() in self.suffixes))
         if not found:
             raise FileNotFoundError(f"source {self.url!r} matched no {self.kind} files")
         return tuple(found)
