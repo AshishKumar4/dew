@@ -79,21 +79,34 @@ def step_at(index=0, key=1, ema=None) -> Step:
     return Step(step=jnp.asarray(index), key=jax.random.key(key), ema=ema)
 
 
-def reference_run(arrays: dict, kind: str, outputs, dtype: str):
+def teacher_outputs(arrays: dict) -> tuple[np.ndarray, np.ndarray]:
+    """The teacher's logits and its paired layers' outputs, `[L, B, T, D]`, from the float32
+    forward the objective runs. The fixture stores none: the outputs its generator saw were another
+    XLA's rounding of that forward (up to 2.7e-6 off in states of about 8), which, fed to the
+    reference, would leave that rounding in Dew's distance from float64 alone."""
+    from tools.distillation_reference import dew_outputs
+
+    teacher = models()[1]
+    layers = [layer for layer, _ in META["pairs"]]
+    logits, states = dew_outputs(teacher, {"params": tree(arrays, "teacher/")["params"]},
+                                 jnp.asarray(arrays["tokens"][:, :-1]), layers)
+    return np.asarray(logits), np.stack([np.asarray(state) for state in states])
+
+
+def reference_run(arrays: dict, kind: str, outputs, teacher, dtype: str):
     """The reference transcription run in torch at the `dtype` named, on the student's `outputs`,
-    its logits and projected features, beside the fixture's teacher: its loss, its terms, and its
-    cotangents on those outputs."""
+    its logits and projected features, beside the `teacher`'s (`teacher_outputs`): its loss, its
+    terms, and its cotangents on those outputs."""
     import torch
 
     from tools.distillation_reference import distillation_loss
 
-    pairs = range(len(META["pairs"]))
     targets = arrays["tokens"][:, 1:]
     logits, features = (torch.tensor(np.asarray(value), requires_grad=True) for value in outputs)
+    teacher_logits, teacher_features = (torch.tensor(value) for value in teacher)
     loss, terms = distillation_loss(
-        logits, torch.tensor(arrays["teacher_logits"]), torch.tensor(targets, dtype=torch.int64),
-        torch.tensor((targets != META["pad_id"]).astype(np.float32)), features,
-        torch.tensor(np.stack([arrays[f"teacher_feature_{index}"] for index in pairs])),
+        logits, teacher_logits, torch.tensor(targets, dtype=torch.int64),
+        torch.tensor((targets != META["pad_id"]).astype(np.float32)), features, teacher_features,
         META["alpha"], META["temperature"], META["beta"], kind, dtype=getattr(torch, dtype))
     d_logits, d_features = torch.autograd.grad(loss, (logits, features))
     reported = {name: value.item() for name, value in terms.items()}
@@ -128,10 +141,11 @@ def test_the_loss_and_its_terms_match_the_maxtext_reference(kind):
     """Loss and every reported term as near float64 as the reference's own
     float32 run is (`assert_leaves_as_exact`): the truth runs the reference in
     float64 on the student's float64 forward, the reference in float32 on its
-    float32 one. Each is one number reduced from every logit, which Dew sums
-    in another order, so the reference's distance counts as at least that
-    many float32 roundings (`reductions`). Padding sits in the batch, so the
-    mask is part of what agrees."""
+    float32 one, both beside the teacher's forward that Dew runs
+    (`teacher_outputs`). Each is one number reduced from every logit, which
+    Dew sums in another order, so the reference's distance counts as at
+    least that many float32 roundings (`reductions`). Padding sits in the
+    batch, so the mask is part of what agrees."""
     arrays = fixture()
     objective, params = fixture_objective(arrays, feature_loss=kind)
     ids = jnp.asarray(arrays["tokens"][:, :-1])
@@ -140,10 +154,11 @@ def test_the_loss_and_its_terms_match_the_maxtext_reference(kind):
     loss, aux = objective.scalar_loss(params, fixture_batch(arrays), step_at())
 
     outputs = student_outputs(model, params["params"], ids)
-    rounded_loss, rounded_terms, _ = reference_run(arrays, kind, outputs, "float32")
+    teacher = teacher_outputs(arrays)
+    rounded_loss, rounded_terms, _ = reference_run(arrays, kind, outputs, teacher, "float32")
     with jax.enable_x64(new_val=True):
         wide, _ = widened_outputs(model, params["params"], ids)
-        truth_loss, truth_terms, _ = reference_run(arrays, kind, wide, "float64")
+        truth_loss, truth_terms, _ = reference_run(arrays, kind, wide, teacher, "float64")
     named = {"loss": "loss", "ce": "hard_loss", "distill/soft_loss": "soft_loss", "distill/kl": "kl_div_at_T",
              "distill/feature": "feature", "distill/teacher_loss": "teacher_loss"}
     reported = {**aux.metrics, "loss": loss}
@@ -164,7 +179,8 @@ def test_the_student_gradient_matches_the_reference_cotangents(kind):
     (`assert_leaves_as_exact`): the truth pulls the reference's float64
     cotangents at the student's float64 forward back through that forward,
     and the reference pulls its float32 cotangents at the float32 forward
-    back through the student in float32. The student's logits are as near
+    back through the student in float32, both beside the teacher's forward
+    that Dew runs (`teacher_outputs`). The student's logits are as near
     its float64 forward as the fixture's, which the reference generator
     wrote from the same forward."""
     arrays = fixture()
@@ -174,11 +190,12 @@ def test_the_student_gradient_matches_the_reference_cotangents(kind):
     model = objective.student.model
 
     outputs, pullback = jax.vjp(lambda trainable: student_outputs(model, trainable, ids), params["params"])
-    _, _, cotangents = reference_run(arrays, kind, outputs, "float32")
+    teacher = teacher_outputs(arrays)
+    _, _, cotangents = reference_run(arrays, kind, outputs, teacher, "float32")
     reference, = pullback(tuple(jnp.asarray(value) for value in cotangents))
     with jax.enable_x64(new_val=True):
         wide, widened_pullback = widened_outputs(model, params["params"], ids)
-        _, _, wide_cotangents = reference_run(arrays, kind, wide, "float64")
+        _, _, wide_cotangents = reference_run(arrays, kind, wide, teacher, "float64")
         truth, = widened_pullback(wide_cotangents)
         truth, wide_logits = jax.tree.map(np.asarray, (truth, wide[0]))
     assert_as_exact_as_the_reference(np.asarray(outputs[0]), arrays["student_logits"], wide_logits, "logits")
@@ -259,6 +276,16 @@ def test_a_validation_pass_scores_with_the_teacher_the_trainer_substituted():
 
     assert after != before
     assert after == scored(built)
+
+
+def test_a_distillation_step_fuses_no_head_and_has_none_to_unfuse():
+    """The step reads the student's whole logits (`predict`), so a tiled student head is no fused
+    head: the program says so and the fit ladder has no rung to unfuse."""
+    student, teacher = (LMObjective(model, SEQ, ema_decay=None, head_tile=(4, 16)) for model in models())
+    objective = DistillationObjective(student, teacher)
+    assert student.program_key()[0].head_fused
+    assert not any(program.head_fused for program in objective.program_key())
+    assert objective.unfuse_head() is None
 
 
 def test_a_layer_the_model_does_not_have_is_named_at_init():
@@ -396,3 +423,23 @@ def test_a_saved_distillation_loads_as_its_student_and_reads_the_students_data(t
     own = objective.student.build_task(objective.student_variables(state.variables))
     prompt = np.asarray(batch[TEXT_KEY])[:1, :4]
     np.testing.assert_array_equal(task(prompt, 3, key=0).tokens, own(prompt, 3, key=0).tokens)
+    # The load restores the student alone, onto a mesh as on the host: the teacher and the
+    # projections stay unread.
+    from dew.inference import TextGeneration
+
+    for loaded in (task, TextGeneration.from_run(str(tmp_path / "run"), mesh=MeshSpec())):
+        assert jax.tree.structure(loaded.variables) == jax.tree.structure(own.variables)
+
+
+def test_a_distillation_trains_for_a_count_of_its_students_tokens():
+    """A run's length in tokens (`fit(tokens=)`) counts the student's, the batches both models
+    score: the run stops at the first step that reaches the count, as the student's own run does."""
+    arrays = fixture()
+    objective, _ = fixture_objective(arrays)
+    # The fixture's two rows on every data-parallel device.
+    batch = {TEXT_KEY: jnp.tile(fixture_batch(arrays)[TEXT_KEY], (max(1, jax.device_count() // 2), 1))}
+    tokens = int(np.sum(objective.student.real_lengths(batch)))
+    distilled = Trainer(objective, optax.sgd(0.0), key=0).fit(fixed(batch), tokens=3 * tokens, log_every=1)
+    alone = Trainer(objective.student, optax.sgd(0.0), key=0).fit(fixed(batch), tokens=3 * tokens,
+                                                                  log_every=1)
+    assert int(distilled.step) == int(alone.step) == 3

@@ -8,13 +8,19 @@ fp32 it rounds differently. A run under each of K orders is one rounding draw
 of the same computation (tests/reference_error.py's K-order rule).
 
 The residual axes are the ones a module declares 'embed' (dew.nn.sharding)
-and, in an undeclared parameter, its one axis of the residual's width: the
-norms' scales, and Kimi K3's depth-attention queries ([width, 1]). Composite
-axes repeat the same order within each residual stream: Engram's declared
-embed axis and mHC's flattened stream inputs. The fixture tool that draws
-the orders evaluates the float64 truth under them and holds it to the
-identity's within float64 rounding.
+and, among undeclared parameters, only those named here: the residual
+stream's norms' scales and biases (RESIDUAL_NORMS, the last axis), and Kimi
+K3's depth-attention scales and queries (DEPTH_ATTENTION, [width] and
+[width, 1]). No parameter is taken for a residual one by its size: a head's
+or a convolution's width can equal the residual's (Kimi Delta Attention's
+2 heads of 16 in a 32-wide model), and permuting it would break the
+symmetry. Composite axes repeat the same order within each residual stream:
+Engram's declared embed axis and mHC's flattened stream inputs. The fixture
+tool that draws the orders evaluates the float64 truth under them and holds
+it to the identity's within float64 rounding.
 """
+
+import re
 
 import jax
 import jax.numpy as jnp
@@ -26,15 +32,41 @@ from dew.nn.sharding import declarations, declared_axes, parameter_path
 # would change their placement. Their columns concatenate residual streams.
 COMPOSITE_RESIDUAL_AXES = {("attn_hc", "fn"): 1, ("ffn_hc", "fn"): 1, ("hc_head", "hc_fn"): 1}
 
+RESIDUAL_NORMS = frozenset({
+    "input_layernorm", "post_attention_layernorm", "attention_output_norm", "mlp_output_norm",
+    "post_per_layer_input_norm", "embedding_layernorm", "head_norm", "enorm", "hnorm",
+    "final_norm"})
+"""The norms over the residual stream a Dew decoder names (backbones/decoder_block.py,
+causal_transformer.py; an MTP head's `final_norm`), beside the final `norm` outside every layer;
+a mixer's own `norm` (Mamba-2's, a gated delta rule's) and the query and key norms are over
+other widths."""
+
+LAYER = re.compile(r"layers(_\d+)?")
+"""A decoder layer's module, under which a `norm` is a mixer's own, not the final norm."""
+
+DEPTH_ATTENTION = frozenset({"attention_res", "mlp_res", "output_res"})
+"""Kimi K3's depth-attention modules (attention_residuals.py `DepthAttention`): a `scale` [width]
+and a query `kernel` [width, 1]."""
+
 
 def _residual_axis(path, leaf, width: int, declared) -> int | None:
     axes = declared_axes(path, leaf.ndim, declared)
     if axes is None:
-        suffix = parameter_path(path)[-2:]
-        if suffix in COMPOSITE_RESIDUAL_AXES:
-            return COMPOSITE_RESIDUAL_AXES[suffix]
-        sized = [axis for axis, size in enumerate(leaf.shape) if size == width]
-        return sized[0] if len(sized) == 1 else None
+        names = parameter_path(path)
+        if names[-2:] in COMPOSITE_RESIDUAL_AXES:
+            return COMPOSITE_RESIDUAL_AXES[names[-2:]]
+        module, name = names[-2:] if len(names) > 1 else ("", names[-1])
+        final = module == "norm" and not any(LAYER.fullmatch(outer) for outer in names[:-2])
+        if name in ("scale", "bias") and (module in RESIDUAL_NORMS or final):
+            axis = leaf.ndim - 1
+        elif module in DEPTH_ATTENTION and name in ("scale", "kernel"):
+            axis = leaf.ndim - (1 if name == "scale" else 2)
+        else:
+            return None
+        if leaf.shape[axis] != width:
+            raise ValueError(f"{'/'.join(names)} is named a residual parameter but its axis {axis} is "
+                             f"{leaf.shape[axis]} wide, the residual {width}")
+        return axis
     if "embed" not in axes or leaf.shape[axes.index("embed")] % width:
         return None
     return axes.index("embed")

@@ -309,6 +309,8 @@ The transforms port `transformers/generation/logits_process.py` from Transformer
 | `MaxLength(length)` | `MaxLengthCriteria` | prompt and generated tokens together |
 | `stop_strings(tokenizer, strings, vocab_size=None)` | `StopStringCriteria` | |
 
+`MaxNewTokens` and `MaxLength` cut a row short rather than end it: a row they finish is not `terminated`, as one that runs out of its budget is not, so `Generation.terminated` marks the rows that ended on an EOS, a stop string or a criterion of your own. A criterion of your own that cuts rows short at a length says so by subclassing `decoding.Truncates`.
+
 `stop_strings` reads the tokenizer once, on the host. It compiles where each token's text can fall inside each stop string, and how many of the string's trailing units the token's start can cover. The criterion then runs entirely on device and never decodes. A string counts only when it touches the token just drawn. So a string produced earlier does not stop the row later, while a string spelled across several tokens or overhanging either end does stop it.
 
 A byte-level or byte-fallback vocabulary is read through its byte spelling and matched over UTF-8 bytes, so a stop string still ends the row when two tokens split one of its code points. Every other vocabulary is read through `convert_tokens_to_string` behind an ordinary prefix, because a decoder adds or removes a leading space depending on what came before. `tokenizer` is a Transformers tokenizer or a task `Processor` holding one, and `vocab_size` sizes the table for a model whose head is wider than the vocabulary.

@@ -13,6 +13,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 import hashlib
+import json
 import threading
 import unicodedata
 from collections.abc import Mapping, Sequence
@@ -33,7 +34,7 @@ if TYPE_CHECKING:
 
 
 _load_lock = threading.Lock()
-_loaded: dict[tuple[str, str | None, bool], PreTrainedTokenizerBase] = {}
+_loaded: dict[tuple[str, str | None, bool, str | None], PreTrainedTokenizerBase] = {}
 
 RENAMED_TOKENIZERS: Mapping[str, str] = {
     # Dream-org/Dream-v0-Base-7B's tokenization_dream.py at 6572adb5 is transformers 4.46's
@@ -63,9 +64,11 @@ class PinnedTokenizer:
     def transformers(self) -> PreTrainedTokenizerBase:
         """The transformers tokenizer of these files, whose chat template
         renders conversations. A directory is read where it is, so the load
-        reaches no hub, and it is the one load every reader of the directory
-        shares (`load_tokenizer`)."""
-        return load_tokenizer(self.directory)
+        reaches no hub, and it is the one load every reader of these files
+        shares (`load_tokenizer`): keyed by their hashes, so a directory whose
+        files changed since a load loads again."""
+        files = json.dumps(self.snapshot["files"], sort_keys=True).encode()
+        return load_tokenizer(self.directory, contents=hashlib.sha256(files).hexdigest())
 
 
 def pin_tokenizer(name: str, *, local_files_only: bool = False) -> PinnedTokenizer:
@@ -94,9 +97,10 @@ def pin_tokenizer(name: str, *, local_files_only: bool = False) -> PinnedTokeniz
     return PinnedTokenizer(snapshot, str(directory))
 
 
-def load_tokenizer(name: str, *, revision: str | None = None,
-                   local_files_only: bool = False) -> PreTrainedTokenizerBase:
-    """The HF tokenizer of a hub repo or local directory, loaded once per process.
+def load_tokenizer(name: str, *, revision: str | None = None, local_files_only: bool = False,
+                   contents: str | None = None) -> PreTrainedTokenizerBase:
+    """The HF tokenizer of a hub repo or local directory, loaded once per process, or once per
+    `contents`, the digest of a directory's files where a caller pinned them (`PinnedTokenizer`).
 
     Every Dew path that needs an HF tokenizer loads it here, so one name at
     one revision is one object however many readers share it. A release whose
@@ -108,7 +112,7 @@ def load_tokenizer(name: str, *, revision: str | None = None,
         if revision is not None and revision != pinned:
             raise ValueError(f"tokenizer {name} and revision={revision!r} disagree")
         name, revision = repo, pinned
-    key = (name, revision, local_files_only)
+    key = (name, revision, local_files_only, contents)
     held = _loaded.get(key)
     if held is not None:
         return held

@@ -1,8 +1,8 @@
 """Sequence, tensor and stage mesh axes: placement, batches, and loss equality.
 
 The mesh carries six axes; parameters distinguish fsdp, expert and tensor,
-the batch's sequence dimension rides sequence, and the layer stack's
-pipeline stages ride stage. Widths stay on fsdp unless a run's rules
+the batch's sequence dimension rides sequence, which holds the state with
+fsdp, and the layer stack's pipeline stages ride stage. Widths stay on fsdp unless a run's rules
 redirect them onto tensor, so the default mesh places as the three-axis one
 did. A fit on each of the sim-mesh topologies trains the same losses:
 sharding moves values, never changes them.
@@ -26,11 +26,12 @@ from dew.data.dataset import Loader
 from dew.nn.backbones.dit import SimpleDiT
 from dew.nn.blocks import Upsample
 from dew.nn.conv import Conv
-from dew.nn.sharding import declarations, declared_axes
+from dew.nn.sharding import declarations, declared_axes, mesh_axes
 from dew.nn.ssm import SpatialFusionConv
 from dew.objectives.base import Step
 from dew.objectives.lm import LMObjective
 from dew.registry import models
+from dew.telemetry.instrumentation import COLLECTIVES
 from dew.training import Layout, MeshSpec, Trainer
 from dew.training.distributed import shard_batch
 
@@ -176,6 +177,10 @@ def test_an_fsdp_step_splits_leading_dimensions_and_moves_no_activation(fused):
              if sharding.spec and "kernel" in jax.tree_util.keystr(path) and declared_axes(path, 2, declared)}
     assert specs.pop("['lm_head']['kernel']") == P(None, "fsdp")
     assert set(specs.values()) == {P("fsdp")}, specs
+    if fused:
+        # Qwen3-Next's fused projections declare the residual axis their unfused ones do.
+        assert all(any(f"['{name}']" in path for path in specs) for name in ("in_proj_qkvz", "in_proj_ba")), (
+            sorted(specs))
     assert moved(text) == moved(stepped(MeshSpec(fsdp=2), 2)[1])
     assert_trains_alike(trained, stepped(MeshSpec(), 1, **delta_layers(fused=fused))[2])
 
@@ -186,6 +191,53 @@ def test_a_delta_net_step_over_fsdp_and_tensor_trains_what_one_device_trains():
     axis splits their kernels by, its other projections their width whole."""
     assert_trains_alike(stepped(MeshSpec(fsdp=2, tensor=2), 4, **delta_layers(fused=False))[2],
                         stepped(MeshSpec(), 1, **delta_layers(fused=False))[2])
+
+
+@pytest.mark.parametrize(("mesh", "devices"), [
+    pytest.param(MeshSpec(sequence=2), 2, marks=pytest.mark.mesh(devices=2), id="sequence2"),
+    pytest.param(MeshSpec(fsdp=2, sequence=2), 4, marks=pytest.mark.mesh(devices=4), id="fsdp2_sequence2"),
+])
+def test_a_sequence_split_holds_the_state_in_shares_and_trains_what_one_device_trains(mesh, devices):
+    """The sequence axis's devices compute their own positions with the same weights, so they hold
+    the persistent state in shares beside fsdp's (`STATE_AXES`): each parameter lies on them as an
+    fsdp of as many devices lays it, every device holding the same share, and one step trains what
+    one device trains."""
+    shardings, _, (loss, trained) = stepped(mesh, devices)
+    model = tiny(max_seq_len=LENGTH, tie_embeddings=False)
+    params = LMObjective(model, LENGTH).init(jax.random.key(0))["params"]
+    fsdp = MeshSpec(fsdp=devices).build(jax.devices()[:devices])
+    grouped = Layout(min_shard=TINY_SHARD).shardings(fsdp, params)
+
+    def shares(placement):
+        return [sharding.shard_shape(np.shape(leaf))
+                for sharding, leaf in zip(jax.tree.leaves(placement), jax.tree.leaves(trained), strict=True)]
+
+    assert shares(shardings) == shares(grouped)
+    assert any("sequence" in mesh_axes(entry)
+               for sharding in jax.tree.leaves(shardings) for entry in sharding.spec)
+    _, _, expected = stepped(MeshSpec(), 1)
+    assert_trains_alike((loss, trained), expected)
+
+
+@pytest.mark.mesh(devices=8)
+def test_the_sequence_axis_shares_the_state_beside_every_split_the_rules_give_it():
+    """The state axes split what the rules put on fsdp and leave every other axis's split as it is:
+    a vocabulary of 516 that tensor 4 divides and tensor 4 times sequence 2 does not keeps its
+    table split over tensor, and no leaf's tensor split moves when sequence joins the mesh."""
+    model = tiny(vocab_size=516, emb_features=256, mlp_features=512)
+    params = LMObjective(model, SEQ_LEN).init(jax.random.key(0))["params"]
+
+    def others(placement):
+        """Each leaf's axes past the state axes, by dimension."""
+        specs = [tuple(sharding.spec) + (None,) * 4 for sharding in jax.tree.leaves(placement)]
+        return [[tuple(axis for axis in mesh_axes(entry) if axis not in ("fsdp", "sequence"))
+                 for entry in spec[:4]] for spec in specs]
+
+    tensor = Layout().shardings(MeshSpec(tensor=4).build(jax.devices()[:8]), params)
+    shared = Layout().shardings(MeshSpec(tensor=4, sequence=2).build(jax.devices()[:8]), params)
+    assert others(shared) == others(tensor)
+    assert any("sequence" in mesh_axes(entry)
+               for sharding in jax.tree.leaves(shared) for entry in sharding.spec)
 
 
 NATIVE_RULES = {"embed": ("zero", "zero2"), "mlp": "zero", "heads": "zero", "kv": "zero", "vocab": "zero",
@@ -223,8 +275,9 @@ def test_a_native_mesh_of_its_own_axes_trains_saves_and_resumes_as_one_device(tm
     `data_axes` split the rows over all three: fit splits the parameters
     over both fsdp levels and the rows over all three axes, and two steps,
     a checkpoint and a resumed third step train what one device trains in
-    three, as a `MeshSpec` mesh does. A rule naming an axis the mesh lacks
-    is refused before anything is placed."""
+    three, as a `MeshSpec` mesh does. A rule naming an axis the mesh lacks,
+    one of Dew's role axes among them, is refused before anything is placed;
+    Dew's own rules, which name every role axis, place on whatever the mesh has."""
     layers = delta_layers(fused=False) if hybrid else {}
     native = Mesh(np.asarray(jax.devices()[:8]).reshape(2, 2, 2), ("replica", "zero", "zero2"))
     layout = Layout(rules=NATIVE_RULES, data_axes=("replica", "zero", "zero2"), min_shard=TINY_SHARD)
@@ -248,6 +301,11 @@ def test_a_native_mesh_of_its_own_axes_trains_saves_and_resumes_as_one_device(tm
     misspelt = Layout(rules={**NATIVE_RULES, "embed": "zer0"}, data_axes=layout.data_axes)
     with pytest.raises(ValueError):
         native_trainer(native, misspelt, None, **layers).fit(data, steps=1)
+    # A rule of one's own (none of Dew's: those put the width on fsdp) that names Dew's tensor axis,
+    # which this mesh lacks, would split nothing.
+    absent = Layout(rules={**NATIVE_RULES, "embed": "tensor"}, data_axes=layout.data_axes)
+    with pytest.raises(ValueError):
+        native_trainer(native, absent, None, **layers).fit(data, steps=1)
 
 
 @pytest.mark.mesh(devices=8)
@@ -310,7 +368,7 @@ def test_cross_attention_spends_communication_only_where_the_sequence_link_pays(
         result = jax.device_get(executable(*inputs))
         flops = compiled_flops(executable)
         assert flops is not None
-        moved = sharded.collective_bytes(executable.as_text(), sharded.COLLECTIVE_OPS)
+        moved = sharded.collective_bytes(executable.as_text(), COLLECTIVES)
         return result, flops * sequence * tensor, moved
 
     expected, _, _ = compiled(1, 1, Link(None, None, "cpu"))
@@ -331,14 +389,15 @@ def test_cross_attention_spends_communication_only_where_the_sequence_link_pays(
 @pytest.mark.parametrize(("mesh", "devices"), [
     pytest.param(MeshSpec(fsdp=2), 2, marks=pytest.mark.mesh(devices=2), id="fsdp2"),
     pytest.param(MeshSpec(fsdp=2, tensor=2), 4, marks=pytest.mark.mesh(devices=4), id="fsdp2_tensor2"),
+    pytest.param(MeshSpec(fsdp=2, sequence=2), 4, marks=pytest.mark.mesh(devices=4), id="fsdp2_sequence2"),
 ])
 def test_a_frozen_collection_kept_whole_is_never_gathered_over_fsdp(mesh, devices):
-    """`Layout.frozen_whole` holds a LoRA base whole over fsdp and split as
-    the rules split it over the rest (tensor): the step gathers none of what
-    fsdp split, the optimizer state and the trained parameters lie as the
-    split layout lays them, and one step trains what it trains."""
+    """`Layout.frozen_whole` holds a LoRA base whole over the state axes,
+    fsdp and sequence, and split as the rules split it over the rest
+    (tensor): the step gathers none of what they split, the optimizer state
+    and the trained parameters lie as the split layout lays them, and one
+    step trains what it trains."""
     from dew.lora import LoRA
-    from dew.nn.sharding import mesh_axes
     from dew.objectives.base import FROZEN
     from dew.training.distributed import placed_bytes
 
@@ -364,8 +423,9 @@ def test_a_frozen_collection_kept_whole_is_never_gathered_over_fsdp(mesh, device
     split_specs = [sharding.spec for sharding in jax.tree.leaves(split.variables[FROZEN])]
     whole_specs = [sharding.spec for sharding in jax.tree.leaves(whole.variables[FROZEN])]
     assert any("fsdp" in mesh_axes(entry) for spec in split_specs for entry in spec)
+    assert mesh.sequence == 1 or any("sequence" in mesh_axes(entry) for spec in split_specs for entry in spec)
     def unsplit(entry):
-        kept = [axis for axis in mesh_axes(entry) if axis != "fsdp"]
+        kept = [axis for axis in mesh_axes(entry) if axis not in ("fsdp", "sequence")]
         return tuple(kept) if kept else None
 
     assert whole_specs == [P(*map(unsplit, spec)) for spec in split_specs]
@@ -383,9 +443,10 @@ class Named(nn.Module):
 
     @nn.compact
     def __call__(self, x):
+        from dew.nn.dense import Dense
         from dew.objectives.base import FROZEN
 
-        return nn.Dense(16, name=FROZEN)(jax.nn.relu(nn.Dense(64, name="hidden")(x)))
+        return Dense(16, name=FROZEN)(jax.nn.relu(Dense(64, name="hidden")(x)))
 
 
 @pytest.mark.mesh(devices=2)
@@ -421,7 +482,6 @@ def test_a_module_or_optimizer_group_named_frozen_keeps_its_split_under_frozen_w
 
     split, split_trained = stepped(frozen_whole=False)
     whole, whole_trained = stepped(frozen_whole=True)
-    from dew.nn.sharding import mesh_axes
 
     split_specs = [sharding.spec for sharding in jax.tree.leaves(split)]
     assert any("fsdp" in mesh_axes(entry) for sharding in jax.tree.leaves(split.opt_state)
@@ -454,7 +514,7 @@ def dense_layout():
 
 
 TOPOLOGIES = {
-    # plan.md 4.5's four mesh configs, on the eight-device simulated mesh,
+    # Four data/FSDP/tensor mesh configurations on eight simulated devices,
     # plus the sequence axis beside a data axis, where the batch rows split
     # over data and fsdp and the sequence over its own axis, and the stage
     # axis beside them: the two-layer model splits into two stages of one
@@ -749,10 +809,16 @@ custom_call_target="__gpu$xla.gpu.triton"
 
 
 def test_an_async_collective_counts_its_results_not_its_operands():
-    """An async `-start` names `(operands, results)`; only the results are the collective's bytes."""
-    text = """  %ag = ((bf16[4,8]{1,0}), bf16[8,8]{1,0}) all-gather-start(bf16[4,8]{1,0} %x), dimensions={0}
+    """An async pair counts once, by its `-done`, which holds what moved: its `-start` names
+    `(operands, results)`. Each result's bytes are as XLA sizes them, an fp8 element's one byte."""
+    text = """ENTRY %main (x: bf16[4,8], y: f32[16], z: f32[8], w: f8e4m3fn[2,8]) -> f32[8] {
+  %ag = ((bf16[4,8]{1,0}), bf16[8,8]{1,0}) all-gather-start(bf16[4,8]{1,0} %x), dimensions={0}
+  %agd = bf16[8,8]{1,0} all-gather-done(((bf16[4,8]{1,0}), bf16[8,8]{1,0}) %ag)
   %rs = (f32[16]{0}, f32[8]{0}) reduce-scatter-start(f32[16]{0} %y), dimensions={0}
-  %ar = f32[8]{0} all-reduce(f32[8]{0} %z), to_apply=%add"""
+  %rsd = f32[8]{0} reduce-scatter-done((f32[16]{0}, f32[8]{0}) %rs)
+  %ar = f32[8]{0} all-reduce(f32[8]{0} %z), to_apply=%add
+  ROOT %wg = f8e4m3fn[8,8]{1,0} all-gather(f8e4m3fn[2,8]{1,0} %w), dimensions={0}
+}"""
     assert sharded.collectives(text) == [("all-gather", [(8, 8)]), ("reduce-scatter", [(8,)]),
-                                         ("all-reduce", [(8,)])]
-    assert sharded.collective_bytes(text, sharded.COLLECTIVE_OPS) == 128 + 32 + 32
+                                         ("all-reduce", [(8,)]), ("all-gather", [(8, 8)])]
+    assert sharded.collective_bytes(text, COLLECTIVES) == 128 + 32 + 32 + 64

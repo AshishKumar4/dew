@@ -39,7 +39,7 @@ replaced according to its status:
 The scheduler keeps no clock of its own: a deadline belongs to the
 operation that can stop when it passes. The remote rollout servers bound
 each request, a sandboxed environment (`SubprocessEnvironment`) its
-`wall_seconds`, and `HarborSource` each trial (`trial_timeout`). A rollout
+`wall_seconds`, and `HarnessSource` each trial (`trial_timeout`). A rollout
 that runs out of time there comes back as an INFRA_ERROR, which the
 scheduler retries. A reward's program past its sandbox's wall clock is a
 TIMEOUT verdict that the reward scores, not a failure.
@@ -124,6 +124,8 @@ from .sessions import (
     Task,
     agreed_records,
     chain_lengths,
+    check_credit,
+    check_estimator,
     check_truncation,
     pack,
     rows_needed,
@@ -247,8 +249,9 @@ class RolloutScheduler:
       integer `task_id` rows).
     - `width` and `rows` fix the packed batch shape. `rows` is this
       process's share of a multi-process trainer's batch.
-    - `estimator` and `truncation` are `pack`'s advantage family and
-      truncation policy, and `support_capacity` is its per-row support
+    - `estimator`, `truncation` and `credit` are `pack`'s advantage family,
+      truncation policy and credit (per session, or per turn from the step
+      rewards still ahead), and `support_capacity` is its per-row support
       length, which a filtered-sampling source requires.
     - `log`, when given, receives a `SchedulerRecord` of this process's
       rollouts after each call. A process that is not the first reader of
@@ -271,7 +274,7 @@ class RolloutScheduler:
                  width: int, rows: int, tasks: Callable[[Batch], Sequence[Task]] = task_ids,
                  groups: int = 4, oversample: int = 0, admit: int | None = None,
                  max_lag: int = 1, ahead: int = 1, sync_every: int = 1, max_attempts: int = 3,
-                 estimator: str = "group", truncation: str = "mask",
+                 estimator: str = "group", truncation: str = "mask", credit: str = "session",
                  support_capacity: int | None = None, log: Callable[[SchedulerRecord], None] | None = None):
         for name, value, least in (("width", width, 2), ("rows", rows, 1), ("groups", groups, 2),
                                    ("oversample", oversample, 0), ("ahead", ahead, 0),
@@ -280,6 +283,8 @@ class RolloutScheduler:
             if type(value) is not int or value < least:
                 raise ValueError(f"{name} must be an integer of at least {least}")
         check_truncation(truncation)
+        check_credit(credit)
+        check_estimator(estimator)
         if admit is not None and (type(admit) is not int or admit < 1):
             raise ValueError("admit must be a positive number of groups, or None to admit every task")
         if ahead + sync_every - 1 > max_lag:
@@ -305,7 +310,7 @@ class RolloutScheduler:
             sync_every,
             max_attempts,
         )
-        self.estimator, self.truncation, self.log = estimator, truncation, log
+        self.estimator, self.truncation, self.credit, self.log = estimator, truncation, credit, log
         self.support_capacity = support_capacity
         self.metrics: dict[str, float] = {}
         self._lock = threading.Lock()
@@ -512,6 +517,7 @@ class RolloutScheduler:
         # A share's packing that fails (a support past its capacity) fails every process, not one.
         packed = agreed("rollout packing", lambda: pack(
             rollouts, self.width, rows=self.rows, estimator=self.estimator, truncation=self.truncation,
+            credit=self.credit,
             support_capacity=self.support_capacity) if sampling else {})
         packed = agreed_records(packed, self.support_capacity)
         mesh = mesh_of(state.variables)

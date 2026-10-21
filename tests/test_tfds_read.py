@@ -13,6 +13,7 @@ from uuid import uuid4
 
 import numpy as np
 import pytest
+import tensorflow_datasets as tfds
 from fsspec.implementations.local import LocalFileSystem
 
 from dew.config.data import HoldOut, ImageData, loader
@@ -21,8 +22,6 @@ from dew.data.compile import compile
 from dew.data.dataset import DataPartition
 from dew.data.image_codec import decode_image
 from dew.data.storage import Store
-
-tfds = pytest.importorskip("tensorflow_datasets", reason="needs the tfds extra")
 
 FIXTURE = Path(__file__).parent / "fixtures" / "tfds" / "dew_images" / "1.0.0"
 
@@ -39,9 +38,9 @@ def test_prepared_records_carry_encoded_pixels_labels_and_caption_names():
         assert isinstance(record["image"], bytes)
         np.testing.assert_array_equal(decode_image(record["image"]), np.full((8, 8, 3), index + 10, np.uint8))
         assert record["label"] == index % 2
-        result = next(Memory([record]).map(images.DecodeImage("image", rejects=False))
-                      .random_map(images.caption(templates=spec.caption_templates,
-                                                 classes=("red", "blue"))).batch(1).iterate())
+        result = next(iter(Memory([record]).map(images.DecodeImage("image", rejects=False))
+                           .random_map(images.caption(templates=spec.caption_templates,
+                                                      classes=("red", "blue"))).batch(1)))
         caption, label = result["caption"][0], result["label"][0]
         assert ("red" if label == 0 else "blue") in caption.split()
     test_split = TFDS("dew_images", path=str(FIXTURE), split="test",

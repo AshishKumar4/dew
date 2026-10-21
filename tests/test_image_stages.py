@@ -19,12 +19,12 @@ def pictures(count: int = 48) -> Memory:
 
 def stage(kind: str):
     if kind == "albumentations":
-        A = pytest.importorskip("albumentations")
+        import albumentations as A
 
         return images.Albumentations(A.Compose([A.HorizontalFlip(p=0.5), A.RandomBrightnessContrast(p=1.0),
                                                 A.RandomCrop(16, 16)]))
     if kind == "torchvision":
-        v2 = pytest.importorskip("torchvision.transforms.v2")
+        from torchvision.transforms import v2
 
         return images.Torchvision(v2.Compose([v2.RandomHorizontalFlip(), v2.ColorJitter(0.4, 0.4, 0.4),
                                               v2.RandomCrop(16)]))
@@ -74,7 +74,7 @@ def _read(chain, threads, count):
 def test_stages_holding_one_albumentations_pipeline_each_draw_their_own_record_s_seed():
     """Two stages around one Compose, read by eight threads: no thread's seed lands between another's
     seed and call, so every record's draws are the ones one thread makes."""
-    A = pytest.importorskip("albumentations")
+    import albumentations as A
 
     compose = A.Compose([A.HorizontalFlip(p=0.5), A.RandomBrightnessContrast(p=1.0), A.RandomCrop(20, 20)])
     chain = (pictures().shuffle(0).repeat().random_map(images.Albumentations(compose))
@@ -211,7 +211,7 @@ def test_a_center_crop_cuts_a_large_image_s_central_square_and_grows_a_small_one
     smaller one bicubically until its shorter side is that size before cutting."""
     large = np.arange(6 * 9 * 3, dtype=np.uint8).reshape(6, 9, 3)
     small = np.arange(2 * 3 * 3, dtype=np.uint8).reshape(2, 3, 3) * 10
-    cropped = list(Memory([{"image": large}, {"image": small}]).map(images.CenterCrop(4)).iterate())
+    cropped = list(Memory([{"image": large}, {"image": small}]).map(images.CenterCrop(4)))
     np.testing.assert_array_equal(cropped[0]["image"], large[1:5, 2:6])
     grown = images.Resize((4, 6), "bicubic").map({"image": small})["image"]
     np.testing.assert_array_equal(cropped[1]["image"], grown[:, 1:5])
@@ -220,14 +220,13 @@ def test_a_center_crop_cuts_a_large_image_s_central_square_and_grows_a_small_one
 def test_an_image_processor_writes_its_pixel_values_beside_the_image_it_reads():
     """Processor runs a Hugging Face image processor on the image in its field and writes the
     processor's own pixel values under its output, keeping the image."""
-    pytest.importorskip("transformers")
     from pathlib import Path
 
     from transformers import CLIPImageProcessorPil
 
     processor = CLIPImageProcessorPil.from_pretrained(str(Path(__file__).parent / "fixtures/clip/tiny"))
     image = np.random.default_rng(0).integers(0, 256, (12, 10, 3), np.uint8)
-    (row,) = Memory([{"photo": image}]).map(images.Processor(processor, field="photo", to="pixels")).iterate()
+    (row,) = Memory([{"photo": image}]).map(images.Processor(processor, field="photo", to="pixels"))
     np.testing.assert_array_equal(row["photo"], image)
     expected = processor(images=image, return_tensors="np")["pixel_values"][0]
     np.testing.assert_array_equal(row["pixels"], expected)

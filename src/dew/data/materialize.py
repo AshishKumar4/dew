@@ -22,7 +22,7 @@ from collections.abc import Mapping, Sequence
 import grain.python as pygrain
 import numpy as np
 
-from dew.data.analysis import _analyzed, _identity, _name
+from dew.data.analysis import _analyzed, _identity, _label, _name
 from dew.data.dataset import Batch, Records
 from dew.data.lowering import _CachedOutputs, _fill, _Locality, _outputs, _packed, _TokenSplit
 from dew.data.mixing import CorpusCounts
@@ -64,6 +64,9 @@ class _Memory:
     documents: int | None = None
     """The most documents a window holds where `ran` packs them, which its
     batches declare (`Coordinates.max_segments`)."""
+
+    def label(self) -> str:
+        return self.original.label()
 
     def describe(self) -> str:
         return self.original.describe()
@@ -123,7 +126,7 @@ def _materialize(
         return _memory_mixture(pipeline, pipeline.source, counts, training=training)
     source = pipeline.source
     stored = source.records("memory")
-    counter = counts.setdefault(_name(pipeline), CorpusCounts(_name(pipeline)))
+    counter = counts.setdefault(_name(pipeline), CorpusCounts(_name(pipeline), _label(pipeline)))
     if not isinstance(source, _Memory):
         counter.attempted = len(stored)
     lowering = _analyzed(pipeline, "memory", validation=not training)
@@ -140,7 +143,7 @@ def _memory_inputs(
     consumed = 0
     if artifact_at is not None:
         filled, manifest, prefix = _fill(pipeline, source, artifact_at, "memory")
-        cached = filled.mapped(pygrain.MapDataset.source(stored), manifest, transform=prefix)
+        cached = filled.mapped(pygrain.MapDataset.source(stored), manifest, transform=prefix, source=source)
         try:
             for index in range(len(cached)):
                 outputs = cached[index]

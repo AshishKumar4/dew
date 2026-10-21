@@ -30,6 +30,7 @@ from dew.training.distributed import Placement, batch_divisor
 from dew.training.host import snapshot
 from dew.training.memory import (
     compiled_if_it_fits,
+    head_fused_of,
     head_tile_of,
     recompute_more,
     recompute_record,
@@ -154,7 +155,8 @@ class Probe:
                 "headroom": self.headroom, "temp": self.temp, "argument": self.argument}
 
     def named(self) -> str:
-        tile = ", the head tiled" if self.rung["head_tile"] is not None else ""
+        tile = ("" if self.rung["head_tile"] is None else ", the head tiled" if self.rung["head_fused"]
+                else ", the head tiled, its gradient in the backward")
         defaults = ", XLA's default options" if self.rung["xla_defaults"] else ""
         return f"{self.split} x {self.rows} rows at remat {self.rung['remat']!r}{tile}{defaults}"
 
@@ -181,8 +183,8 @@ def unplanned(probes: Sequence[Probe]) -> str:
 class Planned:
     """A plan `plan_step` found: the step reading its batch in `split`
     microbatches and its executable, whether it keeps XLA's default options,
-    and the rung it compiled at, as a record and as the objective's modules
-    and head tile."""
+    and the rung it compiled at, as a record and as the objective's modules,
+    head tile and whether that head is fused."""
     split: int
     candidate: Candidate
     executable: jax.stages.Compiled
@@ -190,6 +192,7 @@ class Planned:
     rung: Mapping[str, JSON]
     modules: tuple
     tile: tuple[int, int] | None
+    fused: bool
 
     def record(self) -> dict[str, JSON]:
         return {"split": self.split, "rows": rows_of(self.candidate.micro), **self.rung}
@@ -271,13 +274,12 @@ def plan_step[LossT, EffectsT](
 
     Where that plan splits the batch and `frontier` asks, the frontier's
     other point follows, one compile more: the batch in `candidates[0]`
-    microbatches one remat rung up (`remat_more`) with the head tiled, the
-    most memory one rung frees, where that fits. Which runs faster is
-    measured, not ranked: on an A100-40, Qwen3.5-0.8B's full fine-tune at
-    8 x 3072 ran 1205.6 ms a step in four microbatches without recomputing,
-    1174.1 under 'minimal' whole, the head tiled. The objective is left at
-    the last plan's rung, each plan holding its own (`Planned.modules`,
-    `tile`)."""
+    microbatches one remat rung up (`remat_more`) with the head tiled and
+    unfused, the most memory one rung frees, where that fits. Which runs
+    faster is measured, not ranked: on an A100-40, Qwen3.5-0.8B's full
+    fine-tune at 8 x 3072 ran 1205.6 ms a step in four microbatches without
+    recomputing, 1174.1 under 'minimal' whole, the head tiled. The objective
+    is left at the last plan's rung, each plan holding its own (`Planned`)."""
     probes: list[Probe] = []
     refusals: list[RuntimeError] = []
     lowered: dict[tuple[int, str], Candidate] = {}
@@ -349,8 +351,9 @@ def plan_step[LossT, EffectsT](
 
     def found(split: int) -> Planned:
         assert fitted is not None
-        return Planned(split, *fitted, xla_defaults, rung_record(objective, xla_defaults),
-                       tuple(entry.module for entry in objective.program_key()), head_tile_of(objective))
+        modules = tuple(entry.module for entry in objective.program_key())
+        return Planned(split, *fitted, xla_defaults, rung_record(objective, xla_defaults), modules,
+                       head_tile_of(objective), head_fused_of(objective))
 
     split = planned(candidates, first, fits, climb)
     if split is None or fitted is None:
@@ -358,9 +361,10 @@ def plan_step[LossT, EffectsT](
     plans = [found(split)]
     if frontier and split != candidates[0] and onward(lambda: remat_more(objective)):
         objective.tile_head()
+        objective.unfuse_head()
         xla_defaults = False
         lowered.clear()
-        _log.warning("timing the plan against its batch whole at remat %r, %s", recompute_record(objective),
+        _log.info("timing the plan against its batch whole at remat %r, %s", recompute_record(objective),
                      "the head tiled" if head_tile_of(objective) is not None else "the whole logits kept")
         if fits(candidates[0]):
             plans.append(found(candidates[0]))

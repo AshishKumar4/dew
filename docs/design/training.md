@@ -1,6 +1,6 @@
 # Training in Dew: an objective, an optimizer, a mesh, and `fit`
 
-Design record, 2026-10-12. This is the binding design for Dew's training and model API. Code blocks show the target API; the [status table](#11-status) says what is built and what is planned. Its data counterpart is [the data design](data.md).
+Design record, 2026-10-12. This is the binding design for Dew's training and model API. Code blocks show the target API; implementation and qualification work lives in the [roadmap](../roadmap.md). Its data counterpart is [the data design](data.md). Shared code ownership is in [architecture](architecture.md), and behavioral qualification is in [testing](testing.md).
 
 ## 0. The idea in one paragraph
 
@@ -26,15 +26,13 @@ flowchart LR
 
 ## 1. Models
 
-Any Flax module trains. The objective calls the module's forward, which is `__call__` unless you say otherwise:
+Any Flax module trains. The objective calls the module's forward through Flax's `apply`. Binding a different forward method is tracked in the [roadmap](../roadmap.md#models-and-interop).
 
 ```python
 class MyLM(nn.Module):
     def __call__(self, tokens, *, positions=None, segment_ids=None): ...
-    def logits(self, tokens, **inputs): ...
 
-LMObjective(MyLM(...), seq_len=2048)                     # calls __call__
-LMObjective(MyLM(...), seq_len=2048, method="logits")    # Flax's own apply(method=)
+LMObjective(MyLM(...), seq_len=2048)
 ```
 
 - Flax NNX modules go through Flax's own NNX-to-Linen bridge; Dew has no second module system.
@@ -52,13 +50,13 @@ Trainer(objective, opt, key=0, mesh=MeshSpec(fsdp=8, tensor=2))
 # Native: your own jax.Mesh, any axis names, and how the model maps onto them.
 mesh = jax.make_mesh((4, 8, 2), ("replica", "fsdp", "context"))
 Trainer(objective, opt, key=0, mesh=mesh,
-        rules={"embed": "fsdp", "mlp": "fsdp", "length": "context"},
-        data_axes=("replica", "fsdp"))
+        layout=Layout(rules={"embed": "fsdp", "mlp": "fsdp", "length": "context"},
+                      data_axes=("replica", "fsdp")))
 ```
 
 `MeshSpec` builds Dew's six named axes (`data`, `fsdp`, `expert`, `tensor`, `sequence`, `stage`). It is serializable, so a run's `run.json` and the command line (`--mesh.fsdp 8`) can store it and a resumed run rebuilds the mesh on whatever hardware it lands on. Its `replicas=` orders devices for hybrid sharded data parallelism, so FSDP's gathers stay inside a host's NVLink domain and only the gradient all-reduce crosses the slower network.
 
-A native `jax.Mesh` needs two facts from you: `rules`, which map the model's logical axes (`embed`, `mlp`, `heads`, `vocab`, `experts`, `length`, `layers`) onto mesh axes, and `data_axes`, which say which axes split the batch. `data_axes=` is shorthand that writes the one batch rule everything else reads: each host's data share, gradient reduction, and token accounting. Model-parallel algorithms keep their role names: expert exchange runs on an axis called `expert`, sequence attention on `sequence`, pipeline stages on `stage`. Any other axis, a second FSDP level or a context axis, is free for parameters and data through the rules. Dew refuses by name only what cannot work: a rule naming an axis the mesh lacks, or a parameter placed on a data axis.
+A native `jax.Mesh` needs two facts from you in `Layout`: `rules`, which map the model's logical axes (`embed`, `mlp`, `heads`, `vocab`, `experts`, `length`, `layers`) onto mesh axes, and `data_axes`, which say which axes split the batch. `data_axes=` is shorthand that writes the one batch rule everything else reads: each host's data share, gradient reduction, and token accounting. Model-parallel algorithms keep their role names: expert exchange runs on an axis called `expert`, sequence attention on `sequence`, pipeline stages on `stage`. Any other axis, a second FSDP level or a context axis, is free for parameters and data through the rules. Dew refuses by name only what cannot work: a rule naming an axis the mesh lacks, or a parameter placed on a data axis.
 
 ```mermaid
 flowchart LR
@@ -73,16 +71,20 @@ flowchart LR
 
 `microbatches=` for pipeline stages is a Trainer argument (default: one per stage), the same for both mesh forms.
 
+Where the layout splits a leaf, the shared rule table and that leaf's declared logical axes place it; a leaf that declares none falls back to a shape heuristic, and refusing it instead is not built yet. A rule outside Dew's defaults (`DEFAULT_RULES`) that names an axis the mesh lacks is refused, a role axis among them, since it would split nothing; Dew's own rules take a missing role axis as size 1. A placement rule that deviates for one model family is a separate rule (expert parallelism's, tensor parallelism's), never a branch in the default.
+
+On a native mesh, the layout is to report what it is about to do before the first step, as `Layout.validate(mesh)`, which is not built yet: which leaves split over which axes, the per-device bytes, the batch split, the collectives each logical axis implies, and an unbound logical axis, which would replicate that dimension. A mismatch between the rules and the mesh's axis names is to fail there, not in GSPMD.
+
 ## 3. Memory and speed are chosen for you
 
-The memory planner picks, per model, mesh and GPU, the cheapest combination that fits: micro-batch size, rematerialization policy, LM-head tiling and host offload. The same `batch(1024)` works on one GPU or 256. You override any one of them:
+The memory planner picks, per model, mesh and GPU, the cheapest combination that fits: micro-batch size, rematerialization policy, LM-head tiling and host offload. The planner checks each candidate against its compiled program's memory analysis. Where none fits, `fit` raises naming the split, rematerialization and head options it tried, and the closest candidate's temporary and argument bytes where the analysis gave them. The same `batch(1024)` works on one GPU or 256. You override any one of them:
 
 ```python
 Trainer(objective, opt, key=0, accumulation=4)                    # fix the micro-batch split
 Trainer(objective, opt, key=0, layout=Layout(host=("optimizer",)))  # keep optimizer state in host memory
 ```
 
-Kernels are chosen per GPU generation from one table (`dew.nn.kernels`): FlashAttention 3 on Hopper, FlashAttention 2 on Ampere and Blackwell workstations, fla's gated delta rule, fused norms and SwiGLU. A kernel replaces the XLA path only when it is measured faster and passes the float64 accuracy gate on that GPU. Tile sizes come from one autotuner per GPU and shape, cached with XLA's own autotune results.
+Every eligible model takes the planner's path: no model family needs a planner of its own. Kernels are chosen per GPU generation from one table (`dew.nn.kernels`): FlashAttention 3 on Hopper, FlashAttention 2 on Ampere and Blackwell workstations, fla's gated delta rule, fused norms and SwiGLU. A kernel replaces the XLA path only when it is measured faster and passes the float64 accuracy gate on that GPU. Tile sizes come from one autotuner per GPU and shape, cached with XLA's own autotune results.
 
 ## 4. `fit`
 
@@ -98,9 +100,9 @@ state = trainer.fit(
 )
 ```
 
-- One budget: `steps=`, `epochs=` or `tokens=` (committed valid target tokens, the same clock the data `schedule` reads).
+- One budget: `steps=`, `epochs=` or `tokens=` (committed valid target tokens, the same clock the data `schedule` reads). A run's tokens grow only at a committed update. `fit` checks the budget between steps, so after a rejected microbatch a split step can reach it at a commit and keep a later partial window; ending at that commit is not built yet.
 - `validation` is one chain or a dict of named chains, each reported separately.
-- `fit` returns the final `TrainState`; `fit(..., state=state)` continues from one in memory.
+- `fit` returns the final `TrainState`. `state=` supplies initial state rather than a continuation; checkpoint restore also restores the data position.
 
 ### The batch contract
 
@@ -126,20 +128,20 @@ Trainer(objective, opt, key=0,
 
 ## 6. Compilation
 
-Compiled programs depend only on the model, shapes, dtypes, shardings and configuration, never on where a run happens to be. The persistent compile cache is shared across runs, processes and checkouts. A resumed or repeated run reuses its programs. Compilation can run before a GPU is held, from stored autotune results, so GPUs spend their time training.
+Compiled programs depend only on the model, shapes, dtypes, shardings and configuration, never on where a run happens to be: a compiled program captures no run path, temporary directory or checkout location. The persistent compile cache is shared across runs, processes and checkouts. A resumed or repeated run reuses its programs. `lower_for=` lowers a step for a GPU generation on any host. Compiling that lowered step before a GPU is held and carrying its executable into the run is tracked in the [roadmap](../roadmap.md#training-and-parallelism).
 
 ## 7. Seeing what happens
 
-Every run logs canonical MFU (analytic model FLOPs on real tokens over wall time) and where step time goes. `dew profile runs/lm-1b` prints the step breakdown, MFU, the kernel chosen for each operation, and the top three losses. Trackers (W&B, MLflow) take the same metrics; the local metric journal is JSONL.
+Every run logs canonical MFU (analytic model FLOPs on real tokens over wall time) and where step time goes. A model reports its FLOPs through `model_flops`; a model without them reports no MFU rather than an estimate. Each kernel dispatch records which kernel it chose and why (`dew.nn.kernels.generation.routes`); collecting those choices into a run's report is not built yet. Trackers (W&B, MLflow) take the same metrics; the local metric journal is JSONL. The [roadmap](../roadmap.md#kernels-and-performance) tracks a `dew profile` command that reports the step breakdown, chosen kernels and top three losses from the existing attribution tools.
 
 ## 8. After training
 
 ```python
 pipe = dew.pipeline("runs/lm-1b")                 # the trained model with its processor
-pipe("The capital of France is", max_new_tokens=32)
-pipe([{"role": "user", "content": "Hi"}])        # chat, no PyTorch needed
+pipe("The capital of France is", max_new_tokens=32, key=0)
+pipe([{"role": "user", "content": "Hi"}], key=1)  # chat, no PyTorch needed
 
-run.export("out/", format="hf")                   # loads in transformers and vLLM
+Pretrained.from_run("runs/lm-1b").save("out/")     # loads in transformers and vLLM
 adapter.save("out/lora")                          # a complete PEFT adapter
 ```
 
@@ -155,7 +157,7 @@ A reloaded run behaves like the live one: the same processor, chat template and 
 | Loading readers | Every model family loads and exports through one reversible weight-layout plan. |
 | Checkpoint state | Saving and restoring derive from the training state's own schema; restore casts and places once. |
 
-Each seam has one standing end-to-end test that runs every implementation registered for it.
+Each seam requires one standing end-to-end test that runs every implementation registered for it. The [roadmap](../roadmap.md#ci-and-tooling) tracks the registry-wide coverage still to add.
 
 ## 10. Examples
 
@@ -177,7 +179,7 @@ model = DiT.preset("dit-b/2")
 data = Files("gs://data/laion/*.array_record").filter_map(images.DecodeImage()).map(images.Resize(256)).batch(256)
 trainer = Trainer(DiffusionObjective(model, process=FlowMatching(), vae="stabilityai/sd-vae-ft-ema"), optax.adamw(1e-4), key=0)
 state = trainer.fit(data, steps=400_000)
-images = dew.pipeline(trainer)("a red fox in snow", steps=50, guidance=4.0)
+images = dew.pipeline(trainer)("a red fox in snow", steps=50, guidance=4.0, key=0)
 ```
 
 ### The same LM script on 64 GPUs
@@ -189,18 +191,3 @@ trainer = Trainer(LMObjective(model, seq_len=8192), optax.adamw(3e-4), key=0,
 trainer.fit(data, tokens=2e12)    # launched on every host with `dew launch`
 ```
 
-## 11. Status
-
-| Area | Status |
-|---|---|
-| Trainer, objectives, Optax optimizers, `MeshSpec`, `Layout(rules=)`, checkpoints with automatic resume, `Keep`, trackers, canonical MFU | Built |
-| Memory planner choosing micro-batch, remat and head tiling | Built, landing |
-| Resume skipping pretrained weights; cache keys stable across checkouts | Built, landing |
-| FlashAttention 3, fla GDN, fused norms and SwiGLU, the kernel table | Built |
-| Autotuner per GPU and shape | In review |
-| Native `jax.Mesh` with any axes, `data_axes=`, `microbatches=` on the Trainer | Planned |
-| Native variable trees normalized at the Trainer; `method=` | Planned |
-| `fit(epochs=, tokens=)` | Built, landing |
-| Compile before holding a GPU, period scan over layers | Planned |
-| `dew profile`; reloaded runs keeping their processor; chat without PyTorch; complete PEFT exports; `run.export` | Planned |
-| The five seams and their standing tests | In progress (seam 2 landing; seam 1 built) |

@@ -16,22 +16,15 @@ dependencies = [
     # HiPrim; qwix imports nnx); <0.13 so that a flax that changes linen or nnx
     # arrives through a bump the suite checks, as jax does below.
     "flax>=0.12.10,<0.13",
-    # 0.11.2, whose accelerator builds the cuda12, cuda13 and tpu extras name;
-    # <0.11.3 admits the post releases of the build constraints.txt names.
-    # That build carries the multi-process cache-key fix (jax-ml/jax#40940),
-    # which no release has: 0.11.2 keys an executable by the compiling
-    # process's topology fingerprint, which differs between GPUs with and
-    # without NVLink, so a pool across both kinds loaded a step on some
-    # processes and compiled it on others, whose sharded autotuning then
-    # waited for ever. PyPI refuses a requirement that names a URL, so the
-    # published dewml takes the release: Dew detects a jax without the fix and
-    # compiles a GPU pool without the persistent cache
-    # (dew.training.runtime._pool_keys_alike), and CI and development installs
-    # take the build through constraints.txt. A bump runs the GPU checks
-    # docs/installation.md lists under "Bumping JAX" first: CI is CPU-only.
-    "jax>=0.11.2,<0.11.3",
-    # dew.training.runtime reads whether jax is that build, a post-release.
-    "packaging",
+    # Dew's JAX build: 0.11.2 with the fixes no release has yet (constraints.txt
+    # names them), which only Dew's package index serves, pypi.dewml.dev. The
+    # first build with every fix is post6; a release sorts below it, so an
+    # install from PyPI alone stops at resolving jax rather than running on a
+    # jax without them (docs/installation.md). The accelerator builds the
+    # cuda12, cuda13 and tpu extras name are 0.11.2's. A bump runs the GPU
+    # checks docs/installation.md lists under "Bumping JAX" first: CI is
+    # CPU-only.
+    "jax>=0.11.2.post6,<0.11.3",
     "optax>=0.2.2",
     "orbax-checkpoint>=0.12.4",
     "numpy",
@@ -53,10 +46,11 @@ dependencies = [
     "filelock",
     "huggingface_hub",
     "fsspec>=2026.6.0",
+    # dew.data.sources.urls fetches HTTP(S) through fsspec's aiohttp session under aiohttp's total deadline.
+    "aiohttp>=3.9",
     "zstandard>=0.25.0",
     "gcsfs>=2026.6.0",
     "s3fs>=2026.6.0",
-    "urllib3>=2.5",
     "pyarrow>=25.0.1",
     "array-record>=0.8.3; sys_platform != 'win32'",
     # dew.nn.kernels.tuning: every Pallas launch is a tokamax Op, whose config
@@ -139,9 +133,13 @@ test = [
     "diffusers==0.34.0",
     # tests/test_wan_source.py cleans prompts as Wan's pipelines do (the wan extra).
     "dewml[wan]",
+    # tests/test_tools.py imports FlaxDiff's reference, whose hilbert module imports matplotlib.
+    "matplotlib",
     # tests/test_live_bridge.py runs the live bridge (site/live/container) over real sockets, on the
     # release its container installs (the live extra).
     "dewml[live]",
+    # tests/test_notebook_display.py executes a notebook in a Jupyter kernel and reads it back saved.
+    "dewml[notebooks]",
     # Every decoder and MoE parity number is calibrated against this exact
     # release: the fixtures record it (tests/fixtures/hf/*/meta.json), the
     # tests cite its line numbers, and a resolve that moved it would compare
@@ -177,8 +175,6 @@ mutation = ["cosmic-ray==8.7.0"]
 av = ["moviepy"]
 # FID's Inception weight download
 metrics = ["requests"]
-# Explicit LocalTracker.plot()/plots=True rendering.
-plots = ["matplotlib"]
 wandb = ["wandb"]
 # MLflowTracker: a run in a tracking store, local file store included.
 mlflow = ["mlflow"]
@@ -225,6 +221,9 @@ gguf = ["gguf==0.19.0"]
 inference-clients = ["ollama>=0.6.2,<0.7", "openai>=3.8,<4"]
 # examples/serve_decisions.py: a decision model behind HTTP in Jev's wire format.
 serve = ["starlette>=0.40", "uvicorn>=0.30"]
+# Agent environments and remote sandboxes for rollouts: OpenEnv's environments and the Modal, E2B and
+# Daytona SDKs, which dew.interop's environment and sandbox adapters import when they are used.
+environments = ["openenv>=0.9,<0.10", "modal>=1.6,<1.7", "e2b>=2,<3", "daytona>=0.224,<0.226"]
 # Guided decoding (dew.sampling.guided): regex and JSON-schema token automata.
 guided = ["outlines-core>=0.2.14"]
 # HF image processors use torchvision on the host; model computation stays JAX.
@@ -238,10 +237,11 @@ torchax = ["torch>=2.14,<2.15", "torchax==0.0.14.dev20260922"]
 # The test suite's one environment: every package a test file imports, so no test skips for want
 # of one. CI's jobs, armada's (tools/armada/install.sh), the GPU nodes' and dew-ops' GPU jobs install
 # it under constraints.txt, locked in locks/ (tools/lock_environment.sh).
-ci = ["dewml[test,av,tfds,metrics,plots,inference-clients,serve,vision,augment,quantization,profile,torchax,gguf]",
+ci = ["dewml[test,av,tfds,metrics,inference-clients,serve,environments,vision,augment,quantization,profile,torchax,gguf]",
       "flake8"]
 # The tutorial notebooks' environment outside Colab: the extras they import and a Jupyter kernel.
-tutorials = ["dewml[streaming,interop,plots,notebooks]"]
+# Tutorial 01, Diffusion from scratch, draws with matplotlib, which Colab installs.
+tutorials = ["dewml[streaming,interop,notebooks]", "matplotlib"]
 # Execute notebooks through a Jupyter kernel of the selected interpreter.
 notebooks = ["nbclient", "nbformat", "ipykernel"]
 

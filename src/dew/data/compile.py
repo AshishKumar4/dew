@@ -27,6 +27,7 @@ from dew.data.analysis import (
     _at,
     _cache_manifest,
     _capabilities,
+    _configured,
     _cut,
     _identity,
     _leaves,
@@ -38,6 +39,7 @@ from dew.data.analysis import (
     _preferred_read,
     _promoted,
     _Ran,
+    _stated,
     _steps,
     _until,
     _written,
@@ -57,12 +59,11 @@ from dew.data.dataset import (
 )
 from dew.data.lowering import _as_iter, _Build, _epoch_records, _Locality, _split_spans, _weights, _workers
 from dew.data.materialize import _materialize, _Memory
-from dew.data.mixing import CorpusCounts, SearchBudget
+from dew.data.mixing import CorpusCounts
 from dew.data.pipeline import (
     Artifact,
     Batched,
     BatchStage,
-    Bound,
     Configured,
     Dataset,
     DeviceStep,
@@ -82,13 +83,11 @@ from dew.data.pipeline import (
     Pipeline,
     Prefetch,
     RandomMap,
-    Rebatch,
     RecordStep,
     Repeat,
     Shuffle,
     SingleReader,
     Slice,
-    Stage,
     TokenBudget,
     TokenGeometry,
     Volatile,
@@ -98,12 +97,11 @@ from dew.data.pipeline import (
 )
 from dew.data.plan import Plan, StepIdentity, fingerprint, unplaced
 from dew.data.readers import _CanonicalPass, _Host, _PerShare, _Statistics
-from dew.data.sources.base import Read, ShardManifest, Source, _consumed
+from dew.data.sources.base import Read, ShardManifest, Source, _consumed, tokenizer_contract
 from dew.data.steps.generic import Coordinated
 from dew.records import JSON, integer, json_value, record
 
 _DEFAULT_LOADING = Loading()
-_DEFAULT_BUDGET = SearchBudget()
 
 
 @runtime_checkable
@@ -143,6 +141,12 @@ class _Facts:
     held: _PinnedRead | None = None
     """The memory read pinning took, which the compile's memory reads of the source reuse, so its
     facts and the rows a run materializes are one read's."""
+    stated_label: str = ""
+    """The source's name as it was written, before a read put another in its place (a Hub split's
+    Parquet files, `Consumed`), which the run's metrics go by."""
+
+    def label(self) -> str:
+        return self.stated_label
 
     def describe(self) -> str:
         return self.source.describe()
@@ -199,10 +203,11 @@ def _pin_sources(pipelines: Sequence[Pipeline], read: Read) -> tuple[Pipeline, .
     def pin(source: Source) -> _Facts:
         if isinstance(source, _Facts):
             return source
+        label = source.label()
         source = _consumed(source, read)
-        # A source may measure a fact as it reads (a prompt's reward bound), so the facts follow the read.
-        held = _PinnedRead(source.records(read)) if read == "memory" else None
-        return _Facts(source, read, source.fingerprint(), source.metadata(), held)
+        records, metadata = _stated(source, read)
+        held = None if records is None else _PinnedRead(records)
+        return _Facts(source, read, source.fingerprint(), metadata, held, label)
 
     with ThreadPoolExecutor(max_workers=min(8, max(1, len(sources)))) as readers:
         pinned = dict(zip(sources, readers.map(pin, sources.values()), strict=True))
@@ -220,60 +225,8 @@ def _pin_sources(pipelines: Sequence[Pipeline], read: Read) -> tuple[Pipeline, .
 
 
 def _tokenizer_contract(pipelines: Sequence[Pipeline]) -> None:
-    declared: dict[str, JSON] = {}
-    for pipeline in pipelines:
-        for leaf, source in _leaves(pipeline):
-            metadata = source.metadata()
-            for key in ("tokenizer", "vocab_size", "eos_id", "tokenizer_revision"):
-                if key not in metadata:
-                    continue
-                value = json_value(metadata[key], key)
-                if key in declared and value != declared[key]:
-                    raise ValueError(
-                        f"corpus {_name(leaf)} has {key}={value!r}, expected {declared[key]!r}; "
-                        "mixed corpora must share the tokenizer contract"
-                    )
-                declared[key] = value
-
-
-def _configured(
-    pipeline: Pipeline,
-    shared: Mapping[str, object],
-    read: Read,
-    scope: Literal["source", "run"] | None = None,
-) -> Pipeline:
-    source = pipeline.source
-    if isinstance(source, (Mixture, Phases)):
-        children = tuple(_configured(child, shared, read, scope) for child in source.pipelines)
-        source = dataclasses.replace(source, pipelines=children)
-        local = shared
-    else:
-        local = source.metadata()
-    stages: list[Stage] = []
-    for stage in pipeline.stages:
-        if not isinstance(stage, Configured) or (scope is not None and stage.scope != scope):
-            stages.append(stage)
-            continue
-        metadata = shared if stage.scope == "run" else local
-        missing = sorted(set(stage.needs) - metadata.keys())
-        if missing:
-            raise ValueError(
-                f"{_name(pipeline)} step {_identity(stage).name} needs metadata {missing}; "
-                "provide producer metadata, recipe fields or read='memory'"
-            )
-        binding = Bound(stage, {key: metadata[key] for key in stage.needs})
-        resolved = stage.factory(metadata)
-        if isinstance(resolved, pygrain.RandomMapTransform) != stage.random:
-            raise ValueError(
-                f"Configured {_identity(stage).name} random={stage.random} disagrees with its step"
-            )
-        if isinstance(resolved, Expansion):
-            stages.append(FlatMap(resolved, configured=binding))
-        elif isinstance(resolved, pygrain.RandomMapTransform):
-            stages.append(RandomMap(resolved, rejects=_declares_rejects(resolved), configured=binding))
-        else:
-            stages.append(Map(resolved, rejects=_declares_rejects(resolved), configured=binding))
-    return dataclasses.replace(pipeline, source=source, stages=tuple(stages))
+    tokenizer_contract((f"corpus {_name(leaf)}", source.metadata())
+                       for pipeline in pipelines for leaf, source in _leaves(pipeline))
 
 
 def _row_tokens(pipeline: Pipeline) -> int | None:
@@ -317,7 +270,7 @@ def _windowed(pipeline: Pipeline, objective: ObjectiveData) -> Pipeline:
     if objective.pack is None:
         return pipeline
     at = _until(pipeline.stages, (BatchStage, TokenBudget))
-    windows = dataclasses.replace(pipeline, stages=pipeline.stages[:at]).then(objective.pack)
+    windows = dataclasses.replace(pipeline, stages=pipeline.stages[:at])._then(objective.pack)
     for step in objective.packed:
         windows = windows.map(step)
     return dataclasses.replace(windows, stages=(*windows.stages, *pipeline.stages[at:]))
@@ -480,14 +433,13 @@ def compile(
     loading: Loading | None = None,
     seed: int = 0,
     rejections: Literal["drop", "mask"] = "drop",
-    budget: SearchBudget = _DEFAULT_BUDGET,
     resume: Literal["exact", "non-exact"] = "exact",
 ) -> Loader:
     """Check every leaf before opening readers, then build both branches.
     With no `read`, the sources choose it (`_preferred_read`)."""
     branches = (train,) if validation is None else (train, validation)
     read = read or train.mode or _preferred_read(lambda _: branches, provision=provision)
-    loading = loading or train.loading or _DEFAULT_LOADING
+    loading = loading or train._loading or _DEFAULT_LOADING
     if isinstance(train.source, Phases):
         return _compile_phases(
             train,
@@ -499,11 +451,10 @@ def compile(
             loading=loading,
             seed=seed,
             rejections=rejections,
-            budget=budget,
             resume=resume,
         )
     staged = _staged(train, validation, objective=objective, read=read, provision=provision, loading=loading,
-                     seed=seed, rejections=rejections, budget=budget)
+                     seed=seed, rejections=rejections)
     return _compiled(staged, _coordinated(staged.train), host=host, resume=resume)
 
 
@@ -532,7 +483,6 @@ def _staged(
     loading: Loading,
     seed: int,
     rejections: Literal["drop", "mask"],
-    budget: SearchBudget,
 ) -> _Staged:
     if rejections == "mask":
         raise ValueError(
@@ -563,14 +513,14 @@ def _staged(
         if validation_counts and not any(count.accepted for count in validation_counts.values()):
             validation = None
         _released(branches)
-    build = _Build(read, loading, seed, batch, budget, _analyzed(train, read), training=True)
+    build = _Build(read, loading, seed, batch, _analyzed(train, read), training=True)
     return _Staged(train, validation, original, build, counts, validation_counts, batch_tokens)
 
 
 def _output_batch(pipeline: Pipeline) -> int:
     """The rows each batch of `pipeline` holds as its reader yields them, which its loader declares
-    and its share pads to: the last rebatch's, else its batch's own, which still groups its reads."""
-    return [stage.size for stage in pipeline.stages if isinstance(stage, (BatchStage, Rebatch))][-1]
+    and its share pads to."""
+    return next(stage.size for stage in pipeline.stages if isinstance(stage, BatchStage))
 
 
 def _compiled(
@@ -751,7 +701,6 @@ def _compile_phases(
     loading: Loading,
     seed: int,
     rejections: Literal["drop", "mask"],
-    budget: SearchBudget,
     resume: Literal["exact", "non-exact"],
 ) -> Loader:
     source = train.source
@@ -762,9 +711,9 @@ def _compile_phases(
     staged: list[tuple[_Staged, int | None]] = []
     previous = 0
     for index, (pipeline, until) in enumerate(zip(source.pipelines, source.until_steps, strict=True)):
-        phase = _staged(_continued(pipeline, consumed).then(*train.stages),
+        phase = _staged(_continued(pipeline, consumed)._then(*train.stages),
                         validation if index == 0 else None, objective=objective, read=read,
-                        provision=provision, loading=loading, seed=seed, rejections=rejections, budget=budget)
+                        provision=provision, loading=loading, seed=seed, rejections=rejections)
         end = None if until is None else until * phase.build.batch
         staged.append((phase, end))
         if end is not None:
@@ -945,7 +894,7 @@ def _objective_records(
         if isinstance(step, Expansion):
             pipeline = pipeline.flat_map(step)
         elif isinstance(step, Configured):
-            pipeline = pipeline.then(step)
+            pipeline = pipeline._then(step)
         elif isinstance(step, pygrain.RandomMapTransform):
             drops = _declares_rejects(step)
             pipeline = pipeline.random_filter_map(step) if drops else pipeline.random_map(step)
@@ -973,7 +922,7 @@ def _objective_branch(pipeline: Pipeline, objective: ObjectiveData, *, train: bo
     steps = objective.train_batch if train else objective.evaluate_batch
     # A string or object field stays in the batch for the host code and metrics that read it; the
     # prefetcher places the rest (`dew.training.distributed.split_fields`).
-    return branch.then(*(MapBatch(step) for step in steps))
+    return branch._then(*(MapBatch(step) for step in steps))
 
 
 def _metadata(pipelines: Sequence[Pipeline], read: Read) -> Mapping[str, object]:
@@ -1005,9 +954,9 @@ def _diagnostic(pipeline: Pipeline, *, records: int | None = None) -> _Host:
     eager memory transforms, and leaves its counters in the Grain state.
     """
     read = pipeline.mode or _preferred_read(lambda _: (pipeline,), provision=True)
-    loading = pipeline.loading or _DEFAULT_LOADING
+    loading = pipeline._loading or _DEFAULT_LOADING
     if records is not None:
-        pipeline = pipeline.then(Limit(records))
+        pipeline = pipeline._then(Limit(records))
         loading = dataclasses.replace(loading, workers=0, threads=0, read_buffer=0)
     if not pipeline.batched:
         pipeline = pipeline.batch(1, drop_remainder=False)
@@ -1032,7 +981,7 @@ def _diagnostic(pipeline: Pipeline, *, records: int | None = None) -> _Host:
         lowering = _finite(lowering)
     # A token budget is fixed-length rows by now (`_budgeted`).
     batch = next(stage for stage in pipeline.stages if isinstance(stage, BatchStage)).size
-    build = _Build(read, loading, 0, batch, _DEFAULT_BUDGET, lowering, training=True)
+    build = _Build(read, loading, 0, batch, lowering, training=True)
     return _Host(build.tuned(pipeline).batches(pipeline, DataPartition()), packed + _batch_steps(pipeline)[0])
 
 
@@ -1048,7 +997,6 @@ def iterate(
     read: Read = "streamed",
     provision: bool = False,
     loading: Loading = _DEFAULT_LOADING,
-    budget: SearchBudget = _DEFAULT_BUDGET,
 ) -> pygrain.IterDataset:
     """A finite record pass through the same lowering, for publication and export."""
     if any(
@@ -1061,7 +1009,7 @@ def iterate(
         pipeline = _materialize(pinned, {}, training=False)
         _released((pinned,))
     lowering = _analyzed(pipeline, read, validation=True)
-    build = _Build(read, loading, 0, 1, budget, lowering, training=False)
+    build = _Build(read, loading, 0, 1, lowering, training=False)
     rows = build.records(pipeline, DataPartition())
     return _as_iter(rows, loading)
 
@@ -1080,14 +1028,14 @@ def fitted[Entry](
     Loader is already compiled, and an entry that is no Dataset (a reader,
     an evaluation suite) is passed on as it is."""
     if isinstance(dataset, Dataset):
-        train = _endless(dataset.chain())
+        train = _endless(dataset._chain())
         loader = compile(train, objective=objective, provision=True)
     else:
         loader = dataset
     named = {"val": validation} if isinstance(validation, Dataset) else validation
     if named is None:
         return loader, None
-    return loader, {name: _held(entry.chain(), loader.batch, objective) if isinstance(entry, Dataset)
+    return loader, {name: _held(entry._chain(), loader.batch, objective) if isinstance(entry, Dataset)
                     else entry for name, entry in named.items()}
 
 
@@ -1105,7 +1053,7 @@ def _held(chain: Pipeline, batch: int, objective: ObjectiveData) -> Reader:
     """`chain` read once to validate on, batched by `batch` where it states no
     batch, read and loaded as it asks."""
     return validation(chain, batch=batch, objective=objective, read=chain.mode,
-                      loading=chain.loading or _DEFAULT_LOADING, provision=True)
+                      loading=chain._loading or _DEFAULT_LOADING, provision=True)
 
 
 def validation(
@@ -1118,7 +1066,6 @@ def validation(
     provision: bool = False,
     loading: Loading = _DEFAULT_LOADING,
     seed: int = 0,
-    budget: SearchBudget = _DEFAULT_BUDGET,
 ) -> Reader:
     """Compile one finite evaluation branch without constructing a training
     stream. With no `read`, the sources choose it (`_preferred_read`)."""
@@ -1134,7 +1081,7 @@ def validation(
         _released((pinned,))
     packed = _coordinated(pipeline)
     lowering = _analyzed(pipeline, read, validation=True)
-    build = _Build(read, loading, seed, batch, budget, lowering, training=False)
+    build = _Build(read, loading, seed, batch, lowering, training=False)
     return functools.partial(_validation_reader, pipeline=pipeline, build=build.tuned(pipeline),
                              host=packed + _held_steps(pipeline) + host)
 
@@ -1147,8 +1094,12 @@ def publish(
     provision: bool = False,
     loading: Loading = _DEFAULT_LOADING,
 ):
-    """Fill and seal a deterministic prefix, then publish its certified generation."""
+    """Fill and seal a deterministic prefix, then publish its certified
+    generation, unless one is already published under its key (with the plan
+    of a terminal pack), which it returns."""
     from dew.data.cache import Cache
+    from dew.data.generation import Generation
+    from dew.data.packing import PackingPlan, plan_name
 
     if not isinstance(cache, Cache):
         raise TypeError("publish needs a Cache destination")
@@ -1157,8 +1108,6 @@ def publish(
     planned = _at(pipeline.stages, Pack)
     builder = None
     if planned is not None:
-        from dew.data.packing import PackingPlan
-
         packing = pipeline.stages[planned]
         if not isinstance(packing, Pack) or planned != len(pipeline.stages) - 1:
             raise ValueError("publication accepts one terminal packing stage after the cached prefix")
@@ -1168,12 +1117,23 @@ def publish(
     source = pipeline.source
     if isinstance(source, (Mixture, Phases)):
         raise ValueError("configured publication needs one physical source")
-    cached = pipeline.cache(cache)
     manifest = _cache_manifest(source, pipeline.stages, read)
-    iterator = iter(iterate(cached, read=read, loading=loading))
+
+    def published() -> Generation | None:
+        generation = cache.generation(manifest)
+        held = generation is not None and (
+            builder is None or plan_name(builder.pack, "accepted") in generation.manifest["plan"])
+        return generation if held else None
+
+    found = published()
+    if found is not None:
+        return found
+    iterator = iter(iterate(pipeline.cache(cache), read=read, loading=loading))
     try:
         for _ in iterator:
             pass
     finally:
         iterator.close()
-    return cache.publish(manifest, source, plan=builder)
+    # A fill one reader completed publishes itself (`Cache.mapped`).
+    found = published()
+    return cache.publish(manifest, source, plan=builder) if found is None else found

@@ -30,7 +30,7 @@ from dew.nn.scatter import DROPPED
 from dew.nn.sharding import logical_spec
 from dew.objectives.base import Variables
 from dew.sampling import decoding
-from dew.sampling.decoding import LogitsTransform, StepState, Stopping
+from dew.sampling.decoding import LogitsTransform, StepState
 from dew.sampling.guided import Grammar
 from dew.sampling.strategies import DecoderState, draw
 from dew.sampling.text import decode_ops, prefill_state
@@ -87,11 +87,13 @@ class Admission:
 @struct.dataclass
 class Draws:
     """What one step drew, per slot: the token, whether the row drew at
-    all, whether a criterion stopped it, and both likelihoods."""
+    all, whether a criterion finished it and whether one that ends a row
+    did (`decoding.Finish`), and both likelihoods."""
 
     token: jax.Array
     drawn: jax.Array
     stopped: jax.Array
+    ended: jax.Array
     behavior: jax.Array
     raw: jax.Array
 
@@ -134,6 +136,16 @@ def _placed(resident: jax.Array, incoming: jax.Array, rows: jax.Array, groups: i
 
     placed = jax.vmap(place)(*(grouped(leaf, 0, groups) for leaf in (words, fresh, rows)))
     return from_words(placed.reshape(words.shape), resident.dtype)
+
+
+def _taken(resident: jax.Array, rows: jax.Array, groups: int) -> jax.Array:
+    """`resident`'s rows at `rows`, group by group, as `_placed` writes them; a row at the
+    group's size reads zeros."""
+    def take(resident: jax.Array, rows: jax.Array) -> jax.Array:
+        return jnp.take(resident, rows, axis=0, mode="fill", fill_value=0)
+
+    taken = jax.vmap(take)(grouped(resident, 0, groups), grouped(rows, 0, groups))
+    return taken.reshape(rows.shape[0], *resident.shape[1:])
 
 
 def _seated(state: Slots, decoder: DecoderState, real: jax.Array, admission: Admission, groups: int) -> Slots:
@@ -206,20 +218,31 @@ class Paged:
 
         The piece runs over the shared pool with the page table and cursor the
         host supplies per row, so it reads earlier pieces and shared prefix
-        pages and writes its keys to the row's own pages; per-row leaves and
-        logits are scattered back to the rows' slots.
+        pages and writes its keys to the row's own pages. Any other per-row
+        state (a recurrent mixer's memory, image groups) comes from the row's
+        slot for a piece that continues the row, and fresh, as the model
+        allocates it, for one that starts it. Per-row leaves and logits are
+        scattered back to the rows' slots.
         """
-        def view(path: tuple[jax.tree_util.KeyEntry, ...], leaf: jax.Array) -> jax.Array:
+        rows = admission.cursors.shape[0]
+        allocated = model.apply(params, rows, method="init_cache", mutable=["cache"])[1]["cache"]
+        continues = admission.cursors > 0
+
+        def view(path: tuple[jax.tree_util.KeyEntry, ...], leaf: jax.Array, fresh: jax.Array) -> jax.Array:
             name = leaf_name(path)
             if name == TABLE:
                 return admission.tables
             if name in ROW_CURSORS:
                 # A text row's next position is its count of tokens (`dew.nn.kv_cache.POSITION`).
                 return admission.cursors
-            return leaf
+            if name in POOLED:
+                return leaf
+            held = _taken(leaf, admission.slots, self.groups)
+            return jnp.where(continues.reshape(rows, *(1,) * (held.ndim - 1)), held, fresh)
 
+        cache = jax.tree_util.tree_map_with_path(view, state.decoder.cache, allocated)
         fresh, real = prefill_state(model, params, admission.prompts, decode_ops(model, params, pad_id, None),
-                               cache=jax.tree_util.tree_map_with_path(view, state.decoder.cache))
+                                    cache=cache)
 
         def merged(path: tuple[jax.tree_util.KeyEntry, ...], resident: jax.Array,
                    updated: jax.Array) -> jax.Array:
@@ -236,7 +259,7 @@ Placement = Dense | Paged
 
 def _advanced(model: nn.Module, params: Variables, pad_id: int, placement: Placement, state: Slots,
               admission: Admission | None, transforms: tuple[LogitsTransform, ...],
-              stopping: tuple[Stopping, ...], grammar: Grammar | None) -> tuple[Slots, Draws]:
+              stopping: decoding.Finishing, grammar: Grammar | None) -> tuple[Slots, Draws]:
     """One iteration: admit, feed every drawing row its last draw, then every active row draws.
 
     This is `strategies._sample_rows`'s step over rows that carry their own
@@ -278,12 +301,14 @@ def _advanced(model: nn.Module, params: Variables, pad_id: int, placement: Place
     token, behavior, raw = draw(view, decoder.logits,
                                 chain if grammar is None else grammar.guiding(chain, state.automaton))
     committed = view.commit(token, state.active)
-    stopped = state.active & decoding.criterion(stopping)(committed, token)
+    finished = decoding.finish(stopping)(committed, token)
     drawn = state.active
+    stopped = drawn & finished.done
     return (Slots(decoder, committed.tokens, committed.valid, committed.step, state.budget,
                   drawn & ~stopped & (committed.step < state.budget), state.keys,
                   state.automaton if grammar is None else grammar.advanced(state.automaton, token, drawn)),
-            Draws(token, drawn, stopped, jnp.where(drawn, behavior, 0.0), jnp.where(drawn, raw, 0.0)))
+            Draws(token, drawn, stopped, drawn & finished.ended, jnp.where(drawn, behavior, 0.0),
+                  jnp.where(drawn, raw, 0.0)))
 
 
 def _mixed_step(model: nn.Module, params: Variables, pad_id: int, placement: Placement, decoder: DecoderState,
@@ -357,29 +382,43 @@ def joined(resident: Slots, carried: Slots) -> Slots:
 def _stepped(model: nn.Module, params: Variables, pad_id: int, placement: Placement, steps: int,
              resident: Slots, carried: Slots,
              admission: Admission | None, transforms: tuple[LogitsTransform, ...],
-             stopping: tuple[Stopping, ...], grammar: Grammar | None
+             stopping: decoding.Finishing, grammar: Grammar | None
              ) -> tuple[checkify.Error, tuple[Slots, Slots, Draws]]:
     """Run `steps` iterations of `_advanced` over a split state, carrying their device checks as a value.
 
     The first iteration takes the admission, the draws come back stacked
     `[steps, slots]`, and the host throws the error when it reads them, one
     call later. The state comes back split as it went in.
+
+    Each iteration checks its own draws. jax's checkify cannot carry a check
+    into a shard_map (jax-ml/jax#40907), and every iteration after the first
+    calls the model, which may run one, after the checks of the iteration
+    before it; so the iterations' errors come out of the loop as values and
+    meet in one after it, the first iteration's ahead of the rest.
     """
 
-    def run(params, resident, carried, admission, transforms, stopping, grammar):
-        state, draws = _advanced(model, params, pad_id, placement, joined(resident, carried), admission,
-                                 transforms, stopping, grammar)
-        draws = jax.tree.map(lambda leaf: leaf[None], draws)
-        if steps > 1:
-            def following(state: Slots, _: None) -> tuple[Slots, Draws]:
-                return _advanced(model, params, pad_id, placement, state, None, transforms, stopping, grammar)
+    def advanced(state: Slots, admission: Admission | None) -> tuple[checkify.Error, tuple[Slots, Draws]]:
+        return checkify.checkify(
+            lambda state, admission: _advanced(model, params, pad_id, placement, state, admission, transforms,
+                                               stopping, grammar),
+            errors=checkify.user_checks)(state, admission)
 
-            state, more = jax.lax.scan(following, state, length=steps - 1)
-            draws = jax.tree.map(lambda first, rest: jnp.concatenate([first, rest]), draws, more)
-        return *split_donated(state), draws
+    error, (state, draws) = advanced(joined(resident, carried), admission)
+    draws = jax.tree.map(lambda leaf: leaf[None], draws)
+    if steps > 1:
+        def following(state: Slots, _: None) -> tuple[Slots, tuple[checkify.Error, Draws]]:
+            error, (state, draws) = advanced(state, None)
+            return state, (error, draws)
 
-    return checkify.checkify(run, errors=checkify.user_checks)(
-        params, resident, carried, admission, transforms, stopping, grammar)
+        state, (later, more) = jax.lax.scan(following, state, length=steps - 1)
+        draws = jax.tree.map(lambda first, rest: jnp.concatenate([first, rest]), draws, more)
+
+        def raised(first: checkify.Error, later: checkify.Error) -> None:
+            checkify.check_error(first)
+            checkify.check_error(later)
+
+        error, _ = checkify.checkify(raised, errors=checkify.user_checks)(error, later)
+    return error, (*split_donated(state), draws)
 
 
 Formats = Slots
@@ -441,7 +480,7 @@ def _compiled(resident: Formats, carried: Formats, rows: NamedSharding | None,
 
 def resident_formats(model: nn.Module, params: Variables, pad_id: int, placement: Placement, steps: int,
                       state: Slots, shardings: Slots, rows: NamedSharding | None,
-                      transforms: tuple[LogitsTransform, ...], stopping: tuple[Stopping, ...],
+                      transforms: tuple[LogitsTransform, ...], stopping: decoding.Finishing,
                       grammar: Grammar | None) -> Formats:
     """Choose the memory layout the resident state keeps, by asking XLA for it.
 

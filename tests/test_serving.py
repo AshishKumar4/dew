@@ -14,7 +14,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from episode_support import ToolPolicy
 from flax import linen as nn
+from jax.experimental import checkify
 from model_support import Digits, decoder, serving_task as task
 from sharded import assert_sharded
 from steady_state import guarded, steady_state
@@ -156,6 +158,27 @@ def _host_loaded(dtype="float32"):
                              attention_impl="xla", max_seq_len=64)
     assert all(isinstance(leaf, np.ndarray) for leaf in jax.tree.leaves(loaded.variables["params"]))
     return loaded.text_generation(sampling=Sampling(temperature=0, eos_token_ids=None))
+
+
+def test_a_served_length_limit_truncates_a_request_as_a_direct_call_does():
+    """A task whose criteria cut a request short at a length (`MaxNewTokens`) before its budget
+    finishes it unterminated through a server, as the task's own call does, and a task that ends
+    it on a criterion of its own finishes it terminated through both."""
+    from dew.sampling import Sampling, decoding
+
+    def at_two(state, tokens):
+        return state.step >= 2
+
+    prompt = np.asarray([1, 2, 3], np.int32)
+    for stopping, terminated in (((decoding.MaxNewTokens(2),), False), ((at_two,), True)):
+        bound = dataclasses.replace(task(Sampling(temperature=0, eos_token_ids=None)), stopping=stopping)
+        direct = bound(prompt[None], 8, key=0)
+        server = Server.from_task(bound, slots=2, capacity=32)
+        ticket = server.submit(prompt, 8, key=0)
+        server.run()
+        served = ticket.result()
+        assert direct.lengths.tolist() == served.lengths.tolist() == [2]
+        assert direct.terminated.tolist() == served.terminated.tolist() == [terminated]
 
 
 def test_a_server_over_loaded_weights_places_them_once():
@@ -425,6 +448,32 @@ def test_a_server_round_after_the_first_reuses_its_programs_and_reads_once_a_ste
         np.testing.assert_array_equal(mine.host().tokens, theirs.host().tokens)
 
 
+@pytest.mark.parametrize("decode_steps", [1, 4])
+def test_a_step_whose_draw_has_no_distribution_stops_the_server(decode_steps):
+    """A bigram policy that draws 5 after every id but 5, after which every score is 3e38, which
+    a temperature of 0.5 doubles past float32's range: the step after the first draw has no
+    distribution to draw from, which the device checks. The server raises that check and stops,
+    whether the failing step is a call of its own or a later step of the call that admitted the
+    row."""
+    vocab = 16
+
+    def logits():
+        table = np.full((vocab, vocab), -3e38, np.float32)
+        table[:, 5] = 0.0
+        table[5] = 3e38
+        return table
+
+    model = ToolPolicy(vocab_size=vocab, max_seq_len=64, logits=logits)
+    params = model.init(jax.random.key(0), jnp.ones((1, 1), jnp.int32))
+    bound = TextGeneration(model, params, None, sampling=Sampling(temperature=0.5, eos_token_ids=None))
+    server = Server.from_task(bound, slots=2, capacity=64, decode_steps=decode_steps)
+    server.submit(np.asarray([1, 2, 3], np.int32), 4, key=0)
+    with pytest.raises(checkify.JaxRuntimeError):
+        server.run()
+    with pytest.raises(RuntimeError):
+        server.step()
+
+
 def test_a_request_admitted_mid_flight_draws_what_it_draws_alone():
     bound = task()
     server = Server.from_task(bound, slots=4, capacity=128, admission=2)
@@ -565,6 +614,47 @@ def test_a_multimodal_model_serves_over_its_language_models_cache(options):
         np.testing.assert_array_equal(served.host().tokens[:, :walked.shape[1]], walked)
 
 
+def hybrid_task():
+    """Qwen3.5's stack at toy size: two gated-delta-net layers, whose recurrent memory and conv
+    tail are each row's own state, and one full-attention layer, whose keys a paged server pages."""
+    model = CausalTransformer(
+        vocab_size=VOCAB, emb_features=16, num_layers=3, num_heads=2, num_kv_heads=2, head_dim=8,
+        mlp_features=32, max_seq_len=128, dtype="float32",
+        layer_types=("linear_attention",) * 2 + ("full_attention",),
+        kinds={"linear_attention": {"mixer": {"class": "gated_delta_net", "fields": {
+            "linear_num_key_heads": 2, "linear_num_value_heads": 4, "linear_key_head_dim": 6,
+            "linear_value_head_dim": 8, "linear_conv_kernel_dim": 4}}}})
+    params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
+    return TextGeneration(model, params, RunProcessor(Digits()),
+                          sampling=Sampling(temperature=0, eos_token_ids=EOS))
+
+
+@pytest.mark.parametrize("options", [
+    {}, {"kv_cache": KVCache(page_size=4, pages=64)},
+    {"kv_cache": KVCache(page_size=4, pages=64), "chunk": 3},
+], ids=["dense", "paged", "paged-chunked"])
+def test_a_hybrid_stack_serves_each_rows_own_state_beside_its_pages(options):
+    """A paged server keeps the attention layer's keys in its pool and each row's recurrent state
+    in the row's slot: a row starts from a fresh state, wherever a former occupant left its own,
+    and a prompt prefilled three tokens a step continues the state its earlier pieces left. Every
+    row is the lone task call's."""
+    bound = hybrid_task()
+    alone = [bound(prompt, budget, key=index)
+             for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
+    _, tickets = served_alongside(bound, **options)
+    for ticket, lone in zip(tickets, [*alone, alone[2]], strict=True):
+        assert_same_generation(ticket.result(), lone)
+
+
+def test_a_shared_prefix_is_refused_where_rows_hold_state_beside_their_pages():
+    """A shared prefix's pages hold its keys and nothing of the recurrent state its prompt left,
+    so a row reusing them would start that state from nothing: the server refuses the prefix
+    cache for such a stack rather than serve it."""
+    with pytest.raises(ValueError):
+        Server.from_task(hybrid_task(), slots=4, capacity=128, kv_cache=KVCache(page_size=4, pages=64),
+                         prefix_cache=True)
+
+
 def served_alongside(bound, slots=4, admission=2, **options):
     """Every prompt submitted at once, plus the longest again once it is done,
     through a server with `options`; returns the server and the tickets."""
@@ -602,22 +692,24 @@ def test_a_paged_server_draws_what_each_request_draws_alone(options):
     assert server.prefix_hits == (4 if options.get("prefix_cache") else 0)
 
 
+@pytest.mark.parametrize("prefix_cache", [False, True], ids=["unshared", "prefix"])
 @pytest.mark.parametrize("fields", [{"position_embedding": "alibi"},
                                     {"layer_types": ("chunked_attention",),
                                      "kinds": {"chunked_attention": {"chunk": 4}}}], ids=["alibi", "chunked"])
-def test_a_paged_server_serves_layers_that_read_their_keys_places(fields):
-    """ALiBi and a chunk read their keys' places, which a dense cache keeps
-    beside its keys; a paged server seats its rows at canonical positions,
-    where a key's slot is its place, so its pool keeps none. Over a pool of
-    pages every row is the lone task call's."""
+def test_a_paged_server_serves_layers_that_read_their_keys_places(fields, prefix_cache):
+    """ALiBi and a chunk read their keys' places, which the cache keeps
+    beside its keys, in a paged pool's pages too, so a shared prefix's pages
+    carry theirs. Over a pool of pages every row is the lone task call's."""
     model = decoder().clone(max_seq_len=128, **fields)
     params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
     bound = TextGeneration(model, params, RunProcessor(Digits()), sampling=Sampling(temperature=0))
     alone = [bound(prompt, budget, key=index)
              for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
-    _, tickets = served_alongside(bound, kv_cache=KVCache(page_size=16, pages=12))
+    server, tickets = served_alongside(bound, kv_cache=KVCache(page_size=4, pages=40),
+                                       prefix_cache=prefix_cache)
     for ticket, lone in zip(tickets, [*alone, alone[2]], strict=True):
         assert_same_generation(ticket.result(), lone)
+    assert server.prefix_hits == (4 if prefix_cache else 0)
 
 
 @pytest.mark.parametrize("options", [{}, {"kv_cache": KVCache(page_size=16, pages=12)}],
@@ -670,13 +762,15 @@ def test_a_server_on_a_mesh_draws_what_each_request_draws_alone(mesh, options):
 
 
 @pytest.mark.mesh(devices=4)
+@pytest.mark.parametrize("decode_steps", [1, 4])
 @pytest.mark.parametrize("dispatch", ["global"])
-def test_a_server_on_an_expert_mesh_draws_what_one_device_draws(dispatch):
+def test_a_server_on_an_expert_mesh_draws_what_one_device_draws(dispatch, decode_steps):
     """A mixture layer on an expert mesh can run its dispatch in a shard_map,
     and jax's checkify cannot carry a device check into one (jax-ml/jax#40907).
-    The server's step runs the model before its draws check anything, and a
-    pool smaller than every row's capacity checks nothing on the device, so
-    either dispatch serves what the global one draws alone on one device.
+    The server's step runs the model before its draws check anything, each of
+    a call's steps checks its own draws, and a pool smaller than every row's
+    capacity checks nothing on the device, so either dispatch serves what the
+    global one draws alone on one device, one step a call or several.
     TextGeneration, whose loop carries each draw's checks into the next
     step's model call, refuses the exchange."""
     def generation(dispatch, params):
@@ -694,7 +788,8 @@ def test_a_server_on_an_expert_mesh_draws_what_one_device_draws(dispatch):
     served = generation(
         dispatch, place(lone.variables, MeshSpec(expert=4), Layout(min_shard=1, tolerance=1.0))
     )
-    server, tickets = served_alongside(served, slots=8, admission=8, kv_cache=KVCache(page_size=16, pages=32))
+    server, tickets = served_alongside(served, slots=8, admission=8, kv_cache=KVCache(page_size=16, pages=32),
+                                       decode_steps=decode_steps)
     assert_sharded(served.variables["params"], server.mesh)
     assert server.groups == jax.device_count()
     for ticket, row in zip(tickets, [*alone, alone[2]], strict=True):

@@ -574,7 +574,6 @@ def _voxceleb_tree(root, split="train", identities=("id00012", "id00015")):
 
 
 def test_local_videos_lists_every_file_under_the_directory(tmp_path):
-    pytest.importorskip("moviepy.config", reason="needs the av extra")
     clips = _voxceleb_tree(tmp_path)
     (tmp_path / "extra.webm").write_bytes(b"")
 
@@ -601,7 +600,6 @@ def test_a_video_recipe_reads_frames_and_the_sound_around_them_at_its_audio_mode
     side, at the rate the audio model's extractor reads: a 48 kHz model's record holds 1920 samples
     a frame where a 16 kHz one holds 640. The audio model featurizes the sound when a run encodes
     it, so the record holds the waveform."""
-    pytest.importorskip("moviepy.config", reason="needs the av extra")
     from transformers import AutoFeatureExtractor, Wav2Vec2FeatureExtractor
 
     clips = _voxceleb_tree(tmp_path)
@@ -611,7 +609,7 @@ def test_a_video_recipe_reads_frames_and_the_sound_around_them_at_its_audio_mode
                  audio_padding=1)
 
     train, _, _ = spec.pipelines()
-    records = list(train.repeat(1).iterate())
+    records = list(train.repeat(1))
 
     assert len(records) == len(clips)
     for record in records:
@@ -629,7 +627,6 @@ def test_a_video_recipe_reads_the_same_batches_at_any_worker_count_and_after_a_r
     """Clips whose frames and sound count up, so every drawn window shows: two workers give the
     batches the main process gives, and a reader resumed from a saved position continues with the
     batches an uninterrupted one reads, windows included."""
-    pytest.importorskip("moviepy.config", reason="needs the av extra")
     from test_data_av import _mux
     from transformers import AutoFeatureExtractor, Wav2Vec2FeatureExtractor
 
@@ -926,7 +923,7 @@ def test_a_prepared_set_is_the_deterministic_half_of_the_transform(tmp_path):
     spec = Augmenting(length=16, image_size=8, augment=None, val_batches=None, **WORKERS)
     live = _Images(16)
     rows = [{name: column[index] for name, column in batch.items()}
-            for batch in spec.prepared(live, training=False).batch(4).iterate()
+            for batch in spec.prepared(live, training=False).batch(4)
             for index in range(4)]
     manifest = export(rows, str(tmp_path), format="array_record", rows_per_shard=8,
                       metadata={"image_size": 8})
@@ -982,6 +979,9 @@ class _Lazy:
 
     def describe(self):
         return describe(self.values)
+
+    def label(self):
+        return "lazy"
 
     def fingerprint(self):
         return {"source": describe(self.values), "records": len(self.values)}
@@ -1099,7 +1099,7 @@ def test_the_image_transform_resizes_augments_and_captions_one_record():
     spec = Augmenting(image_size=8, augment=None)
     element = _Images(16)[5]
 
-    out = next(spec.prepared([element]).batch(1).iterate())
+    out = next(iter(spec.prepared([element]).batch(1)))
 
     np.testing.assert_array_equal(
         out["image"][0], cv2.resize(element["image"], (8, 8), interpolation=cv2.INTER_AREA))
@@ -1235,7 +1235,7 @@ def test_a_run_over_a_grain_dataset_trains_and_resumes_where_it_stopped(tmp_path
 
     for expected, actual in zip(jax.tree.leaves(whole.variables),
                                 jax.tree.leaves(resumed.variables), strict=True):
-        np.testing.assert_allclose(np.asarray(actual), np.asarray(expected), rtol=1e-6)
+        np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
 
 
 # ---------------------------------------------------------------------------------
@@ -1478,4 +1478,4 @@ def test_a_run_over_records_in_memory_checkpoints_and_resumes_where_it_stopped(t
 
     for expected, actual in zip(jax.tree.leaves(whole.variables),
                                 jax.tree.leaves(resumed.variables), strict=True):
-        np.testing.assert_allclose(np.asarray(actual), np.asarray(expected), rtol=1e-6)
+        np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))

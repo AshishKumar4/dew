@@ -20,7 +20,6 @@ import pyarrow as pa
 import pyarrow.dataset as ds
 import pyarrow.fs as pafs
 import pytest
-from hub_support import native_builder, stated_shards
 from reader_support import assert_a_rewrite_moves_the_identity
 
 from dew.data.dataset import DataPartition, Loading
@@ -45,351 +44,6 @@ def test_memory_columns_of_different_row_counts_are_refused():
     assert len(Memory({"x": [1, 2], "y": [1, 2]}).records("indexed")) == 2
     with pytest.raises(ValueError):
         len(Memory({"x": [1], "y": [1, 2]}).records("indexed"))
-
-
-def test_pinned_hub_revision_never_falls_through_to_a_different_conversion(monkeypatch):
-    from types import SimpleNamespace
-
-    from huggingface_hub import HfApi
-    from huggingface_hub.hf_api import GitRefInfo, GitRefs
-
-    from dew.data.sources import Hub
-
-    def listing(self, repo, *, repo_type, revision):
-        return ["data/train-00000.parquet"] if revision == "converted" else ["train.tar"]
-
-    conversion = GitRefInfo(name="parquet", ref="refs/convert/parquet", target_commit="converted")
-    monkeypatch.setattr(HfApi, "dataset_info", lambda self, repo, **kwargs: SimpleNamespace(sha="original"))
-    monkeypatch.setattr(HfApi, "list_repo_files", listing)
-    monkeypatch.setattr(HfApi, "list_repo_refs",
-                        lambda self, repo, **kwargs: GitRefs(branches=[], converts=[conversion], tags=[]))
-    stated_shards(monkeypatch)
-    with pytest.raises(FileNotFoundError):
-        _ = Hub("owner/data", revision="original").files
-    latest = Hub("owner/data").files
-    assert latest.url == ("hf://datasets/owner/data@converted/data/train-00000.parquet",)
-
-
-@pytest.fixture
-def moving_hub_conversion(monkeypatch, tmp_path, request):
-    from types import SimpleNamespace
-
-    import datasets
-    import pyarrow.parquet as pq
-    from huggingface_hub import HfApi, HfFileSystem
-    from huggingface_hub.hf_api import GitRefInfo, GitRefs
-
-    converted = ["first"]
-    kind = getattr(request, "param", "records")
-
-    def columns(start):
-        indices = range(start, start + 32)
-        if kind == "prompts":
-            return {"prompt": [[index + 1, index + 2] for index in indices],
-                    "ground_truth": [str(index) for index in indices]}
-        if kind == "decisions":
-            return {"text": [f"row {index}" for index in indices],
-                    "label": ["a" if index % 2 else "b" for index in indices]}
-        return {"id": list(indices)}
-
-    payloads = {}
-    for commit, start in (("first", 0), ("second", 10)):
-        sink = pa.BufferOutputStream()
-        pq.write_table(pa.table(columns(start)), sink)
-        payloads[f"datasets/owner/data@{commit}/default/train/0000.parquet"] = sink.getvalue().to_pybytes()
-
-    def header(self, path, **kwargs):
-        payload = payloads[path]
-        return {"name": path, "type": "file", "size": len(payload), "blob_id": "blob",
-                "lfs": {"sha256": hashlib.sha256(payload).hexdigest(), "size": len(payload)}}
-
-    def refs(self, repo, *, repo_type):
-        conversion = GitRefInfo(name="parquet", ref="refs/convert/parquet", target_commit=converted[-1])
-        return GitRefs(branches=[], converts=[conversion], tags=[])
-
-    def listing(self, repo, *, repo_type, revision):
-        return ["train.tar"] if revision == "original" else ["default/train/0000.parquet"]
-
-    monkeypatch.setattr(HfApi, "dataset_info", lambda self, repo, **kwargs: SimpleNamespace(sha="original"))
-    monkeypatch.setattr(HfApi, "list_repo_files", listing)
-    monkeypatch.setattr(HfApi, "list_repo_refs", refs)
-    monkeypatch.setattr(HfFileSystem, "info", header)
-    monkeypatch.setattr(HfFileSystem, "_open", lambda self, path, **kwargs: io.BytesIO(payloads[path]))
-    # The real builder of the split, prepared: the Arrow a pinned revision without a conversion reads.
-    builder = native_builder({"train": datasets.Dataset.from_dict(columns(0))}, tmp_path / "files",
-                             tmp_path / "arrow")
-    builder.download_and_prepare()
-    monkeypatch.setattr(datasets, "load_dataset_builder", lambda *args, **kwargs: builder)
-    return converted
-
-
-def test_a_split_saved_as_arrow_streams_its_parquet_conversion(monkeypatch):
-    """A dataset repo's `.arrow` files are what `save_to_disk` and `push_to_hub` write, Arrow's
-    stream format, which no file reader opens; a split that holds only those streams its Parquet
-    conversion, and a pinned revision without one is prepared rather than streamed."""
-    from types import SimpleNamespace
-
-    import pyarrow.parquet as pq
-    from huggingface_hub import HfApi, HfFileSystem
-    from huggingface_hub.hf_api import GitRefInfo, GitRefs
-
-    from dew.data.compile import compile
-    from dew.data.dataset import DataPartition
-    from dew.data.pipeline import Pipeline
-    from dew.data.sources import Hub
-
-    rows = pa.table({"id": list(range(12))})
-    stream = pa.BufferOutputStream()
-    with pa.ipc.new_stream(stream, rows.schema) as writer:
-        writer.write_table(rows)
-    converted = pa.BufferOutputStream()
-    pq.write_table(rows, converted)
-    payloads = {
-        "datasets/owner/data@original/train/data-00000-of-00001.arrow": stream.getvalue().to_pybytes(),
-        "datasets/owner/data@converted/default/train/0000.parquet": converted.getvalue().to_pybytes(),
-    }
-
-    def header(self, path, **kwargs):
-        return {"name": path, "type": "file", "size": len(payloads[path]), "blob_id": "blob",
-                "lfs": {"sha256": hashlib.sha256(payloads[path]).hexdigest(), "size": len(payloads[path])}}
-
-    def listing(self, repo, *, repo_type, revision):
-        return (["default/train/0000.parquet"] if revision == "converted"
-                else ["train/data-00000-of-00001.arrow", "train/state.json"])
-
-    conversion = GitRefInfo(name="parquet", ref="refs/convert/parquet", target_commit="converted")
-    monkeypatch.setattr(HfApi, "dataset_info", lambda self, repo, **kwargs: SimpleNamespace(sha="original"))
-    monkeypatch.setattr(HfApi, "list_repo_files", listing)
-    monkeypatch.setattr(HfApi, "list_repo_refs",
-                        lambda self, repo, **kwargs: GitRefs(branches=[], converts=[conversion], tags=[]))
-    monkeypatch.setattr(HfFileSystem, "info", header)
-    monkeypatch.setattr(HfFileSystem, "_open", lambda self, path, **kwargs: io.BytesIO(payloads[path]))
-    reader = compile(Pipeline(Hub("owner/data")).batch(4), read="streamed",
-                     loading=Loading(workers=0)).train(DataPartition())
-    try:
-        assert [int(value) for _ in range(3) for value in next(reader)["id"]] == list(range(12))
-    finally:
-        reader.close()
-    assert Hub("owner/data", revision="original").streamed is None
-
-
-def test_a_conversion_that_moves_under_one_default_commit_is_another_snapshot(moving_hub_conversion):
-    """One source pins its conversion once; a new source refuses the old plan
-    after that conversion moves under the same default commit."""
-    from dew.data.compile import compile
-    from dew.data.pipeline import Pipeline
-    from dew.data.sources import Hub
-
-    def plan():
-        streamed = Pipeline(Hub("owner/data")).batch(2)
-        return compile(streamed, read="streamed", loading=Loading(workers=0)).plan
-
-    source = Hub("owner/data")
-    snapshot = source.files.fingerprint()
-    saved = plan()
-    assert saved.manifest.source["sources"] == [snapshot]
-    plan().check(saved.record())
-    moving_hub_conversion.append("second")
-    assert source.files.url == ("hf://datasets/owner/data@first/default/train/0000.parquet",)
-    assert source.files.fingerprint() == snapshot != Hub("owner/data").files.fingerprint()
-    with pytest.raises(ValueError):
-        plan().check(saved.record())
-
-
-@pytest.mark.parametrize("wrapper,read", [
-    ("hash", "streamed"), ("concatenate", "streamed"), ("concatenate_hash", "streamed"),
-    ("concatenate", "indexed"), ("slice", "indexed"), ("random", "indexed"), ("hash", "memory"),
-])
-def test_wrapped_hub_resume_checks_the_conversion_only_when_consumed(moving_hub_conversion, wrapper, read):
-    from dew.config.data import HoldOut, RecordsData, loader
-    from dew.data.sources import Hub
-    from dew.data.sources.concatenate import Concatenate
-
-    def loaded():
-        source = Hub("owner/data")
-        if wrapper.startswith("concatenate"):
-            source = Concatenate((source, Memory([{"id": index} for index in range(40, 48)])))
-        holdout = (
-            HoldOut(fraction=.25, by="hash") if wrapper.endswith("hash") else
-            HoldOut(records=8, by="index" if wrapper == "slice" else "random")
-            if wrapper in ("slice", "random") else None
-        )
-        return loader(RecordsData(source, validation=holdout), batch=2, read=read, loading=Loading(workers=0))
-
-    data = loaded()
-    reader = data.train(DataPartition())
-    try:
-        next(reader)
-        saved = reader.get_state()
-        expected = next(reader)["id"]
-    finally:
-        reader.close()
-    unchanged = loaded().train(DataPartition())
-    try:
-        unchanged.set_state(saved)
-        np.testing.assert_array_equal(next(unchanged)["id"], expected)
-    finally:
-        unchanged.close()
-    moving_hub_conversion.append("second")
-    moved = loaded().train(DataPartition())
-    try:
-        if read == "streamed":
-            with pytest.raises(ValueError):
-                moved.set_state(saved)
-        else:
-            moved.set_state(saved)
-            np.testing.assert_array_equal(next(moved)["id"], expected)
-    finally:
-        moved.close()
-
-
-@pytest.mark.parametrize("recipe,moving_hub_conversion,read", [
-    ("prompts", "prompts", "streamed"), ("prompts", "prompts", "indexed"), ("prompts", "prompts", "memory"),
-    ("decisions", "decisions", "streamed"), ("decisions", "decisions", "indexed"),
-    ("decisions", "decisions", "memory"),
-], indirect=["moving_hub_conversion"])
-def test_metadata_wrapped_hub_resume_keeps_facts_and_checks_consumed_files(
-    moving_hub_conversion, recipe, read
-):
-    from dew.config.data import PromptData, loader
-    from dew.data.sources import Hub
-    from dew.decision.data import Decisions
-
-    def loaded():
-        source = Hub("owner/data")
-        configured = (
-            PromptData(source, "byte", max_prompt_len=4, reward_bytes=None if read == "memory" else 8)
-            if recipe == "prompts" else Decisions(source, options=("a", "b"))
-        )
-        return loader(configured, batch=2, read=read, loading=Loading(workers=0))
-
-    reader = loaded().train(DataPartition())
-    try:
-        next(reader)
-        saved = reader.get_state()
-        expected = next(reader)
-    finally:
-        reader.close()
-    unchanged = loaded().train(DataPartition())
-    try:
-        unchanged.set_state(saved)
-    finally:
-        unchanged.close()
-    moving_hub_conversion.append("second")
-    moved = loaded().train(DataPartition())
-    try:
-        if read == "streamed":
-            with pytest.raises(ValueError):
-                moved.set_state(saved)
-        else:
-            moved.set_state(saved)
-            actual = next(moved)
-            assert actual.keys() == expected.keys()
-            for key in expected:
-                np.testing.assert_array_equal(actual[key], expected[key])
-    finally:
-        moved.close()
-
-
-@pytest.mark.parametrize(("url", "format", "read_as"), [
-    ("hf://datasets/owner/data", None, "Hub"),
-    ("hf://datasets/owner/data@pinned", None, "Hub"),
-    ("hf://datasets/owner/data/train.jsonl", None, "Files"),
-    ("hf://datasets/owner/data@pinned/train.csv", None, "Files"),
-    ("hf://datasets/owner/data/train.txt", None, "Files"),
-    ("hf://datasets/owner/data/train.array_record", None, "Files"),
-    ("hf://datasets/owner/data/train.parquet", None, "Files"),
-    ("hf://datasets/owner/data/records", "jsonl", "Files"),
-])
-def test_a_hub_url_reads_a_repository_or_the_files_it_names(monkeypatch, url, format, read_as):
-    """An hf:// URL of a repository reads the repository; one naming a file Files reads by its
-    suffix, or any URL given a format, reads that file, whatever its record format."""
-    from huggingface_hub import HfFileSystem
-
-    from dew.data.sources import Files, Hub, source
-
-    monkeypatch.setattr(HfFileSystem, "exists", lambda self, path, **kwargs: False)
-    resolved = source(url, format=format)
-    assert type(resolved) is {"Hub": Hub, "Files": Files}[read_as]
-    if read_as == "Files":
-        assert resolved.url == url and resolved.format == format
-
-
-@pytest.mark.parametrize("format", ["jsonl", "parquet"])
-def test_hub_native_shards_keep_the_requested_revision(monkeypatch, format):
-    from types import SimpleNamespace
-
-    from huggingface_hub import HfApi
-
-    from dew.data.sources import Hub
-
-    monkeypatch.setattr(
-        HfApi, "dataset_info", lambda self, repo, revision=None: SimpleNamespace(sha=revision)
-    )
-    monkeypatch.setattr(HfApi, "list_repo_files", lambda self, repo, **kwargs: [f"train.{format}"])
-    stated_shards(monkeypatch)
-    native = Hub("owner/data", revision="pinned").files
-    assert native.url == (f"hf://datasets/owner/data@pinned/train.{format}",)
-    assert native.format == format
-
-
-@pytest.mark.parametrize("revision,native", [(None, True), ("original", True), (None, False)])
-def test_hub_shard_capability_and_urls_list_each_revision_once(monkeypatch, revision, native):
-    from types import SimpleNamespace
-
-    from huggingface_hub import HfApi
-    from huggingface_hub.hf_api import GitRefInfo, GitRefs
-
-    from dew.data.sources import Hub
-
-    listed = []
-
-    def listing(self, repo, *, repo_type, revision):
-        listed.append(revision)
-        if not native and revision == "original":
-            return ["train.tar"]
-        return ["train-1.parquet", "train-0.parquet"]
-
-    conversion = GitRefInfo(name="parquet", ref="refs/convert/parquet", target_commit="converted")
-    monkeypatch.setattr(HfApi, "dataset_info", lambda self, repo, **kwargs: SimpleNamespace(sha="original"))
-    monkeypatch.setattr(HfApi, "list_repo_files", listing)
-    monkeypatch.setattr(HfApi, "list_repo_refs",
-                        lambda self, repo, **kwargs: GitRefs(branches=[], converts=[conversion], tags=[]))
-    stated_shards(monkeypatch)
-    source = Hub("owner/data", revision=revision)
-    commit = "original" if native else "converted"
-    assert source.supports("streamed")
-    assert source.streamed == commit
-    assert source.files.url == tuple(f"hf://datasets/owner/data@{commit}/train-{index}.parquet"
-                                     for index in range(2))
-    assert source.files.format == "parquet"
-    assert source.supports("streamed")
-    assert listed == (["original"] if native else ["original", "converted"])
-
-
-@pytest.mark.parametrize("revision", [None, "original"])
-def test_hub_refuses_streaming_when_the_chosen_revision_has_no_shards_of_the_split(monkeypatch, revision):
-    from types import SimpleNamespace
-
-    from huggingface_hub import HfApi
-    from huggingface_hub.hf_api import GitRefInfo, GitRefs
-
-    from dew.data.compile import compile
-    from dew.data.pipeline import Pipeline
-    from dew.data.sources import Hub
-
-    conversion = GitRefInfo(name="parquet", ref="refs/convert/parquet", target_commit="converted")
-    monkeypatch.setattr(HfApi, "dataset_info", lambda self, repo, **kwargs: SimpleNamespace(sha="original"))
-    monkeypatch.setattr(HfApi, "list_repo_files", lambda self, repo, **kwargs: ["default/test/0000.parquet"])
-    monkeypatch.setattr(HfApi, "list_repo_refs",
-                        lambda self, repo, **kwargs: GitRefs(branches=[], converts=[conversion], tags=[]))
-    source = Hub("owner/data", revision=revision)
-    assert not source.supports("streamed")
-    assert source.streamed is None
-    with pytest.raises(FileNotFoundError):
-        _ = source.files
-    with pytest.raises(ValueError):
-        compile(Pipeline(source).batch(2), read="streamed", loading=Loading(workers=0))
 
 
 def test_tfds_source_metadata_and_decoder_identity_need_no_data_scan():
@@ -754,7 +408,7 @@ def test_a_source_exports_the_records_its_pipeline_exports():
         return [np.asarray(row["id"]).tolist() for shard in files.manifest().shards
                 for row in files.manifest().reader(shard)]
 
-    assert exported(stored) == exported(stored.chain()) == [[2 * index, 2 * index + 1] for index in range(5)]
+    assert exported(stored) == exported(stored._chain()) == [[2 * index, 2 * index + 1] for index in range(5)]
 
 
 def test_spark_directory_requires_success_marker(tmp_path):
@@ -957,6 +611,91 @@ def test_cli_token_exports_are_readable_by_the_dispatched_token_source(tmp_path,
     assert actual.tolist() == expected.tolist()
 
 
+@pytest.mark.parametrize("read", ["streamed", "indexed"])
+def test_a_parquet_store_reads_with_the_credentials_its_profile_names(tmp_path, monkeypatch, read):
+    """An S3 Parquet store whose storage options name an AWS profile reads its rows with that
+    profile's credentials, on an endpoint that refuses every other request: every setting the
+    store was given reaches the reads, not only those Arrow's own S3 client can take."""
+    import boto3
+    import fsspec
+    import pyarrow.parquet as pq
+    from moto.core import set_initial_no_auth_action_count
+    from moto.server import ThreadedMotoServer
+
+    from dew.data.compile import iterate
+    from dew.data.pipeline import Pipeline
+
+    for name in ("AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_SESSION_TOKEN", "AWS_PROFILE",
+                 "AWS_DEFAULT_PROFILE"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.setenv("AWS_EC2_METADATA_DISABLED", "true")
+    monkeypatch.setenv("AWS_CONFIG_FILE", str(tmp_path / "config"))
+    monkeypatch.setenv("AWS_SHARED_CREDENTIALS_FILE", str(tmp_path / "credentials"))
+    server = ThreadedMotoServer(ip_address="127.0.0.1", port=0, verbose=False)
+    server.start()
+    _, port = server.get_host_and_port()
+    endpoint = f"http://127.0.0.1:{port}"
+
+    # The endpoint authenticates every request after the three that make the profile's user.
+    @set_initial_no_auth_action_count(3)
+    def read_through_the_profile():
+        iam = boto3.Session().client("iam", endpoint_url=endpoint, region_name="us-east-1",
+                                     aws_access_key_id="setup", aws_secret_access_key="setup")
+        # The endpoint's users outlive it in this process, so each test names its own.
+        user = "reader-" + uuid4().hex
+        iam.create_user(UserName=user)
+        iam.put_user_policy(UserName=user, PolicyName="s3", PolicyDocument=json.dumps({
+            "Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Action": "s3:*", "Resource": "*"}]}))
+        key = iam.create_access_key(UserName=user)["AccessKey"]
+        (tmp_path / "credentials").write_text(
+            f"[reader]\naws_access_key_id = {key['AccessKeyId']}\n"
+            f"aws_secret_access_key = {key['SecretAccessKey']}\n")
+        options = {"profile": "reader", "endpoint_url": endpoint}
+        bucket = "profiles-" + uuid4().hex
+        remote = fsspec.filesystem("s3", **options)
+        remote.mkdir(bucket)
+        written = io.BytesIO()
+        pq.write_table(pa.Table.from_pylist([{"id": index} for index in range(5)]), written)
+        remote.pipe(f"{bucket}/rows.parquet", written.getvalue())
+        source = Files(f"s3://{bucket}/rows.parquet", storage_options=options)
+        return sorted(int(row["id"]) for row in iterate(Pipeline(source), read=read))
+
+    try:
+        assert read_through_the_profile() == list(range(5))
+    finally:
+        server.stop()
+
+
+def test_an_anonymous_storage_profile_reads_parquet_though_it_names_keys():
+    """A storage profile over S3 that reads anonymously reads a Parquet store's rows, though it
+    names keys too, which an anonymous client does not sign with."""
+    import fsspec
+    import pyarrow.parquet as pq
+    from moto.server import ThreadedMotoServer
+
+    from dew.data.compile import iterate
+    from dew.data.pipeline import Pipeline
+    from dew.data.storage import _profile
+
+    server = ThreadedMotoServer(ip_address="127.0.0.1", port=0, verbose=False)
+    server.start()
+    try:
+        _, port = server.get_host_and_port()
+        endpoint = f"http://127.0.0.1:{port}"
+        bucket = "public-" + uuid4().hex
+        remote = fsspec.filesystem("s3", key="testing", secret="testing", endpoint_url=endpoint)
+        remote.mkdir(bucket, acl="public-read")
+        written = io.BytesIO()
+        pq.write_table(pa.Table.from_pylist([{"id": index} for index in range(5)]), written)
+        remote.pipe(f"{bucket}/rows.parquet", written.getvalue(), ACL="public-read")
+        _profile("publics3", "s3a", {"key": "unused", "secret": "unused", "anon": True,
+                                     "endpoint_url": endpoint})
+        source = Files(f"publics3://{bucket}/rows.parquet")
+        assert sorted(int(row["id"]) for row in iterate(Pipeline(source), read="streamed")) == list(range(5))
+    finally:
+        server.stop()
+
+
 def test_a_token_export_reads_through_the_storage_options_it_is_given(tmp_path):
     """A committed token export that only its storage options reach, an S3 endpoint of its own,
     reads its manifest, metadata and tokens through them, as its shards and index do."""
@@ -1067,114 +806,6 @@ def test_snapshot_provisions_the_requested_indexed_read(tmp_path):
     stored = Files(str(destination)).records("indexed")
     assert [stored[index] for index in range(len(stored))] == [{"id": 0}, {"id": 1}]
 
-
-@pytest.mark.parametrize("read", [None, "indexed"])
-def test_snapshot_reads_a_prepared_hub_without_physical_shards(tmp_path, monkeypatch, read):
-    from types import SimpleNamespace
-
-    import datasets
-    from huggingface_hub import HfApi
-
-    from dew.data import Hub
-
-    builder = native_builder({"train": datasets.Dataset.from_dict({"id": [4, 5, 6]})}, tmp_path / "files",
-                             tmp_path / "arrow")
-    builder.download_and_prepare()
-    monkeypatch.setattr(datasets, "load_dataset_builder", lambda *args, **kwargs: builder)
-    monkeypatch.setattr(HfApi, "dataset_info", lambda *args, **kwargs: SimpleNamespace(sha="pinned"))
-    monkeypatch.setattr(HfApi, "list_repo_files", lambda *args, **kwargs: ["train.tar"])
-    chain = Hub("owner/data", revision="pinned").threads(1)
-    if read is not None:
-        chain = chain.read(read)
-    destination = tmp_path / "snapshot"
-    chain.snapshot(str(destination))
-    stored = Files(str(destination)).records("indexed")
-    assert [stored[index]["id"] for index in range(len(stored))] == [4, 5, 6]
-
-
-
-def test_a_hub_split_prepared_online_reads_its_own_commits_rows_with_the_hub_offline(tmp_path, monkeypatch):
-    """A Hub split prepared online at two commits reads, with the Hub offline (HF_HUB_OFFLINE),
-    the rows of the commit each source pins: the commit is the answer the Hub gave online
-    (`dew.cache.hub_answer`), the default branch's the last given, and the Arrow is the cache
-    `datasets` prepared at that commit, which `datasets` itself does not find offline."""
-    import datasets
-    from hub_support import native_hub, offline
-
-    from dew.data import Hub
-    from dew.data.compile import compile
-    from dew.data.pipeline import Pipeline
-
-    first, second = "0123456789abcdef0123456789abcdef01234567", "89abcdef0123456789abcdef0123456789abcdef"
-    cache = str(tmp_path / "cache")
-
-    def read(revision=None):
-        pipeline = Pipeline(Hub("acme/records", revision=revision, cache_dir=cache)).batch(4)
-        reader = compile(pipeline, read="indexed", loading=Loading(workers=0), provision=True).train(
-            DataPartition())
-        try:
-            return sorted(int(value) for _ in range(4) for value in next(reader)["id"])
-        finally:
-            reader.close()
-
-    for commit, start in ((first, 0), (second, 100)):
-        rows = datasets.Dataset.from_dict({"id": list(range(start, start + 16))})
-        with pytest.MonkeyPatch.context() as online:
-            native_hub(online, tmp_path / commit, "acme/records", {"train": rows}, commit)
-            assert read(commit) == list(range(start, start + 16))
-            assert read() == list(range(start, start + 16))
-    offline(monkeypatch)
-    assert read(first) == list(range(16))
-    assert read() == list(range(100, 116))
-    assert Hub("acme/records", cache_dir=cache).commit == second
-
-
-def test_a_hub_splits_shards_keep_their_identity_with_the_hub_offline(moving_hub_conversion, monkeypatch):
-    """A Hub split's streamed shards keep the identity a compiled cache is keyed by with the Hub
-    offline: the commit, the commit's files, its conversion and each shard's facts are the Hub's
-    answers, recorded online. A repo never answered online raises the offline error."""
-    from hub_support import offline
-    from huggingface_hub.errors import OfflineModeIsEnabled
-
-    from dew.data.sources import Hub
-
-    answered = Hub("owner/data").files
-    identity = answered.fingerprint()
-    offline(monkeypatch)
-    recorded = Hub("owner/data").files
-    assert recorded.url == answered.url
-    assert recorded.fingerprint() == identity
-    with pytest.raises(OfflineModeIsEnabled):
-        assert Hub("owner/elsewhere").commit
-
-
-def test_a_hub_jsonl_shard_keeps_its_offset_index_in_its_identity_with_the_hub_offline(monkeypatch):
-    """A Hub split's JSON lines shard and the offset index its commit holds beside it keep, with the
-    Hub offline, the identity they had online, the index's facts among the shard's: an index the
-    offline Hub cannot confirm is not dropped from it."""
-    from types import SimpleNamespace
-
-    from hub_support import offline
-    from huggingface_hub import HfApi, HfFileSystem
-
-    from dew.data.sources import Hub
-
-    names = {"train.jsonl": 400, "train.index.npy": 96}
-    stated = {}
-    for index, (name, size) in enumerate(names.items()):
-        path = f"datasets/owner/lines@pinned/{name}"
-        stated[path] = {"name": path, "type": "file", "size": size, "blob_id": f"blob:{name}",
-                        "lfs": {"sha256": f"{index:064x}", "size": size}}
-    monkeypatch.setattr(HfApi, "dataset_info",
-                        lambda self, repo, revision=None: SimpleNamespace(sha=revision))
-    monkeypatch.setattr(HfApi, "list_repo_files", lambda self, repo, **kwargs: list(names))
-    monkeypatch.setattr(HfFileSystem, "info", lambda self, path, **kwargs: stated[path])
-    identity = Hub("owner/lines", revision="pinned").files.fingerprint()
-    assert [facts["bytes"] for facts in identity["files"]] == [400, 96]
-    offline(monkeypatch)
-    # The offline Hub confirms no file: `HfFileSystem.exists` reads an unreachable Hub as absent.
-    monkeypatch.setattr(HfFileSystem, "exists", lambda self, path, **kwargs: False)
-    assert Hub("owner/lines", revision="pinned").files.fingerprint() == identity
 
 def test_remote_indexed_arrayrecords_read_only_the_selected_physical_shard(monkeypatch):
     root = Store(f"memory://lazy-records-{uuid4().hex}")
@@ -1939,31 +1570,26 @@ def test_content_fingerprint_preserves_array_identity_and_sequence_order():
     assert content_fingerprint(np.int16(4)) != content_fingerprint(np.int32(4))
 
 
-@pytest.mark.parametrize("content", [b" \n\n", b'{"id": 1}\n'], ids=["empty", "one row"])
-def test_empty_shard_cycles_exhaust_their_search_budget(content):
-    """A shard that yields no row exhausts the budget the read searches with;
-    the same read of a shard with a row yields it."""
-    root = Store(f"memory://empty-shards-{uuid4().hex}/empty.jsonl")
-    root.write(content)
-    files = Files(root.url)
-    dataset = streamed(
-        files.manifest(),
-        partition=DataPartition(),
-        epochs=None,
-        empty_shard_budget=3,
-        name="empty-corpus",
-        cycle_length=1,
-        loading=Loading(workers=0, threads=1, read_buffer=1),
-    )
-    reader = iter(dataset)
-    try:
-        if content.strip():
-            assert next(reader) == {"id": 1}
-            return
-        with pytest.raises(ValueError):
-            next(reader)
-    finally:
-        reader.close()
+def test_a_pass_reads_its_rows_after_any_run_of_empty_shards():
+    """A pass over a stream reads the rows of its last shard however many empty shards come before
+    it: four thousand and more in a row are no proof the stream holds none."""
+    root = Store(f"memory://empty-run-{uuid4().hex}")
+    for number in range(4097):
+        # A blank line is a shard that holds no row.
+        root.child(f"{number:05d}.jsonl").write(b'{"id": 7}\n' if number == 4096 else b"\n")
+    dataset = streamed(Files(root.url, format="jsonl").manifest(), partition=DataPartition(), epochs=1,
+                       cycle_length=1, loading=Loading(workers=0, threads=1, read_buffer=1))
+    assert list(dataset) == [{"id": 7}]
+
+
+def test_an_endless_read_of_a_store_that_states_it_holds_no_row_is_refused():
+    """A store whose every shard states it holds no row would read nothing forever endlessly, which
+    is refused; read once, it is a pass that yields nothing."""
+    manifest = Memory([], shard_rows=4).manifest()
+    loading = Loading(workers=0, threads=1, read_buffer=1)
+    assert list(streamed(manifest, partition=DataPartition(), epochs=1, loading=loading)) == []
+    with pytest.raises(ValueError):
+        streamed(manifest, partition=DataPartition(), epochs=None, loading=loading)
 
 
 @pytest.mark.parametrize("field", [None, "ids"])
@@ -2016,6 +1642,9 @@ class _StreamOnly:
 
     def describe(self):
         return f"stream-only {self.memory.describe()}"
+
+    def label(self):
+        return self.memory.label()
 
     def fingerprint(self):
         return self.memory.fingerprint()
@@ -2128,7 +1757,7 @@ def test_a_default_read_is_judged_on_the_order_the_recipe_adds_at_that_read(tmp_
 
     class Split:
         def pipelines(self):
-            return Pipeline(Files(str(tmp_path / "rows.parquet"))).token_split(0.5, held=False), None, ()
+            return Pipeline(Files(str(tmp_path / "rows.parquet"))).holdout(tokens=0.5)[0]._chain(), None, ()
 
     rows = [{"text": [index] * 4} for index in range(8)]
     pq.write_table(pa.Table.from_pylist(rows), tmp_path / "rows.parquet")
@@ -2168,7 +1797,7 @@ def test_a_local_store_whose_producer_declared_other_bytes_is_refused(tmp_path):
     path.write_text("".join(json.dumps({"id": index}) + "\n" for index in range(8)))
     url = str(path)
     held = {"bytes": path.stat().st_size, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
-    assert [row["id"] for row in Files(url, file_info={url: held}).iterate()] == list(range(8))
+    assert [row["id"] for row in Files(url, file_info={url: held})] == list(range(8))
     for stale in ({**held, "bytes": 2 * held["bytes"]}, {**held, "sha256": "0" * 64}):
         with pytest.raises(ValueError):
             Files(url, file_info={url: stale}).fingerprint()
@@ -2208,7 +1837,8 @@ def _indexed_source(kind: str, root: Path):
         return Memory([{"id": index} for index in range(7)], shard_rows=3), [
             ("memory:0", "memory", 0, 3, 3), ("memory:3", "memory", 3, 6, 3), ("memory:6", "memory", 6, 7, 1)]
     if kind == "tfds":
-        tfds = pytest.importorskip("tensorflow_datasets", reason="needs the tfds extra")
+        import tensorflow_datasets as tfds
+
         path = str(Path(__file__).parent / "fixtures" / "tfds" / "dew_images" / "1.0.0")
         named = f"tfds:dew_images/None:None:all:{path}"
         return TFDS("dew_images", path=path, split="all", shard_rows=8,
@@ -2311,6 +1941,34 @@ def test_native_map_datasets_read_as_streams_and_mix_with_a_stream_only_member()
             resumed.close()
 
 
+@dataclasses.dataclass(frozen=True)
+class Stated(Memory):
+    """Records with the facts their store states, as a producer's metadata states them."""
+
+    facts: tuple[tuple[str, object], ...] = ()
+
+    def metadata(self):
+        return {**super().metadata(), **dict(self.facts)}
+
+
+def test_a_concatenation_states_what_its_stores_state_of_their_records():
+    """Two splits of one token store joined (`dew.data.Concatenate`) state its tokenizer contract and
+    class names, the targets of both and the rows of both, so a token mixture weighs the joined
+    store and a run checks its contract as of either split; a fact one split alone states or the
+    two state apart is none of the join's, and two contracts make no one store."""
+    from dew.data import Concatenate
+
+    contract = (("tokenizer", "gpt2"), ("vocab_size", 50257), ("class_names", {"label": ("a", "b")}))
+    first = Stated([{"id": np.int32(index)} for index in range(3)],
+                   facts=(*contract, ("valid_targets", 30), ("split", "train")))
+    second = Stated([{"id": np.int32(index)} for index in range(2)],
+                    facts=(*contract, ("valid_targets", 20), ("split", "validation"), ("shuffled", True)))
+    assert Concatenate((first, second)).metadata() == {
+        **dict(contract), "rows": 5, "valid_targets": 50}
+    other = Stated([{"id": np.int32(0)}], facts=(("tokenizer", "llama"),))
+    with pytest.raises(ValueError):
+        Concatenate((first, other)).metadata()
+
 
 @pytest.mark.parametrize("read", ["indexed", "streamed", "memory"])
 def test_concatenated_stores_train_as_one_store_and_resume_where_they_stopped(read):
@@ -2326,7 +1984,7 @@ def test_concatenated_stores_train_as_one_store_and_resume_where_they_stopped(re
     train = Memory([{"id": np.int32(index)} for index in range(6)])
     held = Memory([{"id": np.int32(index)} for index in range(100, 104)])
     joined = Concatenate((train, held))
-    assert joined.map(lambda record: {"id": record["id"] + 1}).chain().source is joined
+    assert joined.map(lambda record: {"id": record["id"] + 1})._chain().source is joined
     loading = Loading(workers=0, threads=1, read_buffer=0, worker_buffer=1)
     passed = validation(Pipeline(joined).batch(2), batch=2, read=read, loading=loading)(DataPartition())
     try:

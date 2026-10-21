@@ -34,6 +34,7 @@ from typing import TYPE_CHECKING, Generic, Literal
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
 from flax import linen as nn
 from typing_extensions import TypeVar
@@ -42,6 +43,7 @@ from dew.artifacts import Artifacts
 from dew.objectives.base import (
     OMITTED,
     TEACHER,
+    UNREAD,
     Aux,
     Batch,
     EMASpec,
@@ -52,6 +54,7 @@ from dew.objectives.base import (
     Ratio,
     Step,
     Variables,
+    without,
 )
 
 Loss = TypeVar("Loss", default=Ratio | jax.Array | float)
@@ -65,6 +68,10 @@ if TYPE_CHECKING:
 
 PROJECTIONS = "distillation"
 """The params subtree holding the feature pairs' width projections."""
+
+NOT_STUDENT = ((TEACHER,), ("params", PROJECTIONS))
+"""The parts of a distillation's tree that are not the student's: the teacher and the feature
+projections, which the student's methods, its task and a loader of its run never read."""
 
 Weight = float | optax.Schedule
 FeatureLoss = Literal["cosine", "l2"]
@@ -124,6 +131,8 @@ class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
                 "pairs in features, and none were named")
         self.feature_loss: FeatureLoss = feature_loss
         self.inputs = student.inputs
+        # The student's batches and their tokens, which the teacher scores too.
+        self.counts_tokens = student.counts_tokens
         averaged = student.ema
         # The EMA follows what moves; the teacher never does.
         self.ema = None if averaged is None else EMASpec(
@@ -134,15 +143,24 @@ class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
         """The student's record and batch steps: the teacher scores the batch the student reads."""
         return self.student.data(tokenizer)
 
+    def real_lengths(self, batch: Batch) -> np.ndarray:
+        """The student's real lengths of the batch it reads."""
+        return self.student.real_lengths(batch)
+
     def inference_record(self) -> JSON:
         """The student's record: a saved distillation loads as the student it trained, on the
-        student's own tree."""
-        return self.student.inference_record()
+        student's own tree, the teacher and the projections left unread (`UNREAD`)."""
+        record = self.student.inference_record()
+        if not isinstance(record, dict):
+            return record
+        return {**record, UNREAD: [list(path) for path in NOT_STUDENT]}
 
     def program_key(self) -> tuple[ProgramModule, ...]:
-        """The student's modules, then the teacher's, which the step does not train."""
-        return (*self.student.program_key(),
-                *(program._replace(trained=False) for program in self.teacher.program_key()))
+        """The student's modules, then the teacher's, which the step does not train. The step reads
+        both models' whole logits (`predict`), so no head of either is fused."""
+        teacher = (program._replace(trained=False) for program in self.teacher.program_key())
+        return tuple(program._replace(head_fused=False)
+                     for program in (*self.student.program_key(), *teacher))
 
     def substitute(self, modules: Sequence[nn.Module]) -> None:
         count = len(self.student.program_key())
@@ -153,8 +171,8 @@ class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
         """Tile the student's head, the vocabulary head this objective trains."""
         return self.student.tile_head(tile)
 
-    def restore_head_tile(self, tile: tuple[int, int] | None) -> None:
-        self.student.restore_head_tile(tile)
+    def restore_head(self, tile: tuple[int, int] | None, *, fused: bool) -> None:
+        self.student.restore_head(tile, fused=fused)
 
     def held_variables(self) -> Variables | None:
         """Return the student's held tree, if any, with the teacher's under `teacher`."""
@@ -197,10 +215,7 @@ class DistillationObjective(Objective[Ratio, Effects], Generic[Loss, Effects]):
         The student's methods read this tree, and a distilled checkpoint
         passes it on to a plain student run.
         """
-        own = {name: value for name, value in params.items() if name != TEACHER}
-        if PROJECTIONS in own["params"]:
-            own["params"] = {name: value for name, value in own["params"].items() if name != PROJECTIONS}
-        return own
+        return without(params, NOT_STUDENT)
 
     def model_variables(self, variables: Variables) -> Variables:
         """Return the student's model tree, without the teacher or the feature projections."""

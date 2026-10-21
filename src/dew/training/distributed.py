@@ -7,13 +7,14 @@ import dataclasses
 import fnmatch
 import functools
 import hashlib
+import itertools
 import json
 import logging
 import math
 import statistics
 import threading
 import time
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from pathlib import Path
 from typing import Concatenate, Protocol, overload
 
@@ -31,6 +32,7 @@ from dew.data.dataset import (
     Closeable,
     DataPartition,
     RampedStream,
+    Stage,
     Stoppable,
     stream_identity,
 )
@@ -64,18 +66,74 @@ from dew.records import JSON, number, record
 from dew.telemetry.profile import region
 from dew.training.state import VARIABLE_FIELDS
 
-# The role axes no parameter splits over: data holds a batch's replicas,
-# sequence its positions, and stage the pipeline's stages of the layer stack,
-# which the decoder places itself. `Layout` refuses a parameter placed there.
-# Every other axis a mesh has, Dew's own (expert, fsdp, tensor) or a native
-# mesh's, holds a parameter where the rules put one.
-UNSPLIT_AXES = (DATA_AXIS, SEQUENCE_AXIS, STAGE_AXIS)
+# The role axes no parameter splits over: data holds a batch's replicas, and
+# stage the pipeline's stages of the layer stack, which the decoder places
+# itself. `Layout` refuses a parameter placed there. Every other axis a mesh
+# has, Dew's own (expert, fsdp, tensor, sequence) or a native mesh's, holds a
+# parameter where the rules put one.
+UNSPLIT_AXES = (DATA_AXIS, STAGE_AXIS)
+
+STATE_AXES = (FSDP_AXIS, SEQUENCE_AXIS)
+"""The axes whose devices compute their own share of one batch with the same
+weights, fsdp's rows and sequence's positions, and so each hold one share of
+the persistent state, as fully sharded data parallelism defines it. What the
+rules place on fsdp, `Layout` splits over both where together they divide it
+(`state_spec`): a sequence-parallel run then holds its parameters, optimizer
+moments, EMA and gradients in shares rather than whole on every device of a
+sequence, which torchtitan's FSDP mesh does over dp_shard and cp alike
+(`resolve_fsdp_mesh`). Leaves below `Layout.min_shard`, or that the pair
+cannot divide, keep their own placement. A step reads a weight split so as
+it reads an fsdp split."""
 
 
 def parameter_axes(names) -> tuple[str, ...]:
     """The mesh axes among `names` (a mesh's `axis_names`) a parameter can
     split over: all but `UNSPLIT_AXES`."""
     return tuple(axis for axis in names if axis not in UNSPLIT_AXES)
+
+
+def state_spec(spec_on: Callable[[Mesh | AbstractMesh], P], mesh: Mesh | AbstractMesh) -> P:
+    """The spec of a leaf of the persistent state on `mesh`, from `spec_on`, its spec on a mesh.
+
+    What `spec_on` places on fsdp splits over fsdp and sequence together
+    (`STATE_AXES`): the spec is read on `mesh` with the two as one fsdp axis
+    of both sizes, so the rules' divisibility and fallbacks judge the
+    group, and each fsdp entry then names both. Where the group divides no
+    dimension fsdp would take, the group's spec moves a split of another axis
+    (a vocabulary the group times tensor cannot divide), the rules place the
+    leaf on sequence already or sequence is Explicit, whose placement the
+    program's types carry and the partitioner does not choose, the spec is
+    `spec_on`'s on `mesh`."""
+    plain = spec_on(mesh)
+    sequence = mesh.shape.get(SEQUENCE_AXIS, 1)
+    if (sequence == 1 or SEQUENCE_AXIS in _spec_axes(plain)
+            or SEQUENCE_AXIS in explicit_axes(mesh)):
+        return plain
+    fsdp = mesh.shape.get(FSDP_AXIS, 1)
+    sizes = {**mesh.shape, SEQUENCE_AXIS: 1, FSDP_AXIS: fsdp * sequence}
+    added = () if FSDP_AXIS in mesh.axis_names else (FSDP_AXIS,)
+    names = (*mesh.axis_names, *added)
+    abstract = mesh.abstract_mesh if isinstance(mesh, Mesh) else mesh
+    grouped = spec_on(abstract.update(axis_sizes=tuple(sizes[name] for name in names), axis_names=names,
+                                      axis_types=(*mesh.axis_types, *(AxisType.Auto for _ in added))))
+    def others(spec: P) -> list[MeshAxes]:
+        entries = [_without_state_axes(entry) for entry in spec]
+        return entries + [None] * (len(grouped) + len(plain) - len(entries))
+
+    if FSDP_AXIS not in _spec_axes(grouped) or others(grouped) != others(plain):
+        return plain
+    group = (FSDP_AXIS,) * (fsdp > 1) + (SEQUENCE_AXIS,)
+
+    def held(entry: MeshAxes) -> MeshAxes:
+        axes = tuple(name for axis in mesh_axes(entry) for name in (group if axis == FSDP_AXIS else (axis,)))
+        return None if not axes else axes[0] if len(axes) == 1 else axes
+
+    return P(*map(held, grouped))
+
+
+def _spec_axes(spec: P) -> set[str]:
+    """Every mesh axis `spec` names."""
+    return {axis for entry in spec for axis in mesh_axes(entry)}
 
 
 def device_mesh(mesh: MeshSpec | Mesh) -> Mesh:
@@ -116,7 +174,7 @@ def ruled[Owner: Ruled, **Arguments, Result](
     return run
 
 
-def explicit_axes(mesh: MeshSpec | Mesh) -> tuple[str, ...]:
+def explicit_axes(mesh: MeshSpec | Mesh | AbstractMesh) -> tuple[str, ...]:
     """The axes of `mesh` whose sharding the program's types carry (`AxisType.Explicit`)."""
     if isinstance(mesh, MeshSpec):
         return tuple(mesh.explicit)
@@ -146,7 +204,8 @@ class MeshSpec:
     """Devices the mlp, head and vocabulary widths are split over, in addition
     to fsdp. 1 keeps every width on fsdp alone."""
     sequence: int = 1
-    """Devices the batch's sequence dimension is split over; 1 keeps whole sequences."""
+    """Devices the batch's sequence dimension is split over; 1 keeps whole
+    sequences. The persistent state splits over them with fsdp (`STATE_AXES`)."""
     stage: int = 1
     """Pipeline stages the layer stack is split into, each on its own devices.
     1 runs the whole stack on every device. How many microbatches a step
@@ -472,6 +531,23 @@ def check_stream(source, mesh: Mesh, microbatches: int, batch: int, *, rows: boo
             f"holds a batch that is a multiple of {divisor}")
 
 
+def check_ramp_window(stages: Sequence[Stage], window: int) -> None:
+    """Refuse a batch ramp whose stage begins inside an accumulation window of `window` steps that
+    replays its batches (a loss of composite statistics): the window's replay slots hold one
+    stage's batches, reallocated for the next where a window begins (`Trainer`'s accumulation)."""
+    starts = itertools.accumulate((after.records - stage.records) // stage.batch
+                                  for stage, after in itertools.pairwise(stages))
+    inside = [(start, stage.batch) for start, stage in zip(starts, stages[1:], strict=True) if start % window]
+    if inside:
+        start, batch = inside[0]
+        raise ValueError(
+            f"a loss of composite statistics replays its accumulation window's batches, and a batch "
+            f"ramp changes their shape at each stage, so each stage begins where a window of {window} "
+            f"steps does; the stage of {batch} records a step begins at step {start}. Ramp in stages "
+            f"of a multiple of {window} steps (Ramp.samples), or pool a shared mean (Ratio), whose "
+            f"window keeps no batch")
+
+
 def microbatch(batch: Batch, part: jax.Array, split: int) -> Batch:
     """The `part`th of the `split` microbatches a step reads `batch` in
     (`Trainer.compile`): every `split`th row from row `part` (`microbatched`),
@@ -549,11 +625,12 @@ class Layout:
     step constrains. An axis of size 1 splits nothing, so the same table serves
     every topology.
 
-    `shardings` refuses rules that place a parameter on the data, sequence or
-    stage axis. The data and sequence axes split the batch, so a parameter on
-    either would be gathered on every use. The stage axis holds the layer
-    stack's pipeline stages, and the decoder places those itself from the
-    stored tree.
+    What the rules place on fsdp also splits over the sequence axis, whose
+    devices compute their own positions with the same weights (`STATE_AXES`).
+    `shardings` refuses rules that place a parameter on the data or stage
+    axis. The data axis holds the batch's replicas, each with the whole
+    state. The stage axis holds the layer stack's pipeline stages, and the
+    decoder places those itself from the stored tree.
 
     Below `min_shard` elements a parameter costs more in collectives than it
     saves in memory, so it stays replicated. `tolerance` is the fraction of
@@ -582,11 +659,12 @@ class Layout:
     parameter on the device, so the patterns are never silently ignored.
 
     `frozen_whole` keeps the frozen collection (`FROZEN`, a LoRA run's base)
-    whole over fsdp, split only over the other axes the rules give it (a
-    tensor split stays). A frozen leaf has no gradient and no optimizer
-    state, so an fsdp split saves only its memory, and the step gathers it
-    whole forward and again backward. `check` counts no leaf it keeps whole,
-    and a leaf `host_parameters` also names is kept so in pinned host memory.
+    whole over fsdp and sequence (`STATE_AXES`), split only over the other
+    axes the rules give it (a tensor split stays). A frozen leaf has no
+    gradient and no optimizer state, so a split over them saves only its
+    memory, and the step gathers it whole forward and again backward.
+    `check` counts no leaf it keeps whole, and a leaf `host_parameters` also
+    names is kept so in pinned host memory.
     """
     rules: LogicalAxisRules | Mapping[str, MeshAxes] = DEFAULT_RULES
     min_shard: int = 2 ** 16
@@ -625,10 +703,13 @@ class Layout:
         return ((("activation_batch", self.data_axes),) if self.data_axes else ()) + rules
 
     def _refuse_unknown(self, mesh: Mesh | AbstractMesh) -> None:
-        """Refuse rules naming an axis `mesh` lacks, unless it is one of Dew's
-        role axes (`MESH_AXES`), which a mesh without them treats as size 1."""
-        unknown = sorted({axis for _, assignment in self.axis_rules for axis in mesh_axes(assignment)}
-                         - set(mesh.axis_names) - set(MESH_AXES))
+        """Refuse rules naming an axis `mesh` lacks. Dew's own rules (`DEFAULT_RULES`) name its role
+        axes (`MESH_AXES`) for any mesh, and one without such an axis takes it as size 1; a rule of
+        your own names an axis you mean to split over, and one the mesh lacks would split nothing."""
+        defaults = set(_rule_table(DEFAULT_RULES))
+        named = {axis for rule in self.axis_rules for axis in mesh_axes(rule[1])
+                 if rule not in defaults or axis not in MESH_AXES}
+        unknown = sorted(named - set(mesh.axis_names))
         if unknown:
             raise ValueError(f"the rules name the axes {unknown}, which this mesh, with axes "
                              f"{list(mesh.axis_names)}, does not have")
@@ -641,17 +722,18 @@ class Layout:
         rules place one of them (`ruled_boxes`). A leaf
         whose path no module declares falls back to a shape heuristic,
         which splits its largest dimension that fsdp divides evenly over fsdp.
-        So the axes of one model family can be declared at a time. A leaf below
-        `min_shard` elements is replicated either way.
+        So the axes of one model family can be declared at a time. Either
+        way, what lands on fsdp splits over the sequence axis too where the
+        two divide it (`state_spec`). A leaf below `min_shard` elements is
+        replicated either way.
 
         Flax metadata that a caller's own module attached is removed, because
         the state the trainer creates from these shardings holds plain arrays.
-        Raises ValueError when the rules place a leaf on the data, sequence or
-        stage axis (`UNSPLIT_AXES`) or on an Explicit axis, or name an axis
+        Raises ValueError when the rules place a leaf on the data or stage
+        axis (`UNSPLIT_AXES`) or on an Explicit axis, or name an axis
         the mesh lacks.
         """
         self._refuse_unknown(mesh)
-        fsdp_size = mesh.shape.get(FSDP_AXIS, 1)
         sharded_devices = math.prod(mesh.shape[axis] for axis in parameter_axes(mesh.axis_names))
         explicit = set(explicit_axes(mesh))
         declared = declarations(tree)
@@ -660,18 +742,20 @@ class Layout:
             axes = self._axes(path, value.ndim, declared)
             size = int(np.prod(value.shape, dtype=np.int64))
             if axes is None:
-                spec = parameter_spec(value.shape, fsdp_size, self.min_shard)
+                spec = state_spec(lambda placed: parameter_spec(
+                    value.shape, placed.shape.get(FSDP_AXIS, 1), self.min_shard), mesh)
             elif sharded_devices == 1 or size < self.min_shard:
                 spec = P()
             else:
-                spec = logical_spec(axes, value.shape, rules=self.axis_rules, mesh=mesh)
+                spec = state_spec(lambda placed: logical_spec(axes, value.shape, rules=self.axis_rules,
+                                                              mesh=placed), mesh)
             if self._kept_whole(path):
-                spec = P(*map(_without_fsdp, spec))
-            placed = {axis for entry in spec for axis in mesh_axes(entry)}
+                spec = P(*map(_without_state_axes, spec))
+            placed = _spec_axes(spec)
             if outside := sorted(placed & set(UNSPLIT_AXES)):
                 raise ValueError(
-                    f"the rules place {_variable_path(path)} on {outside}; the data and "
-                    f"sequence axes split the batch, and the stage axis holds the pipeline")
+                    f"the rules place {_variable_path(path)} on {outside}; the data axis "
+                    f"holds the batch's replicas, and the stage axis the pipeline")
             if typed := sorted(placed & explicit):
                 raise ValueError(
                     f"the rules place {_variable_path(path)} on the Explicit axes {typed}; the "
@@ -758,6 +842,9 @@ class Layout:
         one no rule splits over this mesh's axes is replicated by the mesh's
         choice, as a data axis replicates every parameter, so an expert-only
         mesh keeps a mixture's dense weights whole as data parallelism does.
+        The sequence axis splits only where it divides what the rules place
+        on fsdp (`state_spec`), so a leaf it cannot split is the rules' to
+        count, and a mesh of sequence alone refuses none.
 
         Raises `LayoutRefused` when the replicated fraction is above
         `tolerance`, naming the five largest replicated parameters, and
@@ -1036,9 +1123,9 @@ def first_reader_batch(mesh: Mesh, batch: Mapping[str, np.ndarray]) -> dict[str,
 PREFETCH_DEPTH = 2
 
 
-def _without_fsdp(entry: MeshAxes) -> MeshAxes:
-    """A spec entry with the fsdp axis dropped from it."""
-    kept = tuple(axis for axis in mesh_axes(entry) if axis != FSDP_AXIS)
+def _without_state_axes(entry: MeshAxes) -> MeshAxes:
+    """A spec entry with the state axes (`STATE_AXES`) dropped from it."""
+    kept = tuple(axis for axis in mesh_axes(entry) if axis not in STATE_AXES)
     return kept if kept else None
 
 

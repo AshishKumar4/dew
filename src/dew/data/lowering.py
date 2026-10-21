@@ -20,6 +20,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 import hashlib
+import logging
 import math
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING, Protocol, overload, runtime_checkable
@@ -35,6 +36,7 @@ from dew.data.analysis import (
     _drops,
     _identity,
     _in_memory,
+    _label,
     _Lowering,
     _member_keys,
     _name,
@@ -56,9 +58,9 @@ from dew.data.mixing import (
     Chunked,
     CorpusCounts,
     PrimedMix,
-    SearchBudget,
     TokenDeficit,
     primed_maps,
+    rewound,
     token_weights,
 )
 from dew.data.pipeline import (
@@ -80,7 +82,6 @@ from dew.data.pipeline import (
     Pipeline,
     Prefetch,
     RandomMap,
-    Rebatch,
     Record,
     Rejected,
     Repeat,
@@ -105,6 +106,8 @@ if TYPE_CHECKING:
     from dew.data.cache import Cache
 
 type Rows = pygrain.MapDataset | pygrain.IterDataset
+
+_log = logging.getLogger(__name__)
 
 
 @runtime_checkable
@@ -192,6 +195,15 @@ def _position(value: Record) -> int | None:
     return int(value[_POSITION])
 
 
+def _counts_own_rows(pipeline: Pipeline) -> bool:
+    """Whether a per-share read counts `pipeline`'s rows as they leave it: a corpus does, and a
+    mixture does only where a Grain step of its own may drop rows, which no count of its own
+    follows; else its rows are its corpora's, each counted."""
+    if not isinstance(pipeline.source, (Mixture, Phases)):
+        return True
+    return any(isinstance(stage, Native) for stage in pipeline.stages)
+
+
 def _unplaced(value: Record) -> Record:
     if value is None or isinstance(value, (bytes, Rejected)) or _POSITION not in value:
         return value
@@ -266,8 +278,8 @@ class _Rows(gx.FlatMapTransform):
         return tuple(_placed(output, position) for output in outputs)
 
 
-def _expanded(rows: pygrain.IterDataset, stage: FlatMap, name: str) -> pygrain.IterDataset:
-    return (Chunked(rows, name, functools.partial(_Rows, stage)) if isinstance(stage.step, Chunks)
+def _expanded(rows: pygrain.IterDataset, stage: FlatMap, name: str, label: str) -> pygrain.IterDataset:
+    return (Chunked(rows, name, label, functools.partial(_Rows, stage)) if isinstance(stage.step, Chunks)
             else gx.FlatMapIterDataset(rows, _Rows(stage)))
 
 
@@ -327,12 +339,13 @@ class _ShardSteps:
     stages: tuple[Map | MapWithIndex | Filter | FlatMap, ...]
     cached: bool
     name: str
+    label: str
 
     def __call__(self, shard: Shard) -> pygrain.IterDataset:
         rows = self.reader(shard)
         rows = gx.FlatMapIterDataset(rows, _CachedOutputs()) if self.cached else rows
         for stage in self.stages:
-            rows = (_expanded(rows, stage, self.name) if isinstance(stage, FlatMap)
+            rows = (_expanded(rows, stage, self.name, self.label) if isinstance(stage, FlatMap)
                     else rows.map(_Rows(stage)))
         return rows
 
@@ -536,66 +549,78 @@ class _OverlappedCutsIterator(pygrain.DatasetIterator):
 
 @overload
 def _repeated(rows: pygrain.MapDataset, epochs: int | None, name: str, loading: Loading, *,
-              reseed: bool = True) -> pygrain.MapDataset: ...
+              reseed: bool = True, certain: bool = True) -> pygrain.MapDataset: ...
 
 
 @overload
 def _repeated(rows: Rows, epochs: int | None, name: str, loading: Loading, *,
-              reseed: bool = True) -> Rows: ...
+              reseed: bool = True, certain: bool = True) -> Rows: ...
 
 
-def _repeated(rows: Rows, epochs: int | None, name: str, loading: Loading, *, reseed: bool = True) -> Rows:
+def _repeated(rows: Rows, epochs: int | None, name: str, loading: Loading, *, reseed: bool = True,
+              certain: bool = True) -> Rows:
     """`rows` read `epochs` times over, or endlessly, by Grain's repeat. An indexed repeat draws
     each pass afresh (`reseed`) as Grain's does, unless it stands for a repeat of a stream, whose
-    passes replay the first. An endless repeat of a pass that holds or yields nothing would read
-    nothing forever, so it is refused: an indexed pass by its length, a streamed one when a pass
-    ends without a row (`_Passes`), as a pass of batches does when its records fill no batch."""
+    passes replay the first. An endless repeat of a pass that holds nothing is refused, as it
+    would read nothing forever: an indexed pass by its length, a stream's when a pass ends without
+    a row and nothing before the repeat drops one (`certain`), so the pass is the source's own
+    rows. A pass a step emptied may yield rows next time (a fetch that failed for now), so the
+    repeat reads on, logging its empty passes. Every pass of a stream goes on counting its corpus
+    (`_Passes`)."""
     if isinstance(rows, pygrain.MapDataset):
         if epochs is None and not len(rows):
             raise ValueError(f"a pass of {name} holds no rows, so repeating it reads nothing forever")
         return rows.repeat(epochs, reseed_each_epoch=reseed)
     parent = _as_iter(rows, loading)
-    return gx.RepeatIterDataset(parent if epochs is not None else _Passes(parent, name), epochs)
+    return gx.RepeatIterDataset(_Passes(parent, name, endless=epochs is None, certain=certain), epochs)
 
 
 class _Passes(pygrain.IterDataset):
-    """A stream an endless repeat reads pass after pass, refusing a pass that yields no row."""
+    """A stream a repeat reads pass after pass, each going on counting its corpus. Endlessly read
+    (`endless`), a pass that yields no row is refused where that is certain to repeat (`certain`),
+    and logged at each doubling of a run of them otherwise."""
 
-    def __init__(self, parent: pygrain.IterDataset, name: str):
+    def __init__(self, parent: pygrain.IterDataset, name: str, *, endless: bool, certain: bool):
         super().__init__(parent)
-        self._rows, self._name = parent, name
+        self._rows, self._name, self._endless, self._certain = parent, name, endless, certain
 
     def __iter__(self) -> pygrain.DatasetIterator:
-        return _PassesIterator(self._rows.__iter__(), self._name)
+        return _PassesIterator(self._rows.__iter__(), self._name, self._endless, self._certain)
 
 
 class _PassesIterator(pygrain.DatasetIterator):
-    """Its parent's rows and position. A pass that ends without a row is refused; the repeat
-    restarts a pass by restoring the parent right after one ends, and any other restore lands
-    inside a pass the run already read from."""
+    """Its parent's rows and position. The repeat restarts a pass by restoring the parent right
+    after one ends, and any other restore lands inside a pass the run already read from."""
 
-    def __init__(self, parent: pygrain.DatasetIterator, name: str):
+    def __init__(self, parent: pygrain.DatasetIterator, name: str, endless: bool, certain: bool):
         super().__init__(parent)
-        self._rows, self._name = parent, name
+        self._rows, self._name, self._endless, self._certain = parent, name, endless, certain
         self._yielded = self._ended = False
+        self._empty = 0
 
     def __next__(self):
         try:
             value = next(self._rows)
         except StopIteration:
-            if not self._yielded:
-                raise ValueError(f"a pass of {self._name} yields no rows, so repeating it reads nothing "
-                                 "forever") from None
+            if not self._yielded and self._endless:
+                if self._certain:
+                    raise ValueError(f"a pass of {self._name} yields no rows, so repeating it reads "
+                                     "nothing forever") from None
+                self._empty += 1
+                if not self._empty & (self._empty - 1):
+                    _log.warning("%s yielded no row in its last %d passes; the read goes on until one does",
+                                 self._name, self._empty)
             self._ended = True
             raise
-        self._yielded = True
+        self._yielded, self._empty = True, 0
         return value
 
     def get_state(self):
         return self._rows.get_state()
 
     def set_state(self, state) -> None:
-        self._rows.set_state(state)
+        # Right after a pass ends, this is the repeat rewinding it, which keeps the corpus's counts.
+        self._rows.set_state(rewound(state, self._rows.get_state()) if self._ended else state)
         self._yielded, self._ended = not self._ended, False
 
 
@@ -627,7 +652,6 @@ class _Build:
     loading: Loading
     seed: int
     batch: int
-    budget: SearchBudget
     lowering: _Lowering
     training: bool
     corpus: tuple[int, ...] = ()
@@ -644,16 +668,22 @@ class _Build:
         return dataclasses.replace(self, lowering=self.lowering.children[index],
                                    corpus=(*self.corpus, _member_key(members, index)))
 
-    def stage_seed(self, pipeline: Pipeline, at: int) -> int:
+    def stage_seed(self, pipeline: Pipeline, at: int, partition: DataPartition) -> int:
         """The seed of the random stage written at `at` in `pipeline`: the run's seed, the corpus's
         key in each of its mixtures and how many random stages its corpus wrote before this one. No stage
         a read leaves out or runs ahead draws (a cache's prefix, a published generation's steps,
         the steps a memory read runs over the whole source), so this count is the same in every
         read. Grain's default seed counts the datasets between a step and the nearest seeded one
         instead, which those reads and the wrappers a read adds change. A native step is a random
-        stage too: the dataset it is handed seeds the random steps it adds by that default."""
+        stage too: the dataset it is handed seeds the random steps it adds by that default.
+
+        A stage after the batch draws for this share's part of each batch, which other shares'
+        parts must not repeat, so its seed adds the share where there is more than one."""
         drawn = sum(isinstance(stage, (RandomMap, Native)) for stage in pipeline.stages[:at])
-        return int(np.random.SeedSequence((self.seed, *self.corpus, drawn)).generate_state(1, np.uint32)[0])
+        batched = any(isinstance(stage, BatchStage) for stage in pipeline.stages[:at])
+        share = (partition.index, partition.count) if batched and partition.count > 1 else ()
+        key = (self.seed, *self.corpus, drawn, *share)
+        return int(np.random.SeedSequence(key).generate_state(1, np.uint32)[0])
 
     def mixed(self, pipeline: Pipeline, partition: DataPartition) -> Rows:
         source = pipeline.source
@@ -666,7 +696,7 @@ class _Build:
             checked = primed_maps(mapped)
             return pygrain.MapDataset.mix(checked, _weights(source))
         streams = [
-            Accepted(_as_iter(parent, self.loading), _name(child), budget=self.budget)
+            Accepted(_as_iter(parent, self.loading), _name(child), _label(child))
             for parent, child in zip(parents, source.pipelines, strict=True)
         ]
         # A streamed mix saves each member's position under its key, so a member that joins starts
@@ -678,8 +708,8 @@ class _Build:
                 source.weights,
                 tokens=source.tokens,
                 names=[_name(child) for child in source.pipelines],
+                labels=[_label(child) for child in source.pipelines],
                 keys=keys,
-                budget=self.budget,
             )
         return PrimedMix(streams, source.weights, keys)
 
@@ -707,12 +737,12 @@ class _Build:
             rows = stored.map_with_index(placed) if last >= 0 else stored
             return self.shared(rows, pipeline, partition), 0
         filled, manifest, prefix = _fill(pipeline, source, cache, self.read)
-        cached = filled.mapped(stored, manifest, transform=prefix)
+        cached = filled.mapped(stored, manifest, transform=prefix, source=source)
         placed = cached.map_with_index(_Placed(rows=len(cached))) if last > cache else cached
         view = self.shared(placed, pipeline, partition)
         rows = cached.iterated(view, pygrain.ReadOptions(self.loading.threads, self.loading.read_buffer))
         flat = gx.FlatMapIterDataset(rows, _CachedOutputs())
-        return Accepted(flat, _name(pipeline), budget=self.budget), cache + 1
+        return Accepted(flat, _name(pipeline), _label(pipeline)), cache + 1
 
     def sharded(
         self, pipeline: Pipeline, source: Source, partition: DataPartition, last: int
@@ -733,12 +763,11 @@ class _Build:
         shards = _positioned(shards) if last >= start else shards
         written = stages[start : start if interleave is None else interleave]
         local = tuple(stage for stage in written if isinstance(stage, _LOCAL))
-        shards = dataclasses.replace(
-            shards, reader=_ShardSteps(shards.reader, local, cache is not None, _name(pipeline))
-        )
+        steps = _ShardSteps(shards.reader, local, cache is not None, _name(pipeline), _label(pipeline))
+        shards = dataclasses.replace(shards, reader=steps)
         rows = self.streamed(shards, pipeline, partition)
         if cache is not None or any(_drops(stage) for stage in local):
-            rows = Accepted(rows, _name(pipeline), budget=self.budget)
+            rows = Accepted(rows, _name(pipeline), _label(pipeline))
         return rows, start if interleave is None else interleave + 1
 
     def shared(
@@ -762,6 +791,7 @@ class _Build:
         interleave = None if self.lowering.interleave is None else pipeline.stages[self.lowering.interleave]
         return streamed(
             shards,
+            name=_label(pipeline),
             partition=partition,
             seed=self.seed if self.training else None,
             cycle_length=interleave.cycle_length if isinstance(interleave, Interleave) else 1,
@@ -783,7 +813,7 @@ class _Build:
         else:
             rows, consumed = self.indexed(pipeline, source, partition, last)
         for index, stage in enumerate(pipeline.stages[consumed:], start=consumed):
-            if isinstance(stage, (BatchStage, MapBatch, Rebatch)):
+            if isinstance(stage, (BatchStage, MapBatch)):
                 break
             if index == self.lowering.absorbed:
                 continue
@@ -792,18 +822,19 @@ class _Build:
             rows = self.stage(rows, stage, pipeline, partition, index)
             if index == last:
                 rows = rows.map(_unplaced)
-        if not self.global_order:
-            rows = Accepted(_as_iter(rows, self.loading), _name(pipeline), budget=self.budget)
+        if not self.global_order and _counts_own_rows(pipeline):
+            rows = Accepted(_as_iter(rows, self.loading), _name(pipeline), _label(pipeline))
         return rows
 
     def stage(self, rows: Rows, stage: Stage, pipeline: Pipeline, partition: DataPartition, at: int) -> Rows:
         """`rows` through `stage`, written at `at` in `pipeline`."""
         if isinstance(stage, (Map, RandomMap, MapWithIndex, Filter, FlatMap)):
-            return self.record_stage(rows, stage, pipeline, at)
+            return self.record_stage(rows, stage, pipeline, partition, at)
         if isinstance(stage, Shuffle) and stage.block_shards is not None:
             return self.block_shuffle(rows, stage, pipeline, partition)
         if isinstance(stage, Repeat):
-            return _repeated(rows, stage.epochs, _name(pipeline), self.loading)
+            certain = not any(_drops(written) for written in pipeline.stages[:at])
+            return _repeated(rows, stage.epochs, _name(pipeline), self.loading, certain=certain)
         if isinstance(stage, (Shuffle, Slice, Limit)) and isinstance(rows, pygrain.MapDataset):
             return _reordered(stage, rows)
         if isinstance(stage, Shuffle) and stage.window is not None:
@@ -828,12 +859,8 @@ class _Build:
                 ),
                 worker_init_fn=_dies_with_parent,
             )
-        elif isinstance(stage, Rebatch):
-            rows = gx.RebatchIterDataset(
-                _as_iter(rows, self.loading), partition.rows(stage.size), drop_remainder=self.training
-            )
         elif isinstance(stage, Native):
-            rows = stage.function(rows.seed(self.stage_seed(pipeline, at)))
+            rows = stage.function(rows.seed(self.stage_seed(pipeline, at, partition)))
         elif isinstance(stage, Batched):
             groups = _as_iter(rows, self.loading).batch(stage.size, drop_remainder=False, batch_fn=list)
             rows = gx.FlatMapIterDataset(groups, _Groups(stage))
@@ -868,7 +895,7 @@ class _Build:
         """The windows that hold a target of their token `field`, as a memory read's and a packing
         plan's are (`materialize._targeted`, `packing.plan_windows`): one with nothing to predict
         is counted as zero_targets and left out, so how a run reads does not change its steps."""
-        return Accepted(windows, _name(pipeline), budget=self.budget, tokens=ValidTargets(field))
+        return Accepted(windows, _name(pipeline), _label(pipeline), tokens=ValidTargets(field))
 
     def block_shuffle(self, rows: Rows, stage: Shuffle, pipeline: Pipeline, partition: DataPartition) -> Rows:
         from dew.data.ordering import BlockShuffle
@@ -894,17 +921,17 @@ class _Build:
 
     def record_stage(
         self, rows: Rows, stage: Map | RandomMap | MapWithIndex | Filter | FlatMap, pipeline: Pipeline,
-        at: int,
+        partition: DataPartition, at: int,
     ) -> Rows:
         lowered = _Rows(stage)
         if isinstance(stage, FlatMap):
-            rows = _expanded(_as_iter(rows, self.loading), stage, _name(pipeline))
+            rows = _expanded(_as_iter(rows, self.loading), stage, _name(pipeline), _label(pipeline))
         elif isinstance(stage, RandomMap):
-            rows = rows.random_map(lowered, seed=self.stage_seed(pipeline, at))
+            rows = rows.random_map(lowered, seed=self.stage_seed(pipeline, at, partition))
         else:
             rows = rows.map(lowered)
         if isinstance(stage, (Filter, FlatMap)) or stage.rejects:
-            rows = Accepted(_as_iter(rows, self.loading), _name(pipeline), budget=self.budget)
+            rows = Accepted(_as_iter(rows, self.loading), _name(pipeline), _label(pipeline))
         return rows
 
     def batches(

@@ -15,7 +15,7 @@ from dew.data.cache import Cache
 from dew.data.compile import compile, iterate
 from dew.data.dataset import DataPartition, GlobalStream
 from dew.data.pipeline import Configured, ObjectiveData, Rejected
-from dew.data.plan import Manifest, StepIdentity
+from dew.data.plan import Manifest
 
 READ = Loading(workers=0, threads=1, read_buffer=2, worker_buffer=1)
 
@@ -39,8 +39,9 @@ def test_a_mix_reads_memory_grain_and_files_members_at_their_shares(tmp_path):
         origins = np.concatenate([batch["origin"] for batch in itertools.islice(stream, 32)])
     finally:
         stream.close()
-    shares = {origin: float(np.mean(origins == origin)) for origin in ("memory", "grain", "files")}
-    assert shares == pytest.approx({"memory": 0.5, "grain": 0.25, "files": 0.25}, abs=0.05)
+    # A mix places each member's records at its exact share of every prefix of the order, 2:1:1 here.
+    counts = {origin: int(np.sum(origins == origin)) for origin in ("memory", "grain", "files")}
+    assert counts == {"memory": 128, "grain": 64, "files": 64}
 
 
 @pytest.fixture
@@ -265,10 +266,17 @@ class ConfigureFetch:
         return FetchLike()
 
 
-def fetched_generation(source, directory):
+def fetched_generation(chain, directory):
+    """The fetch outcomes of `chain`, sealed as the generation of its prefix: the keyed
+    manifest publication records, filled once through the cache."""
+    from dew.data.analysis import _cache_manifest
+    from dew.data.compile import _prepared
+
+    (prepared,) = _prepared((chain,), "indexed", provision=False)
+    source = prepared.source
     cache = Cache((directory / "fetched").as_uri())
     fetch = FetchLike()
-    manifest = Manifest(source.fingerprint(), (StepIdentity.of(fetch),))
+    manifest = _cache_manifest(source, prepared.stages, "indexed")
     stored = cache.mapped(grain.MapDataset.source(source.records("indexed")), manifest,
                           transform=lambda index, row: (fetch(row),))
     try:
@@ -298,7 +306,7 @@ def test_eager_fetch_keeps_a_memory_plan_volatile_until_its_generation_is_sealed
         reader.close()
     with pytest.raises(ValueError):
         data.train(DataPartition(readers=2))
-    generation = fetched_generation(source, tmp_path)
+    generation = fetched_generation(chain, tmp_path)
     sealed = compile(chain.cache(generation).batch(2), read="memory", loading=READ)
     assert not sealed.plan.volatile
     readers = [sealed.train(DataPartition(readers=2, reader=index)) for index in range(2)]
@@ -321,12 +329,12 @@ def test_a_sealed_generation_keeps_its_holdout_selection_in_training_and_validat
     from dew.data.holdout import HoldOut
 
     source = Memory(rows("fetched", 64))
-    generation = fetched_generation(source, tmp_path)
+    generation = fetched_generation(source.filter_map(FetchLike()), tmp_path)
     if selection == "random":
         holdout = HoldOut(records=5, by="random", seed=37)
-        train, held, _ = RecordsData(generation.source(), validation=holdout).pipelines()
-        data = loader(RecordsData(source, validation=holdout), cache=generation,
-                      batch=2, read=read, loading=READ)
+        recipe = RecordsData(generation.source(), validation=holdout)
+        train, held, _ = recipe.pipelines()
+        data = loader(recipe, batch=2, read=read, loading=READ)
     else:
         cached = source.filter_map(FetchLike()).cache(generation)
         train, held = (cached.holdout(0.25, key="i") if selection == "fraction"
@@ -452,8 +460,10 @@ def test_stats_counts_a_fresh_pass_and_mix_weighs_tokens():
         origins = np.concatenate([next(reader)["origin"] for _ in range(40)])
     finally:
         reader.close()
-    # Three-token records carry two targets, nine-token records eight: equal targets, four short to one long.
-    assert np.mean(origins == "short") == pytest.approx(0.8, abs=0.05)
+    # Three-token records carry two targets, nine-token records eight. The member furthest below its
+    # share of the targets goes next, ties to the first: one short record, then a long one and four
+    # short ones in turn, so 1 + 63 * 4 + 3 of the 320 records are short.
+    assert int(np.sum(origins == "short")) == 256
 
 
 class Countdown:
@@ -581,7 +591,8 @@ def test_a_hugging_face_stream_resumes_exactly_and_its_own_shuffle_is_refused():
     opening at its own position; a stream that shuffles through Hugging Face's buffer, whose
     rows that state leaves out, is refused, also under a later map, and so is one with no name
     to tell it from another stream."""
-    datasets = pytest.importorskip("datasets")
+    import datasets
+
     stream = datasets.IterableDataset.from_generator(lambda: ({"i": i} for i in range(40)))
     source = from_hf(stream, name="counting@1")
     reader = compile(source.repeat().batch(4), read="streamed", loading=READ).train(DataPartition())
@@ -598,7 +609,7 @@ def test_a_hugging_face_stream_resumes_exactly_and_its_own_shuffle_is_refused():
         assert [next(resumed)["i"].tolist() for _ in range(3)] == rest
     finally:
         resumed.close()
-    assert [row["i"] for row in source.iterate()] == list(range(40))
+    assert [row["i"] for row in source] == list(range(40))
     with pytest.raises(ValueError):
         from_hf(stream.shuffle(seed=0, buffer_size=8).map(lambda row: row), name="shuffled@1")
     with pytest.raises(ValueError):
@@ -623,7 +634,8 @@ def hf_file_rows(shards: list[str]):
 def test_hugging_face_stream_shares_are_disjoint_and_resume_exactly(shard_count, workers):
     """Physical shards and undersharded streams cover every record once across two shares,
     with independent openings and exact per-share resumes, also through real workers."""
-    datasets = pytest.importorskip("datasets")
+    import datasets
+
     stream = datasets.IterableDataset.from_generator(hf_rows, gen_kwargs={"shards": list(range(shard_count))})
     source = from_hf(stream, name=f"sharded-{shard_count}@1")
     chain = (source.map(lambda row: {**row, "twice": 2 * row["i"]}, identity="twice@1")
@@ -659,18 +671,18 @@ def test_hugging_face_stream_shares_are_disjoint_and_resume_exactly(shard_count,
             other.close()
     assert set(shares[0]).isdisjoint(shares[1])
     assert sorted([*shares[0], *shares[1]]) == list(range(12 * shard_count))
-    whole = [row["i"] for row in iterate(source.chain(), read="streamed", loading=READ)]
+    whole = [row["i"] for row in iterate(source._chain(), read="streamed", loading=READ)]
     assert whole == list(range(12 * shard_count))
 
 
 @pytest.mark.parametrize("shares", [1, 2])
 def test_a_hugging_face_stream_cache_publishes_only_its_store_shards(tmp_path, shares):
     """A native-shard fill publishes; a row-wise node split refuses without reopening the store."""
+    import datasets
+
     from dew.data.cache import Cache
-    from dew.data.plan import Manifest
     from dew.data.shards import streamed
 
-    datasets = pytest.importorskip("datasets")
     path = tmp_path / "records.jsonl"
     path.write_text("".join(json.dumps({"i": index}) + "\n" for index in range(12)))
     stream = datasets.IterableDataset.from_generator(hf_file_rows, gen_kwargs={"shards": [str(path)]})
@@ -702,15 +714,70 @@ def test_text_normalize_reads_composed_and_compatibility_characters_alike(form):
     its composed letter and, under NFKC, a ligature and a full-width digit as their plain ones;
     the record's other fields pass through."""
     records = [{"text": "cafe\u0301 \ufb01ne \uff11", "id": 7}, {"text": b"plain", "id": 8}]
-    normalized = list(Memory(records).map(text.Normalized(form)).iterate())
+    normalized = list(Memory(records).map(text.Normalized(form)))
     assert [row["text"] for row in normalized] == [
         "caf\u00e9 fine 1" if form == "NFKC" else "caf\u00e9 \ufb01ne \uff11", "plain"]
     assert [int(row["id"]) for row in normalized] == [7, 8]
 
 
 def test_chunks_cut_long_documents_keeping_every_target():
-    pieces = list(Memory([{"text": np.arange(10)}]).flat_map(text.Chunks(4, overlap=1)).iterate())
+    pieces = list(Memory([{"text": np.arange(10)}]).flat_map(text.Chunks(4, overlap=1)))
     assert [piece["text"].tolist() for piece in pieces] == [[0, 1, 2, 3], [3, 4, 5, 6], [6, 7, 8, 9]]
+
+
+def test_a_mix_counts_each_corpus_under_a_name_of_its_own(tmp_path):
+    """Two unnamed stores share a file name and a third is named as one of theirs would be
+    numbered: each corpus keeps its own counts, the two numbered past the name the third holds."""
+    for part in ("first", "second"):
+        (tmp_path / part).mkdir()
+        (tmp_path / part / "train.jsonl").write_text("".join(f'{{"id": {index}}}\n' for index in range(8)))
+    corpora = [Files(str(tmp_path / part / "train.jsonl")) for part in ("first", "second")]
+    named = Memory([{"id": index} for index in range(8)]).named("train-1")
+    counts = mix([*corpora, named]).stats(records=6)
+    assert {name for name in counts if name.startswith("data/rows/")} == {
+        "data/rows/train-1", "data/rows/train-2", "data/rows/train-3"}
+    assert sum(counts[f"data/rows/train-{place}"] for place in (1, 2, 3)) == 6
+
+
+@pytest.mark.parametrize("read", ["indexed", "streamed"])
+def test_a_mixtures_grain_step_drops_rows_it_rejects_and_counts_them(read):
+    """A Grain step after a mix that rejects rows (`Rejected`) has them dropped before the batch
+    and counted under the mixture, beside its corpora's own counts."""
+    from dew.data.pipeline import Rejected
+
+    def odd_rejected(rows):
+        return rows.map(lambda row: Rejected("odd") if int(row["i"]) % 2 else row)
+
+    mixed = mix([Memory(rows("a", 8)).named("a"), Memory(rows("b", 8)).named("b")])
+    chain = mixed.grain(odd_rejected, identity="odd-rejected@1").batch(2)
+    data = compile(chain, read=read, loading=READ)
+    stream = data.train(DataPartition())
+    try:
+        batches = [next(stream) for _ in range(3)]
+    finally:
+        stream.close()
+    assert all(int(value) % 2 == 0 for batch in batches for value in batch["i"])
+    assert data.statistics()["data/rejected/mixture/odd"] > 0
+
+
+def test_a_runs_truncated_share_is_of_the_rows_it_delivered():
+    """A memory read runs a corpus's steps before its repeat and reads the rest as it goes: every
+    row it delivers was cut short after the repeat, so its truncated share is one, whatever the
+    rows the memory read held before."""
+    from dew.data.steps.text import LengthPolicy
+
+    rows = Memory([{"text": np.arange(5, dtype=np.int32)} for _ in range(4)])
+    chain = (rows.repeat(1).map(LengthPolicy(2)).filter(lambda row: True, identity="all@1")
+             .take(1).batch(1))
+    data = compile(chain, read="memory", loading=Loading(workers=0, threads=1, read_buffer=1))
+    stream = data.train(DataPartition())
+    try:
+        assert np.asarray(next(stream)["text"]).tolist() == [[0, 1]]
+    finally:
+        stream.close()
+    counts = data.statistics()
+    assert counts["data/rows/memory"] == 1
+    assert counts["data/truncated/memory"] == 1.0
 
 
 def test_a_character_filter_and_caption_dropout_keep_and_empty_their_records():
@@ -721,7 +788,7 @@ def test_a_character_filter_and_caption_dropout_keep_and_empty_their_records():
 
     def captions(p):
         chain = Memory(records).filter(text.MinChars(5)).random_map(text.Dropped(p=p))
-        return {int(row["id"]): str(row["caption"]) for row in chain.iterate()}
+        return {int(row["id"]): str(row["caption"]) for row in chain}
 
     assert captions(0.0) == {size: f"a photo {size}" for size in range(5, 12)}
     assert captions(1.0) == dict.fromkeys(range(5, 12), "")
@@ -736,8 +803,8 @@ def test_diagnostic_records_unstack_nested_numeric_and_object_fields(read):
                                         "deep": {"even": index % 2 == 0}},
                 "objects": np.array(["label", {"turns": ["question", "answer"]}], dtype=object),
                 "caption": f"record {index}"} for index in range(3)]
-    chain = dataclasses.replace(Memory(records).read(read), loading=READ)
-    actual = list(chain.iterate())
+    chain = Memory(records).read(read).loading(READ)
+    actual = list(chain)
     assert len(actual) == len(records)
     for row, original in zip(actual, records, strict=True):
         assert row["id"] == original["id"]
@@ -755,10 +822,10 @@ def test_stats_bounds_preprocessing_and_counts_only_the_inspected_records(read):
         processed.append(row["i"])
         return {**row, "twice": 2 * row["i"]}
 
-    chain = dataclasses.replace(Memory(rows("a", 40)).named("sample"), mode=read, loading=READ)
+    chain = Memory(rows("a", 40)).named("sample").read(read).loading(READ)
     counts = chain.map(prepare, identity="stats-prepare@1").filter_map(drop_thirds).stats(10)
-    assert counts["data/accepted/sample"] == 10
-    assert counts["data/attempted/sample"] == 15
+    assert counts["data/rows/sample"] == 10
+    assert counts["data/rows/sample"] + counts["data/rejected/sample/third"] == 15
     assert counts["data/rejected/sample/third"] == 5
     assert processed == list(range(15))
 
@@ -771,12 +838,12 @@ def test_stats_stops_at_a_finite_sources_end(records):
         processed.append(row["i"])
         return row
 
-    chain = dataclasses.replace(Memory(rows("a", 7)).named("sample"), loading=READ)
+    chain = Memory(rows("a", 7)).named("sample").loading(READ)
     counts = chain.map(prepare, identity="stats-finite@1").filter_map(drop_thirds).stats(records)
     expected = 0 if records == 0 else 7
     assert processed == list(range(expected))
-    assert counts.get("data/attempted/sample", 0) == expected
-    assert counts.get("data/accepted/sample", 0) == (0 if records == 0 else 4)
+    assert counts.get("data/rows/sample", 0) + counts.get("data/rejected/sample/third", 0) == expected
+    assert counts.get("data/rows/sample", 0) == (0 if records == 0 else 4)
 
 
 @pytest.mark.parametrize("read", [None, "memory", "indexed", "streamed"])
@@ -787,9 +854,9 @@ def test_stats_counts_one_to_one_chains_lazily(read):
         processed.append(row["i"])
         return {**row, "twice": 2 * row["i"]}
 
-    chain = dataclasses.replace(Memory(rows("a", 7)).named("sample"), mode=read, loading=READ)
+    chain = Memory(rows("a", 7)).named("sample").read(read).loading(READ)
     counts = chain.map(prepare, identity="stats-one-to-one@1").stats(3)
-    assert counts["data/attempted/sample"] == counts["data/accepted/sample"] == 3
+    assert counts["data/rows/sample"] == 3
     assert processed == [0, 1, 2]
 
 
@@ -802,9 +869,9 @@ def expand_record(row):
 @pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
 def test_flat_map_reads_plain_record_functions_through_iteration_and_resume(read):
     chain = Memory(rows("a", 7)).flat_map(expand_record, identity="expand-record@1")
-    chain = dataclasses.replace(chain, mode=read, loading=READ)
+    chain = chain.read(read).loading(READ)
     expected = [(index, piece) for index in range(7) if index % 3 for piece in range(2)]
-    assert [(int(row["i"]), int(row["piece"])) for row in chain.iterate()] == expected
+    assert [(int(row["i"]), int(row["piece"])) for row in chain] == expected
     data = compile(chain.repeat(1).batch(2), loading=READ)
     reader = data.train(DataPartition())
     try:
@@ -831,8 +898,8 @@ def test_finite_diagnostics_draw_after_rejection_and_shuffle_as_training_does(re
     chain = Memory([{**row, "value": row["i"]} for row in rows("a", 7)])
     chain = chain.shuffle(13, **({"window": 3} if read == "streamed" else {}))
     chain = chain.filter_map(drop_thirds).random_map(add_draw)
-    chain = dataclasses.replace(chain, mode=read, loading=READ)
-    actual = list(chain.iterate())
+    chain = chain.read(read).loading(READ)
+    actual = list(chain)
     reader = compile(chain.repeat(1).batch(1, drop_remainder=False), loading=READ).train(DataPartition())
     try:
         reference = list(reader)
@@ -857,8 +924,8 @@ def test_a_random_step_that_drops_records_draws_alike_on_every_read_and_counts_i
     the records training keeps, with training's draws, and counts the rest under the step's
     reason, where a random step that drops once had a verb only as a Grain transform."""
     chain = Memory(rows("a", 24)).named("coins").random_filter_map(keep_heads)
-    chain = dataclasses.replace(chain, mode=read, loading=READ)
-    kept = [(int(row["i"]), float(row["draw"])) for row in chain.iterate()]
+    chain = chain.read(read).loading(READ)
+    kept = [(int(row["i"]), float(row["draw"])) for row in chain]
     reader = compile(chain.repeat(1).batch(1, drop_remainder=False), loading=READ).train(DataPartition())
     try:
         trained = [(int(batch["i"][0]), float(batch["draw"][0])) for batch in reader]
@@ -887,7 +954,7 @@ def test_a_random_step_that_may_drop_draws_as_one_that_cannot(read):
             trained = [float(batch["draw"][0]) for batch in itertools.islice(reader, 8)]
         finally:
             reader.close()
-        inspected = dataclasses.replace(chain.chain(), mode=read, loading=READ).iterate()
+        inspected = iter(chain.read(read).loading(READ))
         return trained, [float(row["draw"]) for row in inspected]
 
     expected, inspected = draws("random_map")
@@ -934,8 +1001,8 @@ def test_an_augmented_image_preset_can_be_inspected_without_repeating(read):
     records = [{"image": np.arange(6 * 8 * 3, dtype=np.uint8).reshape(6, 8, 3) + index,
                 "id": index} for index in range(4)]
     chain = Memory(records).read(read).pipe(presets.images, 4, batch=2, augment=True)
-    chain = dataclasses.replace(chain, loading=READ)
-    inspected = list(chain.iterate())
+    chain = chain.loading(READ)
+    inspected = list(chain)
     data, _ = fitted(chain, None, objective=ObjectiveData())
     reader = data.train(DataPartition())
     try:
@@ -963,8 +1030,8 @@ def test_host_maps_refuse_undeclared_rejections_before_the_next_stage(consumer):
         return batch
 
     chain = Memory(rows("a", 4)).read("indexed").repeat(1).batch(2).map(reject, following)
-    chain = dataclasses.replace(chain, loading=READ)
-    reader = (chain.iterate() if consumer == "iterate"
+    chain = chain.loading(READ)
+    reader = (iter(chain) if consumer == "iterate"
               else compile(chain, loading=READ).train(DataPartition()))
     try:
         with pytest.raises(ValueError):
@@ -979,8 +1046,8 @@ def test_column_verbs_preserve_simultaneous_renames_and_selection(read):
     records = [{"a": index, "b": 10 + index, "unused": -index} for index in range(3)]
     chain = (Memory(records).read(read).rename_columns({"a": "b", "b": "a"})
              .remove_columns("unused", "absent").select_columns("b", "a"))
-    chain = dataclasses.replace(chain, loading=READ)
-    actual = list(chain.iterate())
+    chain = chain.loading(READ)
+    actual = list(chain)
     assert [{name: int(value) for name, value in row.items()} for row in actual] == [
         {"b": index, "a": 10 + index} for index in range(3)]
 

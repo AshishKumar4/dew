@@ -5,7 +5,8 @@ body and returns a Jev response body, so serving it is a few lines of any
 web framework; this uses Starlette, which the `serve` extra installs with
 uvicorn:
 
-    uv pip install "dewml[serve] @ git+https://github.com/AshishKumar4/dew"
+    uv pip install "dewml[serve] @ git+https://github.com/AshishKumar4/dew" \
+        --extra-index-url https://pypi.dewml.dev/simple
     python examples/serve_decisions.py --model convaiinnovations/laya --port 8000
     python examples/serve_decisions.py --run runs/tickets
 

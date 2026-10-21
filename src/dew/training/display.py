@@ -9,8 +9,11 @@ evaluation of each split with its history; and, in the bottom border, the
 phase the run is in. Notes print above the panel. The run ends with a
 summary panel that keeps the final evaluations and their histories.
 
-Anywhere else (a pipe, a log file, CI, a notebook) the same numbers are
-printed as one line per logging interval. Only process zero shows anything.
+In a notebook the same panel is one output that IPython's display handle
+updates in place (`NotebookPanel`), so the saved notebook and the site keep
+its last frame, and the summary follows it. Anywhere else (a pipe, a log
+file, CI) the same numbers are printed as one line per logging interval. Only
+process zero shows anything.
 
 Nothing here knows a workload. The rows are whatever scalars are logged,
 grouped by the prefix of their names (`train`, `rollout`, ...), and how one
@@ -22,8 +25,10 @@ from __future__ import annotations
 import collections
 import dataclasses
 import datetime
+import io
 import math
 import sys
+import threading
 import time
 from collections.abc import Mapping, Sequence
 from contextlib import AbstractContextManager
@@ -32,6 +37,7 @@ import jax
 from rich import box
 from rich.color import Color, blend_rgb
 from rich.console import Console, ConsoleOptions, Group, RenderableType, RenderResult
+from rich.jupyter import JUPYTER_HTML_FORMAT
 from rich.live import Live
 from rich.panel import Panel
 from rich.spinner import Spinner
@@ -64,11 +70,67 @@ PLAIN = Shown()
 WIDEST = 120
 
 
-def terminal(console: Console) -> bool:
-    """Whether `console` is a terminal the panel can redraw. rich takes
-    FORCE_COLOR, which a CI job may set, for a terminal; that asks for
-    colour, not for redraws in a log, so stdout must be a TTY as well."""
+def redraws(console: Console) -> bool:
+    """Whether the panel can redraw on `console`: a terminal or a notebook. rich
+    takes FORCE_COLOR, which a CI job may set, for a terminal; that asks for
+    colour, not for redraws in a log, so a terminal's stdout must be a TTY."""
+    if console.is_jupyter:
+        return True
     return sys.stdout.isatty() and console.is_terminal and not console.is_dumb_terminal
+
+
+class NotebookPanel:
+    """A renderable as one notebook output, redrawn eight times a second by
+    updating it through IPython's display handle, and left as its last frame.
+
+    Not rich's `Live`, whose notebook path redraws an output widget: while it
+    holds the widget, whatever else the cell prints, from any thread, lands in
+    it and is cleared with the next frame, and a saved notebook keeps no
+    widget. An update replaces one output's data and captures nothing."""
+
+    def __init__(self, renderable: RenderableType, console: Console):
+        from IPython.display import DisplayHandle
+
+        self.renderable = renderable
+        self.console = console
+        # Each frame is rendered here and exported as the HTML and text rich prints in a notebook;
+        # the console's own output is emptied after each, which the export does not read.
+        self._sink = io.StringIO()
+        self._frames = Console(record=True, file=self._sink, width=console.width, height=console.height,
+                               color_system="truecolor", force_terminal=True, force_jupyter=False)
+        self._shown = self._frame()
+        self._handle = DisplayHandle()
+        self._handle.display(self._shown, raw=True)
+        self._stopped = threading.Event()
+        self._ticker = threading.Thread(target=self._tick, name="dew-notebook-panel", daemon=True)
+
+    def _frame(self) -> dict[str, str]:
+        self._frames.print(self.renderable)
+        self._sink.seek(0)
+        self._sink.truncate()
+        text = self._frames.export_text(clear=False)
+        return {"text/html": self._frames.export_html(code_format=JUPYTER_HTML_FORMAT, inline_styles=True),
+                "text/plain": text}
+
+    def _update(self) -> None:
+        from IPython.display import update_display
+
+        if (frame := self._frame()) != self._shown:
+            self._shown = frame
+            update_display(frame, display_id=self._handle.display_id, raw=True)
+
+    def _tick(self) -> None:
+        while not self._stopped.wait(1 / 8):
+            self._update()
+
+    def start(self) -> None:
+        self._ticker.start()
+
+    def stop(self) -> None:
+        """Draw the last frame once the redraws have stopped."""
+        self._stopped.set()
+        self._ticker.join()
+        self._update()
 
 
 def mesh_text(mesh: Mapping[str, int]) -> str:
@@ -178,6 +240,74 @@ class Row:
     values: collections.deque
 
 
+# How the display shows the metrics the trainer itself logs; an objective,
+# a rollout and a validation metric declare their own (`Shown`).
+TRAINER_SHOWN = {"loss": Shown(better="lower"),
+                 "learning_rate": Shown(group="optimizer"), "loss_scale": Shown(group="optimizer"),
+                 "accepted": Shown(percent=True, group="optimizer"),
+                 "step_time_ms": Shown(better="lower", group="throughput"),
+                 "samples_per_sec": Shown(better="higher", group="throughput"),
+                 "mfu": Shown(better="higher", percent=True, group="throughput"),
+                 "hfu": Shown(better="higher", percent=True, group="throughput"),
+                 "hlo_flops_util": Shown(better="higher", percent=True, group="throughput"),
+                 **{f"{name}_lower_bound": Shown(better="higher", percent=True, group="throughput")
+                    for name in ("hfu", "hlo_flops_util")}, "unsized_kernels": Shown(group="throughput"),
+                 "tokens": Shown(group="throughput"),
+                 "tokens_per_s": Shown(better="higher", group="throughput"),
+                 "rollout_seconds": Shown(better="lower", group="throughput")}
+
+
+def goodput(wall: float, first_step: float | None, other: float) -> dict[str, float]:
+    """Compute the two goodput numbers from MaxText's report that need no cluster telemetry.
+
+    `first_step` is the time from the start of `fit` to the first step's result:
+    the placement or restore, the first batch, the compile and the step itself.
+    It is None when no step ran. `other` is the time spent outside steps after
+    that: evaluations, checkpoint writes and the wait for them at the end.
+
+    The step fraction is what is left of `wall`. A step's own data stall therefore
+    counts as step time, as it does in MaxText's start-to-start step time.
+    """
+    numbers = {}
+    if first_step is not None:
+        numbers["goodput/time_to_first_step_s"] = first_step
+    steps = wall - (wall if first_step is None else first_step) - other
+    numbers["goodput/step_fraction"] = max(steps, 0.0) / wall if wall > 0 else 0.0
+    return numbers
+
+
+
+def data_line(counters: Mapping[str, float]) -> Text | None:
+    """A run's data counters (`data/...`) as one line: the rows each label's reader delivered
+    (`data/rows/<label>`), as they are, since a chain's labels count different stages (a mixture's
+    corpora the rows they fed it, the mixture those a later step kept) and no sum of them is the
+    run's; the records rejected, summed over the labels, with each reason only where something was
+    rejected for it (`data/rejected/<label>/<reason>`); and the share of the rows truncated where
+    any was (`data/truncated/<label>`, each label's share of its own rows). None where the run
+    reports no rows."""
+    rows = {name.removeprefix("data/rows/"): value for name, value in counters.items()
+            if name.startswith("data/rows/")}
+    if not rows:
+        return None
+    line = Text("data ", LABEL)
+    for index, (label, count) in enumerate(rows.items()):
+        line.append("  " if index else "").append("" if len(rows) == 1 else f"{label} ", LABEL)
+        line.append(f"{int(count):,}", "bold")
+    reasons: collections.Counter[str] = collections.Counter()
+    for name, value in counters.items():
+        if name.startswith("data/rejected/"):
+            reasons[name.rpartition("/")[2]] += int(value)
+    line.append(" rows", LABEL).append("  ·  ", LABEL).append(f"{sum(reasons.values()):,}", "bold")
+    line.append(" rejected", LABEL)
+    if counted := {reason: count for reason, count in reasons.items() if count}:
+        line.append(" (" + ", ".join(f"{reason} {count:,}" for reason, count in counted.items()) + ")", LABEL)
+    shares = {label: counters[name] for label in rows if (name := f"data/truncated/{label}") in counters}
+    weight = sum(rows[label] for label in shares)
+    if weight and (truncated := sum(share * rows[label] for label, share in shares.items())):
+        line.append("  ·  ", LABEL).append(f"{truncated / weight:.1%}", "bold").append(" truncated", LABEL)
+    return line
+
+
 @dataclasses.dataclass
 class TrainingDisplay:
     """The console side of one `Trainer.fit`.
@@ -200,6 +330,12 @@ class TrainingDisplay:
     pace: collections.deque = dataclasses.field(default_factory=lambda: collections.deque(maxlen=24))
     # Metrics by group, then by logged name, in the order first logged.
     groups: dict[str, dict[str, Row]] = dataclasses.field(default_factory=dict)
+    # The names the last interval logged, the rows shown: a metric an interval no longer reports (a
+    # rollout source absent from its batch) keeps its trend for when it returns, not its last value.
+    reported: frozenset[str] = frozenset()
+    # The last interval's data counters (`data/...`, `dew.data.mixing.CorpusCounts.metrics`), shown
+    # as one line (`data_line`) rather than as rows; the trackers keep each of them.
+    corpus_counts: Mapping[str, float] = dataclasses.field(default_factory=dict)
     # Each split's last `TREND` evaluations, in the order they completed,
     # scores only: the trackers keep the previews. A new evaluation rebinds
     # its split's list, so the refresh thread never iterates one that grows.
@@ -210,7 +346,7 @@ class TrainingDisplay:
     ended: bool = False
     # How the phase is drawn, not what the display holds: left out of equality.
     spinner: Spinner = dataclasses.field(default_factory=lambda: Spinner("dots", style=ACCENT), compare=False)
-    live: Live | None = None
+    live: Live | NotebookPanel | None = None
     _logs: AbstractContextManager[None] | None = dataclasses.field(default=None, compare=False)
 
     @property
@@ -244,13 +380,18 @@ class TrainingDisplay:
             self.header.append(("mesh", mesh))
         self.header += [("batch", str(batch)), ("", precision)]
         console = Console()
-        if not terminal(console):
+        if not redraws(console):
             target = (f"to {started.target_steps}" if started.target_steps is not None
                       else f"for {started.tokens} real tokens")
             self.note(f"Training {model} from step {started.start_step} {target}: "
                       + ", ".join(f"{label} {value}".strip() for label, value in self.header))
             return
         self.phase = "compiling"
+        if console.is_jupyter:
+            # Dew's diagnostics print beside the panel as any output does.
+            self.live = NotebookPanel(self, console)
+            self.live.start()
+            return
         self.live = Live(self, console=console, refresh_per_second=8, vertical_overflow="visible")
         self.live.start()
         self._logs = display_console(console)
@@ -278,17 +419,23 @@ class TrainingDisplay:
         """Record one logging interval's scalars, which the host has read."""
         if not self.shown_here:
             return
+        self.corpus_counts = {name: value for name, value in scalars.items() if name.startswith("data/")}
         for name, value in scalars.items():
+            if name in self.corpus_counts:
+                continue
             prefix, _, rest = name.partition("/")
             shown = self.shown.get(rest or prefix, PLAIN)
             rows = self.groups.setdefault(shown.group or prefix, {})
             if name not in rows:
                 rows[name] = Row(rest or prefix, shown, collections.deque(maxlen=TREND))
             rows[name].values.append(value)
+        self.reported = frozenset(scalars) - self.corpus_counts.keys()
         if self.live is None:
             target = "" if self.total is None else f"/{self.total}"
             line = f"step {step}{target}  " + "  ".join(
                 f"{row.name} {number(row.values[-1], row.shown)}" for _, row in self.rows())
+            if (counted := data_line(self.corpus_counts)) is not None:
+                line += f"  {counted.plain}"
             if (rate := self.rate()) and self.total is not None and step < self.total:
                 line += f"  {duration((self.total - step) / rate)} left"
             self.note(line)
@@ -340,7 +487,7 @@ class TrainingDisplay:
         rate = (steps - 1) / stepping if steps > 1 and stepping > 0 else None
         fraction = f"{goodput['goodput/step_fraction']:.1%} of the wall time in steps"
         console = Console()
-        if not terminal(console):
+        if not redraws(console):
             timing = f"Trained {steps} steps in {duration(seconds)}"
             if first is not None:
                 timing += f": first step after {first:.2f} s"
@@ -378,9 +525,11 @@ class TrainingDisplay:
         return f"{split} (ema)" if self.averaged else split
 
     def rows(self) -> list[tuple[str, Row]]:
-        """The metrics to show as (group, row) pairs, grouped in the order
-        each group was first logged."""
-        return [(group, row) for group, named in list(self.groups.items()) for row in list(named.values())]
+        """The metrics the last interval logged, as (group, row) pairs, grouped in the order each
+        group was first logged."""
+        reported = self.reported
+        return [(group, row) for group, named in list(self.groups.items())
+                for name, row in list(named.items()) if name in reported]
 
     def scores(self, evaluation: Evaluation, *, history: bool = False) -> Text:
         """An evaluation's scores and their change since the previous one,
@@ -456,6 +605,8 @@ class TrainingDisplay:
             parts.append(Text.assemble(bar(fraction, room), "  ", stats))
         else:
             parts += [bar(fraction, inner), stats]
+        if (counted := data_line(self.corpus_counts)) is not None:
+            parts.append(counted)
 
         if rows := self.rows():
             # What the rest of the panel takes: the borders, the header, the

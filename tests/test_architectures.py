@@ -367,8 +367,9 @@ def run_case(case: Case, tmp_path, fsdp, devices=None, state=None, steps=2):
     assert int(state.step) == steps
     losses = [s["train/loss"] for _, s in tracker.scalars if "train/loss" in s]
     assert len(losses) == steps and all(np.isfinite(loss) for loss in losses), losses
-    # Every pass scores every row with the same EMA weight selection.
-    assert seen == [shape] * steps, seen
+    # Every pass scores every row with the same EMA weight selection, the one that warms the
+    # evaluations before the first step included where one runs before the end.
+    assert seen == [shape] * (steps + (steps > 1)), seen
     scores = [s["val/artifact_spread"] for _, s in tracker.scalars if "val/artifact_spread" in s]
     assert len(scores) == steps and all(np.isfinite(score) for score in scores)
     assert [type(value) for _, value in tracker.artifacts
@@ -416,7 +417,7 @@ def update_terms(case: Case, tmp_path, initial, steps=2):
 
         def stepped(state):
             for batch in rows:
-                advanced, *_ = body(state, batch, 0)
+                advanced, *_ = body(state, batch, 0, jnp.zeros((2,), jnp.uint32))
                 state = replace(advanced, step=state.step + 1)
             return state
 
@@ -444,7 +445,7 @@ def shard_terms(case: Case, tmp_path, initial):
         body = trainer._step_body(trainer._loss_shape(state, with_rows(np.ones(BATCH, bool))), {}, 1)
 
         def written(valid):
-            advanced, *_ = body(state, with_rows(valid), 0)
+            advanced, *_ = body(state, with_rows(valid), 0, jnp.zeros((2,), jnp.uint32))
             return {name: jax.device_get(jax.tree.map(lambda after, before: after - before,
                                                       getattr(advanced, name), getattr(state, name)))
                     for name in ("variables", "opt_state", "ema")}

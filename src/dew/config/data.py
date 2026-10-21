@@ -9,7 +9,7 @@ from typing import TYPE_CHECKING, Annotated, Literal, Protocol, runtime_checkabl
 
 import numpy as np
 
-from dew.data.analysis import _cache_at, _order_at, _preferred_read, _promoted, _until
+from dew.data.analysis import _cache_at, _order_at, _preferred_read, _promoted, _serves, _until
 from dew.data.compile import compile
 from dew.data.dataset import Batch, DataPhase, Loader, Loading, record_argument
 from dew.data.holdout import (
@@ -160,8 +160,7 @@ class TextData(_Loadable):
         if self.token_holdout is not None and self.validation is None:
             if self.token_holdout.fraction is None:
                 raise ValueError("token_holdout needs fraction=")
-            held = train.token_split(self.token_holdout.fraction, held=True)
-            train = train.token_split(self.token_holdout.fraction, held=False)
+            train, held = (part._chain() for part in train.holdout(tokens=self.token_holdout.fraction))
         if self.pack is None:
             train = train.windows(self.seq_len, stride=self.stride)
             held = (
@@ -224,7 +223,7 @@ class ChatData(_Loadable):
     tokenizer: str
     seq_len: int = 256
     column: str = "messages"
-    long: Literal["truncate", "drop", "chunk"] = "truncate"
+    long: Literal["truncate", "drop", "chunk"] = "chunk"
     packing_bins: int = 8
     validation: Annotated[Validation, source_argument(Validation)] = None
     split: str = "train"
@@ -281,7 +280,7 @@ class PromptData(_Loadable):
     max_prompt_len: int = 256
     pad_id: int = 0
     reward_bytes: int | None = None
-    long: Literal["drop", "truncate"] = "drop"
+    long: Literal["drop", "truncate"] = "truncate"
     thinking: bool | None = None
     validation: Annotated[Validation, source_argument(Validation)] = None
     split: str = "train"
@@ -318,6 +317,9 @@ class _PromptFacts:
     def _measured(self) -> dict[str, int]:
         return {}
 
+    def label(self) -> str:
+        return self.source.label()
+
     def describe(self) -> str:
         return self.source.describe()
 
@@ -328,7 +330,7 @@ class _PromptFacts:
         return self.source.supports(read)
 
     def records(self, read: Read):
-        from dew.data.prompts import _ground_truth, _text
+        from dew.data.prompts import _extra_info, _ground_truth, _text
 
         rows = self.source.records(read)
         if read == "memory" and self.width is None and "reward_bytes" not in self._measured:
@@ -343,7 +345,7 @@ class _PromptFacts:
                         for text in (
                             _text(row.get("data_source")),
                             _ground_truth(row, "prompt"),
-                            _text(row.get("extra_info")),
+                            _text(_extra_info(row)),
                         )
                     ),
                     default=1,
@@ -458,7 +460,7 @@ class ImageData(_Loadable):
                 if augment.jitter:
                     train = train.random_map(images.ColorJitter())
         elif augment is not None:
-            train = train.random_map(images.AugmentationKey()).then(MapBatch(images.DeviceAugment(
+            train = train.random_map(images.AugmentationKey())._then(MapBatch(images.DeviceAugment(
                 self.image_size, crop_scale=augment.crop_scale, flip=augment.flip, jitter=augment.jitter)))
         held = None if held is None else prepared(held, self.image_size)
         return train, held, (EncodeCaptions(),)
@@ -565,8 +567,11 @@ def loader(
     if held is not None and validation_records is not None:
         held = held.take(validation_records)
     if cache is not None:
-        train = _cached(train, cache)
-        held = None if held is None else _cached(held, cache)
+        train, trained = _cached(train, cache)
+        held, scored = (None, 0) if held is None else _cached(held, cache)
+        if not trained + scored:
+            raise ValueError(f"{cache!r} holds the rows of none of this recipe's corpora; name the Cache "
+                             "it was published to, or publish a branch of this recipe (`dew data publish`)")
     train, held = _promoted(train), None if held is None else _promoted(held)
 
     def compiled(at: Read) -> tuple[Pipeline, ...]:
@@ -622,10 +627,16 @@ def _batched(
     return dataclasses.replace(prefix, stages=(*prefix.stages, *pipeline.stages[at:]))
 
 
-def _cached(pipeline: Pipeline, cache: Cache | Generation | str) -> Pipeline:
+def _cached(pipeline: Pipeline, cache: Cache | Generation | str) -> tuple[Pipeline, int]:
+    """`pipeline` with `cache` after the steps a cache can hold, in each of its corpora whose rows
+    it holds (`_serves`: a named generation holds one prefix's), and how many corpora took it."""
     if isinstance(pipeline.source, (Mixture, Phases)):
-        children = tuple(_cached(child, cache) for child in pipeline.source.pipelines)
-        return dataclasses.replace(pipeline, source=dataclasses.replace(pipeline.source, pipelines=children))
+        cached = [_cached(child, cache) for child in pipeline.source.pipelines]
+        children = tuple(child for child, _ in cached)
+        source = dataclasses.replace(pipeline.source, pipelines=children)
+        return dataclasses.replace(pipeline, source=source), sum(count for _, count in cached)
     at = _cache_at(pipeline.stages)
+    if not _serves(cache, pipeline.source, pipeline.stages[:at]):
+        return pipeline, 0
     prefix = dataclasses.replace(pipeline, stages=pipeline.stages[:at]).cache(cache)
-    return dataclasses.replace(prefix, stages=(*prefix.stages, *pipeline.stages[at:]))
+    return dataclasses.replace(prefix, stages=(*prefix.stages, *pipeline.stages[at:])), 1

@@ -173,7 +173,7 @@ class NativeRolloutServer:
     """
 
     def __init__(self, server: Server, *, version: int = 0):
-        if len(server.stopping) != len(server.sampling.criteria()):
+        if len(server.stopping.ending) + len(server.stopping.truncating) != len(server.sampling.criteria()):
             raise ValueError("a rollout's draws end on EOS or at their budget; serve a task without stop "
                              "strings or stopping criteria of its own")
         self._server = server
@@ -477,7 +477,7 @@ class Publication:
     `load(variables, version)` pushes the weights, stamps the version, then
     updates `version`. `weights` does the push (`SafetensorsReload`, or any
     `WeightSync`). `stamp`, when set, labels later calls with a version, as
-    a recording gateway does (`dew.interop.harbor.Gateway.stamp`). The stamp
+    a recording gateway does (`dew.interop.gateway.Gateway.stamp`). The stamp
     runs only after every replica serves the new version, because a gateway
     stamps a call when it arrives, and a stamp ahead of a replica would claim
     weights the call was not sampled from. A failed push or stamp raises and

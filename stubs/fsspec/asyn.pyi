@@ -7,6 +7,7 @@ from .spec import AbstractFileSystem
 P = ParamSpec('P')
 T = TypeVar('T')
 
+def get_loop() -> AbstractEventLoop: ...
 def sync(loop: AbstractEventLoop, func: Callable[P, Awaitable[T]], *args: P.args, **kwargs: P.kwargs) -> T: ...
 
 class AsyncFileSystem(AbstractFileSystem):

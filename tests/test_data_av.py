@@ -12,12 +12,11 @@ binary on PATH.
 
 import subprocess
 
+import moviepy.config as moviepy_config
 import numpy as np
 import pytest
 
 from dew.data import Memory, audio, video
-
-moviepy_config = pytest.importorskip("moviepy.config", reason="needs the av extra")
 
 FPS = 25
 SAMPLE_RATE = 16000
@@ -61,7 +60,7 @@ def media(tmp_path_factory):
 
 
 def _records(chain):
-    return list(chain.repeat(1).iterate())
+    return list(chain.repeat(1))
 
 
 def _frame_indices(frames):

@@ -130,7 +130,9 @@ def test_strict_merge_follows_append_only_history_and_splits_on_any_rewrite(seed
     for index in range(len(rollouts)):
         mine = batch[SESSION_INDEX_KEY] == index
         assert batch[SESSION_WEIGHTS_KEY][mine].sum() == pytest.approx(1.0)
-        assert (batch[ADVANTAGES_KEY][mine] == advantages(rollouts)[index]).all()
+        # Per session, every call takes the session's advantage, as every id of its chains.
+        [value] = set(advantages(rollouts)[index].tolist())
+        assert (batch[ADVANTAGES_KEY][mine] == np.float32(value)).all()
 
 
 def test_masked_rollouts_take_no_rows_and_no_baseline():
@@ -141,9 +143,10 @@ def test_masked_rollouts_take_no_rows_and_no_baseline():
                 Session("t", "g", 3, 0, (call,), Status.INFRA_ERROR, None)]
     batch = pack(rollouts, 3)
     assert set(np.unique(batch[SESSION_INDEX_KEY])) == {0, 1}
-    np.testing.assert_allclose(advantages(rollouts, "mean"), [.5, -.5, 0, 0])
+    # One call a session: its advantage is the session's.
+    np.testing.assert_allclose(np.concatenate(advantages(rollouts, "mean")), [.5, -.5, 0, 0])
     lonely = [rollouts[0], rollouts[2]]
-    assert (advantages(lonely) == 0).all()
+    assert (np.concatenate(advantages(lonely)) == 0).all()
 
 
 @pytest.mark.parametrize("truncation, expected", [
@@ -157,7 +160,8 @@ def test_the_truncation_policy_decides_whether_a_truncation_trains_and_on_what_r
                 Session("t", "g", 1, 0, (call,), Status.AGENT_ERROR, 0.0),
                 Session("t", "g", 2, 0, (call,), Status.TRUNCATED, 5.0),
                 Session("t", "g", 3, 0, (call,), Status.INFRA_ERROR, None)]
-    np.testing.assert_allclose(advantages(sessions, "mean", truncation=truncation), expected, rtol=1e-6)
+    np.testing.assert_allclose(np.concatenate(advantages(sessions, "mean", truncation=truncation)), expected,
+                               rtol=1e-6)
     batch = pack(sessions, 3, estimator="mean", truncation=truncation)
     trained = {0, 1} if truncation == "mask" else {0, 1, 2}
     assert set(np.unique(batch[SESSION_INDEX_KEY][batch[RESPONSE_MASK_KEY] > 0])) == trained
@@ -208,7 +212,7 @@ def test_group_advantages_match_hand_computed_values_across_uneven_groups():
                 Session("b", "g", 0, 0, (call,), Status.COMPLETED, 0.0),
                 Session("b", "g", 1, 0, (call,), Status.COMPLETED, 1.0)]
     expected = [0.57735, -1.15470, 0.57735, 0.0, -0.70711, 0.70711]
-    np.testing.assert_allclose(advantages(rollouts), expected, atol=1e-4)
+    np.testing.assert_allclose(np.concatenate(advantages(rollouts)), expected, atol=1e-4)
     batch = pack(rollouts, 3)
     for index, value in enumerate(expected):
         mine = batch[SESSION_INDEX_KEY] == index

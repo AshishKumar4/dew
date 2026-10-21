@@ -82,24 +82,27 @@ def test_text_windows_keep_document_continuations_and_global_resume():
     resumed.close()
 
 
-def test_prompt_default_drops_long_tasks_and_explicit_truncation_keeps_the_tail():
+def test_prompt_default_keeps_a_long_tasks_tail_and_explicit_dropping_filters_it():
+    """An overlong prompt keeps its tail by default (post-training P62); `long="drop"` filters it."""
     rows = ({"prompt": [1, 2]}, {"prompt": [3, 4, 5, 6, 7]}, {"prompt": [8, 9]})
-    filtered = loader(PromptData(rows, "byte", max_prompt_len=3), batch=1, read="memory", loading=READ)
+    filtered = loader(PromptData(rows, "byte", max_prompt_len=3, long="drop"), batch=1, read="memory",
+                      loading=READ)
     assert filtered.records == 2
-    truncated = loader(PromptData(rows, "byte", max_prompt_len=3, long="truncate"),
-                     batch=3, read="memory", loading=READ)
+    truncated = loader(PromptData(rows, "byte", max_prompt_len=3), batch=3, read="memory", loading=READ)
     reader = truncated.train(DataPartition())
     assert sorted(next(reader)["prompt"].tolist()) == [[0, 1, 2], [0, 8, 9], [5, 6, 7]]
     reader.close()
 
 
-def test_chat_default_truncates_and_chunking_preserves_later_assistant_tokens():
+def test_chat_default_chunks_and_preserves_later_assistant_tokens_that_truncation_cuts():
+    """A long conversation is chunked by default (post-training P37), keeping every turn, where an
+    explicit `long="truncate"` cuts the later assistant tokens away."""
     rows = ({"messages": [{"role": "user", "content": "hi"},
                            {"role": "assistant", "content": "hello " * 20}]},) * 8
     tokenizer = "tests/fixtures/tokenizers/tiny-chat"
-    truncated = loader(ChatData(rows, tokenizer, seq_len=15), batch=1, read="memory", loading=READ)
-    chunked = loader(ChatData(rows, tokenizer, seq_len=15, long="chunk"), batch=1, read="memory",
-                     loading=READ)
+    truncated = loader(ChatData(rows, tokenizer, seq_len=15, long="truncate"), batch=1, read="memory",
+                       loading=READ)
+    chunked = loader(ChatData(rows, tokenizer, seq_len=15), batch=1, read="memory", loading=READ)
     assert chunked.records > truncated.records
     reader = chunked.train(DataPartition())
     assert any(np.any(batch["text_roles"] == 3) for batch in itertools.islice(reader, chunked.records))
