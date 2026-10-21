@@ -183,13 +183,13 @@ def score_hooks(names: tuple, queries: int, keys: int) -> template.Hooks:
 
 ROW_TERMS = ("exact", "output")
 """The backward's two forms of each query's `D = sum_j p dP`: summed from its tiles in a first pass
-(`backward`'s default), and `rowsum(dO * O)` from the forward's fp32 output (`output=`)."""
+(`backward`'s default), and `rowsum(dO * O)` from the forward's fp32 output (`residuals=`)."""
 
 
 def check_backward(case: dict, names: tuple, dtype, forward_config, backward_config, row_term: str = "exact"):
-    """`attention_triton.backward` after `forward`, its every gradient (queries, keys, values, each score
-    parameter, the initial state's) on par with `jax.vjp` of the template's XLA arithmetic, from float64,
-    its `D` in the form `row_term` names."""
+    """`attention_triton.backward`, its every gradient (queries, keys, values, each score parameter, the
+    initial state's) on par with `jax.vjp` of the template's XLA arithmetic, from float64, its `D` in the
+    form `row_term` names (`ROW_TERMS`), the second from `forward`'s residuals."""
     queries, keys = geometry(case)
     spans = template.spans(queries, keys, ROWS, **arguments(case))
     hooks = score_hooks(names, queries, keys)
@@ -212,10 +212,12 @@ def check_backward(case: dict, names: tuple, dtype, forward_config, backward_con
 
     def ours(query, key, value, dout):
         with pins:
-            _, peak, total, *wide = attention_triton.forward(query, key, value, spans, hooks, residuals=True,
-                                                             wide=row_term == "output", interpret=not ON_GPU)
-            grads = attention_triton.backward(query, key, value, spans, hooks, peak, total, dout,
-                                              output=wide[0] if wide else None, interpret=not ON_GPU)
+            residuals = None
+            if row_term == "output":
+                _, *residuals = attention_triton.forward(query, key, value, spans, hooks, residuals=True,
+                                                         wide=True, interpret=not ON_GPU)
+            grads = attention_triton.backward(query, key, value, spans, hooks, dout, residuals=residuals,
+                                              interpret=not ON_GPU)
         return grads.query, grads.key, grads.value, grads.score_params, grads.initial
 
     def xla(query, key, value, dout):
