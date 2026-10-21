@@ -21,6 +21,12 @@ from .tokens import TokenFiles
 def source(
     value: object, *, format: Format | None = None, split: str | None = None, provision: bool = False
 ) -> Source:
+    """The store `value` names: a `Source` as it is; a `tfds://name[:version]` or `hf://owner/repo[@revision]`
+    URL as its TFDS or Hub dataset, `split` its split ("train" by default); any other URL as its files
+    (`Files`, `format` naming their record format where the URL's suffix does not), or as a committed
+    token export (`TokenFiles`) where its manifest says it is one; and records in memory (a sequence
+    of rows, a mapping of columns or a data frame) as `Memory`. A split named for anything but a Hub
+    or TFDS URL is refused. With `provision`, the store builds the indexes its reads need first."""
     if isinstance(value, Source):
         resolved = value
     elif isinstance(value, (str, PathLike)):
@@ -70,4 +76,5 @@ __all__ = [
     "from_hf",
     "from_iter",
     "from_torch",
+    "source",
 ]

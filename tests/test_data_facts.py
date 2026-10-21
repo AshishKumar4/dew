@@ -176,3 +176,17 @@ def test_the_sft_presets_facts_are_its_tokenizer_and_its_rows():
     assert (facts["tokenizer"], facts["seq_len"]) == (tokenizer, 16)
     assert facts["fields"]["text"] == [17] == held["text"]
     assert facts["fields"]["text_roles"] == [17] == held["text_roles"]
+
+
+def test_a_store_not_present_states_nothing_and_the_presets_facts_stand(tmp_path):
+    """A TFDS split never prepared here and a directory of clips not yet fetched state no facts of
+    their own, so a chain over either says what its steps make: the images preset's squares, the
+    video preset's frames, and no class names or rows."""
+    from dew.data import TFDS, Files
+    from dew.data.sources.av_utils import FPS
+
+    images = TFDS("never_prepared", path=str(tmp_path / "tfds")).pipe(presets.images, 16, batch=4).facts()
+    assert images["fields"]["image"] == [16, 16, 3] and "class_names" not in images and "rows" not in images
+    clips = Files(str(tmp_path / "clips"), format="files").pipe(
+        presets.video, 4 / FPS, frames=4, fps=FPS, size=16, batch=2).facts()
+    assert clips["fields"]["video"] == [4, 16, 16, 3]
