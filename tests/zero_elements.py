@@ -126,12 +126,12 @@ def _input(value) -> Bounded:
 
 
 MOVES = {"broadcast_in_dim", "reshape", "transpose", "squeeze", "expand_dims", "slice", "rev", "copy",
-         "copy_p", "concatenate", "stack", "pad", "dynamic_slice", "gather"}
+         "copy_p", "concatenate", "stack", "split", "pad", "dynamic_slice", "gather"}
 """Primitives that only move or select elements, by operands the moved values do not decide: each
 element's bound, exactness and certification move with it."""
 CALLS = {"jit": "jaxpr", "pjit": "jaxpr", "closed_call": "call_jaxpr", "core_call": "call_jaxpr",
          "custom_jvp_call": "call_jaxpr", "custom_vjp_call": "call_jaxpr",
-         "custom_vjp_call_jaxpr": "fun_jaxpr", "checkpoint": "jaxpr", "remat": "jaxpr"}
+         "custom_vjp_call_jaxpr": "fun_jaxpr", "checkpoint": "jaxpr", "remat": "jaxpr", "remat2": "jaxpr"}
 """Primitives that call a program of their own: interpreted through it."""
 COMPARISONS = {"lt", "le", "gt", "ge", "eq", "ne"}
 
@@ -171,6 +171,12 @@ class Interpreter:
 
     def _equation(self, eqn, operands: list[Bounded]) -> list[Bounded]:
         name = eqn.primitive.name
+        if name == "linear_call":
+            # The callee on its own constants and the call's arguments; the transpose is not run forward.
+            callee, own = eqn.params["callee"], eqn.params["num_callee_consts"]
+            skipped = own + eqn.params["num_transpose_consts"]
+            return self._program(callee.jaxpr, [_input(c) for c in callee.consts],
+                                 operands[:own] + operands[skipped:])
         if name in CALLS:
             inner = eqn.params[CALLS[name]]
             closed = inner if hasattr(inner, "consts") else None
@@ -190,7 +196,7 @@ class Interpreter:
             if name in {"stop_gradient", "copy"}:
                 outs = [operands[0]]
             elif name in MOVES:
-                outs = [self._moved(eqn, operands, natives[0])]
+                outs = self._moved(eqn, operands, natives)
             else:
                 outs = handler(eqn, operands, natives)
         for out in outs:
@@ -202,26 +208,29 @@ class Interpreter:
 
     # Moves and selections.
 
-    def _moved(self, eqn, operands: list[Bounded], native: np.ndarray) -> Bounded:
+    def _moved(self, eqn, operands: list[Bounded], natives: list[np.ndarray]) -> list[Bounded]:
         """A move applied to each operand's bound, exactness and certification, its index operands (an
         integer exact and certified) moved as they are."""
-        def moved(field, dtype):
+        def moved(field):
             with jax.enable_x64(new_val=True):
-                arrays = [jnp.asarray(getattr(operand, field), dtype)
+                arrays = [jnp.asarray(getattr(operand, field), jnp.float64)
                           if np.issubdtype(operand.value.dtype, np.inexact) else jnp.asarray(operand.value)
                           for operand in operands]
-                return np.asarray(eqn.primitive.bind(*arrays, **eqn.params))
+                outs = eqn.primitive.bind(*arrays, **eqn.params)
+                return [np.asarray(out) for out in (outs if eqn.primitive.multiple_results else [outs])]
 
         indices_certified = all(operand.certified.all() and operand.exact.all() for operand in operands
                                 if not np.issubdtype(operand.value.dtype, np.inexact))
-        if not np.issubdtype(native.dtype, np.inexact):
+        if not any(np.issubdtype(native.dtype, np.inexact) for native in natives):
             certified = all(operand.certified.all() for operand in operands)
-            return Bounded(native, np.zeros(native.shape), np.full(native.shape, certified),
-                           np.full(native.shape, certified))
-        error = moved("error", jnp.float64)
-        exact = moved("exact", jnp.float64) > 0.5
-        certified = (moved("certified", jnp.float64) > 0.5) & indices_certified
-        return Bounded(native, error, exact & certified, certified)
+            return [Bounded(native, np.zeros(native.shape), np.full(native.shape, certified),
+                            np.full(native.shape, certified)) for native in natives]
+        results = []
+        fields = zip(natives, moved("error"), moved("exact"), moved("certified"), strict=True)
+        for native, error, exact, certified in fields:
+            certified = (certified > 0.5) & indices_certified
+            results.append(Bounded(native, error, (exact > 0.5) & certified, certified))
+        return results
 
     def _select_n(self, eqn, operands, natives):
         which, *cases = operands
@@ -494,6 +503,65 @@ class Interpreter:
                 self.blocked.get("exp (past its range, or not a number)", 0) + int((~certified).sum()))
         return [Bounded(native, error, point & certified, certified)]
 
+    def _enclosed(self, name, natives, operand, function) -> list[Bounded]:
+        """A unary function held at every element to mpmath's interval enclosure of it over the operand's
+        whole interval [x̂ - e, x̂ + e] (`function` of an mpmath interval): its bound the native value's
+        farthest distance from that enclosure, which covers its own rounding and its operand's bound at
+        once; exact where the enclosure is the native value alone. Outside its domain, or not finite,
+        not certified."""
+        native = natives[0]
+        _, blocked = self._formatted(name, natives, operand)
+        if blocked:
+            return blocked
+        x, value, e = operand.value.astype(np.float64), native.astype(np.float64), operand.error
+        error, exact = np.zeros(x.shape), np.zeros(x.shape, bool)
+        certified = operand.certified & np.isfinite(x) & np.isfinite(value)
+        for index in np.flatnonzero(certified):
+            try:
+                with interval_precision(128) as iv:
+                    radius = float(e.flat[index])
+                    around = iv.mpf(float(x.flat[index])) + iv.mpf([-radius, radius])
+                    low, high = interval_ends(function(iv, around), 128)
+            except (ValueError, ZeroDivisionError, ArithmeticError):
+                certified.flat[index] = False
+                continue
+            native_value = fractions.Fraction(float(value.flat[index]))
+            apart = max(abs(native_value - low), abs(high - native_value))
+            error.flat[index] = math.nextafter(float(apart), math.inf) if apart else 0.0
+            exact.flat[index] = low == high == native_value and bool(operand.exact.flat[index])
+        certified &= np.isfinite(error)
+        return [Bounded(native, np.where(certified, error, 0.0), exact & certified, certified)]
+
+    def _log(self, eqn, operands, natives):
+        return self._enclosed("log", natives, operands[0], lambda iv, t: iv.log(t))
+
+    def _log1p(self, eqn, operands, natives):
+        return self._enclosed("log1p", natives, operands[0], lambda iv, t: iv.log1p(t))
+
+    def _expm1(self, eqn, operands, natives):
+        return self._enclosed("expm1", natives, operands[0], lambda iv, t: iv.expm1(t))
+
+    def _sqrt(self, eqn, operands, natives):
+        return self._enclosed("sqrt", natives, operands[0], lambda iv, t: iv.sqrt(t))
+
+    def _rsqrt(self, eqn, operands, natives):
+        return self._enclosed("rsqrt", natives, operands[0], lambda iv, t: 1 / iv.sqrt(t))
+
+    def _sin(self, eqn, operands, natives):
+        return self._enclosed("sin", natives, operands[0], lambda iv, t: iv.sin(t))
+
+    def _cos(self, eqn, operands, natives):
+        return self._enclosed("cos", natives, operands[0], lambda iv, t: iv.cos(t))
+
+    def _tanh(self, eqn, operands, natives):
+        # Increasing: its ends' enclosures, each 1 - 2/(exp(2t) + 1).
+        return self._enclosed("tanh", natives, operands[0], lambda iv, t: _monotone(
+            iv, t, lambda point: 1 - 2 / (iv.exp(2 * point) + 1)))
+
+    def _logistic(self, eqn, operands, natives):
+        return self._enclosed("logistic", natives, operands[0], lambda iv, t: _monotone(
+            iv, t, lambda point: 1 / (1 + iv.exp(-point))))
+
     def _integer_pow(self, eqn, operands, natives):
         """x², a correctly rounded product of x with itself (XLA lowers it so): |t² - x̂²| <= 2|x̂|e + e²."""
         if eqn.params["y"] != 2:
@@ -574,6 +642,12 @@ class Interpreter:
 
     def _reduce_min(self, eqn, operands, natives):
         return self._reduce_max(eqn, operands, natives)
+
+
+def _monotone(iv, interval, function):
+    """An increasing function's enclosure over `interval`: its enclosures at the two ends joined."""
+    low, high = function(iv.mpf(interval.a)), function(iv.mpf(interval.b))
+    return iv.mpf([low.a, high.b])
 
 
 _PROBES: dict = {}
