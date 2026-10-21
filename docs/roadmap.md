@@ -179,6 +179,7 @@ Keep the existing gateway interface. Miles would currently duplicate it: its tra
 
 ## CI and tooling
 
+- Give every duplicated function and statement run one owner its callers share, and land the structural duplication gate (functions equal up to renaming, six-statement windows, across files, no allowlist) once none is left. [896, 897, 898, 899, 900, 901, 902, 903, 904, 905, 906, 907, 908, 909, 910, 911, 912, 913, 914, 915, 916, 917, 918, 919, 920, 921, 922, 923, 924, 925, 926, 927, 928, 929, 930, 931, 932, 933, 934, 935, 936, 937, 938, 939, 940, 941, 942, 943, 944, 945, 946, 947, 948, 949, 950]
 - Derive executable training and generation qualification from the registries. Cover codec combinations with fusion, scan and pipeline stages. [176, 178]
 - Compare cached and full forwards on logits and likelihoods. [179]
 - Build registry-backed uninterrupted/resumed flows and extend them to compiled-program reuse. [182, 183]
