@@ -85,6 +85,9 @@ class DataPartition:
     of what a share reads."""
 
     def __post_init__(self):
+        if self.window < 1:
+            raise ValueError(f"a data partition's window is the steps an update pools, at least 1; got "
+                             f"{self.window}")
         if not 0 <= self.index < self.count or not 0 <= self.reader < self.readers:
             raise ValueError(
                 f"a data partition is share index of count, 0 <= index < count, read "
@@ -456,7 +459,7 @@ class Stage:
     records: int
 
 
-def update_aligned(stages: tuple[Stage, ...], window: int) -> tuple[Stage, ...]:
+def _update_aligned(stages: tuple[Stage, ...], window: int) -> tuple[Stage, ...]:
     """`stages` each beginning at the first multiple of `window` steps at or after the step it begins
     at, counted from the run's first: every start is taken from the given schedule, not from the
     stage before it moved, so no stage drifts past its own end, and a stage left with no step is
@@ -547,7 +550,7 @@ class Ramp:
             records += -(-self.samples // (increments * batch)) * batch
             batch += self.increment
         stages.append(Stage(batch=final, records=records))
-        return update_aligned(tuple(stages), window)
+        return _update_aligned(tuple(stages), window)
 
     def steps_for(self, records: int, final: int, window: int = 1) -> int:
         """Return the number of steps a run of updates of `window` steps takes to read `records`
@@ -1421,7 +1424,9 @@ def ramped(dataset: Loader, ramp: Ramp) -> Loader:
     records it handed over. A stream that batches its own records reports a
     shard offset and is refused, by name.
     """
-    ramp.stages(dataset.batch)  # An impossible schedule fails here, not mid-run.
+    # An impossible schedule fails here, not mid-run. Moving its stages to update boundaries
+    # (`Ramp.stages`' window) cannot make one impossible, so this checks the schedule as given.
+    ramp.stages(dataset.batch)
 
     def train(partition: DataPartition) -> Iterator[Batch]:
         stream = dataset.train(partition)
@@ -1468,5 +1473,4 @@ __all__ = [
     "Stoppable",
     "mapped",
     "record_argument",
-    "update_aligned",
 ]
