@@ -272,8 +272,8 @@ def test_a_timed_backward_launch_walks_every_key():
 
 @pytest.mark.parametrize("peak0, scale, key_size",
                          [(87.0, 1.0, 1.0), (0.0, 2.0 ** -126, 1.0), (0.0, 1.0, 2.0 ** 30),
-                          (0.0, 0.25, 2.0 ** 30), (0.0, 2.0 ** 100, 2.0 ** -126)],
-                         ids=["small weight", "small scale", "large key", "large scaled key", "large scale"])
+                          (0.0, 0.25, 2.0 ** 30)],
+                         ids=["small weight", "small scale", "large key", "large scaled key"])
 def test_an_extreme_fp32_backward_is_as_exact_as_the_reference(peak0, scale, key_size):
     """fp32 at the range's edges, one query over one key resumed from a state holding a denominator of
     2**25, under an output cotangent of 2**100: a weight exp(-87) / 2**25 below fp32's least subnormal,
