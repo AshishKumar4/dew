@@ -1512,6 +1512,50 @@ def test_from_iter_forwards_a_native_stop_request():
         reader.close()
 
 
+def test_two_unnamed_grain_stores_keep_their_own_rows_and_counts_in_phases_and_a_mix():
+    """Two Grain stores given no name, read one in each phase, each from its own first row; mixed,
+    each counted apart. A store read again in a later phase goes on where it stopped."""
+    import grain.python as grain
+
+    from dew.data import from_grain
+    from dew.data.compile import compile
+    from dew.data.pipeline import Phases, Pipeline, mix
+
+    loading = Loading(workers=0, threads=1, read_buffer=1)
+    first = from_grain(grain.MapDataset.source([{"id": index} for index in range(100)]))
+    second = from_grain(grain.MapDataset.source([{"id": 1000 + index} for index in range(100)]))
+    phased = Pipeline(Phases((Pipeline(first).repeat(), Pipeline(second).repeat()), (4, None))).batch(1)
+    stream = compile(phased, read="indexed", loading=loading).train(DataPartition())
+    try:
+        assert [int(next(stream)["id"][0]) for _ in range(6)] == [0, 1, 2, 3, 1000, 1001]
+    finally:
+        stream.close()
+    again = Pipeline(Phases((Pipeline(first).repeat(), Pipeline(first).repeat()), (4, None))).batch(1)
+    stream = compile(again, read="indexed", loading=loading).train(DataPartition())
+    try:
+        assert [int(next(stream)["id"][0]) for _ in range(6)] == [0, 1, 2, 3, 4, 5]
+    finally:
+        stream.close()
+    counts = mix([Pipeline(first), Pipeline(second)]).stats(records=10)
+    assert sorted(value for name, value in counts.items() if name.startswith("data/rows/")) == [5, 5]
+
+
+@pytest.mark.parametrize("table", ["pandas", "arrow"])
+def test_memory_reads_a_table_of_lists_bytes_and_nulls_as_records_hold_them(table):
+    """A table whose columns hold token lists, encoded bytes and a missing value reads as the same
+    records given as records do."""
+    import pandas as pd
+    import pyarrow as pa
+
+    columns = {"tokens": [[1, 2], [3, 4, 5]], "image": [b"ab", b"cde"], "caption": ["a cat", None]}
+    given = pd.DataFrame(columns) if table == "pandas" else pa.table(columns)
+    records = [{"tokens": [1, 2], "image": b"ab", "caption": "a cat"},
+               {"tokens": [3, 4, 5], "image": b"cde", "caption": None}]
+    held = Memory(given).records("indexed")
+    assert [held[index] for index in range(len(held))] == records
+    assert Memory(given).fingerprint()["sha256"] == Memory(records).fingerprint()["sha256"]
+
+
 @pytest.mark.parametrize("kind", ["grain", "iterator"])
 def test_foreign_sources_cannot_use_an_empty_content_identity(kind):
     """A Grain or iterator source given an empty name declares no content version, which is no

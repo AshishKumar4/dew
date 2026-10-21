@@ -785,27 +785,58 @@ def test_stats_reports_the_records_a_second_tokens_and_padding_of_packed_rows(re
     assert "data/tokens" not in plain and "data/padding" not in plain
 
 
-def test_show_prints_what_a_preset_expanded_to_then_the_records(capsys):
-    """`show` prints a chain's store and every verb and step a preset expanded to, in order, then
-    its first records; a mixture's corpora each with their weight and their own steps."""
+@dataclasses.dataclass(frozen=True)
+class Twice:
+    """Each record of a group twice, as columns."""
+
+    def __call__(self, columns):
+        return {name: [value for value in values for _ in range(2)] for name, values in columns.items()}
+
+
+@dataclasses.dataclass(frozen=True)
+class Keep:
+    """Keeps every record, though it may drop one."""
+
+    rejects = True
+
+    def __call__(self, row):
+        return row
+
+
+def test_show_prints_the_chain_as_written_then_the_records_and_leaves_a_reader_where_it_was(capsys):
+    """`show` prints the store and each verb as the chain wrote it, a preset's expanded steps and
+    a verb that drops or expands records under its own name, then the first records as a reader
+    makes them; a reader open beside it reads on as one never shown would."""
     from dew.data import presets
 
     pictures = Memory([{"image": np.full((8, 8, 3), index, np.uint8), "label": index % 2}
                        for index in range(6)])
-    pictures.pipe(presets.images, 4, batch=2, augment=True).loading(READ).show(count=1)
-    printed = capsys.readouterr().out
-    steps = ["Memory", "DecodeImage", "Resize", "AugmentationKey", "batch", "DeviceAugment"]
-    places = [printed.find(step) for step in steps]
-    assert all(place >= 0 for place in places)
-    assert places == sorted(places)
-    assert "image" in printed[places[-1]:]
+    chain = pictures.pipe(presets.images, 4, batch=2, augment=True).loading(READ)
+    data = compile(chain, read="indexed", loading=READ)
+    reader, untouched = data.train(DataPartition()), data.train(DataPartition())
+    try:
+        next(reader)
+        chain.show(count=1)
+        rest, expected = next(reader), (next(untouched), next(untouched))[1]
+        for name in expected:
+            np.testing.assert_array_equal(np.asarray(rest[name]), np.asarray(expected[name]))
+    finally:
+        reader.close()
+        untouched.close()
+    lines = capsys.readouterr().out.splitlines()
+    written = [line.strip() for line in lines[:6]]
+    assert written[0].startswith("Memory")
+    assert [line.split("(")[0] for line in written[1:]] == [
+        ".filter_map", ".map", ".random_map", ".batch", ".map"]
+    assert "DecodeImage" in written[1] and "Resize" in written[2] and "AugmentationKey" in written[3]
+    assert written[4] == ".batch(2)" and "DeviceAugment" in written[5] and "device" in written[5]
+    assert "uint8[2, 4, 4, 3]" in "".join(lines[6:])
 
-    mixed = mix([Memory(rows("a", 4)).named("left"), Memory(rows("b", 4)).named("right").map(Tagged())],
-                [3, 1])
-    mixed.batch(2).loading(READ).show(count=1)
-    printed = capsys.readouterr().out
-    places = [printed.index(text) for text in ("weight 3", "weight 1", "Tagged", "batch")]
-    assert places == sorted(places)
+    grouped = Memory(rows("a", 4)).named("a").flat_map(Twice(), batched=True, batch_size=2)
+    grouped.filter_map(Keep()).loading(READ).show(count=1)
+    lines = capsys.readouterr().out.splitlines()
+    assert lines[1].strip() == ".flat_map(Twice(), batched=True, batch_size=2)"
+    assert lines[2].strip().startswith(".filter_map(Keep")
 
 
 def test_a_runs_truncated_share_is_of_the_rows_it_delivered():
