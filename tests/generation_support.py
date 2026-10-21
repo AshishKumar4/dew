@@ -23,11 +23,15 @@ SUMS_IN_IEEE = pytest.mark.skipif(
 
 
 def runnable(name: str) -> bool:
-    """Whether this process runs the kernels `generation.assumed(name)` routes to."""
+    """Whether this process runs the kernels `generation.assumed(name)` routes to: a CPU any (it
+    interprets them); a GPU Hopper's warpgroup kernels only if it is that generation (capability 9.0
+    alone has the instructions), and any other generation's only if no newer than itself."""
     here = generation.device_generation()
     if not here.startswith("sm"):
         return here == "cpu"
-    return int(name.removeprefix("sm")) <= int(here.removeprefix("sm"))
+    if generation.gpu_target(name).wgmma:
+        return name == here
+    return generation.capability(name) <= generation.capability(here)
 
 
 def runs(name: str):
@@ -38,12 +42,10 @@ def runs(name: str):
 
 
 def lowers(name: str):
-    """A mark skipping a test that lowers `name`'s Mosaic GPU kernels where this process's GPU is older:
-    Mosaic GPU checks a kernel's shared memory against the process's own device (an A100's 166912 bytes
-    refuse an H100's tile)."""
-    return pytest.mark.skipif(not runnable(name),
-                              reason=f"lowers {name}'s Mosaic GPU kernels, which it checks against this "
-                                     "process's device")
+    """A mark skipping a test that lowers `name`'s Mosaic GPU kernels where this process cannot run
+    them (`runnable`): Mosaic GPU checks a kernel against the process's own device (an A100's 166912
+    bytes of shared memory refuse an H100's tile)."""
+    return runs(name)
 
 
 def generations(*names: str) -> list:
