@@ -232,9 +232,10 @@ def user(module, **fields) -> Callable[[], Loaded]:
 
 def torch_fallback() -> Loaded:
     """A random tiny GPT-NeoX, which no Dew family reads, through the torchax fallback."""
-    torch = pytest.importorskip("torch")
-    pytest.importorskip("torchax")
-    transformers = pytest.importorskip("transformers")
+    # The fallback and its reference are the suite's own dependencies (the ci extra): a missing one
+    # fails here, or at the load that imports torchax, rather than skipping the cell.
+    import torch
+    import transformers
     torch.manual_seed(0)
     config = transformers.GPTNeoXConfig(num_hidden_layers=1, hidden_size=16, num_attention_heads=2,
                                         intermediate_size=32, vocab_size=256, max_position_embeddings=64)
