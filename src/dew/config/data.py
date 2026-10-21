@@ -443,7 +443,8 @@ class ImageData(_Loadable):
             classes = tuple(Store(self.labels).read().decode().splitlines())
         caption = images.caption(self.caption, templates=self.caption_templates,
                                  classes=classes, columns=self.caption_columns)
-        configured = Configured(ConfigureCaption(caption), needs=(), random=bool(self.caption_templates))
+        configured = Configured(ConfigureCaption(caption), needs=(), random=bool(self.caption_templates),
+                                one_to_one=True)
 
         def prepared(chain: Pipeline, staging: int) -> Pipeline:
             decoded = _decoded_images(chain, staging, field=self.field, at_least=staging, rejects=False)
