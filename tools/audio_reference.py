@@ -15,6 +15,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from reference_torch import host_arrays
 import transformers
 from safetensors.numpy import save_file
 from transformers import (Gemma3nAudioConfig, Gemma3nAudioFeatureExtractor, Gemma3nTextConfig,
@@ -89,10 +90,6 @@ def reference(kind):
     return config, model, projector, extractor
 
 
-def to_arrays(state):
-    return {name: tensor.detach().cpu().float().numpy().copy() for name, tensor in state.items()}
-
-
 def write_reference(root):
     from reference_releases import require
 
@@ -124,8 +121,8 @@ def write_reference(root):
         coefficient = torch.linspace(-1, 1, soft.numel()).reshape_as(soft)
         loss = torch.mean(soft * coefficient)
         loss.backward()
-        save_file(to_arrays(model.state_dict()), str(directory / "encoder.safetensors"))
-        save_file(to_arrays(projector.state_dict()), str(directory / "projector.safetensors"))
+        save_file(host_arrays(model.state_dict()), str(directory / "encoder.safetensors"))
+        save_file(host_arrays(projector.state_dict()), str(directory / "projector.safetensors"))
         save_file({name: p.grad.detach().numpy().copy() for name, p in model.named_parameters()},
                   str(directory / "encoder_grad.safetensors"))
         np.savez(directory / "reference.npz", input_features=features.detach().numpy(),
