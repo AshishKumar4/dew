@@ -32,6 +32,7 @@ from dew.objectives.base import (
     EXAMPLE_ROWS,
     EXAMPLE_STREAM,
     FROZEN,
+    RECORD,
     Aux,
     Batch,
     Ratio,
@@ -120,6 +121,18 @@ def outcome(current: TrainState, advanced: TrainState, loss: jax.Array, aux: Aux
     return (dataclasses.replace(advanced, step=current.step + stepped), loss,
             {**aux.metrics, **step_counts(batch)}, jnp.isfinite(loss), advanced.microstep > current.microstep,
             committed)
+
+
+def recorded(first, replays, replayed) -> dict:
+    """A recording step's record (`RECORD`): each evaluation's values by name, its rows' places and its
+    column check (`Witness.report`), stacked on a first axis, the attempt's own evaluation first and then
+    the window's other microbatches as the commit replayed them, each in its slot; `evaluated` says which
+    ran, the replays only where the commit replayed its window."""
+    if replays is None:
+        return {**jax.tree.map(lambda leaf: leaf[None], first), "evaluated": jnp.ones((1,), bool)}
+    stacked = jax.tree.map(lambda leaf, more: jnp.concatenate([leaf[None], more]), first, replays)
+    count = jax.tree.leaves(replays)[0].shape[0]
+    return {**stacked, "evaluated": jnp.concatenate([jnp.ones((1,), bool), jnp.full((count,), replayed)])}
 
 
 def with_ema(params: Variables, ema: Variables | None) -> Variables | None:
@@ -311,7 +324,8 @@ class Transaction:
     once here. `step` composes them for a resident run or for a host-master
     run; only where each phase executes differs.
     """
-    def __init__(self, objective, optimizer, accumulation: int, shapes, copies=None, split: int = 1):
+    def __init__(self, objective, optimizer, accumulation: int, shapes, copies=None, split: int = 1,
+                 record: bool = False):
         """Hold the objective, the optimizer and the shapes a step traces for.
 
         `accumulation` is the microbatches a window pools, and `split` the
@@ -320,8 +334,10 @@ class Transaction:
         statistics and `Aux`. Statistics that are a `Ratio` or a bare scalar
         pool into one shared mean, which the window can sum and never has to
         replay. `copies` names the parameters the forward reads through the
-        state's narrow copies, which the commit rewrites (`dew.training.narrow`).
+        state's narrow copies, which the commit rewrites (`dew.training.narrow`). `record` makes each
+        evaluation return what its `Step.sample` and `Step.boundary` calls produced (`recorded`).
         """
+        self.record = record
         self.objective = objective
         self.optimizer = optimizer
         self.copies = copies or {}
@@ -440,7 +456,7 @@ class Transaction:
         accepted, attempt = state.microstep - fill + index, previous.attempts[index]
         # The part its input ran as, which an attempt counts (`step` times `split` plus its part).
         step_info = Step(accepted // self.split, jax.random.fold_in(state.key, attempt),
-                         with_ema(variables, state.ema), committed=state.updates,
+                         with_ema(variables, state.ema), committed=state.updates, record=self.record,
                          **self.examples(state, index, batch, part=attempt % self.split,
                                          rejected=attempt - accepted))
         return self.read(variables, state.compute), batch, step_info
@@ -645,6 +661,7 @@ class Transaction:
             rejected = attempt - state.microstep
             step_info = Step(state.microstep // self.split, jax.random.fold_in(state.key, attempt),
                              with_ema(state.variables, state.ema), committed=state.updates,
+                             record=self.record,
                              **self.examples(state, state.microstep % self.size, batch, part, rejected))
             factor = jnp.asarray(1., jnp.float32) if state.scale is None else state.scale.scale
             realized = realize(self.read(state.variables, state.compute), batch, step_info)
@@ -658,26 +675,42 @@ class Transaction:
             # widens it as it pools it, so the window sums in fp32.
             pending = prepare(state, realized.stats, realized.aux, loss, gradient)
 
+            # A replay's record, each of the window's other microbatches in its slot (`recorded`).
+            witnessed = realized.aux.metrics.get(RECORD)
+            unreplayed = None if witnessed is None else jax.tree.map(
+                lambda leaf: jnp.zeros((self.size - 1, *leaf.shape), leaf.dtype), witnessed)
+
             def replay(_):
                 cot = pooled(pending.pooled, realized.stats, factor)
                 combined = unscale(realized.pullback(cot), factor)
-                def one(index, accumulated):
+                def one(index, carried):
+                    accumulated, kept = carried
                     replayed, records, step_info = self.replay_input(state, pending.fill, index)
                     realized = realize(replayed, records, step_info)
-                    return add(accumulated, realized.pullback(cot), factor)
+                    kept = kept if kept is None else jax.tree.map(
+                        lambda held, leaf: held.at[index].set(leaf), kept, realized.aux.metrics[RECORD])
+                    return add(accumulated, realized.pullback(cot), factor), kept
                 if host:
+                    carried = (combined, unreplayed)
                     for index in range(self.size - 1):
-                        combined = one(index, combined)
-                    return combined
-                return jax.lax.fori_loop(0, self.size - 1, one, combined)
+                        carried = one(index, carried)
+                    return carried
+                return jax.lax.fori_loop(0, self.size - 1, one, (combined, unreplayed))
 
+            replayed = jnp.zeros((), bool)
             if state.accumulation is not None and not self.shared:
                 if host:
-                    gradient = replay(None) if bool(pending.replay_required) else pending.gradient
+                    replayed = pending.replay_required
+                    gradient, replays = (replay(None) if bool(replayed) else (pending.gradient, unreplayed))
                 else:
-                    gradient = jax.lax.cond(pending.replay_required, replay, lambda _: pending.gradient, None)
+                    replayed = pending.replay_required
+                    gradient, replays = jax.lax.cond(
+                        replayed, replay, lambda _: (pending.gradient, unreplayed), None)
             else:
-                gradient = pending.gradient
+                gradient, replays = pending.gradient, None
+            if witnessed is not None:
+                realized = dataclasses.replace(realized, aux=dataclasses.replace(realized.aux, metrics={
+                    **realized.aux.metrics, RECORD: recorded(witnessed, replays, replayed)}))
             if not host:
                 # The commit compiles as the host-master step's does, over values
                 # already computed: without the barrier XLA fuses the gradient's

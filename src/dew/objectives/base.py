@@ -155,6 +155,41 @@ class Recorder:
         return {name: placed(name, records) for name, records in self.values.items()}
 
 
+RECORD = "record"
+"""The metrics key under which a recording step (`Step.record`, `Trainer(record=True)`) returns what its
+loss's `Step.sample` and `Step.boundary` calls produced (`Witness.report`)."""
+
+
+@dataclass(eq=False)
+class Witness:
+    """What one traced evaluation of a loss's `Step.sample` and `Step.boundary` calls produced, by name:
+    the traced values themselves, which the evaluation returns as outputs (`RECORD`), so a compiled step
+    reports what it ran, each microbatch and each replay its own, where a `Recorder` keeps concrete
+    values of a loss run eagerly."""
+    values: dict[str, jax.Array] = field(default_factory=dict)
+    kinds: dict[str, str] = field(default_factory=dict)
+
+    def keep(self, kind: str, name: str, value: jax.Array) -> None:
+        """Keep `value`, a `kind` named `name`. Raises `ValueError` for a name an evaluation produces
+        twice, which a witness could not tell apart."""
+        if name in self.values:
+            raise ValueError(f"{name!r} is produced twice in one evaluation ({self.kinds[name]} and {kind}); "
+                             "a recording holds one value a name")
+        self.values[name], self.kinds[name] = value, kind
+
+    def report(self, batch: Batch, examples: jax.Array | None) -> dict[str, object]:
+        """The evaluation's record: every kept value by name, the places of the batch's rows
+        (`Step.example_index`), and whether each row's place is its trainer column's (`EXAMPLE_ROWS`)
+        plus one offset, the step's place in its window, which a row the step and the batch place
+        apart fails; True where the batch carries no column."""
+        rows = jax.tree.leaves(batch)[0].shape[0]
+        index = jnp.arange(rows, dtype=jnp.int32) if examples is None else examples
+        column = batch.get(EXAMPLE_ROWS)
+        offset = index if column is None else index - column.astype(jnp.int32)
+        agreed = jnp.min(offset) == jnp.max(offset) if column is not None else jnp.ones((), bool)
+        return {"values": dict(self.values), "example_index": index, "column_ok": agreed}
+
+
 EXAMPLE_STREAM = 0x6578616D
 """What a run folds its key with for its examples' draws (`Step.example_key`), apart from its attempts'."""
 
@@ -219,6 +254,12 @@ class Step:
     read in place of drawing or computing them (`Recorder.tape`)."""
     recorder: Recorder | None = struct.field(pytree_node=False, default=None)
     """Where `sample` and `boundary` record what they produce, or None."""
+    record: bool = struct.field(pytree_node=False, default=False)
+    """Whether the loss returns what its `sample` and `boundary` calls produce as outputs (`RECORD`):
+    a static flag, so a compiled step's cache holds one program a mode."""
+    witness: Witness | None = struct.field(pytree_node=False, default=None)
+    """The evaluation's collector of what `sample` and `boundary` produce, which `Objective._loss` opens
+    inside the trace of a recording step (`record`); None otherwise."""
 
     def places(self, rows: int) -> tuple[jax.Array, int]:
         """The places among the update's examples of a batch's `rows` rows (`examples`) and how many
@@ -257,6 +298,8 @@ class Step:
         value = self._drawn(name, draw, shape, dtype, examples)
         if self.recorder is not None:
             self.recorder.record("sample", name, examples, value)
+        if self.witness is not None:
+            self.witness.keep("sample", name, value)
         return value
 
     def sample_update(self, name: str, draw: Callable[..., jax.Array], shape: tuple[int, ...] | None = None,
@@ -290,6 +333,8 @@ class Step:
             value = self._taped(self.tape[name], name, examples, value.shape[1:]).astype(value.dtype)
         if self.recorder is not None:
             self.recorder.record("boundary", name, examples, value)
+        if self.witness is not None:
+            self.witness.keep("boundary", name, value)
         return value
 
     @property
@@ -1073,13 +1118,17 @@ class Objective(ABC, Generic[Loss, Effects]):
 
     def _loss(self, variables: Variables, batch: Batch, step: Step, *,
               validation: bool = False) -> tuple[Loss, Aux[Effects]]:
+        marked = batch
         if EXAMPLE_ROWS in batch:
             # The trainer's column of the examples' places is the step's (`Step.example_index`).
             batch = {name: value for name, value in batch.items() if name != EXAMPLE_ROWS}
+        witness = Witness() if step.record and not validation else None
+        step = step if witness is None else step.replace(witness=witness)
         loss = (self.validation_loss if validation else self.loss)(variables, batch, step)
-        if _has_aux(loss):
-            return loss
-        return loss, Aux(metrics={})
+        stats, aux = loss if _has_aux(loss) else (loss, Aux(metrics={}))
+        if witness is not None:
+            aux = replace(aux, metrics={**aux.metrics, RECORD: witness.report(marked, step.example_index)})
+        return stats, aux
 
     def reduce_loss(self, stats: Loss) -> tuple[jax.Array, jax.Array]:
         """Return the objective value of summed statistics and whether they have any mass.
