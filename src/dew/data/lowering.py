@@ -34,6 +34,7 @@ import numpy as np
 
 from dew.data.analysis import (
     _LOCAL,
+    _VIEWS,
     _at,
     _cache_manifest,
     _drops,
@@ -441,7 +442,10 @@ def _fill(pipeline: Pipeline, source: Source, at: int, read: Read) -> tuple[Cach
     artifact, prefix = pipeline.stages[at], pipeline.stages[:at]
     if not isinstance(artifact, Artifact):
         raise ValueError(f"stage {at} of {_name(pipeline)} is not a cache")
-    return _filled(artifact), _cache_manifest(source, prefix, read), _Prefix(prefix)
+    # The views of the inputs written before the cache read it (`_Build.indexed`); its fill runs the
+    # record steps alone.
+    steps = tuple(stage for stage in prefix if not isinstance(stage, _VIEWS))
+    return _filled(artifact), _cache_manifest(source, prefix, read), _Prefix(steps)
 
 
 def _token_spans(documents: Iterable[Record], split: TokenSplit) -> list[tuple[int, int, int]]:
@@ -960,9 +964,11 @@ class _Build:
             identifiers = () if present is None else tuple((int(position),) for position in present.positions)
             placed = (single.map_with_index(_Placed(identifiers=identifiers, rows=len(single)))
                       if last > cache else single)
-            return self.shared(placed, pipeline, partition), cache + 1
+            view = self.shared(placed, pipeline, partition)
+            return self.viewed(view, pipeline, partition, cache), cache + 1
         placed = cached.map_with_index(_Placed(rows=len(cached))) if last > cache else cached
         view = self.shared(placed, pipeline, partition)
+        view = self.viewed(view, pipeline, partition, cache)
         flat = gx.FlatMapIterDataset(_as_iter(view, self.loading), _CachedOutputs())
         return Accepted(flat, _name(pipeline), _label(pipeline)), cache + 1
 
@@ -1136,6 +1142,20 @@ class _Build:
                 for start, size in zip(starts, sizes, strict=True)
             )
         return BlockShuffle(rows, sizes, stage.block_shards, stage.seed)
+
+    def viewed(self, rows: Rows, pipeline: Pipeline, partition: DataPartition, cache: int) -> Rows:
+        """`rows`, a cache's inputs, through the views of them written before the cache
+        (`_VIEWS`: shuffles, repeats, slices, takes), where and as the uncached chain applies them:
+        each input's cached outputs follow it, as its record steps would make them after the view."""
+        for at, stage in enumerate(pipeline.stages[:cache]):
+            if isinstance(stage, _VIEWS):
+                viewed = self.stage(rows, stage, pipeline, partition, at)
+                if not isinstance(viewed, pygrain.MapDataset):
+                    raise ValueError(f"{type(stage).__name__} before the cache of {_name(pipeline)} reads "
+                                     "its inputs as a stream, and the cache is read by index: write it "
+                                     "after the cache")
+                rows = viewed
+        return rows
 
     def record_stage(
         self, rows: Rows, stage: Map | RandomMap | MapWithIndex | Filter | FlatMap, pipeline: Pipeline,
