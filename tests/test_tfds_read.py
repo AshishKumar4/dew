@@ -129,3 +129,21 @@ def test_prepared_records_reach_grain_batches_without_split_overlap(workers):
         np.testing.assert_array_equal(row["label"], (row["image"][:, 0, 0, 0] - 10) % 2)
         np.testing.assert_array_equal(
             row["image"], np.broadcast_to(row["image"][:, :1, :1, :1], (4, 8, 8, 3)))
+
+
+def test_an_image_recipe_over_a_split_a_run_mirrors_provisions_it_before_reading(tmp_path, monkeypatch):
+    """An image recipe with a fixed caption over a prepared split a run must mirror first: the run
+    mirrors it (provision=True), choosing the caption's order without reading the split, and trains."""
+    monkeypatch.setenv("XDG_CACHE_HOME", str(tmp_path / "cache"))
+    remote = Store(f"memory://tfds-snapshot-{uuid4().hex}/1.0.0")
+    for path in FIXTURE.iterdir():
+        remote.child(path.name).write(path.read_bytes())
+    recipe = ImageData(TFDS("dew_images", path=remote.url, split="all"), image_size=4, caption="a photo",
+                       augment=None, validation=None)
+    loading = Loading(workers=0, threads=1, read_buffer=1)
+    data = loader(recipe, batch=4, read="indexed", provision=True, loading=loading)
+    reader = data.train(DataPartition())
+    try:
+        assert np.asarray(next(reader)["image"]).shape[0] == 4
+    finally:
+        reader.close()
