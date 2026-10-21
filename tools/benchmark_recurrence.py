@@ -309,6 +309,7 @@ def markdown(rows: list[dict], sha: str) -> list[str]:
         found = {row['arm']: row for row in rows if row['shape'] == name}
         if not found:
             continue
+        shape = dataclasses.replace(shape, length=next(iter(found.values())).get('length', shape.length))
         work = flops(shape)
         cells = []
         for arm in ARMS[shape.kind]:
@@ -359,7 +360,7 @@ def main(argv: list[str] | None = None) -> None:
         else:
             continue
         for row in found:
-            row['time'] = time.time()
+            row.update(time=time.time(), length=shape.length)
             line = json.dumps(row)
             print(line, flush=True)
             if args.out:
