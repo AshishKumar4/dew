@@ -212,4 +212,5 @@ def test_widths_off_the_power_of_two_grid_run_on_the_port_padded():
         return jax.jit(run)
 
     assert_as_exact(routed((dy, dfinal), port=True), routed((dy, dfinal), port=False), draw,
-                    "ssd padded widths", seeds=PADDED_SEEDS, truth_fn=routed(widened((dy, dfinal)), port=False))
+                    "ssd padded widths", seeds=PADDED_SEEDS,
+                    truth_fn=routed(widened((dy, dfinal)), port=False))
