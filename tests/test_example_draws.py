@@ -6,13 +6,14 @@ gives a count of its examples go by place too."""
 import jax
 import jax.numpy as jnp
 import numpy as np
+import optax
 import pytest
 
 from dew.data.dataset import DataPartition
 from dew.diffusion import presets
 from dew.inputs import CharTable, Condition, Field, InputSpec
 from dew.nn.backbones import SimpleDiT
-from dew.objectives.base import EXAMPLE_ROWS, Recorder, Step, example_stream, stream
+from dew.objectives.base import EXAMPLE_ROWS, Aux, Objective, Ratio, Recorder, Step, example_stream, stream
 from dew.objectives.diffusion.few_step import MeanFlowObjective, ShortcutObjective
 from dew.training.distributed import marked
 from dew.training.transaction import example_places
@@ -164,3 +165,45 @@ def test_a_posterior_noise_of_another_shape_is_refused():
         posterior_latent(moments, None, jnp.zeros((2, 4, 4, 8)))
     drawn = posterior_latent(moments, None, jnp.ones((2, 4, 4, 4)))
     np.testing.assert_array_equal(drawn, jnp.ones((2, 4, 4, 4)))
+
+
+class Drawing(Objective):
+    """A loss of one weight against each row's own uniform draw, which a row marked bad makes
+    non-finite in its gradient (as a dynamic loss scale rejects it), each accepted microbatch's draws
+    kept in order in its `stats`."""
+
+    def fresh_variables(self, key, held):
+        return {"params": {"w": jnp.asarray(.2)},
+                "stats": {"drawn": jnp.zeros((4, 2), jnp.float32), "count": jnp.asarray(0)}}
+
+    def loss(self, variables, batch, step):
+        w, stats = variables["params"]["w"], variables["stats"]
+        noise = step.sample("noise", jax.random.uniform, (), dtype=jnp.float32, rows=batch["y"].shape[0])
+        bad = jax.lax.cond(jnp.any(batch["bad"]), lambda x: jnp.sqrt(x - jax.lax.stop_gradient(x)),
+                           lambda x: x * 0, w)
+        loss = Ratio(jnp.sum((w + noise - batch["y"]) ** 2) + bad,
+                     jnp.asarray(batch["y"].shape[0], jnp.float32))
+        kept = {"drawn": stats["drawn"].at[stats["count"]].set(noise), "count": stats["count"] + 1}
+        return loss, Aux({}, variables={"stats": kept})
+
+
+def test_an_input_that_takes_a_rejected_microbatchs_slot_draws_afresh():
+    """A step read in two microbatches whose second a dynamic loss scale rejects leaves that slot to
+    the next input's first, which carries the same rows' columns: it draws under a key that folds in
+    the rejection, so no two accepted microbatches of the update draw alike."""
+    from dew.training import MeshSpec, Trainer
+
+    trainer = Trainer(Drawing(), optax.sgd(.1), key=jax.random.key(4), split=2, dynamic_scale=True,
+                      checkpoints=None, tracker=None)
+    trainer.device_mesh = MeshSpec().build(jax.devices()[:1])
+    state = trainer.initial_state()
+    rejected = {"y": jnp.ones((4,)), "bad": jnp.asarray([False, True, False, True])}
+    clean = {"y": jnp.ones((4,)), "bad": jnp.zeros((4,), bool)}
+    run = trainer.compile(state, rejected)
+    state, *_ = run(state, rejected)
+    assert (int(state.microstep), int(state.updates)) == (1, 0)
+    state, *_ = run(state, clean)
+    assert int(state.updates) == 1
+    drawn = np.asarray(state.variables["stats"]["drawn"])
+    # The update's first microbatch and the one that took the rejected one's slot.
+    assert np.all(drawn[0] != drawn[1])
