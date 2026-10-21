@@ -3,9 +3,10 @@
 A decoder's separate query, key and value projections, and a gated MLP's
 gate and up projections, read the same input; packed into one kernel each,
 a decode step multiplies once where it would three or two times. The model
-names the groups it reads packed (`dew.nn.protocols.Serving`), and
-the loader (`dew.inference.pipeline`) and the server pack those whose stored
-members concatenate, through `inference_projections`.
+names the groups it reads packed (`dew.nn.protocols.Serving`). Every compiled
+generation packs those whose stored members concatenate at the start of its call
+(`served`), so a task's variables stay the canonical tree on every route; a server
+packs its constant weights once (`inference_projections`).
 """
 
 
@@ -144,6 +145,17 @@ def packed_layout(model: nn.Module, variables: Variables) -> tuple[tuple[Project
             for projection in group.members:
                 quantized[projection] = scale
     return groups, shapes
+
+
+def served(model: nn.Module, variables: Variables) -> Variables:
+    """`variables` as one compiled generation reads them: the groups `model` reads packed
+    (`projection_groups`) packed, once per call before its decode loop, out of the per-token step.
+    A task's own `variables` stay the canonical tree on every route, bound in place, so the call
+    always reads the current weights and the packed copy lives only in the call's program; a group
+    already packed (a server's constant weights) stays as it is."""
+    groups = tuple(group for group in projection_groups(model, variables)
+                   if group.packed not in _node(variables, "params", group.path))
+    return pack_projections(variables, groups) if groups else variables
 
 
 def inference_projections(model: nn.Module, variables: Variables) -> Variables:
