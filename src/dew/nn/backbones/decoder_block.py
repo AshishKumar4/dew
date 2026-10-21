@@ -33,7 +33,7 @@ from ..hyper_connections import (
     collapse_by,
     mix_streams,
 )
-from ..inputs import LayerInputs, MixerCall, PredictionPhase, coordinates_of, numbered_blocks
+from ..inputs import LayerInputs, MixerCall, PredictionPhase, routing_blocks
 from ..linear import recomputing
 from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, SparseMLP
 from ..ngpt import NGPT, stepped
@@ -236,6 +236,11 @@ class Mixture:
         `dew.inference.serving.Server` step runs the model before it draws, so
         it serves the exchange; `dispatch='global'` computes the same layer.
         This refusal goes once a jax release carries the fix."""
+        if self.routing_block is not None:
+            return ("block routing chooses each block's experts from every token in it, which a cached "
+                    "decode step, holding one token of its block, cannot: the step's routing would differ "
+                    "from the full forward's. Generate by refining whole sequences (dew.diffusion.discrete) "
+                    "or route without blocks")
         if self.dispatch != 'exchange':
             return None
         return ("generation cannot run dispatch='exchange' until jax fixes jax-ml/jax#40907: checkify, "
@@ -582,7 +587,6 @@ class DecoderBlock(nn.Module):
     residual_site: ResidualSite | None = None  # Kimi K3's place in the depth mixture
     routed: bool = False  # the feed-forward, or the parallel branch, routes over experts
     media_routed: bool = False  # the feed-forward routes a media span by its own bias
-    routing_block: int | None = None  # the feed-forward routes blocks of this many places together
     engram: Callable[..., nn.Module] | None = None  # the layer's EngramLayer factory
     engram_index: int | None = None
     prediction_target: bool = False  # records its streams' mean for DSpark
@@ -1048,12 +1052,11 @@ class DecoderBlock(nn.Module):
     def _feedforward_inputs(self, attention_metadata, shape: tuple[int, ...]) -> dict:
         """The token ids for a hash-routed feed-forward, the media mask, when
         the call has one, for one that routes a media span apart, each token's
-        block (`numbered_blocks`, over the call's `shape[:2]`) for one that
+        block (`routing_blocks`, over the call's `shape[:2]`) for one that
         routes blocks together, nothing for the rest."""
-        if self.routing_block is not None:
-            batch, length = shape[:2]
-            tokens = coordinates_of(attention_metadata, batch, length)
-            return {"blocks": numbered_blocks(tokens, (batch, length), self.routing_block)}
+        blocked = routing_blocks(self.mlp, attention_metadata, shape)
+        if blocked:
+            return blocked
         if self.media_routed:
             media = None if attention_metadata is None else attention_metadata.media
             return {} if media is None else {"media": media}

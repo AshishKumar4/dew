@@ -393,14 +393,16 @@ class Router(nn.Module):
         """True where an expert is one of the `experts` best of its token's block: each block's score
         for an expert is its best token's selection score (the release's `block_routing`). `blocks`
         `[..., S]` numbers each row's blocks from 0 (`numbered_blocks`); a padding token, numbered -1,
-        is a block of its own beside them, so it moves no real block's score."""
+        is a block of its own beside them, so it moves no real block's score. A row holds at most as
+        many blocks as tokens, so its blocks' scores take the selection's own size, and each block's
+        shortlist is written by index, never as a one-hot of its experts."""
         *rows, length, count = selection.shape
 
         def row(scores, ids):
             ids = jnp.where(ids < 0, length, ids)
             best = jax.ops.segment_max(scores, ids, num_segments=length + 1)
             _, allowed = jax.lax.top_k(best, experts)
-            kept = jnp.sum(jax.nn.one_hot(allowed, count, dtype=jnp.int32), axis=-2) > 0
+            kept = jnp.zeros((length + 1, count), bool).at[jnp.arange(length + 1)[:, None], allowed].set(True)
             return kept[ids]
 
         flat = jax.vmap(row)(selection.reshape(-1, length, count),
