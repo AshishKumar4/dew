@@ -11,7 +11,7 @@ import threading
 import time
 import uuid
 import weakref
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor, wait
 from contextlib import ExitStack
 from dataclasses import dataclass, field
@@ -162,17 +162,20 @@ class Cache:
         *,
         transform: Transform | None = None,
         source: Source | None = None,
+        missing: Sequence[int] = (),
     ) -> _Mapped:
         """The cached rows of `parent`, a source's records by index: a published
         generation's, or filled as they are read. A fill that completes every
-        input publishes the generation of `source`, the source they are."""
+        input publishes the generation of `source`, the source they are. The
+        inputs `missing` that a read skips (a store's absent records) are written
+        as a fill starts, so it can complete without reading them."""
         self._root(key)
         if transform is not None and _volatile(transform):
             return _Mapped(parent.map_with_index(_Passthrough(transform)))
         published = self.generation(key)
         if published is not None:
             return _Mapped(grain.MapDataset.range(len(parent)).map(_Published(published, transform)))
-        return _CachedMap(parent, self, key, transform, source)
+        return _CachedMap(parent, self, key, transform, source, tuple(missing))
 
     def streamed(
         self,
@@ -663,10 +666,12 @@ class _CachedMap(_Mapped):
         key: DependencyManifest,
         transform: Transform | None,
         source: Source | None,
+        missing: tuple[int, ...] = (),
     ):
         super().__init__(parent)
         # Not `source`, which names MapDataset's own constructor.
         self.cache, self.key, self.transform, self.filled = cache, key, transform, source
+        self.missing = missing
         self.writer_lock = threading.RLock()
 
     @property
@@ -683,6 +688,10 @@ class _CachedMap(_Mapped):
         return self.writer.process(
             index % len(self), index % len(self), self.input_parent[index], self.transform
         )
+
+    def start(self) -> None:
+        for position in self.missing:
+            self.record(position)
 
     def close(self) -> None:
         if "_writer" in self.__dict__:

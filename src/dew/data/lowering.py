@@ -44,7 +44,7 @@ from dew.data.analysis import (
     _name,
     _until,
 )
-from dew.data.cache import _CachedMap, _Mapped
+from dew.data.cache import _Mapped
 from dew.data.concurrent import Concurrently
 from dew.data.dataset import (
     SHARED_BYTES,
@@ -491,10 +491,11 @@ def _as_iter(rows: Rows, loading: Loading) -> pygrain.IterDataset:
     return _Filled(iterated, fills) if fills else iterated
 
 
-def _fills(rows: Rows) -> tuple[_Mapped | _Single, ...]:
+def _fills(rows: Rows) -> tuple[_Mapped, ...]:
     """The cache reads among `rows` and the datasets they read, each once: the fills an iterator
-    of them starts, finishes when it runs out and closes with it."""
-    found: dict[int, _Mapped | _Single] = {}
+    of them starts, finishes when it runs out and closes with it. A cache's own parents are the
+    records it reads, which hold none."""
+    found: dict[int, _Mapped] = {}
     pending: list[pygrain.MapDataset | pygrain.IterDataset] = [rows]
     seen: set[int] = set()
     while pending:
@@ -502,8 +503,9 @@ def _fills(rows: Rows) -> tuple[_Mapped | _Single, ...]:
         if id(dataset) in seen:
             continue
         seen.add(id(dataset))
-        if isinstance(dataset, (_Mapped, _Single)):
+        if isinstance(dataset, _Mapped):
             found[id(dataset)] = dataset
+            continue
         pending.extend(dataset.parents)
     return tuple(found.values())
 
@@ -525,7 +527,7 @@ class _Filled(pygrain.IterDataset):
     """An iterator of indexed rows that owns the cache fills they read: it starts them, finishes
     them when it runs out, so a fill that read every input publishes, and closes them with it."""
 
-    def __init__(self, parent: pygrain.IterDataset, fills: tuple[_Mapped | _Single, ...]):
+    def __init__(self, parent: pygrain.IterDataset, fills: tuple[_Mapped, ...]):
         super().__init__(parent)
         self._rows, self._fills = parent, fills
 
@@ -536,7 +538,7 @@ class _Filled(pygrain.IterDataset):
 
 
 class _FilledIterator(pygrain.DatasetIterator):
-    def __init__(self, parent: pygrain.DatasetIterator, fills: tuple[_Mapped | _Single, ...]):
+    def __init__(self, parent: pygrain.DatasetIterator, fills: tuple[_Mapped, ...]):
         super().__init__(parent)
         self._rows, self._fills = parent, fills
 
@@ -563,15 +565,12 @@ class _FilledIterator(pygrain.DatasetIterator):
 class _Single(pygrain.MapDataset):
     """A cache that holds one record for each input, read as the source's rows are: by index, at
     `positions` (the inputs a store holds, those it misses skipped, as an uncached read skips
-    them), each the one output its completion holds. An iterator of it first writes each missing
-    input's completion (`Rejected("missing")`), so the fill it reads covers every input."""
+    them), each the one output its completion holds. The cache writes the missing inputs'
+    completions itself as its fill starts (`Cache.mapped(missing=)`)."""
 
     def __init__(self, cached: _Mapped, positions: np.ndarray | None):
         super().__init__(cached)
         self._cached, self._positions = cached, positions
-        # The inputs the store misses, found once: a fill writes their completions as it starts.
-        self._missing = (np.setdiff1d(np.arange(len(cached)), positions) if positions is not None
-                         and isinstance(cached, _CachedMap) else np.empty(0, np.int64))
 
     def __len__(self) -> int:
         return len(self._cached) if self._positions is None else len(self._positions)
@@ -588,16 +587,6 @@ class _Single(pygrain.MapDataset):
         position = index if self._positions is None else int(self._positions[index % len(self)])
         outputs = self._cached[position]
         return outputs[0] if isinstance(outputs, tuple) else outputs
-
-    def start(self) -> None:
-        for position in self._missing.tolist():
-            self._cached[position]
-
-    def finish(self) -> None:
-        pass
-
-    def close(self) -> None:
-        pass
 
 
 def _packed(documents: pygrain.IterDataset, stage: Pack) -> pygrain.IterDataset:
@@ -927,11 +916,13 @@ class _Build:
             records = keyed.records(self.read)
             stored = pygrain.MapDataset.source(records)
         filled, manifest, prefix = _fill(pipeline, keyed, cache, self.read)
-        cached = filled.mapped(stored, manifest, transform=prefix, source=keyed)
         if self.lowering.one_to_one:
             # One record for each input: read as the source's own rows, by index and in the
-            # uncached chain's order, its missing inputs skipped as there.
+            # uncached chain's order, its missing inputs skipped as there and written by the fill.
             present = _Present.of(records) if _in_memory(keyed) else None
+            missing = (() if present is None
+                       else np.setdiff1d(np.arange(len(stored)), present.positions).tolist())
+            cached = filled.mapped(stored, manifest, transform=prefix, source=keyed, missing=missing)
             single = _Single(cached, None if present is None else present.positions)
             identifiers = source.identifiers if isinstance(source, _Materialized) else ()
             if present is not None:
@@ -940,6 +931,7 @@ class _Build:
                       if last > cache else single)
             view = self.shared(placed, pipeline, partition)
             return self.viewed(view, pipeline, partition, cache), cache + 1
+        cached = filled.mapped(stored, manifest, transform=prefix, source=keyed)
         placed = cached.map_with_index(_Placed(rows=len(cached))) if last > cache else cached
         view = self.shared(placed, pipeline, partition)
         view = self.viewed(view, pipeline, partition, cache)
