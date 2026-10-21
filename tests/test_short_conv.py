@@ -26,6 +26,9 @@ from dew.nn.linear import causal_conv1d, conv_refusal, xla_conv1d
 pytestmark = pytest.mark.kernel
 
 DELTA = ((32, 16), (32, 16), (32, None))
+SHARDED_SEEDS = 8
+"""The per-shard contract's declared draws (check 1, `sharded.assert_runs_per_shard`), sized by
+`seeds_for`: the fewest for which one device compared with itself resolves the factor."""
 """A delta rule's queries, keys and values on two 16-wide heads: the keys and queries normalised."""
 
 
@@ -366,21 +369,24 @@ def test_the_kernels_are_as_exact_as_xla_at_the_training_shapes(model, dtype, pa
 def test_the_conv_keeps_the_kernel_contract_on_a_mesh_that_splits_rows(axis):
     """`causal_conv1d` over rows split two ways, as data or fsdp parallelism splits them, runs per shard
     (`sharded.assert_runs_per_shard`): its pieces, the l2-normalised queries and keys of a delta rule
-    over padded rows of packed documents, and the gradients of the input, the taps and the bias within
-    the float64 gate of one device's, and no operand moved between devices. On a GPU each shard is the
-    fused kernel."""
+    over padded rows of packed documents, and the gradients of the input, the taps and the bias on par
+    with one device's over the site's draws, and no operand moved between devices. On a GPU each shard
+    is the fused kernel."""
     from jax.sharding import Mesh, PartitionSpec
     from sharded import assert_runs_per_shard
 
-    x, weights, shift, valid = operands(4, 48, DELTA, dtype=jnp.float32, bias=True, valid=True)
-    segments = documents(4, 48)
-    grads = cotangents(x, DELTA, jnp.float32)
+    def draw(seed):
+        x, weights, shift, valid = operands(4, 48, DELTA, dtype=jnp.float32, bias=True, valid=True, seed=seed)
+        return (x, weights, shift, valid, documents(4, 48, seed=seed + 2),
+                *cotangents(x, DELTA, jnp.float32, seed=seed + 1))
 
     def gradients(x, weights, shift, valid, segments, *grads):
         return run(causal_conv1d, x, weights, shift, valid, DELTA, jnp.float32, grads, segments=segments)
 
-    expected = jax.tree.map(np.asarray, truth(x, weights, shift, valid, DELTA, grads, segments=segments))
+    def exact(x, weights, shift, valid, segments, *grads):
+        return truth(x, weights, shift, valid, DELTA, grads, segments=segments)
+
     mesh = Mesh(np.asarray(jax.devices()[:2]), (axis,))
     rows, whole = PartitionSpec(axis), PartitionSpec()
-    assert_runs_per_shard(gradients, (x, weights, shift, valid, segments, *grads),
-                          [rows, whole, whole, rows, rows, rows, rows, rows], mesh, expected)
+    assert_runs_per_shard(gradients, draw, [rows, whole, whole, rows, rows, rows, rows, rows], mesh,
+                          f"conv split over {axis}", seeds=SHARDED_SEEDS, truth_fn=exact)

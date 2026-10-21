@@ -33,6 +33,11 @@ def row_names_port(*, port: bool = True):
     return generation.chosen(ssd="pallas" if port else "xla")
 
 
+SHARDED_SEEDS = 8
+"""The per-shard contract's declared draws (check 1, `sharded.assert_runs_per_shard`), sized by
+`seeds_for`: the fewest for which one device compared with itself resolves the factor."""
+
+
 def scan_operands(batch, length, heads, width, groups, state, *, documents: bool, seed: int = 0):
     """`chunk_ssd`'s operands as Mamba-2 hands them over, fp32: the step through softplus, A from
     -1 to -16 (the S4D init's span), an initial state, and with `documents` packed documents'
@@ -163,8 +168,8 @@ def test_a_mamba2_layer_on_the_port_matches_it_on_xla(dtype, bound):
 @pytest.mark.parametrize("axis, split", [("data", (0,)), ("tensor", (2,))])
 def test_the_port_keeps_the_kernel_contract_on_a_mesh(axis, split):
     """`chunk_ssd` on the port over rows split two ways, or heads split two ways with the groups they
-    read, runs per shard (`assert_runs_per_shard`): its output, final state and gradients within the
-    float64 gate of one device's, and no operand moved between devices."""
+    read, runs per shard (`assert_runs_per_shard`): its output, final state and gradients on par with
+    one device's over the site's draws, and no operand moved between devices."""
     from jax.sharding import Mesh, PartitionSpec
 
     operands, starts = scan_operands(2, 80, 4, 16, 2, 16, documents=True)
@@ -172,8 +177,12 @@ def test_the_port_keeps_the_kernel_contract_on_a_mesh(axis, split):
     dy = jax.random.normal(keys[0], operands[0].shape)
     dfinal = jax.random.normal(keys[1], operands[6].shape)
     run = through(32, starts, dy, dfinal)
-    with jax.enable_x64(new_val=True):
-        truth = jax.tree.map(np.asarray, jax.jit(run)(*widened(operands)))
+
+    def draw(seed):
+        return scan_operands(2, 80, 4, 16, 2, 16, documents=True, seed=seed)[0]
+
+    def exact(*operands):
+        return jax.jit(through(32, starts, *widened((dy, dfinal))))(*operands)
 
     def spec(rank: int, axes: tuple[int, ...]):
         return PartitionSpec(*(axis if dim in axes else None for dim in range(rank)))
@@ -185,4 +194,5 @@ def test_the_port_keeps_the_kernel_contract_on_a_mesh(axis, split):
              spec(4, rows + ((1,) if heads else ()))]
     mesh = Mesh(np.asarray(jax.devices()[:2]), (axis,))
     with row_names_port():
-        assert_runs_per_shard(run, operands, specs, mesh, truth)
+        assert_runs_per_shard(run, draw, specs, mesh, f"ssd split over {axis}", seeds=SHARDED_SEEDS,
+                              truth_fn=exact)
