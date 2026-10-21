@@ -18,7 +18,7 @@ from dew.diffusion.process import Process
 from dew.diffusion.schedules.discrete import DiscreteNoiseScheduler
 from dew.diffusion.schedules.flow import FlowMatchingScheduler
 from dew.diffusion.schedules.karras import EDMNoiseScheduler
-from dew.diffusion.schedules.source_grids import empirical_mu as empirical_mu, published_betas, sampling_grid
+from dew.diffusion.schedules.source_grids import sampling_grid
 from dew.diffusion.schedules.source_policy import Origin as Origin, SourcePolicy, resolve_config
 from dew.diffusion.transforms import PredictionTransform
 from dew.sampling.solvers import Solver
@@ -121,4 +121,4 @@ class SourceGrid:
         return self.schedule.sampling(steps, tokens=self.tokens, origin=self.origin)
 
 
-__all__ = ["SourceGrid", "SourceSchedule", "published_betas"]
+__all__ = ["SourceGrid", "SourceSchedule"]
