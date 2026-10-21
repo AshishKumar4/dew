@@ -29,8 +29,9 @@ def tokens(rng, length=12, rows=2):
     return jax.random.randint(rng, (rows, length), 0, VOCAB)
 
 
-SEEDS = {'decode': 8, 'scanned': 8, 'checkpointed': 8, 'block decode': 8}
-"""Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada)."""
+SEEDS = {'decode': 64, 'scanned': 64, 'checkpointed': 256, 'block decode': 32}
+"""Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada, 2026-10-21):
+the most any of a site's cases took."""
 
 
 def drawn(model, length=12, rows=2):
