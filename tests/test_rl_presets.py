@@ -143,12 +143,14 @@ def test_the_prompts_preset_prepares_what_the_prompt_recipe_does_measuring_its_r
     rows = _prompts(12)
     recipe = PromptData(rows, "byte", max_prompt_len=8, long="drop")
     expected = loader(recipe, batch=2, read="memory", loading=LOADING)
-    measured = rows.shuffle(0).repeat().pipe(presets.prompts, "byte", max_prompt_len=8, batch=2, long="drop")
+    # A rendering that drops prompts reads in a window's order, as the recipe does.
+    measured = rows.shuffle(0, window=64).repeat().pipe(presets.prompts, "byte", max_prompt_len=8, batch=2,
+                                                         long="drop")
     built = compile(measured, read="memory", loading=LOADING)
     same_batches(expected, built, 3)
     assert _widths(built, 3) == {12}
-    given = rows.shuffle(0).repeat().pipe(presets.prompts, "byte", max_prompt_len=8, batch=2, long="drop",
-                                          reward_bytes=12)
+    given = rows.shuffle(0, window=64).repeat().pipe(presets.prompts, "byte", max_prompt_len=8, batch=2,
+                                                      long="drop", reward_bytes=12)
     same_batches(built, compile(given, read="memory", loading=LOADING), 3)
 
 

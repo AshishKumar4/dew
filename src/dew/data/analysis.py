@@ -171,7 +171,8 @@ def _prefix_manifest(source: Source, prefix: Sequence[Stage], read: Read) -> Man
     consumed = _consumed(source, read)
     pipeline = Pipeline(consumed, tuple(prefix))
     if any(isinstance(stage, Configured) for stage in prefix):
-        pipeline = _configured(pipeline, _stated(consumed, read, _measures(prefix))[1], read)
+        stated = _stated(consumed, read, _measures(prefix))[1]
+        pipeline = _configured(pipeline, stated, read, stated=stated)
     return _cache_manifest(consumed, pipeline.stages, read)
 
 
@@ -495,14 +496,19 @@ def _configured(
     shared: Mapping[str, object],
     read: Read,
     scope: Literal["source", "run"] | None = None,
+    *,
+    stated: Mapping[str, object] | None = None,
 ) -> Pipeline:
+    """`pipeline` with its configured steps bound: a source-scoped one to the facts its source
+    states, or `stated` (what `_stated` reads of it, measured facts included), a run-scoped one to
+    the run's (`shared`)."""
     source = pipeline.source
     if isinstance(source, (Mixture, Phases)):
         children = tuple(_configured(child, shared, read, scope) for child in source.pipelines)
         source = dataclasses.replace(source, pipelines=children)
         local = shared
     else:
-        local = source.metadata()
+        local = source.metadata() if stated is None else stated
     stages: list[Stage] = []
     for stage in pipeline.stages:
         if not isinstance(stage, Configured) or (scope is not None and stage.scope != scope):
