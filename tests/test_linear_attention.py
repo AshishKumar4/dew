@@ -41,9 +41,15 @@ from model_support import decode_through
 from reference_error import assert_as_exact_as_the_reference, assert_leaves_as_exact, float64_terms, widened
 from tuned import each_config, launches, timed
 
-from dew.nn import linear
 from dew.nn.inputs import AttentionMetadata, MixerCall, coordinates
 from dew.nn.kernels import tuning
+from dew.nn.kernels.recurrence_chunk import (
+    chunk_decay,
+    chunk_delta_rule,
+    chunk_gated_delta_rule,
+    fla_rule,
+    strictly_lower_inverse,
+)
 from dew.nn.linear import (
     GatedDeltaNet,
     _masked_conv1d,
@@ -51,13 +57,6 @@ from dew.nn.linear import (
     held_conv1d,
     l2norm,
     recurrent_gated_delta_rule,
-)
-from dew.nn.kernels.recurrence_chunk import (
-    chunk_decay,
-    chunk_delta_rule,
-    chunk_gated_delta_rule,
-    fla_rule,
-    strictly_lower_inverse,
 )
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "linear_attention"

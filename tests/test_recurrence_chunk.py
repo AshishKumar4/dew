@@ -34,17 +34,23 @@ FORMED = [
     recurrence.Hooks(decay='scalar', scale=KEY_WIDTH ** -0.5,
                      output=recurrence.OutputNorm(1e-5, 'sigmoid')),
     recurrence.Hooks(decay='scalar', rated=True, delta=False, skip=True),
+    recurrence.Hooks(decay='scalar', rated=True, delta=False, skip=True, output=recurrence.OutputNorm(1e-5)),
+    recurrence.Hooks(decay='scalar', rated=True, l2norm=True),
+    recurrence.Hooks(decay='vector', delta=False, write_gate=True, skip=True,
+                     output=recurrence.OutputNorm(1e-6, 'sigmoid')),
+    recurrence.Hooks(decay='scalar', delta=False),
 ]
 """The prologue's and epilogue's hooks: the gated delta rule's gates and l2 norm, Mamba2's step gates
-clipped with the skip, the gated RMS norm after the l2 norm and after a plain scale, and Mamba2's SSD
-as `chunk_ssd` hands it over (a rated decay, the step its write gate)."""
+clipped with the skip, the gated RMS norm after the l2 norm and after a plain scale, Mamba2's SSD as
+`chunk_ssd` hands it over (a rated decay, the step its write gate), with its gated norm, a rated decay
+under the delta rule and the l2 norm, the norm after the skip, and a decay without any write gate."""
 
 PACKED = (False, True)
 """A row of one sequence, and of packed documents."""
 
 SEEDS = dict(zip(((hooks, packed) for hooks in HOOKS + FORMED for packed in PACKED), (
     8, 8, 8, 8, 8, 8, 8, 8, 16, 16, 64, 64, 16, 16, 16, 16, 32, 32, 64, 64, 8, 8, 8, 8,
-    128, 64, 128, 128, 32, 32, 16, 16, 64, 64), strict=True))
+    128, 64, 128, 128, 32, 32, 16, 16, 64, 64, 8, 8, 8, 8, 8, 8, 8, 8), strict=True))
 """Each site's declared seeds (hooks in `HOOKS` then `FORMED` order, one sequence then packed), sized
 independently by `seeds_for` on armada (2026-10-21). The vector-decay delta rule's sites take 32 where
 their control resolved at 8: the chunked form's own spread left the pooled ratio inconclusive over 8
@@ -54,8 +60,9 @@ seeds (1.315, [1.046, 1.702]; under the l2 norm and output norm 1.317, [1.050, 1
 def draw(hooks: recurrence.Hooks, packed: bool, seed: int) -> tuple[Chunk]:
     """A sequence's operands for `hooks` from `seed`, its keys' and values' dimensions each permuted
     by an order the seed draws (an exact symmetry of every head's recurrence): fresh queries, keys
-    and values, a log decay a head or a key dimension in (-1, 0), a gate in (0, 1), a skip, and with
-    `packed` documents starting at tokens 0, 23 and 40 of the first row and 9 of the second."""
+    and values, a log decay a head or a key dimension in (-1, 0), a gate in (0, 1), a skip, a memory
+    entering, and with `packed` documents starting at tokens 0, 23 and 40 of the first row and 9 and
+    48 of the second, 48 a chunk's first token."""
     keys = jax.random.split(jax.random.key(seed), 8)
     rng = np.random.default_rng(seed)
     key_order, value_order = rng.permutation(KEY_WIDTH), rng.permutation(VALUE_WIDTH)
@@ -89,14 +96,18 @@ def draw(hooks: recurrence.Hooks, packed: bool, seed: int) -> tuple[Chunk]:
     value = jnp.take(value, value_order, axis=-1)
     if hooks.decay == 'vector':
         log_decay = jnp.take(log_decay, key_order, axis=-1)
+    state = 0.3 * jax.random.normal(jax.random.fold_in(jax.random.key(seed), 8),
+                                    (ROWS, VALUE_HEADS, KEY_WIDTH, VALUE_WIDTH))
+    state = jnp.take(jnp.take(state, key_order, axis=2), value_order, axis=3)
     starts = None
     if packed:
-        starts = jnp.zeros((ROWS, LENGTH), bool).at[0, jnp.array([0, 23, 40])].set(True).at[1, 9].set(True)
+        starts = (jnp.zeros((ROWS, LENGTH), bool).at[0, jnp.array([0, 23, 40])].set(True)
+                  .at[1, jnp.array([9, 48])].set(True))
     reads_beta = hooks.gated_write if hooks.gates is None else hooks.gates.write == 'sigmoid'
     plain = hooks.decay != 'none' and hooks.gates is None and not hooks.rated
     return (Chunk(query, key, value, log_decay=log_decay if plain else None,
-                  beta=beta if reads_beta else None, skip=skip if hooks.skip else None, starts=starts,
-                  **gates, **epilogue),)
+                  beta=beta if reads_beta else None, skip=skip if hooks.skip else None, state=state,
+                  starts=starts, **gates, **epilogue),)
 
 
 def token_by_token(hooks: recurrence.Hooks, operands: Chunk):
@@ -105,7 +116,7 @@ def token_by_token(hooks: recurrence.Hooks, operands: Chunk):
     group = VALUE_HEADS // KEY_HEADS
     query, key = (jnp.repeat(x, group, axis=2) for x in (operands.query, operands.key))
     work = jnp.promote_types(operands.value.dtype, jnp.float32)
-    state = jnp.zeros((ROWS, VALUE_HEADS, KEY_WIDTH, VALUE_WIDTH), work)
+    state = operands.state.astype(work)
     starts = jnp.zeros((ROWS, LENGTH), bool) if operands.starts is None else operands.starts
 
     def one_token(state, t):
@@ -137,21 +148,41 @@ def test_the_chunked_op_is_as_exact_as_the_recurrence_token_by_token(hooks, pack
                     seeds=SEEDS[hooks, packed])
 
 
-def test_the_output_rounds_once_after_the_epilogue():
+@pytest.mark.parametrize('hooks', [
+    recurrence.Hooks(decay='none', delta=False, write_gate=True, skip=True),
+    recurrence.Hooks(decay='scalar', scale=0.1, skip=True),
+    recurrence.Hooks(decay='scalar', scale=0.1, skip=True, output=recurrence.OutputNorm(1e-6)),
+], ids=str)
+@pytest.mark.parametrize('ported', [False, True], ids=['portable', 'port'])
+def test_the_output_rounds_once_after_the_epilogue(hooks, ported):
     """The chunked op rounds its output once, after the skip and the norm, as the decode step's reference
-    does: a bf16 token whose readout `0.1` the skip `-0.10009765625` nearly cancels leaves the residual
-    the reference leaves, where a readout rounded first cancels to zero; an explicit `dtype` holds with
-    and without an epilogue, and bf16 operands under the l2 norm come back in bf16."""
-    ones = jnp.ones((1, 1, 1, 8), jnp.bfloat16)
-    hooks = recurrence.Hooks(decay='none', delta=False, write_gate=True, skip=True)
-    operands = Chunk(ones, ones, ones, beta=jnp.full((1, 1, 1), 0.1, jnp.float32),
-                     skip=jnp.full((1,), -0.10009765625, jnp.float32))
-    found, _ = chunk(hooks, operands, ported=False, dtype=jnp.float32)
+    does, on the portable math and on the port (the delta rule with a decay, its kernels interpreted off
+    a GPU): a bf16 token whose readout `0.1` (a unit query and key, the write gate or the scale 0.1)
+    the skip `-0.10009765625` nearly cancels leaves the reference's residual, and the norm reads it,
+    where a readout rounded to bf16 first cancels to zero."""
+    if ported and not hooks.delta:
+        pytest.skip("the port runs the delta rule with a decay")
+    unit = jnp.zeros((1, 1, 1, 8), jnp.bfloat16).at[..., 0].set(1.0)
+    beta = jnp.full((1, 1, 1), 1.0 if hooks.delta else 0.1, jnp.float32)
+    operands = Chunk(unit, unit, jnp.ones((1, 1, 1, 8), jnp.bfloat16),
+                     log_decay=jnp.zeros((1, 1, 1)) if hooks.decay != 'none' else None, beta=beta,
+                     skip=jnp.full((1,), -0.10009765625, jnp.float32),
+                     z=jnp.ones((1, 1, 1, 8)) if hooks.output else None,
+                     weight=jnp.ones((8,)) if hooks.output else None)
+    found, _ = chunk(hooks, operands, ported=ported, dtype=jnp.float32)
     want, _, _ = recurrence.step_reference(hooks, recurrence.Step(
-        jnp.zeros((1, 1, 8, 8), jnp.float32), query=ones[:, 0], key=ones[:, 0], value=ones[:, 0],
-        beta=operands.beta[:, 0], skip=operands.skip), dtype=jnp.float32)
+        jnp.zeros((1, 1, 8, 8), jnp.float32), query=unit[:, 0], key=unit[:, 0], value=operands.value[:, 0],
+        log_decay=None if operands.log_decay is None else operands.log_decay[:, 0], beta=beta[:, 0],
+        skip=operands.skip, z=None if operands.z is None else operands.z[:, 0], weight=operands.weight),
+        dtype=jnp.float32)
     np.testing.assert_array_equal(np.asarray(found[:, 0]), np.asarray(want))
     assert np.all(np.asarray(found) != 0.0)
+
+
+def test_the_output_takes_the_dtype_asked_for():
+    """An explicit `dtype` holds with and without an epilogue, and bf16 operands under the l2 norm, which
+    widens them, come back in bf16."""
+    ones = jnp.ones((1, 1, 1, 8), jnp.bfloat16)
     plain = recurrence.Hooks(decay='scalar', scale=0.25)
     wide = Chunk(*(x.astype(jnp.float32) for x in (ones, ones, ones)), log_decay=jnp.zeros((1, 1, 1)),
                  beta=jnp.ones((1, 1, 1)))
@@ -188,3 +219,14 @@ def test_a_rated_decay_is_its_log_decay_bit_for_bit():
                  chunk_size=CHUNK, ported=False)
     for mine, theirs in zip(found, want, strict=True):
         np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs))
+
+
+def test_the_operands_are_checked_as_the_decode_steps():
+    """A hook's missing operand is named, and a decay of the other kind's rank refused, rather than read
+    as another computation."""
+    ones = jnp.ones((1, 4, 1, 8))
+    with pytest.raises(ValueError, match='beta'):
+        chunk(recurrence.Hooks(decay='scalar'), Chunk(ones, ones, ones, log_decay=jnp.zeros((1, 4, 1))))
+    with pytest.raises(ValueError, match='vector decay'):
+        chunk(recurrence.Hooks(decay='vector'), Chunk(ones, ones, ones, log_decay=jnp.zeros((1, 4, 1)),
+                                                      beta=jnp.ones((1, 4, 1))))

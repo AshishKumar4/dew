@@ -14,22 +14,19 @@ chunk the output is the "attention" `(C B^T * L) x` with
 `L[i, j] = exp(sum_{j<k<=i} dt_k A)`, and the chunk's state crosses to the
 next through one decayed rank-N write.
 
-dew computes transformers 5.16.1's `mamba2_chunk_scan`
-(modeling_mamba2.py:254-357) in the same order: `segment_sum` as its masked
-cumulative sum (73-90), the intra-chunk `Y_diag`, the per-chunk states, the
-inter-chunk recurrence (as a scan over the chunks where the reference
-materialises the `[NC+1, NC+1]` decay matrix; the two are the same
-products) and `Y_off`, the `D` skip added in fp32, and the whole scan in
-fp32 as the reference casts its operands. The decode step is `mamba2_selective_state_update`
-(192-251). Both live here beside their gated-delta-rule counterparts'
-shapes so tests/test_mamba2.py can hold them to the reference's numbers.
+dew computes transformers 5.16.1's `mamba2_chunk_scan` (modeling_mamba2.py:254-357)
+as the recurrence template's chunked op (`chunk_ssd`, `recurrence_chunk.chunk`): no
+delta rule, a rated decay `A dt`, the `D` skip added in fp32, and the whole scan
+in at least fp32 as the reference casts its operands. The decode step is
+`mamba2_selective_state_update` (192-251, `recurrent_ssd`). tests/test_mamba2.py
+holds both to the reference's numbers.
 
 On a GPU whose target row names it the chunked scan is mamba_ssm's own
 kernels (`dew.nn.kernels.mamba_ssd`, `recurrence_chunk.ssd_port_refusal` names where not),
 which multiply `x`, `B` and `C` in their own dtype into fp32 sums as
-mamba_ssm does; elsewhere the scan over the chunks is `xla_chunk_scan`, the
-oracle, or on a TPU whose tiling covers the geometry `dew.nn.kernels.ssd`'s
-Pallas kernel, chosen at trace time. Decoding stays on the recurrent form
+mamba_ssm does; on a TPU whose tiling covers the geometry `dew.nn.kernels.ssd`'s
+Pallas kernel; elsewhere the template's portable math, chosen at trace time.
+Decoding stays on the recurrent form
 either way. The conv sums in at least fp32 and hands the scan its output in
 the model's compute dtype, as mamba_ssm's `causal_conv1d_fn` hands its scan
 (`mamba_split_conv1d_scan_combined`); the step, the decay and the states
@@ -87,74 +84,6 @@ CHUNK_SIZE = 256
 """The reference's default `chunk_size` (configuration_mamba2.py). The
 chunked and the recurrent form agree at any size."""
 
-def segment_sum(x):
-    """`segment_sum` (modeling_mamba2.py:73-90): over the last axis of `x`,
-    `out[..., i, j] = sum_{j < k <= i} x[..., k]` on and below the diagonal,
-    `-inf` above, as the reference's masked cumulative sum rather than a
-    difference of cumulative sums, so exp of it is the same numbers."""
-    size = x.shape[-1]
-    strict = jnp.tril(jnp.ones((size, size), jnp.bool_), -1)
-    expanded = jnp.where(strict, jnp.broadcast_to(x[..., :, None], (*x.shape, size)), 0.0)
-    summed = jnp.cumsum(expanded, axis=-2)
-    inclusive = jnp.tril(jnp.ones((size, size), jnp.bool_))
-    return jnp.where(inclusive, summed, -jnp.inf)
-
-
-def _chunk_writes(x_c, B_c, a_c):
-    """Each chunk's own write into the state, decayed to the chunk's end:
-    `sum_j exp(sum_{j<k<C} a_k) x_j B_j^T`, `[NC, B, H, P, N]`.
-
-    The decay from step j to the chunk's end is the suffix sum after j, a
-    reverse cumulative sum shifted by one, where the reference takes the
-    difference `acs_C-1 - acs_j` of two prefix sums. The two are the same
-    number in exact arithmetic; the suffix sum never subtracts, which is
-    what keeps a document reset exact (`RESET_DECAY`): a reset before j sits
-    in both prefix sums, and their difference would lose every digit below
-    its magnitude."""
-    suffix = jax.lax.cumsum(a_c, axis=a_c.ndim - 1, reverse=True)
-    to_end = jnp.exp(jnp.pad(suffix[..., 1:], [(0, 0)] * (a_c.ndim - 1) + [(0, 1)]))
-    return jnp.einsum('nbjhs,nbhj,nbjhp->nbhps', B_c, to_end, x_c)
-
-
-def _carry(previous, step):
-    """One chunk (or one shard) across the state: decay what entered by the
-    span's total log decay and add the span's own write."""
-    writes, log_decay = step
-    return jnp.exp(log_decay)[..., None, None] * previous + writes, previous
-
-
-def xla_chunk_scan(x, B, C, a, carried, chunk_size: int):
-    """The scan over chunks in plain XLA, the oracle and the fallback for
-    `dew.nn.kernels.ssd`, on the operands as `chunk_ssd` hands either: `x`
-    `[B, T, H, P]` already scaled by `dt`, `B` and `C` `[B, T, H, N]` with the
-    groups expanded, `a` `[B, T, H]` the per-step `A dt`, the length whole
-    chunks of `chunk_size`, and `carried` `[B, H, P, N]` the state entering the
-    sequence; returns the output `[B, T, H, P]` and the state leaving it. The
-    chunks lead its own einsums."""
-    batch, total, heads, head_dim = x.shape
-
-    def chunks(t):  # [B, T, ...] -> [NC, B, C, ...]
-        blocked = t.reshape(batch, total // chunk_size, chunk_size, *t.shape[2:])
-        return jnp.moveaxis(blocked, 1, 0)
-
-    x_c, B_c, C_c = chunks(x), chunks(B), chunks(C)         # [NC, B, C, H, ...]
-    a_c = jnp.moveaxis(chunks(a), 3, 2)                     # [NC, B, H, C]
-    a_cumsum = jnp.cumsum(a_c, axis=-1)
-    # 1. The intra-chunk output: L[i, j] = exp(segsum) masks C_i . B_j.
-    L = jnp.exp(segment_sum(a_c))                           # [NC, B, H, C, C]
-    G = jnp.einsum('nbihs,nbjhs->nbhij', C_c, B_c)
-    y_diag = jnp.einsum('nbhij,nbjhp->nbihp', G * L, x_c)
-    # 2. Each chunk's own write into the state, decayed to the chunk's end.
-    states = _chunk_writes(x_c, B_c, a_c)
-    # 3. The state crossing the chunks: the reference's `decay_chunk @ states`
-    # over the padded [NC+1, NC+1] segment sums is this product carried
-    # chunk by chunk.
-    final, previous = jax.lax.scan(_carry, carried, (states, a_cumsum[..., -1]))
-    # 4. The state each chunk reads, decayed to every position of it.
-    y_off = jnp.einsum('nbihs,nbhps,nbhi->nbihp', C_c, previous, jnp.exp(a_cumsum))
-    return jnp.moveaxis(y_diag + y_off, 0, 1).reshape(batch, total, heads, head_dim), final
-
-
 def _entering_state(decay, write, axis: str):
     """The state entering this shard of a sequence the mesh axis `axis`
     splits, inside a `shard_map` that holds it manual.
@@ -193,7 +122,7 @@ def chunk_ssd(x, dt, A, B, C, D, state=None, chunk_size: int = CHUNK_SIZE, start
     whose entering state drops. The op runs it on mamba_ssm's kernels where their port takes the
     call (`recurrence_chunk.ssd_port_refusal`), on `x`, `B` and `C` in their common dtype; else in
     `at_least_fp32` of it, on the TPU's Pallas kernel where it takes the geometry, else the portable
-    math. `xla_chunk_scan` is the reference's order (tests/test_ssd_kernel.py).
+    math.
     """
     operand = jnp.result_type(x, B, C)
     work = at_least_fp32(operand)
