@@ -87,14 +87,21 @@ def serving(handle):
         server.server_close()
 
 
-@pytest.mark.parametrize("read", ["indexed", "streamed"])
+@pytest.mark.parametrize("read", ["indexed", "streamed", "interleaved", "memory"])
 def test_a_fetch_with_threads_of_its_own_fetches_that_many_at_once_in_order_and_resumes(read):
     """A fetch given four threads of its own fetches four urls at once whatever the read's threads,
-    delivers the records in the order they were read, and a position saved part way restores to
-    the same remaining records."""
+    in every read, before an interleave too; delivers the records it keeps in the order they were
+    read, a gone url dropped and counted; leaves the plan as a fetch without threads makes it; a
+    position saved part way restores to the same remaining records; and a closed reader leaves no
+    thread of its pool running."""
     lock, active, most = threading.Lock(), [0], [0]
 
     def handle(request):
+        index = int(request.path.strip("/"))
+        if index == 9:
+            request.send_response(404)
+            request.end_headers()
+            return
         with lock:
             active[0] += 1
             most[0] = max(most[0], active[0])
@@ -108,17 +115,26 @@ def test_a_fetch_with_threads_of_its_own_fetches_that_many_at_once_in_order_and_
             active[0] -= 1
 
     with serving(handle) as address:
-        catalog = Memory([{"url": f"http://{address}/{index}", "id": index} for index in range(16)],
-                         shard_rows=16)
-        chain = Pipeline(catalog).filter_map(images.fetch(to="bytes", threads=4)).batch(2)
-        data = compile(chain, read=read, loading=Loading(workers=0, threads=1, read_buffer=1))
+        catalog = Memory([{"url": f"http://{address}/{index}", "id": index} for index in range(17)],
+                         shard_rows=17)
+
+        def built(threads):
+            fetched = Pipeline(catalog).filter_map(images.fetch(to="bytes", threads=threads))
+            chain = (fetched.interleave(1) if read == "interleaved" else fetched).batch(2)
+            return compile(chain, read="streamed" if read == "interleaved" else read,
+                           loading=Loading(workers=0, threads=1, read_buffer=1))
+
+        data = built(4)
+        assert data.plan.identity() == built(None).plan.identity()
         reader = data.train(DataPartition())
         try:
             first = [next(reader) for _ in range(3)]
             saved = reader.get_state()
             rest = [next(reader) for _ in range(5)]
+            dropped = rejected(reader)
         finally:
             reader.close()
+        assert not [thread for thread in threading.enumerate() if thread.name.startswith("dew-step")]
         resumed = data.train(DataPartition())
         try:
             resumed.set_state(saved)
@@ -126,10 +142,11 @@ def test_a_fetch_with_threads_of_its_own_fetches_that_many_at_once_in_order_and_
         finally:
             resumed.close()
     assert most[0] == 4
-    ids = [int(value) for batch in [*first, *rest] for value in batch["id"]]
-    assert ids == list(range(16))
+    kept = [index for index in range(17) if index != 9]
+    assert [int(value) for batch in [*first, *rest] for value in batch["id"]] == kept
+    assert dropped == {"http_404": 1}
     assert [bytes(value) for batch in rest for value in batch["bytes"]] == [
-        f"/{index}".encode() for index in range(6, 16)]
+        f"/{index}".encode() for index in kept[6:]]
     assert [[int(value) for value in batch["id"]] for batch in again] == [
         [int(value) for value in batch["id"]] for batch in rest]
 

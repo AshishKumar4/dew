@@ -12,6 +12,7 @@ from uuid import uuid4
 
 import fsspec
 import grain.python as grain
+import numpy as np
 import pytest
 
 from dew.data.cache import Abandoned, Cache
@@ -553,6 +554,18 @@ def test_a_prompt_recipe_reads_the_generation_its_memory_read_published():
 
 
 @dataclass(frozen=True)
+class Same:
+    """A deterministic step that keeps its row and notes each row it runs on."""
+
+    calls: list = field(default_factory=list, compare=False, repr=False)
+    identity = "same@1"
+
+    def __call__(self, row):
+        self.calls.append(1)
+        return row
+
+
+@dataclass(frozen=True)
 class Offset:
     """A deterministic step that notes each row it runs on, so a run shows whether its cache ran it."""
 
@@ -676,20 +689,83 @@ def test_a_cache_read_by_two_loading_workers_seals_what_each_filled(tmp_path):
     from dew.data.dataset import DataPartition, Loading
     from dew.data.pipeline import Pipeline
 
-    source = Memory([{"id": index} for index in range(16)], shard_rows=4)
+    # Two inputs the store misses: each worker writes their completions as its pass starts.
+    source = Memory([None if index in (5, 11) else {"id": index} for index in range(16)], shard_rows=4)
     cache = str(tmp_path / "cache")
     filling = Offset(10)
     chain = Pipeline(source).map(filling).cache(cache).repeat(1).workers(2).batch(2)
     reader = compile(chain, read="indexed", loading=Loading(workers=0, threads=1, read_buffer=1)).train(
         DataPartition())
     try:
-        assert sorted(row for batch in _ids(reader) for row, _ in batch) == list(range(16))
+        assert sorted(row for batch in _ids(reader) for row, _ in batch) == [
+            index for index in range(16) if index not in (5, 11)]
     finally:
         reader.close()
     publishing = Offset(10)
     generation = publish(Pipeline(source).map(publishing), Cache(cache), read="indexed",
                          loading=Loading(workers=0))
-    assert len(generation) == 16
+    assert len(generation) == 14
+    assert publishing.calls == []
+
+
+def test_a_cache_of_a_store_that_misses_every_input_publishes_its_empty_fill(tmp_path):
+    """A store whose every input is missing: a pass reads no row, and its fill holds every input's
+    completion, so a publication runs no step and holds no row."""
+    from dew.data.compile import compile, publish
+    from dew.data.dataset import DataPartition, Loading
+    from dew.data.pipeline import Pipeline
+
+    loading = Loading(workers=0, threads=1, read_buffer=1)
+    source = Memory([None] * 6)
+    cache = str(tmp_path / "cache")
+    reader = compile(Pipeline(source).map(Offset(10)).cache(cache).repeat(1).batch(2), read="indexed",
+                     loading=loading).train(DataPartition())
+    try:
+        assert list(reader) == []
+    finally:
+        reader.close()
+    publishing = Offset(10)
+    assert len(publish(Pipeline(source).map(publishing), Cache(cache), read="indexed", loading=loading)) == 0
+    assert publishing.calls == []
+
+
+def test_a_prompt_recipe_with_a_cache_reads_by_index_in_its_default_order():
+    """A prompt recipe whose rendering drops prompts too long, cached and read by index, takes the
+    default order it takes uncached and reads the same prompts."""
+    from dew.config.data import PromptData, loader
+    from dew.data.dataset import DataPartition
+
+    recipe = PromptData(tuple({"prompt": "hi " * (1 + index % 3)} for index in range(12)), "byte",
+                        max_prompt_len=8, long="drop")
+    cached = loader(recipe, batch=2, cache=_cache(), read="indexed")
+    uncached = loader(recipe, batch=2, read="indexed")
+    assert cached.records == uncached.records
+    first, second = cached.train(DataPartition()), uncached.train(DataPartition())
+    try:
+        for _ in range(3):
+            left, right = next(first), next(second)
+            for name in right:
+                np.testing.assert_array_equal(np.asarray(left[name]), np.asarray(right[name]))
+    finally:
+        first.close()
+        second.close()
+
+
+def test_a_cache_followed_by_a_token_split_seals_the_fill_the_split_reads():
+    """A cache, then a token holdout, which reads every document as the run is planned: the fill
+    the planning read is sealed, so a publication afterwards runs no step again."""
+    from dew.data.compile import compile, publish
+    from dew.data.dataset import DataPartition, Loading
+    from dew.data.pipeline import Pipeline
+
+    loading = Loading(workers=0, threads=1, read_buffer=1)
+    documents = Memory([{"text": np.arange(3 + index % 4, dtype=np.int32)} for index in range(8)])
+    cache = _cache()
+    train, _ = Pipeline(documents).map(Same()).cache(cache).holdout(tokens=0.25)
+    reader = compile(train.repeat().batch(1), read="indexed", loading=loading).train(DataPartition())
+    reader.close()
+    publishing = Same()
+    publish(Pipeline(documents).map(publishing), cache, read="indexed", loading=loading)
     assert publishing.calls == []
 
 
