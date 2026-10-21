@@ -326,8 +326,19 @@ class _Triton(_GroupedLaunch[Tile]):
         # a CPU, which interprets them, or traces the CUDA branch a GPU's lowering takes.
         return _rated(target, ba.arguments['tokens'].dtype)
 
+    @staticmethod
+    @abc.abstractmethod
+    def _dense_extents(ba) -> tuple[int, int]:
+        """The depth and width a dense call's tiles divide."""
+
     def space(self, ba) -> tuple[Tile, ...]:
-        return TILES
+        """Every tile; a dense call's (`triton_dense`) those dividing its depth and width, where any does
+        (the kernel pads to a tile that does not, a copy the cost model does not price)."""
+        if not ba.arguments.get('dense'):
+            return TILES
+        depth, width = self._dense_extents(ba)
+        dividing = tuple(tile for tile in TILES if depth % tile.block_k == 0 and width % tile.block_n == 0)
+        return dividing or TILES
 
     def fitting(self, ba, target) -> tuple[Tile, ...]:
         """The tiles that fit `target` (`Template.fitting`) whose accumulator (two with `exact_sums`)
@@ -399,6 +410,12 @@ class Gmm(_Triton):
     `kernel` `[groups, in, out]`, or of its transpose with `trans_rhs`."""
 
     ROWS: ClassVar[tuple[str, ...]] = ('tokens',)
+
+    @staticmethod
+    def _dense_extents(ba) -> tuple[int, int]:
+        """The depth and width of a dense call's product, which `block_k` and `block_n` tile."""
+        kernel = ba.arguments['kernel']
+        return (kernel.shape[2], kernel.shape[1]) if ba.arguments['trans_rhs'] else kernel.shape[1:]
 
     @staticmethod
     def loaded(tile: Tile) -> int:
@@ -493,6 +510,11 @@ class Tgmm(_Triton):
     kernel gradient `[groups, in, out]`."""
 
     ROWS: ClassVar[tuple[str, ...]] = ('tokens', 'cotangent')
+
+    @staticmethod
+    def _dense_extents(ba) -> tuple[int, int]:
+        """The depth and width of a dense call's gradient, which `block_k` and `block_n` tile."""
+        return ba.arguments['tokens'].shape[1], ba.arguments['cotangent'].shape[1]
 
     @staticmethod
     def loaded(tile: Tile) -> int:
