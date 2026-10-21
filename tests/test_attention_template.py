@@ -545,14 +545,16 @@ def test_cross_documents_of_ids_wider_than_int32_align_apart():
                                       np.tril(np.ones((4, 4), bool)) & np.asarray(document_mask(ids)[0]))
 
 
-def test_a_chunk_wider_than_int32_holds_every_place():
-    """A chunk wider than int32 counts holds the largest places together, as `chunk_mask` does."""
+def test_a_chunk_wider_than_its_places_dtype_holds_every_place_of_one_sign():
+    """A chunk wider than int32 counts, over int32 places, holds the largest places together and the
+    negative ones apart, as `chunk_mask` does (over int64 places, an ordinary chunk)."""
+    ids = jnp.asarray([[1, 1, 1]], jnp.int32)
+    places = jnp.asarray([[-1, 2 ** 31 - 2, 2 ** 31 - 1]], jnp.int32)
+    spans = template.spans(3, 3, 1, chunk=2 ** 31, positions=(places, places), segment_ids=ids)
     with jax.enable_x64(new_val=True):
-        ids = jnp.asarray([[1, 1]], jnp.int32)
-        places = jnp.asarray([[2 ** 31 - 2, 2 ** 31 - 1]], jnp.int64)
-        spans = template.spans(2, 2, 1, chunk=2 ** 31, positions=(places, places), segment_ids=ids)
-        expected = document_mask(ids) & chunk_mask(places, places, 2 ** 31)[:, 0]
-        np.testing.assert_array_equal(np.asarray(template.dense(spans)), np.asarray(expected))
+        wide = places.astype(jnp.int64)
+        expected = document_mask(ids) & chunk_mask(wide, wide, 2 ** 31)[:, 0]
+    np.testing.assert_array_equal(np.asarray(template.dense(spans)), np.asarray(expected))
 
 
 def test_a_block_of_unsigned_ids_is_whole_only_within_one_document():
@@ -567,6 +569,21 @@ def test_a_block_of_unsigned_ids_is_whole_only_within_one_document():
         for tile in range(int(blocks.full_lo[0, block]), int(blocks.full_hi[0, block])):
             if blocks.query_doc[0, block] == blocks.key_doc[0, tile] != 0:
                 assert seen[0, 2 * block:2 * block + 2, 2 * tile:2 * tile + 2].all()
+
+
+def test_a_wider_initial_state_is_read_in_its_own_dtype():
+    """Under x64, a state whose denominator and numerator are float64 and maximum float32 starts a
+    float32 query's softmax in float64: a call of no keys reads `acc / total` unrounded."""
+    with jax.enable_x64(new_val=True):
+        state = template.Initial(jnp.zeros((1, 1, 1), jnp.float32), jnp.full((1, 1, 1), 1 + 2 ** -24),
+                                 jnp.ones((1, 1, 1, 1), jnp.float64))
+        query = jnp.ones((1, 1, 1, 1), jnp.float32)
+        empty = jnp.zeros((1, 0, 1, 1), jnp.float32)
+        spans = template.spans(1, 0, 1)
+        out, _, total = template.reference(query, empty, empty, spans, template.Hooks(initial=state),
+                                           residuals=True)
+        assert float(total[0, 0, 0]) == 1 + 2 ** -24
+        assert float(out[0, 0, 0, 0]) == np.float32(1 / (1 + 2 ** -24))
 
 
 def test_sinks_keep_their_own_wider_dtype():
