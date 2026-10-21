@@ -1,10 +1,14 @@
 """GPT-NeoX's parallel residual, partial rotary and fused qkv checkpoint."""
 
+import json
 from pathlib import Path
 
+import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from interop_support import drawn_ids, float64_logits
+from reference_error import assert_as_exact, declared_seeds, indexed_recording, recording
 
 from dew.interop import Pretrained
 from dew.sampling import Sampling, generate
@@ -13,18 +17,27 @@ DIRECTORY = Path(__file__).parent / 'fixtures' / 'hf' / 'gpt-neox-tiny'
 
 
 def test_gpt_neox_logits_and_cached_greedy_generation_match_transformers():
+    """Dew's logits as exact as transformers' fp32 eager run, both from float64, over the recorded
+    seeds' token grids (tools/gpt_neox_reference.py recording): the truth Dew's model run in float64,
+    held at every seed to the recorded transformers truth's sketch; its cached greedy generation the
+    reference's token for token; and the sequential residual another computation."""
     loaded = Pretrained.load(DIRECTORY, dtype='float32', attention_impl='reference')
+    stored = recording(DIRECTORY / 'recorded_logits.npz')
+    seeds = declared_seeds(DIRECTORY / 'recorded_logits.npz')['logits']
+    vocab = json.loads((DIRECTORY / 'config.json').read_text())['vocab_size']
+    draw, reference, truth = indexed_recording(stored, 'logits', seeds, truth_fn=float64_logits(loaded),
+                                               inputs_of=lambda seed: drawn_ids(vocab, seed))
+    forward = jax.jit(lambda inputs: {'logits': loaded.model.apply(loaded.variables, inputs['input_ids'])})
+    assert_as_exact(lambda index, inputs: forward(inputs), reference, draw, 'gpt-neox logits', seeds=seeds,
+                    truth_fn=truth)
     ids = np.load(DIRECTORY / 'input_ids.npy')
-    expected = np.load(DIRECTORY / 'logits.npy')
     actual = np.asarray(loaded.model.apply(loaded.variables, jnp.asarray(ids)))
-    np.testing.assert_allclose(actual, expected, atol=1e-4, rtol=0)
-    np.testing.assert_array_equal(actual.argmax(-1), expected.argmax(-1))
+    np.testing.assert_array_equal(actual.argmax(-1), np.load(DIRECTORY / 'logits.npy').argmax(-1))
     generated = generate(loaded.model, loaded.variables, ids[:1, :4], 6, key=0,
                          sampling=Sampling(temperature=0))
     np.testing.assert_array_equal(np.asarray(generated.tokens), np.load(DIRECTORY / 'generated.npy'))
     sequential = loaded.model.clone(parallel_residual=False)
-    wrong = np.asarray(sequential.apply(loaded.variables, jnp.asarray(ids)))
-    assert float(np.max(np.abs(wrong - expected))) > 1e-2
+    assert not np.array_equal(np.asarray(sequential.apply(loaded.variables, jnp.asarray(ids))), actual)
 
 
 

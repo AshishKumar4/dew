@@ -69,7 +69,7 @@ FAMILIES = {
     ('grouped_matmul', 'pallas'): ("experts", {"pallas_triton_ragged_dot", "tgmm_ragged_dot"}),
     ('rms_norm', 'pallas'): ("step", {"rms_norm_forward", "rms_norm_backward"}),
     ('swiglu', 'pallas'): ("step", {"swiglu_forward", "swiglu_backward"}),
-    ('gated_delta_rule', 'fla'): ("step", {"fla_chunk_local_cumsum", "fla_kkt_solve", "fla_recompute_w_u",
+    ('gated_delta_rule', 'fla'): ("step", {"recurrence_cumulated", "fla_kkt_solve", "fla_recompute_w_u",
                                            "fla_chunk_fwd_h", "fla_chunk_fwd_o", "fla_chunk_bwd_dv_local",
                                            "fla_chunk_bwd_dhu", "fla_chunk_bwd_dqkwg",
                                            "fla_prepare_wy_repr_bwd"}),
