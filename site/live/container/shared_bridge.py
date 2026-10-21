@@ -79,7 +79,9 @@ class Context:
                 "content": {"code": code, "silent": False, "store_history": False,
                             "user_expressions": {}, "allow_stdin": False, "stop_on_error": True},
             }))
-            reply, idle, size = None, False, 0
+            # What the page shows of the cell, as it shows it (site/src/scripts/live.ts): every output since
+            # the last clear, a display under an id at its latest frame each place it shows (kernel_outputs).
+            reply, idle, size, displays, clearing = None, False, 0, {}, False
             while reply is None or not idle:
                 try:
                     message = json.loads(await asyncio.wait_for(self.channels.recv(), timeout=95))
@@ -99,8 +101,21 @@ class Context:
                     idle = True
                 else:
                     for output in outputs_of(kind, content):
-                        size += len(json.dumps(output))
-                        if size > MAX_OUTPUT:
+                        cost = len(json.dumps(output))
+                        if output["type"] == "clear" and output.get("wait"):
+                            clearing = True
+                        elif output["type"] == "clear":
+                            size, displays, clearing = 0, {}, False
+                        elif output.get("update"):
+                            displays[output["display"]] = [cost] * len(displays.get(output["display"], []))
+                        else:
+                            if clearing:
+                                size, displays, clearing = 0, {}, False
+                            if "display" in output:
+                                displays.setdefault(output["display"], []).append(cost)
+                            else:
+                                size += cost
+                        if size + sum(map(sum, displays.values())) > MAX_OUTPUT:
                             raise ValueError("this cell printed more than the live output allowance")
                         await send(output)
             self.last_used = time.monotonic()

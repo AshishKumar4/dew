@@ -201,9 +201,8 @@ def test_a_conv_step_launches_the_configs_its_store_holds_as_exact_as_xla(tmp_pa
 
     path, stamp, settled, taken = fresh(TUNED, "measure", str(tmp_path / "measured.npz"),
                                         cache_dir=cache_dir, flags=inherited)
-    with open(path) as file:
-        stored = {(type(ba.op), ba.autotuning_cache_key): timings
-                  for ba, timings in tokamax.AutotuningResult.loads(file.read()).data}
+    stored = {(type(ba.op), ba.autotuning_cache_key): timings
+              for ba, timings in tuning._read(path)[0].values()}
     assert settled is True and stored.keys() == distinct.keys()
     for key, timings in stored.items():
         assert len(timings) > 1, key[0]
@@ -223,8 +222,8 @@ def test_a_conv_step_launches_the_configs_its_store_holds_as_exact_as_xla(tmp_pa
     timing = tokamax.BenchmarkData(compile_time_ms=1.0, lower_time_ms=1.0, evaluation_times_ms=(1.0,),
                                    metadata={})
     with open(path, "w") as file:
-        file.write(tokamax.AutotuningResult(jax.devices()[0].device_kind, tuple(
-            (ba, tuning.AutotuningData({chosen[key]: timing})) for key, ba in distinct.items())).dumps())
+        file.write(tuning.dumps_picks(jax.devices()[0].device_kind, tuple(
+            (ba, tuning.Timings({chosen[key]: timing})) for key, ba in distinct.items())))
     _, _, settled, taken = fresh(TUNED, "read", str(tmp_path / "chosen.npz"), cache_dir=cache_dir,
                                  flags=reading)
     assert settled is True and taken == taking(chosen)
