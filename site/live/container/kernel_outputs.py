@@ -37,5 +37,6 @@ def outputs_of(kind, content):
             room -= len(kept[-1])
         return [{"type": "error", "ename": ename, "evalue": evalue, "traceback": kept[::-1]}]
     if kind == "clear_output":
-        return [{"type": "clear"}]
+        # clear_output(wait=True) clears when the next output arrives, so a redraw does not flicker.
+        return [{"type": "clear", "wait": True} if content.get("wait") else {"type": "clear"}]
     return []

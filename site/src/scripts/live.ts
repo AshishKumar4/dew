@@ -14,7 +14,7 @@ export type Output =
 	| { type: 'stream'; name: 'stdout' | 'stderr'; text: string }
 	| { type: 'display'; text?: string; png?: string; display?: string; update?: boolean }
 	| { type: 'error'; ename: string; evalue: string; traceback: string[] }
-	| { type: 'clear' };
+	| { type: 'clear'; wait?: boolean };
 
 export interface Done {
 	status: 'ok' | 'error' | 'aborted';
@@ -171,11 +171,33 @@ export class LiveSession {
 // Rendering outputs, shared by the landing page and the tutorial pages.
 
 
-/** Append one output to `into`, the way the tutorial pages show recorded outputs. */
-export function renderOutput(into: HTMLElement, output: Output): void {
+/**
+ * Show one output in `into`, the way the tutorial pages show recorded outputs, as Jupyter shows a kernel's
+ * messages: clear_output(wait=True) clears when the next output arrives, and a display shown under an id is
+ * updated in place, every place `scope` shows it. `scope` holds the outputs of the kernel that ran the cell:
+ * the cell's own on the landing page, whose cells each run in a context of their own, and the page on a
+ * notebook, whose cells share one.
+ */
+export function renderOutput(into: HTMLElement, output: Output, scope: ParentNode = into): void {
 	if (output.type === 'clear') {
-		into.replaceChildren();
+		if (output.wait) {
+			into.dataset.clearNext = '';
+		} else {
+			delete into.dataset.clearNext;
+			into.replaceChildren();
+		}
 		return;
+	}
+	if (output.type === 'display' && output.update) {
+		const shown = displayed(output);
+		if (!shown || output.display === undefined) return;
+		const showing = scope.querySelectorAll<HTMLElement>(`[data-display="${CSS.escape(output.display)}"]`);
+		showing.forEach((element, index) => element.replaceWith(index === 0 ? shown : shown.cloneNode(true)));
+		return;
+	}
+	if ('clearNext' in into.dataset) {
+		delete into.dataset.clearNext;
+		into.replaceChildren();
 	}
 	if (output.type === 'stream') {
 		const last = into.lastElementChild;
@@ -192,37 +214,32 @@ export function renderOutput(into: HTMLElement, output: Output): void {
 		return;
 	}
 	if (output.type === 'display') {
-		let shown: HTMLElement;
-		if (output.png) {
-			const image = document.createElement('img');
-			image.src = `data:image/png;base64,${output.png}`;
-			image.alt = output.text ?? '';
-			shown = image;
-		} else if (output.text) {
-			const pre = document.createElement('pre');
-			pre.className = 'nb-result';
-			pre.textContent = output.text;
-			shown = pre;
-		} else {
-			return;
-		}
-		// A display under an id is one output that its updates replace, as Jupyter shows IPython's display
-		// handle; an update to an id nothing shows shows nothing.
-		if (output.display === undefined) {
-			into.append(shown);
-			return;
-		}
-		shown.dataset.display = output.display;
-		if (!output.update) {
-			into.append(shown);
-			return;
-		}
-		const showing = [...into.children].filter((child) => child instanceof HTMLElement && child.dataset.display === output.display);
-		showing.forEach((child, index) => child.replaceWith(index === 0 ? shown : shown.cloneNode(true)));
+		const shown = displayed(output);
+		if (shown) into.append(shown);
 		return;
 	}
 	const pre = document.createElement('pre');
 	pre.className = 'nb-error';
 	pre.textContent = terminalText(output.traceback.length > 0 ? output.traceback.join('\n') : `${output.ename}: ${output.evalue}`);
 	into.append(pre);
+}
+
+/** The element a display output shows, tagged with its id, or nothing when it holds nothing to show. */
+function displayed(output: Extract<Output, { type: 'display' }>): HTMLElement | undefined {
+	let shown: HTMLElement;
+	if (output.png) {
+		const image = document.createElement('img');
+		image.src = `data:image/png;base64,${output.png}`;
+		image.alt = output.text ?? '';
+		shown = image;
+	} else if (output.text) {
+		const pre = document.createElement('pre');
+		pre.className = 'nb-result';
+		pre.textContent = output.text;
+		shown = pre;
+	} else {
+		return undefined;
+	}
+	if (output.display !== undefined) shown.dataset.display = output.display;
+	return shown;
 }
