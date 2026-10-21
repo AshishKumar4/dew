@@ -868,9 +868,24 @@ def _token_places(batch: Batch) -> tuple[int, int]:
     return int(tokens.size), int(tokens.size - np.count_nonzero(real))
 
 
-def _shown[Field](value: np.ndarray | bytes | Field) -> np.ndarray | bytes | Field | str:
-    """A field as `show` prints it: an array as its shape and dtype, bytes as their length."""
-    if isinstance(value, np.ndarray) and value.size > 16:
+@runtime_checkable
+class _Shaped(Protocol):
+    """An array a step leaves on a device (a JAX array), as `show` reads it."""
+
+    @property
+    def shape(self) -> tuple[int, ...]: ...
+
+    @property
+    def dtype(self) -> np.dtype: ...
+
+    @property
+    def size(self) -> int: ...
+
+
+def _shown[Field](value: np.ndarray | _Shaped | bytes | Field) -> np.ndarray | _Shaped | bytes | Field | str:
+    """A field as `show` prints it: an array, on the host or on a device after the chain's device
+    steps, as its shape and dtype; bytes as their length."""
+    if isinstance(value, (np.ndarray, _Shaped)) and value.size > 16:
         return f"{value.dtype}{list(value.shape)}"
     if isinstance(value, bytes) and len(value) > 64:
         return f"<{len(value)} bytes>"
