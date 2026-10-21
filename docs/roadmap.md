@@ -121,6 +121,7 @@ The kernel direction (approved 2026-10-19; kernel design 2026-10-20): each case 
 
 ## Training and parallelism
 
+- Hold Shortcut's halves-against-whole outcome per example, before the batch reduction, against a float64 twin. [1020]
 - Stop a block-diffusion run's generation at its checkpoint's end-of-sequence ids, as a loaded model's does. [895]
 - Shard persistent optimizer state on sequence-only meshes. [156]
 - Qualify loss, resume, failure handling and throughput on two physical hosts. [158]
@@ -141,6 +142,7 @@ The kernel direction (approved 2026-10-19; kernel design 2026-10-20): each case 
 
 ## RL and serving
 
+- Sample LLaDA 2.x checkpoints block by block, as their releases generate, through a blockwise masked walk. [1061]
 - After the MFU work, add the approved environment/world-model scope: a Playground/MJX adapter, device replay, Dreamer v3 and v4, and a world-model tutorial. [532]
 - After the MFU work, implement DiffusionNFT and compare it with FlowGRPO under matched conditions. [533]
 - Qualify two-engine vLLM/NCCL weight publication and policy-version stamps on real GPUs. [579]
@@ -177,6 +179,9 @@ Keep the existing gateway interface. Miles would currently duplicate it: its tra
 ## CI and tooling
 
 - Give every duplicated function and statement run one owner its callers share, and land the structural duplication gate (functions equal up to renaming, six-statement windows, across files, no allowlist) once none is left. [896, 897, 898, 899, 900, 901, 902, 903, 904, 905, 906, 907, 908, 909, 910, 911, 912, 913, 914, 915, 916, 917, 918, 919, 920, 921, 922, 923, 924, 925, 926, 927, 928, 929, 930, 931, 932, 933, 934, 935, 936, 937, 938, 939, 940, 941, 942, 943, 944, 945, 946, 947, 948, 949, 950]
+- Give each recurrence, attention, selection and grouped-GEMM rule one owner that kernels, tests and tools share: one chunk transition, decay-range and WY core for every recurrence port, one visibility predicate and softmax state for attention and decode, one selection engine with typed refusals, and one independent test oracle per operation. [952, 953, 954, 955, 956, 957, 958, 959, 960, 961, 962, 963, 964, 965, 966, 967, 968, 969, 970, 971, 972, 973, 974, 975, 976, 977, 978, 979, 980, 981, 982, 983]
+- Give inference, RL, LoRA, quantization, the registry, the CLI and the figures one owner per rule: one sampled-token step, one sampled-call payload, one saved-run resolution, one publication path, and one export manifest and theme. [984, 985, 986, 987, 988, 989, 990, 991, 992, 993, 994, 995, 996, 997, 998, 999, 1000, 1001, 1002, 1003, 1004, 1005, 1006, 1007, 1008, 1009, 1010, 1011, 1012, 1013, 1014, 1015, 1016, 1017, 1018, 1019]
+- Give checkpoint interop one owner per rule (MoE aliases, packed tensors, orientation, rope and layer patterns, alias groups), and move the reference tools' remaining hand-written oracles onto the published releases' code. [1021, 1022, 1023, 1024, 1025, 1026, 1027, 1028, 1029, 1030, 1031, 1032, 1033, 1034, 1035, 1036, 1037, 1038, 1039, 1040, 1041, 1042, 1043, 1044, 1045, 1046, 1047, 1048, 1049, 1050, 1051, 1052, 1053, 1054, 1055, 1056, 1057, 1058, 1059, 1060]
 - Derive executable training and generation qualification from the registries. Cover codec combinations with fusion, scan and pipeline stages. [176, 178]
 - Compare cached and full forwards on logits and likelihoods. [179]
 - Build registry-backed uninterrupted/resumed flows and extend them to compiled-program reuse. [182, 183]
