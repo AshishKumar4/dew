@@ -138,8 +138,8 @@ class TokenFiles(Dataset):
         """The export's committed manifest, read through this store's own storage options."""
         committed = Files(self.url, storage_options=self.storage_options).committed
         if committed is None:
-            raise ValueError(f"{self.url} holds no committed token export; write one with "
-                             "dew.data.text.export_tokens or `dew data export --tokenizer`")
+            raise FileNotFoundError(f"{self.url} holds no committed token export; write one with "
+                                    "dew.data.text.export_tokens or `dew data export --tokenizer`")
         return committed
 
     def label(self) -> str:
