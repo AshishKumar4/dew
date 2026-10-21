@@ -11,7 +11,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from generation_support import INTERPRETS, generations
+from generation_support import INTERPRETS, generations, lowers
 from jax.sharding import Mesh
 from reference_error import assert_as_exact_as_the_reference, equations
 
@@ -162,6 +162,7 @@ def test_an_expert_projection_runs_the_implementation_chosen_for_it_on_the_cpu(g
                                           label)
 
 
+@lowers("sm90")
 @pytest.mark.parametrize("launch", [grouped_matmul.MosaicGmm(), grouped_matmul.MosaicGmmTransposed(),
                                     grouped_matmul.MosaicTgmm()], ids=lambda launch: type(launch).__name__)
 def test_every_tile_of_the_hopper_grouped_matmuls_lowers_for_an_h100(launch):
@@ -193,6 +194,50 @@ def test_every_tile_of_the_hopper_grouped_matmuls_lowers_for_an_h100(launch):
         for config in sorted(covering, key=repr):
             jax.jit(functools.partial(launch.replace(config=config), **options)).trace(*args).lower(
                 lowering_platforms=("cuda",))
+
+
+def bf16_reciprocal(x):
+    return 1 / x
+
+
+def bf16_sigmoid_power(acc):
+    narrow = acc.astype(jnp.bfloat16)
+    return jax.nn.sigmoid(narrow) * narrow ** -2
+
+
+@pytest.mark.parametrize("generation_name", ["sm80", "sm90"])
+@pytest.mark.parametrize("launch", [grouped_matmul.Gmm(), grouped_matmul.Tgmm()],
+                         ids=lambda launch: type(launch).__name__)
+def test_a_hooks_16_bit_divisions_lower_for_cuda(launch, generation_name):
+    """Pallas Triton lowers no 16-bit division, nor `logistic` (`1 / (1 + exp(-x))`) or a negative power:
+    a bf16 hook using them lowers for CUDA, each such operation computed in fp32 and rounded once
+    (`grouped_matmul._lowerable`)."""
+    rows, depth, width, groups = 300, 128, 256, 4
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    sizes = jax.ShapeDtypeStruct((groups,), jnp.int32)
+    if isinstance(launch, grouped_matmul.Tgmm):
+        args = (bf16((rows, depth)), bf16((rows, width)), sizes, ())
+        options = {"out_dtype": "float32", "hooks": grouped_matmul.Hooks(bf16_reciprocal)}
+    else:
+        args = (bf16((rows, depth)), bf16((groups, depth, width)), sizes, (), ())
+        options = {"out_dtype": "bfloat16", "trans_rhs": False,
+                   "hooks": grouped_matmul.Hooks(bf16_reciprocal, (), bf16_sigmoid_power, ())}
+    options |= {"interpret": False}
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), generation_name)
+    with generation.assumed(generation_name), jax.sharding.use_abstract_mesh(mesh):
+        config = launch.fitting(launch.bind(*args, **options), generation.gpu_target())[0]
+        jax.jit(functools.partial(launch.replace(config=config), **options)).trace(*args).lower(
+            lowering_platforms=("cuda",))
+
+
+def test_a_hooks_widened_16_bit_operations_round_as_xla_s():
+    """The 16-bit divisions, sigmoid and negative powers a kernel computes in fp32 round to the bits XLA's
+    16-bit operations give, every bf16 value at once."""
+    every = jax.lax.bitcast_convert_type(jnp.arange(-(2 ** 15), 2 ** 15, dtype=jnp.int32).astype(jnp.int16),
+                                         jnp.bfloat16)
+    for hook in (bf16_reciprocal, lambda x: bf16_sigmoid_power(x.astype(jnp.float32))):
+        np.testing.assert_array_equal(np.asarray(jax.jit(grouped_matmul.Hooks(hook).before())(every)),
+                                      np.asarray(jax.jit(hook)(every)))
 
 
 def test_a_forced_implementation_runs_or_says_why_it_cannot():
