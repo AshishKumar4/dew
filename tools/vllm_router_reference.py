@@ -36,14 +36,13 @@ Run with the Dew test environment's torch, on CPU:
 """
 
 import contextlib
-import json
 import sys
 import types
 from pathlib import Path
 
 import numpy as np
 import torch
-from reference_source import CACHE as UPSTREAM, ran, selected, verified
+from reference_source import CACHE as UPSTREAM, ran, saved_fixture, selected, verified
 
 REPO, COMMIT = "vllm-project/vllm", "ced6857afa0ea7b2e3f0846a62e1394e90f15607"
 PATH = "vllm/model_executor/layers/fused_moe/router/grouped_topk_router.py"
@@ -135,8 +134,7 @@ def main():
         arrays.update({f"{case}/{key}": value for key, value in record.items()})
     meta = {"repo": REPO, "commit": COMMIT, "path": PATH, "sha256": DIGEST, "cases": CASES,
             "margin": MARGIN, "torch": torch.__version__}
-    arrays["meta"] = np.frombuffer(json.dumps(meta).encode(), np.uint8)
-    np.savez_compressed(sys.argv[1], **arrays)
+    saved_fixture(Path(sys.argv[1]), arrays, meta)
     print(f"{sys.argv[1]}: {Path(sys.argv[1]).stat().st_size / 1e6:.2f} MB, {len(arrays)} arrays")
 
 
