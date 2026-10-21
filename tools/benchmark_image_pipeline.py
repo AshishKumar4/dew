@@ -37,6 +37,7 @@ from dew.data.dataset import DataPartition
 from dew.data.image_augmentation import ImageParameters, apply_device, apply_host
 from dew.data.image_codec import decode_image
 from dew.data.images import resize_image
+from dew.training.distributed import split_fields
 
 
 @dataclass
@@ -137,7 +138,8 @@ def device_steps(steps):
         return arrays
 
     def augmented(batch):
-        return apply({name: value for name, value in batch.items() if np.asarray(value).dtype.kind in "biuf"})
+        # The fields a device holds, as the step takes them: no array leaves the device to be read.
+        return apply(split_fields(batch)[0])
 
     return augmented
 
