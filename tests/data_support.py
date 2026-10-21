@@ -3,6 +3,7 @@ hands the words back, the caption templates and host augmentation the image suit
 random step that draws a wide integer."""
 
 import dataclasses
+import itertools
 
 import grain.python as grain
 import numpy as np
@@ -36,3 +37,10 @@ class WideDraw(grain.RandomMapTransform):
 
     def random_map(self, element, rng):
         return {**element, "draw": np.int64(rng.integers(0, 2**32))}
+
+
+def listed(reader, count: int) -> list[dict[str, list]]:
+    """The next `count` batches of `reader` as plain lists, field by field, so a comparison covers
+    every field of every record rather than one of them."""
+    return [{name: np.asarray(value).tolist() for name, value in batch.items()}
+            for batch in itertools.islice(reader, count)]

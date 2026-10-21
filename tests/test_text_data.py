@@ -20,7 +20,7 @@ import optax
 import pytest
 from data_support import parse_grain_flags
 from reader_support import assert_a_rewrite_moves_the_identity
-from token_support import export_byte_tokens, write_token_corpus, write_token_meta
+from token_support import export_byte_tokens, write_token_corpus
 
 from dew.config.data import TextData, loader
 from dew.data import ByteTokenizer, Loading
@@ -30,6 +30,7 @@ from dew.nn.backbones import causal_transformer as backbone
 from dew.objectives.base import VALID_ROWS
 from dew.objectives.lm import LMObjective
 from dew.training import Step
+from tools.token_corpus import write_token_meta
 
 parse_grain_flags()
 

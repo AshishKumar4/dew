@@ -21,7 +21,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from data_support import CAPTION_TEMPLATES, FLIP_JITTER, keep_captions
+from data_support import CAPTION_TEMPLATES, FLIP_JITTER, keep_captions, listed
 from reader_support import assert_resumes_where_it_stopped
 
 from dew.config.data import Augment, HoldOut, ImageData, RecordsData, VideoData, loader
@@ -312,13 +312,6 @@ def _by_hand(source, *, seed, batch, count):
             for start in range(0, count * batch, batch)]
 
 
-def _fields(iterator, count):
-    """`count` batches as plain lists, so a comparison covers every field of
-    every record rather than one of them."""
-    return [{field: np.asarray(rows).tolist() for field, rows in batch.items()}
-            for batch in itertools.islice(iterator, count)]
-
-
 @pytest.mark.parametrize("workers", [0, pytest.param(1, marks=pytest.mark.slow),
                                      pytest.param(2, marks=pytest.mark.slow),
                                      pytest.param(3, marks=pytest.mark.slow)])
@@ -332,7 +325,7 @@ def test_which_records_a_batch_holds_does_not_depend_on_who_stacked_it(workers):
     stream = compile(Pipeline(Memory(source)).shuffle(5).repeat().batch(4), seed=5, loading=Loading(
         workers=workers, threads=2, read_buffer=4, worker_buffer=2)).train(DataPartition())
 
-    read = _fields(stream, 12)
+    read = listed(stream, 12)
     stream.close()
 
     assert read == _by_hand(source, seed=5, batch=4, count=12)
@@ -368,13 +361,13 @@ def test_an_offset_stays_a_bound_on_the_slice_this_process_reads(workers):
     data = compile(Pipeline(Memory(_Indexed(30))).repeat().batch(4), loading=Loading(
         workers=workers, threads=2, read_buffer=4, worker_buffer=2))
     interrupted = data.train(DataPartition())
-    _fields(interrupted, 2)
+    listed(interrupted, 2)
     offset = interrupted.get_state()
     interrupted.close()
 
     stream = data.train(DataPartition())
     stream.set_state(offset)
-    first = _fields(stream, 1)
+    first = listed(stream, 1)
     stream.close()
 
     assert first == [{"index": [8, 9, 10, 11]}]
