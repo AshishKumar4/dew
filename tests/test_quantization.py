@@ -899,15 +899,15 @@ def diffusion_run(directory, batch=RUN_BATCH, **trainer):
     """The smallest unconditional diffusion run: a tiny DiT over 8-pixel
     images, one step, nothing written but the record."""
     from dew.config import ModelConfig, TrainerConfig
-    from dew.config.data import ImageData
+    from diffusion_support import images_of
     from dew.objectives.diffusion import DiffusionRunConfig
 
     return DiffusionRunConfig(
         model=ModelConfig("simple_dit", {"patch_size": 4, "emb_features": 16,
                                          "num_layers": 1, "num_heads": 2, "dtype": "float32"}),
-        data=ImageData(source="tfds://oxford_flowers102", split="all", image_size=RES), text=None,
+        data=images_of("tfds://oxford_flowers102", RES, batch=batch), text=None,
             val_metrics=(),
-        trainer=TrainerConfig(name="quantized", checkpoint_dir=str(directory), batch_size=batch,
+        trainer=TrainerConfig(name="quantized", checkpoint_dir=str(directory),
                               steps=1, eval_every=None, checkpoint_every=None,
                               compilation_cache_dir=None, **trainer), objective=ObjectiveConfig("diffusion",
                               {"guidance": None, "steps": 2}))
