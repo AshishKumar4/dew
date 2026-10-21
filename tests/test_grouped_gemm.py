@@ -223,22 +223,26 @@ def test_the_cost_model_charges_each_multiprocessor_its_programs_in_turn():
         return cost.seconds(work, target)
 
     sms = target.multiprocessors
+    # Each side is the same arithmetic in the same order, so the times are equal exactly.
     assert seconds(0) == 0
-    assert seconds(sms) == pytest.approx(program)
-    assert seconds(sms + 1) == pytest.approx(2 * program)
-    assert seconds(1, device_bytes=target.memory_bandwidth) == pytest.approx(1.0)
+    assert seconds(sms) == program
+    assert seconds(sms + 1) == 2 * program
+    assert seconds(1, device_bytes=target.memory_bandwidth) == 1.0
 
 
 def test_a_mig_slice_keeps_its_generations_tensor_rate():
     """A SKU's catalogued peak lowers its generation's rate where its multiprocessors and clock would
-    exceed it (a GeForce part's half-rate accumulation) and never raises it: an A100 slice reporting 14
-    of its 108 multiprocessors keeps 2048 FLOPs a clock each."""
+    exceed it (a GeForce part's half-rate accumulation) and never raises it: an A100, whose catalogue
+    peak its 108 multiprocessors and clock reach, and a slice of it reporting 14, keep 2048 FLOPs a
+    clock each; a part whose peak is half its multiprocessors at the generation's rate (powers of two,
+    so the halving is exact) takes half."""
     a100 = generation.TARGETS["sm80"]
-    assert a100.tensor_rate("16bit") == pytest.approx(2048, rel=1e-3)
+    assert a100.tensor_rate("16bit") == 2048
     assert dataclasses.replace(a100, multiprocessors=14).tensor_rate("16bit") == 2048
-    rtx4080 = dataclasses.replace(generation.TARGETS["sm89"], device_kind="NVIDIA GeForce RTX 4080",
-                                  multiprocessors=76, clock_hz=2.505e9)
-    assert rtx4080.tensor_rate("16bit") == pytest.approx(512, rel=1e-2)
+    peaks = {"a half-rate part": {"bf16": 512 * 64 * 2.0 ** 31}}
+    half = dataclasses.replace(generation.TARGETS["sm89"], device_kind="a half-rate part", multiprocessors=64,
+                               clock_hz=2.0 ** 31, dense_peaks=peaks)
+    assert half.tensor_rate("16bit") == 512
 
 
 def test_an_unseen_gpu_runs_xla_s_grouped_matmul():
