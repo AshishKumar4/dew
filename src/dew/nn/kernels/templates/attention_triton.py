@@ -54,21 +54,16 @@ def _dot(a: jax.Array, b: jax.Array, interpret: bool) -> jax.Array:
     return plgpu.dot(a, b, precision=jax.lax.Precision.HIGHEST).astype(jnp.float32)
 
 
-def _wide_enough(dtype) -> bool:
-    """Whether `dtype` reaches as far down as fp32 (bf16 does, fp16 does not), so a value fp32 holds
-    narrows to it without underflowing."""
-    return jnp.finfo(dtype).minexp <= jnp.finfo(jnp.float32).minexp
-
-
 def _value_gradient(exponentials: jax.Array, weights: jax.Array, dout: jax.Array, total: jax.Array,
                     interpret: bool) -> jax.Array:
-    """A tile's share of dV `[block_k, Dv]`, fp32. Where the operands' dtype reaches fp32's range (bf16,
-    fp32), the weights `p` narrowed to it against the output's cotangent as it is, FlashAttention's
-    form: no rounding of a cotangent of its own, so a query's cotangents that cancel across a key still
-    cancel. fp16 would underflow a small weight or a small share of a cotangent, so there the unnormalized
-    weights `exp(s - m)` narrowed to it as the reference's forward rounds them, against each query's
-    `dout / total` in fp32, the reference's derivative's own order."""
-    if _wide_enough(dout.dtype):
+    """A tile's share of dV `[block_k, Dv]`, fp32: the unnormalized weights `exp(s - m)` narrowed to the
+    operands' dtype as the reference's forward rounds them, against each query's `dout / total` in fp32,
+    the reference's derivative's own order, so no small weight or share is lost to normalizing first.
+    bf16 alone takes FlashAttention's form, its normalized weights `p` narrowed against the output's
+    cotangent as it is, so the product stays on bf16's tensor cores: a query's cotangents that cancel
+    across a key still cancel, and a normalized weight below bf16's least subnormal (about 9e-41) is
+    dropped, which only a cotangent past about 1e28 would make count."""
+    if dout.dtype == jnp.bfloat16:
         return _dot(weights.astype(dout.dtype).T, dout, interpret)
     scaled = dout.astype(jnp.float32) * _inverse(total)[:, None]
     return _dot(exponentials.astype(dout.dtype).astype(jnp.float32).T, scaled, interpret)
@@ -842,7 +837,7 @@ def _launch_cost(ba: tokamax.BoundArguments, config: BackwardTiles, target: gene
         written += 4 * sum(param.size for param, kind in zip(ba.arguments["score_params"], kinds, strict=True)
                            if kind == Kind.KEY)
     wide = 0
-    if not dq and not _wide_enough(query.dtype):
+    if not dq and query.dtype == jnp.float16:
         # fp16's dV product runs in fp32 (`_value_gradient`), after the launch's 16-bit work.
         products, wide = products - value_width, value_width
     seconds = costs.seconds(costs.Cost(
