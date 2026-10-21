@@ -1323,3 +1323,31 @@ def test_a_finite_mixture_resumed_after_a_member_ends_reads_what_the_uninterrupt
             assert ids(resumed) == expected[step:]
         finally:
             resumed.close()
+
+
+def test_phases_read_each_chain_until_its_step_as_the_phased_text_recipe(tmp_path):
+    """Two token stores read one until step two, then a mix of both, each store packed alone by the
+    lm preset and the phases ordered and batched after: the phased text recipe's plan."""
+    from dew.config.data import DataPhase, TextData, loader
+    from dew.data import phases, presets
+    from dew.data.sources import TokenFiles
+
+    first, second = tmp_path / "first", tmp_path / "second"
+    # Documents of nine tokens, each ended by EOS (0).
+    for path, size in ((first, 200), (second, 300)):
+        ids = np.where(np.arange(size) % 10 == 9, 0, np.arange(size) % 250 + 1).astype(np.uint16)
+        write_token_corpus(path, ids, eos_id=0)
+    loading = Loading(workers=0, threads=1, read_buffer=1)
+    recipe = TextData(source="", seq_len=8, pack="first-fit",
+                      phases=(DataPhase(str(first), 2), DataPhase({str(first): 1.0, str(second): 1.0}, None)))
+    expected = loader(recipe, batch=2, read="indexed", loading=loading)
+
+    def packed(path):
+        # Eight open rows, the recipe's default.
+        return TokenFiles(str(path)).pipe(presets.lm, None, seq_len=8, batch=None, pack="first-fit", bins=8)
+
+    # The phases ordered and repeated as the recipe's loader orders them, then batched.
+    phased = phases((packed(first), 2), (mix([packed(first), packed(second)], by="tokens"), None))
+    chain = phased.shuffle(0).repeat().batch(2)
+    built = compile(chain, read="indexed", loading=loading)
+    assert built.plan.identity() == expected.plan.identity()

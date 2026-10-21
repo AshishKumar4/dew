@@ -999,6 +999,16 @@ def mix(datasets: Sequence[Dataset], weights: Sequence[float] | None = None, *,
     return Pipeline(Mixture(chains, shares, tokens))
 
 
+def phases(*entries: tuple[Dataset, int | None]) -> Pipeline:
+    """Datasets read one after another: each `(dataset, until_step)` until the training step it
+    names, the last until the run ends (`None`). Each phase is a whole chain, laid out and batched
+    as it reads, each of the same batch."""
+    if not entries:
+        raise ValueError("phases need at least one (dataset, until_step)")
+    return Pipeline(Phases(tuple(dataset._chain() for dataset, _ in entries),
+                           tuple(until for _, until in entries)))
+
+
 @dataclasses.dataclass(frozen=True)
 class ObjectiveData:
     train: tuple[RecordStep | pygrain.RandomMapTransform | Expansion | Configured, ...] = ()
