@@ -68,9 +68,10 @@ def model_flags(record):
     return flags
 
 
-def windows(tokens, split: str | None = None, **settings):
-    """The store's windows of SEQ tokens in batches of 8 (`presets.lm`), its `split` where named."""
-    store = TokenFiles(str(tokens)) if split is None else TokenFiles(str(tokens)).holdout(split=split)[1]
+def windows(corpus, held: bool = False, **settings):
+    """The corpus's training store's windows of SEQ tokens in batches of 8 (`presets.lm`), or its
+    validation store's where `held`."""
+    store = TokenFiles(corpus.val if held else corpus.train)
     chain = store.pipe(presets.lm, None, seq_len=SEQ, batch=8, pack=None, **settings)
     return chain.loading(Loading(workers=0))
 
@@ -78,9 +79,9 @@ def windows(tokens, split: str | None = None, **settings):
 def run_config(tokens, *args, model='{"emb_features": 16, "num_layers": 1, "num_heads": 2}', **settings):
     """The recipe's run from its command line over the store's windows (`windows`), scored on its
     validation split."""
-    default = LMRunConfig(data=windows(tokens, **settings), validation=windows(tokens, "val", **settings))
+    default = LMRunConfig(data=windows(tokens, **settings), validation=windows(tokens, held=True, **settings))
     return LMRunConfig.cli([
-        *args, "--trainer.checkpoint-dir", str(tokens.parent / "runs"),
+        *args, "--trainer.checkpoint-dir", str(Path(tokens.train).parents[1] / "runs"),
         "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
         "--trainer.log-every", "1", "--model.dtype", "float32", *model_flags(model)], default=default)
 
@@ -134,8 +135,8 @@ def test_the_recipe_trains_on_weighted_corpora(tmp_path):
     second = write_token_files(tmp_path / "second", 24 * SEQ, 8 * SEQ, eos_id=0)
 
     def packed(store):
-        return TokenFiles(str(store)).pipe(presets.lm, None, seq_len=SEQ, batch=None, pack="first-fit",
-                                           bins=2)
+        return TokenFiles(store.train).pipe(presets.lm, None, seq_len=SEQ, batch=None, pack="first-fit",
+                                            bins=2)
 
     mixture = mix([packed(first), packed(second)], [0.7, 0.3], by="tokens").batch(8).read("memory")
     config = LMRunConfig.cli([
@@ -201,7 +202,7 @@ def export_tiny_decoder(directory, *, tokenizer="byte", vocab_size=256):
 
 
 def recipe_args(tokens, *args, model_config="{}"):
-    return [*args, "--trainer.checkpoint-dir", str(tokens.parent / "runs"),
+    return [*args, "--trainer.checkpoint-dir", str(Path(tokens.train).parents[1] / "runs"),
             "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
             "--trainer.log-every", "1", "--model.dtype", "float32",
             *model_flags(model_config)]
@@ -210,7 +211,7 @@ def recipe_args(tokens, *args, model_config="{}"):
 def pretrained_config(tokens, pretrained, *args, model_config="{}"):
     return LMRunConfig.cli(recipe_args(tokens, "--pretrained", str(pretrained), *args,
                                        model_config=model_config),
-                           default=LMRunConfig(data=windows(tokens), validation=windows(tokens, "val")))
+                           default=LMRunConfig(data=windows(tokens), validation=windows(tokens, held=True)))
 
 
 def test_a_pretrained_run_starts_from_the_checkpoints_weights(tmp_path):
@@ -453,20 +454,15 @@ def test_masked_diffusion_trains_on_packed_documents(tmp_path):
     from dew.objectives.base import Step
 
     checkpoint = REPO_ROOT / "tests/fixtures/hf/llada-tiny"
-    directory = tmp_path / "tokens"
-    directory.mkdir()
-    for split, count in (("train", 400), ("val", 96)):
-        ids = np.random.RandomState(count).randint(4, 100, count).astype(np.uint8)
+    splits = [np.random.RandomState(count).randint(4, 100, count) for count in (400, 96)]
+    for ids in splits:
         ids[6::7] = 1  # every seventh id ends a document
-        (directory / f"{split}.bin").write_bytes(ids.tobytes())
-    (directory / "meta.json").write_text(json.dumps(
-        {"tokenizer": str(checkpoint), "vocab_size": 100, "dtype": "uint8", "eos_id": 1,
-         "train_tokens": 400, "val_tokens": 96}))
-    def packed(split=None):
-        store = TokenFiles(str(directory))
-        store = store if split is None else store.holdout(split=split)[1]
-        return store.pipe(presets.lm, None, seq_len=11, batch=8, pack="first-fit").read("memory").loading(
-            Loading(workers=0))
+    corpus = write_token_corpus(tmp_path / "tokens", *splits, tokenizer=str(checkpoint), vocab_size=100,
+                                eos_id=1)
+
+    def packed(url):
+        windows = TokenFiles(url).pipe(presets.lm, None, seq_len=11, batch=8, pack="first-fit")
+        return windows.read("memory").loading(Loading(workers=0))
 
     config = LMRunConfig.cli([
         "--pretrained", str(checkpoint), "--objective", "masked_diffusion", "--tokenizer", str(checkpoint),
@@ -475,7 +471,7 @@ def test_masked_diffusion_trains_on_packed_documents(tmp_path):
         "--trainer.checkpoint-dir", str(tmp_path / "runs"), "--trainer.name", "packed",
         "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False",
         "--objective.ema-decay", "None", "--max-new-tokens", "0"],
-        default=LMRunConfig(data=packed(), validation=packed("val")))
+        default=LMRunConfig(data=packed(corpus.train), validation=packed(corpus.val)))
 
     state = config.run()
 
@@ -502,15 +498,9 @@ def test_masked_diffusion_continues_a_pretrained_checkpoint(tmp_path):
     from dew.interop import Pretrained
 
     checkpoint = REPO_ROOT / "tests/fixtures/hf/llada-tiny"
-    directory = tmp_path / "tokens"
-    directory.mkdir()
-    for split, count in (("train", 400), ("val", 96)):
-        ids = np.random.RandomState(count).randint(4, 100, count).astype(np.uint8)
-        (directory / f"{split}.bin").write_bytes(ids.tobytes())
-    (directory / "meta.json").write_text(json.dumps(
-        {"tokenizer": str(checkpoint), "vocab_size": 100, "dtype": "uint8", "eos_id": 1,
-         "train_tokens": 400, "val_tokens": 96}))
-    data = TokenFiles(str(directory)).pipe(presets.lm, None, seq_len=11, batch=8, pack=None).loading(
+    corpus = write_token_corpus(tmp_path / "tokens", np.random.RandomState(400).randint(4, 100, 400),
+                                tokenizer=str(checkpoint), vocab_size=100, eos_id=1)
+    data = TokenFiles(corpus.train).pipe(presets.lm, None, seq_len=11, batch=8, pack=None).loading(
         Loading(workers=0))
     config = LMRunConfig.cli([
         "--pretrained", str(checkpoint), "--objective", "masked_diffusion", "--tokenizer", str(checkpoint),
@@ -543,13 +533,9 @@ DIFFUSION_GEMMA = REPO_ROOT / "tests/fixtures/hf/diffusion-gemma-sft"
 def gemma_spans(directory):
     """Windows of 11 inputs, eight a batch, over a token store of random ids in DIFFUSION_GEMMA's
     vocabulary written to `directory`: what a block-diffusion recipe run trains on."""
-    directory.mkdir()
-    for split, count in (("train", 160), ("val", 32)):
-        ids = np.random.RandomState(count).randint(4, 32, count).astype(np.uint8)
-        (directory / f"{split}.bin").write_bytes(ids.tobytes())
-    (directory / "meta.json").write_text(json.dumps(
-        {"tokenizer": str(DIFFUSION_GEMMA), "vocab_size": 32, "dtype": "uint8", "eos_id": 1}))
-    return TokenFiles(str(directory)).pipe(presets.lm, None, seq_len=11, batch=8, pack=None).loading(
+    corpus = write_token_corpus(directory, np.random.RandomState(160).randint(4, 32, 160),
+                                tokenizer=str(DIFFUSION_GEMMA), vocab_size=32, eos_id=1)
+    return TokenFiles(corpus.train).pipe(presets.lm, None, seq_len=11, batch=8, pack=None).loading(
         Loading(workers=0))
 
 

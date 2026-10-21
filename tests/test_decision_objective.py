@@ -364,14 +364,7 @@ def test_a_saved_vision_run_answers_image_rows(tmp_path, separate_tokenizer):
     base = DecisionObjective(source, tokenizer=tokenizer, layout=layout)
     task = Decide(base.model, base.init(jax.random.key(0)), layout, tokenizer, base.specials,
                   processor=source.processor)
-    objective = DecisionObjective(task)
-    data = decision_rows(EXAMPLES, 8, objective=objective.data())
-    run = tmp_path / "run"
-    checkpoints = Checkpoints(str(run), keep=1)
-    state = Trainer(objective, optax.adam(1e-3), key=0, checkpoints=checkpoints).fit(
-        data, steps=1, log_every=100, checkpoint_every=1)
-    checkpoints.wait()
-    live, reloaded = objective.pipeline(state), Decide.from_run(str(run))
+    objective, live, reloaded = saved_and_reloaded(task, tmp_path / "run")
     images = [Image.fromarray(array) for array in np.load(directory / "images.npy")]
     asked = {"team": INTENT}
     first = live("charged twice!", asked, images=images)["team"].probabilities
@@ -382,6 +375,17 @@ def test_a_saved_vision_run_answers_image_rows(tmp_path, separate_tokenizer):
     assert reloaded.processor.source == str(directory)
     assert objective.inference_record()["processor"] == str(directory)
     assert not np.array_equal(second, reloaded("charged twice!", asked)["team"].probabilities)
+
+
+def saved_and_reloaded(task, run):
+    """`task`'s decision objective, the task one checkpointed step over EXAMPLES trains, and that task
+    as `Decide.from_run` reads it back from the run directory `run`."""
+    objective = DecisionObjective(task)
+    checkpoints = Checkpoints(str(run), keep=1)
+    state = Trainer(objective, optax.adam(1e-3), key=0, checkpoints=checkpoints).fit(
+        decision_rows(EXAMPLES, 8, objective=objective.data()), steps=1, log_every=100, checkpoint_every=1)
+    checkpoints.wait()
+    return objective, objective.pipeline(state), Decide.from_run(str(run))
 
 
 def test_a_saved_byte_decision_run_records_no_tokenizer_backed_processor(tmp_path):
@@ -404,14 +408,7 @@ def test_a_saved_byte_decision_run_records_no_tokenizer_backed_processor(tmp_pat
     base = DecisionObjective(source, tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT)
     task = Decide(base.model, base.init(jax.random.key(0)), LAYOUT, TOKENIZER, SPECIALS,
                   processor=source.processor)
-    objective = DecisionObjective(task)
-    data = decision_rows(EXAMPLES, 8, objective=objective.data())
-    run = tmp_path / "run"
-    checkpoints = Checkpoints(str(run), keep=1)
-    state = Trainer(objective, optax.adam(1e-3), key=0, checkpoints=checkpoints).fit(
-        data, steps=1, log_every=100, checkpoint_every=1)
-    checkpoints.wait()
-    live, reloaded = objective.pipeline(state), Decide.from_run(str(run))
+    objective, live, reloaded = saved_and_reloaded(task, tmp_path / "run")
 
     assert source.processor is not None
     assert objective.inference_record()["processor"] is None
