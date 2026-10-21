@@ -240,7 +240,7 @@ def test_run_record_names_the_package_checkout_and_hardware(tmp_path, monkeypatc
     run = TrackedRun()
     monkeypatch.setattr(wandb, 'init', lambda **_: run)
     config = RunConfig(trainer=TrainerConfig(
-        name='telemetry', steps=2, batch_size=8, checkpoint_dir=str(tmp_path), log_every=1,
+        name='telemetry', steps=2, checkpoint_dir=str(tmp_path), log_every=1,
         eval_every=None, checkpoint_every=None, wandb=Wandb('dew', 'ashishkumar4', offline=True)))
     root = Path(dew.config.__file__).resolve().parents[3]
     expected_sha = subprocess.check_output(['git', '-C', str(root), 'rev-parse', 'HEAD'], text=True).strip()

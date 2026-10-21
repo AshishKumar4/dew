@@ -6,13 +6,12 @@ import hashlib
 import json
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Annotated, Literal
+from typing import Literal
 
 import numpy as np
 
 from dew import records
-from dew.data.holdout import HoldOut, SourceValue, Split, Validation, _branches, _named_split, source_argument
-from dew.data.pipeline import Configured, HostStep, Pipeline, mix
+from dew.data.pipeline import Configured, Dataset, Pipeline, mix
 from dew.data.sources.base import Read, ShardManifest, Source, _consumed
 from dew.decision.questions import Choice, Question
 from dew.records import JSON, json_value, record
@@ -130,8 +129,11 @@ def _slots(stated: Mapping[str, object]) -> dict[str, int]:
 
 @dataclass(frozen=True)
 class ParseExample:
+    """A row of an example's fields as its `Example`, or a row that holds its `Example` already as it is."""
+
     def __call__(self, row: Mapping[str, object]) -> Mapping[str, object]:
-        return {"example": Example.of(row)}
+        held = row.get("example")
+        return {"example": held if isinstance(held, Example) else Example.of(row)}
 
 
 @dataclass(frozen=True)
@@ -264,201 +266,133 @@ class _DecisionSource:
         return self.source.manifest()
 
 
-@dataclass(frozen=True)
-class Decisions:
-    """Decision rows and their corpus shares, with layout supplied by the objective."""
+def decisions(dataset: Dataset, *, options: Sequence[str] = (), text: str = "text", label: str = "label",
+              question: str = "label",
+              instructions: str = "Classify the input into the correct category.") -> Pipeline:
+    """`dataset`'s rows as decisions, each an `Example` under `example`, for a chain to batch: a flat
+    table's `text` and `label` columns read as one `question` over `options` (its ClassLabel names, or
+    read whole in memory, where none are given), or rows that hold their examples already. Its stages
+    before this one, a holdout's selection among them, stand; a decision chain is a store's rows, and
+    a mixture of them mixes decision chains (`mixture`). Raises ValueError for a mixture or phases
+    under it."""
+    from dew.data.sources.base import Source
 
-    source: Annotated[
-        str
-        | Source
-        | Sequence[Example | Mapping[str, object]]
-        | Mapping[str, Sequence[Example | Mapping[str, object]]],
-        source_argument(SourceValue),
-    ] = "tickets.csv"
-    validation: Annotated[
-        Validation | Sequence[Example | Mapping[str, object]], source_argument(Validation)
-    ] = None
-    weights: Mapping[str, float] = field(default_factory=dict)
-    options: tuple[str, ...] = ()
-    text: str = "text"
-    label: str = "label"
-    question: str = "label"
-    instructions: str = "Classify the input into the correct category."
-    split: str = "train"
-    descriptor: str | None = None
+    chain = dataset._chain()
+    if not isinstance(chain.source, Source):
+        raise ValueError("decisions reads a store's rows; mix decision chains rather than reading a mixture")
+    table = ParseTable(tuple(options), text, label, question, instructions)
+    wrapped = _DecisionSource(chain.source, {"questions": 1, "options": len(options)} if options else None,
+                              table=table)
+    return dataclasses.replace(chain, source=wrapped).map(Configured(_ParseConfigured(table), needs=()))
 
-    def pipelines(self) -> tuple[Pipeline, Pipeline | None, tuple[HostStep, ...]]:
-        from dew.data.sources import Memory, source
-        from dew.data.storage import Store
 
-        table = ParseTable(self.options, self.text, self.label, self.question, self.instructions)
-        if isinstance(self.source, Mapping):
-            branches = [
-                dataclasses.replace(
-                    dataclasses.replace(self, source=rows, validation=None, weights={}).pipelines()[0],
-                    name=name,
-                )
-                for name, rows in sorted(self.source.items())
-            ]
-            weights = [self.weights.get(name, 1.0) for name in sorted(self.source)]
-            train = branches[0] if len(branches) == 1 else mix(branches, weights)
-            held = (
-                None
-                if self.validation is None
-                else dataclasses.replace(self, source=(), weights={}).pipelines()[1]
-            )
-            return train, held, ()
-        if isinstance(self.source, str):
-            root = Store(self.source)
-            fs, path = root.resolve()
-            mixture = path.rstrip("/") + "/mixture.json"
-            if fs.exists(mixture):
-                return self._mixture(self.source)
-        if isinstance(self.source, Sequence) and not isinstance(self.source, str):
-            rows = tuple({"example": row} if isinstance(row, Example) else row for row in self.source)
-            dataset = _DecisionSource(Memory(rows), table=table)
-            dataset.records("memory")
-            if any("example" not in row for row in rows):
-                dataset.records("memory")
-                train = Pipeline(dataset, name="examples").map(Configured(_ParseConfigured(table), needs=()))
-            else:
-                train = Pipeline(dataset, name="examples")
-        else:
-            dataset = _DecisionSource(
-                source(self.source, split=self.split),
-                {"questions": 1, "options": len(self.options)} if self.options else None,
-                table=table,
-            )
-            train = Pipeline(dataset, name="examples").map(Configured(_ParseConfigured(table), needs=()))
-        if self.validation is None:
-            evaluated = None
-        elif isinstance(self.validation, HoldOut):
-            train, evaluated = _branches(dataset, self.validation, split=self.split, prefix=train.stages)
-        elif isinstance(self.validation, Pipeline):
-            evaluated = self.validation
-        elif isinstance(self.validation, Split):
-            held_source = _DecisionSource(_named_split(dataset.source, self.validation.name), table=table)
-            evaluated = Pipeline(held_source).map(Configured(_ParseConfigured(table), needs=()))
-        elif isinstance(self.validation, Sequence) and not isinstance(self.validation, str):
-            rows = tuple({"example": Example.of(row)} for row in self.validation)
-            held_source = _DecisionSource(Memory(rows))
-            held_source._memory_slots(rows)
-            evaluated = Pipeline(held_source, name="held out")
-        else:
-            evaluated = Pipeline(_DecisionSource(source(self.validation), table=table)).map(
-                Configured(_ParseConfigured(table), needs=())
-            )
-        return train, evaluated, ()
+def mixture(root_url: str, *, weights: Mapping[str, float] | None = None,
+            descriptor: str | None = None) -> tuple[Pipeline, Pipeline | None]:
+    """The decision corpora of the mixture directory `root_url` (its `mixture.json`): every corpus of a
+    positive weight, the manifest's weights over `weights`, mixed by them for training, and their held
+    rows together, or None where none has any. `descriptor` pins a replaced manifest by its URL."""
+    from dew.data.sources import Source
+    from dew.data.sources.concatenate import Concatenate
 
-    def _mixture(self, root_url: str) -> tuple[Pipeline, Pipeline | None, tuple[HostStep, ...]]:
-        from dew.data.sources import Source
-        from dew.data.sources.concatenate import Concatenate
+    stated, pinned = _stated(root_url, descriptor)
+    shares = {
+        name: records.number(value, f"weights.{name}")
+        for name, value in record(stated.get("weights", {}), "weights").items()
+    } | dict(weights or {})
+    training, held, kept = [], [], []
+    for name, weight in sorted(shares.items()):
+        if weight <= 0:
+            continue
+        for split, destination in (("train", training), ("held", held)):
+            read = _corpus(root_url, stated, pinned, name, split)
+            if read is not None:
+                destination.append(read)
+        kept.append(weight)
+    if not training:
+        raise ValueError(f"no corpus of {root_url} has a positive weight")
+    train = training[0] if len(training) == 1 else mix(training, kept)
+    evaluated = None if not held else Pipeline(_DecisionSource(
+        Concatenate(tuple(child.source for child in held if isinstance(child.source, Source))),
+        _slots(stated) or None, descriptor=pinned)).map(ParseExample())
+    return train, evaluated
 
-        stated, pinned = self._stated(root_url)
-        shares = {
-            name: records.number(value, f"weights.{name}")
-            for name, value in record(stated.get("weights", {}), "weights").items()
-        } | dict(self.weights)
-        training, held, weights = [], [], []
-        for name, weight in sorted(shares.items()):
-            if weight <= 0:
-                continue
-            for split, destination in (("train", training), ("held", held)):
-                read = self._corpus(root_url, stated, pinned, name, split)
-                if read is not None:
-                    destination.append(read)
-            weights.append(weight)
-        if not training:
-            raise ValueError(f"no corpus of {self.source} has a positive weight")
-        train = training[0] if len(training) == 1 else mix(training, weights)
-        evaluated = (
-            None
-            if not held
-            else Pipeline(
-                _DecisionSource(
-                    Concatenate(tuple(child.source for child in held if isinstance(child.source, Source))),
-                    _slots(stated) or None,
-                    descriptor=pinned,
-                )
-            ).map(ParseExample())
-        )
-        return train, evaluated, ()
 
-    def corpus(self, name: str, split: Literal["train", "held"] = "held") -> Pipeline | None:
-        """Corpus `name`'s `split` of this mixture as decision loading reads it, from the
-        shards and index its manifest names (or the corpus's one JSONL file), each row an
-        `Example` under `example`; None when the corpus has no such split. A benchmark reads
-        one corpus's held rows through this, whatever its weight."""
-        if not isinstance(self.source, str):
-            raise ValueError("a corpus is read from a mixture directory's manifest")
-        stated, pinned = self._stated(self.source)
-        return self._corpus(self.source, stated, pinned, name, split)
+def corpus(root_url: str, name: str, split: Literal["train", "held"] = "held",
+           descriptor: str | None = None) -> Pipeline | None:
+    """Corpus `name`'s `split` of the mixture directory `root_url` as decision loading reads it, from the
+    shards and index its manifest names (or the corpus's one JSONL file), each row an `Example` under
+    `example`; None when the corpus has no such split. A benchmark reads one corpus's held rows through
+    this, whatever its weight."""
+    stated, pinned = _stated(root_url, descriptor)
+    return _corpus(root_url, stated, pinned, name, split)
 
-    def _stated(self, root_url: str) -> tuple[Mapping[str, object], Mapping[str, object]]:
-        """The mixture's manifest, as its descriptor pins it, and that pin."""
-        from dew.data.storage import Store
 
-        fs, path = Store(root_url).resolve()
-        with fs.open(path.rstrip("/") + "/mixture.json", "rb") as handle:
-            stated = record(json.load(handle), "mixture.json")
-        return self._descriptor(root_url, stated)
+def _stated(root_url: str, descriptor: str | None) -> tuple[Mapping[str, object], Mapping[str, object]]:
+    """The mixture's manifest, as `descriptor` pins it, and that pin."""
+    from dew.data.storage import Store
 
-    def _corpus(self, root_url: str, stated: Mapping[str, object], pinned: Mapping[str, object],
-                name: str, split: str) -> Pipeline | None:
-        """Corpus `name`'s `split` from manifest `stated` (`corpus`)."""
-        from dew.data.sources import Files
-        from dew.data.storage import Store
+    fs, path = Store(root_url).resolve()
+    with fs.open(path.rstrip("/") + "/mixture.json", "rb") as handle:
+        stated = record(json.load(handle), "mixture.json")
+    return _descriptor(root_url, stated, descriptor)
 
-        root = root_url.rstrip("/")
-        corpus = record(record(stated.get("files", {}), "mixture files").get(name, {}), f"files.{name}")
-        entry = record(corpus.get(split, {}), f"files.{name}.{split}")
-        shards = entry.get("shards")
-        if isinstance(shards, list):
-            listed = [record(shard, "shard") for shard in shards]
-            declared: dict[str, Mapping[str, object]] | None = {
-                root + "/" + records.text(shard["path"], "shard.path"): shard for shard in listed
-            }
-            paths = tuple(declared)
-        else:
-            declared = None
-            url = root + f"/{name}{'.held' if split == 'held' else ''}.jsonl"
-            shard_fs, shard_path = Store(url).resolve()
-            paths = (url,) if shard_fs.exists(shard_path) else ()
-        if not paths:
-            return None
-        index = record(entry.get("index", {}), "index").get("path")
-        source_index = None if index is None else root + "/" + records.text(index, "index.path")
-        if declared is not None and source_index is not None:
-            declared[source_index] = record(entry["index"], "index")
-        dataset = _DecisionSource(Files(paths, format="jsonl", index=source_index, file_info=declared),
-                                  _slots(stated) or None, descriptor=pinned)
-        return Pipeline(dataset, name=name).map(ParseExample())
 
-    def _descriptor(
-        self, root_url: str, stated: Mapping[str, object]
-    ) -> tuple[Mapping[str, object], Mapping[str, object]]:
-        from dew.data.storage import Store
+def _corpus(self, root_url: str, stated: Mapping[str, object], pinned: Mapping[str, object],
+            name: str, split: str) -> Pipeline | None:
+    """Corpus `name`'s `split` from manifest `stated` (`corpus`)."""
+    from dew.data.sources import Files
+    from dew.data.storage import Store
 
-        root = Store(root_url)
-        pinned: dict[str, JSON] = {}
-        if self.descriptor is not None:
-            payload = Store(self.descriptor).read()
-            replaced = record(json.loads(payload), "decision descriptor")
-            provenance = record(replaced.get("provenance"), "descriptor provenance")
-            root_manifest = root.child("manifest.sha256").read().decode().strip()
-            if provenance.get("original_manifest_sha") != root_manifest:
-                raise ValueError("decision descriptor refers to a different canonical source manifest")
-            original_files = record(stated.get("files", {}), "original files")
-            for name, value in record(replaced.get("files", {}), "descriptor files").items():
-                old = record(original_files.get(name), f"original files.{name}")
-                for partition, entry in record(value, name).items():
-                    if record(entry, partition).get("sha256") != record(old.get(partition), partition).get(
-                        "sha256"
-                    ):
-                        raise ValueError(f"decision descriptor changes raw corpus {name}/{partition}")
-            stated = replaced
-            pinned = {"url": self.descriptor, "sha256": hashlib.sha256(payload).hexdigest()}
-        return stated, pinned
+    root = root_url.rstrip("/")
+    corpus = record(record(stated.get("files", {}), "mixture files").get(name, {}), f"files.{name}")
+    entry = record(corpus.get(split, {}), f"files.{name}.{split}")
+    shards = entry.get("shards")
+    if isinstance(shards, list):
+        listed = [record(shard, "shard") for shard in shards]
+        declared: dict[str, Mapping[str, object]] | None = {
+            root + "/" + records.text(shard["path"], "shard.path"): shard for shard in listed
+        }
+        paths = tuple(declared)
+    else:
+        declared = None
+        url = root + f"/{name}{'.held' if split == 'held' else ''}.jsonl"
+        shard_fs, shard_path = Store(url).resolve()
+        paths = (url,) if shard_fs.exists(shard_path) else ()
+    if not paths:
+        return None
+    index = record(entry.get("index", {}), "index").get("path")
+    source_index = None if index is None else root + "/" + records.text(index, "index.path")
+    if declared is not None and source_index is not None:
+        declared[source_index] = record(entry["index"], "index")
+    dataset = _DecisionSource(Files(paths, format="jsonl", index=source_index, file_info=declared),
+                              _slots(stated) or None, descriptor=pinned)
+    return Pipeline(dataset, name=name).map(ParseExample())
+
+
+def _descriptor(root_url: str, stated: Mapping[str, object],
+                descriptor: str | None) -> tuple[Mapping[str, object], Mapping[str, object]]:
+    from dew.data.storage import Store
+
+    root = Store(root_url)
+    pinned: dict[str, JSON] = {}
+    if descriptor is not None:
+        payload = Store(descriptor).read()
+        replaced = record(json.loads(payload), "decision descriptor")
+        provenance = record(replaced.get("provenance"), "descriptor provenance")
+        root_manifest = root.child("manifest.sha256").read().decode().strip()
+        if provenance.get("original_manifest_sha") != root_manifest:
+            raise ValueError("decision descriptor refers to a different canonical source manifest")
+        original_files = record(stated.get("files", {}), "original files")
+        for name, value in record(replaced.get("files", {}), "descriptor files").items():
+            old = record(original_files.get(name), f"original files.{name}")
+            for partition, entry in record(value, name).items():
+                if record(entry, partition).get("sha256") != record(old.get(partition), partition).get(
+                    "sha256"
+                ):
+                    raise ValueError(f"decision descriptor changes raw corpus {name}/{partition}")
+        stated = replaced
+        pinned = {"url": descriptor, "sha256": hashlib.sha256(payload).hexdigest()}
+    return stated, pinned
 
 
 @dataclass(frozen=True)
