@@ -33,7 +33,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
-from interop_support import assert_layout_tensors, extract_fixture, fixture_arrays
+from interop_support import assert_transformer_exports, extract_fixture, fixture_arrays, source_transformer
 from reference_error import assert_as_exact_as_the_reference, assert_no_less_exact, float64_terms, widened
 
 from dew.diffusion.process import DenoisingCondition
@@ -62,17 +62,13 @@ def channels_last(value):
 
 
 def load(source, name):
-    config = json.loads((source / name / "transformer" / "config.json").read_text())
-    model = WanTransformer(**wan_fields(config, dtype="float32", attention_impl="xla"))
-    params, layouts = read_transformer(component_tensors(source / name, "transformer"), wan_path)
-    return model, params, layouts
+    return source_transformer(source, name, WanTransformer, wan_fields, wan_path)
 
 
 @pytest.mark.parametrize("name", CASES)
 def test_every_published_tensor_maps_and_exports_bit_identical(source, name):
     _, params, layouts = load(source, name)
-    tensors = component_tensors(source / name, "transformer")
-    assert_layout_tensors(layouts, {"params": params}, tensors, "transformer/")
+    assert_transformer_exports(source, name, layouts, params)
 
 
 @pytest.mark.parametrize("name", CASES)
