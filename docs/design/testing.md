@@ -55,9 +55,7 @@ The GPU tier uses real checkpoints and representative shapes on each target a ch
 
 ## Numerical accuracy
 
-`tests/reference_error.py` owns the acceptance rule. It compares each output and gradient element with float64 truth. The bound comes from the reference implementation's own measured error at that element over multiple reduction orders, with the approved parity factor and fresh-order confirmation. It is NaN-safe and relative to each element's own magnitude, so a large entry cannot hide a wrong small one.
-
-There is no independent error floor: no leaf RMS, dtype epsilon allowance, row-size term, reduction-size term or cancellation allowance. A failure is a defect in Dew, the reference arm or the bound's derivation. Find which one. Never widen a tolerance, change the reference to one Dew already matches, drop failing positions or gradients, or compare only argmax when logits disagree.
+`tests/reference_error.py` owns the acceptance rule and states it: every comparison of Dew's outputs and gradients with float64 truth goes through its assertion, and nothing here restates the rule. A failure is a defect in Dew, the reference arm or the rule's derivation. Find which one. Never widen a tolerance, change the reference to one Dew already matches, drop failing positions or gradients, or compare only argmax when logits disagree.
 
 The committed generator uses the reference's public interface. Kernel qualification records forward, backward and forward-mode behavior where the consuming objective needs it.
 

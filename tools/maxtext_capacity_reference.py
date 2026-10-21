@@ -16,7 +16,6 @@ Run with the Dew test environment's jax, on CPU:
     python tools/maxtext_capacity_reference.py OUTPUT.npz
 """
 
-import json
 import math
 import sys
 import types
@@ -25,7 +24,7 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
-from reference_source import CACHE as UPSTREAM, defined_in, verified
+from reference_source import CACHE as UPSTREAM, defined_in, saved_fixture, verified
 
 REPO, COMMIT = "AI-Hypercomputer/maxtext", "733b5a9147ed87ecf509fbb4779ed187f56c6045"
 PATH = "src/maxtext/layers/moe.py"
@@ -79,8 +78,7 @@ def main():
     meta = {"repo": REPO, "commit": COMMIT, "path": PATH, "sha256": DIGEST,
             "cases": {case: dict(zip(("batch", "length", "experts", "top_k", "factor"), shape, strict=True))
                       for case, shape in CASES.items()}, "jax": jax.__version__}
-    arrays["meta"] = np.frombuffer(json.dumps(meta).encode(), np.uint8)
-    np.savez_compressed(sys.argv[1], **arrays)
+    saved_fixture(Path(sys.argv[1]), arrays, meta)
     print(f"{sys.argv[1]}: {Path(sys.argv[1]).stat().st_size / 1e6:.3f} MB, {len(arrays)} arrays")
 
 

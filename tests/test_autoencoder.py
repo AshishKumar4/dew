@@ -17,7 +17,11 @@ import numpy as np
 import pytest
 from reference_error import assert_as_exact_as_the_reference
 
+from dew.diffusion import presets
+from dew.inputs import Field, InputSpec
 from dew.nn.autoencoders import AutoEncoder, AutoencoderKL, StableDiffusionVAE
+from dew.nn.backbones import SimpleDiT
+from dew.objectives.base import Recorder, Step
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "vae"
 
@@ -134,6 +138,47 @@ def _published(kind: str, directory: Path):
     overrides = {"latent_shift": 0.25, "latent_scale": 0.5} if kind == "dc_ae" else {}
     autoencoder = PretrainedAutoencoder(modelname=str(source), dtype="float32", **overrides).build()
     return autoencoder, autoencoder.params
+
+
+@pytest.mark.parametrize("kind", ["sd_vae", "dc_ae", "wan", "rae", "flux2", "qwen_image"])
+def test_a_stochastic_encoder_samples_at_its_given_noise_and_a_deterministic_one_refuses_it(kind, tmp_path):
+    """A training step hands each example's posterior draw to the encoder as `noise`, in the latent's
+    own layout: a stochastic encoder's latent is its posterior's sample at it, its mean at zero noise
+    whatever the key and another latent at other noise; a deterministic one (DC-AE, RAE) has no posterior
+    to draw and refuses noise, and a latent objective over it draws none (`AutoEncoder.stochastic`)."""
+    from dew.objectives.diffusion import DiffusionObjective
+
+    if kind == "sd_vae":
+        autoencoder = tiny_vae()
+        params = autoencoder.params
+    else:
+        autoencoder, params = _published(kind, tmp_path)
+    side = 2 * autoencoder.downscale_factor
+    frames = (5,) if kind == "wan" else ()
+    shape = (*frames, side, side, getattr(autoencoder.model, "image_channels", 3))
+    image = jax.random.uniform(jax.random.key(0), (2, *shape), minval=-1.0, maxval=1.0)
+    noise = jax.random.normal(jax.random.key(1), (2, *autoencoder.latent_shape(shape)), jnp.float32)
+    assert autoencoder.stochastic is (kind not in ("dc_ae", "rae"))
+    if not autoencoder.stochastic:
+        with pytest.raises(TypeError):
+            autoencoder.encode(params, image, noise=noise)
+        recorder = Recorder()
+        objective = DiffusionObjective(SimpleDiT(output_channels=autoencoder.latent_channels, patch_size=1,
+                                                 emb_features=16, num_layers=1, num_heads=2, mlp_ratio=1),
+                                       presets.EDM(regime="latent")(),
+                                       InputSpec(Field("image", shape)), autoencoder=autoencoder)
+        pixels = np.asarray(jax.random.randint(jax.random.key(2), image.shape, 0, 256), np.uint8)
+        step = Step(jnp.asarray(0), jax.random.key(3), None, example_key=jax.random.key(4),
+                    example_index=jnp.arange(2, dtype=jnp.int32), example_count=2, recorder=recorder)
+        objective.loss(objective.init(jax.random.key(5)), {"image": pixels}, step)
+        assert "times" in recorder.values and "posterior" not in recorder.values
+        return
+    mean = autoencoder.encode(params, image)
+    np.testing.assert_array_equal(autoencoder.encode(params, image, jax.random.key(6), jnp.zeros_like(noise)),
+                                  mean)
+    sampled = autoencoder.encode(params, image, jax.random.key(6), noise)
+    np.testing.assert_array_equal(autoencoder.encode(params, image, jax.random.key(7), noise), sampled)
+    assert not np.array_equal(sampled, mean)
 
 
 @pytest.mark.parametrize("kind", ["sd_vae", "dc_ae", "wan", "rae", "flux2", "qwen_image"])

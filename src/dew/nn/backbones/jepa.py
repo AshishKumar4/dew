@@ -42,7 +42,7 @@ from ..dit import (
 )
 from ..flops import MissingFlopsCount, counted_flops, patch_lengths, projection_flops, real_lengths
 from ..scan_orders import ScanOrder
-from ..sharding import constrain, down_projection, rows_like
+from ..sharding import constrain, down_projection, explicit_spec, rows_like, rows_taken
 from .dit import gather_tokens
 
 
@@ -206,7 +206,8 @@ class JepaVideoEncoder(JepaEncoder):
         B, T, H, W, C = x.shape
         tokens, _ = self.embed(x.reshape(B * T, H, W, C))
         if token_idx is not None:
-            tokens = gather_tokens(tokens, jnp.repeat(token_idx, T, axis=0))
+            frames = jnp.repeat(token_idx, T, axis=0, out_sharding=explicit_spec(token_idx))
+            tokens = gather_tokens(tokens, frames)
         tokens = tokens.reshape(B, T, tokens.shape[1], self.emb_features)
         return self.norm(self.stack(tokens, train=train))
 
@@ -270,7 +271,8 @@ class JepaPredictor(_JepaStackOptions):
             dtype=self.dtype or jnp.float32)
 
         def positions(indices):
-            pos = pos_embed[indices]                       # [B, N, P]
+            # Each row's own indices read the replicated table where the row is placed.
+            pos = rows_taken(pos_embed, indices)           # [B, N, P]
             return pos[:, None] if self.factorized else pos
 
         num_target_tokens = target_idx.shape[-1]

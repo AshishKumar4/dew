@@ -704,6 +704,11 @@ def _linted(tmp_path, files: dict[str, str]) -> list[tuple[str, int, str]]:
                   for module in modules for finding in lint.check(module))
 
 
+def assert_reported(tmp_path, path: str, source: str, code: str, lines: tuple[int, ...]) -> None:
+    """`source`, written at `path` in a sparx checkout, is reported as `code` at `lines` and nowhere else."""
+    assert _linted(tmp_path, {path: source}) == [(path, line, code) for line in lines]
+
+
 def test_the_gate_reads_the_site_the_docs_generators_and_the_kernel_packages_but_not_installed_npm(tmp_path):
     """With no roots named, the gate reads the site's scripts, the docs' figure generators and the
     kernel packages beside the package's source and the scripts, and none of the Python an npm
@@ -958,8 +963,7 @@ def test_a_sentence_looked_for_in_captured_output_is_reported_and_a_parsed_repor
     added to), proves wording. A name bound again to a parse of the output, the same name in a test
     that captured nothing or only in a function it defines, and a mapping an item of the output is
     put in, hold data, and are not reported."""
-    found = _linted(tmp_path, {"tests/test_report.py": (
-        "import json\n"
+    assert_reported(tmp_path, "tests/test_report.py", ("import json\n"
         "def test_direct(capsys):\n"
         "    assert 'saved' in capsys.readouterr().out\n"
         "def test_held(capsys):\n"
@@ -987,8 +991,7 @@ def test_a_sentence_looked_for_in_captured_output_is_reported_and_a_parsed_repor
         "def test_item(capsys):\n"
         "    report = {'tokens': 8}\n"
         "    report['err'] = capsys.readouterr().err\n"
-        "    assert 'tokens' in report\n")})
-    assert found == [("tests/test_report.py", line, "SLOP011") for line in (3, 6, 9, 13)]
+        "    assert 'tokens' in report\n"), "SLOP011", (3, 6, 9, 13))
 
 
 def test_an_errors_or_a_processs_wording_is_reported_and_its_parsed_output_is_not(tmp_path):
@@ -998,8 +1001,7 @@ def test_an_errors_or_a_processs_wording_is_reported_and_its_parsed_output_is_no
     wording. A refusal's type, a process's exit code, a value the process prints and the test
     parses, and an error's own attribute hold behaviour, as does a process's whole output compared
     with the value it computes, and are not reported."""
-    found = _linted(tmp_path, {"tests/test_refusal.py": (
-        "import json\n"
+    assert_reported(tmp_path, "tests/test_refusal.py", ("import json\n"
         "import subprocess\n"
         "import pytest\n"
         "def test_caught():\n"
@@ -1033,8 +1035,7 @@ def test_an_errors_or_a_processs_wording_is_reported_and_its_parsed_output_is_no
         "    try:\n"
         "        int('x')\n"
         "    except ValueError as error:\n"
-        "        assert error.args\n")})
-    assert found == [("tests/test_refusal.py", line, "SLOP011") for line in (8, 12, 13, 18, 21, 22)]
+        "        assert error.args\n"), "SLOP011", (8, 12, 13, 18, 21, 22))
 
 
 def test_a_sleep_a_poll_or_a_retry_is_reported_where_nothing_leaves_the_process(tmp_path):
@@ -1049,8 +1050,7 @@ def test_a_sleep_a_poll_or_a_retry_is_reported_where_nothing_leaves_the_process(
     that falls through to the loop's exit retries nothing. A notebook's display reaches its frontend,
     another process, so its frames redrawn on a clock are at that boundary, while a representation
     built round a loop publishes nothing."""
-    found = _linted(tmp_path, {"src/sparx/waits.py": (
-        "import concurrent.futures\n"
+    assert_reported(tmp_path, "src/sparx/waits.py", ("import concurrent.futures\n"
         "import subprocess\n"
         "import time\n"
         "def poll(done):\n"
@@ -1149,9 +1149,7 @@ def test_a_sleep_a_poll_or_a_retry_is_reported_where_nothing_leaves_the_process(
         "def built(done):\n"
         "    from IPython.display import HTML\n"
         "    while not done.wait(0.125):\n"
-        "        HTML('<b>waiting</b>')\n")})
-    assert found == [("src/sparx/waits.py", line, "SLOP018")
-                     for line in (5, 8, 12, 38, 44, 48, 50, 66, 86, 99)]
+        "        HTML('<b>waiting</b>')\n"), "SLOP018", (5, 8, 12, 38, 44, 48, 50, 66, 86, 99))
 
 
 def test_a_retry_is_told_from_a_scan_by_its_work_and_from_a_failure_by_its_paths(tmp_path):
@@ -1163,8 +1161,7 @@ def test_a_retry_is_told_from_a_scan_by_its_work_and_from_a_failure_by_its_paths
     attempt does not. A failure that runs on into the loop's tail retries where some path of the
     tail goes round, and a `try` inside the loop's own `with`, branch or `match` case is read as
     one in its body."""
-    found = _linted(tmp_path, {"src/sparx/retries.py": (
-        "def retry(work):\n"
+    assert_reported(tmp_path, "src/sparx/retries.py", ("def retry(work):\n"
         "    for _ in range(3):\n"
         "        try:\n"
         "            return work()\n"
@@ -1259,8 +1256,7 @@ def test_a_retry_is_told_from_a_scan_by_its_work_and_from_a_failure_by_its_paths
         "            parsed, _ = work()\n"
         "            return parsed\n"
         "        except ValueError:\n"
-        "            continue\n")})
-    assert found == [("src/sparx/retries.py", line, "SLOP018") for line in (2, 8, 33, 60, 67, 74, 91)]
+        "            continue\n"), "SLOP018", (2, 8, 33, 60, 67, 74, 91))
 
 
 def test_a_sleeps_boundary_is_found_through_calls_as_python_resolves_them(tmp_path):
@@ -1271,8 +1267,7 @@ def test_a_sleeps_boundary_is_found_through_calls_as_python_resolves_them(tmp_pa
     comprehension rebinds is another object's. A generator's element runs only as it is consumed,
     at once where a loop iterates it, and a list's again and again, as a loop's body does. A sleep
     beside a call that reaches a subprocess, a list built of them included, is at its boundary."""
-    found = _linted(tmp_path, {"src/sparx/waits.py": (
-        "import subprocess\n"
+    assert_reported(tmp_path, "src/sparx/waits.py", ("import subprocess\n"
         "import time\n"
         "def run(command):\n"
         "    return subprocess.run(command, check=True)\n"
@@ -1340,8 +1335,7 @@ def test_a_sleeps_boundary_is_found_through_calls_as_python_resolves_them(tmp_pa
         "    return [done.wait(0.1) for _ in range(3)]\n"
         "def consumed(commands):\n"
         "    for finished in (subprocess.run(command) for command in commands):\n"
-        "        time.sleep(1)\n")})
-    assert found == [("src/sparx/waits.py", line, "SLOP018") for line in (25, 30, 39, 44, 47, 50, 57, 64, 66)]
+        "        time.sleep(1)\n"), "SLOP018", (25, 30, 39, 44, 47, 50, 57, 64, 66))
 
 
 def test_a_feature_detected_by_its_exception_is_reported(tmp_path):
@@ -1352,8 +1346,7 @@ def test_a_feature_detected_by_its_exception_is_reported(tmp_path):
     defines is no raise of its own, and one that raises on some paths carries on along the rest. A
     `finally` that completes resumes the raise it interrupted, and a `match` whose last case
     catches all, through `as` or `|`, leaves by its cases alone, unless a guard lets it through."""
-    found = _linted(tmp_path, {"src/sparx/features.py": (
-        "from builtins import ImportError as Missing\n"
+    assert_reported(tmp_path, "src/sparx/features.py", ("from builtins import ImportError as Missing\n"
         "def optional():\n"
         "    try:\n"
         "        import yaml\n"
@@ -1438,8 +1431,7 @@ def test_a_feature_detected_by_its_exception_is_reported(tmp_path):
         "            case _ if name:\n"
         "                raise RuntimeError('install sparx[yaml]') from error\n"
         "        yaml = None\n"
-        "    return yaml\n")})
-    assert found == [("src/sparx/features.py", line, "SLOP019") for line in (5, 17, 22, 37, 54, 81)]
+        "    return yaml\n"), "SLOP019", (5, 17, 22, 37, 54, 81))
 
 
 def test_a_module_rebound_for_every_caller_is_reported_outside_the_suite(tmp_path):

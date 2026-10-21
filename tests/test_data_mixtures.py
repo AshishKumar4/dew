@@ -31,12 +31,12 @@ from token_support import write_token_corpus
 
 from dew.data import Files, Loading, Memory, phases, presets
 from dew.data.compile import compile, held, publish, validation
-from dew.data.dataset import CAPTION, DataPartition, GlobalStream, Loader, Ramp, ramped
+from dew.data.dataset import CAPTION, DataPartition, GlobalStream, Loader, Ramp, Stage, ramped
 from dew.data.images import EncodeCaptions
 from dew.data.pipeline import DeviceStep, Pipeline, mix
 from dew.data.plan import Manifest, Plan
 from dew.data.sources import TokenFiles
-from dew.objectives.base import VALID_ROWS, Aux, Objective, Ratio
+from dew.objectives.base import VALID_ROWS, Aux, Objective, Ratio, freeze, thaw
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer
 
 READ = Loading(workers=0, threads=1, read_buffer=8, worker_buffer=1)
@@ -975,30 +975,104 @@ def test_a_ramped_run_killed_mid_ramp_lands_where_the_run_nobody_stopped_lands(t
                 "the resumed ramp did not land on the uninterrupted run")
 
 
-def test_a_window_across_a_ramp_stage_pools_its_records_as_one_batch_of_them(tmp_path):
-    """An accumulation window pools a ramp's batches as it pools any, across a stage's change too: its
-    update is the one a batch of all its records takes, their errors' mean. Three steps of eight and
-    then sixteen, two to a window, land where a batch of sixteen and then one of twenty-four, the
-    same records in the same order, land."""
+def test_a_ramp_stage_begins_where_an_update_does_and_an_update_pools_one_stage(tmp_path):
+    """A batch ramp changes stage where an update begins, as a batch schedule applies per optimizer
+    step: the stage of sixteen, due at step three, begins at step four, where a window of two steps
+    does, so each update pools two batches of eight. Four such steps land where two batches of
+    sixteen, the same records in the same order, land."""
     records, seed, layout = 4096, 7, Layout(min_shard=1, tolerance=1.0)
     ramp = Ramp(start=8, increment=8, samples=24)
+    assert ramp.stages(16) == (Stage(batch=8, records=0), Stage(batch=16, records=24))
+    assert ramp.stages(16, window=2) == (Stage(batch=8, records=0), Stage(batch=16, records=32))
+    assert ramp.steps_for(64, 16, window=2) == 6
     state = Trainer(Pooled(), optax.sgd(0.5), key=jax.random.key(0), accumulation=2, layout=layout).fit(
         ramped(indexed_data(records, 16, seed), ramp), steps=4, log_every=100)
-
-    def whole(stage: int, batch: int):
-        trainer = Trainer(Pooled(), optax.sgd(0.5), key=jax.random.key(0), layout=layout,
-                          checkpoints=Checkpoints(str(tmp_path / "stitched"), keep=8))
-        return trainer.fit(stitched_data(records, batch, seed), steps=stage + 1, log_every=100,
-                           checkpoint_every=None)
-
-    stitched = [whole(stage, batch) for stage, batch in enumerate([16, 24])][-1]
+    batched = Trainer(Pooled(), optax.sgd(0.5), key=jax.random.key(0), layout=layout).fit(
+        stitched_data(records, 16, seed), steps=2, log_every=100)
 
     assert int(state.step) == 4
-    assert int(state.updates) == int(stitched.updates) == 2
-    pooled, batched = parameters(state), parameters(stitched)
-    assert set(pooled) == set(batched)
-    for name, value in batched.items():
+    assert int(state.updates) == int(batched.updates) == 2
+    pooled, whole = parameters(state), parameters(batched)
+    assert set(pooled) == set(whole)
+    for name, value in whole.items():
         np.testing.assert_allclose(pooled[name], value, rtol=1e-5, atol=1e-6, err_msg=name)
+
+
+def test_a_configured_run_counts_its_ramped_epochs_in_stages_aligned_to_its_updates():
+    """A config's run length and its epoch intervals count a ramp's steps as the trainer's stream cuts
+    them, each stage beginning where an update of its accumulation does: an epoch of 64 records ramped
+    from 8 to 16 is five steps read one at a time and six read two to an update."""
+    from dew.config import TrainerConfig
+
+    data = ramped(indexed_data(64, 16), Ramp(start=8, increment=8, samples=24))
+    assert TrainerConfig(epochs=1).total_steps(data) == 5
+    config = TrainerConfig(epochs=1, accumulation=2)
+    assert config.total_steps(data) == config.eval_interval(data) == config.checkpoint_interval(data) == 6
+    with pytest.raises(ValueError):
+        Ramp(start=8, increment=8, samples=24).stages(16, window=0)
+
+
+class Rejecting(Pooled):
+    """`Pooled` whose loss is not finite on a batch holding the record `rejected`, as a dynamic loss
+    scale rejects an overflowing step."""
+
+    def __init__(self, rejected: int, frozen: bool = False):
+        super().__init__()
+        self.rejected, self.frozen = rejected, frozen
+
+    def fresh_variables(self, key, held):
+        # A frozen bias a host-master run holds resident on the accelerator, apart from the moving weights.
+        variables = super().fresh_variables(key, held)
+        return freeze(variables, lambda path: "kernel" in str(path)) if self.frozen else variables
+
+    def loss(self, variables, batch, step):
+        import jax.numpy as jnp
+
+        stats, aux = super().loss(thaw(variables), batch, step)
+        poisoned = jnp.any(batch["id"] == self.rejected)
+        return Ratio(jnp.where(poisoned, jnp.inf, stats.total), stats.mass), aux
+
+
+@pytest.mark.parametrize("route", ["resident", "host", "host-frozen", "resumed"])
+def test_a_window_a_rejection_shifted_is_dropped_where_a_ramp_stage_begins(route, tmp_path):
+    """A rejected step drops its window, so the next begins a step later than the ramp's stages,
+    which begin where unrejected windows do: the stage's first step then drops the window its last
+    one left part filled, and no update pools two stages' batches. Rejecting step 0 of a ramp of two
+    eight-record steps, then sixteen, two to an update: step 1 alone in its window is dropped at step
+    2, which with step 3 makes the run's one update, whether the variables live on the devices or the
+    host, the host's beside frozen weights the accelerator holds, and in a run resumed from a
+    checkpoint written at the stage's start."""
+    records, seed = 4096, 7
+    ramp = Ramp(start=8, increment=8, samples=16)
+    first = next(iter(ramped(indexed_data(records, 16, seed), ramp).train(DataPartition(window=2))))
+    layout = Layout(host=("variables",) if route.startswith("host") else (), min_shard=1, tolerance=1.0)
+
+    def trainer():
+        checkpoints = Checkpoints(str(tmp_path / "run"), keep=8) if route == "resumed" else None
+        return Trainer(Rejecting(int(first["id"][0]), frozen=route == "host-frozen"), optax.sgd(0.5),
+                       key=jax.random.key(0), accumulation=2, dynamic_scale=True, layout=layout,
+                       checkpoints=checkpoints)
+
+    if route == "resumed":
+        trainer().fit(ramped(indexed_data(records, 16, seed), ramp), steps=2, log_every=100,
+                      checkpoint_every=2)
+    state = trainer().fit(ramped(indexed_data(records, 16, seed), ramp), steps=4, log_every=100)
+    assert (int(state.step), int(state.microstep), int(state.updates)) == (4, 2, 1)
+
+
+def test_each_aligned_stage_begins_from_its_own_schedule_and_one_left_no_step_is_dropped():
+    """Every stage's start moves to the update boundary at or after its own, not after the moved
+    start before it, so no stage drifts past its end; a stage whose start and the next's meet
+    there runs no step and is gone. A window is at least one step."""
+    ramp = Ramp(start=4, increment=4, samples=12)
+    # A step each of 4, 8 and 12 records, from steps 0, 1 and 2; 16 from step 3.
+    assert ramp.stages(16) == (Stage(batch=4, records=0), Stage(batch=8, records=4),
+                               Stage(batch=12, records=12), Stage(batch=16, records=24))
+    assert ramp.stages(16, window=2) == (Stage(batch=4, records=0), Stage(batch=12, records=8),
+                                         Stage(batch=16, records=32))
+    assert ramp.stages(16, window=4) == (Stage(batch=4, records=0), Stage(batch=16, records=16))
+    with pytest.raises(ValueError):
+        DataPartition(window=0)
 
 
 def test_a_window_that_replays_its_batches_pools_a_ramps_stages_as_batches_of_their_records(tmp_path):
@@ -1037,15 +1111,15 @@ def test_a_window_that_replays_its_batches_pools_a_ramps_stages_as_batches_of_th
         trainer().fit(ramped(indexed_data(256, 16), ramp), steps=4, log_every=100, state=part_filled)
 
 
-def test_a_ramp_stage_inside_a_window_that_replays_its_batches_is_refused_before_the_run_trains():
-    """A stage of one step begins inside a window of two, whose replay slots would hold batches of two
-    shapes: the run is refused at its first compile, before any step runs."""
+def test_a_ramp_stage_due_inside_a_window_that_replays_its_batches_begins_at_the_next_update():
+    """A stage of one step would begin inside a window of two, whose replay slots hold one shape of
+    batch: it begins at the next update instead, and the run trains through both stages."""
+    ramp = Ramp(start=8, increment=8, samples=8)
+    assert ramp.stages(16, window=2) == (Stage(batch=8, records=0), Stage(batch=16, records=16))
     trainer = Trainer(Composite(), optax.sgd(0.5), key=jax.random.key(0), accumulation=2,
                       layout=Layout(min_shard=1, tolerance=1.0), checkpoints=None)
-    with pytest.raises(ValueError):
-        trainer.fit(ramped(indexed_data(256, 16), Ramp(start=8, increment=8, samples=8)), steps=4,
-                    log_every=100)
-    assert trainer.executable is None
+    state = trainer.fit(ramped(indexed_data(256, 16), ramp), steps=4, log_every=100)
+    assert (int(state.step), int(state.updates)) == (4, 2)
 
 
 @pytest.mark.mesh
