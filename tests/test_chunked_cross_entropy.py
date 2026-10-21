@@ -21,6 +21,7 @@ import math
 import jax
 import jax.extend
 import jax.numpy as jnp
+import ml_dtypes
 import numpy as np
 import optax
 import pytest
@@ -29,7 +30,7 @@ from residual_orders import order
 from sharded import collectives
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.nn.precision import capped_logits, head_product, rounded_operand, rounded_to, scaled_logits
+from dew.nn.precision import capped_logits, rounded_operand, rounded_to, scaled_logits
 from dew.nn.protocols import OutputTable
 from dew.objectives.lm import chunked
 from dew.objectives.lm.chunked import chunked_cross_entropy, fused_head_loss
@@ -43,18 +44,18 @@ so a whole head and its tiles would differ by TF32's rounding."""
 
 def true_logits(table, states, dtype):
     """`table`'s logits of `states` (`OutputTable.logits`) for a float64 truth: the states through its
-    input quantizer and, under bf16 compute at its default precision, its product as the head rounds
-    it, each taken as exact input to the rest, which runs in float64. Called where x64 is enabled."""
-    with jax.enable_x64(new_val=False), jax.default_matmul_precision(EXERCISED[dtype]):
-        read = table.states(jnp.asarray(states, dtype))
-        matrix = jnp.asarray(table.matrix, jnp.float32)
-        subscripts = '...d,vd->...v' if table.vocab_major else '...d,dv->...v'
-        rounded = (head_product(subscripts, read, matrix, table.precision, compute=table.compute)
-                   if dtype == jnp.bfloat16 else None)
-    if rounded is None:
-        product = jnp.einsum(subscripts, np.asarray(read, np.float64), np.asarray(matrix, np.float64))
-    else:
-        product = jnp.asarray(np.asarray(rounded), jnp.float64)
+    input quantizer, taken as exact, and the rest in float64; under bf16 compute, which multiplies bf16
+    operands and rounds the logits to bf16 (`head_product`), the exact product of the bf16 operands
+    rounded to bf16 once, as either head's product is, its own order aside. Called where x64 is
+    enabled."""
+    with jax.enable_x64(new_val=False):
+        read = np.asarray(table.states(jnp.asarray(states, dtype)))
+    operands = [np.asarray(value, np.float64) for value in (read, table.matrix)]
+    if dtype == jnp.bfloat16:
+        operands = [np.asarray(value.astype(ml_dtypes.bfloat16), np.float64) for value in operands]
+    product = jnp.einsum('...d,vd->...v' if table.vocab_major else '...d,dv->...v', *operands)
+    if dtype == jnp.bfloat16:
+        product = jnp.asarray(np.asarray(product).astype(ml_dtypes.bfloat16), jnp.float64)
     wide = [None if value is None else jnp.asarray(value, jnp.float64) for value in (table.scale, table.bias)]
     return capped_logits(scaled_logits(product, *wide), table.softcap)
 
@@ -128,8 +129,9 @@ def test_the_fused_head_takes_the_whole_heads_loss_and_gradients_under_the_float
     """The gradient-in-forward head's weighted sum of losses and z-loss, and
     its gradients for the states, the head, the per-token scale and the bias,
     and its per-token losses and log Z, on par with the whole-logits head's over
-    drawn heads and columns (check 1), over chunks whose last is short, padded
-    weights and a cap; its top-1 columns are the whole head's."""
+    drawn heads and columns (check 1), over chunks whose last is short (four
+    token tiles and four column tiles), padded weights and a cap; its top-1
+    columns are the whole head's."""
     z_loss = 1e-2
 
     def draw(seed):
@@ -149,7 +151,7 @@ def test_the_fused_head_takes_the_whole_heads_loss_and_gradients_under_the_float
     def fused(states, matrix, scale, bias, targets, weights):
         return fused_head_loss(states, OutputTable(matrix, vocab_major=False, bias=bias, softcap=softcap,
                                                    scale=scale),
-                               targets, weights, z_loss=z_loss, tile=(3, 11))
+                               targets, weights, z_loss=z_loss, tile=(40, 11))
 
     def held(loss):
         def run(*terms):
@@ -980,7 +982,7 @@ def test_the_backbone_receives_both_outputs_gradients(tie_embeddings):
     init = jax.jit(model.init)
 
     def draw(seed):
-        ids = jax.random.randint(jax.random.fold_in(jax.random.PRNGKey(31), seed), (1, 7), 0, 97)
+        ids = jax.random.randint(jax.random.fold_in(jax.random.PRNGKey(31), seed), (4, 16), 0, 97)
         return init(jax.random.fold_in(jax.random.PRNGKey(32), seed), ids)["params"], ids
 
     def full(tree, ids):
