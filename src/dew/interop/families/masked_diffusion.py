@@ -315,7 +315,7 @@ def _llada2_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
     each packed document by its own blocks of real tokens, padding voting for
     none (`dew.nn.moe.Router`), which is the release's routing wherever a row
     is a whole number of blocks of real tokens: one request, or rows that
-    many blocks long (tests/test_hf_decoders.py's recorded probes).
+    many blocks long (tools/llada_moe_reference.py's recorded draws).
     """
     block = (record_int(hf_config, 'block_size', 32)
              if 'block_size' in hf_config or 'expert_capacity' in hf_config else None)

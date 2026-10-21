@@ -1,22 +1,39 @@
-"""The pinned LLaDA MoE releases over synthetic checkpoints and forty token grids.
+"""The pinned LLaDA MoE releases over synthetic checkpoints, recorded over seeds for check 1.
 
-Uses remote_code_reference's loader, which fetches config and Python only,
-never weights. --draw replaces the committed synthetic weights and ids.
-LLaDA-MoE, v2 and 2.0 use transformers 4.57.1; 2.1 and 2.2 use 5.16.1.
-The float64 arm widens explicit fp32 pins through the shared torch helpers.
-LLaDA2's probes carry its release's explicit block-causal mask. Sampling
-recipe parity is separate from this forward parity.
+Each family's site (its fixture directory's name) draws two rows of 16 token ids a seed
+(tests/model_support.py's `llada_draw`, which its test draws again) and records the release's fp32
+forward's evidence against the release run in float64 (`record_case(..., summary=True)`): kilobytes,
+committed as `released.npz` beside the fixture. Dew's own fp32 forward plans the seed count, and the
+recorded release confirms it. LLaDA2's forwards run under its explicit block-causal mask of 4-token
+blocks (`llada_fields`), which its 2.0 forward requires. Sampling-recipe parity is separate.
+
+Uses remote_code_reference's loader, which fetches config and Python only, never weights; --draw
+replaces the committed synthetic weights first. The releases' code reads different transformers:
+LLaDA-MoE, v2 and 2.0 run under 4.57.1, 2.1 and 2.2 under 5.16.1, each in an environment holding Dew
+too, as record_case runs Dew's forward beside the release's:
+  python tools/llada_moe_reference.py llada-moe-tiny llada-moe-v2-tiny llada2-tiny   # 4.57.1
+  python tools/llada_moe_reference.py llada21-tiny llada22-tiny                      # 5.16.1
 """
 
 import argparse
+import sys
 import tempfile
 from pathlib import Path
 
+import jax.numpy as jnp
 import numpy as np
 import torch
+import transformers
 from diffusers_wan_reference import float64
+from recorded_references import provenance, record_case, save
 from remote_code_reference import FIXTURES, RELEASES as REGISTERED, released_model
 from safetensors.torch import save_file
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
+from model_support import llada_draw, llada_fields
+from reference_error import widened
+
+from dew.interop import Pretrained
 
 RELEASES = {
     "llada-moe-tiny": ("inclusionAI/LLaDA-MoE-7B-A1B-Base", "daccaf1ccbf263a427bc9ac2a23b0b004fb275bf",
@@ -31,6 +48,9 @@ RELEASES = {
     "llada22-tiny": ("inclusionAI/LLaDA2.2-flash", "9b78da3f9149f1e239fb6d15f20a326fde574b9f",
                      ("configuration_llada2_moe.py", "modeling_llada2_moe.py"), "AutoModelForCausalLM", True),
 }
+LICENSES = {"llada-moe-tiny": "apache-2.0", "llada-moe-v2-tiny": "apache-2.0", "llada2-tiny": "apache-2.0",
+            "llada21-tiny": "apache-2.0", "llada22-tiny": "apache-2.0"}
+"""Each release's license, as its Hub card states it."""
 
 
 def draw(model, directory):
@@ -45,48 +65,62 @@ def draw(model, directory):
                 buffer.copy_(torch.randn_like(buffer) * 0.3)
     save_file({name: value.contiguous() for name, value in model.state_dict().items()},
               str(directory / 'model.safetensors'))
-    ids = torch.randint(0, model.config.vocab_size, (40, 2, 16)).numpy().astype(np.int32)
-    np.save(directory / 'probe_ids.npy', ids)
-    np.save(directory / 'input_ids.npy', ids[0])
 
 
-def ensemble(model, ids, name):
-    """The released forward on every grid, with LLaDA2's block-causal mask."""
+def released_logits(model, ids, name):
+    """The release's forward of `ids` `[2, 16]`, under LLaDA2's block-causal mask."""
     fields = {}
-    if name in ('llada2-tiny', 'llada21-tiny', 'llada22-tiny'):
-        blocks = torch.arange(ids.shape[-1]) // 4
-        visible = blocks[None, :] <= blocks[:, None]
-        fields['attention_mask'] = torch.where(visible, 0.0, -torch.inf)[None, None].expand(
-            ids.shape[1], 1, -1, -1)
-    return np.stack([model(input_ids=tokens, **fields).logits.detach().numpy() for tokens in ids])
+    mask = llada_fields(name, ids.shape[-1])
+    if mask:
+        visible = torch.from_numpy(np.asarray(mask['attention_pairwise_mask']))
+        fields['attention_mask'] = torch.where(visible, 0.0, -torch.inf).to(model.dtype)[None, None].expand(
+            ids.shape[0], 1, -1, -1)
+    return model(input_ids=ids, **fields).logits.detach().numpy()
+
+
+def record(name: str, workspace: Path) -> None:
+    repo, revision = RELEASES[name][:2]
+    native = released_model(name, workspace / 'fp32').float()
+    with float64():
+        wide = released_model(name, workspace / 'f64').double()
+
+    def evaluate(inputs):
+        ids = torch.from_numpy(inputs['ids'].astype(np.int64))
+        reference = {'logits': released_logits(native, ids, name)}
+        with float64():
+            truth = {'logits': released_logits(wide, ids, name)}
+        return reference, truth
+
+    source = Pretrained.load(FIXTURES / name, dtype='float32', attention_impl='reference')
+    fields = llada_fields(name, 16)
+
+    def forward(inputs):
+        return {'logits': source.model.apply(source.variables, inputs['ids'], **fields)}
+
+    wide_model, wide_variables = source.model.clone(dtype=jnp.float64), widened(source.variables)
+
+    def wide_forward(inputs):
+        return {'logits': wide_model.apply(wide_variables, inputs['ids'], **fields)}
+
+    arrays = record_case(name, lambda seed: llada_draw(seed, source.model.vocab_size), evaluate, forward,
+                         truth_proxy=wide_forward, store_inputs=False, summary=True)
+    arrays[f'{name}.provenance'] = provenance(
+        repo, revision, 'cpu', f'python tools/llada_moe_reference.py {name}',
+        transformers=transformers.__version__, torch=torch.__version__)
+    print(save(FIXTURES / name / 'released.npz', arrays, reference=repo, license=LICENSES[name]), flush=True)
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('names', nargs='+', choices=RELEASES)
     parser.add_argument('--draw', action='store_true', help='redraw the committed synthetic checkpoint')
-    parser.add_argument('--check', action='store_true')
     args = parser.parse_args()
     REGISTERED.update(RELEASES)
     with tempfile.TemporaryDirectory() as workspace, torch.no_grad():
         for name in args.names:
-            directory = FIXTURES / name
-            model = released_model(name, Path(workspace) / 'fp32').float()
             if args.draw:
-                draw(model, directory)
-            ids = torch.from_numpy(np.load(directory / 'probe_ids.npy').astype(np.int64))
-            native = ensemble(model, ids, name)
-            with float64():
-                wide = released_model(name, Path(workspace) / 'f64').double()
-                truth = ensemble(wide, ids, name)
-            if args.check:
-                print(name, 'bitwise' if np.array_equal(np.load(directory / 'probe_logits.npy'), native)
-                      else 'differs')
-            else:
-                for file, values in (('probe_logits.npy', native), ('probe_logits_f64.npy', truth),
-                                     ('logits.npy', native[0]), ('logits_f64.npy', truth[0])):
-                    np.save(directory / file, values)
-                print(name, native.shape)
+                draw(released_model(name, Path(workspace) / 'draw').float(), FIXTURES / name)
+            record(name, Path(workspace) / name)
 
 
 if __name__ == '__main__':
