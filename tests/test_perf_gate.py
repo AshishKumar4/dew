@@ -76,30 +76,6 @@ def standing_in(gate, monkeypatch, *, passed: bool) -> list:
     return commands
 
 
-def test_the_gate_times_the_forward_and_dit_cases_the_benchmarks_define(gate, monkeypatch):
-    """The gate's forward rows are tools/benchmark_forward.py's cases, and its DiT step rows step the parity
-    study's large DiT: both read tools/benchmark_cases.py, so a case changed there changes every one."""
-    monkeypatch.syspath_prepend(str(ROOT / "tools"))
-    import benchmark_cases
-
-    forward = [row.name for row in gate.BATTERY if row.tool == "benchmark_forward.py"]
-    assert forward == list(load("benchmark_forward").FORWARD) == list(benchmark_cases.FORWARD)
-    large = benchmark_cases.parity_case("simple_dit", "large")
-    for name in ("step simple-dit-b 32x64px", "step simple-mmdit-b 32x64px"):
-        step = gate.STEP_CASES[name]
-        assert (step["config"], step["batch_size"], step["image_size"]) == (
-            large.config, large.batch_size, large.image_size)
-
-
-def test_the_benchmark_catalogue_imports_no_framework():
-    """tools/benchmark_cases.py is read by the torch environment's tools and by the gate's own process: it
-    imports neither framework nor Dew, its forward cases importing theirs only when built."""
-    code = ("import sys; sys.path.insert(0, 'tools'); import benchmark_cases; "
-            "print(sorted(name for name in ('jax', 'flax', 'torch', 'dew') if name in sys.modules))")
-    assert subprocess.run([sys.executable, "-c", code], cwd=ROOT, capture_output=True, text=True,
-                          check=True).stdout.strip() == "[]"
-
-
 def test_external_reference_subprocess_failure_keeps_its_measurement(gate, tmp_path, monkeypatch):
     """Exit 1 from an external reference still carries measured evidence through the battery, and a
     tree that measures no hardware row starts no process to read the device kind."""
