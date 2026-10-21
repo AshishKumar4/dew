@@ -446,6 +446,23 @@ def texts_of(figure) -> list[str]:
     return [shape.text for shape in figure.shapes if shape.tag == "text"]
 
 
+def test_a_figures_label_and_text_read_back_as_written():
+    """Markup characters in a figure's label and text are escaped: an SVG reader reads back what was
+    written, quotes of either kind included."""
+    from xml.etree import ElementTree
+
+    from dew import figures
+
+    written = "a < b & \"c\" 'd' > e"
+    figure = figures.Figure(120, 40, label=written)
+    figure.text(10, 20, written)
+    read = ElementTree.fromstring(figure.svg())
+    svg = "{http://www.w3.org/2000/svg}"
+    assert read.get("aria-label") == written
+    assert read.find(f"{svg}title").text == written
+    assert read.find(f"{svg}text").text == written
+
+
 def test_a_curve_draws_each_series_at_its_own_steps_from_its_finite_values():
     """`figures.curve` with steps per series: the axes span the finite values only, a nonfinite
     value is left out of its line (its neighbours joined) and counted on the figure, the running
