@@ -217,7 +217,7 @@ def test_the_port_takes_each_packed_tokens_output_and_gradients_as_its_document_
             *rule, do = operands
 
             def loss(*rule):
-                out = recurrence_chunk.fla_rule(*rule, starts=starts)[0]
+                out = fla_rule(*rule, starts=starts)[0]
                 return jnp.sum(out * do), out
             (_, out), grads = jax.value_and_grad(loss, argnums=tuple(range(5)), has_aux=True)(*rule)
             return {"out": out, **dict(zip(("q", "k", "v", "g", "beta"), grads, strict=True))}
@@ -240,7 +240,7 @@ def test_the_port_takes_each_packed_tokens_output_and_gradients_as_its_document_
 def test_the_port_keeps_each_row_to_itself_at_its_rows_tightest_document_bound():
     """Two right-padded rows of two packed documents each (segment 0 after them) at the tightest
     bound their coordinates give (`Coordinates.max_segments`, two): each document's output on the
-    port (`recurrence_chunk.fla_rule`) is bitwise the document run alone, a row's first from the row's memory.
+    port (`fla_rule`) is bitwise the document run alone, a row's first from the row's memory.
     A row's padding runs as a sequence of its own, so a bound without it ran the second row's last
     document on from its first."""
     from dew.nn.inputs import coordinates
@@ -254,7 +254,7 @@ def test_the_port_keeps_each_row_to_itself_at_its_rows_tightest_document_bound()
     h0 = 0.1 * jax.random.normal(keys[4], (2, 1, 64, 64))
     packed = jax.jit(lambda *a: fla_rule(*a, starts=tokens.starts, max_segments=tokens.max_segments))
     out, _ = packed(q, k, v, g, beta, h0)
-    rule = jax.jit(recurrence_chunk.fla_rule)
+    rule = jax.jit(fla_rule)
     for row, cuts in ((0, (0, 70, 120)), (1, (0, 50, 100))):
         for begin, end in itertools.pairwise(cuts):
             alone, _ = rule(*(x[row:row + 1, begin:end] for x in (q, k, v, g, beta)),
