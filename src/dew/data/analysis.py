@@ -252,7 +252,16 @@ def _promoted(pipeline: Pipeline) -> Pipeline:
         source = dataclasses.replace(source, pipelines=tuple(_promoted(child) for child in source.pipelines))
     for index, stage in enumerate(stages):
         if isinstance(stage, Artifact) and isinstance(stage.cache, Generation):
-            source, stages = _standing_in(stage.cache, pipeline, source, stages[:index]), stages[index + 1 :]
+            # The views of the inputs written before the generation read its rows as they read the
+            # inputs, where it holds one row for each input, in their order (`_one_to_one`).
+            views = tuple(earlier for earlier in stages[:index] if isinstance(earlier, _VIEWS))
+            if views and not _one_to_one(stages[:index]):
+                raise ValueError(
+                    f"generation {stage.cache.url} holds the rows its steps kept, not one for each input, "
+                    f"so the views written before it in {_name(pipeline)} can't read it by input; give "
+                    "the cache that published it, Cache(url), which reads each input's rows")
+            source = _standing_in(stage.cache, pipeline, source, stages[:index])
+            stages = (*views, *stages[index + 1 :])
             plans = record(stage.cache.manifest.get("plan", {}), "published plans")
             overlap = cutting(stages)
             at = int(overlap is not None)
