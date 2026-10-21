@@ -71,8 +71,10 @@ class Hooks:
     keys' l2 norm, the queries' `scale` (in working precision; under the l2 norm `Dk^-1/2` where None,
     else none where None), the decay's kind ('none', 'scalar' a head, 'vector' a key dimension), the
     gates, the delta rule, whether a write gate `beta` scales what the token writes (always under the
-    delta rule or the gates; without them, an input gate, else one), a skip `D v`, and the epilogue.
-    The chunked op (`recurrence_chunk.chunk`) takes the same form."""
+    delta rule or the gates; without them, an input gate, else one), whether a scalar decay is
+    `rated`: the write gate times the head's `rate` (Mamba's discretization, `A dt` with `dt` the
+    write gate), a skip `D v`, and the epilogue. The chunked op (`recurrence_chunk.chunk`) takes
+    the same form."""
     conv: Conv | None = None
     l2norm: bool = False
     scale: float | None = None
@@ -80,19 +82,22 @@ class Hooks:
     gates: Gates | None = None
     delta: bool = True
     write_gate: bool = False
+    rated: bool = False
     skip: bool = False
     output: OutputNorm | None = None
 
     @property
     def gated_write(self) -> bool:
         """Whether the step reads a write gate `beta`."""
-        return self.delta or self.write_gate or self.gates is not None
+        return self.delta or self.write_gate or self.gates is not None or self.rated
 
     def __post_init__(self):
         if self.decay not in ('none', 'scalar', 'vector'):
             raise ValueError(f"a decay is 'none', 'scalar' or 'vector', not {self.decay!r}")
         if self.gates is not None and self.decay != 'scalar':
             raise ValueError('the gates form one log decay a head: their decay is scalar')
+        if self.rated and (self.decay != 'scalar' or self.gates is not None):
+            raise ValueError('a rated decay is one a head without the gates, which rate their own')
 
 
 def round_to_bf16(state, key, value):
@@ -166,7 +171,8 @@ class Step:
     and `taps` `[C, K]`. `log_decay` is `[rows, Hv]` (scalar) or `[rows, Hv, Dk]` (vector), or with
     the gates `gate` `[rows, Hv]`, `log_a` and `bias` `[Hv]`. `beta` `[rows, Hv]` is the write gate
     (a raw beta with the gates), `skip` `[Hv]` the skip's `D`, `z` `[rows, Hv, Dv]` and `weight`
-    `[Dv]` the epilogue's. `state` is `[rows, Hv, Dk, Dv]`, fp32 or bf16 (rounded by
+    `[Dv]` the epilogue's, `rate` `[Hv]` a rated decay's. `state` is `[rows, Hv, Dk, Dv]`, fp32 or
+    bf16 (rounded by
     `round_to_bf16`), or wider for the reference. `active` `[rows]` marks the rows that draw. A pytree
     of its arrays, so it crosses `jit` and a transformation as a token's operands do; the `Hooks` are
     its static form."""
@@ -185,6 +191,7 @@ class Step:
     skip: jax.Array | None = None
     z: jax.Array | None = None
     weight: jax.Array | None = None
+    rate: jax.Array | None = None
     active: jax.Array | None = None
 
 
@@ -200,7 +207,7 @@ def _pieces(hooks: Hooks, value_heads: int, key_width: int, value_width: int, ch
 
 
 OPERANDS = ('state', 'query', 'key', 'value', 'token', 'held', 'taps', 'log_decay', 'gate', 'beta', 'log_a',
-            'bias', 'skip', 'z', 'weight')
+            'bias', 'skip', 'z', 'weight', 'rate')
 """`StepLaunch`'s array operands after `active`, in its order."""
 
 
@@ -209,6 +216,8 @@ def _names(hooks: Hooks) -> tuple[str, ...]:
     streams = ('token', 'held', 'taps') if hooks.conv is not None else ('query', 'key', 'value')
     if hooks.gates is not None:
         gates = ('gate', *('beta',) * (hooks.gates.write == 'sigmoid'), 'log_a', 'bias')
+    elif hooks.rated:
+        gates = ('rate', 'beta')
     else:
         gates = ('log_decay',) * (hooks.decay != 'none') + ('beta',) * hooks.gated_write
     return (*streams, *gates, *('skip',) * hooks.skip, *('z', 'weight') * (hooks.output is not None), 'state')
@@ -260,6 +269,9 @@ def _gates(hooks: Hooks, given: dict, work, key_width: int):
     if hooks.gates is not None:
         beta = given['beta'].astype(work) if hooks.gates.write == 'sigmoid' else None
         g, beta = gated(hooks.gates, *(given[name].astype(work) for name in ('gate', 'log_a', 'bias')), beta)
+    elif hooks.rated:
+        beta = given['beta'].astype(work)
+        g = given['rate'].astype(work)[None, :] * beta
     else:
         g = None if hooks.decay == 'none' else given['log_decay'].astype(work)
         beta = given['beta'].astype(work) if hooks.gated_write else None
@@ -348,6 +360,9 @@ def _kernel(*refs, hooks: Hooks, group: int, key_heads: int, interpret: bool):
             decay = jnp.exp(-jnp.exp(scalar('log_a')) * step)
             write_gate = (step if hooks.gates.write == 'step'
                           else short_conv._sigmoid(scalar('beta'), interpret=interpret))
+        elif hooks.rated:
+            write_gate = scalar('beta')
+            decay = jnp.exp(scalar('rate') * write_gate)
         else:
             decay = (jnp.ones((1,), jnp.float32) if hooks.decay == 'none'
                      else jnp.exp(inputs['log_decay'][...].astype(jnp.float32)))
@@ -467,13 +482,14 @@ class StepLaunch(tuning.KernelOp):
              value: jax.Array | None, token: jax.Array | None, held: jax.Array | None, taps: jax.Array | None,
              log_decay: jax.Array | None, gate: jax.Array | None, beta: jax.Array | None,
              log_a: jax.Array | None, bias: jax.Array | None, skip: jax.Array | None, z: jax.Array | None,
-             weight: jax.Array | None, *, hooks: Hooks, dtype: str, interpret: bool, config: Launch,
+             weight: jax.Array | None, rate: jax.Array | None, *, hooks: Hooks, dtype: str, interpret: bool,
+             config: Launch,
              return_residuals: bool = False):
         from jax.experimental.pallas import triton as plgpu
 
         arrays = {'state': state, 'query': query, 'key': key, 'value': value, 'token': token, 'held': held,
                   'taps': taps, 'log_decay': log_decay, 'gate': gate, 'beta': beta, 'log_a': log_a,
-                  'bias': bias, 'skip': skip, 'z': z, 'weight': weight}
+                  'bias': bias, 'skip': skip, 'z': z, 'weight': weight, 'rate': rate}
         given = {name: arrays[name] for name in _names(hooks)}
         rows, value_heads, key_width, value_width = state.shape
         key_heads = (_pieces(hooks, value_heads, key_width, value_width, given['token'].shape[-1])
@@ -514,7 +530,7 @@ class StepLaunch(tuning.KernelOp):
             'value': valued, 'z': valued, 'state': lambda array: held_state,
             'gate': functools.partial(one, rows=True), 'beta': functools.partial(one, rows=True),
             'log_a': functools.partial(one, rows=False), 'bias': functools.partial(one, rows=False),
-            'skip': functools.partial(one, rows=False),
+            'skip': functools.partial(one, rows=False), 'rate': functools.partial(one, rows=False),
             'log_decay': keyed_by_value if hooks.decay == 'vector' else functools.partial(one, rows=True),
         }
         flags = pl.BlockSpec((None, 1), lambda r, h, c: (r, 0))

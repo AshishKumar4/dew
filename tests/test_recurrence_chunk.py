@@ -33,9 +33,11 @@ FORMED = [
     recurrence.Hooks(decay='vector', l2norm=True, output=recurrence.OutputNorm(1e-6)),
     recurrence.Hooks(decay='scalar', scale=KEY_WIDTH ** -0.5,
                      output=recurrence.OutputNorm(1e-5, 'sigmoid')),
+    recurrence.Hooks(decay='scalar', rated=True, delta=False, skip=True),
 ]
 """The prologue's and epilogue's hooks: the gated delta rule's gates and l2 norm, Mamba2's step gates
-clipped with the skip, and the gated RMS norm after the l2 norm and after a plain scale."""
+clipped with the skip, the gated RMS norm after the l2 norm and after a plain scale, and Mamba2's SSD
+as `chunk_ssd` hands it over (a rated decay, the step its write gate)."""
 
 PACKED = (False, True)
 """A row of one sequence, and of packed documents."""
@@ -72,6 +74,10 @@ def draw(hooks: recurrence.Hooks, packed: bool, seed: int) -> tuple[Chunk]:
                  'log_a': 0.5 * jax.random.normal(heads[1], (VALUE_HEADS,)),
                  'bias': jax.random.normal(heads[2], (VALUE_HEADS,))}
         beta = jax.random.normal(keys[4], (ROWS, LENGTH, VALUE_HEADS))
+    if hooks.rated:
+        # The step through softplus is the write gate; the rate is `A = -exp(A_log)`, a head's.
+        beta = jax.nn.softplus(jax.random.normal(keys[4], (ROWS, LENGTH, VALUE_HEADS)) - 1.0)
+        gates = {'rate': -jnp.exp(0.5 * jax.random.normal(keys[6], (VALUE_HEADS,)))}
     epilogue = {}
     if hooks.output is not None:
         norms = jax.random.split(keys[7], 2)
@@ -86,7 +92,8 @@ def draw(hooks: recurrence.Hooks, packed: bool, seed: int) -> tuple[Chunk]:
     if packed:
         starts = jnp.zeros((ROWS, LENGTH), bool).at[0, jnp.array([0, 23, 40])].set(True).at[1, 9].set(True)
     reads_beta = hooks.gated_write if hooks.gates is None else hooks.gates.write == 'sigmoid'
-    return (Chunk(query, key, value, log_decay=None if hooks.decay == 'none' or hooks.gates else log_decay,
+    plain = hooks.decay != 'none' and hooks.gates is None and not hooks.rated
+    return (Chunk(query, key, value, log_decay=log_decay if plain else None,
                   beta=beta if reads_beta else None, skip=skip if hooks.skip else None, starts=starts,
                   **gates, **epilogue),)
 
@@ -109,7 +116,7 @@ def token_by_token(hooks: recurrence.Hooks, operands: Chunk):
             state, query=query[:, t], key=key[:, t], value=operands.value[:, t],
             log_decay=at(operands.log_decay), gate=at(operands.gate), log_a=operands.log_a,
             bias=operands.bias, beta=at(operands.beta), skip=operands.skip, z=at(operands.z),
-            weight=operands.weight)
+            weight=operands.weight, rate=operands.rate)
         out, _, state = recurrence.step_reference(hooks, token)
         return state, out
 
