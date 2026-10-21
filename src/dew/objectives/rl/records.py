@@ -8,11 +8,7 @@ from dew.sampling.text import Sampling
 
 from .episodes import Action, Episode, EpisodeId, EpisodeStatus, Observation, Transition
 
-real = finite
-"""One score or likelihood, finite as no non-finite one is recorded (`dew.records.finite`)."""
-
-
-reals = functools.partial(listed, read=real, what="a list of finite numbers")
+reals = functools.partial(listed, read=finite, what="a list of finite numbers")
 """One list of finite numbers: a row's likelihoods (`listed`)."""
 
 
@@ -21,7 +17,7 @@ def observation_record(value: Mapping[str, object]) -> Observation:
     reward = record["reward"]
     return Observation(integers(record["context"], "context"),
                        EpisodeStatus(integer(record["status"], "status")), text(record["detail"], "detail"),
-                       None if reward is None else real(reward, "reward"),
+                       None if reward is None else finite(reward, "reward"),
                        messages(record["messages"], "messages"))
 
 
@@ -59,5 +55,5 @@ def episode_from_record(value: Mapping[str, object]) -> Episode:
                    None if initial is None else observation_record(section(initial, "initial")),
                    transitions, EpisodeStatus(integer(record["status"], "status")),
                    text(record["detail"], "detail"),
-                   None if reward is None else real(reward, "reward"),
+                   None if reward is None else finite(reward, "reward"),
                    _binding_id=text(record["_binding_id"], "_binding_id"))

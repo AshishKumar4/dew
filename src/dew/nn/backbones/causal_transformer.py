@@ -1841,7 +1841,7 @@ class CausalTransformer(nn.Module):
             coordinates=coordinates, image_groups=image_groups, rotary_positions=rotary_positions,
             pairwise_mask=pairwise_mask, key_positions=key_positions,
             token_ids=tokens if self.hash_layers else None, engram_ids=engram_ids, media=media_mask,
-            admitted=admitted, blocks=blocks)
+            admitted=admitted, blocks=blocks, routing_block=block)
 
     def looped(self, x, **stack):
         """Run the layer stack over `x` once, or as `loop` says: the layers before

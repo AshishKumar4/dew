@@ -33,7 +33,6 @@ from dew.data.dataset import DataPartition
 from dew.inference.rollouts import check_ending
 from dew.nn.inputs import ModelInputs, mesh_of, pad_token_rows
 from dew.objectives.base import Batch, Variables
-from dew.records import finite
 from dew.sampling.text import Generation, Sampling
 from dew.training.state import TrainState
 
@@ -44,6 +43,7 @@ from .sessions import (
     Status,
     Transcript,
     check_credit,
+    finite_reward,
     json_objects,
     local_task_ids,
     pack,
@@ -238,11 +238,6 @@ _P = ParamSpec("_P")
 
 class _StatusStop(RuntimeError):
     """An environment returned an explicit error or cancellation outcome."""
-
-
-def finite_reward(value: float) -> float:
-    """A verifier's or reward's score as a float, refused unless a finite number (`records.finite`)."""
-    return finite(value, "a reward")
 
 
 @dataclass
