@@ -13,7 +13,8 @@ on:
   push:
     # ci/** is where a branch goes for its own run before it lands.
     branches: [ "ci/**" ]
-    paths: &paths [ "site/**", "docs/**", "tutorials/**", "src/dew/**", "examples/**", "CONTRIBUTING.md", "pyproject.toml", ".github/workflows/site.yml" ]
+    paths: &paths [ "site/**", "docs/**", "tutorials/**", "src/dew/**", "examples/**", "CONTRIBUTING.md", "pyproject.toml", ".github/workflows/site.yml",
+             ".github/actions/site/**" ]
   pull_request:
     branches: [ "main" ]
     paths: *paths
