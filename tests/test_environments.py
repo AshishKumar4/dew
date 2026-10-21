@@ -67,13 +67,14 @@ def test_a_reference_is_named_by_its_installation_and_built_once(tmp_path, monke
 
 
 def test_the_command_line_takes_a_references_installation_whole_after_the_separator(tmp_path):
-    """Everything after `--` is uv's installation, its own options too (a torch backend), and the Python
-    printed is the environment's, made at the Python asked for; a reference with no installation, or a
-    tree beside a reference, is refused before anything is built."""
+    """Everything after `--` is uv's installation, its own options too (a torch backend), whatever spelling
+    of --reference argparse takes, and the Python printed is the environment's, made at the Python asked
+    for; a reference with no installation, or a tree beside a reference, is refused before anything is
+    built."""
     asked, env = standing_in_uv(tmp_path)
     tool = [sys.executable, str(REPO_ROOT / "tools" / "environments.py")]
     cache = tmp_path / "envs"
-    printed = subprocess.run([*tool, "--reference", "fla", "--python", "3.13", "--cache", str(cache), "--",
+    printed = subprocess.run([*tool, "--ref", "fla", "--python", "3.13", "--cache", str(cache), "--",
                               "--torch-backend", "cu126", "fla==0.5.2"],
                              env=env, capture_output=True, text=True, check=True).stdout
     python = Path(printed.strip())

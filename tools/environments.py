@@ -110,8 +110,6 @@ def main() -> int:
     # checkout's `--` is argparse's own, before a TREE that may start with a dash.
     argv = sys.argv[1:]
     cut = argv.index("--") if "--" in argv else len(argv)
-    referencing = any(word == "--reference" or word.startswith("--reference=") for word in argv[:cut])
-    install = argv[cut + 1:] if referencing else []
     parser = argparse.ArgumentParser(prog="tools/environments.py", description=__doc__.split("\n\n")[0])
     parser.add_argument("tree", type=Path, nargs="?")
     parser.add_argument("--lock", default=None, help="cpu, cuda12 or cuda13; by default this machine's")
@@ -119,7 +117,10 @@ def main() -> int:
                         help="a reference environment's name, its installation after --")
     parser.add_argument("--python", default="3.12", help="a reference environment's Python")
     parser.add_argument("--cache", type=Path, default=CACHE)
-    args = parser.parse_args(argv[:cut] if referencing else argv)
+    args = parser.parse_args(argv[:cut])
+    install = argv[cut + 1:] if args.reference is not None else []
+    if args.reference is None:
+        args = parser.parse_args(argv)
     if (args.tree is None) == (args.reference is None):
         parser.error("name a TREE, or a --reference and its installation after --")
     if args.reference is not None:
