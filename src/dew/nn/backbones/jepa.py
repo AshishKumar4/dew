@@ -42,7 +42,7 @@ from ..dit import (
 )
 from ..flops import MissingFlopsCount, counted_flops, patch_lengths, projection_flops, real_lengths
 from ..scan_orders import ScanOrder
-from ..sharding import constrain, down_projection, rows_like
+from ..sharding import constrain, down_projection, rows_like, rows_taken
 from .dit import gather_tokens
 
 
@@ -270,7 +270,8 @@ class JepaPredictor(_JepaStackOptions):
             dtype=self.dtype or jnp.float32)
 
         def positions(indices):
-            pos = pos_embed[indices]                       # [B, N, P]
+            # Each row's own indices read the replicated table where the row is placed.
+            pos = rows_taken(pos_embed, indices)           # [B, N, P]
             return pos[:, None] if self.factorized else pos
 
         num_target_tokens = target_idx.shape[-1]
