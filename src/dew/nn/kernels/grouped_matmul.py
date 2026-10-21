@@ -185,7 +185,7 @@ class _Triton(_GroupedLaunch[Tile]):
         the output rows a multiple of wgmma's 64. Either other kind ran 1.2 to 8.5 times slower than the
         fastest tile on an H100 (GMM-h100-2: an accumulator of 256 registers a thread spills; a 32-row
         share falls back to Ampere's MMA)."""
-        wgmma = _facts(target).wgmma
+        wgmma = generation.effective(target).wgmma
 
         def fits(tile: Tile) -> bool:
             rows, columns = self.output(tile)
@@ -244,7 +244,7 @@ class Gmm(_Triton):
         flops = 2 * tiles * config.block_m * depth * width
         steps = tiles * math.ceil(depth / config.block_k) / chunks
         staged = steps * _triton_staged(config.block_m, config.block_n, config.block_k, config.warps,
-                                        _facts(target).wgmma) * size
+                                        generation.effective(target).wgmma) * size
         moved = (columns * rows * depth + tiles * depth * width) * size + rows * width * out
         return cost.seconds(cost.Cost(
             programs=chunks * columns, device_bytes=moved,
@@ -294,7 +294,7 @@ class Tgmm(_Triton):
         steps = _row_tiles(rows, groups, config.block_m) / groups
         flops = 2 * steps * config.block_m * config.block_k * config.block_n
         staged = steps * _triton_staged(config.block_k, config.block_n, config.block_m, config.warps,
-                                        _facts(target).wgmma) * size
+                                        generation.effective(target).wgmma) * size
         moved = (blocks[1] * rows * depth + blocks[0] * rows * width) * size + groups * depth * width * out
         return cost.seconds(cost.Cost(
             programs=programs, device_bytes=moved, program_flops=flops, program_staged=staged,
@@ -352,7 +352,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
     @staticmethod
     def _in_flight(config: mosaic_gpu.Tiles, target) -> float:
         """The row tiles a band of the planar snake keeps in flight at once on `target`."""
-        return max(1.0, _multiprocessors(_facts(target)) / config.grid_block_n)
+        return max(1.0, _multiprocessors(generation.effective(target)) / config.grid_block_n)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -424,11 +424,6 @@ class MosaicTgmm(_Mosaic):
                                interpret=INTERPRETED if interpret else False), None
 
 
-def _facts(target: generation.GpuTarget) -> generation.GpuTarget:
-    """The target a launch on `target` is costed as (`cost._facts`): a CPU as an A100."""
-    return target if generation.capability(target.generation) is not None else generation.TARGETS['sm80']
-
-
 def _multiprocessors(target: generation.GpuTarget) -> int:
     """`target`'s multiprocessors, which the persistent Mosaic GPU launches spread their tiles over."""
     if target.multiprocessors is None:
@@ -439,7 +434,7 @@ def _multiprocessors(target: generation.GpuTarget) -> int:
 def _rated(target: generation.GpuTarget, dtype) -> bool:
     """Whether `target` states the tensor rate a launch over `dtype` operands is costed by: a generation
     that states none runs XLA's grouped matmul, needing no estimate (`kernel_refusal`)."""
-    return _facts(target).tensor_rate(_mode(dtype)) is not None
+    return generation.effective(target).tensor_rate(_mode(dtype)) is not None
 
 
 def kernel_refusal(compute: Dtype) -> str | None:

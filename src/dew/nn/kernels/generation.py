@@ -367,14 +367,17 @@ SHARED_BUDGET = 99 * 1024
 launches run on (sm86, sm89 and sm120 hold 99 KiB), so a launch sized by it fits wherever it runs."""
 
 
+def effective(target: GpuTarget) -> GpuTarget:
+    """The target whose facts a launch on `target` is sized and costed by: its own on a GPU, and the
+    A100's on a target that is no GPU (a CPU, which interprets the kernels as an A100's block), so the
+    interpreted tests run the tiles an A100 takes."""
+    return target if capability(target.generation) is not None else TARGETS['sm80']
+
+
 def shared_budget(target: GpuTarget) -> int:
     """The shared memory, in bytes, a program on `target` may stage: the block's own, which a real
-    device reports (`runtime_facts`), else `SHARED_BUDGET`. A target that is no GPU (a CPU, which
-    interprets the kernels) holds the A100's, the generation interpretation stands for, so its tests
-    run the tiles an A100 takes."""
-    if capability(target.generation) is None:
-        return TARGETS['sm80'].shared_limit or SHARED_BUDGET
-    return target.shared_limit or SHARED_BUDGET
+    device reports (`runtime_facts`), else `SHARED_BUDGET`, of the `effective` target."""
+    return effective(target).shared_limit or SHARED_BUDGET
 
 
 def fp8_tensor_cores(generation: str) -> bool:
