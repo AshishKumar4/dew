@@ -203,32 +203,12 @@ def reset(net):
             buffer.zero_()
 
 
-def forward(net, ids, start_pos=0):
-    """Transformer.forward (model.py:912-926), every position's logits."""
-    return type(net).forward.__wrapped__(net, ids, start_pos)
-
-
-def draft(net, ids, main_hidden, start_pos):
-    """Transformer.forward_spec (model.py:928-936)."""
-    return type(net).forward_spec.__wrapped__(net, ids, main_hidden, start_pos)
-
-
 def cached(net, ids) -> dict[str, np.ndarray]:
-    """The prefill of the first PROMPT tokens, which seeds DSpark's windows,
-    then a teacher-forced step and DSpark's draft after each."""
-    draft_ids, draft_logits, draft_confidence = [], [], []
-    reset(net)
-    next_ids, _, main_hidden = forward(net, ids[:, :PROMPT])
-    draft(net, next_ids[:, -1], main_hidden, 0)
-    for position in range(PROMPT, LENGTH):
-        next_ids, _, main_hidden = forward(net, ids[:, position:position + 1], position)
-        drafted = draft(net, next_ids[:, -1], main_hidden, position)
-        draft_ids.append(drafted[0])
-        draft_logits.append(drafted[1])
-        draft_confidence.append(drafted[2])
-    return {"draft_ids": torch.stack(draft_ids, 1).numpy().astype(np.int32),
-            "draft_logits": torch.stack(draft_logits, 1).numpy(),
-            "draft_confidence": torch.stack(draft_confidence, 1).numpy()}
+    """The prefill of the first PROMPT tokens, which seeds DSpark's windows, then a
+    teacher-forced step and DSpark's draft after each (V4.1's driver, `v41.cached`,
+    under this release's reset and prompt)."""
+    outputs = v41.cached(net, ids, reset=reset, prompt=PROMPT, length=LENGTH)
+    return {name: outputs[name] for name in ("draft_ids", "draft_logits", "draft_confidence")}
 
 
 def inputs(seed: int) -> torch.Tensor:
@@ -266,7 +246,7 @@ def released_outputs(module, seed: int, ids: torch.Tensor, widen: bool = False):
         net = build(module, seed, widen)
         with lower_index_ties(net, classes=(module.Indexer, module.Gate), found=found):
             reset(net)
-            _, logits, _ = forward(net, ids)
+            _, logits, _ = v41.forward(net, ids)
             outputs = {"release_logits": logits.numpy(), **cached(net, ids)}
     return net, outputs, found
 
