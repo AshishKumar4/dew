@@ -26,6 +26,7 @@ from flax.typing import Dtype
 
 from dew import records
 from dew.interop.components import bind_component, component_source
+from dew.interop.weights import indexed_path
 from dew.objectives.base import Variables
 
 from .api import ModuleAutoEncoder
@@ -322,13 +323,7 @@ def qwen_image_vae_path(name: str, ndim: int) -> tuple[str, ...]:
     leaf = parts.pop()
     if ndim not in _LEAF_RANK[leaf]:
         raise ValueError(f"{name!r} has {ndim} axes, not {' or '.join(map(str, _LEAF_RANK[leaf]))}")
-    path: list[str] = []
-    for part in parts:
-        if part.isdigit() and path and path[-1] in _INDEXED:
-            path[-1] = f"{path[-1]}_{part}"
-        else:
-            path.append(part)
-    return (*path, "kernel" if leaf == "weight" else leaf)
+    return (*indexed_path(parts, indexed=_INDEXED), "kernel" if leaf == "weight" else leaf)
 
 
 class QwenImageAutoencoder(ModuleAutoEncoder[QwenImageVAE]):
