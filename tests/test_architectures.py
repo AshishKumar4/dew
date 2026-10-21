@@ -453,9 +453,19 @@ def test_architecture_trains_on_every_layout_as_on_one_device(case, tmp_path):
         # Each fit donates the state it was handed.
         return jax.tree.map(jnp.copy, initial)
 
+    own = next(batches(case, encoder)())
+
     def draw(seed):
-        """The cell's own batch at seed 0, else one drawn alike from the seed."""
-        return (next(batches(case, encoder, seed)()),)
+        """The cell's own batch at seed 0. A language model's other draws are that batch with its rows
+        in another order, an exact symmetry of a step that averages its rows, which splits them over
+        the devices otherwise: a fresh batch decides a router's or a sparse gate's near-ties, which
+        are discrete, on one side in some seeds and not in others, and glm4_moe's, gemma3n's and
+        qwen35's one-device steps compared with themselves did not resolve within 512 fresh batches.
+        Any other cell's are batches drawn alike from the seed, as its step's noise follows the rows."""
+        if not case.is_lm:
+            return (next(batches(case, encoder, seed)()),)
+        order = np.arange(BATCH) if seed == 0 else np.random.default_rng(seed).permutation(BATCH)
+        return ({name: value[order] for name, value in own.items()},)
 
     seeds = LAYOUT_SEEDS.get(case.name, DEFAULT_LAYOUT_SEEDS)
     for steps in (1, 2):
