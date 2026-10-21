@@ -247,7 +247,8 @@ def test_a_hooks_widened_16_bit_operations_round_as_xla_s():
     widened, xla = widened_and_xla(jax.nn.sigmoid)
     with np.errstate(over="ignore"):
         exact = 1 / (1 + np.exp(-np.asarray(every, np.float64)))
-    assert np.all(np.abs(widened - exact) <= np.abs(xla - exact))
+    np.testing.assert_array_equal(np.isnan(widened), np.isnan(xla))
+    assert not np.any(np.abs(widened - exact) > np.abs(xla - exact))
 
 
 def test_a_forced_implementation_runs_or_says_why_it_cannot():
