@@ -181,3 +181,35 @@ def test_a_callers_preset_is_recorded_as_its_call():
     calls = [stage["pipe"] for stage in written["stages"]]
     assert calls == ["test_data_records:_shouted", "dew.data.presets:lm"]
     assert _batches(decode(written)) == _batches(chain)
+
+
+@dataclass(frozen=True)
+class Drawn(grain.RandomMapTransform):
+    """A random step: each record's draw, from the seed the read gives it."""
+
+    identity = "drawn@1"
+
+    def random_map(self, row, rng):
+        return {**row, "draw": np.int64(rng.integers(0, 2**31))}
+
+
+def test_fitted_reads_training_and_validation_with_the_runs_data_seed():
+    """A chain with a random step, fitted for a run under two data seeds: the training draws and
+    the validation draws each follow the seed, and the same seed draws the same."""
+    from dew.data.compile import fitted
+    from dew.data.pipeline import ObjectiveData
+
+    def draws(seed):
+        chain = _documents().map(Tagged(1)).random_map(Drawn()).batch(2).workers(0)
+        loader, held = fitted(chain, chain, objective=ObjectiveData(), seed=seed)
+        reader = loader.train(DataPartition())
+        try:
+            trained = [np.asarray(next(reader)["draw"]).tolist() for _ in range(2)]
+        finally:
+            reader.close()
+        assert held is not None
+        return trained, [np.asarray(batch["draw"]).tolist() for batch in held["val"](DataPartition())]
+
+    assert draws(1) == draws(1)
+    first, second = draws(1), draws(2)
+    assert first[0] != second[0] and first[1] != second[1]
