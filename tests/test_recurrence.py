@@ -10,14 +10,13 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact_as_the_reference, widened
+from reference_error import assert_as_exact
 from tuned import each_config
 
 from dew.nn.kernels import recurrence, tuning
 
 ROWS, KEY_HEADS, VALUE_HEADS, KEY_WIDTH, VALUE_WIDTH, TAPS = 16, 2, 4, 16, 32, 4
-"""Each row a draw of the operands, and a step's error measured over all of them: three rows' swung
-as far as 2.65x of the reference's over 12 seeds, while the twelve together sat within 1.34x."""
+"""A decode token with grouped heads, idle rows and a four-tap history."""
 
 NORMS = (None, recurrence.OutputNorm(1e-6, 'silu'), recurrence.OutputNorm(1e-6, 'sigmoid'))
 HOOKS = [recurrence.Hooks(conv=conv, l2norm=norm, decay='scalar' if decay == 'gates' else decay,
@@ -28,6 +27,30 @@ HOOKS = [recurrence.Hooks(conv=conv, l2norm=norm, decay='scalar' if decay == 'ga
              (False, True), (False, True), (False, True), NORMS)
          # The delta rule and the gates read a write gate whatever `write_gate` says.
          if (decay != 'gates' or delta) and not (write and (delta or decay == 'gates'))]
+
+SEEDS = dict(zip(HOOKS, (
+    8, 16, 8, 8, 32, 8, 8, 16, 8, 8, 8, 8, 8, 16, 8, 8, 16, 16, 8, 16,
+    8, 8, 8, 8, 8, 32, 8, 8, 8, 16, 8, 16, 16, 8, 32, 16, 16, 16, 8, 8,
+    16, 8, 8, 16, 8, 8, 16, 16, 8, 32, 8, 8, 16, 16, 16, 32, 16, 16, 16, 16,
+    8, 16, 16, 64, 32, 8, 8, 8, 8, 64, 8, 8, 8, 16, 8, 64, 32, 16, 8, 16,
+    16, 32, 8, 16, 8, 16, 8, 64, 16, 16, 8, 32, 16, 64, 32, 32, 8, 32, 16, 64,
+    32, 32, 8, 16, 8, 64, 16, 8, 8, 16, 8, 64, 64, 16, 8, 16, 16, 64, 64, 16,
+    64, 16, 8, 32, 64, 8, 128, 16, 16, 32, 32, 16, 512, 32, 32, 256, 32, 32, 128, 16,
+    16, 64, 32, 16, 32, 8, 8, 32, 32, 16, 128, 32, 32, 128, 32, 32, 64, 16, 8, 64,
+    32, 16, 16, 32, 8, 16, 16, 16, 128, 32, 16, 128, 16, 16, 128, 64, 32, 128, 32, 64,
+    8, 16, 8, 64, 32, 16, 8, 8, 8, 64, 32, 16, 8, 16, 16, 64, 32, 16, 8, 16,
+    16, 64, 64, 32, 8, 8, 8, 128, 32, 16, 8, 8, 8, 128, 32, 16, 8, 16, 8, 128,
+    32, 8, 8, 16, 8, 128, 16, 8, 8, 16, 8, 64, 16, 8, 8, 16, 8, 64, 32, 8,
+), strict=True))
+"""Each hook combination's declared seeds, sized independently by `seeds_for` on armada (2026-10-20).
+The reference compared with itself resolves the factor in every leaf; the count holds at every config.
+"""
+
+BF16_SEEDS = {HOOKS[0]: 8, HOOKS[-1]: 16}
+"""The bf16-state sites' seeds, sized by `seeds_for` on armada (2026-10-20), including every output."""
+
+ONE_TAP_SEEDS = {jnp.float32: 256, jnp.bfloat16: 256}
+"""Each one-tap operand dtype's seeds, sized by `seeds_for` on armada (2026-10-20) on the whole tree."""
 
 
 def operands(hooks: recurrence.Hooks, seed: int = 0, state_dtype=jnp.float32) -> recurrence.Step:
@@ -127,18 +150,14 @@ def test_every_hook_combination_steps_as_its_float64_form(hooks):
     its moved history, which is the history's own bits. The idle row's output is zeros and its state
     and history are its inputs' bits."""
     given = operands(hooks)
-    reference = recurrence.step_reference(hooks, given)
-    with jax.enable_x64(new_val=True):
-        wide = recurrence.Step(**{name: None if value is None else widened(value)
-                                  for name, value in vars(given).items()})
-        truth = [None if x is None else np.asarray(x) for x in recurrence.step_reference(hooks, wide)]
+    reference_fn = jax.jit(functools.partial(recurrence.step_reference, hooks))
+    reference = reference_fn(given)
     for config in each_config(recurrence.StepLaunch, functools.partial(recurrence.step, hooks), given):
         with tuning.pinned({recurrence.StepLaunch: config}):
-            out, history, state = jax.jit(recurrence.step, static_argnums=0)(hooks, given)
-        for name, mine, theirs, exact in (('output', out, reference[0], truth[0]),
-                                          ('state', state, reference[2], truth[2])):
-            assert_as_exact_as_the_reference(np.asarray(mine), np.asarray(theirs), exact,
-                                             f'{config} {name}')
+            step = jax.jit(functools.partial(recurrence.step, hooks))
+            assert_as_exact(step, reference_fn, functools.partial(draw, hooks), f'{hooks} {config}',
+                            seeds=SEEDS[hooks])
+            out, history, state = step(given)
         np.testing.assert_array_equal(np.asarray(out)[1], 0.0)
         np.testing.assert_array_equal(np.asarray(state)[1], np.asarray(given.state)[1])
         if hooks.conv is not None:
@@ -154,12 +173,10 @@ def test_a_bf16_state_steps_as_its_float64_form(hooks):
     given = operands(hooks, seed=1, state_dtype=jnp.bfloat16)
     _, _, state = recurrence.step(hooks, given)
     assert state.dtype == jnp.bfloat16
-    with jax.enable_x64(new_val=True):
-        wide = recurrence.Step(**{name: None if value is None else widened(value)
-                                  for name, value in vars(given).items()})
-        exact = np.asarray(recurrence.step_reference(hooks, wide)[2])
-    reference = np.asarray(recurrence.step_reference(hooks, given)[2], np.float32)
-    assert_as_exact_as_the_reference(np.asarray(state, np.float32), reference, exact, 'the bf16 state')
+    assert_as_exact(jax.jit(functools.partial(recurrence.step, hooks)),
+                    jax.jit(functools.partial(recurrence.step_reference, hooks)),
+                    functools.partial(draw, hooks, state_dtype=jnp.bfloat16), f'bf16 state {hooks}',
+                    seeds=BF16_SEEDS[hooks])
     np.testing.assert_array_equal(np.asarray(state)[1], np.asarray(given.state)[1])
 
 
@@ -177,20 +194,11 @@ def test_a_write_gate_without_the_delta_rule_scales_what_the_token_writes():
         np.testing.assert_array_equal(np.asarray(state), 0.0)
     one_tap = recurrence.Hooks(conv=recurrence.Conv(None), decay='none', delta=False)
     channels = 2 * 16 + 16
-    rng = np.random.default_rng(3)
     for dtype in (jnp.float32, jnp.bfloat16):
-        given = recurrence.Step(jnp.asarray(rng.standard_normal((ROWS, 1, 16, 16)) * 0.3, jnp.float32),
-                                token=jnp.asarray(rng.standard_normal((ROWS, channels)), dtype),
-                                held=jnp.zeros((ROWS, 0, channels), dtype),
-                                taps=jnp.asarray(rng.standard_normal((channels, 1)), dtype))
+        given = one_tap_operands(dtype, 3)
         for step in (recurrence.step, recurrence.step_reference):
             assert step(one_tap, given)[1].shape == (ROWS, 0, channels)
-        with jax.enable_x64(new_val=True):
-            wide = recurrence.Step(**{name: None if value is None else widened(value)
-                                      for name, value in vars(given).items()})
-            exact = recurrence.step_reference(one_tap, wide)
-        found, reference = recurrence.step(one_tap, given), recurrence.step_reference(one_tap, given)
-        for index, name in ((0, 'output'), (2, 'state')):
-            mine, theirs = (np.asarray(x[index], np.float32) for x in (found, reference))
-            assert_as_exact_as_the_reference(mine, theirs, np.asarray(exact[index]),
-                                             f'the one-tap {jnp.dtype(dtype).name} {name}')
+        assert_as_exact(jax.jit(functools.partial(recurrence.step, one_tap)),
+                        jax.jit(functools.partial(recurrence.step_reference, one_tap)),
+                        functools.partial(one_tap_draw, dtype), f'one-tap {jnp.dtype(dtype).name}',
+                        seeds=ONE_TAP_SEEDS[dtype])
