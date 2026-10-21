@@ -29,6 +29,8 @@ from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 
+from dew.nn.kernels.templates.attention import Kind
+
 LOG2E = 1.4426950408889634
 """log2(e): a natural exponent times it is a base-2 one."""
 
@@ -179,3 +181,139 @@ def finish(spec: Forward, state: Partial, *, initial: bool, output_mod: Callable
     if output_mod is not None:
         out = output_mod(out, *output_params)
     return out, m, denominator
+
+
+# The backward's algebra: what lies between its products (S = Q·Kᵀ, dP = dO·Vᵀ, then dV, dK and dQ),
+# on natural logits.
+
+
+def inverse(total: jax.Array) -> jax.Array:
+    """Each query's `1 / total`, zero where it saw nothing (total 0)."""
+    return jnp.where(total > 0, 1.0 / jnp.where(total > 0, total, 1.0), 0.0)
+
+
+def scored(score_mod, logits, q_pos, k_pos, params, *, slopes: bool):
+    """`score_mod` on the scaled logits, in fp32, and with `slopes` each entry's derivative of it along
+    the logits and along each parameter, a tile apiece: `score_mod` being pointwise in the entries, they
+    are the whole of its pullback (`pulled`). They are its reverse-mode pullback's transpose applied to
+    each input's ones, on the hook's own tile and layouts, so a hook through a `jax.custom_vjp`
+    differentiates as the reference's does and a hook reads its arguments at the ranks it is called
+    with. An integer parameter has no derivative: its slopes are zeros. Without a hook, the logits and
+    no slopes."""
+    if score_mod is None:
+        return logits, None
+    if not slopes:
+        return score_mod(logits, q_pos, k_pos, *params).astype(jnp.float32), None
+    floating = [index for index, param in enumerate(params) if jnp.issubdtype(param.dtype, jnp.floating)]
+
+    def hooked(s, *wide):
+        values = list(params)
+        for index, value in zip(floating, wide, strict=True):
+            values[index] = value
+        return score_mod(s, q_pos, k_pos, *values)
+
+    inputs = (logits, *(params[index] for index in floating))
+    out, pull = jax.vjp(hooked, *inputs)
+    along = jax.linear_transpose(pull, out)
+
+    def slope(index):
+        [entries] = along(tuple(jnp.ones_like(x) if place == index else jnp.zeros_like(x)
+                                for place, x in enumerate(inputs)))
+        return entries.astype(jnp.float32)
+
+    differentiated = {index: slope(place + 1) for place, index in enumerate(floating)}
+    return out.astype(jnp.float32), (slope(0), *(differentiated.get(index, jnp.zeros_like(logits))
+                                                  for index in range(len(params))))
+
+
+def pulled(cotangents, slopes, seen, kinds: tuple[Kind, ...]):
+    """The score cotangents `cotangents` through `score_mod`, its entries' derivatives `slopes`
+    (`scored`; None without a hook): the logits' tile, and each parameter's, a head's or a query's its
+    queries' sums `[block_q]`, a key's its keys' `[block_k]`, a tile's the tile. Each entry is masked
+    before any sum, so one the call never sees (padding, another document) adds nothing even where the
+    hook's derivative there is not finite. fp32."""
+    if slopes is None:
+        return cotangents, ()
+    logits = jnp.where(seen, cotangents * slopes[0], 0.0)
+    pieces = []
+    for slope, kind in zip(slopes[1:], kinds, strict=True):
+        entries = jnp.where(seen, cotangents * slope, 0.0)
+        pieces.append(entries.sum(axis=0) if kind == Kind.KEY else entries if kind == Kind.TILE
+                      else entries.sum(axis=-1))
+    return logits, tuple(pieces)
+
+
+class Anchored(NamedTuple):
+    """The backward's first pass over a query block's keys, online as the forward's softmax: its maximum
+    `peak`, the `anchor` c (the product dP of a key that holds the running maximum), the denominator
+    `total` and D's numerator about the anchor, `sum_j exp(s_j - m) (dP_j - c)`, `[bq]` fp32."""
+
+    peak: jax.Array
+    anchor: jax.Array
+    total: jax.Array
+    numerator: jax.Array
+
+
+def anchored(state: Anchored, logits: jax.Array, products: jax.Array) -> Anchored:
+    """The first pass after a tile's logits (-inf where unseen) and its products `dP = dO·Vᵀ`: the
+    weights exp(s - m) / T sum to one over these logits whatever tiles the forward took, and dP_j - D is
+    taken as (dP_j - c) - (D - c), so the key that holds a query's maximum enters it as exactly 0: a
+    query that keeps one key gets 0, and one whose other keys and initial state weigh less than fp32's
+    resolution beside it gets their share in full."""
+    tile_peak = logits.max(axis=-1)
+    peak = jnp.maximum(state.peak, tile_peak)
+    held = jnp.max(jnp.where(logits == tile_peak[:, None], products, -jnp.inf), axis=-1)
+    anchor = jnp.where(tile_peak > state.peak, held, state.anchor)
+    safe = jnp.where(peak == -jnp.inf, 0.0, peak)
+    correction = jnp.exp(state.peak - safe)
+    exponentials = jnp.exp(logits - safe[:, None])
+    numerator = (correction * (state.numerator + (state.anchor - anchor) * state.total)
+                 + jnp.sum(exponentials * (products - anchor[:, None]), axis=-1))
+    return Anchored(peak, anchor, correction * state.total + exponentials.sum(axis=-1), numerator)
+
+
+def anchored_delta(state: Anchored) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """The first pass's maximum (0 for a query that saw nothing), anchor, denominator and `D - c`."""
+    peak = jnp.where(state.peak == -jnp.inf, 0.0, state.peak)
+    return peak, state.anchor, state.total, state.numerator * inverse(state.total)
+
+
+def normalized(logits: jax.Array, peak: jax.Array, total: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """A tile's unnormalized weights `exp(s - m)` and its weights `p`, fp32."""
+    exponentials = jnp.exp(logits - peak[:, None])
+    return exponentials, exponentials * inverse(total)[:, None]
+
+
+def grad_scores(weights: jax.Array, products: jax.Array, anchor: jax.Array, delta: jax.Array,
+                seen: jax.Array) -> jax.Array:
+    """The score cotangents `p (dP - D)` of a tile, taken as `p ((dP - c) - (D - c))` about each query's
+    anchor c (`anchored`), zero where unseen."""
+    return jnp.where(seen, weights * ((products - anchor[:, None]) - delta[:, None]), 0.0)
+
+
+def refinement(residual: jax.Array, mass: jax.Array, peak0: jax.Array, shares: tuple[jax.Array, jax.Array],
+               peak: jax.Array, total: jax.Array, anchor: jax.Array, delta: jax.Array) -> jax.Array:
+    """D's one refinement from the main pass's own sums: the score cotangents of a query and of its
+    initial state (`shares`: its denominator and D's numerator at the state's maximum `peak0`) sum to 0
+    by the softmax's shift, and what they sum to here (`residual`, over the keys' weights `mass`) is D's
+    rounding. Moving D by it over the weights' total lets dK/dV, the initial state's gradients and the
+    head and query parameters' take the D whose cotangents do."""
+    carried = jnp.where(peak0 == -jnp.inf, 0.0, jnp.exp(peak0 - peak)) * inverse(total)
+    whole_residual = residual + (shares[1] - shares[0] * (anchor + delta)) * carried
+    whole_mass = mass + shares[0] * carried
+    return jnp.where(whole_mass > 0, whole_residual / jnp.where(whole_mass > 0, whole_mass, 1.0), 0.0)
+
+
+def value_operands(exponentials: jax.Array, weights: jax.Array, dout: jax.Array,
+                   total: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """The operands `(a, b)` of a tile's share of dV, `aᵀ·b` `[block_k, Dv]` in fp32: the unnormalized
+    weights `exp(s - m)` narrowed to the operands' dtype as the reference's forward rounds them, against
+    each query's `dout / total` in fp32, the reference's derivative's own order, so no small weight or
+    share is lost to normalizing first. bf16 alone takes FlashAttention's form, its normalized weights
+    `p` narrowed against the output's cotangent as it is, so the product stays on bf16's tensor cores: a
+    query's cotangents that cancel across a key still cancel, and a normalized weight below bf16's least
+    subnormal (about 9e-41) is dropped, which only a cotangent past about 1e28 would make count."""
+    if dout.dtype == jnp.bfloat16:
+        return weights.astype(dout.dtype).T, dout
+    scaled = dout.astype(jnp.float32) * inverse(total)[:, None]
+    return exponentials.astype(dout.dtype).astype(jnp.float32).T, scaled

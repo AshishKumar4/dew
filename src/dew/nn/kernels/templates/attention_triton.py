@@ -57,21 +57,6 @@ def _dot(a: jax.Array, b: jax.Array, interpret: bool) -> jax.Array:
     return plgpu.dot(a, b, precision=jax.lax.Precision.HIGHEST).astype(jnp.float32)
 
 
-def _value_gradient(exponentials: jax.Array, weights: jax.Array, dout: jax.Array, total: jax.Array,
-                    interpret: bool) -> jax.Array:
-    """A tile's share of dV `[block_k, Dv]`, fp32: the unnormalized weights `exp(s - m)` narrowed to the
-    operands' dtype as the reference's forward rounds them, against each query's `dout / total` in fp32,
-    the reference's derivative's own order, so no small weight or share is lost to normalizing first.
-    bf16 alone takes FlashAttention's form, its normalized weights `p` narrowed against the output's
-    cotangent as it is, so the product stays on bf16's tensor cores: a query's cotangents that cancel
-    across a key still cancel, and a normalized weight below bf16's least subnormal (about 9e-41) is
-    dropped, which only a cotangent past about 1e28 would make count."""
-    if dout.dtype == jnp.bfloat16:
-        return _dot(weights.astype(dout.dtype).T, dout, interpret)
-    scaled = dout.astype(jnp.float32) * _inverse(total)[:, None]
-    return _dot(exponentials.astype(dout.dtype).astype(jnp.float32).T, scaled, interpret)
-
-
 def _eligible(ba: tokamax.BoundArguments, target: generation.GpuTarget) -> bool:
     """Whether a launch runs on `target`: a CUDA GPU, one dtype of `DTYPES` on the queries, keys and
     values, and bf16 only from `generation.BF16_GPU` on, where Triton compiles its products."""
@@ -393,62 +378,6 @@ DQ_GRADS = (Kind.HEAD, Kind.QUERY, Kind.TILE)
 queries' own, and its tiles' entries; a key parameter's the dK/dV program writes."""
 
 
-def _inverse(total: jax.Array) -> jax.Array:
-    """Each query's `1 / total`, zero where it saw nothing (total 0)."""
-    return jnp.where(total > 0, 1.0 / jnp.where(total > 0, total, 1.0), 0.0)
-
-
-def _scored(score_mod, logits, q_pos, k_pos, params, *, slopes: bool):
-    """`score_mod` on the scaled logits, in fp32, and with `slopes` each entry's derivative of it along
-    the logits and along each parameter, a tile apiece: `score_mod` being pointwise in the entries, they
-    are the whole of its pullback (`_pulled`). They are its reverse-mode pullback's transpose applied to
-    each input's ones, on the hook's own tile and layouts, so a hook through a `jax.custom_vjp`
-    differentiates as the reference's does and a hook reads its arguments at the ranks it is called
-    with. An integer parameter has no derivative: its slopes are zeros. Without a hook, the logits and
-    no slopes."""
-    if score_mod is None:
-        return logits, None
-    if not slopes:
-        return score_mod(logits, q_pos, k_pos, *params).astype(jnp.float32), None
-    floating = [index for index, param in enumerate(params) if jnp.issubdtype(param.dtype, jnp.floating)]
-
-    def scored(s, *wide):
-        values = list(params)
-        for index, value in zip(floating, wide, strict=True):
-            values[index] = value
-        return score_mod(s, q_pos, k_pos, *values)
-
-    inputs = (logits, *(params[index] for index in floating))
-    out, pull = jax.vjp(scored, *inputs)
-    along = jax.linear_transpose(pull, out)
-
-    def slope(index):
-        [entries] = along(tuple(jnp.ones_like(x) if place == index else jnp.zeros_like(x)
-                                for place, x in enumerate(inputs)))
-        return entries.astype(jnp.float32)
-
-    differentiated = {index: slope(place + 1) for place, index in enumerate(floating)}
-    return out.astype(jnp.float32), (slope(0), *(differentiated.get(index, jnp.zeros_like(logits))
-                                                  for index in range(len(params))))
-
-
-def _pulled(cotangents, slopes, seen, kinds: tuple[Kind, ...]):
-    """The score cotangents `cotangents` through `score_mod`, its entries' derivatives `slopes`
-    (`_scored`; None without a hook): the logits' tile, and each parameter's, a head's or a query's its
-    queries' sums `[block_q]`, a key's its keys' `[block_k]`, a tile's the tile. Each entry is masked
-    before any sum, so one the call never sees (padding, another document) adds nothing even where the
-    hook's derivative there is not finite. fp32."""
-    if slopes is None:
-        return cotangents, ()
-    logits = jnp.where(seen, cotangents * slopes[0], 0.0)
-    pieces = []
-    for slope, kind in zip(slopes[1:], kinds, strict=True):
-        entries = jnp.where(seen, cotangents * slope, 0.0)
-        pieces.append(entries.sum(axis=0) if kind == Kind.KEY else entries if kind == Kind.TILE
-                      else entries.sum(axis=-1))
-    return logits, tuple(pieces)
-
-
 def _key_param(ref, kind: Kind, head, rows):
     """A hook parameter's values for a dK/dV program's tile, its queries `rows` of the whole row: the
     head's scalar, the rows' `[block_q, 1]`, its keys' `[1, block_k]`, the rows' entries."""
@@ -468,9 +397,9 @@ def _key_param(ref, kind: Kind, head, rows):
 def _tile_logits(score_mod, query, key, seen, q_pos, k_pos, params, *, scale: float, interpret: bool,
                  slopes: bool = False):
     """A tile's scaled logits under `score_mod`, -inf where unseen, and with `slopes` its entries'
-    derivatives (`_scored`)."""
-    logits, derivatives = _scored(score_mod, _dot(query, key.T, interpret) * scale, q_pos, k_pos, params,
-                                  slopes=slopes)
+    derivatives (`algebra.scored`)."""
+    logits, derivatives = algebra.scored(score_mod, _dot(query, key.T, interpret) * scale, q_pos, k_pos,
+                                         params, slopes=slopes)
     return jnp.where(seen, logits, -jnp.inf), derivatives
 
 
@@ -479,12 +408,11 @@ def _tile_scores(score_mod, query, key, value, dout, peak, total, anchor, delta,
     """A tile's backward through its scores: its unnormalized weights `exp(s - m)` and its weights `p`
     (zero where masked), the masked score cotangents `p * ((dP - c) - (D - c))`, `dP = dO V^T`, `c` each
     query's `anchor` and `delta` its `D - c`, and the entries' derivatives through `score_mod`
-    (`_scored`)."""
+    (`algebra.scored`)."""
     logits, slopes = _tile_logits(score_mod, query, key, seen, q_pos, k_pos, params, scale=scale,
                                   interpret=interpret, slopes=True)
-    exponentials = jnp.exp(logits - peak[:, None])
-    weights, products = exponentials * _inverse(total)[:, None], _dot(dout, value.T, interpret)
-    cotangents = jnp.where(seen, weights * ((products - anchor[:, None]) - delta[:, None]), 0.0)
+    exponentials, weights = algebra.normalized(logits, peak, total)
+    cotangents = algebra.grad_scores(weights, _dot(dout, value.T, interpret), anchor, delta, seen)
     return exponentials, weights, cotangents, slopes
 
 
@@ -526,28 +454,16 @@ def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tu
         # (dP_j - c) - (D - c): the key that holds a query's maximum enters it as exactly 0, so a query
         # that keeps one key gets 0, and one whose other keys and initial state weigh less than fp32's
         # resolution beside it gets their share in full.
-        peak, anchor, total, numerator = carry
         keys, k_pos, seen, params = tile(index)
         logits, _ = _tile_logits(score_mod, query, key_ref[keys, :], seen, q_pos, k_pos, params, scale=scale,
                                  interpret=interpret)
-        products = _dot(dout, value_ref[keys, :].T, interpret)
-        tile_peak = logits.max(axis=-1)
-        new_peak = jnp.maximum(peak, tile_peak)
-        new_anchor = jnp.where(tile_peak > peak, jnp.max(jnp.where(logits == tile_peak[:, None], products,
-                                                                   -jnp.inf), axis=-1), anchor)
-        safe = jnp.where(new_peak == -jnp.inf, 0.0, new_peak)
-        correction = jnp.exp(peak - safe)
-        exponentials = jnp.exp(logits - safe[:, None])
-        numerator = (correction * (numerator + (anchor - new_anchor) * total)
-                     + jnp.sum(exponentials * (products - new_anchor[:, None]), axis=-1))
-        return new_peak, new_anchor, correction * total + exponentials.sum(axis=-1), numerator
+        return algebra.anchored(carry, logits, _dot(dout, value_ref[keys, :].T, interpret))
 
     # From the softmax's initial state (`backward`), anchored at 0.
     peak0, shares = peak, (total, initial_ref[...])
-    peak, anchor, total, numerator = jax.lax.fori_loop(bounds_ref[0], bounds_ref[1], row_terms,
-                                                       (peak, jnp.zeros_like(total), *shares))
-    peak = jnp.where(peak == -jnp.inf, 0.0, peak)
-    delta = jnp.where(total > 0, numerator / jnp.where(total > 0, total, 1.0), 0.0)
+    row = jax.lax.fori_loop(bounds_ref[0], bounds_ref[1], row_terms,
+                            algebra.Anchored(peak, jnp.zeros_like(total), *shares))
+    peak, anchor, total, delta = algebra.anchored_delta(row)
     summed = tuple(kind in (Kind.HEAD, Kind.QUERY) for kind in score_kinds)
 
     def step(index, carry):
@@ -557,7 +473,7 @@ def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tu
         _, weights, cotangents, slopes = _tile_scores(score_mod, query, key, value, dout, peak, total, anchor,
                                                    delta, seen, q_pos, k_pos, params, scale=scale,
                                                    interpret=interpret)
-        logits, pieces = _pulled(cotangents, slopes, seen, score_kinds)
+        logits, pieces = algebra.pulled(cotangents, slopes, seen, score_kinds)
         # Scaled before it narrows to the operands' dtype, so fp16 holds what fp32 does.
         dq = dq + _dot((logits * scale).astype(key.dtype), key, interpret)
         for kind, ref, piece in zip(score_kinds, grad_refs, pieces, strict=True):
@@ -566,7 +482,7 @@ def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tu
         grads = tuple(grad + piece if row else grad for grad, row, piece in zip(grads, summed, pieces,
                                                                                strict=True))
         if any(summed):
-            _, pieces = _pulled(weights, slopes, seen, score_kinds)
+            _, pieces = algebra.pulled(weights, slopes, seen, score_kinds)
             weighed = tuple(sums + piece if row else sums for sums, row, piece in zip(weighed, summed, pieces,
                                                                                     strict=True))
         return (dq, residual + cotangents.sum(axis=-1), mass + weights.sum(axis=-1), grads, weighed)
@@ -581,11 +497,7 @@ def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tu
     # state sum to 0 by the softmax's shift, and what they sum to here is D's rounding. Moving D by it over
     # the weights' total lets the dK/dV launch, the initial state's gradients and the head and query
     # parameters' (by the pullbacks of the weights, `weighed`) take the D whose cotangents do.
-    inverse = jnp.where(total > 0, 1.0 / jnp.where(total > 0, total, 1.0), 0.0)
-    carried = jnp.where(peak0 == -jnp.inf, 0.0, jnp.exp(peak0 - peak)) * inverse
-    whole_residual = residual + (shares[1] - shares[0] * (anchor + delta)) * carried
-    whole_mass = mass + shares[0] * carried
-    refined = jnp.where(whole_mass > 0, whole_residual / jnp.where(whole_mass > 0, whole_mass, 1.0), 0.0)
+    refined = algebra.refinement(residual, mass, peak0, shares, peak, total, anchor, delta)
     delta = delta + refined
     grads = tuple(grad - refined * sums if row else grad
                   for grad, row, sums in zip(grads, summed, weighed, strict=True))
@@ -631,8 +543,8 @@ def _dkv_kernel(ranges_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: t
                                                                  peak_ref[rows],
                                                    total_ref[rows], anchor_ref[rows], delta_ref[rows], seen,
                                                    q_pos, k_pos, params, scale=scale, interpret=interpret)
-        logits, pieces = _pulled(cotangents, slopes, seen, score_kinds)
-        dv = dv + _value_gradient(exponentials, weights, dout, total_ref[rows], interpret)
+        logits, pieces = algebra.pulled(cotangents, slopes, seen, score_kinds)
+        dv = dv + _dot(*algebra.value_operands(exponentials, weights, dout, total_ref[rows]), interpret)
         # Scaled before it narrows to the operands' dtype, so fp16 holds what fp32 does.
         dk = dk + _dot((logits * scale).astype(query.dtype).T, query, interpret)
         updated = [grad + piece if kind == Kind.KEY else grad
@@ -761,7 +673,7 @@ def _launch_cost(ba: tokamax.BoundArguments, config: BackwardTiles, target: gene
                            if kind == Kind.KEY)
     wide = 0
     if not dq and query.dtype == jnp.float16:
-        # fp16's dV product runs in fp32 (`_value_gradient`), after the launch's 16-bit work.
+        # fp16's dV product runs in fp32 (`algebra.value_operands`), after the launch's 16-bit work.
         products, wide = products - value_width, value_width
     seconds = costs.seconds(costs.Cost(
         programs=programs,
