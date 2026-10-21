@@ -88,23 +88,6 @@ def test_prepacked_queries_keys_and_values_preserve_attention_and_cache():
             np.testing.assert_array_equal(after, before)
 
 
-def test_a_server_over_a_canonical_task_serves_its_projections_packed():
-    """A task over a model's own tree, its query, key and value apart, packs
-    them at the weights its generations read (`placed`) and keeps its tree;
-    a server built from it serves them packed, as the task's own calls do,
-    and draws what each request draws alone."""
-    bound = task()
-    attention = bound.variables["params"]["layers_0"]["self_attn"]
-    assert {"q_proj", "k_proj", "v_proj"} <= set(attention) and "qkv_proj" not in attention
-    server, tickets = served_alongside(bound)
-    assert "qkv_proj" in server.variables["params"]["layers_0"]["self_attn"]
-    assert "qkv_proj" in bound.placed["params"]["layers_0"]["self_attn"]
-    alone = [bound(prompt, budget, key=index)
-             for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
-    for ticket, lone in zip(tickets, [*alone, alone[2]], strict=True):
-        assert_same_generation(ticket.result(), lone)
-
-
 def test_a_server_holds_its_weights_at_decoding_storage_and_reloads_into_it():
     """A server over a bf16 decoder's fp32 masters holds what a load at bf16
     storage holds, its head bias fp32, and a reload of trained fp32 weights

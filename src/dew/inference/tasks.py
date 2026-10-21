@@ -31,7 +31,7 @@ from dew.cache import persist_compilations
 from dew.coordination import agreed
 from dew.diffusion.block import BlockProcess, CanvasGeneration, refuse_non_denoiser
 from dew.diffusion.discrete import MDLM_STEPS, DiscreteProcess, Unmask, refuse_causal
-from dew.inference.projections import served
+from dew.inference.projections import packed_owned
 from dew.interop.weights import decoding_storage
 from dew.nn.inputs import Media, ModelInputs, default_placement, mesh_of, request_key, token_id
 from dew.nn.protocols import Bounded, CacheCapacity, TokenModel
@@ -459,12 +459,10 @@ class _NativeTextTask:
 
     @functools.cached_property
     def placed(self) -> Variables:
-        """The weights this task's generations read, prepared at the first of them: the projection
-        groups its decoder reads packed packed (`dew.inference.projections.served`), then placed on
-        the device (`resident`). `variables` stay the canonical tree as given, so host weights
-        quantize on the host (`quantized`), an export reads them as trained, and every route to a
-        model (a run, a source, a live objective) reads the same prepared weights."""
-        return resident(self.model, served(self.model, self.variables))
+        """The weights this task's generations read, placed on the device at the first of them
+        (`resident`): `variables` stay as given, so host weights quantize on the host
+        (`quantized`)."""
+        return resident(self.model, self.variables)
 
     def bind(self, variables: Variables) -> Self:
         """Return the same task over other weights, such as a policy snapshot."""
@@ -654,7 +652,9 @@ class TextGeneration(_NativeTextTask):
         model, variables, settings, processor = cls._loaded(
             directory, TextSettings, lambda model, settings: None, ema=ema, step=step, mesh=mesh,
             layout=layout, dtype=dtype, param_dtype=param_dtype, trust=trust)
-        return cls.from_settings(model, variables, settings, processor)
+        # The task owns the weights it restored: their projections pack here, once, as a source's
+        # do at its load (`dew.pipeline`), and every route then reads the same packed weights.
+        return cls.from_settings(model, packed_owned(model, variables, layout), settings, processor)
 
     @classmethod
     def from_settings(cls, model: nn.Module, variables: Variables, settings: TextSettings,
