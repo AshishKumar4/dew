@@ -39,7 +39,14 @@ from .flops import MissingFlopsCount, counted_flops, projection_flops
 from .kernels.generation import backend, ran_kernel, route, triton_runs
 from .kernels.grouped_matmul import grouped_projection, kernel_refusal, ragged_dot_refusal, xla_ragged_dot
 from .kernels.selection import forced
-from .precision import at_least_fp32, float32_dot_general, float32_einsum, float32_products, rounded_operand
+from .precision import (
+    asks_default_precision,
+    at_least_fp32,
+    float32_dot_general,
+    float32_einsum,
+    float32_products,
+    rounded_operand,
+)
 from .protocols import ProjectionGroup, Routes, declared_groups
 from .sharding import (
     EXPERT_AXIS,
@@ -479,7 +486,8 @@ def expert_projection(x: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
     resolved = float32_products(compute, precision)
     chosen = grouped_matmul_kernel(implementation, compute, (x.dtype, kernel.dtype), resolved)
     if chosen == 'pallas' and seen_whole(x) and seen_whole(kernel):
-        return grouped_projection(x, kernel, group_sizes, compute, implementation == 'pallas')
+        return grouped_projection(x, kernel, group_sizes, compute, implementation == 'pallas',
+                                  not asks_default_precision(resolved, configured=True))
     return _projection(x, kernel, group_sizes, dtype, resolved)
 
 
