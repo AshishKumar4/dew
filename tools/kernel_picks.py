@@ -72,11 +72,12 @@ def main() -> None:
             return lowered.lowered
         raise AssertionError("a trainer under lower_for raises its lowered step")
 
-    lowered = json.loads(tuning.tune(step, measure=True))
+    _, launches = tuning.tune(step, measure=True)
+    launches = json.loads(launches)
     path = Path(cache.kernel_picks_path(jax.devices()[0].device_kind))
     # A store exists once a launch has been measured on this GPU model: a step with no Pallas launch
     # there (the dense 1.1B on an RTX PRO 6000 Blackwell) leaves none.
-    stored = () if not path.is_file() else tokamax.AutotuningResult.load(path.open()).data
+    stored = [] if not path.is_file() else list(tuning._read(str(path))[0].values())
     for ba, timings in stored:
         fastest = timings.prune()
         print(json.dumps({"kernel": type(ba.op).__name__, "key": str(dict(ba.autotuning_cache_key)),
@@ -85,7 +86,7 @@ def main() -> None:
                                     if isinstance(data, tokamax.BenchmarkData))}))
     # The step's launches beside the store's: a launch none of whose configs ran is in the first count
     # alone, and takes its heuristic config in every run.
-    print(json.dumps({"store": str(path), "launches": len(stored), "step_launches": len(lowered)}))
+    print(json.dumps({"store": str(path), "launches": len(stored), "step_launches": len(launches)}))
 
 
 if __name__ == "__main__":
