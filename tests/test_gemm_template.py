@@ -431,9 +431,10 @@ def test_a_side_operands_rows_may_be_any_of_its_dimensions(generation_name):
 @pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))
 def test_a_broadcast_dimension_is_the_squeezed_operands(generation_name):
     """A `[rows, 1]` mean square and a `[1, width]` bias with a None axis give the products of their
-    vectors, bit for bit."""
+    vectors, bit for bit, through the one implementation that takes both (Triton's: Mosaic's refuses a
+    side operand given back with a dimension of one)."""
     drawn = _draw(2)
-    with generation.assumed(generation_name):
+    with generation.assumed(generation_name), generation.chosen(grouped_matmul="triton"):
         column = jax.jit(_drop(_dew(CASES["broadcast axes"], interpret_on_cpu=True)))(*drawn)
         vector = jax.jit(_drop(_dew(CASES["norm and bias"], interpret_on_cpu=True)))(*drawn)
     np.testing.assert_array_equal(np.asarray(column[0], np.float32), np.asarray(vector[0], np.float32))
@@ -1021,8 +1022,8 @@ def test_a_paired_product_without_an_epilogue_is_refused():
 
 def test_a_hook_that_broadcasts_a_side_operand_lowers_for_hopper_through_triton():
     """Mosaic's layout inference finds no layout for a side operand given back with its dimension of
-    one, so the Mosaic launches refuse such a hook and a Hopper call lowers through Triton's, forward
-    and gradient (GMMGATE-h100-8)."""
+    one, so the Mosaic launches refuse such a hook: a Hopper call's hooked launch lowers through
+    Triton's, and its gradient lowers too (GMMGATE-h100-8)."""
     drawn = [jax.ShapeDtypeStruct(array.shape, array.dtype) for array in _draw(0)]
     dew = _drop(_dew(CASES["broadcast axes"]))
 
@@ -1030,8 +1031,9 @@ def test_a_hook_that_broadcasts_a_side_operand_lowers_for_hopper_through_triton(
         return sum(jnp.sum(out.astype(jnp.float32)) for out in dew(*drawn))
 
     mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
-    with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh), generation.routes() as taken:
-        jax.jit(dew).trace(*drawn).lower(lowering_platforms=("cuda",))
+    with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
+        with generation.routes() as taken:
+            jax.jit(dew).trace(*drawn).lower(lowering_platforms=("cuda",))
         jax.jit(jax.grad(loss)).trace(*drawn).lower(lowering_platforms=("cuda",))
     assert _kernels(taken) == {'triton'}
 
