@@ -110,6 +110,25 @@ def test_a_token_stores_windows_are_the_text_recipes(tmp_path):
     same_batches(expected, built)
 
 
+def test_the_token_windows_preset_reads_a_stores_windows_as_the_text_recipe(tmp_path):
+    """The token windows preset over a token store shuffled and repeated: the recipe's plan and
+    batches; recorded and read back with its stride overridden, windows that far apart."""
+    from dew.data.records import Unrecorded, decode, encode, override
+
+    store_of_documents(tmp_path)
+    expected = loader(TextData(str(tmp_path), seq_len=8, stride=2), batch=4, read="indexed", loading=LOADING)
+    chain = TokenFiles(str(tmp_path)).shuffle(0).repeat().pipe(presets.token_windows, seq_len=8, batch=4,
+                                                               stride=2)
+    built = compile(chain, read="indexed", loading=LOADING)
+    assert built.plan.identity() == expected.plan.identity()
+    same_batches(expected, built)
+    written = encode(chain)
+    assert not isinstance(written, Unrecorded)
+    wider = decode(override(written, "token_windows.stride", 4))
+    recipe = loader(TextData(str(tmp_path), seq_len=8, stride=4), batch=4, read="indexed", loading=LOADING)
+    assert compile(wider, read="indexed", loading=LOADING).plan.identity() == recipe.plan.identity()
+
+
 def test_a_token_stores_documents_are_packed_whole(tmp_path):
     """A token store's documents, ended by EOS, packed first-fit with no tokenizer: each row holds
     whole documents, so its targets are its documents' own, and together the rows of a pass hold
