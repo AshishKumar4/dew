@@ -6,7 +6,6 @@ single-device optax loop produces, otherwise the collectives GSPMD derived are
 not the ones we meant.
 """
 
-import json
 
 import jax
 import jax.numpy as jnp
@@ -17,6 +16,7 @@ from flax import linen as nn
 from jax.sharding import PartitionSpec as P
 from recording import RecordingTracker
 from sharded import assert_sharded
+from token_support import write_token_corpus
 
 from dew.artifacts import Representations
 from dew.data import Loading
@@ -261,13 +261,9 @@ def test_prefetch_iterator_resumes_a_packed_dataset_iterator(tmp_path):
     from dew.data.compile import compile
     from dew.data.sources.tokens import TokenFiles
 
-    documents = np.concatenate([np.arange(1, 9), [0]] * 40).astype(np.uint16)
-    (tmp_path / "train.bin").write_bytes(documents.tobytes())
-    (tmp_path / "val.bin").write_bytes(documents.tobytes())
-    (tmp_path / "meta.json").write_text(json.dumps(
-        {"tokenizer": "byte", "vocab_size": 256, "dtype": "uint16", "eos_id": 0}))
-    packed = TokenFiles(str(tmp_path)).shuffle(0).repeat().pipe(presets.lm, None, seq_len=8,
-                                                                 batch=jax.device_count(), bins=2)
+    corpus = write_token_corpus(tmp_path / "tokens", np.concatenate([np.arange(1, 9), [0]] * 40), eos_id=0)
+    packed = TokenFiles(corpus.train).shuffle(0).repeat().pipe(presets.lm, None, seq_len=8,
+                                                               batch=jax.device_count(), bins=2)
     data = compile(packed, read="memory", seed=0, loading=Loading(workers=0))
 
     mesh = MeshSpec().build()
