@@ -61,13 +61,14 @@ def cross_entropy_columns():
         relabel = np.argsort(order)
         return (states, matrix[:, order], scale[order], bias[order], relabel[targets], relabel)
 
-    return jax.jit(reference), draw
+    return jax.jit(reference), draw, None
 
 
 def decoder_residual_orders():
     """tests/test_decoder_export.py's qwen3_next round trip, ordered by its residual stream
     (tests/residual_orders.py): the trained model's logits on the trip's tokens, the model itself on
-    both sides, as equally exact as itself at any order."""
+    both sides, as equally exact as itself at any order, against the trip's float64 truth (the
+    reference run in float64, the same logits at every order)."""
     import tempfile
 
     import jax
@@ -86,7 +87,10 @@ def decoder_residual_orders():
     def draw(seed):
         return permuted(trip.trained, np.random.default_rng(seed).permutation(width)), trip.ids
 
-    return forward, draw
+    def truth(variables, ids):
+        return {"logits": np.asarray(trip.truth, np.float64)}
+
+    return forward, draw, truth
 
 
 CLASSES = {"cross-entropy-columns": cross_entropy_columns, "decoder-residual-orders": decoder_residual_orders}
@@ -102,13 +106,13 @@ def main(argv: list[str]) -> int:
     options = parser.parse_args(argv)
     from reference_error import null_runs, seeds_for
 
-    reference, draw = CLASSES[options.name]()
+    reference, draw, truth = CLASSES[options.name]()
     if options.seeds is None:
-        sized = seeds_for(reference, draw, options.name)
+        sized = seeds_for(reference, draw, options.name, truth_fn=truth)
         print(json.dumps({"class": options.name, "seeds": sized}), flush=True)
         return 0
     verdicts = null_runs(reference, draw, options.name, seeds=options.seeds, runs=options.runs,
-                         first=OFFSET + options.chunk * options.runs)
+                         first=OFFSET + options.chunk * options.runs, truth_fn=truth)
     print(json.dumps({"class": options.name, "chunk": options.chunk, "seeds": options.seeds,
                       "verdicts": verdicts}), flush=True)
     return 0
