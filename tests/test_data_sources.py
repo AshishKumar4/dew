@@ -563,6 +563,7 @@ def test_a_token_export_of_no_documents_reads_as_an_empty_corpus(tmp_path):
     assert manifest["rows"] == 0 and manifest["files"] == []
     stored = TokenFiles(str(tmp_path))
     assert len(stored.tokens) == 0 and stored.metadata()["tokens"] == 0
+    assert stored.fingerprint()["shards"] == []
     assert list(iterate(Pipeline(stored), read="memory")) == []
 
 
