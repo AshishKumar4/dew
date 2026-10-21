@@ -526,6 +526,30 @@ def test_text_preserves_exact_line_terminators_through_byte_tokenization(read):
     assert tokens.tolist() == list(original)
 
 
+def test_a_listing_keeps_the_files_whose_names_end_in_its_suffixes_in_any_case(tmp_path):
+    """A directory's media beside its notes: suffixes keep the media, whatever case either is
+    written in, as the store is read, here and under a glob."""
+    for name in ("a.MP4", "b.webm", "notes.txt", "list.csv"):
+        (tmp_path / name).write_bytes(b"")
+    for url in (str(tmp_path), str(tmp_path / "*")):
+        listing = Files(url, format="files", suffixes=("mp4", ".WEBM"))
+        names = sorted(row["path"].rsplit("/", 1)[-1] for row in listing.records("memory"))
+        assert names == ["a.MP4", "b.webm"]
+
+
+def test_a_token_export_reads_as_its_one_split_and_refuses_another(tmp_path):
+    """An export holds one split: named "train", the default, it reads as itself; named another,
+    it is refused rather than read as that split."""
+    from dew.data.sources import TokenFiles, source
+
+    export([{"text": np.arange(3, dtype=np.int32)}], str(tmp_path), format="array_record",
+           length_field="text", metadata={"token_store": True, "dtype": "int32", "tokenizer": "byte",
+                                          "vocab_size": 256, "eos_id": None})
+    assert isinstance(source(str(tmp_path), split="train"), TokenFiles)
+    with pytest.raises(ValueError):
+        source(str(tmp_path), split="validation")
+
+
 def test_a_token_export_of_no_documents_reads_as_an_empty_corpus(tmp_path):
     """An export whose input yields no rows commits no shards, and reads back as no tokens and no
     documents rather than failing to open."""
