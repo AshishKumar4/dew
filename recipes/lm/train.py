@@ -21,7 +21,9 @@ from dew.data import presets
 from dew.data.sources.tokens import TokenFiles
 from dew.objectives.lm import LMRunConfig
 
-WINDOWS = TokenFiles("data/shakespeare-byte").pipe(presets.lm, None, seq_len=256, batch=32, pack=None)
+# Shuffled before the windows are cut, so the windows are what it orders.
+WINDOWS = TokenFiles("data/shakespeare-byte").shuffle(seed=0).repeat().pipe(
+    presets.lm, None, seq_len=256, batch=32, pack=None)
 
 if __name__ == "__main__":
     LMRunConfig.cli(default=LMRunConfig(data=WINDOWS)).run()

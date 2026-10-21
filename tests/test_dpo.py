@@ -21,9 +21,8 @@ from rl_support import TinyHead
 from steady_state import steady_state
 from tool_support import load
 
-from dew.config.data import PreferenceData, loader
-from dew.data import Loading
-from dew.data.compile import iterate
+from dew.data import Files, Loading, Memory, presets
+from dew.data.compile import compile, iterate
 from dew.data.dataset import DataPartition
 from dew.data.preferences import IDS_KEY, MASK_KEY
 from dew.objectives.base import Step
@@ -203,9 +202,9 @@ def records(*rows):
 
 
 def preference_rows(rows, pad_id, width):
-    recipe = PreferenceData(source=tuple(json.loads(row) for row in rows), seq_len=width, pad_id=pad_id)
-    pipeline, _, _ = recipe.pipelines()
-    return list(iterate(pipeline, read="memory", loading=Loading(workers=0)))
+    pairs = Memory([json.loads(row) for row in rows]).pipe(presets.preferences, seq_len=width, batch=None,
+                                                           pad_id=pad_id)
+    return list(iterate(pairs, read="memory", loading=Loading(workers=0)))
 
 
 PAIR = {"chosen": [1, 2, 3, 4], "rejected": [1, 2, 5],
@@ -215,11 +214,11 @@ PAIR = {"chosen": [1, 2, 3, 4], "rejected": [1, 2, 5],
 def test_a_preference_dataset_trains_as_the_preference_config_does():
     """`Trainer.fit` compiles a Dataset with the objective's own stages.
     DPO adds none, so one step over `preferences.PreferencePair` rows moves the policy
-    exactly as one step over the same pairs through `PreferenceData`."""
+    exactly as one step over the same pairs through the preferences preset."""
     import optax
     from bank_support import identical
 
-    from dew.data import Memory, preferences
+    from dew.data import preferences
     from dew.training import Layout, Trainer
 
     pairs = [PAIR] * 8
@@ -230,8 +229,8 @@ def test_a_preference_dataset_trains_as_the_preference_config_does():
         return trainer.fit(data, steps=1).variables
 
     identical(trained(Memory(pairs).map(preferences.PreferencePair(4)).batch(8)),
-              trained(loader(PreferenceData(source=tuple(pairs), seq_len=4), batch=8, read="memory",
-                             loading=Loading(workers=0))))
+              trained(compile(Memory(pairs).pipe(presets.preferences, seq_len=4, batch=8),
+                              read="memory", loading=Loading(workers=0))))
 
 
 def test_a_ragged_pair_is_refused():
@@ -252,7 +251,8 @@ def test_an_incomplete_row_is_refused():
     with pytest.raises(ValueError):
         preference_rows(records([1, 2]), 0, 4)[0]
     with pytest.raises(ValueError):
-        loader(PreferenceData(source=(), seq_len=4), batch=1, read="memory", loading=Loading(workers=0))
+        compile(Memory([]).pipe(presets.preferences, seq_len=4, batch=1), read="memory",
+                loading=Loading(workers=0))
 
 
 def test_unread_preference_fields_pass_through():
@@ -272,8 +272,8 @@ def test_parquet_pairs_batch_in_pairs(tmp_path):
         "chosen_mask": [[0, 0, 1, 1]], "rejected_mask": [[0, 0, 1]],
     }), path)
 
-    data = loader(PreferenceData(source=str(path), seq_len=4), batch=1, read="memory",
-        loading=Loading(workers=0), validation_records=4 * (1))
+    data = compile(Files(str(path), format="parquet").pipe(presets.preferences, seq_len=4, batch=1),
+                   read="memory", loading=Loading(workers=0))
 
     assert data.records == 1
     batch = next(data.train(DataPartition()))
@@ -295,8 +295,9 @@ def test_varied_rows_pad_to_one_window(mask_case):
     elif mask_case == "default":
         rows = records({"chosen": [1, 2], "rejected": [3]})
     batch_size = 2 if mask_case == "varied" else 1
-    data = loader(PreferenceData(source=tuple(json.loads(row) for row in rows), seq_len=4),
-        batch=batch_size, read="memory", loading=Loading(workers=0), validation_records=4 * batch_size)
+    data = compile(Memory([json.loads(row) for row in rows]).pipe(presets.preferences, seq_len=4,
+                                                                  batch=batch_size),
+                   read="memory", loading=Loading(workers=0))
 
     batch = next(data.train(DataPartition()))
 
@@ -329,9 +330,5 @@ def test_parquet_without_sides_is_refused(tmp_path):
     path = tmp_path / "nopairs.parquet"
     pq.write_table(pa.table({"chosen": [[1]]}), path)
     with pytest.raises(ValueError):
-        loader(PreferenceData(source=str(path)), batch=1, read="memory", validation_records=4 * (1))
-
-
-def test_unknown_recipe_fields_are_refused_before_reading_pairs():
-    with pytest.raises(ValueError):
-        loader("preferences", source=(PAIR,), batch=2, read="memory", records=(PAIR,))
+        next(compile(Files(str(path), format="parquet").pipe(presets.preferences, seq_len=4, batch=1),
+                     read="memory").train(DataPartition()))

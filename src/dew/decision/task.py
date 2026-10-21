@@ -475,11 +475,13 @@ class Decide:
         its objective evaluates them. A batch is one pass within the budget, as
         `batch` packs its rows, on one device, as an answer is: a short last
         batch need not divide."""
+        from dew.data import Memory
         from dew.data.compile import validation
-        from dew.decision.data import Decisions as DecisionRecipe
+        from dew.decision.data import decisions
 
         rows = max(1, min(self.budget.rows, self.budget.tokens // self.layout.max_len))
-        held, _, _ = DecisionRecipe(source=tuple(examples)).pipelines()
+        rows_of = [{"example": row} if isinstance(row, Example) else row for row in examples]
+        held = decisions(Memory(rows_of))
         return validation(held, batch=rows, objective=self._scoring.data(), read="memory")
 
     @functools.cached_property

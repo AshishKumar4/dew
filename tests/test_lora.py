@@ -1025,20 +1025,20 @@ def _recipe_run(tmp_path, image_size, *args):
     TFDS image fixture, with `args` ending in the run's LoRA flags
     (`--lora.rank`, `--lora.modules`) and no subcommand. Returns the parsed
     config and the trained state."""
+    from dew.data import presets
+    from dew.data.sources.tfds import TFDS
     from dew.objectives.diffusion import DiffusionRunConfig
 
+    images = TFDS("dew_images", path=str(IMAGES), split="all").shuffle(seed=0).repeat().pipe(
+        presets.images, image_size, batch=jax.device_count())
     config = DiffusionRunConfig.cli([
-        "--model.dtype", "float32", "--model.attention-impl", "xla",
-        "data:images", "--data.source", json.dumps({"class": "dew.data.sources.tfds:TFDS", "fields": {
-            "name": "dew_images", "path": str(IMAGES), "split": "all"}}), "--data.image-size",
-                str(image_size),
-        "--data.validation", "None", "--objective.solver",
+        "--model.dtype", "float32", "--model.attention-impl", "xla", "--objective.solver",
         '{"class": "euler"}', "--objective.guidance", "None", "--objective.steps", "2",
         "--objective.ema-decay", "None", "--val-metrics", "[]",
-        "--trainer.checkpoint-dir", str(tmp_path), "--trainer.batch-size", str(jax.device_count()),
+        "--trainer.checkpoint-dir", str(tmp_path),
         "--trainer.steps", "2", "--trainer.eval-every", "None", "--trainer.checkpoint-every", "2",
         "--trainer.compilation-cache-dir", "None", "--trainer.multi-host", "False", "--trainer.name", "run",
-        *args, "data.augment:none"])
+        *args], default=DiffusionRunConfig(data=images))
     return config, config.run()
 
 
