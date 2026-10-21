@@ -99,14 +99,13 @@ def gemm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None = None, *
                                       (jnp.dtype(lhs.dtype),), several=False, transpose_rhs=not transpose_rhs,
                                       interpret_on_cpu=interpret_on_cpu, precision=precision, dense=dense))
         if narrow:
-            d_rhs = gemm_t(lhs, d_product, group_sizes, prologue=prologue,
+            d_rhs = gemm_t(lhs, d_product, None if dense else group_sizes, prologue=prologue,
                            prologue_operands=tuple(zip(prologue_arrays, prologue_axes, strict=True)),
-                           out_dtype=rhs.dtype, precision=precision, interpret_on_cpu=interpret_on_cpu,
-                           dense=dense)
+                           out_dtype=rhs.dtype, precision=precision, interpret_on_cpu=interpret_on_cpu)
         else:
             operand = lhs if prologue is None else prologue(lhs, *prologue_arrays).astype(lhs.dtype)
-            d_rhs = gemm_t(operand.astype(work), d_product, group_sizes, out_dtype=rhs.dtype,
-                           precision=precision, interpret_on_cpu=interpret_on_cpu, dense=dense)
+            d_rhs = gemm_t(operand.astype(work), d_product, None if dense else group_sizes,
+                           out_dtype=rhs.dtype, precision=precision, interpret_on_cpu=interpret_on_cpu)
         d_rhs = jnp.swapaxes(d_rhs, 1, 2) if transpose_rhs else d_rhs
         d_lhs, d_prologue = d_operand, ()
         if prologue is not None:
@@ -120,13 +119,15 @@ def gemm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None = None, *
     return differentiable(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays)
 
 
-def gemm_t(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, prologue=None,
+def gemm_t(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None, *, prologue=None,
            prologue_operands: tuple = (), out_dtype, precision: PrecisionLike = None,
-           interpret_on_cpu: bool = False, dense: bool = False) -> jax.Array:
+           interpret_on_cpu: bool = False) -> jax.Array:
     """Each group's rows of `prologue(lhs)` transposed times its rows of `rhs`: `[groups, depth, width]`
-    in `out_dtype`, an empty group's zero, summed as `gemm`'s `precision` asks. A value, as `gemm`'s
-    reverse mode takes it. `dense`: one group of every row, a dense product's (`gemm`)."""
-    group_sizes = group_sizes.astype(jnp.int32)
+    in `out_dtype`, an empty group's zero, summed as `gemm`'s `precision` asks; without `group_sizes`,
+    every row one group, a dense product's (`[1, depth, width]`). A value, as `gemm`'s reverse mode
+    takes it."""
+    dense = group_sizes is None
+    group_sizes = jnp.full((1,), lhs.shape[0], jnp.int32) if dense else group_sizes.astype(jnp.int32)
     prologue_arrays, prologue_axes = _split(prologue_operands, 'prologue')
 
     def kernel(lhs, rhs, group_sizes, prologue_arrays, *, interpret):
