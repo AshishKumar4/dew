@@ -418,12 +418,12 @@
    "by": "2026-11-13"
   },
   "tests/test_hf_decoder_hybrids.py": {
-   "comparisons": 10,
+   "comparisons": 7,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
   "tests/test_hf_decoder_moe.py": {
-   "comparisons": 19,
+   "comparisons": 11,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
