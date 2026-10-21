@@ -268,19 +268,21 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
             anchor, delta, chosen = algebra.split_delta(others, own, others_total, prior, state_total,
                                                         anchor_rows, do, chosen)
         m = maxima
+        over_prior = algebra.inverse(prior)
 
         def step(j, carry):
-            # Against the weights at the prior denominator, taken to the pass's own at the end
-            # (`algebra.dq_finish`), as the Triton mainloop's dQ launch.
+            # Against the unnormalized weights, taken to the pass's own denominator at the end
+            # (`algebra.dq_finish`), dQ's operands over the prior one before they narrow, as the Triton
+            # mainloop's dQ launch.
             dq, residual, mass, grads, weighed = carry
             columns, seen, params, k_tile, v_tile = tile(j)
             logits, slopes = _logits(score_mod, q, k_tile, seen, q_pos, columns[None, :], params, scale,
                                      slopes=True)
-            weights = algebra.normalized(logits, m, prior)[1]
+            weights = algebra.normalized(logits, m, jnp.ones_like(m))[0]
             cotangents = algebra.grad_scores(weights, _dot(do, v_tile.T), anchor, delta, seen,
                                              columns[None, :] == chosen[:, None])
             pulled, pieces = algebra.pulled(cotangents, slopes, seen, score_kinds)
-            dq = dq + _dot((pulled * scale).astype(k_tile.dtype), k_tile)
+            dq = dq + _dot((pulled * (scale * over_prior)[:, None]).astype(k_tile.dtype), k_tile)
             grads = tuple(grad + piece if add else grad for grad, add, piece in zip(grads, summed, pieces,
                                                                                    strict=True))
             if any(summed):
@@ -356,9 +358,10 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
             logits, slopes = _logits(score_mod, q, k_tile, seen, rows[:, None], columns[None, :], params,
                                      scale, slopes=True)
             exponentials, weights = algebra.normalized(logits, m, denominator)
-            cotangents = algebra.grad_scores(weights, _dot(do, v_tile.T), anchor[row, head, rows],
+            cotangents = algebra.grad_scores(exponentials, _dot(do, v_tile.T), anchor[row, head, rows],
                                              delta[row, head, rows], seen,
-                                             columns[None, :] == key_index[row, head, rows][:, None])
+                                             columns[None, :] == key_index[row, head, rows][:, None],
+                                             algebra.inverse(denominator))
             pulled, pieces = algebra.pulled(cotangents, slopes, seen, score_kinds)
             dv = dv + _dot(*algebra.value_operands(exponentials, weights, do, denominator))
             dk = dk + _dot((pulled * scale).astype(q.dtype).T, q)
