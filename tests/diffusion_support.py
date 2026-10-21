@@ -50,6 +50,19 @@ def image_batch(loaded, prompts) -> dict:
     return {"image": pixels, **loaded.inputs.tokenize([prompts[row % len(prompts)] for row in range(rows)])}
 
 
+def source_objective(source):
+    """A published pipeline source (`source`/pipeline) loaded in float32, and the objective that trains
+    its transformer through the whole source: its autoencoder and text towers as state, no
+    unconditional drop, no EMA, two steps."""
+    from dew.interop.pretrained import Pretrained
+    from dew.objectives.diffusion import DiffusionObjective
+
+    loaded = Pretrained.load(str(source / "pipeline"), dtype="float32", attention_impl="xla")
+    return loaded, DiffusionObjective(loaded.model, loaded.process, loaded.inputs,
+                                      autoencoder=loaded.autoencoder, variables=loaded.variables,
+                                      unconditional_prob=0.0, ema_decay=None, steps=2)
+
+
 def trained_step(objective, batch, checkpoints=None):
     """One SGD step of a published source's `objective` over `batch` through the public trainer, at a
     fixed key: the loss falls, the transformer's output projection moves, and the loaded encoders and

@@ -159,6 +159,15 @@ def assert_coder_vjps(loaded, reference, operand: str, posterior, bound: float) 
         layouts, reference, channels_last(reference["decode.grad_latent"]), bound)
 
 
+def recorded_gradients(part, precision: str, inputs, names) -> np.ndarray:
+    """A source's recorded gradients at `precision` (`fp32`, `fp64`), raveled in one order: its
+    `inputs`' (`{precision}.grad_<input>`) then its parameters' (`{precision}.grad_param.<name>`),
+    each read through `part`."""
+    leaves = [part(f"{precision}.grad_{name}") for name in inputs]
+    leaves += [part(f"{precision}.grad_param.{name}") for name in names]
+    return np.concatenate([np.ravel(leaf) for leaf in leaves])
+
+
 def scaled_gap(actual, expected) -> float:
     """Maximum float64 error, scaled by max(1, the reference's magnitude)."""
     expected = np.asarray(expected, np.float64)
