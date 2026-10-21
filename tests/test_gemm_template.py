@@ -639,7 +639,8 @@ def test_a_broadcast_hooks_launch_stores_and_reads_back():
     x, w, ms, nw, b, u, s, ct = _draw(7)
     with generation.assumed("sm80"), tuning.seen() as launches:
         jax.jit(_drop(_dew(CASES["broadcast axes"], interpret_on_cpu=True))).lower(x, w, ms, nw, b, u, s, ct)
-    hooked = [launch for launch in launches if launch.arguments.get("hooks", grouped_matmul.NO_HOOKS).prologue]
+    hooked = [launch for launch in launches
+              if launch.arguments.get("hooks", grouped_matmul.NO_HOOKS).prologue is not None]
     assert hooked
     assert tuning.loads_launches(tuning.dumps_launches(hooked))
 
