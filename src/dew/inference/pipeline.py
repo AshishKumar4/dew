@@ -140,9 +140,9 @@ def _from_source(source: str, *, mesh: MeshSpec | Mesh | None, layout: Layout | 
     placement = DefaultMesh() if mesh is None else mesh
     # The variables stay the canonical tree; each generation packs its projections in its own
     # compiled call (`dew.inference.projections.served`).
-    loaded = (Pretrained._load(source, revision=revision, param_dtype=storage, mesh=placement, layout=layout)
+    loaded = (Pretrained.load(source, revision=revision, param_dtype=storage, mesh=placement, layout=layout)
               if dtype is None else
-              Pretrained._load(source, revision=revision, dtype=dtype, param_dtype=storage, mesh=placement,
+              Pretrained.load(source, revision=revision, dtype=dtype, param_dtype=storage, mesh=placement,
                                layout=layout))
     match loaded:
         case PretrainedPipeline():

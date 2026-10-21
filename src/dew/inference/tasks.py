@@ -33,7 +33,7 @@ from dew.diffusion.block import BlockProcess, CanvasGeneration, refuse_non_denoi
 from dew.diffusion.discrete import MDLM_STEPS, DiscreteProcess, Unmask, refuse_causal
 from dew.inference.projections import served
 from dew.interop.weights import decoding_storage
-from dew.nn.inputs import Media, ModelInputs, mesh_of, request_key, token_id
+from dew.nn.inputs import Media, ModelInputs, default_placement, mesh_of, request_key, token_id
 from dew.nn.protocols import Bounded, CacheCapacity, TokenModel
 from dew.objectives.base import UNREAD, Variables, thaw
 from dew.records import integer, record as named_fields, text as named
@@ -426,7 +426,7 @@ def _saved_processor(settings: TextSettings | MaskedSettings | BlockSettings,
 
 def resident(model: nn.Module, variables: Variables) -> Variables:
     """`variables` as decoding reads them (`decoding_storage`), each leaf held in host memory, as
-    `Pretrained.load` returns them without a mesh, cast on the host and then placed on the device
+    `Pretrained.load(on_host=True)` returns them, cast on the host and then placed on the device
     once: replicated on the mesh the tree's arrays sit on, or committed to this process's default
     device as it is now (`jax.default_device`), so a later call made elsewhere runs where the
     weights are rather than moving them. A jax.Array stays where it is, a pinned-host bank's among
@@ -434,13 +434,7 @@ def resident(model: nn.Module, variables: Variables) -> Variables:
     would be copied to the device again at each call."""
     stored = decoding_storage(model, variables)
     mesh = mesh_of(stored)
-    default = jax.config.jax_default_device
-    if mesh is not None:
-        target = NamedSharding(mesh, P())
-    elif default is None or isinstance(default, str):
-        target = jax.local_devices(backend=default)[0]
-    else:
-        target = default
+    target = default_placement() if mesh is None else NamedSharding(mesh, P())
 
     def placed(leaf):
         return jax.device_put(leaf, target) if isinstance(leaf, (np.ndarray, np.generic)) else leaf
