@@ -474,6 +474,27 @@ def test_coverage_combines_each_tasks_branches_into_one_report_a_module_a_line(c
     assert Path(least[0].removeprefix("| ")).name == "unused.py" and least[-1] == "0.0% |"
 
 
+def test_the_plan_runs_as_one_wave_on_the_pool(ci, tmp_path, monkeypatch):
+    """The plan's target is the least whose tasks fit the pool at once, so no task waits for another to free
+    its container (train 22: 212 tasks of a set 240 s target on 160 containers ran as two waves, 10:10),
+    and no less than the heaviest test, which no cut divides. The plan command reads the pool from
+    .armada.json."""
+    records = {f"tests/test_even{n}.py::test_a": 100.0 for n in range(12)}
+    records |= {"tests/test_heavy.py::test_a": 200.0, "tests/test_heavy.py::test_b": 100.0}
+    for node in records:
+        (tmp_path / node.split("::")[0]).write_text("")
+    (tmp_path / "tests/test_durations.json").write_text(json.dumps(records))
+    monkeypatch.setenv("DEW_TEST_CACHE", "off")
+    for pool in (4, 8):
+        target = ci.one_wave({}, pool)
+        assert len(ci.plan(target, {})) <= pool < len(ci.plan(target - 1, {})), (pool, target)
+    assert ci.one_wave({}, 1000) == 200.0
+    (tmp_path / ".armada.json").write_text(json.dumps({"pool": 8}))
+    command = [sys.executable, str(ROOT / "tools/armada/ci.py"), "plan", "--timings=none.json"]
+    planned = subprocess.run(command, cwd=tmp_path, check=True, capture_output=True, text=True)
+    assert json.loads(planned.stdout)["include"] == ci.plan(ci.one_wave({}, 8), {})
+
+
 def test_a_file_whose_recorded_tests_outweigh_its_median_runs_split_by_them(ci, tmp_path):
     """Train 18's census: main's runs timed the file at 6 s with one test; a head recorded the 1,576
     tests it added (here 40 of 30 s). Each record is a test's least time, so their sum past the median
