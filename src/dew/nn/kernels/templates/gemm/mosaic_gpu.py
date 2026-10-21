@@ -56,8 +56,9 @@ class Tiles:
     (`stages`, upstream's `max_concurrent_steps`) and the column tiles in each band of the planar snake
     (`grid_block_n`); Dew: the warpgroups computing a tile (`warpgroups`: 2 halve `block_n` between two
     consumer warpgroups beside a producer that issues the loads, CUTLASS's cooperative sm90 schedule), and
-    the multiprocessors of a cluster (`cluster`: 2 pair row tiles of one group, which load each step's
-    matrix block once between them, multicast)."""
+    the multiprocessors of a cluster (`cluster`: 2 pair two tiles of one group, which load the block of
+    the operand they share once between them, multicast: `gmm`'s row tiles its matrix block, `tgmm`'s depth
+    tiles its cotangent's), only for a cooperative tile."""
     block_m: int
     block_n: int
     block_k: int
@@ -65,6 +66,14 @@ class Tiles:
     grid_block_n: int
     warpgroups: int = 1
     cluster: int = 1
+
+    def __post_init__(self):
+        paired = self.cluster == 2 and self.warpgroups == 1
+        if self.warpgroups not in (1, 2) or self.cluster not in (1, 2) or paired:
+            raise ValueError(f"{self}: one warpgroup alone, or two in a cluster of one or two "
+                             "multiprocessors")
+        if self.warpgroups == 2 and (self.block_n % 2 or self.block_m % 2):
+            raise ValueError(f"{self}: two warpgroups halve the tile's columns and rows")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -131,11 +140,12 @@ def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles,
     with `transpose_rhs` `[groups, width, depth]`: `[rows, width]` in `out_dtype`, the rows past the
     routed ones zero. The depth must divide by `tiles.block_k` and the width by `tiles.block_n`.
 
-    Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of `lhs` in its shared
-    memory stage before the warpgroup MMA reads it; `epilogue(acc, *side_tiles)` each fp32
-    accumulator tile, returning one output or a tuple of them (`out_dtypes`). A side operand's
-    dimensions follow the launch axes its `*_axes` entry names, 'rows' and 'depth' for the prologue's,
-    'rows' and 'columns' for the epilogue's, each brought to shared memory by TMA."""
+Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of `lhs` (a cooperative
+    tile's consumer, half its rows) in its shared memory stage before the warpgroup MMA reads it;
+    `epilogue(acc, *side_tiles)` each fp32 accumulator tile (a cooperative consumer's, half its columns),
+    returning one output or a tuple of them (`out_dtypes`). A side operand's dimensions follow the launch
+    axes its `*_axes` entry names, 'rows' and 'depth' for the prologue's, 'rows' and 'columns' for the
+    epilogue's, each brought to shared memory by TMA."""
     block_n, block_k = tiles.block_n, tiles.block_k
     rows, k = lhs.shape
     g, k2, n = rhs.shape
@@ -405,6 +415,9 @@ def _gmm_pipeline(tiles: Tiles, transpose_rhs: bool, steps: int, side_axes: tupl
 def _cooperative_kernel(body, out_type, *, tiles: Tiles, multiprocessors: int, interpret):
     """Dew: a cooperative kernel's launch: a pair of multiprocessors a cluster where `tiles.cluster` is 2,
     persistent over them, three warpgroups a block (two consumers and a producer)."""
+    if multiprocessors < tiles.cluster:
+        raise ValueError(f"{tiles} pairs multiprocessors, and the launch has {multiprocessors} (an "
+                         "interpreter's one block does not model a cluster)")
     return plgpu.kernel(
         body,
         out_type=out_type,
@@ -543,15 +556,16 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles
     `[groups, depth, width]` in `out_dtype`, an empty group's zero. The depth must divide by
     `tiles.block_m` and the width by `tiles.block_n`; `tiles.block_k` is the rows a step takes.
 
-    Dew: `prologue(rows, *side_tiles)` transforms each `[block_k, block_m]` stage of `lhs`'s rows in
-    place before the group masking and the MMA; side operands follow 'rows' and 'depth' as `gmm`'s.
+    Dew: `prologue(rows, *side_tiles)` transforms each `[block_k, block_m]` stage of `lhs`'s rows (a
+    cooperative tile's consumer, half its depth) in place before the group masking and the MMA; side
+    operands follow 'rows' and 'depth' as `gmm`'s.
     `exact_sums` adds each step's product into the fp32 sum by an IEEE add, which holds two
     accumulators in registers."""
     block_m, block_n, block_k = tiles.block_m, tiles.block_n, tiles.block_k
     k, m = lhs.shape
     k2, n = rhs.shape
     g = group_sizes.shape[0]
-    if k != k2 or m % block_m or n % block_n:
+    if k != k2 or m % (block_m * tiles.cluster) or n % block_n:
         raise ValueError(f"a [{k}, {m}] by [{k2}, {n}] kernel gradient does not take {tiles}")
     # Dew: the rows padded to a multiple of 8, as `gmm`'s, past every group.
     lhs, rhs = _rows_padded(lhs), _rows_padded(rhs)
