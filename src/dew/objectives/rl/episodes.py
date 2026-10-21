@@ -33,6 +33,7 @@ from dew.data.dataset import DataPartition
 from dew.inference.rollouts import check_ending
 from dew.nn.inputs import ModelInputs, mesh_of, pad_token_rows
 from dew.objectives.base import Batch, Variables
+from dew.records import finite
 from dew.sampling.text import Generation, Sampling
 from dew.training.state import TrainState
 
@@ -240,11 +241,8 @@ class _StatusStop(RuntimeError):
 
 
 def finite_reward(value: float) -> float:
-    """Return a verifier's or reward's score as a float, refusing a non-finite one with ValueError."""
-    reward = float(value)
-    if not math.isfinite(reward):
-        raise ValueError(f"a reward must be a finite number, got {reward}")
-    return reward
+    """A verifier's or reward's score as a float, refused unless a finite number (`records.finite`)."""
+    return finite(value, "a reward")
 
 
 @dataclass
