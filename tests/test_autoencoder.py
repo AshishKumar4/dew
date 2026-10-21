@@ -206,3 +206,20 @@ def test_every_built_in_autoencoder_rebuilds_from_its_saved_record_alone(kind, t
     np.testing.assert_array_equal(np.asarray(rebuilt.encode(params, image)), np.asarray(latent))
     np.testing.assert_array_equal(np.asarray(rebuilt.decode(params, latent)),
                                   np.asarray(original.decode(params, latent)))
+
+
+@pytest.mark.parametrize("family", ["wan_vae", "qwen_image_vae"])
+def test_a_kl_loader_refuses_another_autoencoders_checkpoint(tmp_path, family):
+    """A Wan or Qwen-Image VAE's directory given to the AutoencoderKL loaders, a pipeline's and a
+    standalone one's, is refused by the class its config names, before its tensors meet the KL tree."""
+    from interop_support import extract_fixture
+
+    from dew.nn.autoencoders.pretrained import load_kl_vae
+
+    source = extract_fixture(Path(__file__).parent / "fixtures" / f"{family}.tar.xz", tmp_path)
+    folder = next(path.parent for path in source.rglob("config.json"))
+    with pytest.raises(ValueError):
+        load_kl_vae(folder, subfolder="")
+    with pytest.raises(ValueError):
+        StableDiffusionVAE(str(folder), dtype=jnp.float32)
+
