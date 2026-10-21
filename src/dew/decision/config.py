@@ -7,10 +7,10 @@ and head. `pretrained` names another: a Laya-style repository (one with an
 fresh, with `lora` to train an adapter in place of the whole model. A fresh
 head is Laya's, reading the layout the backbone's order asks for, or with
 `head` the joint schema head, reading every question of an example in one
-row (`JointLayout`). A `Decisions` recipe reads a table or a mixture manifest
-whose sets contribute their recorded shares. A tenth
-of the table's rows, at most 400, are held out by the default `HoldOut`;
-validation scores them, and after training they fit the temperatures the
+row (`JointLayout`). Its data is a chain through `decisions` over a table, or `mixture`'s over a
+mixture manifest whose sets contribute their recorded shares, and its validation the rows a
+`holdout` keeps or a store's own split; validation scores them, and after training they fit the
+temperatures the
 task divides its logits by, saved into the run, so `Decide.from_run` and
 `dew.pipeline` answer calibrated. A question type's temperature needs ten
 held-out answers and a bucket's 2000, Laya's floors.
