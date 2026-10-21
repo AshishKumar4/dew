@@ -511,8 +511,22 @@ class Dataset:
 
     def pipe[**Options](self, stages: Callable[Concatenate[Dataset, Options], Dataset],
                         *args: Options.args, **kwargs: Options.kwargs) -> Dataset:
-        """`stages(self, *args, **kwargs)`: a dataset-level stage, such as `text.pack`."""
-        return stages(self, *args, **kwargs)
+        """`stages(self, *args, **kwargs)`: a dataset-level stage, such as `text.pack`. The chain
+        it returns keeps the call beside the stages it made (`Piped`), which a run's record writes
+        in their place (`dew.data.records`)."""
+        before = self._chain()
+        after = stages(self, *args, **kwargs)
+        if not isinstance(after, Pipeline):
+            return after
+        called = Piped(stages, args, tuple(kwargs.items()), len(before.stages), len(after.stages))
+        kept = tuple(entry for entry in after.piped if entry.end <= len(after.stages))
+        if after.source is before.source and len(after.stages) >= len(before.stages) and all(
+                made is had for made, had in zip(after.stages, before.stages, strict=False)):
+            # The call extends its input: what the input kept still stands, and the call covers the rest.
+            inherited = tuple(entry for entry in before.piped if all(entry is not other for other in kept))
+            return dataclasses.replace(after, piped=(*inherited, *kept, called))
+        # The call made another store of its input: it stands for its input and all it made.
+        return dataclasses.replace(after, piped=(*kept, dataclasses.replace(called, start=0, input=before)))
 
     def map(self, *steps: RecordStep | Configured | HostStep, batched: bool = False, batch_size: int = 1000,
             identity: str | None = None) -> Pipeline:
@@ -827,6 +841,20 @@ class Dataset:
 
 
 @dataclasses.dataclass(frozen=True)
+class Piped:
+    """A call of `Dataset.pipe` and what it made: `function(input, *args, **settings)` made the
+    stages `start` to `end` of the chain that keeps it, or, where it made another store of its
+    input (a token store's windows), the store and the stages to `end` from `input`."""
+
+    function: Callable[..., Dataset]
+    args: tuple[object, ...]
+    settings: tuple[tuple[str, object], ...]
+    start: int
+    end: int
+    input: Pipeline | None = None
+
+
+@dataclasses.dataclass(frozen=True)
 class Pipeline(Dataset):
     """A dataset's store and the stages its verbs added; what every verb returns."""
 
@@ -835,6 +863,8 @@ class Pipeline(Dataset):
     name: str | None = None
     mode: Read | None = None
     _loading: Loading | None = None
+    piped: tuple[Piped, ...] = dataclasses.field(default=(), compare=False, repr=False)
+    """The calls of `pipe` that made its stages (`Piped`), outermost last; no plan reads them."""
 
     def _then(self, *stages: Stage) -> Pipeline:
         return dataclasses.replace(self, stages=(*self.stages, *stages))
