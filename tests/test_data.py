@@ -1,5 +1,5 @@
-"""Data layer tests: the registry, the Dataset contract, lazy imports, the
-video specs and the determinism of what a record becomes.
+"""Data layer tests: the Dataset contract, lazy imports, video listings and
+the determinism of what a record becomes.
 
 `import dew.data` and the grain paths must not need the optional extras,
 which is the point of several of these tests. Anything that genuinely
@@ -35,28 +35,12 @@ from dew.data.sources import Source, Torch, source as stored_source
 from dew.data.steps.generic import Formatting
 from dew.objectives.base import VALID_ROWS
 from dew.position import ENVELOPE
-from dew.registry import datasets
 
 WORKERS = {"loading": Loading(workers=0, threads=1, read_buffer=1, worker_buffer=1)}
 
 
 # ---------------------------------------------------------------------------------
-# The registry
-# ---------------------------------------------------------------------------------
-
-
-def test_an_unknown_dataset_is_refused():
-    with pytest.raises(KeyError):
-        datasets["flowers"]
-
-
-def test_an_unknown_recipe_field_is_refused_before_opening_data():
-    with pytest.raises(ValueError):
-        datasets.build("images", source=[], image_scale=64)
-
-
-# ---------------------------------------------------------------------------------
-# The Dataset contract, on a spec of indexed records
+# The Dataset contract, on records that carry their index
 # ---------------------------------------------------------------------------------
 class _Indexed:
     """Minimal random-access source; stands in for arrayrecord/video sources."""

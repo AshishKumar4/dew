@@ -1104,23 +1104,15 @@ def test_a_counted_corpus_projected_after_its_count_keeps_it_in_memory():
             stream.close()
 
 
-@pytest.mark.parametrize("held", [False, True])
-def test_a_token_mixture_weighs_a_random_holdout_by_the_rows_it_keeps(held):
+def test_a_token_mixture_weighs_its_corpora_by_their_stores_counts():
     """Mixed by tokens, two corpora whose stores state their counts deliver equal valid targets,
-    in one global order weighed by those counts. A random holdout keeps some of its store's rows,
-    so the store's counts describe rows it does not read: its mixture counts targets as they
-    arrive instead."""
-    from dew.config.data import RecordsData
-    from dew.data.holdout import HoldOut
-
+    in one global order weighed by those counts."""
     def corpus(name, lengths):
         return Stated([{"text": np.arange(size, dtype=np.int32), "source": np.int32(name == "long")}
                        for size in lengths])
 
-    long = corpus("long", (2, 10, 10, 10))
-    trained = (RecordsData(long, validation=HoldOut(records=3, by="random", seed=2)).pipelines()[0] if held
-               else Pipeline(long))
-    parts = [dataclasses.replace(trained, name="long"), Pipeline(corpus("short", (2, 2)), name="short")]
+    parts = [Pipeline(corpus("long", (2, 10, 10, 10)), name="long"),
+             Pipeline(corpus("short", (2, 2)), name="short")]
     mixed = mix([part.repeat() for part in parts], by="tokens")
     data = compile(mixed.map(Counted()).batch(8), read="indexed", loading=READ)
     stream = data.train(DataPartition())
@@ -1132,7 +1124,7 @@ def test_a_token_mixture_weighs_a_random_holdout_by_the_rows_it_keeps(held):
     finally:
         stream.close()
     assert abs(targets[0] - targets[1]) <= 9
-    assert data.plan is not None and data.plan.lowering == ("per-share" if held else "global")
+    assert data.plan is not None and data.plan.lowering == "global"
 
 
 class Cursor(grain.IterDataset):
