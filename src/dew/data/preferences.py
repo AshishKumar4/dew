@@ -11,11 +11,13 @@ ids; anything else fails naming the row.
 from __future__ import annotations
 
 import dataclasses
+from collections.abc import Mapping
 from typing import TYPE_CHECKING
 
 import grain.python as grain
 import numpy as np
 
+from dew.data.facts import shaped, unshaped
 from dew.nn.inputs import token_ids
 from dew.records import record
 
@@ -58,6 +60,12 @@ class PreferencePair(grain.MapTransform):
     def __post_init__(self) -> None:
         if self.seq_len < 1:
             raise ValueError("preference seq_len must be positive")
+
+    def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
+        """A chosen and a rejected row of `seq_len` ids and their completion mask, in place of the
+        completions."""
+        rows = shaped(unshaped(facts, *FIELDS), IDS_KEY, [2, self.seq_len])
+        return shaped(rows, MASK_KEY, [2, self.seq_len])
 
     def map(self, element: Batch) -> Batch:
         element = record(element, "preference row")
