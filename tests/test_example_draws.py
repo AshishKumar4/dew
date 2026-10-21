@@ -240,3 +240,52 @@ def test_an_input_that_takes_a_rejected_microbatchs_slot_draws_afresh():
     drawn = np.asarray(state.variables["stats"]["drawn"])
     # The update's first microbatch and the one that took the rejected one's slot.
     assert np.all(drawn[0] != drawn[1])
+
+
+class ReplayedDrawing(Drawing):
+    """`Drawing` whose statistics are a pair it reduces itself, which an accumulation window keeps by
+    replaying its batches at the commit, every evaluation's rows and draws reported to `seen`."""
+
+    def __init__(self, seen: list):
+        self.seen = seen
+
+    def loss(self, variables, batch, step):
+        w, rows = variables["params"]["w"], batch["y"].shape[0]
+        noise = step.sample("noise", jax.random.uniform, (), dtype=jnp.float32, rows=rows)
+        bad = jax.lax.cond(jnp.any(batch["bad"]), lambda x: jnp.sqrt(x - jax.lax.stop_gradient(x)),
+                           lambda x: x * 0, w)
+        jax.debug.callback(lambda held, drawn: self.seen.append((tuple(np.asarray(held)), np.asarray(drawn))),
+                           batch["row"], noise)
+        return (jnp.sum((w + noise - batch["y"]) ** 2) + bad, jnp.asarray(rows, jnp.float32)), Aux({})
+
+    def reduce_loss(self, stats):
+        total, mass = stats
+        return total / mass, mass > 0
+
+
+def test_a_replayed_microbatch_draws_as_its_input_first_drew():
+    """A window of composite statistics replays its batches at the commit. A slot that took its input's
+    second part after a rejection replays that part's draws, not the first part's: each microbatch's
+    rows draw alike every time they are evaluated."""
+    from dew.training import MeshSpec, Trainer
+
+    seen: list = []
+    trainer = Trainer(ReplayedDrawing(seen), optax.sgd(.1), key=jax.random.key(4), split=2,
+                      dynamic_scale=True, checkpoints=None, tracker=None)
+    trainer.device_mesh = MeshSpec().build(jax.devices()[:1])
+    state = trainer.initial_state()
+    first = {"y": jnp.ones((4,)), "bad": jnp.asarray([True, False, True, False]), "row": jnp.arange(4)}
+    second = {"y": jnp.ones((4,)), "bad": jnp.zeros((4,), bool), "row": jnp.arange(4, 8)}
+    run = trainer.compile(state, first)
+    state, *_ = run(state, first)
+    state, *_ = run(state, second)
+    jax.effects_barrier()
+    assert int(state.updates) == 1
+    drawn: dict = {}
+    for rows, values in seen:
+        drawn.setdefault(rows, []).append(values)
+    # The second part of the first input, accepted after its first part was rejected, ran and replayed.
+    assert len(drawn[(1, 3)]) > 1
+    for rows, values in drawn.items():
+        for value in values[1:]:
+            np.testing.assert_array_equal(value, values[0], err_msg=str(rows))
