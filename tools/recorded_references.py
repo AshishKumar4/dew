@@ -28,12 +28,15 @@ def provenance(reference: str, revision: str, device: str, command: str, **detai
                                   "date": datetime.date.today().isoformat(), "command": command, **details}))
 
 
-def record_case(label: str, draw, evaluate, proxy, *, truth_proxy=None) -> dict[str, np.ndarray]:
+def record_case(label: str, draw, evaluate, proxy, *, truth_proxy=None, store_inputs: bool = True
+                ) -> dict[str, np.ndarray]:
     """`label`'s recording: `draw(seed)` gives a seed's inputs (a dict of arrays), `evaluate(inputs)` the
     reference's outputs and their float64 truth (dicts), and `proxy(inputs)` (with `truth_proxy`) a
     function that can run here, which plans the count. The recorded reference then confirms it,
     recording further seeds as `seeds_for` asks, and the recording keeps exactly the confirmed count's
-    draws and their redraw, (1 + REDRAW) times it."""
+    draws and their redraw, (1 + REDRAW) times it. Where `draw` is a seeded function the test can call
+    again, `store_inputs=False` records the outputs alone, and the test hands `draw` to
+    `indexed_recording` as `inputs_of`."""
     planned = seeds_for(jax.jit(proxy), lambda seed: (draw(seed),), label,
                         truth_fn=None if truth_proxy is None else jax.jit(truth_proxy))
     print(f"{label}: planned {planned} seeds on the proxy", flush=True)
@@ -58,6 +61,8 @@ def record_case(label: str, draw, evaluate, proxy, *, truth_proxy=None) -> dict[
     ensure(kept)
     result = {}
     for index, kind in enumerate(("input", "reference", "truth")):
+        if kind == "input" and not store_inputs:
+            continue
         for name in records[0][index]:
             result[f"{label}.{kind}.{name}"] = np.stack([record[index][name] for record in records[:kept]])
     result.update({f"{label}.seeds": np.int32(confirmed), f"{label}.redraw": np.int32(REDRAW)})

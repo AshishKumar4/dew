@@ -285,3 +285,30 @@ def test_a_recording_keeps_the_confirmed_count_where_the_proxy_planned_more():
     recorded = recorder.record_case("site", draw, evaluate, one_element)
     seeds = int(recorded["site.seeds"])
     assert planned > seeds and len(recorded["site.input.x"]) == 5 * seeds
+
+
+def test_a_recording_of_outputs_alone_draws_its_inputs_again(tmp_path):
+    """A generator's seeded draw, called again by the test (`inputs_of`), stands in for recorded inputs:
+    the recording holds the outputs alone and is judged as one that holds both."""
+    from tool_support import load
+
+    recorder = load("recorded_references")
+
+    def draw(seed):
+        return {"x": np.random.default_rng(300 + seed).normal(size=(64,)).astype(np.float32)}
+
+    def evaluate(inputs):
+        x = inputs["x"]
+        return {"y": x * x - np.float32(1)}, {"y": x.astype(np.float64) ** 2 - 1}
+
+    def squared(inputs):
+        return {"y": inputs["x"] * inputs["x"] - 1}
+
+    recorded = recorder.record_case("site", draw, evaluate, squared, store_inputs=False)
+    assert not any(name.startswith("site.input.") for name in recorded)
+    seeds = int(recorded["site.seeds"])
+    with pytest.raises(AssertionError):
+        indexed_recording(recorded, "site", seeds)
+    drawn, reference, truth = indexed_recording(recorded, "site", seeds, inputs_of=draw)
+    assert_as_exact(jax.jit(lambda index, inputs: squared(inputs)), reference, drawn, "drawn again",
+                    seeds=seeds, truth_fn=truth)
