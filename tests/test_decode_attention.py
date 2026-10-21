@@ -711,7 +711,8 @@ def test_a_decode_step_launches_the_decode_kernel_on_each_shard_of_its_mesh(axes
     import math
     import re
 
-    from jax.sharding import AxisType, NamedSharding, PartitionSpec
+    from jax.sharding import AxisType
+    from sharded import placed
 
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.nn.kernels.generation import assumed, gpu_mesh
@@ -728,17 +729,13 @@ def test_a_decode_step_launches_the_decode_kernel_on_each_shard_of_its_mesh(axes
         cache = jax.eval_shape(lambda params: model.apply(params, 4, method=CausalTransformer.init_cache,
                                                           mutable=["cache"])[1]["cache"], params)
 
-    def placed(tree, *spec):
-        sharding = NamedSharding(mesh, PartitionSpec(*spec))
-        return jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=sharding), tree)
-
     def step(params, cache, tokens):
         return model.apply({**params, "cache": cache}, tokens, decode=True, mutable=["cache"])
 
     # A model naming xla lowers its decode step through the decode kernel, jax.nn's lowering of it.
     with assumed("sm80"), jax.sharding.use_abstract_mesh(mesh):
-        lowered = jax.jit(step).trace(placed(params), placed(cache), placed(tokens, "data" if "data" in axes
-                                                                            else None))
+        lowered = jax.jit(step).trace(placed(params, mesh), placed(cache, mesh),
+                                      placed(tokens, mesh, "data" if "data" in axes else None))
         text = lowered.lower(lowering_platforms=("cuda",)).as_text(debug_info=False)
     # Each launch's operand types: the rows' key spans, the padded queries, the cache's keys and values.
     called = r'custom_call @__gpu\$xla\.gpu\.triton\(.*?name = "decode_attention".*?: \((.*?)\) ->'

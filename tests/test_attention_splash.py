@@ -518,15 +518,6 @@ def test_splash_is_as_exact_as_the_reference_attention(case):
         assert_as_exact_over_orders(*distances, f"{case} {ordered}")
 
 
-def vjp_of(attend):
-    """`attend`'s output and its three input gradients against the cotangent `do`."""
-    def run(q, k, v, do):
-        out, pull = jax.vjp(attend, q, k, v)
-        return out, *pull(do)
-
-    return run
-
-
 @pytest.mark.mesh(devices=2)
 @pytest.mark.parametrize("axis, key_heads, packed",
                          [("data", 2, True), ("tensor", 2, False), ("tensor", 1, False)],
@@ -537,7 +528,7 @@ def test_splash_keeps_the_kernel_contract_on_a_mesh(axis, key_heads, packed):
     (`sharded.assert_runs_per_shard`) under pallas's interpreter: the output and the three input
     gradients on par with one device's over the site's draws, and no operand moved between devices."""
     from jax.sharding import Mesh, PartitionSpec
-    from sharded import assert_runs_per_shard
+    from sharded import assert_runs_per_shard, with_gradients
 
     def draw(seed):
         query, _, _ = qkv((2, 256, 4, 64), jnp.float32, seed=3 * seed)
@@ -550,9 +541,9 @@ def test_splash_keeps_the_kernel_contract_on_a_mesh(axis, key_heads, packed):
     keys = rows if axis == "data" else heads if key_heads > 1 else PartitionSpec()
     mesh = Mesh(np.asarray(jax.devices()[:2]), (axis,))
     splash = functools.partial(scaled_dot_product_attention, implementation='tpu', **structure)
-    assert_runs_per_shard(vjp_of(splash), draw, [queries, keys, keys, queries], mesh,
+    assert_runs_per_shard(with_gradients(splash), draw, [queries, keys, keys, queries], mesh,
                           f"splash split over {axis}, {key_heads} key heads", seeds=SHARDED_SEEDS,
-                          truth_fn=vjp_of(lambda q, k, v: exact_attention(q, k, v, **structure)))
+                          truth_fn=with_gradients(lambda q, k, v: exact_attention(q, k, v, **structure)))
 
 
 @pytest.mark.mesh(devices=4)
