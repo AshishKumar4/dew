@@ -173,12 +173,17 @@ def test_a_hooked_launch_keys_by_what_its_hooks_compute_and_round_trips():
 
 
 def test_a_hook_keys_by_the_values_of_the_arrays_it_closes_over():
-    """Two hooks of one code closing over different same-shaped arrays (a flag choosing a branch) key
-    apart; over equal arrays, alike."""
+    """Two hooks of one code closing over different same-shaped arrays (a flag choosing a branch), at
+    the hook's top or inside a jitted helper it calls, key apart; over equal arrays, alike."""
     def hook(flag):
         return lambda tile: jax.lax.cond(flag[0], jnp.tanh, lambda x: x, tile)
 
-    keys = [tuning.program(hook(jnp.asarray([value])), TILE) for value in (True, False, True)]
-    assert keys[0] != keys[1]
-    assert keys[0] == keys[2]
+    def through_a_jitted_helper(flag):
+        inner = jax.jit(hook(flag))
+        return lambda tile: inner(tile) + 1
+
+    for factory in (hook, through_a_jitted_helper):
+        keys = [tuning.program(factory(jnp.asarray([value])), TILE) for value in (True, False, True)]
+        assert keys[0] != keys[1]
+        assert keys[0] == keys[2]
 
