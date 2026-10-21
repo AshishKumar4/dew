@@ -70,7 +70,7 @@ class SourceSchedule:
         if self.policy.family == "flow":
             flow = self.policy.flow
             shift = 1.0 if flow is None else flow.base(tokens)
-            return Process(FlowMatchingScheduler(shift=shift), self.prediction)
+            return Process(FlowMatchingScheduler(shift=shift, dynamic=flow is not None), self.prediction)
         if self.policy.flow_shift is not None:
             return Process(FlowMatchingScheduler(shift=self.policy.flow_shift), self.prediction)
         if self.policy.family == "edm":
