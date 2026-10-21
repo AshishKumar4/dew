@@ -427,7 +427,6 @@ def grouped_query(attend, query, key, value):
     return out.reshape(batch, positions, heads, out.shape[-1])
 
 
-
 def attend(query: jax.Array, key: jax.Array, value: jax.Array, lengths: jax.Array, starts=None, *,
            softcap: float | None = None, sinks: jax.Array | None = None,
            interpret: bool = False) -> jax.Array:

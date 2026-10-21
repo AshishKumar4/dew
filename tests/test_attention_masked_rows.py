@@ -7,7 +7,7 @@ backward recomputes that uniform weight into its query's and its keys'
 gradients. Two ways a row sees no key: an explicit mask with an all-false
 row, and a packed row's padding (segment id 0), which `document_mask` keeps
 from every key. Each implementation is held to the float64 attention of
-tests/test_attention_splash.py, which defines such a row as zero: in fp32 by
+tests/attention_oracle.py, which defines such a row as zero: in fp32 by
 tests/reference_error.py's rule, as the fp32 reference attention is, and in
 bf16 to the tolerance the Splash tests hold bf16 to.
 """
