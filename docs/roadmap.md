@@ -14,7 +14,7 @@ Correctness, contract gaps and duplicated paths come first. After those close, m
 - Carry the historical repair plan's RL tickets as rows: each likelihood and the weight version kept, methods composed from explicit choices, lossless episode records, and on-policy distillation. [857–860]
 - Hold stage-local state in a pipeline and qualify its schedule. [861]
 - Test Dew at its declared dependency bounds in a clean environment. [862]
-- Add InfiLoop's loop-native residual (learned retention over past loop states with temporal decay, a constant-memory streaming recurrence; arXiv 2610.11570) as an option of the looped stack, evaluated on Dory.
+- Let the looped stack's residual be a learned aggregation over past loop states (InfiLoop's loop-native residual, arXiv 2610.11570), through the stack's existing residual seam, evaluated on Dory.
 - Complete Nemotron 3 Ultra, MiMo-V2.6-Pro and Muse Glimmer on the shared family components. Current support covers only parts of their text and multimodal configurations. [357]
 - Add K2 Horizon's MoVA routed value-expert attention on the shared attention and routing primitives; dense K2 Horizon already has source qualification. [479]
 - Qualify MiniCPM5-2B through the existing llama reader and record its supported source fields. [480]
@@ -104,8 +104,8 @@ The kernel direction (owner, 2026-10-21; [design](design/kernel-templates.md)): 
 - Measure multi-GPU MFU at real sizes: FSDP, FSDP×TP and expert parallelism. [1306]
 - Raise tensor-parallel MFU: stop XLA's rematerialization from re-gathering FSDP weights each step, as MaxText does, and overlap TP's collectives. [1307]
 - Raise Dory's MFU past 0.5: profile the looped block, its normalizations and the residual barrier. [1308, 648]
-- Add backprop-free training as an objective that runs on any model: activation-space perturbation with many population members per forward pass and reward-weighted noise as the gradient (Dust, qlabs.sh/noise), measured on the Noise speedrun.
-- Support high-precision scientific ML: a Gauss-Newton optimizer, float64 training paths, and spectral Fourier-feature pyramids for physics-informed networks (arXiv 2509.14185, 2605.24278), each held to its published results.
+- Let the trainer take any gradient estimator, autodiff or a perturbation estimate, through the objective's existing seam, so backprop-free credit assignment (Dust's activation-space perturbation, qlabs.sh/noise) is a choice of estimator on any model, not a separate trainer.
+- Make second-order and high-precision training compositions of what Dew has: Gauss-Newton as an Optax-style transform over the objective's Jacobian products, float64 as a precision policy, and Fourier-feature pyramids as an input embedding, so work like arXiv 2509.14185 and 2605.24278 is reproducible in Dew.
 - Shard persistent optimizer state on sequence-only meshes. [156]
 - Qualify loss, resume, failure handling and throughput on two physical hosts. [158]
 - Expand training and inference across supported parallelism combinations; replace restrictions with composed support where the mathematics permits it. [226, 245]
