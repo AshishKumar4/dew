@@ -190,8 +190,11 @@ def packed_owned(model: nn.Module, variables: Variables) -> Variables:
 
 
 def _held_packed(model: nn.Module, variables: Variables) -> tuple[ProjectionGroup, ...]:
-    """The groups `model` reads packed that `variables` hold packed."""
-    return tuple(group for group in projection_groups(model, variables)
+    """The groups `model` declares (`Serving`) that `variables` hold packed: what the tree stores,
+    whatever an adapter or a quantization would now let `projection_groups` pack anew."""
+    if not isinstance(model, Serving):
+        return ()
+    return tuple(group for group in model.inference_projection_groups(variables)
                  if group.packed in _node(variables, "params", group.path))
 
 

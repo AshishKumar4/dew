@@ -358,9 +358,10 @@ def test_every_route_generates_through_the_same_packed_projections(tmp_path):
     export of it writes, the run's own tree, bit for bit."""
     from flax.core import unfreeze
 
-    from dew.inference.projections import inference_projections
+    from dew.inference.projections import inference_projections, projection_groups
     from dew.interop import Pretrained
     from dew.objectives.lm import LMObjective
+    from dew.quantization import Quantization
     from dew.sampling import Sampling
 
     run = tmp_path / "run"
@@ -387,11 +388,15 @@ def test_every_route_generates_through_the_same_packed_projections(tmp_path):
         np.testing.assert_array_equal(drawn[name].tokens, expected.tokens, err_msg=name)
         np.testing.assert_array_equal(drawn[name].raw_log_probs, expected.raw_log_probs, err_msg=name)
     np.testing.assert_array_equal(drawn["run"].raw_log_probs, drawn["objective"].raw_log_probs)
-    held = LMObjective(routes["run"].model, 8, variables=routes["run"].variables).variables
     trained = Pretrained.from_run(str(run))
-    assert jax.tree.structure(unfreeze(held)) == jax.tree.structure(unfreeze(trained.variables))
-    for ours, theirs in zip(jax.tree.leaves(held), jax.tree.leaves(trained.variables), strict=True):
-        np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
+    # A model quantized on the query alone would not pack the group anew; the tree still stores it packed.
+    queried = Quantization(patterns=(".*/q_proj",)).apply(routes["run"].model)
+    assert "qkv_proj" not in {group.packed for group in projection_groups(queried, trained.variables)}
+    for model in (routes["run"].model, queried):
+        held = LMObjective(model, 8, variables=routes["run"].variables).variables
+        assert jax.tree.structure(unfreeze(held)) == jax.tree.structure(unfreeze(trained.variables))
+        for ours, theirs in zip(jax.tree.leaves(held), jax.tree.leaves(trained.variables), strict=True):
+            np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
     exported, canonical = trained.export(routes["run"].variables), trained.export()
     assert set(exported) == set(canonical)
     for name, tensor in canonical.items():
