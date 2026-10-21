@@ -123,7 +123,8 @@ def test_each_examples_posterior_draw_is_its_own():
 
     inputs = InputSpec(Field("image", (8, 8, 3)))
     objective = DiffusionObjective(SimpleDiT(patch_size=1, emb_features=16, num_layers=1, num_heads=2,
-                                             mlp_ratio=1), presets.EDM()(), inputs, autoencoder=tiny_vae())
+                                             mlp_ratio=1), presets.EDM(regime="latent")(), inputs,
+                                   autoencoder=tiny_vae())
     params = objective.init(jax.random.PRNGKey(0))
     batch = {"image": np.asarray(jax.random.randint(jax.random.PRNGKey(1), (4, 8, 8, 3), 0, 256), np.uint8)}
 

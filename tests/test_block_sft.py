@@ -16,6 +16,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from reference_error import assert_leaves_as_exact, widened
 from safetensors.numpy import load_file
 
 from dew import Trainer
@@ -59,6 +60,20 @@ def objective(loaded, *, variables=None, **kwargs):
 def reference_variables(loaded, name):
     values = translate_weights(load_file(str(REFERENCES / name)), loaded.config)
     return objective(loaded, variables=values).init(jax.random.key(0))
+
+
+def float64_update(directory, build, variables, batch, step, rate):
+    """The SGD update `rate` of `variables`' params under `step`, in float64: `build`'s objective over
+    the model loaded from `directory` in float64, its gradient taken at `variables` widened. The truth a
+    float32 update and its eager twin are measured from (`assert_leaves_as_exact`); the step's draws fix
+    their dtypes, so it corrupts as the float32 run does."""
+    with jax.enable_x64(new_val=True):
+        exact = build(Pretrained.load(directory, dtype="float64", attention_impl="xla", max_seq_len=32))
+        values = jax.tree.map(jnp.asarray, widened(variables))
+        gradient = jax.grad(lambda trainable: exact.scalar_loss(
+            {**values, "params": trainable}, widened(batch), step)[0])(values["params"])
+        updated = jax.tree.map(lambda value, grad: value - rate * grad, values["params"], gradient)
+        return jax.tree.map(np.asarray, {**values, "params": updated})
 
 
 def assert_tree_close(actual, expected, tolerance):
@@ -223,9 +238,11 @@ def test_real_trainer_update_and_checkpoint_resume(source, tmp_path):
                 **example_fields(initial, 0, 1, batch))
     gradient = jax.grad(lambda values: obj.scalar_loss(values, batch, step)[0])(variables)
     expected = jax.tree.map(lambda value, grad: value - 0.001 * grad, variables, gradient)
+    truth = float64_update(FIXTURE, objective, variables, batch, step, 0.001)
     trainer = Trainer(obj, optax.sgd(0.001), key=run_key, checkpoints=Checkpoints(str(tmp_path / "run")))
     updated = trainer.fit(data, steps=1, checkpoint_every=1, log_every=1)
-    assert_tree_close(updated.variables, expected, 2e-6)
+    # The trainer's update is the objective's, as exact as the same update taken eagerly.
+    assert_leaves_as_exact(updated.variables, expected, truth)
     # Google's dense text-only model: transformers' DiffusionGemmaForBlockDiffusion
     # builds experts and a vision tower, so no published implementation reads
     # this layout, and the export is refused rather than written.
@@ -352,10 +369,13 @@ def test_image_sft_trainer_resume_publish_and_generate(image_source, tmp_path):
         {**variables, "params": trainable}, batch, step)[0]))(variables["params"])
     expected = {**variables, "params": jax.tree.map(
         lambda value, grad: value - 0.001 * grad, variables["params"], gradient)}
+    truth = float64_update(FIXTURE.parent / "diffusion-gemma-workflow", lambda wide: BlockDiffusionObjective(
+        wide.model, prompt_length=8, variables=wide.variables), variables, batch, step, 0.001)
     checkpoints = Checkpoints(str(tmp_path / "run"))
     updated = Trainer(obj, optax.sgd(0.001), key=run_key, checkpoints=checkpoints).fit(
         data, steps=1, checkpoint_every=1, log_every=1)
-    assert_tree_close(updated.variables, expected, 2e-6)
+    # The trainer's update is the objective's, as exact as the same update taken eagerly.
+    assert_leaves_as_exact(updated.variables, expected, truth)
     assert any(not np.array_equal(before, after) for before, after in zip(
         jax.tree.leaves(variables["params"]["conditioner"]),
         jax.tree.leaves(updated.variables["params"]["conditioner"]), strict=True))
@@ -371,6 +391,9 @@ def test_image_sft_trainer_resume_publish_and_generate(image_source, tmp_path):
     readback = Pretrained.load(tmp_path / "published", dtype="float32", attention_impl="xla", max_seq_len=32)
     restored = BlockDiffusionObjective(readback.model, prompt_length=8, variables=readback.variables)
     assert_tree_close(restored.init(jax.random.key(0)), resumed.variables, 0)
+    # The published task's loss under the run's draws for the unrepeated rows.
+    step = Step(step=jnp.asarray(0, jnp.int32), key=jax.random.fold_in(state_key, 0), ema=None,
+                **example_fields(started, 0, 1, {"text": inputs}))
     original_loss = obj.scalar_loss(resumed.variables, {"text": inputs}, step)[0]
     restored_loss = restored.scalar_loss(restored.init(jax.random.key(0)), {"text": inputs}, step)[0]
     np.testing.assert_array_equal(restored_loss, original_loss)
