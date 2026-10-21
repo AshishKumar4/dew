@@ -313,12 +313,13 @@ class Shown:
     `better` says which way the metric improves, "higher" or "lower", and the
     display colours its change as progress or regress by it. `percent` shows a
     fraction as a percentage. `group` puts the metric under a heading other
-    than its name's prefix. A metric with no `Shown` is shown under its name,
-    without colour.
+    than its name's prefix, and `label` shows it under another name than its
+    own. A metric with no `Shown` is shown under its name, without colour.
     """
     better: Literal["higher", "lower"] | None = None
     percent: bool = False
     group: str | None = None
+    label: str | None = None
 
 
 @dataclass(frozen=True)
