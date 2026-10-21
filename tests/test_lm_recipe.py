@@ -72,7 +72,7 @@ def windows(corpus, held: bool = False, **settings):
     """The corpus's training store's windows of SEQ tokens in batches of 8 (`presets.lm`), or its
     validation store's where `held`."""
     store = TokenFiles(corpus.val if held else corpus.train)
-    chain = store.pipe(presets.lm, None, seq_len=SEQ, batch=8, pack=None, **settings)
+    chain = store.pipe(presets.lm, None, **{"seq_len": SEQ, "batch": 8, "pack": None, **settings})
     return chain.loading(Loading(workers=0))
 
 
@@ -146,13 +146,15 @@ def test_the_recipe_trains_on_weighted_corpora(tmp_path):
         "--model.dtype", "float32",
         "--model.emb_features", "16", "--model.num_layers", "1", "--model.num_heads", "2"],
         default=LMRunConfig(data=mixture.loading(Loading(workers=0))))
-    assert config.data.source == {str(first): 0.7, str(second): 0.3}
+    mixed = config.data.source
+    assert [child.source.url for child in mixed.pipelines] == [first.train, second.train]
+    assert mixed.weights == (0.7, 0.3)
 
     state = config.run()
 
     assert int(state.step) == 2
     recorded = LMRunConfig.load(str(tmp_path / "runs" / "mixed"))
-    assert recorded.data.source == config.data.source
+    assert recorded.to_dict()["data"] == config.to_dict()["data"]
     assert recorded.model.fields["vocab_size"] == 256
 
 

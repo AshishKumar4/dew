@@ -16,7 +16,7 @@ import pytest
 from decision_support import decision_rows
 
 from dew.config import ModelConfig, ObjectiveConfig
-from dew.data import TFDS, Loading, Memory, presets
+from dew.data import TFDS, Loading, Memory, images as image_steps, presets
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition
 from dew.data.text import ByteTokenizer
@@ -61,10 +61,10 @@ def decoder(**fields):
 
 
 def corpus_windows(corpus: Path):
-    """Windows of SEQ_LEN byte tokens over a short text, in pairs (`presets.lm`), what the LM recipe
-    trains on."""
+    """Windows of SEQ_LEN byte tokens over a short text, each document ended by the tokenizer's EOS and
+    the stream cut into windows, in pairs (`presets.lm`), what the LM recipe trains on."""
     documents = [{"text": "the quick brown fox jumps over the lazy dog " * 8} for _ in range(4)]
-    return Memory(documents).pipe(presets.lm, "byte", seq_len=SEQ_LEN, batch=2)
+    return Memory(documents).pipe(presets.lm, "byte", seq_len=SEQ_LEN, batch=2, eos=True, pack=None)
 
 
 @pytest.fixture(scope="module")
@@ -77,7 +77,8 @@ def diffusion(preset=None, objective="diffusion", **fields) -> DiffusionRunConfi
     with `fields`, sampling in two Euler steps."""
     return DiffusionRunConfig(
         model=ModelConfig.from_model(SimpleDiT(patch_size=2, emb_features=16, num_layers=1, num_heads=2)),
-        data=TFDS("dew_images", path=str(IMAGES), split="all").pipe(presets.images, 4, batch=2),
+        data=TFDS("dew_images", path=str(IMAGES), split="all").pipe(presets.images, 4, batch=2,
+                                                                      caption=image_steps.caption()),
         preset=Flow() if preset is None else preset, val_metrics=(),
         text=TextCondition(encoder="char_table", checkpoint="char_table"),
         objective=ObjectiveConfig(objective, {"solver": Euler(), "steps": 2, **fields}))

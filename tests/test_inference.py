@@ -531,7 +531,7 @@ def test_a_quantized_runs_record_re_wraps_the_model_it_rebuilds(tmp_path):
     config = LMRunConfig(
         model=ModelConfig("causal_transformer", {**fields,
                                                "dtype": "float32", "attention_impl": "reference"}),
-        trainer=TrainerConfig(checkpoint_dir=str(tmp_path), batch_size=batch, steps=1,
+        trainer=TrainerConfig(checkpoint_dir=str(tmp_path), steps=1,
                               eval_every=None, checkpoint_every=1, compilation_cache_dir=None,
                               quantization=Quantization()))
     state = config.train(LMObjective(config.model.build(), seq, ema_decay=0.9),
