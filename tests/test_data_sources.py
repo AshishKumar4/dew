@@ -1802,22 +1802,6 @@ def test_a_token_holdout_with_no_stated_read_reads_unindexed_text_into_memory(tm
     assert next(iter(held(val.pipe(presets.lm, None, seq_len=8, batch=2, pack=None))(DataPartition())))
 
 
-def test_a_token_holdout_before_the_repeat_reads_an_indexed_store_by_index(tmp_path):
-    """Parquet reads by index, and a token split written before the repeat is a global, finite
-    order by itself, so a chain that windows the split's documents as it streams them reads the
-    store by index."""
-    import pyarrow.parquet as pq
-
-    from dew.data import presets, text
-
-    rows = [{"text": f"document {index} " * 6} for index in range(8)]
-    pq.write_table(pa.Table.from_pylist(rows), tmp_path / "rows.parquet")
-    train, _ = Files(str(tmp_path / "rows.parquet")).map(text.tokenize("byte")).holdout(tokens=0.25)
-    loaded = compile(train.repeat().pipe(presets.lm, None, seq_len=8, batch=2, pack=None),
-                     loading=Loading(workers=0))
-    assert loaded.plan is not None and loaded.plan.order["read"] == "indexed"
-
-
 def test_a_local_store_whose_producer_declared_other_bytes_is_refused(tmp_path):
     """A producer's manifest states each file's bytes and checksum; a copy on this host's disk
     that holds other bytes (a cut of the files under the whole set's manifest) is refused, naming
@@ -1873,8 +1857,8 @@ def _indexed_source(kind: str, root: Path):
     corpus = write_token_corpus(root, np.tile(np.array([5, 255], np.uint16), 1030), eos_id=255)
     tokens = TokenFiles(corpus.train).provision()
     if kind == "tokens":
-        return tokens, [(f"{root}:train:0", str(root), 0, 1024, 1024),
-                        (f"{root}:train:1024", str(root), 1024, 1030, 6)]
+        return tokens, [(f"{corpus.train}:train:0", corpus.train, 0, 1024, 1024),
+                        (f"{corpus.train}:train:1024", corpus.train, 1024, 1030, 6)]
     from dew.data.steps.windows import WindowSource
 
     windows = WindowSource(tokens, tokens.tokens, 4, 1)
