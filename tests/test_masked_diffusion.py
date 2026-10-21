@@ -52,7 +52,8 @@ def test_biased_masked_objective_scores_the_same_affine_logits_as_its_forward():
     objective = MaskedDiffusionObjective(model, process, seq_len=4, head_chunks=4,
                                          variables=variables, ema_decay=None)
     key = jax.random.key(1)
-    _, losses, _, _, predicted, _ = objective._token_losses(variables, {'text': tokens}, key, train=False)
+    _, losses, _, _, predicted, _ = objective._token_losses(variables, {'text': tokens},
+                                                            Step(jnp.asarray(0), key, None), train=False)
     time_key, mask_key, _ = jax.random.split(key, 3)
     corrupted, _ = process.corrupt(mask_key, tokens, process.sample_t(time_key, tokens.shape[0]))
     logits = model.apply(variables, corrupted).at[..., 31].set(-jnp.inf)
@@ -87,8 +88,9 @@ def test_a_media_slot_reaches_the_model_and_is_never_masked_or_scored():
     params = objective.init(jax.random.key(0))
     params["params"]["media"] = jnp.ones(8)
     media = {"text": ModelInputs(tokens, {"image_indices": slots})}
-    _, losses, _, counted, _, real = objective._token_losses(params, media, jax.random.key(1), train=False)
-    plain = objective._token_losses(params, {"text": tokens}, jax.random.key(1), train=False)[1]
+    step = Step(jnp.asarray(0), jax.random.key(1), None)
+    _, losses, _, counted, _, real = objective._token_losses(params, media, step, train=False)
+    plain = objective._token_losses(params, {"text": tokens}, step, train=False)[1]
 
     np.testing.assert_array_equal(real, slots < 0)
     assert not counted[:, :2].any() and counted[:, 2:].any()

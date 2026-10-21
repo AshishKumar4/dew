@@ -257,8 +257,9 @@ def weights() -> dict[str, np.ndarray]:
 
 
 def draws(pixels: np.ndarray) -> tuple[list[np.ndarray], np.ndarray]:
-    """DiffusionObjective.loss's draws from `jax.random.key(KEY)`, channels
-    first, in the step's order, and the rows its label dropout blanks."""
+    """The step's draws from `jax.random.key(KEY)`, channels first, in the step's order, and the rows
+    its label dropout blanks: the test hands DiffusionObjective.loss the times, the noise and the
+    dropped rows by name (`Step.tape`), and its posterior draw is the step key's first split's."""
     encode, drop, time, noise, _ = jax.random.split(jax.random.key(KEY), 5)
     latents = (pixels.shape[0], SIDE // DOWNSCALE, SIDE // DOWNSCALE, LATENT)
     uniforms = np.asarray(jax.random.uniform(drop, (pixels.shape[0],)))

@@ -25,6 +25,7 @@ from dew.interop.diffusion_gemma import translate_weights
 from dew.nn.inputs import ModelInputs
 from dew.objectives.base import FROZEN, Step, freeze, select
 from dew.objectives.diffusion.block import BlockDiffusionObjective
+from dew.training.transaction import example_fields
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures/hf/diffusion-gemma-sft"
 REFERENCES = FIXTURE / "reference"
@@ -37,7 +38,14 @@ def source():
         reference = {name: arrays[name] for name in arrays.files}
     batch = {"text": reference["tokens"], "canvas_mask": reference["canvas_mask"],
              "encoder_target_mask": reference["encoder_target_mask"]}
-    step = Step(step=jnp.asarray(0, jnp.int32), key=jax.random.wrap_key_data(reference["step_key"]), ema=None)
+    # The step reads the reference's own draws by name (`Step.tape`): each row's corrupted canvas, the
+    # canvas it scores and whether it conditions on its first pass, which row zero does and row one not.
+    rows, length = reference["noisy"].shape[:2]
+    selected = reference["selected_mask"][..., 0].reshape(rows, 2, length // 2).any(-1).argmax(-1)
+    tape = {"noised input": jnp.asarray(reference["noisy"][..., 0]), "canvas": jnp.asarray(selected),
+            "self conditioning": jnp.asarray([True, False])}
+    step = Step(step=jnp.asarray(0, jnp.int32), key=jax.random.wrap_key_data(reference["step_key"]), ema=None,
+                tape=tape)
     return loaded, batch, step, reference
 
 
@@ -102,6 +110,9 @@ def test_disabling_encoder_gradient_matches_the_reference_control(source):
 def test_both_self_conditioning_branches_match_the_official_adapter(source, probability, reference_key):
     loaded, batch, step, reference = source
     obj = objective(loaded, self_cond_prob=probability)
+    # Every row's self-conditioning is the probability's, not the reference's mixed draw.
+    tape = {name: value for name, value in step.tape.items() if name != "self conditioning"}
+    step = step.replace(tape=tape)
     loss, _ = obj.scalar_loss(jax.tree.map(jnp.asarray, obj.init(jax.random.key(0))), batch, step)
     np.testing.assert_allclose(loss, reference[reference_key], atol=1e-5, rtol=0)
 
@@ -201,6 +212,10 @@ def test_real_trainer_update_and_checkpoint_resume(source, tmp_path):
     run_key = jax.random.key(int(reference["run_seed"]))
     data = dataset(batch)
     variables = jax.tree.map(jnp.asarray, obj.init(jax.random.key(0)))
+    # The trainer's first step: its attempt's key and its examples' draws (`example_fields`).
+    initial = Trainer(obj, optax.sgd(0.001), key=run_key).initial_state()
+    step = Step(jnp.asarray(0, jnp.int32), jax.random.fold_in(initial.key, 0), None,
+                **example_fields(initial, 0, 1, batch))
     gradient = jax.grad(lambda values: obj.scalar_loss(values, batch, step)[0])(variables)
     expected = jax.tree.map(lambda value, grad: value - 0.001 * grad, variables, gradient)
     trainer = Trainer(obj, optax.sgd(0.001), key=run_key, checkpoints=Checkpoints(str(tmp_path / "run")))
