@@ -225,8 +225,7 @@ class ProfileWindow:
 
 def _rollout_metrics(rollout: Rollout) -> Mapping[str, float]:
     """The rollout's report of its latest call. A rollout is any callable,
-    and a plain function reports nothing, so the trainer reads `metrics` at
-    this boundary."""
+    and a plain function reports nothing, so the trainer reads `metrics` at this boundary."""
     return getattr(rollout, 'metrics', {})
 
 
