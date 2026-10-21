@@ -51,4 +51,6 @@ def test_rank_local_environment_error_aborts_peers_and_releases_all_slots(tmp_pa
 def test_inconsistent_cohort_settings_fail_before_creating_environments(tmp_path):
     reports = run(tmp_path / "pool", 2, "mismatch")
     assert all(report["opened"] == report["closed"] == 0 for report in reports)
-    assert all(report["updates"] is None and "must agree" in report["error"] for report in reports)
+    assert all(report["updates"] is None
+               and "episode cohort (task counts, budgets, sampling and clocks) differs between the processes"
+               in report["error"] for report in reports)

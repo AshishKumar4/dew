@@ -674,7 +674,8 @@ class EpisodeRollout:
                          tuple(np.asarray(jax.random.key_data(key)).tolist()), self.journal is not None)
             return tasks, policy, repr(signature)
         tasks, policy, described = agreed("episode preparation", prepare)
-        described = agreed_same("episode task counts, budgets, sampling and clocks", lambda: described)
+        described = agreed_same("episode cohort (task counts, budgets, sampling and clocks)",
+                                lambda: described)
         signature = np.frombuffer(hashlib.sha256(described.encode()).digest(), np.uint8)
         processes, rank = jax.process_count(), jax.process_index()
         binding_id = broadcast_from_process_zero(uuid4().hex if rank == 0 else None)
