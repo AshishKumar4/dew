@@ -222,17 +222,19 @@ def test_wrapped_hub_resume_checks_the_conversion_only_when_consumed(moving_hub_
 def test_metadata_wrapped_hub_resume_keeps_facts_and_checks_consumed_files(
     moving_hub_conversion, recipe, read
 ):
-    from dew.config.data import PromptData, loader
+    from dew.data import presets
+    from dew.data.compile import compile
     from dew.data.sources import Hub
-    from dew.decision.data import Decisions
+    from dew.decision import decisions
 
     def loaded():
         source = Hub("owner/data")
         configured = (
-            PromptData(source, "byte", max_prompt_len=4, reward_bytes=None if read == "memory" else 8)
-            if recipe == "prompts" else Decisions(source, options=("a", "b"))
+            source.pipe(presets.prompts, "byte", max_prompt_len=4, batch=2,
+                        reward_bytes=None if read == "memory" else 8)
+            if recipe == "prompts" else source.pipe(decisions, options=("a", "b")).batch(2)
         )
-        return loader(configured, batch=2, read=read, loading=Loading(workers=0))
+        return compile(configured, read=read, loading=Loading(workers=0))
 
     reader = loaded().train(DataPartition())
     try:
