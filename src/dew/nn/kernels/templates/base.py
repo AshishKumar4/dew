@@ -14,6 +14,7 @@ from typing import ClassVar
 import tokamax
 
 from dew.nn.kernels import generation, selection, tuning
+from dew.nn.kernels.templates import cost
 
 
 class Template[Config: Hashable](tuning.KernelOp):
@@ -36,9 +37,15 @@ class Template[Config: Hashable](tuning.KernelOp):
         """The shared memory, in bytes, a program of the launch of `ba` stages at `config`."""
         raise NotImplementedError(f"{type(self).__name__} declares no staged bytes")
 
-    def cost(self, ba: tokamax.BoundArguments, config: Config, target: generation.GpuTarget) -> float:
-        """The seconds the launch of `ba` is estimated to take at `config` on `target`."""
+    def costed(self, ba: tokamax.BoundArguments, config: Config, target: generation.GpuTarget) -> cost.Cost:
+        """The work, bytes and geometry the estimate of the launch of `ba` at `config` on `target` reads
+        (`cost.Cost`), which the choice layer logs beside each timing as it is."""
         raise NotImplementedError(f"{type(self).__name__} declares no cost")
+
+    def cost(self, ba: tokamax.BoundArguments, config: Config, target: generation.GpuTarget) -> float:
+        """The seconds the launch of `ba` is estimated to take at `config` on `target`: its `costed`
+        record's (`cost.seconds`)."""
+        return cost.seconds(self.costed(ba, config, target), target)
 
     def eligible(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> bool:
         """Whether the implementation runs the call `ba` on `target` (its dtypes, its widths, the

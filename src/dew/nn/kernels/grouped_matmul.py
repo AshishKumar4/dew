@@ -414,7 +414,7 @@ class Gmm(_Triton):
     def extents(tile: Tile) -> dict:
         return {'rows': tile.block_m, 'depth': tile.block_k, 'columns': tile.block_n}
 
-    def cost(self, ba, config: Tile, target) -> float:
+    def costed(self, ba, config: Tile, target) -> cost.Cost:
         # A program is one group's chunk of up to `CHUNK_M` rows (ragged_dot.py) by `block_n` columns,
         # its rows `block_m` at a time, each row tile loading the group's `depth` x `block_n` block
         # again. Programs run chunks before columns, so each column block reads the rows again. The
@@ -455,11 +455,11 @@ class Gmm(_Triton):
             + tiles / chunks * config.block_m * config.block_n * _hook_work(
                 hooks.after(), jnp.float32, epilogue_sides, hooks.epilogue_axes,
                 (config.block_m, config.block_n), extents))
-        return cost.seconds(cost.Cost(
+        return cost.Cost(
             programs=chunks * columns, device_bytes=moved,
             program_flops=flops / (chunks * columns), program_staged=staged,
             program_exponentials=exponentials, mode=_mode(tokens.dtype), steps=steps, stages=config.stages,
-            resident=self._resident(ba, config, target)), target)
+            resident=self._resident(ba, config, target))
 
     def _fwd(self, tokens: jax.Array, kernel: jax.Array, sizes: jax.Array,
              prologue_operands: tuple = (), epilogue_operands: tuple = (), *, out_dtype: str,
@@ -519,7 +519,7 @@ class Tgmm(_Triton):
     def extents(tile: Tile) -> dict:
         return {'rows': tile.block_m, 'depth': tile.block_k}
 
-    def cost(self, ba, config: Tile, target) -> float:
+    def costed(self, ba, config: Tile, target) -> cost.Cost:
         # A program is one group's `block_k` x `block_n` output tile, summed over the group's rows
         # `block_m` at a time; each output column block reads the rows again, and each output row
         # block the cotangent, from device memory (`Gmm.cost`).
@@ -544,10 +544,10 @@ class Tgmm(_Triton):
         exponentials = steps * config.block_m * config.block_k * _hook_work(
             hooks.before(), tokens.dtype, sides, hooks.prologue_axes, (config.block_m, config.block_k),
             self.extents(config))
-        return cost.seconds(cost.Cost(
+        return cost.Cost(
             programs=programs, device_bytes=moved, program_flops=flops, program_staged=staged,
             program_exponentials=exponentials, mode=_mode(tokens.dtype), steps=steps, stages=config.stages,
-            resident=self._resident(ba, config, target)), target)
+            resident=self._resident(ba, config, target))
 
     def _fwd(self, tokens: jax.Array, cotangent: jax.Array, sizes: jax.Array,
              prologue_operands: tuple = (), *, out_dtype: str, interpret: bool, hooks: Hooks = NO_HOOKS,
@@ -629,7 +629,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
     def extents(tile: mosaic_gpu.Tiles) -> dict:
         """The block each launch axis takes at `tile`."""
 
-    def _cost(self, ba, config: mosaic_gpu.Tiles, target, tiles: float, steps: float, moved: float) -> float:
+    def _cost(self, ba, config: mosaic_gpu.Tiles, tiles: float, steps: float, moved: float) -> cost.Cost:
         """`tiles` output tiles of `steps` contraction steps each, `moved` device bytes."""
         tokens, hooks = ba.arguments['tokens'], ba.arguments['hooks']
         size = jnp.dtype(tokens.dtype).itemsize
@@ -649,12 +649,12 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
                         + config.block_m * config.block_n * _hook_work(
                             hooks.after(), jnp.float32, epilogue_sides, hooks.epilogue_axes,
                             (config.block_m, config.block_n), extents))
-        return cost.seconds(cost.Cost(
+        return cost.Cost(
             programs=tiles, device_bytes=moved,
             program_flops=2 * steps * config.block_m * config.block_n * config.block_k,
             program_staged=steps * step + config.block_m * config.block_n * out,
             program_exponentials=exponentials, mode=_mode(tokens.dtype), steps=steps,
-            stages=config.stages), target)
+            stages=config.stages)
 
     def _multiprocessors(self, interpret: bool) -> int:
         # The interpreter runs one block (jax/_src/pallas/mosaic_gpu/interpret).
@@ -682,7 +682,7 @@ class MosaicGmm(_Mosaic):
     def extents(tile: mosaic_gpu.Tiles) -> dict:
         return {'rows': tile.block_m, 'depth': tile.block_k, 'columns': tile.block_n}
 
-    def cost(self, ba, config: mosaic_gpu.Tiles, target) -> float:
+    def costed(self, ba, config: mosaic_gpu.Tiles, target) -> cost.Cost:
         tokens, kernel = ba.arguments['tokens'], ba.arguments['kernel']
         (rows, depth), groups = tokens.shape, kernel.shape[0]
         width = kernel.shape[1] if ba.arguments['trans_rhs'] else kernel.shape[2]
@@ -701,7 +701,7 @@ class MosaicGmm(_Mosaic):
         moved = (bands * rows * depth * size + matrices + rows * width * _output_bytes(ba)
                  + _side_bytes(ba.arguments['prologue_operands'], hooks.prologue_axes, rereads)
                  + _side_bytes(ba.arguments['epilogue_operands'], hooks.epilogue_axes, rereads))
-        return self._cost(ba, config, target, tiles * columns, depth / config.block_k, moved)
+        return self._cost(ba, config, tiles * columns, depth / config.block_k, moved)
 
     def _fwd(self, tokens: jax.Array, kernel: jax.Array, sizes: jax.Array,
              prologue_operands: tuple = (), epilogue_operands: tuple = (), *, out_dtype: str,
@@ -752,7 +752,7 @@ class MosaicTgmm(_Mosaic):
     def extents(tile: mosaic_gpu.Tiles) -> dict:
         return {'rows': tile.block_k, 'depth': tile.block_m}
 
-    def cost(self, ba, config: mosaic_gpu.Tiles, target) -> float:
+    def costed(self, ba, config: mosaic_gpu.Tiles, target) -> cost.Cost:
         tokens, cotangent, sizes = ba.arguments['tokens'], ba.arguments['cotangent'], ba.arguments['sizes']
         (rows, depth), width, groups = tokens.shape, cotangent.shape[1], sizes.shape[0]
         size, out = jnp.dtype(tokens.dtype).itemsize, jnp.dtype(ba.arguments['out_dtype']).itemsize
@@ -767,7 +767,7 @@ class MosaicTgmm(_Mosaic):
                  + groups * depth * width * out
                  + _side_bytes(ba.arguments['prologue_operands'], hooks.prologue_axes, rereads))
         steps = _block_tiles(rows, groups, config.block_k) / groups
-        return self._cost(ba, config, target, groups * blocks[0] * blocks[1], steps, moved)
+        return self._cost(ba, config, groups * blocks[0] * blocks[1], steps, moved)
 
     def _fwd(self, tokens: jax.Array, cotangent: jax.Array, sizes: jax.Array,
              prologue_operands: tuple = (), *, out_dtype: str, interpret: bool, hooks: Hooks = NO_HOOKS,
