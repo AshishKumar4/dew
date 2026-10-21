@@ -11,7 +11,13 @@ import numpy as np
 import pytest
 from model_support import flat_tree
 from reference_error import FACTOR, assert_as_exact_as_the_reference, distance
-from test_hf_decoders import GEMMA4_MOE, fixture_config, fp32_decoder, recorded_logit_difference
+from test_hf_decoders import (
+    GEMMA4_MOE,
+    assert_padded_speculation_is_greedy,
+    fixture_config,
+    fp32_decoder,
+    recorded_logit_difference,
+)
 
 from dew.interop import Pretrained, PretrainedDecoder
 from dew.interop.codecs import dequantize_mxfp4, quantize_mxfp4
@@ -589,22 +595,10 @@ def test_a_v4_grouped_output_projection_under_the_reference_models_names_loads_a
 
 
 def test_deepseek_v4_public_speculation_preserves_padded_rows():
-    from dew.nn.inputs import ModelInputs
-    from dew.sampling import Sampling, Speculative
-
-    source = Pretrained.load(DEEPSEEK_V4, dtype='float32', attention_impl='reference')
-    tokens = np.load(DEEPSEEK_V4 / 'input_ids.npy')[[0, 1, 0], :5].copy()
-    valid = np.arange(5)[None, :] >= np.asarray([0, 2, 4])[:, None]
-    tokens[~valid] = 0
-    inputs = ModelInputs(jnp.asarray(tokens), {'attention_mask': jnp.asarray(valid)})
-    task = source.text_generation(sampling=Sampling(temperature=0))
-    ordinary = task(inputs, max_new_tokens=7, key=0).host()
-    speculative = task(inputs, max_new_tokens=7, key=0, strategy=Speculative(block=3)).host()
     # Three rows differ from the two residual streams: a row mask must not
     # accidentally broadcast along the stream axis during predictor reseeding.
-    np.testing.assert_array_equal(speculative.tokens, ordinary.tokens)
-    np.testing.assert_array_equal(speculative.lengths, ordinary.lengths)
-    np.testing.assert_array_equal(speculative.terminated, ordinary.terminated)
+    source = Pretrained.load(DEEPSEEK_V4, dtype='float32', attention_impl='reference')
+    assert_padded_speculation_is_greedy(source)
 
 
 def test_deepseek_v4_cached_chunks_match_transformers():

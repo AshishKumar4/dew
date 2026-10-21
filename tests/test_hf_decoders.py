@@ -1141,11 +1141,12 @@ def test_glm5_prediction_index_reuse_does_not_change_forward_or_sft(glm5_next_so
     np.testing.assert_array_equal(enabled.apply(source.variables, ids), disabled.apply(source.variables, ids))
 
 
-def test_glm5_prediction_index_reuse_preserves_public_padded_greedy_generation(glm5_next_source):
+def assert_padded_speculation_is_greedy(source) -> None:
+    """Three left-padded rows of a source's recorded ids (0, 2 and 4 pads) generate the same seven
+    greedy tokens, lengths and terminations under speculation (`Speculative(block=3)`) as without."""
     from dew.nn.inputs import ModelInputs
     from dew.sampling import Sampling, Speculative
 
-    source = glm5_next_source
     tokens = np.load(source.source / "input_ids.npy")[[0, 1, 0], :5].copy()
     valid = np.arange(5)[None, :] >= np.asarray([0, 2, 4])[:, None]
     tokens[~valid] = 0
@@ -1156,6 +1157,10 @@ def test_glm5_prediction_index_reuse_preserves_public_padded_greedy_generation(g
     np.testing.assert_array_equal(speculative.tokens, ordinary.tokens)
     np.testing.assert_array_equal(speculative.lengths, ordinary.lengths)
     np.testing.assert_array_equal(speculative.terminated, ordinary.terminated)
+
+
+def test_glm5_prediction_index_reuse_preserves_public_padded_greedy_generation(glm5_next_source):
+    assert_padded_speculation_is_greedy(glm5_next_source)
 
 
 def test_glm5_next_prefill_and_token_steps_match_parallel(glm5_next_source):
