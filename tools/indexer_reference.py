@@ -34,13 +34,22 @@ What it writes:
   a packed mask and the sparse loss over the causal one, each with its
   gradient in the indexer's scores, in float32 and in float64, and the
   exact top-k masks.
+- recorded_<case>.npz (`recording`), one a case: the same published functions
+  recorded over check 1's seeds, each seed's inputs drawn again by the test
+  (`published_inputs`), the float32 run's evidence from its float64 run kept
+  with that run's sketch (tools/recorded_references.py).
+
+    PYTHONPATH=src:tools python tools/indexer_reference.py recording
 """
 
 import json
+import sys
 import types
 from pathlib import Path
 
 import numpy as np
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from reference_source import defined_in, definitions, fetched
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "indexer"
@@ -237,22 +246,99 @@ def write_published() -> None:
     query = rng.normal(size=(batch, length, heads, PUBLISHED["head_dim"])).astype(np.float32)
     key = rng.normal(size=(batch, length, heads, PUBLISHED["head_dim"])).astype(np.float32)
     scores = np.maximum(rng.normal(scale=1.5, size=(batch, length, length)), 0).astype(np.float32)
-    segments = np.repeat(np.array([[1, 2, 3], [1, 2, 0]], np.int32), length // 3, axis=1)
-    arrays = {"query": query, "key": key, "scores": scores, "segments": segments,
+    arrays = {"query": query, "key": key, "scores": scores, "segments": PUBLISHED_SEGMENTS,
               "scale": np.float64(scale)}
-    keeps = {"causal": np.broadcast_to(np.tril(np.ones((length, length), bool)), (batch, length, length)),
-             "packed": ((segments[:, :, None] == segments[:, None, :]) & (segments[:, :, None] != 0)
-                        & np.tril(np.ones((length, length), bool))[None])}
-    cases = {"causal_dense": ("causal", False), "packed_dense": ("packed", False),
-             "causal_sparse": ("causal", True)}
+    keeps = {mask: published_keep(mask) for mask in ("causal", "packed")}
     for dtype, tail in ((jnp.float32, ""), (jnp.float64, "_f64")):
         methods, mask_value = published_methods(dtype)
         with jax.enable_x64(new_val=True):
             arrays.update(published_case(methods, mask_value, dtype, tail, query, key, scores, scale,
-                                         keeps, cases))
+                                         keeps, PUBLISHED_CASES))
     np.savez(FIXTURES / "maxtext.npz", **arrays)
     print(f"{FIXTURES / 'maxtext.npz'}: " + ", ".join(
-        f"{name} {float(arrays[f'{name}/loss_f64']):.6f}" for name in cases))
+        f"{name} {float(arrays[f'{name}/loss_f64']):.6f}" for name in PUBLISHED_CASES))
+
+
+PUBLISHED_CASES = {"causal_dense": ("causal", False), "packed_dense": ("packed", False),
+                   "causal_sparse": ("causal", True)}
+"""Each recorded case: its mask and whether its loss is the sparse one."""
+
+
+PUBLISHED_SEGMENTS = np.repeat(np.array([[1, 2, 3], [1, 2, 0]], np.int32), PUBLISHED["length"] // 3, axis=1)
+"""maxtext.npz's two rows: three documents, then two and padding."""
+
+
+def published_inputs(seed: int) -> dict[str, np.ndarray]:
+    """A seed's inputs to the published loss at maxtext.npz's sizes, as `write_published` draws them:
+    the main heads' query and key and the indexer's ReLU-shaped scores, with exact zeros at the top-k
+    boundary. Check 1's draw for the recorded reference, the same on every run
+    (tests/test_indexer_training.py draws them again)."""
+    batch, length, heads = PUBLISHED["batch"], PUBLISHED["length"], PUBLISHED["heads"]
+    rng = np.random.default_rng([PUBLISHED["seed"], seed])
+    query = rng.normal(size=(batch, length, heads, PUBLISHED["head_dim"])).astype(np.float32)
+    key = rng.normal(size=(batch, length, heads, PUBLISHED["head_dim"])).astype(np.float32)
+    scores = np.maximum(rng.normal(scale=1.5, size=(batch, length, length)), 0).astype(np.float32)
+    return {"query": query, "key": key, "scores": scores}
+
+
+def published_keep(mask: str) -> np.ndarray:
+    """The causal, or over PUBLISHED_SEGMENTS the packed causal, `[B, S, S]` keys a query may read."""
+    segments, length = PUBLISHED_SEGMENTS, PUBLISHED["length"]
+    causal = np.tril(np.ones((length, length), bool))[None]
+    if mask == "causal":
+        return np.broadcast_to(causal, (segments.shape[0], length, length))
+    return (segments[:, :, None] == segments[:, None, :]) & (segments[:, :, None] != 0) & causal
+
+
+def write_published_recording(command: str) -> None:
+    """recorded_<case>.npz, one a case, each under the size a fixture keeps in git: the case's published
+    loss and its gradient in the indexer's scores recorded over check 1's seeds (`record_case`), the
+    float32 run against the float64 run, the count planned on Dew's `indexer_kl` and confirmed on the
+    reference."""
+    import jax
+    import jax.numpy as jnp
+    from fetched_fixtures import save
+    from recorded_references import provenance, record_case
+
+    from dew.nn.mla import indexer_kl
+    from dew.nn.sparse_selection import top_k_keys
+
+    scale = PUBLISHED["head_dim"] ** -0.5
+    published = {dtype: published_methods(dtype) for dtype in (jnp.float32, jnp.float64)}
+    for name, (mask, sparse) in PUBLISHED_CASES.items():
+        def evaluate(inputs, mask=mask, sparse=sparse):
+            keep = published_keep(mask)
+            found = []
+            for dtype in (jnp.float32, jnp.float64):
+                methods, mask_value = published[dtype]
+                attention_mask = jnp.where(keep, 0.0, mask_value).astype(dtype)
+                scaled = jnp.asarray(inputs["query"], dtype) * dtype(scale)
+                (value, _), gradient = jax.value_and_grad(
+                    lambda raw, methods=methods, attention_mask=attention_mask, scaled=scaled, dtype=dtype:
+                    published_loss(methods, dtype, raw, attention_mask, scaled,
+                                   jnp.asarray(inputs["key"], dtype), sparse),
+                    has_aux=True)(jnp.asarray(inputs["scores"], dtype))
+                found.append({"loss": np.asarray(value), "gradient": np.asarray(gradient)})
+            return found[0], found[1]
+
+        def proxy(inputs, mask=mask, sparse=sparse):
+            keep = jnp.asarray(published_keep(mask))
+            region = top_k_keys(inputs["scores"], keep, PUBLISHED["top_k"]) if sparse else keep
+
+            def loss(scores):
+                return jnp.mean(indexer_kl(scores, inputs["query"], inputs["key"], region, scale))
+
+            value, gradient = jax.value_and_grad(loss)(inputs["scores"])
+            return {"loss": value, "gradient": gradient}
+
+        with jax.enable_x64(new_val=True):
+            recording = record_case(name, published_inputs, evaluate, proxy, truth_proxy=proxy,
+                                    store_inputs=False, summary=True)
+        recording[f"{name}.provenance"] = provenance("MaxText MLA.calculate_indexer_loss", COMMIT, "cpu",
+                                                     command, dtype="float32", top_k=PUBLISHED["top_k"])
+        written = save(FIXTURES / f"recorded_{name}.npz", recording, reference="MaxText 0.2.4",
+                       license="Apache-2.0")
+        print(f"{written}: {written.stat().st_size} bytes", flush=True)
 
 
 def published_case(methods, mask_value, dtype, tail, query, key, scores, scale, keeps, cases) -> dict:
@@ -277,5 +363,8 @@ def published_case(methods, mask_value, dtype, tail, query, key, scores, scale, 
 
 
 if __name__ == "__main__":
-    main()
-    write_published()
+    if sys.argv[1:] == ["recording"]:
+        write_published_recording("PYTHONPATH=src:tools python tools/indexer_reference.py recording")
+    else:
+        main()
+        write_published()
