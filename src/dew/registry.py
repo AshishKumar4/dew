@@ -1052,15 +1052,10 @@ def constructor_fields(member: type) -> tuple[dataclasses.Field, ...]:
                  if field.init and field.name not in ("parent", "name"))
 
 
-def constructor_values(model) -> Mapping[str, object]:
-    """`model`'s constructor fields (`constructor_fields`) by name, as it holds them: the arguments that
-    build it again (`rebuilt`)."""
-    return {field.name: getattr(model, field.name) for field in constructor_fields(type(model))}
-
-
-def rebuilt[Built](member: Callable[..., Built], model) -> Built:
+def rebuilt[Built](member: Callable[..., Built], model: object) -> Built:
     """`model` built again by `member`, its own class or one that wraps it (`wrapper_layers`), from its
-    constructor fields (`constructor_values`)."""
+    constructor fields (`constructor_fields`) as it holds them; `rebuilt(dict, model)` is those fields
+    by name. `model` is any dataclass instance: the registry takes no Flax type at import."""
     return member(**{field.name: getattr(model, field.name) for field in constructor_fields(type(model))})
 
 

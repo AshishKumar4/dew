@@ -130,9 +130,10 @@ class Quantization:
     wins. `'.*mlp.*'` quantizes the feed-forward blocks and leaves attention
     in fp32; the default quantizes every matmul of the wrapped methods."""
     calibration: str = "absmax"
-    """The weight calibration method, in the form Qwix parses and validates
-    where it quantizes (`absmax,0.8`, for example): Dew keeps no copy of its
-    grammar."""
+    """The weight calibration method, in the form Qwix parses (`absmax,0.8`,
+    for example). Dew keeps no copy of its grammar: Qwix refuses a method it
+    does not know where it first quantizes a matched weight, not when this
+    spec is built."""
     tile_size: int | None = None
     """The number of elements per tile for sub-channel scales along the contraction axis.
 
@@ -190,8 +191,9 @@ class Quantization:
         each of its `entry_methods` wrapped. Everything
         the registry, the objective and the checkpoint code read from the
         model therefore still works. Invalid settings were already refused
-        when the spec was constructed. Without Qwix installed, the call raises
-        an error that names the extra.
+        when the spec was constructed, all but the calibration method, which
+        Qwix parses where it first quantizes a matched weight. Without Qwix
+        installed, the call raises an error that names the extra.
         """
         return _qwix_wrapped(model, _providers()[0](_rules(self, training=True)), self)
 
