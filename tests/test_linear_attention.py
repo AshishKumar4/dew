@@ -56,6 +56,10 @@ from dew.nn.linear import (
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "linear_attention"
 
+SHARDED_SEEDS = 128
+"""The per-shard contract's declared draws (check 1, `sharded.assert_runs_per_shard`), sized by
+`seeds_for`: the fewest for which one device compared with itself resolves the factor."""
+
 
 @pytest.fixture(scope="module")
 def reference():
@@ -777,20 +781,24 @@ def test_the_decode_kernel_keeps_the_kernel_contract_on_a_mesh(axis, split):
 
     from dew.nn.linear import decode_gated_delta_rule
 
-    rng = np.random.default_rng(2)
     rows, H, D = 4, 4, 32
-    unit = [rng.normal(size=(rows, 1, H, D)) for _ in range(2)]
-    query, key = (jnp.asarray(x / np.linalg.norm(x, axis=-1, keepdims=True), jnp.float32) for x in unit)
-    value = jnp.asarray(rng.normal(size=(rows, 1, H, D)), jnp.float32)
-    g = jnp.asarray(-rng.random((rows, 1, H)) * 3, jnp.float32)
-    beta = jnp.asarray(rng.random((rows, 1, H)), jnp.float32)
-    state = jnp.asarray(rng.normal(size=(rows, H, D, D)) * 0.1, jnp.float32)
     active = jnp.asarray([True, False, True, False])
-    with jax.enable_x64(new_val=True):
-        operands = widened((query, key, value, g, beta, state))
-        out, final = recurrent_gated_delta_rule(*operands)
-        drawing = np.asarray(active)[:, None, None, None]
-        truth = (np.where(drawing, np.asarray(out), 0.0), np.where(drawing, np.asarray(final), operands[-1]))
+
+    def draw(seed):
+        rng = np.random.default_rng(2 + seed)
+        unit = [rng.normal(size=(rows, 1, H, D)) for _ in range(2)]
+        query, key = (jnp.asarray(x / np.linalg.norm(x, axis=-1, keepdims=True), jnp.float32) for x in unit)
+        value = jnp.asarray(rng.normal(size=(rows, 1, H, D)), jnp.float32)
+        g = jnp.asarray(-rng.random((rows, 1, H)) * 3, jnp.float32)
+        beta = jnp.asarray(rng.random((rows, 1, H)), jnp.float32)
+        state = jnp.asarray(rng.normal(size=(rows, H, D, D)) * 0.1, jnp.float32)
+        return query, key, value, g, beta, state, active
+
+    def exact(*operands):
+        """The recurrence in float64, an idle row's output zero and its state as it was."""
+        out, final = recurrent_gated_delta_rule(*operands[:6])
+        drawing = np.asarray(operands[6])[:, None, None, None]
+        return np.where(drawing, np.asarray(out), 0.0), np.where(drawing, np.asarray(final), operands[5])
 
     def spec(rank: int, at: int):
         return PartitionSpec(*(axis if dim == at else None for dim in range(rank)))
@@ -798,8 +806,9 @@ def test_the_decode_kernel_keeps_the_kernel_contract_on_a_mesh(axis, split):
     heads_at = {0: 0, 2: 1}[split]
     specs = [spec(4, split)] * 3 + [spec(3, split)] * 2 + [spec(4, heads_at), spec(1, split)]
     mesh = Mesh(np.asarray(jax.devices()[:2]), (axis,))
-    assert_runs_per_shard(decode_gated_delta_rule, (query, key, value, g, beta, state, active), specs, mesh,
-                          truth)
+    # The kernel aliases its state into its output, and serving donates it (`donate`).
+    assert_runs_per_shard(decode_gated_delta_rule, draw, specs, mesh, f"delta decode split over {axis}",
+                          seeds=SHARDED_SEEDS, truth_fn=exact, donate=(5,))
 
 
 @pytest.mark.gpu(reason="the kernel runs on CUDA")

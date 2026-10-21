@@ -155,6 +155,15 @@ def is_uri(path: str) -> bool:
     return '://' in path
 
 
+def _handler(**options) -> ocp.PyTreeCheckpointHandler:
+    """Orbax's pytree handler as every save of Dew's takes it: moving its arrays to pinned host memory
+    with an explicit copy before it reads them, on every backend whose devices have that memory (a
+    CPU's do, as a GPU's), which Orbax leaves to GPUs by default. Its implicit read instead would be
+    refused under a steady state's transfer guard (tests/steady_state.py), which Dew's JAX build holds
+    a CPU array's reads to as a GPU's."""
+    return ocp.PyTreeCheckpointHandler(enable_pinned_host_transfer=True, **options)
+
+
 ORDERED_DIRECTORIES = AsyncOptions(create_directories_asynchronously=False)
 """A local save creates its step's tmp directory, then its items', before it returns.
 
@@ -1054,7 +1063,7 @@ class Checkpoints:
                 create=True, enable_async_checkpointing=True)
             self._manager = ocp.CheckpointManager(
                 self.directory, options=options,
-                item_handlers=ocp.PyTreeCheckpointHandler())
+                item_handlers=_handler())
             for step in self._manager.all_steps():
                 if not self._complete(step):
                     continue
@@ -1122,7 +1131,7 @@ class Checkpoints:
                 async_options=ORDERED_DIRECTORIES)
             self._local_manager = ocp.CheckpointManager(
                 self.local_path, options=options,
-                item_handlers=ocp.PyTreeCheckpointHandler(
+                item_handlers=_handler(
                     use_ocdbt=True, use_zarr3=True, multiprocessing_options=multiprocessing,
                     type_handler_registry=registry))
         return self._local_manager
@@ -1333,7 +1342,7 @@ class Checkpoints:
             for name, value in values.items():
                 digest = digests[tree][name]
                 if digest not in written and digest not in stored:
-                    with region("checkpoint.frozen"), ocp.PyTreeCheckpointer() as checkpointer:
+                    with region("checkpoint.frozen"), ocp.Checkpointer(_handler()) as checkpointer:
                         checkpointer.save(root / digest, args=ocp.args.PyTreeSave(value))
                     written.add(digest)
         kept_tree = dict(state_tree)

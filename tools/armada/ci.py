@@ -67,13 +67,17 @@ the task's artifacts; a traced task records nothing in the cache either.
 `report` combines the artifacts' data under DIR and writes DIR/coverage.json and
 DIR/coverage.md, a module a line, the least covered first:
 
-    armada map --artifacts=DIR --items=ITEMS -- bash -lc {item}
+    armada map --commit=SHA --artifacts=DIR --items=ITEMS --timeout=6000 --secrets=DEW_XLA_CACHE_TOKEN \
+        -- sh -c {item}
+
+A task reads the shared XLA cache as CI's do (--commit gives the checkout, its environments and the
+cache's URL), and has `COVERAGE_DEADLINE` and armada's timeout past it; a pass with a task cut short is
+refused (`report`), its coverage partial. A target well under CI's keeps tasks short.
 """
 
 import argparse
 import ast
 import concurrent.futures
-import contextlib
 import hashlib
 import heapq
 import importlib.util
@@ -81,7 +85,6 @@ import json
 import math
 import os
 import re
-import signal
 import subprocess
 import sys
 import threading
@@ -93,6 +96,22 @@ import urllib.request
 import xml.etree.ElementTree as ET
 from collections.abc import Mapping
 from pathlib import Path
+
+
+def _beside(name: str):
+    """tools/armada/`name`.py, the module beside this file, loaded by its path: this file runs as a
+    script and is loaded by the tests, and puts nothing on sys.path."""
+    spec = importlib.util.spec_from_file_location(f"armada_{name}", Path(__file__).with_name(f"{name}.py"))
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+child_groups = _beside("child_groups")
+SETTLE = 30.0
+"""Seconds a task's process group has, after SIGKILL, to be reaped and gone: inside armada's own timeout
+with the default deadline and grace (1680 + 60 + 30 + the reader's 10 < .armada.json's 1800)."""
 
 REPO = Path(__file__).resolve().parents[2]
 _CLASSIFIERS = tomllib.loads((REPO / "pyproject.toml").read_text())["project"]["classifiers"]
@@ -138,8 +157,9 @@ SKIPPED = {"tests/test_gen_api.py", "tests/test_multihost.py"}
 """CI runs the first in the lint job, under the griffe it pins, and the second in the multihost job,
 across the containers of an armada gang."""
 DURATIONS = Path("tests/test_durations.json")
-SHARED = ("pyproject.toml", "constraints.txt", ".armada.json", "tools/armada/ci.py", "tools/armada/split.py",
-          "tools/armada/executed.py", "tools/armada/followed.py", str(DURATIONS))
+SHARED = ("pyproject.toml", "constraints.txt", ".armada.json", "tools/armada/ci.py",
+          "tools/armada/child_groups.py", "tools/armada/split.py", "tools/armada/executed.py",
+          "tools/armada/followed.py", str(DURATIONS))
 """The files every test file's key covers whole, beside tests/ and src/, every lock (a GPU node
 builds its environment from its CUDA lock) and the environment's own inputs, which .armada.json
 names (`environment_files`)."""
@@ -487,12 +507,6 @@ def file_of(case: ET.Element) -> str:
     return "/".join(parts[:module + 1]) + ".py"
 
 
-def signal_group(leader: int, number: signal.Signals) -> None:
-    """`number` to every process left in the group `leader` led."""
-    with contextlib.suppress(ProcessLookupError):
-        os.killpg(leader, number)
-
-
 def shown(output: str) -> str:
     """The end of a task's output, and the stack faulthandler printed for a test that hung, if one did."""
     stack = output.rfind("Timeout (")
@@ -540,8 +554,8 @@ def apportioned(own_seconds: Mapping[str, float], wall: float, rows: int) -> dic
 
 def task(python: str, tests: list[str], split: str, out: Path, deadline: float, cache: bool = True,
          grace: float = 60.0, coverage: Path | None = None) -> int:
-    """Run `tests` and write one verdict row a file, interrupting them past `deadline` seconds and
-    killing them `grace` seconds after that.
+    """Run `tests` and write one verdict row a file, interrupting them past `deadline` seconds, killing
+    their process group `grace` seconds after that, and giving it `SETTLE` seconds to be gone.
 
     A row's seconds are its share of the task's wall time, in proportion to its tests' own times:
     the plan weighs a file by what it costs a container (its import, its collection, the
@@ -583,10 +597,9 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     lines: list[str] = []
     # split.py, the plugin that keeps a split file's group, imports from beside this file.
     path = os.pathsep.join(filter(None, [str(Path(__file__).resolve().parent), os.environ.get("PYTHONPATH")]))
-    done = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                            start_new_session=True,
-                            env={**os.environ, **environ, **CLOSED_HUB, "PYTHONPATH": path,
-                                 "DEW_EXECUTED": str(executed_report)})
+    done = child_groups.start(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                       env={**os.environ, **environ, **CLOSED_HUB, "PYTHONPATH": path,
+                            "DEW_EXECUTED": str(executed_report)})
 
     def read() -> None:
         for line in done.stdout or ():
@@ -600,15 +613,11 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     try:
         done.wait(deadline)
     except subprocess.TimeoutExpired:
-        # ^C first, so pytest reports what ran; a test stuck in C ignores it, and the group is killed.
         expired = True
-        signal_group(done.pid, signal.SIGINT)
-        try:
-            done.wait(grace)
-        except subprocess.TimeoutExpired:
-            signal_group(done.pid, signal.SIGKILL)
-            done.wait()
-    signal_group(done.pid, signal.SIGKILL)
+    # Past the deadline ^C first, so pytest reports what ran; a test stuck in C ignores it. Then the group is
+    # killed, what pytest's tests left running with it, and given `SETTLE` to be gone.
+    if left := child_groups.stop(done, interrupt=grace if expired else None, settle=SETTLE):
+        print(f"processes {left} of the task's group still ran {SETTLE:.0f} s after SIGKILL", flush=True)
     reader.join(10)
     output = "".join(lines)
     cases = list(ET.parse(report).getroot().iter("testcase")) if report.is_file() else []
@@ -628,7 +637,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
         if done.returncode not in (0, 1, 5) or (not own and done.returncode == 1):
             red.append(f"pytest exited {done.returncode}" + ("" if own else f" with no report of {name}"))
         if expired:
-            red.append(f"the task ran past its deadline of {deadline:.0f} s and was interrupted")
+            red.append(f"{INTERRUPTED} of {deadline:.0f} s and was interrupted")
         seconds = shares[name]
         # armada times a file at the sum of its rows' timings, a split file's groups together, each
         # Python's apart.
@@ -848,14 +857,19 @@ def durations(verdicts: list[dict]) -> dict[str, float]:
 
 ARTIFACTS = "/armada/task/artifacts"
 """Where an armada task's files are kept for `armada map --artifacts`."""
+INTERRUPTED = "the task ran past its deadline"
+"""How a row says its task was interrupted: tests after the point it reached did not run."""
+COVERAGE_DEADLINE = 5400.0
+"""A coverage task's deadline. Branch tracing slows a task several times over, and a task cut short leaves
+its files' coverage partial, which `coverage_report` refuses."""
 
 
 def coverage_items(target: float, timings: dict) -> list[str]:
     """The plan's tasks for the oldest Python, as armada map items: each runs its files under coverage.py
-    with the test cache off, its rows and data among its artifacts."""
+    with the test cache off, its rows and data among its artifacts, by `COVERAGE_DEADLINE`."""
     return [f"mkdir -p {ARTIFACTS} && python3 tools/armada/ci.py task --python={entry['python']} "
             f"--tests='{entry['tests']}' --split='{entry['split']}' --out={ARTIFACTS}/rows.json --cache=off "
-            f"--coverage={ARTIFACTS}"
+            f"--deadline={COVERAGE_DEADLINE:.0f} --coverage={ARTIFACTS}"
             for entry in plan(target, timings) if entry["python"] == PYTHONS[0] and entry["split"] != COLLECT]
 
 
@@ -871,6 +885,19 @@ def coverage_report(directory: Path) -> int:
     parts = sorted(str(path) for path in directory.glob("*/.coverage.*"))
     if not parts:
         print(f"no coverage data under {directory}", file=sys.stderr)
+        return 1
+    # A task that wrote no rows or was interrupted left the coverage of its files' later tests out.
+    def ran_short(task: Path) -> bool:
+        verdict = task / "rows.json"
+        return not verdict.exists() or any(INTERRUPTED in found["output"]
+                                           for found in json.loads(verdict.read_text())["rows"])
+
+    # armada keeps each task's artifacts in a directory named by its index.
+    short = [task.name for task in sorted(directory.iterdir())
+             if task.is_dir() and task.name.isdecimal() and ran_short(task)]
+    if short:
+        print(f"{len(short)} tasks ran short, so the pass is partial; run them again with a longer deadline: "
+              f"{', '.join(short)}", file=sys.stderr)
         return 1
     subprocess.run([python, "-m", "coverage", "combine", "--keep", f"--data-file={data}", *parts], check=True)
     report = directory / "coverage.json"
