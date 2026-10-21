@@ -206,4 +206,12 @@ def group_layers(name: str) -> range | None:
     return range(first, last + 1)
 
 
+
+def layer_index(name: str) -> int | None:
+    """Return the layer index a single layer's `layers_N` module name holds (`group_layers`), or
+    None, a run's `layers_3_7` (or one-layer run's `layers_3_3`) among the rest."""
+    layers = group_layers(name)
+    return layers.start if layers is not None and name == f"layers_{layers.start}" else None
+
+
 __all__ = ["LayerKind", "LayerSpec", "ResolvedKind"]
