@@ -7,6 +7,7 @@ import numpy as np
 import pytest
 from reference_error import (
     FACTOR,
+    REDRAW,
     Inconclusive,
     assert_as_exact,
     assert_as_exact_as_the_reference,
@@ -201,7 +202,8 @@ def test_a_recorded_reference_is_drawn_by_its_index_and_covers_the_redraw(tmp_pa
     truth = x.astype(np.float64) ** 2 - 1
     path = tmp_path / "recorded.npz"
     np.savez(path, **{"site.input.x": x, "site.reference.y": x * x - np.float32(1),
-                      "site.truth.y": truth, "site.seeds": np.int64(seeds)})
+                      "site.truth.y": truth, "site.seeds": np.int64(seeds),
+                      "site.redraw": np.int64(REDRAW)})
     assert declared_seeds(path) == {"site": seeds}
     with np.load(path) as stored:
         draw, reference, truth_fn = indexed_recording(dict(stored), "site", seeds)

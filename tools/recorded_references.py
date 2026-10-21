@@ -4,9 +4,11 @@ A reference that cannot run in the test (a CUDA-only library, a fetched source) 
 the seeds check 1 draws: `record_case` plans the count on a proxy that can run (Dew's own XLA path),
 records (1 + REDRAW) times it, confirms the count on the recorded reference itself with `seeds_for`,
 records the confirmed count's whole redraw and returns the `<site>.input.*`, `<site>.reference.*`,
-`<site>.truth.*` and `<site>.seeds` arrays to save beside its `provenance`. The proxy only plans: the
-declared count is the recorded reference's own. (tools/recorded_draws.py is another thing: it records
-the random draws a reference generator's library makes, so a second precision reads the same samples.)
+`<site>.truth.*` and `<site>.seeds` arrays to save beside its `provenance` with `save`, which commits a
+recording of at most 1 MiB and sends a larger one to the fetched store (tools/fetched_fixtures.py). The
+proxy only plans: the declared count is the recorded reference's own. (tools/recorded_draws.py is
+another thing: it records the random draws a reference generator's library makes, so a second
+precision reads the same samples.)
 """
 
 import datetime
@@ -18,7 +20,11 @@ import jax
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from fetched_fixtures import save
 from reference_error import REDRAW, input_digest, seeds_for
+
+__all__ = ["provenance", "record_case", "save"]
 
 
 def provenance(reference: str, revision: str, device: str, command: str, **details) -> np.ndarray:
