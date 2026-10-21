@@ -287,11 +287,6 @@
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
-  "tests/test_dsa_kpool.py": {
-   "comparisons": 12,
-   "lane": "Models, Serving & RL",
-   "by": "2026-11-13"
-  },
   "tests/test_edm2.py": {
    "comparisons": 2,
    "lane": "Models, Serving & RL",
