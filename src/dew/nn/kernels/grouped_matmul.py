@@ -36,39 +36,17 @@ from jax.core import ShapedArray
 from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.extend import core as jax_core
 
-from ..precision import asks_default_precision
 from . import generation
 from .templates import base, cost
 from .templates.gemm import mosaic_gpu
+from .templates.product import declared, promoted
 
 
 def ragged_dot_refusal(compute: Dtype, operands: tuple[Dtype, ...],
                        precision: PrecisionLike) -> str | None:
-    """Why the kernels do not compute the product a caller asked for, or None where they do.
-
-    The kernels multiply in `compute` and accumulate in fp32. With 16-bit
-    compute that gives exact products, summed by the tensor cores, whose fp32
-    accumulation truncates each add: the default precision's sums, and an XLA
-    dot's at it. A precision above the default (explicitly or through
-    `jax_default_matmul_precision`) asks for IEEE fp32 sums, which an fp32
-    output takes by adding each depth step's product apart (`exact_sums`);
-    a 16-bit output's one rounding hides the difference. With fp32 compute
-    the kernels multiply in TF32, which only the default precision asks for.
-    An operand or master wider than fp32 needs its gradient summed wider than
-    the kernels sum, and x64 widens their int32 group offsets, so both are
-    refused.
-    """
-    if jax.config.jax_enable_x64:
-        return "x64 widens the kernels' int32 group offsets"
-    if jnp.result_type(compute, *operands, jnp.float32) != jnp.dtype(jnp.float32):
-        return "an operand is wider than fp32, and the kernels sum gradients in fp32"
-    compute = jnp.dtype(compute)
-    if compute in (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16)):
-        return None
-    if compute != jnp.dtype(jnp.float32):
-        return f"the kernels do not multiply in {compute.name}"
-    return None if asks_default_precision(precision, configured=True) else (
-        "fp32 products above the default precision, and the kernels multiply in TF32")
+    """Why the kernels do not compute the product a caller asked for, or None where they do: the
+    declared product's refusal (`templates.product.declared`)."""
+    return declared(compute, precision, operands=operands).refusal
 
 
 @dataclasses.dataclass(frozen=True)
@@ -866,34 +844,29 @@ _TGMMS = (MosaicTgmm(), Tgmm())
 
 
 def launched_gmm(tokens, kernel, sizes, prologue_operands: tuple = (), epilogue_operands: tuple = (), *,
-                 out_dtype, trans_rhs: bool, hooks: Hooks = NO_HOOKS, interpret: bool, exact: bool = False,
+                 out_dtype, trans_rhs: bool, hooks: Hooks = NO_HOOKS, interpret: bool, promoted: bool = False,
                  dense: bool = False):
     """Each group's rows of `tokens` times its matrix of `kernel`, rounded to `tokens`'s dtype, through
     the launch that runs it (`_launch`), with the template's hooks (`templates.gemm.template.gemm`).
-    `exact` (a precision above the default) gives an fp32 output IEEE sums (`ragged_dot_refusal`);
-    `dense`, one group of every row (a dense product), the plain tiled kernel where Triton runs it."""
+    `promoted`, the declared product's (`templates.product.Product`), adds each depth step's partial
+    apart (`exact_sums`); `dense`, one group of every row (a dense product), the plain tiled kernel where
+    Triton runs it."""
     arguments = (tokens, kernel.astype(tokens.dtype), sizes, tuple(prologue_operands),
                  tuple(epilogue_operands))
-    exact_sums = _exact_sums(exact=exact, hooks=hooks, out_dtype=out_dtype)
     options = {'out_dtype': jnp.dtype(out_dtype).name, 'trans_rhs': trans_rhs, 'hooks': hooks,
-               'interpret': interpret, 'exact_sums': exact_sums, 'dense': dense}
+               'interpret': interpret, 'exact_sums': promoted, 'dense': dense}
     return _launch(_GMMS_TRANSPOSED if trans_rhs else _GMMS, arguments, options)(*arguments, **options)
 
 
 def launched_tgmm(tokens, cotangent, sizes, prologue_operands: tuple = (), *, out_dtype,
-                  hooks: Hooks = NO_HOOKS, interpret: bool, exact: bool = False, dense: bool = False):
+                  hooks: Hooks = NO_HOOKS, interpret: bool, promoted: bool = False, dense: bool = False):
     """Each group's rows of `tokens` transposed times its rows of `cotangent`, rounded to `tokens`'s
     dtype, through the launch that runs it, with the template's prologue
     (`templates.gemm.template.gemm_t`); `dense` as `launched_gmm`'s."""
     arguments = (tokens, cotangent.astype(tokens.dtype), sizes, tuple(prologue_operands))
     options = {'out_dtype': jnp.dtype(out_dtype).name, 'hooks': hooks, 'interpret': interpret,
-               'exact_sums': _exact_sums(exact=exact, hooks=hooks, out_dtype=out_dtype), 'dense': dense}
+               'exact_sums': promoted, 'dense': dense}
     return _launch(_TGMMS, arguments, options)(*arguments, **options)
-
-
-def _exact_sums(*, exact: bool, hooks: Hooks, out_dtype) -> bool:
-    """Whether a launch adds each depth step's product apart: asked for IEEE sums, with an fp32 output."""
-    return exact and jnp.dtype(jnp.float32) in {jnp.dtype(d) for d in (hooks.out_dtypes or (out_dtype,))}
 
 
 def _launch(launches, arguments, options):
@@ -967,9 +940,9 @@ def _forward(inputs, matrix, sizes, out_dtype, interpret_on_cpu):
 def _backward(inputs, matrix, sizes, cotangent, input_dtype, kernel_dtype, interpret_on_cpu, exact):
     def kernel(inputs, matrix, sizes, cotangent, *, interpret):
         return (launched_gmm(cotangent, matrix, sizes, out_dtype=input_dtype, trans_rhs=True,
-                             interpret=interpret, exact=exact),
+                             interpret=interpret, promoted=promoted(exact, (input_dtype,))),
                 launched_tgmm(inputs, cotangent, sizes, out_dtype=kernel_dtype, interpret=interpret,
-                              exact=exact))
+                              promoted=promoted(exact, (kernel_dtype,))))
 
     def fallback(inputs, matrix, sizes, cotangent):
         work = jnp.result_type(_summed(input_dtype), _summed(kernel_dtype))
