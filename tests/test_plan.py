@@ -419,8 +419,8 @@ def asked(trainer) -> list[tuple[int, str | None, bool]]:
 def assert_searched(probes, chosen, below, frontier, *, half=None):
     """`probes`, a search that settled on `chosen` (split, remat): the batch whole asked first, no
     compile asked twice, every split that missed at no recomputation asked at the `half` rung next,
-    `below`, the largest split under the plan, asked and missed at each rung it may fit at, and the
-    `frontier` asked last. Which splits between are asked, and in what order, follows the memory
+    `below`, the largest split under the plan, asked and missed at each rung it may fit at, a plan at
+    the half rung missed at no recomputation before, and the `frontier` asked last. Which splits between are asked, and in what order, follows the memory
     each compile measured, which differs between devices (`Forecast`)."""
     assert probes[0][:2] == (1, None) and not probes[0][2]
     assert len({probe[:2] for probe in probes}) == len(probes)
@@ -430,6 +430,9 @@ def assert_searched(probes, chosen, below, frontier, *, half=None):
             assert probes[index + 1] == (split, half, probes[index + 1][2])
     rungs = [None] if half is None else [None, half] if chosen[1] is None else [half]
     assert all((below, remat, False) in probes for remat in rungs)
+    if half is not None and chosen[1] == half:
+        # A plan at the half rung missed at no recomputation first.
+        assert probes.index((chosen[0], None, False)) < probes.index((*chosen, True))
 
 
 DELTA = {"mixer": mixers.build("gated_delta_net", linear_num_key_heads=2, linear_num_value_heads=2,
