@@ -1541,6 +1541,59 @@ def write_tiny(name: str, model: PreTrainedModel, seed: int = 1234, *, padded: b
     print(f"{directory}: {size / 1e3:.0f} kB, {sorted(p.name for p in directory.iterdir())}")
 
 
+def write_logits_recording(name: str, model: PreTrainedModel, command: str) -> None:
+    """The committed tiny fixture `name`'s transformers logits recorded over check 1's seeds
+    (tools/recorded_references.py): each seed's token grid (tests/interop_support.py `drawn_ids`), the
+    reference's fp32 eager logits on the CPU and their float64 truth (the model in float64, its float32
+    pins widened), its count planned on Dew's own load of the fixture and confirmed on the reference.
+    The ids are drawn again by the test, so only the outputs and the ids' digests are kept, in
+    recorded_logits.npz beside the fixture."""
+    import sys
+    from copy import deepcopy
+
+    import jax
+    from diffusers_wan_reference import float64
+    from fetched_fixtures import save
+    from recorded_references import provenance, record_case
+
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
+    from interop_support import drawn_ids
+
+    from dew.interop import Pretrained
+
+    directory = FIXTURES / name
+    model = model.float().eval()
+    model.set_attn_implementation("eager")
+    wide = deepcopy(model).double()
+    vocab = model.config.vocab_size
+    native, widened = (Pretrained.load(directory, dtype=dtype, attention_impl="reference")
+                       for dtype in ("float32", "float64"))
+
+    def evaluate(inputs):
+        ids = torch.from_numpy(inputs["input_ids"].astype(np.int64))
+        with torch.no_grad():
+            reference = model(input_ids=ids, use_cache=False).logits.numpy()
+        with float64(), torch.no_grad():
+            truth = wide(input_ids=ids, use_cache=False).logits.numpy()
+        return {"logits": reference}, {"logits": truth}
+
+    def proxy(inputs):
+        return {"logits": native.model.apply(native.variables, inputs["input_ids"])}
+
+    def truth_proxy(inputs):
+        return {"logits": widened.model.apply(widened.variables, inputs["input_ids"])}
+
+    with jax.enable_x64(True):
+        recording = record_case("logits", lambda seed: drawn_ids(vocab, seed), evaluate, proxy,
+                                truth_proxy=truth_proxy, store_inputs=False)
+    import transformers
+
+    record = provenance(f"transformers {type(model).__name__}", transformers.__version__, "cpu", command,
+                        torch=torch.__version__, dtype="float32", attention="eager")
+    save(directory / "recorded_logits.npz", {**recording, "logits.provenance": record},
+         reference=f"transformers {type(model).__name__}", license="Apache-2.0")
+
+
 def write_device_tiny(name: str, model: PreTrainedModel, device: str, command: str) -> None:
     """`write_tiny` on `device` with TF32 off, the first row's six-token
     greedy continuation of its first four ids, and meta.json naming the run
