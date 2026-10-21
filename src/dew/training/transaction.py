@@ -509,8 +509,9 @@ class Transaction:
         A rejected attempt costs the same trace as an accepted one. With a
         dynamic scaler an attempt is admitted only when every value it
         produced is finite, the committed parameters and optimizer state
-        included; a rejected attempt returns `state` untouched and only the
-        scaler moves.
+        included; a rejected attempt returns `state` with its window dropped
+        (`dropped_window`), its parameters, optimizer state and EMA untouched,
+        and the scaler moved.
 
         A window of one microbatch commits on every step it can, so its
         commit is computed and kept by elementwise selects. A longer window

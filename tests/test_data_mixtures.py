@@ -1043,18 +1043,28 @@ class Rejecting(Pooled):
         return Ratio(jnp.where(poisoned, jnp.inf, stats.total), stats.mass), aux
 
 
-def test_a_window_a_rejection_shifted_is_dropped_where_a_ramp_stage_begins():
+@pytest.mark.parametrize("route", ["resident", "host", "resumed"])
+def test_a_window_a_rejection_shifted_is_dropped_where_a_ramp_stage_begins(route, tmp_path):
     """A rejected step drops its window, so the next begins a step later than the ramp's stages,
-    which begin where unrejected windows do: the stage's first batch then drops the window its last
+    which begin where unrejected windows do: the stage's first step then drops the window its last
     one left part filled, and no update pools two stages' batches. Rejecting step 0 of a ramp of two
     eight-record steps, then sixteen, two to an update: step 1 alone in its window is dropped at step
-    2, which with step 3 makes the run's one update."""
+    2, which with step 3 makes the run's one update, whether the variables live on the devices or the
+    host, and in a run resumed from a checkpoint written at the stage's start."""
     records, seed = 4096, 7
     ramp = Ramp(start=8, increment=8, samples=16)
     first = next(iter(ramped(indexed_data(records, 16, seed), ramp).train(DataPartition(window=2))))
-    trainer = Trainer(Rejecting(int(first["id"][0])), optax.sgd(0.5), key=jax.random.key(0), accumulation=2,
-                      dynamic_scale=True, layout=Layout(min_shard=1, tolerance=1.0), checkpoints=None)
-    state = trainer.fit(ramped(indexed_data(records, 16, seed), ramp), steps=4, log_every=100)
+    layout = Layout(host=("variables",) if route == "host" else (), min_shard=1, tolerance=1.0)
+
+    def trainer():
+        checkpoints = Checkpoints(str(tmp_path / "run"), keep=8) if route == "resumed" else None
+        return Trainer(Rejecting(int(first["id"][0])), optax.sgd(0.5), key=jax.random.key(0), accumulation=2,
+                       dynamic_scale=True, layout=layout, checkpoints=checkpoints)
+
+    if route == "resumed":
+        trainer().fit(ramped(indexed_data(records, 16, seed), ramp), steps=2, log_every=100,
+                      checkpoint_every=2)
+    state = trainer().fit(ramped(indexed_data(records, 16, seed), ramp), steps=4, log_every=100)
     assert (int(state.step), int(state.microstep), int(state.updates)) == (4, 2, 1)
 
 

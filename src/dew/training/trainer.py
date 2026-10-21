@@ -23,6 +23,7 @@ import sys
 import time
 import types
 from collections.abc import Callable, Iterator, Mapping, Sequence
+from itertools import accumulate, pairwise
 from typing import TYPE_CHECKING, Generic, Literal, Protocol
 
 import jax
@@ -45,7 +46,6 @@ from dew.data.dataset import (
     RampedStream,
     Reader,
     Stage,
-    rows_of,
     stream_endless,
     stream_identity,
 )
@@ -487,8 +487,8 @@ class Trainer(Generic[Loss, Effects]):
         # The plan of the last compiled step: its split, the rows of its
         # microbatch and every compile its search made (`Probe`).
         self.plan: JSON = None
-        # The check that the last compiled step fits (`memory_record`), and
-        # whether a step compiled since has yet to run once.
+        # The check that the last compiled step fits (`memory_record`), and whether a step compiled
+        # since has yet to run once.
         self.memory: JSON = None
         self._unproven = False
         # The links the last compiled step decided its projections by, which say whether one spread over
@@ -525,7 +525,7 @@ class Trainer(Generic[Loss, Effects]):
         self._rows: tuple[int, ...] | None = None
         # The stages of the batch ramp `fit` reads, which change the batch's shape; none without one.
         self._ramp: tuple[Stage, ...] = ()
-        self._window_rows: int | None = None
+        self._stage_starts: frozenset[int] = frozenset()
         # The training batch's device steps, which the compiled step runs (`Loader.device`).
         self._device: tuple[DeviceStep, ...] = ()
 
@@ -884,13 +884,11 @@ class Trainer(Generic[Loss, Effects]):
             state = self.initial_state(initializer, key)
             if FROZEN in state.variables:
                 check_bank_pool(bank_bytes(state.variables[FROZEN], self.bank_sites), self.device_mesh)
-                # A scanned run's frozen rows become its bank here and the
-                # bank lands where it stays resident before the next is
-                # stacked, so the host holds one bank in transit, not the
-                # stack; the rows' pages are let go as it lands and the held
-                # tree holds the placed bank where each row was. An
-                # objective placed this way holds banks at its rows afterwards
-                # and does not seed a second trainer.
+                # A scanned run's frozen rows become its bank here and the bank lands where it stays
+                # resident before the next is stacked, so the host holds one bank in transit, not the
+                # stack; the rows' pages are let go as it lands and the held tree holds the placed bank
+                # where each row was. An objective placed this way holds banks at its rows afterwards and
+                # does not seed a second trainer.
                 targets = shardings.variables[FROZEN]
 
                 def stack(rows, path):
@@ -1105,6 +1103,15 @@ class Trainer(Generic[Loss, Effects]):
             self.links = links
         return self._runner(planned, mesh)
 
+    def _staged(self, state: TrainState, step: int) -> TrainState:
+        """`state` to run step `step`: its window dropped (`dropped_window`) where the step begins a ramp's
+        stage after the first and a rejection left the window part filled, so an update pools one
+        stage's batches; a step the attempt count gives, so a resumed run drops it as the run did."""
+        if step not in self._stage_starts or self.accumulation == 1 or state.accumulation is None:
+            return state
+        return jax.jit(functools.partial(dropped_window, size=self.accumulation), donate_argnums=0,
+                       out_shardings=jax.tree.map(lambda x: x.sharding, state))(state)
+
     def _runner(self, planned: Planned, mesh: Mesh) -> CompiledStep:
         """The step `planned` compiled, which reads a batch in its microbatches."""
         # The program compiled above, not the jit: a call through the jit traces and compiles its own,
@@ -1115,12 +1122,6 @@ class Trainer(Generic[Loss, Effects]):
 
         def run(current, batch):
             with self._traced_on(mesh):
-                # A ramp's new stage begins a window: one a rejection left part filled is dropped.
-                previous, self._window_rows = self._window_rows, rows_of(batch)
-                staged = self._ramp and previous not in (None, self._window_rows)
-                if staged and window > 1 and current.accumulation is not None:
-                    current = jax.jit(functools.partial(dropped_window, size=window), donate_argnums=0,
-                                      out_shardings=jax.tree.map(lambda x: x.sharding, current))(current)
                 if candidate.copies and current.compute is None:
                     current = dataclasses.replace(current, compute=jax.jit(
                         lambda variables: narrowed(variables, candidate.copies),
@@ -1435,8 +1436,8 @@ class Trainer(Generic[Loss, Effects]):
         self._display = TrainingDisplay()
         profile, checkpoints = self.profile, self.checkpoints
         profiler = self._own_profile_window()
-        # One boundary lookup at setup: the prefetch worker and the step
-        # scopes share whichever profiler owns the capture.
+        # One boundary lookup at setup: the prefetch worker and the step scopes share whichever profiler
+        # owns the capture.
         tracer = profiler if profiler is not None else telemetry_profile.active_profile()
         try:
             plan = _FitPlan(
@@ -1540,8 +1541,7 @@ class Trainer(Generic[Loss, Effects]):
                 if len(compiled) > known:
                     self._warm_evaluations(plan, state, shardings)
                 if not known:
-                    # Rebound once the step is compiled, so the first tick
-                    # measures steps, not the compile.
+                    # Rebound once the step is compiled, so the first tick measures steps, not the compile.
                     interval.last_log_time = time.time()
                     interval.waited = 0.0
                 elif len(compiled) > known:
@@ -1549,7 +1549,8 @@ class Trainer(Generic[Loss, Effects]):
                     # reports that time apart from its steps'.
                     interval.compiling += time.perf_counter() - began
                 with region("train.step"):
-                    state, loss, aux, finite, accepted, committed = train_step(state, device)
+                    state, loss, aux, finite, accepted, committed = train_step(
+                        self._staged(state, run.current), device)
                 # Read with this step queued behind the one it describes, so the devices go on meanwhile.
                 self._read_taken(run)
                 if self._unproven:
@@ -1622,8 +1623,7 @@ class Trainer(Generic[Loss, Effects]):
                     error = failure
                 else:
                     error.add_note(f"{label} cleanup failed: {failure!r}")
-        # The traceback of a failed run holds fit's frame and this one, and with them whatever these
-        # names still point at.
+        # The traceback of a failed run holds fit's frame and this one, and what these names point at.
         run.source, run.train, run.taken = None, None, None
         close = stop_trace = cleanup = unread = None
         run.other += time.perf_counter() - paused
@@ -1672,6 +1672,9 @@ class Trainer(Generic[Loss, Effects]):
             check_stream(run.source, mesh, self.microbatches, plan.dataset.batch, rows=self.rollout is None,
                          resumed=current if resumed and position is None else None)
             self._ramp = run.source.stages if isinstance(run.source, RampedStream) else ()
+            # The steps a stage after the first begins at, each where an update does (`Ramp.stages`).
+            self._stage_starts = frozenset(accumulate((after.records - stage.records) // stage.batch
+                                                      for stage, after in pairwise(self._ramp)))
             if self._ramp:
                 # Each stage's batch is read whole: no plan splits a ramp's.
                 self._split = 1
@@ -1735,9 +1738,8 @@ class Trainer(Generic[Loss, Effects]):
             self._take(plan, run, interval, state)
 
         if isinstance(plan.checkpoint_every, datetime.timedelta):
-            # The clock is read at the log interval, where the step is already
-            # waited on, so a pool's processes agree on it there rather than
-            # gathering behind every step.
+            # The clock is read at the log interval, where the step is already waited on, so a pool's
+            # processes agree on it there rather than gathering behind every step.
             run.checkpoint_due = False
             if current % plan.log_every == 0:
                 elapsed = time.perf_counter() - run.last_checkpoint
@@ -1762,8 +1764,7 @@ class Trainer(Generic[Loss, Effects]):
             self._saves(plan, run, interval, state, position, scores, evaluation_due=evaluation_due)
         if plan.observe:
             plan.observe.at(current, state)
-        # Asked at every step on every process, as JAX's agreement
-        # needs; the last step ends the run on its own.
+        # Asked at every step on every process, as JAX's agreement needs; the last step ends the run.
         if run.stopped:
             return True
         assert run.notice is not None
@@ -1870,8 +1871,7 @@ class Trainer(Generic[Loss, Effects]):
             agreed("preemption announcement", announce_preemption)
         if run.tracing and profile is not None:
             run.tracing = False
-            # The window outlived the run, and a trace left running takes the
-            # next one down with it.
+            # The window outlived the run, and a trace left running takes the next one down with it.
             assert profiler is not None
             self._stop_trace(run, profile, profiler)
         interval.check_finite(current, self._display)
