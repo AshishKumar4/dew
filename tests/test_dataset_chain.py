@@ -760,6 +760,36 @@ def test_a_mixtures_grain_step_drops_rows_it_rejects_and_counts_them(read):
     assert data.statistics()["data/rejected/mixture/odd"] > 0
 
 
+@dataclasses.dataclass(frozen=True)
+class Tagged:
+    """Marks a record as read from the second corpus."""
+
+    def __call__(self, row):
+        return {**row, "tagged": True}
+
+
+def test_show_prints_what_a_preset_expanded_to_then_the_records(capsys):
+    """`show` prints a chain's store and every verb and step a preset expanded to, in order, then
+    its first records; a mixture's corpora each with their weight and their own steps."""
+    from dew.data import presets
+
+    pictures = Memory([{"image": np.full((8, 8, 3), index, np.uint8), "label": index % 2}
+                       for index in range(6)])
+    pictures.pipe(presets.images, 4, batch=2, augment=True).loading(READ).show(count=1)
+    printed = capsys.readouterr().out
+    steps = ["Memory", "DecodeImage", "Resize", "AugmentationKey", "batch", "DeviceAugment"]
+    places = [printed.find(step) for step in steps]
+    assert all(place >= 0 for place in places)
+    assert places == sorted(places)
+    assert "image" in printed[places[-1]:]
+
+    mixed = mix([Memory(rows("a", 4)).named("left"), Memory(rows("b", 4)).named("right").map(Tagged())],
+                [3, 1])
+    mixed.batch(2).loading(READ).show(count=1)
+    printed = capsys.readouterr().out
+    assert printed.index("weight 3") < printed.index("weight 1") < printed.index("Tagged") < printed.index("batch")
+
+
 def test_a_runs_truncated_share_is_of_the_rows_it_delivered():
     """A memory read runs a corpus's steps before its repeat and reads the rest as it goes: every
     row it delivers was cut short after the repeat, so its truncated share is one, whatever the
