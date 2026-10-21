@@ -1152,16 +1152,6 @@
    "lane": "Training",
    "by": "2026-11-20"
   },
-  "tools/numerics_reference.py": {
-   "comparisons": 1,
-   "lane": "Accuracy Gate",
-   "by": "2026-11-13"
-  },
-  "tools/reference_runs/compare.py": {
-   "comparisons": 1,
-   "lane": "Accuracy Gate",
-   "by": "2026-11-13"
-  },
   "tools/reference_runs/qwen35_pair.py": {
    "comparisons": 1,
    "lane": "Models, Serving & RL",

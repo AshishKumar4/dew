@@ -14,6 +14,7 @@ from reference_error import (
     assert_as_exact,
     assert_as_exact_as_the_reference,
     assert_leaves_as_exact,
+    assert_same_artifact,
     declared_seeds,
     distance,
     indexed_recording,
@@ -118,6 +119,34 @@ def test_check_one_passes_an_equally_exact_sum_over_the_seeds_its_own_reference_
     seeds = seeds_for(_product, _draw, "product")
     assert_as_exact(_reordered, _product, _draw, "reordered", seeds=seeds)
     assert_as_exact(_reordered, _product, _draw, "reordered", seeds=seeds)
+
+
+def test_a_committed_fixture_is_its_references_output_within_twice_a_fresh_runs_error():
+    """An artifact check, not a parity (`assert_same_artifact`): a committed fixture as far from float64
+    as a fresh run, or up to twice as far, is the reference's output; one further is not."""
+    f64 = np.linspace(-1, 1, 11)
+    fresh = f64 + 1e-7
+    assert_same_artifact(fresh, f64 - 2e-7, f64, "twice as far")
+    with pytest.raises(AssertionError):
+        assert_same_artifact(fresh, f64 + 3e-7, f64, "three times as far")
+
+
+def test_a_runs_learning_rates_part_from_the_base_at_any_float32_difference(monkeypatch):
+    """compare.py's conditions read each run's learning rates as float32s, which must be the base run's
+    exactly: a float64 schedule that rounds to the base's float32 matches it, and a value at the next
+    float32 parts, which a relative 1e-6 let through."""
+    from tool_support import REPO_ROOT, load
+
+    monkeypatch.syspath_prepend(str(REPO_ROOT / "tools" / "reference_runs"))
+    compare = load("reference_runs/compare")
+    config = dict.fromkeys(compare.CONDITIONS, 1)
+    base = np.float32([1e-3, 5e-3, 1e-2])
+    rounding = base.astype(np.float64) + 1e-12
+    next_up = np.nextafter(base, np.float32(1)).astype(np.float64)
+    records = {"base": {"config": config, "lr": base.tolist()}}
+    assert not compare.conditions({**records, "run": {"config": config, "lr": rounding.tolist()}})
+    [found] = compare.conditions({**records, "run": {"config": config, "lr": next_up.tolist()}})
+    assert found.startswith("lr of run parts from base at 3 of 3 steps, first at step 0")
 
 
 @pytest.mark.parametrize("wrong", [_lost_term, _bf16_operands], ids=["lost term", "bf16 operands"])
