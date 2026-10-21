@@ -60,27 +60,11 @@ def make_objective():
     devices, and this module is imported before the pool is joined.
     """
     import jax.numpy as jnp
-    import optax
+    from diffusion_support import DeterministicObjective
 
     from dew.artifacts import Representations
-    from dew.inputs import unit_range
-    from dew.nn.backbones.dit import SimpleDiT
-    from dew.objectives.base import Aux, EMASpec, Objective
 
-    class Reconstruction(Objective):
-        def __init__(self):
-            self.model = SimpleDiT(patch_size=4, emb_features=32, num_layers=1, num_heads=2,
-                                   mlp_ratio=1)
-            self.ema = EMASpec(decay=optax.constant_schedule(0.999))
-
-        def fresh_variables(self, key, held):
-            return self.model.init(key, jnp.ones((1, RES, RES, 3)), jnp.zeros((1,)))
-
-        def loss(self, variables, batch, step):
-            data = unit_range(batch["image"])
-            preds = self.model.apply(variables, data, jnp.zeros((data.shape[0],), jnp.float32))
-            return jnp.mean((preds - data) ** 2), Aux({})
-
+    class Reconstruction(DeterministicObjective):
         def evaluate(self, params, batch, step):
             # The validation split here is a token split whose contents the
             # objective has no use for: what the pass exercises is its length.

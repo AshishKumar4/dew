@@ -4,10 +4,15 @@ and its batch, and a student stepped once and saved as a run."""
 import jax
 import jax.numpy as jnp
 import numpy as np
+import optax
 from flax import linen as nn
 from interop_support import scaled_gap
 
+from dew.artifacts import Representations
 from dew.diffusion.schedules import expand
+from dew.inputs import unit_range
+from dew.nn.backbones.dit import SimpleDiT
+from dew.objectives.base import Aux, EMASpec, Objective
 from dew.sampling.sample import sample
 
 
@@ -121,3 +126,36 @@ def saved_after_one_step(config, batch, directory, rate: float):
     checkpoints.wait()
     config.save(str(directory))
     return task, state
+
+
+class DeterministicObjective(Objective):
+    """Squared error against the input, straight through the real DiT.
+
+    No noise level, no dropout, no unconditional mask: the loss depends only
+    on the parameters and the batch. That is what makes two accumulation
+    regimes comparable, and two topologies: every micro-gradient in a window
+    is identical, which is exactly the "one big batch" an accumulated update
+    stands in for, so a k-accumulated run and a plain run must trace the same
+    parameters, and a partitioned run the same losses as a single-device one.
+    """
+
+    def __init__(self, decay=None, emb_features=32):
+        self.model = SimpleDiT(patch_size=4, emb_features=emb_features, num_layers=1,
+                               num_heads=2, mlp_ratio=1)
+        self.ema = EMASpec(decay=optax.constant_schedule(0.999) if decay is None else decay)
+
+    def fresh_variables(self, key, held):
+        return self.model.init(key, jnp.ones((1, 8, 8, 3)), jnp.zeros((1,)))
+
+    def loss(self, variables, batch, step):
+        data = unit_range(batch["image"])
+        preds = self.model.apply(variables, data, jnp.zeros((data.shape[0],), jnp.float32))
+        return jnp.mean((preds - data) ** 2), Aux({})
+
+    def evaluate(self, params, batch, step):
+        """The EMA copy's reconstruction, pooled per example: reads the
+        sharded EMA parameters, which the training step alone never does."""
+        data = unit_range(batch["image"])
+        preds = self.model.apply(step.ema, data, jnp.zeros((data.shape[0],), jnp.float32))
+        return Representations(features=jnp.mean(preds, axis=(1, 2)),
+                               labels=jnp.zeros((data.shape[0],), jnp.int32))
