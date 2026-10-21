@@ -432,11 +432,6 @@
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
-  "tests/test_hf_gpt_neox.py": {
-   "comparisons": 2,
-   "lane": "Models, Serving & RL",
-   "by": "2026-11-13"
-  },
   "tests/test_hf_lifecycle.py": {
    "comparisons": 1,
    "lane": "Models, Serving & RL",
