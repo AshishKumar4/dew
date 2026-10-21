@@ -491,9 +491,10 @@ def test_the_plan_runs_as_one_wave_on_the_pool(ci, tmp_path, monkeypatch, capsys
     def heaviest(entries):
         return max(entry["weight"] for entry in entries if not entry.get("untimed"))
 
-    # 1,500 s of tests on each Python: two tasks of 750 s on four containers; four on eight, the 300 s file
-    # and three of 400 s; on a thousand, the 300 s file as its two tests and every other file alone.
-    cases = ((4, 750.0, 4, 750.0), (8, 375.0, 8, 400.0), (1000, 200.0, 28, 200.0))
+    # 1,500 s of tests on each Python: two tasks on four containers, the heavier 800 s (the 300 s file
+    # with five of 100 s); four on eight; on a thousand, the 300 s file as its two tests and every other
+    # file alone.
+    cases = ((4, 750.0, 4, 800.0), (8, 375.0, 8, 400.0), (1000, 200.0, 28, 200.0))
     for pool, target, tasks, longest in cases:
         entries = ci.plan(target, {}, pool)
         assert ci.one_wave({}, pool) == target and len(entries) == tasks and heaviest(entries) == longest
@@ -573,11 +574,12 @@ def test_a_split_file_pays_its_setup_once_a_group_and_is_not_cut_finer_for_it(ci
     tests = [10.0] * 20
     assert ci.split(tests, 400.0, 150.0, cut=1) == [270.0, 270.0, 260.0]
     assert ci.split(tests, 200.0 + 2 * 50.0, 150.0, cut=2) == [150.0, 150.0]
-    # A cut whose heaviest group, setup included, holds within half again the target is kept, so
-    # its cached programs are: 4 groups of 100 s, and 20 groups of 50 s (an over-cut paying 40 s
-    # each), stay as they ran; 2 groups at 130 s of setup each (230 s, past 225) are cut again.
+    # A cut whose heaviest group, setup included, holds within half again the target either way is
+    # kept, so its cached programs are: 4 groups of 100 s stay as they ran; 2 groups at 130 s of setup
+    # each (230 s, past 225) are cut again, and so are 20 groups of 50 s (an over-cut paying 40 s each,
+    # under 100), coarser, into 2 of 140 s: a plan of fewer, fuller groups holds the suite in one wave.
     assert ci.split(tests, 400.0, 150.0, cut=4) == [100.0] * 4
-    assert ci.split(tests, 200.0 + 20 * 40.0, 150.0, cut=20) == [50.0] * 20
+    assert ci.split(tests, 200.0 + 20 * 40.0, 150.0, cut=20) == [140.0, 140.0]
     assert ci.split(tests, 200.0 + 2 * 130.0, 150.0, cut=2) == [200.0, 200.0, 190.0]
     # The file's median remembers runs at other cuts; its rows are timed at the cut they name. Here
     # four runs at 4 groups (400 s) and the last at 2 (300 s, its rows): measured at 2, it stays at 2.
