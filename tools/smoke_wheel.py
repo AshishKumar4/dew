@@ -11,6 +11,9 @@ nothing of it is importable:
 - every module the wheel installed compiles (`compileall`), so a syntax
   error anywhere in the package fails, imported or not;
 - the console entry point the wheel declares, `dew --help`, runs;
+- the installed dewml, jax and flax report their versions, and flax.nnx imports;
+- a two-layer grouped-query decoder's jitted forward, on its default attention route, gives finite logits
+  of its shape;
 - a tiny language model trains two steps through `Trainer.fit` on token
   files written here, and its parameters stay finite.
 
@@ -47,6 +50,16 @@ from dew.nn.backbones import CausalTransformer
 from dew.objectives.lm import LMObjective
 
 assert "site-packages" in dew.__file__, dew.__file__
+import importlib.metadata
+import flax.nnx  # imports on jax 0.11.2 from flax 0.12.10 on
+print("dewml", importlib.metadata.version("dewml"), "jax", jax.__version__, "flax",
+      importlib.metadata.version("flax"))
+# A grouped-query decoder's compiled forward, on its default attention route.
+gqa = CausalTransformer(vocab_size=64, emb_features=32, num_layers=2, num_heads=4, num_kv_heads=2,
+                        mlp_features=64, max_seq_len=16)
+ids = jnp.arange(16, dtype=jnp.int32).reshape(2, 8)
+logits = jax.jit(gqa.apply)(gqa.init(jax.random.key(0), ids), ids)
+assert logits.shape == (2, 8, 64) and bool(jnp.all(jnp.isfinite(logits))), logits.shape
 data = loader(TextData(source=sys.argv[1], seq_len=8), batch=4, read="memory", validation_records=4,
             loading=Loading(workers=0, threads=1, read_buffer=2))
 model = CausalTransformer(vocab_size=8, emb_features=16, num_layers=1, num_heads=2, mlp_features=32,
