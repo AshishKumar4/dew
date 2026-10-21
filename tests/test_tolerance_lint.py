@@ -432,22 +432,25 @@ def test_a_merge_keeps_an_entry_its_parents_renamed_apart_only_once(lint, tmp_pa
 
 def test_a_merge_keeps_an_entry_whole_as_some_parent_holding_it_does(lint, tmp_path):
     """One parent raised a file's count by rereading the rule and tightened its date, the other kept
-    the lower count and the later date; a merge taking the higher count and the later date holds the
-    entry looser than either parent, and is refused."""
+    the lower count and the later date; a merge taking the higher count and the later date undoes the
+    tightening and is refused, one taking the higher count and the earlier date is not."""
     repo = tmp_path / "repo"
     repo.mkdir()
     subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
     _commit(repo, _inventory({"tests/test_a.py": 7}, by="2026-11-21"), "made",
             {"tests/test_a.py": "a = 1\n", lint.RULE: "r = 1\n"})
     subprocess.run(["git", "checkout", "-q", "-b", "lane"], cwd=repo, check=True)
-    _commit(repo, _inventory({"tests/test_a.py": 7}, by="2026-11-21"), "the lane works", {"tests/o.py": "o\n"})
+    _commit(repo, _inventory({"tests/test_a.py": 7}, by="2026-11-21"), "the lane works",
+            {"tests/o.py": "o\n"})
     subprocess.run(["git", "checkout", "-q", "main"], cwd=repo, check=True)
     _commit(repo, _inventory({"tests/test_a.py": 8}, by="2026-11-20"), "the rule reads more, sooner",
             {lint.RULE: "r = 2\n"})
-    _merged(repo, "main", "lane", _inventory({"tests/test_a.py": 8}, by="2026-11-21"), "the merge takes both")
+    _merged(repo, "main", "lane", _inventory({"tests/test_a.py": 8}, by="2026-11-21"),
+            "the merge takes both")
     assert any("test_a.py" in finding.message for finding in lint.ratchet(repo))
     subprocess.run(["git", "reset", "-q", "--hard", "HEAD~1"], cwd=repo, check=True)
-    _merged(repo, "main", "lane", _inventory({"tests/test_a.py": 8}, by="2026-11-20"), "the merge takes main's")
+    _merged(repo, "main", "lane", _inventory({"tests/test_a.py": 8}, by="2026-11-20"),
+            "the merge takes main's")
     assert list(lint.ratchet(repo)) == []
 
 
