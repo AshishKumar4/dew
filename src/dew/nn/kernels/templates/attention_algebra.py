@@ -398,11 +398,10 @@ def split_delta(others: jax.Array, own: jax.Array, others_total: jax.Array, tota
 
 
 class DqSums(NamedTuple):
-    """A dQ pass's sums over its keys against the unnormalized weights `exp(s - m)`: dQ `[bq, D]`, whose
-    operands alone are taken over a `prior` denominator (the forward's, or the first pass's) before
-    they narrow, so each holds a normalized weight's range; the score cotangents' and the weights' row
-    sums, and the HEAD and QUERY hook parameters' pullbacks of the cotangents (`grads`) and of the
-    weights (`weighed`), fp32."""
+    """A dQ pass's sums over its keys, against weights normalized by a `prior` denominator (the
+    forward's, or the first pass's), so each narrowed operand holds a normalized weight's range: dQ
+    `[bq, D]`, the score cotangents' and the weights' row sums, and the HEAD and QUERY hook parameters'
+    pullbacks of the cotangents (`grads`) and of the weights (`weighed`), fp32."""
 
     dq: jax.Array
     residual: jax.Array
@@ -418,13 +417,13 @@ def dq_finish(sums: DqSums, prior: jax.Array, state_total: jax.Array, peak0: jax
     its own logits, whichever pass gave D), then D refined once from its own sums (`refinement`) and the
     HEAD and QUERY gradients with it. Returns dQ, the refined `D - c`, the denominator, the keys' share
     of the weights, and the hook gradients."""
-    total = state_total + sums.mass
-    scale = inverse(total)
-    mass, residual = sums.mass * scale, sums.residual * scale
+    total = state_total + sums.mass * prior
+    ratio = prior * inverse(total)
+    mass, residual = sums.mass * ratio, sums.residual * ratio
     refined = refinement(residual, mass, peak0, shares, peak, total, anchor, delta)
-    grads = tuple(grad * scale - refined * (weighed * scale)
-                  for grad, weighed in zip(sums.grads, sums.weighed, strict=True))
-    return sums.dq * (prior * scale)[:, None], delta + refined, total, mass, grads
+    grads = tuple(grad * ratio - refined * weighed * ratio for grad, weighed in zip(sums.grads, sums.weighed,
+                                                                                    strict=True))
+    return sums.dq * ratio[:, None], delta + refined, total, mass, grads
 
 
 def normalized(logits: jax.Array, peak: jax.Array, total: jax.Array) -> tuple[jax.Array, jax.Array]:
@@ -433,22 +432,15 @@ def normalized(logits: jax.Array, peak: jax.Array, total: jax.Array) -> tuple[ja
     return exponentials, exponentials * inverse(total)[:, None]
 
 
-def grad_scores(exponentials: jax.Array, products: jax.Array, anchor: jax.Array, delta: jax.Array,
-                seen: jax.Array, at_anchor: jax.Array | None = None,
-                inverse_total: jax.Array | None = None) -> jax.Array:
-    """The score cotangents `p (dP - D)` of a tile from its unnormalized weights `exp(s - m)`, taken as
-    `exp(s - m) ((dP - c) - (D - c))` about each query's anchor c (`off_anchor_delta`) and only then
-    over each query's denominator (`inverse_total`; None leaves them unnormalized, `dq_finish`
-    normalizing them), so a weight below fp32's range beside a large product keeps its share; zero
-    where unseen. The anchor key's own `dP - c` is 0 by definition where `at_anchor` names it, whatever
-    its product's rounding."""
+def grad_scores(weights: jax.Array, products: jax.Array, anchor: jax.Array, delta: jax.Array,
+                seen: jax.Array, at_anchor: jax.Array | None = None) -> jax.Array:
+    """The score cotangents `p (dP - D)` of a tile, taken as `p ((dP - c) - (D - c))` about each query's
+    anchor c (`off_anchor_delta`), zero where unseen; the anchor key's own `dP - c` is 0 by
+    definition where `at_anchor` names it, whatever its product's rounding."""
     relative = products - anchor[:, None]
     if at_anchor is not None:
         relative = jnp.where(at_anchor, 0.0, relative)
-    raw = exponentials * (relative - delta[:, None])
-    if inverse_total is not None:
-        raw = raw * inverse_total[:, None]
-    return jnp.where(seen, raw, 0.0)
+    return jnp.where(seen, weights * (relative - delta[:, None]), 0.0)
 
 
 def refinement(residual: jax.Array, mass: jax.Array, peak0: jax.Array, shares: tuple[jax.Array, jax.Array],
