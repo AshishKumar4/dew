@@ -166,13 +166,10 @@ class Interpreter:
         """A move applied to each operand's bound, exactness and certification, its index operands (an
         integer exact and certified) moved as they are."""
         def moved(field, dtype):
-            arrays = []
-            for operand in operands:
-                if np.issubdtype(operand.value.dtype, np.inexact):
-                    arrays.append(jnp.asarray(getattr(operand, field), dtype))
-                else:
-                    arrays.append(jnp.asarray(operand.value))
             with jax.enable_x64(new_val=True):
+                arrays = [jnp.asarray(getattr(operand, field), dtype)
+                          if np.issubdtype(operand.value.dtype, np.inexact) else jnp.asarray(operand.value)
+                          for operand in operands]
                 return np.asarray(eqn.primitive.bind(*arrays, **eqn.params))
 
         indices_certified = all(operand.certified.all() and operand.exact.all() for operand in operands
@@ -216,9 +213,10 @@ class Interpreter:
         if exact_from is not None:
             representable = exact_from
         u = fmt.unit_roundoff / (1 - fmt.unit_roundoff)
-        rounding = _up(u * np.maximum(np.abs(value), np.abs(hi)) + _least_normal(fmt))
+        with np.errstate(invalid="ignore", over="ignore"):
+            rounding = _up(u * np.maximum(np.abs(value), np.abs(hi)) + _least_normal(fmt))
+            apart = _up(np.abs(value - hi) + np.abs(lo))
         local = np.where(representable, 0.0, rounding)
-        apart = _up(np.abs(value - hi) + np.abs(lo))
         operands_exact = np.logical_and.reduce([np.broadcast_to(o.exact, value.shape) for o in operands])
         certified = (np.logical_and.reduce([np.broadcast_to(o.certified, value.shape) for o in operands])
                      & np.isfinite(value) & np.isfinite(transfer) & ((apart <= local) | representable))
@@ -351,7 +349,14 @@ class Interpreter:
             # An integer wider than the format's significand is checked back through it.
             representable = native.astype(source) == operand.value
             return [self._rounded(fmt, native, hi, lo, operand.error, [operand], exact_from=representable)]
-        return [self._rounded(fmt, native, hi, lo, operand.error, [operand])]
+        finite = np.isfinite(hi)
+        result = self._rounded(fmt, native, np.where(finite, hi, 0.0), lo, operand.error, [operand])
+        # An exact infinity casts to itself.
+        held = ~finite & np.isinf(hi) & operand.exact & operand.certified & (native.astype(np.float64) == hi)
+        result.certified = np.where(finite, result.certified, held)
+        result.exact = np.where(finite, result.exact, held)
+        result.error = np.where(finite, result.error, 0.0)
+        return [result]
 
     # Comparisons: decided where the operands' bounds part, or both are exact.
 
