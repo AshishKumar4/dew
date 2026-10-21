@@ -636,8 +636,9 @@ class PretrainedDecoder(Pretrained):
         caller replaced; the source's EOS and pad ids fill the ones it leaves None,
         and `num_return_sequences` still comes from the source.
 
-        The task shares the bundle's weights, and `dew.pipeline` packs its decoder
-        when it places them. An adapted model whose factors are not merged keeps its
+        The task shares the bundle's weights and packs its decoder's projections inside
+        each generation's compiled call; `dew.pipeline`'s task packs them once, after
+        placing them. An adapted model whose factors are not merged keeps its
         projection paths and is not packed.
         """
         rows = return_sequences(self.config, self.generation_config)

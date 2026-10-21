@@ -763,9 +763,11 @@ def test_a_server_on_a_mesh_draws_what_each_request_draws_alone(mesh, options):
     over the tensor axis. Every row is still the lone single-device call, a
     chunked prompt included, and the repeated prompt starts from the page the
     first one published in its group: over weights drawn from each declared
-    seed, its tokens, lengths and terminations are the lone call's, and its
-    log-likelihoods are as exact as the lone call's (check 1), truth the
-    float64 model's on the lone call's tokens."""
+    seed, its tokens, lengths and terminations are the lone call's, its
+    behaviour log-likelihoods (the greedy policy's, exactly zero) and the
+    likelihood arrays' fill past each row's length are the lone call's bit for
+    bit, and its log-likelihoods are as exact as the lone call's (check 1),
+    truth the float64 model's on the lone call's tokens."""
     layout = Layout(min_shard=1, tolerance=1.0)
     rows = [*zip(PROMPTS, BUDGETS, strict=True), (PROMPTS[2], BUDGETS[2])]
 
@@ -795,8 +797,10 @@ def test_a_server_on_a_mesh_draws_what_each_request_draws_alone(mesh, options):
     def served(seed):
         _, alone, rows_served = drawn(int(seed))
         for row, lone in zip(rows_served, alone, strict=True):
-            for field in ("tokens", "lengths", "terminated"):
+            for field in ("tokens", "lengths", "terminated", "behavior_log_probs"):
                 np.testing.assert_array_equal(getattr(row, field), getattr(lone, field))
+            np.testing.assert_array_equal(row.raw_log_probs[0, row.lengths[0]:],
+                                          lone.raw_log_probs[0, lone.lengths[0]:])
         return likelihoods(rows_served)
 
     def truth(seed):
