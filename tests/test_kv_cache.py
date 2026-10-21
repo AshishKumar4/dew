@@ -409,7 +409,7 @@ def test_a_softcapped_model_decodes_a_paged_cache_on_par_with_its_compact_cache(
     """A bf16 decoder with a logit softcap decodes a paged cache through the kernel the paged selector
     chooses for a GPU (Dew's paged Triton kernel, where the step used to raise), its logits step by
     step on par with the compact cache's (check 1), the compact cache's reference decode in float64 the
-    truth."""
+    truth. Its trace reports the route it takes."""
     def model(layout, dtype, implementation="auto"):
         # Heads 16 wide, which the paged kernel's geometry takes.
         return CausalTransformer(**{**TINY_DECODER, "vocab_size": 64, "head_dim": 16, "dtype": dtype,
@@ -434,6 +434,12 @@ def test_a_softcapped_model_decodes_a_paged_cache_on_par_with_its_compact_cache(
         tokens = jax.random.randint(jax.random.key(seed), (2, 8), 0, 64)
         return model(KVCache(), "bfloat16").init(jax.random.key(seed + 1000), tokens), tokens
 
-    assert_as_exact(decoded(KVCache(page_size=16), "bfloat16"), decoded(KVCache(), "bfloat16"), draw,
-                    "softcapped paged decode", seeds=SOFTCAP_PAGED_SEEDS,
-                    truth_fn=decoded(KVCache(), "float64", "reference"))
+    from dew.nn.kernels.generation import routes
+
+    paged = decoded(KVCache(page_size=16), "bfloat16")
+    with routes() as found:
+        jax.make_jaxpr(paged)(*draw(0))
+    taken = [(route.kernel, route.ran) for route in found if route.choice == "paged_decode"]
+    assert taken and set(taken) == {("triton", "triton")}
+    assert_as_exact(paged, decoded(KVCache(), "bfloat16"), draw, "softcapped paged decode",
+                    seeds=SOFTCAP_PAGED_SEEDS, truth_fn=decoded(KVCache(), "float64", "reference"))
