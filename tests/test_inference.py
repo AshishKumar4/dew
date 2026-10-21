@@ -407,7 +407,9 @@ def test_a_generation_reads_its_models_groups_once_for_every_call(tmp_path):
     """A generate call finds the groups a borrowed tree packs in the call (`pending`) without
     binding the model again: the groups a model declares are a function of the model and its
     tree's shapes, which binding a deep decoder to read took tens of milliseconds of every call.
-    A decoder that counts its declarations is asked once over every call on one tree."""
+    A decoder that counts its declarations is asked once over every call on one tree, draws what
+    a task over its tree packed beforehand draws, and is asked again for a tree of another shape."""
+    from dew.inference.projections import inference_projections, projection_groups
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.sampling import Sampling
 
@@ -426,9 +428,18 @@ def test_a_generation_reads_its_models_groups_once_for_every_call(tmp_path):
                            if field.init and field.name not in ("parent", "name")})
     task = TextGeneration(counting, state.variables, RunProcessor(ByteTokenizer()))
     greedy = Sampling(temperature=0, eos_token_ids=255)
-    for key in range(3):
-        task("the ", 2, key=key, sampling=greedy)
+    drawn = [task("the ", 2, key=key, sampling=greedy).host() for key in range(3)]
     assert len(asked) == 1
+    # The kept plan is the plan: the draws are a prepacked task's, bit for bit.
+    prepacked = TextGeneration(model, inference_projections(model, state.variables), task.processor)
+    for key, generation in enumerate(drawn):
+        expected = prepacked("the ", 2, key=key, sampling=greedy).host()
+        np.testing.assert_array_equal(generation.raw_log_probs, expected.raw_log_probs)
+    # A tree of another shape is asked again: the plan is kept per model and tree shape.
+    widened = jax.tree.map(lambda leaf: leaf, dict(state.variables))
+    widened["params"] = {**widened["params"], "spare": {"kernel": jnp.zeros((2, 2))}}
+    projection_groups(counting, widened)
+    assert len(asked) == 2
 
 
 @pytest.mark.mesh(devices=3)

@@ -579,7 +579,11 @@ class Serving(Protocol):
     """What a server reads off a decoder. `inference_projection_groups` names
     the packed groups `variables` hold, packed or as every member (the packer
     checks the members concatenate; a model that does not decode
-    autoregressively names none). `cache_rebuild_position` is where cached
+    autoregressively names none). It reads which parameters the tree holds and
+    their shapes, never their values or placement, and the model is an unbound,
+    hashable module, so its answer is kept per model and tree shape
+    (`dew.inference.projections`) and is called over `jax.ShapeDtypeStruct`
+    leaves. `cache_rebuild_position` is where cached
     keys go stale and the prefix is recomputed (LongRoPE's long factors,
     Phi-3), or None. `mixed_admission_refusal` says why its layers would not
     run a mixed call (`dew.nn.inputs.Admitted`) as separate decode and
