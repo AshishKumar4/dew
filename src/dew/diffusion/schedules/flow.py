@@ -1,6 +1,7 @@
 """Rectified flow schedules: the linear path and its resolution shift."""
 
 import math
+from functools import partial
 from typing import Literal, get_args
 
 import jax
@@ -19,6 +20,20 @@ def token_mu(tokens: int, base_tokens: int, max_tokens: int, base_shift: float, 
     for operation, so its double is the pipelines' own."""
     slope = (max_shift - base_shift) / (max_tokens - base_tokens)
     return tokens * slope + (base_shift - slope * base_tokens)
+
+
+@partial(jax.custom_jvp, nondiff_argnums=(0,))
+def time_shift(shift: float, t: jax.Array) -> jax.Array:
+    """shift / (shift + 1 / t - 1), Diffusers' `FlowMatchEulerDiscreteScheduler.time_shift` operation for
+    operation. Its derivative is taken in the regular form shift / (shift t + 1 - t)^2: the reciprocal's
+    would multiply zero by infinity at t = 0, where the map and its derivative are finite."""
+    return shift / (shift + (1 / t - 1))
+
+
+@time_shift.defjvp
+def _time_shift_jvp(shift, primals, tangents):
+    (t,), (dt,) = primals, tangents
+    return time_shift(shift, t), shift / (shift * t + (1 - t)) ** 2 * dt
 
 
 class RectifiedFlow:
@@ -77,7 +92,7 @@ class FlowMatchingScheduler(ContinuousNoiseScheduler, RectifiedFlow):
         """`t` at the shift, operation for operation as Diffusers maps it: a dynamic shift as
         `FlowMatchEulerDiscreteScheduler.time_shift`, a static one as its static sigmas."""
         if self.dynamic:
-            return self.shift / (self.shift + (1 / t - 1))
+            return time_shift(self.shift, t)
         return self.shift * t / (1 + (self.shift - 1) * t)
 
     def sample_t(self, key, n):
