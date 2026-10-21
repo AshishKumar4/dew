@@ -60,7 +60,7 @@ def media(tmp_path_factory):
 
 
 def _records(chain):
-    return list(chain.repeat(1).iterate())
+    return list(chain.repeat(1))
 
 
 def _frame_indices(frames):

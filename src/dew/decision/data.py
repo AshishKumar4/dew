@@ -178,6 +178,9 @@ class _DecisionSource:
         consumed._facts.update(self._facts)
         return consumed
 
+    def label(self) -> str:
+        return self.source.label()
+
     def describe(self) -> str:
         return self.source.describe()
 

@@ -542,9 +542,9 @@ def test_a_prompt_recipe_reads_the_generation_its_memory_read_published():
     from dew.config.data import PromptData, loader
     from dew.data.compile import publish
 
-    # Two of the prompts are longer than 8 bytes, which the recipe drops.
+    # Two of the prompts are longer than 8 bytes, which the recipe drops when asked to.
     recipe = PromptData(tuple({"prompt": "hi " * (1 + index % 3)} for index in range(6)), "byte",
-                        max_prompt_len=8)
+                        max_prompt_len=8, long="drop")
     train, _, _ = recipe.pipelines()
     generation = publish(train, _cache(), read="memory")
     data = loader(recipe, batch=2, cache=generation, read="memory")

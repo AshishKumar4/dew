@@ -37,6 +37,15 @@ Each command installs that JAX build and the accelerator build of jaxlib 0.11.2 
 | NVIDIA GPU, CUDA 12 | `uv pip install "dewml[cuda12]" --extra-index-url https://pypi.dewml.dev/simple` | `pip install "dewml[cuda12]" --extra-index-url https://pypi.dewml.dev/simple` |
 | Google TPU VM | `uv pip install "dewml[tpu]" --extra-index-url https://pypi.dewml.dev/simple` | `pip install "dewml[tpu]" --extra-index-url https://pypi.dewml.dev/simple` |
 
+<!-- BEGIN pip (site/scripts/gen_install.py) -->
+Use pip 26.2.2 or newer and uv 0.13.4 or newer: older ones trust the roots of eMudhra's compromised certificate authorities (October 2026). Update pip from its wheel by hash, so the update holds whatever the older pip trusts, and uv through the system's certificates once they are updated:
+
+```bash
+python -m pip install "pip @ https://files.pythonhosted.org/packages/3f/06/3e4420302363fbb71be3c7f35ce042f54bfca330e3e66b3a2e3c4cca579f/pip-26.2.2-py3-none-any.whl#sha256=fd7f4dfa8190e014013b9f08f3e973f4e4c26ffd179a204895533a7254813a70"
+UV_SYSTEM_CERTS=true uv self update
+```
+<!-- END pip -->
+
 Without the index the install stops before it installs anything, at resolving jax, since PyPI has no JAX build Dew accepts. uv says:
 
 ```
@@ -131,7 +140,6 @@ The plain install includes Transformers, the Hugging Face Hub client and the ima
 | `av` | Video readers (moviepy, with ffmpeg) |
 | `vision` | Hugging Face image processors, run with torchvision on the host |
 | `metrics` | SciPy and downloads for image metrics |
-| `plots` | Matplotlib charts in local reports |
 | `wandb`, `mlflow`, `tensorboard` | Experiment trackers |
 | `inference-clients` | The Ollama and OpenAI Python clients, including vLLM-compatible endpoints |
 | `serve` | Starlette and uvicorn, for serving a decision model in Jev's wire format (`examples/serve_decisions.py`) |

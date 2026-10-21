@@ -40,7 +40,7 @@ import jax.numpy as jnp
 import tokamax
 import tyro
 
-from dew.nn.kernels.tuning import samples
+from dew.telemetry.benchmark import samples
 
 IMPLEMENTATIONS = ('reference', 'xla', 'cudnn', 'flash', 'triton', 'jax_cudnn')
 # B chosen so batch * sequence * heads is constant across the sequence sweep:
