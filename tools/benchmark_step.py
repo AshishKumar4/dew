@@ -70,8 +70,6 @@ from dew.training.runtime import prepare_process
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from benchmark_cases import (
-    TEXT_FEATURES as TEXT_FEATURES,
-    TEXT_TOKENS as TEXT_TOKENS,
     Case,
     canvas_split,
     cpu_smoke_cases,
@@ -80,19 +78,7 @@ from benchmark_cases import (
     mesh_label,
     small_cases,
 )
-from benchmark_models import (
-    Batch as Batch,
-    build_objective as build_objective,
-    build_trainer,
-    compiled_step,
-    decoder_objective as decoder_objective,
-    global_batch as global_batch,
-    image_tokens as image_tokens,
-    media_row as media_row,
-    media_values as media_values,
-    timed_steps,
-    trainer_mesh,
-)
+from benchmark_models import build_trainer, compiled_step, global_batch, timed_steps, trainer_mesh
 from trace_window import communication_totals, device_events, kernel_category, kernel_totals, window_split
 
 Row = dict[str, object]
