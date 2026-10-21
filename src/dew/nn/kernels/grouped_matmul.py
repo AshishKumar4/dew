@@ -425,7 +425,8 @@ class Gmm(_Triton):
         (rows, depth), groups = tokens.shape, kernel.shape[0]
         width = kernel.shape[1] if ba.arguments['trans_rhs'] else kernel.shape[2]
         size = jnp.dtype(tokens.dtype).itemsize
-        chunks = _row_tiles(rows, groups, CHUNK_M)
+        # A dense call's program is one row tile (`triton_dense`), a ragged one's a chunk.
+        chunks = _row_tiles(rows, groups, config.block_m if ba.arguments.get('dense') else CHUNK_M)
         columns = math.ceil(width / config.block_n)
         tiles = _row_tiles(rows, groups, config.block_m)
         flops = 2 * tiles * config.block_m * depth * width
@@ -457,9 +458,19 @@ class Gmm(_Triton):
     def _fwd(self, tokens: jax.Array, kernel: jax.Array, sizes: jax.Array,
              prologue_operands: tuple = (), epilogue_operands: tuple = (), *, out_dtype: str,
              trans_rhs: bool, interpret: bool, hooks: Hooks = NO_HOOKS, exact_sums: bool = False,
-             config: Tile, return_residuals: bool = False):
+             dense: bool = False, config: Tile, return_residuals: bool = False):
         # Imported at first use: the kernels need jax's Pallas Triton backend,
         # which jax 0.11.2 deprecates, and importing a model must not load it.
+        if dense:
+            # One group of every row: the plain tiled kernel, which finds no group and masks no row.
+            from .templates.gemm import triton_dense
+            options = hooks.kernel_options()
+            outs = triton_dense.gmm(tokens, kernel[0], tile=config, transpose_rhs=trans_rhs,
+                                    out_dtypes=tuple(jnp.dtype(d) for d in (options.pop('out_dtypes')
+                                                                            or (out_dtype,))),
+                                    interpret=interpret, prologue_operands=prologue_operands,
+                                    epilogue_operands=epilogue_operands, exact_sums=exact_sums, **options)
+            return (outs if hooks.out_dtypes else outs[0]), None
         from . import ragged_dot
         return ragged_dot.gmm(tokens, kernel, sizes, block_m=config.block_m, block_k=config.block_k,
                               block_n=config.block_n, num_warps=config.warps, num_stages=config.stages,
@@ -522,9 +533,16 @@ class Tgmm(_Triton):
             program_exponentials=exponentials, mode=_mode(tokens.dtype), steps=steps, stages=config.stages,
             resident=self._resident(ba, config, target)), target)
 
-    def _fwd(self, tokens: jax.Array, cotangent: jax.Array, sizes: jax.Array,
+def _fwd(self, tokens: jax.Array, cotangent: jax.Array, sizes: jax.Array,
              prologue_operands: tuple = (), *, out_dtype: str, interpret: bool, hooks: Hooks = NO_HOOKS,
-             exact_sums: bool = False, config: Tile, return_residuals: bool = False):
+             exact_sums: bool = False, dense: bool = False, config: Tile, return_residuals: bool = False):
+        if dense:
+            # One group of every row: the plain tiled kernel (`Gmm._fwd`).
+            from .templates.gemm import triton_dense
+            return triton_dense.tgmm(tokens, cotangent, tile=config, out_dtype=jnp.dtype(out_dtype),
+                                     interpret=interpret, prologue=hooks.before(),
+                                     prologue_operands=prologue_operands, prologue_axes=hooks.prologue_axes,
+                                     exact_sums=exact_sums)[None], None
         from . import ragged_dot
         return ragged_dot.tgmm(tokens, cotangent, sizes, block_m=config.block_m, block_k=config.block_k,
                                block_n=config.block_n, num_warps=config.warps, num_stages=config.stages,
@@ -672,8 +690,9 @@ class MosaicGmm(_Mosaic):
     def _fwd(self, tokens: jax.Array, kernel: jax.Array, sizes: jax.Array,
              prologue_operands: tuple = (), epilogue_operands: tuple = (), *, out_dtype: str,
              trans_rhs: bool, interpret: bool, hooks: Hooks = NO_HOOKS, exact_sums: bool = False,
-             config: mosaic_gpu.Tiles, return_residuals: bool = False):
-        del exact_sums  # never set: the launch is not eligible for it
+             dense: bool = False, config: mosaic_gpu.Tiles, return_residuals: bool = False):
+        # Never set: the launch is not eligible for exact sums; a dense call is one group, as any.
+        del exact_sums, dense
         return mosaic_gpu.gmm(tokens, kernel, sizes, tiles=config, transpose_rhs=trans_rhs,
                               out_dtype=out_dtype, multiprocessors=self._multiprocessors(interpret),
                               interpret=INTERPRETED if interpret else False,
@@ -736,7 +755,9 @@ class MosaicTgmm(_Mosaic):
 
     def _fwd(self, tokens: jax.Array, cotangent: jax.Array, sizes: jax.Array,
              prologue_operands: tuple = (), *, out_dtype: str, interpret: bool, hooks: Hooks = NO_HOOKS,
-             exact_sums: bool = False, config: mosaic_gpu.Tiles, return_residuals: bool = False):
+             exact_sums: bool = False, dense: bool = False, config: mosaic_gpu.Tiles,
+             return_residuals: bool = False):
+        del dense  # a dense call is one group, as any
         return mosaic_gpu.tgmm(tokens, cotangent, sizes, tiles=config, out_dtype=out_dtype,
                                multiprocessors=self._multiprocessors(interpret),
                                interpret=INTERPRETED if interpret else False, prologue=hooks.before(),
@@ -788,26 +809,28 @@ _TGMMS = (MosaicTgmm(), Tgmm())
 
 
 def launched_gmm(tokens, kernel, sizes, prologue_operands: tuple = (), epilogue_operands: tuple = (), *,
-                 out_dtype, trans_rhs: bool, hooks: Hooks = NO_HOOKS, interpret: bool, exact: bool = False):
+                 out_dtype, trans_rhs: bool, hooks: Hooks = NO_HOOKS, interpret: bool, exact: bool = False,
+                 dense: bool = False):
     """Each group's rows of `tokens` times its matrix of `kernel`, rounded to `tokens`'s dtype, through
     the launch that runs it (`_launch`), with the template's hooks (`templates.gemm.template.gemm`).
-    `exact` (a precision above the default) gives an fp32 output IEEE sums (`ragged_dot_refusal`)."""
+    `exact` (a precision above the default) gives an fp32 output IEEE sums (`ragged_dot_refusal`);
+    `dense`, one group of every row (a dense product), the plain tiled kernel where Triton runs it."""
     arguments = (tokens, kernel.astype(tokens.dtype), sizes, tuple(prologue_operands),
                  tuple(epilogue_operands))
     exact_sums = _exact_sums(exact=exact, hooks=hooks, out_dtype=out_dtype)
     options = {'out_dtype': jnp.dtype(out_dtype).name, 'trans_rhs': trans_rhs, 'hooks': hooks,
-               'interpret': interpret, 'exact_sums': exact_sums}
+               'interpret': interpret, 'exact_sums': exact_sums, 'dense': dense}
     return _launch(_GMMS_TRANSPOSED if trans_rhs else _GMMS, arguments, options)(*arguments, **options)
 
 
 def launched_tgmm(tokens, cotangent, sizes, prologue_operands: tuple = (), *, out_dtype,
-                  hooks: Hooks = NO_HOOKS, interpret: bool, exact: bool = False):
+                  hooks: Hooks = NO_HOOKS, interpret: bool, exact: bool = False, dense: bool = False):
     """Each group's rows of `tokens` transposed times its rows of `cotangent`, rounded to `tokens`'s
     dtype, through the launch that runs it, with the template's prologue
-    (`templates.gemm.template.gemm_t`)."""
+    (`templates.gemm.template.gemm_t`); `dense` as `launched_gmm`'s."""
     arguments = (tokens, cotangent.astype(tokens.dtype), sizes, tuple(prologue_operands))
     options = {'out_dtype': jnp.dtype(out_dtype).name, 'hooks': hooks, 'interpret': interpret,
-               'exact_sums': _exact_sums(exact=exact, hooks=hooks, out_dtype=out_dtype)}
+               'exact_sums': _exact_sums(exact=exact, hooks=hooks, out_dtype=out_dtype), 'dense': dense}
     return _launch(_TGMMS, arguments, options)(*arguments, **options)
 
 
