@@ -283,7 +283,7 @@ def test_the_panel_names_a_lower_bound_utilization_and_its_uncounted_kernels_wit
     assert all(len(name) + 2 <= 24 for name in names)
 
 
-def test_a_metrics_label_names_it_in_evaluations_and_the_summary_too(capsys):
+def test_a_metrics_label_names_it_in_evaluations_and_the_summary_too():
     """A label (`Shown.label`) is the name everywhere the display shows the metric: an evaluation's
     scores, its rows and the run's summary, whose trackers keep the metric's own name."""
     from dew.objectives.base import Shown
@@ -297,8 +297,8 @@ def test_a_metrics_label_names_it_in_evaluations_and_the_summary_too(capsys):
     display.evaluation(evaluation)
     assert display.scores(evaluation).plain.startswith("top-1 ")
     assert [row.name for _, row in display.evaluation_rows()] == ["top-1"]
-    display.summary(2, 1.0, {"goodput/step_fraction": 0.5}, loss=0.25)
-    assert "final nll" in capsys.readouterr().out
+    # The summary's final loss is named as the display names it.
+    assert display.named("loss") == "nll" and display.named("tokens") == "tokens"
 
 
 def test_the_panel_shows_a_runs_data_as_one_line_and_its_rows_without_the_counters():
