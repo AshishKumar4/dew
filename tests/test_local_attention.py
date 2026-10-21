@@ -193,7 +193,8 @@ def test_gradients_match_the_dense_masked_kernel(span):
 
     def draw(seed):
         query, key, value = inputs(length, seed=seed)
-        return query, key, value, jax.random.normal(jax.random.fold_in(jax.random.key(3), seed), query.shape)
+        readout = jax.random.normal(jax.random.fold_in(jax.random.key(0xC07), seed), query.shape)
+        return query, key, value, readout
 
     def gradients(fn):
         def run(q, k, v, cotangent):
@@ -301,15 +302,10 @@ def test_a_chunked_kind_decodes_what_its_whole_sequence_pass_computes(origin, sh
     model = chunked_model(5).with_kv_cache(layout)
     shape = (2, 13)
     positions = jnp.arange(13) + origin if shared else jnp.broadcast_to(jnp.arange(13) + origin, shape)
-    init = jax.jit(model.init)
     made = jax.jit(lambda variables: model.apply(variables, 2, method=CausalTransformer.init_cache,
                                                  mutable=["cache"])[1]["cache"])
     step = jax.jit(lambda variables, cache, tokens, places: model.apply(
         {**variables, "cache": cache}, tokens, positions=places, decode=True, mutable=["cache"]))
-
-    def draw(seed):
-        tokens = jax.random.randint(jax.random.fold_in(jax.random.key(1), seed), shape, 0, 64)
-        return init(jax.random.fold_in(jax.random.key(0), seed), tokens), tokens
 
     def decoded(variables, tokens):
         logits, mutated = step(variables, made(variables), tokens[:, :4], positions[..., :4])
@@ -323,8 +319,9 @@ def test_a_chunked_kind_decodes_what_its_whole_sequence_pass_computes(origin, sh
     def whole(model):
         return jax.jit(lambda variables, tokens: model.apply(variables, tokens, positions=positions)[:, 3:])
 
-    assert_as_exact(decoded, whole(model), draw, f"{layout} {shared} {origin} chunked decode",
-                    seeds=SEEDS['decode'], truth_fn=whole(model.clone(dtype=jnp.float64)))
+    assert_as_exact(decoded, whole(model), model_draw(model, shape),
+                    f"{layout} {shared} {origin} chunked decode", seeds=SEEDS['decode'],
+                    truth_fn=whole(model.clone(dtype=jnp.float64)))
 
 
 def test_a_chunked_kind_bands_a_row_with_padding_among_its_tokens_by_its_tokens():
