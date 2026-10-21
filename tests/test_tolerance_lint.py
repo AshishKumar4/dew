@@ -373,10 +373,11 @@ def test_a_merge_bringing_a_count_its_other_parent_raised_by_rereading_is_no_loo
 
 
 def _merged(repo, branch, into, inventory, message, files=None):
-    """`branch` merged into `into` without committing, then committed with `inventory` and `files`."""
+    """`branch` merged into `into` without committing, never fast-forward, then committed with
+    `inventory` and `files`."""
     subprocess.run(["git", "checkout", "-q", into], cwd=repo, check=True)
-    subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "merge", "-q", "--no-commit", branch],
-                   cwd=repo, check=False, capture_output=True)
+    subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "merge", "-q", "--no-ff", "--no-commit",
+                    branch], cwd=repo, check=False, capture_output=True)
     _commit(repo, inventory, message, files)
 
 
