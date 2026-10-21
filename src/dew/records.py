@@ -20,6 +20,7 @@ import functools
 import math
 import re
 from collections.abc import Callable, Mapping
+from numbers import Real
 
 type JSON = None | bool | int | float | str | list['JSON'] | dict[str, 'JSON']
 
@@ -65,6 +66,15 @@ def integer(value: object, key: str) -> int:
     return value
 
 
+def finite(value: object, what: str) -> float:
+    """One finite real as a float, NumPy's scalars among them: a reward, a likelihood, a scale.
+    A bool is a flag, not a number; it, every non-number, an infinity and a nan are refused with
+    ValueError naming `what` and the value."""
+    if isinstance(value, bool) or not isinstance(value, Real) or not math.isfinite(value):
+        raise ValueError(f"{what} is a finite number, got {value!r}")
+    return float(value)
+
+
 def number(value: object, key: str) -> float:
     """One real field: an epsilon, a rate, a frequency. An integer is one.
 
@@ -73,11 +83,11 @@ def number(value: object, key: str) -> float:
     the one spelling of an infinity a config carries, and the only one read
     here; a bare non-finite number reached this field from somewhere else.
     """
-    if isinstance(value, Mapping) and "__float__" in value:
+    if isinstance(value, Mapping):
+        if "__float__" not in value:
+            raise ValueError(f"{key}={value!r}: this field is a finite number")
         return float(str(value["__float__"]))
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
-        raise ValueError(f"{key}={value!r}: this field is a finite number")
-    return float(value)
+    return finite(value, key)
 
 
 def boolean(value: object, key: str) -> bool:

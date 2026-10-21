@@ -37,12 +37,10 @@ them. A `TRUNCATED` session follows the `truncation` policy:
 from __future__ import annotations
 
 import itertools
-import math
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Future
 from dataclasses import dataclass, field
 from enum import Enum
-from numbers import Real
 from types import MappingProxyType
 from typing import Protocol
 
@@ -53,7 +51,7 @@ from jax.typing import ArrayLike
 
 from dew.data.tokens import first_fit
 from dew.nn.inputs import local_rows
-from dew.records import json_value, record as section
+from dew.records import finite, json_value, record as section
 from dew.rl import group_advantage, rloo_advantage
 
 IDS_KEY = "input_ids"
@@ -142,18 +140,6 @@ class Status(Enum):
         return self in (Status.COMPLETED, Status.AGENT_ERROR)
 
 
-def _finite(message: str, value: object) -> float:
-    """Parse a boundary number: any finite real, numpy's included, as a float.
-
-    Records arrive from gateways, JSON and numpy arrays, so anything may land
-    here. A bool is a flag, not a score; it and every non-number, infinity
-    or nan raise a ValueError carrying `message`.
-    """
-    if isinstance(value, bool) or not isinstance(value, Real) or not math.isfinite(value):
-        raise ValueError(f"{message}, got {value!r}")
-    return float(value)
-
-
 def _token_ids(name: str, ids: object) -> None:
     if not isinstance(ids, tuple) or any(type(token) is not int or token < 0 for token in ids):
         raise ValueError(f"{name} must be a tuple of nonnegative integer token ids")
@@ -237,11 +223,10 @@ class Call:
                 or len(self.behavior_log_probs) != len(self.sampled_ids)):
             raise ValueError("a call needs one behavior log-probability per sampled id")
         object.__setattr__(self, "behavior_log_probs", tuple(
-            _finite("behavior log-probabilities must be finite numbers", value)
+            finite(value, "a behavior log-probability")
             for value in self.behavior_log_probs))
         if self.reward is not None:
-            object.__setattr__(self, "reward", _finite("a call's reward is a finite number or None",
-                                                       self.reward))
+            object.__setattr__(self, "reward", finite(self.reward, "a call's reward"))
         if self.finish_reason not in FINISH_REASONS:
             raise ValueError(f"finish_reason must be one of {sorted(FINISH_REASONS)}, "
                              f"got {self.finish_reason!r}")
@@ -303,8 +288,7 @@ class Session:
         if not isinstance(self.calls, tuple) or not all(isinstance(call, Call) for call in self.calls):
             raise TypeError("session calls must be a tuple of Call records")
         if self.reward is not None:
-            object.__setattr__(self, "reward", _finite("a session reward is a finite number or None",
-                                                       self.reward))
+            object.__setattr__(self, "reward", finite(self.reward, "a session reward"))
         if self.status.trainable and self.reward is None:
             raise ValueError(f"a {self.status.name} session is scored, so it needs a reward")
         for name in ("sample", "attempt"):
