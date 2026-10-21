@@ -3,6 +3,7 @@ bytes, a source autoencoder's vector-Jacobian products and the audio features
 a checkpoint's own extractor makes; and a Hub cache an offline process
 resolves a repo from."""
 
+import functools
 import json
 import shutil
 import tarfile
@@ -123,6 +124,39 @@ def assert_transformer_exports(source: Path, name: str, layouts, params) -> None
 
     assert_layout_tensors(layouts, {"params": params}, component_tensors(source / name, "transformer"),
                           "transformer/")
+
+
+def channels_last(array) -> np.ndarray:
+    """A channels-first source array `[B, C, ...]` channels last `[B, ..., C]`."""
+    return np.moveaxis(np.asarray(array), 1, -1)
+
+
+def posterior_of(moments) -> tuple[jax.Array, jax.Array]:
+    """The posterior's mean and standard deviation, split from an encoder's stacked moments as
+    Diffusers' `DiagonalGaussianDistribution` splits them."""
+    mean, log_variance = jnp.split(moments, 2, axis=-1)
+    return mean, jnp.exp(0.5 * jnp.clip(log_variance, -30.0, 20.0))
+
+
+def assert_coder_vjps(loaded, reference, operand: str, posterior, bound: float) -> None:
+    """A source KL autoencoder's recorded encode and decode vector-Jacobian products
+    (`assert_autoencoder_vjp`) for its `loaded` (autoencoder, parameters, layouts, config):
+    `posterior(model, params, x)`'s mean and standard deviation against the source's `probe_mean`
+    and `probe_std` from its `operand` (`image`, `video`), and the decode against its `probe` from
+    its `latent`, each array channels last."""
+    autoencoder, params, layouts, _ = loaded
+    model = autoencoder.model
+
+    def decode(params, latent):
+        return model.apply({"params": params}, latent, method=model.decode)
+
+    assert_autoencoder_vjp(
+        "encode", functools.partial(posterior, model), params, channels_last(reference[operand]),
+        [channels_last(reference[f"probe_{name}"]) for name in ("mean", "std")], layouts, reference,
+        channels_last(reference[f"encode.grad_{operand}"]), bound)
+    assert_autoencoder_vjp(
+        "decode", decode, params, channels_last(reference["latent"]), [channels_last(reference["probe"])],
+        layouts, reference, channels_last(reference["decode.grad_latent"]), bound)
 
 
 def scaled_gap(actual, expected) -> float:

@@ -24,10 +24,12 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from interop_support import (
-    assert_autoencoder_vjp,
+    assert_coder_vjps,
     assert_layout_tensors,
+    channels_last,
     extract_fixture,
     fixture_arrays,
+    posterior_of,
     scaled_gap,
 )
 from reference_error import assert_as_exact_as_the_reference
@@ -55,13 +57,8 @@ def loaded(source):
     return load_wan_vae(source)
 
 
-def channels_last(array):
-    return np.asarray(array).transpose(0, 2, 3, 4, 1)
-
-
 def posterior(model, params, video):
-    mean, log_variance = jnp.split(model.apply({"params": params}, video, method=model.moments), 2, axis=-1)
-    return mean, jnp.exp(0.5 * jnp.clip(log_variance, -30.0, 20.0))
+    return posterior_of(model.apply({"params": params}, video, method=model.moments))
 
 
 def test_a_configs_training_dropout_loads_the_same_autoencoder(source, loaded, tmp_path):
@@ -225,22 +222,8 @@ def test_the_published_vae_matches_the_source():
     assert max(gaps.values()) < FORWARD, gaps
 
 
-def test_encoder_gradients_match_the_source(loaded, reference):
-    autoencoder, params, layouts, _ = loaded
-    assert_autoencoder_vjp(
-        "encode", lambda params, video: posterior(autoencoder.model, params, video), params,
-        channels_last(reference["video"]),
-        [channels_last(reference[f"probe_{name}"]) for name in ("mean", "std")], layouts, reference,
-        channels_last(reference["encode.grad_video"]), GRADIENT)
-
-
-def test_decoder_gradients_match_the_source(loaded, reference):
-    autoencoder, params, layouts, _ = loaded
-    model = autoencoder.model
-    assert_autoencoder_vjp(
-        "decode", lambda params, latent: model.apply({"params": params}, latent, method=model.decode), params,
-        channels_last(reference["latent"]), [channels_last(reference["probe"])], layouts, reference,
-        channels_last(reference["decode.grad_latent"]), GRADIENT)
+def test_the_coder_gradients_match_the_source(loaded, reference):
+    assert_coder_vjps(loaded, reference, "video", posterior, GRADIENT)
 
 
 def test_a_bfloat16_walk_matches_the_sources_bfloat16_walk(source):
