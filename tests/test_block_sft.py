@@ -62,13 +62,15 @@ def reference_variables(loaded, name):
     return objective(loaded, variables=values).init(jax.random.key(0))
 
 
-def float64_update(directory, build, variables, batch, step, rate):
+def float64_update(model, build, variables, batch, step, rate):
     """The SGD update `rate` of `variables`' params under `step`, in float64: `build`'s objective over
-    the model loaded from `directory` in float64, its gradient taken at `variables` widened. The truth a
-    float32 update and its eager twin are measured from (`assert_leaves_as_exact`); the step's draws fix
-    their dtypes, so it corrupts as the float32 run does."""
+    `model` computing in float64, its decoder's and vision tower's dtype, its gradient taken at
+    `variables` widened. The truth a float32 update and its eager twin are measured from
+    (`assert_leaves_as_exact`); the step's draws fix their dtypes, so it corrupts as the float32 run
+    does."""
     with jax.enable_x64(new_val=True):
-        exact = build(Pretrained.load(directory, dtype="float64", attention_impl="xla", max_seq_len=32))
+        conditioner = None if model.conditioner is None else model.conditioner.clone(dtype=jnp.float64)
+        exact = build(model.clone(text=model.text.clone(dtype=jnp.float64), conditioner=conditioner))
         values = jax.tree.map(jnp.asarray, widened(variables))
         gradient = jax.grad(lambda trainable: exact.scalar_loss(
             {**values, "params": trainable}, widened(batch), step)[0])(values["params"])
@@ -238,7 +240,8 @@ def test_real_trainer_update_and_checkpoint_resume(source, tmp_path):
                 **example_fields(initial, 0, 1, batch))
     gradient = jax.grad(lambda values: obj.scalar_loss(values, batch, step)[0])(variables)
     expected = jax.tree.map(lambda value, grad: value - 0.001 * grad, variables, gradient)
-    truth = float64_update(FIXTURE, objective, variables, batch, step, 0.001)
+    truth = float64_update(loaded.model, lambda wide: objective(replace(loaded, model=wide)), variables,
+                           batch, step, 0.001)
     trainer = Trainer(obj, optax.sgd(0.001), key=run_key, checkpoints=Checkpoints(str(tmp_path / "run")))
     updated = trainer.fit(data, steps=1, checkpoint_every=1, log_every=1)
     # The trainer's update is the objective's, as exact as the same update taken eagerly.
@@ -369,8 +372,8 @@ def test_image_sft_trainer_resume_publish_and_generate(image_source, tmp_path):
         {**variables, "params": trainable}, batch, step)[0]))(variables["params"])
     expected = {**variables, "params": jax.tree.map(
         lambda value, grad: value - 0.001 * grad, variables["params"], gradient)}
-    truth = float64_update(FIXTURE.parent / "diffusion-gemma-workflow", lambda wide: BlockDiffusionObjective(
-        wide.model, prompt_length=8, variables=wide.variables), variables, batch, step, 0.001)
+    truth = float64_update(loaded.model, lambda wide: BlockDiffusionObjective(
+        wide, prompt_length=8, variables=loaded.variables), variables, batch, step, 0.001)
     checkpoints = Checkpoints(str(tmp_path / "run"))
     updated = Trainer(obj, optax.sgd(0.001), key=run_key, checkpoints=checkpoints).fit(
         data, steps=1, checkpoint_every=1, log_every=1)
