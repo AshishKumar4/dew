@@ -430,7 +430,7 @@ from dew.objectives.lm import LMObjective, Perplexity
 from dew.sampling import Sampling, generate
 
 tokenizer = HFTokenizer("gpt2")
-train, val = TokenFiles("data/tinystories").holdout(split="val")
+train, val = TokenFiles("data/tinystories/train"), TokenFiles("data/tinystories/val")
 data = train.shuffle(seed=0).repeat().pipe(presets.token_windows, seq_len=256, batch=32)
 held = val.pipe(presets.token_windows, seq_len=256, batch=32, records=128)
 model = CausalTransformer(vocab_size=tokenizer.vocab_size, emb_features=256, num_layers=4,
@@ -450,7 +450,7 @@ On one Colab L4 GPU the run takes about three minutes. The training loss falls f
 
 `temperature=0` selects the highest-probability token. GPU reductions are not bitwise repeatable by default, so a second run can continue differently after the first sentence. Validation uses EMA weights, which lag the live parameters during a short run: at step 1,000 their perplexity is 29.3.
 
-`TokenFiles` reads the token store, its `train` and `val` splits, and the `token_windows` preset cuts each into windows by index: the store is one stream with no document ends. Given documents, `presets.lm` tokenizes them and packs whole documents into each row by default (`pack="first-fit"`), recording each row's documents in `text_coordinates`. `presets.sft` reads conversations, from a Parquet or JSONL file or a Hub dataset, renders them with the tokenizer's chat template, and records each token's role. Set `LMObjective(loss_role=Role.ASSISTANT)` to train only on assistant targets. See [language models](https://github.com/AshishKumar4/dew/blob/main/docs/concepts/language_models.md) for checkpoint loading and text tokenization.
+`TokenFiles` reads each token store, and the `token_windows` preset cuts it into windows by index: each store is one stream with no document ends. Given documents, `presets.lm` tokenizes them and packs whole documents into each row by default (`pack="first-fit"`), recording each row's documents in `text_coordinates`. `presets.sft` reads conversations, from a Parquet or JSONL file or a Hub dataset, renders them with the tokenizer's chat template, and records each token's role. Set `LMObjective(loss_role=Role.ASSISTANT)` to train only on assistant targets. See [language models](https://github.com/AshishKumar4/dew/blob/main/docs/concepts/language_models.md) for checkpoint loading and text tokenization.
 
 ### Supervised fine-tuning
 
@@ -1149,7 +1149,7 @@ tokens = Path("runs/tokens")
 export = Path("runs/dew-decoder")
 tokenizer = HFTokenizer("tests/fixtures/tokenizers/tiny-tools")
 
-data = TokenFiles(str(tokens)).shuffle(seed=0).repeat().pipe(presets.token_windows, seq_len=128, batch=16)
+data = TokenFiles(str(tokens / "train")).shuffle(seed=0).repeat().pipe(presets.token_windows, seq_len=128, batch=16)
 model = CausalTransformer(vocab_size=tokenizer.vocab_size,
                           emb_features=128, num_layers=4, num_heads=4, num_kv_heads=2,
                           mlp_features=256, max_seq_len=128, dtype=jnp.float32,
