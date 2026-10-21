@@ -7,7 +7,6 @@ rows.
 """
 
 
-import os
 
 import jax
 import jax.numpy as jnp
@@ -98,25 +97,17 @@ def test_a_cache_leaf_with_no_elements_moves_as_words_and_back_whole(dtype):
     assert (back.shape, back.dtype) == (history.shape, history.dtype)
 
 
-@pytest.mark.gpu(reason="a CUDA bug, which the cuda lane's deterministic scatter reproduces")
-@pytest.mark.xfail(strict=True, raises=AssertionError, reason=(
-    "openxla/xla#49380, fixed by openxla/xla#49498 (merged 2026-09-28, after jaxlib 0.11.2 of "
-    "2026-09-17): when this passes, dew.nn.scatter.DROPPED can give way to an index at its axis size, "
-    "and KVStore.write_tokens and linear.py's channel scatter can write unmapped"))
-def test_a_deterministic_scatter_drops_an_index_at_its_axis_size():
-    """The workarounds' sentry: a scatter with mode='drop' should drop a column index equal to its
-    axis size. The deterministic scatter (--xla_gpu_deterministic_ops) linearizes the index and drops
-    only a position past the whole operand, so row 0's dropped (0, 4) lands on (1, 0) and overwrites
-    row 1's 3 with 2. Any other outcome is no symptom of that bug, and raises."""
-    if "--xla_gpu_deterministic_ops=true" not in os.environ.get("XLA_FLAGS", ""):
-        pytest.skip("the bug is the deterministic scatter's, which the cuda lane's flags select")
-    scatter = jax.jit(lambda buffer, rows, columns, values: buffer.at[rows, columns].set(values, mode="drop"))
-    written = scatter(jnp.zeros((2, 4), jnp.int32), jnp.arange(2)[:, None], jnp.array([[0, 4], [0, 4]]),
-                      jnp.array([[1, 2], [3, 4]], jnp.int32)).tolist()
-    right, bug = [[1, 0, 0, 0], [3, 0, 0, 0]], [[1, 0, 0, 0], [2, 0, 0, 0]]
-    if written not in (right, bug):
-        raise RuntimeError(f"the scatter wrote {written}: neither the right {right} nor the bug's {bug}")
-    assert written == right
+def test_a_dropped_cache_write_leaves_the_next_rows_slot_to_its_own_write():
+    """A cache write whose dropped token (position -1) sits beside the next row's write to its slot 0
+    leaves that slot holding the next row's token. XLA's deterministic GPU scatter, which the cuda
+    lane's flags select, would write an index at the axis size onto the next row's first slot
+    (openxla/xla#49380); the write drops at `dew.nn.scatter.DROPPED` instead, so on every backend each
+    row holds exactly its own tokens."""
+    buffer = jnp.zeros((2, 4, 1, 1), jnp.int32)
+    values = jnp.asarray([[1, 2], [3, 4]], jnp.int32)[:, :, None, None]
+    positions = jnp.asarray([[0, -1], [0, -1]], jnp.int32)
+    written = np.asarray(jax.jit(write_cache)(buffer, values, positions))[..., 0, 0]
+    np.testing.assert_array_equal(written, [[1, 0, 0, 0], [3, 0, 0, 0]])
 
 
 def test_an_int8_cache_keeps_the_logits_outlier_key_channels_would_flatten():
