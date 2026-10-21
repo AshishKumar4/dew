@@ -935,15 +935,15 @@ To trace a window of training, pass `Trainer` a `ProfileWindow` with the trace `
 from dew import Evaluation, LocalTracker
 from dew.config import ModelConfig, OptimConfig, RunConfig, TrainerConfig
 from dew.config.sweep import GridSearch
-from dew.config.data import TextData
+from dew.data import Memory
 
 config = RunConfig(
-    # The run records the model it trains, and the batches above stand in
-    # for the dataset this names.
+    # The run records the model and the data it trains; the batches above
+    # stand in for the records this chain reads.
     model=ModelConfig.from_model(objective.model),
-    data=TextData(source="", seq_len=16),
+    data=Memory(batch).repeat().batch(8),
     optim=OptimConfig(optimizer="adam"),
-    trainer=TrainerConfig(name="lm-rate", checkpoint_dir="runs/sweep", steps=40, batch_size=8,
+    trainer=TrainerConfig(name="lm-rate", checkpoint_dir="runs/sweep", steps=40,
                           eval_every=None, checkpoint_every=None),
 )
 
