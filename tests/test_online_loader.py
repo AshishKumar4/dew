@@ -87,6 +87,53 @@ def serving(handle):
         server.server_close()
 
 
+@pytest.mark.parametrize("read", ["indexed", "streamed"])
+def test_a_fetch_with_threads_of_its_own_fetches_that_many_at_once_in_order_and_resumes(read):
+    """A fetch given four threads of its own fetches four urls at once whatever the read's threads,
+    delivers the records in the order they were read, and a position saved part way restores to
+    the same remaining records."""
+    lock, active, most = threading.Lock(), [0], [0]
+
+    def handle(request):
+        with lock:
+            active[0] += 1
+            most[0] = max(most[0], active[0])
+        time.sleep(0.2)
+        body = request.path.encode()
+        request.send_response(200)
+        request.send_header("Content-Length", str(len(body)))
+        request.end_headers()
+        request.wfile.write(body)
+        with lock:
+            active[0] -= 1
+
+    with serving(handle) as address:
+        catalog = Memory([{"url": f"http://{address}/{index}", "id": index} for index in range(16)],
+                         shard_rows=16)
+        chain = Pipeline(catalog).filter_map(images.fetch(to="bytes", threads=4)).batch(2)
+        data = compile(chain, read=read, loading=Loading(workers=0, threads=1, read_buffer=1))
+        reader = data.train(DataPartition())
+        try:
+            first = [next(reader) for _ in range(3)]
+            saved = reader.get_state()
+            rest = [next(reader) for _ in range(5)]
+        finally:
+            reader.close()
+        resumed = data.train(DataPartition())
+        try:
+            resumed.set_state(saved)
+            again = [next(resumed) for _ in range(5)]
+        finally:
+            resumed.close()
+    assert most[0] == 4
+    ids = [int(value) for batch in [*first, *rest] for value in batch["id"]]
+    assert ids == list(range(16))
+    assert [bytes(value) for batch in rest for value in batch["bytes"]] == [
+        f"/{index}".encode() for index in range(6, 16)]
+    assert [[int(value) for value in batch["id"]] for batch in again] == [
+        [int(value) for value in batch["id"]] for batch in rest]
+
+
 Parents = collections.namedtuple("Parents", ["first", "second"])
 
 
