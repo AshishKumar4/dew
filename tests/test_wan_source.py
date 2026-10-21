@@ -33,7 +33,13 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
-from interop_support import assert_transformer_exports, extract_fixture, fixture_arrays, source_transformer
+from interop_support import (
+    assert_transformer_exports,
+    channels_last,
+    extract_fixture,
+    fixture_arrays,
+    source_transformer,
+)
 from reference_error import assert_as_exact_as_the_reference, assert_no_less_exact, float64_terms, widened
 
 from dew.diffusion.process import DenoisingCondition
@@ -54,11 +60,6 @@ def source(tmp_path_factory):
 @pytest.fixture(scope="module")
 def arrays(source):
     return fixture_arrays(source / "wan_transformer.npz")
-
-
-def channels_last(value):
-    """`[B, C, F, H, W]` to `[B, F, H, W, C]`."""
-    return np.moveaxis(np.asarray(value), 1, -1)
 
 
 def load(source, name):
