@@ -419,6 +419,7 @@ def test_an_accumulated_update_of_a_diffusion_objective_is_its_batch_whole_on_on
               for part in (0, 1)]
     trainer = Trainer(objective, optax.sgd(1.0), key=jax.random.PRNGKey(3), accumulation=2)
     initial = trainer.initial_state()
+    template = jax.tree.map(jnp.copy, initial)
     run = trainer.compile(initial, halves[0])
     fields = example_fields(initial, 0, 1, whole)
     info = Step(jnp.asarray(0), jax.random.fold_in(initial.key, 0), None, **fields)
@@ -426,7 +427,7 @@ def test_an_accumulated_update_of_a_diffusion_objective_is_its_batch_whole_on_on
     twin.substitute([objective.model.clone(dtype=jnp.float64)])
 
     def draw(seed):
-        variables = jax.tree.map(np.asarray, initial.variables)
+        variables = jax.tree.map(np.asarray, template.variables)
         keys = iter(jax.random.split(jax.random.key(seed), len(jax.tree.leaves(variables["params"]))))
         def moved_leaf(leaf):
             return (leaf + 0.02 * np.asarray(jax.random.normal(next(keys), leaf.shape))).astype(leaf.dtype)
@@ -439,7 +440,8 @@ def test_an_accumulated_update_of_a_diffusion_objective_is_its_batch_whole_on_on
         return np.asarray(before, np.float64) - np.asarray(after, np.float64)
 
     def pooled(variables):
-        state = initial.replace(variables=jax.tree.map(jnp.asarray, variables))
+        # The step donates its state: each draw steps a copy of the untouched template.
+        state = jax.tree.map(jnp.copy, template).replace(variables=jax.tree.map(jnp.asarray, variables))
         partial, *_ = run(state, halves[0])
         stepped, *_ = run(partial, halves[1])
         assert int(stepped.updates) == 1
