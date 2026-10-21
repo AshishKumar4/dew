@@ -86,7 +86,8 @@ def both_backward(case: dict, names: tuple, dtype, tiles: attention_triton.Tiles
                                             for value, kind in zip(params, kinds, strict=True)), initial)
     config = attention_triton.BackwardTiles(tiles.block_q, tiles.block_k, tiles.warps, tiles.stages,
                                             tiles.warps, tiles.stages)
-    with tuning.pinned({attention_triton.TritonBackward: config}):
+    # Both mainloops' forwards at the same tiles, whose sums the backwards read (`Split`).
+    with tuning.pinned({attention_triton.TritonBackward: config, attention_triton.TritonForward: tiles}):
         triton = attention_triton.backward(query, key, value, spans, hooks, dout, interpret=True)
     portable = attention_portable.backward(query, key, value, spans, hooks, dout, block_q=tiles.block_q,
                                            block_k=tiles.block_k, pad=attention_triton.BLOCK)
@@ -135,8 +136,8 @@ def test_the_forwards_split_sums_give_the_first_passes_gradients(hooks):
         def run(query, key, value, dout, params, initial):
             given = tuple(template.Param(value, kind) for value, kind in zip(params, kinds, strict=True))
             hooked = template.Hooks(score_mod, given, initial)
-            found = attention_portable.backward(query, key, value, spans, hooked, dout, block_q=32, block_k=32,
-                                                pad=attention_triton.BLOCK, split=split)
+            found = attention_portable.backward(query, key, value, spans, hooked, dout, block_q=32,
+                                                block_k=32, pad=attention_triton.BLOCK, split=split)
             return found.query, found.key, found.value, found.score_params, found.initial
 
         return jax.jit(run)
