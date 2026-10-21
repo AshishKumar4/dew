@@ -1,6 +1,8 @@
 """A dataset's facts (`Dataset.facts`), read without opening a reader: what its stores state, then what
 each step makes of them, in order. They say what the first batch the chain makes holds."""
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 from token_support import write_token_corpus
@@ -136,15 +138,16 @@ def test_the_preference_presets_facts_are_its_first_batchs_rows():
     facts = chain.facts()
     held = _held_fields(chain)
     assert all(held[name] == shape for name, shape in facts["fields"].items())
-    assert facts["fields"]["input_ids"] == [2, 12]
+    assert facts["fields"]["input_ids"] == [2, 12] and facts["seq_len"] == 12
 
 
 def test_a_tokenized_stores_facts_name_its_end_of_document():
-    """Documents tokenized by bytes and ended by EOS: the facts name the byte tokenizer's EOS; not
-    ended, none."""
+    """Documents tokenized by bytes and ended by EOS, as the byte tokenizer ends them by default:
+    the facts name its EOS; not ended, none."""
     documents = Memory([{"text": "a word"}])
     assert documents.map(text.tokenize("byte", eos=True)).facts()["eos_id"] == 255
-    assert documents.map(text.tokenize("byte")).facts()["eos_id"] is None
+    assert documents.map(text.tokenize("byte")).facts()["eos_id"] == 255
+    assert documents.map(text.tokenize("byte", eos=False)).facts()["eos_id"] is None
 
 
 def test_a_holdouts_part_states_what_its_store_states(tmp_path):
@@ -152,10 +155,24 @@ def test_a_holdouts_part_states_what_its_store_states(tmp_path):
     without counting the store's rows, which neither part holds all of."""
     from dew.data.sources import TokenFiles
 
-    directory = tmp_path
-    write_token_corpus(directory, np.arange(1, 100, dtype=np.uint16), eos_id=0)
-    train, held = TokenFiles(str(directory)).holdout(records=1)
+    corpus = write_token_corpus(tmp_path, np.arange(1, 100, dtype=np.uint16), eos_id=0)
+    train, held = TokenFiles(corpus.train).holdout(records=1)
     for part in (train, held):
         facts = part.facts()
         assert (facts["tokenizer"], facts["vocab_size"]) == ("byte", 256)
         assert "rows" not in facts
+
+
+def test_the_sft_presets_facts_are_its_tokenizer_and_its_rows():
+    """Conversations rendered by the byte tokenizer's template and packed into rows of sixteen
+    inputs: the facts name the tokenizer and the rows' length, and shape the ids and speakers as
+    the first batch holds them."""
+    tokenizer = str(Path(__file__).parent / "fixtures" / "tokenizers" / "tiny-chat")
+    conversations = Memory([{"messages": [{"role": "user", "content": "hi " * (1 + index)},
+                                          {"role": "assistant", "content": "hello"}]} for index in range(6)])
+    chain = conversations.repeat().pipe(presets.sft, tokenizer, seq_len=16, batch=2)
+    facts = chain.facts()
+    held = _held_fields(chain)
+    assert (facts["tokenizer"], facts["seq_len"]) == (tokenizer, 16)
+    assert facts["fields"]["text"] == [17] == held["text"]
+    assert facts["fields"]["text_roles"] == [17] == held["text_roles"]

@@ -29,13 +29,13 @@ import pytest
 from affine_run import FEATURES, Affine
 from token_support import write_token_corpus
 
-from dew.config.data import TextData, loader
-from dew.data import Files, Loading, Memory
-from dew.data.compile import compile, publish, validation
-from dew.data.dataset import CAPTION, DataPartition, DataPhase, GlobalStream, Loader, Ramp, ramped
+from dew.data import Files, Loading, Memory, phases, presets
+from dew.data.compile import compile, held, publish, validation
+from dew.data.dataset import CAPTION, DataPartition, GlobalStream, Loader, Ramp, ramped
 from dew.data.images import EncodeCaptions
 from dew.data.pipeline import DeviceStep, Pipeline, mix
 from dew.data.plan import Manifest, Plan
+from dew.data.sources import TokenFiles
 from dew.objectives.base import VALID_ROWS, Aux, Objective, Ratio
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer
 
@@ -224,24 +224,24 @@ def two_splits(tmp_path_factory) -> tuple[str, str]:
     return (rows_dir(root, "big", 1000, 40), rows_dir(root, "small", 2000, 8))
 
 
-@dataclasses.dataclass(frozen=True)
-class RowMix:
-    sources: dict[str, float]
-    held: bool = False
-
-    def pipelines(self):
-        parents = tuple(dataclasses.replace(
-            Pipeline(Files(str(Path(root) / "rows.jsonl"), format="jsonl")).map(
-                lambda row: {"id": np.int32(row["index"])}), name=root)
-            for root in sorted(self.sources))
-        weights = tuple(self.sources[root] for root in sorted(self.sources))
-        mixed = parents[0] if len(parents) == 1 else mix(parents, weights=weights)
-        return mixed, mixed if self.held else None, ()
+def row_corpus(root: str) -> Pipeline:
+    """The rows of `root`'s jsonl file, each its index as an `id`, under `root`'s name."""
+    rows = Pipeline(Files(str(Path(root) / "rows.jsonl"), format="jsonl"))
+    return dataclasses.replace(rows.map(lambda row: {"id": np.int32(row["index"])}), name=root)
 
 
-def test_load_reads_a_weighted_mixture_of_two_datasets(two_splits):
+def row_mix(sources: dict[str, float], *, read: str = "memory", seed: int = 0) -> Loader:
+    """`sources`' rows mixed at their weights as a run trains on them: each corpus shuffled (in a
+    window of 64 where it streams) and repeated, in batches of four."""
+    window = 64 if read == "streamed" else None
+    corpora = [row_corpus(root).shuffle(seed, window=window).repeat() for root in sorted(sources)]
+    weights = [sources[root] for root in sorted(sources)]
+    return compile(mix(corpora, weights=weights).batch(4), read=read, loading=READ, seed=seed)
+
+
+def test_a_weighted_mixture_of_two_datasets_holds_each_share_of_every_batch(two_splits):
     big, small = two_splits
-    data = loader(RowMix({big: 0.75, small: 0.25}), batch=4, read="memory", loading=READ)
+    data = row_mix({big: 0.75, small: 0.25})
     assert data.records == 54 and data.batch == 4 and data.steps_per_epoch == 13
     stream = data.train(DataPartition())
     try:
@@ -253,9 +253,9 @@ def test_load_reads_a_weighted_mixture_of_two_datasets(two_splits):
 
 def test_a_mixed_validation_pass_ends_before_any_source_repeats(two_splits):
     big, small = two_splits
-    data = loader(RowMix({big: 0.75, small: 0.25}, held=True), batch=4, read="memory", loading=READ)
-    assert data.val is not None
-    first, second = data.val(DataPartition()), data.val(DataPartition())
+    passed = held(mix([row_corpus(big), row_corpus(small)], weights=[0.75, 0.25]).batch(4)
+                  .read("memory").loading(READ))
+    first, second = passed(DataPartition()), passed(DataPartition())
     try:
         actual, again = ids(first), ids(second)
     finally:
@@ -269,8 +269,7 @@ def test_a_mixed_validation_pass_ends_before_any_source_repeats(two_splits):
 
 def test_a_mixture_written_in_either_order_is_the_same_run(two_splits):
     big, small = two_splits
-    first = loader(RowMix({big: 0.75, small: 0.25}), batch=4, read="memory", loading=READ)
-    other = loader(RowMix({small: 0.25, big: 0.75}), batch=4, read="memory", loading=READ)
+    first, other = row_mix({big: 0.75, small: 0.25}), row_mix({small: 0.25, big: 0.75})
     left, right = first.train(DataPartition()), other.train(DataPartition())
     try:
         assert taken(left, 4) == taken(right, 4)
@@ -297,7 +296,7 @@ def test_sources_from_different_stores_mix_before_the_share_cut(two_splits):
 
 def test_a_streamed_mixture_keeps_accepted_row_shares(two_splits):
     big, small = two_splits
-    data = loader(RowMix({big: 0.75, small: 0.25}), batch=4, read="streamed", loading=READ)
+    data = row_mix({big: 0.75, small: 0.25}, read="streamed")
     stream = data.train(DataPartition())
     try:
         assert all(sum(value >= 2000 for value in batch) == 1 for batch in taken(stream, 8))
@@ -305,17 +304,36 @@ def test_a_streamed_mixture_keeps_accepted_row_shares(two_splits):
         stream.close()
 
 
-def document_dir(root: Path, documents, eos: int = 0) -> str:
-    """A token directory whose stream is `documents`, each closed by eos."""
+def document_dir(root: Path, documents, eos: int = 0, tokenizer: str = "byte") -> str:
+    """A token store whose stream is `documents`, each closed by eos."""
     stream = np.concatenate([np.asarray([*list(document), eos], np.uint16)
                              for document in documents])
-    return str(write_token_corpus(root, stream, stream, vocab_size=256, eos_id=eos))
+    return write_token_corpus(root, stream, vocab_size=256, eos_id=eos, tokenizer=tokenizer).train
 
 
 def packed_corpus(root: Path, documents: int = 40, length: int = 3) -> str:
     # Document i is the value i + 1 repeated, so a window's values name the
     # documents packed into it and the padding names none.
     return document_dir(root, [[index + 1] * length for index in range(documents)])
+
+
+def packed(url: str) -> Pipeline:
+    """A token store's documents packed first-fit, two rows open, into rows of eight inputs."""
+    return TokenFiles(url).pipe(presets.lm, None, seq_len=8, batch=None, pack="first-fit", bins=2)
+
+
+def ordered(corpus: Pipeline, seed: int = 0) -> Pipeline:
+    """Packed rows in the order a run trains on them: shuffled and repeated."""
+    return corpus.shuffle(seed).repeat()
+
+
+def trained(chain: Pipeline, batch: int = 4) -> Loader:
+    return compile(chain.batch(batch), read="memory", loading=READ)
+
+
+def mixed_packed(stores: dict[str, float]) -> Pipeline:
+    """Token stores' packed rows mixed by their tokens at their weights, each in a run's order."""
+    return mix([ordered(packed(url)) for url in stores], weights=list(stores.values()), by="tokens")
 
 
 def windows_of(batches) -> list[list[tuple[int, ...]]]:
@@ -333,13 +351,11 @@ def test_a_packed_step_is_the_same_windows_at_every_process_count(tmp_path):
     global batch k holds the same windows in the same places however many
     processes read it. Packed behind the shard, as the loader once was, each
     process packed its own documents and no two counts agreed."""
-    corpus = packed_corpus(tmp_path / "corpus")
-    open_stream = loader(TextData(source=corpus, pack="first-fit", seq_len=8, packing_bins=2), batch=4,
-        read="memory", loading=READ).train
+    open_stream = trained(ordered(packed(packed_corpus(tmp_path / "corpus")))).train
 
     whole = pooled(open_stream, 1, 5, rows=windows_of)
 
-    assert whole[0], "the loader produced no windows"
+    assert whole[0], "the chain produced no windows"
     assert pooled(open_stream, 2, 5, rows=windows_of) == whole
     assert pooled(open_stream, 4, 5, rows=windows_of) == whole
 
@@ -348,9 +364,7 @@ def test_a_packed_position_written_by_two_processes_resumes_on_one(tmp_path):
     """The packed stream's position is a global window count, so the two
     processes that stopped at step two hand one process, or four, the steps
     the run would have taken next."""
-    corpus = packed_corpus(tmp_path / "corpus")
-    open_stream = loader(TextData(source=corpus, pack="first-fit", seq_len=8, packing_bins=2), batch=4,
-        read="memory", loading=READ).train
+    open_stream = trained(ordered(packed(packed_corpus(tmp_path / "corpus")))).train
     whole = pooled(open_stream, 1, 6, rows=windows_of)
 
     stopped = open_stream(DataPartition(1, 2))
@@ -366,10 +380,8 @@ def test_a_packed_pass_covers_every_document_once_at_every_process_count(tmp_pat
     """A validation pass over the plan is the same windows in the same order
     for every count, and the processes of a pool cover the split between
     them without overlapping."""
-    corpus = packed_corpus(tmp_path / "corpus", documents=24)
-    pass_over = loader(TextData(source=corpus, pack="first-fit", seq_len=8, packing_bins=2), batch=4,
-        read="memory", loading=READ).val
-    assert pass_over is not None
+    pass_over = held(packed(packed_corpus(tmp_path / "corpus", documents=24)).batch(4).read("memory")
+                     .loading(READ))
     whole = [row for batch in pass_over(DataPartition()) for row in windows_of([batch])[0]]
 
     for processes in (2, 4):
@@ -379,14 +391,13 @@ def test_a_packed_pass_covers_every_document_once_at_every_process_count(tmp_pat
         assert sorted(row for shard in shards for row in shard) == sorted(whole)
 
 
-def weighted_packed(tmp_path, weights, **overrides):
+def weighted_packed(tmp_path, weights, *, tokenizer: str = "byte"):
     """Two corpora told apart by their values: 1..40 in the first, 101..124
     in the second, each document one value repeated three times."""
     first = document_dir(tmp_path / "first", [[index + 1] * 3 for index in range(40)])
-    second = document_dir(tmp_path / "second", [[index + 101] * 3 for index in range(24)])
-    spec = TextData(source={first: weights[0], second: weights[1]}, pack="first-fit", seq_len=8,
-                    packing_bins=2)
-    return spec, first, second
+    second = document_dir(tmp_path / "second", [[index + 101] * 3 for index in range(24)],
+                          tokenizer=tokenizer)
+    return {first: weights[0], second: weights[1]}, first, second
 
 
 def corpus_of(window: tuple[int, ...]) -> int:
@@ -401,9 +412,9 @@ def test_weighted_packed_corpora_fill_every_step_at_their_shares(tmp_path):
     window is one corpus's documents, and every prefix of the stream holds
     each corpus's share of its windows to within one, the contract grain's
     `MapDataset.mix` keeps. At 3:1 a batch of four is three and one."""
-    spec, _, _ = weighted_packed(tmp_path, (3.0, 1.0))
-    rows = [row for batch in packed_rows(loader(spec, batch=4, read="memory",
-        loading=READ).train(DataPartition()), 12) for row in batch]
+    stores, _, _ = weighted_packed(tmp_path, (3.0, 1.0))
+    rows = [row for batch in packed_rows(trained(mixed_packed(stores)).train(DataPartition()), 12)
+            for row in batch]
     drawn = [corpus_of(row) for row in rows]
     for prefix in range(1, len(drawn) + 1):
         assert abs(drawn[:prefix].count(1) - prefix / 4) <= 1
@@ -411,8 +422,8 @@ def test_weighted_packed_corpora_fill_every_step_at_their_shares(tmp_path):
 
 
 def test_weighted_packed_corpora_resume_on_another_process_count(tmp_path):
-    spec, _, _ = weighted_packed(tmp_path, (1.0, 1.0))
-    open_stream = loader(spec, batch=4, read="memory", loading=READ).train
+    stores, _, _ = weighted_packed(tmp_path, (1.0, 1.0))
+    open_stream = trained(mixed_packed(stores)).train
     whole = pooled(open_stream, 1, 6, rows=windows_of)
 
     stopped = open_stream(DataPartition(0, 2))
@@ -491,32 +502,34 @@ def test_a_packed_stream_asks_each_corpus_its_position_only_after_the_corpus_rea
 def test_a_weighted_packed_pass_counts_and_scores_every_corpus(tmp_path):
     """The pass is the windows in which every corpus has been read once, and
     the validation pass reads each held-out window at most once."""
-    spec, first, second = weighted_packed(tmp_path, (1.0, 1.0))
-    loaded = loader(spec, batch=2, read="memory", loading=READ)
-    alone = [loader(TextData(source=path, pack="first-fit", seq_len=8, packing_bins=2), batch=2,
-                    read="memory",
-        loading=READ).records for path in (first, second)]
+    stores, first, second = weighted_packed(tmp_path, (1.0, 1.0))
+    loaded = trained(mixed_packed(stores), batch=2)
+    alone = [trained(ordered(packed(url)), batch=2).records for url in (first, second)]
     assert loaded.records == 2 * max(alone)
-    scored = [row for batch in loaded.val(DataPartition()) for row in windows_of([batch])[0]]
+    passed = held(mix([packed(url) for url in stores], weights=list(stores.values()), by="tokens").batch(2)
+                  .read("memory").loading(READ))
+    scored = [row for batch in passed(DataPartition()) for row in windows_of([batch])[0]]
     assert len(scored) == len(set(scored))
     assert {corpus_of(row) for row in scored} == {0, 1}
 
 
 def test_corpora_from_different_tokenizers_are_not_mixed(tmp_path):
-    spec, _, second = weighted_packed(tmp_path, (1.0, 1.0))
-    meta = json.loads((Path(second) / "meta.json").read_text())
-    (Path(second) / "meta.json").write_text(json.dumps({**meta, "tokenizer": "gpt2"}))
+    stores, _, _ = weighted_packed(tmp_path, (1.0, 1.0), tokenizer="gpt2")
     with pytest.raises(ValueError):
-        loader(spec, batch=4, read="memory", loading=READ)
+        trained(mixed_packed(stores))
 
 
 # --------------------------------------------------------------------------
 # Mixture phases
 # --------------------------------------------------------------------------
 
-def phased_packed(first: str, second: str, *phases: tuple[object, int | None]) -> TextData:
-    return TextData(source="", pack="first-fit", phases=tuple(DataPhase(path, until) for path,
-        until in phases), seq_len=8, packing_bins=2)
+def phased_packed(*entries: tuple[object, int | None]) -> Loader:
+    """Phases each of one token store's packed rows, or a mix of several's (`{url: weight}`), until
+    its step, each in a run's order, in batches of four."""
+    def phase(stores: str | dict[str, float]) -> Pipeline:
+        return ordered(packed(stores)) if isinstance(stores, str) else mixed_packed(stores)
+
+    return trained(phases(*((phase(stores), until) for stores, until in entries)))
 
 
 def test_phases_switch_the_mixture_at_a_step(tmp_path):
@@ -524,9 +537,8 @@ def test_phases_switch_the_mixture_at_a_step(tmp_path):
     at equal shares, every step of the second phase half of each."""
     _, first, second = weighted_packed(tmp_path, (1.0, 1.0))
     both = {first: 1.0, second: 1.0}
-    spec = phased_packed(first, second, (first, 3), (both, None))
 
-    steps = packed_rows(loader(spec, batch=4, read="memory", loading=READ).train(DataPartition()), 7)
+    steps = packed_rows(phased_packed((first, 3), (both, None)).train(DataPartition()), 7)
 
     assert all(corpus_of(row) == 0 for step in steps[:3] for row in step)
     assert all([corpus_of(row) for row in step].count(1) == 2 for step in steps[3:])
@@ -538,9 +550,7 @@ def test_every_phase_declares_the_most_documents_a_window_of_any_phase_holds(tmp
     window's length."""
     whole = document_dir(tmp_path / "whole", [[index + 1] * 7 for index in range(8)])
     short = document_dir(tmp_path / "short", [[index + 101] for index in range(32)])
-    spec = TextData(source="", pack="first-fit", phases=(DataPhase(whole, 2), DataPhase(short)), seq_len=8,
-                    packing_bins=2)
-    stream = loader(spec, batch=4, read="memory", loading=READ).train(DataPartition())
+    stream = phased_packed((whole, 2), (short, None)).train(DataPartition())
     batches = list(itertools.islice(stream, 4))
     assert [int(batch["text_coordinates"].segments.max()) for batch in batches] == [1, 1, 4, 4]
     assert {batch["text_coordinates"].max_segments for batch in batches} == {4}
@@ -550,28 +560,20 @@ def test_a_run_of_one_mixture_resumes_into_phases_that_begin_with_it(tmp_path):
     """Resuming onto a changed mixture is refused, but resuming onto a phase
     list whose first phase is the run's mixture, with a boundary it has not
     passed, is the same run with a switch ahead of it, at any process count."""
-    _spec, first, second = weighted_packed(tmp_path, (1.0, 1.0))
+    _, first, second = weighted_packed(tmp_path, (1.0, 1.0))
     both = {first: 1.0, second: 1.0}
-    plain = TextData(source=first, pack="first-fit", seq_len=8, packing_bins=2)
-    stopped = loader(plain, batch=4, read="memory", loading=READ).train(DataPartition())
+    stopped = trained(ordered(packed(first))).train(DataPartition())
     packed_rows(stopped, 2)
     state = stopped.get_state()
-    phases = phased_packed(first, second, (first, 4), (both, None))
-    open_stream = loader(phases, batch=4, read="memory", loading=READ).train
+    open_stream = phased_packed((first, 4), (both, None)).train
     whole = pooled(open_stream, 1, 7, rows=windows_of)
 
     for processes in (1, 2):
         assert pooled(open_stream, processes, 5, state, rows=windows_of) == whole[2:]
     with pytest.raises(ValueError):
-        loader(phased_packed(first, second, (both, 4), (first, None)), batch=4, read="memory",
-            loading=READ).train(DataPartition()).set_state(
-            state
-        )
+        phased_packed((both, 4), (first, None)).train(DataPartition()).set_state(state)
     with pytest.raises(ValueError):
-        loader(phased_packed(first, second, (first, 1), (both, None)), batch=4, read="memory",
-            loading=READ).train(DataPartition()).set_state(
-            state
-        )
+        phased_packed((first, 1), (both, None)).train(DataPartition()).set_state(state)
 
 
 def test_a_phased_run_resumes_past_a_switch_and_refuses_a_changed_history(tmp_path):
@@ -581,41 +583,33 @@ def test_a_phased_run_resumes_past_a_switch_and_refuses_a_changed_history(tmp_pa
     finished mixture, or a run of one order, is refused."""
     _, first, second = weighted_packed(tmp_path, (1.0, 1.0))
     both = {first: 1.0, second: 1.0}
-    spec = phased_packed(first, second, (first, 3), (both, None))
-    stream = loader(spec, batch=4, read="memory", loading=READ).train(DataPartition())
+    stream = phased_packed((first, 3), (both, None)).train(DataPartition())
     packed_rows(stream, 5)
     state = stream.get_state()
     rest = packed_rows(stream, 3)
 
     saved = json.loads(state)["dew_global_position"]
     assert saved["records"] == 20 and saved["completed"][0][1] == 12
-    for resumed_spec in (spec, phased_packed(first, second, (first, 3), (both, 9), (second, None))):
-        resumed = loader(resumed_spec, batch=4, read="memory", loading=READ).train(DataPartition())
+    for entries in (((first, 3), (both, None)), ((first, 3), (both, 9), (second, None))):
+        resumed = phased_packed(*entries).train(DataPartition())
         resumed.set_state(state)
         assert packed_rows(resumed, 3) == rest
-    for changed in (phased_packed(first, second, (first, 2), (both, None)),
-                    phased_packed(first, second, (second, 3), (both, None))):
+    for changed in (((first, 2), (both, None)), ((second, 3), (both, None))):
         with pytest.raises(ValueError):
-            loader(changed, batch=4, read="memory", loading=READ).train(DataPartition()).set_state(state)
-    plain = TextData(source=both, pack="first-fit", seq_len=8, packing_bins=2)
+            phased_packed(*changed).train(DataPartition()).set_state(state)
     with pytest.raises(ValueError):
-        loader(plain, batch=4, read="memory", loading=READ).train(DataPartition()).set_state(state)
+        trained(mixed_packed(both)).train(DataPartition()).set_state(state)
 
 
 def test_phases_are_a_list_of_ends_and_refuse_a_ramp(tmp_path):
     _, first, second = weighted_packed(tmp_path, (1.0, 1.0))
     with pytest.raises(ValueError):
-        loader(phased_packed(first, second, (first, 3), (second, 3), (first, None)), batch=4,
-            read="memory", loading=READ).train(
-            DataPartition()
-        )
+        phased_packed((first, 3), (second, 3), (first, None)).train(DataPartition())
     with pytest.raises(ValueError):
-        loader(phased_packed(first, second, (first, 3), (second, 5)), batch=4, read="memory",
-            loading=READ).train(DataPartition())
-    spec = phased_packed(first, second, (first, 3), (second, None))
+        phased_packed((first, 3), (second, 5)).train(DataPartition())
     with pytest.raises(TypeError):
-        ramped(loader(spec, batch=4, read="memory", loading=READ), Ramp(start=2, increment=2,
-            samples=8)).train(DataPartition())
+        ramped(phased_packed((first, 3), (second, None)), Ramp(start=2, increment=2,
+                                                               samples=8)).train(DataPartition())
 
 
 # --------------------------------------------------------------------------
@@ -1329,22 +1323,20 @@ def test_phases_read_each_chain_until_its_step_as_the_phased_text_recipe(tmp_pat
     """Two token stores read one until step two, then a mix of both, each store packed alone by the
     lm preset and the phases ordered and batched after: the phased text recipe's plan."""
     from dew.config.data import DataPhase, TextData, loader
-    from dew.data import phases, presets
-    from dew.data.sources import TokenFiles
 
-    first, second = tmp_path / "first", tmp_path / "second"
     # Documents of nine tokens, each ended by EOS (0).
-    for path, size in ((first, 200), (second, 300)):
-        ids = np.where(np.arange(size) % 10 == 9, 0, np.arange(size) % 250 + 1).astype(np.uint16)
-        write_token_corpus(path, ids, eos_id=0)
+    first, second = (
+        write_token_corpus(tmp_path / name, np.where(np.arange(size) % 10 == 9, 0, np.arange(size) % 250 + 1),
+                           eos_id=0).train
+        for name, size in (("first", 200), ("second", 300)))
     loading = Loading(workers=0, threads=1, read_buffer=1)
     recipe = TextData(source="", seq_len=8, pack="first-fit",
-                      phases=(DataPhase(str(first), 2), DataPhase({str(first): 1.0, str(second): 1.0}, None)))
+                      phases=(DataPhase(first, 2), DataPhase({first: 1.0, second: 1.0}, None)))
     expected = loader(recipe, batch=2, read="indexed", loading=loading)
 
     def packed(path):
         # Eight open rows, the recipe's default.
-        return TokenFiles(str(path)).pipe(presets.lm, None, seq_len=8, batch=None, pack="first-fit", bins=8)
+        return TokenFiles(path).pipe(presets.lm, None, seq_len=8, batch=None, pack="first-fit", bins=8)
 
     # The phases ordered and repeated as the recipe's loader orders them, then batched.
     phased = phases((packed(first), 2), (mix([packed(first), packed(second)], by="tokens"), None))

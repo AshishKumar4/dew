@@ -1079,12 +1079,17 @@ def held(dataset: Dataset, *, objective: ObjectiveData | None = None, batch: int
          seed: int = 0) -> Reader:
     """`dataset` read once to validate or evaluate on, in its own batches, else in batches of `batch`,
     read and loaded as it asks, its random steps drawing from `seed`; one that states neither batch is
-    refused."""
+    refused. A pass reads every record: a batch it fills only in part keeps the records it holds,
+    filled out with copies its `VALID_ROWS` marks, where a training read would drop them."""
     chain = dataset._chain()
     if not any(isinstance(stage, (BatchStage, TokenBudget)) for stage in chain.stages):
         if batch is None:
             raise ValueError(f"{_name(chain)} states no batch; batch it (`.batch(n)`) or give batch=")
         chain = chain.batch(batch, drop_remainder=False)
+    batched = (BatchStage, TokenBudget)
+    chain = dataclasses.replace(chain, stages=tuple(
+        dataclasses.replace(stage, drop_remainder=False) if isinstance(stage, batched) else stage
+        for stage in chain.stages))
     # The chain's own batch is the one it is read in; validation's `batch` adds none to it.
     return validation(chain, batch=1, objective=objective, read=chain.mode,
                       loading=chain._loading or _DEFAULT_LOADING, provision=True, seed=seed)

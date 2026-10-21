@@ -65,7 +65,7 @@ class PreferencePair(grain.MapTransform):
         """A chosen and a rejected row of `seq_len` ids and their completion mask, in place of the
         completions."""
         rows = shaped(unshaped(facts, *FIELDS), IDS_KEY, [2, self.seq_len])
-        return shaped(rows, MASK_KEY, [2, self.seq_len])
+        return {**shaped(rows, MASK_KEY, [2, self.seq_len]), "seq_len": self.seq_len}
 
     def map(self, element: Batch) -> Batch:
         element = record(element, "preference row")
