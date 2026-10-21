@@ -171,12 +171,12 @@ def _gmm_alone(lhs, rhs, lengths, shape: tuple, *, tiles: Tiles, transpose_rhs: 
     prologue_operands, epilogue_operands = sides
     m, n, k, g = shape
     block_m, block_n, block_k = tiles.block_m, tiles.block_n, tiles.block_k
-    sides = len(prologue_operands) + len(epilogue_operands)
+    side_count = len(prologue_operands) + len(epilogue_operands)
 
     def body(rows_per_expert_gmem, lhs_gmem, rhs_gmem, *refs):
         prologue_gmems = refs[:len(prologue_operands)]
-        epilogue_gmems = refs[len(prologue_operands):sides]
-        o_gmems = refs[sides:]
+        epilogue_gmems = refs[len(prologue_operands):side_count]
+        o_gmems = refs[side_count:]
         grid_m = pl.cdiv(m, block_m) + g  # Dew: g groups and the unrouted rows
         grid_n = pl.cdiv(n, block_n)
 
