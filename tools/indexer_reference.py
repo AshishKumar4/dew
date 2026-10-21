@@ -34,8 +34,8 @@ What it writes:
   a packed mask and the sparse loss over the causal one, each with its
   gradient in the indexer's scores, in float32 and in float64, and the
   exact top-k masks.
-- recorded_published.npz (`recording`): the same published functions recorded
-  over check 1's seeds, each seed's inputs drawn again by the test
+- recorded_<case>.npz (`recording`), one a case: the same published functions
+  recorded over check 1's seeds, each seed's inputs drawn again by the test
   (`published_inputs`), the float32 run's evidence from its float64 run kept
   with that run's sketch (tools/recorded_references.py).
 
@@ -291,9 +291,10 @@ def published_keep(mask: str) -> np.ndarray:
 
 
 def write_published_recording(command: str) -> None:
-    """recorded_published.npz: each case's published loss and its gradient in the indexer's scores
-    recorded over check 1's seeds (`record_case`), the float32 run against the float64 run, the count
-    planned on Dew's `indexer_kl` and confirmed on the reference."""
+    """recorded_<case>.npz, one a case, each under the size a fixture keeps in git: the case's published
+    loss and its gradient in the indexer's scores recorded over check 1's seeds (`record_case`), the
+    float32 run against the float64 run, the count planned on Dew's `indexer_kl` and confirmed on the
+    reference."""
     import jax
     import jax.numpy as jnp
     from fetched_fixtures import save
@@ -304,7 +305,6 @@ def write_published_recording(command: str) -> None:
 
     scale = PUBLISHED["head_dim"] ** -0.5
     published = {dtype: published_methods(dtype) for dtype in (jnp.float32, jnp.float64)}
-    recording = {}
     for name, (mask, sparse) in PUBLISHED_CASES.items():
         def evaluate(inputs, mask=mask, sparse=sparse):
             keep = published_keep(mask)
@@ -332,11 +332,13 @@ def write_published_recording(command: str) -> None:
             return {"loss": value, "gradient": gradient}
 
         with jax.enable_x64(new_val=True):
-            recording.update(record_case(name, published_inputs, evaluate, proxy, truth_proxy=proxy,
-                                         store_inputs=False, summary=True))
+            recording = record_case(name, published_inputs, evaluate, proxy, truth_proxy=proxy,
+                                    store_inputs=False, summary=True)
         recording[f"{name}.provenance"] = provenance("MaxText MLA.calculate_indexer_loss", COMMIT, "cpu",
                                                      command, dtype="float32", top_k=PUBLISHED["top_k"])
-    save(FIXTURES / "recorded_published.npz", recording, reference="MaxText 0.2.4", license="Apache-2.0")
+        written = save(FIXTURES / f"recorded_{name}.npz", recording, reference="MaxText 0.2.4",
+                       license="Apache-2.0")
+        print(f"{written}: {written.stat().st_size} bytes", flush=True)
 
 
 def published_case(methods, mask_value, dtype, tail, query, key, scores, scale, keeps, cases) -> dict:
