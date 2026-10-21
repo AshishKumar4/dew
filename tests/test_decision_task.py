@@ -9,6 +9,7 @@ from pathlib import Path
 import jax
 import numpy as np
 import pytest
+from decision_support import decision_rows
 from reference_error import assert_as_exact_as_the_reference
 from steady_state import steady_state
 
@@ -252,12 +253,13 @@ def passed(objective, variables, examples):
     from dew.objectives.base import VALID_ROWS, Step
 
     step = Step(jnp.asarray(0), jax.random.key(0), None)
-    rows = []
-    from dew.data.compile import validation
-    from dew.decision.data import Decisions as DecisionRecipe
+    found = []
+    from dew.data import Memory
+    from dew.data.compile import held
+    from dew.decision import decisions
 
-    pipeline, _, _ = DecisionRecipe(source=examples).pipelines()
-    reader = validation(pipeline, batch=8, objective=objective.data(), read="memory")
+    rows = Memory([{"example": example} for example in examples]).pipe(decisions).read("memory")
+    reader = held(rows, objective=objective.data(), batch=8)
     for batch in reader(DataPartition()):
         probabilities = np.asarray(objective.evaluate(variables, batch, step).probabilities)
         logits = np.asarray(objective._logits(variables, laid_out(batch, objective.bounds.segments)))
@@ -265,9 +267,9 @@ def passed(objective, variables, examples):
         for window in np.flatnonzero(batch.get(VALID_ROWS, np.ones(len(batch["kinds"]), bool))):
             for slot in np.flatnonzero(batch["questions"][window]):
                 count = int(batch["options"][window, slot].sum())
-                rows.append((int(batch["kinds"][window, slot]), logits[window, slot, :count],
-                             probabilities[window, slot, :count]))
-    return rows
+                found.append((int(batch["kinds"][window, slot]), logits[window, slot, :count],
+                              probabilities[window, slot, :count]))
+    return found
 
 
 def float32_softmax(logits, temperature):
@@ -431,14 +433,11 @@ def test_dew_export_writes_a_decision_run_in_the_tasks_own_release(decide, tmp_p
 
     from dew.checkpoints import Checkpoints
     from dew.cli.main import Export
-    from dew.config.data import loader
     from dew.decision import DecisionObjective
-    from dew.decision.data import Decisions as DecisionRecipe
     from dew.training.trainer import Trainer
 
     objective = DecisionObjective(decide)
-    data = loader(DecisionRecipe(source=answered() * 2, validation=answered()), batch=8, read="memory",
-                  objective=objective.data())
+    data = decision_rows(answered() * 2, 8, answered(), objective=objective.data())
     checkpoints = Checkpoints(str(tmp_path / "run"), keep=1)
     Trainer(objective, optax.adam(1e-3), key=0, checkpoints=checkpoints).fit(
         data, steps=1, log_every=100, checkpoint_every=1, eval_every=100)
