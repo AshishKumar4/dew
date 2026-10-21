@@ -217,10 +217,10 @@ class MaskedDiffusionObjective(Objective[Ratio]):
         t = step.boundary("times", self.process.stratified(uniforms, places, count))
         draws = step.sample("mask uniforms", jax.random.uniform, tokens.shape[1:], dtype=jnp.float32,
                             rows=rows)
-        masked, is_masked = self.process.masked(draws, tokens, t)
+        _, is_masked = self.process.masked(draws, tokens, t)
         is_masked = step.boundary("mask", is_masked & real)
         dropout_key = jax.random.fold_in(step.key, 2)
-        masked = jnp.where(is_masked, masked, tokens)
+        masked = jnp.where(is_masked, self.process.mask_id, tokens)
 
         read = final_read(self.model, params, masked, train=train,
                           rngs=model_rngs(dropout_key, training=train), mutable=False,
