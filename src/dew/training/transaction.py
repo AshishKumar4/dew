@@ -25,7 +25,18 @@ from flax import struct
 from flax.training import dynamic_scale as dynamic_scale_lib
 from typing_extensions import TypeVar
 
-from dew.objectives.base import FROZEN, Aux, Batch, Ratio, Step, Variables, merge, with_projected
+from dew.data.dataset import rows_of
+from dew.objectives.base import (
+    EXAMPLE_STREAM,
+    FROZEN,
+    Aux,
+    Batch,
+    Ratio,
+    Step,
+    Variables,
+    merge,
+    with_projected,
+)
 from dew.training.model_flops import _TokenCount, step_counts
 from dew.training.narrow import forward_variables, narrowed
 from dew.training.state import Accumulation, TrainState
@@ -219,6 +230,14 @@ class PendingAttempt(Generic[Loss]):
     gradient: Variables
 
 
+def example_places(slot, split: int, rows: int) -> jax.Array:
+    """The places among an update's examples of the `rows` rows of the microbatch in window slot `slot`,
+    of steps read in `split` microbatches each: the step's place in the window times a step's rows, plus
+    the row's in the step's batch, every `split`th from row `slot % split` (`microbatch`)."""
+    step, part = slot // split, slot % split
+    return (step * rows * split + part + split * jnp.arange(rows, dtype=jnp.int32)).astype(jnp.int32)
+
+
 class Transaction:
     """Turn one or more microbatches into one optimizer update.
 
@@ -354,8 +373,20 @@ class Transaction:
             **state.variables, **jax.tree.map(lambda x: x[index], previous.variables)}
         step_info = Step((state.microstep - fill + index) // self.split,
                     jax.random.fold_in(state.key, previous.attempts[index]),
-                    with_ema(variables, state.ema), committed=state.updates)
+                    with_ema(variables, state.ema), committed=state.updates,
+                    **self.examples(state, index, batch))
         return self.read(variables, state.compute), batch, step_info
+
+    def examples(self, state, slot, batch) -> dict[str, jax.Array]:
+        """The `Step` fields of the microbatch in window slot `slot`: the update's key
+        (`Step.example_key`) and each row's place among the update's examples, its step's place in the
+        window times a step's rows, plus its row in the step's batch, which `microbatch` reads every
+        `split`th of from row `part`. A batch with no rows has no examples."""
+        rows = rows_of(batch)
+        if not rows:
+            return {}
+        key = jax.random.fold_in(jax.random.fold_in(state.key, EXAMPLE_STREAM), state.updates)
+        return {"example_key": key, "example_index": example_places(slot, self.split, rows)}
 
     def read(self, variables, compute):
         """The variables a step's forward reads: the narrow copies in place of
@@ -552,7 +583,8 @@ class Transaction:
             # columns the objective's batch no longer holds (`model_batch`).
             attempt = state.step * self.split + part
             step_info = Step(state.microstep // self.split, jax.random.fold_in(state.key, attempt),
-                             with_ema(state.variables, state.ema), committed=state.updates)
+                             with_ema(state.variables, state.ema), committed=state.updates,
+                             **self.examples(state, state.microstep % self.size, batch))
             factor = jnp.asarray(1., jnp.float32) if state.scale is None else state.scale.scale
             realized = realize(self.read(state.variables, state.compute), batch, step_info)
             loss, cotangent = reduce(realized.stats, factor)
