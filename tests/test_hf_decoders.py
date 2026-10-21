@@ -869,6 +869,19 @@ def test_masked_moe_logits_are_as_exact_as_the_released_model_code(name):
     assert_as_exact(forward, reference, draw, name, seeds=seeds, truth_fn=truth)
 
 
+@pytest.mark.parametrize("name", ["llada-moe-7b-a1b", "llada-moe-v2-30b-a3b", "llada2.0-mini",
+                                  "llada2.0-flash", "llada2.1-mini", "llada2.2-flash"])
+def test_a_released_masked_moe_config_builds_the_releases_parameter_count(name):
+    """Each release's own config.json at its pinned revision builds a model holding exactly the
+    parameters the Hub counts in that revision's safetensors (`source.json`), the routers' balancing
+    biases among them: every width, expert, shared expert, dense layer and head as released."""
+    released = json.loads((FIXTURES / name / "source.json").read_text())
+    model = models.build("causal_transformer", translate_config(fixture_config(name)), dtype="float32",
+                         attention_impl="reference")
+    shapes = jax.eval_shape(model.init, jax.random.key(0), jnp.zeros((1, 2), jnp.int32))
+    assert sum(int(np.prod(leaf.shape)) for leaf in jax.tree.leaves(shapes)) == released["parameters"]
+
+
 @pytest.mark.parametrize("name, limit", [("llada2-tiny", {"groups": 1, "groups_per_token": 1}),
                                          ("llada22-tiny", {"routing_block": None, "block_experts": None})])
 def test_llada2_fixtures_route_by_their_bias_and_their_limit(name, limit):
