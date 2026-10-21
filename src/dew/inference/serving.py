@@ -114,7 +114,7 @@ from dew.nn.kv_cache import POOLED, ROW_CURSORS, TABLE, KVCache, is_paged, leaf_
 from dew.nn.protocols import Layered, ProjectionGroup, Serving
 from dew.nn.sharding import SEQUENCE_AXIS, STAGE_AXIS, batch_axes
 from dew.objectives.base import Variables
-from dew.sampling.decoding import Finishing, LogitsTransform
+from dew.sampling.decoding import Finishing, LogitsTransform, StopStrings
 from dew.sampling.guided import Grammar
 from dew.sampling.strategies import Sample
 from dew.sampling.text import Generation, Sampling, check_inputs, rebuild_position, resolve
@@ -427,9 +427,10 @@ class Server:
     join until it returns. A server keeps `slots` rows of `capacity` cache
     slots each and refills them from a queue. Each step prefills the prompts
     admitted that step into free rows and draws one token for every occupied
-    row. A row leaves on EOS or at its budget, and the next request takes its
-    slot. Every request runs the task's policy and draws the same tokens it
-    would draw through the task alone with the same key.
+    row. A row leaves where the task's criteria end it (EOS, a stop string) or
+    at its budget, and the next request takes its slot. Every request runs
+    the task's policy and draws the same tokens it would draw through the
+    task alone with the same key.
 
     Build one with `from_task`. `admission` bounds the prompts one step
     prefills. A request whose prompt and budget do not fit the capacity is
@@ -465,7 +466,7 @@ class Server:
         self.variables = variables
         self._weight_groups: list[ProjectionGroup] = []
         self.processor = processor
-        if sampling.stop:
+        if sampling.stop and not any(isinstance(criterion, StopStrings) for criterion in stopping.ending):
             raise ValueError("a server takes stop strings compiled into stopping; build it with "
                              "Server.from_task, which compiles the task's")
         self.pad_id = sampling.pad
@@ -631,7 +632,9 @@ class Server:
             model,
             task.placed,
             task.processor,
-            sampling=policy,
+            # The policy keeps the stop strings `stopping` compiled, so a server's draws are read
+            # against what ends them (`dew.inference.rollouts.check_ending`).
+            sampling=dataclasses.replace(policy, stop=task.sampling.stop),
             transforms=transforms,
             stopping=stopping,
             grammar=strategy.grammar,

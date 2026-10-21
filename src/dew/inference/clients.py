@@ -355,6 +355,15 @@ def listed_ids(entry: Mapping[str, object]) -> tuple[int, ...] | None:
     return None if listed is None else tuple(listed)
 
 
+def matched_stop(entry: Mapping[str, object]) -> str | int | None:
+    """The stop a choice says ended it, a string or a token id: vLLM's `stop_reason` and SGLang's
+    `matched_stop`. None where it names none, as for its model's own EOS or at its budget."""
+    matched = entry.get("stop_reason", entry.get("matched_stop"))
+    if isinstance(matched, bool) or (matched is not None and not isinstance(matched, (str, int))):
+        raise ValueError(f"a choice's matched stop is a string or a token id, not {matched!r}")
+    return matched
+
+
 def reported_log_probs(entry: Mapping[str, object]) -> tuple[tuple[str, ...], tuple[float, ...]] | None:
     """A choice's logprob tokens as rendered and their log-probabilities, or None where it reports
     none."""
