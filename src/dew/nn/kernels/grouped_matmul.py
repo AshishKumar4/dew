@@ -88,14 +88,21 @@ Where the cost model ties, the first wins: the deeper step, which synchronizes i
 a tile (at 128 x 256 on an H100, a step of 64 took 1.56 ms where 32 took 1.78, GMM-h100-2), and the
 more warps."""
 
+CONSUMER_REGISTERS = 232
+"""The registers a thread of a cooperative tile's consumer warpgroup holds: a producer warpgroup takes 40
+(`mosaic_gpu`'s pipelines' `memory_registers`), and JAX's warp-specialized pipeline gives the consumers
+the rest of the multiprocessor's (`pipeline._compute_registers(40, 2)`)."""
+
 _COOPERATIVE = itertools.product((128,), (256, 128), (64,), (4, 3, 5), (8, 4, 2, 1), (2, 1))
 _ALONE = itertools.product((128, 192, 64), (128, 192, 64), (64,), (4, 5, 2), (8, 4, 2, 1))
-MOSAIC_TILES = (tuple(mosaic_gpu.Tiles(*shape, warpgroups=2, cluster=pair) for *shape, pair in _COOPERATIVE)
-                + tuple(mosaic_gpu.Tiles(*shape) for shape in _ALONE))
-"""Every tile the Mosaic GPU launches may take: tiles two consumer warpgroups compute, CUTLASS's
-cooperative sm90 schedule (128 x 256, a pair of multiprocessors sharing each matrix block), first, then
-the sweep JAX ships with its one-warpgroup kernels (`ragged_dot_mgpu.main`), where an H100's fastest
-lay (GMM-h100-3). Where the cost model ties, the first wins."""
+MOSAIC_TILES = (tuple(mosaic_gpu.Tiles(*shape) for shape in _ALONE)
+                + tuple(mosaic_gpu.Tiles(*shape, warpgroups=2, cluster=pair)
+                        for *shape, pair in _COOPERATIVE))
+"""Every tile the Mosaic GPU launches may take: the sweep JAX ships with its one-warpgroup kernels
+(`ragged_dot_mgpu.main`), where an H100's fastest lay (GMM-h100-3), then tiles two consumer warpgroups
+compute, CUTLASS's cooperative sm90 schedule (128 x 256, a pair of multiprocessors sharing the blocks of
+one operand). The cost model prices no term the cooperative schedule changes yet (its MMA issue, the
+second consumer's reads of the shared stage), so where it ties, the first, a one-warpgroup tile, wins."""
 
 INTERPRETED = plgpu.InterpretGPUParams(out_of_bounds_reads="uninitialized")
 """How a CPU interprets the Mosaic GPU launches: a read past an operand's rows, which a TMA load zeroes,
@@ -529,9 +536,10 @@ class Tgmm(_Triton):
 
 class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
     """JAX's Pallas Mosaic GPU kernels (`templates.gemm.mosaic_gpu`): Hopper's warpgroup MMA, one 16-bit
-    dtype, and widths the space's tiles divide. Each runs one warpgroup a multiprocessor, persistent over
-    the output tiles in a planar snake, so the rows a band of `grid_block_n` column tiles shares and the
-    matrix block the row tiles in flight share come from the L2."""
+    dtype, and widths the space's tiles divide. Each runs one warpgroup a multiprocessor, or two
+    consumers beside a producer (a cooperative tile), persistent over the output tiles in a planar snake,
+    so the rows a band of `grid_block_n` column tiles shares and the matrix block the row tiles in flight
+    share come from the L2."""
     name: ClassVar[str] = 'mosaic_gpu'
     config_cls: ClassVar[type[mosaic_gpu.Tiles]] = mosaic_gpu.Tiles
     EXACT_SUMS: ClassVar[bool] = False
@@ -573,8 +581,13 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         step = (config.block_m + config.block_n) * config.block_k * size + _side_tile_bytes(
             ba.arguments['prologue_operands'], hooks.prologue_axes, extents)
         epilogue = _side_tile_bytes(ba.arguments.get('epilogue_operands', ()), hooks.epilogue_axes, extents)
-        # One warpgroup stages each output in turn; two hold every output's staging buffer at once.
+        # One warpgroup stages each output in turn; two hold every output's staging buffer at once, and
+        # each consumer its own copy of an epilogue side tile without columns (`mosaic_gpu._staging`; a
+        # prologue side's per-consumer copies are within the stages' count of it).
         staged_outs = sum(outs) if config.warpgroups == 2 else max(outs)
+        if config.warpgroups == 2:
+            epilogue_sides = ba.arguments.get('epilogue_operands', ())
+            epilogue += _side_tile_bytes(*_uncut(epilogue_sides, hooks.epilogue_axes, 'columns'), extents)
         return config.stages * step + epilogue + staged_outs * config.block_m * config.block_n
 
     @staticmethod
@@ -694,8 +707,11 @@ class MosaicTgmm(_Mosaic):
         fits = super().fitting(ba, target)
         if not ba.arguments.get('exact_sums'):
             return fits
+        # A cooperative consumer has the registers the producer's 40 leave it (JAX's
+        # `emit_pipeline_warp_specialized`: 232).
         return tuple(tile for tile in fits
-                     if 2 * tile.block_m * tile.block_n // (128 * tile.warpgroups) < cost.THREAD_REGISTERS)
+                     if 2 * tile.block_m * tile.block_n // (128 * tile.warpgroups)
+                     < (CONSUMER_REGISTERS if tile.warpgroups == 2 else cost.THREAD_REGISTERS))
 
     @staticmethod
     def extents(tile: mosaic_gpu.Tiles) -> dict:
@@ -726,6 +742,12 @@ class MosaicTgmm(_Mosaic):
                                interpret=INTERPRETED if interpret else False, prologue=hooks.before(),
                                prologue_operands=prologue_operands, prologue_axes=hooks.prologue_axes,
                                exact_sums=exact_sums), None
+
+
+def _uncut(sides: tuple, axes_of: tuple, halved: str) -> tuple[tuple, tuple]:
+    """The side operands, and their axes, without the launch axis a cooperative consumer's half cuts."""
+    kept = [(side, axes) for side, axes in zip(sides, axes_of, strict=True) if halved not in axes]
+    return tuple(side for side, _ in kept), tuple(axes for _, axes in kept)
 
 
 def _modelled(ba) -> tuple[mosaic_gpu.Tiles, ...]:

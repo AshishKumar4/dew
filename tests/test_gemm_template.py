@@ -174,6 +174,25 @@ def test_the_template_holds_check_1_with_its_hooks(generation_name, case):
                         seeds=SEEDS, truth_fn=_drop(_plain(spec, truth=True)))
 
 
+COOPERATIVE = mosaic_gpu.Tiles(128, 128, 64, 3, 1, warpgroups=2)
+"""A tile two consumer warpgroups compute (a cluster the interpreter does not model)."""
+
+
+@pytest.mark.parametrize("case", ["norm and bias", "gated prologue", "broadcast axes", "two outputs"])
+def test_a_cooperative_tile_holds_check_1_with_its_hooks(case):
+    """The Hopper launches pinned to a cooperative tile, interpreted: each consumer rewrites half the stage
+    both read and computes half the columns' epilogue, as exact as the plain program from float64 truth;
+    the Mosaic kernels ran."""
+    spec = CASES[case]
+    pinned = {grouped_matmul.MosaicGmm: COOPERATIVE, grouped_matmul.MosaicGmmTransposed: COOPERATIVE,
+              grouped_matmul.MosaicTgmm: COOPERATIVE}
+    with generation.assumed("sm90"), tuning.pinned(pinned), generation.routes() as taken:
+        dew = jax.jit(_drop(_dew(spec, interpret_on_cpu=True)))
+        assert_as_exact(dew, jax.jit(_drop(_plain(spec))), _draw, f"{case} cooperative",
+                        seeds=SEEDS, truth_fn=_drop(_plain(spec, truth=True)))
+    assert 'mosaic_gpu' in {route.kernel for route in taken if route.choice == 'grouped_matmul'}
+
+
 def _loss(run):
     def loss(x, w, ms, nw, b, u, s, ct):
         outs = run(x, w, ms, nw, b, u, s)
@@ -512,6 +531,51 @@ def test_exact_sums_add_each_steps_product_as_the_plain_sum_does(generation_name
                                                     precision=precision, interpret_on_cpu=True))(x, dy, sizes)
                           for precision in ("highest", "default"))
     np.testing.assert_array_equal(np.asarray(exact), np.asarray(default))
+
+
+def test_a_cooperative_tiles_exact_sums_add_as_its_plain_sum_does():
+    """`test_exact_sums_add_each_steps_product_as_the_plain_sum_does` at a cooperative tile: each consumer's
+    running fp32 sum, the pipeline's carry, matches its accumulator's bit for bit on the CPU."""
+    rng = np.random.default_rng(5)
+    x = jnp.asarray(rng.normal(size=(ROWS, DEPTH)), jnp.bfloat16)
+    dy = jnp.asarray(rng.normal(size=(ROWS, WIDTH)), jnp.bfloat16)
+    with generation.assumed("sm90"), tuning.pinned({grouped_matmul.MosaicTgmm: COOPERATIVE}):
+        exact, default = (jax.jit(functools.partial(template.gemm_t, out_dtype=jnp.float32,
+                                                    precision=precision, interpret_on_cpu=True))(
+            x, dy, jnp.asarray(SIZES)) for precision in ("highest", "default"))
+    np.testing.assert_array_equal(np.asarray(exact), np.asarray(default))
+
+
+def test_a_tile_states_a_schedule_the_kernels_run():
+    """A pair of multiprocessors needs two warpgroups; a warpgroup count or cluster outside one or two is
+    refused where the tile is made, and a direct kernel gradient refuses a depth its pairs do not divide."""
+    for fields in ({"warpgroups": 1, "cluster": 2}, {"warpgroups": 3}, {"warpgroups": 2, "cluster": 4}):
+        with pytest.raises(ValueError):
+            mosaic_gpu.Tiles(128, 128, 64, 3, 1, **fields)
+    x = jnp.zeros((ROWS, 384), jnp.bfloat16)
+    with pytest.raises(ValueError):
+        mosaic_gpu.tgmm(x, jnp.zeros((ROWS, WIDTH), jnp.bfloat16), jnp.asarray(SIZES),
+                        tiles=mosaic_gpu.Tiles(128, 128, 64, 3, 1, warpgroups=2, cluster=2),
+                        out_dtype=jnp.float32, multiprocessors=2)
+
+
+def test_an_interpreted_launch_takes_no_pair():
+    """The interpreter runs one block, which no cluster fits: an interpreted launch's space has no pair,
+    and a pair pinned on one multiprocessor is refused rather than launched over no blocks."""
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    args = (bf16((ROWS, DEPTH)), bf16((3, DEPTH, WIDTH)), jax.ShapeDtypeStruct((3,), jnp.int32))
+    launch = grouped_matmul.MosaicGmm()
+    with generation.assumed("sm90"):
+        interpreted = launch.space(launch.bind(*args, out_dtype="bfloat16", trans_rhs=False, interpret=True))
+        compiled = launch.space(launch.bind(*args, out_dtype="bfloat16", trans_rhs=False, interpret=False))
+    assert interpreted and not any(tile.cluster == 2 for tile in interpreted)
+    assert any(tile.cluster == 2 for tile in compiled)
+    with pytest.raises(ValueError):
+        mosaic_gpu.gmm(jnp.zeros((ROWS, DEPTH), jnp.bfloat16), jnp.zeros((3, DEPTH, WIDTH), jnp.bfloat16),
+                       jnp.asarray([100, 100, 107]), tiles=mosaic_gpu.Tiles(128, 128, 64, 3, 1, warpgroups=2,
+                                                                             cluster=2),
+                       transpose_rhs=False, out_dtype=jnp.bfloat16, multiprocessors=1,
+                       interpret=grouped_matmul.INTERPRETED)
 
 
 def test_exact_sums_go_to_fp32_outputs_at_a_precision_above_the_default():
