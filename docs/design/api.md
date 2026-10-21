@@ -71,7 +71,6 @@ class Registry(Mapping[str, T]):
 models     = Registry[type[nn.Module]]("model")
 presets    = Registry[type[Preset]]("preset")
 samplers   = Registry[type[Solver]]("sampler")
-datasets   = Registry[type[Recipe]]("dataset")
 encoders   = Registry[type[ConditionEncoder]]("encoder")
 metrics    = Registry[Callable[..., Metric]]("metric")
 objectives = Registry[type[Objective]]("objective")
@@ -240,14 +239,15 @@ class Dataset:
     @property
     def steps_per_epoch(self) -> int | None: ...
 
-from dew.data import TFDS
-from dew.config.data import ImageData, loader
+from dew.data import TFDS, presets
+from dew.data.compile import compile
 
-data = loader(ImageData(source=TFDS("oxford_flowers102"), image_size=128),
-            batch=32, read="memory", provision=True)
+train, val = TFDS("oxford_flowers102").holdout(split="validation")
+data = compile(train.shuffle(0).repeat().pipe(presets.images, 128, batch=32, augment=True),
+               validation=val.pipe(presets.images, 128, batch=32), read="memory", provision=True)
 ```
 
-One registry replaces `datasetMap`, `onlineDatasetMap` and `mediaDatasetMap` (`data/registry.py`). The per-process batch size is computed in one place that raises on `batch % processes` (done in `f3ea98b`). A stream without `get_state` trains, and its resume is refused unless it declares replay (`replayed`, `from_iter(replay=True)`).
+The chain replaces `datasetMap`, `onlineDatasetMap` and `mediaDatasetMap`: a store and the presets and steps it is piped through ([the data design](data.md)). The per-process batch size is computed in one place that raises on `batch % processes` (done in `f3ea98b`). A stream without `get_state` trains, and its resume is refused unless it declares replay (`replayed`, `from_iter(replay=True)`).
 
 ### 3.8 Distributed
 
@@ -373,7 +373,7 @@ The mixer keeps its recurrent state in the `cache` collection, exactly as the KV
 - A new sampler is a `Solver` with a `step`. It states which schedules it integrates.
 - A new metric is a function `(artifact, batch) -> value` behind `@metrics(name)`.
 - A new tracker implements `Tracker` and registers renderers with `singledispatch`.
-- A new recipe is a frozen dataclass implementing Recipe.pipelines(), registered as a dataset alias. All execution goes through Pipeline and compile.
+- A new data preset is a function that takes a dataset, then its settings, and returns a dataset (`dew.data.presets`); a run pipes its store through it. All execution goes through Pipeline and compile.
 
 ## 10. What may be condensed
 

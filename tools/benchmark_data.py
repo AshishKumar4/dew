@@ -5,10 +5,11 @@ Iterates a dataset's training stream for a fixed number of steps and reports
 throughput and per-step latency. No model is built, so when a training step
 looks slow this says whether the loader is the reason.
 
-The dataset is a registered recipe and its fields are the command line, so the
-knobs here are the knobs a run has:
+The dataset is the chain a run reads, named as `dew data export` names one (a
+Python file's `data`, a chain's `.json` record or a store's URL), so the knobs
+here are the knobs a run has:
 
-    python tools/benchmark_data.py --steps 100 data:images --data.image-size 128
+    python tools/benchmark_data.py --steps 100 --data run.py
     python tools/benchmark_data.py matrix --output data-matrix.json --work matrix-work
 
 The matrix runs each arm, Dew's reader and plain Grain over the same steps, in
@@ -42,37 +43,36 @@ os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
 import tyro
 from absl import flags
-from token_corpus import write_token_meta
 
 from dew.data import Loading
 from dew.data.dataset import Forwarding
-from dew.registry import datasets
 
 # grain's worker processes read absl flags, and a plain script never parses them
 flags.FLAGS.mark_as_parsed()
 
 if TYPE_CHECKING:
-    from dew.config.data import RunData
-
-    # tyro reads the runtime annotation, a Union of the registered specs, and
-    # a type checker cannot read a variable in a type expression.
-    AnySpec = RunData
-else:
-    AnySpec = datasets.union
+    from dew.data.pipeline import Pipeline
 
 
-def flowers():
-    from dew.config.data import ImageData
+def flowers(batch: int) -> "Pipeline":
+    """Oxford Flowers 2.1.1 in a run's order, decoded by Dew at a reduced scale no smaller than 128
+    pixels, resized to 128 and augmented on the accelerator, in batches of `batch`."""
+    import tensorflow_datasets as tfds
 
-    return ImageData(source="tfds://oxford_flowers102:2.1.1")
+    from dew.data import TFDS, images, presets
+
+    source = TFDS("oxford_flowers102", version="2.1.1", decoders={"image": tfds.decode.SkipDecoding()})
+    return source.shuffle(0).repeat().pipe(presets.images, 128, batch=batch, augment=True, draft=True,
+                                           rejects=False, host=(images.EncodeCaptions(),))._chain()
 
 
 @dataclass(frozen=True)
 class Benchmark:
-    data: AnySpec = field(default_factory=flowers)
-    """Which dataset, with its own fields as flags."""
+    data: str | None = None
+    """The chain to time: a Python file whose `data` is one, a chain's `.json` record, or a store's
+    URL read in batches of `batch` (`dew.cli.main.chain_of`); none times Oxford Flowers (`flowers`)."""
     batch: int = 32
-    """Global batch size."""
+    """Global batch size, where the chain states none."""
     steps: int = 100
     """Steps to time."""
     warmup: int = 5
@@ -111,10 +111,14 @@ def report(latencies: list[float], batch_size: int) -> None:
 
 
 def main(config: Benchmark) -> None:
-    from dew.config.data import loader
+    from dew.cli.main import chain_of
+    from dew.data.compile import compile
 
-    dataset = loader(config.data, batch=config.batch, read=config.read, loading=config.loading)
-    print(f"{datasets.alias_of(type(config.data))}: {dataset.records} records, "
+    chain = flowers(config.batch) if config.data is None else chain_of(config.data, "train")
+    if not chain.batched:
+        chain = chain.repeat().batch(config.batch)
+    dataset = compile(chain, read=config.read, loading=config.loading)
+    print(f"{config.data or 'oxford_flowers102'}: {dataset.records} records, "
           f"batch {dataset.batch} across every process")
     from dew.data.dataset import DataPartition
     from dew.training import MeshSpec
@@ -221,26 +225,33 @@ def synthetic_inputs(config: Matrix) -> dict:
     # No labels in the encoded layout: the image step uses a genuine per-image
     # squared prediction loss, so all loaders read exactly these same bytes.
     lengths = np.random.default_rng(config.seed).integers(17, 98, 18000)
-    documents = [np.concatenate(((np.arange(size - 1) + index) % 200 + 4, [255]))
+    documents = [np.concatenate(((np.arange(size - 1) + index) % 200 + 4, [255])).astype(np.int32)
                  for index, size in enumerate(lengths)]
-    ids = np.concatenate(documents).astype(np.uint16)
-    ids.tofile(text / "train.bin")
-    held = np.full(129, 42, np.uint16)
-    held[-1] = 255
-    held.tofile(text / "val.bin")
-    write_token_meta(text, len(ids), len(held), eos_id=255)
-    from dew.data import Files
+    from dew.data import Files, Memory
+    from dew.data.sinks import export
 
+    export(Memory([{"text": document} for document in documents]), str(text), format="array_record",
+           length_field="text", metadata={"token_store": True, "tokenizer": "byte", "vocab_size": 256,
+                                          "dtype": "int32", "eos_id": 255})
     Files(str(image), format="array_record").provision()
     return {
         "image": {**file_fact(path), "rows": 4096, "source": str(image)},
-        "text": {**file_fact(text / "train.bin"), "rows": len(documents),
-                 "tokens": len(ids), "source": str(text)},
+        "text": {**file_fact(text / MANIFEST), "rows": len(documents),
+                 "tokens": int(sum(lengths)), "source": str(text)},
     }
 
 
-INPUTS = {"image": ("images.array_record",), "text": ("train.bin", "val.bin", "meta.json")}
-"""The files each workload's inputs are made of, without what a reader provisioned beside them."""
+MANIFEST = "_dew_manifest.json"
+"""A committed export's manifest, which names its shards and their length indexes."""
+
+
+def inputs_of(source: Path, workload: str) -> tuple[str, ...]:
+    """The files `workload`'s inputs under `source` are made of, without what a reader provisioned
+    beside them: the image records, or the token export's manifest and the files it names."""
+    if workload == "image":
+        return ("images.array_record",)
+    files = json.loads((source / MANIFEST).read_text())["files"]
+    return (MANIFEST, *(entry["path"] for entry in files), *(entry["lengths"]["path"] for entry in files))
 
 
 def evicted_copy(source: Path, workload: str, into: Path) -> Path:
@@ -250,7 +261,8 @@ def evicted_copy(source: Path, workload: str, into: Path) -> Path:
     needs it."""
     shutil.rmtree(into, ignore_errors=True)
     into.mkdir(parents=True)
-    for name in INPUTS[workload]:
+    for name in inputs_of(source, workload):
+        (into / name).parent.mkdir(parents=True, exist_ok=True)
         shutil.copyfile(source / name, into / name)
         with (into / name).open("rb+") as copied:
             os.fsync(copied.fileno())
@@ -286,26 +298,26 @@ def objective_for(config: Worker):
 
 
 def dew_reader(config: Worker, objective, loading: Loading):
-    from dew.config.data import ImageData, TextData, loader
-    from dew.data import Files
+    from dew.data import Files, images, presets
     from dew.data.compile import compile
     from dew.data.dataset import DataPartition
     from dew.data.sources import TokenFiles
 
-    if config.workload == "image":
-        # Every record trains, as the Grain arm reads them all.
-        recipe = ImageData(Files(str(config.source), format="array_record"), image_size=config.image_size,
-                           augment=None, validation=None)
-    else:
-        recipe = TextData(TokenFiles(str(config.source)), tokenizer="byte", seq_len=config.seq_len,
-                          pack="first-fit", packing_bins=32)
-    read = "memory" if config.engine == "dew_memory" else "indexed"
     if config.drops:
-        data = compile(_dropping(config), read=read, provision=True, loading=loading, seed=config.seed,
-                       objective=objective.data())
+        chain = _dropping(config)
+    elif config.workload == "image":
+        # Every record trains, as the Grain arm reads them all, through the steps it runs.
+        records = Files(str(config.source), format="array_record").shuffle(config.seed).repeat()
+        chain = records.pipe(presets.images, config.image_size, batch=config.batch, draft=True, rejects=False,
+                             caption=images.caption(), host=(images.EncodeCaptions(),))
     else:
-        data = loader(recipe, batch=config.batch, read=read, provision=True, loading=loading,
-                      seed=config.seed, objective=objective.data())
+        # Packed in the store's order, then ordered, as a run reads a packed token store.
+        packed = TokenFiles(str(config.source)).pipe(presets.lm, None, seq_len=config.seq_len, batch=None,
+                                                     pack="first-fit", bins=32)
+        chain = packed.shuffle(config.seed).repeat().batch(config.batch)
+    read = "memory" if config.engine == "dew_memory" else "indexed"
+    data = compile(chain, read=read, provision=True, loading=loading, seed=config.seed,
+                   objective=objective.data())
     assert data.plan is not None, "a compiled run states its plan"
     plan = data.plan.record()
     return lambda: iter(data.train(DataPartition())), {
@@ -351,7 +363,7 @@ def grain_reader(config: Worker, objective, loading: Loading):
     if config.workload == "image":
         source = grain.ArrayRecordDataSource([str(config.source / "images.array_record")])
         rows = grain.MapDataset.source(source).shuffle(seed=config.seed).repeat()
-        # The image recipe's own record steps (`ImageData.pipelines`), applied by Grain alone.
+        # The images preset's own record steps, applied by Grain alone.
         rows = rows.map(images.DecodeImage("image", at_least=config.image_size, rejects=False))
         rows = rows.map(images.Resize(config.image_size)).map(images.caption())
         rows = rows.batch(config.batch, drop_remainder=True).map(EncodeCaptions())
@@ -359,7 +371,9 @@ def grain_reader(config: Worker, objective, loading: Loading):
     elif config.workload == "text" and config.engine == "grain_prepacked":
         import numpy as np
 
-        source = np.memmap(config.source / "train.bin", mode="r", dtype=np.uint16)
+        from dew.data.sources import TokenFiles
+
+        source = TokenFiles(str(config.source)).tokens[:]
         ends = np.flatnonzero(source == 255) + 1
         documents = [{"text": np.asarray(source[start:end], np.int32)}
                      for start, end in zip(np.concatenate(([0], ends[:-1])), ends, strict=True)]
