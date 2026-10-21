@@ -219,9 +219,9 @@ def _named(cls: type) -> str:
 
 def _function_name(function: types.FunctionType) -> str:
     """A module-level function's module and name, which `_located_function` finds again; a lambda, a
-    closure or a local function has none to store."""
+    closure, a local function or one a class holds has none to store."""
     name = f"{function.__module__}:{function.__qualname__}"
-    if function.__name__ == "<lambda>" or "<locals>" in function.__qualname__ or function.__closure__:
+    if "." in function.__qualname__ or function.__name__ == "<lambda>" or function.__closure__:
         raise TypeError(f"the hook {name} is no module-level function, which a kernel's stored picks name")
     return name
 
@@ -230,29 +230,28 @@ def _located_function(name: str) -> types.FunctionType:
     """The module-level function `_function_name` names: `Unreadable` where this checkout's module holds
     no such function under that name, or another object (a renamed or shadowed hook)."""
     module, _, qualified = name.partition(":")
-    try:
-        found: object = importlib.import_module(module)
-    except ModuleNotFoundError as error:
-        if error.name is None or not (module == error.name or module.startswith(error.name + ".")):
-            raise
-        raise Unreadable(f"this checkout has no module {module}") from error
-    found = vars(found).get(qualified) if "." not in qualified else None
+    found = vars(_module(module)).get(qualified) if "." not in qualified else None
     if not isinstance(found, types.FunctionType) or f"{found.__module__}:{found.__qualname__}" != name:
         raise Unreadable(f"{name} names no module-level function in this checkout")
     return found
 
 
-def _located(name: str) -> type:
-    """The class `_named` names; `Unreadable` where this checkout has no such class."""
-    module, _, qualified = name.partition(":")
+def _module(module: str) -> types.ModuleType:
+    """The module `module` names; `Unreadable` where this checkout has no such module."""
     try:
-        found: object = importlib.import_module(module)
+        return importlib.import_module(module)
     except ModuleNotFoundError as error:
         # The named module or a parent of it is absent; a module that fails to import otherwise, or
         # imports something else that is absent, is this checkout's error and propagates.
         if error.name is None or not (module == error.name or module.startswith(error.name + ".")):
             raise
         raise Unreadable(f"this checkout has no module {module}") from error
+
+
+def _located(name: str) -> type:
+    """The class `_named` names; `Unreadable` where this checkout has no such class."""
+    module, _, qualified = name.partition(":")
+    found: object = _module(module)
     for part in qualified.split("."):
         # A module and each class on the way hold the next part among their own attributes.
         found = vars(found).get(part) if isinstance(found, (type, types.ModuleType)) else None

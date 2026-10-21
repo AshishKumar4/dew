@@ -104,7 +104,6 @@ def test_a_stored_class_this_checkout_lacks_is_unreadable_and_an_imports_own_fai
     assert not isinstance(failed.value, tuning.Unreadable)
 
 
-
 def _scaled_hook(tile):
     """A module-level hook, as a template's prologue is."""
     return tile * 2
@@ -112,6 +111,14 @@ def _scaled_hook(tile):
 
 _shadowed_hook = json.dumps
 """Another module's function under this module's name: no hook of this module."""
+
+
+class _HookHolder:
+    """A function a class holds: its qualified name, dotted, is no module attribute's."""
+
+    @staticmethod
+    def hook(tile):
+        return tile
 
 
 def test_a_module_level_hook_round_trips_and_any_other_callable_is_refused():
@@ -127,7 +134,7 @@ def test_a_module_level_hook_round_trips_and_any_other_callable_is_refused():
     def local(tile):
         return tile * scale
 
-    for hook in (lambda tile: tile, local):
+    for hook in (lambda tile: tile, local, _HookHolder.hook):
         with pytest.raises(TypeError):
             tuning.encoded(hook)
     for name in ("json", "_shadowed_hook", "_no_such_hook"):
