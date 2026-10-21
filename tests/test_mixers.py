@@ -171,10 +171,10 @@ PADDING = 3
 """Segment-0 slots after the documents, the packer's tail."""
 
 
-def documents_alone(model, tokens):
-    """The logits of each document of `tokens` `[1, sum(DOCUMENTS)]` run alone, concatenated, as a
+def documents_alone(model, tokens, documents=DOCUMENTS):
+    """The logits of each document of `tokens` `[1, sum(documents)]` run alone, concatenated, as a
     function of the variables."""
-    starts = (0, *itertools.accumulate(DOCUMENTS))
+    starts = (0, *itertools.accumulate(documents))
 
     def alone(variables):
         return jnp.concatenate([model.apply(variables, tokens[:, begin:end])
@@ -189,18 +189,18 @@ def pulled(forward, variables, cotangent):
     return logits, pull(cotangent.astype(logits.dtype))[0]
 
 
-def packed_forward(model, tokens, *, segmented=True):
-    """The forward of the documents' `tokens` `[1, sum(DOCUMENTS)]` packed in one row (positions
+def packed_forward(model, tokens, *, documents=DOCUMENTS, segmented=True):
+    """The forward of the documents' `tokens` `[1, sum(documents)]` packed in one row (positions
     restarting per document, then PADDING slots whose logits the loss ignores), their segment ids
     given, or with `segmented` False the same row and positions without them."""
-    total = sum(DOCUMENTS)
+    total = sum(documents)
     assert tokens.shape == (1, total)
-    documents = [jnp.full((1, length), i + 1, jnp.int32) for i, length in enumerate(DOCUMENTS)]
-    segments = jnp.concatenate([*documents, jnp.zeros((1, PADDING), jnp.int32)], axis=1)
-    positions = jnp.concatenate([*(jnp.arange(length)[None] for length in DOCUMENTS),
+    segments = [jnp.full((1, length), i + 1, jnp.int32) for i, length in enumerate(documents)]
+    segments = jnp.concatenate([*segments, jnp.zeros((1, PADDING), jnp.int32)], axis=1)
+    positions = jnp.concatenate([*(jnp.arange(length)[None] for length in documents),
                                  jnp.zeros((1, PADDING), jnp.int32)], axis=1)
     row = jnp.concatenate([tokens, jnp.zeros((1, PADDING), tokens.dtype)], axis=1)
-    tokens_at = (coordinates(segments=segments, positions=positions, max_segments=len(DOCUMENTS) + 1)
+    tokens_at = (coordinates(segments=segments, positions=positions, max_segments=len(documents) + 1)
                  if segmented else coordinates(positions=positions))
 
     def forward(variables):
@@ -230,21 +230,31 @@ per-key pairwise decays alone take 134 MB a chunk in KDA's portable math."""
 REFUSED = {"kpool_sparse_attention"}
 """Kinds that refuse packed rows."""
 
+SEEDS = {"attention": 64, "deepseek_v4": 256, "gated_delta_net": 512, "llama4": 128,
+         "mamba": 32, "mla": 64, "mlp": 64}
+"""Each kind's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for`: the fewest for
+which documents run alone compared with themselves resolve PARITY in every logit and parameter
+gradient (2026-10-20, on armada)."""
+
 
 @pytest.mark.parametrize("kind", sorted(mixers.paths))
 def test_a_packed_row_computes_what_its_documents_compute_alone(kind):
-    """Every mixer in the registry: a row packing three documents (segment ids, positions restarting),
+    """Every mixer in the registry: a row packing documents (segment ids, positions restarting),
     one across a chunk of the chunked rules, gives each document's logits and the parameters' gradients
     its documents give run one at a time, within the float64 gate, so no layer carries a conv history,
     a recurrent state or attention across a document boundary, nor between the documents and the
     segment-0 padding after them. Each draw has fresh tokens, parameters and cotangents, with the
     residual channels consistently permuted (`residual_orders`). Both fp32 runs use IEEE products;
-    the float64 truth runs each document alone under the same order."""
+    the float64 truth runs each document alone under the same order. KDA packs twelve documents,
+    DOCUMENTS repeated four times (328 real tokens), so its small summed gradients average more
+    roundings within each draw; the other kinds pack DOCUMENTS' three (82 real tokens)."""
     fields, overrides = KIND_FIELDS.get(kind, ({}, {}))
-    model = tiny(mixer=mixers.build(kind, **fields), max_seq_len=128, **overrides)
-    tokens = jax.random.randint(jax.random.key(3), (1, sum(DOCUMENTS)), 0, VOCAB)
+    documents = DOCUMENTS * 4 if kind == "kimi_delta_attention" else DOCUMENTS
+    total = sum(documents)
+    model = tiny(mixer=mixers.build(kind, **fields), max_seq_len=max(128, total + PADDING), **overrides)
+    tokens = jax.random.randint(jax.random.key(3), (1, total), 0, VOCAB)
     variables = model.init(jax.random.key(4), tokens)
-    cotangent = jax.random.normal(jax.random.key(5), (1, sum(DOCUMENTS), VOCAB))
+    cotangent = jax.random.normal(jax.random.key(5), (1, total, VOCAB))
     if kind in REFUSED:
         unsegmented = functools.partial(pulled, packed_forward(model, tokens, segmented=False))
         jax.block_until_ready(jax.jit(unsegmented)(variables, cotangent))
@@ -255,14 +265,15 @@ def test_a_packed_row_computes_what_its_documents_compute_alone(kind):
     width = residual_width(variables)
 
     def draw(seed):
-        tokens = jax.random.randint(jax.random.key(3 + 3 * seed), (1, sum(DOCUMENTS)), 0, VOCAB)
+        tokens = jax.random.randint(jax.random.key(3 + 3 * seed), (1, total), 0, VOCAB)
         variables = initialize(jax.random.key(4 + 3 * seed), tokens)
-        cotangent = jax.random.normal(jax.random.key(5 + 3 * seed), (1, sum(DOCUMENTS), VOCAB))
+        cotangent = jax.random.normal(jax.random.key(5 + 3 * seed), (1, total, VOCAB))
         order = orders(width, 2, seed)[1]
         return permuted(variables, order), tokens, cotangent
 
     def evaluated(model, variables, tokens, cotangent, *, packed):
-        forward = packed_forward(model, tokens) if packed else documents_alone(model, tokens)
+        forward = (packed_forward(model, tokens, documents=documents) if packed
+                   else documents_alone(model, tokens, documents))
         with jax.default_matmul_precision("highest"):
             logits, grads = pulled(forward, variables, cotangent)
         return {"logits": logits, "grads": grads}
@@ -271,8 +282,10 @@ def test_a_packed_row_computes_what_its_documents_compute_alone(kind):
     reference = jax.jit(functools.partial(evaluated, model, packed=False))
     truth = jax.jit(functools.partial(evaluated, model.clone(dtype=jnp.float64), packed=False))
     label = f"packed {kind}"
-    seeds = seeds_for(reference, draw, label, truth_fn=truth)
-    print(f"SIZED {label}: {seeds}", flush=True)
+    seeds = SEEDS.get(kind)
+    if seeds is None:
+        seeds = seeds_for(reference, draw, label, truth_fn=truth)
+        print(f"SIZED {label}: {seeds}", flush=True)
     assert_as_exact(dew, reference, draw, label, seeds=seeds, truth_fn=truth)
 
 
