@@ -181,15 +181,10 @@ def score_hooks(names: tuple, queries: int, keys: int) -> template.Hooks:
                           template.sinks(SINKS, ROWS, queries, 32) if "sinks" in names else None)
 
 
-ROW_TERMS = ("exact", "output")
-"""The backward's two forms of each query's `D = sum_j p dP`: summed from its tiles in a first pass
-(`backward`'s default), and `rowsum(dO * O)` from the forward's fp32 output (`residuals=`)."""
-
-
-def check_backward(case: dict, names: tuple, dtype, forward_config, backward_config, row_term: str = "exact"):
+def check_backward(case: dict, names: tuple, dtype, config):
     """`attention_triton.backward`, its every gradient (queries, keys, values, each score parameter, the
-    initial state's) on par with `jax.vjp` of the template's XLA arithmetic, from float64, its `D` in the
-    form `row_term` names (`ROW_TERMS`), the second from `forward`'s residuals."""
+    initial state's) on par with `jax.vjp` of the template's XLA arithmetic, from float64, at the dQ and
+    dK/dV config `config`."""
     queries, keys = geometry(case)
     spans = template.spans(queries, keys, ROWS, **arguments(case))
     hooks = score_hooks(names, queries, keys)
@@ -206,18 +201,11 @@ def check_backward(case: dict, names: tuple, dtype, forward_config, backward_con
                                                                              strict=True)),
                               initial)
 
-    pins = tuning.pinned({attention_triton.TritonForward: forward_config,
-                          attention_triton.TritonDq: backward_config,
-                          attention_triton.TritonDkv: backward_config})
+    pins = tuning.pinned({attention_triton.TritonDq: config, attention_triton.TritonDkv: config})
 
     def ours(query, key, value, dout):
         with pins:
-            residuals = None
-            if row_term == "output":
-                _, *residuals = attention_triton.forward(query, key, value, spans, hooks, residuals=True,
-                                                         wide=True, interpret=not ON_GPU)
-            grads = attention_triton.backward(query, key, value, spans, hooks, dout, residuals=residuals,
-                                              interpret=not ON_GPU)
+            grads = attention_triton.backward(query, key, value, spans, hooks, dout, interpret=not ON_GPU)
         return grads.query, grads.key, grads.value, grads.score_params, grads.initial
 
     def xla(query, key, value, dout):
@@ -231,35 +219,31 @@ def check_backward(case: dict, names: tuple, dtype, forward_config, backward_con
         return dq, dk, dv, dparams, dinitial
 
     assert_as_exact(jax.jit(ours), jax.jit(xla), draw,
-                    f"triton backward {case} {names} {jnp.dtype(dtype).name} {backward_config} {row_term}",
+                    f"triton backward {case} {names} {jnp.dtype(dtype).name} {config}",
                     seeds=ALL_HOOKS_SEEDS if len(names) > 1 else SEEDS)
 
 
 BACKWARD_FORMS = ("full", "causal-window", "documents", "cross-causal-lengths-starts", "two-sided-window")
 
 
-@pytest.mark.parametrize("row_term", ROW_TERMS)
 @pytest.mark.parametrize("config", PINNED[:3], ids=str)
 @pytest.mark.parametrize("form", BACKWARD_FORMS)
-def test_the_backward_is_on_par_over_every_call_form(form, config, row_term):
-    """Each call form's keys, fp32, no hooks, at pinned dQ and dK/dV configs, each form of `D`."""
-    check_backward(CASES[form], (), jnp.float32, PINNED[1], config, row_term)
+def test_the_backward_is_on_par_over_every_call_form(form, config):
+    """Each call form's keys, fp32, no hooks, at pinned dQ and dK/dV configs."""
+    check_backward(CASES[form], (), jnp.float32, config)
 
 
-@pytest.mark.parametrize("row_term", ROW_TERMS)
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16], ids=lambda d: jnp.dtype(d).name)
 @pytest.mark.parametrize("hooks", SCORE_HOOKS.values(), ids=SCORE_HOOKS)
-def test_the_backward_is_on_par_under_every_score_hook(hooks, dtype, row_term):
+def test_the_backward_is_on_par_under_every_score_hook(hooks, dtype):
     """Each score hook over causal packed documents under a window: the gradients of its parameters and
-    of the sinks' initial state too, each form of `D`."""
-    check_backward(CASES["causal-documents-window"], hooks, dtype, PINNED[1], PINNED[0], row_term)
+    of the sinks' initial state too."""
+    check_backward(CASES["causal-documents-window"], hooks, dtype, PINNED[0])
 
 
 @pytest.mark.gpu(reason="every config compiles for the GPU")
-@pytest.mark.parametrize("row_term", ROW_TERMS)
 @pytest.mark.parametrize("config", attention_triton.SPACE, ids=str)
-def test_every_backward_config_on_a_gpu(config, row_term):
+def test_every_backward_config_on_a_gpu(config):
     """Every config of the backward's space, bf16, causal documents under a window, a softcap, sinks and
     ALiBi."""
-    check_backward(CASES["causal-documents-window"], SCORE_HOOKS["softcap-sinks-alibi"], jnp.bfloat16,
-                   PINNED[1], config, row_term)
+    check_backward(CASES["causal-documents-window"], SCORE_HOOKS["softcap-sinks-alibi"], jnp.bfloat16, config)
