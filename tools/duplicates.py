@@ -2,21 +2,25 @@
 
 - As text, with pylint's similarity check: a block of more than six lines two files share, once imports,
   signatures, docstrings and comments are set aside, fails.
-- As structure: two functions in different files whose bodies are equal once every name is renamed in the
-  order it is first used, every constant is read as its type, and docstrings and annotations are dropped
-  (at least `FUNCTION_NODES` syntax nodes), fail. So do six consecutive statements of two statement lists in
-  different files, equal the same way (at least `WINDOW_NODES` nodes), each copy named once. Imports, stubs
-  (a protocol's members), a class's annotated fields and a run of calls to one function (a parser's
-  arguments, a registry's entries, a config's fields read one by one) are declarations: the first three
-  are not read, and a run is read as one statement, as the data they declare is not logic.
+- As structure: two functions whose bodies are equal once every name is renamed in the order it is first
+  used, every constant is read as its type, and docstrings and annotations are dropped (at least
+  `FUNCTION_NODES` syntax nodes), fail, in one file or in two. So do six consecutive statements of two
+  statement lists, equal the same way (at least `WINDOW_NODES` nodes). Each copy is named once: the
+  windows of one copied run as the run, and a copy that lies inside a larger one as the larger.
+  Imports, stubs (a protocol's members) and a class's annotated fields are declarations and are not read.
+  A run of calls to one function (a parser's arguments, a registry's entries, a config's fields read one
+  by one) declares data, so its constants are read as their values: runs alike in shape that declare
+  other data are no copy, and a run copied with its data is one.
 
     python tools/duplicates.py [--base=REF] PATH...
 
-Every hit is printed, and any hit fails. With `--base`, a structural hit the merge-base of REF and HEAD
-already had, the same copies by file and enclosing function, is printed and does not fail: main still holds
-the copies its first run found (ledger 896-950), and a head is held to adding none. tools/check.sh (CI's
-lint job, the lanes' lint gate) runs it held to origin/main until main's last copy goes, then with no
-base. tests/test_duplicates.py runs it on copied code.
+Every copy is printed, and any fails. With `--base`, a structural copy fails only where it is written in
+more places than at the merge-base of REF and HEAD, wherever those places are: a copy that moved is held,
+and one written beside it, or once more, fails. Main still holds the copies the gate's runs and the
+duplication audits found (ledger 896-1262), and a head is held to adding none. The text reading has no
+base: main holds no text copy, so any fails. tools/check.sh (CI's lint job, the lanes' lint gate) runs the
+gate held to origin/main until main's last copy goes, then with no base. tests/test_duplicates.py runs it
+on copied code.
 
 It runs the test environment's pylint, which pyproject.toml's test extra pins.
 """
@@ -24,18 +28,21 @@ It runs the test environment's pylint, which pyproject.toml's test extra pins.
 import argparse
 import ast
 import hashlib
+import os
 import subprocess
 import sys
+import time
 from collections import defaultdict
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
+from itertools import pairwise
 from pathlib import Path
 
 from pylint.lint import Run
 
 ARGUMENTS = ("--disable=all", "--enable=duplicate-code", "--min-similarity-lines=6", "--ignore-imports=y",
              "--ignore-signatures=y", "--ignore-docstrings=y", "--ignore-comments=y", "--score=n")
-"""The text reading's one statement of the check, which the gate and its test both run."""
+"""The text reading: pylint's similarity check, as the gate runs it."""
 
 FUNCTION_NODES = 22
 """The fewest syntax nodes a function's body has for its copies to count: below it, a body says too little
@@ -49,9 +56,10 @@ WINDOW_NODES = 28
 six statements (ledger 920) has 28."""
 
 BODIES = ("body", "orelse", "finalbody")
+DEFINITIONS = (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
 DROPPED = {"ctx", "type_comment", "decorator_list", "returns", "annotation", "type_params", "kind"}
 NAME = "\0"
-"""Marks an identifier among a statement's tokens, for each window to number in its own order."""
+"""Marks an identifier among a statement's tokens, for each unit to number in its own order."""
 
 
 @dataclass(frozen=True)
@@ -60,27 +68,31 @@ class Place:
     owner: str
     """The qualified name of the function or class the code is in; "" at a module's top level."""
     line: int
+    end: int
+    """The last line the code spans."""
+
+    def holds(self, other: "Place") -> bool:
+        return self.file == other.file and self.line <= other.line and other.end <= self.end
+
+    def meets(self, other: "Place") -> bool:
+        return self.file == other.file and self.line <= other.end and other.line <= self.end
+
+
+@dataclass(frozen=True)
+class Unit:
+    kind: str
+    """"function" or "statements"."""
+    key: str
+    """Its digest: the units equal up to renaming share it."""
+    place: Place
 
 
 @dataclass(frozen=True)
 class Hit:
     kind: str
-    """"function" or "statements"."""
+    key: str
     places: tuple[Place, ...]
-
-    def copies(self) -> frozenset[tuple[str, str]]:
-        return frozenset((place.file, place.owner) for place in self.places)
-
-
-def declaration(statement: ast.stmt) -> bool:
-    """A docstring or a bare string standing as one, an import, or a stub: a function whose body is only
-    `...` or `pass` (a protocol's member)."""
-    if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
-        body = [line for line in statement.body if not docstring(line)]
-        return len(body) <= 1 and all(
-            isinstance(line, ast.Pass) or (isinstance(line, ast.Expr) and isinstance(line.value, ast.Constant)
-                                           and line.value.value is Ellipsis) for line in body)
-    return docstring(statement) or isinstance(statement, (ast.Import, ast.ImportFrom))
+    """Where the code is written, in file and line order, no two overlapping."""
 
 
 def docstring(statement: ast.stmt) -> bool:
@@ -88,54 +100,24 @@ def docstring(statement: ast.stmt) -> bool:
             and isinstance(statement.value.value, str))
 
 
-def stripped(node: ast.AST, field: str, statements: list[ast.stmt]) -> list[ast.stmt]:
-    """`node`'s statement list without its declarations, nor a class's annotated fields."""
-    fields = isinstance(node, ast.ClassDef) and field == "body"
-    return [statement for statement in statements
-            if not declaration(statement) and not (fields and isinstance(statement, ast.AnnAssign))]
+def declaration(statement: ast.stmt, in_class: bool) -> bool:
+    """A docstring or a bare string standing as one, an import, a stub (a function whose body is only `...`
+    or `pass`), a bare annotation, or a class's annotated field."""
+    if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
+        body = [line for line in statement.body if not docstring(line)]
+        return len(body) <= 1 and all(
+            isinstance(line, ast.Pass) or (isinstance(line, ast.Expr) and isinstance(line.value, ast.Constant)
+                                           and line.value.value is Ellipsis) for line in body)
+    if isinstance(statement, ast.AnnAssign):
+        return in_class or statement.value is None
+    return docstring(statement) or isinstance(statement, (ast.Import, ast.ImportFrom))
 
 
-def tokens(node: ast.AST, out: list[str]) -> int:
-    """`node` as tokens into `out`, every identifier marked with `NAME` and every constant its type (None,
-    booleans and the ellipsis as themselves); its count of syntax nodes."""
-    out.append(type(node).__name__)
-    count = 1
-    for field, value in ast.iter_fields(node):
-        if field in DROPPED:
-            continue
-        out.append(field)
-        if field in BODIES and isinstance(value, list):
-            value = logic(stripped(node, field, value))
-        if isinstance(node, ast.Constant) and field == "value":
-            out.append(repr(value) if value is None or value is Ellipsis or isinstance(value, bool)
-                       else type(value).__name__)
-        elif isinstance(value, ast.AST):
-            count += tokens(value, out)
-        elif isinstance(value, list):
-            out.append(f"[{len(value)}")
-            for item in value:
-                if isinstance(item, ast.AST):
-                    count += tokens(item, out)
-                elif isinstance(item, str):
-                    out.append(NAME + item)
-                else:
-                    out.append(repr(item))
-        elif isinstance(value, str):
-            out.append(NAME + value)
-        else:
-            out.append(repr(value))
-    return count
-
-
-def digest(parts: Sequence[list[str]]) -> str:
-    """The parts' tokens with each identifier numbered in the order it is first used."""
-    numbered: dict[str, str] = {}
-    text = []
-    for part in parts:
-        text.extend(numbered.setdefault(token, f"n{len(numbered)}") if token.startswith(NAME) else token
-                    for token in part)
-        text.append(";")
-    return hashlib.sha256("\x1f".join(text).encode()).hexdigest()
+def assigned(statement: ast.stmt) -> ast.stmt:
+    """A valued annotated assignment as the assignment it is: an annotation hides no copy."""
+    if isinstance(statement, ast.AnnAssign) and statement.value is not None:
+        return ast.copy_location(ast.Assign(targets=[statement.target], value=statement.value), statement)
+    return statement
 
 
 def callee(statement: ast.stmt) -> str | None:
@@ -145,69 +127,175 @@ def callee(statement: ast.stmt) -> str | None:
     return None
 
 
-def logic(body: list[ast.stmt]) -> list[ast.stmt]:
-    """`body` with each run of calls to one function (a parser's arguments, a registry's entries, a
-    config's fields read one by one) kept as its first: what the run declares is data, so code that differs
-    only in it is one logic, and a run is one statement."""
-    return [statement for index, statement in enumerate(body)
-            if index == 0 or callee(statement) is None or callee(statement) != callee(body[index - 1])]
+def normalized(tree: ast.Module) -> set[int]:
+    """`tree` as the gate reads it, rewritten in place: its declarations dropped and its valued annotated
+    assignments plain. Returns the ids of the statements in runs of calls to one function, which declare
+    data."""
+    data: set[int] = set()
+    for node in ast.walk(tree):
+        for field in BODIES:
+            statements = getattr(node, field, None)
+            if not (isinstance(statements, list) and statements and isinstance(statements[0], ast.stmt)):
+                continue
+            kept = [assigned(statement) for statement in statements
+                    if not declaration(statement, isinstance(node, ast.ClassDef))]
+            setattr(node, field, kept)
+            for first, second in pairwise(kept):
+                if callee(first) is not None and callee(first) == callee(second):
+                    data.update((id(first), id(second)))
+    return data
 
 
-def units(file: str, tree: ast.Module) -> Iterator[tuple[str, str, Place, int]]:
-    """(kind, digest, place, nodes) for each function of `tree` and each window of its statement lists."""
-    shapes: dict[int, tuple[list[str], int]] = {}
+class Shapes:
+    """Each statement of one normalized tree as tokens, with its count of syntax nodes, read once."""
 
-    def shape(statement: ast.stmt) -> tuple[list[str], int]:
-        if id(statement) not in shapes:
+    def __init__(self, data: set[int]):
+        self.data = data
+        self.read: dict[int, tuple[list[str], int]] = {}
+
+    def of(self, statement: ast.stmt) -> tuple[list[str], int]:
+        if id(statement) not in self.read:
             out: list[str] = []
-            shapes[id(statement)] = (out, tokens(statement, out))
-        return shapes[id(statement)]
+            self.read[id(statement)] = (out, self.tokens(statement, out, id(statement) in self.data))
+        return self.read[id(statement)]
 
-    def visit(node: ast.AST, owner: str) -> Iterator[tuple[str, str, Place, int]]:
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+    def tokens(self, node: ast.AST, out: list[str], data: bool) -> int:
+        """`node` as tokens into `out`, every identifier marked with `NAME` and every constant its type
+        (None, booleans and the ellipsis as themselves), or its value where `node` declares data; its count
+        of syntax nodes."""
+        out.append(type(node).__name__)
+        count = 1
+        for field, value in ast.iter_fields(node):
+            if field in DROPPED:
+                continue
+            out.append(field)
+            if isinstance(node, ast.Constant) and field == "value":
+                literal = data or value is None or value is Ellipsis or isinstance(value, bool)
+                out.append(repr(value) if literal else type(value).__name__)
+            elif isinstance(value, ast.AST):
+                count += self.tokens(value, out, data)
+            elif isinstance(value, list):
+                out.append(f"[{len(value)}")
+                for item in value:
+                    if isinstance(item, ast.stmt):
+                        part, nodes = self.of(item)
+                        out.extend(part)
+                        count += nodes
+                    elif isinstance(item, ast.AST):
+                        count += self.tokens(item, out, data)
+                    elif isinstance(item, str):
+                        out.append(NAME + item)
+                    else:
+                        out.append(repr(item))
+            elif isinstance(value, str):
+                out.append(NAME + value)
+            else:
+                out.append(repr(value))
+        return count
+
+    def digest(self, statements: Sequence[ast.stmt]) -> tuple[str, int]:
+        """The statements' tokens, each identifier numbered in the order it is first used, hashed; and
+        their count of syntax nodes."""
+        numbered: dict[str, str] = {}
+        text = []
+        nodes = 0
+        for statement in statements:
+            part, count = self.of(statement)
+            nodes += count
+            text.extend(numbered.setdefault(token, f"n{len(numbered)}") if token.startswith(NAME) else token
+                        for token in part)
+            text.append(";")
+        return hashlib.sha256("\x1f".join(text).encode()).hexdigest(), nodes
+
+
+def segments(statements: list[ast.stmt]) -> Iterator[list[ast.stmt]]:
+    """`statements`' runs between definitions: a window reads logic, and a definition is a unit of its own."""
+    run: list[ast.stmt] = []
+    for statement in statements:
+        if isinstance(statement, DEFINITIONS):
+            if run:
+                yield run
+            run = []
+        else:
+            run.append(statement)
+    if run:
+        yield run
+
+
+def units(file: str, tree: ast.Module) -> Iterator[Unit]:
+    """Each function of `tree` and each window of six statements of its statement lists, at its size."""
+    shapes = Shapes(normalized(tree))
+
+    def visit(node: ast.AST, owner: str) -> Iterator[Unit]:
+        if isinstance(node, DEFINITIONS):
             owner = f"{owner}.{node.name}" if owner else node.name
         for field in BODIES:
             statements = getattr(node, field, None)
             if not (isinstance(statements, list) and statements and isinstance(statements[0], ast.stmt)):
                 continue
-            body = logic(stripped(node, field, statements))
-            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and field == "body" and body:
-                nodes = sum(shape(statement)[1] for statement in body)
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and field == "body":
+                key, nodes = shapes.digest(statements)
                 if nodes >= FUNCTION_NODES:
-                    place = Place(file, owner, node.lineno)
-                    yield "function", digest([shape(s)[0] for s in body]), place, nodes
-            for start in range(len(body) - WINDOW + 1):
-                window = body[start:start + WINDOW]
-                nodes = sum(shape(statement)[1] for statement in window)
-                if nodes >= WINDOW_NODES:
-                    yield ("statements", digest([shape(s)[0] for s in window]),
-                           Place(file, owner, window[0].lineno), nodes)
-        for handler in getattr(node, "handlers", None) or ():
-            yield from visit(handler, owner)
+                    end = node.end_lineno or node.lineno
+                    yield Unit("function", key, Place(file, owner, node.lineno, end))
+            for run in segments(statements):
+                for start in range(len(run) - WINDOW + 1):
+                    window = run[start:start + WINDOW]
+                    key, nodes = shapes.digest(window)
+                    if nodes >= WINDOW_NODES:
+                        last = window[-1]
+                        yield Unit("statements", key,
+                                   Place(file, owner, window[0].lineno, last.end_lineno or last.lineno))
         for child in ast.iter_child_nodes(node):
-            if isinstance(child, (ast.stmt, ast.match_case)):
+            if isinstance(child, (ast.stmt, ast.excepthandler, ast.match_case)):
                 yield from visit(child, owner)
 
     yield from visit(tree, "")
 
 
-def structural(sources: dict[str, str]) -> list[Hit]:
-    """The functions and windows `sources` (file to text) write in two files or more."""
-    found: dict[tuple[str, str], list[Place]] = defaultdict(list)
+def distinct(places: list[Place]) -> list[Place]:
+    """`places` in file and line order, less each that overlaps the one kept before it: a window that recurs
+    within one run of statements is written once there."""
+    kept: list[Place] = []
+    for place in sorted(places, key=lambda place: (place.file, place.line)):
+        if not (kept and kept[-1].meets(place)):
+            kept.append(place)
+    return kept
+
+
+def found(sources: dict[str, str]) -> list[Hit]:
+    """Every unit `sources` (file to text) write at two places or more: each a copy, unit by unit."""
+    grouped: dict[tuple[str, str], list[Place]] = defaultdict(list)
     for file, text in sorted(sources.items()):
-        for kind, key, place, _ in units(file, ast.parse(text, filename=file)):
-            found[kind, key].append(place)
-    hits = sorted((Hit(kind, tuple(places)) for (kind, _), places in found.items()
-                   if len({place.file for place in places}) > 1),
-                  key=lambda hit: [(place.file, place.line) for place in hit.places])
-    # A window inside copies a function hit already names is that hit, and the windows over the same copies
-    # (the same files and functions) are one copy, named at its first.
-    functions = [hit.copies() for hit in hits if hit.kind == "function"]
-    windows: dict[frozenset[tuple[str, str]], Hit] = {}
+        for unit in units(file, ast.parse(text, filename=file)):
+            grouped[unit.kind, unit.key].append(unit.place)
+    hits = [Hit(kind, key, tuple(apart)) for (kind, key), places in grouped.items()
+            if len(apart := distinct(places)) > 1]
+    return sorted(hits, key=lambda hit: [(place.file, place.line) for place in hit.places])
+
+
+def named(hits: list[Hit]) -> list[Hit]:
+    """`hits` (as `found` orders them) as the copies they are: the windows of one copied run, each place
+    overlapping its counterpart's, as one; and a copy whose every place lies inside another's as that one."""
+    copies: list[Hit] = []
     for hit in hits:
-        if hit.kind == "statements" and not any(hit.copies() <= copies for copies in functions):
-            windows.setdefault(hit.copies(), hit)
-    return [hit for hit in hits if hit.kind == "function" or windows.get(hit.copies()) is hit]
+        for index, run in enumerate(copies):
+            if hit.kind == run.kind == "statements" and len(hit.places) == len(run.places):
+                pairs = list(zip(run.places, hit.places, strict=True))
+                if all(a.owner == b.owner and a.meets(b) for a, b in pairs):
+                    copies[index] = Hit(run.kind, run.key, tuple(
+                        Place(a.file, a.owner, min(a.line, b.line), max(a.end, b.end)) for a, b in pairs))
+                    break
+        else:
+            copies.append(hit)
+    return [hit for hit in copies
+            if not any(other is not hit and all(any(outer.holds(place) for outer in other.places)
+                                                for place in hit.places) for other in copies)]
+
+
+def structural(sources: dict[str, str]) -> list[Hit]:
+    """The copies `sources` (file to text) write, named."""
+    return named(found(sources))
 
 
 def python_files(paths: Sequence[str]) -> list[Path]:
@@ -217,43 +305,62 @@ def python_files(paths: Sequence[str]) -> list[Path]:
     return sorted(files)
 
 
-def git(*arguments: str) -> str:
-    return subprocess.run(["git", *arguments], capture_output=True, text=True, check=True).stdout
+def git(top: Path, *arguments: str) -> str:
+    return subprocess.run(["git", "-C", str(top), *arguments], stdout=subprocess.PIPE, text=True,
+                          check=True).stdout
 
 
-def new(hits: list[Hit], base: str) -> list[Hit]:
-    """The hits `base`'s merge-base with HEAD did not have: a copy no group of the same kind there held, by
-    file and enclosing function. A hit whose files are all as the merge-base has them it had."""
-    merged = git("merge-base", "HEAD", base).strip()
-    changed = set(git("diff", "--name-only", merged, "--").splitlines())
-    candidates = [hit for hit in hits if any(place.file in changed for place in hit.places)]
-    files = {place.file for hit in candidates for place in hit.places}
-    present = set(git("ls-tree", "-r", "--name-only", merged, "--", *files).splitlines()) if files else set()
-    before = structural({file: git("show", f"{merged}:{file}") for file in files & present})
-    held = defaultdict(list)
-    for hit in before:
-        held[hit.kind].append(hit.copies())
-    return [hit for hit in candidates if not any(hit.copies() <= copies for copies in held[hit.kind])]
+def merge_base(top: Path, base: str) -> str:
+    return git(top, "merge-base", "HEAD", base).strip()
+
+
+def new(hits: list[Hit], merged: str, top: Path) -> list[Hit]:
+    """The copies of `hits` (as `found` gives them, each file named from the repository's top `top`)
+    written in more places than at the commit `merged`. A file the checkout leaves as `merged` has it holds
+    the places it holds now; a changed, deleted or new one is read as `merged` has it."""
+    changed = set(git(top, "diff", "--name-only", merged, "--").splitlines()) | set(
+        git(top, "ls-files", "--others", "--exclude-standard", "--full-name").splitlines())
+    present = set(git(top, "ls-tree", "-r", "--name-only", merged).splitlines())
+    before: dict[tuple[str, str], list[Place]] = defaultdict(list)
+    for file in sorted(changed & present):
+        if file.endswith(".py"):
+            for unit in units(file, ast.parse(git(top, "show", f"{merged}:{file}"), filename=file)):
+                before[unit.kind, unit.key].append(unit.place)
+    return [hit for hit in hits if len(hit.places) > len(distinct(
+        [place for place in hit.places if place.file not in changed] + before[hit.kind, hit.key]))]
 
 
 def report(hit: Hit) -> str:
-    places = "; ".join(f"{place.file}:{place.line} {place.owner or '<module>'}" for place in hit.places)
-    return f"duplicate {hit.kind} in {len({place.file for place in hit.places})} files: {places}"
+    places = "; ".join(f"{place.file}:{place.line}-{place.end} {place.owner or '<module>'}"
+                       for place in hit.places)
+    return f"duplicate {hit.kind} at {len(hit.places)} places: {places}"
 
 
 def main(arguments: Sequence[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--base", help="a commit: a structural hit fails if new to its merge-base with HEAD")
+    parser.add_argument("--base", help="a commit: a structural copy fails if written in more places than at"
+                                       " its merge-base with HEAD")
     parser.add_argument("paths", nargs="+")
     options = parser.parse_args(arguments)
     files = python_files(options.paths)
+    # Held to a base, files are named from the repository's top, as git names them, and an unknown base
+    # fails here, before either reading.
+    top = Path(git(Path.cwd(), "rev-parse", "--show-toplevel").strip()) if options.base else Path.cwd()
+    merged = merge_base(top, options.base) if options.base else ""
+    started = time.monotonic()
     # pylint reads a directory as a package; the files, as files.
     text = Run([*ARGUMENTS, *map(str, files)], exit=False).linter.msg_status
-    hits = structural({str(file): file.read_text() for file in files})
-    failing = new(hits, options.base) if options.base else hits
-    for hit in hits:
-        print(("" if hit in failing else "(held by the base) ") + report(hit))
-    print(f"{len(hits)} structural duplicates over {len(files)} files, {len(failing)} failing")
+    read = time.monotonic()
+    hits = found({os.path.relpath(file.resolve(), top) if options.base else str(file): file.read_text()
+                  for file in files})
+    failing = new(hits, merged, top) if options.base else hits
+    for hit in named(failing):
+        print(report(hit))
+    held = named([hit for hit in hits if hit not in failing])
+    for hit in held:
+        print("(held by the base) " + report(hit))
+    print(f"{len(named(failing))} structural copies failing, {len(held)} held by the base, over {len(files)}"
+          f" files; text read in {read - started:.0f} s, structure in {time.monotonic() - read:.0f} s")
     return 1 if text or failing else 0
 
 
