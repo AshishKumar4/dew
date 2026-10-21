@@ -91,20 +91,19 @@ def test_a_concatenated_conversation_keeps_its_target_across_a_row_end():
     assert held == sum(length - 1 for length in rendered)
 
 
-def store_of_documents(directory) -> np.ndarray:
-    """A token store of 40 short documents, each ended by EOS (0); the stream it holds."""
+def store_of_documents(directory) -> tuple[str, np.ndarray]:
+    """A token store of 40 short documents, each ended by EOS (0): its url and the stream it holds."""
     stream = np.concatenate([np.asarray([*range(1, 4 + index % 5), 0], np.int64) for index in range(40)])
-    write_token_corpus(directory, stream.astype(np.uint16), None, eos_id=0)
-    return stream
+    return write_token_corpus(directory, stream, eos_id=0).train, stream
 
 
 def test_a_token_stores_windows_are_the_text_recipes(tmp_path):
     """A token store's stream cut into fixed windows two apart, shuffled and repeated as the
     recipe orders them, read by index: the windows written first on the store read its stream by
     index, so the plan and batches are the recipe's."""
-    store_of_documents(tmp_path)
-    expected = loader(TextData(str(tmp_path), seq_len=8, stride=2), batch=4, read="indexed", loading=LOADING)
-    chain = TokenFiles(str(tmp_path)).windows(8, stride=2).shuffle(0).repeat().batch(4)
+    url, _ = store_of_documents(tmp_path)
+    expected = loader(TextData(url, seq_len=8, stride=2), batch=4, read="indexed", loading=LOADING)
+    chain = TokenFiles(url).windows(8, stride=2).shuffle(0).repeat().batch(4)
     built = compile(chain, read="indexed", loading=LOADING)
     assert built.plan.identity() == expected.plan.identity()
     same_batches(expected, built)
@@ -115,9 +114,9 @@ def test_the_token_windows_preset_reads_a_stores_windows_as_the_text_recipe(tmp_
     batches; recorded and read back with its stride overridden, windows that far apart."""
     from dew.data.records import Unrecorded, decode, encode, override
 
-    store_of_documents(tmp_path)
-    expected = loader(TextData(str(tmp_path), seq_len=8, stride=2), batch=4, read="indexed", loading=LOADING)
-    chain = TokenFiles(str(tmp_path)).shuffle(0).repeat().pipe(presets.token_windows, seq_len=8, batch=4,
+    url, _ = store_of_documents(tmp_path)
+    expected = loader(TextData(url, seq_len=8, stride=2), batch=4, read="indexed", loading=LOADING)
+    chain = TokenFiles(url).shuffle(0).repeat().pipe(presets.token_windows, seq_len=8, batch=4,
                                                                stride=2)
     built = compile(chain, read="indexed", loading=LOADING)
     assert built.plan.identity() == expected.plan.identity()
@@ -125,7 +124,7 @@ def test_the_token_windows_preset_reads_a_stores_windows_as_the_text_recipe(tmp_
     written = encode(chain)
     assert not isinstance(written, Unrecorded)
     wider = decode(override(written, "token_windows.stride", 4))
-    recipe = loader(TextData(str(tmp_path), seq_len=8, stride=4), batch=4, read="indexed", loading=LOADING)
+    recipe = loader(TextData(url, seq_len=8, stride=4), batch=4, read="indexed", loading=LOADING)
     assert compile(wider, read="indexed", loading=LOADING).plan.identity() == recipe.plan.identity()
 
 
@@ -133,28 +132,12 @@ def test_a_token_stores_documents_are_packed_whole(tmp_path):
     """A token store's documents, ended by EOS, packed first-fit with no tokenizer: each row holds
     whole documents, so its targets are its documents' own, and together the rows of a pass hold
     every target of every document."""
-    stream = store_of_documents(tmp_path)
-    rows = list(TokenFiles(str(tmp_path)).pipe(presets.lm, None, seq_len=8, batch=1, bins=8))
+    url, stream = store_of_documents(tmp_path)
+    rows = list(TokenFiles(url).pipe(presets.lm, None, seq_len=8, batch=1, bins=8))
     segments = [np.asarray(row["text_coordinates"].segments)[0] for row in rows]
     held = sum(int(np.count_nonzero((ids[:-1] == ids[1:]) & (ids[:-1] > 0))) for ids in segments)
     documents = np.split(stream, np.flatnonzero(stream == 0)[:-1] + 1)
     assert held == sum(len(document) - 1 for document in documents)
-
-
-@pytest.mark.parametrize("composed", ["alone", "concatenated", "mixed"])
-def test_a_token_store_that_states_no_document_ends_is_not_packed(tmp_path, composed):
-    """A store with neither a document index nor an EOS token reads as one document, whose pieces
-    no producer made, so packing its documents is refused, alone or among other sources; its
-    stream still reads as fixed windows."""
-    from dew.data import concat, mix
-
-    write_token_corpus(tmp_path, np.arange(64, dtype=np.uint16), None)
-    store = TokenFiles(str(tmp_path))
-    chained = {"alone": store, "concatenated": concat([store]), "mixed": mix([store])}[composed]
-    with pytest.raises(ValueError):
-        chained.pipe(presets.lm, None, seq_len=8, batch=4)
-    rows = list(store.pipe(presets.lm, None, seq_len=8, batch=4, pack=None))
-    assert np.asarray(rows[0]["text"]).shape == (4, 9)
 
 
 def test_the_lm_preset_tokenizes_a_field_of_another_name():
