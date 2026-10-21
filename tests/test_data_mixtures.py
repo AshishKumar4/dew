@@ -309,7 +309,7 @@ def document_dir(root: Path, documents, eos: int = 0) -> str:
     """A token directory whose stream is `documents`, each closed by eos."""
     stream = np.concatenate([np.asarray([*list(document), eos], np.uint16)
                              for document in documents])
-    return str(write_token_corpus(root, stream, stream, vocab_size=256, eos_id=eos))
+    return write_token_corpus(root, stream, stream, vocab_size=256, eos_id=eos).train
 
 
 def packed_corpus(root: Path, documents: int = 40, length: int = 3) -> str:
@@ -1332,19 +1332,19 @@ def test_phases_read_each_chain_until_its_step_as_the_phased_text_recipe(tmp_pat
     from dew.data import phases, presets
     from dew.data.sources import TokenFiles
 
-    first, second = tmp_path / "first", tmp_path / "second"
     # Documents of nine tokens, each ended by EOS (0).
-    for path, size in ((first, 200), (second, 300)):
-        ids = np.where(np.arange(size) % 10 == 9, 0, np.arange(size) % 250 + 1).astype(np.uint16)
-        write_token_corpus(path, ids, eos_id=0)
+    first, second = (
+        write_token_corpus(tmp_path / name, np.where(np.arange(size) % 10 == 9, 0, np.arange(size) % 250 + 1),
+                           eos_id=0).train
+        for name, size in (("first", 200), ("second", 300)))
     loading = Loading(workers=0, threads=1, read_buffer=1)
     recipe = TextData(source="", seq_len=8, pack="first-fit",
-                      phases=(DataPhase(str(first), 2), DataPhase({str(first): 1.0, str(second): 1.0}, None)))
+                      phases=(DataPhase(first, 2), DataPhase({first: 1.0, second: 1.0}, None)))
     expected = loader(recipe, batch=2, read="indexed", loading=loading)
 
     def packed(path):
         # Eight open rows, the recipe's default.
-        return TokenFiles(str(path)).pipe(presets.lm, None, seq_len=8, batch=None, pack="first-fit", bins=8)
+        return TokenFiles(path).pipe(presets.lm, None, seq_len=8, batch=None, pack="first-fit", bins=8)
 
     # The phases ordered and repeated as the recipe's loader orders them, then batched.
     phased = phases((packed(first), 2), (mix([packed(first), packed(second)], by="tokens"), None))

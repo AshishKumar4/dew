@@ -1,39 +1,63 @@
-"""The binary schema shared by distinct token-corpus generators."""
+"""Token corpora the tests read, written as `dew data export` writes a token store."""
 
+import dataclasses
+import itertools
 import json
 from collections.abc import Iterable
 from pathlib import Path
 
 import numpy as np
 
-from tools.token_corpus import write_token_meta
+
+@dataclasses.dataclass(frozen=True)
+class Corpus:
+    """A token corpus's committed stores, as `dew data export` writes them: its training tokens, and
+    its validation tokens where it has them, each read as `TokenFiles(url)`."""
+
+    train: str
+    val: str | None = None
 
 
 def write_token_corpus(directory: Path, train: np.ndarray, val: np.ndarray | None = None,
                        *, tokenizer: str = "byte", vocab_size: int = 256,
-                       eos_id: int | None = None) -> Path:
+                       eos_id: int | None = None) -> Corpus:
+    """`train`, and `val` where given, each a stream of token ids, written as committed token stores
+    at `directory/train` and `directory/val`: each document a record, the tokens through each
+    `eos_id` and any tail past the last; without an `eos_id`, the whole stream one record."""
     directory.mkdir(parents=True, exist_ok=True)
-    (directory / "train.bin").write_bytes(train.tobytes())
-    if val is not None:
-        assert train.dtype == val.dtype
-        (directory / "val.bin").write_bytes(val.tobytes())
-    write_token_meta(directory, len(train), 0 if val is None else len(val), dtype=train.dtype.name,
-                     tokenizer=tokenizer, vocab_size=vocab_size, eos_id=eos_id)
-    return directory
+    train_url = _token_store(directory / "train", train, tokenizer=tokenizer, vocab_size=vocab_size,
+                             eos_id=eos_id)
+    val_url = None if val is None else _token_store(directory / "val", val, tokenizer=tokenizer,
+                                                    vocab_size=vocab_size, eos_id=eos_id)
+    return Corpus(train_url, val_url)
+
+
+def _token_store(url: Path, tokens: np.ndarray, *, tokenizer: str, vocab_size: int,
+                 eos_id: int | None) -> str:
+    from dew.data import Memory
+    from dew.data.sinks import export
+
+    ids = np.asarray(tokens).astype(np.int32)
+    ends = [] if eos_id is None else (np.flatnonzero(ids == eos_id) + 1).tolist()
+    bounds = [0, *ends, *([] if ends and ends[-1] == len(ids) else [len(ids)])]
+    documents = [ids[start:stop] for start, stop in itertools.pairwise(bounds) if stop > start]
+    stated = {"token_store": True, "tokenizer": tokenizer, "vocab_size": vocab_size, "dtype": "int32",
+              "eos_id": eos_id}
+    export(Memory([{"text": document} for document in documents]), str(url), format="array_record",
+           length_field="text", metadata=stated)
+    return str(url)
 
 
 def encoded_token_fixture(directory: Path, documents: Iterable[str], *, tokenizer: str = "byte",
-                          val_fraction: float = 0.1, eos: bool = False) -> Path:
-    """The legacy token-store fixture format, each document encoded by the library's tokenize step
-    (`Tokenize`), empty ones left out."""
+                          val_fraction: float = 0.1, eos: bool = False) -> Corpus:
+    """`documents` encoded by the library's tokenize step (`Tokenize`), empty ones left out, as a
+    token corpus whose first `val_fraction` of the tokens is its validation store."""
     from dew.data.text import Tokenize
 
     step = Tokenize(tokenizer, eos=eos)
     vocabulary = step.vocabulary
-    dtype = (np.uint8 if vocabulary.vocab_size <= 256 else
-             np.uint16 if vocabulary.vocab_size <= 65536 else np.uint32)
     rows = [step.map({"text": document})["text"] for document in documents if document]
-    tokens = np.concatenate([np.zeros(0, np.int32), *rows]).astype(dtype)
+    tokens = np.concatenate([np.zeros(0, np.int32), *rows])
     held = int(len(tokens) * val_fraction)
     return write_token_corpus(directory, tokens[held:], tokens[:held], tokenizer=tokenizer,
                               vocab_size=vocabulary.vocab_size, eos_id=vocabulary.eos_id if eos else None)

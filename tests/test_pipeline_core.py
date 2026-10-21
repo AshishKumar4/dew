@@ -2097,8 +2097,8 @@ def test_an_indexed_pack_over_a_token_store_reads_its_planned_global_windows(tmp
 
     documents = [np.append(np.full(size, index + 1), 0).astype(np.int32)
                  for index, size in enumerate((5, 3, 9, 2, 7, 4, 6, 1))]
-    write_token_corpus(tmp_path, np.concatenate(documents).astype(np.uint16), eos_id=0)
-    store = TokenFiles(str(tmp_path)).provision()
+    corpus = write_token_corpus(tmp_path, np.concatenate(documents).astype(np.uint16), eos_id=0)
+    store = TokenFiles(corpus.train).provision()
 
     def windows(pipeline, read):
         rows = iterate(pipeline.flat_map(Chunks(8)).pack(8, bins=2), read=read, loading=READ)
