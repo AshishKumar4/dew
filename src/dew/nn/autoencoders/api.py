@@ -4,7 +4,7 @@ import copy
 import dataclasses
 from abc import ABC, abstractmethod
 from collections.abc import Iterator, Mapping
-from typing import Any, ClassVar, Self
+from typing import Self
 
 import jax
 import jax.numpy as jnp
@@ -105,12 +105,6 @@ class AutoEncoder(ABC):
     params: Variables
     model: nn.Module
 
-    record_name: ClassVar[str | None] = None
-    """The name a built-in subclass's record goes by (`to_json`); None for
-    an autoencoder no record declares."""
-    record_module: ClassVar[type[Any]]
-    """The native module class a built-in subclass's `model` is, which its
-    record's 'model' rebuilds (each subclass's own `model` type)."""
 
     def record_arguments(self) -> dict:
         """The built-in subclass's constructor arguments besides `model` and
@@ -134,18 +128,21 @@ class AutoEncoder(ABC):
         return replaced
 
     def to_json(self) -> dict:
-        """Return the record of this built-in autoencoder's constructor, without its parameters:
-        `record_name`, its module's fields and `record_arguments`.
+        """Return the record of this built-in autoencoder's constructor, without its parameters: its
+        registration's name (`pretrained.REGISTRATIONS`), its module's fields and `record_arguments`.
 
-        One no record declares (`record_name` None) raises `TypeError`.
+        One no registration declares raises `TypeError`.
         """
-        if self.record_name is None:
-            raise TypeError(f"{type(self).__name__} needs an explicit autoencoder record declaration")
         from dew.registry import record_fields
+
+        from .pretrained import registration
+        registered = registration(type(self))
+        if registered is None:
+            raise TypeError(f"{type(self).__name__} needs an explicit autoencoder record declaration")
         arguments = {name: np.asarray(value).tolist() if isinstance(value, np.ndarray | jax.Array) else value
                      for name, value in self.record_arguments().items()}
-        return {'name': self.record_name,
-                'fields': {'model': record_fields(self.model, self.record_module), **arguments}}
+        return {'name': registered.record,
+                'fields': {'model': record_fields(self.model, registered.module), **arguments}}
 
     @classmethod
     def from_json(cls, record, *, params: Variables) -> AutoEncoder:
@@ -154,22 +151,13 @@ class AutoEncoder(ABC):
         """
         from dew.registry import from_record
 
-        from .dc_ae import DCAutoencoder
-        from .flux2 import Flux2Autoencoder
-        from .qwen_image import QwenImageAutoencoder
-        from .rae import RAEAutoencoder
-        from .sd_vae import StableDiffusionVAE
-        from .wan import WanAutoencoder
-
-        built = {wrapper.record_name: wrapper for wrapper in (
-            StableDiffusionVAE, DCAutoencoder, WanAutoencoder, RAEAutoencoder, Flux2Autoencoder,
-            QwenImageAutoencoder)}
-        if record['name'] not in built:
+        from .pretrained import registration
+        registered = registration(record['name'])
+        if registered is None:
             raise ValueError(f"{record['name']!r} is not a built-in autoencoder declaration")
-        wrapper = built[record['name']]
         fields = dict(record['fields'])
-        model = from_record(wrapper.record_module, fields.pop('model'))
-        return wrapper(model=model, params=params, **fields)
+        model = from_record(registered.module, fields.pop('model'))
+        return registered.wrapper(model=model, params=params, **fields)
 
     @abstractmethod
     def encode_batch(self, params, x: jnp.ndarray, key: jax.Array | None = None,

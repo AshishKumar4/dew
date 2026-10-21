@@ -424,8 +424,6 @@ class WanAutoencoder(AutoEncoder):
     `chunked_decode`), so a clip's length does not set the memory they hold.
     """
 
-    record_name = 'wan'
-    record_module = WanVAE
 
     def __init__(self, *, model: WanVAE, params: Variables, latents_mean, latents_std):
         self.model = model

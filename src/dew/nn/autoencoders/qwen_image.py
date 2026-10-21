@@ -331,8 +331,6 @@ class QwenImageAutoencoder(ModuleAutoEncoder[QwenImageVAE]):
     latent normalization, `(z - latents_mean) / latents_std` on the way out
     and `z * latents_std + latents_mean` on the way in."""
 
-    record_name = 'qwen_image'
-    record_module = QwenImageVAE
 
     def __init__(self, *, model: QwenImageVAE, params: Variables,
                  latents_mean: Sequence[float], latents_std: Sequence[float]):
