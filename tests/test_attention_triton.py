@@ -156,12 +156,13 @@ def test_a_query_that_sees_no_key_reads_zero_and_a_sink_keeps_its_share():
 
 SCORE_HOOKS = {"none": (), "softcap": ("softcap",), "sinks": ("sinks",), "alibi": ("alibi",),
                "temperature": ("temperature",), "key-bias": ("key",), "tile-bias": ("tile",),
-               "resumed": ("resumed",), "custom-vjp": ("custom",),
+               "resumed": ("resumed",), "custom-vjp": ("custom",), "row-indexed": ("indexed",),
                "softcap-sinks-alibi": ("softcap", "sinks", "alibi")}
 """The score hooks the backward differentiates, each kind of parameter among them: ALiBi's slopes a
 head's, a query's temperature (divided by, so padding's zeros would be infinite slopes), a per-key bias,
-a dense bias, a softcap through a `jax.custom_vjp` (which forward-mode differentiation refuses); and the
-softmax's initial state as sinks or as a resumed partial."""
+a dense bias, a softcap through a `jax.custom_vjp` (which forward-mode differentiation refuses), a bias
+indexed off the query's coordinates' column (which reads them at their tile rank); and the softmax's
+initial state as sinks or as a resumed partial."""
 
 
 @jax.custom_vjp
@@ -206,6 +207,8 @@ def score_hooks(names: tuple, queries: int, keys: int, value_width: int = 32):
             s = SOFTCAP * jnp.tanh(s / SOFTCAP)
         if "custom" in names:
             s = custom_softcap(s)
+        if "indexed" in names:
+            s = s + 0.01 * q_pos[:, :1].astype(s.dtype)
         if "alibi" in names:
             s = s + values.pop(0).astype(s.dtype) * k_pos.astype(s.dtype)
         if "temperature" in names:
@@ -234,8 +237,16 @@ def score_hooks(names: tuple, queries: int, keys: int, value_width: int = 32):
             initial = template.Initial(jax.random.normal(streams[5], (ROWS, 4, queries)), total, acc)
         return tuple(params), initial
 
-    scoring = bool({"softcap", "custom", "alibi", "temperature", "key", "tile"} & set(names))
+    scoring = bool({"softcap", "custom", "indexed", "alibi", "temperature", "key", "tile"} & set(names))
     return (score_mod if scoring else None), tuple(kinds), draw
+
+
+def joint(config: attention_triton.Tiles, dkv_config: attention_triton.Tiles | None = None):
+    """The backward's config of the dQ launch's `config` and the dK/dV launch's warps and stages, from
+    `dkv_config` (`config` by default)."""
+    other = config if dkv_config is None else dkv_config
+    return attention_triton.BackwardTiles(config.block_q, config.block_k, config.warps, config.stages,
+                                          other.warps, other.stages)
 
 
 def check_backward(case: dict, names: tuple, dtype, config, dkv_config=None, *, width: int = 32,
@@ -259,8 +270,7 @@ def check_backward(case: dict, names: tuple, dtype, config, dkv_config=None, *, 
         return template.Hooks(score_mod, tuple(template.Param(value, kind)
                                                for value, kind in zip(params, kinds, strict=True)), initial)
 
-    pins = tuning.pinned({attention_triton.TritonDq: config,
-                          attention_triton.TritonDkv: config if dkv_config is None else dkv_config})
+    pins = tuning.pinned({attention_triton.TritonBackward: joint(config, dkv_config)})
 
     def ours(query, key, value, dout, params, initial):
         with pins:
@@ -315,8 +325,7 @@ def test_a_wide_parameter_computes_as_its_fp32_value_and_its_gradient_returns_wi
     query, key, value = drawing(queries, keys, jnp.float32)(0)
     dout = jax.random.normal(jax.random.key(5), query.shape, jnp.float32)
     (slopes,), _ = draw_hooks(0)
-    with jax.enable_x64(new_val=True), tuning.pinned({attention_triton.TritonDq: PINNED[0],
-                                                       attention_triton.TritonDkv: PINNED[0]}):
+    with jax.enable_x64(new_val=True), tuning.pinned({attention_triton.TritonBackward: joint(PINNED[0])}):
         grads = [attention_triton.backward(query, key, value, spans,
                                            template.Hooks(score_mod, (template.Param(wide, kinds[0]),)), dout,
                                            interpret=not ON_GPU)
@@ -325,6 +334,24 @@ def test_a_wide_parameter_computes_as_its_fp32_value_and_its_gradient_returns_wi
     np.testing.assert_array_equal(np.asarray(grads[0].score_params[0], np.float32),
                                   np.asarray(grads[1].score_params[0]))
     np.testing.assert_array_equal(np.asarray(grads[0].query), np.asarray(grads[1].query))
+
+
+def test_an_fp16_weight_too_small_once_normalized_still_reaches_dv():
+    """fp16, one query over keys whose third weight is about 5.3e-8 before its denominator of 2 and
+    2.7e-8 after it, which fp16's least subnormal (6e-8) holds only before: dV's third row takes it, as
+    the reference's derivative does."""
+    spans = template.spans(1, 3, 1)
+    query = jnp.ones((1, 1, 1, 1), jnp.float16)
+    key = jnp.asarray([0.0, 0.0, -16.75], jnp.float16).reshape(1, 3, 1, 1)
+    value = jnp.zeros((1, 3, 1, 1), jnp.float16)
+    dout = jnp.full((1, 1, 1, 1), 2.0, jnp.float16)
+    with tuning.pinned({attention_triton.TritonBackward: joint(PINNED[0])}):
+        ours = attention_triton.backward(query, key, value, spans, None, dout, scale=1.0,
+                                         interpret=not ON_GPU).value
+    _, pull = jax.vjp(lambda value: template.reference(query, key, value, spans, scale=1.0), value)
+    [theirs] = pull(dout)
+    assert float(theirs[0, 2, 0, 0]) > 0
+    np.testing.assert_array_equal(np.asarray(ours, np.float32), np.asarray(theirs, np.float32))
 
 
 def test_the_backward_resumes_queries_that_read_no_key():
