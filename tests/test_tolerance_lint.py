@@ -169,6 +169,35 @@ def test_a_float_compared_within_a_tolerance_outside_the_gate_is_reported(lint, 
     assert len(list(lint.tolerances(module))) == count
 
 
+def test_counts_a_helper_beside_the_file_returns_are_whole_where_its_own_file_proves_it(lint, tmp_path):
+    """A test importing its support's helper by a bare module name: the helper's token counts are whole
+    as its own file makes them, and a helper there that may return a float is not."""
+    _module(lint, tmp_path, "tests/counting_support.py", """\
+        def delivered(batches):
+            targets = [0, 0]
+            for source, count in batches:
+                targets[int(source)] += int(count)
+            return targets
+
+
+        def shares(batches):
+            left, right = delivered(batches)
+            return left / 2, right / 2
+        """)
+    body = """\
+        from counting_support import delivered, shares
+
+
+        def test():
+            left, right = delivered(batches)
+            assert abs(left - right) <= 12 + 12
+            half, other = shares(batches)
+            assert abs(half - other) <= 12
+        """
+    [found] = list(lint.tolerances(_module(lint, tmp_path, "tests/test_case.py", body)))
+    assert found.line == 8
+
+
 def test_the_gate_compares_floats_and_scripts_outside_tests_and_tools_are_not_read(lint, tmp_path):
     body = "import numpy as np\nnp.testing.assert_allclose(a, b, rtol=1e-5)\n"
     assert not list(lint.tolerances(_module(lint, tmp_path, "tests/reference_error.py", body)))

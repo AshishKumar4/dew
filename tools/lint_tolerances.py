@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import ast
 import re
-from collections.abc import Iterable, Iterator, Mapping, Set
+from collections.abc import Callable, Iterable, Iterator, Mapping, Set
 from dataclasses import dataclass, field
 from typing import Protocol
 
@@ -70,8 +70,9 @@ def _called(node: ast.Call, table: Mapping[str, str]) -> str:
 @dataclass
 class _Reading:
     """What SLOP020 knows of one file: each node's import table, its calls' definitions, and the ids of
-    its functions that may return an error or a difference, and of those that return only a margin; and,
-    for each function every return of which is a tuple, the places of it that may hold an error."""
+    its functions that may return an error or a difference, and of those that return only a margin or
+    only whole numbers; for each function every return of which is a tuple, the places of it that may
+    hold an error; and whether an imported function returns only whole numbers (`comparisons`)."""
     tables: Mapping[int, Mapping[str, str]]
     calls: Calls
     erring: set[int]
@@ -79,6 +80,7 @@ class _Reading:
     margining: set[int]
     counting: set[int] = field(default_factory=set)
     erring_at: dict[int, set[int]] = field(default_factory=dict)
+    whole_import: Callable[[str], bool] = field(default=lambda called: False)
 
 
 @dataclass
@@ -230,9 +232,9 @@ def _counted(value: ast.AST, scope: _Scope | None = None, reading: _Reading | No
     """Whether `value` is a whole number, or holds only whole numbers, by an explicit construction: an
     int literal, a truth value, an `int`, `len`, one-argument `round` or `.count` call, `range`, a
     `sum`, `max` or `min` of whole numbers, a container, comprehension or element of them, arithmetic
-    that keeps them whole, a name every binding of which is one, or a call of a function of the file
-    every return of which is one (`delivered` returning its token counts). Nothing is whole by its
-    name or its use."""
+    that keeps them whole, a name every binding of which is one, or a call of a function of the file, or
+    one it imports (`whole_import`), every return of which is one (`delivered` returning its token
+    counts). Nothing is whole by its name or its use."""
     def counted(part):
         return _counted(part, scope, reading, seen)
 
@@ -270,7 +272,10 @@ def _counted(value: ast.AST, scope: _Scope | None = None, reading: _Reading | No
     if isinstance(value.func, ast.Name) and value.func.id in {"sum", "max", "min", "range"} and value.args \
             and not value.keywords:
         return all(counted(argument) for argument in value.args)
-    return scope is not None and reading is not None and _returned(value, scope, reading, reading.counting)
+    if scope is None or reading is None:
+        return False
+    return _returned(value, scope, reading, reading.counting) or reading.whole_import(
+        _called(value, reading.tables.get(id(value), {})))
 
 
 def _measured(inner: ast.AST, scope: _Scope, reading: _Reading) -> tuple[bool, bool]:
@@ -472,17 +477,10 @@ def _relation(left: ast.AST, right: ast.AST, scope: _Scope, reading: _Reading) -
     return None
 
 
-def comparisons(tree: ast.Module, tables: Mapping[int, Mapping[str, str]], calls: Calls
-                ) -> Iterator[tuple[ast.AST, str]]:
-    """Each place a file compares floats within a tolerance, and what it is (its nodes' import tables
-    `tables`, its calls' definitions `calls`): a tolerance API not told to
-    compare exactly (`_exact`), `atol` or `rtol` handed to any call, an ordering relation that compares
-    within a tolerance (`_relation`), and a name bound to a tolerance. What is known of a value only
-    adds findings: nothing is exempted as whole or as a time, so a bound on a count, a time or a mask
-    of positions is written as a plain ordering (lo <= x <= hi, or x - y < w for a window). SLOP020
-    reads conventional code: it does not prove what an obfuscated one computes (a shadowed built-in, a
-    mutated alias), which review does."""
-    reading = _Reading(tables, calls, set(), set(), set())
+def _read(tree: ast.Module, tables: Mapping[int, Mapping[str, str]], calls: Calls,
+          whole_import: Callable[[str], bool]) -> tuple[_Reading, list[ast.AST]]:
+    """What SLOP020 knows of a file's functions (`_Reading`), and the file's scopes."""
+    reading = _Reading(tables, calls, set(), set(), set(), whole_import=whole_import)
     nodes = [tree, *(node for node in ast.walk(tree) if isinstance(node, scopes.SCOPES))]
     functions = [node for node in nodes if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)]
     # Which functions return only tuples is read first, from their returns' shapes alone, so a call of one
@@ -514,6 +512,29 @@ def comparisons(tree: ast.Module, tables: Mapping[int, Mapping[str, str]], calls
                     grew = True
         if not grew:
             break
+    return reading, nodes
+
+
+def whole_functions(tree: ast.Module, tables: Mapping[int, Mapping[str, str]], calls: Calls) -> set[str]:
+    """The names of a file's module-level functions every return of which is whole (`_counted`), read
+    for a file that imports one; what they call through an import of their own is not followed."""
+    reading, _ = _read(tree, tables, calls, lambda called: False)
+    return {node.name for node in tree.body
+            if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and id(node) in reading.counting}
+
+
+def comparisons(tree: ast.Module, tables: Mapping[int, Mapping[str, str]], calls: Calls,
+                whole_import: Callable[[str], bool] = lambda called: False) -> Iterator[tuple[ast.AST, str]]:
+    """Each place a file compares floats within a tolerance, and what it is (its nodes' import tables
+    `tables`, its calls' definitions `calls`, and whether a function it imports returns only whole
+    numbers, `whole_import` of its dotted name): a tolerance API not told to
+    compare exactly (`_exact`), `atol` or `rtol` handed to any call, an ordering relation that compares
+    within a tolerance (`_relation`), and a name bound to a tolerance. What is known of a value only
+    adds findings: nothing is exempted as whole or as a time, so a bound on a count, a time or a mask
+    of positions is written as a plain ordering (lo <= x <= hi, or x - y < w for a window). SLOP020
+    reads conventional code: it does not prove what an obfuscated one computes (a shadowed built-in, a
+    mutated alias), which review does."""
+    reading, nodes = _read(tree, tables, calls, whole_import)
     for scope_node in nodes:
         scope = _read_scope(scope_node, reading)
         for node in scope.nodes:
