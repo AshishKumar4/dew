@@ -295,10 +295,17 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None) -> _Draws:
             truth = (truth_fn or reference_fn)(*widened(inputs))
         paths = jax.tree_util.tree_leaves_with_path(dew)
         names = names or [jax.tree_util.keystr(path) for path, _ in paths]
-        leaves = zip([leaf for _, leaf in paths], jax.tree.leaves(reference), jax.tree.leaves(truth),
-                     strict=True)
         row = []
-        for leaf, their_leaf, true in leaves:
+        for (path, leaf), their_leaf, true in zip(paths, jax.tree.leaves(reference), jax.tree.leaves(truth),
+                                                  strict=True):
+            if np.size(leaf) == 0:
+                # An empty leaf (a one-tap convolution's history) is exact by construction: held to the
+                # reference's shape and dtype, it adds no error and resolves nothing.
+                kept = (np.shape(leaf), np.result_type(leaf))
+                assert kept == (np.shape(their_leaf), np.result_type(their_leaf)), (
+                    jax.tree_util.keystr(path), kept, np.shape(their_leaf))
+                row.append((0.0, 0.0, 0.0, 0.0, 0, True))
+                continue
             leaf, their_leaf, true = (np.asarray(value, np.float64) for value in (leaf, their_leaf, true))
             row.append((float(np.mean(np.square(leaf - true))), float(np.mean(np.square(their_leaf - true))),
                         *_rows(leaf, their_leaf, true),

@@ -240,3 +240,18 @@ def test_a_recording_declares_the_count_its_recorded_reference_resolves(tmp_path
         draw_recorded, reference, truth = indexed_recording(dict(stored), "site", seeds)
         assert_as_exact(jax.jit(lambda index, inputs: squared(inputs)), reference, draw_recorded, "recorded",
                         seeds=seeds, truth_fn=truth)
+
+
+def test_check_one_holds_an_empty_leaf_exact_by_construction():
+    """A tree with an empty leaf beside a real one (a one-tap convolution's history): the empty leaf adds
+    no error and resolves nothing, so the tree is judged by its real leaf; an empty leaf whose shape or
+    dtype is not the reference's fails."""
+    def tree(fn):
+        return jax.jit(lambda x, w: {"y": fn(x, w)["y"], "history": jnp.zeros((16, 0, 48), jnp.float32)})
+
+    assert_as_exact(tree(_reordered), tree(_product), _draw, "with an empty leaf",
+                    seeds=seeds_for(tree(_product), _draw, "with an empty leaf"))
+    narrower = jax.jit(lambda x, w: {"y": _reordered(x, w)["y"],
+                                     "history": jnp.zeros((16, 0, 48), jnp.bfloat16)})
+    with pytest.raises(AssertionError):
+        assert_as_exact(narrower, tree(_product), _draw, "a narrower empty leaf", seeds=8)
