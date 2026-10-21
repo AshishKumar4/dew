@@ -358,6 +358,6 @@ def test_a_large_initial_maximum_gives_the_references_state_gradients():
 
     reference = jax.vjp(attend, query, key, value, state)[1](dout)[3]
     for found in (triton, portable):
-        for mine, theirs in zip(found.initial, reference, strict=True):
+        for mine, theirs in zip(jax.tree.leaves(found.initial), jax.tree.leaves(reference), strict=True):
             assert np.isfinite(np.asarray(mine)).all()
             np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs))
