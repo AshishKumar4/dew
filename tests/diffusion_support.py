@@ -54,7 +54,8 @@ def trained_step(objective, batch, checkpoints=None):
     """One SGD step of a published source's `objective` over `batch` through the public trainer, at a
     fixed key: the loss falls, the transformer's output projection moves, and the loaded encoders and
     autoencoder, which are state rather than weights, keep every leaf. With `checkpoints`, the stepped
-    state saves and places back bit for bit. Returns the initial and the stepped states."""
+    state saves and places back bit for bit. Returns the initial state, read to the host before
+    the step donated it, and the stepped state."""
     import optax
     from affine_run import raw_leaf
 
@@ -70,13 +71,16 @@ def trained_step(objective, batch, checkpoints=None):
         return float(loss.total / loss.mass)
 
     before = value(initial.variables)
+    # The step donates the state it is given, the loaded source's own arrays among its leaves, so
+    # what it is compared with is read first.
+    started = jax.device_get(initial)
     state, _, _, _, accepted, _ = trainer.compile(initial, batch)(initial, batch)
     assert bool(accepted)
     assert value(state.variables) < before
     assert not np.allclose(state.variables["params"]["proj_out"]["kernel"],
-                           initial.variables["params"]["proj_out"]["kernel"])
+                           started.variables["params"]["proj_out"]["kernel"])
     for held in ("encoders", "autoencoder"):
-        for got, want in zip(jax.tree.leaves(state.variables[held]), jax.tree.leaves(initial.variables[held]),
+        for got, want in zip(jax.tree.leaves(state.variables[held]), jax.tree.leaves(started.variables[held]),
                              strict=True):
             np.testing.assert_array_equal(got, want)
     if checkpoints is not None:
@@ -85,7 +89,7 @@ def trained_step(objective, batch, checkpoints=None):
         restored, _, _ = trainer.place()
         for got, want in zip(jax.tree.leaves(restored), jax.tree.leaves(state), strict=True):
             np.testing.assert_array_equal(raw_leaf(got), raw_leaf(want))
-    return initial, state
+    return started, state
 
 
 def saved_after_one_step(config, batch, directory, rate: float):

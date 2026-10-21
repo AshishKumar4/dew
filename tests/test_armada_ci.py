@@ -310,6 +310,50 @@ def test_a_python_child_joins_its_files_record(ci, tmp_path, monkeypatch, cache_
                                    "tests/test_own_environment.py": ["changed"]}
 
 
+def fetcher(root: Path, *, due: bool = False) -> Path:
+    """A stand-in tools/fetched_fixtures.py under `root`: its fetch records that it ran, and with `due`
+    refuses as the real one does a pin whose upload is due."""
+    (root / "tools").mkdir(exist_ok=True)
+    (root / "tools/fetched_fixtures.py").write_text(
+        "import sys, time\nfrom pathlib import Path\n"
+        "assert sys.argv[1:] == ['fetch']\n"
+        "Path('fetched').write_text(str(time.monotonic()))\n"
+        + ("raise SystemExit('x.npz: pinned with no revision: its upload is due')\n" if due else ""))
+    return root / "fetched"
+
+
+def test_a_gpu_lane_fetches_the_pinned_fixtures_before_any_file_and_stops_where_one_is_due(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """The tests read pinned fixtures offline (CLOSED_HUB), so the lane fetches them first, while the Hub is
+    reachable; a pin whose upload is due stops the lane before any file runs."""
+    url, _, _ = cache_worker
+    monkeypatch.setenv("DEW_XLA_CACHE_URL", url)
+    monkeypatch.setenv("DEW_XLA_CACHE_TOKEN", "token")
+    monkeypatch.setenv("XLA_PYTHON_CLIENT_MEM_FRACTION", "0.5")
+    tools = tmp_path / "bin"
+    tools.mkdir()
+    (tools / "nvidia-smi").write_text("#!/bin/sh\necho 81920\n")
+    (tools / "nvidia-smi").chmod(0o755)
+    monkeypatch.setenv("PATH", f"{tools}:{os.environ['PATH']}")
+    venv = tmp_path / ".venv-3.12/bin"
+    venv.mkdir(parents=True)
+    (venv / "python").write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
+    (venv / "python").chmod(0o755)
+    (tmp_path / "tests/test_reads.py").write_text(
+        "import time\nfrom pathlib import Path\n"
+        "def test_reads(): Path('read').write_text(str(time.monotonic()))\n")
+    out = tmp_path / "verdict.json"
+    fetched = fetcher(tmp_path)
+    assert ci.gpu_lane("3.12", ["tests/test_reads.py"], out, cache=True, processes=1, deadline=600.0) == 0
+    assert float(fetched.read_text()) < float((tmp_path / "read").read_text())
+    fetched.unlink()
+    (tmp_path / "read").unlink()
+    fetcher(tmp_path, due=True)
+    with pytest.raises(subprocess.CalledProcessError):
+        ci.gpu_lane("3.12", ["tests/test_reads.py"], out, cache=True, processes=1, deadline=600.0)
+    assert fetched.is_file() and not (tmp_path / "read").exists()
+
+
 def test_a_gpu_lane_runs_each_file_in_a_process_of_its_own_within_its_memory_share(
         ci, tmp_path, monkeypatch, cache_worker):
     """The GPU lane runs each file once, in a process of its own. A file no
@@ -352,6 +396,7 @@ def test_a_gpu_lane_runs_each_file_in_a_process_of_its_own_within_its_memory_sha
     venv.mkdir(parents=True)
     (venv / "python").write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
     (venv / "python").chmod(0o755)
+    fetcher(tmp_path)
 
     def ran(stem: str) -> list[list[str]]:
         return [path.read_text().split() for path in sorted(tmp_path.glob(f"ran-{stem}-*"),

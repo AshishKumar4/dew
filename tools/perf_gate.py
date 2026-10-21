@@ -87,10 +87,11 @@ ATTENTION = ("cudnn", "xla")
 CHECKPOINT = """
 import json, sys, tempfile, time
 import jax
-import benchmark_step as bench
+from benchmark_cases import Case
+from benchmark_models import build_trainer
 from dew.checkpoints import Checkpoints
-case = bench.Case(**json.loads(sys.argv[1]))
-trainer = bench.build_trainer(case)
+case = Case(**json.loads(sys.argv[1]))
+trainer = build_trainer(case)
 abstract = jax.eval_shape(trainer.initial_state)
 shardings = trainer.shardings(abstract)
 state = jax.block_until_ready(jax.jit(trainer.initial_state, out_shardings=shardings)())
