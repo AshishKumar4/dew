@@ -20,8 +20,8 @@ imports and compiles), which is what armada measured the file at beyond its
 tests' times in tests/test_durations.json, at the cut its rows were last timed
 at and shared among that cut's groups (`measured_cut`), so the file takes the
 fewest groups whose heaviest, setup included, holds to `target` (`split`). A file weighs armada's
-median of its last green runs, else its tests' sum in
-tests/test_durations.json, else the mean. Each entry names its rows, one a
+median of its last green runs, or its tests' sum in tests/test_durations.json where that is more
+(the file now holds tests those runs did not), else that sum scaled to armada, else the mean. Each entry names its rows, one a
 file (or a file's group), so armada grades a task that leaves one out as not
 green, and armada queues the heaviest entries first.
 
@@ -300,16 +300,23 @@ def recorded_tests() -> dict[str, list[float]]:
 
 def weights(files: list[str], timings: dict, python: str = PYTHONS[0]) -> dict[str, float | None]:
     """Each file's seconds on armada under `python`: its median, which armada
-    sums over a split file's groups (`task`); else its tests' sum in
-    tests/test_durations.json, scaled by how much slower armada ran the files
-    measured both ways; else None, for a file nothing has timed."""
+    sums over a split file's groups (`task`), or its tests' sum in
+    tests/test_durations.json where that is more. Each test's record is its
+    least time, so a sum past the median means the file now holds tests its
+    measured runs did not, which a head that added them recorded (`durations`):
+    base/kernels' route census, 1,576 tests recorded at 2,654 s in a file main
+    ran in 6 s, was packed by that median with six other files into one task,
+    which ran past its deadline (train 18). Else the recorded sum, scaled by
+    how much slower armada ran the files measured both ways; else None, for a
+    file nothing has timed."""
     recorded = {name: sum(tests) for name, tests in recorded_tests().items()}
     measured = {name: timings.get("files", {})[row(python, name, "")] for name in files
                 if row(python, name, "") in timings.get("files", {})}
     ratios = sorted(measured[name] / recorded[name] for name in files
                     if name in measured and recorded.get(name, 0) > 1)
     slower = ratios[len(ratios) // 2] if ratios else 1.0
-    return {name: measured.get(name, recorded[name] * slower if name in recorded else None) for name in files}
+    return {name: max(measured[name], recorded.get(name, 0.0)) if name in measured
+            else recorded[name] * slower if name in recorded else None for name in files}
 
 
 def row(python: str, name: str, split: str) -> str:
