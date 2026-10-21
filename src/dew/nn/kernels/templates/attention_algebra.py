@@ -331,7 +331,7 @@ def off_anchor_start(peak0: jax.Array, total0: jax.Array, term0: jax.Array, maxi
                      width: int) -> tuple[OffAnchor, jax.Array, jax.Array]:
     """The first pass from the softmax's initial state (its maximum, denominator and share of D's
     numerator) weighed at the forward's `maximum`, and that state's denominator and share there."""
-    carried = jnp.where(peak0 == -jnp.inf, 0.0, jnp.exp(peak0 - maximum))
+    carried = jnp.where(peak0 == -jnp.inf, 0.0, jnp.exp(jnp.minimum(peak0 - maximum, 0.0)))
     state_total, state_share = total0 * carried, term0 * carried
     nothing = jnp.zeros_like(total0)
     return OffAnchor(state_total, jnp.zeros((total0.shape[0], width), jnp.float32), nothing, nothing), \
@@ -343,7 +343,7 @@ def off_anchor_weights(logits: jax.Array, maximum: jax.Array, at_anchor: jax.Arr
     """A tile's weights `exp(s - m)` at the forward's maximum, fp32; them narrowed to the values'
     `dtype` as the forward rounds them, zero at the anchor key (`at_anchor`), the left operand of `B`'s
     product; and the anchor key's narrowed weight, fp32."""
-    exponentials = jnp.exp(logits - maximum[:, None])
+    exponentials = below(logits, maximum)
     rounded = exponentials.astype(dtype)
     rest = jnp.where(at_anchor, jnp.zeros_like(rounded), rounded)
     own = jnp.where(at_anchor, rounded, jnp.zeros_like(rounded)).astype(jnp.float32).sum(axis=-1)
@@ -428,9 +428,17 @@ def dq_finish(sums: DqSums, prior: jax.Array, state_total: jax.Array, peak0: jax
     return sums.dq * ratio[:, None], delta + refined, total, mass, grads
 
 
+def below(logits: jax.Array, peak: jax.Array) -> jax.Array:
+    """`exp(s - m)` for a tile's logits recomputed in the backward against the forward's maximum `m`,
+    fp32: `m` is every key's maximum, so a logit past it by the rounding the two passes do not share (the
+    forward's maximum taken in base 2 and back, or another tile shape's product) is the maximum itself,
+    its weight 1, never past it."""
+    return jnp.exp(jnp.minimum(logits - peak[:, None], 0.0))
+
+
 def normalized(logits: jax.Array, peak: jax.Array, total: jax.Array) -> tuple[jax.Array, jax.Array]:
-    """A tile's unnormalized weights `exp(s - m)` and its weights `p`, fp32."""
-    exponentials = jnp.exp(logits - peak[:, None])
+    """A tile's unnormalized weights `exp(s - m)` (`below`) and its weights `p`, fp32."""
+    exponentials = below(logits, peak)
     return exponentials, exponentials * inverse(total)[:, None]
 
 
@@ -455,7 +463,7 @@ def refinement(residual: jax.Array, mass: jax.Array, peak0: jax.Array, shares: t
     by the softmax's shift, and what they sum to here (`residual`, over the keys' weights `mass`) is D's
     rounding. Moving D by it over the weights' total lets dK/dV, the initial state's gradients and the
     head and query parameters' take the D whose cotangents do."""
-    carried = jnp.where(peak0 == -jnp.inf, 0.0, jnp.exp(peak0 - peak)) * inverse(total)
+    carried = jnp.where(peak0 == -jnp.inf, 0.0, jnp.exp(jnp.minimum(peak0 - peak, 0.0))) * inverse(total)
     whole_residual = residual + (shares[1] - shares[0] * (anchor + delta)) * carried
     whole_mass = mass + shares[0] * carried
     return jnp.where(whole_mass > 0, whole_residual / jnp.where(whole_mass > 0, whole_mass, 1.0), 0.0)
