@@ -66,6 +66,7 @@ from ..inputs import (
     PredictionPhase,
     coordinates as build_coordinates,
     coordinates_of,
+    numbered_blocks,
 )
 from ..kv_cache import KVCache
 from ..mixers import AttentionMixer, MixerBase, MixerContext
@@ -1243,8 +1244,6 @@ class CausalTransformer(nn.Module):
             routed=spec.routed,
             media_routed=(spec.routed and not spec.hash_routed
                           and self.mixture is not None and self.mixture.media_bias),
-            routing_block=(self.mixture.routing_block if spec.routed and not spec.hash_routed
-                           and self.mixture is not None else None),
             engram=None if spec.engram is None or self.engram is None else functools.partial(
                 EngramLayer, rows=self.engram.num_embeddings[spec.engram], head_dim=self.engram.head_dim,
                 hc_mult=self.hyper_connections.hc_mult if self.hyper_connections else 1,
@@ -1829,15 +1828,20 @@ class CausalTransformer(nn.Module):
         engram_ids = (None if self.engram is None else self.engram_hashes(
             tokens, None if coordinates is None else coordinates.valid,
             None if coordinates is None else coordinates.positions, decode, media_mask))
+        # A block router's blocks are numbered once for every routed layer.
+        block = None if self.mixture is None else self.mixture.routing_block
+        blocks = None if block is None else numbered_blocks(
+            coordinates_of(None, *tokens.shape[:2]) if coordinates is None else coordinates, tokens.shape[:2],
+            block)
         if (coordinates is None and image_groups is None and rotary_positions is None
                 and pairwise_mask is None and key_positions is None and not self.hash_layers
-                and engram_ids is None and media_mask is None and admitted is None):
+                and engram_ids is None and media_mask is None and admitted is None and blocks is None):
             return None
         return AttentionMetadata(
             coordinates=coordinates, image_groups=image_groups, rotary_positions=rotary_positions,
             pairwise_mask=pairwise_mask, key_positions=key_positions,
             token_ids=tokens if self.hash_layers else None, engram_ids=engram_ids, media=media_mask,
-            admitted=admitted)
+            admitted=admitted, blocks=blocks)
 
     def looped(self, x, **stack):
         """Run the layer stack over `x` once, or as `loop` says: the layers before
