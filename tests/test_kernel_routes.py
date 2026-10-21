@@ -8,6 +8,7 @@ import pytest
 
 from tools import kernel_routes
 
+
 @pytest.mark.parametrize("mode", kernel_routes.MODES)
 @pytest.mark.parametrize("target", kernel_routes.audited())
 @pytest.mark.parametrize("family", kernel_routes.families())
