@@ -44,8 +44,8 @@ from dew.nn.kv_cache import KVCache, write_cache
 # dsa_kpool reads INDEXER and the expanded cache below. Reading the registry
 # contracts from base avoids importing the kind hub back during this module's
 # initialization, so either kind can be the first imported.
-from dew.nn.mixer_base import MixerBase, MixerContext
-from dew.nn.precision import at_least_fp32
+from dew.nn.mixer_base import ATTENTION_CONTEXT_RESIDUALS, MixerBase, MixerContext
+from dew.nn.precision import at_least_fp32, compensated_add, float32_dot_general, float32_products
 from dew.nn.rope import YarnScaling, deinterleaved, rotate, yarn_query_scale, yarn_rope_freqs
 from dew.nn.sharding import RESIDUAL, LogicalAxes, constrain, down_projection, logical_axes
 from dew.nn.sparse_selection import index_scores, selection_mask, sparse_latent_attention, top_k_selection
@@ -125,12 +125,16 @@ def indexer_kl(scores, query, key, keep, scale: float):
 
     def head(summed, projections):
         q, k = projections
-        logits = jnp.where(keep, jnp.einsum('bsd,btd->bst', q, k), masked)
-        return summed + jax.nn.softmax(logits, axis=-1), None
+        product = jnp.einsum('bsd,btd->bst', q, k, precision=float32_products(q.dtype))
+        probabilities = jax.nn.softmax(jnp.where(keep, product, masked), axis=-1)
+        return compensated_add(summed, (probabilities, jnp.zeros_like(probabilities))), None
 
-    summed, _ = jax.lax.scan(
-        head, jnp.zeros((batch, length, total), wide),
-        (jnp.moveaxis(query, 2, 0), jnp.moveaxis(key, 2, 0)))
+    # The heads sum one at a time, as a compensated pair, so the sum is rounded once: a plain
+    # running sum biased the KL by its roundings (1.67 times MaxText's error from float64, whose
+    # sum over heads runs at once).
+    zeros = jnp.zeros((batch, length, total), wide)
+    (high, low), _ = jax.lax.scan(head, (zeros, zeros), (jnp.moveaxis(query, 2, 0), jnp.moveaxis(key, 2, 0)))
+    summed = high + low
     target = summed / (jnp.sum(summed, axis=-1, keepdims=True) + INDEXER_EPS)
     indexer = jax.nn.softmax(jnp.where(keep, scores.astype(wide), masked), axis=-1)
     return jnp.sum(target * (jnp.log(target + INDEXER_EPS) - jnp.log(indexer + INDEXER_EPS)), axis=-1)
