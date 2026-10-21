@@ -36,6 +36,10 @@ TILES = (attention_triton.Tiles(32, 32, 4, 2), attention_triton.Tiles(64, 32, 4,
 at equal tiles."""
 
 
+RESIDUALS = ("output", "maximum", "denominator", "anchor key")
+"""The forward's outputs with `residuals`, in order."""
+
+
 def both(case: dict, names: frozenset, dtype, tiles: attention_triton.Tiles):
     """The Triton mainloop's and the plain-JAX mainloop's output and residuals over `case` and the hooks
     `names`, seed 0."""
@@ -55,7 +59,7 @@ def both(case: dict, names: frozenset, dtype, tiles: attention_triton.Tiles):
 def test_both_mainloops_compute_the_same_bits_over_every_call_form(form, tiles):
     """Each call form's keys, fp32, no hooks."""
     triton, portable = both(CASES[form], HOOKS["none"], jnp.float32, tiles)
-    for name, mine, theirs in zip(("output", "maximum", "denominator"), triton, portable, strict=True):
+    for name, mine, theirs in zip(RESIDUALS, triton, portable, strict=True):
         np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs), err_msg=f"{form} {name}")
 
 
@@ -65,7 +69,7 @@ def test_both_mainloops_compute_the_same_bits_under_every_hook(hooks, dtype):
     """Each hook (softcap, ALiBi, sinks, the output gate, all at once) over a windowed causal call of
     packed documents, in both dtypes."""
     triton, portable = both(CASES["causal-documents-window"], HOOKS[hooks], dtype, TILES[1])
-    for name, mine, theirs in zip(("output", "maximum", "denominator"), triton, portable, strict=True):
+    for name, mine, theirs in zip(RESIDUALS, triton, portable, strict=True):
         np.testing.assert_array_equal(np.asarray(mine, np.float32), np.asarray(theirs, np.float32),
                                       err_msg=f"{hooks} {jnp.dtype(dtype).name} {name}")
 
