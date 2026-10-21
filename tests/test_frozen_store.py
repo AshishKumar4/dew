@@ -13,8 +13,8 @@ import pytest
 from etils import epath
 
 from dew.checkpoints import FROZEN_STORE, Checkpoints
-from dew.config.data import RecordsData, loader
-from dew.data import Loading
+from dew.data import Loading, Memory
+from dew.data.compile import compile
 from dew.lora import Adapter, LoRA
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.base import FROZEN, Aux, Objective, Ratio
@@ -22,6 +22,11 @@ from dew.objectives.lm import LMObjective
 from dew.training import Trainer
 
 LOADING = Loading(workers=0, threads=1, read_buffer=1)
+
+
+def records(rows):
+    """`rows` as a run reads them: shuffled, repeated, in batches of eight."""
+    return compile(Memory(rows).shuffle(0).repeat().batch(8), read="memory", loading=LOADING)
 
 
 def model():
@@ -38,9 +43,7 @@ def adapted_run(directory, steps: int, *, keep: int = 3) -> tuple[Trainer, Check
     rows = [{"text": (np.arange(9, dtype=np.int32) + index) % 16} for index in range(16)]
     checkpoints = Checkpoints(str(directory), keep=keep)
     trainer = Trainer(objective, optax.sgd(1.0), key=0, checkpoints=checkpoints)
-    state = trainer.fit(loader(RecordsData(source=rows), batch=8, loading=LOADING, read="memory"),
-                        steps=steps,
-                        checkpoint_every=1, log_every=100)
+    state = trainer.fit(records(rows), steps=steps, checkpoint_every=1, log_every=100)
     checkpoints.wait()
     return trainer, checkpoints, state
 
@@ -138,9 +141,7 @@ def test_a_stored_collection_stays_while_a_kept_step_records_it_and_goes_with_th
     rows = [{"x": np.full(3, index, np.float32), "y": np.float32(index)} for index in range(8)]
     checkpoints = Checkpoints(str(tmp_path / "run"), keep=1)
     trainer = Trainer(Counting(), optax.sgd(0.01), key=0, checkpoints=checkpoints)
-    trainer.fit(loader(RecordsData(source=rows), batch=8, loading=LOADING, read="memory"), steps=4,
-        checkpoint_every=1,
-                log_every=100)
+    trainer.fit(records(rows), steps=4, checkpoint_every=1, log_every=100)
     checkpoints.wait()
     store = epath.Path(checkpoints.directory) / FROZEN_STORE
     kept = [kept.step for kept in checkpoints.kept()]
@@ -191,8 +192,7 @@ def test_a_collection_saved_with_x64_on_restores_with_it_off(tmp_path):
     with jax.enable_x64(new_val=True):
         checkpoints = Checkpoints(str(tmp_path / "run"))
         Trainer(Wide(), optax.sgd(0.01), key=0, checkpoints=checkpoints).fit(
-            loader(RecordsData(source=rows), batch=8, loading=LOADING, read="memory"), steps=1,
-                checkpoint_every=1, log_every=100)
+            records(rows), steps=1, checkpoint_every=1, log_every=100)
         checkpoints.wait()
         table = np.asarray(Wide().init(None)["constants"]["table"])
     assert not jax.config.jax_enable_x64
