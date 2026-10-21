@@ -135,3 +135,56 @@ def test_the_chunked_op_is_as_exact_as_the_recurrence_token_by_token(hooks, pack
     reference = jax.jit(functools.partial(token_by_token, hooks))
     assert_as_exact(dew, reference, functools.partial(draw, hooks, packed), f'{hooks} packed={packed}',
                     seeds=SEEDS[hooks, packed])
+
+
+def test_the_output_rounds_once_after_the_epilogue():
+    """The chunked op rounds its output once, after the skip and the norm, as the decode step's reference
+    does: a bf16 token whose readout `0.1` the skip `-0.10009765625` nearly cancels leaves the residual
+    the reference leaves, where a readout rounded first cancels to zero; an explicit `dtype` holds with
+    and without an epilogue, and bf16 operands under the l2 norm come back in bf16."""
+    ones = jnp.ones((1, 1, 1, 8), jnp.bfloat16)
+    hooks = recurrence.Hooks(decay='none', delta=False, write_gate=True, skip=True)
+    operands = Chunk(ones, ones, ones, beta=jnp.full((1, 1, 1), 0.1, jnp.float32),
+                     skip=jnp.full((1,), -0.10009765625, jnp.float32))
+    found, _ = chunk(hooks, operands, ported=False, dtype=jnp.float32)
+    want, _, _ = recurrence.step_reference(hooks, recurrence.Step(
+        jnp.zeros((1, 1, 8, 8), jnp.float32), query=ones[:, 0], key=ones[:, 0], value=ones[:, 0],
+        beta=operands.beta[:, 0], skip=operands.skip), dtype=jnp.float32)
+    np.testing.assert_array_equal(np.asarray(found[:, 0]), np.asarray(want))
+    assert np.all(np.asarray(found) != 0.0)
+    plain = recurrence.Hooks(decay='scalar', scale=0.25)
+    wide = Chunk(*(x.astype(jnp.float32) for x in (ones, ones, ones)), log_decay=jnp.zeros((1, 1, 1)),
+                 beta=jnp.ones((1, 1, 1)))
+    assert chunk(plain, wide, ported=False, dtype=jnp.bfloat16)[0].dtype == jnp.bfloat16
+    normed = recurrence.Hooks(decay='scalar', l2norm=True)
+    assert chunk(normed, Chunk(ones, ones, ones, log_decay=jnp.zeros((1, 1, 1)), beta=jnp.ones((1, 1, 1))),
+                 ported=False)[0].dtype == jnp.bfloat16
+
+
+def test_a_rated_decay_is_its_log_decay_bit_for_bit():
+    """A rated decay (`rate` times the write gate) steps a decode token and a chunked sequence bit for bit
+    as the same log decay given whole, on the launch and on the portable math."""
+    rng = np.random.default_rng(0)
+    rows, heads, width = 2, 2, 16
+    state = jnp.asarray(rng.standard_normal((rows, heads, width, width)), jnp.float32)
+    token = {name: jnp.asarray(rng.standard_normal((rows, heads, width)), jnp.float32)
+             for name in ('query', 'key', 'value')}
+    beta = jnp.asarray(rng.uniform(0.0, 0.5, (rows, heads)), jnp.float32)
+    rate = -jnp.asarray(rng.uniform(0.1, 2.0, (heads,)), jnp.float32)
+    rated = recurrence.Hooks(decay='scalar', rated=True, delta=False, skip=True)
+    whole = recurrence.Hooks(decay='scalar', delta=False, write_gate=True, skip=True)
+    skip = jnp.asarray(rng.standard_normal((heads,)), jnp.float32)
+    for step in (recurrence.step, recurrence.step_reference):
+        found = step(rated, recurrence.Step(state, **token, beta=beta, rate=rate, skip=skip))
+        want = step(whole, recurrence.Step(state, **token, beta=beta, log_decay=rate[None, :] * beta,
+                                           skip=skip))
+        for mine, theirs in zip(found[::2], want[::2], strict=True):
+            np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs))
+    sequence = {name: jnp.asarray(rng.standard_normal((rows, LENGTH, heads, width)), jnp.float32)
+                for name in ('query', 'key', 'value')}
+    steps = jnp.asarray(rng.uniform(0.0, 0.5, (rows, LENGTH, heads)), jnp.float32)
+    found = chunk(rated, Chunk(**sequence, beta=steps, rate=rate, skip=skip), chunk_size=CHUNK, ported=False)
+    want = chunk(whole, Chunk(**sequence, beta=steps, log_decay=rate[None, None, :] * steps, skip=skip),
+                 chunk_size=CHUNK, ported=False)
+    for mine, theirs in zip(found, want, strict=True):
+        np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs))
