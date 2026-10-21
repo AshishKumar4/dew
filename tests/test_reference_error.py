@@ -16,6 +16,8 @@ from reference_error import (
     distance,
     indexed_recording,
     input_digest,
+    null_rate_bound,
+    null_runs,
     seeds_for,
 )
 
@@ -331,3 +333,21 @@ def test_a_recording_of_outputs_alone_draws_its_inputs_again(tmp_path):
     undigested = {name: value for name, value in recorded.items() if name != "site.input_digest"}
     with pytest.raises(AssertionError):
         indexed_recording(undigested, "site", seeds, inputs_of=draw)
+
+
+def test_null_runs_judge_the_reference_against_itself_on_draws_no_other_run_takes():
+    """Each null run is check 1 on the reference against itself, its two sides on disjoint draws and
+    every run on draws of its own; an equally exact pair passes, and the red rate's bound is the
+    one-sided Clopper-Pearson one, not one over the runs."""
+    taken = []
+
+    def draw(seed):
+        taken.append(seed)
+        return _draw(seed)
+
+    verdicts = null_runs(_product, draw, "null", seeds=8, runs=3)
+    assert verdicts == ["pass"] * 3
+    assert len(taken) == len(set(taken))
+    assert null_rate_bound(0, 1400) == pytest.approx(1 - 0.001 ** (1 / 1400), rel=1e-9)
+    assert null_rate_bound(0, 200) > 0.03
+    assert null_rate_bound(3, 3) == 1.0
