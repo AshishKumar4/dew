@@ -8,7 +8,6 @@ differ. The self-conditioning draw enables row zero and disables row one.
 import math
 from dataclasses import replace
 from pathlib import Path
-from types import SimpleNamespace
 
 import grain.python as grain
 import jax
@@ -16,7 +15,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from reference_error import assert_leaves_as_exact, widened
+from reference_error import assert_as_exact, widened
 from safetensors.numpy import load_file
 
 from dew import Trainer
@@ -27,6 +26,7 @@ from dew.interop.diffusion_gemma import translate_weights
 from dew.nn.inputs import ModelInputs
 from dew.objectives.base import FROZEN, Step, freeze, select
 from dew.objectives.diffusion.block import BlockDiffusionObjective
+from dew.training import MeshSpec
 from dew.training.transaction import example_fields
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures/hf/diffusion-gemma-sft"
@@ -35,6 +35,11 @@ REFERENCES = FIXTURE / "reference"
 
 @pytest.fixture(scope="module")
 def source():
+    return loaded_source()
+
+
+def loaded_source():
+    """The SFT fixture's model, batch, the reference's own draws on a step, and its recorded values."""
     loaded = Pretrained.load(FIXTURE, dtype="float32", attention_impl="xla", max_seq_len=32)
     with np.load(FIXTURE / "reference.npz") as arrays:
         reference = {name: arrays[name] for name in arrays.files}
@@ -76,6 +81,48 @@ def float64_update(model, build, variables, batch, step, rate):
             {**values, "params": trainable}, widened(batch), step)[0])(values["params"])
         updated = jax.tree.map(lambda value, grad: value - rate * grad, values["params"], gradient)
         return jax.tree.map(np.asarray, {**values, "params": updated})
+
+
+UPDATE_SEEDS = {"text": 8, "image": 8}
+"""Check 1's declared seeds for the trainer's update against the objective's (`update_site`), sized by
+`seeds_for` (2026-10-21, on armada)."""
+
+
+def update_site(obj, variables, batch, run_key, model, build):
+    """Check 1's arms for the trainer's first SGD update (rate 0.001) of `variables`' params moved by a
+    draw: the trainer's compiled step on one device, the objective's update compiled as one program
+    under the step's draws (`example_fields`), and the float64 update of `build`'s objective over
+    `model` (`float64_update`) the truth. One device holds the comparison to the trainer's composition
+    of the update; its layouts are the parallelism matrix's."""
+    trainer = Trainer(obj, optax.sgd(0.001), key=run_key, split=1)
+    trainer.device_mesh = MeshSpec().build(jax.devices()[:1])
+    initial = trainer.initial_state()
+    step = Step(jnp.asarray(0, jnp.int32), jax.random.fold_in(initial.key, 0), None,
+                **example_fields(initial, 0, 1, batch))
+    run = trainer.compile(jax.tree.map(jnp.copy, initial), batch)
+    leaves, tree = jax.tree.flatten(variables["params"])
+
+    def draw(seed):
+        keys = jax.random.split(jax.random.key(seed), len(leaves))
+        moved = [(leaf + 0.02 * jax.random.normal(key, leaf.shape)).astype(leaf.dtype)
+                 for key, leaf in zip(keys, leaves, strict=True)]
+        return ({**variables, "params": jax.tree.unflatten(tree, moved)},)
+
+    def stepped(values):
+        state = jax.tree.map(jnp.copy, initial).replace(variables=jax.tree.map(jnp.asarray, values))
+        state, *_ = run(state, batch)
+        return jax.tree.map(np.asarray, state.variables["params"])
+
+    @jax.jit
+    def objective_update(values):
+        gradient = jax.grad(lambda trainable: obj.scalar_loss(
+            {**values, "params": trainable}, batch, step)[0])(values["params"])
+        return jax.tree.map(lambda value, grad: value - 0.001 * grad, values["params"], gradient)
+
+    def truth(values):
+        return float64_update(model, build, values, batch, step, 0.001)["params"]
+
+    return stepped, objective_update, draw, truth
 
 
 def assert_tree_close(actual, expected, tolerance):
@@ -227,28 +274,22 @@ def dataset(batch):
 
 
 def test_real_trainer_update_and_checkpoint_resume(source, tmp_path):
-    loaded, original_batch, step, reference = source
+    loaded, original_batch, _, reference = source
     rows = math.lcm(2, jax.device_count())
     batch = jax.tree.map(lambda value: np.concatenate([value] * (rows // 2), axis=0), original_batch)
     obj = objective(loaded)
     run_key = jax.random.key(int(reference["run_seed"]))
     data = dataset(batch)
     variables = jax.tree.map(jnp.asarray, obj.init(jax.random.key(0)))
-    # The trainer's first step: its attempt's key and its examples' draws (`example_fields`).
-    initial = Trainer(obj, optax.sgd(0.001), key=run_key).initial_state()
-    step = Step(jnp.asarray(0, jnp.int32), jax.random.fold_in(initial.key, 0), None,
-                **example_fields(initial, 0, 1, batch))
-    # The update compiled as one program, as the trainer's is: XLA:CPU's compiled gradient of this model
-    # sits 1.0 to 5.2 times further from float64 than the same ops run one by one (measured per leaf,
-    # 2026-10-21), a gap of the compiler's and not of the trainer, which this test holds.
-    gradient = jax.jit(jax.grad(lambda values: obj.scalar_loss(values, batch, step)[0]))(variables)
-    expected = jax.tree.map(lambda value, grad: value - 0.001 * grad, variables, gradient)
-    truth = float64_update(loaded.model, lambda wide: objective(replace(loaded, model=wide)), variables,
-                           batch, step, 0.001)
+    # The trainer's update is the objective's at the step's draws, on par with it over drawn weights
+    # (check 1). The objective's arm is compiled as one program, as the trainer's is: XLA:CPU's compiled
+    # gradient of this model sits 1.0 to 5.2 times further from float64 than the same ops run one by
+    # one (measured per leaf, 2026-10-21), a gap of the compiler's and not of the trainer.
+    dew, reference, draw, truth = update_site(obj, variables, batch, run_key, loaded.model,
+                                              lambda wide: objective(replace(loaded, model=wide)))
+    assert_as_exact(dew, reference, draw, "the trainer's update", seeds=UPDATE_SEEDS["text"], truth_fn=truth)
     trainer = Trainer(obj, optax.sgd(0.001), key=run_key, checkpoints=Checkpoints(str(tmp_path / "run")))
     updated = trainer.fit(data, steps=1, checkpoint_every=1, log_every=1)
-    # The trainer's update is the objective's, as exact as the same update taken eagerly.
-    assert_leaves_as_exact(updated.variables, expected, truth)
     # Google's dense text-only model: transformers' DiffusionGemmaForBlockDiffusion
     # builds experts and a vision tower, so no published implementation reads
     # this layout, and the export is refused rather than written.
@@ -266,6 +307,10 @@ def test_real_trainer_update_and_checkpoint_resume(source, tmp_path):
 
 @pytest.fixture(scope="module")
 def image_source():
+    return loaded_image_source()
+
+
+def loaded_image_source():
     """Native SFT behavior over the real loaded multimodal generation fixture."""
     directory = FIXTURE.parent / "diffusion-gemma-workflow"
     loaded = Pretrained.load(directory, dtype="float32", attention_impl="xla", max_seq_len=32)
@@ -366,22 +411,15 @@ def test_image_sft_trainer_resume_publish_and_generate(image_source, tmp_path):
     stream = grain.MapDataset.source([batch]).repeat().to_iter_dataset()
     data = Loader(train=lambda partition: iter(stream), val=None, records=rows, batch=rows)
     run_key = jax.random.key(2)
-    # The trainer's first step: its attempt's key and its examples' draws (`example_fields`).
-    state_key = jax.random.split(run_key)[1]
-    started = SimpleNamespace(key=state_key, updates=jnp.asarray(0))
-    step = Step(step=jnp.asarray(0, jnp.int32), key=jax.random.fold_in(state_key, 0), ema=None,
-                **example_fields(started, 0, 1, batch))
-    gradient = jax.jit(jax.grad(lambda trainable: obj.scalar_loss(
-        {**variables, "params": trainable}, batch, step)[0]))(variables["params"])
-    expected = {**variables, "params": jax.tree.map(
-        lambda value, grad: value - 0.001 * grad, variables["params"], gradient)}
-    truth = float64_update(loaded.model, lambda wide: BlockDiffusionObjective(
-        wide, prompt_length=8, variables=loaded.variables), variables, batch, step, 0.001)
+    # The trainer's update is the objective's at the step's draws, on par over drawn weights (check 1).
+    dew, reference, draw, truth = update_site(obj, variables, batch, run_key, loaded.model,
+                                              lambda wide: BlockDiffusionObjective(
+                                                  wide, prompt_length=8, variables=loaded.variables))
+    assert_as_exact(dew, reference, draw, "the trainer's update", seeds=UPDATE_SEEDS["image"],
+                    truth_fn=truth)
     checkpoints = Checkpoints(str(tmp_path / "run"))
     updated = Trainer(obj, optax.sgd(0.001), key=run_key, checkpoints=checkpoints).fit(
         data, steps=1, checkpoint_every=1, log_every=1)
-    # The trainer's update is the objective's, as exact as the same update taken eagerly.
-    assert_leaves_as_exact(updated.variables, expected, truth)
     assert any(not np.array_equal(before, after) for before, after in zip(
         jax.tree.leaves(variables["params"]["conditioner"]),
         jax.tree.leaves(updated.variables["params"]["conditioner"]), strict=True))
@@ -398,7 +436,8 @@ def test_image_sft_trainer_resume_publish_and_generate(image_source, tmp_path):
     restored = BlockDiffusionObjective(readback.model, prompt_length=8, variables=readback.variables)
     assert_tree_close(restored.init(jax.random.key(0)), resumed.variables, 0)
     # The published task's loss under the run's draws for the unrepeated rows.
-    step = Step(step=jnp.asarray(0, jnp.int32), key=jax.random.fold_in(state_key, 0), ema=None,
+    started = Trainer(obj, optax.sgd(0.001), key=run_key).initial_state()
+    step = Step(step=jnp.asarray(0, jnp.int32), key=jax.random.fold_in(started.key, 0), ema=None,
                 **example_fields(started, 0, 1, {"text": inputs}))
     original_loss = obj.scalar_loss(resumed.variables, {"text": inputs}, step)[0]
     restored_loss = restored.scalar_loss(restored.init(jax.random.key(0)), {"text": inputs}, step)[0]

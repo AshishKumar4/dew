@@ -87,47 +87,66 @@ def few_step(kind, **fields):
                              bootstrap_every=4, unconditional_prob=0.5, **fields)
 
 
-@pytest.mark.parametrize("kind", ["meanflow", "shortcut"])
-def test_a_few_step_update_gives_its_roles_by_place_on_every_layout(kind):
-    """MeanFlow's instantaneous rows and dropped conditions and a shortcut model's bootstrapping rows
-    are the update's first examples by place: an update read as two halves trains each example as
-    its whole batch does, so the halves' summed gradients are as exact as the whole batch's, the
-    float64 twin's the truth."""
-    import copy
+HALVES_SEEDS = {"meanflow": 8, "shortcut": 8}
+"""Check 1's declared seeds for an update read as two halves (`halves_site`), sized by `seeds_for`
+(2026-10-21, on armada)."""
 
-    from reference_error import assert_leaves_as_exact, widened
+
+def halves_site(kind):
+    """Check 1's arms for a few-step update read as two halves against its whole batch, over drawn
+    weights: each the summed loss's gradient under the update's draws, the float64 twin's the truth."""
+    import copy
 
     objective = few_step(kind)
     twin = copy.copy(objective)
     twin.substitute([objective.model.clone(dtype=jnp.float64)])
-    params = objective.init(jax.random.PRNGKey(0))
-    leaves, tree = jax.tree.flatten(params["params"])
-    keys = jax.random.split(jax.random.PRNGKey(4), len(leaves))
-    params = {**params, "params": jax.tree.unflatten(tree, [
-        0.3 * jax.random.normal(key, leaf.shape) for key, leaf in zip(keys, leaves, strict=True)])}
+    initial = objective.init(jax.random.PRNGKey(0))
+    leaves, tree = jax.tree.flatten(initial["params"])
     rows = 8
     images = jax.random.randint(jax.random.PRNGKey(1), (rows, 4, 4, 3), 0, 256)
     batch = {"image": np.asarray(images, np.uint8),
              **objective.inputs.tokenize([str(row) for row in range(rows)])}
 
-    def gradient(objective, variables, part: slice):
+    def draw(seed):
+        keys = jax.random.split(jax.random.PRNGKey(seed), len(leaves))
+        return ({**initial, "params": jax.tree.unflatten(tree, [
+            0.3 * jax.random.normal(key, leaf.shape) for key, leaf in zip(keys, leaves, strict=True)])},)
+
+    def gradient(objective, part: slice):
         examples = np.arange(rows)[part]
         step = Step(jnp.asarray(0), jax.random.key(2), None, example_key=UPDATE,
                     example_index=jnp.asarray(examples, jnp.int32), example_count=rows)
         rows_of = jax.tree.map(lambda value: value[part], batch)
 
-        def total(trainable):
-            stats, _ = objective.loss({**variables, "params": trainable}, rows_of, step)
-            return stats.total
+        def total(variables):
+            def summed(trainable):
+                stats, _ = objective.loss({**variables, "params": trainable}, rows_of, step)
+                return stats.total
 
-        return jax.tree.map(np.asarray, jax.grad(total)(variables["params"]))
+            return jax.grad(summed)(variables["params"])
 
-    whole = gradient(objective, params, slice(0, rows))
-    halves = jax.tree.map(np.add, gradient(objective, params, slice(0, rows // 2)),
-                          gradient(objective, params, slice(rows // 2, rows)))
-    with jax.enable_x64(new_val=True):
-        truth = gradient(twin, jax.tree.map(jnp.asarray, widened(params)), slice(0, rows))
-    assert_leaves_as_exact(halves, whole, truth)
+        return jax.jit(total)
+
+    first, second = gradient(objective, slice(0, rows // 2)), gradient(objective, slice(rows // 2, rows))
+    whole, exact = gradient(objective, slice(0, rows)), gradient(twin, slice(0, rows))
+
+    def halves(variables):
+        return jax.tree.map(lambda one, other: np.asarray(one) + np.asarray(other), first(variables),
+                            second(variables))
+
+    return halves, whole, draw, exact
+
+
+@pytest.mark.parametrize("kind", ["meanflow", "shortcut"])
+def test_a_few_step_update_gives_its_roles_by_place_on_every_layout(kind):
+    """MeanFlow's instantaneous rows and dropped conditions and a shortcut model's bootstrapping rows
+    are the update's first examples by place: an update read as two halves trains each example as
+    its whole batch does, so the halves' summed gradients are on par with the whole batch's over drawn
+    weights (check 1), the float64 twin's the truth."""
+    from reference_error import assert_as_exact
+
+    halves, whole, draw, exact = halves_site(kind)
+    assert_as_exact(halves, whole, draw, f"{kind} halves", seeds=HALVES_SEEDS[kind], truth_fn=exact)
 
 
 def test_each_examples_posterior_draw_is_its_own():
