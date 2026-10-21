@@ -339,8 +339,10 @@ def test_sft_diffusion_gemma_puts_each_assistant_turn_alone_on_the_canvases(tmp_
     example = load("sft_diffusion_gemma", "examples")
     config = example.smoke_config(example.Config(smoke=True, out=tmp_path))
     _, objective = example.adapted_objective(config)
-    train, _, _ = example.chat_rows(config, objective).pipelines()
-    rows = list(train)
+    from dew.data.sources import source
+
+    # One pass over the conversations in their order, batch by batch.
+    batches = list(example.chat_rows(config, objective, source(config.chat)))
     template = AutoTokenizer.from_pretrained(config.model)
     expected = []
     for turns in example.CONVERSATIONS:
@@ -350,9 +352,10 @@ def test_sft_diffusion_gemma_puts_each_assistant_turn_alone_on_the_canvases(tmp_
             whole = template.apply_chat_template(turns[:index + 1], tokenize=True, return_dict=False)
             expected.append((prompt[:objective.prompt_length], whole[len(prompt):]))
 
-    batch = {name: np.stack([row[name] for row in rows]) for name in ("text", "canvas_mask")}
+    batch = {name: np.concatenate([np.asarray(part[name]) for part in batches])
+             for name in ("text", "canvas_mask")}
     _, tokens, response, _, valid, targets, _ = objective._row(batch)
-    assert len(rows) == len(expected) == 4
+    assert len(batch["text"]) == len(expected) == 4
     for row, (prompt, completion) in enumerate(expected):
         head = np.asarray(tokens[row, :objective.prompt_length])
         assert head[np.asarray(valid[row, :objective.prompt_length])].tolist() == prompt
