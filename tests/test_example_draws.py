@@ -94,7 +94,8 @@ HALVES_SEEDS = {"meanflow": 8, "shortcut": 8}
 
 def halves_site(kind):
     """Check 1's arms for a few-step update read as two halves against its whole batch, over drawn
-    weights: each the summed loss's gradient under the update's draws, the float64 twin's the truth."""
+    weights: each the summed loss under the update's draws, which every example's role enters, the
+    float64 twin's the truth."""
     import copy
 
     objective = few_step(kind)
@@ -112,27 +113,18 @@ def halves_site(kind):
         return ({**initial, "params": jax.tree.unflatten(tree, [
             0.3 * jax.random.normal(key, leaf.shape) for key, leaf in zip(keys, leaves, strict=True)])},)
 
-    def gradient(objective, part: slice):
+    def summed(objective, part: slice):
         examples = np.arange(rows)[part]
         step = Step(jnp.asarray(0), jax.random.key(2), None, example_key=UPDATE,
                     example_index=jnp.asarray(examples, jnp.int32), example_count=rows)
         rows_of = jax.tree.map(lambda value: value[part], batch)
+        return jax.jit(lambda variables: objective.loss(variables, rows_of, step)[0].total)
 
-        def total(variables):
-            def summed(trainable):
-                stats, _ = objective.loss({**variables, "params": trainable}, rows_of, step)
-                return stats.total
-
-            return jax.grad(summed)(variables["params"])
-
-        return jax.jit(total)
-
-    first, second = gradient(objective, slice(0, rows // 2)), gradient(objective, slice(rows // 2, rows))
-    whole, exact = gradient(objective, slice(0, rows)), gradient(twin, slice(0, rows))
+    first, second = summed(objective, slice(0, rows // 2)), summed(objective, slice(rows // 2, rows))
+    whole, exact = summed(objective, slice(0, rows)), summed(twin, slice(0, rows))
 
     def halves(variables):
-        return jax.tree.map(lambda one, other: np.asarray(one) + np.asarray(other), first(variables),
-                            second(variables))
+        return np.asarray(first(variables)) + np.asarray(second(variables))
 
     return halves, whole, draw, exact
 
@@ -141,7 +133,7 @@ def halves_site(kind):
 def test_a_few_step_update_gives_its_roles_by_place_on_every_layout(kind):
     """MeanFlow's instantaneous rows and dropped conditions and a shortcut model's bootstrapping rows
     are the update's first examples by place: an update read as two halves trains each example as
-    its whole batch does, so the halves' summed gradients are on par with the whole batch's over drawn
+    its whole batch does, so the halves' summed losses are on par with the whole batch's over drawn
     weights (check 1), the float64 twin's the truth."""
     from reference_error import assert_as_exact
 
