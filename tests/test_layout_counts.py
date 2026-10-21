@@ -241,8 +241,10 @@ def test_a_laid_out_corpus_resumed_reads_its_windows_counted_as_the_uninterrupte
     def corpus(source, scored):
         # Documents longer than a window, of lengths a window doesn't divide, leave windows and
         # partial bins held when the read stops, so a resume reads next from documents read before.
-        counted = Pipeline(roled(source, 40 if layout == "windows" else 11, scored),
-                           name=str(source)).filter_map(CountTargets(role=1))
+        documents = roled(source, 40 if layout == "windows" else 11, scored, count=8)
+        # A stream read by two loading workers holds a shard for each of them.
+        stored = dataclasses.replace(documents, shard_rows=4)
+        counted = Pipeline(stored, name=str(source)).filter_map(CountTargets(role=1))
         laid_out = (counted.windows(8, fields=ROLED) if layout == "windows"
                     else counted.pack(16, fields=ROLED, policy=layout, bins=3) if layout == "first-fit"
                     else counted.pack(16, fields=ROLED, policy=layout))

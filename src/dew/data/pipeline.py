@@ -6,6 +6,7 @@ import dataclasses
 import itertools
 import math
 import sys
+import time
 import types
 from collections.abc import Callable, Hashable, Iterable, Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING, Concatenate, Literal, Protocol, TypeGuard, runtime_checkable
@@ -675,9 +676,12 @@ class Dataset:
         return self._then(Native(function, identity))
 
     def stats(self, records: int = 1000) -> dict[str, float]:
-        """The counts a run logs from a fresh, lazy pass over at most
-        `records` accepted records: the rows delivered and the drops by
-        reason (`dew.data.mixing.CorpusCounts`)."""
+        """The counts a run logs from a fresh, lazy pass over at most `records` accepted records:
+        the rows delivered and the drops by reason (`dew.data.mixing.CorpusCounts`), the records
+        the pass read a second (`data/records_per_second`, one reader with no workers, so a
+        floor on what loading workers read), and for token rows, under "text", the tokens they
+        hold (`data/tokens`) and the share of their places that pad a packed row
+        (`data/padding`)."""
         from dew.data.compile import _diagnostic
         from dew.data.mixing import data_metrics, state_counts
         from dew.records import record
@@ -690,12 +694,22 @@ class Dataset:
         if records == 0:
             return {}
         reader = _diagnostic(chain, records=records)
+        rows = places = padding = 0
+        started = time.perf_counter()
         try:
-            for _ in reader:
-                pass
-            return data_metrics(state_counts(record(reader.get_state(), "diagnostic state")).values())
+            for batch in reader:
+                rows += 1
+                held, padded = _token_places(batch)
+                places, padding = places + held, padding + padded
+            seconds = time.perf_counter() - started
+            metrics = data_metrics(state_counts(record(reader.get_state(), "diagnostic state")).values())
         finally:
             reader.close()
+        metrics["data/records_per_second"] = rows / seconds if seconds > 0 else math.inf
+        if places:
+            metrics["data/tokens"] = places - padding
+            metrics["data/padding"] = padding / places
+        return metrics
 
     def read(self, mode: Read) -> Pipeline:
         """Read the stores this way, rather than as they prefer: "memory" holds
@@ -828,6 +842,20 @@ def _step_name(step: Hashable) -> str:
 
 def _brief(text: str, width: int = 120) -> str:
     return text if len(text) <= width else text[: width - 1] + "…"
+
+
+def _token_places(batch: Batch) -> tuple[int, int]:
+    """The places a batch's token rows under "text" hold, and those of them that pad a packed row
+    (segment 0 in its coordinates); none where it holds no token ids."""
+    tokens = batch.get("text")
+    if not isinstance(tokens, np.ndarray) or tokens.dtype.kind not in "iu":
+        return 0, 0
+    from dew.nn.inputs import Coordinates
+
+    coordinates = batch.get("text_coordinates")
+    padded = (int(np.count_nonzero(np.asarray(coordinates.segments) == 0))
+              if isinstance(coordinates, Coordinates) else 0)
+    return int(tokens.size), padded
 
 
 def _shown[Field](value: np.ndarray | bytes | Field) -> np.ndarray | bytes | Field | str:
