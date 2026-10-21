@@ -406,13 +406,16 @@ def test_a_saved_distillation_loads_as_its_student_and_reads_the_students_data(t
     from token_support import write_token_corpus
 
     import dew
-    from dew.config.data import TextData, loader
+    from dew.data import presets
+    from dew.data.compile import compile
+    from dew.data.sources.tokens import TokenFiles
 
     arrays = fixture()
     objective, _ = fixture_objective(arrays)
-    write_token_corpus(tmp_path / "corpus", np.arange(4 * SEQ * 8, dtype=np.uint16) % 50)
-    loaded = [loader(TextData(source=str(tmp_path / "corpus"), seq_len=SEQ), tokens=2 * SEQ, read="memory",
-                     objective=chosen.data()) for chosen in (objective.student, objective)]
+    corpus = write_token_corpus(tmp_path / "corpus", np.arange(4 * SEQ * 8, dtype=np.uint16) % 50)
+    windows = TokenFiles(corpus.train).pipe(presets.token_windows, seq_len=SEQ, batch=None)
+    loaded = [compile(windows.batch(tokens=2 * SEQ), read="memory", objective=chosen.data())
+              for chosen in (objective.student, objective)]
     batches = [next(data.train(DataPartition())) for data in loaded]
     np.testing.assert_array_equal(batches[0][TEXT_KEY], batches[1][TEXT_KEY])
     # The fixture's two rows on every data-parallel device.
