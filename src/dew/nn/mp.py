@@ -30,7 +30,7 @@ import optax
 from flax import linen as nn
 
 from dew.nn.conv import convolution
-from dew.nn.precision import at_least_fp32, compensated_sum, float32_matmul
+from dew.nn.precision import at_least_fp32, compensated_sum, float32_matmul, spread
 
 MP_KERNEL = "mp_kernel"
 """The parameter name of a magnitude-preserving weight. Forced weight
@@ -144,6 +144,10 @@ class MPConv(nn.Module):
         shape = (*self.kernel_size, x.shape[-1], self.features)
         weight = self.param(MP_KERNEL, lambda key: drawn_kernel(key, shape))
         weight = normalize(weight.astype(at_least_fp32(x.dtype)))
+        if isinstance(gain, jax.Array):
+            # A learned gain's gradient sums over the whole weight, which a layout shards: through
+            # `spread` it is rounded once on the CPU, as a bias's is.
+            gain = spread(jnp.reshape(gain.astype(weight.dtype), (1,) * weight.ndim), weight.shape)
         weight = weight * (gain / math.sqrt(math.prod(shape[:-1])))
         weight = weight.astype(x.dtype)
         if not self.kernel_size:

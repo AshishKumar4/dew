@@ -48,7 +48,7 @@ def biased(product: jax.Array, bias: jax.Array) -> jax.Array:
     came out up to 3.75 times further from float64 than torch's own bfloat16 gradients. Broadcast
     at fp32, the gradient sums at fp32 and rounds once into the bias.
 
-    On the CPU that sum is the double-float reduction `compensated_sum` (through `_spread`), not
+    On the CPU that sum is the double-float reduction `compensated_sum` (through `spread`), not
     whichever reduction XLA picks for the cotangent's shape: a plain one split over eight devices
     summed each shard as one sequential chain, where one device's went to YNNPACK (ledger 833).
     A GPU's reduction is a tree whatever the shard, and the compensated one cost an A100 DiT step
@@ -59,24 +59,27 @@ def biased(product: jax.Array, bias: jax.Array) -> jax.Array:
     # promoted implicitly. Broadcast at fp32 and rounded back, it adds as flax adds it (XLA folds
     # the round trip, so the product and bias fuse as before) and its gradient sums at fp32.
     bias = jnp.reshape(bias.astype(wide), (1,) * (product.ndim - bias.ndim) + bias.shape)
-    return product.astype(dtype) + jnp.asarray(_spread(bias, product.shape)).astype(dtype)
+    return product.astype(dtype) + jnp.asarray(spread(bias, product.shape)).astype(dtype)
 
 
-def _spread(bias: jax.Array, shape: tuple[int, ...]) -> jax.Array:
-    """`bias` broadcast to `shape`, a linear call whose transpose, a bias's gradient (`biased`), sums
-    every position the bias spread over, with `compensated_sum` on the CPU."""
-    spread = tuple(axis for axis, (size, total) in enumerate(zip(bias.shape, shape, strict=True))
-                   if size == 1 and total != 1)
+def spread(parameter: jax.Array, shape: tuple[int, ...]) -> jax.Array:
+    """`parameter` broadcast to `shape` (its rank already `shape`'s), a linear call whose transpose,
+    the parameter's gradient, sums every position it spread over: with `compensated_sum` on the CPU,
+    so the sum is rounded once whatever axes a layout shards, and plain on a GPU, whose reduction is
+    a tree (`biased`). A bias spread over a product's positions and a gain over a weight
+    (`dew.nn.mp.MPConv`) take their gradients through it."""
+    spread_axes = tuple(axis for axis, (size, total) in enumerate(zip(parameter.shape, shape, strict=True))
+                        if size == 1 and total != 1)
 
     def broadcast(_, value):
         return jnp.broadcast_to(value, shape)
 
     def summed(_, cotangent):
-        total = jax.lax.platform_dependent(cotangent, cpu=lambda value: compensated_sum(value, spread),
-                                           default=lambda value: jnp.sum(value, axis=spread))
-        return jnp.reshape(total, bias.shape)
+        total = jax.lax.platform_dependent(cotangent, cpu=lambda value: compensated_sum(value, spread_axes),
+                                           default=lambda value: jnp.sum(value, axis=spread_axes))
+        return jnp.reshape(total, parameter.shape)
 
-    return linear_call(broadcast, summed, (), bias)
+    return linear_call(broadcast, summed, (), parameter)
 
 
 def precision_names(precision: jax.lax.PrecisionLike) -> frozenset[str]:
