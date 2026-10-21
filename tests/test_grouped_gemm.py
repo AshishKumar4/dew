@@ -241,7 +241,8 @@ def test_a_hooks_widened_16_bit_operations_round_as_xla_s():
                                          jnp.bfloat16)
     for hook in (bf16_reciprocal, lambda x: x ** -2):
         widened = jax.jit(grouped_matmul.Hooks(hook).before())(every)
-        np.testing.assert_array_equal(np.asarray(widened, np.float32), np.asarray(jax.jit(hook)(every), np.float32))
+        native = jax.jit(hook)(every)
+        np.testing.assert_array_equal(np.asarray(widened, np.float32), np.asarray(native, np.float32))
 
 
 def test_a_hooks_widened_sigmoid_holds_check_1():
