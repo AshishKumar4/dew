@@ -181,8 +181,9 @@ class Recipe:
         """
         facts = stage.data.facts()
         fields = record(facts.get("fields", {}), "the chain's fields")
-        needed = {"pretrain": ("text",), "sft": ("text",), "dpo": ("chosen", "rejected"), "grpo": ("prompt",),
-                  "ppo": ("task_id",)}[stage.loss]
+        # A preference pair's rows, as `preferences.PreferencePair` lays them out.
+        needed = {"pretrain": ("text",), "sft": ("text",), "dpo": ("input_ids", "completion_mask"),
+                  "grpo": ("prompt",), "ppo": ("task_id",)}[stage.loss]
         if missing := [name for name in needed if name not in fields]:
             raise ValueError(f"stage {stage.name!r} trains {stage.loss}, whose data carries "
                              f"{', '.join(needed)}; this chain carries no {', '.join(missing)}")
