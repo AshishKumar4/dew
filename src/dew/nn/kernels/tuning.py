@@ -625,7 +625,36 @@ def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> Timings:
         times = tuple(sum(milliseconds for name, milliseconds in run if name not in flushes) for run in runs)
         timings[config] = tokamax.BenchmarkData(compile_time_ms=compiling, lower_time_ms=lowering,
                                                 metadata={}, evaluation_times_ms=times)
+    observed(op, ba, timings, get_default_device())
     return Timings(timings)
+
+
+def observed(op: KernelOp, ba: tokamax.BoundArguments, measured: Mapping[Hashable, object],
+             device) -> None:
+    """Log each config `_measured` timed or saw exhaust the device's resources, with the launch's features
+    and estimate where it states them, where `DEW_TIMINGS` asks (`kernels.timings`): after the timing
+    loop, on this thread, so logging never runs beside a measurement or changes a pick."""
+    from . import timings as log
+    if log.directory() is None:
+        return
+    from .templates import cost, features
+
+    target = generation.gpu_target()
+    call = json.dumps(_launch_json(ba), sort_keys=True)
+    rows = []
+    for config, result in measured.items():
+        found = features.features(op, ba, config, target)
+        timed = isinstance(result, tokamax.BenchmarkData)
+        rows.append(log.observation(
+            type(op).__name__, call, json.dumps(encoded(config), sort_keys=True), device=device,
+            method=log.CUPTI_EVICTED, status='timed' if timed else 'resource_exhausted',
+            samples_ms=tuple(result.evaluation_times_ms) if timed else (),
+            lower_ms=result.lower_time_ms if timed else None,
+            compile_ms=result.compile_time_ms if timed else None,
+            estimate_s=None if found is None else cost.seconds(found.legacy, target),
+            features=None if found is None else found.row(),
+            error=None if timed else result))
+    log.record(rows)
 
 
 def _config(fastest: Timings | None) -> Hashable:

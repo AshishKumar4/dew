@@ -7,7 +7,9 @@ import sys
 
 import filelock
 import jax
+import jax.numpy as jnp
 import pytest
+import tokamax
 
 from dew.nn.kernels import timings
 
@@ -99,3 +101,48 @@ def test_a_held_lock_raises_after_its_stated_wait(monkeypatch, tmp_path):
     monkeypatch.setenv(timings.ENV, str(tmp_path))
     with filelock.FileLock(tmp_path / "timings.jsonl.lock"), pytest.raises(filelock.Timeout):
         timings.record([ROW], wait=0.1)
+
+
+def _bound():
+    """A grouped matmul's forward launch (a template with a costed record) and an RMS norm's (a kernel op
+    with none), each bound to a small call as the tuner keys it."""
+    from test_tuning import operands, step
+
+    from dew.nn.kernels import grouped_matmul, norm_swiglu, tuning
+    shape = jax.ShapeDtypeStruct
+    gmm = grouped_matmul.Gmm().bind(shape((256, 128), jnp.bfloat16), shape((2, 128, 128), jnp.bfloat16),
+                                    shape((2,), jnp.int32), (), (), out_dtype="bfloat16", trans_rhs=False,
+                                    interpret=False)
+    with tuning.launches():
+        found = tokamax.autotuning.get_bound_args(step(), *operands(15))
+    rms = next(ba for ba in found if isinstance(ba.op, norm_swiglu.RmsForward))
+    return gmm, rms
+
+
+def test_the_tuner_logs_each_measured_config_with_its_features(monkeypatch, tmp_path):
+    """Each config the tuner timed is one row: a template's with its features and the estimate they give,
+    a kernel op without a costed record with none, and one the device could not hold with its error's
+    class, its samples empty; with DEW_TIMINGS unset nothing is written."""
+    from dew.nn.kernels import generation, tuning
+
+    gmm, rms = _bound()
+    data = tokamax.BenchmarkData(compile_time_ms=12.0, lower_time_ms=3.0, metadata={},
+                                 evaluation_times_ms=(1.0, 1.5, 1.25))
+    device = jax.devices()[0]
+    with generation.assumed("sm80"):
+        tile, other = gmm.op.fitting(gmm, generation.gpu_target())[:2]
+        monkeypatch.delenv(timings.ENV, raising=False)
+        tuning.observed(gmm.op, gmm, {tile: data}, device)
+        assert not list(tmp_path.iterdir())
+        monkeypatch.setenv(timings.ENV, str(tmp_path))
+        tuning.observed(gmm.op, gmm, {tile: data, other: MemoryError("held")}, device)
+        tuning.observed(rms.op, rms, {next(iter(rms.autotuning_configs)): data}, device)
+    rows = [json.loads(line) for line in (tmp_path / "timings.jsonl").read_text().splitlines()]
+    timed, exhausted, norm = rows
+    assert timed['status'] == 'timed' and timed['samples_ms'] == [1.0, 1.5, 1.25]
+    assert timed['compile_ms'] == 12.0 and timed['features']['legacy']['programs'] > 0
+    assert timed['estimate_s'] is not None and timed['launch'] == 'Gmm'
+    assert exhausted['status'] == 'resource_exhausted' and exhausted['error'] == 'MemoryError'
+    assert exhausted['samples_ms'] == [] and exhausted['compile_ms'] is None
+    assert norm['features'] is None and norm['estimate_s'] is None and norm['launch'] == 'RmsForward'
+
