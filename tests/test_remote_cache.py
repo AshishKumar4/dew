@@ -367,3 +367,74 @@ print(remote.uploaded)
     assert run_child(script, str(tmp_path / "second"), url, "second") == ["1"]
     second = dict(remote_cache.unpacked(stored[key]))
     assert set(first) < set(second) and all(second[name] == first[name] for name in first)
+
+
+def test_a_url_that_is_no_address_leaves_the_local_cache_as_it_is(tmp_path):
+    """A URL that does not parse (an unclosed IPv6 bracket) or names no port is refused with a warning
+    when the cache is installed, as one that is no http(s) address is: the run compiles with JAX's own
+    cache and raises nothing."""
+    script = """
+import sys
+import remote_cache
+from dew.cache import enable_compilation_cache
+enable_compilation_cache(sys.argv[1])
+print(*(remote_cache.install(url, "token") is None for url in ("http://[::1", "http://host:port", "ftp://host")))
+"""
+    assert run_child(script, str(tmp_path / "cache")) == ["True", "True", "True"]
+
+
+def test_a_bundle_fetched_while_another_file_runs_is_not_that_files(tmp_path):
+    """A file's bundle that arrives while another file's tests run is the first file's: the second's
+    bundle holds only what its own tests compiled."""
+    server, url = counted()
+    stored = {}
+
+    class Keeping(Counted):
+        def do_PUT(self):
+            stored[self.path] = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+            self.send_response(204)
+            self.end_headers()
+
+    server.RequestHandlerClass = Keeping
+    cache = remote_cache.RemoteCache(tmp_path, url, "token", "jax/cpu")
+    slow = threading.Thread(target=cache.opened, args=("tests/slow.py",))
+    slow.start()
+    while not Counted.requests:
+        time.sleep(0.01)
+    cache.opened("tests/other.py")
+    compiled(tmp_path, "jit_other-1")
+    Counted.released.set()
+    slow.join()
+    cache.closed("tests/other.py")
+    cache.drain()
+    server.shutdown()
+    assert programs(tmp_path)["jit_slow-1"] == b"slow"
+    bundle = stored["/jax/cpu/bundles/tests/other.py"]
+    assert [key for key, _ in remote_cache.unpacked(bundle)] == ["jit_other-1"]
+
+
+def test_a_bundle_the_cap_cut_short_is_sent_once(cache_worker, tmp_path, monkeypatch):
+    """Two programs that together pass `MAX_BYTES`: the bundle carries the first, is sent once, and is
+    not sent again by a later close or the drain while its tests compile nothing new."""
+    url, stored, seen = cache_worker
+    monkeypatch.setattr(remote_cache, "MAX_BYTES", 1000)
+    cache = remote_cache.RemoteCache(tmp_path, url, "token", "jax/cpu")
+    cache.opened("tests/big.py")
+    compiled(tmp_path, "jit_a-1", b"a" * 600)
+    compiled(tmp_path, "jit_b-1", b"b" * 600)
+    cache.closed("tests/big.py")
+    cache.closed("tests/big.py")
+    cache.drain()
+    assert [key for key, _ in remote_cache.unpacked(stored["/jax/cpu/bundles/tests/big.py"])] == ["jit_a-1"]
+    assert seen.count("/jax/cpu/bundles/tests/big.py") == 2  # its GET, and one PUT
+
+
+def test_a_program_whose_key_fills_a_file_name_round_trips(cache_worker, tmp_path):
+    """A key as long as JAX makes one for a long function's name (`jit_` and the name, `-` and a
+    SHA-256 in hex), whose `-cache` file's name is 236 bytes, reaches the local cache from its bundle."""
+    url, stored, _ = cache_worker
+    key = "jit_" + "f" * 161 + "-" + "0" * 64
+    stored["/jax/cpu/bundles/tests/long.py"] = remote_cache.packed([(key, b"executable")])
+    cache = remote_cache.RemoteCache(tmp_path, url, "token", "jax/cpu")
+    cache.opened("tests/long.py")
+    assert programs(tmp_path) == {key: b"executable"} and cache.programs_fetched == 1
