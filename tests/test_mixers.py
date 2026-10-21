@@ -221,6 +221,8 @@ def packed_and_alone(model, variables, tokens, cotangent):
 KIND_FIELDS = {"mlp": ({"intermediate_size": 64}, {}), "llama4": ({}, {"qk_norm": False}),
                "deepseek_v4": ({"rope_head_dim": 8}, {"kinds": {"full_attention": LayerKind(window=8)}}),
                "kimi_delta_attention": ({"linear_num_heads": 2, "linear_head_dim": 32}, {}),
+               "mamba2": ({"num_heads": 8, "head_dim": 32, "state_size": 32, "n_groups": 4,
+                           "chunk_size": 64}, {}),
                "gated_delta_net": ({"linear_num_key_heads": 2, "linear_num_value_heads": 4,
                                     "linear_key_head_dim": 16, "linear_value_head_dim": 16}, {})}
 """The fields a kind needs beyond its defaults to build in `tiny`: its own, then the model's. The
@@ -234,7 +236,9 @@ SEEDS = {"attention": 64, "deepseek_v4": 256, "gated_delta_net": 512, "kimi_delt
          "llama4": 128, "mamba": 32, "mamba2": 256, "mla": 64, "mlp": 64}
 """Each kind's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for`: the fewest for
 which documents run alone compared with themselves resolve PARITY in every logit and parameter
-gradient (2026-10-20, on armada; Kimi delta attention's 2026-10-21). Its heads are 32 wide
+gradient (2026-10-20, on armada; Kimi delta attention's and Mamba2's 2026-10-21). Mamba2's 8 heads of 32
+over a state of 32 in 64-token chunks (`KIND_FIELDS`) take 256 at 0.04 s a seed, where its defaults (128
+heads of 64 over 128) took 256 at 30 minutes a run. Kimi delta attention's heads are 32 wide
 (`KIND_FIELDS`): at 16 the reference compared with itself did not resolve within 2048 seeds, one seed
 carrying up to 68% of a leaf's summed error, near-collinear keys' erases in fp32; at 32 it carries at
 most 5%. 16 is no path of its own: the portable math this site runs has no width-specific code, and
