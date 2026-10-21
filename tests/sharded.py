@@ -24,6 +24,7 @@ hold; the third needs the GPU.
 import math
 
 import jax
+import jax.numpy as jnp
 from jax.sharding import NamedSharding
 from reference_error import assert_as_exact
 
@@ -86,15 +87,18 @@ def tpu_lowering(fn, args, mesh: jax.sharding.Mesh) -> str:
         return jax.export.export(jax.jit(fn), platforms=["tpu"])(*args).mlir_module()
 
 
-def assert_runs_per_shard(fn, draw, specs, mesh, label: str, *, seeds: int, truth_fn, moves=()) -> None:
+def assert_runs_per_shard(fn, draw, specs, mesh, label: str, *, seeds: int, truth_fn, moves=(),
+                          donate=()) -> None:
     """The custom-kernel contract (module docstring): `fn` on `draw(seed)`'s arguments placed on `mesh`
     by `specs` (PartitionSpecs) is on par with `fn` on one device over the site's declared `seeds`
     (check 1, `assert_as_exact`), both measured from `truth_fn`, the float64 tree of `fn`'s outputs on
     the arguments widened; its compiled step, every draw's one program, holds no collective that moves
     entries between devices (`MOVES`) beyond the ops `moves` names (a sequence split's intended
     exchange), which XLA, unable to split an opaque call, would otherwise insert to replicate it; and no
-    copy or transpose at a kernel call's edge (`boundary_copies`)."""
-    run = jax.jit(fn)
+    copy or transpose at a kernel call's edge (`boundary_copies`). `donate` names the arguments `fn`
+    takes in place, as its callers donate them (a kernel that aliases its state into its output): a
+    call that keeps them would make XLA copy each before the kernel overwrites it."""
+    run = jax.jit(fn, donate_argnums=donate)
 
     def placed(args):
         return [jax.device_put(arg, NamedSharding(mesh, spec)) for arg, spec in zip(args, specs, strict=True)]
@@ -107,11 +111,18 @@ def assert_runs_per_shard(fn, draw, specs, mesh, label: str, *, seeds: int, trut
     copies = boundary_copies(text)
     assert not copies, f"XLA re-lays out arrays at the kernel's boundary: {copies}"
 
+    def kept(args):
+        # A donated argument is consumed; the draw's own array goes on to the other arm and the truth.
+        return [jnp.copy(arg) if index in donate else arg for index, arg in enumerate(args)]
+
     def split(*args):
         with jax.set_mesh(mesh):
-            return compiled(*placed(args))
+            return compiled(*placed(kept(args)))
 
-    assert_as_exact(split, run, draw, label, seeds=seeds, truth_fn=truth_fn)
+    def one_device(*args):
+        return run(*kept(args))
+
+    assert_as_exact(split, one_device, draw, label, seeds=seeds, truth_fn=truth_fn)
 
 
 VIEWS = frozenset({"bitcast", "get-tuple-element", "tuple", "parameter"})
