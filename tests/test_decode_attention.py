@@ -343,15 +343,15 @@ def test_a_launch_without_a_pick_takes_a_config_of_its_keys_space():
 
 
 @pytest.mark.parametrize("processors, programs, steps, splits", [
-    (None, 2, 128, 1), (108, 128, 128, 4), (108, 1024, 128, 1), (108, 2, 128, 32), (132, 16, 128, 32),
-    (132, 32, 4096, 16), (132, 64, 4096, 8), (108, 2, 4, 4)])
+    (None, 2, 128, 1), (108, 128, 128, 4), (108, 647, 128, 1), (108, 648, 128, 1), (108, 1024, 128, 1),
+    (108, 2, 128, 32), (132, 16, 128, 32), (132, 32, 4096, 16), (132, 64, 4096, 8), (108, 2, 4, 4)])
 def test_a_launch_without_a_measurement_fills_six_programs_a_multiprocessor(processors, programs, steps,
                                                                             splits):
-    """The heuristic (`_heuristic`): no slices on a device of no known multiprocessors or where the
-    programs fill every one six deep; else the most whose programs fill at most six a multiprocessor,
-    at most one a step: two programs over 108 multiprocessors take 32, 128 (16 rows of 8 key heads)
-    take 4 and 1024 none, sixteen over 132 take 32, and 32 and 64 take 16 and 8, the H100's fastest for
-    Qwen3-0.6B's 4 and 8 rows over 131072 keys; four steps take at most 4."""
+    """The heuristic (`_heuristic`): no slices on a device of no known multiprocessors or where the programs
+    fill every one six deep; else the most whose programs fill at most six a multiprocessor, at most one a
+    step: two programs over 108 multiprocessors take 32, 128 (16 rows of 8 key heads) take 4, 647 one but
+    may take more, 648 and 1024 none, sixteen over 132 take 32, and 32 and 64 take 16 and 8, the H100's
+    fastest for Qwen3-0.6B's 4 and 8 rows over 131072 keys; four steps take at most 4."""
     from dew.nn.kernels import decode_attention
 
     assert decode_attention._heuristic(programs, steps, processors) == decode_attention.Split(splits)
