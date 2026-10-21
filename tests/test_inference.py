@@ -403,6 +403,34 @@ def test_every_route_generates_through_the_same_packed_projections(tmp_path):
         np.testing.assert_array_equal(np.asarray(exported[name]), np.asarray(tensor), err_msg=name)
 
 
+def test_a_generation_reads_its_models_groups_once_for_every_call(tmp_path):
+    """A generate call finds the groups a borrowed tree packs in the call (`pending`) without
+    binding the model again: the groups a model declares are a function of the model and its
+    tree's shapes, which binding a deep decoder to read took tens of milliseconds of every call.
+    A decoder that counts its declarations is asked once over every call on one tree."""
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.sampling import Sampling
+
+    asked = []
+
+    class Counting(CausalTransformer):
+        def inference_projection_groups(self, variables):
+            asked.append(1)
+            return super().inference_projection_groups(variables)
+
+    run = tmp_path / "run"
+    run.mkdir()
+    objective, state = make_lm_run(run, ema_decay=None)
+    model = objective.pipeline(state).model
+    counting = Counting(**{field.name: getattr(model, field.name) for field in dataclasses.fields(model)
+                           if field.init and field.name not in ("parent", "name")})
+    task = TextGeneration(counting, state.variables, RunProcessor(ByteTokenizer()))
+    greedy = Sampling(temperature=0, eos_token_ids=255)
+    for key in range(3):
+        task("the ", 2, key=key, sampling=greedy)
+    assert len(asked) == 1
+
+
 @pytest.mark.mesh(devices=3)
 def test_a_run_on_a_mesh_packs_the_projections_its_layout_keeps_whole(tmp_path):
     """A packed kernel's columns are its members' outputs side by side, so a run's task packs a
