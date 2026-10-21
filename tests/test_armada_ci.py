@@ -476,11 +476,11 @@ def test_coverage_combines_each_tasks_branches_into_one_report_a_module_a_line(c
 
 def test_the_plan_runs_as_one_wave_on_the_pool(ci, tmp_path, monkeypatch, capsys):
     """The plan's tasks start at once on the pool, none waiting for another to free its container (train
-    22: 212 tasks of a set 240 s target on 160 containers ran as two waves, 10:10), and the target is the
-    one whose heaviest task is lightest: the light files fill every container the split files leave.
-    Files nothing has timed each run alone whatever the target; where even every timed file packed
-    together leaves more tasks than containers, one wave cannot hold the suite, and the plan says so and
-    runs in waves. The plan command reads the pool from .armada.json."""
+    22: 212 tasks of a set 240 s target on 160 containers ran as two waves, 10:10), with the lightest
+    heaviest task the targets tried allow: the containers the split files leave go to the light files'
+    heaviest families. Files nothing has timed each run alone whatever the target; where even every timed
+    file packed together leaves more tasks than containers, one wave cannot hold the suite, and the plan
+    says so and runs in waves. The plan command reads the pool from .armada.json."""
     records = {f"tests/test_even{n}.py::test_a": 100.0 for n in range(12)}
     records |= {"tests/test_heavy.py::test_a": 200.0, "tests/test_heavy.py::test_b": 100.0}
     for node in records:
@@ -491,37 +491,51 @@ def test_the_plan_runs_as_one_wave_on_the_pool(ci, tmp_path, monkeypatch, capsys
     def heaviest(entries):
         return max(entry["weight"] for entry in entries if not entry.get("untimed"))
 
-    # 1,500 s of tests on each Python: two tasks on four containers, the heavier 800 s (the 300 s file
-    # with five of 100 s); four on eight; on a thousand, the 300 s file as its two tests and every other
-    # file alone.
-    cases = ((4, 750.0, 4, 800.0), (8, 375.0, 8, 400.0), (1000, 200.0, 28, 200.0))
-    for pool, target, tasks, longest in cases:
-        entries = ci.plan(target, {}, pool)
-        assert ci.one_wave({}, pool) == target and len(entries) == tasks and heaviest(entries) == longest
+    # 1,500 s of tests on each Python: four containers hold two tasks each, the heavier 800 s (the 300 s
+    # file with five of 100 s); eight hold four each, of 400 s at most; a thousand hold the 300 s file as
+    # its two tests and every other file alone.
+    for pool, tasks, longest in ((4, 4, 800.0), (8, 8, 400.0), (1000, 28, 200.0)):
+        _, entries = ci.one_wave({}, pool)
+        assert len(entries) == tasks and heaviest(entries) == longest, (pool, len(entries), heaviest(entries))
     for n in range(5):
         (tmp_path / f"tests/test_new{n}.py").write_text("")
-    entries = ci.plan(ci.one_wave({}, 20), {}, 20)
+    _, entries = ci.one_wave({}, 20)
     assert len(entries) == 20 and heaviest(entries) == 300.0
     capsys.readouterr()
-    assert ci.one_wave({}, 8) == 1500.0 and len(ci.plan(1500.0, {}, 8)) == 12
-    assert "one wave cannot hold the plan" in capsys.readouterr().err
+    _, entries = ci.one_wave({}, 8)
+    assert len(entries) == 12 and "one wave cannot hold the plan" in capsys.readouterr().err
     (tmp_path / ".armada.json").write_text(json.dumps({"pool": 20}))
     command = [sys.executable, str(ROOT / "tools/armada/ci.py"), "plan", "--timings=none.json"]
     planned = subprocess.run(command, cwd=tmp_path, check=True, capture_output=True, text=True)
-    assert json.loads(planned.stdout)["include"] == ci.plan(ci.one_wave({}, 20), {}, 20)
+    assert json.loads(planned.stdout)["include"] == ci.one_wave({}, 20)[1]
     for name in {node.split("::")[0] for node in records}:
         (tmp_path / name).unlink()
     # Files nothing has timed alone, exactly filling the pool: one wave at whatever target.
-    assert len(ci.plan(ci.one_wave({}, 10), {}, 10)) == 10
+    assert len(ci.one_wave({}, 10)[1]) == 10
 
 
-def test_one_wave_recuts_a_file_its_old_cut_splits_too_finely(ci, tmp_path, monkeypatch):
+def test_one_wave_gives_each_family_its_task_before_sharing_the_rest(ci, tmp_path, monkeypatch, capsys):
+    """Each light family, the `torchax` files apart, takes the tasks its work needs before the spare
+    containers are shared: two files of 500 s and one marked torchax of 1 s on each Python fit five
+    containers as five tasks, one wave."""
+    for name in ("test_a", "test_b"):
+        (tmp_path / f"tests/{name}.py").write_text("")
+    (tmp_path / "tests/test_t.py").write_text("import pytest\npytestmark = pytest.mark.torchax\n")
+    (tmp_path / "tests/test_durations.json").write_text(json.dumps(
+        {"tests/test_a.py::test": 500.0, "tests/test_b.py::test": 500.0, "tests/test_t.py::test": 1.0}))
+    monkeypatch.setenv("DEW_TEST_CACHE", "off")
+    _, entries = ci.one_wave({}, 5)
+    assert len(entries) == 5 and "one wave cannot hold" not in capsys.readouterr().err
+    assert sorted(entry["tests"] for entry in entries if entry["python"] == "3.14") == [
+        "tests/test_a.py tests/test_b.py", "tests/test_t.py"]
+
+
+def test_one_wave_recuts_a_cut_too_fine_and_keeps_the_new_one(ci, tmp_path, monkeypatch):
     """A file keeps the cut it ran as only while that cut's heaviest group is within `KEPT` of the target
-    either way: ten files of twenty 10 s tests, each run at 2,200 s as twenty groups of 110 s (100 s of it
-    setup), would run as 400 tasks of 110 s if the cut held at any finer target. On 160 containers they
-    run as two groups of 200 s each, forty tasks, at the target the timed work over the pool gives; a
-    coarser target runs each file whole at 300 s. One file of 500 s measured as twenty groups fits two
-    containers whole."""
+    either way. Ten files of twenty 10 s tests, each run at 2,200 s as twenty groups of 110 s (100 s of it
+    setup), would run as 400 tasks if the cut held; on 160 containers they run as seven groups each, 140
+    tasks of at most 130 s. A second run, measured at that cut, keeps it, so its groups' cached programs
+    are found. The scan reads the tree and the timings once."""
     names = [f"tests/test_cut{n}.py" for n in range(10)]
     records = {f"{name}::test_{index}": 10.0 for name in names for index in range(20)}
     for name in names:
@@ -531,19 +545,20 @@ def test_one_wave_recuts_a_file_its_old_cut_splits_too_finely(ci, tmp_path, monk
     timings = {"files": {ci.row(python, name, ""): 2200.0 for python in ci.PYTHONS for name in names},
                "rows": {ci.row(python, name, f"{index}/20"): 110.0 for python in ci.PYTHONS for name in names
                         for index in range(1, 21)}}
-    plans = []
-    planning = ci.plan
-    monkeypatch.setattr(ci, "plan", lambda *args: plans.append(args[0]) or planning(*args))
-    target = ci.one_wave(timings, 160)
-    entries = planning(target, timings, 160)
-    assert target == 275.0 and len(entries) == 40 and {entry["weight"] for entry in entries} == {200.0}
-    assert len(plans) <= 60, plans
-    single = {"files": {ci.row(python, names[0], ""): 500.0 for python in ci.PYTHONS},
-              "rows": {ci.row(python, names[0], f"{index}/20"): 10.0 for python in ci.PYTHONS
-                       for index in range(1, 21)}}
-    for name in names[1:]:
-        (tmp_path / name).unlink()
-    assert ci.one_wave(single, 2) == 500.0 and len(planning(500.0, single, 2)) == 2
+    reads = []
+    reading = ci.recorded_tests
+    monkeypatch.setattr(ci, "recorded_tests", lambda: reads.append(1) or reading())
+    _, entries = ci.one_wave(timings, 160)
+    assert len(entries) == 140 and max(entry["weight"] for entry in entries) == 130.0
+    assert len(reads) <= 1 + len(ci.PYTHONS), reads
+    files, rows = {}, {}
+    for entry in entries:
+        rows[ci.row(entry["python"], entry["tests"], entry["split"])] = entry["weight"]
+        whole = ci.row(entry["python"], entry["tests"], "")
+        files[whole] = files.get(whole, 0.0) + entry["weight"]
+    _, again = ci.one_wave({"files": files, "rows": rows}, 160)
+    assert sorted((entry["python"], entry["tests"], entry["split"]) for entry in again) == sorted(
+        (entry["python"], entry["tests"], entry["split"]) for entry in entries)
 
 
 def test_a_file_whose_recorded_tests_outweigh_its_median_runs_split_by_them(ci, tmp_path):
