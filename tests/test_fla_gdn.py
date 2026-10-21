@@ -35,6 +35,7 @@ from reference_error import (
 from sharded import assert_runs_per_shard, boundary_copies
 from tuned import each_config
 
+from dew.nn.kda import KimiDeltaAttention
 from dew.nn.kernels import chunked_launch, fla_gdn, fla_kda, generation, recurrence_chunk, tuning
 from dew.nn.kernels.recurrence import ChunkLocalCumsum, cumulated
 from dew.nn.kernels.recurrence_chunk import fla_rule
@@ -623,7 +624,6 @@ def test_a_cached_continuation_whose_history_varies_in_a_checked_map_runs_the_po
     from jax.sharding import Mesh, PartitionSpec
 
     from dew.nn.inputs import MixerCall
-    from dew.nn.kda import KimiDeltaAttention
 
     layer = (GatedDeltaNet(emb_features=64, num_k_heads=1, num_v_heads=2, head_k_dim=64, head_v_dim=64)
              if kind == "gated delta net" else
@@ -948,12 +948,16 @@ def test_the_port_keeps_the_kernel_contract_on_a_mesh(axis, split, per_key):
 
 
 @pytest.mark.gpu(reason="the port's kernels lower to Triton calls only on a GPU")
-def test_a_bf16_gated_delta_net_trains_with_no_copy_at_the_ports_edges():
-    """A bf16 GatedDeltaNet at the 0.8B's heads, forward and backward, compiled for this GPU: no copy
-    or transpose feeds one of the port's Triton calls or reads one of its results
-    (`sharded.boundary_copies`), so every operand reaches the kernels in the layout they read."""
-    layer = GatedDeltaNet(emb_features=1024, num_k_heads=16, num_v_heads=16, head_k_dim=128, head_v_dim=128,
-                          dtype=jnp.bfloat16)
+@pytest.mark.parametrize("build", [
+    lambda: GatedDeltaNet(emb_features=1024, num_k_heads=16, num_v_heads=16, head_k_dim=128, head_v_dim=128,
+                          dtype=jnp.bfloat16),
+    lambda: KimiDeltaAttention(emb_features=1024, num_heads=8, head_dim=128, dtype=jnp.bfloat16),
+], ids=["gated delta net at the 0.8B's heads", "kimi delta attention at Kimi Linear's heads"])
+def test_a_bf16_delta_rule_layer_trains_with_no_copy_at_the_ports_edges(build):
+    """A bf16 layer on either port, forward and backward, compiled for this GPU: no copy or transpose
+    feeds one of the port's Triton calls or reads one of its results (`sharded.boundary_copies`), so
+    every operand reaches the kernels in the layout they read."""
+    layer = build()
     x = jax.random.normal(jax.random.key(47), (2, 512, 1024), jnp.bfloat16)
     params = layer.init(jax.random.key(53), x)
 

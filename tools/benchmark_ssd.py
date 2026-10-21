@@ -33,6 +33,7 @@ from dataclasses import dataclass
 import jax
 import jax.numpy as jnp
 import tyro
+from benchmark_attention import largest_difference
 
 from dew.nn.kernels.recurrence_chunk import chunk_delta_rule
 from dew.nn.kernels.ssd import ssd_chunk_scan, ssd_kernel_runs
@@ -113,11 +114,6 @@ def failure(error: BaseException) -> str:
     return f"{type(error).__name__}: {str(error).splitlines()[0][:160]}"
 
 
-def largest(left, right) -> float:
-    return max(float(jnp.max(jnp.abs(a.astype(jnp.float32) - b.astype(jnp.float32))))
-               for a, b in zip(jax.tree.leaves(left), jax.tree.leaves(right), strict=True))
-
-
 def measure(case: dict, config: BenchmarkConfig) -> dict:
     """One row: implementation x sequence length, forward and forward+backward.
 
@@ -164,14 +160,14 @@ def measure(case: dict, config: BenchmarkConfig) -> dict:
     if config.parity and case['implementation'] == 'kernel':
         reference = scan_fn('xla', platform, config.chunk_size)
         expected = jax.jit(reference)(*built)
-        row['forward_error'] = largest(scanned, expected)
+        row['forward_error'] = largest_difference(scanned, expected)
         row['forward_scale'] = float(jnp.max(jnp.abs(expected[0])))
         if gradients is not None:
             wanted = jax.jit(jax.grad(
                 lambda *a: (jnp.sum(reference(*a)[0] * cotangents[0])
                             + jnp.sum(reference(*a)[1] * cotangents[1])),
                 argnums=(0, 1, 2, 3, 4)))(*built)
-            row['gradient_error'] = largest(gradients, wanted)
+            row['gradient_error'] = largest_difference(gradients, wanted)
             row['gradient_scale'] = float(max(jnp.max(jnp.abs(g)) for g in wanted))
     return row
 
