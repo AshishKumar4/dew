@@ -28,6 +28,7 @@ import jax.numpy as jnp
 import ml_dtypes
 import numpy as np
 import pytest
+from interop_support import recorded_gradients
 from reference_error import (
     assert_as_exact_as_the_reference,
     assert_as_exact_over_orders,
@@ -232,9 +233,7 @@ def test_the_output_and_every_gradient_are_as_exact_as_flaxdiffs(reference, case
         return np.asarray(tree)
 
     def source_order(precision: str) -> np.ndarray:
-        leaves = [part(f"{precision}.grad_image"), part(f"{precision}.grad_text")]
-        leaves += [part(f"{precision}.grad_param.{name}") for name in names]
-        return np.concatenate([np.ravel(value) for value in leaves])
+        return recorded_gradients(part, precision, ("image", "text"), names)
 
     def gradient_order(gradients, back=None):
         grad_params, grad_image, grad_text = gradients
