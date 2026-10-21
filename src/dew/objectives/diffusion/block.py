@@ -374,10 +374,10 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         noisy = step.boundary("noised input", jnp.where(keep, response, noise))
         eligible = canvas_mask.reshape(rows, self.num_canvases, self.canvas_size).any(axis=-1)
         valid_canvases = eligible.sum(axis=-1)
-        rank = (step.sample("canvas", jax.random.uniform, (), dtype=jnp.float32, rows=rows)
+        rank = (step.sample("canvas uniform", jax.random.uniform, (), dtype=jnp.float32, rows=rows)
                 * jnp.maximum(valid_canvases, 1)).astype(jnp.int32)
         selected = jnp.argmax(jnp.cumsum(eligible, axis=-1) > rank[:, None], axis=-1)
-        use_sc = step.sample("self conditioning", jax.random.uniform, (), dtype=jnp.float32,
+        use_sc = step.sample("self conditioning uniform", jax.random.uniform, (), dtype=jnp.float32,
                              rows=rows) < self.self_cond_prob
         return noisy, step.boundary("canvas", selected), step.boundary("self conditioning", use_sc)
 

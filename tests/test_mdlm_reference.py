@@ -69,7 +69,12 @@ def test_the_nelbo_and_its_gradient_are_mdlms():
     variables = {"params": {"hidden": jnp.asarray(REFERENCE["hidden"]),
                             "head": jnp.asarray(REFERENCE["head"])}}
     batch = {"text": jnp.asarray(REFERENCE["tokens"], jnp.int32)}
-    step = Step(jnp.asarray(0), jax.random.key(0), None)
+    # The objective reads the reference's own corruption, its times and masks (`Step.tape`).
+    process = MDLM(mask_id=MASK)()
+    time_key, mask_key, _ = jax.random.split(jax.random.key(0), 3)
+    t = process.sample_t(time_key, REFERENCE["tokens"].shape[0])
+    _, is_masked = process.corrupt(mask_key, jnp.asarray(REFERENCE["tokens"]), t)
+    step = Step(jnp.asarray(0), jax.random.key(0), None, tape={"times": t, "mask": is_masked})
 
     def mean(variables):
         return model.scalar_loss(variables, batch, step)

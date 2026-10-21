@@ -109,7 +109,12 @@ class DiscreteProcess:
         SAMPLING_EPS keeps every weight at most 1 / SAMPLING_EPS.
         """
         # MDLM's `_sample_t`, kuleshov-group/mdlm@c112c52, diffusion.py:800-808.
-        stratified = (jax.random.uniform(key, (n,)) + jnp.arange(n, dtype=jnp.float32)) / n
+        return self.stratified(jax.random.uniform(key, (n,)), jnp.arange(n), n)
+
+    @staticmethod
+    def stratified(uniforms, strata, n: int) -> jax.Array:
+        """`sample_t` from a uniform for each row and its stratum of `n`."""
+        stratified = (uniforms + strata.astype(jnp.float32)) / n
         return (1 - SAMPLING_EPS) * stratified + SAMPLING_EPS
 
     def corrupt(self, key, tokens, t) -> tuple[jax.Array, jax.Array]:

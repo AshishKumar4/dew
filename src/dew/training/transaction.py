@@ -240,11 +240,12 @@ def example_places(slot, split: int, rows: int) -> jax.Array:
     return (step * rows * split + part + split * jnp.arange(rows, dtype=jnp.int32)).astype(jnp.int32)
 
 
-def example_fields(state, slot, split: int, batch) -> dict[str, jax.Array]:
-    """The `Step` fields of the microbatch in window slot `slot` of the update `state` commits next, its
-    steps read in `split` microbatches each: the update's key (`Step.example_key`) and each row's place
-    among the update's examples (`example_places`), placed as the batch's rows are, so each device draws
-    its own rows' examples alone. A batch with no rows has no examples."""
+def example_fields(state, slot, split: int, batch, slots: int = 1) -> dict:
+    """The `Step` fields of the microbatch in window slot `slot` of the update `state` commits next, of
+    `slots` microbatches, its steps read in `split` microbatches each: the update's key
+    (`Step.example_key`), each row's place among the update's examples (`example_places`), placed as the
+    batch's rows are, so each device draws its own rows' examples alone, and how many examples the update
+    pools. A batch with no rows has no examples."""
     rows = rows_of(batch)
     if not rows:
         return {}
@@ -253,7 +254,7 @@ def example_fields(state, slot, split: int, batch) -> dict[str, jax.Array]:
     like = next(leaf for leaf in jax.tree.leaves(batch) if np.ndim(leaf))
     if (placed := rows_spec(like, 1)) is not None:
         index = jax.sharding.reshard(index, placed)
-    return {"example_key": key, "example_index": index}
+    return {"example_key": key, "example_index": index, "example_count": slots * rows}
 
 
 class Transaction:
@@ -395,8 +396,8 @@ class Transaction:
                     **self.examples(state, index, batch))
         return self.read(variables, state.compute), batch, step_info
 
-    def examples(self, state, slot, batch) -> dict[str, jax.Array]:
-        return example_fields(state, slot, self.split, batch)
+    def examples(self, state, slot, batch) -> dict:
+        return example_fields(state, slot, self.split, batch, self.size)
 
     def read(self, variables, compute):
         """The variables a step's forward reads: the narrow copies in place of

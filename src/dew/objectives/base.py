@@ -123,8 +123,14 @@ class Recorder:
     (`Step.example_index`) its rows are: what one run records for others to replay (`Step.tape`). A
     harness hands a step one and returns `values` from the same trace."""
     values: dict[str, list[tuple[jax.Array, jax.Array]]] = field(default_factory=dict)
+    kinds: dict[str, str] = field(default_factory=dict)
 
-    def record(self, name: str, examples: jax.Array, value: jax.Array) -> None:
+    def record(self, kind: str, name: str, examples: jax.Array, value: jax.Array) -> None:
+        """Keep `value`, a `kind` ("sample" or "boundary") named `name`; a name is one kind, as a tape
+        replays it by name alone."""
+        if self.kinds.setdefault(name, kind) != kind:
+            raise ValueError(f"{name!r} is recorded as a {self.kinds[name]} and as a {kind}: a tape "
+                             "replays a name as one value")
         self.values.setdefault(name, []).append((examples, value))
 
     def tape(self, examples: int) -> dict[str, jax.Array]:
@@ -182,11 +188,20 @@ class Step:
     example_index: jax.Array | None = None
     """Each row's place among the update's examples, `[rows]` int32: its step's place in the window
     times a step's rows, plus its row in the step's batch. None outside a run, where rows are 0, 1, ..."""
+    example_count: int | None = struct.field(pytree_node=False, default=None)
+    """How many examples the update pools, which a draw stratified over them reads (`places`); None
+    outside a run, where it is the batch's rows."""
     tape: Mapping[str, jax.Array] | None = None
     """Values recorded by name, each indexed by example on its first axis, which `sample` and `boundary`
     read in place of drawing or computing them (`Recorder.tape`)."""
     recorder: Recorder | None = struct.field(pytree_node=False, default=None)
     """Where `sample` and `boundary` record what they produce, or None."""
+
+    def places(self, rows: int) -> tuple[jax.Array, int]:
+        """The places among the update's examples of a batch's `rows` rows (`examples`) and how many
+        examples the update pools: what a draw stratified over the update's examples reads, the same
+        on every layout."""
+        return self.examples(rows), rows if self.example_count is None else self.example_count
 
     def examples(self, rows: int) -> jax.Array:
         """The places among the update's examples of a batch's `rows` rows."""
@@ -217,7 +232,7 @@ class Step:
 
             value = jax.vmap(drawn)(examples)
         if self.recorder is not None:
-            self.recorder.record(name, examples, value)
+            self.recorder.record("sample", name, examples, value)
         return value
 
     def boundary(self, name: str, value: jax.Array) -> jax.Array:
@@ -228,7 +243,7 @@ class Step:
         if self.tape is not None and name in self.tape:
             value = jnp.take(self.tape[name], examples, axis=0).astype(value.dtype)
         if self.recorder is not None:
-            self.recorder.record(name, examples, value)
+            self.recorder.record("boundary", name, examples, value)
         return value
 
     @property

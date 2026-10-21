@@ -32,10 +32,11 @@ power iteration and keeps its `u`; the held, fake and R1 passes run one
 from that `u` and keep nothing. torch's own `spectral_norm` does each
 iteration, its `u` restored after the passes that keep nothing.
 
-The draws are the ones `AdversarialDistillationObjective.loss` makes from
-`jax.random.key(KEY)`: of the split's five keys the third picks each row's
-student time, the fourth draws the noise, and the fifth, split again, the
-level's normal and the renoising noise. The student and teacher networks
+The draws, each row's student time, its noise, its level's normal and its
+renoising noise, come from `jax.random.key(KEY)`: of the split's five keys
+the third, the fourth and the fifth split again. The test hands them to
+`AdversarialDistillationObjective.loss` by name (`Step.tape`), so both
+runs step on the same draws. The student and teacher networks
 are stand-ins with one token per sample. Both runs, float32 and float64,
 take their own precision wherever the published code names one (DiT's
 embedding computes in float32). What lands: the inputs, the draws, every
