@@ -1,9 +1,11 @@
 """dew.nn.kernels.tuning's picks in Dew's own JSON: every launch a step traces, its op, its arguments and
 its timings, written and read back equal, through tokamax's public API alone."""
 
+import dataclasses
 import json
 
 import jax
+import jax.numpy as jnp
 import tokamax
 
 from dew.nn.kernels import norm_swiglu, tuning
@@ -101,3 +103,54 @@ def test_a_stored_class_this_checkout_lacks_is_unreadable_and_an_imports_own_fai
     with pytest.raises(ModuleNotFoundError) as failed:
         tuning._located("kernel_needing_a_dependency:Kernel")
     assert not isinstance(failed.value, tuning.Unreadable)
+
+
+@dataclasses.dataclass(frozen=True)
+class _Hooks:
+    """A gemm-like launch's hooks: a function, and axes that decide its side operands."""
+
+    epilogue: object
+    axes: tuple[int, ...]
+
+
+@dataclasses.dataclass(frozen=True)
+class _HookedKernel(tuning.KernelOp):
+    """A launch whose op holds a traced function, and whose argument `hooks` holds another."""
+
+    HOOKS = ("prologue", "hooks")
+    name = "hooked"
+    config_cls = int
+    prologue: object = None
+
+    def _fwd(self, x, hooks, *, config, return_residuals=False):
+        return x, None
+
+    def _get_heuristics_config(self, ba):
+        return 1
+
+    def _get_autotuning_configs(self, ba):
+        return {1, 2}
+
+
+def test_a_hooked_launch_keys_by_its_hooks_presence_and_round_trips():
+    """A template's traced functions, closures among them, key its picks by whether each is there, not
+    by which function it is: two closures key alike and store and read back as the same launch; hooks
+    whose other fields differ (axes) key apart, and so does a launch without the function."""
+    def closure(scale):
+        return lambda tile: tile * scale
+
+    x = jax.ShapeDtypeStruct((8, 16), jnp.float32)
+
+    def keyed(prologue, epilogue, axes):
+        op = _HookedKernel(prologue=prologue)
+        return op.keyed(op.bind(x, _Hooks(epilogue, axes)))
+
+    first, second = keyed(closure(2.0), closure(3.0), (0,)), keyed(closure(5.0), closure(7.0), (0,))
+    assert (tuning._identity(first.op), first.autotuning_cache_key) == (
+        tuning._identity(second.op), second.autotuning_cache_key)
+    [again] = tuning.loads_launches(tuning.dumps_launches([first]))
+    assert (again.op, again.autotuning_cache_key) == (tuning._identity(first.op), first.autotuning_cache_key)
+    other_axes, no_prologue = keyed(closure(2.0), closure(3.0), (1,)), keyed(None, closure(3.0), (0,))
+    assert other_axes.autotuning_cache_key != first.autotuning_cache_key
+    assert tuning._identity(no_prologue.op) != tuning._identity(first.op)
+

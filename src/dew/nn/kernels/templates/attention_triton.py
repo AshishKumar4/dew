@@ -154,6 +154,7 @@ class TritonForward(Template[Tiles]):
     `output_kinds`) and the softmax's initial state. Returns the output `[B, Qp, H, Dvp]` and, with
     `residuals`, each query's running maximum and denominator `[B, H, Qp]`, fp32."""
 
+    HOOKS = ("score_mod", "output_mod")
     name = "triton"
     config_cls = Tiles
     score_mod: Callable | None = None
@@ -551,6 +552,7 @@ def _spans_specs(per_rows, whole, ids: bool) -> list:
 class _Backward(Template[Tiles]):
     """What the backward's two launches share: their space, staged bytes and cost."""
 
+    HOOKS = ("score_mod",)
     score_mod: Callable | None = None
     score_kinds: tuple[Kind, ...] = ()
     scale: float = 1.0
