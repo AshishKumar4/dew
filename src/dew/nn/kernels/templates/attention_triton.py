@@ -32,7 +32,7 @@ from dew.nn.kernels.templates.attention import (
     kept_dtype,
     padded_call,
 )
-from dew.nn.kernels.templates.base import Template
+from dew.nn.kernels.templates.base import Template, dividing
 
 DTYPES = (jnp.float32, jnp.bfloat16, jnp.float16)
 """The operand dtypes the kernels take, one on queries, keys and values alike."""
@@ -344,8 +344,8 @@ class TritonForward(Template[Tiles]):
 
 def _dividing[T: (Tiles, BackwardTiles)](space: tuple[T, ...], ba: tokamax.BoundArguments) -> tuple[T, ...]:
     """The configs of `space` whose tiles divide the launch's padded queries and keys."""
-    queries, keys = ba.arguments["query"].shape[1], ba.arguments["key"].shape[1]
-    return tuple(tiles for tiles in space if queries % tiles.block_q == 0 and keys % tiles.block_k == 0)
+    return dividing(space, (ba.arguments["query"].shape[1], ba.arguments["key"].shape[1]),
+                    lambda tiles: (tiles.block_q, tiles.block_k))
 
 
 def _param_spec(kind: Kind, param: jax.Array, block_q: int, keys: int) -> pl.BlockSpec:
@@ -440,7 +440,7 @@ def _tile_scores(score_mod, query, key, value, dout, peak, total, anchor, delta,
 def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tuple[Kind, ...], score_mod,
                scale: float, block_k: int, interpret: bool):
     refs = list(refs)
-    query_ids_ref, key_ids_ref = (refs.pop(0), refs.pop(0)) if ids else (None, None)
+    id_refs = [refs.pop(0), refs.pop(0)] if ids else []
     (query_ref, key_ref, value_ref, dout_ref, peak_ref, total_ref, initial_ref, maximum_ref, index_ref,
      anchor_value_ref) = (refs.pop(0) for _ in range(10))
     score_refs = [refs.pop(0) for _ in score_kinds]
@@ -448,21 +448,21 @@ def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tu
     for _ in (kind for kind in score_kinds if kind == Kind.TILE):
         refs.pop(0)
     dq_ref, delta_ref, anchor_ref, peak_out_ref, total_out_ref, mass_ref, index_out_ref, *outputs = refs
-    grad_refs = [outputs.pop(0) if kind in DQ_GRADS else None for kind in score_kinds]
+    grad_refs = {place: outputs.pop(0) for place, kind in enumerate(score_kinds) if kind in DQ_GRADS}
     block_q = query_ref.shape[0]
     head = pl.program_id(2)
     q_pos = pl.program_id(0) * block_q + jnp.arange(block_q)[:, None]
     query, dout = query_ref[...], dout_ref[...]
     peak, total = peak_ref[...], total_ref[...]
     start, end = start_ref[...], end_ref[...]
-    query_ids = query_ids_ref[...] if ids else None
+    query_ids = [ref[...] for ref in id_refs[:1]]
 
     def tile(index):
         keys = pl.ds(index * block_k, block_k)
         k_pos = index * block_k + jnp.arange(block_k)[None, :]
         seen = (k_pos >= start[:, None]) & (k_pos < end[:, None])
         if ids:
-            seen &= query_ids[:, None] == key_ids_ref[keys][None, :]
+            seen &= query_ids[0][:, None] == id_refs[1][keys][None, :]
         params = [_tile_param(ref, kind, head, q_pos, keys)
                   for ref, kind in zip(score_refs, score_kinds, strict=True)]
         return keys, k_pos, seen, params
@@ -503,9 +503,9 @@ def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tu
         logits, pieces = algebra.pulled(cotangents, slopes, seen, score_kinds)
         # Scaled before it narrows to the operands' dtype, so fp16 holds what fp32 does.
         dq = dq + _dot((logits * scale).astype(key.dtype), key, interpret)
-        for kind, ref, piece in zip(score_kinds, grad_refs, pieces, strict=True):
+        for place, (kind, piece) in enumerate(zip(score_kinds, pieces, strict=True)):
             if kind == Kind.TILE:
-                ref[:, keys] = piece
+                grad_refs[place][:, keys] = piece
         grads = tuple(grad + piece if row else grad for grad, row, piece in zip(grads, summed, pieces,
                                                                                strict=True))
         if any(summed):
@@ -534,27 +534,27 @@ def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tu
     total_out_ref[...] = total
     # The keys' share of the weights, which tells a query that read only its initial state.
     mass_ref[...] = mass
-    for grad, kind, ref in zip(grads, score_kinds, grad_refs, strict=True):
+    for place, (grad, kind) in enumerate(zip(grads, score_kinds, strict=True)):
         if kind == Kind.HEAD:
-            ref[...] = jnp.broadcast_to(jnp.sum(grad), ref.shape)
+            grad_refs[place][...] = jnp.broadcast_to(jnp.sum(grad), grad_refs[place].shape)
         elif kind == Kind.QUERY:
-            ref[...] = grad
+            grad_refs[place][...] = grad
 
 
 def _dkv_kernel(ranges_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tuple[Kind, ...], score_mod,
                 scale: float, block_q: int, interpret: bool):
     refs = list(refs)
-    query_ids_ref, key_ids_ref = (refs.pop(0), refs.pop(0)) if ids else (None, None)
+    id_refs = [refs.pop(0), refs.pop(0)] if ids else []
     query_ref, key_ref, value_ref, dout_ref, peak_ref, total_ref, anchor_ref, delta_ref, index_ref = (
         refs.pop(0) for _ in range(9))
     score_refs = [refs.pop(0) for _ in score_kinds]
     dk_ref, dv_ref, *outputs = refs
-    grad_refs = [outputs.pop(0) if kind == Kind.KEY else None for kind in score_kinds]
+    grad_refs = {place: outputs.pop(0) for place, kind in enumerate(score_kinds) if kind == Kind.KEY}
     block_k = key_ref.shape[0]
     head = pl.program_id(2)
     k_pos = pl.program_id(0) * block_k + jnp.arange(block_k)[None, :]
     key, value = key_ref[...], value_ref[...]
-    key_ids = key_ids_ref[...] if ids else None
+    key_ids = [ref[...] for ref in id_refs[1:]]
 
     def step(index, carry):
         dk, dv, *grads = carry
@@ -563,7 +563,7 @@ def _dkv_kernel(ranges_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: t
         q_pos = index * block_q + jnp.arange(block_q)[:, None]
         seen = (k_pos >= start_ref[rows][:, None]) & (k_pos < end_ref[rows][:, None])
         if ids:
-            seen &= query_ids_ref[rows][:, None] == key_ids[None, :]
+            seen &= id_refs[0][rows][:, None] == key_ids[0][None, :]
         params = [_key_param(ref, kind, head, rows)
                   for ref, kind in zip(score_refs, score_kinds, strict=True)]
         exponentials, weights, cotangents, slopes = _tile_scores(
@@ -584,9 +584,9 @@ def _dkv_kernel(ranges_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: t
     dk, dv, *grads = jax.lax.fori_loop(ranges_ref[0], ranges_ref[1], step, (*zeros, *sums))
     dk_ref[...] = dk
     dv_ref[...] = dv
-    for grad, kind, ref in zip(grads, score_kinds, grad_refs, strict=True):
+    for place, (grad, kind) in enumerate(zip(grads, score_kinds, strict=True)):
         if kind == Kind.KEY:
-            ref[...] = grad
+            grad_refs[place][...] = grad
 
 
 def _spans_specs(per_rows, whole, ids: bool) -> list:

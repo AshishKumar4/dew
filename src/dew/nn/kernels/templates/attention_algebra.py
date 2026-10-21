@@ -111,7 +111,7 @@ def modify(spec: Forward, s: jax.Array, coords: Coords, params: tuple[jax.Array,
         return logits
     seen = None
     if spec.form == "spans":
-        start, end = _interval(coords)
+        start, end = _given(coords.start, coords.end, "its queries' intervals")
         seen = (coords.k_pos >= start[:, None]) & (coords.k_pos < end[:, None])
     elif spec.form == "causal":
         seen = coords.k_pos <= coords.q_pos
@@ -119,24 +119,17 @@ def modify(spec: Forward, s: jax.Array, coords: Coords, params: tuple[jax.Array,
         # A tile past the call's last key reads padding.
         seen = coords.k_pos < spec.keys if seen is None else seen & (coords.k_pos < spec.keys)
     if spec.ids:
-        query_ids, key_ids = _ids(coords)
+        query_ids, key_ids = _given(coords.query_ids, coords.key_ids, "its queries' and keys' ids")
         same = query_ids[:, None] == key_ids[None, :]
         seen = same if seen is None else seen & same
     return logits if seen is None else jnp.where(seen, logits, -jnp.inf)
 
 
-def _interval(coords: Coords) -> tuple[jax.Array, jax.Array]:
-    """A spans call's intervals, which its mainloop gives every tile's coordinates."""
-    if coords.start is None or coords.end is None:
-        raise ValueError("a spans call's mainloop gives each tile its queries' intervals (`Coords`)")
-    return coords.start, coords.end
-
-
-def _ids(coords: Coords) -> tuple[jax.Array, jax.Array]:
-    """A call of documents' query and key ids, which its mainloop gives every tile's coordinates."""
-    if coords.query_ids is None or coords.key_ids is None:
-        raise ValueError("a mainloop gives a call of documents' tiles their queries' and keys' ids")
-    return coords.query_ids, coords.key_ids
+def _given(first: jax.Array | None, second: jax.Array | None, what: str) -> tuple[jax.Array, jax.Array]:
+    """Two of a tile's coordinates its call's form reads, which its mainloop gives it (`Coords`)."""
+    if first is None or second is None:
+        raise ValueError(f"a mainloop gives each tile of this call {what} (`Coords`)")
+    return first, second
 
 
 def _safe(spec: Forward, m: jax.Array) -> jax.Array:
