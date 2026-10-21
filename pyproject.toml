@@ -109,12 +109,6 @@ test = [
     "moto[server,s3]>=5.1.15",
     # Delta source and publication scenarios use the optional table implementation.
     "dewml[delta]",
-    # tests/kernel_compile.py compiles every declared Pallas kernel config for each GPU generation on a
-    # CPU with the compiler the GPU runs: XLA's CUDA backend of this jaxlib for a compile-only device,
-    # through the Triton jaxlib bundles, with CUDA's libdevice and ptxas (the nvcc wheel) and no GPU.
-    "jax-cuda12-plugin==0.11.2; sys_platform == 'linux' and platform_machine == 'x86_64'",
-    "jax-cuda12-pjrt==0.11.2; sys_platform == 'linux' and platform_machine == 'x86_64'",
-    "nvidia-cuda-nvcc-cu12~=12.9; sys_platform == 'linux' and platform_machine == 'x86_64'",
     # The gate's behavior tests run the same linter and rule set as CI.
     "ruff==0.14.3",
     # tools/check.sh's duplicate-code gate (tools/duplicates.py) and its red fixture run this pylint.
@@ -237,6 +231,13 @@ augment = ["albumentations>=2"]
 # JAX. torchax 0.0.13 fails to import on torch 2.14; this nightly is the build
 # the fallback's tests ran against.
 torchax = ["torch>=2.14,<2.15", "torchax==0.0.14.dev20260922"]
+# tests/kernel_compile.py compiles every declared Pallas kernel config for each GPU generation with the
+# compiler the GPU runs, XLA's CUDA backend of this jaxlib for a compile-only device (the Triton jaxlib
+# bundles, CUDA's libdevice and ptxas from the nvcc wheel), on a host with no GPU: locks/cpu.txt takes
+# this extra, and a GPU host's lock has its own CUDA plugin already (tools/lock_environment.sh).
+kernel-compile = ["jax-cuda12-plugin==0.11.2; sys_platform == 'linux' and platform_machine == 'x86_64'",
+                  "jax-cuda12-pjrt==0.11.2; sys_platform == 'linux' and platform_machine == 'x86_64'",
+                  "nvidia-cuda-nvcc-cu12~=12.9; sys_platform == 'linux' and platform_machine == 'x86_64'"]
 # The test suite's one environment: every package a test file imports, so no test skips for want
 # of one. CI's jobs, armada's (tools/armada/install.sh), the GPU nodes' and dew-ops' GPU jobs install
 # it under constraints.txt, locked in locks/ (tools/lock_environment.sh).
