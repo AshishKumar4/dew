@@ -374,7 +374,8 @@ def test_every_route_generates_through_its_packed_projections_over_canonical_wei
     greedy = Sampling(temperature=0, eos_token_ids=255)
     drawn = {}
     for name, task in routes.items():
-        prepacked = TextGeneration(task.model, inference_projections(task.model, task.variables), task.processor)
+        packed = inference_projections(task.model, task.variables)
+        prepacked = TextGeneration(task.model, packed, task.processor)
         drawn[name] = task("the ", 4, key=2, sampling=greedy).host()
         expected = prepacked("the ", 4, key=2, sampling=greedy).host()
         np.testing.assert_array_equal(drawn[name].tokens, expected.tokens, err_msg=name)
