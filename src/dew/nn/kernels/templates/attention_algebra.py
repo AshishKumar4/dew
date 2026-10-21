@@ -54,8 +54,9 @@ class Forward:
 
     @property
     def guarded(self) -> bool:
-        """Whether a query can see no key, so its maxima and denominators need the empty row's guard."""
-        return self.form == "spans" or self.score_mod is not None
+        """Whether a query can see no key, so its maxima and denominators need the empty row's guard: a
+        call of no keys, one whose spans narrow, or one a score hook may mask."""
+        return self.keys == 0 or self.form == "spans" or self.score_mod is not None
 
     def power(self, x: jax.Array) -> jax.Array:
         """The exponential the logits are in: exp2 in base 2, exp otherwise."""
@@ -215,9 +216,10 @@ def split_output(others: jax.Array, own: jax.Array, anchor_value: jax.Array) -> 
 
 def merge(spec: Forward, first: Partial, second: Partial) -> Partial:
     """Two states over disjoint keys as one, `first`'s keys before `second`'s: each taken to the larger
-    maximum and summed, in that order."""
+    maximum and summed, in that order. Either may hold no key whatever the call (a slice past a row's
+    keys), so `empty` is its identity under every spec."""
     m = jnp.maximum(first.m, second.m)
-    safe = _safe(spec, m)
+    safe = jnp.where(m == -jnp.inf, 0.0, m)
     a, b = spec.power(first.m - safe), spec.power(second.m - safe)
     acc = a[..., None] * first.acc + b[..., None] * second.acc
     return Partial(acc, m, a * first.total + b * second.total)
@@ -393,6 +395,35 @@ def split_delta(others: jax.Array, own: jax.Array, others_total: jax.Array, tota
     anchored = jnp.abs(about_anchor) <= jnp.abs(about_zero)
     numerator = jnp.where(anchored, about_anchor, about_zero)
     return jnp.where(anchored, anchor, 0.0), numerator * inverse(total), jnp.where(anchored, key_index, -1)
+
+
+class DqSums(NamedTuple):
+    """A dQ pass's sums over its keys, against weights normalized by a `prior` denominator (the
+    forward's, or the first pass's), so each narrowed operand holds a normalized weight's range: dQ
+    `[bq, D]`, the score cotangents' and the weights' row sums, and the HEAD and QUERY hook parameters'
+    pullbacks of the cotangents (`grads`) and of the weights (`weighed`), fp32."""
+
+    dq: jax.Array
+    residual: jax.Array
+    mass: jax.Array
+    grads: tuple[jax.Array, ...]
+    weighed: tuple[jax.Array, ...]
+
+
+def dq_finish(sums: DqSums, prior: jax.Array, state_total: jax.Array, peak0: jax.Array,
+              shares: tuple[jax.Array, jax.Array], peak: jax.Array, anchor: jax.Array, delta: jax.Array):
+    """A dQ pass's results from its sums: each taken from the `prior` denominator to the pass's own, the
+    initial state's `state_total` and its keys' weights (so the weights it differentiates sum to one over
+    its own logits, whichever pass gave D), then D refined once from its own sums (`refinement`) and the
+    HEAD and QUERY gradients with it. Returns dQ, the refined `D - c`, the denominator, the keys' share
+    of the weights, and the hook gradients."""
+    total = state_total + sums.mass * prior
+    ratio = prior * inverse(total)
+    mass, residual = sums.mass * ratio, sums.residual * ratio
+    refined = refinement(residual, mass, peak0, shares, peak, total, anchor, delta)
+    grads = tuple(grad * ratio - refined * weighed * ratio for grad, weighed in zip(sums.grads, sums.weighed,
+                                                                                    strict=True))
+    return sums.dq * ratio[:, None], delta + refined, total, mass, grads
 
 
 def normalized(logits: jax.Array, peak: jax.Array, total: jax.Array) -> tuple[jax.Array, jax.Array]:

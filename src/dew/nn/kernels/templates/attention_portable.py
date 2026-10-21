@@ -62,11 +62,13 @@ def _output_param(value: jax.Array, kind: Kind, row, head, rows: jax.Array):
 def forward(spec: algebra.Forward, query: jax.Array, key: jax.Array, value: jax.Array, start: jax.Array,
             end: jax.Array, query_ids: jax.Array | None, key_ids: jax.Array | None, score_params,
             score_kinds: tuple[Kind, ...], output_params, output_kinds: tuple[Kind, ...], initial, *,
-            block_q: int, block_k: int, output_mod=None):
+            block_q: int, block_k: int, output_mod=None, residuals: bool = True):
     """`TritonForward._fwd`'s outputs with its residuals from its operands (`query` `[B, Qp, H, Dp]`,
     `key` and `value` `[B, Kp, Hk, ...]`, the spans' rows and ids, the hooks' padded parameters, the
     initial state `(m0, total0, acc0)` or None), one query block and head at a time in sequence, its key
-    tiles walked as the Triton mainloop walks them."""
+    tiles walked as the Triton mainloop walks them: with `residuals` its training step (the split sums,
+    `algebra.split_accumulate`), else its plain one, so each rounds as the Triton launch it stands for;
+    the residuals are None where not asked for."""
     batch, queries, heads, _ = query.shape
     keys, kv_heads, value_width = key.shape[1], key.shape[2], value.shape[-1]
     group = heads // kv_heads
@@ -89,8 +91,7 @@ def forward(spec: algebra.Forward, query: jax.Array, key: jax.Array, value: jax.
         if ids is not None:
             narrowing["query_ids"] = ids[0][row, rows]
 
-        def step(j, carry: tuple[algebra.Partial, algebra.Argmax, jax.Array, jax.Array]):
-            state, arg, own, others_total = carry
+        def softmax(j, state: algebra.Partial):
             columns = j * block_k + jnp.arange(block_k)
             coords = algebra.Coords(q_pos, columns[None, :], **narrowing,
                                     key_ids=None if ids is None else ids[1][row, columns])
@@ -100,8 +101,17 @@ def forward(spec: algebra.Forward, query: jax.Array, key: jax.Array, value: jax.
             logits = algebra.modify(spec, _dot(q, k_tile.T), coords, params)
             m, alpha = algebra.peak(spec, state.m, logits)
             weights = algebra.weights(spec, logits, m)
-            denominator = algebra.total(state.total, alpha, weights)
             v_tile = jax.lax.dynamic_slice_in_dim(value[row, :, kv_head], j * block_k, block_k)
+            return coords, logits, m, alpha, weights, algebra.total(state.total, alpha, weights), v_tile
+
+        def plain(j, state: algebra.Partial) -> algebra.Partial:
+            _, _, m, alpha, weights, denominator, v_tile = softmax(j, state)
+            acc = algebra.rescale(state.acc, alpha) + _dot(algebra.narrow(weights, v_tile.dtype), v_tile)
+            return algebra.Partial(acc, m, denominator)
+
+        def step(j, carry: tuple[algebra.Partial, algebra.Argmax, jax.Array, jax.Array]):
+            state, arg, own, others_total = carry
+            coords, logits, m, alpha, weights, denominator, v_tile = softmax(j, state)
             # The training forward's split sums (`algebra.split_accumulate`), as the Triton mainloop's.
             anchor = algebra.argmax(arg, logits, coords.k_pos)
             others, own_tile = algebra.anchor_split(algebra.narrow(weights, v_tile.dtype),
@@ -124,19 +134,27 @@ def forward(spec: algebra.Forward, query: jax.Array, key: jax.Array, value: jax.
             lo, hi = 0, tiles
         out_params = tuple(_output_param(param, kind, row, head, rows)
                            for param, kind in zip(output_params, output_kinds, strict=True))
-        nothing = jnp.zeros((block_q,), jnp.float32)
-        carry = state, algebra.no_argmax(block_q), nothing, nothing
-        split, arg, own, others_total = jax.lax.fori_loop(lo, hi, step, carry)
-        state = split._replace(acc=algebra.split_output(split.acc, own, value[row, arg.key, kv_head]))
+        if residuals:
+            nothing = jnp.zeros((block_q,), jnp.float32)
+            carry = state, algebra.no_argmax(block_q), nothing, nothing
+            split, arg, own, others_total = jax.lax.fori_loop(lo, hi, step, carry)
+            state = split._replace(acc=algebra.split_output(split.acc, own, value[row, arg.key, kv_head]))
+            kept = arg.key, split.acc, own, others_total
+        else:
+            state = jax.lax.fori_loop(lo, hi, plain, state)
         out, m, denominator = algebra.finish(spec, state, initial=initial is not None, output_mod=output_mod,
                                              output_params=out_params)
-        return out.astype(query.dtype), m, denominator, arg.key, split.acc, own, others_total
+        return (out.astype(query.dtype), m, denominator, *kept) if residuals else out.astype(query.dtype)
 
-    out, m, denominator, anchors, others, own, others_total = jax.lax.map(program,
-                                                                          jnp.arange(blocks * batch * heads))
+    mapped = jax.lax.map(program, jnp.arange(blocks * batch * heads))
+    out = mapped[0] if residuals else mapped
     # [blocks * batch * heads, bq, ...] back to [B, Qp, H, ...] and [B, H, Qp].
     out = out.reshape(blocks, batch, heads, block_q, value_width).transpose(1, 0, 3, 2, 4)
     out = out.reshape(batch, queries, heads, value_width)
+
+    if not residuals:
+        return out, None, None, None, None
+    _, m, denominator, anchors, others, own, others_total = mapped
 
     def rowwise(x):
         return x.reshape(blocks, batch, heads, block_q).transpose(1, 2, 0, 3).reshape(batch, heads, queries)
@@ -160,14 +178,14 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, 
         state = hooks.initial
         initial = (call.rows(state.m, -jnp.inf), call.rows(state.total),
                    jnp.pad(call.rows(state.acc), ((0, 0),) * 3 + ((0, call.value.shape[-1] - value_width),)))
-    spec = algebra.Forward(spans.form, spans.keys or call.key.shape[1], call.query_ids is not None,
+    spec = algebra.Forward(spans.form, spans.keys, call.query_ids is not None,
                            query.shape[3] ** -0.5 if scale is None else scale, hooks.score_mod)
     out, m, denominator, anchors, split = forward(
         spec, call.query, call.key, call.value, call.start, call.end, call.query_ids, call.key_ids,
         call.score_params, tuple(param.kind for param in hooks.score_params), call.output_params,
         tuple(param.kind for param in hooks.output_params), initial, block_q=block_q, block_k=block_k,
-        output_mod=hooks.output_mod)
-    if not residuals:
+        output_mod=hooks.output_mod, residuals=residuals)
+    if split is None:
         return out[:, :queries, :, :value_width]
     sums = Split(split.others[:, :, :queries, :value_width], split.own[:, :, :queries],
                  split.others_total[:, :, :queries])
@@ -241,23 +259,24 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
                 return algebra.off_anchor(state, exponentials, rest, own, _dot(rest, v_tile))
 
             walked = jax.lax.fori_loop(lo, hi, row_terms, before)
+            prior = walked.total
             anchor, delta, chosen = algebra.off_anchor_delta(walked, anchor_rows, do, state_total,
                                                              state_share, chosen)
         else:
             # The forward took the first pass (`algebra.split_delta`).
-            others, own, others_total, forward_total = (part[row, head, rows] for part in sums)
-            anchor, delta, chosen = algebra.split_delta(others, own, others_total, forward_total, state_total,
+            others, own, others_total, prior = (part[row, head, rows] for part in sums)
+            anchor, delta, chosen = algebra.split_delta(others, own, others_total, prior, state_total,
                                                         anchor_rows, do, chosen)
         m = maxima
 
         def step(j, carry):
-            # Against the unnormalized weights, normalized at the end by their own sum, as the Triton
-            # mainloop's dQ launch.
+            # Against the weights at the prior denominator, taken to the pass's own at the end
+            # (`algebra.dq_finish`), as the Triton mainloop's dQ launch.
             dq, residual, mass, grads, weighed = carry
             columns, seen, params, k_tile, v_tile = tile(j)
             logits, slopes = _logits(score_mod, q, k_tile, seen, q_pos, columns[None, :], params, scale,
                                      slopes=True)
-            weights = algebra.normalized(logits, m, jnp.ones_like(m))[0]
+            weights = algebra.normalized(logits, m, prior)[1]
             cotangents = algebra.grad_scores(weights, _dot(do, v_tile.T), anchor, delta, seen,
                                              columns[None, :] == chosen[:, None])
             pulled, pieces = algebra.pulled(cotangents, slopes, seen, score_kinds)
@@ -272,17 +291,10 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
 
         nothing = jnp.zeros((block_q,), jnp.float32)
         rows_sums = tuple(nothing for _ in score_kinds)
-        dq, residual, mass, grads, weighed = jax.lax.fori_loop(
-            lo, hi, step, (jnp.zeros((block_q, width), jnp.float32), nothing, nothing, rows_sums, rows_sums))
-        denominator = state_total + mass
-        inverse = algebra.inverse(denominator)
-        dq, residual, mass = dq * inverse[:, None], residual * inverse, mass * inverse
-        grads = tuple(grad * inverse for grad in grads)
-        weighed = tuple(sums * inverse for sums in weighed)
-        refined = algebra.refinement(residual, mass, peak0, (total0, term0), m, denominator, anchor, delta)
-        delta = delta + refined
-        grads = tuple(grad - refined * sums if add else grad
-                      for grad, add, sums in zip(grads, summed, weighed, strict=True))
+        found = algebra.DqSums(*jax.lax.fori_loop(
+            lo, hi, step, (jnp.zeros((block_q, width), jnp.float32), nothing, nothing, rows_sums, rows_sums)))
+        dq, delta, denominator, mass, grads = algebra.dq_finish(found, prior, state_total, peak0,
+                                                                (total0, term0), m, anchor, delta)
         return dq, (delta, anchor, m, denominator, mass), chosen, _written(grads, score_kinds)
 
     dq, rows_out, chosen, written = jax.lax.map(program, jnp.arange(blocks * batch * heads))
