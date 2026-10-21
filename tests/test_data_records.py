@@ -118,6 +118,6 @@ def test_held_reads_a_dataset_in_its_own_batch_or_the_one_given():
     unbatched = _documents().map(Tagged(1))
     with pytest.raises(ValueError):
         held(unbatched)
-    # Eight documents in batches of three: two full batches and the two left over.
+    # Eight documents in batches of three: three batches of three rows each.
     sizes = [len(batch["text"]) for batch in held(unbatched, batch=3)(DataPartition())]
-    assert sizes == [3, 3, 2]
+    assert sizes == [3, 3, 3]
