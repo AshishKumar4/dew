@@ -277,7 +277,8 @@ def test_held_to_a_base_only_a_copy_the_base_lacked_fails(tmp_path):
     commit(root, "a head that leaves the copy")
     assert gate(root, "--base=main").returncode == 0 and added(root) == []
     assert gate(root).returncode == 1
-    (root / "third.py").write_text(SPREAD.replace("spread", "third"))
+    third = RANGE_OVER_COUNT.replace("range_over_count", "third").replace("chosen", "picked")
+    (root / "third.py").write_text(third)
     commit(root, "a head that copies it again")
     assert gate(root, "--base=main").returncode == 1
     assert owners(added(root)) == [
@@ -311,13 +312,14 @@ def test_held_to_a_base_a_moved_or_shrunk_copy_passes(tmp_path):
     """Main holds a function two files write. A head that renames one file and its function holds the same
     copy; so does one that changes one function's ending, which leaves six statements copied."""
     first = "def first(values, limit, scale):\n" + body(STEPS) + "    return balance * scale\n"
-    root = repository(tmp_path, {"first.py": first, "second.py": first.replace("first", "second")})
+    second = "def second(values, limit, scale):\n" + body(renamed(STEPS)) + "    return balance * scale\n"
+    root = repository(tmp_path, {"first.py": first, "second.py": second})
     subprocess.run(["git", "mv", "second.py", "moved.py"], cwd=root, check=True)
-    (root / "moved.py").write_text(first.replace("first", "moved"))
+    (root / "moved.py").write_text(second.replace("second", "moved"))
     commit(root, "a head that moves the copy")
     assert gate(root, "--base=main").returncode == 0 and added(root) == []
     branch(root, "shrunk")
-    (root / "second.py").write_text(first.replace("first", "second").replace("balance * scale", "-balance"))
+    (root / "second.py").write_text(second.replace("balance * scale", "-balance"))
     commit(root, "a head that changes one copy's ending")
     assert gate(root, "--base=main").returncode == 0 and added(root) == []
 
