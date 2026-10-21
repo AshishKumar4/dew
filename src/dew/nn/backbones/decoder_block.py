@@ -37,7 +37,7 @@ from ..inputs import LayerInputs, MixerCall, PredictionPhase
 from ..linear import recomputing
 from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, SparseMLP
 from ..ngpt import NGPT, stepped
-from ..precision import scaled
+from ..precision import float32_dot_general, scaled
 from ..protocols import ProjectionGroup, RoutesExperts, declared_groups
 from ..sharding import RESIDUAL, constrain, logical_axes
 
@@ -670,7 +670,8 @@ class DecoderBlock(nn.Module):
             self.output_scalar = self.param("layer_scalar", nn.initializers.ones, (1,), jnp.float32)
         if self.per_layer_input_dim:
             dense = functools.partial(
-                Dense, use_bias=False, dtype=self.dtype, precision=self.precision)
+                Dense, use_bias=False, dtype=self.dtype, precision=self.precision,
+                dot_general=float32_dot_general)
             self.per_layer_input_gate = dense(projections['per_layer_input_gate'][1],
                                               name='per_layer_input_gate')
             self.per_layer_projection = dense(projections['per_layer_projection'][1],
@@ -947,7 +948,10 @@ class DecoderBlock(nn.Module):
         """The state after the sublayer at `site` adds `output` to it."""
         if isinstance(state, _Plain) and self.wiring.ngpt is not None:
             alpha = self.attn_alpha if site == "attention" else self.mlp_alpha
-            stepped_x = stepped(state.x, output, alpha, self.wiring.ngpt.step)
+            # The stepped residual is a fusion boundary. Every later sublayer reads it, and without one
+            # XLA's GPU priority fusion clones each earlier sublayer's normalization into every later one:
+            # 556 of a 72-layer Dory prefill's 664 s compile on an A100 (ledger 635).
+            stepped_x = jax.lax.optimization_barrier(stepped(state.x, output, alpha, self.wiring.ngpt.step))
             return state._replace(x=constrain(stepped_x, RESIDUAL))
         if isinstance(state, _Plain):
             return state._replace(x=constrain(state.x + output, RESIDUAL))
@@ -1141,7 +1145,7 @@ class MTPBlock(nn.Module):
         maps = self.projections()
         def dense(name):
             return Dense(maps[name][1], use_bias=False, dtype=self.dtype,
-                         precision=self.precision, name=name)
+                         precision=self.precision, name=name, dot_general=float32_dot_general)
         if self.hyper_connections is None:
             self.eh_proj = dense('eh_proj')
         else:

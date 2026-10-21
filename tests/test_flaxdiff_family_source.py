@@ -36,6 +36,7 @@ from reference_error import (
     widened,
 )
 
+from dew.interop.flaxdiff import SCAN_PROJECTION, scan_projection
 from dew.nn.attention import Stage
 from dew.nn.backbones.dit import SimpleDiT
 from dew.nn.backbones.mmdit import HierarchicalMMDiT, SimpleMMDiT
@@ -60,6 +61,8 @@ UDIT_MOVED = {"time_embed": ("conditioning", "time_embed"),
               "final_norm": ("output", "final_norm"), "final_proj": ("output", "final_proj")}
 DIT_POOLING = {"text_pooling": "all"}
 PROJECTIONS = {"project_in_conv": "project_in", "project_out_conv": "project_out"}
+# A scan order's patch projection lands on Dew's patch convolution (`scan_projection`).
+SCAN_PROJECTED = ("patch_embed", "Conv_0")
 MMDITS = ("SimpleMMDiT", "HierarchicalMMDiT")
 # FlaxDiff's MM-DiT block module by module, as Dew's `DoubleStreamBlock`
 # names it: one joint attention holds both streams' projections and norms.
@@ -108,6 +111,9 @@ def mmdit_block(cls: str, name: str) -> bool:
 def dew_path(cls: str, name: str) -> tuple[str, ...]:
     """The Dew parameter a FlaxDiff parameter path lands on."""
     path = tuple(name.split("/"))
+    if SCAN_PROJECTION in path:
+        at = path.index(SCAN_PROJECTION)
+        path = (*path[:at], *SCAN_PROJECTED, *path[at + 1:])
     if cls == "SimpleUDiT" and path[0] in UDIT_MOVED:
         return (*UDIT_MOVED[path[0]], *path[1:])
     if mmdit_block(cls, name):
@@ -125,12 +131,16 @@ def dew_path(cls: str, name: str) -> tuple[str, ...]:
     return path
 
 
-def to_dew(cls: str, name: str, value: np.ndarray) -> np.ndarray:
+def to_dew(cls: str, name: str, value: np.ndarray, patch_size: int | None = None) -> np.ndarray:
     """A FlaxDiff parameter in Dew's layout: a 1x1 convolution's kernel as
-    the dense kernel it is, an MM-DiT's per-head projections flat, and its
+    the dense kernel it is, a scan order's patch projection as the patch
+    convolution's kernel, an MM-DiT's per-head projections flat, and its
     modulation pieces in SD3's order."""
     if PROJECTIONS.keys() & set(name.split("/")):
         return value[0, 0]
+    if name.endswith(f"{SCAN_PROJECTION}/kernel"):
+        assert patch_size is not None
+        return scan_projection(value, patch_size)
     if not mmdit_block(cls, name):
         return value
     module, leaf = name.split("/")[1], name.split("/")[-1]
@@ -199,7 +209,7 @@ def test_the_output_and_every_gradient_are_as_exact_as_flaxdiffs(reference, case
     prefix = f"{case}/param."
     names = sorted(name.removeprefix(prefix) for name in arrays if name.startswith(prefix))
     params = nest({dew_path(cls, name): to_dew(cls, name, part(f"param.{name}").view(ml_dtypes.bfloat16)
-                                                    .astype(np.float32))
+                                                    .astype(np.float32), config.get("patch_size"))
                    for name in names})
     constants = nest({(*fourier_path(cls), "frequencies"): part("fourier_table")})
     model = dew_model(cls, config)

@@ -57,6 +57,7 @@ from dew.interop.streaming import WeightLayout
 from dew.nn.backbones.layer_plan import group_layers
 from dew.nn.dense import Dense, DenseGeneral
 from dew.nn.flops import MissingFlopsCount, counted_flops, parameter_flops, projection_flops
+from dew.nn.precision import float32_dot_general
 from dew.nn.protocols import (
     Counted,
     CountedConditionedSpatial,
@@ -74,6 +75,7 @@ from dew.nn.protocols import (
     CountedTraining,
     CountedVideo,
 )
+from dew.nn.sharding import LOW_RANK_FACTORS
 from dew.objectives.base import FROZEN, Path, Variables, freeze, merge as overlay, select, thaw
 from dew.quantization import (
     FROZEN_FP8,
@@ -90,7 +92,7 @@ PEFT_PREFIX = "base_model.model."
 DIFFUSERS_WEIGHTS = "pytorch_lora_weights.safetensors"
 DIFFUSERS_METADATA = "lora_adapter_metadata"
 
-FACTORS = ("lora_A", "lora_B")
+FACTORS = LOW_RANK_FACTORS
 # PEFT's init: A as torch's Linear default, kaiming-uniform with a=sqrt(5),
 # which is uniform on +-1/sqrt(fan_in); B zero, so a fresh adapter is the
 # identity.
@@ -531,9 +533,9 @@ class _Branch:
         if self.dropout and module.has_rng("dropout"):
             x = nn.Dropout(self.dropout, deterministic=False)(x)
         x, a, b = promote_dtype(x, a, b, dtype=module.dtype)
-        hidden = jax.lax.dot_general(x, a, ((axes, tuple(range(len(axes)))), ((), ())),
+        hidden = float32_dot_general(x, a, ((axes, tuple(range(len(axes)))), ((), ())),
                                      precision=module.precision)
-        delta = jax.lax.dot_general(hidden, b, (((hidden.ndim - 1,), (0,)), ((), ())),
+        delta = float32_dot_general(hidden, b, (((hidden.ndim - 1,), (0,)), ((), ())),
                                     precision=module.precision)
         return output + jnp.asarray(_scale(target, self.rslora), delta.dtype) * delta
 

@@ -136,25 +136,9 @@ def pixel_shuffle(x: jnp.ndarray) -> jnp.ndarray:
     return einops.rearrange(x, 'b h w (c p1 p2) -> b (h p1) (w p2) c', p1=2, p2=2)
 
 
-def _ordered_patchify(x: jnp.ndarray, patch_size: int, order: np.ndarray):
-    return patchify(x, patch_size)[:, order, :], inverse_permutation(order)
-
-
-def hilbert_patchify(x: jnp.ndarray, patch_size: int) -> tuple[jnp.ndarray, np.ndarray]:
-    """`(patches in hilbert order, inv_idx)`; `hilbert_unpatchify` takes the
-    pair back to the image."""
-    _, H, W, _ = x.shape
-    return _ordered_patchify(x, patch_size, hilbert_indices(H // patch_size, W // patch_size))
-
-
-def zigzag_patchify(x: jnp.ndarray, patch_size: int) -> tuple[jnp.ndarray, np.ndarray]:
-    """`(patches in zigzag order, inv_idx)`, the contract of `hilbert_patchify`."""
-    _, H, W, _ = x.shape
-    return _ordered_patchify(x, patch_size, zigzag_indices(H // patch_size, W // patch_size))
-
-
 def hilbert_unpatchify(x: jnp.ndarray, inv_idx: np.ndarray, patch_size: int,
                        H: int, W: int, C: int) -> jnp.ndarray:
     """Scan-ordered patches `[B, N, p * p * C]` back to the image `[B, H, W, C]`
-    through the `inv_idx` their patchify returned, whichever order it was."""
+    through the `inv_idx` their gather returned (`dew.nn.dit.scan_ordered`),
+    whichever order it was."""
     return unpatchify(x[:, inv_idx, :], patch_size, H, W, C)

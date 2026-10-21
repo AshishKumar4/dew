@@ -48,7 +48,7 @@ from .attention import (
 from .inputs import PLAIN_CALL, MixerCall, PredictionPhase, coordinates_of, valid_order
 from .mixer_base import MixerBase, MixerContext
 from .mla import INDEXER, MultiHeadLatentAttention, latent_refusals, open_mla_cache
-from .precision import at_least_fp32
+from .precision import at_least_fp32, float32_dot_general, float32_einsum
 from .sharding import down_projection
 from .sparse_selection import index_scores, selection_mask, top_k_selection
 
@@ -98,7 +98,8 @@ class KPoolIndexer(nn.Module):
             raise ValueError(
                 f"the pool budget is index_topk // index_kpool whole pools, so index_topk "
                 f"({self.top_k}) must be divisible by index_kpool ({self.kpool})")
-        dense = functools.partial(Dense, use_bias=False, dtype=self.dtype, precision=self.precision)
+        dense = functools.partial(Dense, use_bias=False, dtype=self.dtype, precision=self.precision,
+                                  dot_general=float32_dot_general)
         self.wq_b = dense(self.n_heads * self.head_dim, name='wq_b')
         self.wk = dense(self.head_dim, name='wk')
         # A LayerNorm with weight and bias at a hardcoded 1e-6 (modeling_glm5_next.py:763).
@@ -119,7 +120,7 @@ class KPoolIndexer(nn.Module):
         x = jax.lax.stop_gradient(x)
         keys = self.k_norm(self.wk(x))
         x, gate = promote_dtype(x, self.index_kpool_compress_gate, dtype=self.dtype)
-        gate_scores = jnp.einsum('bsh,dh->bsd', x, gate, precision=self.precision)
+        gate_scores = float32_einsum('bsh,dh->bsd', x, gate, precision=self.precision)
         return jnp.concatenate(
             [keys, gate_scores.astype(keys.dtype), valid.astype(keys.dtype)[..., None]], axis=-1
         )
