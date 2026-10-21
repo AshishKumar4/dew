@@ -96,9 +96,68 @@ def decoder_residual_orders():
 CLASSES = {"cross-entropy-columns": cross_entropy_columns, "decoder-residual-orders": decoder_residual_orders}
 
 
+def _law(name: str, rng, size: int):
+    """`size` per-draw mean squared errors of a synthetic law: "exact-f" a squared standard normal, so
+    a pooled ratio's square over its own is F(K, K); "flip" 1 but 70 at one draw in 1,000, a rare bf16
+    flip; "gamma-1" a gamma of shape 1/2, a chi-square of one degree."""
+    import numpy as np
+
+    if name == "exact-f":
+        return np.square(rng.standard_normal(size))
+    if name == "flip":
+        return np.where(rng.random(size) < 1e-3, 70.0, 1.0)
+    if name == "gamma-1":
+        return rng.gamma(0.5, 2.0, size)
+    raise ValueError(name)
+
+
+def _procedure(two_stage: bool) -> dict:
+    """`_staged`'s keywords for check 1's two stages, or for the procedure before them (one stage, an
+    over drawing again, its interval's tails 5e-4 each)."""
+    return {} if two_stage else {"two_stage": False, "tails": (5e-4, 5e-4)}
+
+
+def controls(law: str, ratio: float, seeds: int, runs: int, chunk: int, two_stage: bool) -> list:
+    """Check 1's verdicts (`_staged`) on known-ratio controls, `runs` runs from `chunk`'s own stream:
+    Dew's per-draw errors ratio² times a draw of the law and the reference's an independent draw of it,
+    so the population RMS ratio is `ratio` and every run's is random. A law named for a class takes its
+    whole-field draws: each draw of Dew and of the reference one of the class's own draws, every leaf
+    together (512 of them, drawn past every run's seeds)."""
+    import numpy as np
+    from reference_error import REDRAW, _drawn, _Draws, _staged
+
+    rng = np.random.default_rng([chunk, int(ratio * 1000), seeds, int(two_stage)])
+    span = (1 + REDRAW) * seeds
+    if law in CLASSES:
+        reference, draw, truth = CLASSES[law]()
+        pool = _drawn(reference, reference, draw, range(3 * OFFSET * 1024, 3 * OFFSET * 1024 + 512), truth)
+        names, values = pool.names, np.asarray(pool.mine)
+    verdicts = []
+    for _ in range(runs):
+        if law in CLASSES:
+            mine = ratio ** 2 * values[rng.integers(0, len(values), span)]
+            theirs = values[rng.integers(0, len(values), span)]
+        else:
+            names = ["leaf"]
+            mine, theirs = ratio ** 2 * _law(law, rng, span)[:, None], _law(law, rng, span)[:, None]
+        leaves = mine.shape[1]
+
+        def drawn(start, stop, mine=mine, theirs=theirs, leaves=leaves, names=names):
+            count = stop - start
+            return _Draws(names, mine[start:stop], theirs[start:stop], np.zeros((count, leaves, 2)),
+                          np.zeros((count, leaves), int), np.ones((count, leaves), bool))
+
+        over, unresolved, stage = _staged(drawn, seeds, law, **_procedure(two_stage))
+        verdicts.append(("over" if over else "inconclusive" if unresolved else "pass", stage))
+    return verdicts
+
+
 def main(argv: list[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("name", choices=sorted(CLASSES))
+    parser.add_argument("name", help=f"a class ({', '.join(sorted(CLASSES))}), or with --ratio a control's "
+                        "law: a class's or exact-f, flip, gamma-1")
+    parser.add_argument("--ratio", type=float, help="run known-ratio controls of this population ratio")
+    parser.add_argument("--today", action="store_true", help="the procedure before the two stages")
     parser.add_argument("--seeds", type=int, help="the class's declared count; without it, size it "
                         "(`seeds_for`, on the seeds below OFFSET) and print it")
     parser.add_argument("--runs", type=int, default=10)
@@ -108,6 +167,12 @@ def main(argv: list[str]) -> int:
     options = parser.parse_args(argv)
     from reference_error import null_runs, seeds_for
 
+    if options.ratio is not None:
+        verdicts = controls(options.name, options.ratio, options.seeds, options.runs, options.chunk,
+                            not options.today)
+        print(json.dumps({"control": options.name, "ratio": options.ratio, "seeds": options.seeds,
+                          "today": options.today, "chunk": options.chunk, "verdicts": verdicts}), flush=True)
+        return 0
     reference, draw, truth = CLASSES[options.name]()
     if options.draws is not None:
         import numpy as np
@@ -125,9 +190,10 @@ def main(argv: list[str]) -> int:
         print(json.dumps({"class": options.name, "seeds": sized}), flush=True)
         return 0
     verdicts = null_runs(reference, draw, options.name, seeds=options.seeds, runs=options.runs,
-                         first=OFFSET + options.chunk * options.runs, truth_fn=truth)
+                         first=OFFSET + options.chunk * options.runs, truth_fn=truth,
+                         **_procedure(not options.today))
     print(json.dumps({"class": options.name, "chunk": options.chunk, "seeds": options.seeds,
-                      "verdicts": verdicts}), flush=True)
+                      "today": options.today, "verdicts": verdicts}), flush=True)
     return 0
 
 
