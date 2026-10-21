@@ -380,7 +380,7 @@ def bf16_product(subscripts: str, hidden: jax.Array, head: jax.Array) -> jax.Arr
     in fp32: the one product a bf16 head computes (`head_product`) and a tiled head computes over
     each tile, so the two round each logit alike."""
     states = _algorithm_operand(hidden.astype(jnp.float32))
-    logits = jnp.einsum(subscripts, states, _algorithm_operand(head.astype(jnp.float32)),
+    logits = jnp.einsum(subscripts, states, _algorithm_operand(head.astype(at_least_fp32(head.dtype))),
                         precision=jax.lax.DotAlgorithmPreset.BF16_BF16_F32,
                         preferred_element_type=jnp.float32)
     return bf16_logits(logits)
