@@ -359,14 +359,14 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None) -> _Draws:
                 leaf, true = np.asarray(leaf, np.float64), np.asarray(true, np.float64)
                 sizes, my_rows = row_errors(leaf, true)
                 sized = sizes > 0
-                theirs = dict(zip(their_leaf.zero_rows.tolist(), their_leaf.zero_errors.tolist(),
-                                  strict=True))
-                unrecorded = [int(at) for at in np.flatnonzero(~sized) if int(at) not in theirs]
+                at_zero = dict(zip(their_leaf.zero_rows.tolist(), their_leaf.zero_errors.tolist(),
+                                   strict=True))
+                unrecorded = [int(at) for at in np.flatnonzero(~sized) if int(at) not in at_zero]
                 if unrecorded:
                     raise AssertionError(f"{jax.tree_util.keystr(path)}: the truth recomputed holds rows of "
                                          f"float64 zero the recording's did not, {unrecorded[:4]}")
                 zero = sum(1 for at in np.flatnonzero(~sized)
-                           if not my_rows[at] <= ROW_FACTOR * theirs[int(at)])
+                           if not my_rows[at] <= ROW_FACTOR * at_zero[int(at)])
                 row.append((float(np.mean(np.square(leaf - true))), their_leaf.mse,
                             float(np.max(my_rows[sized] / sizes[sized])) if sized.any() else 0.0,
                             their_leaf.worst, zero,
