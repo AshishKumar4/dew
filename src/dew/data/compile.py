@@ -563,7 +563,9 @@ def _compiled(
             if isinstance(stage, Map)
         ),
     )
-    build = build.tuned(train).pooled(train)
+    tuned = build.tuned(train)
+    # The training read's workers move before what drops records (`pooled`); validation reads its own.
+    build = tuned.pooled(train)
     train_host, device = _batch_steps(train)
     train_host = packed + train_host + host
     statistics = _Statistics(counts)
@@ -583,7 +585,7 @@ def _compiled(
             _validation_reader,
             pipeline=validation,
             build=dataclasses.replace(
-                build, lowering=_analyzed(validation, read, validation=True), training=False,
+                tuned, lowering=_analyzed(validation, read, validation=True), training=False,
                 batch=_output_batch(validation),
             ).tuned(validation),
             host=_held_coordinated(validation, packed) + _held_steps(validation) + host,
