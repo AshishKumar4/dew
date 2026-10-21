@@ -86,9 +86,16 @@ def dropped_window(state, size: int):
     wrote keep what they wrote, as torch's AMP keeps a skipped update's running statistics."""
     if state.accumulation is None:
         return state
-    window = dataclasses.replace(cleared(dataclasses.replace(state.accumulation, gradient=None)),
-                                 gradient=state.accumulation.gradient)
-    return dataclasses.replace(state, microstep=state.microstep - state.microstep % size, accumulation=window)
+    microstep, window = window_dropped(state.microstep, state.accumulation, size)
+    return dataclasses.replace(state, microstep=microstep, accumulation=window)
+
+
+def window_dropped(microstep: jax.Array, acc: Accumulation, size: int) -> tuple[jax.Array, Accumulation]:
+    """`dropped_window`'s two fields: the microstep back at its window's start, and the window cleared but
+    for its gradient sum. A state's other fields go round it, as a compiled program over them alone
+    leaves a host-master state's resident frozen weights where they are."""
+    return microstep - microstep % size, dataclasses.replace(
+        cleared(dataclasses.replace(acc, gradient=None)), gradient=acc.gradient)
 
 
 def _only_when(due, taken, kept, operand):

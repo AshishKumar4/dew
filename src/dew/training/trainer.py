@@ -164,7 +164,7 @@ from dew.training.runtime import Preempted, PreemptionNotice, ready_process
 from dew.training.selection import Best, HeldBest, rankings
 from dew.training.state import MODEL_STATE, Accumulation, TrainState, kept_window
 from dew.training.tracker import Tracker
-from dew.training.transaction import Committed, Transaction, compact_qk, dropped_window, outcome, with_ema
+from dew.training.transaction import Committed, Transaction, compact_qk, outcome, window_dropped, with_ema
 
 _log = logging.getLogger(__name__)
 
@@ -1104,14 +1104,16 @@ class Trainer(Generic[Loss, Effects]):
         return self._runner(planned, mesh)
 
     def _staged(self, state: TrainState, step: int) -> TrainState:
-        """`state` to run step `step`: its window dropped (`dropped_window`) where the step begins a ramp's
-        stage after the first and a rejection left the window part filled, so an update pools one
-        stage's batches; a step the attempt count gives, so a resumed run drops it as the run did."""
+        """`state` to run step `step`: its window of `window_size` microbatches dropped where the step, of
+        the attempt count a resumed run restores, begins a ramp's stage after the first and a rejection
+        left the window part filled, so an update pools one stage's batches. Only the window's fields
+        are compiled (`window_dropped`), so a host-master state's resident weights stay where they are."""
         if step not in self._stage_starts or state.accumulation is None:
             return state
-        # The state's own window, in microbatches, whatever its steps are read in.
-        return jax.jit(functools.partial(dropped_window, size=int(state.window_size)), donate_argnums=0,
-                       out_shardings=jax.tree.map(lambda x: x.sharding, state))(state)
+        fields = (state.microstep, state.accumulation)
+        microstep, window = jax.jit(functools.partial(window_dropped, size=int(state.window_size)),
+                                    out_shardings=jax.tree.map(lambda x: x.sharding, fields))(*fields)
+        return dataclasses.replace(state, microstep=microstep, accumulation=window)
 
     def _runner(self, planned: Planned, mesh: Mesh) -> CompiledStep:
         """The step `planned` compiled, which reads a batch in its microbatches."""
@@ -1555,10 +1557,9 @@ class Trainer(Generic[Loss, Effects]):
                 # Read with this step queued behind the one it describes, so the devices go on meanwhile.
                 self._read_taken(run)
                 if self._unproven:
-                    # A step's failure on the devices surfaces at the next
-                    # program that reads its outputs, the loss counters, so a
-                    # newly compiled step's first run is awaited here, where
-                    # its failure can be named.
+                    # A step's failure on the devices surfaces at the next program that reads its
+                    # outputs, the loss counters, so a newly compiled step's first run is awaited here,
+                    # where its failure can be named.
                     self._unproven = False
                     self._await_first_run(loss, run.current)
                 run.loss = loss
@@ -2388,10 +2389,9 @@ class Trainer(Generic[Loss, Effects]):
                 params, averaged = execution.snapshot(params), execution.snapshot(averaged)
             key = execution.on_accelerator(key)
         assert params is not None, "evaluation always has model variables"
-        # The rules and the microbatch count; `Evaluation.run` scores under the
-        # mesh itself, and previews decode outside it. The objective's
-        # schedules read steps, as training does (`Transaction`): a window of
-        # window_size microbatches is `accumulation` steps.
+        # The rules and the microbatch count; `Evaluation.run` scores under the mesh itself, and
+        # previews decode outside it. The objective's schedules read steps, as training does
+        # (`Transaction`): a window of window_size microbatches is `accumulation` steps.
         with (pipeline_microbatches(self.microbatches),
               nn.logical_axis_rules(self.layout.axis_rules), measured_links(self._links(mesh))):
             evaluation = Evaluation.run(
