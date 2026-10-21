@@ -20,8 +20,9 @@ def test_a_steady_state_counts_the_programs_it_compiles():
 
 def test_a_guarded_block_refuses_an_implicit_read_and_takes_an_explicit_one():
     """`float` of an array is an implicit read, which the guard refuses; `jax.device_get` is the read
-    a caller asks for by name. Each reads an array of its own: a read leaves the array's host copy
-    cached, and a later read of that copy moves nothing for the guard to see."""
+    a caller asks for by name. Each reads an array of its own: a read that copies (a GPU's, or a CPU
+    array assembled from several devices) leaves its host copy cached, and a later read of that copy
+    moves nothing for the guard to see."""
     total, other = (jax.jit(jnp.sum)(jnp.arange(4.0) * scale) for scale in (1.0, 2.0))
     with guarded():
         with pytest.raises(RuntimeError):
