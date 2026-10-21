@@ -1198,9 +1198,15 @@ def split_columns(leaf, widths: Sequence[int], *, axis: int = -1) -> list:
     and zero point split as its own axis is, shared (one entry) kept whole by every member, per
     channel split at the same columns, per tile at the tiles' (a member that would cut a tile is
     refused); and the serving tree's wrapper of one (Qwix's annotated array, `array` its field) as
-    the QArray inside it, its recipe kept. A JAX array that no device of this process holds whole
-    splits where it lives; any other on the host."""
+    the QArray inside it, its recipe kept, where no other field of it holds an array that would need
+    a split of its own. A leaf this process can materialize whole (fully addressable, or replicated
+    with an addressable copy) splits on the host and returns host arrays; any other splits where it
+    lives. The widths are positive and sum to `leaf`'s size along `axis`, or the split is refused."""
     edges = np.cumsum(widths)[:-1].tolist()
+
+    def checked(size: int):
+        if not widths or min(widths) < 1 or sum(widths) != size:
+            raise ValueError(f"members {list(widths)} do not partition an axis of {size}")
 
     def arrays(value, ratio: int = 1):
         if value is None:
@@ -1211,10 +1217,12 @@ def split_columns(leaf, widths: Sequence[int], *, axis: int = -1) -> list:
         return np.split(np.asarray(value), [edge // ratio for edge in edges], axis=axis)
 
     if isinstance(leaf, (jax.Array, np.ndarray)):
+        checked(leaf.shape[axis])
         return arrays(leaf)
     qwix = _qwix()
     if isinstance(leaf, qwix.QArray):
         total = leaf.qvalue.shape[axis]
+        checked(total)
 
         def scaled(value):
             if value is None or value.shape[axis] == 1:
@@ -1228,6 +1236,11 @@ def split_columns(leaf, widths: Sequence[int], *, axis: int = -1) -> list:
         return [dataclasses.replace(leaf, qvalue=value, scale=scale, zero_point=zero)
                 for value, scale, zero in parts]
     if dataclasses.is_dataclass(leaf) and isinstance(getattr(leaf, "array", None), qwix.QArray):
+        others = [field.name for field in dataclasses.fields(leaf) if field.name != "array"
+                  and isinstance(getattr(leaf, field.name), (jax.Array, np.ndarray))]
+        if others:
+            raise TypeError(f"a {type(leaf).__name__} holds arrays beside its kernel ({', '.join(others)}), "
+                            "whose split is not this one")
         return [dataclasses.replace(leaf, array=part)
                 for part in split_columns(leaf.array, widths, axis=axis)]
     raise TypeError(f"a {type(leaf).__name__} is not a packed kernel this splits")
