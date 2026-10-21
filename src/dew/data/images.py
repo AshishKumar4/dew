@@ -52,17 +52,19 @@ def resize_image(image: np.ndarray, size: int | tuple[int, int]) -> np.ndarray:
     return cv2.resize(image, (width, height), interpolation=cv2.INTER_AREA if shrinks else cv2.INTER_CUBIC)
 
 
-def fetch(url: str = "url", to: str = "jpg", *, timeout: float = 10.0, max_bytes: int = 64 * 2**20) -> Fetch:
+def fetch(url: str = "url", to: str = "jpg", *, timeout: float = 10.0, max_bytes: int = 64 * 2**20,
+          threads: int | None = None) -> Fetch:
     """A record step (`filter_map`) that fetches the image at the record's
     `url` field into `to` as bytes, in one attempt of at most `timeout` once
     its host is resolved (`Fetch`); a
     failed fetch is counted and dropped, a transient one fetched again on a
-    later pass. An indexed read runs `Loading.threads` fetches at once in each
-    worker. The bytes are volatile: a published cache after the fetch keeps
-    them for exact resume."""
+    later pass. `threads` fetches that many at once on the stage's own pool, in
+    each loading worker, delivered in the order read; without it an indexed
+    read runs `Loading.threads` fetches at once in each worker. The bytes are
+    volatile: a published cache after the fetch keeps them for exact resume."""
     from dew.data.sources.urls import Fetch
 
-    return Fetch(url, to, timeout, max_bytes)
+    return Fetch(url, to, timeout, max_bytes, threads)
 
 
 def _payload(image: bytes | Mapping[str, object] | ArrayLike) -> bytes | ArrayLike:
@@ -195,6 +197,35 @@ class Resize(grain.MapTransform):
             return {**element, self.field: resize_image(image, self.size)}
         height, width = (self.size, self.size) if isinstance(self.size, int) else self.size
         return {**element, self.field: _resized(image, height, width, self.method)}
+
+
+@dataclasses.dataclass(frozen=True)
+class Fit(grain.MapTransform):
+    """The pixels in `field` fitted into a `size` square whole: the longer side resized to `size`
+    (area down, bicubic up), the shorter in proportion, rounded, and the rest padded on both sides
+    with `fill`, the odd pixel at the bottom or right. A web image keeps all it shows, as the
+    retired online loader fitted it; `Resize` stretches it and `CenterCrop` cuts it instead."""
+
+    size: int
+    fill: int = 255
+    _: dataclasses.KW_ONLY
+    field: str = "image"
+
+    def map(self, element: Batch) -> Batch:
+        import cv2
+
+        image = np.asarray(element[self.field])
+        height, width = image.shape[:2]
+        longer = max(height, width)
+        scale = self.size / longer
+        fitted = (max(1, round(height * scale)), max(1, round(width * scale)))
+        resized = cv2.resize(image, fitted[::-1],
+                             interpolation=cv2.INTER_AREA if longer > self.size else cv2.INTER_CUBIC)
+        resized = resized.reshape(*fitted, *image.shape[2:])
+        tall, wide = self.size - fitted[0], self.size - fitted[1]
+        padding = ((tall // 2, tall - tall // 2), (wide // 2, wide - wide // 2),
+                   *((0, 0) for _ in image.shape[2:]))
+        return {**element, self.field: np.pad(resized, padding, constant_values=self.fill)}
 
 
 @dataclasses.dataclass(frozen=True)

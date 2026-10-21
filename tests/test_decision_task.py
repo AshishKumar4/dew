@@ -9,7 +9,7 @@ from pathlib import Path
 import jax
 import numpy as np
 import pytest
-from reference_error import assert_as_exact_as_the_reference
+from reference_error import assert_as_exact, assert_as_exact_as_the_reference
 from steady_state import steady_state
 
 from dew.decision import (
@@ -277,11 +277,18 @@ def float32_softmax(logits, temperature):
     return shifted / shifted.sum()
 
 
+TEMPERED_SEEDS = 16
+"""Check 1's declared seeds for the tempered probabilities, sized by `seeds_for` (2026-10-21, on armada)."""
+
+
 def test_score_is_a_validation_pass_through_the_task_s_temperatures(decide):
     """The pass divides each question's logits by the temperature its answer
     uses, which the released checkpoint sets away from 1: every row chooses
-    what the task answers, its probabilities are as exact as float32's own
-    tempered softmax of the same logits, and score reports that pass."""
+    what the task answers, its probabilities are on par with float32's own
+    tempered softmax of the same logits over drawn weights (check 1), and
+    score reports that pass."""
+    import jax
+
     from dew.decision import KINDS, DecisionObjective
 
     temperatures = decide.calibration.temperatures
@@ -291,12 +298,32 @@ def test_score_is_a_validation_pass_through_the_task_s_temperatures(decide):
     rows = passed(DecisionObjective(decide, temperatures=temperatures), decide.variables, examples)
     assert [int(np.argmax(found)) for _, _, found in rows] == [
         int(np.argmax(answer.probabilities)) for answer in answers]
-    divided = [(logits, temperatures.of(KINDS[kind].kind, len(logits))) for kind, logits, _ in rows]
-    assert_as_exact_as_the_reference(
-        np.concatenate([found for _, _, found in rows]),
-        np.concatenate([float32_softmax(logits, scale) for logits, scale in divided]),
-        np.concatenate([softmax(logits.astype(np.float64), scale) for logits, scale in divided]),
-        "tempered probabilities")
+    objective = DecisionObjective(decide, temperatures=temperatures)
+
+    def draw(seed):
+        # The checkpoint's weights, each moved by a relative 1e-2 of its own: logits near its own.
+        keys = iter(jax.random.split(jax.random.key(seed), len(jax.tree.leaves(decide.variables))))
+
+        def moved(leaf):
+            if not np.issubdtype(leaf.dtype, np.floating):
+                return np.asarray(leaf)
+            return np.asarray(leaf * (1 + 1e-2 * jax.random.normal(next(keys), leaf.shape)), leaf.dtype)
+
+        return (jax.tree.map(moved, decide.variables),)
+
+    def tempered(variables, softmax_of):
+        # The pass runs the checkpoint's model on weights of its dtypes, which a float64 truth's widened.
+        variables = jax.tree.map(lambda leaf, like: np.asarray(leaf).astype(like.dtype), variables,
+                                 decide.variables)
+        return np.concatenate([softmax_of(logits, temperatures.of(KINDS[kind].kind, len(logits)))
+                               for kind, logits, _ in passed(objective, variables, examples)])
+
+    assert_as_exact(lambda variables: np.concatenate([found for _, _, found in passed(objective, variables,
+                                                                                       examples)]),
+                    lambda variables: tempered(variables, float32_softmax), draw, "tempered probabilities",
+                    seeds=TEMPERED_SEEDS,
+                    truth_fn=lambda variables: tempered(variables, lambda logits, scale: softmax(
+                        logits.astype(np.float64), scale)))
     scores = decide.score(examples)
     assert set(scores) == {"accuracy", "ece", "aurc", "log_loss"}
     assert scores["accuracy"] == pytest.approx(np.mean([int(np.argmax(answer.probabilities)) == 0

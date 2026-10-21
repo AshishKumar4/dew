@@ -36,6 +36,27 @@ def augmented(data, batch):
     return batch
 
 
+def test_the_image_pipeline_benchmark_times_the_augmentation_the_loader_leaves_to_the_device():
+    """The benchmark's device arms read what a training step reads: images staged at 24 pixels,
+    cropped, flipped and jittered by the loader's device steps to the 12 pixels the step takes,
+    the same pixels the steps make applied one by one."""
+    from tool_support import load
+
+    benchmark = load("benchmark_image_pipeline")
+    data = loader(spec(backend="device", crop_scale=(0.5, 0.9), staging_size=24), batch=4, read="memory",
+                  seed=37, loading=READ)
+    stream = data.train(DataPartition())
+    try:
+        batch = next(stream)
+    finally:
+        stream.close()
+    timed = benchmark.device_steps(data.device)(batch)
+    assert np.asarray(batch["image"]).shape == (4, 24, 24, 3)
+    assert timed["image"].shape == (4, 12, 12, 3)
+    expected = augmented(data, {name: value for name, value in batch.items() if name != "caption"})
+    np.testing.assert_array_equal(np.asarray(timed["image"]), np.asarray(expected["image"]))
+
+
 def test_device_pipeline_reads_host_batches_the_step_augments_and_resumes_exactly():
     """The reader delivers host arrays with each record's key; the device steps, which the
     compiled training step runs, make uint8 images of the output size from them, the same after

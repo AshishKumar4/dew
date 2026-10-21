@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import base64
 from collections.abc import Callable, Iterator, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import grain.python as grain
 import numpy as np
@@ -12,7 +12,7 @@ import numpy as np
 from dew.data.dataset import Batch, Closeable, Records, Replayed, Stoppable
 from dew.data.pipeline import Dataset
 
-from .base import Read, Shard, ShardManifest
+from .base import Read, Shard, ShardManifest, unnamed
 from .codec import Value, decode, encode
 from .memory import _record
 
@@ -26,25 +26,29 @@ class Iterated(Dataset):
     declares instead that `factory()` reads the same records each time it
     opens, and a resume reads them again to its position (`Replayed`); a
     stream with neither trains, and its resume is refused. `name` declares
-    its content version in a run's plan and its logs."""
+    its content version in a run's plan and its logs; with none, a resume
+    needs `resume="non-exact"` (`Manifest.exact`)."""
 
     factory: Callable[[], Iterator[Batch]]
-    name: str
+    name: str | None = None
     state: Callable[[Iterator[Batch]], Value] | None = None
     load_state: Callable[[Iterator[Batch], Value], None] | None = None
     replay: bool = False
+    place: int = field(default_factory=unnamed, repr=False)
 
     def __post_init__(self) -> None:
+        if self.name == "":
+            raise ValueError("an iterator's name declares its content version; give one, or none")
         if (self.state is None) != (self.load_state is None):
             raise ValueError("from_iter takes state= and load_state= together")
         if self.replay and self.state is not None:
             raise ValueError("from_iter resumes through state= and load_state= or by replay=True, not both")
 
     def label(self) -> str:
-        return self.name
+        return self.name or "iterator"
 
     def describe(self) -> str:
-        return f"iter:{self.name}"
+        return f"iter:{self.name}" if self.name is not None else f"iter:unnamed-{self.place}"
 
     def fingerprint(self) -> Mapping[str, object]:
         return {"store": "iterator", "identity_required": True, "identity": self.name}
@@ -143,11 +147,11 @@ class _StreamIterator(grain.DatasetIterator):
             super().close()
 
 
-def from_iter(factory: Callable[[], Iterator[Batch]], *, name: str,
+def from_iter(factory: Callable[[], Iterator[Batch]], *, name: str | None = None,
               state: Callable[[Iterator[Batch]], Value] | None = None,
               load_state: Callable[[Iterator[Batch], Value], None] | None = None,
               replay: bool = False) -> Iterated:
-    """The records `factory()` iterates as a Dew dataset under `name`, resumed
+    """The records `factory()` iterates as a Dew dataset, under `name` where given, resumed
     through the iterator's own `state` and `load_state` where it has them,
     or by replay where it declares `replay` (`Iterated`)."""
     return Iterated(factory, name, state, load_state, replay)

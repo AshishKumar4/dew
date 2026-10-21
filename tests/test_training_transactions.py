@@ -84,10 +84,11 @@ def trainer(composite=False, k=2, checkpoints=None):
                    accumulation=k, dynamic_scale=True, checkpoints=checkpoints)
 
 
-def test_a_commit_counts_the_tokens_of_its_windows_accepted_microbatches_alone():
-    """A window of two whose second microbatch is rejected (a non-finite loss) commits with its third:
-    its update trained on the first and third microbatches' tokens, which its commit reports
-    (`Committed.tokens`), the rejected one's never, and nothing before the commit."""
+def test_a_commit_counts_the_tokens_of_its_windows_microbatches_alone():
+    """A window of two whose second microbatch is rejected (a non-finite loss) is dropped, its first
+    with it (`dropped_window`): the next window, the third and fourth microbatches, commits, and its
+    update trained on their tokens alone, which its commit reports (`Committed.tokens`), the dropped
+    window's never, and nothing before the commit."""
     from dew.training.model_flops import TOKENS, _TokenCount
 
     train = trainer()
@@ -97,14 +98,19 @@ def test_a_commit_counts_the_tokens_of_its_windows_accepted_microbatches_alone()
     state = train.initial_state()
     run = train.compile(state, data[0])
     reported = []
-    for batch in data[:3]:
+    for batch in data:
         state, _, _, _, accepted, committed = run(state, batch)
         reported.append((bool(accepted), _TokenCount.host(jax.device_get(committed.tokens))))
-    assert reported == [(True, 0), (False, 0), (True, (3 + 7) * rows)]
+    assert reported == [(True, 0), (False, 0), (True, 0), (True, (7 + 11) * rows)]
 
 
 @pytest.mark.parametrize("composite", [False, True])
-def test_boundary_rejection_preserves_accepted_prefix_and_mutable_reads(composite):
+def test_a_boundary_rejection_drops_its_window_and_keeps_its_mutable_writes(composite):
+    """A window of two whose closing microbatch is rejected is dropped whole (`dropped_window`): its
+    parameters stay, its scale halves, its sums are cleared and the next microbatch takes its first
+    slot. The mutable collection its accepted microbatch wrote keeps the write, as torch's AMP keeps a
+    skipped update's running statistics, so the next window's two microbatches read it, and their
+    update is the one the pooled loss over them takes, each under the key of its attempt."""
     train = trainer(composite)
     initial = train.initial_state()
     data = batches()
@@ -119,28 +125,33 @@ def test_boundary_rejection_preserves_accepted_prefix_and_mutable_reads(composit
     # the step consumes the state
     prefix_scale = float(prefix.scale.scale)
     prefix_params = jax.tree.map(np.asarray, prefix.variables)
-    prefix_accumulation = jax.tree.map(np.asarray, prefix.accumulation)
     rejected, _, _, finite, accepted, _ = run(prefix, data[1])
     assert bool(finite) and not bool(accepted)
-    assert int(rejected.step) == 2 and int(rejected.microstep) == 1
+    assert (int(rejected.step), int(rejected.microstep)) == (2, 0)
     assert float(rejected.scale.scale) == prefix_scale / 2
-    for before, after in zip(jax.tree.leaves(prefix_params),
-                             jax.tree.leaves(rejected.variables), strict=True):
+    for before, after in zip(jax.tree.leaves(prefix_params), jax.tree.leaves(rejected.variables),
+                             strict=True):
         np.testing.assert_array_equal(before, after)
-    for before, after in zip(jax.tree.leaves(prefix_accumulation),
-                             jax.tree.leaves(rejected.accumulation), strict=True):
-        np.testing.assert_array_equal(before, after)
-    final, _, _, _, accepted, _ = run(rejected, data[2])
+    # Every sum of the window is cleared, its QK maxima at their identity; the gradient sum alone stays,
+    # unread until the next window's first microbatch replaces it.
+    window = rejected.accumulation
+    for name in ("statistics", "effects", "mass", "tokens", "batches", "attempts", "variables"):
+        assert all(not np.any(np.asarray(leaf)) for leaf in jax.tree.leaves(getattr(window, name))), name
+    assert all(np.all(np.asarray(leaf) == -np.inf) for leaf in jax.tree.leaves(window.qk_stats)
+               if jnp.issubdtype(leaf.dtype, jnp.inexact))
+    pending, _, _, _, accepted, _ = run(rejected, data[2])
+    assert bool(accepted) and int(pending.updates) == 0
+    final, _, _, _, accepted, _ = run(pending, data[3])
     assert bool(accepted) and int(final.updates) == 1
-    assert float(final.variables["stats"]["seen"]) == 2
+    assert float(final.variables["stats"]["seen"]) == 3
     assert float(start["stats"]["seen"]) == 0
 
     def combined(w):
         stats = []
-        for attempt, seen in [(0, 0.), (2, 1.)]:
+        for attempt, seen, microstep in [(2, 1., 0), (3, 2., 1)]:
             variables = {"params": {"w": w}, "stats": {"seen": jnp.array(seen)}}
             from dew.objectives import Step
-            info = Step(jnp.asarray(int(seen)), jax.random.fold_in(key, attempt), variables)
+            info = Step(jnp.asarray(microstep), jax.random.fold_in(key, attempt), variables)
             value, _ = train.objective.loss(variables, data[attempt], info)
             stats.append(value)
         pooled = jax.tree.map(lambda a, b: a + b, *stats)

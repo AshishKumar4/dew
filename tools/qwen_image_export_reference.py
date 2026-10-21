@@ -92,6 +92,7 @@ def consume(directory: Path, output: Path) -> None:
 
     sys.path[:0] = [str(ROOT), str(ROOT / "tools")]
     from diffusers_qwen_image_reference import transformer_call
+    from reference_source import saved_fixture
 
     from tools.diffusers_wan_reference import float64
 
@@ -126,8 +127,7 @@ def consume(directory: Path, output: Path) -> None:
 
     meta = {"digests": digests(export), "grid": GRID, "diffusers": diffusers.__version__,
             "transformers": transformers.__version__, "torch": torch.__version__}
-    arrays["meta"] = np.frombuffer(json.dumps(meta).encode(), np.uint8)
-    np.savez_compressed(output, **arrays)
+    saved_fixture(output, arrays, meta)
     gap = float(np.abs(arrays["fp32.output"] - arrays["fp64.output"]).max())
     print(f"{output}: fp32 off float64 by {gap:.3g}, {len(meta['digests'])} files")
 

@@ -14,10 +14,13 @@ from reference_error import (
     assert_as_exact,
     assert_as_exact_as_the_reference,
     assert_leaves_as_exact,
+    assert_moves,
     declared_seeds,
     distance,
     indexed_recording,
     input_digest,
+    null_rate_bound,
+    null_runs,
     seeds_for,
     widened,
 )
@@ -130,8 +133,8 @@ def test_check_one_fails_a_sum_that_differs_rather_than_rounds(wrong):
 def test_check_one_is_inconclusive_where_its_seeds_cannot_resolve_the_factor():
     """Errors set seed by seed, alike on every host: Dew's squared error is 4 on even seeds and 0.01 on
     odd ones, the reference's 1 on each, so the pooled ratio (1.42) is under PARITY but its interval
-    over 8 seeds straddles it and is wider than it: inconclusive, never a pass. Fewer seeds than
-    FEWEST_SEEDS are inconclusive whatever they read."""
+    straddles it and is wider than it over 8 seeds and over the second stage's 40 alike: inconclusive,
+    never a pass. Fewer seeds than FEWEST_SEEDS are inconclusive whatever they read."""
     def errors(seed):
         return (np.zeros(64, np.float32), np.full(64, 2.0 if seed % 2 == 0 else 0.1, np.float32),
                 np.ones(64, np.float32))
@@ -151,6 +154,60 @@ def test_check_one_is_inconclusive_where_its_seeds_cannot_resolve_the_factor():
         assert_as_exact(_reordered, _product, _draw, "two seeds", seeds=2)
     # And seeds_for never declares fewer, whatever it is asked to start from.
     assert seeds_for(_product, _draw, "product", start=1) >= 8
+
+
+def _set_errors(even: float, odd: float):
+    """A draw whose Dew's squared error is `even` on even seeds and `odd` on odd ones, the reference's 1
+    on each: a site's error law set seed by seed, alike on every host."""
+    def errors(seed):
+        return (np.zeros(64, np.float32), np.full(64, np.sqrt(even if seed % 2 == 0 else odd), np.float32),
+                np.ones(64, np.float32))
+
+    def dew(x, mine, theirs):
+        return {"y": x + mine}
+
+    def reference(x, mine, theirs):
+        return {"y": x + theirs}
+
+    def truth(x, mine, theirs):
+        return {"y": x}
+
+    return dew, reference, errors, truth
+
+
+def test_check_one_decides_at_its_second_stage_what_its_first_leaves_inconclusive(tmp_path, monkeypatch):
+    """Dew's squared error 2.6 on even seeds and 0.1 on odd ones, the reference's 1: over 8 seeds the
+    pooled ratio's interval straddles PARITY and is wider than it; the second stage's 40 resolve it
+    under PARITY, so the site passes, and its stage is logged, as every judgement's is."""
+    import json
+
+    from reference_error import STAGES_LOG, _interval, _pooled, _status
+
+    dew, reference, errors, truth = _set_errors(2.6, 0.1)
+    first = np.array([2.6 if seed % 2 == 0 else 0.1 for seed in range(8)])
+    assert _status(_pooled(first, np.ones(8)), *_interval(first, np.ones(8))) == "inconclusive"
+    log = tmp_path / "stages.jsonl"
+    monkeypatch.setenv(STAGES_LOG, str(log))
+    assert_as_exact(dew, reference, errors, "second stage", seeds=8, truth_fn=truth)
+    assert_as_exact(_reordered, _product, _draw, "first stage", seeds=8)
+    logged = [json.loads(line) for line in log.read_text().splitlines()]
+    assert [(entry["label"], entry["stage"], entry["verdict"]) for entry in logged] == [
+        ("second stage", 2, "pass"), ("first stage", 1, "pass")]
+
+
+def test_a_leafs_interval_is_widened_to_hold_its_ratio():
+    """A percentile interval that leaves out its own ratio is widened to hold it before any verdict: a
+    ratio over PARITY under an interval wholly at or under it is no pass, and a ratio that is not a
+    number is inconclusive."""
+    from reference_error import _status
+
+    assert _status(1.6, 1.0, 1.4) != "pass"
+    assert _status(0.9, 1.1, 1.4) == "pass"
+    assert _status(1.7, 1.6, 1.8) == "over"
+    assert _status(float("nan"), 1.0, 1.2) == "inconclusive"
+    # The rule before the two stages read the interval as it was.
+    assert _status(1.6, 1.0, 1.4, contained=False) == "over"
+    assert _status(1.2, 0.5, 1.6, contained=False) == "inconclusive"
 
 
 def test_check_one_holds_dew_exact_where_the_reference_is_exact_on_every_seed():
@@ -336,6 +393,43 @@ def test_a_recording_of_outputs_alone_draws_its_inputs_again(tmp_path):
         indexed_recording(undigested, "site", seeds, inputs_of=draw)
 
 
+def test_null_runs_judge_the_reference_against_itself_on_draws_no_other_run_takes():
+    """Each null run is check 1 on the reference against itself, its two sides on disjoint draws and
+    every run on draws of its own; an equally exact pair passes, and the red rate's bound is the
+    one-sided Clopper-Pearson one, not one over the runs."""
+    taken = []
+
+    def draw(seed):
+        taken.append(seed)
+        return _draw(seed)
+
+    verdicts = null_runs(_product, draw, "null", seeds=8, runs=3)
+    assert [verdict for verdict, _ in verdicts] == ["pass"] * 3
+
+    # Draws of one truth (an orbit's) pair their rows of float64 zero: Dew's residue on a row the
+    # reference holds at zero is no pass for drawing the reference elsewhere.
+    def one_truth(seed):
+        return np.ones(4, np.float32), np.float32(seed % 2)
+
+    def exact(x, s):
+        return {"y": jnp.stack([x * (1 + 1e-7), 0 * x])}
+
+    def residue(x, s):
+        return {"y": jnp.stack([x * (1 + 1e-7), 1e-12 * s * x])}
+
+    def truth(x, s):
+        return {"y": jnp.stack([x, 0 * x])}
+
+    with pytest.raises(AssertionError):
+        assert_as_exact(residue, exact, one_truth, "orbit", seeds=8, truth_fn=truth)
+    [(verdict, _)] = null_runs(exact, one_truth, "orbit", seeds=8, runs=1, truth_fn=truth, dew_fn=residue)
+    assert verdict == "over"
+    assert len(taken) == len(set(taken))
+    assert null_rate_bound(0, 1400) == pytest.approx(1 - 0.001 ** (1 / 1400), rel=1e-9)
+    assert null_rate_bound(0, 200) > 0.03
+    assert null_rate_bound(3, 3) == 1.0
+
+
 def test_a_recording_of_the_references_evidence_alone_holds_the_recomputed_truth_to_its_sketch():
     """A recording that keeps the reference's evidence (`leaf_summary`) and its truth's sketch, no
     outputs: check 1 judges Dew against it with the test's own float64 path as truth, held at every seed
@@ -408,3 +502,74 @@ def test_a_truths_sketch_rounds_alike_in_any_order_and_refuses_an_overflowing_or
     swapped[[0, 1]] = swapped[[1, 0]]
     bits = _sign_bits(truth.size, 3)
     assert (bits[0] == bits[1]) or np.any(truth_sketch(swapped, 3) != truth_sketch(truth, 3))
+
+
+def test_the_procedure_before_the_two_stages_draws_again_as_it_did():
+    """Compared against, the procedure before check 1's two stages (`_staged(two_stage=False)`) draws
+    the second set wherever a leaf's ratio is over PARITY, a value not finite included, and only there:
+    an inconclusive leaf is final at its declared seeds."""
+    from reference_error import _Draws, _staged
+
+    def law(dew):
+        def drawn(start, stop):
+            count = stop - start
+            return _Draws(["leaf"], np.full((count, 1), dew), np.ones((count, 1)), np.zeros((count, 1, 2)),
+                          np.zeros((count, 1), int), np.full((count, 1), np.isfinite(dew)))
+        return drawn
+
+    with np.errstate(invalid="ignore"):
+        assert _staged(law(np.inf), 8, "infinite", two_stage=False)[2] == 2
+        assert _staged(law(np.inf), 8, "infinite")[2] == 2
+    assert _staged(law(1.0), 8, "equal", two_stage=False)[2] == 1
+
+
+def test_a_change_moves_the_result_only_past_rounding():
+    """`assert_moves`: a product scaled by 1 + 2^-10 moves it far past its rounding and passes; the same
+    product summed in another order, a change rounding accounts for, does not; a leaf the original holds
+    exactly moves on any departure."""
+    def scaled(x, w):
+        return {"y": jnp.dot(x, w, precision="highest") * (1 + 2.0 ** -10)}
+
+    assert_moves(_product, jax.jit(scaled), _draw, "scaled", seeds=8)
+    with pytest.raises(AssertionError):
+        assert_moves(_product, _reordered, _draw, "reordered", seeds=8)
+
+    def zero(x, w):
+        return {"y": jnp.zeros(3, jnp.float32)}
+
+    def off_zero(x, w):
+        return {"y": jnp.full(3, 1e-30, jnp.float32)}
+
+    assert_moves(jax.jit(zero), jax.jit(off_zero), _draw, "off zero", seeds=8)
+
+
+def test_a_change_moves_by_its_intervals_lower_end_and_one_leaf_is_enough():
+    """Errors set seed by seed: a changed RMS error of 1.51 times the original's on every seed (its
+    interval that one value) moves; 1.49 does not, and is no move however its seeds are drawn; with two
+    leaves, one moved is enough; a leaf not finite moves nothing."""
+    for factor, moves in ((1.51, True), (1.49, False)):
+        changed, original, errors, truth = _set_errors(factor ** 2, factor ** 2)
+        if moves:
+            assert_moves(original, changed, errors, "constant", seeds=8, truth_fn=truth)
+        else:
+            with pytest.raises(AssertionError):
+                assert_moves(original, changed, errors, "constant", seeds=8, truth_fn=truth)
+
+    dew, reference, errors, truth = _set_errors(4.0, 4.0)
+
+    def two(x, mine, theirs):
+        return {"moved": dew(x, mine, theirs)["y"], "kept": reference(x, mine, theirs)["y"]}
+
+    def two_original(x, mine, theirs):
+        return {"moved": reference(x, mine, theirs)["y"], "kept": reference(x, mine, theirs)["y"]}
+
+    def two_truth(x, mine, theirs):
+        return {"moved": x, "kept": x}
+
+    assert_moves(two_original, two, errors, "one leaf", seeds=8, truth_fn=two_truth)
+
+    def infinite(x, mine, theirs):
+        return {"y": x + jnp.inf}
+
+    with pytest.raises(AssertionError):
+        assert_moves(reference, infinite, errors, "infinite", seeds=8, truth_fn=truth)
