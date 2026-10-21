@@ -5,10 +5,11 @@ reason."""
 import json
 from dataclasses import dataclass
 
+import grain.python as grain
 import numpy as np
 import pytest
 
-from dew.data import Loading, Memory, from_iter, mix, presets
+from dew.data import Loading, Memory, from_iter, mix, presets, text
 from dew.data.compile import compile, held
 from dew.data.dataset import DataPartition
 from dew.data.records import Unrecorded, decode, encode
@@ -35,6 +36,11 @@ def _batches(chain, count: int = 3) -> list[list[list[int]]]:
         reader.close()
 
 
+def _tokens(start: int, name: str):
+    """Documents tokenized by bytes, ended by EOS, under `name`."""
+    return _documents(start).named(name).map(text.tokenize("byte", eos=True)).repeat()
+
+
 def _lm(dataset, **settings):
     return dataset.pipe(presets.lm, "byte", seq_len=8, batch=2, **settings)
 
@@ -42,8 +48,8 @@ def _lm(dataset, **settings):
 CHAINS = {
     "lm": lambda: _lm(_documents().shuffle(0).repeat()),
     "windows": lambda: _lm(_documents().shuffle(0).repeat(), pack=None),
-    "mix": lambda: _lm(mix([_documents().named("a").repeat(), _documents(8).named("b").repeat()],
-                           [0.25, 0.75], by="tokens")),
+    "mix": lambda: mix([_tokens(0, "a"), _tokens(8, "b")], [0.25, 0.75], by="tokens").pipe(
+        presets.lm, None, seq_len=8, batch=2, pack=None),
     "steps": lambda: _lm(_documents().shuffle(0, window=4).take(6).repeat().map(Tagged(3))),
 }
 
@@ -59,13 +65,13 @@ def test_a_chain_read_back_from_its_record_compiles_to_its_plan_and_batches(name
 
 
 @dataclass(frozen=True)
-class Tagged:
-    """A step of the caller's, a dataclass at module level, which a record names."""
+class Tagged(grain.MapTransform):
+    """A step of the caller's, a Grain transform at module level, which a record names."""
 
     offset: int
     identity = "tagged@1"
 
-    def __call__(self, row):
+    def map(self, row):
         return {**row, "text": row["text"] + " tag" * self.offset}
 
 
