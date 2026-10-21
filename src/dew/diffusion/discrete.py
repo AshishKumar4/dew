@@ -358,10 +358,7 @@ def _generate(model: nn.Module, variables: Variables, inputs: ModelInputs, keys:
     part of it. A continuation keeps the tokens up to its first EOS, pads the
     rest, and reports the steps it took.
     """
-    from dew.inference.projections import served
     from dew.sampling.sample import sample
-
-    variables = served(model, variables)
 
     batch, prompt = inputs.tokens.shape
     if budget == 0:
