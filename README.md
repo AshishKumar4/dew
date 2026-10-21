@@ -1459,7 +1459,14 @@ I recommend 3.14, and CI tests both. To install it yourself, choose the extra fo
 | NVIDIA GPU, driver 525+ | `uv pip install "dewml[cuda12]" --extra-index-url https://pypi.dewml.dev/simple` | `pip install "dewml[cuda12]" --extra-index-url https://pypi.dewml.dev/simple` |
 | Google TPU VM | `uv pip install "dewml[tpu]" --extra-index-url https://pypi.dewml.dev/simple` | `pip install "dewml[tpu]" --extra-index-url https://pypi.dewml.dev/simple` |
 
-Use pip 26.2.2 or newer and uv 0.13.4 or newer: older ones trust the roots of eMudhra's compromised certificate authorities (October 2026). `python -m pip install --upgrade pip` and `uv self update` update them.
+<!-- BEGIN pip (site/scripts/gen_install.py) -->
+Use pip 26.2.2 or newer and uv 0.13.4 or newer: older ones trust the roots of eMudhra's compromised certificate authorities (October 2026). Update pip from its wheel by hash, so the update holds whatever the older pip trusts, and uv through the system's certificates once they are updated:
+
+```bash
+python -m pip install "pip @ https://files.pythonhosted.org/packages/3f/06/3e4420302363fbb71be3c7f35ce042f54bfca330e3e66b3a2e3c4cca579f/pip-26.2.2-py3-none-any.whl#sha256=fd7f4dfa8190e014013b9f08f3e973f4e4c26ffd179a204895533a7254813a70"
+UV_SYSTEM_CERTS=true uv self update
+```
+<!-- END pip -->
 
 Dew runs on its own build of JAX 0.11.2, which only its package index serves; without `--extra-index-url https://pypi.dewml.dev/simple` the install stops at resolving jax ([installation guide](https://github.com/AshishKumar4/dew/blob/main/docs/installation.md#dews-jax-build)).
 

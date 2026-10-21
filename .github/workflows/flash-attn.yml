@@ -47,9 +47,11 @@ jobs:
       # The image's GCC 8 is older than nvcc's C++17 needs.
       run: |
         dnf install -y -q git python3.12 python3.12-pip gcc-toolset-12-gcc-c++
-        python3.12 -m pip install --quiet --upgrade "pip>=26.2.2"
-        python3.12 -m pip install --quiet cmake ninja twine
     - uses: actions/checkout@v4
+    - name: Install the Python build tools, through tools/pip.txt's pip
+      run: |
+        python3.12 -m pip install --quiet -r tools/pip.txt
+        python3.12 -m pip install --quiet cmake ninja twine
     - name: The tag is the version the wheel carries
       if: startsWith(github.ref, 'refs/tags/flash-attn-v')
       run: |

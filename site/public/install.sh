@@ -23,6 +23,7 @@ set -eu
 # BEGIN install facts (site/scripts/gen_install.py)
 python_min=3.12
 package_index=https://pypi.dewml.dev/simple
+pip_least='pip @ https://files.pythonhosted.org/packages/3f/06/3e4420302363fbb71be3c7f35ce042f54bfca330e3e66b3a2e3c4cca579f/pip-26.2.2-py3-none-any.whl#sha256=fd7f4dfa8190e014013b9f08f3e973f4e4c26ffd179a204895533a7254813a70'
 cuda13_driver=580
 cuda13_sm=7.5
 cuda12_driver=525
@@ -180,13 +181,13 @@ fi
 "$python" -c "import sys; sys.exit(sys.version_info < tuple(map(int, '$python_min'.split('.'))))" || die "$python is Python \
 $("$python" -c 'import sys; print("%d.%d" % sys.version_info[:2])'); Dew needs $python_min or newer, so choose a new .venv or upgrade it"
 
-# pip, for --pip, in an environment uv made without it, and at 26.2.2 or newer: older pips trust the
-# roots of eMudhra's compromised CAs in their own bundle (2026-10-20).
+# pip, for --pip, in an environment uv made without it, then pip 26.2.2 by its wheel's hash (tools/pip.txt):
+# older pips trust the roots of eMudhra's compromised CAs in their own bundle (2026-10-20).
 if [ -n "$use_pip" ]; then
 	if ! "$python" -m pip --version >/dev/null 2>&1; then
 		"$python" -m ensurepip -q || die "$python has no pip and ensurepip could not add it; rerun without --pip to use uv"
 	fi
-	"$python" -m pip install -q --upgrade "pip>=26.2.2" || die "pip could not update itself to 26.2.2; rerun without --pip to use uv"
+	"$python" -m pip install -q "$pip_least" || die "pip could not update itself to 26.2.2; rerun without --pip to use uv"
 fi
 
 # The install, shown and then run.
