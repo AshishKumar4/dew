@@ -64,7 +64,7 @@ from dew.data.pipeline import (
     Workers,
     _declares_rejects,
 )
-from dew.data.plan import Manifest, StepIdentity, _changed, _semantic
+from dew.data.plan import Manifest, StepIdentity, _changed, _semantic, identified
 from dew.data.sources.base import READS, Read, Source, _consumed
 from dew.data.sources.concatenate import Concatenate
 from dew.data.sources.memory import Memory
@@ -252,7 +252,16 @@ def _promoted(pipeline: Pipeline) -> Pipeline:
         source = dataclasses.replace(source, pipelines=tuple(_promoted(child) for child in source.pipelines))
     for index, stage in enumerate(stages):
         if isinstance(stage, Artifact) and isinstance(stage.cache, Generation):
-            source, stages = _standing_in(stage.cache, pipeline, source, stages[:index]), stages[index + 1 :]
+            # The views of the inputs written before the generation read its rows as they read the
+            # inputs, where it holds one row for each input, in their order (`_one_to_one`).
+            views = tuple(earlier for earlier in stages[:index] if isinstance(earlier, _VIEWS))
+            if views and not _one_to_one(stages[:index]):
+                raise ValueError(
+                    f"generation {stage.cache.url} holds the rows its steps kept, not one for each input, "
+                    f"so the views written before it in {_name(pipeline)} can't read it by input; give "
+                    "the cache that published it, Cache(url), which reads each input's rows")
+            source = _standing_in(stage.cache, pipeline, source, stages[:index])
+            stages = (*views, *stages[index + 1 :])
             plans = record(stage.cache.manifest.get("plan", {}), "published plans")
             overlap = cutting(stages)
             at = int(overlap is not None)
@@ -492,19 +501,24 @@ def _configured(
                 f"{_name(pipeline)} step {_identity(stage).name} needs metadata {missing}; "
                 "provide producer metadata, recipe fields or read='memory'"
             )
-        binding = Bound(stage, {key: metadata[key] for key in stage.needs})
-        resolved = stage.factory(metadata)
-        if isinstance(resolved, pygrain.RandomMapTransform) != stage.random:
-            raise ValueError(
-                f"Configured {_identity(stage).name} random={stage.random} disagrees with its step"
-            )
-        if isinstance(resolved, Expansion):
-            stages.append(FlatMap(resolved, configured=binding))
-        elif isinstance(resolved, pygrain.RandomMapTransform):
-            stages.append(RandomMap(resolved, rejects=_declares_rejects(resolved), configured=binding))
-        else:
-            stages.append(Map(resolved, rejects=_declares_rejects(resolved), configured=binding))
+        stages.append(_bind(stage, metadata))
     return dataclasses.replace(pipeline, source=source, stages=tuple(stages))
+
+
+def _bind(stage: Configured, metadata: Mapping[str, object]) -> Map | RandomMap | FlatMap:
+    """The record step `stage` resolves to from the facts `metadata` states."""
+    binding = Bound(stage, {key: metadata[key] for key in stage.needs})
+    resolved = stage.factory(metadata)
+    if isinstance(resolved, pygrain.RandomMapTransform) != stage.random:
+        raise ValueError(f"Configured {_identity(stage).name} random={stage.random} disagrees with its step")
+    if stage.one_to_one and (isinstance(resolved, Expansion) or _declares_rejects(resolved)):
+        raise ValueError(f"Configured {_identity(stage).name} states one_to_one=True and binds to a step "
+                         "that drops or expands records")
+    if isinstance(resolved, Expansion):
+        return FlatMap(resolved, configured=binding)
+    if isinstance(resolved, pygrain.RandomMapTransform):
+        return RandomMap(resolved, rejects=_declares_rejects(resolved), configured=binding)
+    return Map(resolved, rejects=_declares_rejects(resolved), configured=binding)
 
 
 def _keyed(stage: Stage) -> bool:
@@ -547,10 +561,19 @@ def _manifest(
 
 
 def _cache_manifest(source: Source, prefix: Sequence[Stage], read: Read) -> Manifest:
+    """The key of a cache of `prefix` over `source`: the source's content and the record steps,
+    without the views of its inputs (`_VIEWS`), which order or select what it holds and make none of
+    it. A store given no name states no content (`Manifest.exact`), and its cache would serve any
+    other's rows."""
+    stated = source.fingerprint()
+    if not identified(json_value(stated, "source")):
+        raise ValueError(f"a cache keys its store's content, which {source.describe()} doesn't "
+                         "state: name it (from_grain(..., name=), from_iter(..., name=), "
+                         "from_torch(..., identity=))")
     return _manifest(
-        source.fingerprint(),
+        stated,
         (source,),
-        tuple(_identity(stage, cache=True) for stage in prefix),
+        tuple(_identity(stage, cache=True) for stage in _cache_steps(prefix)),
         fill={"read": read, "row_ids": "sharded" if read == "streamed" else "indexed"},
     )
 
@@ -578,6 +601,37 @@ counts the rows or draws from the record rng, so they read one continuous
 stream whose shards reshuffle each epoch."""
 
 
+_VIEWS = (Shuffle, Repeat, Slice, Limit)
+"""The stages that order or select a source's inputs and change none: a cache keyed by each input's
+place in its source holds what the record steps make of it whatever view reads it, so these may
+stand before a cache (`_cache_view`) and are no part of its key (`_cache_manifest`)."""
+
+
+def _cache_steps(prefix: Sequence[Stage]) -> tuple[Stage, ...]:
+    """What a cache after `prefix` holds and is keyed by: the record steps written before it, without
+    the views of its inputs (`_VIEWS`), which every read applies to the inputs (`_Build.viewed`)."""
+    return tuple(stage for stage in prefix if not isinstance(stage, _VIEWS))
+
+
+def _cache_view(stages: Sequence[Stage]) -> str | None:
+    """Why a cache after `stages` cannot hold what they make of each input, or None where it can: its
+    stages are deterministic record steps and views of the inputs (`_VIEWS`), and a step before a
+    view keeps one record for each input, so a view of the inputs reads what the written chain
+    does (a record dropped, kept twice or replaced by pieces before a view would change which
+    inputs the view orders)."""
+    last = max((index for index, stage in enumerate(stages) if isinstance(stage, _VIEWS)), default=-1)
+    for index, stage in enumerate(stages):
+        if isinstance(stage, _VIEWS):
+            continue
+        if not _cacheable(stage):
+            return f"{type(stage).__name__} is no deterministic record step a cache can key"
+        if index < last and (_drops(stage) or isinstance(stage, FlatMap)):
+            view = type(stages[last]).__name__
+            return (f"{type(stage).__name__} before {view} drops or expands records, so the view orders "
+                    "other rows than the source's inputs (expansions and drops before a view: roadmap 803b)")
+    return None
+
+
 def _cacheable(stage: Stage) -> bool:
     """Whether a cache can hold what `stage` makes: a deterministic record
     step, or a configured one, which binds to such a step, that a cache can
@@ -591,19 +645,39 @@ def _cache_at(stages: Sequence[Stage]) -> int:
     return next((index for index, stage in enumerate(stages) if not _cacheable(stage)), len(stages))
 
 
+def _one_to_one(stages: Sequence[Stage]) -> bool:
+    """Whether a cache after `stages` holds one record for each of its inputs: none of them drops
+    or expands records. Such a cache reads as the source's own rows do, by index and in one global
+    order (`dew.data.lowering._Inputs`); one that drops or expands is read as a stream, per share. A
+    step a run's facts haven't bound yet (`Configured`) may drop records once bound, so it counts as
+    one that does unless it states it keeps one for each (`Configured.one_to_one`)."""
+    return not any(_drops(stage) or (isinstance(stage, Configured) and not stage.one_to_one)
+                   for stage in stages)
+
+
+def _indexed_cache(prefix: Sequence[Stage], read: Read) -> bool:
+    """Whether a cache after `prefix` reads as the source's rows do, by index and in one global order:
+    one that holds one record for each input (`_one_to_one`), in a memory or indexed read; a
+    streamed read fills its cache shard by shard."""
+    return read != "streamed" and _one_to_one(prefix)
+
+
 def _order_at(stages: Sequence[Stage], read: Read) -> tuple[int, bool]:
     """Where a recipe's default order goes, and whether the rows there are
     indexed so one shuffle can order them all. A memory read orders the rows
     its deterministic steps made, before the first random step or batch; any other
     read orders the source's rows right after the cache that keys them, and
-    a cache's rows reach an indexed read as a stream."""
+    a cache's rows reach an indexed read by index where it holds one record for each input
+    (`_one_to_one`), else as a stream."""
     if read == "memory":
         # Records are ordered before their batch, as before the first random step.
         boundary = (index for index, stage in enumerate(stages)
                     if _random(stage) or isinstance(stage, (BatchStage, TokenBudget)))
         return next(boundary, len(stages)), True
     cache = _at(stages, Artifact)
-    return (0, read == "indexed") if cache is None else (cache + 1, False)
+    if cache is None:
+        return 0, read == "indexed"
+    return cache + 1, _indexed_cache(stages[:cache], read)
 
 
 def _random(stage: Stage) -> bool:
@@ -685,6 +759,9 @@ class _Lowering:
     splits: tuple[int, ...]
     order: Mapping[str, object]
     endless: bool
+    one_to_one: bool
+    """Whether the cache holds one record for each input (`_indexed_cache`), so a memory or indexed
+    read reads it by index, in the order the uncached stages would make (`dew.data.lowering._Inputs`)."""
 
     @property
     def split(self) -> bool:
@@ -714,7 +791,11 @@ def _analyzed(
     cache = _at(stages, Artifact)
     if nested or (cache is not None and any(isinstance(stage, Configured) for stage in stages[:cache])):
         cache = None
-    eager = 0 if cache is None else cache + 1
+    # A view of the inputs before a cache leaves the cache to the lowering, which reads it by input
+    # as an indexed read does; a memory read runs the steps before the first view over the whole
+    # source first, as it does without a cache, and the cache holds the rest.
+    viewed = cache is not None and any(isinstance(stage, _VIEWS) for stage in stages[:cache])
+    eager = 0 if cache is None or viewed else cache + 1
     while read == "memory" and not nested and eager < len(stages) and isinstance(stages[eager], _EAGER):
         eager += 1
     per_share = _checked(pipeline, read, ancestry, eager, validation=validation, promotion=promotion)
@@ -773,6 +854,7 @@ def _analyzed(
         tuple(at for at, stage in enumerate(stages) if at >= eager and isinstance(stage, TokenSplit)),
         order,
         endless,
+        cache is not None and _indexed_cache(stages[:cache], read),
     )
     configured = any(isinstance(stage, Configured) for stage in steps)
     if per_share and lowering.split and not validation and not configured:
@@ -858,11 +940,18 @@ def _checked(
                 raise ValueError(
                     f"cache prefix in {name} contains random step {random}; cache before stochastic steps"
                 )
-            for earlier in prefix:
+            for earlier in _cache_steps(prefix):
                 _identity(earlier, cache=True)
             mixed = isinstance(pipeline.source, (Mixture, Phases))
-            if not mixed and _cache_at(pipeline.stages[:index]) < index:
-                raise ValueError(f"cache prefix in {name} must hold only deterministic record steps")
+            refused = None if mixed else _cache_view(pipeline.stages[:index])
+            viewed = any(isinstance(earlier, _VIEWS) for earlier in prefix)
+            if refused is None and read == "streamed" and viewed:
+                refused = ("a streamed read fills its cache shard by shard, and a view of the inputs "
+                           "before it reads them by index: read='indexed' or 'memory', or write the view "
+                           "after the cache (streamed views before a cache: roadmap 803b)")
+            if refused is not None:
+                raise ValueError(f"cache prefix in {name} must hold deterministic record steps and views of "
+                                 f"the inputs: {refused}")
         if isinstance(stage, Shuffle) and stage.window is None and not indexed and not promotion:
             raise ValueError(f"global shuffle in {name} needs an indexed pipeline; give window=")
         if isinstance(stage, Slice) and not indexed and not promotion:
@@ -870,8 +959,11 @@ def _checked(
         streams = isinstance(stage, (Interleave, Workers, BatchStage, TokenBudget)) or (
             _drops(stage) and index >= eager
         )
-        indexed = indexed and not (streams or (isinstance(stage, Artifact) and read != "memory"))
-        shared = _drops(stage) or isinstance(stage, (Interleave, Artifact, TokenBudget))
+        # A cache reads as the stages it holds would: by index and in one order where they keep one
+        # record for each input, as a stream and per share where they drop or expand them.
+        streamed_cache = isinstance(stage, Artifact) and not _indexed_cache(prefix, read)
+        indexed = indexed and not (streams or (streamed_cache and read != "memory"))
+        shared = _drops(stage) or isinstance(stage, (Interleave, TokenBudget)) or streamed_cache
         per_share = per_share or shared or (isinstance(stage, Workers) and not batched)
         batched = _check_batch(stage, batched=batched, name=name)
         if isinstance(stage, Workers):
