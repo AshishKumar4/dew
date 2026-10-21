@@ -523,6 +523,22 @@ def _resource_exhausted(error: Exception) -> bool:
             or "CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES" in message)
 
 
+def materialized(op: KernelOp, ba: tokamax.BoundArguments):
+    """The arrays the tuner times `ba` on, `op.operands` of its `ShapeDtypeStruct` arguments, and
+    `fill(arrays) -> (args, kwargs)`, its arguments with those arrays (or traced ones) in their places."""
+    leaves, tree = jax.tree.flatten((ba.args, ba.kwargs),
+                                    is_leaf=lambda leaf: isinstance(leaf, jax.ShapeDtypeStruct))
+    places = [index for index, leaf in enumerate(leaves) if isinstance(leaf, jax.ShapeDtypeStruct)]
+
+    def fill(arrays):
+        filled = list(leaves)
+        for index, array in zip(places, arrays, strict=True):
+            filled[index] = array
+        return jax.tree.unflatten(tree, filled)
+
+    return op.operands([leaves[index] for index in places], 0), fill
+
+
 def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> Timings:
     """Every config of `ba`'s launch (at its key's shapes), each compiled on a
     thread and timed alone: the device time CUPTI reads for the launch's own
@@ -530,10 +546,7 @@ def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> Timings:
     with its operands out of cache."""
     from jax.experimental.mosaic.gpu import profiler
 
-    leaves, tree = jax.tree.flatten((ba.args, ba.kwargs),
-                                    is_leaf=lambda leaf: isinstance(leaf, jax.ShapeDtypeStruct))
-    places = [index for index, leaf in enumerate(leaves) if isinstance(leaf, jax.ShapeDtypeStruct)]
-    arrays = op.operands([leaves[index] for index in places], 0)
+    arrays, fill = materialized(op, ba)
     flush = jnp.zeros(FLUSH_BYTES // 4, jnp.float32)
     evicting = jax.jit(jnp.sum).lower(flush).compile()
 
@@ -543,10 +556,7 @@ def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> Timings:
         def run(flush, arrays):
             # The launch waits for the flush, which reads the whole buffer through the cache.
             total, arrays = jax.lax.optimization_barrier((jnp.sum(flush), arrays))
-            filled = list(leaves)
-            for index, array in zip(places, arrays, strict=True):
-                filled[index] = array
-            args, kwargs = jax.tree.unflatten(tree, filled)
+            args, kwargs = fill(arrays)
             return total, configured(*args, **kwargs)
 
         start = time.perf_counter()
