@@ -1054,9 +1054,9 @@ def test_a_block_router_refuses_a_cached_decode_by_name():
     """A block's shortlist is chosen from every token in it, which a cached decode step holding one
     token of its block cannot see, so a causal decoder with a block router refuses autoregressive
     generation by name rather than route its steps unlike its full forward."""
-    from dew.sampling.text import generate
-
     from dataclasses import replace
+
+    from dew.sampling.text import generate
 
     source = Pretrained.load(FIXTURES / 'llada22-tiny', dtype='float32', attention_impl='reference')
     causal = source.model.clone(causal=True)
