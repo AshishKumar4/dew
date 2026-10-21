@@ -168,15 +168,15 @@ def _supports(route) -> str | None:
 
 def verdict(route) -> str:
     """'kernel', 'gap: <row>', 'inherent', 'unclassified' or 'undeclared' (see the module docstring)."""
-    from dew.nn.kernels.generation import UNCLASSIFIED
+    from dew.nn.kernels.generation import INHERENT, UNCLASSIFIED
 
     if route.kernel == route.preferred:
         return "kernel"
     if route.refusal is not None and route.refusal.code == UNCLASSIFIED:
         return "unclassified"
     row = _supports(route)
-    if row == "inherent":
-        return "inherent"
+    if row == INHERENT:
+        return INHERENT
     return f"gap: {row}" if row else "undeclared"
 
 

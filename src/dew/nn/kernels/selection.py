@@ -28,7 +28,7 @@ class Requirement[C]:
     it in a refusal, `holds(case)` tests it on the target (`generation`'s facts, honouring
     `assumed`), and `detail` (text, or a function of the case) says why a call fails it. A limit
     the code could lift names the `row` of the roadmap or ledger that tracks lifting it; one no
-    implementation of the kernel lifts is `inherent`. Its
+    implementation of the kernel lifts names `INHERENT`. Its
     `kind` is 'capability', what the kernel cannot compute; 'measured', where the target measured
     another kernel faster or never qualified this one, which a forced choice overrides; or
     'handoff', what a generic kernel hands to the next generic one even when forced."""
@@ -36,22 +36,17 @@ class Requirement[C]:
     code: str
     holds: Callable[[C], bool]
     detail: str | Callable[[C], str]
-    row: str | None = None
-    inherent: bool = False
+    row: str
     kind: str = 'capability'
 
     def __post_init__(self) -> None:
-        if (self.row is None) != self.inherent:
-            raise ValueError(f"requirement {self.code!r} names the row that tracks lifting it or is "
-                             "inherent, one of the two")
         if self.kind not in ('capability', 'measured', 'handoff'):
             raise ValueError(f"requirement {self.code!r} is of kind {self.kind!r}, not capability, measured "
                              "or handoff")
 
     def refusal(self, case: C) -> Refusal:
-        """This requirement's refusal of `case`, carrying the row that tracks it or 'inherent'."""
-        return Refusal(self.code, self.detail(case) if callable(self.detail) else self.detail,
-                       'inherent' if self.inherent else self.row)
+        """This requirement's refusal of `case`, carrying the row that tracks it or `INHERENT`."""
+        return Refusal(self.code, self.detail(case) if callable(self.detail) else self.detail, self.row)
 
 
 @dataclasses.dataclass(frozen=True)
