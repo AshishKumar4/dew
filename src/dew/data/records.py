@@ -82,12 +82,13 @@ def _source(source: Source | Mixture | Phases) -> dict[str, JSON]:
     if isinstance(source, Phases):
         return {"phases": [_chain(child) for child in source.pipelines],
                 "until_steps": list(source.until_steps)}
-    return _class_record(source, type(source), "store")
+    return _class_record(source, type(source), "store", store=True)
 
 
-def _class_record(value: object, member: type, where: str) -> dict[str, JSON]:
+def _class_record(value: object, member: type, where: str, *, store: bool = False) -> dict[str, JSON]:
     """`value`, an instance of the dataclass `member`, as a class record, refused where reading it
-    back builds anything but an equal value (`_same`)."""
+    back builds anything but an equal value (`_same`). A store is equal where it reads the same
+    records, its fingerprint the same, whichever sequence holds them."""
     if not dataclasses.is_dataclass(value) or isinstance(value, type):
         raise _Unrecordable(f"the {where} is a {type(value).__name__}, which no record carries")
     fields = {field.name: getattr(value, field.name) for field in dataclasses.fields(value) if field.init}
@@ -97,7 +98,10 @@ def _class_record(value: object, member: type, where: str) -> dict[str, JSON]:
         rebuilt = member(**read_arguments(member, written))
     except (TypeError, ValueError, NameError) as refused:
         raise _Unrecordable(f"the {where} ({type(value).__name__}) can't be recorded: {refused}") from None
-    difference = _same(value, rebuilt, where)
+    difference = _same(value, rebuilt, where, sequences=store)
+    if difference is None and store and isinstance(value, Source) and isinstance(rebuilt, Source):
+        same = json_value(value.fingerprint(), where) == json_value(rebuilt.fingerprint(), where)
+        difference = None if same else f"{where} reads back other records"
     if difference is not None:
         raise _Unrecordable(f"the {where} ({type(value).__name__}) reads back otherwise: {difference}")
     return {"class": path, "fields": written}
@@ -113,31 +117,34 @@ def _function(function: Callable[[Batch], int], where: str) -> dict[str, JSON]:
     return {"function": path}
 
 
-def _same(original: object, rebuilt: object, where: str) -> str | None:
+def _same(original: object, rebuilt: object, where: str, *, sequences: bool = False) -> str | None:
     """Where `rebuilt` differs from `original`, None where it is the same value: of the same type at
-    every level, a tuple a tuple and a list a list, an array of the same dtype and values, a
-    function or a class the same object (a bound method read back by its import path is not).
-    A value no record carries is refused."""
-    if type(original) is not type(rebuilt):
+    every level, a tuple a tuple and a list a list (any sequence the other with `sequences`), an
+    array of the same dtype and values, a function or a class the same object (a bound method read
+    back by its import path is not). A value no record carries is refused."""
+    alike = sequences and isinstance(original, (list, tuple)) and isinstance(rebuilt, (list, tuple))
+    if type(original) is not type(rebuilt) and not alike:
         return f"{where} is a {type(original).__name__} and reads back a {type(rebuilt).__name__}"
     if isinstance(original, np.ndarray) and isinstance(rebuilt, np.ndarray):
         same = original.dtype == rebuilt.dtype and np.array_equal(original, rebuilt)
         return None if same else f"{where} reads back other values"
     if dataclasses.is_dataclass(original) and not isinstance(original, type):
         differences = (_same(getattr(original, field.name), getattr(rebuilt, field.name),
-                             f"{where}.{field.name}") for field in dataclasses.fields(original))
+                             f"{where}.{field.name}", sequences=sequences)
+                       for field in dataclasses.fields(original))
         return next((difference for difference in differences if difference is not None), None)
     if isinstance(original, (type, types.FunctionType, types.BuiltinFunctionType, types.MethodType)):
         return None if original is rebuilt else f"{where} reads back another {type(original).__name__}"
     if isinstance(original, Mapping) and isinstance(rebuilt, Mapping):
         if list(original) != list(rebuilt):
             return f"{where} reads back other keys"
-        differences = (_same(value, rebuilt[key], f"{where}[{key!r}]") for key, value in original.items())
+        differences = (_same(value, rebuilt[key], f"{where}[{key!r}]", sequences=sequences)
+                       for key, value in original.items())
         return next((difference for difference in differences if difference is not None), None)
     if isinstance(original, (list, tuple)) and isinstance(rebuilt, (list, tuple)):
         if len(original) != len(rebuilt):
             return f"{where} reads back {len(rebuilt)} entries, not {len(original)}"
-        differences = (_same(left, right, f"{where}[{index}]")
+        differences = (_same(left, right, f"{where}[{index}]", sequences=sequences)
                        for index, (left, right) in enumerate(zip(original, rebuilt, strict=True)))
         return next((difference for difference in differences if difference is not None), None)
     if isinstance(original, (str, bytes, int, float, complex, bool, Enum, np.generic)) or original is None:
