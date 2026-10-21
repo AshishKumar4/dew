@@ -1,6 +1,6 @@
 // How a live run's outputs show (src/scripts/live.ts, renderOutput), in Chrome, as Jupyter shows a kernel's
 // messages: clear_output(wait=True) clears when the next output arrives, and a display shown under an id is
-// one output its updates replace, every place the kernel's outputs show it.
+// one output its updates replace, every place the cell shows it.
 //
 //   pnpm test
 
@@ -27,18 +27,17 @@ after(async () => {
 	await browser?.close();
 });
 
-/** What `cells` (each a list of outputs) show, cell by cell, run in turn by one kernel whose outputs `shared`
- * makes the page's, as a notebook's are, or else each cell's own, as the landing page's are. */
-function shows(cells, shared = false) {
-	return page.evaluate(({ cells, shared }) => {
+/** What `cells` (each a list of outputs) show, cell by cell. */
+function shows(cells) {
+	return page.evaluate((cells) => {
 		const into = cells.map(() => document.body.appendChild(document.createElement('div')));
 		cells.forEach((outputs, index) => {
-			for (const output of outputs) window.live.renderOutput(into[index], output, shared ? document : into[index]);
+			for (const output of outputs) window.live.renderOutput(into[index], output);
 		});
 		const shown = into.map((cell) => [...cell.children].map((child) => child.textContent || child.getAttribute('src')));
 		for (const cell of into) cell.remove();
 		return shown;
-	}, { cells, shared });
+	}, cells);
 }
 
 test('a display under an id is one output its updates replace, each place it shows', async () => {
@@ -69,11 +68,9 @@ test('clear_output(wait=True) clears at the next output, and an update before it
 	assert.deepEqual(await shows([[{ type: 'stream', name: 'stdout', text: 'gone\n' }, { type: 'clear' }]]), [[]]);
 });
 
-test("a notebook's cells share a kernel, so one cell updates what another shows; the landing page's do not", async () => {
-	const cells = [
+test('a display one cell shows is not what another cell updates', async () => {
+	assert.deepEqual(await shows([
 		[{ type: 'display', display: 'p', text: 'shown in the first cell' }],
-		[{ type: 'display', display: 'p', update: true, text: 'updated by the second' }],
-	];
-	assert.deepEqual(await shows(cells, true), [['updated by the second'], []]);
-	assert.deepEqual(await shows(cells, false), [['shown in the first cell'], []]);
+		[{ type: 'display', display: 'p', update: true, text: 'an update from the second' }],
+	]), [['shown in the first cell'], []]);
 });

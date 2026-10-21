@@ -174,11 +174,10 @@ export class LiveSession {
 /**
  * Show one output in `into`, the way the tutorial pages show recorded outputs, as Jupyter shows a kernel's
  * messages: clear_output(wait=True) clears when the next output arrives, and a display shown under an id is
- * updated in place, every place `scope` shows it. `scope` holds the outputs of the kernel that ran the cell:
- * the cell's own on the landing page, whose cells each run in a context of their own, and the page on a
- * notebook, whose cells share one.
+ * updated in place, every place the cell shows it. A display another cell showed is not updated: a notebook's
+ * cells share one kernel, but no page runs a notebook live yet (ledger 846).
  */
-export function renderOutput(into: HTMLElement, output: Output, scope: ParentNode = into): void {
+export function renderOutput(into: HTMLElement, output: Output): void {
 	if (output.type === 'clear') {
 		if (output.wait) {
 			into.dataset.clearNext = '';
@@ -191,7 +190,7 @@ export function renderOutput(into: HTMLElement, output: Output, scope: ParentNod
 	if (output.type === 'display' && output.update) {
 		const shown = displayed(output);
 		if (!shown || output.display === undefined) return;
-		const showing = scope.querySelectorAll<HTMLElement>(`[data-display="${CSS.escape(output.display)}"]`);
+		const showing = into.querySelectorAll<HTMLElement>(`[data-display="${CSS.escape(output.display)}"]`);
 		showing.forEach((element, index) => element.replaceWith(index === 0 ? shown : shown.cloneNode(true)));
 		return;
 	}
