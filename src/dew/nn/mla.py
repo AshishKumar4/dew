@@ -45,7 +45,7 @@ from dew.nn.kv_cache import KVCache, write_cache
 # contracts from base avoids importing the kind hub back during this module's
 # initialization, so either kind can be the first imported.
 from dew.nn.mixer_base import ATTENTION_CONTEXT_RESIDUALS, MixerBase, MixerContext
-from dew.nn.precision import at_least_fp32, compensated_add, float32_dot_general, float32_products
+from dew.nn.precision import at_least_fp32, compensated_add, compensated_sum, float32_dot_general, float32_products
 from dew.nn.rope import YarnScaling, deinterleaved, rotate, yarn_query_scale, yarn_rope_freqs
 from dew.nn.sharding import RESIDUAL, LogicalAxes, constrain, down_projection, logical_axes
 from dew.nn.sparse_selection import index_scores, selection_mask, sparse_latent_attention, top_k_selection
@@ -129,15 +129,16 @@ def indexer_kl(scores, query, key, keep, scale: float):
         probabilities = jax.nn.softmax(jnp.where(keep, product, masked), axis=-1)
         return compensated_add(summed, (probabilities, jnp.zeros_like(probabilities))), None
 
-    # The heads sum one at a time, as a compensated pair, so the sum is rounded once: a plain
-    # running sum biased the KL by its roundings (1.67 times MaxText's error from float64, whose
-    # sum over heads runs at once).
+    # The heads, the target's normalization over the keys and each query's KL over them all sum
+    # rounded once (`compensated_add`, `compensated_sum`): plain sums biased the KL upward, 1.67
+    # times MaxText's error from float64, which sums its heads at once at H times this footprint.
     zeros = jnp.zeros((batch, length, total), wide)
     (high, low), _ = jax.lax.scan(head, (zeros, zeros), (jnp.moveaxis(query, 2, 0), jnp.moveaxis(key, 2, 0)))
     summed = high + low
-    target = summed / (jnp.sum(summed, axis=-1, keepdims=True) + INDEXER_EPS)
+    target = summed / (compensated_sum(summed, (summed.ndim - 1,))[..., None] + INDEXER_EPS)
     indexer = jax.nn.softmax(jnp.where(keep, scores.astype(wide), masked), axis=-1)
-    return jnp.sum(target * (jnp.log(target + INDEXER_EPS) - jnp.log(indexer + INDEXER_EPS)), axis=-1)
+    divergence = target * (jnp.log(target + INDEXER_EPS) - jnp.log(indexer + INDEXER_EPS))
+    return compensated_sum(divergence, (divergence.ndim - 1,))
 
 
 def _rotate(interleave: bool, part, freqs_cos, freqs_sin):
