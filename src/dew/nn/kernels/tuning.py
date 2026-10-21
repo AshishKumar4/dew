@@ -633,7 +633,8 @@ def observed(op: KernelOp, ba: tokamax.BoundArguments, measured: Mapping[Hashabl
              device) -> None:
     """Log each config `_measured` timed or saw exhaust the device's resources, with the launch's features
     and estimate where it states them, where `DEW_TIMINGS` asks (`kernels.timings`): after the timing
-    loop, on this thread, so logging never runs beside a measurement or changes a pick."""
+    loop, on the measuring thread, so logging never runs beside a measurement and changes no pick. A
+    failure to log raises, failing the tune: logging was asked for."""
     from . import timings as log
     if log.directory() is None:
         return
