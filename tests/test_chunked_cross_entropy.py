@@ -158,7 +158,7 @@ def test_the_fused_head_takes_the_whole_heads_loss_and_gradients_under_the_float
     def fused(states, matrix, scale, bias, targets, weights):
         return fused_head_loss(states, OutputTable(matrix, vocab_major=False, bias=bias, softcap=softcap,
                                                    scale=scale),
-                               targets, weights, z_loss=z_loss, tile=(40, 11))
+                               targets, weights, z_loss=z_loss, tile=(3, 11))
 
     def held(loss):
         def run(*terms):
