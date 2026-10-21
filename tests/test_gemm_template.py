@@ -15,6 +15,7 @@ from jax.sharding import Mesh
 from reference_error import assert_as_exact
 
 from dew.nn.kernels import generation, grouped_matmul, tuning
+from dew.nn.kernels.templates import product
 from dew.nn.kernels.templates.gemm import fused, mosaic_gpu, template
 
 pytestmark = pytest.mark.kernel
@@ -913,3 +914,35 @@ def test_a_dense_product_runs_the_plain_tiled_kernel():
         jax.jit(_loss(_dew(spec, interpret_on_cpu=True))).trace(x, w, ms, nw, b, u, s, ct).lower()
     told = {(type(launch).__name__, ba.arguments.get('dense')) for launch, ba in launches}
     assert {('Gmm', True), ('GmmTransposed', True), ('Tgmm', True)} <= told
+
+
+HIGHEST, DEFAULT = jax.lax.Precision.HIGHEST, jax.lax.Precision.DEFAULT
+
+
+@pytest.mark.parametrize(("compute", "precision", "outputs", "promoted", "refused"), [
+    (jnp.bfloat16, HIGHEST, (jnp.float32,), True, None),
+    (jnp.bfloat16, HIGHEST, (jnp.bfloat16,), False, None),
+    (jnp.bfloat16, HIGHEST, (jnp.bfloat16, jnp.float32), True, None),
+    (jnp.float16, DEFAULT, (jnp.float32,), False, None),
+    (jnp.float32, DEFAULT, (jnp.float32,), False, None),
+    (jnp.float32, HIGHEST, (jnp.float32,), True, "TF32"),
+    (jnp.int8, DEFAULT, (jnp.float32,), False, "int8"),
+])
+def test_a_product_declares_its_promotion_and_the_kernels_refusal(compute, precision, outputs, promoted,
+                                                                   refused):
+    """A precision above the default promotes each depth step's partial where an output is fp32; the
+    kernels refuse fp32 products above the default (they multiply in TF32) and a dtype they do not
+    multiply in, and `ragged_dot_refusal` is the declaration's refusal."""
+    declared = product.declared(compute, precision, outputs=outputs)
+    assert declared.promoted is promoted
+    assert (declared.refusal is None) is (refused is None)
+    assert refused is None or refused in declared.refusal
+    assert grouped_matmul.ragged_dot_refusal(compute, (), precision) == declared.refusal
+
+
+def test_a_product_refuses_operands_wider_than_fp32_and_x64():
+    """The kernels sum gradients in fp32 and offset groups in int32."""
+    assert "wider than fp32" in product.declared(jnp.bfloat16, DEFAULT, operands=(jnp.float64,)).refusal
+    with jax.enable_x64(new_val=True):
+        assert "x64" in product.declared(jnp.bfloat16, DEFAULT).refusal
+

@@ -36,7 +36,7 @@ from jax.extend import core as jax_core
 
 from dew.nn.kernels import generation, grouped_matmul
 from dew.nn.kernels.selection import forced
-from dew.nn.precision import asks_default_precision
+from dew.nn.kernels.templates.product import declared
 
 LAUNCH_AXES = {'prologue': ('rows', 'depth'), 'epilogue': ('rows', 'columns')}
 """The launch axes each hook's side operands may follow."""
@@ -48,8 +48,9 @@ def gemm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None = None, *
          interpret_on_cpu: bool = False):
     """Each group's rows of `lhs` times its matrix of `rhs`, through the hooks (the module's docstring):
     `[rows, width]` in `out_dtype`, or a tuple in `out_dtypes`. A `precision` above the default
-    (explicitly or through `jax_default_matmul_precision`) sums an fp32 output in IEEE fp32
-    (`grouped_matmul.ragged_dot_refusal`), in XLA as in the kernels."""
+    (explicitly or through `jax_default_matmul_precision`) sums an fp32 output in IEEE fp32, in XLA as in
+    the kernels: the product `precision` declares (`templates.product.declared`), which every launch of
+    the call and of its derivative keeps."""
     dense = group_sizes is None
     rhs, group_sizes = _grouped(lhs, rhs, group_sizes)
     prologue_arrays, prologue_axes = _split(prologue_operands, 'prologue')
@@ -133,8 +134,9 @@ def gemm_t(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None, *, pro
     def kernel(lhs, rhs, group_sizes, prologue_arrays, *, interpret):
         sides, axes, broadcast = _launchable(prologue_arrays, prologue_axes)
         hooks = grouped_matmul.Hooks(prologue, axes, prologue_broadcast=broadcast)
+        promoted = declared(lhs.dtype, precision, outputs=(out_dtype,)).promoted
         return grouped_matmul.launched_tgmm(lhs, rhs, group_sizes, sides, out_dtype=out_dtype, hooks=hooks,
-                                            interpret=interpret, exact=_exact(precision), dense=dense)
+                                            interpret=interpret, promoted=promoted, dense=dense)
 
     def portable(lhs, rhs, group_sizes, prologue_arrays):
         routed = _routed(group_sizes, lhs.shape[0])
@@ -163,7 +165,9 @@ def _gemm(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, epilo
                                      prologue_broadcast=before_broadcast, epilogue_broadcast=after_broadcast)
         return grouped_matmul.launched_gmm(lhs, rhs, group_sizes, before_sides, after_sides,
                                            out_dtype=dtypes[0], trans_rhs=transpose_rhs, hooks=hooks,
-                                           interpret=interpret, exact=_exact(precision), dense=dense)
+                                           interpret=interpret, promoted=declared(lhs.dtype, precision,
+                                                                                  outputs=dtypes).promoted,
+                                           dense=dense)
 
     def portable(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays):
         return _portable_gemm(lhs, rhs, group_sizes, prologue, prologue_arrays, epilogue, epilogue_arrays,
@@ -260,19 +264,13 @@ def _needed(jaxpr, outvars) -> set:
     return needed
 
 
-def _exact(precision: PrecisionLike) -> bool:
-    """Whether `precision` asks for IEEE fp32 sums: a precision above the default."""
-    return not asks_default_precision(precision, configured=True)
-
-
 def _kernels_take(compute, precision: PrecisionLike) -> bool:
-    """Whether the kernels compute the products `precision` asks for in `compute`: 16-bit products are
-    exact at any precision; fp32's are TF32 in the kernels, which only the default precision asks for, so
-    a higher one runs XLA's portable program, reported as the dispatch's route with the reason
-    (`grouped_matmul.ragged_dot_refusal`), and a kernel `generation.chosen` names for it raises."""
-    if jnp.dtype(compute).itemsize == 2 or not _exact(precision):
+    """Whether the kernels compute the product `precision` declares in `compute`
+    (`templates.product.declared`): one they refuse runs XLA's portable program, reported as the
+    dispatch's route with the reason, and a kernel `generation.chosen` names for it raises."""
+    refusal = declared(compute, precision).refusal
+    if refusal is None:
         return True
-    refusal = "fp32 products above the default precision, and the kernels multiply in TF32"
     named = forced('grouped_matmul')
     if named not in (None, 'xla'):
         raise ValueError(f"grouped_matmul's implementation {named!r} is chosen and does not run this call: "
