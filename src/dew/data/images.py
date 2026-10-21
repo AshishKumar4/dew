@@ -251,6 +251,10 @@ class CenterCrop(grain.MapTransform):
     _: dataclasses.KW_ONLY
     field: str = "image"
 
+    def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
+        """The images `size` squares, as many channels as they held."""
+        return resized(facts, self.field, self.size, self.size)
+
     def map(self, element: Batch) -> Batch:
         image = np.asarray(element[self.field])
         height, width = image.shape[:2]
@@ -371,6 +375,10 @@ class Flip(grain.RandomMapTransform):
     _: dataclasses.KW_ONLY
     field: str = "image"
 
+    def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
+        """The images as their shape was: a mirror moves pixels, not the frame."""
+        return facts
+
     def random_map(self, element: Batch, rng: np.random.Generator) -> Batch:
         image = np.asarray(element[self.field])
         flipped = np.ascontiguousarray(image[:, ::-1]) if rng.random() < self.p else image
@@ -388,6 +396,10 @@ class ColorJitter(grain.RandomMapTransform):
     saturation: float = 0.2
     _: dataclasses.KW_ONLY
     field: str = "image"
+
+    def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
+        """The images as their shape was, uint8 still: the jitter changes their values alone."""
+        return facts
 
     def random_map(self, element: Batch, rng: np.random.Generator) -> Batch:
         from dew.data.image_augmentation import jitter_host, jitter_ranges
@@ -500,6 +512,10 @@ class Caption(grain.MapTransform):
     template: str | None = None
     classes: tuple[str, ...] = ()
     columns: tuple[str, ...] = ("caption", "text")
+
+    def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
+        """A caption, a string of no fixed shape, beside the fields as they were."""
+        return facts
 
     def map(self, element: Batch) -> Batch:
         label = element.get("label")

@@ -35,14 +35,17 @@ def _named_split(source: Source, name: str) -> Source:
 
 
 @dataclasses.dataclass(frozen=True)
-class _SliceRecords:
+class RecordSlice:
+    """The records [`start`, `stop`) of `source`, by index (`holdout(records=)`): the first `start`
+    held out of the part a run trains on, or those a run scores. A run's record names it."""
+
     reads: ClassVar[tuple[Read, ...]] = _INDEXED_READS
     refusal: ClassVar[str] = f"a records= holdout {_BY_INDEX}"
     source: Source
     start: int
     stop: int | None = None
 
-    def consumed(self, read: Read) -> _SliceRecords:
+    def consumed(self, read: Read) -> RecordSlice:
         return dataclasses.replace(self, source=_consumed(self.source, read))
 
     def label(self) -> str:
@@ -115,11 +118,11 @@ class _SelectedRow:
 
 
 @dataclasses.dataclass(frozen=True)
-class _HashSource:
+class HashPart:
     """The rows of `source` whose identity (its `key` field, or its content)
     hashes into [`low`, `high`) of the unit interval (`held`), or the rows
     that do not: a row is in exactly one part, the same in every run, read,
-    machine and resume."""
+    machine and resume (`holdout(fraction)`). A run's record names it."""
 
     reads: ClassVar[tuple[Read, ...]] = ("memory", "streamed")
     refusal: ClassVar[str] = ("a hash holdout reads every row to place it, under read='memory' or "
@@ -130,7 +133,7 @@ class _HashSource:
     held: bool
     key: str | None = None
 
-    def consumed(self, read: Read) -> _HashSource:
+    def consumed(self, read: Read) -> HashPart:
         return dataclasses.replace(self, source=_consumed(self.source, read))
 
     def label(self) -> str:
@@ -211,19 +214,19 @@ def holdout(dataset: Dataset, fraction: float | None = None, *, key: str | None 
     if records is not None:
         if records < 1:
             raise ValueError(f"holdout records= is at least 1, not {records}")
-        return (_rebased(dataset, lambda source: _SliceRecords(source, records)),
-                _rebased(dataset, lambda source: _SliceRecords(source, 0, records)))
+        return (_rebased(dataset, lambda source: RecordSlice(source, records)),
+                _rebased(dataset, lambda source: RecordSlice(source, 0, records)))
     shares = (fraction,) if fraction is not None else tuple(named.values())
     if any(not 0 < share < 1 for share in shares) or sum(shares) >= 1:
         raise ValueError(f"held-out fractions are each in (0, 1) and sum under 1, not {shares}")
     bounds = np.concatenate([[0.0], np.cumsum(shares)]).tolist()
-    trained = _rebased(dataset, lambda source: _HashSource(source, 0.0, bounds[-1], held=False, key=key))
-    held = (functools.partial(_HashSource, low=low, high=high, held=True, key=key)
+    trained = _rebased(dataset, lambda source: HashPart(source, 0.0, bounds[-1], held=False, key=key))
+    held = (functools.partial(HashPart, low=low, high=high, held=True, key=key)
             for low, high in itertools.pairwise(bounds))
     return (trained, *(_rebased(dataset, part) for part in held))
 
 
-_SELECTIONS = (_HashSource, _SliceRecords)
+_SELECTIONS = (HashPart, RecordSlice)
 
 
 def selecting(source: Source | Mixture | Phases) -> Iterator[Source | Mixture | Phases]:
