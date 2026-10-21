@@ -80,7 +80,7 @@ from jax.experimental.pallas import triton as plgpu
 from ..precision import at_least_fp32, compensated_add, rounded_to, two_product
 from ..sharding import logical_spec, manual_map
 from . import generation, tuning
-from .generation import measured_kernel
+from .generation import INHERENT, measured_kernel
 from .selection import Kernel, Op, Requirement, select
 
 IMPLEMENTATIONS = ('auto', 'xla', 'pallas')
@@ -227,12 +227,12 @@ def _dtype_requirements[C: _Typed](name: str, case_type: type[C]) -> tuple[Requi
         Requirement[C]('precision', lambda case: all(_within_fp32(dtype) for dtype in case.dtypes),
                     lambda case: f"{name} reads or writes {', '.join(map(str, case.dtypes))}; the kernel "
                                  "computes in fp32, which a wider dtype's accuracy needs more than",
-                    inherent=True),
+                    row=INHERENT),
         Requirement[C]('fp16', lambda case: jnp.float16 not in case.dtypes,
                     f"{name}'s kernel is not yet qualified on float16 operands", row=QUALIFY_FP16),
         Requirement[C]('dtype', lambda case: all(dtype in (*DTYPES, jnp.float16) for dtype in case.dtypes),
                     lambda case: f"{name} reads or writes {', '.join(map(str, case.dtypes))}; the kernel "
-                                 "computes float32, bfloat16 and float16 alone", inherent=True),
+                                 "computes float32, bfloat16 and float16 alone", row=INHERENT),
     )
 
 
@@ -314,28 +314,28 @@ def norm_case(implementation: str, x, scale, dtype, axes, *, branch=None, gate=N
 
 
 NORM_SUPPORTS: tuple[Requirement[NormCase], ...] = (
-    Requirement('capability', _runs, "the Pallas kernels need a GPU of sm80 or later", inherent=True),
+    Requirement('capability', _runs, "the Pallas kernels need a GPU of sm80 or later", row=INHERENT),
     Requirement('activation', lambda case: not case.activated,
                 "the norm is followed by an activation, which the kernel does not apply",
                 row='ledger 821'),
     Requirement('statistics', lambda case: case.fp32_statistics,
                 "input-dtype statistics round each reduction step; the kernel reduces in fp32",
-                inherent=True),
+                row=INHERENT),
     Requirement('gate_activation', lambda case: case.activation in (None, 'silu', 'sigmoid'),
                 lambda case: f"the gated kernel gates by silu or sigmoid, not {case.activation!r}",
-                inherent=True),
+                row=INHERENT),
     *_dtype_requirements('RMSNorm', NormCase),
     Requirement('empty', lambda case: not case.empty, "RMSNorm needs nonempty rows with a feature axis",
-                inherent=True),
+                row=INHERENT),
     Requirement('width', lambda case: 0 < case.width <= 8192,
                 "RMSNorm's register tile holds at most 8192 features", row='ledger 820'),
     Requirement('scale', lambda case: case.scale_fits,
                 "the kernel takes a vector scale over the features, not a broadcast affine tensor",
-                inherent=True),
+                row=INHERENT),
     Requirement('branch', lambda case: case.branch_fits,
-                "a residual branch must match the normalized input's shape and dtype", inherent=True),
+                "a residual branch must match the normalized input's shape and dtype", row=INHERENT),
     Requirement('gate', lambda case: case.gate_fits, "a gate must match the normalized input's shape",
-                inherent=True),
+                row=INHERENT),
     Requirement('placement', lambda case: case.placed,
                 "a mesh splits RMSNorm's operands by axes the caller does not name or across its features, "
                 "or a shard_map that checks varying axes holds them, and a Pallas call states no varying "
@@ -383,14 +383,14 @@ class SwigluCase:
 
 
 SWIGLU_SUPPORTS: tuple[Requirement[SwigluCase], ...] = (
-    Requirement('capability', _runs, "the Pallas kernels need a GPU of sm80 or later", inherent=True),
+    Requirement('capability', _runs, "the Pallas kernels need a GPU of sm80 or later", row=INHERENT),
     *_dtype_requirements('SwiGLU', SwigluCase),
     Requirement('matching', lambda case: len(set(case.dtypes)) == 1,
                 lambda case: f"SwiGLU of {' and '.join(map(str, case.dtypes))} operands; the kernel reads "
-                             "one dtype, and XLA's product promotes mixed ones", inherent=True),
+                             "one dtype, and XLA's product promotes mixed ones", row=INHERENT),
     Requirement('shape', lambda case: case.shape_fits,
                 "SwiGLU needs nonempty equal shapes, not broadcasting, or a packed [..., 2, H] gate and up",
-                inherent=True),
+                row=INHERENT),
     Requirement('placement', lambda case: case.placed,
                 "a mesh splits SwiGLU's operands by axes the caller does not name, or a shard_map that "
                 "checks varying axes holds them, and a Pallas call states no varying type",

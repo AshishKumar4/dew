@@ -68,7 +68,7 @@
    "by": "2026-11-13"
   },
   "tests/test_attention_splash.py": {
-   "comparisons": 4,
+   "comparisons": 3,
    "lane": "Kernels",
    "by": "2026-11-06"
   },
@@ -429,11 +429,6 @@
   },
   "tests/test_hf_decoders.py": {
    "comparisons": 21,
-   "lane": "Models, Serving & RL",
-   "by": "2026-11-13"
-  },
-  "tests/test_hf_gpt_neox.py": {
-   "comparisons": 2,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
