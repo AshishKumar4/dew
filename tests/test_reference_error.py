@@ -14,6 +14,7 @@ from reference_error import (
     declared_seeds,
     distance,
     indexed_recording,
+    input_digest,
     seeds_for,
 )
 
@@ -285,6 +286,15 @@ def test_a_recording_keeps_the_confirmed_count_where_the_proxy_planned_more():
     recorded = recorder.record_case("site", draw, evaluate, one_element)
     seeds = int(recorded["site.seeds"])
     assert planned > seeds and len(recorded["site.input.x"]) == 5 * seeds
+
+
+def test_an_input_digest_tells_apart_a_scalar_from_its_vector_and_two_formats_of_one_width():
+    """Inputs drawn again in another shape or format with the same bytes are not the recorded ones."""
+    assert input_digest({"x": np.float32(1)}) != input_digest({"x": np.ones(1, np.float32)})
+    one = np.array([1.0, 2.0], jnp.float8_e4m3fn)
+    assert input_digest({"x": one}) != input_digest({"x": one.view(jnp.float8_e4m3fnuz)})
+    strided = np.arange(12, dtype=np.float32).reshape(3, 4)[:, ::2]
+    assert input_digest({"x": strided}) == input_digest({"x": np.ascontiguousarray(strided)})
 
 
 def test_a_recording_of_outputs_alone_draws_its_inputs_again(tmp_path):

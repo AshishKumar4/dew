@@ -451,13 +451,15 @@ def declared_seeds(path) -> dict[str, int]:
 
 
 def input_digest(inputs) -> np.uint64:
-    """A seed's inputs (a dict of arrays) as 64 bits of the SHA-256 of each array's name, dtype, shape and
-    bytes: what a recording of outputs alone keeps, so that inputs drawn again are checked to be the
-    recorded ones."""
+    """A seed's inputs (a dict of NumPy arrays, a torch draw's converted) as 64 bits of the SHA-256 of
+    each array's name, dtype by name, shape and bytes in C order: what a recording of outputs alone
+    keeps, so that inputs drawn again are checked to be the recorded ones. The dtype goes by its name, as
+    some narrow formats share a byte code (float8_e4m3fn's and float8_e4m3fnuz's), and the shape as the
+    array's own, a scalar's included."""
     digest = hashlib.sha256()
     for name in sorted(inputs):
-        value = np.ascontiguousarray(np.asarray(inputs[name]))
-        digest.update(f"{name}:{value.dtype.str}:{value.shape};".encode())
+        value = np.asarray(inputs[name])
+        digest.update(f"{name}:{value.dtype}:{value.shape};".encode())
         digest.update(value.tobytes())
     return np.frombuffer(digest.digest()[:8], np.uint64)[0]
 
