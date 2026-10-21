@@ -313,3 +313,23 @@ def test_an_extreme_fp32_backward_is_as_exact_as_the_reference(peak0, scale, key
         got = np.asarray(found.query)
         assert np.isfinite(got).all()
         assert_as_exact_as_the_reference(got, theirs, want, "dq at fp32's edges")
+
+
+def test_a_logit_past_the_forwards_rounded_maximum_weighs_one_in_the_backward():
+    """fp32, one query of 1610613120 over one key of 1, the value and output cotangent 1, scale 1, no
+    hooks: the forward's maximum, taken in base 2 and back, rounds 128 below the backward's natural
+    logit. Both mainloops weigh that key 1, as the maximum it is, and give the reference's finite
+    gradients (dQ = dK = 0, dV = 1)."""
+    spans = template.spans(1, 1, 1)
+    query = jnp.full((1, 1, 1, 1), 1610613120.0, jnp.float32)
+    key = value = dout = jnp.ones((1, 1, 1, 1), jnp.float32)
+    pins = {attention_triton.TritonBackward: attention_triton.BackwardTiles(32, 32, 4, 2, 4, 2),
+            attention_triton.TritonForward: attention_triton.Tiles(32, 32, 4, 2)}
+    with tuning.pinned(pins):
+        triton = attention_triton.backward(query, key, value, spans, None, dout, scale=1.0, interpret=True)
+    portable = attention_portable.backward(query, key, value, spans, None, dout, block_q=32, block_k=32,
+                                           pad=attention_triton.BLOCK, scale=1.0)
+    for found in (triton, portable):
+        np.testing.assert_array_equal(np.asarray(found.query), 0)
+        np.testing.assert_array_equal(np.asarray(found.key), 0)
+        np.testing.assert_array_equal(np.asarray(found.value), 1)
