@@ -39,7 +39,7 @@ def test_the_plan_runs_every_file_on_the_floor_and_the_newest_python_on_its_own(
         (tmp_path / "tests" / f"{name}.py").write_text("")
     (tmp_path / "tests/test_durations.json").write_text(json.dumps(
         {"tests/test_heavy.py::test_a": 150.0, "tests/test_heavy.py::test_b": 100.0,
-         "tests/test_light.py::test_c": 30.0, "tests/test_measured.py::test_d": 500.0,
+         "tests/test_light.py::test_c": 30.0, "tests/test_measured.py::test_d": 25.0,
          "tests/test_config.py::test_e": 20.0}))
     monkeypatch.setattr(ci, "NEWEST_FILES", ("tests/test_config.py", "tests/test_light.py"))
     entries = ci.plan(120.0, {"files": {"3.12:tests/test_measured.py": 40.0,
@@ -314,7 +314,8 @@ def test_a_gpu_lane_runs_each_file_in_a_process_of_its_own_within_its_memory_sha
         ci, tmp_path, monkeypatch, cache_worker):
     """The GPU lane runs each file once, in a process of its own. A file no
     run has measured runs alone with the lane's whole share, and so does one
-    that started a process it did not follow; files with a measured peak run
+    that started a process it did not follow, its pool growing as it uses it
+    so that child has the rest of the share; files with a measured peak run
     side by side, each with its peak and headroom, and one whose child took
     its share's fraction holds a share more beside them (`gpu_needs`). A red
     row stays red: nothing is run again. The rows join one verdict, each
@@ -336,8 +337,9 @@ def test_a_gpu_lane_runs_each_file_in_a_process_of_its_own_within_its_memory_sha
               "    began = time.monotonic()\n"
               "    time.sleep(1)\n"
               "    share = os.environ['XLA_PYTHON_CLIENT_MEM_FRACTION']\n"
+              "    grown = os.environ.get('XLA_PYTHON_CLIENT_PREALLOCATE', 'true')\n"
               "    ran = Path(f'ran-{Path(__file__).stem}-{os.getpid()}')\n"
-              "    ran.write_text(f'{share} {began} {time.monotonic()}')\n")
+              "    ran.write_text(f'{share} {began} {time.monotonic()} {grown}')\n")
     names = [f"tests/test_file_{index}.py" for index in range(5)]
     for name in names:
         (tmp_path / name).write_text(source)
@@ -356,7 +358,7 @@ def test_a_gpu_lane_runs_each_file_in_a_process_of_its_own_within_its_memory_sha
                                                             key=lambda path: path.stat().st_mtime)]
 
     def overlapping(runs: list[list[str]]) -> int:
-        spans = [(float(began), float(ended)) for _, began, ended in runs]
+        spans = [(float(began), float(ended)) for _, began, ended, _ in runs]
         return max(sum(began <= moment < ended for began, ended in spans) for moment, _ in spans)
 
     out = tmp_path / "verdict.json"
@@ -366,6 +368,9 @@ def test_a_gpu_lane_runs_each_file_in_a_process_of_its_own_within_its_memory_sha
         (f"3.12:{name}", int(name == "tests/test_red.py")) for name in every]
     first = [run for name in every for run in ran(Path(name).stem)]
     assert [share for share, *_ in first] == ["0.5"] * len(every), "unmeasured: each alone, the whole share"
+    # Alone with the whole share, a file grows its pool as it uses it: a child it did not follow, another
+    # environment's Python, has what the file leaves of the share.
+    assert [grown for *_, grown in first] == ["false"] * len(every)
     assert overlapping(first) == 1
     assert len(ran("test_red")) == 1, "a red row stays red: its file is not run again"
     # Measured peaks of 4 GiB: each file then holds 6 GiB of the 40, and four run at once. Records without
@@ -381,6 +386,7 @@ def test_a_gpu_lane_runs_each_file_in_a_process_of_its_own_within_its_memory_sha
     assert [row["exitCode"] for row in rows] == [int(name == "tests/test_red.py") for name in every]
     measured = [ran(Path(name).stem)[-1] for name in names]
     assert [share for share, *_ in measured] == [str(6 * 2 ** 30 / (81920 * 2 ** 20))] * len(names)
+    assert [grown for *_, grown in measured] == ["true"] * len(names), "a measured share is taken whole"
     assert 2 <= overlapping(measured) <= 4
     assert [share for share, *_ in ran("test_spawner")] == ["0.5", measured[0][0]]
     assert overlapping([*measured, ran("test_spawner")[-1]]) >= 2, "a followed spawner packs with the rest"
@@ -468,6 +474,25 @@ def test_coverage_combines_each_tasks_branches_into_one_report_a_module_a_line(c
     assert Path(least[0].removeprefix("| ")).name == "unused.py" and least[-1] == "0.0% |"
 
 
+def test_a_file_whose_recorded_tests_outweigh_its_median_runs_split_by_them(ci, tmp_path):
+    """Train 18's census: main's runs timed the file at 6 s with one test; a head recorded the 1,576
+    tests it added (here 40 of 30 s). Each record is a test's least time, so their sum past the median
+    may mean those runs predate the file's tests, and is a floor on its time: it runs split by its
+    records, alone, not packed with the light files by the median it had before."""
+    for name in ("test_census", "test_light", "test_other"):
+        (tmp_path / "tests" / f"{name}.py").write_text("")
+    (tmp_path / "tests/test_durations.json").write_text(json.dumps(
+        {**{f"tests/test_census.py::test_cell[{n}]": 30.0 for n in range(40)},
+         "tests/test_light.py::test_a": 20.0, "tests/test_other.py::test_b": 20.0}))
+    timings = {"files": {"3.12:tests/test_census.py": 6.0, "3.12:tests/test_light.py": 20.0,
+                         "3.12:tests/test_other.py": 20.0},
+               "rows": {"3.12:tests/test_census.py": 6.0}}
+    floor = sorted((entry["tests"], entry["split"], entry["weight"]) for entry in ci.plan(240.0, timings)
+                   if entry["python"] == "3.12")
+    assert floor == [*((("tests/test_census.py", f"{group}/5", 240.0)) for group in range(1, 6)),
+                     ("tests/test_light.py tests/test_other.py", "", 40.0)]
+
+
 def test_a_split_file_pays_its_setup_once_a_group_and_is_not_cut_finer_for_it(ci):
     """Twenty recorded tests of 10 s that armada measured whole at 400 s paid 200 s besides their
     tests, which every group pays again: at a 150 s target that leaves a group half the target of
@@ -550,10 +575,24 @@ def test_durations_are_each_tests_least_time_over_green_runs_floors(ci):
         ci.durations([{"rows": [{"name": "3.12:tests/test_b.py", "exitCode": 0}]}])
 
 
+def test_a_tasks_wall_time_is_apportioned_by_its_files_tests_times(ci):
+    """A task's wall time split among its files in proportion to their tests'
+    own times, and evenly over its rows where no test recorded one: recorded
+    times whose shares are exact in binary."""
+    assert ci.apportioned({"tests/test_a.py": 0.25, "tests/test_b.py": 0.75}, 2.0, 2) == {
+        "tests/test_a.py": 0.5, "tests/test_b.py": 1.5}
+    assert ci.apportioned({"tests/test_a.py": 0.0, "tests/test_b.py": 0.0}, 3.0, 2) == {
+        "tests/test_a.py": 1.5, "tests/test_b.py": 1.5}
+    # A file named twice is two of the task's rows.
+    assert ci.apportioned({"tests/test_a.py": 0.0, "tests/test_b.py": 0.0}, 3.0, 3) == {
+        "tests/test_a.py": 1.0, "tests/test_b.py": 1.0}
+
+
 def test_a_tasks_rows_share_its_wall_time_by_their_tests_times(ci, tmp_path):
     """The plan weighs a file by what a task spends on it, its import and
-    collection included, so a task's rows add up to its wall time, split in
-    proportion to their tests' own times."""
+    collection included, so a task's rows add up to its wall time, split by
+    their tests' own times (`apportioned`): at least what the tests slept, at
+    most the task's wall time, and the longer sleep the larger row."""
     (tmp_path / "tests").mkdir(exist_ok=True)
     (tmp_path / "tests/test_short.py").write_text("import time\ndef test_a(): time.sleep(0.3)\n")
     (tmp_path / "tests/test_long.py").write_text("import time\ndef test_b(): time.sleep(0.9)\n")
@@ -568,7 +607,7 @@ def test_a_tasks_rows_share_its_wall_time_by_their_tests_times(ci, tmp_path):
     rows = {row["name"]: row["seconds"] for row in json.loads(out.read_text())["rows"]}
     short, long = rows["3.12:tests/test_short.py"], rows["3.12:tests/test_long.py"]
     assert 1.2 < short + long <= wall
-    assert long / short == pytest.approx(3.0, rel=0.25)
+    assert short < long
 
 
 def test_a_task_reuses_a_green_row_only_on_the_cpu_class_and_inputs_it_ran_on(ci, tmp_path, monkeypatch,

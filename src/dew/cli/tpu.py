@@ -348,9 +348,10 @@ class Create(Named):
         if disk:
             source = f"projects/{_project(gcloud, cfg)}/zones/{zone}/disks/{disk}"
             args.append(f"--data-disk=mode=read-write,source={source}")
-            args.append(f"--metadata-from-file=startup-script={_startup_script()}")
+            args.append(f"--metadata-from-file=startup-script={_startup_script(gcloud.dry_run)}")
         gcloud.run(gcloud.argv(*args), capture=False, check=True)
-        config.cache_zone(self.name, zone)
+        if not gcloud.dry_run:
+            config.cache_zone(self.name, zone)
 
         tpu = Tpu(gcloud, self.name, zone, cfg.ssh_user)
         emit(f"{self.name} in {zone}: {api_type} on {config.worker_count(kind)} worker(s)")
@@ -358,11 +359,13 @@ class Create(Named):
         return 0
 
 
-def _startup_script() -> Path:
-    """The data disk mount script, on disk because gcloud reads it from a file."""
+def _startup_script(dry_run: bool) -> Path:
+    """The data disk mount script, on disk because gcloud reads it from a file; a dry run names
+    the file without writing it."""
     path = config.config_dir() / "disk-startup.sh"
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(tpu_setup.disk_startup_script())
+    if not dry_run:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(tpu_setup.disk_startup_script())
     return path
 
 
@@ -652,8 +655,9 @@ class Setup(Named):
             git_key=self.git_key is not None,
         )
         path = config.config_dir() / f"setup-{self.name}.sh"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(script)
+        if not gcloud.dry_run:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(script)
 
         copy = gcloud.run(tpu.scp_argv([str(path)], f"{tpu.host}:~/dew-setup.sh", worker="all"),
                           capture=False)

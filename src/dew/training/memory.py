@@ -325,6 +325,14 @@ def strands_temporaries(platform: str, memory: Mapping[str, int]) -> bool:
     return memory['pool_bytes'] >= memory['bytes_limit'] and partitioning.lower() not in ('false', '0')
 
 
+def temporaries_factor(mesh: Mesh) -> int:
+    """How many times its temporaries a step needs room for on this process's tightest device of
+    `mesh` (`strands_temporaries`): 2 where an allocator can strand them, else 1."""
+    local = [device for device in mesh.devices.flat if device.process_index == jax.process_index()]
+    return max((2 if (memory := device.memory_stats()) is not None
+                and strands_temporaries(device.platform, memory) else 1) for device in local)
+
+
 def fits_everywhere(headroom: int | None) -> bool:
     """Whether every process's headroom is non-negative, with the same answer on every process.
 
