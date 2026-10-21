@@ -432,18 +432,25 @@ def packed(weights: dict[str, float], count: int) -> list[tuple[float, list[str]
 
 
 def one_wave(timings: dict, pool: int) -> float:
-    """The least whole-second target whose plan runs as one wave on `pool` containers: no more tasks
-    than containers, so no task waits for another to free its container. Train 22's suite, 212 tasks
-    of about a set 240 s target on 160 containers, ran as two waves in 10:10. It is no less than the
-    heaviest recorded test, which no cut divides."""
-    heaviest = max((max(tests) for tests in recorded_tests().values() if tests), default=1.0)
-    low = high = max(math.ceil(heaviest), 1)
-    while len(plan(high, timings)) > pool:
-        low, high = high + 1, high * 2
-    while low < high:
-        middle = (low + high) // 2
-        low, high = (low, middle) if len(plan(middle, timings)) <= pool else (middle + 1, high)
-    return float(low)
+    """The target whose plan runs as one wave on `pool` containers, no more tasks than containers, so
+    no task waits for another to free its container: train 22's suite, 212 tasks of about a set 240 s
+    target on 160 containers, ran as two waves in 10:10. From the heaviest recorded test, which no cut
+    divides, the target rises to the plan's work over the containers its shrinkable tasks have: all
+    but the files nothing has timed, which each run alone, and the collect tasks. Where those alone
+    fill the pool, or the work packs no further, one wave cannot hold the suite, and the plan runs at
+    the target it reached, in waves."""
+    target = float(max(math.ceil(max((max(tests) for tests in recorded_tests().values() if tests),
+                                      default=1.0)), 1))
+    while True:
+        entries = plan(target, timings)
+        shrinkable = [entry for entry in entries if entry["split"] != COLLECT and not entry.get("untimed")]
+        fixed, work = len(entries) - len(shrinkable), sum(entry["weight"] for entry in shrinkable)
+        if len(entries) <= pool or fixed >= pool or target >= work:
+            if len(entries) > pool:
+                print(f"one wave cannot hold the plan: {len(entries)} tasks on {pool} containers at a "
+                      f"{target:.0f} s target", file=sys.stderr)
+            return target
+        target = float(max(target + 1, math.ceil(work / (pool - fixed))))
 
 
 def plan(target: float, timings: dict) -> list[dict]:
@@ -462,6 +469,7 @@ def plan(target: float, timings: dict) -> list[dict]:
         timed = weights(files, timings, python)
         tasks: list[tuple[list[str], str, float]] = [
             ([name], "", target) for name, seconds in timed.items() if seconds is None]
+        untimed = len(tasks)
         for name, seconds in timed.items():
             if seconds is not None and seconds > target:
                 at, count = measured_cut(timings, python, name) or (seconds, 1)
@@ -477,9 +485,10 @@ def plan(target: float, timings: dict) -> list[dict]:
             tasks += [(names, "", held) for held, names in packed({name: light[name] for name in family},
                                                                   count) if names]
         for index, (names, group, weight) in enumerate(tasks, start=1):
-            entries.append({"name": f"{python}-{index}", "python": python, "tests": " ".join(names),
-                            "split": group, "rows": [row(python, name, group) for name in names],
-                            "weight": weight, "cache": cache})
+            entry = {"name": f"{python}-{index}", "python": python, "tests": " ".join(names), "split": group,
+                     "rows": [row(python, name, group) for name in names], "weight": weight, "cache": cache}
+            # A file nothing has timed runs alone whatever the target (`one_wave` counts it so).
+            entries.append(entry | {"untimed": True} if index <= untimed else entry)
     rest = [] if cache == "off" else [name for name in every if name not in NEWEST_FILES]
     for index in range(COLLECT_TASKS if rest else 0):
         names = rest[index::COLLECT_TASKS]
