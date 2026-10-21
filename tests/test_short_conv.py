@@ -375,9 +375,11 @@ def test_the_conv_keeps_the_kernel_contract_on_a_mesh_that_splits_rows(axis):
     from sharded import assert_runs_per_shard
 
     def draw(seed):
-        x, weights, shift, valid = operands(4, 48, DELTA, dtype=jnp.float32, bias=True, valid=True, seed=seed)
-        return (x, weights, shift, valid, documents(4, 48, seed=seed + 2),
-                *cotangents(x, DELTA, jnp.float32, seed=seed + 1))
+        # Each role's stream its own: a draw's cotangents never replay another draw's input.
+        x, weights, shift, valid = operands(4, 48, DELTA, dtype=jnp.float32, bias=True, valid=True,
+                                            seed=3 * seed)
+        return (x, weights, shift, valid, documents(4, 48, seed=3 * seed + 2),
+                *cotangents(x, DELTA, jnp.float32, seed=3 * seed + 1))
 
     def gradients(x, weights, shift, valid, segments, *grads):
         return run(causal_conv1d, x, weights, shift, valid, DELTA, jnp.float32, grads, segments=segments)
