@@ -101,5 +101,6 @@ def staged(directory: Path) -> Iterator[Path]:
 
 
 def _beside(target: Path, suffix: str) -> Path:
-    """A name in `target`'s directory that no other write uses."""
-    return target.with_name(f".{target.name}.{secrets.token_hex(8)}{suffix}")
+    """A name in `target`'s directory that no other write uses, named apart from `target`'s own, so a
+    target whose name is as long as the filesystem allows has a temporary too."""
+    return target.with_name(f".dew-{secrets.token_hex(8)}{suffix}")
