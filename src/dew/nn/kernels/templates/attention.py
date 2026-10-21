@@ -290,8 +290,9 @@ class Hooks:
     """The template's hooks, each absent where None: `score_mod(s, q_pos, k_pos, *params)` on the scaled
     logits `s` `[..., q, k]` with `q_pos` `[q, 1]` and `k_pos` `[1, k]` the entries' query and key
     indices, pointwise in the entries; `initial` the softmax's start; `output_mod(o, *params)` on the
-    normalized output `[..., q, Dv]`. A pytree whose callables are static and whose parameters and state
-    are its leaves, so a compiled call takes new values of them."""
+    normalized output `[..., q, Dv]`, pointwise in its entries too (a gate, a scale): a kernel applies it
+    to an output tile whose head width pads to a power of two. A pytree whose callables are static and
+    whose parameters and state are its leaves, so a compiled call takes new values of them."""
 
     score_mod: Callable | None = dataclasses.field(default=None, metadata={"static": True})
     score_params: tuple[Param, ...] = ()
@@ -348,11 +349,11 @@ def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
     fp64 inputs), the scale and `score_mod` on the fp32 logits, the softmax from `hooks.initial` in fp32
     (or the wider of the inputs' and the state's dtypes), the probabilities rounded to the values' dtype
     for their product, the output normalized in fp32 and `output_mod` applied before it rounds to the
-    query's dtype. A query that sees no key and starts from
-    no state gives zeros. With `residuals`, also each query's running maximum `m` and denominator `total`
-    `[B, H, Q]` (natural log, unnormalized), fp32, a query that sees no key and starts from no state
-    holding 0 for both, so every residual is finite; a softmax resumed from them (`Initial`) starts such
-    a query from `m = -inf`. No hooks where `hooks` is None."""
+    query's dtype. A query that sees no key and starts from no state gives zeros. With `residuals`, also
+    each query's running maximum `m` and denominator `total` `[B, H, Q]` (natural log, unnormalized), in
+    the softmax's dtype, a query that sees no key and starts from no state holding 0 for both, so every
+    residual is finite; a softmax resumed from them (`Initial`) starts such a query from `m = -inf`. No
+    hooks where `hooks` is None."""
     hooks = Hooks() if hooks is None else hooks
     batch, queries, heads, _ = query.shape
     kv_heads = key.shape[2]
@@ -386,4 +387,4 @@ def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
     rows = jnp.arange(batch)
     out, m, total = jax.vmap(jax.vmap(one, in_axes=(None, 0)), in_axes=(0, None))(rows, jnp.arange(heads))
     out = jnp.swapaxes(out, 1, 2)
-    return (out, m.astype(jnp.float32), total.astype(jnp.float32)) if residuals else out
+    return (out, m, total) if residuals else out
