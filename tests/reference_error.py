@@ -285,12 +285,12 @@ def _status(ratio: float, low: float, high: float, *, contained: bool = True) ->
     one. Straddling PARITY and wider than it, the leaf is inconclusive, as is a ratio or end that is not
     a number. Not `contained`, the rule before 2026-10-21: the interval as it is, a leaf over PARITY
     by its ratio wherever the interval does not straddle it unresolved."""
-    if not all(np.isfinite(value) for value in (ratio, low, high)):
-        return "inconclusive"
     if not contained:
         if low <= PARITY < high and not _resolves(low, high):
             return "inconclusive"
         return "over" if ratio > PARITY else "pass"
+    if not all(np.isfinite(value) for value in (ratio, low, high)):
+        return "inconclusive"
     low, high = min(low, ratio), max(high, ratio)
     if high <= PARITY:
         return "pass"
@@ -531,8 +531,8 @@ def _staged(drawn, seeds: int, label: str, *, two_stage: bool = True) -> tuple[l
     if two_stage:
         further = any(_judgement(draws, label, tails))
     else:
-        further = any(np.sum(draws.theirs[:, index]) > 0 and draws.finite[:, index].all()
-                      and _judged(draws, index, tails)[0] > PARITY for index in range(len(draws.names)))
+        further = any(np.sum(draws.theirs[:, index]) > 0 and _judged(draws, index, tails)[0] > PARITY
+                      for index in range(len(draws.names)))
     if further:
         draws = draws.joined(drawn(seeds, (1 + REDRAW) * seeds))
     return (*_judgement(draws, label, tails, contained=two_stage), 2 if further else 1)
