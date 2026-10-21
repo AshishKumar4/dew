@@ -17,7 +17,6 @@ from reference_error import (
     assert_as_exact,
     assert_as_exact_as_the_reference,
     assert_rounds_where_the_reference_does,
-    seeds_for,
 )
 from tool_support import load as load_tool
 
@@ -241,6 +240,11 @@ def test_a_shared_loop_cache_takes_each_prompt_whole(options):
         Server.from_task(greedy('last_loop'), slots=2, capacity=32, **options)
 
 
+DORY_GRADIENT_SEEDS = {'trained': 32, 'truncated': 64}
+"""Declared seeds for check 1, sized by `seeds_for` on armada, 2026-10-20: the live torch reference's
+six checkpoint gradients, through every pass or through the last pass alone."""
+
+
 @pytest.mark.parametrize(('name', 'loops', 'backprop_steps'), [('trained', 2, None), ('truncated', 3, 1)])
 def test_the_gradient_of_each_tensor_is_the_references(name, loops, backprop_steps):
     """The gradient of a loss over the logits in the embeddings, an input layer's output-gate
@@ -272,7 +276,7 @@ def test_the_gradient_of_each_tensor_is_the_references(name, loops, backprop_ste
     def torch_gradients(ids, cotangent):
         dtype = TOOL.torch.float64 if cotangent.dtype == np.float64 else TOOL.torch.float32
         reference = TOOL.DoryReference(loaded.config, tensors, dtype, loops=loops)
-        return reference.gradients(np.asarray(ids), np.asarray(cotangent), TOOL.GRADIENTS, cut=cut)
+        return reference.gradients(np.array(ids), np.array(cotangent), TOOL.GRADIENTS, cut=cut)
 
     def reference(ids, cotangent):
         return jax.pure_callback(torch_gradients, shapes(cotangent.dtype), ids, cotangent)
@@ -286,9 +290,7 @@ def test_the_gradient_of_each_tensor_is_the_references(name, loops, backprop_ste
 
     dew, reference = jax.jit(dew), jax.jit(reference)
     label = f'Dory {name} gradients'
-    seeds = seeds_for(reference, draw, label)
-    print(f'SIZED {label}: {seeds}', flush=True)
-    assert_as_exact(dew, reference, draw, label, seeds=seeds)
+    assert_as_exact(dew, reference, draw, label, seeds=DORY_GRADIENT_SEEDS[name])
 
 
 def test_a_cut_loop_trains_the_layers_before_it_through_the_input_every_pass_reads():
