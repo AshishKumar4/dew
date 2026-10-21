@@ -97,7 +97,7 @@ from dew.data.plan import Manifest
 from dew.data.readers import _FillShare
 from dew.data.sources.base import Read, Shard, ShardManifest, Source
 from dew.data.steps.generic import Fields
-from dew.data.steps.text import ValidTargets, recounted
+from dew.data.steps.text import LayoutRule, ValidTargets, recounted
 from dew.data.text import Chunks
 from dew.data.tokens import _WrappingDataset
 from dew.records import integer, integers, record, strings
@@ -467,6 +467,46 @@ def _packed(documents: pygrain.IterDataset, stage: Pack) -> pygrain.IterDataset:
     # windows do (`packed_window`), so Grain writes no copy of them for the rest.
     return packer(documents, length_struct=sizes, num_packing_bins=stage.bins, shuffle_bins=False,
                   max_sequences_per_bin=stage.segments, meta_features=stage.fields[1:])
+
+
+class _Ruled(pygrain.IterDataset):
+    """The windows a pack or windows stage makes of `documents`, each counted by the one rule its
+    documents' targets were counted by (`CountRule`), as a memory read counts them
+    (`materialize._targeted`): a document's count describes no window."""
+
+    def __init__(self, documents: pygrain.IterDataset, stage: Pack | Windows):
+        super().__init__(documents)
+        self._documents, self._stage = documents, stage
+
+    def __iter__(self) -> pygrain.DatasetIterator:
+        from dew.data.steps.windows import CausalWindows
+
+        seen = LayoutRule()
+        documents = self._documents.map(seen)
+        windows = (_packed(documents.map(Fields(self._stage.packed)), self._stage)
+                   if isinstance(self._stage, Pack) else CausalWindows(documents, self._stage))
+        return _RuledIterator(iter(windows), seen, self._stage.fields[0])
+
+
+class _RuledIterator(pygrain.DatasetIterator):
+    def __init__(self, windows: pygrain.DatasetIterator, seen: LayoutRule, field: str):
+        super().__init__(windows)
+        self._windows, self._seen, self._field = windows, seen, field
+
+    def __next__(self) -> Batch:
+        window = next(self._windows)
+        return window if self._seen.rule is None else self._seen.rule.counted(window, self._field)
+
+    def get_state(self) -> Mapping[str, object]:
+        return {"windows": self._windows.get_state(), "rule": self._seen.state()}
+
+    def set_state(self, state: Mapping[str, object]) -> None:
+        # The rule first: a packer restored reads its held documents again.
+        self._seen.restore(record(state["rule"], "layout count rule"))
+        self._windows.set_state(record(state["windows"], "layout windows"))
+
+    def close(self) -> None:
+        self._windows.close()
 
 
 class _Concatenated(pygrain.IterDataset):
@@ -873,14 +913,8 @@ class _Build:
             if not isinstance(rows, pygrain.MapDataset):
                 raise ValueError(f"token split in {_name(pipeline)} needs a finite indexed order")
             rows = _TokenSplit(rows, stage)
-        elif isinstance(stage, Pack):
-            rows = self.targeted(_packed(_as_iter(rows, self.loading).map(Fields(stage.packed)), stage),
-                                 stage.fields[0], pipeline)
-        elif isinstance(stage, Windows):
-            from dew.data.steps.windows import CausalWindows
-
-            windows = CausalWindows(_as_iter(rows, self.loading), stage)
-            rows = self.targeted(windows, stage.fields[0], pipeline)
+        elif isinstance(stage, (Pack, Windows)):
+            rows = self.targeted(_Ruled(_as_iter(rows, self.loading), stage), stage.fields[0], pipeline)
         elif isinstance(stage, Artifact):
             if not isinstance(rows, pygrain.MapDataset) or isinstance(pipeline.source, (Mixture, Phases)):
                 raise ValueError("a cache belongs on each corpus's indexed rows, before mix and interleave")

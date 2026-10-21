@@ -35,6 +35,7 @@ cp "$here/upstream/csrc/cutlass/LICENSE.txt" "$stage/LICENSE.cutlass"
 cp "$here/upstream3/csrc/cutlass/LICENSE.txt" "$stage/LICENSE.cutlass-flash-attn3"
 cp "$here/LICENSE.openxla" "$stage/LICENSE.openxla"
 sed -i "s/dew-flash-attn-cuXX/dew-flash-attn-cu$major/" "$stage/pyproject.toml"
+"$python" -m pip install --quiet -r "$here/../../tools/pip.txt"
 "$python" -m pip wheel --quiet --no-deps --wheel-dir "$stage/wheel" "$stage"
 "$python" -m pip install --quiet "wheel>=0.43"
 "$python" -m wheel tags --remove --python-tag py3 --abi-tag none --platform-tag manylinux_2_28_x86_64 \
