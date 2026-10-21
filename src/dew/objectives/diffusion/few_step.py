@@ -189,22 +189,26 @@ class MeanFlowObjective(DiffusionObjective):
         self.guidance_interval = guidance_interval
         self.norm_p, self.norm_eps = norm_p, norm_eps
 
-    def _draws(self, key, count: int, shape) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
-        """The loss's randomness: two training times per row, the noise, and a
-        uniform per row, whose count under `unconditional_prob` is how many
-        rows drop their condition."""
-        later, earlier, noise, dropping = jax.random.split(key, 4)
+    def _draws(self, step: Step, count: int, shape) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+        """The loss's randomness, each row's its example's own (`Step.sample`): two training times per
+        row, the noise, and a uniform per row, whose count under `unconditional_prob` is how many rows
+        drop their condition."""
         schedule = self.process.schedule
-        return (schedule.sample_t(later, count), schedule.sample_t(earlier, count),
-                jax.random.normal(noise, shape, dtype=jnp.float32), jax.random.uniform(dropping, (count,)))
+
+        def time(key):
+            return schedule.sample_t(key, 1)[0]
+
+        return (step.sample("times", time, rows=count), step.sample("earlier times", time, rows=count),
+                step.sample("noise", jax.random.normal, shape[1:], dtype=jnp.float32, rows=count),
+                step.sample("condition dropout", jax.random.uniform, (), dtype=jnp.float32, rows=count))
 
     def loss(self, variables, batch, step: Step):
-        encode_key, condition_key, draw_key, dropout_key = jax.random.split(step.key, 4)
+        encode_key, condition_key, _, dropout_key = jax.random.split(step.key, 4)
         samples = self.clean_samples(variables, batch, encode_key)
         count = samples.shape[0]
         schedule = self.process.schedule
         given, blank = self._conditions(variables, batch, condition_key)
-        first, second, noise, uniform = self._draws(draw_key, count, samples.shape)
+        first, second, noise, uniform = self._draws(step, count, samples.shape)
         t, r = intervals(first, second, self.instantaneous)
         z, _, v = self.process.prediction.forward_diffusion(
             samples, noise, broadcast_rates(schedule, t, samples)
@@ -270,16 +274,19 @@ class ShortcutObjective(DiffusionObjective):
         _interval_velocity(self.model, self.process, "a shortcut model", "presets.Shortcut")
         self.sections, self.bootstrap_every = sections, bootstrap_every
 
-    def _draws(self, key, count: int, grid: jax.Array, shape) -> tuple[jax.Array, jax.Array, jax.Array]:
-        """The loss's randomness: each row's time index below its `grid`, the
-        noise, and whether a flow-matching row drops its condition."""
-        times, noise, dropping = jax.random.split(key, 3)
-        return (jax.random.randint(times, (count,), 0, grid.astype(jnp.int32)),
-                jax.random.normal(noise, shape, dtype=jnp.float32),
-                jax.random.bernoulli(dropping, self.unconditional_prob, (count,)))
+    def _draws(self, step: Step, count: int, grid: jax.Array, shape
+               ) -> tuple[jax.Array, jax.Array, jax.Array]:
+        """The loss's randomness, each row's its example's own (`Step.sample`): each row's time index
+        below its `grid`, the noise, and whether a flow-matching row drops its condition."""
+        uniform = step.sample("time index", jax.random.uniform, (), dtype=jnp.float32, rows=count)
+        probability = jnp.float32(self.unconditional_prob)
+        return (jnp.floor(uniform * grid).astype(jnp.int32),
+                step.sample("noise", jax.random.normal, shape[1:], dtype=jnp.float32, rows=count),
+                step.sample("condition dropout", lambda key: jax.random.bernoulli(key, probability),
+                            rows=count))
 
     def loss(self, variables, batch, step: Step):
-        encode_key, condition_key, draw_key, dropout_key = jax.random.split(step.key, 4)
+        encode_key, condition_key, _, dropout_key = jax.random.split(step.key, 4)
         samples = self.clean_samples(variables, batch, encode_key)
         count = samples.shape[0]
         rows = count // self.bootstrap_every
@@ -288,7 +295,7 @@ class ShortcutObjective(DiffusionObjective):
 
         levels = shortcut_levels(rows, self.sections)
         grid = jnp.concatenate([2.0 ** levels, jnp.full((count - rows,), float(self.sections))])
-        index, noise, dropping = self._draws(draw_key, count, grid, samples.shape)
+        index, noise, dropping = self._draws(step, count, grid, samples.shape)
         # Data at t = index / grid in the reference's time, on its path; Dew's sigma is 1 - t.
         t = index / grid
         sigma = 1 - t

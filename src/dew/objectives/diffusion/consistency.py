@@ -329,19 +329,24 @@ class ConsistencyDistillationObjective(FlowDistillationObjective):
         return jnp.arctan(rf / (1 - rf))
 
     def _draws(self, step: Step, count: int, shape) -> _Draws:
-        """Every random value the step at `step` reads, from its key."""
-        keys = jax.random.split(step.key, 7)
+        """Every random value the step at `step` reads, each row's its example's own (`Step.sample`)."""
         simulated = self.max_simulation_steps - 1
+        row = shape[1:]
+
+        def normal(name, *dims):
+            return step.sample(name, jax.random.normal, dims, dtype=jnp.float32, rows=count)
+
         return _Draws(
-            consistency_time=(jax.random.uniform(keys[0], (count,))
-                              if self.consistency == "discrete"
-                              else jax.random.normal(keys[0], (count,))),
-            consistency_noise=jax.random.normal(keys[1], shape),
-            start=jax.random.normal(keys[2], shape),
-            simulation_times=jax.random.normal(keys[3], (simulated, count)),
-            simulation_noises=jax.random.normal(keys[4], (simulated, *shape)),
-            critic_time=jax.random.normal(keys[5], (count,)),
-            critic_noise=jax.random.normal(keys[6], shape))
+            consistency_time=(step.sample("consistency time", jax.random.uniform, (), dtype=jnp.float32,
+                                          rows=count)
+                              if self.consistency == "discrete" else normal("consistency time")),
+            consistency_noise=normal("consistency noise", *row),
+            start=normal("start", *row),
+            # Each example's simulation draws, laid out step first as the walk reads them.
+            simulation_times=normal("simulation times", simulated).T,
+            simulation_noises=jnp.moveaxis(normal("simulation noises", simulated, *row), 0, 1),
+            critic_time=normal("critic time"),
+            critic_noise=normal("critic noise", *row))
 
     def _generated(self, student_params, given, draws: _Draws, iteration) -> jax.Array:
         """The student's DMD2 sample: `max_simulation_steps` noisings drawn,
