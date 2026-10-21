@@ -30,9 +30,13 @@ class CrossDocuments(NamedTuple):
 
 def document_ids(segment_ids) -> tuple[jax.Array, jax.Array]:
     """The query's and the key's ids of `segment_ids`, one `[B, S]` array of a
-    call's own documents or a `CrossDocuments`."""
+    call's own documents or a `CrossDocuments`, the two in one dtype (their
+    promotion), so an id names one document on both sides however it is
+    ordered."""
     if isinstance(segment_ids, CrossDocuments):
-        return jnp.asarray(segment_ids.query), jnp.asarray(segment_ids.key)
+        queries, keys = jnp.asarray(segment_ids.query), jnp.asarray(segment_ids.key)
+        common = jnp.promote_types(queries.dtype, keys.dtype)
+        return queries.astype(common), keys.astype(common)
     return jnp.asarray(segment_ids), jnp.asarray(segment_ids)
 
 
