@@ -11,6 +11,7 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
+from reference_error import widened
 
 
 def drawn_ids(vocab_size: int, seed: int) -> dict[str, np.ndarray]:
@@ -21,6 +22,15 @@ def drawn_ids(vocab_size: int, seed: int) -> dict[str, np.ndarray]:
 
     rng = np.random.default_rng([0x1D5, vocab_size, seed])
     return {"input_ids": rng.integers(0, vocab_size, (BATCH, LENGTH)).astype(np.int32)}
+
+
+def float64_logits(loaded):
+    """The logits of `loaded` (a `Pretrained`) cloned to float64, its weights widened once, as a function
+    of a draw (`drawn_ids`) run where x64 is enabled: a recorded decoder's float64 truth, which its
+    recording's sketch holds."""
+    model = loaded.model.clone(dtype=jnp.float64, attention_impl="reference")
+    variables = widened(loaded.variables)
+    return lambda inputs: {"logits": model.apply(variables, jnp.asarray(inputs["input_ids"]))}
 
 
 def extract_fixture(archive: Path, directory: Path) -> Path:
