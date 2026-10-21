@@ -138,11 +138,10 @@ def test_the_shared_dot_preserves_narrow_products_with_fp32_accumulation():
 
 @pytest.mark.parametrize("target", ["sm80", "sm89", "sm120"])
 def test_every_declared_kernel_config_compiles_on_tritons_compiler_within_its_block(target):
-    """Each declared config at each declared shape, lowered as on the GPU and compiled by pip's Triton
-    for its capability on this CPU (tests/kernel_compile.py): it compiles, to no more shared memory
+    """Each declared config at each declared shape, lowered as on the GPU and compiled by XLA's CUDA backend
+    for a compile-only device on this CPU (tests/kernel_compile.py): it compiles, to no more shared memory
     than its GPU's block holds. A kernel that does not compile (a two-result inline asm, a mixed-dtype
     dot) fails here and never reaches a GPU."""
-    pytest.importorskip("triton")
     found = compile_kernels(support.kernel_cases(target), target)
     assert found, "the compile gate must not be vacuous"
     assert not failures(found), "\n".join(failures(found))
@@ -151,9 +150,8 @@ def test_every_declared_kernel_config_compiles_on_tritons_compiler_within_its_bl
 @pytest.mark.parametrize("target", ["sm80", "sm89", "sm120"])
 def test_kimi_delta_attentions_kernels_compile_on_tritons_compiler_within_each_gpus_block(target):
     """Every kernel of the port's forward and backward at the training shape, lowered as on the GPU and
-    compiled by pip's Triton for its capability on this CPU (tests/kernel_compile.py), within the
-    compile bound and the block's shared memory."""
-    pytest.importorskip("triton")
+    compiled by XLA's CUDA backend for a compile-only device on this CPU (tests/kernel_compile.py), within
+    the compile bound and the block's shared memory."""
     found = compile_kernels(kda_training_cases(), target)
     assert len(found) == 2
     assert not failures(found), "\n".join(failures(found))
@@ -161,10 +159,9 @@ def test_kimi_delta_attentions_kernels_compile_on_tritons_compiler_within_each_g
 
 @pytest.mark.parametrize("target", ["sm80", "sm89", "sm120"])
 def test_the_short_convs_kernels_compile_on_tritons_compiler_within_each_gpus_block(target):
-    """Each of the short conv's training cases lowered as on the GPU and compiled by pip's Triton for its
-    capability on this CPU (tests/kernel_compile.py), within the compile bound and the block's shared
-    memory."""
-    pytest.importorskip("triton")
+    """Each of the short conv's training cases lowered as on the GPU and compiled by XLA's CUDA backend for a
+    compile-only device on this CPU (tests/kernel_compile.py), within the compile bound and the block's
+    shared memory."""
     found = compile_kernels(conv_training_cases(), target)
     assert len(found) == 2 * len(CONV_SHAPES) + 2
     assert not failures(found), "\n".join(failures(found))
@@ -175,7 +172,6 @@ def test_every_short_conv_config_compiles_on_tritons_compiler_within_each_gpus_b
     """Each config the tuner may give either launch of the short conv (`short_conv.TILES`,
     `short_conv.WALKS`), pinned at the 9B's packed delta conv, compiled for each GPU within the compile
     bound and the block's shared memory."""
-    pytest.importorskip("triton")
     found = compile_kernels(conv_config_cases(), target)
     assert len(found) == len(short_conv.TILES) + len(short_conv.WALKS)
     assert not failures(found), "\n".join(failures(found))
