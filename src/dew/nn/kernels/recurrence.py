@@ -60,12 +60,14 @@ class OutputNorm:
 @dataclasses.dataclass(frozen=True)
 class Hooks:
     """A step's static form, which enters its launch's key: the prologue's conv, the queries' and
-    keys' l2 norm (and the queries' `Dk^-1/2` scale), the decay's kind ('none', 'scalar' a head,
-    'vector' a key dimension), the gates, the delta rule, whether a write gate `beta` scales what the
-    token writes (always under the delta rule or the gates; without them, an input gate, else one),
-    a skip `D v`, and the epilogue."""
+    keys' l2 norm, the queries' `scale` (in working precision; under the l2 norm `Dk^-1/2` where None,
+    else none where None), the decay's kind ('none', 'scalar' a head, 'vector' a key dimension), the
+    gates, the delta rule, whether a write gate `beta` scales what the token writes (always under the
+    delta rule or the gates; without them, an input gate, else one), a skip `D v`, and the epilogue.
+    The chunked op (`recurrence_chunk.chunk`) takes the same form."""
     conv: Conv | None = None
     l2norm: bool = False
+    scale: float | None = None
     decay: str = 'vector'
     gates: Gates | None = None
     delta: bool = True
@@ -223,7 +225,9 @@ def _prologue(hooks: Hooks, given: dict, work):
     if hooks.l2norm:
         query, key = (x * jax.lax.rsqrt(jnp.sum(x * x, axis=-1, keepdims=True) + L2NORM_EPS)
                       for x in (query, key))
-        query = query * key_width ** -0.5
+        query = query * (key_width ** -0.5 if hooks.scale is None else hooks.scale)
+    elif hooks.scale is not None:
+        query = query * hooks.scale
     group = value_heads // query.shape[1]
     query, key = (jnp.repeat(x, group, axis=1) for x in (query, key))
     return query, key, value, history
@@ -307,9 +311,11 @@ def _kernel(*refs, hooks: Hooks, group: int, key_heads: int, interpret: bool):
         if hooks.l2norm:
             query, key = (x[None] for x in (query, key))
             query = query * short_conv._inverse_norm(query, L2NORM_EPS, interpret=interpret)
-            query = query * key_width ** -0.5
+            query = query * (key_width ** -0.5 if hooks.scale is None else hooks.scale)
             key = key * short_conv._inverse_norm(key, L2NORM_EPS, interpret=interpret)
             query, key = query[0], key[0]
+        elif hooks.scale is not None:
+            query = query * hooks.scale
         if hooks.gates is not None:
             decay = jnp.exp(_gated_decay(scalar('gate'), scalar('log_a'), scalar('bias')))
             write_gate = short_conv._sigmoid(scalar('beta'), interpret=interpret)
