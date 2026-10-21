@@ -36,6 +36,8 @@ RELEASES: Mapping[str, Mapping[str, str]] = {
     "ouro": {"transformers": "4.56.2"},
     "timm": {"timm": "1.0.29"},
     "torch": {"torch": "2.14.0"},
+    # GPT-OSS's exchange gradients, recorded on torch's CPU build (gpt_oss_reference.write_exchange_cases).
+    "gpt-oss-exchange": {"transformers": "5.16.1", "torch": "2.14.0"},
     # fla's kernels and Qwen3.5's fla path, in their own environment (joint_checkpoint_reference.on_fla).
     "fla": {"torch": "2.8.0", "transformers": "5.16.1", "fla-core": "0.5.2"},
     "diffusers": {"diffusers": tested("diffusers")},

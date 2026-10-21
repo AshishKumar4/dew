@@ -857,7 +857,7 @@ def siglip_tiny_system(seed: int = 1234, text_width: int = 16, mm_tokens: int = 
         hidden_size=32, intermediate_size=64, num_hidden_layers=2,
         num_attention_heads=4, image_size=28, patch_size=14, num_channels=3,
         hidden_act="gelu_pytorch_tanh", layer_norm_eps=1e-6)
-    system = ran_vision_tiny(SiglipVisionModel, vconf, lambda: Gemma3MultiModalProjector(Gemma3Config(
+    system = run_vision_tiny(SiglipVisionModel, vconf, lambda: Gemma3MultiModalProjector(Gemma3Config(
         text_config=Gemma3TextConfig(hidden_size=text_width),
         vision_config=vconf, mm_tokens_per_image=mm_tokens)), seed)
     return {**system, "text_width": text_width, "mm_tokens": mm_tokens}
@@ -875,12 +875,12 @@ def llama4_vision_tiny_system(seed: int = 1234, text_width: int = 32):
         pixel_shuffle_ratio=0.5, projector_input_dim=64, projector_output_dim=64,
         vision_output_dim=64, vision_feature_select_strategy="default",
         attention_dropout=0.0, projector_dropout=0.0)
-    system = ran_vision_tiny(Llama4VisionModel, vconf, lambda: Llama4MultiModalProjector(SimpleNamespace(
+    system = run_vision_tiny(Llama4VisionModel, vconf, lambda: Llama4MultiModalProjector(SimpleNamespace(
         vision_config=vconf, text_config=SimpleNamespace(hidden_size=text_width))), seed)
     return {**system, "text_width": text_width}
 
 
-def ran_vision_tiny(tower_class, vconf, projector_of, seed: int) -> dict:
+def run_vision_tiny(tower_class, vconf, projector_of, seed: int) -> dict:
     """The tower `tower_class(vconf)` and the projector `projector_of()` builds, their weights
     scattered from `seed` and `seed + 1`, in fp32 eval mode, with their fp32 outputs on the fixed
     pixels: what the tiny vision systems above share."""
@@ -1232,9 +1232,9 @@ GEMMA4_MM_TEXT: Dict[str, Any] = dict(
                            "partial_rotary_factor": 0.25},
         "sliding_attention": {"rope_type": "default", "rope_theta": 1e4}})
 
-def released_wrapper(vision: dict[str, torch.nn.Module], text: torch.nn.Module) -> dict[str, torch.Tensor]:
-    """A wrapper's tensors as its release names them: each vision part's under its `model.*`
-    prefix, the decoder half's under model.language_model.* and the tied head top-level, as the
+def wrapper_tensors(vision: dict[str, torch.nn.Module], text: torch.nn.Module) -> dict[str, torch.Tensor]:
+    """A wrapper's tensors as its release names them: each vision part's under the prefix its key
+    names, the decoder half's under model.language_model.* and the tied head top-level, as the
     released layout carries it."""
     merged = {f"{prefix}.{name}": tensor
               for prefix, part in vision.items() for name, tensor in part.state_dict().items()}
@@ -1261,7 +1261,7 @@ def write_gemma4_mm_tiny() -> None:
         text_config=Gemma4TextConfig(**GEMMA4_MM_TEXT),
         vision_config=system["vconf"], audio_config=None)).model.language_model
     scatter_weights(text, seed=4321)
-    merged = released_wrapper({"model.vision_tower": system["tower"],
+    merged = wrapper_tensors({"model.vision_tower": system["tower"],
                                "model.embed_vision": system["projector"]}, text)
     directory = FIXTURES / "gemma4-tiny-mm"
     directory.mkdir(parents=True, exist_ok=True)
@@ -1314,7 +1314,7 @@ def write_qwen35_mm_tiny() -> None:
     torch.manual_seed(4321)
     text = Qwen3_5ForCausalLM(Qwen3_5TextConfig(**QWEN35_MM_TEXT)).model
     scatter_weights(text, seed=4321)
-    merged = released_wrapper({"model.visual": system["tower"]}, text)
+    merged = wrapper_tensors({"model.visual": system["tower"]}, text)
     directory = FIXTURES / "qwen35-tiny-mm"
     directory.mkdir(parents=True, exist_ok=True)
     save_file(merged, directory / "model.safetensors")
