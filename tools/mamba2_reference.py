@@ -181,7 +181,9 @@ def write_seeded() -> None:
 
     PYTHONPATH=src:tests:tools JAX_PLATFORMS=cpu python tools/mamba2_reference.py seeded
     """
+    import jax
     from recorded_references import provenance, record_case, save
+    from reference_error import assert_computes_the_oracle, chain_roundings, widened
     from ssd_support import mamba2_draw, mamba2_run
 
     def draw(seed):
@@ -211,16 +213,28 @@ def write_seeded() -> None:
 
     stored = {}
     for site in ("scan", "carried", "step"):
-        def evaluate(inputs, site=site):
+        exact_run = jax.jit(lambda inputs, site=site: mamba2_run(site, inputs))
+        with jax.enable_x64(new_val=True):
+            roundings = chain_roundings(jax.make_jaxpr(exact_run)(widened(draw(0))))
+
+        def evaluate(inputs, site=site, exact_run=exact_run, roundings=roundings):
+            """The reference's fp32 outputs and its torch float64 truth, Dew's float64 path held to that
+            truth at this seed: the recording keeps the reference's evidence alone, and the test's truth
+            is Dew's float64 path (`indexed_recording`'s `truth_fn`)."""
             tensors = {name: torch.from_numpy(value) for name, value in inputs.items()}
             with torch.no_grad():
                 narrow = reference(site, tensors)
                 with float64():
                     exact = reference(site, {name: value.double() for name, value in tensors.items()})
+            with jax.enable_x64(new_val=True):
+                twin = jax.tree.map(np.asarray, exact_run(widened(inputs)))
+            for name, value in exact.items():
+                assert_computes_the_oracle(twin[name], value, f"transformers float64 {site} {name}",
+                                           roundings=roundings)
             return narrow, exact
 
-        stored.update(record_case(site, draw, evaluate,
-                                   lambda inputs, site=site: mamba2_run(site, inputs), store_inputs=False))
+        stored.update(record_case(site, draw, evaluate, lambda inputs, site=site: mamba2_run(site, inputs),
+                                  store_inputs=False, summary=True))
     stored["provenance"] = provenance(
         f"transformers {transformers.__version__}", TRANSFORMERS_REVISION, "cpu",
         "PYTHONPATH=src:tests:tools JAX_PLATFORMS=cpu python tools/mamba2_reference.py seeded",
