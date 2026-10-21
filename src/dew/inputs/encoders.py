@@ -320,6 +320,22 @@ class T5Text(_TextTower):
 
 
 
+def char_codes(texts: Sequence[str], tokens: int, vocab: int) -> dict[str, np.ndarray]:
+    """Each text as `tokens` ids of a `vocab`-row table, behind a start token, with its mask
+    (`CharTable.tokenize`)."""
+    # id 0 is padding and 1 is the start token, so a character takes the
+    # rest of the table: its code point wrapped into the vocabulary above
+    # those two. Two characters that wrap together share a vector, which
+    # a table this small is for.
+    ids = np.zeros((len(texts), tokens), np.int32)
+    mask = np.zeros((len(texts), tokens), np.int32)
+    for row, text in enumerate(texts):
+        codes = [1] + [2 + (ord(char) % (vocab - 2)) for char in text[:tokens - 1]]
+        ids[row, :len(codes)] = codes
+        mask[row, :len(codes)] = 1
+    return {"input_ids": ids, "attention_mask": mask}
+
+
 @dataclass(frozen=True, eq=False)
 class CharTable(ConditionEncoder[str, TextContext]):
     """Encodes text as a table lookup: one id per character, one fixed random
@@ -360,17 +376,7 @@ class CharTable(ConditionEncoder[str, TextContext]):
                    dtype=compute, param_dtype=param_dtype)
 
     def tokenize(self, texts: Sequence[str]) -> dict[str, np.ndarray]:
-        # id 0 is padding and 1 is the start token, so a character takes the
-        # rest of the table: its code point wrapped into the vocabulary above
-        # those two. Two characters that wrap together share a vector, which
-        # a table this small is for.
-        ids = np.zeros((len(texts), self.tokens), np.int32)
-        mask = np.zeros((len(texts), self.tokens), np.int32)
-        for row, text in enumerate(texts):
-            codes = [1] + [2 + (ord(char) % (self.vocab - 2)) for char in text[:self.tokens - 1]]
-            ids[row, :len(codes)] = codes
-            mask[row, :len(codes)] = 1
-        return {"input_ids": ids, "attention_mask": mask}
+        return char_codes(texts, self.tokens, self.vocab)
 
     def conditioning_flops(self, tokens) -> ConditionWork:
         lengths = np.sum(np.asarray(tokens["attention_mask"]) != 0, axis=-1, dtype=np.int64)
