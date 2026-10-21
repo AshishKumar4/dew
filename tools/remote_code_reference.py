@@ -121,6 +121,12 @@ generate cuts blocks of 32, so the blocks the mask keeps apart fit a draw; LLaDA
 blocks are its config's block_size (8)."""
 
 
+DRAWS_A_PROCESS = 40
+"""The draws one process of the release's code runs while recording: a process starts in seconds,
+so a batch of draws keeps the recording a few processes long, and record_case asks for at most five
+times the seeds it plans."""
+
+
 def token_draw(name: str):
     """Seed by seed, a recorded fixture's token ids `[1, length]`: uniform over its vocabulary, half of
     them, drawn apart, the mask id, as a masked-diffusion step reads them."""
@@ -227,7 +233,7 @@ def record(name: str, python: str) -> Path:
         key = inputs["input_ids"].tobytes()
         if key not in outputs:
             first = len(outputs)
-            batch = [draw(seed)["input_ids"] for seed in range(first, first + 40)]
+            batch = [draw(seed)["input_ids"] for seed in range(first, first + DRAWS_A_PROCESS)]
             with tempfile.TemporaryDirectory() as workspace:
                 np.save(Path(workspace) / "ids.npy", np.stack(batch))
                 subprocess.run([python, __file__, name, "--evaluate", workspace], check=True)
@@ -269,10 +275,13 @@ def main() -> None:
         for name in arguments.names:
             print(name, record(name, arguments.python))
         return
+    recorded = sorted(set(arguments.names) & set(RECORDED))
+    if recorded and not arguments.draw:
+        parser.error(f"{recorded} are recorded over seeds: --draw their weights, then --record them")
     with tempfile.TemporaryDirectory() as workspace:
         for name in arguments.names:
             if name in RECORDED:
-                released_model(name, Path(workspace) / name, arguments.draw)
+                released_model(name, Path(workspace) / name, draw=True)
                 continue
             model = released_model(name, Path(workspace) / "fp32", arguments.draw)
             ids = torch.from_numpy(np.load(FIXTURES / name / "input_ids.npy").astype(np.int64))
