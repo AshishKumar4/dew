@@ -48,7 +48,8 @@ from dew.nn.gpt_oss import GptOssMLP
 from dew.nn.inputs import ModelInputs
 from dew.nn.kda import KimiDeltaAttention
 from dew.nn.kernels.generation import assumed
-from dew.nn.linear import GatedDeltaNet, recurrent_delta_rule, recurrent_gated_delta_rule
+from dew.nn.kernels.recurrence_chunk import recurrent_delta_rule
+from dew.nn.linear import GatedDeltaNet, recurrent_gated_delta_rule
 from dew.nn.mixer_base import MixerContext
 from dew.nn.mixers.attention import CausalSelfAttention
 from dew.nn.mixers.gated_delta_net import GatedDeltaNetMixer
