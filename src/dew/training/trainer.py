@@ -1727,15 +1727,16 @@ class Trainer(Generic[Loss, Effects]):
 
     def _between_steps(self, plan: _FitPlan, run: _FitRun, interval: Interval, state: TrainState,
                        shardings: Placement[TrainState], position, loss: jax.Array,
-                       aux: dict[str, jax.Array], accepted: jax.Array) -> bool:
+                       aux: dict[str, jax.Array | Recorded], accepted: jax.Array) -> bool:
         """The cadenced work after one step of `fit`: the log, the validation,
         the checkpoints, and the preemption notice. Returns whether the
         notice stops the run at this step, whose checkpoint is then written."""
         current, checkpoints = run.current, self.checkpoints
         ending = plan.finished(current, interval.real_tokens if plan.tokens is not None else 0)
-        if RECORD in aux:
-            self.records.append(aux[RECORD])
-        aux = {name: value for name, value in aux.items() if name not in (TRAINING_FLOPS, TOKENS, RECORD)}
+        if isinstance(record := aux.get(RECORD), dict):
+            self.records.append(record)
+        aux = {name: value for name, value in aux.items()
+               if name not in (TRAINING_FLOPS, TOKENS, RECORD) and not isinstance(value, dict)}
         run.training = {'train/loss': loss, **{f'train/{name}': value for name, value in aux.items()}}
         run.stepped = (loss, aux, accepted)
         if current % plan.log_every == 0:

@@ -1147,8 +1147,9 @@ class Objective(ABC, Generic[Loss, Effects]):
         loss = (self.validation_loss if validation else self.loss)(variables, batch, step)
         stats, aux = loss if _has_aux(loss) else (loss, Aux(metrics={}))
         if witness is not None:
-            assert step.example_index is not None, "a recording step is a run's, which places its rows"
-            aux = replace(aux, record=witness.report(marked, step.example_index))
+            # A batch with no rows has no examples (`example_fields`), and records none.
+            places = jnp.zeros((0,), jnp.int32) if step.example_index is None else step.example_index
+            aux = replace(aux, record=witness.report(marked, places))
         return stats, aux
 
     def reduce_loss(self, stats: Loss) -> tuple[jax.Array, jax.Array]:
