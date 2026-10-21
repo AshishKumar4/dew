@@ -52,14 +52,13 @@ def test_a_cache_directory_that_cannot_be_written_only_slows_a_task(cache_worker
     """A bundle that cannot be written into the local cache (here the cache's path is a file) is a
     miss counted against the remote, as a request that fails is: it raises nothing."""
     url, stored, _ = cache_worker
-    stored["/jax/cpu/bundles/tests/a.py"] = remote_cache.packed([("jit_a-1", b"executable")])
     blocked = tmp_path / "file"
     blocked.write_text("")
     cache = remote_cache.RemoteCache(blocked, url, "token", "jax/cpu")
-    for _ in range(remote_cache.FAILURES):
-        cache.opened("tests/a.py")
-        cache.opened("tests/b.py")
-    assert not cache.available
+    for index in range(remote_cache.FAILURES):
+        stored[f"/jax/cpu/bundles/tests/test_{index}.py"] = remote_cache.packed([(f"jit_{index}-1", b"x")])
+        cache.opened(f"tests/test_{index}.py")
+    assert not cache.available and cache.programs_fetched == 0
 
 
 def test_a_files_programs_reach_the_next_process_in_one_bundle(cache_worker, tmp_path):
