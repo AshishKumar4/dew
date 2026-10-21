@@ -140,7 +140,8 @@ def _forward_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kind
         out = output_mod(out, *params)
     out_ref[...] = out.astype(out_ref.dtype)
     if residuals:
-        residual_refs[0][...] = peak
+        # A query that saw nothing from no state holds 0 for both, as the reference's residuals do.
+        residual_refs[0][...] = jnp.where(peak == -jnp.inf, 0.0, peak)
         residual_refs[1][...] = total
 
 
