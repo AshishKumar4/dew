@@ -148,20 +148,15 @@ def main() -> None:
     np.savez(OUT / "logits.npz", **logits)
 
 
-FLA_PINS = {"torch": "2.8.0", "transformers": "5.16.1", "fla-core": "0.5.2"}
-"""The packages `on_fla` runs in, as its fixture's provenance names them."""
-
-
 def on_fla() -> None:
-    import importlib.metadata
     import inspect
 
+    from reference_releases import require
     from safetensors.torch import load_file
     from transformers import AutoTokenizer, Qwen3_5ForConditionalGeneration
     from transformers.models.qwen3_5 import modeling_qwen3_5
 
-    found = {name: importlib.metadata.version(name).split("+")[0] for name in FLA_PINS}
-    assert found == FLA_PINS, f"on_fla runs in {FLA_PINS}, not {found}"
+    require("fla")
     if os.environ.get("TRITON_F32_DEFAULT") != "ieee":
         raise SystemExit("run with TRITON_F32_DEFAULT=ieee so fla's kernels keep fp32")
     if os.environ.get("FLA_TRIL_PRECISION", "ieee") != "ieee":

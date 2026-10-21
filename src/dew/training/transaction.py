@@ -20,12 +20,26 @@ from typing import Generic, overload
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 import optax
 from flax import struct
 from flax.training import dynamic_scale as dynamic_scale_lib
 from typing_extensions import TypeVar
 
-from dew.objectives.base import FROZEN, Aux, Batch, Ratio, Step, Variables, merge, with_projected
+from dew.data.dataset import rows_of
+from dew.nn.sharding import rows_spec
+from dew.objectives.base import (
+    EXAMPLE_ROWS,
+    EXAMPLE_STREAM,
+    FROZEN,
+    Aux,
+    Batch,
+    Ratio,
+    Step,
+    Variables,
+    merge,
+    with_projected,
+)
 from dew.training.model_flops import _TokenCount, step_counts
 from dew.training.narrow import forward_variables, narrowed
 from dew.training.state import Accumulation, TrainState
@@ -54,6 +68,34 @@ class Committed:
 def _chosen(take, taken, kept):
     """`taken` where `take` holds and `kept` elsewhere, leaf by leaf."""
     return jax.tree.map(lambda new, old: jnp.where(take, new, old), taken, kept)
+
+
+def cleared(acc: Accumulation) -> Accumulation:
+    """`acc` emptied for its next window: its sums zero, its QK maxima at their identity."""
+    return dataclasses.replace(jax.tree.map(jnp.zeros_like, acc), qk_stats=jax.tree.map(
+        lambda x: jnp.full_like(x, -jnp.inf) if jnp.issubdtype(x.dtype, jnp.inexact) else jnp.zeros_like(x),
+        acc.qk_stats))
+
+
+def dropped_window(state, size: int):
+    """`state` with its window of `size` microbatches dropped: its accepted microbatches forgotten and
+    the next taking its first slot, as a rejected attempt (`Transaction.finish_attempt`) or a batch
+    ramp's new stage (`Trainer`'s runner) leaves it, so a committed update pools one window of one
+    stage's batches, all drawn under one key (`example_fields`). The window's gradient sum stays in
+    place, unread, as a commit leaves it (`prepare_attempt`); the mutable collections its microbatches
+    wrote keep what they wrote, as torch's AMP keeps a skipped update's running statistics."""
+    if state.accumulation is None:
+        return state
+    microstep, window = window_dropped(state.microstep, state.accumulation, size)
+    return dataclasses.replace(state, microstep=microstep, accumulation=window)
+
+
+def window_dropped(microstep: jax.Array, acc: Accumulation, size: int) -> tuple[jax.Array, Accumulation]:
+    """`dropped_window`'s two fields: the microstep back at its window's start, and the window cleared but
+    for its gradient sum. A state's other fields go round it, as a compiled program over them alone
+    leaves a host-master state's resident frozen weights where they are."""
+    return microstep - microstep % size, dataclasses.replace(
+        cleared(dataclasses.replace(acc, gradient=None)), gradient=acc.gradient)
 
 
 def _only_when(due, taken, kept, operand):
@@ -219,6 +261,49 @@ class PendingAttempt(Generic[Loss]):
     gradient: Variables
 
 
+def example_places(slot, split: int, rows: int, column: jax.Array | None = None, part=None) -> jax.Array:
+    """The places among an update's examples of the `rows` rows of the microbatch in window slot `slot`,
+    of steps read in `split` microbatches each: the step's place in the window times a step's rows, plus
+    each row's place among its step's records, its `column` (`EXAMPLE_ROWS`) where the batch holds one,
+    else its row in the step's batch, every `split`th from row `part` (`microbatch`; by default
+    `slot % split`).
+
+    A window pools its steps' microbatches in the order it accepts them. A dynamic loss scale's
+    rejection drops its window (`dropped_window`), and the next takes its first slot under a key that
+    folds in the rejection (`example_fields`), whatever part of its step it reads: a window's slots
+    are consecutive parts, so each step's places stay distinct, and no two examples of an update
+    draw alike."""
+    step = slot // split
+    if column is None:
+        part = slot % split if part is None else part
+        column = part + split * jnp.arange(rows, dtype=jnp.int32)
+    return (step * rows * split + column).astype(jnp.int32)
+
+
+def example_fields(state, slot, split: int, batch, slots: int = 1, part=None, rejected=0) -> dict:
+    """The `Step` fields of the microbatch in window slot `slot` of the update `state` commits next, of
+    `slots` microbatches, its steps read in `split` microbatches each, this the `part`th, after the run
+    rejected `rejected` attempts: the update's key (`Step.example_key`), which folds in the rejections,
+    so a window that follows a dropped one draws afresh, each row's place among the update's
+    examples (`example_places`), placed as the batch's rows are, so each device draws its own rows'
+    examples alone, and how many examples the update pools. A batch with no rows has no examples."""
+    rows = rows_of(batch)
+    if not rows:
+        return {}
+    key = jax.random.fold_in(jax.random.fold_in(jax.random.fold_in(state.key, EXAMPLE_STREAM),
+                                                state.updates), rejected)
+    index = example_places(slot, split, rows, batch.get(EXAMPLE_ROWS), part)
+    return {"example_key": key, "example_index": placed_as_rows(index, batch), "example_count": slots * rows}
+
+
+def placed_as_rows(index: jax.Array, batch) -> jax.Array:
+    """`index`, an entry for each of `batch`'s rows, placed as the batch's rows are, so each device
+    reads its own rows' entries alone."""
+    like = next(leaf for leaf in jax.tree.leaves(batch) if np.ndim(leaf))
+    placed = rows_spec(like, 1)
+    return index if placed is None else jax.sharding.reshard(index, placed)
+
+
 class Transaction:
     """Turn one or more microbatches into one optimizer update.
 
@@ -352,10 +437,16 @@ class Transaction:
         batch = jax.tree.map(lambda x: x[index], previous.batches)
         variables = state.variables if previous.variables is None else {
             **state.variables, **jax.tree.map(lambda x: x[index], previous.variables)}
-        step_info = Step((state.microstep - fill + index) // self.split,
-                    jax.random.fold_in(state.key, previous.attempts[index]),
-                    with_ema(variables, state.ema), committed=state.updates)
+        accepted, attempt = state.microstep - fill + index, previous.attempts[index]
+        # The part its input ran as, which an attempt counts (`step` times `split` plus its part).
+        step_info = Step(accepted // self.split, jax.random.fold_in(state.key, attempt),
+                         with_ema(variables, state.ema), committed=state.updates,
+                         **self.examples(state, index, batch, part=attempt % self.split,
+                                         rejected=attempt - accepted))
         return self.read(variables, state.compute), batch, step_info
+
+    def examples(self, state, slot, batch, part=None, rejected=0) -> dict:
+        return example_fields(state, slot, self.split, batch, self.size, part, rejected)
 
     def read(self, variables, compute):
         """The variables a step's forward reads: the narrow copies in place of
@@ -425,8 +516,9 @@ class Transaction:
         A rejected attempt costs the same trace as an accepted one. With a
         dynamic scaler an attempt is admitted only when every value it
         produced is finite, the committed parameters and optimizer state
-        included; a rejected attempt returns `state` untouched and only the
-        scaler moves.
+        included; a rejected attempt returns `state` with its window dropped
+        (`dropped_window`), its parameters, optimizer state and EMA untouched,
+        and the scaler moved.
 
         A window of one microbatch commits on every step it can, so its
         commit is computed and kept by elementwise selects. A longer window
@@ -502,19 +594,17 @@ class Transaction:
                             lambda held, x: held.at[pending.fill].set(x), acc.variables, reads))
                 return acc
 
-            def clear(acc):
-                return dataclasses.replace(jax.tree.map(jnp.zeros_like, acc), qk_stats=jax.tree.map(
-                    lambda x: jnp.full_like(x, -jnp.inf) if jnp.issubdtype(x.dtype, jnp.inexact)
-                    else jnp.zeros_like(x), acc.qk_stats))
             # A pooled window's gradient sum (a replayed window keeps none)
             # goes round the reset too, its next first microbatch restarting
             # it (`prepare_attempt`): passed through on every microbatch the
             # window does not commit, it was copied each time (Qwen3.5-0.8B's 1 GB
             # embedding sum, twice a step on an A100).
-            window = jax.lax.cond(pending.due, clear, retain, dataclasses.replace(candidate, gradient=None))
+            window = jax.lax.cond(pending.due, cleared, retain, dataclasses.replace(candidate, gradient=None))
             numerical = dataclasses.replace(
                 numerical, accumulation=dataclasses.replace(window, gradient=candidate.gradient))
-        advanced = _chosen(accepted, numerical, state)
+        # A rejected attempt drops its window (`dropped_window`): the update it would have closed is
+        # skipped whole, its accepted microbatches with it.
+        advanced = _chosen(accepted, numerical, dropped_window(state, self.size))
         if self.size == 1 and advanced.compute is not None:
             # The copies are the cast of whichever parameters were chosen, so
             # they are cast after the choice. Choosing between the new and the
@@ -551,8 +641,11 @@ class Transaction:
             # is its real tokens, which the trainer reads off the accounting
             # columns the objective's batch no longer holds (`model_batch`).
             attempt = state.step * self.split + part
+            # Every attempt the run made and did not accept, so a rejected one's slot draws afresh.
+            rejected = attempt - state.microstep
             step_info = Step(state.microstep // self.split, jax.random.fold_in(state.key, attempt),
-                             with_ema(state.variables, state.ema), committed=state.updates)
+                             with_ema(state.variables, state.ema), committed=state.updates,
+                             **self.examples(state, state.microstep % self.size, batch, part, rejected))
             factor = jnp.asarray(1., jnp.float32) if state.scale is None else state.scale.scale
             realized = realize(self.read(state.variables, state.compute), batch, step_info)
             loss, cotangent = reduce(realized.stats, factor)

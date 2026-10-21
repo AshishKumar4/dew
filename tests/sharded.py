@@ -25,7 +25,7 @@ import math
 
 import jax
 import jax.numpy as jnp
-from jax.sharding import NamedSharding
+from jax.sharding import NamedSharding, PartitionSpec
 from reference_error import assert_as_exact
 
 from dew.telemetry.instrumentation import collective, custom_call_kind, hlo_instructions
@@ -87,6 +87,13 @@ def tpu_lowering(fn, args, mesh: jax.sharding.Mesh) -> str:
         return jax.export.export(jax.jit(fn), platforms=["tpu"])(*args).mlir_module()
 
 
+def placed(tree, mesh: jax.sharding.Mesh, *spec):
+    """`tree`'s arrays as abstract values placed on `mesh` by `PartitionSpec(*spec)`, for a step traced
+    and lowered for a mesh it does not run on."""
+    sharding = NamedSharding(mesh, PartitionSpec(*spec))
+    return jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=sharding), tree)
+
+
 def assert_runs_per_shard(fn, draw, specs, mesh, label: str, *, seeds: int, truth_fn, moves=(),
                           donate=()) -> None:
     """The custom-kernel contract (module docstring): `fn` on `draw(seed)`'s arguments placed on `mesh`
@@ -100,11 +107,11 @@ def assert_runs_per_shard(fn, draw, specs, mesh, label: str, *, seeds: int, trut
     call that keeps them would make XLA copy each before the kernel overwrites it."""
     run = jax.jit(fn, donate_argnums=donate)
 
-    def placed(args):
+    def put(args):
         return [jax.device_put(arg, NamedSharding(mesh, spec)) for arg, spec in zip(args, specs, strict=True)]
 
     with jax.set_mesh(mesh):
-        compiled = run.lower(*placed(draw(0))).compile()
+        compiled = run.lower(*put(draw(0))).compile()
     text = compiled.as_text()
     moved = [(op, shapes) for op, shapes in collectives(text) if op in MOVES and op not in moves]
     assert not moved, f"the step moves operands between devices: {moved}"
@@ -117,7 +124,7 @@ def assert_runs_per_shard(fn, draw, specs, mesh, label: str, *, seeds: int, trut
 
     def split(*args):
         with jax.set_mesh(mesh):
-            return compiled(*placed(kept(args)))
+            return compiled(*put(kept(args)))
 
     def one_device(*args):
         return run(*kept(args))
