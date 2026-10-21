@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Write tiny masked-decoder and MiMo logits with the pinned releases' own model code.
+"""Write the llada-tiny, dream-tiny and mimo-v2-tiny logits with the released model code.
 
 LLaDA and Dream ship no transformers class: their Hub repos carry their own
 configuration and modeling files, loaded with trust_remote_code. This fetches
@@ -32,12 +32,6 @@ draws the fixture's weights (every parameter, the sinks and the balancing
 bias too, from N(0, 0.1^2) at seed 0, as the class leaves the sinks empty)
 and its token ids, written in the class's split layout:
   python tools/remote_code_reference.py mimo-v2-tiny --draw
-
-The LLaDA MoE tinies use --draw too. LLaDA-MoE, v2 and LLaDA2.0 run
-under transformers 4.57.1; LLaDA2.1 and 2.2 under 5.16.1. Forty token
-grids hold the native fp32 forward to its float64 execution. LLaDA2's
-probes carry the release's explicit block-causal attention mask; this
-records forward parity, not parity with its block-wise generation recipe.
 """
 
 import argparse
@@ -62,17 +56,6 @@ RELEASES = {
                    "AutoModel", False),
     "mimo-v2-tiny": ("XiaomiMiMo/MiMo-V2.6-Pro-MOPD", "6a7f202e8dbd0e57b3fe1da03917d08d75abc4b8",
                      ("configuration_mimo_v2.py", "modeling_mimo_v2.py"), "AutoModelForCausalLM", True),
-    "llada-moe-tiny": ("inclusionAI/LLaDA-MoE-7B-A1B-Base", "daccaf1ccbf263a427bc9ac2a23b0b004fb275bf",
-                       ("configuration_lladamoe.py", "modeling_lladamoe.py"), "AutoModelForCausalLM", True),
-    "llada-moe-v2-tiny": ("GSAI-ML/LLaDA-MoE-v2-30B-A3B-Base", "2a513f7a4634e426b2ab030e6defb24001d0c847",
-                          ("configuration_lladamoe_v2.py", "modeling_lladamoe_v2.py"),
-                          "AutoModelForCausalLM", True),
-    "llada2-tiny": ("inclusionAI/LLaDA2.0-mini", "dad945cac317da394b390f82c7b40691d8a881ed",
-                    ("configuration_llada2_moe.py", "modeling_llada2_moe.py"), "AutoModelForCausalLM", True),
-    "llada21-tiny": ("inclusionAI/LLaDA2.1-mini", "20e64e2ad21644d0e5248586ed9c942cdd45de0f",
-                     ("configuration_llada2_moe.py", "modeling_llada2_moe.py"), "AutoModelForCausalLM", True),
-    "llada22-tiny": ("inclusionAI/LLaDA2.2-flash", "9b78da3f9149f1e239fb6d15f20a326fde574b9f",
-                     ("configuration_llada2_moe.py", "modeling_llada2_moe.py"), "AutoModelForCausalLM", True),
 }
 """Each fixture's release: the Hub repo, the commit its code is read at, the
 files that code is, the auto class its language model registers as, and
@@ -80,9 +63,6 @@ whether the code pins float32 (MiMo's router casts its logits with
 `.type(torch.float32)`), so its float64 run is built and run under
 `diffusers_wan_reference.float64`, which widens those pins and the rotary
 tables built at init."""
-
-
-MOE = ("llada-moe-tiny", "llada-moe-v2-tiny", "llada2-tiny", "llada21-tiny", "llada22-tiny")
 
 
 def released_model(name: str, scratch: Path, draw: bool = False) -> torch.nn.Module:
@@ -102,39 +82,15 @@ def released_model(name: str, scratch: Path, draw: bool = False) -> torch.nn.Mod
     if draw:
         torch.manual_seed(0)
         with torch.no_grad():
-            for key, parameter in model.named_parameters():
-                noise = torch.randn_like(parameter) * (0.2 if name in MOE else 0.1)
-                parameter.copy_(noise + 1 if name in MOE and 'norm' in key else noise)
-            for key, buffer in model.named_buffers():
-                if name in MOE and key.endswith('expert_bias'):
-                    buffer.copy_(torch.randn_like(buffer) * 0.3)
+            for parameter in model.parameters():
+                parameter.copy_(torch.randn_like(parameter) * 0.1)
         save_file({key: value.contiguous() for key, value in model.state_dict().items()},
                   str(FIXTURES / name / "model.safetensors"))
         vocabulary = json.loads((FIXTURES / name / "config.json").read_text())["vocab_size"]
-        shape = (40, 2, 16) if name in MOE else (2, 16)
-        ids = torch.randint(0, vocabulary, shape).numpy().astype(np.int32)
-        if name in MOE:
-            np.save(FIXTURES / name / "probe_ids.npy", ids)
-        np.save(FIXTURES / name / "input_ids.npy", ids[0] if name in MOE else ids)
+        ids = torch.randint(0, vocabulary, (2, 16)).numpy().astype(np.int32)
+        np.save(FIXTURES / name / "input_ids.npy", ids)
     model.load_state_dict(load_file(str(FIXTURES / name / "model.safetensors")), strict=True)
     return model.eval()
-
-
-def forward(model, ids, name):
-    """The release's inference forward, with LLaDA2's block-causal mask."""
-    fields = {}
-    if name in ('llada2-tiny', 'llada21-tiny', 'llada22-tiny'):
-        blocks = torch.arange(ids.shape[-1]) // 4
-        visible = blocks[None, :] <= blocks[:, None]
-        fields['attention_mask'] = torch.where(visible, 0.0, -torch.inf)[None, None].expand(
-            ids.shape[0], 1, -1, -1)
-    return model(input_ids=ids, **fields).logits
-
-
-def ensemble(model, ids, name):
-    if name in MOE:
-        return np.stack([forward(model, tokens, name).detach().numpy() for tokens in ids])
-    return forward(model, ids, name).detach().numpy()
 
 
 def main() -> None:
@@ -146,28 +102,23 @@ def main() -> None:
     with tempfile.TemporaryDirectory() as scratch:
         for name in arguments.names:
             model = released_model(name, Path(scratch) / "fp32", arguments.draw)
-            ids_name = 'probe_ids.npy' if name in MOE else 'input_ids.npy'
-            ids = torch.from_numpy(np.load(FIXTURES / name / ids_name).astype(np.int64))
+            ids = torch.from_numpy(np.load(FIXTURES / name / "input_ids.npy").astype(np.int64))
             with torch.no_grad():
-                fp32 = ensemble(model.float(), ids, name)
+                fp32 = model.float()(input_ids=ids).logits.numpy()
                 if RELEASES[name][4]:
                     from diffusers_wan_reference import float64
 
                     with float64():
                         wide = released_model(name, Path(scratch) / "f64").double()
-                        f64 = ensemble(wide, ids, name)
+                        f64 = wide(input_ids=ids).logits.numpy()
                 else:
-                    f64 = ensemble(model.double(), ids, name)
+                    f64 = model.double()(input_ids=ids).logits.numpy()
             if arguments.check:
-                saved = 'probe_logits.npy' if name in MOE else 'logits.npy'
-                same = np.array_equal(np.load(FIXTURES / name / saved), fp32)
-                print(name, saved, 'bitwise' if same else 'differs')
+                same = np.array_equal(np.load(FIXTURES / name / "logits.npy"), fp32)
+                print(name, "logits.npy bitwise" if same else "logits.npy differs")
             else:
-                if name in MOE:
-                    np.save(FIXTURES / name / 'probe_logits.npy', fp32)
-                    np.save(FIXTURES / name / 'probe_logits_f64.npy', f64)
-                np.save(FIXTURES / name / "logits.npy", fp32[0] if name in MOE else fp32)
-                np.save(FIXTURES / name / "logits_f64.npy", f64[0] if name in MOE else f64)
+                np.save(FIXTURES / name / "logits.npy", fp32)
+                np.save(FIXTURES / name / "logits_f64.npy", f64)
                 print(name, fp32.shape)
 
 

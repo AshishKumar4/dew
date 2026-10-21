@@ -90,6 +90,10 @@ def sample[StateT, RecordT](
     folded with the step index, so a trajectory is reproducible from one
     key.
 
+    A solver that draws independently per row (Unmask) also accepts one
+    typed PRNG key per row. The model still runs once over the whole batch;
+    only the solver's random draws map over those keys.
+
     The trajectory is one `lax.scan`, traced at each call. Under a caller's
     `jax.jit` it compiles once, which is how the pipelines and objectives
     call it. Called eagerly, it traces and compiles the scan again every
@@ -100,7 +104,8 @@ def sample[StateT, RecordT](
     if steps is not None and (type(steps) is not int or steps < 1):
         raise ValueError("steps must be a positive integer")
     from dew.nn.inputs import request_key
-    key = request_key(key)
+    key = request_key(key, rows=x_T.shape[0])
+    fold = jax.random.fold_in if key.shape == () else jax.vmap(jax.random.fold_in, in_axes=(0, None))
     process = denoise.process
 
     # A process whose model predicts over an interval reads, at each step,
@@ -142,7 +147,7 @@ def sample[StateT, RecordT](
             t_next = jnp.full((batch,), t_next)
             stepping = walk if spanned is None else Walk.over(spanned.spanning(t, t_next), guidance, count)
             (denoised, eps), guided = stepping.step(x, t, index, guided)
-            x, state = solver.step(x, t, t_next, denoised, eps, state, jax.random.fold_in(key, index),
+            x, state = solver.step(x, t, t_next, denoised, eps, state, fold(key, index),
                                    process, stepping.at(guided, index))
             return (x, state, guided), read(x, state)
 
