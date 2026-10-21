@@ -756,14 +756,16 @@ def test_a_bf16_layer_with_wide_keys_hands_the_port_its_narrowed_operands():
 REMAT_ROWS, REMAT_LENGTH = 4, 256
 """Each remat draw's rows and tokens: at one row of 64 with the parameters held fixed, the reference
 compared with itself did not resolve within 512 seeds on an A100 (`in_proj_b`'s and the norm's
-gradients, a few sums over one draw's few tokens)."""
+gradients, a few sums over one draw's few tokens); with fresh parameters a draw, one row of 64 took
+512 seeds, two of 128 took 256, and four of 256 take 64, as eight of 512 do."""
 
-SEEDS = {(1, 1): 8, (2, 1): 8, (2, 2): 8}
+SEEDS = {(1, 1): 64, (2, 1): 64, (2, 2): 64}
 """Each remat policy's declared seeds for check 1 (`assert_as_exact`), keyed by the
-(`fla_chunk_fwd_h`, `fla_chunk_fwd_o`) launches its gradient is held to, sized by `seeds_for`: the
-fewest for which the layer's gradient without remat compared with itself resolves the factor in
-every leaf, truth the float64 layer's gradient. The three policies share that reference, the draw
-and the truth, so one sizing gives all three."""
+(`fla_chunk_fwd_h`, `fla_chunk_fwd_o`) launches its gradient is held to, sized by `seeds_for` on an
+A100 (2026-10-21), where the policies' programs differ: the fewest for which the layer's gradient
+without remat compared with itself resolves the factor in every leaf, truth the float64 layer's
+gradient. The three policies share that reference, the draw and the truth, so one sizing gives all
+three. Off a GPU the two are bitwise."""
 
 
 @pytest.mark.parametrize("policy, memories, outputs", [
