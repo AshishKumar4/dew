@@ -52,7 +52,9 @@ def gate(root: Path, *arguments: str) -> subprocess.CompletedProcess:
                           text=True, timeout=300)
 
 
-def tree(root: Path, files: dict[str, str]) -> Path:
+def tree(tmp_path: Path, name: str, files: dict[str, str]) -> Path:
+    # duplicates_*: CI puts tools/armada on its children's PYTHONPATH, where a plain name can be a module.
+    root = tmp_path / f"duplicates_{name}"
     root.mkdir()
     for name, text in files.items():
         (root / name).write_text(text)
@@ -60,28 +62,28 @@ def tree(root: Path, files: dict[str, str]) -> Path:
 
 
 def test_seven_lines_two_files_copy_fail_the_gate_and_six_or_one_owner_pass_it(tmp_path):
-    copied = tree(tmp_path / "copied", {f"{name}.py": f"def {name}(values, limit):\n{BLOCK}"
-                                        for name in ("first", "second")})
+    copied = tree(tmp_path, "copied", {f"{name}.py": f"def {name}(values, limit):\n{BLOCK}"
+                                       for name in ("first", "second")})
     assert gate(copied).returncode == 1
-    owned = tree(tmp_path / "owned", {"first.py": f"def first(values, limit):\n{BLOCK}",
-                                      "second.py": "from first import first\n\n\ndef second(values, limit):\n"
-                                                   "    return first(values, limit)\n"})
+    owned = tree(tmp_path, "owned", {"first.py": f"def first(values, limit):\n{BLOCK}",
+                                     "second.py": "from first import first\n\n\ndef second(values, limit):\n"
+                                                  "    return first(values, limit)\n"})
     assert gate(owned).returncode == 0
     # The last line differs, so the two share six lines, not past the bar, and differ in what they do.
     differing = BLOCK.replace("return total", "return -total")
-    sharing_six = tree(tmp_path / "sharing_six", {"first.py": f"def first(values, limit):\n{BLOCK}",
-                                                  "second.py": f"def second(values, limit):\n{differing}"})
+    sharing_six = tree(tmp_path, "sharing_six", {"first.py": f"def first(values, limit):\n{BLOCK}",
+                                                 "second.py": f"def second(values, limit):\n{differing}"})
     assert gate(sharing_six).returncode == 0
 
 
 def test_a_function_two_files_write_under_other_names_fails_and_one_owner_passes(tmp_path):
-    copied = tree(tmp_path / "copied", {"spread.py": SPREAD, "ranges.py": RANGE_OVER_COUNT})
+    copied = tree(tmp_path, "copied", {"spread.py": SPREAD, "ranges.py": RANGE_OVER_COUNT})
     done = gate(copied)
     assert done.returncode == 1 and "duplicate function in 2 files" in done.stdout
     assert "spread.py:1 spread" in done.stdout and "ranges.py:1 range_over_count" in done.stdout
     calling = ("from spread import spread\n\n\n"
                "def range_over_count(items, floor):\n    return spread(items, floor)\n")
-    owned = tree(tmp_path / "owned", {"spread.py": SPREAD, "ranges.py": calling})
+    owned = tree(tmp_path, "owned", {"spread.py": SPREAD, "ranges.py": calling})
     assert gate(owned).returncode == 0
 
 
@@ -98,7 +100,7 @@ def test_six_statements_two_functions_share_fail_where_their_functions_differ(tm
     second = ("def second(values, limit):\n    values = sorted(values)\n"
               + "".join(f"    {s}\n" for s in renamed)
               + "    return {'balance': balance, 'kept': len(chosen)}\n")
-    done = gate(tree(tmp_path / "copied", {"first.py": first, "second.py": second}))
+    done = gate(tree(tmp_path, "copied", {"first.py": first, "second.py": second}))
     assert done.returncode == 1 and "duplicate statements in 2 files" in done.stdout
     # Seven shared statements are two windows over one copy: the gate names the copy once.
     steps.append("spread = max(kept) - min(kept)")
@@ -108,7 +110,7 @@ def test_six_statements_two_functions_share_fail_where_their_functions_differ(tm
     second = ("def second(values, limit):\n    values = sorted(values)\n"
               + "".join(f"    {s}\n" for s in renamed)
               + "    return {'balance': balance, 'kept': len(chosen)}\n")
-    done = gate(tree(tmp_path / "longer", {"first.py": first, "second.py": second}))
+    done = gate(tree(tmp_path, "longer", {"first.py": first, "second.py": second}))
     assert done.returncode == 1 and done.stdout.count("duplicate statements") == 1, done.stdout
 
 
@@ -119,8 +121,8 @@ def test_two_files_closing_alike_on_exit_fail(tmp_path):
              "    def __exit__(self, kind, {1}, traceback):\n        try:\n            self.close()\n"
              "        except BaseException as {2}:\n            if {1} is None:\n                raise\n"
              "            {1}.add_note(f'{0} cleanup failed: {{{2}!r}}')\n")
-    done = gate(tree(tmp_path / "copied", {"prefetch.py": exit_.format("Prefetch", "exc", "error"),
-                                           "tracker.py": exit_.format("Tracker", "pending", "failure")}))
+    done = gate(tree(tmp_path, "copied", {"prefetch.py": exit_.format("Prefetch", "exc", "error"),
+                                          "tracker.py": exit_.format("Tracker", "pending", "failure")}))
     assert done.returncode == 1 and "duplicate function in 2 files" in done.stdout, done.stdout
     assert "Prefetch.__exit__" in done.stdout and "Tracker.__exit__" in done.stdout
 
@@ -138,7 +140,7 @@ def test_declarations_alike_are_no_copy(tmp_path):
     stubs = "class {0}:\n" + "".join(f"    @property\n    def {{1}}{index}(self) -> int: ...\n"
                                      for index in range(6))
     reads = "".join(f"{{0}}{index} = {{1}}('{{0}}{index}')\n" for index in range(6))
-    alike = tree(tmp_path / "alike", {
+    alike = tree(tmp_path, "alike", {
         "left.py": record.format("Left", "a") + parser.format("left", "x"),
         "right.py": record.format("Right", "b") + parser.format("right", "y"),
         "left_imports.py": imports.format("left"), "right_imports.py": imports.format("right"),
@@ -157,7 +159,7 @@ def commit(root: Path, message: str) -> None:
 def test_held_to_a_base_only_a_copy_the_base_lacked_fails(tmp_path):
     """Main holds a copy (spread.py, ranges.py): a head that leaves it passes with the base and fails
     without; a head that writes the function a third time fails with the base too, naming the new copy."""
-    root = tree(tmp_path / "repository",
+    root = tree(tmp_path, "repository",
                 {"spread.py": SPREAD, "ranges.py": RANGE_OVER_COUNT, "other.py": "VALUE = 1\n"})
     subprocess.run(["git", "init", "-q", "-b", "main"], cwd=root, check=True)
     commit(root, "main")
