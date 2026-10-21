@@ -107,7 +107,6 @@ The kernel direction (approved 2026-10-19; kernel design 2026-10-20): each case 
 - Fingerprint a transform's arrays by their content, not their truncated repr. [768]
 - Cache automatically: the deterministic stages before the first random or cross-record step are fingerprinted by content and their output reused on a re-run, with no `cache=`, in a local cache directory with a size cap and eviction; `cache=url` stays for shared or remote caches, and there is an opt-out. [824]
 - Carry the caption tokenizer's content in the text conditioners' dependencies, so an exact resume refuses changed token ids. [769]
-- Let Windows and Pack resume with their row ids. [770]
 - Keep a concatenation's metadata, class names and the tokenizer contract included. [771]
 - Run DeviceAugment in the image pipeline benchmark's device-augment arms. [772]
 - The chain is the one data API; recipes, spec.load and the public loader are removed; run.json records the chain (213). [780]
