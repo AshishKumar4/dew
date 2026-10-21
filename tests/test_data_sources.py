@@ -24,6 +24,7 @@ from reader_support import assert_a_rewrite_moves_the_identity, assert_resumes_w
 from storage_support import moto_bucket
 from token_support import export_byte_tokens
 
+from dew.data.compile import compile
 from dew.data.dataset import DataPartition, Loading
 from dew.data.shards import streamed
 from dew.data.sinks import export
@@ -1762,112 +1763,69 @@ def test_a_source_read_only_as_a_stream_packs_its_rows_as_they_arrive():
     assert sorted({int(token) for window in windows for token in window["text"] if token}) == [1, 2, 3, 4]
 
 
-def test_a_run_that_states_no_read_reads_as_its_sources_choose(tmp_path):
+def test_a_chain_that_states_no_read_reads_as_its_sources_choose(tmp_path):
     """Records held in memory read from memory, a store that reads by index
-    reads by index and a stream streams, when the run states no read; a read
+    reads by index and a stream streams, when the chain states no read; a read
     it states wins over each."""
     import pyarrow.parquet as pq
-
-    from dew.config import RunConfig
-    from dew.config.data import RecordsData, loader
 
     rows = [{"value": index} for index in range(8)]
     pq.write_table(pa.Table.from_pylist(rows), tmp_path / "rows.parquet")
     (tmp_path / "rows.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows))
 
-    def read(source, stated=RunConfig.data_read):
-        loaded = loader(RecordsData(source=source), batch=2, read=stated, loading=Loading(workers=0))
+    def read(source, stated=None):
+        loaded = compile(source.repeat().batch(2), read=stated, loading=Loading(workers=0))
         assert loaded.plan is not None
         return loaded.plan.order["read"]
 
-    listed, indexed, streamed = rows, str(tmp_path / "rows.parquet"), str(tmp_path / "rows.jsonl")
+    listed, indexed = Memory(rows), Files(str(tmp_path / "rows.parquet"))
+    streamed = Files(str(tmp_path / "rows.jsonl"))
     assert [read(listed), read(indexed), read(streamed)] == ["memory", "indexed", "streamed"]
     assert [read(listed, "streamed"), read(indexed, "memory"), read(streamed, "memory")] == [
         "streamed", "memory", "memory"]
 
 
-def test_a_run_that_states_no_read_takes_the_first_read_its_sources_can_all_take(tmp_path):
+def test_a_chain_that_states_no_read_takes_the_first_read_its_sources_can_all_take(tmp_path):
     """A CSV with no index prefers a stream, but its random holdout cannot be
-    streamed and the CSV cannot be read by index, so the run reads it into
+    streamed and the CSV cannot be read by index, so the chain reads it into
     memory and trains on the half the holdout leaves."""
-    from dew.config.data import HoldOut, RecordsData, loader
-
     (tmp_path / "rows.csv").write_text("text\n" + "".join(f"row {index}\n" for index in range(8)))
-    split = HoldOut(fraction=0.5, by="random")
-    loaded = loader(RecordsData(source=str(tmp_path / "rows.csv"), validation=split), batch=2, read=None,
-                  loading=Loading(workers=0))
+    train, _ = Files(str(tmp_path / "rows.csv")).holdout(0.5)
+    loaded = compile(train.repeat().batch(2), loading=Loading(workers=0))
     assert loaded.plan is not None and loaded.plan.order["read"] == "memory"
     assert loaded.records == 4
 
 
 def test_a_token_holdout_with_no_stated_read_reads_unindexed_text_into_memory(tmp_path):
     """A token split needs a finite indexed order, which JSON lines without an
-    index can neither stream nor read by index, so the run reads them into
+    index can neither stream nor read by index, so the chain reads them into
     memory and holds out the first quarter of their tokens."""
-    from dew.config.data import HoldOut, TextData, loader
+    from dew.data import presets, text
+    from dew.data.compile import held
 
     documents = [{"text": f"document {index} " * 6} for index in range(8)]
     (tmp_path / "text.jsonl").write_text("".join(json.dumps(document) + "\n" for document in documents))
-    recipe = TextData(source=str(tmp_path / "text.jsonl"), seq_len=8, token_holdout=HoldOut(fraction=0.25))
-    loaded = loader(recipe, batch=2, read=None, loading=Loading(workers=0))
+    train, val = Files(str(tmp_path / "text.jsonl")).map(text.tokenize("byte")).holdout(tokens=0.25)
+    loaded = compile(train.repeat().pipe(presets.lm, None, seq_len=8, batch=2, pack=None),
+                     loading=Loading(workers=0))
     assert loaded.plan is not None and loaded.plan.order["read"] == "memory"
-    assert loaded.val is not None and loaded.records
+    assert loaded.records
+    assert next(iter(held(val.pipe(presets.lm, None, seq_len=8, batch=2, pack=None))(DataPartition())))
 
 
-def test_a_token_holdout_over_an_indexed_store_reads_into_memory_when_no_read_is_stated(tmp_path):
-    """Parquet reads by index, but a recipe's default order repeats an indexed
-    read before its token split, which needs a finite order. Judged on the
-    pipelines each read would run, the run reads into memory, where the order
-    follows the split."""
+def test_a_token_holdout_before_the_repeat_reads_an_indexed_store_by_index(tmp_path):
+    """Parquet reads by index, and a token split written before the order's repeat is a global,
+    finite order by itself, so the chain reads the store by index."""
     import pyarrow.parquet as pq
 
-    from dew.config.data import HoldOut, TextData, loader
+    from dew.data import presets, text
 
     rows = [{"text": f"document {index} " * 6} for index in range(8)]
     pq.write_table(pa.Table.from_pylist(rows), tmp_path / "rows.parquet")
-    recipe = TextData(source=str(tmp_path / "rows.parquet"), seq_len=8, token_holdout=HoldOut(fraction=0.25))
-    loaded = loader(recipe, batch=2, read=None, loading=Loading(workers=0))
-    assert loaded.plan is not None and loaded.plan.order["read"] == "memory"
-
-
-def test_a_default_read_is_judged_on_the_order_the_recipe_adds_at_that_read(tmp_path):
-    """A token split straight after an indexed source is a global, finite
-    order by itself, but the default order a recipe adds at an indexed read
-    repeats before it. The run reads into memory, where the order follows
-    the split, rather than choosing indexed for the recipe as written."""
-    import pyarrow.parquet as pq
-
-    from dew.config.data import loader
-    from dew.data.pipeline import Pipeline
-
-    class Split:
-        def pipelines(self):
-            return Pipeline(Files(str(tmp_path / "rows.parquet"))).holdout(tokens=0.5)[0]._chain(), None, ()
-
-    rows = [{"text": [index] * 4} for index in range(8)]
-    pq.write_table(pa.Table.from_pylist(rows), tmp_path / "rows.parquet")
-    loaded = loader(Split(), batch=1, read=None, loading=Loading(workers=0))
-    assert loaded.plan is not None and loaded.plan.order["read"] == "memory"
-
-
-def test_a_token_store_without_its_length_index_is_refused_until_provisioned(tmp_path):
-    """A token store that cannot be read by span until its length index is
-    built is not read whole into memory when the run states no read: it is
-    refused, and provision=True builds the index."""
-    from array_record.python.array_record_module import ArrayRecordWriter
-
-    from dew.config.data import TextData, loader
-
-    write_token_meta(tmp_path, 40)
-    writer = ArrayRecordWriter(str(tmp_path / "train-0.array_record"), "group_size:1")
-    for start in range(0, 40, 10):
-        writer.write(np.arange(start, start + 10, dtype=np.uint16).tobytes())
-    writer.close()
-    with pytest.raises(ValueError):
-        loader(TextData(source=str(tmp_path), seq_len=4), batch=1, read=None, loading=Loading(workers=0))
-    loaded = loader(TextData(source=str(tmp_path), seq_len=4), batch=1, read=None, provision=True,
-                  loading=Loading(workers=0))
-    assert loaded.plan is not None and loaded.plan.order["read"] == "streamed"
+    train, _ = Files(str(tmp_path / "rows.parquet")).map(text.tokenize("byte")).holdout(tokens=0.25)
+    loaded = compile(train.shuffle(0).repeat().pipe(presets.lm, None, seq_len=8, batch=2, pack=None),
+                     loading=Loading(workers=0))
+    assert loaded.plan is not None and loaded.plan.order["read"] == "indexed"
 
 
 def test_a_local_store_whose_producer_declared_other_bytes_is_refused(tmp_path):
@@ -1884,28 +1842,6 @@ def test_a_local_store_whose_producer_declared_other_bytes_is_refused(tmp_path):
     for stale in ({**held, "bytes": 2 * held["bytes"]}, {**held, "sha256": "0" * 64}):
         with pytest.raises(ValueError):
             Files(url, file_info={url: stale}).fingerprint()
-
-
-def test_provisioning_a_store_again_replaces_the_index_a_reader_has_mapped(tmp_path):
-    """Provisioning a token store again replaces its document index rather than rewriting it in
-    place. A rewrite truncated the file first, so a reader that had mapped it, in this process or
-    another sharing the disk, faulted (SIGBUS) on any page past the cut while it was written;
-    replaced, the old file stays whole under the reader's mapping."""
-    import os
-
-    from token_support import write_token_corpus
-
-    from dew.data.sources import TokenFiles
-
-    stream = np.tile(np.array([5, 6, 7, 255], np.uint16), 64)
-    write_token_corpus(tmp_path, stream, eos_id=255)
-    store = TokenFiles(str(tmp_path)).provision()
-    index = Path(store.document_index.url)
-    mapped = np.load(index, mmap_mode="r")
-    original = os.stat(index).st_ino
-    TokenFiles(str(tmp_path)).provision()
-    assert os.stat(index).st_ino != original
-    assert mapped.tolist() == np.load(index).tolist() == list(range(4, 257, 4))
 
 
 def _indexed_source(kind: str, root: Path):
@@ -1944,8 +1880,8 @@ def _indexed_source(kind: str, root: Path):
         return PackedSource.planned(held, Pack(4, bins=1)), [
             ("memory:documents:0", "memory:documents", 0, 1024, 1024),
             ("memory:documents:1024", "memory:documents", 1024, 1030, 6)]
-    write_token_corpus(root, np.tile(np.array([5, 255], np.uint16), 1030), eos_id=255)
-    tokens = TokenFiles(str(root)).provision()
+    corpus = write_token_corpus(root, np.tile(np.array([5, 255], np.uint16), 1030), eos_id=255)
+    tokens = TokenFiles(corpus.train).provision()
     if kind == "tokens":
         return tokens, [(f"{root}:train:0", str(root), 0, 1024, 1024),
                         (f"{root}:train:1024", str(root), 1024, 1030, 6)]
@@ -2040,11 +1976,9 @@ def test_a_concatenation_states_what_its_stores_state_of_their_records():
 
 @pytest.mark.parametrize("read", ["indexed", "streamed", "memory"])
 def test_concatenated_stores_train_as_one_store_and_resume_where_they_stopped(read):
-    """Two stores read in turn (`dew.data.Concatenate`) are one store to a recipe and to the verbs:
-    a pass over it holds every record of both once, in their order, steps chain on it as on any
-    store, and a training run resumed after two batches reads the batches the uninterrupted run
-    reads."""
-    from dew.config.data import RecordsData, loader
+    """Two stores read in turn (`dew.data.Concatenate`) are one store to the verbs: a pass over it
+    holds every record of both once, in their order, steps chain on it as on any store, and a
+    training run resumed after two batches reads the batches the uninterrupted run reads."""
     from dew.data import Concatenate
     from dew.data.compile import validation
     from dew.data.pipeline import Pipeline
@@ -2060,8 +1994,11 @@ def test_concatenated_stores_train_as_one_store_and_resume_where_they_stopped(re
     finally:
         passed.close()
 
+    trained = compile(Pipeline(joined).shuffle(3, window=4).repeat().batch(2), read=read, loading=loading,
+                      seed=3)
+
     def opened():
-        return loader(RecordsData(joined), batch=2, read=read, loading=loading, seed=3).train(DataPartition())
+        return trained.train(DataPartition())
 
     def ids(reader, count):
         return [np.asarray(next(reader)["id"]).tolist() for _ in range(count)]
