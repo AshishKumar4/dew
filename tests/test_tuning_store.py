@@ -2,6 +2,7 @@
 its timings, written and read back equal, through tokamax's public API alone."""
 
 import dataclasses
+import functools
 import json
 
 import jax
@@ -156,3 +157,24 @@ def test_a_hooked_launch_keys_by_what_its_hooks_compute_and_round_trips():
     for other in (keyed(closure(5.0), closure(3.0), (0,)), keyed(closure(2.0), closure(7.0), (0,)),
                   keyed(closure(2.0), closure(3.0), (1,)), keyed(None, closure(3.0), (0,))):
         assert key(other) != key(first)
+
+
+def _fused(jaxpr, tile):
+    """A fused consumer's stand-in: the generic code a fuser's epilogue runs, over the jaxpr it is
+    partial in."""
+    return tile
+
+
+def test_fused_consumers_of_one_layout_key_by_the_jaxprs_they_close_over():
+    """Two hooks of one code and layout that close over different jaxprs (a fused bias and a fused
+    scale, as the fuser's consumers do) key apart; the same jaxpr keys alike."""
+    def consumer(jaxpr):
+        return functools.partial(_fused, jaxpr)
+
+    accumulator = jax.ShapeDtypeStruct((8, 16), jnp.float32)
+    bias = jax.make_jaxpr(lambda acc, b: acc + b)(accumulator, accumulator)
+    scale = jax.make_jaxpr(lambda acc, b: acc * b)(accumulator, accumulator)
+    digests = [tuning._traced(consumer(jaxpr)) for jaxpr in (bias, scale, bias)]
+    assert digests[0] != digests[1]
+    assert digests[0] == digests[2]
+
