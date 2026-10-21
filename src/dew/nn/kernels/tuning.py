@@ -234,9 +234,12 @@ def _located(name: str) -> type:
 
 
 def _launch_json(ba: tokamax.BoundArguments) -> dict[str, JSON]:
-    """A launch as JSON: its op as its picks name it (`_identity`) and its arguments."""
-    return {"op": encoded(_identity(ba.op)), "arguments": {name: encoded(value)
-                                                           for name, value in ba.arguments.items()}}
+    """A launch as JSON: its op as its picks name it (`_identity`) and its arguments, a hook among them
+    by its presence (`_traced`)."""
+    hooks = getattr(ba.op, "HOOKS", ())
+    return {"op": encoded(_identity(ba.op)),
+            "arguments": {name: encoded(_traced(value) if name in hooks else value)
+                          for name, value in ba.arguments.items()}}
 
 
 def _launch(entry: object) -> tokamax.BoundArguments:
@@ -342,10 +345,15 @@ class KernelOp(tokamax.Op):
     `ROWS`. `revision` is part of its stored picks' identity: a kernel whose
     speed changes raises it, and picks measured for the old revision stop
     matching. A kernel whose inputs must hold more than random values to run
-    (group sizes, indices) overrides `operands`.
+    (group sizes, indices) overrides `operands`. A template names in `HOOKS`
+    its fields and arguments that hold the plain functions it traces in (a
+    score or epilogue hook, closures as often as not): its picks key on
+    whether each is there, never on which function it is (`_traced`), so
+    every launch's picks store and read back alike.
     """
 
     ROWS: ClassVar[tuple[str, ...]] = ()
+    HOOKS: ClassVar[tuple[str, ...]] = ()
     supports_batched_args_capture: ClassVar[bool] = False
     supports_symbolic_shapes: ClassVar[bool] = False
     revision: int = 1
@@ -439,8 +447,8 @@ class KernelOp(tokamax.Op):
 
     def _get_autotuning_cache_key(self, ba: tokamax.BoundArguments) -> Mapping[str, object]:
         key = super()._get_autotuning_cache_key(ba)
-        return type(key)({name: _bucketed(spec) if name in self.ROWS and spec is not None else spec
-                          for name, spec in key.items()})
+        return type(key)({name: _bucketed(spec) if name in self.ROWS and spec is not None
+                          else _traced(spec) if name in self.HOOKS else spec for name, spec in key.items()})
 
     def operands(self, specs: list[jax.ShapeDtypeStruct], seed: int) -> list[jax.Array]:
         """Arrays at `specs` to time the launch on: normal floats, zero integers."""
@@ -449,10 +457,32 @@ class KernelOp(tokamax.Op):
                 else jnp.zeros(spec.shape, spec.dtype) for key, spec in zip(keys, specs, strict=True)]
 
 
+TRACED = "traced"
+"""What a hook's function is in a pick's key (`_traced`)."""
+
+
+def _traced(value: object) -> object:
+    """`value` with every function in it, through dataclasses, tuples, lists and mappings, as `TRACED`:
+    a hook keys a pick by its presence and the rest of its value (its axes, its dtypes), not by which
+    function it is, which a closure could not be stored as. None stays None."""
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return dataclasses.replace(value, **{field.name: _traced(getattr(value, field.name))
+                                             for field in dataclasses.fields(value) if field.init})
+    if isinstance(value, (tuple, list)):
+        return type(value)(_traced(item) for item in value)
+    if isinstance(value, Mapping):
+        return {name: _traced(item) for name, item in value.items()}
+    if callable(value) and not isinstance(value, type):
+        return TRACED
+    return value
+
+
 def _identity(op: tokamax.Op) -> tokamax.Op:
     """`op` as its picks name it: without the config, the vjp and the device
-    check a call sets."""
-    return op.replace(config=None, vjp=None, bypass_device_check=False)
+    check a call sets, its hook fields by their presence (`_traced`)."""
+    hooks = {name: _traced(getattr(op, name)) for name in getattr(op, "HOOKS", ())
+             if name in {field.name for field in dataclasses.fields(op)}}
+    return op.replace(config=None, vjp=None, bypass_device_check=False, **hooks)
 
 
 def _kind(ba: tokamax.BoundArguments) -> str:
