@@ -204,7 +204,8 @@ def test_the_trainer_builds_its_state_from_the_held_checkpoint():
         np.testing.assert_array_equal(np.asarray(leaf), np.asarray(held[name]))
 
 
-@pytest.fixture(scope="module", params=["llada-tiny", "dream-tiny"])
+@pytest.fixture(scope="module", params=["llada-tiny", "dream-tiny", "llada-moe-tiny",
+                                      "llada-moe-v2-tiny", "llada2-tiny", "llada22-tiny"])
 def masked_source(request):
     source = Pretrained.load(FIXTURES / request.param, dtype="float32", attention_impl="xla")
     tokens = jnp.asarray([[0, 120, 5, 6], [1, 2, 3, 4], [0, 0, 7, 8]])

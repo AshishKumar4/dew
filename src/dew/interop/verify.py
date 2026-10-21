@@ -47,9 +47,6 @@ if TYPE_CHECKING:
     from flax import linen as nn
     from transformers import PretrainedConfig, PreTrainedModel
 
-_MASKED = frozenset({'llada', 'dream', 'Dream', 'diffusion_gemma_text'})
-"""The masked-diffusion families: bidirectional, never a causal LM's convention."""
-
 CONVENTIONS: tuple[tuple[str, decoder_parts.DecoderFamily], ...] = (
     # Llama's convention reads every field `base_config` shares, windows
     # included, where the registered Llama family reads only what
@@ -60,7 +57,7 @@ CONVENTIONS: tuple[tuple[str, decoder_parts.DecoderFamily], ...] = (
     # reads them (`prepare`, `packed`: GPT-2's buffers, fused experts) is
     # left out: its names cannot be checked before the weights are read.
     *((family.model_types[0], family) for family in ENTRIES
-      if family.model_types[0] != 'llama' and not set(family.model_types) & _MASKED
+      if family.model_types[0] != 'llama' and not set(family.model_types) & decoder_parts.MASKED_MODEL_TYPES
       and family.prepare is decoder_parts.DecoderFamily.prepare and not family.packed),
 )
 """The registered families an unregistered type is tried as, in order, each
