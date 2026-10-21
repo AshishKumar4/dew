@@ -286,19 +286,19 @@ class _Draws:
                                     for field in ("mine", "theirs", "worst", "zero_rows", "finite")))
 
 
-SKETCH = 16
+SKETCH = 32
 """The random sign projections a recording keeps of each leaf of its reference's float64 truth
 (`truth_sketch`): a move of the truth independent of the signs, a wrong row or index, moves their root
 mean square by about its own norm (a single element's by exactly its size); a move built against the
 signs, in the span their complement leaves, is not seen, which no fixed sketch can exclude."""
-SKETCH_DEVIATIONS = 2.5
+SKETCH_DEVIATIONS = 2.0
 """How many times the oracle rule's bound on a difference's norm the root mean square of its SKETCH sign
 projections may reach. A truth recomputed within the oracle rule, its difference independent of the
-signs, is refused with probability under 2e-12 (a Rademacher sum's square is no heavier-tailed than a
-normal's: Chernoff's bound on a chi-square of SKETCH degrees past 2.5² times its mean). A single
-element's move past 2.5 times the bound is refused always; a wider move past it in norm is refused but
+signs, is refused with probability under 1e-11 (a Rademacher sum's square is no heavier-tailed than a
+normal's: Chernoff's bound on a chi-square of SKETCH degrees past 2² times its mean). A single
+element's move past twice the bound is refused always; a wider move past it in norm is refused but
 for its chance of lying near the signs' complement, which is no guarantee: two entries swapped whose
-sign words agree move no projection, one pair in 2^16 at a seed, and each seed draws its own signs, so
+sign words agree move no projection, one pair in 2^32 at a seed, and each seed draws its own signs, so
 a wrong truth repeated over a site's seeds hides at all of them only by that chance to their power."""
 SKETCH_BLOCK = 64
 """The entries `truth_sketch` sums in float64 in one block, each block's sum then summed exactly: its
@@ -308,7 +308,7 @@ rounding at most gamma(SKETCH_BLOCK) of the magnitudes', in whatever order a hos
 def _sign_bits(size: int, seed: int) -> np.ndarray:
     """SKETCH random signs for each of `size` entries at a recorded seed, one bit a sign, the same on every
     host and run, and drawn apart at every seed."""
-    return np.random.default_rng([0x5E7C4, size, seed]).integers(0, 1 << SKETCH, size, dtype=np.uint32)
+    return np.random.default_rng([0x5E7C4, size, seed]).integers(0, 1 << SKETCH, size, dtype=np.uint64)
 
 
 def truth_sketch(truth, seed: int) -> np.ndarray:
@@ -320,7 +320,7 @@ def truth_sketch(truth, seed: int) -> np.ndarray:
     flat = np.asarray(truth, np.float64).reshape(-1)
     if not flat.size:
         return np.zeros(SKETCH)
-    bits, shifts, partials = _sign_bits(flat.size, seed), np.arange(SKETCH, dtype=np.uint32), []
+    bits, shifts, partials = _sign_bits(flat.size, seed), np.arange(SKETCH, dtype=np.uint64), []
     for start in range(0, flat.size, 1 << 16):
         chunk = flat[start:start + (1 << 16)]
         signs = ((bits[start:start + chunk.size, None] >> shifts) & 1).astype(np.float64) * 2 - 1
@@ -359,6 +359,8 @@ def leaf_summary(reference, truth) -> RecordedLeaf:
     dtype = str(jnp.dtype(getattr(reference, "dtype", np.asarray(reference).dtype)))
     reference, truth = np.asarray(reference, np.float64), np.asarray(truth, np.float64)
     if not reference.size:
+        assert truth.shape == reference.shape, (f"an empty leaf {reference.shape} against a truth "
+                                                f"{truth.shape}")
         return RecordedLeaf(0.0, 0.0, np.zeros(0, np.int64), np.zeros(0), finite=True, dtype=dtype)
     sizes, rows = row_errors(reference, truth)
     sized = sizes > 0
