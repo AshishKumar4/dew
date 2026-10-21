@@ -26,9 +26,7 @@ IRREGULAR = {"full-irregular": {"shape": (257, 385)},
 """Calls of more tiles than the core's cases, of no whole multiple of any tile: every config walks
 several key tiles, a query's maximum moving across them, and the full call holds whole tiles every
 query of a block sees. The CPU walks them at 32-key tiles (13 of them); the GPU sweeps walk them at every
-config, 128-key tiles among them, with the real dot. (Interpreted, XLA:CPU's fp32 product over a
-128-by-128 tile rounds the same entries 1.554 times as far from float64 as the reference's whole
-257-by-385 product does, over 10 draws; recorded 2026-10-21, ledger 882.)"""
+config, 128-key tiles among them, with the real dot."""
 
 
 def geometry(case: dict) -> tuple[int, int]:
