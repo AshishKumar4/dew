@@ -87,17 +87,10 @@ _COUNTS = ("rows", "accepted", "accepted_rows", "windows", "valid_targets", "zer
 
 def stated(source: Source) -> Mapping[str, object]:
     """What `source` states of its records without reading them (`dew.data.pipeline.Stated`), none
-    where it states nothing so, or where it is not here to state anything: a run's record and its
-    model are built where its data may not be, and a consumer that needs a store's fact refuses it
-    by name."""
+    where it states nothing so."""
     from dew.data.pipeline import Stated
 
-    if not isinstance(source, Stated):
-        return {}
-    try:
-        return source.stated()
-    except FileNotFoundError:
-        return {}
+    return source.stated() if isinstance(source, Stated) else {}
 
 
 def _uncounted(metadata: Mapping[str, object]) -> Mapping[str, object]:

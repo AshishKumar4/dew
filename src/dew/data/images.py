@@ -514,8 +514,9 @@ class Caption(grain.MapTransform):
     columns: tuple[str, ...] = ("caption", "text")
 
     def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
-        """A caption, a string of no fixed shape, beside the fields as they were."""
-        return facts
+        """A caption, a string of no fixed shape, in place of any the record held, beside the fields
+        as they were."""
+        return unshaped(facts, "caption")
 
     def map(self, element: Batch) -> Batch:
         label = element.get("label")
@@ -561,8 +562,8 @@ class ConfigureCaption:
     caption: Caption
 
     def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
-        """A caption, a string of no fixed shape, beside the rest."""
-        return facts
+        """A caption, a string of no fixed shape, in place of any the record held, beside the rest."""
+        return unshaped(facts, "caption")
 
     def __call__(self, metadata: Mapping[str, object]) -> Caption:
         from dew.records import strings

@@ -195,7 +195,9 @@ class TokenFiles(Dataset):
 
     def stated(self) -> Mapping[str, object]:
         """What the store's manifest says of its tokens, none of them read (`Dataset.facts`): their
-        tokenizer, vocabulary and EOS, as token ids under "text"."""
+        tokenizer, vocabulary and EOS, as token ids under "text"; an export not here states nothing."""
+        if Files(self.url, storage_options=self.storage_options).committed is None:
+            return {}
         return {**self.meta, "token_store": True}
 
     def metadata(self) -> Mapping[str, object]:
