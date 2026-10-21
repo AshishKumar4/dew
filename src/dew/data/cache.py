@@ -713,7 +713,6 @@ class _CachedMap(_Mapped):
 
 
 @dataclass(frozen=True)
-@dataclass(frozen=True)
 class _Indexed:
     """A record beside its place in its shard, as a passthrough transform reads it."""
 
