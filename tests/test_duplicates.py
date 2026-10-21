@@ -1,7 +1,8 @@
 """tools/duplicates.py, the duplicate-code gate: it refuses code two files write, read as text (pylint's
 similarity) and as structure (a function, or six statements, equal once names are renamed in order of use
 and constants read as their types), and passes the same files once the code has one owner its callers
-share. Held to a base, it refuses only a copy the base did not have."""
+share. Declarations alike (fields, imports, stubs, runs of one call) are no copy. Held to a base, it
+refuses only a copy the base did not have."""
 
 import subprocess
 import sys
@@ -99,17 +100,52 @@ def test_six_statements_two_functions_share_fail_where_their_functions_differ(tm
               + "    return {'balance': balance, 'kept': len(chosen)}\n")
     done = gate(tree(tmp_path / "copied", {"first.py": first, "second.py": second}))
     assert done.returncode == 1 and "duplicate statements in 2 files" in done.stdout
+    # Seven shared statements are two windows over one copy: the gate names the copy once.
+    steps.append("spread = max(kept) - min(kept)")
+    renamed.append("spread = max(chosen) - min(chosen)")
+    first = ("def first(values, limit, scale):\n" + "".join(f"    {s}\n" for s in steps)
+             + "    return balance * scale\n")
+    second = ("def second(values, limit):\n    values = sorted(values)\n"
+              + "".join(f"    {s}\n" for s in renamed)
+              + "    return {'balance': balance, 'kept': len(chosen)}\n")
+    done = gate(tree(tmp_path / "longer", {"first.py": first, "second.py": second}))
+    assert done.returncode == 1 and done.stdout.count("duplicate statements") == 1, done.stdout
+
+
+def test_two_files_closing_alike_on_exit_fail(tmp_path):
+    """Two context managers whose exits close the same way, the error noted on the one in flight: a small
+    function (ledger 934's size), written twice."""
+    exit_ = ("class {0}:\n    def close(self):\n        pass\n\n"
+             "    def __exit__(self, kind, {1}, traceback):\n        try:\n            self.close()\n"
+             "        except BaseException as {2}:\n            if {1} is None:\n                raise\n"
+             "            {1}.add_note(f'{0} cleanup failed: {{{2}!r}}')\n")
+    done = gate(tree(tmp_path / "copied", {"prefetch.py": exit_.format("Prefetch", "exc", "error"),
+                                           "tracker.py": exit_.format("Tracker", "pending", "failure")}))
+    assert done.returncode == 1 and "duplicate function in 2 files" in done.stdout, done.stdout
+    assert "Prefetch.__exit__" in done.stdout and "Tracker.__exit__" in done.stdout
 
 
 def test_declarations_alike_are_no_copy(tmp_path):
-    """Two records' annotated fields and two parsers' arguments, alike in shape, declare different things."""
+    """Two records' annotated fields and two parsers' arguments, alike in shape, declare different things;
+    so do two modules' imports, two protocols' stubs and two runs of values one function reads."""
     record = "from dataclasses import dataclass\n\n\n@dataclass\nclass {0}:\n" + "".join(
         f"    {{1}}{index}: tuple[int, ...] | None = None\n" for index in range(8))
     parser = ("import argparse\n\n\ndef {0}():\n    parser = argparse.ArgumentParser()\n" + "".join(
         f"    parser.add_argument('--{{1}}{index}', type=int, default={index})\n" for index in range(8))
         + "    return parser.parse_args()\n")
-    alike = tree(tmp_path / "alike", {"left.py": record.format("Left", "a") + parser.format("left", "x"),
-                                      "right.py": record.format("Right", "b") + parser.format("right", "y")})
+    imports = "".join(f"from {{0}}{index} import {{0}}a, {{0}}b, {{0}}c, {{0}}d, {{0}}e\n"
+                      for index in range(6))
+    stubs = "class {0}:\n" + "".join(f"    @property\n    def {{1}}{index}(self) -> int: ...\n"
+                                     for index in range(6))
+    reads = "".join(f"{{0}}{index} = {{1}}('{{0}}{index}')\n" for index in range(6))
+    alike = tree(tmp_path / "alike", {
+        "left.py": record.format("Left", "a") + parser.format("left", "x"),
+        "right.py": record.format("Right", "b") + parser.format("right", "y"),
+        "left_imports.py": imports.format("left"), "right_imports.py": imports.format("right"),
+        "left_stubs.py": stubs.format("LeftNames", "token"),
+        "right_stubs.py": stubs.format("RightNames", "field"),
+        "left_reads.py": "values = {}\n" + reads.format("width", "values.get"),
+        "right_reads.py": "import re\n" + reads.format("PATTERN", "re.compile")})
     assert gate(alike).returncode == 0, gate(alike).stdout
 
 
