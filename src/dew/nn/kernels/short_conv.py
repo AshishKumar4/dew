@@ -483,10 +483,6 @@ def _backward(x, taps, bias, valid, documents, cotangents, parts, activation: bo
     return dx, dw, None if bias is None else jnp.concatenate(db).astype(bias.dtype)
 
 
-def _conv(x, taps, bias, valid, documents, parts, activation, eps, dtype, interpret):
-    return _forward(x, taps, bias, valid, documents, parts, activation, eps, dtype, interpret)
-
-
 def _conv_fwd(x, taps, bias, valid, documents, parts, activation, eps, dtype, interpret):
     out = _forward(x, taps, bias, valid, documents, parts, activation, eps, dtype, interpret)
     return out, (x, taps, bias, valid, documents)
@@ -498,7 +494,7 @@ def _conv_bwd(parts, activation, eps, dtype, interpret, residual, cotangents):
     return dx, dw, db, None, None
 
 
-conv = jax.custom_vjp(_conv, nondiff_argnums=(5, 6, 7, 8, 9))
+conv = jax.custom_vjp(_forward, nondiff_argnums=(5, 6, 7, 8, 9))
 """`linear.causal_conv1d` on the kernels: `x` `[B, T, C]` convolved causally by `taps` `[C, K]` behind
 K-1 zero tokens, plus `bias` `[C]` or None, silu'd where `activation`, as the `parts` pieces
 `((width, head), ...)` of its channels in order, each `[B, T, width]` in `dtype`, a piece with a `head`
