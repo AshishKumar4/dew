@@ -1066,16 +1066,18 @@ def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
                 raise ValueError("a score hook takes no output parameter")
     initial = None
     if state is not None:
-        # The initial state as one more softmax term: its weight exp(m0 - m) / T, its value acc0 / total0.
-        weight = jnp.where((total > 0) & jnp.isfinite(starts[0]),
-                           jnp.exp(starts[0] - peak) / jnp.where(total > 0, total, 1.0), 0.0)
+        # The initial state as one more softmax term, its weight exp(m0 - m) / T and value acc0 / total0:
+        # each gradient divides by T first and takes the factor exp(m0 - m) last, so a state that weighs
+        # little beside the keys (a subnormal factor) is rounded once there, as the reference rounds it.
+        factor = jnp.where((total > 0) & jnp.isfinite(starts[0]), jnp.exp(starts[0] - peak), 0.0)
+        inverse = jnp.where(total > 0, 1.0 / jnp.where(total > 0, total, 1.0), 0.0)
         # Its maximum's cotangent, that term's score cotangent, taken whole as the reference's derivative
-        # takes it, so a state that weighs little beside the keys keeps its relative precision; exactly 0
-        # for a query that read only its state, whose output its maximum leaves unmoved.
-        moved = jnp.where(mass > 0, weight * (jnp.sum(state.acc.astype(jnp.float32) * cotangent, axis=-1)
-                                              - state.total.astype(jnp.float32) * delta), 0.0)
-        initial = Initial(m=moved.astype(state.m.dtype), total=(-weight * delta).astype(state.total.dtype),
-                          acc=(weight[..., None] * cotangent).astype(state.acc.dtype))
+        # takes it; exactly 0 for a query that read only its state, whose output its maximum leaves unmoved.
+        moved = (jnp.sum(state.acc.astype(jnp.float32) * cotangent, axis=-1)
+                 - state.total.astype(jnp.float32) * delta) * inverse
+        initial = Initial(m=jnp.where(mass > 0, moved * factor, 0.0).astype(state.m.dtype),
+                          total=(-(delta * inverse) * factor).astype(state.total.dtype),
+                          acc=((cotangent * inverse[..., None]) * factor[..., None]).astype(state.acc.dtype))
     return Gradients(dq[:, :queries, :, :width].astype(query.dtype),
                      dk[:, :keys, :, :width].astype(key.dtype),
                      dv[:, :keys, :, :value_width].astype(value.dtype),
