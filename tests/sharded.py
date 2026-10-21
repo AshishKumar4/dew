@@ -25,7 +25,7 @@ import math
 
 import jax
 import jax.numpy as jnp
-from jax.sharding import NamedSharding
+from jax.sharding import NamedSharding, PartitionSpec
 from reference_error import assert_as_exact
 
 from dew.telemetry.instrumentation import collective, custom_call_kind, hlo_instructions
@@ -85,6 +85,13 @@ def tpu_lowering(fn, args, mesh: jax.sharding.Mesh) -> str:
 
     with generation.assumed("v6e"), jax.set_mesh(mesh):
         return jax.export.export(jax.jit(fn), platforms=["tpu"])(*args).mlir_module()
+
+
+def placed(tree, mesh: jax.sharding.Mesh, *spec):
+    """`tree`'s arrays as abstract values placed on `mesh` by `PartitionSpec(*spec)`, for a step traced
+    and lowered for a mesh it does not run on."""
+    sharding = NamedSharding(mesh, PartitionSpec(*spec))
+    return jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype, sharding=sharding), tree)
 
 
 def assert_runs_per_shard(fn, draw, specs, mesh, label: str, *, seeds: int, truth_fn, moves=(),
