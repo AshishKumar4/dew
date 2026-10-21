@@ -469,6 +469,57 @@ def test_a_snapshot_of_fetched_bytes_trains_and_resumes_exactly_after_every_url_
         np.testing.assert_array_equal(expected["image"], found["image"])
 
 
+@pytest.mark.parametrize(("width", "height"), [(40, 20), (23, 40), (16, 16), (8, 6)])
+def test_a_fetched_web_image_is_fitted_whole_into_its_square(tmp_path, width, height):
+    """A fetched image fitted into a 16-pixel square keeps all it shows, as the retired online
+    loader fitted it: its longer side 16 pixels (area down, bicubic up), the shorter in proportion,
+    rounded, and the rest white, split evenly with the odd pixel at the bottom or right."""
+    import cv2
+
+    rng = np.random.default_rng(width * height)
+    pixels = rng.integers(0, 256, (height, width, 3), np.uint8)
+    Image.fromarray(pixels).save(tmp_path / "image.png")
+    chain = (Pipeline(Memory([{"url": (tmp_path / "image.png").as_uri()}])).filter_map(images.fetch(to="png"))
+             .filter_map(DecodeImage(field="png", to="image")).map(images.Fit(16)).batch(1))
+    reader = compile(chain, read="indexed", loading=READ).train(DataPartition())
+    try:
+        fitted = np.asarray(next(reader)["image"][0])
+    finally:
+        reader.close()
+    scale = 16 / max(width, height)
+    tall, wide = max(1, round(height * scale)), max(1, round(width * scale))
+    top, left = (16 - tall) // 2, (16 - wide) // 2
+    method = cv2.INTER_AREA if max(width, height) > 16 else cv2.INTER_CUBIC
+    assert fitted.shape == (16, 16, 3)
+    np.testing.assert_array_equal(fitted[top : top + tall, left : left + wide],
+                                  cv2.resize(pixels, (wide, tall), interpolation=method))
+    inside = np.zeros((16, 16), bool)
+    inside[top : top + tall, left : left + wide] = True
+    assert (fitted[~inside] == 255).all()
+
+
+def test_a_fetched_clip_under_the_least_size_is_dropped_before_it_is_fitted(tmp_path):
+    """Clips stored at 32 pixels a side, read for 16-pixel frames: with a least size of 48 they
+    are counted and dropped as too small before they are fitted, as the retired loader dropped
+    them; with 32 they are read."""
+    from test_data_av import FPS, _mux
+
+    clip = Path(_mux(tmp_path / "clip.avi", sound=0))
+
+    def read(least):
+        chain = (Pipeline(Memory([{"url": clip.as_uri()}])).repeat(1).filter_map(video.fetch())
+                 .random_filter_map(video.PickClip(8 / FPS))
+                 .filter_map(video.DecodeVideo(8, size=16, min_size=least)).batch(1))
+        reader = compile(chain, read="indexed", loading=READ).train(DataPartition())
+        try:
+            return [batch["video"].shape for batch in reader], rejected(reader)
+        finally:
+            reader.close()
+
+    assert read(32) == ([(1, 8, 16, 16, 3)], {})
+    assert read(48) == ([], {"too_small": 1})
+
+
 def test_a_web_video_flow_decodes_frames_from_fetched_bytes(tmp_path):
     """Clips fetched by url decode from their bytes to frames; bytes that are no clip are dropped."""
     from test_data_av import CLIP_FRAMES, FPS, GREY_STEP, _mux
