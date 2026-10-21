@@ -295,19 +295,25 @@ def test_quantizer_division_rounds_midpoint_neighbours_as_ieee_division():
 
 @pytest.mark.parametrize("tied", [True, False])
 def test_a_tiled_head_takes_each_tile_as_the_whole_head_takes_its_logits(tied):
-    """A chunked or fused head multiplies each vocabulary tile by `bf16_product` over the tile's rows
-    (`dew.objectives.lm.chunked`): of a bf16 model's head those are its logits' columns, bitwise, so a
-    logit near a bf16 tie rounds alike either way."""
+    """A chunked head multiplies each vocabulary tile by `bf16_product` over the tile's rows
+    (`dew.objectives.lm.chunked`): of a bf16 model those are its forward's logits' columns, bitwise,
+    so the chunked head predicts those logits' argmax wherever a tile cuts; its scores are held to
+    those logits' cross entropy by check 1 (tests/test_chunked_cross_entropy.py)."""
     from dew.nn.precision import bf16_product
+    from dew.objectives.lm.chunked import chunked_cross_entropy
 
     model = CausalTransformer(vocab_size=97, emb_features=32, num_layers=2, num_heads=4, mlp_features=64,
                               max_seq_len=16, tie_embeddings=tied, dtype=jnp.bfloat16)
     ids = jax.random.randint(jax.random.key(0), (2, 12), 0, 97)
+    targets = jax.random.randint(jax.random.key(1), (2, 12), 0, 97)
     variables = model.init(jax.random.key(0), ids)
-    states = model.apply(variables, ids, method="hidden_states").reshape(-1, 32)
+    logits = np.asarray(model.apply(variables, ids)).reshape(-1, 97)
+    states = model.apply(variables, ids, method="hidden_states")
     table = model.apply(variables, method="output_table")
-    whole = np.asarray(table.logits(states))
     rows = table.matrix if table.vocab_major else table.matrix.T
     for first in range(0, 97, 25):
-        tile = np.asarray(bf16_product("td,vd->tv", states, rows[first:first + 25]))
-        np.testing.assert_array_equal(tile, whole[:, first:first + 25])
+        tile = np.asarray(bf16_product("td,vd->tv", states.reshape(-1, 32), rows[first:first + 25]))
+        np.testing.assert_array_equal(tile, logits[:, first:first + 25])
+    for chunks in (1, 4):
+        _, predicted, _ = chunked_cross_entropy(states, table, targets, chunks)
+        np.testing.assert_array_equal(np.asarray(predicted).reshape(-1), logits.argmax(-1))
