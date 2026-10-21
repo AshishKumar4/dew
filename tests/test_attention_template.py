@@ -367,9 +367,9 @@ def test_a_resumed_partial_is_on_par_with_one_pass_over_its_keys(case, hooks):
     """The softmax over a call's first keys, its output, maxima and denominators resumed as the initial
     state of one over the rest (`template.Initial`, its numerator the output times the denominator, a
     query that saw nothing resuming from no state), gives the output, maxima and denominators of one
-    pass over every key, on par from float64. The queries and keys are drawn in halves, so every logit
-    is exact in fp32 however a product of the call's shape sums it, and the two arms differ only by the
-    resume's own arithmetic."""
+    pass over every key, on par from float64. The queries and keys are drawn in halves, so every product
+    of a query with a key is exact in fp32 however a product of the call's shape sums it, the scaled
+    logits are the same in both arms, and they differ only by the resume's own arithmetic."""
     queries, keys = geometry(case)
     spans = template.spans(queries, keys, ROWS, **arguments(case))
     edge = keys // 2
@@ -468,6 +468,16 @@ def test_chunks_keep_the_keys_dews_chunk_mask_keeps_over_any_document_layout(ids
         expected = document_mask(ids) & chunk_mask(places, places, chunk)[:, 0]
         if causal:
             expected &= np.tril(np.ones((tokens, tokens), bool))
+        np.testing.assert_array_equal(np.asarray(template.dense(spans)), np.asarray(expected))
+
+
+def test_a_chunk_wider_than_int32_holds_every_place():
+    """A chunk wider than int32 counts holds the largest places together, as `chunk_mask` does."""
+    with jax.enable_x64(new_val=True):
+        ids = jnp.asarray([[1, 1]], jnp.int32)
+        places = jnp.asarray([[2 ** 31 - 2, 2 ** 31 - 1]], jnp.int64)
+        spans = template.spans(2, 2, 1, chunk=2 ** 31, positions=(places, places), segment_ids=ids)
+        expected = document_mask(ids) & chunk_mask(places, places, 2 ** 31)[:, 0]
         np.testing.assert_array_equal(np.asarray(template.dense(spans)), np.asarray(expected))
 
 
