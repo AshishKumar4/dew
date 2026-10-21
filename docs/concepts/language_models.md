@@ -47,7 +47,7 @@ from dew.nn.backbones import CausalTransformer
 from dew.objectives.lm import LMObjective, Perplexity
 from dew.sampling import Sampling, generate
 
-train, val = TokenFiles("data/stories-byte").holdout(split="val")
+train, val = TokenFiles("data/stories-byte/train"), TokenFiles("data/stories-byte/val")
 data = train.shuffle(seed=0).repeat().pipe(presets.token_windows, seq_len=64, batch=16)
 held = val.pipe(presets.token_windows, seq_len=64, batch=16, records=64)
 model = CausalTransformer(vocab_size=tokenizer.vocab_size,
@@ -73,7 +73,7 @@ Trained 300 steps in 0:00:14: first step after 2.76 s, then 30.0 step/s
 One day, Lily saw a big dog in the park. The dog want
 ```
 
-`TokenFiles` reads the store's `train` and `val` splits, and the `token_windows` preset cuts each stream into windows by index: `seq_len=64` yields rows of 65 IDs under the key `text`. `LMObjective(model, seq_len=64)` feeds the first 64 to the model and scores the predictions against the next 64. Token IDs must be integers inside the model's vocabulary. `temperature=0.0` picks the most likely token at every step, and the returned row holds the prompt followed by the continuation.
+`TokenFiles` reads each store, and the `token_windows` preset cuts its stream into windows by index: `seq_len=64` yields rows of 65 IDs under the key `text`. `LMObjective(model, seq_len=64)` feeds the first 64 to the model and scores the predictions against the next 64. Token IDs must be integers inside the model's vocabulary. `temperature=0.0` picks the most likely token at every step, and the returned row holds the prompt followed by the continuation.
 
 The training loss is near zero because the same four sentences repeat, and validation on the held-out start of the stream scores just as low. Validation and the generation above both use the trained `lm_state.variables`, since the objective keeps no moving average unless `ema_decay` is set.
 
@@ -107,7 +107,7 @@ The measured run changes these settings from the example:
 | Setting | Value |
 |---|---|
 | Tokenizer | `HFTokenizer("gpt2")` |
-| Data | `TokenFiles("data/tinystories").holdout(split="val")`, each part through `presets.token_windows` with `seq_len=256, batch=32` |
+| Data | `TokenFiles("data/tinystories/train")` and `TokenFiles("data/tinystories/val")`, each through `presets.token_windows` with `seq_len=256, batch=32` |
 | Model | `emb_features=256, num_layers=4, num_heads=4, max_seq_len=256, dtype=jnp.bfloat16` |
 | Optimizer | `OptimConfig(learning_rate=1e-3)` |
 | Objective | `LMObjective(model, seq_len=256, ema_decay=0.999)` |
@@ -155,7 +155,7 @@ export([{"text": ids[:held]}], "data/corpus-byte/val", format="array_record",
        metadata=metadata, length_field="text")
 ```
 
-`TokenFiles("data/corpus-byte").holdout(split="val")` reads those stores as training and validation parts, and `presets.token_windows` with `seq_len=64, batch=8` cuts each into windows. Indexed mode reads producer lengths without scanning token payloads.
+`TokenFiles("data/corpus-byte/train")` and `TokenFiles("data/corpus-byte/val")` read those stores, and `presets.token_windows` with `seq_len=64, batch=8` cuts each into windows. Indexed mode reads producer lengths without scanning token payloads.
 
 - `token_windows`, and `presets.lm` with `pack=None`, cut fixed windows of `seq_len + 1` IDs, `{"text": int32 [B, seq_len + 1]}`. Each starts `seq_len` IDs after the last.
 - `presets.lm` with `pack="first-fit"`, its default, keeps documents in padded windows and adds aligned segment IDs and positions; `pack="concat"` concatenates and splits aligned fields. Over a store's documents it takes `tokenizer=None`.
