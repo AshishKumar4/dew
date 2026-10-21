@@ -35,8 +35,7 @@ class Concatenate(Dataset):
     or stores of any kinds. A record's position is its place in that order, every source's shards
     are its shards, and its identity is its sources' in order, so a run resumes on it as on any
     store and a changed source refuses the resume as it would alone. It is a store wherever one is
-    read, a recipe's source (`ImageData(source=...)`) among them; `concat` joins stores as a
-    dataset."""
+    read; `concat` joins stores as a dataset."""
 
     sources: tuple[Source, ...]
 

@@ -1,8 +1,8 @@
 """Supervised fine-tuning data: conversations with a role on every token.
 
-The `Chat` recipe reads conversations from a parquet file, a JSONL file or
-an `hf://` Hub dataset, and renders each with the tokenizer's chat
-template. Every token gets the role of the message that wrote it, so
+The sft preset (`dew.data.presets.sft`) reads conversations from any store, a parquet file, a JSONL
+file or a Hub dataset among them, and renders each with the tokenizer's chat template
+(`template`). Every token gets the role of the message that wrote it, so
 `LMObjective` with `loss_role=Role.ASSISTANT` trains on assistant tokens
 only.
 
@@ -14,7 +14,7 @@ stream's position is a global window count, so a run can resume on any
 number of processes.
 
 Block diffusion reads a prompt and the canvases after it instead, so its
-`ChatCanvasData` recipe lays each assistant turn out as a row of its own,
+canvas preset (`dew.data.presets.canvas`) lays each assistant turn out as a row of its own,
 unpacked: the conversation before the turn, then the turn on whole canvases.
 
 A `Message` holds the fields the Hugging Face chat-template contract reads:

@@ -5,27 +5,22 @@ from __future__ import annotations
 import dataclasses
 import functools
 import itertools
-import json
-import random
 from collections.abc import Callable, Iterator, Mapping, Sequence
-from types import UnionType
-from typing import TYPE_CHECKING, ClassVar, Literal, Protocol, TypeAliasType, runtime_checkable
+from typing import TYPE_CHECKING, ClassVar, Protocol, runtime_checkable
 
 import numpy as np
-import tyro
 
 from dew.data.dataset import Batch, Records
-from dew.data.pipeline import Dataset, Mixture, Phases, Pipeline, Stage
+from dew.data.pipeline import Dataset, Mixture, Phases, Pipeline
 from dew.data.sources.base import Read, Shard, ShardManifest, Source, _consumed, _uncounted, stated
 from dew.data.sources.codec import content_fingerprint
-from dew.records import integer
 
 if TYPE_CHECKING:
-    from dew.data.sources.files import Format
+    pass
 
 _INDEXED_READS: tuple[Read, ...] = ("memory", "indexed")
 _BY_INDEX = ("reads by index, under read='memory' or 'indexed'; a stream holds out a hash fraction "
-             "(HoldOut(fraction=..., by='hash'), or Dataset.holdout(fraction)) or nothing (validation=None)")
+             "(holdout(fraction)) or nothing")
 """Why a holdout that picks records by their index refuses a streamed read, and what streams."""
 
 
@@ -45,7 +40,7 @@ def _named_split(source: Source, name: str) -> Source:
 @dataclasses.dataclass(frozen=True)
 class _SliceRecords:
     reads: ClassVar[tuple[Read, ...]] = _INDEXED_READS
-    refusal: ClassVar[str] = f"a records= or index-fraction holdout {_BY_INDEX}"
+    refusal: ClassVar[str] = f"a records= holdout {_BY_INDEX}"
     source: Source
     start: int
     stop: int | None = None
@@ -131,7 +126,7 @@ class _HashSource:
 
     reads: ClassVar[tuple[Read, ...]] = ("memory", "streamed")
     refusal: ClassVar[str] = ("a hash holdout reads every row to place it, under read='memory' or "
-                              "'streamed'; an indexed read holds out records= or an index fraction")
+                              "'streamed'; an indexed read holds out records=")
     source: Source
     low: float
     high: float
@@ -231,126 +226,7 @@ def holdout(dataset: Dataset, fraction: float | None = None, *, key: str | None 
     return (trained, *(_rebased(dataset, part) for part in held))
 
 
-type SourceValue = Source | str | Sequence[Batch] | Mapping[str, Sequence]
-type Validation = HoldOut | Split | Pipeline | Source | str | Sequence[Batch] | Mapping[str, Sequence] | None
-
-
-def source_argument(annotation: type | UnionType | TypeAliasType):
-    def read(words):
-        from dew.registry import from_record
-
-        word = words[0]
-        if word == "None":
-            return None
-        if word.startswith(("{", "[")):
-            value = json.loads(word)
-            return (
-                from_record(annotation, value, dtypes=False)
-                if isinstance(value, Mapping) and "class" in value
-                else value
-            )
-        return word
-
-    def write(value):
-        from dew.registry import to_record
-
-        return [
-            value
-            if isinstance(value, str)
-            else "None"
-            if value is None
-            else json.dumps(to_record(value, None))
-        ]
-
-    return tyro.constructors.PrimitiveConstructorSpec(
-        nargs=1,
-        metavar="URL|JSON",
-        instance_from_str=read,
-        is_instance=lambda value: value is None
-        or isinstance(value, (str, Source, Mapping, Sequence))
-        or dataclasses.is_dataclass(value),
-        str_from_instance=write,
-    )
-
-
-@dataclasses.dataclass(frozen=True)
-class HoldOut:
-    records: int | None = None
-    fraction: float | None = None
-    by: Literal["index", "hash", "random"] = "index"
-    most: int | None = None
-    seed: int = 0
-
-    def __post_init__(self) -> None:
-        if (self.records is None) == (self.fraction is None):
-            raise ValueError("HoldOut needs records or fraction, exactly one")
-        if self.records is not None and self.records < 0:
-            raise ValueError("HoldOut records must be nonnegative")
-        if self.fraction is not None and not 0 <= self.fraction < 1:
-            raise ValueError("HoldOut fraction must be in [0, 1)")
-
-
-@dataclasses.dataclass(frozen=True)
-class Split:
-    name: str = "validation"
-
-
-@dataclasses.dataclass(frozen=True)
-class _RandomSource:
-    reads: ClassVar[tuple[Read, ...]] = _INDEXED_READS
-    refusal: ClassVar[str] = f"a random holdout {_BY_INDEX}"
-    source: Source
-    split: HoldOut
-    held: bool
-
-    def consumed(self, read: Read) -> _RandomSource:
-        return dataclasses.replace(self, source=_consumed(self.source, read))
-
-    def label(self) -> str:
-        return self.source.label()
-
-    def describe(self) -> str:
-        return f"{self.source.describe()} random holdout={self.split!r},held={self.held}"
-
-    def fingerprint(self) -> Mapping[str, object]:
-        return {**self.source.fingerprint(), "holdout": dataclasses.asdict(self.split), "held": self.held}
-
-    def supports(self, read: Read) -> bool:
-        return read in self.reads and self.source.supports(read)
-
-    def _indices(self, count: int) -> tuple[int, ...]:
-        size = (
-            self.split.records
-            if self.split.records is not None
-            else int(count * (self.split.fraction or 0.0))
-        )
-        size = min(size, self.split.most) if self.split.most is not None else size
-        order = list(range(count))
-        random.Random(self.split.seed).shuffle(order)
-        chosen = set(order[:size])
-        return tuple(index for index in range(count) if (index in chosen) == self.held)
-
-    def records(self, read: Read):
-        import grain.python as grain
-
-        rows = self.source.records(read)
-        return grain.MapDataset.source(self._indices(len(rows))).map(_SelectedRow(rows))
-
-    def metadata(self) -> Mapping[str, object]:
-        return _uncounted(self.source.metadata())
-
-    def stated(self) -> Mapping[str, object]:
-        return _uncounted(stated(self.source))
-
-    def lengths(self) -> np.ndarray | None:
-        lengths = self.source.lengths()
-        return None if lengths is None else lengths[list(self._indices(len(lengths)))]
-
-    def manifest(self) -> ShardManifest:
-        raise ValueError(self.refusal)
-
-
-_SELECTIONS = (_HashSource, _SliceRecords, _RandomSource)
+_SELECTIONS = (_HashSource, _SliceRecords)
 
 
 def selecting(source: Source | Mixture | Phases) -> Iterator[Source | Mixture | Phases]:
@@ -366,57 +242,3 @@ def rebased(source: Source | Mixture | Phases, replacement: Source,
     if source is not under and isinstance(source, _SELECTIONS):
         return dataclasses.replace(source, source=rebased(source.source, replacement, under))
     return replacement
-
-
-def _source(
-    value: SourceValue | Mapping[str, float], *, split: str = "train", format: Format | None = None
-) -> Source:
-    from dew.data.sources import source
-
-    return source(value, split=split, format=format)
-
-
-def _split(source: Source, split: Split) -> Source:
-    """`source`'s own split `split.name`."""
-    return _named_split(source, split.name)
-
-
-def _branches(
-    value: SourceValue | Mapping[str, float],
-    validation: Validation,
-    *,
-    split: str,
-    prefix: tuple[Stage, ...],
-    format: Format | None = None,
-) -> tuple[Pipeline, Pipeline | None]:
-    source = _source(value, split=split, format=format)
-    held: Source | None = None
-    train = Pipeline(source, prefix)
-    if isinstance(validation, Pipeline):
-        return train, validation
-    if isinstance(validation, HoldOut):
-        if validation.by == "random":
-            train = Pipeline(_RandomSource(source, validation, held=False), prefix)
-            held = _RandomSource(source, validation, held=True)
-        elif validation.by == "hash":
-            if validation.fraction is None:
-                raise ValueError("hash HoldOut needs fraction=")
-            train = Pipeline(_HashSource(source, 0.0, validation.fraction, held=False), prefix)
-            held = _HashSource(source, 0.0, validation.fraction, held=True)
-        else:
-            count = validation.records
-            if count is None:
-                facts = source.metadata()
-                if "rows" not in facts:
-                    raise ValueError(f"fraction HoldOut of {source.describe()} needs authoritative rows")
-                if validation.fraction is None:
-                    raise ValueError("fraction HoldOut needs fraction=")
-                count = int(integer(facts["rows"], "rows") * validation.fraction)
-            train = Pipeline(_SliceRecords(source, count), prefix)
-            held = _SliceRecords(source, 0, count) if count else None
-    elif isinstance(validation, Split):
-        held = _split(source, validation)
-    elif validation is not None:
-        held = _source(validation, format=format)
-    evaluated = None if held is None else Pipeline(held, prefix)
-    return train, evaluated

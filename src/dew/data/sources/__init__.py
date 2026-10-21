@@ -1,8 +1,7 @@
-"""Storage capabilities and the source boundary used by pipeline recipes."""
+"""Storage capabilities and the source boundary every chain reads through."""
 
 from __future__ import annotations
 
-import json
 from collections.abc import Mapping, Sequence
 from os import PathLike, fspath
 
@@ -34,25 +33,12 @@ def source(
             repo, _, revision = url.removeprefix("hf://").removeprefix("datasets/").partition("@")
             resolved = Hub(repo=repo, revision=revision or None, split=split or "train")
         else:
-            from dew.data.storage import Store
-
-            fs, path = Store(url).resolve()
-            token_file = path.rstrip("/") + f"/{split or 'train'}.bin"
             files = Files(url, format=format)
             committed = files.committed
             metadata = None if committed is None else committed.get("metadata")
-            native_tokens = isinstance(metadata, Mapping) and metadata.get("token_store") is True
-            metadata_path = path.rstrip("/") + "/meta.json"
-            if format is None and not native_tokens and fs.exists(metadata_path):
-                metadata = json.loads(fs.cat_file(metadata_path))
-                native_tokens = (
-                    isinstance(metadata, Mapping) and {"tokenizer", "dtype", "vocab_size"} <= metadata.keys()
-                )
-            resolved = (
-                TokenFiles(url, split or "train")
-                if format is None and (native_tokens or fs.exists(token_file))
-                else files
-            )
+            # A committed token export reads as its token store, unless a format names its files.
+            tokens = format is None and isinstance(metadata, Mapping) and metadata.get("token_store") is True
+            resolved = TokenFiles(url) if tokens else files
     elif isinstance(value, (DataFrame, Mapping, Sequence)):
         resolved = Memory(value)
     else:

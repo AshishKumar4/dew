@@ -212,21 +212,6 @@ def record_argument[Value](annotation: type[Value]) -> tyro.constructors.Primiti
     )
 
 
-@dataclasses.dataclass(frozen=True)
-class DataPhase:
-    """One phase of a run's data: what it reads and the step it ends at.
-
-    `path` names one corpus or a weighted mixture, the same way the spec's own
-    `path` does. `until_step` is the step the phase ends before, counted from
-    the run's start in steps of the full batch, or None for the last phase,
-    which runs to the end. `PhasedStream` describes how a resume treats a
-    changed phase list.
-    """
-
-    path: str | Mapping[str, float]
-    until_step: int | None = None
-
-
 @runtime_checkable
 class Closeable(Protocol):
     """A stream that holds resources a stopped run must release, such as worker processes,
@@ -1416,7 +1401,6 @@ __all__ = [
     "Checkpointable",
     "Closeable",
     "DataPartition",
-    "DataPhase",
     "Forwarding",
     "GlobalStream",
     "Identified",

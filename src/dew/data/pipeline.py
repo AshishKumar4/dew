@@ -129,10 +129,10 @@ class Measure(Protocol):
 class Configured:
     """Resolve one record step from source facts before any record reader opens. `one_to_one`
     states that the step keeps one record for each input whatever the facts, which a cache after it
-    and a recipe's order read before it binds; binding it to a step that drops or expands records is
-    refused. `measures` measures a fact it needs over each store it reads, in a memory read: the
-    whole store, below any holdout, so the parts a run trains and scores on agree; a store's own
-    statement of it gives way to the measure, and a mixture's step binds the largest of its stores'."""
+    reads before it binds; binding it to a step that drops or expands records is refused.
+    `measures` measures a fact it needs over each store it reads, in a memory read: the whole store,
+    below any holdout, so the parts a run trains and scores on agree; a store's own statement of it
+    gives way to the measure, and a mixture's step binds the largest of its stores'."""
 
     factory: Callable[[Mapping[str, object]], RecordStep | pygrain.RandomMapTransform | Expansion]
     needs: tuple[str, ...]
