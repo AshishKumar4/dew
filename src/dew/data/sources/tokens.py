@@ -218,8 +218,9 @@ class TokenFiles(Dataset):
             "split": _SPLIT,
             "metadata": self.meta,
             "field": self.field,
+            # An export of no rows has no shards to name.
             "shards": Files(self.tokens.paths, format="array_record",
-                            storage_options=self.storage_options).fingerprint(),
+                            storage_options=self.storage_options).fingerprint() if self.tokens.paths else [],
             "index": None,
             "shard_rows": None,
             "producer": self.committed,
