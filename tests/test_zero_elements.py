@@ -466,3 +466,34 @@ def test_a_function_that_reads_its_arguments_in_python_is_named_and_not_certifie
     coverage = zero_elements(numpy_side, numpy_side, (jnp.ones(3, jnp.float32),), "numpy")
     assert (coverage.certified, coverage.uncertified, coverage.over) == (0, 3, [])
     assert any(name.startswith("not a traceable program") for name in coverage.blocked)
+
+
+def test_a_function_whose_enclosure_reaches_a_pole_is_not_certified():
+    """log and rsqrt where the operand's interval touches the pole (a subnormal input, held to its own
+    size, which a backend may read as zero), and log1p at -1 so: no finite bound, so not certified; an
+    enclosure past float64's range is not certified rather than raising."""
+    tiny = jnp.asarray([2.0 ** -149], jnp.float32)
+    for function in (jnp.log, jax.lax.rsqrt, lambda x: jnp.log1p(x - 1)):
+        out, _ = _interpreted(function, tiny)
+        assert not out.certified.any(), function
+    # 700 + ((2^60 + 10) - 2^60): 700 natively, its bound past 100, so expm1's enclosure reaches past
+    # float64's range.
+    out, _ = _float64(lambda x: jnp.expm1(x[2] + ((x[0] + x[1]) - x[0])), [2.0 ** 60, 10.0, 700.0])
+    assert not out.certified.any()
+
+
+def test_a_log_whose_operands_interval_reaches_zero_is_not_certified():
+    """z = b - ((A + a) - A) at A = 2^54, a just under 2 and b just over it: z is b natively with a
+    propagated bound of b, so log's enclosure over [0, 2b] reaches -inf; no finite bound, not certified
+    (an infinite end read as zero once certified a bound of 0.69 against a distance of 32.6)."""
+    a, b = float(np.nextafter(2.0, 0.0)), float.fromhex("0x1.000000000001fp+1")
+    out, _ = _float64(lambda x: jnp.log(x[2] - ((x[0] + x[1]) - x[0])), [2.0 ** 54, a, b])
+    assert not out.certified.any()
+
+
+def test_a_linear_call_is_interpreted_through_its_callee():
+    from jax.custom_derivatives import linear_call
+
+    x = jnp.asarray([1.5, -2.0], jnp.float32)
+    out, _ = _interpreted(lambda v: linear_call(lambda _, t: t * 2, lambda _, t: t * 2, (), v), x)
+    assert out.certified.all() and out.exact.all()
