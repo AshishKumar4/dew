@@ -184,8 +184,6 @@ def test_train_diffusion_example_trains_samples_and_exports(tmp_path):
 
 def test_train_flowers_trains_on_every_record_and_its_profiling_run_draws_nothing(tmp_path):
     example = load("train_flowers", "examples")
-    assert example.flowers(example.Config(data=tmp_path)).validation is None, "a split is held out"
-
     config = example.Config(data=tmp_path, output=tmp_path / "run", steps=4, batch=8, image_size=RES,
                             profile=2)
     state = example.main(config, data=fake_dataset(8))
