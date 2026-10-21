@@ -394,3 +394,83 @@ def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
     out, m, total = jax.vmap(jax.vmap(one, in_axes=(None, 0)), in_axes=(0, None))(rows, jnp.arange(heads))
     out = jnp.swapaxes(out, 1, 2)
     return (out, m, total) if residuals else out
+
+
+def power_of_two(width: int) -> int:
+    """The power of two from 16 that holds `width`: a head width a kernel tiles."""
+    return max(16, 1 << (width - 1).bit_length())
+
+
+def _whole(count: int, block: int) -> int:
+    """`count` rounded up to whole `block`s."""
+    return -(-count // block) * block
+
+
+def _padded(param: Param, queries: int, keys: int, value_width: int) -> jax.Array:
+    """A hook parameter at the padded call's shape, in fp32 as the kernels compute (its gradient returns
+    in its own dtype): zeros past its queries, keys and value width, and a head vector at a power of
+    two."""
+    value = param.value
+    if jnp.issubdtype(value.dtype, jnp.floating):
+        value = value.astype(jnp.float32)
+    match param.kind:
+        case Kind.HEAD:
+            return jnp.pad(value, (0, power_of_two(value.shape[0]) - value.shape[0]))
+        case Kind.QUERY:
+            return jnp.pad(value, ((0, 0), (0, 0), (0, queries - value.shape[2])))
+        case Kind.KEY:
+            return jnp.pad(value, ((0, 0), (0, 0), (0, keys - value.shape[2])))
+        case Kind.TILE:
+            return jnp.pad(value, ((0, 0), (0, 0), (0, queries - value.shape[2]), (0, keys - value.shape[3])))
+        case Kind.OUTPUT:
+            return jnp.pad(value, ((0, 0), (0, queries - value.shape[1]), (0, 0),
+                                   (0, value_width - value.shape[3])))
+
+
+@dataclasses.dataclass(frozen=True)
+class PaddedCall:
+    """A call at the launches' padded shapes (`padded_call`): its queries and keys at whole blocks of
+    a backend's largest tile (at least one, so a call of no keys still has a tile to trace), its head
+    widths at powers of two, its spans' rows and its score and output hooks' parameters alike; the
+    padding is unread and sliced off."""
+
+    query: jax.Array
+    key: jax.Array
+    value: jax.Array
+    start: jax.Array
+    end: jax.Array
+    query_ids: jax.Array | None
+    key_ids: jax.Array | None
+    score_params: tuple[jax.Array, ...]
+    output_params: tuple[jax.Array, ...]
+    queries: int
+    keys: int
+
+    def rows(self, array: jax.Array, fill: float = 0.0) -> jax.Array:
+        """A `[B, H, Q, ...]` row statistic at the padded queries."""
+        pad = [(0, 0), (0, 0), (0, self.query.shape[1] - array.shape[2]), *[(0, 0)] * (array.ndim - 3)]
+        return jnp.pad(array, pad, constant_values=fill)
+
+
+def padded_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks,
+                block: int) -> PaddedCall:
+    """A call's one padding for every mainloop of the template (`PaddedCall`): its queries and keys at
+    whole `block`s (a backend's largest tile), its head widths at powers of two."""
+    queries, width = query.shape[1], query.shape[3]
+    keys, value_width = key.shape[1], value.shape[-1]
+    padded_q, padded_k = _whole(max(queries, 1), block), _whole(max(keys, 1), block)
+    padded_d, padded_dv = power_of_two(width), power_of_two(value_width)
+
+    def pad(array, rows, columns):
+        return jnp.pad(array, ((0, 0), (0, rows - array.shape[1]), (0, 0), (0, columns - array.shape[3])))
+
+    def pad_rows(array, rows):
+        return None if array is None else jnp.pad(array, ((0, 0), (0, rows - array.shape[1])))
+
+    return PaddedCall(pad(query, padded_q, padded_d), pad(key, padded_k, padded_d),
+                   pad(value, padded_k, padded_dv), pad_rows(spans.start, padded_q),
+                   pad_rows(spans.end, padded_q), pad_rows(spans.query_ids, padded_q),
+                   pad_rows(spans.key_ids, padded_k),
+                   tuple(_padded(param, padded_q, padded_k, padded_dv) for param in hooks.score_params),
+                   tuple(_padded(param, padded_q, padded_k, padded_dv) for param in hooks.output_params),
+                   queries, keys)
