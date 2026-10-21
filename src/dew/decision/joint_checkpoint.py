@@ -160,7 +160,8 @@ class JointCheckpoint:
 
             # The snapshot holds the backbone's weights alone; the head comes from the same commit.
             hf_hub_download(str(name_or_dir), HEAD_WEIGHTS, revision=root.name)
-        bundle = Pretrained.load(root, dtype=dtype, param_dtype=param_dtype, attention_impl=attention_impl)
+        bundle = Pretrained.load(root, dtype=dtype, param_dtype=param_dtype, attention_impl=attention_impl,
+                                 on_host=True)
         _, head_dtype = DecisionModel.head_size(bundle.model)
         head = StoredJointHead.load(root, dtype=head_dtype, param_dtype=param_dtype,
                                     attention_impl=attention_impl)
