@@ -1043,7 +1043,7 @@
    "by": "2026-11-13"
   },
   "tests/test_vae_16ch.py": {
-   "comparisons": 6,
+   "comparisons": 5,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
