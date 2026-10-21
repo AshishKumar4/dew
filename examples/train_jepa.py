@@ -48,9 +48,10 @@ def flowers(config: Config) -> tuple[Dataset, Dataset]:
     source = TFDS("oxford_flowers102", split="all",
                   path=None if config.data_path is None else str(config.data_path.expanduser()))
     train, validation = source.holdout(records=4 * config.batch_size)
-    return (train.shuffle(seed=0).repeat().pipe(presets.images, config.image_size, batch=config.batch_size,
-                                                augment=True),
-            validation.pipe(presets.images, config.image_size, batch=config.batch_size))
+    # rejects=False: every record decodes or the run stops, so an epoch's length is known up front.
+    sized = {"batch": config.batch_size, "rejects": False}
+    return (train.shuffle(seed=0).repeat().pipe(presets.images, config.image_size, augment=True, **sized),
+            validation.pipe(presets.images, config.image_size, **sized))
 
 
 def main(config: Config, data=None):
