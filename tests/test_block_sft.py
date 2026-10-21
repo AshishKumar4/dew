@@ -112,7 +112,8 @@ def update_site(obj, variables, batch, run_key, model, build):
         return ({**variables, "params": jax.tree.unflatten(tree, moved)},)
 
     def stepped(values):
-        state = jax.tree.map(jnp.copy, initial).replace(variables=jax.tree.map(jnp.asarray, values))
+        # The step consumes its state: it steps copies, the draw's own arrays left for the other arms.
+        state = jax.tree.map(jnp.copy, initial).replace(variables=jax.tree.map(jnp.copy, values))
         state, *_ = run(state, batch)
         return jax.tree.map(np.asarray, state.variables["params"])
 
