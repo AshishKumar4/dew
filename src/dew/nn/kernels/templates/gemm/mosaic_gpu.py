@@ -333,12 +333,7 @@ def _gmm_cooperative(lhs, rhs, lengths, shape: tuple, *, tiles: Tiles, transpose
                     _load_fixed([prologue_gmems[i].at[pl.ds(row_start, block_m)] for i in fixed], fixed_refs,
                                 fixed_barriers, wg)
 
-                    @functools.partial(pl.run_scoped, acc_ref=plgpu.WGMMAAccumulatorRef((block_m, half)))
-                    def _(acc_ref):
-                        run(acc_ref)
-                        plgpu.wgmma_wait(0)
-                        plgpu.barrier_arrive(drained)
-                        finish(acc_ref[...])
+                    _finished(run, (block_m, half), drained, finish)
 
                 def mma(_, lhs_smem, rhs_smem, *rest):
                     *side_smems, acc_ref = rest
@@ -381,6 +376,26 @@ def _gmm_cooperative(lhs, rhs, lengths, shape: tuple, *, tiles: Tiles, transpose
     return kernel(lengths, lhs, rhs, *prologue_operands, *epilogue_operands)
 
 
+def _finished(run, shape: tuple[int, int], drained, finish) -> None:
+    """A consumer's output tile: `run` on a scoped warpgroup accumulator of `shape`, its MMAs waited
+    for, the tile reported drained (`drained`, the producer's cue to reload its stage), then `finish` of
+    its value."""
+    @functools.partial(pl.run_scoped, acc_ref=plgpu.WGMMAAccumulatorRef(shape))
+    def _(acc_ref):
+        run(acc_ref)
+        plgpu.wgmma_wait(0)
+        plgpu.barrier_arrive(drained)
+        finish(acc_ref[...])
+
+
+def _side_spec(axes: tuple, extent: dict, stepped: str) -> plgpu.BlockSpec:
+    """A side operand's block in shared memory: its tile at `extent` per launch axis, advancing along
+    `stepped` (the pipeline's axis) and fixed along the others, held one step longer for the MMA in
+    flight."""
+    return plgpu.BlockSpec(tuple(extent[axis] for axis in axes),
+                           lambda step: tuple(step if axis == stepped else 0 for axis in axes),
+                           memory_space=plgpu.SMEM, delay_release=_IN_FLIGHT)
+
 def _gmm_pipeline(tiles: Tiles, transpose_rhs: bool, steps: int, side_axes: tuple, body, context):
     """Dew: the cooperative `gmm`'s pipeline over the depth's `steps` blocks: the rows' stage, the matrix's
     (multicast to a pair), and each prologue side operand's that has depth, in a producer warpgroup; a
@@ -388,9 +403,7 @@ def _gmm_pipeline(tiles: Tiles, transpose_rhs: bool, steps: int, side_axes: tupl
     extent = {'rows': tiles.block_m, 'depth': tiles.block_k}
 
     def side_spec(axes):
-        return plgpu.BlockSpec(tuple(extent[axis] for axis in axes),
-                               lambda step: tuple(step if axis == 'depth' else 0 for axis in axes),
-                               memory_space=plgpu.SMEM, delay_release=_IN_FLIGHT)
+        return _side_spec(axes, extent, 'depth')
 
     rhs_block = (tiles.block_n, tiles.block_k) if transpose_rhs else (tiles.block_k, tiles.block_n)
     return plgpu.emit_pipeline_warp_specialized(
@@ -750,12 +763,7 @@ def _tgmm_cooperative(operands: tuple, groups: tuple, shape: tuple, *, tiles: Ti
                         store(summed)
                         return
 
-                    @functools.partial(pl.run_scoped, acc_ref=plgpu.WGMMAAccumulatorRef((block_m, half)))
-                    def _(acc_ref):
-                        run(acc_ref)
-                        plgpu.wgmma_wait(0)
-                        plgpu.barrier_arrive(drained)
-                        store(acc_ref[...])
+                    _finished(run, (block_m, half), drained, store)
 
                 nonempty = sizes_gmem[g_i] > 0  # an empty group's tile is zero
 
@@ -783,9 +791,7 @@ def _tgmm_pipeline(tiles: Tiles, side_axes: tuple, body, context, steps):
     extent = {'rows': tiles.block_k, 'depth': tiles.block_m}
 
     def side_spec(axes):
-        return plgpu.BlockSpec(tuple(extent[axis] for axis in axes),
-                               lambda step: tuple(step if axis == 'rows' else 0 for axis in axes),
-                               memory_space=plgpu.SMEM, delay_release=_IN_FLIGHT)
+        return _side_spec(axes, extent, 'rows')
 
     return plgpu.emit_pipeline_warp_specialized(
         body,

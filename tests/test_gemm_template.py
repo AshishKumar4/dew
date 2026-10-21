@@ -349,14 +349,20 @@ def test_a_dense_product_whose_extents_no_tile_divides_holds_check_1(transpose_r
     assert {('GmmTransposed' if transpose_rhs else 'Gmm', True), ('Tgmm', True)} <= ran
 
 
+def _dense_draw(rows: int, depth: int, width: int):
+    """A draw of a dense product's bf16 operands, `[rows, depth]` and `[depth, width]`."""
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        return (jnp.asarray(rng.normal(size=(rows, depth)), jnp.bfloat16),
+                jnp.asarray(rng.normal(size=(depth, width)), jnp.bfloat16))
+    return draw
+
+
 def test_a_dense_gradient_takes_a_padded_tile_where_no_dividing_one_fits():
     """A dense kernel gradient at depth 96 on Hopper: the tiles dividing 96 have 32 output rows, which
     Hopper's warpgroup MMA refuses, so a 64-row tile runs over the padded depth, and the gradients hold
     check 1 against JAX's derivative of the plain product."""
-    def draw(seed):
-        rng = np.random.default_rng(seed)
-        return (jnp.asarray(rng.normal(size=(256, 96)), jnp.bfloat16),
-                jnp.asarray(rng.normal(size=(96, 128)), jnp.bfloat16))
+    draw = _dense_draw(256, 96, 128)
 
     def loss(run):
         return jax.grad(lambda x, w: jnp.sum(run(x, w) * jnp.linspace(-1, 1, 128)), argnums=(0, 1))
@@ -380,10 +386,7 @@ def test_a_dense_products_exact_sums_survive_one_row_tile():
     """At the highest precision, a dense fp32 product of one row tile and many depth steps (its first grid
     axis one program, where a program id is a constant) sums each step's product by an IEEE add: its
     error holds check 1 against XLA's IEEE sums, which a tensor core's truncating accumulation does not."""
-    def draw(seed):
-        rng = np.random.default_rng(seed)
-        return (jnp.asarray(rng.normal(size=(64, 4096)), jnp.bfloat16),
-                jnp.asarray(rng.normal(size=(4096, 128)), jnp.bfloat16))
+    draw = _dense_draw(64, 4096, 128)
 
     def dew(x, w):
         return template.gemm(x, w, None, out_dtype=jnp.float32, precision="highest")
