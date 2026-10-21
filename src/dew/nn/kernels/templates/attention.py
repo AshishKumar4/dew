@@ -146,12 +146,17 @@ def spans(queries: int, keys: int, batch: int, *, causal: bool = False, sliding_
         query_places, key_places = (
             (index, jnp.broadcast_to(jnp.arange(keys, dtype=jnp.int32)[None, :], (batch, keys)))
             if positions is None else (positions[0].astype(jnp.int32), positions[1].astype(jnp.int32)))
-        # The query's chunk's places `[low, low + chunk)`, its last place saturating at int32's largest;
-        # its document's keys there run together in document order, since their places never decrease
-        # along it, and their first and last key indices bound the span.
-        width = min(chunk, jnp.iinfo(jnp.int32).max)
-        low = query_places // width * width
-        top = low + jnp.minimum(width - 1, jnp.iinfo(jnp.int32).max - jnp.maximum(low, 0))
+        # The query's chunk's places `[low, top]`, its last place saturating at int32's largest (a chunk
+        # wider than int32 holds every place of one sign); its document's keys there run together in
+        # document order, since their places never decrease along it, and their first and last key
+        # indices bound the span.
+        least, most = jnp.iinfo(jnp.int32).min, jnp.iinfo(jnp.int32).max
+        if chunk > most:
+            low = jnp.where(query_places >= 0, 0, least)
+            top = jnp.where(query_places >= 0, most, -1)
+        else:
+            low = query_places // chunk * chunk
+            top = low + jnp.minimum(chunk - 1, most - jnp.maximum(low, 0))
         placed = jnp.take_along_axis(key_places, order, axis=1)
         inside_lo = _searched(placed, run_lo, run_hi, low, "left")
         inside_hi = _searched(placed, run_lo, run_hi, top, "right")
