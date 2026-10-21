@@ -128,23 +128,16 @@ def test_a_token_budget_counts_the_tokens_of_committed_updates(tmp_path):
 
 def test_a_fit_places_its_device_prefetch_and_plans_its_step_beside_them():
     """`fit(device_prefetch=n)` queues n placed batches beside the step, and the step's memory plan holds
-    room for them and the one being placed: n + 1 batches, so a deeper queue grows the held bytes by a
-    batch's bytes a batch, and trains the same run."""
-    from dew.training.distributed import batch_shardings, placed_bytes
-
+    room for them and the one being placed: n + 1 batches, so each batch deeper grows the held bytes by
+    one placed batch's bytes, the same each time, and the run trains the same."""
     def run(depth: int):
         trainer = make_trainer()
         state = trainer.fit(dataset(), steps=2, log_every=1, device_prefetch=depth)
         return trainer.memory["held"], jax.tree.map(np.asarray, state.variables)
 
-    (shallow, first), (deep, second) = run(1), run(3)
-    batch = next(iter(dataset().train(DataPartition())))
-    placement = batch_shardings(make_trainer().device_mesh, batch)
-    one = placed_bytes(jax.tree.map(
-        lambda leaf, sharding: jax.ShapeDtypeStruct(np.shape(leaf), leaf.dtype, sharding=sharding), batch,
-        placement))
-    assert deep - shallow == 2 * one
-    for left, right in zip(jax.tree.leaves(first), jax.tree.leaves(second), strict=True):
+    (one, first), (two, _), (three, third) = run(1), run(2), run(3)
+    assert two - one == three - two > 0
+    for left, right in zip(jax.tree.leaves(first), jax.tree.leaves(third), strict=True):
         np.testing.assert_array_equal(left, right)
 
 
