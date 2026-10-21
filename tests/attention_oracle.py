@@ -73,7 +73,8 @@ def kept(q_len, k_len, *, causal=False, sliding_window=None, window=None, mask=N
     if causal:
         keep = keep & (cols <= rows)
     if sliding_window is not None:
-        keep = keep & (np.abs(cols - rows) < sliding_window)
+        # The keys within w - 1 of the query on either side.
+        keep = keep & (cols - rows > -sliding_window) & (cols - rows < sliding_window)
     if window is not None:
         left, right = window
         if left >= 0:
