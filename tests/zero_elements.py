@@ -65,12 +65,13 @@ def _times(a: np.ndarray, b: np.ndarray) -> np.ndarray:
 
 def _widened_sum(total: np.ndarray, terms: int, positive) -> np.ndarray:
     """A float64 sum of `terms` nonnegative bounds (products of them included), taken in any order,
-    widened to an upper bound of the exact sum: by γ64(terms) relatively, and by two of the least float64
-    for each of its `positive` terms, which a product or a partial sum may lose in underflow, so no
-    positive bound sums to zero."""
+    widened to an upper bound of the exact sum: by γ64(terms) relatively, and by two least normal float64
+    values for each of its `positive` terms, which a product or a partial sum may lose in underflow, a
+    flushing backend's included (the bound dots run in XLA), so no positive bound sums to zero."""
     widen = 1 + gamma(max(terms, 1), FLOAT64)
+    least = _least_normal(FLOAT64)
     with np.errstate(over="ignore"):
-        return _up(np.asarray(total, np.float64) * widen + 2 * np.asarray(positive, np.float64) * TINIEST)
+        return _up(np.asarray(total, np.float64) * widen + 2 * np.asarray(positive, np.float64) * least)
 
 
 @dataclasses.dataclass
