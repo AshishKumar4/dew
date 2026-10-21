@@ -2,10 +2,10 @@
 
 A training context runs Dew itself, not the stand-ins of model_client.
 `install` has IPython run each cell with its calls that name a batch, steps
-or log_every, or unpack keywords, passed through `capped`: a preset of
-`dew.data.presets`, called or given to a dataset's `pipe`, makes batches of at
-most BATCH, and a Dew `fit` runs at most STEPS steps, logging at least four
-times. Each cap prints what it
+or log_every, unpack keywords, or batch a dataset, passed through `capped`: a
+preset of `dew.data.presets`, called or given to a dataset's `pipe`, and a
+dataset's own `batch(n)` make batches of at most BATCH rows, and a Dew `fit`
+runs at most STEPS steps, logging at least four times. Each cap prints what it
 changed before the run's own output, so the cell's first lines say how this
 run differs from the code on the page.
 """
@@ -43,15 +43,20 @@ def fitted(steps, log_every):
 
 
 def capped(call, /, *args, **options):
-    """`call(*args, **options)`, its keywords capped where `call` is Dew's: a preset's batch (`batch`),
-    called or through a dataset's `pipe`, a `fit`'s steps and log_every, the latter its own default where
-    the cell names none (`fitted`). Whatever name the cell calls it by, and however it passes the
-    keywords."""
+    """`call(*args, **options)`, its arguments capped where `call` is Dew's: a preset's batch (`batch`),
+    called or through a dataset's `pipe`, a dataset's `batch(n)` rows, a `fit`'s steps and log_every, the
+    latter its own default where the cell names none (`fitted`). Whatever name the cell calls it by, and
+    however it passes them."""
     module = getattr(call, "__module__", None) or ""
     if module.split(".")[0] == "dew":
         name = getattr(call, "__name__", "")
         if (module == "dew.data.presets" or name == "pipe") and "batch" in options:
             options["batch"] = batch(options["batch"])
+        elif module == "dew.data.pipeline" and name == "batch":
+            if args:
+                args = (batch(args[0]), *args[1:])
+            elif "size" in options:
+                options["size"] = batch(options["size"])
         elif name == "fit" and "steps" in options:
             default = inspect.signature(call).parameters["log_every"].default
             options.update(fitted(options["steps"], options.get("log_every", default)))
@@ -59,12 +64,13 @@ def capped(call, /, *args, **options):
 
 
 class Capped(ast.NodeTransformer):
-    """A cell with each call that names one of `CAPPED` or unpacks keywords made through `capped`, as
-    IPython runs every cell of a training context (`install`)."""
+    """A cell with each call that names one of `CAPPED`, unpacks keywords or calls a `batch` method made
+    through `capped`, as IPython runs every cell of a training context (`install`)."""
 
     def visit_Call(self, node: ast.Call) -> ast.Call:
         self.generic_visit(node)
-        if not any(keyword.arg is None or keyword.arg in CAPPED for keyword in node.keywords):
+        method = isinstance(node.func, ast.Attribute) and node.func.attr == "batch"
+        if not method and not any(keyword.arg is None or keyword.arg in CAPPED for keyword in node.keywords):
             return node
         # This module, as a cell reaches it without binding a name of its own.
         module = ast.Call(ast.Name("__import__", ast.Load()), [ast.Constant("live_training")], [])
