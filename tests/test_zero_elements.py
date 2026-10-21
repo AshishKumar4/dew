@@ -278,7 +278,8 @@ def test_a_bound_survives_underflow_in_products_quotients_and_dots():
     """Exactness is never read off an underflowed residual, and a positive bound never rounds to zero:
     2^-540·2^-540, z/2^500 and z·2^-500 for z a cancellation's inexact zero all keep a positive bound."""
     product, _ = _float64(lambda a, b: a * b, [2.0 ** -540], [2.0 ** -540])
-    assert product.certified.all() and not product.exact.any() and float(product.error[0]) >= 2.0 ** -1080
+    assert product.certified.all() and not product.exact.any()
+    assert fractions.Fraction(float(product.error[0])) >= fractions.Fraction(2) ** -1080
 
     def cancelled(x):
         return (x[0] + x[1]) - x[0]
