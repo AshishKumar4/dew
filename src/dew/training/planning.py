@@ -21,6 +21,7 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import AbstractMesh, Mesh
 
+from dew.coordination import from_every_process
 from dew.data.dataset import rows_of
 from dew.nn.kernels.options import compiler_options
 from dew.nn.sharding import LayoutRefused
@@ -30,7 +31,6 @@ from dew.training.distributed import Placement, batch_divisor
 from dew.training.host import snapshot
 from dew.training.memory import (
     compiled_if_it_fits,
-    fits_everywhere,
     head_fused_of,
     head_tile_of,
     recompute_more,
@@ -97,8 +97,7 @@ def whole_step(outputs):
 
 
 def planned(candidates: Sequence[int], first: int, fits: Callable[[int], bool],
-            climb: Callable[[], bool], ruled_out: Callable[[int], bool] = lambda split: False,
-            likely: Callable[[int], bool] = lambda split: False) -> int | None:
+            climb: Callable[[], bool], likely: Callable[[int], bool] = lambda split: False) -> int | None:
     """The split a step reads its batch in, at the rung `climb` leaves the
     objective on, or None where no candidate fits.
 
@@ -124,24 +123,23 @@ def planned(candidates: Sequence[int], first: int, fits: Callable[[int], bool],
     10073768f); it plans offline and returns the frontier, where a run
     takes its first point.
 
-    What the compiles measured spares more of them (`plan_step`): a split
-    `ruled_out` by them cannot fit and is not compiled, and past a miss the
-    first split `likely` to fit is asked in place of the largest. Neither
-    moves the plan, only the compiles that find it: on an A100-40,
-    Qwen3.5-0.8B's packed 8 x 3072 search asked three where it asked six.
+    Past a miss, the first split `likely` to fit by what the compiles
+    measured (`Forecast`) is asked in place of the largest, and where it
+    misses, the next above it: a guess orders the compiles and never moves
+    the plan. Replayed through it, the six compiles an A100-40 asked for
+    Qwen3.5-0.8B's packed 8 x 3072 step are five (no largest split), the
+    plan the same.
     """
     if fits(candidates[first]):
         return candidates[first]
-    low = first
+    low, top = first, len(candidates) - 1
     while True:
-        while open_ := [index for index in range(low + 1, len(candidates))
-                        if not ruled_out(candidates[index])]:
-            index = next((index for index in open_ if likely(candidates[index])), open_[-1])
+        while low < top:
+            index = next((index for index in range(low + 1, top) if likely(candidates[index])), top)
             if fits(candidates[index]):
                 high = index
-                while between := [index for index in range(low + 1, high)
-                                  if not ruled_out(candidates[index])]:
-                    middle = between[(len(between) - 1) // 2]
+                while high - low > 1:
+                    middle = (low + high) // 2
                     low, high = (low, middle) if fits(candidates[middle]) else (middle, high)
                 return candidates[high]
             low = index
@@ -255,66 +253,48 @@ class Timer:
 
 @dataclasses.dataclass
 class Forecast:
-    """What a plan's compiles measured, read to spare it more (`planned`): each rung's (`rung_record`)
-    compiles that read memory, as the split, XLA's temporaries and the headroom, and the half rung each
-    rung where a split missed moved to, None where it had none. `factor` is how many times its
-    temporaries the tightest device needs room for (`temporaries_factor`), and `agree` the pool's
-    answer to whether every process's headroom is non-negative (`fits_everywhere`)."""
-    factor: int
-    agree: Callable[[int | None], bool] = fits_everywhere
-    measured: dict[str, list[tuple[int, int, int]]] = dataclasses.field(default_factory=dict)
+    """What a plan's compiles measured, which orders its search (`planned`'s `likely`): each rung's
+    (`rung_record`) compiles, as the split and every process's XLA temporaries, headroom and
+    temporaries factor (`temporaries_factor`), None where it read none, gathered once a compile
+    (`gather`, `from_every_process`); and the half rung each rung where a split missed moved to, None
+    where it had none."""
+    gather: Callable[[object], list] = from_every_process
+    measured: dict[str, list[tuple[int, list]]] = dataclasses.field(default_factory=dict)
     half_of: dict[str, str | None] = dataclasses.field(default_factory=dict)
 
-    def read(self, key: str, split: int, executable: jax.stages.Compiled | None, headroom: int | None) -> None:
-        """Keep what the compile of `split` at rung `key` measured, where it read memory."""
+    def read(self, key: str, split: int, executable: jax.stages.Compiled | None, headroom: int | None,
+             factor: int) -> None:
+        """Keep what the compile of `split` at rung `key` measured on every process; every process
+        calls this at every compile."""
         stats = None if executable is None else executable.memory_analysis()
-        if stats is not None and headroom is not None:
-            self.measured.setdefault(key, []).append((split, int(stats.temp_size_in_bytes), headroom))
-
-    def predicates(self, rung: Callable[[], str]) -> tuple[Callable[[int], bool], Callable[[int], bool]]:
-        """`planned`'s `ruled_out` and `likely` at the rung `rung` names when each is asked."""
-        return (lambda split: self.ruled_out(rung(), split)), (lambda split: self.likely(rung(), split))
-
-    def bound(self, key: str, split: int) -> int | None:
-        """The most headroom `split` can have at rung `key`, None before a compile there read more rows.
-
-        A microbatch's temporaries are a part fixed beside a part per row, and the bytes held beside the
-        step grow with the split, so each compile that read more rows bounds it from above: its
-        temporaries taken as all per row, its held bytes as no more."""
-        return min((headroom + self.factor * (temporaries - temporaries * asked // split)
-                    for asked, temporaries, headroom in self.measured.get(key, ()) if asked < split),
-                   default=None)
-
-    def alternatives(self, key: str) -> list[str] | None:
-        """The rungs a split fits at from `key`: it and its half rung, which a miss at `key` has asked;
-        None before one has."""
-        return None if key not in self.half_of else [key, *filter(None, [self.half_of[key]])]
-
-    def ruled_out(self, key: str, split: int) -> bool:
-        """Whether `split` fits at no rung it may from `key` on some process, bounded from above."""
-        keys = self.alternatives(key)
-        bounds = [] if keys is None else [self.bound(rung, split) for rung in keys]
-        return not self.agree(most(bounds) if keys is not None else None)
+        local = (None if stats is None or headroom is None
+                 else (int(stats.temp_size_in_bytes), headroom, factor))
+        self.measured.setdefault(key, []).append((split, self.gather(local)))
 
     def likely(self, key: str, split: int) -> bool:
-        """Whether `split` is guessed to fit everywhere at a rung it may from `key`: the headroom the
-        two compiles nearest above it read there, taken as a line in a microbatch's rows, or one
-        compile's bound."""
-        def guess(rung: str) -> int | None:
-            points = sorted((asked, headroom) for asked, _, headroom in self.measured.get(rung, ())
-                            if asked < split)
-            if len(points) < 2:
-                return self.bound(rung, split)
-            (near, low), (nearer, high) = points[-2:]
-            return round(high + (high - low) * (1 / split - 1 / nearer) / (1 / nearer - 1 / near))
+        """Whether `split` is guessed to fit on every process that measured, at `key` or the half rung
+        a miss there moved to: from each process's two compiles nearest above it, its headroom taken
+        as a line in a microbatch's rows, or from one compile, its temporaries as all per row; no guess
+        where no compile above it read memory. A guess only orders the search: it rules nothing out."""
+        rungs = [key, *filter(None, [self.half_of.get(key)])]
+        return any(guess is not None and guess >= 0 for guess in (self.guess(rung, split) for rung in rungs))
 
-        return self.agree(most([guess(rung) for rung in self.alternatives(key) or [key]]))
-
-
-def most(values: Sequence[int | None]) -> int | None:
-    """The largest of `values`, None where any is unknown."""
-    known = [value for value in values if value is not None]
-    return max(known) if known and len(known) == len(values) else None
+    def guess(self, key: str, split: int) -> int | None:
+        """The least headroom a process is guessed to have at `split` and rung `key`, None where none
+        measured above it."""
+        compiles = [(asked, gathered) for asked, gathered in self.measured.get(key, ()) if asked < split]
+        guesses = []
+        for process in range(len(compiles[0][1]) if compiles else 0):
+            points = sorted((asked, gathered[process]) for asked, gathered in compiles
+                            if gathered[process] is not None)
+            if len(points) == 1:
+                (asked, (temporaries, headroom, factor)), = points
+                guesses.append(headroom + factor * (temporaries - temporaries * asked // split))
+            elif points:
+                (near, (_, low, _)), (nearer, (_, high, _)) = points[-2:]
+                slope = (high - low) / (1 / nearer - 1 / near)
+                guesses.append(round(high + slope * (1 / split - 1 / nearer)))
+        return min(guesses, default=None)
 
 
 def settled(planned: Planned, plans: Sequence[Planned], seconds: Sequence[float],
@@ -343,7 +323,7 @@ def plan_step[LossT, EffectsT](
     plan stays there where it fits: no plan splits the batch further at a
     rung where the half rung fits it whole, and climbing and the frontier
     pass every half rung asked (`onward`). What each compile measured
-    (`Forecast`) spares the splits it bounds to miss at both. `resumed`, the
+    (`Forecast`) orders the splits asked. `resumed`, the
     rung a checkpoint trained the shape on, is warned of where it does not
     fit. Where nothing fits, it raises with the closest candidate's numbers.
     Beside the plans come every compile the search made, the frontier's too.
@@ -360,7 +340,7 @@ def plan_step[LossT, EffectsT](
     refusals: list[RuntimeError] = []
     lowered: dict[tuple[int, str], Candidate] = {}
     halves: set[str] = set()  # the remat rungs (`recompute_record`) the search has asked as half rungs
-    forecast = Forecast(temporaries_factor(mesh))
+    forecast, factor = Forecast(), temporaries_factor(mesh)
     chosen: jax.stages.CompilerOptions | None = None
     fitted: tuple[Candidate, jax.stages.Compiled] | None = None
     # Every rung keeps, XLA's defaults' included, the options the modules need to compute right.
@@ -406,7 +386,7 @@ def plan_step[LossT, EffectsT](
         probes.append(Probe(split, rows_of(candidate.micro), rung_record(objective, xla_defaults), fit,
                             headroom, None if stats is None else int(stats.temp_size_in_bytes),
                             None if stats is None else int(stats.argument_size_in_bytes)))
-        forecast.read(rung(), split, executable, headroom)
+        forecast.read(rung(), split, executable, headroom, factor)
         if fit:
             assert executable is not None
             fitted = candidate, executable
@@ -433,7 +413,7 @@ def plan_step[LossT, EffectsT](
         return Planned(split, *fitted, xla_defaults, rung_record(objective, xla_defaults), modules,
                        head_tile_of(objective), head_fused_of(objective))
 
-    split = planned(candidates, first, fits, climb, *forecast.predicates(rung))
+    split = planned(candidates, first, fits, climb, lambda split: forecast.likely(rung(), split))
     if split is None or fitted is None:
         raise RuntimeError(unplanned(probes)) from (refusals[-1] if refusals else None)
     plans = [found(split)]
