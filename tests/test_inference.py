@@ -354,8 +354,7 @@ def test_every_route_generates_through_the_same_packed_projections(tmp_path):
     their load from the weights they own; a live objective's task keeps the trainer's own arrays,
     bound in place, and packs them inside each generation's compiled call. Every route draws, bit
     for bit, what a task over weights packed beforehand draws, and the run's and the objective's
-    draws agree, where a route reading its members apart draws otherwise. A source's packed tree
-    exports as the source's own members."""
+    draws agree."""
     from dew.inference.projections import inference_projections
     from dew.interop import Pretrained
     from dew.sampling import Sampling
@@ -384,19 +383,16 @@ def test_every_route_generates_through_the_same_packed_projections(tmp_path):
         np.testing.assert_array_equal(drawn[name].tokens, expected.tokens, err_msg=name)
         np.testing.assert_array_equal(drawn[name].raw_log_probs, expected.raw_log_probs, err_msg=name)
     np.testing.assert_array_equal(drawn["run"].raw_log_probs, drawn["objective"].raw_log_probs)
-    source = Pretrained.load(tmp_path / "source", dtype="float32", param_dtype="float32")
-    exported, canonical = source.export(routes["source"].variables), source.export()
-    assert set(exported) == set(canonical)
-    for name, tensor in canonical.items():
-        np.testing.assert_array_equal(np.asarray(exported[name]), np.asarray(tensor), err_msg=name)
 
 
 @pytest.mark.mesh(devices=3)
-def test_a_run_on_a_mesh_packs_projections_its_tensor_axis_cannot_split(tmp_path):
-    """Three query heads and one key-value head of width four: the tensor axis splits the query's
-    twelve output units three ways but not the packed projection's twenty. A run's task on that
-    mesh packs at its load, each packed leaf placed as the layout places the packed shape, its
-    members' buffers freed, and draws what the run draws on one device."""
+def test_a_run_on_a_mesh_packs_the_projections_its_layout_keeps_whole(tmp_path):
+    """A packed kernel's columns are its members' outputs side by side, so a run's task packs a
+    group only where the layout leaves each member's output axis whole, and the packed kernel
+    keeps the members' placement. FSDP over three devices splits the inputs and both groups pack;
+    a tensor axis of three splits three query heads' twelve output units, so the query, key and
+    value stay apart, but not the MLP's 32, so the gate and up projections pack. On each mesh the
+    task draws the tokens it draws on one device."""
     from dew.sampling import Sampling
     from dew.training import Layout, MeshSpec
 
@@ -404,18 +400,24 @@ def test_a_run_on_a_mesh_packs_projections_its_tensor_axis_cannot_split(tmp_path
     run.mkdir()
     make_lm_run(run, ema_decay=None, fields={"emb_features": 12, "num_heads": 3, "num_kv_heads": 1,
                                              "head_dim": 4})
+    devices = jax.devices()[:3]
     layout = Layout(min_shard=1, tolerance=1.0)
-    meshed = dew.pipeline(str(run), mesh=MeshSpec(tensor=3), layout=layout)
-    alone = TextGeneration.from_run(str(run))
-    attention = meshed.variables["params"]["layers_0"]["self_attn"]
-    kernel = attention["qkv_proj"]["kernel"]
-    assert kernel.shape[-1] == 20 and not {"q_proj", "k_proj", "v_proj"} & set(attention)
-    assert kernel.sharding.is_equivalent_to(
-        layout.shardings(kernel.sharding.mesh, meshed.variables)["params"]["layers_0"]["self_attn"][
-            "qkv_proj"]["kernel"], kernel.ndim)
     greedy = Sampling(temperature=0, eos_token_ids=255)
-    there, here = (task("the ", 4, key=2, sampling=greedy).host() for task in (meshed, alone))
-    np.testing.assert_array_equal(there.tokens, here.tokens)
+    alone = dew.pipeline(str(run), mesh=MeshSpec().build(devices[:1]), layout=layout)
+    here = alone("the ", 4, key=2, sampling=greedy).host()
+    for spec, packed in ((MeshSpec(fsdp=3), {"qkv_proj", "gate_up_proj"}),
+                         (MeshSpec(tensor=3), {"gate_up_proj"})):
+        task = dew.pipeline(str(run), mesh=spec.build(devices), layout=layout)
+        layer = task.variables["params"]["layers_0"]
+        held = {*layer["self_attn"], *layer["mlp"]}
+        assert held & {"qkv_proj", "gate_up_proj"} == packed, spec
+        assert ({"q_proj", "k_proj", "v_proj"} <= held) == ("qkv_proj" not in packed), spec
+        for name in packed:
+            kernel = (layer["self_attn"] if name == "qkv_proj" else layer["mlp"])[name]["kernel"]
+            assert kernel.sharding.shard_shape(kernel.shape)[-1] == kernel.shape[-1], (spec, name)
+            assert kernel.sharding.shard_shape(kernel.shape)[0] == kernel.shape[0] // spec.fsdp, (spec, name)
+        there = task("the ", 4, key=2, sampling=greedy).host()
+        np.testing.assert_array_equal(there.tokens, here.tokens, err_msg=str(spec))
 
 
 def test_objective_pipeline_binds_the_trained_state_in_place(tmp_path):

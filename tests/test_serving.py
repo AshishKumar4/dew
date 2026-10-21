@@ -916,7 +916,7 @@ def wrapped(kind, model, variables, sampling, processor=None):
 
 
 def test_a_user_decoder_module_is_packed_where_it_names_its_groups():
-    """Placement packs the projections a model names (`Serving`)
+    """Packing reaches the projections a model names (`Serving`)
     at their paths in its variables: a user's module around a decoder that
     names the decoder's is packed, draws what the unpacked weights draw, and
     is served and reloaded from them; one that names none keeps its layout."""

@@ -498,7 +498,7 @@ class _NativeTextTask:
         checked(model, held)
         variables = objectives[named(record["objective"], "objective")]._saved_variables(
             directory, step=exact, ema=ema, mesh=mesh, layout=layout, param_dtype=param_dtype)
-        return model, packed_owned(model, variables, layout), held, _saved_processor(held, config)
+        return model, packed_owned(model, variables), held, _saved_processor(held, config)
 
     @classmethod
     def from_pretrained(cls, repo_id: str, *, revision: str | None = None,
