@@ -101,8 +101,9 @@ def main(config: Config) -> Path:
     # are tokenized already, so the preset takes no tokenizer.
     window = config.sequence_length - 1
     loading = Loading(workers=0, threads=4)
-    data = (train.shuffle(seed=0).repeat()
-            .pipe(presets.lm, None, seq_len=window, batch=config.batch_size, pack=None)
+    # The windows are cut first, then shuffled one by one, as the held-out split's are read.
+    data = (train.pipe(presets.lm, None, seq_len=window, batch=None, pack=None)
+            .shuffle(seed=0).repeat().batch(config.batch_size)
             .read("memory").loading(loading))
     records = None if config.val_batches is None else config.val_batches * config.batch_size
     validation = (held.pipe(presets.lm, None, seq_len=window, batch=config.batch_size, pack=None,

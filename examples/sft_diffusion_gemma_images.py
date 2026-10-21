@@ -212,7 +212,7 @@ def image_data(config: Config, parts: dict[str, Source]) -> tuple[Dataset, Datas
     """Train on train + validation, score on test, which the run never reads. The crops and flips
     run on the host, before the caption layout reads their pixels into the model's inputs; a device
     augment would run after it, on the batch the layout already made."""
-    crop = images.RandomCrop(config.image_size, scale=(0.6, 1.0), flip=True)
+    crop = images.RandomCrop(config.image_size, scale=(0.6, 1.0), flip=True, jitter=True)
     train = (Concatenate((parts["train"], parts["validation"])).shuffle(seed=0).repeat()
              .pipe(presets.images, config.image_size, batch=config.batch_size,
                    staging_size=config.staging_size, augment=crop, rejects=False))
