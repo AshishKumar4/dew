@@ -6,11 +6,10 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from reference_error import (
-    FACTOR,
+    PARITY,
     Inconclusive,
     assert_as_exact,
     assert_as_exact_as_the_reference,
-    assert_leaves_as_exact,
     declared_seeds,
     distance,
     indexed_recording,
@@ -20,16 +19,14 @@ from reference_error import (
 
 def test_a_small_row_beside_large_ones_is_held_to_its_own_size():
     """Dew doubles a row of 5s beside rows of 1e8 that the reference rounds by 8. Every
-    tensor-wide distance passes it: its RMS error, 3.5, sits under twice the reference's, 5.7.
-    Held to its own size, the row is 100% wrong against the reference's 8e-8."""
+    tensor-wide distance passes it: its RMS error, 3.5, sits under PARITY times the reference's,
+    5.7. Held to its own size, the row is 100% wrong against the reference's 8e-8."""
     truth = np.array([[1e8, 1e8], [5.0, 5.0]])
     reference = np.array([[1e8 + 8, 1e8 + 8], [5.0, 5.0]])
     dew = np.array([[1e8, 1e8], [10.0, 10.0]])
-    assert distance(dew, truth) <= FACTOR * distance(reference, truth)
+    assert distance(dew, truth) <= PARITY * distance(reference, truth)
     with pytest.raises(AssertionError):
         assert_as_exact_as_the_reference(dew, reference, truth, "small row")
-    with pytest.raises(AssertionError):
-        assert_leaves_as_exact({"rows": dew}, {"rows": reference}, {"rows": truth})
 
 
 def test_a_row_that_cancels_is_held_to_what_it_sums():
@@ -51,10 +48,10 @@ def test_a_row_that_cancels_is_held_to_what_it_sums():
         return truth + noise
 
     reference, further = rounded(), rounded(10.0)
-    assert_leaves_as_exact({"dq": rounded()}, {"dq": reference}, {"dq": truth}, terms={"dq": terms})
-    assert distance(further, truth) <= FACTOR * distance(reference, truth)
+    assert_as_exact_as_the_reference(rounded(), reference, truth, "cancelling row", terms=terms)
+    assert distance(further, truth) <= PARITY * distance(reference, truth)
     with pytest.raises(AssertionError):
-        assert_leaves_as_exact({"dq": further}, {"dq": reference}, {"dq": truth}, terms={"dq": terms})
+        assert_as_exact_as_the_reference(further, reference, truth, "cancelling row", terms=terms)
 
 
 def test_a_row_of_float64_zero_is_held_to_the_references_own_row():
@@ -71,7 +68,7 @@ def test_a_row_of_float64_zero_is_held_to_the_references_own_row():
     dew = truth + unit * rng.normal(size=truth.shape)
     assert_as_exact_as_the_reference(dew, reference, truth, "zero row")
     reference[0], dew[0] = 0.0, unit
-    assert distance(dew, truth) <= FACTOR * distance(reference, truth)
+    assert distance(dew, truth) <= PARITY * distance(reference, truth)
     with pytest.raises(AssertionError):
         assert_as_exact_as_the_reference(dew, reference, truth, "zero row")
 
