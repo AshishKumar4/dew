@@ -1,6 +1,7 @@
-"""compressed-tensors' MXFP4 codec, the one the reference tools encode and decode with: the scheme a quantized
-checkpoint's Linear carries (moonshotai/Kimi-K3's config group at f831ab6, which Dew's `PACKED_MXFP4_WEIGHTS`
-reads) and the library's own `calculate_qparams` and `MXFP4PackedCompressor`, independent of Dew's codec.
+"""compressed-tensors' MXFP4 codec, which the reference tools encode and decode its checkpoints with: the
+scheme a quantized checkpoint's Linear carries (moonshotai/Kimi-K3's config group at f831ab6, which Dew's
+`PACKED_MXFP4_WEIGHTS` reads) and the library's own `calculate_qparams` and `MXFP4PackedCompressor`,
+independent of Dew's codec.
 
 Environment: torch and compressed-tensors 0.17.1 (the kimi-k3 reference venv, or Dew's test environment).
 """
@@ -29,6 +30,7 @@ def encoded(weight: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
 
 
 def decoded(packed: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-    """The library's decompression of one packed pair, in float32."""
+    """The library's decompression of one packed pair, computed in bfloat16 as the library does and
+    widened to float32."""
     state = {"weight_packed": packed, "weight_scale": scale}
     return MXFP4PackedCompressor.decompress(state, SCHEME)["weight"].float()

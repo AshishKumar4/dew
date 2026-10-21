@@ -279,13 +279,14 @@ def reset(net):
 
 
 def forward(net, ids, start_pos=0):
-    """The release's Transformer.forward (V4.1's model.py:1241-1272) under autograd, every
-    position's logits."""
+    """The release's Transformer.forward (V4.1's model.py:1241-1272, V4 DSpark's 912-926) under
+    autograd, every position's logits."""
     return type(net).forward.__wrapped__(net, ids, start_pos)
 
 
 def draft(net, ids, main_hidden, start_pos):
-    """The release's Transformer.forward_spec, DSpark's draft."""
+    """The release's Transformer.forward_spec (V4.1's model.py:1274-1282, V4 DSpark's 928-936),
+    DSpark's draft."""
     return type(net).forward_spec.__wrapped__(net, ids, main_hidden, start_pos)
 
 
@@ -501,7 +502,7 @@ def stepped(net, gradients, ids) -> np.ndarray:
 
 
 def cached(net, ids, *, reset=reset, prompt=PROMPT, length=LENGTH) -> dict[str, np.ndarray]:
-    """The prefill of the first `prompt` tokens after the release's `reset`, the
+    """The prefill of the first `prompt` tokens after the caller's `reset`, the
     teacher-forced steps after it to `length` and DSpark's draft after each: the
     driver every DSpark release's reference runs (deepseek_v4_dspark_reference.py)."""
     decode_logits, draft_ids, draft_logits, draft_confidence = [], [], [], []

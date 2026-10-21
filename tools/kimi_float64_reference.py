@@ -57,7 +57,8 @@ LATENT_EPS = 1e-6
 def load(directory: Path) -> tuple[dict, dict[str, np.ndarray]]:
     """The text config and the decoder's weights in float64 by their names below
     the vision wrapper, each compressed-tensors MXFP4 pair decoded by the library
-    (`reference_mxfp4`, exact: every E2M1 code times a power of two is a float32)
+    (`reference_mxfp4`, in bfloat16: exact while each scale byte is at most 252, a power of
+    two up to 2^125, as the fixtures' are, since every E2M1 code times one is a bfloat16)
     and each `A_log` as its heads."""
     config = json.loads((directory / "config.json").read_text())
     text = config.get("text_config", config)
@@ -72,6 +73,7 @@ def load(directory: Path) -> tuple[dict, dict[str, np.ndarray]]:
         if name.endswith(".weight_packed"):
             name = name.removesuffix("_packed")
             scale = torch.from_numpy(raw[prefix + name + "_scale"])
+            assert int(scale.max()) <= 252, (name, int(scale.max()))
             value = reference_mxfp4.decoded(torch.from_numpy(value), scale).numpy()
         elif name.endswith(".A_log"):
             # K3 stores the heads zero-padded to the head dim, Kimi Linear as [1, 1, heads, 1].

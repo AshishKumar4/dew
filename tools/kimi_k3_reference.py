@@ -52,7 +52,6 @@ from collections.abc import Callable
 from pathlib import Path
 
 import numpy as np
-import reference_mxfp4
 import torch
 from safetensors.torch import save_file
 
@@ -163,6 +162,8 @@ def greedy(model: torch.nn.Module, input_ids: torch.Tensor, attention_mask: torc
 
 def mxfp4(weight: torch.Tensor):
     """compressed-tensors' MXFP4 encoding of a Linear weight and its decoding (`reference_mxfp4`)."""
+    import reference_mxfp4
+
     packed, scale = reference_mxfp4.encoded(weight.detach().float().cpu())
     return packed, scale, reference_mxfp4.decoded(packed, scale)
 
@@ -195,6 +196,8 @@ def matmul_precision() -> str:
 
 def load_weights(model: torch.nn.Module, tensors: dict[str, torch.Tensor]) -> None:
     """Copy stored tensors into `model`: MXFP4 experts decoded, A_log cut to its heads."""
+    import reference_mxfp4
+
     with torch.no_grad():
         for name, parameter in model.named_parameters():
             if ".block_sparse_moe.experts." in name:
@@ -209,6 +212,8 @@ def load_weights(model: torch.nn.Module, tensors: dict[str, torch.Tensor]) -> No
 
 
 def main() -> None:
+    import reference_mxfp4
+
     configuration, modeling, linear = released_modules()
     config = tiny_config()
     DESTINATION.mkdir(parents=True, exist_ok=True)
@@ -319,9 +324,6 @@ def record_orders(model: torch.nn.Module, drawn: Path, destination: Path,
     np.savez(destination / "orders.npz", orders=drawn_orders.astype(np.min_scalar_type(drawn_orders.max())),
              updated_logits=np.asarray(distances), precision=precision)
     print("orders", len(distances), "distances", np.round(np.asarray(distances) / distances[0], 2))
-
-
-
 
 
 if __name__ == "__main__":

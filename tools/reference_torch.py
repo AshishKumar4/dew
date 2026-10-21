@@ -1,5 +1,5 @@
-"""The torch-side conversions the reference generators share, with torch alone, so a generator in any
-reference venv imports it."""
+"""The torch-side conversions the reference generators share, with torch and NumPy alone, so a
+generator in any reference venv imports it."""
 
 from collections.abc import Mapping
 

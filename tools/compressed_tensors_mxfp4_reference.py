@@ -80,7 +80,8 @@ def main() -> None:
     arrays = {}
     for name, dtype in DTYPES.items():
         cast = weight.to(dtype)
-        packed, scale = (array.numpy() for array in encoded(cast))
+        packed, scale = encoded(cast)
+        packed, scale = packed.numpy(), scale.numpy()
         assert packed.dtype == np.uint8 and scale.dtype == np.uint8
         # The raw bits, since NumPy has no bfloat16.
         arrays[f"weight_{name}"] = cast.view(torch.int32 if name == "float32" else torch.int16).numpy()
