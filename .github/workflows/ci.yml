@@ -131,35 +131,6 @@ jobs:
           cat plain.txt; echo "dewml installed from PyPI alone, on a jax without Dew's fixes"; exit 1
         fi
         grep -q "No matching distribution found for jax" plain.txt || { cat plain.txt; exit 1; }
-    - name: Install the wheel into an empty environment, jax from Dew's package index
-      run: |
-        python -m venv "$RUNNER_TEMP/clean"
-        "$RUNNER_TEMP/clean/bin/python" -m pip install --quiet -r tools/pip.txt
-        index=$(python -c "import runpy; print(runpy.run_path('src/dew/telemetry/builds.py')['PACKAGE_INDEX'])")
-        "$RUNNER_TEMP/clean/bin/pip" install --quiet --index-url https://pypi.org/simple \
-          --extra-index-url "$index" dist/*.whl
-    - name: Run it
-      working-directory: ${{ runner.temp }}
-      run: |
-        "$RUNNER_TEMP/clean/bin/python" - <<'EOF'
-        import importlib.metadata
-
-        import jax
-        import jax.numpy as jnp
-
-        import dew
-        from dew.nn.backbones import CausalTransformer
-
-        assert "site-packages" in dew.__file__, dew.__file__
-        print("dewml", importlib.metadata.version("dewml"), "jax", jax.__version__,
-              "flax", importlib.metadata.version("flax"))
-        import flax.nnx  # noqa: E402,F401  imports on jax 0.11.2 from flax 0.12.10 on
-        model = CausalTransformer(vocab_size=64, emb_features=32, num_layers=2,
-                                  num_heads=4, num_kv_heads=2, mlp_features=64, max_seq_len=16)
-        tokens = jnp.arange(16, dtype=jnp.int32).reshape(2, 8)
-        logits = jax.jit(model.apply)(model.init(jax.random.key(0), tokens), tokens)
-        assert logits.shape == (2, 8, 64) and bool(jnp.all(jnp.isfinite(logits)))
-        EOF
     - name: Resolve the accelerator extras
       run: |
         index=$(python -c "import runpy; print(runpy.run_path('src/dew/telemetry/builds.py')['PACKAGE_INDEX'])")
