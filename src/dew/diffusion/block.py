@@ -395,6 +395,9 @@ def _materialize(state: CanvasDecodeState, prompt_length: int, max_new_tokens: i
 
 def _generate(model: nn.Module, variables: Variables, inputs: ModelInputs,
               key: jax.Array, plan: CanvasPlan, n: int) -> CanvasGeneration:
+    from dew.inference.projections import served
+
+    variables = served(model, variables)
     initial = _begin(model, variables, inputs, plan)
     prompt_length = inputs.tokens.shape[1]
 

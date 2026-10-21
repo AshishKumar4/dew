@@ -404,9 +404,8 @@ class Pretrained:
               revision: str | None = None, gguf_file: str | None = None, single_file: str | None = None,
               dduf_file: str | None = None,
               mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None, fallback: str | None = None,
-              prepare: Callable[[nn.Module, Variables], Variables] | None = None,
               weights: bool = True) -> Self:
-        """Share the source reader with inference's pre-placement projection packing."""
+        """Read a source, as `load` does, for `dew.pipeline` and the loaders that place it."""
         if fallback not in (None, "torchax"):
             raise ValueError(f"fallback={fallback!r} names no loader; the one fallback is 'torchax', "
                              "tier 3 through transformers' PyTorch forward")
@@ -450,7 +449,7 @@ class Pretrained:
             loaded = _load_native_source(name_or_dir, directory, commit, gguf_file=gguf_file, placed=placed,
                                          streaming=streaming or not weights, dtype=dtype,
                                          param_dtype=param_dtype, attention_impl=attention_impl,
-                                         max_seq_len=max_seq_len, prepare=prepare)
+                                         max_seq_len=max_seq_len)
         if not isinstance(loaded, cls):
             raise TypeError(f"{name_or_dir} is a {type(loaded).__name__} source, not a {cls.__name__}; "
                             f"load it with {type(loaded).__name__}.load or Pretrained.load")
@@ -1224,8 +1223,7 @@ def _decoder_source(config: Mapping[str, object], tensors: Mapping[str, np.ndarr
 def _load_native_source(name_or_dir: str | Path, directory: Path, commit: str | None, *,
                         gguf_file: str | None, placed: Callable[[Variables], Variables], streaming: bool,
                         dtype: str, param_dtype: str, attention_impl: str,
-                        max_seq_len: int | None,
-                        prepare: Callable[[nn.Module, Variables], Variables] | None = None) -> Pretrained:
+                        max_seq_len: int | None) -> Pretrained:
     """Decode native source weights and bind their processors and export layout.
 
     Diffusers pipelines and the explicit torchax fallback have already taken
@@ -1281,8 +1279,7 @@ def _load_native_source(name_or_dir: str | Path, directory: Path, commit: str | 
     named = generation_config.get("tokenizer_name") if processor is None else None
 
     def bundle[K: Pretrained](kind: type[K]) -> K:
-        prepared = variables if prepare is None else prepare(model, variables)
-        return kind(model, placed(prepared), processor, config, directory, built, generation_config,
+        return kind(model, placed(variables), processor, config, directory, built, generation_config,
                     layouts, retained, export_adapter, quantized_tensors=quantized_tensors,
                     quantized_scale_dtype=scale_dtype, quantization_grid=grid,
                     # The weights' commit: a pickle repo's may be its conversion's.
