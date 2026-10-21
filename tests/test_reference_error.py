@@ -1,6 +1,8 @@
 """The float64 accuracy rule (tests/reference_error.py) on comparisons whose answer is known: what it
 must refuse, and the rounding it must admit."""
 
+import math
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -19,6 +21,7 @@ from reference_error import (
     null_rate_bound,
     null_runs,
     seeds_for,
+    widened,
 )
 
 
@@ -400,3 +403,77 @@ def test_null_runs_judge_the_reference_against_itself_on_draws_no_other_run_take
     assert null_rate_bound(0, 1400) == pytest.approx(1 - 0.001 ** (1 / 1400), rel=1e-9)
     assert null_rate_bound(0, 200) > 0.03
     assert null_rate_bound(3, 3) == 1.0
+
+
+def test_a_recording_of_the_references_evidence_alone_holds_the_recomputed_truth_to_its_sketch():
+    """A recording that keeps the reference's evidence (`leaf_summary`) and its truth's sketch, no
+    outputs: check 1 judges Dew against it with the test's own float64 path as truth, held at every seed
+    to the recorded sketch, so a float64 path that computes one element a millionth off is refused, and
+    a recording without that path is refused outright."""
+    from tool_support import load
+
+    recorder = load("recorded_references")
+
+    def draw(seed):
+        rng = np.random.default_rng(400 + seed)
+        return {"x": rng.normal(size=(16, 8)).astype(np.float32),
+                "w": rng.normal(size=(8, 32)).astype(np.float32)}
+
+    def evaluate(inputs):
+        x, w = inputs["x"], inputs["w"]
+        return ({"y": np.dot(x, w)},
+                {"y": np.dot(x.astype(np.float64), w.astype(np.float64))})
+
+    def product(inputs):
+        return {"y": jnp.dot(inputs["x"], inputs["w"], precision="highest")}
+
+    def wide(inputs):
+        return {"y": jnp.dot(jnp.asarray(inputs["x"], jnp.float64), jnp.asarray(inputs["w"], jnp.float64))}
+
+    recorded = recorder.record_case("site", draw, evaluate, product, summary=True)
+    assert not any(name.startswith(("site.reference.", "site.truth.", "site.input.")) for name in recorded)
+    seeds = int(recorded["site.seeds"])
+    drawn, reference, truth = indexed_recording(recorded, "site", seeds, inputs_of=draw, truth_fn=wide)
+    assert_as_exact(jax.jit(lambda index, inputs: product(inputs)), reference, drawn, "evidence", seeds=seeds,
+                    truth_fn=truth)
+
+    def off(inputs):
+        y = wide(inputs)["y"]
+        return {"y": y.at[3, 5].multiply(1 + 1e-6)}
+
+    _, _, wrong = indexed_recording(recorded, "site", seeds, inputs_of=draw, truth_fn=off)
+    with pytest.raises(AssertionError), jax.enable_x64(new_val=True):
+        wrong(*widened(drawn(0)))
+    _, _, overflowing = indexed_recording(recorded, "site", seeds, inputs_of=draw,
+                                          truth_fn=lambda inputs: {"y": wide(inputs)["y"] * 1e300})
+    with pytest.raises(AssertionError), jax.enable_x64(new_val=True):
+        overflowing(*widened(drawn(0)))
+    assert recorded["site.sketch.y"].shape == (len(recorded["site.mse.y"]), 32)
+    with pytest.raises(AssertionError):
+        indexed_recording(recorded, "site", seeds, inputs_of=draw)
+
+
+def test_a_truths_sketch_rounds_alike_in_any_order_and_refuses_an_overflowing_or_empty_truth_apart():
+    """The sketch of one truth agrees with itself summed in another order within `sketch_rounding`, each
+    block of SKETCH_BLOCK summed from its other end as another host may; a
+    truth recomputed far past float64's range is refused, not passed on an infinite bound; and an empty
+    leaf's evidence is exact, its reference's dtype kept."""
+    from reference_error import SKETCH, _sign_bits, leaf_summary, sketch_rounding, truth_sketch
+
+    rng = np.random.default_rng(7)
+    truth = rng.normal(size=4096)
+    signs = ((_sign_bits(truth.size, 3)[:, None] >> np.arange(SKETCH, dtype=np.uint64)) & 1) * 2.0 - 1
+    # Another host: each block summed one by one from its end, the blocks' sums summed exactly.
+    blocks = np.flip((truth[:, None] * signs).reshape(-1, 64, SKETCH), axis=1).cumsum(axis=1)[:, -1]
+    other_order = np.asarray([math.fsum(blocks[:, index].tolist()) for index in range(SKETCH)])
+    allowed = 2 * sketch_rounding(float(np.sum(np.abs(truth))))
+    assert np.all(np.abs(truth_sketch(truth, 3) - other_order) <= allowed)
+    empty = leaf_summary(jnp.zeros((16, 0), jnp.bfloat16), np.zeros((16, 0)))
+    assert (empty.mse, empty.worst, empty.finite, empty.dtype) == (0.0, 0.0, True, "bfloat16")
+    with pytest.raises(AssertionError):
+        leaf_summary(np.zeros(0), np.ones(3))
+    # Two entries swapped are seen at a seed unless their signs agree in all SKETCH places.
+    swapped = truth.copy()
+    swapped[[0, 1]] = swapped[[1, 0]]
+    bits = _sign_bits(truth.size, 3)
+    assert (bits[0] == bits[1]) or np.any(truth_sketch(swapped, 3) != truth_sketch(truth, 3))
