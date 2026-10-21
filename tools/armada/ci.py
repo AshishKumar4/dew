@@ -103,7 +103,7 @@ def _beside(name: str):
     return module
 
 
-owned = _beside("owned")
+child_groups = _beside("child_groups")
 SETTLE = 30.0
 """Seconds a task's process group has, after SIGKILL, to be reaped and gone: inside armada's own timeout
 with the default deadline and grace (1680 + 60 + 30 + the reader's 10 < .armada.json's 1800)."""
@@ -152,8 +152,9 @@ SKIPPED = {"tests/test_gen_api.py", "tests/test_multihost.py"}
 """CI runs the first in the lint job, under the griffe it pins, and the second in the multihost job,
 across the containers of an armada gang."""
 DURATIONS = Path("tests/test_durations.json")
-SHARED = ("pyproject.toml", "constraints.txt", ".armada.json", "tools/armada/ci.py", "tools/armada/owned.py",
-          "tools/armada/split.py", "tools/armada/executed.py", "tools/armada/followed.py", str(DURATIONS))
+SHARED = ("pyproject.toml", "constraints.txt", ".armada.json", "tools/armada/ci.py",
+          "tools/armada/child_groups.py", "tools/armada/split.py", "tools/armada/executed.py",
+          "tools/armada/followed.py", str(DURATIONS))
 """The files every test file's key covers whole, beside tests/ and src/, every lock (a GPU node
 builds its environment from its CUDA lock) and the environment's own inputs, which .armada.json
 names (`environment_files`)."""
@@ -591,7 +592,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     lines: list[str] = []
     # split.py, the plugin that keeps a split file's group, imports from beside this file.
     path = os.pathsep.join(filter(None, [str(Path(__file__).resolve().parent), os.environ.get("PYTHONPATH")]))
-    done = owned.start(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+    done = child_groups.start(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
                        env={**os.environ, **environ, **CLOSED_HUB, "PYTHONPATH": path,
                             "DEW_EXECUTED": str(executed_report)})
 
@@ -610,7 +611,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
         expired = True
     # Past the deadline ^C first, so pytest reports what ran; a test stuck in C ignores it. Then the group is
     # killed, what pytest's tests left running with it, and given `SETTLE` to be gone.
-    if left := owned.stop(done, interrupt=grace if expired else None, settle=SETTLE):
+    if left := child_groups.stop(done, interrupt=grace if expired else None, settle=SETTLE):
         print(f"processes {left} of the task's group still ran {SETTLE:.0f} s after SIGKILL", flush=True)
     reader.join(10)
     output = "".join(lines)
