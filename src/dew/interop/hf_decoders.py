@@ -897,7 +897,8 @@ def export_config(model) -> Mapping[str, object]:
     elif ramped:
         config['rope_scaling'] = dataclasses.asdict(next(iter(ramped.values())))
     config.update(exported)
-    written = {key: value for key, value in config.items() if value is not None or key == 'pad_token_id'}
+    written = {key: value for key, value in config.items()
+               if value is not None or key == 'pad_token_id' or key in family.export_nulls}
     refuse_lossy_export(model, written)
     return written
 

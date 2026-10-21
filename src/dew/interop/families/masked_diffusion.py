@@ -283,12 +283,13 @@ def _llada_moe_config(hf_config: Mapping[str, object], used: set[str], *,
     routed = tuple(index for index, enabled in enumerate(pattern[:layers]) if enabled != 0)
     if routed:
         bias = bool(hf_config.get('moe_router_enable_expert_bias'))
+        shared = hf_config.get('shared_expert_intermediate_size', -1)
         config['mixture'] = native_fields(Mixture)(
             experts=record_int(hf_config, 'num_experts'),
             top_k=record_int(hf_config, 'num_experts_per_tok'), layers=routed,
             expert_features=record_int(hf_config, 'expert_intermediate_size'),
-            shared_features=record_int(hf_config, 'shared_expert_intermediate_size')
-            if hf_config.get('shared_expert_intermediate_size') is not None else 0,
+            shared_features=records.integer(shared, 'shared_expert_intermediate_size')
+            if shared is not None else 0,
             norm_topk_prob=v2, scaling=(record_float(hf_config, 'routed_scaling_factor', 1.0)
                                        or 1.0) if v2 else 1.0,
             bias=bias, bias_in_weights=bias)
@@ -414,6 +415,7 @@ _LLADA_NAMES: Renames = (
 _LLADA_MOE_NAMES: Renames = (
     ('shared_expert', 'mlp.shared_experts'),
     ('mlp.expert_bias', 'mlp.gate.e_score_correction_bias'))
+_LLADA_MOE_NULLS = ('shared_expert_intermediate_size',)
 _LLADA2_NAMES: Renames = (
     ('model.word_embeddings', 'model.embed_tokens'),
     ('attention.query_layernorm', 'self_attn.q_norm'),
@@ -445,6 +447,7 @@ def _llada_moe_export(model: CausalTransformer) -> Mapping[str, object]:
         return _mask_token_export(model)
     return {
         **_mask_token_export(model),
+        **({} if mixture.norm_topk_prob else {'architectures': ['LLaDAMoEModelLM']}),
         'dense_intermediate_size': model.hidden_features,
         'expert_intermediate_size': mixture.expert_features or model.hidden_features,
         'shared_expert_intermediate_size': mixture.shared_features or None,
@@ -556,6 +559,7 @@ LLADA = DecoderFamily(
     weight_path=_llada_path,
     export_path=_llada_export_path,
     export_weights=decoder_tensors,
+    export_nulls=_LLADA_MOE_NULLS,
     preserve_source_layout=True,
 )
 
@@ -566,6 +570,7 @@ LLADA_MOE_V2 = DecoderFamily(
     'llada_moe_v2', 'LLaDAMoEv2ModelLM', _llada_moe_export,
     weight_path=partial(renamed_path, _LLADA_MOE_NAMES),
     export_path=partial(renamed_name, _LLADA_MOE_NAMES), export_weights=decoder_tensors,
+    export_nulls=_LLADA_MOE_NULLS,
     preserve_source_layout=True,
 )
 
@@ -577,5 +582,6 @@ LLADA2_MOE = DecoderFamily(
     weight_path=partial(renamed_path, _LLADA2_NAMES),
     export_path=partial(renamed_name, _LLADA2_NAMES), export_weights=decoder_tensors,
     packed=_LLADA2_PACKED, tied_head_names=('lm_head.weight', 'model.word_embeddings.weight'),
+    export_nulls=('num_shared_experts',),
     preserve_source_layout=True,
 )

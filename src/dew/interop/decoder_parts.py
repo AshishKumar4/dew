@@ -1647,6 +1647,10 @@ class DecoderFamily:
     omits them, which the shared readers would otherwise default for every
     family alike: Gemma's GELU, Gemma 2's caps and query scalar, OLMo 3's
     norm epsilon. Rope bases are the class's `RopeSpelling`."""
+    export_nulls: tuple[str, ...] = ()
+    """Config fields whose explicit null disables a component. Other null export fields remove
+    a generic field the family does not read; these survive as JSON null instead of taking the
+    source config class's default."""
 
     def readings(self, tensors: Mapping[str, np.ndarray],
                  config: Mapping[str, object]) -> tuple[Reading, ...]:
