@@ -285,20 +285,31 @@ class _Draws:
                                     for field in ("mine", "theirs", "worst", "zero_rows", "finite")))
 
 
-def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None) -> _Draws:
+def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=None) -> _Draws:
     """Every leaf's errors (`_Draws`) over `seeds`: both functions run on `draw(seed)`'s inputs, truth
-    `truth_fn` on them (by default `reference_fn` on them widened to float64)."""
+    `truth_fn` on them (by default `reference_fn` on them widened to float64). With `reference_seeds`,
+    the reference runs on those draws instead, each held to its own draw's truth (`null_runs`), and a
+    row of float64 zero is paired only where the two truths are the same values (an orbit's draws)."""
     mine, theirs, worst, zero_rows, finite, names = [], [], [], [], [], None
-    for seed in seeds:
-        inputs = draw(seed)
-        dew, reference = dew_fn(*inputs), reference_fn(*inputs)
+
+    def truth_of(inputs):
         with jax.enable_x64(new_val=True):
-            truth = (truth_fn or reference_fn)(*widened(inputs))
+            return (truth_fn or reference_fn)(*widened(inputs))
+
+    for at, seed in enumerate(seeds):
+        inputs = draw(seed)
+        dew, truth = dew_fn(*inputs), truth_of(inputs)
+        if reference_seeds is None:
+            reference, their_truth = reference_fn(*inputs), truth
+        else:
+            their_inputs = draw(reference_seeds[at])
+            reference, their_truth = reference_fn(*their_inputs), truth_of(their_inputs)
         paths = jax.tree_util.tree_leaves_with_path(dew)
         names = names or [jax.tree_util.keystr(path) for path, _ in paths]
         row = []
-        for (path, leaf), their_leaf, true in zip(paths, jax.tree.leaves(reference), jax.tree.leaves(truth),
-                                                  strict=True):
+        for (path, leaf), their_leaf, true, their_true in zip(paths, jax.tree.leaves(reference),
+                                                              jax.tree.leaves(truth),
+                                                              jax.tree.leaves(their_truth), strict=True):
             if np.size(leaf) == 0:
                 # An empty leaf (a one-tap convolution's history) is exact by construction: held to the
                 # reference's shape and dtype, it adds no error and resolves nothing.
@@ -309,10 +320,13 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None) -> _Draws:
                 assert np.shape(true) == np.shape(leaf), (jax.tree_util.keystr(path), np.shape(true))
                 row.append((0.0, 0.0, 0.0, 0.0, 0, True))
                 continue
-            leaf, their_leaf, true = (np.asarray(value, np.float64) for value in (leaf, their_leaf, true))
-            row.append((float(np.mean(np.square(leaf - true))), float(np.mean(np.square(their_leaf - true))),
-                        *_rows(leaf, their_leaf, true),
-                        all(bool(np.isfinite(value).all()) for value in (leaf, their_leaf, true))))
+            leaf, their_leaf, true, their_true = (np.asarray(value, np.float64)
+                                                  for value in (leaf, their_leaf, true, their_true))
+            row.append((float(np.mean(np.square(leaf - true))),
+                        float(np.mean(np.square(their_leaf - their_true))),
+                        *_rows(leaf, their_leaf, true, their_true),
+                        all(bool(np.isfinite(value).all())
+                            for value in (leaf, their_leaf, true, their_true))))
         mine.append([entry[0] for entry in row])
         theirs.append([entry[1] for entry in row])
         worst.append([(entry[2], entry[3]) for entry in row])
@@ -322,24 +336,63 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None) -> _Draws:
                   np.asarray(zero_rows), np.asarray(finite))
 
 
-def _rows(leaf, reference, truth) -> tuple[float, float, int]:
+def _rows(leaf, reference, truth, their_truth=None) -> tuple[float, float, int]:
     """One seed's row evidence for a leaf (`row_errors`): Dew's and the reference's worst sized row over
-    its size, and how many rows of float64 zero Dew is further from than ROW_FACTOR times the reference
-    is on that same row (`rows_over`'s rule for them)."""
+    its size, each over its own truth (`their_truth`, the same by default), and how many rows of
+    float64 zero Dew is further from than ROW_FACTOR times the reference is on that same row
+    (`rows_over`'s rule for them), counted where the two truths are the same values."""
+    their_truth = truth if their_truth is None else their_truth
     sizes, my_rows = row_errors(leaf, truth)
-    _, their_rows = row_errors(reference, truth)
-    sized = sizes > 0
+    their_sizes, their_rows = row_errors(reference, their_truth)
+    sized, their_sized = sizes > 0, their_sizes > 0
     if not sized.size:
         return 0.0, 0.0, 0
+    paired = their_truth is truth or np.array_equal(truth, their_truth)
     return (float(np.max(my_rows[sized] / sizes[sized])) if sized.any() else 0.0,
-            float(np.max(their_rows[sized] / sizes[sized])) if sized.any() else 0.0,
-            int(np.sum(~sized & ~(my_rows <= ROW_FACTOR * their_rows))))
+            float(np.max(their_rows[their_sized] / their_sizes[their_sized])) if their_sized.any() else 0.0,
+            int(np.sum(~sized & ~(my_rows <= ROW_FACTOR * their_rows))) if paired else 0)
 
 
 def _judged(draws: _Draws, index: int) -> tuple[float, float, float]:
     """A leaf's pooled ratio and its CONFIDENCE interval over the draws."""
     a, b = draws.mine[:, index], draws.theirs[:, index]
     return (_pooled(a, b), *_interval(a, b))
+
+
+def _judgement(draws: _Draws, label: str) -> tuple[list[str], list[str]]:
+    """Check 1's findings over `draws` (`assert_as_exact`): each leaf over PARITY, a row or a value it
+    fails, and each leaf its draws leave inconclusive."""
+    over, unresolved = [], []
+    for index, name in enumerate(draws.names):
+        leaf, count = label + name, len(draws.mine)
+        a, b = draws.mine[:, index], draws.theirs[:, index]
+        if not draws.finite[:, index].all():
+            nonfinite = int(np.sum(~draws.finite[:, index]))
+            over.append(f"{leaf}: a value is not finite on {nonfinite} of {count} seeds")
+            continue
+        if np.sum(b) == 0:
+            if np.sum(a) > 0:
+                over.append(f"{leaf}: the reference equals float64 on every seed and dew does not")
+            continue
+        ratio, low, high = _judged(draws, index)
+        # Decided where the whole interval lies on one side of PARITY, however wide; straddling it, an
+        # interval wider than PARITY cannot tell an equally exact computation from one PARITY off.
+        if low <= PARITY < high and not _resolves(low, high):
+            unresolved.append(f"{leaf}: inconclusive: the pooled ratio {ratio:.3f}'s {CONFIDENCE:.1%} "
+                              f"interval over {count} seeds is [{low:.3f}, {high:.3f}], wider than {PARITY}; "
+                              f"give the site larger inputs or more seeds (`seeds_for`)")
+        elif ratio > PARITY:
+            over.append(f"{leaf}: dew's RMS error from float64 is {ratio:.3f} times the reference's over "
+                        f"{count} seeds, {CONFIDENCE:.1%} interval [{low:.3f}, {high:.3f}] "
+                        f"(allowed {PARITY})")
+        my_row, their_row = float(np.max(draws.worst[:, index, 0])), float(np.max(draws.worst[:, index, 1]))
+        if not within(my_row, ROW_FACTOR * their_row):
+            over.append(f"{leaf}: the worst row over {count} seeds is {my_row:.3e} from float64 over its "
+                        f"size, the reference's {their_row:.3e}, allowed {ROW_FACTOR * their_row:.3e}")
+        if draws.zero_rows[:, index].any():
+            over.append(f"{leaf}: {int(draws.zero_rows[:, index].sum())} rows of float64 zero over {count} "
+                        f"seeds are further from it than ROW_FACTOR times the reference's own")
+    return over, unresolved
 
 
 def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn=None) -> None:
@@ -375,36 +428,7 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
                   if np.sum(draws.theirs[:, index]) > 0 and _judged(draws, index)[0] > PARITY]
     if over_first:
         draws = draws.joined(_drawn(dew_fn, reference_fn, draw, range(seeds, (1 + REDRAW) * seeds), truth_fn))
-    over, unresolved = [], []
-    for index, name in enumerate(draws.names):
-        leaf, count = label + name, len(draws.mine)
-        a, b = draws.mine[:, index], draws.theirs[:, index]
-        if not draws.finite[:, index].all():
-            nonfinite = int(np.sum(~draws.finite[:, index]))
-            over.append(f"{leaf}: a value is not finite on {nonfinite} of {count} seeds")
-            continue
-        if np.sum(b) == 0:
-            if np.sum(a) > 0:
-                over.append(f"{leaf}: the reference equals float64 on every seed and dew does not")
-            continue
-        ratio, low, high = _judged(draws, index)
-        # Decided where the whole interval lies on one side of PARITY, however wide; straddling it, an
-        # interval wider than PARITY cannot tell an equally exact computation from one PARITY off.
-        if low <= PARITY < high and not _resolves(low, high):
-            unresolved.append(f"{leaf}: inconclusive: the pooled ratio {ratio:.3f}'s {CONFIDENCE:.1%} "
-                              f"interval over {count} seeds is [{low:.3f}, {high:.3f}], wider than {PARITY}; "
-                              f"give the site larger inputs or more seeds (`seeds_for`)")
-        elif ratio > PARITY:
-            over.append(f"{leaf}: dew's RMS error from float64 is {ratio:.3f} times the reference's over "
-                        f"{count} seeds, {CONFIDENCE:.1%} interval [{low:.3f}, {high:.3f}] "
-                        f"(allowed {PARITY})")
-        my_row, their_row = float(np.max(draws.worst[:, index, 0])), float(np.max(draws.worst[:, index, 1]))
-        if not within(my_row, ROW_FACTOR * their_row):
-            over.append(f"{leaf}: the worst row over {count} seeds is {my_row:.3e} from float64 over its "
-                        f"size, the reference's {their_row:.3e}, allowed {ROW_FACTOR * their_row:.3e}")
-        if draws.zero_rows[:, index].any():
-            over.append(f"{leaf}: {int(draws.zero_rows[:, index].sum())} rows of float64 zero over {count} "
-                        f"seeds are further from it than ROW_FACTOR times the reference's own")
+    over, unresolved = _judgement(draws, label)
     if over:
         raise AssertionError("\n".join(over + unresolved))
     if unresolved:
@@ -439,6 +463,40 @@ def recording(path) -> dict[str, np.ndarray]:
 
     with np.load(load("fetched_fixtures").local(path), allow_pickle=False) as stored:
         return dict(stored)
+
+
+def null_runs(reference_fn, draw, label: str, *, seeds: int, runs: int, first: int = 0,
+              truth_fn=None) -> list[str]:
+    """Check 1 run `runs` times on an equally exact pair, the reference against itself on disjoint
+    draws: each run's verdict, "pass", "over" or "inconclusive", a run judged as `assert_as_exact`
+    judges a site (its declared `seeds`, the redraw, every leaf's ratio, interval and rows). Run r of
+    a call takes draws no other run of any call with the same `first` grid takes: seeds from
+    (first + r)·2·(1 + REDRAW)·seeds on, the first half its "Dew"'s and the second its reference's, so
+    the runs are independent repetitions as far as `draw` makes its draws so. The bible-§10 null
+    control of a site's operation class (orders-through-check1.md): its false-red rate, every
+    nonpassing verdict counted, bounds the gate's own on that class."""
+    verdicts = []
+    span = (1 + REDRAW) * seeds
+    for run in range(first, first + runs):
+        base = run * 2 * span
+        mine, theirs = range(base, base + seeds), range(base + span, base + span + seeds)
+        draws = _drawn(reference_fn, reference_fn, draw, mine, truth_fn, reference_seeds=theirs)
+        if any(np.sum(draws.theirs[:, index]) > 0 and _judged(draws, index)[0] > PARITY
+               for index in range(len(draws.names))):
+            further = range(base + span + seeds, base + 2 * span)
+            draws = draws.joined(_drawn(reference_fn, reference_fn, draw, range(base + seeds, base + span),
+                                        truth_fn, reference_seeds=further))
+        over, unresolved = _judgement(draws, label)
+        verdicts.append("over" if over else "inconclusive" if unresolved else "pass")
+    return verdicts
+
+
+def null_rate_bound(reds: int, runs: int, confidence: float = CONFIDENCE) -> float:
+    """The one-sided Clopper-Pearson upper bound on a false-red rate at `confidence` after `reds` red
+    runs of `runs`: 1 - (1 - confidence)^(1/runs) at none, so 0 of 1,400 bounds it at 0.49%."""
+    from scipy import stats
+
+    return 1.0 if reds >= runs else float(stats.beta.ppf(confidence, reds + 1, runs - reds))
 
 
 def declared_seeds(path) -> dict[str, int]:
