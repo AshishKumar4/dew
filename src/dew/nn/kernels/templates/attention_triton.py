@@ -477,9 +477,9 @@ def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tu
     # From the softmax's initial state (`gradients`): its maximum, denominator and share of D's numerator.
     key_index = index_ref[...]
     peak0, shares = peak, (total, initial_ref[...])
-    start, state_total, state_share = algebra.off_anchor_start(peak, total, shares[1], maximum,
-                                                               value_ref.shape[-1])
-    state = jax.lax.fori_loop(bounds_ref[0], bounds_ref[1], row_terms, start)
+    before, state_total, state_share = algebra.off_anchor_start(peak, total, shares[1], maximum,
+                                                                value_ref.shape[-1])
+    state = jax.lax.fori_loop(bounds_ref[0], bounds_ref[1], row_terms, before)
     peak, total = maximum, state.total
     anchor, delta, key_index = algebra.off_anchor_delta(state, anchor_value_ref[...], dout, state_total,
                                                         state_share, key_index)

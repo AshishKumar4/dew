@@ -212,9 +212,9 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
             exponentials, rest, own = algebra.off_anchor_weights(logits, maxima, at_anchor, v_tile.dtype)
             return algebra.off_anchor(state, exponentials, rest, own, _dot(rest, v_tile))
 
-        start, state_total, state_share = algebra.off_anchor_start(peak0, total0, term0, maxima,
-                                                                   value.shape[-1])
-        state = jax.lax.fori_loop(lo, hi, row_terms, start)
+        before, state_total, state_share = algebra.off_anchor_start(peak0, total0, term0, maxima,
+                                                                    value.shape[-1])
+        state = jax.lax.fori_loop(lo, hi, row_terms, before)
         m, denominator = maxima, state.total
         anchor, delta, chosen = algebra.off_anchor_delta(state, anchor_rows, do, state_total, state_share,
                                                          chosen)
