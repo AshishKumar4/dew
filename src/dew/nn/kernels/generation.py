@@ -188,14 +188,19 @@ class GpuTarget:
 # products, 8192 tokens x 2048 -> 768 over 64 experts: Dew's Pallas grouped matmul 0.60/2.41 on an
 # A100 and 0.27/0.86 on an H100, XLA's ragged dot 7.54/33.99 and 2.62/14.51; tokamax's ragged_dot
 # has no Triton kernel in 0.0.15 and its Mosaic one's backward takes no mixed dtypes. No tokamax
-# implementation is a row's kernel; Dew calls its own through tokamax's Op and tuning.
+# implementation is a row's kernel; Dew calls its own through tokamax's Op and tuning. Decode
+# (bf16, one query, A100-SXM4-40GB, 2026-10-21, ced5d3ad9, device ms by tuning.samples): Qwen3-0.6B's
+# 16/8 heads of 128 at 1 to 128 rows over 2048 to 131072 keys, the decode kernel 1.57x faster than
+# cuDNN in geometric mean over the 28 shapes, faster in 21, at most 1.19x the fastest arm (cuDNN
+# 2.78 ms and the decode kernel 0.42 at one row of 131072 keys); Qwen3.5-0.8B's 8/2 heads of 256,
+# which cuDNN does not take on sm80, the decode kernel at 1.04x the fastest in geometric mean.
 TARGETS = {target.generation: target for target in (
     GpuTarget('sm75', 'Tesla T4', 64 * 1024, dense_peaks={'Tesla T4': {}, 'NVIDIA Tesla T4': {}},
               aliases=('gpu:t4', 't4'), multiprocessors=40),
     GpuTarget('sm80', 'NVIDIA A100-SXM4-80GB', 163 * 1024,
               {'attention': 'flash', 'attention_narrow': 'flash', 'attention_window': 'flash',
                'attention_sinks': 'flash',
-               'attention_packed': 'flash', 'xla_triton_gemm': 'off',
+               'attention_packed': 'flash', 'xla_triton_gemm': 'off', 'decode': 'decode',
                'rms_norm': 'pallas', 'swiglu': 'pallas', 'gate_up': 'joined', 'delta_gates': 'joined',
                'gated_delta_rule': 'fla', 'ssd': 'pallas'},
               {'NVIDIA A100': {'bf16': 312e12}}, ('gpu:a100', 'a100'), head_tile=(4096, 8192),
