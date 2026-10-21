@@ -1044,24 +1044,25 @@ def fitted[Entry](
     validation: Dataset | Mapping[str, Dataset | Entry] | None,
     *,
     objective: ObjectiveData,
+    seed: int = 0,
 ) -> tuple[Loader, Mapping[str, Reader | Entry] | None]:
     """`dataset` and each validation dataset as `Trainer.fit` reads them,
-    compiled with the objective's own stages, their stores provisioned. A
-    training dataset without a repeat repeats before its batch, so a run's
-    length is its steps, epochs or tokens; a validation dataset without a
-    batch takes the training batch, and is read and loaded as it asks. A
-    Loader is already compiled, and an entry that is no Dataset (a reader,
-    an evaluation suite) is passed on as it is."""
+    compiled with the objective's own stages and the run's data `seed`,
+    their stores provisioned. A training dataset without a repeat repeats
+    before its batch, so a run's length is its steps, epochs or tokens; a
+    validation dataset without a batch takes the training batch, and is read
+    and loaded as it asks. A Loader is already compiled, and an entry that is
+    no Dataset (a reader, an evaluation suite) is passed on as it is."""
     if isinstance(dataset, Dataset):
         train = _endless(dataset._chain())
-        loader = compile(train, objective=objective, provision=True)
+        loader = compile(train, objective=objective, provision=True, seed=seed)
     else:
         loader = dataset
     named = {"val": validation} if isinstance(validation, Dataset) else validation
     if named is None:
         return loader, None
-    return loader, {name: held(entry, objective=objective, batch=loader.batch) if isinstance(entry, Dataset)
-                    else entry for name, entry in named.items()}
+    return loader, {name: held(entry, objective=objective, batch=loader.batch, seed=seed)
+                    if isinstance(entry, Dataset) else entry for name, entry in named.items()}
 
 
 def _endless(chain: Pipeline) -> Pipeline:
@@ -1074,9 +1075,11 @@ def _endless(chain: Pipeline) -> Pipeline:
     return dataclasses.replace(chain, stages=(*chain.stages[:at], Repeat(None), *chain.stages[at:]))
 
 
-def held(dataset: Dataset, *, objective: ObjectiveData | None = None, batch: int | None = None) -> Reader:
+def held(dataset: Dataset, *, objective: ObjectiveData | None = None, batch: int | None = None,
+         seed: int = 0) -> Reader:
     """`dataset` read once to validate or evaluate on, in its own batches, else in batches of `batch`,
-    read and loaded as it asks; one that states neither is refused."""
+    read and loaded as it asks, its random steps drawing from `seed`; one that states neither batch is
+    refused."""
     chain = dataset._chain()
     if not any(isinstance(stage, (BatchStage, TokenBudget)) for stage in chain.stages):
         if batch is None:
@@ -1084,7 +1087,7 @@ def held(dataset: Dataset, *, objective: ObjectiveData | None = None, batch: int
         chain = chain.batch(batch, drop_remainder=False)
     # The chain's own batch is the one it is read in; validation's `batch` adds none to it.
     return validation(chain, batch=1, objective=objective, read=chain.mode,
-                      loading=chain._loading or _DEFAULT_LOADING, provision=True)
+                      loading=chain._loading or _DEFAULT_LOADING, provision=True, seed=seed)
 
 
 def validation(
