@@ -936,7 +936,7 @@ def llada_moe_source(request):
     name = request.param
     source = Pretrained.load(FIXTURES / name, dtype='float32', attention_impl='reference')
     path = FIXTURES / name / 'released.npz'
-    return name, source, llada_draw(0, source.model.vocab_size)['ids'], llada_fields(name, 16), (
+    return name, source, llada_draw(0, source.model.vocab_size)['ids'], llada_fields(name, 2, 16), (
         recording(path), declared_seeds(path)[name])
 
 

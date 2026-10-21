@@ -149,11 +149,12 @@ def llada_draw(seed: int, vocabulary: int) -> dict[str, np.ndarray]:
     return {"ids": np.random.default_rng(seed).integers(0, vocabulary, (2, 16)).astype(np.int32)}
 
 
-def llada_fields(name: str, length: int) -> dict[str, jax.Array]:
-    """The forward's fields of a LLaDA-MoE recording: for LLaDA2's releases, the explicit block-causal
-    mask of `LLADA2_BLOCK`-token blocks its 2.0 forward requires and its 2.1 and 2.2 take; none for
-    the others, whose forward is bidirectional."""
+def llada_fields(name: str, rows: int, length: int) -> dict[str, jax.Array]:
+    """The forward's fields of a LLaDA-MoE recording over `rows` of `length` tokens: for LLaDA2's
+    releases, the explicit block-causal mask of `LLADA2_BLOCK`-token blocks its 2.0 forward requires
+    and its 2.1 and 2.2 take; none for the others, whose forward is bidirectional."""
     if name not in ("llada2-tiny", "llada21-tiny", "llada22-tiny"):
         return {}
     blocks = np.arange(length) // LLADA2_BLOCK
-    return {"attention_pairwise_mask": jnp.asarray(blocks[None, :] <= blocks[:, None])}
+    return {"attention_pairwise_mask": jnp.asarray(np.broadcast_to(
+        blocks[None, :] <= blocks[:, None], (rows, length, length)))}

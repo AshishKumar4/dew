@@ -117,8 +117,8 @@ def record(name: str, release_python: str) -> None:
     repo, revision = RELEASES[name][:2]
     worker = subprocess.Popen([release_python, __file__, '--serve', name], stdin=subprocess.PIPE,
                               stdout=subprocess.PIPE)
-    fields = llada_fields(name, 16)
-    mask = {} if not fields else {'visible': np.asarray(fields['attention_pairwise_mask'])}
+    fields = llada_fields(name, 2, 16)
+    mask = {} if not fields else {'visible': np.asarray(fields['attention_pairwise_mask'])[0]}
 
     def evaluate(inputs):
         _send(worker.stdin, {'ids': inputs['ids'], **mask})
