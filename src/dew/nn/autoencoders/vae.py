@@ -223,8 +223,10 @@ def _vae_path(torch_name: str, rank: int) -> tuple[str, ...]:
     """
     parts = torch_name.split(".")
     leaf = "bias" if parts[-1] == "bias" else ("scale" if rank == 1 else "kernel")
-    # to_out.0 is the projection; there is no second entry.
-    names = ".".join(parts[:-1]).replace("to_out.0", "proj_attn").split(".")
+    names = parts[:-1]
+    # to_out.0 is the projection, the module's last; there is no second entry.
+    if names[-2:] == ["to_out", "0"]:
+        names[-2:] = ["proj_attn"]
     return (*indexed_path(_VAE_ATTENTION.get(name, name) for name in names), leaf)
 
 
