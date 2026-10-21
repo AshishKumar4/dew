@@ -30,7 +30,6 @@ from dew.records import number
 from dew.registry import (
     Configured,
     DtypeName,
-    datasets,
     dtype_name,
     encoders,
     from_record,
@@ -516,4 +515,3 @@ class DiffusionRunConfig(RunConfig):
 
 if not TYPE_CHECKING:
     PresetSpec = presets.union
-    CaptionedSpec = datasets.subcommands

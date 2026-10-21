@@ -6,7 +6,7 @@ the command line (`dew.objectives.lm.LMRunConfig`).
 
     curl -o data/shakespeare.txt --create-dirs \\
         https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
-    dew data export records data/shakespeare-byte --fields '{"source": "data/shakespeare.txt"}' \\
+    dew data export data/shakespeare.txt data/shakespeare-byte \\
         --format array_record --tokenizer byte --eos --read memory
     python recipes/lm/train.py data:text --data.source data/shakespeare-byte \\
         --data.seq-len 256 --trainer.batch-size 32 --trainer.epochs 10 \\
