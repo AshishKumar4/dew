@@ -15,7 +15,6 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from reference_error import assert_as_exact, widened
 from safetensors.numpy import load_file
 
 from dew import Trainer
@@ -67,52 +66,20 @@ def reference_variables(loaded, name):
     return objective(loaded, variables=values).init(jax.random.key(0))
 
 
-def float64_update(model, build, batch, step, rate):
-    """The SGD update `rate` of a variables tree's params under `step`, in float64, compiled once:
-    `build`'s objective over `model` computing in float64, its decoder's and vision tower's dtype, its
-    gradient taken at the variables widened. The truth check 1 holds a float32 update to; the step's
-    draws fix their dtypes, so it corrupts as the float32 run does. Called under `jax.enable_x64`."""
-    with jax.enable_x64(new_val=True):
-        conditioner = None if model.conditioner is None else model.conditioner.clone(dtype=jnp.float64)
-        exact = build(model.clone(text=model.text.clone(dtype=jnp.float64), conditioner=conditioner))
-    wide = widened(batch)
-
-    @jax.jit
-    def update(values):
-        gradient = jax.grad(lambda trainable: exact.scalar_loss(
-            {**values, "params": trainable}, wide, step)[0])(values["params"])
-        return jax.tree.map(lambda value, grad: value - rate * grad, values["params"], gradient)
-
-    return update
-
-
-UPDATE_SEEDS = {"text": 8, "image": 8}
-"""Check 1's declared seeds for the trainer's update against the objective's (`update_site`), sized by
-`seeds_for` (2026-10-21, on armada)."""
-
-
-def update_site(obj, variables, batch, run_key, model, build):
-    """Check 1's arms for the trainer's first SGD update (rate 0.001) of `variables`' params moved by a
-    draw: the trainer's compiled step on one device, the objective's update compiled as one program
-    under the step's draws (`example_fields`), and the float64 update of `build`'s objective over
-    `model` (`float64_update`) the truth. One device holds the comparison to the trainer's composition
-    of the update; its layouts are the parallelism matrix's."""
+def trainer_update(obj, batch, run_key):
+    """The trainer's first SGD update (rate 0.001) of a variables tree's params on one device, and the
+    objective's own update under the step's draws (`example_fields`), compiled as one program. One
+    device holds the comparison to the trainer's composition of the update, which computes it to the
+    bit; its layouts are the parallelism matrix's."""
     trainer = Trainer(obj, optax.sgd(0.001), key=run_key, split=1)
     trainer.device_mesh = MeshSpec().build(jax.devices()[:1])
     initial = trainer.initial_state()
     step = Step(jnp.asarray(0, jnp.int32), jax.random.fold_in(initial.key, 0), None,
                 **example_fields(initial, 0, 1, batch))
     run = trainer.compile(jax.tree.map(jnp.copy, initial), batch)
-    leaves, tree = jax.tree.flatten(variables["params"])
-
-    def draw(seed):
-        keys = jax.random.split(jax.random.key(seed), len(leaves))
-        moved = [(leaf + 0.02 * jax.random.normal(key, leaf.shape)).astype(leaf.dtype)
-                 for key, leaf in zip(keys, leaves, strict=True)]
-        return ({**variables, "params": jax.tree.unflatten(tree, moved)},)
 
     def stepped(values):
-        # The step consumes its state: it steps copies, the draw's own arrays left for the other arms.
+        # The step consumes its state: it steps copies.
         state = jax.tree.map(jnp.copy, initial).replace(variables=jax.tree.map(jnp.copy, values))
         state, *_ = run(state, batch)
         return jax.tree.map(np.asarray, state.variables["params"])
@@ -123,7 +90,14 @@ def update_site(obj, variables, batch, run_key, model, build):
             {**values, "params": trainable}, batch, step)[0])(values["params"])
         return jax.tree.map(lambda value, grad: value - 0.001 * grad, values["params"], gradient)
 
-    return stepped, objective_update, draw, float64_update(model, build, batch, step, 0.001)
+    return stepped, objective_update
+
+
+def assert_tree_equal(actual, expected):
+    assert jax.tree.structure(actual) == jax.tree.structure(expected)
+    for (path, left), right in zip(jax.tree_util.tree_leaves_with_path(actual), jax.tree.leaves(expected),
+                                   strict=True):
+        np.testing.assert_array_equal(left, np.asarray(right), err_msg=jax.tree_util.keystr(path))
 
 
 def assert_tree_close(actual, expected, tolerance):
@@ -282,13 +256,12 @@ def test_real_trainer_update_and_checkpoint_resume(source, tmp_path):
     run_key = jax.random.key(int(reference["run_seed"]))
     data = dataset(batch)
     variables = jax.tree.map(jnp.asarray, obj.init(jax.random.key(0)))
-    # The trainer's update is the objective's at the step's draws, on par with it over drawn weights
-    # (check 1). The objective's arm is compiled as one program, as the trainer's is: XLA:CPU's compiled
-    # gradient of this model sits 1.0 to 5.2 times further from float64 than the same ops run one by
-    # one (measured per leaf, 2026-10-21), a gap of the compiler's and not of the trainer.
-    dew, reference, draw, truth = update_site(obj, variables, batch, run_key, loaded.model,
-                                              lambda wide: objective(replace(loaded, model=wide)))
-    assert_as_exact(dew, reference, draw, "the trainer's update", seeds=UPDATE_SEEDS["text"], truth_fn=truth)
+    # The trainer's update is the objective's at the step's draws, to the bit. The objective's is
+    # compiled as one program, as the trainer's is: XLA:CPU's compiled gradient of this model sits 1.0
+    # to 5.2 times further from float64 than the same ops run one by one (measured per leaf,
+    # 2026-10-21), a gap of the compiler's and not of the trainer.
+    stepped, objective_update = trainer_update(obj, batch, run_key)
+    assert_tree_equal(stepped(variables), objective_update(variables))
     trainer = Trainer(obj, optax.sgd(0.001), key=run_key, checkpoints=Checkpoints(str(tmp_path / "run")))
     updated = trainer.fit(data, steps=1, checkpoint_every=1, log_every=1)
     # Google's dense text-only model: transformers' DiffusionGemmaForBlockDiffusion
@@ -412,12 +385,9 @@ def test_image_sft_trainer_resume_publish_and_generate(image_source, tmp_path):
     stream = grain.MapDataset.source([batch]).repeat().to_iter_dataset()
     data = Loader(train=lambda partition: iter(stream), val=None, records=rows, batch=rows)
     run_key = jax.random.key(2)
-    # The trainer's update is the objective's at the step's draws, on par over drawn weights (check 1).
-    dew, reference, draw, truth = update_site(obj, variables, batch, run_key, loaded.model,
-                                              lambda wide: BlockDiffusionObjective(
-                                                  wide, prompt_length=8, variables=loaded.variables))
-    assert_as_exact(dew, reference, draw, "the trainer's update", seeds=UPDATE_SEEDS["image"],
-                    truth_fn=truth)
+    # The trainer's update is the objective's at the step's draws, to the bit.
+    stepped, objective_update = trainer_update(obj, batch, run_key)
+    assert_tree_equal(stepped(variables), objective_update(variables))
     checkpoints = Checkpoints(str(tmp_path / "run"))
     updated = Trainer(obj, optax.sgd(0.001), key=run_key, checkpoints=checkpoints).fit(
         data, steps=1, checkpoint_every=1, log_every=1)
