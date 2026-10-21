@@ -7,7 +7,6 @@ import { becameReady, health, restore } from './container';
 import { expired, type SnapshotGeneration } from './snapshots';
 
 const PORT = 8888;
-const START_MS = 180_000;
 
 /**
  * One model host: its container, restored from its generation's snapshot, its health and the
@@ -69,7 +68,7 @@ export class SharedHost extends DurableObject<Env> {
 			await this.ctx.storage.put('started', Date.now());
 		}
 		await container.setInactivityTimeout((limits.wallSeconds + limits.warmSeconds + 60) * 1000);
-		if (!(await becameReady(container, () => this.available(), START_MS))) {
+		if (!(await becameReady(container, () => this.available()))) {
 			throw new Error('the shared model did not finish warming up');
 		}
 	}

@@ -6,13 +6,13 @@ umask 077
 mkdir -p /run/dew/gateway /sessions/connections /sessions/ipc /sessions/overlay /work
 chmod 0711 /sessions /sessions/connections /sessions/ipc /sessions/overlay
 : > /kernel.json
-# The guests' users and the kernels the gateway may start, from guests.py: ctx<N> has id start + N.
-set -- $(PYTHONPATH=/opt/live /opt/venv/bin/python -c \
-  'import guests; print(len(guests.GUEST_UIDS), guests.GUEST_UIDS.start, guests.MAX_CONTEXTS + 1)')
-for index in $(seq 0 $(($1 - 1))); do
-  id -u "ctx$index" >/dev/null 2>&1 || useradd --uid "$(($2 + index))" --no-create-home --home-dir /work --shell /usr/sbin/nologin "ctx$index"
-done
-kernels=$3
+# The guests' users, each a name and id, and the kernels the gateway may start, all from guests.py.
+PYTHONPATH=/opt/live /opt/venv/bin/python -c \
+  'import guests; [print(guests.user(uid), uid) for uid in guests.GUEST_UIDS]' |
+  while read -r name uid; do
+    id -u "$name" >/dev/null 2>&1 || useradd --uid "$uid" --no-create-home --home-dir /work --shell /usr/sbin/nologin "$name"
+  done
+kernels=$(PYTHONPATH=/opt/live /opt/venv/bin/python -c 'import guests; print(guests.MAX_CONTEXTS + 1)')
 /opt/venv/bin/python - <<'PY'
 import os,secrets
 path='/run/dew/gateway-token'

@@ -90,7 +90,7 @@ export async function smokeSnapshot(container: Container, snapshot: ContainerSna
 	restore(container, snapshot, 'preparation',
 		{ entrypoint: ['sh', '/opt/live/start-shared.sh'], env: { DEW_SHARED_SECRET: relaySecret } });
 	await container.setInactivityTimeout(15 * 60_000);
-	if (!(await becameReady(container, async () => (await health(container, 8888))?.ok === true, 180_000))) {
+	if (!(await becameReady(container, async () => (await health(container, 8888))?.ok === true))) {
 		// A container that never came up may not answer an exec either.
 		const logs = await Promise.race([
 			container.exec(['sh', '-c', 'tail -c 6000 /run/dew/model.log /run/dew/gateway.log 2>/dev/null'])
