@@ -12,7 +12,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
-from reference_error import assert_as_exact_as_the_reference
+from reference_error import assert_as_exact, assert_as_exact_as_the_reference
 
 from dew.diffusion import (
     DirectPredictionTransform,
@@ -174,25 +174,32 @@ class Epsilon(nn.Module):
         return jnp.tanh(x) * 0.3 + expand(label, x) * jnp.cos(expand(time, x) / 300)
 
 
+CFG_PLUS_PLUS_SEEDS = 16
+"""Check 1's declared seeds for the CFG++ walk, sized by `seeds_for` (2026-10-21, on armada)."""
+
+
 @pytest.mark.parametrize("interval", [(0.0, 1.0), (0.0, 0.5)])
 def test_cfg_plus_plus_takes_the_papers_ddim_update(interval):
     """Algorithm 1 of Chung et al.: x_{t-1} = sqrt(abar_{t-1}) x0(eps_lambda)
     + sqrt(1 - abar_{t-1}) eps_uncond, eps_lambda = eps_u + lambda (eps_c -
-    eps_u), written out step by step over the DDIM grid; a step outside the
-    guidance interval takes the conditional denoiser's pair, x0(eps_c) and
-    eps_c."""
+    eps_u), written out step by step over the DDIM grid, Dew's walk on par
+    with it over drawn starting noise (check 1); a step outside the guidance
+    interval takes the conditional denoiser's pair, x0(eps_c) and eps_c."""
     process = Process(LinearNoiseScheduler(1000), EpsilonPredictionTransform())
     rows, scale = 2, 0.6
     conditioned, blank = {"label": jnp.full((rows,), 0.8)}, {"label": jnp.zeros((rows,))}
     denoise = process.denoiser(Epsilon(), {}, conditioned, blank)
-    x_T = jax.random.normal(jax.random.PRNGKey(1), (rows, 4, 4, 3))
-    walked = sample(denoise, x_T, 12, solver=DDIM(), guidance=CFGPlusPlus(scale, interval=interval),
-                    key=jax.random.PRNGKey(0), final_denoise=False)
+
+    def walked(x_T):
+        return sample(denoise, jnp.asarray(x_T), 12, solver=DDIM(),
+                      guidance=CFGPlusPlus(scale, interval=interval), key=jax.random.PRNGKey(0),
+                      final_denoise=False)
 
     schedule = process.schedule
 
-    def walk(dtype):
-        x = np.asarray(x_T, dtype)
+    def walk(x_T):
+        dtype = x_T.dtype.type
+        x = x_T
         times = np.asarray(process.times(12))
         for index, (t, following) in enumerate(itertools.pairwise(times)):
             t_row = jnp.full((rows,), t)
@@ -209,4 +216,7 @@ def test_cfg_plus_plus_takes_the_papers_ddim_update(interval):
             x = np.sqrt(abar_next) * clean + np.sqrt(1 - abar_next) * noise
         return x
 
-    assert_as_exact_as_the_reference(walked, walk(np.float32), walk(np.float64), f"cfg++ {interval}")
+    def noise(seed):
+        return (np.asarray(jax.random.normal(jax.random.PRNGKey(seed), (rows, 4, 4, 3))),)
+
+    assert_as_exact(walked, walk, noise, f"cfg++ {interval}", seeds=CFG_PLUS_PLUS_SEEDS)

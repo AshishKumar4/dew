@@ -7,7 +7,8 @@ import time
 import uuid
 from pathlib import Path
 
-from shared_bridge import DEADLINE_HEADER, GUEST_UIDS, OOM_PROBE, available, load, processes, resident
+from guests import GUEST_UIDS
+from shared_bridge import DEADLINE_HEADER, OOM_PROBE, available, load, processes, resident
 from websockets.asyncio.client import connect
 from websockets.exceptions import ConnectionClosed
 

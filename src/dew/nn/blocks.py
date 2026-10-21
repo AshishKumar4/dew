@@ -17,7 +17,7 @@ from .attention import GroupNorm, RMSNorm
 from .conv import Conv
 from .flops import projection_flops
 from .precision import at_least_fp32
-from .sharding import constrain, explicit_spec, whole_spec
+from .sharding import constrain, explicit_spec, rows_taken, whole_spec
 
 
 def normal_kernel(std: float | None, default: Callable | None = None) -> dict:
@@ -36,10 +36,8 @@ def _table_rows(table: jax.Array, ids: jax.Array, dtype: Dtype) -> jax.Array:
     """`table[ids]` in `dtype`, the table's rows gathered before the cast so
     the gradient accumulates in the table's dtype: casting the table first
     would scatter-add repeated tokens' cotangents in bf16. Under an Explicit
-    axis splitting the ids, the rows are placed as the ids are."""
-    placed = explicit_spec(ids, table.ndim - 1)
-    rows = jnp.take(table, ids, axis=0) if placed is None else table.at[ids].get(out_sharding=placed)
-    return rows.astype(dtype)
+    axis splitting the ids, the rows are placed as the ids are (`rows_taken`)."""
+    return rows_taken(table, ids).astype(dtype)
 
 
 # `jax.custom_vjp` is generic in its return type, and a `functools.partial`
