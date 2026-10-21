@@ -15,6 +15,9 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+from data_support import WideDraw, listed
+from reader_support import assert_resumes_where_it_stopped
+from token_support import write_token_corpus
 
 from dew import position
 from dew.data.cache import Cache
@@ -27,12 +30,6 @@ from dew.data.sources import Files, Memory
 from dew.objectives.base import VALID_ROWS
 
 READ = Loading(workers=0, threads=1, read_buffer=0, worker_buffer=1)
-
-
-@dataclasses.dataclass(frozen=True)
-class Draw(grain.RandomMapTransform):
-    def random_map(self, element, rng):
-        return {**element, "draw": np.int64(rng.integers(0, 2**32))}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -87,11 +84,6 @@ def source(count=24):
     return Memory(tuple({"id": np.int32(index)} for index in range(count)))
 
 
-def take(reader, count):
-    return [{name: np.asarray(value).tolist() for name, value in row.items()}
-            for row in itertools.islice(reader, count)]
-
-
 @dataclasses.dataclass(frozen=True)
 class Logged(Memory):
     """Records in memory that log each read a run takes of them."""
@@ -111,7 +103,8 @@ def test_a_memory_compile_reads_each_source_once():
     data = compile(Pipeline(stored).map(Tagged()).shuffle(0).repeat().batch(2), read="memory", loading=READ)
     reader = data.train(DataPartition())
     try:
-        assert sorted(value for batch in take(reader, 4) for value in batch["tag"]) == list(range(0, 80, 10))
+        tags = sorted(value for batch in listed(reader, 4) for value in batch["tag"])
+        assert tags == list(range(0, 80, 10))
     finally:
         reader.close()
     assert reads.count("memory") == 1
@@ -150,7 +143,8 @@ def test_a_memory_loader_holds_the_rows_it_made_and_lets_the_read_it_made_them_f
     assert len(reads) == 2 and all(read() is None for read in reads)
     reader, checked = data.train(DataPartition()), held(DataPartition())
     try:
-        assert sorted(value for batch in take(reader, 4) for value in batch["tag"]) == list(range(0, 80, 10))
+        tags = sorted(value for batch in listed(reader, 4) for value in batch["tag"])
+        assert tags == list(range(0, 80, 10))
         assert sorted(value for batch in checked for value in batch["tag"]) == list(range(0, 80, 10))
     finally:
         reader.close()
@@ -167,7 +161,7 @@ def test_memory_rejections_are_dense_before_global_order():
                .to_iter_dataset(grain.ReadOptions(num_threads=1, prefetch_buffer_size=0)).batch(4))
     try:
         assert data.records == 12
-        assert take(reader, 4) == take(old, 4)
+        assert listed(reader, 4) == listed(old, 4)
         assert "dew_global_position" in json.loads(reader.get_state())
     finally:
         reader.close()
@@ -175,17 +169,18 @@ def test_memory_rejections_are_dense_before_global_order():
 
 
 def test_global_position_resumes_across_share_counts_with_rng():
-    data = compile(Pipeline(source()).shuffle(7).repeat().random_map(Draw()).batch(4), loading=READ, seed=7)
+    chain = Pipeline(source()).shuffle(7).repeat().random_map(WideDraw()).batch(4)
+    data = compile(chain, loading=READ, seed=7)
     reader = data.train(DataPartition())
-    take(reader, 3)
+    listed(reader, 3)
     saved = reader.get_state()
-    expected = take(reader, 5)
+    expected = listed(reader, 5)
     reader.close()
     shares = []
     for index in range(2):
         reader = data.train(DataPartition(index, 2))
         reader.set_state(saved)
-        shares.append(take(reader, 5))
+        shares.append(listed(reader, 5))
         reader.close()
     joined = [{key: [value for pair in zip(left[key], right[key], strict=True) for value in pair]
                for key in left} for left, right in zip(*shares, strict=True)]
@@ -207,34 +202,19 @@ def test_a_global_order_resumes_through_the_stages_after_its_batch(read, after):
              "random map": rows.repeat().batch(2).random_map(RowDraws()),
              "finite repeat": rows.take(6).batch(2).repeat(2)}[after]
     data = compile(chain, read=read, loading=READ, seed=3)
-    whole = data.train(DataPartition())
-    try:
-        expected = take(whole, 8)
-    finally:
-        whole.close()
-    stopped = data.train(DataPartition())
-    try:
-        head = take(stopped, 2)
-        saved = stopped.get_state()
-    finally:
-        stopped.close()
-    resumed = data.train(DataPartition())
-    try:
-        resumed.set_state(saved)
-        assert head + take(resumed, 6) == expected
-    finally:
-        resumed.close()
+    expected, saved = assert_resumes_where_it_stopped(lambda: data.train(DataPartition()), listed, 2, 6)
+    head = expected[:2]
     shares, uninterrupted = [], []
     for index in range(2):
         reader = data.train(DataPartition(index, 2))
         try:
             reader.set_state(saved)
-            shares.append(take(reader, 6))
+            shares.append(listed(reader, 6))
         finally:
             reader.close()
         reader = data.train(DataPartition(index, 2))
         try:
-            uninterrupted.append(take(reader, 8)[2:])
+            uninterrupted.append(listed(reader, 8)[2:])
         finally:
             reader.close()
     assert shares == uninterrupted
@@ -253,8 +233,8 @@ def test_a_random_step_draws_alike_in_every_read_of_one_order():
     the map before it over the whole source, an indexed read and a streamed read of one share draw
     the same values, in a mixture as alone, and a second random step draws apart from the first."""
     rows = Pipeline(source(8)).map(Tagged())
-    alone = rows.random_map(Draw()).repeat(1).batch(4)
-    mixed = mix([rows.random_map(Draw()).repeat(1)]).batch(4)
+    alone = rows.random_map(WideDraw()).repeat(1).batch(4)
+    mixed = mix([rows.random_map(WideDraw()).repeat(1)]).batch(4)
 
     def draws(chain, read):
         data = compile(chain, read=read, loading=READ, seed=5)
@@ -267,7 +247,7 @@ def test_a_random_step_draws_alike_in_every_read_of_one_order():
 
     for chain in (alone, mixed):
         assert draws(chain, "memory") == draws(chain, "indexed") == draws(chain, "streamed")
-    again = draws(rows.random_map(Draw()).random_map(Draw()).repeat(1).batch(4), "indexed")
+    again = draws(rows.random_map(WideDraw()).random_map(WideDraw()).repeat(1).batch(4), "indexed")
     assert [draw for _, draw in again] != [draw for _, draw in draws(alone, "indexed")]
 
 
@@ -286,7 +266,7 @@ def test_a_mixture_members_draws_stay_as_they_were_when_another_member_joins():
     the members: a member joining before it leaves its draws as they were, and two members of one
     name draw apart."""
     def member(name, index):
-        return Pipeline(source(8), name=name).map(Member(index)).random_map(Draw()).repeat(1)
+        return Pipeline(source(8), name=name).map(Member(index)).random_map(WideDraw()).repeat(1)
 
     def draws(members):
         data = compile(mix(members).batch(4), read="indexed", loading=READ, seed=5)
@@ -311,8 +291,8 @@ def test_an_unnamed_member_draws_alike_wherever_a_host_mounts_it_and_when_a_name
     def mounted(directory, joining=False):
         directory.mkdir(exist_ok=True)
         (directory / "rows.jsonl").write_text("".join(json.dumps({"id": i}) + "\n" for i in range(8)))
-        chain = Pipeline(Files(str(directory / "rows.jsonl"))).map(Member(0)).random_map(Draw())
-        named = Pipeline(source(8), name="joining").map(Member(1)).random_map(Draw()).repeat(1)
+        chain = Pipeline(Files(str(directory / "rows.jsonl"))).map(Member(0)).random_map(WideDraw())
+        named = Pipeline(source(8), name="joining").map(Member(1)).random_map(WideDraw()).repeat(1)
         joined = [named] if joining else []
         return compile(mix([*joined, chain.repeat(1)]).batch(4), read="memory", loading=READ, seed=5)
 
@@ -337,7 +317,7 @@ def test_a_member_named_as_a_place_keeps_its_draws_when_an_unnamed_one_joins():
     member named like a place keeps its draws when an unnamed member joins ahead of it, and an
     unnamed member keeps its own when that named member joins ahead of it."""
     def member(name, index):
-        return Pipeline(source(8), name=name).map(Member(index)).random_map(Draw()).repeat(1)
+        return Pipeline(source(8), name=name).map(Member(index)).random_map(WideDraw()).repeat(1)
 
     def draws(members, of):
         data = compile(mix(members).batch(4), read="indexed", loading=READ, seed=5)
@@ -559,8 +539,8 @@ def test_a_position_is_refused_where_a_mixture_member_was_renamed():
     """A mixture's plan names its members, whose draws their names key: a position saved under one
     name is refused by the mixture that renamed it, which would draw other rows."""
     def mixed(name):
-        members = [Pipeline(source(8), name=name).random_map(Draw()).repeat(),
-                   Pipeline(source(4)).random_map(Draw()).repeat()]
+        members = [Pipeline(source(8), name=name).random_map(WideDraw()).repeat(),
+                   Pipeline(source(4)).random_map(WideDraw()).repeat()]
         return compile(mix(members).batch(4), read="indexed", loading=READ, seed=5)
 
     stream = mixed("first").train(DataPartition())
@@ -580,7 +560,7 @@ def test_a_position_is_refused_where_a_mixture_member_was_renamed():
 def drawn_natively(rows):
     """A Grain step Dew does not name, whose random step draws by the default seed of the rows it
     is handed."""
-    return rows.random_map(Draw())
+    return rows.random_map(WideDraw())
 
 
 @pytest.mark.parametrize("read", ["indexed", "streamed"])
@@ -592,23 +572,7 @@ def test_a_native_step_draws_by_the_runs_seed_and_resumes(read):
 
     def draws(chain, seed):
         data = compile(chain.repeat().batch(2), read=read, loading=READ, seed=seed)
-        whole = data.train(DataPartition())
-        try:
-            expected = take(whole, 4)
-        finally:
-            whole.close()
-        stopped = data.train(DataPartition())
-        try:
-            head = take(stopped, 2)
-            saved = stopped.get_state()
-        finally:
-            stopped.close()
-        resumed = data.train(DataPartition())
-        try:
-            resumed.set_state(saved)
-            assert head + take(resumed, 2) == expected
-        finally:
-            resumed.close()
+        expected, _ = assert_resumes_where_it_stopped(lambda: data.train(DataPartition()), listed, 2, 2)
         return [draw for batch in expected for draw in batch["draw"]]
 
     assert draws(rows, 5) != draws(rows, 6)
@@ -621,15 +585,15 @@ def test_a_position_saved_under_another_plan_version_is_refused(order):
     an earlier version saved, whose random steps drew by another key, is refused rather than
     resumed into other draws, in a global order and in one read per share; one this version saved
     resumes."""
-    rows = Pipeline(source(8)).random_map(Draw())
+    rows = Pipeline(source(8)).random_map(WideDraw())
     chain = rows if order == "global" else rows.grain(drawn_natively)
     data = compile(chain.repeat().batch(2), read="indexed", loading=READ, seed=7)
     assert data.plan is not None and data.plan.lowering == order
     stopped = data.train(DataPartition())
     try:
-        take(stopped, 2)
+        listed(stopped, 2)
         saved = stopped.get_state()
-        expected = take(stopped, 2)
+        expected = listed(stopped, 2)
     finally:
         stopped.close()
     if order == "global":
@@ -644,7 +608,7 @@ def test_a_position_saved_under_another_plan_version_is_refused(order):
         with pytest.raises(ValueError):
             resumed.set_state(earlier)
         resumed.set_state(saved)
-        assert take(resumed, 2) == expected
+        assert listed(resumed, 2) == expected
     finally:
         resumed.close()
 
@@ -657,13 +621,13 @@ def test_host_steps_are_branch_scoped_and_common_steps_run_on_both(read):
     train = data.train(DataPartition())
     held = data.val(DataPartition())
     try:
-        assert take(train, 1)[0]["id"] == [110, 111, 112, 113]
+        assert listed(train, 1)[0]["id"] == [110, 111, 112, 113]
         saved = train.get_state()
-        expected = take(train, 2)
+        expected = listed(train, 2)
         if read != "streamed":
             assert train.records == 12
             assert train.order == json.loads(saved)["dew_global_position"]["order"]
-        assert take(held, 1)[0]["id"] == [100, 101, 102, 103]
+        assert listed(held, 1)[0]["id"] == [100, 101, 102, 103]
     finally:
         train.close()
         held.close()
@@ -673,7 +637,7 @@ def test_host_steps_are_branch_scoped_and_common_steps_run_on_both(read):
     resumed = data.train(DataPartition())
     try:
         resumed.set_state(saved)
-        assert take(resumed, 2) == expected
+        assert listed(resumed, 2) == expected
     finally:
         resumed.close()
 
@@ -681,13 +645,13 @@ def test_host_steps_are_branch_scoped_and_common_steps_run_on_both(read):
 def test_rejection_iterator_resumes_exactly_and_refuses_topology_change():
     data = compile(Pipeline(source()).shuffle(2).repeat().filter_map(Odd()).batch(3), loading=READ, seed=2)
     reader = data.train(DataPartition())
-    take(reader, 3)
+    listed(reader, 3)
     saved = reader.get_state()
-    rest = take(reader, 4)
+    rest = listed(reader, 4)
     reader.close()
     resumed = data.train(DataPartition())
     resumed.set_state(saved)
-    assert take(resumed, 4) == rest
+    assert listed(resumed, 4) == rest
     resumed.close()
     changed = data.train(DataPartition(0, 3))
     with pytest.raises(ValueError):
@@ -699,7 +663,7 @@ def test_random_validation_is_refused():
     compile(Pipeline(source()).batch(4), validation=Pipeline(source()).shuffle(0).batch(4), loading=READ)
     with pytest.raises(ValueError):
         compile(Pipeline(source()).batch(4),
-                validation=Pipeline(source()).shuffle(0).random_map(Draw()).batch(4), loading=READ)
+                validation=Pipeline(source()).shuffle(0).random_map(WideDraw()).batch(4), loading=READ)
 
 
 @pytest.mark.parametrize("workers", [0, 2])
@@ -711,13 +675,13 @@ def test_worker_boundary_keeps_downstream_record_steps_and_exact_positions(worke
         reader = data.train(DataPartition(share, 2))
         first = next(reader)
         state = reader.get_state()
-        expected = take(reader, 8)
+        expected = listed(reader, 8)
         reader.close()
         ids = [*first["id"].tolist(), *(value for row in expected for value in row["id"])]
         assert ids == [100 + share + 2 * index for index in range(12)]
         resumed = data.train(DataPartition(share, 2))
         resumed.set_state(state)
-        assert take(resumed, 8) == expected
+        assert listed(resumed, 8) == expected
         resumed.close()
 
 
@@ -730,7 +694,7 @@ def test_worker_processes_read_a_global_order_in_the_batches_one_process_reads()
         reader = compile(pipeline, seed=5, loading=dataclasses.replace(READ, workers=workers)).train(
             DataPartition())
         try:
-            return take(reader, 9)
+            return listed(reader, 9)
         finally:
             reader.close()
 
@@ -792,10 +756,10 @@ def test_token_deficit_mix_counts_targets_and_restores_delivered_counts():
         # The short corpus within 7 targets of its quarter of all delivered, in whole targets.
         assert abs(4 * int(delivered[0]) - int(sum(delivered))) <= 4 * 7
     saved = reader.get_state()
-    rest = take(reader, 20)
+    rest = listed(reader, 20)
     resumed = iter(mix)
     resumed.set_state(saved)
-    assert take(resumed, 20) == rest
+    assert listed(resumed, 20) == rest
     reader.close()
     resumed.close()
 
@@ -1363,7 +1327,7 @@ def test_an_edit_to_a_configured_factorys_module_alone_is_environment(tmp_path, 
     try:
         next(first)
         state = first.get_state()
-        expected = take(first, 2)
+        expected = listed(first, 2)
     finally:
         first.close()
     module.write_text(factory + "# an edit that changes no code\n")
@@ -1371,7 +1335,7 @@ def test_an_edit_to_a_configured_factorys_module_alone_is_environment(tmp_path, 
     try:
         edited.set_state(state)
         assert edited.manifest_changes == ("modules",)
-        assert take(edited, 2) == expected
+        assert listed(edited, 2) == expected
     finally:
         edited.close()
     other = reader(2)
@@ -1473,14 +1437,14 @@ def test_cold_warm_and_resumed_cache_keep_per_epoch_randomness(tmp_path):
     prefix = Pipeline(stored).cache(cache)
 
     def build(prefix):
-        return compile(prefix.shuffle(5).repeat().random_map(Draw()).batch(4),
+        return compile(prefix.shuffle(5).repeat().random_map(WideDraw()).batch(4),
                        read="memory", seed=5, loading=READ)
 
     cold = build(prefix)
     reader = cold.train(DataPartition())
-    first_epoch = take(reader, 2)
+    first_epoch = listed(reader, 2)
     saved = reader.get_state()
-    second_epoch = take(reader, 2)
+    second_epoch = listed(reader, 2)
     reader.close()
 
     def by_id(epoch):
@@ -1492,10 +1456,10 @@ def test_cold_warm_and_resumed_cache_keep_per_epoch_randomness(tmp_path):
     generation = cache.publish(manifest, stored)
     resumed = build(prefix).train(DataPartition())
     resumed.set_state(saved)
-    assert take(resumed, 2) == second_epoch
+    assert listed(resumed, 2) == second_epoch
     resumed.close()
     warm = build(Pipeline(stored).cache(generation)).train(DataPartition())
-    warm_first, warm_second = take(warm, 2), take(warm, 2)
+    warm_first, warm_second = listed(warm, 2), listed(warm, 2)
     assert by_id(warm_first) != by_id(warm_second)
     assert warm_first == first_epoch
     assert warm_second == second_epoch
@@ -1512,11 +1476,11 @@ def test_causal_windows_keep_each_boundary_target_and_restore_carry():
     reader = iter(windows)
     assert next(reader)["text"].tolist() == [0, 1, 2, 3]
     saved = reader.get_state()
-    rest = take(reader, 10)
+    rest = listed(reader, 10)
     assert rest == [{"text": [3, 4, 5, 6]}, {"text": [6, 7, 8, 9]}]
     resumed = iter(windows)
     resumed.set_state(saved)
-    assert take(resumed, 10) == rest
+    assert listed(resumed, 10) == rest
     reader.close()
     resumed.close()
 
@@ -1547,9 +1511,9 @@ def test_chunk_statistics_count_fanout_per_input_document_and_resume(read, filte
     data = compile(pipeline.repeat(1).batch(1), read=read, loading=READ)
     reader = data.train(DataPartition())
     try:
-        first = take(reader, 1)
+        first = listed(reader, 1)
         saved = reader.get_state()
-        rest = take(reader, 10)
+        rest = listed(reader, 10)
         metrics = dict(data.statistics())
         expected = [
             [1, 2, 3], [3, 4, 5], [5, 6, 7], [11, 12, 13], [13, 14],
@@ -1561,7 +1525,7 @@ def test_chunk_statistics_count_fanout_per_input_document_and_resume(read, filte
     resumed = data.train(DataPartition())
     try:
         resumed.set_state(saved)
-        assert take(resumed, 10) == rest
+        assert listed(resumed, 10) == rest
         assert data.statistics()["data/chunks_per_record/chunks"] == 2.5
     finally:
         resumed.close()
@@ -1579,9 +1543,9 @@ def test_aligned_causal_windows_share_spans_and_resume_across_document_edges(rea
     data = compile(pipeline, read=read, loading=READ)
     reader = data.train(DataPartition())
     try:
-        first = take(reader, 1)
+        first = listed(reader, 1)
         saved = reader.get_state()
-        rest = take(reader, 20)
+        rest = listed(reader, 20)
         assert first + rest == [{"text": [text[start:start + 3].tolist()],
                                  "roles": [roles[start:start + 3].tolist()]}
                                 for start in range(0, len(text) - 2, stride)]
@@ -1590,7 +1554,7 @@ def test_aligned_causal_windows_share_spans_and_resume_across_document_edges(rea
     resumed = data.train(DataPartition())
     try:
         resumed.set_state(saved)
-        assert take(resumed, 20) == rest
+        assert listed(resumed, 20) == rest
     finally:
         resumed.close()
 
@@ -1620,15 +1584,15 @@ def test_block_shuffle_is_a_complete_bounded_physical_order_and_resumes():
     configured = Pipeline(stored).shuffle(11, block_shards=2).repeat().batch(4)
     data = compile(configured, read="memory", loading=READ)
     reader = data.train(DataPartition())
-    first = take(reader, 5)
+    first = listed(reader, 5)
     ids = [value for batch in first for value in batch["id"]]
     assert sorted(ids) == list(range(20))
     state = reader.get_state()
-    rest = take(reader, 4)
+    rest = listed(reader, 4)
     reader.close()
     resumed = data.train(DataPartition())
     resumed.set_state(state)
-    assert take(resumed, 4) == rest
+    assert listed(resumed, 4) == rest
     resumed.close()
     from dew.data.ordering import BlockShuffle
 
@@ -1807,7 +1771,7 @@ def test_an_indexed_read_batches_the_records_memory_holds_in_full_batches():
     data = compile(Pipeline(stored).batch(2), read="indexed", loading=READ)
     reader = data.train(DataPartition())
     try:
-        batches = take(reader, 3)
+        batches = listed(reader, 3)
     finally:
         reader.close()
     assert data.records == 3
@@ -1831,7 +1795,7 @@ def test_map_with_index_reads_each_row_at_its_source_position_in_every_epoch():
         data = compile(numbered.batch(2), read="indexed", loading=READ)
         reader = data.train(DataPartition())
         try:
-            batches = take(reader, rows)
+            batches = listed(reader, rows)
         finally:
             reader.close()
         assert all(batch["at"] == batch["id"] for batch in batches)
@@ -1844,7 +1808,7 @@ def test_a_cached_indexed_root_is_cut_into_disjoint_shares_that_repeat():
     data = compile(cached.batch(2), loading=READ)
     shares = [data.train(DataPartition(index, 2)) for index in range(2)]
     try:
-        read = [[value for batch in take(reader, 8) for value in batch["id"]] for reader in shares]
+        read = [[value for batch in listed(reader, 8) for value in batch["id"]] for reader in shares]
     finally:
         for reader in shares:
             reader.close()
@@ -1862,7 +1826,7 @@ def test_a_mixture_cut_per_share_reads_each_corpus_in_disjoint_shares():
     data = compile(thirds.batch(2), loading=READ)
     shares = [data.train(DataPartition(index, 2)) for index in range(2)]
     try:
-        read = [[value for batch in take(reader, 4) for value in batch["id"]] for reader in shares]
+        read = [[value for batch in listed(reader, 4) for value in batch["id"]] for reader in shares]
     finally:
         for reader in shares:
             reader.close()
@@ -1878,15 +1842,15 @@ def test_a_per_share_position_resumes_against_the_same_rows_cached_elsewhere():
 
     saved = reader()
     try:
-        take(saved, 1)
+        listed(saved, 1)
         state = saved.get_state()
-        expected = take(saved, 2)
+        expected = listed(saved, 2)
     finally:
         saved.close()
     resumed = reader()
     try:
         resumed.set_state(state)
-        assert take(resumed, 2) == expected
+        assert listed(resumed, 2) == expected
     finally:
         resumed.close()
 
@@ -1899,7 +1863,8 @@ def test_a_limit_counts_the_whole_order_and_a_prefetch_never_moves_the_share_cut
     def read(count):
         readers = [data.train(DataPartition(index, count)) for index in range(count)]
         try:
-            return sorted(value for reader in readers for batch in take(reader, 10) for value in batch["id"])
+            return sorted(value for reader in readers
+                          for batch in listed(reader, 10) for value in batch["id"])
         finally:
             for reader in readers:
                 reader.close()
@@ -2082,7 +2047,7 @@ def test_a_streamed_repeat_repeats_where_it_is_written_past_a_limit_or_a_repeat(
     def ids(pipeline, read):
         reader = compile(pipeline.batch(1), read=read, loading=READ).train(DataPartition())
         try:
-            return [row["id"] for row in take(reader, 64)]
+            return [row["id"] for row in listed(reader, 64)]
         finally:
             reader.close()
 
@@ -2105,10 +2070,10 @@ def test_a_nested_mixture_counts_its_epoch_from_each_part():
 def test_a_streamed_training_read_with_a_random_step_and_no_repeat_never_runs_out():
     """A training order that writes no repeat repeats for ever, as its plan
     says, whether or not a random step reads its rows."""
-    reader = compile(Pipeline(source(8)).random_map(Draw()).batch(4), read="streamed",
+    reader = compile(Pipeline(source(8)).random_map(WideDraw()).batch(4), read="streamed",
                      loading=READ).train(DataPartition())
     try:
-        assert reader.endless and len(take(reader, 6)) == 6
+        assert reader.endless and len(listed(reader, 6)) == 6
     finally:
         reader.close()
 
@@ -2132,10 +2097,7 @@ def test_an_indexed_pack_over_a_token_store_reads_its_planned_global_windows(tmp
 
     documents = [np.append(np.full(size, index + 1), 0).astype(np.int32)
                  for index, size in enumerate((5, 3, 9, 2, 7, 4, 6, 1))]
-    (tmp_path / "train.bin").write_bytes(np.concatenate(documents).astype(np.uint16).tobytes())
-    (tmp_path / "meta.json").write_text(json.dumps({
-        "tokenizer": "byte", "dtype": "uint16", "vocab_size": 256, "eos_id": 0,
-        "train_tokens": sum(len(document) for document in documents)}))
+    write_token_corpus(tmp_path, np.concatenate(documents).astype(np.uint16), eos_id=0)
     store = TokenFiles(str(tmp_path)).provision()
 
     def windows(pipeline, read):
@@ -2335,23 +2297,7 @@ def test_an_endless_repeat_resumed_at_the_end_of_a_pass_reads_on(read, batched):
     def ids(stream, count: int) -> list[int]:
         return [int(value) for batch in itertools.islice(stream, count) for value in batch["id"]]
 
-    whole = data.train(DataPartition())
-    try:
-        expected = ids(whole, 3)
-    finally:
-        whole.close()
-    stopped = data.train(DataPartition())
-    try:
-        head = ids(stopped, 1)
-        state = stopped.get_state()
-    finally:
-        stopped.close()
-    resumed = data.train(DataPartition())
-    try:
-        resumed.set_state(state)
-        assert head + ids(resumed, 2) == expected
-    finally:
-        resumed.close()
+    assert_resumes_where_it_stopped(lambda: data.train(DataPartition()), ids, 1, 2)
 
 
 def test_a_random_step_after_an_endless_repeat_draws_as_after_a_finite_one():
@@ -2360,7 +2306,7 @@ def test_a_random_step_after_an_endless_repeat_draws_as_after_a_finite_one():
     rows = Pipeline(source(2)).take(2)
 
     def draws(chain) -> list[int]:
-        data = compile(chain.random_map(Draw()).batch(2), read="streamed", loading=READ)
+        data = compile(chain.random_map(WideDraw()).batch(2), read="streamed", loading=READ)
         stream = data.train(DataPartition())
         try:
             return [int(value) for batch in itertools.islice(stream, 2) for value in batch["draw"]]
@@ -2374,7 +2320,7 @@ def test_a_random_step_after_an_endless_repeat_draws_as_after_a_finite_one():
 def test_a_repeat_after_the_batch_replays_its_first_pass_draws_included(read):
     """A repeat after the batch repeats the batches the first pass made, a random step's draws
     and all, in every read, and a resume reads on as the uninterrupted run does."""
-    data = compile(Pipeline(source(2)).random_map(Draw()).batch(2).repeat(), read=read, loading=READ)
+    data = compile(Pipeline(source(2)).random_map(WideDraw()).batch(2).repeat(), read=read, loading=READ)
 
     def batches(stream, count: int) -> list[tuple[list[int], list[int]]]:
         return [(np.asarray(batch["id"]).tolist(), np.asarray(batch["draw"]).tolist())
