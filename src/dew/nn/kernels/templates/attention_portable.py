@@ -270,6 +270,7 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
             anchor, delta, chosen = algebra.split_delta(others, own, others_total, prior, state_total,
                                                         anchor_rows, do, chosen)
         m = maxima
+        prior = algebra.dq_prior(prior, key.dtype)
         over_prior = algebra.inverse(prior)
 
         def step(j, carry):
