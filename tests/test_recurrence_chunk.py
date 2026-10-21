@@ -42,13 +42,13 @@ as `chunk_ssd` hands it over (a rated decay, the step its write gate)."""
 PACKED = (False, True)
 """A row of one sequence, and of packed documents."""
 
-SEEDS = dict(zip(((hooks, packed) for hooks in HOOKS for packed in PACKED), (
-    8, 8, 8, 8, 8, 8, 8, 8, 16, 16, 64, 64, 16, 16, 16, 16, 32, 32, 64, 64, 8, 8, 8, 8), strict=True))
-"""Each site's declared seeds (hooks in `HOOKS`' order, one sequence then packed), sized independently by
-`seeds_for` on armada (2026-10-21). The vector-decay delta rule's two take 32 where its control resolved
-at 8: the chunked form's own spread left the pooled ratio 1.315 inconclusive over 8 seeds ([1.046,
-1.702])."""
-
+SEEDS = dict(zip(((hooks, packed) for hooks in HOOKS + FORMED for packed in PACKED), (
+    8, 8, 8, 8, 8, 8, 8, 8, 16, 16, 64, 64, 16, 16, 16, 16, 32, 32, 64, 64, 8, 8, 8, 8,
+    128, 64, 128, 128, 8, 8, 16, 16, 64, 64), strict=True))
+"""Each site's declared seeds (hooks in `HOOKS` then `FORMED` order, one sequence then packed), sized
+independently by `seeds_for` on armada (2026-10-21). The vector-decay delta rule's two take 32 where its
+control resolved at 8: the chunked form's own spread left the pooled ratio 1.315 inconclusive over 8
+seeds ([1.046, 1.702])."""
 
 def draw(hooks: recurrence.Hooks, packed: bool, seed: int) -> tuple[Chunk]:
     """A sequence's operands for `hooks` from `seed`, its keys' and values' dimensions each permuted
