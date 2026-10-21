@@ -126,11 +126,25 @@ def test_a_token_budget_counts_the_tokens_of_committed_updates(tmp_path):
     assert resumed.checkpoints.control(4)["committed_tokens"] == 80
 
 
-def test_a_checkpoint_that_counted_every_steps_tokens_cannot_resume_a_token_budget(tmp_path):
-    """A checkpoint whose control counts every step's tokens (`tokens`, as runs counted before they
-    counted commits) holds no committed count: a run whose length is its tokens refuses to resume
-    from it, and a run of steps resumes and keeps the count unknown in its own checkpoints, so a
-    token budget after it is refused too."""
+def test_a_fit_places_its_device_prefetch_and_plans_its_step_beside_them():
+    """`fit(device_prefetch=n)` queues n placed batches beside the step, and the step's memory plan holds
+    room for them and the one being placed: n + 1 batches, so each batch deeper grows the held bytes by
+    one placed batch's bytes, the same each time, and the run trains the same."""
+    def run(depth: int):
+        trainer = make_trainer()
+        state = trainer.fit(dataset(), steps=2, log_every=1, device_prefetch=depth)
+        return trainer.memory["held"], jax.tree.map(np.asarray, state.variables)
+
+    (one, first), (two, _), (three, third) = run(1), run(2), run(3)
+    assert two - one == three - two > 0
+    for left, right in zip(jax.tree.leaves(first), jax.tree.leaves(third), strict=True):
+        np.testing.assert_array_equal(left, right)
+
+
+def test_a_checkpoint_that_counted_every_steps_tokens_is_refused_by_name(tmp_path):
+    """A checkpoint whose control counts every step's tokens under `tokens`, the field runs wrote before
+    they counted commits, holds no count this Dew reads: a run resuming from it is refused, by steps
+    or by tokens, rather than counting from zero."""
     import json
     import pathlib
 
@@ -143,14 +157,9 @@ def test_a_checkpoint_that_counted_every_steps_tokens_cannot_resume_a_token_budg
     control = metadata["custom_metadata"]["control"]
     control["tokens"] = control.pop("committed_tokens")
     written.write_text(json.dumps(metadata))
-    with pytest.raises(ValueError):
-        make_trainer(tmp_path, objective=TokenRegression()).fit(dataset(), tokens=30)
-    resumed = make_trainer(tmp_path, objective=TokenRegression())
-    assert int(resumed.fit(dataset(), steps=3, log_every=1, checkpoint_every=1).step) == 3
-    assert "tokens" in resumed.checkpoints.control(3)
-    assert "committed_tokens" not in resumed.checkpoints.control(3)
-    with pytest.raises(ValueError):
-        make_trainer(tmp_path, objective=TokenRegression()).fit(dataset(), tokens=60)
+    for length in ({"steps": 3}, {"tokens": 60}):
+        with pytest.raises(ValueError):
+            make_trainer(tmp_path, objective=TokenRegression()).fit(dataset(), log_every=1, **length)
 
 
 def test_an_explicit_state_starts_a_token_count_with_its_own_reader(tmp_path):
@@ -1243,11 +1252,13 @@ def test_a_rejected_dynamic_scale_step_leaves_no_trace(accum):
     state, _, _, finite, accepted, _ = step(state, bad)
     assert bool(finite) and not bool(accepted)
     assert int(state.step) == counted + 1
-    assert int(state.microstep) == advanced
+    # The rejection drops its window, the accepted microbatch before it with it (`dropped_window`).
+    assert int(state.microstep) == advanced - advanced % accum
     assert float(state.scale.scale) == scaled / 2
     np.testing.assert_array_equal(state.variables["params"]["w"], w)
     np.testing.assert_array_equal(state.ema["params"]["w"], ema)
-    state, *_ = step(state, good)
+    for _ in range(accum):
+        state, *_ = step(state, good)
     w, ema = host(state)
     np.testing.assert_allclose(w, .64, rtol=1e-6)
     np.testing.assert_allclose(ema, .77, rtol=1e-6)

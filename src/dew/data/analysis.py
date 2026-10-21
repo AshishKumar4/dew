@@ -31,7 +31,7 @@ from typing import TYPE_CHECKING, Literal, Protocol, get_args, runtime_checkable
 
 import grain.python as pygrain
 
-from dew.data.dataset import Records
+from dew.data.dataset import Records, SourceSlice
 from dew.data.pipeline import (
     Artifact,
     Batched,
@@ -46,6 +46,7 @@ from dew.data.pipeline import (
     Map,
     MapBatch,
     MapWithIndex,
+    Measure,
     Mixture,
     Native,
     Pack,
@@ -142,12 +143,43 @@ def _in_memory(source: Source) -> bool:
     return isinstance(_store(source), Memory)
 
 
-def _stated(source: Source, read: Read) -> tuple[Records | None, Mapping[str, object]]:
-    """The records a memory read of `source` holds, then its metadata, read
-    in that order: a source may measure a fact as it reads (a prompt's
-    reward bound), so its facts follow the read."""
+@dataclasses.dataclass(frozen=True)
+class Measuring:
+    """A fact a configured step measures (`Configured.measures`) and the stages before it, which
+    make the records it reads from the store's."""
+
+    measure: Measure
+    before: tuple[Stage, ...]
+
+
+def _stated(source: Source, read: Read, measuring: Sequence[Measuring] = (),
+            whole: Callable[[Source], Records] | None = None) -> tuple[Records | None, Mapping[str, object]]:
+    """The records a memory read of `source` holds, then its metadata, with each fact `measuring`
+    measures in place of any the store states, in a memory read: over the whole store's records,
+    below any holdout, so each part of it binds alike, as the stages before the measuring step make
+    them (`dew.data.lowering.prepared_rows`). `whole` reads the store once for every part of it."""
+    from dew.data.lowering import prepared_rows
+
     held = source.records(read) if read == "memory" else None
-    return held, source.metadata()
+    metadata = source.metadata()
+    if held is None or not measuring:
+        return held, metadata
+    store = _store(source)
+    # A records holdout reads its part of the whole store's records, which it keeps.
+    rows = (held if store is source else held.source if isinstance(held, SourceSlice)
+            else whole(store) if whole is not None else store.records(read))
+    return held, {**metadata, **{each.measure.fact: each.measure(prepared_rows(rows, each.before))
+                                 for each in measuring}}
+
+
+def _measures(stages: Sequence[Stage]) -> tuple[Measuring, ...]:
+    """The facts the configured steps among `stages` measure (`Configured.measures`), each once,
+    with the stages before each."""
+    found: dict[str, Measuring] = {}
+    for index, stage in enumerate(stages):
+        if isinstance(stage, Configured) and stage.measures is not None:
+            found.setdefault(stage.measures.fact, Measuring(stage.measures, tuple(stages[:index])))
+    return tuple(found.values())
 
 
 def _prefix_manifest(source: Source, prefix: Sequence[Stage], read: Read) -> Manifest:
@@ -157,7 +189,8 @@ def _prefix_manifest(source: Source, prefix: Sequence[Stage], read: Read) -> Man
     consumed = _consumed(source, read)
     pipeline = Pipeline(consumed, tuple(prefix))
     if any(isinstance(stage, Configured) for stage in prefix):
-        pipeline = _configured(pipeline, _stated(consumed, read)[1], read)
+        stated = _stated(consumed, read, _measures(prefix))[1]
+        pipeline = _configured(pipeline, stated, read, stated=stated)
     return _cache_manifest(consumed, pipeline.stages, read)
 
 
@@ -481,14 +514,19 @@ def _configured(
     shared: Mapping[str, object],
     read: Read,
     scope: Literal["source", "run"] | None = None,
+    *,
+    stated: Mapping[str, object] | None = None,
 ) -> Pipeline:
+    """`pipeline` with its configured steps bound: a source-scoped one to the facts its source
+    states, or `stated` (what `_stated` reads of it, measured facts included), a run-scoped one to
+    the run's (`shared`)."""
     source = pipeline.source
     if isinstance(source, (Mixture, Phases)):
         children = tuple(_configured(child, shared, read, scope) for child in source.pipelines)
         source = dataclasses.replace(source, pipelines=children)
         local = shared
     else:
-        local = source.metadata()
+        local = source.metadata() if stated is None else stated
     stages: list[Stage] = []
     for stage in pipeline.stages:
         if not isinstance(stage, Configured) or (scope is not None and stage.scope != scope):

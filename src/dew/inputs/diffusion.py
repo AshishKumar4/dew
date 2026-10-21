@@ -59,7 +59,7 @@ def _row_guidance(record: Mapping[str, object], default: float | None) -> float:
     return float(value)
 
 
-def latent_image_conditions(autoencoder, params, pixels, mask, key):
+def latent_image_conditions(autoencoder, params, pixels, mask, key, noise=None):
     """Turns normalized pixels and a binary pixel mask into native UNet inputs.
 
     Returns mask [B,h,w,1] and masked_image [B,h,w,C] under the model keyword
@@ -71,7 +71,7 @@ def latent_image_conditions(autoencoder, params, pixels, mask, key):
     if mask.shape != (*pixels.shape[:-1], 1):
         raise ValueError("Image and mask geometry must match, with one mask channel")
     mask = (mask >= 0.5).astype(jnp.float32)
-    latent = autoencoder.encode(params, pixels * (mask < 0.5), key)
+    latent = autoencoder.encode(params, pixels * (mask < 0.5), key, noise=noise)
     mask = torch_nearest_resize(mask, *latent.shape[1:3])
     return {"mask": mask, "masked_image": latent}
 
@@ -555,10 +555,7 @@ class HiddenStatesConditioner(_LanguageText):
         return tokens
 
     def conditioning_flops(self, tokens) -> ConditionWork:
-        lengths = np.sum(np.asarray(tokens["attention_mask"]) != 0, axis=-1, dtype=np.int64)
-        spans = np.full(lengths.shape, np.shape(tokens["input_ids"])[1], np.int64)
-        return ConditionWork(counted_flops(self.tower, lengths), lengths, spans,
-                             self.tower.emb_features * len(self.layers))
+        return ConditionWork.of_tokens(self.tower, tokens, self.tower.emb_features * len(self.layers))
 
     def encode(self, params, tokens) -> DenoisingCondition:
         ids = jnp.asarray(tokens["input_ids"])
@@ -611,11 +608,9 @@ class WanConditioner(_LanguageText):
                 "attention_mask": np.asarray(encoded.attention_mask, np.int32)}
 
     def conditioning_flops(self, tokens) -> ConditionWork:
-        lengths = np.sum(np.asarray(tokens["attention_mask"]) != 0, axis=-1, dtype=np.int64)
         # The encoder masks padding, but Wan reads its zero-filled fixed
         # output budget without a mask; those keys remain in its softmax.
-        output = np.full(lengths.shape, np.shape(tokens["input_ids"])[1], np.int64)
-        return ConditionWork(counted_flops(self.tower, lengths), lengths, output, self.tower.emb_features)
+        return ConditionWork.of_tokens(self.tower, tokens, self.tower.emb_features)
 
     def encode(self, params, tokens) -> DenoisingCondition:
         mask = jnp.asarray(tokens["attention_mask"])
