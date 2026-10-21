@@ -70,6 +70,18 @@ def load_fixture(name):
     }
 
 
+def assert_tower_with_live_positions(tower, variables, fixture, positions: str) -> None:
+    """`tower`'s features of the fixture's pixels within 1e-4 of its reference's everywhere, and,
+    with the parameters named `positions` zeroed, more than 0.01 away somewhere: the positions are
+    live."""
+    assert np.max(np.abs(
+        np.asarray(tower.apply(variables, fixture["pixels"])) - fixture["tower_ref"])) < 1e-4
+    unpositioned = jax.tree_util.tree_map_with_path(
+        lambda path, leaf: jnp.zeros_like(leaf) if path[-1].key == positions else leaf, variables)
+    assert np.max(np.abs(
+        np.asarray(tower.apply(unpositioned, fixture["pixels"])) - fixture["tower_ref"])) > 1e-2
+
+
 def test_siglip_tower_matches_the_reference_implementation():
     """fp32 parity on the tiny SigLIP trunk, and the positions are live: with
     them zeroed the trunk leaves the reference by more than 0.01."""
@@ -77,14 +89,7 @@ def test_siglip_tower_matches_the_reference_implementation():
     record = siglip.translate_siglip_vision_config(fixture["config"])
     tower = towers.from_record(record).build()
     variables, _ = tower_variables("siglip", fixture["tensors"], "float32")
-    assert np.max(np.abs(
-        np.asarray(tower.apply(variables, fixture["pixels"])) - fixture["tower_ref"])) < 1e-4
-    unpositioned = jax.tree_util.tree_map_with_path(
-        lambda path, leaf: jnp.zeros_like(leaf)
-        if path[-1].key == "embedding" else leaf, variables)
-    assert np.max(np.abs(
-        np.asarray(tower.apply(unpositioned, fixture["pixels"]))
-        - fixture["tower_ref"])) > 1e-2
+    assert_tower_with_live_positions(tower, variables, fixture, "embedding")
 
 
 def test_a_siglip_tower_runs_any_layer_activation_and_an_inactive_dropout_as_the_reference_does():
@@ -144,14 +149,7 @@ def test_llama4_tower_matches_the_reference_implementation():
     record = llama4.translate_llama4_vision_config(fixture["config"])
     tower = towers.from_record(record).build()
     variables, _ = tower_variables("llama4", fixture["tensors"], "float32")
-    assert np.max(np.abs(
-        np.asarray(tower.apply(variables, fixture["pixels"])) - fixture["tower_ref"])) < 1e-4
-    unpositioned = jax.tree_util.tree_map_with_path(
-        lambda path, leaf: jnp.zeros_like(leaf)
-        if path[-1].key == "positional_embedding" else leaf, variables)
-    assert np.max(np.abs(
-        np.asarray(tower.apply(unpositioned, fixture["pixels"]))
-        - fixture["tower_ref"])) > 1e-2
+    assert_tower_with_live_positions(tower, variables, fixture, "positional_embedding")
 
 
 def test_llama4_projector_matches_the_reference_implementation():

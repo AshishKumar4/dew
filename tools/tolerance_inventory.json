@@ -1048,7 +1048,7 @@
    "by": "2026-11-13"
   },
   "tests/test_vision.py": {
-   "comparisons": 21,
+   "comparisons": 19,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
