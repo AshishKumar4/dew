@@ -270,11 +270,10 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
             anchor, delta, chosen = algebra.split_delta(others, own, others_total, prior, state_total,
                                                         anchor_rows, do, chosen)
         m = maxima
-        over_prior = algebra.inverse(prior)
 
         def step(j, carry):
-            # Against the unnormalized weights, taken to the pass's own denominator at the end
-            # (`algebra.dq_finish`), dQ's operands over the prior one before they narrow, as the Triton
+            # Each cotangent over the prior denominator, in the reference's order, and taken to the pass's
+            # own at the end (`algebra.dq_finish`); the weights' sums unnormalized, as the Triton
             # mainloop's dQ launch.
             dq, residual, mass, grads, weighed = carry
             columns, seen, params, k_tile, v_tile = tile(j)
@@ -282,9 +281,9 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
                                      slopes=True)
             weights = algebra.normalized(logits, m, jnp.ones_like(m))[0]
             cotangents = algebra.grad_scores(weights, _dot(do, v_tile.T), anchor, delta, seen,
-                                             columns[None, :] == chosen[:, None])
+                                             columns[None, :] == chosen[:, None], algebra.inverse(prior))
             pulled, pieces = algebra.pulled(cotangents, slopes, seen, score_kinds)
-            dq = dq + _dot(algebra.dq_operand(pulled, over_prior, scale, k_tile.dtype), k_tile)
+            dq = dq + _dot((pulled * scale).astype(k_tile.dtype), k_tile)
             grads = tuple(grad + piece if add else grad for grad, add, piece in zip(grads, summed, pieces,
                                                                                    strict=True))
             if any(summed):
@@ -298,8 +297,7 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
         found = algebra.DqSums(*jax.lax.fori_loop(
             lo, hi, step, (jnp.zeros((block_q, width), jnp.float32), nothing, nothing, rows_sums, rows_sums)))
         dq, delta, denominator, mass, grads = algebra.dq_finish(found, prior, state_total, peak0,
-                                                                (total0, term0), m, anchor, delta,
-                                                                algebra.dq_scale(scale, key.dtype))
+                                                                (total0, term0), m, anchor, delta)
         return dq, (delta, anchor, m, denominator, mass), chosen, _written(grads, score_kinds)
 
     dq, rows_out, chosen, written = jax.lax.map(program, jnp.arange(blocks * batch * heads))

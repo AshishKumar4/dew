@@ -398,11 +398,10 @@ def split_delta(others: jax.Array, own: jax.Array, others_total: jax.Array, tota
 
 
 class DqSums(NamedTuple):
-    """A dQ pass's sums over its keys against the unnormalized weights `exp(s - m)`: dQ `[bq, D]`
-    unscaled, whose operands alone are taken over a `prior` denominator (the forward's, or the first
-    pass's) before the product with the keys, as the reference's cotangents are; the score cotangents'
-    and the weights' row sums, and the HEAD and QUERY hook parameters' pullbacks of the cotangents
-    (`grads`) and of the weights (`weighed`), fp32."""
+    """A dQ pass's sums over its keys: dQ `[bq, D]` and the score cotangents' row sums and the HEAD and
+    QUERY hook parameters' pullbacks of them (`grads`), each cotangent taken over a `prior` denominator
+    (the forward's, or the first pass's; `grad_scores`); and the unnormalized weights' row sums and the
+    hook parameters' pullbacks of them (`weighed`), fp32."""
 
     dq: jax.Array
     residual: jax.Array
@@ -411,41 +410,22 @@ class DqSums(NamedTuple):
     weighed: tuple[jax.Array, ...]
 
 
-def dq_operand(cotangents: jax.Array, over_prior: jax.Array, scale: float, dtype) -> jax.Array:
-    """A tile's dQ operand, the left of its product with the keys: its score cotangents over the prior
-    denominator in fp32, then narrowed to `dtype`. fp16 takes the softmax's scale too before it narrows,
-    its range being fp16's own; bf16 and fp32, whose range is fp32's, leave it to `dq_finish`
-    (`dq_scale`), so no compiler folds a small scale into a small denominator."""
-    normalized = cotangents * over_prior[:, None]
-    if jnp.dtype(dtype) == jnp.float16:
-        normalized = normalized * scale
-    return normalized.astype(dtype)
-
-
-def dq_scale(scale: float, dtype) -> float:
-    """The softmax's scale `dq_finish` applies: what `dq_operand` left for it."""
-    return 1.0 if jnp.dtype(dtype) == jnp.float16 else scale
-
-
 def dq_finish(sums: DqSums, prior: jax.Array, state_total: jax.Array, peak0: jax.Array,
-              shares: tuple[jax.Array, jax.Array], peak: jax.Array, anchor: jax.Array, delta: jax.Array,
-              softmax_scale: float):
-    """A dQ pass's results from its sums: each taken to the pass's own denominator, the initial state's
-    `state_total` and its keys' weights (so the weights it differentiates sum to one over its own logits,
-    whichever pass gave D), dQ from the `prior` its operands were taken over and times the softmax's
-    scale, then D refined once from its own sums (`refinement`) and the HEAD and QUERY gradients with
-    it. Returns dQ, the refined `D - c`, the denominator, the keys' share of the weights, and the hook
-    gradients."""
+              shares: tuple[jax.Array, jax.Array], peak: jax.Array, anchor: jax.Array, delta: jax.Array):
+    """A dQ pass's results from its sums, each taken to the pass's own denominator, the initial state's
+    `state_total` and its keys' weights, so the weights it differentiates sum to one over its own logits
+    whichever pass gave D: the cotangents' sums from the prior by their ratio (one division, about 1),
+    the weights' over it. D is then refined once from its own sums (`refinement`), and the HEAD and
+    QUERY gradients with it. Returns dQ, the refined `D - c`, the denominator, the keys' share of the
+    weights, and the hook gradients."""
     total = state_total + sums.mass
-    scale = inverse(total)
-    mass, residual = sums.mass * scale, sums.residual * scale
-    refined = refinement(residual, mass, peak0, shares, peak, total, anchor, delta)
-    grads = tuple(grad * scale - refined * (weighed * scale)
-                  for grad, weighed in zip(sums.grads, sums.weighed, strict=True))
-    # The prior over the pass's own denominator in one division, about 1, before the softmax's scale
-    # meets it: no compiler can fold the scale into a small factor of it.
     ratio = jnp.where(total > 0, prior / jnp.where(total > 0, total, 1.0), 0.0)
-    return sums.dq * (ratio * softmax_scale)[:, None], delta + refined, total, mass, grads
+    over = inverse(total)
+    mass, residual = sums.mass * over, sums.residual * ratio
+    refined = refinement(residual, mass, peak0, shares, peak, total, anchor, delta)
+    grads = tuple(grad * ratio - refined * (weighed * over)
+                  for grad, weighed in zip(sums.grads, sums.weighed, strict=True))
+    return sums.dq * ratio[:, None], delta + refined, total, mass, grads
 
 
 def normalized(logits: jax.Array, peak: jax.Array, total: jax.Array) -> tuple[jax.Array, jax.Array]:
@@ -455,21 +435,17 @@ def normalized(logits: jax.Array, peak: jax.Array, total: jax.Array) -> tuple[ja
 
 
 def grad_scores(exponentials: jax.Array, products: jax.Array, anchor: jax.Array, delta: jax.Array,
-                seen: jax.Array, at_anchor: jax.Array | None = None,
-                inverse_total: jax.Array | None = None) -> jax.Array:
-    """The score cotangents `p (dP - D)` of a tile from its unnormalized weights `exp(s - m)`, taken as
-    `exp(s - m) ((dP - c) - (D - c))` about each query's anchor c (`off_anchor_delta`) and only then
-    over each query's denominator (`inverse_total`; None leaves them unnormalized, `dq_finish`
-    normalizing them), so a weight below fp32's range beside a large product keeps its share; zero
-    where unseen. The anchor key's own `dP - c` is 0 by definition where `at_anchor` names it, whatever
-    its product's rounding."""
+                seen: jax.Array, at_anchor: jax.Array | None, inverse_total: jax.Array) -> jax.Array:
+    """The score cotangents `p (dP - D)` of a tile in the reference's own order, as JAX differentiates
+    `exp(s - m) / T`: each query's `(dP - c) - (D - c)` about its anchor c (`off_anchor_delta`) over its
+    denominator (`inverse_total`), then times the unnormalized weights `exp(s - m)`, so every
+    intermediate lies where the reference's does (a weight below fp32's range keeps its share beside a
+    large product, and none overflows that the reference keeps); zero where unseen. The anchor key's
+    own `dP - c` is 0 by definition where `at_anchor` names it, whatever its product's rounding."""
     relative = products - anchor[:, None]
     if at_anchor is not None:
         relative = jnp.where(at_anchor, 0.0, relative)
-    raw = exponentials * (relative - delta[:, None])
-    if inverse_total is not None:
-        raw = raw * inverse_total[:, None]
-    return jnp.where(seen, raw, 0.0)
+    return jnp.where(seen, exponentials * ((relative - delta[:, None]) * inverse_total[:, None]), 0.0)
 
 
 def refinement(residual: jax.Array, mass: jax.Array, peak0: jax.Array, shares: tuple[jax.Array, jax.Array],
