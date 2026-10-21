@@ -82,6 +82,13 @@ def test_a_small_recording_is_committed_and_a_large_one_pinned_and_read_as_its_p
     assert store.local(elsewhere, root) == elsewhere
     with pytest.raises(ValueError):
         _saved(store, root, "tests/../outside.npz")
+    # Nor through a symlink at the place that leads out of the fixtures: the file it leads to is kept.
+    (root / SMALL).unlink()
+    (root / SMALL).symlink_to(elsewhere)
+    kept = elsewhere.read_bytes()
+    with pytest.raises(ValueError):
+        _saved(store, root, SMALL, 256)
+    assert elsewhere.read_bytes() == kept
 
 
 def test_check_refuses_a_large_recording_in_git_and_a_pin_not_uploaded_or_not_whole(store, tmp_path):

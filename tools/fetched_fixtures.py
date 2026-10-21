@@ -107,8 +107,9 @@ def save(path, arrays: dict, *, reference: str, license: str, root: Path = REPO_
     import numpy as np
 
     name = fixture(path, root)
-    if name is None:
-        raise ValueError(f"{path}: a recording is saved under {FIXTURES}/")
+    # Written where it resolves to: a symlink at the place, or above it, may not carry a write out.
+    if name is None or not (root / name).resolve().is_relative_to((root / FIXTURES).resolve()):
+        raise ValueError(f"{path}: a recording is saved under {FIXTURES}/, and resolves there")
     buffer = io.BytesIO()
     np.savez_compressed(buffer, **arrays)
     data, target = buffer.getvalue(), root / name
