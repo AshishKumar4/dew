@@ -417,11 +417,17 @@ def check_truncation(truncation: str) -> None:
         raise ValueError(f"truncation must be one of {TRUNCATIONS}, got {truncation!r}")
 
 
+def _trains(status: Status, truncation: str) -> bool:
+    """Whether a session that ended with `status` trains under `truncation`: a trainable status
+    always, a truncated one unless its truncation policy masks it."""
+    return status.trainable or (status is Status.TRUNCATED and truncation != "mask")
+
+
 def _trained_reward(session: Session, truncation: str) -> float | None:
     """The reward `session` trains on under `truncation`, or None when it carries no loss."""
     if session.status.trainable:
         return session.reward
-    if session.status is not Status.TRUNCATED or truncation == "mask":
+    if not _trains(session.status, truncation):
         return None
     if truncation == "zero":
         return 0.0
@@ -802,7 +808,7 @@ def session_metrics(sessions: Sequence[Session], batch: Mapping[str, np.ndarray]
     everything = max(sum(sampled.values()), 1)
     for status in Status:
         metrics[f"status/{status.value}"] = sum(session.status == status for session in sessions) / total
-        if not status.trainable and not (status is Status.TRUNCATED and truncation != "mask"):
+        if not _trains(status, truncation):
             metrics[f"masked/{status.value}"] = sampled[status] / everything
     segments = np.asarray(batch[SEGMENT_IDS_KEY])
     rows = np.arange(segments.shape[0])[:, None] * (segments.shape[1] + 1) + segments
