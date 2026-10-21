@@ -87,17 +87,14 @@ def _cases():
 @pytest.mark.parametrize("generation_name,record", list(_cases()))
 def test_the_cost_model_picks_within_10_percent_of_the_measured_best_or_names_its_miss(generation_name: str,
                                                                                       record: dict):
-    """The measured time of the config the cost model picks among the swept ones, over the fastest
-    swept config's: at most 1.10, or the case is in `MISSES` and still past it."""
+    """The measured time of the config the launch runs (its heuristic, the cost model's choice among
+    every fitting config) over the fastest swept config's: the pick was swept, and runs at most 1.10
+    times the best, or the case is in `MISSES` and still past it."""
     launch, args, options = _launch(record)
     configs = {_config(text): ms for text, ms in record["times"].items()}
     with generation.assumed(generation_name):
-        target = generation.gpu_target()
-        ba = launch.bind(*args, **options, interpret=False)
-        space = list(launch.space(ba))
-        swept = [config for config in space if config in configs]
-        estimates = {config: launch.cost(ba, config, target) for config in swept}
-    pick = min(swept, key=lambda config: (estimates[config], space.index(config)))
+        pick = launch.bind(*args, **options, interpret=False).heuristics_config
+    assert pick in configs, f"the sweep did not time the pick {pick}"
     ratio = configs[pick] / min(configs.values())
     miss = MISSES.get((generation_name, record["implementation"], record["shape"], record["product"]))
     if miss is None:
