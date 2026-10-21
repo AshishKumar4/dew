@@ -115,7 +115,8 @@ jobs:
         python-version-file: .python-version
     - name: Build and check the sdist and wheel
       run: |
-        python -m pip install --upgrade pip build twine uv
+        python -m pip install --quiet -r tools/pip.txt
+        python -m pip install --upgrade build twine uv
         python -m build
         python -m twine check --strict dist/*
         python tools/check_distribution.py dist/*
@@ -127,9 +128,12 @@ jobs:
       with:
         name: dist
         path: dist/
+    # Every environment's pip is tools/pip.txt's before it installs anything: older pips trust the
+    # roots of eMudhra's compromised CAs (2026-10-20).
     - name: Without Dew's package index, an install stops at resolving jax
       run: |
         python -m venv "$RUNNER_TEMP/plain"
+        "$RUNNER_TEMP/plain/bin/python" -m pip install --quiet -r tools/pip.txt
         if "$RUNNER_TEMP/plain/bin/pip" install --index-url https://pypi.org/simple dist/*.whl > plain.txt 2>&1; then
           cat plain.txt; echo "dewml installed from PyPI alone, on a jax without Dew's fixes"; exit 1
         fi
@@ -137,6 +141,7 @@ jobs:
     - name: Install the wheel into an empty environment, jax from Dew's package index
       run: |
         python -m venv "$RUNNER_TEMP/clean"
+        "$RUNNER_TEMP/clean/bin/python" -m pip install --quiet -r tools/pip.txt
         index=$(python -c "import runpy; print(runpy.run_path('src/dew/telemetry/builds.py')['PACKAGE_INDEX'])")
         "$RUNNER_TEMP/clean/bin/pip" install --quiet --index-url https://pypi.org/simple \
           --extra-index-url "$index" dist/*.whl
@@ -176,8 +181,9 @@ jobs:
     runs-on: ubuntu-latest
     # The suite runs on armada (.armada.json, tools/armada/ci.py): both
     # Pythons as tasks of about five minutes each on Dew's own armada
-    # deployment, on at most 84 containers: with the gangs' 12, a run holds
-    # 96 of the deployment's 108 and leaves the rest to the lanes' own jobs.
+    # deployment, on at most 160 containers: with the gangs' 12, a run holds
+    # 172 of the deployment's 216 (its 864-vCPU fleet cap) and leaves the rest
+    # to the lanes' own jobs.
     # A straggler at the end runs again (task.speculative). Tasks share XLA's
     # compilations through the dew-xla-cache Worker (tests/remote_cache.py).
     # Its URL and token are the ARMADA_URL and ARMADA_TOKEN secrets.
@@ -236,7 +242,7 @@ jobs:
           gangs=$!
         fi
         # Its own deadline sits below this job's 60 minutes, so a hang is armada's named error, and
-        # above what every file takes on 84 containers when no row is cached (a change to a module
+        # above what every file takes on 160 containers when no row is cached (a change to a module
         # most tests import, and the daily run, which proves the commit again with every file).
         if [ "$DEW_TEST_CACHE" = off ] || ! $armada verdict ${{ github.sha }}; then
           setsid $armada run ${{ github.sha }} --deadline=2700 --label="${{ github.ref_name }}" \

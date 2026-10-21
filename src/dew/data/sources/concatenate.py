@@ -12,6 +12,7 @@ import numpy as np
 from dew.data.dataset import Records
 from dew.data.pipeline import Dataset
 from dew.data.sources.base import _COUNTS, Read, Shard, ShardManifest, Source, _consumed, tokenizer_contract
+from dew.data.steps.text import stated_rules
 from dew.records import integer
 
 COUNTED = (*_COUNTS, "held_out")
@@ -56,15 +57,21 @@ class Concatenate(Dataset):
     def metadata(self) -> Mapping[str, object]:
         """What every source states of its records, as one store's: the counts (`COUNTED`) added
         where each source states one, the tokenizer contract where the sources that state it agree
-        (`tokenizer_contract`, which refuses two), and any other fact, class names among them,
-        where every source states the one value."""
+        (`tokenizer_contract`, which refuses two), the rules any part's rows were counted by
+        where every part states its own (`count_rules`), and any other fact, class names among
+        them, where every source states the one value."""
         stated = [source.metadata() for source in self.sources]
         contract = tokenizer_contract((source.describe(), facts)
                                       for source, facts in zip(self.sources, stated, strict=True))
         facts: dict[str, object] = dict(contract)
         for key in dict.fromkeys(key for given in stated for key in given):
             values = [given[key] for given in stated if key in given]
-            if key in COUNTED:
+            if key == "count_rules":
+                # The rules any part's rows were counted by, where every part states its own.
+                if len(values) == len(stated):
+                    rules = {rule for value in values for rule in stated_rules(value)}
+                    facts[key] = [list(rule) for rule in sorted(rules, key=repr)]
+            elif key in COUNTED:
                 if len(values) == len(stated) and all(isinstance(value, int) for value in values):
                     facts[key] = sum(integer(value, key) for value in values)
             elif key not in contract and len(values) == len(stated) and all(
