@@ -102,11 +102,25 @@ def main(argv: list[str]) -> int:
     parser.add_argument("--seeds", type=int, help="the class's declared count; without it, size it "
                         "(`seeds_for`, on the seeds below OFFSET) and print it")
     parser.add_argument("--runs", type=int, default=10)
+    parser.add_argument("--draws", type=int, help="instead, print the reference's own mean squared error "
+                        "from float64 by leaf over this many draws past every run's, for a sizing model")
     parser.add_argument("--chunk", type=int, default=0)
     options = parser.parse_args(argv)
     from reference_error import null_runs, seeds_for
 
     reference, draw, truth = CLASSES[options.name]()
+    if options.draws is not None:
+        import numpy as np
+
+        from reference_error import _drawn
+
+        seeds = range(2 * OFFSET * 1024 + options.chunk * options.draws,
+                      2 * OFFSET * 1024 + (options.chunk + 1) * options.draws)
+        draws = _drawn(reference, reference, draw, seeds, truth)
+        print(json.dumps({"class": options.name, "chunk": options.chunk, "names": draws.names,
+                          "mse": np.asarray(draws.mine).tolist(),
+                          "worst": np.asarray(draws.worst[..., 0]).tolist()}), flush=True)
+        return 0
     if options.seeds is None:
         sized = seeds_for(reference, draw, options.name, truth_fn=truth)
         print(json.dumps({"class": options.name, "seeds": sized}), flush=True)
