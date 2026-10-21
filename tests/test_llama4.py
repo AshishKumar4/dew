@@ -14,6 +14,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from interop_support import fixture_arrays
 
 from dew.inference import TextGeneration
 from dew.interop import Pretrained
@@ -31,8 +32,7 @@ HIDDEN, HEADS, KV_HEADS, HEAD_DIM = 32, 4, 2, 8
 
 
 def fixture(name: str) -> dict:
-    with np.load(FIXTURES / f"{name}.npz") as data:
-        return {key: np.asarray(value) for key, value in data.items()}
+    return fixture_arrays(FIXTURES / f"{name}.npz")
 
 
 def attention(*, attention_chunk_size: int | None = None, **overrides):
