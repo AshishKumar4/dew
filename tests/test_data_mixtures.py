@@ -1327,7 +1327,7 @@ def test_a_finite_mixture_resumed_after_a_member_ends_reads_what_the_uninterrupt
 
 def test_phases_read_each_chain_until_its_step_as_the_phased_text_recipe(tmp_path):
     """Two token stores read one until step two, then a mix of both, each store packed alone by the
-    lm preset and the phases batched after: the phased text recipe's plan."""
+    lm preset and the phases ordered and batched after: the phased text recipe's plan."""
     from dew.config.data import DataPhase, TextData, loader
     from dew.data import phases, presets
     from dew.data.sources import TokenFiles
@@ -1345,6 +1345,8 @@ def test_phases_read_each_chain_until_its_step_as_the_phased_text_recipe(tmp_pat
     def packed(path):
         return TokenFiles(str(path)).pipe(presets.lm, None, seq_len=8, batch=None, pack="first-fit")
 
-    chain = phases((packed(first), 2), (mix([packed(first), packed(second)], by="tokens"), None)).batch(2)
+    # The phases ordered and repeated as the recipe's loader orders them, then batched.
+    phased = phases((packed(first), 2), (mix([packed(first), packed(second)], by="tokens"), None))
+    chain = phased.shuffle(0).repeat().batch(2)
     built = compile(chain, read="indexed", loading=loading)
     assert built.plan.identity() == expected.plan.identity()
