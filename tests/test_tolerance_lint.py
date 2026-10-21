@@ -234,6 +234,35 @@ def test_counts_a_helper_beside_the_file_returns_are_whole_where_its_own_file_pr
     assert [finding.line for finding in found] == [8, 10]
 
 
+def test_an_imported_helper_that_returns_an_error_is_compared_as_a_local_one_is(lint, tmp_path):
+    """A test importing its support's difference helper (`largest_difference`) and holding its result
+    within a tolerance compares an error, as the same helper defined in the test does: both are found."""
+    helper = """\
+        import numpy as np
+
+
+        def largest_difference(a, b):
+            return float(np.max(np.abs(np.asarray(a) - np.asarray(b))))
+        """
+    _module(lint, tmp_path, "tests/model_support.py", helper)
+    imported = """\
+        from model_support import largest_difference
+
+
+        def test():
+            assert largest_difference(a, b) < 1e-5
+        """
+    local = helper + """\
+
+
+        def test():
+            assert largest_difference(a, b) < 1e-5
+        """
+    for relative, body in (("tests/test_imported.py", imported), ("tests/test_local.py", local)):
+        found = list(lint.tolerances(_module(lint, tmp_path, relative, body)))
+        assert len(found) == 1, relative
+
+
 def test_the_gate_compares_floats_and_scripts_outside_tests_and_tools_are_not_read(lint, tmp_path):
     body = "import numpy as np\nnp.testing.assert_allclose(a, b, rtol=1e-5)\n"
     assert not list(lint.tolerances(_module(lint, tmp_path, "tests/reference_error.py", body)))

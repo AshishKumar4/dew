@@ -81,6 +81,7 @@ class _Reading:
     counting: set[int] = field(default_factory=set)
     erring_at: dict[int, set[int]] = field(default_factory=dict)
     whole_import: Callable[[str], bool] = field(default=lambda called: False)
+    erring_import: Callable[[str], bool] = field(default=lambda called: False)
 
 
 @dataclass
@@ -306,7 +307,8 @@ def _measured(inner: ast.AST, scope: _Scope, reading: _Reading) -> tuple[bool, b
 def _erring(value: ast.AST, scope: _Scope, reading: _Reading) -> bool:
     """Whether `value` holds an error: a magnitude, square or norm of a difference, or a distance
     (`_measured`), a name the scope binds to one, what a function of the file may return of one (the
-    call resolved to its definitions, `_Calls.reached`), or a place of a tuple it returns."""
+    call resolved to its definitions, `_Calls.reached`) or a function it imports (`erring_import`), or
+    a place of a tuple it returns."""
     for inner in _parts(value, scope, reading):
         if isinstance(inner, ast.Name) and inner.id in scope.errors:
             return True
@@ -316,7 +318,9 @@ def _erring(value: ast.AST, scope: _Scope, reading: _Reading) -> bool:
             continue
         if _measured(inner, scope, reading)[1]:
             return True
-        if isinstance(inner, ast.Call) and _returned(inner, scope, reading, reading.erring):
+        if isinstance(inner, ast.Call) and (
+                _returned(inner, scope, reading, reading.erring)
+                or reading.erring_import(_called(inner, reading.tables.get(id(inner), {})))):
             return True
     return False
 
@@ -609,9 +613,11 @@ def _conjoined_bands(node: ast.AST, scope: _Scope, reading: _Reading) -> int:
 
 
 def _read(tree: ast.Module, tables: Mapping[int, Mapping[str, str]], calls: Calls,
-          whole_import: Callable[[str], bool]) -> tuple[_Reading, list[ast.AST]]:
+          whole_import: Callable[[str], bool],
+          erring_import: Callable[[str], bool] = lambda called: False) -> tuple[_Reading, list[ast.AST]]:
     """What SLOP020 knows of a file's functions (`_Reading`), and the file's scopes."""
-    reading = _Reading(tables, calls, set(), set(), set(), whole_import=whole_import)
+    reading = _Reading(tables, calls, set(), set(), set(), whole_import=whole_import,
+                       erring_import=erring_import)
     nodes = [tree, *(node for node in ast.walk(tree) if isinstance(node, scopes.SCOPES))]
     functions = [node for node in nodes if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)]
     # Which functions return only tuples is read first, from their returns' shapes alone, so a call of one
@@ -646,16 +652,20 @@ def _read(tree: ast.Module, tables: Mapping[int, Mapping[str, str]], calls: Call
     return reading, nodes
 
 
-def whole_functions(tree: ast.Module, tables: Mapping[int, Mapping[str, str]], calls: Calls) -> set[str]:
-    """The names of a file's module-level functions every return of which is whole (`_counted`), read
-    for a file that imports one; what they call through an import of their own is not followed."""
+def support_functions(tree: ast.Module, tables: Mapping[int, Mapping[str, str]], calls: Calls
+                      ) -> dict[str, set[str]]:
+    """The names of a file's module-level functions read for a file that imports one: "whole", those
+    every return of which is whole (`_counted`), and "erring", those that may return an error or a
+    difference's magnitude (`_erring`); what they call through an import of their own is not followed."""
     reading, _ = _read(tree, tables, calls, lambda called: False)
-    return {node.name for node in tree.body
-            if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef) and id(node) in reading.counting}
+    functions = [node for node in tree.body if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)]
+    return {"whole": {node.name for node in functions if id(node) in reading.counting},
+            "erring": {node.name for node in functions if id(node) in reading.erring}}
 
 
 def comparisons(tree: ast.Module, tables: Mapping[int, Mapping[str, str]], calls: Calls,
-                whole_import: Callable[[str], bool] = lambda called: False) -> Iterator[tuple[ast.AST, str]]:
+                whole_import: Callable[[str], bool] = lambda called: False,
+                erring_import: Callable[[str], bool] = lambda called: False) -> Iterator[tuple[ast.AST, str]]:
     """Each place a file compares floats within a tolerance, and what it is (its nodes' import tables
     `tables`, its calls' definitions `calls`, and whether a function it imports returns only whole
     numbers, `whole_import` of its dotted name): a tolerance API not told to
@@ -665,7 +675,7 @@ def comparisons(tree: ast.Module, tables: Mapping[int, Mapping[str, str]], calls
     of positions is written as a plain ordering (lo <= x <= hi, or x - y < w for a window). SLOP020
     reads conventional code: it does not prove what an obfuscated one computes (a shadowed built-in, a
     mutated alias), which review does."""
-    reading, nodes = _read(tree, tables, calls, whole_import)
+    reading, nodes = _read(tree, tables, calls, whole_import, erring_import)
     # A band is a test's claim: what an assertion holds, not a schedule's window in a test's helper.
     asserted = {id(part) for statement in ast.walk(tree) if isinstance(statement, ast.Assert)
                 for part in ast.walk(statement.test)}
