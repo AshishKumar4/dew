@@ -501,8 +501,8 @@ def test_the_plan_runs_as_one_wave_on_the_pool(ci, tmp_path, monkeypatch, capsys
     command = [sys.executable, str(ROOT / "tools/armada/ci.py"), "plan", "--timings=none.json"]
     planned = subprocess.run(command, cwd=tmp_path, check=True, capture_output=True, text=True)
     assert json.loads(planned.stdout)["include"] == ci.plan(300.0, {})
-    for node in records:
-        (tmp_path / node.split("::")[0]).unlink()
+    for name in {node.split("::")[0] for node in records}:
+        (tmp_path / name).unlink()
     # Files nothing has timed alone, exactly filling the pool: one wave at whatever target.
     assert len(ci.plan(ci.one_wave({}, 10), {})) == 10
 
