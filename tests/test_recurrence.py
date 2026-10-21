@@ -2,6 +2,7 @@
 hooks against its XLA form in float64, at every config of its launch, and the continuation contract a
 decode token keeps (an idle row untouched, a bf16 state rounded as it is held)."""
 
+import dataclasses
 import functools
 import itertools
 
@@ -60,6 +61,63 @@ def operands(hooks: recurrence.Hooks, seed: int = 0, state_dtype=jnp.float32) ->
     if hooks.output is not None:
         given |= {'z': normal(ROWS, VALUE_HEADS, VALUE_WIDTH), 'weight': normal(VALUE_WIDTH)}
     return recurrence.Step(**given)
+
+
+def orbit(given: recurrence.Step, seed: int) -> recurrence.Step:
+    """Permute every head's key and value dimensions alike, an exact symmetry of a decode token.
+
+    The state moves on both axes, the per-key decay with the keys, the output gate and norm weight
+    with the values, and the conv's channels with the projections they hold. Every arm runs on this
+    layout, so its outputs stay in it.
+    """
+    rng = np.random.default_rng(seed)
+    key_width, value_width = given.state.shape[-2:]
+    keys, values = rng.permutation(key_width), rng.permutation(value_width)
+    moved = {'state': given.state[..., keys, :][..., values]}
+    for name in ('query', 'key'):
+        if (array := getattr(given, name)) is not None:
+            moved[name] = array[..., keys]
+    for name in ('value', 'z', 'weight'):
+        if (array := getattr(given, name)) is not None:
+            moved[name] = array[..., values]
+    if given.log_decay is not None and given.log_decay.ndim == 3:
+        moved['log_decay'] = given.log_decay[..., keys]
+    if given.token is not None:
+        value_heads = given.state.shape[1]
+        key_heads = (given.token.shape[-1] - value_heads * value_width) // (2 * key_width)
+        key_channels = np.arange(key_heads * key_width).reshape(key_heads, key_width)[:, keys].ravel()
+        value_channels = np.arange(value_heads * value_width).reshape(value_heads, value_width)
+        channels = np.concatenate((key_channels, key_heads * key_width + key_channels,
+                                   2 * key_heads * key_width + value_channels[:, values].ravel()))
+        moved |= {'token': given.token[..., channels], 'held': given.held[..., channels],
+                  'taps': given.taps[channels]}
+    return dataclasses.replace(given, **moved)
+
+
+def draw(hooks: recurrence.Hooks, seed: int, state_dtype=jnp.float32) -> tuple[recurrence.Step]:
+    """Fresh operands and an independent exact orbit, deterministically keyed by the draw's seed."""
+    operand_seed, orbit_seed = (int(value) for value in np.random.SeedSequence(seed).generate_state(2))
+    return (orbit(operands(hooks, operand_seed, state_dtype), orbit_seed),)
+
+
+def one_tap_operands(dtype, seed: int) -> recurrence.Step:
+    """A one-tap token, preserving the two dtypes' consecutive draws at the original seed."""
+    channels = 2 * 16 + 16
+    rng = np.random.default_rng(seed)
+    operands = {}
+    for operand_dtype in (jnp.float32, jnp.bfloat16):
+        operands[operand_dtype] = recurrence.Step(
+            jnp.asarray(rng.standard_normal((ROWS, 1, 16, 16)) * 0.3, jnp.float32),
+            token=jnp.asarray(rng.standard_normal((ROWS, channels)), operand_dtype),
+            held=jnp.zeros((ROWS, 0, channels), operand_dtype),
+            taps=jnp.asarray(rng.standard_normal((channels, 1)), operand_dtype))
+    return operands[dtype]
+
+
+def one_tap_draw(dtype, seed: int) -> tuple[recurrence.Step]:
+    """A fresh one-tap token and an independent key/value orbit, deterministic for each seed."""
+    operand_seed, orbit_seed = (int(value) for value in np.random.SeedSequence(seed).generate_state(2))
+    return (orbit(one_tap_operands(dtype, operand_seed), orbit_seed),)
 
 
 @pytest.mark.parametrize('hooks', HOOKS, ids=str)
