@@ -23,7 +23,7 @@ observed. Run it with an interpreter that has torch and jax:
 
 `recording` records the advantage estimators over check 1's seeds instead
 (tools/recorded_references.py), each reference's float32 run's evidence from
-verl's float64 run, every float32 pin widened, with that run's sketch, each
+verl's float64 run, with that run's sketch, each
 seed's inputs drawn again by tests/test_rl_advantage.py (`advantage_inputs`):
 
   PYTHONPATH=src:tools python tools/parity_rl.py recording
@@ -195,34 +195,37 @@ def tunix_advantages(tunix, inputs: dict[str, np.ndarray], dtype) -> dict[str, n
     return {name: np.asarray(found[name]) for name in ESTIMATORS}
 
 
-def write_advantage_recording(verl, tunix, command: str, out: Path) -> None:
-    """recorded_advantage_<reference>.npz: each reference's estimators recorded over check 1's seeds
-    (`record_case`'s summary), its float32 run's evidence from verl's float64 run (every float32 pin
-    widened, tools/diffusers_wan_reference.py `float64`) and that run's sketch, the count planned on
-    Dew's own estimators."""
+def dew_estimators(inputs: dict) -> dict:
+    """Dew's estimators on a draw (`advantage_inputs`), by the recording's leaf names: the count the
+    recording plans on, and the test's arm and, in float64, its truth."""
     import jax
     import jax.numpy as jnp
-    import torch
-    from diffusers_wan_reference import float64
-    from fetched_fixtures import save
-    from recorded_references import provenance, record_case
 
     from dew.rl.advantage import gae, group_advantage, masked_mean, masked_whiten, rloo_advantage
 
-    def truth(inputs):
-        with float64():
-            return verl_advantages(verl, inputs, torch.float64)
+    mask = jnp.asarray(DRAWN_MASK, inputs["values"].dtype)
+    advantages, returns = gae(inputs["token_rewards"], inputs["values"], mask, gamma=GAMMA, lam=LAM)
+    return {"masked_mean_rows": masked_mean(inputs["values"], mask, axis=-1),
+            "masked_whiten": jax.vmap(lambda one: masked_whiten(one, mask))(inputs["whitened"]),
+            "group_advantage": group_advantage(inputs["rewards"], GROUP),
+            "group_advantage_unnormalised": group_advantage(inputs["rewards"], GROUP, normalise_by_std=False),
+            "rloo_advantage": rloo_advantage(inputs["rewards"], GROUP),
+            "gae_advantage": advantages, "gae_return": returns}
 
-    def proxy(inputs):
-        mask = jnp.asarray(DRAWN_MASK, inputs["values"].dtype)
-        advantages, returns = gae(inputs["token_rewards"], inputs["values"], mask, gamma=GAMMA, lam=LAM)
-        return {"masked_mean_rows": masked_mean(inputs["values"], mask, axis=-1),
-                "masked_whiten": jax.vmap(lambda one: masked_whiten(one, mask))(inputs["whitened"]),
-                "group_advantage": group_advantage(inputs["rewards"], GROUP),
-                "group_advantage_unnormalised": group_advantage(inputs["rewards"], GROUP,
-                                                                normalise_by_std=False),
-                "rloo_advantage": rloo_advantage(inputs["rewards"], GROUP),
-                "gae_advantage": advantages, "gae_return": returns}
+
+def write_advantage_recording(verl, tunix, command: str, out: Path) -> None:
+    """recorded_advantage_<reference>.npz: each reference's estimators recorded over check 1's seeds
+    (`record_case`'s summary), its float32 run's evidence from verl's float64 run, which keeps float64
+    through every estimator, and that run's sketch, the count planned on Dew's own estimators
+    (`dew_estimators`)."""
+    import jax
+    import jax.numpy as jnp
+    import torch
+    from fetched_fixtures import save
+    from recorded_references import provenance, record_case
+
+    def truth(inputs):
+        return verl_advantages(verl, inputs, torch.float64)
 
     def tunix_float32(inputs):
         # The recording runs where x64 is enabled, where a constant Tunix makes without a dtype (its
@@ -234,7 +237,8 @@ def write_advantage_recording(verl, tunix, command: str, out: Path) -> None:
                    "tunix": lambda inputs: (tunix_float32(inputs), truth(inputs))}
     for name, evaluate in evaluations.items():
         with jax.enable_x64(new_val=True):
-            recorded = record_case(name, advantage_inputs, evaluate, proxy, truth_proxy=proxy,
+            recorded = record_case(name, advantage_inputs, evaluate, dew_estimators,
+                                   truth_proxy=dew_estimators,
                                    store_inputs=False, summary=True)
         commit = {"verl": "896a9bb", "tunix": "b9f5e65"}[name]
         recorded[f"{name}.provenance"] = provenance(name, commit, "cpu", command, torch=torch.__version__,

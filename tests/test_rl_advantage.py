@@ -16,8 +16,8 @@ import numpy as np
 import pytest
 from reference_error import assert_as_exact, declared_seeds, indexed_recording, recording
 
-from dew.rl.advantage import gae, group_advantage, masked_mean, masked_whiten, rloo_advantage
-from tools.parity_rl import DRAWN_MASK, GAMMA, GROUP, LAM, advantage_inputs
+from dew.rl.advantage import gae, group_advantage, rloo_advantage
+from tools.parity_rl import advantage_inputs, dew_estimators
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "rl" / "advantage.npz"
 RECORDED = Path(__file__).resolve().parent / "fixtures" / "rl"
@@ -28,17 +28,8 @@ def reference():
     return dict(np.load(FIXTURE))
 
 
-@jax.jit
-def estimators(inputs):
-    """Every estimator Dew has on a recorded draw, by the recording's leaf names."""
-    mask = jnp.asarray(DRAWN_MASK, inputs["values"].dtype)
-    advantages, returns = gae(inputs["token_rewards"], inputs["values"], mask, gamma=GAMMA, lam=LAM)
-    return {"masked_mean_rows": masked_mean(inputs["values"], mask, axis=-1),
-            "masked_whiten": jax.vmap(lambda one: masked_whiten(one, mask))(inputs["whitened"]),
-            "group_advantage": group_advantage(inputs["rewards"], GROUP),
-            "group_advantage_unnormalised": group_advantage(inputs["rewards"], GROUP, normalise_by_std=False),
-            "rloo_advantage": rloo_advantage(inputs["rewards"], GROUP),
-            "gae_advantage": advantages, "gae_return": returns}
+estimators = jax.jit(dew_estimators)
+"""Every estimator Dew has on a recorded draw, by the recording's leaf names."""
 
 
 @pytest.mark.parametrize("source", ["verl", "tunix"])
@@ -58,12 +49,12 @@ def test_the_estimators_are_as_exact_as_the_references(source):
 def test_the_estimators_on_paper():
     """Arithmetic small enough to do on paper, exact in float32: a group's advantages centred and,
     unnormalised, its mean taken off; the leave-one-out baseline; and returns discounted by halves."""
-    hand = group_advantage(jnp.array([2.0, -1.0, 0.25, 1.0]), 4, normalise_by_std=False)
+    hand = group_advantage(jnp.array([2.0, -1.0, 0.25, 1.0], jnp.float32), 4, normalise_by_std=False)
     np.testing.assert_array_equal(hand, [1.4375, -1.5625, -0.3125, 0.4375])
-    hand = rloo_advantage(jnp.array([1.0, 0.0, 0.0, 0.0]), 4)
+    hand = rloo_advantage(jnp.array([1.0, 0.0, 0.0, 0.0], jnp.float32), 4)
     np.testing.assert_array_equal(hand, [1.0, -np.float32(1 / 3), -np.float32(1 / 3), -np.float32(1 / 3)])
-    _, hand_returns = gae(jnp.array([[0.0, 0.0, 1.0]]), jnp.array([[1.0, 2.0, 3.0]]),
-                          jnp.ones((1, 3)), gamma=0.5, lam=0.5)
+    rewards, values = jnp.array([[0.0, 0.0, 1.0]], jnp.float32), jnp.array([[1.0, 2.0, 3.0]], jnp.float32)
+    _, hand_returns = gae(rewards, values, jnp.ones((1, 3), jnp.float32), gamma=0.5, lam=0.5)
     np.testing.assert_array_equal(hand_returns[0], [0.75, 1.0, 1.0])
 
 
