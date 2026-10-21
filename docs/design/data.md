@@ -66,7 +66,7 @@ flowchart TD
   D -- "it makes several" --> FLM["flat_map"]
 ```
 
-Library stages are values of these shapes. `images.Resize(256)` is a `RecordFn`, `images.Flip(p=0.5)` a `RandomFn`, `images.MinSide(256)` a `Predicate`, `images.fetch()` a `TryFn`. Each is a small frozen value with `__call__`: picklable for worker processes, printable in `show()`, and identified for caching by its configuration and the versions it depends on. Your own function works the same way. A `map` stage that returns `Rejected` raises, naming the stage. Every library step passes through the fields it does not read (`text.tokenize` included); `pack` keeps only the fields it packs, as its `fields=` says. A step reads its field by the record's convention (`jpg`/`png`/`image`, `txt`/`text`/`caption`, `url`, `mp4`) and names it where the convention does not fit: `images.DecodeImage(field="jpg", to="image")`, `images.Resize(field=)`, `images.Processor(field=, to=)`, `images.fetch(url=, to=)`. `text.Normalized(form=, field=)` puts text in one Unicode normal form before it tokenizes. Errors that name the failing stage, field and fix are not built yet for every step.
+Library stages are values of these shapes. `images.Resize(256)` is a `RecordFn` (and `images.Fit(256)`, which fits an image whole into its square on white, as a web image is shown), `images.Flip(p=0.5)` a `RandomFn`, `images.MinSide(256)` a `Predicate`, `images.fetch()` a `TryFn`. Each is a small frozen value with `__call__`: picklable for worker processes, printable in `show()`, and identified for caching by its configuration and the versions it depends on. Your own function works the same way. A `map` stage that returns `Rejected` raises, naming the stage. Every library step passes through the fields it does not read (`text.tokenize` included); `pack` keeps only the fields it packs, as its `fields=` says. A step reads its field by the record's convention (`jpg`/`png`/`image`, `txt`/`text`/`caption`, `url`, `mp4`) and names it where the convention does not fit: `images.DecodeImage(field="jpg", to="image")`, `images.Resize(field=)`, `images.Processor(field=, to=)`, `images.fetch(url=, to=)`. `text.Normalized(form=, field=)` puts text in one Unicode normal form before it tokenizes. Errors that name the failing stage, field and fix are not built yet for every step.
 
 ## 2. Sources
 
@@ -261,7 +261,7 @@ web = Files("s3://tokens/v3/web/")                 # training reads it back
 clips = (Files("gs://av/catalog.parquet")
            .filter_map(video.fetch())
            .random_filter_map(video.PickClip(seconds=2.0))  # writes one start/stop descriptor
-           .filter_map(video.DecodeVideo(frames=32, fps=16, size=256))            # reads the descriptor
+           .filter_map(video.DecodeVideo(frames=32, fps=16, size=256, min_size=128))  # reads the descriptor; drops clips under 128 px
            .filter_map(audio.DecodeAudio(sample_rate=16_000, missing="silence")))  # reads the same descriptor
 ```
 
