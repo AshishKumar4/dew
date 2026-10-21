@@ -115,11 +115,11 @@ else:
     raise AssertionError("a training context exceeded its memory allowance")
 from dew import Trainer
 from dew.config import OptimConfig
-from dew.data import load
+from dew.data import Hub, presets
 from dew.nn.backbones import CausalTransformer
 from dew.objectives.lm import LMObjective
 # The lm cell's corpus, which the preparation compiled (prepare-cells.py), read with the Hub offline.
-data = load("hf/winglian/tiny-shakespeare", batch=64, tokenizer="byte", seq_len=64)
+data = Hub("winglian/tiny-shakespeare").pipe(presets.lm, "byte", seq_len=64, batch=64)
 model = CausalTransformer(vocab_size=256, emb_features=32, num_layers=1, num_heads=2,
                           mlp_features=64, max_seq_len=128)
 state = Trainer(LMObjective(model, seq_len=64), OptimConfig(learning_rate=1e-3), key=0).fit(data, steps=1000)

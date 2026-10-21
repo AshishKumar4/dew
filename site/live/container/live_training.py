@@ -2,10 +2,10 @@
 
 A training context runs Dew itself, not the stand-ins of model_client.
 `install` has IPython run each cell with its calls that name a batch, steps
-or log_every, or unpack keywords, passed through `capped`: a Dew `load` or
-`loader` (a dataset's or a recipe's, whose `load` reads its batch through
-`dew.config.data.loader`) reads batches of at most BATCH, and a Dew `fit` runs
-at most STEPS steps, logging at least four times. Each cap prints what it
+or log_every, or unpack keywords, passed through `capped`: a preset of
+`dew.data.presets`, called or given to a dataset's `pipe`, makes batches of at
+most BATCH, and a Dew `fit` runs at most STEPS steps, logging at least four
+times. Each cap prints what it
 changed before the run's own output, so the cell's first lines say how this
 run differs from the code on the page.
 """
@@ -43,12 +43,14 @@ def fitted(steps, log_every):
 
 
 def capped(call, /, *args, **options):
-    """`call(*args, **options)`, its keywords capped where `call` is Dew's: a `load` or `loader`'s batch
-    (`batch`), a `fit`'s steps and log_every, the latter its own default where the cell names none
-    (`fitted`). Whatever name the cell calls it by, and however it passes the keywords."""
-    if (getattr(call, "__module__", None) or "").split(".")[0] == "dew":
+    """`call(*args, **options)`, its keywords capped where `call` is Dew's: a preset's batch (`batch`),
+    called or through a dataset's `pipe`, a `fit`'s steps and log_every, the latter its own default where
+    the cell names none (`fitted`). Whatever name the cell calls it by, and however it passes the
+    keywords."""
+    module = getattr(call, "__module__", None) or ""
+    if module.split(".")[0] == "dew":
         name = getattr(call, "__name__", "")
-        if name in ("load", "loader") and "batch" in options:
+        if (module == "dew.data.presets" or name == "pipe") and "batch" in options:
             options["batch"] = batch(options["batch"])
         elif name == "fit" and "steps" in options:
             default = inspect.signature(call).parameters["log_every"].default
