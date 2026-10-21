@@ -230,6 +230,26 @@ def _conversation_windows(rendered: Dataset, pack: Pack, *,
     return (rendered.filter_map(fitted) if long == "drop" else rendered.map(fitted))._then(pack)
 
 
+def prompts(dataset: Dataset, tokenizer: str | PreTrainedTokenizerBase, *, max_prompt_len: int, batch: int,
+            pad_id: int = 0, long: Literal["drop", "truncate"] = "truncate", thinking: bool | None = None,
+            reward_bytes: int | None = None, records: int | None = None,
+            host: tuple[HostStep, ...] = ()) -> Pipeline:
+    """Prompt rows (verl's columns: "prompt", "data_source", "ground_truth", ...) rendered to
+    `max_prompt_len` left-padded ids, keeping a longer prompt's tail, or dropping it (`long="drop"`),
+    with their reward columns padded to `reward_bytes`, in batches of `batch` (`records` and `host`
+    as `images` takes them). Without `reward_bytes`, a memory read measures it over each store, the
+    widest reward string it holds, so every row fits whole; another read needs it given, or stated
+    by the store's metadata."""
+    from dew.data.prompts import RewardWidth
+    from dew.data.steps.chat import ConfigurePrompt
+    from dew.data.text import tokenizer_name
+
+    configure = ConfigurePrompt(tokenizer_name(tokenizer), max_prompt_len, pad_id, long, thinking)
+    rendered = (dataset.filter_map(configure({"reward_bytes": reward_bytes})) if reward_bytes is not None
+                else dataset.map(Configured(configure, needs=("reward_bytes",), measures=RewardWidth())))
+    return _finished(rendered, batch=batch, records=records, host=host)
+
+
 def preferences(dataset: Dataset, *, seq_len: int, batch: int, pad_id: int = 0, records: int | None = None,
                 host: tuple[HostStep, ...] = ()) -> Pipeline:
     """Preference pairs of token ids, chosen and rejected, each laid out in `seq_len` tokens with

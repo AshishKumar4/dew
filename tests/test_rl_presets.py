@@ -1,4 +1,4 @@
-"""The preference, chat-canvas and clip presets prepare what their recipes do, from their settings."""
+"""The prompt, preference, chat-canvas and clip presets prepare what their recipes do, from their settings."""
 
 import dataclasses
 from pathlib import Path
@@ -7,9 +7,10 @@ import numpy as np
 import pytest
 from test_text_presets import same_batches
 
-from dew.config.data import ChatCanvasData, PreferenceData, VideoData, loader
+from dew.config.data import ChatCanvasData, PreferenceData, PromptData, VideoData, loader
 from dew.data import Loading, Memory, presets
 from dew.data.compile import compile
+from dew.data.dataset import DataPartition
 
 CHAT = Path(__file__).resolve().parent / "fixtures" / "tokenizers" / "tiny-chat"
 LOADING = Loading(workers=0, threads=1, read_buffer=2)
@@ -114,3 +115,77 @@ def test_clips_fill_or_drop_media_without_sound_and_drop_or_stop_on_media_too_sh
     assert valid == ([True, False] if missing == "silence" else [True])
     with pytest.raises(ValueError):
         list(media.pipe(presets.clips, 4 / FPS, frames=4, fps=FPS, size=16, batch=1, rejects=False))
+
+
+def _prompts(count: int, start: int = 0, *, widest_first: bool = False) -> Memory:
+    """Prompt rows whose ground truth grows with their index, so the widest is the last, or
+    shrinks with it."""
+    sizes = [1 + index for index in range(start, start + count)]
+    return Memory([{"prompt": "hi " * (1 + index % 3), "ground_truth": "x" * size, "data_source": "rule"}
+                   for index, size in enumerate(sizes[::-1] if widest_first else sizes)])
+
+
+def _widths(loaded, count: int) -> set[int]:
+    """The widths the reward columns of `count` training batches are padded to."""
+    from dew.data.prompts import TRUTH_KEY
+
+    reader = loaded.train(DataPartition())
+    try:
+        return {np.asarray(next(reader)[TRUTH_KEY]).shape[-1] for _ in range(count)}
+    finally:
+        reader.close()
+
+
+def test_the_prompts_preset_prepares_what_the_prompt_recipe_does_measuring_its_reward_width():
+    """Prompt rows rendered to eight left-padded ids, long ones dropped, their reward columns as wide
+    as the widest the store holds, measured as a memory read reads it: the batches the recipe makes,
+    and those of the width given outright."""
+    rows = _prompts(12)
+    recipe = PromptData(rows, "byte", max_prompt_len=8, long="drop")
+    expected = loader(recipe, batch=2, read="memory", loading=LOADING)
+    measured = rows.shuffle(0).repeat().pipe(presets.prompts, "byte", max_prompt_len=8, batch=2, long="drop")
+    built = compile(measured, read="memory", loading=LOADING)
+    same_batches(expected, built, 3)
+    assert _widths(built, 3) == {12}
+    given = rows.shuffle(0).repeat().pipe(presets.prompts, "byte", max_prompt_len=8, batch=2, long="drop",
+                                          reward_bytes=12)
+    same_batches(built, compile(given, read="memory", loading=LOADING), 3)
+
+
+def test_a_measured_reward_width_is_the_whole_stores_in_both_parts_of_a_holdout():
+    """A store held out in part, its widest row among the held: the training part and the held part
+    bind the width of the widest row of the whole store, so both pad their reward columns alike."""
+    from dew.config.data import HoldOut
+
+    recipe = PromptData(_prompts(12, widest_first=True), "byte", max_prompt_len=16,
+                        validation=HoldOut(records=3))
+    loaded = loader(recipe, batch=1, read="memory", loading=LOADING)
+    assert _widths(loaded, 4) == {12}
+    held = loaded.val(DataPartition())
+    try:
+        from dew.data.prompts import TRUTH_KEY
+
+        assert {np.asarray(batch[TRUTH_KEY]).shape[-1] for batch in held} == {12}
+    finally:
+        held.close()
+
+
+def test_a_mixtures_prompt_step_binds_the_widest_of_its_stores():
+    """The prompts preset over a mixture of two stores, one with wider reward strings: the step the
+    mixture runs binds the wider store's width, so every row of either fits."""
+    from dew.data import mix
+
+    narrow, wide = _prompts(4), _prompts(4, start=20)
+    chain = mix([narrow.repeat(), wide.repeat()]).pipe(presets.prompts, "byte", max_prompt_len=16, batch=2)
+    assert _widths(compile(chain, read="memory", loading=LOADING), 4) == {24}
+
+
+def test_a_prompt_width_neither_given_nor_stated_is_refused_where_the_read_cannot_measure_it():
+    """An indexed read holds no store's records to measure: the preset is refused until the width
+    is given, and reads with it."""
+    rows = _prompts(4)
+    with pytest.raises(ValueError):
+        compile(rows.repeat().pipe(presets.prompts, "byte", max_prompt_len=16, batch=2), read="indexed",
+                loading=LOADING)
+    given = rows.repeat().pipe(presets.prompts, "byte", max_prompt_len=16, batch=2, reward_bytes=4)
+    assert _widths(compile(given, read="indexed", loading=LOADING), 2) == {4}
