@@ -7,8 +7,8 @@
   (at least `FUNCTION_NODES` syntax nodes), fail. So do six consecutive statements of two statement lists in
   different files, equal the same way (at least `WINDOW_NODES` nodes), each copy named once. Imports, stubs
   (a protocol's members), a class's annotated fields and a run of calls to one function (a parser's
-  arguments, a registry's entries, a config's fields read one by one) are declarations: no window, and in
-  a function one statement, as the data they declare is not logic.
+  arguments, a registry's entries, a config's fields read one by one) are declarations: the first three
+  are not read, and a run is read as one statement, as the data they declare is not logic.
 
     python tools/duplicates.py [--base=REF] PATH...
 
@@ -104,7 +104,7 @@ def tokens(node: ast.AST, out: list[str]) -> int:
             continue
         out.append(field)
         if field in BODIES and isinstance(value, list):
-            value = stripped(node, field, value)
+            value = logic(stripped(node, field, value))
         if isinstance(node, ast.Constant) and field == "value":
             out.append(repr(value) if value is None or value is Ellipsis or isinstance(value, bool)
                        else type(value).__name__)
@@ -144,16 +144,10 @@ def callee(statement: ast.stmt) -> str | None:
     return None
 
 
-def declarative(window: Sequence[ast.stmt]) -> bool:
-    """A run of calls to one function (a parser's arguments, a registry's entries, a config's fields read
-    one by one): data, not logic."""
-    called = {callee(statement) for statement in window}
-    return len(called) == 1 and None not in called
-
-
 def logic(body: list[ast.stmt]) -> list[ast.stmt]:
-    """`body` with each run of calls to one function kept as its first: what the run declares is data, so
-    two functions that differ only in it are not one logic."""
+    """`body` with each run of calls to one function (a parser's arguments, a registry's entries, a
+    config's fields read one by one) kept as its first: what the run declares is data, so code that differs
+    only in it is one logic, and a run is one statement."""
     return [statement for index, statement in enumerate(body)
             if index == 0 or callee(statement) is None or callee(statement) != callee(body[index - 1])]
 
@@ -175,17 +169,16 @@ def units(file: str, tree: ast.Module) -> Iterator[tuple[str, str, Place, int]]:
             statements = getattr(node, field, None)
             if not (isinstance(statements, list) and statements and isinstance(statements[0], ast.stmt)):
                 continue
-            body = stripped(node, field, statements)
+            body = logic(stripped(node, field, statements))
             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and field == "body" and body:
-                kept = logic(body)
-                nodes = sum(shape(statement)[1] for statement in kept)
+                nodes = sum(shape(statement)[1] for statement in body)
                 if nodes >= FUNCTION_NODES:
                     place = Place(file, owner, node.lineno)
-                    yield "function", digest([shape(s)[0] for s in kept]), place, nodes
+                    yield "function", digest([shape(s)[0] for s in body]), place, nodes
             for start in range(len(body) - WINDOW + 1):
                 window = body[start:start + WINDOW]
                 nodes = sum(shape(statement)[1] for statement in window)
-                if nodes >= WINDOW_NODES and not declarative(window):
+                if nodes >= WINDOW_NODES:
                     yield ("statements", digest([shape(s)[0] for s in window]),
                            Place(file, owner, window[0].lineno), nodes)
         for handler in getattr(node, "handlers", None) or ():
