@@ -285,6 +285,10 @@ class Hub(Dataset):
     def manifest(self) -> ShardManifest:
         return self.files.manifest()
 
+    def stated(self) -> Mapping[str, object]:
+        """Its builder's info, which its metadata is, no row read."""
+        return self.metadata()
+
     def metadata(self) -> Mapping[str, object]:
         splits = self.builder.info.splits
         rows = (

@@ -16,7 +16,7 @@ import tyro
 
 from dew.data.dataset import Batch, Records
 from dew.data.pipeline import Dataset, Mixture, Phases, Pipeline, Stage
-from dew.data.sources.base import Read, Shard, ShardManifest, Source, _consumed, _uncounted
+from dew.data.sources.base import Read, Shard, ShardManifest, Source, _consumed, _uncounted, stated
 from dew.data.sources.codec import content_fingerprint
 from dew.records import integer
 
@@ -76,6 +76,9 @@ class _SliceRecords:
 
     def metadata(self) -> Mapping[str, object]:
         return {**_uncounted(self.source.metadata()), **({"held_out": self.start} if self.start else {})}
+
+    def stated(self) -> Mapping[str, object]:
+        return _uncounted(stated(self.source))
 
     def lengths(self) -> np.ndarray | None:
         lengths = self.source.lengths()
@@ -162,6 +165,9 @@ class _HashSource:
 
     def metadata(self) -> Mapping[str, object]:
         return _uncounted(self.source.metadata())
+
+    def stated(self) -> Mapping[str, object]:
+        return _uncounted(stated(self.source))
 
     def lengths(self) -> np.ndarray | None:
         return None
@@ -332,6 +338,9 @@ class _RandomSource:
 
     def metadata(self) -> Mapping[str, object]:
         return _uncounted(self.source.metadata())
+
+    def stated(self) -> Mapping[str, object]:
+        return _uncounted(stated(self.source))
 
     def lengths(self) -> np.ndarray | None:
         lengths = self.source.lengths()

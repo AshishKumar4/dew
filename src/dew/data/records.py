@@ -1,10 +1,14 @@
 """A chain's record, version 1: what a run's record holds for its data, from which the same chain is
-built again (`encode`, `decode`). A store and each stage are class records, `{"class": <import
-path>, "fields": {...}}`, written and read by the registry against the class's own constructor; a
-mixture is its corpora's records with their weights, phases theirs with the steps they end at.
+built again (`encode`, `decode`). A store, each stage and the loading are written and read by the
+registry's one typed walk (`dew.registry.to_record`, `from_record`) against what the chain declares
+them as: a store, a stage, a Loading. So a record builds only those, of Dew's classes or a trusted
+package's (`trust=`), and nothing else it names runs first. A call of `pipe` is written as the call,
+`{"pipe": <import path>, "settings": {...}}`, its arguments bound to the function's parameters and
+walked against their annotations alike; a mixture is its corpora's records with their weights and
+token count, phases theirs with the steps they end at.
 
-A chain no record carries whole is `Unrecorded`, with the reason: a step that is a lambda or a bound
-method, a store whose records are arrays, any value that would come back as something else."""
+A chain no record carries whole is `Unrecorded`, with the reason: a step that is a lambda, a store
+whose records are arrays, any value that would come back as something else."""
 
 from __future__ import annotations
 
@@ -13,24 +17,38 @@ import inspect
 import json
 import logging
 import types
-from collections.abc import Callable, Mapping
+import typing
+from collections.abc import Callable, Mapping, Sequence
 from enum import Enum
-from typing import TYPE_CHECKING, TypeGuard
+from typing import Literal, TypeGuard, Union
 
 import numpy as np
 
-from dew.data.pipeline import Mixture, Phases, Piped, Pipeline, Stage
+from dew.data.dataset import Batch, Loading
+from dew.data.pipeline import Dataset, Mixture, Phases, Piped, Pipeline, Stage
 from dew.data.sources.base import READS, Read, Source
 from dew.records import JSON, integer, json_value, numbers, record
-from dew.registry import Configured, argument_records, import_path, imported, read_arguments
-
-if TYPE_CHECKING:
-    from dew.data.dataset import Batch, Loading
-    from dew.data.pipeline import Dataset
+from dew.registry import (
+    Annotation,
+    Configured,
+    argument_records,
+    declared_type,
+    from_record,
+    import_path,
+    import_trusted,
+    imported,
+    parameter_type,
+    read_arguments,
+    to_record,
+)
 
 VERSION = 1
 
 _log = logging.getLogger(__name__)
+
+# What making a call of `pipe` again can raise, the function being the caller's: a call that raises
+# one is written as the stages it made instead (`_invocation`).
+_REPLAY_ERRORS = (TypeError, ValueError, LookupError, OSError, ImportError)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -45,28 +63,38 @@ class _Unrecordable(ValueError):
     """Raised inside `encode` where a value can't be recorded, with the reason `Unrecorded` keeps."""
 
 
-def encode(dataset: Dataset) -> dict[str, JSON] | Unrecorded:
+def encode(dataset: Dataset, *, trust: Sequence[str] = ()) -> dict[str, JSON] | Unrecorded:
     """The record of `dataset`'s chain, from which `decode` builds the same chain, or `Unrecorded`
-    where a part of it can't be recorded and read back as it is."""
+    where a part of it can't be recorded and read back as it is. Each part is read back as it is
+    written, through JSON, and compared; each call of `pipe` is made again from its recorded
+    arguments, so a preset that reads files reads them again here. A class of a package outside Dew
+    is read back only where `trust` names the package, as a run's record trusts it."""
+    import_trusted(None, trust)
     try:
         return {"version": VERSION, **_chain(dataset._chain())}
     except _Unrecordable as unrecordable:
         return Unrecorded(str(unrecordable))
 
 
-def decode(written: Mapping[str, object]) -> Pipeline:
-    """The chain `encode` recorded."""
+def decode(written: Mapping[str, object], *, trust: Sequence[str] = ()) -> Pipeline:
+    """The chain `encode` recorded, building the classes of a package outside Dew only where
+    `trust` names it."""
     version = written.get("version")
     if version != VERSION:
         raise ValueError(f"a chain's record of version {version!r}; this Dew reads version {VERSION}")
+    import_trusted(json_value(dict(written), "chain"), trust)
     return _read_chain(written)
 
 
 def override(written: Mapping[str, object], path: str, value: JSON) -> dict[str, JSON]:
-    """`written` with one setting of one call of `pipe` in it set to `value`, parsed JSON: `path` is
-    "<preset>.<setting>", the preset by its name where the chain calls it once, or by its stage's
-    place among the chain's stages ("2.seq_len"), its store's call as "source". Reading the record
-    back makes the call again with the setting, so the stages it makes follow it."""
+    """`written` with one setting of one call of `pipe` set to `value`, parsed JSON and read against
+    the setting's annotation. `path` is "<preset>.<setting>", the preset by its name where the
+    chain's own stages call it once, by its entry's place among the record's stages ("2.seq_len"),
+    or "source" for the call that made its store. A call inside a mix or phases is not addressed
+    here. Reading the record back makes the call again, so the stages it makes follow it."""
+    version = written.get("version")
+    if version != VERSION:
+        raise ValueError(f"a chain's record of version {version!r}; this Dew overrides version {VERSION}")
     target, _, setting = path.rpartition(".")
     if not target or not setting:
         raise ValueError(f"an override names a call and its setting, `<preset>.<setting>`, not {path!r}")
@@ -77,21 +105,28 @@ def override(written: Mapping[str, object], path: str, value: JSON) -> dict[str,
              if isinstance(stage, Mapping) and "pipe" in stage]
     if "pipe" in source:
         calls.append(("source", source))
-    named = [call for label, call in calls if target in (label, str(call["pipe"]).rpartition(".")[2],
-                                                          str(call["pipe"]).rpartition(":")[2])]
+    named = [call for label, call in calls if target in (label, str(call["pipe"]).rpartition(":")[2])]
     if len(named) != 1:
-        found = sorted(str(call["pipe"]) for _, call in calls)
+        found = [f"{str(call['pipe']).rpartition(':')[2]}@{label}" for label, call in calls]
         raise ValueError(f"an override names {target!r}, which names {len(named)} of the chain's calls "
-                         f"{found}")
+                         f"{found}; name one by its place, `<index>.{setting}`")
     (call,) = named
-    function = imported(str(call["pipe"]))
+    function = _function(call["pipe"])
     parameters = inspect.signature(function).parameters
+    reads = next(iter(parameters))
+    if setting == reads:
+        raise ValueError(f"{call['pipe']}'s {reads} is the dataset it reads, which no override sets")
     if setting not in parameters and not any(parameter.kind is inspect.Parameter.VAR_KEYWORD
                                              for parameter in parameters.values()):
-        raise ValueError(f"{call['pipe']} takes no setting {setting!r}; it takes {sorted(parameters)[1:]}")
-    settings = dict(record(call.get("settings", {}), "settings"))
-    settings[setting] = _value(value, setting)
-    updated = {**call, "settings": settings}
+        raise ValueError(f"{call['pipe']} takes no setting {setting!r}; it takes "
+                         f"{[name for name in parameters if name != reads]}")
+    # The typed walk reads a record or a list against the setting's annotation, refusing one it
+    # doesn't build; a scalar it passes as it is, which `_fits` checks.
+    read_arguments(function, {setting: value})
+    annotation = parameter_type(function, setting) if setting in parameters else None
+    if not _fits(value, annotation):
+        raise ValueError(f"{call['pipe']}'s {setting} is {annotation}, not {value!r}")
+    updated = {**call, "settings": {**record(call.get("settings", {}), "settings"), setting: value}}
     overridden = ({**changed, "source": updated} if call is source
                   else {**changed, "stages": [updated if stage is call else stage for stage in stages]})
     written_back = json_value(overridden, "chain")
@@ -100,32 +135,54 @@ def override(written: Mapping[str, object], path: str, value: JSON) -> dict[str,
     return written_back
 
 
+def _fits(value: JSON, annotation: Annotation) -> bool:
+    """Whether a setting a record holds, JSON, is of the type its annotation declares, as far as a
+    scalar shows it; a record or a list the typed walk read is its type already. This is the
+    boundary where a record's JSON meets a function's parameters, so it asks each value its type."""
+    if annotation is None or isinstance(value, (dict, list)):
+        return True
+    if isinstance(annotation, typing.TypeAliasType):
+        return _fits(value, annotation.__value__)
+    origin = typing.get_origin(annotation)
+    if origin in (Union, types.UnionType):
+        return any(_fits(value, member) for member in typing.get_args(annotation))
+    if origin is Literal:
+        return value in typing.get_args(annotation)
+    if annotation is type(None):
+        return value is None
+    if annotation is float:
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if annotation is int:
+        return isinstance(value, int) and not isinstance(value, bool)
+    if annotation in (str, bool):
+        return isinstance(value, annotation)
+    # A class or a protocol it declares is a record, which the typed walk read already.
+    return value is not None
+
+
 def _chain(pipeline: Pipeline) -> dict[str, JSON]:
     """`pipeline`'s record: each call of `pipe` that made its stages (`Piped`) written as the call
-    where reading it back makes the same stages, the outermost first, and every other stage as
-    itself."""
-    from dew.data.dataset import Loading
-
+    where making it again from its recorded arguments makes the same stages, the outermost of
+    calls over the same stages first, and every other stage as itself."""
     loading = pipeline._loading
     source, index = _source(pipeline.source), 0
-    made = sorted(((entry, entry.input) for entry in pipeline.piped if entry.input is not None),
-                  key=lambda pair: -pair[0].end)
-    for entry, input in made:
-        invocation = _invocation(entry, input, pipeline)
-        if invocation is not None:
-            source, index = {**invocation, "input": _chain(input)}, entry.end
-            break
+    # `pipe` keeps the calls it made inside a call before the call itself: the later, the outer.
+    ranked = sorted(enumerate(pipeline.piped), key=lambda pair: (-pair[1].end, -pair[0]))
+    for _, entry in ranked:
+        if entry.input is not None:
+            invocation = _invocation(entry, entry.input, pipeline)
+            if invocation is not None:
+                source, index = {**invocation, "input": _chain(entry.input)}, entry.end
+                break
     stages: list[JSON] = []
     while index < len(pipeline.stages):
-        calls = sorted((entry for entry in pipeline.piped
-                        if entry.input is None and entry.start == index and entry.end > index),
-                       key=lambda e: -e.end)
+        calls = [entry for _, entry in ranked
+                 if entry.input is None and entry.start == index and entry.end > index]
         prefix = Pipeline(pipeline.source, pipeline.stages[:index])
         chosen = next(((entry, invocation) for entry in calls
                        if (invocation := _invocation(entry, prefix, pipeline)) is not None), None)
         if chosen is None:
-            stage = pipeline.stages[index]
-            stages.append(_class_record(stage, type(stage), f"stage {index}"))
+            stages.append(_typed(pipeline.stages[index], Stage, f"stage {index}"))
             index += 1
         else:
             stages.append(chosen[1])
@@ -134,108 +191,81 @@ def _chain(pipeline: Pipeline) -> dict[str, JSON]:
         "source": source,
         "name": pipeline.name,
         "read": pipeline.mode,
-        "loading": None if loading is None else _class_record(loading, Loading, "loading"),
+        "loading": None if loading is None else _typed(loading, Loading, "loading"),
         "stages": stages,
     }
 
 
 def _invocation(entry: Piped, input: Pipeline, pipeline: Pipeline) -> dict[str, JSON] | None:
-    """`entry`'s call as a record, None where it can't stand for what it made: its function no
-    record names, an argument no record carries, or a call that, made again from what it read,
-    makes other stages or another store (a mutable argument changed since)."""
-    try:
-        path = import_path(entry.function)
-        args = [_value(argument, f"argument {index}") for index, argument in enumerate(entry.args)]
-        settings = {name: _value(setting, name) for name, setting in entry.settings}
-        made = entry.function(input, *(_read_value(arg) for arg in args),
-                              **{name: _read_value(setting) for name, setting in settings.items()})
-        same = isinstance(made, Pipeline) and _makes(entry, made, pipeline)
-    except (TypeError, ValueError) as refused:
-        # `_Unrecordable` among them: the call is written as the stages it made instead.
-        _log.info("the call of %s is recorded as the stages it made: %s", entry.function, refused)
+    """`entry`'s call as a record, None where it can't stand for what it made: a function no import
+    path names as it is (a bound method, a callable object, a closure), arguments the registry
+    can't write and read back against the function's parameters, or a call that, made again from
+    those arguments, makes other stages or another store (an argument changed since)."""
+    function = entry.function
+    if not isinstance(function, types.FunctionType):
         return None
-    return {"pipe": path, "args": args, "settings": settings} if same else None
+    try:
+        path = import_path(function)
+        if imported(path) is not function:
+            return None
+        signature = inspect.signature(function)
+        bound = signature.bind(input, *entry.args, **dict(entry.settings))
+        reads = next(iter(signature.parameters))
+        arguments: dict[str, Configured] = {}
+        for name, argument in bound.arguments.items():
+            kind = signature.parameters[name].kind
+            if kind is inspect.Parameter.VAR_POSITIONAL:
+                return None
+            if kind is inspect.Parameter.VAR_KEYWORD:
+                arguments.update(argument)
+            elif name != reads:
+                arguments[name] = argument
+        settings = argument_records(function, arguments)
+        again = read_arguments(function, json.loads(json.dumps(settings)))
+        made = function(input, **again)
+        same = isinstance(made, Pipeline) and _makes(entry, made, pipeline)
+    except _REPLAY_ERRORS as refused:
+        _log.info("the call of %s is recorded as the stages it made: %s", function.__qualname__, refused)
+        return None
+    return {"pipe": path, "settings": settings} if same else None
 
 
 def _makes(entry: Piped, made: Pipeline, pipeline: Pipeline) -> bool:
     """Whether `made`, `entry`'s call made again, is what it made in `pipeline`: the same stages from
-    the same store, or, where it made another store, a store reading the same records."""
+    the same store, or, where it made another store, an equal store that reads the same records."""
     if entry.input is None:
         return (made.source is pipeline.source and len(made.stages) == entry.end
                 and _same(made.stages[entry.start:], pipeline.stages[entry.start:entry.end], "call") is None)
     again, had = made.source, pipeline.source
-    if isinstance(again, Source) and isinstance(had, Source):
+    same_store = _same(again, had, "call", sequences=True) is None
+    if same_store and isinstance(again, Source) and isinstance(had, Source):
         same_store = json_value(again.fingerprint(), "store") == json_value(had.fingerprint(), "store")
-    else:
-        same_store = _same(again, had, "call", sequences=True) is None
     return (same_store and len(made.stages) == entry.end
             and _same(made.stages, pipeline.stages[:entry.end], "call") is None)
 
 
-def _value(value: object, where: str) -> JSON:
-    """A call's argument as JSON that says what it is: a scalar or a list as it is, a tuple, a
-    mapping, a dataclass (a class record) or a module-level function by name."""
-    if value is None or isinstance(value, (bool, int, float, str)):
-        return value
-    if isinstance(value, list):
-        return [_value(entry, where) for entry in value]
-    if isinstance(value, tuple):
-        return {"tuple": [_value(entry, where) for entry in value]}
-    if isinstance(value, Mapping) and all(isinstance(key, str) for key in value):
-        return {"mapping": {str(key): _value(entry, where) for key, entry in value.items()}}
-    if dataclasses.is_dataclass(value) and not isinstance(value, type):
-        return _class_record(value, type(value), where)
-    if isinstance(value, types.FunctionType):
-        return _function(value, where)
-    raise _Unrecordable(f"{where} is a {type(value).__name__}, which no record carries")
-
-
-def _read_value(written: object) -> Configured:
-    """A call's argument from what `_value` wrote."""
-    if written is None or isinstance(written, (bool, int, float, str)):
-        return written
-    if isinstance(written, list):
-        return [_read_value(entry) for entry in written]
-    if not isinstance(written, Mapping):
-        raise ValueError(f"a call's argument is written as a {type(written).__name__}, which no record "
-                         "writes")
-    if "tuple" in written:
-        return tuple(_read_value(entry) for entry in _entries(written["tuple"], "tuple"))
-    if "mapping" in written:
-        return {key: _read_value(entry) for key, entry in record(written["mapping"], "mapping").items()}
-    if "function" in written:
-        function = imported(str(written["function"]))
-        if not isinstance(function, types.FunctionType):
-            raise ValueError(f"{written['function']} names no function")
-        return function
-    return _read_class(record(written, "argument"))
-
-
 def _source(source: Source | Mixture | Phases) -> dict[str, JSON]:
     if isinstance(source, Mixture):
-        counted = source.tokens
-        where = "a mixture's token count"
-        tokens = (None if counted is None else _class_record(counted, type(counted), where)
-                  if dataclasses.is_dataclass(counted) else _function(counted, where))
+        tokens = (None if source.tokens is None
+                  else _typed(source.tokens, declared_type(Mixture, "tokens"), "a mixture's token count"))
         return {"mix": [_chain(child) for child in source.pipelines], "weights": list(source.weights),
                 "tokens": tokens}
     if isinstance(source, Phases):
         return {"phases": [_chain(child) for child in source.pipelines],
                 "until_steps": list(source.until_steps)}
-    return _class_record(source, type(source), "store", store=True)
+    written = _typed(source, Source, "store", store=True)
+    if not isinstance(written, dict):
+        raise _Unrecordable(f"the store ({type(source).__name__}) is written as no record of its class")
+    return written
 
 
-def _class_record(value: object, member: type, where: str, *, store: bool = False) -> dict[str, JSON]:
-    """`value`, an instance of the dataclass `member`, as a class record, refused where reading it
-    back builds anything but an equal value (`_same`). A store is equal where it reads the same
-    records, its fingerprint the same, whichever sequence holds them."""
-    if not dataclasses.is_dataclass(value) or isinstance(value, type):
-        raise _Unrecordable(f"the {where} is a {type(value).__name__}, which no record carries")
-    fields = {field.name: getattr(value, field.name) for field in dataclasses.fields(value) if field.init}
+def _typed(value: object, annotation: Annotation, where: str, *, store: bool = False) -> JSON:
+    """`value` as the registry writes it against `annotation`, refused where reading that back
+    through JSON builds anything but the same value (`_same`). A store is the same where it reads
+    the same records, its fingerprint the same, whichever sequence holds them."""
     try:
-        path = import_path(member)
-        written = argument_records(member, fields)
-        rebuilt = member(**read_arguments(member, written))
+        written = to_record(value, annotation)
+        rebuilt = from_record(_annotated(annotation), json.loads(json.dumps(written)))
     except (TypeError, ValueError, NameError) as refused:
         raise _Unrecordable(f"the {where} ({type(value).__name__}) can't be recorded: {refused}") from None
     difference = _same(value, rebuilt, where, sequences=store)
@@ -244,24 +274,26 @@ def _class_record(value: object, member: type, where: str, *, store: bool = Fals
         difference = None if same else f"{where} reads back other records"
     if difference is not None:
         raise _Unrecordable(f"the {where} ({type(value).__name__}) reads back otherwise: {difference}")
-    return {"class": path, "fields": written}
+    return written
 
 
-def _function(function: Callable[[Batch], int], where: str) -> dict[str, JSON]:
-    try:
-        path = import_path(function)
-    except ValueError as refused:
-        raise _Unrecordable(f"{where} can't be recorded: {refused}") from None
-    if imported(path) is not function:
-        raise _Unrecordable(f"{where} is not the function its import path names ({path})")
-    return {"function": path}
+def _annotated(annotation: Annotation) -> type | types.UnionType | typing.TypeAliasType:
+    """`annotation` as one the registry reads a class record against: a class, a union or an alias."""
+    if not isinstance(annotation, (type, types.UnionType, typing.TypeAliasType)):
+        raise ValueError(f"a record is read against a class, a union or an alias, not {annotation!r}")
+    return annotation
+
+
+def _counts(value: Configured) -> TypeGuard[Callable[[Batch], int]]:
+    """Whether a mixture's token count read back is a function, as `Mixture.tokens` is."""
+    return callable(value)
 
 
 def _same(original: object, rebuilt: object, where: str, *, sequences: bool = False) -> str | None:
     """Where `rebuilt` differs from `original`, None where it is the same value: of the same type at
     every level, a tuple a tuple and a list a list (any sequence the other with `sequences`), an
-    array of the same dtype and values, a function or a class the same object (a bound method read
-    back by its import path is not). A value no record carries is refused."""
+    array of the same dtype and values, a function of the same code over the same values, a class
+    or a method of the same object. A value no record carries is refused."""
     alike = sequences and isinstance(original, (list, tuple)) and isinstance(rebuilt, (list, tuple))
     if type(original) is not type(rebuilt) and not alike:
         return f"{where} is a {type(original).__name__} and reads back a {type(rebuilt).__name__}"
@@ -281,9 +313,12 @@ def _same(original: object, rebuilt: object, where: str, *, sequences: bool = Fa
             return f"{where} reads back another function"
         cells = [cell.cell_contents for cell in original.__closure__ or ()]
         again = [cell.cell_contents for cell in rebuilt.__closure__ or ()]
-        return _same((cells, original.__defaults__), (again, rebuilt.__defaults__), where,
-                     sequences=sequences)
-    if isinstance(original, (type, types.BuiltinFunctionType, types.MethodType)):
+        return _same((cells, original.__defaults__, original.__kwdefaults__),
+                     (again, rebuilt.__defaults__, rebuilt.__kwdefaults__), where, sequences=sequences)
+    if isinstance(original, types.MethodType) and isinstance(rebuilt, types.MethodType):
+        same = original.__func__ is rebuilt.__func__ and original.__self__ is rebuilt.__self__
+        return None if same else f"{where} reads back another method"
+    if isinstance(original, (type, types.BuiltinFunctionType)):
         return None if original is rebuilt else f"{where} reads back another {type(original).__name__}"
     if isinstance(original, Mapping) and isinstance(rebuilt, Mapping):
         if list(original) != list(rebuilt):
@@ -304,87 +339,71 @@ def _same(original: object, rebuilt: object, where: str, *, sequences: bool = Fa
 
 def _read_chain(written: Mapping[str, object]) -> Pipeline:
     chain = record(written, "chain")
-    loading = chain.get("loading")
+    if "source" not in chain:
+        raise ValueError("a chain's record names its store under \"source\"")
     source = record(chain["source"], "chain source")
-    built = (_read_call(_read_chain(record(source["input"], "a call's input")), source) if "pipe" in source
-             else Pipeline(_read_source(source)))
+    if "pipe" in source:
+        built = _read_call(_read_chain(record(source.get("input"), "a call's input")), source)
+    else:
+        built = Pipeline(_read_source(source))
     for written_stage in _entries(chain.get("stages", []), "stages"):
         stage = record(written_stage, "stage")
         built = _read_call(built, stage) if "pipe" in stage else built._then(_read_stage(stage))
+    loading = chain.get("loading")
     return dataclasses.replace(
         built,
         name=None if chain.get("name") is None else str(chain["name"]),
         mode=_read_mode(chain.get("read")),
-        _loading=None if loading is None else _read_loading(record(loading, "loading")),
+        _loading=None if loading is None else from_record(Loading, json_value(loading, "loading")),
     )
 
 
 def _read_call(input: Pipeline, written: Mapping[str, object]) -> Pipeline:
     """`input` through the call of `pipe` a record wrote, made again (`Piped`)."""
-    function = imported(str(written["pipe"]))
-    if not _preset(function):
-        raise ValueError(f"{written['pipe']} names no function a chain is piped through")
-    made = input.pipe(function, *(_read_value(arg) for arg in _entries(written.get("args", []), "args")),
-                      **{name: _read_value(setting)
-                         for name, setting in record(written.get("settings", {}), "settings").items()})
+    function = _function(written.get("pipe"))
+    made = input.pipe(function, **read_arguments(function, record(written.get("settings", {}), "settings")))
     if not isinstance(made, Pipeline):
         raise ValueError(f"{written['pipe']} made no chain")
     return made
 
 
-def _preset(value: Configured) -> TypeGuard[Callable[..., Dataset]]:
-    return isinstance(value, types.FunctionType)
-
-
-def _read_loading(written: Mapping[str, object]) -> Loading:
-    from dew.data.dataset import Loading
-
-    built = _read_class(written)
-    if not isinstance(built, Loading):
-        raise ValueError(f"a chain's loading names {written['class']}, which is no Loading")
-    return built
+def _function(written: object) -> types.FunctionType:
+    """The function a call's record names by its import path."""
+    if not isinstance(written, str):
+        raise ValueError(f"a call names its function by its import path, not {written!r}")
+    function = imported(written)
+    if not isinstance(function, types.FunctionType):
+        raise ValueError(f"{written} names no function a chain is piped through")
+    return function
 
 
 def _read_source(written: Mapping[str, object]) -> Source | Mixture | Phases:
     if "mix" in written:
-        tokens = None if written.get("tokens") is None else record(written["tokens"], "tokens")
-        counted = (None if tokens is None else _read_class(tokens) if "class" in tokens
-                   else imported(str(tokens["function"])))
-        if counted is not None and not _counts(counted):
-            raise ValueError(f"a mixture's token count names {counted!r}, which is no function")
+        tokens = written.get("tokens")
         corpora = _entries(written["mix"], "mix")
+        counting = _annotated(declared_type(Mixture, "tokens"))
+        counted = None if tokens is None else from_record(counting, json_value(tokens, "tokens"))
+        if counted is not None and not _counts(counted):
+            raise ValueError("a mixture's token count reads back as no function")
         return Mixture(tuple(_read_chain(record(child, "corpus")) for child in corpora),
-                       numbers(written["weights"], "weights"), counted)
+                       numbers(written.get("weights"), "weights"), counted)
     if "phases" in written:
-        until = _entries(written["until_steps"], "until_steps")
+        until = _entries(written.get("until_steps"), "until_steps")
         phases = _entries(written["phases"], "phases")
         return Phases(tuple(_read_chain(record(child, "phase")) for child in phases),
                       tuple(None if step is None else integer(step, "until_steps") for step in until))
-    built = _read_class(written)
-    if not isinstance(built, Source):
-        raise ValueError(f"a chain's store names {written['class']}, which is no store")
-    return built
+    return from_record(Source, written)
 
 
 def _read_stage(written: Mapping[str, object]) -> Stage:
-    built = _read_class(written)
+    built = from_record(Stage, written)
     if not _stage(built):
-        raise ValueError(f"a chain's stage names {written['class']}, which is no stage")
+        raise ValueError(f"a chain's stage names {written.get('class')}, which is no stage")
     return built
 
 
 def _stage(value: Configured) -> TypeGuard[Stage]:
     return isinstance(value, Stage.__value__)
-
-
-def _counts(value: Configured) -> TypeGuard[Callable[[Batch], int]]:
-    """Whether `value` is a function, as a mixture's token count is: a record's tokens."""
-    return callable(value)
-
-
-def _read_class(written: Mapping[str, object]) -> Configured:
-    member = imported(str(written["class"]))
-    return member(**read_arguments(member, record(written.get("fields", {}), "fields")))
 
 
 def _entries(value: object, where: str) -> list[JSON]:

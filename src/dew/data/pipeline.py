@@ -5,10 +5,9 @@ from __future__ import annotations
 import dataclasses
 import itertools
 import math
-import sys
 import time
 import types
-from collections.abc import Callable, Hashable, Iterable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING, Concatenate, Literal, Protocol, TypeGuard, runtime_checkable
 
 import grain.python as pygrain
@@ -19,9 +18,8 @@ from dew.data.dataset import Batch, Records
 if TYPE_CHECKING:
     import jax
 
-    from dew.data.cache import Cache
     from dew.data.dataset import Loading
-    from dew.data.generation import Generation
+    from dew.data.generation import DependencyManifest
     from dew.data.sources.base import Read, Source
 
 
@@ -81,6 +79,11 @@ class TokenBudget:
     tokens: int
     drop_remainder: bool = True
     batch_fn: Callable[[Sequence[Batch]], Batch] | None = None
+
+    def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
+        """Rows of the pipeline's row length, as many a batch as `tokens` holds."""
+        width = facts.get("seq_len")
+        return {**facts, "batch": self.tokens // (width + 1)} if isinstance(width, int) else dict(facts)
 
     def __post_init__(self) -> None:
         if self.tokens <= 0:
@@ -278,7 +281,7 @@ class Pack:
         """Rows of `seq_len` tokens along `fields`, the last of them a target: `seq_len - 1` inputs."""
         from dew.data.facts import windowed
 
-        return windowed(facts, self.seq_len - 1, self.fields, packed=True)
+        return windowed(facts, self.seq_len - 1, self.fields, packed=True, along=self.along)
 
     def __post_init__(self) -> None:
         if self.policy == "concat" and (self.segments is not None or self.along):
@@ -356,9 +359,21 @@ class MapBatch:
     identity: str | None = None
 
 
+@runtime_checkable
+class Cached(Protocol):
+    """What a cache stage fills and reads, a `dew.data.cache.Cache`, or the published generation
+    it stands in for, a `dew.data.generation.Generation`: each says where it lives and which rows
+    a plan reads from it."""
+
+    @property
+    def url(self) -> str: ...
+
+    def reference(self, manifest: DependencyManifest, /) -> str: ...
+
+
 @dataclasses.dataclass(frozen=True)
 class Artifact:
-    cache: Cache | Generation
+    cache: Cached
 
 
 type Stage = (
@@ -700,7 +715,7 @@ class Dataset:
     def take(self, count: int) -> Pipeline:
         return self._then(Limit(count))
 
-    def cache(self, cache: str | Cache | Generation) -> Pipeline:
+    def cache(self, cache: str | Cached) -> Pipeline:
         """Fill `cache` with the deterministic record steps before it, or read a
         published `Generation` as the source in their place, with its published
         packing in place of a `pack` that follows."""
@@ -833,11 +848,9 @@ class Dataset:
     def show(self, count: int = 8) -> None:
         """Print the chain, each verb and step a preset or function expanded to in order, then
         its first `count` records."""
-        from rich.pretty import pprint
+        from dew.data.show import shown
 
-        sys.stdout.write("\n".join(_chain_lines(self._chain())) + "\n")
-        for row in itertools.islice(self, count):
-            pprint({name: _shown(value) for name, value in row.items()} if isinstance(row, Mapping) else row)
+        shown(self._chain(), itertools.islice(self, count))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -884,63 +897,6 @@ def concat(datasets: Sequence[Dataset]) -> Pipeline:
     return Pipeline(Concatenate(stores))
 
 
-def _chain_lines(chain: Pipeline, depth: int = 0) -> list[str]:
-    """The lines `show` prints of `chain`: its store, or the corpora a mix or phases read, each
-    with its own chain indented below, then each stage in order, one a line."""
-    indent = "  " * depth
-    source = chain.source
-    if isinstance(source, Mixture):
-        lines = [f"{indent}mix" if source.tokens is None else f"{indent}mix(by='tokens')"]
-        for weight, child in zip(source.weights, source.pipelines, strict=True):
-            lines += [f"{indent}  weight {weight:g}:", *_chain_lines(child._chain(), depth + 2)]
-    elif isinstance(source, Phases):
-        lines = [f"{indent}phases"]
-        for until, child in zip(source.until_steps, source.pipelines, strict=True):
-            lines += [f"{indent}  until step {until}:" if until is not None else f"{indent}  last:",
-                      *_chain_lines(child._chain(), depth + 2)]
-    else:
-        lines = [f"{indent}{type(source).__name__} {source.label()!r}"]
-    return lines + [f"{indent}.{_stage_line(stage)}" for stage in chain.stages]
-
-
-def _stage_line(stage: Stage | Batched | Native) -> str:
-    """One stage as `show` prints it: the verb that wrote it and the step it runs, or the
-    stage's own settings."""
-    if isinstance(stage, MapBatch):
-        where = "device" if isinstance(stage.step, DeviceStep) else "host"
-        return f"map({_step_name(stage.step)}) on the {where}, per batch"
-    if isinstance(stage, Configured):
-        return f"map({_step_name(stage.factory)})"
-    if isinstance(stage, Filter):
-        return f"filter({_step_name(stage.predicate)})"
-    if isinstance(stage, Native):
-        return f"grain({_step_name(stage.function)})"
-    if isinstance(stage, Batched):
-        verb = "map" if stage.same_rows else "flat_map"
-        return f"{verb}({_step_name(stage.step)}, batched=True, batch_size={stage.size})"
-    if isinstance(stage, (Map, RandomMap)):
-        drawn = "random_" if isinstance(stage, RandomMap) else ""
-        verb = drawn + ("filter_map" if stage.rejects else "map")
-        return f"{verb}({_step_name(stage.step)})"
-    if isinstance(stage, (MapWithIndex, FlatMap)):
-        verb = "map_with_index" if isinstance(stage, MapWithIndex) else "flat_map"
-        return f"{verb}({_step_name(stage.step)})"
-    if isinstance(stage, BatchStage):
-        return f"batch({stage.size})"
-    return _brief(repr(stage))
-
-
-def _step_name(step: Hashable) -> str:
-    """A step as `show` prints it: a function by its name, any other step by its settings."""
-    if isinstance(step, (types.FunctionType, types.MethodType)):
-        return step.__qualname__
-    return _brief(repr(step))
-
-
-def _brief(text: str, width: int = 120) -> str:
-    return text if len(text) <= width else text[: width - 1] + "…"
-
-
 def _token_places(batch: Batch) -> tuple[int, int]:
     """The places a batch's token rows under "text" hold, and those of them that pad a row, as a
     model reads them (`dew.nn.inputs.real_slots`): segment 0 of a packed row and the places its
@@ -955,30 +911,6 @@ def _token_places(batch: Batch) -> tuple[int, int]:
               if f"text_{name}" in batch}
     real = real_slots(fields, tokens.shape, xp=np)
     return int(tokens.size), int(tokens.size - np.count_nonzero(real))
-
-
-@runtime_checkable
-class _Shaped(Protocol):
-    """An array a step leaves on a device (a JAX array), as `show` reads it."""
-
-    @property
-    def shape(self) -> tuple[int, ...]: ...
-
-    @property
-    def dtype(self) -> np.dtype: ...
-
-    @property
-    def size(self) -> int: ...
-
-
-def _shown[Field](value: np.ndarray | _Shaped | bytes | Field) -> np.ndarray | _Shaped | bytes | Field | str:
-    """A field as `show` prints it: an array, on the host or on a device after the chain's device
-    steps, as its shape and dtype; bytes as their length."""
-    if isinstance(value, (np.ndarray, _Shaped)) and value.size > 16:
-        return f"{value.dtype}{list(value.shape)}"
-    if isinstance(value, bytes) and len(value) > 64:
-        return f"<{len(value)} bytes>"
-    return value
 
 
 def mix(datasets: Sequence[Dataset], weights: Sequence[float] | None = None, *,
