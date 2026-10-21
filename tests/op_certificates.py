@@ -356,3 +356,161 @@ def rsqrt_rounded(x, fmt: Format) -> np.ndarray:
         else:
             result.flat[index] = float(fraction_rounded(midpoint, fmt))
     return result
+
+
+
+EXP_ULPS = 2
+"""The error of the exp an attention kernel takes, in ulps of its result: numpy's on the interpreter,
+the device's libdevice exp on a GPU (within 2 on an A100's normal results, op-certificates-report)."""
+
+
+def _above(terms: np.ndarray, count: int) -> np.ndarray:
+    """A float64 sum of `count` nonnegative terms per entry, widened by float64's own worst case so it
+    bounds the exact sum from above (`magnitude_sum`'s widening)."""
+    return np.nextafter(np.asarray(terms, np.float64) * (1.0 + 2.0 * count * 2.0 ** -53), np.inf)
+
+
+def _exact_dot(a: np.ndarray, b: np.ndarray) -> float:
+    """Σ a·b of fp32 or bf16 operands, exactly zero only where the exact sum is: each product is exact
+    in float64, and `math.fsum` rounds their sum once."""
+    return math.fsum((np.asarray(a, np.float64) * np.asarray(b, np.float64)).tolist())
+
+
+@dataclasses.dataclass(frozen=True)
+class _AttentionBackward:
+    """What an attention backward's certificate reads, every array float64 from the native inputs:
+    `q` `[B, Q, H, D]`, `k`, `v` each query head's key head's `[B, K, H, ·]`, `do` `[B, Q, H, Dv]`,
+    `out` the output D reads or None (D sums P·dP over the kernel's tiles), `visible` and `p` the exact
+    softmax `[B, H, Q, K]`, and `group` query heads a key head."""
+    q: np.ndarray
+    k: np.ndarray
+    v: np.ndarray
+    do: np.ndarray
+    out: np.ndarray | None
+    visible: np.ndarray
+    p: np.ndarray
+    group: int
+
+    def structural(self, b: int, h: int, i: int, j: int | None = None) -> bool:
+        """Whether query `i`'s dS is exactly zero on these inputs, at key `j` or at every key it sees,
+        by structure: D the exact dot it is (from `out`), or every key it sees giving the same dP (P·dP
+        summed)."""
+        keys = np.flatnonzero(self.visible[b, h, i]) if j is None else [j]
+        if j is not None and not self.visible[b, h, i, j]:
+            return True
+        do = self.do[b, i, h]
+        if self.out is not None:
+            return all(_exact_dot(np.concatenate([do, -do]), np.concatenate([self.v[b, key, h], self.out[b, i, h]]))
+                       == 0.0 for key in keys)
+        seen = np.flatnonzero(self.visible[b, h, i])
+        first = seen[:1]
+        return all(_exact_dot(np.concatenate([do, -do]), np.concatenate([self.v[b, key, h], self.v[b, first[0], h]]))
+                   == 0.0 for key in seen[1:]) if first.size else True
+
+
+def attention_backward_zero_rows(grads, truth, *, query, key, value, d_out, spans, hooks=None, scale=None,
+                                 out=None, label: str) -> None:
+    """Check 2 at an attention backward's rows of float64 zero: the rows of `dq`, `dk` and `dv` the
+    float64 `truth` holds at zero, which check 1 has no size to hold (tests/reference_error.py
+    `rows_over`), each element of the native `grads` within its certified bound of the exact result on
+    the same native inputs (`query`, `key`, `value`, `d_out`, and `out`, the output the kernel's D reads,
+    or None where D sums P·dP over the kernel's own tiles), the template's attention
+    (dew.nn.kernels.templates.attention) over `spans` and `hooks`.
+
+    Such a row is zero by structure: a query that keeps one key (P = 1, so dP = D exactly and dS = 0), a
+    key no query sees, a cotangent of zero. On it the native value is rounding alone, bounded by the
+    rounding of each sum the backward takes, in fp32 whatever the inputs' format: dP and D, dots of
+    native operands, γ(n) of their magnitudes; P rebuilt from the forward's residuals, within a factor
+    exp(2Δ + 2·EXP_ULPS·u)(1 + γ(K + 1))² of its exact value, Δ the most the backward's scores may sit
+    from the forward's (their dot's γ(D + 1) and score_mod's declared `score_ulps`, its slope at most
+    `score_slope`); dS rounded to the inputs' dtype for its products, and those products' own γ. A row
+    zero by cancellation rather than structure is not certified, and fails."""
+    import jax
+    import jax.numpy as jnp
+    from reference_error import row_errors
+
+    from dew.nn.kernels.templates import attention
+
+    hooks = attention.Hooks() if hooks is None else hooks
+    if hooks.initial is not None or hooks.output_mod is not None:
+        raise AssertionError(f"{label}: an initial state's or an output_mod's rows have no certificate here")
+    if hooks.score_mod is None:
+        slope, ulps = 1.0, 0
+    elif getattr(hooks, "score_slope", None) is None or getattr(hooks, "score_ulps", None) is None:
+        raise AssertionError(f"{label}: a score_mod declaring no score_slope and score_ulps has no "
+                             f"certified bound")
+    else:
+        slope, ulps = float(hooks.score_slope), int(hooks.score_ulps)
+    q, k, v, do = (np.asarray(array, np.float64) for array in (query, key, value, d_out))
+    batch, queries, heads, width = q.shape
+    keys, kv_heads, values = k.shape[1], k.shape[2], v.shape[-1]
+    group = heads // kv_heads
+    scale = width ** -0.5 if scale is None else scale
+    u = FLOAT32.unit_roundoff
+    cast = 1 + (BFLOAT16.unit_roundoff if jnp.dtype(query.dtype) == jnp.bfloat16 else 0.0)
+    with jax.enable_x64(True):
+        s = np.asarray(attention.scores(jnp.asarray(q), jnp.asarray(k), spans, hooks, scale=scale))
+    visible = np.isfinite(s)
+    shifted = np.where(visible, s - np.max(np.where(visible, s, -np.inf), -1, initial=0.0, where=visible)[..., None],
+                       -np.inf)
+    weights = np.exp(shifted)
+    total = weights.sum(-1, keepdims=True)
+    p = np.divide(weights, total, out=np.zeros_like(weights), where=total > 0)
+    kh, vh = np.repeat(k, group, axis=2), np.repeat(v, group, axis=2)
+    dots = _above(np.einsum("bqhd,bkhd->bhqk", np.abs(q), np.abs(kh)), width) * scale
+    delta = 2 * (slope * gamma(width + 1, FLOAT32) * dots + ulps * u * np.abs(np.where(visible, s, 0.0)))
+    spread = np.max(np.where(visible, delta, 0.0), -1, keepdims=True)
+    rho = np.nextafter(np.exp(2 * spread + 2 * EXP_ULPS * u) * (1 + gamma(keys + 1, FLOAT32)) ** 2 - 1, np.inf)
+    p_hat = (1 + rho) * p
+    a = _above(np.einsum("bqhd,bkhd->bhqk", np.abs(do), np.abs(vh)), values)
+    g = gamma(values, FLOAT32)
+    if out is None:
+        # D̂ - dP = Σ_k P̂_k (dP̂_k - dP) + dP (ΣP̂ - 1) + its products' and sum's rounding, dP common to
+        # every key the row sees.
+        carried = np.einsum("bhqk,bhqk->bhq", p_hat, a)[..., None]
+        pulled = g * a + (g + gamma(keys + 1, FLOAT32) * (1 + g)) * carried + rho * a
+    else:
+        o = np.asarray(out, np.float64)
+        pulled = g * (a + _above(np.einsum("bqhd,bqhd->bhq", np.abs(do), np.abs(o)), values)[..., None])
+    errors = p_hat * (slope + 4 * u) * pulled * (1 + gamma(3, FLOAT32))
+
+    def per_key(array):
+        return array.reshape(batch, keys, kv_heads, group, -1).sum(3)
+
+    bounds = {
+        "dq": scale * (1 + gamma(keys + 2, FLOAT32)) * cast * np.einsum("bhqk,bkhd->bqhd", errors, np.abs(kh)),
+        "dk": scale * (1 + gamma(queries * group + 2, FLOAT32)) * cast * per_key(
+            np.einsum("bhqk,bqhd->bkhd", errors, np.abs(q))),
+        "dv": (1 + gamma(queries * group + 1, FLOAT32)) * cast * per_key(
+            np.einsum("bhqk,bqhd->bkhd", p_hat, np.abs(do))),
+    }
+    backward = _AttentionBackward(q, kh, vh, do, None if out is None else np.asarray(out, np.float64),
+                                  visible, p, group)
+
+    def structural(name, b, row, head):
+        if name == "dq":
+            return backward.structural(b, head, row)
+        heads_ = range(head * group, (head + 1) * group)
+        if name == "dv":
+            return not np.any(p[b, heads_.start:heads_.stop, :, row][..., None]
+                              * do[b, :, heads_.start:heads_.stop].transpose(1, 0, 2))
+        return all(backward.structural(b, h, i) if out is None else backward.structural(b, h, i, row)
+                   for h in heads_ for i in range(queries) if visible[b, h, i, row])
+
+    failures = []
+    for name in ("dq", "dk", "dv"):
+        native, exact = np.asarray(grads[name], np.float64), np.asarray(truth[name], np.float64)
+        sizes, _ = row_errors(exact, exact)
+        flat = native.reshape(-1, native.shape[-1])
+        bound = bounds[name].reshape(flat.shape)
+        for row in np.flatnonzero(sizes == 0):
+            b, position, head = np.unravel_index(row, native.shape[:-1])
+            if not structural(name, int(b), int(position), int(head)):
+                failures.append(f"{name} row {(int(b), int(position), int(head))}: zero in float64 by "
+                                f"cancellation, not structure, which this certificate does not hold")
+            elif not (np.abs(flat[row]) <= bound[row]).all():
+                worst = int(np.argmax(np.abs(flat[row]) - bound[row]))
+                failures.append(f"{name} row {(int(b), int(position), int(head))}: {flat[row, worst]:.3e} "
+                                f"where the exact value is 0 and its certified bound {bound[row, worst]:.3e}")
+    assert not failures, f"{label}: " + "; ".join(failures[:6]) + (
+        f" (and {len(failures) - 6} more)" if len(failures) > 6 else "")

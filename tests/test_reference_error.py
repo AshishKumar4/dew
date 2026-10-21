@@ -58,23 +58,19 @@ def test_a_row_that_cancels_is_held_to_what_it_sums():
         assert_leaves_as_exact({"dq": further}, {"dq": reference}, {"dq": truth}, terms={"dq": terms})
 
 
-def test_a_row_of_float64_zero_is_held_to_the_references_own_row():
-    """A sum that cancels exactly before anything its terms see, as a query that keeps one key
-    has a zero gradient through the flash formula's delta, has no size of its own: its distance
-    is held to the reference's on that same row. Dew at the reference's residue passes; Dew with a
-    residue where the reference computes the float64 zero exactly does not, though the tensor-wide
-    RMS admits it."""
+def test_a_row_of_float64_zero_is_left_to_check_two():
+    """A row the float64 truth holds at exactly zero, as a query that keeps one key holds its gradient,
+    has no size to be held by: Dew's rounding residue there, where the reference's arithmetic makes the
+    zero exactly (the softmax VJP's D from the same dP), is not held to the reference's luck. Check 2
+    holds each of its elements to its operation's certified bound (tests/op_certificates.py)."""
     rng = np.random.default_rng(1)
     truth = rng.normal(size=(64, 16))
     truth[0] = 0.0
     unit = float(np.finfo(np.float32).eps)
     reference = truth + unit * rng.normal(size=truth.shape)
     dew = truth + unit * rng.normal(size=truth.shape)
-    assert_as_exact_as_the_reference(dew, reference, truth, "zero row")
     reference[0], dew[0] = 0.0, unit
-    assert distance(dew, truth) <= FACTOR * distance(reference, truth)
-    with pytest.raises(AssertionError):
-        assert_as_exact_as_the_reference(dew, reference, truth, "zero row")
+    assert_as_exact_as_the_reference(dew, reference, truth, "zero row")
 
 
 def _draw(seed):
@@ -176,17 +172,14 @@ def test_check_one_fails_a_value_that_is_not_finite(rank):
     assert raised.type is AssertionError
 
 
-def test_check_one_holds_a_row_of_float64_zero_to_the_references_own():
-    """A row the float64 truth holds at exactly zero, the reference too, is no further from zero in Dew
-    than ROW_FACTOR times the reference on that row: a corruption too small to move the pooled error
-    still fails there."""
+def test_check_one_leaves_a_row_of_float64_zero_to_check_two():
+    """A row the float64 truth holds at exactly zero, the reference too, has no size for check 1 to hold
+    Dew's residue there by: its elements are check 2's, each within its operation's certified bound."""
     def zero_row(offset):
         return jax.jit(lambda x, w: {"y": jnp.concatenate(
             [jnp.dot(x, w, precision="highest"), jnp.full((1, w.shape[1]), offset, jnp.float32)])})
 
-    with pytest.raises(AssertionError) as raised:
-        assert_as_exact(zero_row(1e-12), zero_row(0.0), _draw, "zero row", seeds=8)
-    assert raised.type is AssertionError
+    assert_as_exact(zero_row(1e-12), zero_row(0.0), _draw, "zero row", seeds=8)
 
 
 def test_a_recorded_reference_is_drawn_by_its_index_and_covers_the_redraw(tmp_path):

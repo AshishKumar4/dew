@@ -175,11 +175,12 @@ def row_errors(value, truth, terms=None) -> tuple[np.ndarray, np.ndarray]:
 def rows_over(dew, reference, truth, terms=None, floor: float = 0.0) -> list[str]:
     """Where Dew's rows are further from float64 than ROW_FACTOR times the
     reference's (`row_errors`): its worst row over its own size against the
-    reference's worst, at least `floor` (an order floor in the rows' units),
-    and each row of size zero, a sum that cancels exactly before anything its
-    terms see (a query that keeps one key), against the reference's distance
-    on that same row, which is all the evidence such a row has: where the
-    reference is exactly the float64 zero, Dew must be too."""
+    reference's worst, at least `floor` (an order floor in the rows' units).
+    A row of float64 zero has no size to be held by and is check 2's, each
+    element within its operation's certified bound (tests/op_certificates.py):
+    held to the reference's own row, it was held to the reference's luck, a
+    zero the reference's arithmetic makes exactly (the softmax VJP's D from the
+    same dP) where an equally exact one rounds."""
     sizes, mine = row_errors(dew, truth, terms)
     _, theirs = row_errors(reference, truth, terms)
     sized = sizes > 0
@@ -190,11 +191,6 @@ def rows_over(dew, reference, truth, terms=None, floor: float = 0.0) -> list[str
         if not within(row, ROW_FACTOR * max(their_row, floor)):
             over.append(f"the worst row is {row:.3e} from float64 over its size, the reference's "
                         f"{their_row:.3e}, allowed {ROW_FACTOR * max(their_row, floor):.3e}")
-    zero = ~sized & ~(mine <= ROW_FACTOR * theirs)
-    if zero.any():
-        at = int(np.flatnonzero(zero)[0])
-        over.append(f"{int(zero.sum())} rows of float64 zero are further from it than the reference's own, "
-                    f"row {at} by {mine[at]:.3e} against {theirs[at]:.3e}")
     return over
 
 
@@ -270,25 +266,23 @@ def _resolves(low: float, high: float) -> bool:
 @dataclasses.dataclass
 class _Draws:
     """Each leaf's errors over a run of seeds: Dew's and the reference's mean squared error from
-    float64 (seed by leaf), each seed's worst sized row over its size (Dew's, the reference's), each
-    seed's count of rows of float64 zero where Dew is further from it than ROW_FACTOR times the
-    reference, and whether every value of the leaf was finite on every seed."""
+    float64 (seed by leaf), each seed's worst sized row over its size (Dew's, the reference's), and
+    whether every value of the leaf was finite on every seed."""
     names: list[str]
     mine: np.ndarray
     theirs: np.ndarray
     worst: np.ndarray
-    zero_rows: np.ndarray
     finite: np.ndarray
 
     def joined(self, other: "_Draws") -> "_Draws":
         return _Draws(self.names, *(np.concatenate([getattr(self, field), getattr(other, field)])
-                                    for field in ("mine", "theirs", "worst", "zero_rows", "finite")))
+                                    for field in ("mine", "theirs", "worst", "finite")))
 
 
 def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None) -> _Draws:
     """Every leaf's errors (`_Draws`) over `seeds`: both functions run on `draw(seed)`'s inputs, truth
     `truth_fn` on them (by default `reference_fn` on them widened to float64)."""
-    mine, theirs, worst, zero_rows, finite, names = [], [], [], [], [], None
+    mine, theirs, worst, finite, names = [], [], [], [], None
     for seed in seeds:
         inputs = draw(seed)
         dew, reference = dew_fn(*inputs), reference_fn(*inputs)
@@ -307,7 +301,7 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None) -> _Draws:
                     jax.tree_util.keystr(path), kept, np.shape(their_leaf))
                 # The truth empty alike (in float64, its dtype is its own).
                 assert np.shape(true) == np.shape(leaf), (jax.tree_util.keystr(path), np.shape(true))
-                row.append((0.0, 0.0, 0.0, 0.0, 0, True))
+                row.append((0.0, 0.0, 0.0, 0.0, True))
                 continue
             leaf, their_leaf, true = (np.asarray(value, np.float64) for value in (leaf, their_leaf, true))
             row.append((float(np.mean(np.square(leaf - true))), float(np.mean(np.square(their_leaf - true))),
@@ -316,24 +310,20 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None) -> _Draws:
         mine.append([entry[0] for entry in row])
         theirs.append([entry[1] for entry in row])
         worst.append([(entry[2], entry[3]) for entry in row])
-        zero_rows.append([entry[4] for entry in row])
-        finite.append([entry[5] for entry in row])
+        finite.append([entry[4] for entry in row])
     return _Draws(names, np.asarray(mine), np.asarray(theirs), np.asarray(worst).reshape(len(mine), -1, 2),
-                  np.asarray(zero_rows), np.asarray(finite))
+                  np.asarray(finite))
 
 
-def _rows(leaf, reference, truth) -> tuple[float, float, int]:
+def _rows(leaf, reference, truth) -> tuple[float, float]:
     """One seed's row evidence for a leaf (`row_errors`): Dew's and the reference's worst sized row over
-    its size, and how many rows of float64 zero Dew is further from than ROW_FACTOR times the reference
-    is on that same row (`rows_over`'s rule for them)."""
+    its size. A row of float64 zero is check 2's (`rows_over`)."""
     sizes, my_rows = row_errors(leaf, truth)
     _, their_rows = row_errors(reference, truth)
     sized = sizes > 0
-    if not sized.size:
-        return 0.0, 0.0, 0
-    return (float(np.max(my_rows[sized] / sizes[sized])) if sized.any() else 0.0,
-            float(np.max(their_rows[sized] / sizes[sized])) if sized.any() else 0.0,
-            int(np.sum(~sized & ~(my_rows <= ROW_FACTOR * their_rows))))
+    if not sized.any():
+        return 0.0, 0.0
+    return float(np.max(my_rows[sized] / sizes[sized])), float(np.max(their_rows[sized] / sizes[sized]))
 
 
 def _judged(draws: _Draws, index: int) -> tuple[float, float, float]:
@@ -345,8 +335,8 @@ def _judged(draws: _Draws, index: int) -> tuple[float, float, float]:
 def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn=None) -> None:
     """Check 1 of the owner's gate (bible §7, 2026-10-20): on par. Each leaf's RMS error from float64,
     pooled over the site's declared seeds, within PARITY times the reference's, and its worst row over
-    those seeds within ROW_FACTOR times the reference's worst; each row of float64 zero no further from
-    it than ROW_FACTOR times the reference on that row; every value finite.
+    those seeds within ROW_FACTOR times the reference's worst; every value finite. A row of float64 zero
+    has no size to hold and is check 2's (`rows_over`).
 
     `draw(seed)` returns the inputs of one draw, the same for a seed on every run; `dew_fn(*inputs)`
     and `reference_fn(*inputs)` return the same tree, and truth is `reference_fn` on the inputs
@@ -402,9 +392,6 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
         if not within(my_row, ROW_FACTOR * their_row):
             over.append(f"{leaf}: the worst row over {count} seeds is {my_row:.3e} from float64 over its "
                         f"size, the reference's {their_row:.3e}, allowed {ROW_FACTOR * their_row:.3e}")
-        if draws.zero_rows[:, index].any():
-            over.append(f"{leaf}: {int(draws.zero_rows[:, index].sum())} rows of float64 zero over {count} "
-                        f"seeds are further from it than ROW_FACTOR times the reference's own")
     if over:
         raise AssertionError("\n".join(over + unresolved))
     if unresolved:
