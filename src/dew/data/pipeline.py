@@ -826,10 +826,18 @@ def _stage_line(stage: Stage | Batched | Native) -> str:
         return f"filter({_step_name(stage.predicate)})"
     if isinstance(stage, Native):
         return f"grain({_step_name(stage.function)})"
-    if isinstance(stage, (Map, RandomMap, MapWithIndex, FlatMap, Batched)):
-        verb = {Map: "map", RandomMap: "random_map", MapWithIndex: "map_with_index",
-                FlatMap: "flat_map", Batched: "map"}[type(stage)]
+    if isinstance(stage, Batched):
+        verb = "map" if stage.same_rows else "flat_map"
+        return f"{verb}({_step_name(stage.step)}, batched=True, batch_size={stage.size})"
+    if isinstance(stage, (Map, RandomMap)):
+        drawn = "random_" if isinstance(stage, RandomMap) else ""
+        verb = drawn + ("filter_map" if stage.rejects else "map")
         return f"{verb}({_step_name(stage.step)})"
+    if isinstance(stage, (MapWithIndex, FlatMap)):
+        verb = "map_with_index" if isinstance(stage, MapWithIndex) else "flat_map"
+        return f"{verb}({_step_name(stage.step)})"
+    if isinstance(stage, BatchStage):
+        return f"batch({stage.size})"
     return _brief(repr(stage))
 
 

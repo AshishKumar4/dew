@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import grain.python as grain
 import numpy as np
@@ -11,7 +11,7 @@ import numpy as np
 from dew.data.dataset import Records
 from dew.data.pipeline import Dataset
 
-from .base import Read, Shard, ShardManifest
+from .base import Read, Shard, ShardManifest, unnamed
 
 
 @dataclass(frozen=True, eq=False)
@@ -24,6 +24,7 @@ class Grain(Dataset):
 
     dataset: grain.MapDataset | grain.IterDataset
     name: str | None = None
+    place: int = field(default_factory=unnamed, repr=False)
 
     def __post_init__(self) -> None:
         if self.name == "":
@@ -33,7 +34,7 @@ class Grain(Dataset):
         return self.name or "grain"
 
     def describe(self) -> str:
-        return f"grain:{self.name or 'unnamed'}"
+        return f"grain:{self.name}" if self.name is not None else f"grain:unnamed-{self.place}"
 
     def fingerprint(self) -> Mapping[str, object]:
         return {"store": "grain", "identity_required": True, "identity": self.name, **self.metadata()}
