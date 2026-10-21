@@ -117,7 +117,7 @@ def test_qwix_refuses_an_unknown_calibration_where_it_first_quantizes_a_weight()
     and the first forward that quantizes a matched weight raises, Qwix's own refusal."""
     pytest.importorskip("qwix")
     _, qmodel, variables, ids = quantized_forward(Quantization(calibration="not_a_method"))
-    with pytest.raises(ValueError):  # noqa: PT011 - Qwix's message, not Dew's
+    with pytest.raises(ValueError):
         qmodel.apply(variables, ids)
 
 
