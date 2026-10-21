@@ -20,6 +20,7 @@ import pytest
 from affine_run import dataset
 from recording import RecordingTracker
 from reference_error import assert_as_exact_as_the_reference, assert_leaves_as_exact, widened
+from token_support import token_batch_of
 
 from dew.artifacts import TokenScores
 from dew.data.chat import ROLES_KEY, Role
@@ -62,9 +63,7 @@ def step_at(index=0, key=1, ema=None):
 
 
 def token_batch(batch=4, seq=SEQ, seed=0):
-    """A `[B, seq + 1]` batch of ids, as the token pipeline packs them."""
-    ids = np.random.RandomState(seed).randint(0, VOCAB, (batch, seq + 1))
-    return {TEXT_KEY: jnp.asarray(ids, jnp.int32)}
+    return token_batch_of(VOCAB, seq, batch, seed)
 
 
 def cycle_batches(batch=BATCH, seq=SEQ, seed=0):

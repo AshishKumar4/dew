@@ -51,6 +51,12 @@ def decode_through(module: nn.Module, variables, hidden, prefill: int):
     return jnp.concatenate(outputs, axis=1), allocated["cache"], cache["cache"]
 
 
+def largest_difference(left, right) -> float:
+    """The largest absolute difference between two trees of the same structure, over every leaf."""
+    return max(float(np.max(np.abs(np.asarray(a) - np.asarray(b))))
+               for a, b in zip(jax.tree.leaves(left), jax.tree.leaves(right), strict=True))
+
+
 def flat_tree(tree) -> dict:
     """`tree`'s leaves by their dictionary keys joined with dots, the way a
     checkpoint names them: 'params.layers_0.mlp.gate.kernel'."""
