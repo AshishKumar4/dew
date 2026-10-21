@@ -54,3 +54,18 @@ def repeated_token_batch(vocabulary: int, rows: int, length: int, seed: int = 0)
     batch = {"text": tokens.astype(np.int32)}
     while True:
         yield batch
+
+
+def byte_level_tokenizer(directory: Path):
+    """A byte-level BPE over all 256 bytes, saved in `directory` and read back through
+    transformers: any text has a spelling, and a code point may split across tokens."""
+    from tokenizers import Tokenizer, decoders, models, pre_tokenizers
+    from transformers import AutoTokenizer, PreTrainedTokenizerFast
+    from transformers.convert_slow_tokenizer import bytes_to_unicode
+
+    alphabet = bytes_to_unicode()
+    backend = Tokenizer(models.BPE({alphabet[byte]: byte for byte in range(256)}, [], unk_token=None))
+    backend.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    backend.decoder = decoders.ByteLevel()
+    PreTrainedTokenizerFast(tokenizer_object=backend).save_pretrained(directory)
+    return AutoTokenizer.from_pretrained(directory, local_files_only=True)

@@ -16,6 +16,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from token_support import byte_level_tokenizer
 
 from dew.inference import RunProcessor, TextGeneration
 from dew.inference.serving import Server
@@ -30,17 +31,7 @@ EOS = 256
 @pytest.fixture(scope="module")
 def tokenizer(tmp_path_factory):
     """A byte-level BPE over all 256 bytes, so any text has a spelling."""
-    from tokenizers import Tokenizer, decoders, models, pre_tokenizers
-    from transformers import AutoTokenizer, PreTrainedTokenizerFast
-    from transformers.convert_slow_tokenizer import bytes_to_unicode
-
-    alphabet = bytes_to_unicode()
-    backend = Tokenizer(models.BPE({alphabet[byte]: byte for byte in range(256)}, [], unk_token=None))
-    backend.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
-    backend.decoder = decoders.ByteLevel()
-    path = tmp_path_factory.mktemp("bytes")
-    PreTrainedTokenizerFast(tokenizer_object=backend).save_pretrained(path)
-    return AutoTokenizer.from_pretrained(path, local_files_only=True)
+    return byte_level_tokenizer(tmp_path_factory.mktemp("bytes"))
 
 
 _DEFAULT_TASK_SAMPLING = Sampling(temperature=0, eos_token_ids=EOS)
