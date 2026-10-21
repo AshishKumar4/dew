@@ -195,7 +195,7 @@ Rule 0 applies: use Splash's MaskInfo, with its empty/partial/full classes and p
 
 - **sm120 (consumer Blackwell: RTX 50, RTX PRO 6000) has no tcgen05 and no TMEM.** Its tensor cores take sm80's mma.sync forms (with FP8/FP4 additions), so it runs the Triton mainloop, not the Blackwell one.
 - **sm86/sm89/sm120 differ from sm80 in shared memory per SM** (99–100 KB a block against the A100's 163 KB) and in SM count. So their tile spaces and picks are their own TARGETS rows (`generation.shared_budget`), and their scoreboard rows are measured, not inferred from the A100.
-- **sm75 (T4) and older** have no bf16 tensor cores, and Pallas Triton doesn't compile there (§ the T4 row in TARGETS). They run XLA.
+- **sm75 (T4) and older** have no bf16 tensor cores, and Pallas Triton doesn't compile there (`generation.py`, the sm75 row of TARGETS). They run XLA.
 
 Each mainloop's shape comes from the fastest known kernel on its hardware, built rung by rung against it:
 
