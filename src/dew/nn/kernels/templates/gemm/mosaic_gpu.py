@@ -287,12 +287,7 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles
                                                                                strict=True))
 
     group_sizes = group_sizes.astype(jnp.int32)
-    group_starts = jnp.concatenate([jnp.zeros(1, jnp.int32), jnp.cumsum(group_sizes)[:-1]]).astype(jnp.int32)
-    group_ends = jnp.cumsum(group_sizes).astype(jnp.int32)
-    group_block_starts = group_starts // block_k * block_k
-    group_block_ends = -(group_ends // -block_k) * block_k
-    group_num_blocks = (group_block_ends - group_block_starts) // block_k
-
+    group_starts, group_ends, group_num_blocks, group_block_starts = _group_blocks(group_sizes, block_k)
     out_dtype = jnp.dtype(out_dtype)
 
     def body(group_sizes_gmem, group_starts_gmem, group_ends_gmem, group_num_blocks_gmem,
@@ -311,16 +306,7 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles
             group_block_start = pl.multiple_of(group_block_starts_gmem[g_i], block_k)
             gmem_slice = pl.ds(group_block_start, k)
 
-            # Dew: each prologue side operand's block, its rows the group's slice as `lhs`'s.
-            side_block = {'rows': (block_k, lambda k_i: k_i), 'depth': (block_m, lambda k_i: m_i)}
-            def side_spec(axes):
-                return plgpu.BlockSpec(tuple(side_block[axis][0] for axis in axes),
-                                       lambda k_i: tuple(side_block[axis][1](k_i) for axis in axes),
-                                       delay_release=int(tiles.stages > 1))
-
-            side_specs = [side_spec(axes) for axes in prologue_axes]
-            sides = [side.at[tuple(gmem_slice if axis == 'rows' else slice(None) for axis in axes)]
-                     for side, axes in zip(side_gmems, prologue_axes, strict=True)]
+            side_specs, sides = _tgmm_sides(side_gmems, prologue_axes, gmem_slice, m_i, tiles)
 
             def acc_scope(acc_ref):
                 def block_matmul(block_idx, lhs_smem, rhs_smem, *side_smems):
@@ -331,19 +317,8 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles
                             lhs_smem.dtype)
                         plgpu.commit_smem()
 
-                    # Dew: the first and last blocks of the group may hold a neighbour's rows, which
-                    # both operands zero by selection, so a neighbour's NaN or infinity stays out.
-                    @pl.when(block_idx == 0)
-                    def _():
-                        start_index = lax.rem(group_starts_gmem[g_i], block_k)
-                        _zero_rows(lhs_smem, rhs_smem, lambda rows: rows >= start_index, block_k, block_m,
-                                   block_n)
-
-                    @pl.when(block_idx == group_num_blocks_gmem[g_i] - 1)
-                    def _():
-                        last_index = lax.rem(group_ends_gmem[g_i] - 1, block_k)
-                        _zero_rows(lhs_smem, rhs_smem, lambda rows: rows <= last_index, block_k, block_m,
-                                   block_n)
+                    _zero_neighbours(lhs_smem, rhs_smem, block_idx, group_starts_gmem[g_i],
+                                     group_ends_gmem[g_i], group_num_blocks_gmem[g_i], tiles)
 
                     plgpu.wgmma(acc_ref, lhs_smem.transpose((1, 0)), rhs_smem)
                     if tiles.stages == 1:
@@ -370,15 +345,8 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles
                 return acc_ref[...]
 
             acc = pl.run_scoped(acc_scope, plgpu.WGMMAAccumulatorRef((block_m, block_n)))
-
-            # Dew: the output in its own dtype, an fp32 gradient above all.
-            @functools.partial(pl.run_scoped, o_smem=plgpu.SMEM((block_m, block_n), dtype=o_gmem.dtype))
-            def store_scope(o_smem):
-                o_smem[...] = acc.astype(o_smem.dtype)
-                plgpu.commit_smem()
-                plgpu.copy_smem_to_gmem(
-                    o_smem, o_gmem.at[g_i, pl.ds(m_i * block_m, block_m), pl.ds(n_i * block_n, block_n)])
-                plgpu.wait_smem_to_gmem(0, wait_read_only=True)
+            tile = o_gmem.at[g_i, pl.ds(m_i * block_m, block_m), pl.ds(n_i * block_n, block_n)]
+            _store_gradient_tile(acc, tile)
 
     kernel = plgpu.kernel(
         body,
@@ -390,6 +358,56 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles
     )
     return kernel(group_sizes, group_starts, group_ends, group_num_blocks, group_block_starts, lhs, rhs,
                   *prologue_operands)
+
+
+def _group_blocks(group_sizes: jax.Array, block_k: int) -> tuple:
+    """Each group's first row, end, count of `block_k`-row blocks, and its first block's first row."""
+    group_starts = jnp.concatenate([jnp.zeros(1, jnp.int32), jnp.cumsum(group_sizes)[:-1]]).astype(jnp.int32)
+    group_ends = jnp.cumsum(group_sizes).astype(jnp.int32)
+    group_block_starts = group_starts // block_k * block_k
+    group_block_ends = -(group_ends // -block_k) * block_k
+    return group_starts, group_ends, (group_block_ends - group_block_starts) // block_k, group_block_starts
+
+
+def _tgmm_sides(side_gmems, axes_of, gmem_slice, m_i, tiles: Tiles) -> tuple[list, list]:
+    """Dew: each prologue side operand's block spec and its view: its rows the group's slice as `lhs`'s,
+    wherever they are among its dimensions, its depth the tile's."""
+    block = {'rows': (tiles.block_k, lambda k_i: k_i), 'depth': (tiles.block_m, lambda k_i: m_i)}
+
+    def spec(axes):
+        return plgpu.BlockSpec(tuple(block[axis][0] for axis in axes),
+                               lambda k_i: tuple(block[axis][1](k_i) for axis in axes),
+                               delay_release=int(tiles.stages > 1))
+
+    views = [side.at[tuple(gmem_slice if axis == 'rows' else slice(None) for axis in axes)]
+             for side, axes in zip(side_gmems, axes_of, strict=True)]
+    return [spec(axes) for axes in axes_of], views
+
+
+def _zero_neighbours(lhs_smem, rhs_smem, block_idx, start, end, blocks, tiles: Tiles) -> None:
+    """Dew: the first and last blocks of a group may hold a neighbour's rows, which both operands zero by
+    selection, so a neighbour's NaN or infinity stays out."""
+    @pl.when(block_idx == 0)
+    def _():
+        start_index = lax.rem(start, tiles.block_k)
+        _zero_rows(lhs_smem, rhs_smem, lambda rows: rows >= start_index, tiles.block_k, tiles.block_m,
+                   tiles.block_n)
+
+    @pl.when(block_idx == blocks - 1)
+    def _():
+        last_index = lax.rem(end - 1, tiles.block_k)
+        _zero_rows(lhs_smem, rhs_smem, lambda rows: rows <= last_index, tiles.block_k, tiles.block_m,
+                   tiles.block_n)
+
+
+def _store_gradient_tile(acc, o_gmem) -> None:
+    """Dew: a kernel gradient's tile in the output's own dtype, an fp32 gradient above all."""
+    @functools.partial(pl.run_scoped, o_smem=plgpu.SMEM(acc.shape, dtype=o_gmem.dtype))
+    def store_scope(o_smem):
+        o_smem[...] = acc.astype(o_smem.dtype)
+        plgpu.commit_smem()
+        plgpu.copy_smem_to_gmem(o_smem, o_gmem)
+        plgpu.wait_smem_to_gmem(0, wait_read_only=True)
 
 
 def _rows_padded(array: jax.Array, axis: int = 0) -> jax.Array:

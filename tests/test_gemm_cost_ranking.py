@@ -62,7 +62,9 @@ def _launch(record):
     """The launch, its arguments and options of one swept record."""
     rows, depth, width, groups = SHAPES[record["shape"]]
     mosaic = record["implementation"] == "mosaic_gpu"
-    bf16 = lambda shape: jax.ShapeDtypeStruct(shape, jnp.bfloat16)  # noqa: E731
+    def bf16(shape):
+        return jax.ShapeDtypeStruct(shape, jnp.bfloat16)
+
     sizes = jax.ShapeDtypeStruct((groups,), jnp.int32)
     product = record["product"]
     if product == "forward":

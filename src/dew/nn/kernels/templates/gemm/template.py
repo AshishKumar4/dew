@@ -76,7 +76,7 @@ def gemm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None = None, *
                             (jnp.dtype(jnp.float32),), several=False, **plain)
             else:
                 acc = jnp.zeros(acc_shape, jnp.float32)
-            outs, pull = jax.vjp(lambda acc, *sides: _as_tuple(epilogue(acc, *sides)), acc, *epilogue_arrays)
+            outs, pull = jax.vjp(functools.partial(_tupled, epilogue), acc, *epilogue_arrays)
             d_acc, *d_epilogue = pull(tuple(c.astype(out.dtype)
                                             for c, out in zip(cotangents, outs, strict=True)))
             narrow = _passes_cotangent(epilogue, acc_shape, epilogue_arrays, dtypes, lhs.dtype)
@@ -214,11 +214,13 @@ def _passes_cotangent(epilogue, acc_shape: tuple, sides: tuple, dtypes: tuple, n
 def _epilogue_vjp(epilogue, acc_shape: tuple, sides: tuple):
     """The epilogue's VJP as a program of the accumulator, its side operands and its outputs'
     cotangents, and the cotangents' variables in it."""
+    tupled = functools.partial(_tupled, epilogue)
+
     def pulled(acc, sides, cotangents):
-        return jax.vjp(lambda acc, *sides: _as_tuple(epilogue(acc, *sides)), acc, *sides)[1](cotangents)
+        return jax.vjp(tupled, acc, *sides)[1](cotangents)
 
     acc = jax.ShapeDtypeStruct(acc_shape, jnp.float32)
-    outs = jax.eval_shape(lambda acc, *sides: _as_tuple(epilogue(acc, *sides)), acc, *sides)
+    outs = jax.eval_shape(tupled, acc, *sides)
     closed = jax.make_jaxpr(pulled)(acc, sides, outs)
     return closed, list(closed.jaxpr.invars[1 + len(sides):])
 
@@ -234,6 +236,11 @@ def _needed(jaxpr, outvars) -> set:
 
 def _as_tuple(outs) -> tuple:
     return outs if isinstance(outs, tuple) else (outs,)
+
+
+def _tupled(hook, *args) -> tuple:
+    """`hook`'s outputs as a tuple, one or several."""
+    return _as_tuple(hook(*args))
 
 
 def _grouped(lhs, rhs, group_sizes):
