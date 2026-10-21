@@ -733,9 +733,9 @@ def ssd_port_refusal(x, B, chunk_size: int) -> str | None:
     gives no tangent; inside a caller's `shard_map` that checks varying axes
     over operands that vary, where a Pallas call, which states no varying
     type for its results, cannot run; float64 operands, whose scan is the
-    reference math itself; and chunks that are not powers of two of at least
-    16, the smallest block Triton's dot takes. Head and state widths of any
-    size go to the kernels padded to such a width (`_ssd_ported`)."""
+    reference math itself; and head widths, state widths or chunks that are
+    not powers of two of at least 16, the smallest block Triton's dot takes."""
+    widths = (x.shape[-1], B.shape[-1], chunk_size)
     return first_refusal(
         (measured_kernel('ssd', 'xla') == 'pallas',
          "the device's target row (generation.TARGETS) does not name the port"),
@@ -745,8 +745,9 @@ def ssd_port_refusal(x, B, chunk_size: int) -> str | None:
          "a shard_map that checks varying axes holds the operands, and a Pallas call states no "
          "varying type for its results"),
         (jnp.dtype(x.dtype) != jnp.float64, "float64 operands, whose scan is the reference math itself"),
-        (chunk_size >= 16 and chunk_size & (chunk_size - 1) == 0,
-         f"chunk {chunk_size}; the port's chunks are powers of two of at least 16"),
+        (all(width >= 16 and width & (width - 1) == 0 for width in widths),
+         f"head width {widths[0]}, state {widths[1]} and chunk {widths[2]}; the port takes powers of "
+         "two of at least 16"),
     )
 
 
@@ -755,21 +756,12 @@ def _ssd_ported(x, dt, A, B, C, D, state, chunk_size: int, starts):
     `starts` (mamba_ssm's `seq_idx`). On a mesh it runs per shard
     (`manual_map`): rows where the rules split them, and heads with their
     groups where the head split divides the groups, the time axis whole;
-    off a GPU its kernels interpret, as the CPU suite runs them. A head width
-    or state width that is not a power of two of at least 16 is padded to
-    one with zero columns (Nemotron-H 4B's 80-wide heads), which change no
-    real output, state or gradient: every padded product is an exact zero.
-    The outputs are cut back."""
+    off a GPU its kernels interpret, as the CPU suite runs them."""
     interpret = not triton_runs()
     seq = None if starts is None else jnp.cumsum(starts, axis=1, dtype=jnp.int32)
-    width, size = x.shape[-1], B.shape[-1]
-    widths = tuple(max(16, 1 << (n - 1).bit_length()) for n in (width, size))
 
     def scan(x, dt, A, B, C, D, state, *seq):
-        x, state = _padded(x, 3, widths[0]), _padded(_padded(state, 2, widths[0]), 3, widths[1])
-        B, C = (_padded(t, 3, widths[1]) for t in (B, C))
-        out, final = mamba_ssd.ssd_scan(x, dt, A, B, C, D, state, *(seq or (None,)), chunk_size, interpret)
-        return out[..., :width], final[..., :width, :size]
+        return mamba_ssd.ssd_scan(x, dt, A, B, C, D, state, *(seq or (None,)), chunk_size, interpret)
 
     operands = (x, dt, A, B, C, D, state, *([] if seq is None else [seq]))
     rows, heads = grouped_heads(x.shape, B.shape[2])

@@ -14,7 +14,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact, assert_leaves_as_exact, float64_terms, ieee_fixture, widened
+from reference_error import assert_leaves_as_exact, float64_terms, ieee_fixture, widened
 from sharded import assert_runs_per_shard
 from tuned import each_config
 
@@ -186,31 +186,3 @@ def test_the_port_keeps_the_kernel_contract_on_a_mesh(axis, split):
     mesh = Mesh(np.asarray(jax.devices()[:2]), (axis,))
     with row_names_port():
         assert_runs_per_shard(run, operands, specs, mesh, truth)
-
-
-PADDED_SEEDS = 8
-"""The padded widths' declared draws (check 1), sized by `seeds_for` on armada."""
-
-
-def test_widths_off_the_power_of_two_grid_run_on_the_port_padded():
-    """Head and state widths that are no power of two (24 and 40, as Nemotron-H 4B's 80-wide heads) run
-    on the port, padded with zero columns and cut back (`recurrence_chunk._ssd_ported`): its output,
-    final state and gradients on par with the portable math's over the site's draws, from float64."""
-    shape = (2, 48, 4, 24, 2, 40)
-    operands, starts = scan_operands(*shape, documents=True)
-    # The cotangents' key is one no draw's seed reaches (`test_the_port_keeps_the_kernel_contract_on_a_mesh`).
-    keys = jax.random.split(jax.random.fold_in(jax.random.key(0), 1 << 20))
-    dy, dfinal = jax.random.normal(keys[0], operands[0].shape), jax.random.normal(keys[1], operands[6].shape)
-
-    def draw(seed):
-        return scan_operands(*shape, documents=True, seed=seed)[0]
-
-    def routed(cotangents, *, port: bool):
-        def run(*args):
-            with row_names_port(port=port):
-                return through(16, starts, *cotangents)(*args)
-        return jax.jit(run)
-
-    assert_as_exact(routed((dy, dfinal), port=True), routed((dy, dfinal), port=False), draw,
-                    "ssd padded widths", seeds=PADDED_SEEDS,
-                    truth_fn=routed(widened((dy, dfinal)), port=False))
