@@ -58,27 +58,45 @@ def dense(spans: KeySpans) -> jax.Array:
     return jax.vmap(lambda row: visible(spans, row, queries, keys))(jnp.arange(spans.start.shape[0]))
 
 
-def _document_extent(query_ids: jax.Array, key_ids: jax.Array) -> tuple[jax.Array, jax.Array]:
-    """The first key index and one past the last carrying each query's id, `[B, Q]` int32 each, the keys'
-    ids in any order; an id no key carries, or a call of no keys, gives an empty extent at 0."""
-    if key_ids.shape[-1] == 0:
-        empty = jnp.zeros(query_ids.shape, jnp.int32)
-        return empty, empty
+def _runs(query_ids: jax.Array | None, key_ids: jax.Array | None, batch: int, queries: int,
+          keys: int) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """Each row's key indices in document order `[B, K]`, and where each query's document runs in it,
+    `[lo, hi)` `[B, Q]` int32: a stable sort of the keys' ids (in any order), so a document's keys keep
+    their index order; without ids, every key in index order, one run."""
+    if key_ids is None:
+        order = jnp.broadcast_to(jnp.arange(keys, dtype=jnp.int32)[None, :], (batch, keys))
+        return order, jnp.zeros((batch, queries), jnp.int32), jnp.full((batch, queries), keys, jnp.int32)
 
-    def row(queries, keys):
-        order = jnp.argsort(keys, stable=True)
-        ordered = keys[order]
-        first = jnp.searchsorted(ordered, queries, side="left")
-        last = jnp.searchsorted(ordered, queries, side="right")
-        present = last > first
-        # A stable sort keeps equal ids in index order, so a document's first and last positions in
-        # the sorted keys are its smallest and largest key index; an index past the end clamps.
-        lowest = order[jnp.minimum(first, keys.shape[0] - 1)]
-        highest = order[jnp.maximum(last - 1, 0)] + 1
-        return (jnp.where(present, lowest, 0).astype(jnp.int32),
-                jnp.where(present, highest, 0).astype(jnp.int32))
+    def row(wanted, held):
+        order = jnp.argsort(held, stable=True)
+        ordered = held[order]
+        return (order.astype(jnp.int32), jnp.searchsorted(ordered, wanted, side="left").astype(jnp.int32),
+                jnp.searchsorted(ordered, wanted, side="right").astype(jnp.int32))
 
     return jax.vmap(row)(query_ids, key_ids)
+
+
+def _indexed(order: jax.Array, at: jax.Array, fill: int) -> jax.Array:
+    """`order[b, at[b, q]]` `[B, Q]`, `fill` where `order` has no entries."""
+    if order.shape[1] == 0:
+        return jnp.full(at.shape, fill, jnp.int32)
+    return jnp.take_along_axis(order, jnp.clip(at, 0, order.shape[1] - 1), axis=1)
+
+
+def _searched(values: jax.Array, lo: jax.Array, hi: jax.Array, wanted: jax.Array, side: str) -> jax.Array:
+    """`jnp.searchsorted` of each query's `wanted` `[B, Q]` within its own run `[lo, hi)` of `values`
+    `[B, K]`, ascending there: the first position whose value is not below it (`side='left'`) or above
+    it (`'right'`), `hi` where none."""
+    def step(_, bounds):
+        low, high = bounds
+        middle = (low + high) // 2
+        value = _indexed(values, middle, 0)
+        right = (value < wanted) if side == "left" else (value <= wanted)
+        live = low < high
+        return jnp.where(live & right, middle + 1, low), jnp.where(live & ~right, middle, high)
+
+    steps = max(values.shape[1], 1).bit_length()
+    return jax.lax.fori_loop(0, steps, step, (lo, hi))[0]
 
 
 def spans(queries: int, keys: int, batch: int, *, causal: bool = False, sliding_window: int | None = None,
@@ -89,8 +107,8 @@ def spans(queries: int, keys: int, batch: int, *, causal: bool = False, sliding_
     left aligned, as jax's `is_causal`); `sliding_window=w` keeps the keys `window_sides` gives, the w - 1
     before a query and it, or without causality those within w - 1 of it; `chunk=c` keeps a query to the
     keys of its own chunk of c places (`chunk_mask`, Llama 4's, under causality those before it), the
-    queries' `[B, Q]` and keys' `[B, K]` places `positions`, which count up by one within each document as
-    Dew's coordinates do, by default their indices; `segment_ids`, one `[B, S]` array or a
+    queries' `[B, Q]` and keys' `[B, K]` places `positions`, which never decrease along a document's
+    keys, as Dew's coordinates count them, by default their indices; `segment_ids`, one `[B, S]` array or a
     `CrossDocuments` (its keys in ascending id order, as it takes them), keeps each query to its
     document's keys, under causality or a window a cross call's queries aligned to their document's last
     keys (`aligned_places`); `lengths` `[B]` end each row's keys and `starts` `[B]` begin them. The ids
@@ -99,13 +117,16 @@ def spans(queries: int, keys: int, batch: int, *, causal: bool = False, sliding_
     from dew.nn.documents import CrossDocuments, aligned_places, document_ids
 
     index = jnp.broadcast_to(jnp.arange(queries, dtype=jnp.int32)[None, :], (batch, queries))
-    place, first = index, jnp.zeros((batch, queries), jnp.int32)
+    place = index
     start = jnp.zeros((batch, queries), jnp.int32)
     end = jnp.full((batch, queries), keys, jnp.int32)
-    query_ids = key_ids = None
+    query_ids, key_ids = (None, None) if segment_ids is None else document_ids(segment_ids)
+    order, run_lo, run_hi = _runs(query_ids, key_ids, batch, queries, keys)
+    present = run_hi > run_lo
     if segment_ids is not None:
-        query_ids, key_ids = document_ids(segment_ids)
-        first, last = _document_extent(query_ids, key_ids)
+        # A document's first and last keys in document order are its smallest and largest key index.
+        first = jnp.where(present, _indexed(order, run_lo, 0), 0)
+        last = jnp.where(present, _indexed(order, run_hi - 1, -1) + 1, 0)
         padding = query_ids == 0
         start = jnp.where(padding, 0, jnp.maximum(start, first))
         end = jnp.where(padding, 0, jnp.minimum(end, last))
@@ -121,15 +142,22 @@ def spans(queries: int, keys: int, batch: int, *, causal: bool = False, sliding_
         before, after = window_sides(causal, min(sliding_window, queries + keys + 1))
         start = jnp.maximum(start, place - before)
         end = jnp.minimum(end, place + after + 1)
-    if chunk is not None and keys > 0:
+    if chunk is not None:
         query_places, key_places = (
             (index, jnp.broadcast_to(jnp.arange(keys, dtype=jnp.int32)[None, :], (batch, keys)))
             if positions is None else (positions[0].astype(jnp.int32), positions[1].astype(jnp.int32)))
-        # The key index of the query's document's place 0: its first key's index less that key's place.
-        origin = first - jnp.take_along_axis(key_places, first, axis=1)
-        cut = origin + (query_places // chunk) * chunk
-        start = jnp.maximum(start, cut)
-        end = jnp.minimum(end, cut + chunk)
+        # The query's chunk's places `[low, low + chunk)`, its last place saturating at int32's largest;
+        # its document's keys there run together in document order, since their places never decrease
+        # along it, and their first and last key indices bound the span.
+        width = min(chunk, jnp.iinfo(jnp.int32).max)
+        low = query_places // width * width
+        top = low + jnp.minimum(width - 1, jnp.iinfo(jnp.int32).max - jnp.maximum(low, 0))
+        placed = jnp.take_along_axis(key_places, order, axis=1)
+        inside_lo = _searched(placed, run_lo, run_hi, low, "left")
+        inside_hi = _searched(placed, run_lo, run_hi, top, "right")
+        held = inside_hi > inside_lo
+        start = jnp.where(held, jnp.maximum(start, _indexed(order, inside_lo, 0)), start)
+        end = jnp.where(held, jnp.minimum(end, _indexed(order, inside_hi - 1, -1) + 1), 0)
     if lengths is not None:
         end = jnp.minimum(end, lengths.astype(jnp.int32)[:, None])
     if starts is not None:
@@ -143,7 +171,7 @@ class BlockMap:
     """The tiles a launch over `block_q` queries by `block_k` keys visits, both directions, from one
     `KeySpans`: query block i reads key blocks `[lo[b, i], hi[b, i])`, of which `[full_lo, full_hi)` are
     visible in every entry for its every query (the kernel skips the predicate there, where the ids
-    agree: `query_doc[b, i] == key_doc[b, j] > 0`, or the call has none); key block j is read by query
+    agree: `query_doc[b, i] == key_doc[b, j] != 0`, or the call has none); key block j is read by query
     blocks `[q_lo[b, j], q_hi[b, j])`, each of which still checks `lo <= j < hi`. Every visible entry lies
     in a visited tile; a visited tile may hold none (an envelope over a block's spans)."""
 
@@ -166,12 +194,13 @@ def _blocked(values: jax.Array, block: int, fill) -> jax.Array:
 
 
 def _uniform_doc(ids: jax.Array | None, block: int) -> jax.Array | None:
-    """Each block's document id where all its entries carry one (and it is not padding), else -1."""
+    """Each block's document id where all its entries carry that one, else 0, the padding id, which no
+    whole tile carries; a block running past the ids is padded with it."""
     if ids is None:
         return None
-    blocks = _blocked(ids, block, -1)
+    blocks = _blocked(ids, block, 0)
     first = blocks[..., :1]
-    return jnp.where(jnp.all(blocks == first, axis=-1) & (first[..., 0] > 0), first[..., 0], -1)
+    return jnp.where(jnp.all(blocks == first, axis=-1), first[..., 0], 0)
 
 
 def block_map(spans: KeySpans, block_q: int, block_k: int) -> BlockMap:

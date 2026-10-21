@@ -150,13 +150,14 @@ BLOCKS = [(16, 16), (32, 16), (16, 64), (64, 32)]
 
 
 def uniform_documents(ids, block: int) -> np.ndarray:
-    """Each block's document id `[B, N // block]` where every one of its tokens carries that one id and
-    it is no padding, else -1, from the call's ids themselves; a block running past them is -1."""
+    """Each block's document id `[B, N // block]` where every one of its tokens carries that one id,
+    else 0, the padding id, from the call's ids themselves; a block running past them is 0 unless its
+    tokens are all padding too."""
     ids = np.asarray(ids)
-    padded = np.full((ids.shape[0], -(-ids.shape[1] // block) * block), -1, ids.dtype)
+    padded = np.zeros((ids.shape[0], -(-ids.shape[1] // block) * block), ids.dtype)
     padded[:, :ids.shape[1]] = ids
     blocks = padded.reshape(ids.shape[0], -1, block)
-    return np.where((blocks == blocks[..., :1]).all(axis=-1) & (blocks[..., 0] > 0), blocks[..., 0], -1)
+    return np.where((blocks == blocks[..., :1]).all(axis=-1), blocks[..., 0], 0)
 
 
 @pytest.mark.parametrize("block_q, block_k", BLOCKS)
@@ -193,7 +194,7 @@ def test_a_block_map_visits_every_visible_entry_and_calls_a_tile_whole_only_wher
         for block in range(lo.shape[1]):
             assert lo[row, block] <= full_lo[row, block] <= full_hi[row, block] <= hi[row, block]
             for tile in range(full_lo[row, block], full_hi[row, block]):
-                if query_doc is not None and not (query_doc[row, block] == key_doc[row, tile] > 0):
+                if query_doc is not None and not (query_doc[row, block] == key_doc[row, tile] != 0):
                     continue
                 entries = padded[row, block * block_q:(block + 1) * block_q,
                                  tile * block_k:(tile + 1) * block_k]
@@ -202,7 +203,7 @@ def test_a_block_map_visits_every_visible_entry_and_calls_a_tile_whole_only_wher
     # Every tile whose entries are all visible, of one document where there are any, is in a whole range.
     tiles = padded.reshape(ROWS, padded.shape[1] // block_q, block_q, -1, block_k).all(axis=(2, 4))
     if query_doc is not None:
-        tiles &= (query_doc[:, :, None] == key_doc[:, None, :]) & (query_doc[:, :, None] > 0)
+        tiles &= (query_doc[:, :, None] == key_doc[:, None, :]) & (query_doc[:, :, None] != 0)
     assert whole == tiles.sum()
     if case is CASES["documents"] and (block_q, block_k) == (16, 16):
         assert whole > 0
@@ -366,11 +367,12 @@ def test_a_resumed_partial_is_on_par_with_one_pass_over_its_keys(case, hooks):
     """The softmax over a call's first keys, its output, maxima and denominators resumed as the initial
     state of one over the rest (`template.Initial`, its numerator the output times the denominator, a
     query that saw nothing resuming from no state), gives the output, maxima and denominators of one
-    pass over every key, on par from float64. The keys part at a tile's edge, as a split-KV launch
-    parts them."""
+    pass over every key, on par from float64. The queries and keys are drawn in halves, so every logit
+    is exact in fp32 however a product of the call's shape sums it, and the two arms differ only by the
+    resume's own arithmetic."""
     queries, keys = geometry(case)
     spans = template.spans(queries, keys, ROWS, **arguments(case))
-    edge = keys // 2 // 32 * 32
+    edge = keys // 2
     first, rest = halves(spans, edge)
     start = hooks_of(hooks, queries)
 
@@ -385,8 +387,13 @@ def test_a_resumed_partial_is_on_par_with_one_pass_over_its_keys(case, hooks):
     def whole(query, key, value):
         return template.reference(query, key, value, spans, start, residuals=True)
 
-    assert_as_exact(jax.jit(resumed), jax.jit(whole), drawing(queries, keys),
-                    f"template resumed {case} {hooks}", seeds=SEEDS)
+    draw_normal = drawing(queries, keys)
+
+    def draw(seed):
+        query, key, value = draw_normal(seed)
+        return jnp.round(2 * query) / 2, jnp.round(2 * key) / 2, value
+
+    assert_as_exact(jax.jit(resumed), jax.jit(whole), draw, f"template resumed {case} {hooks}", seeds=SEEDS)
 
 
 def test_hooks_are_a_pytree_whose_values_a_compiled_call_takes():
@@ -442,6 +449,40 @@ def test_document_ids_wider_than_int32_keep_their_documents_apart():
         ids = jnp.asarray([[1, 1, 2 ** 32 + 1, 2 ** 32 + 1, 2 ** 32]], jnp.int64)
         spans = template.spans(5, 5, 1, segment_ids=ids)
         np.testing.assert_array_equal(np.asarray(template.dense(spans)), np.asarray(document_mask(ids)))
+
+
+@pytest.mark.parametrize("ids, places, chunk", [
+    ([[1, 1, 0, 1, 1]], [[0, 1, 0, 2, 3]], 2),
+    ([[1, 2, 1, 2, 1, 2]], [[0, 0, 1, 1, 2, 2]], 2),
+    ([[1, 2, 2]], [[0, 0, 1]], 2 ** 31 - 1),
+], ids=["padding-inside", "interleaved", "widest"])
+def test_chunks_keep_the_keys_dews_chunk_mask_keeps_over_any_document_layout(ids, places, chunk):
+    """A call's own documents, padding inside one, two interleaved, or a chunk as wide as int32 allows:
+    the spans keep exactly the keys `document_mask & chunk_mask` keeps over the call's places, causal or
+    not."""
+    ids, places = jnp.asarray(ids, jnp.int32), jnp.asarray(places, jnp.int32)
+    tokens = ids.shape[1]
+    for causal in (False, True):
+        spans = template.spans(tokens, tokens, 1, causal=causal, chunk=chunk, positions=(places, places),
+                               segment_ids=ids)
+        expected = document_mask(ids) & chunk_mask(places, places, chunk)[:, 0]
+        if causal:
+            expected &= np.tril(np.ones((tokens, tokens), bool))
+        np.testing.assert_array_equal(np.asarray(template.dense(spans)), np.asarray(expected))
+
+
+def test_a_block_of_unsigned_ids_is_whole_only_within_one_document():
+    """Unsigned document ids: a block whose tokens carry two documents is tagged as none, so a block map
+    over interleaved documents calls no tile whole."""
+    ids = jnp.asarray([[1, 2, 1, 2, 1, 2, 1, 2]], jnp.uint32)
+    blocks = template.block_map(template.spans(8, 8, 1, segment_ids=ids), 2, 2)
+    np.testing.assert_array_equal(np.asarray(blocks.query_doc), uniform_documents(ids, 2))
+    np.testing.assert_array_equal(np.asarray(blocks.key_doc), uniform_documents(ids, 2))
+    seen = np.asarray(template.dense(template.spans(8, 8, 1, segment_ids=ids)))
+    for block in range(4):
+        for tile in range(int(blocks.full_lo[0, block]), int(blocks.full_hi[0, block])):
+            if blocks.query_doc[0, block] == blocks.key_doc[0, tile] != 0:
+                assert seen[0, 2 * block:2 * block + 2, 2 * tile:2 * tile + 2].all()
 
 
 def test_sinks_keep_their_own_wider_dtype():
