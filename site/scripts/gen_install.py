@@ -71,7 +71,8 @@ def main() -> None:
     parser.add_argument("--check", action="store_true", help="Check the generated blocks without writing them.")
     args = parser.parse_args()
     builds, index, python = facts()
-    pip = next(line for line in (REPO / "tools/pip.txt").read_text().splitlines() if line and not line.startswith("#"))
+    pip = next(line for line in (REPO / "tools/pip.txt").read_text().splitlines()
+               if line and not line.startswith("#"))
     shell = [f"python_min={python}", f"package_index={index}", f"pip_least='{pip}'"]
     table = ["| Build | CUDA | NVIDIA driver | GPU (SM) |", "|---|---|---|---|"]
     for build, driver, (major, minor), cuda in builds:
@@ -79,9 +80,10 @@ def main() -> None:
         table.append(f"| `{build}` | {cuda // 1000}.{cuda % 1000 // 10} or later | {driver} or later, or an older "
                      f"one under NVIDIA's cuda-compat | {major}.{minor} or later |")
     least = [f"Dew needs Python {python} or newer."]
-    advice = ["Use pip 26.2.2 or newer and uv 0.13.4 or newer: older ones trust the roots of eMudhra's compromised "
-              "certificate authorities (October 2026). Update pip from its wheel by hash, so the update holds whatever "
-              "the older pip trusts, and uv through the system's certificates once they are updated:", "",
+    advice = ["Use pip 26.2.2 or newer and uv 0.13.4 or newer: older ones trust the roots of eMudhra's "
+              "compromised certificate authorities (October 2026). Update pip from its wheel by hash, so "
+              "the update holds whatever the older pip trusts, and uv through the system's certificates "
+              "once they are updated:", "",
               "```bash", f'python -m pip install "{pip}"', "UV_SYSTEM_CERTS=true uv self update", "```"]
     stale = []
     for path, blocks in ((REPO / "site/public/install.sh", ((SHELL, shell),)),
