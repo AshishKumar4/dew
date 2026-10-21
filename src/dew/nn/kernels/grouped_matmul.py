@@ -32,6 +32,7 @@ from jax._src.pallas.mosaic_gpu import (
     core as plgpu_core,  # the lowering's semantics (`_lowers_on_mosaic`)
     lowering as mosaic_gpu_lowering,
 )
+from jax.core import ShapedArray
 from jax.experimental.pallas import mosaic_gpu as plgpu
 from jax.extend import core as jax_core
 
@@ -158,9 +159,9 @@ def _transcendentals(hook, tile, sides) -> float:
     if hook is None:
         return 0.0
     jaxpr = jax.make_jaxpr(hook)(tile, *sides)
-    counted = sum(math.prod(var.aval.shape) for equation in _equations(jaxpr.jaxpr)
-                  if equation.primitive.name in TRANSCENDENTALS for var in equation.outvars
-                  if isinstance(var.aval, jax.core.ShapedArray))
+    avals = (var.aval for equation in _equations(jaxpr.jaxpr) if equation.primitive.name in TRANSCENDENTALS
+             for var in equation.outvars)
+    counted = sum(math.prod(aval.shape) for aval in avals if isinstance(aval, ShapedArray))
     return counted / math.prod(tile.shape)
 
 
