@@ -125,8 +125,8 @@ def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles,
     with `transpose_rhs` `[groups, width, depth]`: `[rows, width]` in `out_dtype`, the rows past the
     routed ones zero. The depth must divide by `tiles.block_k` and the width by `tiles.block_n`.
 
-    Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of `lhs` in registers,
-    which the warpgroup MMA takes as its left operand; `epilogue(acc, *side_tiles)` each fp32
+    Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of `lhs` in its shared
+    memory stage before the warpgroup MMA reads it; `epilogue(acc, *side_tiles)` each fp32
     accumulator tile, returning one output or a tuple of them (`out_dtypes`). A side operand's
     dimensions follow the launch axes its `*_axes` entry names, 'rows' and 'depth' for the prologue's,
     'rows' and 'columns' for the epilogue's, each brought to shared memory by TMA."""
@@ -170,15 +170,13 @@ def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles,
 
             def acc_scope(acc_ref):
                 def step(_, lhs_smem, rhs_smem, *side_smems):
-                    rhs = rhs_smem.transpose((1, 0)) if transpose_rhs else rhs_smem
-                    if prologue is None:
-                        plgpu.wgmma(acc_ref, lhs_smem, rhs)
-                        return
-                    # Dew: the prologue in registers, its tile the MMA's left operand; the MMA done before
-                    # the next step's prologue reuses the registers.
-                    tile = prologue(lhs_smem[...], *(side[...] for side in side_smems)).astype(lhs.dtype)
-                    plgpu.wgmma(acc_ref, tile, rhs)
-                    plgpu.wgmma_wait(0)
+                    if prologue is not None:
+                        # Dew: the prologue rewrites the stage of `lhs` in place, which the one warpgroup
+                        # owns, before the MMA reads it.
+                        lhs_smem[...] = prologue(lhs_smem[...], *(side[...] for side in side_smems)).astype(
+                            lhs_smem.dtype)
+                        plgpu.commit_smem()
+                    plgpu.wgmma(acc_ref, lhs_smem, rhs_smem.transpose((1, 0)) if transpose_rhs else rhs_smem)
 
                 # Dew: the unrouted rows' tiles multiply nothing, their accumulator stays zero, and a grid
                 # slot past the last tile no group has (GroupInfo's group 0, no rows) multiplies nothing.
