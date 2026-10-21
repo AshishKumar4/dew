@@ -831,9 +831,7 @@ def _checked(model: nn.Module, params: Variables, inputs: ModelInputs, keys: jax
     """
 
     def run(params, inputs, keys, budget, transforms, stopping, strategy):
-        from dew.inference.projections import served
-
-        return _generate(model, served(model, params), inputs, keys, trips, budget, pad_id, n,
+        return _generate(model, params, inputs, keys, trips, budget, pad_id, n,
                          transforms, stopping, strategy)
 
     return checkify.checkify(run, errors=checkify.user_checks)(
