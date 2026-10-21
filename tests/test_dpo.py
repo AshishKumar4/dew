@@ -16,7 +16,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact, declared_seeds, indexed_recording
+from reference_error import assert_as_exact, declared_seeds, indexed_recording, recording
 from rl_support import TinyHead
 from steady_state import steady_state
 
@@ -37,7 +37,7 @@ WIDTH = 6
 
 @pytest.fixture(scope="module")
 def reference():
-    return dict(np.load(FIXTURE, allow_pickle=True))
+    return recording(FIXTURE)
 
 
 def trl_layout_loss(policy_logits, fixture):
