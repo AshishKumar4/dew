@@ -43,13 +43,8 @@ from tuned import each_config, launches, timed
 
 from dew.nn.inputs import AttentionMetadata, MixerCall, coordinates
 from dew.nn.kernels import tuning
-from dew.nn.kernels.recurrence_chunk import (
-    chunk_decay,
-    chunk_delta_rule,
-    chunk_gated_delta_rule,
-    fla_rule,
-    strictly_lower_inverse,
-)
+from dew.nn.kernels.recurrence_algebra import chunk_decay, strictly_lower_inverse
+from dew.nn.kernels.recurrence_chunk import chunk_delta_rule, chunk_gated_delta_rule, fla_rule
 from dew.nn.linear import (
     GatedDeltaNet,
     _masked_conv1d,

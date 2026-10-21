@@ -7,8 +7,8 @@ Per head, over a state `S` `[Dk, Dv]`, a token updates and reads
 
 as the decode step does (`recurrence.step`), its form the same `recurrence.Hooks`. Within a chunk of
 `C` tokens the dependencies resolve in matrix form: the decay between two positions is one
-exponential of their prefixes' difference (`chunk_decay`), the delta rule's corrections one strictly
-lower inverse (`strictly_lower_inverse`, fla's WY form), and only the memory crosses chunks
+exponential of their prefixes' difference (`recurrence_algebra.decays`), the delta rule's corrections
+one strictly lower inverse (`recurrence_algebra.factor`, fla's WY form), and only the memory crosses chunks
 (`xla_chunk_states`). Without the delta rule (`delta=False`, R = 0, Mamba2's SSD and the gated
 linear attentions) the inverse is the identity and nothing is corrected.
 
@@ -27,15 +27,14 @@ import functools
 
 import jax
 import jax.numpy as jnp
-from jax.custom_derivatives import linear_call
 from jax.sharding import PartitionSpec as P
 
 from dew.nn.attention import FORWARD_MODE, repeat_kv_heads
 from dew.nn.inputs import cu_seqlens
-from dew.nn.precision import at_least_fp32, compensated_add, compensated_difference
+from dew.nn.precision import at_least_fp32
 from dew.nn.sharding import grouped_heads, manual_map, rows_like
 
-from . import fla_gdn, fla_kda, generation, mamba_ssd, recurrence
+from . import fla_gdn, fla_kda, generation, mamba_ssd, recurrence, recurrence_algebra as algebra
 from .generation import Refusal, first_refusal, measured_kernel, ran_kernel, refused, route, triton_runs
 from .ssd import ssd_chunk_scan, ssd_kernel_platform
 
@@ -46,164 +45,9 @@ recurrent form agree at any size; the size only trades memory for
 parallelism, and 64 is what the reference's kernels assume."""
 
 
-def _cumulated(g, documents=None):
-    """`g` `[..., C, F]` cumulated over its C positions as a compensated pair `(hi, lo)`
-    (`compensated_add`), restarting at each of packed `documents`' first positions."""
-    zeros = jnp.zeros_like(g)
-    if documents is None:
-        return jax.lax.associative_scan(compensated_add, (g, zeros), axis=g.ndim - 2)
-
-    def segmented(left, right):
-        (left_start, *left_sum), (right_start, *right_sum) = left, right
-        total = compensated_add(left_sum, right_sum)
-        restarted = (jnp.where(right_start, kept, summed)
-                     for kept, summed in zip(right_sum, total, strict=True))
-        return left_start | right_start, *restarted
-
-    changed = jnp.concatenate([jnp.ones_like(documents[..., :1, :], bool),
-                               documents[..., 1:, :] != documents[..., :-1, :]], axis=-2)
-    _, hi, lo = jax.lax.associative_scan(segmented, (jnp.broadcast_to(changed, g.shape), g, zeros),
-                                         axis=g.ndim - 2)
-    return hi, lo
-
-
-@jax.custom_jvp
-def chunk_decay(g, documents=None):
-    """Cumulate per-chunk log decays and build the pairwise decay between positions.
-
-    `g` is `[..., C, F]`: the C positions of a chunk and F decay channels.
-    Returns the inclusive cumulative sum `gc` over C, `[..., C, F]`, and
-    `decay[..., s, t, f] = exp(gc[s, f] - gc[t, f])` for s >= t, zero above
-    the diagonal, `[..., C, C, F]`.
-
-    The references subtract two fp32 cumulative sums, so every exponent
-    carries the rounding of the chunk's whole accumulated magnitude, which
-    exp turns into a relative error on every decay. Here the cumulative sum
-    is compensated (`compensated_add`) and the difference takes both
-    halves, so an exponent is as precise as its own range. On
-    tests/fixtures/hf/kimi-linear-tiny that error dominated the gradient:
-    over 16 orderings of the residual stream (an exact symmetry, so only the
-    rounding moves) the updated logits sat at an RMS 2.04 times the
-    reference's distance from float64 with plain sums on CPU and 1.83 on an
-    RTX 4080, and 0.92 and 0.72 with these, against the reference's own
-    0.98. Summing each pair's range instead (Mamba-2's `segment_sum`) is as
-    exact and made a KDA layer's forward and backward 25% slower; this
-    costs about 1% (on an RTX 4080, Kimi Linear's KDA layer over 1024 tokens
-    47.6 against 48.0 ms, Qwen3.5-0.8B's gated delta net over 4096 16.3
-    against 16.5).
-
-    The gradient is the pairs' own (`_chunk_decay_tangent`): differentiating
-    the difference of two prefixes sums a pair's cotangent into its two ends
-    with opposite signs, and the decay gradient, a row sum less a column sum
-    of the chunk's pairs, cancelled to fp32 noise wherever the prefixes ran
-    long.
-
-    With packed `documents` `[..., C, 1]` (each position's document within
-    its chunk), the sum restarts at each document's first position and pairs
-    of positions in different documents weigh zero, masked before exp: a
-    document's decays are its own tokens' alone, the ones it computes run by
-    itself.
-    """
-    hi, lo = _cumulated(g, documents)
-    chunk_size = hi.shape[-2]
-    inclusive = jnp.tril(jnp.ones((chunk_size, chunk_size), jnp.bool_))[..., None]
-    if documents is not None:
-        inclusive = inclusive & (documents[..., :, None, :] == documents[..., None, :, :])
-    diff = compensated_difference((hi[..., :, None, :], lo[..., :, None, :]),
-                                  (hi[..., None, :, :], lo[..., None, :, :]))
-    # Masked before exp, as the references do. The unused positive
-    # differences can overflow, and an outer where alone leaves 0 * inf in
-    # the decay gradient.
-    diff = jnp.where(inclusive, diff, 0.0)
-    return hi, jnp.where(inclusive, jnp.exp(diff), 0.0)
-
-
-def _ranged(decay, dg):
-    """The decay's tangent: each pair's decay times its range's tangent, `dg` summed over `(t, s]`,
-    pair by pair; a pair across documents weighs zero."""
-    width = dg.shape[-2]
-    strict = jnp.tril(jnp.ones((width, width), bool), -1)[..., None]
-    return decay * jnp.cumsum(jnp.where(strict, dg[..., :, None, :], 0.0), axis=-3)
-
-
-def _ranged_transpose(decay, cotangent):
-    """`_ranged`'s transpose: position i's gradient is the weighted cotangent of every pair whose
-    range holds it, `sum_{s >= i} sum_{t < i} cotangent[s, t] decay[s, t]`, two cumulative sums
-    of the chunk's pairs, no pair entering any sum it does not span."""
-    width = decay.shape[-3]
-    strict = jnp.tril(jnp.ones((width, width), bool), -1)[..., None]
-    weighted = jnp.cumsum(jnp.where(strict, cotangent * decay, 0.0), axis=-2)
-    before = jnp.concatenate([jnp.zeros_like(weighted[..., :, :1, :]), weighted[..., :, :-1, :]], axis=-2)
-    after = jnp.flip(jnp.cumsum(jnp.flip(before, axis=-3), axis=-3), axis=-3)
-    return jnp.moveaxis(jnp.diagonal(after, axis1=-3, axis2=-2), -1, -2)
-
-
-@chunk_decay.defjvp
-def _chunk_decay_tangent(primals, tangents):
-    """The pairs' own tangent, in forward and reverse mode alike: the decay's is each pair's range
-    (`_ranged`), and its transpose sums only the pairs spanning a position (`_ranged_transpose`).
-    On Qwen3.5-tiny's packed decision rows (tests/test_decision_packing.py, joint) the prefix
-    difference's gradient put the gated delta net's A_log 3.58 and dt_bias 4.49 times as far from
-    float64 as the rows run alone, against 2 allowed; with this and the memory write's decay row
-    (`xla_chunk_states`) every backbone leaf sat at 0.77-0.93, on six CPUs of two models. It costs
-    the chunked rule's forward and backward 4% with a decay per head and 26% with one per key
-    dimension on CPU (2 x 4096 x 16 heads of 128: 1.508 against 1.564 s; 2 x 1024 x 8 heads,
-    1.936 against 2.440 s)."""
-    g, documents = primals
-    dg, _ = tangents
-    gc, decay = chunk_decay(g, documents)
-    return (gc, decay), (_cumulated(dg, documents)[0], linear_call(_ranged, _ranged_transpose, decay, dg))
-
-
-def strictly_lower_inverse(a):
-    """Return (I - A)^-1 for strictly lower triangular `a` `[..., C, C]`, the
-    chunked delta rules' `attn[i, :i] += sum_k attn[i, k] attn[k, :i]` loop.
-
-    Built from its diagonal blocks, doubling their size: with X1 and X2 the
-    inverses of two neighbouring blocks, their union's is X1 and X2 on the
-    diagonal and X2 A21 X1 below. Each block is a diagonal block of the
-    whole inverse, so every product stays the size of its entries. The
-    series I + A + A^2 + ..., summed by doubling powers of A, did not: on
-    Qwen3.5-0.8B's aligned keys the powers grew as binomials (1.8e17 at C=64)
-    and cancelled to an inverse whose entries are at most 1, 1e24 off in
-    fp32. The first level is written out rather than as products with
-    one-wide identity blocks: XLA TPU rewrites a matmul by a broadcast
-    identity into a dilated convolution whose fusion fails register
-    allocation on a v6e (`live_range_finder.cc:57 RET_CHECK`, jax 0.11.2).
-    """
-    chunk_size = a.shape[-1]
-    if chunk_size == 1:
-        return jnp.ones_like(a)
-    width = 1 << (chunk_size - 1).bit_length()
-    if width != chunk_size:  # zero rows and columns extend it by the identity
-        pad = [(0, 0)] * (a.ndim - 2) + [(0, width - chunk_size)] * 2
-        return strictly_lower_inverse(jnp.pad(a, pad))[..., :chunk_size, :chunk_size]
-    lead = a.shape[:-2]
-
-    def diagonal_blocks(size):
-        """`a`'s `[..., width // size, size, size]` blocks on the diagonal."""
-        count = width // size
-        blocked = a.reshape(*lead, count, size, count, size)
-        return jnp.moveaxis(jnp.diagonal(blocked, axis1=-4, axis2=-2), -1, -3)
-
-    # Two-wide blocks: [[1, 0], [a, 1]].
-    below = diagonal_blocks(2)[..., 1, 0]
-    one, zero = jnp.ones_like(below), jnp.zeros_like(below)
-    inverse = jnp.stack([jnp.stack([one, zero], -1), jnp.stack([below, one], -1)], -2)
-    size = 2
-    while size < width:
-        pairs = inverse.reshape(*lead, width // (2 * size), 2, size, size)
-        first, second = pairs[..., 0, :, :], pairs[..., 1, :, :]
-        joined = second @ diagonal_blocks(2 * size)[..., size:, :size] @ first
-        top = jnp.concatenate([first, jnp.zeros_like(first)], -1)
-        inverse = jnp.concatenate([top, jnp.concatenate([joined, second], -1)], -2)
-        size *= 2
-    return inverse.reshape(*lead, width, width)
-
-
 def xla_chunk_states(key, k_cumdecay, out_vals, gc, last_decay, state, kept=None):
     """The memory crossing chunks, the one sequential part of the chunked
-    rule, as a `lax.scan`: per chunk the reference's corrected values
+    rule, as a `lax.scan` over the algebra's `carry`: per chunk the reference's corrected values
     `v_new = value - k_cumdecay @ S` and its write `S * exp(gc[-1]) +
     (k * exp(gc[-1] - gc))^T @ v_new` (modeling_qwen3_next.py:439-446).
 
@@ -216,7 +60,7 @@ def xla_chunk_states(key, k_cumdecay, out_vals, gc, last_decay, state, kept=None
     `[B, H, NC, C, Dv]` and the state leaving the last chunk.
 
     The write weighs each token by `last_decay` `[B, H, NC, C, D]`, the last
-    row of the chunk's pairwise decay (`chunk_decay`'s `exp(gc[-1] - gc)`):
+    row of the chunk's pairwise decay (`recurrence_algebra.decays`' `exp(gc[-1] - gc)`):
     its exponent compensated as every pair's is, where the prefix's rounded
     half alone put a long chunk's write off by its whole sum's rounding, and
     zero for every token of a packed chunk's earlier documents, which the
@@ -224,25 +68,11 @@ def xla_chunk_states(key, k_cumdecay, out_vals, gc, last_decay, state, kept=None
     marks the chunks no document starts in, the only ones the memory they
     entered passes through.
     """
-    def one_chunk(s, step):
-        k_i, kd_i, v_i, gc_i, last_i, kept_i = step
-        v_corrected = v_i - kd_i @ s
-        return (s * jnp.swapaxes(jnp.exp(gc_i[..., -1:, :]), -1, -2) * kept_i
-                + jnp.swapaxes(k_i * last_i, -1, -2) @ v_corrected, (s, v_corrected))
     kept = jnp.ones((1, 1, gc.shape[2], 1, 1), gc.dtype) if kept is None else kept.astype(gc.dtype)
     final, (entered, corrected) = jax.lax.scan(
-        one_chunk, state,
+        algebra.carry, state,
         tuple(jnp.moveaxis(x, 2, 0) for x in (key, k_cumdecay, out_vals, gc, last_decay, kept)))
     return jnp.moveaxis(entered, 0, 2), jnp.moveaxis(corrected, 0, 2), final
-
-
-def _paired(left, right, decay):
-    """`sum_d left[s, d] right[t, d] decay[s, t, d]` within each chunk,
-    `[..., C, C]`: one decay channel scales the product after it, one per key
-    dimension weighs each term of it."""
-    if decay.shape[-1] == 1:
-        return (left @ jnp.swapaxes(right, -1, -2)) * decay[..., 0]
-    return jnp.einsum('...sd,...td,...std->...st', left, right, decay)
 
 
 def chunk_delta_rule(query, key, value, g, beta, state=None, chunk_size: int = CHUNK_SIZE, *, starts=None,
@@ -253,7 +83,7 @@ def chunk_delta_rule(query, key, value, g, beta, state=None, chunk_size: int = C
     `(output [B, S, H, Dv], final_state [B, H, Dk, Dv])`, the output in the
     queries', keys' and values' common dtype and the memory in at least fp32,
     as the port returns them (`fla_rule`), computed in at least fp32. The
-    references' sequential correction is the inverse `strictly_lower_inverse`
+    references' sequential correction is the inverse `recurrence_algebra.factor`
     builds from its diagonal blocks.
 
     Only the memory crosses chunks, so only its recurrence runs chunk after
@@ -271,7 +101,7 @@ def chunk_delta_rule(query, key, value, g, beta, state=None, chunk_size: int = C
     returned in `dtype` where one is given.
 
     `starts` `[B, S]` marks packed documents' first tokens, each from a zero
-    memory: within a chunk each document's decays are its own (`chunk_decay`),
+    memory: within a chunk each document's decays are its own (`recurrence_algebra.decays`),
     a token reads the memory the chunk entered only in the document that
     memory belongs to, and the chunk's write keeps only its last document's
     tokens (the decay's last row is zero for the others), the memory it
@@ -308,20 +138,12 @@ def chunk_delta_rule(query, key, value, g, beta, state=None, chunk_size: int = C
     # `g = g.cumsum(dim=-1)` (modeling_qwen3_next.py:417), and the decay
     # `exp(gc[s] - gc[t])` between positions s >= t, zero above the diagonal:
     # [B, H, NC, C, D], [B, H, NC, C, C, D].
-    gc, decay = chunk_decay(chunks(g), document)
-    # The mask is strictly lower (tril, -1): the reference's masked_fill
-    # zeroes the diagonal too.
-    strict = jnp.tril(jnp.ones((chunk_size, chunk_size), jnp.bool_), -1)
+    gc, decay = algebra.decays(chunks(g), document)
     entering = jnp.exp(gc) if first is None else jnp.exp(gc) * first
-    if delta:
-        attn = jnp.where(strict, -_paired(kb_c, k_c, decay), 0.0)
-        # The reference's `attn + I` operator after its row correction loop.
-        inv = strictly_lower_inverse(attn)
-        out_vals = inv @ vb_c  # the reference's `value = attn @ v_beta`
-        k_cumdecay = inv @ (kb_c * entering)
-    else:
-        # Nothing is corrected: each token writes its gated value, and the memory corrects none.
-        out_vals, k_cumdecay = vb_c, jnp.zeros_like(kb_c)
+    # The reference's `attn + I` operator after its row correction loop; without the delta rule nothing
+    # is corrected, and each token writes its gated value.
+    inverse = algebra.factor(algebra.intra(k_c, kb_c, decay)) if delta else None
+    k_cumdecay, out_vals = algebra.apply(inverse, kb_c, vb_c, entering)
 
     # A zero state like the values: inside a shard_map that checks varying axes the chunk loop's
     # carry varies as the operands it takes in do, and under an Explicit axis its rows are placed as
@@ -338,7 +160,7 @@ def chunk_delta_rule(query, key, value, g, beta, state=None, chunk_size: int = C
                                                    kept)
     # decay is zero above the diagonal, so this is the reference's inclusive
     # lower `masked_fill(triu(1), 0)`.
-    core = (q_c * entering) @ entered + _paired(q_c, k_c, decay) @ v_corrected
+    core = algebra.readout(q_c, entering, entered, k_c, decay, v_corrected)
     # core: [B, H, NC, C, Dv] -> [B, H, NC*C, Dv] -> [B, S, H, Dv]
     core = jnp.moveaxis(core.reshape(B, H, T, Dv), 1, 2)[:, :S]
     return core.astype(dtype), state
