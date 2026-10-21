@@ -529,6 +529,13 @@ class ChunkBwdDhu(_Launch):
     PICKS = _picks(Tiles(0, 64, 4, 3), small=Tiles(0, 64, 4, 1), wide_fp32=Tiles(0, 64, 4, 1),
                    small_fp32=Tiles(0, 32, 4, 1))
 
+    def _tiles(self, ba, tiles: Tiles) -> Tiles:
+        """The picks' tiles for the call, one stage past `WIDEST` keys: the memory gradient is held a
+        64-key slice at a time, so 256-wide keys stage twice 128-wide ones', and three stages took
+        271,368 shared bytes of an A100's 166,912 and an H100's 232,448 in 16 bits."""
+        tiles = super()._tiles(ba, tiles)
+        return dataclasses.replace(tiles, stages=1) if ba.arguments['k'].shape[-1] > WIDEST else tiles
+
     def _fwd(self, q: jax.Array, k: jax.Array, w: jax.Array, g: jax.Array, dht: jax.Array,
              do: jax.Array, dv: jax.Array, chunk_spans: jax.Array, sequence_spans: jax.Array, *, scale: float,
              chunk: int, interpret: bool, config: Tiles, return_residuals: bool = False):
