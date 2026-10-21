@@ -2,6 +2,7 @@
 from its record compiles to the same plan; one no record carries whole is `Unrecorded`, with the
 reason."""
 
+import dataclasses
 import json
 from dataclasses import dataclass
 
@@ -216,13 +217,20 @@ def test_fitted_reads_training_and_validation_with_the_runs_data_seed():
     assert first[0] != second[0] and first[1] != second[1]
 
 
-def _records_of(dataset, steps: int = 3):
-    """The first `steps` batches of `dataset` compiled by index, as plain lists."""
+def _plain(value):
+    """A batch's value as plain lists, a dataclass of arrays (a row's coordinates) field by field."""
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        return {field.name: _plain(getattr(value, field.name)) for field in dataclasses.fields(value)}
+    return np.asarray(value).tolist()
+
+
+def _records_of(dataset, steps: int = 3, read: str = "indexed"):
+    """The first `steps` batches of `dataset` compiled for `read`, as plain lists."""
     loading = Loading(workers=0, threads=1, read_buffer=1)
-    reader = compile(dataset, read="indexed", loading=loading).train(DataPartition())
+    reader = compile(dataset, read=read, loading=loading).train(DataPartition())
     try:
         batches = (next(reader) for _ in range(steps))
-        return [{name: np.asarray(value).tolist() for name, value in batch.items()} for batch in batches]
+        return [{name: _plain(value) for name, value in batch.items()} for batch in batches]
     finally:
         reader.close()
 
@@ -236,9 +244,15 @@ def _cached(tmp_path):
     return _documents().map(Tagged(1)).cache(str(tmp_path / "cache")).shuffle(0).repeat().batch(2)
 
 
+def _phased():
+    def windows(start):
+        return _documents(start).pipe(presets.lm, "byte", seq_len=8, batch=None, pack=None)
+
+    return phases((windows(0), 2), (windows(8), None)).shuffle(0).repeat().batch(2)
+
+
 ROUND_TRIPS = {
-    "phases": lambda tmp_path: phases((_lm(_documents().shuffle(0).repeat()), 2),
-                                      (_lm(_documents(8).shuffle(1).repeat()), None)),
+    "phases": lambda tmp_path: _phased(),
     "a holdout": lambda tmp_path: _lm(_documents().holdout(records=2)[0].shuffle(0).repeat()),
     "a cache": _cached,
     "a prompt width measured": lambda tmp_path: _prompts(),
@@ -262,13 +276,15 @@ def test_each_part_of_a_chain_reads_back_from_its_record(tmp_path, name):
     chain = ROUND_TRIPS[name](tmp_path)
     written = encode(chain)
     assert not isinstance(written, Unrecorded), written
-    assert _records_of(decode(json.loads(json.dumps(written)))) == _records_of(chain)
+    # A measured width is measured by a memory read.
+    read = "memory" if name == "a prompt width measured" else "indexed"
+    assert _records_of(decode(json.loads(json.dumps(written))), read=read) == _records_of(chain, read=read)
 
 
 def test_a_published_generation_reads_back_from_its_record(tmp_path):
     """A generation published from documents stands in for its steps: recorded and read back, it
     reads the same batches."""
-    from dew.data import Cache
+    from dew.data.cache import Cache
     from dew.data.compile import publish
 
     generation = publish(_documents().map(Tagged(1)), Cache(str(tmp_path / "cache")), read="indexed")
@@ -293,8 +309,16 @@ def test_a_record_naming_a_class_no_store_is_refused_before_it_is_built(tmp_path
 def test_an_override_of_a_positional_setting_replaces_it(tmp_path):
     """The images preset's size given in its call's place, overridden: the chain read back makes
     images of the new size; a setting of the wrong type, or the dataset the call reads, is refused."""
-    rows = Memory([{"image": np.full((6, 6, 3), index, np.uint8), "label": index} for index in range(4)])
-    written = encode(rows.repeat().pipe(presets.images, 4, batch=2))
+    import cv2
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from dew.data import Files
+
+    images = [{"image": cv2.imencode(".png", np.full((6, 6, 3), index, np.uint8))[1].tobytes(),
+               "label": index} for index in range(4)]
+    pq.write_table(pa.Table.from_pylist(images), tmp_path / "images.parquet")
+    written = encode(Files(str(tmp_path / "images.parquet")).repeat().pipe(presets.images, 4, batch=2))
     assert not isinstance(written, Unrecorded)
     larger = decode(override(written, "images.size", 5))
     assert np.asarray(next(iter(larger))["image"]).shape[1:] == (5, 5, 3)
