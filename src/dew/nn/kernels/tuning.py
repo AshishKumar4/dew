@@ -111,6 +111,19 @@ type Rebuilt = Hashable | list | dict
 """What `decoded` rebuilds: an op's field, a launch's argument or a config."""
 
 
+class Unpinnable(ValueError):
+    """A config pinned for a kernel (`pinned`) that a launch of it cannot take: not in its space at the
+    launch's key, or past a bound its legality checks (`KernelOp.unpinnable`)."""
+
+    def __init__(self, kernel: str, config: Hashable, reason: str):
+        super().__init__(f"{kernel} cannot take the pinned config {config}: {reason}")
+        self.kernel, self.config, self.reason = kernel, config, reason
+
+    def __reduce__(self):
+        # Rebuilt from its own fields, as a pickle or a process boundary carries it.
+        return type(self), (self.kernel, self.config, self.reason)
+
+
 class Unreadable(ValueError):
     """A stored launch or timing this checkout cannot rebuild: another checkout's kernel, its fields or
     its config's, or JSON this module did not write. `_read` keeps such an entry as it is."""
@@ -405,15 +418,25 @@ class KernelOp(tokamax.Op):
 
     def chosen(self, ba: tokamax.BoundArguments) -> Hashable:
         """The config a launch of `ba` takes where it traces now: the op's own `config` where it carries
-        one, else a config pinned for its kernel that its key's space holds (`pinned`), else its pick
-        (`_pick`, else `_nearest`), else its own shapes' heuristic."""
+        one, else a config pinned for its kernel (`pinned`, raising `Unpinnable` where its key's legal
+        configs do not hold it), else its pick (`_pick`, else `_nearest`), else its own shapes'
+        heuristic."""
         return self.config if self.config is not None else self._chosen(ba, self.keyed(ba))
 
     def _chosen(self, ba: tokamax.BoundArguments, keyed: tokamax.BoundArguments) -> Hashable:
-        pin = dict(cache.KERNEL_PINS.value).get(type(self))
+        pins = dict(cache.KERNEL_PINS.value)
+        if type(self) in pins:
+            pin = pins[type(self)]
+            if pin not in keyed.autotuning_configs:
+                raise Unpinnable(type(self).__name__, pin, self.unpinnable(keyed, pin))
+            return pin
         pick = _pick(keyed) or self._nearest(keyed)
-        return (pin if pin in keyed.autotuning_configs
-                else ba.heuristics_config if pick is None else pick.fastest_config)
+        return ba.heuristics_config if pick is None else pick.fastest_config
+
+    def unpinnable(self, ba: tokamax.BoundArguments, config: Hashable) -> str:
+        """Why the legal configs of `ba`'s launch do not hold `config`."""
+        del ba, config
+        return "not in its space at this launch's key"
 
     def keyed(self, ba: tokamax.BoundArguments) -> tokamax.BoundArguments:
         """`ba` as its key reads it, where its space, heuristic and measurement

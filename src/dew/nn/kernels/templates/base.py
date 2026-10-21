@@ -57,6 +57,15 @@ class Template[Config: Hashable](tuning.KernelOp):
                                                      default=None), budget, target.generation)
         return fits
 
+    def unpinnable(self, ba: tokamax.BoundArguments, config: Config) -> str:
+        """Why `config` is not among `ba`'s legal configs: outside `space`, or staging more shared
+        memory than a block of the GPU holds."""
+        if config not in tuple(self.space(ba)):
+            return "not in its space at this launch's key"
+        target = generation.gpu_target()
+        return (f"its programs stage {self.staged_bytes(ba, config)} bytes of shared memory, past the "
+                f"{generation.shared_budget(target)} a block of {target.generation} holds")
+
     def estimate(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> tuple[float, Config]:
         """The seconds `cost` estimates at the launch's fastest fitting config on `target`, and that
         config, the first of `space`'s order where several tie."""
