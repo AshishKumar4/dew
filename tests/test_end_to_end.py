@@ -16,17 +16,27 @@ import optax
 import pytest
 from diffusion_stubs import label_table
 from flax import linen as nn
-from reference_error import assert_as_exact_as_the_reference, assert_computes_the_oracle, chain_roundings
+from reference_error import (
+    assert_as_exact,
+    assert_as_exact_as_the_reference,
+    assert_computes_the_oracle,
+    chain_roundings,
+)
 from test_lpips import drawn_weights
 from test_mean_flow import CLASSES
 
 from dew.diffusion import presets
 from dew.eval.lpips import variables_from_torch
 from dew.inputs import Condition, Field, InputSpec, unit_range
+from dew.nn.autoencoders.api import AutoEncoder
 from dew.nn.autoencoders.dc_ae import DCAE, DCAutoencoder
+from dew.nn.autoencoders.flux2 import Flux2Autoencoder
 from dew.nn.autoencoders.kl import AutoencoderKL
+from dew.nn.autoencoders.qwen_image import QwenImageAutoencoder
+from dew.nn.autoencoders.rae import RAEAutoencoder
 from dew.nn.autoencoders.sd_vae import StableDiffusionVAE
 from dew.nn.autoencoders.vae import translate_vae_weights
+from dew.nn.autoencoders.wan import WanAutoencoder
 from dew.nn.backbones import SimpleDiT
 from dew.objectives.base import Step
 from dew.objectives.diffusion import Alignment, DiffusionObjective
@@ -631,3 +641,36 @@ def test_a_run_config_tunes_its_autoencoder_and_from_run_decodes_with_the_tuned_
         np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
     expected = task.pipeline(state, ema=False)(["a red bird"], key=9).host().images
     np.testing.assert_array_equal(restored(["a red bird"], key=9).host().images, expected)
+
+
+BUILT_INS = (StableDiffusionVAE, DCAutoencoder, WanAutoencoder, RAEAutoencoder, Flux2Autoencoder,
+             QwenImageAutoencoder)
+"""Every built-in autoencoder (`AutoEncoder.from_json`'s)."""
+
+
+def test_only_the_kl_autoencoders_with_a_posterior_reach_end_to_end_tuning():
+    """End-to-end tuning trains through `moments`; a built-in without one is refused when the objective
+    is built (`_check_end_to_end`), so the start below covers every built-in a run can tune."""
+    exposes = {wrapper for wrapper in BUILT_INS if wrapper.moments is not AutoEncoder.moments}
+    assert exposes == {StableDiffusionVAE}
+
+
+def test_the_running_statistics_start_by_normalizing_as_the_autoencoder_does():
+    """REPA-E's start, `normalized` by `initial_statistics` of the autoencoder's shift and scale with
+    the batch norm's epsilon at zero, normalizes a posterior's latents as `encode` does
+    (`LatentNormalization.normalized`, which `encode` applies to its draw): neither the identity nor
+    twice."""
+    autoencoder = objective(EndToEnd()).autoencoder
+    tuning = EndToEnd(epsilon=0.0)
+    statistics = tuning.initial_statistics(autoencoder.latent_shift, autoencoder.latent_scale,
+                                           autoencoder.latent_channels)
+
+    def draw(seed):
+        return (jax.random.normal(jax.random.key(seed), (8, 4, 4, autoencoder.latent_channels)),)
+
+    def started(latents):
+        return tuning.normalized(latents, jax.tree.map(lambda value: value.astype(latents.dtype), statistics))
+
+    assert_as_exact(jax.jit(started), jax.jit(autoencoder.normalization.normalized), draw,
+                    "end-to-end start", seeds=8)
+
