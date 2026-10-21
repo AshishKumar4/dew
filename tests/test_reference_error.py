@@ -122,13 +122,19 @@ def test_check_one_passes_an_equally_exact_sum_over_the_seeds_its_own_reference_
 
 
 def test_a_committed_fixture_is_its_references_output_within_twice_a_fresh_runs_error():
-    """An artifact check, not a parity (`assert_same_artifact`): a committed fixture as far from float64
-    as a fresh run, or up to twice as far, is the reference's output; one further is not."""
-    f64 = np.linspace(-1, 1, 11)
+    """An artifact check, not a parity (`assert_same_artifact`): a committed fixture whose largest error
+    from float64 is up to twice a fresh run's is the reference's output; one further is not, even where
+    only one element moves, which an RMS would let through."""
+    f64 = np.linspace(-1, 1, 101)
     fresh = f64 + 1e-7
     assert_same_artifact(fresh, f64 - 2e-7, f64, "twice as far")
     with pytest.raises(AssertionError):
         assert_same_artifact(fresh, f64 + 3e-7, f64, "three times as far")
+    corrupted = f64.copy()
+    corrupted[50] += 5e-7
+    assert np.sqrt(np.mean(np.square(corrupted - f64))) < 1e-7
+    with pytest.raises(AssertionError):
+        assert_same_artifact(fresh, corrupted, f64, "one element moved")
 
 
 def test_a_runs_learning_rates_part_from_the_base_at_any_float32_difference(monkeypatch):

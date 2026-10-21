@@ -1624,11 +1624,11 @@ def assert_same_artifact(recomputed, committed, f64, name: str) -> None:
     a parity): its largest error from the float64 run `f64` at most twice `recomputed`'s, the reference
     run again here. Another torch build sums in another order, so the two need not agree bit for bit
     across machines; a fixture that is not this reference's output sits orders further."""
-    fresh, stored = (float(np.max(np.abs(np.asarray(value, np.float64) - np.asarray(f64, np.float64))))
-                     for value in (recomputed, committed))
+    fresh, stored = (float(np.max(np.abs(value - f64))) for value in (recomputed, committed))
     print(f"{name}: committed {stored:.3e} and recomputed {fresh:.3e} from float64, "
-          f"{float(np.max(np.abs(np.asarray(recomputed, np.float64) - committed))):.3e} apart")
-    assert stored <= 2 * fresh, f"{name}: the committed fixture is not this reference's output"
+          f"{float(np.max(np.abs(recomputed - committed))):.3e} apart")
+    if stored > 2 * fresh:
+        raise AssertionError(f"{name}: the committed fixture is not this reference's output")
 
 
 def chain_roundings(closed_jaxpr) -> int:
