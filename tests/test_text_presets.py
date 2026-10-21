@@ -1,13 +1,12 @@
-"""The text presets prepare what the text and chat recipes do, from the recipes' own settings."""
+"""The text presets: documents tokenized and packed, conversations rendered and packed, and a token
+store's windows and documents, written out as the public steps."""
 
 from pathlib import Path
 
 import jax
 import numpy as np
-import pytest
 from token_support import write_token_corpus
 
-from dew.config.data import ChatData, TextData, loader
 from dew.data import Loading, Memory, presets, text
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition
@@ -37,40 +36,6 @@ def same_batches(expected, built, count: int = 4) -> None:
         made.close()
 
 
-@pytest.mark.parametrize("pack", [None, "first-fit", "concat"])
-def test_the_lm_preset_prepares_what_the_text_recipe_does(pack):
-    """Raw passages, tokenized by bytes with an EOS and laid out by each of the recipe's layouts:
-    fixed windows, first-fit packing in eight open rows, or concatenation, read by index: the
-    preset's plan and batches are the recipe's. (A memory read orders the recipe's windows, after
-    its fixed steps, and the chain's documents, where its shuffle is written.)"""
-    read = "indexed"
-    recipe = TextData(documents(), tokenizer="byte", seq_len=16, pack=pack, packing_bins=8,
-                      token_holdout=None)
-    expected = loader(recipe, batch=4, read=read, loading=LOADING)
-    chain = documents().shuffle(0).repeat().pipe(presets.lm, "byte", seq_len=16, batch=4, eos=True,
-                                                 pack=pack, bins=8)
-    built = compile(chain, read=read, loading=LOADING)
-    assert built.plan.identity() == expected.plan.identity()
-    same_batches(expected, built)
-
-
-@pytest.mark.parametrize("long", ["chunk", "truncate", "drop"])
-def test_the_sft_preset_prepares_what_the_chat_recipe_does(long):
-    """Conversations of differing lengths rendered by a chat template, each one longer than a row
-    cut into pieces, cut at its end or dropped, as the recipe's `long` says, read by index."""
-    read = "indexed"
-    conversations = Memory([{"messages": [{"role": "user", "content": "say " + "more " * index},
-                                          {"role": "assistant", "content": "done " * (1 + index % 5)}]}
-                            for index in range(24)])
-    recipe = ChatData(conversations, tokenizer=str(CHAT), seq_len=48, long=long, packing_bins=8)
-    expected = loader(recipe, batch=2, read=read, loading=LOADING)
-    chain = conversations.shuffle(0).repeat().pipe(presets.sft, str(CHAT), seq_len=48, batch=2, long=long,
-                                                   bins=8)
-    built = compile(chain, read=read, loading=LOADING)
-    assert built.plan.identity() == expected.plan.identity()
-    same_batches(expected, built)
-
-
 def test_a_concatenated_conversation_keeps_its_target_across_a_row_end():
     """Conversations that each fit a row, concatenated: the first fills less than a row, so the
     second is cut where that row ends, and the next row starts with the cut's last token again;
@@ -97,35 +62,26 @@ def store_of_documents(directory) -> tuple[str, np.ndarray]:
     return write_token_corpus(directory, stream, eos_id=0).train, stream
 
 
-def test_a_token_stores_windows_are_the_text_recipes(tmp_path):
-    """A token store's stream cut into fixed windows two apart, shuffled and repeated as the
-    recipe orders them, read by index: the windows written first on the store read its stream by
-    index, so the plan and batches are the recipe's."""
-    url, _ = store_of_documents(tmp_path)
-    expected = loader(TextData(url, seq_len=8, stride=2), batch=4, read="indexed", loading=LOADING)
-    chain = TokenFiles(url).windows(8, stride=2).shuffle(0).repeat().batch(4)
-    built = compile(chain, read="indexed", loading=LOADING)
-    assert built.plan.identity() == expected.plan.identity()
-    same_batches(expected, built)
-
-
-def test_the_token_windows_preset_reads_a_stores_windows_as_the_text_recipe(tmp_path):
-    """The token windows preset over a token store shuffled and repeated: the recipe's plan and
-    batches; recorded and read back with its stride overridden, windows that far apart."""
+def test_the_token_windows_preset_reads_a_stores_windows_as_the_windows_verb_written_first(tmp_path):
+    """The token windows preset over a token store shuffled and repeated: the plan and batches of the
+    store's windows two apart written first and then shuffled, repeated and batched, read by index;
+    recorded and read back with its stride overridden, windows that far apart."""
     from dew.data.records import Unrecorded, decode, encode, override
 
     url, _ = store_of_documents(tmp_path)
-    expected = loader(TextData(url, seq_len=8, stride=2), batch=4, read="indexed", loading=LOADING)
-    chain = TokenFiles(url).shuffle(0).repeat().pipe(presets.token_windows, seq_len=8, batch=4,
-                                                               stride=2)
+
+    def windows(stride):
+        return compile(TokenFiles(url).windows(8, stride=stride).shuffle(0).repeat().batch(4), read="indexed",
+                       loading=LOADING)
+
+    chain = TokenFiles(url).shuffle(0).repeat().pipe(presets.token_windows, seq_len=8, batch=4, stride=2)
     built = compile(chain, read="indexed", loading=LOADING)
-    assert built.plan.identity() == expected.plan.identity()
-    same_batches(expected, built)
+    assert built.plan.identity() == windows(2).plan.identity()
+    same_batches(windows(2), built)
     written = encode(chain)
     assert not isinstance(written, Unrecorded)
     wider = decode(override(written, "token_windows.stride", 4))
-    recipe = loader(TextData(url, seq_len=8, stride=4), batch=4, read="indexed", loading=LOADING)
-    assert compile(wider, read="indexed", loading=LOADING).plan.identity() == recipe.plan.identity()
+    assert compile(wider, read="indexed", loading=LOADING).plan.identity() == windows(4).plan.identity()
 
 
 def test_a_token_stores_documents_are_packed_whole(tmp_path):

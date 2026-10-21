@@ -1,4 +1,4 @@
-"""The prompt, preference, chat-canvas and clip presets prepare what their recipes do, from their settings."""
+"""The prompt, preference, chat-canvas and clip presets, each the public steps written out."""
 
 import dataclasses
 from pathlib import Path
@@ -7,7 +7,6 @@ import numpy as np
 import pytest
 from test_text_presets import same_batches
 
-from dew.config.data import ChatCanvasData, PreferenceData, PromptData, VideoData, loader
 from dew.data import Loading, Memory, presets
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition
@@ -16,34 +15,43 @@ CHAT = Path(__file__).resolve().parent / "fixtures" / "tokenizers" / "tiny-chat"
 LOADING = Loading(workers=0, threads=1, read_buffer=2)
 
 
-def test_the_preferences_preset_prepares_what_the_preference_recipe_does():
+def test_the_preferences_preset_lays_out_pairs_as_its_step_written_out():
     """Chosen and rejected token ids with their completion masks, laid out in six tokens padded
-    with 7, read by index."""
+    with 7, read by index: the plan and batches of the pair step written out."""
+    from dew.data.preferences import PreferencePair
+
     pairs = Memory([{"chosen": [1, 2, 3, 4][: 2 + index % 3], "rejected": [1, 2, 5][: 2 + index % 2],
                      "chosen_mask": [0, 0, 1, 1][: 2 + index % 3],
                      "rejected_mask": [0, 0, 1][: 2 + index % 2]}
                     for index in range(12)])
-    expected = loader(PreferenceData(pairs, seq_len=6, pad_id=7), batch=4, read="indexed", loading=LOADING)
+    written = compile(pairs.shuffle(0).repeat().map(PreferencePair(6, pad_id=7)).batch(4), read="indexed",
+                      loading=LOADING)
     chain = pairs.shuffle(0).repeat().pipe(presets.preferences, seq_len=6, batch=4, pad_id=7)
     built = compile(chain, read="indexed", loading=LOADING)
-    assert built.plan.identity() == expected.plan.identity()
-    same_batches(expected, built, 3)
+    assert built.plan.identity() == written.plan.identity()
+    same_batches(written, built, 3)
 
 
-def test_the_canvas_preset_prepares_what_the_chat_canvas_recipe_does():
+def test_the_canvas_preset_lays_out_turns_as_its_steps_written_out():
     """Conversations rendered by a chat template, each assistant turn one row of a prompt of 24
-    tokens and two canvases of 8, ended by the tokenizer's EOS, read by index."""
+    tokens and two canvases of 8, ended by the tokenizer's EOS, read by index: the plan and batches
+    of the rendering and the canvas step written out."""
+    from dew.data import chat
+    from dew.data.steps.chat import ResponseCanvases
+
     conversations = Memory([{"talk": [{"role": "user", "content": "say " + "more " * index},
                                       {"role": "assistant", "content": "done " * (1 + index % 5)}]}
                             for index in range(12)])
-    recipe = ChatCanvasData(conversations, tokenizer=str(CHAT), prompt_length=24, canvas_size=8, canvases=2,
-                            pad_id=0, column="talk")
-    expected = loader(recipe, batch=2, read="indexed", loading=LOADING)
+    renderer = chat.template(str(CHAT), messages="talk")
+    eos = renderer.vocabulary.eos_id
+    assert eos is not None
+    steps = conversations.shuffle(0).repeat().map(renderer).flat_map(ResponseCanvases(24, 8, 2, eos, 0))
+    written = compile(steps.batch(2), read="indexed", loading=LOADING)
     chain = conversations.shuffle(0).repeat().pipe(presets.canvas, str(CHAT), prompt_length=24, canvas_size=8,
                                                    batch=2, canvases=2, messages="talk")
     built = compile(chain, read="indexed", loading=LOADING)
-    assert built.plan.identity() == expected.plan.identity()
-    same_batches(expected, built, 3)
+    assert built.plan.identity() == written.plan.identity()
+    same_batches(written, built, 3)
 
 
 def test_a_canvas_needs_a_tokenizer_that_ends_a_response():
@@ -61,78 +69,32 @@ def test_a_canvas_needs_a_tokenizer_that_ends_a_response():
         conversations.pipe(presets.canvas, endless, prompt_length=8, canvas_size=4, batch=1)
 
 
-@dataclasses.dataclass(frozen=True)
-class Listed:
-    """A listed clip's path as the decoder reads it, with the caption the video recipe gives."""
-
-    caption: str
-
-    def __call__(self, row):
-        return {"mp4": row["path"], "caption": self.caption}
-
-
-def test_the_clips_preset_prepares_what_the_video_recipe_does(tmp_path, monkeypatch):
-    """Clips whose frames and sound count up, so the drawn window and its margin show, four frames of
-    16 pixels and the sound a frame wider each side at 16 kHz, every listed clip required to decode,
-    as the video recipe reads them, by index."""
-    from test_data_av import _mux
-    from transformers import AutoFeatureExtractor, Wav2Vec2FeatureExtractor
-
-    from dew.data import Files
-    from dew.data.sources.av_utils import FPS
-
-    (tmp_path / "train").mkdir()
-    for index in range(6):
-        _mux(tmp_path / "train" / f"{index}.avi")
-    monkeypatch.setattr(AutoFeatureExtractor, "from_pretrained",
-                        lambda name: Wav2Vec2FeatureExtractor(sampling_rate=16000))
-    recipe = VideoData(source=str(tmp_path / "train"), caption="a speaker", frames=4, frame_size=16,
-                       audio_padding=1, extensions=(".avi",))
-    expected = loader(recipe, batch=2, read="indexed", loading=LOADING)
-    clips = Files(str(tmp_path / "train" / "*.avi"), format="files")
-    chain = (clips.map(Listed("a speaker"), identity="listed-clip@1").shuffle(0).repeat()
-             .pipe(presets.clips, 4 / FPS, frames=4, fps=FPS, size=16, batch=2, sample_rate=16000,
-                   margin=1 / FPS, context=1 / FPS, missing="reject", rejects=False))
-    built = compile(chain, read="indexed", loading=LOADING, host=recipe.pipelines()[2])
-    same_batches(expected, built, 3)
-
-
-def test_the_video_preset_reads_a_directorys_media_as_the_video_recipe(tmp_path, monkeypatch):
+def test_the_video_preset_reads_a_directorys_media_and_passes_over_the_rest(tmp_path):
     """A directory of clips and a note beside them, listed and read through the video preset: an
-    epoch of the rows the video recipe reads, the note passed over, and facts saying the frames and
-    the sound's length."""
+    epoch of the six clips, the note passed over, and facts saying the frames and the sound's
+    length; read once to validate on, every clip."""
     from test_data_av import _mux
-    from transformers import AutoFeatureExtractor, Wav2Vec2FeatureExtractor
 
     from dew.data import Files
+    from dew.data.compile import held
     from dew.data.sources.av_utils import FPS
 
     (tmp_path / "train").mkdir()
     for index in range(6):
         _mux(tmp_path / "train" / f"{index}.avi")
     (tmp_path / "train" / "notes.txt").write_text("not a clip")
-    monkeypatch.setattr(AutoFeatureExtractor, "from_pretrained",
-                        lambda name: Wav2Vec2FeatureExtractor(sampling_rate=16000))
-    recipe = VideoData(source=str(tmp_path / "train"), caption="a speaker", frames=4, frame_size=16,
-                       audio_padding=1)
-    expected = loader(recipe, batch=2, read="indexed", loading=LOADING)
     listing = Files(str(tmp_path / "train"), format="files")
-    chain = listing.shuffle(0).repeat().pipe(presets.video, 4 / FPS, frames=4, fps=FPS, size=16, batch=2,
-                                             caption="a speaker", sample_rate=16000, margin=1 / FPS,
-                                             context=1 / FPS, missing="reject", rejects=False)
+    settings = {"frames": 4, "fps": FPS, "size": 16, "batch": 2, "caption": "a speaker", "sample_rate": 16000,
+                "margin": 1 / FPS, "context": 1 / FPS, "missing": "reject", "rejects": False}
+    chain = listing.shuffle(0).repeat().pipe(presets.video, 4 / FPS, **settings)
     facts = chain.facts()
     assert facts["fields"]["video"] == [4, 16, 16, 3]
     assert facts["audio_seconds"] == 6 / FPS
-    built = compile(chain, read="indexed", loading=LOADING, host=recipe.pipelines()[2])
-    # Six clips, two a batch: an epoch is three batches.
-    assert _epoch(built, 3) == _epoch(expected, 3)
-    # The listing is cut to its media as the recipe cuts it, so its corpus is the recipe's.
-    assert built.records == expected.records == 6
-    # The same media read once to validate on: every clip, drawn as validation draws it.
-    from dew.data.compile import held
-
-    once = listing.pipe(presets.video, 4 / FPS, frames=4, fps=FPS, size=16, batch=2, caption="a speaker",
-                        sample_rate=16000, margin=1 / FPS, context=1 / FPS, missing="reject", rejects=False)
+    built = compile(chain, read="indexed", loading=LOADING)
+    # The listing is cut to its media: six clips, two a batch, an epoch of three batches.
+    assert built.records == 6
+    assert len(_epoch(built, 3)) == 6
+    once = listing.pipe(presets.video, 4 / FPS, **settings)
     assert sum(len(batch["video"]) for batch in held(once)(DataPartition())) == 6
 
 
@@ -175,21 +137,21 @@ def _widths(loaded, count: int) -> set[int]:
         reader.close()
 
 
-def test_the_prompts_preset_prepares_what_the_prompt_recipe_does_measuring_its_reward_width():
+def test_the_prompts_preset_measures_its_reward_width_as_the_width_given_outright():
     """Prompt rows rendered to eight left-padded ids, long ones dropped, their reward columns as wide
-    as the widest the store holds, measured as a memory read reads it: an epoch of the rows the
-    recipe makes, which orders them after rendering, and the batches of the width given outright."""
+    as the widest the store holds, measured as a memory read reads it: an epoch of the eight rows
+    kept, ordered after rendering, and the batches of the width given outright."""
     rows = _prompts(12)
-    recipe = PromptData(rows, "byte", max_prompt_len=8, long="drop")
-    expected = loader(recipe, batch=2, read="memory", loading=LOADING)
-    measured = rows.shuffle(0).repeat().pipe(presets.prompts, "byte", max_prompt_len=8, batch=2, long="drop")
-    built = compile(measured, read="memory", loading=LOADING)
+
+    def loaded(**options):
+        rendered = rows.pipe(presets.prompts, "byte", max_prompt_len=8, batch=None, long="drop", **options)
+        return compile(rendered.shuffle(0).repeat().batch(2), read="memory", loading=LOADING)
+
+    built = loaded()
     # Eight of the twelve prompts fit in eight bytes: an epoch is four batches.
-    assert _epoch(built, 4) == _epoch(expected, 4)
+    assert built.records == 8 and len(set(_epoch(built, 4))) == 8
     assert _widths(built, 3) == {12}
-    given = rows.shuffle(0).repeat().pipe(presets.prompts, "byte", max_prompt_len=8, batch=2, long="drop",
-                                          reward_bytes=12)
-    same_batches(built, compile(given, read="memory", loading=LOADING), 3)
+    same_batches(built, loaded(reward_bytes=12), 3)
 
 
 def _epoch(loaded, batches: int) -> list[tuple[bytes, ...]]:
@@ -210,16 +172,18 @@ def _epoch(loaded, batches: int) -> list[tuple[bytes, ...]]:
 def test_a_measured_reward_width_is_the_whole_stores_in_both_parts_of_a_holdout():
     """A store held out in part, its widest row among the held: the training part and the held part
     bind the width of the widest row of the whole store, so both pad their reward columns alike."""
-    from dew.config.data import HoldOut
+    from dew.data.prompts import TRUTH_KEY
 
-    recipe = PromptData(_prompts(12, widest_first=True), "byte", max_prompt_len=16,
-                        validation=HoldOut(records=3))
-    loaded = loader(recipe, batch=1, read="memory", loading=LOADING)
+    train, scored = _prompts(12, widest_first=True).holdout(records=3)
+
+    def rendered(part):
+        return part.pipe(presets.prompts, "byte", max_prompt_len=16, batch=None)
+
+    loaded = compile(rendered(train).shuffle(0).repeat().batch(1), validation=rendered(scored).batch(1),
+                     read="memory", loading=LOADING)
     assert _widths(loaded, 4) == {12}
     held = loaded.val(DataPartition())
     try:
-        from dew.data.prompts import TRUTH_KEY
-
         assert {np.asarray(batch[TRUTH_KEY]).shape[-1] for batch in held} == {12}
     finally:
         held.close()

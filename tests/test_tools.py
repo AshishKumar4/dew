@@ -232,8 +232,7 @@ def token_directory(tmp_path: Path) -> Path:
     corpus = tmp_path / "corpus.txt"
     corpus.write_text("".join(f"{line}\n" for line in LINES))
     out = tmp_path / "tokens"
-    assert DataExport("records", str(out), fields=json.dumps({"source": str(corpus)}), tokenizer="byte",
-                      eos=True, read="memory").run_command() == 0
+    assert DataExport(str(corpus), str(out), tokenizer="byte", eos=True, read="memory").run_command() == 0
     return out
 
 

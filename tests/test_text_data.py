@@ -250,11 +250,9 @@ def test_documents_write_one_eos_each_and_empty_documents_write_nothing(tmp_path
 def _export_cli(input_path, destination):
     import subprocess
 
-    fields = json.dumps({"source": {"class": "dew.data.sources.files:Files",
-                                   "fields": {"url": str(input_path), "format": "text"}}})
-    return subprocess.run([sys.executable, "-m", "dew.cli.main", "data", "export", "records",
-                           str(destination), "--fields", fields, "--format", "array_record",
-                           "--tokenizer", "byte", "--read", "memory"], cwd=destination.parent,
+    return subprocess.run([sys.executable, "-m", "dew.cli.main", "data", "export", str(input_path),
+                           str(destination), "--format", "array_record", "--tokenizer", "byte",
+                           "--read", "memory"], cwd=destination.parent,
                           capture_output=True, text=True,
                           env={**os.environ, "PYTHONPATH": str(REPO_ROOT / "src"), "JAX_PLATFORMS": "cpu"},
                           check=False)
