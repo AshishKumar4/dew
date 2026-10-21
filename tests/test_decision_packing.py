@@ -308,7 +308,8 @@ def assert_rows_decided_alone(objective, wide_modules, seeds: int, held=lambda p
     assert kept(objective.init(jax.random.key(0))), "no gradient leaf held"
     # A logit sums within its row's window; a parameter's gradient over every window's tokens, in
     # another order than the rows alone.
-    assert_as_exact(packed, alone, lambda seed: (objective.init(jax.random.key(seed)),), "packed window",
+    initialized = jax.jit(objective.init)
+    assert_as_exact(packed, alone, lambda seed: (initialized(jax.random.key(seed)),), "packed window",
                     seeds=seeds, truth_fn=truth)
 
 
