@@ -500,18 +500,19 @@ def test_coverage_combines_each_tasks_branches_into_one_report_a_module_a_line(c
         "                   check=True, env={**os.environ, 'PYTHONPATH': 'src'})\n")
     items = ci.coverage_items(300.0, {})
     assert items and all("--python=3.12 " in item and "--cache=off" in item
-                         and f"--coverage={ci.ARTIFACTS}" in item
-                         and f"--deadline={ci.COVERAGE_DEADLINE:.0f}" in item for item in items)
+                         and f"--coverage={ci.ARTIFACTS}" in item for item in items)
     assert sorted(name for item in items for name in re.search(r"--tests='([^']*)'", item)[1].split()) == [
         "tests/test_negative.py", "tests/test_positive.py"]
     venv = tmp_path / ".venv-3.12/bin"
     venv.mkdir(parents=True)
     (venv / "python").write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
     (venv / "python").chmod(0o755)
-    for name in ("negative", "positive"):
-        (tmp_path / "runs" / name).mkdir(parents=True)
-        ci.task("3.12", [f"tests/test_{name}.py"], "", tmp_path / "runs" / name / "rows.json", 600.0,
-                cache=False, coverage=tmp_path / "runs" / name)
+    # armada keeps each task's artifacts under its index; a directory of another name is no task.
+    for index, name in enumerate(("negative", "positive")):
+        (tmp_path / "runs" / str(index)).mkdir(parents=True)
+        ci.task("3.12", [f"tests/test_{name}.py"], "", tmp_path / "runs" / str(index) / "rows.json", 600.0,
+                cache=False, coverage=tmp_path / "runs" / str(index))
+    (tmp_path / "runs/logs").mkdir()
     assert ci.coverage_report(tmp_path / "runs") == 0
     files = {Path(name).name: measured for name, measured in
              json.loads((tmp_path / "runs/coverage.json").read_text())["files"].items()}
@@ -520,10 +521,18 @@ def test_coverage_combines_each_tasks_branches_into_one_report_a_module_a_line(c
     assert Path(least[0].removeprefix("| ")).name == "unused.py" and least[-1] == "0.0% |"
     # A task interrupted at its deadline leaves its later tests' coverage out: the pass is refused.
     (tmp_path / "tests/test_slow.py").write_text("import time\ndef test_slow(): time.sleep(30)\n")
-    (tmp_path / "runs/slow").mkdir()
-    ci.task("3.12", ["tests/test_slow.py"], "", tmp_path / "runs/slow/rows.json", 1.0, cache=False, grace=5.0,
-            coverage=tmp_path / "runs/slow")
+    (tmp_path / "runs/2").mkdir()
+    ci.task("3.12", ["tests/test_slow.py"], "", tmp_path / "runs/2/rows.json", 1.0, cache=False, grace=5.0,
+            coverage=tmp_path / "runs/2")
     assert ci.coverage_report(tmp_path / "runs") == 1
+
+
+def test_a_coverage_task_has_a_deadline_for_tracing(ci, tmp_path):
+    """Branch tracing slows a task several times over: each coverage item runs by COVERAGE_DEADLINE,
+    not a CI task's."""
+    (tmp_path / "tests/test_one.py").write_text("def test_one(): pass\n")
+    items = ci.coverage_items(300.0, {})
+    assert items and all(f"--deadline={ci.COVERAGE_DEADLINE:.0f}" in item for item in items)
 
 
 def test_a_file_whose_recorded_tests_outweigh_its_median_runs_split_by_them(ci, tmp_path):
