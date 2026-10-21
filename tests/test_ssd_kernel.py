@@ -193,7 +193,8 @@ SEEDS = {
     ("shape", ((1, 1024, 4, 64, 64, 1), 128)): 64,
     ("shape", ((1, 4096, 4, 64, 64, 1), 128)): 256,
 }
-"""Sized by seeds_for on XLA's output, final state and all five gradients (2026-10-20, armada)."""
+"""Sized by seeds_for on XLA's output, final state and all five gradients (2026-10-20, armada), and
+resolving at these counts against the TPU's own XLA on a v5e (11 cases, 2026-10-21)."""
 
 
 on_device = pytest.mark.skipif(jax.default_backend() != "tpu",
