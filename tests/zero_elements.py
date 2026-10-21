@@ -553,7 +553,9 @@ class Interpreter:
         if blocked:
             return blocked
         x, value, e = operand.value.astype(np.float64), native.astype(np.float64), operand.error
-        ordinary = np.isfinite(x) & np.isfinite(value) & (e <= 1) & operand.certified
+        # An array of its own, written element by element below: a 0-d value's numpy scalar would take no
+        # write.
+        ordinary = np.array(np.isfinite(x) & np.isfinite(value) & (e <= 1) & operand.certified, dtype=bool)
         upper, local = np.zeros(x.shape), np.zeros(x.shape)
         if fmt is FLOAT32:
             inside = ordinary & (x >= -110) & (x <= 90)
@@ -599,7 +601,8 @@ class Interpreter:
             return blocked
         x, value, e = operand.value.astype(np.float64), native.astype(np.float64), operand.error
         error, exact = np.zeros(x.shape), np.zeros(x.shape, bool)
-        certified = operand.certified & np.isfinite(x) & np.isfinite(value)
+        # An array of its own, written element by element below (a 0-d value's numpy scalar would not be).
+        certified = np.array(operand.certified & np.isfinite(x) & np.isfinite(value), dtype=bool)
         for index in np.flatnonzero(certified):
             try:
                 with interval_precision(128) as iv:
