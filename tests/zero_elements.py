@@ -30,17 +30,20 @@ than Dew's own rounding there passes.
 """
 
 import dataclasses
+import fractions
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 from jax.extend import core as jcore
-from op_certificates import FLOAT32, Format, _two_product, gamma, two_sum
+from op_certificates import FLOAT32, Format, _two_product, fraction_rounded, gamma, two_sum
 
 FLOAT64 = Format("float64", 53, -1022, 1023)
 FORMATS = {np.dtype(np.float32): FLOAT32, np.dtype(np.float64): FLOAT64}
 TINIEST = 5e-324
 """The least positive float64: a product of nonzero bounds is never taken below it."""
+DEKKER_FLOOR = 2.0 ** -968
+"""The least float64 product whose Dekker residual cannot underflow (2^(emin + p + 1))."""
 
 
 def _least_normal(fmt: Format) -> float:
@@ -60,11 +63,14 @@ def _times(a: np.ndarray, b: np.ndarray) -> np.ndarray:
     return np.where((a > 0) & (b > 0), np.maximum(product, TINIEST), product)
 
 
-def _widened_sum(total: np.ndarray, terms: int) -> np.ndarray:
-    """A float64 sum of `terms` nonnegative bounds, taken in any order, widened to an upper bound of the
-    exact sum."""
+def _widened_sum(total: np.ndarray, terms: int, positive) -> np.ndarray:
+    """A float64 sum of `terms` nonnegative bounds (products of them included), taken in any order,
+    widened to an upper bound of the exact sum: by γ64(terms) relatively, and by two of the least float64
+    for each of its `positive` terms, which a product or a partial sum may lose in underflow, so no
+    positive bound sums to zero."""
     widen = 1 + gamma(max(terms, 1), FLOAT64)
-    return _up(np.asarray(total, np.float64) * widen + terms * TINIEST * (np.asarray(total) > 0))
+    with np.errstate(over="ignore"):
+        return _up(np.asarray(total, np.float64) * widen + 2 * np.asarray(positive, np.float64) * TINIEST)
 
 
 @dataclasses.dataclass
@@ -85,15 +91,24 @@ class Bounded:
 
 
 def _input(value) -> Bounded:
-    """A native input: the computation's own, exact by definition, but for a subnormal float, which a
-    backend may read as zero."""
+    """A native input, constant or literal: the computation's own, exact by definition, but for a
+    subnormal float, which a backend may read as zero, held to its own size; a value that is not a
+    number, or of a type without contracts (complex, or a float format other than float32's and
+    float64's), is not certified."""
     value = np.asarray(value)
     bounded = Bounded.exactly(value)
+    if np.issubdtype(value.dtype, np.complexfloating):
+        bounded.exact = bounded.certified = np.zeros(value.shape, bool)
+        return bounded
     fmt = FORMATS.get(value.dtype)
     if fmt is not None:
-        tiny = (value != 0) & (np.abs(value.astype(np.float64)) < _least_normal(fmt))
-        bounded.error = np.where(tiny, np.abs(value.astype(np.float64)), 0.0)
-        bounded.exact = ~tiny
+        wide = value.astype(np.float64)
+        tiny = (wide != 0) & (np.abs(wide) < _least_normal(fmt))
+        bounded.error = np.where(tiny, np.abs(wide), 0.0)
+        bounded.certified = ~np.isnan(wide)
+        bounded.exact = ~tiny & bounded.certified
+    elif np.issubdtype(value.dtype, np.inexact):
+        bounded.exact = bounded.certified = np.zeros(value.shape, bool)
     return bounded
 
 
@@ -116,8 +131,7 @@ class Interpreter:
         self.blocked: dict[str, int] = {}
 
     def run(self, closed, *inputs) -> list[Bounded]:
-        return self._program(closed.jaxpr, [Bounded.exactly(np.asarray(c)) for c in closed.consts],
-                             [_input(x) for x in inputs])
+        return self._program(closed.jaxpr, [_input(c) for c in closed.consts], [_input(x) for x in inputs])
 
     def _program(self, jaxpr, consts: list[Bounded], arguments: list[Bounded]) -> list[Bounded]:
         env: dict = dict(zip(jaxpr.constvars, consts, strict=True))
@@ -125,7 +139,7 @@ class Interpreter:
 
         def read(atom):
             if isinstance(atom, jcore.Literal):
-                return Bounded.exactly(np.asarray(atom.val, dtype=atom.aval.dtype))
+                return _input(np.asarray(atom.val, dtype=atom.aval.dtype))
             return env[atom]
 
         for eqn in jaxpr.eqns:
@@ -148,17 +162,30 @@ class Interpreter:
             inner = eqn.params[CALLS[name]]
             closed = inner if hasattr(inner, "consts") else None
             jaxpr = closed.jaxpr if closed is not None else inner
-            consts = [Bounded.exactly(np.asarray(c)) for c in closed.consts] if closed is not None else []
+            consts = [_input(c) for c in closed.consts] if closed is not None else []
             return self._program(jaxpr, consts, operands[:len(jaxpr.invars)])
         natives = self._native(eqn, operands)
-        if name == "stop_gradient" or name == "copy":
-            return [operands[0]]
-        if name in MOVES:
-            return [self._moved(eqn, operands, natives[0])]
+        if any(np.issubdtype(array.dtype, np.complexfloating)
+               for array in [*natives, *(operand.value for operand in operands)]):
+            return self._blocked(f"{name} (complex)", natives)
         handler = getattr(self, f"_{name}", None)
-        if handler is None:
+        if name not in MOVES | {"stop_gradient", "copy"} and handler is None:
             return self._blocked(name, natives)
-        return handler(eqn, operands, natives)
+        # Bound arithmetic that overflows or has no value leaves a bound that is not finite, which the
+        # check below refuses; numpy's warnings of it say nothing more.
+        with np.errstate(over="ignore", invalid="ignore", under="ignore", divide="ignore"):
+            if name in {"stop_gradient", "copy"}:
+                outs = [operands[0]]
+            elif name in MOVES:
+                outs = [self._moved(eqn, operands, natives[0])]
+            else:
+                outs = handler(eqn, operands, natives)
+        for out in outs:
+            # A bound past float64's range certifies nothing.
+            out.certified = out.certified & np.isfinite(out.error)
+            out.exact = out.exact & out.certified
+            out.error = np.where(out.certified, out.error, 0.0)
+        return outs
 
     # Moves and selections.
 
@@ -263,6 +290,9 @@ class Interpreter:
         x, y = np.where(finite, x, 0.0), np.where(finite, y, 0.0)
         if fmt is FLOAT64:
             hi, lo = _two_product(x, y)
+            # Dekker's residual is exact only where it cannot underflow; below, one least normal holds it.
+            low = (np.abs(hi) < DEKKER_FLOOR) & (x != 0) & (y != 0)
+            lo = np.where(low, _least_normal(FLOAT64), lo)
         else:
             hi, lo = x * y, np.zeros(np.broadcast(x, y).shape)
         transfer = _up(_times(np.abs(x), ey) + _times(np.abs(y), ex) + _times(ex, ey))
@@ -278,24 +308,40 @@ class Interpreter:
         return [result]
 
     def _div(self, eqn, operands, natives):
+        if not np.issubdtype(natives[0].dtype, np.inexact):
+            return self._blocked("div (integer)", natives)
         fmt, blocked = self._formatted("div", natives, *operands)
         if blocked:
             return blocked
         (x, ex), (y, ey) = ((o.value.astype(np.float64), o.error) for o in operands)
         q = natives[0].astype(np.float64)
-        if fmt is FLOAT64:
-            back, residue = _two_product(y, q)
-            representable = (back == x) & (residue == 0)
-        else:
-            representable = y * q == x
-        margin = np.abs(y) - ey
-        lower = np.where(margin > 0, np.nextafter(np.abs(y) * margin * (1 - 2.0 ** -50), 0.0), 0.0)
-        with np.errstate(divide="ignore", invalid="ignore"):
+        finite = np.isfinite(x) & np.isfinite(y) & np.isfinite(q) & (y != 0)
+        x, y, q = np.where(finite, x, 0.0), np.where(finite, y, 1.0), np.where(finite, q, 0.0)
+        with np.errstate(divide="ignore", invalid="ignore", over="ignore", under="ignore"):
+            if fmt is FLOAT64:
+                # The residual x - y·q exactly, where Dekker's product cannot underflow and x - p is exact
+                # (Sterbenz: p within a factor of two of x).
+                p, e = _two_product(y, q)
+                near = (np.abs(p) >= np.abs(x) / 2) & (np.abs(p) <= 2 * np.abs(x))
+                sterbenz = (q == 0) | ((x * p > 0) & near)
+                valid = ((np.abs(p) >= DEKKER_FLOOR) | (q == 0)) & sterbenz
+                residual = (x - p) - e
+                representable = valid & (x - p == 0) & (e == 0)
+                apart = np.where(valid, _up(np.abs(residual) / np.abs(y) * (1 + 2.0 ** -50)), np.inf)
+            else:
+                # Products of fp32 values are exact in float64, and x/y there within 2^-53 of its value.
+                representable = y * q == x
+                apart = _up(np.abs(q - x / y) + 2.0 ** -53 * np.abs(x / y))
+            margin = np.abs(y) - ey
+            lower = np.where(margin > 0, np.nextafter(np.abs(y) * margin * (1 - 2.0 ** -50), 0.0), 0.0)
             moved = _up(_times(np.abs(x), ey) + _times(np.abs(y), ex))
-            transfer = np.where(lower > 0, _up(moved / lower), np.inf)
-            hi = x / y
-        lo = np.where(representable, 0.0, _up(np.abs(hi) * 2.0 ** -52))
-        return [self._rounded(fmt, natives[0], hi, lo, transfer, operands, exact_from=representable)]
+            divided = _up(moved / np.where(lower > 0, lower, 1.0))
+            quotient = np.where(moved > 0, np.maximum(divided, TINIEST), 0.0)
+            transfer = np.where(lower > 0, quotient, np.inf)
+        result = self._rounded(fmt, natives[0], q, apart, transfer, operands, exact_from=representable)
+        result.certified = result.certified & finite
+        result.exact = result.exact & finite
+        return [result]
 
     def _neg(self, eqn, operands, natives):
         operand = operands[0]
@@ -423,8 +469,10 @@ class Interpreter:
         x = np.abs(operand.value.astype(np.float64))
         terms = int(np.prod([operand.value.shape[a] for a in axes])) if axes else 1
         nonzero = np.asarray(np.sum(operand.value != 0, axis=axes))
-        magnitude = _widened_sum(np.sum(x, axis=axes), terms)
-        propagated = _widened_sum(np.sum(operand.error, axis=axes), terms)
+        with np.errstate(over="ignore", invalid="ignore"):
+            magnitude = _widened_sum(np.sum(x, axis=axes), terms, nonzero)
+        positive = np.sum(operand.error > 0, axis=axes)
+        propagated = _widened_sum(np.sum(operand.error, axis=axes), terms, positive)
         rounding = np.array([gamma(int(m) - 1, fmt) if m > 1 else 0.0 for m in nonzero.reshape(-1)]).reshape(
             nonzero.shape)
         local = np.where(nonzero > 1, _up(_times(rounding, magnitude) + nonzero * _least_normal(fmt)), 0.0)
@@ -439,6 +487,9 @@ class Interpreter:
             return blocked
         if jax.default_backend() != "cpu":
             return self._blocked(f"dot_general (no contract on {jax.default_backend()})", natives)
+        precision, preferred = eqn.params.get("precision"), eqn.params.get("preferred_element_type")
+        if not _probed_dot(precision, preferred, operands[0].value.dtype):
+            return self._blocked(f"dot_general (precision {precision} unprobed)", natives)
         (a, ea, ca), (b, eb, cb) = ((o.value.astype(np.float64), o.error, o.certified) for o in operands)
         numbers = eqn.params["dimension_numbers"]
 
@@ -450,8 +501,9 @@ class Interpreter:
 
         terms = int(np.prod([a.shape[axis] for axis in numbers[0][0]])) if numbers[0][0] else 1
         nonzero = np.asarray(dot(a != 0, b != 0))
-        magnitude = _widened_sum(dot(np.abs(a), np.abs(b)), terms)
-        propagated = _widened_sum(dot(np.abs(a), eb) + dot(ea, np.abs(b)) + dot(ea, eb), terms)
+        magnitude = _widened_sum(dot(np.abs(a), np.abs(b)), terms, nonzero)
+        positive = dot(a != 0, eb > 0) + dot(ea > 0, b != 0) + dot(ea > 0, eb > 0)
+        propagated = _widened_sum(dot(np.abs(a), eb) + dot(ea, np.abs(b)) + dot(ea, eb), 3 * terms, positive)
         rounding = np.array([gamma(int(m), fmt) if m > 0 else 0.0 for m in nonzero.reshape(-1)]).reshape(
             nonzero.shape)
         local = np.where(nonzero > 0, _up(_times(rounding, magnitude) + nonzero * _least_normal(fmt)), 0.0)
@@ -471,13 +523,48 @@ class Interpreter:
         return self._reduce_max(eqn, operands, natives)
 
 
+_PROBES: dict = {}
+
+
+def _probed_dot(precision, preferred, dtype) -> bool:
+    """Whether this backend's dot at `precision` (none, or a precision per operand; never an algorithm,
+    which may convert its operands) rounds each product and its accumulation in the operands' own format:
+    probed natively, a product (1 + 2^-12)² that a narrower product loses, and a sum 2^20 + 1.125 that a
+    narrower accumulator loses (for float64, (1 + 2^-27)² and 2^40 + (1 + 2^-10)), each its correctly
+    rounded value exactly."""
+    if precision is not None and not (isinstance(precision, tuple)
+                                      and all(isinstance(p, jax.lax.Precision) for p in precision)):
+        return False
+    if preferred is not None and np.dtype(preferred) != np.dtype(dtype):
+        return False
+    key = (precision, np.dtype(dtype))
+    if key not in _PROBES:
+        wide = np.dtype(dtype) == np.float64
+        small, big, rest = (2.0 ** -27, 2.0 ** 40, 1 + 2.0 ** -10) if wide else (2.0 ** -12, 2.0 ** 20, 1.125)
+        fmt = FLOAT64 if wide else FLOAT32
+        with jax.enable_x64(new_val=wide):
+            numbers = (((0,), (0,)), ((), ()))
+
+            def run(left, right):
+                left, right = jnp.asarray(left, dtype), jnp.asarray(right, dtype)
+                return float(jax.lax.dot_general(left, right, numbers, precision=precision))
+
+            square = fractions.Fraction(1 + small) ** 2
+            product = run([1 + small], [1 + small]) == fraction_rounded(square, fmt)
+            summed = run([1.0, 1.0], [big, rest]) == big + rest
+        _PROBES[key] = product and summed
+    return _PROBES[key]
+
+
 @dataclasses.dataclass
 class Coverage:
     """What the certificate judged of a site's zero elements: how many were certified and held to their
-    bound, how many were not certified and by which primitives, and each certified element past its
-    bound."""
+    bound, how many were not certified and why (a primitive without a contract on Dew's or the truth's
+    side, or an interpretation its native execution does not reproduce), the primitives that left values
+    uncertified, and each certified element past its bound."""
     certified: int
     uncertified: int
+    causes: dict[str, int]
     blocked: dict[str, int]
     over: list[str]
 
@@ -506,22 +593,32 @@ def _bitwise(a: np.ndarray, b: np.ndarray) -> np.ndarray:
 
 def zero_elements(dew_fn, reference_fn, inputs, label: str, truth_fn=None) -> Coverage:
     """Check 2 at the elements of Dew's output whose float64 truth is exactly zero (the module's
-    certificate): each where Dew's interpretation is certified and equals Dew's native output bit for
-    bit, held to `|dew - truth| <= e + τ`; `inputs` the tuple of the functions' arguments. Its coverage;
-    an element past its bound is listed in `over`."""
+    certificate), the truth the reference's executed float64 output: each where Dew's interpretation and
+    the truth's are certified and each reproduces its native execution bit for bit, held to
+    `|dew - truth| <= e + τ`; `inputs` the tuple of the functions' arguments. Its coverage; an element
+    past its bound is listed in `over`."""
     mine, blocked = _interpreted(dew_fn, inputs)
     native = [np.asarray(out) for out in jax.tree_util.tree_leaves(dew_fn(*inputs))]
     with jax.enable_x64(new_val=True):
         wide = jax.tree.map(_widened, inputs)
         truths, blocked_truth = _interpreted(truth_fn or reference_fn, wide)
-    certified = uncertified = 0
+        executed = [np.asarray(out) for out in jax.tree_util.tree_leaves((truth_fn or reference_fn)(*wide))]
+    causes = {"Dew's interpretation not certified": 0, "the truth's interpretation not certified": 0,
+              "Dew's execution not the interpretation": 0, "the truth's execution not the interpretation": 0}
+    certified = 0
     over = []
-    for index, (bounded, out, truth) in enumerate(zip(mine, native, truths, strict=True)):
-        zero = truth.value.astype(np.float64) == 0.0
-        held = zero & bounded.certified & truth.certified & _bitwise(bounded.value, out)
+    for index, (bounded, out, truth, value) in enumerate(zip(mine, native, truths, executed, strict=True)):
+        zero = value.astype(np.float64) == 0.0
+        reasons = [(~bounded.certified, "Dew's interpretation not certified"),
+                   (~truth.certified, "the truth's interpretation not certified"),
+                   (~_bitwise(bounded.value, out), "Dew's execution not the interpretation"),
+                   (~_bitwise(truth.value, value), "the truth's execution not the interpretation")]
+        held = zero.copy()
+        for failed, cause in reasons:
+            causes[cause] += int((held & failed).sum())
+            held &= ~failed
         certified += int(held.sum())
-        uncertified += int((zero & ~held).sum())
-        apart = np.abs(out.astype(np.float64) - truth.value.astype(np.float64))
+        apart = np.abs(out.astype(np.float64) - value.astype(np.float64))
         allowed = _up(bounded.error + truth.error)
         for at in np.argwhere(held & ~(apart <= allowed))[:4]:
             at = tuple(int(i) for i in at)
@@ -530,7 +627,8 @@ def zero_elements(dew_fn, reference_fn, inputs, label: str, truth_fn=None) -> Co
                         f"{truth.error[at]:.3e}")
     merged = dict(blocked)
     merged.update({f"{name} (truth)": count for name, count in blocked_truth.items()})
-    return Coverage(certified, uncertified, merged, over)
+    found = {cause: count for cause, count in causes.items() if count}
+    return Coverage(certified, sum(found.values()), found, merged, over)
 
 
 def assert_zero_elements(dew_fn, reference_fn, inputs, label: str, truth_fn=None) -> Coverage:
