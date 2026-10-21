@@ -215,8 +215,9 @@ def image_data(config: Config, parts: dict[str, Source]) -> tuple[Dataset, Datas
     crop = images.RandomCrop(config.image_size, scale=(0.6, 1.0), flip=True)
     train = (Concatenate((parts["train"], parts["validation"])).shuffle(seed=0).repeat()
              .pipe(presets.images, config.image_size, batch=config.batch_size,
-                   staging_size=config.staging_size, augment=crop))
-    test = parts["test"].pipe(presets.images, config.image_size, batch=config.batch_size)
+                   staging_size=config.staging_size, augment=crop, rejects=False))
+    # rejects=False: an image that does not decode stops the run, so every epoch reads every record.
+    test = parts["test"].pipe(presets.images, config.image_size, batch=config.batch_size, rejects=False)
     return train.loading(loading(config)), test.loading(loading(config))
 
 
