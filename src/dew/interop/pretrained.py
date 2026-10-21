@@ -513,9 +513,12 @@ class Pretrained:
         An adapted bundle (`lora`) writes the source's own tensors with the factors
         merged into their kernels, as PEFT's `merge_and_unload` does, from its
         variables or a trainer's split of them; `adapter.save` writes the factors
-        alone.
+        alone. A loaded task's tree, its projections packed for serving, is written
+        as the source's own members (`dew.inference.projections.unpacked`).
         """
-        values = self.variables if variables is None else variables
+        from dew.inference.projections import unpacked
+
+        values = unpacked(self.model, self.variables if variables is None else variables)
         if self.adapter is not None:
             values = self.adapter.merge(values)
         quantization = self._quantization()

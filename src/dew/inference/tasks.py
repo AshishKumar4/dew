@@ -574,6 +574,11 @@ class TextGeneration(_NativeTextTask):
 
     model: nn.Module
     variables: Variables
+    """The weights generations read. A task loaded from a source (`dew.pipeline`) or a saved run
+    (`from_run`) holds them in the serving layout, its projections packed
+    (`dew.inference.projections`); one over a live objective's arrays holds those as they are. An
+    objective built over them, and an export of them, read the model's own tree
+    (`projections.unpacked`)."""
     processor: Processor | None = None
     sampling: Sampling = dataclasses.field(default_factory=Sampling)
     max_new_tokens: int | None = None
