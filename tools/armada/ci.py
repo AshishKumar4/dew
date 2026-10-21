@@ -782,7 +782,12 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: bool, processes
     measured that large, or with a child the lane did not follow, as the fla reference's in another
     environment's Python) grows its pool as it uses it rather than taking the share at its first GPU
     op (`XLA_PYTHON_CLIENT_PREALLOCATE`), so such a child has what the file has not yet taken; a file
-    that grows to the whole share still leaves its child none."""
+    that grows to the whole share still leaves its child none.
+
+    First the pinned fixtures the tests read offline are fetched while the Hub is reachable
+    (tools/fetched_fixtures.py): a store file already whole is kept, and a pin whose upload is due stops
+    the lane before any file runs."""
+    subprocess.run([f".venv-{python}/bin/python", "tools/fetched_fixtures.py", "fetch"], check=True)
     token = os.environ["DEW_XLA_CACHE_TOKEN"]
     [total] = (int(megabytes) * 2 ** 20 for megabytes in gpu_query("memory.total"))
     budget = float(os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"]) * total
