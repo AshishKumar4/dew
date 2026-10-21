@@ -39,6 +39,19 @@ CASES = {
     "wide-state-documents": (1, 48, 2, 16, 2, 256, 16, "float32", True),
 }
 
+SEEDED_CASES = {
+    "bf16": (2, 200, 24, 16, 8, 32, 64, "bfloat16", True),
+    "ragged-documents": (2, 100, 24, 16, 8, 16, 32, "float32", True),
+    "whole-chunks": (1, 128, 64, 32, 1, 32, 64, "float32", False),
+    "wide-state-documents": (2, 48, 16, 16, 2, 256, 16, "float32", True),
+}
+"""The seeded recording's cases (`write_seeded`): `CASES`' with more heads (three a group where
+`CASES` has three, one group where it has one) and the wide state over two rows, where `CASES`' own
+did not resolve: `D`'s gradient is a head's one sum, and a few heads' per-head decays are each
+draw's shared factors, so the reference compared with itself needed 512 seeds or more on the XLA
+proxy (`seeds_for`), mamba_ssm's own more than 512 for ragged-documents; these take 64 to 128 on the
+proxy (2026-10-21, on armada)."""
+
 
 def operands(rng, batch, tokens, heads, width, groups, state, cast, documents) -> dict[str, np.ndarray]:
     """A case's inputs, with `cast` narrowing native operands and storing their values in fp32."""
@@ -114,7 +127,7 @@ def write_seeded(scan, minimal, version, revision):
     from ssd_support import mamba_ssd_draw, mamba_ssd_xla, ssd_orbit
 
     stored = {"precision": np.asarray("ieee")}
-    for case, (*shape, chunk, dtype, documents) in CASES.items():
+    for case, (*shape, chunk, dtype, documents) in SEEDED_CASES.items():
         narrow_dtype, dtype = jnp.dtype(dtype), getattr(torch, dtype)
         exact_run = jax.jit(lambda arrays, chunk=chunk: mamba_ssd_xla(arrays, chunk))
 
