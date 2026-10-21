@@ -25,6 +25,7 @@ from jax.experimental import multihost_utils
 
 from dew.coordination import PeerFailure, agree_process_phase, agreed, broadcast_from_process_zero
 from dew.data.dataset import DataPartition
+from dew.inference.rollouts import check_ending
 from dew.nn.inputs import ModelInputs, local_rows, mesh_of
 from dew.objectives.base import Batch, Variables
 from dew.sampling.text import Generation, Sampling
@@ -109,11 +110,13 @@ class Action:
     `raw_log_probs` are the unmodified model's likelihoods, or None when
     the server that drew the action does not report them, as vLLM and
     SGLang do not. `behavior_log_probs` include the `Sampling` controls.
-    EOS ends the model turn, not the episode. Context and action ids are
-    nonnegative integers. An action stops at the first configured EOS, and
-    `terminated` is true exactly when its last token is that EOS; anything
-    else raises ValueError. Checking ids against the vocabulary size is
-    left to the caller, which knows the model.
+    EOS or a stop string ends the model turn, not the episode. Context and
+    action ids are nonnegative integers. An action ends as its `sampling`
+    ends a draw (`dew.inference.rollouts.check_ending`): on the first EOS id
+    or the id completing a stop string, where `terminated` is true, or cut
+    short, where it is false; anything else raises ValueError. Checking ids
+    against the vocabulary size is left to the caller, which knows the
+    model.
     """
 
     context: tuple[int, ...]
@@ -139,12 +142,7 @@ class Action:
                 raise ValueError("sampled action likelihoods must be finite")
         if type(self.terminated) is not bool:
             raise ValueError("sampled action terminated must be a boolean")
-        stops = self.sampling.stops
-        if self.terminated != (self.tokens[-1] in stops):
-            raise ValueError("inference termination disagrees with the sampled EOS token")
-        for index, token in enumerate(self.tokens):
-            if token in stops and index != len(self.tokens) - 1:
-                raise ValueError("sampled action cannot contain tokens after EOS")
+        check_ending(self.tokens, self.terminated, self.sampling)
 
 
 @dataclass(frozen=True)
@@ -353,8 +351,8 @@ def _halted(slot: EpisodeProgress) -> None:
 
 
 def step_action(environment: Environment, action: Action) -> Observation:
-    """Step the environment with an action that ended on EOS; one that
-    hit its token limit truncates instead."""
+    """Step the environment with an action that ended its turn, on EOS or a
+    stop string; one that hit its token limit truncates instead."""
     if action.terminated:
         return environment.step(action)
     return Observation((), EpisodeStatus.TRUNCATED, "model turn reached its token limit")
@@ -370,7 +368,7 @@ class EpisodeRollout:
     `verifier`. An error or a cancellation aborts the whole group before a
     `Trainer` update, and `record` receives the partial episodes before the
     exception propagates. `groups` must be at least 2, and `sampling` must
-    set an EOS id.
+    set an EOS id or a stop string.
 
     Episodes train through `sessions.pack`. A call whose context extends the
     previous call's context and actions merges into that call's chain, and
@@ -413,8 +411,9 @@ class EpisodeRollout:
                 raise ValueError(f"{name} must be a positive integer")
         if type(self.groups) is not int or self.groups < 2:
             raise ValueError("an episode group needs at least two samples")
-        if self.sampling.eos_token_ids is None:
-            raise ValueError("tool episodes need an EOS token to distinguish complete and truncated actions")
+        if self.sampling.eos_token_ids is None and not self.sampling.stop:
+            raise ValueError("tool episodes need an EOS id or a stop string to tell a turn that ended "
+                             "from one cut at its token limit")
         check_credit(self.credit)
 
     def _persist(self, slot: EpisodeProgress, run: JournalRun | None, policy_step: int, binding: str) -> None:
@@ -486,8 +485,8 @@ class EpisodeRollout:
                  binding_id: str, turn: int, run: JournalRun | None) -> None:
         """Record this turn's draws, then step each slot's environment with them.
 
-        A model turn that stopped on its token limit instead of EOS
-        truncates the episode rather than calling the environment.
+        A model turn that stopped on its token limit instead of EOS or a stop
+        string truncates the episode rather than calling the environment.
         """
         if not isinstance(generation, Generation):
             raise TypeError("tool episodes require an autoregressive Generation")
@@ -785,7 +784,7 @@ def session_of(episode: Episode, *, group: str) -> Session:
     behavior likelihoods, its reward is the step reward the observation after
     it carries, its transcript lists the messages the observations before it
     carried (none where they carried none), and its finish reason is `stop`
-    when the action ended on EOS and `length` otherwise. An error the
+    when the action ended on EOS or a stop string and `length` otherwise. An error the
     environment reports
     becomes `INFRA_ERROR`, because the verifier's reward, not the status,
     says how well the agent did.
