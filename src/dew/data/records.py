@@ -287,9 +287,11 @@ def _counts(value: Configured) -> TypeGuard[Callable[[Batch], int]]:
 
 def _same(original: object, rebuilt: object, where: str, *, sequences: bool = False) -> str | None:
     """Where `rebuilt` differs from `original`, None where it is the same value: of the same type at
-    every level, a tuple a tuple and a list a list (any sequence the other with `sequences`), an
-    array of the same dtype and values, a function of the same code over the same values, a class
-    or a method of the same object. A value no record carries is refused."""
+    every level, a tuple a tuple and a list a list, an array of the same dtype and values, a
+    function of the same code over the same values, a class or a method of the same object. With
+    `sequences`, a value or a dataclass's field may be any sequence where it was another, as a
+    store's settings may, but what the sequence holds is held to its own types. A value no record
+    carries is refused."""
     alike = sequences and isinstance(original, (list, tuple)) and isinstance(rebuilt, (list, tuple))
     if type(original) is not type(rebuilt) and not alike:
         return f"{where} is a {type(original).__name__} and reads back a {type(rebuilt).__name__}"
@@ -319,13 +321,12 @@ def _same(original: object, rebuilt: object, where: str, *, sequences: bool = Fa
     if isinstance(original, Mapping) and isinstance(rebuilt, Mapping):
         if list(original) != list(rebuilt):
             return f"{where} reads back other keys"
-        differences = (_same(value, rebuilt[key], f"{where}[{key!r}]", sequences=sequences)
-                       for key, value in original.items())
+        differences = (_same(value, rebuilt[key], f"{where}[{key!r}]") for key, value in original.items())
         return next((difference for difference in differences if difference is not None), None)
     if isinstance(original, (list, tuple)) and isinstance(rebuilt, (list, tuple)):
         if len(original) != len(rebuilt):
             return f"{where} reads back {len(rebuilt)} entries, not {len(original)}"
-        differences = (_same(left, right, f"{where}[{index}]", sequences=sequences)
+        differences = (_same(left, right, f"{where}[{index}]")
                        for index, (left, right) in enumerate(zip(original, rebuilt, strict=True)))
         return next((difference for difference in differences if difference is not None), None)
     if isinstance(original, (str, bytes, int, float, complex, bool, Enum, np.generic)) or original is None:
