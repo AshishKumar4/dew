@@ -33,6 +33,7 @@ from .text import ByteTokenizer, HFTokenizer
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
 
+    from dew.data.dataset import Records
     from dew.data.steps.chat import RenderPrompt
 
 PROMPT_KEY = "prompt"
@@ -186,3 +187,19 @@ def encode(tokenizer: str | PreTrainedTokenizerBase, *, max_prompt_len: int = 25
     from dew.data.text import tokenizer_name
 
     return RenderPrompt(tokenizer_name(tokenizer), max_prompt_len, pad_id, long=long, thinking=thinking)
+
+
+@dataclass(frozen=True)
+class RewardWidth:
+    """The bytes the widest reward string of a store's prompt rows takes, its data source, ground
+    truth and extra info, at least one: the width each row's reward columns are padded to, so every
+    row fits whole (`Configured.measures`)."""
+
+    fact = "reward_bytes"
+
+    def __call__(self, records: Records, /) -> int:
+        widths = (len(text.encode("utf-8")) for index in range(len(records)) for row in (records[index],)
+                  if isinstance(row, Mapping)
+                  for text in (_text(row.get("data_source")), _ground_truth(row, "prompt"),
+                               _text(_extra_info(row))))
+        return max(1, max(widths, default=1))
