@@ -38,7 +38,7 @@ import pytest
 from delta_rule_support import recurrence, through
 from flax import linen as nn
 from model_support import decode_through
-from reference_error import assert_as_exact, assert_as_exact_as_the_reference, seeds_for, widened
+from reference_error import assert_as_exact, assert_as_exact_as_the_reference, widened
 from tuned import each_config, launches, timed
 
 from dew.nn import linear
@@ -144,6 +144,11 @@ def test_the_chunked_and_recurrent_forms_agree(reference):
     assert largest(chunked_state, recurrent_state) < 1e-5
 
 
+PACKED_RULE_SEEDS = {(1, False): 32, (1, True): 128, (8, False): 16, (8, True): 128}
+"""Declared seeds for check 1, sized by `seeds_for` on armada, 2026-10-20: the separate documents'
+chunked rule against the float64 recurrence, for each decay width and strength."""
+
+
 @pytest.mark.parametrize("strong", [False, True], ids=["drawn decay", "strong decay"])
 @pytest.mark.parametrize("decay_width", [1, 8], ids=["per head", "per key dimension"])
 def test_the_chunked_rule_runs_packed_documents_as_each_runs_alone(decay_width, strong):
@@ -195,9 +200,7 @@ def test_the_chunked_rule_runs_packed_documents_as_each_runs_alone(decay_width, 
         evaluated, functools.partial(recurrence, cuts=(begins,), rule=chunked)))
     truth = jax.jit(functools.partial(evaluated, functools.partial(recurrence, cuts=(begins,))))
     label = f"packed delta rule {decay_width=} {strong=}"
-    seeds = seeds_for(reference, draw, label, truth_fn=truth)
-    print(f"SIZED {label}: {seeds}", flush=True)
-    assert_as_exact(dew, reference, draw, label, seeds=seeds, truth_fn=truth)
+    assert_as_exact(dew, reference, draw, label, seeds=PACKED_RULE_SEEDS[decay_width, strong], truth_fn=truth)
 
 
 @pytest.mark.parametrize("per_key", [False, True], ids=["gated delta net", "Kimi delta attention"])
