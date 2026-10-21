@@ -63,8 +63,8 @@ import jax.numpy as jnp
 import tyro
 
 from dew.config import OptimConfig
-from dew.config.data import PromptData, loader
-from dew.data import HFTokenizer, Loading
+from dew.data import HFTokenizer, Memory, presets
+from dew.data.compile import compile
 from dew.data.prompts import PromptRecord
 from dew.inference import (
     NativeRolloutServer,
@@ -579,11 +579,10 @@ def main(config: Config) -> dict:
             lambda text: words.tokenizer.encode(text, add_special_tokens=False),
             config,
         )
-    data = loader(PromptData(tokenizer=tokenizer,
-        source=tuple(json.loads(row) for row in records(config.tasks, config.seed)),
-                        thinking=config.thinking, max_prompt_len=config.prompt_tokens, long="truncate",
-                        pad_id=sampling.pad_token_id), batch=config.prompts, read="memory",
-                loading=Loading(workers=0, threads=1, read_buffer=2, worker_buffer=1), seed=config.seed)
+    prompts = Memory([json.loads(row) for row in records(config.tasks, config.seed)])
+    data = compile(prompts.shuffle(seed=config.seed).repeat().pipe(
+        presets.prompts, tokenizer, max_prompt_len=config.prompt_tokens, batch=config.prompts,
+        pad_id=sampling.pad_token_id, long="truncate", thinking=config.thinking), seed=config.seed)
     # Every session packs as one chain within the width.
     rollout = RolloutScheduler(objective, sessions, server, width=width, rows=config.prompts * config.groups,
                                tasks=prompt_tasks, groups=config.groups,
