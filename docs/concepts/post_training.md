@@ -681,15 +681,17 @@ On several hosts, every rank takes part in generation. Rewards run on rank zero.
 
 ## Stage chains
 
-`recipes.chain.Recipe(model, optimizer, key, stages, directory, batch=8, layout=Layout())` trains one decoder through a tuple of `Stage` values, in Python only. The type of a stage's dataset decides its objective:
+`recipes.chain.Recipe(model, optimizer, key, stages, directory, layout=Layout())` trains one decoder through a tuple of `Stage` values, in Python only. A stage's `loss` decides its objective, and its `data` ends in that loss's preset:
 
-| Stage data | Objective | Rollout |
-| --- | --- | --- |
-| `TextData` | `LMObjective`, every token (pretraining) | none |
-| `ChatData` | `LMObjective(loss_role=Role.ASSISTANT)` (SFT) | none |
-| `PreferenceData` | `DPOObjective` | none |
-| `PromptData` | `GRPOObjective` | `SampledRollout` |
-| `RecordsData` of `task_id` rows | `PPOObjective` | `PPORollout` over an `EpisodeRollout` |
+| Stage `loss` | Data ends in | Objective | Rollout |
+| --- | --- | --- | --- |
+| `"pretrain"` | `presets.lm` | `LMObjective`, every token | none |
+| `"sft"` | `presets.sft` | `LMObjective(loss_role=Role.ASSISTANT)` | none |
+| `"dpo"` | `presets.preferences` | `DPOObjective` | none |
+| `"grpo"` | `presets.prompts` | `GRPOObjective` | `SampledRollout` |
+| `"ppo"` | `batch(n)` over `task_id` rows | `PPOObjective` | `PPORollout` over an `EpisodeRollout` |
+
+`Recipe.run` checks each stage's data against its loss by the fields the chain writes, and refuses a mismatch by name.
 
 A pretraining or SFT stage with a `teacher` trains `DistillationObjective` over that objective instead. The stage name only labels its directory, so a name such as `"sft"` does not infer masks or convert data.
 
@@ -697,7 +699,7 @@ In new stage directories, each stage starts a fresh optimizer and step counter f
 
 A `Stage` sets `steps` (default 100) and `beta` (`None` picks 0.1 for DPO and 0.0 for GRPO and PPO; a pretraining or SFT stage refuses a `beta`). `groups` and `max_new_tokens` size the GRPO and PPO samples, `estimator` sets the GRPO advantage, and `sampling` sets the decoding policy of both.
 
-- A GRPO stage requires a `reward`. The reward reads completions decoded by the `PromptData` tokenizer, and sampling stops at that tokenizer's EOS where `sampling` names no EOS of its own.
+- A GRPO stage requires a `reward`. The reward reads completions decoded by the `prompts` preset's tokenizer, and sampling stops at that tokenizer's EOS where `sampling` names no EOS of its own.
 - A PPO stage requires `episodes`, an `Episodes(environment, verifier, critic, max_prompt_tokens, max_turns, gamma, lam)`. Its `sampling` must name the EOS that ends an action. The critic, such as `ValueHead` over a decoder, starts from its key in each PPO stage.
 - `teacher` is a `Teacher(model, alpha, temperature)`. Its `model` is a loaded model with its weights over the decoder's vocabulary, such as `Pretrained.load`'s or `Pretrained.from_run`'s. The chain does not set feature-pair distillation; build `DistillationObjective` and `Trainer` directly for it.
 
