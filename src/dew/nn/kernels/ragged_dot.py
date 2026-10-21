@@ -128,20 +128,13 @@ def _make_gmm_group_metadata(
 
 
 def _side_tile(ref, axes, origins: dict, masks: dict):
-  """Dew: a side operand's tile, loaded at the launch's own origins: each of its two dimensions follows
-  the launch axis `axes` names ('rows', 'depth', 'columns'), its start, extent and mask from `origins`
-  and `masks`, or is broadcast (None: extent 1, index 0)."""
-  index, dimension_masks = [], []
-  for axis in axes:
-    if axis is None:
-      index.append(pl.ds(0, 1))
-      dimension_masks.append(jnp.ones((1,), jnp.bool_))
-    else:
-      start, extent = origins[axis]
-      index.append(pl.ds(start, extent))
-      dimension_masks.append(masks[axis])
-  mask = dimension_masks[0][:, None] & dimension_masks[1][None, :]
-  return plgpu.load(ref.at[index[0], index[1]], mask=mask, other=0)
+  """Dew: a side operand's tile, loaded at the launch's own origins: each of its dimensions follows the
+  launch axis `axes` names ('rows', 'depth', 'columns'), its start, extent and mask from `origins` and
+  `masks`. A vector is one axis's, which the hook broadcasts itself."""
+  index = tuple(pl.ds(*origins[axis]) for axis in axes)
+  first, *rest = (masks[axis] for axis in axes)
+  mask = first[:, None] & rest[0][None, :] if rest else first
+  return plgpu.load(ref.at[index], mask=mask, other=0)
 
 
 def _gpu_ragged_dot_kernel(
@@ -293,8 +286,8 @@ def gmm(
 
   Dew: `prologue(tile, *side_tiles)` transforms each loaded `[block_m, block_k]` tile of `x` and
   `epilogue(acc, *side_tiles)` each fp32 accumulator tile, returning one output or a tuple of them
-  (`out_dtypes`). Each side operand is 2-D, its dimensions following the launch axes its `*_axes`
-  entry names (`_side_tile`)."""
+  (`out_dtypes`). Each side operand's dimensions follow the launch axes its `*_axes` entry names
+  (`_side_tile`): 'rows' and 'depth' for the prologue's, 'rows' and 'columns' for the epilogue's."""
 
   msg = "This gmm kernel only supports either (m, k) x (g, k, n) -> (m, n) "
   msg += f"or (m, k) x (g, n, k) -> (m, n), but got {x.shape=} {A.shape=}"
@@ -332,7 +325,7 @@ def gmm(
       group_metadata,
     ),
     # Dew: each side operand whole; the kernel loads its tiles at its own origins.
-    *(pl.BlockSpec(side.shape, lambda i, j: (0, 0)) for side in sides),
+    *(pl.BlockSpec(side.shape, lambda i, j, ndim=side.ndim: (0,) * ndim) for side in sides),
   ]
   dtypes = out_dtypes or (out_dtype or x.dtype,)
   out_shape = tuple(jax.ShapeDtypeStruct((size.m, size.n), dtype=dtype) for dtype in dtypes)
@@ -489,7 +482,7 @@ def tgmm(
     pl.BlockSpec((size.m, block_n), lambda i, r, c: (0, c)),
     pl.BlockSpec((size.g,), lambda i, r, c: (0,)),
     pl.BlockSpec((size.g,), lambda i, r, c: (0,)),
-    *(pl.BlockSpec(side.shape, lambda i, r, c: (0, 0)) for side in prologue_operands),
+    *(pl.BlockSpec(side.shape, lambda i, r, c, ndim=side.ndim: (0,) * ndim) for side in prologue_operands),
   ]
 
   out_shape = jax.ShapeDtypeStruct(
