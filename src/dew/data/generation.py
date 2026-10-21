@@ -89,6 +89,15 @@ def _decode_outputs(encoded: bytes) -> Outputs:
     return tuple(outputs)
 
 
+def _rule(value: Batch | bytes | Rejected | None) -> list[int | None] | None:
+    """The role and pad id a published row's targets were counted by (`CountRule`), or None where
+    they are every target's, as a row never counted is."""
+    from dew.data.steps.text import CountRule
+
+    rule = CountRule.of(value) if isinstance(value, Mapping) else None
+    return None if rule is None else [rule.role, rule.pad_id]
+
+
 def _fact(value: Batch | bytes | Rejected | None, name: str) -> int | None:
     if not isinstance(value, Mapping) or name not in value:
         return None
@@ -145,6 +154,7 @@ def _publish(
                 "output": index,
                 "length": entry["lengths"][index],
                 "valid_targets": entry["valid_targets"][index],
+                "rule": entry["rules"][index],
             }
             for index in range(entry["fanout"])
         )
@@ -171,6 +181,10 @@ def _publish(
     if all(count is not None for count in targets):
         metadata["valid_targets"] = sum(targets)
         metadata["zero_target_windows"] = targets.count(0)
+    # The rules other than every target's that the rows' targets were counted by, which a plan of
+    # their lengths cannot count (`dew.data.analysis._ruled`).
+    distinct = {tuple(entry["rule"]) for entry in dense if entry["rule"] is not None}
+    metadata["count_rules"] = [list(rule) for rule in sorted(distinct, key=repr)]
     referenced = {entry["shard"] for entry in completions.values()}
     definition = {
         "schema": 1,
@@ -303,9 +317,9 @@ def _completion(entry: Mapping[str, object], encoded: Batch | bytes | None) -> N
         raise ValueError(f"cache accepted-output checksum differs for {entry['id']}")
     if entry["outputs"] != [[entry["id"], index] for index in range(len(accepted))]:
         raise ValueError(f"cache completion output IDs differ for {entry['id']}")
-    if entry["lengths"] != [_fact(value, "_dew_length") for value in accepted] or entry["valid_targets"] != [
-        _fact(value, "_dew_valid_targets") for value in accepted
-    ]:
+    if (entry["lengths"] != [_fact(value, "_dew_length") for value in accepted]
+            or entry["valid_targets"] != [_fact(value, "_dew_valid_targets") for value in accepted]
+            or entry["rules"] != [_rule(value) for value in accepted]):
         raise ValueError(f"cache completion metadata differs for {entry['id']}")
 
 
@@ -503,6 +517,7 @@ class _GenerationSource:
             **_uncounted(self.generation.manifest["source_metadata"]),
             "rows": len(self.generation),
             "accepted_rows": len(self.generation),
+            **({"count_rules": metadata["count_rules"]} if "count_rules" in metadata else {}),
             **(
                 {
                     "valid_targets": metadata["valid_targets"],
