@@ -328,3 +328,50 @@ def test_values_without_a_contract_are_not_certified():
         assert not out.certified.any()
     assert not _probed_dot(jax.lax.DotAlgorithmPreset.F16_F16_F16, None, np.float32)
     assert _probed_dot(None, None, np.float32)
+
+
+def test_exp_is_held_to_a_verified_enclosure_at_every_element_and_carries_its_operands_bound():
+    """exp at ordinary fp32 and float64 arguments: certified, its bound at least its distance from the
+    exact value (mpmath at 200 bits); past its range, not certified."""
+    import mpmath
+
+    for dtype, values in ((jnp.float32, [0.3, -5.0, 20.0]), (jnp.float64, [0.3, -5.0, 20.0])):
+        with jax.enable_x64(new_val=dtype == jnp.float64):
+            x = jnp.asarray(values, dtype)
+            out, _ = _interpreted(jnp.exp, x)
+        assert out.certified.all()
+        for at in range(len(values)):
+            with mpmath.workprec(200):
+                mantissa, exponent = mpmath.exp(mpmath.mpf(float(x[at]))).man_exp
+            exact = fractions.Fraction(mantissa) * fractions.Fraction(2) ** exponent
+            apart = abs(exact - fractions.Fraction(float(out.value[at])))
+            assert fractions.Fraction(float(out.error[at])) >= apart
+    overflowing, _ = _interpreted(jnp.exp, jnp.asarray([100.0], jnp.float32))
+    assert not overflowing.certified.any()
+
+
+def test_a_single_key_query_gradient_with_computed_scores_is_certified():
+    """The single-key query gradient with its scores computed from q·kᵀ, so exp is taken at a bounded
+    argument: certified on its own bound, and FlashAttention's D passes there."""
+    keep = np.array([0, 2, 1, 3])
+    visible = jnp.asarray(np.arange(4)[None, :] == keep[:, None])
+
+    def probabilities(q, k):
+        scores = jnp.where(visible, q @ k.T * jnp.float32(0.25), -jnp.inf)
+        weights = jnp.exp(scores - jnp.max(scores, axis=-1, keepdims=True))
+        return weights / jnp.sum(weights, axis=-1, keepdims=True)
+
+    def dew(q, k, v, d_out):
+        p = probabilities(q, k)
+        delta = jnp.sum(d_out * (p @ v), axis=-1, keepdims=True)
+        return {"d_q": (p * (d_out @ v.T - delta)) @ k * jnp.float32(0.25)}
+
+    def reference(q, k, v, d_out):
+        p = probabilities(q, k)
+        d_p = d_out @ v.T
+        return {"d_q": (p * (d_p - jnp.sum(p * d_p, axis=-1, keepdims=True))) @ k * 0.25}
+
+    rng = np.random.default_rng(5)
+    inputs = tuple(jnp.asarray(rng.normal(size=(4, 16)), jnp.float32) for _ in range(4))
+    coverage = assert_zero_elements(dew, reference, inputs, "computed scores")
+    assert coverage.certified == 64, coverage
