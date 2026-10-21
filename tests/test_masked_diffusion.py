@@ -20,6 +20,7 @@ import optax
 import pytest
 from flax import linen as nn
 from model_support import flat_tree
+from reference_error import assert_as_exact
 
 from dew.checkpoints import Checkpoints
 from dew.data import ByteTokenizer
@@ -204,7 +205,8 @@ def test_the_trainer_builds_its_state_from_the_held_checkpoint():
         np.testing.assert_array_equal(np.asarray(leaf), np.asarray(held[name]))
 
 
-@pytest.fixture(scope="module", params=["llada-tiny", "dream-tiny"])
+@pytest.fixture(scope="module", params=["llada-tiny", "dream-tiny", "llada-moe-tiny",
+                                      "llada-moe-v2-tiny", "llada2-tiny", "llada22-tiny"])
 def masked_source(request):
     source = Pretrained.load(FIXTURES / request.param, dtype="float32", attention_impl="xla")
     tokens = jnp.asarray([[0, 120, 5, 6], [1, 2, 3, 4], [0, 0, 7, 8]])
@@ -322,11 +324,19 @@ def test_masked_training_resume_publish_and_run_pipeline(masked_source, tmp_path
     assert all(leaf.dtype == jnp.float32 for leaf in jax.tree.leaves(restored.variables))
     converted = pipeline(str(tmp_path / "run"), ema=False, dtype="float32", param_dtype="bfloat16")
     reference = replace(live, model=model.clone(dtype=jnp.float32),
-                        variables=jax.tree.map(lambda leaf: leaf.astype(jnp.bfloat16), live.variables))
+                        variables={**live.variables, 'params': jax.tree.map(
+                            lambda leaf: leaf.astype(jnp.bfloat16), live.variables['params'])})
     np.testing.assert_array_equal(converted(prompt, key=7).host().tokens,
                                   reference(prompt, 8, key=7).host().tokens)
     assert converted.model.dtype == jnp.float32
-    assert all(leaf.dtype == jnp.bfloat16 for leaf in jax.tree.leaves(converted.variables))
+    assert jax.tree.map(lambda leaf: leaf.dtype, converted.variables) == jax.tree.map(
+        lambda leaf: leaf.dtype, reference.variables)
+    expected_logits = jax.jit(lambda tokens: reference.model.apply(reference.variables, tokens))
+    actual_logits = jax.jit(lambda tokens: converted.model.apply(converted.variables, tokens))
+    assert_as_exact(actual_logits, expected_logits,
+                    lambda seed: (np.asarray([(np.arange(8) + seed) % model.vocab_size], np.int32),),
+                    'converted masked decoder logits', seeds=8,
+                    truth_fn=lambda tokens: np.asarray(expected_logits(tokens), np.float64))
 
     source.save(tmp_path / "published", variables=resumed.variables)
     reloaded = Pretrained.load(tmp_path / "published", dtype="bfloat16", attention_impl="xla")
