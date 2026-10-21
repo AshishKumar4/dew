@@ -474,25 +474,32 @@ def test_coverage_combines_each_tasks_branches_into_one_report_a_module_a_line(c
     assert Path(least[0].removeprefix("| ")).name == "unused.py" and least[-1] == "0.0% |"
 
 
-def test_the_plan_runs_as_one_wave_on_the_pool(ci, tmp_path, monkeypatch):
-    """The plan's target is the least whose tasks fit the pool at once, so no task waits for another to free
-    its container (train 22: 212 tasks of a set 240 s target on 160 containers ran as two waves, 10:10),
-    and no less than the heaviest test, which no cut divides. The plan command reads the pool from
-    .armada.json."""
+def test_the_plan_runs_as_one_wave_on_the_pool(ci, tmp_path, monkeypatch, capsys):
+    """The plan's target rises from the heaviest test, which no cut divides, to its work over the pool, so its
+    tasks start at once and none waits for another to free its container (train 22: 212 tasks of a set 240 s
+    target on 160 containers ran as two waves, 10:10). Files nothing has timed each run alone whatever the
+    target; where they alone fill the pool, one wave cannot hold the suite, and the plan says so and runs in
+    waves. The plan command reads the pool from .armada.json."""
     records = {f"tests/test_even{n}.py::test_a": 100.0 for n in range(12)}
     records |= {"tests/test_heavy.py::test_a": 200.0, "tests/test_heavy.py::test_b": 100.0}
     for node in records:
         (tmp_path / node.split("::")[0]).write_text("")
     (tmp_path / "tests/test_durations.json").write_text(json.dumps(records))
     monkeypatch.setenv("DEW_TEST_CACHE", "off")
-    for pool in (4, 8):
-        target = ci.one_wave({}, pool)
-        assert len(ci.plan(target, {})) <= pool < len(ci.plan(target - 1, {})), (pool, target)
-    assert ci.one_wave({}, 1000) == 200.0
-    (tmp_path / ".armada.json").write_text(json.dumps({"pool": 8}))
+    # 1,500 s of tests on each Python: two tasks of 750 s each on four containers, four of 375 s on eight.
+    for pool, target in ((4, 750.0), (8, 375.0), (1000, 200.0)):
+        assert ci.one_wave({}, pool) == target
+        assert len(ci.plan(target, {})) <= pool
+    for n in range(5):
+        (tmp_path / f"tests/test_new{n}.py").write_text("")
+    assert ci.one_wave({}, 20) == 300.0 and len(ci.plan(300.0, {})) == 20
+    capsys.readouterr()
+    assert ci.one_wave({}, 8) == 200.0 and len(ci.plan(200.0, {})) > 8
+    assert "one wave cannot hold the plan" in capsys.readouterr().err
+    (tmp_path / ".armada.json").write_text(json.dumps({"pool": 20}))
     command = [sys.executable, str(ROOT / "tools/armada/ci.py"), "plan", "--timings=none.json"]
     planned = subprocess.run(command, cwd=tmp_path, check=True, capture_output=True, text=True)
-    assert json.loads(planned.stdout)["include"] == ci.plan(ci.one_wave({}, 8), {})
+    assert json.loads(planned.stdout)["include"] == ci.plan(300.0, {})
 
 
 def test_a_file_whose_recorded_tests_outweigh_its_median_runs_split_by_them(ci, tmp_path):
