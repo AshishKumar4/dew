@@ -746,7 +746,7 @@ def _epoch(reader, batches: int) -> list[tuple[bytes, ...]]:
     return sorted(rows)
 
 
-def test_a_prompt_recipe_with_a_cache_reads_by_index_the_prompts_it_reads_uncached():
+def test_a_prompt_recipe_with_a_cache_reads_by_index_the_prompts_it_reads_uncached(tmp_path):
     """A prompt recipe whose rendering drops prompts too long, cached and read by index: the cache
     holds what is left of each input, so its default order is a window over the rows it reads,
     and an epoch reads the prompts the uncached recipe's epoch reads."""
@@ -756,7 +756,8 @@ def test_a_prompt_recipe_with_a_cache_reads_by_index_the_prompts_it_reads_uncach
     # A third of the prompts are longer than 8 bytes, which the recipe drops: four batches an epoch.
     recipe = PromptData(tuple({"prompt": "hi " * (1 + index % 3)} for index in range(12)), "byte",
                         max_prompt_len=8, long="drop", reward_bytes=8)
-    cached = loader(recipe, batch=2, cache=_cache(), read="indexed")
+    # The recipe reads in worker processes, which read a cache on disk.
+    cached = loader(recipe, batch=2, cache=str(tmp_path / "cache"), read="indexed")
     uncached = loader(recipe, batch=2, read="indexed")
     assert cached.records == uncached.records
     first, second = cached.train(DataPartition()), uncached.train(DataPartition())
@@ -767,7 +768,7 @@ def test_a_prompt_recipe_with_a_cache_reads_by_index_the_prompts_it_reads_uncach
         second.close()
 
 
-def test_an_image_recipe_with_a_fixed_caption_and_a_cache_reads_in_its_uncached_order():
+def test_an_image_recipe_with_a_fixed_caption_and_a_cache_reads_in_its_uncached_order(tmp_path):
     """An image recipe's fixed caption is a configured step, which binds to one that keeps every
     image: cached and read by index, it holds one row for each input, so the recipe takes the
     global order it takes uncached and reads the same batches."""
@@ -777,7 +778,7 @@ def test_an_image_recipe_with_a_fixed_caption_and_a_cache_reads_in_its_uncached_
     images = [{"image": np.random.default_rng(index).integers(0, 256, (6, 5, 3), np.uint8), "label": index}
               for index in range(80)]
     recipe = ImageData(Memory(images), image_size=4, caption="a photo", augment=None, validation=None)
-    cached = loader(recipe, batch=4, cache=_cache(), read="indexed")
+    cached = loader(recipe, batch=4, cache=str(tmp_path / "cache"), read="indexed")
     uncached = loader(recipe, batch=4, read="indexed")
     first, second = cached.train(DataPartition()), uncached.train(DataPartition())
     try:
