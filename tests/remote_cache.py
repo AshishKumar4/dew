@@ -3,13 +3,21 @@
 Each armada task and GPU pass starts on a cold machine, so the on-disk cache conftest turns on
 (`dew.cache.enable_compilation_cache`) is always empty there, and the suite spends most of its time
 in XLA: on the Colab A100 tier, compiling took 55% of every file's wall time. With
-DEW_XLA_CACHE_URL and DEW_XLA_CACHE_TOKEN set (.armada.json), `install` puts `RemoteCache` over
-JAX's own cache, and every program a test file compiles or reads joins that file's bundle on the
-dew-xla-cache Worker (deployed from the private dew-ops repository): one GET as the file is
-collected puts its last run's programs in the local cache, and one PUT after it ran, where it used
-any program the bundle lacked, writes them back. Bundles are kept under jax's and jaxlib's
-versions, the backend, the Python minor and the device's kind, beside JAX's own key of each
-program and its flags.
+DEW_XLA_CACHE_URL and DEW_XLA_CACHE_TOKEN set (.armada.json), `install` keeps each test file's
+programs in that file's bundle on the dew-xla-cache Worker (deployed from the private dew-ops
+repository), through JAX's own cache directory: one GET as the file is collected writes its last
+run's programs into the directory, and one PUT after it ran, where it compiled any program the
+bundle lacked, sends the programs compiled under it and those fetched for it. Bundles are kept
+under jax's and jaxlib's versions, the backend, the Python minor and the device's kind, beside
+JAX's own key of each program and its flags.
+
+JAX keeps a program as one file, `<key>-cache`, in `jax_compilation_cache_dir`, and with no
+`jax_compilation_cache_max_size` (Dew sets none) it neither evicts nor stamps them
+(jax/_src/lru_cache.py in jax 0.11.2), so the files a directory gains while a file's tests run are
+the programs they compiled. The programs they only read are not seen, so a program another
+file's bundle brought in joins this file's bundle only where it is compiled under it. Each pytest
+worker that keeps a bundle has a directory of its own (conftest), so the files a worker's bundle
+gains are its own whole writes, never another worker's half-written one.
 
 A bundle is a file's in one execution partition (conftest's `bundle`): a split file's group, or an
 xdist worker, has its own, so partitions that compile apart never replace each other's programs. A
@@ -19,14 +27,15 @@ compile than to ask a Worker for: asking about each one took a DeepSeek drafting
 962 s. A file's bundle is its programs' few megabytes (the CPU lane's same-bits test, 6546
 programs, 46 MB).
 
-The remote can only make a task slower: a fetch or an upload that fails counts against it, and
-after `FAILURES` in a row it is left alone for the rest of the process, so an outage costs a few
-timeouts. Being left alone is final and is checked as each request is made: an answer that arrives
-after it, a request already under way, does not take the remote back, and the uploads still queued
-are dropped unsent. Uploads run on a background thread, and the process waits up to `DRAIN_SECONDS`
-for them at exit.
+The remote can only make a task slower: a fetch or an upload that fails, or a local read or write
+of the directory that fails, counts against it, and after `FAILURES` in a row it is left alone for
+the rest of the process, so an outage costs a few timeouts. Being left alone is final and is
+checked as each request is made: an answer that arrives after it, a request already under way,
+does not take the remote back, and the uploads still queued are dropped unsent. Uploads run on a
+background thread, and the process waits up to `DRAIN_SECONDS` for them at exit.
 """
 
+import http.client
 import logging
 import os
 import queue
@@ -37,35 +46,47 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from pathlib import Path
 
 FAILURES = 3
 TIMEOUT_SECONDS = 30.0
 DRAIN_SECONDS = 120.0
 MAX_BYTES = 96 * 1024 * 1024
 """The largest bundle sent: the Worker's request bound, beside the headers."""
+SUFFIX = "-cache"
+"""What JAX's cache names a program's file after its key (jax/_src/lru_cache.py)."""
+UNREACHABLE = (OSError, http.client.HTTPException)
+"""A request that did not complete: urllib's URLError, HTTPError and timeouts are OSErrors, a
+connection cut mid-answer an HTTPException; a local read or write of the cache directory that
+fails is an OSError too."""
 
 logger = logging.getLogger(__name__)
 
 
 class RemoteCache:
-    """`base` (a JAX `CacheInterface`), each test file's entries also read from and written to `url`."""
+    """JAX's cache `directory`, each test file's programs also read from and written to `url`."""
 
-    def __init__(self, base, url: str, token: str, prefix: str):
-        self.base, self.url, self.prefix = base, url.rstrip("/"), prefix.strip("/")
+    def __init__(self, directory: Path, url: str, token: str, prefix: str):
+        self.directory, self.url, self.prefix = Path(directory), url.rstrip("/"), prefix.strip("/")
         # Cloudflare refuses urllib's own User-Agent with a 403 (error 1010) before the Worker sees it.
         self.headers = {"Authorization": f"Bearer {token}", "User-Agent": "dew-ci-xla-cache"}
         self.failures = 0
         self.given_up = False
         self.lock = threading.Lock()
         self.file: str | None = None
-        self.used: dict[str, set[str]] = {}
-        """The programs each bundle's tests compiled or read in this process, by JAX's key."""
+        self.seen: set[str] | None = None
+        """The programs in the directory when the current bundle's run began or last moved on."""
+        self.written: dict[str, list[str]] = {}
+        """The programs compiled while each bundle's tests ran, in the order they appeared."""
+        self.fetched: dict[str, list[str]] = {}
+        """The programs each bundle's GET brought, in the bundle's order."""
         self.held: dict[str, set[str]] = {}
         """The programs each bundle holds on the Worker, as read or last written."""
         # Daemon threads, which the interpreter does not wait for at exit; `drain` bounds the wait.
         self.uploads: queue.Queue[tuple[str, bytes]] = queue.Queue()
-        threading.Thread(target=self._uploading, daemon=True, name="xla-cache").start()
-        self.fetched = self.uploaded = 0
+        self.uploader = threading.Thread(target=self._uploading, daemon=True, name="xla-cache")
+        self.uploader.start()
+        self.programs_fetched = self.uploaded = 0
 
     @property
     def available(self) -> bool:
@@ -92,59 +113,100 @@ class RemoteCache:
                                          data=data, method=method, headers=self.headers)
         return urllib.request.urlopen(request, timeout=TIMEOUT_SECONDS)
 
-    def get(self, key: str):
-        value = self.base.get(key)
-        if value is not None:
-            self._used(key)
-        return value
+    def _programs(self) -> set[str]:
+        return {path.name.removesuffix(SUFFIX) for path in self.directory.glob(f"*{SUFFIX}")}
 
-    def put(self, key: str, value: bytes) -> None:
-        self.base.put(key, value)
-        self._used(key)
-
-    def _used(self, key: str) -> None:
-        with self.lock:
-            if self.file is not None:
-                self.used.setdefault(self.file, set()).add(key)
+    def _moved_on(self) -> None:
+        """The programs the directory gained since the current bundle's run began or last moved on,
+        written to its account."""
+        if self.file is None or self.seen is None:
+            return
+        programs = self._programs()
+        written = self.written.setdefault(self.file, [])
+        written += sorted(programs - self.seen - set(written))
+        self.seen = programs
 
     def opened(self, file: str) -> None:
-        """Bundle `file` in the local cache, and the programs compiled or read from here on its."""
-        self.file = file
-        if file in self.held or not self.available:
+        """Bundle `file` in the local cache, and the programs compiled from here on its."""
+        if not self.available:
             return
-        self.held[file] = set()
         try:
-            answer = self._request(file, "GET")
-            if answer is None:
+            if file != self.file:
+                self._moved_on()
+                self.file = file
+                self.seen = self._programs()
+            if file in self.held:
                 return
-            with answer as response:
-                entries = unpacked(response.read(MAX_BYTES + 1))
-        except urllib.error.HTTPError as error:
-            if error.code != 404:
-                self._failed(error)
-            return
-        except Exception as error:  # a remote that cannot answer, or answers no whole bundle, is a miss
+            self.held[file] = set()
+            entries = self._fetched(file)
+            for key, value in entries:
+                self._seeded(key, value)
+        except UNREACHABLE as error:
             self._failed(error)
             return
-        self._answered()
-        for key, value in entries:
-            self.base.put(key, value)
-            self.held[file].add(key)
+        except ValueError as error:  # an answer that is no whole bundle is a miss
+            self._failed(error)
+            return
+        keys = [key for key, _ in entries]
+        self.fetched[file] = keys
+        self.held[file] = set(keys)
+        self.seen |= set(keys)
         with self.lock:
-            self.fetched += len(entries)
+            self.programs_fetched += len(keys)
+
+    def _fetched(self, file: str) -> list[tuple[str, bytes]]:
+        """The entries of `file`'s bundle on the Worker; none where it has none."""
+        try:
+            answer = self._request(file, "GET")
+        except urllib.error.HTTPError as error:
+            if error.code == 404:
+                return []
+            raise
+        if answer is None:
+            return []
+        with answer as response:
+            entries = unpacked(response.read(MAX_BYTES + 1))
+        self._answered()
+        return entries
+
+    def _seeded(self, key: str, value: bytes) -> None:
+        """`value` as program `key`'s file, unless the directory has it: written to a name of its own
+        and linked in whole, so a reader sees all of it or none."""
+        staged = self.directory / f".{key}.{os.getpid()}.partial"
+        staged.write_bytes(value)
+        try:
+            os.link(staged, self.directory / f"{key}{SUFFIX}")
+        except FileExistsError:
+            pass
+        finally:
+            staged.unlink()
 
     def closed(self, file: str) -> None:
-        """Bundle `file` written back, where its tests used a program it lacked: every program they
-        used in this process, so a file whose tests ran apart (another file's between) sends them all."""
-        with self.lock:
-            used = set(self.used.get(file, ()))
-        if not used - self.held.get(file, set()) or not self.available:
+        """Bundle `file` written back, where its tests compiled a program it lacked: the programs
+        compiled under it, then those fetched for it, up to `MAX_BYTES`."""
+        if not self.available:
             return
-        entries = [(key, value) for key in sorted(used) if (value := self.base.get(key)) is not None]
-        bundle = packed(entries)
-        if len(bundle) <= MAX_BYTES:
-            self.held[file] = used
-            self.uploads.put((file, bundle))
+        try:
+            if file == self.file:
+                self._moved_on()
+            written = self.written.get(file, [])
+            if not set(written) - self.held.get(file, set()):
+                return
+            entries, size = [], 0
+            for key in dict.fromkeys([*written, *self.fetched.get(file, [])]):
+                path = self.directory / f"{key}{SUFFIX}"
+                if not path.exists():
+                    continue
+                value = path.read_bytes()
+                size += HEADER.size + len(key.encode()) + len(value)
+                if size > MAX_BYTES:
+                    break
+                entries.append((key, value))
+        except UNREACHABLE as error:
+            self._failed(error)
+            return
+        self.held[file] = {key for key, _ in entries}
+        self.uploads.put((file, packed(entries)))
 
     def _uploading(self) -> None:
         while True:
@@ -156,7 +218,7 @@ class RemoteCache:
                     self._answered()
                     with self.lock:
                         self.uploaded += 1
-            except Exception as error:  # a bundle that does not reach the remote is compiled again elsewhere
+            except UNREACHABLE as error:  # a bundle that does not reach it is compiled again elsewhere
                 self._failed(error)
             finally:
                 self.uploads.task_done()
@@ -164,16 +226,20 @@ class RemoteCache:
     def summary(self) -> str:
         """What the remote did for this process, which a task's log ends with: a slow task whose
         compilations missed it says so."""
-        return (f"shared XLA cache: {self.fetched} programs fetched, {self.uploaded} bundles uploaded"
-                + ("" if self.available else ", given up as unreachable"))
+        return (f"shared XLA cache: {self.programs_fetched} programs fetched, "
+                f"{self.uploaded} bundles uploaded" + ("" if self.available else ", given up as unreachable"))
 
     def drain(self, seconds: float = DRAIN_SECONDS) -> None:
-        """Every file's bundle written back, waiting up to `seconds` for the uploads, at the end of
-        pytest's session; what is left is abandoned with the process."""
-        for file in list(self.used):
+        """Every bundle written back, waiting up to `seconds` for the uploads, at the end of pytest's
+        session; what is left is abandoned with the process, as it is where the upload thread
+        stopped on an error it does not expect, which its own traceback reports."""
+        if self.file is not None:
+            self.closed(self.file)
+        for file in list(self.written):
             self.closed(file)
         began = time.monotonic()
-        while self.uploads.unfinished_tasks and time.monotonic() - began < seconds:
+        while (self.uploads.unfinished_tasks and self.uploader.is_alive()
+               and time.monotonic() - began < seconds):
             time.sleep(0.1)
 
 
@@ -196,7 +262,8 @@ def packed(entries: list[tuple[str, bytes]]) -> bytes:
 
 def unpacked(bundle: bytes) -> list[tuple[str, bytes]]:
     """The `(key, value)` entries of a `packed` bundle, or ValueError where it is not one whole: more
-    than `MAX_BYTES`, or an entry its lengths run past."""
+    than `MAX_BYTES`, an entry its lengths run past, or a key that is no file name in one directory
+    (empty, `.` or `..`, a separator or NUL in it, or too long for its file's name)."""
     if len(bundle) > MAX_BYTES:
         raise ValueError(f"a bundle of more than {MAX_BYTES} bytes")
     entries, at = [], 0
@@ -207,7 +274,11 @@ def unpacked(bundle: bytes) -> list[tuple[str, bytes]]:
         at += HEADER.size
         if at + keyed + sized > len(bundle):
             raise ValueError(f"a bundle's entry at {at} runs past its {len(bundle)} bytes")
-        entries.append((bundle[at:at + keyed].decode(), bundle[at + keyed:at + keyed + sized]))
+        key = bundle[at:at + keyed].decode()
+        if (key in ("", ".", "..") or any(character in key for character in "/\\\0")
+                or len(f".{key}.{sys.maxsize}.partial".encode()) > 255):
+            raise ValueError(f"a bundle's key {key[:80]!r} is no file name")
+        entries.append((key, bundle[at + keyed:at + keyed + sized]))
         at += keyed + sized
     return entries
 
@@ -226,20 +297,20 @@ def prefix() -> str:
 
 
 def install(url: str, token: str) -> RemoteCache | None:
-    """Put a `RemoteCache` at `url` over JAX's initialized persistent cache, or leave JAX's cache as
-    it is, and return None, where its internals are not what this expects."""
-    try:
-        from jax._src import compilation_cache
+    """A `RemoteCache` at `url` over the cache directory JAX is configured with, or None, logged,
+    where JAX keeps no local directory (the cache off, none set, or one on a remote store) or `url`
+    is no http(s) address."""
+    import jax
 
-        compilation_cache._initialize_cache()
-        if compilation_cache._cache is None or isinstance(compilation_cache._cache, RemoteCache):
-            return None
-        remote = RemoteCache(compilation_cache._cache, url, token, prefix())
-        compilation_cache._cache = remote
-    except Exception as error:  # a jax whose cache has moved runs on its local cache alone
-        logger.warning("the shared XLA cache is not installed: %s", error)
+    directory = jax.config.jax_compilation_cache_dir
+    address = urllib.parse.urlparse(url)
+    if not jax.config.jax_enable_compilation_cache or not directory or "://" in directory:
+        logger.warning("the shared XLA cache needs JAX's cache on in a local directory, not %r", directory)
         return None
-    return remote
+    if address.scheme not in ("http", "https") or not address.netloc:
+        logger.warning("the shared XLA cache's URL %r is no http(s) address", url)
+        return None
+    return RemoteCache(Path(directory), url, token, prefix())
 
 
 def install_from_environment() -> RemoteCache | None:
