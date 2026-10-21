@@ -48,7 +48,6 @@ import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 
-from ..decode_geometry import grouped_query
 from . import tuning
 from .generation import INHERENT, gpu_target, triton_runs
 from .selection import Requirement
@@ -407,6 +406,26 @@ def _spans(lengths: jax.Array, starts: jax.Array | None) -> jax.Array:
     lengths = jnp.asarray(lengths, jnp.int32)
     starts = jnp.zeros_like(lengths) if starts is None else jnp.asarray(starts, jnp.int32)
     return jnp.stack([starts, lengths], axis=1)
+
+
+def grouped_query(attend, query, key, value):
+    """`attend` over `query` `[B, T, N, D]` with each key head's `N // K` query heads as its query
+    positions, `[B, T * N // K, K, D]` over the `K` key heads, and its output back in the query's
+    layout: a decode step's lone query, whose heads read the same keys (key lengths alone end a
+    row's), reads its key head's keys once a group. cuDNN otherwise padded the lone query to two
+    positions and ran each query head on its own, 4.7% slower a layer at 64 rows for the same bits
+    (docs/performance.md), and the decode kernel takes as many query heads as key heads
+    (`decode_attention.SUPPORTS`)."""
+    batch, positions, heads, width = query.shape
+    kv_heads = key.shape[-2]
+    group = heads // kv_heads
+    if group == 1:
+        return attend(query, key, value)
+    grouped = query.reshape(batch, positions, kv_heads, group, width).transpose(0, 1, 3, 2, 4)
+    out = attend(grouped.reshape(batch, positions * group, kv_heads, width), key, value)
+    out = out.reshape(batch, positions, group, kv_heads, out.shape[-1]).transpose(0, 1, 3, 2, 4)
+    return out.reshape(batch, positions, heads, out.shape[-1])
+
 
 
 def attend(query: jax.Array, key: jax.Array, value: jax.Array, lengths: jax.Array, starts=None, *,

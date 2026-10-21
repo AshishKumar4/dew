@@ -431,8 +431,9 @@ class Refusal:
     code: str
     detail: str
     row: str | None = None
-    """The roadmap or ledger row that tracks lifting the limit, `INHERENT` where no implementation of the
-    kernel lifts it, None where the site declares neither (`dew.nn.kernels.selection.Requirement`)."""
+    """The roadmap or ledger row that tracks lifting the limit (`dew.nn.kernels.selection.Requirement`),
+    `INHERENT` where no implementation of the kernel lifts it, None for a refusal its site gives as text
+    alone (`refused`, `UNCLASSIFIED`)."""
 
     def __str__(self) -> str:
         return self.detail
