@@ -15,13 +15,15 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
-from reference_error import assert_leaves_as_exact
+from reference_error import assert_as_exact
 
 from dew.nn.gemma3n import AltUp, AltUpLayer, LaurelBlock
 from dew.nn.mlp import GatedMLP, gaussian_topk
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "gemma3n"
 HIDDEN, COPIES = 32, 4
+ALTUP_SEEDS, STEP_SEEDS, PADDED_SEEDS, SPARSITY_SEEDS = 16, 16, 16, 16
+"""Each site's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for`."""
 
 
 def fixture() -> dict:
@@ -93,15 +95,25 @@ def test_altup_trains_past_its_coefficient_clip_as_the_reference_does():
     clip = float(np.median(np.abs(tensors["altup.prediction_coefs.weight"])))
     assert np.abs(tensors["altup.correction_coefs.weight"]).max() > clip
     tensors["altup.prediction_coefs.weight"][[0, 1], [0, 1]] = 1e10, -1e10
-    stream, activated = tensors["stream"], tensors["activated"]
-    draws = np.random.default_rng(0)
-    cotangents = [draws.standard_normal(shape).astype(np.float32)
-                  for shape in (stream.shape, stream.shape, activated.shape)]
     config = Gemma3nTextConfig(hidden_size=HIDDEN, num_hidden_layers=1, altup_num_inputs=COPIES,
                                altup_coef_clip=clip)
     names = ("correction_coefs", "prediction_coefs", "modality_router")
 
-    def reference(dtype):
+    def draw(seed):
+        """The fixture's stream and activations at seed 0, else each drawn normal at its own scale,
+        and the outputs' cotangents standard normal."""
+        draws = np.random.default_rng(seed)
+        inputs = (tensors["stream"], tensors["activated"]) if seed == 0 else tuple(
+            (np.std(tensors[name]) * draws.standard_normal(tensors[name].shape)).astype(np.float32)
+            for name in ("stream", "activated"))
+        stream, activated = inputs
+        if seed == 0:
+            draws = np.random.default_rng(0)
+        cotangents = tuple(draws.standard_normal(shape).astype(np.float32)
+                           for shape in (stream.shape, stream.shape, activated.shape))
+        return (stream, activated, *cotangents)
+
+    def reference(dtype, stream, activated, *cotangents):
         # The float64 truth runs under `float64`, the norm's and the router's float32 pins included.
         with float64() if dtype == torch.float64 else contextlib.nullcontext():
             altup = Gemma3nTextAltUp(config).to(dtype).train()
@@ -120,16 +132,23 @@ def test_altup_trains_past_its_coefficient_clip_as_the_reference_does():
             "router_norm": {"scale": altup.router_norm.weight.grad.numpy()},
             "correct_output_scale": altup.correct_output_scale.grad.numpy()}}}
 
-    def loss(params):
-        outputs = Steps(AltUp(num_inputs=COPIES, coef_clip=clip)).apply(
-            {"params": params}, jnp.asarray(stream), jnp.asarray(activated), train=True)
-        terms = [jnp.sum(output * cotangent) for output, cotangent in zip(outputs, cotangents, strict=True)]
-        return sum(terms), outputs
+    params = altup_variables(tensors)["params"]
 
-    (_, outputs), gradient = jax.value_and_grad(loss, has_aux=True)(altup_variables(tensors)["params"])
-    dew = jax.tree.map(np.asarray, {"outputs": list(outputs), "params": gradient})
-    assert_leaves_as_exact(dew, reference(torch.float32), reference(torch.float64),
-                           reductions=stream.shape[1] * stream.shape[2])
+    @jax.jit
+    def stepped(stream, activated, *cotangents):
+        def loss(params):
+            outputs = Steps(AltUp(num_inputs=COPIES, coef_clip=clip)).apply(
+                {"params": params}, stream, activated, train=True)
+            terms = [jnp.sum(output * cotangent)
+                     for output, cotangent in zip(outputs, cotangents, strict=True)]
+            return sum(terms), outputs
+
+        (_, outputs), gradient = jax.value_and_grad(loss, has_aux=True)(params)
+        return {"outputs": list(outputs), "params": gradient}
+
+    assert_as_exact(stepped, lambda *inputs: reference(torch.float32, *inputs), draw,
+                    "an AltUp step past its clip", seeds=ALTUP_SEEDS,
+                    truth_fn=lambda *inputs: reference(torch.float64, *inputs))
 
 
 def clipped_gemma3n():
@@ -173,17 +192,29 @@ def test_a_training_step_updates_the_clamped_altup_coefficients_as_the_reference
     loaded, model, clip = clipped_gemma3n()
     directory = loaded.source
     ids = np.load(directory / "input_ids.npy").astype(np.int32)
-    rows = ids[np.arange(jax.device_count()) % len(ids)]
+    fixed = ids[np.arange(jax.device_count()) % len(ids)]
     rate = 0.1
     tx = optax.chain(optax.add_decayed_weights(decay), optax.sgd(rate))
-    trainer = Trainer(LMObjective(model, rows.shape[1] - 1, head_chunks=1, variables=loaded.variables), tx,
+    trainer = Trainer(LMObjective(model, fixed.shape[1] - 1, head_chunks=1, variables=loaded.variables), tx,
                       key=jax.random.key(0))
-    state, _, _ = trainer.place()
-    state, *_ = trainer.compile(state, {"text": rows})(state, {"text": rows})
-    trained = loaded.export({**loaded.variables, "params": state.variables["params"]})
-    dew = {name: np.asarray(tensor, np.float32) for name, tensor in trained.items()}
+    initial, _, _ = trainer.place()
+    step = trainer.compile(initial, {"text": fixed})
+    names = list(loaded.export(loaded.variables))
 
-    def reference(dtype):
+    def draw(seed):
+        """The fixture's rows at seed 0, else rows of ids drawn uniformly from the vocabulary."""
+        if seed == 0:
+            return (fixed,)
+        vocab = int(model.vocab_size)
+        return (np.random.default_rng(seed).integers(0, vocab, fixed.shape).astype(np.int32),)
+
+    def stepped(rows):
+        # The step donates the state it is given: each draw steps from its own copy.
+        state, *_ = step(jax.tree.map(jnp.copy, initial), {"text": rows})
+        trained = loaded.export({**loaded.variables, "params": state.variables["params"]})
+        return {name: np.asarray(trained[name], np.float32) for name in names}
+
+    def reference(dtype, rows):
         hf_config = AutoConfig.from_pretrained(directory)
         hf_config.altup_coef_clip = clip
         reference = AutoModelForCausalLM.from_pretrained(directory, config=hf_config,
@@ -201,9 +232,11 @@ def test_a_training_step_updates_the_clamped_altup_coefficients_as_the_reference
             reference(input_ids=tokens, labels=tokens).loss.backward()
             solver.step()
         state_dict = reference.state_dict()
-        return {name: state_dict[name].detach().numpy() for name in dew}
+        return {name: state_dict[name].detach().numpy() for name in names}
 
-    assert_leaves_as_exact(dew, reference(torch.float32), reference(torch.float64))
+    assert_as_exact(stepped, lambda rows: reference(torch.float32, rows), draw,
+                    f"a clamped AltUp training step, decay {decay}", seeds=STEP_SEEDS,
+                    truth_fn=lambda rows: reference(torch.float64, rows))
 
 
 @pytest.mark.parametrize("optimizer", ["sgd", "adamw"])
@@ -314,17 +347,28 @@ def test_the_sparse_mlp_trains_on_padded_rows_as_the_reference_does():
 
     tensors = fixture()
     names = ("gate_proj", "up_proj", "down_proj")
-    hidden = np.array(tensors["activated"], np.float32)
-    hidden[:, 4:] = 0
-    real = np.arange(hidden.shape[1]) < 4
-    cotangent = np.random.default_rng(0).standard_normal(hidden.shape).astype(np.float32) * real[:, None]
+    shape = np.shape(tensors["activated"])
+    real = np.arange(shape[1]) < 4
+
+    def draw(seed):
+        """The fixture's activations at seed 0, else drawn normal at their scale, rows past the
+        fourth padded to zero; the cotangent standard normal, zero on the padding."""
+        draws = np.random.default_rng(seed)
+        hidden = np.array(tensors["activated"] if seed == 0
+                          else np.std(tensors["activated"]) * draws.standard_normal(shape), np.float32)
+        hidden[:, 4:] = 0
+        if seed == 0:
+            draws = np.random.default_rng(0)
+        cotangent = draws.standard_normal(hidden.shape).astype(np.float32) * real[:, None]
+        return hidden, cotangent
+
     config = Gemma3nTextConfig(
         vocab_size=64, hidden_size=HIDDEN, intermediate_size=48, num_hidden_layers=2,
         num_attention_heads=4, num_key_value_heads=2, head_dim=8, sliding_window=4,
         hidden_size_per_layer_input=8, altup_num_inputs=COPIES, laurel_rank=8,
         activation_sparsity_pattern=[0.95, 0.0], num_kv_shared_layers=0)
 
-    def reference(dtype):
+    def reference(dtype, hidden, cotangent):
         mlp = Gemma3nTextMLP(config, layer_idx=0).to(dtype)
         with torch.no_grad():
             for name in names:
@@ -335,23 +379,27 @@ def test_the_sparse_mlp_trains_on_padded_rows_as_the_reference_does():
         return {"output": output.detach().numpy(), "input": x.grad.numpy(),
                 **{name: getattr(mlp, name).weight.grad.numpy().T for name in names}}
 
-    def loss(params, x):
-        output = GatedMLP(hidden_features=48, out_features=HIDDEN, activation="geglu",
-                          activation_sparsity=0.95).apply({"params": params}, x)
-        return jnp.sum(output * cotangent), output
-
     params = {name: {"kernel": jnp.asarray(tensors[f"mlp.{name}.weight"].T)} for name in names}
-    (_, output), (kernels, inputs) = jax.value_and_grad(loss, (0, 1), has_aux=True)(
-        params, jnp.asarray(hidden))
-    dew = {"output": output, "input": inputs, **{name: kernels[name]["kernel"] for name in names}}
-    assert_leaves_as_exact(jax.tree.map(np.asarray, dew), reference(torch.float32), reference(torch.float64),
-                           reductions=hidden.shape[0] * hidden.shape[1])
+
+    @jax.jit
+    def stepped(hidden, cotangent):
+        def loss(params, x):
+            output = GatedMLP(hidden_features=48, out_features=HIDDEN, activation="geglu",
+                              activation_sparsity=0.95).apply({"params": params}, x)
+            return jnp.sum(output * cotangent), output
+
+        (_, output), (kernels, inputs) = jax.value_and_grad(loss, (0, 1), has_aux=True)(params, hidden)
+        return {"output": output, "input": inputs, **{name: kernels[name]["kernel"] for name in names}}
+
+    assert_as_exact(stepped, lambda *inputs: reference(torch.float32, *inputs), draw,
+                    "a sparse MLP step over padded rows", seeds=PADDED_SEEDS,
+                    truth_fn=lambda *inputs: reference(torch.float64, *inputs))
 
 
 def sparse_mlps(sparsity: float, width: int, rows: int, dtype, hidden: int = HIDDEN):
     """The reference's public `Gemma3nTextMLP` and Dew's `GatedMLP` at `sparsity` over the
     same random weights, `width` gate activations a row of `hidden` features, and `rows`
-    random inputs."""
+    random inputs; the reference takes other rows (`rows`) as well."""
     import torch
     from transformers import Gemma3nTextConfig
     from transformers.models.gemma3n.modeling_gemma3n import Gemma3nTextMLP
@@ -366,12 +414,12 @@ def sparse_mlps(sparsity: float, width: int, rows: int, dtype, hidden: int = HID
                                num_attention_heads=1, num_key_value_heads=1, head_dim=max(hidden, 2),
                                activation_sparsity_pattern=[sparsity])
 
-    def reference(torch_dtype, cotangent=None):
+    def reference(torch_dtype, cotangent=None, rows=None):
         mlp = Gemma3nTextMLP(config, layer_idx=0).to(torch_dtype)
         with torch.no_grad():
             for name in names:
                 getattr(mlp, name).weight.copy_(torch.from_numpy(weights[name]))
-        x = torch.tensor(inputs).to(torch_dtype).requires_grad_()
+        x = torch.tensor(inputs if rows is None else rows).to(torch_dtype).requires_grad_()
         output = mlp(x)
         if cotangent is None:
             return {"output": output.detach().float().numpy()}
@@ -398,20 +446,27 @@ def test_the_sparse_mlp_is_as_exact_as_the_reference_at_each_sparsity(sparsity):
     import torch
 
     reference, model, params, hidden = sparse_mlps(sparsity, 2048, 256, jnp.float32, hidden=4)
-    cotangent = np.random.default_rng(1).standard_normal((256, 4)).astype(np.float32)
 
-    def loss(params, x):
-        output = model.apply({"params": params}, x)
-        return jnp.sum(output * cotangent), output
+    def draw(seed):
+        """The shared rows and a cotangent from seed 1 at seed 0, else both standard normal."""
+        if seed == 0:
+            return np.asarray(hidden), np.random.default_rng(1).standard_normal((256, 4)).astype(np.float32)
+        draws = np.random.default_rng(seed)
+        return tuple(draws.standard_normal((256, 4)).astype(np.float32) for _ in range(2))
 
-    (_, output), (kernels, inputs) = jax.jit(jax.value_and_grad(loss, (0, 1), has_aux=True))(params, hidden)
-    dew = {"output": output, "input": inputs, **{name: kernel["kernel"] for name, kernel in kernels.items()}}
-    ours, theirs, truth = (jax.tree.map(np.asarray, dew), reference(torch.float32, cotangent),
-                           reference(torch.float64, cotangent))
-    # The output and the input's gradient sum over the 2048 activations; a kernel's gradient over the rows.
-    for names, reductions in ((("output", "input"), 2048), (("gate_proj", "up_proj", "down_proj"), 256)):
-        assert_leaves_as_exact(*({name: tree[name] for name in names} for tree in (ours, theirs, truth)),
-                               reductions=reductions)
+    @jax.jit
+    def stepped(rows, cotangent):
+        def loss(params, x):
+            output = model.apply({"params": params}, x)
+            return jnp.sum(output * cotangent), output
+
+        (_, output), (kernels, inputs) = jax.value_and_grad(loss, (0, 1), has_aux=True)(params, rows)
+        return {"output": output, "input": inputs,
+                **{name: kernel["kernel"] for name, kernel in kernels.items()}}
+
+    assert_as_exact(stepped, lambda rows, cotangent: reference(torch.float32, cotangent, rows), draw,
+                    f"a sparse MLP step at sparsity {sparsity}", seeds=SPARSITY_SEEDS,
+                    truth_fn=lambda rows, cotangent: reference(torch.float64, cotangent, rows))
 
 
 @pytest.mark.parametrize("sparsity", [1e-9, 1 - 1e-9])
