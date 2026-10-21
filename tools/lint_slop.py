@@ -38,6 +38,12 @@ Scope is per rule, because the rules are not all about the same thing:
 - SLOP018 and SLOP019 are about `src/<package>`, the code a user's process
   runs: it sleeps, polls and retries only where it deals with what leaves
   the process, and it detects no feature by the exception its absence raises.
+- SLOP020 is about `tests` and `tools`: every accuracy comparison goes through
+  the one assertion of the gate (bible §7, `tests/reference_error.py`), so a
+  float compared within a tolerance anywhere else is a finding. The files that
+  still hold such comparisons are the inventory
+  (`tools/tolerance_inventory.json`), each at its count, lane and date, and it
+  only shrinks.
 
 Every rule fails the gate, and none has a per-finding suppression.
 
@@ -70,11 +76,13 @@ from __future__ import annotations
 
 import argparse
 import ast
+import datetime
 import functools
 import hashlib
 import io
 import json
 import re
+import subprocess
 import sys
 import tokenize
 from collections.abc import Iterable, Iterator, Mapping, Sequence, Set
@@ -83,6 +91,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import lint_scopes as scopes
+import lint_tolerances as tolerance_rules
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -1740,6 +1749,205 @@ def detections(module: Module) -> Iterator[Finding]:
                           "the version that has it")
 
 
+GATE = frozenset({"tests/reference_error.py", "tests/op_certificates.py", "tools/op_certificates_swiglu.py",
+                  "tests/reference_graph.py", "tests/reference_trees.py", "tests/residual_orders.py",
+                  "tests/test_reference_error.py", "tests/test_op_certificates.py",
+                  "tests/test_reference_orders.py", "tests/test_reference_graph.py",
+                  "tests/test_gate_calibration.py", "tests/test_float64_terms.py"})
+"""The gate's modules and the tests of the gate itself, the one place a float is compared within a
+bound (bible §7, 2026-10-20): every other comparison goes through its assertion."""
+INVENTORY = "tools/tolerance_inventory.json"
+RULE = "tools/lint_tolerances.py"
+"""SLOP020's reading of a file (`tolerance_rules`), whose change may grow what the inventory holds."""
+
+
+def _tolerance_comparisons(module: Module) -> Iterator[tuple[ast.AST, str]]:
+    """SLOP020's comparisons in a module (`tolerance_rules.comparisons`), its imports read from its own
+    package and its calls resolved as SLOP018 resolves them. A function imported by a bare module name
+    from a file beside it, as tests import their support (`from test_pipeline_core import delivered`),
+    returns only whole numbers where that file's own reading proves it does (`_whole_functions`)."""
+    parent = tuple(_parent(module))
+    tables = {id(node): table for node, table in scopes.scoped(module.tree.body, {}, list(parent))}
+
+    def whole_import(called: str) -> bool:
+        source, _, name = called.rpartition(".")
+        path = module.path.parent / f"{source}.py"
+        return bool(source) and "." not in source and path.is_file() and name in _whole_functions(
+            path, parent, path.stat().st_mtime_ns)
+
+    return tolerance_rules.comparisons(module.tree, tables, _Calls(module.tree), whole_import)
+
+
+@functools.cache
+def _whole_functions(path: Path, parent: tuple[str, ...], modified: int) -> frozenset[str]:
+    """The module-level functions of the file at `path` every return of which is whole, read as of its
+    modification time `modified`."""
+    tree = ast.parse(path.read_text(encoding="utf-8"))
+    tables = {id(node): table for node, table in scopes.scoped(tree.body, {}, list(parent))}
+    calls = _Calls(tree)
+    # A name the module binds twice, or to anything but its one definition, is no one's.
+    bound = calls.bindings[id(tree)]
+    return frozenset(name for name in tolerance_rules.whole_functions(tree, tables, calls)
+                     if isinstance(bound.get(name), ast.FunctionDef | ast.AsyncFunctionDef))
+
+
+def _inventory(checkout: Path) -> dict:
+    """The inventory as it is now: read again whenever the file changes, so one process reading two
+    states of a checkout sees each."""
+    path = checkout / INVENTORY
+    if not path.is_file():
+        return {}
+    stat = path.stat()
+    return _read_inventory(path, stat.st_mtime_ns, stat.st_size)
+
+
+@functools.cache
+def _read_inventory(path: Path, mtime: int, size: int) -> dict:
+    del mtime, size  # the cache's key: the file's state
+    return json.loads(path.read_text())
+
+
+def _git(checkout: Path, *arguments: str) -> str:
+    return subprocess.run(["git", *arguments], cwd=checkout, capture_output=True, text=True,
+                          check=True).stdout
+
+
+@functools.cache
+def _inventory_at(checkout: Path, commit: str) -> dict | None:
+    shown = subprocess.run(["git", "show", f"{commit}:{INVENTORY}"], cwd=checkout, capture_output=True,
+                           text=True, check=False)
+    return json.loads(shown.stdout) if shown.returncode == 0 else None
+
+
+def _loosened(checkout: Path, commit: str, parent: str, mine: dict, theirs: dict,
+              authorized: dict[str, int] | None = None,
+              grants: dict[str, int] | None = None) -> Iterator[str]:
+    """How `commit`'s inventory `mine` is looser than `parent`'s `theirs`: a file added, a count raised,
+    a date moved later, its empty_by later; a file renamed between them carries its entry. Where the
+    commit changes SLOP020's reading (`RULE`), a file it leaves unchanged may be added or raised: what
+    the rule now reads there was in the file all along, and `grants` takes the count it reached. A file
+    may also sit at a count `authorized` holds for it, one a commit between `parent` and `commit`
+    reached so (HEAD against its base). No date moves later either way."""
+    renamed, changed = {}, set()
+    changes = _git(checkout, "diff", "--name-status", "-M", parent, commit, "--", "tests", "tools")
+    for change in changes.splitlines():
+        status, *paths = change.split("\t")
+        changed.update(paths)
+        if status.startswith("R") and len(paths) == 2:
+            renamed[paths[1]] = paths[0]
+    reread = RULE in changed
+    if mine["empty_by"] > theirs["empty_by"]:
+        yield "moves empty_by later"
+    for name, entry in mine["files"].items():
+        kept = theirs["files"].get(name) or theirs["files"].get(renamed.get(name, ""))
+        held = (authorized or {}).get(name, (authorized or {}).get(renamed.get(name, ""), -1))
+        grown = (reread and name not in changed) or entry["comparisons"] <= held
+        if grants is not None and reread and name not in changed:
+            grants[name] = max(grants.get(name, 0), entry["comparisons"])
+        if kept is None:
+            if not grown:
+                yield f"adds {name}"
+        elif entry["by"] > kept["by"] or (entry["comparisons"] > kept["comparisons"] and not grown):
+            yield f"raises {name}'s count or moves its date"
+
+
+def ratchet(checkout: Path, base: str | None = None) -> Iterator[Finding]:
+    """SLOP020's inventory never loosens. HEAD's is held to `base`'s merge-base with HEAD (main's, in
+    CI), and every commit in HEAD's history whose inventory differs from a parent's, merges included
+    (`--full-history`, no simplification), to that parent's (`_loosened`), from the commit that first
+    made it on. That commit has no parent's to keep, and no commit removes it once made. `--ratchet`
+    runs it (CI's lint job, on its whole history); a shallow checkout, or one without git, cannot
+    hold the inventory, and it says so rather than passing."""
+    try:
+        shallow = _git(checkout, "rev-parse", "--is-shallow-repository").strip() == "true"
+        # The walk starts where the inventory was first made: the history before it holds none.
+        made = _git(checkout, "log", "--full-history", "--diff-filter=A", "--reverse", "--format=%P", "HEAD",
+                    "--", INVENTORY).splitlines()
+        before = [f"^{parent}" for parent in (made[0].split() if made else [])]
+        listed = _git(checkout, "rev-list", "--full-history", "--parents", "HEAD", *before, "--", INVENTORY)
+        merged = _git(checkout, "merge-base", "HEAD", base).strip() if base else None
+    except (subprocess.CalledProcessError, FileNotFoundError) as error:
+        yield Finding(INVENTORY, 1, 1, "SLOP020", "holds the inventory to its history, which git cannot "
+                      f"read here ({error}); run with the repository's history")
+        return
+    if shallow:
+        yield Finding(INVENTORY, 1, 1, "SLOP020", "holds the inventory to its history, and this checkout is "
+                      "shallow: fetch it whole (`git fetch --unshallow`)")
+        return
+    head_id = _git(checkout, "rev-parse", "HEAD").strip()
+    head = _inventory_at(checkout, head_id)
+    # Each commit against its parents first, so the counts a change of the rule's reading reached
+    # (`grants`) hold HEAD against its base too.
+    walked, grants = [], {}
+    for line in filter(None, listed.splitlines()):
+        commit, *parents = line.split()
+        mine = _inventory_at(checkout, commit)
+        for parent in parents:
+            theirs = _inventory_at(checkout, parent)
+            if theirs is None:
+                continue
+            if mine is None:
+                walked.append(Finding(INVENTORY, 1, 1, "SLOP020", f"{commit[:9]} removes the inventory "
+                                      f"its parent {parent[:9]} kept; an empty inventory stays, as "
+                                      f"`files: {{}}`"))
+                continue
+            walked += [Finding(INVENTORY, 1, 1, "SLOP020", f"{commit[:9]} against its parent {parent[:9]} "
+                               f"{why}") for why in _loosened(checkout, commit, parent, mine, theirs,
+                                                              grants=grants)]
+    if merged is not None:
+        kept = _inventory_at(checkout, merged)
+        if kept is not None and head is None:
+            yield Finding(INVENTORY, 1, 1, "SLOP020",
+                          f"HEAD removes the inventory {base}'s {merged[:9]} keeps")
+        elif kept is not None:
+            for why in _loosened(checkout, head_id, merged, head, kept, authorized=grants):
+                yield Finding(INVENTORY, 1, 1, "SLOP020", f"HEAD against {base}'s {merged[:9]} {why}")
+    yield from walked
+
+
+def _checkout(module: Module) -> Path:
+    return Path(module.path.as_posix().removesuffix(module.relative))
+
+
+def tolerances(module: Module) -> Iterator[Finding]:
+    """SLOP020: a float compared within a tolerance outside the gate (`GATE`, `_tolerance_comparisons`).
+    A file the inventory holds may keep its count until its date and the inventory's own (`empty_by`);
+    past either, or above its count, every comparison is reported; below it, the inventory is told to
+    come down, so the count it keeps is the file's and it only shrinks (`ratchet` holds every commit's
+    inventory to its parents')."""
+    if not module.relative.startswith(("tests/", "tools/")) or module.relative in GATE:
+        return
+    found = sorted(_tolerance_comparisons(module),
+                   key=lambda pair: (pair[0].lineno, pair[0].col_offset))
+    inventory = _inventory(_checkout(module))
+    entry = inventory.get("files", {}).get(module.relative)
+    gate = "go through the gate's assertion (tests/reference_error.py)"
+    if entry is None:
+        why = "not in the inventory"
+    else:
+        due = min(datetime.date.fromisoformat(entry["by"]),
+                  datetime.date.fromisoformat(inventory["empty_by"]))
+        if datetime.date.today() > due and not found:
+            yield Finding(module.relative, 1, 1, "SLOP020",
+                          f"{INVENTORY} still holds this file: remove its entry")
+            return
+        if datetime.date.today() > due:
+            why = f"past the inventory's date for it, {due.isoformat()}"
+        elif len(found) > entry["comparisons"]:
+            why = f"the inventory counts {entry['comparisons']}"
+        elif len(found) < entry["comparisons"]:
+            yield Finding(module.relative, 1, 1, "SLOP020",
+                          f"{INVENTORY} counts {entry['comparisons']} tolerance comparisons here and "
+                          f"the file holds {len(found)}: "
+                          + ("remove its entry" if not found else f"lower it to {len(found)}"))
+            return
+        else:
+            return
+    for node, what in found:
+        yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP020",
+                      f"{what} compares floats within a tolerance ({why}); {gate}")
+
+
 CONTRACT_RULES = (contracts, probes, names, imports, calls, authorities, waits, detections)
 UNIVERSAL_RULES = (suppressions, swallowed, comments, size)
 
@@ -1749,6 +1957,7 @@ def check(module: Module, models: ModelIndex | None = None) -> Iterator[Finding]
     `models`, the package's index, or this file's own without one."""
     rules = (*CONTRACT_RULES, *UNIVERSAL_RULES) if module.is_source else UNIVERSAL_RULES
     rules = (*rules, mocks, wording, skips) if module.relative.startswith("tests/") else (*rules, patches)
+    rules = (*rules, tolerances)
     findings = [finding for rule in rules for finding in rule(module)]
     if module.is_source:
         findings += boundaries(module, models or ModelIndex.build([module]))
@@ -1799,9 +2008,19 @@ def main(argv: Sequence[str] | None = None) -> int:
                         "package's source, tests, tools, recipes, examples, site, docs/assets and kernels")
     parser.add_argument("--root", type=Path, default=ROOT, help="the checkout (default: Dew's)")
     parser.add_argument("--package", default="dew", help="the package under src/ (default: dew)")
+    parser.add_argument("--ratchet", action="store_true",
+                        help="hold SLOP020's inventory to its git history (`ratchet`), the whole history")
+    parser.add_argument("--base", help="with --ratchet, the branch HEAD's inventory is held to (at their "
+                        "merge-base): origin/main in CI")
     parser.add_argument("--print-roots", action="store_true",
                         help="print the roots it reads by default; tools/pre-commit lints their staged files")
     args = parser.parse_args(argv)
+    if args.ratchet:
+        findings = list(ratchet(args.root.resolve(), args.base))
+        for finding in findings:
+            print(finding)
+        print(f"{len(findings)} findings", file=sys.stderr)
+        return 1 if findings else 0
     if args.print_roots:
         print(" ".join(default_roots(args.package)))
         return 0
@@ -1809,11 +2028,19 @@ def main(argv: Sequence[str] | None = None) -> int:
     counts: dict[str, int] = {}
     files: dict[str, set[str]] = {}
     models = ModelIndex.build(list(collect([f"src/{args.package}"], args.root.resolve(), args.package)))
+    seen = set()
     for module in collect(roots, args.root.resolve(), args.package):
+        seen.add(module.relative)
         for finding in check(module, models):
             print(finding)
             counts[finding.code] = counts.get(finding.code, 0) + 1
             files.setdefault(finding.code, set()).add(finding.path)
+    if not args.roots:
+        # Every file the inventory names is read on a whole run, so one it names that is gone is stale.
+        for relative in sorted(set(_inventory(args.root.resolve()).get("files", {})) - seen):
+            print(Finding(INVENTORY, 1, 1, "SLOP020", f"names {relative}, which is gone: remove its entry"))
+            counts["SLOP020"] = counts.get("SLOP020", 0) + 1
+            files.setdefault("SLOP020", set()).add(INVENTORY)
     for code, count in sorted(counts.items()):
         print(f"{code}: {count} in {len(files[code])} files", file=sys.stderr)
     failures = sum(counts.values())

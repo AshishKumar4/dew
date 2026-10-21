@@ -63,6 +63,7 @@ rounding of the computation itself (`assert_computes_the_oracle`).
 """
 
 import dataclasses
+import hashlib
 
 import jax
 import jax.numpy as jnp
@@ -222,6 +223,11 @@ an assertion decides alike on every run."""
 CONFIDENCE = 0.999
 """The bootstrap interval check 1 reads: a site whose pooled ratio's 99.9% interval is wider than
 PARITY cannot tell an equally exact computation from one PARITY off, and is inconclusive."""
+FEWEST_SEEDS = 8
+"""The fewest seeds check 1 judges by, an engineering minimum and no statistical threshold: over very few
+seeds a bootstrap has so few distinct resamples that its interval can sit wholly to one side of PARITY by
+the draws' luck, so fewer is Inconclusive whatever their ratio reads; above it the measured interval
+decides. `seeds_for` never declares fewer."""
 REDRAW = 4
 """A failing site's pooled ratio is drawn again over REDRAW times its seeds before it fails."""
 
@@ -290,10 +296,19 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None) -> _Draws:
             truth = (truth_fn or reference_fn)(*widened(inputs))
         paths = jax.tree_util.tree_leaves_with_path(dew)
         names = names or [jax.tree_util.keystr(path) for path, _ in paths]
-        leaves = zip([leaf for _, leaf in paths], jax.tree.leaves(reference), jax.tree.leaves(truth),
-                     strict=True)
         row = []
-        for leaf, their_leaf, true in leaves:
+        for (path, leaf), their_leaf, true in zip(paths, jax.tree.leaves(reference), jax.tree.leaves(truth),
+                                                  strict=True):
+            if np.size(leaf) == 0:
+                # An empty leaf (a one-tap convolution's history) is exact by construction: held to the
+                # reference's shape and dtype, it adds no error and resolves nothing.
+                kept = (np.shape(leaf), jnp.dtype(leaf.dtype))
+                assert kept == (np.shape(their_leaf), jnp.dtype(their_leaf.dtype)), (
+                    jax.tree_util.keystr(path), kept, np.shape(their_leaf))
+                # The truth empty alike (in float64, its dtype is its own).
+                assert np.shape(true) == np.shape(leaf), (jax.tree_util.keystr(path), np.shape(true))
+                row.append((0.0, 0.0, 0.0, 0.0, 0, True))
+                continue
             leaf, their_leaf, true = (np.asarray(value, np.float64) for value in (leaf, their_leaf, true))
             row.append((float(np.mean(np.square(leaf - true))), float(np.mean(np.square(their_leaf - true))),
                         *_rows(leaf, their_leaf, true),
@@ -352,6 +367,9 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
     This is an engineering gate, deterministic and reproducible, not a guarantee against every error
     law: "never wrong" is check 2's, each element within its operation's certified bound
     (tests/op_certificates.py)."""
+    if seeds < FEWEST_SEEDS:
+        raise Inconclusive(f"{label}: {seeds} seeds cannot be judged; check 1 takes at least {FEWEST_SEEDS} "
+                           f"(`seeds_for`)")
     draws = _drawn(dew_fn, reference_fn, draw, range(seeds), truth_fn)
     over_first = [index for index in range(len(draws.names))
                   if np.sum(draws.theirs[:, index]) > 0 and _judged(draws, index)[0] > PARITY]
@@ -378,7 +396,8 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
                               f"give the site larger inputs or more seeds (`seeds_for`)")
         elif ratio > PARITY:
             over.append(f"{leaf}: dew's RMS error from float64 is {ratio:.3f} times the reference's over "
-                        f"{count} seeds (allowed {PARITY})")
+                        f"{count} seeds, {CONFIDENCE:.1%} interval [{low:.3f}, {high:.3f}] "
+                        f"(allowed {PARITY})")
         my_row, their_row = float(np.max(draws.worst[:, index, 0])), float(np.max(draws.worst[:, index, 1]))
         if not within(my_row, ROW_FACTOR * their_row):
             over.append(f"{leaf}: the worst row over {count} seeds is {my_row:.3e} from float64 over its "
@@ -392,12 +411,13 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
         raise Inconclusive("\n".join(unresolved))
 
 
-def seeds_for(reference_fn, draw, label: str, *, start: int = 8, most: int = 512, truth_fn=None) -> int:
+def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most: int = 512,
+              truth_fn=None) -> int:
     """The seeds a site declares: the fewest, doubling from `start`, for which the reference compared
     with itself (its errors on two disjoint seed sets, `_interval`'s control) resolves PARITY in every
     leaf: the pooled ratio's CONFIDENCE interval no wider than PARITY. Fails past `most`, where the
     site needs larger inputs or fewer shared factors, not more seeds."""
-    count = start
+    count = max(start, FEWEST_SEEDS)
     while count <= most:
         first = _drawn(reference_fn, reference_fn, draw, range(count), truth_fn)
         second = _drawn(reference_fn, reference_fn, draw, range(count, 2 * count), truth_fn)
@@ -409,6 +429,91 @@ def seeds_for(reference_fn, draw, label: str, *, start: int = 8, most: int = 512
         count *= 2
     raise AssertionError(f"{label}: the reference compared with itself does not resolve {PARITY} within "
                          f"{most} seeds at {wide[:4]}; give the site larger inputs or fewer shared factors")
+
+
+def recording(path) -> dict[str, np.ndarray]:
+    """A recording of a reference over seeds (`indexed_recording`'s `stored`), read whole: where a pin
+    holds it, from the fetched store's local copy, checked against the pin; else from the file at
+    `path`, as git holds one of at most 1 MiB (tools/fetched_fixtures.py)."""
+    from tool_support import load
+
+    with np.load(load("fetched_fixtures").local(path), allow_pickle=False) as stored:
+        return dict(stored)
+
+
+def declared_seeds(path) -> dict[str, int]:
+    """Each site's declared seed count in a recording of a reference over seeds (`indexed_recording`):
+    its `<site>.seeds`, written at record time by `seeds_for` on the recorded reference."""
+    return {name.removesuffix(".seeds"): int(value) for name, value in recording(path).items()
+            if name.endswith(".seeds")}
+
+
+def input_digest(inputs) -> np.uint64:
+    """A seed's inputs (a dict of NumPy arrays, a torch draw's converted) as 64 bits of the SHA-256 of
+    each array's name, dtype by name, shape and bytes in C order: what a recording of outputs alone
+    keeps, so that inputs drawn again are checked to be the recorded ones. The dtype goes by its name, as
+    some narrow formats share a byte code (float8_e4m3fn's and float8_e4m3fnuz's), and the shape as the
+    array's own, a scalar's included."""
+    digest = hashlib.sha256()
+    for name in sorted(inputs):
+        value = np.asarray(inputs[name])
+        digest.update(f"{name}:{value.dtype}:{value.shape};".encode())
+        digest.update(value.tobytes())
+    return np.frombuffer(digest.digest()[:8], np.uint64)[0]
+
+
+def indexed_recording(stored, site: str, seeds: int, *, inputs_of=None):
+    """`assert_as_exact`'s draw, reference and truth for a reference recorded over seeds, where it cannot
+    run in the test (a CUDA-only library, a fetched source): `stored` holds `<site>.reference.<name>` and
+    `<site>.truth.<name>`, and `<site>.input.<name>` unless `inputs_of(seed)` draws a seed's inputs again
+    (a seeded NumPy or torch draw the generator made them by), every array stacked over the seeds on its
+    first axis, the truth in float64, and `<site>.redraw`, check 1's REDRAW it was recorded for. Inputs
+    drawn again are checked against the recording's `<site>.input_digest` (`input_digest`), so a
+    generator that changed since is named, not judged. A draw is `(index, inputs)`, the index an
+    integer `widened` keeps; the reference and the truth read the recorded outputs at it, and Dew's
+    function takes the same two arguments and ignores the index. The recording covers check 1's redraw,
+    (1 + REDRAW) times the declared seeds, so a numerical failure stays a finding rather than running
+    out of recorded seeds."""
+    def tree(kind):
+        prefix = f"{site}.{kind}."
+        return {name.removeprefix(prefix): value for name, value in stored.items() if name.startswith(prefix)}
+
+    inputs, reference, truth = tree("input"), tree("reference"), tree("truth")
+    narrow = [name for name, value in truth.items()
+              if jnp.issubdtype(value.dtype, jnp.floating) and value.dtype != np.float64]
+    if narrow:
+        raise AssertionError(f"{site}: the recorded truth {narrow} is not float64; record it in float64, as "
+                             f"no later widening recovers what a narrower recording dropped")
+    if inputs_of is None and not inputs:
+        raise AssertionError(f"{site}: no inputs recorded and no `inputs_of` to draw them again")
+    if int(stored.get(f"{site}.redraw", -1)) != REDRAW:
+        raise AssertionError(f"{site}: the recording holds no `{site}.redraw` of {REDRAW}, which "
+                             f"record_case writes and the fetched store's rule reads it by")
+    digests = stored.get(f"{site}.input_digest")
+    if inputs_of is not None and digests is None:
+        raise AssertionError(f"{site}: `inputs_of` draws the inputs again and the recording keeps no "
+                             f"digest to check them by; record the outputs alone (`store_inputs=False`)")
+    recorded = [*reference.values(), *truth.values(),
+                *(inputs.values() if inputs_of is None else [digests])]
+    count = min(len(value) for value in recorded)
+    if count < (1 + REDRAW) * seeds:
+        raise AssertionError(f"{site}: {count} recorded seeds, and check 1 over {seeds} may draw "
+                             f"{(1 + REDRAW) * seeds}; record (1 + REDRAW) times the declared seeds")
+
+    def draw(seed):
+        if inputs_of is None:
+            return np.int32(seed), {name: value[seed] for name, value in inputs.items()}
+        drawn = inputs_of(seed)
+        if input_digest(drawn) != digests[seed]:
+            raise AssertionError(f"{site}: seed {seed}'s inputs drawn again are not the recorded ones (their "
+                                 f"digest differs); the generator's draw changed since the recording")
+        return np.int32(seed), drawn
+
+    def lookup(values):
+        return jax.jit(lambda index, inputs: {name: jnp.asarray(value)[index]
+                                            for name, value in values.items()})
+
+    return draw, lookup(reference), lookup(truth)
 
 
 def assert_no_less_exact(dew, reference, truth, label: str) -> None:
