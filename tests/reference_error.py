@@ -285,6 +285,51 @@ class _Draws:
                                     for field in ("mine", "theirs", "worst", "zero_rows", "finite")))
 
 
+SKETCH = 4
+"""The random projections a recording keeps of each row of its reference's float64 truth (`truth_sketch`)."""
+
+
+def _projections(width: int) -> np.ndarray:
+    """The SKETCH standard normal vectors a row of `width` entries is projected on, the same on every
+    host and run."""
+    return np.random.default_rng([0x5E7C4, width]).standard_normal((width, SKETCH))
+
+
+def _as_rows(value) -> np.ndarray:
+    """`value` in float64 as rows (every axis but the last), a value of rank one or less one row."""
+    value = np.asarray(value, np.float64)
+    return value.reshape(1, -1) if value.ndim < 2 else value.reshape(-1, value.shape[-1])
+
+
+def truth_sketch(truth) -> np.ndarray:
+    """A float64 truth leaf's sketch `[rows, SKETCH]`: each row projected on SKETCH random vectors, so a
+    truth recomputed apart is held to the recorded one row by row without the recording keeping it
+    (`indexed_recording`)."""
+    rows = _as_rows(truth)
+    return rows @ _projections(rows.shape[1])
+
+
+@dataclasses.dataclass(frozen=True)
+class RecordedLeaf:
+    """A recorded reference's evidence for one leaf at one seed, all check 1 reads of it (`_drawn`): its
+    mean squared error from its own float64 truth, its worst sized row over its size, every row's RMS
+    error (`row_errors`), and whether it and its truth were finite."""
+    mse: float
+    worst: float
+    rows: np.ndarray
+    finite: bool
+
+
+def leaf_summary(reference, truth) -> RecordedLeaf:
+    """`RecordedLeaf` of a reference leaf against its float64 truth."""
+    reference, truth = np.asarray(reference, np.float64), np.asarray(truth, np.float64)
+    sizes, rows = row_errors(reference, truth)
+    sized = sizes > 0
+    return RecordedLeaf(float(np.mean(np.square(reference - truth))),
+                        float(np.max(rows[sized] / sizes[sized])) if sized.any() else 0.0, rows,
+                        bool(np.isfinite(reference).all() and np.isfinite(truth).all()))
+
+
 def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None) -> _Draws:
     """Every leaf's errors (`_Draws`) over `seeds`: both functions run on `draw(seed)`'s inputs, truth
     `truth_fn` on them (by default `reference_fn` on them widened to float64)."""
@@ -308,6 +353,21 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None) -> _Draws:
                 # The truth empty alike (in float64, its dtype is its own).
                 assert np.shape(true) == np.shape(leaf), (jax.tree_util.keystr(path), np.shape(true))
                 row.append((0.0, 0.0, 0.0, 0.0, 0, True))
+                continue
+            if isinstance(their_leaf, RecordedLeaf):
+                # A recorded reference: its evidence as recorded, Dew's against the truth recomputed,
+                # which `indexed_recording` holds to the recorded truth's sketch first.
+                leaf, true = np.asarray(leaf, np.float64), np.asarray(true, np.float64)
+                sizes, my_rows = row_errors(leaf, true)
+                sized = sizes > 0
+                if my_rows.shape != their_leaf.rows.shape:
+                    raise AssertionError(f"{jax.tree_util.keystr(path)}: {my_rows.shape} rows against the "
+                                         f"recording's {their_leaf.rows.shape}")
+                zero = int(np.sum(~sized & ~(my_rows <= ROW_FACTOR * their_leaf.rows)))
+                row.append((float(np.mean(np.square(leaf - true))), their_leaf.mse,
+                            float(np.max(my_rows[sized] / sizes[sized])) if sized.any() else 0.0,
+                            their_leaf.worst, zero,
+                            their_leaf.finite and bool(np.isfinite(leaf).all() and np.isfinite(true).all())))
                 continue
             leaf, their_leaf, true = (np.asarray(value, np.float64) for value in (leaf, their_leaf, true))
             row.append((float(np.mean(np.square(leaf - true))), float(np.mean(np.square(their_leaf - true))),
@@ -462,7 +522,7 @@ def input_digest(inputs) -> np.uint64:
     return np.frombuffer(digest.digest()[:8], np.uint64)[0]
 
 
-def indexed_recording(stored, site: str, seeds: int, *, inputs_of=None):
+def indexed_recording(stored, site: str, seeds: int, *, inputs_of=None, truth_fn=None):
     """`assert_as_exact`'s draw, reference and truth for a reference recorded over seeds, where it cannot
     run in the test (a CUDA-only library, a fetched source): `stored` holds `<site>.reference.<name>` and
     `<site>.truth.<name>`, and `<site>.input.<name>` unless `inputs_of(seed)` draws a seed's inputs again
@@ -473,7 +533,19 @@ def indexed_recording(stored, site: str, seeds: int, *, inputs_of=None):
     integer `widened` keeps; the reference and the truth read the recorded outputs at it, and Dew's
     function takes the same two arguments and ignores the index. The recording covers check 1's redraw,
     (1 + REDRAW) times the declared seeds, so a numerical failure stays a finding rather than running
-    out of recorded seeds."""
+    out of recorded seeds.
+
+    A recording of the reference's evidence alone (`record_case(..., summary=True)`: `<site>.mse.<name>`,
+    `<site>.worst.<name>`, `<site>.rows.<name>`, `<site>.finite.<name>` and `<site>.sketch.<name>`,
+    each over the seeds) keeps no outputs: its reference arm gives check 1 that evidence
+    (`RecordedLeaf`), and its truth is `truth_fn(inputs)`, Dew's own float64 path, held at every seed to
+    the recorded truth's sketch (`truth_sketch`) within float64's rounding of the computation itself,
+    the oracle rule's bound (`assert_computes_the_oracle`, its roundings counted on `truth_fn`'s
+    program, `chain_roundings`): a truth recomputed wrong moves its sketch by far more, so check 1
+    never judges Dew against its own float64 path where that path is not the reference's."""
+    if any(name.startswith(f"{site}.sketch.") for name in stored):
+        return _summarized(stored, site, seeds, inputs_of, truth_fn)
+
     def tree(kind):
         prefix = f"{site}.{kind}."
         return {name.removeprefix(prefix): value for name, value in stored.items() if name.startswith(prefix)}
@@ -514,6 +586,63 @@ def indexed_recording(stored, site: str, seeds: int, *, inputs_of=None):
                                             for name, value in values.items()})
 
     return draw, lookup(reference), lookup(truth)
+
+
+def _summarized(stored, site: str, seeds: int, inputs_of, truth_fn):
+    """`indexed_recording` of a recording of the reference's evidence alone."""
+    def tree(kind):
+        prefix = f"{site}.{kind}."
+        return {name.removeprefix(prefix): np.asarray(value) for name, value in stored.items()
+                if name.startswith(prefix)}
+
+    mse, worst, rows, finite, sketch = (tree(kind) for kind in ("mse", "worst", "rows", "finite", "sketch"))
+    if truth_fn is None or inputs_of is None:
+        raise AssertionError(f"{site}: a recording of the reference's evidence alone takes `truth_fn`, "
+                             f"Dew's float64 path, and `inputs_of`, its inputs drawn again")
+    if int(stored.get(f"{site}.redraw", -1)) != REDRAW:
+        raise AssertionError(f"{site}: the recording holds no `{site}.redraw` of {REDRAW}")
+    digests = stored[f"{site}.input_digest"]
+    count = min(len(value) for part in (mse, worst, rows, finite, sketch) for value in part.values())
+    if min(count, len(digests)) < (1 + REDRAW) * seeds:
+        raise AssertionError(f"{site}: {min(count, len(digests))} recorded seeds, and check 1 over {seeds} "
+                             f"may draw {(1 + REDRAW) * seeds}")
+    roundings = {}
+
+    def draw(seed):
+        drawn = inputs_of(seed)
+        if input_digest(drawn) != digests[seed]:
+            raise AssertionError(f"{site}: seed {seed}'s inputs drawn again are not the recorded ones (their "
+                                 f"digest differs); the generator's draw changed since the recording")
+        return np.int32(seed), drawn
+
+    def reference(index, inputs):
+        index = int(index)
+        return {name: RecordedLeaf(float(mse[name][index]), float(worst[name][index]), rows[name][index],
+                                   bool(finite[name][index])) for name in mse}
+
+    def truth(index, inputs):
+        index = int(index)
+        computed = truth_fn(inputs)
+        if not roundings:
+            roundings["count"] = chain_roundings(jax.make_jaxpr(truth_fn)(inputs))
+        eps = float(np.finfo(np.float64).eps)
+        for name, value in computed.items():
+            value = np.asarray(value, np.float64)
+            recorded = sketch[name][index]
+            norms = np.linalg.norm(_projections(_as_rows(value).shape[1]), axis=0)
+            scale = float(np.sqrt(np.mean(np.square(value)))) if value.size else 0.0
+            bound = 2 * roundings["count"] * eps * scale * np.sqrt(value.size) * norms
+            apart = np.abs(truth_sketch(value) - recorded)
+            if apart.shape != recorded.shape or not (apart <= bound).all():
+                away = float(np.max(apart)) if apart.size else 0.0
+                raise AssertionError(
+                    f"{site}: seed {index}'s float64 truth of {name!r} recomputed is not the recorded "
+                    f"reference's: its sketch is {away:.3e} away, past float64's rounding of the computation "
+                    f"({roundings['count']} roundings); `truth_fn` does not compute what the reference's "
+                    f"truth did")
+        return computed
+
+    return draw, reference, truth
 
 
 def assert_no_less_exact(dew, reference, truth, label: str) -> None:

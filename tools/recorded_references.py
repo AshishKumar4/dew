@@ -22,7 +22,7 @@ import numpy as np
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from fetched_fixtures import save
-from reference_error import REDRAW, input_digest, seeds_for
+from reference_error import REDRAW, input_digest, leaf_summary, seeds_for, truth_sketch
 
 __all__ = ["provenance", "record_case", "save"]
 
@@ -34,15 +34,19 @@ def provenance(reference: str, revision: str, device: str, command: str, **detai
                                   "date": datetime.date.today().isoformat(), "command": command, **details}))
 
 
-def record_case(label: str, draw, evaluate, proxy, *, truth_proxy=None, store_inputs: bool = True
-                ) -> dict[str, np.ndarray]:
+def record_case(label: str, draw, evaluate, proxy, *, truth_proxy=None, store_inputs: bool = True,
+                summary: bool = False) -> dict[str, np.ndarray]:
     """`label`'s recording: `draw(seed)` gives a seed's inputs (a dict of arrays), `evaluate(inputs)` the
     reference's outputs and their float64 truth (dicts), and `proxy(inputs)` (with `truth_proxy`) a
     function that can run here, which plans the count. The recorded reference then confirms it,
     recording further seeds as `seeds_for` asks, and the recording keeps exactly the confirmed count's
     draws and their redraw, (1 + REDRAW) times it. Where `draw` is a seeded function the test can call
     again, `store_inputs=False` records the outputs alone and each draw's `input_digest`, and the test
-    hands `draw` to `indexed_recording` as `inputs_of`."""
+    hands `draw` to `indexed_recording` as `inputs_of`. With `summary`, the recording keeps no outputs
+    at all: per seed and leaf, the reference's evidence check 1 reads (`leaf_summary`: its mean squared
+    error from its truth, its worst sized row, every row's error, finiteness) and its truth's sketch
+    (`truth_sketch`), which the test's own float64 path is held to (`indexed_recording`'s `truth_fn`):
+    kilobytes where outputs over (1 + REDRAW) times the seeds are gigabytes."""
     planned = seeds_for(jax.jit(proxy), lambda seed: (draw(seed),), label,
                         truth_fn=None if truth_proxy is None else jax.jit(truth_proxy))
     print(f"{label}: planned {planned} seeds on the proxy", flush=True)
@@ -66,6 +70,19 @@ def record_case(label: str, draw, evaluate, proxy, *, truth_proxy=None, store_in
     kept = (1 + REDRAW) * confirmed
     ensure(kept)
     result = {}
+    if summary:
+        for name in records[0][1]:
+            evidence = [leaf_summary(record[1][name], record[2][name]) for record in records[:kept]]
+            result.update({f"{label}.mse.{name}": np.asarray([leaf.mse for leaf in evidence]),
+                           f"{label}.worst.{name}": np.asarray([leaf.worst for leaf in evidence]),
+                           f"{label}.rows.{name}": np.stack([leaf.rows for leaf in evidence]),
+                           f"{label}.finite.{name}": np.asarray([leaf.finite for leaf in evidence]),
+                           f"{label}.sketch.{name}": np.stack([truth_sketch(record[2][name])
+                                                               for record in records[:kept]])})
+        result[f"{label}.input_digest"] = np.asarray([input_digest(record[0]) for record in records[:kept]])
+        result.update({f"{label}.seeds": np.int32(confirmed), f"{label}.redraw": np.int32(REDRAW)})
+        print(f"{label}: declared {confirmed} seeds; recorded {kept} draws' evidence", flush=True)
+        return result
     for index, kind in enumerate(("input", "reference", "truth")):
         if kind == "input" and not store_inputs:
             continue
