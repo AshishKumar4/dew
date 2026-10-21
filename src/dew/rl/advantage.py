@@ -120,12 +120,19 @@ def group_advantage(rewards: jax.Array, group: int, normalise_by_std: bool = Tru
     `norm_adv_by_std_in_grpo`.
     """
     grouped = _grouped(rewards, group)
-    centred = grouped - jnp.mean(grouped, axis=-1, keepdims=True)
     if not normalise_by_std:
-        return centred.reshape(-1)
+        return (grouped - jnp.mean(grouped, axis=-1, keepdims=True)).reshape(-1)
     # ddof 1 is both references' choice, and jnp.std defaults to 0.
-    deviation = jnp.std(grouped, axis=-1, ddof=1, keepdims=True)
-    return (centred / (deviation + eps)).reshape(-1)
+    return group_normalised(grouped, ddof=1, eps=eps).reshape(-1)
+
+
+def group_normalised(grouped, *, ddof: int, eps: float, xp=jnp):
+    """Each row of `grouped` `[groups, members]` less its mean, over its standard deviation
+    (`ddof`) plus `eps`, in `grouped`'s dtype and array library (`xp`, NumPy for a host reference's
+    float64): the arithmetic every group-relative advantage shares, each reference its own
+    `ddof`, `eps` and dtype."""
+    centred = grouped - xp.mean(grouped, axis=-1, keepdims=True)
+    return centred / (xp.std(grouped, axis=-1, ddof=ddof, keepdims=True) + eps)
 
 
 def rloo_advantage(rewards: jax.Array, group: int) -> jax.Array:
