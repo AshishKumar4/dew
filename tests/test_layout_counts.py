@@ -252,7 +252,9 @@ def test_a_laid_out_corpus_resumed_reads_its_windows_counted_as_the_uninterrupte
         # each of its own tokens, so a lost, repeated or replayed row shows.
         length = 40 if layout == "windows" else 11
         documents = Memory([{"text": np.arange(length, dtype=np.int32) + 1000 * index + 100_000 * source,
-                             "text_roles": (np.arange(length) < scored).astype(np.int32),
+                             # The first `scored` targets in role 1, as `roled` scores them: a
+                             # token's role scores the one after it.
+                             "text_roles": (np.arange(length) < scored + 1).astype(np.int32),
                              "source": np.int32(source)} for index in range(8)], shard_rows=4)
         # A stream read by two loading workers holds a shard for each of them.
         counted = Pipeline(documents, name=str(source)).filter_map(CountTargets(role=1))
@@ -264,8 +266,7 @@ def test_a_laid_out_corpus_resumed_reads_its_windows_counted_as_the_uninterrupte
     loading = dataclasses.replace(READ, workers=workers)
 
     def stream():
-        # A token's role scores the one after it: two scored tokens make one target a document.
-        mixed = mix([corpus(0, 2), corpus(1, 5)], by="tokens")
+        mixed = mix([corpus(0, 1), corpus(1, 5)], by="tokens")
         return compile(mixed.map(Delivered()).batch(2), read=read, loading=loading).train(DataPartition())
 
     uninterrupted = stream()
