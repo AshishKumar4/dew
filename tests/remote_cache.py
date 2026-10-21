@@ -41,6 +41,7 @@ import os
 import queue
 import struct
 import sys
+import tempfile
 import threading
 import time
 import urllib.error
@@ -73,6 +74,10 @@ class RemoteCache:
         self.failures = 0
         self.given_up = False
         self.lock = threading.Lock()
+        """Guards the failure count and the counters."""
+        self.state = threading.Lock()
+        """Guards the bundles' bookkeeping and the directory's view: a bundle's switch, its seeding, its
+        sealing; held across no request."""
         self.file: str | None = None
         self.seen: set[str] | None = None
         """The programs in the directory when the current bundle's run began or last moved on."""
@@ -82,6 +87,12 @@ class RemoteCache:
         """The programs each bundle's GET brought, in the bundle's order."""
         self.held: dict[str, set[str]] = {}
         """The programs each bundle holds on the Worker, as read or last written."""
+        self.queued: dict[str, set[str]] = {}
+        """The compiled programs each bundle's last upload was made for: a bundle the cap cut short is not
+        sent again until its tests compile another."""
+        self.unrestored: set[str] = set()
+        """The bundles whose fetched programs did not all reach the directory: never written back, so a
+        partial restore does not replace a whole bundle."""
         # Daemon threads, which the interpreter does not wait for at exit; `drain` bounds the wait.
         self.uploads: queue.Queue[tuple[str, bytes]] = queue.Queue()
         self.uploader = threading.Thread(target=self._uploading, daemon=True, name="xla-cache")
@@ -118,7 +129,7 @@ class RemoteCache:
 
     def _moved_on(self) -> None:
         """The programs the directory gained since the current bundle's run began or last moved on,
-        written to its account."""
+        written to its account (under `state`)."""
         if self.file is None or self.seen is None:
             return
         programs = self._programs()
@@ -131,28 +142,35 @@ class RemoteCache:
         if not self.available:
             return
         try:
-            if file != self.file:
-                self._moved_on()
-                self.file = file
-                self.seen = self._programs()
-            if file in self.held:
-                return
-            self.held[file] = set()
+            with self.state:
+                if file != self.file:
+                    self._moved_on()
+                    self.file = file
+                    self.seen = self._programs()
+                if file in self.held:
+                    return
+                self.held[file] = set()
             entries = self._fetched(file)
-            for key, value in entries:
-                self._seeded(key, value)
-            if entries:
-                self._answered()
         except UNREACHABLE as error:
             self._failed(error)
             return
         except ValueError as error:  # an answer that is no whole bundle is a miss
             self._failed(error)
             return
-        keys = [key for key, _ in entries]
-        self.fetched[file] = keys
-        self.held[file] = set(keys)
-        self.seen |= set(keys)
+        keys = []
+        with self.state:
+            try:
+                for key, value in entries:
+                    self._seeded(key, value)
+                    keys.append(key)
+                    self.seen.add(key)
+            except UNREACHABLE as error:
+                self.unrestored.add(file)
+                self._failed(error)
+            self.fetched[file] = keys
+            self.held[file] = set(keys)
+        if keys and file not in self.unrestored:
+            self._answered()
         with self.lock:
             self.programs_fetched += len(keys)
 
@@ -173,28 +191,32 @@ class RemoteCache:
     def _seeded(self, key: str, value: bytes) -> None:
         """`value` as program `key`'s file, unless the directory has it: written to a name of its own
         and linked in whole, so a reader sees all of it or none."""
-        staged = self.directory / f".{key}.{os.getpid()}.partial"
-        staged.write_bytes(value)
+        handle, staged = tempfile.mkstemp(prefix=".", suffix=".partial", dir=self.directory)
         try:
+            with os.fdopen(handle, "wb") as written:
+                written.write(value)
             os.link(staged, self.directory / f"{key}{SUFFIX}")
         except FileExistsError:
             pass
         finally:
-            staged.unlink()
+            os.unlink(staged)
 
     def closed(self, file: str) -> None:
         """Bundle `file` written back, where its tests compiled a program it lacked: the programs
         compiled under it, then those fetched for it, up to `MAX_BYTES`."""
-        if not self.available:
+        if not self.available or file in self.unrestored:
             return
         try:
-            if file == self.file:
-                self._moved_on()
-            written = self.written.get(file, [])
-            if not set(written) - self.held.get(file, set()):
-                return
+            with self.state:
+                if file == self.file:
+                    self._moved_on()
+                written = list(self.written.get(file, []))
+                if not set(written) - self.held.get(file, set()) - self.queued.get(file, set()):
+                    return
+                self.queued[file] = set(written)
+                fetched = list(self.fetched.get(file, []))
             entries, size = [], 0
-            for key in dict.fromkeys([*written, *self.fetched.get(file, [])]):
+            for key in dict.fromkeys([*written, *fetched]):
                 path = self.directory / f"{key}{SUFFIX}"
                 if not path.exists():
                     continue
@@ -206,7 +228,8 @@ class RemoteCache:
         except UNREACHABLE as error:
             self._failed(error)
             return
-        self.held[file] = {key for key, _ in entries}
+        with self.state:
+            self.held[file] = {key for key, _ in entries}
         self.uploads.put((file, packed(entries)))
 
     def _uploading(self) -> None:
@@ -264,7 +287,7 @@ def packed(entries: list[tuple[str, bytes]]) -> bytes:
 def unpacked(bundle: bytes) -> list[tuple[str, bytes]]:
     """The `(key, value)` entries of a `packed` bundle, or ValueError where it is not one whole: more
     than `MAX_BYTES`, an entry its lengths run past, or a key that is no file name in one directory
-    (empty, `.` or `..`, a separator or NUL in it, or too long for its file's name)."""
+    (empty, `.` or `..`, a separator or NUL in it, or too long for its `-cache` file's name)."""
     if len(bundle) > MAX_BYTES:
         raise ValueError(f"a bundle of more than {MAX_BYTES} bytes")
     entries, at = [], 0
@@ -277,7 +300,7 @@ def unpacked(bundle: bytes) -> list[tuple[str, bytes]]:
             raise ValueError(f"a bundle's entry at {at} runs past its {len(bundle)} bytes")
         key = bundle[at:at + keyed].decode()
         if (key in ("", ".", "..") or any(character in key for character in "/\\\0")
-                or len(f".{key}.{sys.maxsize}.partial".encode()) > 255):
+                or len(f"{key}{SUFFIX}".encode()) > 255):
             raise ValueError(f"a bundle's key {key[:80]!r} is no file name")
         entries.append((key, bundle[at + keyed:at + keyed + sized]))
         at += keyed + sized
@@ -304,11 +327,15 @@ def install(url: str, token: str) -> RemoteCache | None:
     import jax
 
     directory = jax.config.jax_compilation_cache_dir
-    address = urllib.parse.urlparse(url)
     if not jax.config.jax_enable_compilation_cache or not directory or "://" in directory:
         logger.warning("the shared XLA cache needs JAX's cache on in a local directory, not %r", directory)
         return None
-    if address.scheme not in ("http", "https") or not address.netloc:
+    try:
+        address = urllib.parse.urlparse(url)
+        address.port  # noqa: B018 -- a port that is no number raises here, not at the first request
+    except ValueError:
+        address = None
+    if address is None or address.scheme not in ("http", "https") or not address.netloc:
         logger.warning("the shared XLA cache's URL %r is no http(s) address", url)
         return None
     return RemoteCache(Path(directory), url, token, prefix())
