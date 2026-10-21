@@ -84,8 +84,12 @@ def consistency_loss(
         g = -cos t sqrt(1 - r^2 sin^2 t) (F_sg - F_teacher) - (r cos t sin t x + dF/dt)
 
     normalized by its norm plus 0.1, and the loss is ||F - F_sg - g||^2.
-    `student(x, t)` returns the student's F.
+    `student(x, t)` returns the student's F. The noised sample and its time, built from float32 draws,
+    are widened to the teacher's dtype, exactly, so a float64 twin takes its JVP in float64, its
+    tangents in the primals' dtypes as `jax.jvp` asks.
     """
+    wide = jnp.result_type(x, t, teacher_F)
+    x, t = x.astype(wide), t.astype(wide)
     cos, sin = expand(jnp.cos(t), x), expand(jnp.sin(t), x)
     with forward_mode_attention():
         _, derivative = jax.jvp(student, (x, t), (cos * sin * teacher_F, jnp.cos(t) * jnp.sin(t)))
