@@ -1011,8 +1011,8 @@ def _diagnostic(pipeline: Pipeline, *, records: int | None = None) -> _Host:
         lowering = _finite(lowering)
     # A token budget is fixed-length rows by now (`_budgeted`).
     batch = next(stage for stage in pipeline.stages if isinstance(stage, BatchStage)).size
-    build = _Build(read, loading, 0, batch, lowering, training=True)
-    return _Host(build.tuned(pipeline).batches(pipeline, DataPartition()), packed + _batch_steps(pipeline)[0])
+    build = _Build(read, loading, 0, batch, lowering, training=True).tuned(pipeline).pooled(pipeline)
+    return _Host(build.batches(pipeline, DataPartition()), packed + _batch_steps(pipeline)[0])
 
 
 def _finite(lowering: _Lowering) -> _Lowering:
