@@ -939,12 +939,14 @@ def test_a_product_declares_its_promotion_and_the_kernels_refusal(compute, preci
     assert grouped_matmul.ragged_dot_refusal(compute, (), precision) == declared.refusal
 
 
-def test_a_product_under_x64_is_refused():
-    """x64 widens the kernels' int32 group offsets, and the operands it allows wider than fp32 would need
-    their gradients summed wider than the kernels sum."""
+def test_a_product_under_x64_or_from_a_complex_master_is_refused():
+    """x64 widens the kernels' int32 group offsets; a complex master's gradient is one the kernels,
+    summing in fp32, cannot write, at a real compute dtype as at any."""
     with jax.enable_x64(new_val=True):
         assert "x64" in product.declared(jnp.bfloat16, DEFAULT).refusal
-        assert grouped_matmul.ragged_dot_refusal(jnp.bfloat16, (jnp.float64,), DEFAULT) is not None
+    refusal = product.declared(jnp.bfloat16, DEFAULT, operands=(jnp.complex64,)).refusal
+    assert refusal is not None and "fp32 does not hold" in refusal
+    assert grouped_matmul.ragged_dot_refusal(jnp.bfloat16, (jnp.complex64,), DEFAULT) == refusal
 
 
 def swiglu(gate, up):
@@ -972,7 +974,9 @@ def test_a_paired_product_is_its_two_products_combined_bitwise():
     [up_acc] = triton_dense.gmm(lhs, up, out_dtypes=("float32",), **options)
     expected = swiglu(gate_acc, up_acc).astype(jnp.bfloat16)
     assert paired.shape == (rows, width) and paired.dtype == jnp.bfloat16
-    np.testing.assert_array_equal(np.asarray(paired, np.float32), np.asarray(expected, np.float32))
+    assert bool(jnp.all(jnp.isfinite(paired)))
+    np.testing.assert_array_equal(np.asarray(jax.lax.bitcast_convert_type(paired, jnp.uint16)),
+                                  np.asarray(jax.lax.bitcast_convert_type(expected, jnp.uint16)))
 
 
 @pytest.mark.parametrize("generation_name", ["sm80", "sm86", "sm90"])
