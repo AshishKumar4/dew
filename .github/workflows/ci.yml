@@ -60,6 +60,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
     - uses: actions/checkout@v4
+      with:
+        fetch-depth: 0  # SLOP020's inventory ratchet reads the whole history
     - uses: actions/setup-python@v5
       with:
         python-version-file: .python-version
@@ -72,6 +74,10 @@ jobs:
         sh tools/install_environment.sh cpu --system
     - name: Every cheap gate (tools/check.sh), all failures reported
       run: sh tools/check.sh
+    # No commit loosens the tolerance inventory (SLOP020): held to main's at the merge-base and to
+    # every parent in the history. Lanes run it on the PC before a LAND; armada's checkouts are shallow.
+    - name: The tolerance inventory only shrinks
+      run: python tools/lint_slop.py --ratchet --base=origin/main
     - name: Upload the complexity distribution
       uses: actions/upload-artifact@v4
       with:

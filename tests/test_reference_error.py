@@ -11,7 +11,9 @@ from reference_error import (
     assert_as_exact,
     assert_as_exact_as_the_reference,
     assert_leaves_as_exact,
+    declared_seeds,
     distance,
+    indexed_recording,
     seeds_for,
 )
 
@@ -184,3 +186,57 @@ def test_check_one_holds_a_row_of_float64_zero_to_the_references_own():
     with pytest.raises(AssertionError) as raised:
         assert_as_exact(zero_row(1e-12), zero_row(0.0), _draw, "zero row", seeds=8)
     assert raised.type is AssertionError
+
+
+def test_a_recorded_reference_is_drawn_by_its_index_and_covers_the_redraw(tmp_path):
+    """A reference recorded over (1 + REDRAW)·K seeds: each draw reads its seed's inputs, the reference
+    and truth read their recorded outputs at it, and check 1 judges Dew against them; a recording too
+    short for the redraw is refused before anything is judged."""
+    rng = np.random.default_rng(9)
+    count, seeds = 40, 8
+    x = rng.normal(size=(count, 32)).astype(np.float32)
+    # x·x - 1, rounded twice at fp32 alike by NumPy and XLA (XLA's tanh is about 1.6 times libm's error
+    # on a CPU, so a transcendental would compare the two libraries, not the recording).
+    truth = x.astype(np.float64) ** 2 - 1
+    path = tmp_path / "recorded.npz"
+    np.savez(path, **{"site.input.x": x, "site.reference.y": x * x - np.float32(1),
+                      "site.truth.y": truth, "site.seeds": np.int64(seeds)})
+    assert declared_seeds(path) == {"site": seeds}
+    with np.load(path) as stored:
+        draw, reference, truth_fn = indexed_recording(dict(stored), "site", seeds)
+        squared = jax.jit(lambda index, inputs: {"y": inputs["x"] * inputs["x"] - 1})
+        assert_as_exact(squared, reference, draw, "recorded", seeds=seeds, truth_fn=truth_fn)
+        with pytest.raises(AssertionError):
+            indexed_recording(dict(stored), "site", 16)
+        for narrow in (np.float32, jnp.bfloat16):
+            with pytest.raises(AssertionError):
+                indexed_recording({**stored, "site.truth.y": truth.astype(narrow)}, "site", seeds)
+
+
+def test_a_recording_declares_the_count_its_recorded_reference_resolves(tmp_path):
+    """tools/recorded_references.py records a reference over the seeds its own recording resolves, and
+    their redraw; check 1 then judges Dew against the recording by its index."""
+    from tool_support import load
+
+    recorder = load("recorded_references")
+
+    def draw(seed):
+        return {"x": np.random.default_rng(100 + seed).normal(size=(64,)).astype(np.float32)}
+
+    def evaluate(inputs):
+        x = inputs["x"]
+        return {"y": x * x - np.float32(1)}, {"y": x.astype(np.float64) ** 2 - 1}
+
+    def squared(inputs):
+        return {"y": inputs["x"] * inputs["x"] - 1}
+
+    recorded = recorder.record_case("site", draw, evaluate, squared)
+    seeds = int(recorded["site.seeds"])
+    assert seeds >= 8 and len(recorded["site.input.x"]) >= 5 * seeds
+    path = tmp_path / "recorded.npz"
+    np.savez(path, **recorded)
+    assert declared_seeds(path) == {"site": seeds}
+    with np.load(path) as stored:
+        draw_recorded, reference, truth = indexed_recording(dict(stored), "site", seeds)
+        assert_as_exact(jax.jit(lambda index, inputs: squared(inputs)), reference, draw_recorded, "recorded",
+                        seeds=seeds, truth_fn=truth)
