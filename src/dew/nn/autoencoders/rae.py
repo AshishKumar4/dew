@@ -41,7 +41,7 @@ from dew.nn.precision import float32_dot_general
 from dew.objectives.base import Variables
 
 from ..conv import Conv
-from .api import LatentNormalization, ModuleAutoEncoder
+from .api import LatentNormalization, ModuleAutoEncoder, RecordValue
 
 if TYPE_CHECKING:
     from dew.interop.streaming import WeightLayout
@@ -435,7 +435,7 @@ class RAEAutoencoder(ModuleAutoEncoder[RAE]):
                  scaling_factor: float = 1.0):
         super().__init__(model, params)
         # The record keeps the checkpoint's statistics as given, in the source's layout.
-        record: dict[str, object] = {
+        record: dict[str, RecordValue] = {
             name: None if value is None else np.asarray(value, np.float32)
             for name, value in (('latents_mean', latents_mean), ('latents_std', latents_std))}
         record['scaling_factor'] = scaling_factor

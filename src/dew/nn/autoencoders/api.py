@@ -13,6 +13,9 @@ from flax import linen as nn
 
 from dew.objectives.base import Variables
 
+type RecordValue = float | np.ndarray | None
+"""A value a latent normalization's record keeps: a number, one per channel or position, or absent."""
+
 
 @dataclasses.dataclass(frozen=True, eq=False)
 class LatentNormalization:
@@ -21,7 +24,7 @@ class LatentNormalization:
     together once and read-only after. Latents are normalized as `(z - shift) * factor` and restored
     as `z / factor + shift`; one that `divides` normalizes as `(z - shift) / factor` and restores as
     `z * factor + shift`, as its source rounds."""
-    record: Mapping[str, object]
+    record: Mapping[str, RecordValue]
     shift: float | np.ndarray
     factor: float | np.ndarray
     divides: bool = False
@@ -36,7 +39,7 @@ class LatentNormalization:
     @property
     def scale(self) -> float | np.ndarray:
         """The factor a normalized latent is the shifted one times."""
-        return _frozen(np.float32(1.0) / self.factor) if self.divides else self.factor
+        return _frozen(np.asarray(np.float32(1.0) / self.factor)) if self.divides else self.factor
 
     def normalized(self, latent: jnp.ndarray) -> jnp.ndarray:
         shift, factor = (jnp.asarray(value, latent.dtype) for value in (self.shift, self.factor))
@@ -47,13 +50,13 @@ class LatentNormalization:
         return z * factor + shift if self.divides else z / factor + shift
 
 
-class _Record(Mapping[str, object]):
+class _Record(Mapping[str, RecordValue]):
     """A record's values, read-only (a mapping with no way to set one), and picklable as any object is."""
 
-    def __init__(self, values: dict[str, object]):
-        self._values = values
+    def __init__(self, values: Mapping[str, RecordValue]):
+        self._values = dict(values)
 
-    def __getitem__(self, name: str) -> object:
+    def __getitem__(self, name: str) -> RecordValue:
         return self._values[name]
 
     def __iter__(self) -> Iterator[str]:
@@ -63,7 +66,7 @@ class _Record(Mapping[str, object]):
         return len(self._values)
 
 
-def _frozen(value):
+def _frozen[T](value: T) -> T:
     """`value`, or a read-only copy where it is an array."""
     if not isinstance(value, np.ndarray):
         return value

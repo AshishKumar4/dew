@@ -136,8 +136,8 @@ def load_autoencoder(modelname: str, *, revision: str = "bf16", dtype: DTypeLike
                          f"{sorted(given)} would not survive the run's rebuild from that record")
     if not given:
         return autoencoder
+    shift = autoencoder.latent_shift if latent_shift is None else latent_shift
+    scale = autoencoder.latent_scale if latent_scale is None else latent_scale
     record = dict(autoencoder.normalization.record)
-    overrides = (("latent_shift", latent_shift), ("latent_scale", latent_scale))
-    record.update({name: value for name, value in overrides if value is not None})
-    return autoencoder.with_normalization(
-        LatentNormalization(record, record["latent_shift"], record["latent_scale"]))
+    record.update(latent_shift=shift, latent_scale=scale)
+    return autoencoder.with_normalization(LatentNormalization(record, shift, scale))

@@ -337,16 +337,16 @@ class QwenImageAutoencoder(ModuleAutoEncoder[QwenImageVAE]):
     def __init__(self, *, model: QwenImageVAE, params: Variables,
                  latents_mean: Sequence[float], latents_std: Sequence[float]):
         super().__init__(model, params)
-        latents_mean, latents_std = np.asarray(latents_mean, np.float32), np.asarray(latents_std, np.float32)
+        mean, std = np.asarray(latents_mean, np.float32), np.asarray(latents_std, np.float32)
         expected = (model.latent_channels,)
-        if latents_mean.shape != expected or latents_std.shape != expected:
+        if mean.shape != expected or std.shape != expected:
             raise ValueError(
-                f"latents_mean {latents_mean.shape} and latents_std {latents_std.shape} "
+                f"latents_mean {mean.shape} and latents_std {std.shape} "
                 f"must both hold one value per latent channel {expected}"
             )
         # The pipeline divides by the standard deviation and multiplies back.
-        self.normalization = LatentNormalization({'latents_mean': latents_mean, 'latents_std': latents_std},
-                                                 latents_mean, latents_std, divides=True)
+        self.normalization = LatentNormalization({'latents_mean': mean, 'latents_std': std}, mean, std,
+                                                 divides=True)
 
     def record_arguments(self) -> dict:
         return dict(self.normalization.record)

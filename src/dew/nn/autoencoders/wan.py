@@ -430,15 +430,14 @@ class WanAutoencoder(AutoEncoder):
     def __init__(self, *, model: WanVAE, params: Variables, latents_mean, latents_std):
         self.model = model
         self.params = params
-        latents_mean, latents_std = np.asarray(latents_mean, np.float32), np.asarray(latents_std, np.float32)
-        self.normalization = LatentNormalization({'latents_mean': latents_mean, 'latents_std': latents_std},
-                                                 latents_mean, 1.0 / latents_std)
+        mean, std = np.asarray(latents_mean, np.float32), np.asarray(latents_std, np.float32)
         expected = (model.latent,)
-        if self.latent_shift.shape != expected or self.latent_scale.shape != expected:
+        if mean.shape != expected or std.shape != expected:
             raise ValueError(
-                f"latents_mean {self.latent_shift.shape} and latents_std {self.latent_scale.shape} "
+                f"latents_mean {mean.shape} and latents_std {std.shape} "
                 f"must both hold one value per latent channel {expected}"
             )
+        self.normalization = LatentNormalization({'latents_mean': mean, 'latents_std': std}, mean, 1.0 / std)
         # The posterior's draw reads the whole video's moments, its chunks assembled, and its noise whole.
         self._encode = jax.jit(lambda params, video, key=None, noise=None: posterior_latent(
             chunked_moments(model, {"params": params}, video), key, noise))
