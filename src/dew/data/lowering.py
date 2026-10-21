@@ -921,17 +921,20 @@ class _Build:
             rows = stored.map_with_index(placed) if last >= 0 else stored
             return self.shared(rows, pipeline, partition), 0
         keyed = _keyed(source)
-        if keyed is not source:
+        if isinstance(source, _Materialized) and keyed is not source:
             # A memory read that ran no step before the cache holds the rows of the source it keys,
-            # which the cache reads by their places there, its missing inputs among them.
+            # at the places there it states: the cache reads those, its missing inputs skipped.
             records = keyed.records(self.read)
+            held = np.asarray([identifier[0] for identifier in source.identifiers], np.int64)
+            positions = None if len(held) == len(records) else held
+        else:
+            present = _Present.of(records) if _in_memory(keyed) else None
+            positions = None if present is None else present.positions
         stored = _cache_inputs(keyed, records)
         filled, manifest, prefix = _fill(pipeline, keyed, cache, self.read)
         # Read by input, as the source's own rows are: its missing inputs skipped, as the uncached
         # root skips them, and written by the fill; one record for each input reads by index and in
         # the uncached chain's order, the rest as a stream of each input's outputs.
-        present = _Present.of(records) if _in_memory(keyed) else None
-        positions = None if present is None else present.positions
         missing = () if positions is None else np.setdiff1d(np.arange(len(stored)), positions).tolist()
         cached = filled.mapped(stored, manifest, transform=prefix, source=keyed, missing=missing)
         inputs = _Inputs(cached, positions, single=self.lowering.one_to_one)

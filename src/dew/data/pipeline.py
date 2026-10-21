@@ -97,12 +97,16 @@ type ExpandStep = Expansion | Callable[[Batch], Iterable[Batch | Rejected]]
 
 @dataclasses.dataclass(frozen=True)
 class Configured:
-    """Resolve one record step from source facts before any record reader opens."""
+    """Resolve one record step from source facts before any record reader opens. `one_to_one`
+    states that the step keeps one record for each input whatever the facts, which a cache after it
+    and a recipe's order read before it binds; binding it to a step that drops or expands records is
+    refused."""
 
     factory: Callable[[Mapping[str, object]], RecordStep | pygrain.RandomMapTransform | Expansion]
     needs: tuple[str, ...]
     scope: Literal["source", "run"] = "source"
     random: bool = False
+    one_to_one: bool = False
 
 
 @dataclasses.dataclass(frozen=True)

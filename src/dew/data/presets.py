@@ -94,7 +94,7 @@ def images(dataset: Dataset, size: int, *, batch: int,
                                rejects=rejects)
     drawn = isinstance(caption, image_steps.RandomCaption)
     captioned = None if caption is None else Configured(image_steps.ConfigureCaption(caption), needs=(),
-                                                        random=drawn)
+                                                        random=drawn, one_to_one=True)
     if captioned is not None and not drawn:
         prepared = prepared.map(captioned)
     prepared = _cached(prepared, cache)
