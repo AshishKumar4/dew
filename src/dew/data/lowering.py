@@ -340,7 +340,9 @@ class _ConcurrentIterator(pygrain.DatasetIterator):
         self._rows.set_state(state)
 
     def close(self) -> None:
-        self._pool.shutdown(wait=False, cancel_futures=True)
+        # Records not yet started are dropped; those running finish first, so a closed reader
+        # leaves no thread of its own running.
+        self._pool.shutdown(wait=True, cancel_futures=True)
         self._pending.clear()
         self._rows.close()
 
