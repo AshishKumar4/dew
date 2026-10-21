@@ -23,12 +23,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from interop_support import extract_fixture, packed, unpacked
-from reference_error import (
-    assert_as_exact,
-    assert_as_exact_as_the_reference,
-    declared_seeds,
-    indexed_recording,
-)
+from reference_error import assert_as_exact, assert_as_exact_as_the_reference
 
 from dew.diffusion.process import DenoisingCondition
 from dew.interop.diffusion import component_tensors, flux_fields, flux_path, read_transformer
@@ -36,6 +31,8 @@ from dew.nn.backbones.flux import FluxTransformer
 
 ROOT = Path(__file__).resolve().parents[1]
 CASES = ("schnell", "dev", "rect", "deep", "mixed")
+CASE_SEEDS = dict.fromkeys(CASES, 8)
+"""Each transformer's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for`."""
 
 
 @pytest.fixture(scope="module")
@@ -43,14 +40,10 @@ def source(tmp_path_factory):
     return extract_fixture(ROOT / "tests/fixtures/flux_source.tar.xz", tmp_path_factory.mktemp("flux-source"))
 
 
-def flux_walk(source, name: str, grid: tuple[int, int], *, dtype="float32"):
-    """A compiled forward and every gradient on a draw, with the fixture's weights.
-
-    The recorder plans its seeds on this same walk with dtype inferred from the inputs, so its
-    float64 proxy widens the computation along with them. Layout export stays outside the jit.
-    """
+def flux_walk(source, name: str, grid: tuple[int, int]):
+    """A compiled native forward and every gradient on a draw, with the fixture's weights."""
     config = json.loads((source / name / "transformer" / "config.json").read_text())
-    model = FluxTransformer(**flux_fields(config, dtype=dtype, attention_impl="xla"))
+    model = FluxTransformer(**flux_fields(config, attention_impl="xla"))
     params, layouts = read_transformer(component_tensors(source / name, "transformer"), flux_path)
 
     @jax.jit
@@ -65,8 +58,7 @@ def flux_walk(source, name: str, grid: tuple[int, int], *, dtype="float32"):
             return jnp.sum(output * probe), output
 
         (_, output), gradients = jax.value_and_grad(objective, argnums=(0, 1, 2, 3), has_aux=True)(
-            jax.tree.map(lambda value: jnp.asarray(value, latent.dtype), params),
-            latent, inputs["context"], inputs["pooled"])
+            params, latent, inputs["context"], inputs["pooled"])
         return {"output": packed(output), "grad_packed": packed(gradients[1]),
                 "grad_context": gradients[2], "grad_pooled": gradients[3], "grad_params": gradients[0]}
 
@@ -84,23 +76,86 @@ def test_native_flux_matches_the_source_forward_and_every_gradient(name, source)
     double and single blocks, and one walked at a different distilled
     guidance per row.
     """
+    import torch
+    from diffusers.models.transformers.transformer_flux import FluxTransformer2DModel
+
+    from tools.diffusers_wan_reference import float64
+
     record = json.loads((source / "flux_transformer.json").read_text())
-    grid = tuple(record["cases"][name]["grid"])
+    case = record["cases"][name]
+    grid = tuple(case["grid"])
+    checkpoint = source / name / "transformer"
+    config = json.loads((checkpoint / "config.json").read_text())
     walk, layout = flux_walk(source, name, grid)
-    seeds = declared_seeds(source / "flux_transformer.npz")[name]
     with np.load(source / "flux_transformer.npz") as arrays:
+        original = {key: np.array(arrays[f"{name}.{key}"])
+                    for key in ("packed", "context", "pooled", "times", "guidance", "probe")}
         prefix = f"{name}.grad_param."
         tensors = [key[len(prefix):] for key in arrays.files if key.startswith(prefix)]
-        assert tensors
-        draw, reference, truth = indexed_recording(arrays, name, seeds)
+    assert tensors
 
-        def native(index, inputs):
-            values = walk(inputs)
-            gradients = values.pop("grad_params")
-            return {**values, **{f"grad_param.{tensor}": layout["transformer/" + tensor].export(
-                {"params": gradients}) for tensor in tensors}}
+    batch, tokens = case["batch"], record["tokens"]
+    rows, columns = grid
+    shape = (batch, rows * columns, config["in_channels"])
 
-        assert_as_exact(native, reference, draw, f"Flux {name}", seeds=seeds, truth_fn=truth)
+    def draw(seed):
+        """The fixture's inputs at seed 0, else the generator's normal draws at `seed`, with
+        each embedded guidance value perturbed by a unit-normal draw."""
+        if seed == 0:
+            return (original,)
+        generator = torch.Generator().manual_seed(24 + seed)
+        guidance = (torch.tensor(case["guidance"][:batch], dtype=torch.float32)
+                    if config["guidance_embeds"] else torch.zeros(0))
+        inputs = {
+            "packed": torch.randn(shape, generator=generator),
+            "context": torch.randn((batch, tokens, config["joint_attention_dim"]), generator=generator),
+            "pooled": torch.randn((batch, config["pooled_projection_dim"]), generator=generator),
+            "times": torch.from_numpy(original["times"]),
+            "probe": torch.randn(shape, generator=generator),
+        }
+        if guidance.numel():
+            guidance = guidance + torch.randn(guidance.shape, generator=generator)
+        return ({**{key: value.numpy() for key, value in inputs.items()}, "guidance": guidance.numpy()},)
+
+    narrow_model = FluxTransformer2DModel.from_pretrained(
+        checkpoint, torch_dtype=torch.float32, local_files_only=True).eval()
+    with float64():
+        wide_model = FluxTransformer2DModel.from_pretrained(
+            checkpoint, torch_dtype=torch.float64, local_files_only=True).eval()
+    positions = np.zeros((rows * columns, 3))
+    positions[:, 1] = np.repeat(np.arange(rows), columns)
+    positions[:, 2] = np.tile(np.arange(columns), rows)
+
+    def reference_walk(model, dtype, drawn):
+        inputs = [torch.tensor(drawn[key], dtype=dtype).requires_grad_()
+                  for key in ("packed", "context", "pooled")]
+        times, guidance, probe = (torch.tensor(drawn[key], dtype=dtype)
+                                  for key in ("times", "guidance", "probe"))
+        named = list(model.named_parameters())
+        output = model(hidden_states=inputs[0], encoder_hidden_states=inputs[1],
+                       pooled_projections=inputs[2], timestep=times / 1000,
+                       guidance=guidance if guidance.numel() else None,
+                       txt_ids=torch.zeros(tokens, 3, dtype=dtype),
+                       img_ids=torch.tensor(positions, dtype=dtype), return_dict=False)[0]
+        gradients = torch.autograd.grad((output * probe).sum(),
+                                        inputs + [value for _, value in named])
+        return {"output": output.detach().numpy(), "grad_packed": gradients[0].numpy(),
+                "grad_context": gradients[1].numpy(), "grad_pooled": gradients[2].numpy(),
+                **{f"grad_param.{key}": gradient.numpy()
+                   for (key, _), gradient in zip(named, gradients[3:], strict=True)}}
+
+    def truth(inputs):
+        with float64():
+            return reference_walk(wide_model, torch.float64, inputs)
+
+    def native(inputs):
+        values = walk(inputs)
+        gradients = values.pop("grad_params")
+        return {**values, **{f"grad_param.{tensor}": layout["transformer/" + tensor].export(
+            {"params": gradients}) for tensor in tensors}}
+
+    assert_as_exact(native, lambda inputs: reference_walk(narrow_model, torch.float32, inputs), draw,
+                    f"Flux {name}", seeds=CASE_SEEDS[name], truth_fn=truth)
 
 
 @pytest.fixture(scope="module")

@@ -25,12 +25,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from interop_support import assert_layout_tensors, extract_fixture, fixture_arrays
-from reference_error import (
-    assert_as_exact,
-    assert_as_exact_as_the_reference,
-    declared_seeds,
-    indexed_recording,
-)
+from reference_error import assert_as_exact_as_the_reference, assert_leaves_as_exact
 
 from dew.diffusion.process import DenoisingCondition
 from dew.interop.diffusion import component_tensors, read_transformer, z_image_fields, z_image_path
@@ -57,42 +52,29 @@ def arrays(source):
     return fixture_arrays(source / "z_image.npz")
 
 
-def load(source, name, *, dtype="float32"):
+def nhwc(latents):
+    """`[B, C, 1, H, W]` to `[B, H, W, C]`."""
+    return np.asarray(latents)[:, :, 0].transpose(0, 2, 3, 1)
+
+
+def load(source, name):
     config = json.loads((source / name / "transformer" / "config.json").read_text())
-    model = ZImageTransformer(**z_image_fields(config, dtype=dtype, attention_impl="xla"))
+    model = ZImageTransformer(**z_image_fields(config, dtype="float32", attention_impl="xla"))
     params, layouts = read_transformer(component_tensors(source / name, "transformer"), z_image_path)
     return model, params, layouts
 
 
-def transformer_walk(source, name, lengths, *, dtype="float32"):
-    """The native flow and gradients, plus the padded prompt gradient.
-
-    The recorder plans seeds on the same walk, inferring dtype for its widened proxy.
-    """
-    model, params, layouts = load(source, name, dtype=dtype)
+def inputs(name, arrays, record):
+    """The native call's inputs: the latents channels last, the model time
+    from the source's 1 - sigma, and each prompt padded to the budget."""
+    lengths = record["cases"][name]["lengths"]
+    width = arrays[f"{name}.caption.0"].shape[-1]
+    context = np.zeros((len(lengths), BUDGET, width), np.float32)
+    for row, length in enumerate(lengths):
+        context[row, :length] = arrays[f"{name}.caption.{row}"]
     mask = np.arange(BUDGET)[None] < np.asarray(lengths)[:, None]
-
-    @jax.jit
-    def walk(inputs):
-        latents = inputs["latents"][:, :, 0].transpose(0, 2, 3, 1)
-        probe = inputs["probe"][:, :, 0].transpose(0, 2, 3, 1)
-        context = jnp.zeros((len(lengths), BUDGET, inputs["caption.0"].shape[-1]), latents.dtype)
-        for row, length in enumerate(lengths):
-            context = context.at[row, :length].set(inputs[f"caption.{row}"])
-        time = 1000.0 * (1.0 - inputs["times"])
-
-        def objective(params, latents, context):
-            output = model.apply({"params": params}, latents, time, DenoisingCondition(context, mask=mask))
-            return jnp.sum(output * probe), output
-
-        (_, output), gradients = jax.value_and_grad(objective, argnums=(0, 1, 2), has_aux=True)(
-            jax.tree.map(lambda value: jnp.asarray(value, latents.dtype), params), latents, context)
-        return {"output": -output, "grad_latents": -gradients[1],
-                **{f"grad_caption.{row}": -gradients[2][row, :length]
-                   for row, length in enumerate(lengths)},
-                "grad_params": gradients[0], "grad_context": gradients[2]}
-
-    return walk, layouts
+    time = 1000.0 * (1.0 - arrays[f"{name}.times"])
+    return jnp.asarray(nhwc(arrays[f"{name}.latents"])), jnp.asarray(time, jnp.float32), context, mask
 
 
 @pytest.mark.parametrize("name", CASES)
@@ -107,24 +89,34 @@ def test_the_flow_and_its_gradients_match_the_source(source, arrays, record, nam
     """The native flow is the negated source output, its gradients the
     negated source gradients, every parameter's among them, whatever the
     rows' prompt lengths: each as near float64 as the source's float32."""
-    lengths = record["cases"][name]["lengths"]
-    walk, layouts = transformer_walk(source, name, lengths)
+    model, params, layouts = load(source, name)
+    latents, time, context, mask = inputs(name, arrays, record)
+    probe = nhwc(arrays[f"{name}.probe"])
+
+    def objective(params, latents, context):
+        return jnp.sum(
+            model.apply({"params": params}, latents, time, DenoisingCondition(context, mask=mask)) * probe
+        )
+
+    def held(value, key, layout=np.asarray):
+        assert_as_exact_as_the_reference(-np.asarray(value), layout(arrays[f"{name}.{key}"]),
+                                         layout(arrays[f"{name}.fp64.{key}"]), f"{name} {key}")
+
+    flow = model.apply({"params": params}, latents, time, DenoisingCondition(jnp.asarray(context), mask=mask))
+    held(flow, "output", nhwc)
+    grad_params, grad_latents, grad_context = jax.grad(objective, argnums=(0, 1, 2))(params, latents,
+                                                                                     jnp.asarray(context))
+    held(grad_latents, "grad_latents", nhwc)
+    for row, length in enumerate(record["cases"][name]["lengths"]):
+        held(grad_context[row, :length], f"grad_caption.{row}")
+        assert not np.asarray(grad_context[row, length:]).any()
     tensors = {layout.name.removeprefix("transformer/"): layout for layout in layouts}
     assert {key.removeprefix(f"{name}.grad_param.") for key in arrays
             if key.startswith(f"{name}.grad_param.")} == set(tensors)
-    seeds = declared_seeds(source / "z_image.npz")[name]
-    draw, reference, truth = indexed_recording(arrays, name, seeds)
-
-    def native(index, inputs):
-        values = walk(inputs)
-        gradients = values.pop("grad_params")
-        grad_context = values.pop("grad_context")
-        for row, length in enumerate(lengths):
-            assert not np.asarray(grad_context[row, length:]).any()
-        return {**values, **{f"grad_param.{tensor}": -layout.export({"params": gradients})
-                            for tensor, layout in tensors.items()}}
-
-    assert_as_exact(native, reference, draw, f"Z-Image {name}", seeds=seeds, truth_fn=truth)
+    assert_leaves_as_exact(
+        {tensor: -np.asarray(layout.export({"params": grad_params})) for tensor, layout in tensors.items()},
+        {tensor: arrays[f"{name}.grad_param.{tensor}"] for tensor in tensors},
+        {tensor: arrays[f"{name}.fp64.grad_param.{tensor}"] for tensor in tensors})
 
 
 @pytest.fixture(scope="module")

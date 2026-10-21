@@ -5,7 +5,7 @@ Tiny `FluxTransformer2DModel` instances are constructed and saved with
 is then run on packed latents the way its pipeline runs it: the ids the
 pipeline lays out, the timestep it divides by a thousand, and the distilled
 guidance a guidance-embedded checkpoint takes. Every case records the
-forward, the vector-Jacobian products against a drawn cotangent for the
+forward, the vector-Jacobian products against a fixed cotangent for the
 latent, the text tokens and the pooled vector, and the gradient of every
 parameter, unmodified, in float32, the reference, and in float64, the truth
 (`diffusers_wan_reference.float64`: the source's float32 pins widened). The
@@ -24,7 +24,6 @@ from __future__ import annotations
 
 import json
 import os
-import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -36,11 +35,10 @@ import torch
 from diffusers_reference_helpers import restore_transformers_names
 from diffusers_sd3_reference import bundle, clip_tokenizers, t5_tokenizer
 from diffusers_wan_reference import float64
-from recorded_references import provenance, record_case
 
-BASE = {"patch_size": 1, "in_channels": 16, "num_layers": 2, "num_single_layers": 2,
-        "attention_head_dim": 12, "num_attention_heads": 2, "joint_attention_dim": 16,
-        "pooled_projection_dim": 10, "guidance_embeds": False, "axes_dims_rope": (4, 4, 4)}
+BASE = dict(patch_size=1, in_channels=16, num_layers=2, num_single_layers=2,
+            attention_head_dim=12, num_attention_heads=2, joint_attention_dim=16,
+            pooled_projection_dim=10, guidance_embeds=False, axes_dims_rope=(4, 4, 4))
 TOKENS = 5
 SEED = 23
 
@@ -58,12 +56,12 @@ class Case:
 
 CASES: dict[str, Case] = {
     "schnell": Case(),
-    "dev": Case({"guidance_embeds": True}),
-    "rect": Case({"guidance_embeds": True}, grid=(6, 2)),
-    "deep": Case({"num_layers": 1, "num_single_layers": 3}, grid=(2, 6)),
+    "dev": Case(dict(guidance_embeds=True)),
+    "rect": Case(dict(guidance_embeds=True), grid=(6, 2)),
+    "deep": Case(dict(num_layers=1, num_single_layers=3), grid=(2, 6)),
     # Each row walked at its own distilled guidance, which the source takes as
     # a per-row tensor rather than one scalar.
-    "mixed": Case({"guidance_embeds": True}, guidance=(3.5, 7.0)),
+    "mixed": Case(dict(guidance_embeds=True), guidance=(3.5, 7.0)),
 }
 
 
@@ -76,74 +74,59 @@ def image_ids(rows: int, columns: int) -> torch.Tensor:
 
 
 def build(name: str, case: Case, root: Path) -> dict[str, np.ndarray]:
-    """The saved transformer and its float32 and float64 walks over recorded seeds.
-
-    Seed zero keeps the original draw. Further seeds redraw standard-normal inputs and cotangents,
-    with unit-normal guidance perturbations about the case's per-row guidance. Weights stay fixed.
-    """
+    """The case's saved transformer and its walk in float32 and in float64
+    (`fp64.`), the same weights and inputs widened."""
     from diffusers.models.transformers.transformer_flux import FluxTransformer2DModel
-    from test_flux_source import flux_walk
 
     config = {**BASE, **case.config}
     torch.manual_seed(SEED)
     model = FluxTransformer2DModel(**config).eval()
     directory = root / name / "transformer"
     model.save_pretrained(directory, safe_serialization=True)
+    generator = torch.Generator().manual_seed(SEED + 1)
     rows, columns = case.grid
-    shape = (case.batch, rows * columns, config["in_channels"])
+    packed = torch.randn((case.batch, rows * columns, config["in_channels"]), generator=generator,
+                         dtype=torch.float32, requires_grad=True)
+    context = torch.randn((case.batch, TOKENS, config["joint_attention_dim"]),
+                          generator=generator, dtype=torch.float32, requires_grad=True)
+    pooled = torch.randn((case.batch, config["pooled_projection_dim"]), generator=generator,
+                         dtype=torch.float32, requires_grad=True)
+    # The schedule's own model times, which the pipeline divides by the
+    # training count before the call and the transformer multiplies back.
+    times = torch.tensor([731.0, 42.0][: case.batch], dtype=torch.float32)
+    guidance = (torch.tensor(case.guidance[: case.batch], dtype=torch.float32)
+                if config["guidance_embeds"] else None)
+    probe = torch.randn(packed.shape, generator=generator, dtype=torch.float32)
 
-    def draw(seed):
-        generator = torch.Generator().manual_seed(SEED + 1 + seed)
-        inputs = {
-            "packed": torch.randn(shape, generator=generator),
-            "context": torch.randn((case.batch, TOKENS, config["joint_attention_dim"]), generator=generator),
-            "pooled": torch.randn((case.batch, config["pooled_projection_dim"]), generator=generator),
-            "times": torch.tensor([731.0, 42.0][:case.batch]),
-            "probe": torch.randn(shape, generator=generator),
-        }
-        guidance = torch.tensor(case.guidance[:case.batch]) if config["guidance_embeds"] else torch.zeros(0)
-        if seed and guidance.numel():
-            guidance = guidance + torch.randn(guidance.shape, generator=generator)
-        return {**{key: value.numpy() for key, value in inputs.items()}, "guidance": guidance.numpy()}
-
-    def walk(model, dtype, drawn) -> dict[str, np.ndarray]:
-        inputs = [torch.from_numpy(drawn[key]).to(dtype).requires_grad_()
-                  for key in ("packed", "context", "pooled")]
-        times, guidance, probe = (torch.from_numpy(drawn[key]).to(dtype)
-                                  for key in ("times", "guidance", "probe"))
+    def walk(model, dtype) -> dict[str, np.ndarray]:
+        inputs = [tensor.detach().to(dtype).requires_grad_() for tensor in (packed, context, pooled)]
         named = list(model.named_parameters())
         output = model(hidden_states=inputs[0], encoder_hidden_states=inputs[1],
-                       pooled_projections=inputs[2], timestep=times / 1000,
-                       guidance=guidance if guidance.numel() else None,
+                       pooled_projections=inputs[2], timestep=times.to(dtype) / 1000,
+                       guidance=None if guidance is None else guidance.to(dtype),
                        txt_ids=torch.zeros(TOKENS, 3, dtype=dtype),
                        img_ids=image_ids(rows, columns).to(dtype), return_dict=False)[0]
-        gradients = torch.autograd.grad((output * probe).sum(),
+        gradients = torch.autograd.grad((output * probe.to(dtype)).sum(),
                                         inputs + [value for _, value in named])
         return {"output": output.detach().numpy(), "grad_packed": gradients[0].numpy(),
                 "grad_context": gradients[1].numpy(), "grad_pooled": gradients[2].numpy(),
                 **{f"grad_param.{key}": gradient.numpy()
                    for (key, _), gradient in zip(named, gradients[3:], strict=True)}}
 
+    narrow = walk(model, torch.float32)
     with float64():
-        wide_model = FluxTransformer2DModel.from_pretrained(directory, torch_dtype=torch.float64).eval()
-
-    def evaluate(inputs):
-        narrow = walk(model, torch.float32, inputs)
-        with float64():
-            wide = walk(wide_model, torch.float64, inputs)
-        return narrow, wide
-
-    original = draw(0)
-    narrow, wide = evaluate(original)
+        wide = walk(FluxTransformer2DModel.from_pretrained(directory, torch_dtype=torch.float64).eval(),
+                    torch.float64)
     arrays = {
         "config": np.asarray(json.dumps(json.loads((directory / "config.json").read_text()))),
-        **original, **narrow, **{f"fp64.{key}": value for key, value in wide.items()},
+        "packed": packed.detach().numpy(), "context": context.detach().numpy(),
+        "pooled": pooled.detach().numpy(), "times": times.numpy(),
+        "guidance": np.zeros(0, np.float32) if guidance is None else guidance.numpy(),
+        "probe": probe.numpy(), **narrow, **{f"fp64.{key}": value for key, value in wide.items()},
     }
-    print(f"{name}: packed {shape} grid {case.grid} tokens {TOKENS} "
+    print(f"{name}: packed {tuple(packed.shape)} grid {case.grid} tokens {TOKENS} "
           f"|output| <= {float(np.abs(narrow['output']).max()):.4g} parameters {len(narrow) - 4}")
-    proxy, _ = flux_walk(root, name, case.grid, dtype=None)
-    return {**{f"{name}.{key}": value for key, value in arrays.items()},
-            **record_case(name, draw, evaluate, proxy)}
+    return arrays
 
 
 def reload(directory: str, recorded: str) -> None:
@@ -180,6 +163,7 @@ def reload(directory: str, recorded: str) -> None:
 
 def main(destination: str) -> None:
     import diffusers
+
     from reference_releases import require
 
     require("diffusers")
@@ -193,7 +177,8 @@ def main(destination: str) -> None:
     record: dict[str, object] = {"diffusers": diffusers.__version__, "base": BASE, "tokens": TOKENS,
                                  "cases": cases}
     for name, case in CASES.items():
-        arrays.update(build(name, case, root))
+        for key, value in build(name, case, root).items():
+            arrays[f"{name}.{key}"] = value
         cases[name] = {"config": {**BASE, **case.config}, "grid": list(case.grid),
                        "batch": case.batch, "guidance": list(case.guidance[: case.batch])}
     import inspect
@@ -207,11 +192,6 @@ def main(destination: str) -> None:
                           "default_steps": defaults["num_inference_steps"].default,
                           "default_guidance": defaults["guidance_scale"].default,
                           "true_cfg": defaults["true_cfg_scale"].default}
-    arrays["provenance"] = provenance(
-        "diffusers.FluxTransformer2DModel", diffusers.__version__, "cpu",
-        "PYTHONPATH=src python tools/diffusers_flux_reference.py OUTPUT_DIR",
-        generator_revision=subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
-        torch=torch.__version__)
     np.savez_compressed(root / "flux_transformer.npz", **arrays)
     (root / "flux_transformer.json").write_text(json.dumps(record, indent=1) + "\n")
     size = sum(path.stat().st_size for path in root.rglob("*") if path.is_file())

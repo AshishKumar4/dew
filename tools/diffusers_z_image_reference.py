@@ -4,7 +4,7 @@ Two halves. The transformer half constructs tiny `ZImageTransformer2DModel`
 instances with every parameter moved off its initialization, saves each with
 `save_pretrained`, and calls each as `ZImagePipeline` calls it: a list of
 latents `[C, 1, H, W]`, the time `1 - sigma`, and a list of prompt states
-of each prompt's own length. It records the output and, against a drawn
+of each prompt's own length. It records the output and, against a fixed
 cotangent, the gradients of the latents, the prompt states and every
 parameter (the weights rounded to bfloat16-representable values so the
 fixture compresses), unmodified, in float32, the reference, and in float64,
@@ -28,7 +28,6 @@ Run in the isolated reference environment (diffusers 0.40.0, transformers
 from __future__ import annotations
 
 import json
-import subprocess
 import sys
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -37,7 +36,6 @@ import numpy as np
 import torch
 from diffusers_reference_helpers import perturb, recording, saved_pipeline, tiny_qwen3_encoder
 from diffusers_wan_reference import float64, float64_scheduler
-from recorded_references import provenance, record_case
 from reference_releases import RELEASES
 
 DIFFUSERS = RELEASES["diffusers-0.40"]["diffusers"]
@@ -74,13 +72,9 @@ CASES: dict[str, Case] = {
 
 
 def build(name: str, case: Case, root: Path) -> dict[str, np.ndarray]:
-    """The saved weights walked over standard-normal inputs and cotangents over seeds.
-
-    Seed zero resumes the original RNG after its weight perturbations, so it includes the old draw.
-    Each caption retains its row's original length, and the weights and times stay fixed.
-    """
+    """The case's saved transformer and its walk in float32 and in float64
+    (`fp64.`), the same weights and inputs widened."""
     from diffusers import ZImageTransformer2DModel
-    from test_z_image_source import transformer_walk
 
     config = {**BASE, **case.config}
     torch.manual_seed(SEED)
@@ -92,58 +86,36 @@ def build(name: str, case: Case, root: Path) -> dict[str, np.ndarray]:
             parameter.copy_(parameter.to(torch.bfloat16).float())
     directory = root / name / "transformer"
     model.save_pretrained(directory, safe_serialization=True)
-    initial_state = generator.get_state()
     height, width = case.size
     batch = len(case.lengths)
-    shape = (batch, config["in_channels"], 1, height, width)
+    latents = torch.randn((batch, config["in_channels"], 1, height, width), generator=generator)
+    captions = [torch.randn((length, config["cap_feat_dim"]), generator=generator) for length in case.lengths]
+    times = torch.tensor(case.times)
+    probe = torch.randn((batch, config["in_channels"], 1, height, width), generator=generator)
 
-    def draw(seed):
-        generator = torch.Generator().manual_seed(SEED + 1 + seed)
-        if seed == 0:
-            generator.set_state(initial_state)
-        inputs = {"latents": torch.randn(shape, generator=generator),
-                  **{f"caption.{row}": torch.randn((length, config["cap_feat_dim"]), generator=generator)
-                     for row, length in enumerate(case.lengths)},
-                  "times": torch.tensor(case.times), "probe": torch.randn(shape, generator=generator)}
-        return {key: value.numpy() for key, value in inputs.items()}
-
-    def walk(model, dtype, drawn) -> dict[str, np.ndarray]:
-        keys = ("latents", *(f"caption.{row}" for row in range(batch)))
-        inputs = [torch.from_numpy(drawn[key]).to(dtype).requires_grad_() for key in keys]
-        times, probe = (torch.from_numpy(drawn[key]).to(dtype) for key in ("times", "probe"))
+    def walk(model, dtype) -> dict[str, np.ndarray]:
+        inputs = [tensor.detach().to(dtype).requires_grad_() for tensor in (latents, *captions)]
         named = list(model.named_parameters())
-        output = torch.stack(model(list(inputs[0].unbind(0)), times, inputs[1:],
+        output = torch.stack(model(list(inputs[0].unbind(0)), times.to(dtype), inputs[1:],
                                    return_dict=False)[0])
-        grads = torch.autograd.grad((output * probe).sum(), inputs + [value for _, value in named])
+        grads = torch.autograd.grad((output * probe.to(dtype)).sum(), inputs + [value for _, value in named])
         return {"output": output.detach().numpy(), "grad_latents": grads[0].numpy(),
                 **{f"grad_caption.{row}": grads[1 + row].numpy() for row in range(batch)},
                 **{f"grad_param.{key}": gradient.numpy()
                    for (key, _), gradient in zip(named, grads[1 + batch:], strict=True)}}
 
+    narrow = walk(model, torch.float32)
     with float64():
-        wide_model = ZImageTransformer2DModel.from_pretrained(directory, torch_dtype=torch.float64).eval()
+        from diffusers import ZImageTransformer2DModel
 
-    def evaluate(inputs):
-        narrow = walk(model, torch.float32, inputs)
-        with float64():
-            wide = walk(wide_model, torch.float64, inputs)
-        return narrow, wide
-
-    original = draw(0)
-    narrow, wide = evaluate(original)
-    arrays = {**original, **narrow, **{f"fp64.{key}": value for key, value in wide.items()}}
+        wide = walk(ZImageTransformer2DModel.from_pretrained(directory, torch_dtype=torch.float64).eval(),
+                    torch.float64)
+    arrays = {"latents": latents.numpy(), "times": times.numpy(), "probe": probe.numpy(),
+              **{f"caption.{row}": caption.numpy() for row, caption in enumerate(captions)},
+              **narrow, **{f"fp64.{key}": value for key, value in wide.items()}}
     print(f"{name}: size {case.size} prompts {case.lengths} "
           f"|output| <= {float(np.abs(narrow['output']).max()):.4g} parameters {len(narrow) - 2 - batch}")
-
-    def channels_last(inputs):
-        # Keep the channel rows the original native comparison held, including its worst-row check.
-        return tuple({key: value[:, :, 0].transpose(0, 2, 3, 1)
-                      if key in ("output", "grad_latents") else value for key, value in values.items()}
-                     for values in evaluate(inputs))
-
-    proxy, _ = transformer_walk(root, name, case.lengths, dtype=None)
-    return {**{f"{name}.{key}": value for key, value in arrays.items()},
-            **record_case(name, draw, channels_last, proxy)}
+    return arrays
 
 
 PIPELINE = {**BASE, "cap_feat_dim": 16, "n_layers": 1}
@@ -195,8 +167,7 @@ def pipeline_record(root: Path) -> dict[str, np.ndarray]:
 
     pipe = build_pipeline(root)
     generator = torch.Generator().manual_seed(SEED + 9)
-    latents = torch.randn((len(PROMPTS), PIPELINE["in_channels"], HEIGHT // 2, WIDTH // 2),
-                          generator=generator)
+    latents = torch.randn((len(PROMPTS), PIPELINE["in_channels"], HEIGHT // 2, WIDTH // 2), generator=generator)
 
     def walk(pipe, dtype) -> dict[str, np.ndarray]:
         arrays = {}
@@ -229,7 +200,7 @@ def main(destination: str) -> None:
     root = recording(destination, "diffusers-0.40")
     arrays: dict[str, np.ndarray] = {}
     for name, case in CASES.items():
-        arrays.update(build(name, case, root))
+        arrays.update({f"{name}.{key}": value for key, value in build(name, case, root).items()})
     arrays.update(pipeline_record(root))
     record = {"diffusers": DIFFUSERS, "base": BASE, "seed": SEED,
               "cases": {name: {"config": {**BASE, **case.config}, "size": list(case.size),
@@ -237,11 +208,6 @@ def main(destination: str) -> None:
                         for name, case in CASES.items()},
               "pipeline": {"config": PIPELINE, "vae": PIPELINE_VAE, "prompts": PROMPTS, "height": HEIGHT,
                            "width": WIDTH, "steps": STEPS, "guidance": GUIDANCE}}
-    arrays["provenance"] = provenance(
-        "diffusers.ZImageTransformer2DModel", DIFFUSERS, "cpu",
-        "PYTHONPATH=src python tools/diffusers_z_image_reference.py OUTPUT_DIR",
-        generator_revision=subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip(),
-        torch=torch.__version__)
     np.savez_compressed(root / "z_image.npz", **arrays)
     (root / "z_image.json").write_text(json.dumps(record, indent=1) + "\n")
     size = sum(path.stat().st_size for path in root.rglob("*") if path.is_file())
