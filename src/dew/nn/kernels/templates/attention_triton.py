@@ -753,9 +753,9 @@ def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
     query's softmax again, online over the tiles and products its main pass takes, to its maximum,
     denominator and `D = sum_j p dP`, as the softmax's derivative takes it: the weights it differentiates
     sum to one over its own logits, and each `dP - D` is taken about the product of the key that holds
-    the query's maximum, so no rounding of that key's product enters it. Given the forward's `residuals` instead, its maxima, denominators and
-    fp32 output before its hook (`forward`'s `wide`), `D` is `rowsum(dout * output)` and that pass is
-    skipped. The output hook is no part of it: a differentiated call applies `output_mod` past the
+    the query's maximum, so no rounding of that key's product enters it. Given the forward's `residuals`
+    instead, its maxima, denominators and fp32 output before its hook (`forward`'s `wide`), `D` is
+    `rowsum(dout * output)` and that pass is skipped. The output hook is no part of it: a differentiated call applies `output_mod` past the
     kernel, where its own derivative runs, and passes `dout` before it. Deterministic: every gradient
     element is written by one program, a head parameter's partial sums added in a fixed order and a key
     head's query heads summed in XLA."""
