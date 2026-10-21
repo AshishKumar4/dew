@@ -173,6 +173,10 @@ def _unsqueezed(hook, positions: tuple, tile, *sides):
 
 NO_HOOKS = Hooks()
 
+EXACT_STEP = 64
+"""The most of the contraction one step of a launch with `exact_sums` takes: the tensor cores truncate
+each add within a step's MMA chain, and exact sums promote only between steps."""
+
 TRANSCENDENTALS = ('exp', 'exp2', 'log', 'logistic', 'rsqrt', 'sqrt', 'tanh', 'erf', 'erfc', 'erf_inv', 'pow')
 """The primitives a multiprocessor's special-function units evaluate (`cost.EXPONENTIALS_PER_CLOCK`)."""
 
@@ -322,12 +326,17 @@ class _Triton(_GroupedLaunch[Tile]):
         share falls back to Ampere's MMA)."""
         wgmma = _facts(target).wgmma
 
-        accumulators = 2 if ba.arguments.get('exact_sums') else 1
+        exact_sums = ba.arguments.get('exact_sums')
+        accumulators = 2 if exact_sums else 1
 
         def fits(tile: Tile) -> bool:
             rows, columns = self.output(tile)
             held = accumulators * rows * columns // (32 * tile.warps) < cost.THREAD_REGISTERS
-            return held and not (wgmma and rows // max(tile.warps // 4, 1) % 64)
+            # Exact sums promote between depth steps; a step's own MMA chain truncates its adds, so it takes
+            # at most EXACT_STEP of the contraction (H100: a 128-row step left 1.55x IEEE's error, a 64-row
+            # one 1.03x; GMMGATE-h100-5, GMMDKX-h100).
+            short = not exact_sums or self.contraction(tile) <= EXACT_STEP
+            return held and short and not (wgmma and rows // max(tile.warps // 4, 1) % 64)
 
         return tuple(tile for tile in super().fitting(ba, target) if fits(tile))
 
@@ -335,6 +344,11 @@ class _Triton(_GroupedLaunch[Tile]):
     @abc.abstractmethod
     def output(tile: Tile) -> tuple[int, int]:
         """The rows and columns of a program's output tile, the dot's M and N."""
+
+    @staticmethod
+    @abc.abstractmethod
+    def contraction(tile: Tile) -> int:
+        """The contraction one step of `tile` takes, the dot's K."""
 
     def staged_bytes(self, ba, config: Tile) -> int:
         # Pallas Triton's pipeline holds `stages - 1` depth steps, and on Hopper `stages` where it
@@ -381,6 +395,10 @@ class Gmm(_Triton):
     @staticmethod
     def output(tile: Tile) -> tuple[int, int]:
         return tile.block_m, tile.block_n
+
+    @staticmethod
+    def contraction(tile: Tile) -> int:
+        return tile.block_k
 
     @staticmethod
     def extents(tile: Tile) -> dict:
@@ -460,6 +478,10 @@ class Tgmm(_Triton):
     @staticmethod
     def output(tile: Tile) -> tuple[int, int]:
         return tile.block_k, tile.block_n
+
+    @staticmethod
+    def contraction(tile: Tile) -> int:
+        return tile.block_m
 
     @staticmethod
     def extents(tile: Tile) -> dict:

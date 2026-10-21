@@ -513,8 +513,9 @@ def test_exact_sums_add_each_steps_product_as_the_plain_sum_does(generation_name
 
 def test_exact_sums_go_to_fp32_outputs_at_a_precision_above_the_default():
     """`exact_sums` is set for an fp32 output at the highest precision, never for a 16-bit output or the
-    default precision; Mosaic's forward launches, which do not add apart, refuse it, and Mosaic's kernel
-    gradient keeps only tiles whose two accumulators stay in registers."""
+    default precision; Mosaic's forward launches, which do not add apart, refuse it, Mosaic's kernel
+    gradient keeps only tiles whose two accumulators stay in registers, and Triton's only steps of at most
+    `EXACT_STEP` rows."""
     hooks = grouped_matmul.NO_HOOKS
     assert grouped_matmul._exact_sums(exact=True, hooks=hooks, out_dtype="float32")
     assert not grouped_matmul._exact_sums(exact=True, hooks=hooks, out_dtype="bfloat16")
@@ -537,6 +538,12 @@ def test_exact_sums_go_to_fp32_outputs_at_a_precision_above_the_default():
         kept = launch.fitting(exact, target)
         assert kept and all(2 * tile.block_m * tile.block_n // 128 < 255 for tile in kept)
         assert set(kept) < set(launch.fitting(plain, target))
+        # Triton's kernel gradient with exact sums takes at most EXACT_STEP rows a step.
+        triton = grouped_matmul.Tgmm()
+        steps = {tile.block_m for tile in triton.fitting(triton.bind(
+            bf16((rows, 768)), bf16((rows, 1536)), sizes, (), out_dtype="float32", interpret=False,
+            exact_sums=True), target)}
+        assert steps and max(steps) <= grouped_matmul.EXACT_STEP
 
 
 def test_the_exact_mosaic_kernel_gradient_lowers_for_an_h100():
