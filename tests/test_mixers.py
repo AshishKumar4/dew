@@ -242,7 +242,11 @@ heads of 64 over 128) took 256 at 30 minutes a run. Kimi delta attention's heads
 (`KIND_FIELDS`): at 16 the reference compared with itself did not resolve within 2048 seeds, one seed
 carrying up to 68% of a leaf's summed error, near-collinear keys' erases in fp32; at 32 it carries at
 most 5%. 16 is no path of its own: the portable math this site runs has no width-specific code, and
-the port pads every key width below 64 to 64 (tests/test_fla_gdn.py's any-width site)."""
+the port pads every key width below 64 to 64 (`recurrence_chunk._blocked_rule`), which
+tests/test_fla_gdn.py's any-width site holds at 32. The packed row no longer runs a 16-wide Kimi
+layer or Mamba2's defaults (128 heads of 64 over a state of 128 in 256-token chunks, where these
+documents sit in one chunk); the scan's packed resets within a chunk stay held by tests/test_mamba2.py
+and tests/test_mamba_ssd.py at their own geometries."""
 
 
 @pytest.mark.parametrize("kind", sorted(mixers.paths))
