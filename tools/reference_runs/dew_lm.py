@@ -140,8 +140,9 @@ def build(args: argparse.Namespace) -> Run:
     schedule_steps = steps_for(order, args.batch)
     total = schedule_steps if args.steps is None else min(schedule_steps, args.steps)
 
+    # On the host: the trainer places the weights over its mesh.
     pretrained = Pretrained.load(args.model, dtype=args.dtype, param_dtype="float32",
-                                 attention_impl=args.attention)
+                                 attention_impl=args.attention, on_host=True)
     model = pretrained.model
     if args.remat is not None and isinstance(model, MultimodalTransformer):
         # A multimodal checkpoint's decoder is its language model.
