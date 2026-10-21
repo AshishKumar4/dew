@@ -11,13 +11,11 @@ against the float64 one beside the committed output; a committed output
 further from float64 than twice the fresh one stops the script, since the new
 files would then describe different weights or a different reference.
 
-    uv venv ~/.cache/dew/reference-venvs/numerics --python 3.12
-    uv pip install --python ~/.cache/dew/reference-venvs/numerics/bin/python \
-        torch --index-url https://download.pytorch.org/whl/cpu
-    uv pip install --python ~/.cache/dew/reference-venvs/numerics/bin/python \
-        transformers==5.16.1 safetensors numpy huggingface_hub sentencepiece
-    PYTHONPATH=tools ~/.cache/dew/reference-venvs/numerics/bin/python \
-        tools/numerics_reference.py
+    PYTHONPATH=src:tools python tools/numerics_reference.py
+
+in the repository's environment, which holds torch and transformers 5.16.1
+beside JAX: the artifact check is the gate's (tests/reference_error.py
+`assert_same_artifact`), which reads Dew.
 
 What lands, beside each fixture's own files:
 
