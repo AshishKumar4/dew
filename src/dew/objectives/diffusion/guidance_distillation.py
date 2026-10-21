@@ -111,7 +111,8 @@ class GuidanceDistillationObjective(DiffusionObjective):
         frozen = jax.lax.stop_gradient(variables[TEACHER])
         # The teacher's masked image is the student's: drawn by the same name and places, recorded once,
         # by the student's conditions below.
-        given, blank = teacher._conditions(frozen, batch, drop_key, replace(step, recorder=None))
+        unrecorded = replace(step, recorder=None, witness=None)
+        given, blank = teacher._conditions(frozen, batch, drop_key, unrecorded)
         # The teacher reads the student's noised sample at the time drawn on the training schedule.
         denoise = teacher.process.denoiser(teacher.model, teacher.model_variables(frozen), given, blank,
                                            schedule=schedule)
