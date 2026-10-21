@@ -15,6 +15,7 @@ from tool_support import load
 
 CONTAINER = Path(__file__).resolve().parents[1] / "site/live/container"
 SECRET = "bridge-secret"
+FRAME = 4000
 
 
 @pytest.fixture(scope="module")
@@ -27,7 +28,9 @@ def bridge():
 class Kernels:
     """The Kernel Gateway's REST and channel protocol over a set of kernels. A phase in `held`
     ("create", or "preload", a context loading its client) sets its `entered` event and waits for
-    its `release`; a cell whose code is `sleep N` runs N seconds, or until the kernel is interrupted.
+    its `release`; a cell whose code is `sleep N` runs N seconds, or until the kernel is interrupted;
+    one whose code is `panel N` shows a display under an id, as IPython's display handle does, and
+    updates it N times with frames of FRAME characters, as the notebook panel does.
     The next `failing` deletes fail. `live` holds the kernels created and not deleted, and `created`
     counts every one."""
 
@@ -76,6 +79,12 @@ class Kernels:
             status = "ok"
             if code.startswith(("import model_client", "import live_training")):
                 await self.phase("preload")
+            elif code.startswith("panel "):
+                transient = {"display_id": "panel"}
+                await reply("display_data", {"data": {"text/plain": "frame 0"}, "transient": transient})
+                for frame in range(1, int(code.split()[1]) + 1):
+                    text = f"frame {frame} ".ljust(FRAME, ".")
+                    await reply("update_display_data", {"data": {"text/plain": text}, "transient": transient})
             elif code.startswith("sleep "):
                 # Its seconds, unless an interrupt ends it first, as an error.
                 self.interrupts[kernel].clear()
@@ -175,6 +184,37 @@ def test_a_page_runs_or_queues_at_most_its_cells_of_either_kind(bridge, monkeypa
             await second.close()
             await settled(kernels)
             assert kernels.live == set()
+        finally:
+            server.close()
+            await runner.cleanup()
+
+    asyncio.run(scenario())
+
+
+def test_a_display_updated_in_place_is_one_output_its_frames_replace(bridge, monkeypatch):
+    """A training cell's panel is one display that IPython's handle updates eight times a second: the
+    bridge sends each frame under the display's id, an update marked as one, and counts only the latest
+    frame against the cell's output allowance, so a long run's frames, past the allowance together, end
+    the cell as it ends (7fb1f1bd3's preview: the finetune cell stopped at 101 s)."""
+    monkeypatch.setattr(bridge, "available", lambda: 1 << 40)
+    frames = bridge.MAX_OUTPUT // FRAME * 2
+
+    async def scenario():
+        kernels = Kernels()
+        _, server, runner, port = await serving(bridge, kernels)
+        try:
+            socket = await page(port, str(uuid.uuid4()))
+            await socket.send(json.dumps({"op": "execute", "id": "train", "cell": "finetune",
+                                          "kernel": "train", "code": f"panel {frames}"}))
+            heard = await answer(socket, "train")
+            assert heard[-1]["status"] == "ok", heard[-1]
+            shown = [message for message in heard if message["type"] == "display"]
+            assert len(shown) == frames + 1
+            assert {message["display"] for message in shown} == {"panel"}
+            assert [message.get("update", False) for message in shown] == [False] + [True] * frames
+            assert shown[-1]["text"].startswith(f"frame {frames} ")
+            await socket.close()
+            await settled(kernels)
         finally:
             server.close()
             await runner.cleanup()
