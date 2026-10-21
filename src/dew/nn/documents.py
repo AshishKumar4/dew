@@ -14,9 +14,9 @@ class CrossDocuments(NamedTuple):
     """The packed documents of a call whose keys are not its queries
     (cross-attention): `query` `[B, Q]` and `key` `[B, K]` ids, each query
     reading the keys of its own document, 0 as padding, which reads nothing
-    and is read by nothing. FlashAttention runs each row's documents as its
-    packed sequences, which needs the keys in ascending id order, padding
-    after them; the queries it orders itself.
+    and is read by nothing; ids are nonnegative. FlashAttention runs each
+    row's documents as its packed sequences, which needs the keys in
+    ascending id order, padding after them; the queries it orders itself.
 
     Under causality or a window, a document's queries are its last keys, in
     order: the last query reads up to the document's last key, the one before
@@ -30,9 +30,13 @@ class CrossDocuments(NamedTuple):
 
 def document_ids(segment_ids) -> tuple[jax.Array, jax.Array]:
     """The query's and the key's ids of `segment_ids`, one `[B, S]` array of a
-    call's own documents or a `CrossDocuments`."""
+    call's own documents or a `CrossDocuments`, the two in one dtype (their
+    promotion), so an id names one document on both sides however it is
+    ordered."""
     if isinstance(segment_ids, CrossDocuments):
-        return jnp.asarray(segment_ids.query), jnp.asarray(segment_ids.key)
+        queries, keys = jnp.asarray(segment_ids.query), jnp.asarray(segment_ids.key)
+        common = jnp.promote_types(queries.dtype, keys.dtype)
+        return queries.astype(common), keys.astype(common)
     return jnp.asarray(segment_ids), jnp.asarray(segment_ids)
 
 
@@ -67,9 +71,11 @@ def document_offsets(segment_ids, max_segments: int) -> jax.Array:
 
 
 def _padding_last(ids: jax.Array) -> jax.Array:
-    """`ids` ordered with padding (0) after every document: each id less one as an unsigned word, so
-    padding wraps to the largest and no document's id meets it."""
-    return jnp.asarray(ids).astype(jnp.uint32) - jnp.uint32(1)
+    """`ids` ordered with padding (0) after every document: each id less one as an unsigned word of its
+    own width, so padding wraps to the largest and no two documents' ids meet."""
+    ids = jnp.asarray(ids)
+    word = jnp.dtype(f"uint{8 * ids.dtype.itemsize}")
+    return ids.astype(word) - jnp.asarray(1, word)
 
 
 def _searched(ordered: jax.Array, wanted: jax.Array, side: str) -> jax.Array:
