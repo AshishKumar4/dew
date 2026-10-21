@@ -340,6 +340,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument('--repeats', type=int, default=20)
     parser.add_argument('--out', help='append JSON lines here as well as printing them')
     parser.add_argument('--sha', default='unknown')
+    parser.add_argument('--length', type=int, help="every shape's tokens, for a smoke run of the tool")
     args = parser.parse_args(argv)
     if args.mode == 'row':
         rows = [json.loads(line) for line in Path(args.runs).read_text().splitlines() if line.strip()]
@@ -347,7 +348,7 @@ def main(argv: list[str] | None = None) -> None:
         return
     names = sorted(SHAPES) if args.shape == 'all' else [args.shape]
     for name in names:
-        shape = SHAPES[name]
+        shape = SHAPES[name] if args.length is None else dataclasses.replace(SHAPES[name], length=args.length)
         if args.mode == 'jax':
             import jax
             found = jax_arms(name, shape, args.warmup, args.repeats)
