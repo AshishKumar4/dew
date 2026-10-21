@@ -171,10 +171,8 @@ class Row(grain.MapTransform):
 
 def media(listing: Files, extensions: Sequence[str] = (".mp4", ".avi", ".mov", ".webm")) -> Files:
     """A listing of files (`Files(url, format="files")`) cut to those whose name ends in one of
-    `extensions`, any case: a directory's media, not the lists and notes beside it."""
-    from pathlib import PurePosixPath
-
+    `extensions`, any case: a directory's media, not the lists and notes beside it, listed when the
+    store is read (`Files.suffixes`), so a chain over media not fetched yet is made and recorded."""
     wanted = tuple(extension.lower() if extension.startswith(".") else "." + extension.lower()
                    for extension in extensions)
-    return dataclasses.replace(listing, url=tuple(path for path in listing.paths
-                                                  if PurePosixPath(path).suffix.lower() in wanted))
+    return dataclasses.replace(listing, suffixes=wanted)
