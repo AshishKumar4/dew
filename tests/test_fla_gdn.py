@@ -761,7 +761,7 @@ def test_a_bf16_layer_with_wide_keys_hands_the_port_its_narrowed_operands():
 @generation.chosen(gated_delta_rule="fla")
 def test_a_remat_policy_saves_the_ports_named_residuals_and_changes_no_gradient(policy, memories, outputs):
     """A block's remat policy keeps or recomputes the port's named residuals
-    (`decoder_block.RESIDUALS`): without one the layer saves its decay, inverse and memory
+    (`mixer_base.RESIDUALS`): without one the layer saves its decay, inverse and memory
     ('delta_memory') for its backward; 'all_but_delta_memory', which the block applies by tracing its
     layers recomputing that name (`linear.recomputing`) rather than by a checkpoint policy, has the
     backward recompute the memory alone; a policy saving the output, decay and inverse saves those

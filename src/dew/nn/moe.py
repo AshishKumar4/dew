@@ -978,7 +978,7 @@ class ExpertMLP(nn.Module):
                 x, kernel, sizes, dtype, self.implementation, self.precision))
 
         # The same residual names as the dense MLP's, so one remat policy
-        # covers both (decoder_block.RESIDUALS).
+        # covers both (mixer_base.RESIDUALS).
         if self.activation == 'relu2':
             up = checkpoint_name(linear(tokens, kernels[0]), 'up_proj')
             hidden = relu2(up)

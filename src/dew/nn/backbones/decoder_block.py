@@ -35,6 +35,7 @@ from ..hyper_connections import (
 )
 from ..inputs import LayerInputs, MixerCall, PredictionPhase, routing_blocks
 from ..linear import recomputing
+from ..mixer_base import ATTENTION_RESIDUALS, MLP_RESIDUALS, QKV_RESIDUALS, RESIDUALS
 from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, SparseMLP
 from ..ngpt import NGPT, stepped
 from ..precision import float32_dot_general, scaled
@@ -343,11 +344,6 @@ class BlockWiring:
             raise ValueError("layer_scalar must be None, frozen or trainable")
 
 
-QKV_RESIDUALS = ('q_proj', 'k_proj', 'v_proj', 'kv_proj')
-ATTENTION_RESIDUALS = (*QKV_RESIDUALS, 'o_proj')
-MLP_RESIDUALS = ('gate_proj', 'up_proj', 'down_proj')
-DELTA_RESIDUALS = ('delta_decay', 'delta_inverse', 'delta_memory')
-RESIDUALS = (*ATTENTION_RESIDUALS, 'context', 'conv', *DELTA_RESIDUALS, *MLP_RESIDUALS)
 """The values a block names as it runs, each after the projection that
 produced it: `kv_proj` is latent attention's fused `kv_b_proj`, `context`
 the attention kernel's or the gated delta rule's output before `o_proj`,

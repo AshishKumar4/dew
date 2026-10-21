@@ -351,7 +351,7 @@ def normalized_in_fp32(normalize, static_argnums: tuple[int, ...] = ()):
     the backward pass would keep two fp32 copies of the activations per norm
     (2.35 GiB on one SimpleDiT step). Saving nothing keeps the arguments (the
     bf16 input, the weight and the bias) and leaves the residuals to the policy
-    that recomputes the block (`decoder_block.RESIDUALS`). The wrapped function
+    that recomputes the block (`mixer_base.RESIDUALS`). The wrapped function
     takes arrays first and static arguments last, so no flax lifting sits
     between the checkpoint and the module; forward values are unchanged.
     """
