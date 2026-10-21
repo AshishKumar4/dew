@@ -319,7 +319,7 @@ def test_null_dropout_matches_explicit_tokens_under_current_encoder(conditional_
     np.testing.assert_allclose(actual[0], expected[0], atol=1e-6, rtol=1e-6)
     for left, right in zip(jax.tree.leaves(actual[1]["params"]),
                            jax.tree.leaves(expected[1]["params"]), strict=True):
-        np.testing.assert_allclose(left, right, atol=1e-6, rtol=1e-6)
+        np.testing.assert_array_equal(left, right)
 
 
 def test_a_dropped_row_is_conditioned_on_the_steps_own_towers(conditional_mmdit):
