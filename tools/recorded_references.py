@@ -44,7 +44,8 @@ def record_case(label: str, draw, evaluate, proxy, *, truth_proxy=None, store_in
     again, `store_inputs=False` records the outputs alone and each draw's `input_digest`, and the test
     hands `draw` to `indexed_recording` as `inputs_of`. With `summary`, the recording keeps no outputs
     at all: per seed and leaf, the reference's evidence check 1 reads (`leaf_summary`: its mean squared
-    error from its truth, its worst sized row, every row's error, finiteness) and its truth's sketch
+    error from its truth, its worst sized row, its errors on the truth's rows of zero, finiteness) and
+    its truth's sketch
     (`truth_sketch`), which the test's own float64 path is held to (`indexed_recording`'s `truth_fn`):
     kilobytes where outputs over (1 + REDRAW) times the seeds are gigabytes."""
     planned = seeds_for(jax.jit(proxy), lambda seed: (draw(seed),), label,
@@ -71,14 +72,22 @@ def record_case(label: str, draw, evaluate, proxy, *, truth_proxy=None, store_in
     ensure(kept)
     result = {}
     if summary:
+        kept_records = records[:kept]
         for name in records[0][1]:
             evidence = [leaf_summary(record[1][name], record[2][name]) for record in records[:kept]]
             result.update({f"{label}.mse.{name}": np.asarray([leaf.mse for leaf in evidence]),
                            f"{label}.worst.{name}": np.asarray([leaf.worst for leaf in evidence]),
-                           f"{label}.rows.{name}": np.stack([leaf.rows for leaf in evidence]),
                            f"{label}.finite.{name}": np.asarray([leaf.finite for leaf in evidence]),
-                           f"{label}.sketch.{name}": np.stack([truth_sketch(record[2][name])
-                                                               for record in records[:kept]])})
+                           f"{label}.zero_rows.{name}": np.concatenate(
+                               [np.zeros(0, np.int64), *(leaf.zero_rows for leaf in evidence)]),
+                           f"{label}.zero_errors.{name}": np.concatenate(
+                               [np.zeros(0), *(leaf.zero_errors for leaf in evidence)]),
+                           f"{label}.zero_offsets.{name}": np.cumsum(
+                               [0, *(len(leaf.zero_rows) for leaf in evidence)]),
+                           f"{label}.sketch.{name}": np.stack([truth_sketch(record[2][name], seed)
+                                                               for seed, record in enumerate(kept_records)]),
+                           f"{label}.shape.{name}": np.asarray(np.shape(records[0][2][name]), np.int64),
+                           f"{label}.dtype.{name}": np.asarray(evidence[0].dtype)})
         result[f"{label}.input_digest"] = np.asarray([input_digest(record[0]) for record in records[:kept]])
         result.update({f"{label}.seeds": np.int32(confirmed), f"{label}.redraw": np.int32(REDRAW)})
         print(f"{label}: declared {confirmed} seeds; recorded {kept} draws' evidence", flush=True)
