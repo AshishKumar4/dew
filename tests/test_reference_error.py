@@ -14,6 +14,7 @@ from reference_error import (
     assert_as_exact,
     assert_as_exact_as_the_reference,
     assert_leaves_as_exact,
+    assert_moves,
     declared_seeds,
     distance,
     indexed_recording,
@@ -520,3 +521,23 @@ def test_the_procedure_before_the_two_stages_draws_again_as_it_did():
         assert _staged(law(np.inf), 8, "infinite", two_stage=False)[2] == 2
         assert _staged(law(np.inf), 8, "infinite")[2] == 2
     assert _staged(law(1.0), 8, "equal", two_stage=False)[2] == 1
+
+
+def test_a_change_moves_the_result_only_past_rounding():
+    """`assert_moves`: a product scaled by 1 + 2^-10 moves it far past its rounding and passes; the same
+    product summed in another order, a change rounding accounts for, does not; a leaf the original holds
+    exactly moves on any departure."""
+    def scaled(x, w):
+        return {"y": jnp.dot(x, w, precision="highest") * (1 + 2.0 ** -10)}
+
+    assert_moves(_product, jax.jit(scaled), _draw, "scaled", seeds=8)
+    with pytest.raises(AssertionError):
+        assert_moves(_product, _reordered, _draw, "reordered", seeds=8)
+
+    def zero(x, w):
+        return {"y": jnp.zeros(3, jnp.float32)}
+
+    def off_zero(x, w):
+        return {"y": jnp.full(3, 1e-30, jnp.float32)}
+
+    assert_moves(jax.jit(zero), jax.jit(off_zero), _draw, "off zero", seeds=8)

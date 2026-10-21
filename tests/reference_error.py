@@ -595,6 +595,49 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
         raise Inconclusive("\n".join(unresolved))
 
 
+def _moved(draws: _Draws) -> tuple[list[str], list[str]]:
+    """The leaves a change moves beyond rounding (`assert_moves`), and why each other one does not."""
+    moved, kept = [], []
+    for index, name in enumerate(draws.names):
+        mine, theirs = draws.mine[:, index], draws.theirs[:, index]
+        if not draws.finite[:, index].all():
+            kept.append(f"{name}: a value not finite, which moves nothing a ratio can show")
+        elif np.sum(theirs) == 0:
+            # The original holds the float64 truth exactly: any move off it is past its rounding.
+            (moved if np.sum(mine) > 0 else kept).append(
+                f"{name}: {'moved off' if np.sum(mine) > 0 else 'kept'} the original's exact value")
+        else:
+            ratio, low, high = _pooled(mine, theirs), *_interval(mine, theirs)
+            (moved if low > PARITY else kept).append(
+                f"{name}: the changed RMS distance from the original's float64 run is {ratio:.3f} times the "
+                f"original's own, interval [{low:.3f}, {high:.3f}]")
+    return moved, kept
+
+
+def assert_moves(original_fn, changed_fn, draw, label: str, *, seeds: int, truth_fn=None) -> None:
+    """A change that must move the result beyond rounding (a sensitivity check): over check 1's draws
+    (`assert_as_exact`), some leaf of `changed_fn` sits further from the original's float64 run (truth
+    `original_fn` on the inputs widened, or `truth_fn`) than PARITY times `original_fn`'s own rounding,
+    by its pooled ratio's interval's lower bound, so a change rounding could account for never passes.
+    A leaf the original holds exactly moves on any departure from it. Two pre-declared stages, as check
+    1's: at `seeds`, then, where no leaf moved, REDRAW times as many further seeds. Where the change is
+    structural and the alternative is bitwise identity (another seed, another mask), exact inequality
+    says enough and this is not needed."""
+    if seeds < FEWEST_SEEDS:
+        raise Inconclusive(f"{label}: {seeds} seeds cannot be judged; check 1 takes at least {FEWEST_SEEDS} "
+                           f"(`seeds_for`)")
+    draws = _drawn(changed_fn, original_fn, draw, range(seeds), truth_fn)
+    moved, kept = _moved(draws)
+    if not moved:
+        further = range(seeds, (1 + REDRAW) * seeds)
+        draws = draws.joined(_drawn(changed_fn, original_fn, draw, further, truth_fn))
+        moved, kept = _moved(draws)
+    _logged(label, 1 if moved and len(draws.mine) == seeds else 2, "pass" if moved else "over")
+    if not moved:
+        raise AssertionError(f"{label}: the change moves no leaf beyond rounding over {len(draws.mine)} seeds:\n"
+                             + "\n".join(kept))
+
+
 def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most: int = 512,
               truth_fn=None) -> int:
     """The seeds a site declares: the fewest, doubling from `start`, for which the reference compared
