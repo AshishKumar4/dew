@@ -67,7 +67,31 @@ COMPARISONS = {
                                      "keep = np.abs(rows - 1) < window", 1),
     "a mask of positions changed in place": ("import numpy as np\nrows = np.arange(n)\nrows[0] = 0.5\n"
                                              "keep = np.abs(rows - 1) < window", 1),
-    "a time bounded on both sides": ("assert 2.25 <= long_seconds / short_seconds <= 3.75", 0),
+    # A band around a float target, in an assertion (`_band`), each way round and as a conjunction.
+    "a time bounded on both sides": ("assert 2.25 <= long_seconds / short_seconds <= 3.75", 1),
+    "a band written the other way": ("assert 3.75 >= ratio >= 2.25", 1),
+    "a band about zero": ("assert -1e-6 <= residual <= 1e-6", 1),
+    "a band through names": ("low, high = 2.25, 3.75\nassert low <= ratio <= high", 1),
+    "a target less and plus a fraction of it": ("assert c - c / 4 <= x <= c + c / 4", 1),
+    "a target scaled both ways": ("assert 0.75 * c <= x <= 1.25 * c", 1),
+    "a band as a conjunction": ("assert x >= 2.25 and x <= 3.75", 1),
+    "a band of masks": ("import numpy as np\nassert np.all((x > 2.25) & (x < 3.75))", 1),
+    "a statistic's band": ("assert 0.3 < revealed.mean() < 0.7", 1),
+    "a ratio's band above one": ("assert 1.0 <= ratio <= 1.05", 1),
+    "a band beside an error in one assertion": (
+        "assert abs(a - b) <= 1e-6 and 2.25 <= ratio and ratio <= 3.75", 2),
+    "two bands in one assertion": ("assert 2.25 <= r and r <= 3.75 and 0.3 < s and s < 0.7", 2),
+    "a share's domain": ("assert all(1 / 8 <= load <= 1.0 for load in loads)", 0),
+    "an error bounded the other way round": ("import numpy as np\nassert 1e-6 >= np.max(np.abs(a - b))", 1),
+    "a sign and a bound": ("assert 0 <= share <= 0.5", 0),
+    "a cosine's domain": ("assert -1.0 <= float(alignment) <= 1.0", 0),
+    "a cosine near one": ("assert 0.99 <= cosine <= 1.0", 0),
+    "the sleeps' floor and the task's wall time": ("assert 1.2 < short + long <= wall", 0),
+    "a duration's floor and timeout": ("import time\nbegan = time.monotonic()\n"
+                                       "assert 4.0 <= time.monotonic() - began < 30", 0),
+    "a count's band of unknown provenance": ("assert 3 * batches <= tallies['error'] <= 4 * batches", 0),
+    "a schedule's window in a helper": ("scale = 2 if 0.1 <= index / 4 <= 0.8 else 1", 0),
+    "two orderings of two values": ("assert a < 2.5 and b > 1.5", 0),
     "a timeout": ("assert elapsed < 5.0", 0),
     "a magnitude against an exact zero, written as a float": (
         "import numpy as np\nassert np.abs(actual - expected).max() <= 0.0", 0),
@@ -138,7 +162,8 @@ COMPARISONS = {
     "pytest's approx given only a zero abs": ("import pytest\nassert a == pytest.approx(b, abs=0)", 0),
     "both of numpy's tolerances zero": ("import numpy as np\nnp.testing.assert_allclose(a, b, rtol=0)", 0),
     "a count bounded on both sides": ("assert 67 <= len(rows) <= 69", 0),
-    "a difference of counts within whole bounds": ("assert -1 <= left - right <= 1", 0),
+    "a difference of counts within whole bounds": ("left, right = len(a), len(b)\n"
+                                                    "assert -1 <= left - right <= 1", 0),
     "index arithmetic": ("while len(ended) < bridge.MAX_CELLS - 1:\n    pass\n"
                          "hung = output[stack:] if 0 <= stack < len(output) - 4000 else ''", 0),
     "a difference against a named tolerance": ("assert actual - expected < tolerance", 1),
@@ -167,6 +192,46 @@ def test_a_float_compared_within_a_tolerance_outside_the_gate_is_reported(lint, 
     body, count = COMPARISONS[case]
     module = _module(lint, tmp_path, "tests/test_case.py", body)
     assert len(list(lint.tolerances(module))) == count
+
+
+def test_counts_a_helper_beside_the_file_returns_are_whole_where_its_own_file_proves_it(lint, tmp_path):
+    """A test importing its support's helper by a bare module name: the helper's token counts are whole
+    as its own file makes them, and a helper there that may return a float is not, nor one its file
+    binds twice."""
+    _module(lint, tmp_path, "tests/counting_support.py", """\
+        def delivered(batches):
+            targets = [0, 0]
+            for source, count in batches:
+                targets[int(source)] += int(count)
+            return targets
+
+
+        def shares(batches):
+            left, right = delivered(batches)
+            return left / 2, right / 2
+
+
+        def rebound(batches):
+            return delivered(batches)
+
+
+        def rebound(batches):
+            return [0.25, 0.75]
+        """)
+    body = """\
+        from counting_support import delivered, rebound, shares
+
+
+        def test():
+            left, right = delivered(batches)
+            assert abs(left - right) <= 12 + 12
+            half, other = shares(batches)
+            assert abs(half - other) <= 12
+            one, two = rebound(batches)
+            assert abs(one - two) <= 12
+        """
+    found = list(lint.tolerances(_module(lint, tmp_path, "tests/test_case.py", body)))
+    assert [finding.line for finding in found] == [8, 10]
 
 
 def test_the_gate_compares_floats_and_scripts_outside_tests_and_tools_are_not_read(lint, tmp_path):
@@ -245,6 +310,35 @@ def test_no_commit_loosens_the_inventory_its_parents_kept(lint, tmp_path):
                    check=True)
     _commit(repo, _inventory({"tests/test_b.py": 20}), "made again")
     assert any("removes the inventory" in finding.message for finding in lint.ratchet(repo))
+
+
+def test_a_change_of_the_rules_reading_grows_the_inventory_only_for_files_it_leaves_unchanged(lint, tmp_path):
+    """A commit that changes SLOP020's reading (`RULE`) may add or raise an entry for a file it leaves
+    unchanged, against its parent and its base alike; a file it also changes, or one it adds, may not
+    grow, and no date moves later."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
+    _commit(repo, _inventory({"tests/test_a.py": 1}), "made",
+            {"tests/test_a.py": "a = 1\n", "tests/test_b.py": "b = 1\n", lint.RULE: "reading = 1\n"})
+    subprocess.run(["git", "checkout", "-q", "-b", "head"], cwd=repo, check=True)
+    _commit(repo, _inventory({"tests/test_a.py": 2, "tests/test_b.py": 1}), "the rule reads more",
+            {lint.RULE: "reading = 2\n"})
+    assert list(lint.ratchet(repo, "main")) == []
+    # A later edit of a file whose count the rule raised keeps that count against the base.
+    _commit(repo, _inventory({"tests/test_a.py": 2, "tests/test_b.py": 1}), "a docstring",
+            {"tests/test_a.py": "a = 1  # one\n"})
+    assert list(lint.ratchet(repo, "main")) == []
+    _commit(repo, _inventory({"tests/test_a.py": 3, "tests/test_b.py": 1, "tests/test_c.py": 1}),
+            "the rule and the files change", {lint.RULE: "reading = 3\n", "tests/test_a.py": "a = 2\n",
+                                               "tests/test_c.py": "c = 1\n"})
+    messages = [finding.message for finding in lint.ratchet(repo, "main")]
+    assert any("raises tests/test_a.py" in message for message in messages)
+    assert any("adds tests/test_c.py" in message for message in messages)
+    assert not any("tests/test_b.py" in message for message in messages)
+    _commit(repo, _inventory({"tests/test_a.py": 3, "tests/test_b.py": 1, "tests/test_c.py": 1},
+                             by="2026-11-21"), "a later date", {lint.RULE: "reading = 4\n"})
+    assert any("moves its date" in finding.message for finding in lint.ratchet(repo, "main"))
 
 
 def test_the_ratchet_holds_a_branch_to_its_base_and_refuses_a_shallow_history(lint, tmp_path):
