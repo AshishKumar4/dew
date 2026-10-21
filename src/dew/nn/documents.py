@@ -67,9 +67,11 @@ def document_offsets(segment_ids, max_segments: int) -> jax.Array:
 
 
 def _padding_last(ids: jax.Array) -> jax.Array:
-    """`ids` ordered with padding (0) after every document: each id less one as an unsigned word, so
-    padding wraps to the largest and no document's id meets it."""
-    return jnp.asarray(ids).astype(jnp.uint32) - jnp.uint32(1)
+    """`ids` ordered with padding (0) after every document: each id less one as an unsigned word of its
+    own width, so padding wraps to the largest and no two documents' ids meet."""
+    ids = jnp.asarray(ids)
+    word = jnp.dtype(f"uint{8 * ids.dtype.itemsize}")
+    return ids.astype(word) - jnp.asarray(1, word)
 
 
 def _searched(ordered: jax.Array, wanted: jax.Array, side: str) -> jax.Array:

@@ -361,19 +361,23 @@ def halves(spans: template.KeySpans, half: int) -> tuple[template.KeySpans, temp
                               spans.query_ids, None if ids is None else ids[:, half:], spans.keys - half))
 
 
+@pytest.mark.parametrize("split", ["tile-edge", "half-exact-products"])
 @pytest.mark.parametrize("dtype", DTYPES, ids=lambda dtype: jnp.dtype(dtype).name)
 @pytest.mark.parametrize("hooks", [HOOKS["none"], HOOKS["sinks"]], ids=["none", "sinks"])
 @pytest.mark.parametrize("case", [CASES[name] for name in ARITHMETIC], ids=ARITHMETIC)
-def test_a_resumed_partial_is_on_par_with_one_pass_over_its_keys(case, hooks, dtype):
+def test_a_resumed_partial_is_on_par_with_one_pass_over_its_keys(case, hooks, dtype, split):
     """The softmax over a call's first keys, its output, maxima and denominators resumed as the initial
     state of one over the rest (`template.Initial`, its numerator the output times the denominator, a
     query that saw nothing resuming from no state), gives the output, maxima and denominators of one
-    pass over every key, on par from float64. The queries and keys are drawn in halves, so every product
-    of a query with a key is exact in fp32 however a product of the call's shape sums it, the scaled
-    logits are the same in both arms, and they differ only by the resume's own arithmetic."""
+    pass over every key, on par from float64: over the site's draws parted at a tile's edge, as a
+    split-KV launch parts them, and parted at the keys' half over draws in halves, whose every product of
+    a query with a key is exact in fp32 however a product of the call's shape sums it, so the two arms
+    differ only by the resume's own arithmetic. (A Gaussian draw parted at 50 of 100 keys sees XLA:CPU's
+    50-key product round its logits 1.5 times as far from float64 as its 100-key product does, which no
+    arithmetic of the resume's touches.)"""
     queries, keys = geometry(case)
     spans = template.spans(queries, keys, ROWS, **arguments(case))
-    edge = keys // 2
+    edge = keys // 2 // 32 * 32 if split == "tile-edge" else keys // 2
     first, rest = halves(spans, edge)
     start = hooks_of(hooks, queries)
 
@@ -388,14 +392,16 @@ def test_a_resumed_partial_is_on_par_with_one_pass_over_its_keys(case, hooks, dt
     def whole(query, key, value):
         return template.reference(query, key, value, spans, start, residuals=True)
 
-    draw_normal = drawing(queries, keys, dtype)
+    draw = drawing(queries, keys, dtype)
+    if split == "half-exact-products":
+        normal = draw
 
-    def draw(seed):
-        query, key, value = draw_normal(seed)
-        return jnp.round(2 * query) / 2, jnp.round(2 * key) / 2, value
+        def draw(seed):
+            query, key, value = normal(seed)
+            return jnp.round(2 * query) / 2, jnp.round(2 * key) / 2, value
 
     assert_as_exact(jax.jit(resumed), jax.jit(whole), draw,
-                    f"template resumed {case} {hooks} {jnp.dtype(dtype).name}", seeds=SEEDS)
+                    f"template resumed {case} {hooks} {jnp.dtype(dtype).name} {split}", seeds=SEEDS)
 
 
 def test_hooks_are_a_pytree_whose_values_a_compiled_call_takes():
@@ -490,6 +496,34 @@ def test_a_call_of_no_queries_maps_no_tiles():
     blocks = template.block_map(template.spans(0, 40, 1, causal=True), 16, 16)
     assert blocks.lo.shape == (1, 0)
     np.testing.assert_array_equal(np.asarray(blocks.q_hi), 0)
+
+
+def test_chunks_over_the_widest_places_neither_wrap_nor_alias():
+    """Places at int32's least, and int64 places past int32, chunk as `chunk_mask` chunks them."""
+    ids = jnp.asarray([[1, 2]], jnp.int32)
+    places = jnp.asarray([[-2 ** 31, -2 ** 31 + 1]], jnp.int32)
+    spans = template.spans(2, 2, 1, chunk=3, positions=(places, places), segment_ids=ids)
+    expected = document_mask(ids) & chunk_mask(places, places, 3)[:, 0]
+    np.testing.assert_array_equal(np.asarray(template.dense(spans)), np.asarray(expected))
+    with jax.enable_x64(new_val=True):
+        ids = jnp.asarray([[1, 1, 1]], jnp.int32)
+        places = jnp.asarray([[2 ** 32, 2 ** 32 + 1, 2 ** 32 + 2]], jnp.int64)
+        spans = template.spans(3, 3, 1, chunk=2, positions=(places, places), segment_ids=ids)
+        expected = document_mask(ids) & chunk_mask(places, places, 2)[:, 0]
+        np.testing.assert_array_equal(np.asarray(template.dense(spans)), np.asarray(expected))
+
+
+def test_cross_documents_of_ids_wider_than_int32_align_apart():
+    """Another sequence's documents with ids past int32, causal: each query aligns within its own
+    document, as `cross_document_mask` aligns it."""
+    with jax.enable_x64(new_val=True):
+        ids = jnp.asarray([[1, 1, 2 ** 32 + 1, 2 ** 32 + 1]], jnp.int64)
+        cross = CrossDocuments(ids, ids)
+        spans = template.spans(4, 4, 1, causal=True, segment_ids=cross)
+        expected = cross_document_mask(cross, causal=True, sliding_window=None)[:, 0]
+        np.testing.assert_array_equal(np.asarray(template.dense(spans)), np.asarray(expected))
+        np.testing.assert_array_equal(np.asarray(expected)[0],
+                                      np.tril(np.ones((4, 4), bool)) & np.asarray(document_mask(ids)[0]))
 
 
 def test_a_chunk_wider_than_int32_holds_every_place():

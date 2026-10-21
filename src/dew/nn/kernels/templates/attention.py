@@ -89,7 +89,7 @@ def _searched(values: jax.Array, lo: jax.Array, hi: jax.Array, wanted: jax.Array
     it (`'right'`), `hi` where none."""
     def step(_, bounds):
         low, high = bounds
-        middle = (low + high) // 2
+        middle = low + (high - low) // 2
         value = _indexed(values, middle, 0)
         right = (value < wanted) if side == "left" else (value <= wanted)
         live = low < high
@@ -111,8 +111,8 @@ def spans(queries: int, keys: int, batch: int, *, causal: bool = False, sliding_
     keys, as Dew's coordinates count them, by default their indices; `segment_ids`, one `[B, S]` array or a
     `CrossDocuments` (its keys in ascending id order, as it takes them), keeps each query to its
     document's keys, under causality or a window a cross call's queries aligned to their document's last
-    keys (`aligned_places`); `lengths` `[B]` end each row's keys and `starts` `[B]` begin them. Places,
-    lengths and starts are int32 token coordinates; the ids keep their own dtype."""
+    keys (`aligned_places`); `lengths` `[B]` end each row's keys and `starts` `[B]` begin them.
+    Lengths and starts are int32 token coordinates; places and ids keep their own dtypes."""
     from dew.nn.attention import window_sides
     from dew.nn.documents import CrossDocuments, aligned_places, document_ids
 
@@ -145,21 +145,22 @@ def spans(queries: int, keys: int, batch: int, *, causal: bool = False, sliding_
     if chunk is not None:
         query_places, key_places = (
             (index, jnp.broadcast_to(jnp.arange(keys, dtype=jnp.int32)[None, :], (batch, keys)))
-            if positions is None else (positions[0].astype(jnp.int32), positions[1].astype(jnp.int32)))
-        # The query's chunk's places `[low, top]`, its last place saturating at int32's largest (a chunk
-        # wider than int32 holds every place of one sign); its document's keys there run together in
-        # document order, since their places never decrease along it, and their first and last key
-        # indices bound the span.
-        least, most = jnp.iinfo(jnp.int32).min, jnp.iinfo(jnp.int32).max
-        if chunk > most:
-            low = jnp.where(query_places >= 0, 0, least)
-            top = jnp.where(query_places >= 0, most, -1)
-        else:
-            low = query_places // chunk * chunk
-            top = low + jnp.minimum(chunk - 1, most - jnp.maximum(low, 0))
-        placed = jnp.take_along_axis(key_places, order, axis=1)
-        inside_lo = _searched(placed, run_lo, run_hi, low, "left")
-        inside_hi = _searched(placed, run_lo, run_hi, top, "right")
+            if positions is None else positions)
+
+        def chunk_of(places):
+            # Each place's chunk number in the places' own dtype; a chunk wider than it holds every
+            # place of one sign.
+            places = jnp.asarray(places)
+            if chunk > jnp.iinfo(places.dtype).max:
+                return jnp.where(places >= 0, 0, -1).astype(places.dtype)
+            return places // chunk
+
+        # The query's document's keys of its chunk run together in document order, since their places
+        # never decrease along it, and their first and last key indices bound the span.
+        wanted = chunk_of(query_places)
+        numbers = jnp.take_along_axis(chunk_of(key_places), order, axis=1)
+        inside_lo = _searched(numbers, run_lo, run_hi, wanted, "left")
+        inside_hi = _searched(numbers, run_lo, run_hi, wanted, "right")
         held = inside_hi > inside_lo
         start = jnp.where(held, jnp.maximum(start, _indexed(order, inside_lo, 0)), start)
         end = jnp.where(held, jnp.minimum(end, _indexed(order, inside_hi - 1, -1) + 1), 0)
