@@ -36,7 +36,7 @@ from dew.data.dataset import CAPTION, DataPartition, DataPhase, GlobalStream, Lo
 from dew.data.images import EncodeCaptions
 from dew.data.pipeline import DeviceStep, Pipeline, mix
 from dew.data.plan import Manifest, Plan
-from dew.objectives.base import VALID_ROWS, Aux, Objective, Ratio
+from dew.objectives.base import VALID_ROWS, Aux, Objective, Ratio, freeze, thaw
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer
 
 READ = Loading(workers=0, threads=1, read_buffer=8, worker_buffer=1)
@@ -1031,35 +1031,42 @@ class Rejecting(Pooled):
     """`Pooled` whose loss is not finite on a batch holding the record `rejected`, as a dynamic loss
     scale rejects an overflowing step."""
 
-    def __init__(self, rejected: int):
+    def __init__(self, rejected: int, frozen: bool = False):
         super().__init__()
-        self.rejected = rejected
+        self.rejected, self.frozen = rejected, frozen
+
+    def fresh_variables(self, key, held):
+        # A frozen bias a host-master run holds resident on the accelerator, apart from the moving weights.
+        variables = super().fresh_variables(key, held)
+        return freeze(variables, lambda path: "kernel" in str(path)) if self.frozen else variables
 
     def loss(self, variables, batch, step):
         import jax.numpy as jnp
 
-        stats, aux = super().loss(variables, batch, step)
+        stats, aux = super().loss(thaw(variables), batch, step)
         poisoned = jnp.any(batch["id"] == self.rejected)
         return Ratio(jnp.where(poisoned, jnp.inf, stats.total), stats.mass), aux
 
 
-@pytest.mark.parametrize("route", ["resident", "host", "resumed"])
+@pytest.mark.parametrize("route", ["resident", "host", "host-frozen", "resumed"])
 def test_a_window_a_rejection_shifted_is_dropped_where_a_ramp_stage_begins(route, tmp_path):
     """A rejected step drops its window, so the next begins a step later than the ramp's stages,
     which begin where unrejected windows do: the stage's first step then drops the window its last
     one left part filled, and no update pools two stages' batches. Rejecting step 0 of a ramp of two
     eight-record steps, then sixteen, two to an update: step 1 alone in its window is dropped at step
     2, which with step 3 makes the run's one update, whether the variables live on the devices or the
-    host, and in a run resumed from a checkpoint written at the stage's start."""
+    host, the host's beside frozen weights the accelerator holds, and in a run resumed from a
+    checkpoint written at the stage's start."""
     records, seed = 4096, 7
     ramp = Ramp(start=8, increment=8, samples=16)
     first = next(iter(ramped(indexed_data(records, 16, seed), ramp).train(DataPartition(window=2))))
-    layout = Layout(host=("variables",) if route == "host" else (), min_shard=1, tolerance=1.0)
+    layout = Layout(host=("variables",) if route.startswith("host") else (), min_shard=1, tolerance=1.0)
 
     def trainer():
         checkpoints = Checkpoints(str(tmp_path / "run"), keep=8) if route == "resumed" else None
-        return Trainer(Rejecting(int(first["id"][0])), optax.sgd(0.5), key=jax.random.key(0), accumulation=2,
-                       dynamic_scale=True, layout=layout, checkpoints=checkpoints)
+        return Trainer(Rejecting(int(first["id"][0]), frozen=route == "host-frozen"), optax.sgd(0.5),
+                       key=jax.random.key(0), accumulation=2, dynamic_scale=True, layout=layout,
+                       checkpoints=checkpoints)
 
     if route == "resumed":
         trainer().fit(ramped(indexed_data(records, 16, seed), ramp), steps=2, log_every=100,
