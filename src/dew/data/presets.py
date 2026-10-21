@@ -30,52 +30,155 @@ from dew.data import (
     text as text_steps,
     video as video_steps,
 )
-from dew.data.pipeline import Pack
+from dew.data.pipeline import Configured, DeviceStep, Pack
 
 if TYPE_CHECKING:
+    from collections.abc import Iterator
+
     from transformers import PreTrainedTokenizerBase
 
-    from dew.data.pipeline import Dataset, Pipeline, RandomStep
+    from dew.data.pipeline import Dataset, HostStep, Mixture, Phases, Pipeline, RandomStep
+    from dew.data.sources.base import Source
 
 
-def images(dataset: Dataset, size: int, *, batch: int, augment: bool | RandomStep = False,
-           crop_scale: tuple[float, float] = (1.0, 1.0)) -> Pipeline:
-    """Images decoded and resized to `size` squares, in batches of `batch`.
-    With `augment=True`, each batch is cropped to `crop_scale` of the area,
-    flipped and colour-jittered on the accelerator, each image by a key its
-    record draws (`images.AugmentationKey`), so a resumed run augments as
-    the uninterrupted one would. A user random step instead runs on the
-    host right after resizing."""
+def images(dataset: Dataset, size: int, *, batch: int,
+           augment: bool | image_steps.DeviceAugment | RandomStep | tuple[RandomStep, ...] = False,
+           crop_scale: tuple[float, float] = (1.0, 1.0), field: str = "image",
+           staging_size: int | None = None, draft: bool = False, rejects: bool = True,
+           caption: image_steps.Caption | None = None,
+           records: int | None = None, host: tuple[HostStep, ...] = ()) -> Pipeline:
+    """Images in `field` decoded and resized to `size` squares, in batches of `batch`.
 
-    resized = _decoded_images(dataset, size)
-    if augment is False:
-        return resized.batch(batch)
+    - `augment=True` crops each image of a batch to `crop_scale` of its area, flips and
+      colour-jitters it on the accelerator, by a key its record draws (`images.AugmentationKey`),
+      so a resumed run augments as the uninterrupted one would; an `images.DeviceAugment(size,
+      ...)` value sets those three itself. A random step, or a tuple of them, runs on the host
+      right after the resize and the caption instead.
+    - `staging_size` resizes to that size instead, for an augmentation that crops to `size`:
+      `augment=True` and a `DeviceAugment` do, and host steps return `size` squares, as
+      `images.RandomCrop(size)` and `images.RandomResizedCrop(size)` do. With no augmentation it
+      is not used. `draft` decodes a JPEG at a reduced scale no smaller than that
+      size (`images.DecodeImage(at_least=)`).
+    - With `rejects=False`, an image that does not decode stops the run instead of being dropped
+      and counted.
+    - `caption` (`images.caption(...)`) writes each record's caption after the resize; its class
+      names, where it names none, are the source's (`class_names.label` in its metadata), and with
+      `templates=` it draws one per record.
+    - `records` keeps that many prepared records before the batch; `host` steps then read each
+      batch on the host, before any step on the accelerator."""
+
+    device: image_steps.DeviceAugment | None = None
+    on_host: tuple[RandomStep, ...] = ()
     if augment is True:
-        return (resized.random_map(image_steps.AugmentationKey()).batch(batch)
-                .map(image_steps.DeviceAugment(size, crop_scale=crop_scale, flip=True, jitter=True)))
-    return resized.random_map(augment).batch(batch)
+        device = image_steps.DeviceAugment(size, crop_scale=crop_scale, flip=True, jitter=True)
+    elif isinstance(augment, image_steps.DeviceAugment):
+        device = augment
+    elif isinstance(augment, tuple):
+        on_host = augment
+    elif augment is not False:
+        on_host = (augment,)
+    staging = size if staging_size is None or (device is None and not on_host) else staging_size
+    if size < 1 or staging < size:
+        raise ValueError(f"images need a positive size and a staging_size at least that size, not {size} "
+                         f"and {staging_size}")
+    if device is not None and device.size != size:
+        raise ValueError(f"the augmentation crops to {device.size} pixels and the images are {size}; give "
+                         "DeviceAugment the preset's size")
+    prepared = _decoded_images(dataset, staging, field=field, at_least=staging if draft else None,
+                               rejects=rejects)
+    if caption is not None:
+        prepared = prepared.map(Configured(image_steps.ConfigureCaption(caption), needs=(),
+                                           random=isinstance(caption, image_steps.RandomCaption)))
+    if device is not None:
+        prepared = prepared.random_map(image_steps.AugmentationKey())
+    for step in on_host:
+        prepared = prepared.random_map(step)
+    return _finished(prepared, batch=batch, records=records, host=host,
+                     device=() if device is None else (device,))
 
 
-def lm(dataset: Dataset, tokenizer: str | PreTrainedTokenizerBase, *, seq_len: int, batch: int,
-       field: str = "text") -> Pipeline:
-    """Documents in `field` tokenized, ended by the tokenizer's EOS where it
-    has one, cut into pieces that keep every next-token target, and packed
-    first-fit into rows of `seq_len + 1` tokens (the last a target), in
-    batches of `batch` rows."""
-
-    documents = dataset.map(text_steps.tokenize(tokenizer, field=field))
-    return _next_token_windows(documents, Pack(seq_len + 1)).batch(batch)
+def _finished(prepared: Dataset, *, batch: int, records: int | None, host: tuple[HostStep, ...],
+              device: tuple[DeviceStep, ...] = ()) -> Pipeline:
+    """`prepared` cut to `records` where given, in batches of `batch`, read by the `host` steps and
+    then the `device` steps, in that order (a device step runs in the compiled step, after every
+    host step). Every preset ends through it."""
+    kept = prepared if records is None else prepared.take(records)
+    return kept.batch(batch).map(*host, *device) if host or device else kept.batch(batch)
 
 
-def sft(dataset: Dataset, tokenizer: str | PreTrainedTokenizerBase, *, seq_len: int, batch: int) -> Pipeline:
+def lm(dataset: Dataset, tokenizer: str | PreTrainedTokenizerBase | None, *, seq_len: int, batch: int,
+       field: str = "text", eos: bool | None = None,
+       pack: Literal["first-fit", "best-fit", "concat"] | None = "first-fit", bins: int = 32,
+       stride: int | None = None, records: int | None = None, host: tuple[HostStep, ...] = ()) -> Pipeline:
+    """Documents in `field` tokenized, ended by the tokenizer's EOS where it has one (`eos=True`
+    always, `False` never), cut into pieces that keep every next-token target, and packed into
+    rows of `seq_len + 1` tokens (the last a target) by `pack`, first-fit with `bins` open rows,
+    best-fit, or concatenated, in batches of `batch` rows (`records` and `host` as `images` takes
+    them). `pack=None` joins the documents into one stream of tokens instead and cuts it into
+    windows `stride` apart (`windows`), which carry no document coordinates. With
+    `tokenizer=None` the documents are token ids already, under "text", such as a token store's,
+    whose windows a store reads by index (`TokenFiles(url).pipe(presets.lm, None, seq_len=512,
+    batch=8, pack=None)`); a store packed must state where its documents end."""
+
+    if pack is not None and stride is not None:
+        raise ValueError("stride places fixed windows, pack=None; a pack lays documents out whole")
+    documents = dataset if tokenizer is None else dataset.map(
+        text_steps.tokenize(tokenizer, field=field, eos=eos))
+    if pack is None:
+        windows = documents.windows(seq_len, stride=stride)
+    else:
+        if tokenizer is None:
+            _documented(dataset)
+        windows = _next_token_windows(documents, Pack(seq_len + 1, bins=bins, policy=pack))
+    return _finished(windows, batch=batch, records=records, host=host)
+
+
+def sft(dataset: Dataset, tokenizer: str | PreTrainedTokenizerBase, *, seq_len: int, batch: int,
+        messages: str = "messages", long: Literal["chunk", "truncate", "drop"] = "chunk",
+        pack: Literal["first-fit", "best-fit", "concat"] = "first-fit", bins: int = 32,
+        records: int | None = None, host: tuple[HostStep, ...] = ()) -> Pipeline:
     """Conversations in `messages` rendered through the tokenizer's chat
     template, each token's speaker kept beside it for an assistant-only loss,
-    a longer one cut into pieces of `seq_len + 1` tokens that keep every
-    turn, and packed first-fit into rows of that length, in batches of
-    `batch` rows."""
+    and packed into rows of `seq_len + 1` tokens by `pack`, as `lm` packs,
+    in batches of `batch` rows (`records` and `host` as `images` takes
+    them). A conversation longer than a row is cut into pieces that keep
+    every turn (`long="chunk"`), cut at its end (`"truncate"`), or dropped
+    and counted (`"drop"`)."""
 
-    return _conversation_windows(dataset.map(chat.template(tokenizer)), Pack(seq_len + 1, _CHAT_FIELDS),
-                                 long="chunk").batch(batch)
+    rendered = dataset.map(chat.template(tokenizer, messages=messages))
+    packing = Pack(seq_len + 1, _CHAT_FIELDS, bins=bins, policy=pack)
+    windows = _conversation_windows(rendered, packing, long=long)
+    return _finished(windows, batch=batch, records=records, host=host)
+
+
+def _documented(dataset: Dataset) -> None:
+    """Refuse to pack token documents from a store that states no document ends (neither an index
+    of them nor an EOS token), wherever it sits in the chain's sources: its tokens would read as
+    one document, whose pieces no producer made."""
+    from dew.data.sources.tokens import TokenFiles
+
+    for source in _stores(dataset._chain().source):
+        if isinstance(source, TokenFiles) and not source.documented:
+            raise ValueError(f"packed text needs producer document boundaries or EOS: {source.describe()}")
+
+
+def _stores(source: Source | Mixture | Phases) -> Iterator[Source]:
+    """Every store under `source`: a mixture's or phases' corpora's, a concatenation's parts, and
+    the store each holdout selection selects from."""
+    from dew.data.holdout import selecting
+    from dew.data.pipeline import Mixture, Phases
+    from dew.data.sources.concatenate import Concatenate
+
+    if isinstance(source, (Mixture, Phases)):
+        for child in source.pipelines:
+            yield from _stores(child.source)
+        return
+    for selected in selecting(source):
+        if isinstance(selected, Concatenate):
+            for part in selected.sources:
+                yield from _stores(part)
+        elif not isinstance(selected, (Mixture, Phases)):
+            yield selected
 
 
 _CHAT_FIELDS = ("text", chat.ROLES_KEY)
@@ -89,8 +192,8 @@ def _next_token_windows(documents: Dataset, pack: Pack) -> Pipeline:
     `lm`, a conversation cut into pieces and the text and chat recipes (`dew.config.data`) prepare
     text through it."""
     if pack.policy == "concat":
-        return documents.then(dataclasses.replace(pack, overlap=1))
-    return documents.flat_map(text_steps.Chunks(pack.seq_len, fields=pack.fields, overlap=1)).then(pack)
+        return documents._then(dataclasses.replace(pack, overlap=1))
+    return documents.flat_map(text_steps.Chunks(pack.seq_len, fields=pack.fields, overlap=1))._then(pack)
 
 
 def _conversation_windows(rendered: Dataset, pack: Pack, *,
@@ -101,21 +204,61 @@ def _conversation_windows(rendered: Dataset, pack: Pack, *,
     if long == "chunk":
         return _next_token_windows(rendered, pack)
     fitted = chat.fit_length(pack.seq_len, long=long)
-    return (rendered.filter_map(fitted) if long == "drop" else rendered.map(fitted)).then(pack)
+    # A concatenating pack cuts conversations where its rows end, so its cuts overlap by one token too.
+    pack = dataclasses.replace(pack, overlap=1) if pack.policy == "concat" else pack
+    return (rendered.filter_map(fitted) if long == "drop" else rendered.map(fitted))._then(pack)
+
+
+def preferences(dataset: Dataset, *, seq_len: int, batch: int, pad_id: int = 0, records: int | None = None,
+                host: tuple[HostStep, ...] = ()) -> Pipeline:
+    """Preference pairs of token ids, chosen and rejected, each laid out in `seq_len` tokens with
+    its completion's mask, padded with `pad_id` (`preferences.PreferencePair`), in batches of
+    `batch` (`records` and `host` as `images` takes them). No tokenizer: a pair of raw text is
+    tokenized by a step before it."""
+    from dew.data.preferences import PreferencePair
+
+    return _finished(dataset.map(PreferencePair(seq_len, pad_id=pad_id)), batch=batch, records=records,
+                     host=host)
+
+
+def canvas(dataset: Dataset, tokenizer: str | PreTrainedTokenizerBase, *, prompt_length: int,
+           canvas_size: int, batch: int, canvases: int = 1, pad_id: int = 0, messages: str = "messages",
+           records: int | None = None, host: tuple[HostStep, ...] = ()) -> Pipeline:
+    """Conversations in `messages` rendered through the tokenizer's chat template, then each
+    assistant turn one row of a block-diffusion objective (`ResponseCanvases`): what comes before
+    it in `prompt_length` tokens, padded with `pad_id`, and its response in `canvases` canvases of
+    `canvas_size`, the tokenizer's EOS filling the rest of its last canvas and `pad_id` the canvases
+    after it; a longer prompt or response keeps its first tokens. Never packed, in batches of
+    `batch` (`records` and `host` as `images` takes them). A tokenizer with no EOS cannot fill a
+    canvas, and is refused."""
+    from dew.data.steps.chat import ResponseCanvases
+
+    renderer = chat.template(tokenizer, messages=messages)
+    eos = renderer.vocabulary.eos_id
+    if eos is None:
+        raise ValueError(f"tokenizer {renderer.tokenizer!r} declares no eos token to end a response's canvas")
+    layout = ResponseCanvases(prompt_length, canvas_size, canvases, eos, pad_id)
+    return _finished(dataset.map(renderer).flat_map(layout), batch=batch, records=records, host=host)
 
 
 def clips(dataset: Dataset, seconds: float, *, frames: int, fps: float, size: int, batch: int,
-          sample_rate: int | None = None) -> Pipeline:
+          sample_rate: int | None = None, margin: float = 0.0, context: float = 0.0,
+          missing: Literal["silence", "reject"] = "silence", rejects: bool = True, records: int | None = None,
+          host: tuple[HostStep, ...] = ()) -> Pipeline:
     """Windows of `seconds` drawn from the media in `mp4`, each record's own
     on every read and resume (`video.PickClip`), as `frames` frames at `fps`
     fitted into `size` squares, in batches of `batch`. With `sample_rate`,
     the window's sound beside them, mono at that rate, filled with silence
-    marked invalid where the media has none (`audio.DecodeAudio`). Media shorter
-    than the window, or that does not decode, is counted and dropped; the
-    media and its window are read here and leave the record."""
+    marked invalid where the media has none (`audio.DecodeAudio`), or with
+    `missing="reject"` dropped. Media shorter than the window, or that does not decode, is
+    counted and dropped, or with `rejects=False` stops the run. A window is drawn `margin`
+    seconds clear of the media's ends, and its sound is `context` seconds wider on each side. The
+    media and its window are read here and leave the record. `records` and `host` as `images`
+    takes them."""
 
-    return _clips(dataset, seconds, frames=frames, fps=fps, size=size, sample_rate=sample_rate,
-                  missing="silence").batch(batch)
+    windows = _clips(dataset, seconds, frames=frames, fps=fps, size=size, margin=margin,
+                     sample_rate=sample_rate, context=context, missing=missing, rejects=rejects)
+    return _finished(windows, batch=batch, records=records, host=host)
 
 
 def _decoded_images(rows: Dataset, size: int, *, field: str = "image", at_least: int | None = None,

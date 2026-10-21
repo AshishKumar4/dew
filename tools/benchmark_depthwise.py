@@ -24,7 +24,7 @@ from flax import linen as nn
 
 import dew.nn.conv as conv
 from dew.accuracy import reduction_bound, within
-from dew.nn.kernels.tuning import samples
+from dew.telemetry.benchmark import samples
 
 
 def reference(x, kernel, dilation, *, layout='NHWC', precision=jax.lax.Precision.HIGHEST):

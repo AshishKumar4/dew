@@ -34,6 +34,9 @@ class Concatenate(Dataset):
         if not self.sources:
             raise ValueError("concatenation needs at least one source")
 
+    def label(self) -> str:
+        return "+".join(dict.fromkeys(source.label() for source in self.sources))
+
     def describe(self) -> str:
         return "concatenate[" + ",".join(source.describe() for source in self.sources) + "]"
 

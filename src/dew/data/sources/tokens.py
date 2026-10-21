@@ -15,7 +15,7 @@ from dew.data.dataset import Batch, Records
 from dew.data.pipeline import Dataset
 from dew.data.storage import Store, content_version, local
 
-from .base import Read, ShardManifest, _indexed_manifest
+from .base import Read, ShardManifest, _indexed_manifest, url_label
 from .files import Files
 from .index import ArrayIndex
 
@@ -224,6 +224,9 @@ class TokenFiles(Dataset):
                 f"token export {self.url!r} has one split; give an explicit TokenFiles URL for {name!r}"
             )
         return replace(self, split=name)
+
+    def label(self) -> str:
+        return url_label(self.url)
 
     def describe(self) -> str:
         return f"tokens:{self.url}:{self.split}:field={self.field}"
