@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Literal, Protocol, TypedDict, TypeGuard, Unpac
 
 import jax
 import jax.numpy as jnp
+import ml_dtypes
 import numpy as np
 
 from dew import records
@@ -253,7 +254,7 @@ class Processor:
             "text": text if isinstance(text, str) else list(text),
             "padding": not isinstance(text, str) and len(text) > 1,
             "truncation": False,
-            "return_tensors": "pt",
+            "return_tensors": "np",
         }
         if audio is not None:
             arguments["audio"] = audio
@@ -261,7 +262,7 @@ class Processor:
             arguments["videos"] = videos
         if video_metadata is not None:
             arguments["video_metadata"] = video_metadata
-        return self._from_tensors(self.media(images=images, **arguments))
+        return self._from_arrays(self.media(images=images, **arguments))
 
     def chat(self, messages: Sequence[Mapping[str, object]], *, add_generation_prompt: bool = True,
              **template_options: JSON) -> ModelInputs:
@@ -280,21 +281,22 @@ class Processor:
                     for part in content)
         reference = self._media_reference if media else self.reference
         values = reference.apply_chat_template(
-            messages, tokenize=True, return_dict=True, return_tensors="pt" if media else "np",
+            messages, tokenize=True, return_dict=True, return_tensors="np",
             add_generation_prompt=add_generation_prompt, **template_options)
         if not isinstance(values, Mapping):
             raise TypeError("the source chat processor must return named numeric inputs")
-        return self._from_tensors(values) if media else self.from_hf(values)
+        return self._from_arrays(values) if media else self.from_hf(values)
 
-    def _from_tensors(self, values: Mapping[str, object]) -> ModelInputs:
-        import torch
-
+    def _from_arrays(self, values: Mapping[str, object]) -> ModelInputs:
+        """A media processor's NumPy fields (`return_tensors='np'`, no PyTorch), a bfloat16 one
+        (Llama 4's pixels) widened to float32, which is exact; a processor that returns anything
+        but NumPy arrays is refused by name."""
         arrays: dict[str, np.ndarray] = {}
         for name, value in values.items():
-            if not isinstance(value, torch.Tensor):
-                raise TypeError(f"processor field {name!r} is not a tensor")
-            # Llama 4's processor emits bf16; float32 widening is exact.
-            arrays[name] = (value.float() if value.dtype == torch.bfloat16 else value).numpy()
+            if not isinstance(value, np.ndarray):
+                raise TypeError(f"{type(self._media_reference).__name__} returned {name!r} as "
+                                f"{type(value).__name__}, not the NumPy array Dew asks it for")
+            arrays[name] = value.astype(np.float32) if value.dtype == ml_dtypes.bfloat16 else value
         return self.from_hf(arrays)
 
     def from_hf(self, values: Mapping[str, object]) -> ModelInputs:
