@@ -356,7 +356,7 @@ def translate_gemma4_vision_config(hf_config: Mapping[str, object]) -> Record:
         "hidden_act": activation_name(vision, ("gelu_pytorch_tanh", "gelu"), "gelu_pytorch_tanh",
                                       ("hidden_activation", "hidden_act")),
         "rms_norm_eps": records.number(vision.get("rms_norm_eps", 1e-6), "rms_norm_eps"),
-        "rope_theta": rope_base(vision, 100.0),
+        "rope_theta": rope_base(vision, 100.0, axial=True),
         "standardize": bool(vision.get("standardize", False)),
         "use_clipped_linears": bool(vision.get("use_clipped_linears", False)),
     }}
