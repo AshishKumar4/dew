@@ -130,22 +130,23 @@ def test_the_fused_head_takes_the_whole_heads_loss_and_gradients_under_the_float
     and its per-token losses and log Z, on par with the whole-logits head's over
     drawn heads and columns (check 1), over chunks whose last is short, padded
     weights and a cap; its top-1 columns are the whole head's."""
-    weights = jnp.asarray([[1, 1, 0, 1, 2], [1, 0, 1, 1, 1]], jnp.float32)
     z_loss = 1e-2
 
     def draw(seed):
-        states, matrix, targets = inputs(vocab=37, features=16, tokens=(2, 5), dtype=dtype, seed=seed)
+        states, matrix, targets = inputs(vocab=37, features=16, tokens=(8, 16), dtype=dtype, seed=seed)
+        # Padded tokens weigh nothing, others one or two.
+        weights = jax.random.randint(jax.random.fold_in(jax.random.key(8), seed), targets.shape, 0, 3)
         # Sums exact in any order, so the chunks' products are the whole head's.
-        return (*eighths(states, matrix), *columns(37, seed), targets)
+        return (*eighths(states, matrix), *columns(37, seed), targets, weights.astype(jnp.float32))
 
-    def whole(states, matrix, scale, bias, targets):
+    def whole(states, matrix, scale, bias, targets, weights):
         head = OutputTable(matrix, vocab_major=False, bias=bias, softcap=softcap, scale=scale)
         logits = head.logits(states)
         log_z = jax.nn.logsumexp(logits, axis=-1)
         losses = log_z - jnp.take_along_axis(logits, targets[..., None], axis=-1)[..., 0]
         return jnp.sum(weights * (losses + z_loss * jnp.square(log_z))), (losses, logits.argmax(-1), log_z)
 
-    def fused(states, matrix, scale, bias, targets):
+    def fused(states, matrix, scale, bias, targets, weights):
         return fused_head_loss(states, OutputTable(matrix, vocab_major=False, bias=bias, softcap=softcap,
                                                    scale=scale),
                                targets, weights, z_loss=z_loss, tile=(3, 11))
@@ -589,7 +590,8 @@ def test_bf16_states_from_the_backbone_score_as_the_logits_did(chunks, tie_embed
     rng = jax.random.PRNGKey(0)
     ids = jax.random.randint(rng, (2, 12), 0, 97)
     variables = model.init(rng, ids)
-    table = OutputTable(head_matrix(model, variables), vocab_major=False)
+    # The model's own table, whose product the whole logits round as the chunks do.
+    table = chunked.head_table(model, variables)
 
     def draw(seed):
         keys = jax.random.split(jax.random.fold_in(jax.random.key(1), seed))
@@ -610,7 +612,8 @@ def test_bf16_states_from_the_backbone_score_as_the_logits_did(chunks, tie_embed
                     f'{dtype} {tie_embeddings} {chunks} backbone states', seeds=SEEDS['backbone states'],
                     truth_fn=lambda hidden, targets: true_losses(table, hidden, targets, dtype))
     hidden = model.apply(variables, ids, method=CausalTransformer.hidden_states)
-    _, predicted, _ = chunked_cross_entropy(hidden, table, ids, chunks)
+    matrix = OutputTable(head_matrix(model, variables), vocab_major=False)
+    _, predicted, _ = chunked_cross_entropy(hidden, matrix, ids, chunks)
     assert hidden.dtype == dtype
     assert jnp.array_equal(predicted, jnp.argmax(model.apply(variables, ids), axis=-1))
 
@@ -626,11 +629,12 @@ def test_the_gradient_reaches_the_backbone_through_the_states_and_the_head():
     once, as the chunked head's does.
     """
     model, wide = small_model(), small_model(dtype=jnp.float64)
+    init = jax.jit(model.init)
 
     def draw(seed):
         keys = jax.random.split(jax.random.fold_in(jax.random.key(0), seed), 3)
         ids = jax.random.randint(keys[0], (2, 12), 0, 97)
-        return model.init(keys[1], ids)['params'], ids, jax.random.randint(keys[2], (2, 12), 0, 97)
+        return init(keys[1], ids)['params'], ids, jax.random.randint(keys[2], (2, 12), 0, 97)
 
     def full(params, ids, targets):
         hidden = model.apply({'params': params}, ids, method=CausalTransformer.hidden_states)
@@ -650,7 +654,7 @@ def test_the_gradient_reaches_the_backbone_through_the_states_and_the_head():
         return jnp.mean(optax.softmax_cross_entropy_with_integer_labels(logits, targets))
 
     assert_as_exact(jax.jit(jax.grad(tiled)), jax.jit(jax.grad(full)), draw, 'backbone gradient',
-                    seeds=SEEDS['backbone'], truth_fn=jax.grad(true))
+                    seeds=SEEDS['backbone'], truth_fn=jax.jit(jax.grad(true)))
     for path, leaf in jax.tree_util.tree_leaves_with_path(jax.grad(full)(*draw(0))):
         name = jax.tree_util.keystr(path)
         assert jnp.abs(leaf).max() > 0, f"{name} has a zero gradient, so nothing is checked"
@@ -671,7 +675,7 @@ def test_small_vocabularies_take_any_positive_chunk_count(chunks, tile):
     """A five-column head's short tail and one-column tiles score every column and gradient: on par
     with the whole logits over drawn heads (check 1), and the whole logits' top-1."""
     def draw(seed):
-        hidden, head, targets = inputs(vocab=5, features=8, tokens=(2, 4), seed=seed)
+        hidden, head, targets = inputs(vocab=5, features=8, tokens=(16, 32), seed=seed)
         return hidden, head, jax.random.normal(jax.random.fold_in(jax.random.key(3), seed), (5,)) / 7, targets
 
     def tiled(hidden, head, bias, targets):
@@ -689,10 +693,9 @@ def test_small_vocabularies_take_any_positive_chunk_count(chunks, tile):
     def held(loss):
         def run(*terms):
             with jax.default_matmul_precision("highest"):
-                (total, (losses, _, log_z)), gradients = jax.value_and_grad(loss, argnums=(0, 1, 2),
-                                                                            has_aux=True)(*terms)
-            return dict(zip(("loss", "losses", "log Z", "hidden", "head", "bias"), (total, losses, log_z,
-                                                                                   *gradients), strict=True))
+                gradients, (losses, _, log_z) = jax.grad(loss, argnums=(0, 1, 2), has_aux=True)(*terms)
+            return dict(zip(("losses", "log Z", "hidden", "head", "bias"), (losses, log_z, *gradients),
+                            strict=True))
         return run
 
     assert_as_exact(jax.jit(held(tiled)), jax.jit(held(whole)), draw, f"{chunks} {tile} small vocabulary",
@@ -703,11 +706,11 @@ def test_small_vocabularies_take_any_positive_chunk_count(chunks, tile):
 
 @pytest.mark.parametrize("chunks", [4, 8])
 def test_lm_training_with_small_vocabularies_matches_the_unchunked_head(chunks):
-    """The objective's chunk count reaches the tiled head in both the loss and optimizer update: each
-    on par with the unchunked head's over drawn batches (check 1), the truth the model in float64."""
+    """The objective's chunk count reaches the tiled head in both its token losses and the optimizer's
+    update: each on par with the unchunked head's over drawn batches (check 1), the truth the model in
+    float64. The update's loss is the objective's (`scalar_loss`), its token losses' mean."""
     from reference_error import widened
 
-    from dew.objectives.base import Step
     from dew.objectives.lm import LMObjective
     from dew.training import Trainer
 
@@ -716,29 +719,29 @@ def test_lm_training_with_small_vocabularies_matches_the_unchunked_head(chunks):
     objective = LMObjective(model, seq_len=4, head_chunks=chunks, head_tile=(3, 2), ema_decay=None)
     trainer = Trainer(objective, optax.sgd(.01), key=jax.random.key(0))
     initial = trainer.initial_state()
-    step = Step(jnp.array(0), jax.random.key(1), None)
 
     def draw(seed):
         key = jax.random.fold_in(jax.random.key(2), seed)
         return (jax.random.randint(key, (jax.device_count(), 5), 0, 5),)
 
     compiled = trainer.compile(initial, {"text": draw(0)[0]})
-    loss = jax.jit(lambda ids: objective.scalar_loss(initial.variables, {"text": ids}, step)[0])
+    scores = jax.jit(lambda ids: objective.token_scores(initial.variables, ids).losses)
 
     def trained(ids):
         state, _, _, _, accepted, _ = compiled(jax.tree.map(jnp.copy, initial), {"text": ids})
         assert bool(accepted) and int(state.updates) == 1
-        return {"loss": loss(ids), "params": state.variables["params"]}
+        return {"losses": scores(ids), "params": state.variables["params"]}
 
     def stepped(model, variables):
         def whole(params, ids):
             logits = model.apply({**variables, "params": params}, ids[:, :-1])
-            return jnp.mean(optax.softmax_cross_entropy_with_integer_labels(logits, ids[:, 1:]))
+            losses = optax.softmax_cross_entropy_with_integer_labels(logits, ids[:, 1:])
+            return jnp.mean(losses), losses
 
         def run(ids):
-            want, gradient = jax.value_and_grad(whole)(variables["params"], ids)
+            gradient, losses = jax.grad(whole, has_aux=True)(variables["params"], ids)
             updated = jax.tree.map(lambda p, g: p - .01 * g, variables["params"], gradient)
-            return {"loss": want, "params": updated}
+            return {"losses": losses, "params": updated}
         return run
 
     assert_as_exact(trained, jax.jit(stepped(model, initial.variables)), draw,
@@ -775,8 +778,8 @@ def oracle(hidden, head, targets, softcap=None, precision=None):
 @pytest.mark.parametrize("softcap", [None, 30.])
 def test_the_bounded_backward_matches_the_full_vocabulary_pass(
         loss_weight, z_weight, softcap):
-    """Both outputs' gradients, on par with the pass that holds all the logits over drawn heads
-    (check 1); its top-1 the full pass's, and neither short tile's gradient dropped."""
+    """Both outputs, and their gradients, on par with the pass that holds all the logits over drawn
+    heads (check 1); its top-1 the full pass's, and neither short tile's gradient dropped."""
     precision = jax.lax.Precision.HIGHEST
 
     def draw(seed):
@@ -784,7 +787,7 @@ def test_the_bounded_backward_matches_the_full_vocabulary_pass(
 
     def full(states, matrix, targets):
         losses, log_z = oracle(states, matrix, targets, softcap, precision)
-        return jnp.sum(loss_weight * losses + z_weight * jnp.square(log_z))
+        return jnp.sum(loss_weight * losses + z_weight * jnp.square(log_z)), (losses, log_z)
 
     def tiled(states, matrix, targets):
         losses, _, log_z = chunked_cross_entropy(
@@ -794,12 +797,12 @@ def test_the_bounded_backward_matches_the_full_vocabulary_pass(
             4,
             tile=RAGGED,
         )
-        return jnp.sum(loss_weight * losses + z_weight * jnp.square(log_z))
+        return jnp.sum(loss_weight * losses + z_weight * jnp.square(log_z)), (losses, log_z)
 
     def held(loss):
         def run(*terms):
-            total, gradients = jax.value_and_grad(loss, argnums=(0, 1))(*terms)
-            return dict(zip(("loss", "hidden", "head"), (total, *gradients), strict=True))
+            gradients, (losses, log_z) = jax.grad(loss, argnums=(0, 1), has_aux=True)(*terms)
+            return dict(zip(("losses", "log Z", "hidden", "head"), (losses, log_z, *gradients), strict=True))
         return run
 
     assert_as_exact(jax.jit(held(tiled)), jax.jit(held(full)), draw,
@@ -974,9 +977,11 @@ def test_the_backbone_receives_both_outputs_gradients(tie_embeddings):
     model, wide = (small_model(dtype=dtype, tie_embeddings=tie_embeddings, final_logit_softcap=30.)
                    for dtype in (jnp.float32, jnp.float64))
 
+    init = jax.jit(model.init)
+
     def draw(seed):
         ids = jax.random.randint(jax.random.fold_in(jax.random.PRNGKey(31), seed), (1, 7), 0, 97)
-        return model.init(jax.random.fold_in(jax.random.PRNGKey(32), seed), ids)["params"], ids
+        return init(jax.random.fold_in(jax.random.PRNGKey(32), seed), ids)["params"], ids
 
     def full(tree, ids):
         targets = jnp.roll(ids, -1, axis=-1)
