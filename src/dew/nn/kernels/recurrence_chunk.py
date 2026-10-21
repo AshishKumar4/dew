@@ -422,8 +422,9 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
                       for x in (query, key))
     scale = (key.shape[-1] ** -0.5 if hooks.l2norm else 1.0) if hooks.scale is None else hooks.scale
     if hooks.gates is not None:
-        g = recurrence._gated_decay(*(x.astype(work) for x in (operands.gate, operands.log_a, operands.bias)))
-        beta = jax.nn.sigmoid(operands.beta.astype(work))
+        raw = operands.beta.astype(work) if hooks.gates.write == 'sigmoid' else None
+        g, beta = recurrence.gated(hooks.gates, *(x.astype(work) for x in (operands.gate, operands.log_a,
+                                                                           operands.bias)), raw)
     else:
         g = (jnp.zeros(value.shape[:3], work) if hooks.decay == 'none'
              else operands.log_decay)

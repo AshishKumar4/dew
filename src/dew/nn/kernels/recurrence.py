@@ -44,9 +44,17 @@ class Conv:
 
 @dataclasses.dataclass(frozen=True)
 class Gates:
-    """The gates from their pre-activations, a head's: the log decay `-exp(log_a) softplus(gate +
-    bias)` (the gated delta rule's and Mamba2's), and beta `sigmoid(beta)`. Without it the step takes
-    the log decay and beta as they are."""
+    """The gates from their pre-activations, a head's: the step `softplus(gate + bias)`, clipped to
+    `limit` where one is given, the log decay `-exp(log_a)` times it (the gated delta rule's and
+    Mamba2's), and the write gate `write`: 'sigmoid' of a raw `beta` (the gated delta rule's), or
+    'step', the step itself (Mamba2's discretized input). Without it the step takes the log decay and
+    beta as they are."""
+    write: str = 'sigmoid'
+    limit: tuple[float, float] | None = None
+
+    def __post_init__(self):
+        if self.write not in ('sigmoid', 'step'):
+            raise ValueError(f"a write gate is 'sigmoid' or 'step', not {self.write!r}")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -129,6 +137,18 @@ def _gated_decay(gate, log_a, bias):
     return -jnp.exp(log_a) * jax.nn.softplus(gate + bias)
 
 
+def gated(gates: Gates, gate, log_a, bias, beta):
+    """The log decay and the write gate `gates` forms from its pre-activations, in their dtype: with a
+    sigmoid write gate the gated delta rule's (`_gated_decay`, `sigmoid(beta)`), with the step's
+    Mamba2's (`-exp(log_a)` times the clipped step, and the step)."""
+    if gates.write == 'sigmoid' and gates.limit is None:
+        return _gated_decay(gate, log_a, bias), jax.nn.sigmoid(beta)
+    step = jax.nn.softplus(gate + bias)
+    if gates.limit is not None:
+        step = jnp.clip(step, *gates.limit)
+    return -jnp.exp(log_a) * step, step if gates.write == 'step' else jax.nn.sigmoid(beta)
+
+
 def gated_rms(out, z, weight, norm: OutputNorm):
     """The epilogue over a head's output `[..., Dv]` in fp32 or wider: `rms_norm(o) weight act(z)`,
     the mean a product by the reciprocal, as XLA's."""
@@ -187,8 +207,10 @@ OPERANDS = ('state', 'query', 'key', 'value', 'token', 'held', 'taps', 'log_deca
 def _names(hooks: Hooks) -> tuple[str, ...]:
     """The `Step` operands a launch reads, in its order, after `active`; `state` last."""
     streams = ('token', 'held', 'taps') if hooks.conv is not None else ('query', 'key', 'value')
-    gates = (('gate', 'beta', 'log_a', 'bias') if hooks.gates is not None
-             else ('log_decay',) * (hooks.decay != 'none') + ('beta',) * hooks.gated_write)
+    if hooks.gates is not None:
+        gates = ('gate', *('beta',) * (hooks.gates.write == 'sigmoid'), 'log_a', 'bias')
+    else:
+        gates = ('log_decay',) * (hooks.decay != 'none') + ('beta',) * hooks.gated_write
     return (*streams, *gates, *('skip',) * hooks.skip, *('z', 'weight') * (hooks.output is not None), 'state')
 
 
@@ -236,8 +258,8 @@ def _prologue(hooks: Hooks, given: dict, work):
 def _gates(hooks: Hooks, given: dict, work, key_width: int):
     """The reference's decay per key dimension `[rows, Hv, Dk]` and write gate `[rows, Hv]`."""
     if hooks.gates is not None:
-        g = _gated_decay(*(given[name].astype(work) for name in ('gate', 'log_a', 'bias')))
-        beta = jax.nn.sigmoid(given['beta'].astype(work))
+        beta = given['beta'].astype(work) if hooks.gates.write == 'sigmoid' else None
+        g, beta = gated(hooks.gates, *(given[name].astype(work) for name in ('gate', 'log_a', 'bias')), beta)
     else:
         g = None if hooks.decay == 'none' else given['log_decay'].astype(work)
         beta = given['beta'].astype(work) if hooks.gated_write else None
@@ -316,9 +338,16 @@ def _kernel(*refs, hooks: Hooks, group: int, key_heads: int, interpret: bool):
             query, key = query[0], key[0]
         elif hooks.scale is not None:
             query = query * hooks.scale
-        if hooks.gates is not None:
+        if hooks.gates is not None and hooks.gates.write == 'sigmoid' and hooks.gates.limit is None:
             decay = jnp.exp(_gated_decay(scalar('gate'), scalar('log_a'), scalar('bias')))
             write_gate = short_conv._sigmoid(scalar('beta'), interpret=interpret)
+        elif hooks.gates is not None:
+            step = jax.nn.softplus(scalar('gate') + scalar('bias'))
+            if hooks.gates.limit is not None:
+                step = jnp.clip(step, *hooks.gates.limit)
+            decay = jnp.exp(-jnp.exp(scalar('log_a')) * step)
+            write_gate = (step if hooks.gates.write == 'step'
+                          else short_conv._sigmoid(scalar('beta'), interpret=interpret))
         else:
             decay = (jnp.ones((1,), jnp.float32) if hooks.decay == 'none'
                      else jnp.exp(inputs['log_decay'][...].astype(jnp.float32)))
