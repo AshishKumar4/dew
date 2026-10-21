@@ -172,9 +172,10 @@ def _sampling_key(key: int | jax.Array | RowKeys, solver: Solver, rows: int) -> 
     if not isinstance(solver, RowSolver):
         raise ValueError(f"row keys draw each row by its own key, which a solver does in step_rows "
                          f"(RowSolver), and {type(solver).__name__} draws the batch from one key")
-    if key.keys.shape != (rows,):
-        raise ValueError(f"row keys are one key per row: {rows} rows, keys {key.keys.shape}")
-    return RowKeys(request_rows(key.keys))
+    keys = request_rows(jnp.asarray(key.keys) if isinstance(key.keys, (list, tuple)) else key.keys)
+    if keys.shape != (rows,):
+        raise ValueError(f"row keys are one key per row: {rows} rows, keys {keys.shape}")
+    return RowKeys(keys)
 
 
 def _stepped(solver: Solver, key: jax.Array | RowKeys, index: jax.Array) -> Callable[..., tuple]:

@@ -14,6 +14,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from model_support import parameter_loss
 
 from dew.interop import Pretrained
 from dew.objectives.base import Step
@@ -154,9 +155,7 @@ def test_source_update_exports_and_decodes_as_reference(source, tmp_path):
                             pad_id=int(loaded.generation_config["pad_token_id"]))
     step = Step(step=jnp.int32(0), key=jax.random.key(0), ema=None)
 
-    def loss(variables):
-        statistics, _ = objective.loss({**loaded.variables, "params": variables}, {"text": inputs}, step)
-        return objective.reduce_loss(statistics)[0]
+    loss = parameter_loss(objective, loaded.variables, {"text": inputs}, step)
 
     value, gradient = jax.jit(jax.value_and_grad(loss))(loaded.variables["params"])
     np.testing.assert_allclose(value, reference["loss"], atol=1e-5, rtol=0)
@@ -243,9 +242,7 @@ def test_prediction_loss_respects_padding_and_exports_trained_depth(source, tmp_
                             pad_id=int(loaded.generation_config["pad_token_id"]))
     step = Step(step=jnp.int32(0), key=jax.random.key(0), ema=None)
 
-    def loss(variables):
-        statistics, _ = objective.loss({**loaded.variables, "params": variables}, {"text": inputs}, step)
-        return objective.reduce_loss(statistics)[0]
+    loss = parameter_loss(objective, loaded.variables, {"text": inputs}, step)
 
     value, gradient = jax.jit(jax.value_and_grad(loss))(loaded.variables["params"])
     np.testing.assert_allclose(value, reference["loss"], atol=1e-5, rtol=0)
@@ -321,9 +318,7 @@ def test_video_prediction_training_exports_the_reference_update(video_source, tm
                             pad_id=int(loaded.generation_config["pad_token_id"]))
     step = Step(step=jnp.int32(0), key=jax.random.key(0), ema=None)
 
-    def loss(variables):
-        statistics, _ = objective.loss({**loaded.variables, "params": variables}, {"text": inputs}, step)
-        return objective.reduce_loss(statistics)[0]
+    loss = parameter_loss(objective, loaded.variables, {"text": inputs}, step)
 
     value, gradient = jax.jit(jax.value_and_grad(loss))(loaded.variables["params"])
     np.testing.assert_allclose(value, reference["loss"], atol=1e-5, rtol=0)

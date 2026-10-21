@@ -47,11 +47,16 @@ def encoded_token_fixture(directory: Path, documents: Iterable[str], *, tokenize
                               vocab_size=vocabulary.vocab_size, eos_id=vocabulary.eos_id if eos else None)
 
 
+def token_rows(vocabulary: int, rows: int, length: int, *, seed: int = 0, low: int = 0) -> dict:
+    """A batch of `rows` token rows `length` long under the key "text", drawn at `seed` from
+    `low` up to `vocabulary`."""
+    tokens = np.random.default_rng(seed).integers(low, vocabulary, size=(rows, length))
+    return {"text": tokens.astype(np.int32)}
+
+
 def repeated_token_batch(vocabulary: int, rows: int, length: int, seed: int = 0):
-    """One batch of `rows` token rows `length` long under the key "text", drawn at `seed` from
-    `vocabulary`, yielded forever: a train loader whose every step reads the same batch."""
-    tokens = np.random.default_rng(seed).integers(0, vocabulary, size=(rows, length))
-    batch = {"text": tokens.astype(np.int32)}
+    """One batch of `token_rows` yielded forever: a train loader whose every step reads it."""
+    batch = token_rows(vocabulary, rows, length, seed=seed)
     while True:
         yield batch
 

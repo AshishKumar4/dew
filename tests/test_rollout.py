@@ -14,7 +14,7 @@ import numpy as np
 import pytest
 from affine_run import dataset, frozen_trainer, raw_leaf
 from recording import RecordingTracker
-from rl_support import TinyHead
+from rl_support import TinyHead, padded_text
 
 from dew.objectives.lm import LMObjective
 from dew.objectives.rl import SampledRollout
@@ -140,8 +140,7 @@ def prompt_batch(rows=2):
     prompts[1] = [2, 3, 4, 5, 6, 7, 1, 2]
     info = max(len("rule"), len("other"), 1)
     def pad(text):
-        return np.pad(
-            np.frombuffer(text.encode(), np.uint8).astype(np.int32), (0, info - len(text)))
+        return padded_text(text, info)
     return {
         "prompt": prompts,
         "prompt_length": np.full(rows, width, np.int32),

@@ -155,14 +155,19 @@ def test_clip_tiny_fixture_is_what_the_generator_writes(tmp_path):
 # tools/t5_reference.py
 # ---------------------------------------------------------------------------
 
+def assert_generated_fixture(tool: str, written: Path, committed: Path, weights: str, outputs) -> None:
+    """`tool`'s fixture written to `written` (its `main(["--out", ...])`) is the committed one: its
+    JSON files, its `weights` checkpoint bit for bit, and its reference arrays at their tolerances."""
+    load(tool).main(["--out", str(written.parent)])
+    assert_fixture_json(written, committed, tool)
+    assert_same_tensors(written / weights, committed / weights)
+    assert_fixture_arrays(written / "reference.npz", committed / "reference.npz", outputs)
+
+
 def test_t5_tiny_fixture_is_what_the_generator_writes(tmp_path):
     """Exact checkpoint, config, tokenizer and tokens; fp32 encoder parity."""
-    load("t5_reference").main(["--out", str(tmp_path)])
-
-    written, committed = tmp_path / "tiny", FIXTURES / "t5" / "tiny"
-    assert_fixture_json(written, committed, "t5_reference")
-    assert_same_tensors(written / "model.safetensors", committed / "model.safetensors")
-    assert_fixture_arrays(written / "reference.npz", committed / "reference.npz", T5_OUTPUTS)
+    assert_generated_fixture("t5_reference", tmp_path / "tiny", FIXTURES / "t5" / "tiny", "model.safetensors",
+                             T5_OUTPUTS)
 
 
 # ---------------------------------------------------------------------------
@@ -171,13 +176,8 @@ def test_t5_tiny_fixture_is_what_the_generator_writes(tmp_path):
 
 def test_vae_tiny_fixture_is_what_the_generator_writes(tmp_path):
     """Exact checkpoint, config and sample; fp32 encode/decode parity."""
-    load("vae_reference").main(["--out", str(tmp_path)])
-
-    written, committed = tmp_path / "sd3-tiny", FIXTURES / "vae" / "sd3-tiny"
-    assert_fixture_json(written, committed, "vae_reference")
-    assert_same_tensors(written / "diffusion_pytorch_model.safetensors",
-                        committed / "diffusion_pytorch_model.safetensors")
-    assert_fixture_arrays(written / "reference.npz", committed / "reference.npz", VAE_OUTPUTS)
+    assert_generated_fixture("vae_reference", tmp_path / "sd3-tiny", FIXTURES / "vae" / "sd3-tiny",
+                             "diffusion_pytorch_model.safetensors", VAE_OUTPUTS)
 
 
 # ---------------------------------------------------------------------------

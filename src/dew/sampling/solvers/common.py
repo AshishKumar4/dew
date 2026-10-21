@@ -41,9 +41,9 @@ class Solver(Protocol[StateT]):
         """Return the initial state for sampling from `x` over the concrete grid `times`.
 
         It checks the grid's endpoint domains at compile time. `key` is the
-        root key of the whole sampling run; only `DPMSolverSDE` reads it, for
-        its whole-trajectory Brownian tree. Each step draws from the folded key
-        passed to it.
+        root key of the whole sampling run, or a `RowSolver`'s `RowKeys`; only
+        `DPMSolverSDE` reads it, for its whole-trajectory Brownian tree. Each
+        step draws from the folded key passed to it.
         """
         ...
 
