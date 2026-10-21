@@ -216,6 +216,18 @@ def hooks_of(hooks: dict, queries: int) -> template.Hooks:
 ARITHMETIC = ("full", "causal-window", "causal-documents-window", "cross-causal-lengths-starts")
 
 
+@pytest.mark.parametrize("case", [CASES[name] for name in ARITHMETIC], ids=ARITHMETIC)
+def test_the_scores_hide_exactly_the_keys_their_spans_hide(case):
+    """`template.scores`, which `reference`'s softmax takes, under every score hook: -inf where the
+    call's spans hide the key, finite where they keep it."""
+    queries, keys = geometry(case)
+    spans = template.spans(queries, keys, ROWS, **arguments(case))
+    query, key, _ = drawing(queries, keys)(0)
+    logits = template.scores(query, key, spans, hooks_of(HOOKS["softcap-sinks-alibi"], queries))
+    seen = np.broadcast_to(np.asarray(template.dense(spans))[:, None], logits.shape)
+    np.testing.assert_array_equal(np.isfinite(np.asarray(logits)), seen)
+
+
 @pytest.mark.parametrize("hooks", HOOKS.values(), ids=HOOKS)
 @pytest.mark.parametrize("case", [CASES[name] for name in ARITHMETIC], ids=ARITHMETIC)
 def test_the_templates_arithmetic_is_on_par_with_dews_reference_attention(case, hooks):
