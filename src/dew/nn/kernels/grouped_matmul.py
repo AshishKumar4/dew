@@ -591,8 +591,13 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
     @staticmethod
     def _hooks_lower(ba, dtype) -> bool:
         """Whether Mosaic GPU's lowering takes the launch's hooks (`_lowers_on_mosaic`), traced on 64-wide
-        tiles: the primitives a hook makes do not depend on its tile's extents."""
+        tiles: the primitives a hook makes do not depend on its tile's extents. A side operand the launch
+        squeezes and gives back with its dimension of one (`Hooks.prologue_broadcast`) has no layout
+        Mosaic's inference finds for the size-one dimension, so a hook taking one does not lower there
+        (GMMGATE-h100-8), where Triton's lowering takes it."""
         hooks = ba.arguments['hooks']
+        if hooks.prologue_broadcast or hooks.epilogue_broadcast:
+            return False
 
         def tiles(name, axes_of):
             return [jax.ShapeDtypeStruct((64,) * len(axes), side.dtype)

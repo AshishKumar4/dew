@@ -10,7 +10,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from generation_support import INTERPRETS, SUMS_IN_IEEE, generations, lowers
+from generation_support import INTERPRETS, SUMS_IN_IEEE, generations, lowers, runs
 from jax.experimental.pallas import fuser
 from jax.sharding import Mesh
 from reference_error import assert_as_exact
@@ -186,7 +186,17 @@ COOPERATIVE = mosaic_gpu.Tiles(128, 128, 64, 3, 1, warpgroups=2)
 """A tile two consumer warpgroups compute (a cluster the interpreter does not model)."""
 
 
-@pytest.mark.parametrize("case", ["norm and bias", "gated prologue", "broadcast axes", "cast prologue"])
+MOSAIC_RAN = {'mosaic_gpu'} if jax.default_backend() == 'cpu' else {'mosaic_gpu', 'triton'}
+"""The grouped matmul's kernels a call pinned to Mosaic reports: a GPU process also traces the CPU branch
+of its platform choice, which interprets Triton's and never runs there (`grouped_matmul._launch`)."""
+
+
+def _kernels(taken) -> set:
+    return {route.kernel for route in taken if route.choice == 'grouped_matmul'}
+
+
+@runs("sm90")
+@pytest.mark.parametrize("case", ["norm and bias", "gated prologue", "cast prologue"])
 def test_a_cooperative_tile_holds_check_1_with_its_hooks(case):
     """The Hopper launches pinned to a cooperative tile, interpreted: each consumer rewrites half the stage
     both read and computes half the columns' epilogue, as exact as the plain program from float64 truth;
@@ -199,7 +209,7 @@ def test_a_cooperative_tile_holds_check_1_with_its_hooks(case):
         dew = jax.jit(_drop(_dew(spec, interpret_on_cpu=True)))
         assert_as_exact(dew, jax.jit(_drop(_plain(spec))), _draw, f"{case} cooperative",
                         seeds=SEEDS, truth_fn=_drop(_plain(spec, truth=True)))
-    assert {route.kernel for route in taken if route.choice == 'grouped_matmul'} == {'mosaic_gpu'}
+    assert _kernels(taken) == MOSAIC_RAN
 
 
 def _loss(run):
@@ -675,7 +685,8 @@ def test_exact_sums_add_each_steps_product_as_the_plain_sum_does(generation_name
             np.testing.assert_array_equal(np.asarray(exact), np.asarray(default))
 
 
-@pytest.mark.parametrize("case", ["norm and bias", "broadcast axes"])
+@runs("sm90")
+@pytest.mark.parametrize("case", ["norm and bias"])
 def test_a_cooperative_tiles_gradients_hold_check_1(case):
     """`test_a_cooperative_tile_holds_check_1_with_its_hooks`'s reverse mode: the input gradient through the
     cooperative transposed launch, the kernel gradient through the cooperative kernel gradient with the
@@ -689,9 +700,10 @@ def test_a_cooperative_tiles_gradients_hold_check_1(case):
         assert_as_exact(_loss(_dew(spec, interpret_on_cpu=True)), jax.jit(_loss(_plain(spec))), _draw,
                         f"{case} cooperative gradients", seeds=SEEDS,
                         truth_fn=_loss(_plain(spec, truth=True)))
-    assert {route.kernel for route in taken if route.choice == 'grouped_matmul'} == {'mosaic_gpu'}
+    assert _kernels(taken) == MOSAIC_RAN
 
 
+@SUMS_IN_IEEE
 def test_a_cooperative_tiles_exact_sums_add_as_its_plain_sum_does():
     """`test_exact_sums_add_each_steps_product_as_the_plain_sum_does` at a cooperative tile: each consumer's
     running fp32 sum, the pipeline's carry, matches its accumulator's bit for bit on the CPU."""
@@ -1005,4 +1017,18 @@ def test_a_paired_product_without_an_epilogue_is_refused():
     with pytest.raises(ValueError):
         triton_dense.gmm(lhs, lhs, paired=lhs, out_dtypes=("bfloat16",), tile=PAIRED_TILE,
                          transpose_rhs=False, interpret=True)
+
+
+def test_a_hook_that_broadcasts_a_side_operand_lowers_for_hopper_through_triton():
+    """Mosaic's layout inference finds no layout for a side operand given back with its dimension of
+    one, so the Mosaic launches refuse such a hook and a Hopper call lowers through Triton's, forward
+    and gradient (GMMGATE-h100-8)."""
+    drawn = [jax.ShapeDtypeStruct(array.shape, array.dtype) for array in _draw(0)]
+    dew = _drop(_dew(CASES["broadcast axes"]))
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
+    with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh), generation.routes() as taken:
+        jax.jit(dew).trace(*drawn).lower(lowering_platforms=("cuda",))
+        loss = lambda *drawn: sum(jnp.sum(out.astype(jnp.float32)) for out in dew(*drawn))  # noqa: E731
+        jax.jit(jax.grad(loss)).trace(*drawn).lower(lowering_platforms=("cuda",))
+    assert _kernels(taken) == {'triton'}
 
