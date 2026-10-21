@@ -537,19 +537,27 @@ def test_masked_diffusion_continues_a_pretrained_checkpoint(tmp_path):
     assert drawn > 1.0, f"a fresh init is only {drawn:.3e} from the checkpoint"
 
 
-def test_official_block_diffusion_is_a_complete_pretrained_recipe(tmp_path):
-    from dew.interop import Pretrained
+DIFFUSION_GEMMA = REPO_ROOT / "tests/fixtures/hf/diffusion-gemma-sft"
 
-    checkpoint = REPO_ROOT / "tests/fixtures/hf/diffusion-gemma-sft"
-    directory = tmp_path / "tokens"
+
+def gemma_spans(directory):
+    """Windows of 11 inputs, eight a batch, over a token store of random ids in DIFFUSION_GEMMA's
+    vocabulary written to `directory`: what a block-diffusion recipe run trains on."""
     directory.mkdir()
     for split, count in (("train", 160), ("val", 32)):
         ids = np.random.RandomState(count).randint(4, 32, count).astype(np.uint8)
         (directory / f"{split}.bin").write_bytes(ids.tobytes())
     (directory / "meta.json").write_text(json.dumps(
-        {"tokenizer": str(checkpoint), "vocab_size": 32, "dtype": "uint8", "eos_id": 1}))
-    spans = TokenFiles(str(directory)).pipe(presets.lm, None, seq_len=11, batch=8, pack=None).loading(
+        {"tokenizer": str(DIFFUSION_GEMMA), "vocab_size": 32, "dtype": "uint8", "eos_id": 1}))
+    return TokenFiles(str(directory)).pipe(presets.lm, None, seq_len=11, batch=8, pack=None).loading(
         Loading(workers=0))
+
+
+def test_official_block_diffusion_is_a_complete_pretrained_recipe(tmp_path):
+    from dew.interop import Pretrained
+
+    checkpoint = DIFFUSION_GEMMA
+    spans = gemma_spans(tmp_path / "tokens")
     config = LMRunConfig.cli([
         "--pretrained", str(checkpoint), "--objective", "block_diffusion", "--tokenizer", str(checkpoint),
         "--objective.prompt-length", "4", "--model.dtype", "float32", "--model.attention-impl", "xla",
@@ -583,17 +591,8 @@ def test_block_diffusion_trains_quantized_as_any_lm_recipe_does(tmp_path):
     and it moves the checkpoint other than the same step without it does."""
     from dew.quantization import Quantization
 
-    checkpoint = REPO_ROOT / "tests/fixtures/hf/diffusion-gemma-sft"
-    directory = tmp_path / "tokens"
-    directory.mkdir()
-    for split, count in (("train", 160), ("val", 32)):
-        ids = np.random.RandomState(count).randint(4, 32, count).astype(np.uint8)
-        (directory / f"{split}.bin").write_bytes(ids.tobytes())
-    (directory / "meta.json").write_text(json.dumps(
-        {"tokenizer": str(checkpoint), "vocab_size": 32, "dtype": "uint8", "eos_id": 1}))
-
-    spans = TokenFiles(str(directory)).pipe(presets.lm, None, seq_len=11, batch=8, pack=None).loading(
-        Loading(workers=0))
+    checkpoint = DIFFUSION_GEMMA
+    spans = gemma_spans(tmp_path / "tokens")
 
     def run(name, *quantized):
         return LMRunConfig.cli([

@@ -337,7 +337,7 @@ def _stated(root_url: str, descriptor: str | None) -> tuple[Mapping[str, object]
     return _descriptor(root_url, stated, descriptor)
 
 
-def _corpus(self, root_url: str, stated: Mapping[str, object], pinned: Mapping[str, object],
+def _corpus(root_url: str, stated: Mapping[str, object], pinned: Mapping[str, object],
             name: str, split: str) -> Pipeline | None:
     """Corpus `name`'s `split` from manifest `stated` (`corpus`)."""
     from dew.data.sources import Files

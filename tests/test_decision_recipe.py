@@ -8,9 +8,8 @@ from pathlib import Path
 
 import pytest
 
-from dew.config.data import Split
-from dew.data import Memory
-from dew.decision import Choice, Decide, Decisions
+from dew.data import Files, Loading, Memory
+from dew.decision import Choice, Decide, decisions
 from dew.decision.config import DecisionRunConfig
 from dew.decision.scoring import ScoringRule
 from dew.registry import from_record
@@ -29,18 +28,22 @@ def test_a_csv_fine_tunes_a_laya_checkpoint_into_a_calibrated_run(tmp_path):
         writer = csv.writer(file)
         writer.writerow(["text", "label"])
         writer.writerows(tickets)
-    # The command line `laya-train --data tickets.csv` is, with this run's sizes.
+    # The command line over a table's chain: half its rows held out by the hash of their content.
+    train, held = Files(str(table), format="csv").holdout(0.5)
+
+    def asked(rows):
+        return rows.pipe(decisions, question="team").batch(8).loading(Loading(workers=0))
+
     config = DecisionRunConfig.cli([
-        "--data.source", str(table), "--data.validation", json.dumps({"class": "dew.data.holdout:HoldOut",
-            "fields": {"fraction": 0.5, "by": "random", "most": 400}}), "--data.question", "team",
-        "--loading.workers", "0", "--pretrained", str(TINY), "--objective.loss", json.dumps(
+        "--pretrained", str(TINY), "--objective.loss", json.dumps(
             {"class": "dew.decision.scoring:Combined",
              "fields": {"terms": [[1.0, {"class": "log_loss"}], [0.5, {"class": "brier"}]]}}),
         "--trainer.name", "tickets", "--trainer.checkpoint-dir", str(tmp_path / "runs"),
-        "--trainer.batch-size", "8", "--trainer.steps", "2", "--trainer.eval-every", "2",
+        "--trainer.steps", "2", "--trainer.eval-every", "2",
         "--trainer.checkpoint-every", "2", "--trainer.log-every", "1", "--trainer.multi-host", "False",
-        "--trainer.compilation-cache-dir", "None", "--model.dtype", "float32"])
-    assert isinstance(config.data, Decisions)
+        "--trainer.compilation-cache-dir", "None", "--model.dtype", "float32"],
+        default=DecisionRunConfig(data=asked(train), validation=asked(held)))
+    assert config.data.facts()["batch"] == 8
     assert from_record(ScoringRule, config.objective.fields["loss"]).name == "log_loss+0.5*brier"
     config.run()
     run = tmp_path / "runs" / "tickets"
@@ -65,22 +68,26 @@ class _NamedSplits(Memory):
 
 
 def test_a_named_validation_split_reads_the_source_s_own_split():
-    """`Split("validation")` opens the training source's own named split through its
-    `with_split`, as every recipe opens one, and a source with no native splits refuses it."""
+    """A holdout of the store's own named split (`holdout(split="validation")`) opens it through the
+    source's `with_split`, and the decisions over it read that split's rows; a source with no native
+    splits refuses it."""
+    from dew.data.compile import iterate
+
     train = tuple({"text": f"train {index}", "label": "ab"[index % 2]} for index in range(4))
     held = tuple({"text": f"held {index}", "label": "a"} for index in range(2))
     named = _NamedSplits(train, splits={"train": train, "validation": held})
-    _, evaluated, _ = Decisions(source=named, validation=Split("validation"), question="team").pipelines()
-    assert list(evaluated.source.source.records("memory")) == list(held)
+    _, evaluated = named.holdout(split="validation")
+    rows = iterate(evaluated.pipe(decisions, options=("a", "b"), question="team"), read="memory")
+    assert [row["example"].state for row in rows] == [row["text"] for row in held]
     with pytest.raises(ValueError):
-        Decisions(source=Memory(train), validation=Split("validation"), question="team").pipelines()
+        Memory(train).holdout(split="validation")
 
 
 def test_a_tables_own_integer_labels_name_their_options_by_value():
     """A flat table whose options are its label column's own values: every
     label names the option of its value, the integers 2 and 10 included,
     rather than the option at that position. The options sort as text."""
-    from dew.config.data import loader
+    from dew.data.compile import held as held_reader
     from dew.data.dataset import DataPartition
     from dew.data.text import ByteTokenizer
     from dew.decision import Specials
@@ -96,10 +103,8 @@ def test_a_tables_own_integer_labels_name_their_options_by_value():
         tokenizer=ByteTokenizer(), specials=Specials(begin=None, separator=10, marker=0, marker_text="\x00",
                                                      pad=255),
         layout=layout, shuffle_options=False)
-    parsed, _, _ = Decisions(source=rows).pipelines()
-    data = loader(Decisions(source=rows, validation=parsed), batch=8, read="memory",
-                  objective=objective.data())
-    (batch,) = list(data.val(DataPartition()))
+    table = Memory(rows).pipe(decisions).read("memory")
+    (batch,) = list(held_reader(table.batch(8), objective=objective.data())(DataPartition()))
     scored = batch["scored"].ravel()
     labels = [int(label) for label, real in zip(batch["labels"].ravel(), scored, strict=True) if real]
     # Options ("10", "2"): the three tens are option 0 and the five twos option 1.

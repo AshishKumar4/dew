@@ -9,6 +9,7 @@ from typing import TYPE_CHECKING, Any
 import jax.numpy as jnp
 import pytest
 from affine_run import TimingRegression as Regression, batches
+from diffusion_support import images_of
 from flax import linen as nn
 
 import dew.config
@@ -18,7 +19,7 @@ from dew.data.dataset import Loader, Ramp
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.vision import GemmaProjector, SiglipVision
 from dew.objectives.diffusion import DiffusionRunConfig
-from dew.registry import Aliases, datasets, projectors, towers
+from dew.registry import Aliases, projectors, towers
 from dew.training import Checkpoints, Layout, MeshSpec
 
 
@@ -164,17 +165,16 @@ def test_the_run_length_is_steps_or_epochs():
         TrainerConfig().total_steps(sized)
 
 
-def test_the_cli_parses_the_mesh_the_layout_and_a_dataset_subcommand():
-    config = RunConfig.cli( [
+def test_the_cli_parses_the_mesh_the_layout_and_a_setting_of_the_chain():
+    config = RunConfig.cli([
         "--trainer.mesh.fsdp", "2", "--trainer.layout.min-shard", "8",
         "--trainer.steps", "5", "--model", "uvit", "--model.emb_features", "32",
-        "data:text", "--data.source", "tokens", "--data.seq-len", "8"])
+        "--set", "data.images.size=64"], default=RunConfig(data=images_of("tfds://oxford_flowers102", 32)))
     assert config.trainer.mesh == MeshSpec(fsdp=2)
     assert config.trainer.layout.min_shard == 8
     assert config.model.fields == {"emb_features": 32}
-    assert type(config.data) is datasets["text"]
-    assert config.data.seq_len == 8
-    assert RunConfig.from_dict(config.to_dict()) == config
+    assert config.data is not None and config.data.facts()["fields"]["image"] == [64, 64, 3]
+    assert RunConfig.from_dict(config.to_dict()).to_dict() == config.to_dict()
 
 
 
@@ -488,7 +488,6 @@ def test_a_learning_rate_schedule_is_a_typed_record_that_round_trips():
     groups included."""
     from dew.training.optim import ParamGroup, Power, PowerTail
     config = RunConfig(
-        data=datasets["images"](source="data/cc12m", image_size=64),
         trainer=TrainerConfig(steps=1),
         optim=OptimConfig(schedule=Power(peak=0.01, warmup_steps=5, a=4.0, c=16.0,
                                          tail=PowerTail(start=8)),
@@ -503,7 +502,6 @@ def test_param_groups_with_schedules_momentum_and_bounds_round_trip():
     from dew.training.optim import Cosine, Exponential, OneCycle, ParamGroup
     momentum = OneCycle(peak=0.85, init=0.95, end=0.95, every=40)
     config = RunConfig(
-        data=datasets["images"](source="data/cc12m", image_size=64),
         trainer=TrainerConfig(steps=1),
         optim=OptimConfig(
             optimizer="adam", schedule=Exponential(init=1e-3, end=1e-5, decay_steps=8, offset=1e-6),
