@@ -141,6 +141,8 @@ class Mixture:
     mesh axis that divides the expert count. `hash_layers` route by DeepSeek
     V4's token table, `latent_features` gives Kimi K3's latent MoE, and
     `media_bias` is DeepSeek-V4.1's image-span bias (`SparseMLP`, `Router`).
+    `bias_in_weights` gates on the balancing bias as LLaDA-MoE does, and
+    `routing_block` with `block_experts` is LLaDA2.2's block routing.
     """
 
     experts: int
@@ -153,6 +155,9 @@ class Mixture:
     groups_per_token: int = 1
     group_score: str = 'top2'
     bias: bool = False
+    bias_in_weights: bool = False
+    routing_block: int | None = None
+    block_experts: int | None = None
     scale_inputs: bool = False
     parallel: bool = False
     expert_features: int | None = None
@@ -171,10 +176,10 @@ class Mixture:
             object.__setattr__(self, "layers", tuple(self.layers))
         if self.hash_layers is not None:
             object.__setattr__(self, "hash_layers", tuple(int(index) for index in self.hash_layers))
-            if self.groups != 1 or self.parallel:
+            if self.groups != 1 or self.parallel or self.routing_block is not None:
                 raise ValueError(
                     "hash routing selects by the token table alone, so it has no "
-                    "expert groups and is not Gemma 4's parallel branch")
+                    "expert groups, no routing blocks and is not Gemma 4's parallel branch")
         if self.experts < 1:
             raise ValueError(
                 f"a mixture needs experts to route to, got {self.experts}; a "
@@ -201,13 +206,19 @@ class Mixture:
             raise ValueError(
                 f"capacity_factor scales each expert's share of a sequence, so it is "
                 f"positive, got {self.capacity_factor}; None keeps every slot")
+        if self.bias_in_weights and not self.bias:
+            raise ValueError("bias_in_weights gates on the balancing bias, which bias holds")
+        if (self.routing_block is None) != (self.block_experts is None):
+            raise ValueError("block routing names its block of tokens and the experts a block may use, "
+                             f"got routing_block={self.routing_block} and block_experts={self.block_experts}")
         if self.parallel and (
                 self.score_function != 'softmax' or not self.norm_topk_prob
                 or self.scaling != 1.0 or self.groups != 1 or self.bias
+                or self.bias_in_weights or self.routing_block is not None
                 or self.scale_inputs or self.shared_features or self.latent_features is not None):
             raise ValueError(
                 "a parallel mixture routes with Gemma 4's router, which has no "
-                "score function, scaling, groups, balancing bias, input scaling "
+                "score function, scaling, groups, balancing bias, routing blocks, input scaling "
                 "or shared branch to set")
 
     @property
@@ -248,7 +259,8 @@ class Mixture:
             # GPT OSS's experts and router are its own: a knob they do not read is refused.
             plain = Mixture(experts=self.experts, top_k=self.top_k)
             ignored = [name for name in ('score_function', 'norm_topk_prob', 'scaling', 'groups',
-                                         'groups_per_token', 'group_score', 'bias', 'scale_inputs',
+                                         'groups_per_token', 'group_score', 'bias', 'bias_in_weights',
+                                         'routing_block', 'block_experts', 'scale_inputs',
                                          'parallel', 'expert_features', 'shared_features', 'hash_layers',
                                          'latent_features', 'latent_norm', 'media_bias')
                        if getattr(self, name) != getattr(plain, name)]
@@ -276,7 +288,9 @@ class Mixture:
             score_function=self.score_function, normalize_weights=self.norm_topk_prob,
             routed_scaling_factor=self.scaling, expert_groups=self.groups,
             groups_per_token=self.groups_per_token,
-            group_score=self.group_score, expert_bias=self.bias, media_bias=self.media_bias,
+            group_score=self.group_score, expert_bias=self.bias, bias_in_weights=self.bias_in_weights,
+            media_bias=self.media_bias, routing_block=self.routing_block,
+            block_experts=self.block_experts,
             scale_inputs=self.scale_inputs, swiglu_limit=swiglu_limit,
             shared=None if not self.shared_features else functools.partial(
                 dense, hidden_features=self.shared_features),

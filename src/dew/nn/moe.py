@@ -195,6 +195,8 @@ class Router(nn.Module):
     token uses and not what they contribute, and no gradient reaches it.
     `load_balance_update` computes its update and the step that applies it owns
     the write (MaxText `layers/moe.py:965-972` hands it back the same way).
+    `bias_in_weights` is LLaDA-MoE's reading of the same buffer: the biased
+    scores are also the weights (modeling_lladamoe.py, LLaDAMoESparseMoeBlock).
 
     `expert_groups` above one is DeepSeek's node limit: a token chooses inside
     the best `groups_per_token` groups, scored by `group_score`, 'top2' (V3's
@@ -207,6 +209,13 @@ class Router(nn.Module):
     token id the caller passes, weighted by the learned gate. `media_bias` is
     DeepSeek-V4.1's second bias, selecting for image-span tokens in place of
     `expert_bias` (`bias_vl`, model.py:807-820), given the `media` mask.
+
+    `routing_block` with `block_experts` is LLaDA2.2's block routing
+    (modeling_llada2_moe.py, LLaDA2MoeGate.block_routing): the tokens in
+    row-major order fall into blocks of `routing_block`, a block's score for
+    an expert is its best token's, and each token chooses among the block's
+    `block_experts` best. A trailing partial block routes by its own tokens,
+    where the reference asserts a whole one.
     """
     num_experts: int
     in_features: int
@@ -218,7 +227,10 @@ class Router(nn.Module):
     groups_per_token: int = 1
     group_score: str = 'top2'
     expert_bias: bool = False
+    bias_in_weights: bool = False
     media_bias: bool = False
+    routing_block: int | None = None
+    block_experts: int | None = None
     hash_vocab: int | None = None
     init_std: float | None = None  # normal std of the kernel; None: lecun normal
     precision: PrecisionLike = None
@@ -257,6 +269,21 @@ class Router(nn.Module):
                     f"{self.groups_per_token} of {self.expert_groups} groups hold "
                     f"{self.groups_per_token * per_group} experts, fewer than the "
                     f"top_k of {self.top_k}")
+        if self.bias_in_weights and not self.expert_bias:
+            raise ValueError("bias_in_weights gates on the balancing bias, which expert_bias holds")
+        if (self.routing_block is None) != (self.block_experts is None):
+            raise ValueError("block routing names its block of tokens and the experts a block may use, "
+                             f"got routing_block={self.routing_block} and block_experts={self.block_experts}")
+        if self.routing_block is not None:
+            if self.routing_block < 1:
+                raise ValueError(f"routing_block counts a block's tokens, got {self.routing_block}")
+            if self.block_experts is None or not self.top_k <= self.block_experts <= self.num_experts:
+                raise ValueError(
+                    f"block_experts must hold the top_k of {self.top_k} and at most the "
+                    f"{self.num_experts} experts, got {self.block_experts}")
+            if self.expert_groups > 1 or self.hash_vocab is not None:
+                raise ValueError("block routing limits a token to its block's experts, so it has no "
+                                 "expert groups and no hash table")
         # The kernel is the router's own parameter, not a nested Dense, so
         # the leaf is `gate/kernel` where a Hugging Face sparse layer keeps
         # `gate.weight`.
@@ -270,10 +297,10 @@ class Router(nn.Module):
         if self.media_bias:
             self.bias_vl = self.variable('moe', 'media_bias', jnp.zeros, (self.num_experts,), jnp.float32)
         if self.hash_vocab is not None:
-            if self.expert_bias or self.expert_groups > 1:
+            if self.expert_bias or self.expert_groups > 1 or self.routing_block is not None:
                 raise ValueError(
                     "hash routing selects by the token table alone, so it has no "
-                    "balancing bias and no expert groups")
+                    "balancing bias, no expert groups and no routing blocks")
             self.tid2eid = self.variable(
                 'moe', 'tid2eid', jnp.zeros, (self.hash_vocab, self.top_k), jnp.int32)
 
@@ -291,10 +318,11 @@ class Router(nn.Module):
             self.sow('router', 'scores', scores)
             # The router z-loss squares each position's log partition.
             self.sow('router', 'log_z', jax.nn.logsumexp(logits, axis=-1))
-        if self.normalize_weights and self.score_function == 'softmax':
+        if self.normalize_weights and self.score_function == 'softmax' and not self.bias_in_weights:
             weights = renormalized_softmax(logits, indices)
         else:
-            weights = jnp.take_along_axis(scores, indices, axis=-1)
+            gating = scores + self.bias.value if self.bias_in_weights else scores
+            weights = jnp.take_along_axis(gating, indices, axis=-1)
             if self.normalize_weights:
                 weights = weights / (jnp.sum(weights, axis=-1, keepdims=True) + WEIGHT_SUM_EPSILON)
         return weights * self.routed_scaling_factor, indices
@@ -310,6 +338,9 @@ class Router(nn.Module):
         selection = scores if not self.expert_bias else scores + self.bias.value
         if media is not None:
             selection = jnp.where(media[..., None], scores + self.bias_vl.value, selection)
+        if self.routing_block is not None and self.block_experts is not None:
+            selection = jnp.where(self.block_mask(selection, self.routing_block, self.block_experts),
+                                   selection, -jnp.inf)
         if self.expert_groups > 1:
             selection = jnp.where(self.group_mask(selection), selection, -jnp.inf)
         _, indices = jax.lax.top_k(selection, self.top_k)
@@ -347,6 +378,23 @@ class Router(nn.Module):
         kept = jnp.sum(
             jax.nn.one_hot(groups, self.expert_groups, dtype=jnp.int32), axis=-2)
         return jnp.repeat(kept > 0, per_group, axis=-1)
+
+    def block_mask(self, selection, block: int, experts: int):
+        """True where an expert is among its token's block's best (`routing_block`).
+
+        The tokens flatten in row-major order, as the reference's
+        `view(-1, hidden)` leaves them; a short last block is padded with
+        rows that score nothing, so it routes by its own tokens alone.
+        """
+        flat = selection.reshape(-1, self.num_experts)
+        tokens = flat.shape[0]
+        blocks = (tokens + block - 1) // block
+        padded = jnp.pad(flat, ((0, blocks * block - tokens), (0, 0)),
+                         constant_values=-jnp.inf)
+        best = jnp.max(padded.reshape(blocks, block, self.num_experts), axis=1)
+        _, allowed = jax.lax.top_k(best, experts)
+        kept = jnp.sum(jax.nn.one_hot(allowed, self.num_experts, dtype=jnp.int32), axis=-2)
+        return jnp.repeat(kept > 0, block, axis=0)[:tokens].reshape(selection.shape)
 
 
 def grouped_matmul_kernel(implementation: str, compute: Dtype, operands: tuple[Dtype, ...],
@@ -993,7 +1041,10 @@ class SparseMLP(nn.Module):
     groups_per_token: int = 1
     group_score: str = 'top2'
     expert_bias: bool = False
+    bias_in_weights: bool = False
     media_bias: bool = False
+    routing_block: int | None = None
+    block_experts: int | None = None
     hash_vocab: int | None = None
     swiglu_limit: float | None = None
     scale_inputs: bool = False
@@ -1039,7 +1090,10 @@ class SparseMLP(nn.Module):
                            groups_per_token=self.groups_per_token,
                            group_score=self.group_score,
                            expert_bias=self.expert_bias,
+                           bias_in_weights=self.bias_in_weights,
                            media_bias=self.media_bias,
+                           routing_block=self.routing_block,
+                           block_experts=self.block_experts,
                            hash_vocab=self.hash_vocab, init_std=self.init_std,
                            precision=self.precision, name='gate')
         width = self.out_features if self.latent_features is None else self.latent_features

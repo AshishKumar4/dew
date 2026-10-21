@@ -42,6 +42,7 @@ from dew.nn.inputs import (
     coordinates,
     local_rows,
     mesh_of,
+    prompt_major,
     real_slots,
 )
 from dew.nn.kernels.options import compiler_options
@@ -259,10 +260,16 @@ class Unmask:
         alpha_t = process.schedule.alpha(t)
         alpha_s = process.schedule.alpha(t_next)
         reveal_chance = (alpha_s - alpha_t) / (1 - alpha_t)
-        reveal_key, token_key = jax.random.split(key)
         masked = denoise.masked(x)
-        reveal = jax.random.uniform(reveal_key, x.shape) < reveal_chance[:, None]
-        drawn = jax.random.categorical(token_key, log_probs, axis=-1)
+        if jax.random.key_data(key).ndim == 1:
+            reveal_key, token_key = jax.random.split(key)
+            reveal = jax.random.uniform(reveal_key, x.shape)
+            drawn = jax.random.categorical(token_key, log_probs, axis=-1)
+        else:
+            split = jax.vmap(jax.random.split)(key)
+            reveal = jax.vmap(lambda row_key: jax.random.uniform(row_key, x.shape[1:]))(split[:, 0])
+            drawn = jax.vmap(jax.random.categorical)(split[:, 1], log_probs)
+        reveal = reveal < reveal_chance[:, None]
         return jnp.where(masked & reveal, drawn, x), state
 
 
@@ -354,9 +361,10 @@ def _generate(model: nn.Module, variables: Variables, inputs: ModelInputs, keys:
               eos_ids: tuple[int, ...], pad_id: int) -> CanvasGeneration:
     """The compiled body: one masked walk per row, `n` continuations each.
 
-    Each row is sampled on its own so the response span is the only mutable
-    part of it. A continuation keeps the tokens up to its first EOS, pads the
-    rest, and reports the steps it took.
+    One model call denoises the batch at each step; only the random draws
+    map over row keys. Mapping the whole model would batch its kernels too,
+    which ragged_dot cannot do with an unmapped expert matrix. A continuation
+    keeps tokens up to its first EOS and reports the steps it took.
     """
     from dew.sampling.sample import sample
 
@@ -366,20 +374,18 @@ def _generate(model: nn.Module, variables: Variables, inputs: ModelInputs, keys:
         return CanvasGeneration(jnp.repeat(inputs.tokens, n, axis=0), zeros, zeros.astype(bool), zeros)
     full, mutable = _response_inputs(inputs, budget, process.mask_id)
 
-    def row(prepared, changeable, key):
-        prepared = jax.tree.map(lambda leaf: leaf[None], prepared)
-        denoise = process.denoiser(model, variables, inputs=prepared, mutable_mask=changeable[None])
-        def continued(draw_key):
-            tokens = sample(denoise, prepared.tokens, steps, solver=solver, key=draw_key)[0]
-            active = jnp.any(changeable)
-            response, length, ended = through_eos(tokens[prompt:], jnp.where(active, budget, 0),
-                                                  eos_ids, pad_id)
-            return CanvasGeneration(jnp.concatenate([tokens[:prompt], response]), length,
-                                    ended, jnp.where(active, steps, 0))
-        return jax.lax.map(continued, continuation_keys(key, n))
+    denoise = process.denoiser(model, variables, inputs=full, mutable_mask=mutable)
 
-    generated = jax.vmap(row)(full, mutable, keys)
-    return jax.tree.map(lambda leaf: leaf.reshape((batch * n, *leaf.shape[2:])), generated)
+    def continued(draw_keys):
+        tokens = sample(denoise, full.tokens, steps, solver=solver, key=draw_keys)
+        active = jnp.any(mutable, axis=-1)
+        response, length, ended = jax.vmap(
+            lambda row, count: through_eos(row, count, eos_ids, pad_id))(
+                tokens[:, prompt:], jnp.where(active, budget, 0))
+        return CanvasGeneration(jnp.concatenate([tokens[:, :prompt], response], axis=-1), length,
+                                ended, jnp.where(active, steps, 0))
+
+    return prompt_major(jax.lax.map(continued, continuation_keys(keys, n)))
 
 
 @functools.cache

@@ -13,6 +13,7 @@ from dew.interop.decoder_parts import (
     base_config,
     decoder_tensors,
     dew_path,
+    qkv_widths,
     refuse,
     rope_records,
 )
@@ -88,16 +89,9 @@ def _phi3_config(hf: Mapping[str, object], used: set[str]) -> DecoderFields:
     return config
 
 
-def _qkv_widths(config: Mapping[str, object]) -> tuple[int, ...]:
-    head_dim = records.integer(config['head_dim'], 'head_dim')
-    query = records.integer(config['num_heads'], 'num_heads') * head_dim
-    kv = records.integer(config['num_kv_heads'], 'num_kv_heads') * head_dim
-    return query, kv, kv
-
-
 _PHI3_PACKED = (
     Packed('.self_attn.qkv_proj.weight', tuple(f'.self_attn.{part}.weight'
-           for part in ('q_proj', 'k_proj', 'v_proj')), 0, widths=_qkv_widths),
+           for part in ('q_proj', 'k_proj', 'v_proj')), 0, widths=qkv_widths),
     Packed('.mlp.gate_up_proj.weight', ('.mlp.gate_proj.weight', '.mlp.up_proj.weight'), 0))
 
 

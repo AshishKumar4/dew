@@ -36,6 +36,10 @@ from dew.nn.text_encoders import check_tree
 # checkpoint would allocate one of those whether the caller asked or not.
 DEFAULT_MAX_SEQ_LEN = 8192
 
+MASKED_MODEL_TYPES = frozenset({
+    'llada', 'llada_moe_v2', 'llada2_moe', 'dream', 'Dream', 'diffusion_gemma_text'})
+"""Bidirectional diffusion decoders, never an unknown causal LM's loading convention."""
+
 # hidden_act / hidden_activation values, onto the GatedMLP activations. These
 # are the three the covered families use; anything else raises a ValueError
 # naming the value.
@@ -812,7 +816,7 @@ def translate_family_config(hf_config: Mapping[str, object],
     # decoder), so their own translators own the direction and this check
     # leaves them alone.
     bidirectional = hf_config.get('use_bidirectional_attention', False)
-    if (model_type not in ('llada', 'dream', 'Dream', 'diffusion_gemma_text')
+    if (model_type not in MASKED_MODEL_TYPES
             and bidirectional and bidirectional != 'vision'):
         refuse(f"use_bidirectional_attention={bidirectional!r}", "the backbone is causal")
     used = {'model_type', 'use_bidirectional_attention', 'num_hidden_layers'}
@@ -1235,11 +1239,24 @@ def decoder_tensors(family: "DecoderFamily", model: CausalTransformer, variables
     tree = variables if 'params' in variables else {'params': params}
     leaves: dict[tuple[str, ...], object] = {
         ('params', *path): value for path, value in flatten_dict(dict(params)).items()}
+    state = tree.get('moe')
+    if isinstance(state, Mapping):
+        leaves.update({('moe', *path): value for path, value in flatten_dict(dict(state)).items()})
     constants = tree.get('constants')
     if model.layer_scalar == 'frozen' and isinstance(constants, Mapping):
         leaves.update({('params', *path): value for path, value in flatten_dict(dict(constants)).items()
                        if path[-1] == 'layer_scalar'})
-    layouts = leaf_layouts(leaves, lambda path: family.tensor_name('.'.join(path[1:]), config))
+    def names(path: tuple[str, ...]) -> str | tuple[str, ...] | None:
+        if (len(path) == 6 and path[2:4] == ('mlp', 'experts') and path[-1] == 'kernel'
+                and model.mixture is not None):
+            named = tuple(family.tensor_name('.'.join((*path[1:4], str(expert), *path[4:])), config)
+                          for expert in range(model.mixture.experts))
+            if any(name is None for name in named):
+                raise ValueError(f'{path} has no tensor name for each expert')
+            return tuple(name for name in named if name is not None)
+        return family.tensor_name('.'.join(path[1:]), config)
+
+    layouts = leaf_layouts(leaves, names)
     # A packed tensor's geometry is the model's, read as a translated config spells it.
     geometry = {'num_heads': model.num_heads, 'num_kv_heads': model.kv_heads,
                 'head_dim': model.features_per_head, 'value_head_dim': model.value_head_dim}
@@ -1332,6 +1349,14 @@ def hf_tensor_name(dew_name: str, config: Mapping[str, object], *,
     if parts[0].startswith('layers_'):
         index = parts[0].removeprefix('layers_')
         module, leaf = parts[1], parts[-1]
+        if (module == 'mlp' and len(parts) == 6 and parts[2] == 'experts' and parts[3].isdigit()
+                and parts[4] in MOE_SHARED and leaf == 'kernel'):
+            return f'model.layers.{index}.mlp.experts.{parts[3]}.{parts[4]}.weight'
+        if (module == 'mlp' and len(parts) == 5 and parts[2] == 'shared_experts'
+                and parts[3] in MOE_SHARED and leaf == 'kernel'):
+            return f'model.layers.{index}.mlp.shared_experts.{parts[3]}.weight'
+        if module == 'mlp' and len(parts) == 4 and parts[2] == 'gate' and leaf in _MOE_STATE:
+            return f'model.layers.{index}.mlp.gate.{leaf}'
         if len(parts) == 3 and _PER_LAYER_INPUTS.get(module) == leaf:
             return f'model.layers.{index}.{module}.weight'
         if len(parts) == 4 and module in _PROJECTIONS:
@@ -1510,6 +1535,16 @@ def joined_packed(tensors: Mapping[str, np.ndarray], packed: Sequence[Packed]) -
 _QKV = ('q_proj', 'k_proj', 'v_proj')
 
 
+def qkv_widths(config: Mapping[str, object]) -> tuple[int, int, int]:
+    """The contiguous query, key and value row counts of a fused projection."""
+    head_dim = records.integer(config['head_dim'], 'head_dim')
+    query = records.integer(config['num_heads'], 'num_heads') * head_dim
+    key = records.integer(config['num_kv_heads'], 'num_kv_heads') * head_dim
+    value = records.integer(config['num_kv_heads'], 'num_kv_heads') * records.integer(
+        config.get('value_head_dim') or head_dim, 'value_head_dim')
+    return query, key, value
+
+
 def _key_runs(config: Mapping[str, object]) -> int:
     """A grouped qkv's runs: one a key head."""
     return records.integer(config['num_kv_heads'], 'num_kv_heads')
@@ -1612,6 +1647,10 @@ class DecoderFamily:
     omits them, which the shared readers would otherwise default for every
     family alike: Gemma's GELU, Gemma 2's caps and query scalar, OLMo 3's
     norm epsilon. Rope bases are the class's `RopeSpelling`."""
+    export_nulls: tuple[str, ...] = ()
+    """Config fields whose explicit null disables a component. Other null export fields remove
+    a generic field the family does not read; these survive as JSON null instead of taking the
+    source config class's default."""
 
     def readings(self, tensors: Mapping[str, np.ndarray],
                  config: Mapping[str, object]) -> tuple[Reading, ...]:

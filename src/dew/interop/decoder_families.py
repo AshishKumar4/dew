@@ -26,7 +26,7 @@ from dew.interop.families.kimi import KIMI_K3, KIMI_LINEAR
 from dew.interop.families.llama import GRANITEMOE, MISTRAL, MIXTRAL, llama_config, ministral_config
 from dew.interop.families.llama4 import LLAMA4_TEXT
 from dew.interop.families.mamba import MAMBA
-from dew.interop.families.masked_diffusion import DIFFUSION_GEMMA_TEXT, DREAM, LLADA
+from dew.interop.families.masked_diffusion import DIFFUSION_GEMMA_TEXT, DREAM, LLADA, LLADA2_MOE, LLADA_MOE_V2
 from dew.interop.families.mimo import MIMO_V2, MIMO_V2_FLASH
 from dew.interop.families.modernbert import MODERNBERT
 from dew.interop.families.muse import MUSE_GLIMMER_TEXT
@@ -70,6 +70,8 @@ ENTRIES = (
     GLM5_NEXT_TEXT,
     DIFFUSION_GEMMA_TEXT,
     DREAM,
+    LLADA2_MOE,
+    LLADA_MOE_V2,
     LLADA,
     GPT_OSS,
     LLAMA4_TEXT,
