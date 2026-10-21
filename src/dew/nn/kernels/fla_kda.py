@@ -69,7 +69,7 @@ def _intra_rows_kernel(chunk_ref, q_ref, k_ref, g_ref, beta_ref, aqk_ref, akk_re
     `safe_gate=False` path) takes the diagonal 16-token blocks so, and factors every block below them
     through its sub-chunk's first row (`(q exp2(g_i - g_n)) (k exp2(g_n - g_j))`, chunk_intra.py:43-391):
     two exponentials rounded and one more product a term, against one exponential here (Dew's portable
-    math's, `dew.nn.kernels.recurrence_chunk.chunk_decay`'s). This port's earlier factored blocks,
+    math's, `dew.nn.kernels.recurrence_algebra.chunk_decay`'s). This port's earlier factored blocks,
     which moved decayed keys from sub-chunk to sub-chunk where fla recomputes each factor, put 11 of a
     packed row's 16384 scores and 5 of its inverse's past twice the pairwise form's distance from
     float64; fla's own factored form was

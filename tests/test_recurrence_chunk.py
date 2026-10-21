@@ -12,7 +12,7 @@ import numpy as np
 import pytest
 from reference_error import assert_as_exact
 
-from dew.nn.kernels import recurrence
+from dew.nn.kernels import recurrence, recurrence_algebra as algebra
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk
 
 ROWS, LENGTH, KEY_HEADS, VALUE_HEADS, KEY_WIDTH, VALUE_WIDTH = 2, 70, 1, 2, 16, 8
@@ -49,6 +49,9 @@ FORMED = [
 clipped with the skip, the gated RMS norm after the l2 norm and after a plain scale, Mamba2's SSD as
 `chunk_ssd` hands it over (a rated decay, the step its write gate), with its gated norm, a rated decay
 under the delta rule and the l2 norm, the norm after the skip, and a decay without any write gate."""
+
+COMPOSED_SEEDS = {}
+"""The composed-chunks sites' declared seeds, sized by `seeds_for` on armada."""
 
 PACKED = (False, True)
 """A row of one sequence, and of packed documents."""
@@ -236,3 +239,56 @@ def test_the_operands_are_checked_as_the_decode_steps():
     with pytest.raises(ValueError):
         chunk(recurrence.Hooks(decay='vector'), Chunk(ones, ones, ones, log_decay=jnp.zeros((1, 4, 1)),
                                                       beta=jnp.ones((1, 4, 1))))
+
+
+def chunk_transitions(operands: Chunk, delta: bool):
+    """Each chunk's `carry` operands from a sequence's (no documents, one decay a key dimension or a head):
+    the keys, `W`, `U`, `gc`, the decay's last row and `kept`, `[B, H, NC, ...]`, in at least fp32."""
+    key, value = (x.astype(jnp.float32) for x in (operands.key, operands.value))
+    group = value.shape[2] // key.shape[2]
+    key = jnp.repeat(key, group, axis=2)
+    g = operands.log_decay.astype(jnp.float32)
+    g = g if g.ndim == 4 else g[..., None]
+    beta = operands.beta.astype(jnp.float32)
+    batch, length, heads = key.shape[:3]
+
+    def chunks(x):
+        moved = jnp.moveaxis(x, 2, 1)
+        return moved.reshape(batch, heads, length // CHUNK, CHUNK, *moved.shape[3:])
+
+    k_c = chunks(key)
+    kb_c, vb_c = chunks(key * beta[..., None]), chunks(value * beta[..., None])
+    gc, pairs = algebra.decays(chunks(g))
+    entering = jnp.exp(gc)
+    inverse = algebra.factor(algebra.intra(k_c, kb_c, pairs)) if delta else None
+    w, u = algebra.apply(inverse, kb_c, vb_c, entering)
+    return k_c, w, u, gc, pairs[..., -1, :, :], jnp.ones_like(gc[..., :1, :1])
+
+
+@pytest.mark.parametrize('hooks', [HOOKS[4], HOOKS[8], HOOKS[6]], ids=str)
+def test_composed_chunks_carry_the_memory_as_the_chunks_do_in_turn(hooks):
+    """`compose` over the chunks' transitions (`transition`), as an associative scan runs it, leaves the
+    memory the chunks leave carried one after another (`carry`), on par from float64 over the site's
+    draws: the scalar decay with the delta rule, the vector decay with it, and the scalar without."""
+    def final(operands, *, composed: bool):
+        step = chunk_transitions(operands, hooks.delta)
+        state = operands.state.astype(jnp.float32)
+        if composed:
+            transitions = algebra.transition(*step)
+            t, w = jax.lax.associative_scan(algebra.compose, transitions, axis=2)
+            return jnp.einsum('bhkj,bhjv->bhkv', t[:, :, -1], state) + w[:, :, -1]
+        moved = tuple(jnp.moveaxis(x, 2, 0) for x in step)
+        return jax.lax.scan(algebra.carry, state, moved)[0]
+
+    def draw_whole(seed):
+        """A draw's sequence cut to whole chunks, its memory entering kept."""
+        operands = draw(hooks, packed=False, seed=seed)[0]
+        cut = (LENGTH // CHUNK) * CHUNK
+        names = ('query', 'key', 'value', 'log_decay', 'beta')
+        tokens = {name: getattr(operands, name)[:, :cut] for name in names
+                  if getattr(operands, name) is not None}
+        return (Chunk(**tokens, state=operands.state),)
+
+    assert_as_exact(jax.jit(functools.partial(final, composed=True)),
+                    jax.jit(functools.partial(final, composed=False)), draw_whole,
+                    f'{hooks} composed', seeds=COMPOSED_SEEDS[hooks])

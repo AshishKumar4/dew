@@ -17,7 +17,7 @@ import numpy as np
 import pytest
 from reference_error import float64_terms, widened
 
-from dew.nn.kernels import fla_gdn, recurrence_chunk
+from dew.nn.kernels import fla_gdn, recurrence_algebra, recurrence_chunk
 
 CHUNKED = 64
 """The terms a chunk sums in another order than the portable math: a port's fp32 floor over the
@@ -174,7 +174,7 @@ def fla_decay_parts(q, k, v, g, beta, h0, do, dht, starts=None, chunk: int = CHU
     decay = jnp.where(lower[..., None], jnp.exp(gc[..., :, None, :] - gc[..., None, :, :]), 0.0)
     akk = jnp.where(strict, jnp.einsum('...sd,...td,...std->...st', k * beta, k, decay), 0.0)
     aqk = jnp.einsum('...sd,...td,...std->...st', q, k, decay)
-    inverse = recurrence_chunk.strictly_lower_inverse(-akk)
+    inverse = recurrence_algebra.strictly_lower_inverse(-akk)
     w, u = inverse @ (k * beta * gated), inverse @ (v * beta)
     last_decay = jnp.exp(last - gc)
     leaving = k * last_decay
