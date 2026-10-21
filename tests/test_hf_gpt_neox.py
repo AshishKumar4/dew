@@ -17,14 +17,21 @@ DIRECTORY = Path(__file__).parent / 'fixtures' / 'hf' / 'gpt-neox-tiny'
 
 
 def test_gpt_neox_logits_and_cached_greedy_generation_match_transformers():
-    """Dew's logits as exact as transformers' fp32 eager run, both from its float64 one, over the
-    recorded seeds' token grids (tools/gpt_neox_reference.py recording); its cached greedy generation
-    the reference's token for token; and the sequential residual another computation."""
+    """Dew's logits as exact as transformers' fp32 eager run, both from float64, over the recorded
+    seeds' token grids (tools/gpt_neox_reference.py recording): the truth Dew's model run in float64,
+    held at every seed to the recorded transformers truth's sketch; its cached greedy generation the
+    reference's token for token; and the sequential residual another computation."""
     loaded = Pretrained.load(DIRECTORY, dtype='float32', attention_impl='reference')
     stored = recording(DIRECTORY / 'recorded_logits.npz')
     seeds = declared_seeds(DIRECTORY / 'recorded_logits.npz')['logits']
     vocab = json.loads((DIRECTORY / 'config.json').read_text())['vocab_size']
-    draw, reference, truth = indexed_recording(stored, 'logits', seeds,
+    wide_model = loaded.model.clone(dtype=jnp.float64, attention_impl='reference')
+
+    def wide(inputs):
+        variables = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64), loaded.variables)
+        return {'logits': wide_model.apply(variables, jnp.asarray(inputs['input_ids']))}
+
+    draw, reference, truth = indexed_recording(stored, 'logits', seeds, truth_fn=wide,
                                                inputs_of=lambda seed: drawn_ids(vocab, seed))
     forward = jax.jit(lambda inputs: {'logits': loaded.model.apply(loaded.variables, inputs['input_ids'])})
     assert_as_exact(lambda index, inputs: forward(inputs), reference, draw, 'gpt-neox logits', seeds=seeds,
