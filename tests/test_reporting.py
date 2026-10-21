@@ -267,6 +267,22 @@ def test_the_panel_shows_the_metrics_its_last_interval_reported():
         ("loss", [2.0, 1.5, 1.0]), ("source/a/reward", [1.0, 0.5])]
 
 
+def test_the_panel_names_a_lower_bound_utilization_and_its_uncounted_kernels_within_its_name_column():
+    """A step some of whose launches' work XLA's cost analysis cannot count reports its utilizations
+    as lower bounds beside how many launches went uncounted: the panel shows them as `hfu ≥` and
+    `hlo_flops_util ≥` and the count as `uncounted kernels`, each whole within the name column, where
+    the metrics' own names would be cut."""
+    from dew.training.display import TrainingDisplay
+
+    display = TrainingDisplay(total=10)
+    display.interval(1, {"train/loss": 2.0, "train/hfu_lower_bound": 0.41,
+                         "train/hlo_flops_util_lower_bound": 0.38, "train/unsized_kernels": 50.0})
+    names = {row.name: group for group, row in display.rows()}
+    assert names == {"loss": "train", "hfu ≥": "throughput", "hlo_flops_util ≥": "throughput",
+                     "uncounted kernels": "throughput"}
+    assert all(len(name) + 2 <= 24 for name in names)
+
+
 def test_the_panel_shows_a_runs_data_as_one_line_and_its_rows_without_the_counters():
     """A run's data counters (`data/...`) reach the panel as one line, not as a row each: each
     label's rows as its reader counted them, named only where there is more than one label, the
