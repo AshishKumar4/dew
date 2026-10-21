@@ -12,7 +12,7 @@ export const liveEnabled = Boolean(ENDPOINT && SITEKEY);
 
 export type Output =
 	| { type: 'stream'; name: 'stdout' | 'stderr'; text: string }
-	| { type: 'display'; text?: string; png?: string }
+	| { type: 'display'; text?: string; png?: string; display?: string; update?: boolean }
 	| { type: 'error'; ename: string; evalue: string; traceback: string[] }
 	| { type: 'clear' };
 
@@ -192,17 +192,33 @@ export function renderOutput(into: HTMLElement, output: Output): void {
 		return;
 	}
 	if (output.type === 'display') {
+		let shown: HTMLElement;
 		if (output.png) {
 			const image = document.createElement('img');
 			image.src = `data:image/png;base64,${output.png}`;
 			image.alt = output.text ?? '';
-			into.append(image);
+			shown = image;
 		} else if (output.text) {
 			const pre = document.createElement('pre');
 			pre.className = 'nb-result';
 			pre.textContent = output.text;
-			into.append(pre);
+			shown = pre;
+		} else {
+			return;
 		}
+		// A display under an id is one output that its updates replace, as Jupyter shows IPython's display
+		// handle; an update to an id nothing shows shows nothing.
+		if (output.display === undefined) {
+			into.append(shown);
+			return;
+		}
+		shown.dataset.display = output.display;
+		if (!output.update) {
+			into.append(shown);
+			return;
+		}
+		const showing = [...into.children].filter((child) => child instanceof HTMLElement && child.dataset.display === output.display);
+		showing.forEach((child, index) => child.replaceWith(index === 0 ? shown : shown.cloneNode(true)));
 		return;
 	}
 	const pre = document.createElement('pre');

@@ -79,7 +79,9 @@ class Context:
                 "content": {"code": code, "silent": False, "store_history": False,
                             "user_expressions": {}, "allow_stdin": False, "stop_on_error": True},
             }))
-            reply, idle, size = None, False, 0
+            # What the cell has shown: every output, but a display updated in place by its id only as its
+            # latest frame, as the page shows it (kernel_outputs).
+            reply, idle, size, displays = None, False, 0, {}
             while reply is None or not idle:
                 try:
                     message = json.loads(await asyncio.wait_for(self.channels.recv(), timeout=95))
@@ -99,8 +101,11 @@ class Context:
                     idle = True
                 else:
                     for output in outputs_of(kind, content):
-                        size += len(json.dumps(output))
-                        if size > MAX_OUTPUT:
+                        if "display" in output:
+                            displays[output["display"]] = len(json.dumps(output))
+                        else:
+                            size += len(json.dumps(output))
+                        if size + sum(displays.values()) > MAX_OUTPUT:
                             raise ValueError("this cell printed more than the live output allowance")
                         await send(output)
             self.last_used = time.monotonic()
