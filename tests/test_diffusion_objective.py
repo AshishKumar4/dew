@@ -468,65 +468,26 @@ def test_an_accumulated_update_of_a_diffusion_objective_is_its_batch_whole_on_on
     assert_as_exact(pooled, alone, draw, "pooled update", seeds=POOLED_SEEDS, truth_fn=truth)
 
 
-HOST_SEEDS = 8
-"""Check 1's declared seeds for a host-master step against a resident one (`host_master_site`), sized
-by `seeds_for` (2026-10-21, on armada)."""
-
-
-def host_master_site():
-    """Check 1's arms for one SGD step over drawn images: a trainer whose variables live on the host,
-    one whose variables the devices hold, and the float64 twin's update at the step's draws
-    (`example_fields`) the truth."""
-    import copy
-
-    import optax
-    from reference_error import widened
-
-    from dew.training import Layout, Trainer
-    from dew.training.transaction import example_fields
-
-    objective = make_objective(unconditional_prob=0.5)
-    template = make_batch_of(4 * jax.device_count())
-    initial = Trainer(objective, optax.sgd(0.1), key=jax.random.PRNGKey(3)).initial_state()
-    info = Step(jnp.asarray(0), jax.random.fold_in(initial.key, 0), None,
-                **example_fields(initial, 0, 1, template))
-    twin = copy.copy(objective)
-    twin.substitute([objective.model.clone(dtype=jnp.float64)])
-    start = jax.tree.map(np.asarray, initial.variables)
-
-    def draw(seed):
-        images = np.random.default_rng(seed).integers(0, 256, template["image"].shape, dtype=np.uint8)
-        return ({**template, "image": images},)
-
-    def stepper(layout):
-        trainer = Trainer(objective, optax.sgd(0.1), key=jax.random.PRNGKey(3), layout=layout)
-        state, _, _ = trainer.place()
-        run = trainer.compile(state, template)
-
-        def stepped(batch):
-            # The step consumes its state: each draw steps a fresh one.
-            fresh, _, _ = trainer.place()
-            fresh, *_ = run(fresh, batch)
-            return jax.tree.map(np.asarray, fresh.variables["params"])
-
-        return stepped
-
-    def truth(batch):
-        wide = jax.tree.map(jnp.asarray, widened(start))
-        grads = jax.grad(lambda params: twin.scalar_loss({**wide, "params": params}, batch, info)[0])(
-            wide["params"])
-        return jax.tree.map(lambda value, grad: np.asarray(value - 0.1 * grad), wide["params"], grads)
-
-    return (stepper(Layout(host=("variables",), min_shard=1, tolerance=1.)),
-            stepper(Layout(min_shard=1, tolerance=1.)), draw, truth)
-
-
 def test_a_host_master_step_draws_each_examples_noise_as_the_resident_step_does():
     """A step whose variables live on the host runs its loss on the accelerator with the examples'
-    draws the step carries, so it takes the update a resident step takes, on par with it over drawn
-    images (check 1): a host-master run's draws by the attempt would read other times, noise and
-    dropped conditions, and step elsewhere."""
-    from reference_error import assert_as_exact
+    draws the step carries, so it takes the update a resident step takes, to the bit: a host-master
+    run's draws by the attempt would read other times, noise and dropped conditions, and step
+    elsewhere."""
+    import optax
 
-    host, resident, draw, truth = host_master_site()
-    assert_as_exact(host, resident, draw, "host-master step", seeds=HOST_SEEDS, truth_fn=truth)
+    from dew.training import Layout, Trainer
+
+    objective = make_objective(unconditional_prob=0.5)
+    batch = make_batch_of(4 * jax.device_count())
+
+    def stepped(layout):
+        trainer = Trainer(objective, optax.sgd(0.1), key=jax.random.PRNGKey(3), layout=layout)
+        state, _, _ = trainer.place()
+        state, *_ = trainer.compile(state, batch)(state, batch)
+        return jax.tree.map(np.asarray, state.variables["params"])
+
+    resident = stepped(Layout(min_shard=1, tolerance=1.))
+    host = stepped(Layout(host=("variables",), min_shard=1, tolerance=1.))
+    for (path, got), want in zip(jax.tree_util.tree_leaves_with_path(host), jax.tree.leaves(resident),
+                                 strict=True):
+        np.testing.assert_array_equal(got, want, err_msg=jax.tree_util.keystr(path))
