@@ -1333,8 +1333,11 @@ def test_phases_read_each_chain_until_its_step_as_the_phased_text_recipe(tmp_pat
     from dew.data.sources import TokenFiles
 
     first, second = tmp_path / "first", tmp_path / "second"
-    write_token_corpus(first, np.arange(1, 200, dtype=np.uint16) % 250 + 1)
-    write_token_corpus(second, np.arange(1, 300, dtype=np.uint16) % 250 + 2)
+    # Documents of nine tokens, each ended by EOS (0).
+    write_token_corpus(first, np.where(np.arange(200) % 10 == 9, 0, np.arange(200) % 250 + 1).astype(np.uint16),
+                       eos_id=0)
+    write_token_corpus(second, np.where(np.arange(300) % 10 == 9, 0, np.arange(300) % 250 + 2).astype(np.uint16),
+                       eos_id=0)
     loading = Loading(workers=0, threads=1, read_buffer=1)
     recipe = TextData(source="", seq_len=8, pack="first-fit",
                       phases=(DataPhase(str(first), 2), DataPhase({str(first): 1.0, str(second): 1.0}, None)))
