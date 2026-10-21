@@ -1170,3 +1170,25 @@ def test_the_whole_logits_head_computes_what_the_tiled_one_does(dtype, softcap):
     ]:
         have, want = jnp.asarray(have, jnp.float32), jnp.asarray(want, jnp.float32)
         assert jnp.abs(have - want).max() <= bound * jnp.abs(want).max() + 1e-7
+
+
+def test_an_fp32_whole_heads_overflowed_state_gradient_stays_infinite():
+    """A whole fp32 head sums its state gradient over column blocks (`FP32_STATE_BLOCK`): a block whose
+    product overflows leaves the sum infinite, as one product's is, never inf - inf. One zero state,
+    2048 columns, the target's at -3e38 and the rest at +3e38: a finite loss, log 2048, whose state
+    gradient overflows."""
+    from dew.objectives.lm.chunked import FP32_STATE_BLOCK
+
+    columns = 2 * FP32_STATE_BLOCK
+    head = jnp.full((1, columns), 3e38, jnp.float32).at[0, 0].set(-3e38)
+    hidden, targets = jnp.zeros((1, 1, 1), jnp.float32), jnp.zeros((1, 1), jnp.int32)
+
+    def loss(states):
+        table = OutputTable(head, vocab_major=False)
+        losses, _, _ = chunked_cross_entropy(states, table, targets, 1, tile=None)
+        return jnp.sum(losses)
+
+    with jax.default_matmul_precision("highest"):
+        value, gradient = jax.value_and_grad(loss)(hidden)
+    assert np.isclose(float(value), np.log(columns))
+    assert np.all(np.isinf(np.asarray(gradient))) and not np.any(np.isnan(np.asarray(gradient)))
