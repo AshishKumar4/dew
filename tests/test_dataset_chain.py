@@ -787,7 +787,8 @@ def test_show_prints_what_a_preset_expanded_to_then_the_records(capsys):
                 [3, 1])
     mixed.batch(2).loading(READ).show(count=1)
     printed = capsys.readouterr().out
-    assert printed.index("weight 3") < printed.index("weight 1") < printed.index("Tagged") < printed.index("batch")
+    places = [printed.index(text) for text in ("weight 3", "weight 1", "Tagged", "batch")]
+    assert places == sorted(places)
 
 
 def test_a_runs_truncated_share_is_of_the_rows_it_delivered():
