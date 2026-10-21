@@ -190,8 +190,8 @@ def test_the_port_keeps_the_kernel_contract_on_a_mesh(axis, split):
     def draw(seed):
         return scan_operands(*SHARDED, documents=True, seed=seed)[0]
 
-    def exact(*operands):
-        return jax.jit(through(32, starts, *widened((dy, dfinal))))(*operands)
+    # One float64 program for every seed's truth.
+    exact = jax.jit(through(32, starts, *widened((dy, dfinal))))
 
     def spec(rank: int, axes: tuple[int, ...]):
         return PartitionSpec(*(axis if dim in axes else None for dim in range(rank)))
