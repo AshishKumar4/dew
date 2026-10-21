@@ -17,7 +17,7 @@ row's own and one of zeros.
 
 Each kernel is a launch the tuner times (`dew.nn.kernels.tuning.KernelOp`) over the tiles fla's own
 autotuner lists for it that fit the GPU's block (its `SPACES`), fla's picks for 99 KB GPUs its
-heuristic (its `PICKS`); `dew.nn.linear.fla_rule` shapes any other call to them.
+heuristic (its `PICKS`); `dew.nn.kernels.recurrence_chunk.fla_rule` shapes any other call to them.
 """
 
 import dataclasses

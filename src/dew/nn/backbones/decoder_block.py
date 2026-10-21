@@ -350,7 +350,7 @@ class RematPolicy:
     `offload` names those to move to pinned host memory. Both empty is
     MaxText's `full`. `recompute` instead names the only residuals recomputed,
     each by the layer that computes it (a delta rule its memory,
-    `dew.nn.linear.RECOMPUTED`), the block running without remat and keeping
+    `dew.nn.kernels.recurrence_chunk.RECOMPUTED`), the block running without remat and keeping
     every other value; it takes neither list. A checkpoint policy cannot
     say it: one that saves anything but a name saves the value the name
     marks from the op that made it.

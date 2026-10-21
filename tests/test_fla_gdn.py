@@ -35,10 +35,10 @@ from reference_error import (
 from sharded import assert_runs_per_shard, boundary_copies
 from tuned import each_config
 
-from dew.nn import linear
-from dew.nn.kernels import chunked_launch, fla_gdn, fla_kda, generation, tuning
+from dew.nn.kernels import chunked_launch, fla_gdn, fla_kda, generation, recurrence_chunk, tuning
 from dew.nn.kernels.recurrence import ChunkLocalCumsum, cumulated
-from dew.nn.linear import GatedDeltaNet, fla_rule, l2norm
+from dew.nn.kernels.recurrence_chunk import fla_rule
+from dew.nn.linear import GatedDeltaNet, l2norm
 from dew.training._lowering import triton_calls
 
 pytestmark = pytest.mark.kernel
@@ -460,7 +460,7 @@ def test_a_range_late_in_a_long_decayed_chunk_is_as_exact_as_fla(per_key):
     theirs = fla_side((*inputs, do, dht), None, jnp.float32)
 
     def math(q, k, v, g, beta, h0):
-        return linear.chunk_delta_rule(q, k, v, g if per_key else g[..., None], beta, h0)
+        return recurrence_chunk.chunk_delta_rule(q, k, v, g if per_key else g[..., None], beta, h0)
 
     with jax.enable_x64(new_val=True):
         operands = widened((*inputs, do, dht))
@@ -595,7 +595,7 @@ def test_inside_a_shard_map_that_checks_varying_axes_the_rule_runs_the_portable_
     beta = jax.nn.sigmoid(jax.random.normal(keys[4], (2, 64, 2)))
     do = jax.random.normal(keys[5], v.shape)
     rows = PartitionSpec("data")
-    mapped = jax.shard_map(lambda *operands: linear.chunk_gated_delta_rule(*operands)[0],
+    mapped = jax.shard_map(lambda *operands: recurrence_chunk.chunk_gated_delta_rule(*operands)[0],
                            mesh=Mesh(np.asarray(jax.devices()[:2]), ("data",)), in_specs=(rows,) * 5,
                            out_specs=rows, check_vma=True)
 
@@ -749,7 +749,7 @@ def route_cotangents(mode, operands):
 
 @pytest.mark.parametrize("label", sorted(ROUTES))
 def test_the_rule_computes_the_route_its_geometry_selects(label):
-    """The rule a layer calls (`linear.chunk_gated_delta_rule`), its output, final memory and every
+    """The rule a layer calls (`recurrence_chunk.chunk_gated_delta_rule`), its output, final memory and every
     operand's gradient (its tangents under `jax.jvp`), at each geometry the port takes and each it
     refuses (`port_refusal`): bit for bit the port's (`fla_rule`) where it takes the rule and the
     portable math's (`chunk_delta_rule`) where it does not. Each route is held to its reference
@@ -759,7 +759,7 @@ def test_the_rule_computes_the_route_its_geometry_selects(label):
     operands = routed_operands(dtypes, width, heads)
     cotangents = route_cotangents(mode, operands)
     with row_names_port(port=names_port):
-        found = run_rule(linear.chunk_gated_delta_rule, mode, operands, cotangents)
+        found = run_rule(recurrence_chunk.chunk_gated_delta_rule, mode, operands, cotangents)
         want = run_rule(fla_rule if ported else portable, mode, operands, cotangents)
     jax.tree.map(np.testing.assert_array_equal, found, want)
 
@@ -767,7 +767,7 @@ def test_the_rule_computes_the_route_its_geometry_selects(label):
 @pytest.mark.parametrize("label", sorted(ROUTES))
 def test_both_routes_return_the_operands_common_dtype(label):
     """One contract whichever route a GPU's row picks: the port (`fla_rule`), at every geometry it takes
-    (`linear.port_refusal`'s widths), and the portable math (`chunk_delta_rule`), at every geometry,
+    (`recurrence_chunk.port_refusal`'s widths), and the portable math (`chunk_delta_rule`), at every geometry,
     return the output in the queries', keys' and values' common dtype, the final memory in at least
     fp32, and each operand's gradient in its own."""
     dtypes, width, heads, _, _, _ = ROUTES[label]
@@ -784,7 +784,7 @@ def test_both_routes_return_the_operands_common_dtype(label):
 @pytest.mark.gpu(reason="float64 distances against fla's own on this GPU")
 @pytest.mark.parametrize("label", sorted(label for label, route in ROUTES.items() if route[5]))
 def test_where_the_rule_takes_the_port_it_is_as_exact_as_fla(label):
-    """The rule a layer calls (`linear.chunk_gated_delta_rule`) at each geometry the port takes, mixed
+    """The rule a layer calls (`chunk_gated_delta_rule`) at each geometry the port takes, mixed
     dtypes and the widest bf16 keys: its output, final memory and every operand's gradient as near the
     float64 recurrence as fla 0.5.2's own run on the same operands in their common dtype (`fla_side`),
     each sized by its float64 terms (`float64_truth`)."""
@@ -792,7 +792,8 @@ def test_where_the_rule_takes_the_port_it_is_as_exact_as_fla(label):
     operands = routed_operands(dtypes, width, heads)
     do, dht = route_cotangents("reverse", operands)
     with row_names_port():
-        mine = [np.asarray(x, np.float64) for x in through(linear.chunk_gated_delta_rule, do, dht)(*operands)]
+        rule = recurrence_chunk.chunk_gated_delta_rule
+        mine = [np.asarray(x, np.float64) for x in through(rule, do, dht)(*operands)]
     inputs = (*operands, do, dht)
     theirs = fla_side(inputs, None, jnp.result_type(*dtypes))
     for name, dew, fla, value, summed in zip(NAMES, mine, theirs, *float64_truth(inputs, None), strict=True):
@@ -807,7 +808,7 @@ def test_float64_operands_compute_the_recurrence_in_float64():
         operands = widened(routed_operands((jnp.float32,) * 3, 64, (2, 64)))
         cotangents = tuple(np.asarray(jax.random.normal(jax.random.key(index), shape), np.float64)
                            for index, shape in enumerate((operands[2].shape, operands[5].shape)))
-        run = through(linear.chunk_gated_delta_rule, *cotangents)
+        run = through(recurrence_chunk.chunk_gated_delta_rule, *cotangents)
         roundings = chain_roundings(jax.make_jaxpr(run)(*operands))
         found = jax.tree.map(np.asarray, run(*operands))
         truth = jax.tree.map(np.asarray, through(recurrence, *cotangents)(*operands))
@@ -848,7 +849,7 @@ def test_a_remat_policy_saves_the_ports_named_residuals_and_changes_no_gradient(
     """A block's remat policy keeps or recomputes the port's named residuals
     (`decoder_block.RESIDUALS`): without one the layer saves its decay, inverse and memory
     ('delta_memory') for its backward; 'all_but_delta_memory', which the block applies by tracing its
-    layers recomputing that name (`linear.recomputing`) rather than by a checkpoint policy, has the
+    layers recomputing that name (`recurrence_chunk.recomputing`) rather than by a checkpoint policy, has the
     backward recompute the memory alone; a policy saving the output, decay and inverse saves those
     three. Each is read from the kernels the gradient runs: the memory's (`fla_chunk_fwd_h`) once
     where it is saved and again in the backward where it is recomputed; the output's
@@ -859,7 +860,7 @@ def test_a_remat_policy_saves_the_ports_named_residuals_and_changes_no_gradient(
     roundings differ: on an H100 even the XLA math's A_log gradient moved by 5.4e-5 relative between
     the two, the remat one nearer float64."""
     from dew.nn.backbones.decoder_block import remat_policy
-    from dew.nn.linear import recomputing
+    from dew.nn.kernels.recurrence_chunk import recomputing
 
     layer = GatedDeltaNet(emb_features=64, num_k_heads=1, num_v_heads=2, head_k_dim=64, head_v_dim=64)
     x = jax.random.normal(jax.random.key(71), (1, 64, 64))
@@ -909,7 +910,7 @@ def test_the_rule_on_the_port_takes_any_chunk_size_and_mixed_dtypes_in_their_com
     v = jax.random.normal(keys[2], (1, 96, 2, 64)).astype(jnp.bfloat16)
     g = -jnp.exp(jax.random.normal(keys[3], v.shape[:3]) - 3.0)
     beta = jax.nn.sigmoid(jax.random.normal(keys[4], v.shape[:3]))
-    got = linear.chunk_gated_delta_rule(q, k, v, g, beta, chunk_size=chunk_size)
+    got = recurrence_chunk.chunk_gated_delta_rule(q, k, v, g, beta, chunk_size=chunk_size)
     want = fla_rule(q, k.astype(jnp.float32), v.astype(jnp.float32), g, beta)
     for mine, theirs in zip(got, want, strict=True):
         assert mine.dtype == jnp.float32

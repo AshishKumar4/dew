@@ -17,8 +17,7 @@ import numpy as np
 import pytest
 from reference_error import float64_terms, widened
 
-from dew.nn import linear
-from dew.nn.kernels import fla_gdn
+from dew.nn.kernels import fla_gdn, recurrence_chunk
 
 CHUNKED = 64
 """The terms a chunk sums in another order than the portable math: a port's fp32 floor over the
@@ -175,11 +174,11 @@ def fla_decay_parts(q, k, v, g, beta, h0, do, dht, starts=None, chunk: int = CHU
     decay = jnp.where(lower[..., None], jnp.exp(gc[..., :, None, :] - gc[..., None, :, :]), 0.0)
     akk = jnp.where(strict, jnp.einsum('...sd,...td,...std->...st', k * beta, k, decay), 0.0)
     aqk = jnp.einsum('...sd,...td,...std->...st', q, k, decay)
-    inverse = linear.strictly_lower_inverse(-akk)
+    inverse = recurrence_chunk.strictly_lower_inverse(-akk)
     w, u = inverse @ (k * beta * gated), inverse @ (v * beta)
     last_decay = jnp.exp(last - gc)
     leaving = k * last_decay
-    entered, corrected, _ = linear.xla_chunk_states(k, w, u, gc, last_decay, h0)
+    entered, corrected, _ = recurrence_chunk.xla_chunk_states(k, w, u, gc, last_decay, h0)
     daqk = jnp.where(lower, do @ jnp.swapaxes(corrected, -1, -2), 0.0)
     local = jnp.swapaxes(aqk, -1, -2) @ do
 
@@ -242,7 +241,8 @@ def math(q, k, v, g, beta, h0, starts=None):
     group = v.shape[2] // q.shape[2]
     q, k = (jnp.repeat(x, group, axis=2) for x in (q, k))
     starts = None if starts is None else jnp.asarray(starts)
-    return linear.chunk_delta_rule(q, k, v, g if g.ndim == 4 else g[..., None], beta, h0, starts=starts)
+    return recurrence_chunk.chunk_delta_rule(q, k, v, g if g.ndim == 4 else g[..., None], beta, h0,
+                                             starts=starts)
 
 
 HEADS = 8
