@@ -299,3 +299,35 @@ def test_the_cost_model_names_a_fact_its_target_lacks():
                                    jax.ShapeDtypeStruct((2,), jnp.int32), out_dtype="bfloat16",
                                    trans_rhs=False, interpret=False)
     assert not grouped_matmul.Gmm().eligible(ba, target)
+
+
+def halved(acc, bias):
+    return (acc + bias[None, :]).astype(jnp.bfloat16)
+
+
+def doubled_halves(acc, bias):
+    return (acc * 2).astype(jnp.bfloat16), (acc + bias[None, :]).astype(jnp.bfloat16)
+
+
+def twice(acc, bias):
+    del bias
+    return (acc * 2).astype(jnp.bfloat16)
+
+
+def test_a_cooperative_tile_stores_each_of_several_outputs():
+    """A cooperative tile's consumers stage every output at once: a two-output epilogue's outputs, each its
+    own staging buffer, are bit for bit those of the same tile asked for each output alone."""
+    x, w, _, _ = operands(SIZES["ragged"], jnp.bfloat16)
+    x, w = jnp.asarray(x, jnp.bfloat16), jnp.asarray(w, jnp.bfloat16)
+    bias = jnp.asarray(np.linspace(-1, 1, WIDTH), jnp.float32)
+    sizes = jnp.asarray(SIZES["ragged"], jnp.int32)
+    tiles = mosaic_gpu.Tiles(128, 128, 64, 2, 1, warpgroups=2)
+
+    def run(epilogue, out_dtypes=None):
+        return mosaic_gpu.gmm(x, w, sizes, tiles=tiles, transpose_rhs=False, out_dtype=jnp.bfloat16,
+                              multiprocessors=1, interpret=grouped_matmul.INTERPRETED, epilogue=epilogue,
+                              epilogue_operands=(bias,), epilogue_axes=(("columns",),), out_dtypes=out_dtypes)
+
+    first, second = run(doubled_halves, (jnp.bfloat16, jnp.bfloat16))
+    np.testing.assert_array_equal(np.asarray(first, np.float32), np.asarray(run(twice), np.float32))
+    np.testing.assert_array_equal(np.asarray(second, np.float32), np.asarray(run(halved), np.float32))
