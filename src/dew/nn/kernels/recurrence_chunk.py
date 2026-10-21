@@ -24,6 +24,7 @@ import contextlib
 import contextvars
 import dataclasses
 import functools
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -45,7 +46,7 @@ recurrent form agree at any size; the size only trades memory for
 parallelism, and 64 is what the reference's kernels assume."""
 
 
-def xla_chunk_states(key, k_cumdecay, out_vals, gc, last_decay, state, kept=None):
+def xla_chunk_states(key, k_cumdecay, out_vals, gc, last_decay, state, kept):
     """The memory crossing chunks, the one sequential part of the chunked
     rule, as a `lax.scan` over the algebra's `carry`: per chunk the reference's corrected values
     `v_new = value - k_cumdecay @ S` and its write `S * exp(gc[-1]) +
@@ -64,15 +65,77 @@ def xla_chunk_states(key, k_cumdecay, out_vals, gc, last_decay, state, kept=None
     its exponent compensated as every pair's is, where the prefix's rounded
     half alone put a long chunk's write off by its whole sum's rounding, and
     zero for every token of a packed chunk's earlier documents, which the
-    write does not keep. With packed documents, `kept` `[B, 1, NC, 1, 1]`
-    marks the chunks no document starts in, the only ones the memory they
-    entered passes through.
+    write does not keep. `kept` `[B, 1, NC, 1, 1]` marks the chunks no
+    document starts in, the only ones the memory they entered passes through
+    (`Chunked`).
     """
-    kept = jnp.ones((1, 1, gc.shape[2], 1, 1), gc.dtype) if kept is None else kept.astype(gc.dtype)
     final, (entered, corrected) = jax.lax.scan(
         algebra.carry, state,
         tuple(jnp.moveaxis(x, 2, 0) for x in (key, k_cumdecay, out_vals, gc, last_decay, kept)))
     return jnp.moveaxis(entered, 0, 2), jnp.moveaxis(corrected, 0, 2), final
+
+
+class Chunked(NamedTuple):
+    """A sequence's chunks as the algebra takes them, `[B, H, NC, C, ...]` in the working precision: the
+    scaled queries, the keys, the decay cumulated within each chunk `gc`, the pairs' decay, the queries'
+    and the write's decay from the memory entered `entering` (zero outside the entered document), the
+    write's products `W` and `U` (`recurrence_algebra.apply`), the decay's last row `last` (zero outside
+    the chunk's last document) and `kept` `[B, 1, NC, 1, 1]` (one where the memory entered passes
+    through), with `padding` the tokens the last chunk was padded with."""
+    query: jax.Array
+    key: jax.Array
+    gc: jax.Array
+    pairs: jax.Array
+    entering: jax.Array
+    w: jax.Array
+    u: jax.Array
+    last: jax.Array
+    kept: jax.Array
+    padding: int
+
+
+def chunked(query, key, value, g, beta, chunk_size: int = CHUNK_SIZE, *, starts=None, delta: bool = True,
+            scale: float | None = None) -> Chunked:
+    """`chunk_delta_rule`'s operands as each chunk's algebra (`Chunked`): what `carry` and `readout` read,
+    and what `transition` composes. Within a chunk each document's decays are its own, `entering` is zero
+    outside the document the memory entering belongs to and `last` outside the chunk's last document, so
+    a chunk's transition keeps the memory entering only where `kept`."""
+    work = at_least_fp32(jnp.result_type(query, key, value))
+    query, key, value, g, beta = (x.astype(work) for x in (query, key, value, g, beta))
+    B, S, H, Dk = key.shape
+    pad = (chunk_size - S % chunk_size) % chunk_size
+    query, key, value, g = (jnp.pad(x, ((0, 0), (0, pad), (0, 0), (0, 0))) for x in (query, key, value, g))
+    beta = jnp.pad(beta, ((0, 0), (0, pad), (0, 0)))
+    T = S + pad
+    query = query * (Dk ** -0.5 if scale is None else scale)
+
+    def chunks(x):  # [B, S, H, ...] -> [B, H, NC, C, ...], the reference's layout
+        moved = jnp.moveaxis(x, 2, 1)  # [B, H, S, ...]
+        return moved.reshape(B, H, T // chunk_size, chunk_size, *moved.shape[3:])
+
+    q_c, k_c = chunks(query), chunks(key)
+    kb_c, vb_c = chunks(key * beta[..., None]), chunks(value * beta[..., None])
+    document = first = None
+    kept = jnp.ones((1, 1, T // chunk_size, 1, 1), work)
+    if starts is not None:
+        # Each token's document within its row, per chunk, [B, 1, NC, C, 1], and the document the
+        # memory each chunk enters belongs to: its first token's, unless that token starts one.
+        begins = jnp.pad(jnp.asarray(starts, jnp.int32), ((0, 0), (0, pad)))
+        document = jnp.cumsum(begins, axis=1).reshape(B, 1, T // chunk_size, chunk_size, 1)
+        entered_document = document[..., :1, :] - begins.reshape(document.shape)[..., :1, :]
+        first = document == entered_document
+        kept = (document[..., -1:, :] == entered_document).astype(work)
+    # The log decay cumulated within each chunk, the reference's
+    # `g = g.cumsum(dim=-1)` (modeling_qwen3_next.py:417), and the decay
+    # `exp(gc[s] - gc[t])` between positions s >= t, zero above the diagonal:
+    # [B, H, NC, C, D], [B, H, NC, C, C, D].
+    gc, pairs = algebra.decays(chunks(g), document)
+    entering = jnp.exp(gc) if first is None else jnp.exp(gc) * first
+    # The reference's `attn + I` operator after its row correction loop; without the delta rule nothing
+    # is corrected, and each token writes its gated value.
+    inverse = algebra.factor(algebra.intra(k_c, kb_c, pairs)) if delta else None
+    w, u = algebra.apply(inverse, kb_c, vb_c, entering)
+    return Chunked(q_c, k_c, gc, pairs, entering, w, u, pairs[..., -1, :, :], kept, pad)
 
 
 def chunk_delta_rule(query, key, value, g, beta, state=None, chunk_size: int = CHUNK_SIZE, *, starts=None,
@@ -110,40 +173,10 @@ def chunk_delta_rule(query, key, value, g, beta, state=None, chunk_size: int = C
     """
     dtype = jnp.result_type(query, key, value) if dtype is None else jnp.dtype(dtype)
     work = at_least_fp32(jnp.result_type(query, key, value))
-    query, key, value, g, beta = (x.astype(work) for x in (query, key, value, g, beta))
     B, S, H, Dk = key.shape
     Dv = value.shape[-1]
-    pad = (chunk_size - S % chunk_size) % chunk_size
-    query, key, value, g = (jnp.pad(x, ((0, 0), (0, pad), (0, 0), (0, 0))) for x in (query, key, value, g))
-    beta = jnp.pad(beta, ((0, 0), (0, pad), (0, 0)))
-    T = S + pad
-    query = query * (Dk ** -0.5 if scale is None else scale)
-
-    def chunks(x):  # [B, S, H, ...] -> [B, H, NC, C, ...], the reference's layout
-        moved = jnp.moveaxis(x, 2, 1)  # [B, H, S, ...]
-        return moved.reshape(B, H, T // chunk_size, chunk_size, *moved.shape[3:])
-
-    q_c, k_c = chunks(query), chunks(key)
-    kb_c, vb_c = chunks(key * beta[..., None]), chunks(value * beta[..., None])
-    document = first = kept = None
-    if starts is not None:
-        # Each token's document within its row, per chunk, [B, 1, NC, C, 1], and the document the
-        # memory each chunk enters belongs to: its first token's, unless that token starts one.
-        begins = jnp.pad(jnp.asarray(starts, jnp.int32), ((0, 0), (0, pad)))
-        document = jnp.cumsum(begins, axis=1).reshape(B, 1, T // chunk_size, chunk_size, 1)
-        entered_document = document[..., :1, :] - begins.reshape(document.shape)[..., :1, :]
-        first = document == entered_document
-        kept = document[..., -1:, :] == entered_document
-    # The log decay cumulated within each chunk, the reference's
-    # `g = g.cumsum(dim=-1)` (modeling_qwen3_next.py:417), and the decay
-    # `exp(gc[s] - gc[t])` between positions s >= t, zero above the diagonal:
-    # [B, H, NC, C, D], [B, H, NC, C, C, D].
-    gc, decay = algebra.decays(chunks(g), document)
-    entering = jnp.exp(gc) if first is None else jnp.exp(gc) * first
-    # The reference's `attn + I` operator after its row correction loop; without the delta rule nothing
-    # is corrected, and each token writes its gated value.
-    inverse = algebra.factor(algebra.intra(k_c, kb_c, decay)) if delta else None
-    k_cumdecay, out_vals = algebra.apply(inverse, kb_c, vb_c, entering)
+    steps = chunked(query, key, value, g, beta, chunk_size, starts=starts, delta=delta, scale=scale)
+    T = S + steps.padding
 
     # A zero state like the values: inside a shard_map that checks varying axes the chunk loop's
     # carry varies as the operands it takes in do, and under an Explicit axis its rows are placed as
@@ -156,11 +189,11 @@ def chunk_delta_rule(query, key, value, g, beta, state=None, chunk_size: int = C
     # The barrier materializes the zero. Remove it when XLA:CPU no longer
     # returns an uninitialized scan carry here.
     state = jax.lax.optimization_barrier(state)
-    entered, v_corrected, state = xla_chunk_states(k_c, k_cumdecay, out_vals, gc, decay[..., -1, :, :], state,
-                                                   kept)
-    # decay is zero above the diagonal, so this is the reference's inclusive
+    entered, v_corrected, state = xla_chunk_states(steps.key, steps.w, steps.u, steps.gc, steps.last, state,
+                                                   steps.kept)
+    # The pairs are zero above the diagonal, so this is the reference's inclusive
     # lower `masked_fill(triu(1), 0)`.
-    core = algebra.readout(q_c, entering, entered, k_c, decay, v_corrected)
+    core = algebra.readout(steps.query, steps.entering, entered, steps.key, steps.pairs, v_corrected)
     # core: [B, H, NC, C, Dv] -> [B, H, NC*C, Dv] -> [B, S, H, Dv]
     core = jnp.moveaxis(core.reshape(B, H, T, Dv), 1, 2)[:, :S]
     return core.astype(dtype), state

@@ -43,7 +43,7 @@ from tuned import each_config, launches, timed
 
 from dew.nn.inputs import AttentionMetadata, MixerCall, coordinates
 from dew.nn.kernels import tuning
-from dew.nn.kernels.recurrence_algebra import chunk_decay, strictly_lower_inverse
+from dew.nn.kernels.recurrence_algebra import decays, factor
 from dew.nn.kernels.recurrence_chunk import chunk_delta_rule, chunk_gated_delta_rule, fla_rule
 from dew.nn.linear import (
     GatedDeltaNet,
@@ -657,7 +657,7 @@ def test_the_chunk_inverse_is_exact_where_its_series_cancels(chunk):
     256-token prompt and its logits NaN."""
     a = -jnp.tril(jnp.ones((2, chunk, chunk), jnp.float32), -1)
     want = np.eye(chunk) - np.eye(chunk, k=-1)
-    np.testing.assert_allclose(strictly_lower_inverse(a), np.broadcast_to(want, a.shape), atol=1e-6)
+    np.testing.assert_allclose(factor(a), np.broadcast_to(want, a.shape), atol=1e-6)
 
 
 def test_a_decay_deep_in_a_chunk_keeps_its_own_precision():
@@ -670,7 +670,7 @@ def test_a_decay_deep_in_a_chunk_keeps_its_own_precision():
     ~128 u on a decay between neighbours, which the KDA gradient amplified
     to twice the reference's distance from float64 (tests/test_kimi_linear.py)."""
     g = np.random.default_rng(7).uniform(-3, -1, (2, 64, 4)).astype(np.float32)
-    _, decay = chunk_decay(jnp.asarray(g))
+    _, decay = decays(jnp.asarray(g))
     wide = np.asarray(g, np.float64)
     rows, cols = np.tril_indices(64)
     ranges = [wide[:, c + 1:r + 1] for r, c in zip(rows, cols, strict=True)]
@@ -698,19 +698,19 @@ def test_the_decay_gradient_sums_only_the_pairs_spanning_each_position():
     cotangent = rng.standard_normal((2, 64, 64, 4)).astype(np.float32)
 
     def gradient(g, cotangent):
-        _, pull = jax.vjp(lambda g: chunk_decay(g)[1], g)
+        _, pull = jax.vjp(lambda g: decays(g)[1], g)
         return pull(cotangent)[0]
 
     got = np.asarray(gradient(jnp.asarray(g), jnp.asarray(cotangent)), np.float64)
     with jax.enable_x64(new_val=True):
         wide = widened((g, cotangent))
         want = np.asarray(gradient(*wide))
-        weighed = np.abs(np.asarray(wide[1] * chunk_decay(wide[0])[1]))
+        weighed = np.abs(np.asarray(wide[1] * decays(wide[0])[1]))
     spans = np.array([weighed[:, i:, :i].sum((1, 2)) for i in range(64)]).transpose(1, 0, 2)
     bound = 2 * 64 * (np.finfo(np.float32).eps / 2) * spans
     assert np.all(np.abs(got - want) <= bound), float(np.max(np.abs(got - want) / np.maximum(bound, 1e-30)))
     tangent = rng.standard_normal(g.shape).astype(np.float32)
-    _, forward = jax.jvp(lambda g: chunk_decay(g)[1], (jnp.asarray(g),), (jnp.asarray(tangent),))
+    _, forward = jax.jvp(lambda g: decays(g)[1], (jnp.asarray(g),), (jnp.asarray(tangent),))
     paired = float(jnp.vdot(forward, cotangent))
     np.testing.assert_allclose(paired, float(np.vdot(tangent, got)), rtol=1e-5)
 

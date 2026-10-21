@@ -1503,7 +1503,7 @@ Qwen3.5-0.8B's real keys (near-aligned keys, beta near one) the powers grew
 as binomials while the inverse's entries stay under 1, and the cancellation
 left its fifth delta-rule layer 1e24 off in fp32 on a 256-token prompt:
 every later layer, the logits and every served request were NaN.
-`strictly_lower_inverse` now joins diagonal-block inverses, doubling their
+`recurrence_algebra.factor` (then `strictly_lower_inverse`) now joins diagonal-block inverses, doubling their
 size, so each product is the size of its entries. Every layer's chunked rule
 is within 8e-7 of a float64 token-by-token run, and the logits within 3.3e-05
 of transformers' fp32 forward with every argmax equal. It is cheaper too. At
