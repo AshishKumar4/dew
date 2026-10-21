@@ -94,14 +94,16 @@ class GuidanceDistillationObjective(DiffusionObjective):
         return {**super().held_variables(beside=beside), TEACHER: self.teacher_variables}
 
     def loss(self, variables, batch, step: Step):
-        encode_key, drop_key, time_key, noise_key, scale_key = jax.random.split(step.key, 5)
+        # Each example's scale, time and noise are its own (`Step.sample`).
+        encode_key, drop_key, _, _, _ = jax.random.split(step.key, 5)
         samples = self.clean_samples(variables, batch, encode_key)
         count = samples.shape[0]
         low, high = self.scales
-        scale = jax.random.uniform(scale_key, (count,), minval=low, maxval=high)
+        scale = step.sample("guidance scale", lambda key: jax.random.uniform(key, minval=low, maxval=high),
+                            rows=count)
         schedule = self.process.schedule
-        t = schedule.sample_t(time_key, count)
-        noise = jax.random.normal(noise_key, samples.shape, dtype=jnp.float32)
+        t = step.sample("times", lambda key: schedule.sample_t(key, 1)[0], rows=count)
+        noise = step.sample("noise", jax.random.normal, samples.shape[1:], dtype=jnp.float32, rows=count)
         rates = broadcast_rates(schedule, t, samples)
         noisy, c_in, _ = self.process.prediction.forward_diffusion(samples, noise, rates)
 

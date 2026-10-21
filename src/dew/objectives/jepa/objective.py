@@ -217,8 +217,12 @@ class JepaObjective(Objective[Ratio]):
     def loss(self, variables, batch, step: Step):
         samples = unit_range(batch[self.sample.key])
         batch_size = samples.shape[0]
-        mask_key, dropout_key = jax.random.split(step.key)
-        context_idx, target_idx = self.mask.sample(mask_key, batch_size)
+        # The masks are each example's own (`Step.sample`); the encoders' dropout is the attempt's.
+        _, dropout_key = jax.random.split(step.key)
+        drawn = [step.sample(f"mask {name}", draw, shape, rows=batch_size) for name, draw, shape in
+                 zip(("shapes", "corners", "order"), self.mask.draws(), self.mask.draw_shapes(), strict=True)]
+        context_idx, target_idx = self.mask.placed(*drawn)
+        context_idx, target_idx = step.boundary("context", context_idx), step.boundary("targets", target_idx)
         num_targets = self.mask.num_targets
 
         # The target branch reads the whole view through the EMA encoder, without gradients.

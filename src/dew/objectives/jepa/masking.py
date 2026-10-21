@@ -117,20 +117,31 @@ class MultiBlockMask:
         indices, `[B, num_targets, block_area]`, where `B` is `batch_size`.
         Both are sorted positions in the encoder's token sequence.
         """
-        H_P, W_P = self.grid
-        S = self.num_patches
-        M = self.num_targets
+        drawn = zip(self.draws(), jax.random.split(rng, 3), self.draw_shapes(), strict=True)
+        return self.placed(*(draw(key, (batch_size, *shape)) for draw, key, shape in drawn))
 
+    def draw_shapes(self) -> tuple[tuple[int, ...], ...]:
+        """One example's shape of each of `draws`: its blocks' shapes, their corners, the context's order."""
+        return (self.num_targets,), (self.num_targets, 2), (self.num_patches,)
+
+    def draws(self) -> tuple:
+        """The draws a mask is placed from (`placed`), each `draw(key, shape)`: which of the block shapes
+        each target takes, where its corner falls, and an order over the tokens. Their dtypes are fixed,
+        so a float64 run samples the masks a float32 one does."""
+        shapes = len(self.block_shapes)
+        return (lambda key, shape: jax.random.randint(key, shape, 0, shapes, dtype=jnp.int32),
+                lambda key, shape: jax.random.uniform(key, shape, dtype=jnp.float32),
+                lambda key, shape: jax.random.uniform(key, shape, dtype=jnp.float32))
+
+    def placed(self, choice: jax.Array, corner: jax.Array, order: jax.Array):
+        """`sample`'s indices from its draws (`draws`), `[B, ...]` each."""
+        H_P, W_P = self.grid
+        batch_size = choice.shape[0]
         heights = jnp.asarray([h for h, _ in self.block_shapes])
         widths = jnp.asarray([w for _, w in self.block_shapes])
         # flat offsets of a block's tokens from its top-left corner, per shape
         offsets = jnp.asarray([[(i // w) * W_P + (i % w) for i in range(h * w)]
                                for h, w in self.block_shapes])
-
-        shape_key, pos_key, context_key = jax.random.split(rng, 3)
-        # The draws' dtypes are fixed, so a float64 run samples the masks a float32 one does.
-        choice = jax.random.randint(shape_key, (batch_size, M), 0, len(self.block_shapes), dtype=jnp.int32)
-        corner = jax.random.uniform(pos_key, (batch_size, M, 2), dtype=jnp.float32)
         top = jnp.floor(corner[..., 0] * (H_P - heights[choice] + 1)).astype(jnp.int32)
         left = jnp.floor(corner[..., 1] * (W_P - widths[choice] + 1)).astype(jnp.int32)
         target_idx = (top * W_P + left)[..., None] + offsets[choice]
@@ -139,10 +150,10 @@ class MultiBlockMask:
             # A grid position's place in the encoder's sequence.
             target_idx = jnp.sort(jnp.asarray(inverse_permutation(scan))[target_idx], axis=-1)
 
-        is_target = jnp.zeros((batch_size, S), dtype=bool).at[
+        is_target = jnp.zeros((batch_size, self.num_patches), dtype=bool).at[
             jnp.arange(batch_size)[:, None], target_idx.reshape(batch_size, -1)].set(True)
         # target tokens sort last, so the first num_context entries of a random
         # ordering are a uniform sample of the complement
-        order = jax.random.uniform(context_key, (batch_size, S), dtype=jnp.float32) + is_target
+        order = order + is_target
         context_idx = jnp.sort(jnp.argsort(order, axis=1)[:, :self.num_context], axis=1)
         return context_idx, target_idx
