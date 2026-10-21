@@ -58,10 +58,6 @@ DEFAULT_BLOCK_K = 64
 # block_m. It solves the problem of large groups or very few groups.
 CHUNK_M = 512  # block size to chunk rows into to increase SM participation for very large groups
 
-def cdiv(a, b):
-  return (a + b - 1) // b
-
-
 arange = partial(jnp.arange, dtype=np.int32)
 
 
@@ -187,13 +183,13 @@ def _gpu_ragged_dot_kernel(
       return acc + xA.astype(acc_dtype)
 
     acc = jnp.zeros((block.m, block.n), dtype=acc_dtype)
-    acc = lax.fori_loop(0, cdiv(size.k, block.k), inner_compute, acc)
+    acc = lax.fori_loop(0, pl.cdiv(size.k, block.k), inner_compute, acc)
     acc = acc.astype(y_ref.dtype)
     mask = lhs_rows_mask[:, None] & rhs_cols_mask[None, :]
     plgpu.store(y_ref.at[lhs_rows_idx, rhs_cols_idx], acc, mask=mask)
     return
 
-  lax.fori_loop(0, cdiv(group_sz, block.m), outer_compute, None)
+  lax.fori_loop(0, pl.cdiv(group_sz, block.m), outer_compute, None)
 
   # zero out memory past sum(group_sizes) if we're the last kernel along m
   last_offset = (
@@ -217,7 +213,7 @@ def _gpu_ragged_dot_kernel(
       zero = jnp.zeros((block.m, block.n), dtype=y_ref.dtype)
       plgpu.store(y_ref.at[*window], zero, mask=mask)
 
-    lax.fori_loop(0, cdiv(size.m - last_offset, block.m), set_zero, None)
+    lax.fori_loop(0, pl.cdiv(size.m - last_offset, block.m), set_zero, None)
 
 
 @jax.jit(static_argnums=list(range(3, 14)))
@@ -352,7 +348,7 @@ def _tgmm_ragged_dot_kernel(
       ).astype(acc.dtype)
 
     acc = jnp.zeros((block.k, block.n), dtype=acc_dtype)
-    acc = lax.fori_loop(0, cdiv(group_sz, block.m), inner_compute, acc)
+    acc = lax.fori_loop(0, pl.cdiv(group_sz, block.m), inner_compute, acc)
     # Dew: upstream casts to y_ref's dtype, the second input's, which fails
     # to store whenever out_dtype differs from it (bf16 inputs, fp32 grad).
     acc = acc.astype(A_bar_ref.dtype)
