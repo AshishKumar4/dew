@@ -159,8 +159,8 @@ def jax_arms(name: str, shape: Shape, warmup: int, repeats: int) -> list[dict]:
                 return out, jnp.swapaxes(final, -1, -2)
 
             def hand(x, dt, A, B, C, D):
-                interpret = False
-                return mamba_ssd.ssd_scan(x, dt, A, B, C, D, state, None, shape.chunk, interpret)
+                return mamba_ssd.ssd_scan(x, dt, A, B, C, D, state, None, shape.chunk,
+                                          not generation.triton_runs())
 
             # What the kernels take, whatever this GPU's row prefers.
             with generation.chosen(ssd='pallas'):
