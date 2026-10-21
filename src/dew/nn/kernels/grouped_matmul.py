@@ -173,10 +173,10 @@ def _unsqueezed(hook, positions: tuple, tile, *sides):
 
 def _lowerable(hook):
     """`hook` with each 16-bit float operation Pallas Triton lowers only for fp32 or wider computed in
-    fp32 and rounded once, as XLA computes a 16-bit one: its division (`_truediv`), `logistic` (lowered as
-    `1 / (1 + exp(-x))`), `erf_inv`, and a negative power's final reciprocal (the power itself in the input's
-    dtype, as JAX lowers it). Other operations, and any inside a hook's control flow, are traced as
-    written."""
+    fp32 and rounded once: its division (`_truediv`) and a negative power's final reciprocal (the power in
+    the input's dtype, as JAX lowers it), bit for bit XLA's; its `logistic` (lowered as `1 / (1 + exp(-x))`)
+    and `erf_inv`, one rounding where XLA's 16-bit forms round each step, so never less exact. Other
+    operations, and any inside a hook's control flow, are traced as written."""
     if hook is None:
         return None
 
@@ -190,7 +190,8 @@ def _lowerable(hook):
 
 
 _FP32_ONLY = ('div', 'logistic', 'erf_inv')
-"""The primitives Pallas Triton lowers for no 16-bit float (`_lowerable`), beside a negative power's division."""
+"""The primitives Pallas Triton lowers for no 16-bit float (`_lowerable`), beside a negative power's
+division."""
 
 _CALLS = ('pjit', 'jit', 'closed_call', 'core_call', 'custom_jvp_call', 'custom_vjp_call')
 """The primitives that call one jaxpr as written, which `_widened` enters (a kernel never differentiates

@@ -231,13 +231,23 @@ def test_a_hooks_16_bit_divisions_lower_for_cuda(launch, generation_name):
 
 
 def test_a_hooks_widened_16_bit_operations_round_as_xla_s():
-    """The 16-bit divisions, sigmoid and negative powers a kernel computes in fp32 round to the bits XLA's
-    16-bit operations give, every bf16 value at once."""
+    """Every bf16 value through the 16-bit operations a kernel computes in fp32 (`Hooks.before`): a division
+    and a negative power give XLA's bits; a sigmoid, rounded once where XLA's 16-bit form rounds each step,
+    is never further from the float64 value than XLA's."""
     every = jax.lax.bitcast_convert_type(jnp.arange(-(2 ** 15), 2 ** 15, dtype=jnp.int32).astype(jnp.int16),
                                          jnp.bfloat16)
-    for hook in (bf16_reciprocal, lambda x: bf16_sigmoid_power(x.astype(jnp.float32))):
-        np.testing.assert_array_equal(np.asarray(jax.jit(grouped_matmul.Hooks(hook).before())(every)),
-                                      np.asarray(jax.jit(hook)(every)))
+
+    def widened_and_xla(hook):
+        return (np.asarray(jax.jit(grouped_matmul.Hooks(hook).before())(every), np.float64),
+                np.asarray(jax.jit(hook)(every), np.float64))
+
+    for hook in (bf16_reciprocal, lambda x: x ** -2):
+        widened, xla = widened_and_xla(hook)
+        np.testing.assert_array_equal(widened, xla)
+    widened, xla = widened_and_xla(jax.nn.sigmoid)
+    with np.errstate(over="ignore"):
+        exact = 1 / (1 + np.exp(-np.asarray(every, np.float64)))
+    assert np.all(np.abs(widened - exact) <= np.abs(xla - exact))
 
 
 def test_a_forced_implementation_runs_or_says_why_it_cannot():
