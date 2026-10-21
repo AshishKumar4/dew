@@ -932,6 +932,10 @@ def test_llada_moe_trained_exports_reload_and_run(llada_moe_source, tmp_path, de
     assert_as_exact(lambda seed: actual(ids[int(seed)]), lambda seed: expected(ids[int(seed)]),
                     lambda seed: (np.asarray(seed, np.int32),), name + ' trained export', seeds=8,
                     truth_fn=lambda seed: np.asarray(expected(ids[int(seed)]), np.float64))
+    prompt = ids[0, :1, :4]
+    generated = reloaded.text_generation()(prompt, 4, key=7, steps=3).host().tokens
+    np.testing.assert_array_equal(generated[:, :4], prompt)
+    assert generated.shape == (1, 8) and np.all(generated[:, 4:] != model.mask_token_id)
 
 
 @pytest.fixture(scope='module')

@@ -825,7 +825,7 @@ def export_config(model) -> Mapping[str, object]:
         'attention_bias': model.attention_bias,
         'tie_word_embeddings': model.tie_embeddings,
         'hidden_act': hf_activation(model.mlp),
-        'use_cache': True,
+        'use_cache': model.causal,
     }
     # A dial only some families' references read cannot ride in another
     # family's config. Qwen2 splits the o_proj bias from the others, and
