@@ -7,6 +7,9 @@ Spatial-Mamba's, and the two together are the SSM mixer of `ModulatedBlock`.
 """
 
 
+import functools
+import operator
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -19,6 +22,25 @@ from .conv import Conv
 from .flops import conv_flops, projection_flops
 from .precision import at_least_fp32, float32_dot_general, float32_products
 
+
+def affine_spans(left, right, multiply=operator.mul, add=operator.add):
+    """Two consecutive spans of the affine recurrence `h_t = a_t h_(t-1) + b_t` as one,
+    `(a1, b1) then (a2, b2)` being `(a1 a2, a2 b1 + b2)`: the combine every associative scan of a
+    linear recurrence runs (Mamba's `combine_fn`, S5's), over native real or complex arrays, or
+    over real `(re, im)` pairs with `multiply` and `add` their complex product and sum
+    (`_pair_product`, `_pair_sum`)."""
+    (a1, b1), (a2, b2) = left, right
+    return multiply(a1, a2), add(multiply(a2, b1), b2)
+
+
+def _pair_product(x, y):
+    """The complex product of two real `(re, im)` pairs."""
+    return x[0] * y[0] - x[1] * y[1], x[0] * y[1] + x[1] * y[0]
+
+
+def _pair_sum(x, y):
+    """The complex sum of two real `(re, im)` pairs."""
+    return x[0] + y[0], x[1] + y[1]
 
 def hippo_a_imag_init(key, shape, dtype=jnp.float32):
     """S4D-Lin imaginary part: A_imag_n = pi * n."""
@@ -56,16 +78,11 @@ def _carried(pole: jax.Array, last: jax.Array) -> jax.Array:
     for the first chunk, then `e_(c-1)` of `e_c = pole * e_(c-1) + last_c`,
     run by `associative_scan` over the chunks' own last states `last`
     `[B, 2, C, N]` with `pole` the `[N]` complex power that spans one chunk."""
-    def combine(earlier, later):
-        a_re, a_im, b_re, b_im = earlier
-        c_re, c_im, d_re, d_im = later
-        return (a_re * c_re - a_im * c_im, a_re * c_im + a_im * c_re,
-                c_re * b_re - c_im * b_im + d_re, c_re * b_im + c_im * b_re + d_im)
-
     chunks = last.shape[2]
     span = (jnp.broadcast_to(pole.real, (1, chunks, pole.shape[0])),
             jnp.broadcast_to(pole.imag, (1, chunks, pole.shape[0])))
-    *_, end_re, end_im = jax.lax.associative_scan(combine, (*span, last[:, 0], last[:, 1]), axis=1)
+    combine = functools.partial(affine_spans, multiply=_pair_product, add=_pair_sum)
+    _, (end_re, end_im) = jax.lax.associative_scan(combine, (span, (last[:, 0], last[:, 1])), axis=1)
     ends = jnp.stack([end_re, end_im], axis=1)
     return jnp.pad(ends[:, :, :-1], ((0, 0), (0, 0), (1, 0), (0, 0)))
 
@@ -242,8 +259,8 @@ def _scanned_directions(u: jax.Array, operators, reversed_: tuple[bool, ...], dt
         read = jnp.flip(u, axis=1) if backwards else u
         read = read.astype(compute_dtype(dtype))
         bu = jnp.einsum('bsf,nf->bsn', read, b)
-        _, x = jax.lax.associative_scan(lambda e1, e2: (e1[0] * e2[0], e2[0] * e1[1] + e2[1]),
-                                        (jnp.broadcast_to(pole[None, None, :], bu.shape), bu), axis=1)
+        _, x = jax.lax.associative_scan(affine_spans, (jnp.broadcast_to(pole[None, None, :], bu.shape), bu),
+                                        axis=1)
         y = (jnp.einsum('fn,bsn->bsf', c, x).real + d[None, None, :] * read).astype(dtype)
         out.append(jnp.flip(y, axis=1) if backwards else y)
     return out
