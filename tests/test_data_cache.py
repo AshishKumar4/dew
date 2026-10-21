@@ -683,9 +683,10 @@ def test_a_cache_skips_the_inputs_a_store_misses_as_the_uncached_read_does_and_p
 
 
 def test_a_cache_read_by_two_loading_workers_seals_what_each_filled(tmp_path):
-    """A cache read in one pass by two loading workers: each worker's fill is finished as its pass
-    ends, so publishing the cache afterwards runs the step on no input again."""
-    from dew.data.compile import compile, publish
+    """A cache read in one pass by two loading workers: each worker's fill is sealed as its pass
+    ends, the inputs the store misses among them, so together the sealed fills hold every input,
+    which a publication of the cache unions."""
+    from dew.data.compile import compile
     from dew.data.dataset import DataPartition, Loading
     from dew.data.pipeline import Pipeline
 
@@ -701,11 +702,13 @@ def test_a_cache_read_by_two_loading_workers_seals_what_each_filled(tmp_path):
             index for index in range(16) if index not in (5, 11)]
     finally:
         reader.close()
-    publishing = Offset(10)
-    generation = publish(Pipeline(source).map(publishing), Cache(cache), read="indexed",
-                         loading=Loading(workers=0))
-    assert len(generation) == 14
-    assert publishing.calls == []
+    fs, path = Store(cache).resolve()
+    seals = [location for location in fs.find(path) if location.endswith("/seal.json")]
+    held = {completion["id"] for location in fs.find(path)
+            if "/segments/" in location and not location.endswith("/seal.json")
+            for completion in json.loads(fs.cat_file(location))["completions"]}
+    assert len(seals) == 2
+    assert held == {str(index) for index in range(16)}
 
 
 def test_a_cache_of_a_store_that_misses_every_input_publishes_its_empty_fill(tmp_path):
