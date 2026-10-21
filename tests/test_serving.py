@@ -7,6 +7,7 @@ left, a queue longer than the slots, and a request too large for the cache.
 """
 
 import dataclasses
+import functools
 import itertools
 import threading
 
@@ -18,6 +19,7 @@ from episode_support import ToolPolicy
 from flax import linen as nn
 from jax.experimental import checkify
 from model_support import Digits, decoder, serving_task as task
+from reference_error import assert_as_exact
 from sharded import assert_sharded
 from steady_state import guarded, steady_state
 
@@ -38,6 +40,8 @@ VOCAB = 13
 EOS = 12
 PROMPTS = ["12", "5", "1234567", "98", "321"]
 BUDGETS = [5, 9, 3, 12, 7]
+MESH_SEEDS = 16
+"""The mesh server's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for`."""
 
 
 
@@ -757,22 +761,61 @@ def test_a_server_on_a_mesh_draws_what_each_request_draws_alone(mesh, options):
     split over the row axes, one group of rows per device group, the heads
     over the tensor axis. Every row is still the lone single-device call, a
     chunked prompt included, and the repeated prompt starts from the page the
-    first one published in its group."""
-    bound = task()
-    alone = [bound(prompt, budget, key=index)
-             for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
-    placed = bound.bind(place(bound.variables, mesh, Layout(min_shard=1, tolerance=1.0)))
-    server, tickets = served_alongside(placed, slots=8, admission=8, **options)
-    assert_sharded(placed.variables["params"], server.mesh)
-    assert server.groups == jax.device_count() // mesh.tensor
-    for ticket, lone in zip(tickets, [*alone, alone[2]], strict=True):
-        assert_same_generation(ticket.result(), lone)
-    assert server.prefix_hits == (4 if options.get("prefix_cache") else 0)
-    if "kv_cache" in options:
-        pool = next(leaf for leaf in jax.tree.leaves(server.cache) if leaf.ndim == 4)
-        pages = pool.sharding.spec[1]
-        assert ((pages,) if isinstance(pages, str) else tuple(pages)) == tuple(
-            axis for axis in BATCH_AXES if server.mesh.shape[axis] > 1)
+    first one published in its group: over weights drawn from each declared
+    seed, its tokens, lengths and terminations are the lone call's, and its
+    log-likelihoods are as exact as the lone call's (check 1), truth the
+    float64 model's on the lone call's tokens."""
+    layout = Layout(min_shard=1, tolerance=1.0)
+    rows = [*zip(PROMPTS, BUDGETS, strict=True), (PROMPTS[2], BUDGETS[2])]
+
+    @functools.cache
+    def drawn(seed):
+        """The lone calls' and the mesh server's rows over the weights `seed` draws."""
+        bound = task()
+        bound = bound.bind(bound.model.init(jax.random.key(seed), jnp.ones((1, 2), jnp.int32)))
+        alone = [bound(prompt, budget, key=index).host()
+                 for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
+        placed = bound.bind(place(bound.variables, mesh, layout))
+        server, tickets = served_alongside(placed, slots=8, admission=8, **options)
+        assert_sharded(placed.variables["params"], server.mesh)
+        assert server.groups == jax.device_count() // mesh.tensor
+        assert server.prefix_hits == (4 if options.get("prefix_cache") else 0)
+        if "kv_cache" in options:
+            pool = next(leaf for leaf in jax.tree.leaves(server.cache) if leaf.ndim == 4)
+            pages = pool.sharding.spec[1]
+            assert ((pages,) if isinstance(pages, str) else tuple(pages)) == tuple(
+                axis for axis in BATCH_AXES if server.mesh.shape[axis] > 1)
+        return bound, [*alone, alone[2]], [ticket.result().host() for ticket in tickets]
+
+    def likelihoods(generations):
+        return {"raw": np.concatenate([generation.raw_log_probs[0, :generation.lengths[0]]
+                                       for generation in generations])}
+
+    def served(seed):
+        _, alone, rows_served = drawn(int(seed))
+        for row, lone in zip(rows_served, alone, strict=True):
+            for field in ("tokens", "lengths", "terminated"):
+                np.testing.assert_array_equal(getattr(row, field), getattr(lone, field))
+        return likelihoods(rows_served)
+
+    def truth(seed):
+        """The float64 model's raw log-likelihood of each lone row's tokens, teacher-forced."""
+        bound, alone, _ = drawn(int(seed))
+        with jax.enable_x64(new_val=True):
+            model = bound.model.clone(dtype=jnp.float64)
+            params = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64), bound.variables)
+            picked = []
+            for (prompt, _), lone in zip(rows, alone, strict=True):
+                ids = Digits().encode(prompt)
+                drawn_ids = lone.tokens[0, lone.prompt_width:lone.prompt_width + lone.lengths[0]]
+                sequence = jnp.asarray([*ids, *drawn_ids.tolist()], jnp.int32)[None]
+                log_probs = jax.nn.log_softmax(model.apply(params, sequence)[0], axis=-1)
+                picked.append(np.asarray(log_probs[np.arange(len(ids) - 1, len(ids) - 1 + len(drawn_ids)),
+                                                   drawn_ids]))
+        return {"raw": np.concatenate(picked)}
+
+    assert_as_exact(served, lambda seed: likelihoods(drawn(int(seed))[1]), lambda seed: (np.int32(seed),),
+                    f"a server on {mesh}", seeds=MESH_SEEDS, truth_fn=truth)
 
 
 @pytest.mark.mesh(devices=4)
