@@ -61,7 +61,8 @@ jobs:
     steps:
     - uses: actions/checkout@v4
       with:
-        fetch-depth: 0  # SLOP020's inventory ratchet reads the whole history
+        # SLOP020's inventory ratchet reads the whole history; check.sh's duplicate-code gate, origin/main.
+        fetch-depth: 0
     - uses: actions/setup-python@v5
       with:
         python-version-file: .python-version
