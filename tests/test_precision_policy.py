@@ -291,3 +291,23 @@ def test_quantizer_division_rounds_midpoint_neighbours_as_ieee_division():
     expected = (numerator.astype(np.float64) / denominator.astype(np.float64)).astype(np.float32)
     actual = np.asarray(jax.jit(correctly_rounded_divide)(numerator, denominator))
     np.testing.assert_array_equal(actual.view(np.uint32), expected.view(np.uint32))
+
+
+@pytest.mark.parametrize("tied", [True, False])
+def test_a_tiled_head_takes_each_tile_as_the_whole_head_takes_its_logits(tied):
+    """A chunked or fused head multiplies each vocabulary tile by `bf16_product` over the tile's rows
+    (`dew.objectives.lm.chunked`): of a bf16 model's head those are its logits' columns, bitwise, so a
+    logit near a bf16 tie rounds alike either way."""
+    from dew.nn.precision import bf16_product
+
+    model = CausalTransformer(vocab_size=97, emb_features=32, num_layers=2, num_heads=4, mlp_features=64,
+                              max_seq_len=16, tie_embeddings=tied, dtype=jnp.bfloat16)
+    ids = jax.random.randint(jax.random.key(0), (2, 12), 0, 97)
+    variables = model.init(jax.random.key(0), ids)
+    states = model.apply(variables, ids, method="hidden_states").reshape(-1, 32)
+    table = model.apply(variables, method="output_table")
+    whole = np.asarray(table.logits(states))
+    rows = table.matrix if table.vocab_major else table.matrix.T
+    for first in range(0, 97, 25):
+        tile = np.asarray(bf16_product("td,vd->tv", states, rows[first:first + 25]))
+        np.testing.assert_array_equal(tile, whole[:, first:first + 25])
