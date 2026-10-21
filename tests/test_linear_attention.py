@@ -59,7 +59,7 @@ from dew.nn.linear import (
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "linear_attention"
 
-SHARDED_SEEDS = 8
+SHARDED_SEEDS = 128
 """The per-shard contract's declared draws (check 1, `sharded.assert_runs_per_shard`), sized by
 `seeds_for`: the fewest for which one device compared with itself resolves the factor."""
 

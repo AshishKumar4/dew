@@ -115,7 +115,7 @@ def operands(x, rows, scales):
     return cast.astype(np.float64), packed.astype(np.float64)
 
 
-PRODUCT_SEEDS = 8
+PRODUCT_SEEDS = 16
 """The frozen product's declared draws (check 1, `assert_as_exact`), sized by `seeds_for`: the fewest for
 which the float32 reference compared with itself resolves the factor."""
 
