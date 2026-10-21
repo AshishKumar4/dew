@@ -652,7 +652,7 @@ def test_z_loss_adds_the_squared_log_partition_of_the_counted_targets():
     assert abs(float(loss) - float(without)) > 1e-4, "the term made no difference to check"
 
 
-Z_LOSS_SEEDS = 16
+Z_LOSS_SEEDS = 256
 """Check 1's declared seeds for the z-loss gradient, sized by `seeds_for` (2026-10-21, on armada)."""
 
 
