@@ -40,9 +40,12 @@ import jax.numpy as jnp
 import tokamax
 import tyro
 
+from dew.nn.attention_kernels import ATTENTION
 from dew.telemetry.benchmark import samples
 
-IMPLEMENTATIONS = ('reference', 'xla', 'cudnn', 'flash', 'triton', 'jax_cudnn')
+IMPLEMENTATIONS = (*(kernel.name for kernel in ATTENTION.kernels), 'jax_cudnn', 'tokamax_triton')
+"""Dew's attention kernels as the selector names them, each through the production entry, then two
+upstream arms called directly: jax.nn's cuDNN call and tokamax's Triton kernel."""
 # B chosen so batch * sequence * heads is constant across the sequence sweep:
 # 512k query tokens at every row, so a slower row is a slower kernel, not a
 # smaller one.
@@ -55,7 +58,7 @@ class BenchmarkConfig:
 
     sequence_lengths: tuple[int, ...] = (256, 1024, 4096)
     head_dims: tuple[int, ...] = (64, 128)
-    implementations: tuple[str, ...] = IMPLEMENTATIONS[:3]
+    implementations: tuple[str, ...] = ('reference', 'xla', 'cudnn')
     causal: tuple[bool, ...] = (False, True)
     kv_groups: int = 1
     """Query heads per key/value head; 1 is multi-head attention."""
@@ -70,7 +73,7 @@ class BenchmarkConfig:
     value_dim: Optional[int] = None
     """The value heads' width where it is narrower than the query's (MiMo-V2's 128 under 192)."""
     softcap: Optional[float] = None
-    """Gemma 2's tanh logit cap. Only the reference, xla and triton paths take it."""
+    """Gemma 2's tanh logit cap. Only the reference and xla paths and tokamax_triton take it."""
     forward_only: bool = False
     """Skip the gradient timings; the fwd row is the cheaper question."""
     reference_error: bool = False
@@ -91,12 +94,12 @@ def attention_fn(implementation: str, config: BenchmarkConfig, causal: bool, sin
     from dew.nn.attention import scaled_dot_product_attention
     from dew.nn.local_attention import local_attention
     window, softcap = config.sliding_window, config.softcap
-    if sinks is not None and implementation in ('jax_cudnn', 'triton'):
+    if sinks is not None and implementation in ('jax_cudnn', 'tokamax_triton'):
         raise ValueError(f"{implementation} takes no attention sinks")
     if implementation == 'jax_cudnn':
         # jax.nn's own cuDNN call, which takes heads wider than Dew's cudnn path does.
         return lambda q, k, v: jax.nn.dot_product_attention(q, k, v, is_causal=causal, implementation='cudnn')
-    if implementation == 'triton':
+    if implementation == 'tokamax_triton':
         local = None if window is None else (window - 1, 0)
         return lambda q, k, v: tokamax.dot_product_attention(
             q, k, v, is_causal=causal, local_window_size=local,
@@ -110,7 +113,7 @@ def attention_fn(implementation: str, config: BenchmarkConfig, causal: bool, sin
 
 
 def lowering_target(implementation: str, config: BenchmarkConfig):
-    if implementation != 'triton' or config.triton_device_kind is None:
+    if implementation not in ('triton', 'tokamax_triton') or config.triton_device_kind is None:
         return contextlib.nullcontext()
     device = jax.sharding.AbstractDevice(config.triton_device_kind, None, 'cuda')
     return jax.sharding.use_abstract_mesh(
