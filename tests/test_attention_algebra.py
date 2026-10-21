@@ -181,3 +181,89 @@ def test_two_states_merged_are_on_par_with_one_pass_over_their_keys():
     whole = state(*draw(0))
     for mine, theirs in zip(algebra.merge(spec, algebra.empty(8, 16), whole), whole, strict=True):
         np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs))
+
+
+def forwards(query, key, value, spans, hooks=None, *, residuals=False):
+    """The Triton mainloop's forward, interpreted, and the plain-JAX one's, at 32 by 32 tiles."""
+    tiles = attention_triton.Tiles(32, 32, 4, 2)
+    with tuning.pinned({attention_triton.TritonForward: tiles}):
+        triton = attention_triton.forward(query, key, value, spans, hooks, residuals=residuals,
+                                          interpret=True)
+    portable = attention_portable.attend(query, key, value, spans, hooks, block_q=32, block_k=32,
+                                         pad=attention_triton.BLOCK, residuals=residuals)
+    return triton, portable
+
+
+@pytest.mark.parametrize("form", FORMS)
+def test_both_mainloops_compute_the_same_bits_where_no_residuals_are_kept(form):
+    """An inference forward (no residuals), which keeps no split sums, rounds alike in both mainloops."""
+    queries, keys = geometry(CASES[form])
+    spans = template.spans(queries, keys, ROWS, **arguments(CASES[form]))
+    triton, portable = forwards(*drawing(queries, keys, jnp.float32)(0), spans)
+    np.testing.assert_array_equal(np.asarray(triton), np.asarray(portable))
+
+
+@pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
+def test_a_plain_call_of_no_keys_reads_its_initial_state_or_zero_in_both_mainloops(causal):
+    """A full or causal call of no keys walks no padding as keys: zero output from no state, and a resumed
+    partial's own `acc / total` (1.5), in both mainloops."""
+    spans = template.spans(3, 0, 1, causal=causal)
+    query = jnp.ones((1, 3, 2, 32), jnp.float32)
+    empty = jnp.zeros((1, 0, 1, 32), jnp.float32)
+    for out in forwards(query, empty, empty, spans):
+        np.testing.assert_array_equal(np.asarray(out), 0)
+    state = template.Initial(jnp.zeros((1, 2, 3)), jnp.full((1, 2, 3), 2.0), jnp.full((1, 2, 3, 32), 3.0))
+    for out in forwards(query, empty, empty, spans, template.Hooks(initial=state)):
+        np.testing.assert_array_equal(np.asarray(out), 1.5)
+
+
+@pytest.mark.parametrize("form", ["full", "causal"])
+def test_merging_partials_of_no_keys_is_the_identity_whatever_the_form(form):
+    """`empty` merged with `empty`, and ahead of a state with keys, under a full or causal spec (whose
+    tile loop takes no guard), stays finite and leaves the state as it was."""
+    spec = algebra.Forward(form, 64, ids=False, scale=0.125)
+    nothing = algebra.merge(spec, algebra.empty(4, 8), algebra.empty(4, 8))
+    assert np.isneginf(np.asarray(nothing.m)).all()
+    np.testing.assert_array_equal(np.asarray(nothing.acc), 0)
+    np.testing.assert_array_equal(np.asarray(nothing.total), 0)
+    filled = algebra.Partial(jnp.ones((4, 8)), jnp.full((4,), 2.0), jnp.full((4,), 3.0))
+    for mine, theirs in zip(algebra.merge(spec, nothing, filled), filled, strict=True):
+        np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs))
+
+
+def test_an_fp16_backward_keeps_a_gradient_whose_scores_are_large_but_cancel():
+    """fp16 values of ±1000 over 128 equally scored keys, under an output cotangent of 1000: each score
+    cotangent is ±1953 normalized (±250000 unnormalized, past fp16's range), and D is 0, so dQ is 0 in
+    both mainloops, finite."""
+    spans = template.spans(128, 128, 1)
+    query = jnp.zeros((1, 128, 1, 16), jnp.float16)
+    key = jnp.zeros((1, 128, 1, 16), jnp.float16)
+    value = jnp.zeros((1, 128, 1, 16), jnp.float16).at[0, :, 0, 0].set(
+        jnp.where(jnp.arange(128) % 2 == 0, 1000.0, -1000.0).astype(jnp.float16))
+    dout = jnp.zeros((1, 128, 1, 16), jnp.float16).at[..., 0].set(1000.0)
+    with tuning.pinned({attention_triton.TritonBackward: attention_triton.BackwardTiles(32, 32, 4, 2, 4, 2),
+                        attention_triton.TritonForward: attention_triton.Tiles(32, 32, 4, 2)}):
+        triton = attention_triton.backward(query, key, value, spans, None, dout, interpret=True)
+    portable = attention_portable.backward(query, key, value, spans, None, dout, block_q=32, block_k=32,
+                                           pad=attention_triton.BLOCK)
+    for found in (triton, portable):
+        np.testing.assert_array_equal(np.asarray(found.query, np.float32), 0)
+
+
+def test_a_timed_backward_launch_walks_every_key():
+    """The backward's timing operands (`TritonBackward.operands`) give each query every key: its first
+    key 0 and one past its last the key count, whichever integer operand (the anchor keys among them)
+    comes first."""
+    queries, keys = 64, 96
+    arrays = {"query": jax.ShapeDtypeStruct((1, queries, 2, 32), jnp.bfloat16),
+              "key": jax.ShapeDtypeStruct((1, keys, 1, 32), jnp.bfloat16)}
+    specs = [arrays["query"], arrays["key"], arrays["key"], arrays["query"],
+             *[jax.ShapeDtypeStruct((1, 2, queries), jnp.float32)] * 4,
+             jax.ShapeDtypeStruct((1, 2, queries), jnp.int32),
+             jax.ShapeDtypeStruct((1, queries, 2, 32), jnp.float32),
+             jax.ShapeDtypeStruct((1, 2, queries, 32), jnp.float32),
+             *[jax.ShapeDtypeStruct((1, 2, queries), jnp.float32)] * 3,
+             *[jax.ShapeDtypeStruct((1, queries), jnp.int32)] * 2]
+    filled = attention_triton.TritonBackward().operands(specs, 0)
+    np.testing.assert_array_equal(np.asarray(filled[-2]), 0)
+    np.testing.assert_array_equal(np.asarray(filled[-1]), keys)
