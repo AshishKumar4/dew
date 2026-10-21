@@ -10,6 +10,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from generation_support import generations
 from jax.experimental.pallas import fuser
 from jax.sharding import Mesh
 from reference_error import assert_as_exact
@@ -57,7 +58,8 @@ def shifted(x, side):
 
 
 def reciprocal(x):
-    return 1 / x
+    """The reciprocal in fp32 (Pallas Triton divides no 16-bit floats), rounded back."""
+    return (1 / _wide(x)).astype(x.dtype)
 
 
 def biased(acc, bias):
@@ -162,7 +164,7 @@ def _drop(f):
     return lambda x, w, ms, nw, b, u, s, ct: f(x, w, ms, nw, b, u, s)
 
 
-@pytest.mark.parametrize("generation_name", ["sm80", "sm90"])
+@pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))
 @pytest.mark.parametrize("case", list(CASES))
 def test_the_template_holds_check_1_with_its_hooks(generation_name, case):
     """Each hook through the launch the generation picks, interpreted on the CPU: as exact as the plain
@@ -181,7 +183,7 @@ def _loss(run):
     return jax.grad(loss, argnums=tuple(range(7)))
 
 
-@pytest.mark.parametrize("generation_name", ["sm80", "sm90"])
+@pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))
 @pytest.mark.parametrize("case", GRADIENT_CASES)
 def test_the_templates_gradients_hold_check_1(generation_name, case):
     """Every operand's cotangent through the template's own reverse mode, against JAX's derivative of
@@ -260,7 +262,7 @@ def test_the_prologues_rounding_is_in_its_derivative():
     np.testing.assert_array_equal(np.asarray(got), np.asarray(jax.jit(jax.grad(plain))(scale)))
 
 
-@pytest.mark.parametrize("generation_name", ["sm80"])
+@pytest.mark.parametrize("generation_name", generations("sm80"))
 def test_a_prologue_never_sees_the_depths_padding(generation_name):
     """A depth no tile divides is padded with zeros, which `reciprocal` turns to infinities: the kernel
     zeroes them again before the product, so every output is the routed rows' sum of 17 ones."""
@@ -271,7 +273,7 @@ def test_a_prologue_never_sees_the_depths_padding(generation_name):
     np.testing.assert_array_equal(np.asarray(out), np.full((3, 16), 17.0))
 
 
-@pytest.mark.parametrize("generation_name", ["sm80", "sm90"])
+@pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))
 def test_a_side_operands_rows_may_be_any_of_its_dimensions(generation_name):
     """A side operand's rows as its second dimension load each group's rows as its first would: the
     forward product and the kernel gradient are the same bit for bit, whatever rows are a multiple of."""
@@ -299,7 +301,7 @@ def test_a_side_operands_rows_may_be_any_of_its_dimensions(generation_name):
     np.testing.assert_array_equal(np.asarray(gradients[0]), np.asarray(gradients[1]))
 
 
-@pytest.mark.parametrize("generation_name", ["sm80", "sm90"])
+@pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))
 def test_a_broadcast_dimension_is_the_squeezed_operands(generation_name):
     """A `[rows, 1]` mean square and a `[1, width]` bias with a None axis give the products of their
     vectors, bit for bit."""
@@ -320,7 +322,7 @@ def test_a_side_operand_names_one_launch_axis_per_dimension():
                           out_dtype=jnp.float32)
 
 
-@pytest.mark.parametrize("generation_name", ["sm80", "sm90"])
+@pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))
 def test_the_epilogue_applies_to_every_row(generation_name):
     """A row past the routed ones sums nothing: its output is the epilogue of zero, the bias."""
     x, w, _, _, b, *_ = _draw(1)
@@ -377,7 +379,7 @@ def positional(prod, b, r, dtype=jnp.bfloat16):
     return (prod + jax.lax.broadcasted_iota(prod.dtype, prod.shape, 1)).astype(dtype)
 
 
-@pytest.mark.parametrize("generation_name", ["sm80", "sm90"])
+@pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))
 @pytest.mark.parametrize("consumer", [bias_cast, silu_residual, two_consumers, positional],
                          ids=lambda consumer: consumer.__name__)
 def test_the_fused_epilogue_keeps_the_programs_value(generation_name, consumer):
@@ -495,7 +497,7 @@ def test_the_mosaic_kernels_load_a_side_operands_rows_from_any_dimension():
     np.testing.assert_array_equal(np.asarray(gradients[0]), np.asarray(gradients[1]))
 
 
-@pytest.mark.parametrize("generation_name", ["sm80", "sm90"])
+@pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))
 def test_exact_sums_add_each_steps_product_as_the_plain_sum_does(generation_name):
     """At the highest precision an fp32 kernel gradient adds each step's product apart (`exact_sums`):
     interpreted on the CPU, whose dots sum in IEEE fp32 either way, at one tile it is the default path's
