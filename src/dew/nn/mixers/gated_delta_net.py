@@ -5,7 +5,7 @@ from __future__ import annotations
 import dataclasses
 import functools
 
-from dew.nn.mixer_base import MixerBase, MixerContext
+from dew.nn.mixer_base import DELTA_RULE_RESIDUALS, MixerBase, MixerContext
 
 
 @dataclasses.dataclass(frozen=True)
@@ -21,7 +21,7 @@ class GatedDeltaNetMixer(MixerBase):
     layer has no keys to cache, no rope and no window.
     """
 
-    residuals = ('context', 'conv', 'delta_decay', 'delta_inverse', 'delta_memory')
+    residuals = DELTA_RULE_RESIDUALS
 
     linear_num_key_heads: int = 16
     linear_num_value_heads: int = 32

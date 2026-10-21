@@ -16,7 +16,7 @@ from collections.abc import Callable
 
 from flax import linen as nn
 
-from dew.nn.mixer_base import MixerBase, MixerContext
+from dew.nn.mixer_base import ATTENTION_CONTEXT_RESIDUALS, MixerBase, MixerContext
 from dew.nn.mixers.attention import CausalSelfAttention
 
 
@@ -32,7 +32,7 @@ class Llama4Mixer(MixerBase):
     the backbone through the context.
     """
 
-    residuals = ('q_proj', 'k_proj', 'v_proj', 'kv_proj', 'o_proj', 'context')
+    residuals = ATTENTION_CONTEXT_RESIDUALS
 
     use_rope: bool = True
     use_qk_norm: bool = True

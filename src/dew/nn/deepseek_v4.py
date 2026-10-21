@@ -62,7 +62,7 @@ from dew.nn.documents import document_mask
 from dew.nn.fake_quant import FakeQuantizing
 from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of, valid_order
 from dew.nn.kv_cache import KVCache, write_cache
-from dew.nn.mixer_base import MixerBase, MixerContext
+from dew.nn.mixer_base import ATTENTION_CONTEXT_RESIDUALS, MixerBase, MixerContext
 from dew.nn.precision import at_least_fp32, float32_dot_general, float32_einsum
 from dew.nn.rope import YarnScaling, rotate, yarn_rope_freqs
 from dew.nn.sharding import RESIDUAL, LogicalAxes, constrain, down_projection, logical_axes
@@ -879,7 +879,7 @@ class DeepseekV4Mixer(MixerBase):
     `candidates` the pool's role.
     """
 
-    residuals = ('q_proj', 'k_proj', 'v_proj', 'kv_proj', 'o_proj', 'context')
+    residuals = ATTENTION_CONTEXT_RESIDUALS
 
     q_lora_rank: int = 1024
     o_groups: int = 8

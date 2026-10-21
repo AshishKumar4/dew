@@ -50,7 +50,7 @@ from .linear import (
     on_the_port,
     recurrent_delta_rule,
 )
-from .mixer_base import MixerBase, MixerContext
+from .mixer_base import DELTA_RULE_RESIDUALS, MixerBase, MixerContext
 from .precision import at_least_fp32, float32_dot_general
 from .sharding import logical_axes
 
@@ -219,7 +219,7 @@ class KimiDeltaAttentionMixer(MixerBase):
     window and the forget gate's lower bound (configuration_glm5_next.py:143-146),
     and Kimi K3's `use_full_rank_gate` output gate."""
 
-    residuals = ('context', 'conv', 'delta_decay', 'delta_inverse', 'delta_memory')
+    residuals = DELTA_RULE_RESIDUALS
 
     linear_num_heads: int = 64
     linear_head_dim: int = 128

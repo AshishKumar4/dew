@@ -44,7 +44,7 @@ from dew.nn.kv_cache import KVCache, write_cache
 # dsa_kpool reads INDEXER and the expanded cache below. Reading the registry
 # contracts from base avoids importing the kind hub back during this module's
 # initialization, so either kind can be the first imported.
-from dew.nn.mixer_base import MixerBase, MixerContext
+from dew.nn.mixer_base import ATTENTION_CONTEXT_RESIDUALS, MixerBase, MixerContext
 from dew.nn.precision import at_least_fp32, float32_dot_general, float32_products
 from dew.nn.rope import YarnScaling, deinterleaved, rotate, yarn_query_scale, yarn_rope_freqs
 from dew.nn.sharding import RESIDUAL, LogicalAxes, constrain, down_projection, logical_axes
@@ -443,7 +443,7 @@ class MultiHeadLatentAttention(nn.Module):
         batch, length, _ = x.shape
         qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         # The projections carry the names a remat policy saves or offloads
-        # (decoder_block.RESIDUALS); kv_b_proj is the fused K/V one.
+        # (mixer_base.RESIDUALS); kv_b_proj is the fused K/V one.
         if self.q_lora_rank is None:
             q_resid = None
             queries = self.q_proj(x)
@@ -745,7 +745,7 @@ class MLAMixer(MixerBase):
     values norm, a window, an attention scale, a partial rotary) are refused.
     """
 
-    residuals = ('q_proj', 'k_proj', 'v_proj', 'kv_proj', 'o_proj', 'context')
+    residuals = ATTENTION_CONTEXT_RESIDUALS
 
     q_lora_rank: int | None = None
     kv_lora_rank: int = 512

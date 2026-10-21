@@ -159,7 +159,7 @@ def causal_conv1d(x, kernel, activation: bool = True, bias=None, *, valid=None, 
         else:
             out = xla_conv1d(x, kernel, activation, bias, valid=valid, segments=segments, parts=parts,
                              dtype=dtype)
-    # The conv's output, which a remat policy may keep (`dew.nn.backbones.decoder_block.RESIDUALS`).
+    # The conv's output, which a remat policy may keep (`dew.nn.mixer_base.RESIDUALS`).
     return jax.tree.map(lambda piece: checkpoint_name(piece, 'conv'), out)
 
 
