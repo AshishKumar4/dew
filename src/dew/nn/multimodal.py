@@ -13,20 +13,17 @@ from flax import linen as nn, struct
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.nn.backbones.decoder_stack import DecoderBank
 from dew.nn.flops import MissingFlopsCount, counted_flops, parameter_flops
 from dew.nn.inputs import Coordinates, coordinates as build_coordinates, next_position
 from dew.nn.kv_cache import POSITION
 from dew.nn.protocols import OutputTable, ProjectionGroup, held_groups
 from dew.nn.sharding import explicit_spec
 from dew.nn.vision import Gemma3nVision, ProjectorBase, TowerBase
+from dew.nn.wrapping import DecoderWrapper
 
 if TYPE_CHECKING:
-    from dew.nn.backbones.decoder_block import RematPolicy
     from dew.nn.hyper_connections import HyperConnections
-    from dew.nn.kv_cache import KVCache
     from dew.nn.mla import MLAMixer
-    from dew.records import JSON
 
 
 @runtime_checkable
@@ -182,7 +179,7 @@ def _place(embeddings: jax.Array, table: jax.Array, indices: jax.Array) -> jax.A
 
 
 
-class MultimodalTransformer(nn.Module):
+class MultimodalTransformer(DecoderWrapper):
     """Conditions the shared decoder on images and audio, using the ordinary decoder cache and head.
 
     ``image_indices`` and ``audio_indices`` give, for each token slot, the
@@ -193,8 +190,11 @@ class MultimodalTransformer(nn.Module):
     names, and audio adds `audio_tower` and `audio_projector`. Gemma 3n also
     embeds its hard vision and audio vocabulary ranges through the embedders,
     and keeps placeholder ids for its per-layer inputs, as modeling_gemma3n.py
-    does.
+    does. The serving and training hooks are its language model's (`DecoderWrapper`); a
+    clone keeps the towers and every variable's path.
     """
+
+    wraps = "language_model"
 
     language_model: CausalTransformer
     vision: TowerBase
@@ -247,35 +247,6 @@ class MultimodalTransformer(nn.Module):
                 self.vocab_size - 1 if self.family == "gemma3n" else None,
                 dtype=self.dtype, precision=self.precision)
             nn.share_scope(self.audio_conditioner, self)
-
-    @property
-    def vocab_size(self) -> int:
-        return self.language_model.vocab_size
-
-    @property
-    def bank_sites(self) -> tuple[DecoderBank, ...]:
-        return tuple(DecoderBank(("language_model", *site.namespace), site.view, site.scanned)
-                     for site in self.language_model.bank_sites)
-
-    @property
-    def max_seq_len(self) -> int:
-        return self.language_model.max_seq_len
-
-    @property
-    def emb_features(self) -> int:
-        return self.language_model.emb_features
-
-    @property
-    def final_logit_softcap(self) -> float | None:
-        return self.language_model.final_logit_softcap
-
-    @property
-    def causal(self) -> bool:
-        return self.language_model.causal
-
-    @property
-    def mask_token_id(self) -> int | None:
-        return self.language_model.mask_token_id
 
     @property
     def num_nextn_predict_layers(self) -> int:
@@ -486,63 +457,12 @@ class MultimodalTransformer(nn.Module):
         self.variable("cache", POSITION, jnp.zeros, (batch_size,), jnp.int32)
         self.language_model.init_cache(batch_size)
 
-    # The serving and training hooks (`dew.nn.protocols`), its language
-    # model's; a clone keeps the towers and every variable's path.
-
-    @nn.nowrap
-    def with_cache_capacity(self, capacity: int) -> Self:
-        return self.clone(language_model=self.language_model.with_cache_capacity(capacity))
-
-    @property
-    def kv_cache(self) -> KVCache:
-        return self.language_model.kv_cache
-
-    @nn.nowrap
-    def with_kv_cache(self, layout: KVCache) -> Self:
-        return self.clone(language_model=self.language_model.with_kv_cache(layout))
-
-    @nn.nowrap
-    def projected(self, params, *, updated: bool):
-        """The language model's projection of its own parameters (`ProjectsParameters`); the
-        towers' as they are."""
-        if 'language_model' not in params:
-            return params
-        return {**params, 'language_model': self.language_model.projected(params['language_model'],
-                                                                           updated=updated)}
-
-    @nn.nowrap
-    def generation_refusal(self) -> str | None:
-        return self.language_model.generation_refusal()
-
-    @nn.nowrap
-    def with_remat(self, policy: RematPolicy | None) -> Self:
-        """Choose the language model's layer policy, leaving the towers as they were."""
-        return self.clone(language_model=self.language_model.with_remat(policy))
-
-    @nn.nowrap
-    def recompute_record(self) -> JSON:
-        return self.language_model.recompute_record()
-
-    @nn.nowrap
-    def recompute_more(self) -> Self | None:
-        language_model = self.language_model.recompute_more()
-        return None if language_model is None else self.clone(language_model=language_model)
-
-    @nn.nowrap
-    def recompute_half(self) -> Self | None:
-        language_model = self.language_model.recompute_half()
-        return None if language_model is None else self.clone(language_model=language_model)
-
-    @nn.nowrap
-    def restore_recompute(self, record: JSON) -> Self:
-        return self.clone(language_model=self.language_model.restore_recompute(record))
-
     @nn.nowrap
     def with_passes(self, steps: int | None = None, layers: tuple[int, int] | None = None, *,
                     backprop_steps: int | None = None, remat: bool | None = None) -> Self | None:
         language_model = self.language_model.with_passes(steps, layers, backprop_steps=backprop_steps,
                                                          remat=remat)
-        return None if language_model is None else self.clone(language_model=language_model)
+        return None if language_model is None else self._over(language_model)
 
     @nn.nowrap
     def inference_projection_groups(self, variables: Mapping[str, Mapping]) -> tuple[ProjectionGroup, ...]:
@@ -566,10 +486,6 @@ class MultimodalTransformer(nn.Module):
     @property
     def indexed_mixers(self) -> tuple[MLAMixer, ...]:
         return self.language_model.indexed_mixers
-
-    @property
-    def keeps_triton_gemm(self) -> bool:
-        return self.language_model.keeps_triton_gemm
 
 
 __all__ = ["MultimodalTransformer"]
