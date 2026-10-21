@@ -475,11 +475,12 @@ def test_coverage_combines_each_tasks_branches_into_one_report_a_module_a_line(c
 
 
 def test_the_plan_runs_as_one_wave_on_the_pool(ci, tmp_path, monkeypatch, capsys):
-    """The plan's target rises from the heaviest test, which no cut divides, to its work over the pool, so its
-    tasks start at once and none waits for another to free its container (train 22: 212 tasks of a set 240 s
-    target on 160 containers ran as two waves, 10:10). Files nothing has timed each run alone whatever the
-    target; where they alone fill the pool, one wave cannot hold the suite, and the plan says so and runs in
-    waves. The plan command reads the pool from .armada.json."""
+    """The plan's target starts at the timed work over the pool, no less than the heaviest test, which no
+    cut divides, and grows until its tasks start at once, none waiting for another to free its container
+    (train 22: 212 tasks of a set 240 s target on 160 containers ran as two waves, 10:10). Files nothing
+    has timed each run alone whatever the target; where even every timed file packed together leaves
+    more tasks than containers, one wave cannot hold the suite, and the plan says so and runs in waves.
+    The plan command reads the pool from .armada.json."""
     records = {f"tests/test_even{n}.py::test_a": 100.0 for n in range(12)}
     records |= {"tests/test_heavy.py::test_a": 200.0, "tests/test_heavy.py::test_b": 100.0}
     for node in records:
@@ -494,12 +495,40 @@ def test_the_plan_runs_as_one_wave_on_the_pool(ci, tmp_path, monkeypatch, capsys
         (tmp_path / f"tests/test_new{n}.py").write_text("")
     assert ci.one_wave({}, 20) == 300.0 and len(ci.plan(300.0, {})) == 20
     capsys.readouterr()
-    assert ci.one_wave({}, 8) == 200.0 and len(ci.plan(200.0, {})) > 8
+    assert ci.one_wave({}, 8) == 1500.0 and len(ci.plan(1500.0, {})) == 12
     assert "one wave cannot hold the plan" in capsys.readouterr().err
     (tmp_path / ".armada.json").write_text(json.dumps({"pool": 20}))
     command = [sys.executable, str(ROOT / "tools/armada/ci.py"), "plan", "--timings=none.json"]
     planned = subprocess.run(command, cwd=tmp_path, check=True, capture_output=True, text=True)
     assert json.loads(planned.stdout)["include"] == ci.plan(300.0, {})
+
+
+def test_one_wave_holds_a_file_its_measured_cut_keeps_split(ci, tmp_path, monkeypatch):
+    """A file measured at a cut stays at that cut while its heaviest group is within `KEPT` of the target,
+    so the task count is not monotone in the target: ten files of twenty 10 s tests, each run at 2,200 s
+    as twenty groups of 110 s, plan as 400 tasks at any target under 2,200 s and as twenty at 2,200 s.
+    The target grows to where they fit, in a few plans, and no fewer containers than the files' medians
+    need are declared impossible (one file of 500 s measured as twenty 10 s groups fits two containers)."""
+    names = [f"tests/test_cut{n}.py" for n in range(10)]
+    records = {f"{name}::test_{index}": 10.0 for name in names for index in range(20)}
+    for name in names:
+        (tmp_path / name).write_text("")
+    (tmp_path / "tests/test_durations.json").write_text(json.dumps(records))
+    monkeypatch.setenv("DEW_TEST_CACHE", "off")
+    timings = {"files": {ci.row(python, name, ""): 2200.0 for python in ci.PYTHONS for name in names},
+               "rows": {ci.row(python, name, f"{index}/20"): 110.0 for python in ci.PYTHONS for name in names
+                        for index in range(1, 21)}}
+    plans = []
+    planning = ci.plan
+    monkeypatch.setattr(ci, "plan", lambda target, timings: plans.append(target) or planning(target, timings))
+    assert ci.one_wave(timings, 160) == 2200.0 and len(planning(2200.0, timings)) == 20
+    assert len(plans) <= 30, plans
+    single = {"files": {ci.row(python, names[0], ""): 500.0 for python in ci.PYTHONS},
+              "rows": {ci.row(python, names[0], f"{index}/20"): 10.0 for python in ci.PYTHONS
+                       for index in range(1, 21)}}
+    for name in names[1:]:
+        (tmp_path / name).unlink()
+    assert ci.one_wave(single, 2) == 500.0 and len(planning(500.0, single)) == 2
 
 
 def test_a_file_whose_recorded_tests_outweigh_its_median_runs_split_by_them(ci, tmp_path):
