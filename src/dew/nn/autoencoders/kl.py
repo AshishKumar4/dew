@@ -20,15 +20,22 @@ def posterior_moments(moments: jnp.ndarray) -> tuple[jnp.ndarray, jnp.ndarray]:
     return mean, jnp.clip(log_variance, -30.0, 20.0)
 
 
-def posterior_latent(moments: jnp.ndarray, key: jax.Array | None) -> jnp.ndarray:
-    """The posterior mean when `key` is None, else one draw from it (`posterior_moments`)."""
+def posterior_latent(moments: jnp.ndarray, key: jax.Array | None,
+                     noise: jnp.ndarray | None = None) -> jnp.ndarray:
+    """The posterior mean when `key` and `noise` are None, else one draw from it
+    (`posterior_moments`): `mean + deviation * noise`, a standard normal draw of
+    the mean's shape, drawn from `key` where `noise` is None. Raises
+    `ValueError` for a noise of another shape than the mean's."""
     mean, log_variance = posterior_moments(moments)
-    if key is None:
-        return mean
-    deviation = jnp.exp(0.5 * log_variance)
-    # Drawn in float32, as the rest of a step's draws are, whatever the
-    # moments' precision, so a float64 run draws the same numbers.
-    return mean + deviation * jax.random.normal(key, mean.shape, dtype=jnp.float32).astype(mean.dtype)
+    if noise is None:
+        if key is None:
+            return mean
+        # Drawn in float32, as the rest of a step's draws are, whatever the
+        # moments' precision, so a float64 run draws the same numbers.
+        noise = jax.random.normal(key, mean.shape, dtype=jnp.float32)
+    elif noise.shape != mean.shape:
+        raise ValueError(f"the posterior's noise is {noise.shape}, and its mean {mean.shape}")
+    return mean + jnp.exp(0.5 * log_variance) * noise.astype(mean.dtype)
 
 
 class AutoencoderKL(nn.Module):
@@ -117,8 +124,8 @@ class AutoencoderKL(nn.Module):
         moments = self.encoder(image)
         return self.quant_conv(moments) if self.quantize else moments
 
-    def encode(self, image, key=None):
-        return posterior_latent(self.moments(image), key)
+    def encode(self, image, key=None, noise=None):
+        return posterior_latent(self.moments(image), key, noise)
 
     def decode(self, latents):
         if self.post_quantize:

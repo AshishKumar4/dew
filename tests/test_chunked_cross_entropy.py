@@ -76,58 +76,49 @@ def test_vocabulary_bias_is_fp32_after_tied_or_untied_head_products(dtype, tied)
 def test_the_fused_head_takes_the_whole_heads_loss_and_gradients_under_the_float64_rule(dtype, softcap):
     """The gradient-in-forward head's weighted sum of losses and z-loss, and
     its gradients for the states, the head, the per-token scale and the bias,
-    as close to float64 as the whole-logits head's, over chunks whose last is
-    short, padded weights and a cap; its per-token losses, log Z and top-1
-    columns are the whole head's.
+    on par with the whole-logits head's over drawn heads and columns (check 1),
+    over chunks whose last is short, padded weights and a cap; its per-token
+    losses, log Z and top-1 columns are the whole head's."""
+    from reference_error import assert_as_exact
 
-    The scale's gradient sums each of the 10 tokens' logit cotangent times its
-    product, about nine times the bias's in size, and over its 37 entries the
-    whole head's own rounding draw falls anywhere from 0.4 to 3.7 times the
-    fused head's (twelve seeds, 2026-10-18), so it is held to the rule with the
-    order floor of its 10-term sum (`assert_leaves_as_exact`): at this seed the
-    fused head is 1.05e-6 from float64 against 4.1e-7 and a floor of 3.6e-6, an
-    fp32 unit of entries near 9.5."""
-    from reference_error import assert_as_exact_as_the_reference, assert_leaves_as_exact, float64_terms
-
-    states, matrix, targets = inputs(vocab=37, features=16, tokens=(2, 5), dtype=dtype)
-    # Sums exact in any order, so the chunks' products are the whole head's.
-    states, matrix = eighths(states, matrix)
-    scale, bias = columns(37)
     weights = jnp.asarray([[1, 1, 0, 1, 2], [1, 0, 1, 1, 1]], jnp.float32)
     z_loss = 1e-2
 
-    def whole(states, matrix, scale, bias):
+    def draw(seed):
+        states, matrix, targets = inputs(vocab=37, features=16, tokens=(2, 5), dtype=dtype, seed=seed)
+        # Sums exact in any order, so the chunks' products are the whole head's.
+        return (*eighths(states, matrix), *columns(37, seed), targets)
+
+    def whole(states, matrix, scale, bias, targets):
         head = OutputTable(matrix, vocab_major=False, bias=bias, softcap=softcap, scale=scale)
         logits = head.logits(states)
         log_z = jax.nn.logsumexp(logits, axis=-1)
         losses = log_z - jnp.take_along_axis(logits, targets[..., None], axis=-1)[..., 0]
         return jnp.sum(weights * (losses + z_loss * jnp.square(log_z))), (losses, log_z, logits)
 
-    def fused(states, matrix, scale, bias):
+    def fused(states, matrix, scale, bias, targets):
         return fused_head_loss(states, OutputTable(matrix, vocab_major=False, bias=bias, softcap=softcap,
                                                    scale=scale),
                                targets, weights, z_loss=z_loss, tile=(3, 11))
 
-    terms = (states, matrix, scale, bias)
+    def held(loss):
+        def run(*terms):
+            with jax.default_matmul_precision(EXERCISED[dtype]):
+                total, gradients = jax.value_and_grad(lambda *values: loss(*values)[0], argnums=(0, 1, 2, 3))(
+                    *terms)
+            return dict(zip(('loss', 'states', 'head', 'scale', 'bias'), (total, *gradients), strict=True))
+
+        return run
+
+    assert_as_exact(jax.jit(held(fused)), jax.jit(held(whole)), draw, f'{dtype} {softcap} fused head',
+                    seeds=FUSED_SEEDS)
+    terms = draw(0)
     with jax.default_matmul_precision(EXERCISED[dtype]):
-        (total, (losses, predicted, log_z)), gradients = jax.value_and_grad(
-            fused, argnums=(0, 1, 2, 3), has_aux=True)(*terms)
-        (reference, (expected, expected_z, logits)), expected_gradients = jax.value_and_grad(
-            whole, argnums=(0, 1, 2, 3), has_aux=True)(*terms)
+        _, (losses, predicted, log_z) = fused(*terms)
+        _, (expected, expected_z, logits) = whole(*terms)
     np.testing.assert_array_equal(predicted, logits.argmax(-1))
     np.testing.assert_allclose(losses, expected, rtol=1e-6, atol=1e-6)
     np.testing.assert_allclose(log_z, expected_z, rtol=1e-6, atol=1e-6)
-    with jax.enable_x64(new_val=True):
-        wide = [jnp.asarray(value, jnp.float64) for value in terms]
-        (exact, exact_gradients), (_, sizes) = float64_terms(
-            jax.value_and_grad(lambda *values: whole(*values)[0], argnums=(0, 1, 2, 3)), *wide)
-    held = zip(('loss', 'states', 'head', 'scale', 'bias'), (total, *gradients),
-               (reference, *expected_gradients), (exact, *exact_gradients), strict=True)
-    for label, mine, theirs, true in held:
-        if label != 'scale':
-            assert_as_exact_as_the_reference(mine, theirs, true, f'{dtype} {softcap} fused {label}')
-    assert_leaves_as_exact(gradients[2], expected_gradients[2], exact_gradients[2], reductions=targets.size,
-                           terms=sizes[2])
 
 
 @pytest.mark.parametrize('kind', ['nvfp4', 'fp8'])
@@ -181,55 +172,72 @@ def test_a_bf16_models_table_scores_states_handed_over_in_fp32_as_its_head_does(
         np.testing.assert_array_equal(OutputTable(table.matrix, table.vocab_major).logits(states), logits)
 
 
-def columns(vocab: int):
+def columns(vocab: int, seed: int = 0):
     """A per-token scale about 1 and a bias about 0, fp32, as a head's columns hold them past its product."""
-    return (jnp.exp(jax.random.normal(jax.random.key(4), (vocab,), jnp.float32) / 3),
-            jax.random.normal(jax.random.key(3), (vocab,), jnp.float32) / 17)
+    scale, bias = jax.random.split(jax.random.fold_in(jax.random.key(4), seed))
+    return (jnp.exp(jax.random.normal(scale, (vocab,), jnp.float32) / 3),
+            jax.random.normal(bias, (vocab,), jnp.float32) / 17)
+
+
+COLUMN_SEEDS = {"scale and bias": 64, "vocabulary split": 256}
+FUSED_SEEDS = 16
+"""Check 1's declared seeds for the fused head, sized by `seeds_for` (2026-10-21, on armada)."""
+"""Check 1's declared seeds for the head's gradient sites, sized by `seeds_for` (2026-10-21, on armada)."""
 
 
 @pytest.mark.parametrize('dtype', [jnp.float32, jnp.bfloat16])
 @pytest.mark.parametrize('tile', [None, (3, 11)], ids=['whole', 'tiled'])
 def test_the_scale_and_bias_gradients_match_full_logits_under_the_float64_rule(dtype, tile):
     """The per-token scale's and the bias's gradients of the tiled head and of
-    the whole-logits head, each taken past the product's rounding, as close to
-    float64 as the full logits' own."""
-    from reference_error import assert_as_exact_as_the_reference
+    the whole-logits head, each taken past the product's rounding, on par with
+    the full logits' own over drawn heads and columns (check 1)."""
+    from reference_error import assert_as_exact
 
     from dew.nn.precision import head_product
 
     # Sums exact in any order: a tile's product is then the whole product on
     # any device, as the oracle takes it, where an fp32 sum's last bit, which
     # a GPU's tile shape picks, can move a bf16 logit a whole bf16 step.
-    states, matrix, targets = inputs(vocab=37, features=16, tokens=(2, 5), dtype=dtype)
-    states, matrix = eighths(states, matrix)
-    terms = columns(37)
-    with jax.default_matmul_precision('default'):
-        def full(scale, bias):
+    def draw(seed):
+        states, matrix, targets = inputs(vocab=37, features=16, tokens=(2, 5), dtype=dtype, seed=seed)
+        return (*eighths(states, matrix), targets, *columns(37, seed))
+
+    def full(states, matrix, targets, scale, bias):
+        def loss(scale, bias):
             logits = OutputTable(matrix, vocab_major=False, bias=bias, scale=scale).logits(states)
             return optax.softmax_cross_entropy_with_integer_labels(logits, targets).mean()
 
-        def bounded(scale, bias):
+        with jax.default_matmul_precision('default'):
+            return dict(zip(('scale', 'bias'), jax.grad(loss, argnums=(0, 1))(scale, bias), strict=True))
+
+    def bounded(states, matrix, targets, scale, bias):
+        def loss(scale, bias):
             return chunked_cross_entropy(
                 states, OutputTable(matrix, vocab_major=False, bias=bias, scale=scale), targets, 4, tile=tile
             )[0].mean()
 
-        reference = jax.grad(full, argnums=(0, 1))(*terms)
-        actual = jax.grad(bounded, argnums=(0, 1))(*terms)
-        product = head_product('...d,dv->...v', states, matrix, None)
-        with jax.enable_x64(new_val=True):
-            # For bf16 the rounded product is exact input to the affine
-            # head: this oracle isolates its fp32 scale, bias and softmax gradient.
-            if dtype == jnp.float32:
-                product = jnp.einsum('...d,dv->...v', states.astype(jnp.float64),
-                                     matrix.astype(jnp.float64), precision=jax.lax.Precision.HIGHEST)
-            wide = product.astype(jnp.float64)
+        with jax.default_matmul_precision('default'):
+            return dict(zip(('scale', 'bias'), jax.grad(loss, argnums=(0, 1))(scale, bias), strict=True))
 
-            def truth(scale, bias):
-                return optax.softmax_cross_entropy_with_integer_labels(wide * scale + bias, targets).mean()
+    def truth(states, matrix, targets, scale, bias):
+        # For bf16 the rounded product is exact input to the affine head: this
+        # oracle isolates its fp32 scale, bias and softmax gradient, the product
+        # rounded as the head rounds it before it is widened.
+        if dtype == jnp.float32:
+            wide = jnp.einsum('...d,dv->...v', states, matrix, precision=jax.lax.Precision.HIGHEST)
+        else:
+            with jax.enable_x64(new_val=False), jax.default_matmul_precision('default'):
+                rounded = head_product('...d,dv->...v', jnp.asarray(states, dtype),
+                                       jnp.asarray(matrix, jnp.float32), None)
+            wide = jnp.asarray(np.asarray(rounded.astype(jnp.float32)), jnp.float64)
 
-            exact = jax.grad(truth, argnums=(0, 1))(*(term.astype(jnp.float64) for term in terms))
-    for label, mine, theirs, true in zip(('scale', 'bias'), actual, reference, exact, strict=True):
-        assert_as_exact_as_the_reference(mine, theirs, true, f'{dtype} vocabulary {label} gradient')
+        def loss(scale, bias):
+            return optax.softmax_cross_entropy_with_integer_labels(wide * scale + bias, targets).mean()
+
+        return dict(zip(('scale', 'bias'), jax.grad(loss, argnums=(0, 1))(scale, bias), strict=True))
+
+    assert_as_exact(jax.jit(bounded), jax.jit(full), draw, f'{dtype} vocabulary gradient',
+                    seeds=COLUMN_SEEDS["scale and bias"], truth_fn=truth)
 
 
 @pytest.mark.mesh(devices=2)
@@ -266,45 +274,50 @@ def test_a_vocabulary_split_head_rounds_a_confident_targets_gradient_as_one_devi
 def test_a_vocabulary_split_head_takes_every_gradient_under_the_float64_rule(tile):
     """Split over the vocabulary on a mesh, the head's loss and its gradients
     for the states, the head, the per-token scale and the bias are as close to
-    float64 as one device's whole logits, under the rule with the order floor
-    of the 20 tokens each column's gradients sum (`assert_leaves_as_exact`),
+    float64 as one device's whole logits over drawn heads and columns (check 1),
     and no collective carries an array the head's size: each device's columns,
     scale and bias stay in its shard."""
     from jax.sharding import NamedSharding, PartitionSpec as P
-    from reference_error import assert_leaves_as_exact, float64_terms
+    from reference_error import assert_as_exact
 
     from dew.training import MeshSpec
 
-    states, matrix, targets = inputs(vocab=512, features=16, tokens=(4, 5))
-    states, matrix = eighths(states, matrix)
-    scale, bias = columns(512)
+    def draw(seed):
+        states, matrix, targets = inputs(vocab=512, features=16, tokens=(4, 5), seed=seed)
+        return (*eighths(states, matrix), *columns(512, seed), targets)
 
-    def loss(states, matrix, scale, bias):
+    def loss(states, matrix, scale, bias, targets):
         head = OutputTable(matrix, vocab_major=False, bias=bias, scale=scale)
         losses, _, log_z = chunked_cross_entropy(states, head, targets, 4, tile=tile)
         return jnp.sum(losses + 1e-2 * jnp.square(log_z))
 
-    def whole(states, matrix, scale, bias):
+    def whole(states, matrix, scale, bias, targets):
         logits = OutputTable(matrix, vocab_major=False, bias=bias, scale=scale).logits(states)
         log_z = jax.nn.logsumexp(logits, axis=-1)
         losses = log_z - jnp.take_along_axis(logits, targets[..., None], axis=-1)[..., 0]
         return jnp.sum(losses + 1e-2 * jnp.square(log_z))
 
-    terms = (states, matrix, scale, bias)
-    gradient = jax.value_and_grad(loss, argnums=(0, 1, 2, 3))
+    gradient = jax.jit(jax.value_and_grad(loss, argnums=(0, 1, 2, 3)))
     mesh = MeshSpec(fsdp=2).build(jax.devices()[:2])
+    specs = (P('fsdp'), P(None, 'fsdp'), P('fsdp'), P('fsdp'), P())
+
+    def split(*terms):
+        with jax.set_mesh(mesh), jax.default_matmul_precision('highest'):
+            placed = [jax.device_put(term, NamedSharding(mesh, spec)) for term, spec in
+                      zip(terms, specs, strict=True)]
+            return jax.tree.map(np.asarray, gradient(*placed))
+
+    def alone(*terms):
+        with jax.default_matmul_precision('highest'):
+            return jax.value_and_grad(whole, argnums=(0, 1, 2, 3))(*terms)
+
+    assert_as_exact(split, alone, draw, 'vocabulary-split head', seeds=COLUMN_SEEDS["vocabulary split"])
+    terms = draw(0)
+    matrix = terms[1]
     with jax.set_mesh(mesh), jax.default_matmul_precision('highest'):
-        placed = [jax.device_put(term, NamedSharding(mesh, spec)) for term, spec in
-                  zip(terms, (P('fsdp'), P(None, 'fsdp'), P('fsdp'), P('fsdp')), strict=True)]
-        split = jax.jit(gradient)(*placed)
-        program = jax.jit(gradient).lower(*placed).compile().as_text()
-    with jax.default_matmul_precision('highest'):
-        reference = jax.value_and_grad(whole, argnums=(0, 1, 2, 3))(*terms)
-    with jax.enable_x64(new_val=True):
-        exact, sizes = float64_terms(jax.value_and_grad(whole, argnums=(0, 1, 2, 3)),
-                                     *(jnp.asarray(term, jnp.float64) for term in terms))
-    assert_leaves_as_exact(jax.tree.map(np.asarray, split), reference, exact, reductions=targets.size,
-                           terms=sizes)
+        placed = [jax.device_put(term, NamedSharding(mesh, spec))
+                  for term, spec in zip(terms, specs, strict=True)]
+        program = gradient.lower(*placed).compile().as_text()
     moved = [math.prod(shape) for _, shapes in collectives(program) for shape in shapes]
     assert moved and max(moved) < matrix.size // 2, moved
 
