@@ -63,6 +63,7 @@ rounding of the computation itself (`assert_computes_the_oracle`).
 """
 
 import dataclasses
+import hashlib
 
 import jax
 import jax.numpy as jnp
@@ -430,22 +431,49 @@ def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most
                          f"{most} seeds at {wide[:4]}; give the site larger inputs or fewer shared factors")
 
 
+def recording(path) -> dict[str, np.ndarray]:
+    """A recording of a reference over seeds (`indexed_recording`'s `stored`), read whole: where a pin
+    holds it, from the fetched store's local copy, checked against the pin; else from the file at
+    `path`, as git holds one of at most 1 MiB (tools/fetched_fixtures.py)."""
+    from tool_support import load
+
+    with np.load(load("fetched_fixtures").local(path), allow_pickle=False) as stored:
+        return dict(stored)
+
+
 def declared_seeds(path) -> dict[str, int]:
     """Each site's declared seed count in a recording of a reference over seeds (`indexed_recording`):
     its `<site>.seeds`, written at record time by `seeds_for` on the recorded reference."""
-    with np.load(path) as stored:
-        return {name.removesuffix(".seeds"): int(stored[name]) for name in stored.files
-                if name.endswith(".seeds")}
+    return {name.removesuffix(".seeds"): int(value) for name, value in recording(path).items()
+            if name.endswith(".seeds")}
 
 
-def indexed_recording(stored, site: str, seeds: int):
+def input_digest(inputs) -> np.uint64:
+    """A seed's inputs (a dict of NumPy arrays, a torch draw's converted) as 64 bits of the SHA-256 of
+    each array's name, dtype by name, shape and bytes in C order: what a recording of outputs alone
+    keeps, so that inputs drawn again are checked to be the recorded ones. The dtype goes by its name, as
+    some narrow formats share a byte code (float8_e4m3fn's and float8_e4m3fnuz's), and the shape as the
+    array's own, a scalar's included."""
+    digest = hashlib.sha256()
+    for name in sorted(inputs):
+        value = np.asarray(inputs[name])
+        digest.update(f"{name}:{value.dtype}:{value.shape};".encode())
+        digest.update(value.tobytes())
+    return np.frombuffer(digest.digest()[:8], np.uint64)[0]
+
+
+def indexed_recording(stored, site: str, seeds: int, *, inputs_of=None):
     """`assert_as_exact`'s draw, reference and truth for a reference recorded over seeds, where it cannot
-    run in the test (a CUDA-only library, a fetched source): `stored` holds `<site>.input.<name>`,
-    `<site>.reference.<name>` and `<site>.truth.<name>`, every array stacked over the seeds on its first
-    axis, the truth in float64. A draw is `(index, inputs)`, the index an integer `widened` keeps; the
-    reference and the truth read the recorded outputs at it, and Dew's function takes the same two
-    arguments and ignores the index. The recording covers check 1's redraw, (1 + REDRAW) times the
-    declared seeds, so a numerical failure stays a finding rather than running out of recorded seeds."""
+    run in the test (a CUDA-only library, a fetched source): `stored` holds `<site>.reference.<name>` and
+    `<site>.truth.<name>`, and `<site>.input.<name>` unless `inputs_of(seed)` draws a seed's inputs again
+    (a seeded NumPy or torch draw the generator made them by), every array stacked over the seeds on its
+    first axis, the truth in float64, and `<site>.redraw`, check 1's REDRAW it was recorded for. Inputs
+    drawn again are checked against the recording's `<site>.input_digest` (`input_digest`), so a
+    generator that changed since is named, not judged. A draw is `(index, inputs)`, the index an
+    integer `widened` keeps; the reference and the truth read the recorded outputs at it, and Dew's
+    function takes the same two arguments and ignores the index. The recording covers check 1's redraw,
+    (1 + REDRAW) times the declared seeds, so a numerical failure stays a finding rather than running
+    out of recorded seeds."""
     def tree(kind):
         prefix = f"{site}.{kind}."
         return {name.removeprefix(prefix): value for name, value in stored.items() if name.startswith(prefix)}
@@ -456,13 +484,30 @@ def indexed_recording(stored, site: str, seeds: int):
     if narrow:
         raise AssertionError(f"{site}: the recorded truth {narrow} is not float64; record it in float64, as "
                              f"no later widening recovers what a narrower recording dropped")
-    count = min(len(value) for part in (inputs, reference, truth) for value in part.values())
+    if inputs_of is None and not inputs:
+        raise AssertionError(f"{site}: no inputs recorded and no `inputs_of` to draw them again")
+    if int(stored.get(f"{site}.redraw", -1)) != REDRAW:
+        raise AssertionError(f"{site}: the recording holds no `{site}.redraw` of {REDRAW}, which "
+                             f"record_case writes and the fetched store's rule reads it by")
+    digests = stored.get(f"{site}.input_digest")
+    if inputs_of is not None and digests is None:
+        raise AssertionError(f"{site}: `inputs_of` draws the inputs again and the recording keeps no "
+                             f"digest to check them by; record the outputs alone (`store_inputs=False`)")
+    recorded = [*reference.values(), *truth.values(),
+                *(inputs.values() if inputs_of is None else [digests])]
+    count = min(len(value) for value in recorded)
     if count < (1 + REDRAW) * seeds:
         raise AssertionError(f"{site}: {count} recorded seeds, and check 1 over {seeds} may draw "
                              f"{(1 + REDRAW) * seeds}; record (1 + REDRAW) times the declared seeds")
 
     def draw(seed):
-        return np.int32(seed), {name: value[seed] for name, value in inputs.items()}
+        if inputs_of is None:
+            return np.int32(seed), {name: value[seed] for name, value in inputs.items()}
+        drawn = inputs_of(seed)
+        if input_digest(drawn) != digests[seed]:
+            raise AssertionError(f"{site}: seed {seed}'s inputs drawn again are not the recorded ones (their "
+                                 f"digest differs); the generator's draw changed since the recording")
+        return np.int32(seed), drawn
 
     def lookup(values):
         return jax.jit(lambda index, inputs: {name: jnp.asarray(value)[index]
