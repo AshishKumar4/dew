@@ -15,7 +15,15 @@ from jax.ad_checkpoint import checkpoint_name
 
 from dew.nn.dense import Dense
 
-from .activations import UNGATED, Activation, GatedActivation, Situ, gated_product, packed_gated_product
+from .activations import (
+    UNGATED,
+    Activation,
+    GatedActivation,
+    Situ,
+    gated_product,
+    packed_gated_product,
+    swiglu_clamped,
+)
 from .blocks import normal_kernel
 from .flops import projection_flops
 from .joined import joined_dense, joins
@@ -184,10 +192,7 @@ class GatedMLP(nn.Module):
         up = checkpoint_name(constrain(up, MLP_HIDDEN), 'up_proj')
         if self.ngpt is not None:
             return self._down(self._ngpt_hidden(self.ngpt, gate, up, activation), train)
-        if self.swiglu_limit is not None:
-            # GLM-5.3-Flash's clamp, modeling_glm5_next.py:98-104.
-            gate = jnp.minimum(gate, self.swiglu_limit)
-            up = jnp.clip(up, -self.swiglu_limit, self.swiglu_limit)
+        gate, up = swiglu_clamped(gate, up, self.swiglu_limit)
         if self.activation_sparsity:
             gate = gaussian_topk(gate, self.activation_sparsity)
         return self._down(gated_product(activation, axes=MLP_HIDDEN)(gate, up), train)

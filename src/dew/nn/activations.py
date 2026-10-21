@@ -171,6 +171,15 @@ def _rounded(activate: Callable[[jax.Array], jax.Array]) -> Callable[[jax.Array,
 _recomputed = functools.partial(jax.checkpoint, policy=jax.checkpoint_policies.nothing_saveable)
 
 
+def swiglu_clamped(gate: jax.Array, up: jax.Array, limit: float | None) -> tuple[jax.Array, jax.Array]:
+    """A gated MLP's gate and up projections clamped before their product, the gate from above and
+    the up projection both ways by `limit` (GLM-5.3-Flash's, modeling_glm5_next.py:98-104, and
+    DeepSeek V4's experts'); unclamped where `limit` is None."""
+    if limit is None:
+        return gate, up
+    return jnp.minimum(gate, limit), jnp.clip(up, -limit, limit)
+
+
 def gated_product(activation: GatedActivation, *, implementation: str = 'auto',
                   axes=None) -> Callable[[jax.Array, jax.Array], jax.Array]:
     """The product a gated MLP takes of its gate and up projections, rounded
@@ -185,23 +194,10 @@ def gated_product(activation: GatedActivation, *, implementation: str = 'auto',
     the operands' logical axes, place the kernel on a mesh."""
     if isinstance(activation, Situ):
         return activation
-    activate = _gate_function(activation, implementation)
-    rounded_product = _recomputed(_rounded(activate))
-
-    def portable(gate: jax.Array, up: jax.Array) -> jax.Array:
-        if jnp.finfo(jnp.result_type(gate, up)).bits >= 32:
-            return activate(gate) * up
-        return rounded_product(gate, up)
-
-    def product(gate: jax.Array, up: jax.Array) -> jax.Array:
-        chosen = 'xla' if activation != 'swiglu' else norm_swiglu.swiglu_kernel(
-            implementation, gate, up, axes=axes)
-        if chosen == 'pallas':
-            # Every order of its derivative is the portable product's; every level runs the kernels.
-            return norm_swiglu.swiglu(gate, up, portable, axes=axes)
-        return portable(gate, up)
-
-    return product
+    portable = _portable(_gate_function(activation, implementation), lambda gate, up: (gate, up))
+    return _dispatched(activation, portable,
+                       lambda gate, up: norm_swiglu.swiglu_kernel(implementation, gate, up, axes=axes),
+                       lambda gate, up, portable: norm_swiglu.swiglu(gate, up, portable, axes=axes))
 
 
 def packed_gated_product(activation: str, *, implementation: str = 'auto',
@@ -211,20 +207,36 @@ def packed_gated_product(activation: str, *, implementation: str = 'auto',
     writes the packed layout (`norm_swiglu.packed_swiglu`), and XLA's product
     recomputes from the packed output itself, so neither copies a half out.
     `axes` are the product's logical axes, `[..., H]`'s."""
-    activate = _gate_function(activation, implementation)
+    portable = _portable(_gate_function(activation, implementation),
+                         lambda gate_up: (gate_up[..., 0, :], gate_up[..., 1, :]))
+    return _dispatched(activation, portable,
+                       lambda gate_up: norm_swiglu.packed_swiglu_kernel(implementation, gate_up, axes=axes),
+                       lambda gate_up, portable: norm_swiglu.packed_swiglu(gate_up, portable, axes=axes))
+
+
+def _portable(activate, halves):
+    """The XLA product of a gate and up projection that `halves(*operands)` reads from the operands
+    (the two projections, or one packed output's two halves): `activate(gate) * up` at fp32 and
+    wider, else rounded where torch rounds it (`_rounded`) and recomputed from the operands
+    themselves in the backward, so a packed output is never copied into halves."""
     rounded = _rounded(activate)
-    rounded_product = _recomputed(lambda gate_up: rounded(gate_up[..., 0, :], gate_up[..., 1, :]))
+    rounded_product = _recomputed(lambda *operands: rounded(*halves(*operands)))
 
-    def portable(gate_up: jax.Array) -> jax.Array:
-        if jnp.finfo(gate_up.dtype).bits >= 32:
-            return activate(gate_up[..., 0, :]) * gate_up[..., 1, :]
-        return rounded_product(gate_up)
+    def portable(*operands: jax.Array) -> jax.Array:
+        gate, up = halves(*operands)
+        if jnp.finfo(jnp.result_type(gate, up)).bits >= 32:
+            return activate(gate) * up
+        return rounded_product(*operands)
 
-    def product(gate_up: jax.Array) -> jax.Array:
-        chosen = 'xla' if activation != 'swiglu' else norm_swiglu.packed_swiglu_kernel(
-            implementation, gate_up, axes=axes)
-        if chosen == 'pallas':
-            return norm_swiglu.packed_swiglu(gate_up, portable, axes=axes)
-        return portable(gate_up)
+    return portable
+
+
+def _dispatched(activation, portable, kernel_choice, kernel):
+    """The product over the operands: SwiGLU's Pallas `kernel(*operands, portable)` where
+    `kernel_choice(*operands)` chooses it (every order of its derivative is the portable product's;
+    every level runs the kernels), else `portable`, which every other activation runs."""
+    def product(*operands: jax.Array) -> jax.Array:
+        chosen = 'xla' if activation != 'swiglu' else kernel_choice(*operands)
+        return kernel(*operands, portable) if chosen == 'pallas' else portable(*operands)
 
     return product
