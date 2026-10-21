@@ -265,7 +265,8 @@ def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
     the probabilities rounded to the values' dtype for their product, the output normalized in fp32 and
     `output_mod` applied before it rounds to the query's dtype. A query that sees no key and starts from
     no state gives zeros. With `residuals`, also each query's running maximum `m` and denominator `total`
-    `[B, H, Q]` (natural log, unnormalized), fp32. No hooks where `hooks` is None."""
+    `[B, H, Q]` (natural log, unnormalized), fp32, a query that sees no key and starts from no state
+    holding 0 for both, so every residual is finite. No hooks where `hooks` is None."""
     hooks = Hooks() if hooks is None else hooks
     batch, queries, heads, width = query.shape
     kv_heads = key.shape[2]
@@ -300,7 +301,7 @@ def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
         o = jnp.where(total[:, None] > 0, acc / jnp.where(total > 0, total, 1)[:, None], 0)
         if hooks.output_mod is not None:
             o = hooks.output_mod(o, *(_per_head(p, row, head) for p in hooks.output_params))
-        return o.astype(query.dtype), m, total
+        return o.astype(query.dtype), safe, total
 
     rows = jnp.arange(batch)
     out, m, total = jax.vmap(jax.vmap(one, in_axes=(None, 0)), in_axes=(0, None))(rows, jnp.arange(heads))
