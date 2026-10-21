@@ -44,11 +44,11 @@ PACKED = (False, True)
 
 SEEDS = dict(zip(((hooks, packed) for hooks in HOOKS + FORMED for packed in PACKED), (
     8, 8, 8, 8, 8, 8, 8, 8, 16, 16, 64, 64, 16, 16, 16, 16, 32, 32, 64, 64, 8, 8, 8, 8,
-    128, 64, 128, 128, 8, 8, 16, 16, 64, 64), strict=True))
+    128, 64, 128, 128, 32, 32, 16, 16, 64, 64), strict=True))
 """Each site's declared seeds (hooks in `HOOKS` then `FORMED` order, one sequence then packed), sized
-independently by `seeds_for` on armada (2026-10-21). The vector-decay delta rule's two take 32 where its
-control resolved at 8: the chunked form's own spread left the pooled ratio 1.315 inconclusive over 8
-seeds ([1.046, 1.702])."""
+independently by `seeds_for` on armada (2026-10-21). The vector-decay delta rule's sites take 32 where
+their control resolved at 8: the chunked form's own spread left the pooled ratio inconclusive over 8
+seeds (1.315, [1.046, 1.702]; under the l2 norm and output norm 1.317, [1.050, 1.652])."""
 
 
 def draw(hooks: recurrence.Hooks, packed: bool, seed: int) -> tuple[Chunk]:
