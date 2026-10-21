@@ -677,11 +677,11 @@ class Dataset:
 
     def stats(self, records: int = 1000) -> dict[str, float]:
         """The counts a run logs from a fresh, lazy pass over at most `records` accepted records:
-        the rows delivered and the drops by reason (`dew.data.mixing.CorpusCounts`), the records
-        the pass read a second (`data/records_per_second`, one reader with no workers, so a
-        floor on what loading workers read), and for token rows, under "text", the tokens they
-        hold (`data/tokens`) and the share of their places that pad a packed row
-        (`data/padding`)."""
+        the rows delivered and the drops by reason (`dew.data.mixing.CorpusCounts`), the rows the
+        pass read a second once its reader was open (`data/records_per_second`: the loading
+        settings default to none, while workers or prefetching the chain writes run as written),
+        and for token rows, under "text", the tokens they hold (`data/tokens`) and the share of
+        their places that pad a row (`data/padding`)."""
         from dew.data.compile import _diagnostic
         from dew.data.mixing import data_metrics, state_counts
         from dew.records import record
@@ -853,17 +853,19 @@ def _brief(text: str, width: int = 120) -> str:
 
 
 def _token_places(batch: Batch) -> tuple[int, int]:
-    """The places a batch's token rows under "text" hold, and those of them that pad a packed row
-    (segment 0 in its coordinates); none where it holds no token ids."""
+    """The places a batch's token rows under "text" hold, and those of them that pad a row, as a
+    model reads them (`dew.nn.inputs.real_slots`): segment 0 of a packed row and the places its
+    validity marks invalid, in its `text_coordinates` or in stored `text_segment_ids` and
+    `text_attention_mask`; none where it holds no token ids."""
     tokens = batch.get("text")
     if not isinstance(tokens, np.ndarray) or tokens.dtype.kind not in "iu":
         return 0, 0
-    from dew.nn.inputs import Coordinates
+    from dew.nn.inputs import COORDINATES_FIELD, VALIDITY_FIELD, real_slots
 
-    coordinates = batch.get("text_coordinates")
-    padded = (int(np.count_nonzero(np.asarray(coordinates.segments) == 0))
-              if isinstance(coordinates, Coordinates) else 0)
-    return int(tokens.size), padded
+    fields = {name: batch[f"text_{name}"] for name in (COORDINATES_FIELD, VALIDITY_FIELD, "segment_ids")
+              if f"text_{name}" in batch}
+    real = real_slots(fields, tokens.shape, xp=np)
+    return int(tokens.size), int(tokens.size - np.count_nonzero(real))
 
 
 def _shown[Field](value: np.ndarray | bytes | Field) -> np.ndarray | bytes | Field | str:
