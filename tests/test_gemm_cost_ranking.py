@@ -26,8 +26,8 @@ LOADED_LATENCY = "the load latency under load, the waiting term's being unloaded
 TRANSPOSED_READS = "the kernel gradient's transposed-operand shared-memory reads, which cost 8 warps more"
 L2_REUSE = "the L2's reuse of a few experts' weights, which the device-byte term counts as rereads"
 ACCUMULATOR_REGISTERS = "a warpgroup's accumulator registers at 192 columns, which the model does not charge"
-CONSUMER_OVERLAP = ("two consumer warpgroups overlapping each other's MMA issue and epilogue, which the model's one "
-                    "warpgroup's latency term does not credit")
+CONSUMER_OVERLAP = ("two consumer warpgroups overlapping each other's MMA issue and epilogue, which the "
+                    "model's one warpgroup's latency term does not credit")
 MISSES = {
     ("sm80", "triton", "qwen3-30b-a3b gate_up", "kernel_gradient"): TRANSPOSED_READS,
     ("sm80", "triton", "kimi-linear gate_up", "kernel_gradient"): TRANSPOSED_READS,
