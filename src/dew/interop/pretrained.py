@@ -32,7 +32,7 @@ from dew.diffusion.process import Process
 from dew.diffusion.schedules.source import SourceSchedule
 from dew.inference import BlockGeneration, MaskedGeneration, TextGeneration
 from dew.inference.pipeline import place
-from dew.inference.tasks import Processor as TaskProcessor
+from dew.inference.tasks import Processor as TaskProcessor, prepared
 from dew.inputs import InputSpec
 from dew.interop import decoder_parts, gguf, hf_decoders as decoders, mamba2, sources, verify
 from dew.interop.codecs import SourceQuantization, source_quantization
@@ -629,7 +629,8 @@ class PretrainedDecoder(Pretrained):
         rows = return_sequences(self.config, self.generation_config)
         policy, logits, strategy = source_decoding(
             self.config, self.generation_config, self.model, rows, sampling)
-        return TextGeneration(
+        # Prepared as every route's task is (`prepared`); a load already packed its projections.
+        return prepared(TextGeneration(
             self.model,
             self.variables,
             self.text_processor,
@@ -639,7 +640,7 @@ class PretrainedDecoder(Pretrained):
             n=rows,
             logits=logits,
             strategy=strategy,
-        )
+        ))
 
 
 
@@ -666,13 +667,14 @@ class PretrainedMaskedDecoder(Pretrained):
         if mask_id is None:
             raise TypeError("a masked decoder generates by unmasking, and this model names no mask token")
         audit_masked(config, generation)
-        return MaskedGeneration(self.model, self.variables, MDLM(mask_id=mask_id)(),
+        task = MaskedGeneration(self.model, self.variables, MDLM(mask_id=mask_id)(),
                                 self.text_processor,
                                 eos_token_ids=eos_ids(config, generation),
                                 pad_token_id=pad_id(config, generation),
                                 max_new_tokens=generation_limit(config, generation, "max_new_tokens"),
                                 max_length=generation_limit(config, generation, "max_length"),
                                 n=return_sequences(config, generation))
+        return prepared(task)
 
 
 @dataclass(frozen=True)

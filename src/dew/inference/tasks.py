@@ -657,16 +657,17 @@ class TextGeneration(_NativeTextTask):
         model, variables, settings, processor = cls._loaded(
             directory, TextSettings, lambda model, settings: None, ema=ema, step=step, mesh=mesh,
             layout=layout, dtype=dtype, param_dtype=param_dtype, trust=trust)
-        return cls.from_settings(model, variables, settings, processor)
+        return cls.from_settings(model, variables, settings, processor, layout=layout)
 
     @classmethod
     def from_settings(cls, model: nn.Module, variables: Variables, settings: TextSettings,
-                      processor: Processor | None) -> TextGeneration:
+                      processor: Processor | None, *, layout: Layout | None = None) -> TextGeneration:
         """The task `settings` describe over `model` and `variables`, reading text through
         `processor`: the previews' policy and budget become its defaults. A live objective
-        (`LMObjective.build_task`) and a saved run (`from_run`) build it alike."""
-        return cls(model, variables, processor, sampling=settings.sampling,
-                   max_new_tokens=settings.max_new_tokens or None)
+        (`LMObjective.build_task`) and a saved run (`from_run`) build it alike, prepared
+        (`prepared`) under `layout`."""
+        return prepared(cls(model, variables, processor, sampling=settings.sampling,
+                            max_new_tokens=settings.max_new_tokens or None), layout)
 
 
 
@@ -741,16 +742,18 @@ class BlockGeneration(_NativeTextTask):
         model, variables, settings, processor = cls._loaded(
             directory, BlockSettings, lambda model, settings: refuse_non_denoiser(model), ema=ema,
             step=step, mesh=mesh, layout=layout, dtype=dtype, param_dtype=param_dtype, trust=trust)
-        return cls.from_settings(model, variables, settings, processor)
+        return cls.from_settings(model, variables, settings, processor, layout=layout)
 
     @classmethod
     def from_settings(cls, model: nn.Module, variables: Variables, settings: BlockSettings,
-                      processor: Processor | None) -> BlockGeneration:
+                      processor: Processor | None, *, layout: Layout | None = None) -> BlockGeneration:
         """The task `settings` describe over `model` and `variables`, reading text through
         `processor`: their process, pad id and canvas budget. A live objective
-        (`BlockDiffusionObjective.build_task`) and a saved run (`from_run`) build it alike."""
-        return cls(model, variables, settings.process, processor, pad_token_id=settings.pad_token_id,
-                   max_new_tokens=settings.max_new_tokens or None)
+        (`BlockDiffusionObjective.build_task`) and a saved run (`from_run`) build it alike,
+        prepared (`prepared`) under `layout`."""
+        return prepared(cls(model, variables, settings.process, processor,
+                            pad_token_id=settings.pad_token_id,
+                            max_new_tokens=settings.max_new_tokens or None), layout)
 
 
 
@@ -826,17 +829,19 @@ class MaskedGeneration(_NativeTextTask):
         model, variables, settings, processor = cls._loaded(
             directory, MaskedSettings, checked, ema=ema, step=step, mesh=mesh, layout=layout, dtype=dtype,
             param_dtype=param_dtype, trust=trust)
-        return cls.from_settings(model, variables, settings, processor)
+        return cls.from_settings(model, variables, settings, processor, layout=layout)
 
     @classmethod
     def from_settings(cls, model: nn.Module, variables: Variables, settings: MaskedSettings,
-                      processor: Processor | None) -> MaskedGeneration:
+                      processor: Processor | None, *, layout: Layout | None = None) -> MaskedGeneration:
         """The task `settings` describe over `model` and `variables`, reading text through
         `processor`: their process, solver, step count and response budget. A live objective
-        (`MaskedDiffusionObjective.build_task`) and a saved run (`from_run`) build it alike."""
+        (`MaskedDiffusionObjective.build_task`) and a saved run (`from_run`) build it alike,
+        prepared (`prepared`) under `layout`."""
         assert isinstance(settings.solver, Unmask)
-        return cls(model, variables, settings.process, processor, solver=settings.solver,
-                   steps=settings.sampling_steps, max_new_tokens=settings.max_new_tokens or None)
+        return prepared(cls(model, variables, settings.process, processor, solver=settings.solver,
+                            steps=settings.sampling_steps, max_new_tokens=settings.max_new_tokens or None),
+                        layout)
 
 
 
@@ -858,4 +863,36 @@ class MaskedGeneration(_NativeTextTask):
         return _canvas_text(self.processor, generation, "inference.masked.decode")
 
 
-__all__ = ["SHAPE_BUCKETS", "BlockGeneration", "MaskedGeneration", "Processor", "TextGeneration"]
+
+def prepared[T: TextGeneration | BlockGeneration | MaskedGeneration](task: T,
+                                                                   layout: Layout | None = None) -> T:
+    """`task` as every route builds it, a live objective's (`from_settings`), a saved run's
+    (`from_run`, `dew.pipeline`) and a source's (`Pretrained.text_generation`) alike: the
+    projection groups its model reads packed are packed (`projection_groups`, which leaves a packed
+    group as it is), whether its weights sit on the host or on a mesh, so two routes over one model
+    compute alike. A packed weight on a mesh is placed as `layout` places it (the trainer's default
+    when None), and every other weight keeps its placement; weights on the host stay there, for the
+    task to place at its first call (`resident`), so they can still be quantized on the host."""
+    from dew.inference.projections import pack_projections, projection_groups
+    from dew.training.distributed import Layout as DefaultLayout
+
+    def node(path):
+        held = task.variables["params"]
+        for part in path:
+            held = held[part]
+        return held
+
+    groups = tuple(group for group in projection_groups(task.model, task.variables)
+                   if group.packed not in node(group.path))
+    if not groups:
+        return task
+    packed = pack_projections(task.variables, groups)
+    mesh = mesh_of(packed)
+    if mesh is not None:
+        shardings = (DefaultLayout() if layout is None else layout).shardings(mesh, packed)
+        packed = jax.tree.map(
+            lambda leaf, sharding: jax.device_put(leaf, sharding) if isinstance(leaf, jax.Array)
+            and not leaf.sharding.is_equivalent_to(sharding, leaf.ndim) else leaf, packed, shardings)
+    return task.bind(packed)
+
+__all__ = ["SHAPE_BUCKETS", "BlockGeneration", "MaskedGeneration", "Processor", "TextGeneration", "prepared"]
