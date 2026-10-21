@@ -412,9 +412,43 @@ def test_a_merge_keeps_an_entry_its_parents_renamed_apart_only_once(lint, tmp_pa
     subprocess.run(["git", "checkout", "-q", "main"], cwd=repo, check=True)
     subprocess.run(["git", "mv", "tests/test_a.py", "tests/test_c.py"], cwd=repo, check=True)
     _commit(repo, _inventory({"tests/test_c.py": 1}), "main renames it")
-    _merged(repo, "main", "lane", _inventory({"tests/test_b.py": 1, "tests/test_c.py": 1}),
-            "the merge keeps both", {"tests/test_c.py": "a = 1  # one comparison\n"})
+    # Each side edits its copy past git's notice of the rename, its date tightened, before the merge.
+    for branch, name in (("lane", "test_b.py"), ("main", "test_c.py")):
+        subprocess.run(["git", "checkout", "-q", branch], cwd=repo, check=True)
+        _commit(repo, _inventory({f"tests/{name}": 1}, by="2026-11-19"), "edited",
+                {f"tests/{name}": f"a = 1  # one comparison\n{branch * 40}\n" * 8})
+    _merged(repo, "main", "lane", _inventory({"tests/test_b.py": 1, "tests/test_c.py": 1}, by="2026-11-19"),
+            "the merge keeps both")
     assert any("renamed it apart" in finding.message for finding in lint.ratchet(repo))
+    # Kept under a third name the merge itself gives, the copy is the same entry still.
+    subprocess.run(["git", "reset", "-q", "--hard", "HEAD~1"], cwd=repo, check=True)
+    _merged(repo, "main", "lane", _inventory({"tests/test_d.py": 1, "tests/test_c.py": 1}, by="2026-11-19"),
+            "the merge renames one copy")
+    subprocess.run(["git", "mv", "-f", "tests/test_b.py", "tests/test_d.py"], cwd=repo, check=True)
+    amend = ["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--amend", "--no-edit"]
+    subprocess.run(amend, cwd=repo, check=True)
+    assert any("renamed it apart" in finding.message for finding in lint.ratchet(repo))
+
+
+def test_a_merge_keeps_an_entry_whole_as_some_parent_holding_it_does(lint, tmp_path):
+    """One parent raised a file's count by rereading the rule and tightened its date, the other kept
+    the lower count and the later date; a merge taking the higher count and the later date holds the
+    entry looser than either parent, and is refused."""
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
+    _commit(repo, _inventory({"tests/test_a.py": 7}, by="2026-11-21"), "made",
+            {"tests/test_a.py": "a = 1\n", lint.RULE: "r = 1\n"})
+    subprocess.run(["git", "checkout", "-q", "-b", "lane"], cwd=repo, check=True)
+    _commit(repo, _inventory({"tests/test_a.py": 7}, by="2026-11-21"), "the lane works", {"tests/o.py": "o\n"})
+    subprocess.run(["git", "checkout", "-q", "main"], cwd=repo, check=True)
+    _commit(repo, _inventory({"tests/test_a.py": 8}, by="2026-11-20"), "the rule reads more, sooner",
+            {lint.RULE: "r = 2\n"})
+    _merged(repo, "main", "lane", _inventory({"tests/test_a.py": 8}, by="2026-11-21"), "the merge takes both")
+    assert any("test_a.py" in finding.message for finding in lint.ratchet(repo))
+    subprocess.run(["git", "reset", "-q", "--hard", "HEAD~1"], cwd=repo, check=True)
+    _merged(repo, "main", "lane", _inventory({"tests/test_a.py": 8}, by="2026-11-20"), "the merge takes main's")
+    assert list(lint.ratchet(repo)) == []
 
 
 def test_only_the_heads_own_rereadings_authorize_a_count_against_its_base(lint, tmp_path):
