@@ -10,7 +10,17 @@ import numpy as np
 import pytest
 from reference_error import assert_as_exact
 from test_attention_template import CASES, ROWS, arguments
-from test_attention_triton import FORMS, HOOKS, drawing, gate_of, geometry, hooks_for
+from test_attention_triton import (
+    BACKWARD_FORMS,
+    FORMS,
+    HOOKS,
+    SCORE_HOOKS,
+    drawing,
+    gate_of,
+    geometry,
+    hooks_for,
+    score_hooks,
+)
 
 from dew.nn.kernels import tuning
 from dew.nn.kernels.templates import (
@@ -58,6 +68,50 @@ def test_both_mainloops_compute_the_same_bits_under_every_hook(hooks, dtype):
     for name, mine, theirs in zip(("output", "maximum", "denominator"), triton, portable, strict=True):
         np.testing.assert_array_equal(np.asarray(mine, np.float32), np.asarray(theirs, np.float32),
                                       err_msg=f"{hooks} {jnp.dtype(dtype).name} {name}")
+
+
+def both_backward(case: dict, names: tuple, dtype, tiles: attention_triton.Tiles):
+    """The Triton mainloop's and the plain-JAX mainloop's gradients over `case` and the score hooks
+    `names` at `tiles` (both launches'), seed 0."""
+    queries, keys = geometry(case)
+    spans = template.spans(queries, keys, ROWS, **arguments(case))
+    score_mod, kinds, draw_hooks = score_hooks(names, queries, keys, 32)
+    query, key, value = drawing(queries, keys, dtype)(0)
+    dout = jax.random.normal(jax.random.key(1000), (ROWS, queries, 4, 32), jnp.float32).astype(dtype)
+    params, initial = draw_hooks(0)
+    hooks = template.Hooks(score_mod, tuple(template.Param(value, kind)
+                                            for value, kind in zip(params, kinds, strict=True)), initial)
+    config = attention_triton.BackwardTiles(tiles.block_q, tiles.block_k, tiles.warps, tiles.stages,
+                                            tiles.warps, tiles.stages)
+    with tuning.pinned({attention_triton.TritonBackward: config}):
+        triton = attention_triton.backward(query, key, value, spans, hooks, dout, interpret=True)
+    portable = attention_portable.backward(query, key, value, spans, hooks, dout, block_q=tiles.block_q,
+                                           block_k=tiles.block_k, pad=attention_triton.BLOCK)
+    return triton, portable
+
+
+def assert_same_bits(mine, theirs, label: str):
+    """Every leaf of two gradient trees equal to the bit."""
+    for (path, a), b in zip(jax.tree_util.tree_leaves_with_path(mine), jax.tree.leaves(theirs), strict=True):
+        np.testing.assert_array_equal(np.asarray(a, np.float32), np.asarray(b, np.float32),
+                                      err_msg=f"{label} {jax.tree_util.keystr(path)}")
+
+
+@pytest.mark.parametrize("tiles", TILES[:2], ids=str)
+@pytest.mark.parametrize("form", BACKWARD_FORMS)
+def test_both_mainloops_compute_the_same_gradients_over_every_call_form(form, tiles):
+    """Each call form's gradients of the queries, keys and values, fp32, no hooks."""
+    triton, portable = both_backward(CASES[form], (), jnp.float32, tiles)
+    assert_same_bits(triton, portable, form)
+
+
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16], ids=["float32", "bfloat16"])
+@pytest.mark.parametrize("hooks", SCORE_HOOKS)
+def test_both_mainloops_compute_the_same_gradients_under_every_score_hook(hooks, dtype):
+    """Each score hook's gradients (its parameters' and the initial state's too) over a windowed causal
+    call of packed documents, in both dtypes."""
+    triton, portable = both_backward(CASES["causal-documents-window"], SCORE_HOOKS[hooks], dtype, TILES[1])
+    assert_same_bits(triton, portable, f"{hooks} {jnp.dtype(dtype).name}")
 
 
 MERGE_SEEDS = 8

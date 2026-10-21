@@ -21,7 +21,17 @@ from jax.experimental import pallas as pl
 
 from dew.nn.kernels import generation, tuning
 from dew.nn.kernels.templates import attention_algebra as algebra, cost as costs
-from dew.nn.kernels.templates.attention import Hooks, Initial, KeySpans, Kind, block_map, padded_call
+from dew.nn.kernels.templates.attention import (
+    DQ_GRADS,
+    Gradients,
+    Hooks,
+    KeySpans,
+    Kind,
+    block_map,
+    gradients,
+    kept_dtype,
+    padded_call,
+)
 from dew.nn.kernels.templates.base import Template
 
 DTYPES = (jnp.float32, jnp.bfloat16, jnp.float16)
@@ -74,11 +84,6 @@ def _mode(dtype) -> str:
 
 TRACED_TILE = 16
 """The tile a hook is traced at for its picks' key (`_hook_program`)."""
-
-
-def _kept_dtype(dtype) -> str:
-    """A hook parameter's dtype in the kernels: fp32 for a floating one (`_padded`), else its own."""
-    return "float32" if jnp.issubdtype(dtype, jnp.floating) else jnp.dtype(dtype).name
 
 
 def _hook_program(name: str, hook, kinds: tuple[Kind, ...], dtypes: tuple[str, ...], *,
@@ -359,8 +364,8 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
     op = TritonForward(score_mod=hooks.score_mod, output_mod=hooks.output_mod,
                        score_kinds=tuple(param.kind for param in hooks.score_params),
                        output_kinds=tuple(param.kind for param in hooks.output_params),
-                       score_dtypes=tuple(_kept_dtype(param.value.dtype) for param in hooks.score_params),
-                       output_dtypes=tuple(_kept_dtype(param.value.dtype) for param in hooks.output_params),
+                       score_dtypes=tuple(kept_dtype(param.value.dtype) for param in hooks.score_params),
+                       output_dtypes=tuple(kept_dtype(param.value.dtype) for param in hooks.output_params),
                        output_width=call.value.shape[-1],
                        scale=query.shape[3] ** -0.5 if scale is None else scale, form=spans.form,
                        keys=spans.keys)
@@ -371,11 +376,6 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
         return out[:, :queries, :, :value_width]
     out, peak, total = out
     return out[:, :queries, :, :value_width], peak[:, :, :queries], total[:, :, :queries]
-
-
-DQ_GRADS = (Kind.HEAD, Kind.QUERY, Kind.TILE)
-"""The parameter kinds whose gradients the dQ program writes: a head's partial sum over its queries, its
-queries' own, and its tiles' entries; a key parameter's the dK/dV program writes."""
 
 
 def _key_param(ref, kind: Kind, head, rows):
@@ -819,98 +819,18 @@ def _key_param_spec(kind: Kind, param: jax.Array, queries: int, block_k: int) ->
             raise ValueError("an output hook's parameter has no score tile")
 
 
-@jax.tree_util.register_dataclass
-@dataclasses.dataclass(frozen=True)
-class Gradients:
-    """The backward's gradients: of the queries, keys and values, of each score hook parameter (the
-    order `Hooks.score_params` gives them), and of the softmax's initial state where it has one."""
-
-    query: jax.Array
-    key: jax.Array
-    value: jax.Array
-    score_params: tuple[jax.Array, ...]
-    initial: Initial | None
+def _launch(query, key, value, dout, peak, total, initial_term, start, end, query_ids, key_ids, score_params,
+            *, score_mod, score_kinds: tuple[Kind, ...], score_dtypes: tuple[str, ...], scale: float,
+            interpret: bool):
+    """The Triton mainloop's two launches under one tuning decision (`TritonBackward`)."""
+    op = TritonBackward(score_mod=score_mod, score_kinds=score_kinds, scale=scale, score_dtypes=score_dtypes)
+    return op(query, key, value, dout, peak, total, initial_term, start, end, query_ids, key_ids,
+              score_params, interpret=interpret)
 
 
 def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None,
              dout: jax.Array, *, scale: float | None = None, interpret: bool = False) -> Gradients:
-    """The template's backward (`TritonBackward`) of `forward` under the output's cotangent `dout`
-    `[B, Q, H, Dv]`: each gradient fp32, then rounded to its input's dtype. The dQ launch first takes each
-    query's softmax again, online over the tiles and products its main pass takes, to its maximum,
-    denominator and `D = sum_j p dP`, as the softmax's derivative takes it: the weights it differentiates
-    sum to one over its own logits, and each `dP - D` is taken about the product of the key that holds
-    the query's maximum, so no rounding of that key's product enters it; the main pass then refines `D`
-    once from its own sums for the dK/dV launch and the head, query and initial state's gradients
-    (`_dq_kernel`). It reads none of the forward's residuals. The output hook is no part of it: a
-    differentiated call applies `output_mod` past the kernel, where its own derivative runs, and passes
-    `dout` before it. Deterministic: every gradient element is written by one program, a head
-    parameter's partial sums added in a fixed order and a key head's query heads summed in XLA."""
-    hooks = Hooks() if hooks is None else hooks
-    if hooks.output_mod is not None:
-        raise ValueError("the backward takes the output before the output hook (`backward`'s docstring)")
-    batch, queries, heads, width = query.shape
-    keys, kv_heads, value_width = key.shape[1], key.shape[2], value.shape[-1]
-    group = heads // kv_heads
-    scale = width ** -0.5 if scale is None else scale
-    # One cotangent for every part: the output's, in the operands' dtype as the reference takes it.
-    dout = dout.astype(query.dtype)
-    cotangent = jnp.swapaxes(dout.astype(jnp.float32), 1, 2)
-    state = hooks.initial
-    if state is None:
-        nothing = jnp.zeros((batch, heads, queries), jnp.float32)
-        starts = nothing - jnp.inf, nothing, nothing
-    else:
-        # The softmax's initial state: its maximum, denominator and share of D's numerator, in fp32.
-        starts = (state.m.astype(jnp.float32), state.total.astype(jnp.float32),
-                  jnp.sum(state.acc.astype(jnp.float32) * cotangent, axis=-1))
-    call = padded_call(query, key, value, spans, hooks, BLOCK)
-    padded_dout = jnp.pad(dout, ((0, 0), (0, call.query.shape[1] - queries), (0, 0),
-                                 (0, call.value.shape[-1] - value_width)))
-    operands = (call.query, call.key, call.value, padded_dout)
-    rows = (call.start, call.end, call.query_ids, call.key_ids, call.score_params)
-    kinds = tuple(param.kind for param in hooks.score_params)
-    dtypes = tuple(_kept_dtype(param.value.dtype) for param in hooks.score_params)
-    outputs = TritonBackward(score_mod=hooks.score_mod, score_kinds=kinds, scale=scale, score_dtypes=dtypes)(
-        *operands, *(call.rows(start) for start in starts), *rows, interpret=interpret)
-    dq, softmax = outputs[0], outputs[1:6]
-    grads_out = list(outputs[6:])
-    dq_grads = [grads_out.pop(0) for kind in kinds if kind in DQ_GRADS]
-    dk, dv, *key_grads = grads_out
-    delta, anchor, peak, total, mass = (array[:, :, :queries] for array in softmax)
-    delta = anchor + delta
-    padded_k, padded_d, padded_dv = call.key.shape[1], call.key.shape[-1], call.value.shape[-1]
-    dk = dk.reshape(batch, padded_k, kv_heads, group, padded_d).sum(axis=3)
-    dv = dv.reshape(batch, padded_k, kv_heads, group, padded_dv).sum(axis=3)
-    grads = []
-    for param in hooks.score_params:
-        match param.kind:
-            case Kind.HEAD:
-                grads.append(dq_grads.pop(0).sum(axis=(0, 1))[:param.value.shape[0], 0])
-            case Kind.QUERY:
-                grads.append(dq_grads.pop(0)[:, :, :queries])
-            case Kind.TILE:
-                grads.append(dq_grads.pop(0)[:, :, :queries, :keys])
-            case Kind.KEY:
-                grads.append(key_grads.pop(0)[:, :, :keys])
-            case Kind.OUTPUT:
-                raise ValueError("a score hook takes no output parameter")
-    initial = None
-    if state is not None:
-        # The initial state as one more softmax term, its weight exp(m0 - m) / T and value acc0 / total0:
-        # each gradient divides by T first and takes the factor exp(m0 - m) last, so a state that weighs
-        # little beside the keys (a subnormal factor) is rounded once there, as the reference rounds it.
-        factor = jnp.where((total > 0) & jnp.isfinite(starts[0]), jnp.exp(starts[0] - peak), 0.0)
-        inverse = jnp.where(total > 0, 1.0 / jnp.where(total > 0, total, 1.0), 0.0)
-        # Its maximum's cotangent, that term's score cotangent, taken whole as the reference's derivative
-        # takes it; exactly 0 for a query that read only its state, whose output its maximum leaves unmoved.
-        moved = (jnp.sum(state.acc.astype(jnp.float32) * cotangent, axis=-1)
-                 - state.total.astype(jnp.float32) * delta) * inverse
-        initial = Initial(m=jnp.where(mass > 0, moved * factor, 0.0).astype(state.m.dtype),
-                          total=(-(delta * inverse) * factor).astype(state.total.dtype),
-                          acc=((cotangent * inverse[..., None]) * factor[..., None]).astype(state.acc.dtype))
-    return Gradients(dq[:, :queries, :, :width].astype(query.dtype),
-                     dk[:, :keys, :, :width].astype(key.dtype),
-                     dv[:, :keys, :, :value_width].astype(value.dtype),
-                     tuple(grad.astype(param.value.dtype) for grad, param in zip(grads, hooks.score_params,
-                                                                                 strict=True)),
-                     initial)
+    """The template's backward on the Triton mainloop (`gradients`, `TritonBackward`). `interpret` runs it
+    on the CPU."""
+    return gradients(functools.partial(_launch, interpret=interpret), query, key, value, spans, hooks, dout,
+                     block=BLOCK, scale=scale)
