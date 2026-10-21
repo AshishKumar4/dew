@@ -386,13 +386,12 @@ def test_sft_gemma4_validates_on_conversations_it_never_trains_on(tmp_path):
     used to read the training split again and score what the run trained on."""
     from transformers import AutoTokenizer
 
-    from dew.config.data import loader
+    from dew.data.compile import compile
 
     example = load("sft_gemma4", "examples")
     config, tokenizer, chat = example.smoke_config(example.Config(smoke=True, out=tmp_path))
     run = example.run_config(config, tokenizer, chat)
-    data = loader(run.data, batch=run.trainer.batch_size, read=run.data_read, provision=run.provision,
-                  loading=run.loading, validation_records=run.validation_records)
+    data = compile(run.data, validation=run.validation, provision=True)
     vocabulary = AutoTokenizer.from_pretrained(tokenizer)
     words = [{token for turn in turns
               for token in vocabulary.encode(turn["content"], add_special_tokens=False)}
