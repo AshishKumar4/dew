@@ -506,9 +506,10 @@ def test_the_plan_runs_as_one_wave_on_the_pool(ci, tmp_path, monkeypatch, capsys
 def test_one_wave_holds_a_file_its_measured_cut_keeps_split(ci, tmp_path, monkeypatch):
     """A file measured at a cut stays at that cut while its heaviest group is within `KEPT` of the target,
     so the task count is not monotone in the target: ten files of twenty 10 s tests, each run at 2,200 s
-    as twenty groups of 110 s, plan as 400 tasks at any target under 2,200 s and as twenty at 2,200 s.
-    The target grows to where they fit, in a few plans, and no fewer containers than the files' medians
-    need are declared impossible (one file of 500 s measured as twenty 10 s groups fits two containers)."""
+    as twenty groups of 110 s, plan as 400 tasks at any target under 2,200 s and as twenty from there.
+    The target grows by tenths to within a tenth of where they fit, in a few plans, and no fewer
+    containers than the files' medians need are declared impossible (one file of 500 s measured as
+    twenty 10 s groups fits two containers)."""
     names = [f"tests/test_cut{n}.py" for n in range(10)]
     records = {f"{name}::test_{index}": 10.0 for name in names for index in range(20)}
     for name in names:
@@ -521,7 +522,8 @@ def test_one_wave_holds_a_file_its_measured_cut_keeps_split(ci, tmp_path, monkey
     plans = []
     planning = ci.plan
     monkeypatch.setattr(ci, "plan", lambda target, timings: plans.append(target) or planning(target, timings))
-    assert ci.one_wave(timings, 160) == 2200.0 and len(planning(2200.0, timings)) == 20
+    target = ci.one_wave(timings, 160)
+    assert 2200.0 <= target <= 2420.0 and len(planning(target, timings)) == 20, target
     assert len(plans) <= 30, plans
     single = {"files": {ci.row(python, names[0], ""): 500.0 for python in ci.PYTHONS},
               "rows": {ci.row(python, names[0], f"{index}/20"): 10.0 for python in ci.PYTHONS
