@@ -923,10 +923,8 @@ class DeepseekV4Mixer(MixerBase):
             raise ValueError("a deepseek_v4 layer attends a sliding window, not a chunk")
         if ctx.kv_shared and self.compressor != 'csa2':
             raise ValueError("of the deepseek_v4 kinds only CSA2 shares its entries across layers")
-        if ctx.kv_cache != KVCache():
-            raise ValueError(
-                "the deepseek_v4 mixer keeps its own compressed cache; it takes no kv_cache layout"
-            )
+        ctx.refuse("deepseek_v4", {"kv_cache": ctx.kv_cache != KVCache()},
+                   "it keeps its own compressed cache, which takes no kv_cache layout")
         ctx.refuse("deepseek_v4", ctx.policies(),
                    "its attention keeps sinks of its own, softmaxes in fp32 and projects out through "
                    "grouped low-rank heads, without a softcap, value scale, bias or dropout")

@@ -37,7 +37,7 @@ import dew
 from dew.config import ModelConfig, ObjectiveConfig, OptimConfig, RunConfig, TrainerConfig
 from dew.config.data import Augment, ImageData, loader
 from dew.data import ByteTokenizer, Concatenate, Files, Hub, Loading, Source
-from dew.data.dataset import DataPartition
+from dew.data.dataset import DataPartition, Loader
 from dew.interop.diffusion_gemma import build
 from dew.nn.inputs import ModelInputs
 from dew.objectives.base import VALID_ROWS
@@ -168,65 +168,59 @@ def smoke_splits(config: Config) -> dict[str, str]:
     import datasets
     from PIL import Image
 
-    features = datasets.Features({"image": datasets.Image(),
+    # Each image's id, which rides through the run's stream beside its label.
+    features = datasets.Features({"image": datasets.Image(), "image_id": datasets.Value("int64"),
                                   "label": datasets.ClassLabel(names=["pink rose", "yellow tulip"])})
     files = {}
     for index, split in enumerate(SPLITS):
         images = [Image.fromarray(np.random.RandomState(10 * index + row).randint(
             0, 256, (config.staging_size, config.staging_size, 3), np.uint8)) for row in range(8)]
         files[split] = str(config.out / "data" / f"{split}.parquet")
-        datasets.Dataset.from_dict({"image": images, "label": [row % 2 for row in range(8)]},
+        datasets.Dataset.from_dict({"image": images, "image_id": [100 * index + row for row in range(8)],
+                                    "label": [row % 2 for row in range(8)]},
                                    features=features).to_parquet(files[split])
     return files
 
 
-def main(config: Config) -> Path:
-    if config.smoke:
-        config = replace(config, image_size=16, staging_size=20, prompt_tokens=24, canvas_length=32,
-                         batch_size=8, steps=4, warmup_steps=1, features=32, layers=1,
-                         vision_features=16, vision_layers=1, eval_every=2)
-    (config.out / "data").mkdir(parents=True, exist_ok=True)
-    parts = splits(config)
-    # Train on train + validation, score on test, which the run never reads.
-    # The crops and flips run on the host, before the caption layout reads their pixels into the
-    # model's inputs; a device augment would run after it, on the batch the layout already made.
-    spec = ImageData(source=Concatenate((parts["train"], parts["validation"])), validation=parts["test"],
+def sized(config: Config) -> Config:
+    """`config`, with `--smoke` the few-pixel, few-step run."""
+    if not config.smoke:
+        return config
+    return replace(config, image_size=16, staging_size=20, prompt_tokens=24, canvas_length=32, batch_size=8,
+                   steps=4, warmup_steps=1, features=32, layers=1, vision_features=16, vision_layers=1,
+                   eval_every=2)
+
+
+def class_names(parts: dict[str, Source]) -> tuple[str, ...]:
+    """The label names the dataset's Hugging Face schema records, as its source reads them."""
+    names = read_record(parts["train"].metadata().get("class_names", {}), "class names").get("label")
+    return tuple(name.strip() for name in strings(names, "class_names.label"))
+
+
+def caption_data(config: Config, parts: dict[str, Source], labels: tuple[str, ...]) -> Loader:
+    """The run's batches: `data_spec`'s splits, read as the run reads them, in the caption layout."""
+    return loader(data_spec(config, parts), batch=config.batch_size, read="memory", provision=True,
+                  loading=loading(config), host=(CaptionLayout(config, labels),))
+
+
+def loading(config: Config) -> Loading:
+    return Loading(workers=0, threads=1 if config.smoke else 8)
+
+
+def data_spec(config: Config, parts: dict[str, Source]) -> ImageData:
+    """Train on train + validation, score on test, which the run never reads. The crops and flips
+    run on the host, before the caption layout reads their pixels into the model's inputs; a device
+    augment would run after it, on the batch the layout already made."""
+    return ImageData(source=Concatenate((parts["train"], parts["validation"])), validation=parts["test"],
                      caption_columns=(), image_size=config.image_size, staging_size=config.staging_size,
                      augment=Augment(flip=True, crop_scale=(0.6, 1.0), backend="host"))
-    # The label names the dataset's Hugging Face schema records, as its source reads them.
-    names = read_record(parts["train"].metadata().get("class_names", {}), "class names").get("label")
-    labels = tuple(name.strip() for name in strings(names, "class_names.label"))
-    record = model_config(config)
-    model = build(record, dtype="float32" if config.smoke else "bfloat16")
-    run = RunConfig(
-        model=ModelConfig.from_model(model), data=spec,
-        loading=Loading(workers=0, threads=1 if config.smoke else 8),
-        objective=ObjectiveConfig("block_diffusion", {"prompt_length": config.prompt_tokens,
-                                                      "pad_token_id": PAD}),
-        optim=OptimConfig(weight_decay=0.05, clip_grads=1.0, schedule=Cosine(
-            peak=config.learning_rate, warmup_steps=config.warmup_steps, end=config.learning_rate / 20)),
-        trainer=TrainerConfig(checkpoint_dir=str(config.out / "checkpoints"), keep=1,
-                              batch_size=config.batch_size, steps=config.steps,
-                              log_every=1 if config.smoke else 100, eval_every=config.eval_every,
-                              checkpoint_every=config.eval_every, mesh=MeshSpec(fsdp=1),
-                              multi_host=False, compilation_cache_dir=None))
-    prepare_process(run.trainer.wandb, run.trainer.multi_host, run.trainer.xla_flags,
-                    run.trainer.compilation_cache_dir, layout=run.trainer.layout)
-    objective = run.objective.build(model=model)
-    data = loader(spec, batch=run.trainer.batch_size, read="memory", provision=True, loading=run.loading,
-                  host=(CaptionLayout(config, labels),))
-    started = time.perf_counter()
-    name = "flowers-caption"
-    run.train(objective, data, name=name, metrics=(Perplexity(),),
-              summary={"dataset": config.dataset, "classes": len(labels)})
-    trained = time.perf_counter()
 
-    # The other half, from the files alone: the run directory loads as the
-    # canvas task its objective saved, and it captions every test image.
-    run_dir = Path(run.trainer.checkpoint_dir) / name
-    task = replace(dew.pipeline(str(run_dir)), eos_token_ids=(EOS,), pad_token_id=PAD)
+
+def captioned(task, data, config: Config, labels) -> list[dict[str, str]]:
+    """Each real test image's label and the caption `task` writes for it, the prompt's tokens its
+    image and the canvas its caption, drawn under one key."""
     tokenizer = ByteTokenizer()
-    captions, correct = [], 0
+    captions = []
     stream = data.val(DataPartition())
     try:
         for batch in stream:
@@ -235,18 +229,59 @@ def main(config: Config) -> Path:
             for row, length, label, real in zip(
                     np.asarray(generated.tokens), np.asarray(generated.lengths), batch["label"],
                     batch.get(VALID_ROWS, np.ones(len(batch["label"]), bool)), strict=True):
-                if not real:
-                    continue
-                text = tokenizer.decode([int(token) for token in row[config.prompt_tokens:][:length]
-                                         if token < 256])
-                captions.append({"label": labels[int(label)], "caption": text})
-                correct += text == caption(labels[int(label)])
+                if real:
+                    captions.append({"label": labels[int(label)], "caption": tokenizer.decode(
+                        [int(token) for token in row[config.prompt_tokens:][:length] if token < 256])})
     finally:
         stream.close()
+    return captions
+
+
+def main(config: Config) -> Path:
+    config = sized(config)
+    (config.out / "data").mkdir(parents=True, exist_ok=True)
+    parts = splits(config)
+    spec = data_spec(config, parts)
+    labels = class_names(parts)
+    record = model_config(config)
+    model = build(record, dtype="float32" if config.smoke else "bfloat16")
+    run = RunConfig(
+        model=ModelConfig.from_model(model), data=spec,
+        loading=loading(config),
+        objective=ObjectiveConfig("block_diffusion", {"prompt_length": config.prompt_tokens,
+                                                      "pad_token_id": PAD}),
+        optim=OptimConfig(weight_decay=0.05, clip_grads=1.0, schedule=Cosine(
+            peak=config.learning_rate, warmup_steps=config.warmup_steps, end=config.learning_rate / 20)),
+        # A smoke run keeps both of its checkpoints, so what training moved between them can be read.
+        trainer=TrainerConfig(checkpoint_dir=str(config.out / "checkpoints"), keep=2 if config.smoke else 1,
+                              batch_size=config.batch_size, steps=config.steps,
+                              log_every=1 if config.smoke else 100, eval_every=config.eval_every,
+                              checkpoint_every=config.eval_every, mesh=MeshSpec(fsdp=1),
+                              multi_host=False, compilation_cache_dir=None))
+    prepare_process(run.trainer.wandb, run.trainer.multi_host, run.trainer.xla_flags,
+                    run.trainer.compilation_cache_dir, layout=run.trainer.layout)
+    objective = run.objective.build(model=model)
+    data = caption_data(config, parts, labels)
+    started = time.perf_counter()
+    name = "flowers-caption"
+    state = run.train(objective, data, name=name, metrics=(Perplexity(),),
+                      summary={"dataset": config.dataset, "classes": len(labels)})
+    trained = time.perf_counter()
+
+    # The other half, from the files alone: the run directory loads as the
+    # canvas task its objective saved, and it captions every test image, as
+    # the trained model in this process does.
+    run_dir = Path(run.trainer.checkpoint_dir) / name
+    restored = replace(dew.pipeline(str(run_dir)), eos_token_ids=(EOS,), pad_token_id=PAD)
+    live = replace(objective.pipeline(state), eos_token_ids=(EOS,), pad_token_id=PAD)
+    captions = captioned(restored, data, config, labels)
     report = {"dataset": config.dataset, "train_images": data.records, "test_images": len(captions),
               "classes": len(labels), "device": jax.devices()[0].device_kind, "steps": config.steps,
               "batch_size": config.batch_size, "train_seconds": round(trained - started, 1),
-              "caption_accuracy": correct / len(captions), "captions": captions[:32]}
+              "caption_accuracy": sum(row["caption"] == caption(row["label"]) for row in captions)
+              / len(captions),
+              "captions": captions[:32],
+              "restored_matches_live": captions == captioned(live, data, config, labels)}
     (config.out / "result.json").write_text(json.dumps(report, indent=2) + "\n")
     (config.out / "model-config.json").write_text(json.dumps(record, indent=2) + "\n")
     (config.out / "captions.jsonl").write_text("".join(json.dumps(row) + "\n" for row in captions))

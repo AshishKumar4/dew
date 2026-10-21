@@ -1035,43 +1035,105 @@ def test_a_bf16_decoder_scores_the_same_on_one_device_and_split_over_four(mixtur
 def test_an_expert_gated_product_rounds_its_projections_and_product_under_jit(activation):
     """An expert's gate and up come out of `expert_projection`, whose fp32
     sum XLA can carry into the activation past the sum's bf16 cast. One
-    expert takes the fixture's gate g and up u through projections that sum
-    each with an eighth of its bf16 ulp, which rounds back to g and u only
-    if the projection's rounding survives, and a down projection that hands
-    the product out unchanged: the MLP's output and its input's gradient
-    must be Torch's product and gradients of the same gate and up."""
-    from dew.nn.moe import ExpertMLP
+    expert takes gate g and up u through projections that sum each with an
+    eighth of its bf16 ulp, which rounds back to g and u only if the
+    projection's rounding survives, and a down projection that hands the
+    product out unchanged: on the fixture's g and u the MLP's output must be
+    Torch's product, and over drawn ones its input's gradient as exact as
+    Torch's (`_torch_gated_gradients`) by the float64 gate: the fused kernel
+    rounds the gate's gradient once from fp32, where Torch rounds the
+    cotangent first."""
+    from reference_error import assert_as_exact
 
     fixture = np.load(Path(__file__).parent / "fixtures" / "gated_product" / "bf16.npz")
-    tokens, width = 16, 128
     gate, up, cotangent, output, d_gate, d_up = (
-        np.asarray(fixture[f"{activation}/{key}"], np.float32).reshape(tokens, width)
+        np.asarray(fixture[f"{activation}/{key}"], np.float32).reshape(GATED_SHAPE)
         for key in ("gate", "up", "cotangent", "output", "d_gate", "d_up"))
+    fixed = tuple(jnp.asarray(value, jnp.bfloat16) for value in (gate, up, cotangent))
+    expert = _expert_gated(activation)
+    out, _ = jax.jit(expert)(*fixed)
+    np.testing.assert_array_equal(np.asarray(out, np.float32),
+                                  np.hstack([output] + [np.zeros_like(output)] * 3), err_msg="output")
+    reference = functools.partial(_torch_gated_gradients, activation)
+    # The reference arm is Torch's own: on the fixture it gives the gradients Torch recorded there.
+    for got, want in zip(reference(*fixed), (d_gate, d_gate, d_up, d_up), strict=True):
+        np.testing.assert_array_equal(np.asarray(got, np.float32), want)
 
-    def eighth_ulp(values):
-        magnitude = np.abs(values)
-        exponent = np.floor(np.log2(np.where(magnitude > 0, magnitude, 1.0)))
-        return np.where(magnitude > 0, np.sign(values) * 2.0 ** (exponent - 10), 0.0).astype(np.float32)
+    def draw(seed):
+        if seed == 0:
+            return fixed
+        rng = np.random.default_rng(seed)
+        # The fixture's laws: gate 3 N(0, 1), up and cotangent N(0, 1).
+        return tuple(jnp.asarray(scale * rng.standard_normal(GATED_SHAPE), jnp.bfloat16)
+                     for scale in (3, 1, 1))
 
+    activated = GATED_ACTIVATIONS[activation]
+
+    def truth(gate, up, cotangent):
+        d_gate, d_up = jax.grad(lambda gate, up: jnp.sum(activated(gate) * up * cotangent), (0, 1))(gate, up)
+        return d_gate, d_gate, d_up, d_up
+
+    assert_as_exact(jax.jit(lambda *inputs: _blocks(expert(*inputs)[1])), reference, draw,
+                    f"{activation} input gradient", seeds=GATED_SEEDS, truth_fn=truth)
+
+
+GATED_SHAPE = (16, 128)
+GATED_SEEDS = 8
+"""The gated product's declared draws (`reference_error.seeds_for` of Torch's gradients on them)."""
+GATED_ACTIVATIONS = {"swiglu": jax.nn.silu, "geglu": functools.partial(jax.nn.gelu, approximate=True),
+                     "geglu_exact": functools.partial(jax.nn.gelu, approximate=False)}
+"""Each gated activation's float64 truth."""
+
+
+def _expert_gated(activation):
+    """One expert of `ExpertMLP` whose projections hand `gate` and `up` (each summed with an eighth of
+    its bf16 ulp) to its gated product and the product out unchanged: `(gate, up, cotangent)` to the
+    MLP's output and its input's gradient."""
+    from dew.nn.moe import ExpertMLP
+
+    tokens, width = GATED_SHAPE
     eye, zero = np.eye(width, dtype=np.float32), np.zeros((width, width), np.float32)
     kernels = {"gate_proj": np.vstack([eye, eye, zero, zero]), "up_proj": np.vstack([zero, zero, eye, eye]),
                "down_proj": np.hstack([eye, zero, zero, zero])}
     variables = {"params": {name: {"kernel": jnp.asarray(np.stack([kernel] * 2))}
                             for name, kernel in kernels.items()}}
     model = ExpertMLP(2, width, 4 * width, activation=activation, dtype=jnp.bfloat16)
-    x = jnp.asarray(np.hstack([gate, eighth_ulp(gate), up, eighth_ulp(up)]), jnp.bfloat16)
     weights, indices = jnp.ones((tokens, 1), jnp.float32), jnp.zeros((tokens, 1), jnp.int32)
-    slot_cotangent = jnp.asarray(np.hstack([cotangent] + [np.zeros_like(cotangent)] * 3), jnp.bfloat16)
 
-    def forward_and_backward(x, cotangent):
+    def eighth_ulp(values):
+        mantissa, exponent = jnp.frexp(values.astype(jnp.float32))
+        return jnp.where(values != 0, jnp.ldexp(jnp.sign(mantissa), exponent - 11), 0.0)
+
+    def run(gate, up, cotangent):
+        x = jnp.hstack([gate.astype(jnp.float32), eighth_ulp(gate), up.astype(jnp.float32),
+                        eighth_ulp(up)]).astype(jnp.bfloat16)
+        slot_cotangent = jnp.hstack([cotangent] + [jnp.zeros_like(cotangent)] * 3)
         out, pull = jax.vjp(lambda x: model.apply(variables, x, weights, indices), x)
-        return out, pull(cotangent)[0]
+        return out, pull(slot_cotangent)[0]
 
-    out, dx = jax.jit(forward_and_backward)(x, slot_cotangent)
-    np.testing.assert_array_equal(np.asarray(out, np.float32),
-                                  np.hstack([output] + [np.zeros_like(output)] * 3), err_msg="output")
-    np.testing.assert_array_equal(np.asarray(dx, np.float32), np.hstack([d_gate, d_gate, d_up, d_up]),
-                                  err_msg="input gradient")
+    return run
+
+
+def _blocks(dx):
+    """The input gradient's four blocks: the gate's twice and the up's twice."""
+    return tuple(jnp.split(dx, 4, axis=1))
+
+
+def _torch_gated_gradients(activation, gate, up, cotangent):
+    """Torch's gradients of its bf16 gated product `act(gate) * up` (transformers' gated MLP, as
+    tools/gated_product_reference.py runs it), in the input gradient's four blocks."""
+    import torch
+    import torch.nn.functional as F
+
+    act = {"swiglu": F.silu, "geglu": functools.partial(F.gelu, approximate="tanh"),
+           "geglu_exact": F.gelu}[activation]
+    gate, up, cotangent = (torch.from_numpy(np.asarray(value, np.float32)).bfloat16()
+                           for value in (gate, up, cotangent))
+    gate.requires_grad_()
+    up.requires_grad_()
+    (act(gate) * up).backward(cotangent)
+    d_gate, d_up = (jnp.asarray(value.grad.float().numpy(), jnp.bfloat16) for value in (gate, up))
+    return d_gate, d_gate, d_up, d_up
 
 
 def test_exclusive_self_attention_removes_the_own_value_direction_per_query_head():
