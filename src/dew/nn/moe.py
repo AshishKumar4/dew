@@ -211,11 +211,17 @@ class Router(nn.Module):
     `expert_bias` (`bias_vl`, model.py:807-820), given the `media` mask.
 
     `routing_block` with `block_experts` is LLaDA2.2's block routing
-    (modeling_llada2_moe.py, LLaDA2MoeGate.block_routing): the tokens in
-    row-major order fall into blocks of `routing_block`, a block's score for
+    (modeling_llada2_moe.py, LLaDA2MoeGate.block_routing): a block's score for
     an expert is its best token's, and each token chooses among the block's
-    `block_experts` best. A trailing partial block routes by its own tokens,
-    where the reference asserts a whole one.
+    `block_experts` best. The caller numbers the blocks (`blocks`,
+    `dew.nn.inputs.numbered_blocks`): each row's and each packed document's
+    own, of `routing_block` places counted over its real tokens, a partial
+    last block routing by its own tokens and padding voting for none. The
+    release flattens the batch's rows into one stream before cutting blocks
+    and asserts whole ones, so a row's experts there depend on the rows beside
+    it; Dew keeps each request's routing its own, which is the release's
+    computation wherever a row is whole blocks of real tokens (one row, or
+    rows a whole number of blocks long).
     """
     num_experts: int
     in_features: int
@@ -304,10 +310,10 @@ class Router(nn.Module):
             self.tid2eid = self.variable(
                 'moe', 'tid2eid', jnp.zeros, (self.hash_vocab, self.top_k), jnp.int32)
 
-    def __call__(self, x, tokens=None, media=None, routes: Routes | None = None):
+    def __call__(self, x, tokens=None, media=None, routes: Routes | None = None, blocks=None):
         logits = self.logits(x)
         scores = self._activated(logits)
-        indices = chosen_experts(lambda: self._selected(scores, tokens, media),
+        indices = chosen_experts(lambda: self._selected(scores, tokens, media, blocks),
                                  (*scores.shape[:-1], self.top_k), routes)
         # The load each expert took, for the step that balances the bias:
         # written only when a caller opens the 'router' collection, and never
@@ -327,8 +333,12 @@ class Router(nn.Module):
                 weights = weights / (jnp.sum(weights, axis=-1, keepdims=True) + WEIGHT_SUM_EPSILON)
         return weights * self.routed_scaling_factor, indices
 
-    def _selected(self, scores, tokens, media):
+    def _selected(self, scores, tokens, media, blocks):
         """The experts this router chooses on its own: `[..., top_k]`."""
+        if (blocks is None) != (self.routing_block is None):
+            raise ValueError("a block router chooses each block's experts together, from the blocks its "
+                             "caller numbers (dew.nn.inputs.numbered_blocks), and only a block router "
+                             "reads them")
         if self.hash_vocab is not None:
             if tokens is None:
                 raise ValueError("hash routing selects by the token ids, which the caller passes")
@@ -338,9 +348,8 @@ class Router(nn.Module):
         selection = scores if not self.expert_bias else scores + self.bias.value
         if media is not None:
             selection = jnp.where(media[..., None], scores + self.bias_vl.value, selection)
-        if self.routing_block is not None and self.block_experts is not None:
-            selection = jnp.where(self.block_mask(selection, self.routing_block, self.block_experts),
-                                   selection, -jnp.inf)
+        if blocks is not None and self.block_experts is not None:
+            selection = jnp.where(self.block_mask(selection, blocks, self.block_experts), selection, -jnp.inf)
         if self.expert_groups > 1:
             selection = jnp.where(self.group_mask(selection), selection, -jnp.inf)
         _, indices = jax.lax.top_k(selection, self.top_k)
@@ -379,22 +388,24 @@ class Router(nn.Module):
             jax.nn.one_hot(groups, self.expert_groups, dtype=jnp.int32), axis=-2)
         return jnp.repeat(kept > 0, per_group, axis=-1)
 
-    def block_mask(self, selection, block: int, experts: int):
-        """True where an expert is among its token's block's best (`routing_block`).
+    @staticmethod
+    def block_mask(selection, blocks, experts: int):
+        """True where an expert is one of the `experts` best of its token's block: each block's score
+        for an expert is its best token's selection score (the release's `block_routing`). `blocks`
+        `[..., S]` numbers each row's blocks from 0 (`numbered_blocks`); a padding token, numbered -1,
+        is a block of its own beside them, so it moves no real block's score."""
+        *rows, length, count = selection.shape
 
-        The tokens flatten in row-major order, as the reference's
-        `view(-1, hidden)` leaves them; a short last block is padded with
-        rows that score nothing, so it routes by its own tokens alone.
-        """
-        flat = selection.reshape(-1, self.num_experts)
-        tokens = flat.shape[0]
-        blocks = (tokens + block - 1) // block
-        padded = jnp.pad(flat, ((0, blocks * block - tokens), (0, 0)),
-                         constant_values=-jnp.inf)
-        best = jnp.max(padded.reshape(blocks, block, self.num_experts), axis=1)
-        _, allowed = jax.lax.top_k(best, experts)
-        kept = jnp.sum(jax.nn.one_hot(allowed, self.num_experts, dtype=jnp.int32), axis=-2)
-        return jnp.repeat(kept > 0, block, axis=0)[:tokens].reshape(selection.shape)
+        def row(scores, ids):
+            ids = jnp.where(ids < 0, length, ids)
+            best = jax.ops.segment_max(scores, ids, num_segments=length + 1)
+            _, allowed = jax.lax.top_k(best, experts)
+            kept = jnp.sum(jax.nn.one_hot(allowed, count, dtype=jnp.int32), axis=-2) > 0
+            return kept[ids]
+
+        flat = jax.vmap(row)(selection.reshape(-1, length, count),
+                             jnp.broadcast_to(blocks, (*rows, length)).reshape(-1, length))
+        return flat.reshape(selection.shape)
 
 
 def grouped_matmul_kernel(implementation: str, compute: Dtype, operands: tuple[Dtype, ...],
@@ -1133,8 +1144,8 @@ class SparseMLP(nn.Module):
         """It takes a layer's replayed experts (`RoutesExperts`)."""
         return True
 
-    def __call__(self, x, tokens=None, media=None, routes: Routes | None = None):
-        weights, indices = self.gate(x, tokens, media, routes)
+    def __call__(self, x, tokens=None, media=None, routes: Routes | None = None, blocks=None):
+        weights, indices = self.gate(x, tokens, media, routes, blocks)
         if self.latent_features is None:
             routed = self.experts(x, weights, indices)
         else:

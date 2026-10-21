@@ -1017,6 +1017,56 @@ def test_llada_moe_routing_limits_change_the_forward(llada_moe_source):
                         truth_fn=lambda seed: truth[int(seed)], seeds=8)
 
 
+def llada22_routes(source, tokens, **fields) -> dict:
+    """Each routed layer's chosen experts `[B, S, top_k]`, sorted, for `tokens` under `fields`."""
+    _, state = source.model.apply(source.variables, jnp.asarray(tokens, jnp.int32), **fields,
+                                  mutable=['router'])
+    return {layer: np.sort(np.asarray(values['mlp']['gate']['indices'][0]), axis=-1)
+            for layer, values in state['router'].items()}
+
+
+def test_llada22_block_routing_is_each_requests_own():
+    """LLaDA2.2 routes each block of `block_size` places together. The release cuts its blocks from
+    the batch flattened into one stream, so there a row's experts depend on the rows beside it; Dew
+    numbers each request's blocks over its own real tokens (`numbered_blocks`), the release's blocks
+    wherever a row is whole blocks (the recorded probes). Two requests 6 and 9 tokens long, neither a
+    whole number of 4-token blocks, batched with left padding, route every real token to the experts
+    it routes to alone: their blocks do not meet, and the padding votes for none."""
+    source = Pretrained.load(FIXTURES / 'llada22-tiny', dtype='float32', attention_impl='reference')
+    assert source.model.mixture.routing_block == 4
+    ids = np.load(FIXTURES / 'llada22-tiny' / 'probe_ids.npy')
+    requests = [ids[1, 0, :6], ids[2, 1, :9]]
+    width = max(len(request) for request in requests)
+    padded = np.stack([np.pad(request, (width - len(request), 0)) for request in requests])
+    valid = np.stack([np.arange(width) >= width - len(request) for request in requests])
+    batched = llada22_routes(source, padded, attention_mask=jnp.asarray(valid))
+    assert batched
+    for row, request in enumerate(requests):
+        alone = llada22_routes(source, request[None])
+        for layer, chosen in alone.items():
+            np.testing.assert_array_equal(batched[layer][row, width - len(request):], chosen[0],
+                                          err_msg=f'request {row}, {layer}')
+
+
+def test_llada22_block_routing_is_each_packed_documents_own():
+    """Two documents packed in one row, 6 and 7 tokens, route every token to the experts it routes to
+    alone: each document's blocks are counted from its own first token, so neither a block nor its
+    shortlist spans the boundary."""
+    source = Pretrained.load(FIXTURES / 'llada22-tiny', dtype='float32', attention_impl='reference')
+    ids = np.load(FIXTURES / 'llada22-tiny' / 'probe_ids.npy')
+    documents = [ids[3, 0, :6], ids[4, 1, :7]]
+    packed = np.concatenate(documents)[None]
+    segments = np.concatenate([np.full(len(document), index + 1) for index, document in enumerate(documents)])
+    together = llada22_routes(source, packed, segment_ids=jnp.asarray(segments[None], jnp.int32))
+    start = 0
+    for index, document in enumerate(documents):
+        alone = llada22_routes(source, document[None])
+        for layer, chosen in alone.items():
+            np.testing.assert_array_equal(together[layer][0, start:start + len(document)], chosen[0],
+                                          err_msg=f'document {index}, {layer}')
+        start += len(document)
+
+
 @pytest.mark.parametrize('derived', [False, True], ids=['source-layout', 'native-layout'])
 def test_llada_moe_trained_exports_reload_and_run(llada_moe_source, tmp_path, derived):
     name, source, ids, fields = llada_moe_source

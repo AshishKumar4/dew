@@ -33,7 +33,7 @@ from ..hyper_connections import (
     collapse_by,
     mix_streams,
 )
-from ..inputs import LayerInputs, MixerCall, PredictionPhase
+from ..inputs import LayerInputs, MixerCall, PredictionPhase, coordinates_of, numbered_blocks
 from ..linear import recomputing
 from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, SparseMLP
 from ..ngpt import NGPT, stepped
@@ -582,6 +582,7 @@ class DecoderBlock(nn.Module):
     residual_site: ResidualSite | None = None  # Kimi K3's place in the depth mixture
     routed: bool = False  # the feed-forward, or the parallel branch, routes over experts
     media_routed: bool = False  # the feed-forward routes a media span by its own bias
+    routing_block: int | None = None  # the feed-forward routes blocks of this many places together
     engram: Callable[..., nn.Module] | None = None  # the layer's EngramLayer factory
     engram_index: int | None = None
     prediction_target: bool = False  # records its streams' mean for DSpark
@@ -839,7 +840,7 @@ class DecoderBlock(nn.Module):
                 mlp_input = (normed if self.wiring.shared_parallel_norm else
                              self.post_attention_layernorm(read) if self.wiring.pre_norms else read)
             hidden = self.mlp(mlp_input,
-                              **self._feedforward_inputs(attention_metadata),
+                              **self._feedforward_inputs(attention_metadata, mlp_input.shape),
                               **({} if self.parallel is not None else routes),
                               **({"train": train} if isinstance(self.mlp, ReadsTrain) and self.mlp.reads_train
                                  else {}))
@@ -1044,10 +1045,15 @@ class DecoderBlock(nn.Module):
             **({} if prediction_phase == "ordinary" else {"prediction_phase": prediction_phase}),
         )
 
-    def _feedforward_inputs(self, attention_metadata) -> dict:
+    def _feedforward_inputs(self, attention_metadata, shape: tuple[int, ...]) -> dict:
         """The token ids for a hash-routed feed-forward, the media mask, when
-        the call has one, for one that routes a media span apart, nothing for
-        the rest."""
+        the call has one, for one that routes a media span apart, each token's
+        block (`numbered_blocks`, over the call's `shape[:2]`) for one that
+        routes blocks together, nothing for the rest."""
+        if self.routing_block is not None:
+            batch, length = shape[:2]
+            tokens = coordinates_of(attention_metadata, batch, length)
+            return {"blocks": numbered_blocks(tokens, (batch, length), self.routing_block)}
         if self.media_routed:
             media = None if attention_metadata is None else attention_metadata.media
             return {} if media is None else {"media": media}
