@@ -54,7 +54,7 @@ import math
 import re
 from collections.abc import Callable, Hashable, Mapping, Sequence
 from types import ModuleType
-from typing import TYPE_CHECKING, Any, ClassVar, Literal
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, Protocol, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -67,7 +67,7 @@ from dew.nn.fake_quant import correctly_rounded_divide
 from dew.nn.kernels.generation import backend
 
 if TYPE_CHECKING:
-    from qwix import QuantizationProvider
+    from qwix import QArray, QuantizationProvider
 
     from dew.diffusion.process import Conditioning
     from dew.objectives.base import Variables
@@ -1191,6 +1191,15 @@ def _providers() -> tuple[type, type]:
     return QtProvider, PtqProvider
 
 
+@runtime_checkable
+class Annotated(Protocol):
+    """A serving tree's quantized kernel as Qwix's post-training quantization annotates it: the QArray
+    (`array`) with the recipe it was quantized by (`how`), a dataclass of those fields."""
+
+    array: QArray
+    how: object
+
+
 def split_columns(leaf, widths: Sequence[int], *, axis: int = -1) -> list:
     """`leaf` split into one leaf a member along `axis` by `widths`, a packed projection's kernel
     taken back into its members' (`dew.inference.projections.unpacked`): a plain array, host or
@@ -1235,7 +1244,8 @@ def split_columns(leaf, widths: Sequence[int], *, axis: int = -1) -> list:
         parts = zip(arrays(leaf.qvalue), scaled(leaf.scale), scaled(leaf.zero_point), strict=True)
         return [dataclasses.replace(leaf, qvalue=value, scale=scale, zero_point=zero)
                 for value, scale, zero in parts]
-    if dataclasses.is_dataclass(leaf) and isinstance(getattr(leaf, "array", None), qwix.QArray):
+    if (isinstance(leaf, Annotated) and isinstance(leaf.array, qwix.QArray) and dataclasses.is_dataclass(leaf)
+            and not isinstance(leaf, type)):
         others = [field.name for field in dataclasses.fields(leaf) if field.name != "array"
                   and isinstance(getattr(leaf, field.name), (jax.Array, np.ndarray))]
         if others:
