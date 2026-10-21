@@ -326,7 +326,8 @@ def _dropping(config: Worker):
     if config.workload == "image":
         rows = Pipeline(Files(str(config.source), format="array_record")).shuffle(config.seed).repeat()
         return rows.pipe(presets.images, config.image_size, batch=config.batch, rejects=True)
-    documents = Pipeline(TokenFiles(str(config.source))).shuffle(config.seed).repeat().map(CountTargets())
+    documents = Pipeline(TokenFiles(str(config.source))).shuffle(config.seed).repeat()
+    documents = documents.filter_map(CountTargets())
     return documents.pipe(presets.lm, None, seq_len=config.seq_len, batch=config.batch, bins=32)
 
 

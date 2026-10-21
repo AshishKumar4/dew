@@ -106,7 +106,7 @@ from dew.data.steps.generic import Fields
 from dew.data.steps.text import LayoutRule, ValidTargets, recounted
 from dew.data.text import Chunks
 from dew.data.tokens import _WrappingDataset
-from dew.records import integer, integers, record, strings
+from dew.records import boolean, integer, integers, record, strings
 
 if TYPE_CHECKING:
     from dew.data.cache import Cache
@@ -155,14 +155,16 @@ def _corpora(pipeline: Pipeline) -> tuple[Pipeline, ...]:
 def _carried(pipeline: Pipeline, consumed: int, *, marked: bool) -> int:
     """Where a pooled read's loading workers hand its rows to the reading process (`_Build.pooled`):
     at its first stage from `consumed` that can't carry a dropped record as a marker. Record steps
-    carry them. A view of the inputs (a shuffle, slice, take or repeat) reads markers as records,
-    and a Grain step of the caller's can't tell one, so either ends the workers' part once a step
-    has dropped (`marked`); before that, the caller's step runs in the workers, as written, and the
-    workers' part ends after it, as what it drops in an iterator of its own leaves no marker. Every
-    other stage lays out, mixes or batches several records into one and ends it."""
+    and repeats carry them. A view of the inputs (a shuffle, slice or take) reads markers as
+    records, and a Grain step of the caller's can't tell one, so either ends the workers' part once
+    a step has dropped (`marked`); before that, the caller's step runs in the workers, as written,
+    and the workers' part ends after it, as what it drops in an iterator of its own leaves no marker.
+    Every other stage lays out, mixes or batches several records into one and ends it."""
     for at, stage in enumerate(pipeline.stages[consumed:], start=consumed):
         if isinstance(stage, (Map, RandomMap, MapWithIndex, Filter, FlatMap)):
             marked = marked or _drops(stage)
+        elif isinstance(stage, Repeat):
+            continue
         elif isinstance(stage, Native) and not marked:
             return at + 1
         elif not (isinstance(stage, (Shuffle, Slice, Limit, Repeat)) and not marked
@@ -802,16 +804,16 @@ class _OverlappedCutsIterator(pygrain.DatasetIterator):
 
 @overload
 def _repeated(rows: pygrain.MapDataset, epochs: int | None, name: str, loading: Loading, *,
-              reseed: bool = True, certain: bool = True) -> pygrain.MapDataset: ...
+              reseed: bool = True, certain: bool = True, barren: bool = False) -> pygrain.MapDataset: ...
 
 
 @overload
 def _repeated(rows: Rows, epochs: int | None, name: str, loading: Loading, *,
-              reseed: bool = True, certain: bool = True) -> Rows: ...
+              reseed: bool = True, certain: bool = True, barren: bool = False) -> Rows: ...
 
 
 def _repeated(rows: Rows, epochs: int | None, name: str, loading: Loading, *, reseed: bool = True,
-              certain: bool = True) -> Rows:
+              certain: bool = True, barren: bool = False) -> Rows:
     """`rows` read `epochs` times over, or endlessly, by Grain's repeat. An indexed repeat draws
     each pass afresh (`reseed`) as Grain's does, unless it stands for a repeat of a stream, whose
     passes replay the first. An endless repeat of a pass that holds nothing is refused, as it
@@ -819,13 +821,15 @@ def _repeated(rows: Rows, epochs: int | None, name: str, loading: Loading, *, re
     a row and nothing before the repeat drops one (`certain`), so the pass is the source's own
     rows. A pass a step emptied may yield rows next time (a fetch that failed for now), so the
     repeat reads on, logging its empty passes. Every pass of a stream goes on counting its corpus
-    (`_Passes`)."""
+    (`_Passes`). A worker's pass of its inputs and the markers of what they dropped that holds
+    nothing (`barren`) holds no input at all, which ends it (`_Barren`)."""
     if isinstance(rows, pygrain.MapDataset):
         if epochs is None and not len(rows):
             raise ValueError(f"a pass of {name} holds no rows, so repeating it reads nothing forever")
         return rows.repeat(epochs, reseed_each_epoch=reseed)
     parent = _as_iter(rows, loading)
-    return gx.RepeatIterDataset(_Passes(parent, name, endless=epochs is None, certain=certain), epochs)
+    passes = _Passes(parent, name, endless=epochs is None, certain=certain, barren=barren)
+    return gx.RepeatIterDataset(passes, epochs)
 
 
 class _Passes(pygrain.IterDataset):
@@ -833,21 +837,25 @@ class _Passes(pygrain.IterDataset):
     (`endless`), a pass that yields no row is refused where that is certain to repeat (`certain`),
     and logged at each doubling of a run of them otherwise."""
 
-    def __init__(self, parent: pygrain.IterDataset, name: str, *, endless: bool, certain: bool):
+    def __init__(self, parent: pygrain.IterDataset, name: str, *, endless: bool, certain: bool,
+                 barren: bool = False):
         super().__init__(parent)
         self._rows, self._name, self._endless, self._certain = parent, name, endless, certain
+        self._barren = barren
 
     def __iter__(self) -> pygrain.DatasetIterator:
-        return _PassesIterator(self._rows.__iter__(), self._name, self._endless, self._certain)
+        return _PassesIterator(self._rows.__iter__(), self._name, self._endless, self._certain, self._barren)
 
 
 class _PassesIterator(pygrain.DatasetIterator):
     """Its parent's rows and position. The repeat restarts a pass by restoring the parent right
     after one ends, and any other restore lands inside a pass the run already read from."""
 
-    def __init__(self, parent: pygrain.DatasetIterator, name: str, endless: bool, certain: bool):
+    def __init__(self, parent: pygrain.DatasetIterator, name: str, endless: bool, certain: bool,
+                 barren: bool = False):
         super().__init__(parent)
         self._rows, self._name, self._endless, self._certain = parent, name, endless, certain
+        self._barren = barren
         self._yielded = self._ended = False
         self._empty = 0
 
@@ -855,6 +863,8 @@ class _PassesIterator(pygrain.DatasetIterator):
         try:
             value = next(self._rows)
         except StopIteration:
+            if not self._yielded and self._barren:
+                raise _Barren(self._name) from None
             if not self._yielded and self._endless:
                 if self._certain:
                     raise ValueError(f"a pass of {self._name} yields no rows, so repeating it reads "
@@ -875,6 +885,45 @@ class _PassesIterator(pygrain.DatasetIterator):
         # Right after a pass ends, this is the repeat rewinding it, which keeps the corpus's counts.
         self._rows.set_state(rewound(state, self._rows.get_state()) if self._ended else state)
         self._yielded, self._ended = not self._ended, False
+
+
+class _Barren(Exception):
+    """A pass of a loading worker's inputs, each read as a row or the marker of a dropped record,
+    that held nothing: the worker holds no input (`_repeated`)."""
+
+
+class _Ended(pygrain.IterDataset):
+    """A repeat of a loading worker's inputs, which ends where a pass of them holds none (`_Barren`)
+    instead of repeating nothing forever, so the other workers read on."""
+
+    def __init__(self, parent: pygrain.IterDataset):
+        super().__init__(parent)
+        self._rows = parent
+
+    def __iter__(self) -> pygrain.DatasetIterator:
+        return _EndedIterator(self._rows.__iter__())
+
+
+class _EndedIterator(pygrain.DatasetIterator):
+    def __init__(self, parent: pygrain.DatasetIterator):
+        super().__init__(parent)
+        self._rows, self._ended = parent, False
+
+    def __next__(self):
+        if self._ended:
+            raise StopIteration
+        try:
+            return next(self._rows)
+        except _Barren:
+            self._ended = True
+            raise StopIteration from None
+
+    def get_state(self) -> Mapping[str, object]:
+        return {"parent": self._rows.get_state(), "ended": self._ended}
+
+    def set_state(self, state: Mapping[str, object]) -> None:
+        self._rows.set_state(record(state["parent"], "repeat position"))
+        self._ended = boolean(state["ended"], "repeat ended")
 
 
 def _reordered(stage: Shuffle | Slice | Limit, rows: pygrain.MapDataset) -> pygrain.MapDataset:
@@ -1142,6 +1191,11 @@ class _Build:
                 continue
             if index < carried and isinstance(stage, (Map, RandomMap, MapWithIndex, Filter, FlatMap)):
                 rows = self.record_stage(rows, stage, pipeline, partition, index, marked=True)
+            elif index < carried and isinstance(stage, Repeat) and not isinstance(rows, pygrain.MapDataset):
+                # A worker's inputs hold a marker for each record dropped, so a pass with nothing
+                # in it holds no input: that worker reads no more, and the others read on.
+                repeated = _repeated(rows, stage.epochs, _name(pipeline), self.loading, barren=True)
+                rows = _Ended(_as_iter(repeated, self.loading))
             else:
                 rows = self.stage(rows, stage, pipeline, partition, index)
             if index == last:
