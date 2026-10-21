@@ -36,6 +36,7 @@ import dataclasses
 import hashlib
 import io
 import json
+import os
 import platform
 import pstats
 import time
@@ -358,7 +359,12 @@ def vllm_parallelism(mesh: dict[str, int] | None) -> dict[str, object]:
 
 async def engine_points(args):
     """The same scheduler/stream clocks, without HTTP serialization. Output stays token ids, not text, as
-    Dew's and SGLang's do (`detokenize=False`)."""
+    Dew's and SGLang's do (`detokenize=False`). An engine over several GPUs starts its workers by
+    spawning them, as vLLM advises once the parent has touched CUDA, which forked workers cannot
+    initialize again."""
+    parallelism = vllm_parallelism(args.mesh)
+    if parallelism.get("tensor_parallel_size", 1) > 1:
+        os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
     from vllm import SamplingParams
     from vllm.engine.arg_utils import AsyncEngineArgs
     from vllm.inputs import TokensPrompt
@@ -367,8 +373,7 @@ async def engine_points(args):
     engine = AsyncLLM.from_engine_args(AsyncEngineArgs(
         model=args.model, dtype="bfloat16", max_model_len=args.prompt + args.output,
         max_num_seqs=max(args.slots), gpu_memory_utilization=0.90,
-        generation_config="vllm", enable_prefix_caching=False, disable_log_stats=True,
-        **vllm_parallelism(args.mesh)))
+        generation_config="vllm", enable_prefix_caching=False, disable_log_stats=True, **parallelism))
 
     async def streamed(prompt, output):
         """The time each of a request's tokens reached the client."""
