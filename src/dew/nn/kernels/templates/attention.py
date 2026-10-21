@@ -495,9 +495,13 @@ class Split(NamedTuple):
     own: jax.Array
 
 
-DQ_GRADS = (Kind.HEAD, Kind.QUERY, Kind.TILE)
-"""The parameter kinds whose gradients the dQ program writes: a head's partial sum over its queries, its
-queries' own, and its tiles' entries; a key parameter's the dK/dV program writes."""
+DQ_GRADS = (Kind.HEAD, Kind.QUERY)
+"""The parameter kinds whose gradients the dQ program writes: a head's partial sum over its queries and
+its queries' own."""
+
+DKV_GRADS = (Kind.KEY, Kind.TILE)
+"""The parameter kinds whose gradients the dK/dV program writes, under the refined D: its keys' and its
+tiles' entries."""
 
 
 @jax.tree_util.register_dataclass
@@ -525,7 +529,7 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
     initial_term, maximum, key_index, anchor_value, others, own, total, start, end, query_ids, key_ids,
     score_params, *, score_mod, score_kinds, score_dtypes, scale)` giving dQ, the softmax's rows (`D - c`,
     `c`, `m`, `T`, the keys' mass), each query's anchor key as it chose it, the dQ program's hook gradients
-    (`DQ_GRADS`), then dK, dV and the key parameters' gradients; each gradient fp32, then rounded to its
+    (`DQ_GRADS`), then dK, dV and the dK/dV program's (`DKV_GRADS`); each gradient fp32, then rounded to its
     input's dtype. D is taken two ways, about 0 and about the anchor key's `v_c · dO`, each query the
     nearer, from the forward's split sums (`attention_algebra.split_delta`) or a first pass of the dQ
     launch's own over the keys at the forward's maximum (`off_anchor_delta`): the anchor key's `dP - c`
@@ -587,7 +591,7 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
             case Kind.QUERY:
                 grads.append(dq_grads.pop(0)[:, :, :queries])
             case Kind.TILE:
-                grads.append(dq_grads.pop(0)[:, :, :queries, :keys])
+                grads.append(key_grads.pop(0)[:, :, :queries, :keys])
             case Kind.KEY:
                 grads.append(key_grads.pop(0)[:, :, :keys])
             case Kind.OUTPUT:
