@@ -21,7 +21,7 @@ gate() {
   fi
 }
 # The duplicate-code scan takes as long as several gates together and reads nothing they write, so it
-# runs beside them and reports last. Main still holds copies (ledger 896-1287), so a checkout is held to
+# runs beside them and reports last. Main still holds copies (ledger 896-1287, 1309), so a checkout is held to
 # adding none to origin/main's (tools/duplicates.py); the scan needs that ref and its history.
 duplicates=$(mktemp)
 "$python" tools/duplicates.py --base=origin/main src/dew tools tests examples site > "$duplicates" 2>&1 &

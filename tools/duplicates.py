@@ -18,7 +18,7 @@
 Every copy is printed, and any fails. With `--base`, a structural copy fails only where it is written in
 more places than at the merge-base of REF and HEAD, wherever those places are: a copy that moved is held,
 and one written beside it, or once more, fails. Main still holds the copies the gate's runs and the
-duplication audits found (ledger 896-1287), and a head is held to adding none. The text reading has no
+duplication audits found (ledger 896-1287, 1309), and a head is held to adding none. The text reading has no
 base: main holds no text copy, so any fails. tools/check.sh (CI's lint job, the lanes' lint gate) runs the
 gate held to origin/main until main's last copy goes, then with no base. tests/test_duplicates.py runs it
 on copied code.
