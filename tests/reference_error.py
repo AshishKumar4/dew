@@ -222,6 +222,11 @@ an assertion decides alike on every run."""
 CONFIDENCE = 0.999
 """The bootstrap interval check 1 reads: a site whose pooled ratio's 99.9% interval is wider than
 PARITY cannot tell an equally exact computation from one PARITY off, and is inconclusive."""
+FEWEST_SEEDS = 8
+"""The fewest seeds check 1 judges by, an engineering minimum and no statistical threshold: over very few
+seeds a bootstrap has so few distinct resamples that its interval can sit wholly to one side of PARITY by
+the draws' luck, so fewer is Inconclusive whatever their ratio reads; above it the measured interval
+decides. `seeds_for` never declares fewer."""
 REDRAW = 4
 """A failing site's pooled ratio is drawn again over REDRAW times its seeds before it fails."""
 
@@ -352,6 +357,9 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
     This is an engineering gate, deterministic and reproducible, not a guarantee against every error
     law: "never wrong" is check 2's, each element within its operation's certified bound
     (tests/op_certificates.py)."""
+    if seeds < FEWEST_SEEDS:
+        raise Inconclusive(f"{label}: {seeds} seeds cannot be judged; check 1 takes at least {FEWEST_SEEDS} "
+                           f"(`seeds_for`)")
     draws = _drawn(dew_fn, reference_fn, draw, range(seeds), truth_fn)
     over_first = [index for index in range(len(draws.names))
                   if np.sum(draws.theirs[:, index]) > 0 and _judged(draws, index)[0] > PARITY]
@@ -378,7 +386,8 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
                               f"give the site larger inputs or more seeds (`seeds_for`)")
         elif ratio > PARITY:
             over.append(f"{leaf}: dew's RMS error from float64 is {ratio:.3f} times the reference's over "
-                        f"{count} seeds (allowed {PARITY})")
+                        f"{count} seeds, {CONFIDENCE:.1%} interval [{low:.3f}, {high:.3f}] "
+                        f"(allowed {PARITY})")
         my_row, their_row = float(np.max(draws.worst[:, index, 0])), float(np.max(draws.worst[:, index, 1]))
         if not within(my_row, ROW_FACTOR * their_row):
             over.append(f"{leaf}: the worst row over {count} seeds is {my_row:.3e} from float64 over its "
@@ -392,12 +401,13 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
         raise Inconclusive("\n".join(unresolved))
 
 
-def seeds_for(reference_fn, draw, label: str, *, start: int = 8, most: int = 512, truth_fn=None) -> int:
+def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most: int = 512,
+              truth_fn=None) -> int:
     """The seeds a site declares: the fewest, doubling from `start`, for which the reference compared
     with itself (its errors on two disjoint seed sets, `_interval`'s control) resolves PARITY in every
     leaf: the pooled ratio's CONFIDENCE interval no wider than PARITY. Fails past `most`, where the
     site needs larger inputs or fewer shared factors, not more seeds."""
-    count = start
+    count = max(start, FEWEST_SEEDS)
     while count <= most:
         first = _drawn(reference_fn, reference_fn, draw, range(count), truth_fn)
         second = _drawn(reference_fn, reference_fn, draw, range(count, 2 * count), truth_fn)
@@ -409,6 +419,47 @@ def seeds_for(reference_fn, draw, label: str, *, start: int = 8, most: int = 512
         count *= 2
     raise AssertionError(f"{label}: the reference compared with itself does not resolve {PARITY} within "
                          f"{most} seeds at {wide[:4]}; give the site larger inputs or fewer shared factors")
+
+
+def declared_seeds(path) -> dict[str, int]:
+    """Each site's declared seed count in a recording of a reference over seeds (`indexed_recording`):
+    its `<site>.seeds`, written at record time by `seeds_for` on the recorded reference."""
+    with np.load(path) as stored:
+        return {name.removesuffix(".seeds"): int(stored[name]) for name in stored.files
+                if name.endswith(".seeds")}
+
+
+def indexed_recording(stored, site: str, seeds: int):
+    """`assert_as_exact`'s draw, reference and truth for a reference recorded over seeds, where it cannot
+    run in the test (a CUDA-only library, a fetched source): `stored` holds `<site>.input.<name>`,
+    `<site>.reference.<name>` and `<site>.truth.<name>`, every array stacked over the seeds on its first
+    axis, the truth in float64. A draw is `(index, inputs)`, the index an integer `widened` keeps; the
+    reference and the truth read the recorded outputs at it, and Dew's function takes the same two
+    arguments and ignores the index. The recording covers check 1's redraw, (1 + REDRAW) times the
+    declared seeds, so a numerical failure stays a finding rather than running out of recorded seeds."""
+    def tree(kind):
+        prefix = f"{site}.{kind}."
+        return {name.removeprefix(prefix): value for name, value in stored.items() if name.startswith(prefix)}
+
+    inputs, reference, truth = tree("input"), tree("reference"), tree("truth")
+    narrow = [name for name, value in truth.items()
+              if jnp.issubdtype(value.dtype, jnp.floating) and value.dtype != np.float64]
+    if narrow:
+        raise AssertionError(f"{site}: the recorded truth {narrow} is not float64; record it in float64, as "
+                             f"no later widening recovers what a narrower recording dropped")
+    count = min(len(value) for part in (inputs, reference, truth) for value in part.values())
+    if count < (1 + REDRAW) * seeds:
+        raise AssertionError(f"{site}: {count} recorded seeds, and check 1 over {seeds} may draw "
+                             f"{(1 + REDRAW) * seeds}; record (1 + REDRAW) times the declared seeds")
+
+    def draw(seed):
+        return np.int32(seed), {name: value[seed] for name, value in inputs.items()}
+
+    def lookup(values):
+        return jax.jit(lambda index, inputs: {name: jnp.asarray(value)[index]
+                                            for name, value in values.items()})
+
+    return draw, lookup(reference), lookup(truth)
 
 
 def assert_no_less_exact(dew, reference, truth, label: str) -> None:
