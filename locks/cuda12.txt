@@ -262,7 +262,7 @@ deprecated==1.3.1
     #   deltalake
 dew-flash-attn-cu12==0.3.4
     # via dewml (pyproject.toml)
-diffusers==0.40.0
+diffusers==0.39.0
     # via dewml (pyproject.toml)
 dill==0.4.1
     # via
