@@ -782,6 +782,7 @@ class Keeps:
 
     every: int
     identity = "keeps@1"
+    rejects = True
 
     def __call__(self, row):
         return Rejected("unkept") if int(row["id"]) % self.every == 0 else row
@@ -942,6 +943,43 @@ def test_views_before_a_cache_of_a_store_missing_inputs_read_its_present_ones(tm
     assert batches(str(tmp_path / "cache")) == batches(None)
 
 
+def test_views_before_a_cache_of_a_grain_store_missing_inputs_read_its_present_ones_in_memory(tmp_path):
+    """A Grain dataset missing an input, read in memory, shuffled, then a step and a cache: the
+    cache reads the inputs the store holds, as the uncached chain does, in its order."""
+    from dew.data.compile import compile
+    from dew.data.dataset import DataPartition, Loading
+    from dew.data.pipeline import Pipeline
+    from dew.data.sources.grain import from_grain
+
+    loading = Loading(workers=0, threads=1, read_buffer=1)
+    records = [None if index == 2 else {"id": index} for index in range(6)]
+    source = from_grain(grain.MapDataset.source(records), name="missing-two")
+
+    def batches(cache):
+        stepped = Pipeline(source).shuffle(1).map(Offset(10))
+        chain = (stepped if cache is None else stepped.cache(cache)).repeat(1).batch(1)
+        reader = compile(chain, read="memory", loading=loading).train(DataPartition())
+        try:
+            return _ids(reader)
+        finally:
+            reader.close()
+
+    expected = batches(None)
+    assert sorted(row for batch in expected for row, _ in batch) == [0, 1, 3, 4, 5]
+    assert batches(str(tmp_path / "cache")) == expected
+
+
+@dataclass(frozen=True)
+class KeepsBy:
+    """A configured step that binds to `step`, which drops records."""
+
+    step: Keeps
+    identity = "keeps-by@1"
+
+    def __call__(self, metadata):
+        return self.step
+
+
 @dataclass(frozen=True)
 class OffsetBy:
     """A configured step that binds to `step`, keeping every record."""
@@ -980,8 +1018,9 @@ def test_a_configured_memory_read_fills_the_cache_its_publication_reads(tmp_path
 
 @pytest.mark.parametrize("read", ["memory", "indexed"])
 def test_a_generation_of_a_configured_step_after_a_shuffle_reads_as_the_steps_it_stands_for(tmp_path, read):
-    """A generation published from a configured step that binds to one keeping every record stands
-    in for it after a shuffle, read as the uncached chain's rows."""
+    """A generation published from a configured step that states it keeps every record stands in for
+    it after a shuffle, read as the uncached chain's rows; one that binds to a step dropping records
+    against its statement is refused."""
     from dew.data.compile import compile, publish
     from dew.data.dataset import DataPartition, Loading
     from dew.data.pipeline import Configured, Pipeline
@@ -990,7 +1029,7 @@ def test_a_generation_of_a_configured_step_after_a_shuffle_reads_as_the_steps_it
     source = Memory([{"id": index} for index in range(12)])
 
     def stepped(chain):
-        return chain.map(Configured(OffsetBy(Offset(10)), needs=()))
+        return chain.map(Configured(OffsetBy(Offset(10)), needs=(), one_to_one=True))
 
     def batches(chain):
         reader = compile(chain.repeat().batch(3), read=read, loading=loading).train(DataPartition())
@@ -1002,6 +1041,8 @@ def test_a_generation_of_a_configured_step_after_a_shuffle_reads_as_the_steps_it
     generation = publish(stepped(Pipeline(source)), Cache(str(tmp_path / "one")), read=read, loading=loading)
     assert batches(stepped(Pipeline(source).shuffle(3)).cache(generation)) == batches(
         stepped(Pipeline(source).shuffle(3)))
+    with pytest.raises(ValueError):
+        batches(Pipeline(source).map(Configured(KeepsBy(Keeps(5)), needs=(), one_to_one=True)))
 
 
 @dataclass(frozen=True)
