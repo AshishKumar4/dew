@@ -11,7 +11,7 @@
  },
  "transformers": {"version": "4.57.1"},
  "torch": {"version": "2.9.0+cpu"},
- "generator": "tools/remote_code_reference.py llada-moe-tiny --draw",
+ "generator": "tools/llada_moe_reference.py llada-moe-tiny --draw",
  "seed": 0,
  "probes": 40,
  "changes": "Small geometry, a dense middle layer and nonzero expert_bias exercise the supported routing branches. The release fixes norm_topk_prob=False and does not apply routed_scaling_factor."
