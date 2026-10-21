@@ -487,8 +487,8 @@ class AttentionMetadata:
     (`Admitted`). `position_bias` is added to every attention logit,
     `[B or 1, heads, S, keys]`: T5's relative position table, which its
     encoder computes once for its layers. `blocks` `[B, S]` number each row's
-    routing blocks for a block router (`numbered_blocks`), which the model
-    computes once for its layers.
+    routing blocks of `routing_block` places for a block router
+    (`numbered_blocks`), which the model computes once for its layers.
 
     `coordinates` are the tokens' documents, validity, positions and cache
     slots (`Coordinates`). Their `right_padded` says each row's real tokens
@@ -511,6 +511,7 @@ class AttentionMetadata:
     admitted: Admitted | None = None
     position_bias: jax.Array | None = None
     blocks: jax.Array | None = None
+    routing_block: int | None = struct.field(pytree_node=False, default=None)
 
     @property
     def valid(self) -> jax.Array | None:
@@ -1140,15 +1141,15 @@ __all__ = ["RESPONSE_FIELDS", "AttentionMetadata", "FieldExtension", "LayerInput
 
 def routing_blocks(feedforward, metadata: AttentionMetadata | None, shape: tuple[int, ...]) -> dict:
     """The blocks a block-routed feed-forward (`dew.nn.moe.SparseMLP`'s `routing_block`) routes its
-    tokens in, over a call of `shape[:2]`: its metadata's, which the model numbers once for its
-    layers, else numbered from the call's coordinates (`numbered_blocks`); nothing for another
-    feed-forward."""
+    tokens in, over a call of `shape[:2]`: its metadata's where they number blocks of its size,
+    which the model numbers once for its layers, else numbered from the call's coordinates
+    (`numbered_blocks`); nothing for another feed-forward."""
     from dew.nn.protocols import RoutesBlocks
 
     block = feedforward.routing_block if isinstance(feedforward, RoutesBlocks) else None
     if block is None:
         return {}
-    if metadata is not None and metadata.blocks is not None:
+    if metadata is not None and metadata.blocks is not None and metadata.routing_block == block:
         return {"blocks": metadata.blocks}
     batch, length = shape[:2]
     return {"blocks": numbered_blocks(coordinates_of(metadata, batch, length), (batch, length), block)}

@@ -15,7 +15,6 @@ from dew.data.prompts import INFO_KEY, LENGTH_KEY, PROMPT_KEY, SOURCE_KEY, TRUTH
 from dew.inference.rollouts import InfrastructureError, response
 from dew.nn.inputs import ModelInputs, local_rows, mesh_of
 from dew.objectives.base import Shown
-from dew.records import finite
 from dew.sampling.text import Sampling
 
 from ..lm import TokenScorer
@@ -26,6 +25,7 @@ from .sessions import (
     Status,
     check_estimator,
     check_truncation,
+    finite_reward,
     pack,
     sampled_values,
 )
@@ -47,7 +47,7 @@ def scored_draw(task: str, sample: int, call: Call, text: str, record: PromptRec
         return Session(task, "", sample, 0, (call,), Status.INFRA_ERROR, None, {},
                        f"reward: {type(error).__name__}: {error}")
     status = Status.COMPLETED if call.finish_reason == "stop" else Status.TRUNCATED
-    return Session(task, "", sample, 0, (call,), status, finite(score, "a reward"))
+    return Session(task, "", sample, 0, (call,), status, finite_reward(score))
 
 
 def drawn_call(prompt: Sequence[int], tokens: Sequence[int], behavior: Sequence[float], terminated: bool,

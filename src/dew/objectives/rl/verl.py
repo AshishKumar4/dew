@@ -36,9 +36,9 @@ from typing import TypedDict
 import numpy as np
 
 from dew.data.prompts import PromptRecord
-from dew.records import JSON, integer, integers, listed, record as section, text
+from dew.records import JSON, finite, integer, integers, listed, record as section, text
 
-from .records import messages, real, reals
+from .records import messages, reals
 from .rollout import Reward
 from .sessions import Call, Session, Status, Transcript, chains
 
@@ -248,7 +248,7 @@ def _calls(row: Mapping[str, object], version: int | None,
                 routed_experts=None if record is None else record[:forwarded],
                 support=None if support is None else listed(
                     support, "support", read=integers, what="a list of token-id lists"),
-                reward=None if meta.get("reward") is None else real(meta["reward"], "reward"),
+                reward=None if meta.get("reward") is None else finite(meta["reward"], "reward"),
                 transcript=None if meta.get("transcript") is None else _transcript(meta["transcript"]),
             )
         )
@@ -304,7 +304,7 @@ def from_verl(rows: Sequence[Mapping[str, object]], *, samples: int = 1,
             session = Session(str(cursor // samples), "0", cursor % samples, 0,
                               _calls(row, version if steps is None else integer(steps, "min_global_steps"),
                                      None),
-                              Status.COMPLETED, real(reward, "reward_score"))
+                              Status.COMPLETED, finite(reward, "reward_score"))
             used = 1
         else:
             dew = _dew(row)
@@ -323,12 +323,12 @@ def from_verl(rows: Sequence[Mapping[str, object]], *, samples: int = 1,
                           for call in _calls(member, None, listed(
                               _dew(member)["calls"], "calls", read=section, what="a list of calls")))
             record = section(dew["session"], "session")
-            components = {key: real(value, key)
+            components = {key: finite(value, key)
                           for key, value in section(record["components"], "components").items()}
             session = Session(text(record["task"], "task"), text(record["group"], "group"),
                               integer(record["sample"], "sample"), integer(record["attempt"], "attempt"),
                               calls, Status(text(record["status"], "status")),
-                              None if reward is None else real(reward, "reward_score"),
+                              None if reward is None else finite(reward, "reward_score"),
                               MappingProxyType(components), text(record["detail"], "detail"))
             if dew.get("stamped", False):
                 for key in ("min_global_steps", "max_global_steps"):
