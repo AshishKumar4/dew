@@ -152,10 +152,12 @@ def served(model: nn.Module, variables: Variables) -> Variables:
     (`projection_groups`) packed, once per call before its decode loop, out of the per-token step.
     A task's own `variables` stay the canonical tree on every route, bound in place, so the call
     always reads the current weights and the packed copy lives only in the call's program; a group
-    already packed (a server's constant weights) stays as it is."""
+    already packed (a server's constant weights) stays as it is. The packed tree is held as written
+    (`optimization_barrier`), so the decode loop reads packed kernels, not a concatenation XLA is
+    free to fuse into the products inside it."""
     groups = tuple(group for group in projection_groups(model, variables)
                    if group.packed not in _node(variables, "params", group.path))
-    return pack_projections(variables, groups) if groups else variables
+    return jax.lax.optimization_barrier(pack_projections(variables, groups)) if groups else variables
 
 
 def inference_projections(model: nn.Module, variables: Variables) -> Variables:
