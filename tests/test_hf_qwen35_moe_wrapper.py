@@ -65,7 +65,8 @@ def test_images_read_through_a_config_that_leaves_the_merge_size_to_its_default(
     and the model computes the conditional reference's logits."""
     from interop_support import without_config_field
 
-    checkpoint = without_config_field(DIRECTORY, tmp_path / 'checkpoint', 'vision_config', 'spatial_merge_size')
+    checkpoint = without_config_field(DIRECTORY, tmp_path / 'checkpoint',
+                                      'vision_config', 'spatial_merge_size')
     loaded = Pretrained.load(checkpoint, dtype='float32', attention_impl='reference')
     assert loaded.processor is not None
     images = np.load(DIRECTORY / 'raw_images.npy')
