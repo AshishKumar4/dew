@@ -1,8 +1,10 @@
 """Compile Pallas kernels for a GPU on this CPU with the compiler the GPU itself runs: the CPU suite's
-first filter for declared kernel configs (tests/test_kernel_configs.py). XLA's CUDA backend (the
-jax-cuda12-plugin of this jaxlib, the `test` extra) compiles a program for a compile-only device of the
-generation, no GPU attached, through the Triton jaxlib bundles: so a kernel's shared bytes here are the
-bytes the GPU asks for, the GPU's own refusal included. A GPU's tests are the verdict on everything else.
+first filter for declared kernel configs (tests/test_kernel_configs.py). XLA's CUDA backend (this
+jaxlib's CUDA plugin: the `kernel-compile` extra on a host with no GPU, a GPU host's own CUDA extra)
+compiles a program for a compile-only device of the generation, no GPU attached, through the Triton
+jaxlib bundles: so a kernel's shared bytes here are the bytes the GPU asks for, the GPU's own refusal
+included. A host without the plugin fails here rather than skip. A GPU's tests are the verdict on
+everything else.
 """
 
 import contextlib

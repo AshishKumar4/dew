@@ -1030,7 +1030,6 @@ def test_the_fused_step_compiles_on_tritons_compiler_within_each_gpus_block(targ
     conv of 4 taps over an fp32 history, a bf16 state) and at Qwen3.5-9B's value heads over half as
     many key heads, at every config of its space, lowered for each GPU on this CPU and compiled by
     Triton within its block's shared memory."""
-    pytest.importorskip("jax_cuda12_plugin")
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_kernels, failures
 
