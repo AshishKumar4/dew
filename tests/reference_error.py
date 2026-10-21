@@ -441,8 +441,10 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
                 assert np.shape(true) == np.shape(leaf), (jax.tree_util.keystr(path), np.shape(true))
                 row.append((0.0, 0.0, 0.0, 0.0, 0, True))
                 continue
-            row.append(_paired(jax.tree_util.keystr(path), leaf_summary(leaf, true), their,
-                               paired=their_truth is truth or recorded))
+            # Rows pair where the two truths are the same values: the same draw, or an orbit's draws.
+            paired = (recorded or their_truth is truth
+                      or np.array_equal(np.asarray(true), np.asarray(their_true)))
+            row.append(_paired(jax.tree_util.keystr(path), leaf_summary(leaf, true), their, paired=paired))
         mine.append([entry[0] for entry in row])
         theirs.append([entry[1] for entry in row])
         worst.append([(entry[2], entry[3]) for entry in row])
