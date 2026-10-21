@@ -118,7 +118,7 @@
    "by": "2026-11-13"
   },
   "tests/test_causal_transformer.py": {
-   "comparisons": 44,
+   "comparisons": 43,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },

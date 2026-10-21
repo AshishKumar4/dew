@@ -12,6 +12,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import optax
+import pytest
 from flax import linen as nn
 from reference_error import assert_as_exact_as_the_reference, assert_as_exact_over_orders
 from safetensors.numpy import load_file
@@ -148,7 +149,10 @@ def test_an_rslora_adapter_loads_trains_and_exports_as_peft_trains_it(tmp_path):
     logits = adapter.model.apply(adapter.variables, jnp.asarray(reference["input_ids"]))
     assert_as_exact_as_the_reference(logits, reference["adapted_logits"], reference["adapted_logits_f64"],
                                      "the adapted logits")
-    assert np.abs(reference["adapted_logits_f64"] - reference["base_logits"]).max() > 1
+    # The adapter moves the logits far past rounding: the base model's are nowhere near the adapted ones.
+    with pytest.raises(AssertionError):
+        assert_as_exact_as_the_reference(reference["base_logits"], reference["adapted_logits"],
+                                         reference["adapted_logits_f64"], "the base logits as adapted ones")
     assert_trains_as_peft(adapter, reference, "rslora", tmp_path)
 
 
