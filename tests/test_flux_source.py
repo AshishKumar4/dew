@@ -188,7 +188,11 @@ def test_a_trained_flux_step_exports_and_reloads(source, pipeline_record, tmp_pa
                                    autoencoder=loaded.autoencoder, variables=loaded.variables,
                                    unconditional_prob=0.0, ema_decay=None, steps=2)
     batch = image_batch(loaded, pipeline_record["prompts"])
+    held = jax.device_get(loaded.variables)
     _, state = trained_step(objective, batch, Checkpoints(str(tmp_path / "run")))
+    # The step donated a state of its own: the source it started from still reads as loaded.
+    for leaf, before in zip(jax.tree.leaves(loaded.variables), jax.tree.leaves(held), strict=True):
+        np.testing.assert_array_equal(np.asarray(leaf), before)
 
     export = tmp_path / "export"
     loaded.save(export, variables=state.variables)

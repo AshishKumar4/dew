@@ -137,7 +137,8 @@ def main(config: Config) -> Path:
 
     source = PretrainedDecoder.load(config.model, dtype=jnp.float32 if config.smoke else jnp.bfloat16,
                                     attention_impl="xla" if config.smoke else "auto",
-                                    max_seq_len=config.sequence_length + run.max_new_tokens)
+                                    max_seq_len=config.sequence_length + run.max_new_tokens,
+                                    on_host=True)  # the trainer places it over its fsdp mesh
     words = HFTokenizer(tokenizer)
     # The run decodes through this tokenizer, so its checkpoints record its name.
     objective = LMObjective(

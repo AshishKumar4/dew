@@ -9,7 +9,9 @@ runs `follow` as the child starts: it records the checkout's files the child exe
 and the GPU pool it held, and writes them as it exits.
 A child marks its start, and one that ends without its record (killed, or leaving through os._exit)
 has a mark and no record, and the parent then counts its file's starts as unfollowed (`gathered`), as
-it does a child whose record names another file or a count of records other than the starts it saw."""
+it does a child whose record names another file or a count of records other than the starts it saw.
+It imports the standard library alone, since the `.pth` runs it in every child before the child's own
+imports, so its two writes publish by a rename of their own rather than through dew.files."""
 
 import atexit
 import dis
