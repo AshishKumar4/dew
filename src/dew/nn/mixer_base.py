@@ -75,6 +75,10 @@ class MixerContext:
     attention_chunk: int | None = None
     """The kind's chunk: a query reads only the keys whose position shares
     its `position // attention_chunk` (`LayerKind.chunk`)."""
+    diffusion_block: int | None = None
+    """A block-diffusion model's block: a query reads the keys of its own
+    `position // diffusion_block` and of the blocks before it
+    (`CausalTransformer.diffusion_block`)."""
     attention_bias: bool = False
     """The q/k/v biases, as config.attention_bias in HF."""
     o_proj_bias: bool | None = None
@@ -135,6 +139,7 @@ class MixerContext:
             "attention_dropout_rate": bool(self.attention_dropout_rate),
             "narrow_rotary_tables": self.narrow_rotary_tables,
             "ngpt": self.ngpt is not None,
+            "diffusion_block": self.diffusion_block is not None,
         }
 
     def refuse(self, kind: str, asked: Mapping[str, object], why: str) -> None:

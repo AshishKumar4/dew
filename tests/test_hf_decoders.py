@@ -102,6 +102,7 @@ Tolerances and the differences actually observed, fp32 on CPU:
   nonzero selection bias, grouped sigmoid routing and optional latent projections.
 """
 
+import dataclasses
 import json
 import os
 import subprocess
@@ -113,7 +114,13 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from model_support import flat_tree
-from reference_error import assert_as_exact_as_the_reference
+from reference_error import (
+    assert_as_exact,
+    assert_as_exact_as_the_reference,
+    declared_seeds,
+    indexed_recording,
+    recording,
+)
 
 from dew.interop import Pretrained, PretrainedDecoder
 from dew.interop.hf_decoders import translate_config, translate_weights
@@ -833,6 +840,54 @@ def test_llada_logits_match_the_released_model_code():
     assert_as_exact_as_the_reference(model.apply(variables, ids), reference, truth, "llada-tiny logits")
     causal = model.clone(causal=True)
     assert np.max(np.abs(np.asarray(causal.apply(variables, ids)) - reference)) > 1.0
+
+
+def _recorded_source(name):
+    """A recorded fixture (tools/remote_code_reference.py `RECORDED`) loaded through `Pretrained.load`
+    from its checkpoint in the release's own tensor names, its model reading the recording's block."""
+    from tools import remote_code_reference as tool
+
+    source = Pretrained.load(FIXTURES / name, dtype="float32", attention_impl="reference")
+    block = tool.RECORDED[name].block
+    return source, (source.model if block is None else source.model.clone(diffusion_block=block))
+
+
+@pytest.mark.parametrize("name", ["llada-moe-tiny", "llada-moe-v2-tiny", "llada2-tiny", "llada22-tiny"])
+def test_masked_moe_logits_are_as_exact_as_the_released_model_code(name):
+    """LLaDA-MoE-7B-A1B (a dense layer between two routed ones), LLaDA-MoE-v2 (GQA, wide heads, a
+    shared expert, renormalized and scaled weights), LLaDA2.1 (the fused qkv, half-head rotary, the
+    group-limited sigmoid router with its bias, a shared expert after a dense layer) and LLaDA2.2
+    (its block routing), each held to its release's own modeling code over its recorded seeds:
+    LLaDA2 under its generate's block mask, the block the model reads too."""
+    from tools import remote_code_reference as tool
+
+    path = FIXTURES / name / "recording.npz"
+    seeds = declared_seeds(path)[name]
+    draw, reference, truth = indexed_recording(recording(path), name, seeds, inputs_of=tool.token_draw(name))
+    source, model = _recorded_source(name)
+    forward = jax.jit(lambda index, inputs: {"logits": model.apply(source.variables, inputs["input_ids"])})
+    assert_as_exact(forward, reference, draw, name, seeds=seeds, truth_fn=truth)
+
+
+@pytest.mark.parametrize("name, limit", [("llada2-tiny", {"groups": 1, "groups_per_token": 1}),
+                                         ("llada22-tiny", {"routing_block": None, "block_experts": None})])
+def test_llada2_fixtures_route_by_their_bias_and_their_limit(name, limit):
+    """The parity above holds where LLaDA2's routing decides: on the recording's draws, its tokens
+    choose experts their unbiased scores would not, and experts the bias alone would not without the
+    group limit (2.1) or the block's experts (2.2)."""
+    from tools import remote_code_reference as tool
+
+    source, model = _recorded_source(name)
+    ids = np.concatenate([tool.token_draw(name)(seed)["input_ids"] for seed in range(8)])
+
+    def chosen(mixture):
+        _, sown = model.clone(mixture=mixture).apply(source.variables, ids, mutable=["router"])
+        return np.asarray(jax.tree.leaves(sown["router"]["layers_1"]["mlp"]["gate"]["indices"])[0])
+
+    routed = np.sort(chosen(model.mixture), axis=-1)
+    for changed in ({"bias": False}, limit):
+        other = np.sort(chosen(dataclasses.replace(model.mixture, **changed)), axis=-1)
+        assert (other != routed).any(axis=-1).any(), changed
 
 
 @pytest.fixture(scope='module')

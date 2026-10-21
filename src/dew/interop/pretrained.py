@@ -645,10 +645,10 @@ class PretrainedDecoder(Pretrained):
 
 @dataclass(frozen=True)
 class PretrainedMaskedDecoder(Pretrained):
-    """A masked-diffusion decoder (LLaDA, Dream).
+    """A masked-diffusion decoder (LLaDA, LLaDA-MoE, LLaDA2, Dream).
 
-    It is a non-causal decoder with a mask id that generates by unmasking a whole
-    response.
+    It is a non-causal decoder with a mask id that generates by unmasking its
+    response, whole or, where it reads in blocks (LLaDA2), a block at a time.
     """
 
     model: CausalTransformer
@@ -656,8 +656,8 @@ class PretrainedMaskedDecoder(Pretrained):
     def text_generation(self) -> MaskedGeneration:
         """Build the masked generation task this source describes.
 
-        It uses Dew's MDLM sampler, which refines a whole response with Unmask, not
-        the source family's own generation recipe.
+        It uses Dew's MDLM sampler, which refines the response with Unmask, a block
+        at a time for a block model, not the source family's own generation recipe.
         """
         from dew.diffusion.discrete import MDLM
 

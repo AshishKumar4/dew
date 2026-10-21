@@ -45,7 +45,7 @@ from dew.nn.inputs import (
     real_slots,
 )
 from dew.nn.kernels.options import compiler_options
-from dew.nn.protocols import Logits, TokenModel
+from dew.nn.protocols import BlockDiffusion, Logits, TokenModel
 from dew.nn.sharding import explicit_spec
 from dew.objectives.base import Variables
 
@@ -163,7 +163,10 @@ class DiscreteProcess:
         """Generate `max_new_tokens` tokens after each prompt with native MDLM.
 
         The whole response span starts masked, and `solver` (`Unmask` by
-        default) unmasks it over a grid of `steps` times. Each prompt row
+        default) unmasks it over a grid of `steps` times. A model that reads
+        in blocks (`BlockDiffusion`) has each block of the response unmasked
+        in turn over its own `steps`, as BD3-LM samples, every block clean
+        before the next one starts. Each prompt row
         gets `n` continuations in the returned `CanvasGeneration`. Prompt
         tokens never change, including literal mask ids. An EOS token trims
         the finished response, and the tokens after it become
@@ -356,7 +359,8 @@ def _generate(model: nn.Module, variables: Variables, inputs: ModelInputs, keys:
 
     Each row is sampled on its own so the response span is the only mutable
     part of it. A continuation keeps the tokens up to its first EOS, pads the
-    rest, and reports the steps it took.
+    rest, and reports the steps it took. A block model's walk runs once a
+    block (`_blockwise`).
     """
     from dew.sampling.sample import sample
 
@@ -365,21 +369,51 @@ def _generate(model: nn.Module, variables: Variables, inputs: ModelInputs, keys:
         zeros = jnp.zeros((batch * n,), jnp.int32)
         return CanvasGeneration(jnp.repeat(inputs.tokens, n, axis=0), zeros, zeros.astype(bool), zeros)
     full, mutable = _response_inputs(inputs, budget, process.mask_id)
+    block = model.diffusion_block if isinstance(model, BlockDiffusion) else None
 
     def row(prepared, changeable, key):
         prepared = jax.tree.map(lambda leaf: leaf[None], prepared)
-        denoise = process.denoiser(model, variables, inputs=prepared, mutable_mask=changeable[None])
         def continued(draw_key):
-            tokens = sample(denoise, prepared.tokens, steps, solver=solver, key=draw_key)[0]
+            if block is None:
+                denoise = process.denoiser(model, variables, inputs=prepared, mutable_mask=changeable[None])
+                tokens, walked = sample(denoise, prepared.tokens, steps, solver=solver, key=draw_key)[0], 1
+            else:
+                tokens, walked = _blockwise(model, variables, prepared, changeable, draw_key, process, solver,
+                                            budget, steps, block)
             active = jnp.any(changeable)
             response, length, ended = through_eos(tokens[prompt:], jnp.where(active, budget, 0),
                                                   eos_ids, pad_id)
             return CanvasGeneration(jnp.concatenate([tokens[:prompt], response]), length,
-                                    ended, jnp.where(active, steps, 0))
+                                    ended, jnp.where(active, steps * walked, 0))
         return jax.lax.map(continued, continuation_keys(key, n))
 
     generated = jax.vmap(row)(full, mutable, keys)
     return jax.tree.map(lambda leaf: leaf.reshape((batch * n, *leaf.shape[2:])), generated)
+
+
+def _blockwise(model: nn.Module, variables: Variables, prepared: ModelInputs, changeable: jax.Array,
+               key: jax.Array, process: DiscreteProcess, solver: Unmask, budget: int, steps: int,
+               block: int) -> tuple[jax.Array, jax.Array]:
+    """One row's walk under a block model: each block of its response, by the places the model reads
+    (`positions`), unmasked over its own `steps` with every other slot held, in order. A response of
+    `budget` slots spans at most ceil((budget + block - 1) / block) blocks wherever it starts, and a
+    walk over a block that holds none of the row's slots changes nothing. Returns the row's tokens and
+    the walks that held some."""
+    from dew.sampling.sample import sample
+
+    blocks = prepared.token_fields["positions"][0] // block
+    first = jnp.min(jnp.where(changeable, blocks, jnp.max(blocks)))
+
+    def walk(index, carried):
+        tokens, walked = carried
+        held = changeable & (blocks == first + index)
+        denoise = process.denoiser(model, variables, inputs=prepared, mutable_mask=held[None])
+        tokens = sample(denoise, tokens, steps, solver=solver, key=jax.random.fold_in(key, index))
+        return tokens, walked + jnp.any(held)
+
+    tokens, walked = jax.lax.fori_loop(0, -(-(budget + block - 1) // block), walk,
+                                       (prepared.tokens, jnp.int32(0)))
+    return tokens[0], walked
 
 
 @functools.cache

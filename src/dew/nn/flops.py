@@ -92,12 +92,14 @@ def dense_training_flops(lengths: np.ndarray, inputs: int, outputs: int, *,
 
 
 def attention_flops(lengths: np.ndarray, heads: int, key: int, value: int, *, causal: bool,
-                    window: int | None = None, chunk: int | None = None) -> float:
+                    window: int | None = None, chunk: int | None = None, block: int | None = None) -> float:
     """QK and AV, two FLOPs per multiply-add, causal attention halved.
 
     The conventional model count uses L squared (not L*(L+1)) for causal
     triangles: 2*h*d*L^2 for equal key/value widths, 4*h*d*L^2 for full
     attention. Masking, softmaxes and fused-kernel padding are not matmuls.
+    A diffusion `block` reads each query's block and the ones before it: block
+    b's queries read (b + 1) blocks of keys, a partial last block all L.
     """
     def pairs(length):
         if window is None:
@@ -108,7 +110,12 @@ def attention_flops(lengths: np.ndarray, heads: int, key: int, value: int, *, ca
         return (length * visible - 0.5 * visible * visible) * (1 if causal else 2)
 
     length = real_lengths(lengths)
-    if chunk is not None:
+    if block is not None:
+        if block < 1:
+            raise ValueError("an attention FLOP block must be positive")
+        whole = np.floor(length / block)
+        work = block * block * whole * (whole + 1) / 2 + (length - whole * block) * length
+    elif chunk is not None:
         if chunk < 1:
             raise ValueError("an attention FLOP chunk must be positive")
         work = np.floor(length / chunk) * pairs(chunk) + pairs(np.remainder(length, chunk))

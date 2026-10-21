@@ -1,0 +1,14 @@
+{
+ "released": {
+  "repo": "GSAI-ML/LLaDA-MoE-v2-30B-A3B-Base",
+  "revision": "2a513f7a4634e426b2ab030e6defb24001d0c847",
+  "code": [
+   "configuration_lladamoe_v2.py",
+   "modeling_lladamoe_v2.py"
+  ]
+ },
+ "transformers": {
+  "version": "4.53.2"
+ },
+ "seed": 0
+}

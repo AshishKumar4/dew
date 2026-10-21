@@ -1,9 +1,10 @@
-"""Translate the bidirectional decoders: LLaDA, Dream and DiffusionGemma's text half.
+"""Translate the bidirectional decoders: LLaDA, LLaDA-MoE, LLaDA2, Dream and DiffusionGemma's text half.
 
 Each is a causal family's block with the mask replaced: full attention in
-place of the causal mask, and a mask token the sampler denoises to. Dream
-rides the qwen2 layout and DiffusionGemma the Gemma 4 one, so only LLaDA's
-OLMo-style tensor names need a map of their own.
+place of the causal mask, or LLaDA2's blocks, and a mask token the sampler
+denoises to. Dream rides the qwen2 layout and DiffusionGemma the Gemma 4 one;
+LLaDA's OLMo-style tensor names, LLaDA-MoE's layer-level shared expert and
+LLaDA2's Ling-style names each take a map of their own.
 """
 
 from __future__ import annotations
@@ -12,17 +13,23 @@ from collections.abc import Mapping
 from functools import partial
 
 from dew import records
+from dew.interop.config_records import native_fields
 from dew.interop.decoder_parts import (
     DEFAULT_MAX_SEQ_LEN,
     FUSED_EXPERTS,
     DecoderFamily,
     DecoderFields,
+    MixtureFields,
+    Packed,
     Renames,
     Ropes,
     base_config,
+    qkv_widths,
+    read_rope,
     refuse,
     renamed_name,
     renamed_path,
+    softmax_top_k,
 )
 from dew.interop.families.gemma import (
     GEMMA4_DEFAULTS,
@@ -34,6 +41,7 @@ from dew.interop.families.gemma import (
 )
 from dew.interop.families.qwen import qwen2_config
 from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.backbones.decoder_block import Mixture
 
 
 def _mask_token(hf_config: Mapping[str, object], used: set[str]) -> int:
@@ -61,7 +69,14 @@ def _llada_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFie
     (model.transformer.blocks.N.{attn_norm,q_proj,k_proj,v_proj,attn_out,
     ff_norm,ff_proj,up_proj,ff_out}, wte, ln_f, ff_out for the head), so
     `_llada_path` renames them onto the llama layout the shared map reads.
+
+    inclusionAI/LLaDA-MoE-7B-A1B releases its MoE under the same model_type
+    with a config class of its own (configuration_lladamoe.LLaDAConfig),
+    which always names its experts, so a config with `num_experts` is read as
+    that release (`_llada_moe_config`).
     """
+    if 'num_experts' in hf_config:
+        return _llada_moe_config(hf_config, used, renormalized=False)
     std = _llada_geometry(hf_config)
     layers = records.integer(std['num_hidden_layers'], 'num_hidden_layers/n_layers')
     config = base_config(std, set(), layer_types=('full_attention',) * layers,
@@ -221,6 +236,171 @@ def _llada_refusals(hf_config: Mapping[str, object], used: set[str],
         refuse('embedding_size', f'it names {embedding} rows for a {vocab} vocabulary')
 
 
+_RELEASED_MASK = 156895
+"""The `<|mask|>` id of the vocabulary LLaDA-MoE and LLaDA2 share: LLaDAMoEv2Config's mask_token_id
+default, and the mask_id both families' own samplers default to (LLaDA-MoE-7B-A1B's README
+`generate`, LLaDA2MoeModelLM.generate). LLaDA-MoE-7B-A1B's and LLaDA2's configs name none."""
+
+
+def _llada_moe_config(hf_config: Mapping[str, object], used: set[str], *,
+                      renormalized: bool) -> DecoderFields:
+    """Read a LLaDA-MoE config into `CausalTransformer` fields.
+
+    inclusionAI/LLaDA-MoE-7B-A1B (model_type 'llada', modeling_lladamoe.py) and
+    GSAI-ML/LLaDA-MoE-v2-30B-A3B ('llada_moe_v2', modeling_lladamoe_v2.py) compute OLMoE's block with
+    no causal mask (the attention's is_causal False, the decoder layer's mask None): q/k RMSNorm per
+    head before a rotate-half rotary over the first partial_rotary_factor of each head (transformers'
+    default rope), SwiGLU, a dense MLP dense_intermediate_size wide where moe_layer_freq is 0, routed
+    experts elsewhere, and an ungated shared expert beside them where
+    shared_expert_intermediate_size is set.
+
+    They route differently, and neither reads most of the routing fields its config carries
+    (moe_router_score_function, router_num_group, router_topk_group): 7B-A1B weighs its top-k by the
+    softmax over every expert, unnormalized and unscaled (LLaDAMoESparseMoeBlock fixes
+    norm_topk_prob False); v2, `renormalized`, softmaxes its top-k logits alone and scales them by a
+    nonzero routed_scaling_factor (LLaDAMoEv2SparseMoeBlock). The expert bias neither release
+    enables adds to 7B-A1B's routing weights themselves and is unbound in v2's forward, so it is
+    refused.
+    """
+    layers = records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers')
+    dense = records.integer(hf_config.get('dense_intermediate_size', -1), 'dense_intermediate_size')
+    if dense < 1:
+        refuse('dense_intermediate_size', 'the dense MLP needs its width; the config class leaves it at -1')
+    heads = records.integer(hf_config['num_attention_heads'], 'num_attention_heads')
+    width = records.integer(hf_config['hidden_size'], 'hidden_size') // heads
+    if not renormalized and hf_config.get('head_dim') not in (None, width):
+        # 7B-A1B's attention splits hidden_size // num_attention_heads whatever head_dim says, and
+        # its rotary reads head_dim.
+        refuse(f"head_dim {hf_config['head_dim']!r}", f'LLaDA-MoE-7B-A1B attends {width}-wide heads')
+    # Both config classes default rms_norm_eps to 1e-05 where the shared reader takes 1e-06.
+    shared_geometry = {**hf_config, 'intermediate_size': dense,
+                       'rms_norm_eps': hf_config.get('rms_norm_eps', 1e-5)}
+    config = base_config(shared_geometry, used, rope=read_rope(hf_config, used),
+                         qk_norm=bool(hf_config.get('qk_layernorm')), reads=frozenset({'attention_bias'}))
+    factor = records.number(hf_config.get('partial_rotary_factor', -1), 'partial_rotary_factor')
+    if not 0 < factor <= 1:
+        refuse(f'partial_rotary_factor {factor!r}', 'the rotary turns a share of each head in (0, 1]; the '
+               'config class leaves it at -1')
+    if hf_config.get('clip_qkv') is not None:
+        refuse('clip_qkv', 'the projections are not clamped here')
+    if hf_config.get('moe_router_enable_expert_bias'):
+        refuse('moe_router_enable_expert_bias', 'no release enables it, and it would add to the routing '
+               'weights rather than choose by them')
+    stated = hf_config.get('moe_layer_freq')
+    if not isinstance(stated, list) or len(stated) < layers:
+        refuse('moe_layer_freq', f'the reference reads one entry a layer, 0 for a dense one, of {layers}')
+    sparse = tuple(index for index in range(layers)
+                   if records.integer(stated[index], 'moe_layer_freq') != 0)
+    if not sparse:
+        refuse('moe_layer_freq', 'it routes no layer, which no LLaDA-MoE release builds')
+    shared = hf_config.get('shared_expert_intermediate_size')
+    if shared is not None and records.integer(shared, 'shared_expert_intermediate_size') < 1:
+        refuse('shared_expert_intermediate_size', 'the shared expert needs its width, or null for none')
+    scaling = records.number(hf_config.get('routed_scaling_factor') or 1.0, 'routed_scaling_factor')
+    used.update(('dense_intermediate_size', 'partial_rotary_factor', 'qk_layernorm', 'clip_qkv',
+                 'moe_router_enable_expert_bias', 'moe_layer_freq', 'shared_expert_intermediate_size',
+                 'num_experts', 'expert_intermediate_size', 'routed_scaling_factor', 'norm_topk_prob',
+                 'moe_router_score_function', 'router_num_group', 'router_topk_group', 'mask_token_id'))
+    config.update(
+        partial_rotary_factor=None if factor == 1 else factor, partial_rotary_type='default',
+        mixture=native_fields(Mixture)(
+            experts=records.integer(hf_config['num_experts'], 'num_experts'),
+            top_k=softmax_top_k(hf_config, used), layers=sparse, score_function='softmax',
+            norm_topk_prob=renormalized, scaling=scaling if renormalized else 1.0,
+            expert_features=records.integer(hf_config['expert_intermediate_size'],
+                                            'expert_intermediate_size'),
+            shared_features=(0 if shared is None
+                             else records.integer(shared, 'shared_expert_intermediate_size'))),
+        causal=False,
+        mask_token_id=records.integer(hf_config.get('mask_token_id', _RELEASED_MASK), 'mask_token_id'))
+    return config
+
+
+_LLADA2_BLOCK = 32
+"""The block LLaDA2 attends and denoises by: LLaDA2MoeModelLM.generate's block_length default
+(modeling_llada2_moe.py:1237 of LLaDA2.0-mini), which every release's README samples with."""
+
+
+def _llada2_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
+    """Read a LLaDA2.x config (model_type 'llada2_moe') into `CausalTransformer` fields.
+
+    inclusionAI's LLaDA2.0-mini/-flash, LLaDA2.1-mini/-flash and LLaDA2.2-flash compute Ling 2.0's
+    block (modeling_llada2_moe.py): one query_key_value projection stacking every query head, then
+    every key and value head; q/k RMSNorm per head before a rotate-half rotary over the first
+    partial_rotary_factor of each head (transformers' default rope); the output projection `dense`;
+    a dense MLP on the first first_k_dense_replace layers and routed SwiGLU experts after them beside
+    num_shared_experts' ungated MLP. Each token chooses by its sigmoid scores plus the gate's
+    expert_bias and weighs by its unbiased scores, normalized past one expert and scaled by
+    routed_scaling_factor (LLaDA2MoeGate). 2.0 and 2.1 keep a token to its topk_group best of n_group
+    groups, each scored by its two best experts; 2.2 has each block of block_size tokens choose
+    expert_capacity experts together instead (block_routing), reading no group field.
+
+    The model attends in blocks: its generate cuts the row into blocks of 32 from the prompt's first
+    token, lets each block read itself and the blocks before it (block_diffusion_attention_mask)
+    and denoises them in order, so the record carries that block (`diffusion_block`).
+
+    The release's model reads none of score_function, router_dtype, moe_router_enable_expert_bias,
+    norm_topk_prob, norm_softmax, norm_head, use_rmsnorm, using_split_qkv_in_self_attention,
+    rotary_dim, sliding_window (which only flash attention, which the class refuses, would apply) or
+    the dropouts: it fixes a sigmoid fp32 router with its bias, RMSNorm and the fused projection
+    whatever they say. delete_token_id and split_token_id are 2.2's sampler's edit tokens.
+    """
+    if not hf_config.get('num_key_value_heads'):
+        refuse('num_key_value_heads', 'LLaDA2MoeConfig leaves it at 0, which no head divides into')
+    # LLaDA2.0's and 2.1's config class norms queries and keys unless told not to, and 2.2's, which
+    # adds block_size and expert_capacity, only when told to.
+    qk_norm = bool(hf_config.get('use_qk_norm', 'block_size' not in hf_config))
+    config = base_config(hf_config, used, rope=read_rope(hf_config, used), qk_norm=qk_norm,
+                         reads=frozenset())
+    head_dim = records.integer(config['head_dim'], 'head_dim')
+    factor = records.number(hf_config.get('partial_rotary_factor', 0.5), 'partial_rotary_factor')
+    if not 0 < factor <= 1 or int(head_dim * factor) % 2:
+        refuse(f'partial_rotary_factor {factor!r}',
+               f'the rotary turns an even share of a {head_dim}-wide head')
+    layers = records.integer(hf_config['num_hidden_layers'], 'num_hidden_layers')
+    first_k = records.integer(hf_config.get('first_k_dense_replace', 0), 'first_k_dense_replace')
+    experts = hf_config.get('num_experts', 16)
+    sparse = () if experts is None else tuple(range(min(first_k, layers), layers))
+    used.update(('use_qk_norm', 'partial_rotary_factor', 'use_qkv_bias', 'use_bias', 'first_k_dense_replace',
+                 'num_experts', 'num_experts_per_tok', 'num_shared_experts', 'moe_intermediate_size',
+                 'routed_scaling_factor', 'n_group', 'topk_group', 'block_size', 'expert_capacity',
+                 'score_function', 'router_dtype', 'moe_router_enable_expert_bias', 'norm_topk_prob',
+                 'norm_softmax', 'norm_head', 'use_rmsnorm', 'using_split_qkv_in_self_attention',
+                 'rotary_dim', 'sliding_window', 'embedding_dropout', 'output_dropout',
+                 'output_router_logits', 'router_aux_loss_coef', 'delete_token_id', 'split_token_id',
+                 'mask_token_id'))
+    config.update(
+        partial_rotary_factor=None if factor == 1 else factor, partial_rotary_type='default',
+        attention_bias=bool(hf_config.get('use_qkv_bias', False)),
+        o_proj_bias=bool(hf_config.get('use_bias', True)),
+        mixture=(_llada2_mixture(hf_config, records.integer(experts, 'num_experts'), sparse)
+                 if sparse else None),
+        causal=False, diffusion_block=_LLADA2_BLOCK,
+        mask_token_id=records.integer(hf_config.get('mask_token_id', _RELEASED_MASK), 'mask_token_id'))
+    return config
+
+
+def _llada2_mixture(hf_config: Mapping[str, object], experts: int,
+                    sparse: tuple[int, ...]) -> MixtureFields:
+    """LLaDA2's routed experts: groups for 2.0 and 2.1, blocks for 2.2 (`_llada2_config`)."""
+    top_k = records.integer(hf_config.get('num_experts_per_tok', 2), 'num_experts_per_tok')
+    width = hf_config.get('moe_intermediate_size')
+    if width is None:
+        refuse('moe_intermediate_size', 'the routed experts need their width')
+    expert_width = records.integer(width, 'moe_intermediate_size')
+    shared = records.integer(hf_config.get('num_shared_experts', 0) or 0, 'num_shared_experts')
+    blocks = hf_config.get('block_size')
+    routing = ({'groups': records.integer(hf_config.get('n_group', 8), 'n_group'),
+                'groups_per_token': records.integer(hf_config.get('topk_group', 4), 'topk_group')}
+               if blocks is None else
+               {'routing_block': records.integer(blocks, 'block_size'),
+                'block_experts': records.integer(hf_config.get('expert_capacity', 48), 'expert_capacity')})
+    return native_fields(Mixture)(
+        experts=experts, top_k=top_k, layers=sparse, score_function='sigmoid', norm_topk_prob=top_k > 1,
+        scaling=records.number(hf_config.get('routed_scaling_factor', 2.5), 'routed_scaling_factor'),
+        bias=True, expert_features=expert_width, shared_features=shared * expert_width, **routing)
+
+
 def _dream_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFields:
     """Read a Dream-v0 config into `CausalTransformer` fields.
 
@@ -295,10 +475,30 @@ _LLADA_NAMES: Renames = (
 
 def _llada_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
     """Return the variables-tree path for one LLaDA tensor name, every one of
-    which the release nests under `model.transformer.`."""
+    which the dense release nests under `model.transformer.`. LLaDA-MoE-7B-A1B,
+    released under the same model_type, names its tensors OLMoE's way."""
+    if config.get('mixture') is not None:
+        return renamed_path(_LLADA_MOE_NAMES, name, config)
     if not name.startswith('model.transformer.'):
         raise ValueError(f'unknown tensor name {name!r}')
     return renamed_path(_LLADA_NAMES, name, config)
+
+
+# LLaDA-MoE's shared expert sits beside its layer's routed block, where the
+# shared map reads it inside that block.
+_LLADA_MOE_NAMES: Renames = (('shared_expert', 'mlp.shared_experts'),)
+
+# LLaDA2's Ling-style names beside the shared ones; its fused query_key_value
+# is split by `_LLADA2_PACKED`.
+_LLADA2_NAMES: Renames = (
+    ('model.word_embeddings', 'model.embed_tokens'), ('attention.dense', 'self_attn.o_proj'),
+    ('attention.query_layernorm', 'self_attn.q_norm'), ('attention.key_layernorm', 'self_attn.k_norm'),
+    ('mlp.gate.expert_bias', 'mlp.gate.e_score_correction_bias'))
+_LLADA2_PACKED = tuple(
+    Packed(f'.attention.query_key_value.{leaf}',
+           tuple(f'.self_attn.{part}.{leaf}' for part in ('q_proj', 'k_proj', 'v_proj')), 0,
+           widths=qkv_widths)
+    for leaf in ('weight', 'bias'))
 
 
 def _mask_token_export(model: CausalTransformer) -> Mapping[str, object]:
@@ -336,6 +536,34 @@ DIFFUSION_GEMMA_TEXT = DecoderFamily(
     export_weights=gemma4_export_weights,
     preserve_source_layout=False,
     defaults=GEMMA4_DEFAULTS,
+)
+
+LLADA2 = DecoderFamily(
+    ('llada2_moe',),
+    _llada2_config,
+    lambda fields: bool(fields.causal is False and fields.diffusion_block is not None),
+    'llada2_moe',
+    'LLaDA2MoeModelLM',
+    _mask_token_export,
+    weight_path=partial(renamed_path, _LLADA2_NAMES),
+    packed=_LLADA2_PACKED,
+    preserve_source_layout=True,
+    # LLaDA2MoeConfig's default; the shared reader's is 1e-06.
+    defaults={'rms_norm_eps': 1e-5},
+)
+
+# LLaDA-MoE-7B-A1B's 'llada' configs reach this computation through LLADA's
+# reader (`_llada_config`); its weights through LLADA's map (`_llada_path`).
+LLADA_MOE = DecoderFamily(
+    ('llada_moe_v2',),
+    partial(_llada_moe_config, renormalized=True),
+    lambda fields: bool(fields.causal is False and fields.mixture is not None
+                        and fields.mixture.score_function == 'softmax' and not fields.mixture.parallel),
+    'llada_moe_v2',
+    'LLaDAMoEv2ModelLM',
+    _mask_token_export,
+    weight_path=partial(renamed_path, _LLADA_MOE_NAMES),
+    preserve_source_layout=True,
 )
 
 DREAM = DecoderFamily(

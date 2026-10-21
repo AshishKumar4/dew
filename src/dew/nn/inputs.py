@@ -411,6 +411,19 @@ def counted_places(segments=None, valid=None, positions=None) -> jax.Array | Non
     return jnp.take_along_axis(jnp.broadcast_to(given, shape), slots, axis=1) + count
 
 
+def numbered_blocks(tokens: Coordinates, shape: tuple[int, int], block: int) -> jax.Array:
+    """Each token's block of `block` places counted over its document's real tokens
+    (`counted_places`), numbered along its row from 0, a padding slot -1 `[B, S]`: the blocks a block
+    router chooses its experts for together (`dew.nn.moe.Router.block_experts`)."""
+    counted = counted_places(tokens.segments, tokens.valid, tokens.positions)
+    cut = jnp.broadcast_to(jnp.arange(shape[1]) if counted is None else counted, shape) // block
+    documents = jnp.zeros(shape, jnp.int32) if tokens.segments is None else jnp.asarray(tokens.segments)
+    opens = jnp.concatenate([jnp.ones((shape[0], 1), bool),
+                             (cut[:, 1:] != cut[:, :-1]) | (documents[:, 1:] != documents[:, :-1])], axis=1)
+    numbered = jnp.cumsum(opens, axis=1, dtype=jnp.int32) - 1
+    return numbered if tokens.valid is None else jnp.where(tokens.valid, numbered, -1)
+
+
 def document_reach(segments, valid, places) -> jax.Array:
     """Each token's document's furthest place `[B, S]`: `places` at the document's last real token,
     which LongRoPE picks its factors by, as the reference picks them by a sequence's largest position,

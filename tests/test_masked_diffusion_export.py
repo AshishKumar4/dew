@@ -34,6 +34,7 @@ loading report has to name no missing, unexpected or mismatched tensor.
 import json
 from pathlib import Path
 
+import jax
 import numpy as np
 import pytest
 from interop_support import assert_restores
@@ -122,7 +123,6 @@ def test_a_masked_diffusion_run_exports_and_reloads_as_a_masked_decoder(fixture,
     import math
 
     import grain.python as grain
-    import jax
     import optax
 
     from dew.checkpoints import Checkpoints
@@ -161,3 +161,22 @@ def test_a_masked_diffusion_run_exports_and_reloads_as_a_masked_decoder(fixture,
     assert (task.max_new_tokens, task.pad_token_id) == (saved.max_new_tokens, saved.pad_token_id)
     assert task.max_new_tokens == int(ids.shape[1])
     assert task(ids[:1, :4], 4, key=0).tokens.shape[-1] == 8
+
+
+@pytest.mark.parametrize("fixture", ["llada-moe-tiny", "llada-moe-v2-tiny", "llada2-tiny", "llada22-tiny"])
+def test_a_masked_moe_source_writes_its_own_tensors_back_and_reloads(fixture, tmp_path):
+    """LLaDA-MoE and LLaDA2 export in their release's own layout, as Qwen-MoE's families do: a moved
+    tree written back holds every tensor the checkpoint does, under its name, shape and dtype
+    (LLaDA2's fused query_key_value packed again, its expert_bias from the router's state), and
+    `Pretrained.load` reads the export back to the moved model."""
+    from safetensors.numpy import load_file
+
+    source = Pretrained.load(str(FIXTURES / fixture), dtype="float32", attention_impl="reference")
+    moved = jax.tree.map(lambda leaf: np.asarray(leaf) + np.float32(0.01), source.variables)
+    source.save(tmp_path, variables=moved)
+    stored, written = load_file(str(FIXTURES / fixture / "model.safetensors")), source.export(moved)
+    assert {name: (value.shape, value.dtype) for name, value in written.items()} == {
+        name: (value.shape, value.dtype) for name, value in stored.items()}
+    reloaded = Pretrained.load(str(tmp_path), dtype="float32", attention_impl="reference")
+    ids = np.random.default_rng(0).integers(3, 60, (2, 16)).astype(np.int32)
+    assert_restores(source.model, moved, reloaded, ids)

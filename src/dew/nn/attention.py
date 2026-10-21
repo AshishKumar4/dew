@@ -201,6 +201,16 @@ def chunk_mask(query_positions, key_positions, chunk_size: int):
     return same[..., None, :, :] if same.ndim == 3 else same[None, None]
 
 
+def diffusion_block_mask(query_positions, key_positions, block: int):
+    """Boolean `[.., 1, T, S]` keeping the keys of the query's block and the blocks before it, both
+    absolute: block diffusion's mask (BD3-LM's `block_diff_mask`, LLaDA2's `generate`), `kv // block
+    <= q // block`."""
+    query_blocks = jnp.asarray(query_positions) // block
+    key_blocks = jnp.asarray(key_positions) // block
+    seen = key_blocks[..., None, :] <= query_blocks[..., :, None]
+    return seen[..., None, :, :] if seen.ndim == 3 else seen[None, None]
+
+
 def combined_attention_mask(query_length: int, key_length: int, causal: bool,
                             sliding_window: int | None,
                             mask: jax.Array | None) -> jax.Array | None:

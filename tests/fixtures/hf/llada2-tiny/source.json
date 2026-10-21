@@ -1,0 +1,14 @@
+{
+ "released": {
+  "repo": "inclusionAI/LLaDA2.1-mini",
+  "revision": "20e64e2ad21644d0e5248586ed9c942cdd45de0f",
+  "code": [
+   "configuration_llada2_moe.py",
+   "modeling_llada2_moe.py"
+  ]
+ },
+ "transformers": {
+  "version": "5.16.1"
+ },
+ "seed": 0
+}

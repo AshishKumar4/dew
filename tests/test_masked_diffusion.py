@@ -237,6 +237,40 @@ def test_native_masked_task_matches_direct_mdlm_trajectory(masked_source):
         np.testing.assert_array_equal(result.tokens[row], expected[0])
 
 
+def test_a_block_model_unmasks_its_response_one_block_at_a_time():
+    """LLaDA2's generation, BD3-LM's sampler: each block of the response, by the places the model
+    reads, takes its own walk of `steps` with every other slot held, in order, so a block reads the
+    ones before it clean, and a row walks the blocks its response spans. Its training is MDLM's no
+    more: a block model learns each noisy block against clean ones before it, which MDLM's corrupted
+    row does not hold, so the objective refuses it."""
+    source = Pretrained.load(FIXTURES / "llada2-tiny", dtype="float32", attention_impl="xla")
+    model = source.model.clone(diffusion_block=4)
+    task = replace(source.text_generation(), model=model)
+    tokens = jnp.asarray([[0, 9, 5, 6], [1, 2, 3, 4], [0, 0, 7, 8]])
+    valid = jnp.asarray([[0, 1, 1, 1], [1, 1, 1, 1], [0, 0, 1, 1]], bool)
+    places = jnp.asarray([[0, 3, 4, 5], [0, 1, 2, 3], [0, 0, 4, 5]])
+    key = jax.random.key(7)
+    result = task(ModelInputs(tokens, {"attention_mask": valid, "positions": places}), 8, key=key,
+                  steps=3).host()
+    np.testing.assert_array_equal(result.tokens[:, :4], tokens)
+    assert np.all(result.tokens[:, 4:] != model.mask_token_id)
+    np.testing.assert_array_equal(result.decoder_steps, [9, 6, 9])
+    for row in range(3):
+        walked = jnp.concatenate([tokens[row:row + 1], jnp.full((1, 8), model.mask_token_id)], axis=1)
+        positions = jnp.concatenate([places[row:row + 1], places[row].max() + jnp.arange(1, 9)[None]], axis=1)
+        prepared = ModelInputs(walked, {"attention_mask": jnp.concatenate(
+            [valid[row:row + 1], jnp.ones((1, 8), bool)], axis=1), "positions": positions})
+        blocks, response = positions // 4, jnp.arange(12)[None] >= 4
+        for index in range(3):
+            held = response & (blocks == blocks[0, 4] + index)
+            denoise = task.process.denoiser(model, source.variables, inputs=prepared, mutable_mask=held)
+            walked = sample(denoise, walked, 3, solver=Unmask(),
+                            key=jax.random.fold_in(jax.random.fold_in(key, row), index))
+        np.testing.assert_array_equal(result.tokens[row], walked[0])
+    with pytest.raises(ValueError):
+        MaskedDiffusionObjective(model, task.process, seq_len=8, variables=source.variables)
+
+
 def test_masked_continuations_seed_eos_and_zero_budget(masked_source):
     source, inputs = masked_source
     task = source.text_generation()

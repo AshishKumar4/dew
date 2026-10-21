@@ -1947,6 +1947,38 @@
    ],
    "note": "Dynamic remote import; routing weights use unshifted scores (tools/kimi_linear_reference.py:33); fla kernels forced IEEE."
   },
+  "hf/llada-moe-tiny/recording.npz": {
+   "tool": "tools/remote_code_reference.py",
+   "sources": [
+    {
+     "repo": "inclusionAI/LLaDA-MoE-7B-A1B-Base",
+     "version": "daccaf1ccbf263a427bc9ac2a23b0b004fb275bf",
+     "runs": "fetched"
+    },
+    {
+     "repo": "huggingface/transformers",
+     "version": "4.53.2",
+     "runs": "transformers"
+    }
+   ],
+   "note": "The release's LLaDAMoEModelLM in fp32 and in float64 (its float32 pins widened), per seed over token_draw's ids, no mask passed (its layers drop any)."
+  },
+  "hf/llada-moe-v2-tiny/recording.npz": {
+   "tool": "tools/remote_code_reference.py",
+   "sources": [
+    {
+     "repo": "GSAI-ML/LLaDA-MoE-v2-30B-A3B-Base",
+     "version": "2a513f7a4634e426b2ab030e6defb24001d0c847",
+     "runs": "fetched"
+    },
+    {
+     "repo": "huggingface/transformers",
+     "version": "4.53.2",
+     "runs": "transformers"
+    }
+   ],
+   "note": "The release's LLaDAMoEv2ModelLM in fp32 and in float64 (its float32 pins widened), per seed over token_draw's ids, no mask passed (its layers drop any)."
+  },
   "hf/llada-tiny/logits.npy": {
    "tool": "tools/remote_code_reference.py",
    "sources": [
@@ -1976,6 +2008,38 @@
      "runs": "transformers"
     }
    ]
+  },
+  "hf/llada2-tiny/recording.npz": {
+   "tool": "tools/remote_code_reference.py",
+   "sources": [
+    {
+     "repo": "inclusionAI/LLaDA2.1-mini",
+     "version": "20e64e2ad21644d0e5248586ed9c942cdd45de0f",
+     "runs": "fetched"
+    },
+    {
+     "repo": "huggingface/transformers",
+     "version": "5.16.1",
+     "runs": "transformers"
+    }
+   ],
+   "note": "The release's LLaDA2MoeModelLM in fp32 and in float64 (its float32 pins widened), per seed over token_draw's ids, under its generate's block mask with block_length 4."
+  },
+  "hf/llada22-tiny/recording.npz": {
+   "tool": "tools/remote_code_reference.py",
+   "sources": [
+    {
+     "repo": "inclusionAI/LLaDA2.2-flash",
+     "version": "9b78da3f9149f1e239fb6d15f20a326fde574b9f",
+     "runs": "fetched"
+    },
+    {
+     "repo": "huggingface/transformers",
+     "version": "5.16.1",
+     "runs": "transformers"
+    }
+   ],
+   "note": "The release's LLaDA2MoeModelLM in fp32 and in float64 (its float32 pins widened), per seed over token_draw's ids, under its generate's block mask with block_length 4; routing blocks of the config's 8."
   },
   "hf/llama-tiny/beam.npz": {
    "tool": "tools/beam_reference.py",
@@ -4279,6 +4343,11 @@
    "tool": "tools/ouro_reference.py",
    "what": "Ouro weights, probe token ids and padded validity masks",
    "files": ["hf/ouro-tiny/attention_mask.npy", "hf/ouro-tiny/input_ids.npy", "hf/ouro-tiny/model.safetensors", "hf/ouro-tiny/padded_ids.npy"]
+  },
+  {
+   "tool": "tools/remote_code_reference.py",
+   "what": "LLaDA-MoE and LLaDA2 weights, drawn by each release's own class at seed 0 (--draw)",
+   "files": ["hf/llada-moe-tiny/model.safetensors", "hf/llada-moe-v2-tiny/model.safetensors", "hf/llada2-tiny/model.safetensors", "hf/llada22-tiny/model.safetensors"]
   }
  ]
 }

@@ -65,6 +65,7 @@ if TYPE_CHECKING:
 __all__ = [
     "AffineHead",
     "BlockDenoiser",
+    "BlockDiffusion",
     "BlockDrafting",
     "Bounded",
     "CacheCapacity",
@@ -372,6 +373,16 @@ class TokenModel(Protocol):
 
     @property
     def mask_token_id(self) -> int | None: ...
+
+
+@runtime_checkable
+class BlockDiffusion(Protocol):
+    """A token model that is not causal and may read in blocks: each position reads its own block of
+    `diffusion_block` positions and the blocks before it (BD3-LM, LLaDA2), or the whole sequence
+    where it is None. A model without the field reads the whole sequence."""
+
+    @property
+    def diffusion_block(self) -> int | None: ...
 
 
 class DenoisingModel(Protocol):

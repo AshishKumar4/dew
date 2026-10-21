@@ -182,7 +182,7 @@ def verdict(route) -> str:
 def model_of(config: dict, mode: str = "train", *, causal: bool | None = None):
     """The family's `CausalTransformer` in bf16 for `mode`: its decoder, a media bundle's
     (`hf_decoders.bundles`, `translate_wrapper_config`) where the fixture is one, on a paged cache for
-    'decode-paged', its attention made `causal` where given."""
+    'decode-paged', its attention made `causal` where given, which drops a diffusion block."""
     import jax.numpy as jnp
 
     from dew.interop.hf_decoders import bundles, translate_config, translate_wrapper_config
@@ -195,6 +195,8 @@ def model_of(config: dict, mode: str = "train", *, causal: bool | None = None):
         fields["kv_cache"] = KVCache(page_size=16)
     if causal is not None:
         fields["causal"] = causal
+    if causal:
+        fields["diffusion_block"] = None
     return CausalTransformer(**fields)
 
 

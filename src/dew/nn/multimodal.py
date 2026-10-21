@@ -274,6 +274,10 @@ class MultimodalTransformer(nn.Module):
         return self.language_model.causal
 
     @property
+    def diffusion_block(self) -> int | None:
+        return self.language_model.diffusion_block
+
+    @property
     def mask_token_id(self) -> int | None:
         return self.language_model.mask_token_id
 

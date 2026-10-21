@@ -799,6 +799,11 @@ def translated(hf_config: Mapping[str, object], family: "DecoderFamily") -> Deco
     return config
 
 
+MASKED_DIFFUSION_TYPES = frozenset({'llada', 'llada_moe_v2', 'llada2_moe', 'dream', 'Dream',
+                                    'diffusion_gemma_text'})
+"""The masked-diffusion families' model_types: bidirectional by construction, never a causal LM's."""
+
+
 def translate_family_config(hf_config: Mapping[str, object],
                             family: "DecoderFamily") -> tuple[DecoderFields, set[str]]:
     """Translate a config as `family` reads it, returning the fields nothing read."""
@@ -811,8 +816,7 @@ def translate_family_config(hf_config: Mapping[str, object],
     # decoder), so their own translators own the direction and this check
     # leaves them alone.
     bidirectional = hf_config.get('use_bidirectional_attention', False)
-    if (model_type not in ('llada', 'dream', 'Dream', 'diffusion_gemma_text')
-            and bidirectional and bidirectional != 'vision'):
+    if model_type not in MASKED_DIFFUSION_TYPES and bidirectional and bidirectional != 'vision':
         refuse(f"use_bidirectional_attention={bidirectional!r}", "the backbone is causal")
     if hf_config.get('mlp_bias'):
         refuse("mlp_bias=True", "the gated MLP is bias-free")
@@ -1508,6 +1512,14 @@ def joined_packed(tensors: Mapping[str, np.ndarray], packed: Sequence[Packed]) -
 
 
 _QKV = ('q_proj', 'k_proj', 'v_proj')
+
+
+def qkv_widths(config: Mapping[str, object]) -> tuple[int, int, int]:
+    """A fused q, k and v projection's rows when it stacks them whole: every query head's, then every
+    key head's and every value head's (Phi-3's `qkv_proj`, LLaDA2's `query_key_value`)."""
+    head_dim = records.integer(config['head_dim'], 'head_dim')
+    kv = records.integer(config['num_kv_heads'], 'num_kv_heads') * head_dim
+    return records.integer(config['num_heads'], 'num_heads') * head_dim, kv, kv
 
 
 def _key_runs(config: Mapping[str, object]) -> int:

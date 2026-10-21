@@ -33,7 +33,7 @@ from ..hyper_connections import (
     collapse_by,
     mix_streams,
 )
-from ..inputs import LayerInputs, MixerCall, PredictionPhase
+from ..inputs import LayerInputs, MixerCall, PredictionPhase, coordinates_of, numbered_blocks
 from ..linear import recomputing
 from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, SparseMLP
 from ..ngpt import NGPT, stepped
@@ -141,6 +141,10 @@ class Mixture:
     mesh axis that divides the expert count. `hash_layers` route by DeepSeek
     V4's token table, `latent_features` gives Kimi K3's latent MoE, and
     `media_bias` is DeepSeek-V4.1's image-span bias (`SparseMLP`, `Router`).
+    `routing_block` and `block_experts` are LLaDA2.2's block routing: the
+    tokens of each block of `routing_block` places choose `block_experts`
+    experts together, and each token its `top_k` among them
+    (`Router.block_experts`).
     """
 
     experts: int
@@ -165,6 +169,8 @@ class Mixture:
     latent_features: int | None = None
     latent_norm: bool = False
     media_bias: bool = False
+    routing_block: int | None = None
+    block_experts: int | None = None
 
     def __post_init__(self):
         if self.layers is not None:
@@ -191,6 +197,12 @@ class Mixture:
             raise ValueError("shared_gate requires shared_features")
         if self.latent_norm and self.latent_features is None:
             raise ValueError("latent_norm norms the latent experts' output, which needs latent_features")
+        if (self.routing_block is None) != (self.block_experts is None) or (
+                self.routing_block is not None and (self.routing_block < 1 or self.parallel
+                                                    or self.hash_layers is not None)):
+            raise ValueError(
+                "block routing has blocks of routing_block places choose block_experts experts "
+                "together, so it sets both, a positive block, and no parallel branch or hash routing")
         if self.implementation not in GROUPED_MATMULS:
             raise ValueError(
                 f"implementation is the experts' grouped matmul, one of "
@@ -250,7 +262,8 @@ class Mixture:
             ignored = [name for name in ('score_function', 'norm_topk_prob', 'scaling', 'groups',
                                          'groups_per_token', 'group_score', 'bias', 'scale_inputs',
                                          'parallel', 'expert_features', 'shared_features', 'hash_layers',
-                                         'latent_features', 'latent_norm', 'media_bias')
+                                         'latent_features', 'latent_norm', 'media_bias', 'routing_block',
+                                         'block_experts')
                        if getattr(self, name) != getattr(plain, name)]
             ignored += ['swiglu_limit'] if swiglu_limit is not None else []
             if ignored:
@@ -277,7 +290,7 @@ class Mixture:
             routed_scaling_factor=self.scaling, expert_groups=self.groups,
             groups_per_token=self.groups_per_token,
             group_score=self.group_score, expert_bias=self.bias, media_bias=self.media_bias,
-            scale_inputs=self.scale_inputs, swiglu_limit=swiglu_limit,
+            block_experts=self.block_experts, scale_inputs=self.scale_inputs, swiglu_limit=swiglu_limit,
             shared=None if not self.shared_features else functools.partial(
                 dense, hidden_features=self.shared_features),
             shared_gate=self.shared_gate, init_std=init_std, output_init_std=output_init_std,
@@ -568,6 +581,7 @@ class DecoderBlock(nn.Module):
     residual_site: ResidualSite | None = None  # Kimi K3's place in the depth mixture
     routed: bool = False  # the feed-forward, or the parallel branch, routes over experts
     media_routed: bool = False  # the feed-forward routes a media span by its own bias
+    routing_block: int | None = None  # the feed-forward's router chooses experts a block of places at a time
     engram: Callable[..., nn.Module] | None = None  # the layer's EngramLayer factory
     engram_index: int | None = None
     prediction_target: bool = False  # records its streams' mean for DSpark
@@ -824,7 +838,7 @@ class DecoderBlock(nn.Module):
                 mlp_input = (normed if self.wiring.shared_parallel_norm else
                              self.post_attention_layernorm(read) if self.wiring.pre_norms else read)
             hidden = self.mlp(mlp_input,
-                              **self._feedforward_inputs(attention_metadata),
+                              **self._feedforward_inputs(attention_metadata, mlp_input.shape[:2]),
                               **({} if self.parallel is not None else routes),
                               **({"train": train} if isinstance(self.mlp, ReadsTrain) and self.mlp.reads_train
                                  else {}))
@@ -1026,15 +1040,17 @@ class DecoderBlock(nn.Module):
             **({} if prediction_phase == "ordinary" else {"prediction_phase": prediction_phase}),
         )
 
-    def _feedforward_inputs(self, attention_metadata) -> dict:
+    def _feedforward_inputs(self, attention_metadata, shape: tuple[int, int]) -> dict:
         """The token ids for a hash-routed feed-forward, the media mask, when
-        the call has one, for one that routes a media span apart, nothing for
-        the rest."""
+        the call has one, for one that routes a media span apart, each token's
+        numbered block for one that routes by blocks, nothing for the rest."""
+        blocks = {} if self.routing_block is None else {
+            "blocks": numbered_blocks(coordinates_of(attention_metadata, *shape), shape, self.routing_block)}
         if self.media_routed:
             media = None if attention_metadata is None else attention_metadata.media
-            return {} if media is None else {"media": media}
+            return blocks if media is None else {**blocks, "media": media}
         if not self.hash_routed:
-            return {}
+            return blocks
         if attention_metadata is None or attention_metadata.token_ids is None:
             raise ValueError(
                 "a hash-routed layer selects its experts by the token ids, which the "

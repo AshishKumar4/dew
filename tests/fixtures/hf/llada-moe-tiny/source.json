@@ -1,0 +1,14 @@
+{
+ "released": {
+  "repo": "inclusionAI/LLaDA-MoE-7B-A1B-Base",
+  "revision": "daccaf1ccbf263a427bc9ac2a23b0b004fb275bf",
+  "code": [
+   "configuration_lladamoe.py",
+   "modeling_lladamoe.py"
+  ]
+ },
+ "transformers": {
+  "version": "4.53.2"
+ },
+ "seed": 0
+}

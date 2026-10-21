@@ -343,6 +343,13 @@ FAMILIES: Mapping[str, tuple[Family, ...]] = {
                released("llada-tiny")),
         Family("causal_transformer+dream", "causal_transformer", BIDIRECTIONAL_LM | {MASK_TOKEN}, 128,
                released("dream-tiny")),
+        Family("causal_transformer+llada_moe", "causal_transformer", BIDIRECTIONAL_LM | {MASK_TOKEN}, 64,
+               released("llada-moe-tiny")),
+        Family("causal_transformer+llada_moe_v2", "causal_transformer", BIDIRECTIONAL_LM | {MASK_TOKEN}, 64,
+               released("llada-moe-v2-tiny")),
+        # Each position reads its own block and the ones before it: neither causal nor the whole row.
+        Family("causal_transformer+llada2", "causal_transformer", frozenset({LOGITS, STATES, MASK_TOKEN}), 64,
+               released("llada2-tiny")),
     ),
     "multimodal_transformer": (
         Family("multimodal_transformer+gemma3", "multimodal_transformer", DECODER_LM, 256,

@@ -318,6 +318,12 @@ class CausalTransformer(nn.Module):
     """Whether attention is causal. False gives full attention, the encoder that
     a masked diffusion language model denoises with. The parameter tree is the
     same either way."""
+    diffusion_block: int | None = None
+    """The block of a block-diffusion model (BD3-LM, LLaDA2), which is not
+    `causal`: its places are cut into blocks of this many, counted over each
+    document's tokens, and a query reads the keys of its own block and of the
+    blocks before it. A masked-diffusion sampler denoises the blocks in order
+    (`dew.diffusion.discrete`). None reads the whole row."""
     per_layer_input_dim: int | None = None
     """The width of Gemma 3n/4 per-layer inputs, or None for a model without
     them. Each layer reads its own slice of an extra table and adds it to its
@@ -790,6 +796,10 @@ class CausalTransformer(nn.Module):
             raise ValueError(
                 f"num_heads ({self.num_heads}) must be a multiple of num_kv_heads "
                 f"({self.kv_heads})")
+        if self.diffusion_block is not None and (self.causal or self.diffusion_block < 1):
+            raise ValueError(
+                f"diffusion_block cuts a bidirectional model's row into blocks of a positive size, got "
+                f"{self.diffusion_block} on a model that is{'' if self.causal else ' not'} causal")
         if self.partial_rotary_factor is not None and not 0 < self.partial_rotary_factor <= 1:
             raise ValueError(
                 "partial_rotary_factor must be within (0, 1], "
@@ -1233,6 +1243,8 @@ class CausalTransformer(nn.Module):
             routed=spec.routed,
             media_routed=(spec.routed and not spec.hash_routed
                           and self.mixture is not None and self.mixture.media_bias),
+            routing_block=(self.mixture.routing_block if spec.routed and self.mixture is not None
+                           else None),
             engram=None if spec.engram is None or self.engram is None else functools.partial(
                 EngramLayer, rows=self.engram.num_embeddings[spec.engram], head_dim=self.engram.head_dim,
                 hc_mult=self.hyper_connections.hc_mult if self.hyper_connections else 1,

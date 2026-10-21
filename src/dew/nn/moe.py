@@ -204,6 +204,11 @@ class Router(nn.Module):
     token id the caller passes, weighted by the learned gate. `media_bias` is
     DeepSeek-V4.1's second bias, selecting for image-span tokens in place of
     `expert_bias` (`bias_vl`, model.py:807-820), given the `media` mask.
+
+    `block_experts` is LLaDA2.2's block routing: the tokens of a block, which
+    the caller numbers (`blocks`), first choose `block_experts` experts
+    together, by each expert's best selection score over them, and each token
+    then chooses its `top_k` among those (`block_mask`).
     """
     num_experts: int
     in_features: int
@@ -217,6 +222,7 @@ class Router(nn.Module):
     expert_bias: bool = False
     media_bias: bool = False
     hash_vocab: int | None = None
+    block_experts: int | None = None
     init_std: float | None = None  # normal std of the kernel; None: lecun normal
     precision: PrecisionLike = None
 
@@ -254,6 +260,12 @@ class Router(nn.Module):
                     f"{self.groups_per_token} of {self.expert_groups} groups hold "
                     f"{self.groups_per_token * per_group} experts, fewer than the "
                     f"top_k of {self.top_k}")
+        if self.block_experts is not None and (not self.top_k <= self.block_experts <= self.num_experts
+                                               or self.expert_groups > 1):
+            raise ValueError(
+                f"block_experts are the experts a block's tokens all choose their top_k ({self.top_k}) "
+                f"among, so between top_k and num_experts ({self.num_experts}), got "
+                f"{self.block_experts}, and a token limited to its groups might find fewer there")
         # The kernel is the router's own parameter, not a nested Dense, so
         # the leaf is `gate/kernel` where a Hugging Face sparse layer keeps
         # `gate.weight`.
@@ -267,17 +279,17 @@ class Router(nn.Module):
         if self.media_bias:
             self.bias_vl = self.variable('moe', 'media_bias', jnp.zeros, (self.num_experts,), jnp.float32)
         if self.hash_vocab is not None:
-            if self.expert_bias or self.expert_groups > 1:
+            if self.expert_bias or self.expert_groups > 1 or self.block_experts is not None:
                 raise ValueError(
                     "hash routing selects by the token table alone, so it has no "
-                    "balancing bias and no expert groups")
+                    "balancing bias, expert groups or block experts")
             self.tid2eid = self.variable(
                 'moe', 'tid2eid', jnp.zeros, (self.hash_vocab, self.top_k), jnp.int32)
 
-    def __call__(self, x, tokens=None, media=None, routes: Routes | None = None):
+    def __call__(self, x, tokens=None, media=None, routes: Routes | None = None, blocks=None):
         logits = self.logits(x)
         scores = self._activated(logits)
-        indices = chosen_experts(lambda: self._selected(scores, tokens, media),
+        indices = chosen_experts(lambda: self._selected(scores, tokens, media, blocks),
                                  (*scores.shape[:-1], self.top_k), routes)
         # The load each expert took, for the step that balances the bias:
         # written only when a caller opens the 'router' collection, and never
@@ -296,7 +308,7 @@ class Router(nn.Module):
                 weights = weights / (jnp.sum(weights, axis=-1, keepdims=True) + WEIGHT_SUM_EPSILON)
         return weights * self.routed_scaling_factor, indices
 
-    def _selected(self, scores, tokens, media):
+    def _selected(self, scores, tokens, media, blocks):
         """The experts this router chooses on its own: `[..., top_k]`."""
         if self.hash_vocab is not None:
             if tokens is None:
@@ -304,13 +316,34 @@ class Router(nn.Module):
             return self.tid2eid.value[jnp.asarray(tokens)]
         if tokens is not None:
             raise ValueError("only a hash router reads the token ids")
+        if (blocks is None) != (self.block_experts is None):
+            raise ValueError("a block router chooses each block's experts together, from the blocks the "
+                             "caller numbers, and only a block router reads them")
         selection = scores if not self.expert_bias else scores + self.bias.value
         if media is not None:
             selection = jnp.where(media[..., None], scores + self.bias_vl.value, selection)
         if self.expert_groups > 1:
             selection = jnp.where(self.group_mask(selection), selection, -jnp.inf)
+        if blocks is not None:
+            selection = jnp.where(self.block_mask(selection, blocks), selection, -jnp.inf)
         _, indices = jax.lax.top_k(selection, self.top_k)
         return indices
+
+    def block_mask(self, selection, blocks):
+        """True where an expert is one of the `block_experts` its token's block chose: the experts of
+        the best selection scores over the block's tokens (LLaDA2.2's `block_routing`,
+        modeling_llada2_moe.py:244-275). `blocks` `[..., S]` numbers each row's blocks from 0, and a
+        token numbered -1 (padding) votes for none."""
+        rows, (length, experts) = selection.shape[:-2], selection.shape[-2:]
+
+        def row(scores, ids):
+            best = jax.ops.segment_max(scores, ids, num_segments=length)
+            _, chosen = jax.lax.top_k(best, self.block_experts)
+            allowed = jnp.zeros((length, experts), bool).at[jnp.arange(length)[:, None], chosen].set(True)
+            return allowed[jnp.maximum(ids, 0)]
+
+        flat = jax.vmap(row)(selection.reshape(-1, length, experts), jnp.reshape(blocks, (-1, length)))
+        return flat.reshape(*rows, length, experts)
 
     def logits(self, x):
         """Each token's gate logit for every expert, in fp32 (`at_least_fp32`):
@@ -982,6 +1015,7 @@ class SparseMLP(nn.Module):
     expert_bias: bool = False
     media_bias: bool = False
     hash_vocab: int | None = None
+    block_experts: int | None = None
     swiglu_limit: float | None = None
     scale_inputs: bool = False
     shared: Callable[..., nn.Module] | None = None
@@ -1027,8 +1061,8 @@ class SparseMLP(nn.Module):
                            group_score=self.group_score,
                            expert_bias=self.expert_bias,
                            media_bias=self.media_bias,
-                           hash_vocab=self.hash_vocab, init_std=self.init_std,
-                           precision=self.precision, name='gate')
+                           hash_vocab=self.hash_vocab, block_experts=self.block_experts,
+                           init_std=self.init_std, precision=self.precision, name='gate')
         width = self.out_features if self.latent_features is None else self.latent_features
         self.experts = ExpertMLP(
             num_experts=self.num_experts, hidden_features=self.hidden_features,
@@ -1064,8 +1098,8 @@ class SparseMLP(nn.Module):
         """It takes a layer's replayed experts (`RoutesExperts`)."""
         return True
 
-    def __call__(self, x, tokens=None, media=None, routes: Routes | None = None):
-        weights, indices = self.gate(x, tokens, media, routes)
+    def __call__(self, x, tokens=None, media=None, routes: Routes | None = None, blocks=None):
+        weights, indices = self.gate(x, tokens, media, routes, blocks)
         if self.latent_features is None:
             routed = self.experts(x, weights, indices)
         else:

@@ -26,6 +26,7 @@ from dew.nn.attention import (
     chunk_mask,
     combined_attention_mask,
     cudnn_takes_mask,
+    diffusion_block_mask,
     kernel_for_materialized_mask,
     max_attention_logits,
     open_kv_cache,
@@ -329,18 +330,21 @@ class CausalSelfAttention(nn.Module):
     @nn.nowrap
     def model_flops(self, lengths) -> float:
         """Query/output maps and unshared K/V maps, plus QK and AV."""
-        window = self.ctx.sliding_window if self.ctx.causal or self.ctx.bidirectional_window else None
         return (sum(projection_flops(lengths, *shape) for shape in self.projections().values())
-                + attention_flops(lengths, self.ctx.num_heads, self.ctx.head_dim, self.value_dim,
-                                  causal=self.ctx.causal, window=window, chunk=self.ctx.attention_chunk))
+                + self._product_flops(lengths))
 
     @nn.nowrap
     def parameter_flops(self, lengths) -> float:
         """Learned QKV/output/gate maps, excluding data-dependent attention products."""
+        return self.model_flops(lengths) - self._product_flops(lengths)
+
+    @nn.nowrap
+    def _product_flops(self, lengths) -> float:
+        """QK and AV over the keys the layer's structure leaves each query."""
         window = self.ctx.sliding_window if self.ctx.causal or self.ctx.bidirectional_window else None
-        products = attention_flops(lengths, self.ctx.num_heads, self.ctx.head_dim, self.value_dim,
-                                   causal=self.ctx.causal, window=window, chunk=self.ctx.attention_chunk)
-        return self.model_flops(lengths) - products
+        return attention_flops(lengths, self.ctx.num_heads, self.ctx.head_dim, self.value_dim,
+                               causal=self.ctx.causal, window=window, chunk=self.ctx.attention_chunk,
+                               block=self.ctx.diffusion_block)
 
     @nn.nowrap
     def projections(self) -> dict[str, tuple[int, int]]:
@@ -845,8 +849,13 @@ class CausalSelfAttention(nn.Module):
             causal, window, documents = False, None, None
             implementation = masked
         if self.ctx.attention_chunk is not None:
-            mask = self._chunked(mask, documents, causal, window, places, key_places, S, key.shape[-3],
-                                 self.ctx.attention_chunk)
+            mask = self._structured(mask, documents, causal, window, S, key.shape[-3],
+                                    chunk_mask(places, key_places, self.ctx.attention_chunk))
+            causal, window, documents = False, None, None
+            implementation = masked
+        if self.ctx.diffusion_block is not None:
+            mask = self._structured(mask, documents, causal, window, S, key.shape[-3],
+                                    self._diffusion_blocks(places, key_places, prefix, key.shape[-3]))
             causal, window, documents = False, None, None
             implementation = masked
         max_segments = (None if documents is None else 1 if isinstance(documents, CrossDocuments)
@@ -855,12 +864,9 @@ class CausalSelfAttention(nn.Module):
                         cursor, starts, key_places)
 
     @staticmethod
-    def _chunked(mask, documents, causal: bool, window: int | None, places, key_places, length: int,
-                 keys: int, chunk: int):
+    def _structured(mask, documents, causal: bool, window: int | None, length: int, keys: int, structure):
         """`mask` with a call's documents, causality and window folded in, joined with the layer's
-        chunks of `chunk` places: the decode and diagnostic paths, each query and key in the chunk of
-        its counted place, never its cache slot."""
-        chunked = chunk_mask(places, key_places, chunk)
+        `structure` over counted places, never cache slots: its chunks, or its diffusion blocks."""
         if isinstance(documents, CrossDocuments):
             aligned = cross_document_mask(documents, causal=causal, sliding_window=window)
             mask = aligned if mask is None else aligned & mask
@@ -868,7 +874,18 @@ class CausalSelfAttention(nn.Module):
         if documents is not None:
             mask = with_documents(mask, documents)
         base = combined_attention_mask(length, keys, causal, window, mask)
-        return chunked if base is None else base & chunked
+        return structure if base is None else base & structure
+
+    def _diffusion_blocks(self, places, key_places, prefix, keys: int):
+        """The keys of each query's diffusion block and of the blocks before it
+        (`diffusion_block_mask`). A canvas over a cached prefix reads every prefix key, which comes
+        before its blocks by construction, and its own keys by their blocks."""
+        block = self.ctx.diffusion_block
+        if prefix is None:
+            return diffusion_block_mask(places, key_places, block)
+        canvas = diffusion_block_mask(places, places, block)
+        return jnp.concatenate([jnp.ones((*canvas.shape[:-1], keys - canvas.shape[-1]), bool), canvas],
+                               axis=-1)
 
     def _pairwise_mask(self, metadata: AttentionMetadata, rotary_positions, B: int, S: int, keys: int):
         """A call's own mask `[B, 1, S, keys]` (`AttentionMetadata.pairwise_mask`) and the places its

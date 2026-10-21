@@ -35,7 +35,7 @@ from dew.diffusion.discrete import MDLM_STEPS, DiscreteProcess, Unmask
 from dew.inference.tasks import MaskedGeneration, MaskedSettings, recorded_processor, recorded_tokenizer
 from dew.inputs import Field, InputSpec
 from dew.nn.inputs import real_slots
-from dew.nn.protocols import TokenModel
+from dew.nn.protocols import BlockDiffusion, TokenModel
 from dew.objectives.base import (
     OMITTED,
     Aux,
@@ -106,6 +106,12 @@ class MaskedDiffusionObjective(Objective[Ratio]):
             raise ValueError(
                 "a masked diffusion model reads the whole corrupted row, so its states attend "
                 "both ways (TokenModel with causal False), as CausalTransformer(causal=False)'s do")
+        if isinstance(model, BlockDiffusion) and model.diffusion_block is not None:
+            # BD3-LM trains each noisy block on the clean blocks before it, which MDLM's one
+            # corrupted row cannot hold.
+            raise ValueError(
+                f"a masked diffusion model reads the whole corrupted row, and this one reads in blocks of "
+                f"{model.diffusion_block} (diffusion_block), each against the clean blocks before it")
         refuse_without_logits(model, "masked diffusion")
         self.model = model
         self.process = process
