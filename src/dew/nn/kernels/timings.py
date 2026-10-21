@@ -1,10 +1,11 @@
-"""Every timing the choice layer learns from (design §7), from the day it is measured.
+"""The timing log the choice layer learns from (design §7).
 
-Where the environment variable `DEW_TIMINGS` names a directory, each measured config of a launch is one
-JSON line appended to `timings.jsonl` there (`record`): the launch and call by their encodings, the
+A measured config of a launch is one row (`observation`): the launch and call by their encodings, the
 config, how it was measured, its samples, its lowering and compile times, its outcome, and the analytic
-estimate where the launch has one. Unset or empty, nothing is done and nothing is imported. Logging only
-observes: it never tunes, never runs another config and never changes a pick or an error.
+estimate where the launch has one. Where the environment variable `DEW_TIMINGS` names a directory
+(`directory`), `record` appends rows to `timings.jsonl` there; a caller builds rows only then, so with it
+unset or empty nothing is built, imported or written. The tuner's measurement loop is to be that caller;
+logging only observes: it never tunes, never runs another config and never changes a pick or an error.
 
 A row carries three kinds of field, so a ranker trained on them can only read the first:
 - predictors, which a trace has: the call, the config and the estimate (features join them);
@@ -28,6 +29,13 @@ the traced-program fingerprint (design §4) replaces it."""
 LOCK_SECONDS = 60.0
 """How long an append waits for another process's lock on the file before raising: a boundary wait."""
 
+MAX_TEXT = 16384
+"""The longest launch, call, config or method text a row keeps as written; a longer one is kept as its
+SHA-256 and length."""
+
+MAX_SAMPLES = 64
+"""The most samples a row keeps; `samples_total` counts all of them."""
+
 RUN = uuid.uuid4().hex
 """This process's run, which every row it writes carries."""
 
@@ -42,25 +50,36 @@ def directory() -> str | None:
     return os.environ.get(ENV) or None
 
 
-def observation(launch: str, call: str, config: str, *, method: dict, status: str,
+def observation(launch: str, call: str, config: str, *, device, method: dict, status: str,
                 samples_ms: tuple = (), lower_ms: float | None = None, compile_ms: float | None = None,
                 estimate_s: float | None = None, error: BaseException | None = None) -> dict:
     """One measured config as a row: `launch` the op's name, `call` and `config` their encodings,
-    `method` how it was timed, `status` its outcome ('timed', 'resource_exhausted', 'failed' or
-    'skipped'), and an error by its class's name alone."""
+    `device` the one it ran on, `method` how it was timed, `status` its outcome ('timed',
+    'resource_exhausted', 'failed' or 'skipped'), and an error by its class's name alone. Texts and
+    samples are bounded (`MAX_TEXT`, `MAX_SAMPLES`)."""
     from importlib.metadata import version
 
     import jax
 
-    device = jax.devices()[0]
     return {
         'schema': SCHEMA, 'identity': IDENTITY, 'run': RUN, 'observation': uuid.uuid4().hex,
-        'launch': launch, 'call': call, 'config': config, 'estimate_s': estimate_s,
-        'method': method, 'status': status, 'error': None if error is None else type(error).__name__,
-        'samples_ms': list(samples_ms), 'lower_ms': lower_ms, 'compile_ms': compile_ms,
+        'launch': _bounded(launch), 'call': _bounded(call), 'config': _bounded(config),
+        'estimate_s': estimate_s, 'method': {key: _bounded(str(value)) for key, value in method.items()},
+        'status': status, 'error': None if error is None else type(error).__name__,
+        'samples_ms': [float(sample) for sample in samples_ms[:MAX_SAMPLES]],
+        'samples_total': len(samples_ms), 'lower_ms': lower_ms, 'compile_ms': compile_ms,
         'jax': jax.__version__, 'jaxlib': version('jaxlib'), 'platform': device.platform,
         'device_kind': device.device_kind,
     }
+
+
+def _bounded(text: str) -> str:
+    """`text` as written, or past `MAX_TEXT` its SHA-256 and length."""
+    if len(text) <= MAX_TEXT:
+        return text
+    import hashlib
+
+    return f"sha256:{hashlib.sha256(text.encode()).hexdigest()}:{len(text)}"
 
 
 def record(rows: list[dict], *, wait: float = LOCK_SECONDS) -> None:

@@ -39,7 +39,7 @@ class Template[Config: Hashable](tuning.KernelOp):
 
     def costed(self, ba: tokamax.BoundArguments, config: Config, target: generation.GpuTarget) -> cost.Cost:
         """The work, bytes and geometry the estimate of the launch of `ba` at `config` on `target` reads
-        (`cost.Cost`), which the choice layer logs beside each timing as it is."""
+        (`cost.Cost`): the analytic estimate's inputs as they are, for the choice layer's timing log."""
         raise NotImplementedError(f"{type(self).__name__} declares no cost")
 
     def cost(self, ba: tokamax.BoundArguments, config: Config, target: generation.GpuTarget) -> float:

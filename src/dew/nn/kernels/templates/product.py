@@ -27,14 +27,16 @@ class Product:
     refusal: str | None
 
 
-def declared(compute: Dtype, precision: PrecisionLike, *, outputs: tuple = ()) -> Product:
+def declared(compute: Dtype, precision: PrecisionLike, *, outputs: tuple = (),
+             operands: tuple = ()) -> Product:
     """The product a caller asks for with `precision` (explicitly or through
-    `jax_default_matmul_precision`), multiplying in `compute` into `outputs`' dtypes. The kernels sum in
-    fp32 and offset groups in int32, so x64 is refused, the one setting under which an operand or master
-    is wider than fp32; their fp32 products are TF32, which only the default precision asks for."""
+    `jax_default_matmul_precision`), multiplying in `compute` into `outputs`' dtypes from operands (or
+    masters) of `operands`' dtypes. The kernels sum in fp32 and offset groups in int32, so x64 is
+    refused, and an operand fp32 does not hold (a complex master), whose gradient they cannot write;
+    their fp32 products are TF32, which only the default precision asks for."""
     compute = jnp.dtype(compute)
     above = not asks_default_precision(precision, configured=True)
-    return Product(compute, promoted(above=above, outputs=outputs), _refusal(compute, above))
+    return Product(compute, promoted(above=above, outputs=outputs), _refusal(compute, operands, above))
 
 
 def promoted(*, above: bool, outputs: tuple) -> bool:
@@ -43,9 +45,11 @@ def promoted(*, above: bool, outputs: tuple) -> bool:
     return above and jnp.dtype(jnp.float32) in {jnp.dtype(dtype) for dtype in outputs}
 
 
-def _refusal(compute: jnp.dtype, above: bool) -> str | None:
+def _refusal(compute: jnp.dtype, operands: tuple, above: bool) -> str | None:
     if jax.config.jax_enable_x64:
-        return "x64 widens the kernels' int32 group offsets and allows operands wider than fp32"
+        return "x64 widens the kernels' int32 group offsets"
+    if jnp.result_type(compute, *operands, jnp.float32) != jnp.dtype(jnp.float32):
+        return "an operand fp32 does not hold, and the kernels sum gradients in fp32"
     if compute in HALF:
         return None
     if compute != jnp.dtype(jnp.float32):
