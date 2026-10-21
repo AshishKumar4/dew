@@ -169,6 +169,14 @@ class Quantization:
                 "bwd_stochastic_rounding is 'uniform', 'low_bit_uniform' or "
                 f"unset, got {self.bwd_stochastic_rounding!r}")
 
+    def rule_for(self, scope: Sequence[str]) -> int | None:
+        """The index of the pattern that quantizes the module at `scope` (its path of names), the
+        first whose regex fully matches the `/`-joined path as Qwix matches it, or None for a module
+        no pattern selects."""
+        joined = "/".join(scope)
+        return next((index for index, pattern in enumerate(self.patterns) if re.fullmatch(pattern, joined)),
+                    None)
+
     def apply(self, model: nn.Module) -> nn.Module:
         """Return a copy of `model` whose trunk matmuls train in this spec's dtype.
 
