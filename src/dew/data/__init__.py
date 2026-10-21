@@ -14,7 +14,7 @@ from . import audio, chat, images, preferences, presets, prompts, text, video
 from .chat import Role
 from .dataset import Batch, Loading
 from .load import load
-from .pipeline import Dataset, Rejected, concat, mix
+from .pipeline import Dataset, Rejected, concat, mix, phases
 from .sources import (
     TFDS,
     Concatenate,
@@ -55,6 +55,7 @@ __all__ = [
     "images",
     "load",
     "mix",
+    "phases",
     "preferences",
     "presets",
     "prompts",
