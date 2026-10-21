@@ -30,7 +30,7 @@ import numpy as np
 from flax.typing import Dtype, PrecisionLike
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
-from ..precision import asks_default_precision
+from ..precision import asks_default_precision, at_least_fp32
 from . import generation
 from .templates import base, cost
 from .templates.gemm import mosaic_gpu
@@ -529,7 +529,7 @@ def _forward(inputs, matrix, sizes, out_dtype, interpret_on_cpu):
         return _gmm(inputs, matrix, sizes, out_dtype, trans_rhs=False, interpret=interpret)
 
     def fallback(inputs, matrix, sizes):
-        summed = xla_ragged_dot(inputs, matrix, sizes, preferred_element_type=_summed(out_dtype))
+        summed = xla_ragged_dot(inputs, matrix, sizes, preferred_element_type=at_least_fp32(out_dtype))
         return summed.astype(out_dtype)
 
     branches, default = _on_platform(kernel, fallback, interpret_on_cpu)
@@ -542,7 +542,7 @@ def _backward(inputs, matrix, sizes, cotangent, input_dtype, kernel_dtype, inter
                 _tgmm(inputs, cotangent, sizes, kernel_dtype, interpret=interpret))
 
     def fallback(inputs, matrix, sizes, cotangent):
-        work = jnp.result_type(_summed(input_dtype), _summed(kernel_dtype))
+        work = jnp.result_type(at_least_fp32(input_dtype), at_least_fp32(kernel_dtype))
         d_inputs = xla_ragged_dot(cotangent, jnp.swapaxes(matrix, 1, 2), sizes,
                                   preferred_element_type=work)
         _, pullback = jax.vjp(lambda matrix: xla_ragged_dot(
@@ -552,11 +552,6 @@ def _backward(inputs, matrix, sizes, cotangent, input_dtype, kernel_dtype, inter
     branches, default = _on_platform(kernel, fallback, interpret_on_cpu)
     return jax.lax.platform_dependent(inputs, matrix, sizes, cotangent, default=default,
                                       **branches)
-
-
-def _summed(dtype) -> jnp.dtype:
-    """The dtype a product written in `dtype` is summed in: at least fp32."""
-    return jnp.promote_types(dtype, jnp.float32)
 
 
 @functools.partial(jax.custom_vjp, nondiff_argnums=(3, 4))
