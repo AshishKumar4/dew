@@ -245,7 +245,8 @@ def _cached(tmp_path):
 
 
 def _phased():
-    return phases((_documents(0).map(Tagged(1)), 2), (_documents(8).map(Tagged(2)), None)).shuffle(0).repeat().batch(2)
+    phased = phases((_documents(0).map(Tagged(1)), 2), (_documents(8).map(Tagged(2)), None))
+    return phased.shuffle(0).repeat().batch(2)
 
 
 ROUND_TRIPS = {
