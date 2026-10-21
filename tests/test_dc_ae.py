@@ -76,24 +76,21 @@ def test_the_quadratic_attention_matches_the_source(variant):
     assert max(gaps.values()) < FORWARD, gaps
 
 
-def test_encoder_gradients_match_the_source(variant):
-    _, (autoencoder, params, layouts, _), reference = variant
-    model = autoencoder.model
-    latent = assert_autoencoder_vjp(
-        "encode", lambda params, image: model.apply({"params": params}, image, method=model.encode), params,
-        channels_last(reference["image"]), [channels_last(reference["probe_latent"])], parameters(layouts),
-        reference, channels_last(reference["encode.grad_image"]), GRADIENT)
-    assert scaled_gap(latent, channels_last(reference["latent"])) < FORWARD
+WALKS = {"encode": ("image", "probe_latent", "latent"), "decode": ("code", "probe", "pixels")}
+"""Each walk's operand, output probe and output, by their names in the source's reference."""
 
 
-def test_decoder_gradients_match_the_source(variant):
+@pytest.mark.parametrize("method", WALKS)
+def test_gradients_match_the_source(variant, method):
+    """The encoder's or decoder's output and its parameter and input gradients against the source's."""
+    given, probe, output = WALKS[method]
     _, (autoencoder, params, layouts, _), reference = variant
     model = autoencoder.model
-    pixels = assert_autoencoder_vjp(
-        "decode", lambda params, code: model.apply({"params": params}, code, method=model.decode), params,
-        channels_last(reference["code"]), [channels_last(reference["probe"])], parameters(layouts), reference,
-        channels_last(reference["decode.grad_code"]), GRADIENT)
-    assert scaled_gap(pixels, channels_last(reference["pixels"])) < FORWARD
+    result = assert_autoencoder_vjp(
+        method, lambda params, x: model.apply({"params": params}, x, method=getattr(model, method)), params,
+        channels_last(reference[given]), [channels_last(reference[probe])], parameters(layouts), reference,
+        channels_last(reference[f"{method}.grad_{given}"]), GRADIENT)
+    assert scaled_gap(result, channels_last(reference[output])) < FORWARD
 
 
 def test_the_autoencoder_scales_as_the_pipeline_does(variant):

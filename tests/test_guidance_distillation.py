@@ -96,10 +96,7 @@ def test_the_loss_is_the_papers_equation(runs):
     task = config.build()
     assert isinstance(task, GuidanceDistillationObjective)
     params = task.init(jax.random.PRNGKey(1))
-    step = Step(step=jnp.asarray(0), key=jax.random.PRNGKey(2), ema=None)
-    loss, _ = task.loss(params, batch, step)
-
-    _, drop_key, time_key, noise_key, scale_key = jax.random.split(step.key, 5)
+    _, drop_key, time_key, noise_key, scale_key = jax.random.split(jax.random.PRNGKey(2), 5)
     assert task.autoencoder is None
     samples = unit_range(batch["image"])
     count = samples.shape[0]
@@ -107,6 +104,10 @@ def test_the_loss_is_the_papers_equation(runs):
     schedule = task.process.schedule
     t = schedule.sample_t(time_key, count)
     noise = jax.random.normal(noise_key, samples.shape)
+    # The step reads these scales, times and noise (`Step.tape`); its conditions' key is its own.
+    step = Step(step=jnp.asarray(0), key=jax.random.PRNGKey(2), ema=None,
+                tape={"guidance scale": scale, "times": t, "noise": noise})
+    loss, _ = task.loss(params, batch, step)
     alpha, sigma = broadcast_rates(schedule, t, samples)
     x = (alpha * samples + sigma * noise) * task.process.prediction.get_input_scale((alpha, sigma))
     time = schedule.model_time(t)

@@ -19,9 +19,10 @@ Two more fixtures:
   and ImageNet's normalization at the data's size), all run as published,
   and its gradient in every weight. The model is a stand-in, a patch
   network whose block's tokens are aligned, and so is the encoder, a patch
-  projection of the preprocessed pixels. `SILoss`'s time and noise are the
-  ones `DiffusionObjective.loss` draws from `jax.random.key(3)`: the split's
-  third key for the times and its fourth for the noise. Beside the
+  projection of the preprocessed pixels. `SILoss`'s time and noise come from
+  `jax.random.key(3)`: the split's third key for the times and its fourth for
+  the noise, which the test hands `DiffusionObjective.loss` by name
+  (`Step.tape`). Beside the
   gradient, REPA's fp32 gradient's distance from its float64 one over
   ORDERS orders of the stand-in's hidden units (tests/residual_orders.py),
   for tests/reference_error.py's K-order rule; order 1 in float64 is

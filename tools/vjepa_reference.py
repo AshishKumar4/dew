@@ -27,7 +27,6 @@ Run with the Dew test environment's torch, on CPU:
 """
 
 import importlib.util
-import json
 import sys
 import types
 from functools import cache, partial
@@ -36,7 +35,7 @@ from pathlib import Path
 import ml_dtypes
 import numpy as np
 import torch
-from reference_source import CACHE as UPSTREAM, verified
+from reference_source import CACHE as UPSTREAM, saved_fixture, verified
 
 REPO, COMMIT = "facebookresearch/jepa", "51c59d518fc63c08464af6de585f78ac0c7ed4d5"
 # In import order: each module's own imports come before it.
@@ -167,8 +166,7 @@ def main():
         print(f"{case}: fp32 off float64 by {gap:.3g}")
     meta = {"repo": REPO, "commit": COMMIT, "files": FILES, "cases": CASES, "batch": BATCH,
             "torch": torch.__version__}
-    arrays["meta"] = np.frombuffer(json.dumps(meta).encode(), np.uint8)
-    np.savez_compressed(sys.argv[1], **arrays)
+    saved_fixture(Path(sys.argv[1]), arrays, meta)
     print(f"{sys.argv[1]}: {Path(sys.argv[1]).stat().st_size / 1e6:.2f} MB, {len(arrays)} arrays")
 
 
