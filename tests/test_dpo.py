@@ -16,7 +16,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact_as_the_reference
+from reference_error import assert_as_exact, declared_seeds, indexed_recording
 from rl_support import TinyHead
 from steady_state import steady_state
 
@@ -52,7 +52,7 @@ def trl_layout_loss(policy_logits, fixture):
         return jnp.take_along_axis(jax.nn.log_softmax(logits[:, :-1]), ids, axis=-1)[..., 0]
 
     policy = token_log_probs(policy_logits)
-    ref = token_log_probs(jnp.asarray(fixture["ref_logits"], jnp.float32))
+    ref = token_log_probs(jnp.asarray(fixture["ref_logits"]))
     half = policy.shape[0] // 2
     terms, (chosen, rejected) = preference_logsigmoid_terms(
         policy[:half], policy[half:], ref[:half], ref[half:], mask[:half], mask[half:],
@@ -62,17 +62,20 @@ def trl_layout_loss(policy_logits, fixture):
 
 def test_dpo_loss_rewards_and_gradient_match_trl(reference):
     """Dew against TRL 1.12.0's own `DPOTrainer._compute_loss` with its
-    default settings (tools/parity_dpo.py), on fixed policy and reference
-    logits, held to the float64 rule over the loss, its gradient in the
-    policy logits and the chosen and rejected rewards: Dew's RMS error from
-    TRL's float64 values at most twice TRL's own fp32 error."""
-    (loss, rewards), gradient = jax.value_and_grad(trl_layout_loss, has_aux=True)(
-        jnp.asarray(reference["policy_logits"], jnp.float32), reference)
-    mine = np.concatenate([[loss], np.ravel(gradient), rewards])
-    theirs, truth = (np.concatenate([np.ravel(reference[f"trl_loss{tail}"]),
-                                     np.ravel(reference[f"trl_policy_logits_grad{tail}"]),
-                                     reference[f"trl_rewards{tail}"]]) for tail in ("", "_f64"))
-    assert_as_exact_as_the_reference(mine, theirs, truth, "DPO loss, gradient and rewards")
+    default settings (tools/parity_dpo.py), on par with TRL's fp32 over the
+    recorded policy and reference logits (check 1): the loss, its gradient in
+    the policy logits and the chosen and rejected rewards, TRL's float64 run
+    the truth."""
+    seeds = declared_seeds(FIXTURE)["dpo"]
+    draw, recorded, truth = indexed_recording(reference, "dpo", seeds)
+
+    @jax.jit
+    def dew(index, arrays):
+        (loss, rewards), gradient = jax.value_and_grad(trl_layout_loss, has_aux=True)(
+            arrays["policy_logits"], {**arrays, "beta": reference["beta"]})
+        return {"loss": loss, "policy_logits_grad": gradient, "rewards": jnp.stack(rewards)}
+
+    assert_as_exact(dew, recorded, draw, "DPO loss, gradient and rewards", seeds=seeds, truth_fn=truth)
 
 
 # --- the objective -------------------------------------------------------------
