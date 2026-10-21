@@ -592,13 +592,13 @@ class InputQuantization:
         """`model` computing under this record's frozen FP8 sites, and under
         the input quantization it already computes under, if any: one
         wrapper, so one interceptor, serves both."""
-        from dew.registry import constructor_values, wrapper_layers
+        from dew.registry import rebuilt, wrapper_layers
 
         _, layers = wrapper_layers(type(model))
         held = layers[0]._dew_wrapper() if layers else None
         if not isinstance(held, InputQuantization):
             return self.apply(model)
-        unwrapped = layers[0]._dew_wrapped(**constructor_values(model))
+        unwrapped = rebuilt(layers[0]._dew_wrapped, model)
         joined = dataclasses.replace(held, frozen_fp8=self.frozen_fp8, measured_on=self.measured_on)
         return joined.apply(unwrapped)
 
@@ -619,7 +619,7 @@ class InputQuantization:
         is otherwise unchanged, so its dtype, accumulation precision, output
         sharding and the bias placement stay as the model defines them.
         """
-        from dew.registry import constructor_values
+        from dew.registry import rebuilt
 
         base, record = type(model), self
         if any("_dew_input_quantization" in vars(layer) for layer in base.__mro__):
@@ -684,7 +684,7 @@ class InputQuantization:
                 return output, ({**variables, QUANTIZATION: record.declared()} if record.sites else variables)
 
         InputQuantized.__name__ = InputQuantized.__qualname__ = base.__name__
-        return InputQuantized(**constructor_values(model))
+        return rebuilt(InputQuantized, model)
 
 
 def _site_kernel(tree: Variables, site: str) -> jax.typing.ArrayLike:
