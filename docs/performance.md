@@ -127,15 +127,15 @@ Each mesh holds one row per FSDP shard, so the tensor-parallel rows run half the
 
 ### Qwen3-30B-A3B serving, expert-parallel
 
-`tools/benchmark_lm_serving.py --backend dew` served the pretrained Qwen3-30B-A3B in-process. The expert axis spanned every GPU. Each run was 128 requests of 256 prompt tokens and 128 greedy output tokens with EOS ignored, repeated three times, at `0f8360bfe` with JAX 0.11.2.post6.
+`tools/benchmark_lm_serving.py --backend dew` served the pretrained Qwen3-30B-A3B in-process. The expert axis spanned every GPU. Each run was two requests a slot, each of 256 prompt tokens and 128 greedy output tokens with EOS ignored, repeated three times, at `0f8360bfe` with JAX 0.11.2.post6.
 
-| GPUs | slots | output tokens/s | wall s | TTFT p50 |
-|---|---|---|---|---|
-| 8x A100 40GB, expert 8 | 64 | 208.3 | 78.7 | 1.02 s |
-| 8x A100 40GB, expert 8 | 128 | 411.9 | 79.6 | 0.80 s |
-| 4x H100 80GB, expert 4 | 64 | 382.7 | 42.8 | 0.41 s |
+| GPUs | slots | requests | output tokens/s | wall s | TTFT p50 |
+|---|---|---|---|---|---|
+| 8x A100 40GB, expert 8 | 64 | 128 | 208.3 | 78.7 | 1.02 s |
+| 8x A100 40GB, expert 8 | 128 | 256 | 411.9 | 79.6 | 0.80 s |
+| 4x H100 80GB, expert 4 | 64 | 128 | 382.7 | 42.8 | 0.41 s |
 
-The three repeats agree to 0.1 tokens/s. From 64 to 128 slots, the A100 node's throughput nearly doubles at about the same wall time: its decode step takes as long for 128 sequences as for 64. The H100 node spent 2,040 s compiling and warming the 64-slot programs. Its 128-slot run did not finish within the job's minutes. No vLLM row on the same nodes completed, so this section has no reference comparison yet.
+The three repeats agree to 0.1 tokens/s. From 64 to 128 slots, the A100 node does twice the requests in about the same wall time: its decode step takes as long for 128 sequences as for 64. The H100 node spent 2,040 s compiling and warming the 64-slot programs. Its 128-slot run did not finish within the job's minutes. No vLLM row on the same nodes completed, so this section has no reference comparison yet.
 
 ## A CPU cluster against one GPU, 2026-10-08
 

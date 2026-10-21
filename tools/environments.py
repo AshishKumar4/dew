@@ -27,6 +27,7 @@ import os
 import shutil
 import subprocess
 import sys
+from collections.abc import Callable
 from pathlib import Path
 
 CACHE = Path(os.environ.get("XDG_CACHE_HOME") or Path.home() / ".cache") / "dew" / "environments"
@@ -60,10 +61,10 @@ def machine_lock() -> str:
     return builds.newest_build(builds.listed_gpus(answer.stdout if answer.returncode == 0 else None)) or "cpu"
 
 
-def built(venv: Path, python: str, install: list[str], cwd: Path | None = None) -> Path:
-    """The Python of `venv`, created at Python `python` and filled by `install` (a command, run in `cwd`,
-    whose `{python}` is the environment's Python) first if no finished build exists. Builders of one
-    environment take turns on a lock file beside it, and a build that never finished is started over."""
+def built(venv: Path, python: str, install: Callable[[Path], list[str]], cwd: Path | None = None) -> Path:
+    """The Python of `venv`, created at Python `python` and filled by `install`'s command for the
+    environment's Python (run in `cwd`) first if no finished build exists. Builders of one environment take
+    turns on a lock file beside it, and a build that never finished is started over."""
     executable = venv / "bin" / "python"
     venv.parent.mkdir(parents=True, exist_ok=True)
     with open(venv.parent / f"{venv.name}.lock", "w") as held:
@@ -73,8 +74,7 @@ def built(venv: Path, python: str, install: list[str], cwd: Path | None = None) 
                 shutil.rmtree(venv)
             # Each uv call names its interpreter, so no UV_PYTHON or environment of the caller's is used.
             subprocess.run(["uv", "venv", "-q", "--python", python, str(venv)], check=True)
-            subprocess.run([part.replace("{python}", str(executable)) for part in install], cwd=cwd,
-                           check=True)
+            subprocess.run(install(executable), cwd=cwd, check=True)
             (venv / "complete").touch()
     return executable
 
@@ -88,26 +88,30 @@ def environment(tree: Path, lock: str, cache: Path = CACHE) -> Path:
         raise Unlocked(f"{tree} has no {', '.join(missing)}")
     digest = hashlib.sha256(b"".join(path.read_bytes() for path in files)).hexdigest()[:12]
     return built(cache / f"{lock}-{digest}", files[2].read_text().strip(),
-                 ["sh", "tools/install_environment.sh", lock, "-q", "--python", "{python}"], cwd=tree)
+                 lambda python: ["sh", "tools/install_environment.sh", lock, "-q", "--python", str(python)],
+                 cwd=tree)
 
 
 def reference(name: str, install: list[str], python: str = "3.12", cache: Path = CACHE) -> Path:
     """The Python of the reference environment CACHE/`name`-<installation> (`built`): `install`, uv pip
     install's arguments, at Python `python`. The installation's digest (its arguments, a requirements file's
-    lines in place of its path) names it, so a changed installation is built anew beside the old one, which
-    a running job may hold."""
+    lines in place of its path, and its Python where that is not 3.12, whose names predate the choice) names
+    it, so a changed installation is built anew beside the old one, which a running job may hold."""
     named = [Path(argument).read_text() if previous == "-r" else argument
              for previous, argument in zip(["", *install], install, strict=False)]
+    named += [] if python == "3.12" else [f"python {python}"]
     digest = hashlib.sha256(json.dumps(named).encode()).hexdigest()[:12]
     return built(cache.resolve() / f"{name}-{digest}", python,
-                 ["uv", "pip", "install", "-q", "--python", "{python}", *install])
+                 lambda executable: ["uv", "pip", "install", "-q", "--python", str(executable), *install])
 
 
 def main() -> int:
-    # A reference's installation follows `--`, read whole: its own options are uv's, not this parser's.
+    # A reference's installation follows `--`, read whole: its own options are uv's, not this parser's. A
+    # checkout's `--` is argparse's own, before a TREE that may start with a dash.
     argv = sys.argv[1:]
-    install = argv[argv.index("--") + 1:] if "--" in argv else []
-    argv = argv[:argv.index("--")] if "--" in argv else argv
+    cut = argv.index("--") if "--" in argv else len(argv)
+    referencing = any(word == "--reference" or word.startswith("--reference=") for word in argv[:cut])
+    install = argv[cut + 1:] if referencing else []
     parser = argparse.ArgumentParser(prog="tools/environments.py", description=__doc__.split("\n\n")[0])
     parser.add_argument("tree", type=Path, nargs="?")
     parser.add_argument("--lock", default=None, help="cpu, cuda12 or cuda13; by default this machine's")
@@ -115,7 +119,7 @@ def main() -> int:
                         help="a reference environment's name, its installation after --")
     parser.add_argument("--python", default="3.12", help="a reference environment's Python")
     parser.add_argument("--cache", type=Path, default=CACHE)
-    args = parser.parse_args(argv)
+    args = parser.parse_args(argv[:cut] if referencing else argv)
     if (args.tree is None) == (args.reference is None):
         parser.error("name a TREE, or a --reference and its installation after --")
     if args.reference is not None:
