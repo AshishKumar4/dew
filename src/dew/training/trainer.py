@@ -1107,9 +1107,10 @@ class Trainer(Generic[Loss, Effects]):
         """`state` to run step `step`: its window dropped (`dropped_window`) where the step begins a ramp's
         stage after the first and a rejection left the window part filled, so an update pools one
         stage's batches; a step the attempt count gives, so a resumed run drops it as the run did."""
-        if step not in self._stage_starts or self.accumulation == 1 or state.accumulation is None:
+        if step not in self._stage_starts or state.accumulation is None:
             return state
-        return jax.jit(functools.partial(dropped_window, size=self.accumulation), donate_argnums=0,
+        # The state's own window, in microbatches, whatever its steps are read in.
+        return jax.jit(functools.partial(dropped_window, size=int(state.window_size)), donate_argnums=0,
                        out_shardings=jax.tree.map(lambda x: x.sharding, state))(state)
 
     def _runner(self, planned: Planned, mesh: Mesh) -> CompiledStep:
