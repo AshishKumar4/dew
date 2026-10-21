@@ -154,9 +154,9 @@ def test_5_a_primitive_without_a_contract_is_named_and_its_values_not_certified(
     assert "sin" in coverage.blocked
 
 
-def test_6_a_slot_routing_drops_is_exactly_zero_and_an_ulp_there_fails():
-    """A slot whose score is decided below its threshold carries an exact zero; one ulp added there
-    fails."""
+def test_6_a_slot_routing_drops_is_exactly_zero_and_a_least_normal_there_fails():
+    """A slot whose score is decided below its threshold carries an exact zero; the least normal added
+    there fails (a smaller subnormal a flushing backend would read as zero)."""
     scores = jnp.asarray([0.9, 0.1, 0.7], jnp.float32)
 
     def routed(score, value, extra=0.0):
@@ -237,7 +237,7 @@ def test_11_an_injected_subnormal_on_an_unused_slot_fails_where_the_backend_keep
 def test_12_a_bound_sum_encloses_the_exact_sum():
     terms = np.array([1.0, *([2.0 ** -54] * 32767)])
     exact = sum(fractions.Fraction(term) for term in terms)
-    assert fractions.Fraction(float(_widened_sum(np.sum(terms), terms.size))) >= exact
+    assert fractions.Fraction(float(_widened_sum(np.sum(terms), terms.size, terms.size))) >= exact
 
 
 def test_15_an_element_its_native_output_does_not_witness_is_not_certified():
@@ -266,3 +266,53 @@ def test_the_truths_own_rounding_is_propagated_at_float64():
         out, _ = _interpreted(lambda x: (x[0] + x[1]) + x[2], *inputs)
     assert FLOAT64.precision == 53
     assert out.certified.all() and float(out.error) >= 1.0
+
+
+def _float64(function, *values):
+    with jax.enable_x64(new_val=True):
+        inputs = tuple(jnp.asarray(value, jnp.float64) for value in values)
+        return _interpreted(function, *inputs)
+
+
+def test_a_bound_survives_underflow_in_products_quotients_and_dots():
+    """Exactness is never read off an underflowed residual, and a positive bound never rounds to zero:
+    2^-540·2^-540, z/2^500 and z·2^-500 for z a cancellation's inexact zero all keep a positive bound."""
+    product, _ = _float64(lambda a, b: a * b, [2.0 ** -540], [2.0 ** -540])
+    assert product.certified.all() and not product.exact.any() and float(product.error[0]) >= 2.0 ** -1080
+
+    def cancelled(x):
+        return (x[0] + x[1]) - x[0]
+
+    inputs = ([2.0 ** -600, 2.0 ** -1000],)
+    quotient, _ = _float64(lambda x: cancelled(x) / 2.0 ** 500, *inputs)
+    dotted, _ = _float64(lambda x: jnp.dot(jnp.stack([cancelled(x)]), jnp.asarray([2.0 ** -500])), *inputs)
+    for out in (quotient, dotted):
+        assert not out.exact.any() and (out.error > 0).all()
+
+
+def test_a_correctly_rounded_float64_quotient_is_certified():
+    quotient, _ = _float64(lambda a, b: a / b, [1.0], [3.0])
+    assert quotient.certified.all() and not quotient.exact.any()
+
+
+def test_a_subnormal_constant_is_held_to_its_size_where_a_backend_may_read_it_as_zero():
+    tiny = np.float32(2.0 ** -149)
+    constant = jnp.asarray([tiny, 0.0], jnp.float32)
+    summed, _ = _interpreted(lambda x: jnp.sum(x + constant), jnp.zeros(2, jnp.float32))
+    assert not summed.exact.any() and float(summed.error) >= 2.0 ** -149
+    compared, _ = _interpreted(lambda x: x < tiny, jnp.zeros(1, jnp.float32))
+    assert not compared.certified.any()
+
+
+def test_values_without_a_contract_are_not_certified():
+    """A complex modulus, a value that is not a number, a sum whose bound overflows, and a dot by an
+    algorithm that may convert its operands."""
+    modulus, _ = _interpreted(jnp.abs, jnp.asarray([1 + 1j], jnp.complex64))
+    passed, _ = _interpreted(lambda x: x, jnp.asarray([np.nan], jnp.float32))
+    overflowing, _ = _float64(jnp.sum, [2.0 ** 1023, -(2.0 ** 1023)])
+    half = jax.lax.DotAlgorithmPreset.F16_F16_F16
+    a = jnp.asarray([1 + 2.0 ** -12], jnp.float32)
+    converted, blocked = _interpreted(lambda x, y: jax.lax.dot(x, y, precision=half), a, a)
+    for out in (modulus, passed, overflowing, converted):
+        assert not out.certified.any()
+    assert any(name.startswith("dot_general") for name in blocked)
