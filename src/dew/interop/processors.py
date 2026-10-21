@@ -263,7 +263,7 @@ class Processor:
             "text": text if isinstance(text, str) else list(text),
             "padding": not isinstance(text, str) and len(text) > 1,
             "truncation": False,
-            "return_tensors": None,
+            "return_tensors": self._media_tensors,
         }
         if audio is not None:
             arguments["audio"] = audio
@@ -290,30 +290,38 @@ class Processor:
                     for part in content)
         reference = self._media_reference if media else self.reference
         values = reference.apply_chat_template(
-            messages, tokenize=True, return_dict=True, return_tensors=None if media else "np",
+            messages, tokenize=True, return_dict=True, return_tensors=self._media_tensors if media else "np",
             add_generation_prompt=add_generation_prompt, **template_options)
         if not isinstance(values, Mapping):
             raise TypeError("the source chat processor must return named numeric inputs")
         return self._from_arrays(values) if media else self.from_hf(values)
 
-    def _from_arrays(self, values: Mapping[str, object]) -> ModelInputs:
-        """A media processor's fields, as it computes them (`return_tensors=None`), on the host:
-        NumPy arrays and lists as they are, a framework's tensors (a fast image processor's) read
-        through DLPack, so Dew imports no PyTorch, and a bfloat16 field (Llama 4's pixels) widened to
-        float32, which is exact. A field none of these is refused naming the processor."""
-        return self.from_hf({name: self._host_array(name, value) for name, value in values.items()})
+    @property
+    def _media_tensors(self) -> Literal["np", "pt"]:
+        """The tensor type the media processor is asked for: NumPy, unless an image or video
+        processor of it computes in PyTorch (Transformers' torchvision backend, whose bfloat16
+        pixels NumPy cannot hold), whose own tensors are then read through DLPack
+        (`_from_arrays`), so Dew itself imports no PyTorch."""
+        from transformers.image_processing_backends import TorchvisionBackend
 
-    def _host_array(self, name: str, value: object) -> np.ndarray:
-        if isinstance(value, (list, tuple)) and value and isinstance(value[0], _DLPack):
-            array = np.stack([self._host_array(name, image) for image in value])
-        elif isinstance(value, _DLPack) and not isinstance(value, np.ndarray):
-            array = np.asarray(jax.dlpack.from_dlpack(value))
-        elif isinstance(value, (np.ndarray, list, tuple)):
-            array = np.asarray(value)
-        else:
-            raise TypeError(f"{type(self._media_reference).__name__} returned {name!r} as "
-                            f"{type(value).__name__}, which is no array")
-        return array.astype(np.float32) if array.dtype == ml_dtypes.bfloat16 else array
+        parts = vars(self._media_reference).values()
+        return "pt" if any(isinstance(part, TorchvisionBackend) for part in parts) else "np"
+
+    def _from_arrays(self, values: Mapping[str, object]) -> ModelInputs:
+        """A media processor's fields on the host: NumPy arrays as they are, a framework's tensors read
+        through DLPack, and a bfloat16 field (Llama 4's pixels) widened to float32, which is exact. A
+        field neither is refused naming the processor."""
+        arrays = {}
+        for name, value in values.items():
+            if isinstance(value, np.ndarray):
+                array = value
+            elif isinstance(value, _DLPack):
+                array = np.asarray(jax.dlpack.from_dlpack(value))
+            else:
+                raise TypeError(f"{type(self._media_reference).__name__} returned {name!r} as "
+                                f"{type(value).__name__}, which is no array")
+            arrays[name] = array.astype(np.float32) if array.dtype == ml_dtypes.bfloat16 else array
+        return self.from_hf(arrays)
 
     def from_hf(self, values: Mapping[str, object]) -> ModelInputs:
         """Check a processor's raw outputs and turn them into `ModelInputs` for the device.
