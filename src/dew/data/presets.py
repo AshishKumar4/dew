@@ -179,9 +179,10 @@ def token_windows(dataset: Dataset, *, seq_len: int, batch: int | None, stride: 
                   records: int | None = None, host: tuple[HostStep, ...] = ()) -> Pipeline:
     """A token store's stream of tokens (`TokenFiles`) cut into windows of `seq_len` inputs and their
     targets, `stride` apart (`seq_len` where None), read by index: each window a record of the
-    store's, whose rows and valid targets it states, in batches of `batch` (`records` and `host` as
-    `images` takes them). A shuffle, repeat or take written before it orders and selects the
-    windows; its holdout takes the store's own split (`holdout(split="val")`)."""
+    store's, whose rows and valid targets it states, in batches of `batch` (`batch=None`, `records`
+    and `host` as `images` takes them). A shuffle, repeat or take written before it orders and
+    selects the windows. A store holds one split: validation tokens are a store of their own, its
+    `TokenFiles(url)` through the preset as well."""
     from dew.data.sources.tokens import TokenFiles
 
     chain = dataset._chain()
@@ -259,8 +260,8 @@ def _next_token_windows(documents: Dataset, pack: Pack, *, cache: str | Cached |
     token's next-token target stays in one piece: a fitting pack's documents are cut into pieces of
     its length first, and a concatenating pack overlaps the cuts it makes itself (`Pack.overlap`).
     `cache` holds the documents so cut, before the pack, where a published generation's packing
-    plan takes the pack's place. `lm`, a conversation cut into pieces and the text and chat recipes
-    (`dew.config.data`) prepare text through it."""
+    plan takes the pack's place. `lm` and `sft`'s conversations cut into pieces prepare text
+    through it."""
     if pack.policy == "concat":
         return _cached(documents, cache)._then(dataclasses.replace(pack, overlap=1))
     pieces = documents.flat_map(text_steps.Chunks(pack.seq_len, fields=pack.fields, overlap=1))
@@ -271,7 +272,7 @@ def _conversation_windows(rendered: Dataset, pack: Pack, *, long: Literal["trunc
                           cache: str | Cached | None = None) -> Pipeline:
     """Rendered conversations (`chat.template`) packed by `pack` with their speakers: one longer
     than a window cut at its end, dropped and counted, or cut into pieces (`_next_token_windows`),
-    as `long` says. `sft` and the chat recipe (`dew.config.data.ChatData`) share it."""
+    as `long` says (`sft`)."""
     if long == "chunk":
         return _next_token_windows(rendered, pack, cache=cache)
     fitted = chat.fit_length(pack.seq_len, long=long)
@@ -300,7 +301,7 @@ def _rendered_prompts(dataset: Dataset, tokenizer: str | SavedTokenizer, max_pro
                       pad_id: int, long: Literal["drop", "truncate"], thinking: bool | None,
                       reward_bytes: int | None) -> Pipeline:
     """Prompt rows rendered with their reward columns `reward_bytes` wide, or as wide as measured over
-    each store (`prompts`). `prompts` and the prompt recipe (`dew.config.data.PromptData`) share it."""
+    each store (`prompts`)."""
     from dew.data.prompts import RewardWidth
     from dew.data.steps.chat import ConfigurePrompt
     from dew.data.text import tokenizer_name
@@ -388,7 +389,7 @@ def _decoded_images(rows: Dataset, size: int, *, field: str = "image", at_least:
                     rejects: bool = True) -> Pipeline:
     """The images in `field` decoded, reduced no further than `at_least` pixels where given, and
     resized to `size` squares. With `rejects` an image that does not decode is dropped and counted,
-    else it stops the run. `images` and the image recipe (`dew.config.data.ImageData`) share it."""
+    else it stops the run (`images`)."""
     decode = image_steps.DecodeImage(field, at_least=at_least, rejects=rejects)
     return (rows.filter_map(decode) if rejects else rows.map(decode)).map(image_steps.Resize(size))
 
@@ -400,8 +401,7 @@ def _clips(media: Dataset, seconds: float, *, frames: int, fps: float, size: int
     every read and resume, as `frames` frames at `fps` in `size` squares, and with `sample_rate`
     the window's sound `context` seconds wider (`missing` says what media without sound gives).
     The media and its window leave the record. With `rejects` media too short or that does not
-    decode is dropped and counted, else it stops the run. `clips` and the video recipe
-    (`dew.config.data.VideoData`) share it."""
+    decode is dropped and counted, else it stops the run (`clips`)."""
     pick = video_steps.PickClip(seconds, margin=margin, rejects=rejects)
     decoders: list[video_steps.DecodeVideo | audio_steps.DecodeAudio] = [
         video_steps.DecodeVideo(frames, fps=fps, size=size, rejects=rejects)]

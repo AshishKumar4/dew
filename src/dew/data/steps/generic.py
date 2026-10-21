@@ -1,4 +1,4 @@
-"""Field selection and record filtering shared by the typed recipes."""
+"""Field selection, formatting and record filtering, steps any chain takes."""
 
 from __future__ import annotations
 

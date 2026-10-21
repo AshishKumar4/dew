@@ -472,7 +472,7 @@ def compile(
     """Check every leaf before opening readers, then build both branches.
     With no `read`, the sources choose it (`_preferred_read`)."""
     branches = (train,) if validation is None else (train, validation)
-    read = read or train.mode or _preferred_read(lambda _: branches, provision=provision)
+    read = read or train.mode or _preferred_read(branches, provision=provision)
     loading = loading or train._loading or _DEFAULT_LOADING
     if isinstance(train.source, Phases):
         return _compile_phases(
@@ -978,7 +978,7 @@ def _diagnostic(pipeline: Pipeline, *, records: int | None = None) -> _Host:
     A bounded record pass runs lazily without loader read-ahead or
     eager memory transforms, and leaves its counters in the Grain state.
     """
-    read = pipeline.mode or _preferred_read(lambda _: (pipeline,), provision=True)
+    read = pipeline.mode or _preferred_read((pipeline,), provision=True)
     loading = pipeline._loading or _DEFAULT_LOADING
     if records is not None:
         pipeline = pipeline._then(Limit(records))
@@ -1108,7 +1108,7 @@ def validation(
 ) -> Reader:
     """Compile one finite evaluation branch without constructing a training
     stream. With no `read`, the sources choose it (`_preferred_read`)."""
-    read = read or _preferred_read(lambda _: (pipeline,), provision=provision)
+    read = read or _preferred_read((pipeline,), provision=provision)
     if not any(isinstance(stage, (BatchStage, TokenBudget)) for stage in pipeline.stages):
         pipeline = pipeline.batch(batch, drop_remainder=False)
     (pinned,) = _prepared((pipeline,), read, provision=provision, objective=objective, counts=({},))
