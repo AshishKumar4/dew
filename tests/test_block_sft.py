@@ -261,7 +261,12 @@ def test_real_trainer_update_and_checkpoint_resume(source, tmp_path):
     # to 5.2 times further from float64 than the same ops run one by one (measured per leaf,
     # 2026-10-21), a gap of the compiler's and not of the trainer.
     stepped, objective_update = trainer_update(obj, batch, run_key)
-    assert_tree_equal(stepped(variables), objective_update(variables))
+    expected = objective_update(variables)
+    assert_tree_equal(stepped(variables), expected)
+    # And the run's own path, its loader, plan and marked rows, takes that update on one device.
+    solo = Trainer(obj, optax.sgd(0.001), key=run_key)
+    solo.device_mesh = MeshSpec().build(jax.devices()[:1])
+    assert_tree_equal(solo.fit(data, steps=1, log_every=1).variables["params"], expected)
     trainer = Trainer(obj, optax.sgd(0.001), key=run_key, checkpoints=Checkpoints(str(tmp_path / "run")))
     updated = trainer.fit(data, steps=1, checkpoint_every=1, log_every=1)
     # Google's dense text-only model: transformers' DiffusionGemmaForBlockDiffusion
@@ -387,7 +392,12 @@ def test_image_sft_trainer_resume_publish_and_generate(image_source, tmp_path):
     run_key = jax.random.key(2)
     # The trainer's update is the objective's at the step's draws, to the bit.
     stepped, objective_update = trainer_update(obj, batch, run_key)
-    assert_tree_equal(stepped(variables), objective_update(variables))
+    expected = objective_update(variables)
+    assert_tree_equal(stepped(variables), expected)
+    # And the run's own path, its loader, plan and marked rows, takes that update on one device.
+    solo = Trainer(obj, optax.sgd(0.001), key=run_key)
+    solo.device_mesh = MeshSpec().build(jax.devices()[:1])
+    assert_tree_equal(solo.fit(data, steps=1, log_every=1).variables["params"], expected)
     checkpoints = Checkpoints(str(tmp_path / "run"))
     updated = Trainer(obj, optax.sgd(0.001), key=run_key, checkpoints=checkpoints).fit(
         data, steps=1, checkpoint_every=1, log_every=1)
