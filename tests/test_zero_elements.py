@@ -291,9 +291,14 @@ def test_a_bound_survives_underflow_in_products_quotients_and_dots():
         return jnp.dot(jnp.stack([cancelled(x) / 2.0 ** 500]), jnp.asarray([2.0 ** 500]))
 
     flushed, _ = _float64(scaled_back, [2.0 ** -600, 2.0 ** -654])
-    for out in (quotient, dotted, flushed):
+    # A subnormal input amplified past the normal range, which XLA:CPU's denormal flushing reads as zero:
+    # its bound encloses the exact product.
+    amplified, _ = _float64(jnp.dot, [2.0 ** -1074], [2.0 ** 1000])
+    for out in (quotient, dotted, flushed, amplified):
         assert not out.exact.any() and (out.error > 0).all()
     assert float(flushed.error) >= 2.0 ** -654
+    exact = fractions.Fraction(2) ** -74
+    assert fractions.Fraction(float(amplified.error)) >= abs(exact - fractions.Fraction(float(amplified.value)))
 
 
 def test_a_correctly_rounded_float64_quotient_is_certified():
