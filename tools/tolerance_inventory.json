@@ -113,7 +113,7 @@
    "by": "2026-11-13"
   },
   "tests/test_causal_transformer.py": {
-   "comparisons": 43,
+   "comparisons": 41,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
@@ -793,7 +793,7 @@
    "by": "2026-11-20"
   },
   "tests/test_ppo.py": {
-   "comparisons": 18,
+   "comparisons": 17,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
@@ -968,7 +968,7 @@
    "by": "2026-11-20"
   },
   "tests/test_text_encoders.py": {
-   "comparisons": 15,
+   "comparisons": 4,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
@@ -998,7 +998,7 @@
    "by": "2026-11-13"
   },
   "tests/test_torchax_fallback.py": {
-   "comparisons": 6,
+   "comparisons": 5,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
