@@ -32,7 +32,9 @@ __all__ = ["THEMES", "Figure", "Shape", "bars", "curve", "heatmap", "images", "p
 Role = Literal["text", "muted", "rule", "surface", "raised", "accent", "accent_fill", "warm",
                "warm_fill", "tint0", "tint1", "tint2", "tint3", "none"]
 
-# The site's colors (site/src/styles/theme.css), and the tints of the docs' figures.
+# The colors a figure draws with. The site's stylesheet takes the roles they share from here
+# (site/scripts/gen_theme.py writes them into site/src/styles/theme.css); warm, its fill and the tints
+# are the figures' own.
 THEMES: dict[str, dict[str, str]] = {
     "light": {"text": "#16282b", "muted": "#4d6763", "rule": "#c9d9d5", "surface": "#f2f6f5",
               "raised": "#ffffff", "accent": "#0b7d71", "accent_fill": "#d3f1ec", "warm": "#b45f06",
