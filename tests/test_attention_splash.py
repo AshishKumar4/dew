@@ -47,8 +47,7 @@ from residual_orders import orders
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.documents import document_mask
 
-on_tpu = pytest.mark.skipif(jax.default_backend() != 'tpu',
-                            reason="needs a TPU; the interpreter covers the rest here")
+on_tpu = pytest.mark.tpu(reason="needs a TPU; the interpreter covers the rest here")
 
 # How far two correct kernels sit apart, as a fraction of each array's own
 # scale. bf16 gets the two ulps the cudnn parity in tests/test_kernels.py

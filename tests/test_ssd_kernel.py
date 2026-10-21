@@ -242,8 +242,7 @@ def shape_case(shape, chunk_size: int):
     return (x, b, c, a, state), chunk_size, shape[1] + shape[3] + shape[4]
 
 
-on_device = pytest.mark.skipif(jax.default_backend() != "tpu",
-                               reason="needs a tpu, the one backend the kernel is chosen on")
+on_device = pytest.mark.tpu(reason="needs a tpu, the one backend the kernel is chosen on")
 
 # (batch, steps, heads, head width, state, groups), chunk: a tail of one step short, whole chunks, a tail
 # of one step over, four chunks with a ragged tail, at widths the kernel takes and fewer groups than heads;
