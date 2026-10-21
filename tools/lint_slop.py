@@ -1753,7 +1753,8 @@ GATE = frozenset({"tests/reference_error.py", "tests/op_certificates.py", "tools
                   "tests/reference_graph.py", "tests/reference_trees.py", "tests/residual_orders.py",
                   "tests/test_reference_error.py", "tests/test_op_certificates.py",
                   "tests/test_reference_orders.py", "tests/test_reference_graph.py",
-                  "tests/test_gate_calibration.py", "tests/test_float64_terms.py"})
+                  "tests/test_gate_calibration.py", "tests/test_float64_terms.py",
+                  "tests/zero_elements.py", "tests/test_zero_elements.py"})
 """The gate's modules and the tests of the gate itself, the one place a float is compared within a
 bound (bible §7, 2026-10-20): every other comparison goes through its assertion."""
 INVENTORY = "tools/tolerance_inventory.json"
