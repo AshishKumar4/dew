@@ -36,7 +36,7 @@ TILES = (attention_triton.Tiles(32, 32, 4, 2), attention_triton.Tiles(64, 32, 4,
 at equal tiles."""
 
 
-RESIDUALS = ("output", "maximum", "denominator", "anchor key")
+RESIDUALS = ("output", "maximum", "denominator", "anchor key", "split sums")
 """The forward's outputs with `residuals`, in order."""
 
 
@@ -60,7 +60,7 @@ def test_both_mainloops_compute_the_same_bits_over_every_call_form(form, tiles):
     """Each call form's keys, fp32, no hooks."""
     triton, portable = both(CASES[form], HOOKS["none"], jnp.float32, tiles)
     for name, mine, theirs in zip(RESIDUALS, triton, portable, strict=True):
-        np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs), err_msg=f"{form} {name}")
+        assert_same_bits(mine, theirs, f"{form} {name}")
 
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16], ids=["float32", "bfloat16"])
@@ -70,8 +70,7 @@ def test_both_mainloops_compute_the_same_bits_under_every_hook(hooks, dtype):
     packed documents, in both dtypes."""
     triton, portable = both(CASES["causal-documents-window"], HOOKS[hooks], dtype, TILES[1])
     for name, mine, theirs in zip(RESIDUALS, triton, portable, strict=True):
-        np.testing.assert_array_equal(np.asarray(mine, np.float32), np.asarray(theirs, np.float32),
-                                      err_msg=f"{hooks} {jnp.dtype(dtype).name} {name}")
+        assert_same_bits(mine, theirs, f"{hooks} {jnp.dtype(dtype).name} {name}")
 
 
 def both_backward(case: dict, names: tuple, dtype, tiles: attention_triton.Tiles):
@@ -116,6 +115,37 @@ def test_both_mainloops_compute_the_same_gradients_under_every_score_hook(hooks,
     call of packed documents, in both dtypes."""
     triton, portable = both_backward(CASES["causal-documents-window"], SCORE_HOOKS[hooks], dtype, TILES[1])
     assert_same_bits(triton, portable, f"{hooks} {jnp.dtype(dtype).name}")
+
+
+@pytest.mark.parametrize("hooks", ["none", "sinks", "softcap"])
+def test_the_forwards_split_sums_give_the_first_passes_gradients(hooks):
+    """The backward from the forward's split sums (`algebra.split_delta`) and from the dQ launch's own
+    first pass over the keys (`algebra.off_anchor_delta`) on par with each other's reference (check 1),
+    over a windowed causal call of packed documents: the training forward's sums are the first pass."""
+    queries, keys = geometry(CASES["causal-documents-window"])
+    spans = template.spans(queries, keys, ROWS, **arguments(CASES["causal-documents-window"]))
+    score_mod, kinds, draw_hooks = score_hooks(SCORE_HOOKS[hooks], queries, keys, 32)
+    draw_qkv = drawing(queries, keys, jnp.float32)
+
+    def draw(seed):
+        dout = jax.random.normal(jax.random.key(seed + 1000), (ROWS, queries, 4, 32), jnp.float32)
+        return *draw_qkv(seed), dout, *draw_hooks(seed)
+
+    def grads(*, split: bool):
+        def run(query, key, value, dout, params, initial):
+            given = tuple(template.Param(value, kind) for value, kind in zip(params, kinds, strict=True))
+            hooked = template.Hooks(score_mod, given, initial)
+            found = attention_portable.backward(query, key, value, spans, hooked, dout, block_q=32, block_k=32,
+                                                pad=attention_triton.BLOCK, split=split)
+            return found.query, found.key, found.value, found.score_params, found.initial
+
+        return jax.jit(run)
+
+    assert_as_exact(grads(split=True), grads(split=False), draw, f"split sums {hooks}", seeds=SPLIT_SEEDS)
+
+
+SPLIT_SEEDS = 8
+"""The split sums' site's declared draws (check 1)."""
 
 
 MERGE_SEEDS = 8
