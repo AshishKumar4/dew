@@ -54,6 +54,8 @@ from dew.data.dataset import (
     FilledBatch,
     Loading,
     Records,
+    _column,
+    _shareable,
     record_batch,
     stacked,
     take_batch,
@@ -390,11 +392,16 @@ def _expanded(rows: pygrain.IterDataset, stage: FlatMap, name: str, label: str) 
             else gx.FlatMapIterDataset(rows, _Rows(stage)))
 
 
+type Field = Batch | np.ndarray | np.generic | str | bytes | int | float | bool | None | list | tuple
+"""A record's field, as the steps before a batch leave it."""
+
+
 @dataclasses.dataclass
 class _Grouped:
     """A loading worker's records and the markers of those its steps dropped, a batch's count at a
-    time (`_Build.handed`): the records stacked as a batch is, into shared memory once Grain asks
-    for it, where they hold the same fields, and the markers beside them."""
+    time (`_Build.handed`): where the records hold the same fields, field by field, each field's
+    arrays of one shape and type stacked as a batch's are, into shared memory once Grain asks for
+    it, and any other field's values listed; the markers beside them."""
 
     shared: bool = False
 
@@ -407,8 +414,20 @@ class _Grouped:
         records = [row for row in rows if isinstance(row, Mapping)]
         alike = (bool(rows) and len(records) == len(rows)
                  and all(row.keys() == records[0].keys() for row in records))
-        held = record_batch(records, shared=self.shared) if alike else rows
+        held = {name: self.column([row[name] for row in records]) for name in records[0]} if alike else rows
         return {"held": held, "alike": alike, "rows": len(rows), "markers": markers}
+
+    def column(self, values: list[Field]) -> np.ndarray | list[Field]:
+        """One field's values across the group: stacked where they are arrays of one shape and type,
+        else as they are."""
+        arrays = [value for value in values if isinstance(value, (np.ndarray, np.generic))]
+        if len(arrays) < len(values) or any(array.shape != arrays[0].shape or array.dtype != arrays[0].dtype
+                                            for array in arrays):
+            return values
+        stacked = _column(arrays, shared=self.shared and _shareable(arrays))
+        if not isinstance(stacked, np.ndarray):
+            raise TypeError(f"arrays of one shape stacked into a {type(stacked).__name__}")
+        return stacked
 
 
 @dataclasses.dataclass(frozen=True)
