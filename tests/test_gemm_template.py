@@ -493,3 +493,65 @@ def test_the_mosaic_kernels_load_a_side_operands_rows_from_any_dimension():
                                  prologue_axes=(layout,), **common) for hook, layout, operand in layouts]
     np.testing.assert_array_equal(np.asarray(products[0]), np.asarray(products[1]))
     np.testing.assert_array_equal(np.asarray(gradients[0]), np.asarray(gradients[1]))
+
+
+@pytest.mark.parametrize("generation_name", ["sm80", "sm90"])
+def test_exact_sums_add_each_steps_product_as_the_plain_sum_does(generation_name):
+    """At the highest precision an fp32 kernel gradient adds each step's product apart (`exact_sums`):
+    interpreted on the CPU, whose dots sum in IEEE fp32 either way, it is the default path's bit for bit,
+    and its launch is one that takes exact sums."""
+    rng = np.random.default_rng(4)
+    x = jnp.asarray(rng.normal(size=(ROWS, DEPTH)), jnp.bfloat16)
+    dy = jnp.asarray(rng.normal(size=(ROWS, WIDTH)), jnp.bfloat16)
+    sizes = jnp.asarray(SIZES)
+    with generation.assumed(generation_name):
+        exact, default = (jax.jit(functools.partial(template.gemm_t, out_dtype=jnp.float32,
+                                                    precision=precision, interpret_on_cpu=True))(x, dy, sizes)
+                          for precision in ("highest", "default"))
+    np.testing.assert_array_equal(np.asarray(exact), np.asarray(default))
+
+
+def test_exact_sums_go_to_fp32_outputs_at_a_precision_above_the_default():
+    """`exact_sums` is set for an fp32 output at the highest precision, never for a 16-bit output or the
+    default precision; Mosaic's forward launches, which do not add apart, refuse it, and Mosaic's kernel
+    gradient keeps only tiles whose two accumulators stay in registers."""
+    hooks = grouped_matmul.NO_HOOKS
+    assert grouped_matmul._exact_sums(exact=True, hooks=hooks, out_dtype="float32")
+    assert not grouped_matmul._exact_sums(exact=True, hooks=hooks, out_dtype="bfloat16")
+    assert not grouped_matmul._exact_sums(exact=False, hooks=hooks, out_dtype="float32")
+    rows = 2048
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    sizes = jax.ShapeDtypeStruct((8,), jnp.int32)
+    with generation.assumed("sm90"):
+        target = generation.gpu_target()
+        forward = grouped_matmul.MosaicGmm().bind(bf16((rows, 768)), bf16((8, 768, 1536)), sizes, (), (),
+                                                  out_dtype="float32", trans_rhs=False, interpret=False,
+                                                  exact_sums=True)
+        assert not grouped_matmul.MosaicGmm().eligible(forward, target)
+        launch = grouped_matmul.MosaicTgmm()
+        exact = launch.bind(bf16((rows, 768)), bf16((rows, 1536)), sizes, (), out_dtype="float32",
+                            interpret=False, exact_sums=True)
+        plain = launch.bind(bf16((rows, 768)), bf16((rows, 1536)), sizes, (), out_dtype="float32",
+                            interpret=False)
+        assert launch.eligible(exact, target)
+        kept = launch.fitting(exact, target)
+        assert kept and all(2 * tile.block_m * tile.block_n // 128 < 255 for tile in kept)
+        assert set(kept) < set(launch.fitting(plain, target))
+
+
+def test_the_exact_mosaic_kernel_gradient_lowers_for_an_h100():
+    """Mosaic GPU's kernel gradient with `exact_sums`, its running sum the pipeline's carry, lowers for
+    an H100 on the CPU at a fitting tile of every block shape."""
+    rows, depth, width, groups = 2044, 768, 1536, 8
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    args = (bf16((rows, depth)), bf16((rows, width)), jax.ShapeDtypeStruct((groups,), jnp.int32), ())
+    options = {"out_dtype": "float32", "interpret": False, "exact_sums": True}
+    launch = grouped_matmul.MosaicTgmm()
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
+    with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
+        fits = launch.fitting(launch.bind(*args, **options), generation.gpu_target())
+        covering = set({(c.block_m, c.block_n): c for c in reversed(fits)}.values())
+        assert covering
+        for config in sorted(covering, key=repr):
+            jax.jit(functools.partial(launch.replace(config=config), **options)).trace(*args).lower(
+                lowering_platforms=("cuda",))

@@ -156,6 +156,7 @@ def _gpu_ragged_dot_kernel(
   prologue_axes: tuple = (),
   epilogue=None,
   epilogue_axes: tuple = (),
+  exact_sums: bool = False,
 ):
   prologue_refs = refs[:len(prologue_axes)]
   epilogue_refs = refs[len(prologue_axes):len(prologue_axes) + len(epilogue_axes)]
@@ -210,7 +211,7 @@ def _gpu_ragged_dot_kernel(
       xA = lax.dot_general(
           x, A, dimension_numbers=dim_nums, preferred_element_type=acc_dtype
       )
-      return acc + xA.astype(acc_dtype)
+      return _summed(acc, xA.astype(acc_dtype), group_sz > 0, exact_sums=exact_sums)
 
     acc = jnp.zeros((block.m, block.n), dtype=acc_dtype)
     acc = lax.fori_loop(0, cdiv(size.k, block.k), inner_compute, acc)
@@ -220,6 +221,15 @@ def _gpu_ragged_dot_kernel(
   stored = partial(_store_epilogued, out_refs, epilogue, epilogue_refs, epilogue_axes, pid.j, block, size)
   lax.fori_loop(0, cdiv(group_sz, block.m), outer_compute, None)
   _store_past_routed(stored, group_metadata_ref, pid, block, size, acc_dtype)
+
+
+def _summed(acc, partial_sum, live, *, exact_sums: bool):
+  """Dew: the running fp32 sum plus a step's: with `exact_sums`, an IEEE add of the step's product summed
+  apart, which a tensor core's accumulation (truncating each add) leaves less exact; `live` (true for
+  every computed step, unknown to the compiler) keeps the add from folding into the MMA's accumulator."""
+  if exact_sums:
+    return acc + jnp.where(live, partial_sum, 0)
+  return acc + partial_sum
 
 
 def _store_epilogued(out_refs, epilogue, refs, axes_of, column_block, block, size, acc, row, rows_mask):
@@ -263,7 +273,7 @@ def _store_past_routed(stored, group_metadata_ref, pid, block, size, acc_dtype):
 @partial(jax.jit, static_argnames=(
   "block_m", "block_k", "block_n", "trans_rhs", "interpret", "compute_dtype", "acc_dtype", "num_warps",
   "num_stages", "chunk_m", "out_dtype", "prologue", "prologue_axes", "epilogue", "epilogue_axes",
-  "out_dtypes"))
+  "out_dtypes", "exact_sums"))
 def gmm(
   x: jax.Array,  # [m, k]
   A: jax.Array,  # [g, k, n]
@@ -287,13 +297,15 @@ def gmm(
   epilogue_operands: tuple[jax.Array, ...] = (),
   epilogue_axes: tuple = (),
   out_dtypes: tuple | None = None,
+  exact_sums: bool = False,
 ) -> jax.Array | tuple[jax.Array, ...]:
   """Compute grouped matmul on GPU via a Pallas lowering.
 
   Dew: `prologue(tile, *side_tiles)` transforms each loaded `[block_m, block_k]` tile of `x` and
   `epilogue(acc, *side_tiles)` each fp32 accumulator tile, returning one output or a tuple of them
   (`out_dtypes`). Each side operand's dimensions follow the launch axes its `*_axes` entry names
-  (`_side_tile`): 'rows' and 'depth' for the prologue's, 'rows' and 'columns' for the epilogue's."""
+  (`_side_tile`): 'rows' and 'depth' for the prologue's, 'rows' and 'columns' for the epilogue's.
+  `exact_sums` adds each depth step's product into the fp32 sum by an IEEE add (`_summed`)."""
 
   msg = "This gmm kernel only supports either (m, k) x (g, k, n) -> (m, n) "
   msg += f"or (m, k) x (g, n, k) -> (m, n), but got {x.shape=} {A.shape=}"
@@ -348,6 +360,7 @@ def gmm(
     "prologue_axes": prologue_axes,
     "epilogue": epilogue,
     "epilogue_axes": epilogue_axes,
+    "exact_sums": exact_sums,
   }
   with jax.named_scope("pallas_triton_ragged_dot"):
     outs = pl.pallas_call(
@@ -383,6 +396,7 @@ def _tgmm_ragged_dot_kernel(
   acc_dtype: DTypeLike = np.float32,
   prologue=None,
   prologue_axes: tuple = (),
+  exact_sums: bool = False,
 ):
   *prologue_refs, A_bar_ref = refs
   assert A_bar_ref.shape == (block.k, block.n)
@@ -421,9 +435,8 @@ def _tgmm_ragged_dot_kernel(
       y = plgpu.load(y_ref.at[xy_rows_idx, cols_idx], mask=mask, other=0)
       x, y = x.astype(compute_dtype), y.astype(compute_dtype)
       dim_nums = (((0,), (0,)), ((), ()))
-      return acc + lax.dot_general(
-          x, y, dimension_numbers=dim_nums, preferred_element_type=acc_dtype
-      ).astype(acc.dtype)
+      partial_sum = lax.dot_general(x, y, dimension_numbers=dim_nums, preferred_element_type=acc_dtype)
+      return _summed(acc, partial_sum.astype(acc.dtype), group_sz > 0, exact_sums=exact_sums)
 
     acc = jnp.zeros((block.k, block.n), dtype=acc_dtype)
     acc = lax.fori_loop(0, cdiv(group_sz, block.m), inner_compute, acc)
@@ -443,7 +456,7 @@ def _tgmm_ragged_dot_kernel(
 
 @partial(jax.jit, static_argnames=(
   "block_m", "block_n", "block_k", "interpret", "compute_dtype", "acc_dtype", "num_warps", "num_stages",
-  "chunk_m", "out_dtype", "prologue", "prologue_axes"))
+  "chunk_m", "out_dtype", "prologue", "prologue_axes", "exact_sums"))
 def tgmm(
   x: jax.Array,  # [m, k]
   y: jax.Array,  # [m, n]
@@ -462,11 +475,13 @@ def tgmm(
   prologue=None,
   prologue_operands: tuple[jax.Array, ...] = (),
   prologue_axes: tuple = (),
+  exact_sums: bool = False,
 ) -> jax.Array:
   """Compute grouped matmul on GPU via a Pallas lowering.
 
   Dew: `prologue(rows, *side_tiles)` transforms each loaded `[block_m, block_k]` tile of `x`'s rows
-  before its transposed product; side operands as `gmm`'s, along 'rows' and 'depth'."""
+  before its transposed product; side operands as `gmm`'s, along 'rows' and 'depth'. `exact_sums` as
+  `gmm`'s."""
   del chunk_m
   msg = "This tgmm kernel only supports (m, k) x (m, n) -> (g, k, n), but got "
   msg += f"{x.shape=} {y.shape=}"
@@ -498,7 +513,7 @@ def tgmm(
 
   block_sizes = BlockSizes(m=block_m, k=block_k, n=block_n)
   dtype_spec = {"compute_dtype": compute_dtype, "acc_dtype": acc_dtype, "prologue": prologue,
-                "prologue_axes": prologue_axes}
+                "prologue_axes": prologue_axes, "exact_sums": exact_sums}
   with jax.named_scope("tgmm_ragged_dot"):
     return pl.pallas_call(
       partial(_tgmm_ragged_dot_kernel, size=size, block=block_sizes,

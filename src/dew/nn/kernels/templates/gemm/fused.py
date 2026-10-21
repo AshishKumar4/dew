@@ -36,8 +36,8 @@ def fusible_gemm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None =
                  transpose_rhs: bool = False, interpret_on_cpu: bool = False) -> jax.Array:
     """`template.gemm`'s fp32 product of each group's rows of `lhs` and its matrix of `rhs`, its consumers
     fused into the epilogue under `fuser.fuse` (the module's docstring)."""
-    fusible = fuser.fusible(functools.partial(_product, transpose_rhs, interpret_on_cpu, group_sizes is None),
-                            output_fusion_prefix=True)
+    fusible = fuser.fusible(output_fusion_prefix=True)(
+        functools.partial(_product, transpose_rhs, interpret_on_cpu, group_sizes is None))
     return fusible(lhs, rhs) if group_sizes is None else fusible(lhs, rhs, group_sizes)
 
 

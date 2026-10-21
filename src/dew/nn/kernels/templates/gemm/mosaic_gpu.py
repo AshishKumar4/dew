@@ -267,13 +267,15 @@ def _store_rows(o_smem, o_gmem, group_info: GroupInfo, smem_start, rows: int, co
 
 def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles, out_dtype,
          multiprocessors: int, interpret: bool | plgpu.InterpretGPUParams = False, prologue=None,
-         prologue_operands: tuple = (), prologue_axes: tuple = ()) -> jax.Array:
+         prologue_operands: tuple = (), prologue_axes: tuple = (), exact_sums: bool = False) -> jax.Array:
     """Each group's rows of `lhs` `[rows, depth]` transposed times its rows of `rhs` `[rows, width]`:
     `[groups, depth, width]` in `out_dtype`, an empty group's zero. The depth must divide by
     `tiles.block_m` and the width by `tiles.block_n`; `tiles.block_k` is the rows a step takes.
 
     Dew: `prologue(rows, *side_tiles)` transforms each `[block_k, block_m]` stage of `lhs`'s rows in
-    place before the group masking and the MMA; side operands follow 'rows' and 'depth' as `gmm`'s."""
+    place before the group masking and the MMA; side operands follow 'rows' and 'depth' as `gmm`'s.
+    `exact_sums` adds each step's product into the fp32 sum by an IEEE add, which holds two
+    accumulators in registers."""
     block_m, block_n, block_k = tiles.block_m, tiles.block_n, tiles.block_k
     k, m = lhs.shape
     k2, n = rhs.shape
@@ -308,45 +310,29 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles
 
             side_specs, sides = _tgmm_sides(side_gmems, prologue_axes, gmem_slice, m_i, tiles)
 
-            def acc_scope(acc_ref):
-                def block_matmul(block_idx, lhs_smem, rhs_smem, *side_smems):
-                    block_idx = block_idx[0]
-                    if prologue is not None:
-                        # Dew: the prologue rewrites the rows' stage in place, which the one warpgroup owns.
-                        lhs_smem[...] = prologue(lhs_smem[...], *(side[...] for side in side_smems)).astype(
-                            lhs_smem.dtype)
-                        plgpu.commit_smem()
+            def staged(block_idx, lhs_smem, rhs_smem, side_smems):
+                if prologue is not None:
+                    # Dew: the prologue rewrites the rows' stage in place, which the one warpgroup owns.
+                    lhs_smem[...] = prologue(lhs_smem[...], *(side[...] for side in side_smems)).astype(
+                        lhs_smem.dtype)
+                    plgpu.commit_smem()
+                _zero_neighbours(lhs_smem, rhs_smem, block_idx, group_starts_gmem[g_i],
+                                 group_ends_gmem[g_i], group_num_blocks_gmem[g_i], tiles)
 
-                    _zero_neighbours(lhs_smem, rhs_smem, block_idx, group_starts_gmem[g_i],
-                                     group_ends_gmem[g_i], group_num_blocks_gmem[g_i], tiles)
-
-                    plgpu.wgmma(acc_ref, lhs_smem.transpose((1, 0)), rhs_smem)
-                    if tiles.stages == 1:
-                        # Without delayed release, we won't have at least two separate smem blocks in
-                        # flight, so we cannot rely on the implicit wait of wgmma to guarantee that the
-                        # data in smem is ready to be overwritten by the next pipeline iteration.
-                        plgpu.wgmma_wait(0)
-
-                @pl.when(group_sizes_gmem[g_i] > 0)  # Skip the group if it is empty.
-                def _():
-                    plgpu.emit_pipeline(
-                        block_matmul,
-                        grid=(group_num_blocks_gmem[g_i],),
-                        in_specs=[
-                            plgpu.BlockSpec((block_k, block_m), lambda k_i: (k_i, m_i),
-                                            delay_release=int(tiles.stages > 1)),
-                            plgpu.BlockSpec((block_k, block_n), lambda k_i: (k_i, n_i),
-                                            delay_release=int(tiles.stages > 1)),
-                            *side_specs,
-                        ],
-                        max_concurrent_steps=tiles.stages,
-                    )(lhs_gmem.at[gmem_slice, :], rhs_gmem.at[gmem_slice, :], *sides)
-
-                return acc_ref[...]
-
-            acc = pl.run_scoped(acc_scope, plgpu.WGMMAAccumulatorRef((block_m, block_n)))
+            pipeline = functools.partial(
+                plgpu.emit_pipeline, grid=(group_num_blocks_gmem[g_i],),
+                in_specs=[plgpu.BlockSpec((block_k, block_m), lambda k_i: (k_i, m_i),
+                                          delay_release=int(tiles.stages > 1)),
+                          plgpu.BlockSpec((block_k, block_n), lambda k_i: (k_i, n_i),
+                                          delay_release=int(tiles.stages > 1)),
+                          *side_specs],
+                max_concurrent_steps=tiles.stages)
+            operands = (lhs_gmem.at[gmem_slice, :], rhs_gmem.at[gmem_slice, :], *sides)
             tile = o_gmem.at[g_i, pl.ds(m_i * block_m, block_m), pl.ds(n_i * block_n, block_n)]
-            _store_gradient_tile(acc, tile)
+            nonempty = group_sizes_gmem[g_i] > 0  # Skip the group if it is empty.
+
+            summed = _exactly_summed_gradient if exact_sums else _summed_gradient
+            summed(pipeline, operands, staged, tile, nonempty, tiles)
 
     kernel = plgpu.kernel(
         body,
@@ -398,6 +384,56 @@ def _zero_neighbours(lhs_smem, rhs_smem, block_idx, start, end, blocks, tiles: T
         last_index = lax.rem(end - 1, tiles.block_k)
         _zero_rows(lhs_smem, rhs_smem, lambda rows: rows <= last_index, tiles.block_k, tiles.block_m,
                    tiles.block_n)
+
+
+def _summed_gradient(pipeline, operands, staged, tile, nonempty, tiles: Tiles) -> None:
+    """Dew: a kernel gradient tile's sum over its group's row steps, each step's product into one
+    accumulator by the warpgroup MMA, stored to `tile`; an empty group's zero."""
+    def acc_scope(acc_ref):
+        def block_matmul(block_idx, lhs_smem, rhs_smem, *side_smems):
+            staged(block_idx[0], lhs_smem, rhs_smem, side_smems)
+            plgpu.wgmma(acc_ref, lhs_smem.transpose((1, 0)), rhs_smem)
+            if tiles.stages == 1:
+                # Without delayed release, we won't have at least two separate smem blocks in flight, so
+                # we cannot rely on the implicit wait of wgmma to guarantee that the data in smem is ready
+                # to be overwritten by the next pipeline iteration.
+                plgpu.wgmma_wait(0)
+
+        @pl.when(nonempty)
+        def _():
+            pipeline(block_matmul)(*operands)
+
+        return acc_ref[...]
+
+    _store_gradient_tile(pl.run_scoped(acc_scope, plgpu.WGMMAAccumulatorRef((tiles.block_m, tiles.block_n))),
+                         tile)
+
+
+def _exactly_summed_gradient(pipeline, operands, staged, tile, nonempty, tiles: Tiles) -> None:
+    """Dew: `_summed_gradient` with each step's product summed apart in a fresh accumulator, then added
+    into the running fp32 sum, the pipeline's carry, by an IEEE add: a tensor core's accumulation
+    truncates each add."""
+    shape = (tiles.block_m, tiles.block_n)
+
+    def exact_step(block_idx, lhs_smem, rhs_smem, *rest):
+        *side_smems, running = rest
+        staged(block_idx[0], lhs_smem, rhs_smem, side_smems)
+
+        def step_scope(step_ref):
+            plgpu.wgmma(step_ref, lhs_smem.transpose((1, 0)), rhs_smem)
+            return step_ref[...]
+
+        return running + pl.run_scoped(step_scope, plgpu.WGMMAAccumulatorRef(shape))
+
+    zeros = plgpu.layout_cast(jnp.zeros(shape, jnp.float32), plgpu.Layout.WGMMA)
+
+    @pl.when(nonempty)
+    def _():
+        _store_gradient_tile(pipeline(exact_step, init_carry=zeros)(*operands), tile)
+
+    @pl.when(~nonempty)
+    def _():
+        _store_gradient_tile(zeros, tile)
 
 
 def _store_gradient_tile(acc, o_gmem) -> None:
