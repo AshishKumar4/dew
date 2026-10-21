@@ -11,9 +11,9 @@
     python3 tools/armada/ci.py gangs
 
 The plan prints a task matrix for each Python CI proves, every task of it at
-once on .armada.json's pool (`one_wave`): its target is the least whose plan
-holds no more tasks than the pool has containers, so none waits for another to
-end. Whole test files are packed heaviest first into the lightest of the tasks,
+once on .armada.json's pool (`one_wave`): its target grows from the timed work
+over the pool until the plan holds no more tasks than the pool has containers,
+so none waits for another to end. Whole test files are packed heaviest first into the lightest of the tasks,
 each near `target` seconds, so a task imports only its own modules. A file heavier than that runs
 as groups of its tests (`groups`, tools/armada/split.py): runs of consecutive
 tests in node-id order, each as light as that many runs let it be, a heavier
@@ -432,25 +432,36 @@ def packed(weights: dict[str, float], count: int) -> list[tuple[float, list[str]
 
 
 def one_wave(timings: dict, pool: int) -> float:
-    """The target whose plan runs as one wave on `pool` containers, no more tasks than containers, so
-    no task waits for another to free its container: train 22's suite, 212 tasks of about a set 240 s
-    target on 160 containers, ran as two waves in 10:10. From the heaviest recorded test, which no cut
-    divides, the target rises to the plan's work over the containers its shrinkable tasks have: all
-    but the files nothing has timed, which each run alone, and the collect tasks. Where those alone
-    fill the pool, or the work packs no further, one wave cannot hold the suite, and the plan runs at
-    the target it reached, in waves."""
-    target = float(max(math.ceil(max((max(tests) for tests in recorded_tests().values() if tests),
-                                      default=1.0)), 1))
-    while True:
-        entries = plan(target, timings)
-        shrinkable = [entry for entry in entries if entry["split"] != COLLECT and not entry.get("untimed")]
-        fixed, work = len(entries) - len(shrinkable), sum(entry["weight"] for entry in shrinkable)
-        if len(entries) <= pool or fixed >= pool or target >= work:
-            if len(entries) > pool:
-                print(f"one wave cannot hold the plan: {len(entries)} tasks on {pool} containers at a "
-                      f"{target:.0f} s target", file=sys.stderr)
-            return target
-        target = float(max(target + 1, math.ceil(work / (pool - fixed))))
+    """A target whose plan runs as one wave on `pool` containers, no more tasks than containers, so no
+    task waits for another to free its container: train 22's suite, 212 tasks of about a set 240 s
+    target on 160 containers, ran as two waves in 10:10. The first target tried is the timed files'
+    work over the containers left beside the tasks that never shrink (files nothing has timed, which
+    run alone, and the collect tasks), and no less than the heaviest recorded test, which no cut
+    divides; it grows by a tenth until the plan fits. At the heaviest Python's whole timed work every
+    file packs into its family's one task, so where the plan holds more tasks than the pool even
+    there, one wave cannot hold the suite and the plan runs at that target, in waves."""
+    heaviest = max((max(tests) for tests in recorded_tests().values() if tests), default=1.0)
+    totals = [[seconds for seconds in weights(files_of(python), timings, python).values()
+               if seconds is not None] for python in PYTHONS]
+    saturated = float(math.ceil(max([sum(seconds) for seconds in totals] + [heaviest, 1.0])))
+    entries = plan(saturated, timings)
+    if len(entries) > pool:
+        print(f"one wave cannot hold the plan: {len(entries)} tasks on {pool} containers even at a "
+              f"{saturated:.0f} s target", file=sys.stderr)
+        return saturated
+    fixed = sum(1 for entry in entries if entry["split"] == COLLECT or entry.get("untimed"))
+    target = float(max(math.ceil(heaviest), math.ceil(sum(map(sum, totals)) / (pool - fixed)), 1))
+    while target < saturated and len(plan(target, timings)) > pool:
+        target = min(float(math.ceil(target * 1.1)), saturated)
+    return target
+
+
+def files_of(python: str) -> list[str]:
+    """The test files `python`'s tasks run: every file on the first Python, and on a pushed run's
+    others the newest (`NEWEST_FILES`) whole; every file on each with the test cache off."""
+    every = sorted(str(path) for path in Path("tests").glob("test_*.py") if str(path) not in SKIPPED)
+    whole = python == PYTHONS[0] or os.environ.get("DEW_TEST_CACHE") == "off"
+    return every if whole else [name for name in every if name in NEWEST_FILES]
 
 
 def plan(target: float, timings: dict) -> list[dict]:
@@ -459,14 +470,11 @@ def plan(target: float, timings: dict) -> list[dict]:
     then on. Files marked `torchax` (`APART`) share tasks only with one another. Each entry carries
     the test cache's policy, DEW_TEST_CACHE here, to its task."""
     cache = "off" if os.environ.get("DEW_TEST_CACHE") == "off" else "on"
-    every = sorted(str(path) for path in Path("tests").glob("test_*.py") if str(path) not in SKIPPED)
+    every = files_of(PYTHONS[0])
     recorded = recorded_tests()
     entries = []
     for python in PYTHONS:
-        # Every file on every Python daily; on a pushed run the newest takes `NEWEST_FILES` whole.
-        whole = python == PYTHONS[0] or cache == "off"
-        files = every if whole else [name for name in every if name in NEWEST_FILES]
-        timed = weights(files, timings, python)
+        timed = weights(files_of(python), timings, python)
         tasks: list[tuple[list[str], str, float]] = [
             ([name], "", target) for name, seconds in timed.items() if seconds is None]
         untimed = len(tasks)
