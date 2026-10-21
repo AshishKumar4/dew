@@ -44,12 +44,12 @@ from jax.sharding import PartitionSpec as P
 from dew.nn.kernels.generation import gpu_target
 from dew.nn.precision import (
     at_least_fp32,
+    bf16_product,
     capped_logits,
     compensated_add,
     compensated_sum,
     head_product,
     rounded_operand,
-    rounded_to,
     rounds_to_bf16,
     scaled_logits,
 )
@@ -179,11 +179,12 @@ class _Columns(NamedTuple):
 def _tile_logits(states, matrix, precision: jax.lax.PrecisionLike):
     """Uncapped `[tokens, features] @ [columns, features].T` in at least fp32,
     over operands already in the dtype the head multiplies in. Under the
-    bf16 algorithm the logits are rounded to bf16 values, as
-    `dew.nn.precision.head_product` rounds the model's."""
-    logits = jnp.einsum('td,vd->tv', states, matrix.astype(states.dtype),
-                        precision=precision, preferred_element_type=at_least_fp32(states.dtype))
-    return rounded_to(logits, jnp.bfloat16) if precision is BF16 else logits
+    bf16 algorithm it is the model's own bf16 product (`bf16_product`, as
+    `dew.nn.precision.head_product` takes it), so each logit rounds alike."""
+    if precision is BF16:
+        return bf16_product('td,vd->tv', states, matrix)
+    return jnp.einsum('td,vd->tv', states, matrix.astype(states.dtype),
+                      precision=precision, preferred_element_type=at_least_fp32(states.dtype))
 
 
 def _rescaled(maximum, total, larger):
@@ -195,10 +196,8 @@ def _rescaled(maximum, total, larger):
 
 def token_loss(peak: jax.Array, mass: jax.Array, target: jax.Array) -> jax.Array:
     """A token's cross entropy from its row's maximum `peak`, the sum of exponentials scaled to it
-    `mass`, and its target's logit: log(mass) - (target - peak), as Optax takes it, each term at the
-    loss's own magnitude. `peak + log(mass) - target` rounds log Z at the logits' magnitude before
-    the subtraction cancels it: a tied bf16 decoder's worst token sat 8.3e-6 from float64 that way and
-    4.8e-7 this way, Optax's own on the same logits (tests/test_chunked_cross_entropy.py)."""
+    `mass`, and its target's logit: log(mass) - (target - peak), as Optax takes it, so neither term is
+    rounded at the logits' magnitude before the subtraction that cancels it does."""
     return jnp.log(mass) - (target - peak)
 
 
