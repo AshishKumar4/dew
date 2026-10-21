@@ -490,20 +490,34 @@ def _fractional(bound: ast.AST, scope: _Scope, reading: _Reading) -> bool:
                for part in ast.walk(bound))
 
 
+def _written(bound: ast.AST, scope: _Scope) -> ast.AST | None:
+    """A bound written out (`_literal`), as it is or through a name the scope binds only to it."""
+    if _literal(bound):
+        return bound
+    if isinstance(bound, ast.Name):
+        found = _bound_to(bound.id, scope)
+        if len(found) == 1 and _literal(found[0]):
+            return found[0]
+    return None
+
+
 def _band(lower: ast.AST, value: ast.AST, upper: ast.AST, scope: _Scope, reading: _Reading) -> bool:
     """Whether `lower <= value <= upper` holds a float in a band around a target: a value neither whole
-    nor a duration, between bounds one of which holds a fraction (`_fractional`), both written out
-    (`2.25 <= ratio <= 3.75`, `-1e-6 <= residual <= 1e-6`), a target less and plus one width
-    (`c - w <= value <= c + w`), or a target scaled by two written-out factors (`0.75 * c <= value <=
-    1.25 * c`). A bound at zero asks a sign, [-1, 1] is a cosine's domain, a duration's floor and
-    timeout time it, and a bound that is a reading (a task's wall time) is no target."""
-    if _counted(value, scope, reading) or _clocked(value, scope, reading) or _zero(lower) or _zero(upper):
+    nor a duration, between bounds one of which holds a fraction (`_fractional`), both written out, as
+    they are or through names (`2.25 <= ratio <= 3.75`, `-1e-6 <= residual <= 1e-6`), a target less
+    and plus one width (`c - w <= value <= c + w`), or a target scaled by two written-out factors
+    (`0.75 * c <= value <= 1.25 * c`). A bound at zero asks a sign, [-1, 1] is a cosine's domain, a
+    duration's floor and timeout time it, and a bound that is a reading (a task's wall time) is no
+    target."""
+    low, high = _written(lower, scope), _written(upper, scope)
+    bounds = [bound for bound in (lower, upper, low, high) if bound is not None]
+    if _counted(value, scope, reading) or _clocked(value, scope, reading) or any(map(_zero, bounds)):
         return False
-    if not (_fractional(lower, scope, reading) or _fractional(upper, scope, reading)):
+    if not any(_fractional(bound, scope, reading) for bound in bounds):
         return False
-    if _literal(lower) and _literal(upper):
+    if low is not None and high is not None:
         try:
-            return (ast.literal_eval(lower), ast.literal_eval(upper)) != (-1, 1)
+            return (ast.literal_eval(low), ast.literal_eval(high)) != (-1, 1)
         except ValueError:
             return True
     if not (isinstance(lower, ast.BinOp) and isinstance(upper, ast.BinOp)):
