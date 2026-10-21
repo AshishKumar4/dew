@@ -83,6 +83,32 @@ def objective_loss(objective, variables, tokens, *, scalar: bool = False):
     return loss if scalar else float(loss)
 
 
+
+def token_draws(tokens):
+    """Check 1's draw of token rows: `tokens` (the fixture's) at seed 0, else rows of their shape
+    drawn uniformly from the vocabulary."""
+    def draw(seed):
+        if seed == 0:
+            return (tokens,)
+        return (np.random.default_rng(seed).integers(0, TINY["vocab_size"], tokens.shape).astype(np.int32),)
+
+    return draw
+
+
+def loss_and_gradients(loaded, model, params):
+    """A draw's LM loss of the fallback-loaded model and its gradient for each parameter `model`
+    (its torch twin) names, the loss as `[1]`: the function check 1 holds against torch's step."""
+    objective = LMObjective(loaded, seq_len=SEQ, ema_decay=None)
+    step = jax.jit(jax.value_and_grad(lambda params, ids: objective_loss(
+        objective, {**loaded.variables, "params": params}, ids, scalar=True)))
+    names = [name for name, _ in model.named_parameters()]
+
+    def dew_fn(ids):
+        value, grads = step(params, ids)
+        return {"loss": value[None]} | {name: grads[name] for name in names}
+
+    return dew_fn
+
 def test_the_logits_and_the_objective_loss_are_transformers(source, loaded, tokens):
     """`apply` is the torch forward, and LMObjective's chunked loss over the
     captured head input and the head weight is transformers' own loss."""
@@ -260,21 +286,8 @@ def test_a_head_trains_as_transformers_does_by_what_it_is(head, tokens, tmp_path
         loaded = Pretrained.load(tmp_path, fallback="torchax", dtype="float32", param_dtype=stored)
     assert type(loaded.model).__name__ == module
 
-    def draw(seed):
-        """The fixture's tokens at seed 0, else tokens drawn uniformly from the vocabulary."""
-        if seed == 0:
-            return (tokens,)
-        return (np.random.default_rng(seed).integers(0, TINY["vocab_size"], tokens.shape).astype(np.int32),)
-
-    objective = LMObjective(loaded, seq_len=SEQ, ema_decay=None)
-    step = jax.jit(jax.value_and_grad(lambda params, ids: objective_loss(
-        objective, {**loaded.variables, "params": params}, ids, scalar=True)))
     params = {name: jnp.asarray(leaf) for name, leaf in loaded.variables["params"].items()}
-    names = [name for name, _ in model.named_parameters()]
-
-    def dew_fn(ids):
-        value, grads = step(params, ids)
-        return {"loss": value[None]} | {name: grads[name] for name in names}
+    dew_fn = loss_and_gradients(loaded, model, params)
 
     reference_model = copy.deepcopy(model).float()
 
@@ -294,7 +307,7 @@ def test_a_head_trains_as_transformers_does_by_what_it_is(head, tokens, tmp_path
             return torch_step(wide_model, ids, torch.float64)
 
     dew = dew_fn(tokens)
-    assert_as_exact(dew_fn, reference_fn, draw, f"torchax {head} LM step", seeds=HEAD_SEEDS,
+    assert_as_exact(dew_fn, reference_fn, token_draws(tokens), f"torchax {head} LM step", seeds=HEAD_SEEDS,
                     truth_fn=truth_fn)
     if head in ("zero bias", "bias"):
         assert np.abs(dew["lm_head.bias"]).max() > 0
@@ -321,21 +334,7 @@ def test_bf16_compute_gradients_are_as_exact_as_torchs_bf16(family, tokens, tmp_
     with pytest.warns(UserWarning):
         loaded = Pretrained.load(tmp_path, fallback="torchax", dtype="bfloat16", param_dtype="bfloat16")
 
-    def draw(seed):
-        """The fixture's tokens at seed 0, else tokens drawn uniformly from the vocabulary."""
-        if seed == 0:
-            return (tokens,)
-        return (np.random.default_rng(seed).integers(0, TINY["vocab_size"], tokens.shape).astype(np.int32),)
-
-    objective = LMObjective(loaded, seq_len=SEQ, ema_decay=None)
-    step = jax.jit(jax.value_and_grad(lambda params, ids: objective_loss(
-        objective, {**loaded.variables, "params": params}, ids, scalar=True)))
-    params = loaded.variables["params"]
-    names = [name for name, _ in model.named_parameters()]
-
-    def dew_fn(ids):
-        value, grads = step(params, ids)
-        return {"loss": value[None]} | {name: grads[name] for name in names}
+    dew_fn = loss_and_gradients(loaded, model, loaded.variables["params"])
 
     reference_model = copy.deepcopy(model)
 
@@ -351,8 +350,8 @@ def test_bf16_compute_gradients_are_as_exact_as_torchs_bf16(family, tokens, tmp_
         with float64():
             return torch_step(wide, ids, torch.float64)
 
-    assert_as_exact(dew_fn, reference_fn, draw, f"torchax bf16 {family} LM step", seeds=BF16_SEEDS,
-                    truth_fn=truth_fn)
+    assert_as_exact(dew_fn, reference_fn, token_draws(tokens), f"torchax bf16 {family} LM step",
+                    seeds=BF16_SEEDS, truth_fn=truth_fn)
 
 
 def test_save_writes_the_source_names_back(source, loaded, tokens, tmp_path):

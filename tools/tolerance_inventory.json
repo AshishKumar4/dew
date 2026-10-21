@@ -843,7 +843,7 @@
    "by": "2026-11-13"
   },
   "tests/test_qwen_qualification.py": {
-   "comparisons": 15,
+   "comparisons": 13,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
