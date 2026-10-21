@@ -586,7 +586,7 @@ def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tu
     # A tile parameter's gradient enters as its zeros, aliased to its output (`_dq_launch`).
     for _ in (kind for kind in score_kinds if kind == Kind.TILE):
         refs.pop(0)
-    dq_ref, delta_ref, anchor_ref, peak_out_ref, total_out_ref, mass_ref, first_ref, index_out_ref, *outputs = refs
+    dq_ref, delta_ref, anchor_ref, peak_out_ref, total_out_ref, mass_ref, index_out_ref, *outputs = refs
     grad_refs = [outputs.pop(0) if kind in DQ_GRADS else None for kind in score_kinds]
     block_q = query_ref.shape[0]
     head = pl.program_id(2)
@@ -654,7 +654,6 @@ def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tu
     anchor = jnp.where(anchored, anchor, 0.0)
     key_index = jnp.where(anchored, key_index, -1)
     delta = jnp.where(total > 0, numerator / jnp.where(total > 0, total, 1.0), 0.0)
-    first_ref[...] = delta
     index_out_ref[...] = key_index
     summed = tuple(kind in (Kind.HEAD, Kind.QUERY) for kind in score_kinds)
 
@@ -806,7 +805,7 @@ class TritonBackward(Template[BackwardTiles]):
                             *spans, warps=config.dq_warps, stages=config.dq_stages, **shared)
         delta, anchor, peak, total = dq_out[1:5]
         # Each query's anchor key as the dQ launch chose it, -1 where it took D about 0.
-        dkv_out = _dkv_launch(query, key, value, dout, peak, total, anchor, delta, dq_out[7], *spans,
+        dkv_out = _dkv_launch(query, key, value, dout, peak, total, anchor, delta, dq_out[6], *spans,
                               warps=config.dkv_warps, stages=config.dkv_stages, **shared)
         return (*dq_out, *dkv_out), None
 
@@ -923,10 +922,10 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, key_index, an
         in_specs.append(_param_spec(kind, param, block_q, keys))
         arrays.append(param)
     out_shape = [jax.ShapeDtypeStruct(query.shape, jnp.float32),
-                 *[jax.ShapeDtypeStruct((batch, heads, queries), jnp.float32)] * 6,
+                 *[jax.ShapeDtypeStruct((batch, heads, queries), jnp.float32)] * 5,
                  jax.ShapeDtypeStruct((batch, heads, queries), jnp.int32)]
     out_specs = [pl.BlockSpec((None, block_q, None, width), lambda i, b, h: (b, i, h, 0)),
-                 *[per_head] * 7]
+                 *[per_head] * 6]
     aliases = {}
     for param, kind in zip(score_params, score_kinds, strict=True):
         match kind:
@@ -1081,12 +1080,12 @@ def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
                                    jnp.swapaxes(key_index, 1, 2)[..., None], axis=1)
     outputs = TritonBackward(score_mod=hooks.score_mod, score_kinds=kinds, scale=scale, score_dtypes=dtypes)(
         *operands, *(call.rows(start) for start in starts), key_index, gathered, *rows, interpret=interpret)
-    dq, softmax = outputs[0], outputs[1:7]
-    grads_out = list(outputs[8:])
+    dq, softmax = outputs[0], outputs[1:6]
+    grads_out = list(outputs[7:])
     dq_grads = [grads_out.pop(0) for kind in kinds if kind in DQ_GRADS]
     dk, dv, *key_grads = grads_out
-    delta, anchor, peak, total, mass, first = (array[:, :, :queries] for array in softmax)
-    delta, first = anchor + delta, anchor + first
+    delta, anchor, peak, total, mass = (array[:, :, :queries] for array in softmax)
+    delta = anchor + delta
     padded_k, padded_d, padded_dv = call.key.shape[1], call.key.shape[-1], call.value.shape[-1]
     dk = dk.reshape(batch, padded_k, kv_heads, group, padded_d).sum(axis=3)
     dv = dv.reshape(batch, padded_k, kv_heads, group, padded_dv).sum(axis=3)
