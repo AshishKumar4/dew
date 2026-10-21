@@ -25,7 +25,6 @@ from dew.config import ModelConfig, ObjectiveConfig, TrainerConfig
 from dew.config.data import ImageData
 from dew.diffusion.presets import Flow, ResolutionShift
 from dew.diffusion.process import Process
-from dew.diffusion.schedules import FlowMatchingScheduler
 from dew.diffusion.schedules.source import SourceSchedule
 from dew.objectives import Step
 from dew.objectives.diffusion import Alignment, DiffusionObjective, DiffusionRunConfig, TextCondition
@@ -447,20 +446,26 @@ def test_the_resolution_shift_and_the_noise_levels_it_maps_to_are_diffusers(cons
         "_class_name": "FlowMatchEulerDiscreteScheduler", "num_train_timesteps": 1000,
         "use_dynamic_shifting": True, "base_shift": 0.5, "max_shift": top_shift,
         "base_image_seq_len": 256, "max_image_seq_len": top})
-    shifts = {}
+    schedules, mus = {}, {}
     for index, tokens in enumerate(SHIFTS["tokens"]):
-        shift = ResolutionShift(tokens=int(tokens), **fields).shift()
+        resolution = ResolutionShift(tokens=int(tokens), **fields)
+        shift = resolution.shift()
         assert shift == flux_shift(int(tokens), constants)
-        assert loaded.training_process(int(tokens)).schedule.shift == shift
-        shifts[f"{tokens} tokens"] = (shift, float(SHIFTS[f"{constants}/mu"][index]))
+        schedule = loaded.training_process(int(tokens)).schedule
+        assert schedule.shift == shift
+        # A preset's resolution shift maps as the loaded file's does, to the bit.
+        drawn, = shift_times(index)
+        np.testing.assert_array_equal(Flow(resolution_shift=resolution)().schedule.rates(drawn)[1],
+                                      schedule.rates(drawn)[1])
+        schedules[f"{tokens} tokens"] = schedule
+        mus[f"{tokens} tokens"] = float(SHIFTS[f"{constants}/mu"][index])
     scheduler = FlowMatchEulerDiscreteScheduler(use_dynamic_shifting=True)
 
     def dew(times):
-        return {name: FlowMatchingScheduler(shift=shift).rates(times)[1]
-                for name, (shift, _) in shifts.items()}
+        return {name: schedule.rates(times)[1] for name, schedule in schedules.items()}
 
     def diffusers(times):
-        return {name: scheduler.time_shift(mu, 1.0, times) for name, (_, mu) in shifts.items()}
+        return {name: scheduler.time_shift(mu, 1.0, times) for name, mu in mus.items()}
 
     assert_as_exact(dew, diffusers, shift_times, f"{constants} noise levels", seeds=SHIFT_SEEDS)
 

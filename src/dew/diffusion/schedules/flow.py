@@ -49,12 +49,16 @@ class FlowMatchingScheduler(ContinuousNoiseScheduler, RectifiedFlow):
     Training draws the unshifted time. `shift` then maps it, and the
     sampling grid, to the resolution's noise levels with
     shift t / (1 + (shift - 1) t), and the model is conditioned on the
-    shifted time times 1000. An unknown `density`, or a `mode_scale` outside
-    its range for `mode`, raises `ValueError`.
+    shifted time times 1000. A `dynamic` shift, one a resolution sets
+    (`ResolutionShift`, a scheduler file's dynamic shifting), takes that map
+    as Diffusers' dynamic shifting does, shift / (shift + 1 / t - 1); a
+    static one as its static schedule does. The two are one function and
+    round apart, each as its source rounds it. An unknown `density`, or a
+    `mode_scale` outside its range for `mode`, raises `ValueError`.
     """
 
     def __init__(self, shift: float = 1.0, logit_mean: float = 0.0, logit_std: float = 1.0,
-                 density: Density = "logit_normal", mode_scale: float = 1.29):
+                 density: Density = "logit_normal", mode_scale: float = 1.29, dynamic: bool = False):
         if density not in get_args(Density):
             raise ValueError(f"density is one of {get_args(Density)}, not {density!r}")
         if density == "mode" and not -1.0 <= mode_scale <= 2.0 / (math.pi - 2.0):
@@ -63,19 +67,18 @@ class FlowMatchingScheduler(ContinuousNoiseScheduler, RectifiedFlow):
         if not math.isfinite(shift) or shift <= 0:
             raise ValueError(f"a rectified-flow timestep shift must be finite and positive, got {shift}")
         self.shift = shift
+        self.dynamic = dynamic
         self.logit_mean = logit_mean
         self.logit_std = logit_std
         self.density = density
         self.mode_scale = mode_scale
 
     def shift_timesteps(self, t) -> jax.Array:
-        """shift t / (1 + (shift - 1) t), taken as t / (t + (1 - t) / shift): in float32 it rounds no
-        more than Diffusers' static form (this one's numerator and denominator) or its exponential
-        form (exp(mu) / (exp(mu) + 1 / t - 1)) at any shift, 0.6 to 1.04 times their RMS error from
-        float64 over shifts 0.5 to 12, and maps 0 and 1 to themselves. Unshifted it is t."""
-        if self.shift == 1:
-            return t
-        return t / (t + (1 - t) * (1 / self.shift))
+        """`t` at the shift, operation for operation as Diffusers maps it: a dynamic shift as
+        `FlowMatchEulerDiscreteScheduler.time_shift`, a static one as its static sigmas."""
+        if self.dynamic:
+            return self.shift / (self.shift + (1 / t - 1))
+        return self.shift * t / (1 + (self.shift - 1) * t)
 
     def sample_t(self, key, n):
         if self.density == "logit_normal":
