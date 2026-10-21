@@ -238,7 +238,10 @@ def test_real_trainer_update_and_checkpoint_resume(source, tmp_path):
     initial = Trainer(obj, optax.sgd(0.001), key=run_key).initial_state()
     step = Step(jnp.asarray(0, jnp.int32), jax.random.fold_in(initial.key, 0), None,
                 **example_fields(initial, 0, 1, batch))
-    gradient = jax.grad(lambda values: obj.scalar_loss(values, batch, step)[0])(variables)
+    # The update compiled as one program, as the trainer's is: XLA:CPU's compiled gradient of this model
+    # sits 1.0 to 5.2 times further from float64 than the same ops run one by one (measured per leaf,
+    # 2026-10-21), a gap of the compiler's and not of the trainer, which this test holds.
+    gradient = jax.jit(jax.grad(lambda values: obj.scalar_loss(values, batch, step)[0]))(variables)
     expected = jax.tree.map(lambda value, grad: value - 0.001 * grad, variables, gradient)
     truth = float64_update(loaded.model, lambda wide: objective(replace(loaded, model=wide)), variables,
                            batch, step, 0.001)
