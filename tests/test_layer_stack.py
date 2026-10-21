@@ -650,9 +650,10 @@ def qwen35(periods: int, **overrides):
 def test_a_training_step_scans_a_periodic_stack_as_one_body_and_trains_as_the_loop():
     """Under `scan_layers`, a training step over resident weights scans a stack whose unlike layers
     repeat one period (Qwen3.5's three delta-net layers and one attention layer) as one body of
-    the period's layers: the step's program is the same for two periods as for six, where the plain
-    loop traces every layer. The loss, every gradient, and every parameter and moment one AdamW step
-    leaves are as exact as the plain loop's (check 1), both from the loop's own float64 step."""
+    the period's layers: the loss and gradient's program is the same for two periods as for six,
+    where the plain loop traces every layer (the optimizer's update stays one per leaf). The loss,
+    every gradient, and every parameter and moment one AdamW step leaves are as exact as the plain
+    loop's (check 1), both from the loop's own float64 step."""
     import optax
 
     deep = qwen35(3)
@@ -660,11 +661,14 @@ def test_a_training_step_scans_a_periodic_stack_as_one_body_and_trains_as_the_lo
     variables = deep.init(jax.random.key(0), ids)
     adamw = optax.adamw(1e-3)
 
-    def stepped(model, variables, ids):
-        def loss(params):
+    def loss(model, variables, ids):
+        def scored(params):
             logits = model.apply({**variables, "params": params}, ids[:, :-1], train=False)
             return optax.softmax_cross_entropy_with_integer_labels(logits, ids[:, 1:]).mean()
-        value, gradient = jax.value_and_grad(loss)(variables["params"])
+        return jax.value_and_grad(scored)(variables["params"])
+
+    def stepped(model, variables, ids):
+        value, gradient = loss(model, variables, ids)
         updates, moments = adamw.update(gradient, adamw.init(variables["params"]), variables["params"])
         return {"loss": value, "gradient": gradient,
                 "params": optax.apply_updates(variables["params"], updates), "moments": moments}
@@ -672,7 +676,7 @@ def test_a_training_step_scans_a_periodic_stack_as_one_body_and_trains_as_the_lo
     def program(model):
         held = model.init(jax.random.key(0), ids)
         return sorted(str(equation.primitive) for equation in equations(jax.make_jaxpr(
-            lambda variables: stepped(model, variables, ids))(held)))
+            lambda variables: loss(model, variables, ids))(held)))
 
     scanned_program = program(qwen35(2, scan_layers=True))
     assert scanned_program == program(qwen35(6, scan_layers=True))
