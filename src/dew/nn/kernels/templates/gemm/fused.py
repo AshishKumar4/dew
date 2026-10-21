@@ -82,11 +82,11 @@ def _axes(consumer, values, acc) -> tuple | None:
     axes = []
     specs = jax.tree.leaves(value_specs, is_leaf=_is_spec)
     for leaf, leaf_spec in zip(jax.tree.leaves(values), specs, strict=True):
-        if not _is_block(leaf_spec):
+        block_shape, index_map = _block_and_map(leaf_spec)
+        if block_shape is None or index_map is None:
             return None
         named = []
-        indices = leaf_spec.index_map(1, 2)
-        for block, index, size in zip(leaf_spec.block_shape, indices, leaf.shape, strict=True):
+        for block, index, size in zip(block_shape, index_map(1, 2), leaf.shape, strict=True):
             if index not in (1, 2) or block != probe[index - 1] or size != acc.shape[index - 1]:
                 return None
             named.append(AXES[index - 1])
@@ -104,12 +104,16 @@ def _specs(consumer, values, acc, block: tuple):
 
 def _is_tile(spec, probe: tuple) -> bool:
     """Whether `spec` is the probe tile at its own place: a block of `probe` at (row, column)."""
-    return _is_block(spec) and tuple(spec.block_shape) == probe and tuple(spec.index_map(1, 2)) == (1, 2)
+    block_shape, index_map = _block_and_map(spec)
+    return block_shape is not None and index_map is not None and tuple(block_shape) == probe and tuple(
+        index_map(1, 2)) == (1, 2)
 
 
-def _is_block(spec) -> bool:
-    """Whether `spec` is a block spec with a block and an index map: a scalar's is not."""
-    return isinstance(spec, pl.BlockSpec) and spec.index_map is not None and spec.block_shape is not None
+def _block_and_map(spec):
+    """A block spec's block and index map; none for a spec that is not a block spec (a scalar's)."""
+    if not isinstance(spec, pl.BlockSpec):
+        return None, None
+    return spec.block_shape, spec.index_map
 
 
 def _probe(size: int) -> int:
