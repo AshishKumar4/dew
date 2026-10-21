@@ -27,6 +27,7 @@ from typing_extensions import TypeVar
 from dew.nn.blocks import table_rows
 from dew.nn.dit import TextContext
 from dew.nn.flops import counted_flops
+from dew.nn.protocols import Counted
 from dew.nn.text_encoders import (
     DEFAULT_MODEL,
     DEFAULT_T5_MODEL,
@@ -74,6 +75,15 @@ class ConditionWork:
     features: int
     pooled_features: int | None = None
     time_ids: int | None = None
+
+    @classmethod
+    def of_tokens(cls, tower: Counted, tokens: Mapping[str, np.ndarray], features: int) -> Self:
+        """The work of a `tower` that reads each row's unmasked `tokens` and hands its denoiser the
+        whole fixed-length sequence, `features` wide: its FLOPs over the real tokens, their lengths,
+        and spans of the token budget."""
+        lengths = np.sum(np.asarray(tokens["attention_mask"]) != 0, axis=-1, dtype=np.int64)
+        spans = np.full(lengths.shape, np.shape(tokens["input_ids"])[1], np.int64)
+        return cls(counted_flops(tower, lengths), lengths, spans, features)
 
 
 class ConditionEncoder(ABC, Generic[Raw, Encoded]):
@@ -225,10 +235,7 @@ class _TextTower(ConditionEncoder[str, TextContext]):
                 "attention_mask": np.asarray(tokens["attention_mask"], np.int32)}
 
     def conditioning_flops(self, tokens) -> ConditionWork:
-        lengths = np.sum(np.asarray(tokens["attention_mask"]) != 0, axis=-1, dtype=np.int64)
-        spans = np.full(lengths.shape, np.shape(tokens["input_ids"])[1], np.int64)
-        return ConditionWork(counted_flops(self.transformer, lengths), lengths, spans,
-                             self.transformer.emb_features)
+        return ConditionWork.of_tokens(self.transformer, tokens, self.transformer.emb_features)
 
     def encode(self, params, tokens) -> TextContext:
         mask = jnp.asarray(tokens["attention_mask"])
