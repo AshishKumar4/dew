@@ -160,23 +160,7 @@ class _ProcessEnvironment:
         nothing left is unregistered, so the selector itself reports when
         the worker can no longer answer.
         """
-        descriptor = event.fd
-        if event.data == "stdin":
-            try:
-                sent += os.write(descriptor, request[sent:])
-            except BrokenPipeError:
-                ready.unregister(self.stdin)
-            else:
-                if sent == len(request):
-                    ready.unregister(self.stdin)
-            return sent
-        chunk = os.read(descriptor, 65536)
-        if not chunk:
-            ready.unregister(event.fileobj)
-        elif event.data == "stdout":
-            self.output.extend(chunk)
-        else:
-            diagnostic.extend(chunk)
+        sent, _ = _pumped(ready, event, request, sent, self.output, diagnostic)
         if len(self.output) + len(diagnostic) > self.limits.message_bytes:
             raise ValueError("sandbox response exceeds message_bytes")
         return sent
@@ -349,6 +333,31 @@ def _written(program: Program, directory: str) -> None:
         path.write_text(text)
 
 
+def _pumped(ready: selectors.BaseSelector, key: selectors.SelectorKey, request: bytes, sent: int,
+            stdout: bytearray, stderr: bytearray) -> tuple[int, bool]:
+    """One ready stream's turn of a bounded byte-stream pump over a process's three pipes, each
+    registered under its name: the rest of `request` written to stdin, which is unregistered once
+    all of it is written or its reader is gone (True, so a caller may close it), or a chunk of
+    stdout read into `stdout` or of stderr into `stderr`, a stream unregistered at its end. Returns
+    how much of `request` is written, and whether stdin finished on this turn."""
+    if key.data == "stdin":
+        try:
+            sent += os.write(key.fd, request[sent:])
+        except BrokenPipeError:
+            ready.unregister(key.fileobj)
+            return sent, True
+        if sent == len(request):
+            ready.unregister(key.fileobj)
+            return sent, True
+        return sent, False
+    chunk = os.read(key.fd, 65536)
+    if not chunk:
+        ready.unregister(key.fileobj)
+    else:
+        (stdout if key.data == "stdout" else stderr).extend(chunk)
+    return sent, False
+
+
 @dataclass
 class _Streams:
     stdout: bytearray = field(default_factory=bytearray)
@@ -372,27 +381,16 @@ def _collected(process: subprocess.Popen[bytes], stdin: bytes, deadline: float,
             ready.register(process.stdin, selectors.EVENT_WRITE, "stdin")
         else:
             process.stdin.close()
-        ready.register(process.stdout, selectors.EVENT_READ, streams.stdout)
-        ready.register(process.stderr, selectors.EVENT_READ, streams.stderr)
+        ready.register(process.stdout, selectors.EVENT_READ, "stdout")
+        ready.register(process.stderr, selectors.EVENT_READ, "stderr")
         while ready.get_map():
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 return streams, Verdict.TIMEOUT
             for key, _ in ready.select(remaining):
-                if key.data == "stdin":
-                    try:
-                        sent += os.write(key.fd, stdin[sent:])
-                    except BrokenPipeError:
-                        sent = len(stdin)
-                    if sent == len(stdin):
-                        ready.unregister(key.fileobj)
-                        process.stdin.close()
-                    continue
-                chunk = os.read(key.fd, 65536)
-                if not chunk:
-                    ready.unregister(key.fileobj)
-                    continue
-                key.data.extend(chunk)
+                sent, finished = _pumped(ready, key, stdin, sent, streams.stdout, streams.stderr)
+                if finished:
+                    process.stdin.close()
                 if len(streams.stdout) + len(streams.stderr) > limit:
                     return streams, Verdict.OUTPUT_LIMIT
     try:
