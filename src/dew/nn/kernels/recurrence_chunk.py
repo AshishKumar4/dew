@@ -417,9 +417,9 @@ def _blocked_rule(query, key, value, g, beta, state, starts, *, documents: int |
                   scale: float | None = None, wide: bool = False):
     """The port's rule on one shard, shaped to its kernels' blocks: values
     wider than the port's widest split into more value heads of their key
-    head; value heads padded to a power of two per key head, which dqkwg's
-    block holds, with heads that neither write nor read (zero value, beta
-    and decay); keys and values padded with zero columns to 64, 128 or 256,
+    head, each key head's value heads as many as it serves (dqkwg's block
+    holds them, loaded a head at a time, so no count need be a power of
+    two); keys and values padded with zero columns to 64, 128 or 256,
     widths every block of the kernels' configs divides, a decay per key
     dimension with them. None of them changes a real output or gradient:
     every padded product is an exact zero. The outputs are cut back. Where
@@ -428,7 +428,7 @@ def _blocked_rule(query, key, value, g, beta, state, starts, *, documents: int |
     the port: per head fla's gated delta rule, per key dimension its Kimi
     delta attention. It keeps its memory for the backward
     but where the block's remat rung recomputes it (`RECOMPUTED`)."""
-    B, S, Hk, Dk = key.shape
+    B, S, _, Dk = key.shape
     Hv, Dv = value.shape[2:]
     scale = Dk ** -0.5 if scale is None else scale
     split = -(-Dv // fla_gdn.WIDEST)
@@ -438,14 +438,6 @@ def _blocked_rule(query, key, value, g, beta, state, starts, *, documents: int |
         g, beta = (jnp.repeat(x, split, axis=2) for x in (g, beta))
         state = jnp.moveaxis(_padded(state, 3, split * width).reshape(B, Hv, Dk, split, width), 3, 2)
         state = state.reshape(B, Hv * split, Dk, width)
-    served = value.shape[2] // Hk
-    group = 1 << (served - 1).bit_length()
-
-    def grouped(x, axis):
-        x = _padded(x.reshape(*x.shape[:axis], Hk, served, *x.shape[axis + 1:]), axis + 1, group)
-        return x.reshape(*x.shape[:axis], Hk * group, *x.shape[axis + 2:])
-
-    value, g, beta, state = grouped(value, 2), grouped(g, 2), grouped(beta, 2), grouped(state, 1)
     blocks = (max(64, 1 << (Dk - 1).bit_length()), max(64, 1 << (value.shape[3] - 1).bit_length()))
     query, key = (_padded(x, 3, blocks[0]) for x in (query, key))
     per_key = g.ndim == 4
@@ -457,9 +449,8 @@ def _blocked_rule(query, key, value, g, beta, state, starts, *, documents: int |
     port = fla_kda.chunk_kda if per_key else fla_gdn.chunk_gated_delta_rule
     out, final = port(query, key, value, g, beta, state, spans, scale, CHUNK_SIZE,
                       not generation.triton_runs(), "delta_memory" not in RECOMPUTED.get(), wide)
-    out = out[..., :width].reshape(B, S, Hk, group, width)[:, :, :, :served]
-    out = out.reshape(B, S, Hv, split * width)[..., :Dv]
-    final = final[:, :, :Dk, :width].reshape(B, Hk, group, Dk, width)[:, :, :served]
+    out = out[..., :width].reshape(B, S, Hv, split * width)[..., :Dv]
+    final = final[:, :, :Dk, :width]
     final = jnp.moveaxis(final.reshape(B, Hv, split, Dk, width), 2, 3).reshape(B, Hv, Dk, split * width)
     return out, final[..., :Dv]
 
