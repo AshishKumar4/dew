@@ -290,3 +290,52 @@ def test_a_replayed_microbatch_draws_as_its_input_first_drew():
     for rows, values in drawn.items():
         for value in values[1:]:
             np.testing.assert_array_equal(value, values[0], err_msg=str(rows))
+
+
+def test_a_distilled_inpainting_step_reads_no_draw_of_its_attempt():
+    """Guidance distillation over a stochastic autoencoder and a masked image: the student's and the
+    teacher's masked-image posteriors, the times, noise, scales and dropped conditions are each
+    example's own draws, so two attempts at the same examples, under other attempt keys, take the same
+    loss to the bit. A teacher that drew its masked image from the attempt's key would read another."""
+    from dataclasses import dataclass
+
+    from diffusion_stubs import StubText
+    from flax import linen as nn
+    from test_autoencoder import tiny_vae
+
+    from dew.diffusion.process import DenoisingCondition
+    from dew.objectives.diffusion import GuidanceDistillationObjective
+
+    @dataclass(frozen=True, eq=False)
+    class GuidedText(StubText):
+        def encode(self, params, tokens):
+            return DenoisingCondition(params["table"][jnp.asarray(tokens["input_ids"])])
+
+    class GuidedInpainting(nn.Module):
+        @nn.compact
+        def __call__(self, x, temb, textcontext, mask=None, masked_image=None, train=False):
+            gain = self.param("gain", nn.initializers.constant(0.25), ())
+            text = jnp.mean(textcontext.context, axis=(1, 2))[:, None, None, None]
+            guidance = 0.0 if textcontext.guidance is None else textcontext.guidance[:, None, None, None]
+            return (gain * x + 0.3 * masked_image * (1 - mask) + 0.1 * text + 0.01 * guidance
+                    + (temb / 1000)[:, None, None, None] * 0.1)
+
+    text = {"textcontext": Condition(GuidedText.from_pretrained("stub"))}
+    inputs = InputSpec(Field("image", (8, 8, 3)), text, mask=Field("mask", (8, 8, 1)))
+    objective = GuidanceDistillationObjective(GuidedInpainting(), presets.Flow()(), inputs,
+                                              autoencoder=tiny_vae(), scales=(1.0, 6.0), ema_decay=None,
+                                              unconditional_prob=0.5)
+    params = objective.init(jax.random.PRNGKey(0))
+    rows = 4
+    mask = np.zeros((rows, 8, 8, 1), np.float32)
+    mask[:, :, 4:] = 1
+    pixels = np.asarray(jax.random.randint(jax.random.PRNGKey(1), (rows, 8, 8, 3), 0, 256), np.uint8)
+    batch = {"image": pixels, "mask": mask, **objective.inputs.tokenize(["a", "bb", "", "ccc"])}
+
+    def loss(attempt: int):
+        step = Step(jnp.asarray(0), jax.random.key(attempt), None, example_key=UPDATE,
+                    example_index=jnp.arange(rows, dtype=jnp.int32), example_count=rows)
+        stats, _ = objective.loss(params, batch, step)
+        return np.asarray(stats.total)
+
+    np.testing.assert_array_equal(loss(1), loss(2))
