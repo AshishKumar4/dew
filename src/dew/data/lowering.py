@@ -159,15 +159,17 @@ def _corpora(pipeline: Pipeline) -> tuple[Pipeline, ...]:
 def _carried(pipeline: Pipeline, consumed: int, *, marked: bool) -> int:
     """Where a pooled read's loading workers hand its rows to the reading process (`_Build.pooled`):
     at its first stage from `consumed` that can't carry a dropped record as a marker. Record steps
-    and repeats carry them. A Grain step of the caller's over indexed rows does, where what it
-    drops reads as None (`_Marked`); over a stream, or where it makes one, the workers hand on
-    around it (`_Build.records`). A view of the inputs (a shuffle, slice or take) reads markers as
-    records, so it ends the workers' part once a step may have dropped (`marked`). Every other
-    stage lays out, mixes or batches several records into one and ends it."""
+    and repeats carry them. A Grain step of the caller's reads no marker, so it runs in the workers
+    only before any: over indexed rows, where what it drops reads as None (`_Marked`); over a
+    stream, or where it makes one, the workers hand on around it (`_Build.records`). A view of the
+    inputs (a shuffle, slice or take) reads markers as records, so it ends the workers' part once a
+    step may have dropped (`marked`). Every other stage lays out, mixes or batches several records
+    into one and ends it."""
     for at, stage in enumerate(pipeline.stages[consumed:], start=consumed):
         if isinstance(stage, (Map, RandomMap, MapWithIndex, Filter, FlatMap)):
             marked = marked or _drops(stage)
-        elif isinstance(stage, (Repeat, Native)):
+        elif isinstance(stage, Repeat) or (isinstance(stage, Native) and not marked):
+            # The caller's Grain step reads no marker: it runs in the workers before any.
             marked = marked or isinstance(stage, Native)
         elif not (isinstance(stage, (Shuffle, Slice, Limit, Repeat)) and not marked
                   and not (isinstance(stage, Shuffle) and stage.window is not None)):
@@ -1061,20 +1063,27 @@ class _Build:
                     Workers(count, self.loading.worker_buffer))
         return dataclasses.replace(self, loading=dataclasses.replace(self.loading, workers=count), pool=pool)
 
-    def own_pool(self, pipeline: Pipeline) -> Workers | None:
-        """The workers this corpus reads in: those it writes, or its share of the read's."""
+    def owning(self, pipeline: Pipeline) -> _Build:
+        """This build reading `pipeline` in the workers it writes, a corpus or a mixture whose
+        corpora share them, or else in its share of the read's (`pool`)."""
         written = next((stage for stage in pipeline.stages if isinstance(stage, Workers)), None)
-        return written if self.pool is not None and written is not None else self.pool
+        if self.pool is None or written is None:
+            return self
+        loading = dataclasses.replace(self.loading, workers=written.count)
+        return dataclasses.replace(self, pool=written, loading=loading)
 
-    def pools(self, pipeline: Pipeline) -> list[int]:
-        """The loading workers each corpus reads in, as `pooled` shares them out, which a position
-        saved under one sharing restores only under the same."""
+    def pools(self, pipeline: Pipeline) -> dict[str, int]:
+        """The loading workers each corpus reads in, as `pooled` shares them out, by the corpus's
+        place among the mixtures above it, which a position saved under one sharing restores only
+        under the same, a corpus a mixture keeps across an edit included."""
+        build = self.owning(pipeline)
         source = pipeline.source
-        pool = self.own_pool(pipeline)
-        if pool is None or not isinstance(source, (Mixture, Phases)):
-            return [] if pool is None else [pool.count]
-        return [count for index, child in enumerate(source.pipelines)
-                for count in self.child(index).pools(child)]
+        if build.pool is None:
+            return {}
+        if not isinstance(source, (Mixture, Phases)):
+            return {"/".join(str(key) for key in build.corpus): build.pool.count}
+        return {key: count for index, child in enumerate(source.pipelines)
+                for key, count in build.child(index).pools(child).items()}
 
     def stage_seed(self, pipeline: Pipeline, at: int, partition: DataPartition) -> int:
         """The seed of the random stage written at `at` in `pipeline`: the run's seed, the corpus's
@@ -1243,14 +1252,17 @@ class _Build:
         last = max(placed, default=-1)
         # This corpus's own workers, where they read its first steps (`pooled`): those steps keep
         # each record they drop as a marker, which the reading process drops after them.
-        pool = self.own_pool(pipeline)
+        pool = self.owning(pipeline).pool
         pooled = pool is not None and pool.count > 0 and not isinstance(source, (Mixture, Phases))
+        # A Grain step of the caller's reads its rows as Grain gives them, without a marker.
+        native = next((isinstance(stage, Native) for stage in pipeline.stages
+                       if not isinstance(stage, (Shuffle, Slice, Limit, Repeat))), False)
         if isinstance(source, (Mixture, Phases)):
-            rows, consumed = self.mixed(pipeline, partition), 0
+            rows, consumed = self.owning(pipeline).mixed(pipeline, partition), 0
         elif self.read == "streamed":
             rows, consumed = self.sharded(pipeline, source, partition, last, marked=pooled)
         else:
-            rows, consumed = self.indexed(pipeline, source, partition, last, marked=pooled)
+            rows, consumed = self.indexed(pipeline, source, partition, last, marked=pooled and not native)
         # A cache read as a stream of each input's outputs marks what it drops from the start, as do
         # the steps a streamed read runs inside each shard.
         marked = self.lowering.cache is not None and (self.read == "streamed" or not self.lowering.one_to_one)
