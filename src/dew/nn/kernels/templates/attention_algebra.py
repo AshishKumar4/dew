@@ -411,6 +411,22 @@ class DqSums(NamedTuple):
     weighed: tuple[jax.Array, ...]
 
 
+def dq_operand(cotangents: jax.Array, over_prior: jax.Array, scale: float, dtype) -> jax.Array:
+    """A tile's dQ operand, the left of its product with the keys: its score cotangents over the prior
+    denominator in fp32, then narrowed to `dtype`. fp16 takes the softmax's scale too before it narrows,
+    its range being fp16's own; bf16 and fp32, whose range is fp32's, leave it to `dq_finish`
+    (`dq_scale`), so no compiler folds a small scale into a small denominator."""
+    normalized = cotangents * over_prior[:, None]
+    if jnp.dtype(dtype) == jnp.float16:
+        normalized = normalized * scale
+    return normalized.astype(dtype)
+
+
+def dq_scale(scale: float, dtype) -> float:
+    """The softmax's scale `dq_finish` applies: what `dq_operand` left for it."""
+    return 1.0 if jnp.dtype(dtype) == jnp.float16 else scale
+
+
 def dq_finish(sums: DqSums, prior: jax.Array, state_total: jax.Array, peak0: jax.Array,
               shares: tuple[jax.Array, jax.Array], peak: jax.Array, anchor: jax.Array, delta: jax.Array,
               softmax_scale: float):

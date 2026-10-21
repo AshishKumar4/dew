@@ -231,16 +231,17 @@ def test_merging_partials_of_no_keys_is_the_identity_whatever_the_form(form):
         np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs))
 
 
-def test_an_fp16_backward_keeps_a_gradient_whose_scores_are_large_but_cancel():
-    """fp16 values of ±1000 over 128 equally scored keys, under an output cotangent of 1000: each score
-    cotangent is ±1953 normalized (±250000 unnormalized, past fp16's range), and D is 0, so dQ is 0 in
-    both mainloops, finite."""
-    spans = template.spans(128, 128, 1)
-    query = jnp.zeros((1, 128, 1, 16), jnp.float16)
-    key = jnp.zeros((1, 128, 1, 16), jnp.float16)
-    value = jnp.zeros((1, 128, 1, 16), jnp.float16).at[0, :, 0, 0].set(
-        jnp.where(jnp.arange(128) % 2 == 0, 1000.0, -1000.0).astype(jnp.float16))
-    dout = jnp.zeros((1, 128, 1, 16), jnp.float16).at[..., 0].set(1000.0)
+@pytest.mark.parametrize("keys", [8, 128])
+def test_an_fp16_backward_keeps_a_gradient_whose_scores_are_large_but_cancel(keys):
+    """fp16 values of ±1000 over 8 or 128 equally scored keys, under an output cotangent of 1000: each
+    score cotangent, ±1000000 unnormalized, is ±125000 normalized over 8 keys (past fp16's range) and
+    ±31250 scaled too, and D is 0, so dQ is 0 in both mainloops, finite."""
+    spans = template.spans(keys, keys, 1)
+    query = jnp.zeros((1, keys, 1, 16), jnp.float16)
+    key = jnp.zeros((1, keys, 1, 16), jnp.float16)
+    value = jnp.zeros((1, keys, 1, 16), jnp.float16).at[0, :, 0, 0].set(
+        jnp.where(jnp.arange(keys) % 2 == 0, 1000.0, -1000.0).astype(jnp.float16))
+    dout = jnp.zeros((1, keys, 1, 16), jnp.float16).at[..., 0].set(1000.0)
     with tuning.pinned({attention_triton.TritonBackward: attention_triton.BackwardTiles(32, 32, 4, 2, 4, 2),
                         attention_triton.TritonForward: attention_triton.Tiles(32, 32, 4, 2)}):
         triton = attention_triton.backward(query, key, value, spans, None, dout, interpret=True)
