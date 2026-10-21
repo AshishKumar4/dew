@@ -245,10 +245,7 @@ def _cached(tmp_path):
 
 
 def _phased():
-    def windows(start):
-        return _documents(start).pipe(presets.lm, "byte", seq_len=8, batch=None, pack=None)
-
-    return phases((windows(0), 2), (windows(8), None)).shuffle(0).repeat().batch(2)
+    return phases((_documents(0).map(Tagged(1)), 2), (_documents(8).map(Tagged(2)), None)).shuffle(0).repeat().batch(2)
 
 
 ROUND_TRIPS = {
