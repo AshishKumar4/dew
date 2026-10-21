@@ -25,7 +25,14 @@ import ml_dtypes
 import numpy as np
 import optax
 import pytest
-from reference_error import assert_as_exact
+import reference_error as _gate
+
+
+def assert_as_exact(dew_fn, reference_fn, draw, label, *, seeds, truth_fn=None):
+    count = _gate.seeds_for(reference_fn, draw, label, truth_fn=truth_fn)
+    print(f"SIZED {label!r} {count}", flush=True)
+    _gate.assert_as_exact(dew_fn, reference_fn, draw, label, seeds=count, truth_fn=truth_fn)
+    print(f"PASSED {label!r}", flush=True)
 from residual_orders import order
 from sharded import collectives
 
