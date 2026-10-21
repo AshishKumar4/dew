@@ -848,7 +848,8 @@ class TrainerConfig:
             raise ValueError(
                 "epochs need a dataset with a record count; this one streams without "
                 "one, so give the run length as --trainer.steps")
-        return dataset.epoch_steps(self.epochs)
+        # A ramp's stages begin where updates do (`Ramp.stages`), as the trainer's stream cuts them.
+        return dataset.epoch_steps(self.epochs, self.accumulation)
 
     def eval_interval(self, dataset: Loader) -> int | None:
         """Return the steps between validation passes over `data`, or None for never."""
@@ -863,15 +864,14 @@ class TrainerConfig:
             return value
         return self._interval(self.checkpoint_every, dataset, "checkpoint-every")
 
-    @staticmethod
-    def _interval(value, dataset: Loader, field_name: str) -> int | None:
+    def _interval(self, value, dataset: Loader, field_name: str) -> int | None:
         if value is None or isinstance(value, int):
             return value
         if dataset.steps_per_epoch is None:
             raise ValueError(
                 f"--trainer.{field_name} epoch needs a dataset with a record count; this "
                 f"one streams without one, so give the interval in steps or None")
-        return dataset.epoch_steps()
+        return dataset.epoch_steps(window=self.accumulation)
 
 
 def _local_tracker(directory: str, name: str):

@@ -25,6 +25,8 @@ from dew.interop.diffusion_gemma import translate_weights
 from dew.nn.inputs import ModelInputs
 from dew.objectives.base import FROZEN, Step, freeze, select
 from dew.objectives.diffusion.block import BlockDiffusionObjective
+from dew.training import MeshSpec
+from dew.training.transaction import example_fields
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures/hf/diffusion-gemma-sft"
 REFERENCES = FIXTURE / "reference"
@@ -32,12 +34,24 @@ REFERENCES = FIXTURE / "reference"
 
 @pytest.fixture(scope="module")
 def source():
+    return loaded_source()
+
+
+def loaded_source():
+    """The SFT fixture's model, batch, the reference's own draws on a step, and its recorded values."""
     loaded = Pretrained.load(FIXTURE, dtype="float32", attention_impl="xla", max_seq_len=32)
     with np.load(FIXTURE / "reference.npz") as arrays:
         reference = {name: arrays[name] for name in arrays.files}
     batch = {"text": reference["tokens"], "canvas_mask": reference["canvas_mask"],
              "encoder_target_mask": reference["encoder_target_mask"]}
-    step = Step(step=jnp.asarray(0, jnp.int32), key=jax.random.wrap_key_data(reference["step_key"]), ema=None)
+    # The step reads the reference's own draws by name (`Step.tape`): each row's corrupted canvas, the
+    # canvas it scores and whether it conditions on its first pass, which row zero does and row one not.
+    rows, length = reference["noisy"].shape[:2]
+    selected = reference["selected_mask"][..., 0].reshape(rows, 2, length // 2).any(-1).argmax(-1)
+    tape = {"noised input": jnp.asarray(reference["noisy"][..., 0]), "canvas": jnp.asarray(selected),
+            "self conditioning": jnp.asarray([True, False])}
+    step = Step(step=jnp.asarray(0, jnp.int32), key=jax.random.wrap_key_data(reference["step_key"]), ema=None,
+                tape=tape)
     return loaded, batch, step, reference
 
 
@@ -50,6 +64,51 @@ def objective(loaded, *, variables=None, **kwargs):
 def reference_variables(loaded, name):
     values = translate_weights(load_file(str(REFERENCES / name)), loaded.config)
     return objective(loaded, variables=values).init(jax.random.key(0))
+
+
+def trainer_update(obj, batch, run_key):
+    """The trainer's first SGD update (rate 0.001) of a variables tree's params on one device, and the
+    objective's own update under the step's draws (`example_fields`), compiled as one program. One
+    device holds the comparison to the trainer's composition of the update, which computes it to the
+    bit; its layouts are the parallelism matrix's."""
+    trainer = Trainer(obj, optax.sgd(0.001), key=run_key, split=1)
+    trainer.device_mesh = MeshSpec().build(jax.devices()[:1])
+    initial = trainer.initial_state()
+    step = Step(jnp.asarray(0, jnp.int32), jax.random.fold_in(initial.key, 0), None,
+                **example_fields(initial, 0, 1, batch))
+    run = trainer.compile(jax.tree.map(jnp.copy, initial), batch)
+
+    def stepped(values):
+        # The step consumes its state: it steps copies.
+        state = jax.tree.map(jnp.copy, initial).replace(variables=jax.tree.map(jnp.copy, values))
+        state, *_ = run(state, batch)
+        return jax.tree.map(np.asarray, state.variables["params"])
+
+    @jax.jit
+    def objective_update(values):
+        gradient = jax.grad(lambda trainable: obj.scalar_loss(
+            {**values, "params": trainable}, batch, step)[0])(values["params"])
+        return jax.tree.map(lambda value, grad: value - 0.001 * grad, values["params"], gradient)
+
+    return stepped, objective_update
+
+
+def assert_updates_as_the_objective(obj, batch, data, run_key, variables):
+    """The trainer's update is the objective's at the step's draws, to the bit (`trainer_update`), and
+    the run's own path, its loader, plan and marked rows, takes that update on one device."""
+    stepped, objective_update = trainer_update(obj, batch, run_key)
+    expected = objective_update(variables)
+    assert_tree_equal(stepped(variables), expected)
+    solo = Trainer(obj, optax.sgd(0.001), key=run_key)
+    solo.device_mesh = MeshSpec().build(jax.devices()[:1])
+    assert_tree_equal(solo.fit(data, steps=1, log_every=1).variables["params"], expected)
+
+
+def assert_tree_equal(actual, expected):
+    assert jax.tree.structure(actual) == jax.tree.structure(expected)
+    for (path, left), right in zip(jax.tree_util.tree_leaves_with_path(actual), jax.tree.leaves(expected),
+                                   strict=True):
+        np.testing.assert_array_equal(left, np.asarray(right), err_msg=jax.tree_util.keystr(path))
 
 
 def assert_tree_close(actual, expected, tolerance):
@@ -102,6 +161,9 @@ def test_disabling_encoder_gradient_matches_the_reference_control(source):
 def test_both_self_conditioning_branches_match_the_official_adapter(source, probability, reference_key):
     loaded, batch, step, reference = source
     obj = objective(loaded, self_cond_prob=probability)
+    # Every row's self-conditioning is the probability's, not the reference's mixed draw.
+    tape = {name: value for name, value in step.tape.items() if name != "self conditioning"}
+    step = step.replace(tape=tape)
     loss, _ = obj.scalar_loss(jax.tree.map(jnp.asarray, obj.init(jax.random.key(0))), batch, step)
     np.testing.assert_allclose(loss, reference[reference_key], atol=1e-5, rtol=0)
 
@@ -135,6 +197,8 @@ def test_scoring_reports_the_denoiser_cross_entropy_of_every_canvas_target(sourc
 
 def test_sparse_canvas_targets_train_and_score_their_physical_canvas(source):
     loaded, _, step, _ = source
+    # Another batch than the reference's: the step draws its own, not the reference's tape.
+    step = step.replace(tape=None)
     obj = objective(loaded, canvas_size=2, encoder_loss_weight=0)
     variables = jax.tree.map(jnp.asarray, obj.init(jax.random.key(0)))
     tokens = jnp.tile(jnp.arange(1, 9, dtype=jnp.int32), (4, 1))
@@ -154,6 +218,8 @@ def test_sparse_canvas_targets_train_and_score_their_physical_canvas(source):
 
 def test_canvas_sampling_is_uniform_over_noncontiguous_partial_canvases(source):
     loaded, _, step, _ = source
+    # Another batch than the reference's: the step draws its own, not the reference's tape.
+    step = step.replace(tape=None)
     obj = BlockDiffusionObjective(loaded.model, prompt_length=4, num_canvases=4,
                                   canvas_size=2, variables=loaded.variables)
     variables = jax.tree.map(jnp.asarray, obj.init(jax.random.key(0)))
@@ -194,18 +260,19 @@ def dataset(batch):
 
 
 def test_real_trainer_update_and_checkpoint_resume(source, tmp_path):
-    loaded, original_batch, step, reference = source
+    loaded, original_batch, _, reference = source
     rows = math.lcm(2, jax.device_count())
     batch = jax.tree.map(lambda value: np.concatenate([value] * (rows // 2), axis=0), original_batch)
     obj = objective(loaded)
     run_key = jax.random.key(int(reference["run_seed"]))
     data = dataset(batch)
     variables = jax.tree.map(jnp.asarray, obj.init(jax.random.key(0)))
-    gradient = jax.grad(lambda values: obj.scalar_loss(values, batch, step)[0])(variables)
-    expected = jax.tree.map(lambda value, grad: value - 0.001 * grad, variables, gradient)
+    # The objective's update is compiled as one program, as the trainer's is: XLA:CPU's compiled
+    # gradient of this model sits 1.0 to 5.2 times further from float64 than the same ops run one by
+    # one (measured per leaf, 2026-10-21), a gap of the compiler's and not of the trainer.
+    assert_updates_as_the_objective(obj, batch, data, run_key, variables)
     trainer = Trainer(obj, optax.sgd(0.001), key=run_key, checkpoints=Checkpoints(str(tmp_path / "run")))
     updated = trainer.fit(data, steps=1, checkpoint_every=1, log_every=1)
-    assert_tree_close(updated.variables, expected, 2e-6)
     # Google's dense text-only model: transformers' DiffusionGemmaForBlockDiffusion
     # builds experts and a vision tower, so no published implementation reads
     # this layout, and the export is refused rather than written.
@@ -223,6 +290,10 @@ def test_real_trainer_update_and_checkpoint_resume(source, tmp_path):
 
 @pytest.fixture(scope="module")
 def image_source():
+    return loaded_image_source()
+
+
+def loaded_image_source():
     """Native SFT behavior over the real loaded multimodal generation fixture."""
     directory = FIXTURE.parent / "diffusion-gemma-workflow"
     loaded = Pretrained.load(directory, dtype="float32", attention_impl="xla", max_seq_len=32)
@@ -323,16 +394,10 @@ def test_image_sft_trainer_resume_publish_and_generate(image_source, tmp_path):
     stream = grain.MapDataset.source([batch]).repeat().to_iter_dataset()
     data = Loader(train=lambda partition: iter(stream), val=None, records=rows, batch=rows)
     run_key = jax.random.key(2)
-    step = Step(step=jnp.asarray(0, jnp.int32),
-                key=jax.random.fold_in(jax.random.split(run_key)[1], 0), ema=None)
-    gradient = jax.jit(jax.grad(lambda trainable: obj.scalar_loss(
-        {**variables, "params": trainable}, batch, step)[0]))(variables["params"])
-    expected = {**variables, "params": jax.tree.map(
-        lambda value, grad: value - 0.001 * grad, variables["params"], gradient)}
+    assert_updates_as_the_objective(obj, batch, data, run_key, variables)
     checkpoints = Checkpoints(str(tmp_path / "run"))
     updated = Trainer(obj, optax.sgd(0.001), key=run_key, checkpoints=checkpoints).fit(
         data, steps=1, checkpoint_every=1, log_every=1)
-    assert_tree_close(updated.variables, expected, 2e-6)
     assert any(not np.array_equal(before, after) for before, after in zip(
         jax.tree.leaves(variables["params"]["conditioner"]),
         jax.tree.leaves(updated.variables["params"]["conditioner"]), strict=True))
@@ -348,14 +413,21 @@ def test_image_sft_trainer_resume_publish_and_generate(image_source, tmp_path):
     readback = Pretrained.load(tmp_path / "published", dtype="float32", attention_impl="xla", max_seq_len=32)
     restored = BlockDiffusionObjective(readback.model, prompt_length=8, variables=readback.variables)
     assert_tree_close(restored.init(jax.random.key(0)), resumed.variables, 0)
+    # The published task's loss under the run's draws for the unrepeated rows.
+    started = Trainer(obj, optax.sgd(0.001), key=run_key).initial_state()
+    step = Step(step=jnp.asarray(0, jnp.int32), key=jax.random.fold_in(started.key, 0), ema=None,
+                **example_fields(started, 0, 1, {"text": inputs}))
     original_loss = obj.scalar_loss(resumed.variables, {"text": inputs}, step)[0]
     restored_loss = restored.scalar_loss(restored.init(jax.random.key(0)), {"text": inputs}, step)[0]
     np.testing.assert_array_equal(restored_loss, original_loss)
     prompt = jax.tree.map(jnp.asarray, batch["text"]).slice_tokens(stop=8)
     key = jax.random.key(11)
     published_task = readback.block_generation()
-    generated = obj.pipeline(resumed, ema=False, processor=loaded.processor)(
-        prompt, 4, key=key, process=published_task.process)
+    # The run's task stops where the published one does: at the checkpoint's end-of-sequence ids, which
+    # the run's own settings do not carry yet (ledger 895).
+    run_task = replace(obj.pipeline(resumed, ema=False, processor=loaded.processor),
+                       eos_token_ids=published_task.eos_token_ids)
+    generated = run_task(prompt, 4, key=key, process=published_task.process)
     published = published_task(prompt, 4, key=key)
     np.testing.assert_array_equal(generated.tokens, published.tokens)
     np.testing.assert_array_equal(generated.decoder_steps, published.decoder_steps)

@@ -63,8 +63,8 @@ from typing import Protocol
 from dew.data.prompts import PromptRecord
 from dew.inference.rollouts import InfrastructureError
 from dew.objectives.rl.episodes import Action, Environment, EpisodeId, EpisodeStatus, Observation
-from dew.objectives.rl.records import messages, real
-from dew.records import JSON
+from dew.objectives.rl.records import messages
+from dew.records import JSON, finite
 
 
 @dataclass(frozen=True)
@@ -106,7 +106,7 @@ def _observation(value: object) -> Observation:
         state = EpisodeStatus[status.upper()]
     except KeyError:
         raise ValueError(f"unknown sandbox observation status {status!r}") from None
-    return Observation(tuple(context), state, detail, None if reward is None else real(reward, "reward"),
+    return Observation(tuple(context), state, detail, None if reward is None else finite(reward, "reward"),
                        messages(value.get("messages", []), "messages"))
 
 

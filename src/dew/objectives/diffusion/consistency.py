@@ -84,8 +84,12 @@ def consistency_loss(
         g = -cos t sqrt(1 - r^2 sin^2 t) (F_sg - F_teacher) - (r cos t sin t x + dF/dt)
 
     normalized by its norm plus 0.1, and the loss is ||F - F_sg - g||^2.
-    `student(x, t)` returns the student's F.
+    `student(x, t)` returns the student's F. The noised sample and its time, built from float32 draws,
+    are widened to the teacher's dtype, exactly, so a float64 twin takes its JVP in float64, its
+    tangents in the primals' dtypes as `jax.jvp` asks.
     """
+    wide = jnp.result_type(x, t, teacher_F)
+    x, t = x.astype(wide), t.astype(wide)
     cos, sin = expand(jnp.cos(t), x), expand(jnp.sin(t), x)
     with forward_mode_attention():
         _, derivative = jax.jvp(student, (x, t), (cos * sin * teacher_F, jnp.cos(t) * jnp.sin(t)))
@@ -329,19 +333,24 @@ class ConsistencyDistillationObjective(FlowDistillationObjective):
         return jnp.arctan(rf / (1 - rf))
 
     def _draws(self, step: Step, count: int, shape) -> _Draws:
-        """Every random value the step at `step` reads, from its key."""
-        keys = jax.random.split(step.key, 7)
+        """Every random value the step at `step` reads, each row's its example's own (`Step.sample`)."""
         simulated = self.max_simulation_steps - 1
+        row = shape[1:]
+
+        def normal(name, *dims):
+            return step.sample(name, jax.random.normal, dims, dtype=jnp.float32, rows=count)
+
         return _Draws(
-            consistency_time=(jax.random.uniform(keys[0], (count,))
-                              if self.consistency == "discrete"
-                              else jax.random.normal(keys[0], (count,))),
-            consistency_noise=jax.random.normal(keys[1], shape),
-            start=jax.random.normal(keys[2], shape),
-            simulation_times=jax.random.normal(keys[3], (simulated, count)),
-            simulation_noises=jax.random.normal(keys[4], (simulated, *shape)),
-            critic_time=jax.random.normal(keys[5], (count,)),
-            critic_noise=jax.random.normal(keys[6], shape))
+            consistency_time=(step.sample("consistency time", jax.random.uniform, (), dtype=jnp.float32,
+                                          rows=count)
+                              if self.consistency == "discrete" else normal("consistency time")),
+            consistency_noise=normal("consistency noise", *row),
+            start=normal("start", *row),
+            # Each example's simulation draws, laid out step first as the walk reads them.
+            simulation_times=normal("simulation times", simulated).T,
+            simulation_noises=jnp.moveaxis(normal("simulation noises", simulated, *row), 0, 1),
+            critic_time=normal("critic time"),
+            critic_noise=normal("critic noise", *row))
 
     def _generated(self, student_params, given, draws: _Draws, iteration) -> jax.Array:
         """The student's DMD2 sample: `max_simulation_steps` noisings drawn,
@@ -357,9 +366,9 @@ class ConsistencyDistillationObjective(FlowDistillationObjective):
 
     def loss(self, variables, batch, step: Step):
         encode_key, drop_key = jax.random.split(jax.random.fold_in(step.key, 1))
-        samples = self.clean_samples(variables, batch, encode_key)
+        samples = self.clean_samples(variables, batch, encode_key, step)
         count = samples.shape[0]
-        given, blank = self._conditions(variables, batch, drop_key)
+        given, blank = self._conditions(variables, batch, drop_key, step)
         draws = self._draws(step, count, samples.shape)
         iteration = step.updates
         warm = iteration < self.tangent_warmup

@@ -110,14 +110,22 @@ class DiscreteProcess:
         SAMPLING_EPS keeps every weight at most 1 / SAMPLING_EPS.
         """
         # MDLM's `_sample_t`, kuleshov-group/mdlm@c112c52, diffusion.py:800-808.
-        stratified = (jax.random.uniform(key, (n,)) + jnp.arange(n, dtype=jnp.float32)) / n
+        return self.stratified(jax.random.uniform(key, (n,), jnp.float32), jnp.arange(n), n)
+
+    @staticmethod
+    def stratified(uniforms, strata, n: int) -> jax.Array:
+        """`sample_t` from a uniform for each row and its stratum of `n`."""
+        stratified = (uniforms + strata.astype(jnp.float32)) / n
         return (1 - SAMPLING_EPS) * stratified + SAMPLING_EPS
 
     def corrupt(self, key, tokens, t) -> tuple[jax.Array, jax.Array]:
         """Return `(masked tokens, is_masked)` at `t`, with one t per row."""
-        move_chance = 1 - self.schedule.alpha(t)
-        draws = jax.random.uniform(key, tokens.shape, out_sharding=explicit_spec(tokens))
-        is_masked = draws < move_chance[:, None]
+        draws = jax.random.uniform(key, tokens.shape, jnp.float32, out_sharding=explicit_spec(tokens))
+        return self.masked(draws, tokens, t)
+
+    def masked(self, draws, tokens, t) -> tuple[jax.Array, jax.Array]:
+        """`corrupt` from a uniform draw for each of the tokens: those under `1 - alpha(t)` masked."""
+        is_masked = draws < (1 - self.schedule.alpha(t))[:, None]
         return jnp.where(is_masked, self.mask_id, tokens), is_masked
 
     def weight(self, t) -> jax.Array:

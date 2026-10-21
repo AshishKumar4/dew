@@ -302,9 +302,9 @@ def test_each_records_guidance_reaches_the_model_and_survives_the_shared_seams(
             dict(pipeline_record["prompts"][1], guidance=6.0)]
     same = [dict(rows[0]), dict(rows[1], guidance=2.0)]
     tokens = encoder.tokenize(rows)
-    np.testing.assert_allclose(tokens["guidance"], [2.0, 6.0], atol=0)
+    np.testing.assert_array_equal(tokens["guidance"], [2.0, 6.0])
     given = encoder.encode(params, tokens)
-    np.testing.assert_allclose(np.asarray(given.guidance), [2.0, 6.0], atol=0)
+    np.testing.assert_array_equal(np.asarray(given.guidance), [2.0, 6.0])
     # A value that is not a finite number is refused rather than embedded.
     with pytest.raises(ValueError):
         encoder.tokenize([{"text": "a red cat", "guidance": float("inf")}])
