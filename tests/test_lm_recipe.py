@@ -14,7 +14,7 @@ from tool_support import load
 import dew
 from dew.config.data import loader
 from dew.data import Loading
-from dew.data.dataset import DataPhase, Loader
+from dew.data.dataset import Loader
 from dew.inference import TextGeneration
 from dew.objectives.lm import LMObjective, LMRunConfig
 from dew.sampling import Sampling
@@ -28,18 +28,18 @@ SEQ = 32
 @pytest.mark.parametrize("steps", [7_250, 725_000])
 def test_rigel_empty_phases_extend_the_preceding_mixture(steps):
     rigel = load("rigel", "recipes/lm")
-    assert rigel.phases({"stem": "data/stem", "other": "data/other"}, steps) == (
-        DataPhase("data/stem", round(515_000 * steps / rigel.STEPS)),
-        DataPhase({"data/stem": 11.5, "data/other": 4.9}),
+    assert rigel.schedule({"stem": "data/stem", "other": "data/other"}, steps) == (
+        ({"data/stem": 1.0}, round(515_000 * steps / rigel.STEPS)),
+        ({"data/stem": 11.5, "data/other": 4.9}, None),
     )
 
 
 def test_rigel_leading_empty_phases_take_the_first_available_mixture():
     rigel = load("rigel", "recipes/lm")
-    assert rigel.phases({"other": "data/other"}, 7_250) == (DataPhase("data/other"),)
-    assert rigel.phases({"stem": "data/stem"}, 7_250) == (DataPhase("data/stem"),)
+    assert rigel.schedule({"other": "data/other"}, 7_250) == (({"data/other": 1.0}, None),)
+    assert rigel.schedule({"stem": "data/stem"}, 7_250) == (({"data/stem": 1.0}, None),)
     with pytest.raises(ValueError):
-        rigel.phases({"unknown": "data/unknown"}, 7_250)
+        rigel.schedule({"unknown": "data/unknown"}, 7_250)
 
 
 # The committed byte-level BPE a run can train with offline.
