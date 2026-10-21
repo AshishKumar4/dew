@@ -63,9 +63,6 @@ def target_config(generation: str) -> str:
   registers_per_block_limit: 65536
 }}
 platform_name: "CUDA"
-dnn_version_info {{
-  major: 9
-}}
 device_description_str: "{target.device_kind}"
 """
 
