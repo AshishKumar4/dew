@@ -198,9 +198,9 @@ def test_a_forced_implementation_runs_or_says_why_it_cannot():
 
 @pytest.mark.parametrize("generation_name", ["sm80", "sm90"])
 def test_the_kernels_write_each_product_in_its_own_dtype(generation_name):
-    """A bf16 projection over an fp32 master, through the implementations each generation picks: the
-    platform choice returns the forward and the input gradient in bf16 and the kernel gradient in fp32,
-    as the launches write them, with no fp32 `[rows, width]` product for a conversion pass after."""
+    """A bf16 projection over an fp32 master, through the implementations each generation picks: its
+    launches write the forward and the input gradient in bf16 and the kernel gradient in fp32, with no
+    fp32 `[rows, width]` product for a conversion pass after."""
     x = jax.ShapeDtypeStruct((ROWS, DEPTH), jnp.bfloat16)
     w = jax.ShapeDtypeStruct((4, DEPTH, WIDTH), jnp.float32)
     sizes = jax.ShapeDtypeStruct((4,), jnp.int32)
@@ -210,12 +210,13 @@ def test_the_kernels_write_each_product_in_its_own_dtype(generation_name):
 
     with generation.assumed(generation_name):
         jaxpr = jax.make_jaxpr(jax.grad(loss, (0, 1)))(x, w, sizes)
-    # The platform choice (`jax.lax.platform_dependent`) is a cond; a kernel body's own conds return scalars.
-    returned = {(var.aval.shape, var.aval.dtype) for equation in equations(jaxpr)
-                if equation.primitive.name == "cond" for var in equation.outvars}
-    assert ((ROWS, WIDTH), jnp.dtype(jnp.float32)) not in returned
+    # Each launch's own outputs: Triton's are a pallas_call's, Mosaic GPU's a custom_vmap_call's
+    # (`plgpu.kernel` wraps its call in `custom_vmap`).
+    written = {(var.aval.shape, var.aval.dtype) for equation in equations(jaxpr)
+               if equation.primitive.name in ("pallas_call", "custom_vmap_call") for var in equation.outvars}
+    assert ((ROWS, WIDTH), jnp.dtype(jnp.float32)) not in written
     assert {((ROWS, WIDTH), jnp.dtype(jnp.bfloat16)), ((ROWS, DEPTH), jnp.dtype(jnp.bfloat16)),
-            ((4, DEPTH, WIDTH), jnp.dtype(jnp.float32))} <= returned
+            ((4, DEPTH, WIDTH), jnp.dtype(jnp.float32))} <= written
 
 
 def test_the_cost_model_charges_each_multiprocessor_its_programs_in_turn():
