@@ -14,7 +14,7 @@ from dew.data.pipeline import Dataset
 from dew.data.storage import Store, local
 
 from .base import Read, ShardManifest, _indexed_manifest, url_label
-from .files import Files
+from .files import Files, export_content
 from .index import ArrayIndex
 
 _SPLIT = "train"
@@ -209,8 +209,10 @@ class TokenFiles(Dataset):
 
     @cached_property
     def _fingerprint(self) -> Mapping[str, object]:
-        """Tokens and metadata, by the export's committed manifest: the document index is derived from
-        the tokens' EOS positions. The keys an export's fingerprint has always had (`_SPLIT`)."""
+        """Tokens and metadata, by the export's committed manifest and the files it names, each by its
+        content and place in the manifest, not the name its writer gave it (`export_content`), so two
+        exports of the same documents agree: the document index is derived from the tokens' EOS
+        positions. The keys an export's fingerprint has always had (`_SPLIT`)."""
         store, _ = Store(self.url, self.storage_options).resolve()
         # A local store is named by its content, so hosts that mounted it at different paths agree.
         place = {} if local(store) else {"url": self.url}
@@ -221,11 +223,11 @@ class TokenFiles(Dataset):
             "metadata": self.meta,
             "field": self.field,
             # An export of no rows has no shards to name.
-            "shards": Files(self.tokens.paths, format="array_record",
-                            storage_options=self.storage_options).fingerprint() if self.tokens.paths else [],
+            "shards": Files(self.url, storage_options=self.storage_options).fingerprint() if self.tokens.paths
+            else [],
             "index": None,
             "shard_rows": None,
-            "producer": self.committed,
+            "producer": export_content(self.committed),
         }
 
     def supports(self, read: Read) -> bool:
