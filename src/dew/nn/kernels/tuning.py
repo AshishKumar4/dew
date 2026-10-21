@@ -47,7 +47,6 @@ import concurrent.futures
 import contextlib
 import dataclasses
 import enum
-import functools
 import hashlib
 import importlib
 import json
@@ -64,7 +63,6 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import tokamax
-from jax.extend import core as jax_core
 from jax.extend.backend import get_default_device
 
 from dew import cache, coordination, records
@@ -241,7 +239,7 @@ def _launch_json(ba: tokamax.BoundArguments) -> dict[str, JSON]:
     by its presence (`_traced`)."""
     hooks = getattr(ba.op, "HOOKS", ())
     return {"op": encoded(_identity(ba.op)),
-            "arguments": {name: encoded(_traced(value) if name in hooks else value)
+            "arguments": {name: encoded(ba.op.traced(name, value) if name in hooks else value)
                           for name, value in ba.arguments.items()}}
 
 
@@ -350,9 +348,9 @@ class KernelOp(tokamax.Op):
     matching. A kernel whose inputs must hold more than random values to run
     (group sizes, indices) overrides `operands`. A template names in `HOOKS`
     its fields and arguments that hold the plain functions it traces in (a
-    score or epilogue hook, closures as often as not): its picks key on
-    what each computes (`_traced`), never on the function object, so every
-    launch's picks store and read back alike.
+    score or epilogue hook, closures as often as not), and keys its picks on
+    what each computes (`traced`, through `program`), never on the function
+    object, so every launch's picks store and read back alike.
     """
 
     ROWS: ClassVar[tuple[str, ...]] = ()
@@ -451,7 +449,14 @@ class KernelOp(tokamax.Op):
     def _get_autotuning_cache_key(self, ba: tokamax.BoundArguments) -> Mapping[str, object]:
         key = super()._get_autotuning_cache_key(ba)
         return type(key)({name: _bucketed(spec) if name in self.ROWS and spec is not None
-                          else _traced(spec) if name in self.HOOKS else spec for name, spec in key.items()})
+                          else self.traced(name, spec) if name in self.HOOKS else spec
+                          for name, spec in key.items()})
+
+    def traced(self, name: str, value: object) -> object:
+        """The hook field or argument `name`'s value as this op's picks key it: what each function in it
+        computes (`program`, at the arguments the template traces it at), the rest of it as it is. An op
+        naming `HOOKS` defines it."""
+        raise NotImplementedError(f"{type(self).__name__} names hooks {self.HOOKS} but no way to trace them")
 
     def operands(self, specs: list[jax.ShapeDtypeStruct], seed: int) -> list[jax.Array]:
         """Arrays at `specs` to time the launch on: normal floats, zero integers."""
@@ -460,84 +465,18 @@ class KernelOp(tokamax.Op):
                 else jnp.zeros(spec.shape, spec.dtype) for key, spec in zip(keys, specs, strict=True)]
 
 
-def _traced(value: object) -> object:
-    """`value` with every function in it, through dataclasses, tuples, lists and mappings, as the digest
-    of its computation (`_computation`), so a hook keys a pick by what it computes and by the rest of its
-    value (its axes, its dtypes), and a closure, which has no name to store, stores. None stays None."""
-    if dataclasses.is_dataclass(value) and not isinstance(value, type):
-        return dataclasses.replace(value, **{field.name: _traced(getattr(value, field.name))
-                                             for field in dataclasses.fields(value) if field.init})
-    if isinstance(value, (tuple, list)):
-        return type(value)(_traced(item) for item in value)
-    if isinstance(value, Mapping):
-        return {name: _traced(item) for name, item in value.items()}
-    if callable(value) and not isinstance(value, type):
-        return f"traced:{_computation(value)}"
-    return value
-
-
-def _computation(function: Callable) -> str:
-    """A digest of what `function` computes, the same in every process: its code, through nested code
-    objects, with the names and constants it reads, and what it closes over or is partial in, a number
-    or string by value, an array or an abstract value by its shape and dtype, a jaxpr (a fused
-    consumer's) or a pytree's structure by its printed form, a function by its own digest. Two closures
-    over equal values digest alike; other code or other captured values digest apart. A capture of
-    another kind enters by its type and, where it prints no memory address, its printed form: every
-    process must key a launch alike to take process 0's config, so no capture keys by its address, and
-    two hooks that differ only in such a capture share a pick, which costs speed and never results."""
-    digest = hashlib.sha256()
-    visited: set[int] = set()
-
-    def code(body: types.CodeType) -> None:
-        digest.update(body.co_code)
-        digest.update(repr(body.co_names).encode())
-        for constant in body.co_consts:
-            if isinstance(constant, types.CodeType):
-                code(constant)
-            else:
-                static(constant)
-
-    def static(item: object) -> None:
-        if id(item) in visited:
-            return
-        visited.add(id(item))
-        if isinstance(item, functools.partial):
-            static(item.func)
-            static(item.args)
-            static(sorted(item.keywords.items()))
-        elif isinstance(item, types.FunctionType):
-            digest.update(f"{item.__module__}:{item.__qualname__}".encode())
-            code(item.__code__)
-            static(item.__defaults__)
-            for cell in item.__closure__ or ():
-                static(cell.cell_contents)
-        elif isinstance(item, (jax_core.Jaxpr, jax_core.ClosedJaxpr, jax.tree_util.PyTreeDef)):
-            digest.update(str(item).encode())
-        elif hasattr(item, "shape") and hasattr(item, "dtype"):
-            # An array, a ShapeDtypeStruct or an abstract value: its shape and dtype.
-            digest.update(repr((tuple(item.shape), str(item.dtype))).encode())
-        elif isinstance(item, (tuple, list)):
-            for entry in item:
-                static(entry)
-        elif isinstance(item, (set, frozenset)):
-            # A set's order follows the process's string hashing; its entries' sorted forms do not.
-            digest.update(repr(sorted(repr(entry) for entry in item)).encode())
-        elif item is None or isinstance(item, (bool, int, float, complex, str, bytes)):
-            digest.update(repr(item).encode())
-        else:
-            printed = repr(item)
-            kind = f"{type(item).__module__}:{type(item).__qualname__}:{getattr(item, '__name__', '')}"
-            digest.update(f"{kind}:{'' if ' at 0x' in printed else printed}".encode())
-
-    static(function)
-    return digest.hexdigest()[:16]
+def program(function: Callable, *arguments: jax.ShapeDtypeStruct) -> str:
+    """What `function` computes, traced at `arguments`, as a key: a digest of its jaxpr's printed form
+    (its primitives, shapes, dtypes and literals, a closure's captured numbers among them), the same in
+    every process, so every process keys a launch alike and takes process 0's config (`_settle`)."""
+    return "traced:" + hashlib.sha256(str(jax.make_jaxpr(function)(*arguments)).encode()).hexdigest()[:16]
 
 
 def _identity(op: tokamax.Op) -> tokamax.Op:
     """`op` as its picks name it: without the config, the vjp and the device
-    check a call sets, its hook fields by their presence (`_traced`)."""
-    hooks = {name: _traced(getattr(op, name)) for name in getattr(op, "HOOKS", ())
-             if name in {field.name for field in dataclasses.fields(op)}}
+    check a call sets, its hook fields by what they compute (`KernelOp.traced`)."""
+    fields = {field.name for field in dataclasses.fields(op)}
+    hooks = {name: op.traced(name, getattr(op, name)) for name in getattr(op, "HOOKS", ()) if name in fields}
     return op.replace(config=None, vjp=None, bypass_device_check=False, **hooks)
 
 
@@ -791,9 +730,7 @@ def tune(lower: Callable[[], jax.stages.Lowered], *,
     (`seen`); process 0 takes its stored pick for each, with `measure`
     measuring and storing one for a launch without where it has its GPU to
     itself, and every process takes exactly process 0's configs (`_settle`).
-    Where that changes a config the lowering traced, it lowers again, and
-    settles the launches that lowering traces anew (a launch whose identity
-    another's config names), until none is new: a
+    Where that changes a config the lowering traced, it lowers again: a
     launch's description in the program, which tokamax reads its launches out
     of (`launches`), keeps it from the persistent cache, so reading them so
     took a lowering of its own, about 62 s of each cold plan candidate's
@@ -806,20 +743,10 @@ def tune(lower: Callable[[], jax.stages.Lowered], *,
     tuned = cache.KERNEL_TUNES.get_global()
     with seen() as found:
         lowered = lower()
-    distinct = pending = _distinct(found)
-    while pending:
-        _settle(pending, measure=measure)
-        if cache.KERNEL_TUNES.get_global() == tuned:
-            break
-        # A settled config can name a later launch (one launch takes another's tiles), so the program
-        # lowers again and settles each launch it traces anew; launches are finitely many, so it ends.
-        tuned = cache.KERNEL_TUNES.get_global()
-        with seen() as found:
-            lowered = lower()
-        known = {(_identity(ba.op), ba.autotuning_cache_key) for _, ba in distinct}
-        pending = [(op, ba) for op, ba in _distinct(found)
-                   if (_identity(ba.op), ba.autotuning_cache_key) not in known]
-        distinct = [*distinct, *pending]
+    distinct = _distinct(found)
+    _settle(distinct, measure=measure)
+    if cache.KERNEL_TUNES.get_global() != tuned:
+        lowered = lower()
     return lowered, dumps_launches([ba for _, ba in distinct])
 
 

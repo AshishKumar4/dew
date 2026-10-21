@@ -114,9 +114,13 @@ class _Hooks:
     axes: tuple[int, ...]
 
 
+TILE = jax.ShapeDtypeStruct((8, 16), jnp.float32)
+
+
 @dataclasses.dataclass(frozen=True)
 class _HookedKernel(tuning.KernelOp):
-    """A launch whose op holds a traced function, and whose argument `hooks` holds another."""
+    """A launch whose op holds a traced function, and whose argument `hooks` holds another, each traced
+    at its tile for its picks' key."""
 
     HOOKS = ("prologue", "hooks")
     name = "hooked"
@@ -132,20 +136,26 @@ class _HookedKernel(tuning.KernelOp):
     def _get_autotuning_configs(self, ba):
         return {1, 2}
 
+    def traced(self, name, value):
+        if value is None or isinstance(value, str):
+            return value
+        if name == "prologue":
+            return tuning.program(value, TILE)
+        return dataclasses.replace(value, epilogue=self.traced("prologue", value.epilogue))
+
 
 def test_a_hooked_launch_keys_by_what_its_hooks_compute_and_round_trips():
-    """A template's traced functions, closures among them, key its picks by what they compute: two
-    closures over equal values key alike and store and read back as the same launch; a closure over
-    another value, hooks whose other fields differ (axes), and a launch without the function key
-    apart."""
+    """A template's traced functions, closures among them, key its picks by what they compute (their
+    traced programs): two closures over equal values key alike and store and read back as the same
+    launch; a closure over another value, another computation of one layout (a sum against a product,
+    as two fused epilogues differ), hooks whose other fields differ (axes), and a launch without the
+    function key apart."""
     def closure(scale):
         return lambda tile: tile * scale
 
-    x = jax.ShapeDtypeStruct((8, 16), jnp.float32)
-
     def keyed(prologue, epilogue, axes):
         op = _HookedKernel(prologue=prologue)
-        return op.keyed(op.bind(x, _Hooks(epilogue, axes)))
+        return op.keyed(op.bind(TILE, _Hooks(epilogue, axes)))
 
     def key(launch):
         return tuning._identity(launch.op), launch.autotuning_cache_key
@@ -154,27 +164,9 @@ def test_a_hooked_launch_keys_by_what_its_hooks_compute_and_round_trips():
     assert key(first) == key(again_alike)
     [again] = tuning.loads_launches(tuning.dumps_launches([first]))
     assert (again.op, again.autotuning_cache_key) == key(first)
+    added = functools.partial(lambda combine, tile: combine(tile, tile), jnp.add)
+    multiplied = functools.partial(lambda combine, tile: combine(tile, tile), jnp.multiply)
+    assert key(keyed(closure(2.0), added, (0,))) != key(keyed(closure(2.0), multiplied, (0,)))
     for other in (keyed(closure(5.0), closure(3.0), (0,)), keyed(closure(2.0), closure(7.0), (0,)),
                   keyed(closure(2.0), closure(3.0), (1,)), keyed(None, closure(3.0), (0,))):
         assert key(other) != key(first)
-
-
-def _fused(jaxpr, tile):
-    """A fused consumer's stand-in: the generic code a fuser's epilogue runs, over the jaxpr it is
-    partial in."""
-    return tile
-
-
-def test_fused_consumers_of_one_layout_key_by_the_jaxprs_they_close_over():
-    """Two hooks of one code and layout that close over different jaxprs (a fused bias and a fused
-    scale, as the fuser's consumers do) key apart; the same jaxpr keys alike."""
-    def consumer(jaxpr):
-        return functools.partial(_fused, jaxpr)
-
-    accumulator = jax.ShapeDtypeStruct((8, 16), jnp.float32)
-    bias = jax.make_jaxpr(lambda acc, b: acc + b)(accumulator, accumulator)
-    scale = jax.make_jaxpr(lambda acc, b: acc * b)(accumulator, accumulator)
-    digests = [tuning._traced(consumer(jaxpr)) for jaxpr in (bias, scale, bias)]
-    assert digests[0] != digests[1]
-    assert digests[0] == digests[2]
-
