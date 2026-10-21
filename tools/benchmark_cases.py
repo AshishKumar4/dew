@@ -18,15 +18,15 @@ TEXT_FEATURES = 768
 # dense one 24 layers deep and 1024 wide, and a 12-layer, 768-wide one whose
 # every second layer routes eight experts top-2, Qwen3-MoE's
 # decoder_sparse_step 2.
-DIT_B: dict[str, object] = {"patch_size": 4, "emb_features": 768, "num_layers": 12, "num_heads": 12,
-                            "mlp_ratio": 4}
-"""DiT-B/4: the large, compute-dominated SimpleDiT the parity study and the performance gate step."""
 LM_DENSE: dict[str, object] = {"vocab_size": 50304, "emb_features": 1024, "num_layers": 24, "num_heads": 16,
                                "mlp_features": 2816, "max_seq_len": 1024}
 LM_MOE: dict[str, object] = {
     "vocab_size": 50304, "emb_features": 768, "num_layers": 12, "num_heads": 12, "mlp_features": 2048,
     "max_seq_len": 1024,
     "mixture": {"experts": 8, "top_k": 2, "layers": [1, 3, 5, 7, 9, 11], "dispatch": "global"}}
+DIT_B: dict[str, object] = {"patch_size": 4, "emb_features": 768, "num_layers": 12, "num_heads": 12,
+                            "mlp_ratio": 4}
+"""DiT-B/4: the large, compute-dominated SimpleDiT the parity study and the performance gate step."""
 
 @dataclass(frozen=True)
 class Case:
@@ -364,7 +364,7 @@ def parity_case(model: str, size: str, *, batch_size: int | None = None,
                             "mlp_features": 3072, "max_seq_len": 1024},
                     batch_size=8, seq_len=1024, image_size=64)
     elif model == "simple_dit":
-        case = Case(model, DIT_B, batch_size=32, image_size=64)
+        case = Case(model, dict(DIT_B), batch_size=32, image_size=64)
     else:
         raise ValueError("the unet has no large parity case")
     config = case.config if vocab_size is None else {**case.config, "vocab_size": vocab_size}
