@@ -50,6 +50,7 @@ independently by `seeds_for` on armada (2026-10-21). The vector-decay delta rule
 control resolved at 8: the chunked form's own spread left the pooled ratio 1.315 inconclusive over 8
 seeds ([1.046, 1.702])."""
 
+
 def draw(hooks: recurrence.Hooks, packed: bool, seed: int) -> tuple[Chunk]:
     """A sequence's operands for `hooks` from `seed`, its keys' and values' dimensions each permuted
     by an order the seed draws (an exact symmetry of every head's recurrence): fresh queries, keys
