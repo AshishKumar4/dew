@@ -64,7 +64,6 @@ rounding of the computation itself (`assert_computes_the_oracle`).
 
 import dataclasses
 import hashlib
-from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -433,13 +432,12 @@ def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most
 
 
 def recording(path) -> dict[str, np.ndarray]:
-    """A recording of a reference over seeds (`indexed_recording`'s `stored`), read whole: from git where
-    it is at most 1 MiB, else from the fetched store's local copy, checked against its pin
-    (tools/fetched_fixtures.py)."""
-    from tool_support import REPO_ROOT, load
+    """A recording of a reference over seeds (`indexed_recording`'s `stored`), read whole: where a pin
+    holds it, from the fetched store's local copy, checked against the pin; else from the file at
+    `path`, as git holds one of at most 1 MiB (tools/fetched_fixtures.py)."""
+    from tool_support import load
 
-    relative = Path(path).resolve().relative_to(REPO_ROOT).as_posix()
-    with np.load(load("fetched_fixtures").local(relative), allow_pickle=False) as stored:
+    with np.load(load("fetched_fixtures").local(path), allow_pickle=False) as stored:
         return dict(stored)
 
 
@@ -469,12 +467,13 @@ def indexed_recording(stored, site: str, seeds: int, *, inputs_of=None):
     run in the test (a CUDA-only library, a fetched source): `stored` holds `<site>.reference.<name>` and
     `<site>.truth.<name>`, and `<site>.input.<name>` unless `inputs_of(seed)` draws a seed's inputs again
     (a seeded NumPy or torch draw the generator made them by), every array stacked over the seeds on its
-    first axis, the truth in float64. Inputs drawn again are checked against the recording's
-    `<site>.input_digest` (`input_digest`), so a generator that changed since is named, not judged. A draw
-    is `(index, inputs)`, the index an integer `widened` keeps; the reference and the truth read the
-    recorded outputs at it, and Dew's function takes the same two arguments and ignores the index. The
-    recording covers check 1's redraw, (1 + REDRAW) times the declared seeds, so a numerical failure
-    stays a finding rather than running out of recorded seeds."""
+    first axis, the truth in float64, and `<site>.redraw`, check 1's REDRAW it was recorded for. Inputs
+    drawn again are checked against the recording's `<site>.input_digest` (`input_digest`), so a
+    generator that changed since is named, not judged. A draw is `(index, inputs)`, the index an
+    integer `widened` keeps; the reference and the truth read the recorded outputs at it, and Dew's
+    function takes the same two arguments and ignores the index. The recording covers check 1's redraw,
+    (1 + REDRAW) times the declared seeds, so a numerical failure stays a finding rather than running
+    out of recorded seeds."""
     def tree(kind):
         prefix = f"{site}.{kind}."
         return {name.removeprefix(prefix): value for name, value in stored.items() if name.startswith(prefix)}
@@ -487,6 +486,9 @@ def indexed_recording(stored, site: str, seeds: int, *, inputs_of=None):
                              f"no later widening recovers what a narrower recording dropped")
     if inputs_of is None and not inputs:
         raise AssertionError(f"{site}: no inputs recorded and no `inputs_of` to draw them again")
+    if int(stored.get(f"{site}.redraw", -1)) != REDRAW:
+        raise AssertionError(f"{site}: the recording holds no `{site}.redraw` of {REDRAW}, which "
+                             f"record_case writes and the fetched store's rule reads it by")
     digests = stored.get(f"{site}.input_digest")
     if inputs_of is not None and digests is None:
         raise AssertionError(f"{site}: `inputs_of` draws the inputs again and the recording keeps no "
