@@ -158,3 +158,16 @@ def llada_fields(name: str, rows: int, length: int) -> dict[str, jax.Array]:
     blocks = np.arange(length) // LLADA2_BLOCK
     return {"attention_pairwise_mask": jnp.asarray(np.broadcast_to(
         blocks[None, :] <= blocks[:, None], (rows, length, length)))}
+
+
+def cached_round_trips(round_trip, cases, workspace) -> Callable[[str], object]:
+    """A function of a case's name to its round trip (`round_trip(cases[name], workspace)`, a family
+    trained and exported once), run the first time a test asks for it and shared after."""
+    cache = {}
+
+    def trip(name: str):
+        if name not in cache:
+            cache[name] = round_trip(cases[name], workspace)
+        return cache[name]
+
+    return trip
