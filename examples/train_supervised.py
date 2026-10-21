@@ -26,7 +26,7 @@ import optax
 from flax import linen as nn
 
 from dew.config import ModelConfig, ObjectiveConfig, OptimConfig, RunConfig, TrainerConfig
-from dew.config.data import RecordsData
+from dew.data import Files
 from dew.inputs import Field, InputSpec
 from dew.objectives.supervised import Accuracy
 
@@ -69,9 +69,10 @@ def run() -> RunConfig:
              "validation": spirals(data / "validation.jsonl", 256, 1)}
     return RunConfig(
         model=ModelConfig.from_model(MLP()),
-        data=RecordsData(source=files["train"], validation=files["validation"]),
+        data=Files(files["train"]).shuffle(seed=0).repeat().batch(64),
+        validation=Files(files["validation"]).batch(64),
         objective=ObjectiveConfig("supervised", {
             "loss": cross_entropy, "metrics": (Accuracy(),), "inputs": InputSpec(Field("x", (2,)))}),
         optim=OptimConfig(learning_rate=3e-3),
-        trainer=TrainerConfig(steps=300, batch_size=64, log_every=50, eval_every=100,
+        trainer=TrainerConfig(steps=300, log_every=50, eval_every=100,
                               checkpoint_every=100))
