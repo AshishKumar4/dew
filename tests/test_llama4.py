@@ -13,14 +13,20 @@ from typing import Any
 import jax
 import jax.numpy as jnp
 import numpy as np
+import pytest
 
+from dew.inference import TextGeneration
+from dew.interop import Pretrained
 from dew.nn.inputs import AttentionMetadata, MixerCall, coordinates
+from dew.nn.kv_cache import KVCache
 from dew.nn.llama4 import Llama4Mixer
 from dew.nn.mixer_base import MixerContext
 from dew.nn.mlp import GatedMLP
 from dew.nn.moe import SparseMLP
+from dew.sampling import Sampling
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "llama4"
+LLAMA4_CHECKPOINT = Path(__file__).resolve().parent / "fixtures" / "hf" / "llama4-tiny"
 HIDDEN, HEADS, KV_HEADS, HEAD_DIM = 32, 4, 2, 8
 
 
@@ -120,6 +126,26 @@ def test_the_temperature_reads_logical_positions_through_a_cache():
     state = {**module.init(jax.random.key(0), hidden[:, :1], MixerCall(decode=True)), **variables}
     cached, _ = module.apply(state, hidden, MixerCall(metadata, decode=True), mutable=["cache"])
     assert float(np.max(np.abs(np.asarray(cached) - uncached))) < 1e-5
+
+
+@pytest.mark.parametrize("dense, layout", [
+    (KVCache(), KVCache(page_size=4)),
+    (KVCache(quantized="int8"), KVCache(quantized="int8", page_size=4)),
+    (KVCache(quantized="float8_e4m3fn"), KVCache(quantized="float8_e4m3fn", page_size=4))],
+    ids=["paged", "int8-paged", "float8-paged"])
+def test_a_paged_cache_draws_what_the_dense_cache_draws(dense, layout):
+    """The tiny Llama 4 checkpoint (three chunked rotated layers, one global layer without rope)
+    decodes greedily through each storage layout of the shared attention: a paged cache draws the
+    dense cache's tokens at full precision and at each quantized format."""
+    pretrained = Pretrained.load(str(LLAMA4_CHECKPOINT), dtype="float32", attention_impl="reference")
+    prompts = np.load(LLAMA4_CHECKPOINT / "input_ids.npy")[:, :7]
+
+    def drawn(cache: KVCache) -> np.ndarray:
+        generate = TextGeneration(pretrained.model.with_kv_cache(cache), pretrained.variables,
+                                  sampling=Sampling(temperature=0))
+        return np.asarray(generate(prompts, 16, key=0).tokens)
+
+    np.testing.assert_array_equal(drawn(layout), drawn(dense))
 
 
 def test_the_input_scaled_experts_match_the_reference_block():

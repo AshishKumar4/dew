@@ -75,6 +75,7 @@ from dew.nn.protocols import (
     CountedTraining,
     CountedVideo,
 )
+from dew.nn.sharding import LOW_RANK_FACTORS
 from dew.objectives.base import FROZEN, Path, Variables, freeze, merge as overlay, select, thaw
 from dew.quantization import (
     FROZEN_FP8,
@@ -91,7 +92,7 @@ PEFT_PREFIX = "base_model.model."
 DIFFUSERS_WEIGHTS = "pytorch_lora_weights.safetensors"
 DIFFUSERS_METADATA = "lora_adapter_metadata"
 
-FACTORS = ("lora_A", "lora_B")
+FACTORS = LOW_RANK_FACTORS
 # PEFT's init: A as torch's Linear default, kaiming-uniform with a=sqrt(5),
 # which is uniform on +-1/sqrt(fan_in); B zero, so a fresh adapter is the
 # identity.
