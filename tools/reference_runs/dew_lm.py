@@ -86,6 +86,8 @@ def arguments() -> argparse.Namespace:
                         help="Adam's moments in memory (OptimConfig.state_dtype)")
     parser.add_argument("--remat", default=None, choices=sorted(REMAT_POLICIES),
                         help="the decoder's starting remat policy; unset, the model's")
+    parser.add_argument("--scan-layers", action="store_true",
+                        help="the decoder scans its layers (`scan_layers`), by period over resident weights")
     parser.add_argument("--aux-loss-alpha", type=float, default=None,
                         help="MoE: LMObjective's aux_loss_alpha (Switch balance loss per router)")
     parser.add_argument("--seq-aux", action="store_true",
@@ -148,6 +150,10 @@ def build(args: argparse.Namespace) -> Run:
         model = model.clone(language_model=model.language_model.clone(remat=args.remat))
     elif args.remat is not None:
         model = model.clone(remat=args.remat)
+    if args.scan_layers and isinstance(model, MultimodalTransformer):
+        model = model.clone(language_model=model.language_model.clone(scan_layers=True))
+    elif args.scan_layers:
+        model = model.clone(scan_layers=True)
     if args.dispatch is not None:
         if not isinstance(model, CausalTransformer) or model.mixture is None:
             raise SystemExit(f"--dispatch sets a mixture's dispatch, and {args.model} builds no mixture")
