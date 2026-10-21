@@ -125,8 +125,6 @@ def stores(statement: ast.stmt) -> bool:
     the parent class's constructor."""
     if isinstance(statement, ast.Assign):
         return all(field(target) for target in statement.targets) and data(statement.value)
-    if isinstance(statement, ast.AnnAssign):
-        return statement.value is not None and field(statement.target) and data(statement.value)
     call = statement.value if isinstance(statement, ast.Expr) else None
     if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute)
             and call.func.attr == "__init__"):
@@ -147,7 +145,7 @@ def declaration(statement: ast.stmt, in_class: bool) -> bool:
         stub = len(body) <= 1 and all(
             isinstance(line, ast.Pass) or (isinstance(line, ast.Expr) and isinstance(line.value, ast.Constant)
                                            and line.value.value is Ellipsis) for line in body)
-        return stub or all(stores(line) for line in body)
+        return stub or all(stores(assigned(line)) for line in body)
     if isinstance(statement, ast.AnnAssign):
         return in_class or statement.value is None
     return docstring(statement) or isinstance(statement, (ast.Import, ast.ImportFrom))
@@ -314,9 +312,15 @@ def found(sources: dict[str, str]) -> list[Hit]:
     return sorted(hits, key=lambda hit: [(place.file, place.line) for place in hit.places])
 
 
+def covers(outer: Hit, inner: Hit) -> bool:
+    """Every place of `inner` lies inside one of `outer`'s."""
+    return all(any(place.holds(each) for place in outer.places) for each in inner.places)
+
+
 def named(hits: list[Hit]) -> list[Hit]:
     """`hits` (as `found` orders them) as the copies they are: the windows of one copied run, each place
-    overlapping its counterpart's, as one; and a copy whose every place lies inside another's as that one."""
+    overlapping its counterpart's, as one; and a copy whose every place lies inside another's as that one.
+    Of copies on the same lines (a function written on one line and its statements), the function is named."""
     copies: list[Hit] = []
     for hit in hits:
         for index, run in enumerate(copies):
@@ -328,9 +332,12 @@ def named(hits: list[Hit]) -> list[Hit]:
                     break
         else:
             copies.append(hit)
-    return [hit for hit in copies
-            if not any(other is not hit and all(any(outer.holds(place) for outer in other.places)
-                                                for place in hit.places) for other in copies)]
+
+    def inside(index: int, hit: Hit) -> bool:
+        return any(covers(other, hit) and (not covers(hit, other) or (other.kind, at) < (hit.kind, index))
+                   for at, other in enumerate(copies) if at != index)
+
+    return [hit for index, hit in enumerate(copies) if not inside(index, hit)]
 
 
 def structural(sources: dict[str, str]) -> list[Hit]:
@@ -379,10 +386,9 @@ def report(hit: Hit) -> str:
 
 
 def judged(hits: list[Hit], merged: str, top: Path) -> tuple[list[Hit], list[Hit]]:
-    """`hits` (as `found` gives them) as the copies held to the commit `merged` fails and those it holds,
-    each named."""
+    """`hits` (as `found` gives them) as the copies held to the commit `merged` fails and those it holds."""
     failing = new(hits, merged, top)
-    return named(failing), named([hit for hit in hits if hit not in failing])
+    return failing, [hit for hit in hits if hit not in failing]
 
 
 def main(arguments: Sequence[str]) -> int:
@@ -409,13 +415,15 @@ def main(arguments: Sequence[str]) -> int:
     read = time.monotonic()
     hits = found({os.path.relpath(file.resolve(), top) if options.base else str(file): file.read_text()
                   for file in files})
-    failing, held = judged(hits, merged, top) if options.base else (named(hits), [])
-    for hit in failing:
+    failing, held = judged(hits, merged, top) if options.base else (hits, [])
+    for hit in named(failing):
         print(report(hit))
-    for hit in held:
+    for hit in named(held):
         print("(held by the base) " + report(hit))
-    print(f"{len(failing)} structural copies failing, {len(held)} held by the base, over {len(files)} files;"
-          f" text read in {read - started:.0f} s, structure in {time.monotonic() - read:.0f} s")
+    print(f"{len(named(failing))} structural copies failing, {len(named(held))} held by the base, over"
+          f" {len(files)} files; text read in {read - started:.0f} s,"
+          f" structure in {time.monotonic() - read:.0f} s")
+    # The verdict is the copies' own, whatever naming them shows.
     return 1 if text or failing else 0
 
 
