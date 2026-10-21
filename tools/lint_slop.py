@@ -1753,10 +1753,12 @@ GATE = frozenset({"tests/reference_error.py", "tests/op_certificates.py", "tools
                   "tests/reference_graph.py", "tests/reference_trees.py", "tests/residual_orders.py",
                   "tests/test_reference_error.py", "tests/test_op_certificates.py",
                   "tests/test_reference_orders.py", "tests/test_reference_graph.py",
-                  "tests/test_gate_calibration.py"})
+                  "tests/test_gate_calibration.py", "tests/test_float64_terms.py"})
 """The gate's modules and the tests of the gate itself, the one place a float is compared within a
 bound (bible §7, 2026-10-20): every other comparison goes through its assertion."""
 INVENTORY = "tools/tolerance_inventory.json"
+RULE = "tools/lint_tolerances.py"
+"""SLOP020's reading of a file (`tolerance_rules`), whose change may grow what the inventory holds."""
 
 
 def _tolerance_comparisons(module: Module) -> Iterator[tuple[ast.AST, str]]:
@@ -1815,20 +1817,26 @@ def _inventory_at(checkout: Path, commit: str) -> dict | None:
 
 def _loosened(checkout: Path, commit: str, parent: str, mine: dict, theirs: dict) -> Iterator[str]:
     """How `commit`'s inventory `mine` is looser than `parent`'s `theirs`: a file added, a count raised,
-    a date moved later, its empty_by later; a file renamed between them carries its entry."""
-    renamed = {}
+    a date moved later, its empty_by later; a file renamed between them carries its entry. Where the
+    commit changes SLOP020's reading (`RULE`), a file it leaves unchanged may be added or raised: what
+    the rule now reads there was in the file all along. No date moves later either way."""
+    renamed, changed = {}, set()
     changes = _git(checkout, "diff", "--name-status", "-M", parent, commit, "--", "tests", "tools")
     for change in changes.splitlines():
         status, *paths = change.split("\t")
+        changed.update(paths)
         if status.startswith("R") and len(paths) == 2:
             renamed[paths[1]] = paths[0]
+    reread = RULE in changed
     if mine["empty_by"] > theirs["empty_by"]:
         yield "moves empty_by later"
     for name, entry in mine["files"].items():
         kept = theirs["files"].get(name) or theirs["files"].get(renamed.get(name, ""))
+        grown = reread and name not in changed
         if kept is None:
-            yield f"adds {name}"
-        elif entry["comparisons"] > kept["comparisons"] or entry["by"] > kept["by"]:
+            if not grown:
+                yield f"adds {name}"
+        elif entry["by"] > kept["by"] or (entry["comparisons"] > kept["comparisons"] and not grown):
             yield f"raises {name}'s count or moves its date"
 
 

@@ -57,11 +57,6 @@
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
-  "tests/test_armada_ci.py": {
-   "comparisons": 1,
-   "lane": "Integration & Docs",
-   "by": "2026-11-27"
-  },
   "tests/test_attention_masked_rows.py": {
    "comparisons": 1,
    "lane": "Kernels",
@@ -263,7 +258,7 @@
    "by": "2026-11-20"
   },
   "tests/test_discrete.py": {
-   "comparisons": 7,
+   "comparisons": 8,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
@@ -347,18 +342,13 @@
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
-  "tests/test_float64_terms.py": {
-   "comparisons": 12,
-   "lane": "Accuracy Gate",
-   "by": "2026-11-13"
-  },
   "tests/test_flow_grpo.py": {
    "comparisons": 29,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
   "tests/test_flow_matching.py": {
-   "comparisons": 7,
+   "comparisons": 8,
    "lane": "Training",
    "by": "2026-11-20"
   },
@@ -698,7 +688,7 @@
    "by": "2026-11-20"
   },
   "tests/test_moe_decoder.py": {
-   "comparisons": 5,
+   "comparisons": 6,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
