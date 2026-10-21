@@ -467,16 +467,14 @@ def _tile_logits(score_mod, query, key, seen, q_pos, k_pos, params, *, scale: fl
 def _tile_scores(score_mod, query, key, value, dout, peak, total, anchor, delta, seen, q_pos, k_pos, params,
                  *, key_index, scale: float, interpret: bool):
     """A tile's backward through its scores: its unnormalized weights `exp(s - m)` and its weights `p` over
-    `total` (zero where masked; unnormalized where `total` is None, as the dQ pass sums them), the masked
-    score cotangents `p * ((dP - c) - (D - c))` (`algebra.grad_scores`), `dP = dO V^T`, `c` each query's
-    `anchor` and `delta` its `D - c`, and the entries' derivatives through `score_mod`
-    (`algebra.scored`)."""
+    `total` (zero where masked), the masked score cotangents `p * ((dP - c) - (D - c))`
+    (`algebra.grad_scores`), `dP = dO V^T`, `c` each query's `anchor` and `delta` its `D - c`, and the
+    entries' derivatives through `score_mod` (`algebra.scored`)."""
     logits, slopes = _tile_logits(score_mod, query, key, seen, q_pos, k_pos, params, scale=scale,
                                   interpret=interpret, slopes=True)
-    inverse = None if total is None else algebra.inverse(total)
-    exponentials, weights = algebra.normalized(logits, peak, jnp.ones_like(peak) if total is None else total)
+    exponentials, weights = algebra.normalized(logits, peak, total)
     cotangents = algebra.grad_scores(exponentials, _dot(dout, value.T, interpret), anchor, delta, seen,
-                                     k_pos == key_index[:, None], inverse)
+                                     k_pos == key_index[:, None], algebra.inverse(total))
     return exponentials, weights, cotangents, slopes
 
 
@@ -544,22 +542,18 @@ def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tu
     index_out_ref[...] = key_index
     summed = tuple(kind in (Kind.HEAD, Kind.QUERY) for kind in score_kinds)
 
-    over_prior = algebra.inverse(prior)
-
     def step(index, carry):
-        # Against the unnormalized weights, taken to the pass's own denominator at the end
-        # (`algebra.dq_finish`); dQ's operands alone over the prior one before they narrow, so each
-        # holds a normalized weight's range.
+        # Each cotangent over the prior denominator, in the reference's order, and taken to the pass's
+        # own at the end (`algebra.dq_finish`); the weights' sums unnormalized.
         dq, residual, mass, grads, weighed = carry
         keys, k_pos, seen, params = tile(index)
         key, value = key_ref[keys, :], value_ref[keys, :]
-        _, weights, cotangents, slopes = _tile_scores(score_mod, query, key, value, dout, peak, None, anchor,
+        weights, _, cotangents, slopes = _tile_scores(score_mod, query, key, value, dout, peak, prior, anchor,
                                                    delta, seen, q_pos, k_pos, params, key_index=key_index,
                                                    scale=scale, interpret=interpret)
         logits, pieces = algebra.pulled(cotangents, slopes, seen, score_kinds)
-        # Over the prior denominator in fp32 before the product with the keys, as the reference takes each
-        # cotangent over its denominator (`algebra.dq_operand`).
-        dq = dq + _dot(algebra.dq_operand(logits, over_prior, scale, key.dtype), key, interpret)
+        # Scaled before it narrows to the operands' dtype and meets the keys, as the reference's is.
+        dq = dq + _dot((logits * scale).astype(key.dtype), key, interpret)
         grads = tuple(grad + piece if row else grad for grad, row, piece in zip(grads, summed, pieces,
                                                                                strict=True))
         if any(summed):
@@ -574,7 +568,7 @@ def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tu
                                              (jnp.zeros(query.shape, jnp.float32), nothing, nothing, rows,
                                               rows)))
     dq, delta, total, mass, grads = algebra.dq_finish(sums, prior, state_total, peak0, shares, peak, anchor,
-                                                      delta, algebra.dq_scale(scale, key_ref.dtype))
+                                                      delta)
     dq_ref[...] = dq
     delta_ref[...] = delta
     anchor_ref[...] = anchor
