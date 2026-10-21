@@ -988,8 +988,10 @@ class _EndedIterator(pygrain.DatasetIterator):
         return {"parent": self._rows.get_state(), "ended": self._ended}
 
     def set_state(self, state: Mapping[str, object]) -> None:
-        self._rows.set_state(record(state["parent"], "repeat position"))
+        # An ended repeat reads no more, so only one that reads on restores where it was.
         self._ended = boolean(state["ended"], "repeat ended")
+        if not self._ended:
+            self._rows.set_state(record(state["parent"], "repeat position"))
 
 
 def _reordered(stage: Shuffle | Slice | Limit, rows: pygrain.MapDataset) -> pygrain.MapDataset:
