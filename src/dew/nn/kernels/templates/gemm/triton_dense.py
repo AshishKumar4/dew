@@ -26,33 +26,33 @@ def gmm(lhs: jax.Array, rhs: jax.Array, *, tile, transpose_rhs: bool, out_dtypes
     """`lhs` times `rhs` in each of `out_dtypes` (the epilogue's outputs, or the accumulator rounded), a
     `tile` (`grouped_matmul.Tile`) an output tile and its depth step; `exact_sums` adds each step's product
     into the fp32 sum by an IEEE add (`_summed`)."""
-    rows, width = lhs.shape[0], rhs.shape[0] if transpose_rhs else rhs.shape[1]
+    (rows, depth), width = lhs.shape, rhs.shape[0] if transpose_rhs else rhs.shape[1]
     block_m, block_n, block_k = tile.block_m, tile.block_n, tile.block_k
-    # A tile that does not divide the depth or the width takes them padded with zeros, which add nothing
-    # and are dropped (the launch's space prefers tiles that divide).
-    lhs = _padded_axis(lhs, 1, block_k)
+    # A tile that does not divide the rows, depth or width takes them padded with zeros, which add nothing
+    # and are dropped (the launch prefers tiles that divide); padded depth is zeroed again after the
+    # prologue, which need not keep it zero.
     depth_axis, width_axis = (1, 0) if transpose_rhs else (0, 1)
+    lhs = _padded_axis(_padded_axis(lhs, 1, block_k), 0, block_m)
     rhs = _padded_axis(_padded_axis(rhs, depth_axis, block_k), width_axis, block_n)
-    depth, padded_width = lhs.shape[1], rhs.shape[0] if transpose_rhs else rhs.shape[1]
-    prologue_operands = _padded_on(prologue_operands, prologue_axes, 'depth', block_k)
-    epilogue_operands = _padded_on(epilogue_operands, epilogue_axes, 'columns', block_n)
-    lhs, padded = _padded_rows(lhs, block_m)
-    prologue_operands = _padded_sides(prologue_operands, prologue_axes, padded)
-    epilogue_operands = _padded_sides(epilogue_operands, epilogue_axes, padded)
-    blocks = {'rows': (block_m, 0), 'depth': (depth, None), 'columns': (block_n, 1)}
+    (padded, padded_depth), padded_width = lhs.shape, rhs.shape[width_axis]
+    prologue_operands = _padded_on(_padded_on(prologue_operands, prologue_axes, 'depth', block_k),
+                                   prologue_axes, 'rows', block_m)
+    epilogue_operands = _padded_on(_padded_on(epilogue_operands, epilogue_axes, 'columns', block_n),
+                                   epilogue_axes, 'rows', block_m)
+    blocks = {'rows': (block_m, 0), 'depth': (padded_depth, None), 'columns': (block_n, 1)}
 
     def spec(axes):
         return pl.BlockSpec(tuple(blocks[axis][0] for axis in axes),
                             lambda i, j: tuple(0 if blocks[axis][1] is None else (i, j)[blocks[axis][1]]
                                                for axis in axes))
 
-    in_specs = [pl.BlockSpec((block_m, depth), lambda i, j: (i, 0)),
-                pl.BlockSpec((block_n, depth), lambda i, j: (j, 0)) if transpose_rhs
-                else pl.BlockSpec((depth, block_n), lambda i, j: (0, j)),
+    in_specs = [_LIVE_SPEC, pl.BlockSpec((block_m, padded_depth), lambda i, j: (i, 0)),
+                pl.BlockSpec((block_n, padded_depth), lambda i, j: (j, 0)) if transpose_rhs
+                else pl.BlockSpec((padded_depth, block_n), lambda i, j: (0, j)),
                 *(spec(axes) for axes in prologue_axes), *(spec(axes) for axes in epilogue_axes)]
     kernel = functools.partial(
-        _gmm_kernel, steps=depth // block_k, block_k=block_k, transpose_rhs=transpose_rhs,
-        prologue=prologue, prologue_axes=prologue_axes, epilogue=epilogue,
+        _gmm_kernel, depth=depth, block_k=block_k, transpose_rhs=transpose_rhs, prologue=prologue,
+        prologue_axes=prologue_axes, epilogue=epilogue,
         sides=(len(prologue_operands), len(epilogue_operands)), exact_sums=exact_sums)
     outs = pl.pallas_call(
         kernel,
@@ -62,24 +62,27 @@ def gmm(lhs: jax.Array, rhs: jax.Array, *, tile, transpose_rhs: bool, out_dtypes
         out_specs=tuple(pl.BlockSpec((block_m, block_n), lambda i, j: (i, j)) for _ in out_dtypes),
         compiler_params=plgpu.CompilerParams(num_warps=tile.warps, num_stages=tile.stages),
         interpret=interpret,
-    )(lhs, rhs, *prologue_operands, *epilogue_operands)
+    )(_live(rows), lhs, rhs, *prologue_operands, *epilogue_operands)
     return tuple(out[:rows, :width] for out in outs)
 
 
-def _gmm_kernel(lhs_ref, rhs_ref, *refs, steps: int, block_k: int, transpose_rhs: bool, prologue,
+def _gmm_kernel(live_ref, lhs_ref, rhs_ref, *refs, depth: int, block_k: int, transpose_rhs: bool, prologue,
                 prologue_axes: tuple, epilogue, sides: tuple, exact_sums: bool):
     prologue_refs, epilogue_refs, out_refs = refs[:sides[0]], refs[sides[0]:sum(sides)], refs[sum(sides):]
-    live = _unknown_true()
+    live = live_ref[0] > 0
 
     def step(k, acc):
-        depth = pl.ds(k * block_k, block_k)
-        x = lhs_ref[:, depth]
+        span = pl.ds(k * block_k, block_k)
+        x = lhs_ref[:, span]
         if prologue is not None:
-            x = prologue(x, *_cut(prologue_refs, prologue_axes, 'depth', depth)).astype(x.dtype)
-        w = rhs_ref[:, depth].T if transpose_rhs else rhs_ref[depth, :]
-        return _summed(acc, jnp.dot(x, w, preferred_element_type=jnp.float32), live, exact_sums=exact_sums)
+            x = prologue(x, *_cut(prologue_refs, prologue_axes, 'depth', span)).astype(x.dtype)
+            if depth % block_k:
+                x = _kept(x, k * block_k, depth, axis=1)
+        w = rhs_ref[:, span].T if transpose_rhs else rhs_ref[span, :]
+        product = jnp.dot(x, w, precision=lax.Precision.DEFAULT, preferred_element_type=jnp.float32)
+        return _summed(acc, product, live, exact_sums=exact_sums)
 
-    acc = lax.fori_loop(0, steps, step, jnp.zeros(out_refs[0].shape, jnp.float32))
+    acc = lax.fori_loop(0, lhs_ref.shape[1] // block_k, step, jnp.zeros(out_refs[0].shape, jnp.float32))
     outs = (acc,) if epilogue is None else epilogue(acc, *(ref[...] for ref in epilogue_refs))
     for ref, out in zip(out_refs, outs if isinstance(outs, tuple) else (outs,), strict=True):
         ref[...] = out.astype(ref.dtype)
@@ -89,40 +92,40 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, *, tile, out_dtype, interpret: bool, pr
          prologue_operands: tuple = (), prologue_axes: tuple = (), exact_sums: bool = False) -> jax.Array:
     """`prologue(lhs)` transposed times `rhs`: `[depth, width]` in `out_dtype`, a `tile` a `block_k` x
     `block_n` output tile summed over the rows `block_m` at a time (`grouped_matmul.Tgmm`'s tiles)."""
-    rows, depth = lhs.shape
-    width = rhs.shape[1]
+    (rows, depth), width = lhs.shape, rhs.shape[1]
     block_m, block_n, block_k = tile.block_m, tile.block_n, tile.block_k
-    # Padded depth and width as `gmm`'s, dropped from the gradient.
-    lhs, rhs = _padded_axis(lhs, 1, block_k), _padded_axis(rhs, 1, block_n)
-    prologue_operands = _padded_on(prologue_operands, prologue_axes, 'depth', block_k)
-    (lhs, padded), (rhs, _) = _padded_rows(lhs, block_m), _padded_rows(rhs, block_m)
-    prologue_operands = _padded_sides(prologue_operands, prologue_axes, padded)
+    # Padded as `gmm`'s: the depth and width dropped from the gradient, the rows it sums zeroed again
+    # after the prologue.
+    lhs = _padded_axis(_padded_axis(lhs, 1, block_k), 0, block_m)
+    rhs = _padded_axis(_padded_axis(rhs, 1, block_n), 0, block_m)
+    (padded, padded_depth), padded_width = lhs.shape, rhs.shape[1]
+    prologue_operands = _padded_on(_padded_on(prologue_operands, prologue_axes, 'depth', block_k),
+                                   prologue_axes, 'rows', block_m)
     blocks = {'rows': (padded, None), 'depth': (block_k, 0)}
 
     def spec(axes):
         return pl.BlockSpec(tuple(blocks[axis][0] for axis in axes),
                             lambda i, j: tuple(i if blocks[axis][1] == 0 else 0 for axis in axes))
 
-    kernel = functools.partial(_tgmm_kernel, steps=padded // block_m, block_m=block_m, rows=rows,
-                               prologue=prologue, prologue_axes=prologue_axes, exact_sums=exact_sums)
-    padded_depth, padded_width = lhs.shape[1], rhs.shape[1]
+    kernel = functools.partial(_tgmm_kernel, rows=rows, block_m=block_m, prologue=prologue,
+                               prologue_axes=prologue_axes, exact_sums=exact_sums)
     return pl.pallas_call(
         kernel,
         out_shape=jax.ShapeDtypeStruct((padded_depth, padded_width), out_dtype),
         grid=(padded_depth // block_k, padded_width // block_n),
-        in_specs=[pl.BlockSpec((padded, block_k), lambda i, j: (0, i)),
+        in_specs=[_LIVE_SPEC, pl.BlockSpec((padded, block_k), lambda i, j: (0, i)),
                   pl.BlockSpec((padded, block_n), lambda i, j: (0, j)),
                   *(spec(axes) for axes in prologue_axes)],
         out_specs=pl.BlockSpec((block_k, block_n), lambda i, j: (i, j)),
         compiler_params=plgpu.CompilerParams(num_warps=tile.warps, num_stages=tile.stages),
         interpret=interpret,
-    )(lhs, rhs, *prologue_operands)[:depth, :width]
+    )(_live(rows), lhs, rhs, *prologue_operands)[:depth, :width]
 
 
-def _tgmm_kernel(lhs_ref, rhs_ref, *refs, steps: int, block_m: int, rows: int, prologue,
-                 prologue_axes: tuple, exact_sums: bool):
+def _tgmm_kernel(live_ref, lhs_ref, rhs_ref, *refs, rows: int, block_m: int, prologue, prologue_axes: tuple,
+                 exact_sums: bool):
     *prologue_refs, out_ref = refs
-    live = _unknown_true()
+    live = live_ref[0] > 0
 
     def step(r, acc):
         span = pl.ds(r * block_m, block_m)
@@ -130,14 +133,24 @@ def _tgmm_kernel(lhs_ref, rhs_ref, *refs, steps: int, block_m: int, rows: int, p
         if prologue is not None:
             x = prologue(x, *_cut(prologue_refs, prologue_axes, 'rows', span)).astype(x.dtype)
             if rows % block_m:
-                # The padding rows, which the prologue need not keep zero, contribute nothing.
-                kept = r * block_m + lax.broadcasted_iota(jnp.int32, x.shape, 0) < rows
-                x = jnp.where(kept, x, jnp.zeros_like(x))
-        partial = jnp.dot(x.T, rhs_ref[span, :], preferred_element_type=jnp.float32)
-        return _summed(acc, partial, live, exact_sums=exact_sums)
+                x = _kept(x, r * block_m, rows, axis=0)
+        product = jnp.dot(x.T, rhs_ref[span, :], precision=lax.Precision.DEFAULT,
+                          preferred_element_type=jnp.float32)
+        return _summed(acc, product, live, exact_sums=exact_sums)
 
-    acc = lax.fori_loop(0, steps, step, jnp.zeros(out_ref.shape, jnp.float32))
+    acc = lax.fori_loop(0, lhs_ref.shape[0] // block_m, step, jnp.zeros(out_ref.shape, jnp.float32))
     out_ref[...] = acc.astype(out_ref.dtype)
+
+
+_LIVE_SPEC = pl.BlockSpec((1,), lambda i, j: (0,))
+"""The block of `_live`'s count every program reads."""
+
+
+def _live(rows: int) -> jax.Array:
+    """The call's row count, which a kernel reads from memory: a condition on it, always true where a
+    program runs, the compiler cannot prove (a program id on a one-program axis it can: Pallas Triton
+    lowers it to zero)."""
+    return jnp.full((1,), rows, jnp.int32)
 
 
 def _summed(acc, partial, live, *, exact_sums: bool):
@@ -147,10 +160,10 @@ def _summed(acc, partial, live, *, exact_sums: bool):
     return acc + jnp.where(live, partial, 0) if exact_sums else acc + partial
 
 
-def _unknown_true():
-    """A condition always true that the compiler cannot prove: a program id below 2^30 (a CUDA block index
-    is known only to be below 2^31)."""
-    return pl.program_id(0) < (1 << 30)
+def _kept(x: jax.Array, start, extent: int, *, axis: int) -> jax.Array:
+    """`x`, a tile at `start` along `axis`, with its entries at `extent` or past it zero."""
+    kept = start + lax.broadcasted_iota(jnp.int32, x.shape, axis) < extent
+    return jnp.where(kept, x, jnp.zeros_like(x))
 
 
 def _padded_axis(array: jax.Array, axis: int, block: int) -> jax.Array:
@@ -169,31 +182,8 @@ def _padded_on(sides: tuple, axes_of: tuple, axis_name: str, block: int) -> tupl
                  for side, axes in zip(sides, axes_of, strict=True))
 
 
-def _padded_rows(array: jax.Array, block: int) -> tuple[jax.Array, int]:
-    """`array`'s rows padded with zeros to a multiple of `block`, and the padded count."""
-    padded = -(array.shape[0] // -block) * block
-    if padded == array.shape[0]:
-        return array, padded
-    return jnp.pad(array, ((0, padded - array.shape[0]), (0, 0))), padded
-
-
 def _cut(refs, axes_of: tuple, stepped: str, span) -> list:
     """Each side tile of a step: its block cut to `span` along the `stepped` launch axis, whole along the
     others."""
     return [ref[tuple(span if axis == stepped else slice(None) for axis in axes)]
             for ref, axes in zip(refs, axes_of, strict=True)]
-
-
-def _padded_sides(sides: tuple, axes_of: tuple, padded: int) -> tuple:
-    """Each side operand's rows padded (`_padded_side`)."""
-    return tuple(_padded_side(side, axes, padded) for side, axes in zip(sides, axes_of, strict=True))
-
-
-def _padded_side(side: jax.Array, axes: tuple, padded: int) -> jax.Array:
-    """A side operand's rows, wherever they are among its dimensions, padded with zeros to `padded`."""
-    if 'rows' not in axes:
-        return side
-    axis = axes.index('rows')
-    widths = [(0, 0)] * side.ndim
-    widths[axis] = (0, padded - side.shape[axis])
-    return jnp.pad(side, widths) if widths[axis][1] else side

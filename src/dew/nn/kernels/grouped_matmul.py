@@ -332,13 +332,7 @@ class _Triton(_GroupedLaunch[Tile]):
         """The depth and width a dense call's tiles divide."""
 
     def space(self, ba) -> tuple[Tile, ...]:
-        """Every tile; a dense call's (`triton_dense`) those dividing its depth and width, where any does
-        (the kernel pads to a tile that does not, a copy the cost model does not price)."""
-        if not ba.arguments.get('dense'):
-            return TILES
-        depth, width = self._dense_extents(ba)
-        dividing = tuple(tile for tile in TILES if depth % tile.block_k == 0 and width % tile.block_n == 0)
-        return dividing or TILES
+        return TILES
 
     def fitting(self, ba, target) -> tuple[Tile, ...]:
         """The tiles that fit `target` (`Template.fitting`) whose accumulator (two with `exact_sums`)
@@ -361,7 +355,14 @@ class _Triton(_GroupedLaunch[Tile]):
             short = not exact_sums or self.contraction(tile) <= EXACT_STEP
             return held and short and not (wgmma and rows // max(tile.warps // 4, 1) % 64)
 
-        return tuple(tile for tile in super().fitting(ba, target) if fits(tile))
+        fitted = tuple(tile for tile in super().fitting(ba, target) if fits(tile))
+        if not ba.arguments.get('dense'):
+            return fitted
+        # A dense call (`triton_dense`) prefers the fitting tiles dividing its depth and width, where any
+        # does: the kernel pads to one that does not, a copy the cost model does not price.
+        depth, width = self._dense_extents(ba)
+        dividing = tuple(tile for tile in fitted if depth % tile.block_k == 0 and width % tile.block_n == 0)
+        return dividing or fitted
 
     @staticmethod
     @abc.abstractmethod

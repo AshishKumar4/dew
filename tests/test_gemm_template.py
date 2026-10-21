@@ -283,14 +283,66 @@ def test_the_prologues_rounding_is_in_its_derivative():
 
 
 @pytest.mark.parametrize("generation_name", ["sm80"])
-def test_a_prologue_never_sees_the_depths_padding(generation_name):
-    """A depth no tile divides is padded with zeros, which `reciprocal` turns to infinities: the kernel
-    zeroes them again before the product, so every output is the routed rows' sum of 17 ones."""
+@pytest.mark.parametrize("sizes", [[3], None], ids=["ragged", "dense"])
+def test_a_prologue_never_sees_the_depths_padding(generation_name, sizes):
+    """A depth no tile divides is padded with zeros, which `reciprocal` turns to infinities: the kernel,
+    ragged or dense, zeroes them again before the product, so every output is the sum of 17 ones."""
     x, w = jnp.ones((3, 17), jnp.bfloat16), jnp.ones((1, 17, 16))
+    w = w if sizes else w[0]
     with generation.assumed(generation_name):
-        out = jax.jit(lambda x, w: template.gemm(x, w, jnp.asarray([3]), prologue=reciprocal,
-                                                 out_dtype=jnp.float32, interpret_on_cpu=True))(x, w)
+        out = jax.jit(lambda x, w: template.gemm(x, w, None if sizes is None else jnp.asarray(sizes),
+                                                 prologue=reciprocal, out_dtype=jnp.float32,
+                                                 interpret_on_cpu=True))(x, w)
     np.testing.assert_array_equal(np.asarray(out), np.full((3, 16), 17.0))
+
+
+def test_a_dense_gradient_takes_a_padded_tile_where_no_dividing_one_fits():
+    """A dense kernel gradient at depth 96 on Hopper: the tiles dividing 96 have 32 output rows, which
+    Hopper's warpgroup MMA refuses, so a 64-row tile runs over the padded depth, and the gradients hold
+    check 1 against JAX's derivative of the plain product."""
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        return (jnp.asarray(rng.normal(size=(256, 96)), jnp.bfloat16),
+                jnp.asarray(rng.normal(size=(96, 128)), jnp.bfloat16))
+
+    def loss(run):
+        return jax.grad(lambda x, w: jnp.sum(run(x, w) * jnp.linspace(-1, 1, 128)), argnums=(0, 1))
+
+    def dew(x, w):
+        return template.gemm(x, w, None, out_dtype=jnp.float32, interpret_on_cpu=True)
+
+    def plain(x, w, wide=jnp.float32):
+        return jnp.dot(x.astype(wide), w.astype(wide))
+
+    with generation.assumed("sm90"), generation.routes() as taken:
+        assert_as_exact(jax.jit(loss(dew)), jax.jit(loss(plain)), draw, "dense depth 96", seeds=SEEDS,
+                        truth_fn=loss(functools.partial(plain, wide=jnp.float64)))
+    assert {route.kernel for route in taken if route.choice == 'grouped_matmul'} == {'triton'}
+
+
+@pytest.mark.skipif(not generation.triton_runs(), reason="needs a GPU the Pallas kernels compile for")
+def test_a_dense_products_exact_sums_survive_one_row_tile():
+    """At the highest precision, a dense fp32 product of one row tile and many depth steps (its first grid
+    axis one program, where a program id is a constant) sums each step's product by an IEEE add: its
+    error holds check 1 against XLA's IEEE sums, which a tensor core's truncating accumulation does not."""
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        return (jnp.asarray(rng.normal(size=(64, 4096)), jnp.bfloat16),
+                jnp.asarray(rng.normal(size=(4096, 128)), jnp.bfloat16))
+
+    def dew(x, w):
+        return template.gemm(x, w, None, out_dtype=jnp.float32, precision="highest")
+
+    def xla(x, w):
+        return jnp.dot(x, w, precision="highest", preferred_element_type=jnp.float32)
+
+    def truth(x, w):
+        return jnp.dot(x.astype(jnp.float64), w.astype(jnp.float64))
+
+    with generation.routes() as taken:
+        assert_as_exact(jax.jit(dew), jax.jit(xla), draw, "dense exact sums, one row tile", seeds=SEEDS,
+                        truth_fn=truth)
+    assert {route.kernel for route in taken if route.choice == 'grouped_matmul'} == {'triton'}
 
 
 @pytest.mark.parametrize("generation_name", ["sm80", "sm90"])
