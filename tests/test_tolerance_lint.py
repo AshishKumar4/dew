@@ -510,11 +510,12 @@ def test_the_retiring_helper_is_refused_outside_its_named_sites(lint, tmp_path):
     import reference_error
 
     body = "from reference_error import assert_leaves_as_exact\nassert_leaves_as_exact(a, b, c)\n"
+    refused = "the retiring one-draw rule, kept only"
     outside = [finding for finding in lint.tolerances(_module(lint, tmp_path, "tests/test_case.py", body))
-               if lint.RETIRING in finding.message]
+               if refused in finding.message]
     assert len(outside) == 2
     named = sorted(lint.RETIRING_SITES)[0]
     inside = [finding for finding in lint.tolerances(_module(lint, tmp_path, named, body))
-              if lint.RETIRING in finding.message]
+              if refused in finding.message]
     assert inside == []
     assert lint.RETIRING_SITES == reference_error.RETIRING_SITES
