@@ -244,7 +244,7 @@ def test_decoder_gradients_match_the_source(loaded, reference):
 
 
 def test_a_bfloat16_walk_matches_the_sources_bfloat16_walk(source):
-    """The fixture VAE in bfloat16 against diffusers 0.34.0's own bfloat16
+    """The fixture VAE in bfloat16 against diffusers 0.39.0's own bfloat16
     walk of it (`wan_vae_bf16.npz`, the reference tool's `bfloat16` mode):
     the posterior and decode of one bfloat16 video and latent, and their
     input gradients. Each differs from the source by less than one bfloat16

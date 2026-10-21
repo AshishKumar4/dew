@@ -1,6 +1,6 @@
 {
   "_class_name": "AutoencoderKL",
-  "_diffusers_version": "0.34.0",
+  "_diffusers_version": "0.39.0",
   "act_fn": "silu",
   "block_out_channels": [
     8,
