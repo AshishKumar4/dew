@@ -34,7 +34,7 @@ def estimators(inputs):
     mask = jnp.asarray(DRAWN_MASK, inputs["values"].dtype)
     advantages, returns = gae(inputs["token_rewards"], inputs["values"], mask, gamma=GAMMA, lam=LAM)
     return {"masked_mean_rows": masked_mean(inputs["values"], mask, axis=-1),
-            "masked_whiten": masked_whiten(inputs["values"], mask),
+            "masked_whiten": jax.vmap(lambda one: masked_whiten(one, mask))(inputs["whitened"]),
             "group_advantage": group_advantage(inputs["rewards"], GROUP),
             "group_advantage_unnormalised": group_advantage(inputs["rewards"], GROUP, normalise_by_std=False),
             "rloo_advantage": rloo_advantage(inputs["rewards"], GROUP),
