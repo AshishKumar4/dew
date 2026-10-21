@@ -603,6 +603,96 @@ def test_a_cache_reads_the_fill_an_earlier_run_completed_and_fills_another_key_a
     assert sorted(other.calls) == list(range(6))
 
 
+def _ids(batches):
+    return [[(int(row), int(value)) for row, value in zip(batch["id"], batch["value"], strict=True)]
+            for batch in batches]
+
+
+def test_a_cache_of_one_record_an_input_reads_each_share_as_the_uncached_order_does(tmp_path):
+    """A cache whose steps keep one record for each input, then a shuffle: two shares of an
+    indexed read each read what the uncached chain's share reads, the shuffle one order over every
+    input. A position saved at two shares restores at one, reading on as the uncached chain does."""
+    from dew.data.compile import compile
+    from dew.data.dataset import DataPartition, Loading
+    from dew.data.pipeline import Pipeline
+
+    loading = Loading(workers=0, threads=1, read_buffer=1)
+    source = Memory([{"id": index} for index in range(12)])
+
+    def built(cache):
+        stepped = Pipeline(source).map(Offset(10))
+        return compile((stepped if cache is None else stepped.cache(cache)).shuffle(0).repeat().batch(2),
+                       read="indexed", loading=loading)
+
+    def share(data, index, count, steps, state=None):
+        reader = data.train(DataPartition(index=index, count=count))
+        try:
+            if state is not None:
+                reader.set_state(state)
+            return _ids(next(reader) for _ in range(steps)), reader.get_state()
+        finally:
+            reader.close()
+
+    uncached, cached = built(None), built(str(tmp_path / "cache"))
+    for index in range(2):
+        assert share(cached, index, 2, 4)[0] == share(uncached, index, 2, 4)[0]
+    _, saved = share(cached, 0, 2, 3)
+    _, uncached_saved = share(uncached, 0, 2, 3)
+    assert share(cached, 0, 1, 3, saved)[0] == share(uncached, 0, 1, 3, uncached_saved)[0]
+
+
+def test_a_cache_skips_the_inputs_a_store_misses_as_the_uncached_read_does_and_publishes_them(tmp_path):
+    """A store in memory missing two of its inputs: a cache of one record for each input reads the
+    rest as the uncached chain does, and completes its fill with the missing ones, so a later run
+    reads the cache without running its step."""
+    from dew.data.compile import compile
+    from dew.data.dataset import DataPartition, Loading
+    from dew.data.pipeline import Pipeline
+
+    loading = Loading(workers=0, threads=1, read_buffer=1)
+    records = [None if index in (3, 7) else {"id": index} for index in range(10)]
+
+    def batches(step, cache):
+        stepped = Pipeline(Memory(records)).map(step)
+        chain = (stepped if cache is None else stepped.cache(cache)).repeat(1).batch(2)
+        reader = compile(chain, read="indexed", loading=loading).train(DataPartition())
+        try:
+            return _ids(reader)
+        finally:
+            reader.close()
+
+    expected = batches(Offset(10), None)
+    filling, reading = Offset(10), Offset(10)
+    assert batches(filling, str(tmp_path / "cache")) == expected
+    assert batches(reading, str(tmp_path / "cache")) == expected
+    assert sorted(filling.calls) == [index for index in range(10) if index not in (3, 7)]
+    assert reading.calls == []
+
+
+def test_a_cache_read_by_two_loading_workers_seals_what_each_filled(tmp_path):
+    """A cache read in one pass by two loading workers: each worker's fill is finished as its pass
+    ends, so publishing the cache afterwards runs the step on no input again."""
+    from dew.data.compile import compile, publish
+    from dew.data.dataset import DataPartition, Loading
+    from dew.data.pipeline import Pipeline
+
+    source = Memory([{"id": index} for index in range(16)], shard_rows=4)
+    cache = str(tmp_path / "cache")
+    filling = Offset(10)
+    chain = Pipeline(source).map(filling).cache(cache).repeat(1).workers(2).batch(2)
+    reader = compile(chain, read="indexed", loading=Loading(workers=0, threads=1, read_buffer=1)).train(
+        DataPartition())
+    try:
+        assert sorted(row for batch in _ids(reader) for row, _ in batch) == list(range(16))
+    finally:
+        reader.close()
+    publishing = Offset(10)
+    generation = publish(Pipeline(source).map(publishing).cache(cache), Cache(cache), read="indexed",
+                         loading=Loading(workers=0))
+    assert len(generation) == 16
+    assert publishing.calls == []
+
+
 def test_a_streamed_cache_reads_the_generation_published_under_its_key(tmp_path):
     """A streamed fill's shards are filled apart, so `publish` publishes them; a later streamed read
     of the same source and steps then reads the generation, and `publish` returns it as it is."""
