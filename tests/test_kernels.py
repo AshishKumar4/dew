@@ -708,7 +708,7 @@ def test_key_lengths_attend_as_the_mask_they_mean(implementation, causal):
     by_length = key_length_call(implementation, query, key, value, lengths, causal=causal)
     by_mask = key_length_call(implementation, query, key, value, lengths, causal=causal, as_mask=True)
     for got, want in zip(by_length, by_mask, strict=True):
-        np.testing.assert_allclose(got, want, atol=1e-6, rtol=1e-6)
+        np.testing.assert_array_equal(got, want)
     past = jnp.arange(9)[None, :, None, None] >= lengths[:, None, None, None]
     moved = key_length_call(implementation, query, jnp.where(past, 3.0, key),
                             jnp.where(past, -2.0, value), lengths, causal=causal)
