@@ -687,7 +687,7 @@ def test_a_cache_read_by_two_loading_workers_seals_what_each_filled(tmp_path):
     finally:
         reader.close()
     publishing = Offset(10)
-    generation = publish(Pipeline(source).map(publishing).cache(cache), Cache(cache), read="indexed",
+    generation = publish(Pipeline(source).map(publishing), Cache(cache), read="indexed",
                          loading=Loading(workers=0))
     assert len(generation) == 16
     assert publishing.calls == []
