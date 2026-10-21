@@ -145,8 +145,11 @@ def test_an_expert_projection_runs_the_implementation_chosen_for_it_on_the_cpu(g
     with (generation.assumed(generation_name), generation.chosen(grouped_matmul=implementation),
           generation.routes() as routes):
         operands_ = (jnp.asarray(x, jnp.bfloat16), jnp.asarray(w, jnp.float32))
-        # The CPU's lowering is the interpreted kernels', with no XLA ragged dot left to compare with itself.
-        assert "ragged_dot" not in jax.jit(products).lower(*operands_).as_text()
+        # The CPU's lowering is the interpreted kernels', not XLA's ragged dot compared with itself: an
+        # interpreter runs the grid in loops, Mosaic GPU's through host callbacks; XLA's has neither.
+        lowered = jax.jit(products).lower(*operands_).as_text()
+        assert "stablehlo.while" in lowered
+        assert ("callback" in lowered) == (implementation == "mosaic_gpu")
         y, dx, dw = jax.jit(products)(*operands_)
     assert {route.kernel for route in routes if route.choice == "grouped_matmul"} == {implementation}
     assert (y.dtype, dx.dtype, dw.dtype) == (jnp.bfloat16, jnp.bfloat16, jnp.float32)
