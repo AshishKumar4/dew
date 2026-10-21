@@ -251,13 +251,13 @@ def _source(source: Source | Mixture | Phases) -> dict[str, JSON]:
     if isinstance(source, Phases):
         return {"phases": [_chain(child) for child in source.pipelines],
                 "until_steps": list(source.until_steps)}
-    written = _typed(source, Source, "store", store=True)
+    written = _typed(source, Source, "store")
     if not isinstance(written, dict):
         raise _Unrecordable(f"the store ({type(source).__name__}) is written as no record of its class")
     return written
 
 
-def _typed(value: object, annotation: Annotation, where: str, *, store: bool = False) -> JSON:
+def _typed(value: object, annotation: Annotation, where: str) -> JSON:
     """`value` as the registry writes it against `annotation`, refused where reading that back
     through JSON builds anything but the same value (`_same`): a store is the same where its
     settings are, whichever sequence holds them, compared without opening it, since a run's record
@@ -267,7 +267,7 @@ def _typed(value: object, annotation: Annotation, where: str, *, store: bool = F
         rebuilt = from_record(_annotated(annotation), json.loads(json.dumps(written)))
     except (TypeError, ValueError, NameError) as refused:
         raise _Unrecordable(f"the {where} ({type(value).__name__}) can't be recorded: {refused}") from None
-    difference = _same(value, rebuilt, where, sequences=store)
+    difference = _same(value, rebuilt, where, sequences=isinstance(value, Source))
     if difference is not None:
         raise _Unrecordable(f"the {where} ({type(value).__name__}) reads back otherwise: {difference}")
     return written
