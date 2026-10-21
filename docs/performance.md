@@ -2604,7 +2604,7 @@ fused recurrent kernel passes once over the rows it holds. Tracing 32
 slots, those passes were a quarter of the decode program's device time.
 
 The decode token now goes through a Pallas kernel on CUDA
-(`dew.nn.kernels.delta_rule`). It reads each row-head's fp32 state once and
+(`dew.nn.kernels.recurrence.step`). It reads each row-head's fp32 state once and
 writes it once: both readouts are products with the old state (the query's
 of the update is `(q . k) delta`). At 128 rows the four XLA passes over 2.4
 GB were two thirds of the decode program. In isolation, 18 layers took 9.1
@@ -2656,7 +2656,7 @@ once. The conv state holds the projections' own bf16 values, so it is now
 held in their dtype at no loss. Rounding to nearest broke over long decodes.
 A head whose decay moves the state by less than half a bf16 step per token
 never decays, because every token rounds it back to where it was. So the
-state is rounded stochastically (`delta_rule.round_to_bf16`): up with the
+state is rounded stochastically (`recurrence.round_to_bf16`): up with the
 probability of the dropped bits, with noise hashed from the token's key and
 value.
 
