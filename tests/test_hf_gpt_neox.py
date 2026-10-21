@@ -7,7 +7,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from interop_support import drawn_ids
+from interop_support import drawn_ids, float64_logits
 from reference_error import assert_as_exact, declared_seeds, indexed_recording, recording
 
 from dew.interop import Pretrained
@@ -25,13 +25,7 @@ def test_gpt_neox_logits_and_cached_greedy_generation_match_transformers():
     stored = recording(DIRECTORY / 'recorded_logits.npz')
     seeds = declared_seeds(DIRECTORY / 'recorded_logits.npz')['logits']
     vocab = json.loads((DIRECTORY / 'config.json').read_text())['vocab_size']
-    wide_model = loaded.model.clone(dtype=jnp.float64, attention_impl='reference')
-
-    def wide(inputs):
-        variables = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64), loaded.variables)
-        return {'logits': wide_model.apply(variables, jnp.asarray(inputs['input_ids']))}
-
-    draw, reference, truth = indexed_recording(stored, 'logits', seeds, truth_fn=wide,
+    draw, reference, truth = indexed_recording(stored, 'logits', seeds, truth_fn=float64_logits(loaded),
                                                inputs_of=lambda seed: drawn_ids(vocab, seed))
     forward = jax.jit(lambda inputs: {'logits': loaded.model.apply(loaded.variables, inputs['input_ids'])})
     assert_as_exact(lambda index, inputs: forward(inputs), reference, draw, 'gpt-neox logits', seeds=seeds,

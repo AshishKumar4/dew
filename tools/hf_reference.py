@@ -1553,13 +1553,12 @@ def write_logits_recording(name: str, model: PreTrainedModel, command: str) -> N
     from copy import deepcopy
 
     import jax
-    import jax.numpy as jnp
     from diffusers_wan_reference import float64
     from fetched_fixtures import save
     from recorded_references import provenance, record_case
 
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
-    from interop_support import drawn_ids
+    from interop_support import drawn_ids, float64_logits
 
     from dew.interop import Pretrained
 
@@ -1570,8 +1569,12 @@ def write_logits_recording(name: str, model: PreTrainedModel, command: str) -> N
     with float64():
         # Rotary inverse frequencies are buffers built at construction in float32: rebuilt in float64.
         for module in wide.modules():
-            build = getattr(module, "rope_init_fn", None) or getattr(module, "compute_default_rope_parameters", None)
-            if build is not None and hasattr(module, "inv_freq"):
+            build = (getattr(module, "rope_init_fn", None)
+                     or getattr(module, "compute_default_rope_parameters", None))
+            if hasattr(module, "inv_freq"):
+                if build is None:
+                    raise ValueError(f"{type(module).__name__} holds float32 inverse frequencies and no rule "
+                                     f"to rebuild them in float64")
                 inverse, _ = build(module.config, None)
                 module.inv_freq = inverse.double()
                 if hasattr(module, "original_inv_freq"):
@@ -1579,7 +1582,6 @@ def write_logits_recording(name: str, model: PreTrainedModel, command: str) -> N
                 print(f"{type(module).__name__}: inverse frequencies rebuilt in float64", flush=True)
     vocab = model.config.vocab_size
     native = Pretrained.load(directory, dtype="float32", attention_impl="reference")
-    wide_model = native.model.clone(dtype=jnp.float64, attention_impl="reference")
 
     def evaluate(inputs):
         ids = torch.from_numpy(inputs["input_ids"].astype(np.int64))
@@ -1592,13 +1594,9 @@ def write_logits_recording(name: str, model: PreTrainedModel, command: str) -> N
     def proxy(inputs):
         return {"logits": native.model.apply(native.variables, inputs["input_ids"])}
 
-    def truth_proxy(inputs):
-        wide_variables = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64), native.variables)
-        return {"logits": wide_model.apply(wide_variables, inputs["input_ids"])}
-
-    with jax.enable_x64(True):
+    with jax.enable_x64(new_val=True):
         recording = record_case("logits", lambda seed: drawn_ids(vocab, seed), evaluate, proxy,
-                                truth_proxy=truth_proxy, store_inputs=False, summary=True)
+                                truth_proxy=float64_logits(native), store_inputs=False, summary=True)
     import transformers
 
     record = provenance(f"transformers {type(model).__name__}", transformers.__version__, "cpu", command,
