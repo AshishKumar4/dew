@@ -1765,36 +1765,33 @@ def _tolerance_comparisons(module: Module) -> Iterator[tuple[ast.AST, str]]:
     """SLOP020's comparisons in a module (`tolerance_rules.comparisons`), its imports read from its own
     package and its calls resolved as SLOP018 resolves them. A function imported by a bare module name
     from a file beside it, as tests import their support (`from test_pipeline_core import delivered`),
-    returns only whole numbers, or may return an error, where that file's own reading proves it does
-    (`_support_functions`), as the same function defined in the test would."""
+    is read as that file's own reading proves it (`_support_functions`), as the same function defined in
+    the test would be."""
     parent = tuple(_parent(module))
     tables = {id(node): table for node, table in scopes.scoped(module.tree.body, {}, list(parent))}
 
-    def imported(kind: str):
-        def read(called: str) -> bool:
-            source, _, name = called.rpartition(".")
-            path = module.path.parent / f"{source}.py"
-            return bool(source) and "." not in source and path.is_file() and name in _support_functions(
-                path, parent, path.stat().st_mtime_ns)[kind]
-        return read
+    def imported(called: str) -> tolerance_rules.Imported | None:
+        source, _, name = called.rpartition(".")
+        path = module.path.parent / f"{source}.py"
+        if not source or "." in source or not path.is_file():
+            return None
+        return _support_functions(path, parent, path.stat().st_mtime_ns).get(name)
 
-    return tolerance_rules.comparisons(module.tree, tables, _Calls(module.tree), imported("whole"),
-                                       imported("erring"))
+    return tolerance_rules.comparisons(module.tree, tables, _Calls(module.tree), imported)
 
 
 @functools.cache
-def _support_functions(path: Path, parent: tuple[str, ...], modified: int) -> dict[str, frozenset[str]]:
-    """The module-level functions of the file at `path` every return of which is whole, and those that
-    may return an error (`tolerance_rules.support_functions`), read as of its modification time
-    `modified`."""
+def _support_functions(path: Path, parent: tuple[str, ...], modified: int
+                       ) -> dict[str, tolerance_rules.Imported]:
+    """What the file at `path` proves of each of its module-level functions
+    (`tolerance_rules.support_functions`), read as of its modification time `modified`."""
     tree = ast.parse(path.read_text(encoding="utf-8"))
     tables = {id(node): table for node, table in scopes.scoped(tree.body, {}, list(parent))}
     calls = _Calls(tree)
     # A name the module binds twice, or to anything but its one definition, is no one's.
     bound = calls.bindings[id(tree)]
-    defined = ast.FunctionDef | ast.AsyncFunctionDef
-    return {kind: frozenset(name for name in names if isinstance(bound.get(name), defined))
-            for kind, names in tolerance_rules.support_functions(tree, tables, calls).items()}
+    return {name: found for name, found in tolerance_rules.support_functions(tree, tables, calls).items()
+            if isinstance(bound.get(name), ast.FunctionDef | ast.AsyncFunctionDef)}
 
 
 def _inventory(checkout: Path) -> dict:
