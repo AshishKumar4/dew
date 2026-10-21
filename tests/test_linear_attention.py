@@ -809,8 +809,9 @@ def test_the_decode_kernel_keeps_the_kernel_contract_on_a_mesh(axis, split):
     heads_at = {0: 0, 2: 1}[split]
     specs = [spec(4, split)] * 3 + [spec(3, split)] * 2 + [spec(4, heads_at), spec(1, split)]
     mesh = Mesh(np.asarray(jax.devices()[:2]), (axis,))
+    # The kernel aliases its state into its output, and serving donates it (`donate`).
     assert_runs_per_shard(decode_gated_delta_rule, draw, specs, mesh, f"delta decode split over {axis}",
-                          seeds=SHARDED_SEEDS, truth_fn=exact)
+                          seeds=SHARDED_SEEDS, truth_fn=exact, donate=(5,))
 
 
 @pytest.mark.gpu(reason="the kernel runs on CUDA")
