@@ -23,13 +23,45 @@ and none rewrites. A token updates and reads, per head over a state `S` `[Dk, Dv
 Each works over any leading dimensions: the portable math (`recurrence_chunk.chunk_delta_rule`) calls them
 on `[B, H, NC, ...]` arrays, and a kernel's body on one chunk's tiles. Packed `documents` restart the
 decays at each document's first position (varlen).
+
+The algebra declares its products and issues none (the design's layering): every product goes through the
+caller's `issue(name, left, right)`, the mainloop's, by its name in `PRODUCTS`, which says what it
+multiplies; the portable math's issuer is XLA's (`portable`), a kernel's its own dot.
 """
+
+from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
 from jax.custom_derivatives import linear_call
 
 from dew.nn.precision import compensated_add, compensated_difference
+
+Issue = Callable[[str, jax.Array, jax.Array], jax.Array]
+"""A mainloop's product: `issue(name, left, right)` is `left @ right` over the last two axes, the product
+`PRODUCTS[name]` declares, in the mainloop's own dot."""
+
+PRODUCTS = {
+    "intra": "the write-gated keys against the keys, `kb k^T`, under a decay a head (`intra`)",
+    "scores": "the queries against the keys, `q k^T`, under a decay a head (`readout`)",
+    "merge": "two diagonal blocks' inverses joined across the block below them (`factor`)",
+    "apply_w": "the inverse against the decayed write-gated keys, `L (kb exp(gc))` (`apply`)",
+    "apply_u": "the inverse against the write-gated values, `L (vb)` (`apply`)",
+    "corrected": "the write's keys against the memory entering, `W S` (`carry`)",
+    "write": "the decayed keys against the corrected values, `(k last)^T v_new` (`carry`)",
+    "memory": "the decayed queries against the memory entered, `(q exp(gc)) S` (`readout`)",
+    "local": "the chunk's scores against its corrected values, `A_qk v_new` (`readout`)",
+    "compose": "a transition against another's, `T2 T1` and `T2 W1` (`compose`)",
+}
+"""The algebra's products by name. A decay a key dimension weighs each term of `intra`'s and `scores`'
+contractions (`paired`), which a mainloop issues as a product of the factored operands within the
+range its decay's bound keeps exact, or as the weighed sum."""
+
+
+def portable(name: str, left, right):
+    """XLA's product, the portable math's issuer: `left @ right`, at the process's default precision."""
+    del name
+    return left @ right
 
 
 def _cumulated(g, documents=None):
@@ -141,7 +173,7 @@ def _chunk_decay_tangent(primals, tangents):
     return (gc, decay), (_cumulated(dg, documents)[0], linear_call(_ranged, _ranged_transpose, decay, dg))
 
 
-def strictly_lower_inverse(a):
+def strictly_lower_inverse(a, issue: Issue = portable):
     """Return (I - A)^-1 for strictly lower triangular `a` `[..., C, C]`, the
     chunked delta rules' `attn[i, :i] += sum_k attn[i, k] attn[k, :i]` loop.
 
@@ -163,7 +195,7 @@ def strictly_lower_inverse(a):
     width = 1 << (chunk_size - 1).bit_length()
     if width != chunk_size:  # zero rows and columns extend it by the identity
         pad = [(0, 0)] * (a.ndim - 2) + [(0, width - chunk_size)] * 2
-        return strictly_lower_inverse(jnp.pad(a, pad))[..., :chunk_size, :chunk_size]
+        return strictly_lower_inverse(jnp.pad(a, pad), issue)[..., :chunk_size, :chunk_size]
     lead = a.shape[:-2]
 
     def diagonal_blocks(size):
@@ -180,19 +212,18 @@ def strictly_lower_inverse(a):
     while size < width:
         pairs = inverse.reshape(*lead, width // (2 * size), 2, size, size)
         first, second = pairs[..., 0, :, :], pairs[..., 1, :, :]
-        joined = second @ diagonal_blocks(2 * size)[..., size:, :size] @ first
+        joined = issue("merge", issue("merge", second, diagonal_blocks(2 * size)[..., size:, :size]), first)
         top = jnp.concatenate([first, jnp.zeros_like(first)], -1)
         inverse = jnp.concatenate([top, jnp.concatenate([joined, second], -1)], -2)
         size *= 2
     return inverse.reshape(*lead, width, width)
 
 
-def _paired(left, right, decay):
-    """`sum_d left[s, d] right[t, d] decay[s, t, d]` within each chunk,
-    `[..., C, C]`: one decay channel scales the product after it, one per key
-    dimension weighs each term of it."""
+def paired(name: str, left, right, decay, issue: Issue = portable):
+    """`sum_d left[s, d] right[t, d] decay[s, t, d]` within each chunk, `[..., C, C]`: one decay channel
+    scales the product `name` after it, one per key dimension weighs each term of it."""
     if decay.shape[-1] == 1:
-        return (left @ jnp.swapaxes(right, -1, -2)) * decay[..., 0]
+        return issue(name, left, jnp.swapaxes(right, -1, -2)) * decay[..., 0]
     return jnp.einsum('...sd,...td,...std->...st', left, right, decay)
 
 
@@ -201,56 +232,57 @@ def decays(g, documents=None):
     return chunk_decay(g, documents)
 
 
-def intra(key, keyed, pairs):
+def intra(key, keyed, pairs, issue: Issue = portable):
     """The delta rule's strictly lower system `A` `[..., C, C]`: `-sum_d keyed[s, d] key[t, d] pairs[s, t, d]`
     for s > t, zero on and above the diagonal, `keyed` the write-gated keys `beta k`."""
     chunk_size = pairs.shape[-2]
     strict = jnp.tril(jnp.ones((chunk_size, chunk_size), jnp.bool_), -1)
-    return jnp.where(strict, -_paired(keyed, key, pairs), 0.0)
+    return jnp.where(strict, -paired("intra", keyed, key, pairs, issue), 0.0)
 
 
-def factor(a):
+def factor(a, issue: Issue = portable):
     """`(I - A)^-1` of the strictly lower `a` (`strictly_lower_inverse`)."""
-    return strictly_lower_inverse(a)
+    return strictly_lower_inverse(a, issue)
 
 
-def apply(inverse, keyed, valued, entering):
+def apply(inverse, keyed, valued, entering, issue: Issue = portable):
     """`(W, U)`: the corrected write's products `inverse @ (keyed * entering)` and `inverse @ valued`, or,
     without the delta rule (`inverse` None), no correction and the gated values as they are."""
     if inverse is None:
         return jnp.zeros_like(keyed), valued
-    return inverse @ (keyed * entering), inverse @ valued
+    return issue("apply_w", inverse, keyed * entering), issue("apply_u", inverse, valued)
 
 
-def carry(state, step):
+def carry(state, step, issue: Issue = portable):
     """One chunk across the memory `state` `[..., Dk, Dv]`: `step` is the chunk's keys, `W`, `U`, `gc`, the
     decay's last row `last` (`exp(gc[-1] - gc)`, zero for a packed chunk's earlier documents) and `kept`
     (one where the memory entering passes through, zero where a document starts in the chunk). Returns
     the memory leaving and `(the memory entering, v_new)`."""
     k_i, w_i, u_i, gc_i, last_i, kept_i = step
-    v_corrected = u_i - w_i @ state
+    v_corrected = u_i - issue("corrected", w_i, state)
     return (state * jnp.swapaxes(jnp.exp(gc_i[..., -1:, :]), -1, -2) * kept_i
-            + jnp.swapaxes(k_i * last_i, -1, -2) @ v_corrected, (state, v_corrected))
+            + issue("write", jnp.swapaxes(k_i * last_i, -1, -2), v_corrected), (state, v_corrected))
 
 
-def readout(query, entering, entered, key, pairs, corrected):
+def readout(query, entering, entered, key, pairs, corrected, issue: Issue = portable):
     """A chunk's output `[..., C, Dv]`: the memory it entered read through the decayed queries, and the
     chunk's own pairs over its corrected values (the inclusive lower `pairs` read the token itself)."""
-    return (query * entering) @ entered + _paired(query, key, pairs) @ corrected
+    return (issue("memory", query * entering, entered)
+            + issue("local", paired("scores", query, key, pairs, issue), corrected))
 
 
-def compose(first, second):
+def compose(first, second, issue: Issue = portable):
     """Two spans' transitions as one: each a pair `(T [..., Dk, Dk], W [..., Dk, Dv])` taking the memory
     entering to `T S + W`; `second` after `first` is `(T2 T1, T2 W1 + W2)`, associative, so a scan over
     spans may run as a tree."""
     (t1, w1), (t2, w2) = first, second
-    return t2 @ t1, t2 @ w1 + w2
+    return issue("compose", t2, t1), issue("compose", t2, w1) + w2
 
 
-def transition(key, w, u, gc, last, kept):
+def transition(key, w, u, gc, last, kept, issue: Issue = portable):
     """A chunk's transition `(T, W)` (`compose`): with `carry`'s operands,
     `T = exp(gc[-1]) kept - (k last)^T W` and `W = (k last)^T U`, so `carry`'s memory leaving is `T S + W`."""
     decayed = jnp.swapaxes(key * last, -1, -2)
     dk = key.shape[-1]
     diagonal = jnp.eye(dk, dtype=gc.dtype) * jnp.swapaxes(jnp.exp(gc[..., -1:, :]), -1, -2) * kept
-    return diagonal - decayed @ w, decayed @ u
+    return diagonal - issue("corrected", decayed, w), issue("write", decayed, u)
