@@ -64,6 +64,7 @@ rounding of the computation itself (`assert_computes_the_oracle`).
 
 import dataclasses
 import hashlib
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -431,12 +432,22 @@ def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most
                          f"{most} seeds at {wide[:4]}; give the site larger inputs or fewer shared factors")
 
 
+def recording(path) -> dict[str, np.ndarray]:
+    """A recording of a reference over seeds (`indexed_recording`'s `stored`), read whole: from git where
+    it is at most 1 MiB, else from the fetched store's local copy, checked against its pin
+    (tools/fetched_fixtures.py)."""
+    from tool_support import REPO_ROOT, load
+
+    relative = Path(path).resolve().relative_to(REPO_ROOT).as_posix()
+    with np.load(load("fetched_fixtures").local(relative), allow_pickle=False) as stored:
+        return dict(stored)
+
+
 def declared_seeds(path) -> dict[str, int]:
     """Each site's declared seed count in a recording of a reference over seeds (`indexed_recording`):
     its `<site>.seeds`, written at record time by `seeds_for` on the recorded reference."""
-    with np.load(path) as stored:
-        return {name.removesuffix(".seeds"): int(stored[name]) for name in stored.files
-                if name.endswith(".seeds")}
+    return {name.removesuffix(".seeds"): int(value) for name, value in recording(path).items()
+            if name.endswith(".seeds")}
 
 
 def input_digest(inputs) -> np.uint64:

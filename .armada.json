@@ -4,7 +4,8 @@
     "base": "cloudflare/debian-trixie",
     "setup": "tools/armada/setup.sh",
     "install": "tools/armada/install.sh",
-    "key": ["locks/cpu.txt", "tools/install_environment.sh"],
+    "key": ["locks/cpu.txt", "tools/install_environment.sh", "tools/armada/install.sh",
+            "tests/fixtures/fetched.json"],
     "smoke": ".venv-3.12/bin/python -c 'import dew' && .venv-3.14/bin/python -c 'import dew'"
   },
   "history": "commit",
