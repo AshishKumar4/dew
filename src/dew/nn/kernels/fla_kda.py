@@ -144,9 +144,10 @@ _INTRA_ROWS = IntraRows()
 
 def intra_rows(q, k, g, beta, *, scale: float, chunk: int = 64, spans: Sequences | None = None,
                interpret: bool = False):
-    """`(Aqk, Akk)` `[B, T, HV, BT]`, each token's row of its chunk, `Aqk` in `k`'s dtype and `Akk` fp32,
-    every pair's decay its own (`_intra_rows_kernel`): a program per place of each chunk (`spans`, the
-    rows' own where None) and `BH` value heads."""
+    """`(Aqk, Akk)` `[B, T, HV, BT]`, each token's row of its chunk's diagonal 16-token block, zero
+    elsewhere (the solve computes the blocks below it, `intra_solve`), `Aqk` in `k`'s dtype and `Akk`
+    fp32, every pair's decay its own (`_intra_rows_kernel`): a program per place of each chunk (`spans`,
+    the rows' own where None) and `BH` value heads."""
     spans = sequences(*k.shape[:2], chunk=chunk) if spans is None else spans
     return _INTRA_ROWS(q, k, g, beta, *spans, chunk=chunk, scale=scale, interpret=interpret)
 
@@ -156,10 +157,11 @@ def _intra_solve_kernel(chunk_ref, q_ref, k_ref, g_ref, beta_ref, aqkd_ref, akkd
     """fla's `chunk_kda_fwd_kernel_inter_solve_fused` (chunk_intra.py:43-391), safe_gate off, for one
     chunk of one head in 16-row blocks: the diagonal blocks the rows `intra_rows` computed, and each
     block below them factored through its rows' sub-chunk's first row `n`, `Aqk_IJ = scale (q_I
-    exp2(g_I - g_n)) (k_J exp2(g_n - g_J))^T` and `Akk_IJ = (beta_I k_I exp2(g_I - g_n)) (k_J exp2(g_n -
-    g_J))^T`, every factor's exponent at most zero, the factors rounded to the keys' dtype for their
-    product at the call's solve precision (`fla_gdn._dot`'s `solve`), as fla's are; `Aqk` stored in the
-    keys' dtype, and `I + Akk`'s diagonal blocks inverted by forward substitution and merged in fla's
+    exp2(g_I - g_n)) (k_J exp2(g_n - g_J))^T` and `Akk_IJ = beta_I (k_I exp2(g_I - g_n)) (k_J exp2(g_n -
+    g_J))^T`, every factor's exponent at most zero, the factors fp32 and their product at the call's solve
+    precision (`fla_gdn._dot`'s `solve`), beta applied after it, as fla's are (chunk_intra.py:141-161,
+    226-228); `Aqk` stored in the keys' dtype, and `I + Akk`'s diagonal blocks inverted by forward
+    substitution and merged in fla's
     order, `X_IJ = -(X_II A_IJ) X_JJ` for neighbours and `-X_II (sum_M A_IM X_MJ)` beyond, at the
     solve precision, the inverse stored in the keys' dtype; both zero above the diagonal. A chunk's
     rows past its end are none of them stored."""
@@ -188,12 +190,11 @@ def _intra_solve_kernel(chunk_ref, q_ref, k_ref, g_ref, beta_ref, aqkd_ref, akkd
             ahead = jnp.exp2(_gates(g_ref, start, taken, SUB, i * SUB) - first[None, :])
             behind = jnp.exp2(first[None, :] - _gates(g_ref, start, taken, SUB, j * SUB))
             beta = rows(beta_ref, i).astype(jnp.float32)
-            narrow = k_ref.dtype
-            right = (rows(k_ref, j).astype(jnp.float32) * behind).astype(narrow).T
-            queries = (rows(q_ref, i).astype(jnp.float32) * ahead).astype(narrow)
-            keys = (rows(k_ref, i).astype(jnp.float32) * beta[:, None] * ahead).astype(narrow)
+            right = (rows(k_ref, j).astype(jnp.float32) * behind).T
+            queries = rows(q_ref, i).astype(jnp.float32) * ahead
+            keys = rows(k_ref, i).astype(jnp.float32) * ahead
             return (_dot(queries, right, exact=exact, solve=solve) * scale,
-                    _dot(keys, right, exact=exact, solve=solve))
+                    _dot(keys, right, exact=exact, solve=solve) * beta[:, None])
 
         blocks = {(i, j): below(i, j) for i in range(count) for j in range(i)}
         for i in range(count):
@@ -224,8 +225,9 @@ class IntraSolve(_Launch):
 
     NAME = "intra_solve"
     KEYS, VALUES = "aqk", None
-    SPACES = _spaces(_tiles([(0, 0)], (1, 2, 4), (1,)))
-    PICKS = _picks(Tiles(0, 0, 1, 1), small=Tiles(0, 0, 2, 1))
+    # The blocks below the diagonal are products over the keys' width, a warp's work no longer.
+    SPACES = _spaces(_tiles([(0, 0)], (1, 2, 4, 8), (1,)))
+    PICKS = _picks(Tiles(0, 0, 4, 1))
     revision: int = 3
 
     def _fwd(self, q: jax.Array, k: jax.Array, g: jax.Array, beta: jax.Array, aqk: jax.Array, akk: jax.Array,
