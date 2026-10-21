@@ -129,8 +129,8 @@ def test_check_one_fails_a_sum_that_differs_rather_than_rounds(wrong):
 def test_check_one_is_inconclusive_where_its_seeds_cannot_resolve_the_factor():
     """Errors set seed by seed, alike on every host: Dew's squared error is 4 on even seeds and 0.01 on
     odd ones, the reference's 1 on each, so the pooled ratio (1.42) is under PARITY but its interval
-    over 8 seeds straddles it and is wider than it: inconclusive, never a pass. Fewer seeds than
-    FEWEST_SEEDS are inconclusive whatever they read."""
+    straddles it and is wider than it over 8 seeds and over the second stage's 40 alike: inconclusive,
+    never a pass. Fewer seeds than FEWEST_SEEDS are inconclusive whatever they read."""
     def errors(seed):
         return (np.zeros(64, np.float32), np.full(64, 2.0 if seed % 2 == 0 else 0.1, np.float32),
                 np.ones(64, np.float32))
@@ -150,6 +150,55 @@ def test_check_one_is_inconclusive_where_its_seeds_cannot_resolve_the_factor():
         assert_as_exact(_reordered, _product, _draw, "two seeds", seeds=2)
     # And seeds_for never declares fewer, whatever it is asked to start from.
     assert seeds_for(_product, _draw, "product", start=1) >= 8
+
+
+def _set_errors(even: float, odd: float):
+    """A draw whose Dew's squared error is `even` on even seeds and `odd` on odd ones, the reference's 1
+    on each: a site's error law set seed by seed, alike on every host."""
+    def errors(seed):
+        return (np.zeros(64, np.float32), np.full(64, np.sqrt(even if seed % 2 == 0 else odd), np.float32),
+                np.ones(64, np.float32))
+
+    def dew(x, mine, theirs):
+        return {"y": x + mine}
+
+    def reference(x, mine, theirs):
+        return {"y": x + theirs}
+
+    def truth(x, mine, theirs):
+        return {"y": x}
+
+    return dew, reference, errors, truth
+
+
+def test_check_one_decides_at_its_second_stage_what_its_first_leaves_inconclusive(tmp_path, monkeypatch):
+    """Dew's squared error 2.6 on even seeds and 0.1 on odd ones, the reference's 1: over 8 seeds the
+    pooled ratio's interval straddles PARITY and is wider than it; the second stage's 40 resolve it
+    under PARITY, so the site passes, and its stage is logged, as every judgement's is."""
+    import json
+
+    from reference_error import STAGES_LOG, _interval, _pooled, _status
+
+    dew, reference, errors, truth = _set_errors(2.6, 0.1)
+    first = np.array([2.6 if seed % 2 == 0 else 0.1 for seed in range(8)])
+    assert _status(_pooled(first, np.ones(8)), *_interval(first, np.ones(8))) == "inconclusive"
+    log = tmp_path / "stages.jsonl"
+    monkeypatch.setenv(STAGES_LOG, str(log))
+    assert_as_exact(dew, reference, errors, "second stage", seeds=8, truth_fn=truth)
+    assert_as_exact(_reordered, _product, _draw, "first stage", seeds=8)
+    logged = [json.loads(line) for line in log.read_text().splitlines()]
+    assert [(entry["label"], entry["stage"], entry["verdict"]) for entry in logged] == [
+        ("second stage", 2, "pass"), ("first stage", 1, "pass")]
+
+
+def test_a_leafs_interval_is_widened_to_hold_its_ratio():
+    """A percentile interval that leaves out its own ratio is widened to hold it before any verdict: a
+    ratio over PARITY under an interval wholly at or under it is no pass."""
+    from reference_error import _status
+
+    assert _status(1.6, 1.0, 1.4) != "pass"
+    assert _status(0.9, 1.1, 1.4) == "pass"
+    assert _status(1.7, 1.6, 1.8) == "over"
 
 
 def test_check_one_holds_dew_exact_where_the_reference_is_exact_on_every_seed():
@@ -346,7 +395,7 @@ def test_null_runs_judge_the_reference_against_itself_on_draws_no_other_run_take
         return _draw(seed)
 
     verdicts = null_runs(_product, draw, "null", seeds=8, runs=3)
-    assert verdicts == ["pass"] * 3
+    assert [verdict for verdict, _ in verdicts] == ["pass"] * 3
     assert len(taken) == len(set(taken))
     assert null_rate_bound(0, 1400) == pytest.approx(1 - 0.001 ** (1 / 1400), rel=1e-9)
     assert null_rate_bound(0, 200) > 0.03
