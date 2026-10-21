@@ -17,6 +17,7 @@ import time
 from collections.abc import Callable, Hashable, Mapping
 
 import jax
+import jax.numpy as jnp
 
 
 @dataclasses.dataclass(frozen=True)
@@ -75,6 +76,13 @@ class Benchmark[T]:
 
     def __str__(self) -> str:
         return self.table()
+
+
+def largest_difference(left, right) -> float:
+    """The largest elementwise difference between two pytrees of arrays, in fp32: how far one
+    implementation's outputs sit from another's."""
+    return max(float(jnp.max(jnp.abs(a.astype(jnp.float32) - b.astype(jnp.float32))))
+               for a, b in zip(jax.tree.leaves(left), jax.tree.leaves(right), strict=True))
 
 
 def samples[T](fn: Callable[..., T], *args, warmup: int = 3, repeats: int = 10,
