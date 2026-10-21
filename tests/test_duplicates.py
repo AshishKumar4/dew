@@ -114,17 +114,16 @@ def test_six_statements_two_functions_share_fail_where_their_functions_differ(tm
     assert done.returncode == 1 and done.stdout.count("duplicate statements") == 1, done.stdout
 
 
-def test_two_files_closing_alike_on_exit_fail(tmp_path):
-    """Two context managers whose exits close the same way, the error noted on the one in flight: a small
-    function (ledger 934's size), written twice."""
-    exit_ = ("class {0}:\n    def close(self):\n        pass\n\n"
-             "    def __exit__(self, kind, {1}, traceback):\n        try:\n            self.close()\n"
-             "        except BaseException as {2}:\n            if {1} is None:\n                raise\n"
-             "            {1}.add_note(f'{0} cleanup failed: {{{2}!r}}')\n")
-    done = gate(tree(tmp_path, "copied", {"prefetch.py": exit_.format("Prefetch", "exc", "error"),
-                                          "tracker.py": exit_.format("Tracker", "pending", "failure")}))
+def test_two_files_evaluating_alike_fail(tmp_path):
+    """Two objectives that score their own batch fields through one compiled program the same way: a small
+    function (ledger 932's size), written twice."""
+    evaluate = ("class {0}:\n    def evaluate(self, params, batch, step):\n"
+                "        {1} = {{{2!r}: batch[{2!r}], {3!r}: batch[{3!r}]}}\n"
+                "        return self.compiled(self.variables(params, step), {1}, step.key)\n")
+    done = gate(tree(tmp_path, "copied", {"grpo.py": evaluate.format("Grpo", "prompts", "prompt", "length"),
+                                          "dpo.py": evaluate.format("Dpo", "pairs", "ids", "mask")}))
     assert done.returncode == 1 and "duplicate function in 2 files" in done.stdout, done.stdout
-    assert "Prefetch.__exit__" in done.stdout and "Tracker.__exit__" in done.stdout
+    assert "Grpo.evaluate" in done.stdout and "Dpo.evaluate" in done.stdout
 
 
 def test_declarations_alike_are_no_copy(tmp_path):

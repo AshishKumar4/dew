@@ -37,10 +37,11 @@ ARGUMENTS = ("--disable=all", "--enable=duplicate-code", "--min-similarity-lines
              "--ignore-signatures=y", "--ignore-docstrings=y", "--ignore-comments=y", "--score=n")
 """The text reading's one statement of the check, which the gate and its test both run."""
 
-FUNCTION_NODES = 20
+FUNCTION_NODES = 22
 """The fewest syntax nodes a function's body has for its copies to count: below it, a body says too little
-(a property, a one-line delegation) for two to be one logic. The least that holds every copy the first run
-filed: the smallest, two classes' two-line constructors (ledger 934), has 21."""
+(a property, a one-line delegation) for two to be one logic. The smallest copy filed that shares knowledge,
+two objectives' evaluate (ledger 932), has 23; at 21, two test doubles storing their own fields match by
+shape alone (ledger 934)."""
 WINDOW = 6
 """Consecutive statements a window holds, as pylint's six lines."""
 WINDOW_NODES = 28
