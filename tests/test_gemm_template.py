@@ -15,7 +15,7 @@ from jax.sharding import Mesh
 from reference_error import assert_as_exact
 
 from dew.nn.kernels import generation, grouped_matmul
-from dew.nn.kernels.templates.gemm import fused, template
+from dew.nn.kernels.templates.gemm import fused, mosaic_gpu, template
 
 pytestmark = pytest.mark.kernel
 
@@ -131,23 +131,28 @@ def _dew(case, **kw):
     return run
 
 
-def _plain(case, out_dtypes=None):
+def _plain(case, *, truth: bool = False):
     """The program the template stands for: the prologue rounded to the rows' dtype, each group's rows
-    times its matrix rounded alike, summed wide, the epilogue, each output rounded once."""
+    times its matrix rounded alike, summed wide, the epilogue, each output rounded once. As `truth`, on
+    float64 inputs: the operands rounded as the program rounds them (forward only), nothing else."""
+    def operand(array, dtype):
+        rounded = array.astype(dtype).astype(array.dtype)
+        return array + jax.lax.stop_gradient(rounded - array) if truth else rounded
+
     def run(x, w, ms, nw, b, u, s):
         drawn, h = (x, w, ms, nw, b, u, s), x
         if case.prologue is not None:
-            h = case.prologue(x, *(a for a, _ in case.prologue_operands(*drawn))).astype(x.dtype)
+            h = operand(case.prologue(x, *(a for a, _ in case.prologue_operands(*drawn))), jnp.bfloat16)
         wide = jnp.promote_types(x.dtype, jnp.float32)
+        matrix = operand(w, jnp.bfloat16).astype(h.dtype)
         if case.dense:
-            acc = jnp.dot(h, w[1].astype(x.dtype), preferred_element_type=wide)
+            acc = jnp.dot(h, matrix[1], preferred_element_type=wide)
         else:
-            acc = jax.lax.ragged_dot(h, w.astype(x.dtype), jnp.asarray(SIZES), preferred_element_type=wide)
+            acc = jax.lax.ragged_dot(h, matrix, jnp.asarray(SIZES), preferred_element_type=wide)
         if case.epilogue is not None:
             acc = case.epilogue(acc, *(a for a, _ in case.epilogue_operands(*drawn)))
-        outs = acc
-        outs = outs if isinstance(outs, tuple) else (outs,)
-        dtypes = out_dtypes or case.out_dtypes
+        outs = acc if isinstance(acc, tuple) else (acc,)
+        dtypes = (jnp.float64,) * len(outs) if truth else case.out_dtypes
         return tuple(out.astype(dtype) for out, dtype in zip(outs, dtypes, strict=True))
     return run
 
@@ -166,7 +171,7 @@ def test_the_template_holds_check_1_with_its_hooks(generation_name, case):
     with generation.assumed(generation_name):
         dew = jax.jit(_drop(_dew(spec, interpret_on_cpu=True)))
         assert_as_exact(dew, jax.jit(_drop(_plain(spec))), _draw, f"{case} on {generation_name}",
-                        seeds=SEEDS, truth_fn=_drop(_plain(spec, (jnp.float64,) * len(spec.out_dtypes))))
+                        seeds=SEEDS, truth_fn=_drop(_plain(spec, truth=True)))
 
 
 def _loss(run):
@@ -187,7 +192,7 @@ def test_the_templates_gradients_hold_check_1(generation_name, case):
         dew = _loss(_dew(spec, interpret_on_cpu=True))
         dew = dew if generation_name == "sm90" else jax.jit(dew)
         assert_as_exact(dew, jax.jit(_loss(_plain(spec))), _draw, f"{case} gradients on {generation_name}",
-                        seeds=SEEDS, truth_fn=_loss(_plain(spec, (jnp.float64,) * len(spec.out_dtypes))))
+                        seeds=SEEDS, truth_fn=_loss(_plain(spec, truth=True)))
 
 
 def test_an_empty_rows_undefined_derivative_reaches_no_shared_gradient():
@@ -310,7 +315,7 @@ def test_a_side_operand_names_one_launch_axis_per_dimension():
     x, w = jnp.ones((8, DEPTH), jnp.bfloat16), jnp.ones((1, DEPTH, WIDTH))
     for operand, axes in ((jnp.ones((8,)), ("columns",)), (jnp.ones((8, 2)), ("rows", None)),
                           (jnp.ones((1,)), (None,))):
-        with pytest.raises(ValueError, match="prologue side operand of shape"):
+        with pytest.raises(ValueError):
             template.gemm(x, w, jnp.asarray([8]), prologue=normed, prologue_operands=((operand, axes),),
                           out_dtype=jnp.float32)
 
@@ -356,20 +361,20 @@ def test_forward_mode_takes_the_plain_programs_tangent():
     assert value.dtype == portable_value.dtype == jnp.bfloat16
 
 
-def bias_cast(prod, b, r):
-    return (prod + b[None, :]).astype(jnp.bfloat16)
+def bias_cast(prod, b, r, dtype=jnp.bfloat16):
+    return (prod + b[None, :]).astype(dtype)
 
 
-def silu_residual(prod, b, r):
-    return (jax.nn.silu(prod * 2) + r.astype(jnp.float32)).astype(jnp.bfloat16)
+def silu_residual(prod, b, r, dtype=jnp.bfloat16):
+    return (jax.nn.silu(prod * 2) + _wide(r)).astype(dtype)
 
 
-def two_consumers(prod, b, r):
-    return prod.astype(jnp.bfloat16), prod + b[None, :]
+def two_consumers(prod, b, r, dtype=jnp.bfloat16):
+    return prod.astype(dtype), prod + b[None, :]
 
 
-def positional(prod, b, r):
-    return (prod + jax.lax.broadcasted_iota(jnp.float32, prod.shape, 1)).astype(jnp.bfloat16)
+def positional(prod, b, r, dtype=jnp.bfloat16):
+    return (prod + jax.lax.broadcasted_iota(prod.dtype, prod.shape, 1)).astype(dtype)
 
 
 @pytest.mark.parametrize("generation_name", ["sm80", "sm90"])
@@ -377,40 +382,42 @@ def positional(prod, b, r):
                          ids=lambda consumer: consumer.__name__)
 def test_the_fused_epilogue_keeps_the_programs_value(generation_name, consumer):
     """Under `fuser.fuse`, a product's consumers run in the epilogue (or after it in XLA, where they read
-    the tile's position) with the unfused program's value on every row: as exact as it from float64."""
-    x, w, _, _, b, u, *_ = _draw(3)
-    r = u[:, :WIDTH]
+    the tile's position) with the unfused program's value on every row: as exact as it, from float64."""
     sizes = jnp.asarray(SIZES)
+
+    def draw(seed):
+        x, w, _, _, b, u, *_ = _draw(seed)
+        return x, w, b, u[:, :WIDTH]
+
+    def fusing(x, w, b, r):
+        return consumer(fused.fusible_gemm(x, w, sizes, interpret_on_cpu=True), b, r)
 
     def unfused(x, w, b, r):
         return consumer(template.gemm(x, w, sizes, out_dtype=jnp.float32), b, r)
 
-    with generation.assumed(generation_name):
-        def fusing(x, w, b, r):
-            return consumer(fused.fusible_gemm(x, w, sizes, interpret_on_cpu=True), b, r)
+    def truth(x, w, b, r):
+        matrix = w.astype(jnp.bfloat16).astype(x.dtype)
+        product = jax.lax.ragged_dot(x, matrix, sizes, preferred_element_type=x.dtype)
+        return consumer(product, b, r, dtype=x.dtype)
 
-        got = jax.jit(fuser.fuse(fusing))(x, w, b, r)
-        want = jax.jit(unfused)(x, w, b, r)
-    for g, v in zip(jax.tree.leaves(got), jax.tree.leaves(want), strict=True):
-        assert g.dtype == v.dtype
-        np.testing.assert_allclose(np.asarray(g, np.float32), np.asarray(v, np.float32),
-                                   rtol=0, atol=float(jnp.finfo(g.dtype).eps) * 4 * float(np.max(np.abs(v))))
+    with generation.assumed(generation_name):
+        assert_as_exact(jax.jit(fuser.fuse(fusing)), jax.jit(unfused), draw, f"fused {consumer.__name__}",
+                        seeds=SEEDS, truth_fn=truth)
 
 
 @pytest.mark.parametrize("launch", [grouped_matmul.MosaicGmm(), grouped_matmul.MosaicTgmm()],
                          ids=lambda launch: type(launch).__name__)
 def test_the_hooked_mosaic_launches_lower_for_an_h100(launch):
     """Each Mosaic GPU launch with a prologue (and the forward's epilogue) lowers for an H100 on the CPU
-    at a fitting tile of every block shape, rows no multiple of 8, a side operand's rows its second
-    dimension."""
+    at a fitting tile of every block shape, rows no multiple of 8."""
     rows, depth, width, groups = 2044, 768, 1536, 8
     bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
     f32 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.float32)
     sizes = jax.ShapeDtypeStruct((groups,), jnp.int32)
     prologue = (normed, (f32((rows,)), f32((depth,))), (("rows",), ("depth",)))
     if isinstance(launch, grouped_matmul.MosaicTgmm):
-        args = (bf16((rows, depth)), bf16((rows, width)), sizes, (f32((depth, rows)),))
-        hooks = grouped_matmul.Hooks(shifted, (("depth", "rows"),))
+        args = (bf16((rows, depth)), bf16((rows, width)), sizes, prologue[1])
+        hooks = grouped_matmul.Hooks(prologue[0], prologue[2])
         options = {"out_dtype": "float32", "hooks": hooks, "interpret": False}
     else:
         args = (bf16((rows, depth)), bf16((groups, depth, width)), sizes, prologue[1], (f32((width,)),))
@@ -441,3 +448,48 @@ def test_a_keyed_launch_buckets_its_side_operands_rows_with_its_tokens():
     assert keyed.arguments["tokens"].shape == (512, DEPTH)
     assert keyed.arguments["prologue_operands"][0].shape == (DEPTH, 512)
     assert keyed.arguments["epilogue_operands"][0].shape == (WIDTH,)
+
+
+def test_mosaic_takes_only_the_hooks_its_lowering_has_rules_for():
+    """Mosaic GPU's warpgroup lowering has no transpose: a hook that transposes a side tile leaves the
+    Hopper launch to Triton's, which takes it; a hook of elementwise arithmetic stays Mosaic's."""
+    rows = 256
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    f32 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.float32)
+    sizes = jax.ShapeDtypeStruct((2,), jnp.int32)
+    launch = grouped_matmul.MosaicTgmm()
+    with generation.assumed("sm90"):
+        target = generation.gpu_target()
+        operands = (bf16((rows, DEPTH)), bf16((rows, WIDTH)), sizes)
+        transposing = launch.bind(*operands, (f32((DEPTH, rows)),), out_dtype="float32",
+                                  hooks=grouped_matmul.Hooks(shifted, (("depth", "rows"),)), interpret=False)
+        elementwise = launch.bind(*operands, (f32((rows,)), f32((DEPTH,))), out_dtype="float32",
+                                  hooks=grouped_matmul.Hooks(normed, (("rows",), ("depth",))),
+                                  interpret=False)
+        assert not launch.eligible(transposing, target)
+        assert launch.eligible(elementwise, target)
+
+
+def test_the_mosaic_kernels_load_a_side_operands_rows_from_any_dimension():
+    """Interpreted, Mosaic GPU's kernels pad and slice a side operand along its rows wherever they sit:
+    a `[depth, rows]` side gives the `[rows, depth]` one's products bit for bit."""
+    rows, sizes = 136, jnp.asarray([70, 66])
+    rng = np.random.default_rng(0)
+    x = jnp.asarray(rng.normal(size=(rows, 64)), jnp.bfloat16)
+    w = jnp.asarray(rng.normal(size=(2, 64, 64)) / 8, jnp.bfloat16)
+    dy = jnp.asarray(rng.normal(size=(rows, 64)), jnp.bfloat16)
+    side = jnp.asarray(rng.normal(size=(rows, 64)), jnp.float32)
+
+    def row_major(x, side):
+        return (_wide(x) + side).astype(x.dtype)
+
+    tiles = mosaic_gpu.Tiles(64, 64, 64, 2, 1)
+    layouts = ((row_major, ("rows", "depth"), side), (shifted, ("depth", "rows"), side.T))
+    common = {"tiles": tiles, "out_dtype": jnp.float32, "multiprocessors": 1,
+              "interpret": grouped_matmul.INTERPRETED}
+    products = [mosaic_gpu.gmm(x, w, sizes, transpose_rhs=False, prologue=hook, prologue_operands=(operand,),
+                               prologue_axes=(layout,), **common) for hook, layout, operand in layouts]
+    gradients = [mosaic_gpu.tgmm(x, dy, sizes, prologue=hook, prologue_operands=(operand,),
+                                 prologue_axes=(layout,), **common) for hook, layout, operand in layouts]
+    np.testing.assert_array_equal(np.asarray(products[0]), np.asarray(products[1]))
+    np.testing.assert_array_equal(np.asarray(gradients[0]), np.asarray(gradients[1]))

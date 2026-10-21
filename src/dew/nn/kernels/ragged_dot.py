@@ -214,27 +214,33 @@ def _gpu_ragged_dot_kernel(
 
     acc = jnp.zeros((block.m, block.n), dtype=acc_dtype)
     acc = lax.fori_loop(0, cdiv(size.k, block.k), inner_compute, acc)
-    mask = lhs_rows_mask[:, None] & rhs_cols_mask[None, :]
-    outs = _epilogued(acc, ridx, lhs_rows_mask)
-    for y_ref, out in zip(out_refs, outs, strict=True):
-      plgpu.store(y_ref.at[lhs_rows_idx, rhs_cols_idx], out.astype(y_ref.dtype), mask=mask)
-    return
+    stored(acc, ridx, lhs_rows_mask)
 
-  def _epilogued(acc, row, rows_mask):
-    """Dew: the epilogue on an fp32 accumulator tile at `row` and its side operands' tiles; one or more
-    outputs (the accumulator itself without one)."""
-    if epilogue is None:
-      return (acc,)
-    cols_mask = (pid.j * block.n + arange(block.n)) < size.n
-    tiles = [_side_tile(ref, axes, {'rows': (row, block.m), 'columns': (pid.j * block.n, block.n)},
-                        {'rows': rows_mask, 'columns': cols_mask})
-             for ref, axes in zip(epilogue_refs, epilogue_axes, strict=True)]
-    outs = epilogue(acc, *tiles)
-    return outs if isinstance(outs, tuple) else (outs,)
-
+  # Dew: the epilogue on each fp32 accumulator tile and its side operands' tiles, its outputs stored.
+  stored = partial(_store_epilogued, out_refs, epilogue, epilogue_refs, epilogue_axes, pid.j, block, size)
   lax.fori_loop(0, cdiv(group_sz, block.m), outer_compute, None)
+  _store_past_routed(stored, group_metadata_ref, pid, block, size, acc_dtype)
 
-  # The rows past sum(group_sizes), by the last program along m.
+
+def _store_epilogued(out_refs, epilogue, refs, axes_of, column_block, block, size, acc, row, rows_mask):
+  """Dew: each output of the epilogue on an fp32 accumulator tile at `row` and its side operands' tiles
+  (the accumulator itself without one), stored at its rows and the program's columns."""
+  cols_mask = (column_block * block.n + arange(block.n)) < size.n
+  outs = (acc,)
+  if epilogue is not None:
+    tiles = [_side_tile(ref, axes, {'rows': (row, block.m), 'columns': (column_block * block.n, block.n)},
+                        {'rows': rows_mask, 'columns': cols_mask})
+             for ref, axes in zip(refs, axes_of, strict=True)]
+    outs = epilogue(acc, *tiles)
+    outs = outs if isinstance(outs, tuple) else (outs,)
+  mask = rows_mask[:, None] & cols_mask[None, :]
+  for y_ref, out in zip(out_refs, outs, strict=True):
+    plgpu.store(y_ref.at[pl.ds(row, block.m), pl.ds(0, block.n)], out.astype(y_ref.dtype), mask=mask)
+
+
+def _store_past_routed(stored, group_metadata_ref, pid, block, size, acc_dtype):
+  """Dew: the rows past sum(group_sizes) sum nothing: by the last program along m, each output there is
+  the epilogue of a zero accumulator, zero without one (`stored`)."""
   last_offset = (
     group_metadata_ref.group_offsets[size.g - 1]
     + group_metadata_ref.group_sizes[size.g - 1]
@@ -247,20 +253,11 @@ def _gpu_ragged_dot_kernel(
     & (last_offset < size.m)
   )
   def _():
-    col_mask = (block.n * pid.j + arange(block.n)) < size.n
-
-    # Dew: the rows past the routed ones sum nothing: each output there is the epilogue of a zero
-    # accumulator, zero without one.
-    def set_empty(i, _):
+    def store_empty(i, _):
       row = last_offset + i * block.m
-      row_mask = (row + arange(block.m)) < size.m
-      window = (pl.ds(row, block.m), pl.ds(0, block.n))
-      mask = row_mask[:, None] & col_mask[None, :]
-      outs = _epilogued(jnp.zeros((block.m, block.n), acc_dtype), row, row_mask)
-      for y_ref, out in zip(out_refs, outs, strict=True):
-        plgpu.store(y_ref.at[*window], out.astype(y_ref.dtype), mask=mask)
+      stored(jnp.zeros((block.m, block.n), acc_dtype), row, (row + arange(block.m)) < size.m)
 
-    lax.fori_loop(0, cdiv(size.m - last_offset, block.m), set_empty, None)
+    lax.fori_loop(0, cdiv(size.m - last_offset, block.m), store_empty, None)
 
 
 @partial(jax.jit, static_argnames=(

@@ -36,42 +36,38 @@ def fusible_gemm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None =
                  transpose_rhs: bool = False, interpret_on_cpu: bool = False) -> jax.Array:
     """`template.gemm`'s fp32 product of each group's rows of `lhs` and its matrix of `rhs`, its consumers
     fused into the epilogue under `fuser.fuse` (the module's docstring)."""
-    if group_sizes is None:
-        return _fusible(transpose_rhs, interpret_on_cpu, dense=True)(lhs, rhs)
-    return _fusible(transpose_rhs, interpret_on_cpu, dense=False)(lhs, rhs, group_sizes)
+    fusible = fuser.fusible(functools.partial(_product, transpose_rhs, interpret_on_cpu, group_sizes is None),
+                            output_fusion_prefix=True)
+    return fusible(lhs, rhs) if group_sizes is None else fusible(lhs, rhs, group_sizes)
 
 
-@functools.cache
-def _fusible(transpose_rhs: bool, interpret_on_cpu: bool, *, dense: bool):
-    """The fusible product at these options, one per options so its operands are arrays alone."""
-
-    def product(*fusions):
-        *operand_fusions, out_fusion = fusions
-        lhs, rhs, *rest = (fusion() for fusion in operand_fusions)
-        group_sizes = None if dense else rest[0]
-        options = {'transpose_rhs': transpose_rhs, 'interpret_on_cpu': interpret_on_cpu}
-        if out_fusion is None:
-            return template.gemm(lhs, rhs, group_sizes, out_dtype=jnp.float32, **options)
-        width = rhs.shape[-2] if transpose_rhs else rhs.shape[-1]
-        acc = jax.ShapeDtypeStruct((lhs.shape[0], width), jnp.float32)
-        consumer, values, prefetch = fuser.get_fusion_values(out_fusion, acc)
-        leaves, treedef = jax.tree.flatten(values)
-        axes = _axes(consumer, values, acc) if not prefetch else None
-        if axes is None:
-            summed = template.gemm(lhs, rhs, group_sizes, out_dtype=jnp.float32, **options)
-            return consumer(values, summed)
-        outs = jax.eval_shape(consumer, values, acc)
-        out_leaves, out_treedef = jax.tree.flatten(outs)
-        value_types = tuple(jax.typeof(leaf) for leaf in leaves)
-        epilogue = functools.partial(_tiled, consumer, treedef, value_types, out_treedef, acc.shape)
-        several = len(out_leaves) > 1
-        dtypes = tuple(leaf.dtype for leaf in out_leaves)
-        result = template.gemm(lhs, rhs, group_sizes, epilogue=epilogue,
-                               epilogue_operands=tuple(zip(leaves, axes, strict=True)), out_dtype=dtypes[0],
-                               out_dtypes=dtypes if several else None, **options)
-        return jax.tree.unflatten(out_treedef, result if several else (result,))
-
-    return fuser.fusible(product, output_fusion_prefix=True)
+def _product(transpose_rhs: bool, interpret_on_cpu: bool, dense: bool, *fusions):
+    """The fusible product: its operands from their fusions, its consumers (`fusions`' last) as the
+    template's epilogue where the kernels take them tile by tile, after its product in XLA otherwise."""
+    *operand_fusions, out_fusion = fusions
+    lhs, rhs, *rest = (fusion() for fusion in operand_fusions)
+    group_sizes = None if dense else rest[0]
+    if out_fusion is None:
+        return template.gemm(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs, out_dtype=jnp.float32,
+                             interpret_on_cpu=interpret_on_cpu)
+    width = rhs.shape[-2] if transpose_rhs else rhs.shape[-1]
+    acc = jax.ShapeDtypeStruct((lhs.shape[0], width), jnp.float32)
+    consumer, values, prefetch = fuser.get_fusion_values(out_fusion, acc)
+    leaves, treedef = jax.tree.flatten(values)
+    axes = _axes(consumer, values, acc) if not prefetch else None
+    if axes is None:
+        summed = template.gemm(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs, out_dtype=jnp.float32,
+                               interpret_on_cpu=interpret_on_cpu)
+        return consumer(values, summed)
+    out_leaves, out_treedef = jax.tree.flatten(jax.eval_shape(consumer, values, acc))
+    value_types = tuple(jax.typeof(leaf) for leaf in leaves)
+    epilogue = functools.partial(_tiled, consumer, treedef, value_types, out_treedef, acc.shape)
+    dtypes = tuple(leaf.dtype for leaf in out_leaves)
+    several = len(dtypes) > 1
+    consumed = template.gemm(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs, epilogue=epilogue,
+                             epilogue_operands=tuple(zip(leaves, axes, strict=True)), out_dtype=dtypes[0],
+                             out_dtypes=dtypes if several else None, interpret_on_cpu=interpret_on_cpu)
+    return jax.tree.unflatten(out_treedef, consumed if several else (consumed,))
 
 
 def _axes(consumer, values, acc) -> tuple | None:

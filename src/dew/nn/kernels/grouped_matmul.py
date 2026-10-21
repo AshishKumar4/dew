@@ -28,7 +28,12 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 from flax.typing import Dtype, PrecisionLike
+from jax._src.pallas.mosaic_gpu import (
+    core as plgpu_core,  # the lowering's semantics (`_lowers_on_mosaic`)
+    lowering as mosaic_gpu_lowering,
+)
 from jax.experimental.pallas import mosaic_gpu as plgpu
+from jax.extend import core as jax_core
 
 from ..precision import asks_default_precision
 from . import generation
@@ -149,18 +154,25 @@ def _transcendentals(hook, tile, sides) -> float:
     if hook is None:
         return 0.0
     jaxpr = jax.make_jaxpr(hook)(tile, *sides)
-    counted = sum(math.prod(var.aval.shape) for equation in _equations(jaxpr.jaxpr)
+    counted = sum(math.prod(jax.typeof(var).shape) for equation in _equations(jaxpr.jaxpr)
                   if equation.primitive.name in TRANSCENDENTALS for var in equation.outvars)
     return counted / math.prod(tile.shape)
 
 
 def _equations(jaxpr):
-    for equation in jaxpr.eqns:
-        yield equation
-        for value in equation.params.values():
-            inner = getattr(value, 'jaxpr', value)
-            if hasattr(inner, 'eqns'):
-                yield from _equations(inner)
+    """Every equation of `jaxpr` and of the programs nested in it."""
+    for inner in (jaxpr, *jax_core.subjaxprs(jaxpr)):
+        yield from inner.eqns
+
+
+def _lowers_on_mosaic(hook, tile, sides) -> bool:
+    """Whether Pallas's Mosaic GPU lowering has a rule, at warpgroup semantics, for every primitive of
+    `hook` on `tile` and its side tiles: it has none for a transpose, which Triton's lowering takes."""
+    if hook is None:
+        return True
+    rules = mosaic_gpu_lowering.mosaic_lowering_rules[plgpu_core.WGxWG_SEMANTICS]
+    return all(equation.primitive in rules
+               for equation in _equations(jax.make_jaxpr(hook)(tile, *sides).jaxpr))
 
 
 def _hook_work(hook, dtype, sides, axes_of, tile: tuple, extents: dict) -> float:
@@ -468,7 +480,22 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         # process's lowering of the platform choice cannot carry in the CPU branch it does not take.
         interpretable = not ba.arguments['interpret'] or jax.default_backend() == 'cpu'
         return (target.wgmma and first == second and jnp.dtype(first).itemsize == 2 and interpretable
-                and _rated(target, first) and bool(self.space(ba)))
+                and _rated(target, first) and bool(self.space(ba)) and self._hooks_lower(ba, first))
+
+    @staticmethod
+    def _hooks_lower(ba, dtype) -> bool:
+        """Whether Mosaic GPU's lowering takes the launch's hooks (`_lowers_on_mosaic`), traced on 64-wide
+        tiles: the primitives a hook makes do not depend on its tile's extents."""
+        hooks = ba.arguments['hooks']
+
+        def tiles(name, axes_of):
+            return [jax.ShapeDtypeStruct((64,) * len(axes), side.dtype)
+                    for side, axes in zip(ba.arguments.get(name, ()), axes_of, strict=True)]
+
+        return (_lowers_on_mosaic(hooks.prologue, jax.ShapeDtypeStruct((64, 64), dtype),
+                                  tiles('prologue_operands', hooks.prologue_axes))
+                and _lowers_on_mosaic(hooks.epilogue, jax.ShapeDtypeStruct((64, 64), jnp.float32),
+                                      tiles('epilogue_operands', hooks.epilogue_axes)))
 
     def staged_bytes(self, ba, config: mosaic_gpu.Tiles) -> int:
         # The pipeline's stages of both operand blocks and the prologue's side tiles, the epilogue's side
