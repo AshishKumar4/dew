@@ -109,7 +109,6 @@ class DPOObjective(TokenScorer):
             "accuracy": accuracy,
         }, qk_stats=policy.qk), policy
 
-
     def _evaluation_scores(self, params, batch, key) -> TokenScores:
         """The chosen responses' per-token cross entropies, with the shifted
         completion mask as weights."""
