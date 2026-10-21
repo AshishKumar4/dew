@@ -94,9 +94,10 @@ def checkpoint_array(tensor, param_dtype: str = "float32") -> np.ndarray:
 
 def indexed_path(tokens: Iterable[str], *, indexed: Container[str] | None = None) -> tuple[str, ...]:
     """A source tensor name's dotted tokens as Linen's path: each numeric token joins the token before it
-    (`down_blocks.0` → `down_blocks_0`) where that token is one of `indexed` (any token, where None), so
-    consecutive digits all join it (`a.0.1` → `a_0_1`); a leading numeric token, or one after a token
-    `indexed` leaves out, stays its own."""
+    (`down_blocks.0` → `down_blocks_0`) where that token, as folded so far, is one of `indexed` (any token,
+    where None; none, where empty). Unrestricted, consecutive digits all join it (`a.0.1` → `a_0_1`);
+    with `indexed`, the second joins only where the folded token (`a_0`) is itself in it. A leading
+    numeric token, or one after a token `indexed` leaves out, stays its own."""
     path: list[str] = []
     for token in tokens:
         if token.isdigit() and path and (indexed is None or path[-1] in indexed):
