@@ -894,6 +894,11 @@ def _checked(
                     _identity(earlier, cache=True)
             mixed = isinstance(pipeline.source, (Mixture, Phases))
             refused = None if mixed else _cache_view(pipeline.stages[:index])
+            viewed = any(isinstance(earlier, _VIEWS) for earlier in prefix)
+            if refused is None and read == "streamed" and viewed:
+                refused = ("a streamed read fills its cache shard by shard, and a view of the inputs "
+                           "before it reads them by index: read='indexed' or 'memory', or write the view "
+                           "after the cache (streamed views before a cache: roadmap 803b)")
             if refused is not None:
                 raise ValueError(f"cache prefix in {name} must hold deterministic record steps and views of "
                                  f"the inputs: {refused}")
