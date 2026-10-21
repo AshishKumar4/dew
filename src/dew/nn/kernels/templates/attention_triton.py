@@ -1113,9 +1113,9 @@ def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
         # Its maximum's cotangent, that term's score cotangent, taken whole as the reference's derivative
         # takes it; exactly 0 for a query that read only its state, whose output its maximum leaves unmoved.
         moved = (jnp.sum(state.acc.astype(jnp.float32) * cotangent, axis=-1)
-                 - state.total.astype(jnp.float32) * first) * inverse
+                 - state.total.astype(jnp.float32) * delta) * inverse
         initial = Initial(m=jnp.where(mass > 0, moved * factor, 0.0).astype(state.m.dtype),
-                          total=(-(first * inverse) * factor).astype(state.total.dtype),
+                          total=(-(delta * inverse) * factor).astype(state.total.dtype),
                           acc=((cotangent * inverse[..., None]) * factor[..., None]).astype(state.acc.dtype))
     return Gradients(dq[:, :queries, :, :width].astype(query.dtype),
                      dk[:, :keys, :, :width].astype(key.dtype),
