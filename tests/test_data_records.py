@@ -356,3 +356,18 @@ def test_a_preset_calling_another_is_recorded_as_the_outer_call():
     assert written["stages"][0]["pipe"] == "test_data_records:_outer"
     changed = decode(override(written, "_outer.times", 3))
     assert next(iter(changed))["text"][0].endswith(" tag tag tag")
+
+
+def test_a_chain_over_stores_not_present_here_is_recorded_and_read_back(tmp_path):
+    """A run's record is written where its data may not be: a TFDS split never prepared here, a
+    directory of clips not yet fetched. The record is the stores' settings and the steps, so it is
+    written and read back without opening either store."""
+    from dew.data import TFDS, Files
+    from dew.data.sources.av_utils import FPS
+
+    split = TFDS("never_prepared", path=str(tmp_path / "tfds"))
+    clips = Files(str(tmp_path / "clips"), format="files")
+    for chain in (split.shuffle(0).repeat().pipe(presets.images, 16, batch=4),
+                  clips.pipe(presets.video, 4 / FPS, frames=4, fps=FPS, size=16, batch=2)):
+        again = _read_back(chain)
+        assert encode(again) == encode(chain)
