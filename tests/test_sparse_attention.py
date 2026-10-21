@@ -184,3 +184,15 @@ def test_memory_follows_the_selection_not_the_sequence():
     logits = HEADS * length * length * 4
     assert dense >= logits
     assert selected < logits
+
+
+def test_a_querys_empty_selection_slots_leave_the_next_querys_keys_alone():
+    """A selection's -1 slots (`top_k_selection` leaves them where fewer keys are allowed than the top
+    k) mark no key in `selection_mask`, so packed documents keep their own keys: the second query, the
+    first of its document, sees its own key alone and never the first query's key 0."""
+    segments = jnp.asarray([[1, 2, 2, 2]])
+    indices = causal_selection(jnp.zeros((1, 4, 4)), 2, segments)
+    np.testing.assert_array_equal(np.asarray(indices)[0, :2], [[0, -1], [1, -1]])
+    expected = np.asarray([[1, 0, 0, 0], [0, 1, 0, 0], [0, 1, 1, 0], [0, 1, 1, 0]], bool)
+    np.testing.assert_array_equal(np.asarray(jax.jit(selection_mask, static_argnums=1)(indices, 4))[0],
+                                  expected)

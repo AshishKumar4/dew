@@ -8,6 +8,7 @@ import jax
 import numpy as np
 import optax
 import pytest
+from data_support import keep_captions
 from recording import RecordingTracker
 
 from dew import Field, InputSpec, Trainer
@@ -110,11 +111,6 @@ def jpegs(count: int) -> list[dict]:
     return encoded
 
 
-def kept_captions(captions):
-    """The captions a batch holds, kept as an array to compare."""
-    return {"caption": np.asarray(captions)}
-
-
 IMAGE_RECIPES = {
     # Each case: the recipe's settings, and the preset settings that prepare its records alike.
     "device augmentation from a staged size": (
@@ -155,7 +151,7 @@ def test_the_images_preset_prepares_what_the_image_recipe_does(read, case):
     recipe = ImageData(source, image_size=16, augment=augment, classes=("cat", "dog", "owl"),
                        validation=holdout, **recipe_settings)
     recipe_settings["augment"] = backend
-    host = (images.EncodeCaptions(kept_captions),)
+    host = (images.EncodeCaptions(keep_captions),)
     expected = loader(recipe, batch=4, read=read, loading=loading, validation_records=3, host=host)
 
     order = {"memory": None, "indexed": None, "streamed": 64}[read]
@@ -197,6 +193,31 @@ def test_images_staged_larger_are_cropped_to_size_by_a_host_step(crop):
     step = images.RandomResizedCrop(16) if crop == "random resized crop" else corner
     batch = first_batch(Memory(jpegs(8)).pipe(presets.images, 16, batch=4, staging_size=24, augment=step))
     assert batch["image"].shape == (4, 16, 16, 3)
+
+
+@pytest.mark.parametrize("read", ["memory", "indexed"])
+def test_a_cached_preset_after_a_shuffle_trains_on_what_the_uncached_one_does(tmp_path, read):
+    """The spec's example: a shuffle, then the images preset with a cache. Its batches are the
+    uncached chain's, an undecodable image dropped where it is, as the run that fills the cache and
+    the one that reads it both deliver."""
+    from dew.data.compile import compile
+
+    records = [*jpegs(11), {"image": b"not an image", "label": 0}]
+
+    def batches(cache):
+        chain = Memory(records).shuffle(0).repeat().pipe(presets.images, 16, batch=4, cache=cache)
+        reader = compile(chain, read=read, loading=Loading(workers=0, threads=1, read_buffer=1)).train(
+            DataPartition())
+        try:
+            return [np.asarray(next(reader)["image"]) for _ in range(4)]
+        finally:
+            reader.close()
+
+    expected = batches(None)
+    for cached in (batches(str(tmp_path / "cache")), batches(str(tmp_path / "cache"))):
+        assert len(cached) == len(expected)
+        for made, wanted in zip(cached, expected, strict=True):
+            np.testing.assert_array_equal(made, wanted)
 
 
 def test_lm_packs_documents_into_rows_that_keep_every_target():

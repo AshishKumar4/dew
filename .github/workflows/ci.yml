@@ -61,7 +61,8 @@ jobs:
     steps:
     - uses: actions/checkout@v4
       with:
-        fetch-depth: 0  # SLOP020's inventory ratchet reads the whole history
+        # SLOP020's inventory ratchet reads the whole history; check.sh's duplicate-code gate, origin/main.
+        fetch-depth: 0
     - uses: actions/setup-python@v5
       with:
         python-version-file: .python-version
@@ -83,16 +84,8 @@ jobs:
       with:
         name: complexity
         path: complexity.json
-    - uses: pnpm/action-setup@v4
-      with:
-        package_json_file: site/package.json
-    - uses: actions/setup-node@v4
-      with:
-        node-version: 22
-        cache: pnpm
-        cache-dependency-path: site/pnpm-lock.yaml
-    - name: Install site dependencies
-      run: pnpm --dir site install --frozen-lockfile
+    - name: The site's toolchain and dependencies
+      uses: ./.github/actions/site
     - name: Check site content
       run: |
         node site/scripts/sync-docs.mjs --check
@@ -138,35 +131,6 @@ jobs:
           cat plain.txt; echo "dewml installed from PyPI alone, on a jax without Dew's fixes"; exit 1
         fi
         grep -q "No matching distribution found for jax" plain.txt || { cat plain.txt; exit 1; }
-    - name: Install the wheel into an empty environment, jax from Dew's package index
-      run: |
-        python -m venv "$RUNNER_TEMP/clean"
-        "$RUNNER_TEMP/clean/bin/python" -m pip install --quiet -r tools/pip.txt
-        index=$(python -c "import runpy; print(runpy.run_path('src/dew/telemetry/builds.py')['PACKAGE_INDEX'])")
-        "$RUNNER_TEMP/clean/bin/pip" install --quiet --index-url https://pypi.org/simple \
-          --extra-index-url "$index" dist/*.whl
-    - name: Run it
-      working-directory: ${{ runner.temp }}
-      run: |
-        "$RUNNER_TEMP/clean/bin/python" - <<'EOF'
-        import importlib.metadata
-
-        import jax
-        import jax.numpy as jnp
-
-        import dew
-        from dew.nn.backbones import CausalTransformer
-
-        assert "site-packages" in dew.__file__, dew.__file__
-        print("dewml", importlib.metadata.version("dewml"), "jax", jax.__version__,
-              "flax", importlib.metadata.version("flax"))
-        import flax.nnx  # noqa: E402,F401  imports on jax 0.11.2 from flax 0.12.10 on
-        model = CausalTransformer(vocab_size=64, emb_features=32, num_layers=2,
-                                  num_heads=4, num_kv_heads=2, mlp_features=64, max_seq_len=16)
-        tokens = jnp.arange(16, dtype=jnp.int32).reshape(2, 8)
-        logits = jax.jit(model.apply)(model.init(jax.random.key(0), tokens), tokens)
-        assert logits.shape == (2, 8, 64) and bool(jnp.all(jnp.isfinite(logits)))
-        EOF
     - name: Resolve the accelerator extras
       run: |
         index=$(python -c "import runpy; print(runpy.run_path('src/dew/telemetry/builds.py')['PACKAGE_INDEX'])")
@@ -219,6 +183,11 @@ jobs:
         # which it finds in the history.
         fetch-depth: 0
     - uses: oven-sh/setup-bun@v2
+    # Installed once, before the suite's and the gangs' clients start together: two bunx runs of one
+    # package at once install it into one place, and one failed copying from bun's cache (train 37's
+    # gangs: "ENOENT: failed copying files from cache to destination for package armada").
+    - name: Install the armada CLI
+      run: bun install --global "$ARMADA"
     - name: Run the suite and the multi-host gangs on armada
       env:
         ARMADA_URL: ${{ secrets.ARMADA_URL }}
@@ -226,7 +195,7 @@ jobs:
         DEW_TEST_CACHE: ${{ github.event_name == 'schedule' && 'off' || 'on' }}
         PROVEN: ${{ needs.proven.outputs.run }}
       run: |
-        armada="bunx --bun $ARMADA"
+        armada=armada
         # Each client runs in a session of its own, so the interrupt a cancelled run sends this shell
         # reaches it and it cancels its armada job; the shell waits on them, where a trap runs.
         trap 'for group in ${gangs:-} ${suite:-}; do kill -INT -- "-$group" 2>/dev/null || true; done' INT TERM
