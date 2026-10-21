@@ -359,7 +359,8 @@ def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
     kv_heads = key.shape[2]
     wide = jnp.promote_types(query.dtype, jnp.float32)
     if hooks.initial is not None:
-        wide = jnp.promote_types(wide, hooks.initial.m.dtype)
+        for state in (hooks.initial.m, hooks.initial.total, hooks.initial.acc):
+            wide = jnp.promote_types(wide, state.dtype)
     logits = scores(query, key, spans, hooks, scale=scale).astype(wide)
 
     def one(row, head):

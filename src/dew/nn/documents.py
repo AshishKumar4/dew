@@ -14,9 +14,9 @@ class CrossDocuments(NamedTuple):
     """The packed documents of a call whose keys are not its queries
     (cross-attention): `query` `[B, Q]` and `key` `[B, K]` ids, each query
     reading the keys of its own document, 0 as padding, which reads nothing
-    and is read by nothing. FlashAttention runs each row's documents as its
-    packed sequences, which needs the keys in ascending id order, padding
-    after them; the queries it orders itself.
+    and is read by nothing; ids are nonnegative. FlashAttention runs each
+    row's documents as its packed sequences, which needs the keys in
+    ascending id order, padding after them; the queries it orders itself.
 
     Under causality or a window, a document's queries are its last keys, in
     order: the last query reads up to the document's last key, the one before
