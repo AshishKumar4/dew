@@ -13,17 +13,22 @@
 	--sl-sidebar-width: 17.5rem;
 
 	/* Dark, the default: ink with a teal cast. */
-	--sl-color-white: #eef6f4;
+	/* BEGIN dark colors from dew.figures.THEMES (site/scripts/gen_theme.py) */
 	--sl-color-gray-1: #d8e5e2;
+	--dew-muted: #93aba7;
+	--sl-color-gray-5: #243639;
+	--dew-surface: #0f191c;
+	--dew-surface-raised: #131f23;
+	--sl-color-accent: #2fb8a8;
+	--sl-color-accent-low: #0b3531;
+	/* END dark colors */
+	--sl-color-white: #eef6f4;
 	--sl-color-gray-2: #b2c6c2;
 	--sl-color-gray-3: #7e9894;
 	--sl-color-gray-4: #55706b;
-	--sl-color-gray-5: #243639;
 	--sl-color-gray-6: #111b1e;
 	--sl-color-black: #0a1113;
 
-	--sl-color-accent-low: #0b3531;
-	--sl-color-accent: #2fb8a8;
 	--sl-color-accent-high: #86e3d5;
 
 	--sl-color-bg-nav: #0a1113;
@@ -34,10 +39,7 @@
 	--sl-color-hairline-shade: #050a0b;
 	--sl-color-backdrop-overlay: hsla(190, 30%, 4%, 0.72);
 
-	--dew-surface: #0f191c;
-	--dew-surface-raised: #131f23;
 	--dew-rule: #1c2c30;
-	--dew-muted: #93aba7;
 	--dew-accent-text: #5fdcc9;
 	--dew-accent-fill: #12a394;
 	--dew-warn: #f2b45a;
@@ -47,18 +49,23 @@
 }
 
 :root[data-theme='light'] {
-	--sl-color-white: #0d1a1c;
+	/* BEGIN light colors from dew.figures.THEMES (site/scripts/gen_theme.py) */
 	--sl-color-gray-1: #16282b;
+	--dew-muted: #4d6763;
+	--sl-color-gray-5: #c9d9d5;
+	--dew-surface: #f2f6f5;
+	--dew-surface-raised: #ffffff;
+	--sl-color-accent: #0b7d71;
+	--sl-color-accent-low: #d3f1ec;
+	/* END light colors */
+	--sl-color-white: #0d1a1c;
 	--sl-color-gray-2: #2a3f42;
 	--sl-color-gray-3: #4c6662;
 	--sl-color-gray-4: #7d9793;
-	--sl-color-gray-5: #c9d9d5;
 	--sl-color-gray-6: #e7efed;
 	--sl-color-gray-7: #f3f7f6;
 	--sl-color-black: #fbfcfb;
 
-	--sl-color-accent-low: #d3f1ec;
-	--sl-color-accent: #0b7d71;
 	--sl-color-accent-high: #065249;
 
 	--sl-color-bg-nav: #fbfcfb;
@@ -69,10 +76,7 @@
 	--sl-color-hairline-shade: #d3e0dc;
 	--sl-color-backdrop-overlay: hsla(190, 20%, 30%, 0.5);
 
-	--dew-surface: #f2f6f5;
-	--dew-surface-raised: #ffffff;
 	--dew-rule: #dde7e4;
-	--dew-muted: #4d6763;
 	--dew-accent-text: #0b7d71;
 	--dew-accent-fill: #12a394;
 	--dew-warn: #8a5a00;

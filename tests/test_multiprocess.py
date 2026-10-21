@@ -26,8 +26,8 @@ from pathlib import Path
 import multiprocess_worker as worker
 import numpy as np
 import pytest
+from lane_environment import MESH_DEVICES
 from process_support import (
-    DEVICES,
     free_port,
     report_of,
     run_pool,
@@ -123,8 +123,8 @@ def test_a_field_no_step_reads_stays_on_the_host_across_processes(tmp_path):
         assert report["read_differs_from_placed"]
         assert report["unused_on_host"] and report["x_placed"]
         # A stand-in of the placed rows, which the executable checks and drops.
-        assert report["unused_shape"] == [DEVICES]
-        assert report["sum"] == 3 * DEVICES
+        assert report["unused_shape"] == [MESH_DEVICES]
+        assert report["sum"] == 3 * MESH_DEVICES
 
 def test_a_real_token_budget_agrees_across_processes_after_logging_ticks(tmp_path):
     corpus = token_corpus(tmp_path / "tokens", records=16, seq_len=4)
@@ -174,11 +174,11 @@ def test_the_mesh_covers_every_process_in_the_pool(two_processes):
     for index, report in enumerate(two_processes):
         assert report["process_index"] == index
         assert report["process_count"] == 2
-        assert report["device_count"] == DEVICES
-        assert report["local_device_count"] == DEVICES // 2
-        assert report["mesh_shape"] == {"data": DEVICES // 2, "expert": 1, "fsdp": 2,
+        assert report["device_count"] == MESH_DEVICES
+        assert report["local_device_count"] == MESH_DEVICES // 2
+        assert report["mesh_shape"] == {"data": MESH_DEVICES // 2, "expert": 1, "fsdp": 2,
                                         "tensor": 1, "sequence": 1, "stage": 1}
-        assert report["mesh_devices"] == DEVICES
+        assert report["mesh_devices"] == MESH_DEVICES
         assert report["mesh_process_indices"] == [0, 1]
 
 
@@ -188,8 +188,8 @@ def test_four_processes_build_the_same_mesh_as_two(tmp_path):
     reports = run_pool("topology", tmp_path, 4, fsdp_size=2)
     for index, report in enumerate(reports):
         assert report["process_index"] == index
-        assert report["local_device_count"] == DEVICES // 4
-        assert report["mesh_shape"] == {"data": DEVICES // 2, "expert": 1, "fsdp": 2,
+        assert report["local_device_count"] == MESH_DEVICES // 4
+        assert report["mesh_shape"] == {"data": MESH_DEVICES // 2, "expert": 1, "fsdp": 2,
                                         "tensor": 1, "sequence": 1, "stage": 1}
         assert report["mesh_process_indices"] == [0, 1, 2, 3]
 
@@ -205,7 +205,7 @@ def test_the_global_batch_is_the_union_of_the_process_slices(two_processes):
     slices = [report["local_rows"] for report in two_processes]
     for report in two_processes:
         assert report["batch_shape"] == [worker.BATCH, worker.RES, worker.RES, 3]
-        assert report["addressable_shards"] == DEVICES // 2
+        assert report["addressable_shards"] == MESH_DEVICES // 2
     assert not set(slices[0]) & set(slices[1]), "both processes hold the same rows"
     assert sorted(slices[0] + slices[1]) == list(range(worker.BATCH))
     assert slices[0] == list(range(worker.BATCH // 2)), "process 0 did not get its own rows"
@@ -358,7 +358,7 @@ def test_two_processes_train_the_step_one_process_trains(tmp_path):
     # The pool's arrays really do span processes, so the parity above is not
     # two single-process runs agreeing with each other.
     assert pool[0]["sharding"]["fully_addressable"] == [False]
-    assert pool[0]["sharding"]["device_counts"] == [DEVICES]
+    assert pool[0]["sharding"]["device_counts"] == [MESH_DEVICES]
 
     assert_same_parameters(dumped_params(tmp_path / "pool" / "process0.json"),
                            worker.params_dict(state.variables))
@@ -640,7 +640,7 @@ def test_a_packed_pool_reads_the_windows_one_process_reads(tmp_path, packed_chec
     pool reads at a step is the step one process reads, row for row."""
     flags = {"name": "packed", "fsdp_size": 1, "steps": POOL_STEPS,
              "tokens": packed_checkpoint["corpus"], "seq_len": PACKED_SEQ_LEN}
-    single = run_worker("packed_fit", tmp_path / "single.json", devices=DEVICES,
+    single = run_worker("packed_fit", tmp_path / "single.json", devices=MESH_DEVICES,
                         run_dir=tmp_path / "single-run", **flags)
     pool = run_pool("packed_fit", tmp_path / "pool", 2,
                     run_dir=tmp_path / "pool-run", **flags)

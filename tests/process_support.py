@@ -13,11 +13,11 @@ from pathlib import Path
 from types import TracebackType
 
 import pytest
+from lane_environment import MESH_DEVICES, without_deterministic_ops
 from tool_support import load
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 WORKER = Path(__file__).with_name("multiprocess_worker.py")
-DEVICES = 8
 groups = load("child_groups", "tools/armada")
 """The children's group ownership Dew's CI uses too."""
 
@@ -25,15 +25,10 @@ groups = load("child_groups", "tools/armada")
 READ_ONLY = "--xla_gpu_experimental_autotune_cache_mode=AUTOTUNE_CACHE_MODE_READ"
 """The flag `gpu-run -n 0.5` adds beside other work on a GPU, under which no process measures."""
 
-REPEATABLE = "--xla_gpu_deterministic_ops=true"
-"""The flag under which a process keeps no picks, so its kernels repeat from run to run."""
-
-
 def keeping_picks() -> str:
-    """This process's XLA flags without `REPEATABLE`, which the cuda lane sets: a process
-    keeps and measures picks only without it (`dew.cache.keeps_picks`)."""
-    return " ".join(flag for flag in os.environ.get("XLA_FLAGS", "").split()
-                    if not flag.startswith(REPEATABLE.split("=")[0]))
+    """This process's XLA flags without the cuda lane's deterministic-ops flag: a process keeps and
+    measures picks only without it (`dew.cache.keeps_picks`)."""
+    return without_deterministic_ops(os.environ.get("XLA_FLAGS", ""))
 
 
 def fresh(script: str, *arguments: str, cache_dir, flags: str, source: Path = REPO_ROOT / "src"):
@@ -114,7 +109,7 @@ def spawn(mode: str, out: Path, processes: int = 1, process_id: int = 0,
             command.append(flag)
         elif value is not None:
             command += [flag, str(value)]
-    return start_process(command, DEVICES // processes if devices is None else devices)
+    return start_process(command, MESH_DEVICES // processes if devices is None else devices)
 
 
 def terminate(process: subprocess.Popen[str]) -> None:
