@@ -12,10 +12,12 @@ lower inverse (`strictly_lower_inverse`, fla's WY form), and only the memory cro
 (`xla_chunk_states`). Without the delta rule (`delta=False`, R = 0, Mamba2's SSD and the gated
 linear attentions) the inverse is the identity and nothing is corrected.
 
-Two implementations compute it: the portable math in XLA (`chunk_delta_rule`), every hook, Dew's
-float32 reference and the CPU path, and on a GPU whose row names it the port of fla 0.5.2's kernels
-(`fla_rule`, `fla_gdn` and `fla_kda`), which takes the delta rule with one decay a head or one per
-key dimension. `chunk` picks one per call (`on_the_port`) and applies the hooks around it.
+The portable math in XLA (`chunk_delta_rule`) computes every hook: Dew's float32 reference and the
+CPU path. Kernels take the rest: on a GPU whose row names it, the port of fla 0.5.2's kernels
+(`fla_rule`, `fla_gdn` and `fla_kda`) takes the delta rule with one decay a head or one per key
+dimension; without the delta rule, a rated decay (Mamba2's SSD) runs on the port of mamba_ssm's
+kernels (`dew.nn.kernels.mamba_ssd`) on such a GPU, or on a TPU's Pallas scan (`dew.nn.kernels.ssd`).
+`chunk` picks one per call and applies the hooks around it.
 """
 
 import contextlib
@@ -381,9 +383,9 @@ class Chunk:
     value heads. `log_decay` is `[B, S, Hv]` (scalar) or `[B, S, Hv, Dk]` (vector), or with the gates
     `gate` `[B, S, Hv]`, `log_a` and `bias` `[Hv]`. `beta` `[B, S, Hv]` is the write gate (a raw beta
     with the gates), `skip` `[Hv]` the skip's `D`, `z` `[B, S, Hv, Dv]` and `weight` `[Dv]` the
-    epilogue's, `rate` `[Hv]` a rated decay's. `state` `[B, Hv, Dk, Dv]` is the memory entering,
-    zero where None, and `starts` `[B, S]` marks packed documents' first tokens, each from a zero
-    memory."""
+    epilogue's, `rate` `[Hv]` a rated decay's, at most zero (`recurrence.Hooks.rated`). `state`
+    `[B, Hv, Dk, Dv]` is the memory entering, zero where None, and `starts` `[B, S]` marks packed
+    documents' first tokens, each from a zero memory."""
     query: jax.Array
     key: jax.Array
     value: jax.Array
@@ -412,16 +414,23 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
     (`fla_rule`) for the delta rule with a decay where `ported` (the caller's route, `on_the_port`,
     decided here where None); without the delta rule, a rated decay (Mamba2's SSD) runs on the port
     of mamba_ssm's kernels where it takes the call (`ssd_port_refusal`), or on a TPU's Pallas scan
-    where its tiling covers the geometry (`ssd_kernel_platform`); else the portable math
+    where its tiling covers the geometry (`ssd_kernel_platform`), unless `ported` is False; else the
+    portable math
     (`chunk_delta_rule`, in `chunk_size` chunks, which a port's need not match). Packed documents
     (`starts`, at most `max_segments` a row) each compute as they would alone. A conv runs before the
-    op: it takes the conv's output."""
+    op: it takes the conv's output. The operands the hooks read are checked as the decode step's
+    (`recurrence.read`), and a rated decay is taken on its declared domain, a contraction."""
     if hooks.conv is not None:
         raise ValueError("the chunked op takes the conv's output: its queries, keys and values")
-    query, key, value = operands.query, operands.key, operands.value
+    given = recurrence.read(hooks, operands, optional=('state',))
+    query, key, value = given['query'], given['key'], given['value']
     if value.shape[2] % key.shape[2]:
         raise ValueError(f"{value.shape[2]} value heads over {key.shape[2]} key heads: each key head serves "
                          "a whole number of value heads")
+    ranks = {'scalar': 3, 'vector': 4}
+    if 'log_decay' in given and given['log_decay'].ndim != ranks[hooks.decay]:
+        raise ValueError(f"a {hooks.decay} decay is {ranks[hooks.decay]}-dimensional, [B, S, Hv"
+                         f"{', Dk' * (hooks.decay == 'vector')}], not {given['log_decay'].shape}")
     dtype = jnp.result_type(query, key, value) if dtype is None else jnp.dtype(dtype)
     work = at_least_fp32(jnp.result_type(query, key, value))
     if hooks.l2norm:
@@ -429,41 +438,31 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
         query, key = (x * jax.lax.rsqrt(jnp.sum(x * x, axis=-1, keepdims=True) + recurrence.L2NORM_EPS)
                       for x in (query, key))
     scale = (key.shape[-1] ** -0.5 if hooks.l2norm else 1.0) if hooks.scale is None else hooks.scale
-    if hooks.gates is not None:
-        raw = operands.beta.astype(work) if hooks.gates.write == 'sigmoid' else None
-        g, beta = recurrence.gated(hooks.gates, *(x.astype(work) for x in (operands.gate, operands.log_a,
-                                                                           operands.bias)), raw)
-    elif hooks.rated:
-        beta = operands.beta.astype(work)
-        g = operands.rate.astype(work)[None, None, :] * beta
-    else:
-        g = (jnp.zeros(value.shape[:3], work) if hooks.decay == 'none'
-             else operands.log_decay)
-        beta = operands.beta if hooks.gated_write else jnp.ones(value.shape[:3], work)
-    takes_port = hooks.delta and hooks.decay != 'none'
+    g, beta = recurrence.log_gates(hooks, given, work)
+    g = jnp.zeros(value.shape[:3], work) if g is None else g
+    beta = jnp.ones(value.shape[:3], work) if beta is None else beta
+    state, starts = operands.state, operands.starts
+    epilogue = hooks.skip or hooks.output is not None
     if hooks.rated and not hooks.delta and not hooks.l2norm and hooks.scale is None:
-        out, final = _rated_scan(hooks, query, key, beta, operands, chunk_size, work)
-        if hooks.output is not None:
-            out = recurrence.gated_rms(out, operands.z.astype(work), operands.weight.astype(work),
-                                       hooks.output)
-        return out.astype(dtype), final
-    if takes_port and (on_the_port(query, key, value) if ported is None else ported):
-        out, final = fla_rule(query, key, value, g, beta, operands.state, starts=operands.starts,
-                              max_segments=max_segments, scale=scale)
+        # Each of its routes adds the skip, the port in its kernels.
+        out, final = _rated_scan(hooks, query, key, value, g, beta, given, state, starts, chunk_size, work,
+                                 kernels=ported is not False)
     else:
-        group = value.shape[2] // key.shape[2]
-        if group > 1:
-            query, key = (jnp.repeat(x, group, axis=2) for x in (query, key))
-        # Unrounded: the epilogue runs in the working precision, and the output rounds once.
-        out, final = chunk_delta_rule(query, key, value, g.reshape(*value.shape[:3], -1), beta,
-                                      operands.state, chunk_size, starts=operands.starts, delta=hooks.delta,
-                                      scale=scale, dtype=work)
-    if hooks.skip:
-        out = out.astype(work) + operands.skip.astype(work)[:, None] * value.astype(work)
-    if hooks.output is not None:
-        out = recurrence.gated_rms(out.astype(work), operands.z.astype(work), operands.weight.astype(work),
-                                   hooks.output)
-    return out.astype(dtype), final
+        if hooks.delta and hooks.decay != 'none' and (on_the_port(query, key, value) if ported is None
+                                                      else ported):
+            # Unrounded where an epilogue follows, as on the portable math.
+            out, final = fla_rule(query, key, value, g, beta, state, starts=starts, max_segments=max_segments,
+                                  scale=scale, wide=epilogue)
+        else:
+            group = value.shape[2] // key.shape[2]
+            if group > 1:
+                query, key = (jnp.repeat(x, group, axis=2) for x in (query, key))
+            out, final = chunk_delta_rule(query, key, value, g.reshape(*value.shape[:3], -1), beta, state,
+                                          chunk_size, starts=starts, delta=hooks.delta, scale=scale,
+                                          dtype=work)
+        out = recurrence.skipped(hooks, out.astype(work), value, given, work)
+    # The epilogue in the working precision, and the output rounded once.
+    return recurrence.normed(hooks, out, given, work).astype(dtype), final
 
 
 def port_refusal(query, key, value) -> Refusal | None:
@@ -504,7 +503,7 @@ def on_the_port(query, key, value) -> bool:
 
 
 def fla_rule(query, key, value, g, beta, state=None, *, starts=None, max_segments: int | None = None,
-             scale: float | None = None):
+             scale: float | None = None, wide: bool = False):
     """The port's chunked rule for any call the portable math takes:
     `[B, S, Hk, Dk]` queries and keys, `[B, S, Hv, Dv]` values, the log decay
     `g` `[B, S, Hv]` per head (`fla_gdn.chunk_gated_delta_rule`) or `[B, S,
@@ -512,12 +511,14 @@ def fla_rule(query, key, value, g, beta, state=None, *, starts=None, max_segment
     `beta` `[B, S, Hv]`, the memory `[B, Hv, Dk, Dv]` or None, and packed
     documents' first tokens `starts` `[B, S]`, at most `max_segments` a row
     (the row length where None), the queries scaled by `scale` in the
-    kernels (`Dk^-1/2` where None). Each document runs as a sequence of its own
-    (fla's varlen `cu_seqlens`), its chunks from its first token and its
-    memory from zero, as it would alone; the row's first takes `state`, unless
-    its first token begins a document of its own. The kernels' grids are
-    sized by that bound, a chunk more for each document and the row's
-    padding; the memories they keep are not (`chunked_launch.Sequences`).
+    kernels (`Dk^-1/2` where None), the output in the operands' common dtype,
+    or fp32 where `wide`, for an epilogue to read it unrounded. Each document
+    runs as a sequence of its own (fla's varlen `cu_seqlens`), its chunks
+    from its first token and its memory from zero, as it would alone; the
+    row's first takes `state`, unless its first token begins a document of
+    its own. The kernels' grids are sized by that bound, a chunk more for
+    each document and the row's padding; the memories they keep are not
+    (`chunked_launch.Sequences`).
 
     The operands go to their common dtype, beta with them, as fla's layer
     holds them. On a mesh the rule runs per shard (`manual_map`): rows where
@@ -542,7 +543,7 @@ def fla_rule(query, key, value, g, beta, state=None, *, starts=None, max_segment
     rows, heads = grouped_heads(value.shape, key.shape[2])
     P = jax.sharding.PartitionSpec
     four, three, memory = P(rows, None, heads, None), P(rows, None, heads), P(rows, heads, None, None)
-    return manual_map(functools.partial(_blocked_rule, documents=documents, scale=scale),
+    return manual_map(functools.partial(_blocked_rule, documents=documents, scale=scale, wide=wide),
                       (four, four, four, P(*four[:g.ndim]), three, memory, P(rows, None)),
                       (four, memory))(query, key, value, g, beta, state, starts)
 
@@ -565,7 +566,7 @@ def recomputing(names: tuple[str, ...]):
 
 
 def _blocked_rule(query, key, value, g, beta, state, starts, *, documents: int | None,
-                  scale: float | None = None):
+                  scale: float | None = None, wide: bool = False):
     """The port's rule on one shard, shaped to its kernels' blocks: values
     wider than the port's widest split into more value heads of their key
     head; value heads padded to a power of two per key head, which dqkwg's
@@ -607,7 +608,7 @@ def _blocked_rule(query, key, value, g, beta, state, starts, *, documents: int |
     spans = None if documents is None else cu_seqlens(starts, B * (documents + 1))
     port = fla_kda.chunk_kda if per_key else fla_gdn.chunk_gated_delta_rule
     out, final = port(query, key, value, g, beta, state, spans, scale, CHUNK_SIZE,
-                      not generation.triton_runs(), "delta_memory" not in RECOMPUTED.get())
+                      not generation.triton_runs(), "delta_memory" not in RECOMPUTED.get(), wide)
     out = out[..., :width].reshape(B, S, Hk, group, width)[:, :, :, :served]
     out = out.reshape(B, S, Hv, split * width)[..., :Dv]
     final = final[:, :, :Dk, :width].reshape(B, Hk, group, Dk, width)[:, :, :served]
@@ -658,41 +659,40 @@ def recurrent_delta_rule(query, key, value, g, beta, state=None, *, starts=None)
     return jnp.moveaxis(out, 0, 1).astype(dtype), state
 
 
-def _rated_scan(hooks: recurrence.Hooks, query, key, beta, operands: Chunk, chunk_size: int, work):
+def _rated_scan(hooks: recurrence.Hooks, query, key, value, g, beta, given: dict, state, starts,
+                chunk_size: int, work, *, kernels: bool = True):
     """`chunk` without the delta rule over a rated decay (Mamba2's SSD: `x` the values, `B` the keys,
     `C` the queries, `dt` the write gate and `A` the rate): on the port of mamba_ssm's kernels where
     it takes the call, which adds the skip itself and takes the rated decay's declared domain, a
     contraction (`recurrence.Hooks`), as its kernels clamp each pairwise decay to at most one; else
     on a TPU's Pallas scan where its tiling covers the geometry, or the portable math, the skip added
-    after. Returns the output in `work`, unrounded,
-    and the memory `[B, Hv, Dk, Dv]`."""
-    value = operands.value
-    rate = operands.rate.astype(work)
-    skip = (operands.skip if hooks.skip else jnp.zeros(rate.shape, work)).astype(work)
-    starts = operands.starts
+    after; only the portable math without `kernels`. `g` is the log decay the rate and the write gate
+    `beta` form (`recurrence.log_gates`), which the kernels form themselves. Returns the output in
+    `work`, unrounded, and the memory `[B, Hv, Dk, Dv]`."""
+    rate = given['rate'].astype(work)
+    skip = given['skip'].astype(work) if hooks.skip else jnp.zeros(rate.shape, work)
     operand = jnp.result_type(query, key, value)
     x, B, C = (jnp.asarray(t, operand) for t in (value, key, query))
     batch, _, heads, head_dim = x.shape
     state_size = B.shape[-1]
     # The SSD's memory is `[P, N]`, values by keys: the template's `[N, P]` transposed.
-    carried = (jnp.zeros_like(x, work, shape=(batch, heads, head_dim, state_size)) if operands.state is None
-               else jnp.swapaxes(operands.state, -1, -2).astype(work))
-    refusal = ssd_port_refusal(x, B, chunk_size)
+    carried = (jnp.zeros_like(x, work, shape=(batch, heads, head_dim, state_size)) if state is None
+               else jnp.swapaxes(state, -1, -2).astype(work))
+    refusal = ssd_port_refusal(x, B, chunk_size) if kernels else "the caller's route is the portable math"
     if refusal is None:
         out, final = _ssd_ported(x, beta, rate, B, C, skip, carried, chunk_size, starts)
         return out.astype(work), jnp.swapaxes(final.astype(work), -1, -2)
     ran_kernel('ssd', 'xla', refusal)
-    platform = ssd_kernel_platform(chunk_size, head_dim, state_size, dtype=work)
+    platform = ssd_kernel_platform(chunk_size, head_dim, state_size, dtype=work) if kernels else None
     if platform is not None:
         out, final = _ssd_tpu(x, beta, rate, B, C, skip, carried, chunk_size, starts, platform, work)
         return out, jnp.swapaxes(final, -1, -2)
     group = heads // key.shape[2]
     if group > 1:
         query, key = (jnp.repeat(t, group, axis=2) for t in (query, key))
-    out, final = chunk_delta_rule(query, key, value, (rate[None, None, :] * beta)[..., None], beta,
-                                  operands.state, chunk_size, starts=starts, delta=False, scale=1.0,
-                                  dtype=work)
-    return out + skip[:, None] * value.astype(work), final
+    out, final = chunk_delta_rule(query, key, value, g[..., None], beta, state, chunk_size, starts=starts,
+                                  delta=False, scale=1.0, dtype=work)
+    return recurrence.skipped(hooks, out, value, given, work), final
 
 
 RESET_DECAY = -1e4

@@ -73,9 +73,10 @@ class Hooks:
     gates, the delta rule, whether a write gate `beta` scales what the token writes (always under the
     delta rule or the gates; without them, an input gate, else one), whether a scalar decay is
     `rated`: the write gate times the head's `rate` (Mamba's discretization, `A dt` with `dt` the
-    write gate), declared on its domain, a contraction (`rate <= 0`, the write gate `>= 0`), which
-    a port may take as given; a skip `D v`, and the epilogue. The chunked op (`recurrence_chunk.chunk`) takes
-    the same form."""
+    write gate), a value kind defined on a contraction, `rate <= 0` and the write gate `>= 0`, which
+    its callers hold and a port may take as given (mamba_ssm's kernels clamp each decay to at most
+    one); a skip `D v`, and the epilogue. The chunked op (`recurrence_chunk.chunk`) takes the same
+    form."""
     conv: Conv | None = None
     l2norm: bool = False
     scale: float | None = None
@@ -172,9 +173,9 @@ class Step:
     and `taps` `[C, K]`. `log_decay` is `[rows, Hv]` (scalar) or `[rows, Hv, Dk]` (vector), or with
     the gates `gate` `[rows, Hv]`, `log_a` and `bias` `[Hv]`. `beta` `[rows, Hv]` is the write gate
     (a raw beta with the gates), `skip` `[Hv]` the skip's `D`, `z` `[rows, Hv, Dv]` and `weight`
-    `[Dv]` the epilogue's, `rate` `[Hv]` a rated decay's. `state` is `[rows, Hv, Dk, Dv]`, fp32 or
-    bf16 (rounded by
-    `round_to_bf16`), or wider for the reference. `active` `[rows]` marks the rows that draw. A pytree
+    `[Dv]` the epilogue's, `rate` `[Hv]` a rated decay's, at most zero (`Hooks.rated`). `state` is
+    `[rows, Hv, Dk, Dv]`, fp32 or bf16 (rounded by `round_to_bf16`), or wider for the reference.
+    `active` `[rows]` marks the rows that draw. A pytree
     of its arrays, so it crosses `jit` and a transformation as a token's operands do; the `Hooks` are
     its static form."""
     state: jax.Array
@@ -224,13 +225,15 @@ def _names(hooks: Hooks) -> tuple[str, ...]:
     return (*streams, *gates, *('skip',) * hooks.skip, *('z', 'weight') * (hooks.output is not None), 'state')
 
 
-def _read(hooks: Hooks, operands: Step) -> dict:
-    """The operands `hooks` read (`_names`), by name, each held, else a ValueError naming those it lacks."""
+def read(hooks: Hooks, operands, *, optional: tuple[str, ...] = ()) -> dict:
+    """The operands `hooks` read (`_names`) from a `Step` or a chunked op's operands
+    (`recurrence_chunk.Chunk`), by name, each held but those `optional` leaves out, else a ValueError
+    naming those it lacks."""
     given = {name: getattr(operands, name) for name in _names(hooks)}
-    missing = [name for name, array in given.items() if array is None]
+    missing = [name for name, array in given.items() if array is None and name not in optional]
     if missing:
-        raise ValueError(f"{hooks} reads {', '.join(missing)}, which the step does not hold")
-    return given
+        raise ValueError(f"{hooks} reads {', '.join(missing)}, which its operands do not hold")
+    return {name: array for name, array in given.items() if array is not None}
 
 
 def _prologue(hooks: Hooks, given: dict, work):
@@ -265,17 +268,35 @@ def _prologue(hooks: Hooks, given: dict, work):
     return query, key, value, history
 
 
-def _gates(hooks: Hooks, given: dict, work, key_width: int):
-    """The reference's decay per key dimension `[rows, Hv, Dk]` and write gate `[rows, Hv]`."""
+def log_gates(hooks: Hooks, given: dict, work):
+    """The log decay and the write gate, each in `work`, from the operands `given` by name (`read`): the
+    gates' (`gated`), a rated decay's (the rate times the write gate), or as given; None for a decay
+    or a write gate the hooks have not."""
     if hooks.gates is not None:
         beta = given['beta'].astype(work) if hooks.gates.write == 'sigmoid' else None
-        g, beta = gated(hooks.gates, *(given[name].astype(work) for name in ('gate', 'log_a', 'bias')), beta)
-    elif hooks.rated:
+        return gated(hooks.gates, *(given[name].astype(work) for name in ('gate', 'log_a', 'bias')), beta)
+    if hooks.rated:
         beta = given['beta'].astype(work)
-        g = given['rate'].astype(work)[None, :] * beta
-    else:
-        g = None if hooks.decay == 'none' else given['log_decay'].astype(work)
-        beta = given['beta'].astype(work) if hooks.gated_write else None
+        return given['rate'].astype(work) * beta, beta
+    return (None if hooks.decay == 'none' else given['log_decay'].astype(work),
+            given['beta'].astype(work) if hooks.gated_write else None)
+
+
+def skipped(hooks: Hooks, out, value, given: dict, work):
+    """An output `[..., Hv, Dv]` in `work` with the skip `D v` added where the hooks have one."""
+    return out + given['skip'].astype(work)[:, None] * value.astype(work) if hooks.skip else out
+
+
+def normed(hooks: Hooks, out, given: dict, work):
+    """An output `[..., Hv, Dv]` in `work` through the epilogue's gated RMS norm where the hooks have one."""
+    if hooks.output is None:
+        return out
+    return gated_rms(out, given['z'].astype(work), given['weight'].astype(work), hooks.output)
+
+
+def _gates(hooks: Hooks, given: dict, work, key_width: int):
+    """The reference's decay per key dimension `[rows, Hv, Dk]` and write gate `[rows, Hv]`."""
+    g, beta = log_gates(hooks, given, work)
     rows, heads = given['state'].shape[:2]
     if g is None:
         decay = jnp.ones((rows, heads, key_width), work)
@@ -291,7 +312,7 @@ def step_reference(hooks: Hooks, operands: Step, *, dtype=None):
     """`(output [rows, Hv, Dv], history' or None, state')` of a decode token, in XLA: each piece of
     arithmetic in at least fp32 (float64 operands in float64), the state held as it came (bf16
     rounded by `round_to_bf16`), the output in `dtype` (the value's or the token's without it)."""
-    given = _read(hooks, operands)
+    given = read(hooks, operands)
     state = given['state']
     operand = given['token' if hooks.conv is not None else 'value'].dtype
     work = jnp.promote_types(jnp.promote_types(operand, state.dtype), jnp.float32)
@@ -299,10 +320,7 @@ def step_reference(hooks: Hooks, operands: Step, *, dtype=None):
     query, key, value, history = _prologue(hooks, given, work)
     decay, write = _gates(hooks, given, work, key_width)
     out, updated = update(state.astype(work), query, key, value, decay, write[..., None], delta=hooks.delta)
-    if hooks.skip:
-        out = out + given['skip'].astype(work)[None, :, None] * value
-    if hooks.output is not None:
-        out = gated_rms(out, given['z'].astype(work), given['weight'].astype(work), hooks.output)
+    out = normed(hooks, skipped(hooks, out, value, given, work), given, work)
     held = _held(updated, key, value, state.dtype)
     if operands.active is not None:
         active = jnp.asarray(operands.active, bool)
@@ -612,7 +630,7 @@ def step(hooks: Hooks, operands: Step, *, dtype=None):
     where the caller lets it go. A row `active` marks False keeps its history and state, its output
     zeros. A one-tap conv holds no history, so its token is a channel-wise scale: it is taken here
     and the launch steps the queries, keys and values it makes."""
-    given = _read(hooks, operands)
+    given = read(hooks, operands)
     if hooks.conv is not None and given['held'].shape[1] == 0:
         return _one_tap(hooks, hooks.conv, operands, given, dtype)
     rows = given['state'].shape[0]
