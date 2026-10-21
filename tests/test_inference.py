@@ -349,6 +349,39 @@ def make_lm_run(directory, *, mesh=None, ema_decay=0.9, max_seq_len=16):
     return objective, state
 
 
+def test_every_route_generates_through_its_packed_projections_over_canonical_weights(tmp_path):
+    """A run's task, its source export's task and a live objective's keep the canonical tree, the
+    objective's bound in place, and each generation packs its decoder's query/key/value and gate/up
+    projections inside its own compiled call: each draws, bit for bit, what a task over weights
+    packed beforehand draws, and the routes draw alike. A source's task packed at load and a run's
+    did not, so one model drew two ways and a source's tree could not export."""
+    from dew.inference.projections import inference_projections
+    from dew.interop import Pretrained
+    from dew.sampling import Sampling
+
+    run = tmp_path / "run"
+    run.mkdir()
+    objective, state = make_lm_run(run, ema_decay=None)
+    Pretrained.from_run(str(run)).save(tmp_path / "source")
+    routes = {"run": dew.pipeline(str(run)), "source": dew.pipeline(str(tmp_path / "source")),
+              "objective": objective.pipeline(state)}
+    for name, task in routes.items():
+        attention = task.variables["params"]["layers_0"]["self_attn"]
+        assert {"q_proj", "k_proj", "v_proj"} <= set(attention) and "qkv_proj" not in attention, name
+    for bound, live in zip(jax.tree.leaves(routes["objective"].variables), jax.tree.leaves(state.variables),
+                           strict=True):
+        assert bound is live
+    greedy = Sampling(temperature=0, eos_token_ids=255)
+    drawn = {}
+    for name, task in routes.items():
+        prepacked = TextGeneration(task.model, inference_projections(task.model, task.variables), task.processor)
+        drawn[name] = task("the ", 4, key=2, sampling=greedy).host()
+        expected = prepacked("the ", 4, key=2, sampling=greedy).host()
+        np.testing.assert_array_equal(drawn[name].tokens, expected.tokens, err_msg=name)
+        np.testing.assert_array_equal(drawn[name].raw_log_probs, expected.raw_log_probs, err_msg=name)
+    np.testing.assert_array_equal(drawn["run"].raw_log_probs, drawn["objective"].raw_log_probs)
+
+
 def test_objective_pipeline_binds_the_trained_state_in_place(tmp_path):
     """A just-trained state is the pipeline: the averaged weights when the
     objective keeps them, the live ones on request, the objective's own
