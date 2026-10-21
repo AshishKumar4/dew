@@ -486,7 +486,9 @@ class _NativeTextTask:
             layout: Layout | None, dtype: DTypeLike | None, param_dtype: DTypeLike | None,
             trust: Sequence[str]) -> tuple[nn.Module, Variables, SettingsT, Processor | None]:
         """A run's model at `dtype`, as `checked` accepts it before any weight loads, its weights
-        as its objective restores them, its task settings, and its host processor."""
+        as its objective restores them, its task settings, and its host processor. The task owns
+        the weights it restored: their projections pack here, once, as a source's do at its load
+        (`dew.pipeline`), so every route reads the same packed weights."""
         from dew.registry import objectives
 
         record, exact = run_record(directory, step, trust)
@@ -496,7 +498,7 @@ class _NativeTextTask:
         checked(model, held)
         variables = objectives[named(record["objective"], "objective")]._saved_variables(
             directory, step=exact, ema=ema, mesh=mesh, layout=layout, param_dtype=param_dtype)
-        return model, variables, held, _saved_processor(held, config)
+        return model, packed_owned(model, variables, layout), held, _saved_processor(held, config)
 
     @classmethod
     def from_pretrained(cls, repo_id: str, *, revision: str | None = None,
@@ -652,9 +654,7 @@ class TextGeneration(_NativeTextTask):
         model, variables, settings, processor = cls._loaded(
             directory, TextSettings, lambda model, settings: None, ema=ema, step=step, mesh=mesh,
             layout=layout, dtype=dtype, param_dtype=param_dtype, trust=trust)
-        # The task owns the weights it restored: their projections pack here, once, as a source's
-        # do at its load (`dew.pipeline`), and every route then reads the same packed weights.
-        return cls.from_settings(model, packed_owned(model, variables, layout), settings, processor)
+        return cls.from_settings(model, variables, settings, processor)
 
     @classmethod
     def from_settings(cls, model: nn.Module, variables: Variables, settings: TextSettings,
