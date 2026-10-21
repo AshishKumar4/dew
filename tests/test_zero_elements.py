@@ -286,8 +286,14 @@ def test_a_bound_survives_underflow_in_products_quotients_and_dots():
     inputs = ([2.0 ** -600, 2.0 ** -1000],)
     quotient, _ = _float64(lambda x: cancelled(x) / 2.0 ** 500, *inputs)
     dotted, _ = _float64(lambda x: jnp.dot(jnp.stack([cancelled(x)]), jnp.asarray([2.0 ** -500])), *inputs)
-    for out in (quotient, dotted):
+    # A subnormal bound fed to the bound dot, which XLA may read as zero.
+    def scaled_back(x):
+        return jnp.dot(jnp.stack([cancelled(x) / 2.0 ** 500]), jnp.asarray([2.0 ** 500]))
+
+    flushed, _ = _float64(scaled_back, [2.0 ** -600, 2.0 ** -654])
+    for out in (quotient, dotted, flushed):
         assert not out.exact.any() and (out.error > 0).all()
+    assert float(flushed.error) >= 2.0 ** -654
 
 
 def test_a_correctly_rounded_float64_quotient_is_certified():

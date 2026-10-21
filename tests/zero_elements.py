@@ -495,6 +495,11 @@ class Interpreter:
         numbers = eqn.params["dimension_numbers"]
 
         def dot(left, right):
+            # XLA may read a subnormal operand as zero: each positive one raised to the least normal, an
+            # upper bound of it, so no bound product is lost.
+            least = _least_normal(FLOAT64)
+            left, right = (np.where((v > 0) & (v < least), least, v)
+                           for v in (np.asarray(left, np.float64), np.asarray(right, np.float64)))
             with jax.enable_x64(new_val=True):
                 left, right = jnp.asarray(left, jnp.float64), jnp.asarray(right, jnp.float64)
                 highest = jax.lax.Precision.HIGHEST
