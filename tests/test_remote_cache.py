@@ -1,43 +1,33 @@
 """The shared layer under JAX's compilation cache (tests/remote_cache.py), each test file's
-programs one bundle, against a stand-in for the dew-xla-cache Worker and against no Worker at all."""
+programs one bundle, against a stand-in for the dew-xla-cache Worker and against no Worker at all.
+JAX's cache directory is the boundary: a program JAX compiles is a `<key>-cache` file there, which
+`compiled` writes as JAX does where a test needs no real compilation."""
 
 import http.server
 import socket
 import threading
 import time
-import urllib.parse
 import urllib.request
+from pathlib import Path
 from typing import ClassVar
 
 import remote_cache
 
 
-class Local:
-    """A JAX cache of a dict."""
-
-    def __init__(self):
-        self.entries = {}
-
-    def get(self, key):
-        return self.entries.get(key)
-
-    def put(self, key, value):
-        self.entries[key] = value
+def compiled(directory: Path, key: str, value: bytes = b"executable") -> None:
+    """Program `key` in JAX's cache `directory`, as JAX writes one."""
+    (directory / f"{key}{remote_cache.SUFFIX}").write_bytes(value)
 
 
-def entry(name: str) -> bytes:
-    """A cache entry as JAX writes one."""
-    from jax._src import compilation_cache
-
-    return compilation_cache.compress_executable(
-        compilation_cache.combine_executable_and_time(name.encode(), 2))
+def programs(directory: Path) -> dict[str, bytes]:
+    return {path.name.removesuffix(remote_cache.SUFFIX): path.read_bytes()
+            for path in directory.glob(f"*{remote_cache.SUFFIX}")}
 
 
-def test_an_unreachable_remote_only_slows_a_task_by_its_first_failed_requests(monkeypatch):
+def test_an_unreachable_remote_only_slows_a_task_by_its_first_failed_requests(monkeypatch, tmp_path):
     """No Worker at the URL: each file's bundle fails to arrive or leave until
-    `FAILURES` requests have, the remote is then left alone, every read is a
-    local miss and every write stays local, and no call raises or asks the URL
-    again."""
+    `FAILURES` requests have, the remote is then left alone, every program stays
+    in the local cache, and no call raises or asks the URL again."""
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
         port = probe.getsockname()[1]
@@ -45,22 +35,35 @@ def test_an_unreachable_remote_only_slows_a_task_by_its_first_failed_requests(mo
     urlopen = urllib.request.urlopen
     monkeypatch.setattr(urllib.request, "urlopen",
                         lambda *args, **kwargs: (opened.append(args), urlopen(*args, **kwargs))[1])
-    cache = remote_cache.RemoteCache(Local(), f"http://127.0.0.1:{port}", "token", "jax/cpu")
+    cache = remote_cache.RemoteCache(tmp_path, f"http://127.0.0.1:{port}", "token", "jax/cpu")
     began = time.monotonic()
     for index in range(10):
         cache.opened(f"tests/test_{index}.py")
-        assert cache.get(f"jit_step-{index}") is None
-        cache.put(f"jit_step-{index}", entry("step"))
+        compiled(tmp_path, f"jit_step-{index}")
         cache.closed(f"tests/test_{index}.py")
     cache.drain()
     assert time.monotonic() - began < 10
     # An upload already under way as the remote was given up may be one request more.
     assert not cache.available and remote_cache.FAILURES <= len(opened) <= remote_cache.FAILURES + 1
-    assert all(cache.base.get(f"jit_step-{index}") == entry("step") for index in range(10))
+    assert set(programs(tmp_path)) == {f"jit_step-{index}" for index in range(10)}
+
+
+def test_a_cache_directory_that_cannot_be_written_only_slows_a_task(cache_worker, tmp_path):
+    """A bundle that cannot be written into the local cache (here the cache's path is a file) is a
+    miss counted against the remote, as a request that fails is: it raises nothing."""
+    url, stored, _ = cache_worker
+    stored["/jax/cpu/bundles/tests/a.py"] = remote_cache.packed([("jit_a-1", b"executable")])
+    blocked = tmp_path / "file"
+    blocked.write_text("")
+    cache = remote_cache.RemoteCache(blocked, url, "token", "jax/cpu")
+    for _ in range(remote_cache.FAILURES):
+        cache.opened("tests/a.py")
+        cache.opened("tests/b.py")
+    assert not cache.available
 
 
 def test_a_files_programs_reach_the_next_process_in_one_bundle(cache_worker, tmp_path):
-    """With jax as Dew pins it: `install` wraps JAX's own persistent cache, a
+    """With jax as Dew pins it: `install` keeps JAX's own cache directory, a
     file's compilations reach the Worker as one bundle under the version and
     device prefix, and a process with an empty local cache reads them back
     instead of compiling, its programs all held, so it writes nothing back. A
@@ -86,7 +89,7 @@ if sys.argv[3] == "more":
     jax.jit(lambda x: x - 1.0)(1.0)
 remote.drain()
 counts = compilation_cache_counts()
-print(remote.fetched, remote.uploaded, int(counts.get("train/cache_misses", 0)))
+print(remote.programs_fetched, remote.uploaded, int(counts.get("train/cache_misses", 0)))
 """
     path = os.pathsep.join([os.path.dirname(__file__), os.environ.get("PYTHONPATH", "")])
     env = {**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": path}
@@ -110,7 +113,7 @@ print(remote.fetched, remote.uploaded, int(counts.get("train/cache_misses", 0)))
     assert len(list(remote_cache.unpacked(stored[key]))) > programs
 
 
-def test_a_slow_remote_never_holds_a_process_exit():
+def test_a_slow_remote_never_holds_a_process_exit(tmp_path):
     """A bundle queued behind a remote that takes a minute a write does not
     keep the process from exiting: it uploads on a daemon thread, and only the
     drain at the end of pytest's session waits for it, up to its bound."""
@@ -134,21 +137,22 @@ def test_a_slow_remote_never_holds_a_process_exit():
     server.daemon_threads = True
     threading.Thread(target=server.serve_forever, daemon=True).start()
     script = f"""
+import pathlib
+import sys
 import remote_cache
 remote_cache.TIMEOUT_SECONDS = 2
-class Local(dict):
-    def put(self, key, value):
-        self[key] = value
-remote = remote_cache.RemoteCache(Local(), "http://127.0.0.1:{server.server_address[1]}", "token", "jax/cpu")
+directory = pathlib.Path(sys.argv[1])
+url = "http://127.0.0.1:{server.server_address[1]}"
+remote = remote_cache.RemoteCache(directory, url, "token", "jax/cpu")
 for index in range(20):
     remote.opened(f"tests/test_{{index}}.py")
-    remote.put(f"jit_step-{{index}}", b"executable")
+    (directory / f"jit_step-{{index}}-cache").write_bytes(b"executable")
     remote.closed(f"tests/test_{{index}}.py")
 """
     path = os.pathsep.join([os.path.dirname(__file__), os.environ.get("PYTHONPATH", "")])
     began = time.monotonic()
-    done = subprocess.run([sys.executable, "-c", script], env={**os.environ, "PYTHONPATH": path},
-                          capture_output=True, text=True, timeout=120)
+    done = subprocess.run([sys.executable, "-c", script, str(tmp_path)], capture_output=True, text=True,
+                          env={**os.environ, "PYTHONPATH": path}, timeout=120)
     server.shutdown()
     assert done.returncode == 0, done.stderr[-2000:]
     assert time.monotonic() - began < 30
@@ -170,7 +174,7 @@ class Counted(http.server.BaseHTTPRequestHandler):
             self.rfile.read(int(self.headers.get("Content-Length") or 0))
         if self.command == "GET" and "/slow" in self.path:
             Counted.released.wait(60)
-            body = remote_cache.packed([("jit_slow-1", entry("slow"))])
+            body = remote_cache.packed([("jit_slow-1", b"slow")])
             self.send_response(200)
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
@@ -192,30 +196,54 @@ def counted() -> tuple[http.server.ThreadingHTTPServer, str]:
     return server, f"http://127.0.0.1:{server.server_address[1]}"
 
 
-def test_a_remote_given_up_sends_none_of_the_uploads_still_queued():
-    """Twenty files' bundles queued behind a remote that fails each: once
-    `FAILURES` requests have failed, the bundles still queued are dropped unsent,
+class Refusing(http.server.BaseHTTPRequestHandler):
+    """A remote that has no bundle and refuses every upload; it counts the uploads that reach it."""
+
+    uploads: ClassVar[list[str]] = []
+
+    def log_message(self, *args):
+        pass
+
+    def do_GET(self):
+        self.send_response(404)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+    def do_PUT(self):
+        Refusing.uploads.append(self.path)
+        self.rfile.read(int(self.headers.get("Content-Length") or 0))
+        self.send_response(500)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
+
+def test_a_remote_given_up_sends_none_of_the_uploads_still_queued(tmp_path):
+    """Twenty files' bundles queued behind a remote that refuses each: once
+    `FAILURES` uploads have failed, the bundles still queued are dropped unsent,
     and each file's programs stay in the local cache."""
-    server, url = counted()
-    cache = remote_cache.RemoteCache(Local(), url, "token", "jax/cpu")
+    Refusing.uploads = []
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Refusing)
+    server.daemon_threads = True
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    url = f"http://127.0.0.1:{server.server_address[1]}"
+    cache = remote_cache.RemoteCache(tmp_path, url, "token", "jax/cpu")
     for index in range(20):
-        cache.put(f"jit_step-{index}", entry("step"))
-    cache.used = {f"tests/test_{index}.py": {f"jit_step-{index}"} for index in range(20)}
-    for index in range(20):
+        cache.opened(f"tests/test_{index}.py")
+        compiled(tmp_path, f"jit_step-{index}")
         cache.closed(f"tests/test_{index}.py")
     cache.drain()
     server.shutdown()
     assert not cache.available
-    assert remote_cache.FAILURES <= len(Counted.requests) <= remote_cache.FAILURES + 1
-    assert all(cache.base.get(f"jit_step-{index}") == entry("step") for index in range(20))
+    assert remote_cache.FAILURES <= len(Refusing.uploads) <= remote_cache.FAILURES + 1
+    assert set(programs(tmp_path)) == {f"jit_step-{index}" for index in range(20)}
 
 
-def test_an_answer_that_arrives_after_the_remote_was_given_up_does_not_take_it_back():
+def test_an_answer_that_arrives_after_the_remote_was_given_up_does_not_take_it_back(tmp_path):
     """A bundle's fetch under way while other requests fail the remote: its
     programs are kept, but the remote stays given up, and no request reaches it
     after."""
     server, url = counted()
-    cache = remote_cache.RemoteCache(Local(), url, "token", "jax/cpu")
+    cache = remote_cache.RemoteCache(tmp_path, url, "token", "jax/cpu")
     slow = threading.Thread(target=cache.opened, args=("tests/slow.py",))
     slow.start()
     try:
@@ -230,43 +258,49 @@ def test_an_answer_that_arrives_after_the_remote_was_given_up_does_not_take_it_b
     slow.join()
     sent = len(Counted.requests)
     cache.opened("tests/late.py")
-    cache.put("jit_late-1", entry("late"))
+    compiled(tmp_path, "jit_late-1")
     cache.closed("tests/late.py")
     cache.drain()
     server.shutdown()
-    assert cache.base.get("jit_slow-1") == entry("slow") and not cache.available
+    assert programs(tmp_path)["jit_slow-1"] == b"slow" and not cache.available
     assert len(Counted.requests) == sent
 
 
-def test_a_bundle_holds_every_program_its_files_tests_used_however_they_ran(cache_worker):
+def test_a_bundle_holds_every_program_its_files_tests_compiled_however_they_ran(cache_worker, tmp_path):
     """A file whose tests ran apart, another file's between them, writes back every program its tests
-    used, not the last run's alone; a split file's groups each keep a bundle of their own, which no
-    other group's replaces; and a bundle the Worker answers cut short or past its bound is a miss
+    compiled, not the last run's alone, and a program compiled as a file is collected joins its bundle;
+    a split file's groups each keep a bundle of their own, which no other group's replaces; and a
+    bundle the Worker answers cut short, past its bound or with a key that is no file name is a miss
     that puts nothing in the local cache."""
     url, stored, _ = cache_worker
-    cache = remote_cache.RemoteCache(Local(), url, "token", "jax/cpu")
+    cache = remote_cache.RemoteCache(tmp_path, url, "token", "jax/cpu")
+    cache.opened("tests/a.py")
+    compiled(tmp_path, "jit_collected-1")
+    cache.opened("tests/b.py")
     for file, program in (("tests/a.py", "first"), ("tests/b.py", "other"), ("tests/a.py", "second")):
         cache.opened(file)
-        cache.put(f"jit_{program}-1", entry(program))
+        compiled(tmp_path, f"jit_{program}-1")
         cache.closed(file)
     cache.drain()
     [key] = [key for key in stored if key.endswith("/bundles/tests/a.py")]
-    assert dict(remote_cache.unpacked(stored[key])) == {"jit_first-1": entry("first"),
-                                                         "jit_second-1": entry("second")}
+    assert dict(remote_cache.unpacked(stored[key])) == dict.fromkeys(
+        ("jit_collected-1", "jit_first-1", "jit_second-1"), b"executable")
     for group in ("1/2", "2/2"):
         cache.opened(remote_cache.bundle("tests/split.py::test_x", group, None))
-        cache.put(f"jit_{group[0]}-1", entry(group))
+        compiled(tmp_path, f"jit_{group[0]}-1")
         cache.closed(remote_cache.bundle("tests/split.py::test_x", group, None))
     cache.drain()
     assert [len(remote_cache.unpacked(stored[f"/jax/cpu/bundles/tests/split.py/{group}-of-2"]))
             for group in "12"] == [1, 1]
-    whole = remote_cache.packed([("jit_cut-1", entry("cut")), ("jit_cut-2", entry("cut"))])
-    for name, body in (("cut", whole[:-3]), ("header", whole + b"\0\0")):
+    whole = remote_cache.packed([("jit_cut-1", b"cut"), ("jit_cut-2", b"cut")])
+    for name, body in (("cut", whole[:-3]), ("header", whole + b"\0\0"),
+                       ("escape", remote_cache.packed([("../jit_escape-1", b"x")]))):
         stored[f"/jax/cpu/bundles/tests/{name}.py"] = body
-        fresh = remote_cache.RemoteCache(Local(), url, "token", "jax/cpu")
+        fresh = remote_cache.RemoteCache(tmp_path / name, url, "token", "jax/cpu")
+        (tmp_path / name).mkdir()
         fresh.opened(f"tests/{name}.py")
-        assert fresh.base.entries == {} and fresh.fetched == 0 and fresh.failures == 1
-
+        assert programs(tmp_path / name) == {} and fresh.programs_fetched == 0 and fresh.failures == 1
+    assert not (tmp_path / "jit_escape-1-cache").exists()
 
 def run_child(script: str, *arguments: str) -> list[str]:
     """`script` run in a fresh Python with the tests' directory on its path and JAX on the CPU: its
