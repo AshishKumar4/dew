@@ -416,8 +416,11 @@ def test_image_sft_trainer_resume_publish_and_generate(image_source, tmp_path):
     prompt = jax.tree.map(jnp.asarray, batch["text"]).slice_tokens(stop=8)
     key = jax.random.key(11)
     published_task = readback.block_generation()
-    generated = obj.pipeline(resumed, ema=False, processor=loaded.processor)(
-        prompt, 4, key=key, process=published_task.process)
+    # The run's task stops where the published one does: at the checkpoint's end-of-sequence ids, which
+    # the run's own settings do not carry.
+    run_task = replace(obj.pipeline(resumed, ema=False, processor=loaded.processor),
+                       eos_token_ids=published_task.eos_token_ids)
+    generated = run_task(prompt, 4, key=key, process=published_task.process)
     published = published_task(prompt, 4, key=key)
     np.testing.assert_array_equal(generated.tokens, published.tokens)
     np.testing.assert_array_equal(generated.decoder_steps, published.decoder_steps)

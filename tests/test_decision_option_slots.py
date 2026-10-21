@@ -8,7 +8,6 @@ rounding, whatever the number of option slots: XLA's products sum in an
 order that may follow how many rows they multiply.
 """
 
-import copy
 import dataclasses
 import json
 from pathlib import Path
@@ -17,7 +16,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import Inconclusive, assert_as_exact, widened
+from reference_error import assert_leaves_as_exact, float64_terms, widened
 from safetensors.numpy import load_file
 
 from dew.config.data import loader
@@ -117,16 +116,12 @@ def ragged() -> list[Example]:
             Example("book a flight", {"intent": intents}, {"intent": "i3"})]
 
 
-SLOT_SEEDS = 16
-"""Check 1's declared seeds for the compacted options, sized by `seeds_for` (2026-10-21, on armada)."""
-
-
 def test_a_ragged_batch_trains_on_compacted_options_as_on_the_grid():
     """Rows of 100, 17 x 3 and 24 real options packed into windows of a grid
     as many questions deep as a window holds, which the packing compacts into
     the slots its bounds allow: the loss and every parameter's
-    gradient, backbone's and head's, on par with the grid's over drawn
-    parameters (check 1), and the loss reads only the real options."""
+    gradient, backbone's and head's, as over the grid to float32 rounding,
+    and the loss reads only the real options."""
     tokenizer = ByteTokenizer()
     specials = Specials(begin=None, separator=10, marker=0, marker_text="\x00", pad=255)
     examples = ragged()
@@ -157,40 +152,35 @@ def test_a_ragged_batch_trains_on_compacted_options_as_on_the_grid():
     capacity = -(-bounds.options // 128) * 128
     assert laid_out(slotted, bounds.segments).option_slots.shape == (len(options), capacity)
     batch = {name: value for name, value in slotted.items() if name not in ("option_slots", "slotted")}
-    step = Step(jnp.asarray(0), jax.random.key(0), None)
-    wide = copy.copy(objective)
-    wide.substitute((objective.model.backbone.clone(dtype=jnp.float64),
-                     objective.model.head.clone(dtype=jnp.float64)))
-
-    def stepped(objective, rows):
-        @jax.jit
-        def loss_and_gradient(held):
-            return jax.value_and_grad(lambda held: objective.scalar_loss(held, rows, step)[0])(held)
-
-        return loss_and_gradient
-
-    # The compaction reorders the sums over the grid's option slots. Truth: the grid's step in
-    # float64, the backbone and head widened (the head and its scoring rule keep a float64 input's
-    # dtype); a key bias's and the scorer's shared bias gradients cancel (q.b shifts every key's
-    # logit alike; the residual gate shifts every option's), so their rows of float64 zero are held
-    # as check 1 holds such rows.
-    compacted, grid = stepped(objective, slotted), stepped(objective, batch)
-    initialized = jax.jit(objective.init)
-    assert_as_exact(compacted, grid, lambda seed: (initialized(jax.random.key(seed)),),
-                    "compacted options", seeds=SLOT_SEEDS, truth_fn=stepped(wide, widened(batch)))
     variables = objective.init(jax.random.key(0))
-    fewer, fewer_gradient = compacted(variables)
-    # A NaN in one gradient leaf fails the same comparison.
-    leaves, structure = jax.tree.flatten(fewer_gradient)
-    poisoned = jax.tree.unflatten(structure, [np.full_like(leaves[0], np.nan), *leaves[1:]])
-    with pytest.raises(AssertionError) as poisoned_failure:
-        assert_as_exact(lambda variables: (fewer, poisoned), grid, lambda seed: (variables,), "poisoned",
-                        seeds=SLOT_SEEDS, truth_fn=stepped(wide, widened(batch)))
-    # A failure of the comparison, not a draw too small to judge.
-    assert not isinstance(poisoned_failure.value, Inconclusive)
+    step = Step(jnp.asarray(0), jax.random.key(0), None)
 
     def loss(held, rows):
         return objective.scalar_loss(held, rows, step)[0]
+
+    (grid, grid_gradient), (fewer, fewer_gradient) = (jax.value_and_grad(loss)(variables, rows)
+                                                      for rows in (batch, slotted))
+    # Float64 truth: the grid's step in float64 (the head and its scoring rule
+    # keep a float64 input's dtype), with each gradient leaf's terms: a key
+    # bias's and the scorer's shared bias gradients cancel (q.b shifts every
+    # key's logit alike; the residual gate shifts every option's), so their
+    # terms, not their near-zero sizes, are their rounding's scale. The
+    # compacted step is held to it as the grid is, per tensor
+    # (tests/reference_error.py).
+    with jax.enable_x64(new_val=True):
+        wide_variables, wide_batch = widened((variables, batch))
+        (truth, truth_gradient), (_, terms) = float64_terms(jax.value_and_grad(loss), wide_variables,
+                                                            wide_batch)
+        truth, truth_gradient = float(truth), jax.tree.map(np.asarray, truth_gradient)
+    # The compaction reorders the sums over the grid's option slots.
+    slots = options.shape[1] * options.shape[2]
+    assert_leaves_as_exact(fewer, grid, truth, reductions=slots)
+    assert_leaves_as_exact(fewer_gradient, grid_gradient, truth_gradient, reductions=slots, terms=terms)
+    # A NaN in one gradient leaf fails the same comparison.
+    leaves, structure = jax.tree.flatten(fewer_gradient)
+    poisoned = jax.tree.unflatten(structure, [np.full_like(leaves[0], np.nan), *leaves[1:]])
+    with pytest.raises(AssertionError):
+        assert_leaves_as_exact(poisoned, grid_gradient, truth_gradient, reductions=slots, terms=terms)
 
     # Whatever the head gives a slot with no real option, the loss and its
     # gradients are the same bits: the model's logits mask those slots.
