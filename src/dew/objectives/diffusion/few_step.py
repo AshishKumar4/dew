@@ -216,6 +216,7 @@ class MeanFlowObjective(DiffusionObjective):
         # The update's first examples by place take each role, as its whole batch's first rows do.
         places, total = step.places(count)
         t, r = intervals(first, second, self.instantaneous, places, total)
+        t, r = step.boundary("interval end", t), step.boundary("interval start", r)
         z, _, v = self.process.prediction.forward_diffusion(
             samples, noise, broadcast_rates(schedule, t, samples)
         )
@@ -240,7 +241,7 @@ class MeanFlowObjective(DiffusionObjective):
             guided = v
         update = step.sample_update("condition dropout", jax.random.uniform, (), dtype=jnp.float32,
                                     rows=count)
-        dropped = places < jnp.sum(update < self.unconditional_prob)
+        dropped = step.boundary("dropped conditions", places < jnp.sum(update < self.unconditional_prob))
         conditions = jax.tree.map(lambda value, null: jnp.where(expand(dropped, value), null, value),
                                   given, blank)
         guided = jnp.where(expand(dropped, v), v, guided)
@@ -309,15 +310,15 @@ class ShortcutObjective(DiffusionObjective):
         bootstrap = places < rows
         levels = shortcut_levels(max(rows, 1), self.sections)
         level = rows_taken(levels, jnp.clip(places, 0, levels.shape[0] - 1))
-        grid = jnp.where(bootstrap, 2.0 ** level, float(self.sections))
+        grid = step.boundary("level grid", jnp.where(bootstrap, 2.0 ** level, float(self.sections)))
         index, noise, dropping = self._draws(step, count, grid, samples.shape)
         # Data at t = index / grid in the reference's time, on its path; Dew's sigma is 1 - t.
-        t = index / grid
+        t = step.boundary("data times", index / grid)
         sigma = 1 - t
         x = (1 - (1 - _NOISE_FLOOR) * expand(t, samples)) * noise + expand(t, samples) * samples
         v = (1 - _NOISE_FLOOR) * noise - samples
         step_size = jnp.where(bootstrap, 2.0 ** -level, 1 / self.sections)
-        dropped = ~bootstrap & dropping
+        dropped = step.boundary("dropped conditions", ~bootstrap & dropping)
         conditions = jax.tree.map(lambda value, null: jnp.where(expand(dropped, value), null, value),
                                   given, blank)
 
