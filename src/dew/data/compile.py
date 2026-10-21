@@ -33,6 +33,7 @@ from dew.data.analysis import (
     _leaves,
     _Lowering,
     _manifest,
+    _measures,
     _member_keys,
     _members,
     _name,
@@ -75,6 +76,7 @@ from dew.data.pipeline import (
     Limit,
     Map,
     MapBatch,
+    Measure,
     Mixture,
     Native,
     ObjectiveData,
@@ -199,13 +201,18 @@ def _released(pipelines: Sequence[Pipeline]) -> None:
 
 def _pin_sources(pipelines: Sequence[Pipeline], read: Read) -> tuple[Pipeline, ...]:
     sources = {id(source): source for branch in pipelines for _, source in _leaves(branch)}
+    measured: dict[int, dict[str, Measure]] = {}
+    for branch in pipelines:
+        for key, measures in _measured(branch).items():
+            measured.setdefault(key, {}).update({measure.fact: measure for measure in measures})
 
     def pin(source: Source) -> _Facts:
         if isinstance(source, _Facts):
             return source
         label = source.label()
+        measures = tuple(measured.get(id(source), {}).values())
         source = _consumed(source, read)
-        records, metadata = _stated(source, read)
+        records, metadata = _stated(source, read, measures)
         held = None if records is None else _PinnedRead(records)
         return _Facts(source, read, source.fingerprint(), metadata, held, label)
 
@@ -222,6 +229,20 @@ def _pin_sources(pipelines: Sequence[Pipeline], read: Read) -> tuple[Pipeline, .
         return dataclasses.replace(branch, source=source)
 
     return tuple(replace(branch) for branch in pipelines)
+
+
+def _measured(pipeline: Pipeline, above: tuple[Measure, ...] = ()) -> dict[int, tuple[Measure, ...]]:
+    """The facts each store `pipeline` reads has measured for the configured steps over it, its own
+    and its mixtures' (`Configured.measures`), by the store's identity."""
+    measures = (*above, *_measures(pipeline.stages))
+    source = pipeline.source
+    if not isinstance(source, (Mixture, Phases)):
+        return {id(source): measures}
+    found: dict[int, tuple[Measure, ...]] = {}
+    for child in source.pipelines:
+        for key, child_measures in _measured(child, measures).items():
+            found[key] = (*found.get(key, ()), *child_measures)
+    return found
 
 
 def _tokenizer_contract(pipelines: Sequence[Pipeline]) -> None:
@@ -934,6 +955,8 @@ def _metadata(pipelines: Sequence[Pipeline], read: Read) -> Mapping[str, object]
     combined: Batch = {}
     conflicted: set[str] = set()
     slots: dict[str, int] = {}
+    # A fact a configured step measures binds a mixture's step to the largest of its stores'.
+    measured = {measure.fact for pipeline in pipelines for measure in _measures(_steps(pipeline))}
     for pipeline in pipelines:
         for _, source in _leaves(pipeline):
             if isinstance(source, _Memory) and not source.held:
@@ -943,6 +966,8 @@ def _metadata(pipelines: Sequence[Pipeline], read: Read) -> Mapping[str, object]
                 if key == "slots":
                     for name, size in record(value, "slots").items():
                         slots[name] = max(slots.get(name, 0), integer(size, f"slots.{name}"))
+                elif key in measured:
+                    combined[key] = max(integer(value, key), integer(combined.get(key, 0), key))
                 elif key not in combined:
                     combined[key] = value
                 elif combined[key] != value:

@@ -25,7 +25,7 @@ import dataclasses
 import inspect
 import itertools
 import json
-from collections.abc import Callable, Iterator, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from typing import TYPE_CHECKING, Literal, Protocol, get_args, runtime_checkable
 
@@ -46,6 +46,7 @@ from dew.data.pipeline import (
     Map,
     MapBatch,
     MapWithIndex,
+    Measure,
     Mixture,
     Native,
     Pack,
@@ -142,12 +143,25 @@ def _in_memory(source: Source) -> bool:
     return isinstance(_store(source), Memory)
 
 
-def _stated(source: Source, read: Read) -> tuple[Records | None, Mapping[str, object]]:
-    """The records a memory read of `source` holds, then its metadata, read
-    in that order: a source may measure a fact as it reads (a prompt's
-    reward bound), so its facts follow the read."""
+def _stated(source: Source, read: Read,
+            measures: Sequence[Measure] = ()) -> tuple[Records | None, Mapping[str, object]]:
+    """The records a memory read of `source` holds, then its metadata, with each fact `measures`
+    measure over its store's records in a memory read in place of any the store states: the whole
+    store, below any holdout, so each part of it binds alike (`Configured.measures`)."""
     held = source.records(read) if read == "memory" else None
-    return held, source.metadata()
+    metadata = source.metadata()
+    if held is None or not measures:
+        return held, metadata
+    store = _store(source)
+    rows = held if store is source else store.records(read)
+    return held, {**metadata, **{measure.fact: measure(rows) for measure in measures}}
+
+
+def _measures(stages: Iterable[Stage]) -> tuple[Measure, ...]:
+    """The facts the configured steps among `stages` measure (`Configured.measures`), each once."""
+    found = {stage.measures.fact: stage.measures for stage in stages
+             if isinstance(stage, Configured) and stage.measures is not None}
+    return tuple(found.values())
 
 
 def _prefix_manifest(source: Source, prefix: Sequence[Stage], read: Read) -> Manifest:
@@ -157,7 +171,7 @@ def _prefix_manifest(source: Source, prefix: Sequence[Stage], read: Read) -> Man
     consumed = _consumed(source, read)
     pipeline = Pipeline(consumed, tuple(prefix))
     if any(isinstance(stage, Configured) for stage in prefix):
-        pipeline = _configured(pipeline, _stated(consumed, read)[1], read)
+        pipeline = _configured(pipeline, _stated(consumed, read, _measures(prefix))[1], read)
     return _cache_manifest(consumed, pipeline.stages, read)
 
 
