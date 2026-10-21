@@ -523,12 +523,12 @@ the libraries offline, and the Hub's address a closed port for any that would as
 test that needs the Hub is marked network; one that reads a model or dataset otherwise brings it."""
 
 
-def apportioned(own_seconds: Mapping[str, float], wall: float) -> dict[str, float]:
+def apportioned(own_seconds: Mapping[str, float], wall: float, rows: int) -> dict[str, float]:
     """Each file's share of a task's `wall` time, in proportion to its tests' own times (`task`), or an
-    even split where no test recorded a time."""
+    even split over the task's `rows` (a file named twice is two) where no test recorded a time."""
     total = sum(own_seconds.values())
     pace = wall / total if total > 0 else 0.0
-    return {name: own * pace if pace else wall / len(own_seconds) for name, own in own_seconds.items()}
+    return {name: own * pace if pace else wall / rows for name, own in own_seconds.items()}
 
 
 def task(python: str, tests: list[str], split: str, out: Path, deadline: float, cache: bool = True,
@@ -608,7 +608,7 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     ran = []
     own_seconds = {name: sum(float(case.get("time") or 0) for case in cases if file_of(case) == name)
                    for name in tests}
-    shares = apportioned(own_seconds, time.monotonic() - began)
+    shares = apportioned(own_seconds, time.monotonic() - began, len(tests))
     for name in tests:
         own = [case for case in cases if file_of(case) == name]
         red = [f"{kind.upper()} {case.get('classname')}::{case.get('name')}: {node.get('message')}"

@@ -558,12 +558,15 @@ def test_durations_are_each_tests_least_time_over_green_runs_floors(ci):
 
 def test_a_tasks_wall_time_is_apportioned_by_its_files_tests_times(ci):
     """A task's wall time split among its files in proportion to their tests'
-    own times, and evenly where no test recorded one: recorded times whose
-    shares are exact in binary."""
-    assert ci.apportioned({"tests/test_a.py": 0.25, "tests/test_b.py": 0.75}, 2.0) == {
+    own times, and evenly over its rows where no test recorded one: recorded
+    times whose shares are exact in binary."""
+    assert ci.apportioned({"tests/test_a.py": 0.25, "tests/test_b.py": 0.75}, 2.0, 2) == {
         "tests/test_a.py": 0.5, "tests/test_b.py": 1.5}
-    assert ci.apportioned({"tests/test_a.py": 0.0, "tests/test_b.py": 0.0}, 3.0) == {
+    assert ci.apportioned({"tests/test_a.py": 0.0, "tests/test_b.py": 0.0}, 3.0, 2) == {
         "tests/test_a.py": 1.5, "tests/test_b.py": 1.5}
+    # A file named twice is two of the task's rows.
+    assert ci.apportioned({"tests/test_a.py": 0.0, "tests/test_b.py": 0.0}, 3.0, 3) == {
+        "tests/test_a.py": 1.0, "tests/test_b.py": 1.0}
 
 
 def test_a_tasks_rows_share_its_wall_time_by_their_tests_times(ci, tmp_path):

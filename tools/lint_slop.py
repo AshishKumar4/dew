@@ -1784,7 +1784,11 @@ def _whole_functions(path: Path, parent: tuple[str, ...], modified: int) -> froz
     modification time `modified`."""
     tree = ast.parse(path.read_text(encoding="utf-8"))
     tables = {id(node): table for node, table in scopes.scoped(tree.body, {}, list(parent))}
-    return frozenset(tolerance_rules.whole_functions(tree, tables, _Calls(tree)))
+    calls = _Calls(tree)
+    # A name the module binds twice, or to anything but its one definition, is no one's.
+    bound = calls.bindings[id(tree)]
+    return frozenset(name for name in tolerance_rules.whole_functions(tree, tables, calls)
+                     if isinstance(bound.get(name), ast.FunctionDef | ast.AsyncFunctionDef))
 
 
 def _inventory(checkout: Path) -> dict:
@@ -1815,11 +1819,15 @@ def _inventory_at(checkout: Path, commit: str) -> dict | None:
     return json.loads(shown.stdout) if shown.returncode == 0 else None
 
 
-def _loosened(checkout: Path, commit: str, parent: str, mine: dict, theirs: dict) -> Iterator[str]:
+def _loosened(checkout: Path, commit: str, parent: str, mine: dict, theirs: dict,
+              authorized: dict[str, int] | None = None,
+              grants: dict[str, int] | None = None) -> Iterator[str]:
     """How `commit`'s inventory `mine` is looser than `parent`'s `theirs`: a file added, a count raised,
     a date moved later, its empty_by later; a file renamed between them carries its entry. Where the
     commit changes SLOP020's reading (`RULE`), a file it leaves unchanged may be added or raised: what
-    the rule now reads there was in the file all along. No date moves later either way."""
+    the rule now reads there was in the file all along, and `grants` takes the count it reached. A file
+    may also sit at a count `authorized` holds for it, one a commit between `parent` and `commit`
+    reached so (HEAD against its base). No date moves later either way."""
     renamed, changed = {}, set()
     changes = _git(checkout, "diff", "--name-status", "-M", parent, commit, "--", "tests", "tools")
     for change in changes.splitlines():
@@ -1832,7 +1840,10 @@ def _loosened(checkout: Path, commit: str, parent: str, mine: dict, theirs: dict
         yield "moves empty_by later"
     for name, entry in mine["files"].items():
         kept = theirs["files"].get(name) or theirs["files"].get(renamed.get(name, ""))
-        grown = reread and name not in changed
+        held = (authorized or {}).get(name, (authorized or {}).get(renamed.get(name, ""), -1))
+        grown = (reread and name not in changed) or entry["comparisons"] <= held
+        if grants is not None and reread and name not in changed:
+            grants[name] = max(grants.get(name, 0), entry["comparisons"])
         if kept is None:
             if not grown:
                 yield f"adds {name}"
@@ -1865,14 +1876,9 @@ def ratchet(checkout: Path, base: str | None = None) -> Iterator[Finding]:
         return
     head_id = _git(checkout, "rev-parse", "HEAD").strip()
     head = _inventory_at(checkout, head_id)
-    if merged is not None:
-        kept = _inventory_at(checkout, merged)
-        if kept is not None and head is None:
-            yield Finding(INVENTORY, 1, 1, "SLOP020",
-                          f"HEAD removes the inventory {base}'s {merged[:9]} keeps")
-        elif kept is not None:
-            for why in _loosened(checkout, head_id, merged, head, kept):
-                yield Finding(INVENTORY, 1, 1, "SLOP020", f"HEAD against {base}'s {merged[:9]} {why}")
+    # Each commit against its parents first, so the counts a change of the rule's reading reached
+    # (`grants`) hold HEAD against its base too.
+    walked, grants = [], {}
     for line in filter(None, listed.splitlines()):
         commit, *parents = line.split()
         mine = _inventory_at(checkout, commit)
@@ -1881,12 +1887,22 @@ def ratchet(checkout: Path, base: str | None = None) -> Iterator[Finding]:
             if theirs is None:
                 continue
             if mine is None:
-                yield Finding(INVENTORY, 1, 1, "SLOP020", f"{commit[:9]} removes the inventory its parent "
-                              f"{parent[:9]} kept; an empty inventory stays, as `files: {{}}`")
+                walked.append(Finding(INVENTORY, 1, 1, "SLOP020", f"{commit[:9]} removes the inventory "
+                                      f"its parent {parent[:9]} kept; an empty inventory stays, as "
+                                      f"`files: {{}}`"))
                 continue
-            for why in _loosened(checkout, commit, parent, mine, theirs):
-                yield Finding(INVENTORY, 1, 1, "SLOP020",
-                              f"{commit[:9]} against its parent {parent[:9]} {why}")
+            walked += [Finding(INVENTORY, 1, 1, "SLOP020", f"{commit[:9]} against its parent {parent[:9]} "
+                               f"{why}") for why in _loosened(checkout, commit, parent, mine, theirs,
+                                                              grants=grants)]
+    if merged is not None:
+        kept = _inventory_at(checkout, merged)
+        if kept is not None and head is None:
+            yield Finding(INVENTORY, 1, 1, "SLOP020",
+                          f"HEAD removes the inventory {base}'s {merged[:9]} keeps")
+        elif kept is not None:
+            for why in _loosened(checkout, head_id, merged, head, kept, authorized=grants):
+                yield Finding(INVENTORY, 1, 1, "SLOP020", f"HEAD against {base}'s {merged[:9]} {why}")
+    yield from walked
 
 
 def _checkout(module: Module) -> Path:

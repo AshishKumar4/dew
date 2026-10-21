@@ -688,7 +688,7 @@
    "by": "2026-11-20"
   },
   "tests/test_moe_decoder.py": {
-   "comparisons": 6,
+   "comparisons": 5,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
