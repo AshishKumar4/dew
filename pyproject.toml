@@ -129,9 +129,10 @@ test = [
     "scipy",
     # tests/test_reporting.py exercises the WandbTracker adapter.
     "dewml[wandb]",
-    # The Diffusers references the tests run live (Flux 2's and Z-Image's transformers among them,
-    # which 0.40.0 first ships), and the release the committed VAE fixture records.
-    "diffusers==0.40.0",
+    # The Diffusers references the tests run live (Flux 2's and Z-Image's transformers among them),
+    # and the release the committed VAE fixture records: 0.39.0, the last that ships Diffusers' Flax
+    # modules, which the Flax VAE, UNet and pipeline references read (0.40.0 removed them).
+    "diffusers==0.39.0",
     # tests/test_wan_source.py cleans prompts as Wan's pipelines do (the wan extra).
     "dewml[wan]",
     # tests/test_tools.py imports FlaxDiff's reference, whose hilbert module imports matplotlib.
