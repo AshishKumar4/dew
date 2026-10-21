@@ -974,7 +974,9 @@ def _checked(
         )
         # A cache reads as the stages it holds would: by index and in one order where they keep one
         # record for each input, as a stream and per share where they drop or expand them.
-        streamed_cache = isinstance(stage, Artifact) and not _indexed_cache(prefix, read)
+        # A configured step the source's facts bind is the step it binds to (`_bound`).
+        cached = isinstance(stage, Artifact)
+        streamed_cache = cached and not _indexed_cache(_bound(pipeline.source, prefix), read)
         indexed = indexed and not (streams or (streamed_cache and read != "memory"))
         shared = _drops(stage) or isinstance(stage, (Interleave, TokenBudget)) or streamed_cache
         per_share = per_share or shared or (isinstance(stage, Workers) and not batched)
