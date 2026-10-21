@@ -62,6 +62,7 @@ def gmm(lhs: jax.Array, rhs: jax.Array, *, tile, transpose_rhs: bool, out_dtypes
         out_specs=tuple(pl.BlockSpec((block_m, block_n), lambda i, j: (i, j)) for _ in out_dtypes),
         compiler_params=plgpu.CompilerParams(num_warps=tile.warps, num_stages=tile.stages),
         interpret=interpret,
+        name="pallas_triton_dense_dot",
     )(_live(rows), lhs, rhs, *prologue_operands, *epilogue_operands)
     return tuple(out[:rows, :width] for out in outs)
 
@@ -119,6 +120,7 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, *, tile, out_dtype, interpret: bool, pr
         out_specs=pl.BlockSpec((block_k, block_n), lambda i, j: (i, j)),
         compiler_params=plgpu.CompilerParams(num_warps=tile.warps, num_stages=tile.stages),
         interpret=interpret,
+        name="pallas_triton_dense_tdot",
     )(_live(rows), lhs, rhs, *prologue_operands)[:depth, :width]
 
 

@@ -461,6 +461,10 @@ class Gmm(_Triton):
         moved = ((columns * rows * depth + tiles * depth * width) * size + rows * width * _output_bytes(ba)
                  + _side_bytes(prologue_sides, hooks.prologue_axes, rereads)
                  + _side_bytes(epilogue_sides, hooks.epilogue_axes, rereads))
+        if ba.arguments.get('dense'):
+            moved += _padding_bytes((((rows, depth), ('rows', 'depth'), size),
+                                     ((depth, width), ('depth', 'width'), size),
+                                     ((rows, width), ('rows', 'width'), _output_bytes(ba))), config)
         extents = self.extents(config)
         exponentials = (
             steps * config.block_m * config.block_k * _hook_work(
@@ -550,6 +554,10 @@ class Tgmm(_Triton):
         rereads = {'rows': groups, 'depth': blocks[0], 'columns': blocks[1]}
         moved = ((blocks[1] * rows * depth + blocks[0] * rows * width) * size + groups * depth * width * out
                  + _side_bytes(sides, hooks.prologue_axes, rereads))
+        if ba.arguments.get('dense'):
+            moved += _padding_bytes((((rows, depth), ('rows', 'depth'), size),
+                                     ((rows, width), ('rows', 'width'), size),
+                                     ((depth, width), ('depth', 'width'), out)), config)
         exponentials = steps * config.block_m * config.block_k * _hook_work(
             hooks.before(), tokens.dtype, sides, hooks.prologue_axes, (config.block_m, config.block_k),
             self.extents(config))
@@ -788,6 +796,20 @@ class MosaicTgmm(_Mosaic):
                                interpret=INTERPRETED if interpret else False, prologue=hooks.before(),
                                prologue_operands=prologue_operands, prologue_axes=hooks.prologue_axes,
                                exact_sums=exact_sums), None
+
+
+def _padding_bytes(arrays: tuple, config: Tile) -> int:
+    """The bytes a dense call's copies move (`triton_dense`): each of `arrays` (its shape, the launch axes
+    'rows', 'depth' or 'width' its dimensions follow, its itemsize), read and written padded to
+    `config`'s tile (rows by `block_m`, depth by `block_k`, width by `block_n`) where it is not a multiple
+    of it."""
+    block = {'rows': config.block_m, 'depth': config.block_k, 'width': config.block_n}
+    moved = 0
+    for shape, axes, itemsize in arrays:
+        grown = tuple(-(extent // -block[axis]) * block[axis]
+                      for extent, axis in zip(shape, axes, strict=True))
+        moved += 2 * math.prod(grown) * itemsize if grown != tuple(shape) else 0
+    return moved
 
 
 def _uncut(sides: tuple, axes_of: tuple, halved: str) -> tuple[tuple, tuple]:

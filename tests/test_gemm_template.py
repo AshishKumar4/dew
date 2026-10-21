@@ -104,9 +104,13 @@ CASES = {
     "dense": Case(out_dtypes=(jnp.float32,), dense=True),
     "dense norm and bias": Case(normed, lambda x, w, ms, nw, b, u, s: ((ms, ("rows",)), (nw, ("depth",))),
                                 biased, lambda x, w, ms, nw, b, u, s: ((b, ("columns",)),), dense=True),
+    "dense scaled": Case(epilogue=scaled,
+                         epilogue_operands=lambda x, w, ms, nw, b, u, s: ((s, ("columns",)),),
+                         out_dtypes=(jnp.float32,), dense=True),
+    "dense two outputs": Case(epilogue=doubled, out_dtypes=(jnp.bfloat16, jnp.float32), dense=True),
 }
 GRADIENT_CASES = ("norm and bias", "gated prologue", "cast prologue", "broadcast axes", "scaled",
-                  "two outputs", "wide output", "dense norm and bias")
+                  "two outputs", "wide output", "dense norm and bias", "dense scaled", "dense two outputs")
 
 
 def _draw(seed):
@@ -294,6 +298,41 @@ def test_a_prologue_never_sees_the_depths_padding(generation_name, sizes):
                                                  prologue=reciprocal, out_dtype=jnp.float32,
                                                  interpret_on_cpu=True))(x, w)
     np.testing.assert_array_equal(np.asarray(out), np.full((3, 16), 17.0))
+
+
+@pytest.mark.parametrize("transpose_rhs", [False, True])
+def test_a_dense_product_whose_extents_no_tile_divides_holds_check_1(transpose_rhs):
+    """A dense product of 65 rows, 40 deep and 100 wide, which no tile divides, through the plain kernel's
+    padded rows, depth and width, with a norm prologue and a bias epilogue: the output and its gradients
+    hold check 1 against JAX's derivative of the plain program, the matrix stored either way."""
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        x = jnp.asarray(rng.normal(size=(65, 40)), jnp.bfloat16)
+        w = jnp.asarray(rng.normal(size=(100, 40) if transpose_rhs else (40, 100)) / 7, jnp.bfloat16)
+        ms = jnp.asarray(rng.uniform(0.5, 2, size=(65,)), jnp.float32)
+        nw = jnp.asarray(rng.normal(size=(40,)), jnp.float32)
+        b = jnp.asarray(rng.normal(size=(100,)), jnp.float32)
+        return x, w, ms, nw, b
+
+    def dew(x, w, ms, nw, b):
+        return template.gemm(x, w, None, prologue=normed,
+                             prologue_operands=((ms, ("rows",)), (nw, ("depth",))), epilogue=biased,
+                             epilogue_operands=((b, ("columns",)),), out_dtype=jnp.float32,
+                             transpose_rhs=transpose_rhs, interpret_on_cpu=True)
+
+    def plain(x, w, ms, nw, b, wide=jnp.float32):
+        w = w.T if transpose_rhs else w
+        return jnp.dot(normed(x, ms, nw).astype(wide), w.astype(wide)) + b[None, :].astype(wide)
+
+    def loss(run):
+        return jax.grad(lambda *a: jnp.sum(run(*a) * jnp.linspace(-1, 1, 100)), argnums=(0, 1, 2, 3, 4))
+
+    with generation.assumed("sm80"), generation.routes() as taken:
+        assert_as_exact(jax.jit(dew), jax.jit(plain), draw, "dense 65x40x100", seeds=SEEDS,
+                        truth_fn=functools.partial(plain, wide=jnp.float64))
+        assert_as_exact(jax.jit(loss(dew)), jax.jit(loss(plain)), draw, "dense 65x40x100 gradients",
+                        seeds=SEEDS, truth_fn=loss(functools.partial(plain, wide=jnp.float64)))
+    assert {route.kernel for route in taken if route.choice == 'grouped_matmul'} == {'triton'}
 
 
 def test_a_dense_gradient_takes_a_padded_tile_where_no_dividing_one_fits():
@@ -507,6 +546,44 @@ def test_the_hooked_mosaic_launches_lower_for_an_h100(launch):
                 lowering_platforms=("cuda",))
 
 
+@pytest.mark.parametrize("generation_name", ["sm80", "sm90"])
+@pytest.mark.parametrize("launch",
+                         [grouped_matmul.Gmm(), grouped_matmul.GmmTransposed(), grouped_matmul.Tgmm()],
+                         ids=lambda launch: type(launch).__name__)
+def test_the_hooked_dense_launches_lower_for_cuda(launch, generation_name):
+    """Each Triton launch of a dense call, with a prologue (and the forward's epilogue) and at the highest
+    precision's exact sums, lowers for CUDA on the CPU at a fitting tile of every block shape, through the
+    plain tiled kernel (its `pallas_call` named), with rows, depth and width no tile divides."""
+    rows, depth, width = 1021, 200, 300
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    f32 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.float32)
+    sizes = jax.ShapeDtypeStruct((1,), jnp.int32)
+    prologue = (normed, (f32((rows,)), f32((depth,))), (("rows",), ("depth",)))
+    if isinstance(launch, grouped_matmul.Tgmm):
+        args = (bf16((rows, depth)), bf16((rows, width)), sizes, prologue[1])
+        hooks = grouped_matmul.Hooks(prologue[0], prologue[2])
+        options = {"out_dtype": "float32", "hooks": hooks, "interpret": False}
+        name = "pallas_triton_dense_tdot"
+    else:
+        trans_rhs = isinstance(launch, grouped_matmul.GmmTransposed)
+        matrix = bf16((1, width, depth) if trans_rhs else (1, depth, width))
+        args = (bf16((rows, depth)), matrix, sizes, prologue[1], (f32((width,)),))
+        hooks = grouped_matmul.Hooks(prologue[0], prologue[2], biased, (("columns",),),
+                                     out_dtypes=("float32",))
+        options = {"out_dtype": "float32", "trans_rhs": trans_rhs, "hooks": hooks, "interpret": False}
+        name = "pallas_triton_dense_dot"
+    options |= {"dense": True, "exact_sums": True}
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), generation_name)
+    with generation.assumed(generation_name), jax.sharding.use_abstract_mesh(mesh):
+        fits = launch.fitting(launch.bind(*args, **options), generation.gpu_target())
+        covering = set({(c.block_m, c.block_n, c.block_k): c for c in reversed(fits)}.values())
+        assert covering
+        for config in sorted(covering, key=repr):
+            lowered = jax.jit(functools.partial(launch.replace(config=config), **options)).trace(*args).lower(
+                lowering_platforms=("cuda",))
+            assert name in lowered.as_text()
+
+
 def test_a_keyed_launch_buckets_its_side_operands_rows_with_its_tokens():
     """The launch a key measures covers its side operands' rows as it covers the tokens': both at the
     rows' power of two, wherever the rows are among a side operand's dimensions."""
@@ -582,10 +659,11 @@ def test_exact_sums_add_each_steps_product_as_the_plain_sum_does(generation_name
     tiles = {grouped_matmul.Tgmm: grouped_matmul.Tile(64, 128, 64, 4, 2),
              grouped_matmul.MosaicTgmm: mosaic_gpu.Tiles(64, 128, 64, 2, 1)}
     with generation.assumed(generation_name), tuning.pinned(tiles):
-        exact, default = (jax.jit(functools.partial(template.gemm_t, out_dtype=jnp.float32,
-                                                    precision=precision, interpret_on_cpu=True))(x, dy, sizes)
-                          for precision in ("highest", "default"))
-    np.testing.assert_array_equal(np.asarray(exact), np.asarray(default))
+        for group_sizes in (sizes, None):
+            exact, default = (jax.jit(functools.partial(template.gemm_t, out_dtype=jnp.float32,
+                                                        precision=precision, interpret_on_cpu=True))(
+                x, dy, group_sizes) for precision in ("highest", "default"))
+            np.testing.assert_array_equal(np.asarray(exact), np.asarray(default))
 
 
 @pytest.mark.parametrize("case", ["norm and bias", "broadcast axes"])
