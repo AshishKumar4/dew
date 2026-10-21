@@ -18,7 +18,7 @@ import jax
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "tests"))
-from reference_error import REDRAW, seeds_for
+from reference_error import REDRAW, input_digest, seeds_for
 
 
 def provenance(reference: str, revision: str, device: str, command: str, **details) -> np.ndarray:
@@ -35,8 +35,8 @@ def record_case(label: str, draw, evaluate, proxy, *, truth_proxy=None, store_in
     function that can run here, which plans the count. The recorded reference then confirms it,
     recording further seeds as `seeds_for` asks, and the recording keeps exactly the confirmed count's
     draws and their redraw, (1 + REDRAW) times it. Where `draw` is a seeded function the test can call
-    again, `store_inputs=False` records the outputs alone, and the test hands `draw` to
-    `indexed_recording` as `inputs_of`."""
+    again, `store_inputs=False` records the outputs alone and each draw's `input_digest`, and the test
+    hands `draw` to `indexed_recording` as `inputs_of`."""
     planned = seeds_for(jax.jit(proxy), lambda seed: (draw(seed),), label,
                         truth_fn=None if truth_proxy is None else jax.jit(truth_proxy))
     print(f"{label}: planned {planned} seeds on the proxy", flush=True)
@@ -65,6 +65,8 @@ def record_case(label: str, draw, evaluate, proxy, *, truth_proxy=None, store_in
             continue
         for name in records[0][index]:
             result[f"{label}.{kind}.{name}"] = np.stack([record[index][name] for record in records[:kept]])
+    if not store_inputs:
+        result[f"{label}.input_digest"] = np.asarray([input_digest(record[0]) for record in records[:kept]])
     result.update({f"{label}.seeds": np.int32(confirmed), f"{label}.redraw": np.int32(REDRAW)})
     print(f"{label}: declared {confirmed} seeds; recorded {kept} draws", flush=True)
     return result
