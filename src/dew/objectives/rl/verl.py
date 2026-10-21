@@ -49,12 +49,6 @@ does not read."""
 EXTRAS = (*MEDIA, "metrics")
 """Native fields Dew has no record for; they ride in `VerlTrajectory.extras`."""
 
-FIELDS = ("prompt_ids", "response_ids", "response_mask", "response_logprobs", "routed_experts",
-          "multi_modal_data", "reward_score", "num_turns", "metrics", "extra_fields",
-          "mm_processor_kwargs", "mm_processor_output")
-"""`AgentLoopOutput`'s twelve fields at verl 12ebe0c, in its order."""
-
-
 class _DewCall(TypedDict):
     """One call of a chain: where its sampled ids start in the row's ids and
     how many it sampled, which may be none (a call aborted before its first
@@ -84,6 +78,10 @@ class VerlRow(TypedDict):
     extra_fields: dict[str, object]
     mm_processor_kwargs: object
     mm_processor_output: object
+
+
+FIELDS = tuple(VerlRow.__annotations__)
+"""`AgentLoopOutput`'s twelve fields at verl 12ebe0c, in its order: `VerlRow`'s."""
 
 
 @dataclass(frozen=True)
