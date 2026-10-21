@@ -1014,12 +1014,9 @@ def renamed_path(renames: Renames, name: str, config: Mapping[str, object], *, l
     return dew_path(spelled, config)
 
 
-def renamed_name(renames: Renames, dew_name: str,
-                 config: Mapping[str, object]) -> str | tuple[str, ...] | None:
+def renamed_name(renames: Renames, dew_name: str, config: Mapping[str, object]) -> str | None:
     """`hf_tensor_name` respelled in the family's own names: `renamed_path` backwards."""
     name = hf_tensor_name(dew_name, config)
-    if isinstance(name, tuple):
-        return tuple(renamed(part, renames, export=True) for part in name)
     return None if name is None else renamed(name, renames, export=True)
 
 
@@ -1249,7 +1246,17 @@ def decoder_tensors(family: "DecoderFamily", model: CausalTransformer, variables
     if model.layer_scalar == 'frozen' and isinstance(constants, Mapping):
         leaves.update({('params', *path): value for path, value in flatten_dict(dict(constants)).items()
                        if path[-1] == 'layer_scalar'})
-    layouts = leaf_layouts(leaves, lambda path: family.tensor_name('.'.join(path[1:]), config))
+    def names(path: tuple[str, ...]) -> str | tuple[str, ...] | None:
+        if (len(path) == 6 and path[2:4] == ('mlp', 'experts') and path[-1] == 'kernel'
+                and model.mixture is not None):
+            named = tuple(family.tensor_name('.'.join((*path[1:4], str(expert), *path[4:])), config)
+                          for expert in range(model.mixture.experts))
+            if any(name is None for name in named):
+                raise ValueError(f'{path} has no tensor name for each expert')
+            return tuple(name for name in named if name is not None)
+        return family.tensor_name('.'.join(path[1:]), config)
+
+    layouts = leaf_layouts(leaves, names)
     # A packed tensor's geometry is the model's, read as a translated config spells it.
     geometry = {'num_heads': model.num_heads, 'num_kv_heads': model.kv_heads,
                 'head_dim': model.features_per_head, 'value_head_dim': model.value_head_dim}
@@ -1325,7 +1332,7 @@ def layout_tensors(layouts: Mapping[str, WeightLayout], variables: Mapping[str, 
 
 
 def hf_tensor_name(dew_name: str, config: Mapping[str, object], *,
-                   sandwich_norms: bool = False) -> str | tuple[str, ...] | None:
+                   sandwich_norms: bool = False) -> str | None:
     """Map one flattened dew param path to its HF tensor name, or None.
 
     None is the tied lm_head, whose embedding copy is written instead.
@@ -1342,11 +1349,9 @@ def hf_tensor_name(dew_name: str, config: Mapping[str, object], *,
     if parts[0].startswith('layers_'):
         index = parts[0].removeprefix('layers_')
         module, leaf = parts[1], parts[-1]
-        if module == 'mlp' and len(parts) == 5 and parts[2] == 'experts' and leaf == 'kernel':
-            experts = next(config[key] for key in ('num_experts', 'num_local_experts', 'n_routed_experts')
-                           if key in config)
-            return tuple(f'model.layers.{index}.mlp.experts.{expert}.{parts[3]}.weight'
-                         for expert in range(records.integer(experts, 'num_experts')))
+        if (module == 'mlp' and len(parts) == 6 and parts[2] == 'experts' and parts[3].isdigit()
+                and parts[4] in MOE_SHARED and leaf == 'kernel'):
+            return f'model.layers.{index}.mlp.experts.{parts[3]}.{parts[4]}.weight'
         if (module == 'mlp' and len(parts) == 5 and parts[2] == 'shared_experts'
                 and parts[3] in MOE_SHARED and leaf == 'kernel'):
             return f'model.layers.{index}.mlp.shared_experts.{parts[3]}.weight'
@@ -1601,7 +1606,7 @@ class DecoderFamily:
     preserve_source_layout: bool = field(kw_only=True)
     """Bind source tensor names/config for export instead of deriving them from the model."""
     weight_path: Callable[[str, Mapping[str, object]], tuple[str, ...] | None] = dew_path
-    export_path: Callable[[str, Mapping[str, object]], str | tuple[str, ...] | None] | None = None
+    export_path: Callable[[str, Mapping[str, object]], str | None] | None = None
     """The source name of a dew path; None is the shared names (`hf_tensor_name`)."""
     export_weights: Callable[["DecoderFamily", CausalTransformer, Mapping[str, object], Mapping[str, object]],
                              Mapping[str, np.ndarray]] = _dense_decoder_weights
@@ -1666,7 +1671,7 @@ class DecoderFamily:
                 Part(part, value, self.source_path(part, config)) for part, value in parts.items())))
         return tuple(readings)
 
-    def tensor_name(self, name: str, config: Mapping[str, object]) -> str | tuple[str, ...] | None:
+    def tensor_name(self, name: str, config: Mapping[str, object]) -> str | None:
         """The source name the dew path `name` exports under."""
         if self.export_path is None:
             return hf_tensor_name(name, config, sandwich_norms=self.sandwich_norms)
