@@ -90,10 +90,10 @@ def decode(written: Mapping[str, object], *, trust: Sequence[str] = ()) -> Pipel
 def override(written: Mapping[str, object], path: str, value: JSON) -> dict[str, JSON]:
     """`written` with one setting of one call of `pipe`, or of its store, set to `value`, parsed JSON
     and read against the setting's annotation. `path` is "<preset>.<setting>", the preset by its
-    name where the chain's own stages call it once, or by its entry's place among the record's
-    stages ("2.seq_len"); or "source.<setting>" for what the chain reads (`_source_with`). A call
-    inside a mix or phases is not addressed here. Reading the record back makes the call again, so
-    the stages it makes follow it."""
+    name where the chain's own stages, or the call that made its store, call it once, or by its
+    entry's place among the record's stages ("2.seq_len"); or "source.<setting>" for what the chain
+    reads (`_source_with`). A call inside a mix or phases is not addressed here. Reading the record
+    back makes the call again, so the stages it makes follow it."""
     version = written.get("version")
     if version != VERSION:
         raise ValueError(f"a chain's record of version {version!r}; this Dew overrides version {VERSION}")
@@ -105,8 +105,12 @@ def override(written: Mapping[str, object], path: str, value: JSON) -> dict[str,
         overridden = _source_with(changed, setting, value)
     else:
         stages = _entries(changed.get("stages", []), "stages")
+        source = record(changed["source"], "chain source")
         calls = [(str(index), record(stage, "stage")) for index, stage in enumerate(stages)
                  if isinstance(stage, Mapping) and "pipe" in stage]
+        if "pipe" in source:
+            # The call that made the store, as token_windows makes its windows, by its name alike.
+            calls.append(("source", source))
         named = [call for label, call in calls if target in (label, str(call["pipe"]).rpartition(":")[2])]
         if len(named) != 1:
             found = [f"{str(call['pipe']).rpartition(':')[2]}@{label}" for label, call in calls]
@@ -117,7 +121,8 @@ def override(written: Mapping[str, object], path: str, value: JSON) -> dict[str,
         if updated is None:
             raise ValueError(f"{call['pipe']} takes no setting {setting!r}; it takes "
                              f"{list(inspect.signature(_function(call['pipe'])).parameters)[1:]}")
-        overridden = {**changed, "stages": [updated if stage is call else stage for stage in stages]}
+        overridden = ({**changed, "source": updated} if call is source
+                      else {**changed, "stages": [updated if stage is call else stage for stage in stages]})
     written_back = json_value(overridden, "chain")
     if not isinstance(written_back, dict):
         raise ValueError("a chain's record is a mapping")
