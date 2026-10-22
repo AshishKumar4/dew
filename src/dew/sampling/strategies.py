@@ -221,6 +221,36 @@ def draw(state: StepState, logits: jax.Array,
     return token, behavior, selected
 
 
+@struct.dataclass
+class RowStep:
+    """One draw of every row (`row_step`): the token each drew, its behaviour and raw likelihoods
+    (zero where the row did not draw), the state committed with it, how the stopping criteria finish
+    it, and the grammar's state after it (None without one)."""
+
+    token: jax.Array
+    behavior: jax.Array
+    raw: jax.Array
+    committed: StepState
+    finished: Finish
+    automaton: jax.Array | None
+
+
+def row_step(state: StepState, logits: jax.Array, transform: Callable[[StepState, jax.Array], jax.Array],
+             stopping: Callable[[StepState, jax.Array], Finish],
+             guide: tuple[Grammar, jax.Array] | None = None) -> RowStep:
+    """Every active row of `state` draws its next token from `logits` (`draw`), under `transform`
+    guided by a grammar from each row's automaton state where `guide` gives them, and commits it: the
+    step both decoding loops take, `Sample`'s scan and the server's (`dew.inference.serving_kernel`),
+    each keeping its own model call and its own rule for which rows go on drawing."""
+    active = state.active
+    guided = transform if guide is None else guide[0].guiding(transform, guide[1])
+    token, behavior, raw = draw(state, logits, guided)
+    committed = state.commit(token, active)
+    return RowStep(token, jnp.where(active, behavior, 0.0), jnp.where(active, raw, 0.0), committed,
+                   stopping(committed, token),
+                   None if guide is None else guide[0].advanced(guide[1], token, active))
+
+
 def continuations(start: StepState, n: int,
                   run: Callable[[StepState], Draws]) -> Draws:
     """`run` over `n` continuations of every prompt, in prompt order.
@@ -270,16 +300,13 @@ def _sample_rows(state: DecoderState, start: StepState, ops: DecodeOps,
     def step(carry, _):
         state, step_state, terminated, automaton = carry
         active = step_state.active
-        chain = transform if grammar is None else grammar.guiding(transform, automaton)
-        token, behavior, raw = draw(step_state, state.logits, chain)
-        committed = step_state.commit(token, active)
-        finished = stopping(committed, token)
-        stopped = active & finished.done
-        following = ops.advance(state, token, active)
-        carry = (following, dataclasses.replace(committed, active=active & ~stopped),
-                 terminated | (active & finished.ended),
-                 None if grammar is None else grammar.advanced(automaton, token, active))
-        return carry, (token, active, jnp.where(active, behavior, 0.0), jnp.where(active, raw, 0.0))
+        drew = row_step(step_state, state.logits, transform, stopping,
+                        None if grammar is None else (grammar, automaton))
+        stopped = active & drew.finished.done
+        following = ops.advance(state, drew.token, active)
+        carry = (following, dataclasses.replace(drew.committed, active=active & ~stopped),
+                 terminated | (active & drew.finished.ended), drew.automaton)
+        return carry, (drew.token, active, drew.behavior, drew.raw)
 
     initial = (state, start, jnp.zeros(start.rows, bool),
                None if grammar is None else grammar.start(start.rows))
