@@ -32,8 +32,8 @@ def build_2d_sincos_pos_embed(emb_dim: int, H_P: int, W_P: int) -> np.ndarray:
     assert emb_dim % 4 == 0, f"emb_dim must be divisible by 4 for 2D sincos, got {emb_dim}"
     quarter = emb_dim // 4
     omega = sinusoid_frequencies(quarter, quarter)
-    rows = np.asarray(sinusoids(np.arange(H_P, dtype=np.float32)[:, None] * omega))
-    cols = np.asarray(sinusoids(np.arange(W_P, dtype=np.float32)[:, None] * omega))
+    rows = sinusoids(np.arange(H_P, dtype=np.float32)[:, None] * omega, xp=np)
+    cols = sinusoids(np.arange(W_P, dtype=np.float32)[:, None] * omega, xp=np)
     pos = np.concatenate([np.broadcast_to(rows[:, None], (H_P, W_P, 2 * quarter)),
                           np.broadcast_to(cols[None, :], (H_P, W_P, 2 * quarter))], axis=-1)
     return pos.reshape(H_P * W_P, emb_dim)

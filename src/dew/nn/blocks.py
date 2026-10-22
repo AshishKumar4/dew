@@ -193,11 +193,12 @@ def sinusoid_frequencies(count: int, divisor: float, *, dtype: DTypeLike = np.fl
     return np.exp(exponent.astype(np.float64)).astype(width)
 
 
-def sinusoids(angles, *, cosine_first: bool = False):
+def sinusoids(angles, *, cosine_first: bool = False, xp=jnp):
     """Each angle's sine and cosine side by side, `[..., n]` to `[..., 2n]`: the sines first, or the
-    cosines where `cosine_first`."""
-    first, second = (jnp.cos(angles), jnp.sin(angles)) if cosine_first else (jnp.sin(angles), jnp.cos(angles))
-    return jnp.concatenate([first, second], axis=-1)
+    cosines where `cosine_first`. `xp` is the array module it computes with: `numpy` for a host table
+    built while a model traces, which JAX would otherwise stage into the trace."""
+    first, second = (xp.cos(angles), xp.sin(angles)) if cosine_first else (xp.sin(angles), xp.cos(angles))
+    return xp.concatenate([first, second], axis=-1)
 
 
 def sinusoidal_time(time, features: int, *, dtype: DTypeLike, shift: float = 0, cosine_first: bool = True):
