@@ -275,8 +275,13 @@ def peak(spec: Forward, m: jax.Array, s: jax.Array) -> tuple[jax.Array, jax.Arra
 
 
 def weights(spec: Forward, s: jax.Array, m: jax.Array) -> jax.Array:
-    """A tile's unnormalized weights `[bq, bk]` under the running maximum `m`, fp32."""
-    return spec.power(s - expand(_safe(spec, m), s))
+    """A tile's unnormalized weights `[bq, bk]` under the running maximum `m`, fp32. A logit equal to its
+    row's maximum weighs 1 exactly: a compiler may contract the scaling of a logit into its subtraction
+    (`fma(s, c, -m)`, FlashAttention 2's by design), whose exact product less the rounded maximum is the
+    product's rounding, up to an ulp of the logit, 2^104 at fp32's largest, which an exponential takes to
+    0 or infinity; below the maximum the difference is negative either way."""
+    peak = expand(_safe(spec, m), s)
+    return spec.power(jnp.where(s < peak, s - peak, 0.0))
 
 
 def narrow(p: jax.Array, dtype) -> jax.Array:
@@ -587,8 +592,10 @@ def below(logits: jax.Array, peak: jax.Array) -> jax.Array:
     """`exp(s - m)` for a tile's logits recomputed in the backward against the forward's maximum `m`,
     fp32: `m` is every key's maximum, so a logit past it by the rounding the two passes do not share (the
     forward's maximum taken in base 2 and back, or another tile shape's product) is the maximum itself,
-    its weight 1, never past it."""
-    return jnp.exp(jnp.minimum(logits - expand(peak, logits), 0.0))
+    its weight 1, never past it, and one at it weighs 1 however a compiler contracts its scaling into the
+    subtraction (`weights`)."""
+    peak = expand(peak, logits)
+    return jnp.exp(jnp.where(logits < peak, logits - peak, 0.0))
 
 
 def normalized(logits: jax.Array, peak: jax.Array, total: jax.Array) -> tuple[jax.Array, jax.Array]:
