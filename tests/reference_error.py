@@ -918,8 +918,7 @@ RETIRING_FACTOR = 2.0
 sites until they convert: no other rule reads it."""
 
 RETIRING_SITES = frozenset({"tests/test_architectures.py", "tests/test_flux2_source.py",
-                            "tests/test_z_image_source.py", "tests/test_linear_attention.py",
-                            "tests/test_mixers.py", "tests/test_ssd_kernel.py"})
+                            "tests/test_z_image_source.py", "tests/test_ssd_kernel.py"})
 """The sites that keep the retiring one-draw helper until they convert (Main's ruling): every other
 caller is refused (tools/lint_slop.py, SLOP020). tests/test_ssd_kernel.py's is the TPU kernel run
 interpreted on the CPU host, where check 1 measures the host's XLA lowering, not the kernel, and
