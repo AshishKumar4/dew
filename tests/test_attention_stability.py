@@ -71,11 +71,32 @@ RESUMED = 128
 """The resumed family's rows, more, as each holds one query over two keys."""
 SEEDS = {"ties at scale 1": 64, "ties at scale 1, cotangents near 2**125": 64, "ties at scale 1/2": 64,
          "ties at scale 1/2, cotangents near 2**125": 64, "ties at scale 1/4": 64,
-         "ties at scale 1/4, cotangents near 2**125": 64, "a sink and one key": 64, "logits near 1e4": 32,
-         "a small weight on a large value, float32": 32, "a small weight on a large value, bfloat16": 64,
-         "a resumed state of a large denominator": 64, "a decode step's sink and one key": 64}
-"""Each family's declared seeds past `reference_error.FEWEST_SEEDS`, the fewest over which the reference
-compared with itself resolves check 1's parity (`reference_error.seeds_for`)."""
+         "ties at scale 1/4, cotangents near 2**125": 64, "a logit near fp32's largest": 8,
+         "a logit near fp32's largest at scale 1/4": 8, "values near fp32's largest over 2 equal keys": 8,
+         "values near fp32's largest over 64 equal keys": 8, "one key": 8, "a sink and one key": 64,
+         "a sink near fp32's largest and one key": 8, "a sink and one key, its logit near fp32's largest": 8,
+         "a sink near fp32's largest at scale 1/4": 8, "logits near 1e4": 32, "logits near 1e30": 8,
+         "a small weight on a large value, float32": 128, "a small weight on a large value, bfloat16": 256,
+         "a weight at the exponent's edge on a large value, float32": 256,
+         "a weight at the exponent's edge on a large value, bfloat16": 512,
+         "a small column beside an overflowing one": 64,
+         "a column near fp32's least normal beside an overflowing one": 64,
+         "a cotangent on a small column beside an overflowing one": 64,
+         "a tiny value beside an overflowing column at equal weights": 8,
+         "an anchor-relative share beside an overflowing column": 8,
+         "a column near fp32's least normal under a large cotangent": 8,
+         "a subnormal share of an overflowing row, float32": 32,
+         "a subnormal share of an overflowing row, bfloat16": 32,
+         "a subnormal mass beside its anchor at equal values": 8,
+         "a subnormal share beside 255 equal weights, bfloat16": 32, "a row of no keys": 8,
+         "causal queries before every key": 8, "a row that overflows beside one that does not": 8,
+         "two finite slices whose merge overflows": 8, "a resumed state of a large denominator": 64,
+         "a resumed state beside an overflowing column": 16,
+         "a resumed state of a denominator near fp32's largest beside an overflowing column": 8,
+         "a decode step's sink and one key": 64, "a decode step's sink near fp32's largest and one key": 8,
+         "documents of one key": 8}
+"""Each family's declared seeds, the fewest over which the reference compared with itself resolves check
+1's parity (`reference_error.seeds_for`), sized for every family at the suite's own draws and reference."""
 
 
 def _first(sizes: np.ndarray, width: int) -> np.ndarray:
@@ -474,7 +495,7 @@ def _families() -> dict[str, Family]:
     families["documents of one key"] = Family(_drawn(4, 4), _causal(4, 4, ROWS) & (ids[:, None, :, None] ==
                                                                                   ids[:, None, None, :]),
                                               {"causal": True, "segment_ids": ids})
-    return {name: dataclasses.replace(family, seeds=SEEDS.get(name, family.seeds))
+    return {name: dataclasses.replace(family, seeds=SEEDS[name])
             for name, family in families.items()}
 
 
