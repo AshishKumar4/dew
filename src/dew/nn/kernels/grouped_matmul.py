@@ -1,4 +1,5 @@
-"""The MoE grouped matmul: its kernels' launches and the custom VJP that trains through them.
+"""The grouped matmul's kernel launches, which the GEMM template (`templates.gemm.template`) runs and
+differentiates (`dew.nn.moe.expert_projection` through it), and XLA's portable projection.
 
 Three products, in MaxText's megablox shape: the forward `gmm`, the input gradient `gmm` against the
 transposed kernel, and the kernel gradient `tgmm`. Each is a template launch (`templates.base`) with
@@ -348,9 +349,7 @@ class _Triton(_GroupedLaunch[Tile]):
         # Every CUDA GPU the template sends the kernels to (`templates.gemm.template`), and
         # a CPU, which interprets them, or traces the CUDA branch a GPU's lowering takes; never a TPU.
         cuda = generation.capability(generation.effective(target).generation) is not None
-        # A dense call's plain kernel takes one matrix, not a bank's layer.
-        banked = bool(ba.arguments.get('layers')) and ba.arguments.get('dense')
-        return cuda and not banked and _rated(target, ba.arguments['tokens'].dtype)
+        return cuda and _rated(target, ba.arguments['tokens'].dtype)
 
     @staticmethod
     @abc.abstractmethod
@@ -514,8 +513,9 @@ class Gmm(_Triton):
              dense: bool = False, config: Tile, return_residuals: bool = False):
         # Imported at first use: the kernels need jax's Pallas Triton backend,
         # which jax 0.11.2 deprecates, and importing a model must not load it.
-        if dense:
-            # One group of every row: the plain tiled kernel, which finds no group and masks no row.
+        if dense and not layers:
+            # One group of every row: the plain tiled kernel, which finds no group and masks no row (a
+            # bank's layer runs the grouped kernel, which reads it in place).
             from .templates.gemm import triton_dense
             options = hooks.kernel_options()
             outs = triton_dense.gmm(tokens, kernel[0], tile=config, transpose_rhs=trans_rhs,
@@ -737,7 +737,9 @@ class MosaicGmm(_Mosaic):
         bands = math.ceil(columns / config.grid_block_n)
         in_flight = self._in_flight(config, target)
         per_group = tiles / max(min(groups, rows), 1)
-        matrices = _routed(rows, groups) * kernel.size * size * math.ceil(per_group / in_flight)
+        # A bank's layer alone is read (`launched_gmm`'s `layers`).
+        layer = math.prod(kernel.shape[-3:])
+        matrices = _routed(rows, groups) * layer * size * math.ceil(per_group / in_flight)
         hooks = ba.arguments['hooks']
         rereads = {'rows': tiles, 'columns': bands}
         moved = (bands * rows * depth * size + matrices + rows * width * _output_bytes(ba)

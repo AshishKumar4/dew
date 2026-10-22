@@ -65,6 +65,8 @@ def gemm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None = None, *
     prologue then."""
     if compute is not None and jnp.dtype(compute) != lhs.dtype and prologue is not None:
         raise ValueError(f"a prologue's {lhs.dtype} operand is multiplied in its own dtype, not {compute}")
+    # Named, the products' rounding passes tangents through unrounded (`_rounded_product`).
+    straight = compute is not None and prologue is None
     compute = jnp.dtype(lhs.dtype if compute is None else compute)
     dense = group_sizes is None
     layers = ()
@@ -86,9 +88,9 @@ def gemm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None = None, *
                      **plain)
 
     def portable(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays, layers):
-        return _portable_gemm(lhs.astype(compute), _layer_of(rhs, layers), group_sizes, prologue,
-                              prologue_arrays, epilogue, epilogue_arrays, dtypes, several, transpose_rhs,
-                              precision)
+        return _portable_gemm(lhs if straight else lhs.astype(compute), _layer_of(rhs, layers), group_sizes,
+                              prologue, prologue_arrays, epilogue, epilogue_arrays, dtypes, several,
+                              transpose_rhs, precision, compute if straight else None)
 
     def forward(*operands):
         return value(*operands), ()
@@ -117,13 +119,16 @@ def gemm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None = None, *
         # passed through), wide otherwise, each product rounding once.
         work = compute if narrow else jnp.promote_types(d_acc.dtype, jnp.float32)
         d_product = d_acc.astype(work)
-        # A bank is of the products' dtype (`gemm`), its layer read in place again.
-        matrix = bank.astype(compute)
+        # A bank is of the products' dtype (`gemm`), its layer read in place again, where the cotangent
+        # multiplies in that dtype; a wider one's launch widens the layer alone, not the bank.
+        matrix, matrix_layers = bank.astype(compute), layers
+        if layers and jnp.dtype(work) != compute:
+            matrix, matrix_layers = _layer_of(matrix, layers), ()
         # The cotangent of the operand the forward multiplied, `prologue(lhs)` rounded to `lhs`'s dtype.
         d_operand = jnp.asarray(_gemm(d_product, matrix, group_sizes, None, (), (), None, (), (),
                                       (jnp.dtype(lhs.dtype),), several=False, transpose_rhs=not transpose_rhs,
                                       interpret_on_cpu=interpret_on_cpu, precision=precision, dense=dense,
-                                      layers=layers))
+                                      layers=matrix_layers))
         if narrow:
             d_rhs = gemm_t(lhs.astype(compute), d_product, None if dense else group_sizes, prologue=prologue,
                            prologue_operands=tuple(zip(prologue_arrays, prologue_axes, strict=True)),
@@ -214,15 +219,44 @@ def _gemm(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, epilo
 
 
 def _portable_gemm(lhs, rhs, group_sizes, prologue, prologue_arrays, epilogue, epilogue_arrays, dtypes,
-                   several: bool, transpose_rhs: bool, precision: PrecisionLike):
-    """`gemm`'s arithmetic in XLA: the kernels' products of `lhs`'s dtype summed in fp32, one rounding."""
-    product = lhs if prologue is None else prologue(lhs, *prologue_arrays).astype(lhs.dtype)
-    matrix = (jnp.swapaxes(rhs, 1, 2) if transpose_rhs else rhs).astype(lhs.dtype)
-    summed = grouped_matmul.xla_ragged_dot(product, matrix, group_sizes, precision=precision,
-                                           preferred_element_type=jnp.float32)
+                   several: bool, transpose_rhs: bool, precision: PrecisionLike, compute=None):
+    """`gemm`'s arithmetic in XLA: the kernels' products of `lhs`'s dtype (`compute`'s where given, its
+    rounding straight through for tangents, `_rounded_product`) summed in fp32, one rounding."""
+    matrix = jnp.swapaxes(rhs, 1, 2) if transpose_rhs else rhs
+    if compute is not None:
+        summed = _rounded_product(lhs, matrix, group_sizes, compute, precision)
+    else:
+        product = lhs if prologue is None else prologue(lhs, *prologue_arrays).astype(lhs.dtype)
+        summed = grouped_matmul.xla_ragged_dot(product, matrix.astype(lhs.dtype), group_sizes,
+                                               precision=precision, preferred_element_type=jnp.float32)
     outs = _as_tuple(summed if epilogue is None else epilogue(summed, *epilogue_arrays))
     outs = tuple(out.astype(dtype) for out, dtype in zip(outs, dtypes, strict=True))
     return outs if several else outs[0]
+
+
+@functools.partial(jax.custom_jvp, nondiff_argnums=(3, 4))
+def _rounded_product(lhs, matrix, group_sizes, compute, precision):
+    """Each group's rows of `lhs` times its matrix of `matrix`, both rounded to `compute`, summed in fp32.
+    Its tangent is `dlhs @ Q(matrix) + Q(lhs) @ dmatrix`, `Q` the rounding and the tangents unrounded,
+    summed over the widest of fp32 and the operands' dtypes and rounded once to fp32 (the MoE projection's
+    law, `grouped_matmul.portable_projection`'s), where a cast's own tangent would round them first."""
+    return grouped_matmul.xla_ragged_dot(lhs.astype(compute), matrix.astype(compute), group_sizes,
+                                         precision=precision, preferred_element_type=jnp.float32)
+
+
+@_rounded_product.defjvp
+def _rounded_product_jvp(compute, precision, primals, tangents):
+    lhs, matrix, group_sizes = primals
+    d_lhs, d_matrix, _ = tangents
+    work = jnp.result_type(jnp.float32, lhs.dtype, matrix.dtype)
+    rounded_lhs, rounded_matrix = (lhs.astype(compute).astype(work), matrix.astype(compute).astype(work))
+
+    def product(a, b):
+        return grouped_matmul.xla_ragged_dot(a, b, group_sizes, precision=precision,
+                                             preferred_element_type=work)
+
+    tangent = product(d_lhs.astype(work), rounded_matrix) + product(rounded_lhs, d_matrix.astype(work))
+    return _rounded_product(lhs, matrix, group_sizes, compute, precision), tangent.astype(jnp.float32)
 
 
 def _prologue_cotangents(prologue, lhs, arrays, axes_of, group_sizes, d_operand, vjp=None):

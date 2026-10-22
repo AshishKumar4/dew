@@ -36,7 +36,7 @@ from dew.nn.dense import Dense
 from .activations import GatedActivation, gated_product, relu2, swiglu_clamped
 from .blocks import normal_kernel
 from .flops import MissingFlopsCount, counted_flops, projection_flops
-from .kernels.generation import ran_kernel, route
+from .kernels.generation import backend, ran_kernel, route, triton_runs
 from .kernels.grouped_matmul import portable_projection, ragged_dot_refusal
 from .kernels.selection import forced
 from .kernels.templates.gemm import template
@@ -461,7 +461,9 @@ def expert_projection(x: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
     compute = canonicalize_dtype(x, kernel, dtype=dtype)
     resolved = float32_products(compute, precision)
     named = forced('grouped_matmul')
-    refusal = ragged_dot_refusal(compute, (x.dtype, kernel.dtype), resolved)
+    placed = triton_runs() or (implementation == 'pallas' and backend() == 'cpu')
+    refusal = ragged_dot_refusal(compute, (x.dtype, kernel.dtype), resolved) or (
+        None if placed else "the Pallas kernels need a GPU of sm80 or later")
     if named == 'xla' or (named is None and implementation == 'xla'):
         route('grouped_matmul', kernel='xla')
     elif refusal is not None and named is not None:
