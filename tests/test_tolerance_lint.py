@@ -274,28 +274,21 @@ def test_the_gate_compares_floats_and_scripts_outside_tests_and_tools_are_not_re
     assert list(lint.tolerances(_module(lint, tmp_path, "tools/report.py", body)))
 
 
-def test_the_inventory_holds_a_file_at_its_count_until_its_date_and_only_shrinks(lint, tmp_path):
-    """A file the inventory holds at its count and before its dates passes; one that grew reports
-    every comparison; one that shrank reports once, until the count comes down; past its own date or
-    the inventory's, every comparison is reported, whatever its count. Each reading sees the
-    inventory as it is then, in one process."""
+def test_the_inventory_holds_a_file_at_its_count_and_only_shrinks(lint, tmp_path):
+    """A file the inventory holds at its count passes; one that grew reports every comparison; one that
+    shrank reports once, until the count comes down, and one with none left is told to remove its
+    entry. Each reading sees the inventory as it is then, in one process."""
     body = "import numpy as np, pytest\nnp.testing.assert_allclose(a, b)\nassert a == pytest.approx(b)\n"
 
-    def findings(count, by="2999-01-01", empty_by="2999-01-01"):
-        entry = {"tests/test_case.py": {"comparisons": count, "lane": "Kernels", "by": by}}
-        inventory = {"empty_by": empty_by, "files": entry}
+    def findings(count, body=body):
+        inventory = {"files": {"tests/test_case.py": {"comparisons": count, "lane": "Kernels"}}}
         return list(lint.tolerances(_module(lint, tmp_path, "tests/test_case.py", body, inventory)))
 
     assert findings(2) == []
     assert len(findings(1)) == 2
     [lower] = findings(3)
     assert lower.line == 1
-    assert len(findings(2, by="2000-01-01")) == 2
-    assert len(findings(3, by="2000-01-01")) == 2
-    assert len(findings(2, empty_by="2000-01-01")) == 2
-    empty = {"empty_by": "2999-01-01", "files": {"tests/test_case.py": {"comparisons": 2, "lane": "Kernels",
-                                                                           "by": "2000-01-01"}}}
-    [remove] = list(lint.tolerances(_module(lint, tmp_path, "tests/test_case.py", "x = 1\n", empty)))
+    [remove] = findings(2, "x = 1\n")
     assert "remove its entry" in remove.message
 
 
@@ -310,10 +303,8 @@ def _commit(repo, inventory, message, files=None):
                    check=True)
 
 
-def _inventory(counts: dict, by="2026-11-20", empty_by="2026-11-27"):
-    return {"empty_by": empty_by,
-            "files": {name: {"comparisons": count, "lane": "Kernels", "by": by}
-                      for name, count in counts.items()}}
+def _inventory(counts: dict):
+    return {"files": {name: {"comparisons": count, "lane": "Kernels"} for name, count in counts.items()}}
 
 
 def test_no_commit_loosens_the_inventory_its_parents_kept(lint, tmp_path):
@@ -358,7 +349,7 @@ def test_no_commit_loosens_the_inventory_its_parents_kept(lint, tmp_path):
 def test_a_change_of_the_rules_reading_grows_the_inventory_only_for_files_it_leaves_unchanged(lint, tmp_path):
     """A commit that changes SLOP020's reading (`RULE`) may add or raise an entry for a file it leaves
     unchanged, against its parent and its base alike; a file it also changes, or one it adds, may not
-    grow, and no date moves later."""
+    grow."""
     repo = tmp_path / "repo"
     repo.mkdir()
     subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
@@ -379,9 +370,6 @@ def test_a_change_of_the_rules_reading_grows_the_inventory_only_for_files_it_lea
     assert any("raises tests/test_a.py" in message for message in messages)
     assert any("adds tests/test_c.py" in message for message in messages)
     assert not any("tests/test_b.py" in message for message in messages)
-    _commit(repo, _inventory({"tests/test_a.py": 3, "tests/test_b.py": 1, "tests/test_c.py": 1},
-                             by="2026-11-21"), "a later date", {lint.RULE: "reading = 4\n"})
-    assert any("date later" in finding.message for finding in lint.ratchet(repo, "main"))
 
 
 def test_a_merge_bringing_a_count_its_other_parent_raised_by_rereading_is_no_loosening(lint, tmp_path):
@@ -414,23 +402,6 @@ def _merged(repo, branch, into, inventory, message, files=None):
     _commit(repo, inventory, message, files)
 
 
-def test_a_merge_moves_no_date_past_its_parents_holding_the_entry_whatever_another_grants(lint, tmp_path):
-    """One parent inventories a file by rereading the rule, the other holds no entry for it; the merge
-    keeping that entry with a later date moves a date the first parent held, which the second's grant
-    to add the entry does not excuse."""
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
-    _commit(repo, _inventory({}), "made", {"tests/test_a.py": "a = 1\n", lint.RULE: "r = 1\n"})
-    subprocess.run(["git", "checkout", "-q", "-b", "lane"], cwd=repo, check=True)
-    _commit(repo, _inventory({}), "the lane works", {"tests/other.py": "o = 1\n"})
-    subprocess.run(["git", "checkout", "-q", "main"], cwd=repo, check=True)
-    _commit(repo, _inventory({"tests/test_a.py": 1}), "the rule reads more", {lint.RULE: "r = 2\n"})
-    _merged(repo, "main", "lane", _inventory({"tests/test_a.py": 1}, by="2026-11-21"),
-            "the merge postpones")
-    assert any("test_a.py's date later" in finding.message for finding in lint.ratchet(repo))
-
-
 def test_a_merge_keeps_an_entry_its_parents_renamed_apart_only_once(lint, tmp_path):
     """Two parents rename one inventoried file to two names; a merge keeping both holds its allowance
     twice, though each name keeps its own parent's count."""
@@ -445,46 +416,22 @@ def test_a_merge_keeps_an_entry_its_parents_renamed_apart_only_once(lint, tmp_pa
     subprocess.run(["git", "checkout", "-q", "main"], cwd=repo, check=True)
     subprocess.run(["git", "mv", "tests/test_a.py", "tests/test_c.py"], cwd=repo, check=True)
     _commit(repo, _inventory({"tests/test_c.py": 1}), "main renames it")
-    # Each side edits its copy past git's notice of the rename, its date tightened, before the merge.
+    # Each side edits its copy past git's notice of the rename before the merge.
     for branch, name in (("lane", "test_b.py"), ("main", "test_c.py")):
         subprocess.run(["git", "checkout", "-q", branch], cwd=repo, check=True)
-        _commit(repo, _inventory({f"tests/{name}": 1}, by="2026-11-19"), "edited",
+        _commit(repo, _inventory({f"tests/{name}": 1}), "edited",
                 {f"tests/{name}": f"a = 1  # one comparison\n{branch * 40}\n" * 8})
-    _merged(repo, "main", "lane", _inventory({"tests/test_b.py": 1, "tests/test_c.py": 1}, by="2026-11-19"),
+    _merged(repo, "main", "lane", _inventory({"tests/test_b.py": 1, "tests/test_c.py": 1}),
             "the merge keeps both")
     assert any("renamed it apart" in finding.message for finding in lint.ratchet(repo))
     # Kept under a third name the merge itself gives, the copy is the same entry still.
     subprocess.run(["git", "reset", "-q", "--hard", "HEAD~1"], cwd=repo, check=True)
-    _merged(repo, "main", "lane", _inventory({"tests/test_d.py": 1, "tests/test_c.py": 1}, by="2026-11-19"),
+    _merged(repo, "main", "lane", _inventory({"tests/test_d.py": 1, "tests/test_c.py": 1}),
             "the merge renames one copy")
     subprocess.run(["git", "mv", "-f", "tests/test_b.py", "tests/test_d.py"], cwd=repo, check=True)
     amend = ["git", "-c", "user.name=t", "-c", "user.email=t@t", "commit", "-q", "--amend", "--no-edit"]
     subprocess.run(amend, cwd=repo, check=True)
     assert any("renamed it apart" in finding.message for finding in lint.ratchet(repo))
-
-
-def test_a_merge_keeps_an_entry_whole_as_some_parent_holding_it_does(lint, tmp_path):
-    """One parent raised a file's count by rereading the rule and tightened its date, the other kept
-    the lower count and the later date; a merge taking the higher count and the later date undoes the
-    tightening and is refused, one taking the higher count and the earlier date is not."""
-    repo = tmp_path / "repo"
-    repo.mkdir()
-    subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
-    _commit(repo, _inventory({"tests/test_a.py": 7}, by="2026-11-21"), "made",
-            {"tests/test_a.py": "a = 1\n", lint.RULE: "r = 1\n"})
-    subprocess.run(["git", "checkout", "-q", "-b", "lane"], cwd=repo, check=True)
-    _commit(repo, _inventory({"tests/test_a.py": 7}, by="2026-11-21"), "the lane works",
-            {"tests/o.py": "o\n"})
-    subprocess.run(["git", "checkout", "-q", "main"], cwd=repo, check=True)
-    _commit(repo, _inventory({"tests/test_a.py": 8}, by="2026-11-20"), "the rule reads more, sooner",
-            {lint.RULE: "r = 2\n"})
-    _merged(repo, "main", "lane", _inventory({"tests/test_a.py": 8}, by="2026-11-21"),
-            "the merge takes both")
-    assert any("test_a.py" in finding.message for finding in lint.ratchet(repo))
-    subprocess.run(["git", "reset", "-q", "--hard", "HEAD~1"], cwd=repo, check=True)
-    _merged(repo, "main", "lane", _inventory({"tests/test_a.py": 8}, by="2026-11-20"),
-            "the merge takes main's")
-    assert list(lint.ratchet(repo)) == []
 
 
 def test_only_the_heads_own_rereadings_authorize_a_count_against_its_base(lint, tmp_path):
@@ -516,7 +463,7 @@ def test_the_ratchet_holds_a_branch_to_its_base_and_refuses_a_shallow_history(li
     _commit(repo, _inventory({"tests/test_a.py": 4}), "made", {"tests/test_a.py": "a = 1\n"})
     _commit(repo, _inventory({"tests/test_a.py": 3}), "lowered")
     subprocess.run(["git", "checkout", "-q", "-b", "head", "HEAD~1"], cwd=repo, check=True)
-    _commit(repo, _inventory({"tests/test_a.py": 4}, by="2026-11-21"), "a later date")
+    _commit(repo, _inventory({"tests/test_a.py": 5}), "a raised count")
     assert any("against main's" in finding.message for finding in lint.ratchet(repo, "main"))
     # Two readings in one process, a commit between them, see each HEAD as it is.
     subprocess.run(["git", "checkout", "-q", "main"], cwd=repo, check=True)
