@@ -196,7 +196,7 @@ def test_every_tile_of_the_grouped_kernels_holds_the_float64_gate(kernel, width,
     assert len(configs) > 1
     if kernel.name == 'mosaic_gpu':
         # The kernel gradient's schedule is one multiprocessor's (`MosaicTgmm.space`).
-        paired = set() if isinstance(kernel, grouped_matmul.MosaicTgmm) else {(2, 2)}
+        paired = set() if kernel is grouped_matmul.MosaicTgmm else {(2, 2)}
         assert {(c.warpgroups, c.cluster) for c in configs} == {(1, 1), (2, 1)} | paired
     for config in configs:
         gate.check(config)
