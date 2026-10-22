@@ -1581,8 +1581,8 @@ def _epoch_records(train: Pipeline, build: _Build) -> int | None:
     by a repeat that never ends, a training order's own (`_Build.batched`), or a
     mix of parts that never end, reads each part on from where it was, so it
     counts until every part has come round once (`Proportions.covering`), the
-    parts it mixes counted alike, unless a slice or a limit before its repeat
-    reads a view of the mix, whose pass it counts. An order that ends counts no
+    parts it mixes counted alike; a part a slice or a limit bounds comes round
+    once its bounded records are read (`covered`). An order that ends counts no
     more than it reads, whatever bounds it after its repeat. A repeat written before a cache counts the
     inputs a pass reads where the cache keeps one record for each, and none
     otherwise, ahead of reading them; phases are counted by none."""
@@ -1605,11 +1605,22 @@ def _epoch_records(train: Pipeline, build: _Build) -> int | None:
                                     DataPartition())) as rows:
             return len(rows) if isinstance(rows, pygrain.MapDataset) else None
 
+    def held(pipeline: Pipeline, build: _Build) -> int | None:
+        """The records `pipeline` holds through all its stages, as the lowering builds them."""
+        with _closing(build.records(pipeline, DataPartition())) as rows:
+            return len(rows) if isinstance(rows, pygrain.MapDataset) else None
+
     def covered(pipeline: Pipeline, build: _Build) -> int | None:
-        """The records of `pipeline` read on past its end in which every part comes round once."""
+        """The records of `pipeline` read on past its end in which every part comes round once. A
+        view a slice or a limit bounds comes round once its bounded records are read: those the
+        first repeat after its last bound reads, or the bounded order itself where none follows."""
+        stages = pipeline.stages
+        bounds = [at for at, stage in enumerate(stages) if _bounds(stage)]
+        if bounds:
+            after = [at for at, stage in enumerate(stages) if at > bounds[-1] and isinstance(stage, Repeat)]
+            return held(dataclasses.replace(pipeline, stages=stages[: after[0]] if after else stages), build)
         source = pipeline.source
-        once = pipeline.stages[:_until(pipeline.stages, (Repeat,))]
-        if not isinstance(source, Mixture) or any(isinstance(stage, (Slice, Limit)) for stage in once):
+        if not isinstance(source, Mixture):
             return passed(pipeline, build)
         sizes = [covered(child, build.child(index)) for index, child in enumerate(source.pipelines)]
         known = [size for size in sizes if size is not None]
@@ -1633,6 +1644,11 @@ def _epoch_records(train: Pipeline, build: _Build) -> int | None:
         return min(count, len(rows)) if isinstance(rows, pygrain.MapDataset) else count
 
 
+def _bounds(stage: Stage) -> bool:
+    """Whether `stage` ends the order it reads: a limit, or a slice with an end."""
+    return isinstance(stage, Limit) or (isinstance(stage, Slice) and stage.selection.stop is not None)
+
+
 def _unending(pipeline: Pipeline) -> bool:
     """Whether `pipeline`'s order never ends, its stages read in turn: a repeat without a count makes
     it endless and a limit or a slice with an end ends it again, from a mixture whose parts' orders
@@ -1642,7 +1658,7 @@ def _unending(pipeline: Pipeline) -> bool:
     for stage in pipeline.stages:
         if isinstance(stage, Repeat) and stage.epochs is None:
             endless = True
-        elif isinstance(stage, Limit) or (isinstance(stage, Slice) and stage.selection.stop is not None):
+        elif _bounds(stage):
             endless = False
     return endless
 
