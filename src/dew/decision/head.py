@@ -421,11 +421,18 @@ class JointSchemaHead(Head):
         options = self.option_norm(routed)
         repeated = _per_slot(fields, owners, inputs)
         cosine = jnp.sum(l2_normalized(repeated, 1e-8) * l2_normalized(options, 1e-8), axis=-1)
-        features = jnp.concatenate([repeated, options, repeated * options, jnp.abs(repeated - options)], -1)
+        features = scorer_features(repeated, options)
         residual = self.scorer_out(gelu_exact_torch(self.scorer_hidden(features)))[..., 0]
         joint = jnp.exp(jnp.minimum(self.joint_logit_scale, math.log(100.0))) * cosine + residual
         scores = prior + jax.nn.sigmoid(self.residual_gate) * joint
         return _laid_back(scores.astype(at_least_fp32(scores.dtype)), inputs)
+
+
+def scorer_features(repeated, options):
+    """The pairwise features a slot's scorer reads of its question's field and its option: both, their
+    product and their absolute difference, Laya's. At a tie the difference's slope is `abs`'s at zero,
+    0, so a slot whose option equals its field moves neither through it."""
+    return jnp.concatenate([repeated, options, repeated * options, jnp.abs(repeated - options)], -1)
 
 
 def decision_geometry(lengths, questions, options):

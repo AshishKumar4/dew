@@ -186,8 +186,10 @@ SCORER_MARGIN = 1e-4
 a hundred times the fp32 rounding of `repeated - options` (seed 225 of the unmargined draw rounded a
 7.8e-7 difference to 0, which flips `abs`'s slope and moved every gradient by its upstream value), so
 float32 and float64 take one slope. What it excludes, the slope at a difference that rounds to zero,
-is `abs`'s own convention and no compaction's; the scorer's features themselves are held to Laya's
-(tests/test_decision_laya.py::test_laya_logits_match_laya_under_the_float64_rule)."""
+is `abs`'s own convention and no compaction's, held exactly by
+tests/test_decision_joint_checkpoint.py::test_a_scorer_tie_moves_neither_side_through_the_difference;
+the joint head's scores themselves are held to its release's by
+test_the_stored_joint_head_matches_its_release_under_the_float64_rule."""
 
 
 def scorer_gap(objective: DecisionObjective, variables, grid) -> float:

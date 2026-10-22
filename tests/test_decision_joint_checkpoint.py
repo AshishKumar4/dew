@@ -10,6 +10,7 @@ from dataclasses import replace
 from pathlib import Path
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
@@ -153,6 +154,32 @@ def test_the_stored_joint_head_matches_its_release_under_the_float64_rule(tokeni
     run (measured: 1.42 times)."""
     found, reference, truth, terms = head_logits(tokenizer)
     assert_as_exact_as_the_reference(found, reference, truth, "stored joint head logits", terms=terms)
+
+
+def test_a_scorer_tie_moves_neither_side_through_the_difference():
+    """Where a slot's option equals its field bit for bit, the scorer's absolute difference takes
+    `abs`'s slope at zero, 0: neither side moves through it, exactly, and each still moves through
+    the features that read it directly (both, and their product). The compacted-options site draws
+    away from such ties (test_decision_option_slots's SCORER_MARGIN); this holds them."""
+    from dew.decision.head import scorer_features
+
+    field = np.random.default_rng(0).standard_normal((2, 5, 8)).astype(np.float32)
+    option = field.copy()
+    option[0, 1] += 0.5  # one slot apart from its field, the rest tied
+
+    def through(name):
+        width = field.shape[-1]
+
+        def difference(repeated, options):
+            return jnp.sum(scorer_features(repeated, options)[..., 3 * width:])
+        return jax.grad(difference, argnums=0 if name == "field" else 1)(field, option)
+
+    tied = np.ones(field.shape[:-1], bool)
+    tied[0, 1] = False
+    for name in ("field", "option"):
+        moved = np.asarray(through(name))
+        np.testing.assert_array_equal(moved[tied], 0)
+        assert np.all(moved[0, 1] != 0)
 
 
 def test_a_padded_batch_scores_every_row_as_it_scores_alone(tokenizer):
