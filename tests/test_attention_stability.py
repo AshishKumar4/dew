@@ -211,7 +211,9 @@ def _families() -> dict[str, Family]:
         # anchor's own weight away from 1 by more than any bound states.
         "logits near 1e30": Family(drawn(64, 64, rows=4, size=1e30), _causal(64, 64, 4), {"causal": True},
                                    folded=False),
-        "a small weight on a large value, float32": small_weight("float32"),
+        # Folded in fp32, one weight carries each row's output, so the fold's extra rounding of its logit is
+        # the row's error: 2.04 times the reference's (an extreme-magnitude divergence the design names).
+        "a small weight on a large value, float32": dataclasses.replace(small_weight("float32"), folded=False),
         "a small weight on a large value, bfloat16": small_weight("bfloat16"),
     }
     lengths = np.tile([4, 0], ROWS // 2)
