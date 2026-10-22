@@ -371,7 +371,8 @@ class TritonForward(Template[Tiles]):
         # A call's own key count, none included; an op built without one counts its launch's keys.
         spec = algebra.Forward(self.form, keys if self.keys is None else self.keys, ids, self.scale,
                                self.score_mod, self.natural,
-                               algebra.headroom(value.dtype, keys, initial))
+                               algebra.headroom(value.dtype, keys, initial),
+                               wide=jnp.dtype(query.dtype).itemsize >= 4)
         kernel = functools.partial(
             _forward_kernel, spec=spec, score_kinds=self.score_kinds, output_kinds=self.output_kinds,
             initial=initial, residuals=residuals, output_mod=self.output_mod, block_k=block_k,

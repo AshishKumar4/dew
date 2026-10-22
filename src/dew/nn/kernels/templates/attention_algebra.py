@@ -38,8 +38,9 @@ class Forward:
     """What the forward's functions specialize on, all static: the spans' `form` ('full', 'causal' or
     'spans', `KeySpans.form`), the call's key count `keys`, whether it packs documents (`ids`), the
     softmax `scale`, the score hook `score_mod(s, q_pos, k_pos, *params)` on natural logits, whether
-    the call keeps its logits `natural` (`base2`), and whether its weighted values can pass fp32's
-    largest, so a program's walk is `guarded` (`headroom`)."""
+    the call keeps its logits `natural` (`base2`), whether its weighted values can pass fp32's largest,
+    so a program's walk is `guarded` (`headroom`), and whether its operands are `wide`, fp32 or wider
+    (`base2`)."""
 
     form: str
     keys: int
@@ -48,6 +49,7 @@ class Forward:
     score_mod: Callable | None = None
     natural: bool = NATURAL
     headroom: bool = True
+    wide: bool = False
 
     @property
     def base2(self) -> bool:
@@ -60,9 +62,14 @@ class Forward:
         times its size, so logits the reference keeps apart can tie: keys of 2 * 1610613120 and 2 * 1610612992
         under a query of 1 at scale 0.5 weigh 1 and 0 in the reference and 0.5 each folded, and a
         cotangent of 2**125 then overflows its backward (docs/design/kernel-templates.md, §3, the
-        exponent's forms). On drawn inputs both forms pass check 1."""
+        exponent's forms). On drawn inputs both forms pass check 1. fp32 (`wide`) operands keep their
+        logits natural: where one weight carries a row's output (one of e^-12 to e^-26 on a value near
+        2^126), the fold's extra rounding of its logit is the row's error, 2.04 times the reference's,
+        which their weights' rounding to 16 bits hides in bf16; the default is the fastest form that
+        passes both checks."""
         # The factor as the kernel multiplies by it, rounded to fp32.
-        return not self.natural and self.score_mod is None and float(np.float32(self.scale * LOG2E)) < 1.0
+        return (not self.natural and not self.wide and self.score_mod is None
+                and float(np.float32(self.scale * LOG2E)) < 1.0)
 
     @property
     def guarded(self) -> bool:
