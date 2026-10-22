@@ -268,10 +268,10 @@ def _large_values(keys: int):
     return draw
 
 
-def _drawn(queries, keys, width=16, rows=ROWS, size=1.0):
+def _drawn(queries, keys, width=16, rows=ROWS, size=1.0, heads=2):
     def draw(seed):
-        query, key, value, dout = _normal(seed, (rows, queries, 2, width), (rows, keys, 2, width),
-                                          (rows, keys, 2, width), (rows, queries, 2, width))
+        query, key, value, dout = _normal(seed, (rows, queries, heads, width), (rows, keys, heads, width),
+                                          (rows, keys, heads, width), (rows, queries, heads, width))
         return query * np.float32(size), key, value, None, dout
     return draw
 
@@ -414,7 +414,8 @@ def _families() -> dict[str, Family]:
         # A key at its row's maximum weighs 1 exactly in the accurate form; the fold's contracted weight is
         # 1 within an ulp of its logit's exponent.
         "one key": Family(_drawn(4, 1), _kept(4, 1), folded=False),
-        "a sink and one key": Family(_with_sinks(_drawn(16, 1), -3.0, 3.0), _kept(16, 1)),
+        # Sixteen heads, so each draw holds sixteen sinks' gradients.
+        "a sink and one key": Family(_with_sinks(_drawn(16, 1, heads=16), -3.0, 3.0), _kept(16, 1)),
         "a sink near fp32's largest and one key": Family(_with_sinks(_drawn(16, 1), 1e38, 3e38),
                                                          _kept(16, 1), folded=False),
         "a sink and one key, its logit near fp32's largest": Family(
@@ -489,8 +490,8 @@ def _families() -> dict[str, Family]:
     for low, high, label in ((-3.0, 3.0, ""), (1e38, 3e38, " near fp32's largest")):
         # One query a row, so the decode kernel takes the family too.
         name = f"a decode step's sink{label} and one key"
-        families[name] = Family(_with_sinks(_drawn(1, 1, rows=128), low, high), np.ones((128, 1, 1, 1), bool),
-                                folded=low < 0)
+        families[name] = Family(_with_sinks(_drawn(1, 1, rows=128, heads=16), low, high),
+                                np.ones((128, 1, 1, 1), bool), folded=low < 0)
     ids = np.tile(np.asarray([[1, 2, 3, 3]], np.int32), (ROWS, 1))
     families["documents of one key"] = Family(_drawn(4, 4), _causal(4, 4, ROWS) & (ids[:, None, :, None] ==
                                                                                   ids[:, None, None, :]),
