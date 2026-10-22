@@ -406,6 +406,76 @@ LAYOUT_SEEDS: dict[str, int] = {
 most any of its four layouts and step counts took; a cell not named takes DEFAULT_LAYOUT_SEEDS."""
 DEFAULT_LAYOUT_SEEDS = 16
 
+MARGIN = 1e-5
+"""The least selection margin a draw admits (`selection_margin`), relative to the scale of what is
+selected: thirty times the fp32 rounding a layout's sums move a selection's inputs by (a K-term fp32
+dot's sqrt(K) 2^-24 of its row, about 3e-7 at these widths), so one device, each layout and the float64
+run select alike. A selection is discontinuous: inputs within rounding of a boundary pick other keys or
+units in other runs, a difference no precision bounds."""
+
+
+def selects(case: Case) -> bool:
+    """Whether the cell's model selects discontinuously: a lightning indexer's top-k or Gemma 3n's
+    gaussian top-k (`selection_margin`)."""
+    fields = case.config.get("mixer", {}).get("fields", {})
+    sparsities = case.config.get("activation_sparsity_pattern", ())
+    return case.is_lm and bool(fields.get("index_topk") or any(sparsities))
+
+
+def selection_margin(case: Case, variables_by_step, tokens) -> float:
+    """The smallest margin, over the forward of each of the draw's steps, of the model's
+    discontinuous selections relative to their scale: the lightning indexer's top-k (the gap between
+    the k-th and the next visible key's score, over the query's largest) and Gemma 3n's gaussian top-k
+    (the gate's distance from its cutoff, the row's mean plus the sparsity's normal quantile times its
+    population deviation, over that deviation, as `dew.nn.mlp.gaussian_topk` forms it). A query that
+    sees no more keys than its budget, and an exact zero tie of relu'd scores, ordered alike by index
+    in every run, decide nothing."""
+    from statistics import NormalDist
+
+    from flax import linen as nn
+
+    from dew.nn.mla import SparseIndexer
+    from dew.nn.mlp import MLP
+
+    fields = case.config.get("mixer", {}).get("fields", {})
+    sparsities = case.config.get("activation_sparsity_pattern", ())
+    model = models.build(case.architecture, **case.config)
+
+    def selecting(module, method):
+        parent = module.parent
+        return method == "__call__" and (isinstance(module, SparseIndexer) or (
+            isinstance(module, nn.Dense) and module.name == "gate_proj" and isinstance(parent, MLP)
+            and bool(parent.activation_sparsity)))
+
+    margin = np.inf
+    for variables in variables_by_step:
+        _, captured = model.apply(variables, jnp.asarray(tokens[:, :-1]), capture_intermediates=selecting,
+                                  mutable=["intermediates"])
+        for path, values in jax.tree_util.tree_flatten_with_path(captured["intermediates"])[0]:
+            names = [str(getattr(part, "key", part)) for part in path]
+            values = np.asarray(values, np.float64)
+            if "gate_proj" in names:
+                layer = int(next(name for name in names if name.startswith("layers_")).split("_")[1])
+                quantile = NormalDist().inv_cdf(sparsities[layer])
+                deviation = values.std(-1, keepdims=True)
+                cutoff = values.mean(-1, keepdims=True) + quantile * deviation
+                # As the indexer's: the least kept unit's height over the cutoff, and the cutoff's over
+                # the greatest dropped one, in the row's deviations.
+                kept = np.min(np.where(values > cutoff, values, np.inf), axis=-1, keepdims=True)
+                dropped = np.max(np.where(values > cutoff, -np.inf, values), axis=-1, keepdims=True)
+                margin = min(margin, float(np.min(np.minimum(kept - cutoff, cutoff - dropped) / deviation)))
+                continue
+            budget, (queries, keys) = fields["index_topk"], values.shape[-2:]
+            if keys <= budget:
+                continue
+            visible = np.tril(np.ones((queries, keys), bool), keys - queries)
+            ranked = -np.sort(-np.where(visible, values, -np.inf), axis=-1)
+            kept, rejected = ranked[..., budget - 1], ranked[..., budget]
+            decided = np.isfinite(rejected) & ~((kept == 0) & (rejected == 0))
+            scale = np.maximum(np.abs(ranked[..., 0]), np.finfo(np.float32).tiny)
+            margin = min(margin, float(np.min(np.where(decided, (kept - rejected) / scale, np.inf))))
+    return margin
+
 
 def reordered(state, order):
     """`state` with its residual stream's units in `order` (`tests/residual_orders.permuted`), its
@@ -470,15 +540,24 @@ def test_architecture_trains_on_every_layout_as_on_one_device(case, tmp_path):
         return jax.tree.map(jnp.copy, initial)
 
     width = residual_width(initial.variables) if case.is_lm else 0
+    one_step = drawn_steps(case, tmp_path, 1, 1, initial, 1)
 
     def draw(seed):
         """A batch drawn from the seed and, independently, an order of the residual stream's units
         (`reordered`), the cell's own batch and the identity at seed 0: the fresh batch varies the
         values, the order every contraction's summation, and the reference and each layout start
         from the same reordered state, so all are judged in its coordinates. A model with no
-        token embedding has no residual stream to permute, and draws batches alone."""
-        order = (np.arange(width) if seed == 0 else np.random.default_rng(seed).permutation(width))
-        return next(batches(case, encoder, seed)()), order
+        token embedding has no residual stream to permute, and draws batches alone. A model that
+        selects discontinuously takes the seed's first batch whose selections, in the forward of
+        each step, clear MARGIN (`selection_margin`)."""
+        for attempt in range(64):
+            key = seed if attempt == 0 else 1_000_003 * (attempt + 1) + seed
+            order = (np.arange(width) if key == 0 else np.random.default_rng(key).permutation(width))
+            raw = next(batches(case, encoder, key)())
+            if not selects(case) or selection_margin(case, (initial.variables, one_step(
+                    raw, np.arange(width))["variables"]), raw["text"]) > MARGIN:
+                return raw, order
+        raise AssertionError(f"no batch of seed {seed} clears the selection margin {MARGIN}")
 
     seeds = LAYOUT_SEEDS.get(case.name, DEFAULT_LAYOUT_SEEDS)
     for steps in (1, 2):
