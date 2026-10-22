@@ -1,9 +1,9 @@
 {
-  "transformers": "5.16.1",
-  "torch": "2.14.0+cu130",
+  "transformers": "5.17.0",
+  "torch": "2.14.1+cu126",
   "dtype": "float32",
   "attention": "eager",
-  "device": "NVIDIA GeForce RTX 4080",
   "seed": 1234,
+  "device": "NVIDIA A100-SXM4-40GB",
   "command": "PYTHONPATH=src python tools/gpt_neox_reference.py"
 }

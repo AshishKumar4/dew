@@ -30,6 +30,7 @@ from dew.nn.blocks import Modulation
 from dew.nn.dense import Dense
 from dew.nn.flops import MissingFlopsCount, attention_flops, matching_lengths, projection_flops
 from dew.nn.mlp import GatedMLP
+from dew.nn.precision import float32_dot_general
 from dew.nn.rope import rotate
 from dew.nn.sharding import logical_axes
 
@@ -57,9 +58,10 @@ def embedding(x, features: int, name: str, *, bias: bool = True, dtype: Dtype | 
     activation is SiLU, or Wan's tanh GELU. The two layers are stored flat
     as `{name}_linear_1` and `{name}_linear_2` in the calling module.
     """
-    hidden = Dense(features, use_bias=bias, dtype=dtype, precision=precision, name=f"{name}_linear_1")(x)
+    hidden = Dense(features, use_bias=bias, dtype=dtype, precision=precision, name=f"{name}_linear_1",
+                   dot_general=float32_dot_general)(x)
     return Dense(features, use_bias=bias, dtype=dtype, precision=precision,
-                 name=f"{name}_linear_2")(activation(hidden))
+                 name=f"{name}_linear_2", dot_general=float32_dot_general)(activation(hidden))
 
 
 def embedding_axes(*names: str) -> dict[tuple[str, ...], tuple[str | None, ...]]:

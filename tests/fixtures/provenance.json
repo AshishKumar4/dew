@@ -357,7 +357,7 @@
    "sources": [
     {
      "repo": "huggingface/transformers",
-     "version": "5.16.1",
+     "version": "5.17.0",
      "runs": "transformers"
     }
    ]
@@ -1562,7 +1562,7 @@
    "sources": [
     {
      "repo": "huggingface/transformers",
-     "version": "5.16.1",
+     "version": "5.17.0",
      "runs": "transformers"
     }
    ],
@@ -1573,7 +1573,7 @@
    "sources": [
     {
      "repo": "huggingface/transformers",
-     "version": "5.16.1",
+     "version": "5.17.0",
      "runs": "transformers"
     }
    ],
@@ -1634,7 +1634,7 @@
    "sources": [
     {
      "repo": "huggingface/transformers",
-     "version": "5.16.1",
+     "version": "5.17.0",
      "runs": "transformers"
     }
    ],
@@ -1781,7 +1781,7 @@
    "sources": [
     {
      "repo": "huggingface/transformers",
-     "version": "5.16.1",
+     "version": "5.17.0",
      "runs": "transformers"
     }
    ]
@@ -1791,7 +1791,7 @@
    "sources": [
     {
      "repo": "huggingface/transformers",
-     "version": "5.16.1",
+     "version": "5.17.0",
      "runs": "transformers"
     }
    ]
@@ -1812,7 +1812,7 @@
    "sources": [
     {
      "repo": "huggingface/transformers",
-     "version": "5.16.1",
+     "version": "5.17.0",
      "runs": "transformers"
     }
    ],
@@ -1823,7 +1823,7 @@
    "sources": [
     {
      "repo": "huggingface/transformers",
-     "version": "5.16.1",
+     "version": "5.17.0",
      "runs": "transformers"
     }
    ],
@@ -1946,6 +1946,26 @@
     }
    ],
    "note": "Dynamic remote import; routing weights use unshifted scores (tools/kimi_linear_reference.py:33); fla kernels forced IEEE."
+  },
+  "hf/llada-moe-tiny": {
+   "tool": "tools/llada_moe_reference.py",
+   "sources": [{"repo": "inclusionAI/LLaDA-MoE-7B-A1B-Base", "version": "daccaf1ccbf263a427bc9ac2a23b0b004fb275bf", "runs": "fetched"}, {"repo": "inclusionAI/LLaDA-MoE-7B-A1B-Instruct", "version": "783d3467f108d28ac0a78d3e41af16ab05cabd8d", "runs": "fetched"}, {"repo": "huggingface/transformers", "version": "4.57.1", "runs": "transformers"}]
+  },
+  "hf/llada-moe-v2-tiny": {
+   "tool": "tools/llada_moe_reference.py",
+   "sources": [{"repo": "GSAI-ML/LLaDA-MoE-v2-30B-A3B-Base", "version": "2a513f7a4634e426b2ab030e6defb24001d0c847", "runs": "fetched"}, {"repo": "GSAI-ML/LLaDA-MoE-v2-30B-A3B-Instruct", "version": "97cfa32a580778df8d796c1faad72d22c8f8a6ba", "runs": "fetched"}, {"repo": "huggingface/transformers", "version": "4.57.1", "runs": "transformers"}]
+  },
+  "hf/llada2-tiny": {
+   "tool": "tools/llada_moe_reference.py",
+   "sources": [{"repo": "inclusionAI/LLaDA2.0-mini", "version": "dad945cac317da394b390f82c7b40691d8a881ed", "runs": "fetched"}, {"repo": "inclusionAI/LLaDA2.0-flash", "version": "744c3f8c6c8317d2377d6d16d8a3d4be2caef563", "runs": "fetched"}, {"repo": "huggingface/transformers", "version": "4.57.1", "runs": "transformers"}]
+  },
+  "hf/llada21-tiny": {
+   "tool": "tools/llada_moe_reference.py",
+   "sources": [{"repo": "inclusionAI/LLaDA2.1-mini", "version": "20e64e2ad21644d0e5248586ed9c942cdd45de0f", "runs": "fetched"}, {"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
+  },
+  "hf/llada22-tiny": {
+   "tool": "tools/llada_moe_reference.py",
+   "sources": [{"repo": "inclusionAI/LLaDA2.2-flash", "version": "9b78da3f9149f1e239fb6d15f20a326fde574b9f", "runs": "fetched"}, {"repo": "huggingface/transformers", "version": "5.16.1", "runs": "transformers"}]
   },
   "hf/llada-tiny/logits.npy": {
    "tool": "tools/remote_code_reference.py",
@@ -2292,7 +2312,7 @@
    "sources": [
     {
      "repo": "huggingface/transformers",
-     "version": "5.16.1",
+     "version": "5.17.0",
      "runs": "transformers"
     }
    ],
@@ -2303,7 +2323,7 @@
    "sources": [
     {
      "repo": "huggingface/transformers",
-     "version": "5.16.1",
+     "version": "5.17.0",
      "runs": "transformers"
     }
    ],
@@ -2456,7 +2476,7 @@
    "sources": [
     {
      "repo": "huggingface/transformers",
-     "version": "5.16.1",
+     "version": "5.17.0",
      "runs": "transformers"
     }
    ]
@@ -2466,7 +2486,7 @@
    "sources": [
     {
      "repo": "huggingface/transformers",
-     "version": "5.16.1",
+     "version": "5.17.0",
      "runs": "transformers"
     }
    ]
@@ -2476,7 +2496,7 @@
    "sources": [
     {
      "repo": "huggingface/transformers",
-     "version": "5.16.1",
+     "version": "5.17.0",
      "runs": "transformers"
     }
    ]
@@ -3484,7 +3504,7 @@
    "sources": [
     {
      "repo": "huggingface/transformers",
-     "version": "5.16.1",
+     "version": "5.17.0",
      "runs": "transformers"
     }
    ]
@@ -3494,7 +3514,7 @@
    "sources": [
     {
      "repo": "huggingface/transformers",
-     "version": "5.16.1",
+     "version": "5.17.0",
      "runs": "transformers"
     }
    ]
@@ -3617,7 +3637,7 @@
    "sources": [
     {
      "repo": "huggingface/diffusers",
-     "version": "0.34.0",
+     "version": "0.39.0",
      "runs": "diffusers"
     }
    ]
@@ -3654,7 +3674,7 @@
    "sources": [
     {
      "repo": "huggingface/diffusers",
-     "version": "0.34.0",
+     "version": "0.39.0",
      "runs": "diffusers"
     }
    ]
@@ -3664,7 +3684,7 @@
    "sources": [
     {
      "repo": "huggingface/diffusers",
-     "version": "0.34.0",
+     "version": "0.39.0",
      "runs": "diffusers"
     }
    ],

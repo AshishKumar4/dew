@@ -1,6 +1,6 @@
 from dew.sampling import CFG, DPMSolverMultistep, TextToImage
 
-pipe = TextToImage.from_pretrained("dewml/hybrid-dit-176m", revision="90bf92263920adb5646a969b7f170bdeea0fc770")
+pipe = TextToImage.from_pretrained("dewml/hybrid-dit-176m", revision="9056c18392bd7d906f5ced2bd64ebcbaba8d0989")
 prompt = "the northern lights over a frozen lake at night, vivid colors, dramatic lighting, highly detailed"
 negative = ("letterbox, white border, black border, frame, text, watermark, collage, blurry, lowres, "
             "low quality, dull colors, washed out, low contrast, grainy")

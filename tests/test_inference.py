@@ -311,12 +311,12 @@ def test_a_metric_a_run_names_without_a_validation_split_refuses_before_an_updat
     assert Checkpoints(str(tmp_path / "checkpoints"), keep=1).latest is None
 
 
-def make_lm_run(directory, *, mesh=None, ema_decay=0.9, max_seq_len=16):
+def make_lm_run(directory, *, mesh=None, ema_decay=0.9, max_seq_len=16, fields=None):
     """Two training steps of a tiny byte-level decoder, its checkpoints, whose
     record names the byte tokenizer it decodes through, and the `run.json` the
     LM recipe writes: the resolved model, tokenizer and budget.
     `max_seq_len` is the model's window, which training at 9 ids does not
-    reach."""
+    reach; `fields` override the decoder's shape."""
     import json
 
     from dew.objectives.lm import LMObjective, Samples
@@ -324,7 +324,7 @@ def make_lm_run(directory, *, mesh=None, ema_decay=0.9, max_seq_len=16):
     from dew.training import MeshSpec
 
     fields = {"vocab_size": 256, "emb_features": 16, "num_layers": 1, "num_heads": 2, "head_dim": 8,
-                  "mlp_features": 32, "max_seq_len": max_seq_len}
+              "mlp_features": 32, "max_seq_len": max_seq_len, **(fields or {})}
     model_config = ModelConfig("causal_transformer", {**fields,
                                                     "dtype": "float32", "attention_impl": "reference"})
     objective = LMObjective(model_config.build(), 8, ema_decay=ema_decay,
@@ -347,6 +347,134 @@ def make_lm_run(directory, *, mesh=None, ema_decay=0.9, max_seq_len=16):
         "max_new_tokens": 4, "sampling": dataclasses.asdict(objective.samples.sampling),
         "ema_decay": ema_decay, "data": {"seq_len": 8}}))
     return objective, state
+
+
+def test_every_route_generates_through_the_same_packed_projections(tmp_path):
+    """A run's task and a source's hold their query/key/value and gate/up packed, packed once at
+    their load from the weights they own; a live objective's task keeps the trainer's own arrays,
+    bound in place, and packs them inside each generation's compiled call. Every route draws, bit
+    for bit, what a task over weights packed beforehand draws, and the run's and the objective's
+    draws agree. The run task's tree is a serving layout: an objective built over it holds, and an
+    export of it writes, the run's own tree, bit for bit."""
+    from flax.core import unfreeze
+
+    from dew.inference.projections import inference_projections, projection_groups
+    from dew.interop import Pretrained
+    from dew.objectives.lm import LMObjective
+    from dew.quantization import Quantization
+    from dew.sampling import Sampling
+
+    run = tmp_path / "run"
+    run.mkdir()
+    objective, state = make_lm_run(run, ema_decay=None)
+    Pretrained.from_run(str(run)).save(tmp_path / "source")
+    routes = {"run": dew.pipeline(str(run)), "source": dew.pipeline(str(tmp_path / "source")),
+              "objective": objective.pipeline(state)}
+    for name, task in routes.items():
+        attention = task.variables["params"]["layers_0"]["self_attn"]
+        owned = name != "objective"
+        assert ("qkv_proj" in attention) == owned, name
+        assert ({"q_proj", "k_proj", "v_proj"} & set(attention) == set()) == owned, name
+    for bound, live in zip(jax.tree.leaves(routes["objective"].variables), jax.tree.leaves(state.variables),
+                           strict=True):
+        assert bound is live
+    greedy = Sampling(temperature=0, eos_token_ids=255)
+    drawn = {}
+    for name, task in routes.items():
+        packed = inference_projections(task.model, task.variables)
+        prepacked = TextGeneration(task.model, packed, task.processor)
+        drawn[name] = task("the ", 4, key=2, sampling=greedy).host()
+        expected = prepacked("the ", 4, key=2, sampling=greedy).host()
+        np.testing.assert_array_equal(drawn[name].tokens, expected.tokens, err_msg=name)
+        np.testing.assert_array_equal(drawn[name].raw_log_probs, expected.raw_log_probs, err_msg=name)
+    np.testing.assert_array_equal(drawn["run"].raw_log_probs, drawn["objective"].raw_log_probs)
+    trained = Pretrained.from_run(str(run))
+    # A model quantized on the query alone would not pack the group anew; the tree still stores it packed.
+    queried = Quantization(patterns=(".*/q_proj",)).apply(routes["run"].model)
+    assert "qkv_proj" not in {group.packed for group in projection_groups(queried, trained.variables)}
+    for model in (routes["run"].model, queried):
+        held = LMObjective(model, 8, variables=routes["run"].variables).variables
+        assert jax.tree.structure(unfreeze(held)) == jax.tree.structure(unfreeze(trained.variables))
+        for ours, theirs in zip(jax.tree.leaves(held), jax.tree.leaves(trained.variables), strict=True):
+            np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
+    exported, canonical = trained.export(routes["run"].variables), trained.export()
+    assert set(exported) == set(canonical)
+    for name, tensor in canonical.items():
+        np.testing.assert_array_equal(np.asarray(exported[name]), np.asarray(tensor), err_msg=name)
+
+
+def test_a_generation_reads_its_models_groups_once_for_every_call(tmp_path):
+    """A generate call finds the groups a borrowed tree packs in the call (`pending`) without
+    binding the model again: the groups a model declares are a function of the model and its
+    tree's shapes, which binding a deep decoder to read took tens of milliseconds of every call.
+    A decoder that counts its declarations is asked once over every call on one tree, draws what
+    a task over its tree packed beforehand draws, and is asked again for a tree of another shape."""
+    from dew.inference.projections import inference_projections, projection_groups
+    from dew.nn.backbones.causal_transformer import CausalTransformer
+    from dew.sampling import Sampling
+
+    asked = []
+
+    class Counting(CausalTransformer):
+        def inference_projection_groups(self, variables):
+            asked.append(1)
+            return super().inference_projection_groups(variables)
+
+    run = tmp_path / "run"
+    run.mkdir()
+    objective, state = make_lm_run(run, ema_decay=None)
+    model = objective.pipeline(state).model
+    counting = Counting(**{field.name: getattr(model, field.name) for field in dataclasses.fields(model)
+                           if field.init and field.name not in ("parent", "name")})
+    task = TextGeneration(counting, state.variables, RunProcessor(ByteTokenizer()))
+    greedy = Sampling(temperature=0, eos_token_ids=255)
+    drawn = [task("the ", 2, key=key, sampling=greedy).host() for key in range(3)]
+    assert len(asked) == 1
+    # The kept plan is the plan: the draws are a prepacked task's, bit for bit.
+    prepacked = TextGeneration(model, inference_projections(model, state.variables), task.processor)
+    for key, generation in enumerate(drawn):
+        expected = prepacked("the ", 2, key=key, sampling=greedy).host()
+        np.testing.assert_array_equal(generation.raw_log_probs, expected.raw_log_probs)
+    # A tree of another shape is asked again: the plan is kept per model and tree shape.
+    widened = jax.tree.map(lambda leaf: leaf, dict(state.variables))
+    widened["params"] = {**widened["params"], "spare": {"kernel": jnp.zeros((2, 2))}}
+    projection_groups(counting, widened)
+    assert len(asked) == 2
+
+
+@pytest.mark.mesh(devices=3)
+def test_a_run_on_a_mesh_packs_the_projections_its_layout_keeps_whole(tmp_path):
+    """A packed kernel's columns are its members' outputs side by side, so a run's task packs a
+    group only where the layout leaves each member's output axis whole, and the packed kernel
+    keeps the members' placement. FSDP over three devices splits the inputs and both groups pack;
+    a tensor axis of three splits three query heads' twelve output units, so the query, key and
+    value stay apart, but not the MLP's 32, so the gate and up projections pack. On each mesh the
+    task draws the tokens it draws on one device."""
+    from dew.sampling import Sampling
+    from dew.training import Layout, MeshSpec
+
+    run = tmp_path / "run"
+    run.mkdir()
+    make_lm_run(run, ema_decay=None, fields={"emb_features": 12, "num_heads": 3, "num_kv_heads": 1,
+                                             "head_dim": 4})
+    devices = jax.devices()[:3]
+    layout = Layout(min_shard=1, tolerance=1.0)
+    greedy = Sampling(temperature=0, eos_token_ids=255)
+    alone = dew.pipeline(str(run), mesh=MeshSpec().build(devices[:1]), layout=layout)
+    here = alone("the ", 4, key=2, sampling=greedy).host()
+    for spec, packed in ((MeshSpec(fsdp=3), {"qkv_proj", "gate_up_proj"}),
+                         (MeshSpec(tensor=3), {"gate_up_proj"})):
+        task = dew.pipeline(str(run), mesh=spec.build(devices), layout=layout)
+        layer = task.variables["params"]["layers_0"]
+        held = {*layer["self_attn"], *layer["mlp"]}
+        assert held & {"qkv_proj", "gate_up_proj"} == packed, spec
+        assert ({"q_proj", "k_proj", "v_proj"} <= held) == ("qkv_proj" not in packed), spec
+        for name in packed:
+            kernel = (layer["self_attn"] if name == "qkv_proj" else layer["mlp"])[name]["kernel"]
+            assert kernel.sharding.shard_shape(kernel.shape)[-1] == kernel.shape[-1], (spec, name)
+            assert kernel.sharding.shard_shape(kernel.shape)[0] == kernel.shape[0] // spec.fsdp, (spec, name)
+        there = task("the ", 4, key=2, sampling=greedy).host()
+        np.testing.assert_array_equal(there.tokens, here.tokens, err_msg=str(spec))
 
 
 def test_objective_pipeline_binds_the_trained_state_in_place(tmp_path):
@@ -413,19 +541,12 @@ def test_an_lm_run_over_a_sources_own_processor_reloads_that_processor(tmp_path)
     """A decoder fine-tuned from a checkpoint encodes text with the processor the
     checkpoint ships; its run records that processor's source, so the reloaded task
     encodes as the trained one does rather than loading as weights that take ids."""
-    import shutil
-    from pathlib import Path
+    from model_support import tokenized_qwen3
 
     from dew.interop import Pretrained
     from dew.objectives.lm import LMObjective
 
-    fixtures = Path(__file__).parent / "fixtures" / "hf"
-    source = tmp_path / "source"
-    source.mkdir()
-    for name in ("config.json", "model.safetensors"):
-        shutil.copyfile(fixtures / "qwen3-tiny" / name, source / name)
-    for name in ("tokenizer.json", "tokenizer_config.json"):
-        shutil.copyfile(fixtures / "qwen38-dense-tiny" / name, source / name)
+    source = tokenized_qwen3(tmp_path / "source")
     loaded = Pretrained.load(source, dtype="float32", attention_impl="xla", max_seq_len=32)
     objective = LMObjective(loaded, 8)
     batch = {"text": np.random.RandomState(0).randint(1, 100, (8, 9)).astype(np.int32)}

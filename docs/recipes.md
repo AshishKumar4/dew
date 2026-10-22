@@ -169,7 +169,7 @@ For a committed store, `--set data.source.url=...` is its URL. A URL catalog add
 
 To train one of these published architectures from scratch, name it with `--model` and set its fields with `--model.<field>` flags. To condition it on a pipeline's text encoders, pass `--text.encoder diffusion_text --text.checkpoint REPO`.
 
-`--objective flow_grpo` trains the model with Flow-GRPO in place of the denoising loss, and it needs a flow preset. For each prompt it samples `--objective.groups` images through the flow SDE and scores them with the image metric named by `--objective.reward`. That metric has to give better images higher scores, as `clip_score` does.
+`--objective flow_grpo` trains the model with Flow-GRPO in place of the denoising loss, and it needs a flow preset. For each prompt it samples `--rollout.groups` images through the flow SDE and scores them with the image metric named by `--rollout.reward`. That metric has to give better images higher scores, as `clip_score`, the default, does. `--rollout.steps` counts the rollout's time points and `--rollout.train-steps` the transitions it trains on.
 
 A JEPA configuration adds predictor fields, target-mask settings and optional representation probes; the target encoder's EMA momentum is the objective's (`--objective.momentum 0.996 1.0`), ramped over the whole run unless `--objective.momentum-steps` says otherwise. The predictor estimates the encoded features of hidden image or video regions. The dataset and the model must both be image or both be video. Set the run length explicitly and prepare the dataset before starting.
 

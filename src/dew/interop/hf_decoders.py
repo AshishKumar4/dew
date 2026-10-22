@@ -825,7 +825,7 @@ def export_config(model) -> Mapping[str, object]:
         'attention_bias': model.attention_bias,
         'tie_word_embeddings': model.tie_embeddings,
         'hidden_act': hf_activation(model.mlp),
-        'use_cache': True,
+        'use_cache': model.causal,
     }
     # A dial only some families' references read cannot ride in another
     # family's config. Qwen2 splits the o_proj bias from the others, and
@@ -835,7 +835,7 @@ def export_config(model) -> Mapping[str, object]:
     # reads the field without passing it on). A checkpoint written under a
     # family that would drop the dial is refused naming it.
     if (model.o_proj_bias is not None and model.o_proj_bias != model.attention_bias
-            and family.export_model_type not in ('qwen2', 'dream', 'gpt_neo')):
+            and family.export_model_type not in ('qwen2', 'dream', 'gpt_neo', 'llada2_moe')):
         raise ValueError(
                 "o_proj_bias differs from attention_bias, which only the qwen2 "
                 "and dream references build, so the model cannot be written as "
@@ -897,7 +897,8 @@ def export_config(model) -> Mapping[str, object]:
     elif ramped:
         config['rope_scaling'] = dataclasses.asdict(next(iter(ramped.values())))
     config.update(exported)
-    written = {key: value for key, value in config.items() if value is not None or key == 'pad_token_id'}
+    written = {key: value for key, value in config.items()
+               if value is not None or key == 'pad_token_id' or key in family.export_nulls}
     refuse_lossy_export(model, written)
     return written
 

@@ -48,13 +48,23 @@ from .documents import (
     query_order,
     with_documents,
 )
-from .flops import attention_flops, cross_attention_flops, projection_flops
+from .flops import cross_attention_flops, projection_flops, self_attention_flops
 from .inputs import cu_seqlens
 from .kernels import decode_attention, generation, norm_swiglu
 from .kernels.generation import bf16_dot_runs, gpu_placed
 from .kernels.selection import forced, select
 from .kv_cache import Append, KVCache, KVStore, filled_slots
-from .precision import asks_default_precision, at_default_precision, at_least_fp32, rounded_to
+from .precision import (
+    asks_default_precision,
+    at_default_precision,
+    at_least_fp32,
+    configured_precision,
+    float32_dot_general,
+    float32_einsum,
+    float32_products,
+    operand_precision,
+    rounded_to,
+)
 from .rope import rotate
 from .sharding import (
     HEADS,
@@ -324,7 +334,7 @@ def max_attention_logits(query: jax.Array, key: jax.Array, *, causal: bool = Fal
     scale = 1.0 / math.sqrt(query.shape[-1])
     logits = jnp.einsum('...qhd,...khd->...hqk',
                         query.astype(jnp.float32) * jnp.asarray(scale, jnp.float32),
-                        key.astype(jnp.float32))
+                        key.astype(jnp.float32), precision=operand_precision(jnp.float32))
     if bias is not None:
         logits = logits + bias.astype(jnp.float32)
     combined = combined_attention_mask(
@@ -341,7 +351,7 @@ def normalized_in_fp32(normalize, static_argnums: tuple[int, ...] = ()):
     the backward pass would keep two fp32 copies of the activations per norm
     (2.35 GiB on one SimpleDiT step). Saving nothing keeps the arguments (the
     bf16 input, the weight and the bias) and leaves the residuals to the policy
-    that recomputes the block (`decoder_block.RESIDUALS`). The wrapped function
+    that recomputes the block (`mixer_base.RESIDUALS`). The wrapped function
     takes arrays first and static arguments last, so no flax lifting sits
     between the checkpoint and the module; forward values are unchanged.
     """
@@ -1167,7 +1177,7 @@ def weighted_values(equation, weights, value, *, precision=None) -> jax.Array:
     if equation != '...hqk,...khd->...qhd':
         raise ValueError(f"weighted_values takes flax's value product, got {equation!r}")
     weights = weights.astype(value.dtype)
-    plain = functools.partial(jnp.einsum, equation, precision=precision)
+    plain = functools.partial(float32_einsum, equation, precision=precision)
     if value.dtype != jnp.float32 or value.shape[-3] <= VALUE_BLOCK or generation.backend() != 'cpu':
         return plain(weights, value)
     # Both modes differentiate the plain product: neither sums over the keys, and the blocked
@@ -1185,7 +1195,7 @@ def _blocked_values(weights, value, precision) -> jax.Array:
     value = jnp.pad(value, [(0, 0)] * (value.ndim - 3) + [(0, pad), (0, 0), (0, 0)])
     weights = weights.reshape(*weights.shape[:-1], blocks, VALUE_BLOCK)
     value = value.reshape(*value.shape[:-3], blocks, VALUE_BLOCK, *value.shape[-2:])
-    return jnp.einsum('...hqck,...ckhd->...qhdc', weights, value, precision=precision).sum(-1)
+    return float32_einsum('...hqck,...ckhd->...qhdc', weights, value, precision=precision).sum(-1)
 
 
 
@@ -1202,9 +1212,11 @@ def reference_attention(query, key, value, *, mask=None, bias=None, sinks=None, 
     (modeling_gemma2.py:192-208), and `sinks` `[H]` put one value-free logit
     per head in the softmax's denominator (`sink_softmax`). Keys and values
     may carry fewer heads. Without sinks they repeat to the query's, as flax
-    repeats them, which keeps flax's rounding; a sink layer decodes over its
-    whole cache here, since no fused kernel takes sinks, so there the query
-    heads group over their key head and no key or value repeats.
+    repeats them, which keeps flax's rounding; with sinks the query heads
+    group over their key head and no key or value repeats, as the decode
+    selector (`attention_kernels.decodes`) needs where it routes a sink
+    layer here rather than to the fused decode kernel, which takes sinks on a
+    GPU.
     """
     query, key, value = promote_dtype(query, key, value, dtype=dtype)
     dtype = query.dtype
@@ -1213,10 +1225,10 @@ def reference_attention(query, key, value, *, mask=None, bias=None, sinks=None, 
     scaled_query = query / jnp.sqrt(width).astype(dtype)
     if sinks is None:
         key, value = repeat_kv_heads(key, heads), repeat_kv_heads(value, heads)
-        logits = jnp.einsum('...qhd,...khd->...hqk', scaled_query, key, precision=precision)
+        logits = float32_einsum('...qhd,...khd->...hqk', scaled_query, key, precision=precision)
     else:
         grouped = scaled_query.reshape(*rows, length, kv_heads, heads // kv_heads, width)
-        logits = jnp.einsum('...tkgd,...skd->...kgts', grouped, key, precision=precision).reshape(
+        logits = float32_einsum('...tkgd,...skd->...kgts', grouped, key, precision=precision).reshape(
             *rows, heads, length, keys)
     if softcap is not None:
         logits = jnp.tanh(logits / softcap) * softcap
@@ -1243,7 +1255,7 @@ def reference_attention(query, key, value, *, mask=None, bias=None, sinks=None, 
     if sinks is None:
         return weighted_values('...hqk,...khd->...qhd', weights, value, precision=precision)
     groups = weights.astype(value.dtype).reshape(*rows, kv_heads, heads // kv_heads, length, keys)
-    return jnp.einsum('...kgts,...skd->...tkgd', groups, value, precision=precision).reshape(
+    return float32_einsum('...kgts,...skd->...tkgd', groups, value, precision=precision).reshape(
         *rows, length, heads, value.shape[-1])
 
 
@@ -1427,11 +1439,14 @@ def _fused_attention(query, key, value, bias, mask, causal, sliding_window, impl
     elif implementation == 'xla':
         # A window of (l, r) keeps the l keys before the query and the r after
         # it on both the xla and the cudnn path, the sides `window_sides` counts.
-        out = jax.nn.dot_product_attention(
-            query, key, value, bias=bias, mask=mask, is_causal=causal,
-            key_value_seq_lengths=key_value_seq_lengths,
-            local_window_size=None if sliding_window is None else window_sides(causal, sliding_window),
-            implementation='xla')
+        # jax.nn's products take the precision their dtype does (`float32_products`) through the
+        # matmul config, which it reads for float32 operands.
+        with configured_precision(float32_products(query.dtype)):
+            out = jax.nn.dot_product_attention(
+                query, key, value, bias=bias, mask=mask, is_causal=causal,
+                key_value_seq_lengths=key_value_seq_lengths,
+                local_window_size=None if sliding_window is None else window_sides(causal, sliding_window),
+                implementation='xla')
     else:  # 'tpu'
         if key_value_seq_lengths is not None:
             mask = with_key_lengths(mask, key_value_seq_lengths, key.shape[-3])
@@ -1959,10 +1974,11 @@ def projected_heads(x, name: str, heads: int, head_dim: int, *, flat: bool, bias
     """
     width = heads * head_dim
     if flat:
-        projected = Dense(width, use_bias=bias, dtype=dtype, precision=precision, name=name)(x)
+        projected = Dense(width, use_bias=bias, dtype=dtype, precision=precision, name=name,
+                          dot_general=float32_dot_general)(x)
     else:
         projected = DenseGeneral((heads, head_dim), use_bias=bias, dtype=dtype, precision=precision,
-                                 name=name)(x)
+                                 name=name, dot_general=float32_dot_general)(x)
     if norm is not None and across_heads:
         projected = norm(projected.reshape(*x.shape[:-1], width))
     projected = projected.reshape(*x.shape[:-1], heads, head_dim)
@@ -1976,10 +1992,11 @@ def projected_output(attended, name: str, features: int, *, flat: bool, bias: bo
     own: `[heads * head_dim, features]` flat, else `[heads, head_dim, features]`."""
     if flat:
         # The width is named, not inferred: an empty stream (no context tokens) has nothing to infer it from.
-        return Dense(features, use_bias=bias, dtype=dtype, precision=precision, name=name)(
+        return Dense(features, use_bias=bias, dtype=dtype, precision=precision, name=name,
+                     dot_general=float32_dot_general)(
             attended.reshape(*attended.shape[:-2], math.prod(attended.shape[-2:])))
     return DenseGeneral(features, axis=(-2, -1), use_bias=bias, dtype=dtype, precision=precision,
-                        name=name)(attended)
+                        name=name, dot_general=float32_dot_general)(attended)
 
 
 @logical_axes({
@@ -2025,8 +2042,7 @@ class NormalAttention(nn.Module):
     @nn.nowrap
     def model_flops(self, lengths) -> float:
         """Self-attention maps and its full QK/AV products on real rows."""
-        return (sum(projection_flops(lengths, *shape) for shape in self.projections().values())
-                + attention_flops(lengths, self.heads, self.dim_head, self.dim_head, causal=False))
+        return self_attention_flops(lengths, self.projections(), self.heads, self.dim_head)
 
     @nn.nowrap
     def cross_flops(self, lengths, context_lengths, context_features: int) -> float:
@@ -2100,7 +2116,8 @@ class FlaxGEGLU(nn.Module):
         return projection_flops(lengths, *self.projections()["proj"])
 
     def setup(self):
-        self.proj = Dense(self.projections()["proj"][1], dtype=self.dtype, precision=self.precision)
+        self.proj = Dense(self.projections()["proj"][1], dtype=self.dtype, precision=self.precision,
+                          dot_general=float32_dot_general)
 
     def __call__(self, hidden_states):
         hidden_states = self.proj(hidden_states)
@@ -2137,7 +2154,8 @@ class FlaxFeedForward(nn.Module):
         self.net_0 = FlaxGEGLU(
             self.dim, dtype=self.dtype, precision=self.precision, approximate=self.approximate_gelu
         )
-        self.net_2 = Dense(self.projections()["net_2"][1], dtype=self.dtype, precision=self.precision)
+        self.net_2 = Dense(self.projections()["net_2"][1], dtype=self.dtype, precision=self.precision,
+                           dot_general=float32_dot_general)
         self.dropout_layer = nn.Dropout(self.dropout)
 
     def __call__(self, hidden_states, *, train: bool = False):
@@ -2292,7 +2310,7 @@ class TransformerBlock(nn.Module):
 
         def project(features: int, name: str):
             return Dense(features=features, use_bias=False, precision=self.precision,
-                         dtype=self.dtype, name=name)
+                         dtype=self.dtype, name=name, dot_general=float32_dot_general)
 
         if self.use_projection:
             inner_dim = self.heads * self.dim_head
