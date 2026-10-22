@@ -194,3 +194,23 @@ def test_a_request_generates_alike_from_coordinates_and_from_its_fields(placed):
                     for form in forms)
     np.testing.assert_array_equal(np.asarray(laid.tokens), np.asarray(fields.tokens))
     np.testing.assert_array_equal(np.asarray(laid.lengths), np.asarray(fields.lengths))
+
+
+def test_a_feed_forward_reads_blocks_of_its_own_size_from_the_layers_metadata():
+    """The model numbers its block router's blocks once, in its metadata (`AttentionMetadata.blocks`);
+    a feed-forward routing blocks of another size numbers its own from the call's coordinates rather
+    than read blocks of the wrong width."""
+    from dew.nn.inputs import AttentionMetadata, coordinates, numbered_blocks, routing_blocks
+
+    class Routed:
+        def __init__(self, block):
+            self.routing_block = block
+
+    tokens = coordinates((1, 8))
+    metadata = AttentionMetadata(coordinates=tokens, blocks=numbered_blocks(tokens, (1, 8), 4),
+                                 routing_block=4)
+    four = routing_blocks(Routed(4), metadata, (1, 8, 3))["blocks"]
+    two = routing_blocks(Routed(2), metadata, (1, 8, 3))["blocks"]
+    np.testing.assert_array_equal(four, [[0, 0, 0, 0, 1, 1, 1, 1]])
+    np.testing.assert_array_equal(two, [[0, 0, 1, 1, 2, 2, 3, 3]])
+    assert routing_blocks(Routed(None), metadata, (1, 8, 3)) == {}

@@ -7,7 +7,7 @@ MFU. Rematerialization belongs only to the separate HLO hardware count.
 """
 
 import math
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 
 import numpy as np
 from flax import linen as nn
@@ -73,6 +73,14 @@ def conv_flops(lengths: np.ndarray, inputs: int, outputs: int, taps: int, *, gro
     return projection_flops(lengths, taps * inputs // groups, outputs)
 
 
+def frozen_training_flops(forward: float, frozen: float, adapter: float = 0.0) -> float:
+    """The forward and backward work of layers whose matrices doing `frozen` of their `forward`
+    work take no weight gradient, with trainable adapter factors doing `adapter` forward work: three
+    times the forward work (forward, input gradient, weight gradient), less the frozen matrices'
+    weight gradients, plus the adapters' three passes."""
+    return 3 * forward - frozen + 3 * adapter
+
+
 def dense_training_flops(lengths: np.ndarray, inputs: int, outputs: int, *,
                           trainable: bool = True, adapter_rank: int = 0) -> float:
     """Forward/backward work of a dense layer, separate from forward FLOPs.
@@ -87,7 +95,9 @@ def dense_training_flops(lengths: np.ndarray, inputs: int, outputs: int, *,
     """
     if inputs < 0 or outputs < 0 or adapter_rank < 0:
         raise ValueError("dense training FLOPs need nonnegative matrix widths and adapter rank")
-    per_token = (6 if trainable else 4) * inputs * outputs + 6 * adapter_rank * (inputs + outputs)
+    forward = 2 * inputs * outputs
+    adapter = 2 * adapter_rank * (inputs + outputs)
+    per_token = frozen_training_flops(forward, 0 if trainable else forward, adapter)
     return float(np.sum(real_lengths(lengths)) * per_token)
 
 
@@ -115,6 +125,14 @@ def attention_flops(lengths: np.ndarray, heads: int, key: int, value: int, *, ca
     else:
         work = pairs(length)
     return _attention_products(work, heads, key, value)
+
+
+def self_attention_flops(lengths: np.ndarray, projections: Mapping[str, tuple[int, int]], heads: int,
+                         head_dim: int) -> float:
+    """A bidirectional self-attention block over real rows: its `projections` (name to input and
+    output width) and the full QK and AV products of `heads` heads `head_dim` wide."""
+    return (sum(projection_flops(lengths, *shape) for shape in projections.values())
+            + attention_flops(lengths, heads, head_dim, head_dim, causal=False))
 
 
 def cross_attention_flops(lengths: np.ndarray, context_lengths: np.ndarray,

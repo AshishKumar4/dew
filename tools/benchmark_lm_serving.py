@@ -22,7 +22,9 @@ prompts and the full measured output length.
 `--mesh` places Dew's weights on a mesh of those MeshSpec fields before the
 server is built, as `dew.pipeline(mesh=...)` does, to time sharded decode;
 the record names the mesh, the devices the weights span and the mesh axes
-that split them (a weight below the layout's `min_shard` stays whole).
+that split them (a weight below the layout's `min_shard` stays whole). For
+vllm-engine it sets the engine's parallelism over as many GPUs
+(`vllm_parallelism`), so the two run at one shape.
 """
 
 from __future__ import annotations
@@ -34,6 +36,7 @@ import dataclasses
 import hashlib
 import io
 import json
+import os
 import platform
 import pstats
 import time
@@ -342,9 +345,26 @@ def closed_loop(streamed):
     return request
 
 
+def vllm_parallelism(mesh: dict[str, int] | None) -> dict[str, object]:
+    """vLLM's engine flags for a `--mesh` of 'tensor' and 'expert' sizes: tensor parallelism over
+    their product, its experts split over those ranks where 'expert' is above 1
+    (`enable_expert_parallel`), vLLM's one engine's way to spread an MoE's experts over GPUs."""
+    if not mesh:
+        return {}
+    if set(mesh) - {"tensor", "expert"}:
+        raise ValueError(f"vllm-engine runs a mesh of 'tensor' and 'expert' sizes, not {sorted(mesh)}")
+    expert = mesh.get("expert", 1)
+    return {"tensor_parallel_size": mesh.get("tensor", 1) * expert, "enable_expert_parallel": expert > 1}
+
+
 async def engine_points(args):
     """The same scheduler/stream clocks, without HTTP serialization. Output stays token ids, not text, as
-    Dew's and SGLang's do (`detokenize=False`)."""
+    Dew's and SGLang's do (`detokenize=False`). An engine over several GPUs starts its workers by
+    spawning them, as vLLM advises once the parent has touched CUDA, which forked workers cannot
+    initialize again."""
+    parallelism = vllm_parallelism(args.mesh)
+    if parallelism.get("tensor_parallel_size", 1) > 1:
+        os.environ.setdefault("VLLM_WORKER_MULTIPROC_METHOD", "spawn")
     from vllm import SamplingParams
     from vllm.engine.arg_utils import AsyncEngineArgs
     from vllm.inputs import TokensPrompt
@@ -353,7 +373,7 @@ async def engine_points(args):
     engine = AsyncLLM.from_engine_args(AsyncEngineArgs(
         model=args.model, dtype="bfloat16", max_model_len=args.prompt + args.output,
         max_num_seqs=max(args.slots), gpu_memory_utilization=0.90,
-        generation_config="vllm", enable_prefix_caching=False, disable_log_stats=True))
+        generation_config="vllm", enable_prefix_caching=False, disable_log_stats=True, **parallelism))
 
     async def streamed(prompt, output):
         """The time each of a request's tokens reached the client."""
@@ -426,8 +446,14 @@ def main():
     args.rate = [float(value) for value in args.rate.split(",") if value]
     if args.rate and args.backend == "vllm":
         parser.error("--rate runs Dew and the in-process engines")
-    if args.mesh is not None and args.backend != "dew":
-        parser.error("--mesh places Dew's weights; vLLM takes its own parallelism flags")
+    if args.mesh is not None and args.backend not in ("dew", "vllm-engine"):
+        parser.error("--mesh places Dew's weights, or sets vllm-engine's parallelism; a vLLM server "
+                     "takes its own flags")
+    if args.backend == "vllm-engine":
+        try:
+            vllm_parallelism(args.mesh)
+        except ValueError as error:
+            parser.error(str(error))
     if (min(args.slots) < 1 or min(args.prompt, args.output, args.repeats, args.profile_steps) < 1
             or args.requests < 0 or args.vocab_limit <= 100):
         parser.error("counts must be positive; --requests=0 chooses the default")

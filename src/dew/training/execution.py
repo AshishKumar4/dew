@@ -33,16 +33,8 @@ import jax
 import jax.numpy as jnp
 from jax.sharding import NamedSharding, PartitionSpec as P
 
-from dew.inference.banks import (
-    bank_sharding,
-    bank_sites,
-    entry_tree,
-    in_namespace,
-    layer_index,
-    narrowed,
-    one_layer,
-)
-from dew.nn.backbones.layer_plan import group_name
+from dew.inference.banks import bank_sharding, bank_sites, entry_tree, in_namespace, narrowed, one_layer
+from dew.nn.backbones.layer_plan import group_name, layer_index
 from dew.nn.kernels.options import compiler_options
 from dew.objectives.base import FROZEN, merge, thaw
 from dew.training.distributed import batch_shardings

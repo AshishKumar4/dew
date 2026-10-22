@@ -31,6 +31,7 @@ from dew.cache import persist_compilations
 from dew.coordination import agreed
 from dew.diffusion.block import BlockProcess, CanvasGeneration, refuse_non_denoiser
 from dew.diffusion.discrete import MDLM_STEPS, DiscreteProcess, Unmask, refuse_causal
+from dew.inference.projections import packed_owned
 from dew.interop.weights import decoding_storage
 from dew.nn.inputs import Media, ModelInputs, default_placement, mesh_of, request_key, token_id
 from dew.nn.protocols import Bounded, CacheCapacity, TokenModel
@@ -485,7 +486,9 @@ class _NativeTextTask:
             layout: Layout | None, dtype: DTypeLike | None, param_dtype: DTypeLike | None,
             trust: Sequence[str]) -> tuple[nn.Module, Variables, SettingsT, Processor | None]:
         """A run's model at `dtype`, as `checked` accepts it before any weight loads, its weights
-        as its objective restores them, its task settings, and its host processor."""
+        as its objective restores them, its task settings, and its host processor. The task owns
+        the weights it restored: their projections pack here, once, as a source's do at its load
+        (`dew.pipeline`), so every route reads the same packed weights."""
         from dew.registry import objectives
 
         record, exact = run_record(directory, step, trust)
@@ -495,7 +498,7 @@ class _NativeTextTask:
         checked(model, held)
         variables = objectives[named(record["objective"], "objective")]._saved_variables(
             directory, step=exact, ema=ema, mesh=mesh, layout=layout, param_dtype=param_dtype)
-        return model, variables, held, _saved_processor(held, config)
+        return model, packed_owned(model, variables), held, _saved_processor(held, config)
 
     @classmethod
     def from_pretrained(cls, repo_id: str, *, revision: str | None = None,
@@ -571,6 +574,11 @@ class TextGeneration(_NativeTextTask):
 
     model: nn.Module
     variables: Variables
+    """The weights generations read. A task loaded from a source (`dew.pipeline`) or a saved run
+    (`from_run`) holds them in the serving layout, its projections packed
+    (`dew.inference.projections`); one over a live objective's arrays holds those as they are. An
+    objective built over them, and an export of them, read the model's own tree
+    (`projections.unpacked`)."""
     processor: Processor | None = None
     sampling: Sampling = dataclasses.field(default_factory=Sampling)
     max_new_tokens: int | None = None

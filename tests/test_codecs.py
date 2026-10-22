@@ -15,7 +15,6 @@ real tensors of V4-Flash, V4-Flash-Base and V4.1-Flash at pinned commits.
 """
 
 import json
-import os
 import re
 import struct
 from pathlib import Path
@@ -457,10 +456,6 @@ def released_tensor(repo: str, name: str, rows: tuple[int, int] | None) -> np.nd
 
 
 @pytest.mark.network
-@pytest.mark.skipif(os.environ.get("DEW_NETWORK_TESTS") != "1",
-                    reason="reads six tensors of DeepSeek-V4-Flash, V4-Flash-Base and V4.1-Flash and their "
-                           "scales from the hub; "
-                           "DEW_NETWORK_TESTS=1 runs it")
 @pytest.mark.parametrize("repo, name, rows, block, fp4_experts", [
     ("deepseek-ai/DeepSeek-V4-Flash", "layers.0.attn.wkv.weight", None, 128, True),
     ("deepseek-ai/DeepSeek-V4-Flash", "layers.0.ffn.experts.0.w2.weight", None, 128, True),

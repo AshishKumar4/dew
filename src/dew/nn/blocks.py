@@ -16,7 +16,7 @@ from dew.nn.dense import Dense, DenseGeneral
 from .attention import GroupNorm, RMSNorm
 from .conv import Conv
 from .flops import projection_flops
-from .precision import at_least_fp32
+from .precision import at_least_fp32, float32_dot_general
 from .sharding import constrain, explicit_spec, rows_taken, whole_spec
 
 
@@ -90,7 +90,8 @@ def modulation(conditioning, features: int, pieces: int, *, name: str, silu: boo
     projects the conditioning as it is (FlaxDiff 0.2's DiT); `zero_init` starts it at zero,
     adaLN-Zero's identity block at the start of training."""
     return Dense(pieces * features, use_bias=bias, dtype=dtype, precision=precision, name=name,
-                 kernel_init=nn.initializers.zeros if zero_init else nn.initializers.lecun_normal())(
+                 kernel_init=nn.initializers.zeros if zero_init else nn.initializers.lecun_normal(),
+                 dot_general=float32_dot_general)(
         nn.silu(conditioning) if silu else conditioning)
 
 
@@ -213,7 +214,7 @@ class TimeProjection(nn.Module):
     @nn.compact
     def __call__(self, x):
         dense = partial(DenseGeneral, self.features,
-                        dtype=self.dtype, precision=self.precision)
+                        dtype=self.dtype, precision=self.precision, dot_general=float32_dot_general)
         x = self.activation(dense()(x))
         return self.activation(dense()(x))
 
@@ -379,7 +380,8 @@ class ResidualBlock(nn.Module):
         out = conv(name="conv1")(self.norm1(x))
 
         temb = DenseGeneral(features=self.features, name="temb_projection",
-                            dtype=self.dtype, precision=self.precision)(temb)
+                            dtype=self.dtype, precision=self.precision,
+                            dot_general=float32_dot_general)(temb)
         out = out + temb[:, None, None, :]
 
         out = self.norm2(out)

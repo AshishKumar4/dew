@@ -15,13 +15,12 @@ pinned commit against transformers over the same file.
 import os
 import sys
 
+import gguf
 import numpy as np
 import pytest
+import torch
 
 from dew.interop import Pretrained, gguf as dew_gguf
-
-gguf = pytest.importorskip("gguf")
-torch = pytest.importorskip("torch")
 
 HIDDEN, HEADS, KV_HEADS, FFN, LAYERS, VOCAB = 256, 4, 2, 256, 2, 256
 """Every matrix's row is 256 values wide, one K-quant super-block."""
@@ -303,21 +302,12 @@ PROMPTS = ("The Cascade Range runs from northern California through Oregon and W
 LOGITS = {"SmolLM2-135M-Instruct-Q8_0.gguf": 1.4e-4, "SmolLM2-135M-Instruct-Q4_K_M.gguf": 3.2e-4}
 
 
-def available(name: str) -> bool:
-    if os.environ.get("DEW_NETWORK_TESTS") == "1":
-        return True
-    from huggingface_hub import try_to_load_from_cache
-    return isinstance(try_to_load_from_cache(REPO, name, revision=REVISION), str)
-
-
 @pytest.mark.network
 @pytest.mark.parametrize("name", list(LOGITS))
 def test_released_gguf_logits_match_transformers(name):
     """Dew over the released file against transformers over the same file, fp32."""
     from transformers import AutoModelForCausalLM
 
-    if not available(name):
-        pytest.skip(f"{REPO}/{name} at {REVISION[:8]} is neither cached nor DEW_NETWORK_TESTS=1")
     pretrained = Pretrained.load(REPO, revision=REVISION, gguf_file=name, dtype="float32",
                                  attention_impl="reference", max_seq_len=64)
     reference = AutoModelForCausalLM.from_pretrained(REPO, revision=REVISION, gguf_file=name,

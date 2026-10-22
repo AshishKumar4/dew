@@ -265,12 +265,8 @@ def _qwen35_config(hf_config: Mapping[str, object], used: set[str]) -> DecoderFi
     config = _qwen_hybrid_config(hf_config, used, mixer={})
     # The reference's attention always chunks a doubled q_proj into the
     # query and a sigmoid gate on the branch (modeling_qwen3_5.py:644-646,
-    # 670-673, 701), whatever the config's attn_output_gate says. The
-    # field is read nowhere in transformers 5.16.1, so a config turning
-    # it off describes a model the reference cannot build.
-    if not hf_config.get('attn_output_gate', True):
-        refuse("attn_output_gate=False",
-                "Qwen3_5Attention always gates its output")
+    # 670-673, 701), whatever the config's attn_output_gate says: the field
+    # is read nowhere in transformers 5.16.1, so the gate is built either way.
     used.add('attn_output_gate')
     # Published checkpoints call the DeltaNet SiLU gate "swish". Full
     # attention always uses sigmoid; this field never changes that branch.

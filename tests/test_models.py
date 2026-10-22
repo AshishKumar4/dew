@@ -273,12 +273,13 @@ def test_strided_convolutions_keep_nested_vmap_and_its_vjp():
 
 @pytest.mark.parametrize("architecture, extra", [
     ("simple_dit", {}),
+    ("simple_dit", {"patch_bottleneck": 16}),
     ("hybrid_dit", {"ssm_attention_ratio": "all-attn"}),
     ("simple_mmdit", {}),
-], ids=["simple_dit", "hybrid_dit", "simple_mmdit"])
+], ids=["simple_dit", "simple_dit_bottleneck", "hybrid_dit", "simple_mmdit"])
 def test_a_scan_order_is_a_permutation_joint_attention_cannot_see(rng, architecture, extra):
-    """The hilbert and zigzag orders share one parameter tree (`hilbert_projection`
-    over raw patches) and differ only in the permutation the tokens travel in.
+    """The hilbert and zigzag orders share one parameter tree (the patch
+    embedding's) and differ only in the permutation the tokens travel in.
     Attention is permutation-equivariant and the MLP is per token, so on the
     same weights the two orders must agree once each is unpermuted back to the
     image: the sincos signal has to be permuted with the tokens, the rotation
@@ -340,13 +341,15 @@ def test_2d_fusion_convolves_the_grid_not_the_scan(rng, scan_order):
 
 
 def test_hilbert_patchify_roundtrip(rng):
-    """patchify returns patches in hilbert order plus the inverse permutation;
+    """Patches gathered into hilbert order come with the inverse permutation;
     unpatchify with that permutation must be an exact identity, on a grid
     that is not square and not a power of two on either side."""
-    from dew.nn.scan_orders import hilbert_patchify, hilbert_unpatchify
+    from dew.nn.dit import scan_ordered
+    from dew.nn.scan_orders import hilbert_unpatchify, patchify
 
     x = jax.random.normal(rng, (2, 12, 20, 3))
-    patches, inv_idx = hilbert_patchify(x, 4)
+    patches, inv_idx = scan_ordered(patchify(x, 4), "hilbert", 3, 5)
+    assert inv_idx is not None
     rec = hilbert_unpatchify(patches, inv_idx, 4, 12, 20, 3)
     assert jnp.array_equal(rec, x)
 
