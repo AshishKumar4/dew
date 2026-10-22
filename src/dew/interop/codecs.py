@@ -1035,15 +1035,23 @@ def _awq_encode(name: str, weight: np.ndarray, *, bits: int, group: int,
     return {stem + '.qweight': _words(packed, bits), stem + '.qzeros': packed_zeros, stem + '.scales': scales}
 
 
+def _packed_format(suffixes: tuple[str, ...], decode, encode, grid: Mapping[str, np.ndarray] | None,
+                   **settings) -> SourceQuantization:
+    """A packed integer format storing each `<m>.weight` as `<m>` with each of `suffixes`: the packed
+    codes first, then the grid (zeros, scales, ...) an encode reuses. `decode` and `encode` take the
+    format's `settings` (its bits, its group or its zero convention), the encode `grid` too."""
+    def stored(name: str) -> tuple[str, ...]:
+        return tuple(name.removesuffix('.weight') + suffix for suffix in suffixes)
+
+    return SourceQuantization(lambda tensors: _paired(tensors, suffixes, '.weight'), stored,
+                              partial(decode, **settings), partial(encode, **settings, grid=grid),
+                              grid=lambda name: stored(name)[1:])
+
+
 def awq(bits: int, group: int, grid: Mapping[str, np.ndarray] | None = None) -> SourceQuantization:
     """AutoAWQ's gemm packing: `<m>.qweight` int32 [in, out * bits / 32] in
     `AWQ_ORDER`, `<m>.qzeros` likewise per group, `<m>.scales` fp16 [in / group, out]."""
-    return SourceQuantization(
-        lambda tensors: _paired(tensors, AWQ_SUFFIXES, '.weight'),
-        lambda name: tuple(name.removesuffix('.weight') + suffix for suffix in AWQ_SUFFIXES),
-        partial(_awq_decode, bits=bits, group=group),
-        partial(_awq_encode, bits=bits, group=group, grid=grid),
-        grid=lambda name: tuple(name.removesuffix('.weight') + suffix for suffix in AWQ_SUFFIXES[1:]))
+    return _packed_format(AWQ_SUFFIXES, _awq_decode, _awq_encode, grid, bits=bits, group=group)
 
 
 _V1_ZERO_OFFSET = {2: 0x55555555, 4: 0x11111111, 8: 0x01010101}
@@ -1083,12 +1091,7 @@ def gptq(bits: int, *, v1: bool, grid: Mapping[str, np.ndarray] | None = None) -
     `<m>.qzeros` int32 [groups, out * bits / 32] (stored one below the zero in
     a v1 checkpoint), `<m>.scales` fp16 [groups, out] and `<m>.g_idx` [in],
     the group of each input, which act-order permutes."""
-    return SourceQuantization(
-        lambda tensors: _paired(tensors, GPTQ_SUFFIXES, '.weight'),
-        lambda name: tuple(name.removesuffix('.weight') + suffix for suffix in GPTQ_SUFFIXES),
-        partial(_gptq_decode, bits=bits, v1=v1),
-        partial(_gptq_encode, bits=bits, v1=v1, grid=grid),
-        grid=lambda name: tuple(name.removesuffix('.weight') + suffix for suffix in GPTQ_SUFFIXES[1:]))
+    return _packed_format(GPTQ_SUFFIXES, _gptq_decode, _gptq_encode, grid, bits=bits, v1=v1)
 
 
 def _integer_bits(quantization: Mapping[str, object], method: str) -> int:
