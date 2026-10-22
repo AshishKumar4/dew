@@ -79,6 +79,32 @@ def test_decisions_read_their_table_as_the_stages_before_them_make_it():
     assert [example.answers["team"] for example in examples] == ["a", "b", "a", "b"]
 
 
+class _ClassLabels(Memory):
+    """Memory rows whose store states its label column's class names, as a Hub ClassLabel does."""
+
+    names: tuple[str, ...] = ()
+
+    def metadata(self):
+        return {**super().metadata(), "class_names": {"label": list(self.names)}}
+
+
+def test_a_relabelled_table_reads_its_new_labels_not_the_store_s_class_names():
+    """The store's class names name the options where the stages before `decisions` keep its labels,
+    and a map that relabels the column is read from its rows instead."""
+    from dew.data.compile import iterate
+
+    rows = [{"text": f"ticket {index}", "label": index % 2} for index in range(4)]
+    store = _ClassLabels(rows, names=("billing", "technical"))
+
+    def options(chain):
+        examples = [row["example"] for row in iterate(chain.pipe(decisions, question="team"), read="memory")]
+        return list(examples[0].questions["team"].options), [example.answers["team"] for example in examples]
+
+    assert options(store) == (["billing", "technical"], [0, 1, 0, 1])
+    renamed = store.map(lambda row: {**row, "label": "xy"[row["label"]]})
+    assert options(renamed) == (["x", "y"], ["x", "y", "x", "y"])
+
+
 def test_a_decision_mixture_states_its_weights_and_the_manifest_that_made_it(tmp_path):
     """`mixture` mixes the corpora of a positive weight and states, through the chain's facts, the
     weights it mixes them by and the manifest it read, which a run's summary reports."""

@@ -81,6 +81,19 @@ def test_a_chains_settings_are_set_together():
     assert moved.data.facts()["fields"]["image"] == [128, 128, 3]
 
 
+def test_a_point_sets_a_runs_fields_and_its_chains_settings_together():
+    """A run's own fields and its chain's settings are one point, built once: audio conditioning and
+    clips that carry audio are valid only together, and a point that sets both reads as both."""
+    from dew.data import presets
+    from dew.objectives.diffusion import AudioCondition
+
+    clips = Files("clips", format="files").pipe(presets.clips, 2 / 25, frames=2, fps=25, size=8, batch=8)
+    audio = DiffusionRunConfig(text=None, audio=AudioCondition()).to_dict()["audio"]
+    moved = DiffusionRunConfig(data=clips).override({"text": None, "audio": audio,
+                                                     "data.clips.sample_rate": 16000})
+    assert moved.audio is not None and moved.data is not None and "audio" in moved.data.facts()["fields"]
+
+
 def test_a_python_run_whose_chain_is_unrecorded_trains_from_dew_train(tmp_path):
     """`dew train run.py` trains a run whose chain holds a step only Python has (a lambda) as the file
     built it, and its run.json says why it can't be rebuilt from the record."""

@@ -1035,15 +1035,16 @@ def _read_chain(name: str, written: object) -> Dataset | dict[str, Dataset] | No
     return splits
 
 
-def _overridden[C: "RunConfig"](config: C, point: Mapping[str, JSON]) -> C:
-    """`config` with the settings of its recorded chains in `point` set (`dew.data.records.override`):
-    each path is `data.<call>.<setting>`, or `validation[.<split>].<call>.<setting>`. A chain's
-    settings are set together on its record, then it is read back once, so settings valid only
-    together are one point."""
+def _overridden(chains: Mapping[str, object], point: Mapping[str, JSON]) -> dict[str, object]:
+    """A run's chain fields `chains` with the settings of their recorded chains in `point` set
+    (`dew.data.records.override`): each path is `data.<call>.<setting>`, or
+    `validation[.<split>].<call>.<setting>`. A chain's settings are set together on its record and it
+    is read back once, and no run is built here, so the caller builds the run once with every field
+    of the point in place."""
     targets: dict[tuple[str, str | None], dict[str, JSON]] = {}
     for path, value in point.items():
         name, _, rest = path.partition(".")
-        held = getattr(config, name)
+        held = chains[name]
         split = None
         if isinstance(held, Mapping):
             split, _, rest = rest.partition(".")
@@ -1052,14 +1053,14 @@ def _overridden[C: "RunConfig"](config: C, point: Mapping[str, JSON]) -> C:
         elif held is None:
             raise KeyError(f"{path} sets the run's {name}, which it does not hold")
         targets.setdefault((name, split), {})[rest] = value
-    changed: dict[str, Dataset | dict[str, Dataset]] = {}
+    changed = dict(chains)
     for (name, split), settings in targets.items():
-        held = changed.get(name, getattr(config, name))
+        held = changed[name]
         if isinstance(held, Mapping) and split is not None:
             changed[name] = {**held, split: _overridden_chain(f"{name}.{split}", held[split], settings)}
         elif isinstance(held, Dataset):
             changed[name] = _overridden_chain(name, held, settings)
-    return dataclasses.replace(config, **changed)
+    return changed
 
 
 def _overridden_chain(name: str, chain: Dataset, settings: Mapping[str, JSON]) -> Dataset:
@@ -1224,8 +1225,9 @@ class RunConfig:
             for group in groups:
                 node = _within(node, group)
             node[field] = value
-        built = dataclasses.replace(type(self).from_dict(record), data=self.data, validation=self.validation)
-        return _overridden(built, chained) if chained else built
+        chains = _overridden({name: getattr(self, name) for name in _CHAINS}, chained)
+        # Built once, every field of the point in place, so its checks read the run it describes.
+        return dataclasses.replace(type(self).from_dict(record), **chains)
 
     def assigned(self, assignments: Sequence[str]) -> Self:
         """This config with each `path=value` in `assignments` set (`override`).
