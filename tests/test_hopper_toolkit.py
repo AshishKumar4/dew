@@ -19,6 +19,8 @@ from dew.nn.kernels import generation
 from dew.nn.kernels.templates import hopper
 
 BLOCK = (64, 64)
+INTERPRETED = plgpu.InterpretGPUParams()
+"""Mosaic GPU's own interpreter, which models warpgroups, barriers and shared memory."""
 TILES = 3
 STAGES = 2
 
@@ -95,7 +97,7 @@ def test_a_ring_streams_tiles_of_their_own_trip_counts(consumers):
     tile sums exactly its own steps' blocks (sums of bf16 values, exact in fp32), one consumer or two
     sharing each slot and taking turns."""
     x = _stream()
-    summed = _ring_sums(x, interpret=True, consumers=consumers)
+    summed = _ring_sums(x, interpret=INTERPRETED, consumers=consumers)
     np.testing.assert_array_equal(np.asarray(summed), _expected(x))
 
 
@@ -112,7 +114,7 @@ def test_a_persistent_loop_walks_its_tiles_in_its_order():
             plgpu.wait_smem_to_gmem(0)
 
     out = plgpu.kernel(body, out_type=jax.ShapeDtypeStruct((TILES, 128), jnp.float32), grid=(1,),
-                       grid_names=("sm",), compiler_params=hopper.compiler_params(), interpret=True)()
+                       grid_names=("sm",), compiler_params=hopper.compiler_params(), interpret=INTERPRETED)()
     np.testing.assert_array_equal(np.asarray(out[:, 0]), np.arange(TILES)[::-1])
 
 
