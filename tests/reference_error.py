@@ -617,7 +617,7 @@ def _logged(label: str, stage: int, verdict: str) -> None:
                                   "label": label, "stage": stage, "verdict": verdict}) + "\n")
 
 
-def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn=None) -> None:
+def _assert_as_exact_declared(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn=None) -> None:
     """Check 1 of the owner's gate (bible §7): on par. Each leaf's RMS error from float64,
     pooled over the site's declared seeds, within PARITY times the reference's, and its worst row over
     those seeds within ROW_FACTOR times the reference's worst; each row of float64 zero (below RESOLUTION
@@ -1782,3 +1782,15 @@ def assert_rounds_where_the_reference_does(dew, reference, truth, label: str) ->
     assert within(apart, theirs / 4), (
         f"{label}: dew is {apart:.3e} from the reference (rms), whose own error is {theirs:.3e} "
         f"(ratio {apart / theirs:.2f}, allowed 0.25)")
+
+
+def assert_as_exact(dew_fn, reference_fn, draw, label, *, seeds, truth_fn=None, **options):
+    """Debug (not for landing): size the site, print it, then judge at the sized count."""
+    try:
+        count = seeds_for(reference_fn, draw, label, truth_fn=truth_fn)
+    except Exception as error:  # noqa: BLE001
+        print(f"UNSIZED {label!r} declared {seeds}: {type(error).__name__}: {str(error)[:120]}", flush=True)
+        count = seeds
+    print(f"SIZED {label!r} {count} (declared {seeds})", flush=True)
+    _assert_as_exact_declared(dew_fn, reference_fn, draw, label, seeds=count, truth_fn=truth_fn, **options)
+    print(f"PASSED {label!r}", flush=True)
