@@ -81,13 +81,25 @@ def seconds(cost: Cost, target: generation.GpuTarget) -> float:
         raise ValueError(f"{facts.generation} ({facts.device_kind}) states no "
                          f"{', '.join(name for name, value in named if value is None)}, "
                          "which the kernel cost model needs")
-    program = max(cost.program_flops / (rate * clock),
-                  cost.program_staged / (SHARED_BYTES_PER_CLOCK * clock),
-                  cost.program_exponentials / (EXPONENTIALS_PER_CLOCK * clock))
+    program = program_seconds(cost, rate, clock)
     latency = facts.load_latency
-    waiting = 0.0 if latency is None else cost.steps * latency / max(cost.stages - 1, 1) / clock
+    waiting = 0.0 if latency is None else waiting_seconds(cost, latency, clock)
     waves = math.ceil(cost.programs / (multiprocessors * cost.resident))
     return max(waves * max(cost.resident * program, waiting), cost.device_bytes / bandwidth)
+
+
+def program_seconds(cost: Cost, rate: float, clock: float) -> float:
+    """One program's service time on a multiprocessor: its tensor-core, shared-memory or special-function
+    work, whichever takes longest at `rate` tensor FLOPs a clock and `clock` Hz (the module's docstring)."""
+    return max(cost.program_flops / (rate * clock),
+               cost.program_staged / (SHARED_BYTES_PER_CLOCK * clock),
+               cost.program_exponentials / (EXPONENTIALS_PER_CLOCK * clock))
+
+
+def waiting_seconds(cost: Cost, latency: float, clock: float) -> float:
+    """The seconds a program's steps wait on loads `latency` clocks long, its stages in flight hiding
+    `stages - 1` steps of it (Little's law, the module's docstring)."""
+    return cost.steps * latency / max(cost.stages - 1, 1) / clock
 
 
 def resident(target: generation.GpuTarget, staged: int, threads: int, registers: int) -> int:
