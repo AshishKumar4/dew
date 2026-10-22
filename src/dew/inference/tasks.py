@@ -31,6 +31,7 @@ from dew.cache import persist_compilations
 from dew.coordination import agreed
 from dew.diffusion.block import BlockProcess, CanvasGeneration, refuse_non_denoiser
 from dew.diffusion.discrete import MDLM_STEPS, DiscreteProcess, Unmask, refuse_causal
+from dew.inference.banks import banked
 from dew.inference.projections import packed_owned
 from dew.interop.weights import decoding_storage
 from dew.nn.inputs import Media, ModelInputs, default_placement, mesh_of, request_key
@@ -413,8 +414,11 @@ def resident(model: nn.Module, variables: Variables) -> Variables:
     device as it is now (`jax.default_device`), so a later call made elsewhere runs where the
     weights are rather than moving them. A jax.Array stays where it is, a pinned-host bank's among
     them. A task's generations and a server's steps read their weights so, where a host leaf
-    would be copied to the device again at each call."""
-    stored = decoding_storage(model, variables)
+    would be copied to the device again at each call. A decoder that scans its layers reads each
+    run banked (`dew.inference.banks.banked`), stacked here once rather than on every call: host
+    layers stack on the host before they are placed, device layers on the device, beside the
+    caller's per-layer arrays (a caller that keeps its device tree holds the decoder twice)."""
+    stored = banked(model, decoding_storage(model, variables))
     mesh = mesh_of(stored)
     target = default_placement() if mesh is None else NamedSharding(mesh, P())
 

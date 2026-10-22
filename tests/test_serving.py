@@ -337,6 +337,46 @@ def test_a_server_compiles_its_decoding_step_once_and_each_admission_width_once(
         jax.monitoring.unregister_event_duration_listener(listener)
 
 
+@pytest.mark.parametrize("decode_steps", [1, 3])
+def test_a_scanned_decoder_serves_from_its_banks_what_each_request_draws_alone(decode_steps):
+    """A decoder that scans its layers is served from its banks (`dew.inference.banks.banked`): the
+    server's weights hold each run stacked once, its rows are the lone task calls' (whose generations
+    read the same banks), and a reload of the layers' own tree serves the reloaded weights."""
+    model = decoder().clone(num_layers=3, scan_layers=True, max_seq_len=128)
+    params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
+    bound = TextGeneration(model, params, RunProcessor(Digits()), sampling=Sampling(temperature=0))
+    assert "layers_0_2" in bound.placed["params"] and "layers_0" not in bound.placed["params"]
+    alone = [bound(prompt, budget, key=index)
+             for index, (prompt, budget) in enumerate(zip(PROMPTS, BUDGETS, strict=True))]
+    server, tickets = served_alongside(bound, decode_steps=decode_steps)
+    assert "layers_0_2" in server.variables["params"]
+    for ticket, lone in zip(tickets, [*alone, alone[2]], strict=True):
+        assert_same_generation(ticket.result(), lone)
+    other = model.init(jax.random.key(1), jnp.ones((1, 2), jnp.int32))
+    server.reload(other)
+    assert_same_generation(server(["12"], 6, key=3)[0], bound.bind(other)("12", 6, key=3))
+
+
+def test_a_scanned_decoder_reads_its_banks_without_stacking_its_weights_per_call():
+    """A scanned decoder over a banked store computes what it computes over its layers' own tree, bit
+    for bit, and its compiled call holds no stacked copy of the layers' weights among its
+    temporaries, which the per-layer tree costs it on every call (ledger 1342)."""
+    from dew.inference.banks import banked
+
+    model = decoder().clone(num_layers=4, scan_layers=True, emb_features=64, mlp_features=256, head_dim=32)
+    ids = jnp.ones((2, 8), jnp.int32)
+    layers = model.init(jax.random.key(0), ids)
+    banks = banked(model, layers)
+    assert "layers_0_3" in banks["params"] and "layers_0" not in banks["params"]
+    weights = sum(leaf.nbytes for name, tree in layers["params"].items() if name.startswith("layers_")
+                  for leaf in jax.tree.leaves(tree))
+    called = jax.jit(model.apply)
+    np.testing.assert_array_equal(called(banks, ids), called(layers, ids))
+    per_layer = called.lower(layers, ids).compile().memory_analysis()
+    stacked = called.lower(banks, ids).compile().memory_analysis()
+    assert per_layer.temp_size_in_bytes >= weights > stacked.temp_size_in_bytes
+
+
 def test_host_task_and_server_preserve_nonzero_lora_branches():
     from dew.lora import LoRA
 

@@ -30,11 +30,12 @@ from collections.abc import Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from pathlib import Path
 from types import MappingProxyType
-from typing import TYPE_CHECKING, Literal, Protocol
+from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+from flax import linen as nn
 from jax.experimental.layout import Format, Layout as DeviceLayout
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P, SingleDeviceSharding
 from jax.typing import DTypeLike
@@ -677,6 +678,7 @@ def _bank_placement(placement: Placement, shapes: Variables, stacked: bool) -> P
     return jax.tree.map(place, placement, shapes)
 
 
+@runtime_checkable
 class BankedModel(Protocol):
     @property
     def bank_sites(self) -> tuple[DecoderBank, ...]: ...
@@ -712,6 +714,68 @@ def bank_sites(model: BankedModel) -> tuple[DecoderBank, ...]:
     if any(right[:len(left)] == left for left, right in itertools.pairwise(ordered)):
         raise ValueError("declared decoder banks overlap in their canonical layer ownership")
     return tuple(owners.values())
+
+
+def banked(model: nn.Module, variables: Variables) -> Variables:
+    """`variables` with each scanned run of `model`'s decoder held as one bank (`layers_3_7`, every
+    layer stacked on a leading axis), where the model declares scanned runs (`BankedModel`), in every
+    collection but its cache; anything else as it is.
+
+    A scanned run reads its layers stacked (`dew.nn.backbones.decoder_stack.StackView`), so a store held
+    one subtree per layer is stacked on every call: a served MoE's decode step copied its decoder's
+    weights whole each step, at less than half the rate of the same model unrolled (ledger 1342).
+    Banked once, a call reads the bank where it is. A run's layers stack where they are held: host
+    leaves on the host, placed once at their row's sharding with the layer axis in front
+    (`bank_sharding`); device leaves on the device, each run its own program, so the stacking holds
+    one run beside the tree. The caller's per-layer arrays are not released: a caller that keeps its
+    own device tree holds the decoder twice, once per layer and once banked."""
+    if not isinstance(model, BankedModel) or not model.bank_sites:
+        return variables
+    sites = [site for site in bank_sites(model)
+             if site.scanned and any(count > 1 for _, count in site.view.groups)]
+    if not sites:
+        return variables
+    stored = {collection: dict(tree) for collection, tree in variables.items()}
+    for site in sites:
+        for collection, tree in stored.items():
+            if collection == "cache":
+                continue
+            node = tree
+            for component in site.namespace:
+                node = node.get(component) if isinstance(node, Mapping) else None
+            if not isinstance(node, Mapping):
+                continue
+            layers = dict(node)
+            for (first, count), name in zip(site.view.groups, site.view.bank_names(), strict=True):
+                rows = [f"layers_{index}" for index in range(first, first + count)]
+                if count == 1 or not all(row in layers for row in rows):
+                    continue
+                layers[name] = _stacked([layers.pop(row) for row in rows])
+            _set_namespace(tree, site.namespace, layers)
+    return stored
+
+
+def _stacked(rows: Sequence[Mapping]) -> Mapping:
+    """The layers' subtrees `rows` stacked on a new leading axis, each leaf where its rows are held."""
+    def stacked(*leaves):
+        if all(isinstance(leaf, (np.ndarray, np.generic)) for leaf in leaves):
+            return np.stack(leaves)
+        sharding = getattr(leaves[0], "sharding", None)
+        out = (bank_sharding(sharding, memory_kind=sharding.memory_kind)
+               if isinstance(sharding, NamedSharding) else None)
+        return jax.jit(lambda *rows: jnp.stack(rows), out_shardings=out)(*leaves)
+    return jax.tree.map(stacked, *rows)
+
+
+def _set_namespace(tree: dict, namespace: tuple[str, ...], value: Mapping) -> None:
+    """`tree` with the subtree at `namespace` replaced by `value`, every mapping on the way copied."""
+    if not namespace:
+        tree.clear()
+        tree.update(value)
+        return
+    child = dict(tree[namespace[0]])
+    _set_namespace(child, namespace[1:], value)
+    tree[namespace[0]] = child
 
 
 def entry_tree(variables: Variables, sites: Sequence[DecoderBank]) -> Variables:

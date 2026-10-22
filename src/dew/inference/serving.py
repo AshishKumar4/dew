@@ -80,6 +80,7 @@ from jax.experimental import checkify
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from jax.typing import ArrayLike
 
+from dew.inference.banks import banked, shape_rows, spread
 from dew.inference.pages import Pages
 from dew.inference.projections import pack_projections, packed_layout
 from dew.inference.serving_kernel import (
@@ -498,7 +499,10 @@ class Server:
         )
 
         with self._context():
-            groups, source_shapes = packed_layout(model, variables)
+            # The groups and the tree a reload takes are the layers' own, read off the banked store's
+            # shapes spread back over its layers, which costs nothing.
+            groups, source_shapes = packed_layout(model, spread(jax.eval_shape(lambda: variables),
+                                                                shape_rows))
             self._weight_groups.extend(groups)
             self._source_shapes = jax.tree_util.tree_flatten_with_path(source_shapes)[0]
             shapes = jax.eval_shape(functools.partial(opened, model, pad_id=self.pad_id, slots=slots,
@@ -698,7 +702,7 @@ class Server:
             incoming_structure, [jnp.asarray(np.asarray(new, dtype=old.dtype)
                                              if isinstance(new, np.ndarray) else new, dtype=old.dtype)
                                  for (_, new), (_, old) in zip(incoming, source, strict=True)])
-        packed = pack_projections(normalized, self._weight_groups)
+        packed = banked(self.model, pack_projections(normalized, self._weight_groups))
         incoming, _ = jax.tree_util.tree_flatten_with_path(packed)
         served, structure = jax.tree_util.tree_flatten_with_path(self.variables)
         leaves = []
