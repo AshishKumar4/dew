@@ -7,6 +7,7 @@ from shutil import copytree
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from interop_support import without_config_field
 
 from dew.interop import Pretrained
 
@@ -14,11 +15,7 @@ SOURCE = Path(__file__).parent / 'fixtures' / 'hf' / 'gemma4-native-tiny'
 
 
 def test_gemma4_wrapper_supplies_the_missing_nested_text_type(tmp_path):
-    checkpoint = tmp_path / 'raw-config'
-    copytree(SOURCE, checkpoint)
-    config = json.loads((checkpoint / 'config.json').read_text())
-    del config['text_config']['model_type']
-    (checkpoint / 'config.json').write_text(json.dumps(config))
+    checkpoint = without_config_field(SOURCE, tmp_path / 'raw-config', 'text_config', 'model_type')
     loaded = Pretrained.load(checkpoint, dtype='float32', attention_impl='reference')
     original = Pretrained.load(SOURCE, dtype='float32', attention_impl='reference')
     ids = jnp.asarray(np.load(SOURCE / 'input_ids.npy'))

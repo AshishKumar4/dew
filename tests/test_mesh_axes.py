@@ -20,7 +20,7 @@ from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec as P
 from model_support import TINY_DECODER
 from recording import RecordingTracker
 from sharded import assert_sharded
-from token_support import write_token_corpus
+from token_support import repeated_token_batch, write_token_corpus
 
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import Loader
@@ -495,10 +495,7 @@ def test_a_module_or_optimizer_group_named_frozen_keeps_its_split_under_frozen_w
 
 
 def token_batches():
-    rng = np.random.default_rng(0)
-    batch = {"text": rng.integers(0, VOCAB, size=(BATCH, SEQ_LEN + 1)).astype(np.int32)}
-    while True:
-        yield batch
+    return repeated_token_batch(VOCAB, BATCH, SEQ_LEN + 1)
 
 
 def run_losses(mesh, layout, steps, microbatches=None):

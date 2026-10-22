@@ -33,11 +33,12 @@ from ..hyper_connections import (
     collapse_by,
     mix_streams,
 )
-from ..inputs import LayerInputs, MixerCall, PredictionPhase
+from ..inputs import LayerInputs, MixerCall, PredictionPhase, routing_blocks
 from ..kernels.recurrence_chunk import recomputing
+from ..mixer_base import ATTENTION_RESIDUALS, MLP_RESIDUALS, QKV_RESIDUALS, RESIDUALS
 from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, SparseMLP
 from ..ngpt import NGPT, stepped
-from ..precision import scaled
+from ..precision import float32_dot_general, scaled
 from ..protocols import ProjectionGroup, RoutesExperts, declared_groups
 from ..sharding import RESIDUAL, constrain, logical_axes
 
@@ -141,6 +142,8 @@ class Mixture:
     mesh axis that divides the expert count. `hash_layers` route by DeepSeek
     V4's token table, `latent_features` gives Kimi K3's latent MoE, and
     `media_bias` is DeepSeek-V4.1's image-span bias (`SparseMLP`, `Router`).
+    `bias_in_weights` gates on the balancing bias as LLaDA-MoE does, and
+    `routing_block` with `block_experts` is LLaDA2.2's block routing.
     """
 
     experts: int
@@ -153,6 +156,9 @@ class Mixture:
     groups_per_token: int = 1
     group_score: str = 'top2'
     bias: bool = False
+    bias_in_weights: bool = False
+    routing_block: int | None = None
+    block_experts: int | None = None
     scale_inputs: bool = False
     parallel: bool = False
     expert_features: int | None = None
@@ -171,10 +177,10 @@ class Mixture:
             object.__setattr__(self, "layers", tuple(self.layers))
         if self.hash_layers is not None:
             object.__setattr__(self, "hash_layers", tuple(int(index) for index in self.hash_layers))
-            if self.groups != 1 or self.parallel:
+            if self.groups != 1 or self.parallel or self.routing_block is not None:
                 raise ValueError(
                     "hash routing selects by the token table alone, so it has no "
-                    "expert groups and is not Gemma 4's parallel branch")
+                    "expert groups, no routing blocks and is not Gemma 4's parallel branch")
         if self.experts < 1:
             raise ValueError(
                 f"a mixture needs experts to route to, got {self.experts}; a "
@@ -201,13 +207,19 @@ class Mixture:
             raise ValueError(
                 f"capacity_factor scales each expert's share of a sequence, so it is "
                 f"positive, got {self.capacity_factor}; None keeps every slot")
+        if self.bias_in_weights and not self.bias:
+            raise ValueError("bias_in_weights gates on the balancing bias, which bias holds")
+        if (self.routing_block is None) != (self.block_experts is None):
+            raise ValueError("block routing names its block of tokens and the experts a block may use, "
+                             f"got routing_block={self.routing_block} and block_experts={self.block_experts}")
         if self.parallel and (
                 self.score_function != 'softmax' or not self.norm_topk_prob
                 or self.scaling != 1.0 or self.groups != 1 or self.bias
+                or self.bias_in_weights or self.routing_block is not None
                 or self.scale_inputs or self.shared_features or self.latent_features is not None):
             raise ValueError(
                 "a parallel mixture routes with Gemma 4's router, which has no "
-                "score function, scaling, groups, balancing bias, input scaling "
+                "score function, scaling, groups, balancing bias, routing blocks, input scaling "
                 "or shared branch to set")
 
     @property
@@ -225,6 +237,11 @@ class Mixture:
         `dew.inference.serving.Server` step runs the model before it draws, so
         it serves the exchange; `dispatch='global'` computes the same layer.
         This refusal goes once a jax release carries the fix."""
+        if self.routing_block is not None:
+            return ("block routing chooses each block's experts from every token in it, which a cached "
+                    "decode step, holding one token of its block, cannot: the step's routing would differ "
+                    "from the full forward's. Generate by refining whole sequences (dew.diffusion.discrete) "
+                    "or route without blocks")
         if self.dispatch != 'exchange':
             return None
         return ("generation cannot run dispatch='exchange' until jax fixes jax-ml/jax#40907: checkify, "
@@ -248,7 +265,8 @@ class Mixture:
             # GPT OSS's experts and router are its own: a knob they do not read is refused.
             plain = Mixture(experts=self.experts, top_k=self.top_k)
             ignored = [name for name in ('score_function', 'norm_topk_prob', 'scaling', 'groups',
-                                         'groups_per_token', 'group_score', 'bias', 'scale_inputs',
+                                         'groups_per_token', 'group_score', 'bias', 'bias_in_weights',
+                                         'routing_block', 'block_experts', 'scale_inputs',
                                          'parallel', 'expert_features', 'shared_features', 'hash_layers',
                                          'latent_features', 'latent_norm', 'media_bias')
                        if getattr(self, name) != getattr(plain, name)]
@@ -276,7 +294,9 @@ class Mixture:
             score_function=self.score_function, normalize_weights=self.norm_topk_prob,
             routed_scaling_factor=self.scaling, expert_groups=self.groups,
             groups_per_token=self.groups_per_token,
-            group_score=self.group_score, expert_bias=self.bias, media_bias=self.media_bias,
+            group_score=self.group_score, expert_bias=self.bias, bias_in_weights=self.bias_in_weights,
+            media_bias=self.media_bias, routing_block=self.routing_block,
+            block_experts=self.block_experts,
             scale_inputs=self.scale_inputs, swiglu_limit=swiglu_limit,
             shared=None if not self.shared_features else functools.partial(
                 dense, hidden_features=self.shared_features),
@@ -322,23 +342,6 @@ class BlockWiring:
                              "norms, parallel residual or layer scalar")
         if self.layer_scalar not in (None, "frozen", "trainable"):
             raise ValueError("layer_scalar must be None, frozen or trainable")
-
-
-QKV_RESIDUALS = ('q_proj', 'k_proj', 'v_proj', 'kv_proj')
-ATTENTION_RESIDUALS = (*QKV_RESIDUALS, 'o_proj')
-MLP_RESIDUALS = ('gate_proj', 'up_proj', 'down_proj')
-DELTA_RESIDUALS = ('delta_decay', 'delta_inverse', 'delta_memory')
-RESIDUALS = (*ATTENTION_RESIDUALS, 'context', 'conv', *DELTA_RESIDUALS, *MLP_RESIDUALS)
-"""The values a block names as it runs, each after the projection that
-produced it: `kv_proj` is latent attention's fused `kv_b_proj`, `context`
-the attention kernel's or the gated delta rule's output before `o_proj`,
-`conv` a linear-attention or SSM mixer's short conv output (`causal_conv1d`,
-its queries, keys and values for a delta rule), `delta_decay`,
-`delta_inverse` and `delta_memory` the rule's cumulated decay, chunk inverse
-and memory (with `w` and the corrected values) the port saves for its
-backward (`dew.nn.kernels.fla_gdn`), and the MLP names cover the dense MLP
-and the routed experts alike. A remat policy picks from these; a
-name off the list is a typo that would otherwise recompute silently."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -670,7 +673,8 @@ class DecoderBlock(nn.Module):
             self.output_scalar = self.param("layer_scalar", nn.initializers.ones, (1,), jnp.float32)
         if self.per_layer_input_dim:
             dense = functools.partial(
-                Dense, use_bias=False, dtype=self.dtype, precision=self.precision)
+                Dense, use_bias=False, dtype=self.dtype, precision=self.precision,
+                dot_general=float32_dot_general)
             self.per_layer_input_gate = dense(projections['per_layer_input_gate'][1],
                                               name='per_layer_input_gate')
             self.per_layer_projection = dense(projections['per_layer_projection'][1],
@@ -824,7 +828,7 @@ class DecoderBlock(nn.Module):
                 mlp_input = (normed if self.wiring.shared_parallel_norm else
                              self.post_attention_layernorm(read) if self.wiring.pre_norms else read)
             hidden = self.mlp(mlp_input,
-                              **self._feedforward_inputs(attention_metadata),
+                              **self._feedforward_inputs(attention_metadata, mlp_input.shape),
                               **({} if self.parallel is not None else routes),
                               **({"train": train} if isinstance(self.mlp, ReadsTrain) and self.mlp.reads_train
                                  else {}))
@@ -947,7 +951,10 @@ class DecoderBlock(nn.Module):
         """The state after the sublayer at `site` adds `output` to it."""
         if isinstance(state, _Plain) and self.wiring.ngpt is not None:
             alpha = self.attn_alpha if site == "attention" else self.mlp_alpha
-            stepped_x = stepped(state.x, output, alpha, self.wiring.ngpt.step)
+            # The stepped residual is a fusion boundary. Every later sublayer reads it, and without one
+            # XLA's GPU priority fusion clones each earlier sublayer's normalization into every later one:
+            # 556 of a 72-layer Dory prefill's 664 s compile on an A100 (ledger 635).
+            stepped_x = jax.lax.optimization_barrier(stepped(state.x, output, alpha, self.wiring.ngpt.step))
             return state._replace(x=constrain(stepped_x, RESIDUAL))
         if isinstance(state, _Plain):
             return state._replace(x=constrain(state.x + output, RESIDUAL))
@@ -1026,10 +1033,14 @@ class DecoderBlock(nn.Module):
             **({} if prediction_phase == "ordinary" else {"prediction_phase": prediction_phase}),
         )
 
-    def _feedforward_inputs(self, attention_metadata) -> dict:
+    def _feedforward_inputs(self, attention_metadata, shape: tuple[int, ...]) -> dict:
         """The token ids for a hash-routed feed-forward, the media mask, when
-        the call has one, for one that routes a media span apart, nothing for
-        the rest."""
+        the call has one, for one that routes a media span apart, each token's
+        block (`routing_blocks`, over the call's `shape[:2]`) for one that
+        routes blocks together, nothing for the rest."""
+        blocked = routing_blocks(self.mlp, attention_metadata, shape)
+        if blocked:
+            return blocked
         if self.media_routed:
             media = None if attention_metadata is None else attention_metadata.media
             return {} if media is None else {"media": media}
@@ -1141,7 +1152,7 @@ class MTPBlock(nn.Module):
         maps = self.projections()
         def dense(name):
             return Dense(maps[name][1], use_bias=False, dtype=self.dtype,
-                         precision=self.precision, name=name)
+                         precision=self.precision, name=name, dot_general=float32_dot_general)
         if self.hyper_connections is None:
             self.eh_proj = dense('eh_proj')
         else:

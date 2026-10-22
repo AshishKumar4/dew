@@ -8,8 +8,10 @@ objective and the data it names, and pass both to `RunConfig.train`, so
 The model is its class and the fields the run gives it: `--model
 hybrid_dit` (an alias or an import path) picks the class, and each of its
 own fields is a flag typed by its annotation (`--model.num_layers 12`,
-`--model.dtype bfloat16`). A dataset is the spec itself, which tyro turns
-into a subcommand over the aliased specs (`data:token-windows --data.path ...`).
+`--model.dtype bfloat16`). The data is a chain (`dew.data`), which the record writes through
+the data's codec (`dew.data.records`) and the command line sets one setting of at a time:
+`--set data.<call>.<setting>=...` for a call's (`data.token_windows.seq_len=512`) and
+`--set data.source.<field>=...` for its store's.
 
 The resolved config is the run's spec. A recipe writes it to `run.json` next
 to the checkpoints with `save`, and `load` reads it back into the same class,
@@ -980,13 +982,25 @@ _CHAINS = ("data", "validation")
 
 def _chain_record(value: Dataset | Mapping[str, Dataset] | None) -> JSON:
     """The record of a chain field: a chain's record (`dew.data.records.encode`), `{"unrecorded":
-    reason}` where the codec cannot describe it, one a name for named splits, or None."""
+    reason}` where the codec cannot describe it, `{"splits": [[name, record], ...]}` for named splits
+    in their order (the first is the one a run ranks and calibrates on, which a sorted JSON object
+    would not keep), or None."""
     if value is None:
         return None
     if isinstance(value, Mapping):
-        return {name: _chain_record(split) for name, split in value.items()}
+        return {"splits": [[name, _chain_record(split)] for name, split in value.items()]}
     encoded = records.encode(value)
     return {"unrecorded": encoded.reason} if isinstance(encoded, records.Unrecorded) else encoded
+
+
+def _unrecorded(value: Dataset | Mapping[str, Dataset] | None) -> list[str]:
+    """Why each chain of a chain field is not recorded (`_chain_record`), none where all are."""
+    if value is None:
+        return []
+    if isinstance(value, Mapping):
+        return [reason for split in value.values() for reason in _unrecorded(split)]
+    encoded = records.encode(value)
+    return [encoded.reason] if isinstance(encoded, records.Unrecorded) else []
 
 
 def _read_chain(name: str, written: object) -> Dataset | dict[str, Dataset] | None:
@@ -1006,31 +1020,57 @@ def _read_chain(name: str, written: object) -> Dataset | dict[str, Dataset] | No
                          "(`dew.data.presets`) and train a new run")
     if "version" in written:
         return records.decode(written)
-    return {split: chain for split, value in written.items()
-            if (chain := _read_chain(f"{name}.{split}", value)) is not None and isinstance(chain, Dataset)}
+    if "splits" not in written:
+        raise ValueError(f"run.json's {name} is no chain's record and no named splits: {sorted(written)}")
+    pairs = written["splits"]
+    if not isinstance(pairs, list) or not all(isinstance(pair, list) and len(pair) == 2
+                                              and isinstance(pair[0], str) for pair in pairs):
+        raise ValueError(f"run.json's {name}.splits is {pairs!r}, not a list of [name, chain] pairs")
+    splits = {}
+    for split, value in pairs:
+        chain = _read_chain(f"{name}.{split}", value)
+        if not isinstance(chain, Dataset):
+            raise ValueError(f"run.json's {name}.{split} is no chain's record")
+        splits[split] = chain
+    return splits
 
 
-def _overridden[C: "RunConfig"](config: C, path: str, value: JSON) -> C:
-    """`config` with one setting of a recorded chain set (`dew.data.records.override`): `path` is
-    `data.<call>.<setting>`, or `validation[.<split>].<call>.<setting>`."""
-    name, _, rest = path.partition(".")
-    held = getattr(config, name)
-    if isinstance(held, Mapping):
-        split, _, rest = rest.partition(".")
-        if split not in held:
-            raise KeyError(f"{path} names no split of the run's {name}")
-        return dataclasses.replace(config, **{name: {**held, split: _overridden_chain(path, held[split], rest,
-                                                                                    value)}})
-    if held is None:
-        raise KeyError(f"{path} sets the run's {name}, which it does not hold")
-    return dataclasses.replace(config, **{name: _overridden_chain(path, held, rest, value)})
+def _overridden(chains: Mapping[str, object], point: Mapping[str, JSON]) -> Mapping[str, object]:
+    """A run's chain fields `chains` with the settings of their recorded chains in `point` set
+    (`dew.data.records.override`): each path is `data.<call>.<setting>`, or
+    `validation[.<split>].<call>.<setting>`. A chain's settings are set together on its record and it
+    is read back once, and no run is built here, so the caller builds the run once with every field
+    of the point in place."""
+    targets: dict[tuple[str, str | None], dict[str, JSON]] = {}
+    for path, value in point.items():
+        name, _, rest = path.partition(".")
+        held = chains[name]
+        split = None
+        if isinstance(held, Mapping):
+            split, _, rest = rest.partition(".")
+            if split not in held:
+                raise KeyError(f"{path} names no split of the run's {name}")
+        elif held is None:
+            raise KeyError(f"{path} sets the run's {name}, which it does not hold")
+        targets.setdefault((name, split), {})[rest] = value
+    changed = dict(chains)
+    for (name, split), settings in targets.items():
+        held = changed[name]
+        if isinstance(held, Mapping) and split is not None:
+            changed[name] = {**held, split: _overridden_chain(f"{name}.{split}", held[split], settings)}
+        elif isinstance(held, Dataset):
+            changed[name] = _overridden_chain(name, held, settings)
+    return changed
 
 
-def _overridden_chain(path: str, chain: Dataset, setting: str, value: JSON) -> Dataset:
+def _overridden_chain(name: str, chain: Dataset, settings: Mapping[str, JSON]) -> Dataset:
     encoded = records.encode(chain)
     if isinstance(encoded, records.Unrecorded):
-        raise ValueError(f"{path} sets a chain that was not recorded ({encoded.reason}); set it in Python")
-    return records.decode(records.override(encoded, setting, value))
+        raise ValueError(f"{name}'s settings set a chain that was not recorded ({encoded.reason}); set it in "
+                         "Python")
+    for setting, value in settings.items():
+        encoded = records.override(encoded, setting, value)
+    return records.decode(encoded)
 
 
 def _flag_json_or_text(text: str) -> JSON:
@@ -1138,10 +1178,20 @@ class RunConfig:
         their chains' records (`dew.data.records.encode`), and a chain the
         codec cannot describe is `{"unrecorded": reason}`.
         """
+        return {**self._fields_record(), **{name: _chain_record(getattr(self, name)) for name in _CHAINS}}
+
+    def unrecorded(self) -> list[str]:
+        """Why each of the run's chains is not recorded, none where its record can rebuild them all:
+        a run built in Python with a step the record cannot describe trains as built, and its
+        run.json, which says why, refuses to rebuild it."""
+        return [reason for name in _CHAINS for reason in _unrecorded(getattr(self, name))]
+
+    def _fields_record(self) -> dict[str, JSON]:
+        """The record of every field but the chains (`to_dict`), which an override of the others
+        writes without encoding the chains."""
         with registry.recording():
-            written = {field.name: to_record(getattr(self, field.name), declared_type(type(self), field.name))
-                       for field in dataclasses.fields(self) if field.name not in _CHAINS}
-        return {**written, **{name: _chain_record(getattr(self, name)) for name in _CHAINS}}
+            return {field.name: to_record(getattr(self, field.name), declared_type(type(self), field.name))
+                    for field in dataclasses.fields(self) if field.name not in _CHAINS}
 
     @classmethod
     def from_dict(cls, values: Mapping[str, object]) -> Self:
@@ -1166,7 +1216,7 @@ class RunConfig:
         under `model` names an argument of the model this config holds.
         """
         chained = {path: value for path, value in point.items() if path.partition(".")[0] in _CHAINS}
-        record = {name: value for name, value in self.to_dict().items() if name not in _CHAINS}
+        record = self._fields_record()
         for path, value in point.items():
             if path in chained:
                 continue
@@ -1175,10 +1225,9 @@ class RunConfig:
             for group in groups:
                 node = _within(node, group)
             node[field] = value
-        built = dataclasses.replace(type(self).from_dict(record), data=self.data, validation=self.validation)
-        for path, value in chained.items():
-            built = _overridden(built, path, value)
-        return built
+        chains = _overridden({name: getattr(self, name) for name in _CHAINS}, chained)
+        # Built once, every field of the point in place, so its checks read the run it describes.
+        return dataclasses.replace(type(self).from_dict(record), **chains)
 
     def assigned(self, assignments: Sequence[str]) -> Self:
         """This config with each `path=value` in `assignments` set (`override`).

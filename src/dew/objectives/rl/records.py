@@ -1,33 +1,15 @@
 """JSON-compatible episode records for interchange and turn-boundary recovery."""
 
-import math
-from collections.abc import Callable, Mapping
+import functools
+from collections.abc import Mapping
 
-from dew.records import JSON, integer, integers, record as section, text
+from dew.records import finite, integer, integers, listed, record as section, text
 from dew.sampling.text import Sampling
 
 from .episodes import Action, Episode, EpisodeId, EpisodeStatus, Observation, Transition
 
-
-def sequence[ItemT](value: object, read: Callable[[JSON], ItemT], key: str) -> tuple[ItemT, ...]:
-    """Read every entry of a JSON array, each one through `read`."""
-    if not isinstance(value, (list, tuple)):
-        raise ValueError(f"{key}={value!r}: this field is a list")
-    return tuple(read(entry) for entry in value)
-
-
-def real(value: object, key: str) -> float:
-    """One score or likelihood, finite as no non-finite one is recorded."""
-    if not isinstance(value, (float, int)) or isinstance(value, bool) or not math.isfinite(value):
-        raise ValueError(f"{key}={value!r}: this field is a finite number")
-    return float(value)
-
-
-def reals(value: object, key: str) -> tuple[float, ...]:
-    """One list of finite numbers: a row's likelihoods."""
-    if not isinstance(value, (list, tuple)):
-        raise ValueError(f"{key}={value!r}: this field is a list of finite numbers")
-    return tuple(real(entry, key) for entry in value)
+reals = functools.partial(listed, read=finite, what="a list of finite numbers")
+"""One list of finite numbers: a row's likelihoods (`listed`)."""
 
 
 def observation_record(value: Mapping[str, object]) -> Observation:
@@ -35,15 +17,12 @@ def observation_record(value: Mapping[str, object]) -> Observation:
     reward = record["reward"]
     return Observation(integers(record["context"], "context"),
                        EpisodeStatus(integer(record["status"], "status")), text(record["detail"], "detail"),
-                       None if reward is None else real(reward, "reward"),
+                       None if reward is None else finite(reward, "reward"),
                        messages(record["messages"], "messages"))
 
 
-def messages(value: object, key: str) -> tuple[Mapping[str, object], ...]:
-    """A list of chat messages, each a JSON object, kept as written."""
-    if not isinstance(value, (list, tuple)):
-        raise ValueError(f"{key}={value!r}: this field is a list of chat messages")
-    return tuple(section(message, key) for message in value)
+messages = functools.partial(listed, read=section, what="a list of chat messages")
+"""A list of chat messages, each a JSON object, kept as written (`listed`)."""
 
 
 def action_record(value: Mapping[str, object]) -> Action:
@@ -69,12 +48,12 @@ def episode_from_record(value: Mapping[str, object]) -> Episode:
     transitions = tuple(
         Transition(action_record(section(turn["action"], "action")),
                    observation_record(section(turn["observation"], "observation")))
-        for turn in sequence(record["transitions"], lambda turn: section(turn, "transition"), "transitions"))
+        for turn in listed(record["transitions"], "transitions", read=section, what="a list of transitions"))
     return Episode(EpisodeId(integer(identity["task"], "task"), integer(identity["attempt"], "attempt"),
                              integer(identity["sample"], "sample"), integers(identity["seed"], "seed")),
                    integer(record["policy_step"], "policy_step"),
                    None if initial is None else observation_record(section(initial, "initial")),
                    transitions, EpisodeStatus(integer(record["status"], "status")),
                    text(record["detail"], "detail"),
-                   None if reward is None else real(reward, "reward"),
+                   None if reward is None else finite(reward, "reward"),
                    _binding_id=text(record["_binding_id"], "_binding_id"))

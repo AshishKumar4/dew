@@ -44,6 +44,20 @@ def test_rigel_leading_empty_phases_take_the_first_available_mixture():
         rigel.schedule({"unknown": "data/unknown"}, 7_250)
 
 
+def test_the_recipes_default_chain_trains_an_epoch_of_another_store(tmp_path):
+    """recipes/lm/train.py's default chain, pointed at another store with `--set`, trains by epochs:
+    its windows are read by index and ordered after, so the run knows an epoch's length. 40 x SEQ
+    tokens are 39 windows of SEQ inputs and their targets, four batches of eight."""
+    recipe = load("train", "recipes/lm")
+    tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ)
+    config = LMRunConfig.cli(recipe_args(
+        tokens, "--set", f"data.source.url={tokens.train}", "--set", f"data.token_windows.seq_len={SEQ}",
+        "--set", "data.token_windows.batch=8", "--trainer.epochs", "1", "--trainer.name", "default",
+        "--max-new-tokens", "0", model_config='{"emb_features": 16, "num_layers": 1, "num_heads": 2}'),
+        default=LMRunConfig(data=recipe.WINDOWS))
+    assert int(config.run().step) == 4
+
+
 # The committed byte-level BPE a run can train with offline.
 def write_token_files(root, train_tokens, val_tokens, tokenizer="byte", eos_id=None):
     rng = np.random.RandomState(0)

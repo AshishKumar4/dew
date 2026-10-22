@@ -14,7 +14,7 @@ import numpy as np
 import pytest
 from affine_run import dataset, frozen_trainer, raw_leaf
 from recording import RecordingTracker
-from rl_support import TinyHead
+from rl_support import TinyHead, padded_text
 
 from dew.objectives.lm import LMObjective
 from dew.objectives.rl import SampledRollout
@@ -140,8 +140,7 @@ def prompt_batch(rows=2):
     prompts[1] = [2, 3, 4, 5, 6, 7, 1, 2]
     info = max(len("rule"), len("other"), 1)
     def pad(text):
-        return np.pad(
-            np.frombuffer(text.encode(), np.uint8).astype(np.int32), (0, info - len(text)))
+        return padded_text(text, info)
     return {
         "prompt": prompts,
         "prompt_length": np.full(rows, width, np.int32),
@@ -277,3 +276,26 @@ def test_each_estimator_turns_the_calls_rewards_into_the_packed_advantages(estim
     assert all(np.count_nonzero(group) >= 2 for group in expected.reshape(-1, groups))
     for index, chain in chains(out).items():
         np.testing.assert_allclose(chain["advantages"], expected[index], rtol=1e-5)
+
+
+def test_a_draw_is_scored_by_any_finite_reward_float_takes():
+    """A reward may be a verifier's bool or a NumPy or JAX scalar, as `float` takes it; a non-finite
+    one is refused, and a reward whose external boundary failed leaves an INFRA_ERROR session."""
+    import jax.numpy as jnp
+
+    from dew.data.prompts import PromptRecord
+    from dew.objectives.rl.rollout import drawn_call, scored_draw
+    from dew.objectives.rl.sessions import Status
+
+    call = drawn_call([1, 2], [3, 4], [-0.5, -0.25], terminated=True, version=0)
+    record = PromptRecord("rule", "1", "")
+    for reward, expected in ((True, 1.0), (np.float32(0.5), 0.5), (jnp.asarray(2.0), 2.0)):
+        session = scored_draw("task", 0, call, "text", record, lambda text, record, reward=reward: reward)
+        assert session.status is Status.COMPLETED and session.reward == expected
+    with pytest.raises(ValueError):
+        scored_draw("task", 0, call, "text", record, lambda text, record: float("nan"))
+
+    def unreachable(text, record):
+        raise OSError("the verifier service is down")
+
+    assert scored_draw("task", 0, call, "text", record, unreachable).status is Status.INFRA_ERROR
