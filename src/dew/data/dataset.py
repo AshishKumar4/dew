@@ -116,6 +116,26 @@ class DataPartition:
         """
         return dataclasses.replace(_partition(mesh, batch_axes(mesh)), window=window)
 
+    def held(self, rows: int, offset: int = 0) -> tuple[slice, bool]:
+        """Which of `rows` rows a validation read of this share holds, and whether they are real:
+        every count-th from its index, `offset` places on as a resume's count inside a batch leaves
+        it (`GlobalStream`); where that holds none of rows that hold some, the first in their place,
+        not real (`FilledBatch` marks them so), so every share reads a batch where any does and
+        none scores another's row."""
+        mine = self.cut(offset)
+        if rows and not range(rows)[mine]:
+            return slice(1), False
+        return mine, True
+
+    def cut(self, offset: int = 0) -> slice:
+        """This share's rows of an order or a batch: every count-th from its first (`first`)."""
+        return slice(self.first(offset), None, self.count)
+
+    def first(self, offset: int = 0) -> int:
+        """This share's first row of an order or a batch: its index, `offset` places on as a resume's
+        count inside a batch leaves it (`GlobalStream`)."""
+        return (self.index + offset) % self.count
+
     def rows(self, batch: int) -> int:
         """Return how many rows of a `batch`-row global batch one share holds.
 
