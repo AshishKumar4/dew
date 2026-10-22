@@ -1176,7 +1176,7 @@ def test_an_objectives_record_steps_read_as_the_verbs_that_name_what_they_are(re
     """An objective's record steps, a dropping one, an expanding one and a drawing one, train on what
     the verbs for what they are, `filter_map`, `flat_map` and `random_map`, make of the records."""
     from dew.data.pipeline import Pipeline
-    from dew.objectives.base import ObjectiveData
+    from dew.data.pipeline import ObjectiveData
 
     rows = Pipeline(Memory([{"id": index} for index in range(16)]))
     steps = (_Dropping(), _Doubled(), _Noised())
