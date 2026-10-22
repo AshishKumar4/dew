@@ -226,7 +226,7 @@ def test_the_layer_gradients_match_the_oracle():
 
 
 BOUND = 1e-4
-"""The retiring site's bound (`test_default_eps_gradients_hold_their_prior_bound`), its gradients'
+"""The existing bound (`test_default_eps_gradients_hold_their_prior_bound`), its gradients'
 largest error over their largest value."""
 
 
@@ -235,7 +235,7 @@ def scaled(actual, wanted) -> float:
 
 
 def test_default_eps_gradients_hold_their_prior_bound():
-    """A retiring site (ledger row 1343): at the gated norm's own eps 1e-5, a gradient through the norm
+    """An existing bound (ledger row 1348): at the gated norm's own eps 1e-5, a gradient through the norm
     of a near-zero row errs as the row's inverse square, a tail check 1 cannot resolve, so the layer's
     gradients there keep the prior bound, their largest error within BOUND of their largest value from
     the transcription's float64 gradients (its autodiff, where central differences were), until the
