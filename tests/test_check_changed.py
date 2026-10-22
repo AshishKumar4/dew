@@ -28,7 +28,7 @@ def git(root: Path, *arguments: str) -> None:
 
 def checkout(tmp_path: Path) -> Path:
     """A checkout whose main holds one test comparing floats within a tolerance, held by the inventory, with
-    main as origin/main, so tools/base_history.sh fetches nothing."""
+    main as origin/main, so tools/base_history.sh fetches nothing, and a head branch checked out."""
     root = tmp_path / "checkout"
     for name in ("src/dew", "tools", "tests", "examples", "site"):
         (root / name).mkdir(parents=True)
@@ -41,6 +41,7 @@ def checkout(tmp_path: Path) -> Path:
     git(root, "add", "-A")
     git(root, "commit", "-qm", "main")
     git(root, "update-ref", "refs/remotes/origin/main", "HEAD")
+    git(root, "checkout", "-q", "-b", "head")
     return root
 
 
@@ -60,7 +61,7 @@ def test_a_head_touching_the_inventory_or_deleting_a_file_it_names_fails_its_cha
     git(root, "commit", "-qam", "a head that drops the entry")
     assert changed(root).returncode == 1
     # A deleted file whose entry stays.
-    git(root, "checkout", "-q", "-b", "deleting", "main")
+    git(root, "checkout", "-q", "-b", "deleting", "origin/main")
     (root / "tests/test_close.py").unlink()
     git(root, "commit", "-qam", "a head that deletes the held file")
     gone = changed(root)
