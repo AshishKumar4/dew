@@ -30,8 +30,8 @@ lock() {
     --exclude-newer "$RESOLVED" --exclude-newer-package "dew-flash-attn-cu12=$FLASH" \
     --exclude-newer-package "dew-flash-attn-cu13=$FLASH" -P dew-flash-attn-cu12 -P dew-flash-attn-cu13 \
     --exclude-newer-package jax=false --exclude-newer-package "certifi=$CERTIFI" -P certifi --emit-index-url \
-    $(for package in jaxlib jax-cuda12-plugin jax-cuda12-pjrt jax-cuda13-plugin jax-cuda13-pjrt; do
-      echo --exclude-newer-package "$package=$JAXLIB"; done) \
+    $(for package in jaxlib jax-cuda12-plugin jax-cuda12-pjrt jax-cuda13-plugin jax-cuda13-pjrt libtpu; do
+      echo --exclude-newer-package "$package=$JAXLIB" -P "$package"; done) \
     $(for package in openenv daytona daytona-api-client daytona-api-client-async daytona-toolbox-api-client \
         daytona-toolbox-api-client-async daytona-analytics-api-client daytona-analytics-api-client-async; do
       echo --exclude-newer-package "$package=$ENVIRONMENTS"; done) \
