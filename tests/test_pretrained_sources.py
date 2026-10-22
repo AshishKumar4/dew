@@ -169,12 +169,13 @@ def test_a_source_is_routed_on_its_config_alone_as_the_loader_reads_it():
         asked.append(unregistered["model_type"])
         raise ValueError("no registered family's convention computes it")
 
+    llama = fixture_config("llama-tiny")
     with pytest.raises(ValueError):
-        source_route({**fixture_config("llama-tiny"), "model_type": "an_unregistered_decoder"}, verified=verifier)
+        source_route({**llama, "model_type": "an_unregistered_decoder"}, verified=verifier)
     assert asked == ["an_unregistered_decoder"]
     with pytest.raises(StorageRefused):
-        source_route({**fixture_config("llama-tiny"), "quantization_config": {"quant_method": "mlx", "bits": 4,
-                                                                        "group_size": 64, "mode": "affine"}})
+        source_route({**llama, "quantization_config": {"quant_method": "mlx", "bits": 4, "group_size": 64,
+                                                        "mode": "affine"}})
     with pytest.raises(StorageRefused):
         # A storage format is refused before the verifier is asked about an unregistered type.
         source_route({"model_type": "an_unregistered_decoder", "quantization": {"bits": 4, "group_size": 64}},
