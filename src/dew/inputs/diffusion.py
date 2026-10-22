@@ -648,7 +648,7 @@ def _cubic_weights(source: int, target: int) -> tuple[np.ndarray, np.ndarray]:
 @dataclass(frozen=True)
 class CLIPImageTransform:
     """Runs the published CLIP preprocessing as JAX arithmetic over uint8 NHWC
-    pixels.
+    pixels, integer levels in any dtype.
 
     The reference is the PIL image processor: `CLIPImageProcessor` as
     transformers 4 ran it, which the safety fixtures were generated with
@@ -720,7 +720,11 @@ class CLIPImageTransform:
                                           (pad_w - pad_w // 2, pad_w // 2), (0, 0)))
             top, left = (pixels.shape[1] - crop_h) // 2, (pixels.shape[2] - crop_w) // 2
             pixels = pixels[:, top:top + crop_h, left:left + crop_w]
-        pixels = pixels * self.rescale
+        # transformers rescales in float64 and rounds once to float32 (`image_transforms.rescale`); over
+        # integer pixels that is a table of the 256 levels, rounded on the host. A float32 product with
+        # the rounded factor rounds twice, half again as far from the exact levels.
+        levels = jnp.asarray(np.arange(256, dtype=np.float64) * self.rescale, jnp.float32)
+        pixels = jnp.take(levels, pixels.astype(jnp.int32))
         if self.normalize:
             pixels = (pixels - jnp.asarray(self.mean, jnp.float32)) / jnp.asarray(self.std, jnp.float32)
         return pixels.transpose(0, 3, 1, 2)

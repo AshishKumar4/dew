@@ -12,26 +12,15 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from diffusion_support import SourceOracle, relative_gap, walk
-from flax import linen as nn
+from diffusion_support import ConditionalSourceOracle, SourceOracle, relative_gap, walk
 from reference_error import assert_as_exact_as_the_reference, assert_as_exact_over_orders, distance
 
-from dew.diffusion import expand
 from dew.sampling import CFG, DPMSolverSDE, sample
 
 DIFFUSERS_FIXTURES = Path(__file__).resolve().parent / "fixtures" / "diffusers"
 SOURCE = json.loads((DIFFUSERS_FIXTURES / "source_schedulers.json").read_text())
 SOURCE_ARRAYS = np.load(DIFFUSERS_FIXTURES / "source_schedulers.npz")
 SOURCE_ROUNDING = np.load(DIFFUSERS_FIXTURES / "source_rounding.npz")
-
-
-class ConditionalSourceOracle(nn.Module):
-    """The same model offset by its condition, so a guided walk reads back the
-    combination that was applied."""
-
-    @nn.compact
-    def __call__(self, x, temb, label):
-        return jnp.sin(x) * 0.07 + expand(temb, x) * 0.001 + expand(label, x)
 
 
 def source_case(name: str):
