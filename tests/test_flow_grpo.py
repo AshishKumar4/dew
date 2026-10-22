@@ -45,8 +45,8 @@ from dew.telemetry.records import RECORD_TYPES
 from dew.training import Trainer
 from tools.parity_flow_grpo import RECORDED, dew_transition, transition_inputs
 
-SEEDS = {'guided walk': 8, 'converted': 8, 'rescored walk': 8, 'clipping': 32, 'kl': 8, 'rollout': 64,
-         'inpainting': 128, 'live policy': 64, 'mixed precision': 32, 'prompt evaluation': 8}
+SEEDS = {'guided walk': 8, 'converted': 8, 'rescored walk': 16, 'clipping': 32, 'kl': 8, 'rollout': 64,
+         'inpainting': 32, 'live policy': 64, 'mixed precision': 32, 'prompt evaluation': 8}
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada)."""
 ROWS = 64
 """A drawn batch's rows: enough that a few seeds resolve a site."""
@@ -54,17 +54,11 @@ BATCHES = 16
 """The batches a draw of a site holds whose outputs are one number a batch."""
 
 
-def as_float32(tree):
-    """`tree`'s float leaves at float32, as the arm under test took them, its other leaves as they are:
-    a float64 truth evaluates the arm's own float32 states."""
-    return jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float32)
-                        if jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.floating) else leaf, tree)
-
-
 def walked_in_float32(walk, *inputs):
-    """`walk` on `inputs` at float32 with x64 off, as the arm under test walked them."""
+    """`walk` on `inputs`, float arrays, at float32 with x64 off, as the arm under test walked them: a
+    float64 truth evaluates the arm's own float32 states."""
     with jax.enable_x64(new_val=False):
-        return walk(*as_float32(inputs))
+        return walk(*(jnp.asarray(value, jnp.float32) for value in inputs))
 
 
 def drawn_rows(*shapes, scale=0.5):
@@ -156,6 +150,16 @@ def test_recorded_trajectory_rescores_under_shifted_guided_process():
 
 
 
+def recorded_and_rescored(walk, rescore, variables):
+    """A walk's recorded densities and their rescoring under `variables` (`rescore`, the objective's
+    `log_probs`), from a start."""
+    def scored(start):
+        trajectory = walk(start)
+        return {"recorded": trajectory.log_probs,
+                "rescored": rescore(variables, trajectory_batch(trajectory, np.ones(ROWS, np.float32)))}
+    return scored
+
+
 def trajectory_batch(trajectory, advantages, mask=None):
     count, points = trajectory.states.shape[:2]
     return {
@@ -195,12 +199,8 @@ def test_flow_objective_uses_converted_predictions(prediction):
         density = walk_density(trajectory, lambda t: t, velocity, 0.5, dtype)
         return {"recorded": density, "rescored": density}
 
-    def scored(start):
-        trajectory = walk(start)
-        return {"recorded": trajectory.log_probs,
-                "rescored": rescore(variables, trajectory_batch(trajectory, np.ones(ROWS, np.float32)))}
-
-    assert_as_exact(scored, lambda start: rectified(walk(start), np.float32), drawn_rows((2,)),
+    assert_as_exact(recorded_and_rescored(walk, rescore, variables),
+                    lambda start: rectified(walk(start), np.float32), drawn_rows((2,)),
                     f"{prediction} converted", seeds=SEEDS['converted'],
                     truth_fn=lambda start: rectified(walked_in_float32(walk, start), np.float64))
     trajectory = walk(jnp.asarray([[0.2, -0.5], [-0.1, 0.7]]))
@@ -377,17 +377,12 @@ def test_flow_objective_matches_clipping_and_conditional_gaussian_kl():
 
     rescore = jax.jit(objective.log_probs)
 
-    def scored_walk(start):
-        trajectory = walk(start)
-        return {"recorded": trajectory.log_probs,
-                "rescored": rescore(old, trajectory_batch(trajectory, np.ones(ROWS, np.float32)))}
-
     def walked(trajectory, dtype):
         density = walk_density(trajectory, lambda t: t, lambda index, x, t: 0.25 * x + 0.1 * t, 0.6, dtype)
         return {"recorded": density, "rescored": density}
 
-    assert_as_exact(scored_walk, lambda start: walked(walk(start), np.float32), drawn_rows((2,)),
-                    "rescored clipping walk", seeds=SEEDS['rescored walk'],
+    assert_as_exact(recorded_and_rescored(walk, rescore, old), lambda start: walked(walk(start), np.float32),
+                    drawn_rows((2,)), "rescored clipping walk", seeds=SEEDS['rescored walk'],
                     truth_fn=lambda start: walked(walked_in_float32(walk, start), np.float64))
 
     start, advantages, mask = (value[0] for value in draw(0))
@@ -503,6 +498,8 @@ def test_flow_rollout_groups_rewards_selects_steps_and_preserves_likelihoods():
         blank = jax.tree.map(lambda null, value: jnp.broadcast_to(null, value.shape),
                              objective.encode(encoders), given)
         steps = int(batch["rollout_steps"][0]) - 1
+        # The DiT computing at `dtype`: its own float32 floor would round a float64 truth's times.
+        apply = jax.jit(model.clone(dtype=dtype).apply)
 
         def velocity(column, x, sigma):
             # The rollout's step of this column, off its time on the rollout's own grid of `steps` steps.
@@ -510,7 +507,7 @@ def test_flow_rollout_groups_rewards_selects_steps_and_preserves_likelihoods():
             scale = 1.5 if 0.3 <= index / steps <= 0.6 else 1.0
             time = jnp.asarray(sigma.reshape(-1) * 1000)
             conditional, unconditional = (
-                np.asarray(model.apply(weights, jnp.asarray(x), time, **conditions), dtype)
+                np.asarray(apply(weights, jnp.asarray(x), time, **conditions), dtype)
                 for conditions in (given, blank))
             return unconditional + scale * (conditional - unconditional)
 
@@ -858,7 +855,15 @@ def test_conditioned_prompt_only_evaluation_preview_and_trainer_consumers():
     model = SimpleDiT(output_channels=1, patch_size=2, emb_features=8,
                       num_layers=1, num_heads=2, mlp_ratio=2)
     process = Process(FlowMatchingScheduler(shift=2), FlowMatchPredictionTransform())
-    objective = FlowGRPOObjective(model, process, inputs, guidance=CFG(1.5), beta=0.1, steps=3)
+    untrained = FlowGRPOObjective(model, process, inputs, guidance=CFG(1.5), beta=0.1, steps=3).init(
+        jax.random.key(100))
+    # Noise in every weight, the zeroed output head's too, so the evaluation reads its prompts.
+    leaves, tree = jax.tree.flatten(untrained["params"])
+    noise = jax.random.split(jax.random.key(103), len(leaves))
+    params = jax.tree.unflatten(tree, [leaf + 0.1 * jax.random.normal(key, leaf.shape, leaf.dtype)
+                                       for leaf, key in zip(leaves, noise, strict=True)])
+    objective = FlowGRPOObjective(model, process, inputs, guidance=CFG(1.5), beta=0.1, steps=3,
+                                  variables={**untrained, "params": params})
     rollout = FlowRollout(objective, lambda images, batch: images.mean((1, 2, 3)), groups=2, steps=3)
     tracker, metric = RecordingTracker(), PixelMean()
     trainer = Trainer(objective, optax.sgd(1e-3), key=jax.random.key(101), rollout=rollout, tracker=tracker)
@@ -885,6 +890,8 @@ def test_conditioned_prompt_only_evaluation_preview_and_trainer_consumers():
         given = objective.encode(encoders, many_tokens)
         blank = jax.tree.map(lambda null, value: jnp.broadcast_to(null, value.shape),
                              objective.encode(encoders), given)
+        # The DiT computing at `dtype`: its own float32 floor would round a float64 truth's times.
+        apply = jax.jit(model.clone(dtype=dtype).apply)
 
         def run(key):
             with jax.enable_x64(new_val=False):
@@ -894,9 +901,9 @@ def test_conditioned_prompt_only_evaluation_preview_and_trainer_consumers():
             sigmas = 2 * times / (1 + times)
             for sigma, following in itertools.pairwise(sigmas):
                 time = jnp.full((16,), sigma * 1000)
-                conditional, unconditional = (np.asarray(model.apply(weights, jnp.asarray(images), time,
-                                                                     **conditions), dtype)
-                                              for conditions in (given, blank))
+                conditional, unconditional = (
+                    np.asarray(apply(weights, jnp.asarray(images), time, **conditions), dtype)
+                    for conditions in (given, blank))
                 images = images + (following - sigma) * (unconditional + 1.5 * (conditional - unconditional))
             return np.clip(images, -1, 1).reshape(16, -1)
         return run
