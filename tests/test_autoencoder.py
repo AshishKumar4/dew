@@ -121,7 +121,7 @@ def test_a_clip_decodes_as_diffusers_decodes_its_frames(contract, sd3_tiny):
 
 FIXTURE_ROOT = Path(__file__).resolve().parent / "fixtures"
 
-FIXTURES = {
+ARCHIVES = {
     "dc_ae": ("dc_ae.tar.xz", "conv"),
     "wan": ("wan_vae.tar.xz", ""),
     "rae": ("rae.tar.xz", "dinov2"),
@@ -138,7 +138,7 @@ def _published(kind: str, directory: Path):
 
     from dew.objectives.diffusion import PretrainedAutoencoder
 
-    archive, inside = FIXTURES[kind]
+    archive, inside = ARCHIVES[kind]
     source = extract_fixture(FIXTURE_ROOT / archive, directory) / inside
     # A scalar normalization takes a run's own statistics, which its record must keep.
     overrides = {"latent_shift": 0.25, "latent_scale": 0.5} if kind == "dc_ae" else {}
@@ -156,7 +156,7 @@ def test_every_registration_is_one_autoencoder_with_a_fixture():
     published = [name for entry in REGISTRATIONS for name in entry.published]
     assert len(set(RECORDS)) == len(RECORDS) and len(set(published)) == len(published)
     assert len({entry.wrapper for entry in REGISTRATIONS}) == len(REGISTRATIONS)
-    assert set(FIXTURES) | {"sd_vae"} == set(RECORDS)
+    assert set(ARCHIVES) | {"sd_vae"} == set(RECORDS)
 
 
 @pytest.mark.parametrize("kind", RECORDS)
