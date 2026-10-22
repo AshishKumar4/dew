@@ -18,7 +18,13 @@ multiprocessor's `resident` programs (`resident`) wait together (Little's law). 
     waiting  = steps · load latency / (stages - 1)
     compute  = ceil(programs / (multiprocessors · resident)) · max(resident · program, waiting)
     memory   = device_bytes / memory bandwidth
-    seconds  = max(compute, memory)
+    l2       = l2_bytes / L2 bandwidth
+    seconds  = max(compute, memory, l2)
+
+`l2_bytes` are the bytes all programs stage from the L2 together: a tile every program re-reads (the
+keys and values each query block of attention walks, the operand bands each output tile of a GEMM
+reads) is served there, not from device memory, at the L2's rate, so a config of more, smaller programs
+stages more. A template states them; one that states none is ranked without the term.
 
 Work a program does between its matrix instructions, which they wait for, is serial: `serial_staged` bytes
 and `serial_exponentials` exponentials it adds to its service time rather than overlapping (a Mosaic
@@ -74,6 +80,7 @@ class Cost:
     resident: int = 1
     serial_staged: float = 0.0
     serial_exponentials: float = 0.0
+    l2_bytes: float = 0.0
 
 
 def seconds(cost: Cost, target: generation.GpuTarget) -> float:
@@ -91,7 +98,8 @@ def seconds(cost: Cost, target: generation.GpuTarget) -> float:
     latency = facts.load_latency
     waiting = 0.0 if latency is None else waiting_seconds(cost, latency, clock)
     waves = math.ceil(cost.programs / (multiprocessors * cost.resident))
-    return max(waves * max(cost.resident * program, waiting), cost.device_bytes / bandwidth)
+    l2 = 0.0 if facts.l2_bandwidth is None else cost.l2_bytes / facts.l2_bandwidth
+    return max(waves * max(cost.resident * program, waiting), cost.device_bytes / bandwidth, l2)
 
 
 def program_seconds(cost: Cost, rate: float, clock: float) -> float:
