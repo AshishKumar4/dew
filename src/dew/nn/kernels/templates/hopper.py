@@ -21,8 +21,13 @@ import functools
 import math
 
 from jax import lax, numpy as jnp
+from jax._src.state import types as state_types
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
+
+Ref = state_types.AbstractRef | state_types.TransformedRef
+"""A scoped allocation a primitive takes: shared memory, transformed (tiled and swizzled) or not, or
+barriers."""
 
 
 def compiler_params() -> plgpu.CompilerParams:
@@ -144,11 +149,15 @@ class Ring:
     (`release`). The counter runs across a persistent kernel's tiles, so a tile's first loads reuse the
     slots the last tile left, and each tile may take its own number of steps (a causal tile's trip range):
     a slot is free for its first fill and, after, once every consumer released it; the producer drains the
-    ring after its last load (`drain`). Allocated with `ring`."""
-    stages: int
-    smem: object
-    full: object
-    consumed: object
+    ring after its last load (`drain`). Allocated with `ring`, its slot count the allocation's own."""
+    smem: Ref
+    full: state_types.AbstractRef
+    consumed: state_types.AbstractRef
+
+    @property
+    def stages(self) -> int:
+        """The ring's slots: its allocation's leading dimension."""
+        return int(self.smem.shape[0])
 
     def slot(self, counter):
         """The slot step `counter` uses."""
@@ -182,7 +191,7 @@ class Ring:
 def ring(block: tuple, dtype, stages: int, *, consumers: int = 1, transforms: tuple = ()) -> dict:
     """A `Ring`'s allocations for `pl.run_scoped`: `stages` slots of `block` in `dtype` (`transforms` their
     shared-memory tiling and swizzle), a load barrier each, and a release barrier each that `consumers`
-    arrive at. `Ring(stages, **allocated)` once scoped."""
+    arrive at. `Ring(**allocated)` once scoped."""
     return {'smem': plgpu.SMEM((stages, *block), dtype, transforms=transforms),
             'full': plgpu.Barrier(num_barriers=stages),
             'consumed': plgpu.Barrier(num_arrivals=consumers, num_barriers=stages)}
@@ -204,32 +213,36 @@ def roles(wg, consumers: int, consumer, producer, *, registers: tuple[int, int] 
 
 
 def schedule_barrier():
-    """The barrier two consumers take turns at (`turn`): two arrivals."""
+    """The barrier two consumers meet at (`rendezvous`): two arrivals."""
     return plgpu.Barrier(num_arrivals=2)
 
 
-def turn(barrier) -> None:
-    """One consumer's turn at the schedule barrier: it arrives and waits for the other, so their
-    tensor-core phases alternate (FA3's ping-pong; `attention_mgpu`'s schedule barrier)."""
+def rendezvous(barrier) -> None:
+    """One consumer's meeting with the other at the schedule barrier: it arrives and waits until both
+    have. Symmetric meetings order nothing; a ping-pong of tensor-core phases is the mainloop's schedule
+    on top of them, its phases offset by a meeting one consumer takes before the loop and the other after
+    it (as `attention_mgpu` does), which each template keeps."""
     plgpu.barrier_arrive(barrier)
     plgpu.barrier_wait(barrier)
 
 
 def persistent(count: int, *, collective_axes, order=None):
-    """A persistent loop over `count` tiles, each block taking its share: `body(tile, info)` with the tile
+    """A persistent loop over `count` tiles, each block taking its share: `body(tile, loop)` with the tile
     `order(index)` names for the loop's linear index (the index itself without one: an LPT or causal
     order reverses it, a GEMM's planar snake folds it)."""
     def decorator(body):
         @plgpu.nd_loop((count,), collective_axes=collective_axes)
-        def _(info: plgpu.NDLoopInfo):
-            index = info.index[0]
-            body(index if order is None else order(index), info)
+        def _(loop: plgpu.NDLoopInfo):
+            index = loop.index[0]
+            body(index if order is None else order(index), loop)
     return decorator
 
 
 def store_vector(vector, smem, view) -> None:
     """A per-row vector (an attention tile's running max or sum) to `view` in global memory through
-    `smem`, its layout's relayout there."""
+    `smem`, its layout's relayout there, once the store before it has read `smem`. The caller waits for the
+    last store (`plgpu.wait_smem_to_gmem`) before `smem`'s scope ends or the vector is read back."""
+    plgpu.wait_smem_to_gmem(0, wait_read_only=True)
     smem[...] = vector.astype(smem.dtype)
     plgpu.commit_smem()
     plgpu.copy_smem_to_gmem(smem, view)
