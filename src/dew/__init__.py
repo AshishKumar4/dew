@@ -32,13 +32,12 @@ a program that never ran `absl.app` would stop them there. A program that
 parses its flags itself, through `absl.app` or `FLAGS(argv)`, still does.
 """
 
-from collections.abc import Callable
-from importlib import import_module
 from typing import TYPE_CHECKING
 
 from absl import flags as _flags
 
 from dew import cache as cache
+from dew._exports import lookup as _lookup
 from dew.telemetry.devices import (
     divide_exactly as _divide_exactly,
     keep_roundings as _keep_roundings,
@@ -118,11 +117,7 @@ _EXPORTS = {
 }
 
 
-def __getattr__(name: str) -> type | Callable:
-    module = _EXPORTS.get(name)
-    if module is None:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    return getattr(import_module(module), name)
+__getattr__ = _lookup(__name__, _EXPORTS)
 
 
 def __dir__() -> list[str]:
