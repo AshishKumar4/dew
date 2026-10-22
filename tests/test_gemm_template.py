@@ -742,10 +742,12 @@ def test_the_hooked_tpu_launches_lower_for_a_v5e(launch, side_dtype):
                 lowering_platforms=("tpu",))
 
 
+@runs("v5e")
 @pytest.mark.parametrize("product", ["gemm", "gemm_t"])
 def test_a_tpu_lowers_xlas_program_for_a_call_no_launch_takes(product):
     """A product of widths no TPU block divides lowers for a TPU through XLA's program, the refusal
-    reported, its kernel branches traced on the way and none raising."""
+    reported, its kernel branches traced on the way and none raising. A CPU process's: a GPU's interprets
+    its CPU branch with Triton's launch whatever the target (`grouped_matmul._launch`)."""
     x = jax.ShapeDtypeStruct((32, 64), jnp.bfloat16)
     other = jax.ShapeDtypeStruct((1, 64, 64) if product == "gemm" else (32, 64), jnp.bfloat16)
     sizes = jnp.asarray([32], jnp.int32)
