@@ -2126,9 +2126,9 @@ def main(argv: Sequence[str] | None = None, jobs: int = 1) -> int:
     seen = {relative for _, relative, _ in read}
     if jobs > 1:
         # A worker's collector would trace through everything the fork inherited: a worker collects nothing,
-        # and ends after 64 files.
+        # and ends after 16 files, so what it leaves uncollected stays small.
         forked = multiprocessing.get_context("fork")
-        with forked.Pool(jobs, initializer=gc.disable, maxtasksperchild=8) as pool:
+        with forked.Pool(jobs, initializer=gc.disable, maxtasksperchild=2) as pool:
             found = pool.map(checked, read, chunksize=8)
     else:
         found = [checked(file) for file in read]
@@ -2150,4 +2150,4 @@ def main(argv: Sequence[str] | None = None, jobs: int = 1) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main(jobs=os.cpu_count() or 1))
+    raise SystemExit(main(jobs=len(os.sched_getaffinity(0))))

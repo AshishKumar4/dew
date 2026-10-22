@@ -8,9 +8,9 @@
 # inventory to; default: origin/main. A lane runs it before every LAND, and CI's lint job runs it as is.
 # Usage, from the checkout: sh tools/check.sh [--changed | --gate NAME | --list]
 #
-# The full run starts the gates side by side, as many at once as the machine has processors, and prints each
-# one's verdict and, where it failed, its output, in the file's order: it takes about as long as its slowest
-# gate. --gate NAME runs one gate and exits with its status (the lanes' lint gate runs each gate on a container
+# The full run starts the gates side by side, as many at once as this process may use processors (nproc),
+# and prints each one's verdict and, where it failed, its output, in the file's order: it takes about as long
+# as its slowest gate. --gate NAME runs one gate and exits with its status (the lanes' lint gate runs each gate on a container
 # of its own); --list prints the gates' names.
 #
 # --changed: the gates a head's own Python files decide, in seconds, for iterating on it: ruff and slop lint
@@ -68,7 +68,8 @@ esac
 # ended. The history the duplicate scan and the ratchet read is fetched once, before either starts.
 sh tools/base_history.sh
 results=$(mktemp -d)
-names | xargs -P "$(getconf _NPROCESSORS_ONLN)" -I '{}' sh -c 'sh tools/check.sh --gate "$1" > "$2/$1.out" 2>&1; echo $? > "$2/$1.status"' \
+names | xargs -P "$(nproc)" -I '{}' \
+  sh -c 'sh tools/check.sh --gate "$1" > "$2/$1.out" 2>&1; echo $? > "$2/$1.status"' \
   _ '{}' "$results"
 for name in $(names); do
   gate "$name" sh -c 'cat "$1/$2.out"; exit "$(cat "$1/$2.status")"' _ "$results" "$name"
