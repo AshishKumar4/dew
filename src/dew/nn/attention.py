@@ -1200,7 +1200,8 @@ def _blocked_values(weights, value, precision) -> jax.Array:
 
 
 def reference_attention(query, key, value, *, mask=None, bias=None, sinks=None, softcap=None, dtype=None,
-                        precision=None, force_fp32_for_softmax=True, dropout_rate=0.0, dropout_rng=None):
+                        precision=None, force_fp32_for_softmax=True, dropout_rate=0.0, dropout_rng=None,
+                        wide_logits=False):
     """Attend over [B, S, H, D] in plain XLA ops, every score policy on one pipeline.
 
     It is flax's reference attention, op for op: the query scaled by
@@ -1216,20 +1217,28 @@ def reference_attention(query, key, value, *, mask=None, bias=None, sinks=None, 
     group over their key head and no key or value repeats, as the decode
     selector (`attention_kernels.decodes`) needs where it routes a sink
     layer here rather than to the fused decode kernel, which takes sinks on a
-    GPU.
+    GPU. `wide_logits` computes the logits from the query and keys widened to
+    at least fp32 and scales them after the product, as DeepSeek V4 does
+    (modeling_deepseek_v4.py:708-736); the value product stays in the inputs'
+    dtype.
     """
     query, key, value = promote_dtype(query, key, value, dtype=dtype)
     dtype = query.dtype
     *rows, length, heads, width = query.shape
     kv_heads, keys = key.shape[-2], key.shape[-3]
-    scaled_query = query / jnp.sqrt(width).astype(dtype)
+    if wide_logits:
+        scaled_query, scoring = query.astype(at_least_fp32(dtype)), key.astype(at_least_fp32(dtype))
+    else:
+        scaled_query, scoring = query / jnp.sqrt(width).astype(dtype), key
     if sinks is None:
-        key, value = repeat_kv_heads(key, heads), repeat_kv_heads(value, heads)
-        logits = float32_einsum('...qhd,...khd->...hqk', scaled_query, key, precision=precision)
+        scoring, value = repeat_kv_heads(scoring, heads), repeat_kv_heads(value, heads)
+        logits = float32_einsum('...qhd,...khd->...hqk', scaled_query, scoring, precision=precision)
     else:
         grouped = scaled_query.reshape(*rows, length, kv_heads, heads // kv_heads, width)
-        logits = float32_einsum('...tkgd,...skd->...kgts', grouped, key, precision=precision).reshape(
+        logits = float32_einsum('...tkgd,...skd->...kgts', grouped, scoring, precision=precision).reshape(
             *rows, heads, length, keys)
+    if wide_logits:
+        logits = logits * width ** -0.5
     if softcap is not None:
         logits = jnp.tanh(logits / softcap) * softcap
     if bias is not None:
