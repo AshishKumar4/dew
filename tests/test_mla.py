@@ -61,6 +61,11 @@ SEEDS = {"v3 block": 16, "v3n block": 16, "v32 block": 16, "auto": 16, "decode":
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` on armada: the most any of
 a site's cases took."""
 
+LENGTH = 28
+"""The tokens of a drawn row: four times the fixtures' seven, so a draw's input gradient sums over
+enough positions for the reference compared with itself to resolve (at seven, the block without the
+query LoRA did not within 512 seeds)."""
+
 MARGIN = 1e-3
 """The least selection margin a V3.2 draw admits (`boundary_gap`): four orders above the scores' fp32
 rounding, so float64 and fp32 select the same keys."""
@@ -221,10 +226,10 @@ def boundary_gap(name: str, hidden: np.ndarray) -> float:
 
 
 def block_draw(name: str):
-    """Check 1's draw for a block: a seed's hidden states and probe at the fixture's shape, for the
+    """Check 1's draw for a block: a seed's hidden states and probe, rows LENGTH tokens long, for the
     V3.2 block the first of the seed's candidates its reference selects by more than MARGIN
     (`boundary_gap`)."""
-    shape = (CONFIG["batch"], CONFIG["length"], CONFIG["v3"]["hidden_size"])
+    shape = (CONFIG["batch"], LENGTH, CONFIG["v3"]["hidden_size"])
 
     def draw(seed):
         for attempt in range(64):
