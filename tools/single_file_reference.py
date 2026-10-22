@@ -23,14 +23,14 @@ configs diffusers infers for it (sd15_from_single_file.json).
 """
 
 import hashlib
-import importlib.util
 import json
 import shutil
 import sys
 import tarfile
 import tempfile
-import urllib.request
 from pathlib import Path
+
+from reference_source import fetched, github, module_at
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / "tests" / "fixtures" / "single_file"
@@ -97,13 +97,9 @@ def tiny_pipeline(kind: str, directory: Path, tokenizer_from: Path) -> None:
 
 def _reverse_script(kind: str, scratch: Path):
     script = scratch / SCRIPTS[kind]
-    urllib.request.urlretrieve(f"https://raw.githubusercontent.com/huggingface/diffusers/v0.34.0/scripts/"
-                               f"{SCRIPTS[kind]}", script)
-    spec = importlib.util.spec_from_file_location("convert", script)
-    assert spec is not None and spec.loader is not None
-    convert = importlib.util.module_from_spec(spec)
+    script.write_text(fetched(github("huggingface/diffusers", "v0.34.0", f"scripts/{SCRIPTS[kind]}")))
     argv, sys.argv = sys.argv, ["convert"]
-    spec.loader.exec_module(convert)
+    convert = module_at("convert", script)
     sys.argv = argv
     return convert
 

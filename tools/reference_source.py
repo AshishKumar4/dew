@@ -11,7 +11,8 @@ class around them does so between `selected` and `ran`. `simple_statements`
 takes single lines out of a published function. `verified` keeps a reference
 file on disk, fetched once and checked against its pinned SHA-256 on every
 use; `imported` runs such a file as a module of its own, and `packaged` and
-`module_at` let an upstream's files import each other.
+`module_at` let an upstream's files import each other, as `package_at` does
+for a package of fetched files.
 `stub_torch_utils` stands in for the two `torch_utils` names NVIDIA's EDM and
 EDM2 networks import. `saved_fixture` writes a generator's arrays with its
 provenance as the suite reads them, and `recipe_images` draws the images a
@@ -22,6 +23,7 @@ from __future__ import annotations
 
 import ast
 import hashlib
+import importlib
 import importlib.util
 import sys
 import urllib.request
@@ -118,20 +120,34 @@ def packaged(names: Iterable[str]) -> None:
         sys.modules[name] = package
 
 
-def hub_code(repo: str, revision: str, package: str, files: Iterable[str]) -> None:
-    """A Hub repository's remote-code `files` at `revision`, copied into a fresh package `package` on the
-    import path, for the caller to import as `package.<module>`."""
-    import shutil
-    import tempfile
+def package_at(package: str, files: dict[str, str], cache: Path) -> list[ModuleType]:
+    """The files at `files`' URLs (a file name to its URL, at a pinned revision), fetched into `cache` /
+    `package` once, imported in their order as the modules of the package `package`, whose directory
+    `cache` puts on the import path."""
+    directory = cache / package
+    directory.mkdir(parents=True, exist_ok=True)
+    for name, url in files.items():
+        if not (directory / name).is_file():
+            (directory / name).write_text(fetched(url))
+    (directory / "__init__.py").touch()
+    sys.path.insert(0, str(cache))
+    return [importlib.import_module(f"{package}.{name.removesuffix('.py')}") for name in files]
 
-    from huggingface_hub import hf_hub_download
 
-    directory = Path(tempfile.mkdtemp()) / package
-    directory.mkdir()
-    (directory / "__init__.py").write_text("")
-    for name in files:
-        shutil.copy(hf_hub_download(repo, name, revision=revision), directory / name)
-    sys.path.insert(0, str(directory.parent))
+def hub_package(repo: str, revision: str, package: str, files: Iterable[str]) -> list[ModuleType]:
+    """A Hugging Face repository's remote-code `files` at `revision`, imported as the modules of `package`
+    (`package_at`), kept in the cache under the repository and revision."""
+    return package_at(package, {name: hub(repo, revision, name) for name in files}, CACHE / repo / revision)
+
+
+def github(repo: str, commit: str, path: str) -> str:
+    """The URL of `path` in the GitHub repository `repo` at `commit`."""
+    return f"https://raw.githubusercontent.com/{repo}/{commit}/{path}"
+
+
+def hub(repo: str, revision: str, path: str) -> str:
+    """The URL of `path` in the Hugging Face repository `repo` at `revision`."""
+    return f"https://huggingface.co/{repo}/resolve/{revision}/{path}"
 
 
 def left_padded(ids):

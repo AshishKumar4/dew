@@ -30,14 +30,11 @@ Run with Torch 2.14.0 CPU and NumPy:
 """
 
 import argparse
-import importlib
-import sys
-import tempfile
-import urllib.request
 from functools import partial
 from pathlib import Path
 
 import numpy as np
+from reference_source import CACHE, github, package_at
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures"
 RECORDED = FIXTURES / "weighting" / "recorded_weights.npz"
@@ -97,18 +94,13 @@ def closed_form(name: str, mean: str, options: dict, inputs: dict, dtype) -> dic
     return {"weight": jnp.where(snr == 0, 1.0, weight).astype(dtype)}
 
 
-def guided_diffusion(name: str, directory: Path):
+def guided_diffusion(name: str):
     """The repo's own gaussian_diffusion module, imported from its files."""
     repo, commit = REPOS[name]
-    package = directory / f"guided_diffusion_{name}"
-    package.mkdir()
-    (package / "__init__.py").write_text("")
-    for file in ("gaussian_diffusion.py", "nn.py", "losses.py"):
-        url = f"https://raw.githubusercontent.com/{repo}/{commit}/guided_diffusion/{file}"
-        with urllib.request.urlopen(url, timeout=60) as response:
-            (package / file).write_bytes(response.read())
-    sys.path.insert(0, str(directory))
-    return importlib.import_module(f"guided_diffusion_{name}.gaussian_diffusion")
+    files = ("gaussian_diffusion.py", "nn.py", "losses.py")
+    gaussian_diffusion, *_ = package_at(f"guided_diffusion_{name}", {
+        file: github(repo, commit, f"guided_diffusion/{file}") for file in files}, CACHE / repo / commit)
+    return gaussian_diffusion
 
 
 def weights(module, betas: np.ndarray, mean: str, options: dict, exact: bool) -> np.ndarray:
@@ -143,9 +135,9 @@ def main() -> None:
     from recorded_references import provenance, record_case, save
 
     recorded = {}
-    with tempfile.TemporaryDirectory() as directory, jax.enable_x64(new_val=True):
+    with jax.enable_x64(new_val=True):
         for name, cases in CASES.items():
-            module = guided_diffusion(name, Path(directory))
+            module = guided_diffusion(name)
             for mean, options in cases:
                 for table in TABLES:
                     label = label_of(name, mean, options, table)

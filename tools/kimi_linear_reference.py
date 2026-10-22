@@ -62,10 +62,10 @@ from kimi_k3_reference import (
     fixture_batch,
     greedy,
     record_orders,
-    remote_modules,
     scatter,
     sgd_step,
 )
+from reference_source import hub, package_at
 from safetensors.torch import save_file
 
 REPO = "moonshotai/Kimi-Linear-48B-A3B-Instruct"
@@ -162,7 +162,8 @@ def released_modules():
     documented = transformers.utils.auto_docstring
     transformers.utils.auto_docstring = lambda obj=None, **kwargs: obj if obj is not None else (lambda inner: inner)
     try:
-        configuration, modeling = remote_modules(REPO, REVISION, CACHE, "kimi_linear_remote", REMOTE)
+        configuration, modeling = package_at(
+            "kimi_linear_remote", {name: hub(REPO, REVISION, name) for name in REMOTE}, CACHE)
     finally:
         transformers.utils.auto_docstring = documented
     from fla.ops.kda import wy_fast
