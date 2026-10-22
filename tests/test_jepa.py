@@ -369,6 +369,7 @@ def test_training_makes_the_prediction_depend_on_the_context(mask):
     before = context_ablation(objective, initial.variables, initial.ema,
                               normalized_test, mask, jax.random.PRNGKey(9))
     fresh = paired_statistic(1.5 * before[0] - before[1])
+    print('STAT fresh', fresh, flush=True)
     assert fresh > 7.0, f"a fresh predictor favours its own context (t = {fresh:.1f})"
 
     def batches():
@@ -391,8 +392,10 @@ def test_training_makes_the_prediction_depend_on_the_context(mask):
     after = context_ablation(objective, state.variables, state.ema,
                              normalized_test, mask, jax.random.PRNGKey(9))
     halved = paired_statistic(before[0] - 2 * after[0])
+    print('STAT halved', halved, flush=True)
     assert halved > 7.0, f"held-out prediction error did not halve (t = {halved:.1f})"
     cost = paired_statistic(after[1] - 5 * after[0])
+    print('STAT cost', cost, flush=True)
     assert cost > 7.0, f"the predictor still ignores its context (t = {cost:.1f})"
 
 
