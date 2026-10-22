@@ -31,8 +31,8 @@ from .attention_kernels import (
     ATTENTION,
     DECODE,
     SPLASH_BLOCK,
-    SPLASH_DTYPES,
     SPLASH_LANES,
+    TPU_SUPPORTS,
     AttentionCase,
     decodes,
 )
@@ -1662,7 +1662,7 @@ def attention_case(query, key, *, dtype=None, precision=None, force_fp32_for_sof
     `AttentionImpl`, which decides whether splash might run it."""
     cross = isinstance(segment_ids, CrossDocuments)
     q_len, kv_len = query.shape[-3], key.shape[-3]
-    return AttentionCase(
+    case = AttentionCase(
         queries=q_len, keys=kv_len, heads=query.shape[-2], kv_heads=key.shape[-2],
         head_dim=query.shape[-1], dtype=jnp.dtype(query.dtype), key_dtype=jnp.dtype(key.dtype),
         causal=bool(causal), window=sliding_window,
@@ -1674,17 +1674,17 @@ def attention_case(query, key, *, dtype=None, precision=None, force_fp32_for_sof
         arithmetic=reference_only(query, dtype, precision, force_fp32_for_softmax),
         narrows=_xla_kernel_narrows(query) or _xla_kernel_chains(query, key),
         folds=folds(query, key, bias, mask, causal, sliding_window),
-        # Splash's descriptor reads a concrete mask on the host, so only a call splash could take
-        # builds it: one that names it or chooses, a TPU's, of its dtypes, with no bias or sequence
-        # axis, at lengths it tiles.
-        splash=(named in ('auto', 'tpu') and generation.backend() == 'tpu'
-                and jnp.dtype(query.dtype) in SPLASH_DTYPES
-                and bias is None and sequence_shards() == 1
-                and q_len % SPLASH_LANES == 0 and kv_len % SPLASH_LANES == 0
-                and min(q_len, kv_len) >= SPLASH_MIN_LENGTH
-                and splash_mask_descriptor(q_len, kv_len, shard_heads(query), causal, sliding_window,
-                                           mask) is not None),
-        shards=sequence_shards())
+        splash=False, shards=sequence_shards())
+    # Splash's descriptor reads a concrete mask on the host, so it is built only for a call under a
+    # name that may choose splash which every other requirement of splash's takes (`TPU_SUPPORTS`):
+    # whether splash tiles the call is the one fact left, its lengths and its descriptor.
+    if named in ('auto', 'tpu') and all(need.holds(case) for need in TPU_SUPPORTS if need.code != 'tiles'):
+        tiled = q_len % SPLASH_LANES == 0 and kv_len % SPLASH_LANES == 0
+        case = dataclasses.replace(case, splash=(
+            tiled and min(q_len, kv_len) >= SPLASH_MIN_LENGTH
+            and splash_mask_descriptor(q_len, kv_len, shard_heads(query), causal, sliding_window,
+                                       mask) is not None))
+    return case
 
 
 def resolve_implementation(implementation, query, key, *, dtype=None, precision=None,
