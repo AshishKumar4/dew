@@ -5,7 +5,7 @@ import dataclasses
 import json
 import logging
 import os
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Protocol
@@ -76,7 +76,7 @@ class Registration:
     """One built-in autoencoder: its wrapper, the name its record goes by and the native module its
     record's 'model' rebuilds (`AutoEncoder.to_json`, `from_json`), the `_class_name` a published
     config states, and the loader that builds it from a pipeline's directory or a repo."""
-    wrapper: type[AutoEncoder]
+    wrapper: Callable[..., AutoEncoder]
     record: str
     module: type
     published: str

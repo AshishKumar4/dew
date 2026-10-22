@@ -359,12 +359,16 @@ def _load_from_hub(modelname: str, revision: str, params, errors: list) -> dict 
     return None
 
 
+KL_CLASSES = ("AutoencoderKL", "FlaxAutoencoderKL")
+"""The `_class_name`s an AutoencoderKL's config states: diffusers' and its Flax port's."""
+
+
 def kl_config[ConfigT: Mapping](config: ConfigT, where: str | Path) -> ConfigT:
-    """`config`, an AutoencoderKL's: one that names another class (`_class_name`, a Wan or Qwen-Image
-    VAE's) is refused, naming it, before its tensors meet the KL tree; one that names none is taken
-    as the AutoencoderKL older checkpoints are."""
+    """`config`, an AutoencoderKL's (`KL_CLASSES`, diffusers' and its Flax port's): one that names
+    another class (`_class_name`, a Wan or Qwen-Image VAE's) is refused, naming it, before its tensors
+    meet the KL tree; one that names none is taken as the AutoencoderKL older checkpoints are."""
     named = config.get("_class_name")
-    if named is not None and named != "AutoencoderKL":
+    if named is not None and named not in KL_CLASSES:
         raise ValueError(f"{where} holds a {named}, not an AutoencoderKL")
     return config
 
