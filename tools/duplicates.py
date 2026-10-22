@@ -402,19 +402,29 @@ def judged(hits: list[Hit], merged: str, top: Path) -> tuple[list[Hit], list[Hit
     return failing, [hit for hit in hits if hit not in failing]
 
 
-def stripped(file: Path) -> list["LineSet"]:
-    """`file`'s lines as the text reading compares them (`SIMILARITY`), read in a process of its own."""
-    from pylint.checkers.symilar import Symilar
+def stripped(file: Path) -> tuple["LineSet", set[int]]:
+    """`file`'s lines as the text reading compares them (`SIMILARITY`), and the hashes of their windows of
+    `min_lines` lines, as pylint's comparison of two files hashes them (`hash_lineset`), read in a process of
+    its own (a fork, which hashes text as its parent does)."""
+    from pylint.checkers.symilar import Symilar, hash_lineset
 
     reading = Symilar(**SIMILARITY)
     with file.open(encoding="utf-8") as stream:
         reading.append_stream(str(file), stream)
-    return reading.get_map_data()
+    [lineset] = reading.get_map_data()
+    windows, _ = hash_lineset(lineset, SIMILARITY["min_lines"])
+    return lineset, {hash(window) for window in windows}
 
 
 def text_copies(files: list[Path], jobs: int) -> int:
-    """Print pylint's similarity report over `files`, stripped by `jobs` processes and compared in this one in
-    the files' order, and return how many lines the copies it finds repeat."""
+    """Print pylint's similarity report on the files of `files` that share a window, and return how many
+    lines the copies it finds repeat.
+
+    pylint compares every two files, hashing both each time, which is quadratic in the files; it finds a
+    copy only where two files share a window's hash. So each file is stripped and hashed once, by `jobs`
+    processes; files are grouped where they share a window, transitively; and pylint compares each group's
+    files, in the files' order, as it compares them in a run over all of them: a group shares no file and no
+    line with another, so no copy in one changes what pylint reports in another."""
     from pylint.checkers.symilar import Symilar  # its import alone takes seconds, which the structure skips
 
     if jobs > 1:
@@ -422,16 +432,38 @@ def text_copies(files: list[Path], jobs: int) -> int:
             read = pool.map(stripped, files, chunksize=8)
     else:
         read = [stripped(file) for file in files]
-    reading = Symilar(**SIMILARITY)
-    reading.combine_mapreduce_data(read)
-    report = io.StringIO()
-    with contextlib.redirect_stdout(report):
-        reading.run()
-    print(report.getvalue(), end="")
-    # The report's last line: "TOTAL lines=N duplicates=M percent=P".
-    totals = re.search(r"^TOTAL lines=\d+ duplicates=(\d+) ", report.getvalue(), re.MULTILINE)
-    assert totals is not None, "pylint's similarity report ends with its totals"
-    return int(totals.group(1))
+    # Each file's group, as the first file it shares a window with names it, merged where two groups meet.
+    group = list(range(len(read)))
+
+    def root(index: int) -> int:
+        while group[index] != index:
+            group[index] = group[group[index]]
+            index = group[index]
+        return index
+
+    first: dict[int, int] = {}
+    for index, (_, windows) in enumerate(read):
+        for window in windows:
+            group[root(index)] = root(first.setdefault(window, index))
+    members: dict[int, list[int]] = defaultdict(list)
+    for index in range(len(read)):
+        members[root(index)].append(index)
+    repeated = 0
+    for indexes in sorted(members.values()):
+        if len(indexes) < 2:
+            continue
+        reading = Symilar(**SIMILARITY)
+        reading.combine_mapreduce_data([[read[index][0]] for index in indexes])
+        report = io.StringIO()
+        with contextlib.redirect_stdout(report):
+            reading.run()
+        # The report's last line: "TOTAL lines=N duplicates=M percent=P".
+        totals = re.search(r"^TOTAL lines=\d+ duplicates=(\d+) ", report.getvalue(), re.MULTILINE)
+        assert totals is not None, "pylint's similarity report ends with its totals"
+        if int(totals.group(1)):
+            print(report.getvalue(), end="")
+            repeated += int(totals.group(1))
+    return repeated
 
 
 def main(arguments: Sequence[str], jobs: int = 1) -> int:
