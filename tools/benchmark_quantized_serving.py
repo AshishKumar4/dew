@@ -50,6 +50,7 @@ from jax.typing import ArrayLike
 from dew.artifacts import uint8_pixels
 from dew.quantization import Quantization
 from dew.sampling import CFG, DPMSolverMultistep, TextToImage
+from dew.telemetry.benchmark import samples
 
 PROMPTS = (
     "a watercolor painting of a mountain lake at sunrise",
@@ -109,12 +110,7 @@ def forward(pipe: TextToImage) -> dict:
 
     compiled = jax.jit(step).lower(variables, x, t).compile()
     memory = compiled.memory_analysis()
-    jax.block_until_ready(compiled(variables, x, t))
-    times = []
-    for _ in range(5):
-        started = time.perf_counter()
-        jax.block_until_ready(compiled(variables, x, t))
-        times.append(time.perf_counter() - started)
+    times = samples(compiled, variables, x, t, warmup=1, repeats=5)
     return {"weights_mib": round(nbytes(variables["params"]) / 2**20, 1),
             "forward_ms": round(1e3 * statistics.median(times), 2),
             "arguments_mib": round(memory.argument_size_in_bytes / 2**20, 1),

@@ -263,6 +263,8 @@ A second copy of the algebra written in triton.language is not an acceptable ans
    - sm80: jax mha, then FA2;
    - sm90: Tokamax Mosaic, then FA3.
 
+   A variant's scoreboard row also names the best kernel for that variant: FlagAttention's Triton kernels for SageAttention, piecewise attention, MiniMax M3's sparse attention, parallel NSA, split-KV and paged decode (they run on NVIDIA, AMD, Intel and several other vendors' accelerators); SageAttention's own kernels; FlashMLA for MLA and DSA.
+
    Today's A100 forward meets this at the best configuration (template 1.730 ms vs jax 1.709 ms, causal). It misses at some configurations: V loaded early stays live through the softmax, and the fix is being measured.
 
 ## 7. Choice: the config chooser inside each template
@@ -419,6 +421,7 @@ Questions 1 and 2 as recommended. Question 3: support all of them (§12). Questi
 | 14 | temperature | score hook | HEAD or QUERY param | |
 | 15 | any pointwise `score_mod` | score hook | traced callable + typed params | Identity is its traced-program fingerprint (§4). |
 | 16 | custom_vjp hooks | hook backward | `jax.vjp` of the callable in the backward kernel | Honours the hook's own custom_vjp. |
+| 16a | Piecewise attention: two Q/K pairs selected by token distance, `s = q1·k1` where `|i − j| ≤ w`, else `q2·k2`, one V | structure + two declared score products | a tile wholly within distance w takes only the first product, one wholly beyond it only the second (the window form's full and partial classes, #3), and a tile the boundary cuts takes both and selects by coordinates in `modify`; the backward gives dq1, dk1 from the near entries' cotangents and dq2, dk2 from the far ones' | ⚑ The design declares one score product a step; this needs a step's score products declared as a list with their combine: a sum (absorbed MLA, #25) or a selection by coordinates (here). Comparator: FlagAttention's `piecewise_attention`, forward and backward. |
 
 #### Softmax state
 
@@ -465,6 +468,7 @@ Questions 1 and 2 as recommended. Question 3: support all of them (§12). Questi
 | 35 | DSA top-k (2048 keys a query, a query's own selection) | structure + load contract | indexed at (query, key) granularity: a query tile is one query × its heads (MLA's 128 heads over one latent), and its keys are gathered by index (FlashMLA sparse) | ⚑ The design's indexed form is block lists per query block. DSA selects tokens per query, so it needs a token-granular gathered K/V tile: TMA gather4 on sm100, cp.async on sm90. |
 | 36 | NSA (compressed + selected + sliding, gated) | three calls + pointwise | compressed: plain attention on the compressed K/V; selected: indexed blocks per (query, group); sliding: spans. The gate combine runs in XLA. | Selection is per query, like #35. A one-kernel fused combine is a proposed non-goal. |
 | 37 | MoBA | structure | indexed blocks per query plus causal in its own block | Per-query granularity, like #35. |
+| 37a | MiniMax M3 sparse attention (128-token page scoring, top-k pages, sparse prefill and decode) | structure + a scoring pass | the scoring pass is a product (each query block or decode query against a summary per 128-token page) and a top-k, run as the GEMM template plus XLA's `top_k`; attention then runs the indexed form over the selected pages, block-granular at page size 128, and over a paged cache in decode (#27, #30) | Page-granular, so the design's indexed block lists hold it directly, unlike DSA's token granularity (#35). Comparator: FlagAttention's `minimax_m3_*`, inference only. |
 
 #### Backward
 
@@ -484,6 +488,7 @@ Questions 1 and 2 as recommended. Question 3: support all of them (§12). Questi
 |---|---|---|---|---|
 | 45 | FA3 e4m3 Q/K/V with block scales; P quantized | product declaration + algebra | scales in `mma`; `narrow(p)` to e4m3 | ⚑ `narrow(p)` returns no scale, but P quantization needs `narrow(p) -> (p8, scale)`, which the P·V declaration consumes. V transposed for an fp8 wgmma is a mainloop matter. |
 | 46 | fp8 KV cache | hooks | as #28 | |
+| 46a | SageAttention: per-block INT8 Q and K with fp32 block scales, K smoothed by its mean over tokens; P·V in 16-bit or FP8 | product declaration + a K pre-pass | the Q·Kᵀ product declared INT8 with per-block scales (`Product.scales`, the mechanism FP8 block scales use), the scales applied to a tile's products before `modify`; smoothing K by its token mean shifts each query's logits by one constant, which the softmax drops, so it is a pre-pass that changes no output | ⚑ `Product` names FP8 and 16-bit operands; INT8 (mma.sync s8 on sm80+, wgmma s8 on sm90) must join it. The token mean is a cross-tile reduction, so it is an algebra pre-pass, not a hook. Comparators: FlagAttention's `sage_attention` (forward only) and SageAttention's own kernels. |
 
 #### Training features
 
@@ -575,6 +580,8 @@ Each ⚑ in the tables above is closed by the matching item below.
 7. A named composition of spans with a tail TILE mask, for speculative trees (#10). **Closed in the design.**
 8. A named owner for the sinks' gradient (#17). **Closed in the design.**
 9. Keep 'reference' as the naive oracle, distinct from the algebra's plain-JAX mainloop (Table 2). **Closed in the design.**
+10. INT8 operands with per-block scales in the product declaration, and a K pre-pass for SageAttention's smoothing (#46a). Open.
+11. A step's score products as a declared list with their combine (sum or selection by coordinates), for piecewise attention (#16a) and absorbed MLA (#25). Open.
 
 ## Appendix B. Coverage: linear recurrence
 

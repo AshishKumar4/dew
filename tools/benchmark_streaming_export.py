@@ -20,15 +20,14 @@ import time
 from pathlib import Path
 
 from dew.interop import Pretrained
+from dew.telemetry.benchmark import resident_memory
 from dew.training.distributed import MeshSpec
 
 
 def _resident_gb() -> tuple[float, float]:
     """The process's resident memory and its anonymous part, in GiB."""
-    stated = {line.split(":")[0]: int(line.split()[1]) / 2**20
-              for line in Path("/proc/self/status").read_text().splitlines()
-              if line.startswith(("VmRSS:", "RssAnon:"))}
-    return stated["VmRSS"], stated["RssAnon"]
+    memory = resident_memory()
+    return memory["VmRSS"] / 2**30, memory["RssAnon"] / 2**30
 
 
 def main() -> None:
