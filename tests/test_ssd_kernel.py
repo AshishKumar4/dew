@@ -266,8 +266,9 @@ fusions, the nine host cases on an AMD x86-64-v4 host."""
 
 
 on_device = pytest.mark.tpu(reason="needs a tpu, the one backend the kernel is chosen on")
-interpreted = pytest.mark.skipif(jax.default_backend() == "gpu", reason="no user runs this kernel on a GPU, "
-                                 "and check 1 measures it interpreted on the CPU lane")
+host_only = pytest.mark.skipif(
+    jax.default_backend() in ("gpu", "tpu"),
+    reason="interpreted on the CPU lane; a TPU judges its compiled copies, and no user runs it on a GPU")
 
 # (batch, steps, heads, head width, state, groups), chunk: a tail of one step short, whole chunks, a tail
 # of one step over, four chunks with a ragged tail, at widths the kernel takes and fewer groups than heads;
@@ -275,24 +276,25 @@ interpreted = pytest.mark.skipif(jax.default_backend() == "gpu", reason="no user
 # a chunk of 128 over 4 heads of 64 channels and a state of 64, which `ssd_kernel_runs` takes.
 CASES = [
     *(pytest.param("fixture", (chunk, resets), False, id=f"fixture-{label}{'-resets' if resets else ''}",
-                   marks=interpreted)
+                   marks=host_only)
       for chunk, label in ((32, "three-chunks-ragged"), (128, "one-chunk")) for resets in (False, True)),
-    pytest.param("shape", ((2, 63, 4, 8, 8, 2), 64), False, id="one-short", marks=interpreted),
-    pytest.param("shape", ((2, 64, 4, 8, 8, 2), 64), False, id="whole-chunk", marks=interpreted),
-    pytest.param("shape", ((2, 65, 4, 16, 8, 2), 64), False, id="one-over", marks=interpreted),
-    pytest.param("shape", ((2, 193, 4, 16, 8, 2), 64), False, id="four-chunks-ragged", marks=interpreted),
-    pytest.param("shape", ((2, 257, 2, 64, 128, 1), 256), False, id="default-chunk", marks=interpreted),
+    pytest.param("shape", ((2, 63, 4, 8, 8, 2), 64), False, id="one-short", marks=host_only),
+    pytest.param("shape", ((2, 64, 4, 8, 8, 2), 64), False, id="whole-chunk", marks=host_only),
+    pytest.param("shape", ((2, 65, 4, 16, 8, 2), 64), False, id="one-over", marks=host_only),
+    pytest.param("shape", ((2, 193, 4, 16, 8, 2), 64), False, id="four-chunks-ragged", marks=host_only),
+    pytest.param("shape", ((2, 257, 2, 64, 128, 1), 256), False, id="default-chunk", marks=host_only),
     *(pytest.param("shape", ((1, length, 4, 64, 64, 1), 128), True, id=f"compiled-{length}-steps",
                    marks=on_device) for length in (1024, 4096)),
 ]
 
 
-# The host geometries again on a TPU, where the kernel compiles, for the tier selects its tests by mark.
-ON_DEVICE = [pytest.param(*param.values, id=f"tpu-{param.id}", marks=on_device)
-             for param in CASES if not param.values[2]]
+# The host geometries compiled on a TPU, marked so that the TPU tier, which selects its tests by mark,
+# runs them.
+TPU_COPIES = [pytest.param(*param.values, id=f"tpu-{param.id}", marks=on_device)
+              for param in CASES if not param.values[2]]
 
 
-@pytest.mark.parametrize(("kind", "case", "compiled"), CASES + ON_DEVICE)
+@pytest.mark.parametrize(("kind", "case", "compiled"), CASES + TPU_COPIES)
 def test_the_kernel_is_as_exact_as_the_xla_scan(reference, kind, case, compiled):
     """The kernel, interpreted on the host or compiled on a TPU, against float64: every forward and
     gradient leaf over declared draws (check 1)."""
@@ -314,11 +316,12 @@ HOST_CASES = [pytest.param(*param.values[:2], id=param.id) for param in CASES if
 
 
 @pytest.mark.skipif(jax.default_backend() != "cpu", reason="YNNPACK is XLA:CPU's")
-def test_the_interpreted_kernel_and_the_scan_compile_no_ynnpack_fusion():
+@pytest.mark.parametrize(("kind", "case"), HOST_CASES)
+def test_the_interpreted_kernel_and_the_scan_compile_no_ynnpack_fusion(reference, kind, case):
     """Both arms of a host case's check 1 run on XLA:CPU's own code, compiled for the host's
     instruction set with no dispatch at run time (`without_ynn`)."""
-    operands, seeded = case_draw(None, "shape", ((2, 63, 4, 8, 8, 2), 64))(0)
-    for arm in parity_functions(64, 0)[:2]:
+    operands, seeded = case_draw(reference, kind, case)(0)
+    for arm in parity_functions(case[0] if kind == "fixture" else case[1], 0)[:2]:
         assert "ynn_fusion" not in arm.lower(operands, seeded).compile().as_text()
 
 
