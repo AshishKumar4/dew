@@ -201,6 +201,8 @@ class Slow:
         request.send_header("Content-Length", str(len(body)))
         request.end_headers()
         request.wfile.write(body)
+        # Widened: the handler finishes after its client has the answer, as a loaded host schedules it.
+        time.sleep(0.05)
         with self.lock:
             self.active[side] -= 1
 
