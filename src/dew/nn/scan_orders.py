@@ -15,6 +15,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
+from dew.nn.blocks import sinusoid_frequencies, sinusoids
+
 from .sharding import rows_spec
 
 ScanOrder = Literal['raster', 'hilbert', 'zigzag']
@@ -28,23 +30,12 @@ def build_2d_sincos_pos_embed(emb_dim: int, H_P: int, W_P: int) -> np.ndarray:
     index the result by that order's permutation.
     """
     assert emb_dim % 4 == 0, f"emb_dim must be divisible by 4 for 2D sincos, got {emb_dim}"
-    half = emb_dim // 2
-    quarter = half // 2
-
-    omega = np.arange(quarter, dtype=np.float32) / quarter
-    omega = 1.0 / (10000.0 ** omega)  # [quarter]
-
-    rows = np.arange(H_P, dtype=np.float32)
-    cols = np.arange(W_P, dtype=np.float32)
-
-    row_emb = np.einsum('h,d->hd', rows, omega)
-    col_emb = np.einsum('w,d->wd', cols, omega)
-
-    pos = np.zeros((H_P, W_P, emb_dim), dtype=np.float32)
-    pos[..., 0:quarter] = np.sin(row_emb)[:, None, :]
-    pos[..., quarter:half] = np.cos(row_emb)[:, None, :]
-    pos[..., half:half + quarter] = np.sin(col_emb)[None, :, :]
-    pos[..., half + quarter:] = np.cos(col_emb)[None, :, :]
+    quarter = emb_dim // 4
+    omega = sinusoid_frequencies(quarter, quarter)
+    rows = sinusoids(np.arange(H_P, dtype=np.float32)[:, None] * omega, xp=np)
+    cols = sinusoids(np.arange(W_P, dtype=np.float32)[:, None] * omega, xp=np)
+    pos = np.concatenate([np.broadcast_to(rows[:, None], (H_P, W_P, 2 * quarter)),
+                          np.broadcast_to(cols[None, :], (H_P, W_P, 2 * quarter))], axis=-1)
     return pos.reshape(H_P * W_P, emb_dim)
 
 
