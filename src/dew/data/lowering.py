@@ -1234,7 +1234,7 @@ class _Build:
         cache under them still keys each row by its place in the source."""
         if self.global_order or not self.training:
             return rows
-        rows = rows[partition.index :: partition.count]
+        rows = rows[partition.cut()]
         if not self.lowering.repeated:
             rows = _repeated(rows, None, _name(pipeline), self.loading)
         return rows
@@ -1526,14 +1526,12 @@ class _Build:
         # The records after a resume's count go to the shares in turn from the first of them on
         # (`GlobalStream`), so a count that ends inside a batch hands this share the rows the share
         # that many places on holds.
-        share = (partition.index + offset) % partition.count
-        rows = rows[share :: partition.count]
-        empty = not self.training and not len(rows) and bool(len(whole))
-        if empty:
-            rows = whole[:1]
+        share = partition.first(offset)
+        held, real = (partition.cut(offset), True) if self.training else partition.held(len(whole), offset)
+        rows = whole[held]
         batches = rows.batch(size, drop_remainder=drop, batch_fn=_Batched(batch_stage.batch_fn))
         if not drop and fill:
-            batches = batches.map(FilledBatch(size, real=not empty))
+            batches = batches.map(FilledBatch(size, real=real))
         for at in after:
             stage = pipeline.stages[at]
             if isinstance(stage, _UNPLACED):

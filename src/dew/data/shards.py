@@ -53,7 +53,7 @@ def streamed(
         root = root.shuffle(seed=seed)
     if epochs != 1:
         root = root.repeat(epochs)
-    root = root[partition.index :: partition.count]
+    root = root[partition.cut()]
     return _ShardPass(root, manifest.reader, cycle_length, loading, described)
 
 
