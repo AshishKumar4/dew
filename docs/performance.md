@@ -3372,10 +3372,11 @@ time by the host's instruction set. Check 1 between them (`tests/test_ssd_kernel
 one-short case's state gradient at 1.598 (99.9% interval 1.581 to 1.617, 640 seeds) on an AMD EPYC
 Zen 4 host (x86-64-v4, AVX-512) and at 0.77 on a Zen 3 one (x86-64-v3, AVX2). With both arms compiled
 without the fusions (`tests/reference_error.py`'s `without_ynn`), the same two arms' pooled ratios
-over 128 draws of each case had their worst leaf at 1.17 over the nine host cases on Zen 4 and at
-1.20 for the one-short case on Zen 3, and check 1 passed all nine at their declared seeds on Zen 4.
+over 128 draws of each case (`tools/ssd_ynn_probe.py`) had their worst leaf at 1.17 over the nine host
+cases on Zen 4 and at 1.20 for the one-short case on Zen 3, and check 1 passed all nine at their
+declared seeds on Zen 4.
 Which fused op moved the verdict was not isolated. Without the fusions XLA still compiles for the
-host's instruction set, so the bits can differ by host though the verdicts did not: on one Intel Core
+host's instruction set, so the bits can differ by host though the verdicts did not. On one Intel Core
 i9-12900K (AVX2), jaxlib 0.11.2, the one-short case at seed 0 compiled with `--xla_cpu_max_isa=AVX`
 and with no cap differed bitwise in 2090 of the kernel's 4096 outputs and 2111 of the scan's.
 
