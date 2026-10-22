@@ -669,7 +669,7 @@ def test_flow_grpo_over_a_loaded_pipeline_samples_on_the_pipelines_grid(pipeline
     np.testing.assert_array_equal(published, reference)
 
     config = DiffusionRunConfig(pretrained=str(directory), preset=None, model=precision(),
-                                data=ImageData(source="tfds://oxford_flowers102", image_size=16),
+                                data=images_of("tfds://oxford_flowers102", 16),
                                 val_metrics=(),
                                 trainer=TrainerConfig(checkpoint_dir=str(tmp_path)),
                                 objective=ObjectiveConfig("flow_grpo", settings), rollout=rollout)
