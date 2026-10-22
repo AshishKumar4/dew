@@ -1233,6 +1233,11 @@ def reference_attention(query, key, value, *, mask=None, bias=None, sinks=None, 
     if sinks is None:
         scoring, value = repeat_kv_heads(scoring, heads), repeat_kv_heads(value, heads)
         logits = float32_einsum('...qhd,...khd->...hqk', scaled_query, scoring, precision=precision)
+    elif kv_heads == 1:
+        # One key/value head (DeepSeek V4's): the query heads are a free dim beside the rows, and no
+        # size-one head axis rides as a batch dim, which had XLA transpose the fp32 query for the
+        # product (a V4 layer's training step on an H100, batch 4 by 2048: 2 GiB more and 5% slower).
+        logits = float32_einsum('...tgd,...sd->...gts', scaled_query, scoring[..., 0, :], precision=precision)
     else:
         grouped = scaled_query.reshape(*rows, length, kv_heads, heads // kv_heads, width)
         logits = float32_einsum('...tkgd,...skd->...kgts', grouped, scoring, precision=precision).reshape(
@@ -1263,6 +1268,9 @@ def reference_attention(query, key, value, *, mask=None, bias=None, sinks=None, 
         weights = weights * (drawn.astype(dtype) / jnp.asarray(keep, dtype))
     if sinks is None:
         return weighted_values('...hqk,...khd->...qhd', weights, value, precision=precision)
+    if kv_heads == 1:
+        return float32_einsum('...gts,...sd->...tgd', weights.astype(value.dtype), value[..., 0, :],
+                              precision=precision)
     groups = weights.astype(value.dtype).reshape(*rows, kv_heads, heads // kv_heads, length, keys)
     return float32_einsum('...kgts,...skd->...tkgd', groups, value, precision=precision).reshape(
         *rows, length, heads, value.shape[-1])
