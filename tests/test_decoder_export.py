@@ -452,6 +452,27 @@ def test_the_export_carries_the_sources_tokenizer(tmp_path):
     assert again.processor.decode(rows) == source.processor.decode(rows)
 
 
+def test_the_export_assets_rewrite_a_tokenizers_nested_files_in_place(tmp_path):
+    """A tokenizer's files under a directory of their own (a processor's chat_templates/) are
+    published one file at a time like the rest, so a second export into the same directory replaces
+    them, as a weight reload into a serving directory does."""
+    from dew.interop.hf_decoders import save_export_assets
+
+    class Templated:
+        def __init__(self, template):
+            self.template = template
+
+        def save_pretrained(self, directory, /):
+            (Path(directory) / "chat_templates").mkdir()
+            (Path(directory) / "chat_templates" / "brief.jinja").write_text(self.template)
+            (Path(directory) / "tokenizer.json").write_text("{}")
+
+    save_export_assets(tmp_path, tokenizer=Templated("first"))
+    save_export_assets(tmp_path, tokenizer=Templated("second"))
+    assert (tmp_path / "chat_templates" / "brief.jinja").read_text() == "second"
+    assert (tmp_path / "tokenizer.json").read_text() == "{}"
+
+
 def test_an_export_past_its_shard_size_writes_shards_that_transformers_reads(tmp_path):
     """Past `max_shard_size` the weights go out as numbered shards and their
     index, which transformers and Dew both read back to the same logits; a

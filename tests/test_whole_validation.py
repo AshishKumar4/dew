@@ -13,14 +13,15 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from data_support import record_batches
 from diffusion_stubs import batch_for
+from diffusion_support import images_of
 from objective_cases import cases, corpus_windows
 from reference_error import assert_computes_the_oracle, chain_roundings
 from test_guidance_distillation import FIXTURES, FLUX
 
 from dew import Evaluation
 from dew.config import ModelConfig, ObjectiveConfig
-from dew.config.data import ImageData, RecordsData, loader
 from dew.data import Loading
 from dew.data.chat import Role
 from dew.data.dataset import DataPartition, rows_of
@@ -53,8 +54,7 @@ def runnable(name: str, windows, tmp_path):
         archive.extractall(tmp_path / "flux", filter="data")
     teacher = DiffusionRunConfig(
         model=ModelConfig("flux_transformer", {**FLUX, "dtype": "float32", "attention_impl": "xla"}),
-        data=ImageData(source="tfds://oxford_flowers102", split="all", image_size=8), preset=Flow(),
-            val_metrics=(),
+        data=images_of("tfds://oxford_flowers102", 8), preset=Flow(), val_metrics=(),
         text=TextCondition(encoder="diffusion_text", checkpoint=str(tmp_path / "flux" / "pipeline")),
         objective=ObjectiveConfig("diffusion",
                                   {"solver": Euler(), "guidance": None, "steps": 2,
@@ -104,8 +104,8 @@ def test_the_last_batch_is_filled_out_and_marked_on_every_process_count(held):
     one to validate. The pass reads each record once, on one process or two,
     and the repeats that fill the last batch out are marked; with one record,
     process 1's share is empty and reads one batch of repeats alone."""
-    data = loader(RecordsData(source={"id": np.arange(8)}, validation={"id": np.arange(held)}), batch=4,
-        loading=Loading(workers=0, threads=1, read_buffer=1), read="memory")
+    data = record_batches({"id": np.arange(8)}, 4, {"id": np.arange(held)},
+                          loading=Loading(workers=0, threads=1, read_buffer=1))
     for count in (1, 2):
         seen = []
         for index in range(count):
@@ -124,7 +124,7 @@ EVALUATED = sorted(set(objectives) - ROLLOUT)
 
 def evaluated(name: str, windows, tmp_path) -> dict:
     """`name`'s pass over a split of `RECORDS` in batches of `ROWS`, run on
-    every process of the pool: once through `loader(RecordsData(...))`, whose
+    every process of the pool: once through a run's compiled records (`record_batches`), whose
     repeats fill the last batch with its own rows, and once with the repeats
     another record's. Each pass's scores and counts, and for a loss that draws
     nothing (the same under two keys) the loss of every record in one batch
@@ -135,8 +135,7 @@ def evaluated(name: str, windows, tmp_path) -> dict:
         drawn = objective.init(jax.random.key(0))
         variables, averaged = moved(drawn, 1), moved(drawn, 2)
         records = wide(records)
-        data = loader(RecordsData(source=records, validation=records), batch=ROWS, loading=Loading(workers=0,
-            threads=1, read_buffer=1), read="memory")
+        data = record_batches(records, ROWS, records, loading=Loading(workers=0, threads=1, read_buffer=1))
         tail = len(records) - ROWS
         batches = [{**stacked(records[:ROWS]), VALID_ROWS: np.ones(ROWS, bool)},
                    {**stacked(records[ROWS:] + [records[0]] * (ROWS - tail)),
@@ -257,8 +256,8 @@ def perplexity(windows, count: int = RECORDS) -> dict:
     records = records_of(batch, count)
     with jax.enable_x64(new_val=True):
         variables = moved(objective.init(jax.random.key(0)), 1)
-        data = loader(RecordsData(source=records_of(batch, ROWS), validation=records), batch=ROWS,
-            loading=Loading(workers=0, threads=1, read_buffer=1), read="memory")
+        data = record_batches(records_of(batch, ROWS), ROWS, records,
+                              loading=Loading(workers=0, threads=1, read_buffer=1))
         result = Evaluation.run(objective, variables, data.val, key=3, metrics=(Perplexity(),))
         whole = stacked(records)
         step = Step(jnp.asarray(0), jax.random.key(1), None)
