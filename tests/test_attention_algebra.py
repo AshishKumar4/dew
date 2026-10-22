@@ -470,3 +470,22 @@ def test_the_fold_reads_its_factor_as_the_kernel_rounds_it():
     assert just_below * algebra.LOG2E < 1
     assert not algebra.Forward("full", 1, ids=False, scale=just_below).base2
     assert algebra.Forward("full", 1, ids=False, scale=0.5).base2
+
+
+@pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
+def test_the_headroom_guard_leaves_ordinary_inputs_bitwise_unchanged(causal):
+    """The accurate form's walk with its headroom guard (`algebra.guarded`) gives the same bits as the walk
+    without it on drawn inputs, whose sums never overflow: the guard only reads the plain walk's sums."""
+    query, key, value = drawing(200, 300, jnp.float32, width=64, value_width=64)(0)
+    spans = template.spans(200, 300, ROWS, causal=causal)
+    call = template.padded_call(query, key, value, spans, template.Hooks(), attention_triton.BLOCK)
+
+    def walked(*, headroom: bool):
+        spec = algebra.Forward(spans.form, spans.keys, ids=False, scale=64 ** -0.5, natural=True,
+                               headroom=headroom)
+        out, _ = attention_portable.forward(spec, call.query, call.key, call.value, call.start, call.end,
+                                            None, None, (), (), (), (), None, block_q=32, block_k=32,
+                                            output_mod=None, residuals=False)
+        return np.asarray(out)
+
+    np.testing.assert_array_equal(walked(headroom=True), walked(headroom=False))
