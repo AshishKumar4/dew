@@ -468,7 +468,7 @@ def gather_expert_bias(bias: jax.Array, expert_ids: jax.Array, dtype: Dtype) -> 
 
 def expert_projection(x: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
                       dtype: Dtype | None, implementation: str,
-                      precision: PrecisionLike) -> jax.Array:
+                      precision: PrecisionLike, *, layer: jax.Array | None = None) -> jax.Array:
     """The grouped matmul of `x`'s expert-sorted rows, `[rows, in]`, through
     each expert's matrix in `kernel`, `[experts, in, out]`, `group_sizes`
     counting each expert's leading rows, under one precision contract for both
@@ -486,13 +486,19 @@ def expert_projection(x: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
     (`dew.nn.kernels.grouped_matmul`), and a trace the kernels cannot take
     (`seen_whole`) runs 'xla'. tests/test_moe_precision.py measures it against
     float64 sums and three Adam steps on every expert/fsdp layout.
+
+    `layer`, an integer scalar where given, makes `kernel` a bank of layers'
+    expert matrices, `[layers, experts, in, out]`, whose layer the kernels read
+    in place (`grouped_projection`), a scanned stack's with no copy a step.
     """
     compute = canonicalize_dtype(x, kernel, dtype=dtype)
     resolved = float32_products(compute, precision)
     chosen = grouped_matmul_kernel(implementation, compute, (x.dtype, kernel.dtype), resolved)
     if chosen == 'pallas' and seen_whole(x) and seen_whole(kernel):
         return grouped_projection(x, kernel, group_sizes, compute, implementation == 'pallas',
-                                  not asks_default_precision(resolved, configured=True))
+                                  not asks_default_precision(resolved, configured=True), layer)
+    if layer is not None:
+        kernel = jax.lax.dynamic_index_in_dim(kernel, layer, keepdims=False)
     return portable_projection(x, kernel, group_sizes, dtype, resolved)
 
 

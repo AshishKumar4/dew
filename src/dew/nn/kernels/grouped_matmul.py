@@ -1266,42 +1266,49 @@ def _portable_projection_jvp(dtype: Dtype | None, precision: PrecisionLike,
 portable_projection.defjvp(_portable_projection_jvp, symbolic_zeros=True)
 
 
-def _forward(inputs, matrix, sizes, out_dtype, interpret_on_cpu):
-    def kernel(inputs, matrix, sizes, *, interpret):
-        return launched_gmm(inputs, matrix, sizes, out_dtype=out_dtype, trans_rhs=False, interpret=interpret)
+def _forward(inputs, matrix, sizes, layers, out_dtype, interpret_on_cpu):
+    def kernel(inputs, matrix, sizes, layers, *, interpret):
+        return launched_gmm(inputs, matrix, sizes, (), (), layers, out_dtype=out_dtype, trans_rhs=False,
+                            interpret=interpret)
 
-    def fallback(inputs, matrix, sizes):
-        return portable_projection(inputs, matrix, sizes, out_dtype, None)
+    def fallback(inputs, matrix, sizes, layers):
+        return portable_projection(inputs, _layer_of(matrix, layers), sizes, out_dtype, None)
 
     branches, default = _on_platform(kernel, fallback, interpret_on_cpu)
-    return jax.lax.platform_dependent(inputs, matrix, sizes, default=default, **branches)
+    return jax.lax.platform_dependent(inputs, matrix, sizes, layers, default=default, **branches)
 
 
-def _backward(inputs, matrix, sizes, cotangent, input_dtype, kernel_dtype, interpret_on_cpu, exact):
-    def kernel(inputs, matrix, sizes, cotangent, *, interpret):
-        return (launched_gmm(cotangent, matrix, sizes, out_dtype=input_dtype, trans_rhs=True,
+def _backward(inputs, matrix, sizes, layers, cotangent, input_dtype, kernel_dtype, interpret_on_cpu, exact):
+    def kernel(inputs, matrix, sizes, layers, cotangent, *, interpret):
+        return (launched_gmm(cotangent, matrix, sizes, (), (), layers, out_dtype=input_dtype, trans_rhs=True,
                              interpret=interpret, promoted=promoted(above=exact, outputs=(input_dtype,))),
                 launched_tgmm(inputs, cotangent, sizes, out_dtype=kernel_dtype, interpret=interpret,
                               promoted=promoted(above=exact, outputs=(kernel_dtype,))))
 
-    def fallback(inputs, matrix, sizes, cotangent):
+    def fallback(inputs, matrix, sizes, layers, cotangent):
         # The portable projection's derivative on the rounded operands widened to the work dtype, which
         # holds them whatever their own dtypes (an fp16 master cannot hold every rounded bf16 value), each
         # gradient then rounded once to its operand's dtype.
         work = jnp.result_type(at_least_fp32(input_dtype), at_least_fp32(kernel_dtype))
         _, pullback = jax.vjp(lambda x, kernel: portable_projection(x, kernel, sizes, inputs.dtype, None),
-                              inputs.astype(work), matrix.astype(work))
+                              inputs.astype(work), _layer_of(matrix, layers).astype(work))
         d_inputs, d_matrix = pullback(cotangent)
         return d_inputs.astype(input_dtype), d_matrix.astype(kernel_dtype)
 
     branches, default = _on_platform(kernel, fallback, interpret_on_cpu)
-    return jax.lax.platform_dependent(inputs, matrix, sizes, cotangent, default=default,
+    return jax.lax.platform_dependent(inputs, matrix, sizes, layers, cotangent, default=default,
                                       **branches)
+
+
+def _layer_of(matrix, layers: tuple):
+    """A bank's layer (`grouped_projection`'s `layer`), sliced out for XLA's program, or `matrix` itself."""
+    return jax.lax.dynamic_index_in_dim(matrix, layers[0], keepdims=False) if layers else matrix
 
 
 @functools.partial(jax.custom_vjp, nondiff_argnums=(3, 4, 5))
 def grouped_projection(x: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
-                       compute: Dtype, interpret_on_cpu: bool, exact: bool = False) -> jax.Array:
+                       compute: Dtype, interpret_on_cpu: bool, exact: bool = False,
+                       layer: jax.Array | None = None) -> jax.Array:
     """Compute `dew.nn.moe.expert_projection` with the kernels, differentiable in first-order reverse mode.
 
     The operands are cast to `compute`, and the product accumulates in fp32
@@ -1313,27 +1320,42 @@ def grouped_projection(x: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
     kernels (`interpret_on_cpu` adds the CPU's interpreter). Every other
     lowering runs `jax.lax.ragged_dot` under the same contract. `exact` (a
     precision above the default) gives an fp32 gradient IEEE sums
-    (`ragged_dot_refusal`).
+    (`ragged_dot_refusal`). `layer`, an integer scalar where given, makes
+    `kernel` a bank of layers' expert matrices `[layers, experts, in, out]`
+    whose layer the kernels read in place (`launched_gmm`), a scanned layer
+    stack's without a copy a step; its gradient is the bank's, zero but at
+    the layer. A bank of another dtype than `compute` is cast a layer at a time.
     """
-    return _projection_fwd(x, kernel, group_sizes, compute, interpret_on_cpu, exact)[0]
+    return _projection_fwd(x, kernel, group_sizes, compute, interpret_on_cpu, exact, layer)[0]
 
 
-def _projection_fwd(x, kernel, group_sizes, compute, interpret_on_cpu, exact):
+def _projection_fwd(x, kernel, group_sizes, compute, interpret_on_cpu, exact, layer=None):
+    # A bank's layer and its layers' count (a zero-size residual's), which the bank's gradient takes.
+    banked = () if layer is None else (jnp.asarray(layer, jnp.int32),
+                                       jnp.zeros((kernel.shape[0], 0), jnp.int8))
+    layers = banked[:1]
+    if banked and kernel.dtype != jnp.dtype(compute):
+        kernel, layers = _layer_of(kernel, layers), ()  # cast one layer, not the bank
     inputs, matrix = x.astype(compute), kernel.astype(compute)
     sizes = group_sizes.astype(jnp.int32)
-    output = _forward(inputs, matrix, sizes, jnp.dtype(compute), interpret_on_cpu)
+    output = _forward(inputs, matrix, sizes, layers, jnp.dtype(compute), interpret_on_cpu)
     # The residuals are the rounded operands, the values the forward
     # multiplied; the dtypes of the originals are what the gradients take.
-    residuals = (inputs, matrix, sizes, jnp.zeros((0,), x.dtype), jnp.zeros((0,), kernel.dtype))
+    residuals = (inputs, matrix, sizes, layers, banked, jnp.zeros((0,), x.dtype),
+                 jnp.zeros((0,), kernel.dtype))
     return output, residuals
 
 
 def _projection_bwd(compute, interpret_on_cpu, exact, residuals, cotangent):
     del compute
-    inputs, matrix, sizes, x_like, kernel_like = residuals
-    d_inputs, d_matrix = _backward(inputs, matrix, sizes, cotangent.astype(inputs.dtype), x_like.dtype,
-                                   kernel_like.dtype, interpret_on_cpu, exact)
-    return d_inputs, d_matrix, np.zeros(sizes.shape, jax.dtypes.float0)
+    inputs, matrix, sizes, layers, banked, x_like, kernel_like = residuals
+    d_inputs, d_matrix = _backward(inputs, matrix, sizes, layers, cotangent.astype(inputs.dtype),
+                                   x_like.dtype, kernel_like.dtype, interpret_on_cpu, exact)
+    if banked:
+        index, count = banked
+        bank = jnp.zeros((count.shape[0], *d_matrix.shape), d_matrix.dtype)
+        d_matrix = jax.lax.dynamic_update_index_in_dim(bank, d_matrix, index, 0)
+    return d_inputs, d_matrix, np.zeros(sizes.shape, jax.dtypes.float0), None
 
 
 grouped_projection.defvjp(_projection_fwd, _projection_bwd)
