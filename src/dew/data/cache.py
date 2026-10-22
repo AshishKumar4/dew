@@ -202,15 +202,9 @@ class Cache:
         record = json.loads(current.data)
         if record["manifest"] != key.key:
             raise ValueError(f"cache CURRENT manifest differs at {root.url}")
-        _checked(
-            root,
-            {
-                "path": f"generations/{record['generation']}/manifest.json",
-                "bytes": record["bytes"],
-                "sha256": record["sha256"],
-            },
-        )
-        return Generation(root.child(f"generations/{record['generation']}").url, self._mirror_options())
+        # Pinned, then its manifest read once, checked against what CURRENT committed.
+        return Generation(root.child(f"generations/{record['generation']}").url, self._mirror_options(),
+                          committed={"bytes": record["bytes"], "sha256": record["sha256"]})
 
     def publish(
         self,
@@ -579,9 +573,14 @@ class _Writer:
             self.closed = True
             self.pool.shutdown(wait=True, cancel_futures=True)
             self.index.close()
-            self.directory.cleanup()
-            if self.pin is not None:
-                self.pin.close()
+            self._release()
+
+    def _release(self) -> None:
+        """The writer's local spool and its pin let go, once no upload reads them: the one release
+        every way a writer ends takes, whichever drains or abandons its uploads first."""
+        self.directory.cleanup()
+        if self.pin is not None:
+            self.pin.close()
 
     def close(self) -> None:
         with self.lock:
@@ -610,16 +609,12 @@ class _Writer:
                 with self.lock:
                     remaining.discard(future)
                     if not remaining:
-                        self.directory.cleanup()
-                        if self.pin is not None:
-                            self.pin.close()
+                        self._release()
 
             for future in unfinished:
                 future.add_done_callback(released)
         else:
-            self.directory.cleanup()
-            if self.pin is not None:
-                self.pin.close()
+            self._release()
         self._completed()
 
 

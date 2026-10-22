@@ -2,14 +2,13 @@
 
 from __future__ import annotations
 
-import hashlib
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from functools import cached_property
 
 import numpy as np
 
-from dew.data.storage import Store, local
+from dew.data.storage import Store, local, matching, object_info
 
 
 @dataclass(frozen=True)
@@ -41,14 +40,9 @@ class ArrayIndex:
         return values
 
     def verify(self, reference: Mapping[str, object]) -> None:
-        self.pin.seek(0, 2)
-        size = self.pin.tell()
-        self.pin.seek(0)
+        """Refuse the pinned index unless it is the size and digest `reference` committed."""
         with open(self.pin.name, "rb") as reader:
-            checksum = hashlib.file_digest(reader, "sha256").hexdigest()
-        self.pin.seek(0)
-        if size != reference["bytes"] or checksum != reference["sha256"]:
-            raise OSError(f"committed NumPy index is corrupt: {self.url}")
+            matching(object_info(reader), reference, self.url)
 
     def close(self) -> None:
         self.__dict__.pop("values", None)
@@ -78,9 +72,9 @@ class Ranges:
     def start(self, shard: int) -> int:
         return int(self.ends[shard - 1]) if shard else 0
 
-    def locate(self, item: int) -> tuple[int, int]:
-        """The range that holds `item`, and its place in that range."""
-        if not 0 <= item < len(self):
-            raise IndexError(item)
-        shard = int(np.searchsorted(self.ends, item, side="right"))
-        return shard, item - self.start(shard)
+    def locate(self, position: int) -> tuple[int, int]:
+        """The range that holds the item at `position` of them all, and its place in that range."""
+        if not 0 <= position < len(self):
+            raise IndexError(position)
+        shard = int(np.searchsorted(self.ends, position, side="right"))
+        return shard, position - self.start(shard)

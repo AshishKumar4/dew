@@ -49,6 +49,15 @@ def _json(value: JSON | Mapping[str, object]) -> bytes:
     ).encode()
 
 
+ROW_PAGE = 4096
+"""The dense rows a generation's row index holds in each of its pages (`index/rows-*.json`)."""
+
+
+def input_page(row_key: str) -> str:
+    """The page of a generation's input index that holds the input `row_key` names."""
+    return hashlib.sha256(row_key.encode()).hexdigest()[:2]
+
+
 def _row_key(value: RowId) -> str:
     return _json(list(value) if isinstance(value, tuple) else value).decode()
 
@@ -58,19 +67,12 @@ def _hash(value: bytes) -> str:
 
 
 def _checked(root: Store, entry: Mapping[str, object]) -> bytes:
+    """The object `entry` names under `root` (`Store.child` keeps it inside), checked against the
+    size and digest `entry` states (`Store.checked`)."""
     path = entry["path"]
     if not isinstance(path, str):
         raise ValueError("artifact object path is not a string")
-    if path.startswith("/") or any(part in ("", ".", "..") for part in path.split("/")):
-        raise ValueError(f"artifact object path escapes its root: {path!r}")
-    payload = root.child(path).read()
-    if len(payload) != entry["bytes"] or _hash(payload) != entry["sha256"]:
-        raise OSError(
-            f"committed object is corrupt: {root.child(path).url}; "
-            f"bytes={len(payload)}, sha256={_hash(payload)}, "
-            f"expected bytes={entry['bytes']}, sha256={entry['sha256']}"
-        )
-    return payload
+    return root.child(path).checked(entry)
 
 
 def _accepted(outputs: Sequence[Record]) -> Outputs:
@@ -146,8 +148,7 @@ def _publish(
     for row in expected:
         row_key = _row_key(row)
         entry = completions[row_key]
-        page = hashlib.sha256(row_key.encode()).hexdigest()[:2]
-        pages.setdefault(page, {})[row_key] = entry
+        pages.setdefault(input_page(row_key), {})[row_key] = entry
         dense.extend(
             {
                 **entry,
@@ -165,8 +166,8 @@ def _publish(
         target.child(path).verified(payload)
         indexes[page] = {"path": path, "bytes": len(payload), "sha256": _hash(payload)}
     row_pages = []
-    for offset in range(0, len(dense), 4096):
-        payload = _json(dense[offset : offset + 4096])
+    for offset in range(0, len(dense), ROW_PAGE):
+        payload = _json(dense[offset : offset + ROW_PAGE])
         path = f"index/rows-{len(row_pages):06d}.json"
         target.child(path).verified(payload)
         row_pages.append({"path": path, "bytes": len(payload), "sha256": _hash(payload)})
@@ -362,6 +363,9 @@ class Generation:
     url: str
     storage_options: Mapping[str, object] | None = field(default=None, compare=False, hash=False, repr=False)
     _definition: Mapping[str, object] | None = field(default=None, compare=False, hash=False, repr=False)
+    committed: Mapping[str, object] | None = field(default=None, compare=False, hash=False, repr=False)
+    """The size and digest its cache committed its manifest under (`Cache.generation`), which the one
+    read of the manifest is checked against."""
 
     def reference(self, manifest: DependencyManifest) -> str:
         return f"generation {self.url}"
@@ -376,9 +380,12 @@ class Generation:
         _ = self.pin
         if self._definition is not None:
             return dict(self._definition)
-        manifest = Store(self.url, self.storage_options).child("manifest.json")
+        root = Store(self.url, self.storage_options)
+        manifest = root.child("manifest.json")
+        payload = (manifest.read() if self.committed is None
+                   else _checked(root, {**self.committed, "path": "manifest.json"}))
         try:
-            record = json.loads(manifest.read())
+            record = json.loads(payload)
         except ValueError as error:
             raise ValueError(f"committed cache manifest is corrupt: {manifest.url}") from error
         if not isinstance(record, dict) or record.get("schema") != 1:
@@ -462,13 +469,12 @@ class Generation:
     def holds(self, row_id: RowId) -> bool:
         """Whether this generation holds the input `row_id` names."""
         row_key = _row_key(row_id)
-        page = hashlib.sha256(row_key.encode()).hexdigest()[:2]
+        page = input_page(row_key)
         return page in self.manifest["pages"] and row_key in self._page(page)
 
     def outputs(self, row_id: RowId) -> Outputs:
         row_key = _row_key(row_id)
-        page = hashlib.sha256(row_key.encode()).hexdigest()[:2]
-        entry = self._page(page)[row_key]
+        entry = self._page(input_page(row_key))[row_key]
         payload = self._shard(entry["shard"])[entry["record"]]
         if not isinstance(payload, bytes):
             raise ValueError(f"committed cache record is not bytes: {self.url}")
@@ -483,7 +489,7 @@ class Generation:
     def __getitem__(self, index: int) -> Batch | bytes | None:
         if not 0 <= index < len(self):
             raise IndexError(index)
-        entry = self._rows(index // 4096)[index % 4096]
+        entry = self._rows(index // ROW_PAGE)[index % ROW_PAGE]
         row_id = json.loads(entry["id"])
         if isinstance(row_id, list):
             row_id = row_id[0], row_id[1]
