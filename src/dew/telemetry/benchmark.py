@@ -1,7 +1,6 @@
 """Wall-clock timing of calls: `samples`, which every benchmark tool in Dew measures with, and
-`benchmark`, which lays out many calls' timings as a table; `Compiles`, which counts the programs a
-jitted function compiles; and the process's resident memory as the kernel reports it
-(`resident_memory`), which the memory benchmarks read.
+`benchmark`, which lays out many calls' timings as a table; and the process's resident memory as
+the kernel reports it (`resident_memory`), which the memory benchmarks read.
 
 A run is timed from the call to the moment its output is ready on the devices
 (`jax.block_until_ready`), so an asynchronous dispatch is timed as the work it
@@ -91,39 +90,6 @@ def resident_memory() -> dict[str, int]:
                 case [amount, "kB"]:
                     fields[name] = int(amount) * 1024
     return fields
-
-
-class Compiles:
-    """Counts the programs XLA compiles for jitted functions named `name` while it is open, as JAX
-    reports them (`jax.monitoring`'s backend compile event, which names a function `jit(<name>)`):
-    what a warm-up costs, or a compile a measured run should not have paid.
-
-        with Compiles("_stepped") as compiles:
-            server.run()
-        assert compiles.count == 0
-    """
-
-    EVENT = "/jax/core/compile/backend_compile_duration"
-
-    def __init__(self, name: str) -> None:
-        self.name = f"jit({name})"
-        self.seconds: list[float] = []
-        """Each compile's seconds, in the order they ran."""
-
-    @property
-    def count(self) -> int:
-        return len(self.seconds)
-
-    def __enter__(self) -> Compiles:
-        jax.monitoring.register_event_duration_secs_listener(self._heard)
-        return self
-
-    def __exit__(self, *_) -> None:
-        jax.monitoring.unregister_event_duration_listener(self._heard)
-
-    def _heard(self, event: str, duration_secs: float, **metadata: str | int) -> None:
-        if event == self.EVENT and metadata.get("fun_name") == self.name:
-            self.seconds.append(duration_secs)
 
 
 def largest_difference(left, right) -> float:
