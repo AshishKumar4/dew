@@ -122,6 +122,9 @@ class GpuTarget:
     scoped_vmem: int | None = None
     """A TPU's scoped VMEM limit in bytes at XLA's default, past which a Mosaic kernel refuses to compile
     (`dew.nn.attention.splash_block_sizes`); None where no measurement states it."""
+    tmem_columns: int | None = None
+    """A Blackwell multiprocessor's tensor memory columns (PTX ISA, tcgen05.alloc), the bound a kernel's
+    tensor memory takes (tests/kernel_compile.py); None on a GPU without it."""
     int8_triton_gemm: bool = False
     """Whether XLA's Triton GEMM fusion computes int8 dots right on this GPU: on none measured, an
     A100 and an RTX PRO 6000 Blackwell, at jaxlib 0.11.2 (openxla/xla#51016;
@@ -243,7 +246,7 @@ TARGETS = {target.generation: target for target in (
     # its peaks the scoreboard's MFU; a B200 run states its own clock and bandwidth (`runtime_facts`).
     GpuTarget('sm100', 'NVIDIA B200', 227 * 1024,
               dense_peaks={'NVIDIA B200': {'bf16': 2.25e15, 'fp8': 4.5e15}}, multiprocessors=148,
-              clock_hz=1965e6, memory_bandwidth=8e12),
+              clock_hz=1965e6, memory_bandwidth=8e12, tmem_columns=512),
     GpuTarget('sm120', 'NVIDIA RTX PRO 6000 Blackwell Server Edition', 99 * 1024,
               {'attention': 'flash', 'gated_delta_rule': 'fla'},
               dense_peaks={'NVIDIA RTX PRO 6000 Blackwell': {'bf16': 500e12, 'fp8': 1000e12}},

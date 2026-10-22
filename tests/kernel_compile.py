@@ -14,6 +14,7 @@ import functools
 import os
 import re
 import tempfile
+import threading
 from pathlib import Path
 
 import jax
@@ -131,8 +132,9 @@ MOSAIC_DUMPS = {"MOSAIC_GPU_DUMP_PTXAS": "1", "MOSAIC_GPU_DUMP_RESOURCES": "1"}
 """Mosaic GPU's own compile reports (ptxas's register and spill counts, its resource estimate), written
 under `MOSAIC_GPU_DUMP_TO` for each kernel compiled while they are set: Mosaic compiles its kernels, to
 PTX and through ptxas, when XLA compiles the program around them, device or none."""
-TMEM_COLUMNS = 512
-"""A Blackwell multiprocessor's tensor memory columns (PTX ISA, tcgen05.alloc)."""
+DUMPING = threading.RLock()
+"""Held while Mosaic's reports are on (`mosaic_dumps`): the dump settings are the process's
+environment, so one scope at a time sets and restores them."""
 REGISTERS = re.compile(r"Used (\d+) registers")
 SPILLS = re.compile(r"(\d+) bytes spill stores, (\d+) bytes spill loads")
 SMEM = re.compile(r"smem_scratch_bytes=(\d+)")
@@ -141,67 +143,78 @@ TMEM_USED = re.compile(r"tmem_scratch_cols=(\d+), tmem_collective_scratch_cols=(
 
 @contextlib.contextmanager
 def mosaic_dumps(directory: str):
-    """Mosaic GPU's reports (`MOSAIC_DUMPS`) on, into `directory`, for the compiles in the block."""
-    before = {name: os.environ.get(name) for name in (*MOSAIC_DUMPS, "MOSAIC_GPU_DUMP_TO")}
-    os.environ.update(MOSAIC_DUMPS, MOSAIC_GPU_DUMP_TO=directory)
-    try:
-        yield
-    finally:
-        for name, value in before.items():
-            if value is None:
-                os.environ.pop(name, None)
-            else:
-                os.environ[name] = value
+    """Mosaic GPU's reports (`MOSAIC_DUMPS`) on, into `directory`, for the compiles in the block, under
+    `DUMPING` from before the settings are read to after they are restored."""
+    with DUMPING:
+        before = {name: os.environ.get(name) for name in (*MOSAIC_DUMPS, "MOSAIC_GPU_DUMP_TO")}
+        os.environ.update(MOSAIC_DUMPS, MOSAIC_GPU_DUMP_TO=directory)
+        try:
+            yield
+        finally:
+            for name, value in before.items():
+                if value is None:
+                    os.environ.pop(name, None)
+                else:
+                    os.environ[name] = value
 
 
 def mosaic_kernels(directory: str) -> list[dict]:
     """Each Mosaic GPU kernel's report in `directory`: its shared bytes and tensor memory columns (Mosaic's
-    resource estimate), its registers a thread and its spilled bytes (ptxas's)."""
+    resource estimate), its registers a thread and its spilled bytes (ptxas's), or `unread`, what a
+    report lacks: a resource estimate without its ptxas log, or a field neither states, is no
+    evidence the kernel is within its resources."""
     kernels = []
     for resources in sorted(Path(directory).glob("*.resources.txt")):
-        text = resources.read_text()
-        ptxas = resources.with_name(resources.name.removesuffix(".resources.txt") + ".ptxas")
-        log = ptxas.read_text() if ptxas.exists() else ""
-        spills = [int(stores) + int(loads) for stores, loads in SPILLS.findall(log)]
+        name = resources.name.removesuffix(".resources.txt")
+        ptxas = resources.with_name(name + ".ptxas")
+        text, log = resources.read_text(), ptxas.read_text() if ptxas.exists() else ""
         shared, tmem = SMEM.search(text), TMEM_USED.search(text)
-        kernels.append({"kernel": resources.name.removesuffix(".resources.txt"),
-                        "shared": int(shared.group(1)) if shared else 0,
-                        "tmem": sum(map(int, tmem.groups())) if tmem else 0,
-                        "registers": max(map(int, REGISTERS.findall(log)), default=0),
-                        "spilled": max(spills, default=0)})
+        registers, spills = REGISTERS.findall(log), SPILLS.findall(log)
+        unread = [field for field, found in (("shared bytes", shared), ("tensor memory columns", tmem),
+                                             ("registers", registers), ("spills", spills)) if not found]
+        kernels.append({"kernel": name, "unread": unread,
+                        "shared": int(shared.group(1)) if shared else None,
+                        "tmem": sum(map(int, tmem.groups())) if tmem else None,
+                        "registers": max(map(int, registers), default=None),
+                        "spilled": max((int(stores) + int(loads) for stores, loads in spills), default=None)})
     return kernels
 
 
 def compile_mosaic_kernels(cases, generation: str) -> list[dict]:
     """Each Mosaic GPU case (`name`, `call()` giving the kernel and abstract operands) compiled as
     `compile_kernels` compiles Triton's, for a compile-only device of the CUDA `generation`, with Mosaic's
-    own reports on (`mosaic_dumps`): its name, the generation's shared-memory limit, and each of its
-    kernels' shared bytes, tensor memory columns, registers and spilled bytes (`mosaic_kernels`), or the
-    error."""
+    own reports on (`mosaic_dumps`): its name, the generation's shared-memory and tensor-memory limits
+    (`GpuTarget.tmem_columns`, 0 where it has none), and each of its kernels' report (`mosaic_kernels`),
+    or the error."""
     found: list[dict] = []
     for case in cases:
         with tempfile.TemporaryDirectory(prefix="dew-mosaic-") as directory, mosaic_dumps(directory):
             [record] = compile_kernels([case], generation)
             record["kernels"] = mosaic_kernels(directory)
+        record["tmem_limit"] = gpu_target(generation).tmem_columns or 0
         found.append(record)
     return found
 
 
 def mosaic_failures(found: list[dict]) -> list[str]:
-    """Each Mosaic GPU record's failure: its error, no kernel compiled, or a kernel past its multiprocessor's
-    shared memory or tensor memory, or spilling registers."""
+    """Each Mosaic GPU record's failure: its error, no kernel compiled, a kernel whose report lacks a
+    field (`mosaic_kernels`), or a kernel past its multiprocessor's shared memory or tensor memory, or
+    spilling registers."""
     failed = []
     for record in found:
         if "error" in record:
             failed.append(f"{record['name']}: {record['error']}")
         elif not record["kernels"]:
             failed.append(f"{record['name']}: no Mosaic GPU kernel compiled")
-        failed += [f"{record['name']} {kernel['kernel']}: {kernel['shared']} shared bytes (limit "
-                   f"{record['limit']}), {kernel['tmem']} tensor memory columns (limit {TMEM_COLUMNS}), "
-                   f"{kernel['spilled']} bytes spilled"
-                   for kernel in record.get("kernels", ())
-                   if not (kernel["shared"] <= record["limit"] and kernel["tmem"] <= TMEM_COLUMNS
-                           and kernel["spilled"] == 0)]
+        for kernel in record.get("kernels", ()):
+            where = f"{record['name']} {kernel['kernel']}"
+            if kernel["unread"]:
+                failed.append(f"{where}: its reports state no {', '.join(kernel['unread'])}")
+            elif not (kernel["shared"] <= record["limit"] and kernel["tmem"] <= record["tmem_limit"]
+                      and kernel["spilled"] == 0):
+                failed.append(f"{where}: {kernel['shared']} shared bytes (limit {record['limit']}), "
+                              f"{kernel['tmem']} tensor memory columns (limit {record['tmem_limit']}), "
+                              f"{kernel['spilled']} bytes spilled")
     return failed
 
 
@@ -223,6 +236,8 @@ def compile_tpu_kernels(cases, generation: str) -> list[dict]:
     of a kernel past its stated VMEM limit included."""
     mesh = _tpu_device(generation)
     replicated = NamedSharding(mesh, PartitionSpec())
+    # The generation assumed as well as its mesh, so a kernel's facts are its target's
+    # (`dew.nn.attention.splash_block_sizes`' scoped VMEM).
     found: list[dict] = []
     for case in cases:
         record: dict = {"name": case.name, "generation": generation}
@@ -231,7 +246,7 @@ def compile_tpu_kernels(cases, generation: str) -> list[dict]:
         placed = jax.tree.map(lambda leaf: jax.ShapeDtypeStruct(leaf.shape, leaf.dtype, sharding=replicated)
                               if isinstance(leaf, jax.ShapeDtypeStruct) else leaf, args)
         try:
-            with jax.sharding.use_abstract_mesh(mesh.abstract_mesh):
+            with assumed(generation), jax.sharding.use_abstract_mesh(mesh.abstract_mesh):
                 lowered = jax.jit(fn).trace(*placed).lower()
             lowered.compile()
         except Exception as error:  # A case that does not lower or compile is its own failure.
