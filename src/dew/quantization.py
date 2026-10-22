@@ -1089,26 +1089,10 @@ def _group_scaled_convolution() -> type:
 
 
 @functools.cache
-def _providers() -> tuple[type, type]:
-    """Qwix's quantized-training and serving providers with Dew's grouped
-    convolution; importing Qwix here keeps it optional.
-
-    Both pass a matmul with a complex operand through unquantized, as the
-    hybrid DiT's S5 scan needs: Qwix 0.1.8's serving raises on one, and its
-    quantized training quantized the real operand of the scan's
-    real-by-complex input projection, after which `jax.grad` failed on the
-    complex gradient Qwix returned for it. The training provider
-    differentiates a grouped convolution (`_grouped_convolution_gradient`).
-
-    The serving provider casts a quantized kernel's scales to the dtype a
-    module promotes its kernel to, where Qwix 0.1.8 passes the kernel
-    through: a bf16 module then multiplied bf16 activations by fp32
-    dequantized kernels, so its matmuls ran in fp32 (50.4 ms against 34.8 for
-    the plain bf16 176M DiT forward at batch 24 on the RTX 4080). And it
-    scales two quantized operands' product in float32
-    (`_scaled_in_float32`)."""
+def _complex_in_float() -> type:
+    """The providers' shared base (`ComplexInFloat`): a complex matmul unquantized, and the call's contract
+    honoured on a quantized one (`_providers`)."""
     qwix = _qwix()
-    group_scaled = _group_scaled_convolution()
 
     class ComplexInFloat(qwix.QuantizationProvider):
         """Passes a matmul with a complex operand through unquantized, and
@@ -1161,10 +1145,17 @@ def _providers() -> tuple[type, type]:
             out = super().einsum(einsum_str, *_widened(operands, preferred), **kwargs)
             return _honoured(out, preferred, out_sharding)
 
-    class QtProvider(group_scaled, ComplexInFloat, _grouped_convolution_gradient()):
-        pass
+    return ComplexInFloat
 
-    class PtqProvider(group_scaled, ComplexInFloat, qwix.PtqProvider):
+
+@functools.cache
+def _serving_provider() -> type:
+    """The serving provider (`_providers`): Qwix's post-training quantization with Dew's grouped
+    convolution, its products scaled in float32 (`_scaled_in_float32`), a quantized kernel no rule matches
+    multiplied by its own recorded recipe, and a quantized kernel's scales promoted with the module's."""
+    qwix = _qwix()
+
+    class PtqProvider(_group_scaled_convolution(), _complex_in_float(), qwix.PtqProvider):
         keeps_out_sharding: ClassVar[bool] = True  # ptq.py:180 passes it on
 
         def __init__(self, rules: Sequence[object]) -> None:
@@ -1219,7 +1210,33 @@ def _providers() -> tuple[type, type]:
             return jax.tree.map(lambda value: value.astype(dtype) if quantized(value) else value,
                                 promoted, is_leaf=quantized)
 
-    return QtProvider, PtqProvider
+    return PtqProvider
+
+
+@functools.cache
+def _providers() -> tuple[type, type]:
+    """Qwix's quantized-training and serving providers with Dew's grouped
+    convolution; importing Qwix here keeps it optional.
+
+    Both pass a matmul with a complex operand through unquantized, as the
+    hybrid DiT's S5 scan needs: Qwix 0.1.8's serving raises on one, and its
+    quantized training quantized the real operand of the scan's
+    real-by-complex input projection, after which `jax.grad` failed on the
+    complex gradient Qwix returned for it. The training provider
+    differentiates a grouped convolution (`_grouped_convolution_gradient`).
+
+    The serving provider casts a quantized kernel's scales to the dtype a
+    module promotes its kernel to, where Qwix 0.1.8 passes the kernel
+    through: a bf16 module then multiplied bf16 activations by fp32
+    dequantized kernels, so its matmuls ran in fp32 (50.4 ms against 34.8 for
+    the plain bf16 176M DiT forward at batch 24 on the RTX 4080). And it
+    scales two quantized operands' product in float32
+    (`_scaled_in_float32`)."""
+
+    class QtProvider(_group_scaled_convolution(), _complex_in_float(), _grouped_convolution_gradient()):
+        pass
+
+    return QtProvider, _serving_provider()
 
 
 @runtime_checkable
