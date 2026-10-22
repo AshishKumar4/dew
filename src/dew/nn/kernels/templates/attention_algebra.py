@@ -38,8 +38,9 @@ from dew.nn.kernels.templates.attention import LOG2E, NATURAL, Kind, natural_exp
 class Forward:
     """What the forward's functions specialize on, all static: the spans' `form` ('full', 'causal' or
     'spans', `KeySpans.form`), the call's key count `keys`, whether it packs documents (`ids`), the
-    softmax `scale`, the score hook `score_mod(s, q_pos, k_pos, *params)` on natural logits, and whether
-    the call keeps its logits `natural` (`base2`)."""
+    softmax `scale`, the score hook `score_mod(s, q_pos, k_pos, *params)` on natural logits, whether
+    the call keeps its logits `natural` (`base2`), and whether its operands are `wide`, fp32 or wider
+    (`power`)."""
 
     form: str
     keys: int
@@ -47,6 +48,7 @@ class Forward:
     scale: float
     score_mod: Callable | None = None
     natural: bool = NATURAL
+    wide: bool = False
 
     @property
     def base2(self) -> bool:
@@ -58,8 +60,8 @@ class Forward:
         times its size, so logits the reference keeps apart can tie: keys of 2 * 1610613120 and 2 * 1610612992
         under a query of 1 at scale 0.5 weigh 1 and 0 in the reference and 0.5 each folded, and a
         cotangent of 2**125 then overflows its backward (docs/design/kernel-templates.md, the forms'
-        divergences). On drawn inputs both forms pass check 1."""
-        return not self.natural and self.score_mod is None and self.scale * LOG2E <= 1.0
+        divergences). Wide operands never fold (`power`)."""
+        return not self.natural and not self.wide and self.score_mod is None and self.scale * LOG2E <= 1.0
 
     @property
     def guarded(self) -> bool:
@@ -68,8 +70,15 @@ class Forward:
         return self.keys == 0 or self.form == "spans" or self.score_mod is not None
 
     def power(self, x: jax.Array) -> jax.Array:
-        """The exponential the logits are in: exp2 folded, `natural_exp` natural."""
-        return jnp.exp2(x) if self.base2 else natural_exp(x)
+        """The exponential the logits are in: exp2 folded, `natural_exp` natural, and for `wide` operands
+        `jnp.exp`, the reference's own. The default is the fastest form that passes both checks: each fast
+        form rounds once more than `jnp.exp`, which 16-bit operands' weights, rounded to 16 bits for
+        their product, never see, but fp32 ones do: at width 128, causal, the fold and `natural_exp` were
+        1.61-1.63 times the reference's error from float64 on every mainloop, at key tiles of 128 and
+        384 alike (check 1 allows 1.5), where `jnp.exp` is on par."""
+        if self.base2:
+            return jnp.exp2(x)
+        return jnp.exp(x) if self.wide else natural_exp(x)
 
 
 def expand(x: jax.Array, like: jax.Array) -> jax.Array:
