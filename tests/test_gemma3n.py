@@ -195,7 +195,9 @@ def test_a_training_step_updates_the_clamped_altup_coefficients_as_the_reference
     to the clamped weight (a coefficient at 2 under a clip of 1, gradient 1 and SGD at 0.1
     stores 0.9, not 1.9). Every stored parameter after the step is on par with the reference's
     float32 step from its float64 step over drawn rows (check 1), each draw one whose gaussian
-    top-k gates all clear their cutoff by MARGIN (`model_support.gate_margin`). The steps after it, under
+    top-k gates all clear their cutoff by MARGIN (`model_support.gate_margin`); the gate at units
+    nearer it is held where it lives, by the sparse MLP's check 1 over rows drawn with no margin
+    (`test_the_sparse_mlp_is_as_exact_as_the_reference_at_each_sparsity`). The steps after it, under
     SGD or AdamW, read and update the projected weights the same way, bit for bit
     (`test_steps_from_coefficients_past_the_clip_are_the_steps_from_the_clamped_ones`); an
     AdamW step itself is not held to torch's here, since optax forms Adam's bias corrections
