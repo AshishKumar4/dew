@@ -4,8 +4,9 @@ op under the inputs that break chunked forms, each held to the same recurrence a
 
 - finite wherever the reference in float64 is finite: no NaN or inf of the chunked form's own, an
   exponent's overflow or an underflow's `0 * inf`;
-- no merging: its fp32 output and final memory hold as many distinct values as the reference's fp32 run
-  does, so no underflow or saturation collapses values the reference keeps apart;
+- no merging: values it rounds to one fp32 number are apart in float64 by no more than the fp32
+  reference's own error on them (twice its largest there, and a rounding at their size), so no underflow or
+  saturation collapses values the reference keeps apart;
 - check 1 (`assert_as_exact`): on par with the reference from float64 over the regime's draws.
 
 The regimes: decays near one, whose memory accumulates, and over a long sequence; decays near zero, whose
@@ -103,6 +104,25 @@ SEEDS = {}
 """Each site's declared seeds for check 1, sized by `seeds_for` on armada; 8 where not yet sized."""
 
 
+def assert_kept_apart(ours: np.ndarray, reference: np.ndarray, truth: np.ndarray, label: str):
+    """Every group of entries `ours` rounds to one value spans in float64 no more than twice the fp32
+    `reference`'s largest error over the group and one fp32 spacing at its size: the values it merges are
+    ones the reference's own rounding cannot tell apart."""
+    flat, ref, exact = (np.ravel(x) for x in (ours, reference, truth))
+    finite = np.isfinite(flat) & np.isfinite(exact)
+    flat, ref, exact = flat[finite], ref[finite], exact[finite]
+    order = np.argsort(flat, kind='stable')
+    values = flat[order]
+    starts = np.flatnonzero(np.r_[True, values[1:] != values[:-1]])
+    sizes = np.diff(np.r_[starts, values.size])
+    for start, size in zip(starts[sizes > 1], sizes[sizes > 1], strict=True):
+        group = order[start:start + size]
+        spread = exact[group].max() - exact[group].min()
+        allowed = 2.0 * np.abs(ref[group] - exact[group]).max() + np.spacing(np.float32(values[start]))
+        assert spread <= allowed, (f'{label}: {size} entries merged at {values[start]:.6g} span {spread:.3g}'
+                                   f' in float64, the reference telling apart {allowed:.3g}')
+
+
 def stressed(hooks, regime: str, seed: int) -> tuple[Chunk]:
     """Draw `seed`'s operands for `hooks` under `regime`."""
     transform, length = REGIMES[regime]
@@ -138,7 +158,5 @@ def test_the_chunked_op_stays_finite_distinct_and_exact_where_chunked_forms_brea
             ours, fp32, exact = (np.asarray(x) for x in (ours, fp32, exact))
             finite = np.isfinite(exact)
             assert np.all(np.isfinite(ours)[finite]), f'{leaf}: not finite where float64 is, seed {seed}'
-            assert np.unique(ours).size >= np.unique(fp32).size, (
-                f'{leaf}: {np.unique(ours).size} distinct values where the reference keeps '
-                f'{np.unique(fp32).size}, seed {seed}')
+            assert_kept_apart(ours, fp32, exact, f'{leaf}, seed {seed}')
     assert_as_exact(dew, reference, draws, f'{name} under {regime}', seeds=SEEDS.get((name, regime), 8))
