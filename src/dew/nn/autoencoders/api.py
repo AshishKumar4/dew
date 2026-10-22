@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import copy
+import dataclasses
 from abc import ABC, abstractmethod
-from typing import Any, ClassVar
+from collections.abc import Iterator, Mapping
+from typing import Self
 
 import jax
 import jax.numpy as jnp
@@ -9,6 +12,95 @@ import numpy as np
 from flax import linen as nn
 
 from dew.objectives.base import Variables
+
+type RecordValue = float | np.ndarray | None
+"""A value a latent normalization's record keeps: a number, one per channel or position, or absent."""
+
+
+def check_class(config: Mapping[str, object], names: tuple[str, ...], where, *,
+                nameless: bool = False) -> None:
+    """Refuse a published autoencoder's `config` whose `_class_name` is none of `names`, naming the class it
+    holds (a Wan VAE's given to the KL loader); one that names none is taken as `names`' own where
+    `nameless` (an older AutoencoderKL's config)."""
+    named = config.get("_class_name")
+    if named not in names and not (named is None and nameless):
+        raise ValueError(f"{where} holds a {named}, not an {names[0]}")
+
+
+def published_source(name_or_dir, revision, subfolder: str, names: tuple[str, ...], *, weights: bool,
+                     nameless: bool = False):
+    """A published autoencoder's directory and config (`dew.interop.components.component_source`), its
+    config checked first (`check_class`) and its weights fetched only after, so a foreign checkpoint is
+    refused by name before any of its weights is read."""
+    from dew.interop.components import component_source
+
+    directory, config = component_source(name_or_dir, revision, subfolder, weights=False)
+    check_class(config, names, directory, nameless=nameless)
+    if weights:
+        directory, config = component_source(name_or_dir, revision, subfolder, weights=True)
+    return directory, config
+
+
+@dataclasses.dataclass(frozen=True, eq=False)
+class LatentNormalization:
+    """A latent normalization, one description: the source values an autoencoder's record keeps
+    (`record`, as given) beside the shift and factor its autoencoder derived from them, written
+    together once and read-only after. Latents are normalized as `(z - shift) * factor` and restored
+    as `z / factor + shift`; one that `divides` normalizes as `(z - shift) / factor` and restores as
+    `z * factor + shift`, as its source rounds."""
+    record: Mapping[str, RecordValue]
+    shift: float | np.ndarray
+    factor: float | np.ndarray
+    divides: bool = False
+
+    def __post_init__(self):
+        # Read-only copies, so no reader writes the normalization through what it reads.
+        record = {name: _frozen(value) for name, value in self.record.items()}
+        object.__setattr__(self, 'record', _Record(record))
+        object.__setattr__(self, 'shift', _frozen(self.shift))
+        object.__setattr__(self, 'factor', _frozen(self.factor))
+
+    @property
+    def scale(self) -> float | np.ndarray:
+        """The factor a normalized latent is the shifted one times."""
+        return _frozen(np.asarray(np.float32(1.0) / self.factor)) if self.divides else self.factor
+
+    def normalized(self, latent: jnp.ndarray) -> jnp.ndarray:
+        shift, factor = (jnp.asarray(value, latent.dtype) for value in (self.shift, self.factor))
+        return (latent - shift) / factor if self.divides else (latent - shift) * factor
+
+    def restored(self, z: jnp.ndarray) -> jnp.ndarray:
+        shift, factor = (jnp.asarray(value, z.dtype) for value in (self.shift, self.factor))
+        return z * factor + shift if self.divides else z / factor + shift
+
+
+class _Record(Mapping[str, RecordValue]):
+    """A record's values, read-only (a mapping with no way to set one), and picklable as any object is."""
+
+    def __init__(self, values: Mapping[str, RecordValue]):
+        self._values = dict(values)
+
+    def __getitem__(self, name: str) -> RecordValue:
+        return self._values[name]
+
+    def __iter__(self) -> Iterator[str]:
+        return iter(self._values)
+
+    def __len__(self) -> int:
+        return len(self._values)
+
+
+def _frozen[T](value: T) -> T:
+    """`value`, or a read-only copy where it is an array."""
+    if not isinstance(value, np.ndarray):
+        return value
+    frozen = np.array(value, copy=True)
+    frozen.setflags(write=False)
+    return frozen
+
+
+IDENTITY = LatentNormalization({}, 0.0, 1.0)
+"""The normalization that leaves latents as they are."""
 
 
 class AutoEncoder(ABC):
@@ -18,49 +110,63 @@ class AutoEncoder(ABC):
     `[B, h, w, c]` and back. `encode` and `decode` here take video
     `[B, T, H, W, C]` frame by frame, unless the subclass encodes time itself
     (`encode_video`, `decode_video`, `latent_shape`), and they apply the
-    latent normalization. On the way out, latents are normalized as
-    (z - latent_shift) * latent_scale, and on the way in the normalization is
-    inverted, the SD3 convention. `latent_shift` and `latent_scale` are each
-    one number or one per latent channel. The defaults are the identity; set
-    them to the dataset's own latent mean and 1/std so the diffusion model
-    sees roughly unit-variance, zero-mean inputs.
+    latent normalization (`normalization`, `LatentNormalization`). On the way
+    out, latents are normalized as (z - latent_shift) * latent_scale, and on
+    the way in the normalization is inverted, the SD3 convention.
+    `latent_shift` and `latent_scale` are each one number or one per latent
+    channel, read from `normalization`; one that divides by its factor (Qwen-
+    Image's) rounds as a division does. The default is the identity; an
+    autoencoder normalized by the dataset's own latent mean and 1/std, so the
+    diffusion model sees roughly unit-variance, zero-mean inputs, is
+    `with_normalization`'s.
 
     The weights are an argument, as a `ConditionEncoder`'s are. `params` holds
     what a run loaded, and every call takes the tree to use, so the layout
     places the weights and the checkpoint stores them.
     """
 
-    latent_shift: float | np.ndarray | jax.Array = 0.0
-    latent_scale: float | np.ndarray | jax.Array = 1.0
+    normalization: LatentNormalization = IDENTITY
     params: Variables
     model: nn.Module
-
-    record_name: ClassVar[str | None] = None
-    """The name a built-in subclass's record goes by (`to_json`); None for
-    an autoencoder no record declares."""
-    record_module: ClassVar[type[Any]]
-    """The native module class a built-in subclass's `model` is, which its
-    record's 'model' rebuilds (each subclass's own `model` type)."""
 
     def record_arguments(self) -> dict:
         """The built-in subclass's constructor arguments besides `model` and
         `params`, as it was given them: its compute dtype and latent
         normalization."""
-        raise TypeError(f"{type(self).__name__} needs an explicit autoencoder record declaration")
+        raise TypeError(f"{type(self).__name__} is not a registered built-in (`pretrained.REGISTRATIONS`)")
+
+    @property
+    def latent_shift(self) -> float | np.ndarray:
+        return self.normalization.shift
+
+    @property
+    def latent_scale(self) -> float | np.ndarray:
+        return self.normalization.scale
+
+    def with_normalization(self, normalization: LatentNormalization) -> Self:
+        """This autoencoder normalizing its latents by `normalization` instead: a copy, this one
+        unchanged."""
+        replaced = copy.copy(self)
+        replaced.normalization = normalization
+        return replaced
 
     def to_json(self) -> dict:
-        """Return the record of this built-in autoencoder's constructor, without its parameters:
-        `record_name`, its module's fields and `record_arguments`.
+        """Return the record of this built-in autoencoder's constructor, without its parameters: its
+        registration's name (`pretrained.REGISTRATIONS`), its module's fields and `record_arguments`.
 
-        One no record declares (`record_name` None) raises `TypeError`.
+        One no registration names raises `TypeError`.
         """
-        if self.record_name is None:
-            raise TypeError(f"{type(self).__name__} needs an explicit autoencoder record declaration")
         from dew.registry import record_fields
+
+        from .pretrained import registration
+        registered = registration(type(self))
+        if registered is None:
+            raise TypeError(f"{type(self).__name__} is not a registered built-in "
+                            "(`pretrained.REGISTRATIONS`)")
         arguments = {name: np.asarray(value).tolist() if isinstance(value, np.ndarray | jax.Array) else value
                      for name, value in self.record_arguments().items()}
-        return {'name': self.record_name,
-                'fields': {'model': record_fields(self.model, self.record_module), **arguments}}
+        return {'name': registered.record,
+                'fields': {'model': record_fields(self.model, registered.module), **arguments}}
 
     @classmethod
     def from_json(cls, record, *, params: Variables) -> AutoEncoder:
@@ -69,22 +175,14 @@ class AutoEncoder(ABC):
         """
         from dew.registry import from_record
 
-        from .dc_ae import DCAutoencoder
-        from .flux2 import Flux2Autoencoder
-        from .qwen_image import QwenImageAutoencoder
-        from .rae import RAEAutoencoder
-        from .sd_vae import StableDiffusionVAE
-        from .wan import WanAutoencoder
-
-        built = {wrapper.record_name: wrapper for wrapper in (
-            StableDiffusionVAE, DCAutoencoder, WanAutoencoder, RAEAutoencoder, Flux2Autoencoder,
-            QwenImageAutoencoder)}
-        if record['name'] not in built:
-            raise ValueError(f"{record['name']!r} is not a built-in autoencoder declaration")
-        wrapper = built[record['name']]
+        from .pretrained import registration
+        registered = registration(record['name'])
+        if registered is None:
+            raise ValueError(f"{record['name']!r} is not a registered built-in autoencoder "
+                             "(`pretrained.REGISTRATIONS`)")
         fields = dict(record['fields'])
-        model = from_record(wrapper.record_module, fields.pop('model'))
-        return wrapper(model=model, params=params, **fields)
+        model = from_record(registered.module, fields.pop('model'))
+        return registered.wrapper(model=model, params=params, **fields)
 
     @abstractmethod
     def encode_batch(self, params, x: jnp.ndarray, key: jax.Array | None = None,
@@ -162,13 +260,11 @@ class AutoEncoder(ABC):
         encoder's sample drawn from `key` or read off `noise` (`encode_batch`)."""
         latent = (self.encode_video(params, x, key, noise) if x.ndim == 5
                   else self.encode_batch(params, x, key=key, noise=noise))
-        shift, scale = (jnp.asarray(value, latent.dtype) for value in (self.latent_shift, self.latent_scale))
-        return (latent - shift) * scale
+        return self.normalization.normalized(latent)
 
     def decode(self, params, z: jnp.ndarray) -> jnp.ndarray:
         """Decode normalized latents `[B, h, w, c]` or `[B, t, h, w, c]` back to images or video."""
-        shift, scale = (jnp.asarray(value, z.dtype) for value in (self.latent_shift, self.latent_scale))
-        z = z / scale + shift
+        z = self.normalization.restored(z)
         return self.decode_video(params, z) if z.ndim == 5 else self.decode_batch(params, z)
 
     def __call__(self, params, x: jnp.ndarray,
