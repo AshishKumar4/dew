@@ -36,6 +36,7 @@ from dew.nn.kernels.templates.attention import (
     padded_call,
 )
 from dew.nn.kernels.templates.base import Template, dividing
+from dew.nn.precision import float32_products, products_dtype
 
 DTYPES = (jnp.float32, jnp.bfloat16, jnp.float16)
 """The operand dtypes the kernels take, one on queries, keys and values alike."""
@@ -69,10 +70,11 @@ BLOCK = max(max(tiles.block_q for tiles in SPACE), max(tiles.block_k for tiles i
 
 
 def _dot(a: jax.Array, b: jax.Array, interpret: bool) -> jax.Array:
-    """`a @ b` accumulated in fp32: bf16's and fp16's own product, IEEE fp32 for fp32 operands;
-    interpreted, the CPU's own product."""
+    """`a @ b` accumulated in fp32: bf16's and fp16's own product, IEEE fp32 for fp32 operands
+    (`dew.nn.precision.float32_products`); interpreted, the CPU's product at that precision."""
     if interpret:
-        return jnp.dot(a, b, preferred_element_type=jnp.float32)
+        return jnp.dot(a, b, precision=float32_products(products_dtype(a, b)),
+                       preferred_element_type=jnp.float32)
     from jax.experimental.pallas import triton as plgpu
 
     return plgpu.dot(a, b, precision=jax.lax.Precision.HIGHEST).astype(jnp.float32)
