@@ -933,16 +933,17 @@ def image_batches(batch):
 def diffusion_run(directory, batch=RUN_BATCH, **trainer):
     """The smallest unconditional diffusion run: a tiny DiT over 8-pixel
     images, one step, nothing written but the record."""
+    from diffusion_support import images_of
+
     from dew.config import ModelConfig, TrainerConfig
-    from dew.config.data import ImageData
     from dew.objectives.diffusion import DiffusionRunConfig
 
     return DiffusionRunConfig(
         model=ModelConfig("simple_dit", {"patch_size": 4, "emb_features": 16,
                                          "num_layers": 1, "num_heads": 2, "dtype": "float32"}),
-        data=ImageData(source="tfds://oxford_flowers102", split="all", image_size=RES), text=None,
+        data=images_of("tfds://oxford_flowers102", RES, batch=batch), text=None,
             val_metrics=(),
-        trainer=TrainerConfig(name="quantized", checkpoint_dir=str(directory), batch_size=batch,
+        trainer=TrainerConfig(name="quantized", checkpoint_dir=str(directory),
                               steps=1, eval_every=None, checkpoint_every=None,
                               compilation_cache_dir=None, **trainer), objective=ObjectiveConfig("diffusion",
                               {"guidance": None, "steps": 2}))
@@ -1262,8 +1263,7 @@ def training_on_xla_default_options_flow():
 def assert_step_moves_by_the_hosts_gradient():
     """One SGD step of the trainer over a decoder quantized to int8 moves its weights by the gradient
     of its loss the host computes."""
-    from dew.config.data import RecordsData, loader
-    from dew.data import Loading
+    from dew.data import Loading, Memory
     from dew.training.trainer import Trainer
 
     # Eight rows, one on each of the host's eight test devices.
@@ -1271,8 +1271,8 @@ def assert_step_moves_by_the_hosts_gradient():
     batch = {"text": np.random.default_rng(0).integers(0, VOCAB, (8, length + 1)).astype(np.int32)}
     held = jax.device_get(tiny().init(jax.random.key(0), jnp.ones((1, length), jnp.int32)))
     objective = LMObjective(spec.apply(tiny()), seq_len=length, ema_decay=None, variables=held)
-    data = loader(RecordsData(source=[{"text": row} for row in batch["text"]]), batch=8,
-                  loading=Loading(workers=0, threads=1, read_buffer=1), read="memory")
+    rows = Memory([{"text": row} for row in batch["text"]]).read("memory")
+    data = rows.shuffle().repeat().batch(8).loading(Loading(workers=0, threads=1, read_buffer=1))
     state = Trainer(objective, optax.sgd(1.0), key=0).fit(data, steps=1, log_every=100)
     moved = jax.tree.map(lambda before, after: np.asarray(before, np.float64) - np.asarray(after, np.float64),
                          held["params"], jax.device_get(state.variables["params"]))

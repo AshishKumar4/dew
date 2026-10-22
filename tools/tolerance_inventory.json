@@ -109,10 +109,6 @@
    "comparisons": 1,
    "lane": "Models, Serving & RL"
   },
-  "tests/test_data.py": {
-   "comparisons": 1,
-   "lane": "Data"
-  },
   "tests/test_data_av.py": {
    "comparisons": 2,
    "lane": "Data"

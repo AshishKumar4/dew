@@ -15,7 +15,6 @@ import numpy as np
 import pytest
 
 from dew.artifacts import ImageGrid
-from dew.config.data import RecordsData, loader
 
 
 def test_mean_metric_counts_uneven_batches_and_weighted_totals():
@@ -41,13 +40,13 @@ def test_mean_lm_accuracy_matches_the_full_forward_after_a_real_fit(tmp_path):
 
     from dew import Checkpoints, Mean, Trainer
     from dew.artifacts import TokenScores
-    from dew.data import Loading
+    from dew.data import Loading, Memory
     from dew.nn.backbones import CausalTransformer
     from dew.objectives.lm import LMObjective
 
     tokens = np.tile(np.asarray([[0, 1, 2, 3, 0]], np.int32), (8, 1))
-    data = loader(RecordsData(source={"text": tokens}, validation={"text": tokens}), batch=8,
-        loading=Loading(workers=0, threads=1, read_buffer=1), read="memory")
+    rows = Memory({"text": tokens}).read("memory").loading(Loading(workers=0, threads=1, read_buffer=1))
+    data, validation = rows.shuffle().repeat().batch(8), rows.batch(8)
     model = CausalTransformer(vocab_size=4, emb_features=8, num_layers=1,
                               num_heads=2, mlp_features=16, max_seq_len=4, attention_impl="reference")
     objective = LMObjective(model, seq_len=4, ema_decay=None)
@@ -55,7 +54,8 @@ def test_mean_lm_accuracy_matches_the_full_forward_after_a_real_fit(tmp_path):
                   reads=TokenScores, name="accuracy", better="higher")
     trainer = Trainer(objective, optax.adam(.05), key=jax.random.key(0),
                       checkpoints=Checkpoints(str(tmp_path / "lm")))
-    final = trainer.fit(data, steps=4, log_every=1, eval_every=1, metrics=[metric], best=metric)
+    final = trainer.fit(data, steps=4, log_every=1, eval_every=1, metrics=[metric], best=metric,
+                        validation=validation)
     logits = model.apply(final.variables, jnp.asarray(tokens[:, :-1]), train=False)
     expected = float(jnp.mean(jnp.argmax(logits, axis=-1) == tokens[:, 1:]))
     assert trainer._display.evaluations["val"][-1].scores["val/accuracy"] == expected
@@ -73,7 +73,7 @@ def test_mean_image_error_matches_each_real_row_after_a_fit(tmp_path):
     import optax
 
     from dew import Checkpoints, Mean, Trainer
-    from dew.data import Loading
+    from dew.data import Loading, Memory
     from dew.objectives.base import Aux, Objective
 
     class Pixels(Objective):
@@ -87,13 +87,14 @@ def test_mean_image_error_matches_each_real_row_after_a_fit(tmp_path):
             return ImageGrid(jnp.broadcast_to(params["params"]["value"], batch["images"].shape))
 
     images = np.full((8, 2, 2, 1), .5, np.float32)
-    data = loader(RecordsData(source={"images": images}, validation={"images": images}), batch=8,
-        loading=Loading(workers=0, threads=1, read_buffer=1), read="memory")
+    rows = Memory({"images": images}).read("memory").loading(Loading(workers=0, threads=1, read_buffer=1))
+    data, validation = rows.shuffle().repeat().batch(8), rows.batch(8)
     metric = Mean(lambda grid, batch: np.square(grid.images - batch["images"]).mean(axis=(1, 2, 3)),
                   reads=ImageGrid, name="pixel_error", better="lower")
     trainer = Trainer(Pixels(), optax.sgd(.1), key=jax.random.key(0),
                       checkpoints=Checkpoints(str(tmp_path / "image")))
-    final = trainer.fit(data, steps=4, log_every=1, eval_every=1, metrics=[metric], best=metric)
+    final = trainer.fit(data, steps=4, log_every=1, eval_every=1, metrics=[metric], best=metric,
+                        validation=validation)
     expected = float((final.variables["params"]["value"] - .5) ** 2)
     assert trainer._display.evaluations["val"][-1].scores["val/pixel_error"] == pytest.approx(expected)
     trainer.checkpoints.wait()
