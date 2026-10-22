@@ -1,7 +1,9 @@
 """The duplicate-code gate: no code is written twice. It reads code two ways.
 
-- As text, with pylint's similarity check: a block of more than six lines two files share, once imports,
-  signatures, docstrings and comments are set aside, fails.
+- As text, with pylint's similarity check (`Symilar`, the `symilar` command's): a block of more than six
+  lines two files share, once imports, signatures, docstrings and comments are set aside, fails. No pragma
+  holds a copy: a `pylint: disable=duplicate-code` is not read. The script strips the files in a pool of
+  processes, one a processor, and compares them in one, in the files' order, as pylint's own run does.
 - As structure: two functions whose bodies are equal once every name is renamed in the order it is first
   used, every constant is read as its type, and docstrings and annotations are dropped (at least
   `FUNCTION_NODES` syntax nodes), fail, in one file or in two. So do six consecutive statements of two
@@ -31,8 +33,12 @@ It runs the test environment's pylint, which pyproject.toml's test extra pins.
 
 import argparse
 import ast
+import contextlib
 import hashlib
+import io
+import multiprocessing
 import os
+import re
 import subprocess
 import sys
 import time
@@ -41,9 +47,13 @@ from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
 from itertools import pairwise
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-ARGUMENTS = ("--disable=all", "--enable=duplicate-code", "--min-similarity-lines=6", "--ignore-imports=y",
-             "--ignore-signatures=y", "--ignore-docstrings=y", "--ignore-comments=y", "--score=n")
+if TYPE_CHECKING:
+    from pylint.checkers.symilar import LineSet
+
+SIMILARITY = {"min_lines": 6, "ignore_comments": True, "ignore_docstrings": True, "ignore_imports": True,
+              "ignore_signatures": True}
 """The text reading: pylint's similarity check, as the gate runs it."""
 
 FUNCTION_NODES = 20
@@ -392,7 +402,42 @@ def judged(hits: list[Hit], merged: str, top: Path) -> tuple[list[Hit], list[Hit
     return failing, [hit for hit in hits if hit not in failing]
 
 
-def main(arguments: Sequence[str]) -> int:
+def stripped(file: Path) -> list["LineSet"]:
+    """`file`'s lines as the text reading compares them (`SIMILARITY`), read in a process of its own."""
+    from pylint.checkers.symilar import Symilar
+
+    reading = Symilar(**SIMILARITY)
+    with file.open(encoding="utf-8") as stream:
+        reading.append_stream(str(file), stream)
+    return reading.get_map_data()
+
+
+def text_copies(files: list[Path], jobs: int) -> int:
+    """Print pylint's similarity report over `files`, stripped by `jobs` processes and compared in this one in
+    the files' order, and return how many lines the copies it finds repeat."""
+    from pylint.checkers.symilar import Symilar  # its import alone takes seconds, which the structure skips
+
+    if jobs > 1:
+        with multiprocessing.get_context("fork").Pool(jobs) as pool:
+            read = pool.map(stripped, files, chunksize=8)
+    else:
+        read = [stripped(file) for file in files]
+    reading = Symilar(**SIMILARITY)
+    reading.combine_mapreduce_data(read)
+    report = io.StringIO()
+    with contextlib.redirect_stdout(report):
+        reading.run()
+    print(report.getvalue(), end="")
+    # The report's last line: "TOTAL lines=N duplicates=M percent=P".
+    totals = re.search(r"^TOTAL lines=\d+ duplicates=(\d+) ", report.getvalue(), re.MULTILINE)
+    assert totals is not None, "pylint's similarity report ends with its totals"
+    return int(totals.group(1))
+
+
+def main(arguments: Sequence[str], jobs: int = 1) -> int:
+    """The gate, the text read by `jobs` processes: the script runs one a processor, each a fork of a
+    process that holds no threads; a caller in a process that may hold threads (a test, under JAX) reads
+    it in its own."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--base", help="a commit: a structural copy fails if written in more places than at"
                                        " its merge-base with HEAD")
@@ -418,10 +463,7 @@ def main(arguments: Sequence[str]) -> int:
     started = time.monotonic()
     text = 0
     if options.reading != "structure":
-        from pylint.lint import Run  # its import alone takes seconds, which the structure alone skips
-
-        # pylint reads a directory as a package; the files, as files.
-        text = Run([*ARGUMENTS, *map(str, files)], exit=False).linter.msg_status
+        text = text_copies(files, jobs)
     read = time.monotonic()
     hits = [] if options.reading == "text" else found({
         os.path.relpath(file.resolve(), top) if options.base else str(file): file.read_text()
@@ -439,4 +481,4 @@ def main(arguments: Sequence[str]) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:]))
+    sys.exit(main(sys.argv[1:], jobs=os.cpu_count() or 1))
