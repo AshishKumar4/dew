@@ -81,6 +81,7 @@ from .sharding import (
     sequence_shards,
     split_positions,
 )
+from .visibility import same_chunk, visible, windowed
 
 AttentionImpl = Literal["auto", "reference", "xla", "cudnn", "triton", "flash", "tpu"]
 """Names which kernel an attention call runs.
@@ -139,10 +140,8 @@ def causal_attention_mask(query_positions, kv_len: int, sliding_window=None, *, 
     if positions.ndim == 1:
         positions = positions[None, :]
     q_pos = positions[:, :, None]
-    k_pos = jnp.arange(kv_len)[None, None, :]
-    mask = (q_pos >= 0) & (k_pos <= q_pos)
-    if sliding_window is not None:
-        mask = mask & (k_pos > q_pos - sliding_window)
+    keys = jnp.arange(kv_len)[None, None, :]
+    mask = (q_pos >= 0) & visible(q_pos, keys, causal=True, window=sliding_window)
     if key_valid is not None:
         mask = mask & jnp.asarray(key_valid, bool)[:, None, :]
     return mask[:, None]
@@ -194,8 +193,9 @@ def structural_mask(query_positions, kv_len: int, causal: bool,
     positions = jnp.asarray(query_positions)
     if positions.ndim == 1:
         positions = positions[None, :]
-    distance = positions[:, :, None] - jnp.arange(kv_len)[None, None, :]
-    return ((positions[:, :, None] >= 0) & (jnp.abs(distance) < sliding_window))[:, None]
+    keys = jnp.arange(kv_len)[None, None, :]
+    queries = positions[:, :, None]
+    return ((queries >= 0) & windowed(queries, keys, sliding_window, causal=False))[:, None]
 
 
 def chunk_mask(query_positions, key_positions, chunk_size: int):
@@ -205,9 +205,8 @@ def chunk_mask(query_positions, key_positions, chunk_size: int):
     counted from the sequence start, so a packed document's positions place
     its chunks from its own first token.
     """
-    query_chunks = jnp.asarray(query_positions) // chunk_size
-    key_chunks = jnp.asarray(key_positions) // chunk_size
-    same = query_chunks[..., :, None] == key_chunks[..., None, :]
+    same = same_chunk(jnp.asarray(query_positions)[..., :, None], jnp.asarray(key_positions)[..., None, :],
+                      chunk_size)
     return same[..., None, :, :] if same.ndim == 3 else same[None, None]
 
 

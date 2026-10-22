@@ -68,6 +68,7 @@ from dew.nn.precision import at_least_fp32, float32_dot_general
 from dew.nn.rope import YarnScaling, rotary_freqs, rotate
 from dew.nn.sharding import RESIDUAL, LogicalAxes, constrain, down_projection, logical_axes
 from dew.nn.sparse_selection import candidate_pool, index_scores, selection_mask, top_k_keys, top_k_selection
+from dew.nn.visibility import visible
 
 COMPRESSORS = ('csa', 'hca', 'csa2')
 CANDIDATES = ('source', 'restrict')
@@ -711,8 +712,7 @@ class DeepseekV4Attention(FakeQuantizing):
         # The sliding window over the row's own positions: key j at or before
         # query i and within the window, its own position included
         # (masking_utils sliding_window_overlay, modeling_deepseek_v4.py:205).
-        query_pos, key_pos = rows[:, None], rows[None, :]
-        allowed = (key_pos <= query_pos) & (key_pos > query_pos - self.sliding_window)
+        allowed = visible(rows[:, None], rows[None, :], causal=True, window=self.sliding_window)
         allowed = jnp.broadcast_to(allowed, (batch, length, length))
         if cache is not None and cached_key is not None:
             slots, _, allocated = cache
@@ -840,7 +840,7 @@ class DSparkAttention(DeepseekV4Attention):
                                 dtype=at_least_fp32(x.dtype))
         place = down_projection(x, self.q_lora_rank + self.head_dim)
         query, _ = self._queries(x, cos, sin, place)
-        window = (places <= last[:, None]) & (places > last[:, None] - self.sliding_window)
+        window = visible(last[:, None], places, causal=True, window=self.sliding_window)
         if real is not None:
             window = window & real
         allowed = jnp.concatenate([
