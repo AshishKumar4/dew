@@ -230,24 +230,24 @@ def _forward_kernel(*refs, spec: algebra.Forward, score_kinds: tuple[Kind, ...],
                                                           value_ref[arg.key, :], product, others, own_tile)
         return algebra.Partial(acc, m, *sums), anchor, own, others_total
 
-    def start(*, shifted: bool) -> algebra.Partial:
+    def start(live) -> algebra.Partial:
         if initial:
-            return algebra.resumed(spec, *(ref[...] for ref in initial_refs), shifted=shifted)
+            return algebra.resumed(spec, *(ref[...] for ref in initial_refs), live=live)
         empty = algebra.empty(block_q, value_ref.shape[-1])
-        return algebra.headroomed(empty) if shifted else empty
+        return empty if live is None else algebra.headroomed(empty, live)
 
-    def walk(*, shifted: bool):
+    def walk(live=None):
+        # The plain walk where `live` is None, else the guarded one, those rows shifting.
         if not residuals:
-            return jax.lax.fori_loop(lo, hi, step, start(shifted=shifted))
+            return jax.lax.fori_loop(lo, hi, step, start(live))
         nothing = jnp.zeros((block_q,), jnp.float32)
-        carry = start(shifted=shifted), algebra.no_argmax(block_q), nothing, nothing
+        carry = start(live), algebra.no_argmax(block_q), nothing, nothing
         return jax.lax.fori_loop(lo, hi, tracked, carry)
 
     output_params = tuple(_tile_param(ref, kind, head, q_pos, None)
                           for ref, kind in zip(output_refs, output_kinds, strict=True))
-    plain, shifted = functools.partial(walk, shifted=False), functools.partial(walk, shifted=True)
     weighted = functools.partial(_weighted, value_ref) if residuals else (lambda state: state.acc)
-    walked = algebra.guarded(plain, shifted, weighted) if spec.headroom else plain()
+    walked = algebra.guarded(walk, walk, weighted) if spec.headroom else walk()
     state = _split_written(walked, value_ref, residual_refs) if residuals else walked
     out, m, denominator = algebra.finish(spec, state, initial=initial, output_mod=output_mod,
                                          output_params=output_params)

@@ -60,49 +60,57 @@ def _uniform(seed: int, low: float, high: float, shape=()) -> np.ndarray:
     return np.asarray(jax.random.uniform(jax.random.key(seed), shape, jnp.float32, low, high))
 
 
+ROWS = 32
+"""The independent instances a draw holds along its batch, so a family's draw resolves check 1 over its
+seeds (`reference_error.seeds_for`): each row its own drawn values under the family's structure."""
+
+
 def _first(sizes: np.ndarray, width: int) -> np.ndarray:
-    """`[1, len(sizes), 1, width]` vectors of `sizes` in their first entry and zeros past it, so a
-    product of two of them is its sizes' product exactly at every width."""
-    out = np.zeros((1, len(sizes), 1, width), np.float32)
-    out[0, :, 0, 0] = sizes
+    """`[B, n, 1, width]` vectors of `sizes` `[B, n]` in their first entry and zeros past it, so a product of
+    two of them is its sizes' product exactly at every width."""
+    sizes = np.asarray(sizes, np.float32)
+    out = np.zeros((*sizes.shape, 1, width), np.float32)
+    out[..., 0, 0] = sizes
     return out
 
 
-def _causal(queries: int, keys: int) -> np.ndarray:
-    return np.tril(np.ones((queries, keys), bool))[None, None]
+def _causal(queries: int, keys: int, rows: int = 1) -> np.ndarray:
+    return np.broadcast_to(np.tril(np.ones((queries, keys), bool)), (rows, 1, queries, keys))
 
 
 def _ties(width: int, cotangent: float) -> Callable[[int], tuple]:
-    """One query of 1 over two keys whose logits are a drawn fp32 near 2^30 and the one a drawn 1 to 4
-    ulps below it (Sol's case: the reference weighs the first alone, which a base-2 fold rounding each
-    logit at log2(e) times its size can tie), their keys scaled by sqrt(`width`) so the logits are those
-    at every scale; values and cotangent in their first entry, drawn in [-1, 1), the cotangent times
-    `cotangent`, so their products stay finite in the reference's backward."""
+    """`ROWS` rows of one query of 1 over two keys whose logits are a drawn fp32 near 2^30 and the one a
+    drawn 1 to 4 ulps below it (Sol's case: the reference weighs the first alone, which a base-2 fold
+    rounding each logit at log2(e) times its size can tie), their keys scaled by sqrt(`width`) so the
+    logits are those at every scale; values and cotangent in their first entry, drawn in [-1, 1), the
+    cotangent times `cotangent`, so their products stay finite in the reference's backward."""
     def draw(seed: int):
-        top = np.float32(_uniform(seed, 2.0 ** 30, 2.0 ** 31))
-        below = top
-        for _ in range(int(_uniform(seed + 1, 1, 5))):
-            below = np.nextafter(below, np.float32(0))
-        value = _first(_uniform(seed + 2, -1.0, 1.0, (2,)), width)
-        dout = _first(_uniform(seed + 3, -1.0, 1.0, (1,)) * np.float32(cotangent), width)
+        top = _uniform(seed, 2.0 ** 30, 2.0 ** 31, (ROWS,))
+        below = top.copy()
+        for row, ulps in enumerate(np.asarray(_uniform(seed + 1, 1, 5, (ROWS,)), np.int32)):
+            for _ in range(ulps):
+                below[row] = np.nextafter(below[row], np.float32(0))
+        value = _first(_uniform(seed + 2, -1.0, 1.0, (ROWS, 2)), width)
+        dout = _first(_uniform(seed + 3, -1.0, 1.0, (ROWS, 1)) * np.float32(cotangent), width)
         root = np.float32(np.sqrt(width))
-        return (_first(np.ones(1, np.float32), width), _first(np.asarray([top, below]) * root, width), value,
-                None, dout)
+        keys = _first(np.stack([top, below], axis=1) * root, width)
+        return _first(np.ones((ROWS, 1), np.float32), width), keys, value, None, dout
 
     return draw
 
 
 def _families() -> dict[str, Family]:
-    every = np.ones((1, 1, 1, 1), bool)
+    def kept(queries: int, keys: int) -> np.ndarray:
+        return np.ones((ROWS, 1, queries, keys), bool)
 
     def near_max_logit(width: int):
-        # One key whose product with the query is a drawn fp32 near its largest (its key's first entry in
-        # [1/2, 1) times a query near fp32's largest): the output is the key's value.
+        # One key a row whose product with the query is a drawn fp32 near its largest (its key's first
+        # entry in [1/2, 1) times a query near fp32's largest): the output is the key's value.
         def draw(seed):
-            size = _uniform(seed, 1e38, 3e38)
-            key = _first(_uniform(seed + 1, 0.5, 1.0, (1,)), width)
-            value, dout = _normal(seed + 2, (1, 1, 1, width), (1, 1, 1, width))
-            return _first(np.asarray([size], np.float32), width), key, value, None, dout
+            size = _uniform(seed, 1e38, 3e38, (ROWS, 1))
+            key = _first(_uniform(seed + 1, 0.5, 1.0, (ROWS, 1)), width)
+            value, dout = _normal(seed + 2, (ROWS, 1, 1, width), (ROWS, 1, 1, width))
+            return _first(size, width), key, value, None, dout
         return draw
 
     def large_values(keys: int):
@@ -111,13 +119,13 @@ def _families() -> dict[str, Family]:
         # cotangent is drawn times 2^-8, so the cotangent's product with the values stays finite in the
         # reference's backward too.
         def draw(seed):
-            value = _uniform(seed, 3.0e38, 3.4e38, (1, keys, 1, 16))
-            (dout,) = _normal(seed + 1, (1, 1, 1, 16))
-            return (np.zeros((1, 1, 1, 16), np.float32), np.zeros((1, keys, 1, 16), np.float32), value, None,
-                    dout * np.float32(2.0 ** -8))
+            value = _uniform(seed, 3.0e38, 3.4e38, (ROWS, keys, 1, 16))
+            (dout,) = _normal(seed + 1, (ROWS, 1, 1, 16))
+            return (np.zeros((ROWS, 1, 1, 16), np.float32), np.zeros((ROWS, keys, 1, 16), np.float32), value,
+                    None, dout * np.float32(2.0 ** -8))
         return draw
 
-    def drawn(queries, keys, width=16, rows=1, size=1.0):
+    def drawn(queries, keys, width=16, rows=ROWS, size=1.0):
         def draw(seed):
             query, key, value, dout = _normal(seed, (rows, queries, 2, width), (rows, keys, 2, width),
                                               (rows, keys, 2, width), (rows, queries, 2, width))
@@ -132,62 +140,61 @@ def _families() -> dict[str, Family]:
         return draw
 
     def small_weight(dtype):
-        # A weight of exp(-l), l drawn in [80, 87), normal in fp32 and bf16, on a value of 2^e, e drawn in
-        # [120, 126], among 256 keys of which two are seen: the output is that product alone, which a
-        # weight shifted for the keys' count before it is narrowed would lose.
+        # Eight queries a row over 256 keys of which two are seen: a key of logit 0 and one whose logit is
+        # each query's drawn size in [3, 5) times its key's -l, l drawn in [16, 21), so its weight is
+        # exp(-20) to exp(-105), normal in fp32 and bf16, on a value of 2^e, e drawn in [120, 126]: its
+        # share of the output, a weight shifted for the keys' count before it is narrowed would lose.
         def draw(seed):
-            key = np.zeros((1, 256, 1, 16), np.float32)
-            key[0, 1, 0, 0] = -_uniform(seed, 80.0, 87.0)
-            value = np.zeros((1, 256, 1, 16), np.float32)
-            value[0, 1, 0, 0] = 2.0 ** np.floor(_uniform(seed + 1, 120.0, 127.0))
-            (dout,) = _normal(seed + 2, (1, 1, 1, 16))
-            return _first(np.asarray([4.0], np.float32), 16), key, value, None, dout
-        seen = np.zeros((1, 1, 1, 256), bool)
+            query = _first(_uniform(seed + 4, 3.0, 5.0, (ROWS, 8)), 16)
+            key = np.zeros((ROWS, 256, 1, 16), np.float32)
+            key[:, 1, 0, 0] = -_uniform(seed, 16.0, 21.0, (ROWS,))
+            value = np.zeros((ROWS, 256, 1, 16), np.float32)
+            value[:, 1, 0, 0] = 2.0 ** np.floor(_uniform(seed + 1, 120.0, 127.0, (ROWS,)))
+            value[:, :2, 0, 1:] = _uniform(seed + 3, -1.0, 1.0, (ROWS, 2, 15))
+            (dout,) = _normal(seed + 2, (ROWS, 8, 1, 16))
+            return query, key, value, None, dout
+        seen = np.zeros((ROWS, 1, 8, 256), bool)
         seen[..., :2] = True
-        return Family(draw, seen, {"lengths": np.asarray([2])}, dtype=dtype)
+        return Family(draw, seen, {"lengths": np.full(ROWS, 2)}, dtype=dtype)
 
     families = {
-        "ties at scale 1": Family(_ties(1, 1.0), np.ones((1, 1, 1, 2), bool)),
-        "ties at scale 1, cotangents near 2**125": Family(_ties(1, 2.0 ** 125), np.ones((1, 1, 1, 2), bool)),
-        "ties at scale 1/2": Family(_ties(4, 1.0), np.ones((1, 1, 1, 2), bool), folded=False),
-        "ties at scale 1/2, cotangents near 2**125": Family(_ties(4, 2.0 ** 125), np.ones((1, 1, 1, 2), bool),
-                                                            folded=False),
-        "ties at scale 1/4": Family(_ties(16, 1.0), np.ones((1, 1, 1, 2), bool), folded=False),
-        "ties at scale 1/4, cotangents near 2**125": Family(_ties(16, 2.0 ** 125),
-                                                            np.ones((1, 1, 1, 2), bool), folded=False),
-        "a logit near fp32's largest": Family(near_max_logit(1), every),
-        "a logit near fp32's largest at scale 1/4": Family(near_max_logit(16), every),
-        "values near fp32's largest over 2 equal keys": Family(large_values(2), np.ones((1, 1, 1, 2), bool)),
-        "values near fp32's largest over 64 equal keys": Family(large_values(64),
-                                                                np.ones((1, 1, 1, 64), bool)),
+        "ties at scale 1": Family(_ties(1, 1.0), kept(1, 2)),
+        "ties at scale 1, cotangents near 2**125": Family(_ties(1, 2.0 ** 125), kept(1, 2)),
+        "ties at scale 1/2": Family(_ties(4, 1.0), kept(1, 2), folded=False),
+        "ties at scale 1/2, cotangents near 2**125": Family(_ties(4, 2.0 ** 125), kept(1, 2), folded=False),
+        "ties at scale 1/4": Family(_ties(16, 1.0), kept(1, 2), folded=False),
+        "ties at scale 1/4, cotangents near 2**125": Family(_ties(16, 2.0 ** 125), kept(1, 2), folded=False),
+        "a logit near fp32's largest": Family(near_max_logit(1), kept(1, 1)),
+        "a logit near fp32's largest at scale 1/4": Family(near_max_logit(16), kept(1, 1)),
+        "values near fp32's largest over 2 equal keys": Family(large_values(2), kept(1, 2)),
+        "values near fp32's largest over 64 equal keys": Family(large_values(64), kept(1, 64)),
         # A key at its row's maximum weighs 1 exactly however its scaling contracts into the subtraction
         # (`algebra.weights`), so one key's output is its value, folded or natural.
-        "one key": Family(drawn(4, 1), np.ones((1, 1, 4, 1), bool)),
-        "a sink and one key": Family(with_sinks(drawn(16, 1), -3.0, 3.0), np.ones((1, 1, 16, 1), bool)),
-        "a sink near fp32's largest and one key": Family(with_sinks(drawn(16, 1), 1e38, 3e38),
-                                                         np.ones((1, 1, 16, 1), bool)),
-        "a sink and one key, its logit near fp32's largest": Family(
-            with_sinks(near_max_logit(1), -3.0, 3.0), every),
-        "a sink near fp32's largest at scale 1/4": Family(with_sinks(drawn(16, 1), 1e38, 3e38),
-                                                          np.ones((1, 1, 16, 1), bool)),
-        "logits near 1e4": Family(drawn(64, 64, size=1e4), _causal(64, 64), {"causal": True}),
+        "one key": Family(drawn(4, 1), kept(4, 1)),
+        "a sink and one key": Family(with_sinks(drawn(16, 1), -3.0, 3.0), kept(16, 1)),
+        "a sink near fp32's largest and one key": Family(with_sinks(drawn(16, 1), 1e38, 3e38), kept(16, 1)),
+        "a sink and one key, its logit near fp32's largest": Family(with_sinks(near_max_logit(1), -3.0, 3.0),
+                                                                    kept(1, 1)),
+        "a sink near fp32's largest at scale 1/4": Family(with_sinks(drawn(16, 1), 1e38, 3e38), kept(16, 1)),
+        "logits near 1e4": Family(drawn(64, 64, rows=16, size=1e4), _causal(64, 64, 16), {"causal": True}),
         # Folded, the backward takes the base-2 maximum back to natural units, which at 1e30 rounds the
         # anchor's own weight away from 1 by more than any bound states.
-        "logits near 1e30": Family(drawn(64, 64, size=1e30), _causal(64, 64), {"causal": True}, folded=False),
+        "logits near 1e30": Family(drawn(64, 64, rows=4, size=1e30), _causal(64, 64, 4), {"causal": True},
+                                   folded=False),
         "a small weight on a large value, float32": small_weight("float32"),
         "a small weight on a large value, bfloat16": small_weight("bfloat16"),
     }
-    empty = np.ones((2, 1, 4, 4), bool)
-    empty[1] = False
-    families["a row of no keys"] = Family(drawn(4, 4, rows=2), empty, {"lengths": np.asarray([4, 0])},
-                                          empty=np.asarray([[False] * 4, [True] * 4]))
-    before = _causal(4, 4) & (np.arange(4) >= 2)
+    lengths = np.tile([4, 0], ROWS // 2)
+    empty = np.broadcast_to((lengths > 0)[:, None, None, None], (ROWS, 1, 4, 4))
+    families["a row of no keys"] = Family(drawn(4, 4), empty, {"lengths": lengths},
+                                          empty=np.broadcast_to((lengths == 0)[:, None], (ROWS, 4)))
+    before = _causal(4, 4, ROWS) & (np.arange(4) >= 2)
     families["causal queries before every key"] = Family(
-        drawn(4, 4), before, {"causal": True, "starts": np.asarray([2])},
-        empty=np.asarray([[True, True, False, False]]))
-    ids = np.asarray([[1, 2, 3, 3]], np.int32)
-    families["documents of one key"] = Family(drawn(4, 4), _causal(4, 4) & (ids[:, None, :, None] ==
-                                                                            ids[:, None, None, :]),
+        drawn(4, 4), before, {"causal": True, "starts": np.full(ROWS, 2)},
+        empty=np.broadcast_to(np.asarray([True, True, False, False]), (ROWS, 4)))
+    ids = np.tile(np.asarray([[1, 2, 3, 3]], np.int32), (ROWS, 1))
+    families["documents of one key"] = Family(drawn(4, 4), _causal(4, 4, ROWS) & (ids[:, None, :, None] ==
+                                                                                  ids[:, None, None, :]),
                                               {"causal": True, "segment_ids": ids})
     return families
 

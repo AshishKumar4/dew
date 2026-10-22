@@ -172,17 +172,19 @@ def _attend(query: jax.Array, span: tuple, read, block: int, spec: algebra.Forwa
         product = _dot(algebra.narrow(weights, value.dtype), value, interpret)
         return algebra.Partial(algebra.rescale(state.acc, factor) + product, m, denominator, shift, reach)
 
-    def walk(*, shifted: bool) -> algebra.Partial:
+    def walk(live=None) -> algebra.Partial:
+        # The plain walk where `live` is None, else the guarded one, those rows shifting.
         start = algebra.empty(QUERIES, query.shape[-1])
         if sink is not None:
             real = sink > -jnp.inf
-            start = algebra.resumed(spec, sink, real.astype(jnp.float32), start.acc, shifted=shifted)
-        elif shifted:
-            start = algebra.headroomed(start)
+            start = algebra.resumed(spec, sink, real.astype(jnp.float32), start.acc, live=live)
+        elif live is not None:
+            start = algebra.headroomed(start, live)
         return jax.lax.fori_loop(*steps, body, start)
 
-    plain, shifted = functools.partial(walk, shifted=False), functools.partial(walk, shifted=True)
-    return algebra.headroomed(algebra.guarded(plain, shifted) if spec.headroom else plain())
+    # A slice's state carries a bound on its values (`algebra.headroomed`), so a merge of slices each
+    # finite but whose join overflows shifts as it needs (`algebra.merge`).
+    return algebra.headroomed(algebra.guarded(walk, walk) if spec.headroom else walk())
 
 
 def _slice(span: tuple, block: int, split, splits: int) -> tuple:
@@ -202,7 +204,9 @@ def _write(out_refs, spec: algebra.Forward, state: algebra.Partial):
         out = algebra.finish(spec, state, initial=True)[0]
         out_refs[0][...] = out.astype(out_refs[0].dtype)
     else:
-        for ref, value in zip(out_refs, state, strict=True):
+        # The state's sums, maxima, totals, shifts and bounds; which rows shifted is the merge's own to
+        # find again (`algebra.merge`).
+        for ref, value in zip(out_refs, state[:5], strict=True):
             ref[...] = value
 
 
