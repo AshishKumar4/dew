@@ -295,7 +295,7 @@ def solid_colour_images(rs, n):
     return jnp.asarray(np.clip(colours + rs.uniform(-15, 15, (n, RES, RES, 3)), 0, 255))
 
 
-def context_ablation(objective, params, ema, data, mask, rng, draws=8):
+def context_errors(objective, params, ema, data, mask, rng, draws=8):
     """Each pair of consecutive images' mean prediction error from their own contexts and from each
     other's, over `draws` mask draws: two arrays of a value a pair, pairs being independent draws."""
     n, blocks = data.shape[0], mask.num_targets
@@ -366,7 +366,7 @@ def test_training_makes_the_prediction_depend_on_the_context(mask):
                                 momentum=(0.9, 0.99), momentum_steps=150)
     objective = trainer.objective
     initial = trainer.initial_state()
-    before = context_ablation(objective, initial.variables, initial.ema,
+    before = context_errors(objective, initial.variables, initial.ema,
                               normalized_test, mask, jax.random.PRNGKey(9))
     fresh = paired_statistic(1.5 * before[0] - before[1])
     assert fresh > 7.0, f"a fresh predictor favours its own context (t = {fresh:.1f})"
@@ -388,7 +388,7 @@ def test_training_makes_the_prediction_depend_on_the_context(mask):
 
     state = trainer.fit(dataset(batches, batch=16), steps=150, log_every=50)
 
-    after = context_ablation(objective, state.variables, state.ema,
+    after = context_errors(objective, state.variables, state.ema,
                              normalized_test, mask, jax.random.PRNGKey(9))
     halved = paired_statistic(before[0] - 2 * after[0])
     assert halved > 7.0, f"held-out prediction error did not halve (t = {halved:.1f})"
