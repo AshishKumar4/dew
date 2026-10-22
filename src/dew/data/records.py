@@ -18,7 +18,7 @@ import json
 import logging
 import types
 import typing
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from enum import Enum
 from typing import Literal, TypeGuard, Union
 
@@ -88,11 +88,10 @@ def decode(written: Mapping[str, object], *, trust: Sequence[str] = ()) -> Pipel
 
 
 def override(written: Mapping[str, object], path: str, value: JSON) -> dict[str, JSON]:
-    """`written` with one setting of one call of `pipe` set to `value`, parsed JSON and read against
-    the setting's annotation. `path` is "<preset>.<setting>", the preset by its name where the
-    chain's own stages call it once, by its entry's place among the record's stages ("2.seq_len"),
-    or "source" for the call that made its store. A setting that call doesn't take, or any where no
-    call made the store, sets that field of the store the chain reads (`_source_with`). A call
+    """`written` with one setting of one call of `pipe`, or of its store, set to `value`, parsed JSON
+    and read against the setting's annotation. `path` is "<preset>.<setting>", the preset by its
+    name where the chain's own stages call it once, or by its entry's place among the record's
+    stages ("2.seq_len"); or "source.<setting>" for what the chain reads (`_source_with`). A call
     inside a mix or phases is not addressed here. Reading the record back makes the call again, so
     the stages it makes follow it."""
     version = written.get("version")
@@ -102,23 +101,32 @@ def override(written: Mapping[str, object], path: str, value: JSON) -> dict[str,
     if not target or not setting:
         raise ValueError(f"an override names a call and its setting, `<preset>.<setting>`, not {path!r}")
     changed = record(json.loads(json.dumps(written)), "chain")
-    source = record(changed["source"], "chain source")
-    if target == "source" and not ("pipe" in source and _takes(source, setting)):
-        moved = json_value(_source_with(changed, setting, value), "chain")
-        if not isinstance(moved, dict):
-            raise ValueError("a chain's record is a mapping")
-        return moved
-    stages = _entries(changed.get("stages", []), "stages")
-    calls = [(str(index), record(stage, "stage")) for index, stage in enumerate(stages)
-             if isinstance(stage, Mapping) and "pipe" in stage]
-    if "pipe" in source:
-        calls.append(("source", source))
-    named = [call for label, call in calls if target in (label, str(call["pipe"]).rpartition(":")[2])]
-    if len(named) != 1:
-        found = [f"{str(call['pipe']).rpartition(':')[2]}@{label}" for label, call in calls]
-        raise ValueError(f"an override names {target!r}, which names {len(named)} of the chain's calls "
-                         f"{found}; name one by its place, `<index>.{setting}`")
-    (call,) = named
+    if target == "source":
+        overridden = _source_with(changed, setting, value)
+    else:
+        stages = _entries(changed.get("stages", []), "stages")
+        calls = [(str(index), record(stage, "stage")) for index, stage in enumerate(stages)
+                 if isinstance(stage, Mapping) and "pipe" in stage]
+        named = [call for label, call in calls if target in (label, str(call["pipe"]).rpartition(":")[2])]
+        if len(named) != 1:
+            found = [f"{str(call['pipe']).rpartition(':')[2]}@{label}" for label, call in calls]
+            raise ValueError(f"an override names {target!r}, which names {len(named)} of the chain's calls "
+                             f"{found}; name one by its place, `<index>.{setting}`")
+        (call,) = named
+        updated = _call_with(call, setting, value)
+        if updated is None:
+            raise ValueError(f"{call['pipe']} takes no setting {setting!r}; it takes "
+                             f"{list(inspect.signature(_function(call['pipe'])).parameters)[1:]}")
+        overridden = {**changed, "stages": [updated if stage is call else stage for stage in stages]}
+    written_back = json_value(overridden, "chain")
+    if not isinstance(written_back, dict):
+        raise ValueError("a chain's record is a mapping")
+    return written_back
+
+
+def _call_with(call: Mapping[str, object], setting: str, value: JSON) -> Mapping[str, object] | None:
+    """`call`, a call of `pipe`, with its `setting` set to `value`, read against the setting's
+    annotation; None where its function takes no such setting."""
     function = _function(call["pipe"])
     parameters = inspect.signature(function).parameters
     reads = next(iter(parameters))
@@ -126,46 +134,36 @@ def override(written: Mapping[str, object], path: str, value: JSON) -> dict[str,
         raise ValueError(f"{call['pipe']}'s {reads} is the dataset it reads, which no override sets")
     if setting not in parameters and not any(parameter.kind is inspect.Parameter.VAR_KEYWORD
                                              for parameter in parameters.values()):
-        raise ValueError(f"{call['pipe']} takes no setting {setting!r}; it takes "
-                         f"{[name for name in parameters if name != reads]}")
+        return None
     # The typed walk reads a record or a list against the setting's annotation, refusing one it
-    # doesn't build; a scalar it passes as it is, which `_fits` checks.
+    # doesn't build; `_fits` checks what a scalar or a container is.
     read_arguments(function, {setting: value})
     annotation = parameter_type(function, setting) if setting in parameters else None
     if not _fits(value, annotation):
         raise ValueError(f"{call['pipe']}'s {setting} is {annotation}, not {value!r}")
-    updated = {**call, "settings": {**record(call.get("settings", {}), "settings"), setting: value}}
-    overridden = ({**changed, "source": updated} if call is source
-                  else {**changed, "stages": [updated if stage is call else stage for stage in stages]})
-    written_back = json_value(overridden, "chain")
-    if not isinstance(written_back, dict):
-        raise ValueError("a chain's record is a mapping")
-    return written_back
-
-
-def _takes(call: Mapping[str, object], setting: str) -> bool:
-    """Whether the function a call of `pipe` names takes `setting`, by name or as a keyword."""
-    parameters = inspect.signature(_function(call["pipe"])).parameters
-    return setting in parameters or any(parameter.kind is inspect.Parameter.VAR_KEYWORD
-                                        for parameter in parameters.values())
+    return {**call, "settings": {**record(call.get("settings", {}), "settings"), setting: value}}
 
 
 def _source_with(chain: Mapping[str, object], setting: str, value: JSON) -> Mapping[str, object]:
-    """`chain`'s record with `setting` set on the store it reads: its store's (`_store_with`), or,
-    where a call made the store from a chain it read, that chain's."""
+    """`chain`'s record with `setting` set on what it reads, one rule at every depth: the call that
+    made its store where that call takes the setting, which so shadows a store's field of its name;
+    else, through that call's input, the chain it read; else its store's field (`_store_with`)."""
     source = record(chain["source"], "chain source")
     if "pipe" not in source:
         return {**chain, "source": _store_with(source, setting, value)}
-    if "input" not in source:
-        raise ValueError(f"{source['pipe']} made the chain's store, and takes no setting {setting!r}")
-    read = _source_with(record(source["input"], "a call's input"), setting, value)
-    return {**chain, "source": {**source, "input": read}}
+    updated = _call_with(source, setting, value)
+    if updated is None:
+        if "input" not in source:
+            raise ValueError(f"{source['pipe']} made the chain's store, and takes no setting {setting!r}")
+        updated = {**source, "input": _source_with(record(source["input"], "a call's input"), setting, value)}
+    return {**chain, "source": updated}
 
 
 def _store_with(store: Mapping[str, object], setting: str, value: JSON) -> Mapping[str, object]:
     """`store`, a store's class record, with its field `setting` set to `value`, read against the
     field's annotation; where its class has no such field, the store it selects from (its own
-    `source`, as a holdout's selection holds it) with it, and so on down."""
+    `source`, as a holdout's selection holds it) with it, and so on down. This is the boundary where
+    a record's JSON meets a store's fields, so it asks the value what it is."""
     named = class_record(store)
     if named is None:
         raise ValueError(f"a chain's store is a class record, {{'class': ..., 'fields': {{...}}}}, "
@@ -177,7 +175,7 @@ def _store_with(store: Mapping[str, object], setting: str, value: JSON) -> Mappi
     declared = [field.name for field in dataclasses.fields(kind) if field.init]
     if setting in declared:
         annotation = declared_type(kind, setting)
-        if annotation is not None:
+        if annotation is not None and isinstance(value, (dict, list)):
             # The typed walk refuses a record or a list it doesn't build; `_fits` checks a scalar.
             from_record(_annotated(annotation), value)
         if not _fits(value, annotation):
@@ -192,9 +190,10 @@ def _store_with(store: Mapping[str, object], setting: str, value: JSON) -> Mappi
 
 def _fits(value: JSON, annotation: Annotation) -> bool:
     """Whether a setting a record holds, JSON, is of the type its annotation declares, as far as a
-    scalar shows it; a record or a list the typed walk read is its type already. This is the
+    scalar shows it, and a list a sequence's or a mapping a mapping's or a class's, which the typed
+    walk read against it. This is the
     boundary where a record's JSON meets a function's parameters, so it asks each value its type."""
-    if annotation is None or isinstance(value, (dict, list)):
+    if annotation is None:
         return True
     if isinstance(annotation, typing.TypeAliasType):
         return _fits(value, annotation.__value__)
@@ -203,6 +202,12 @@ def _fits(value: JSON, annotation: Annotation) -> bool:
         return any(_fits(value, member) for member in typing.get_args(annotation))
     if origin is Literal:
         return value in typing.get_args(annotation)
+    if isinstance(value, list):
+        return (origin or annotation) in (list, tuple, Sequence, Iterable)
+    if isinstance(value, dict):
+        # A mapping, or a class's record, which the typed walk read against the class.
+        return (origin or annotation) in (dict, Mapping) or (
+            isinstance(annotation, type) and annotation not in (str, bytes, int, float, bool, type(None)))
     if annotation is type(None):
         return value is None
     if annotation is float:
@@ -358,25 +363,25 @@ def _counts(value: Configured) -> TypeGuard[Callable[[Batch], int]]:
     return callable(value)
 
 
-def _same(original: object, rebuilt: object, where: str, *, sequences: bool = False) -> str | None:
+def _same(original: object, rebuilt: object, where: str, *, sequences: bool = False,
+          field: bool = False) -> str | None:
     """Where `rebuilt` differs from `original`, None where it is the same value: of the same type at
     every level, a tuple a tuple and a list a list, an array of the same dtype and values, a
     function of the same code over the same values, a class or a method of the same object. With
-    `sequences`, a value or a dataclass's field may be any sequence where it was another, as a
-    store's settings may, and so may the settings of the dataclasses a sequence or mapping holds,
-    as a concatenation's stores are, but anything else they hold keeps its own types. A value no
-    record carries is refused."""
+    `sequences`, a dataclass's `field`, a setting, may be any sequence where it was another, as a
+    store's settings may, at any depth (a concatenation's stores' settings too), but what a
+    sequence or mapping holds keeps its own types. A value no record carries is refused."""
 
-    alike = sequences and isinstance(original, (list, tuple)) and isinstance(rebuilt, (list, tuple))
+    alike = sequences and field and isinstance(original, (list, tuple)) and isinstance(rebuilt, (list, tuple))
     if type(original) is not type(rebuilt) and not alike:
         return f"{where} is a {type(original).__name__} and reads back a {type(rebuilt).__name__}"
     if isinstance(original, np.ndarray) and isinstance(rebuilt, np.ndarray):
         same = original.dtype == rebuilt.dtype and np.array_equal(original, rebuilt)
         return None if same else f"{where} reads back other values"
     if dataclasses.is_dataclass(original) and not isinstance(original, type):
-        differences = (_same(getattr(original, field.name), getattr(rebuilt, field.name),
-                             f"{where}.{field.name}", sequences=sequences)
-                       for field in dataclasses.fields(original))
+        differences = (_same(getattr(original, setting.name), getattr(rebuilt, setting.name),
+                             f"{where}.{setting.name}", sequences=sequences, field=True)
+                       for setting in dataclasses.fields(original))
         return next((difference for difference in differences if difference is not None), None)
     if isinstance(original, types.FunctionType) and isinstance(rebuilt, types.FunctionType):
         # A function a call makes afresh is the same where its code and what it closes over are.
@@ -396,15 +401,13 @@ def _same(original: object, rebuilt: object, where: str, *, sequences: bool = Fa
     if isinstance(original, Mapping) and isinstance(rebuilt, Mapping):
         if list(original) != list(rebuilt):
             return f"{where} reads back other keys"
-        differences = (_same(value, rebuilt[key], f"{where}[{key!r}]", sequences=sequences
-                             and dataclasses.is_dataclass(value) and not isinstance(value, type))
+        differences = (_same(value, rebuilt[key], f"{where}[{key!r}]", sequences=sequences)
                        for key, value in original.items())
         return next((difference for difference in differences if difference is not None), None)
     if isinstance(original, (list, tuple)) and isinstance(rebuilt, (list, tuple)):
         if len(original) != len(rebuilt):
             return f"{where} reads back {len(rebuilt)} entries, not {len(original)}"
-        differences = (_same(left, right, f"{where}[{index}]", sequences=sequences
-                             and dataclasses.is_dataclass(left) and not isinstance(left, type))
+        differences = (_same(left, right, f"{where}[{index}]", sequences=sequences)
                        for index, (left, right) in enumerate(zip(original, rebuilt, strict=True)))
         return next((difference for difference in differences if difference is not None), None)
     if isinstance(original, (str, bytes, int, float, complex, bool, Enum, np.generic)) or original is None:

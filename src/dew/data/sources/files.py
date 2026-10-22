@@ -121,17 +121,31 @@ def _native_gcs(fs: GCSFileSystem) -> bool:
             and fs.requests_timeout is None and fs.timeout is None)
 
 
+def export_place(path: str) -> str:
+    """Where a committed export holds a file, its path without the directory its writer named by a
+    nonce of its own (`dew.data.sinks.export`: `shards/<writer>/...`, `_dew_indexes/<writer>/...`):
+    its partitions and its name stay, so two exports of the same rows place their files alike."""
+    head, _, rest = path.partition("/")
+    if head in ("shards", "_dew_indexes") and "/" in rest:
+        return f"{head}/{rest.partition('/')[2]}"
+    return path
+
+
 def export_content(committed: Mapping[str, object]) -> Mapping[str, object]:
-    """A committed export's manifest without where its writer put each file: a writer names its
-    shards by a nonce of its own (`dew.data.sinks.export`), so two exports of the same rows hold the
-    same content under other names, which the manifest's order, sizes and hashes say alike."""
+    """A committed export's manifest with each file where it is placed (`export_place`), not where
+    its writer put it, so two exports of the same rows hold the same content, which the manifest's
+    order, places, sizes and hashes say alike."""
     files = committed.get("files")
-    if not isinstance(files, list):
-        raise ValueError("export manifest files must be a list")
-    unplaced = [{name: ({key: fact for key, fact in value.items() if key != "path"}
-                        if isinstance(value, Mapping) else value)
-                 for name, value in entry.items() if name != "path"} for entry in files]
-    return {**committed, "files": unplaced}
+    if not isinstance(files, list) or not all(isinstance(entry, Mapping) for entry in files):
+        raise ValueError("export manifest files must be a list of file entries")
+
+    def placed(entry: Mapping[str, object]) -> Mapping[str, object]:
+        """`entry` with its path, and its length index's, where the export places them."""
+        return {key: (export_place(fact) if key == "path" and isinstance(fact, str)
+                      else placed(fact) if key == "lengths" and isinstance(fact, Mapping) else fact)
+                for key, fact in entry.items()}
+
+    return {**committed, "files": [placed(entry) for entry in files]}
 
 
 def _mount_root(paths: Sequence[str]) -> str:
@@ -317,9 +331,8 @@ class Files(Dataset):
         # Local copies are named by their place under the files' common directory and their
         # content, so hosts that mounted one dataset at different paths name it alike.
         root = _mount_root([path for _, fs, path in resolved if local(fs)])
-        # A committed export's files are named by their place in its manifest, not the writer's names.
-        places = ({} if self.committed is None
-                  else {url: f"#{number}" for number, url in enumerate(self.paths)})
+        # A committed export's files, here or remote, are named where it places them (`export_place`).
+        places = self._export_places
         for url, fs, path in resolved:
             if url in indexed and not self._present(url):
                 continue
@@ -345,7 +358,7 @@ class Files(Dataset):
                 version = fs.ukey(path)
             files.append(
                 (url, {
-                    "uri": places.get(url, posixpath.relpath(path, root)) if local(fs) else url,
+                    "uri": places.get(url) or (posixpath.relpath(path, root) if local(fs) else url),
                     "bytes": metadata["size"],
                     "version": version,
                 })
@@ -369,8 +382,25 @@ class Files(Dataset):
             else hashlib.sha256(
                 json.dumps(export_content(self.committed), sort_keys=True, separators=(",", ":")).encode()
             ).hexdigest(),
-            "transport": Store(self.paths[0], self.storage_options).describe() if self.paths else {},
+            # How an export is reached is its root's; its files are under its writer's own names.
+            "transport": Store(str(self.url) if self.committed is not None else self.paths[0],
+                               self.storage_options).describe() if self.paths else {},
         }
+
+    @cached_property
+    def _export_places(self) -> Mapping[str, str]:
+        """Each file of a committed export, and each length index beside one, by URL: where the export
+        places it (`export_place`); none for other files."""
+        if self.committed is None:
+            return {}
+        root = Store(str(self.url), self.storage_options)
+        entries = self.committed["files"]
+        if not isinstance(entries, list):
+            raise ValueError(f"export manifest has invalid files at {self.url}")
+        named = [entry for entry in entries if isinstance(entry, Mapping)]
+        lengths = [entry["lengths"] for entry in named if isinstance(entry.get("lengths"), Mapping)]
+        return {root.child(str(entry["path"])).url: export_place(str(entry["path"]))
+                for entry in (*named, *lengths)}
 
     def supports(self, read: Read) -> bool:
         if read != "indexed" or self.kind == "files":
