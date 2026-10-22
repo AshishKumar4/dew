@@ -35,6 +35,10 @@ from dew.nn.scan_orders import pixel_shuffle
 ROOT = Path(__file__).resolve().parents[1]
 CASES = ("dev", "rect", "unguided", "narrow")
 CASE_SEEDS = {"dev": 16, "rect": 16, "unguided": 16, "narrow": 16}
+ROWS = 4
+"""Each draw holds the case's batch ROWS times over, so a parameter's gradient sums over more rows and
+one draw's error varies less: at the fixture's batch the dev and rect cases did not resolve within 512
+seeds."""
 
 
 @pytest.fixture(scope="module")
@@ -104,11 +108,12 @@ def test_the_forward_and_every_gradient_match_the_source(source, arrays, record,
     rows, columns = record["cases"][name]["grid"]
     walk = flux2_walk(model, params, (rows, columns))
     tensors = {layout.name.removeprefix("transformer/"): layout for layout in layouts}
-    original = {key: np.array(arrays[f"{name}.{key}"])
+    original = {key: np.concatenate([np.array(arrays[f"{name}.{key}"])] * ROWS)
                 for key in ("latent", "context", "times", "guidance", "probe")}
 
     def draw(seed):
-        """The fixture's inputs at seed 0, else fresh normal draws at `seed`."""
+        """The fixture's inputs, its batch ROWS times over, at seed 0, else fresh normal draws of
+        those shapes."""
         if seed == 0:
             return (original,)
         generator = torch.Generator().manual_seed(29 + seed)
