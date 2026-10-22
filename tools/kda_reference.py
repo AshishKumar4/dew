@@ -63,7 +63,8 @@ def oracle_recurrent(query, key, value, g, beta, state):
     import jax.numpy as jnp
 
     query, key = l2norm(query), l2norm(key)
-    query = query / np.sqrt(query.shape[-1])
+    # A Python scale, as upstream's: a NumPy one would carry a float32 query to float64 under x64.
+    query = query * (1 / query.shape[-1] ** 0.5)
     outputs, s = [], state
     for i in range(query.shape[1]):
         s = s * jnp.exp(g[:, i])[..., None]
@@ -85,7 +86,7 @@ def oracle_chunk(query, key, value, g, beta, state, chunk_size=4):
     dv = value.shape[-1]
     pad = (chunk_size - length % chunk_size) % chunk_size
     total = length + pad
-    query = jnp.pad(query, ((0, 0), (0, 0), (0, pad), (0, 0))) / np.sqrt(dk)
+    query = jnp.pad(query, ((0, 0), (0, 0), (0, pad), (0, 0))) * (1 / dk ** 0.5)
     key, value, g = (jnp.pad(x, ((0, 0), (0, 0), (0, pad), (0, 0))) for x in (key, value, g))
     beta = jnp.pad(beta, ((0, 0), (0, 0), (0, pad)))
     v_beta, k_beta = value * beta[..., None], key * beta[..., None]

@@ -119,6 +119,10 @@ def test_the_chunked_rule_matches_the_oracle_across_chunks_with_a_carried_state(
     evaluation over drawn operands (check 1)."""
     oracle = jax.jit(partial(oracle_chunk, chunk_size=4))
     assert_as_exact(jax.jit(dew_rule("chunk")), oracle, operands, "chunk oracle", seeds=SEEDS['chunk oracle'])
+    # The transcriptions compute at their operands' dtype, float32 ones in float32 whatever x64 says.
+    with jax.enable_x64(new_val=True):
+        for rule in (oracle, oracle_recurrent):
+            assert {value.dtype for value in rule(*operands(0))} == {np.dtype(np.float32)}
 
 
 def test_the_recurrent_rule_matches_the_oracle_and_the_chunked_rule():
