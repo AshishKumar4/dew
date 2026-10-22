@@ -170,10 +170,10 @@ def test_a_run_config_distills_a_saved_flow_run_and_alternates_student_and_criti
     import dataclasses
 
     from diffusion_stubs import batch_for
+    from diffusion_support import images_of
 
     from dew.checkpoints import Checkpoints
     from dew.config import ModelConfig, ObjectiveConfig, TrainerConfig
-    from dew.config.data import ImageData
     from dew.diffusion.presets import Flow
     from dew.lora import LoRA
     from dew.objectives.base import FROZEN, TEACHER, Step
@@ -185,7 +185,7 @@ def test_a_run_config_distills_a_saved_flow_run_and_alternates_student_and_criti
     teacher_run = DiffusionRunConfig(
         model=ModelConfig("simple_dit", {"patch_size": 2, "emb_features": 16, "num_layers": 1, "num_heads": 2,
                                          "time_scale": 0.002, "dtype": "float32", "attention_impl": "xla"}),
-        data=ImageData(source="tfds://oxford_flowers102", image_size=4), preset=Flow(), val_metrics=(),
+        data=images_of("tfds://oxford_flowers102", 4), preset=Flow(), val_metrics=(),
         trainer=TrainerConfig(checkpoint_dir=str(tmp_path)),
         text=TextCondition(encoder="char_table", checkpoint="char_table"),
         objective=ObjectiveConfig("diffusion",
@@ -272,10 +272,10 @@ def test_an_accumulated_distillation_alternates_its_networks_update_by_update(tm
     import dataclasses
 
     from diffusion_stubs import batch_for
+    from diffusion_support import images_of
 
     from dew.checkpoints import Checkpoints
     from dew.config import ModelConfig, ObjectiveConfig, TrainerConfig
-    from dew.config.data import ImageData
     from dew.diffusion.presets import Flow
     from dew.objectives.base import Step
     from dew.objectives.diffusion import DiffusionRunConfig, TextCondition
@@ -286,7 +286,7 @@ def test_an_accumulated_distillation_alternates_its_networks_update_by_update(tm
     teacher_run = DiffusionRunConfig(
         model=ModelConfig("simple_dit", {"patch_size": 2, "emb_features": 16, "num_layers": 1, "num_heads": 2,
                                          "dtype": "float32", "attention_impl": "xla"}),
-        data=ImageData(source="tfds://oxford_flowers102", image_size=4), preset=Flow(), val_metrics=(),
+        data=images_of("tfds://oxford_flowers102", 4), preset=Flow(), val_metrics=(),
         trainer=TrainerConfig(checkpoint_dir=str(tmp_path)),
         text=TextCondition(encoder="char_table", checkpoint="char_table"),
         objective=ObjectiveConfig("diffusion",
@@ -337,10 +337,10 @@ def test_a_pretrained_run_distills_the_model_it_loads_without_a_teacher_run(tmp_
     import tarfile
     from pathlib import Path
 
+    from diffusion_support import images_of
     from test_diffusion_run_sources import precision
 
     from dew.config import ObjectiveConfig
-    from dew.config.data import ImageData
     from dew.diffusion.presets import Flow
     from dew.interop.pretrained import load_diffusion_source
     from dew.objectives.base import TEACHER
@@ -353,7 +353,7 @@ def test_a_pretrained_run_distills_the_model_it_loads_without_a_teacher_run(tmp_
         archive.extractall(tmp_path, filter="data")
     pipeline = str(tmp_path / "pipeline")
     objective = DiffusionRunConfig(pretrained=pipeline, preset=Flow(), model=precision(),
-                                   data=ImageData(source="tfds://oxford_flowers102", image_size=16),
+                                   data=images_of("tfds://oxford_flowers102", 16),
                                        val_metrics=(),
                                    objective=ObjectiveConfig("rcm", {"ema_decay": None})).build()
     source = load_diffusion_source(pipeline, dtype="float32", attention_impl="xla", size=(16, 16))

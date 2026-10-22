@@ -22,13 +22,14 @@ import numpy as np
 import optax
 import pytest
 from diffusion_stubs import StubText
+from diffusion_support import images_of
+from flax import linen as nn
 from recording import RecordingTracker
 from reference_error import assert_as_exact
 from residual_orders import permuted, residual_width
 
 from dew.artifacts import ImageGrid, Representations, TokenScores, VideoGrid
 from dew.config import MetricConfig, ModelConfig, ObjectiveConfig
-from dew.config.data import ImageData
 from dew.data.dataset import Loader
 from dew.diffusion import presets
 from dew.eval.images import DEFAULT_MODEL
@@ -434,8 +435,6 @@ def selection_margin(case: Case, variables_by_step, tokens) -> float:
     in every run, decide nothing."""
     from statistics import NormalDist
 
-    from flax import linen as nn
-
     from dew.nn.mla import SparseIndexer
     from dew.nn.mlp import GatedMLP
 
@@ -616,7 +615,7 @@ JSON_UNET = {"emb_features": 32, "feature_depths": [8, 16], "norm_groups": 4,
 def unet_run(fields):
     return DiffusionRunConfig(
         model=ModelConfig("unet", {**fields, "dtype": "float32", "attention_impl": "reference"}),
-        data=ImageData(source="tfds://oxford_flowers102", image_size=8), text=None,
+        data=images_of("tfds://oxford_flowers102", 8), text=None,
         objective=ObjectiveConfig("diffusion", {"guidance": None, "solver": Euler(), "steps": SAMPLER_STEPS}))
 
 

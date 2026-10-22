@@ -85,6 +85,14 @@ _COUNTS = ("rows", "accepted", "accepted_rows", "windows", "valid_targets", "zer
 """The `metadata` facts that count a source's rows and their target tokens."""
 
 
+def stated(source: Source) -> Mapping[str, object]:
+    """What `source` states of its records without reading them (`dew.data.pipeline.Stated`), none
+    where it states nothing so."""
+    from dew.data.pipeline import Stated
+
+    return source.stated() if isinstance(source, Stated) else {}
+
+
 def _uncounted(metadata: Mapping[str, object]) -> Mapping[str, object]:
     """`metadata` without its counts (`_COUNTS`): the facts a source that reads part of another's
     rows, or rows made from them, keeps of the other's. Its own counts, where it knows them, it

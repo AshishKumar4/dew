@@ -12,11 +12,10 @@ import numpy as np
 import optax
 import pytest
 from diffusion_stubs import batch_for
-from diffusion_support import saved_after_one_step
+from diffusion_support import images_of, saved_after_one_step
 
 from dew.checkpoints import Checkpoints
 from dew.config import ModelConfig, ObjectiveConfig, TrainerConfig
-from dew.config.data import ImageData
 from dew.diffusion import broadcast_rates
 from dew.diffusion.presets import EDM, Flow
 from dew.diffusion.process import aligned_conditions
@@ -53,7 +52,7 @@ def runs(tmp_path_factory, request):
         archive.extractall(root / "flux", filter="data")
     teacher = DiffusionRunConfig(
         model=ModelConfig("flux_transformer", {**FLUX, "dtype": "float32", "attention_impl": "xla"}),
-        data=ImageData(source="tfds://oxford_flowers102", image_size=8), preset=request.param, val_metrics=(),
+        data=images_of("tfds://oxford_flowers102", 8), preset=request.param, val_metrics=(),
         trainer=TrainerConfig(checkpoint_dir=str(root)),
         text=TextCondition(encoder="diffusion_text", checkpoint=str(root / "flux" / "pipeline")),
         objective=ObjectiveConfig("diffusion",

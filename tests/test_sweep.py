@@ -21,7 +21,7 @@ SPACE = {'optim.learning_rate': [0.1, 0.01], 'optim.clip_grads': [0.0, 1.0]}
 
 def config(tmp_path, name='sweep'):
     return RunConfig(trainer=TrainerConfig(
-        name=name, checkpoint_dir=str(tmp_path / 'runs'), steps=2, batch_size=8,
+        name=name, checkpoint_dir=str(tmp_path / 'runs'), steps=2,
         eval_every=None, checkpoint_every=None))
 
 
