@@ -119,7 +119,8 @@ class PagesOnHost:
         began = time.perf_counter()
         payload, _ = self.copy_out(pool, pages)
         pool = self.load(pool, self.stage(payload), list(range(len(pages))), pages)
-        jax.block_until_ready(pool)
+        # A pool is keyed by paths, which a pytree cannot sort; its leaves are what is waited on.
+        jax.block_until_ready(list(pool.values()))
         return pool, (time.perf_counter() - began) / len(pages)
 
     def _count(self, needed: int) -> int:
