@@ -155,7 +155,6 @@ def test_a_source_is_routed_on_its_config_alone_as_the_loader_reads_it():
     wrapper; DiffusionGemma's its own; an unregistered model_type goes to the verifier given; a
     storage format the codecs cannot decode and a family's refusal are refused on the config, as the
     loader refuses them."""
-    from dew.interop.codecs import StorageRefused
     from dew.interop.pretrained import source_route
 
     route = source_route(fixture_config("llama-tiny"))
@@ -173,14 +172,34 @@ def test_a_source_is_routed_on_its_config_alone_as_the_loader_reads_it():
     with pytest.raises(ValueError):
         source_route({**llama, "model_type": "an_unregistered_decoder"}, verified=verifier)
     assert asked == ["an_unregistered_decoder"]
-    with pytest.raises(StorageRefused):
+    with pytest.raises(ValueError):
         source_route({**llama, "quantization_config": {"quant_method": "mlx", "bits": 4, "group_size": 64,
                                                         "mode": "affine"}})
-    with pytest.raises(StorageRefused):
+    with pytest.raises(ValueError):
         # A storage format is refused before the verifier is asked about an unregistered type.
         source_route({"model_type": "an_unregistered_decoder", "quantization": {"bits": 4, "group_size": 64}},
                      verified=verifier)
     assert asked == ["an_unregistered_decoder"]
     with pytest.raises(ValueError):
         source_route({**fixture_config("llama-tiny"), "hidden_act": "a_nonexistent_activation"})
+
+
+def test_the_hub_census_routes_a_config_as_the_loader_does():
+    """tools/hf_coverage.py classifies a config by the loader's own route (`source_route`): a storage
+    format the codecs refuse is refused before transformers is asked about the type, as is one a
+    codec's own reader refuses (GPTQ at three bits); a type transformers has no class for, asked
+    only after those, is remote code; a registered family's config is tier 1."""
+    from tool_support import load
+
+    census = load("hf_coverage")
+
+    def verifier(config):
+        raise census.NoReference(config["model_type"])
+
+    for quantization in ({"quantization": {"bits": 4, "group_size": 64}},
+                         {"quantization_config": {"quant_method": "gptq", "bits": 3}}):
+        assert census._route({"model_type": "a_custom_decoder", **quantization}, verifier)[0] == "refused"
+    llama = fixture_config("llama-tiny")
+    assert census._route({**llama, "model_type": "a_custom_decoder"}, verifier)[0] == "remote code"
+    assert census._route(llama, verifier)[0] == "tier 1"
 

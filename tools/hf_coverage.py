@@ -52,14 +52,16 @@ def census(out: Path, limit: int) -> None:
     (out / "census.json").write_text(json.dumps(rows))
 
 
+class NoReference(ValueError):
+    """An unregistered model_type transformers has no class for, which the loader would ask it to verify
+    against (`classify`'s verifier): a repo of remote code."""
+
+
 def _route(config: dict, verified) -> tuple[str, str]:
     """The census route of `config`: the loader's own decision on the config alone
     (`dew.interop.pretrained.source_route`), and for a refusal, the refusal's own words. `verified`
     checks an unregistered model_type against transformers, once per type (`classify`)."""
-    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
-
-    from dew.interop import decoder_parts, hf_decoders
-    from dew.interop.codecs import StorageRefused
+    from dew.interop import decoder_parts
     from dew.interop.pretrained import source_route
 
     if set(config) <= {"model_type", "architectures"}:
@@ -70,11 +72,9 @@ def _route(config: dict, verified) -> tuple[str, str]:
         route = source_route(config, verified=verified)
     except decoder_parts.DrafterRefused as error:
         return "by design", str(error)[:300]
-    except StorageRefused as error:
-        return "refused", f"storage format: {error}"[:300]
+    except NoReference:
+        return "remote code", "transformers has no class for it"
     except (KeyError, ValueError, TypeError) as error:
-        if config["model_type"] not in CONFIG_MAPPING and config["model_type"] not in hf_decoders.families():
-            return "remote code", "transformers has no class for it"
         return "refused", f"{type(error).__name__}: {error}"[:300]
     if route.verified is None:
         return "tier 1", f"registered {route.kind}"
@@ -89,6 +89,8 @@ def _route(config: dict, verified) -> tuple[str, str]:
 def classify(out: Path) -> None:
     rows = [row for row in json.loads((out / "census.json").read_text())
             if "config" in row and isinstance(row.get("model_type"), str)]
+    from transformers.models.auto.configuration_auto import CONFIG_MAPPING
+
     from dew.interop import verify
 
     probed: dict[str, VerifiedMapping | tuple[type[Exception], tuple]] = {}
@@ -98,6 +100,9 @@ def classify(out: Path) -> None:
         registered family reads (the rows come ranked), its mapping or its refusal reused after; a
         refusal is kept as its type and arguments, not the probe's frames, and raised afresh."""
         model_type = config["model_type"]
+        if model_type not in CONFIG_MAPPING:
+            # Asked only once the loader has passed the storage format and the registered families.
+            raise NoReference(model_type)
         if model_type not in probed:
             try:
                 probed[model_type] = verify.verify_mapping(config)
