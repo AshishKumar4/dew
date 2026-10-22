@@ -843,6 +843,9 @@ class _MosaicTpu(_GroupedLaunch[mosaic_tpu.Blocks]):
         """The blocks whose double-buffered operands, outputs and accumulator fit the TPU's scoped VMEM
         (`Template.fitting`'s rule, VMEM for a block's shared memory)."""
         budget = generation.effective(target).scoped_vmem
+        if budget is None:
+            raise ValueError(f"{target.generation} states no scoped VMEM, which the TPU launches fit their "
+                             "blocks to")
         space = self.space(ba)
         fits = tuple(blocks for blocks in space if self.staged_bytes(ba, blocks) <= budget)
         if not fits:
