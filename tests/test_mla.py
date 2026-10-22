@@ -301,6 +301,19 @@ def decode_loop(module, variables, tokens):
 SETTINGS = {"mla_v3": "v3", "mla_v3n": "v3n", "mla_v32": "v32"}
 
 
+@pytest.mark.mesh
+@pytest.mark.parametrize("name", ["mla_v3", "mla_v32"])
+def test_a_latent_attention_refuses_to_decode_under_a_sequence_axis_as_attention_does(name):
+    """A decode cache holds whole sequences, so a latent attention, its dense latents and its sparse
+    expanded keys alike, refuses to decode under a sequence axis, through the attention cache it
+    keeps them in (`open_kv_cache`)."""
+    from dew.nn.sharding import SEQUENCE_AXIS, LayoutRefused
+
+    module = mla_module(CONFIG[SETTINGS[name]])
+    with jax.set_mesh(jax.make_mesh((2,), (SEQUENCE_AXIS,))), pytest.raises(LayoutRefused):
+        module.init(jax.random.key(0), jnp.zeros((1, 1, module.emb_features)), MixerCall(decode=True))
+
+
 @pytest.mark.parametrize("name", ["mla_v3", "mla_v3n", "mla_v32"])
 def test_decode_matches_prefill(name):
     """Prefill plus one-token steps on par with the block's parallel pass from that pass in float64
