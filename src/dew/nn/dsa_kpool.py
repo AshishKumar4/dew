@@ -224,6 +224,7 @@ class KPoolSparseAttention(MultiHeadLatentAttention):
     """The latent norms' epsilon, the model's rms_norm_eps (configuration_glm5_next.py's 1e-5)."""
     index_kpool: int = 16
     index_kpool_always_select_tail: bool = True
+    force_fp32_for_softmax: bool = True
 
     def setup(self):
         if self.qk_rope_head_dim or self.rotary:
@@ -335,7 +336,8 @@ class KPoolSparseAttention(MultiHeadLatentAttention):
         # alike in the reference, whose masked logits are all equal there;
         # attention itself reads nothing for a row that sees no key.
         unselected = jnp.logical_and(row_valid, ~jnp.any(selected, -1))[:, :, None, None]
-        return self._attend(query, key, value, x, mask, implementation, unselected=unselected)
+        return self._attend(query, key, value, x, mask, implementation, unselected=unselected,
+                            force_fp32_for_softmax=self.force_fp32_for_softmax)
 
 
 @dataclasses.dataclass(frozen=True)

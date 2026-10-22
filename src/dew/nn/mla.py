@@ -316,9 +316,6 @@ class MultiHeadLatentAttention(nn.Module):
     dtype: Dtype | None = None
     precision: PrecisionLike = None
     attention_impl: str = "auto"  # an AttentionImpl
-    force_fp32_for_softmax: bool = True
-    """The softmax in float32; a latent attention's kind refuses another policy (`latent_refusals`),
-    which a k-pool attention forwards (`KPoolSparseAttentionMixer`)."""
     rotary: bool = True
     """False is Kimi K3's MLA (`mla_use_nope`, modeling_kimi_linear.py:396-437
     of moonshotai/Kimi-K3 at f831ab6): the decoupled rope head is kept as
@@ -657,11 +654,12 @@ class MultiHeadLatentAttention(nn.Module):
         return causal_attention_mask(slots, total, key_valid=cached_validity(self, total))
 
     def _attend(self, query, key, value, x, mask, implementation, *, causal: bool = False,
-                unselected=None):
+                unselected=None, force_fp32_for_softmax: bool = True):
         """The attention over `key` and `value` and its output projection, sowing the per-head
         maxima QK-Clip reads where a caller opened the collection. A query `unselected` marks reads
         every key alike, the mean of the values, as a selection that chose nothing does in the
-        reference (`KPoolSparseAttention`)."""
+        reference, and `force_fp32_for_softmax` is a k-pool attention's own policy; a latent
+        attention's kind refuses any but the default (`latent_refusals`)."""
         # The per-head maxima the QK-Clip reads, with the nope width the
         # clip needs to split the latent projections: computed only when a
         # caller opened the collection. Under a sparse selection the mask
@@ -672,7 +670,7 @@ class MultiHeadLatentAttention(nn.Module):
             self.sow("qk", "qk_nope", jnp.asarray(self.qk_nope_head_dim))
         attention = scaled_dot_product_attention(
             query, key, value, dtype=self.dtype, precision=self.precision,
-            force_fp32_for_softmax=self.force_fp32_for_softmax,
+            force_fp32_for_softmax=force_fp32_for_softmax,
             implementation=implementation, causal=causal, mask=mask)
         if unselected is not None:
             uniform = jnp.mean(value.astype(jnp.float32), axis=1, keepdims=True).astype(attention.dtype)
