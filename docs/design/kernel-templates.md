@@ -66,6 +66,7 @@ Coordinates and row vectors come from the toolkit, because Mosaic GPU iotas need
 
 **The exponent's forms.** The default folds log2(e) into the scale (exp2 of `s·c − m`), FA2's and jax's mha arithmetic; `natural=` keeps the reference's natural logits (`natural_exp`, exp2 of the difference times log2(e)). Both pass check 1 on drawn inputs and the stability suite (tests/test_attention_stability.py). The fold's divergences, which run natural alone there:
 - logits a ulp apart near 2^30, at scales below 1: the fold rounds each logit at log2(e) times its size, so two the reference keeps apart can tie, and a large cotangent then overflows the backward;
+- in fp32, a row whose output one weight carries over values near fp32's largest (a weight of e^-12 to e^-26 on values of 2^120 to 2^126): the fold's extra rounding of that weight's logit is the row's error, 2.04 times the reference's; bf16 hides it in the weight's rounding to 16 bits;
 - logits near 1e30 and beyond: the backward takes the base-2 maximum back to natural units, which moves the anchor's own weight away from 1. A backward that reads the forward's base-2 maximum (a residual kept in base 2 inside the kernels, natural only at the API) would remove it.
 
 The fold needs `scale·log2(e) < 1`, so every folded logit is an ulp of fp32's largest below it, and an initial maximum (a sink) past fp32's largest in base 2 saturates exactly (`base2_maximum`).
