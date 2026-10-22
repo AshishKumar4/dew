@@ -10,6 +10,7 @@ import contextvars
 import dataclasses
 import functools
 import importlib
+import itertools
 import math
 from collections.abc import Callable
 from typing import Literal, get_args
@@ -31,8 +32,8 @@ from .attention_kernels import (
     ATTENTION,
     DECODE,
     SPLASH_BLOCK,
-    SPLASH_DTYPES,
     SPLASH_LANES,
+    TPU_SUPPORTS,
     AttentionCase,
     decodes,
 )
@@ -81,6 +82,7 @@ from .sharding import (
     sequence_shards,
     split_positions,
 )
+from .visibility import same_chunk, visible, windowed
 
 AttentionImpl = Literal["auto", "reference", "xla", "cudnn", "triton", "flash", "tpu"]
 """Names which kernel an attention call runs.
@@ -139,10 +141,8 @@ def causal_attention_mask(query_positions, kv_len: int, sliding_window=None, *, 
     if positions.ndim == 1:
         positions = positions[None, :]
     q_pos = positions[:, :, None]
-    k_pos = jnp.arange(kv_len)[None, None, :]
-    mask = (q_pos >= 0) & (k_pos <= q_pos)
-    if sliding_window is not None:
-        mask = mask & (k_pos > q_pos - sliding_window)
+    keys = jnp.arange(kv_len)[None, None, :]
+    mask = (q_pos >= 0) & visible(q_pos, keys, causal=True, window=sliding_window)
     if key_valid is not None:
         mask = mask & jnp.asarray(key_valid, bool)[:, None, :]
     return mask[:, None]
@@ -194,8 +194,9 @@ def structural_mask(query_positions, kv_len: int, causal: bool,
     positions = jnp.asarray(query_positions)
     if positions.ndim == 1:
         positions = positions[None, :]
-    distance = positions[:, :, None] - jnp.arange(kv_len)[None, None, :]
-    return ((positions[:, :, None] >= 0) & (jnp.abs(distance) < sliding_window))[:, None]
+    keys = jnp.arange(kv_len)[None, None, :]
+    queries = positions[:, :, None]
+    return ((queries >= 0) & windowed(queries, keys, sliding_window, causal=False))[:, None]
 
 
 def chunk_mask(query_positions, key_positions, chunk_size: int):
@@ -205,9 +206,8 @@ def chunk_mask(query_positions, key_positions, chunk_size: int):
     counted from the sequence start, so a packed document's positions place
     its chunks from its own first token.
     """
-    query_chunks = jnp.asarray(query_positions) // chunk_size
-    key_chunks = jnp.asarray(key_positions) // chunk_size
-    same = query_chunks[..., :, None] == key_chunks[..., None, :]
+    same = same_chunk(jnp.asarray(query_positions)[..., :, None], jnp.asarray(key_positions)[..., None, :],
+                      chunk_size)
     return same[..., None, :, :] if same.ndim == 3 else same[None, None]
 
 
@@ -1662,7 +1662,7 @@ def attention_case(query, key, *, dtype=None, precision=None, force_fp32_for_sof
     `AttentionImpl`, which decides whether splash might run it."""
     cross = isinstance(segment_ids, CrossDocuments)
     q_len, kv_len = query.shape[-3], key.shape[-3]
-    return AttentionCase(
+    case = AttentionCase(
         queries=q_len, keys=kv_len, heads=query.shape[-2], kv_heads=key.shape[-2],
         head_dim=query.shape[-1], dtype=jnp.dtype(query.dtype), key_dtype=jnp.dtype(key.dtype),
         causal=bool(causal), window=sliding_window,
@@ -1674,17 +1674,19 @@ def attention_case(query, key, *, dtype=None, precision=None, force_fp32_for_sof
         arithmetic=reference_only(query, dtype, precision, force_fp32_for_softmax),
         narrows=_xla_kernel_narrows(query) or _xla_kernel_chains(query, key),
         folds=folds(query, key, bias, mask, causal, sliding_window),
-        # Splash's descriptor reads a concrete mask on the host, so only a call splash could take
-        # builds it: one that names it or chooses, a TPU's, of its dtypes, with no bias or sequence
-        # axis, at lengths it tiles.
-        splash=(named in ('auto', 'tpu') and generation.backend() == 'tpu'
-                and jnp.dtype(query.dtype) in SPLASH_DTYPES
-                and bias is None and sequence_shards() == 1
-                and q_len % SPLASH_LANES == 0 and kv_len % SPLASH_LANES == 0
-                and min(q_len, kv_len) >= SPLASH_MIN_LENGTH
-                and splash_mask_descriptor(q_len, kv_len, shard_heads(query), causal, sliding_window,
-                                           mask) is not None),
-        shards=sequence_shards())
+        splash=False, shards=sequence_shards())
+    # Splash's descriptor reads a concrete mask on the host, so it is built only for a call under a
+    # name that may choose splash which every requirement of splash's before its tiling takes
+    # (`TPU_SUPPORTS`, in the order a refusal names them): whether splash tiles the call is then the
+    # fact to form, its lengths and its descriptor, and a later refusal is still reported as itself.
+    earlier = itertools.takewhile(lambda need: need.code != 'tiles', TPU_SUPPORTS)
+    if named in ('auto', 'tpu') and all(need.holds(case) for need in earlier):
+        tiled = q_len % SPLASH_LANES == 0 and kv_len % SPLASH_LANES == 0
+        case = dataclasses.replace(case, splash=(
+            tiled and min(q_len, kv_len) >= SPLASH_MIN_LENGTH
+            and splash_mask_descriptor(q_len, kv_len, shard_heads(query), causal, sliding_window,
+                                       mask) is not None))
+    return case
 
 
 def resolve_implementation(implementation, query, key, *, dtype=None, precision=None,

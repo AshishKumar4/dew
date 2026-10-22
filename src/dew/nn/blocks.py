@@ -178,6 +178,29 @@ class FourierEmbedding(nn.Module):
         return jnp.concatenate([jnp.sin(emb), jnp.cos(emb)], axis=-1)
 
 
+def sinusoid_frequencies(count: int, divisor: float, *, dtype: DTypeLike = np.float32,
+                         base: float = 10000.0) -> np.ndarray:
+    """The `count` frequencies `base ** (-i / divisor)` every sinusoidal position or time signal in Dew
+    rotates by, as a host array of `dtype`.
+
+    The whole exponent `i * -ln(base)` is formed in `dtype` before it is divided, as the published
+    diffusion models form it (the other order moves a timestep embedding's sine by 1e-5 near timestep
+    1000), and its exp is taken on the host in float64 and rounded once, so the table does not vary
+    with the backend.
+    """
+    width = np.dtype(dtype).type
+    exponent = np.arange(count, dtype=width) * width(-math.log(base)) / width(divisor)
+    return np.exp(exponent.astype(np.float64)).astype(width)
+
+
+def sinusoids(angles, *, cosine_first: bool = False, xp=jnp):
+    """Each angle's sine and cosine side by side, `[..., n]` to `[..., 2n]`: the sines first, or the
+    cosines where `cosine_first`. `xp` is the array module it computes with: `numpy` for a host table
+    built while a model traces, which JAX would otherwise stage into the trace."""
+    first, second = (xp.cos(angles), xp.sin(angles)) if cosine_first else (xp.sin(angles), xp.cos(angles))
+    return xp.concatenate([first, second], axis=-1)
+
+
 def sinusoidal_time(time, features: int, *, dtype: DTypeLike, shift: float = 0, cosine_first: bool = True):
     """Embed a scalar timestep as `features` sinusoids: `[B]` to `[B, features]`,
     computed in `dtype` (`at_least_fp32` of the model's).
@@ -189,15 +212,8 @@ def sinusoidal_time(time, features: int, *, dtype: DTypeLike, shift: float = 0, 
     half = features // 2
     if features % 2 or half <= shift:
         raise ValueError("Time embedding width must be even and exceed twice the frequency shift")
-    # Scale the whole exponent before dividing, as the published models do;
-    # the other order moves a sine by 1e-5 near timestep 1000. Take exp on
-    # the host in float64 so the table does not vary with the backend.
-    width = np.dtype(dtype).type
-    exponent = np.arange(half, dtype=width) * width(-math.log(10000.0)) / width(half - shift)
-    frequencies = jnp.asarray(np.exp(exponent.astype(np.float64)).astype(width))
-    phase = jnp.asarray(time, width).reshape(-1, 1) * frequencies[None]
-    first, second = (jnp.cos(phase), jnp.sin(phase)) if cosine_first else (jnp.sin(phase), jnp.cos(phase))
-    return jnp.concatenate([first, second], axis=-1)
+    frequencies = jnp.asarray(sinusoid_frequencies(half, half - shift, dtype=dtype))
+    return sinusoids(jnp.asarray(time, dtype).reshape(-1, 1) * frequencies[None], cosine_first=cosine_first)
 
 
 class TimeProjection(nn.Module):
