@@ -219,7 +219,7 @@ def test_a_training_step_updates_the_clamped_altup_coefficients_as_the_reference
         for attempt in range(64):
             rows = np.random.default_rng([0x3E, seed, attempt]).integers(
                 0, int(model.vocab_size), shape).astype(np.int32)
-            if gate_margin(model, loaded.variables, rows[:, :-1]) > MARGIN:
+            if gate_margin(model, loaded.variables, rows[:, :-1], train=True) > MARGIN:
                 return (rows,)
         raise AssertionError(f"no rows of seed {seed} clear the gates' margin {MARGIN}")
 
@@ -243,6 +243,8 @@ def test_a_training_step_updates_the_clamped_altup_coefficients_as_the_reference
         reference = references[dtype]
         reference.load_state_dict(weights)
         reference.train()
+        # Reloading the weights leaves the last draw's gradients in place: each draw's are its own.
+        reference.zero_grad(set_to_none=True)
         solver = torch.optim.SGD(reference.parameters(), lr=rate, weight_decay=decay)
         tokens = torch.from_numpy(rows).long()
         with float64() if dtype == torch.float64 else torch.enable_grad():
