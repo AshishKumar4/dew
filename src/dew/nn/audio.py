@@ -23,6 +23,7 @@ from flax.typing import Dtype, PrecisionLike
 
 from dew import records
 from dew.interop.weights import ParamTree, placed
+from dew.nn.blocks import sinusoid_frequencies, sinusoids
 from dew.nn.dense import Dense
 from dew.nn.inputs import sequence_blocks
 from dew.nn.precision import float32_dot_general, float32_products, products_dtype
@@ -249,9 +250,8 @@ def _block_context(x, chunk: int, left: int, right: int):
 def _position_signal(width: int, positions, dtype):
     """Embed each relative position as `width` sinusoids, sines then cosines."""
     half = width // 2
-    inv = jnp.exp(jnp.arange(half, dtype=jnp.float32) * (-math.log(10000.0) / max(half - 1, 1)))
-    angles = positions.astype(jnp.float32)[:, None] * inv[None, :]
-    return jnp.concatenate((jnp.sin(angles), jnp.cos(angles)), axis=-1).astype(dtype)
+    inv = jnp.asarray(sinusoid_frequencies(half, max(half - 1, 1)))
+    return sinusoids(positions.astype(jnp.float32)[:, None] * inv[None, :]).astype(dtype)
 
 
 def _relative_logits(query, key, positional, precision: PrecisionLike = None):

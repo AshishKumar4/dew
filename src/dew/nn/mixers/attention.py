@@ -55,6 +55,7 @@ from dew.nn.precision import at_least_fp32, float32_dot_general, rounded_to, sca
 from dew.nn.protocols import ProjectionGroup
 from dew.nn.rope import LongRopeScaling, axis_halves, axis_tables, mrope_tables, rotary_freqs, rotate
 from dew.nn.sharding import HEADS, KV_HEADS, constrain, logical_axes
+from dew.nn.visibility import windowed
 
 
 def temperature_scale(positions, floor_scale: float, attn_scale: float, *, dtype: DTypeLike):
@@ -498,12 +499,11 @@ class CausalSelfAttention(nn.Module):
         if self.ctx.sliding_window is not None and (self.ctx.causal or self.ctx.bidirectional_window):
             places = jnp.broadcast_to(query_slots if decode else counted, (batch, length))
             key_places = jnp.arange(key_length)[None, :] if decode else places
-            distance = places[:, None, :, None] - key_places[:, None, None, :]
             # A causal window bounds only the keys behind the query, so an
             # image's later tokens stay visible to its earlier ones; a
-            # two-sided one bounds both (`window_sides`).
-            keep = keep & ((distance < self.ctx.sliding_window) if self.ctx.causal
-                           else (jnp.abs(distance) < self.ctx.sliding_window))
+            # two-sided one bounds both (`windowed`).
+            keep = keep & windowed(places[:, None, :, None], key_places[:, None, None, :],
+                                   self.ctx.sliding_window, causal=self.ctx.causal)
         if valid is not None:
             keep = keep & valid[:, None, None, :]
         if decode:
