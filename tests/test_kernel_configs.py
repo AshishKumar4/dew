@@ -27,13 +27,20 @@ def test_the_compiled_shapes_reach_the_widest_keys_and_values_the_port_takes():
 
 @pytest.mark.parametrize("target, wide", [("sm80", True), ("sm90", True), ("sm86", False), ("sm89", False),
                                           ("sm120", False), ("sm100", False), ("cpu", True)])
-def test_each_gpu_takes_the_picks_its_block_holds_and_measures_a_space_holding_them(target, wide):
+def test_a_gpu_takes_an_a100s_picks_where_its_block_holds_as_much_shared_memory(target, wide):
     """An A100's picks on every GPU whose block holds as much shared memory, the 99 KB ones elsewhere,
-    on a GPU the targets do not list (sm100) too, and an A100's where a CPU interprets; every kernel's
-    16-bit space holds its unmeasured pick, Kimi delta attention's own kernels' too, and fp32 has a pick
-    for every kernel."""
+    on a GPU the targets do not list (sm100) too, and an A100's where a CPU interprets."""
     with generation.assumed(target):
         assert chunked_launch._wide() is wide
+
+
+@pytest.mark.parametrize("target", [*generation.TARGETS, "sm100", "cpu"])
+def test_each_targets_space_holds_its_picks(target):
+    """On every target `generation.TARGETS` lists, a GPU it does not and a CPU, every kernel's 16-bit
+    space at the target's width holds its unmeasured pick, Kimi delta attention's own kernels' too, and
+    fp32 has a pick for every kernel."""
+    with generation.assumed(target):
+        wide = chunked_launch._wide()
     for launch in LAUNCHES:
         assert launch.PICKS["bfloat16", wide] in launch.SPACES[wide], launch.NAME
         assert {"bfloat16", "float32"} <= {dtype for dtype, _ in launch.PICKS}, launch.NAME
