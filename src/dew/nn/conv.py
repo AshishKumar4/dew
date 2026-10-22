@@ -155,8 +155,11 @@ def _depthwise_taps(lhs: jax.Array, rhs: jax.Array, dilation: int, *, materializ
     if materialized:
         wide, kernel = _barrier(wide), _barrier(kernel)
     padded = jnp.pad(wide, border)
-    products = [padded[:, row * dilation:row * dilation + height, column * dilation:column * dilation + width, :]
-                * kernel[row, column, 0] for row in range(3) for column in range(3)]
+    def tap(row: int, column: int) -> jax.Array:
+        top, left = row * dilation, column * dilation
+        return padded[:, top:top + height, left:left + width, :] * kernel[row, column, 0]
+
+    products = [tap(row, column) for row in range(3) for column in range(3)]
     if not materialized:
         products = jax.lax.optimization_barrier(products)
     total = products[0]
