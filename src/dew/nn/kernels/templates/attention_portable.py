@@ -23,11 +23,13 @@ from dew.nn.kernels.templates.attention import (
     gradients,
     padded_call,
 )
+from dew.nn.precision import float32_products, products_dtype
 
 
 def _dot(a: jax.Array, b: jax.Array) -> jax.Array:
-    """`a @ b` accumulated in fp32, the product an interpreted kernel takes."""
-    return jnp.dot(a, b, preferred_element_type=jnp.float32)
+    """`a @ b` accumulated in fp32 at its operands' precision (`dew.nn.precision.float32_products`: fp32
+    products for fp32 operands), the product every mainloop takes."""
+    return jnp.dot(a, b, precision=float32_products(products_dtype(a, b)), preferred_element_type=jnp.float32)
 
 
 def _tile_param(value: jax.Array, kind: Kind, row, head, rows: jax.Array, keys: jax.Array):
@@ -183,7 +185,8 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, 
         initial = (call.rows(state.m, -jnp.inf), call.rows(state.total),
                    jnp.pad(call.rows(state.acc), ((0, 0),) * 3 + ((0, call.value.shape[-1] - value_width),)))
     spec = algebra.Forward(spans.form, spans.keys, call.query_ids is not None,
-                           query.shape[3] ** -0.5 if scale is None else scale, hooks.score_mod, natural)
+                           query.shape[3] ** -0.5 if scale is None else scale, hooks.score_mod, natural,
+                           wide=jnp.dtype(query.dtype).itemsize >= 4)
     out, kept = forward(
         spec, call.query, call.key, call.value, call.start, call.end, call.query_ids, call.key_ids,
         call.score_params, tuple(param.kind for param in hooks.score_params), call.output_params,
