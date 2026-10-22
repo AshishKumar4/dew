@@ -323,7 +323,9 @@ def test_eager_fetch_keeps_a_memory_plan_volatile_until_its_generation_is_sealed
                                                ("records", "memory"), ("records", "indexed")])
 def test_a_sealed_generation_keeps_its_holdout_selection_in_training_and_validation(tmp_path,
                                                                                  selection, read):
-    """Generation promotion splits its accepted rows, not the original inputs or the full generation."""
+    """A holdout of a chain whose steps a published generation stands for splits the store's inputs,
+    as it does uncached, and reads the generation's rows of the inputs each part keeps: the first
+    five inputs held out are the accepted ones among them, not the generation's first five rows."""
     source = Memory(rows("fetched", 64))
     generation = fetched_generation(source.filter_map(FetchLike()), tmp_path)
     cached = source.filter_map(FetchLike()).cache(generation)
@@ -335,7 +337,7 @@ def test_a_sealed_generation_keeps_its_holdout_selection_in_training_and_validat
     assert parts[0].isdisjoint(parts[1])
     assert parts[0] | parts[1] == accepted
     if selection == "records":
-        assert parts[1] == set(sorted(accepted)[:5])
+        assert parts[1] == {index for index in range(5) if index % 3}
     training, validation = data.train(DataPartition()), data.val(DataPartition())
     try:
         trained = {int(index) for batch in itertools.islice(training, len(accepted)) for index in batch["i"]}

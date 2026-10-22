@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import dataclasses
 import functools
+import hashlib
 import itertools
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import ClassVar, Protocol, runtime_checkable
@@ -11,8 +12,18 @@ from typing import ClassVar, Protocol, runtime_checkable
 import numpy as np
 
 from dew.data.dataset import Batch, Records
+from dew.data.generation import Generation, RowId, _GenerationSource, _row_key, _shard_inputs, _source_ids
 from dew.data.pipeline import Dataset, Mixture, Phases, Pipeline
-from dew.data.sources.base import Read, Shard, ShardManifest, Source, _consumed, _uncounted, stated
+from dew.data.sources.base import (
+    Read,
+    Shard,
+    ShardManifest,
+    Source,
+    _consumed,
+    _indexed_manifest,
+    _uncounted,
+    stated,
+)
 from dew.data.sources.codec import content_fingerprint
 
 _INDEXED_READS: tuple[Read, ...] = ("memory", "indexed")
@@ -55,7 +66,7 @@ class RecordSlice:
         return f"{self.source.describe()}[{self.start}:{self.stop}]"
 
     def fingerprint(self) -> Mapping[str, object]:
-        return {**self.source.fingerprint(), "slice": [self.start, self.stop]}
+        return _selected(self.source, "slice", {"slice": [self.start, self.stop]})
 
     def supports(self, read: Read) -> bool:
         return read in self.reads and self.source.supports(read)
@@ -64,10 +75,22 @@ class RecordSlice:
         from dew.data.dataset import SourceSlice
 
         records = self.source.records(read)
-        stop = len(records) if self.stop is None else self.stop
-        if not 0 <= self.start <= stop <= len(records):
-            raise ValueError(f"{self.describe()} exceeds the source's {len(records)} records")
-        return SourceSlice(records, self.start, stop)
+        return SourceSlice(records, *self.bounds(len(records)))
+
+    def admits(self, position: int, row: Batch | bytes | None) -> bool:
+        """Whether the record at `position` among its source's is in this slice."""
+        return self.start <= position and (self.stop is None or position < self.stop)
+
+    def admitted(self, records: int) -> None:
+        """Refuse a slice past the `records` it was offered (`bounds`)."""
+        self.bounds(records)
+
+    def bounds(self, records: int) -> tuple[int, int]:
+        """The first and the one past the last of `records` it keeps, refusing a slice past them."""
+        stop = records if self.stop is None else self.stop
+        if not 0 <= self.start <= stop <= records:
+            raise ValueError(f"{self.describe()} exceeds the source's {records} records")
+        return self.start, stop
 
     def metadata(self) -> Mapping[str, object]:
         return {**_uncounted(self.source.metadata()), **({"held_out": self.start} if self.start else {})}
@@ -94,19 +117,6 @@ def _inside(row: Batch | bytes, low: float, high: float, key: str | None) -> boo
         raise ValueError(f"a holdout by {key!r} reads that field, which this record lacks")
     hashed = int.from_bytes(identity[:8], "big")
     return int(low * 2**64) <= hashed < int(high * 2**64)
-
-
-@dataclasses.dataclass(frozen=True)
-class _HashRows:
-    low: float
-    high: float
-    held: bool
-    key: str | None = None
-
-    def __call__(self, row: Batch) -> bool:
-        """Whether `row` is in this part: the other part's rows are no rejection, as a memory read
-        holds none of them."""
-        return _inside(row, self.low, self.high, self.key) == self.held
 
 
 @dataclasses.dataclass(frozen=True)
@@ -144,8 +154,9 @@ class HashPart:
         return f"{self.source.describe()} hash holdout={part}"
 
     def fingerprint(self) -> Mapping[str, object]:
-        return {**self.source.fingerprint(), "holdout": [self.low, self.high], "held": self.held,
-                "key": self.key, "content_hash": "sha256:sorted-mappings-v1"}
+        part = {"holdout": [self.low, self.high], "held": self.held, "key": self.key,
+                "content_hash": "sha256:sorted-mappings-v1"}
+        return _selected(self.source, "hash", part)
 
     def supports(self, read: Read) -> bool:
         return read in self.reads and self.source.supports(read)
@@ -154,9 +165,19 @@ class HashPart:
         import grain.python as grain
 
         rows = self.source.records(read)
-        keys = tuple(index for index in range(len(rows)) if (row := rows[index]) is not None
-                     and _inside(row, self.low, self.high, self.key) == self.held)
+        keys = tuple(index for index in range(len(rows)) if self.keeps(rows[index]))
         return grain.MapDataset.source(keys).map(_SelectedRow(rows))
+
+    def keeps(self, row: Batch | bytes | None) -> bool:
+        """Whether this part holds `row`: one that is there, its identity in the part."""
+        return row is not None and _inside(row, self.low, self.high, self.key) == self.held
+
+    def admits(self, position: int, row: Batch | bytes | None) -> bool:
+        """Whether this part holds `row`, wherever it is (`keeps`)."""
+        return self.keeps(row)
+
+    def admitted(self, records: int) -> None:
+        """Any number of rows holds a hash part."""
 
     def metadata(self) -> Mapping[str, object]:
         return _uncounted(self.source.metadata())
@@ -176,7 +197,8 @@ class HashPart:
                              None if subdivide is None else functools.partial(_unsized_parts, subdivide))
 
     def _reader(self, manifest: ShardManifest, shard: Shard):
-        return manifest.reader(shard).filter(_HashRows(self.low, self.high, self.held, self.key))
+        # The other part's rows are no rejection, as a memory read holds none of them.
+        return manifest.reader(shard).filter(self.keeps)
 
 
 def _unsized(shards: Sequence[Shard]) -> tuple[Shard, ...]:
@@ -236,9 +258,157 @@ def selecting(source: Source | Mixture | Phases) -> Iterator[Source | Mixture | 
         yield from selecting(source.source)
 
 
-def rebased(source: Source | Mixture | Phases, replacement: Source,
-            under: Source | Mixture | Phases | None = None) -> Source:
-    """The holdout selections of `source` above `under`, its store by default, around `replacement`."""
-    if source is not under and isinstance(source, _SELECTIONS):
-        return dataclasses.replace(source, source=rebased(source.source, replacement, under))
-    return replacement
+def _selected(source: Source, kind: str, selection: Mapping[str, object]) -> Mapping[str, object]:
+    """A selection's identity: what it selects, of its source's identity, so selections stacked on
+    one another each keep their own."""
+    return {"selection": kind, "of": source.fingerprint(), **selection}
+
+
+@dataclasses.dataclass(frozen=True)
+class SelectedGeneration:
+    """The rows `generation` holds for the inputs of `stored`, the source it was published from, that
+    the holdout `selections` keep (outermost first, `stored` below the last), in their order: the
+    generation standing in for its steps under selections written before it, each picking the
+    inputs it picks uncached (`dew.data.analysis._in_place`). The selections name the part, as the
+    run wrote them; `stored` is read as the fill read it (`_consumed`), numbering its inputs by
+    their place in a memory or indexed read (`placing`), or by its shards' rows in a stream, as the
+    fill did (`_source_ids`). Ids that name other inputs than the fill's are refused, never read as none."""
+
+    generation: Generation
+    selections: tuple[RecordSlice | HashPart, ...]
+    stored: Source
+    placing: Read
+
+    def label(self) -> str:
+        return self.selections[0].label()
+
+    def describe(self) -> str:
+        return f"generation:{self.generation.url} for {self.selections[0].describe()}"
+
+    def fingerprint(self) -> Mapping[str, object]:
+        generation = _GenerationSource(self.generation).fingerprint()
+        return {**generation, "selected": self.selections[0].fingerprint()}
+
+    # Every read reads the generation's rows; placing them reads `stored` by `placing` whatever the run reads.
+    def supports(self, read: Read) -> bool:
+        return self.stored.supports(self.placing)
+
+    def can_provision(self, read: Read) -> bool:
+        from dew.data.analysis import _provisioner
+
+        return _provisioner(self.stored, self.placing) is not None
+
+    def provision(self) -> SelectedGeneration:
+        from dew.data.analysis import _provisioner
+
+        preparer = _provisioner(self.stored, self.placing)
+        if preparer is None:
+            raise ValueError(f"{self.stored.describe()} can't prepare the {self.placing} read that places "
+                             "its inputs")
+        preparer.provision()
+        return self
+
+    def records(self, read: Read) -> Records:
+        return _Placed(self.generation, self._dense).rows()
+
+    def manifest(self) -> ShardManifest:
+        # A worker reads the placed rows alone (`_Placed`), not the store that placed them.
+        return _indexed_manifest(self, f"{self.generation.url}#selected", self.generation.url, 4096,
+                                 _Placed(self.generation, self._dense))
+
+    def metadata(self) -> Mapping[str, object]:
+        """The selections' facts, as uncached (what they hold out included), with this part's rows and
+        the generation's count rules."""
+        rules = _GenerationSource(self.generation).metadata()
+        return {**_uncounted(self.selections[0].metadata()), "rows": len(self._dense),
+                "accepted_rows": len(self._dense),
+                **({"count_rules": rules["count_rules"]} if "count_rules" in rules else {})}
+
+    def stated(self) -> Mapping[str, object]:
+        return _uncounted(stated(self.stored))
+
+    def order_fingerprints(self) -> Mapping[str, str]:
+        """Which of the generation's rows this part reads, in their order."""
+        return {"selected": hashlib.sha256(np.ascontiguousarray(self._dense, np.int64).tobytes()).hexdigest()}
+
+    def lengths(self) -> np.ndarray | None:
+        """None: a part packs as it does uncached, where the steps the generation stands for come
+        between it and the pack."""
+        return None
+
+    @functools.cached_property
+    def _dense(self) -> np.ndarray:
+        """The indices of the generation's rows of the inputs the selections keep. The generation's
+        rows are its inputs' outputs in input order (`_publish`), so they are walked in step with
+        the inputs (`_admitted`), each row the next input's that names it."""
+        admitted = self._admitted()
+        dense = []
+        current, kept = None, False
+        index = inputs = 0
+        for page in range(len(self.generation.manifest["row_pages"])):
+            for entry in self.generation._rows(page):
+                while entry["id"] != current:
+                    current, kept = next(admitted, (None, False))
+                    inputs += current is not None
+                    if current is None:
+                        raise ValueError(
+                            f"generation {self.generation.url} holds input {entry['id']}, which "
+                            f"{self.stored.describe()} doesn't name by its {self.placing} read here (a "
+                            "stream names its inputs by where it read their shards, a memory or indexed read "
+                            "by their place), so the holdout written before it can't pick its inputs "
+                            "from it; read it where it was filled, or publish it again from a "
+                            f"{self.placing} read")
+                if kept:
+                    dense.append(index)
+                index += 1
+        inputs += sum(1 for _ in admitted)
+        filled = self.generation.manifest["inputs"]
+        if inputs != filled:
+            raise ValueError(f"generation {self.generation.url} was filled from {filled} inputs, and "
+                             f"{self.stored.describe()} holds {inputs} here, so the holdout written before "
+                             "it can't pick its inputs from it")
+        return np.asarray(dense, np.int64)
+
+    def _admitted(self) -> Iterator[tuple[str, bool]]:
+        """Each input of `stored`, by the key the fill gave it (`_row_key`), and whether the selections
+        keep it: they apply innermost first as the inputs stream past, each at its own position among
+        the inputs the ones within it admitted (`admits`); only a hash holdout reads the rows."""
+        inner = self.selections[::-1]
+        hashed = any(isinstance(selection, HashPart) for selection in inner)
+        if self.placing != "streamed":
+            records = self.stored.records(self.placing)
+            inputs: Iterator[tuple[RowId, Batch | bytes | None]] = (
+                (index, records[index] if hashed else None) for index in range(len(records)))
+        elif hashed:
+            manifest = self.stored.manifest()
+            inputs = (pair for shard in manifest.shards for pair in _shard_inputs(manifest, shard))
+        else:
+            inputs = ((row_id, None) for row_id in _source_ids(self.stored, streamed=True))
+        reached = [0] * len(inner)
+        for row_id, row in inputs:
+            admitted = True
+            for level, selection in enumerate(inner):
+                position, reached[level] = reached[level], reached[level] + 1
+                if not selection.admits(position, row):
+                    admitted = False
+                    break
+            yield _row_key(row_id), admitted
+        for level, selection in enumerate(inner):
+            selection.admitted(reached[level])
+
+
+@dataclasses.dataclass(frozen=True)
+class _Placed:
+    """The rows of `generation` at `indices`: a selected generation's records (`rows`), and the reader
+    of a shard of them a worker takes, holding nothing of the store that placed them."""
+
+    generation: Generation
+    indices: np.ndarray
+
+    def rows(self):
+        import grain.python as grain
+
+        return grain.MapDataset.source(self.indices).map(_SelectedRow(self.generation))
+
+    def __call__(self, shard: Shard):
+        return self.rows()[shard.start : shard.stop].to_iter_dataset()
