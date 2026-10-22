@@ -1719,3 +1719,25 @@ def test_a_worker_reads_a_part_of_a_generation_without_its_store():
     trained, _ = Pipeline(source).holdout(0.25)
     part = _promoted(_tagged(trained).cache(generation)).source
     assert len(pickle.dumps(part.manifest().reader)) * 100 < len(pickle.dumps(source))
+
+
+@pytest.mark.parametrize("store", ["grain", "arrow"])
+def test_a_records_holdout_over_a_stream_filled_generation_of_a_dataset_read_in_index_order(store):
+    """A Grain map dataset and an Arrow dataset stream their records in index order, as they say: a
+    records holdout over a generation a stream filled from either reads the rows of the inputs it
+    keeps, as the chain does uncached."""
+    import datasets
+    import grain.python as grain
+
+    from dew.data import from_grain, from_hf
+    from dew.data.compile import publish
+    from dew.data.pipeline import Pipeline
+
+    rows = [{"id": index} for index in range(12)]
+    source = (from_grain(grain.MapDataset.source(rows), name="rows@1") if store == "grain"
+              else from_hf(datasets.Dataset.from_list(rows), name="rows@1"))
+    generation = publish(_tagged(Pipeline(source)), _cache(), read="streamed")
+    parts = Pipeline(source).holdout(records=5)
+    uncached = [_tags(_tagged(part)) for part in parts]
+    assert all(uncached)
+    assert [_tags(_tagged(part).cache(generation)) for part in parts] == uncached
