@@ -1042,3 +1042,22 @@ def test_a_hook_that_broadcasts_a_side_operand_lowers_for_hopper_through_triton(
     assert {type(launch) for launch, _ in broadcast} >= {grouped_matmul.Gmm, grouped_matmul.Tgmm}
     assert not any(isinstance(launch, grouped_matmul._Mosaic) for launch, _ in broadcast)
 
+
+
+@pytest.mark.parametrize("columns", [128, 300, 384], ids=lambda n: f"{n}-columns")
+def test_an_interpreted_fp32_product_at_highest_is_the_correctly_rounded_sum(columns):
+    """A promoted fp32 product issued off a GPU (`product.interpreted`) sums in float64 and rounds once,
+    so it is the float64 product rounded to fp32 at every shape: XLA's CPU dot takes a less exact
+    accumulation at a 128-aligned shape than at another. A 16-bit product keeps an fp32 sum."""
+    streams = jax.random.split(jax.random.key(0), 2)
+    lhs = jax.random.normal(streams[0], (128, 128), jnp.float32)
+    rhs = jax.random.normal(streams[1], (128, columns), jnp.float32)
+    declared = product.declared(jnp.float32, jax.lax.Precision.HIGHEST, outputs=(jnp.float32,))
+    found = jax.jit(lambda a, b: product.interpreted(declared, a, b, (((1,), (0,)), ((), ()))))(lhs, rhs)
+    truth = np.asarray(lhs, np.float64) @ np.asarray(rhs, np.float64)
+    np.testing.assert_array_equal(np.asarray(found), truth.astype(np.float32))
+    half = product.declared(jnp.bfloat16, None, outputs=(jnp.float32,))
+    assert not half.promoted
+    narrow = (lhs.astype(jnp.bfloat16), rhs.astype(jnp.bfloat16))
+    out = product.interpreted(half, *narrow, (((1,), (0,)), ((), ())))
+    assert out.dtype == jnp.float32

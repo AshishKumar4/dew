@@ -53,7 +53,7 @@ from . import tuning
 from .generation import INHERENT, gpu_target, triton_runs
 from .selection import Requirement
 from .templates import attention_algebra as algebra
-from .templates.attention import NATURAL
+from .templates.attention import NATURAL, interpreted_dot
 
 if TYPE_CHECKING:
     # Named in quotes: tokamax reads its ops' `_fwd` annotations as types, which postponed ones are not.
@@ -120,9 +120,9 @@ FULL = jax.lax.Precision.HIGHEST
 
 
 def _dot(a: jax.Array, b: jax.Array, interpret: bool) -> jax.Array:
-    """`a @ b` in fp32 at `FULL` precision; interpreted, the CPU's own fp32 product."""
+    """`a @ b` in fp32 at `FULL` precision; interpreted, the template's CPU product (`interpreted_dot`)."""
     if interpret:
-        return jnp.dot(a, b, preferred_element_type=jnp.float32)
+        return interpreted_dot(a, b)
     from jax.experimental.pallas import triton as plgpu
 
     return plgpu.dot(a, b, precision=FULL).astype(jnp.float32)
