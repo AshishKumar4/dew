@@ -129,9 +129,10 @@ its caches), the verdict no longer."""
 def equal_dots(fn, **jit_options):
     """`fn` jitted, with EQUAL_DOTS on the CPU lane: an arm of a check 1 between two Dew paths, such as
     an interpreted kernel and the XLA program it replaces, whose dots must reach the same code on any
-    host. On an accelerator lane, where an interpreted kernel runs on the accelerator and a float64
-    truth's dots reach no fusion, it is `jax.jit`. A program Dew's users run compiles with the fusions,
-    as they do."""
+    host. On an accelerator lane, where an interpreted kernel runs on the accelerator, it is `jax.jit`:
+    a float64 twin compiled there for the CPU keeps the fusions, and the oracle rule it is held to
+    (`assert_computes_the_oracle`) is what judges it. A program Dew's users run compiles with the
+    fusions, as they do."""
     if jax.default_backend() == "cpu":
         jit_options["compiler_options"] = {**EQUAL_DOTS, **(jit_options.get("compiler_options") or {})}
     return jax.jit(fn, **jit_options)
