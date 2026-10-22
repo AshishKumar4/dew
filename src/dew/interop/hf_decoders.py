@@ -767,12 +767,16 @@ def save_export_assets(
                          "on a Hugging Face tokenizer")
     os.makedirs(directory, exist_ok=True)
     if writer is not None:
-        # The tokenizer writes its files beside the directory, and each replaces its old one whole,
-        # so an engine reading the directory never reads one half written.
+        # The tokenizer writes its files beside the directory, and each replaces its old one whole at
+        # its own path (a processor's chat_templates/ among them), so an engine reading the directory
+        # never reads one half written.
         with tempfile.TemporaryDirectory(prefix=".dew-", dir=directory) as staged:
             writer.save_pretrained(staged)
-            for written in Path(staged).iterdir():
-                os.replace(written, Path(directory) / written.name)
+            for written in sorted(Path(staged).rglob("*")):
+                if written.is_file():
+                    target = Path(directory) / written.relative_to(staged)
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    os.replace(written, target)
     if byte:
         values['tokenizer_name'] = "byte"
     write_atomically(os.path.join(directory, GENERATION_CONFIG_FILE), json.dumps(values, indent=2))
