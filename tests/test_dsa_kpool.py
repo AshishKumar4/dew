@@ -109,7 +109,7 @@ rounding, so float64 and fp32 select the same pools."""
 
 SEEDS = {'output': 8, 'biased': 8, 'dense': 8, 'gradients': 128, 'parallel': 8, 'decode': 8,
          'padded decode': 8, 'hole': 8}
-"""Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada, 2026-10-21)."""
+"""Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada)."""
 
 
 def drawn(block, padded: bool = True, cotangent: bool = False):
