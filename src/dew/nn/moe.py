@@ -37,7 +37,7 @@ from .activations import GatedActivation, gated_product, relu2, swiglu_clamped
 from .blocks import normal_kernel
 from .flops import MissingFlopsCount, counted_flops, projection_flops
 from .kernels.generation import backend, ran_kernel, route, triton_runs
-from .kernels.grouped_matmul import portable_projection, ragged_dot_refusal
+from .kernels.grouped_matmul import portable_projection
 from .kernels.selection import forced
 from .kernels.templates.gemm import template
 from .precision import at_least_fp32, float32_dot_general, float32_einsum, float32_products, rounded_operand
@@ -425,7 +425,7 @@ def gather_expert_bias(bias: jax.Array, expert_ids: jax.Array, dtype: Dtype) -> 
 
 def expert_projection(x: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
                       dtype: Dtype | None, implementation: str,
-                      precision: PrecisionLike, *, layer: jax.Array | None = None) -> jax.Array:
+                      precision: PrecisionLike) -> jax.Array:
     """The grouped matmul of `x`'s expert-sorted rows, `[rows, in]`, through
     each expert's matrix in `kernel`, `[experts, in, out]`, `group_sizes`
     counting each expert's leading rows, under one precision contract for both
@@ -451,19 +451,16 @@ def expert_projection(x: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
     Qwen3-30B-A3B's and Kimi Linear's experts (GMM-h100-2), so where the kernels
     run they are the choice. tests/test_moe_precision.py measures it against
     float64 sums and three Adam steps on every expert/fsdp layout.
-
-    `layer`, an integer scalar where given, makes `kernel` a bank of layers'
-    expert matrices, `[layers, experts, in, out]`, whose layer the kernels read
-    in place (`template.gemm`'s `rhs_index`), a scanned stack's with no copy a step.
     """
     if implementation not in GROUPED_MATMULS:
         raise ValueError(f"implementation must be one of {list(GROUPED_MATMULS)}, got {implementation!r}")
     compute = canonicalize_dtype(x, kernel, dtype=dtype)
     resolved = float32_products(compute, precision)
     named = forced('grouped_matmul')
+    # The kernels run in a GPU's process, or interpreted in a CPU's where 'pallas' asks; what they compute
+    # is the template's to refuse (`template.gemm`).
     placed = triton_runs() or (implementation == 'pallas' and backend() == 'cpu')
-    refusal = ragged_dot_refusal(compute, (x.dtype, kernel.dtype), resolved) or (
-        None if placed else "the Pallas kernels need a GPU of sm80 or later")
+    refusal = None if placed else "the Pallas kernels need a GPU of sm80 or later"
     if named == 'xla' or (named is None and implementation == 'xla'):
         route('grouped_matmul', kernel='xla')
     elif refusal is not None and named is not None:
@@ -475,9 +472,7 @@ def expert_projection(x: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
         # The GEMM template: its launches where they run the call (each reports its route), XLA's
         # program elsewhere, differentiable at every order.
         return template.gemm(x, kernel, group_sizes, compute=compute, out_dtype=compute, precision=resolved,
-                             interpret_on_cpu=implementation == 'pallas', rhs_index=layer)
-    if layer is not None:
-        kernel = jax.lax.dynamic_index_in_dim(kernel, layer, keepdims=False)
+                             interpret_on_cpu=implementation == 'pallas')
     return portable_projection(x, kernel, group_sizes, dtype, resolved)
 
 

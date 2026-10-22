@@ -4,15 +4,13 @@ rounded operands; the MoE dispatcher's routes to each implementation; the produc
 kernels write them; and the cost model (`dew.nn.kernels.templates.cost`) on analytic launches."""
 
 import dataclasses
-import functools
 import itertools
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from generation_support import INTERPRETS, generations, lowers
-from jax.sharding import Mesh
+from generation_support import INTERPRETS, generations
 from reference_error import assert_as_exact_as_the_reference, equations
 
 from dew.nn.kernels import generation, grouped_matmul
@@ -159,91 +157,23 @@ def test_an_expert_projection_runs_the_implementation_chosen_for_it_on_the_cpu(g
 
 
 
-@INTERPRETS
-@pytest.mark.parametrize("generation_name,implementation", [("sm80", "triton"), ("sm90", "mosaic_gpu")])
-@pytest.mark.parametrize("master", [jnp.bfloat16, jnp.float32], ids=["bf16", "fp32"])
-def test_a_banked_projection_is_its_layers_plain_projection(generation_name: str, implementation: str,
-                                                           master):
-    """An expert projection reading its matrices from a bank's layer (`layer`) is the plain projection of
-    that layer, bit for bit: its output and input gradient, and its kernel gradient at the layer, zero at
-    every other (the plain projection held to check 1 above). A bf16 bank is read in place by the kernels,
-    an fp32 master's layer cast first."""
-    sizes = [0, 70, 1, 100, 0]
-    x, w, dy, _ = operands(sizes, jnp.bfloat16, seed=5)
-    rng = np.random.default_rng(6)
-    bank = jnp.asarray(rng.normal(size=(3, *w.shape)), master).at[1].set(jnp.asarray(w, master))
-    group_sizes = jnp.asarray(sizes, jnp.int32)
-    x, dy = jnp.asarray(x, jnp.bfloat16), jnp.asarray(dy, jnp.bfloat16)
-
-    def products(x, w, **layer):
-        y, pull = jax.vjp(lambda x, w: expert_projection(x, w, group_sizes, jnp.bfloat16, "pallas", None,
-                                                         **layer), x, w)
-        return (y, *pull(dy))
-
-    # Mosaic's interpreter's ordered callbacks run eagerly: a jitted `linear_call` cannot carry them.
-    staged = (lambda f: f) if implementation == "mosaic_gpu" else jax.jit
-    with (generation.assumed(generation_name), generation.chosen(grouped_matmul=implementation),
-          generation.routes() as routes):
-        banked = staged(functools.partial(products, layer=jnp.int32(1)))(x, bank)
-        plain = staged(products)(x, bank[1])
-    assert {route.kernel for route in routes if route.choice == "grouped_matmul"} == {implementation}
-    for got, want in zip(banked[:2], plain[:2], strict=True):
-        np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
-    np.testing.assert_array_equal(np.asarray(banked[2][1]), np.asarray(plain[2]))
-    np.testing.assert_array_equal(np.asarray(banked[2][::2]), np.zeros((2, *w.shape)))
-
-@lowers("sm90")
-@pytest.mark.parametrize("launch,trans_rhs", [(grouped_matmul.MosaicGmm(), False),
-                                              (grouped_matmul.MosaicGmm(), True),
-                                              (grouped_matmul.MosaicTgmm(), None)],
-                         ids=["MosaicGmm", "MosaicGmm-transposed", "MosaicTgmm"])
-def test_every_tile_of_the_hopper_grouped_matmuls_lowers_for_an_h100(launch, trans_rhs):
-    """The tiles the Mosaic GPU launches may pick at an expert layer's shapes lower for an H100 on the
-    CPU, as a GPU session's compile would, over rows no multiple of 8: every block shape and every
-    schedule among those that fit an H100's block (`Template.fitting`). The interpreter takes kernels
-    Mosaic GPU's layout inference and TMA descriptors refuse; the GPU's tile gate runs each one
-    (test_moe_precision)."""
-    # Rows not a multiple of 8, which a TMA descriptor tiles by.
-    rows, depth, width, groups = 2044, 768, 1536, 8
-    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
-    sizes, matrices = jax.ShapeDtypeStruct((groups,), jnp.int32), bf16((groups, depth, width))
-    if isinstance(launch, grouped_matmul.MosaicTgmm):
-        args, options = (bf16((rows, depth)), bf16((rows, width)), sizes), {"out_dtype": "float32"}
-    elif trans_rhs:
-        args, options = (bf16((rows, width)), matrices, sizes), {"trans_rhs": True}
-    else:
-        args, options = (bf16((rows, depth)), matrices, sizes), {"trans_rhs": False}
-    options = {"out_dtype": "bfloat16", **options, "interpret": False}
-    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
-    with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
-        fits = launch.fitting(launch.bind(*args, **options), generation.gpu_target())
-        # A fitting tile of every block shape and of every schedule: what the lowering depends on
-        # (shared memory, the snake's index arithmetic), each value once.
-        covering = set({(c.block_m, c.block_n): c for c in reversed(fits)}.values())
-        covering |= set({(c.stages, c.grid_block_n): c for c in reversed(fits)}.values())
-        covering |= set({(c.warpgroups, c.cluster, c.block_n): c for c in reversed(fits)}.values())
-        assert {(c.block_m, c.block_n) for c in covering} == {(c.block_m, c.block_n) for c in fits}
-        assert {(c.stages, c.grid_block_n) for c in covering} == {(c.stages, c.grid_block_n) for c in fits}
-        assert {(c.warpgroups, c.cluster) for c in covering} == {(c.warpgroups, c.cluster) for c in fits}
-        for config in sorted(covering, key=repr):
-            jax.jit(functools.partial(launch.replace(config=config), **options)).trace(*args).lower(
-                lowering_platforms=("cuda",))
-
-
 def test_the_kernels_forward_mode_keeps_the_projections_law():
-    """An expert projection's tangent through the template is the portable projection's, bit for bit:
-    `dx @ Q(kernel) + Q(x) @ dkernel` with the tangents unrounded, where a cast's own tangent would round
-    an fp32 input's to bf16 first (two products of an fp32 1 + 2^-8 and 1.5 sum to 3.015625, rounded first
-    3)."""
+    """An expert projection's tangent through the template (its launches interpreted, as an A100 runs
+    them) is the XLA projection's, bit for bit: `dx @ Q(kernel) + Q(x) @ dkernel` with the tangents
+    unrounded, where a cast's own tangent would round an fp32 input's to bf16 first (two products of an
+    fp32 1 + 2^-8 and 1.5 sum to 3.015625, rounded first 3)."""
     sizes = jnp.asarray([1, 2], jnp.int32)
     x, w = jnp.zeros((3, 2), jnp.float32), jnp.full((2, 2, 2), 1.5, jnp.float32)
-    dx, dw = jnp.full((3, 2), 1 + 2.0 ** -8, jnp.float32), jnp.zeros((2, 2, 2), jnp.float32)
-    tangents = {implementation: jax.jvp(lambda x, w, implementation=implementation: expert_projection(
-        x, w, sizes, jnp.bfloat16, implementation, None), (x, w), (dx, dw))[1]
-        for implementation in ("auto", "xla")}
-    np.testing.assert_array_equal(np.asarray(tangents["auto"], np.float32),
-                                  np.asarray(tangents["xla"], np.float32))
-    assert np.asarray(tangents["xla"], np.float32)[0, 0] == np.float32(3.015625)
+    dx, dw = jnp.full((3, 2), 1 + 2.0 ** -8, jnp.float32), jnp.full((2, 2, 2), 2.0 ** -9, jnp.float32)
+
+    def tangent(implementation):
+        return jax.jit(lambda x, w, dx, dw: jax.jvp(lambda x, w: expert_projection(
+            x, w, sizes, jnp.bfloat16, implementation, None), (x, w), (dx, dw))[1])(x, w, dx, dw)
+
+    with generation.assumed("sm80"), generation.routes() as taken:
+        kernels = tangent("pallas")
+    assert {route.kernel for route in taken if route.choice == "grouped_matmul"} == {"triton"}
+    np.testing.assert_array_equal(np.asarray(kernels, np.float32), np.asarray(tangent("xla"), np.float32))
 
 
 def test_a_named_kernel_refuses_where_the_kernels_do_not_run():

@@ -138,12 +138,10 @@ def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles,
         out_dtype, multiprocessors: int, interpret: bool | plgpu.InterpretGPUParams = False,
         prologue=None, prologue_operands: tuple = (), prologue_axes: tuple = (), epilogue=None,
         epilogue_operands: tuple = (), epilogue_axes: tuple = (),
-        out_dtypes: tuple | None = None, layer: jax.Array | None = None) -> jax.Array | tuple[jax.Array, ...]:
+        out_dtypes: tuple | None = None) -> jax.Array | tuple[jax.Array, ...]:
     """Each group's rows of `lhs` `[rows, depth]` times its matrix of `rhs`, `[groups, depth, width]` or
     with `transpose_rhs` `[groups, width, depth]`: `[rows, width]` in `out_dtype`, the rows past the
-    routed ones zero. The depth must divide by `tiles.block_k` and the width by `tiles.block_n`. Dew:
-    with `layer`, an int32 scalar, `rhs` is a bank `[layers, groups, ...]` whose layer `layer` the kernel
-    reads in place, its TMA loads offset by it, where slicing it out would copy it.
+    routed ones zero. The depth must divide by `tiles.block_k` and the width by `tiles.block_n`.
 
 Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of `lhs` (a cooperative
     tile's consumer, half its rows) in its shared memory stage before the warpgroup MMA reads it;
@@ -153,7 +151,7 @@ Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of 
     epilogue's, each brought to shared memory by TMA."""
     block_n, block_k = tiles.block_n, tiles.block_k
     rows, k = lhs.shape
-    g, k2, n = rhs.shape[-3:]
+    g, k2, n = rhs.shape
     if transpose_rhs:
         k2, n = n, k2
     if k != k2 or k % block_k or n % block_n:
@@ -170,17 +168,16 @@ Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of 
                                                                                strict=True))
     dtypes = tuple(jnp.dtype(dtype) for dtype in (out_dtypes or (out_dtype,)))
     launch = _gmm_cooperative if tiles.warpgroups == 2 else _gmm_alone
-    layers = () if layer is None else (jnp.reshape(layer.astype(jnp.int32), (1,)),)
     outs = launch(lhs, rhs, lengths, (m, n, k, g), tiles=tiles, transpose_rhs=transpose_rhs, dtypes=dtypes,
                   multiprocessors=multiprocessors, interpret=interpret,
                   hooks=(prologue, prologue_axes, epilogue, epilogue_axes),
-                  sides=(prologue_operands, epilogue_operands), layers=layers)
+                  sides=(prologue_operands, epilogue_operands))
     outs = tuple(out[:rows] for out in outs)
     return outs if out_dtypes else outs[0]
 
 
 def _gmm_alone(lhs, rhs, lengths, shape: tuple, *, tiles: Tiles, transpose_rhs: bool, dtypes: tuple,
-               multiprocessors: int, interpret, hooks: tuple, sides: tuple, layers: tuple = ()) -> tuple:
+               multiprocessors: int, interpret, hooks: tuple, sides: tuple) -> tuple:
     """`gmm`'s product at a tile one warpgroup computes, loading and multiplying (upstream's kernel), with
     `_gmm_cooperative`'s arguments."""
     prologue, prologue_axes, epilogue, epilogue_axes = hooks
@@ -254,7 +251,7 @@ def _gmm_alone(lhs, rhs, lengths, shape: tuple, *, tiles: Tiles, transpose_rhs: 
                     plgpu.wait_smem_to_gmem(0, wait_read_only=True)
 
     kernel = plgpu.kernel(
-        _indexed(body, layers),
+        body,
         # Dew: the output dtypes asked for, and the device's multiprocessors.
         out_type=tuple(jax.ShapeDtypeStruct((m, n), dtype) for dtype in dtypes),
         grid=(multiprocessors,),
@@ -262,12 +259,11 @@ def _gmm_alone(lhs, rhs, lengths, shape: tuple, *, tiles: Tiles, transpose_rhs: 
         compiler_params=hopper.compiler_params(),
         interpret=interpret,
     )
-    return kernel(lengths, *layers, lhs, rhs, *prologue_operands, *epilogue_operands)
+    return kernel(lengths, lhs, rhs, *prologue_operands, *epilogue_operands)
 
 
 def _gmm_cooperative(lhs, rhs, lengths, shape: tuple, *, tiles: Tiles, transpose_rhs: bool, dtypes: tuple,
-                     multiprocessors: int, interpret, hooks: tuple, sides: tuple,
-                     layers: tuple = ()) -> tuple:
+                     multiprocessors: int, interpret, hooks: tuple, sides: tuple) -> tuple:
     """Dew: `gmm` at a tile two consumer warpgroups compute (half its columns each) beside a producer
     issuing the loads (as `hopper_matmul_mgpu`); `tiles.cluster` 2 pairs two row tiles of one group, which
     load each matrix block once, multicast. A prologue's consumers each rewrite half the rows' shared stage,
@@ -375,24 +371,10 @@ def _gmm_cooperative(lhs, rhs, lengths, shape: tuple, *, tiles: Tiles, transpose
 
         plgpu.wait_smem_to_gmem(0, wait_read_only=True)
 
-    outs = tuple(jax.ShapeDtypeStruct((m, n), dtype) for dtype in dtypes)
-    kernel = hopper.cooperative(_indexed(body, layers), outs,
+    kernel = hopper.cooperative(body, tuple(jax.ShapeDtypeStruct((m, n), dtype) for dtype in dtypes),
                                 consumers=2, cluster=tiles.cluster, multiprocessors=multiprocessors,
                                 interpret=interpret)
-    return kernel(lengths, *layers, lhs, rhs, *prologue_operands, *epilogue_operands)
-
-
-def _indexed(body, layers: tuple):
-    """Dew: a `gmm` kernel's `body` on a bank's layer where `layers` holds its index (`gmm`'s `layer`): the
-    index read once, the matrices' ref offset by it, so every TMA load of a matrix block reads the layer
-    in place."""
-    if not layers:
-        return body
-
-    def on_layer(lengths_gmem, layer_gmem, lhs_gmem, rhs_gmem, *refs):
-        return body(lengths_gmem, lhs_gmem, rhs_gmem.at[layer_gmem[0]], *refs)
-
-    return on_layer
+    return kernel(lengths, lhs, rhs, *prologue_operands, *epilogue_operands)
 
 
 def _gmm_pipeline(tiles: Tiles, transpose_rhs: bool, steps: int, side_axes: tuple, body, context):

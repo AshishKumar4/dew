@@ -153,14 +153,7 @@ def _gpu_ragged_dot_kernel(
   epilogue=None,
   epilogue_axes: tuple = (),
   exact_sums: bool = False,
-  indexed: bool = False,
 ):
-  # Dew: `A_ref` a bank of matrix sets where `indexed`, the layer's read in place: its index leads every
-  # load's (one indexer, Triton's lowering composing none).
-  lead = ()
-  if indexed:
-    layer_ref, *refs = refs
-    lead = (layer_ref[0],)
   prologue_refs = refs[:len(prologue_axes)]
   epilogue_refs = refs[len(prologue_axes):len(prologue_axes) + len(epilogue_axes)]
   out_refs = refs[len(prologue_axes) + len(epilogue_axes):]
@@ -201,10 +194,10 @@ def _gpu_ragged_dot_kernel(
         x = jnp.where(mask, prologue(x, *tiles), 0)
       if not trans_rhs:
         mask = inner_mask[:, None] & rhs_cols_mask[None, :]
-        A = _load(A_ref.at[(*lead, pid.gi, inner_idx, rhs_cols_idx)], mask=mask)
+        A = _load(A_ref.at[pid.gi, inner_idx, rhs_cols_idx], mask=mask)
       else:
         mask = rhs_cols_mask[:, None] & inner_mask[None, :]
-        A = _load(A_ref.at[(*lead, pid.gi, rhs_cols_idx, inner_idx)], mask=mask)
+        A = _load(A_ref.at[pid.gi, rhs_cols_idx, inner_idx], mask=mask)
       x, A = x.astype(compute_dtype), A.astype(compute_dtype)
       dim_nums = (
           (((1,), (0,)), ((), ()))  # normal matmul product x @ y
@@ -302,7 +295,6 @@ def gmm(
   epilogue_axes: tuple = (),
   out_dtypes: tuple | None = None,
   exact_sums: bool = False,
-  layer: jax.Array | None = None,
 ) -> jax.Array | tuple[jax.Array, ...]:
   """Compute grouped matmul on GPU via a Pallas lowering.
 
@@ -310,13 +302,8 @@ def gmm(
   `epilogue(acc, *side_tiles)` each fp32 accumulator tile, returning one output or a tuple of them
   (`out_dtypes`). Each side operand's dimensions follow the launch axes its `*_axes` entry names
   (`_side_tile`): 'rows' and 'depth' for the prologue's, 'rows' and 'columns' for the epilogue's.
-  `exact_sums` adds each depth step's product into the fp32 sum by an IEEE add (`_summed`).
-  With `layer`, an int32 scalar, `A` is a bank `[layers, g, k, n]` (or `[layers, g, n, k]`) whose layer
-  `layer` the kernel reads in place, the index offsetting its loads, where slicing it out would copy it."""
+  `exact_sums` adds each depth step's product into the fp32 sum by an IEEE add (`_summed`)."""
 
-  bank = A
-  if layer is not None:
-    A = jax.ShapeDtypeStruct(bank.shape[1:], bank.dtype)
   msg = "This gmm kernel only supports either (m, k) x (g, k, n) -> (m, n) "
   msg += f"or (m, k) x (g, n, k) -> (m, n), but got {x.shape=} {A.shape=}"
   if not (A.ndim == 3 and x.ndim == 2):
@@ -340,12 +327,6 @@ def gmm(
   A_spec = pl.BlockSpec((size.g, size.k, block_n), lambda i, j: (0, 0, j))
   if trans_rhs:  # transposed spec
     A_spec = pl.BlockSpec((size.g, block_n, size.k), lambda i, j: (0, j, 0))
-  layers = ()
-  if layer is not None:
-    # Dew: the whole bank in the layers' dimension, and the layer, read once a program.
-    A_spec = pl.BlockSpec((bank.shape[0], *A_spec.block_shape),
-                          lambda i, j, index=A_spec.index_map: (0, *index(i, j)))
-    layers = (jnp.reshape(layer.astype(jnp.int32), (1,)),)
 
   group_metadata = _make_gmm_group_metadata(
     group_sizes=group_sizes, m=size.m, chunk_m=chunk_m
@@ -358,7 +339,6 @@ def gmm(
       lambda x: pl.BlockSpec(x.shape, lambda *args: (0,) * x.ndim),
       group_metadata,
     ),
-    *(pl.BlockSpec((1,), lambda i, j: (0,)) for _ in layers),
     # Dew: each side operand whole; the kernel loads its tiles at its own origins.
     *(pl.BlockSpec(side.shape, lambda i, j, ndim=side.ndim: (0,) * ndim) for side in sides),
   ]
@@ -378,7 +358,6 @@ def gmm(
     "epilogue": epilogue,
     "epilogue_axes": epilogue_axes,
     "exact_sums": exact_sums,
-    "indexed": layer is not None,
   }
   with jax.named_scope("pallas_triton_ragged_dot"):
     outs = pl.pallas_call(
@@ -395,7 +374,7 @@ def gmm(
         num_warps=num_warps, num_stages=num_stages
       ),
       name="pallas_triton_ragged_dot",
-    )(x, bank, group_metadata, *layers, *sides)
+    )(x, A, group_metadata, *sides)
   return outs if out_dtypes else outs[0]
 
 
