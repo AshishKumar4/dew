@@ -490,7 +490,8 @@ def test_flow_rollout_groups_rewards_selects_steps_and_preserves_likelihoods():
         blank = jax.tree.map(lambda null, value: jnp.broadcast_to(null, value.shape),
                              objective.encode(encoders), given)
         steps = int(batch["rollout_steps"][0]) - 1
-        apply = jax.jit(model.apply)
+        # The DiT computing at `dtype`: its own float32 floor would round a float64 truth's times.
+        apply = jax.jit(model.clone(dtype=dtype).apply)
 
         def velocity(column, x, sigma):
             # The rollout's step of this column, off its time on the rollout's own grid of `steps` steps.
@@ -846,7 +847,15 @@ def test_conditioned_prompt_only_evaluation_preview_and_trainer_consumers():
     model = SimpleDiT(output_channels=1, patch_size=2, emb_features=8,
                       num_layers=1, num_heads=2, mlp_ratio=2)
     process = Process(FlowMatchingScheduler(shift=2), FlowMatchPredictionTransform())
-    objective = FlowGRPOObjective(model, process, inputs, guidance=CFG(1.5), beta=0.1, steps=3)
+    untrained = FlowGRPOObjective(model, process, inputs, guidance=CFG(1.5), beta=0.1, steps=3).init(
+        jax.random.key(100))
+    # Noise in every weight, the zeroed output head's too, so the evaluation reads its prompts.
+    leaves, tree = jax.tree.flatten(untrained["params"])
+    noise = jax.random.split(jax.random.key(103), len(leaves))
+    params = jax.tree.unflatten(tree, [leaf + 0.1 * jax.random.normal(key, leaf.shape, leaf.dtype)
+                                       for leaf, key in zip(leaves, noise, strict=True)])
+    objective = FlowGRPOObjective(model, process, inputs, guidance=CFG(1.5), beta=0.1, steps=3,
+                                  variables={**untrained, "params": params})
     rollout = FlowRollout(objective, lambda images, batch: images.mean((1, 2, 3)), groups=2, steps=3)
     tracker, metric = RecordingTracker(), PixelMean()
     trainer = Trainer(objective, optax.sgd(1e-3), key=jax.random.key(101), rollout=rollout, tracker=tracker)
@@ -873,7 +882,8 @@ def test_conditioned_prompt_only_evaluation_preview_and_trainer_consumers():
         given = objective.encode(encoders, many_tokens)
         blank = jax.tree.map(lambda null, value: jnp.broadcast_to(null, value.shape),
                              objective.encode(encoders), given)
-        apply = jax.jit(model.apply)
+        # The DiT computing at `dtype`: its own float32 floor would round a float64 truth's times.
+        apply = jax.jit(model.clone(dtype=dtype).apply)
 
         def run(key):
             with jax.enable_x64(new_val=False):
