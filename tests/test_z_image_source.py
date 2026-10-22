@@ -25,7 +25,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from interop_support import assert_transformer_exports, extract_fixture, fixture_arrays, source_transformer
-from reference_error import assert_as_exact_as_the_reference, assert_leaves_as_exact
+from reference_error import assert_as_exact, assert_as_exact_as_the_reference
 
 from dew.diffusion.process import DenoisingCondition
 from dew.interop.diffusion import z_image_fields, z_image_path
@@ -33,6 +33,7 @@ from dew.nn.backbones.z_image import ZImageTransformer
 
 ROOT = Path(__file__).resolve().parents[1]
 CASES = ("padded", "exact", "deep")
+CASE_SEEDS = {"padded": 16, "exact": 16, "deep": 16}
 BUDGET = 64
 
 
@@ -61,17 +62,24 @@ def load(source, name):
     return source_transformer(source, name, ZImageTransformer, z_image_fields, z_image_path)
 
 
-def inputs(name, arrays, record):
-    """The native call's inputs: the latents channels last, the model time
-    from the source's 1 - sigma, and each prompt padded to the budget."""
-    lengths = record["cases"][name]["lengths"]
-    width = arrays[f"{name}.caption.0"].shape[-1]
-    context = np.zeros((len(lengths), BUDGET, width), np.float32)
-    for row, length in enumerate(lengths):
-        context[row, :length] = arrays[f"{name}.caption.{row}"]
-    mask = np.arange(BUDGET)[None] < np.asarray(lengths)[:, None]
-    time = 1000.0 * (1.0 - arrays[f"{name}.times"])
-    return jnp.asarray(nhwc(arrays[f"{name}.latents"])), jnp.asarray(time, jnp.float32), context, mask
+def z_image_walk(model, params, lengths):
+    """A compiled native flow and every gradient on a draw: the source's latents channels last, the
+    model time from the source's 1 - sigma, and each prompt padded to the budget and masked."""
+    mask = jnp.asarray(np.arange(BUDGET)[None] < np.asarray(lengths)[:, None])
+
+    @jax.jit
+    def walk(latents, times, context, probe):
+        time = 1000.0 * (1.0 - times)
+
+        def objective(params, latents, context):
+            flow = model.apply({"params": params}, latents, time, DenoisingCondition(context, mask=mask))
+            return jnp.sum(flow * probe), flow
+
+        (_, flow), gradients = jax.value_and_grad(objective, argnums=(0, 1, 2), has_aux=True)(
+            params, latents, context)
+        return flow, gradients
+
+    return walk
 
 
 @pytest.mark.parametrize("name", CASES)
@@ -82,37 +90,73 @@ def test_every_published_tensor_maps_and_exports_bit_identical(source, name):
 
 @pytest.mark.parametrize("name", CASES)
 def test_the_flow_and_its_gradients_match_the_source(source, arrays, record, name):
-    """The native flow is the negated source output, its gradients the
-    negated source gradients, every parameter's among them, whatever the
-    rows' prompt lengths: each as near float64 as the source's float32."""
+    """The native flow is the negated source output, its gradients the negated source gradients,
+    every parameter's among them, whatever the rows' prompt lengths, each as near float64 as
+    Diffusers' own float32 walk (`assert_as_exact`) over the fixture's draw and fresh ones; a
+    prompt's padding takes no gradient."""
+    import torch
+    from diffusers import ZImageTransformer2DModel
+
+    from tools.diffusers_wan_reference import float64
+
     model, params, layouts = load(source, name)
-    latents, time, context, mask = inputs(name, arrays, record)
-    probe = nhwc(arrays[f"{name}.probe"])
-
-    def objective(params, latents, context):
-        return jnp.sum(
-            model.apply({"params": params}, latents, time, DenoisingCondition(context, mask=mask)) * probe
-        )
-
-    def held(value, key, layout=np.asarray):
-        assert_as_exact_as_the_reference(-np.asarray(value), layout(arrays[f"{name}.{key}"]),
-                                         layout(arrays[f"{name}.fp64.{key}"]), f"{name} {key}")
-
-    flow = model.apply({"params": params}, latents, time, DenoisingCondition(jnp.asarray(context), mask=mask))
-    held(flow, "output", nhwc)
-    grad_params, grad_latents, grad_context = jax.grad(objective, argnums=(0, 1, 2))(params, latents,
-                                                                                     jnp.asarray(context))
-    held(grad_latents, "grad_latents", nhwc)
-    for row, length in enumerate(record["cases"][name]["lengths"]):
-        held(grad_context[row, :length], f"grad_caption.{row}")
-        assert not np.asarray(grad_context[row, length:]).any()
+    lengths = record["cases"][name]["lengths"]
+    walk = z_image_walk(model, params, lengths)
     tensors = {layout.name.removeprefix("transformer/"): layout for layout in layouts}
     assert {key.removeprefix(f"{name}.grad_param.") for key in arrays
             if key.startswith(f"{name}.grad_param.")} == set(tensors)
-    assert_leaves_as_exact(
-        {tensor: -np.asarray(layout.export({"params": grad_params})) for tensor, layout in tensors.items()},
-        {tensor: arrays[f"{name}.grad_param.{tensor}"] for tensor in tensors},
-        {tensor: arrays[f"{name}.fp64.grad_param.{tensor}"] for tensor in tensors})
+    captions = [f"caption.{row}" for row in range(len(lengths))]
+    original = {key: np.array(arrays[f"{name}.{key}"]) for key in ("latents", "times", "probe", *captions)}
+
+    def draw(seed):
+        """The fixture's inputs at seed 0, else fresh normal draws at `seed`."""
+        if seed == 0:
+            return (original,)
+        generator = torch.Generator().manual_seed(31 + seed)
+        return ({**{key: torch.randn(original[key].shape, generator=generator).numpy()
+                    for key in ("latents", "probe", *captions)}, "times": original["times"]},)
+
+    checkpoint = source / name / "transformer"
+    narrow_model = ZImageTransformer2DModel.from_pretrained(
+        checkpoint, torch_dtype=torch.float32, local_files_only=True).eval()
+    with float64():
+        wide_model = ZImageTransformer2DModel.from_pretrained(
+            checkpoint, torch_dtype=torch.float64, local_files_only=True).eval()
+
+    def reference_walk(model, dtype, drawn):
+        inputs = [torch.tensor(drawn[key], dtype=dtype).requires_grad_() for key in ("latents", *captions)]
+        named = list(model.named_parameters())
+        output = torch.stack(model(list(inputs[0].unbind(0)), torch.tensor(drawn["times"], dtype=dtype),
+                                   inputs[1:], return_dict=False)[0])
+        gradients = torch.autograd.grad((output * torch.tensor(drawn["probe"], dtype=dtype)).sum(),
+                                        inputs + [value for _, value in named])
+        return {"output": nhwc(output.detach().numpy()), "grad_latents": nhwc(gradients[0].numpy()),
+                **{f"grad_{caption}": gradient.numpy()
+                   for caption, gradient in zip(captions, gradients[1:1 + len(captions)], strict=True)},
+                **{f"grad_param.{key}": gradient.numpy()
+                   for (key, _), gradient in zip(named, gradients[1 + len(captions):], strict=True)}}
+
+    def truth(inputs):
+        with float64():
+            return reference_walk(wide_model, torch.float64, inputs)
+
+    def native(inputs):
+        width = inputs[captions[0]].shape[-1]
+        context = np.zeros((len(lengths), BUDGET, width), np.float32)
+        for row, length in enumerate(lengths):
+            context[row, :length] = inputs[f"caption.{row}"]
+        flow, (grad_params, grad_latents, grad_context) = walk(
+            jnp.asarray(nhwc(inputs["latents"])), jnp.asarray(inputs["times"], jnp.float32),
+            jnp.asarray(context), jnp.asarray(nhwc(inputs["probe"])))
+        grad_context = np.asarray(grad_context)
+        assert not any(grad_context[row, length:].any() for row, length in enumerate(lengths))
+        return {"output": -np.asarray(flow), "grad_latents": -np.asarray(grad_latents),
+                **{f"grad_caption.{row}": -grad_context[row, :length] for row, length in enumerate(lengths)},
+                **{f"grad_param.{tensor}": -np.asarray(layout.export({"params": grad_params}))
+                   for tensor, layout in tensors.items()}}
+
+    assert_as_exact(native, lambda inputs: reference_walk(narrow_model, torch.float32, inputs), draw,
+                    f"Z-Image {name}", seeds=CASE_SEEDS[name], truth_fn=truth)
 
 
 @pytest.fixture(scope="module")
