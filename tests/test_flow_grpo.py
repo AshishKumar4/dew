@@ -46,17 +46,11 @@ BATCHES = 16
 """The batches a draw of a site holds whose outputs are one number a batch."""
 
 
-def as_float32(tree):
-    """`tree`'s float leaves at float32, as the arm under test took them, its other leaves as they are:
-    a float64 truth evaluates the arm's own float32 states."""
-    return jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float32)
-                        if jnp.issubdtype(jnp.asarray(leaf).dtype, jnp.floating) else leaf, tree)
-
-
 def walked_in_float32(walk, *inputs):
-    """`walk` on `inputs` at float32 with x64 off, as the arm under test walked them."""
+    """`walk` on `inputs`, float arrays, at float32 with x64 off, as the arm under test walked them: a
+    float64 truth evaluates the arm's own float32 states."""
     with jax.enable_x64(new_val=False):
-        return walk(*as_float32(inputs))
+        return walk(*(jnp.asarray(value, jnp.float32) for value in inputs))
 
 
 def drawn_rows(*shapes, scale=0.5):
@@ -148,6 +142,16 @@ def test_recorded_trajectory_rescores_under_shifted_guided_process():
 
 
 
+def recorded_and_rescored(walk, rescore, variables):
+    """A walk's recorded densities and their rescoring under `variables` (`rescore`, the objective's
+    `log_probs`), from a start."""
+    def scored(start):
+        trajectory = walk(start)
+        return {"recorded": trajectory.log_probs,
+                "rescored": rescore(variables, trajectory_batch(trajectory, np.ones(ROWS, np.float32)))}
+    return scored
+
+
 def trajectory_batch(trajectory, advantages, mask=None):
     count, points = trajectory.states.shape[:2]
     return {
@@ -187,12 +191,8 @@ def test_flow_objective_uses_converted_predictions(prediction):
         density = walk_density(trajectory, lambda t: t, velocity, 0.5, dtype)
         return {"recorded": density, "rescored": density}
 
-    def scored(start):
-        trajectory = walk(start)
-        return {"recorded": trajectory.log_probs,
-                "rescored": rescore(variables, trajectory_batch(trajectory, np.ones(ROWS, np.float32)))}
-
-    assert_as_exact(scored, lambda start: rectified(walk(start), np.float32), drawn_rows((2,)),
+    assert_as_exact(recorded_and_rescored(walk, rescore, variables),
+                    lambda start: rectified(walk(start), np.float32), drawn_rows((2,)),
                     f"{prediction} converted", seeds=SEEDS['converted'],
                     truth_fn=lambda start: rectified(walked_in_float32(walk, start), np.float64))
     trajectory = walk(jnp.asarray([[0.2, -0.5], [-0.1, 0.7]]))
@@ -369,17 +369,12 @@ def test_flow_objective_matches_clipping_and_conditional_gaussian_kl():
 
     rescore = jax.jit(objective.log_probs)
 
-    def scored_walk(start):
-        trajectory = walk(start)
-        return {"recorded": trajectory.log_probs,
-                "rescored": rescore(old, trajectory_batch(trajectory, np.ones(ROWS, np.float32)))}
-
     def walked(trajectory, dtype):
         density = walk_density(trajectory, lambda t: t, lambda index, x, t: 0.25 * x + 0.1 * t, 0.6, dtype)
         return {"recorded": density, "rescored": density}
 
-    assert_as_exact(scored_walk, lambda start: walked(walk(start), np.float32), drawn_rows((2,)),
-                    "rescored clipping walk", seeds=SEEDS['rescored walk'],
+    assert_as_exact(recorded_and_rescored(walk, rescore, old), lambda start: walked(walk(start), np.float32),
+                    drawn_rows((2,)), "rescored clipping walk", seeds=SEEDS['rescored walk'],
                     truth_fn=lambda start: walked(walked_in_float32(walk, start), np.float64))
 
     start, advantages, mask = (value[0] for value in draw(0))
