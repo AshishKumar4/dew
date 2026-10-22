@@ -291,7 +291,6 @@ CASES = [
 ]
 
 
-@on_device
 @pytest.mark.parametrize(("kind", "case", "compiled"), CASES)
 def test_the_kernel_is_as_exact_as_the_xla_scan(reference, kind, case, compiled):
     """The compiled TPU kernel against float64, every forward and gradient leaf over declared draws."""
