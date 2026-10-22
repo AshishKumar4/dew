@@ -208,10 +208,13 @@ def test_a_grouped_convolution_quantizes_each_group_on_its_own_range(group_width
     group, in float32 and in bf16 compute, the quantized convolution is on
     par (check 1) with Qwix's own quantization of it written ungrouped on
     each group's range (`ungrouped_reference`), from the float64
-    convolution of the same inputs and kernel. One scale per example for
-    all channels rounds the small groups to zero instead: observed on CPU
-    before the fix, the worst channel 100% (depthwise) and 107% (4 per
-    group) off, where the per-group quantization is 1.0% to 1.4% off."""
+    convolution of the same inputs and kernel, each output channel its own
+    leaf, so a quiet group is judged on its own and not pooled with the loud
+    ones; and quantization moves every channel off the float convolution.
+    One scale per example for all channels rounds the small groups to zero
+    instead: observed on CPU before the fix, the worst channel 100%
+    (depthwise) and 107% (4 per group) off, where the per-group quantization
+    is 1.0% to 1.4% off."""
     qwix = pytest.importorskip("qwix")
     from dew.nn.conv import Conv
 
@@ -228,16 +231,25 @@ def test_a_grouped_convolution_quantizes_each_group_on_its_own_range(group_width
         kernel = init(jax.random.key(2 * seed + 1), x)["params"]["kernel"].astype(dtype)
         return x, kernel
 
+    def channels(output):
+        """Each output channel its own leaf, `[B, H, W]`."""
+        return {f"channel {index}": output[..., index] for index in range(features)}
+
     def dew(x, kernel):
-        return quantized.apply({"params": {"kernel": kernel}}, x)
+        return channels(quantized.apply({"params": {"kernel": kernel}}, x))
 
     def plain(x, kernel):
-        return conv.clone(dtype=jnp.float64).apply({"params": {"kernel": kernel}}, x)
+        return channels(conv.clone(dtype=jnp.float64).apply({"params": {"kernel": kernel}}, x))
 
-    found = jax.jit(dew)(*draw(0))
+    x, kernel = draw(0)
+    found = quantized.apply({"params": {"kernel": kernel}}, x)
     assert found.dtype == dtype
-    assert_as_exact(jax.jit(dew), jax.jit(lambda x, kernel: reference(kernel, x, peaks_of(x))), draw,
-                    f"grouped {group_width} {jnp.dtype(dtype).name} quantized convolution",
+    unquantized = conv.apply({"params": {"kernel": kernel}}, x)
+    for index in range(features):
+        assert not np.array_equal(found[..., index], unquantized[..., index]), index
+    qwix_own = jax.jit(lambda x, kernel: channels(reference(kernel, x, peaks_of(x))))
+    label = f"grouped {group_width} {jnp.dtype(dtype).name} quantized convolution"
+    assert_as_exact(jax.jit(dew), qwix_own, draw, label,
                     seeds=CONVOLUTION_SEEDS, truth_fn=plain)
 
 
@@ -940,7 +952,7 @@ def test_serving_leaves_complex_matmuls_in_float():
     assert not np.array_equal(found, model.apply(variables, x))
 
 
-PIPELINE_SEEDS = 8
+PIPELINE_SEEDS = 512
 """The quantized pipeline's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for` on
 armada."""
 
