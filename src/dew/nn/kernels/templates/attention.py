@@ -401,6 +401,12 @@ LOG2E = 1.4426950408889634
 """log2(e): a natural exponent times it is a base-2 one."""
 
 
+NATURAL = False
+"""Whether attention keeps its logits natural unless a call says otherwise
+(`attention_algebra.Forward.base2`): False, the base-2 fold, the fast form, until the natural form's cost
+closes; every kernel's default reads it, so the default switches here."""
+
+
 def natural_exp(x: jax.Array) -> jax.Array:
     """`exp(x)` as the hardware's base-2 exponential of `x * log2(e)`, the logits staying natural: a
     difference of the reference's own logits converted only after it is taken, so no logit the reference
