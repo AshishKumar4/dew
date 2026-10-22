@@ -544,14 +544,6 @@ def usage_code(relative: str, path: Path) -> Iterator[tuple[str, set[int] | None
         yield path.read_text(), None
 
 
-@dataclass(frozen=True)
-class Instance:
-    """A name a unit bound to an instance of a Dew class: `cls`'s members are
-    its attributes, and calling one is calling a method."""
-
-    cls: griffe.Object
-
-
 INSTANCE = "<instance>"
 """What a name `name = Class(...)` binds stands for in a scope's table (`held`): this, then the class's
 path, which no import's dotted path starts with."""
@@ -580,7 +572,7 @@ def unresolved_uses(package: griffe.Module, home: dict[str, str], pages: dict[st
     `from dew... import ...` as Python's scopes read them (tools/lint_scopes.py):
     in this unit or an earlier one of the same file (`bound`, the module
     scope's names, which this updates), except where a scope binds the name
-    itself; `name = Class(...)` binds an `Instance` whose calls must be methods."""
+    itself; `name = Class(...)` binds an instance, whose calls must be methods."""
     try:
         tree = ast.parse(code)
     except SyntaxError as error:
@@ -619,10 +611,10 @@ def unresolved_uses(package: griffe.Module, home: dict[str, str], pages: dict[st
             found = reached(package, target.removeprefix(INSTANCE))
             if found is None:
                 continue
-            kept = Instance(found) if target.startswith(INSTANCE) else None
-            problem = unresolved_chain(kept.cls if kept else found, path, home, pages)
-            if problem is None and kept is not None and id(node) in called and len(path) == 2:
-                problem = called_attribute(kept.cls, path)
+            problem = unresolved_chain(found, path, home, pages)
+            # An instance's members are its class's, and calling one is calling a method.
+            if problem is None and target.startswith(INSTANCE) and id(node) in called and len(path) == 2:
+                problem = called_attribute(found, path)
         except Unresolved as error:
             problem = f"`{'.'.join(path)}`: {error}"
         if problem:
