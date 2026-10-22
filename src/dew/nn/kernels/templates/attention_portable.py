@@ -5,6 +5,7 @@ mainloop, in XLA ops, so it runs on any backend and is the boundary test's secon
 same tiles). It takes a call at its launches' padded shapes, as `TritonForward` does."""
 
 import functools
+from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
@@ -24,6 +25,22 @@ from dew.nn.kernels.templates.attention import (
     interpreted_dot,
     padded_call,
 )
+
+
+def _normalized_pass(spec: algebra.Forward, state: algebra.Partial, logits_at: Callable, anchor: jax.Array, *,
+                     bounds, initial: bool) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """A guarded training walk's live rows' split sums, normalized: a pass over its keys (`logits_at` a
+    tile's coordinates, logits and values) at the walk's maximum and natural denominator
+    (`algebra.normalized_terms`), as the Triton mainloop's."""
+    _, maximum, total = algebra.finish(spec, state, initial=initial)
+
+    def step(j, carry):
+        coords, logits, v_tile = logits_at(j)
+        rest, own_tile = algebra.normalized_terms(logits, maximum, total, coords.k_pos == anchor[:, None],
+                                                  v_tile.dtype, algebra.recompute(spec))
+        return carry[0] + _dot(rest, v_tile), carry[1] + own_tile, carry[2] + rest.sum(axis=-1)
+    nothing = jnp.zeros_like(total)
+    return jax.lax.fori_loop(*bounds, step, (jnp.zeros_like(state.acc), nothing, nothing))
 
 
 def _plain(held: algebra.Room | None, value: jax.Array) -> jax.Array | None:
@@ -98,16 +115,19 @@ def forward(spec: algebra.Forward, query: jax.Array, key: jax.Array, value: jax.
         if ids is not None:
             narrowing["query_ids"] = ids[0][row, rows]
 
-        def softmax(j, state: algebra.Partial):
+        def logits_at(j):
             columns = j * block_k + jnp.arange(block_k)
             coords = algebra.Coords(q_pos, columns[None, :], **narrowing,
                                     key_ids=None if ids is None else ids[1][row, columns])
             params = tuple(_tile_param(param, kind, row, head, rows, columns)
                            for param, kind in zip(score_params, score_kinds, strict=True))
             k_tile = jax.lax.dynamic_slice_in_dim(key[row, :, kv_head], j * block_k, block_k)
-            logits = algebra.modify(spec, _dot(q, k_tile.T), coords, params)
-            m, alpha = algebra.peak(spec, state.m, logits)
             v_tile = jax.lax.dynamic_slice_in_dim(value[row, :, kv_head], j * block_k, block_k)
+            return coords, algebra.modify(spec, _dot(q, k_tile.T), coords, params), v_tile
+
+        def softmax(j, state: algebra.Partial):
+            coords, logits, v_tile = logits_at(j)
+            m, alpha = algebra.peak(spec, state.m, logits)
             weights = algebra.weights(spec, logits, m)
             weights, factor, held = algebra.tile(state, alpha, weights, v_tile)
             return coords, logits, m, factor, weights, held, v_tile
@@ -167,8 +187,9 @@ def forward(spec: algebra.Forward, query: jax.Array, key: jax.Array, value: jax.
             split, arg, own, others_total = walked
             anchor_value = value[row, arg.key, kv_head]
             state = split._replace(acc=algebra.split_output(split.acc, own, anchor_value))
-            sums = algebra.split_residuals(spec, split, own, others_total, anchor_value, state,
-                                           initial=initial is not None)
+            terms = None if split.shift is None else _normalized_pass(
+                spec, state, logits_at, arg.key, bounds=(lo, hi), initial=initial is not None)
+            sums = algebra.split_residuals(split, own, others_total, terms)
             kept = (arg.key, *sums)
         else:
             state, kept = walked, ()
@@ -488,6 +509,9 @@ def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
                                                   natural=natural)
         residuals = maxima, totals, anchors, sums
     initial = hooks is not None and hooks.initial is not None
+    # A guarded forward's live rows carry normalized split sums (`algebra.split_residuals`), which the first
+    # pass cannot recompute without the forward's denominator: D comes from them.
+    split = split or (natural and algebra.headroom(value.dtype, key.shape[1], initial))
     launch = functools.partial(_launch, block_q=block_q, block_k=block_k, split=split, natural=natural,
                                initial=initial)
     return gradients(launch, query, key, value, spans, hooks, dout, residuals, block=pad, scale=scale)
