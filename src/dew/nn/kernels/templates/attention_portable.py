@@ -40,7 +40,8 @@ def _normalized_pass(spec: algebra.Forward, state: algebra.Partial, logits_at: C
                                                   v_tile.dtype, algebra.recompute(spec))
         return carry[0] + _dot(rest, v_tile), carry[1] + own_tile, carry[2] + rest.sum(axis=-1)
     nothing = jnp.zeros_like(total)
-    return jax.lax.fori_loop(*bounds, step, (jnp.zeros_like(state.acc), nothing, nothing))
+    lo, hi = bounds
+    return jax.lax.fori_loop(lo, hi, step, (jnp.zeros_like(state.acc), nothing, nothing))
 
 
 def _plain(held: algebra.Room | None, value: jax.Array) -> jax.Array | None:
@@ -151,21 +152,12 @@ def forward(spec: algebra.Forward, query: jax.Array, key: jax.Array, value: jax.
                                       _plain(held, v_tile))
             return stepped._replace(acc=acc), anchor, own, others_total
 
-        def begun(live) -> algebra.Partial:
-            if initial is None:
-                empty = algebra.empty(block_q, value_width)
-                return empty if live is None else algebra.headroomed(empty, live)
-            m0, total0, acc0 = initial
-            return algebra.resumed(spec, m0[row, head, rows], total0[row, head, rows], acc0[row, head, rows],
-                                   live=live)
-
         def walk(live=None):
             # The plain walk where `live` is None, else the guarded one, those rows shifting.
-            if not residuals:
-                return jax.lax.fori_loop(lo, hi, plain, begun(live))
-            nothing = jnp.zeros((block_q,), jnp.float32)
-            carry = begun(live), algebra.no_argmax(block_q), nothing, nothing
-            return jax.lax.fori_loop(lo, hi, step, carry)
+            resumed = None if initial is None else (initial[0][row, head, rows], initial[1][row, head, rows],
+                                                    initial[2][row, head, rows])
+            start = algebra.started(spec, resumed, block_q, value_width, live)
+            return algebra.walked(lo, hi, plain, step, start, residuals=residuals)
 
         if spec.form == "spans":
             lo, hi = blocks_map.lo[row, i], blocks_map.hi[row, i]

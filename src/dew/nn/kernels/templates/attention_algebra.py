@@ -31,6 +31,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew.nn.kernels.templates.attention import LOG2E, NATURAL, Kind, natural_exp
+from dew.nn.precision import two_product, two_sum
 
 
 @dataclasses.dataclass(frozen=True)
@@ -171,6 +172,25 @@ class Partial(NamedTuple):
     live: jax.Array | None = None
 
 
+class Guard(NamedTuple):
+    """A guarded state's fields (`Partial`'s on the guarded path), each present."""
+
+    shift: jax.Array
+    reach: jax.Array
+    plain: jax.Array
+    plain_total: jax.Array
+    live: jax.Array
+
+
+def guard(state: Partial) -> Guard:
+    """`state`'s guarded fields, which every state on the guarded path carries (`headroomed`)."""
+    shift, reach, plain, plain_total, live = (state.shift, state.reach, state.plain, state.plain_total,
+                                              state.live)
+    if shift is None or reach is None or plain is None or plain_total is None or live is None:
+        raise ValueError("a softmax state off the guarded path has no headroom (algebra.headroomed)")
+    return Guard(shift, reach, plain, plain_total, live)
+
+
 def empty(rows: int, width: int) -> Partial:
     """The softmax before any key: `merge`'s identity."""
     return Partial(jnp.zeros((rows, width), jnp.float32), jnp.full((rows,), -jnp.inf, jnp.float32),
@@ -203,16 +223,17 @@ def overflowed(acc: jax.Array) -> jax.Array:
     return jnp.max(jnp.where(jnp.isfinite(acc), 0.0, 1.0), axis=-1) > 0
 
 
-def guarded(plain: Callable, shifted: Callable, weighted: Callable = lambda state: state.acc) -> object:
-    """A program's softmax walk under headroom: `plain()`, its walk as ever, whose carry's first element is
-    its `Partial`; where that walk's weighted values, `weighted(carry)` (a training walk's split sums
-    joined, `split_output`), overflowed on some row (`overflowed`), `shifted(live)` instead, the walk
-    again with those rows alone shifting (`room`), every other row's bits the plain walk's. Ordinary
-    inputs take the plain walk alone, their bits and their cost unchanged but for this check; both
-    return the guarded carry (`headroomed`)."""
+def guarded[C: (Partial, tuple)](plain: Callable[[], C], shifted: Callable[[jax.Array], C],
+                                 weighted: Callable[[C], jax.Array] | None = None) -> C:
+    """A program's softmax walk under headroom: `plain()`, its walk as ever, its carry a `Partial` or a
+    tuple whose first element is one; where that walk's weighted values (its state's, else `weighted(carry)`:
+    a training walk's split sums joined, `split_output`) overflowed on some row (`overflowed`),
+    `shifted(live)` instead, the walk again with those rows alone shifting (`room`), every other row's
+    bits the plain walk's. Ordinary inputs take the plain walk alone, their bits and their cost unchanged
+    but for this check; both return the guarded carry (`headroomed`)."""
     carry = plain()
     state, *rest = (carry,) if isinstance(carry, Partial) else carry
-    live = overflowed(weighted(carry))
+    live = overflowed(state.acc if weighted is None else weighted(carry))
 
     def kept(live):
         held = headroomed(state)
@@ -306,10 +327,13 @@ def stepped(state: Partial, m: jax.Array, factor: jax.Array, p: jax.Array, produ
     acc = rescale(state.acc, factor) + beyond_weights(product, held)
     if held is None:
         return Partial(acc, m, denominator)
+    if plain_product is None:
+        raise ValueError("a guarded tile takes its unshifted weights' product (Room.plain)")
     # The unshifted sums beside them: finite in every column the plain walk kept finite (`finish`).
-    plain = rescale(state.plain, held.alpha) + plain_product
-    plain_total = held.alpha * state.plain_total + held.plain.sum(axis=-1)
-    return Partial(acc, m, denominator, held.shift, held.reach, plain, plain_total, state.live)
+    fields = guard(state)
+    plain = rescale(fields.plain, held.alpha) + plain_product
+    plain_total = held.alpha * fields.plain_total + held.plain.sum(axis=-1)
+    return Partial(acc, m, denominator, held.shift, held.reach, plain, plain_total, fields.live)
 
 
 def room(state: Partial, alpha: jax.Array, p: jax.Array, value: jax.Array) -> Room:
@@ -326,12 +350,13 @@ def room(state: Partial, alpha: jax.Array, p: jax.Array, value: jax.Array) -> Ro
     so a small column of a row whose other column overflows keeps the reference's resolution."""
     # The largest value magnitude of the keys each row weighs, as a key the row does not see (padding, a
     # stale cache slot, another document) would shift it for nothing.
+    fields = guard(state)
     largest = jnp.max(jnp.abs(value.astype(jnp.float32)), axis=-1)
-    reach = jnp.maximum(state.reach, jnp.where(p > 0, across(largest, p), 0.0).max(axis=-1))
-    natural = power2(alpha * state.total, state.shift) + p.sum(axis=-1)
-    shift = jnp.where(state.live, jnp.maximum(state.shift, needed(natural, reach)), state.shift)
+    reach = jnp.maximum(fields.reach, jnp.where(p > 0, across(largest, p), 0.0).max(axis=-1))
+    natural = power2(alpha * state.total, fields.shift) + p.sum(axis=-1)
+    shift = jnp.where(fields.live, jnp.maximum(fields.shift, needed(natural, reach)), fields.shift)
     weight = jnp.minimum(shift, WEIGHT_SHIFT)
-    return Room(power2(p, expand(-weight, p)), power2(alpha, state.shift - shift), shift, reach,
+    return Room(power2(p, expand(-weight, p)), power2(alpha, fields.shift - shift), shift, reach,
                 weight - shift, p, alpha)
 
 
@@ -357,7 +382,7 @@ def resumed(spec: Forward, m: jax.Array, total: jax.Array, acc: jax.Array, *,
     if live is None:
         return Partial(acc, m, total)
     state = headroomed(Partial(acc, m, total), live)
-    shift = jnp.where(live, needed(total, state.reach), 0.0)
+    shift = jnp.where(live, needed(total, guard(state).reach), 0.0)
     return state._replace(acc=power2(acc, expand(-shift, acc)), total=power2(total, -shift), shift=shift)
 
 
@@ -413,32 +438,18 @@ def peak(spec: Forward, m: jax.Array, s: jax.Array) -> tuple[jax.Array, jax.Arra
 def carried(spec: Forward, m: jax.Array, safe: jax.Array) -> jax.Array:
     """The factor `exp(m - safe)` a state takes from its maximum `m` to `safe` (`peak`, `merge`), in the
     accurate form with its exponent compensated (`peak`)."""
-    difference = m - safe
-    alpha = spec.carry(difference)
     if not spec.natural:
-        return alpha
+        return spec.carry(m - safe)
     # TwoSum: m - safe is difference + error exactly; raw, the scale's product with it is split exactly too
     # (TwoProduct); exp's derivative is itself.
-    back = difference - m
-    error = (m - (difference - back)) + (-safe - back)
+    difference, error = two_sum(m, -safe)
+    alpha = spec.carry(difference)
     if spec.raw:
         product, rounding = two_product(difference, jnp.float32(spec.scale))
         alpha = jnp.exp(product)
         error = rounding + error * spec.scale
     corrected = alpha * (1.0 + error)
     return jnp.where(jnp.isfinite(corrected), corrected, spec.carry(difference))
-
-
-def two_product(a: jax.Array, b: jax.Array) -> tuple[jax.Array, jax.Array]:
-    """`a * b` as its fp32 rounding and the rounding's error, `a * b = product + error` exactly (Dekker's
-    TwoProduct over Veltkamp's split, no FMA needed); not finite where `4097 a` or `4097 b` overflows."""
-    def split(x):
-        wide = 4097.0 * x
-        high = wide - (wide - x)
-        return high, x - high
-    product = a * b
-    (a_high, a_low), (b_high, b_low) = split(a), split(b)
-    return product, ((a_high * b_high - product) + a_high * b_low + a_low * b_high) + a_low * b_low
 
 
 def weights(spec: Forward, s: jax.Array, m: jax.Array) -> jax.Array:
@@ -481,6 +492,26 @@ class Argmax(NamedTuple):
 def no_argmax(rows: int) -> Argmax:
     """`Argmax` before any key."""
     return Argmax(jnp.full((rows,), -jnp.inf, jnp.float32), jnp.zeros((rows,), jnp.int32))
+
+
+def started(spec: Forward, initial: tuple[jax.Array, jax.Array, jax.Array] | None, rows: int, width: int,
+            live: jax.Array | None) -> Partial:
+    """A program's softmax before its first tile: resumed from `initial` (`resumed`), else `empty`; on the
+    guarded path (`live`, `guarded`) headroomed."""
+    if initial is not None:
+        return resumed(spec, *initial, live=live)
+    state = empty(rows, width)
+    return state if live is None else headroomed(state, live)
+
+
+def walked(lo, hi, plain: Callable, tracked: Callable, start: Partial, *, residuals: bool):
+    """A program's walk of its key tiles `lo` to `hi` from `start`: the `plain` step's, or with `residuals`
+    the training step's (`tracked`), whose carry also holds the anchor key and the split sums, from none
+    (`split_accumulate`)."""
+    if not residuals:
+        return jax.lax.fori_loop(lo, hi, plain, start)
+    nothing = jnp.zeros(start.total.shape, jnp.float32)
+    return jax.lax.fori_loop(lo, hi, tracked, (start, no_argmax(start.total.shape[0]), nothing, nothing))
 
 
 def argmax(state: Argmax, logits: jax.Array, k_pos: jax.Array) -> Argmax:
@@ -541,11 +572,14 @@ def split_residuals(split: Partial, own: jax.Array, others_total: jax.Array,
     sums = split.acc, own, others_total, jnp.zeros_like(own)
     if split.shift is None:
         return sums
+    if normalized is None:
+        raise ValueError("a guarded walk's split sums take its live rows' normalized ones (normalized_terms)")
+    fields = guard(split)
     fresh = (*normalized, jnp.full_like(own, -1.0))
 
     def chosen(new, old):
-        return jnp.where(expand(split.live, old) if old.ndim > own.ndim else split.live, new, old)
-    return tuple(chosen(new, old) for new, old in zip(fresh, (*sums[:3], split.shift), strict=True))
+        return jnp.where(expand(fields.live, old) if old.ndim > own.ndim else fields.live, new, old)
+    return tuple(chosen(new, old) for new, old in zip(fresh, (*sums[:3], fields.shift), strict=True))
 
 
 def split_output(others: jax.Array, own: jax.Array, anchor_value: jax.Array) -> jax.Array:
@@ -564,25 +598,26 @@ def merge(spec: Forward, first: Partial, second: Partial) -> Partial:
         acc = expand(a, first.acc) * first.acc + expand(b, second.acc) * second.acc
         return Partial(acc, m, a * first.total + b * second.total)
     first, second = headroomed(first), headroomed(second)
-    reach = jnp.maximum(first.reach, second.reach)
+    ones, others = guard(first), guard(second)
+    reach = jnp.maximum(ones.reach, others.reach)
     factors = carried(spec, first.m, safe), carried(spec, second.m, safe)
-    natural = (power2(factors[0] * first.total, first.shift)
-               + power2(factors[1] * second.total, second.shift))
+    natural = (power2(factors[0] * first.total, ones.shift)
+               + power2(factors[1] * second.total, others.shift))
 
     def joined(shift):
-        a, b = power2(factors[0], first.shift - shift), power2(factors[1], second.shift - shift)
+        a, b = power2(factors[0], ones.shift - shift), power2(factors[1], others.shift - shift)
         acc = expand(a, first.acc) * first.acc + expand(b, second.acc) * second.acc
         return acc, a * first.total + b * second.total
 
     a, b = factors
-    plain = expand(a, first.plain) * first.plain + expand(b, second.plain) * second.plain
-    plain_total = a * first.plain_total + b * second.plain_total
+    plain = expand(a, ones.plain) * ones.plain + expand(b, others.plain) * others.plain
+    plain_total = a * ones.plain_total + b * others.plain_total
 
     # Joined at the larger shift; a row whose join overflows (two finite slices can) shifts as it needs,
     # every other row's bits the plain join's.
-    held = jnp.maximum(first.shift, second.shift)
+    held = jnp.maximum(ones.shift, others.shift)
     acc, _ = joined(held)
-    live = overflowed(acc) | first.live | second.live
+    live = overflowed(acc) | ones.live | others.live
     shift = jnp.where(live, jnp.maximum(held, needed(natural, reach)), held)
     acc, total = joined(shift)
     return Partial(acc, m, total, shift, reach, plain, plain_total, live)
@@ -597,26 +632,25 @@ def finish(spec: Forward, state: Partial, *, initial: bool, output_mod: Callable
     output is the shifted sums' ratio, which the shift leaves."""
     m = state.m if spec.raw else spec.naturalized(state.m)
     denominator = state.total
-    natural = None
-    if state.shift is not None:
-        # The natural denominator: the unshifted one where finite, else the shifted one taken back.
-        finite = jnp.isfinite(state.plain_total)
-        natural = jnp.where(finite, state.plain_total, power2(denominator, state.shift))
     if spec.guarded or initial:
         out = jnp.where(expand(denominator > 0, state.acc),
                         state.acc / expand(jnp.where(denominator > 0, denominator, 1.0), state.acc), 0.0)
         m = jnp.where(m == -jnp.inf, 0.0, m)
     else:
         out = state.acc / expand(denominator, state.acc)
-    if natural is not None:
+    if state.shift is not None:
+        fields = guard(state)
+        # The natural denominator: the unshifted one where finite, else the shifted one taken back.
+        finite = jnp.isfinite(fields.plain_total)
+        denominator = jnp.where(finite, fields.plain_total, power2(denominator, fields.shift))
         # Each element from the unshifted sums where they and their denominator are finite, as the plain
         # walk's; the shifted sums' ratio where they overflowed (`Partial.plain`).
-        kept = jnp.isfinite(state.plain) & expand(finite & (state.plain_total > 0), out)
-        safe = expand(jnp.where(finite & (state.plain_total > 0), state.plain_total, 1.0), out)
-        out = jnp.where(kept, state.plain / safe, out)
+        kept = jnp.isfinite(fields.plain) & expand(finite & (fields.plain_total > 0), out)
+        safe = expand(jnp.where(finite & (fields.plain_total > 0), fields.plain_total, 1.0), out)
+        out = jnp.where(kept, fields.plain / safe, out)
     if output_mod is not None:
         out = output_mod(out, *output_params)
-    return out, m, denominator if natural is None else natural
+    return out, m, denominator
 
 
 # The backward's algebra: what lies between its products (S = Q·Kᵀ, dP = dO·Vᵀ, then dV, dK and dQ),
