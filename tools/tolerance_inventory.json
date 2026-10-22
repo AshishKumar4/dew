@@ -4,8 +4,8 @@
  "files": {
   "tests/diffusion_support.py": {
    "comparisons": 1,
-   "lane": "Training",
-   "by": "2026-11-20"
+   "lane": "Models, Serving & RL",
+   "by": "2026-11-13"
   },
   "tests/interop_support.py": {
    "comparisons": 2,
@@ -109,11 +109,6 @@
   },
   "tests/test_capability_matrix.py": {
    "comparisons": 1,
-   "lane": "Models, Serving & RL",
-   "by": "2026-11-13"
-  },
-  "tests/test_causal_transformer.py": {
-   "comparisons": 41,
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
