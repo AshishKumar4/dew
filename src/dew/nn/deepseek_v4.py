@@ -54,9 +54,9 @@ from dew.nn.attention import (
     cache_positions,
     cached_validity,
     causal_attention_mask,
+    reference_attention,
     unweighted_rmsnorm,
 )
-from dew.nn.attention_sinks import sink_softmax
 from dew.nn.dense import Dense, DenseGeneral
 from dew.nn.documents import document_mask
 from dew.nn.fake_quant import FakeQuantizing
@@ -64,7 +64,7 @@ from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of, valid_order
 from dew.nn.kv_cache import KVCache, write_cache
 from dew.nn.mixer_base import ATTENTION_CONTEXT_RESIDUALS, MixerBase, MixerContext
 from dew.nn.mla import IndexerFront
-from dew.nn.precision import at_least_fp32, float32_dot_general, float32_einsum
+from dew.nn.precision import at_least_fp32, float32_dot_general
 from dew.nn.rope import YarnScaling, rotary_freqs, rotate
 from dew.nn.sharding import RESIDUAL, LogicalAxes, constrain, down_projection, logical_axes
 from dew.nn.sparse_selection import candidate_pool, index_scores, selection_mask, top_k_keys, top_k_selection
@@ -764,15 +764,11 @@ class DeepseekV4Attention(FakeQuantizing):
 
     def _attend(self, query, keys, allowed, cos, sin):
         batch, length = query.shape[:2]
-        # One shared key/value head under every query head, the per-head
-        # sink beside the logits, softmax in fp32 and the sink dropped
-        # (:708-736).
-        wide = at_least_fp32(query.dtype)
-        logits = float32_einsum('bshd,btd->bhst', query.astype(wide), keys.astype(wide),
-                            precision=self.precision) * self.head_dim ** -0.5
-        logits = jnp.where(allowed[:, None], logits, -jnp.inf)
-        probs = sink_softmax(logits, self.sinks)
-        context = float32_einsum('bhst,btd->bshd', probs.astype(keys.dtype), keys, precision=self.precision)
+        # One shared key/value head under every query head, its logits in fp32 scaled after the
+        # product, the per-head sink beside them, softmax in fp32 and the sink dropped (:708-736).
+        shared = keys[:, :, None]
+        context = reference_attention(query, shared, shared, mask=allowed[:, None], sinks=self.sinks,
+                                      precision=self.precision, wide_logits=True)
         # The values are the rotated keys, so the rope slice of the output is
         # turned back at the query's position (:853-859).
         context = _rotate_rope(checkpoint_name(context, 'context'), cos, -sin)
