@@ -16,6 +16,7 @@ from typing import Protocol, runtime_checkable
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.experimental.layout import Format
 from jax.sharding import Mesh, NamedSharding, PartitionSpec as P, Sharding, SingleDeviceSharding
 
 from dew.objectives.base import Variables
@@ -187,7 +188,7 @@ def snapshot[T](tree: T) -> Callable[[], T]:
     return lambda: structure.unflatten([placed(*copy, impl) for copy, impl in zip(held, keys, strict=True)])
 
 
-def place_leaf(value, target: Sharding) -> jax.Array:
+def place_leaf(value, target: Sharding | Format) -> jax.Array:
     """Move one array into `target`, releasing the source once it lands.
 
     A host array or a single device's array is cut into shards by each
@@ -195,7 +196,17 @@ def place_leaf(value, target: Sharding) -> jax.Array:
     mesh moves as it is. A `HostSource` is read and placed one device shard
     at a time. Memory-mapped
     source pages are given back to the kernel, which is what keeps a large
-    checkpoint from being resident twice."""
+    checkpoint from being resident twice. A `Format` target, a physical
+    layout beside its sharding (a bank's, `dew.inference.banks`), takes the
+    whole value at once: a `HostSource` is read whole and released whether
+    or not it lands, and any other value is put as it is and kept."""
+    if isinstance(target, Format):
+        try:
+            whole = value.read(None) if isinstance(value, HostSource) else value
+            return jax.block_until_ready(jax.device_put(whole, target))
+        finally:
+            if isinstance(value, HostSource):
+                value.release()
     if isinstance(value, jax.Array) and isinstance(target, NamedSharding) and (
             isinstance(value.sharding, NamedSharding) or jnp.issubdtype(value.dtype, jax.dtypes.prng_key)):
         return transfer(value, target)

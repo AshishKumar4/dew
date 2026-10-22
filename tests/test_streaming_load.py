@@ -151,6 +151,48 @@ def test_a_host_source_is_placed_holding_one_device_shard_at_a_time():
     assert source.most == 1
 
 
+class Whole:
+    """A host source read whole, as a bank's row is, recording whether it was released."""
+
+    def __init__(self, value: np.ndarray, *, fails: bool = False):
+        self.value, self.fails, self.released = value, fails, False
+
+    @property
+    def shape(self):
+        return self.value.shape
+
+    @property
+    def ndim(self):
+        return self.value.ndim
+
+    def read(self, index):
+        if self.fails:
+            raise OSError("the read failed")
+        return self.value if index is None else self.value[index]
+
+    def release(self):
+        self.released = True
+
+
+def test_a_format_placement_lands_a_source_whole_and_releases_it_whether_or_not_it_lands():
+    """`place_leaf` puts a host source on a physical layout (`Format`, a bank's target) whole,
+    in that layout, and releases the source; a placement that fails releases it too."""
+    from jax.experimental.layout import Format, Layout as DeviceLayout
+    from jax.sharding import SingleDeviceSharding
+
+    from dew.training.host import place_leaf
+
+    target = Format(DeviceLayout(major_to_minor=(0, 1)), SingleDeviceSharding(jax.devices()[0]))
+    source = Whole(np.arange(12, dtype=np.float32).reshape(3, 4))
+    placed = place_leaf(source, target)
+    np.testing.assert_array_equal(np.asarray(placed), source.value)
+    assert placed.format.layout.major_to_minor == (0, 1) and source.released
+    failing = Whole(source.value, fails=True)
+    with pytest.raises(OSError):
+        place_leaf(failing, target)
+    assert failing.released
+
+
 def test_a_loaded_source_is_ready_to_run_on_the_default_device():
     """A source loaded without a mesh or layout holds its variables on JAX's default device,
     uncommitted, as a `jnp` array is held, so a jitted call reads them where they are rather than
