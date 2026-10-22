@@ -17,7 +17,7 @@ from jax.sharding import AbstractDevice, AbstractMesh, AxisType, Mesh
 from reference_error import assert_as_exact
 
 from dew.nn.kernels import generation, grouped_matmul, tuning
-from dew.nn.kernels.templates import product
+from dew.nn.kernels.templates import hopper, product
 from dew.nn.kernels.templates.gemm import fused, mosaic_gpu, template, triton_dense
 
 pytestmark = pytest.mark.kernel
@@ -184,7 +184,7 @@ def test_the_template_holds_check_1_with_its_hooks(generation_name, case):
 
 
 COOPERATIVE = mosaic_gpu.Tiles(128, 128, 64, 3, 1, warpgroups=2)
-"""A tile two consumer warpgroups compute (a cluster the interpreter does not model)."""
+"""A tile two consumer warpgroups compute, on one multiprocessor (the interpreter models no cluster)."""
 
 
 MOSAIC_RAN = {'mosaic_gpu'} if jax.default_backend() == 'cpu' else {'mosaic_gpu', 'triton'}
@@ -601,6 +601,24 @@ def test_a_normed_operand_runs_in_the_prologue_with_the_programs_value(generatio
     assert {route.kernel for route in taken if route.choice == 'gemm_prologue'} == {'fused'}
 
 
+@lowers("sm90")
+@pytest.mark.parametrize("producer", [rms_norm, dew_rms_norm], ids=lambda producer: producer.__name__)
+def test_a_fused_norm_lowers_for_an_h100(producer):
+    """An RMS norm fused into the Mosaic GPU forward's prologue lowers for an H100 on the CPU: its row
+    statistic, a column the template squeezed, comes back to its tile by a broadcast, which Mosaic GPU's
+    layout inference lays out (a reshape it does not; FUSEDNORM-h100)."""
+    sizes = jnp.asarray(SIZES)
+    x, w, _, nw, *_ = _draw(0)
+
+    def fusing(x, w, weight):
+        return fused.fusible_gemm(producer(x, weight), w, sizes).astype(jnp.bfloat16)
+
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
+    with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh), generation.routes() as taken:
+        jax.jit(fuser.fuse(fusing)).trace(x, w, nw).lower(lowering_platforms=("cuda",))
+    assert 'mosaic_gpu' in {route.kernel for route in taken if route.choice == 'grouped_matmul'}
+    assert {route.kernel for route in taken if route.choice == 'gemm_prologue'} == {'fused'}
+
 @pytest.mark.parametrize("producer", [rms_norm, dew_rms_norm, relu], ids=lambda producer: producer.__name__)
 def test_a_fused_producers_gradients_are_its_own(producer):
     """Every input's gradient through a producer fused into the prologue is the unfused program's: the
@@ -742,10 +760,12 @@ def test_the_hooked_tpu_launches_lower_for_a_v5e(launch, side_dtype):
                 lowering_platforms=("tpu",))
 
 
+@runs("v5e")
 @pytest.mark.parametrize("product", ["gemm", "gemm_t"])
 def test_a_tpu_lowers_xlas_program_for_a_call_no_launch_takes(product):
     """A product of widths no TPU block divides lowers for a TPU through XLA's program, the refusal
-    reported, its kernel branches traced on the way and none raising."""
+    reported, its kernel branches traced on the way and none raising. A CPU process's: a GPU's interprets
+    its CPU branch with Triton's launch whatever the target (`grouped_matmul._launch`)."""
     x = jax.ShapeDtypeStruct((32, 64), jnp.bfloat16)
     other = jax.ShapeDtypeStruct((1, 64, 64) if product == "gemm" else (32, 64), jnp.bfloat16)
     sizes = jnp.asarray([32], jnp.int32)
@@ -940,12 +960,22 @@ def test_a_cooperative_tiles_exact_sums_add_as_its_plain_sum_does():
 
 
 def test_a_tile_states_a_schedule_the_kernels_run():
-    """A pair of multiprocessors needs two warpgroups; a warpgroup count or cluster outside one or two is
-    refused where the tile is made, and a direct kernel gradient refuses a depth its pairs do not divide."""
-    for fields in ({"warpgroups": 1, "cluster": 2}, {"warpgroups": 3}, {"warpgroups": 2, "cluster": 4}):
+    """A pair of multiprocessors needs two warpgroups, which stream at least two stages; a warpgroup count
+    or cluster outside one or two is refused where the tile is made; the kernel gradient's schedule is one
+    multiprocessor's, so its space holds no pair and a direct kernel gradient refuses one."""
+    for fields in ({"warpgroups": 1, "cluster": 2}, {"warpgroups": 3}, {"warpgroups": 2, "cluster": 4},
+                   {"warpgroups": 2, "stages": 1}):
         with pytest.raises(ValueError):
-            mosaic_gpu.Tiles(128, 128, 64, 3, 1, **fields)
-    x = jnp.zeros((ROWS, 384), jnp.bfloat16)
+            mosaic_gpu.Tiles(**{"block_m": 128, "block_n": 128, "block_k": 64, "stages": 3, "grid_block_n": 1}
+                             | fields)
+    launch = grouped_matmul.MosaicTgmm()
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    with generation.assumed("sm90"):
+        space = launch.space(launch.bind(bf16((ROWS, 512)), bf16((ROWS, WIDTH)),
+                                         jax.ShapeDtypeStruct((3,), jnp.int32), out_dtype="float32",
+                                         interpret=False))
+    assert space and all(tile.cluster == 1 for tile in space)
+    x = jnp.zeros((ROWS, 512), jnp.bfloat16)
     with pytest.raises(ValueError):
         mosaic_gpu.tgmm(x, jnp.zeros((ROWS, WIDTH), jnp.bfloat16), jnp.asarray(SIZES),
                         tiles=mosaic_gpu.Tiles(128, 128, 64, 3, 1, warpgroups=2, cluster=2),
@@ -1000,7 +1030,7 @@ def test_exact_sums_go_to_fp32_outputs_at_a_precision_above_the_default():
         assert mosaic_gpu.Tiles(128, 128, 64, 3, 1, warpgroups=2) in kept  # 128 registers a thread
         assert mosaic_gpu.Tiles(128, 256, 64, 3, 1, warpgroups=2) not in kept  # 256
         assert kept and all(2 * tile.block_m * tile.block_n // (128 * tile.warpgroups)
-                            < (grouped_matmul.CONSUMER_REGISTERS if tile.warpgroups == 2 else 255)
+                            < (hopper.CONSUMER_REGISTERS if tile.warpgroups == 2 else 255)
                             for tile in kept)
         assert set(kept) < set(launch.fitting(plain, target))
         # Triton's kernel gradient with exact sums takes at most EXACT_STEP rows a step.
