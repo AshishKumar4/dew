@@ -58,7 +58,6 @@ from dew.data.pipeline import (
     Shuffle,
     Slice,
     Stage,
-    Step,
     TokenBudget,
     TokenSplit,
     Windows,
@@ -67,6 +66,7 @@ from dew.data.pipeline import (
     chains,
     children,
     record_stage,
+    runs,
     with_children,
 )
 from dew.data.plan import Manifest, StepIdentity, _changed, _semantic, identified
@@ -489,30 +489,24 @@ def _identity(stage: Stage, *, cache: bool = False) -> StepIdentity:
     carries the factory's modules after its own."""
     if isinstance(stage, Artifact):
         return StepIdentity(f"dew.data.cache.{type(stage.cache).__name__}", "", exact=True)
-    if isinstance(stage, Configured):
-        return StepIdentity.of(stage.factory, cache=cache)
-    if isinstance(stage, (Map, RandomMap, MapWithIndex, FlatMap, MapBatch)):
-        identity = StepIdentity.of(stage.step, stage.identity, cache=cache)
-        if isinstance(stage, (Map, RandomMap, FlatMap)) and stage.configured is not None:
-            bound = stage.configured
-            factory = _identity(bound.step)
-            binding = {"factory": factory.semantic(), "scope": bound.step.scope, "values": bound.values}
-            identity = dataclasses.replace(
-                identity,
-                config=json.dumps({"step": identity.config, "configured": binding}, sort_keys=True),
-                modules=(*identity.modules, *factory.modules),
-            )
-        return identity
-    if isinstance(stage, Filter):
-        return StepIdentity.of(stage.predicate, stage.identity, cache=cache)
-    if isinstance(stage, Native):
-        return StepIdentity.of(stage.function, stage.identity, cache=cache)
+    ran = runs(stage)
+    if ran is None:
+        return StepIdentity.of(stage)
+    identity = StepIdentity.of(ran.step, ran.identity, cache=cache)
+    if ran.configured is not None:
+        bound = ran.configured
+        factory = _identity(bound.step)
+        binding = {"factory": factory.semantic(), "scope": bound.step.scope, "values": bound.values}
+        identity = dataclasses.replace(
+            identity,
+            config=json.dumps({"step": identity.config, "configured": binding}, sort_keys=True),
+            modules=(*identity.modules, *factory.modules),
+        )
     if isinstance(stage, Batched):
-        step = StepIdentity.of(stage.step, stage.identity, cache=cache)
         # The group size and whether the rows keep their count decide what a resume reads.
         shape = f"[batched {stage.size}, {'same rows' if stage.same_rows else 'any rows'}]"
-        return dataclasses.replace(step, name=step.name + shape, config=step.config + shape)
-    return StepIdentity.of(stage)
+        identity = dataclasses.replace(identity, name=identity.name + shape, config=identity.config + shape)
+    return identity
 
 
 def _configured(
@@ -564,25 +558,13 @@ def _keyed(stage: Stage) -> bool:
     """Whether a cache can key what `stage` runs (`StepIdentity.keyable`):
     the steps `_identity` names it by, a configured one's factory included,
     as `_identity(stage, cache=True)` refuses them."""
-    if isinstance(stage, Artifact):
+    ran = runs(stage)
+    if ran is None:
         return True
-    if isinstance(stage, Configured):
-        return _step_keyed(stage.factory)
-    if isinstance(stage, (Map, RandomMap, FlatMap)) and stage.configured is not None:
-        return _step_keyed(stage.step, stage.identity) and _keyed(stage.configured.step)
-    if isinstance(stage, (Map, RandomMap, MapWithIndex, FlatMap, MapBatch, Batched)):
-        return _step_keyed(stage.step, stage.identity)
-    if isinstance(stage, Filter):
-        return _step_keyed(stage.predicate, stage.identity)
-    if isinstance(stage, Native):
-        return _step_keyed(stage.function, stage.identity)
-    return True
-
-
-def _step_keyed(step: Step, identity: str | None = None) -> bool:
-    function = inspect.isfunction(step)
-    external = not (step if function else type(step)).__module__.startswith("dew.")
-    return StepIdentity.of(step, identity).keyable(function=function, external=external)
+    function = inspect.isfunction(ran.step)
+    external = not (ran.step if function else type(ran.step)).__module__.startswith("dew.")
+    keyable = StepIdentity.of(ran.step, ran.identity).keyable(function=function, external=external)
+    return keyable and (ran.configured is None or _keyed(ran.configured.step))
 
 
 def _manifest(
