@@ -31,7 +31,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from dew.nn.kernels.templates.attention import LOG2E, NATURAL, Kind, natural_exp
+from dew.nn.kernels.templates.attention import LOG2E, NATURAL, Kind, natural_exp, within
 from dew.nn.precision import two_product, two_sum
 
 
@@ -417,18 +417,15 @@ def modify(spec: Forward, s: jax.Array, coords: Coords, params: tuple[jax.Array,
         return logits
     seen = None
     if coords.spans is not None:
-        # The spans' form: its mainloops give each tile its queries' intervals.
+        # The spans' form: its mainloops give each tile its queries' intervals and, with documents, ids.
         start, end = coords.spans
-        seen = (coords.k_pos >= expand(start, s)) & (coords.k_pos < expand(end, s))
+        ids = None if coords.ids is None else (expand(coords.ids[0], s), across(coords.ids[1], s))
+        seen = within(coords.k_pos, expand(start, s), expand(end, s), ids)
     elif spec.form == "causal":
         seen = coords.k_pos <= coords.q_pos
     if spec.form != "spans" and spec.keys % s.shape[1]:
         # A tile past the call's last key reads padding.
         seen = coords.k_pos < spec.keys if seen is None else seen & (coords.k_pos < spec.keys)
-    if coords.ids is not None:
-        query_ids, key_ids = coords.ids
-        same = expand(query_ids, s) == across(key_ids, s)
-        seen = same if seen is None else seen & same
     return logits if seen is None else jnp.where(seen, logits, -jnp.inf)
 
 
@@ -600,7 +597,7 @@ def normalized_pass(spec: Forward, carry: Carry, keys_at: Callable[[jax.Array], 
     tiles `bounds` (`keys_at`) at the walk's own maximum and natural denominator (`normalized_terms`), from
     the `initial` state's share (`normalized_start`, `(m0, acc0)`): the other keys' weighted values, the
     anchor's weight and the other keys' weights, over the denominator; a weight below its dtype's least
-    normal once normalized takes its product raised, taken back after it (`small_shift`)."""
+    normal once normalized takes its product raised and in fp32, taken back after it (`SMALL_SHIFT`)."""
     split, arg, _, _ = carry
     _, maximum, total = finish(spec, joined(carry, rows), initial=initial is not None)
 
@@ -610,10 +607,9 @@ def normalized_pass(spec: Forward, carry: Carry, keys_at: Callable[[jax.Array], 
         rest, own_tile, small = normalized_terms(keys.logits, maximum, total,
                                                  keys.coords.k_pos == arg.key[:, None], value.dtype,
                                                  recompute(spec))
-        lowered = jnp.float32(-small_shift(value.dtype))
-        product = keys.dot(rest, value) + power2(keys.dot(small, value), lowered)
-        others = (rest.astype(jnp.float32).sum(axis=-1)
-                  + power2(small.astype(jnp.float32).sum(axis=-1), lowered))
+        lowered = jnp.float32(-SMALL_SHIFT)
+        product = keys.dot(rest, value) + power2(keys.dot(small, value.astype(jnp.float32)), lowered)
+        others = rest.astype(jnp.float32).sum(axis=-1) + power2(small.sum(axis=-1), lowered)
         return sums[0] + product, sums[1] + own_tile, sums[2] + others
 
     nothing = jnp.zeros_like(total)
@@ -668,12 +664,11 @@ def split_accumulate(others: jax.Array, own: jax.Array, others_total: jax.Array,
             jnp.where(moved, own_tile, carry_factor(own, alpha, held)), total)
 
 
-def small_shift(dtype) -> int:
-    """The power of two `normalized_terms` raises the weights below `dtype`'s least normal by, half that
-    least normal's exponent: 63 for fp32's and bf16's range, 7 for fp16's. A raised weight is then below
-    `2^-k`, so a sum of them on values at the dtype's largest stays finite over any key count a call holds,
-    and normal down to `2^-3k` of the least normal."""
-    return -int(np.log2(float(jnp.finfo(dtype).tiny))) // 2
+SMALL_SHIFT = 63
+"""The power of two `normalized_terms` raises a normalized weight below its values' dtype's least normal
+by, half fp32's least normal's exponent: raised, such a weight on a value of any dtype is below `2^-63`
+of fp32's largest (`2^49` of fp16's), so a sum of them stays finite over any key count a call holds, and
+it is a normal fp32 down to `2^-189`."""
 
 
 def normalized_terms(logits: jax.Array, maximum: jax.Array, total: jax.Array, at_anchor: jax.Array,
@@ -682,20 +677,23 @@ def normalized_terms(logits: jax.Array, maximum: jax.Array, total: jax.Array, at
     as the reference's softmax divides), the reference's probabilities, narrowed to the values' `dtype`:
     zero at the anchor key (`at_anchor`) and where below the dtype's least normal, the left operand of the
     other keys' sum; the anchor's own, fp32; and the other keys' weights that normalizing takes below the
-    least normal, raised by `2^small_shift(dtype)` and narrowed, `small`, whose product the pass takes back
-    after it (`normalized_pass`). Normalized, no sum of them overflows (each is at most the values'
-    largest), and a small weight on a large value keeps its share's resolution, so a column the reference
-    resolves is resolved here, whatever another column's size or the denominator's."""
-    exponentials = below(logits, maximum, how)
+    least normal, raised by `2^SMALL_SHIFT` in fp32, `small`, whose product with the values the pass takes
+    in fp32 and back after it (`normalized_pass`): each exponential raised as two halves, `e^(x/2) 2^k
+    e^(x/2)`, so none passes through fp32's subnormals either. Normalized, no sum of them overflows (each
+    is at most the values' largest), and a small weight on a large value keeps fp32's resolution of its
+    share, so a column the reference resolves is resolved here, whatever another column's size or the
+    denominator's."""
+    natural = exponent(logits, maximum, how)
     seen = expand(total > 0, logits)
     denominator = expand(jnp.where(total > 0, total, 1.0), logits)
-    p = jnp.where(seen, exponentials / denominator, 0.0)
+    p = jnp.where(seen, jnp.exp(natural) / denominator, 0.0)
     tiny = (p < float(jnp.finfo(dtype).tiny)) & jnp.logical_not(at_anchor)
     rounded = p.astype(dtype)
     zero = jnp.zeros_like(rounded)
     rest = jnp.where(at_anchor | tiny, zero, rounded)
-    raised = jnp.where(seen, power2(exponentials, jnp.float32(small_shift(dtype))) / denominator, 0.0)
-    small = jnp.where(tiny, raised, 0.0).astype(dtype)
+    half = jnp.exp(natural / 2)
+    raised = jnp.where(seen, half * jnp.float32(2.0 ** SMALL_SHIFT) * half / denominator, 0.0)
+    small = jnp.where(tiny, raised, 0.0)
     return rest, jnp.where(at_anchor, rounded, zero).astype(jnp.float32).sum(axis=-1), small
 
 
@@ -1043,13 +1041,18 @@ def below(logits: jax.Array, peak: jax.Array, how: Recompute = PLAIN) -> jax.Arr
     rounding the two passes do not share (the forward's maximum taken in base 2 and back, or another tile
     shape's product) is the maximum itself, its weight 1, never past it; in the accurate form one at it
     weighs 1 however a compiler contracts its scaling into the subtraction (`weights`)."""
+    return jnp.exp(exponent(logits, peak, how))
+
+
+def exponent(logits: jax.Array, peak: jax.Array, how: Recompute = PLAIN) -> jax.Array:
+    """The natural exponent `s - m` (at most 0) of `below`'s weights."""
     peak = expand(peak, logits)
     if how.factor is not None:
         # Raw products: the difference is taken first, so the largest's is exactly 0.
-        return jnp.exp(jnp.minimum(logits - peak, 0.0) * how.factor)
+        return jnp.minimum(logits - peak, 0.0) * how.factor
     if how.exact:
-        return jnp.exp(jnp.where(logits < peak, logits - peak, 0.0))
-    return jnp.exp(jnp.minimum(logits - peak, 0.0))
+        return jnp.where(logits < peak, logits - peak, 0.0)
+    return jnp.minimum(logits - peak, 0.0)
 
 
 def normalized(logits: jax.Array, peak: jax.Array, total: jax.Array, how: Recompute = PLAIN

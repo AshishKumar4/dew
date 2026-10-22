@@ -45,14 +45,22 @@ class KeySpans:
     form: str = dataclasses.field(default="spans", metadata={"static": True})
 
 
+def within(keys: jax.Array, start: jax.Array, end: jax.Array,
+           ids: tuple[jax.Array, jax.Array] | None = None) -> jax.Array:
+    """Whether each key index of `keys` lies in its query's interval `start` to `end` and, with `ids`
+    (the queries' and the keys', broadcasting alike), is of its document: the keys a call's spans let a
+    query see, which the reference (`visible`) and every mainloop (`attention_algebra.modify`, the
+    backward's tiles) mask by."""
+    seen = (keys >= start) & (keys < end)
+    return seen if ids is None else seen & (ids[0] == ids[1])
+
+
 def visible(spans: KeySpans, row: jax.Array | int, queries: jax.Array, keys: jax.Array) -> jax.Array:
     """Whether each of `keys` (key indices, broadcasting) is visible to each of `queries` (query
-    indices) in batch row `row`: inside the query's interval and, with ids, of its document."""
-    start, end = spans.start[row][queries], spans.end[row][queries]
-    seen = (keys >= start) & (keys < end)
-    if spans.query_ids is not None and spans.key_ids is not None:
-        seen &= spans.query_ids[row][queries] == spans.key_ids[row][keys]
-    return seen
+    indices) in batch row `row` (`within`)."""
+    ids = (None if spans.query_ids is None or spans.key_ids is None
+           else (spans.query_ids[row][queries], spans.key_ids[row][keys]))
+    return within(keys, spans.start[row][queries], spans.end[row][queries], ids)
 
 
 def dense(spans: KeySpans) -> jax.Array:

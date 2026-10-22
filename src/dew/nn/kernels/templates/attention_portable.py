@@ -23,6 +23,7 @@ from dew.nn.kernels.templates.attention import (
     gradients,
     interpreted_dot,
     padded_call,
+    within,
 )
 
 
@@ -207,10 +208,9 @@ def _seen(spans: tuple[jax.Array, jax.Array, jax.Array | None, jax.Array | None]
           columns: jax.Array) -> jax.Array:
     """The entries `[len(rows), len(columns)]` of batch row `row` its spans let each query see."""
     start, end, query_ids, key_ids = spans
-    seen = (columns[None, :] >= start[row, rows][:, None]) & (columns[None, :] < end[row, rows][:, None])
-    if query_ids is not None and key_ids is not None:
-        seen &= query_ids[row, rows][:, None] == key_ids[row, columns][None, :]
-    return seen
+    ids = (None if query_ids is None or key_ids is None
+           else (query_ids[row, rows][:, None], key_ids[row, columns][None, :]))
+    return within(columns[None, :], start[row, rows][:, None], end[row, rows][:, None], ids)
 
 
 def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_index, anchor_value, shift,
