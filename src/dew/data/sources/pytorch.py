@@ -82,7 +82,11 @@ class Torch(Dataset):
     dataset: TorchDataset
     fields: tuple[str, ...] | None = None
     identity: str | None = None
-    facts: Mapping[str, object] | None = None
+    known: Mapping[str, object] | None = None
+    """Facts of its records the caller states, which its metadata and `Dataset.facts` carry."""
+
+    def stated(self) -> Mapping[str, object]:
+        return dict(self.known or {})
 
     def label(self) -> str:
         return self.identity or "torch"
@@ -113,7 +117,7 @@ class Torch(Dataset):
         return _indexed_manifest(self, "torch", self.describe(), 1024)
 
     def metadata(self) -> Mapping[str, object]:
-        return {**(self.facts or {}), "rows": len(self.records("indexed"))}
+        return {**(self.known or {}), "rows": len(self.records("indexed"))}
 
     def lengths(self) -> np.ndarray | None:
         return None

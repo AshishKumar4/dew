@@ -5,7 +5,12 @@
 # versions, duplicate code (tools/duplicates.py) and pyright. PYTHON names
 # the interpreter of the test suite's environment (tools/install_environment.sh); default: python. A
 # lane runs it before every LAND, and CI's lint job runs it as is.
-# Usage, from the checkout: sh tools/check.sh
+# Usage, from the checkout: sh tools/check.sh [--changed]
+#
+# --changed: the gates a head's own Python files decide, in seconds, for iterating on it: ruff and slop lint
+# over the Python files that differ from its merge-base with origin/main (committed or not, untracked
+# included), SLOP020's ratchet, and the duplicate scan's structural reading held to origin/main. Every gate
+# runs, without it, before a LAND.
 set -u
 . tools/lint_inputs.sh
 python=${PYTHON:-python}
@@ -20,11 +25,34 @@ gate() {
     printf '=== %s FAILED\n%s\n' "$name" "$out"
   fi
 }
+# Main still holds copies (ledger 896-1287, 1309), so a checkout is held to adding none to origin/main's
+# (tools/duplicates.py) over these roots; the scan needs that ref and its history, as SLOP020's ratchet does,
+# which a shallow checkout fetches first (tools/base_history.sh).
+duplicate_roots="src/dew tools tests examples site"
+PYTHON="$python" sh tools/base_history.sh
+if [ "${1:-}" = --changed ]; then
+  since=$(git merge-base origin/main HEAD)
+  gate ruff sh -c '. tools/lint_inputs.sh; python_changed "$1" $ruff_inputs | xargs -0r "$2" -m ruff check' \
+    _ "$since" "$python"
+  # SLOP020's inventory names files across the tree, and a deleted file can leave its entry behind: a head
+  # that changes the inventory or deletes a Python file has the whole tree read, as the full run reads it.
+  if git diff --quiet "$since" -- tools/tolerance_inventory.json &&
+    [ -z "$(git diff --no-renames --name-only --diff-filter=D "$since" -- '*.py')" ]; then
+    gate slop sh -c '. tools/lint_inputs.sh; python_changed "$1" $("$2" tools/lint_slop.py --print-roots) |
+      JAX_PLATFORMS=cpu xargs -0r "$2" tools/lint_slop.py' _ "$since" "$python"
+  else
+    gate slop env JAX_PLATFORMS=cpu "$python" tools/lint_slop.py
+  fi
+  gate ratchet "$python" tools/lint_slop.py --ratchet --base=origin/main
+  gate duplicates "$python" tools/duplicates.py --structural --base=origin/main $duplicate_roots
+  [ -z "$failed" ] || { echo "check --changed: FAILED$failed"; exit 1; }
+  echo "check --changed: green"
+  exit 0
+fi
 # The duplicate-code scan takes as long as several gates together and reads nothing they write, so it
-# runs beside them and reports last. Main still holds copies (ledger 896-1287, 1309), so a checkout is held to
-# adding none to origin/main's (tools/duplicates.py); the scan needs that ref and its history.
+# runs beside them and reports last.
 duplicates=$(mktemp)
-"$python" tools/duplicates.py --base=origin/main src/dew tools tests examples site > "$duplicates" 2>&1 &
+"$python" tools/duplicates.py --base=origin/main $duplicate_roots > "$duplicates" 2>&1 &
 scan=$!
 gate locks sh -c 'sh tools/lock_environment.sh && git diff --exit-code --stat locks/'
 gate flake8 "$python" -m flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics \
@@ -36,6 +64,7 @@ gate complexity sh -c "\"$python\" tools/complexity.py src/dew tools/lint_slop.p
 gate api-pages uv run --no-project --with-requirements site/scripts/requirements.txt python site/scripts/gen_api.py --check
 gate install-script "$python" site/scripts/gen_install.py --check
 gate theme "$python" site/scripts/gen_theme.py --check
+gate model-pin "$python" site/scripts/gen_pin.py --check
 gate pythons "$python" tools/armada/ci.py pythons --check
 gate api-tests uv run --no-project --with-requirements site/scripts/requirements.txt --with pytest \
   python -m pytest -q --noconftest tests/test_gen_api.py

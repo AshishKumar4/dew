@@ -30,7 +30,7 @@ def tokens(rng, length=12, rows=2):
 
 
 SEEDS = {'decode': 64, 'scanned': 64, 'checkpointed': 256, 'block decode': 32}
-"""Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada, 2026-10-21):
+"""Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada):
 the most any of a site's cases took."""
 
 
