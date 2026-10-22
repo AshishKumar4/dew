@@ -65,7 +65,7 @@ from dew.data.pipeline import (
     _declares_rejects,
 )
 from dew.data.plan import Manifest, StepIdentity, _changed, _semantic, identified
-from dew.data.sources.base import READS, Read, Source, _consumed
+from dew.data.sources.base import READS, Read, Source, _consumed, _IndexedSlice
 from dew.data.sources.concatenate import Concatenate
 from dew.data.sources.memory import Memory
 from dew.records import json_value, record
@@ -199,12 +199,16 @@ def _in_place(generation: Generation, source: Source | Mixture | Phases,
     was published from, `source` itself or one its holdout selections select
     from, read as it was filled; under selections above that source, the
     rows of the inputs they keep, each picked from that source as it is
-    uncached (`SelectedGeneration`). Its rows are its source, steps,
-    tokenizers and fill (`Manifest.semantic`); the code and machine that
-    filled it (`Manifest.environment`) do not change them. A step bound to
-    the whole run's facts (scope='run') binds to another run's facts in a
-    generation than in this run, and a step no cache can key (`_keyed`) is
-    in no generation's prefix, so no generation stands for either."""
+    uncached (`SelectedGeneration`), where no step before the cache reads its
+    record's index (which the selections number otherwise than that source)
+    and a records holdout numbers that source's inputs as the fill did (by
+    index, or by a stream that reads them in index order). Its rows are its
+    source, steps, tokenizers and fill (`Manifest.semantic`); the code and
+    machine that filled it (`Manifest.environment`) do not change them. A
+    step bound to the whole run's facts (scope='run') binds to another run's
+    facts in a generation than in this run, and a step no cache can key
+    (`_keyed`) is in no generation's prefix, so no generation stands for
+    either."""
     from dew.data.holdout import HashPart, RecordSlice, SelectedGeneration, selecting
 
     dependency = record(generation.manifest["dependency"], "generation dependency")
@@ -237,13 +241,15 @@ def _in_place(generation: Generation, source: Source | Mixture | Phases,
             f"a step before generation {generation.url} reads its record's index, which the holdout written "
             "before the cache numbers otherwise than the source the generation was published from; cache "
             "the part with a Cache(url), which fills from the part's own records")
-    if read == "streamed" and any(isinstance(selection, RecordSlice) for selection in selections):
-        raise ValueError(
-            f"a records holdout numbers its inputs by index, and generation {generation.url} was filled by a "
-            "stream, which numbers them by its shards; publish it from an indexed or memory read")
     placed = _consumed(stored, read)
-    placing: Read = ("streamed" if read == "streamed"
-                     else "indexed" if placed.supports("indexed") else "memory")
+    # The fill numbered its inputs by index where it read them so, else by its stream (`_source_ids`).
+    placing: Read = "indexed" if read != "streamed" and placed.supports("indexed") else "streamed"
+    if (placing == "streamed" and any(isinstance(selection, RecordSlice) for selection in selections)
+            and not isinstance(placed.manifest().reader, _IndexedSlice)):
+        raise ValueError(
+            f"a records holdout numbers its inputs by index, and generation {generation.url} numbers them by "
+            f"the shards a stream of {placed.describe()} read, in an order of its own; publish it from an "
+            "indexed read")
     return SelectedGeneration(generation, selections, placed, placing), ()
 
 

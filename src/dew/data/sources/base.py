@@ -191,17 +191,19 @@ def _consumed(source: Source, read: Read) -> Source:
     return source.consumed(read) if isinstance(source, Consumed) else source
 
 
-def _indexed_manifest(source: Source, prefix: str, uri: str, rows: int) -> ShardManifest:
+def _indexed_manifest(source: Source, prefix: str, uri: str, rows: int,
+                      reader: Callable[[Shard], pygrain.IterDataset] | None = None) -> ShardManifest:
     """The records `source` reads by index as a stream: consecutive ranges of
     at most `rows` records, each `Shard` named `<prefix>:<start>` at `uri`,
-    read as that slice of its indexed records (`_IndexedSlice`)."""
+    read as that slice of its indexed records (`_IndexedSlice`), or by
+    `reader`, which reads the same slice with less than `source` to pickle."""
     count = len(source.records("indexed"))
     return ShardManifest(
         tuple(
             Shard(f"{prefix}:{start}", uri, start, min(start + rows, count), min(rows, count - start))
             for start in range(0, count, rows)
         ),
-        _IndexedSlice(source),
+        _IndexedSlice(source) if reader is None else reader,
     )
 
 
