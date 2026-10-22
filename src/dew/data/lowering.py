@@ -1590,8 +1590,8 @@ def _epoch_records(train: Pipeline, build: _Build) -> int | None:
     mix of parts that never end, reads each part on from where it was, so it
     counts until every part has come round once (`Proportions.covering`), the
     parts it mixes counted alike, unless a slice or a limit before its repeat
-    reads a view of the mix, whose pass it counts. An order a slice or a limit
-    bounds after its repeat counts no more than it reads. A repeat written before a cache counts the
+    reads a view of the mix, whose pass it counts. An order that ends counts no
+    more than it reads, whatever bounds it after its repeat. A repeat written before a cache counts the
     inputs a pass reads where the cache keeps one record for each, and none
     otherwise, ahead of reading them; phases are counted by none."""
     if not build.global_order:
@@ -1625,29 +1625,34 @@ def _epoch_records(train: Pipeline, build: _Build) -> int | None:
             return None
         return Proportions.of(_weights(source)).covering(known)
 
-    unending = isinstance(train.source, Mixture) and _unending(train)
-    # A training order that repeats nowhere repeats for ever at its root (`_Build.batched`).
-    if unending or (build.training and build.lowering.endless and not build.lowering.repeated):
-        count = covered(train, build)
-    else:
-        count = passed(train, build)
     repeated, batched = _until(train.stages, (Repeat,)), _until(train.stages, (BatchStage, TokenBudget))
-    bounds = [stage for stage in train.stages[repeated:batched] if isinstance(stage, (Slice, Limit))]
-    if count is None or not bounds:
-        return count
-    # The records the bounded order holds, all of them read before its batch.
     order = dataclasses.replace(train, stages=train.stages[:batched])
+    # Read on past its end: by a repeat without a count, or as a mix of parts that never end.
+    source = train.source
+    onward = any(isinstance(stage, Repeat) and stage.epochs is None for stage in order.stages) or (
+        isinstance(source, Mixture) and all(_unending(child) for child in source.pipelines))
+    # A training order that repeats nowhere repeats for ever at its root (`_Build.batched`).
+    rooted = build.training and build.lowering.endless and not build.lowering.repeated
+    count = covered(train, build) if onward or rooted else passed(train, build)
+    if count is None or rooted or _unending(order) or (not onward and repeated >= batched):
+        return count
+    # An order that ends holds no more than it reads before its batch, whatever bounds it after its repeat.
     with _closing(build.records(order, DataPartition())) as rows:
         return min(count, len(rows)) if isinstance(rows, pygrain.MapDataset) else count
 
 
 def _unending(pipeline: Pipeline) -> bool:
-    """Whether `pipeline` reads for ever by itself: by a repeat without a count, or as a mixture of
-    parts that each do, whose mix never ends."""
-    if any(isinstance(stage, Repeat) and stage.epochs is None for stage in pipeline.stages):
-        return True
+    """Whether `pipeline`'s order never ends, its stages read in turn: a repeat without a count makes
+    it endless and a limit or a slice with an end ends it again, from a mixture whose parts' orders
+    each never end, whose mix never does, or a source that ends."""
     source = pipeline.source
-    return isinstance(source, Mixture) and all(_unending(child) for child in source.pipelines)
+    endless = isinstance(source, Mixture) and all(_unending(child) for child in source.pipelines)
+    for stage in pipeline.stages:
+        if isinstance(stage, Repeat) and stage.epochs is None:
+            endless = True
+        elif isinstance(stage, Limit) or (isinstance(stage, Slice) and stage.selection.stop is not None):
+            endless = False
+    return endless
 
 
 def _split_spans(pipeline: Pipeline, build: _Build) -> Iterator[list[tuple[int, int, int]]]:
