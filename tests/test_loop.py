@@ -11,7 +11,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from model_support import TINY_DECODER
+from model_support import TINY_DECODER, model_draw
 from reference_error import assert_as_exact
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -36,12 +36,7 @@ the most any of a site's cases took."""
 
 def drawn(model, length=12, rows=2):
     """Check 1's draw for `model`: a seed's parameters and `rows` rows of `length` tokens."""
-    init = jax.jit(model.init)
-
-    def draw(seed):
-        ids = tokens(jax.random.fold_in(jax.random.key(1), seed), length, rows)
-        return init(jax.random.fold_in(jax.random.key(0), seed), ids), ids
-    return draw
+    return model_draw(model, (rows, length), VOCAB)
 
 
 def wide(model):

@@ -21,7 +21,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
-from model_support import TINY_DECODER
+from model_support import TINY_DECODER, model_draw
 from reference_error import assert_as_exact
 
 from dew.nn.attention import scaled_dot_product_attention
@@ -53,12 +53,7 @@ sites on an A100, 2026-10-22): the most any of a site's cases took."""
 
 def drawn(model, batch=2, length=SEQ):
     """Check 1's draw for `model`: a seed's variables and `[batch, length]` tokens."""
-    init = jax.jit(model.init)
-
-    def draw(seed):
-        ids = tokens(jax.random.fold_in(jax.random.key(1), seed), batch, length)
-        return init(jax.random.fold_in(jax.random.key(0), seed), ids), ids
-    return draw
+    return model_draw(model, (batch, length), VOCAB)
 
 
 def float64(model):
@@ -1065,28 +1060,24 @@ def test_a_cast_then_scale_norm_rounds_under_jit_and_keeps_an_fp32_weight_gradie
 
     x = (jax.random.normal(jax.random.key(0), (64, 512)) * 3).astype(jnp.bfloat16)
     weight = 1.0 + 0.1 * jax.random.normal(jax.random.key(1), (512,), jnp.float32)
-    # The cotangent of a bf16 output is bf16, so c holds bf16 values.
-    c = jax.random.normal(jax.random.key(2), (64, 512)).astype(jnp.bfloat16).astype(jnp.float32)
     norm = RMSNorm(epsilon=1e-6, scale_after_cast=True, dtype=jnp.bfloat16)
 
-    x32 = np.asarray(x, np.float32)
-    inverse = np.float32(1) / np.sqrt(np.mean(np.square(x32), -1, keepdims=True) + np.float32(1e-6))
-    rounded = (x32 * inverse).astype(jnp.bfloat16).astype(np.float32)
-    expected = (rounded * np.asarray(weight)).astype(jnp.bfloat16)
-    expected_grad = np.sum(np.asarray(c, np.float64) * rounded, axis=0)
+    def normalized(x):
+        """The fp32 normalization, rounded to bf16."""
+        x32 = np.asarray(x, np.float32)
+        inverse = np.float32(1) / np.sqrt(np.mean(np.square(x32), -1, keepdims=True) + np.float32(1e-6))
+        return (x32 * inverse).astype(jnp.bfloat16).astype(np.float32)
 
-    def loss(weight):
-        return jnp.sum(norm.apply({"params": {"scale": weight}}, x).astype(jnp.float32) * c)
-
+    expected = (normalized(x) * np.asarray(weight)).astype(jnp.bfloat16)
     out = jax.jit(norm.apply)({"params": {"scale": weight}}, x)
     assert out.dtype == jnp.bfloat16
     np.testing.assert_array_equal(np.asarray(out), expected)
-    assert expected_grad.shape == weight.shape
 
     def draw(seed):
         keys = jax.random.split(jax.random.fold_in(jax.random.key(3), seed), 3)
         x = (jax.random.normal(keys[0], (64, 512)) * 3).astype(jnp.bfloat16)
         weight = 1.0 + 0.1 * jax.random.normal(keys[1], (512,), jnp.float32)
+        # The cotangent of a bf16 output is bf16, so c holds bf16 values.
         c = jax.random.normal(keys[2], (64, 512)).astype(jnp.bfloat16).astype(jnp.float32)
         return x, weight, c
 
@@ -1096,9 +1087,7 @@ def test_a_cast_then_scale_norm_rounds_under_jit_and_keeps_an_fp32_weight_gradie
         return jax.grad(loss)(weight)
 
     def summed(x, weight, c):
-        x32 = np.asarray(x, np.float32)
-        inverse = np.float32(1) / np.sqrt(np.mean(np.square(x32), -1, keepdims=True) + np.float32(1e-6))
-        rounded = (x32 * inverse).astype(jnp.bfloat16).astype(np.float32)
+        rounded = normalized(x)
         dtype = np.asarray(c).dtype
         return np.sum(np.asarray(c, dtype) * rounded.astype(dtype), axis=0)
 
