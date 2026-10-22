@@ -27,6 +27,37 @@ from reference_error import (
 )
 
 
+def test_a_torch_arm_pulls_back_the_cotangent_it_is_given():
+    """`torch_with_gradients` gives, bit for bit, a torch function's output and the gradients torch's
+    autograd pulls back from the cotangent passed last, cast to the output's dtype, at float32 and at
+    float64; a module's parameters are inputs through `functional_call`; an input the output does not
+    reach has a zero gradient."""
+    torch = pytest.importorskip("torch")
+    from reference_error import torch_with_gradients
+
+    rng = np.random.default_rng(0)
+    for dtype in (torch.float32, torch.float64):
+        layer = torch.nn.Linear(3, 4).to(dtype)
+        x, unused = (rng.normal(size=shape) for shape in ((5, 3), (2,)))
+        params = {name: value.detach().numpy() for name, value in layer.named_parameters()}
+        x, unused = x.astype(params["weight"].dtype), unused.astype(params["weight"].dtype)
+        cotangent = rng.normal(size=(5, 4))  # float64, cast to the output's dtype as jax.vjp casts
+
+        def forward(x, params, unused, layer=layer):
+            return torch.tanh(torch.func.functional_call(layer, params, (x,)))
+
+        out, grad_x, grads, grad_unused = torch_with_gradients(forward)(x, params, unused, cotangent)
+        tensors = [torch.from_numpy(x).requires_grad_(), *(torch.from_numpy(v).requires_grad_()
+                                                           for v in params.values())]
+        expected = torch.tanh(torch.func.functional_call(layer, dict(zip(params, tensors[1:], strict=True)),
+                                                         (tensors[0],)))
+        wanted = torch.autograd.grad(expected, tensors, torch.from_numpy(cotangent).to(dtype))
+        np.testing.assert_array_equal(out, expected.detach().numpy())
+        for got, want in zip((grad_x, *(grads[name] for name in params)), wanted, strict=True):
+            np.testing.assert_array_equal(got, want.numpy())
+        np.testing.assert_array_equal(grad_unused, np.zeros_like(unused))
+
+
 def test_a_small_row_beside_large_ones_is_held_to_its_own_size():
     """Dew doubles a row of 5s beside rows of 1e8 that the reference rounds by 8. Every
     tensor-wide distance passes it: its RMS error, 3.5, sits under twice the reference's, 5.7.
