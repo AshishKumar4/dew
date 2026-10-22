@@ -26,16 +26,14 @@ Run with the Dew test environment's torch, on CPU:
     python tools/vjepa_reference.py OUTPUT.npz
 """
 
-import importlib.util
 import sys
-import types
 from functools import cache, partial
 from pathlib import Path
 
 import ml_dtypes
 import numpy as np
 import torch
-from reference_source import CACHE as UPSTREAM, saved_fixture, verified
+from reference_source import CACHE as UPSTREAM, imported, packaged, saved_fixture
 
 REPO, COMMIT = "facebookresearch/jepa", "51c59d518fc63c08464af6de585f78ac0c7ed4d5"
 # In import order: each module's own imports come before it.
@@ -64,17 +62,10 @@ SEED = 53
 @cache
 def jepa():
     """V-JEPA's `src` at `COMMIT`, under its own package names."""
-    for package in ("src", "src.models", "src.models.utils", "src.masks", "src.utils"):
-        module = types.ModuleType(package)
-        module.__path__ = []
-        sys.modules[package] = module
+    packaged(("src", "src.models", "src.models.utils", "src.masks", "src.utils"))
     for path, digest in FILES.items():
-        local = verified(f"https://raw.githubusercontent.com/{REPO}/{COMMIT}/{path}", CACHE / path, digest)
-        name = path.removesuffix(".py").replace("/", ".")
-        spec = importlib.util.spec_from_file_location(name, local)
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[name] = module
-        spec.loader.exec_module(module)
+        imported(f"https://raw.githubusercontent.com/{REPO}/{COMMIT}/{path}", CACHE / path, digest,
+                 path.removesuffix(".py").replace("/", "."))
     return sys.modules["src.models.vision_transformer"], sys.modules["src.models.predictor"]
 
 

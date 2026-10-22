@@ -248,32 +248,19 @@ WALKS: dict[str, tuple[ModuleType, Callable[..., list[torch.Tensor]]]] = {
 }
 
 
-def multistep(**config) -> Case:
-    steps = config.pop("steps", STEPS)
-    return Case("DPMSolverMultistepScheduler",
-                dict(prediction_type="epsilon", final_sigmas_type="sigma_min",
-                     thresholding=False, **config), dew_grid(steps))
+def family(scheduler: str, grid: Callable[[int], np.ndarray], **defaults) -> Callable[..., Case]:
+    """A scheduler family's cases: an epsilon model on `grid`'s steps (`steps`, STEPS unless a case names
+    it), the family's `defaults` under each case's own settings."""
+    def case(steps: int = STEPS, **config) -> Case:
+        return Case(scheduler, dict(prediction_type="epsilon", **defaults, **config), grid(steps))
+    return case
 
 
-def singlestep(**config) -> Case:
-    steps = config.pop("steps", STEPS)
-    return Case("DPMSolverSinglestepScheduler",
-                dict(prediction_type="epsilon", final_sigmas_type="sigma_min", **config),
-                dew_grid(steps))
-
-
-def deis(**config) -> Case:
-    steps = config.pop("steps", STEPS)
-    return Case("DEISMultistepScheduler",
-                dict(prediction_type="epsilon", timestep_spacing="trailing", **config),
-                trailing_grid(steps))
-
-
-def unipc(**config) -> Case:
-    steps = config.pop("steps", STEPS)
-    return Case("UniPCMultistepScheduler",
-                dict(prediction_type="epsilon", timestep_spacing="trailing",
-                     final_sigmas_type="sigma_min", **config), trailing_grid(steps))
+multistep = family("DPMSolverMultistepScheduler", dew_grid, final_sigmas_type="sigma_min", thresholding=False)
+singlestep = family("DPMSolverSinglestepScheduler", dew_grid, final_sigmas_type="sigma_min")
+deis = family("DEISMultistepScheduler", trailing_grid, timestep_spacing="trailing")
+unipc = family("UniPCMultistepScheduler", trailing_grid, timestep_spacing="trailing",
+               final_sigmas_type="sigma_min")
 
 
 def distilled(scheduler: str, **step_kwargs) -> Case:

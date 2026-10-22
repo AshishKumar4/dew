@@ -22,32 +22,25 @@ float64.
 """
 
 import argparse
-import importlib
-import sys
-import tempfile
-import urllib.request
 from pathlib import Path
 
 import numpy as np
 import torch
+from beta_schedule_reference import SOURCES
+import reference_source
 
 ROOT = Path(__file__).resolve().parents[1]
-REPO, COMMIT = "XiangLi1999/Diffusion-LM", "759889d58ef38e2eed41a8c34db8032e072826f4"
+REPO, COMMIT, GAUSSIAN_DIFFUSION = SOURCES["diffusion_lm"]
 STEPS = 2000
 SHAPE = (6, 3, 4, 4)
 
 
 def published():
     """Diffusion-LM's gaussian_diffusion module, from its own files at the pinned commit."""
-    package = Path(tempfile.mkdtemp()) / "improved_diffusion"
-    package.mkdir()
-    (package / "__init__.py").write_text("")
-    for name in ("gaussian_diffusion.py", "nn.py", "losses.py"):
-        url = f"https://raw.githubusercontent.com/{REPO}/{COMMIT}/improved-diffusion/improved_diffusion/{name}"
-        with urllib.request.urlopen(url, timeout=60) as response:
-            (package / name).write_bytes(response.read())
-    sys.path.insert(0, str(package.parent))
-    return importlib.import_module("improved_diffusion.gaussian_diffusion")
+    gaussian_diffusion, *_ = reference_source.published(
+        "improved_diffusion", REPO, COMMIT, ("gaussian_diffusion.py", "nn.py", "losses.py"),
+        within=str(Path(GAUSSIAN_DIFFUSION).parent))
+    return gaussian_diffusion
 
 
 def main() -> None:

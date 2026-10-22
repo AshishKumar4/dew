@@ -14,16 +14,13 @@ inputs drawn again by tests/test_flow_grpo.py (`transition_inputs`):
 from __future__ import annotations
 
 import argparse
-import importlib.util
-import tempfile
 from pathlib import Path
-from urllib.request import urlopen
 
 import numpy as np
+from reference_source import published
 
 COMMIT = "879042cf5707f8b90daa98d147d7deac2317c5da"
-SOURCE = (f"https://raw.githubusercontent.com/yifan123/flow_grpo/{COMMIT}/"
-          "flow_grpo/diffusers_patch/sd3_sde_with_logprob.py")
+REPO, WITHIN, FILE = "yifan123/flow_grpo", "flow_grpo/diffusers_patch", "sd3_sde_with_logprob.py"
 RECORDED = Path(__file__).resolve().parents[1] / "tests/fixtures/rl/recorded_flow_transition.npz"
 SIGMAS = (1.0, 0.7, 0.4, 0.1)
 """The fixture's schedule: each of its rows takes one of these points' transitions to the next."""
@@ -48,15 +45,7 @@ def transition_inputs(seed: int) -> dict[str, np.ndarray]:
 
 def fetched_reference():
     """The pinned author module, fetched and run as published."""
-    with tempfile.TemporaryDirectory(prefix="dew-flow-reference-") as directory:
-        path = Path(directory) / "reference.py"
-        with urlopen(SOURCE, timeout=30) as response:
-            path.write_bytes(response.read())
-        spec = importlib.util.spec_from_file_location("flow_reference", path)
-        if spec is None or spec.loader is None:
-            raise RuntimeError("could not load the pinned Flow-GRPO reference")
-        reference = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(reference)
+    [reference] = published("flow_grpo_reference", REPO, COMMIT, [FILE], within=WITHIN)
     return reference
 
 

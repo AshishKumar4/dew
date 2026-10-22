@@ -13,7 +13,6 @@ from __future__ import annotations
 import argparse
 import gzip
 import hashlib
-import importlib.util
 import json
 import math
 import os
@@ -27,6 +26,7 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from reference_source import module_at
 from trace_window import device_events, kernel_category, kernel_totals, window_totals
 
 EVIDENCE = Path(os.environ.get(
@@ -35,12 +35,7 @@ EVIDENCE = Path(os.environ.get(
 
 def _native(name: str, source: str):
     """Read Dew's host-only records and target table without its backend import policy."""
-    path = Path(__file__).resolve().parents[2] / "src/dew" / source
-    spec = importlib.util.spec_from_file_location(name, path)
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
+    return module_at(name, Path(__file__).resolve().parents[2] / "src/dew" / source)
 
 
 gpu_target = _native("dew_gpu_targets", "nn/kernels/generation.py").gpu_target

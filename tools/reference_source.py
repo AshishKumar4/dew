@@ -8,20 +8,28 @@ upstream definition fails the generator instead of leaving a stale one in
 scope. `defined_in` (`definitions` for a URL) runs them in the generator's
 scope; a generator that retargets a dtype, drops a decorator or builds a
 class around them does so between `selected` and `ran`. `simple_statements`
-takes single lines out of a published function. `verified` keeps a
-reference file on disk, fetched once and checked against its pinned SHA-256
-on every use. `stub_torch_utils` stands in for the two `torch_utils` names
-NVIDIA's EDM and EDM2 networks import. `saved_fixture` writes a generator's
-arrays with its provenance as the suite reads them, and `recipe_images` draws the images a recipe names.
+takes single lines out of a published function. `verified` keeps a reference
+file on disk, fetched once and checked against its pinned SHA-256 on every
+use; `imported` runs such a file as a module of its own, and `packaged` and
+`module_at` let an upstream's files import each other, as `published` does
+for a package of files it fetches.
+`stub_torch_utils` stands in for the two `torch_utils` names NVIDIA's EDM and
+EDM2 networks import. `saved_fixture` writes a generator's arrays with its
+provenance as the suite reads them, and `recipe_images` draws the images a
+recipe names.
 """
 
 from __future__ import annotations
 
 import ast
 import hashlib
+import importlib
+import importlib.util
+import sys
 import urllib.request
 from collections.abc import Iterable
 from pathlib import Path
+from types import ModuleType
 
 TIMEOUT = 120
 """Seconds a fetch may take."""
@@ -85,6 +93,69 @@ def verified(url: str, local: Path, digest: str) -> Path:
     if found != digest:
         raise RuntimeError(f"{local} has SHA-256 {found}, not the pinned {digest}")
     return local
+
+
+def module_at(name: str, path: Path) -> ModuleType:
+    """The file at `path` run as the module `name`, registered under it before it runs, so the modules it
+    imports, and those that import it, find it."""
+    spec = importlib.util.spec_from_file_location(name, path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    # A dotted name is also its parent package's attribute, as Python's import binds it.
+    parent, _, leaf = name.rpartition(".")
+    if parent in sys.modules:
+        setattr(sys.modules[parent], leaf, module)
+    spec.loader.exec_module(module)
+    return module
+
+
+def imported(url: str, local: Path, digest: str, name: str) -> ModuleType:
+    """The file at `url`, kept at `local` and checked against `digest` (`verified`), run as the module
+    `name` (`module_at`)."""
+    return module_at(name, verified(url, local, digest))
+
+
+def packaged(names: Iterable[str]) -> None:
+    """Empty packages named `names`, registered, for an upstream's modules run one by one (`module_at`) to
+    import each other under their own package names."""
+    for name in names:
+        package = ModuleType(name)
+        package.__path__ = []
+        sys.modules[name] = package
+
+
+HOSTS = {"github": "https://raw.githubusercontent.com/{repo}/{revision}/{path}",
+         "hub": "https://huggingface.co/{repo}/resolve/{revision}/{path}"}
+"""Where a published file is read: a GitHub repository's raw file, or a Hugging Face repository's."""
+
+
+def published(package: str, repo: str, revision: str, files: Iterable[str], *, host: str = "github",
+              within: str = "") -> list[ModuleType]:
+    """`files`, the names of files in the directory `within` of `repo` at `revision` on `host` (`HOSTS`),
+    fetched once into the cache under the repository and revision, and imported in their order as the
+    modules of the package `package`, which that cache directory puts on the import path."""
+    cache = CACHE / repo / revision
+    directory = cache / package
+    directory.mkdir(parents=True, exist_ok=True)
+    names = list(files)
+    for name in names:
+        if not (directory / name).is_file():
+            path = f"{within}/{name}" if within else name
+            url = HOSTS[host].format(repo=repo, revision=revision, path=path)
+            (directory / name).write_text(fetched(url))
+    (directory / "__init__.py").touch()
+    sys.path.insert(0, str(cache))
+    return [importlib.import_module(f"{package}.{name.removesuffix('.py')}") for name in names]
+
+
+def left_padded(ids):
+    """`ids` as the recorders run them left-padded: the second row's first three tokens padded away. The
+    attention mask, the padded ids (0 where masked) and each token's position among its row's kept ones."""
+    import numpy as np
+
+    mask = np.ones_like(ids, bool)
+    mask[1, :3] = False
+    return mask, np.where(mask, ids, 0), np.maximum(np.cumsum(mask, axis=-1) - 1, 0)
 
 
 def _defined(node: ast.stmt) -> set[str]:

@@ -23,14 +23,14 @@ configs diffusers infers for it (sd15_from_single_file.json).
 """
 
 import hashlib
-import importlib.util
 import json
 import shutil
 import sys
 import tarfile
 import tempfile
-import urllib.request
 from pathlib import Path
+
+from reference_source import published
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / "tests" / "fixtures" / "single_file"
@@ -95,15 +95,10 @@ def tiny_pipeline(kind: str, directory: Path, tokenizer_from: Path) -> None:
     pipe.save_pretrained(directory, safe_serialization=True)
 
 
-def _reverse_script(kind: str, scratch: Path):
-    script = scratch / SCRIPTS[kind]
-    urllib.request.urlretrieve(f"https://raw.githubusercontent.com/huggingface/diffusers/v0.34.0/scripts/"
-                               f"{SCRIPTS[kind]}", script)
-    spec = importlib.util.spec_from_file_location("convert", script)
-    assert spec is not None and spec.loader is not None
-    convert = importlib.util.module_from_spec(spec)
+def _reverse_script(kind: str):
     argv, sys.argv = sys.argv, ["convert"]
-    spec.loader.exec_module(convert)
+    [convert] = published("diffusers_scripts", "huggingface/diffusers", "v0.34.0", [SCRIPTS[kind]],
+                          within="scripts")
     sys.argv = argv
     return convert
 
@@ -143,7 +138,7 @@ def tiny(kind: str) -> None:
         archive.extractall(scratch / "committed", filter="data")
     pipeline = scratch / kind
     tiny_pipeline(kind, pipeline, scratch / "committed" / "sd" / "tokenizer")
-    state = _original(kind, pipeline, _reverse_script(kind, scratch))
+    state = _original(kind, pipeline, _reverse_script(kind))
     out = FIXTURE / kind
     shutil.rmtree(out, ignore_errors=True)
     shutil.copytree(pipeline, out / "configs", ignore=shutil.ignore_patterns("*.safetensors"))

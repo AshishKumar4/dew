@@ -721,12 +721,10 @@ def official_kernels():
     revision), under a name of their own beside the stand-in `kernel`."""
     from huggingface_hub import hf_hub_download
 
+    from reference_source import module_at
+
     path = hf_hub_download(REPO, "inference/kernel.py", revision=DEEPSEEK_V41_REVISION)
-    spec = importlib.util.spec_from_file_location("deepseek_v41_tilelang_kernels", path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    return module_at("deepseek_v41_tilelang_kernels", Path(path))
 
 
 def write_kernels():

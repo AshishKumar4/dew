@@ -52,7 +52,6 @@ included).
 """
 
 import copy
-import importlib.util
 import json
 import os
 import sys
@@ -60,6 +59,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
+from reference_source import module_at
 
 ROOT = Path(__file__).resolve().parents[1]
 BACKBONE = ROOT / "tests" / "fixtures" / "hf" / "qwen38-dense-tiny"
@@ -73,12 +73,9 @@ def upstream_module():
     from huggingface_hub import hf_hub_download
 
     source = json.loads((OUT / "source.json").read_text())
+    # Registered before it runs: its dataclasses look their module up.
     path = hf_hub_download(source["repo"], "joint_schema_model.py", revision=source["revision"])
-    spec = importlib.util.spec_from_file_location("joint_schema_model", path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[spec.name] = module  # its dataclasses look their module up
-    spec.loader.exec_module(module)
+    module = module_at("joint_schema_model", Path(path))
     return module, getattr(module, source["model"])
 
 

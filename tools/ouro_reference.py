@@ -21,15 +21,14 @@ loaded checkpoint to.
 
 import argparse
 import shutil
-import sys
-import tempfile
 from pathlib import Path
 
 import numpy as np
 import torch
-import transformers
 from diffusers_wan_reference import float64
 from huggingface_hub import hf_hub_download
+
+from reference_source import left_padded, published
 
 from dew.interop.verify import probe_ids, scatter_weights
 
@@ -40,14 +39,8 @@ COLUMNS = np.random.RandomState(11).choice(49152, 64, replace=False)
 
 def remote():
     """Ouro's modeling module, imported from the pinned remote code as a package."""
-    package = Path(tempfile.mkdtemp()) / 'ouro_remote'
-    package.mkdir()
-    (package / '__init__.py').write_text('')
-    for name in ('configuration_ouro.py', 'modeling_ouro.py'):
-        shutil.copy(hf_hub_download(REPO, name, revision=REVISION), package / name)
-    sys.path.insert(0, str(package.parent))
-    import ouro_remote.modeling_ouro as modeling
-    return modeling
+    files = ('configuration_ouro.py', 'modeling_ouro.py')
+    return published('ouro_remote', REPO, REVISION, files, host='hub')[-1]
 
 
 def last_pass(model):
@@ -81,10 +74,7 @@ def write_tiny(modeling) -> None:
     model = last_pass(model)
     model.save_pretrained(directory, safe_serialization=True)
     ids = probe_ids(config.vocab_size)
-    mask = np.ones_like(ids, bool)
-    mask[1, :3] = False
-    padded = np.where(mask, ids, 0)
-    positions = np.maximum(np.cumsum(mask, axis=-1) - 1, 0)
+    mask, padded, positions = left_padded(ids)
     arrays = {'input_ids': ids, 'padded_ids': padded, 'attention_mask': mask}
     arrays['logits'], arrays['exit_logits'] = outputs(model, ids)
     arrays['padded_logits'], _ = outputs(model, padded, mask, positions)

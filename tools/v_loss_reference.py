@@ -23,15 +23,12 @@ float64.
 """
 
 import argparse
-import importlib
-import sys
-import tempfile
-import urllib.request
 from pathlib import Path
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+import reference_source
 
 jax.config.update("jax_enable_x64", val=True)
 
@@ -43,15 +40,9 @@ SHAPE = (6, 4, 4, 3)
 
 def published() -> object:
     """diffusion_distillation's dpm module, from its own files at the pinned commit."""
-    package = Path(tempfile.mkdtemp()) / "diffusion_distillation"
-    package.mkdir()
-    (package / "__init__.py").write_text("")
-    for name in ("dpm.py", "utils.py"):
-        url = f"https://raw.githubusercontent.com/{REPO}/{COMMIT}/diffusion_distillation/diffusion_distillation/{name}"
-        with urllib.request.urlopen(url, timeout=60) as response:
-            (package / name).write_bytes(response.read())
-    sys.path.insert(0, str(package.parent))
-    return importlib.import_module("diffusion_distillation.dpm")
+    dpm, _ = reference_source.published("diffusion_distillation", REPO, COMMIT, ("dpm.py", "utils.py"),
+                                        within="diffusion_distillation/diffusion_distillation")
+    return dpm
 
 
 def main() -> None:

@@ -23,15 +23,13 @@ Run with the Dew test environment's torch, on CPU:
     python tools/uvit_reference.py OUTPUT.npz
 """
 
-import importlib.util
 import sys
-import types
 from pathlib import Path
 
 import ml_dtypes
 import numpy as np
 import torch
-from reference_source import CACHE as UPSTREAM, saved_fixture, verified
+from reference_source import CACHE as UPSTREAM, imported, packaged, saved_fixture
 
 REPO, COMMIT = "baofff/U-ViT", "ce551708dc9cde9818d2af7d84dfadfeb7bd9034"
 FILES = {
@@ -53,18 +51,12 @@ SEED = 47
 
 def uvit():
     """U-ViT's libs at `COMMIT`, as the package `uvit_libs`, in its math attention."""
-    package = types.ModuleType("uvit_libs")
-    package.__path__ = []
-    sys.modules["uvit_libs"] = package
+    packaged(("uvit_libs",))
     modules = {}
     for path, digest in FILES.items():
-        local = verified(f"https://raw.githubusercontent.com/{REPO}/{COMMIT}/{path}", CACHE / path, digest)
         name = "uvit_libs." + Path(path).stem
-        spec = importlib.util.spec_from_file_location(name, local)
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[name] = module
-        spec.loader.exec_module(module)
-        modules[name] = module
+        modules[name] = imported(f"https://raw.githubusercontent.com/{REPO}/{COMMIT}/{path}", CACHE / path,
+                                 digest, name)
     t2i = modules["uvit_libs.uvit_t2i"]
     t2i.ATTENTION_MODE = "math"
     return t2i

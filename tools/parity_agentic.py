@@ -27,14 +27,15 @@ own arithmetic. Run with an interpreter that has torch:
   ~/Desktop/dew/.venv/bin/python tools/parity_agentic.py
 """
 
-import subprocess
 import sys
 from pathlib import Path
 
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from parity_rl import ActorConfig, compile_reference, load_verl, stub
+from parity_rl import ActorConfig, load_verl, stub
+from reference_source import module_at
+from reference_runs.common import git_head
 
 SOURCES = Path.home() / ".cache/dew/research/src"
 VERL = SOURCES / "verl"
@@ -88,26 +89,21 @@ SEQUENCE_BAND = (0.5, 3.0)
 GEOMETRIC_BAND = (0.87, 2.0)
 
 
-def revision(path: Path) -> str:
-    return subprocess.run(["git", "-C", str(path), "rev-parse", "HEAD"],
-                          check=True, capture_output=True, text=True).stdout.strip()
-
-
 def load():
     """verl's core_algos and rollout_corr_helper, then Agent Lightning's per-rollout loss."""
     for path, wanted in ((VERL, VERL_REVISION), (LIGHTNING, LIGHTNING_REVISION)):
-        if revision(path) != wanted:
+        if git_head(path) != wanted:
             raise RuntimeError(f"{path} is not at {wanted}")
     core = load_verl(VERL)
     # What rollout_corr_helper imports beyond core_algos.
     stub("verl.protocol", DataProto=object)
     stub("verl.trainer.config.algorithm", RolloutCorrectionConfig=object)
     stub("verl.workers.config.actor", PolicyLossConfig=object)
-    helper = compile_reference("verl.trainer.ppo.rollout_corr_helper",
+    helper = module_at("verl.trainer.ppo.rollout_corr_helper",
                                VERL / "verl/trainer/ppo/rollout_corr_helper.py")
     stub("agentlightning")
     stub("agentlightning.verl")
-    lightning = compile_reference("agentlightning.verl.per_rollout_loss",
+    lightning = module_at("agentlightning.verl.per_rollout_loss",
                                   LIGHTNING / "agentlightning/verl/per_rollout_loss.py")
     return core, helper, lightning
 

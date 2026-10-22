@@ -223,20 +223,45 @@ def gemma3n_post_sgd_spread() -> None:
     print(report)
 
 
-def write_gemma3_native() -> None:
-    """The actual public processor and conditional model over unequal image rows."""
-    source = ROOT / "gemma3-tiny-mm"
-    destination = ROOT / "gemma3-native-tiny"
+def _native(name: str, config_class, model_class, **changes):
+    """`name`-tiny-mm's weights in the public conditional model, saved with its config as `name`-native-tiny;
+    `changes` set config fields first. The model, eager, and the source config's dict."""
+    source = ROOT / f"{name}-tiny-mm"
+    destination = ROOT / f"{name}-native-tiny"
     destination.mkdir(parents=True, exist_ok=True)
-    config = json.loads((source / "config.json").read_text())
-    config["mm_tokens_per_image"] = 4
-    hf_config = Gemma3Config.from_dict(config)
+    config = {**json.loads((source / "config.json").read_text()), **changes}
+    hf_config = config_class.from_dict(config)
     hf_config._attn_implementation = "eager"
-    model = Gemma3ForConditionalGeneration(hf_config).float().eval()
+    model = model_class(hf_config).float().eval()
     tensors = load_file(str(source / "model.safetensors"))
     model.load_state_dict(tensors, strict=True)
     save_file(tensors, str(destination / "model.safetensors"))
     hf_config.save_pretrained(destination)
+    return model, config, destination
+
+
+def qwen35_processor(destination: Path):
+    """The public Qwen3VLProcessor over a tiny vocabulary with Qwen3.5's vision tokens, saved to
+    `destination` and read back as AutoProcessor reads it."""
+    from transformers import Qwen3VLProcessor, Qwen3VLVideoProcessor
+    from transformers.models.qwen2_vl.image_processing_qwen2_vl import Qwen2VLImageProcessor
+
+    special = {"<pad>": 0, "<eos>": 1, "<bos>": 2, "<unk>": 3,
+               "<image_soft_token>": 200, "<video>": 201,
+               "<start_of_image>": 202, "<end_of_image>": 203}
+    tokenizer = _tokenizer(256, special, video_token="<video>",
+                           vision_start_token="<start_of_image>", vision_end_token="<end_of_image>")
+    processor = Qwen3VLProcessor(
+        Qwen2VLImageProcessor(patch_size=8, temporal_patch_size=2, merge_size=2, do_resize=False),
+        tokenizer, Qwen3VLVideoProcessor(patch_size=8, temporal_patch_size=2, merge_size=2))
+    processor.save_pretrained(destination)
+    return AutoProcessor.from_pretrained(destination, local_files_only=True)
+
+
+def write_gemma3_native() -> None:
+    """The actual public processor and conditional model over unequal image rows."""
+    model, _, destination = _native("gemma3", Gemma3Config, Gemma3ForConditionalGeneration,
+                                    mm_tokens_per_image=4)
 
     special = {"<pad>": 0, "<eos>": 1, "<bos>": 2, "<unk>": 3,
                "<start_of_image>": 200, "<end_of_image>": 201, "<image_soft_token>": 202}
@@ -303,17 +328,7 @@ def write_llama4_native() -> None:
     from transformers import Llama4Config, Llama4ForConditionalGeneration, Llama4Processor
     from transformers.models.llama4.image_processing_llama4 import Llama4ImageProcessor
 
-    source = ROOT / "llama4-tiny-mm"
-    destination = ROOT / "llama4-native-tiny"
-    destination.mkdir(parents=True, exist_ok=True)
-    config = json.loads((source / "config.json").read_text())
-    hf_config = Llama4Config.from_dict(config)
-    hf_config._attn_implementation = "eager"
-    model = Llama4ForConditionalGeneration(hf_config).float().eval()
-    tensors = load_file(str(source / "model.safetensors"))
-    model.load_state_dict(tensors, strict=True)
-    save_file(tensors, str(destination / "model.safetensors"))
-    hf_config.save_pretrained(destination)
+    model, config, destination = _native("llama4", Llama4Config, Llama4ForConditionalGeneration)
     special = {"<pad>": 0, "<bos>": 1, "<eos>": 2, "<unk>": 3,
                "<|image_start|>": 90, "<|image_end|>": 91, "<|patch|>": 92, "<|image|>": 93,
                "<|tile_x_separator|>": 94, "<|tile_y_separator|>": 95}
@@ -331,30 +346,10 @@ def write_llama4_native() -> None:
 
 def write_qwen35_native() -> None:
     """The actual Qwen3VLProcessor and hybrid model, including spatial M-RoPE."""
-    from transformers import Qwen3VLProcessor, Qwen3VLVideoProcessor, Qwen3_5Config, Qwen3_5ForConditionalGeneration
-    from transformers.models.qwen2_vl.image_processing_qwen2_vl import Qwen2VLImageProcessor
+    from transformers import Qwen3_5Config, Qwen3_5ForConditionalGeneration
 
-    source = ROOT / "qwen35-tiny-mm"
-    destination = ROOT / "qwen35-native-tiny"
-    destination.mkdir(parents=True, exist_ok=True)
-    config = json.loads((source / "config.json").read_text())
-    hf_config = Qwen3_5Config.from_dict(config)
-    hf_config._attn_implementation = "eager"
-    model = Qwen3_5ForConditionalGeneration(hf_config).float().eval()
-    tensors = load_file(str(source / "model.safetensors"))
-    model.load_state_dict(tensors, strict=True)
-    save_file(tensors, str(destination / "model.safetensors"))
-    hf_config.save_pretrained(destination)
-    special = {"<pad>": 0, "<eos>": 1, "<bos>": 2, "<unk>": 3,
-               "<image_soft_token>": 200, "<video>": 201,
-               "<start_of_image>": 202, "<end_of_image>": 203}
-    tokenizer = _tokenizer(256, special, video_token="<video>",
-                           vision_start_token="<start_of_image>", vision_end_token="<end_of_image>")
-    processor = Qwen3VLProcessor(
-        Qwen2VLImageProcessor(patch_size=8, temporal_patch_size=2, merge_size=2, do_resize=False),
-        tokenizer, Qwen3VLVideoProcessor(patch_size=8, temporal_patch_size=2, merge_size=2))
-    processor.save_pretrained(destination)
-    processor = AutoProcessor.from_pretrained(destination, local_files_only=True)
+    model, _, destination = _native("qwen35", Qwen3_5Config, Qwen3_5ForConditionalGeneration)
+    processor = qwen35_processor(destination)
     images = np.random.default_rng(2305).integers(0, 256, (3, 32, 32, 3), dtype=np.uint8)
     prompts = ["token7 <start_of_image><image_soft_token><end_of_image> token9",
                "token5 <start_of_image><image_soft_token><end_of_image> token8 <start_of_image><image_soft_token><end_of_image> token6"]

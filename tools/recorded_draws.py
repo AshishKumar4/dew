@@ -3,14 +3,28 @@ makes them or replayed from an earlier walk's record, so a second precision,
 or Dew's own step, reads exactly the samples the first did.
 
 `Tape` holds the record; `TorchDraws` and `JaxDraws` stand in for `torch`
-and `jax.random` in a reference's scope, every other name passing through.
+and `jax.random` in a reference's scope, every other name passing through;
+`fixed` replays one base for every Torch draw a library makes.
 A draw is made only while recording, and a replayed one is checked against
 the shape asked for where the call names one.
 """
 
 from __future__ import annotations
 
+import contextlib
 import importlib
+
+
+@contextlib.contextmanager
+def fixed(base):
+    """`torch.normal(mean, std, size)` and `torch.rand(size)` return `base`'s values, a tensor its caller
+    builds in the precision it runs."""
+    import torch
+    from torch_precision import replaced
+
+    with replaced((torch, "normal", lambda mean, std, size, **_: mean + std * base),
+                  (torch, "rand", lambda size, **_: base)):
+        yield
 
 
 class Tape:
