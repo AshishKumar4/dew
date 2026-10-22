@@ -266,8 +266,8 @@ fusions, the nine host cases on an AMD x86-64-v4 host."""
 
 
 on_device = pytest.mark.tpu(reason="needs a tpu, the one backend the kernel is chosen on")
-interpreted = pytest.mark.skipif(jax.default_backend() == "gpu", reason="a GPU runs mamba_ssm's kernels, "
-                                 "and this one is measured interpreted on the CPU lane")
+interpreted = pytest.mark.skipif(jax.default_backend() == "gpu", reason="no user runs this kernel on a GPU, "
+                                 "and check 1 measures it interpreted on the CPU lane")
 
 # (batch, steps, heads, head width, state, groups), chunk: a tail of one step short, whole chunks, a tail
 # of one step over, four chunks with a ragged tail, at widths the kernel takes and fewer groups than heads;

@@ -1749,9 +1749,10 @@ rule of `tests/reference_error.py`:
   which cost 10-30% more.
 - Blocks of 128 keys round closer to float64 (0.66-0.76x torch), but they
   double the partial products, and their forward cost up to 18% more.
-- Turning YNNPACK's dots off with
-  `--xla_cpu_experimental_ynn_fusion_type=-individual_dot` gives every CPU
-  dot Eigen's blocks. On two threads, Eigen ran the 176M hybrid DiT's MLP
+- Turning YNNPACK's individual dots off with
+  `--xla_cpu_experimental_ynn_fusion_type=-individual_dot` gives those
+  dots Eigen's blocks; dots YNNPACK fuses with other ops, as a scan's, stay
+  its own. On two threads, Eigen ran the 176M hybrid DiT's MLP
   shapes (512 x 768 x 3072) 12% slower. It would also change every CPU
   result, including the live sampler's image.
 
@@ -3370,8 +3371,9 @@ element-wise and layout ops to YNNPACK fusions by default, and YNNPACK picks the
 time by the host's instruction set. Check 1 between them (`tests/test_ssd_kernel.py`) read the
 one-short case's state gradient at 1.598 (99.9% interval 1.581 to 1.617, 640 seeds) on an AMD EPYC
 Zen 4 host (x86-64-v4, AVX-512) and at 0.77 on a Zen 3 one (x86-64-v3, AVX2). With both arms compiled
-without the fusions (`tests/reference_error.py`'s `without_ynn`), the worst leaf over the nine host
-cases was 1.17 at 128 draws each on Zen 4, and the one-short case's worst 1.20 at 128 draws on Zen 3.
+without the fusions (`tests/reference_error.py`'s `without_ynn`), a probe of the same arms at 128
+draws each read the worst leaf over the nine host cases at 1.17 on Zen 4 and the one-short case's at
+1.20 on Zen 3, and check 1 passes all nine at their declared seeds on Zen 4.
 Which fused op moved the verdict was not isolated. The bits still differ by host without the
 fusions, since XLA compiles for the host's instruction set (2090 of 4096 outputs moved between
 `--xla_cpu_max_isa=AVX` and no cap on one host); the verdicts do not.
