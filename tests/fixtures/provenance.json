@@ -3690,7 +3690,7 @@
    ],
    "note": "Loads the saved Wan VAE fixture in bfloat16 and records posterior/decode and input gradients."
   },
-  "weighting/weights.npz": {
+  "weighting/recorded_weights.npz": {
    "tool": "tools/weighting_reference.py",
    "sources": [
     {
@@ -3709,7 +3709,7 @@
      "runs": "torch"
     }
    ],
-   "note": "Each repo's own GaussianDiffusion.training_losses at every step; the beta tables in it are inputs."
+   "note": "Each repo's own GaussianDiffusion.training_losses at every step of beta tables check 1 draws (table_inputs), in fp32 and with float64 kept; check 1's evidence of each case over its seeds, summarized."
   },
   "z_image_source.tar.xz": {
    "tool": "tools/diffusers_z_image_reference.py",
