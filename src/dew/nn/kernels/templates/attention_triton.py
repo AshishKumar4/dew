@@ -322,7 +322,8 @@ class TritonForward(Template[Tiles]):
             out_specs += [per_row, per_row, per_row, per_value, per_row, per_row]
         # A call's own key count, none included; an op built without one counts its launch's keys.
         spec = algebra.Forward(self.form, keys if self.keys is None else self.keys, ids, self.scale,
-                               self.score_mod, self.natural, initial=initial)
+                               self.score_mod, self.natural, initial=initial,
+                               shift=algebra.headroom(keys, value.dtype))
         kernel = functools.partial(
             _forward_kernel, spec=spec, score_kinds=self.score_kinds, output_kinds=self.output_kinds,
             initial=initial, residuals=residuals, output_mod=self.output_mod, block_k=block_k,
@@ -486,7 +487,7 @@ def _tile_scores(score_mod, query, key, value, dout, peak, total, anchor, delta,
 
 
 def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tuple[Kind, ...], score_mod,
-               scale: float, block_k: int, split: bool, interpret: bool):
+               scale: float, block_k: int, split: bool, shift: int, interpret: bool):
     refs = list(refs)
     id_refs = [refs.pop(0), refs.pop(0)] if ids else []
     (query_ref, key_ref, value_ref, dout_ref, peak_ref, total_ref, initial_ref, maximum_ref, index_ref,
@@ -525,26 +526,26 @@ def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tu
                                  interpret=interpret)
         value = value_ref[keys, :]
         exponentials, rest, own = algebra.off_anchor_weights(logits, maximum, k_pos == key_index[:, None],
-                                                             value.dtype)
+                                                             value.dtype, shift)
         return algebra.off_anchor(state, exponentials, rest, own, _dot(rest, value, interpret))
 
     # From the softmax's initial state (`gradients`): its maximum, denominator and share of D's numerator.
     key_index = index_ref[...]
     peak0, shares = peak, (total, initial_ref[...])
     before, state_total, state_share = algebra.off_anchor_start(peak, total, shares[1], maximum,
-                                                                value_ref.shape[-1])
+                                                                value_ref.shape[-1], shift)
     if split:
         # The forward took the first pass (`algebra.split_accumulate`).
         others_ref, own_ref, others_total_ref, forward_total_ref = split_refs
         prior = forward_total_ref[...]
         anchor, delta, key_index = algebra.split_delta(
             others_ref[...], own_ref[...], others_total_ref[...], prior, state_total, anchor_value_ref[...],
-            dout, key_index)
+            dout, key_index, shift)
     else:
         state = jax.lax.fori_loop(bounds_ref[0], bounds_ref[1], row_terms, before)
-        prior = state.total
+        prior = algebra.unshifted(state.total, shift)
         anchor, delta, key_index = algebra.off_anchor_delta(state, anchor_value_ref[...], dout, state_total,
-                                                            state_share, key_index)
+                                                            state_share, key_index, shift)
     peak = maximum
     index_out_ref[...] = key_index
     summed = tuple(kind in (Kind.HEAD, Kind.QUERY) for kind in score_kinds)
@@ -852,7 +853,7 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
                 out_specs.append(per_head)
     kernel = functools.partial(_dq_kernel, ids=ids, score_kinds=score_kinds,
                                score_mod=score_mod, scale=scale, block_k=block_k, split=sums is not None,
-                               interpret=interpret)
+                               shift=algebra.headroom(keys, value.dtype), interpret=interpret)
     out = pl.pallas_call(
         kernel, grid=(queries // block_q, batch, heads), in_specs=in_specs, out_specs=out_specs,
         out_shape=out_shape, interpret=interpret, name="attention_dq",

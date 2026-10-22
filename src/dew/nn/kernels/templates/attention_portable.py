@@ -186,7 +186,8 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, 
                    jnp.pad(call.rows(state.acc), ((0, 0),) * 3 + ((0, call.value.shape[-1] - value_width),)))
     spec = algebra.Forward(spans.form, spans.keys, call.query_ids is not None,
                            query.shape[3] ** -0.5 if scale is None else scale, hooks.score_mod, natural,
-                           initial=initial is not None)
+                           initial=initial is not None,
+                           shift=algebra.headroom(call.key.shape[1], value.dtype))
     out, kept = forward(
         spec, call.query, call.key, call.value, call.start, call.end, call.query_ids, call.key_ids,
         call.score_params, tuple(param.kind for param in hooks.score_params), call.output_params,
@@ -233,6 +234,8 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
     start, end, query_ids, key_ids = spans
     bounds = block_map(KeySpans(start, end, query_ids, key_ids, keys), block_q, block_k)
     summed = tuple(kind in (Kind.HEAD, Kind.QUERY) for kind in score_kinds)
+    # The forward's weights' shift, which its split sums carry (`algebra.headroom`).
+    shift = algebra.headroom(keys, value.dtype)
 
     def program(index):
         i, rest = index // (batch * heads), index % (batch * heads)
@@ -256,25 +259,26 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
             return columns, _seen(spans, row, rows, columns), params, k_tile, v_tile
 
         before, state_total, state_share = algebra.off_anchor_start(peak0, total0, term0, maxima,
-                                                                    value.shape[-1])
+                                                                    value.shape[-1], shift)
         if sums is None:
             # D without the forward's split sums: the dQ launch's own pass over the keys.
             def row_terms(j, state):
                 columns, seen, params, k_tile, v_tile = tile(j)
                 logits, _ = _logits(score_mod, q, k_tile, seen, q_pos, columns[None, :], params, scale)
                 at_anchor = columns[None, :] == chosen[:, None]
-                exponentials, rest, own = algebra.off_anchor_weights(logits, maxima, at_anchor, v_tile.dtype)
+                exponentials, rest, own = algebra.off_anchor_weights(logits, maxima, at_anchor, v_tile.dtype,
+                                                                     shift)
                 return algebra.off_anchor(state, exponentials, rest, own, _dot(rest, v_tile))
 
             walked = jax.lax.fori_loop(lo, hi, row_terms, before)
-            prior = walked.total
+            prior = algebra.unshifted(walked.total, shift)
             anchor, delta, chosen = algebra.off_anchor_delta(walked, anchor_rows, do, state_total,
-                                                             state_share, chosen)
+                                                             state_share, chosen, shift)
         else:
             # The forward took the first pass (`algebra.split_delta`).
             others, own, others_total, prior = (part[row, head, rows] for part in sums)
             anchor, delta, chosen = algebra.split_delta(others, own, others_total, prior, state_total,
-                                                        anchor_rows, do, chosen)
+                                                        anchor_rows, do, chosen, shift)
         m = maxima
 
         def step(j, carry):
