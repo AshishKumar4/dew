@@ -77,6 +77,7 @@ from __future__ import annotations
 import argparse
 import ast
 import functools
+import gc
 import hashlib
 import io
 import json
@@ -2124,7 +2125,10 @@ def main(argv: Sequence[str] | None = None, jobs: int = 1) -> int:
     read = [(path, relative, args.package) for path, relative in files(roots, args.root.resolve())]
     seen = {relative for _, relative, _ in read}
     if jobs > 1:
-        with multiprocessing.get_context("fork").Pool(jobs) as pool:
+        # A worker's collector would trace through everything the fork inherited: a worker collects nothing,
+        # and ends after 64 files.
+        forked = multiprocessing.get_context("fork")
+        with forked.Pool(jobs, initializer=gc.disable, maxtasksperchild=8) as pool:
             found = pool.map(checked, read, chunksize=8)
     else:
         found = [checked(file) for file in read]

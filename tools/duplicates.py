@@ -34,6 +34,7 @@ It runs the test environment's pylint, which pyproject.toml's test extra pins.
 import argparse
 import ast
 import contextlib
+import gc
 import hashlib
 import io
 import multiprocessing
@@ -428,7 +429,10 @@ def text_copies(files: list[Path], jobs: int) -> int:
     from pylint.checkers.symilar import Symilar  # its import alone takes seconds, which the structure skips
 
     if jobs > 1:
-        with multiprocessing.get_context("fork").Pool(jobs) as pool:
+        # pylint's parser leaves cycles a worker's collector would trace through everything the fork
+        # inherited, which tripled the stripping's time: a worker collects nothing, and ends after 64 files.
+        forked = multiprocessing.get_context("fork")
+        with forked.Pool(jobs, initializer=gc.disable, maxtasksperchild=8) as pool:
             read = pool.map(stripped, files, chunksize=8)
     else:
         read = [stripped(file) for file in files]
