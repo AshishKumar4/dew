@@ -94,7 +94,7 @@ def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles,
         wg = lax.axis_index("wg")
 
         @plgpu.nd_loop((grid[0] * grid[1],), collective_axes="sm", init_carry=jnp.int32(0))
-        def _(loop: plgpu.NDLoopInfo, carry):
+        def computed(loop: plgpu.NDLoopInfo, carry):
             mi, ni = plgpu.planar_snake(loop.index[0], grid, 1, tiles.grid_block_n)
             info = GroupInfo.create(lengths_gmem, block_m, mi)
             # The unrouted rows' group multiplies nothing, and a slot past the last tile has no rows; the
@@ -113,6 +113,15 @@ def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles,
             pl.when((wg == STORE) & (info.actual_size > 0))(functools.partial(
                 _stores, tile, sides, outs, scratch, epilogue, epilogue_axes, tiles=tiles, shape=shape))
             return carry + tile.computes.astype(jnp.int32)
+
+        # Each barrier's last completions, which no later turn waited for, observed, so every barrier
+        # ends at the phase its waiters saw: the stages' last releases and the accumulators' last stores.
+        @pl.when(wg == ISSUE)
+        def _():
+            @plgpu.warp_map
+            def _(warp):
+                pl.when(warp == LOAD_WARP)(lambda: _drain(scratch.consumed, computed * steps, stages))
+                pl.when(warp == MMA_WARP)(lambda: _drain(scratch.store_done, computed, 2))
 
     tensor_core = functools.partial(plgpu.Barrier, orders_tensor_core=True)
     scratch = (
@@ -250,6 +259,15 @@ def _stores(tile: _Tile, sides, outs, scratch: _Scratch, epilogue, epilogue_axes
 
     pl.when(~tile.computes)(lambda: store(lambda chunk: plgpu.layout_cast(
         jnp.zeros((tiles.block_m, chunk_n), jnp.float32), plgpu.Layout.TCGEN05)))
+
+
+def _drain(barriers, turns, slots: int) -> None:
+    """The completions of the last `slots` of `turns` turns taken round `barriers`, one a slot, which no
+    later turn of the slot waited for."""
+    for back in range(1, slots + 1):
+        turn = turns - back
+        slot = lax.rem(jnp.maximum(turn, 0), slots)
+        pl.when(turn >= 0)(functools.partial(plgpu.barrier_wait, barriers.at[slot]))
 
 def _epilogue(epilogue, acc, gmems, smems, barriers, axes_of, origins: dict, extent: dict) -> tuple:
     """`epilogue(acc, *side_tiles)` as a tuple of outputs, each side operand's tile at the chunk's rows and
