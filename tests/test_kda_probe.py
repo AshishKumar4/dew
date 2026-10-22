@@ -1,10 +1,11 @@
-"""Probe (not for landing): per-seed errors of the KDA gradient reference for the gate leaves."""
+"""Probe (not for landing): the spread of the KDA gate gradients' reference errors."""
+from functools import partial
+
 import jax
 import jax.numpy as jnp
 import numpy as np
 from reference_error import widened
-from test_kda import ROWS, S, E, layer_and_params, oracle_layer, oracle_params
-from functools import partial
+from test_kda import GROUPS, S, E, layer_and_params, oracle_layer, oracle_params
 from tools.kda_reference import oracle_chunk
 
 
@@ -12,15 +13,24 @@ def test_probe():
     def loss_oracle(x, p, cotangent):
         return jnp.sum(oracle_layer(x, p, -5.0, 1e-5, partial(oracle_chunk, chunk_size=4)) * cotangent)
 
-    theirs = jax.jit(lambda x, p, c: jax.grad(loss_oracle, argnums=(0, 1))(x, p, c)[1])
-    for seed in range(24):
-        rng = np.random.RandomState(seed)
-        params = oracle_params(layer_and_params(-5.0, seed=1000 + seed)[2])
-        x, cotangent = rng.randn(2, 8 * ROWS, S, E).astype(np.float32)
-        found = theirs(x, params, cotangent)
+    theirs = jax.jit(jax.vmap(lambda x, p, c: jax.grad(loss_oracle, argnums=(0, 1))(x, p, c)))
+    params = oracle_params(layer_and_params(-5.0)[2])
+    stacked = jax.tree.map(lambda leaf: np.broadcast_to(leaf, (GROUPS, *leaf.shape)), params)
+    errors = {name: [] for name in ("A_log", "dt_bias", "x")}
+    for seed in range(64):
+        x, cotangent = np.random.RandomState(seed).randn(2, GROUPS, 16, S, E).astype(np.float32)
+        gx, found = theirs(x, stacked, cotangent)
+        found = {"x": gx, **found}
         with jax.enable_x64(True):
-            truth = theirs(*widened((x, params, cotangent)))
-            for name in ("A_log", "dt_bias", "b_proj", "f_a_proj", "q_proj"):
+            tx, truth = theirs(*widened((x, stacked, cotangent)))
+            truth = {"x": tx, **truth}
+            for name in errors:
                 err = np.asarray(found[name], np.float64) - np.asarray(truth[name])
-                print("PROBE", seed, name, f"{np.sqrt(np.mean(err**2)):.3e}", f"{np.sqrt(np.mean(np.asarray(truth[name])**2)):.3e}",
-                      bool(np.isfinite(np.asarray(found[name])).all()), flush=True)
+                errors[name].append(np.sqrt(np.mean(err.reshape(GROUPS, -1) ** 2, axis=1)))
+    for name, values in errors.items():
+        values = np.concatenate(values)
+        q = np.quantile(values, [0.5, 0.9, 0.99, 1.0])
+        print("PROBE", name, " ".join(f"{v:.2e}" for v in q), f"mean2/median2 {np.mean(values**2)/np.median(values)**2:.1f}",
+              flush=True)
+        worst = np.argsort(values)[-5:]
+        print("PROBE worst", name, worst // GROUPS, worst % GROUPS, flush=True)
