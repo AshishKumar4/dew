@@ -221,8 +221,7 @@ def _forward_kernel(*refs, spec: algebra.Forward, score_kinds: tuple[Kind, ...],
         product = _dot(others, value, interpret)
         # The old anchor's value row, read only where the anchor moved: after a row's first tiles it
         # rarely does, and a masked load fetches nothing for the rest.
-        old_value = pl.load(value_ref, (arg.key, pl.ds(0, value_ref.shape[-1])), mask=moved[:, None],
-                            other=0)
+        old_value = plgpu.load(value_ref.at[arg.key, :], mask=moved[:, None], other=0)
         acc, own, others_total = algebra.split_accumulate(state.acc, own, others_total, alpha, moved,
                                                           old_value, product, others, own_tile)
         return algebra.Partial(acc, m, denominator), anchor, own, others_total
