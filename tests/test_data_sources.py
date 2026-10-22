@@ -1335,9 +1335,9 @@ def test_torch_source_reads_every_way_and_refuses_a_cache_without_content_identi
 
     from dew.data.cache import Cache
     from dew.data.plan import Manifest
-    from dew.data.sources import Torch
+    from dew.data.sources import from_torch
 
-    rows = Torch(TensorDataset(torch.arange(4)), fields=("id",))
+    rows = from_torch(TensorDataset(torch.arange(4)), ("id",))
     assert rows.supports("streamed")
     assert int(rows.records("indexed")[2]["id"]) == 2
     import grain.python as grain
