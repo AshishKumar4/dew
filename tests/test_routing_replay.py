@@ -76,10 +76,15 @@ def replayed_log_probs(obj, params, tokens, routes):
 def replay_draw(obj, batch: int):
     """Check 1's draw of a replay: a seed's parameters and tokens, and a record one expert off the
     router's own choice on every layer, so the replay moves each token."""
+    init = jax.jit(obj.init)
+    sown = jax.jit(lambda params, tokens: obj.token_scores(params, tokens, routing=True).routing)
+
     def draw(seed):
-        params = obj.init(jax.random.fold_in(jax.random.key(0), seed))
+        params = init(jax.random.fold_in(jax.random.key(0), seed))
         tokens = tokens_of(batch, seed=1000 + seed)
-        return params, tokens, (engine_layout(choices(obj, params, tokens), batch) + 1) % EXPERTS
+        chosen = {int(name.split('_')[1]): np.asarray(tree['mlp']['gate']['indices'][0])
+                  for name, tree in sown(params, tokens).items()}
+        return params, tokens, (engine_layout(chosen, batch) + 1) % EXPERTS
     return draw
 
 
@@ -177,6 +182,15 @@ def test_the_gate_keeps_its_gradient_under_replay():
         pair = jnp.concatenate([routed, (routed + 1) % EXPERTS], axis=-1)
         return params, tokens_of(2, seed=1000 + seed), pair
 
+    def forward(loss):
+        # A directional derivative a kernel entry at a time, looped: the experts' ragged product has
+        # no batching rule past its first dimension.
+        def run(kernel):
+            basis = jnp.eye(kernel.size, dtype=kernel.dtype).reshape(-1, *kernel.shape)
+            return jax.lax.map(lambda tangent: jax.jvp(loss, (kernel,), (tangent,))[1], basis).reshape(
+                kernel.shape)
+        return run
+
     def gradient(obj, differentiate):
         def run(params, tokens, routed):
             def loss(kernel):
@@ -189,8 +203,8 @@ def test_the_gate_keeps_its_gradient_under_replay():
 
     backward = gradient(obj, jax.grad)
     assert float(jnp.abs(backward(*draw(0))).sum()) > 0
-    assert_as_exact(backward, gradient(obj, jax.jacfwd), draw, "gate gradient", seeds=SEEDS['gate'],
-                    truth_fn=gradient(wide, jax.jacfwd))
+    assert_as_exact(backward, gradient(obj, forward), draw, "gate gradient", seeds=SEEDS['gate'],
+                    truth_fn=gradient(wide, forward))
 
 
 @pytest.mark.parametrize("parallel", [False, True], ids=["router", "gemma4"])
@@ -256,22 +270,22 @@ def test_tokens_without_a_record_keep_the_routers_own_choice():
     np.testing.assert_array_equal(replayed[0][:, 5:], native[0][:, 5:])
 
 
-@pytest.mark.parametrize("layout", [Layout(min_shard=1, tolerance=1.0),
-                                    Layout(min_shard=1, tolerance=1.0, host_parameters=("params/layers_*",))],
-                         ids=["device", "host"])
-def test_replay_on_banked_weights_scores_as_on_the_plain_tree(layout):
+@pytest.mark.parametrize("where", ["device", "host"])
+def test_replay_on_banked_weights_scores_as_on_the_plain_tree(where):
     """A store banked by run, resident or in pinned host memory, is read by
     the prefetch loop one layer at a time; the replay reaches each layer the
     same way and scores what the plain tree scores."""
+    layout = Layout(min_shard=1, tolerance=1.0,
+                    host_parameters=("params/layers_*",) if where == "host" else ())
     plain = objective()
     banked = objective(scan=True, bank_layers=2)
     draw = replay_draw(plain, 2)
+    scored = jax.jit(lambda store, tokens, routed: replayed_log_probs(banked, store, tokens, (routed, None)))
 
     def from_banks(params, tokens, routed):
-        store = HeldBanks(params).place(banked.model, layout=layout)
-        return np.asarray(replayed_log_probs(banked, store, tokens, (routed, None)))
+        return np.asarray(scored(HeldBanks(params).place(banked.model, layout=layout), tokens, routed))
 
-    assert_as_exact(from_banks, replayed(plain), draw, f"{layout} banked replay", seeds=SEEDS['banked'],
+    assert_as_exact(from_banks, replayed(plain), draw, f"{where} banked replay", seeds=SEEDS['banked'],
                     truth_fn=replayed(objective(dtype=jnp.float64)))
     params, tokens, routed = draw(0)
     native = plain.per_token_log_probs(params, tokens)
