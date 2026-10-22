@@ -739,8 +739,8 @@ class MosaicTgmm(_Mosaic):
     def space(self, ba) -> tuple[mosaic_gpu.Tiles, ...]:
         depth, width = ba.arguments['tokens'].shape[1], ba.arguments['cotangent'].shape[1]
         # A pair takes two depth tiles of one group.
-        return tuple(tile for tile in _modelled(ba)
-                     if depth % (tile.block_m * tile.cluster) == 0 and width % tile.block_n == 0)
+        return base.dividing(_modelled(ba), (depth, width),
+                             lambda tile: (tile.block_m * tile.cluster, tile.block_n))
 
     def fitting(self, ba, target) -> tuple[mosaic_gpu.Tiles, ...]:
         """The tiles that fit `target` (`Template.fitting`), with `exact_sums` those whose two fp32
