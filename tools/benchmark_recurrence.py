@@ -215,7 +215,14 @@ def _failure(error: BaseException) -> str:
 
 
 def torch_arm(name: str, shape: Shape, arm: str, warmup: int, repeats: int) -> dict:
-    """fla's, FlashQLA's or mamba_ssm's kernels on `shape`, timed by CUDA events."""
+    """fla's, FlashQLA's or mamba_ssm's kernels on `shape`, timed by CUDA events. fla's arm runs fla's own
+    Triton kernels: fla dispatches its gated delta rule to FlashQLA where that is installed and the GPU
+    takes it (`fla.ops.gated_delta_rule.backends.flash_qla`), which `FLA_DISABLE_BACKEND_DISPATCH` turns
+    off before fla is imported. An arm whose kernels refuse this GPU records the refusal."""
+    import os
+
+    if arm == 'fla':
+        os.environ['FLA_DISABLE_BACKEND_DISPATCH'] = '1'
     import torch
 
     given = {key: torch.tensor(value, device='cuda') for key, value in operands(shape).items()}
@@ -231,7 +238,12 @@ def torch_arm(name: str, shape: Shape, arm: str, warmup: int, repeats: int) -> d
 
         cotangents = (given['dy'].to(bf16), given['dfinal'])
     elif arm == 'flashqla':
-        from flash_qla import chunk_gated_delta_rule as rule
+        major, minor = torch.cuda.get_device_capability()
+        try:
+            from flash_qla import chunk_gated_delta_rule as rule
+        except ValueError as error:  # FlashQLA refuses an architecture it has no kernels for at import
+            return {'shape': name, 'arm': arm, 'length': shape.length, 'device': torch.cuda.get_device_name(),
+                    'fwd_ms': None, 'fwd_bwd_ms': None, 'error': f"refuses sm{major}{minor}: {error}"}
 
         leaves = [given['q'].to(bf16), given['k'].to(bf16), given['v'].to(bf16), given['g'],
                   given['beta'].to(bf16)]
