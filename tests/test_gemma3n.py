@@ -24,47 +24,25 @@ _probe_model = []
 
 def assert_as_exact(dew_fn, reference_fn, draw, label, *, seeds, truth_fn=None):
     import time
-    per = {}
+    per, power = {}, {}
     started = time.time()
     for seed in range(48):
         inputs = draw(seed)
         found = reference_fn(*inputs)
         truth = truth_fn(*inputs)
         for name in found:
-            err = np.mean((np.asarray(found[name], np.float64) - np.asarray(truth[name], np.float64)) ** 2)
+            want = np.asarray(truth[name], np.float64)
+            err = np.mean((np.asarray(found[name], np.float64) - want) ** 2)
             per.setdefault(name, []).append(err)
+            power.setdefault(name, []).append(float(np.mean(want ** 2)))
     print(f"TAILTIME {label} {time.time() - started:.0f}s", flush=True)
-    import flax.linen as fnn
-    from model_support import gate_margin  # noqa: F401
-    model, variables = _probe_model[0], _probe_model[1]
-
-    def norms_of(tokens):
-        seen = {}
-
-        def record(next_fun, args, kwargs, context):
-            module = context.module
-            if context.method_name == "__call__" and type(module).__name__ == "RMSNorm" and args:
-                x = np.asarray(args[0], np.float64)
-                rms = np.sqrt(np.mean(x * x, axis=-1))
-                name = "/".join(str(p) for p in module.scope.path[-3:])
-                seen.setdefault(name, []).append(float(rms.min() / np.median(rms)))
-            return next_fun(*args, **kwargs)
-
-        with fnn.intercept_methods(record):
-            model.apply(variables, jnp.asarray(tokens), train=True)
-        return {name: min(v) for name, v in seen.items()}
-
-    table = {}
-    for seed in range(48):
-        rows = draw(seed)[0]
-        for name, value in norms_of(rows[:, :-1]).items():
-            table.setdefault(name, []).append(value)
-    worst = sorted(((min(v), name, int(np.argmin(v))) for name, v in table.items()))[:12]
-    for value, name, seed in worst:
-        print(f"NORM {name} min rms/median {value:.2e} at seed {seed}; seed 22 {table[name][22]:.2e} seed 41 {table[name][41]:.2e} median {np.median(table[name]):.2e}", flush=True)
     rows = sorted(((max(v) / np.median(v), name, len(v)) for name, v in per.items() if np.median(v) > 0), reverse=True)
-    for spread, name, n in rows[:10]:
-        print(f"TAIL {label} {name} max/median {spread:.1f} worst seed {int(np.argmax(per[name]))}", flush=True)
+    for spread, name, n in rows[:8]:
+        worst = int(np.argmax(per[name]))
+        rel = np.asarray(per[name]) / np.asarray(power[name])
+        print(f"TAIL {label} {name} max/median {spread:.1f} worst seed {worst}; its truth power / median "
+              f"{power[name][worst] / np.median(power[name]):.2f}; relative error there / median "
+              f"{rel[worst] / np.median(rel):.1f}", flush=True)
 
 from dew.nn.gemma3n import AltUp, AltUpLayer, LaurelBlock
 from dew.nn.mlp import GatedMLP, gaussian_topk
