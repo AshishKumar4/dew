@@ -653,3 +653,33 @@ def test_a_hook_through_a_custom_vjp_lowers_and_compiles_on_tritons_compiler(tar
     assert len(found) == 2
     assert not failures(found), "\n".join(failures(found))
     assert all(record["shared"] > 0 for record in found), found
+
+
+@pytest.mark.parametrize("target", ["sm80", "sm90"])
+def test_the_accurate_form_lowers_and_compiles_on_tritons_compiler(target):
+    """The accurate form (`natural`) from sinks: its forward with residuals (the plain launch that flags
+    overflowing rows, the one that walks them again, the normalized pass) and its backward, lowered as on
+    the GPU and compiled by XLA's CUDA backend for a compile-only device on this CPU
+    (tests/kernel_compile.py): the interpreted suite lowers none of them, and a constant the algebra
+    splits must reach no bitcast Pallas Triton cannot lower (`precision.two_product`)."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_kernels, failures
+
+    spans = template.spans(256, 256, 1, causal=True)
+    hooks = template.Hooks(initial=template.sinks(jnp.asarray([0.5, -1.0], jnp.float32), 1, 256, 64))
+    shape = jax.ShapeDtypeStruct((1, 256, 2, 64), jnp.bfloat16)
+    pins = {attention_triton.TritonForward: PINNED[0], attention_triton.TritonBackward: joint(PINNED[0])}
+
+    def forward(query, key, value):
+        with tuning.pinned(pins):
+            return attention_triton.forward(query, key, value, spans, hooks, residuals=True, natural=True)
+
+    def backward(query, key, value, dout):
+        with tuning.pinned(pins):
+            grads = attention_triton.backward(query, key, value, spans, hooks, dout, natural=True)
+        return grads.query, grads.key, grads.value, grads.initial
+
+    found = compile_kernels([KernelCase("forward", lambda: (forward, (shape,) * 3)),
+                             KernelCase("backward", lambda: (backward, (shape,) * 4))], target)
+    assert len(found) >= 2
+    assert not failures(found), "\n".join(failures(found))
