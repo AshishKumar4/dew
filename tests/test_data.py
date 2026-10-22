@@ -31,7 +31,7 @@ from dew.data.image_codec import decode_image
 from dew.data.images import EncodeCaptions
 from dew.data.pipeline import Pipeline
 from dew.data.sinks import export
-from dew.data.sources import Source, Torch, source as stored_source
+from dew.data.sources import Source, from_torch, source as stored_source
 from dew.data.steps.generic import Formatting
 from dew.objectives.base import VALID_ROWS
 from dew.position import ENVELOPE
@@ -1073,7 +1073,7 @@ def test_columns_rows_and_a_torch_dataset_are_the_same_records():
 
     first, *others = (next(data.train(DataPartition())) for data in (
         _records(columns), _records(rows),
-        _records(Torch(tensors, fields=("index", "x"), identity="columns@1"))))
+        _records(from_torch(tensors, ("index", "x"), identity="columns@1"))))
 
     assert first["x"].shape == (4, 2) and first["x"].dtype == np.float32
     for other in others:
@@ -1089,7 +1089,7 @@ def test_a_torch_dataset_streams_the_records_it_indexes_and_resumes():
     import torch
 
     tensors = torch.utils.data.TensorDataset(torch.arange(12))
-    source = Torch(tensors, fields=("index",), identity="indices@1")
+    source = from_torch(tensors, ("index",), identity="indices@1")
     reading = Loading(workers=0, threads=1, read_buffer=0, worker_buffer=1)
     from dew.data.compile import validation
     from dew.data.pipeline import Pipeline
@@ -1125,15 +1125,15 @@ def test_a_torchvision_style_dataset_reads_its_tuples_as_named_fields():
         def __getitem__(self, index):
             return Image.fromarray(np.full((5, 5, 3), index, np.uint8)), index
 
-    batch = next(_held_records(Torch(Pictures(), fields=("image", "label"), identity="pictures@1"))(
+    batch = next(_held_records(from_torch(Pictures(), ("image", "label"), identity="pictures@1"))(
         DataPartition()))
 
     assert batch["image"].shape == (4, 5, 5, 3) and batch["image"].dtype == np.uint8
     np.testing.assert_array_equal(batch["image"][:, 0, 0, 0], batch["label"])
     with pytest.raises(TypeError):
-        _records(Torch(Pictures()))
+        _records(from_torch(Pictures()))
     with pytest.raises(TypeError):
-        _records(Torch(torch.utils.data.DataLoader(Pictures())))
+        _records(from_torch(torch.utils.data.DataLoader(Pictures())))
 
 
 def test_columns_of_different_lengths_are_refused_by_name():
@@ -1254,3 +1254,42 @@ def test_a_run_over_records_in_memory_checkpoints_and_resumes_where_it_stopped(t
     for expected, actual in zip(jax.tree.leaves(whole.variables),
                                 jax.tree.leaves(resumed.variables), strict=True):
         np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
+
+
+def test_a_batch_encoders_reader_is_part_of_the_plan_a_resume_checks():
+    """A batch encoder names the reader it runs in the run's plan: a run resumed with the same reader
+    reads on as it did, and one given another reader, the same words handed back by another
+    function, is refused before it reads."""
+
+    def run(reader):
+        rows = Pipeline(Memory(_Images(16))).shuffle(3).repeat()
+        caption = images.caption(templates=CAPTION_TEMPLATES, classes=_CLASSES)
+        pictures = presets.images(rows, 8, batch=4, augment=False, rejects=False, caption=caption,
+                                  host=(EncodeCaptions(reader),))
+        return compile(pictures, read="indexed", seed=3, **WORKERS).train(DataPartition())
+
+    stream = run(keep_captions)
+    try:
+        next(stream)
+        saved = stream.get_state()
+        expected = _rows(next(stream))
+    finally:
+        stream.close()
+    resumed = run(keep_captions)
+    try:
+        resumed.set_state(saved)
+        assert _rows(next(resumed)) == expected
+    finally:
+        resumed.close()
+    other = run(_captions_again)
+    try:
+        with pytest.raises(ValueError):
+            other.set_state(saved)
+    finally:
+        other.close()
+
+
+def _captions_again(captions):
+    """The words a batch's captions hold, handed back as `keep_captions` hands them: another reader
+    of the same output."""
+    return {"caption": np.asarray(captions)}

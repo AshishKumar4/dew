@@ -78,19 +78,24 @@ class _Stream(grain.IterDataset):
         self._source = source
 
     def __iter__(self) -> grain.DatasetIterator:
-        return _StreamIterator(self._source)
+        source = self._source
+        return _StreamIterator(source.factory, source.describe(), state=source.state,
+                               load_state=source.load_state, replay=source.replay)
 
 
-class _StreamIterator(grain.DatasetIterator):
-    """The iterator `source.factory` makes, its position the iterator's own
-    state, its replay (`Replayed`), or for neither the count of records read,
-    from which it cannot resume."""
+class _StreamIterator[Rows: Iterator[Batch]](grain.DatasetIterator):
+    """The iterator `factory` makes, read as the stream `label` names, its position the iterator's
+    own (`state`, restored by `load_state`), its replay (`Replayed`), or for neither the count of
+    records read, from which it cannot resume: an iterator store's (`Iterated`) and a Hugging Face
+    stream's (`hf._Streamed`)."""
 
-    def __init__(self, source: Iterated):
+    def __init__(self, factory: Callable[[], Rows], label: str, *,
+                 state: Callable[[Rows], Value] | None = None,
+                 load_state: Callable[[Rows, Value], None] | None = None, replay: bool = False):
         super().__init__()
         self._closed = True
-        self._source = source
-        self._rows = Replayed(source.factory) if source.replay else source.factory()
+        self._factory, self._label, self._state, self._load_state = factory, label, state, load_state
+        self._rows: Rows | Replayed = Replayed(factory) if replay else factory()
         # The records read, which the position of a stream that does not replay carries.
         self._read = 0
         self._closed = False
@@ -105,7 +110,7 @@ class _StreamIterator(grain.DatasetIterator):
     def get_state(self) -> Mapping[str, object]:
         if isinstance(self._rows, Replayed):
             return self._rows.get_state()
-        state = self._source.state
+        state = self._state
         if state is None:
             return {"read": self._read}
         # Through the artifact codec, so arrays, NumPy scalars and bytes reach load_state as they were.
@@ -116,21 +121,21 @@ class _StreamIterator(grain.DatasetIterator):
         if isinstance(self._rows, Replayed):
             self._rows.set_state(state)
             return
-        if self._source.load_state is None:
+        if self._load_state is None:
             raise ValueError(
-                f"{self._source.describe()} keeps no position and declares no replay, so it cannot "
+                f"{self._label} keeps no position and declares no replay, so it cannot "
                 f"resume; pass replay=True if it reads the same records each time it opens, or "
                 f"state= and load_state=")
-        read, saved = state["read"], state.get("state")
+        read, saved = state.get("read"), state.get("state")
         if not isinstance(read, int) or read < 0:
             raise ValueError(f"an iterator's position is the count of records it read, not {read!r}")
         if not isinstance(saved, str):
             raise ValueError("this iterator resumes through load_state, and its position holds no state")
         position = decode(base64.b64decode(saved))
         self.close()
-        self._rows = self._source.factory()
-        self._closed = False
-        self._source.load_state(self._rows, position)
+        rows = self._factory()
+        self._rows, self._closed = rows, False
+        self._load_state(rows, position)
         self._read = read
 
     def request_stop(self) -> None:
@@ -144,6 +149,7 @@ class _StreamIterator(grain.DatasetIterator):
             if isinstance(self._rows, Closeable):
                 self._rows.close()
         finally:
+            self._closed = True
             super().close()
 
 

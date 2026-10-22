@@ -10,6 +10,7 @@ that write every tensor back, so `Pretrained.save` restores what it read.
 
 from __future__ import annotations
 
+import dataclasses
 import json
 import os
 from collections.abc import Callable, Mapping, Sequence
@@ -1135,11 +1136,11 @@ class _Built(NamedTuple):
     export_adapter: Callable[..., Mapping[str, np.ndarray]] | None = None
 
 
-def _wrapper_source(config: Mapping[str, object], tensors: Mapping[str, np.ndarray], directory: Path, *,
-                    dtype: str, attention_impl: str, max_seq_len: int | None, param_dtype: str,
-                    lazy: bool) -> _Built:
-    """A multimodal wrapper: the decoder under its text_config and the towers beside it."""
-    record = decoders.translate_wrapper_config(config)
+def _wrapper_source(config: Mapping[str, object], record: decoder_parts.WrapperFields,
+                    tensors: Mapping[str, np.ndarray], directory: Path, *, dtype: str, attention_impl: str,
+                    max_seq_len: int | None, param_dtype: str, lazy: bool) -> _Built:
+    """A multimodal wrapper, `record` its translated config: the decoder under its text_config and the
+    towers beside it."""
     text_fields = _wrapper_text_fields(config, record, max_seq_len)
     parts, language, media = decoders.read_wrapper(tensors, record, param_dtype=param_dtype, lazy=lazy)
     for fields in (text_fields, record['text']):
@@ -1152,6 +1153,39 @@ def _wrapper_source(config: Mapping[str, object], tensors: Mapping[str, np.ndarr
         parts["language_model"], record["text"], directory)})
     layouts, retained = _wrapper_layouts(tensors, record, variables, language, media)
     return _Built(model, variables, record, wrapper, layouts, retained)
+
+
+@dataclasses.dataclass(frozen=True)
+class SourceRoute:
+    """How `Pretrained.load` reads a source, decided on its config alone before any weight downloads
+    (`source_route`): `kind` names the reader, a registered decoder family's (`'decoder'`), a media
+    wrapper's (`'wrapper'`), DiffusionGemma's (`'diffusion_gemma'`) or a registered family's verified
+    convention (`'verified'`, tier 2, `dew.interop.verify`); `record` is a decoder's translated
+    config, `wrapper` a wrapper's, and `verified` the verified mapping."""
+
+    kind: Literal["decoder", "wrapper", "diffusion_gemma", "verified"]
+    record: decoder_parts.DecoderFields | None = None
+    wrapper: decoder_parts.WrapperFields | None = None
+    verified: verify.VerifiedMapping | None = None
+
+
+def source_route(config: Mapping[str, object], *,
+                 verified: Callable[[Mapping[str, object]], verify.VerifiedMapping] = verify.verify_mapping
+                 ) -> SourceRoute:
+    """The route `Pretrained.load` reads `config`'s source by, or the refusal it raises for it, on the
+    config alone: a storage format the codecs cannot decode, a registered family's or wrapper's own
+    refusal of the config (`decoder_parts.DrafterRefused` among them), or an unregistered model_type
+    no registered family's convention computes. `verified` checks an unregistered decoder against
+    transformers (`verify.verify_mapping`); a census over many configs passes a memo of it."""
+    source_quantization(config)
+    family = config.get("model_type")
+    if family == "diffusion_gemma":
+        return SourceRoute("diffusion_gemma")
+    if _media_wrapper(config):
+        return SourceRoute("wrapper", wrapper=decoders.translate_wrapper_config(config))
+    if isinstance(family, str) and family not in decoders.families():
+        return SourceRoute("verified", verified=verified(config))
+    return SourceRoute("decoder", decoders.translate_config(config))
 
 
 def _media_wrapper(config: Mapping[str, object]) -> bool:
@@ -1186,12 +1220,15 @@ def _spelled_source_weights(spelling: Mapping[str, str], model: CausalTransforme
 
 
 def _decoder_source(config: Mapping[str, object], tensors: Mapping[str, np.ndarray], directory: Path,
-                    verified: verify.VerifiedMapping | None, *, dtype: str, attention_impl: str,
+                    route: SourceRoute, *, dtype: str, attention_impl: str,
                     max_seq_len: int | None, param_dtype: str, lazy: bool, quantized: bool) -> _Built:
-    """A decoder of a registered family, or of one it was verified as (tier 2).
+    """A decoder of a registered family, or of one it was verified as (tier 2), as `route` read it.
     `quantized` says the source ships weights in a quantization format."""
+    verified = route.verified
     if verified is None:
-        record = decoders.translate_config(config)
+        assert route.record is not None
+        # The route's record is its own; this load edits a copy of it.
+        record = NativeFields(CausalTransformer, route.record)
         # translate_config refused every model_type but a registered family's name.
         family = records.text(config.get("model_type"), "model_type")
     else:
@@ -1262,22 +1299,18 @@ def _load_native_source(name_or_dir: str | Path, directory: Path, commit: str | 
     if mamba_ssm:
         config = mamba2.config_from_mamba_ssm(config)
     family = config.get("model_type")
-    # Before any weight downloads: a format the codec cannot read is refused
-    # on the config alone.
-    source_quantization(config)
-    # An unregistered decoder is checked against transformers on the config
-    # alone, before its weights download (tier 2, dew.interop.verify).
-    verified = (verify.verify_mapping(config) if isinstance(family, str) and family not in decoders.families()
-                and family != "diffusion_gemma" and "text_config" not in config else None)
+    # Before any weight downloads, on the config alone: a format the codec cannot read, a family's
+    # refusal, an unregistered decoder checked against transformers (tier 2).
+    route = source_route(config)
     if tensors is None:
         directory = sources.snapshot(str(name_or_dir), directory.name)
         tensors = sources.load_shards(directory)
     if mamba_ssm:
         tensors = mamba2.tensors_from_mamba_ssm(tensors)
-    media = _media_wrapper(config)
     tensors, quantized_tensors, scale_dtype, grid = _decoded(
-        tensors, config, declared_dtype(config, tensors) if param_dtype == AUTO else param_dtype, media=media)
-    if family == "diffusion_gemma":
+        tensors, config, declared_dtype(config, tensors) if param_dtype == AUTO else param_dtype,
+        media=route.kind == "wrapper")
+    if route.kind == "diffusion_gemma":
         from dew.interop import diffusion_gemma
 
         model = diffusion_gemma.build(
@@ -1287,13 +1320,13 @@ def _load_native_source(name_or_dir: str | Path, directory: Path, commit: str | 
         record, layouts, retained = config, (), {}
         built: Mapping[str, object] = {**config, "dtype": dtype, "attention_impl": attention_impl}
         export_adapter = diffusion_gemma.export_weights
-    elif media:
+    elif route.wrapper is not None:
         model, variables, record, built, layouts, retained, export_adapter = _wrapper_source(
-            config, tensors, directory, dtype=dtype, attention_impl=attention_impl, max_seq_len=max_seq_len,
-            param_dtype=param_dtype, lazy=streaming)
+            config, route.wrapper, tensors, directory, dtype=dtype,
+            attention_impl=attention_impl, max_seq_len=max_seq_len, param_dtype=param_dtype, lazy=streaming)
     else:
         model, variables, record, built, layouts, retained, export_adapter = _decoder_source(
-            config, tensors, directory, verified, dtype=dtype, attention_impl=attention_impl,
+            config, tensors, directory, route, dtype=dtype, attention_impl=attention_impl,
             max_seq_len=max_seq_len, param_dtype=param_dtype, lazy=streaming,
             quantized=source_quantization(config) is not None)
     model, variables = _input_quantization(model, variables, layouts, config, grid)
