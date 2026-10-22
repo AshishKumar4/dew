@@ -42,6 +42,7 @@ from dew.inference.banks import LayerBanks, at_namespace, in_namespace, narrowed
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.base import Variables
 from dew.registry import models
+from dew.telemetry.benchmark import resident_memory
 from dew.training import Layout, MeshSpec
 from dew.training.distributed import Placement
 
@@ -139,14 +140,8 @@ class SyntheticBanks(LayerBanks):
 
 def status() -> dict[str, int]:
     """This process's resident memory, in bytes, as the kernel reports it."""
-    wanted = {"VmRSS": "rss", "RssAnon": "rss_anon", "VmHWM": "rss_peak"}
-    values = {}
-    with open("/proc/self/status") as handle:
-        for line in handle:
-            name, _, rest = line.partition(":")
-            if name in wanted:
-                values[wanted[name]] = int(rest.split()[0]) * 1024
-    return values
+    memory = resident_memory()
+    return {"rss": memory["VmRSS"], "rss_anon": memory["RssAnon"], "rss_peak": memory["VmHWM"]}
 
 
 def plan(compiled) -> dict[str, int]:
