@@ -96,7 +96,8 @@ def seconds(cost: Cost, target: generation.GpuTarget) -> float:
 
 def program_seconds(cost: Cost, rate: float, clock: float) -> float:
     """One program's service time on a multiprocessor: its tensor-core, shared-memory or special-function
-    work, whichever takes longest at `rate` tensor FLOPs a clock and `clock` Hz (the module's docstring)."""
+    work, whichever takes longest at `rate` tensor FLOPs a clock and `clock` Hz, plus its serial work (the
+    module's docstring)."""
     return (max(cost.program_flops / (rate * clock),
                 cost.program_staged / (SHARED_BYTES_PER_CLOCK * clock),
                 cost.program_exponentials / (EXPONENTIALS_PER_CLOCK * clock))
