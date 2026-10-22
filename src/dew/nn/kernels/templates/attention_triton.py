@@ -201,10 +201,14 @@ def _forward_kernel(*refs, spec: algebra.Forward, score_kinds: tuple[Kind, ...],
                        for ref, kind in zip(score_refs, score_kinds, strict=True))
         logits = algebra.modify(spec, _dot(query, key_ref[tile, :].T, interpret), coords, params)
         m, alpha = algebra.peak(spec, state.m, logits)
-        # The values load after the softmax, where jax's mha loads them; the weights take the row's shift
-        # their sizes need (`algebra.room`).
+        weights = algebra.weights(spec, logits, m)
+        # The values load after the softmax, where jax's mha loads them; on the guarded walk the weights
+        # take the row's shift their sizes need (`algebra.room`).
         value = value_ref[tile, :]
-        weights, factor, shift, reach = algebra.room(state, alpha, algebra.weights(spec, logits, m), value)
+        if state.shift is None:
+            denominator = algebra.total(state.total, alpha, weights)
+            return tile, coords, logits, m, alpha, weights, value, (denominator,)
+        weights, factor, shift, reach = algebra.room(state, alpha, weights, value)
         denominator = algebra.total(state.total, factor, weights)
         return tile, coords, logits, m, factor, weights, value, (denominator, shift, reach)
 
@@ -227,22 +231,33 @@ def _forward_kernel(*refs, spec: algebra.Forward, score_kinds: tuple[Kind, ...],
                                                           value_ref[arg.key, :], product, others, own_tile)
         return algebra.Partial(acc, m, *sums), anchor, own, others_total
 
-    start = (algebra.resumed(spec, *(ref[...] for ref in initial_refs)) if initial
-             else algebra.empty(block_q, value_ref.shape[-1]))
+    def start(*, shifted: bool) -> algebra.Partial:
+        if initial:
+            return algebra.resumed(spec, *(ref[...] for ref in initial_refs), shifted=shifted)
+        empty = algebra.empty(block_q, value_ref.shape[-1])
+        return algebra.headroomed(empty) if shifted else empty
+
+    def walk(*, shifted: bool):
+        if not residuals:
+            return jax.lax.fori_loop(lo, hi, step, start(shifted=shifted))
+        nothing = jnp.zeros((block_q,), jnp.float32)
+        carry = start(shifted=shifted), algebra.no_argmax(block_q), nothing, nothing
+        return jax.lax.fori_loop(lo, hi, tracked, carry)
+
     output_params = tuple(_tile_param(ref, kind, head, q_pos, None)
                           for ref, kind in zip(output_refs, output_kinds, strict=True))
+    plain, shifted = functools.partial(walk, shifted=False), functools.partial(walk, shifted=True)
+    walked = algebra.guarded(plain, shifted) if spec.headroom else plain()
     if residuals:
-        nothing = jnp.zeros((block_q,), jnp.float32)
-        carry = start, algebra.no_argmax(block_q), nothing, nothing
-        split, arg, own, others_total = jax.lax.fori_loop(lo, hi, tracked, carry)
+        split, arg, own, others_total = walked
         residual_refs[2][...] = arg.key
         residual_refs[3][...] = split.acc
         residual_refs[4][...] = own
         residual_refs[5][...] = others_total
-        residual_refs[6][...] = split.shift
+        residual_refs[6][...] = jnp.zeros_like(own) if split.shift is None else split.shift
         state = split._replace(acc=algebra.split_output(split.acc, own, value_ref[arg.key, :]))
     else:
-        state = jax.lax.fori_loop(lo, hi, step, start)
+        state = walked
     out, m, denominator = algebra.finish(spec, state, initial=initial, output_mod=output_mod,
                                          output_params=output_params)
     out_ref[...] = out.astype(out_ref.dtype)
@@ -324,7 +339,8 @@ class TritonForward(Template[Tiles]):
             out_specs += [per_row, per_row, per_row, per_value, per_row, per_row, per_row]
         # A call's own key count, none included; an op built without one counts its launch's keys.
         spec = algebra.Forward(self.form, keys if self.keys is None else self.keys, ids, self.scale,
-                               self.score_mod, self.natural)
+                               self.score_mod, self.natural,
+                               algebra.headroom(value.dtype, keys, initial))
         kernel = functools.partial(
             _forward_kernel, spec=spec, score_kinds=self.score_kinds, output_kinds=self.output_kinds,
             initial=initial, residuals=residuals, output_mod=self.output_mod, block_k=block_k,
