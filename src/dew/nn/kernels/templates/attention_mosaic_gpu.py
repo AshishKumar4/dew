@@ -91,9 +91,11 @@ def _forward(query, key, value, *, spec: algebra.Forward, tiles: Tiles, interpre
     batch, queries, heads, width = query.shape
     keys, kv_heads, value_width = key.shape[1], key.shape[2], value.shape[-1]
     group = heads // kv_heads
-    block_q, block_k, stages = tiles.block_q, tiles.block_k, tiles.stages
+    block_q, block_k = tiles.block_q, tiles.block_k
     pair = CONSUMERS * block_q
     steps = keys // block_k
+    # No more stages than key tiles: a stage past them would load past the keys.
+    stages = min(tiles.stages, steps)
     causal = spec.form == "causal"
     dtype = query.dtype
 
