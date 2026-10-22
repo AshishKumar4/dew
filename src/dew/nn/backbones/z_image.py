@@ -30,7 +30,7 @@ from dew.nn.attention import RMSNorm
 from dew.nn.blocks import sinusoidal_time
 from dew.nn.dense import Dense
 from dew.nn.flops import MissingFlopsCount, matching_lengths, patch_lengths, projection_flops
-from dew.nn.precision import at_least_fp32
+from dew.nn.precision import at_least_fp32, float32_dot_general
 from dew.nn.rope import axis_tables
 from dew.nn.scan_orders import patchify, unpatchify
 from dew.nn.sharding import logical_axes
@@ -123,7 +123,7 @@ class ZImageBlock(nn.Module):
             x = x + norm("attention_norm2")(attention(norm("attention_norm1")(x)))
             return x + norm("ffn_norm2")(feed_forward(norm("ffn_norm1")(x)))
         modulated = Dense(self.modulation_features, dtype=self.dtype, precision=self.precision,
-                          name="modulation")(embedded)[:, None]
+                          name="modulation", dot_general=float32_dot_general)(embedded)[:, None]
         scale, gate, scale_mlp, gate_mlp = jnp.split(modulated, 4, axis=-1)
         attended = attention(norm("attention_norm1")(x) * (1 + scale))
         x = x + jnp.tanh(gate) * norm("attention_norm2")(attended)
@@ -210,9 +210,9 @@ class ZImageTransformer(nn.Module):
         features = sinusoidal_time(source_time, FREQUENCIES, dtype=width).astype(dtype)
         maps = self.projections(0, 0)
         hidden = Dense(maps['t_embedder_1'][1], dtype=self.dtype, precision=self.precision,
-                       name="t_embedder_1")(features)
+                       name="t_embedder_1", dot_general=float32_dot_general)(features)
         return Dense(maps['t_embedder_2'][1], dtype=self.dtype, precision=self.precision,
-                     name="t_embedder_2")(nn.silu(hidden))
+                     name="t_embedder_2", dot_general=float32_dot_general)(nn.silu(hidden))
 
     @nn.compact
     def __call__(self, x, time, conditioning: DenoisingCondition, train: bool = False):
@@ -245,13 +245,13 @@ class ZImageTransformer(nn.Module):
         pad_caption = self.param("cap_pad_token", nn.initializers.zeros, (1, self.dim))
         maps = self.projections(x.shape[-1], conditioning.context.shape[-1])
         image = Dense(maps['x_embedder'][1], dtype=self.dtype, precision=self.precision,
-                      name="x_embedder")(patchify(x, 2))
+                      name="x_embedder", dot_general=float32_dot_general)(patchify(x, 2))
         image = jnp.concatenate(
             [image, jnp.broadcast_to(pad_image.astype(image.dtype), (batch, image_span - count, self.dim))],
             axis=1,
         )
         caption = Dense(maps['cap_embedder'][1], dtype=self.dtype, precision=self.precision,
-                        name="cap_embedder")(
+                        name="cap_embedder", dot_general=float32_dot_general)(
             RMSNorm(epsilon=self.norm_eps, dtype=self.dtype, name="cap_norm")(context))
         caption = jnp.where(mask[..., None], caption, pad_caption.astype(caption.dtype))
 
@@ -285,9 +285,10 @@ class ZImageTransformer(nn.Module):
                 joined, rotation, image_span + spans, embedded)
 
         scale = 1 + Dense(maps['final_modulation'][1], dtype=self.dtype, precision=self.precision,
-                          name="final_modulation")(nn.silu(embedded))[:, None]
+                          name="final_modulation",
+                          dot_general=float32_dot_general)(nn.silu(embedded))[:, None]
         out = Dense(maps['final_linear'][1], dtype=self.dtype, precision=self.precision,
-                    name="final_linear")(
+                    name="final_linear", dot_general=float32_dot_general)(
             layer_norm(self.dtype)(joined[:, :count]) * scale)
         return -unpatchify(out, 2, *x.shape[1:])
 

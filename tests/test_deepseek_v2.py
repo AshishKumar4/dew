@@ -13,6 +13,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from interop_support import fixture_arrays
 from moe_support import by_expert, router_variables
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -27,8 +28,7 @@ CONFIG = json.loads((FIXTURES / "config.json").read_text())["deepseek_v2"]
 
 
 def fixture() -> dict:
-    with np.load(FIXTURES / "deepseek_v2.npz") as data:
-        return {key: np.asarray(value) for key, value in data.items()}
+    return fixture_arrays(FIXTURES / "deepseek_v2.npz")
 
 
 def v2_router(normalize_weights: bool = CONFIG["norm_topk_prob"],

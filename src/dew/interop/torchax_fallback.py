@@ -44,6 +44,7 @@ from dew.interop.generation_config import read_generation_config
 from dew.interop.pickles import host_view
 from dew.interop.pretrained import PretrainedFallback, source_processor
 from dew.interop.weights import AUTO
+from dew.nn.precision import configured_precision, float32_products
 from dew.nn.protocols import OutputTable
 from dew.nn.sharding import LogicalAxes, Suffix, parameter_path
 from dew.registry import resolve_dtype
@@ -138,10 +139,11 @@ class TorchGraph:
     persistent: tuple[str, ...]
 
     def __call__(self, params: Mapping[str, jax.Array], buffers: Mapping[str, jax.Array],
-                 tokens: jax.Array, *, train: bool, key: jax.Array | None = None
-                 ) -> tuple[jax.Array, jax.Array]:
+                 tokens: jax.Array, *, train: bool, key: jax.Array | None = None,
+                 precision: jax.lax.PrecisionLike = None) -> tuple[jax.Array, jax.Array]:
         """The logits and the output head's input states for `tokens`, in Dew's torchax
-        environment (`_environment`). Each broadcast of a value narrower than fp32 sums
+        environment (`_environment`), every product at `precision` (`configured_precision`):
+        torch's operators state none. Each broadcast of a value narrower than fp32 sums
         its gradient in fp32 (`_accumulating`), as torch's reduction of a broadcast's
         gradient does."""
         env = _environment()
@@ -158,7 +160,8 @@ class TorchGraph:
                 self.module.eval()
 
         arguments = (dict(params), dict(buffers), tokens, key)
-        traced, shapes = jax.make_jaxpr(forward, return_shape=True)(*arguments)
+        with configured_precision(precision):
+            traced, shapes = jax.make_jaxpr(forward, return_shape=True)(*arguments)
         logits, hidden = jax.tree.unflatten(jax.tree.structure(shapes),
                                             _accumulating(traced, *jax.tree.leaves(arguments)))
         if draws.host:
@@ -423,7 +426,12 @@ class TorchCausalLM(nn.Module):
         params = {name: self._compute(leaf) for name, leaf in held["params"].items()}
         buffers = {name: jnp.asarray(leaf) for name, leaf in held.get("buffers", {}).items()}
         key = self.make_rng("dropout") if train and self.has_rng("dropout") else None
-        return self.graph(params, buffers, jnp.asarray(tokens), train=train, key=key)
+        # Torch's operators state no precision, so the forward's products take the one its compute
+        # dtype does (`float32_products`): `dtype`, or the dtype its floating parameters hold.
+        compute = self.dtype or jnp.result_type(*[leaf for leaf in params.values()
+                                                  if jnp.issubdtype(leaf.dtype, jnp.floating)])
+        return self.graph(params, buffers, jnp.asarray(tokens), train=train, key=key,
+                          precision=float32_products(compute, self.precision))
 
     def _compute(self, leaf) -> jax.Array:
         value = jnp.asarray(leaf)

@@ -14,6 +14,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+import torch
 
 from dew.config import ModelConfig, ObjectiveConfig
 from dew.config.data import ImageData, VideoData, loader
@@ -28,8 +29,6 @@ from dew.training import Trainer
 # CI runs this file in tasks of its own: torchax renames torch's privateuse1 backend process-wide.
 pytestmark = pytest.mark.torchax
 
-torch = pytest.importorskip("torch")
-pytest.importorskip("torchax")
 
 RATE = 16000
 
@@ -134,7 +133,6 @@ def test_an_audio_conditioned_video_run_learns_and_samples_from_audio(towers, tm
     degrees of freedom at one in a billion, 7.0
     (scipy.stats.t.isf(1e-9, 63)). A run that learns nothing scores near 0;
     this one scored 15.9, on the pixel regime's sigmas a pixel run draws."""
-    pytest.importorskip("moviepy.config", reason="needs the av extra")
     for hertz in range(220, 1100, 110):
         _clip(tmp_path / f"{hertz}.avi", hertz)
     data = VideoData(source=str(tmp_path), extensions=(".avi",), frame_size=8, frames=2,
