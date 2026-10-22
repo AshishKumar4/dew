@@ -354,9 +354,10 @@ def test_training_makes_the_prediction_depend_on_the_context(mask):
     """The loss can be driven down by predicting the average target while
     ignoring the context entirely, which would teach the encoder nothing.
     Over 64 held-out pairs of images, each pair's errors averaged over 8 mask
-    draws, by paired tests of their logarithms (`paired_statistic`): a fresh
-    predictor's cost of the other image's context stays under 1.5 times, and
-    training at least halves the error and makes that cost over five times."""
+    draws, by paired tests (`paired_statistic`): a fresh predictor's error
+    from the other image's context stays under 1.5 times its own, and
+    training at least halves its own and makes the other's over five times
+    it."""
     rs = np.random.RandomState(0)
     train_x, test_x = solid_colour_images(rs, 128), solid_colour_images(rs, 128)
     normalized_test = (test_x - 127.5) / 127.5
@@ -365,9 +366,9 @@ def test_training_makes_the_prediction_depend_on_the_context(mask):
                                 momentum=(0.9, 0.99), momentum_steps=150)
     objective = trainer.objective
     initial = trainer.initial_state()
-    before = np.log(context_ablation(objective, initial.variables, initial.ema,
-                                     normalized_test, mask, jax.random.PRNGKey(9)))
-    fresh = paired_statistic(np.log(1.5) - (before[1] - before[0]))
+    before = context_ablation(objective, initial.variables, initial.ema,
+                              normalized_test, mask, jax.random.PRNGKey(9))
+    fresh = paired_statistic(1.5 * before[0] - before[1])
     assert fresh > 7.0, f"a fresh predictor favours its own context (t = {fresh:.1f})"
 
     def batches():
@@ -387,11 +388,11 @@ def test_training_makes_the_prediction_depend_on_the_context(mask):
 
     state = trainer.fit(dataset(batches, batch=16), steps=150, log_every=50)
 
-    after = np.log(context_ablation(objective, state.variables, state.ema,
-                                    normalized_test, mask, jax.random.PRNGKey(9)))
-    halved = paired_statistic(before[0] - after[0] - np.log(2))
+    after = context_ablation(objective, state.variables, state.ema,
+                             normalized_test, mask, jax.random.PRNGKey(9))
+    halved = paired_statistic(before[0] - 2 * after[0])
     assert halved > 7.0, f"held-out prediction error did not halve (t = {halved:.1f})"
-    cost = paired_statistic(after[1] - after[0] - np.log(5))
+    cost = paired_statistic(after[1] - 5 * after[0])
     assert cost > 7.0, f"the predictor still ignores its context (t = {cost:.1f})"
 
 
