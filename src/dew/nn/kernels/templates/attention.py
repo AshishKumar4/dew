@@ -397,6 +397,17 @@ def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
     return (out, m, total) if residuals else out
 
 
+LOG2E = 1.4426950408889634
+"""log2(e): a natural exponent times it is a base-2 one."""
+
+
+def natural_exp(x: jax.Array) -> jax.Array:
+    """`exp(x)` as the hardware's base-2 exponential of `x * log2(e)`, the logits staying natural: a
+    difference of the reference's own logits converted only after it is taken, so no logit the reference
+    keeps finite passes fp32's largest and none it keeps apart ties (the stability invariant)."""
+    return jnp.exp2(x * LOG2E)
+
+
 def power_of_two(width: int) -> int:
     """The power of two from 16 that holds `width`: a head width a kernel tiles."""
     return max(16, 1 << (width - 1).bit_length())
@@ -606,8 +617,8 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
         # little beside the keys (a subnormal factor) is rounded once there, as the reference rounds it.
         # Bounded as the launch's own carried factor is (`attention_algebra.below`): the forward's
         # maximum is the state's too, whatever its rounding.
-        factor = jnp.where((total > 0) & jnp.isfinite(starts[0]), jnp.exp(jnp.minimum(starts[0] - peak, 0.0)),
-                           0.0)
+        carried = natural_exp(jnp.minimum(starts[0] - peak, 0.0))
+        factor = jnp.where((total > 0) & jnp.isfinite(starts[0]), carried, 0.0)
         inverse = jnp.where(total > 0, 1.0 / jnp.where(total > 0, total, 1.0), 0.0)
         # Its maximum's cotangent, that term's score cotangent, taken whole as the reference's derivative
         # takes it; exactly 0 for a query that read only its state, whose output its maximum leaves unmoved.

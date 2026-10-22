@@ -16,8 +16,10 @@ A forward step over one key tile, in a mainloop's order:
 `Partial` is that running state, `merge` joins two of them in order (split keys, ring attention,
 chunked prefill), and `finish` normalizes the last one and applies the output hook.
 
-The functions specialize at trace time on what the call holds (`Forward`): with no score hook the
-logits stay in base 2 (log2(e) folded into the scale) for exp2; a full or causal call's mask comes from
+The logits stay natural, the reference's own, every exponential taken of their difference
+(`natural_exp`), so no input the reference handles gives a non-finite value or ties two logits it keeps
+apart (the stability invariant). The functions specialize at trace time on what the call holds
+(`Forward`): a full or causal call's mask comes from
 its coordinates alone, only spans read intervals and ids, and a tile no query's interval cuts takes no
 mask at all (`masked`); and only a call where a query can see nothing (spans, a score hook) guards its
 maxima and denominators against an empty row."""
@@ -29,10 +31,7 @@ from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 
-from dew.nn.kernels.templates.attention import Kind
-
-LOG2E = 1.4426950408889634
-"""log2(e): a natural exponent times it is a base-2 one."""
+from dew.nn.kernels.templates.attention import Kind, natural_exp
 
 
 @dataclasses.dataclass(frozen=True)
@@ -48,26 +47,10 @@ class Forward:
     score_mod: Callable | None = None
 
     @property
-    def base2(self) -> bool:
-        """Whether the logits stay in base 2 (log2(e) folded into the scale, then exp2: FlashAttention 2's
-        and jax's mha's arithmetic): no hook reads them, and the scale times log2(e) is at most 1, so the
-        fold takes no product the reference keeps finite past fp32's largest (a scale past 1/log2(e),
-        0.69, takes the natural form). That guard covers only that overflow: the fold's extra rounding
-        remains at every scale, so at logit magnitudes near 1e9, or values near overflow, it can differ
-        from the reference (keys of 2 * 1610613120 and 2 * 1610612992 under a query of 1 at scale 0.5:
-        the reference weighs them 1 and 0, the fold 0.5 each, and a cotangent of 2**125 then overflows
-        its backward). On drawn inputs it passes check 1."""
-        return self.score_mod is None and self.scale * LOG2E <= 1.0
-
-    @property
     def guarded(self) -> bool:
         """Whether a query can see no key, so its maxima and denominators need the empty row's guard: a
         call of no keys, one whose spans narrow, or one a score hook may mask."""
         return self.keys == 0 or self.form == "spans" or self.score_mod is not None
-
-    def power(self, x: jax.Array) -> jax.Array:
-        """The exponential the logits are in: exp2 in base 2, exp otherwise."""
-        return jnp.exp2(x) if self.base2 else jnp.exp(x)
 
 
 class Coords(NamedTuple):
@@ -104,7 +87,8 @@ def resumed(spec: Forward, m: jax.Array, total: jax.Array, acc: jax.Array) -> Pa
     """The softmax resumed from a state `(m, total, acc)` (`Hooks.initial`: sinks, a resumed partial),
     its maximum taken to base 2 where the step's logits are."""
     m, total, acc = (array.astype(jnp.float32) for array in (m, total, acc))
-    return Partial(acc, m * LOG2E if spec.base2 else m, total)
+    del spec
+    return Partial(acc, m, total)
 
 
 def modify(spec: Forward, s: jax.Array, coords: Coords, params: tuple[jax.Array, ...] = (),
@@ -112,7 +96,7 @@ def modify(spec: Forward, s: jax.Array, coords: Coords, params: tuple[jax.Array,
     """A tile's logits from its products `s` `[bq, bk]` (fp32): scaled (by log2(e) too in base 2), then
     the score hook, then -inf at each key the query does not see. `masked` False is a tile every query
     of the block sees whole (a full tile of the block map), which takes no mask."""
-    logits = s * (spec.scale * LOG2E if spec.base2 else spec.scale)
+    logits = s * spec.scale
     if spec.score_mod is not None:
         logits = hooked(spec.score_mod, logits, coords.q_pos, coords.k_pos, params)
     if not masked:
@@ -149,12 +133,12 @@ def peak(spec: Forward, m: jax.Array, s: jax.Array) -> tuple[jax.Array, jax.Arra
     """The running maximum after a tile's logits `s`, and `alpha`, the factor the state before it
     takes to the new maximum."""
     new = jnp.maximum(m, s.max(axis=-1))
-    return new, spec.power(m - _safe(spec, new))
+    return new, natural_exp(m - _safe(spec, new))
 
 
 def weights(spec: Forward, s: jax.Array, m: jax.Array) -> jax.Array:
     """A tile's unnormalized weights `[bq, bk]` under the running maximum `m`, fp32."""
-    return spec.power(s - _safe(spec, m)[..., None])
+    return natural_exp(s - _safe(spec, m)[..., None])
 
 
 def narrow(p: jax.Array, dtype) -> jax.Array:
@@ -227,7 +211,7 @@ def merge(spec: Forward, first: Partial, second: Partial) -> Partial:
     keys), so `empty` is its identity under every spec."""
     m = jnp.maximum(first.m, second.m)
     safe = jnp.where(m == -jnp.inf, 0.0, m)
-    a, b = spec.power(first.m - safe), spec.power(second.m - safe)
+    a, b = natural_exp(first.m - safe), natural_exp(second.m - safe)
     acc = a[..., None] * first.acc + b[..., None] * second.acc
     return Partial(acc, m, a * first.total + b * second.total)
 
@@ -237,7 +221,7 @@ def finish(spec: Forward, state: Partial, *, initial: bool, output_mod: Callable
     """The block's output `[bq, Dv]` fp32 (its weighted values over its denominator, zero for a query
     that saw nothing and started from no state, then the output hook) and its residuals: the natural
     maximum (0 for such a query, as the reference's) and the denominator."""
-    m = state.m / LOG2E if spec.base2 else state.m
+    m = state.m
     denominator = state.total
     if spec.guarded or initial:
         out = jnp.where(denominator[..., None] > 0,
@@ -347,7 +331,7 @@ def off_anchor_start(peak0: jax.Array, total0: jax.Array, term0: jax.Array, maxi
                      width: int) -> tuple[OffAnchor, jax.Array, jax.Array]:
     """The first pass from the softmax's initial state (its maximum, denominator and share of D's
     numerator) weighed at the forward's `maximum`, and that state's denominator and share there."""
-    carried = jnp.where(peak0 == -jnp.inf, 0.0, jnp.exp(jnp.minimum(peak0 - maximum, 0.0)))
+    carried = jnp.where(peak0 == -jnp.inf, 0.0, natural_exp(jnp.minimum(peak0 - maximum, 0.0)))
     state_total, state_share = total0 * carried, term0 * carried
     nothing = jnp.zeros_like(total0)
     return OffAnchor(state_total, jnp.zeros((total0.shape[0], width), jnp.float32), nothing, nothing), \
@@ -449,7 +433,7 @@ def below(logits: jax.Array, peak: jax.Array) -> jax.Array:
     fp32: `m` is every key's maximum, so a logit past it by the rounding the two passes do not share (the
     forward's maximum taken in base 2 and back, or another tile shape's product) is the maximum itself,
     its weight 1, never past it."""
-    return jnp.exp(jnp.minimum(logits - peak[:, None], 0.0))
+    return natural_exp(jnp.minimum(logits - peak[:, None], 0.0))
 
 
 def normalized(logits: jax.Array, peak: jax.Array, total: jax.Array) -> tuple[jax.Array, jax.Array]:
@@ -479,7 +463,7 @@ def refinement(residual: jax.Array, mass: jax.Array, peak0: jax.Array, shares: t
     by the softmax's shift, and what they sum to here (`residual`, over the keys' weights `mass`) is D's
     rounding. Moving D by it over the weights' total lets dK/dV, the initial state's gradients and the
     head and query parameters' take the D whose cotangents do."""
-    carried = jnp.where(peak0 == -jnp.inf, 0.0, jnp.exp(jnp.minimum(peak0 - peak, 0.0))) * inverse(total)
+    carried = jnp.where(peak0 == -jnp.inf, 0.0, natural_exp(jnp.minimum(peak0 - peak, 0.0))) * inverse(total)
     whole_residual = residual + (shares[1] - shares[0] * (anchor + delta)) * carried
     whole_mass = mass + shares[0] * carried
     return jnp.where(whole_mass > 0, whole_residual / jnp.where(whole_mass > 0, whole_mass, 1.0), 0.0)
