@@ -375,20 +375,22 @@ def _gmm_cooperative(lhs, rhs, lengths, shape: tuple, *, tiles: Tiles, transpose
 
 
 
-def _gmm_streamed(lhs, rhs, lengths, shape: tuple, *, tiles: Tiles, transpose_rhs: bool, dtypes: tuple,
+def _gmm_pingpong(lhs, rhs, lengths, shape: tuple, *, tiles: Tiles, transpose_rhs: bool, dtypes: tuple,
                   multiprocessors: int, interpret, hooks: tuple, sides: tuple) -> tuple:
-    """`gmm`'s product at a cooperative tile with its operand stages streaming across the persistent loop's
-    tiles (`hopper.Ring`): the producer loads the next tile's first steps while the consumers finish this
-    one's epilogue, and each consumer's stores of a tile run on while the next tile's products do (its
-    staging buffer awaited only by the next epilogue). No prologue and one multiprocessor a tile;
-    `_gmm_cooperative`'s arguments."""
+    """Dew: `gmm`'s product with two consumer warpgroups each computing whole tiles in turn (ping-pong): one's
+    products run on the tensor cores while the other's epilogue stores its tile before. The operand stages
+    stream across the persistent loop's tiles (`hopper.Ring`, each stage one consumer's), and the two meet
+    at a schedule barrier where one's products end and the other's begin, warpgroup 1 a meeting behind.
+    The tiles that hold rows alternate between them; a slot past the last tile is neither's. No prologue
+    and one multiprocessor a tile; `_gmm_cooperative`'s arguments."""
     _, _, epilogue, epilogue_axes = hooks
     _, epilogue_operands = sides
     m, n, k, g = shape
     block_m, block_n, block_k = tiles.block_m, tiles.block_n, tiles.block_k
-    half, steps = block_n // 2, k // block_k
+    steps = k // block_k
     grid = (pl.cdiv(m, block_m) + g, n // block_n)  # g groups and the unrouted rows
-    side_shapes = [tuple({'rows': block_m, 'columns': half}[axis] for axis in axes) for axes in epilogue_axes]
+    extent = {'rows': block_m, 'columns': block_n}
+    side_shapes = [tuple(extent[axis] for axis in axes) for axes in epilogue_axes]
     rhs_block = (block_n, block_k) if transpose_rhs else (block_k, block_n)
 
     def body(lengths_gmem, lhs_gmem, rhs_gmem, *refs):
@@ -403,13 +405,14 @@ def _gmm_streamed(lhs, rhs, lengths, shape: tuple, *, tiles: Tiles, transpose_rh
 
         @functools.partial(
             pl.run_scoped,
-            lhs_ring=hopper.ring((block_m, block_k), lhs_gmem.dtype, tiles.stages, consumers=2),
-            rhs_ring=hopper.ring(rhs_block, rhs_gmem.dtype, tiles.stages, consumers=2),
-            o_smems=[plgpu.SMEM((2, block_m, half), gmem.dtype) for gmem in o_gmems],
+            lhs_ring=hopper.ring((block_m, block_k), lhs_gmem.dtype, tiles.stages, consumers=1),
+            rhs_ring=hopper.ring(rhs_block, rhs_gmem.dtype, tiles.stages, consumers=1),
+            o_smems=[plgpu.SMEM((2, block_m, block_n), gmem.dtype) for gmem in o_gmems],
             **hopper.staging('side', zip(side_shapes, side_gmems, strict=True)),
+            schedule=hopper.schedule_barrier(),
             collective_axes="wg",
         )
-        def scope(lhs_ring, rhs_ring, o_smems, side_smems, side_barriers):
+        def scope(lhs_ring, rhs_ring, o_smems, side_smems, side_barriers, schedule):
             lhs_ring, rhs_ring = hopper.Ring(**lhs_ring), hopper.Ring(**rhs_ring)
 
             def producer():
@@ -436,50 +439,63 @@ def _gmm_streamed(lhs, rhs, lengths, shape: tuple, *, tiles: Tiles, transpose_rh
                 rhs_ring.drain(loaded)
 
             def consumer(wg):
-                @plgpu.nd_loop((grid[0] * grid[1],), collective_axes="cluster_grid", init_carry=jnp.int32(0))
-                def _(loop: plgpu.NDLoopInfo, carry):
-                    counter = carry  # the ring's turn: the steps the tiles before took
+                pl.when(wg == 1)(lambda: hopper.rendezvous(schedule))  # warpgroup 0's products first
+
+                @plgpu.nd_loop((grid[0] * grid[1],), collective_axes="cluster_grid",
+                               init_carry=(jnp.int32(0), jnp.int32(0)))
+                def carried(loop: plgpu.NDLoopInfo, carry):
+                    counter, taken = carry  # the ring's turn; the tiles with rows before, both consumers'
                     info, ni, active = tile(loop.index[0])
-                    column = ni * block_n + wg * half
+                    rows = info.actual_size > 0
+                    column = ni * block_n
 
                     def finish(acc):
                         origins = {'rows': pl.ds(info.block * block_m, block_m),
-                                   'columns': pl.ds(column, half)}
+                                   'columns': pl.ds(column, block_n)}
                         views = [gmem.at[tuple(origins[axis] for axis in axes)]
                                  for gmem, axes in zip(side_gmems, epilogue_axes, strict=True)]
                         _finish_half(acc, epilogue, (views, side_smems, side_barriers), (o_gmems, o_smems),
                                      (info.block_start, info.start_within_block, info.actual_size, column,
                                       min(block_m, m)), wg)
 
-                    @pl.when(active)
+                    @pl.when(rows & (lax.rem(taken, 2) == wg))
                     def _():
-                        @functools.partial(pl.run_scoped, acc_ref=plgpu.WGMMAAccumulatorRef((block_m, half)))
+                        hopper.rendezvous(schedule)  # this one's products begin
+
+                        accumulator = plgpu.WGMMAAccumulatorRef((block_m, block_n))
+
+                        @functools.partial(pl.run_scoped, acc_ref=accumulator)
                         def _(acc_ref):
-                            @pl.loop(0, steps)
-                            def _(step):
-                                rows_stage = lhs_ring.acquire(counter + step)
-                                matrix_stage = rhs_ring.acquire(counter + step)
-                                columns = pl.ds(wg * half, half)
-                                plgpu.wgmma(acc_ref, rows_stage, matrix_stage.at[columns].transpose((1, 0))
-                                            if transpose_rhs else matrix_stage.at[:, columns])
-                                # One MMA in flight: the step before's stages are read.
-                                plgpu.wgmma_wait(_IN_FLIGHT)
+                            @pl.when(active)
+                            def _():
+                                @pl.loop(0, steps)
+                                def _(step):
+                                    rows_stage = lhs_ring.acquire(counter + step)
+                                    matrix_stage = rhs_ring.acquire(counter + step)
+                                    plgpu.wgmma(acc_ref, rows_stage, matrix_stage.transpose((1, 0))
+                                                if transpose_rhs else matrix_stage)
+                                    # One MMA in flight: the step before's stages are read.
+                                    plgpu.wgmma_wait(_IN_FLIGHT)
 
-                                @pl.when(step > 0)
-                                def _():
-                                    lhs_ring.release(counter + step - 1)
-                                    rhs_ring.release(counter + step - 1)
+                                    @pl.when(step > 0)
+                                    def _():
+                                        lhs_ring.release(counter + step - 1)
+                                        rhs_ring.release(counter + step - 1)
 
-                            plgpu.wgmma_wait(0)
-                            lhs_ring.release(counter + steps - 1)
-                            rhs_ring.release(counter + steps - 1)
-                            finish(acc_ref[...])
+                                plgpu.wgmma_wait(0)
+                                lhs_ring.release(counter + steps - 1)
+                                rhs_ring.release(counter + steps - 1)
 
-                    # The unrouted rows: the epilogue of a zero accumulator.
-                    pl.when(~active & (info.actual_size > 0))(
-                        lambda: finish(jnp.zeros((block_m, half), jnp.float32)))
-                    return counter + jnp.where(active, steps, 0)
+                            hopper.rendezvous(schedule)  # the other's products begin
+                            # The unrouted rows: the epilogue of a zero accumulator.
+                            finish(jnp.where(active, acc_ref[...], 0.0))
 
+                    return counter + jnp.where(active, steps, 0), taken + rows.astype(jnp.int32)
+
+                # Each consumer meets as often as the other: warpgroup 1's first meeting is matched by
+                # warpgroup 0's last where the tiles with rows are even in number, and the other way round.
+                _, taken = carried
+                pl.when(lax.rem(taken, 2) == wg)(lambda: hopper.rendezvous(schedule))
                 plgpu.wait_smem_to_gmem(0, wait_read_only=True)
 
             hopper.roles(lax.axis_index("wg"), 2, consumer, producer)
