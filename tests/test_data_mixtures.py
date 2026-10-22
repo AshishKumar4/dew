@@ -1311,7 +1311,7 @@ def test_an_epoch_of_a_mix_of_corpora_written_without_repeats_reads_every_corpus
     every record of the corpus it ends on once and every record of the others, where a repeat of
     the mix would start over at its shortest corpus's end and leave the slow corpus's tail unread."""
     from dew.data.compile import fitted
-    from dew.objectives.base import ObjectiveData
+    from dew.data.pipeline import ObjectiveData
 
     corpora = [Pipeline(Memory(Indexed(tag, size)), name=f"corpus-{tag}")
                for tag, size in ((1, 40), (2, 200))]
