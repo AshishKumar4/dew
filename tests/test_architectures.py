@@ -451,9 +451,14 @@ def selection_margin(case: Case, variables_by_step, tokens) -> float:
         return method == "__call__" and isinstance(module, nn.Dense) and module.name == "gate_proj" and gated
 
     margin, seen = np.inf, 0
+    # One compiled forward a draw rather than an op at a time: XLA:CPU's JIT failed to materialize a
+    # gather fusion among the many small programs an unjitted capture compiles.
+    def captured_in(variables, tokens):
+        return model.apply(variables, tokens, capture_intermediates=selecting, mutable=["intermediates"])
+
+    forward = jax.jit(captured_in)
     for variables in variables_by_step:
-        _, captured = model.apply(variables, jnp.asarray(tokens[:, :-1]), capture_intermediates=selecting,
-                                  mutable=["intermediates"])
+        _, captured = forward(variables, jnp.asarray(tokens[:, :-1]))
         for path, values in jax.tree_util.tree_flatten_with_path(captured.get("intermediates", {}))[0]:
             seen += 1
             names = [str(getattr(part, "key", part)) for part in path]
