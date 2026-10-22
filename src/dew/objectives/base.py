@@ -573,6 +573,10 @@ leaves that `freeze` keeps in `params` are the ones that train. The frozen
 leaves stay in this collection as part of the state, and `thaw` merges the
 two before the model reads them."""
 
+PARAMETER_ROOTS = (("params",), (FROZEN,))
+"""The collections of a variables tree that hold a model's parameters, which a run's loaders read
+and a storage dtype casts: the trained ones and the frozen."""
+
 
 VALID_ROWS = "valid_rows"
 
@@ -1387,7 +1391,7 @@ class Objective(ABC, Generic[Loss, Effects]):
     def _saved_variables(cls, directory: str, *, step: int | str | None, ema: bool | None,
                          mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
                          param_dtype: DTypeLike | None = None,
-                         parameter_roots: tuple[tuple[str, ...], ...] = (("params",), (FROZEN,))
+                         parameter_roots: tuple[tuple[str, ...], ...] = PARAMETER_ROOTS
                          ) -> Variables:
         """Return the model's variables from a run of this objective, as every run loader reads them.
 
