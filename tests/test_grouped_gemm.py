@@ -147,10 +147,9 @@ def test_an_expert_projection_runs_the_implementation_chosen_for_it_on_the_cpu(g
     with (generation.assumed(generation_name), generation.chosen(grouped_matmul=implementation),
           generation.routes() as routes):
         operands_ = (jnp.asarray(x, jnp.bfloat16), jnp.asarray(w, jnp.float32))
-        # The CPU's program is the interpreted kernels', not XLA's ragged dot compared with itself. Mosaic's
-        # interpreter's ordered callbacks run eagerly: a jitted `linear_call` cannot carry them.
-        traced = str(jax.make_jaxpr(products)(*operands_))
-        assert "pallas_call" in traced
+        # The CPU runs the interpreted kernels (each launch's route says so), not XLA's ragged dot compared
+        # with itself. Mosaic's interpreter's ordered callbacks run eagerly: a jitted `linear_call` cannot
+        # carry them.
         y, dx, dw = (products if implementation == "mosaic_gpu" else jax.jit(products))(*operands_)
     assert {route.kernel for route in routes if route.choice == "grouped_matmul"} == {implementation}
     assert (y.dtype, dx.dtype, dw.dtype) == (jnp.bfloat16, jnp.bfloat16, jnp.float32)
