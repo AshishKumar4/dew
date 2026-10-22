@@ -39,6 +39,7 @@ from dew.data.lowering import (
 from dew.data.mixing import CorpusCounts
 from dew.data.pipeline import (
     FlatMap,
+    Map,
     Mixture,
     Pack,
     Phases,
@@ -52,7 +53,7 @@ from dew.data.pipeline import (
 from dew.data.plan import fingerprint
 from dew.data.sources.base import Read, Rows, ShardManifest, Source, View, _uncounted
 from dew.data.steps.generic import Fields
-from dew.data.steps.text import CountRule, LayoutRule, ValidTargets, counted_window
+from dew.data.steps.text import CountRule, CountTargets, LayoutRule, ValidTargets, counted_window
 from dew.records import JSON, integer, json_value, record
 
 _log = logging.getLogger(__name__)
@@ -205,7 +206,13 @@ def _memory_stages(
     derived: dict[str, str] = {}
     targets: Mapping[str, int] | None = None
     documents = source.segments if isinstance(source, _Memory) else None
+    # Whether the rows' targets are counted, which they carry (`recounted`, `counted_window`): by the
+    # memory read this one reads on from, a count step or a layout.
+    counting = isinstance(source, _Memory) and any(
+        isinstance(value, Mapping) and "_dew_valid_targets" in value for value in source.held)
     for stage in pipeline.stages[consumed:eager]:
+        counting = counting or isinstance(stage, (Windows, Pack)) or (
+            isinstance(stage, Map) and isinstance(stage.step, CountTargets))
         if isinstance(stage, TokenSplit):
             split = _TokenSplit(pygrain.MapDataset.source([value for _, value in rows]), stage)
             spans = enumerate(split.spans)
@@ -276,10 +283,8 @@ def _memory_stages(
                         expanded.append((output_id, output))
             rows = expanded
         consumed += 1
-    # Counted rows carry their targets (`recounted`, `counted_window`), as every read's do.
-    counted = [value for _, value in rows if isinstance(value, Mapping) and "_dew_valid_targets" in value]
-    if counted:
-        targets = {"valid_targets": sum(ValidTargets()(value) for value in counted)}
+    if counting:
+        targets = {"valid_targets": sum(ValidTargets()(record(value, "counted row")) for _, value in rows)}
     if targets is not None and targets["valid_targets"] == 0 and training:
         raise ValueError(f"corpus {_name(pipeline)} has zero valid target tokens")
     inputs = source.inputs if isinstance(source, _Memory) else len(stored)
