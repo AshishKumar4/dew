@@ -782,11 +782,6 @@
    "lane": "Models, Serving & RL",
    "by": "2026-11-13"
   },
-  "tests/test_quantization.py": {
-   "comparisons": 16,
-   "lane": "Models, Serving & RL",
-   "by": "2026-11-13"
-  },
   "tests/test_quantization_sites.py": {
    "comparisons": 1,
    "lane": "Models, Serving & RL",
