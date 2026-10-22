@@ -33,7 +33,7 @@ from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 IN_GIT = 1 << 20
-"""The largest recording committed to git, in bytes (Main's)."""
+"""The largest recording committed to git, in bytes, as Main set it."""
 STORE = "dewml/fixtures"
 """The fetched store: a public dataset repo on the Hugging Face Hub."""
 FIXTURES = "tests/fixtures"

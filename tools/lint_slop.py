@@ -2033,7 +2033,7 @@ RECORDED = {"site/src/data/hero.py": "site/src/data/capture.json"}
 """Python files whose bytes a recording pins, each with the recording that names their sha256
 (`meta.script_sha256`): the landing hero's script, whose capture the site's build checks it against
 (site/src/pages/index.astro), so an edit fails the build until the hero is recorded again on a host as
-fast as the recording's (the owner's: the 60 s recording stays). The gate reads such a file only
+fast as the recording's (the owner keeps the 60 s recording). The gate reads such a file only
 once its bytes are no longer the recorded ones, which an edit makes them."""
 
 
