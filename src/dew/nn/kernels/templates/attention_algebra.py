@@ -133,7 +133,11 @@ def headroomed(state: Partial, live: jax.Array | None = None) -> Partial:
     none), and a bound on its values' magnitudes, its weighted values' largest over its denominator (the
     weighted mean bounds the merged sums a slice's state joins, `merge`)."""
     if state.shift is not None:
-        return state
+        # A slice's state read back from its launch's outputs carries no `live`: none of its rows shifts
+        # but by its own merge (`merge`).
+        if state.live is not None:
+            return state
+        return state._replace(live=jnp.zeros(state.total.shape, jnp.bool_))
     rows = state.total
     largest = jnp.max(jnp.abs(state.acc), axis=-1)
     reach = jnp.where(rows > 0, largest / jnp.where(rows > 0, rows, 1.0), 0.0)
