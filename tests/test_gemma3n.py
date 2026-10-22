@@ -36,6 +36,11 @@ def assert_as_exact(dew_fn, reference_fn, draw, label, *, seeds, truth_fn=None):
             per.setdefault(name, []).append(err)
             power.setdefault(name, []).append(float(np.mean(want ** 2)))
     print(f"TAILTIME {label} {time.time() - started:.0f}s", flush=True)
+    from model_support import gate_margin as _margin
+    model, variables = _probe_model
+    margins = [_margin(model, variables, draw(seed)[0][:, :-1], train=True) for seed in range(48)]
+    print("MARGINS", {seed: f"{margins[seed]:.2e}" for seed in (22, 41, 37, 10)}, "median", f"{np.median(margins):.2e}",
+          "smallest", sorted(f"{m:.1e}@{i}" for i, m in sorted(enumerate(margins), key=lambda im: im[1])[:6]), flush=True)
     rows = sorted(((max(v) / np.median(v), name, len(v)) for name, v in per.items() if np.median(v) > 0), reverse=True)
     for spread, name, n in rows[:8]:
         worst = int(np.argmax(per[name]))
