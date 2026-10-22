@@ -41,6 +41,7 @@ A row reads at least one key: an idle slot reads its first.
 """
 
 import dataclasses
+import functools
 import math
 from typing import TYPE_CHECKING, ClassVar
 
@@ -51,6 +52,8 @@ from jax.experimental import pallas as pl
 from . import tuning
 from .generation import INHERENT, gpu_target, triton_runs
 from .selection import Requirement
+from .templates import attention_algebra as algebra
+from .templates.attention import NATURAL
 
 if TYPE_CHECKING:
     # Named in quotes: tokamax reads its ops' `_fwd` annotations as types, which postponed ones are not.
@@ -67,10 +70,6 @@ DTYPES = (jnp.float32, jnp.bfloat16, jnp.float16)
 
 SPLITS = (1, 2, 4, 8, 16, 32)
 """The slices a launch may cut each row's keys into (`Split`), each held to the float64 gate on the GPU."""
-
-EMPTY = float(jnp.finfo(jnp.float32).min)
-"""A slice's running maximum before it reads a key: an empty slice's weighs nothing (`_combined`)."""
-
 
 @dataclasses.dataclass(frozen=True)
 class Split:
@@ -129,39 +128,47 @@ def _dot(a: jax.Array, b: jax.Array, interpret: bool) -> jax.Array:
     return plgpu.dot(a, b, precision=FULL).astype(jnp.float32)
 
 
-def _attend(query: jax.Array, span: tuple, read, block: int, scale: float, steps,
-            interpret: bool, softcap: float | None = None, sink: jax.Array | None = None) -> tuple:
-    """`query` `[QUERIES, D]` over the keys of `steps`, a range of the loop's
-    steps of `block` keys, those of the row's `span` (its first key and its
-    length) alone, `read(step)` giving a step's keys and values `[block, D]`:
-    an online softmax's fp32 sums `[QUERIES, D]`, its running maximum and its
-    total `[QUERIES]`, unnormalized. A `softcap` bounds each scaled logit to
-    `softcap · tanh(logit / softcap)`; a `sink` `[QUERIES]` (each query row's
-    value-free logit, or `EMPTY` for a slice that does not carry it) starts
-    the softmax as its first term, with a total of one where it is real."""
-    width = query.shape[-1]
+def _capped(softcap: float, logits, q_pos, k_pos):
+    """Gemma 2's logit cap, `softcap · tanh(logit / softcap)`, the decode kernel's one score hook."""
+    del q_pos, k_pos
+    return softcap * jnp.tanh(logits / softcap)
+
+
+def _spec(scale: float, softcap: float | None, natural: bool) -> algebra.Forward:
+    """The algebra's facts for a decode launch: each query block's keys its row's span (`spans`), no
+    documents, the cap as its score hook, the logits `natural` or not (`algebra.Forward.base2`). A
+    decode block's rows are a key head's query heads and positions (`grouped_query`), so the hook takes
+    no query positions."""
+    return algebra.Forward("spans", 0, ids=False, scale=scale,
+                           score_mod=None if softcap is None else functools.partial(_capped, softcap),
+                           natural=natural)
+
+
+def _attend(query: jax.Array, span: tuple, read, block: int, spec: algebra.Forward, steps,
+            interpret: bool, sink: jax.Array | None = None) -> algebra.Partial:
+    """The decode mainloop: `query` `[QUERIES, D]` over the keys of `steps`, a range of the loop's steps
+    of `block` keys, those of the row's `span` (its first key and its length) alone, `read(step)` giving
+    a step's keys and values `[block, D]`, as a softmax state (`algebra.Partial`). A `sink` `[QUERIES]`
+    (each query row's value-free logit, -inf for a slice that does not carry it) starts the softmax as
+    its first term."""
     first_key, length = span
+    rows = jnp.arange(QUERIES)
+    narrowing = {"start": jnp.full((QUERIES,), first_key), "end": jnp.full((QUERIES,), length)}
 
-    def body(step, carry):
-        out, peak, total = carry
+    def body(step, state):
         key, value = read(step)
-        logits = _dot(query, key.T, interpret) * scale  # [QUERIES, block]
-        if softcap is not None:
-            logits = softcap * jnp.tanh(logits / softcap)
-        index = step * block + jnp.arange(block)
-        reads = (index >= first_key) & (index < length)
-        logits = jnp.where(reads[None, :], logits, -0.7 * float(jnp.finfo(jnp.float32).max))
-        new_peak = jnp.maximum(peak, logits.max(axis=-1))
-        correction = jnp.exp(peak - new_peak)
-        weights = jnp.exp(logits - new_peak[:, None])
-        product = _dot(weights.astype(value.dtype), value, interpret)
-        out = correction[:, None] * out + product
-        return out, new_peak, correction * total + weights.sum(axis=-1)
+        coords = algebra.Coords(rows[:, None], step * block + jnp.arange(block)[None, :], **narrowing)
+        logits = algebra.modify(spec, _dot(query, key.T, interpret), coords)
+        m, alpha = algebra.peak(spec, state.m, logits)
+        weights = algebra.weights(spec, logits, m)
+        denominator = algebra.total(state.total, alpha, weights)
+        acc = algebra.rescale(state.acc, alpha) + _dot(algebra.narrow(weights, value.dtype), value, interpret)
+        return algebra.Partial(acc, m, denominator)
 
-    start = (jnp.zeros((QUERIES, width), jnp.float32), jnp.full((QUERIES,), EMPTY, jnp.float32),
-             jnp.zeros((QUERIES,), jnp.float32))
+    start = algebra.empty(QUERIES, query.shape[-1])
     if sink is not None:
-        start = start[0], sink, (sink > EMPTY).astype(jnp.float32)
+        real = sink > -jnp.inf
+        start = algebra.resumed(spec, sink, real.astype(jnp.float32), start.acc)
     first, last = steps
     return jax.lax.fori_loop(first, last, body, start)
 
@@ -176,25 +183,27 @@ def _slice(span: tuple, block: int, split, splits: int) -> tuple:
     return begin, jnp.minimum(begin + per, last)
 
 
-def _write(out_refs, out, peak, total):
-    """The row's output normalized where one slice reads it all, else the slice's sums."""
+def _write(out_refs, spec: algebra.Forward, state: algebra.Partial):
+    """The row's output normalized where one slice reads it all, else the slice's state, which
+    `_combined` merges."""
     if len(out_refs) == 1:
-        out_refs[0][...] = (out / total[:, None]).astype(out_refs[0].dtype)
+        out = algebra.finish(spec, state, initial=True)[0]
+        out_refs[0][...] = out.astype(out_refs[0].dtype)
     else:
-        for ref, value in zip(out_refs, (out, peak, total), strict=True):
+        for ref, value in zip(out_refs, state, strict=True):
             ref[...] = value
 
 
 def _first_slice_sink(sinks_ref) -> jax.Array | None:
     """The block's sinks where this program reads the row's first slice, which alone carries them, so a
-    combine of the slices counts each once (`_combined`); `EMPTY` in every other."""
+    merge of the slices counts each once (`_combined`); -inf in every other."""
     if sinks_ref is None:
         return None
-    return jnp.where(pl.program_id(2) == 0, sinks_ref[...], EMPTY)
+    return jnp.where(pl.program_id(2) == 0, sinks_ref[...], -jnp.inf)
 
 
-def _kernel(spans_ref, query_ref, key_ref, value_ref, *refs, scale: float, splits: int, interpret: bool,
-            softcap: float | None, sinks: bool):
+def _kernel(spans_ref, query_ref, key_ref, value_ref, *refs, spec: algebra.Forward, splits: int,
+            interpret: bool, sinks: bool):
     sinks_ref, out_refs = (refs[0], refs[1:]) if sinks else (None, refs)
 
     def read(step):
@@ -203,12 +212,12 @@ def _kernel(spans_ref, query_ref, key_ref, value_ref, *refs, scale: float, split
 
     span = spans_ref[0], spans_ref[1]
     steps = _slice(span, BLOCK, pl.program_id(2), splits)
-    _write(out_refs, *_attend(query_ref[...], span, read, BLOCK, scale, steps, interpret, softcap,
-                              _first_slice_sink(sinks_ref)))
+    _write(out_refs, spec, _attend(query_ref[...], span, read, BLOCK, spec, steps, interpret,
+                                   _first_slice_sink(sinks_ref)))
 
 
-def _paged_kernel(spans_ref, table_ref, query_ref, key_ref, value_ref, *refs, pages: int, scale: float,
-                  splits: int, interpret: bool, softcap: float | None, sinks: bool):
+def _paged_kernel(spans_ref, table_ref, query_ref, key_ref, value_ref, *refs, pages: int,
+                  spec: algebra.Forward, splits: int, interpret: bool, sinks: bool):
     sinks_ref, out_refs = (refs[0], refs[1:]) if sinks else (None, refs)
     page_size, width = key_ref.shape[-2:]
 
@@ -219,18 +228,18 @@ def _paged_kernel(spans_ref, table_ref, query_ref, key_ref, value_ref, *refs, pa
 
     span = spans_ref[0], spans_ref[1]
     steps = _slice(span, pages * page_size, pl.program_id(2), splits)
-    _write(out_refs, *_attend(query_ref[...], span, read, pages * page_size, scale, steps, interpret,
-                              softcap, _first_slice_sink(sinks_ref)))
+    _write(out_refs, spec, _attend(query_ref[...], span, read, pages * page_size, spec, steps, interpret,
+                                   _first_slice_sink(sinks_ref)))
 
 
-def _combined(sums, peaks, totals, axis: int):
-    """The slices' sums `[..., splits, ..., QUERIES, D]` along `axis`, their running maxima and totals
-    `[..., splits, ..., QUERIES]`, as the normalized output in fp32: each slice weighed by its maximum's
-    distance below the largest, so an empty slice (`EMPTY`) weighs nothing."""
-    peak = jnp.max(peaks, axis=axis, keepdims=True)
-    weights = jnp.exp(peaks - peak)
-    out = jnp.sum(weights[..., None] * sums, axis=axis)
-    return out / jnp.sum(weights * totals, axis=axis)[..., None]
+def _combined(spec: algebra.Forward, sums, peaks, totals, axis: int):
+    """The slices' states (`[..., splits, ..., QUERIES, D]` sums along `axis`, their maxima and totals)
+    merged in slice order (`algebra.merge`), as the normalized output in fp32: an empty slice's state
+    (a maximum of -inf) merges as nothing."""
+    states = [algebra.Partial(*(jnp.take(part, split, axis=axis) for part in (sums, peaks, totals)))
+              for split in range(sums.shape[axis])]
+    return algebra.finish(spec, functools.reduce(functools.partial(algebra.merge, spec), states),
+                          initial=True)[0]
 
 
 def _outputs(shape: tuple[int, ...], dtype, splits: int, at: int, spec, specs):
@@ -283,8 +292,8 @@ class DecodeAttention(tuning.KernelOp):
     ROWS: ClassVar[tuple[str, ...]] = ('query', 'key', 'value', 'spans')
 
     def _fwd(self, query: jax.Array, key: jax.Array, value: jax.Array, spans: jax.Array,
-             sinks: jax.Array | None = None, *, interpret: bool, softcap: float | None = None, config: Split,
-             return_residuals: bool = False):
+             sinks: jax.Array | None = None, *, interpret: bool, softcap: float | None = None,
+             natural: bool = NATURAL, config: Split, return_residuals: bool = False):
         from jax.experimental.pallas import triton as plgpu
 
         batch, _, heads, width = query.shape
@@ -297,9 +306,10 @@ class DecodeAttention(tuning.KernelOp):
         reduced = pl.BlockSpec((None, None, QUERIES, None), lambda row, head, split: (row, split, 0, head))
         out_shape, out_specs = _outputs(query.shape, query.dtype, splits, 1, queried,
                                         [summed, reduced, reduced])
+        spec = _spec(1 / math.sqrt(width), softcap, natural)
         out = pl.pallas_call(
-            lambda *refs: _kernel(*refs, scale=1 / math.sqrt(width), splits=splits, interpret=interpret,
-                                  softcap=softcap, sinks=sinks is not None),
+            lambda *refs: _kernel(*refs, spec=spec, splits=splits, interpret=interpret,
+                                  sinks=sinks is not None),
             grid=(batch, heads, splits),
             in_specs=[pl.BlockSpec((None, 2), lambda row, head, split: (row, 0)), queried, keyed, keyed,
                       *sunk],
@@ -308,7 +318,7 @@ class DecodeAttention(tuning.KernelOp):
             compiler_params=plgpu.CompilerParams(num_warps=WARPS, num_stages=2),
             interpret=interpret, name="decode_attention",
         )(spans, query, key, value, *([] if sinks is None else [sinks]))
-        return (out if splits == 1 else _combined(*out, axis=1).astype(query.dtype)), None
+        return (out if splits == 1 else _combined(spec, *out, axis=1).astype(query.dtype)), None
 
     def operands(self, specs: list[jax.ShapeDtypeStruct], seed: int) -> list[jax.Array]:
         """Normal floats, each row's span its whole capacity."""
@@ -340,7 +350,8 @@ class PagedDecodeAttention(tuning.KernelOp):
 
     def _fwd(self, query: jax.Array, key_pages: jax.Array, value_pages: jax.Array, table: jax.Array,
              spans: jax.Array, sinks: jax.Array | None = None, *, interpret: bool,
-             softcap: float | None = None, config: Split, return_residuals: bool = False):
+             softcap: float | None = None, natural: bool = NATURAL, config: Split,
+             return_residuals: bool = False):
         from jax.experimental.pallas import triton as plgpu
 
         rows, kv_heads, _, width = query.shape
@@ -354,9 +365,10 @@ class PagedDecodeAttention(tuning.KernelOp):
         sunk = [] if sinks is None else [pl.BlockSpec((None, QUERIES), lambda row, head, split: (head, 0))]
         out_shape, out_specs = _outputs(query.shape, query.dtype, splits, 2, queried,
                                         [summed, reduced, reduced])
+        spec = _spec(1 / math.sqrt(width), softcap, natural)
         out = pl.pallas_call(
-            lambda *refs: _paged_kernel(*refs, pages=pages, scale=1 / math.sqrt(width), splits=splits,
-                                        interpret=interpret, softcap=softcap, sinks=sinks is not None),
+            lambda *refs: _paged_kernel(*refs, pages=pages, spec=spec, splits=splits, interpret=interpret,
+                                        sinks=sinks is not None),
             grid=(rows, kv_heads, splits),
             in_specs=[pl.BlockSpec((None, 2), lambda row, head, split: (row, 0)),
                       pl.BlockSpec((None, table.shape[1]), lambda row, head, split: (row, 0)),
@@ -366,7 +378,7 @@ class PagedDecodeAttention(tuning.KernelOp):
             compiler_params=plgpu.CompilerParams(num_warps=WARPS, num_stages=2),
             interpret=interpret, name="paged_decode_attention",
         )(spans, table, query, key_pages, value_pages, *([] if sinks is None else [sinks]))
-        return (out if splits == 1 else _combined(*out, axis=2).astype(query.dtype)), None
+        return (out if splits == 1 else _combined(spec, *out, axis=2).astype(query.dtype)), None
 
     def operands(self, specs: list[jax.ShapeDtypeStruct], seed: int) -> list[jax.Array]:
         """Normal floats, each row's table naming pages of the pool in turn and its span the whole
@@ -428,7 +440,7 @@ def grouped_query(attend, query, key, value):
 
 
 def attend(query: jax.Array, key: jax.Array, value: jax.Array, lengths: jax.Array, starts=None, *,
-           softcap: float | None = None, sinks: jax.Array | None = None,
+           softcap: float | None = None, sinks: jax.Array | None = None, natural: bool = NATURAL,
            interpret: bool = False) -> jax.Array:
     """Attention of `query` `[B, T, N, D]` over the keys from `starts` `[B]`
     (0 where None) to `lengths` `[B]` of `key` and `value` `[B, S, K, D]`, a
@@ -438,7 +450,8 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, lengths: jax.Arra
     is below its length. A key head's query heads are its query positions, so
     the call's positions times its group are at most `QUERIES`. A `softcap`
     bounds the scaled logits (`softcap · tanh(logit / softcap)`, Gemma 2's);
-    `sinks` `[N]` put one value-free logit a head in each row's softmax. Its
+    `sinks` `[N]` put one value-free logit a head in each row's softmax;
+    `natural` keeps the logits natural (`algebra.Forward.base2`). Its
     Pallas call has no derivative: `dew.nn.attention` differentiates it as the
     attention it stands in for."""
     sunk = None if sinks is None else _row_sinks(sinks, key.shape[2], query.shape[1])
@@ -447,7 +460,8 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, lengths: jax.Arra
         # A key head's query heads as its query positions, `t * group + g` for head `k * group + g`.
         rows = grouped.shape[1]
         padded = jnp.pad(grouped, ((0, 0), (0, QUERIES - rows), (0, 0), (0, 0)))
-        out = _DECODE(padded, key, value, _spans(lengths, starts), sunk, interpret=interpret, softcap=softcap)
+        out = _DECODE(padded, key, value, _spans(lengths, starts), sunk, interpret=interpret, softcap=softcap,
+                      natural=natural)
         return out[:, :rows]
 
     return grouped_query(launched, query, key, value)
@@ -455,10 +469,10 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, lengths: jax.Arra
 
 def _row_sinks(sinks: jax.Array, kv_heads: int, positions: int) -> jax.Array:
     """Each key head's query rows' sinks `[kv_heads, QUERIES]` from the query heads' `sinks` `[N]`: row
-    `t * group + g` of key head `k` is query head `k * group + g`'s, a row past the call's `EMPTY`, which
+    `t * group + g` of key head `k` is query head `k * group + g`'s, a row past the call's -inf, which
     no softmax counts."""
     rows = jnp.tile(sinks.astype(jnp.float32).reshape(kv_heads, -1), (1, positions))
-    return jnp.pad(rows, ((0, 0), (0, QUERIES - rows.shape[1])), constant_values=EMPTY)
+    return jnp.pad(rows, ((0, 0), (0, QUERIES - rows.shape[1])), constant_values=-jnp.inf)
 
 
 def _paged_geometry(case: "PagedCase") -> bool:
@@ -477,13 +491,15 @@ selector's GPU kernel declares (`dew.nn.kv_cache.TRITON_PAGED_SUPPORTS`)."""
 
 def attend_paged(query: jax.Array, key_pages: jax.Array, value_pages: jax.Array, table: jax.Array,
                  lengths: jax.Array, starts=None, *, softcap: float | None = None,
-                 sinks: jax.Array | None = None, interpret: bool = False) -> jax.Array:
+                 sinks: jax.Array | None = None, natural: bool = NATURAL,
+                 interpret: bool = False) -> jax.Array:
     """Attention of one query a row `[rows, heads, D]` over the keys from
     `starts` `[rows]` (0 where None) to `lengths` `[rows]` of that row's pages,
     `table` `[rows, per_row]` naming them in the `[kv_heads, pages, page_size,
     D]` pools; a query head reads the key head it shares with `heads //
     kv_heads` others; a `softcap` bounds the scaled logits and `sinks` `[heads]`
-    join each row's softmax as `attend`'s. `[rows, heads, D]` out, `interpret`
+    join each row's softmax and `natural` keeps the logits natural as `attend`'s.
+    `[rows, heads, D]` out, `interpret`
     running it on the CPU."""
     rows, heads, width = query.shape
     kv_heads, _, page_size, _ = key_pages.shape
@@ -493,5 +509,5 @@ def attend_paged(query: jax.Array, key_pages: jax.Array, value_pages: jax.Array,
     table = jnp.pad(table, ((0, 0), (0, -table.shape[1] % pages)))
     sunk = None if sinks is None else _row_sinks(sinks, kv_heads, 1)
     out = _PAGED_DECODE(grouped, key_pages, value_pages, table, _spans(lengths, starts), sunk,
-                        interpret=interpret, softcap=softcap)
+                        interpret=interpret, softcap=softcap, natural=natural)
     return out[:, :, :group].reshape(rows, heads, width)

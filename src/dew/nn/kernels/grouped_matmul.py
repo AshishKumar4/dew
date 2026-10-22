@@ -761,8 +761,8 @@ class MosaicTgmm(_Mosaic):
         depth, width = ba.arguments['tokens'].shape[1], ba.arguments['cotangent'].shape[1]
         # No pair: the streamed cooperative tile ran 1.06-1.23x faster than the paired tiles' kernel, which
         # never beat it by more than 2% (OVERLAP-h100, GMMCOOP-h100).
-        return tuple(tile for tile in _modelled(ba)
-                     if tile.cluster == 1 and depth % tile.block_m == 0 and width % tile.block_n == 0)
+        return base.dividing(tuple(tile for tile in _modelled(ba) if tile.cluster == 1), (depth, width),
+                             lambda tile: (tile.block_m, tile.block_n))
 
     def fitting(self, ba, target) -> tuple[mosaic_gpu.Tiles, ...]:
         """The tiles that fit `target` (`Template.fitting`), with `exact_sums` those whose two fp32
