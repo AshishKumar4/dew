@@ -61,6 +61,7 @@ from dew.data.dataset import (
     _column,
     _shareable,
     _stacked,
+    logged_run,
     record_batch,
     stacked,
     take_batch,
@@ -943,7 +944,8 @@ class _PassesIterator(pygrain.DatasetIterator):
                     raise ValueError(f"a pass of {self._name} yields no rows, so repeating it reads "
                                      "nothing forever") from None
                 self._empty += 1
-                if not self._empty & (self._empty - 1):
+                # From the first: a pass of no rows is no ordinary filter's run.
+                if logged_run(self._empty):
                     _log.warning("%s yielded no row in its last %d passes; the read goes on until one does",
                                  self._name, self._empty)
             self._ended = True

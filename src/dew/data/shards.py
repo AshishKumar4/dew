@@ -12,15 +12,10 @@ import grain.python as grain
 
 from dew.records import boolean, record
 
-from .dataset import DataPartition, Loading
+from .dataset import LONG_RUN, DataPartition, Loading, logged_run
 from .sources.base import Shard, ShardManifest
 
 _log = logging.getLogger(__name__)
-
-_FIRST_LOGGED_EMPTY = 1024
-"""The run of empty shards in a row a read first logs, then again at each doubling: more than a
-sharded store holds by accident, so a store of empty files is named from the first line."""
-
 
 def streamed(
     manifest: ShardManifest,
@@ -35,7 +30,7 @@ def streamed(
     """The shards of `manifest` read `epochs` times over (endlessly where None), this share's part
     of them interleaved `cycle_length` at a time. An endless read of a store whose shards all state
     they hold no row is refused, as it would read nothing forever; any other run of empty shards is
-    read through, logged at each doubling (`_FIRST_LOGGED_EMPTY`)."""
+    read through, logged at each doubling from `LONG_RUN` (`logged_run`)."""
     if cycle_length < 1:
         raise ValueError("interleave cycle_length must be positive")
     described = name or (manifest.shards[0].uri if manifest.shards else "a stream")
@@ -94,7 +89,7 @@ class _EmptyRun:
         with self.lock:
             self.count = 0 if yielded else self.count + 1
             count = self.count
-        if count >= _FIRST_LOGGED_EMPTY and not count & (count - 1):
+        if logged_run(count, LONG_RUN):
             _log.warning("%s: its last %d shards held no row; the read goes on to the next", self.name, count)
 
 
