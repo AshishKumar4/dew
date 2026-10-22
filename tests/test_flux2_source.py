@@ -35,7 +35,8 @@ from dew.nn.scan_orders import pixel_shuffle
 ROOT = Path(__file__).resolve().parents[1]
 CASES = ("dev", "rect", "unguided", "narrow")
 CASE_SEEDS = {"dev": 256, "rect": 256, "unguided": 64, "narrow": 256}
-"""Check 1's declared seeds for each case, sized by `seeds_for` (on an A100 node's CPU, where the reference runs)."""
+"""Check 1's declared seeds for each case, sized by `seeds_for` on an A100 node's CPU, where the
+reference runs."""
 ROWS = 4
 """Each draw holds the case's batch ROWS times over, so a parameter's gradient sums over more rows and
 one draw's error varies less: at the fixture's batch the dev and rect cases did not resolve within 512
