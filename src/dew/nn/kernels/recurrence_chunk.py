@@ -47,24 +47,24 @@ parallelism, and 64 is what the reference's kernels assume."""
 
 
 def held_chunk(chunk_size: int, key_width: int) -> int:
-    """The longest chunk the delta rule holds at `key_width`: `chunk_size`, at most twice the keys' width
-    and at least a sub-chunk of 16. A chunk's keys span at most `key_width` dimensions, so past it its
-    triangular system's inverse grows and the memory's update, `S exp(G) - (k last)^T (W S)`, cancels
-    to a far smaller value: over a long sequence (1024 tokens, the decay near one) 64-token chunks of
-    16-wide keys put the final memory 1.7 to 1.8 times the token-by-token recurrence's error from
-    float64, chunks of 32 and 16 held it, and so did 64-token chunks of 32-, 64- and 128-wide keys
-    (armada, every delta family)."""
-    return min(chunk_size, max(16, 2 * key_width))
+    """The delta rule's chunk at `key_width`: `chunk_size`, at most twice the keys' width. A measured
+    sizing policy, not a conditioning bound: over a long sequence (1024 tokens, the decay near one),
+    64-token chunks of 16-wide keys put the final memory 1.7 to 1.8 times the token-by-token
+    recurrence's error from float64 under every delta family, where chunks of 32 and 16 held it, and so
+    did 64-token chunks of 32-, 64- and 128-wide keys (tests/test_recurrence_stability.py, its long
+    sequence). The port's chunk is the power of two at or under it (`_blocked_rule`)."""
+    return min(chunk_size, 2 * key_width)
 
 
-def xla_chunk_states(key, k_cumdecay, out_vals, gc, last_decay, state, kept):
+def xla_chunk_states(key, k_cumdecay, out_vals, grown, last_decay, state, kept):
     """The memory crossing chunks, the one sequential part of the chunked
     rule, as a `lax.scan` over the algebra's `carry`: per chunk the reference's corrected values
     `v_new = value - k_cumdecay @ S` and its write `S * exp(gc[-1]) +
     (k * exp(gc[-1] - gc))^T @ v_new` (modeling_qwen3_next.py:439-446).
 
     Operands are per chunk in the reference's layout, `[B, H, NC, C, ...]`,
-    `gc` `[B, H, NC, C, D]` being the log decay cumulated within each chunk,
+    `grown` `[B, H, NC, C, D]` being the decay from each chunk's start, `exp(gc)` of the log decay
+    cumulated within it (`recurrence_algebra.decays`),
     D one for a decay per head or Dk for one per key dimension (KDA's, whose
     rows of S decay apart, modeling_glm5_next.py:529-532), and `state`
     `[B, H, Dk, Dv]` enters the first chunk. Returns the state each chunk
@@ -82,20 +82,21 @@ def xla_chunk_states(key, k_cumdecay, out_vals, gc, last_decay, state, kept):
     """
     final, (entered, corrected) = jax.lax.scan(
         algebra.carry, state,
-        tuple(jnp.moveaxis(x, 2, 0) for x in (key, k_cumdecay, out_vals, gc, last_decay, kept)))
+        tuple(jnp.moveaxis(x, 2, 0) for x in (key, k_cumdecay, out_vals, grown, last_decay, kept)))
     return jnp.moveaxis(entered, 0, 2), jnp.moveaxis(corrected, 0, 2), final
 
 
 class Chunked(NamedTuple):
     """A sequence's chunks as the algebra takes them, `[B, H, NC, C, ...]` in the working precision: the
-    scaled queries, the keys, the decay cumulated within each chunk `gc`, the pairs' decay, the queries'
-    and the write's decay from the memory entered `entering` (zero outside the entered document), the
+    scaled queries, the keys, the decay from each chunk's start `grown` (`recurrence_algebra.decays`), the
+    pairs' decay, the queries' and the write's decay from the memory entered `entering` (`grown`, zero
+    outside the entered document), the
     write's products `W` and `U` (`recurrence_algebra.apply`), the decay's last row `last` (zero outside
     the chunk's last document) and `kept` `[B, 1, NC, 1, 1]` (one where the memory entered passes
     through), with `padding` the tokens the last chunk was padded with."""
     query: jax.Array
     key: jax.Array
-    gc: jax.Array
+    grown: jax.Array
     pairs: jax.Array
     entering: jax.Array
     w: jax.Array
@@ -136,17 +137,16 @@ def chunked(query, key, value, g, beta, chunk_size: int = CHUNK_SIZE, *, starts=
         entered_document = document[..., :1, :] - begins.reshape(document.shape)[..., :1, :]
         first = document == entered_document
         kept = (document[..., -1:, :] == entered_document).astype(work)
-    # The log decay cumulated within each chunk, the reference's
-    # `g = g.cumsum(dim=-1)` (modeling_qwen3_next.py:417), and the decay
-    # `exp(gc[s] - gc[t])` between positions s >= t, zero above the diagonal:
-    # [B, H, NC, C, D], [B, H, NC, C, C, D].
-    gc, pairs = algebra.decays(chunks(g), document)
-    entering = jnp.exp(gc) if first is None else jnp.exp(gc) * first
+    # The decay from each chunk's start, exp of the reference's `g = g.cumsum(dim=-1)`
+    # (modeling_qwen3_next.py:417), and the decay `exp(gc[s] - gc[t])` between positions s >= t, zero
+    # above the diagonal: [B, H, NC, C, D], [B, H, NC, C, C, D].
+    grown, pairs = algebra.decays(chunks(g), document)
+    entering = grown if first is None else grown * first
     # The reference's `attn + I` operator after its row correction loop; without the delta rule nothing
     # is corrected, and each token writes its gated value.
     inverse = algebra.factor(algebra.intra(k_c, kb_c, pairs)) if delta else None
     w, u = algebra.apply(inverse, kb_c, vb_c, entering)
-    return Chunked(q_c, k_c, gc, pairs, entering, w, u, pairs[..., -1, :, :], kept, pad)
+    return Chunked(q_c, k_c, grown, pairs, entering, w, u, pairs[..., -1, :, :], kept, pad)
 
 
 def chunk_delta_rule(query, key, value, g, beta, state=None, chunk_size: int = CHUNK_SIZE, *, starts=None,
@@ -200,8 +200,8 @@ def chunk_delta_rule(query, key, value, g, beta, state=None, chunk_size: int = C
     # The barrier materializes the zero. Remove it when XLA:CPU no longer
     # returns an uninitialized scan carry here.
     state = jax.lax.optimization_barrier(state)
-    entered, v_corrected, state = xla_chunk_states(steps.key, steps.w, steps.u, steps.gc, steps.last, state,
-                                                   steps.kept)
+    entered, v_corrected, state = xla_chunk_states(steps.key, steps.w, steps.u, steps.grown, steps.last,
+                                                   state, steps.kept)
     # The pairs are zero above the diagonal, so this is the reference's inclusive
     # lower `masked_fill(triu(1), 0)`.
     core = algebra.readout(steps.query, steps.entering, entered, steps.key, steps.pairs, v_corrected)
@@ -326,6 +326,11 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
     return recurrence.normed(hooks, out, given, work).astype(dtype), final
 
 
+NARROWEST_KEYS = 8
+"""The narrowest keys the port takes: their chunk, twice their width (`held_chunk`), a whole sub-chunk of
+16 (fla's BC)."""
+
+
 def port_refusal(query, key, value, *, per_key: bool = False, floor: float | None = None) -> Refusal | None:
     """Why a rule over these operands runs the portable math rather than the
     port (`fla_rule`) on a target whose row names the port, or None where the
@@ -337,7 +342,8 @@ def port_refusal(query, key, value, *, per_key: bool = False, floor: float | Non
     over operands that vary, where a Pallas call, which states no varying
     type for its results, cannot run; float64 operands, whose rule is the
     reference math itself; and keys wider than the port takes in their
-    dtype. Packed documents take the port at any bound: it stores the
+    dtype, or narrower than `NARROWEST_KEYS`, whose chunk (`held_chunk`) is under a sub-chunk of 16.
+    Packed documents take the port at any bound: it stores the
     memories by where they pass, as many as the tokens' chunks, a row's and
     one, whatever the bound (`chunked_launch.Sequences`)."""
     widest = fla_gdn.WIDEST_KEYS if jnp.result_type(query, key, value).itemsize == 2 else fla_gdn.WIDEST
@@ -349,8 +355,8 @@ def port_refusal(query, key, value, *, per_key: bool = False, floor: float | Non
          "varying type for its results"),
         (all(jnp.dtype(x.dtype) != jnp.float64 for x in (query, key, value)), 'float64',
          "float64 operands, whose rule is the reference math itself"),
-        (key.shape[-1] <= widest, 'key_width',
-         f"keys {key.shape[-1]} wide; the port takes at most {widest} in "
+        (NARROWEST_KEYS <= key.shape[-1] <= widest, 'key_width',
+         f"keys {key.shape[-1]} wide; the port takes {NARROWEST_KEYS} to {widest} in "
          f"{jnp.result_type(query, key, value).name}"),
         (not per_key or (floor is not None and floor >= fla_kda.DECAY_FLOOR), 'decay_floor',
          f"a decay per key dimension with floor {floor} a token; the port takes "
@@ -474,8 +480,10 @@ def _blocked_rule(query, key, value, g, beta, state, starts, *, documents: int |
     state = _padded(_padded(state, 2, blocks[0]), 3, blocks[1])
     # A row's padding after its documents runs as one more sequence of its own.
     spans = None if documents is None else cu_seqlens(starts, B * (documents + 1))
+    # Whole sub-chunks of 16, a power of two the kernels' blocks take; keys under 8 wide are refused.
+    chunk = 1 << (held_chunk(CHUNK_SIZE, Dk).bit_length() - 1)
     port = fla_kda.chunk_kda if per_key else fla_gdn.chunk_gated_delta_rule
-    out, final = port(query, key, value, g, beta, state, spans, scale, held_chunk(CHUNK_SIZE, Dk),
+    out, final = port(query, key, value, g, beta, state, spans, scale, chunk,
                       not generation.triton_runs(), "delta_memory" not in RECOMPUTED.get(), wide)
     out = out[..., :width].reshape(B, S, Hv, split * width)[..., :Dv]
     final = final[:, :, :Dk, :width]

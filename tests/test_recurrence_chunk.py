@@ -262,7 +262,7 @@ def test_composed_chunks_leave_the_memory_the_recurrence_leaves(hooks, packed):
         steps = recurrence_chunk.chunked(query, key, operands.value, g, operands.beta, CHUNK,
                                          starts=operands.starts, delta=hooks.delta)
         t, w = jax.lax.associative_scan(algebra.compose, algebra.transition(
-            steps.key, steps.w, steps.u, steps.gc, steps.last, steps.kept), axis=2)
+            steps.key, steps.w, steps.u, steps.grown, steps.last, steps.kept), axis=2)
         entered = float32_einsum('bhkj,bhjv->bhkv', t[:, :, -1], operands.state.astype(t.dtype))
         return entered + w[:, :, -1]
 

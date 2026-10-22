@@ -65,10 +65,10 @@ def _case_call(launch, tiles, shape, dtype, *, reverse=False):
         "recompute_w_u": (keyed, valued, beta, inverse, gated),
         "chunk_fwd_h": (keyed, weighted, valued, prefix, state),
         "chunk_fwd_o": (keyed, keyed, valued, entered, prefix),
-        "chunk_bwd_dv_local": (keyed, keyed, gated, valued),
-        "chunk_bwd_dhu": (keyed, keyed, weighted, gated, state, valued, valued),
-        "chunk_bwd_dqkwg": (keyed, keyed, valued, weighted, gated, entered, valued, valued, entered),
-        "prepare_wy_repr_bwd": (keyed, valued, beta, gated, inverse, weighted, valued, keyed),
+        "chunk_bwd_dv_local": (keyed, keyed, prefix, valued),
+        "chunk_bwd_dhu": (keyed, keyed, weighted, prefix, state, valued, valued),
+        "chunk_bwd_dqkwg": (keyed, keyed, valued, weighted, prefix, entered, valued, valued, entered),
+        "prepare_wy_repr_bwd": (keyed, valued, beta, prefix, inverse, weighted, valued, keyed),
     }
     kwargs = {"chunk": chunk, "interpret": False}
     if kernel == "cumulated":
