@@ -4,23 +4,23 @@
 computes. The kernel is written for TPU (a GPU runs mamba_ssm's own kernels,
 `dew.nn.kernels.mamba_ssd`); a host without one runs it through
 `pallas_call(interpret=True)`, which checks the exact contracts: shapes, dtypes, finiteness, resets and
-state gradients. Its numbers are the TPU's: check 1 holds every geometry, the host's among them, where
-the kernel runs (`test_the_kernel_is_as_exact_as_the_xla_scan` in this file, on the TPU tier; 11 passed on
-a v5e). An interpreted kernel's numbers on a CPU are XLA:CPU's dot lowering, not the kernel's, and
-follow the host's ISA: the one-short state-gradient RMS ratio was 1.598 (99.9% interval [1.581, 1.617],
-640 seeds) on AMD x86-64-v4 against 0.77 on v3, so no CPU check judges them (ledger row 1322).
+state gradients. The kernel's numbers are judged where it runs: check 1 holds every geometry, the host's
+among them, on the TPU tier (`test_the_kernel_is_as_exact_as_the_xla_scan` in this file; 11 passed on a
+v5e). Interpreted on a CPU, the ratio moves with the host's ISA, for one kernel and one draw: the
+one-short state-gradient RMS ratio was 1.598 (99.9% interval [1.581, 1.617], 640 seeds) on AMD
+x86-64-v4 against 0.77 on v3, and one-over's final-state ratio 1.508 ([1.475, 1.543], 160 seeds) on v4.
+Which arm moves is not yet measured. On the host, the XLA scan's float64 arithmetic is held to the
+recurrence (`test_the_xla_scan_computes_the_recurrence`).
 
-One driver (`assert_kernel_parity`) holds every case to the same rule: the
+On the TPU tier, one driver (`assert_kernel_parity`) holds every case to the same rule: the
 kernel's forward, final state and all five gradients finite and, by
 tests/reference_error.py's pooled gate, on par with XLA's distance from the stepwise recurrence in
 float64 (`stepwise_scan`, which shares no line with either chunked path), the XLA path's arithmetic in float64
-first held to the recurrence. The cases (`CASES`): the reference fixture's scan
-at a chunk of 32 (three chunks, a ragged tail) and of 128 (one chunk, mostly
-padding), with and without document resets (`RESET_DECAY` in `A dt`, which the
-kernel's segment sums multiply by the 0/1 triangle where a -inf would make
-NaN); tails one short of and one over a chunk, whole chunks, ragged ones and
-the default chunk at a production width; and, compiled on a TPU, the geometry
-`tools/benchmark_ssd.py --parity` times.
+first held to the recurrence. The cases (`CASES`): the reference fixture's scan at a chunk of 32 (three
+chunks, a ragged tail) and of 128 (one chunk, padded), with and without document resets (`RESET_DECAY` in
+`A dt`, which the kernel's segment sums multiply by the 0/1 triangle where a -inf would make NaN); tails
+one short of and one over a chunk, whole chunks, ragged ones and the default chunk at a production width;
+and, compiled on a TPU, a geometry `tools/benchmark_ssd.py --parity` can time.
 """
 
 from pathlib import Path
@@ -29,7 +29,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact, assert_computes_the_oracle
+from reference_error import assert_as_exact, assert_computes_the_oracle, widened
 from ssd_support import ssd_orbit
 
 from dew.nn.kernels.recurrence_chunk import RESET_DECAY
@@ -302,6 +302,21 @@ def test_the_kernel_is_as_exact_as_the_xla_scan(reference, kind, case, compiled)
 
 
 HOST_CASES = [pytest.param(*param.values[:2], id=param.id) for param in CASES if not param.values[2]]
+
+
+@pytest.mark.parametrize(("kind", "case"), HOST_CASES)
+def test_the_xla_scan_computes_the_recurrence(reference, kind, case):
+    """The XLA scan's float64 output, final state and all five gradients within float64 rounding of the
+    stepwise recurrence's on the host, the oracle check 1's truth rests on (`parity_functions`)."""
+    chunk_size = case[0] if kind == "fixture" else case[1]
+    if kind == "fixture":
+        _, length, _, width = reference["scan.x"].shape
+        roundings = length + width + reference["scan.B"].shape[-1]
+    else:
+        roundings = case[0][1] + case[0][3] + case[0][4]
+    _, truth = parity_functions(chunk_size, roundings)
+    with jax.enable_x64(new_val=True):
+        truth(*widened(case_draw(reference, kind, case)(0)))
 
 
 @pytest.mark.parametrize(("kind", "case"), HOST_CASES)
