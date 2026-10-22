@@ -10,7 +10,6 @@ import contextvars
 import dataclasses
 import functools
 import importlib
-import itertools
 import math
 from collections.abc import Callable
 from typing import Literal, get_args
@@ -33,7 +32,7 @@ from .attention_kernels import (
     DECODE,
     SPLASH_BLOCK,
     SPLASH_LANES,
-    TPU_SUPPORTS,
+    TPU_BACKEND,
     AttentionCase,
     decodes,
 )
@@ -82,7 +81,7 @@ from .sharding import (
     sequence_shards,
     split_positions,
 )
-from .visibility import same_chunk, visible, windowed
+from .visibility import same_chunk, visible, window_sides, windowed
 
 AttentionImpl = Literal["auto", "reference", "xla", "cudnn", "triton", "flash", "tpu"]
 """Names which kernel an attention call runs.
@@ -166,20 +165,6 @@ def alibi_bias(key_positions, num_heads: int, *, dtype) -> jax.Array:
     positions = jnp.atleast_2d(key_positions)
     return (jnp.asarray(slopes)[None, :, None, None]
             * positions[:, None, None, :]).astype(dtype)
-
-
-def window_sides(causal: bool, sliding_window: int) -> tuple[int, int]:
-    """The keys a window of `sliding_window` keeps before and after each query,
-    counted as `jax.nn.dot_product_attention`'s `local_window_size` counts them.
-
-    A causal window keeps the query and the w - 1 keys before it. A
-    bidirectional one keeps the keys within w - 1 positions on either side,
-    |q - k| < w: ModernBERT's |q - k| <= local_attention // 2, which is w =
-    local_attention // 2 + 1 (masking_utils.py:141-158, transformers 5.16.1).
-    A model layer passes one only where its kind asks for it
-    (`LayerKind.bidirectional_window`).
-    """
-    return sliding_window - 1, 0 if causal else sliding_window - 1
 
 
 def structural_mask(query_positions, kv_len: int, causal: bool,
@@ -1675,12 +1660,10 @@ def attention_case(query, key, *, dtype=None, precision=None, force_fp32_for_sof
         narrows=_xla_kernel_narrows(query) or _xla_kernel_chains(query, key),
         folds=folds(query, key, bias, mask, causal, sliding_window),
         splash=False, shards=sequence_shards())
-    # Splash's descriptor reads a concrete mask on the host, so it is built only for a call under a
-    # name that may choose splash which every requirement of splash's before its tiling takes
-    # (`TPU_SUPPORTS`, in the order a refusal names them): whether splash tiles the call is then the
-    # fact to form, its lengths and its descriptor, and a later refusal is still reported as itself.
-    earlier = itertools.takewhile(lambda need: need.code != 'tiles', TPU_SUPPORTS)
-    if named in ('auto', 'tpu') and all(need.holds(case) for need in earlier):
+    # Splash's descriptor reads a concrete mask on the host, so it is built only where splash may run,
+    # a call under a name that may choose it on a TPU (`TPU_BACKEND`): whether splash tiles the call is
+    # then a fact of its own, and each other requirement reports itself (`TPU_SUPPORTS`).
+    if named in ('auto', 'tpu') and TPU_BACKEND.holds(case):
         tiled = q_len % SPLASH_LANES == 0 and kv_len % SPLASH_LANES == 0
         case = dataclasses.replace(case, splash=(
             tiled and min(q_len, kv_len) >= SPLASH_MIN_LENGTH

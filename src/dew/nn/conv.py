@@ -19,14 +19,17 @@ On TPU, XLA's space-to-batch rewrite corrupts a convolution feeding a strided
 strided convolution's input, whatever the global batch, since a shard's may
 be small; its derivative and batching rules are identities.
 
-A dilated 3x3 depthwise convolution runs on CUDA as an undilated one over
-its interleaved grids (`_polyphase_depthwise_3x3`), since cuDNN's dilated
-grouped kernels are slow: on the RTX 4080 at 16x16x768, batch 16, bf16
-forward and VJP take 0.097 ms (dilation 2) against 1.6 ms dilated, and the
-176M hybrid DiT's bf16 step runs 70.2 ms against 75.3
-(`tools/benchmark_depthwise.py`). Accumulation stays fp32 and ordinary JAX
-differentiation keeps higher-order derivatives; other backends use lax, as
-does a convolution a Qwix rule quantizes (`dew.quantization`).
+A dilated 3x3 depthwise convolution runs on CUDA in the form measured faster
+for its dtype, since cuDNN's dilated grouped kernels are slow: in bf16 as an
+undilated one over its interleaved grids (`_polyphase_depthwise_3x3`), whose
+forward and VJP on the RTX 4080 at 16x16x768, batch 16, take 0.097 ms at
+dilation 2 against 0.31 ms as nine shifted products, the 176M hybrid DiT's
+bf16 step 70.2 ms against 75.3; in fp32 as those nine products held in memory
+(`_materialized_depthwise_3x3`), where cuDNN's grouped direct kernels make the
+polyphase form slower (docs/performance.md, `tools/benchmark_depthwise.py`).
+Accumulation stays fp32 and ordinary JAX differentiation keeps higher-order
+derivatives; other backends use lax, as does a convolution a Qwix rule
+quantizes (`dew.quantization`).
 """
 
 import math
@@ -140,39 +143,17 @@ def _polyphase_depthwise_3x3(lhs: jax.Array, rhs: jax.Array, dilation: int) -> j
     return output.reshape(batch, rows * dilation, columns * dilation, features)[:, :height, :width]
 
 
-def _depthwise_taps(lhs: jax.Array, rhs: jax.Array, dilation: int, *, materialized: bool) -> jax.Array:
-    """The depthwise convolution as its nine shifted products in fp32, summed in the kernel's row-major
-    order and rounded once to the input's dtype: the one body both schedules run.
-
-    The schedule is where XLA may round: barriered (`materialized=False`), each product is rounded to
-    fp32 before it is added, where XLA would otherwise contract it into a fused multiply-add;
-    materialized, the fp32 input, kernel and output are held in memory (`_barrier`, in the cotangents
-    too), so XLA fuses the products and their weight reductions into kernels of their own rather than
-    into a neighbour's, contracting as it measures fastest."""
-    height, width = lhs.shape[1:3]
-    border = ((0, 0), (dilation, dilation), (dilation, dilation), (0, 0))
-    wide, kernel = lhs.astype(jnp.float32), rhs.astype(jnp.float32)
-    if materialized:
-        wide, kernel = _barrier(wide), _barrier(kernel)
-    padded = jnp.pad(wide, border)
-    def tap(row: int, column: int) -> jax.Array:
-        top, left = row * dilation, column * dilation
-        return padded[:, top:top + height, left:left + width, :] * kernel[row, column, 0]
-
-    products = [tap(row, column) for row in range(3) for column in range(3)]
-    if not materialized:
-        products = jax.lax.optimization_barrier(products)
-    # The materialized sum starts from a positive zero, as cuDNN's accumulator does, so taps that are
-    # all negative zero sum to positive zero; the barriered one from the first product, as YNNPACK's.
-    total = jnp.zeros(lhs.shape, jnp.float32) if materialized else products[0]
-    for product in products if materialized else products[1:]:
-        total = total + product
-    return (_barrier(total) if materialized else total).astype(lhs.dtype)
+def _taps(padded: jax.Array, kernel: jax.Array, dilation: int, height: int, width: int) -> list[jax.Array]:
+    """The depthwise convolution's nine fp32 products, in the kernel's row-major order: each tap of the
+    padded input, shifted by its row and column times `dilation`, times the kernel's weight there. Each
+    schedule (`_shifted_depthwise_3x3`, `_materialized_depthwise_3x3`) sums them as it rounds."""
+    return [padded[:, row * dilation:row * dilation + height, column * dilation:column * dilation + width, :]
+            * kernel[row, column, 0] for row in range(3) for column in range(3)]
 
 
 def _shifted_depthwise_3x3(lhs: jax.Array, rhs: jax.Array, dilation: int) -> jax.Array:
-    """The depthwise convolution's taps (`_depthwise_taps`), each product rounded to fp32 before it is
-    added.
+    """The depthwise convolution's taps (`_taps`), each product rounded to fp32 before it is added, the
+    sum from the first, rounded once to the input's dtype.
 
     For more than 16 features that is XLA:CPU's library convolution's
     arithmetic (YNNPACK, jax 0.11.2), bit for bit in fp32 and bf16, which on
@@ -181,12 +162,19 @@ def _shifted_depthwise_3x3(lhs: jax.Array, rhs: jax.Array, dilation: int) -> jax
     convolution. If a jax or YNNPACK release changes that summation,
     tests/test_depthwise_conv.py's
     test_cpu_depthwise_is_the_library_convolution_bit_for_bit fails."""
-    return _depthwise_taps(lhs, rhs, dilation, materialized=False)
+    height, width = lhs.shape[1:3]
+    padded = jnp.pad(lhs, ((0, 0), (dilation, dilation), (dilation, dilation), (0, 0))).astype(jnp.float32)
+    products = jax.lax.optimization_barrier(_taps(padded, rhs.astype(jnp.float32), dilation, height, width))
+    total = products[0]
+    for product in products[1:]:
+        total = total + product
+    return total.astype(lhs.dtype)
 
 
 def _materialized_depthwise_3x3(lhs: jax.Array, rhs: jax.Array, dilation: int) -> jax.Array:
-    """The depthwise convolution's taps (`_depthwise_taps`) with its fp32 input, kernel and output held
-    in memory.
+    """The depthwise convolution's taps (`_taps`) summed onto zeros, its fp32 input, kernel and output
+    held in memory (`_barrier`, in the cotangents too), so XLA fuses the products and their weight
+    reductions into kernels of their own rather than into a neighbour's.
 
     CUDA runs a dilated one in this form in fp32 and in the polyphase form
     in bf16: the 176M hybrid DiT's training step on an RTX 4080, ms, with
@@ -201,7 +189,13 @@ def _materialized_depthwise_3x3(lhs: jax.Array, rhs: jax.Array, dilation: int) -
     In fp32 cuDNN runs the polyphase convolutions with its grouped direct
     kernels, 3.8 ms of the 5.2 ms a b16 step spent in those layers, and the
     interleaving transposes 1.3 ms more."""
-    return _depthwise_taps(lhs, rhs, dilation, materialized=True)
+    height, width = lhs.shape[1:3]
+    border = ((0, 0), (dilation, dilation), (dilation, dilation), (0, 0))
+    padded = jnp.pad(_barrier(lhs.astype(jnp.float32)), border)
+    output = jnp.zeros(lhs.shape, jnp.float32)
+    for product in _taps(padded, _barrier(rhs.astype(jnp.float32)), dilation, height, width):
+        output = output + product
+    return _barrier(output).astype(lhs.dtype)
 
 
 def _conv_general_dilated(

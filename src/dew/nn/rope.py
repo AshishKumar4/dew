@@ -27,6 +27,15 @@ from dew.registry import from_record
 from .precision import at_least_fp32
 
 
+def sinusoids(angles, *, cosine_first: bool = False, xp=jnp):
+    """Each angle's sine and cosine side by side, `[..., n]` to `[..., 2n]`, the sines first or, where
+    `cosine_first`, the cosines: the absolute sinusoidal tables (a timestep's, a patch grid's, audio's
+    relative positions) over `inverse_frequencies`. `xp` is the array module: `numpy` for a host table
+    built while a model traces, which JAX would otherwise stage into the trace."""
+    first, second = (xp.cos(angles), xp.sin(angles)) if cosine_first else (xp.sin(angles), xp.cos(angles))
+    return xp.concatenate([first, second], axis=-1)
+
+
 def inverse_frequencies(theta: float, dim: int, pairs: int | None = None, *,
                         dtype: DTypeLike) -> np.ndarray:
     """`1 / theta ** (2i / dim)` for i below `pairs` (all of `dim // 2` by

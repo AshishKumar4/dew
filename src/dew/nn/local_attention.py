@@ -333,10 +333,8 @@ def _local_blocks(kernel, query, key, value, *, window, chunk, places, segment_i
         if chunk is not None and places is None:
             keep = keep & same_chunk(rows[..., :, None], key_rows[..., None, :], chunk)
         elif chunk is not None:
-            places = row_blocks(places) // chunk
-            earlier = preceding(2)
-            keep = keep & (places[..., :, None] == _banded(
-                places, None if earlier is None else earlier // chunk)[..., None, :])
+            held = row_blocks(places)
+            keep = keep & same_chunk(held[..., :, None], _banded(held, preceding(2))[..., None, :], chunk)
         if segment_ids is not None:
             segments = row_blocks(segment_ids)
             keep = keep & ((segments[..., :, None] == _banded(segments, preceding(3))[..., None, :])

@@ -97,7 +97,7 @@ class AttentionCase:
     reference path computes (`reference_only`), `narrows` one jax.nn's xla kernel would compute
     below its precision (`_xla_kernel_narrows`, `_xla_kernel_chains`), `folds` one of few query
     positions `folded_attention` reads on a GPU, and `splash` one splash's blocking tiles and its
-    mask describes (`tpu_runs`)."""
+    mask's descriptor describes, formed on a TPU alone (`TPU_BACKEND`) and False elsewhere."""
 
     queries: int
     keys: int
@@ -297,10 +297,14 @@ most 64 wide where it was measured faster (an RTX 4080's SimpleDiT-B attention 5
 causal 3-layer decoder's 1.82 to 1.24; Qwen3-0.6B's 128-wide 9.13 to 9.24), and no window, mask, bias,
 sinks, softcap, documents or key lengths or starts."""
 
+TPU_BACKEND = _Need('backend', lambda case: generation.backend() == 'tpu', "it runs on a TPU", row=INHERENT,
+                    kind='measured')
+"""Splash's first requirement, a TPU, which the case builder also reads before it forms the tiling fact
+(`AttentionCase.splash`), the one fact that costs a host-side descriptor."""
+
 TPU_SUPPORTS = (
     # Elsewhere it runs interpreted, where 'tpu' is named.
-    _Need('backend', lambda case: generation.backend() == 'tpu', "it runs on a TPU", row=INHERENT,
-                kind='measured'),
+    TPU_BACKEND,
     _Need('bias', lambda case: not case.bias, "splash takes no bias", row=INHERENT, kind='measured'),
     _Need('key_lengths', lambda case: not (case.lengths or case.starts),
                 "splash takes key lengths and starts only as a mask it cannot describe", row=INHERENT,
