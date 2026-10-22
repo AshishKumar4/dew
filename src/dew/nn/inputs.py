@@ -141,10 +141,10 @@ def _check_token_ids(array: np.ndarray) -> None:
 
 def _token_row(row: object) -> list[int] | np.ndarray:
     """One row of token ids by `token_id`'s law, before rows join into one array, where NumPy would
-    promote a bool into an id: a list or tuple token by token (`token_ids`), an array whole by its
-    dtype, an integer one, whose range `host_token_rows` checks with the rest."""
-    if isinstance(row, list | tuple):
-        return token_ids(row, where="a token row")
+    promote a bool into an id: a sequence token by token (`token_ids`), an array whole by its dtype,
+    an integer one, whose range `host_token_rows` checks with the rest."""
+    if isinstance(row, Sequence) and not isinstance(row, str | bytes):
+        return token_ids(list(row), where="a token row")
     array = np.asarray(row)
     if not np.issubdtype(array.dtype, np.integer):
         raise ValueError(f"a token row holds integer token ids, got an array of {array.dtype}")
@@ -184,8 +184,8 @@ class ModelInputs:
         A `ModelInputs` is validated as it is, and a JAX array is wrapped where
         it sits. Anything else is read on the host as an integer `[B, S]`
         array, and ids that int32 cannot represent raise ValueError. Rows given
-        in a list or tuple are each read by `token_id`'s law first (`_token_row`),
-        so a bool among them is refused rather than promoted into an id.
+        as a sequence are each read by `token_id`'s law first (`_token_row`), so
+        a bool among them is refused rather than promoted into an id.
 
         Distributed algorithms call this inside their agreed validation phase.
         It runs no collectives and no model.
@@ -195,7 +195,8 @@ class ModelInputs:
         elif isinstance(value, jax.Array):
             prepared = cls(value)
         else:
-            rows = [_token_row(row) for row in value] if isinstance(value, list | tuple) else value
+            rows = ([_token_row(row) for row in value]
+                    if isinstance(value, Sequence) and not isinstance(value, str | bytes) else value)
             prepared = cls(jnp.asarray(host_token_rows(np.asarray(rows))))
         prepared.validate()
         return prepared
