@@ -4,9 +4,18 @@ import json
 from collections.abc import Iterable
 from pathlib import Path
 
+import jax.numpy as jnp
 import numpy as np
 
+from dew.objectives.lm import TEXT_KEY
 from tools.token_corpus import write_token_meta
+
+
+def token_batch_of(vocab: int, seq: int, batch: int = 4, seed: int = 0) -> dict:
+    """A `[batch, seq + 1]` batch of ids under `vocab`, drawn from `seed`, as the token pipeline packs
+    them."""
+    ids = np.random.RandomState(seed).randint(0, vocab, (batch, seq + 1))
+    return {TEXT_KEY: jnp.asarray(ids, jnp.int32)}
 
 
 def write_token_corpus(directory: Path, train: np.ndarray, val: np.ndarray | None = None,
@@ -37,6 +46,35 @@ def encoded_token_fixture(directory: Path, documents: Iterable[str], *, tokenize
     held = int(len(tokens) * val_fraction)
     return write_token_corpus(directory, tokens[held:], tokens[:held], tokenizer=tokenizer,
                               vocab_size=vocabulary.vocab_size, eos_id=vocabulary.eos_id if eos else None)
+
+
+def token_rows(vocabulary: int, rows: int, length: int, *, seed: int = 0, low: int = 0) -> dict:
+    """A batch of `rows` token rows `length` long under the key "text", drawn at `seed` from
+    `low` up to `vocabulary`."""
+    tokens = np.random.default_rng(seed).integers(low, vocabulary, size=(rows, length))
+    return {"text": tokens.astype(np.int32)}
+
+
+def repeated_token_batch(vocabulary: int, rows: int, length: int, seed: int = 0):
+    """One batch of `token_rows` yielded forever: a train loader whose every step reads it."""
+    batch = token_rows(vocabulary, rows, length, seed=seed)
+    while True:
+        yield batch
+
+
+def byte_level_tokenizer(directory: Path):
+    """A byte-level BPE over all 256 bytes, saved in `directory` and read back through
+    transformers: any text has a spelling, and a code point may split across tokens."""
+    from tokenizers import Tokenizer, decoders, models, pre_tokenizers
+    from transformers import AutoTokenizer, PreTrainedTokenizerFast
+    from transformers.convert_slow_tokenizer import bytes_to_unicode
+
+    alphabet = bytes_to_unicode()
+    backend = Tokenizer(models.BPE({alphabet[byte]: byte for byte in range(256)}, [], unk_token=None))
+    backend.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
+    backend.decoder = decoders.ByteLevel()
+    PreTrainedTokenizerFast(tokenizer_object=backend).save_pretrained(directory)
+    return AutoTokenizer.from_pretrained(directory, local_files_only=True)
 
 
 def export_byte_tokens(root: Path, documents: Iterable[str], *flags: str) -> Path:

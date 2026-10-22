@@ -42,6 +42,7 @@ from collections.abc import Callable, Iterator, Mapping
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax import linen as nn
 from flax.linen import spmd
 
@@ -753,20 +754,48 @@ def boxed(table: Mapping[Suffix, LogicalAxes]) -> Iterator[None]:
         _BOXED.reset(token)
 
 
+ADAPTER_RANK = "adapter_rank"
+"""The logical axis of a low-rank adapter's rank (`LOW_RANK_FACTORS`), which no rule places."""
+
+LOW_RANK_FACTORS = ("lora_A", "lora_B")
+"""The low-rank factors an adapted module holds beside its kernel (`dew.lora`): `lora_A` of shape
+`[in..., r]` and `lora_B` of `[r, out...]`, which `declarations` gives the kernel's axes on each
+one's side of the rank."""
+
+
 def declarations(tree) -> dict[Suffix, LogicalAxes]:
     """The axes `logical_axes` declares for each leaf of `tree`, by the
     leaf's parameter path, the one place the declarations are read: a
     declaration names a module, whose parameters share its axes, or one
     parameter under its module, for a module whose leaves have different
     axes (GPT OSS's fused experts). The parameter's own path is tried first.
+    A low-rank factor under a declared module takes its kernel's axes on its
+    side of the rank and `ADAPTER_RANK` for the rank (`factor_axes`).
     """
     table: dict[Suffix, LogicalAxes] = {}
-    for path, _ in jax.tree_util.tree_leaves_with_path(nn.unbox(tree)):
+    for path, leaf in jax.tree_util.tree_leaves_with_path(nn.unbox(tree)):
         names = parameter_path(path)
-        suffix = _matching(_OWNERS, names) or _matching(_OWNERS, names[:-1])
-        if suffix is not None:
-            table[names] = _OWNERS[suffix][0]
+        if (owned := _matching(_OWNERS, names)) is not None:
+            table[names] = _OWNERS[owned][0]
+        elif (module := _matching(_OWNERS, names[:-1])) is not None:
+            axes = _OWNERS[module][0]
+            factor = names[-1] in LOW_RANK_FACTORS
+            table[names] = factor_axes(axes, names[-1], np.ndim(leaf)) if factor else axes
     return table
+
+
+def factor_axes(kernel: LogicalAxes, factor: str, ndim: int) -> LogicalAxes:
+    """The axes of a layer's low-rank `factor` (`LOW_RANK_FACTORS`) of `ndim` dimensions, under a
+    kernel declared `kernel`: `lora_A`'s are the kernel's leading `ndim - 1` axes, its inputs, then
+    `ADAPTER_RANK`; `lora_B`'s `ADAPTER_RANK` then the kernel's trailing `ndim - 1`, its outputs.
+    Read off the factor alone, so a tree holding one factor without the other (an optimizer's
+    masked partition, a parameter group) declares it as the whole adapter does."""
+    sides = ndim - 1
+    if not 0 < sides < len(kernel):
+        raise ValueError(f"a {factor} of {ndim} dimensions does not split a kernel declared {kernel}")
+    if factor == "lora_A":
+        return (*kernel[:sides], ADAPTER_RANK)
+    return (ADAPTER_RANK, *kernel[len(kernel) - sides:])
 
 
 def declared_axes(path, ndim: int, declared: Mapping[Suffix, LogicalAxes]) -> LogicalAxes | None:
@@ -786,5 +815,5 @@ def declared_axes(path, ndim: int, declared: Mapping[Suffix, LogicalAxes]) -> Lo
     return axes[len(axes) - ndim:]
 
 
-__all__ = ["DATA_AXIS", "FSDP_AXIS", "RESIDUAL", "LayoutRefused", "Link", "LogicalAxes", "LogicalAxisRules",
-           "Schedule", "logical_axes", "logical_spec"]
+__all__ = ["ADAPTER_RANK", "DATA_AXIS", "FSDP_AXIS", "RESIDUAL", "LayoutRefused", "Link", "LogicalAxes",
+           "LogicalAxisRules", "Schedule", "logical_axes", "logical_spec"]

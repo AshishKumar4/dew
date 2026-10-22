@@ -11,11 +11,12 @@ from dew.objectives.base import Aux, EMASpec, Metric, Objective, Step, everythin
 from .distributed import DEFAULT_RULES, Layout, MeshSpec
 from .evaluation import EvalSuite, Evaluation
 from .observe import Observe
+from .profiling import ProfileWindow
 from .runtime import Preempted, prepare_process, run_timestamp
 from .selection import Best
 from .state import TrainState
 from .tracker import LocalTracker, MLflowTracker, TensorBoardTracker, Tracker, Trackers, WandbTracker
-from .trainer import Plateau, ProfileWindow, Rollout, Trainer
+from .trainer import Plateau, Rollout, Trainer
 from .transaction import ema_update
 
 __all__ = ["DEFAULT_RULES", "Aux", "Best", "Checkpoints", "EMASpec", "EvalSuite", "Evaluation", "Keep",

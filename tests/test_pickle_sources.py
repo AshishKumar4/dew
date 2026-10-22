@@ -16,11 +16,10 @@ import jax
 import ml_dtypes
 import numpy as np
 import pytest
+import torch
 from safetensors.numpy import load_file
 
 from dew.interop import Pretrained, sources
-
-torch = pytest.importorskip("torch")
 
 FIXTURE = Path(__file__).resolve().parent / "fixtures" / "hf" / "mamba2-tiny"
 

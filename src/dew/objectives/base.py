@@ -27,8 +27,10 @@ from typing import (
     Generic,
     Literal,
     NamedTuple,
+    NotRequired,
     Protocol,
     Self,
+    TypedDict,
     runtime_checkable,
 )
 
@@ -155,6 +157,74 @@ class Recorder:
         return {name: placed(name, records) for name, records in self.values.items()}
 
 
+RECORD = "record/"
+"""The prefix of the metrics under which a recording step (`Trainer(record=True)`) returns what its
+evaluations' `Step.sample` and `Step.boundary` calls produced, one array each (`recorded_metrics`),
+which `taken_record` reads back as a `Recorded`."""
+
+
+class Evaluated(TypedDict):
+    """One evaluation's record (`Witness.report`): each kept value by name, `[rows, ...]`, the places
+    of its rows (`Step.example_index`), and the trainer column the loss saw (`EXAMPLE_ROWS`), where
+    its batch carried one."""
+    values: dict[str, jax.Array]
+    example_index: jax.Array
+    column: NotRequired[jax.Array]
+
+
+class Recorded(TypedDict):
+    """A recording step's record (`transaction.recorded`): its evaluations' values by name and places
+    stacked on a first axis, whether each row's place is the one its slot and column give it
+    (`column_ok`), and which evaluations ran (`evaluated`)."""
+    values: dict[str, jax.Array]
+    example_index: jax.Array
+    column_ok: jax.Array
+    evaluated: jax.Array
+
+
+def recorded_metrics(record: Recorded) -> dict[str, jax.Array]:
+    """`record` as a step's metrics, one array each under `RECORD`, as a compiled step returns them."""
+    fields = {f"{RECORD}{name}": record[name] for name in ("example_index", "column_ok", "evaluated")}
+    return {**fields, **{f"{RECORD}values/{name}": value for name, value in record["values"].items()}}
+
+
+def taken_record(metrics: Mapping[str, jax.Array]) -> tuple[Recorded | None, dict[str, jax.Array]]:
+    """A step's record read back from its `metrics` (`recorded_metrics`), None for a step that
+    records nothing, and the metrics without it."""
+    rest = {name: value for name, value in metrics.items() if not name.startswith(RECORD)}
+    if f"{RECORD}evaluated" not in metrics:
+        return None, rest
+    values = {name.removeprefix(f"{RECORD}values/"): value for name, value in metrics.items()
+              if name.startswith(f"{RECORD}values/")}
+    return Recorded(values=values, example_index=metrics[f"{RECORD}example_index"],
+                    column_ok=metrics[f"{RECORD}column_ok"], evaluated=metrics[f"{RECORD}evaluated"]), rest
+
+
+@dataclass(eq=False)
+class Witness:
+    """What one traced evaluation of a loss's `Step.sample` and `Step.boundary` calls produced, by name:
+    the traced values themselves, which the evaluation returns as outputs (`RECORD`), so a compiled step
+    reports what it ran, each microbatch and each replay its own, where a `Recorder` keeps concrete
+    values of a loss run eagerly."""
+    values: dict[str, jax.Array] = field(default_factory=dict)
+    kinds: dict[str, str] = field(default_factory=dict)
+
+    def keep(self, kind: str, name: str, value: jax.Array) -> None:
+        """Keep `value`, a `kind` named `name`. Raises `ValueError` for a name an evaluation produces
+        twice, which a witness could not tell apart."""
+        if name in self.values:
+            raise ValueError(f"{name!r} is produced twice in one evaluation ({self.kinds[name]} and {kind}); "
+                             "a recording holds one value a name")
+        self.values[name], self.kinds[name] = value, kind
+
+    def report(self, batch: Batch, examples: jax.Array) -> Evaluated:
+        """The evaluation's record (`Evaluated`) of the batch the loss saw and its rows' places."""
+        evaluated = Evaluated(values=dict(self.values), example_index=examples)
+        if EXAMPLE_ROWS in batch:
+            evaluated["column"] = jnp.asarray(batch[EXAMPLE_ROWS], jnp.int32)
+        return evaluated
+
+
 EXAMPLE_STREAM = 0x6578616D
 """What a run folds its key with for its examples' draws (`Step.example_key`), apart from its attempts'."""
 
@@ -219,6 +289,12 @@ class Step:
     read in place of drawing or computing them (`Recorder.tape`)."""
     recorder: Recorder | None = struct.field(pytree_node=False, default=None)
     """Where `sample` and `boundary` record what they produce, or None."""
+    record: bool = struct.field(pytree_node=False, default=False)
+    """Whether the loss returns what its `sample` and `boundary` calls produce as outputs (`RECORD`):
+    a static flag, so a compiled step's cache holds one program a mode."""
+    witness: Witness | None = struct.field(pytree_node=False, default=None)
+    """The evaluation's collector of what `sample` and `boundary` produce, which `Objective._loss` opens
+    inside the trace of a recording step (`record`); None otherwise."""
 
     def places(self, rows: int) -> tuple[jax.Array, int]:
         """The places among the update's examples of a batch's `rows` rows (`examples`) and how many
@@ -257,6 +333,8 @@ class Step:
         value = self._drawn(name, draw, shape, dtype, examples)
         if self.recorder is not None:
             self.recorder.record("sample", name, examples, value)
+        if self.witness is not None:
+            self.witness.keep("sample", name, value)
         return value
 
     def sample_update(self, name: str, draw: Callable[..., jax.Array], shape: tuple[int, ...] | None = None,
@@ -290,6 +368,8 @@ class Step:
             value = self._taped(self.tape[name], name, examples, value.shape[1:]).astype(value.dtype)
         if self.recorder is not None:
             self.recorder.record("boundary", name, examples, value)
+        if self.witness is not None:
+            self.witness.keep("boundary", name, value)
         return value
 
     @property
@@ -346,6 +426,10 @@ class Aux(Generic[Effects]):
     the clip does nothing."""
     effects: Effects | None = None
     """Additive observations that `Objective.apply_effects` applies once per optimizer commit."""
+    record: Evaluated | Recorded | None = None
+    """What a recording evaluation's `Step.sample` and `Step.boundary` calls produced (`Step.record`),
+    which `Objective._loss` fills (`Evaluated`) and a transaction stacks with its replays' (`Recorded`);
+    None otherwise."""
 
 
 def _has_aux(loss: Loss | tuple[Loss, Aux[Effects]]) -> TypeIs[tuple[Loss, Aux[Effects]]]:
@@ -759,15 +843,19 @@ class Objective(ABC, Generic[Loss, Effects]):
         three, and `variables` and `processor` override its own, an explicit
         None included. A bare model supplies none, so what is omitted is None.
         The constructor keeps the model as `model`, the module the objective
-        trains, which `program_key` names by default.
+        trains, which `program_key` names by default. A loaded task's tree, its
+        projections packed for serving, is held as the model's own tree
+        (`dew.inference.projections.unpacked`).
         """
+        from dew.inference.projections import unpacked
+
         if _loaded(source):
             variables = source.variables if variables is OMITTED else variables
             processor = source.text_processor if processor is OMITTED else processor
             model = source.model
         else:
             model = source
-        self.variables = None if variables is OMITTED else variables
+        self.variables = None if variables is OMITTED or variables is None else unpacked(model, variables)
         self.processor = None if processor is OMITTED else processor
         return model
 
@@ -1073,13 +1161,22 @@ class Objective(ABC, Generic[Loss, Effects]):
 
     def _loss(self, variables: Variables, batch: Batch, step: Step, *,
               validation: bool = False) -> tuple[Loss, Aux[Effects]]:
+        marked = batch
         if EXAMPLE_ROWS in batch:
             # The trainer's column of the examples' places is the step's (`Step.example_index`).
             batch = {name: value for name, value in batch.items() if name != EXAMPLE_ROWS}
+        witness = Witness() if step.record and not validation else None
+        step = step if witness is None else replace(step, witness=witness)
         loss = (self.validation_loss if validation else self.loss)(variables, batch, step)
         if _has_aux(loss):
-            return loss
-        return loss, Aux(metrics={})
+            stats, aux = loss
+        else:
+            stats, aux = loss, Aux[Effects](metrics={})
+        if witness is not None:
+            # A batch with no rows has no examples (`example_fields`), and records none.
+            places = jnp.zeros((0,), jnp.int32) if step.example_index is None else step.example_index
+            aux = replace(aux, record=witness.report(marked, places))
+        return stats, aux
 
     def reduce_loss(self, stats: Loss) -> tuple[jax.Array, jax.Array]:
         """Return the objective value of summed statistics and whether they have any mass.

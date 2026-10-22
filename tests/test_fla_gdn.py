@@ -24,9 +24,9 @@ from delta_rule_support import (
 )
 from jax.core import ShapedArray
 from reference_error import (
+    assert_as_exact,
     assert_as_exact_as_the_reference,
     assert_computes_the_oracle,
-    assert_leaves_as_exact,
     chain_roundings,
     equations,
     float64_terms,
@@ -844,6 +844,21 @@ def test_a_bf16_layer_with_wide_keys_hands_the_port_its_narrowed_operands():
         assert query.dtype == key.dtype == value.dtype == jnp.bfloat16
 
 
+REMAT_ROWS, REMAT_LENGTH = 4, 256
+"""Each remat draw's rows and tokens: at one row of 64 with the parameters held fixed, the reference
+compared with itself did not resolve within 512 seeds on an A100 (`in_proj_b`'s and the norm's
+gradients, a few sums over one draw's few tokens); with fresh parameters a draw, one row of 64 took
+512 seeds, two of 128 took 256, and four of 256 take 64, as eight of 512 do."""
+
+SEEDS = {(1, 1): 64, (2, 1): 64, (2, 2): 64}
+"""Each remat policy's declared seeds for check 1 (`assert_as_exact`), keyed by the
+(`fla_chunk_fwd_h`, `fla_chunk_fwd_o`) launches its gradient is held to, sized by `seeds_for` on an
+A100 (2026-10-21), where the policies' programs differ: the fewest for which the layer's gradient
+without remat compared with itself resolves the factor in every leaf, truth the float64 layer's
+gradient. The three policies share that reference, the draw and the truth, so one sizing gives all
+three. Off a GPU the two are bitwise."""
+
+
 @pytest.mark.parametrize("policy, memories, outputs", [
     (None, 1, 1),
     ({"recompute": ("delta_memory",)}, 2, 1),
@@ -852,49 +867,59 @@ def test_a_bf16_layer_with_wide_keys_hands_the_port_its_narrowed_operands():
 @generation.chosen(gated_delta_rule="fla")
 def test_a_remat_policy_saves_the_ports_named_residuals_and_changes_no_gradient(policy, memories, outputs):
     """A block's remat policy keeps or recomputes the port's named residuals
-    (`decoder_block.RESIDUALS`): without one the layer saves its decay, inverse and memory
+    (`mixer_base.RESIDUALS`): without one the layer saves its decay, inverse and memory
     ('delta_memory') for its backward; 'all_but_delta_memory', which the block applies by tracing its
     layers recomputing that name (`recurrence_chunk.recomputing`) rather than by a checkpoint policy, has the
     backward recompute the memory alone; a policy saving the output, decay and inverse saves those
     three. Each is read from the kernels the gradient runs: the memory's (`fla_chunk_fwd_h`) once
     where it is saved and again in the backward where it is recomputed; the output's
     (`fla_chunk_fwd_o`) once, but where the policy recomputes the memory, whose recompute re-runs the
-    rule's forward, output and all. Each computes the gradients the layer computes without remat
-    within tests/reference_error.py's rule against the float64 layer's, each leaf sized by its own
-    float64 terms; off a GPU, bitwise. A GPU compiles the remat step as another program, whose
-    roundings differ: on an H100 even the XLA math's A_log gradient moved by 5.4e-5 relative between
-    the two, the remat one nearer float64."""
+    rule's forward, output and all. Each computes the gradients the layer computes without remat, on
+    par with it by check 1 (`assert_as_exact`) over fresh parameters and inputs drawn from each seed
+    (`REMAT_ROWS` rows of `REMAT_LENGTH` tokens), truth the float64 layer's gradient; off a GPU,
+    bitwise. A GPU compiles
+    the remat step as another program, whose roundings differ: on an H100 even the XLA math's A_log
+    gradient moved by 5.4e-5 relative between the two, the remat one nearer float64."""
     from dew.nn.backbones.decoder_block import remat_policy
     from dew.nn.kernels.recurrence_chunk import recomputing
 
     layer = GatedDeltaNet(emb_features=64, num_k_heads=1, num_v_heads=2, head_k_dim=64, head_v_dim=64)
-    x = jax.random.normal(jax.random.key(71), (1, 64, 64))
-    params = layer.init(jax.random.key(73), x)
+    x = jax.random.normal(jax.random.key(71), (REMAT_ROWS, REMAT_LENGTH, 64))
+    initialize = jax.jit(layer.init)
+    params = initialize(jax.random.key(73), x)
 
-    def loss(params):
+    def loss(params, x):
         return jnp.sum(layer.apply(params, x) ** 2)
 
     rung = None if policy is None else remat_policy(policy)
     if rung is None:
         remat = loss
     elif rung.recompute:
-        def remat(params):
+        def remat(params, x):
             with recomputing(rung.recompute):
-                return loss(params)
+                return loss(params, x)
     else:
         remat = jax.checkpoint(loss, policy=rung.checkpoint_policy())
-    graph = jax.make_jaxpr(jax.grad(remat))(params)
+    graph = jax.make_jaxpr(jax.grad(remat))(params, x)
     launched = [str(equation.params["name"]) for equation in equations(graph)
                 if equation.primitive.name == "pallas_call"]
     counted = (launched.count("fla_chunk_fwd_h"), launched.count("fla_chunk_fwd_o"))
     assert counted == (memories, outputs), launched
-    want = jax.jit(jax.grad(loss))(params)
-    got = jax.jit(jax.grad(remat))(params)
-    with jax.enable_x64(new_val=True):
-        wide = layer.clone(dtype=jnp.float64)
-        truth, terms = float64_terms(jax.grad(lambda params: jnp.sum(wide.apply(params, x) ** 2)),
-                                     jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64), params))
-    assert_leaves_as_exact(got, want, truth, terms=terms)
+    reference_grad, remat_grad = jax.jit(jax.grad(loss)), jax.jit(jax.grad(remat))
+    want, got = reference_grad(params, x), remat_grad(params, x)
+
+    def draw(seed):
+        keys = jax.random.split(jax.random.key(seed))
+        x = jax.random.normal(keys[0], (REMAT_ROWS, REMAT_LENGTH, 64))
+        return initialize(keys[1], x), x
+
+    wide = layer.clone(dtype=jnp.float64)
+
+    def truth(params, x):
+        return jax.grad(lambda params: jnp.sum(wide.apply(params, x) ** 2))(params)
+
+    assert_as_exact(remat_grad, reference_grad, draw, "remat policy gradient",
+                    seeds=SEEDS[(memories, outputs)], truth_fn=jax.jit(truth))
     if jax.default_backend() != "gpu":
         for (path, mine), theirs in zip(jax.tree_util.tree_leaves_with_path(got), jax.tree.leaves(want),
                                         strict=True):

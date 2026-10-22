@@ -64,7 +64,7 @@ def test_padless_tokenizer_batches_match_unpadded_rows_without_changing_exports(
     from tokenizers import Tokenizer, models, pre_tokenizers
     from transformers import AutoTokenizer, PreTrainedTokenizerFast
 
-    from dew.interop.pretrained import Processor
+    from dew.interop.processors import Processor
 
     vocabulary = {"<unk>": 0, "one": 1, "two": 2, "three": 3, "<eos>": 4}
     vocabulary.update({f"t{index}": index for index in range(5, task.model.vocab_size)})
