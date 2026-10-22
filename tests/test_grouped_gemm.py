@@ -234,7 +234,8 @@ def test_every_tile_of_the_hopper_grouped_matmuls_lowers_for_an_h100(launch, tra
 def test_the_kernels_forward_mode_keeps_the_projections_law():
     """An expert projection's tangent through the template is the portable projection's, bit for bit:
     `dx @ Q(kernel) + Q(x) @ dkernel` with the tangents unrounded, where a cast's own tangent would round
-    an fp32 input's to bf16 first (an fp32 1 + 2^-8 times 1.5 is 1.5078125, rounded first 1.5)."""
+    an fp32 input's to bf16 first (two products of an fp32 1 + 2^-8 and 1.5 sum to 3.015625, rounded first
+    3)."""
     sizes = jnp.asarray([1, 2], jnp.int32)
     x, w = jnp.zeros((3, 2), jnp.float32), jnp.full((2, 2, 2), 1.5, jnp.float32)
     dx, dw = jnp.full((3, 2), 1 + 2.0 ** -8, jnp.float32), jnp.zeros((2, 2, 2), jnp.float32)
@@ -243,7 +244,7 @@ def test_the_kernels_forward_mode_keeps_the_projections_law():
         for implementation in ("auto", "xla")}
     np.testing.assert_array_equal(np.asarray(tangents["auto"], np.float32),
                                   np.asarray(tangents["xla"], np.float32))
-    assert np.asarray(tangents["xla"], np.float32)[0, 0] == np.float32(1.5078125).astype(jnp.bfloat16)
+    assert np.asarray(tangents["xla"], np.float32)[0, 0] == np.float32(3.015625)
 
 
 def test_a_named_kernel_refuses_where_the_kernels_do_not_run():
