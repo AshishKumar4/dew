@@ -30,7 +30,7 @@ from s3fs import S3FileSystem
 from dew.data.dataset import Batch, Records
 from dew.data.pipeline import Dataset
 from dew.data.steps.generic import Fields
-from dew.data.storage import Readable, Store, content_version, in_memory, local, on_gcs
+from dew.data.storage import Readable, Store, commit_export, content_version, in_memory, local, on_gcs
 from dew.records import integer, record
 
 from .base import Read, Shard, ShardManifest, preparing, url_label
@@ -504,15 +504,8 @@ class Files(Dataset):
                     "sha256": digest,
                 }
             )
-        manifest = {
-            "schema": 1,
-            "format": "array_record",
-            "codec": None,
-            "rows": sum(entry["rows"] for entry in files),
-            "files": files,
-            "metadata": {},
-        }
-        root.child("_dew_manifest.json").put_if_absent(json.dumps(manifest, sort_keys=True).encode())
+        commit_export(root, format="array_record", codec=None, rows=sum(entry["rows"] for entry in files),
+                      files=files)
         self.__dict__.pop("committed", None)
         self.__dict__.pop("declared", None)
         self.__dict__.pop("_file_facts", None)
