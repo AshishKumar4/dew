@@ -27,6 +27,18 @@ from reference_error import (
 )
 
 
+def test_two_dew_paths_compiled_with_equal_dots_reach_no_dot_fusion():
+    """`equal_dots` compiles a program whose dots XLA:CPU keeps to its own code, where it would hand
+    them to a YNNPACK or XNNPACK fusion dispatched by the host's ISA (ledger row 1349), and passes its
+    other jit options through."""
+    from reference_error import equal_dots
+
+    left, right = np.ones((16, 48), np.float32), np.ones((48, 4), np.float32)
+    text = equal_dots(jnp.dot).lower(left, right).compile().as_text()
+    assert "ynn_fusion" not in text and "xnn_fusion" not in text
+    assert equal_dots(lambda x, n: x * n, static_argnums=1)(left, 2).shape == left.shape
+
+
 def test_a_small_row_beside_large_ones_is_held_to_its_own_size():
     """Dew doubles a row of 5s beside rows of 1e8 that the reference rounds by 8. Every
     tensor-wide distance passes it: its RMS error, 3.5, sits under twice the reference's, 5.7.

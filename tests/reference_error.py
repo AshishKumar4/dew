@@ -115,6 +115,26 @@ def widened(tree):
         leaf, np.float64 if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf.dtype), tree)
 
 
+EQUAL_DOTS = {"xla_cpu_experimental_ynn_fusion_type": "", "xla_cpu_experimental_xnn_fusion_type": ""}
+"""XLA:CPU's compiler options under which every dot of a program takes XLA's own code, not a YNNPACK
+or XNNPACK fusion (ledger row 1349). Those libraries pick their microkernels at run time by the
+host's ISA, and reach a program's dots but not the dots inside the loops of Pallas' interpreter: the
+interpreted SSD kernel against XLA's scan, whose own dots reached them, put its state gradient at
+1.586 times the scan's distance from float64 on an AVX-512 host (AMD 25/17) and at 0.765 on an AVX2
+one (AMD 25/1). With both arms on XLA's dots its worst leaf over the nine host cases is 1.17 on
+25/17, and the one-short case's 1.20 on 25/1. The bits still part with the host (Eigen blocks a dot by
+its caches), the verdict no longer."""
+
+
+def equal_dots(fn, **jit_options):
+    """`fn` jitted, with EQUAL_DOTS on the CPU: an arm of a check 1 between two Dew paths, such as an
+    interpreted kernel and the XLA program it replaces, whose dots must reach the same code on any
+    host. A program Dew's users run compiles with the fusions, as they do."""
+    if jax.default_backend() == "cpu":
+        jit_options["compiler_options"] = {**EQUAL_DOTS, **jit_options.get("compiler_options", {})}
+    return jax.jit(fn, **jit_options)
+
+
 def with_gradients(fn):
     """`fn` as `run(*inputs, cotangent)`, which returns `fn(*inputs)` and the gradients of its inputs
     under the cotangent passed last: a differentiated call's leaves, as the gate compares them."""
