@@ -161,6 +161,38 @@ def test_an_expert_projection_runs_the_implementation_chosen_for_it_on_the_cpu(g
                                           label)
 
 
+
+@INTERPRETS
+@pytest.mark.parametrize("generation_name,implementation", [("sm80", "triton"), ("sm90", "mosaic_gpu")])
+@pytest.mark.parametrize("master", [jnp.bfloat16, jnp.float32], ids=["bf16", "fp32"])
+def test_a_banked_projection_is_its_layers_plain_projection(generation_name: str, implementation: str,
+                                                           master):
+    """An expert projection reading its matrices from a bank's layer (`layer`) is the plain projection of
+    that layer, bit for bit: its output and input gradient, and its kernel gradient at the layer, zero at
+    every other (the plain projection held to check 1 above). A bf16 bank is read in place by the kernels,
+    an fp32 master's layer cast first."""
+    sizes = [0, 70, 1, 100, 0]
+    x, w, dy, _ = operands(sizes, jnp.bfloat16, seed=5)
+    rng = np.random.default_rng(6)
+    bank = jnp.asarray(rng.normal(size=(3, *w.shape)), master).at[1].set(jnp.asarray(w, master))
+    group_sizes = jnp.asarray(sizes, jnp.int32)
+    x, dy = jnp.asarray(x, jnp.bfloat16), jnp.asarray(dy, jnp.bfloat16)
+
+    def products(x, w, **layer):
+        y, pull = jax.vjp(lambda x, w: expert_projection(x, w, group_sizes, jnp.bfloat16, "pallas", None,
+                                                         **layer), x, w)
+        return (y, *pull(dy))
+
+    with (generation.assumed(generation_name), generation.chosen(grouped_matmul=implementation),
+          generation.routes() as routes):
+        banked = jax.jit(functools.partial(products, layer=jnp.int32(1)))(x, bank)
+        plain = jax.jit(products)(x, bank[1])
+    assert {route.kernel for route in routes if route.choice == "grouped_matmul"} == {implementation}
+    for got, want in zip(banked[:2], plain[:2], strict=True):
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+    np.testing.assert_array_equal(np.asarray(banked[2][1]), np.asarray(plain[2]))
+    np.testing.assert_array_equal(np.asarray(banked[2][::2]), np.zeros((2, *w.shape)))
+
 @lowers("sm90")
 @pytest.mark.parametrize("launch,trans_rhs", [(grouped_matmul.MosaicGmm(), False),
                                               (grouped_matmul.MosaicGmm(), True),
