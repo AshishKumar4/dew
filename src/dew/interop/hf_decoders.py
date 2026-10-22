@@ -27,6 +27,7 @@ import functools
 import json
 import operator
 import os
+import tempfile
 from collections.abc import Callable, Collection, Mapping
 from dataclasses import asdict
 from pathlib import Path
@@ -37,6 +38,7 @@ import numpy as np
 
 from dew import records
 from dew._model_types import QWEN35_TEXT_TYPES, QWEN35_TYPES
+from dew.files import write_atomically
 from dew.interop.config_records import NativeFields
 from dew.interop.decoder_families import ENTRIES
 from dew.interop.decoder_parts import (
@@ -765,11 +767,19 @@ def save_export_assets(
                          "on a Hugging Face tokenizer")
     os.makedirs(directory, exist_ok=True)
     if writer is not None:
-        writer.save_pretrained(str(directory))
+        # The tokenizer writes its files beside the directory, and each replaces its old one whole at
+        # its own path (a processor's chat_templates/ among them), so an engine reading the directory
+        # never reads one half written.
+        with tempfile.TemporaryDirectory(prefix=".dew-", dir=directory) as staged:
+            writer.save_pretrained(staged)
+            for written in sorted(Path(staged).rglob("*")):
+                if written.is_file():
+                    target = Path(directory) / written.relative_to(staged)
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    os.replace(written, target)
     if byte:
         values['tokenizer_name'] = "byte"
-    with open(os.path.join(directory, GENERATION_CONFIG_FILE), 'w') as handle:
-        json.dump(values, handle, indent=2)
+    write_atomically(os.path.join(directory, GENERATION_CONFIG_FILE), json.dumps(values, indent=2))
 
 
 def export_decoder_weights(model: CausalTransformer, variables: Mapping[str, object],
