@@ -167,9 +167,9 @@ def _families() -> dict[str, Family]:
 
     def small_weight(dtype, rows=128):
         # Eight queries a row over 256 keys of which two are seen: a key of logit 0 and one whose logit is
-        # each query's drawn size in [3, 5) times its key's -l, l drawn in [16, 21), so its weight is
-        # exp(-20) to exp(-105), normal in fp32 and bf16, on a value of 2^e, e drawn in [120, 126]: its
-        # share of the output, a weight shifted for the keys' count before it is narrowed would lose.
+        # a quarter of each query's drawn size in [3, 5) times its key's -l, l drawn in [16, 21), so its
+        # weight is exp(-12) to exp(-26), on a value of 2^e, e drawn in [120, 126]: its share of the
+        # output, a weight shifted for the keys' count before it is narrowed would lose.
         def draw(seed):
             query = _first(_uniform(seed + 4, 3.0, 5.0, (rows, 8)), 16)
             key = np.zeros((rows, 256, 1, 16), np.float32)
@@ -177,8 +177,10 @@ def _families() -> dict[str, Family]:
             value = np.zeros((rows, 256, 1, 16), np.float32)
             value[:, 1, 0, 0] = 2.0 ** np.floor(_uniform(seed + 1, 120.0, 127.0, (rows,)))
             value[:, :2, 0, 1:] = _uniform(seed + 3, -1.0, 1.0, (rows, 2, 15))
+            # The cotangent drawn times 2^-4, so its product with a value of 2^126 stays within bf16's and
+            # fp32's largest in the reference's backward.
             (dout,) = _normal(seed + 2, (rows, 8, 1, 16))
-            return query, key, value, None, dout
+            return query, key, value, None, dout * np.float32(2.0 ** -4)
         seen = np.zeros((rows, 1, 8, 256), bool)
         seen[..., :2] = True
         return Family(draw, seen, {"lengths": np.full(rows, 2)}, dtype=dtype)
