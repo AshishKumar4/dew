@@ -49,18 +49,15 @@ def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, blocks: Block
         out_dtype, interpret: bool | pltpu.InterpretParams = False, prologue=None,
         prologue_operands: tuple = (), prologue_axes: tuple = (), epilogue=None,
         epilogue_operands: tuple = (), epilogue_axes: tuple = (),
-        out_dtypes: tuple | None = None, layer: jax.Array | None = None) -> jax.Array | tuple[jax.Array, ...]:
+        out_dtypes: tuple | None = None) -> jax.Array | tuple[jax.Array, ...]:
     """Each group's rows of `lhs` `[rows, depth]` times its matrix of `rhs`, `[groups, depth, width]` or
     with `transpose_rhs` `[groups, width, depth]`: `[rows, width]` in `out_dtype` (or a tuple in
     `out_dtypes`), each row past the routed ones the epilogue of a zero accumulator. The depth must divide
-    by `blocks.block_k` and the width by `blocks.block_n`. With `layer`, an int32 scalar, `rhs` is a bank
-    `[layers, groups, ...]` whose layer `layer` the pipeline reads in place (a scalar prefetched beside the
-    group metadata, its blocks' index), where slicing it out would copy it."""
+    by `blocks.block_k` and the width by `blocks.block_n`."""
     block_m, block_n, block_k = blocks.block_m, blocks.block_n, blocks.block_k
     rows, depth = lhs.shape
-    groups = rhs.shape[-3]
-    rhs_depth, width = (rhs.shape[-1], rhs.shape[-2]) if transpose_rhs else rhs.shape[-2:]
-    layers = () if layer is None else (jnp.reshape(layer.astype(jnp.int32), (1,)),)
+    groups = rhs.shape[0]
+    rhs_depth, width = (rhs.shape[2], rhs.shape[1]) if transpose_rhs else rhs.shape[1:]
     if depth != rhs_depth or depth % block_k or width % block_n:
         raise ValueError(f"a [{rows}, {depth}] x {list(rhs.shape)} product does not take {blocks}")
     lhs = _rows_padded(lhs, 0, block_m)
@@ -77,9 +74,7 @@ def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, blocks: Block
     steps = depth // block_k
     sides = len(prologue_operands) + len(epilogue_operands)
 
-    def kernel(group_offsets, group_ids, m_tile_ids, *refs):
-        refs = refs[len(layers):]  # the layer read by the blocks' index alone
-        lhs_ref, rhs_ref, *refs = refs
+    def kernel(group_offsets, group_ids, m_tile_ids, lhs_ref, rhs_ref, *refs):
         prologue_refs, epilogue_refs = refs[:len(prologue_operands)], refs[len(prologue_operands):sides]
         out_refs, acc_ref = refs[sides:-1], refs[-1]
         slot, step = pl.program_id(1), pl.program_id(2)
@@ -109,41 +104,40 @@ def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, blocks: Block
             for out_ref, out in zip(out_refs, outs, strict=True):
                 out_ref[...] = jnp.where(mine, out.astype(out_ref.dtype), out_ref[...])
 
-    def lhs_index(column, slot, step, group_offsets, group_ids, m_tile_ids, *_):
+    def lhs_index(column, slot, step, group_offsets, group_ids, m_tile_ids):
         return m_tile_ids[slot], step
 
-    def rhs_index(column, slot, step, group_offsets, group_ids, m_tile_ids, *layer_ref):
+    def rhs_index(column, slot, step, group_offsets, group_ids, m_tile_ids):
         group = jnp.minimum(group_ids[slot], groups - 1)
-        lead = tuple(ref[0] for ref in layer_ref)
-        return (*lead, group, column, step) if transpose_rhs else (*lead, group, step, column)
+        return (group, column, step) if transpose_rhs else (group, step, column)
 
     def side_spec(axes):
         extent = {'rows': block_m, 'depth': block_k, 'columns': block_n}
 
-        def index(column, slot, step, group_offsets, group_ids, m_tile_ids, *_):
+        def index(column, slot, step, group_offsets, group_ids, m_tile_ids):
             origin = {'rows': m_tile_ids[slot], 'depth': step, 'columns': column}
             return tuple(origin[axis] for axis in axes)
 
         return pl.BlockSpec(tuple(extent[axis] for axis in axes), index)
 
-    def out_index(column, slot, step, group_offsets, group_ids, m_tile_ids, *_):
+    def out_index(column, slot, step, group_offsets, group_ids, m_tile_ids):
         return m_tile_ids[slot], column
 
-    matrix_block = (None, block_n, block_k) if transpose_rhs else (None, block_k, block_n)
     outs = pl.pallas_call(
         kernel,
         out_shape=tuple(jax.ShapeDtypeStruct((m, width), dtype) for dtype in dtypes),
         grid_spec=pltpu.PrefetchScalarGridSpec(
-            num_scalar_prefetch=3 + len(layers),
+            num_scalar_prefetch=3,
             in_specs=[pl.BlockSpec((block_m, block_k), lhs_index),
-                      pl.BlockSpec((None,) * len(layers) + matrix_block, rhs_index),
+                      pl.BlockSpec((None, block_n, block_k) if transpose_rhs else (None, block_k, block_n),
+                                   rhs_index),
                       *(side_spec(axes) for axes in (*prologue_axes, *epilogue_axes))],
             out_specs=tuple(pl.BlockSpec((block_m, block_n), out_index) for _ in dtypes),
             grid=(width // block_n, active, steps),
             scratch_shapes=[pltpu.VMEM((block_m, block_n), jnp.float32)]),
         compiler_params=_compiler_params(),
         interpret=interpret,
-    )(*metadata, *layers, lhs, rhs, *prologue_operands, *epilogue_operands)
+    )(*metadata, lhs, rhs, *prologue_operands, *epilogue_operands)
     outs = tuple(out[:rows] for out in outs)
     return outs if out_dtypes else outs[0]
 

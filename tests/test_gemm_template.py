@@ -619,103 +619,6 @@ def test_a_fused_norm_lowers_for_an_h100(producer):
     assert 'mosaic_gpu' in {route.kernel for route in taken if route.choice == 'grouped_matmul'}
     assert {route.kernel for route in taken if route.choice == 'gemm_prologue'} == {'fused'}
 
-LAYERS, LAYER = 3, 1
-"""A bank of three layers' matrices, read at the second (`gemm`'s `rhs_index`)."""
-
-
-def _banked(seed):
-    """A draw with its matrices a bank: the drawn ones at `LAYER`, others beside them."""
-    x, w, _, _, b, *_ = _draw(seed)
-    rng = np.random.default_rng(seed + 1000)
-    bank = jnp.asarray(rng.normal(size=(LAYERS, *w.shape)) / np.sqrt(DEPTH), jnp.bfloat16)
-    cotangent = jnp.asarray(rng.normal(size=(ROWS, WIDTH)), jnp.bfloat16)
-    return x, bank.at[LAYER].set(w.astype(jnp.bfloat16)), b, cotangent
-
-
-def _indexed_program(*, indexed: bool, truth: bool = False, interpret_on_cpu: bool = False):
-    """The biased product of the bank's layer and its every input's cotangent: through the bank read in
-    place (`indexed`), or through the layer sliced out, which XLA computes (in float64 as truth)."""
-    sizes = jnp.asarray(SIZES)
-
-    def product(x, bank, b):
-        if truth:
-            wide = (_wide(x).astype(jnp.float64), bank[LAYER].astype(jnp.float64))
-            return biased(grouped_matmul.xla_ragged_dot(*wide, sizes, preferred_element_type=jnp.float64), b)
-        if indexed:
-            return template.gemm(x, bank, sizes, rhs_index=jnp.int32(LAYER), epilogue=biased,
-                                 epilogue_operands=((b, ('columns',)),), out_dtype=jnp.bfloat16,
-                                 interpret_on_cpu=interpret_on_cpu)
-        summed = grouped_matmul.xla_ragged_dot(x, bank[LAYER], sizes, preferred_element_type=jnp.float32)
-        return biased(summed, b).astype(jnp.bfloat16)
-
-    def run(x, bank, b, cotangent):
-        out, pull = jax.vjp(product, x, bank, b)
-        return (out, *pull(cotangent.astype(out.dtype)))
-    return run
-
-
-@pytest.mark.parametrize("generation_name", generations("sm80", "sm90", "v5e"))
-def test_an_indexed_bank_holds_check_1_with_the_plain_calls_value(generation_name):
-    """A product reading its matrices from a bank's layer in place (`rhs_index`), and its derivative (the
-    bank's zero but at the layer), are as exact as the same product of the layer sliced out, from float64
-    truth, through the launches the generation runs."""
-    with generation.assumed(generation_name), generation.routes() as taken:
-        dew = _indexed_program(indexed=True, interpret_on_cpu=True)
-        assert_as_exact(dew if generation_name != "sm80" else jax.jit(dew),
-                        jax.jit(_indexed_program(indexed=False)), _banked,
-                        f"indexed bank on {generation_name}", seeds=SEEDS,
-                        truth_fn=_indexed_program(indexed=False, truth=True))
-    assert _kernels(taken) <= {'triton', 'mosaic_gpu', 'mosaic_tpu'} and _kernels(taken)
-
-
-@runs("sm80")
-def test_a_dense_bank_reads_its_layer_as_the_plain_product():
-    """A dense product of a bank's layer (`rhs_index`, no groups) runs Triton's grouped kernel on the bank
-    in place, as exact as the layer's plain product from float64 truth."""
-    def draw(seed):
-        x, bank, b, cotangent = _banked(seed)
-        return x, bank[:, 0], b, cotangent
-
-    def run(indexed: bool, truth: bool = False):
-        def product(x, bank, b):
-            if truth:
-                return biased(_wide(x).astype(jnp.float64) @ bank[LAYER].astype(jnp.float64), b)
-            if indexed:
-                return template.gemm(x, bank, None, rhs_index=jnp.int32(LAYER), epilogue=biased,
-                                     epilogue_operands=((b, ('columns',)),), out_dtype=jnp.bfloat16,
-                                     interpret_on_cpu=True)
-            return biased(jnp.dot(x, bank[LAYER], preferred_element_type=jnp.float32), b).astype(jnp.bfloat16)
-
-        def program(x, bank, b, cotangent):
-            out, pull = jax.vjp(product, x, bank, b)
-            return (out, *pull(cotangent.astype(out.dtype)))
-        return program
-
-    with generation.assumed("sm80"), generation.routes() as taken:
-        assert_as_exact(jax.jit(run(indexed=True)), jax.jit(run(indexed=False)), draw, "dense bank",
-                        seeds=SEEDS, truth_fn=run(indexed=False, truth=True))
-    assert _kernels(taken) == {'triton'}
-
-
-@pytest.mark.parametrize("generation_name",
-                         [pytest.param(name, marks=lowers(name)) for name in ("sm80", "sm90")])
-def test_an_indexed_bank_lowers_without_slicing_its_layer(generation_name):
-    """For an A100 (Triton) and an H100 (Mosaic GPU) the product reads the bank's layer in place: the
-    lowered program slices no layer out of the bank before its kernels, as a scanned layer stack's would
-    every step."""
-    x, bank, b, _ = _banked(0)
-    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), generation_name)
-
-    def product(x, bank, b, layer):
-        return template.gemm(x, bank, jnp.asarray(SIZES), rhs_index=layer, epilogue=biased,
-                             epilogue_operands=((b, ('columns',)),), out_dtype=jnp.bfloat16)
-
-    on = (generation.assumed(generation_name), jax.sharding.use_abstract_mesh(mesh))
-    with on[0], on[1], generation.routes() as taken:
-        lowered = jax.jit(product).trace(x, bank, b, jnp.int32(LAYER)).lower(lowering_platforms=("cuda",))
-        text = lowered.as_text()
-    assert "dynamic_slice" not in text and _kernels(taken) - {'xla'}
-
 
 @pytest.mark.parametrize("producer", [rms_norm, dew_rms_norm, relu], ids=lambda producer: producer.__name__)
 def test_a_fused_producers_gradients_are_its_own(producer):
@@ -749,23 +652,6 @@ def test_a_fused_producers_gradients_are_its_own(producer):
         assert_as_exact(jax.jit(loss(fused_gemm, fuser.fuse)), jax.jit(loss(plain_gemm)), draw,
                         f"{producer.__name__} gradients", seeds=SEEDS, truth_fn=loss(truth_gemm))
     assert {route.kernel for route in taken if route.choice == 'gemm_prologue'} == {'fused'}
-
-
-@pytest.mark.parametrize("launch", [grouped_matmul.Gmm(), grouped_matmul.MosaicGmm()],
-                         ids=lambda launch: type(launch).__name__)
-def test_an_indexed_launch_prices_the_layer_it_reads(launch):
-    """A launch reading a bank's layer in place moves the plain call's bytes at every tile, whatever the
-    layers beside it: the cost model prices the layer it reads, not the bank."""
-    x, bank, *_ = _banked(0)
-    sizes = jnp.asarray(SIZES)
-    options = {"out_dtype": "bfloat16", "trans_rhs": False, "interpret": False}
-    with generation.assumed("sm90"):
-        target = generation.gpu_target()
-        banked = launch.bind(x, bank, sizes, (), (), (jnp.int32(LAYER),), **options)
-        plain = launch.bind(x, bank[LAYER], sizes, **options)
-        for config in launch.fitting(plain, target):
-            assert (launch.costed(banked, config, target).device_bytes
-                    == launch.costed(plain, config, target).device_bytes), config
 
 
 def test_a_one_row_normed_operand_fuses():
