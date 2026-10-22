@@ -1109,10 +1109,11 @@ def with_triton_gemms(flow) -> None:
     flags = [flag for flag in os.environ.get("XLA_FLAGS", "").split()
              if not flag.startswith(("--xla_gpu_deterministic_ops", "--xla_gpu_enable_triton_gemm"))]
     script = f"import {Path(__file__).stem} as tests; tests.{flow.__name__}()"
+    # pytest's own path (pyproject's `pythonpath`: the sources and the repository root) and this directory.
+    path = os.pathsep.join([str(here.parent / "src"), str(here.parent), str(here)])
     run = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=1200,
                          cwd=here, env={**os.environ, "XLA_FLAGS": " ".join(flags),
-                                        "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
-                                        "PYTHONPATH": os.pathsep.join([str(here.parent / "src"), str(here)])})
+                                        "XLA_PYTHON_CLIENT_PREALLOCATE": "false", "PYTHONPATH": path})
     assert run.returncode == 0, run.stderr[-4000:]
 
 
