@@ -422,7 +422,7 @@ def off_anchor_start(peak0: jax.Array, total0: jax.Array, term0: jax.Array, maxi
                      width: int) -> tuple[OffAnchor, jax.Array, jax.Array]:
     """The first pass from the softmax's initial state (its maximum, denominator and share of D's
     numerator) weighed at the forward's `maximum`, and that state's denominator and share there."""
-    carried = jnp.where(peak0 == -jnp.inf, 0.0, natural_exp(jnp.minimum(peak0 - maximum, 0.0)))
+    carried = jnp.where(peak0 == -jnp.inf, 0.0, jnp.exp(jnp.minimum(peak0 - maximum, 0.0)))
     state_total, state_share = total0 * carried, term0 * carried
     nothing = jnp.zeros_like(total0)
     return OffAnchor(state_total, jnp.zeros((total0.shape[0], width), jnp.float32), nothing, nothing), \
@@ -524,7 +524,7 @@ def below(logits: jax.Array, peak: jax.Array) -> jax.Array:
     fp32: `m` is every key's maximum, so a logit past it by the rounding the two passes do not share (the
     forward's maximum taken in base 2 and back, or another tile shape's product) is the maximum itself,
     its weight 1, never past it."""
-    return natural_exp(jnp.minimum(logits - peak[:, None], 0.0))
+    return jnp.exp(jnp.minimum(logits - peak[:, None], 0.0))
 
 
 def normalized(logits: jax.Array, peak: jax.Array, total: jax.Array) -> tuple[jax.Array, jax.Array]:
@@ -554,7 +554,7 @@ def refinement(residual: jax.Array, mass: jax.Array, peak0: jax.Array, shares: t
     by the softmax's shift, and what they sum to here (`residual`, over the keys' weights `mass`) is D's
     rounding. Moving D by it over the weights' total lets dK/dV, the initial state's gradients and the
     head and query parameters' take the D whose cotangents do."""
-    carried = jnp.where(peak0 == -jnp.inf, 0.0, natural_exp(jnp.minimum(peak0 - peak, 0.0))) * inverse(total)
+    carried = jnp.where(peak0 == -jnp.inf, 0.0, jnp.exp(jnp.minimum(peak0 - peak, 0.0))) * inverse(total)
     whole_residual = residual + (shares[1] - shares[0] * (anchor + delta)) * carried
     whole_mass = mass + shares[0] * carried
     return jnp.where(whole_mass > 0, whole_residual / jnp.where(whole_mass > 0, whole_mass, 1.0), 0.0)

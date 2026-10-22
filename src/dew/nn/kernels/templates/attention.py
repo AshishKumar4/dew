@@ -408,9 +408,12 @@ closes; every kernel's default reads it, so the default switches here."""
 
 
 def natural_exp(x: jax.Array) -> jax.Array:
-    """`exp(x)` as the hardware's base-2 exponential of `x * log2(e)`, the logits staying natural: a
-    difference of the reference's own logits converted only after it is taken, so no logit the reference
-    keeps finite passes fp32's largest and none it keeps apart ties (the stability invariant)."""
+    """The natural form's forward exponential (`attention_algebra.Forward.power`): `exp(x)` as the
+    hardware's base-2 exponential of `x * log2(e)`, the logits staying natural, a difference of the
+    reference's own logits converted only after it is taken, so no logit the reference keeps finite
+    passes fp32's largest and none it keeps apart ties (the stability invariant). Its conversion rounds
+    once more than `jnp.exp`, about `|x|` fp32 ulps of the result, so the backward's weights and every
+    factor that carries a state (whose size may be any) take `jnp.exp`, as the reference does."""
     return jnp.exp2(x * LOG2E)
 
 
@@ -623,7 +626,7 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
         # little beside the keys (a subnormal factor) is rounded once there, as the reference rounds it.
         # Bounded as the launch's own carried factor is (`attention_algebra.below`): the forward's
         # maximum is the state's too, whatever its rounding.
-        carried = natural_exp(jnp.minimum(starts[0] - peak, 0.0))
+        carried = jnp.exp(jnp.minimum(starts[0] - peak, 0.0))
         factor = jnp.where((total > 0) & jnp.isfinite(starts[0]), carried, 0.0)
         inverse = jnp.where(total > 0, 1.0 / jnp.where(total > 0, total, 1.0), 0.0)
         # Its maximum's cotangent, that term's score cotangent, taken whole as the reference's derivative
