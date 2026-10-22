@@ -1749,10 +1749,11 @@ rule of `tests/reference_error.py`:
   which cost 10-30% more.
 - Blocks of 128 keys round closer to float64 (0.66-0.76x torch), but they
   double the partial products, and their forward cost up to 18% more.
-- Turning YNNPACK's dots off with
-  `--xla_cpu_experimental_ynn_fusion_type=-individual_dot` gives every CPU
-  dot, with the ops YNNPACK fused to it, XLA's own code, and leaves its
-  other fusions (reductions, some element-wise ops) in place. On two threads, Eigen ran the 176M hybrid DiT's MLP
+- `--xla_cpu_experimental_ynn_fusion_type=-individual_dot` moves each dot
+  out of YNNPACK's fusions, with the fusions of the ops that consume a
+  dot's output. In the SSD scan it takes 24 of 30 YNNPACK fusions out and
+  leaves four reductions, two of them contractions XLA lowered to multiply
+  and reduce, and two element-wise fusions. On two threads, Eigen ran the 176M hybrid DiT's MLP
   shapes (512 x 768 x 3072) 12% slower. It would also change every CPU
   result, including the live sampler's image.
 
