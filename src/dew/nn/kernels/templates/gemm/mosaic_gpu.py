@@ -379,9 +379,9 @@ def _gmm_streamed(lhs, rhs, lengths, shape: tuple, *, tiles: Tiles, transpose_rh
                   multiprocessors: int, interpret, hooks: tuple, sides: tuple) -> tuple:
     """`gmm`'s product at a cooperative tile with its operand stages streaming across the persistent loop's
     tiles (`hopper.Ring`): the producer loads the next tile's first steps while the consumers finish this
-    one's epilogue, and each consumer's stores of a tile run on while the next tile's products do, its
-    output staging two buffers deep. No prologue and one multiprocessor a tile; `_gmm_cooperative`'s
-    arguments."""
+    one's epilogue, and each consumer's stores of a tile run on while the next tile's products do (its
+    staging buffer awaited only by the next epilogue). No prologue and one multiprocessor a tile;
+    `_gmm_cooperative`'s arguments."""
     _, _, epilogue, epilogue_axes = hooks
     _, epilogue_operands = sides
     m, n, k, g = shape
@@ -405,7 +405,7 @@ def _gmm_streamed(lhs, rhs, lengths, shape: tuple, *, tiles: Tiles, transpose_rh
             pl.run_scoped,
             lhs_ring=hopper.ring((block_m, block_k), lhs_gmem.dtype, tiles.stages, consumers=2),
             rhs_ring=hopper.ring(rhs_block, rhs_gmem.dtype, tiles.stages, consumers=2),
-            o_smems=[plgpu.SMEM((2, 2, block_m, half), gmem.dtype) for gmem in o_gmems],
+            o_smems=[plgpu.SMEM((2, block_m, half), gmem.dtype) for gmem in o_gmems],
             **hopper.staging('side', zip(side_shapes, side_gmems, strict=True)),
             collective_axes="wg",
         )
@@ -436,25 +436,19 @@ def _gmm_streamed(lhs, rhs, lengths, shape: tuple, *, tiles: Tiles, transpose_rh
                 rhs_ring.drain(loaded)
 
             def consumer(wg):
-                @plgpu.nd_loop((grid[0] * grid[1],), collective_axes="cluster_grid",
-                               init_carry=(jnp.int32(0), jnp.int32(0)))
-                def _(loop: plgpu.NDLoopInfo, carry):
-                    counter, stored = carry
+                @plgpu.nd_loop((grid[0] * grid[1],), collective_axes="cluster_grid", init_carry=jnp.int32(0))
+                def _(loop: plgpu.NDLoopInfo, counter):
                     info, ni, active = tile(loop.index[0])
                     column = ni * block_n + wg * half
 
                     def finish(acc):
-                        # The buffer this tile stores from is free once its stores two tiles back have
-                        # read it; the last tile's may still run.
-                        plgpu.wait_smem_to_gmem(1, wait_read_only=True)
                         origins = {'rows': pl.ds(info.block * block_m, block_m),
                                    'columns': pl.ds(column, half)}
                         views = [gmem.at[tuple(origins[axis] for axis in axes)]
                                  for gmem, axes in zip(side_gmems, epilogue_axes, strict=True)]
-                        buffers = [smem.at[wg, lax.rem(stored, 2)] for smem in o_smems]
-                        _store_half(acc, epilogue, (views, side_smems, side_barriers), (o_gmems, buffers),
-                                    (info.block_start, info.start_within_block, info.actual_size, column,
-                                     min(block_m, m)), wg)
+                        _finish_half(acc, epilogue, (views, side_smems, side_barriers), (o_gmems, o_smems),
+                                     (info.block_start, info.start_within_block, info.actual_size, column,
+                                      min(block_m, m)), wg)
 
                     @pl.when(active)
                     def _():
@@ -483,8 +477,7 @@ def _gmm_streamed(lhs, rhs, lengths, shape: tuple, *, tiles: Tiles, transpose_rh
                     # The unrouted rows: the epilogue of a zero accumulator.
                     pl.when(~active & (info.actual_size > 0))(
                         lambda: finish(jnp.zeros((block_m, half), jnp.float32)))
-                    taken = info.actual_size > 0
-                    return counter + jnp.where(active, steps, 0), stored + taken.astype(jnp.int32)
+                    return counter + jnp.where(active, steps, 0)
 
                 plgpu.wait_smem_to_gmem(0, wait_read_only=True)
 
@@ -494,23 +487,6 @@ def _gmm_streamed(lhs, rhs, lengths, shape: tuple, *, tiles: Tiles, transpose_rh
                                 consumers=2, cluster=1, multiprocessors=multiprocessors, interpret=interpret)
     return kernel(lengths, lhs, rhs, *epilogue_operands)
 
-
-def _store_half(acc, epilogue, sides: tuple, outs: tuple, place: tuple, wg) -> None:
-    """Dew: a consumer warpgroup's half tile as `_finish_half` stores it, from the staging buffers `outs`
-    names (one a output), its stores one group of copies a tile (`hopper.store_rows`' `grouped`)."""
-    row_start, first, stored, column, most = place
-    tiles_of = []
-    for view, smem, barrier in zip(*sides, strict=True):
-        plgpu.copy_gmem_to_smem(view, smem.at[wg], barrier.at[wg])
-        plgpu.barrier_wait(barrier.at[wg])
-        tiles_of.append(smem[wg])
-    values = (acc,) if epilogue is None else epilogue(acc, *tiles_of)
-    values = values if isinstance(values, tuple) else (values,)
-    for o_gmem, buffer, value in zip(*outs, values, strict=True):
-        buffer[...] = value.astype(buffer.dtype)
-        plgpu.commit_smem()
-        hopper.store_rows(buffer, o_gmem, row_start, first, stored, column, most, grouped=True)
-    plgpu.commit_smem_to_gmem_group()
 
 def _gmm_pipeline(tiles: Tiles, transpose_rhs: bool, steps: int, side_axes: tuple, body, context):
     """Dew: the cooperative `gmm`'s pipeline over the depth's `steps` blocks: the rows' stage, the matrix's

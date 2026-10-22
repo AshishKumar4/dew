@@ -126,11 +126,9 @@ def load_fixed(views: list, refs: list, barriers: list, wg) -> None:
         plgpu.barrier_wait(barrier.at[wg])
 
 
-def store_rows(o_smem, o_gmem, row_start, first, stored, column, most: int, *, grouped: bool = False) -> None:
+def store_rows(o_smem, o_gmem, row_start, first, stored, column, most: int) -> None:
     """Rows `first` to `first + stored` of `o_smem` to `o_gmem` at row `row_start + first` and `column`, in a
-    power-of-two ladder of TMA stores (a descriptor's extents are static), the largest `most` rows'. Each
-    store is its own group of copies, or with `grouped` none is, the caller committing them together
-    (`plgpu.commit_smem_to_gmem_group`), so one wait covers a tile's stores whatever rungs it took."""
+    power-of-two ladder of TMA stores (a descriptor's extents are static), the largest `most` rows'."""
     start, size = first, most
     while size:
         rung = 1 << int(math.log2(size))
@@ -139,8 +137,7 @@ def store_rows(o_smem, o_gmem, row_start, first, stored, column, most: int, *, g
         @pl.when(stored & rung != 0)
         def _(start=start, rung=rung):
             plgpu.copy_smem_to_gmem(o_smem.at[pl.ds(start, rung)],
-                                    o_gmem.at[pl.ds(row_start + start, rung), pl.ds(column, o_smem.shape[1])],
-                                    commit_group=not grouped)
+                                    o_gmem.at[pl.ds(row_start + start, rung), pl.ds(column, o_smem.shape[1])])
 
         start = start + (stored & rung)
 
