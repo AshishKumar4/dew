@@ -381,6 +381,19 @@ class TritonForward(Template[Tiles]):
         shared = config.block_q >= 128 and width <= 128
         return streamed + (max(query_tile, weights) if shared else query_tile + weights)
 
+    def registers(self, ba: tokamax.BoundArguments, config: Tiles) -> int:
+        """The fp32 words a thread holds live across the walk, the program's spread over its threads: the
+        block's weighted values `[block_q, Dv]` and a tile's logits `[block_q, block_k]`, and in a training
+        walk the anchor's value row beside them, `[block_q, Dv]` (`algebra.training_step`). Measured where
+        it passes a thread's registers: the training walk at 128 by 64 in four warps, 320 a thread, takes
+        10x the plain forward's time on an A100 and 4.6x on an H100, at 64 by 64 2.1x and 2.0x
+        (TRAINTILES3-a100, TRAINTILES2-h100)."""
+        rows, value_width = config.block_q, ba.arguments["value"].shape[-1]
+        words = rows * value_width + rows * config.block_k
+        if ba.arguments.get("residuals"):
+            words += rows * value_width
+        return words // (32 * config.warps)
+
     def cost(self, ba: tokamax.BoundArguments, config: Tiles, target: generation.GpuTarget) -> float:
         """Every key tile of the call (a bound: the spans are traced, so a sparse call visits fewer),
         each staging its key and value tiles once and taking a `block_q` by `block_k` product of the
