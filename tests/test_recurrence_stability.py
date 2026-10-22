@@ -11,20 +11,20 @@ certified bound of its float64 value keeps apart any two that float64 holds more
 apart, so the suite takes it with the chunk ops' certificates (`tests/op_certificates.py`).
 
 The regimes: decays near one, whose memory accumulates, and over a long sequence; decays near zero, whose
-pairs within a chunk span tens of e-folds; every token at the decay's range bound (Kimi delta
-attention's lower bound, -5 a token); near-collinear keys with the write gate near one, whose WY system
-grows as binomials; documents reset on chunks' first and last tokens; and saturated gates (write gates at
-0 and 1, Mamba's step through softplus at 30), and pre-activations spread over [-20, 20], which keep
-gates near 0 and 1 apart; and a memory fading over a long sequence, whose output falls far below its scale.
-Each runs the portable math, and the port of fla's kernels (`recurrence_chunk.fla_rule`) where the hooks
-take it (the delta rule with a decay), both forward and through their gradient, held to the recurrence's
-gradient by check 1. The port runs where its route takes the regime's declared decay floor (`FLOORS`): a
-decay a key dimension steeper than its domain, -5 a token, it refuses (`fla_kda.DECAY_FLOOR`), which the
-port's arm asserts. The port's prefix difference uncompensated in base 2 failed check 1 under saturated
-write gates, aligned keys, resets on chunk edges and the decay bound, and its 64-token chunks of the
-suite's 16-wide keys over a long sequence; compensated, and its chunk no longer than twice the keys' width
-(`recurrence_chunk.held_chunk`), it passes.
-"""
+pairs within a chunk span tens of e-folds; every token at the decay's range bound (Kimi delta attention's
+lower bound, -5 a token); near-collinear keys with the write gate near one, whose WY system grows as
+binomials; documents reset on chunks' first and last tokens; and saturated gates (write gates at 0 and 1,
+Mamba's step through softplus at 30), and pre-activations spread over [-20, 20], which keep gates near 0 and 1
+apart; a memory fading over a long sequence, whose output falls far below its scale; and a steep decay every
+eighth token between mild ones, whose pairs after it are differences of large, nearly equal prefixes. Each
+runs the portable math, and the port of fla's kernels (`recurrence_chunk.fla_rule`) where the hooks take it
+(the delta rule with a decay), both forward and through their gradient, held to the recurrence's gradient by
+check 1. The port runs where its route takes the regime's declared decay floor (`FLOORS`): a decay a key
+dimension steeper than its domain, -5 a token, it refuses (`fla_kda.DECAY_FLOOR`), which the port's arm
+asserts. The port's prefix difference uncompensated in base 2 failed check 1 under saturated write gates,
+aligned keys, resets on chunk edges and the decay bound, and its 64-token chunks of the suite's 16-wide keys
+over a long sequence; compensated, and its chunk no longer than twice the keys' width
+(`recurrence_chunk.held_chunk`), it passes."""
 
 import dataclasses
 import functools
@@ -61,7 +61,21 @@ def _decayed(operands: Chunk, hooks, log_decay: float, spread: float, key) -> Ch
     whichever operand the hooks read it from: the log decay itself, the gate's pre-activation (`gated`'s
     `-exp(log_a) softplus(gate + bias)`), or a rated decay's write gate (`rate * dt`)."""
     noise = spread * jax.random.uniform(key, operands.value.shape[:3], minval=-1.0, maxval=1.0)
-    target = jnp.minimum(log_decay + noise, 0.0)
+    return _formed(operands, hooks, jnp.minimum(log_decay + noise, 0.0))
+
+
+def _steep(operands: Chunk, hooks, key) -> Chunk:
+    """Every eighth token's log decay steep, -1000, so the memory passes it all but nothing, and every other
+    token's mild, near -0.02: after a steep token a chunk's prefix is large and each mild pair's decay a
+    difference of two nearly equal prefixes (a decay a key dimension clipped to its floor, `stressed`)."""
+    steep = jnp.arange(operands.value.shape[1]) % 8 == 0
+    mild = -0.02 + 0.01 * jax.random.uniform(key, operands.value.shape[:3], minval=-1.0, maxval=1.0)
+    return _formed(operands, hooks, jnp.where(steep[None, :, None], -1000.0, mild))
+
+
+def _formed(operands: Chunk, hooks, target) -> Chunk:
+    """`operands` with every token's log decay `target` `[B, T, H]`, formed through whichever operand the
+    hooks read it from (`_decayed`)."""
     if hooks.rated:
         # The log decay is `rate * dt`: dt the target over each head's rate.
         return dataclasses.replace(operands, beta=target / operands.rate)
@@ -131,6 +145,7 @@ REGIMES = {
     'spread gates': (lambda operands, hooks, key: _spread(operands, hooks, key), None),
     'a long sequence': (lambda operands, hooks, key: _decayed(operands, hooks, -1e-3, 5e-4, key), LONG),
     'a fading memory': (lambda operands, hooks, key: _decayed(operands, hooks, -0.1, 0.05, key), LONG),
+    'steep then mild': (lambda operands, hooks, key: _steep(operands, hooks, key), None),
 }
 """Each regime's transform of a draw's operands and its tokens (the draw's own where None)."""
 
@@ -148,6 +163,7 @@ GRADIENT_SEEDS = {
     ('scalar delta', 'spread gates'): 16,
     ('scalar delta', 'a long sequence'): 8,
     ('scalar delta', 'a fading memory'): 8,
+    ('scalar delta', 'steep then mild'): 8,
     ('vector delta', 'decays near one'): 8,
     ('vector delta', 'the decay bound'): 8,
     ('vector delta', 'aligned keys'): 16,
@@ -156,6 +172,7 @@ GRADIENT_SEEDS = {
     ('vector delta', 'spread gates'): 8,
     ('vector delta', 'a long sequence'): 8,
     ('vector delta', 'a fading memory'): 8,
+    ('vector delta', 'steep then mild'): 8,
     ('scalar write', 'decays near one'): 32,
     ('scalar write', 'the decay bound'): 8,
     ('scalar write', 'aligned keys'): 16,
@@ -164,6 +181,7 @@ GRADIENT_SEEDS = {
     ('scalar write', 'spread gates'): 16,
     ('scalar write', 'a long sequence'): 16,
     ('scalar write', 'a fading memory'): 8,
+    ('scalar write', 'steep then mild'): 8,
     ('gated', 'decays near one'): 32,
     ('gated', 'the decay bound'): 64,
     ('gated', 'aligned keys'): 256,
@@ -172,6 +190,7 @@ GRADIENT_SEEDS = {
     ('gated', 'spread gates'): 512,
     ('gated', 'a long sequence'): 8,
     ('gated', 'a fading memory'): 8,
+    ('gated', 'steep then mild'): 64,
     ('rated', 'decays near one'): 128,
     ('rated', 'the decay bound'): 128,
     ('rated', 'aligned keys'): 64,
@@ -180,8 +199,9 @@ GRADIENT_SEEDS = {
     ('rated', 'spread gates'): 256,
     ('rated', 'a long sequence'): 128,
     ('rated', 'a fading memory'): 128,
+    ('rated', 'steep then mild'): 128,
 }
-"""Each site's declared seeds for its gradient's check 1, sized by `seeds_for` on armada (2026-10-22)."""
+"""Each site's declared seeds for its gradient's check 1, sized by `seeds_for`."""
 
 SEEDS = {
     ('scalar delta', 'decays near one'): 8,
@@ -193,6 +213,7 @@ SEEDS = {
     ('scalar delta', 'a long sequence'): 8,
     ('scalar delta', 'spread gates'): 32,
     ('scalar delta', 'a fading memory'): 8,
+    ('scalar delta', 'steep then mild'): 16,
     ('vector delta', 'decays near one'): 8,
     ('vector delta', 'decays near zero'): 64,
     ('vector delta', 'the decay bound'): 32,
@@ -202,6 +223,7 @@ SEEDS = {
     ('vector delta', 'a long sequence'): 8,
     ('vector delta', 'spread gates'): 32,
     ('vector delta', 'a fading memory'): 8,
+    ('vector delta', 'steep then mild'): 8,
     ('scalar write', 'decays near one'): 8,
     ('scalar write', 'decays near zero'): 64,
     ('scalar write', 'the decay bound'): 32,
@@ -211,6 +233,7 @@ SEEDS = {
     ('scalar write', 'a long sequence'): 8,
     ('scalar write', 'spread gates'): 32,
     ('scalar write', 'a fading memory'): 8,
+    ('scalar write', 'steep then mild'): 8,
     ('gated', 'decays near one'): 8,
     ('gated', 'decays near zero'): 128,
     ('gated', 'the decay bound'): 64,
@@ -220,6 +243,7 @@ SEEDS = {
     ('gated', 'a long sequence'): 8,
     ('gated', 'spread gates'): 128,
     ('gated', 'a fading memory'): 8,
+    ('gated', 'steep then mild'): 8,
     ('rated', 'decays near one'): 16,
     ('rated', 'decays near zero'): 256,
     ('rated', 'the decay bound'): 128,
@@ -229,8 +253,9 @@ SEEDS = {
     ('rated', 'a long sequence'): 8,
     ('rated', 'spread gates'): 64,
     ('rated', 'a fading memory'): 128,
+    ('rated', 'steep then mild'): 128,
 }
-"""Each site's declared seeds for check 1, sized by `seeds_for` on armada (2026-10-22): the fewest for
+"""Each site's declared seeds for check 1, sized by `seeds_for`: the fewest for
 which the token-by-token reference compared with itself resolves the factor in both leaves."""
 
 
@@ -239,7 +264,8 @@ FLOORS = {'decays near one': -1.5e-4, 'decays near zero': -35.0, 'the decay boun
           'a long sequence': -1.5e-3, 'a fading memory': -0.15}
 """Each regime's declared per-token log decay floor, the steepest it draws: its decays' target less their
 spread, or Kimi Linear's bound (-5, `dew.nn.kda`'s `lower_bound`) where the regime keeps the draw's own
-decays, which a decay per key dimension is clipped to (`stressed`)."""
+decays or draws steeper ones (steep then mild's -1000), which a decay per key dimension is clipped to
+(`stressed`)."""
 
 
 def floor(regime: str) -> float:
