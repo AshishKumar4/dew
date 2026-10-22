@@ -323,7 +323,9 @@ def test_eager_fetch_keeps_a_memory_plan_volatile_until_its_generation_is_sealed
                                                ("records", "memory"), ("records", "indexed")])
 def test_a_sealed_generation_keeps_its_holdout_selection_in_training_and_validation(tmp_path,
                                                                                  selection, read):
-    """Generation promotion splits its accepted rows, not the original inputs or the full generation."""
+    """A holdout of a chain whose steps a published generation stands for splits the store's inputs,
+    as it does uncached, and reads the generation's rows of the inputs each part keeps: the first
+    five inputs held out are the accepted ones among them, not the generation's first five rows."""
     source = Memory(rows("fetched", 64))
     generation = fetched_generation(source.filter_map(FetchLike()), tmp_path)
     cached = source.filter_map(FetchLike()).cache(generation)
@@ -335,7 +337,7 @@ def test_a_sealed_generation_keeps_its_holdout_selection_in_training_and_validat
     assert parts[0].isdisjoint(parts[1])
     assert parts[0] | parts[1] == accepted
     if selection == "records":
-        assert parts[1] == set(sorted(accepted)[:5])
+        assert parts[1] == {index for index in range(5) if index % 3}
     training, validation = data.train(DataPartition()), data.val(DataPartition())
     try:
         trained = {int(index) for batch in itertools.islice(training, len(accepted)) for index in batch["i"]}
@@ -1142,3 +1144,63 @@ def test_a_fact_two_corpora_state_differently_reaches_no_run_step_whatever_anoth
     with pytest.raises(ValueError):
         compile(mix(members).map(Configured(_stamped, needs=("rows",), scope="run")).batch(1),
                 read="indexed", loading=Loading(workers=0))
+
+
+class _Dropping(grain.MapTransform):
+    """Keeps even ids; says it drops the rest."""
+
+    rejects = True
+
+    def map(self, element):
+        from dew.data.pipeline import Rejected
+
+        return element if int(element["id"]) % 2 == 0 else Rejected("odd")
+
+
+class _Doubled:
+    """Each record twice."""
+
+    def flat_map(self, element):
+        return [element, element]
+
+
+class _Noised(grain.RandomMapTransform):
+    """Adds a draw from the record's generator."""
+
+    def random_map(self, element, rng):
+        return {**element, "noise": int(rng.integers(0, 1000))}
+
+
+@pytest.mark.parametrize("read", ["memory", "indexed"])
+def test_an_objectives_record_steps_read_as_the_verbs_that_name_what_they_are(read):
+    """An objective's record steps, a dropping one, an expanding one and a drawing one, train on what
+    the verbs for what they are, `filter_map`, `flat_map` and `random_map`, written where the objective
+    reads the records, make of them: before their batch, a pass of 8 kept and doubled in 4 batches."""
+    from dew.data.pipeline import ObjectiveData, Pipeline
+
+    rows = Pipeline(Memory([{"id": index} for index in range(16)]))
+    steps = (_Dropping(), _Doubled(), _Noised())
+    written = rows.filter_map(steps[0]).flat_map(steps[1]).random_map(steps[2]).batch(4)
+    expected = compile(written, read=read, loading=READ, seed=5).train(DataPartition())
+    trained = compile(rows.batch(4), objective=ObjectiveData(train=steps), read=read, loading=READ,
+                      seed=5).train(DataPartition())
+    try:
+        for batch, reference in zip(itertools.islice(trained, 4), itertools.islice(expected, 4), strict=True):
+            for field in ("id", "noise"):
+                np.testing.assert_array_equal(batch[field], reference[field])
+    finally:
+        expected.close()
+        trained.close()
+
+
+def test_the_defaults_a_verb_and_its_stage_take_are_the_same_value():
+    """A verb written without its settings and the stage it makes written without them are one:
+    the same stage, so the same plan."""
+    from dew.data.pipeline import Interleave, Pack, Pipeline, Prefetch, Windows, Workers
+
+    rows = Pipeline(Memory([{"text": np.arange(4)}]))
+    assert rows.interleave().stages[-1] == Interleave()
+    assert rows.pack(8).stages[-1] == Pack(8)
+    assert rows.windows(8).stages[-1] == Windows(8)
+    assert rows.prefetch().stages[-1] == Prefetch()
+    assert rows.workers(2).stages[-1] == Workers(2)
