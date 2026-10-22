@@ -2090,12 +2090,12 @@ def test_a_nested_mixture_read_a_counted_number_of_times_counts_the_records_its_
 
 
 def test_a_mixture_of_a_repeated_corpus_and_one_read_once_counts_what_a_run_reads():
-    """A run of a corpus of 8 repeated and one of 4 written without a repeat, at even weights, counts
-    an epoch in which a run reads every record of both."""
+    """A mix of a corpus of 8 repeated and one of 4 written without a repeat, at even weights, ends
+    where the one read once does, at 8, and a run reads that many records: the order repeats
+    already, so a run adds no repeat of its own."""
     loader = compile(mix([_tagged(1, 8).repeat(), _tagged(2, 4)], weights=(1, 1)).batch(1), loading=READ)
-    read = _ids(loader.train(DataPartition()), loader.records)
-    assert len(read) == loader.records
-    assert sorted(set(read)) == [*range(100, 108), *range(200, 204)]
+    assert loader.records == 8
+    assert sorted(_ids(loader.train(DataPartition()))) == [*range(100, 104), *range(200, 204)]
 
 def test_a_streamed_training_read_with_a_random_step_and_no_repeat_never_runs_out():
     """A training order that writes no repeat repeats for ever, as its plan
