@@ -98,7 +98,9 @@ class HF(Dataset):
 
         if isinstance(self.dataset, Arrow):
             rows = len(self.dataset)
-            return ShardManifest((Shard(self.describe(), self.describe(), 0, rows, rows),), self._read_shard)
+            # One shard, the Arrow dataset's records in their index order.
+            return ShardManifest((Shard(self.describe(), self.describe(), 0, rows, rows),), self._read_shard,
+                                 index_ordered=True)
         return ShardManifest(self._shards(self.dataset.n_shards), self._read_shard, self._shards)
 
     def _shards(self, count: int) -> tuple[Shard, ...]:

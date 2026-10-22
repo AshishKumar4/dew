@@ -146,9 +146,8 @@ def test_clip_tiny_fixture_is_what_the_generator_writes(tmp_path):
     assert_fixture_json(tmp_path, committed, "clip_reference")
     assert_same_tensors(tmp_path / "model.safetensors", committed / "model.safetensors")
     with np.load(committed / "reference.npz") as inputs:
-        truth = transformers_clip(tmp_path, dict(inputs), torch.float64)
-    assert_fixture_arrays(tmp_path / "reference.npz", committed / "reference.npz", {},
-                          {name: truth[name] for name in CLIP_OUTPUTS})
+        truth = transformers_clip(tmp_path, dict(inputs), torch.float64, CLIP_OUTPUTS)
+    assert_fixture_arrays(tmp_path / "reference.npz", committed / "reference.npz", {}, truth)
 
 
 # ---------------------------------------------------------------------------

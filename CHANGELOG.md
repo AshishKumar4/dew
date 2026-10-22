@@ -32,6 +32,19 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   shards, so hosts that each export the same rows read one store. A data
   position saved over a committed export before is refused as its source
   changed, and a cache or generation over one fills again.
+- A holdout written before a published generation picks the inputs it picks
+  without the cache: the generation stands in for the inputs each part keeps,
+  by hash (by a field the cached step drops too) or by records, over missing
+  rows and steps that drop or expand them. A records holdout over a
+  generation a stream filled is served where the store states that its stream
+  reads its records in index order (in-memory, token, TFDS, PyTorch, Grain
+  and Arrow datasets, generations), and refused otherwise: publish those from
+  a memory read, or an indexed one (`provision=True`). A step that reads its
+  record's index there is refused, naming `Cache(url)`. A holdout part is named by
+  what it selects of its source's identity, so selections stacked on one
+  another stay apart; a data position saved over a holdout part before is
+  refused as its source changed, and a generation published from one no
+  longer stands in for it, where a `Cache(url)` over it fills again.
 
 ## 0.1.0
 
