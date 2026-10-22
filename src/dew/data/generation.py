@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import io
-import itertools
 import json
 import uuid
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
@@ -17,17 +16,9 @@ from typing import TYPE_CHECKING, Protocol
 import numpy as np
 
 from dew.data.dataset import Batch, Records
-from dew.data.pipeline import Mixture, Phases, Record, Rejected
+from dew.data.pipeline import Record, Rejected
 from dew.data.retention import LocalRetention
-from dew.data.sources.base import (
-    Read,
-    ShardManifest,
-    Source,
-    _consumed,
-    _indexed_manifest,
-    _uncounted,
-    url_label,
-)
+from dew.data.sources.base import Read, ShardManifest, Source, _indexed_manifest, _uncounted, url_label
 from dew.data.sources.codec import decode, fingerprint
 from dew.data.sources.index import ArrayIndex
 from dew.data.sources.records import ArrayRecords
@@ -563,169 +554,3 @@ class _GenerationSource:
         )
         index.verify(entry)
         return index
-
-
-@dataclass(frozen=True)
-class _DenseRows:
-    """The rows of `generation` at `indices`, in their order."""
-
-    generation: Generation
-    indices: np.ndarray
-
-    def __len__(self) -> int:
-        return len(self.indices)
-
-    def __getitem__(self, index: int) -> Batch | bytes | None:
-        return self.generation[int(self.indices[index])]
-
-
-@dataclass(frozen=True)
-class _SelectedGeneration:
-    """The rows of `generation` for the inputs of the source it was published from, `depth` holdout
-    selections below `selected`, that those selections keep, in their order: the generation standing
-    in for its steps under selections written before it, each picking the inputs it picks uncached
-    (`dew.data.analysis._in_place`). Its input ids number that source's records as the fill read
-    them, `fill` (`_source_ids`), and are checked against the generation's own, so ids that name
-    other inputs than the fill's are refused rather than read as none."""
-
-    generation: Generation
-    selected: Source
-    depth: int
-    fill: Read
-
-    @property
-    def _selections(self) -> tuple[Source, ...]:
-        """The selections from `selected` down, outermost first, above the published source."""
-        from dew.data.holdout import selecting
-
-        return tuple(selection for selection in itertools.islice(selecting(self.selected), self.depth)
-                     if not isinstance(selection, (Mixture, Phases)))
-
-    @property
-    def stored(self) -> Source:
-        """The source the generation was published from."""
-        from dew.data.holdout import selecting
-
-        found = next(itertools.islice(selecting(self.selected), self.depth, None))
-        if isinstance(found, (Mixture, Phases)):
-            raise ValueError(f"{self.selected.describe()} selects from a mixture, which no generation "
-                             "stands for")
-        return found
-
-    def label(self) -> str:
-        return self.selected.label()
-
-    def describe(self) -> str:
-        return f"generation:{self.generation.url} for {self.selected.describe()}"
-
-    def fingerprint(self) -> Mapping[str, object]:
-        return {**_GenerationSource(self.generation).fingerprint(), "selected": self.selected.fingerprint()}
-
-    @property
-    def _placing(self) -> tuple[Source, Read]:
-        """The store the selections place inputs from, and the read that numbers them as the fill did."""
-        stored = _consumed(self.stored, self.fill)
-        if self.fill == "streamed":
-            return stored, "streamed"
-        return stored, "indexed" if stored.supports("indexed") else "memory"
-
-    def supports(self, read: Read) -> bool:
-        store, placing = self._placing
-        return store.supports(placing)
-
-    def can_provision(self, read: Read) -> bool:
-        from dew.data.analysis import _provisioner
-
-        store, placing = self._placing
-        return _provisioner(store, placing) is not None
-
-    def provision(self) -> _SelectedGeneration:
-        from dew.data.analysis import _provisioner
-
-        store, placing = self._placing
-        preparer = _provisioner(store, placing)
-        if preparer is None:
-            raise ValueError(f"{store.describe()} can't prepare the {placing} read that places its inputs")
-        preparer.provision()
-        return self
-
-    def records(self, read: Read) -> Records:
-        return _DenseRows(self.generation, self._dense)
-
-    def manifest(self) -> ShardManifest:
-        return _indexed_manifest(self, f"{self.generation.url}#selected", self.generation.url, 4096)
-
-    def metadata(self) -> Mapping[str, object]:
-        whole = _GenerationSource(self.generation).metadata()
-        # The generation's target counts are its whole fill's; this reads a part of it.
-        part = {name: value for name, value in whole.items()
-                if name not in ("valid_targets", "zero_target_windows")}
-        return {**part, "rows": len(self._dense), "accepted_rows": len(self._dense)}
-
-    def order_fingerprints(self) -> Mapping[str, str]:
-        selected = _hash(np.ascontiguousarray(self._dense, np.int64).tobytes())
-        return {**_GenerationSource(self.generation).order_fingerprints(), "selected": selected}
-
-    def lengths(self) -> np.ndarray | None:
-        lengths = _GenerationSource(self.generation).lengths()
-        return None if lengths is None else np.asarray(lengths)[self._dense]
-
-    @cached_property
-    def _dense(self) -> np.ndarray:
-        """The generation's rows of the kept inputs, in its order, which is theirs (`_kept`)."""
-        kept, shards = self._kept
-        dense = []
-        for page in range(len(self.generation.manifest["row_pages"])):
-            for offset, entry in enumerate(self.generation._rows(page)):
-                if shards is not None and json.loads(entry["id"])[0] not in shards:
-                    raise ValueError(self._renamed)
-                if entry["id"] in kept:
-                    dense.append(page * 4096 + offset)
-        return np.asarray(dense, np.int64)
-
-    @cached_property
-    def _kept(self) -> tuple[frozenset[str], frozenset[str] | None]:
-        """The ids of the inputs the selections keep, and for a streamed fill the shards that number
-        them. The selections apply innermost first: a records holdout slices the inputs it reads
-        (`RecordSlice.bounds`), a hash holdout keeps the rows its part holds (`HashPart.keeps`)."""
-        from dew.data.holdout import HashPart, RecordSlice
-
-        store, placing = self._placing
-        selections = self._selections
-        hashed = any(not isinstance(selection, RecordSlice) for selection in selections)
-        if placing == "streamed":
-            manifest = store.manifest()
-            ids: list[RowId] = []
-            rows: list[Batch | bytes | None] = []
-            for shard in manifest.shards:
-                reader = iter(manifest.reader(shard))
-                try:
-                    for index, row in enumerate(reader):
-                        ids.append((shard.id, index))
-                        if hashed:
-                            rows.append(row)
-                finally:
-                    reader.close()
-            shards: frozenset[str] | None = frozenset(shard.id for shard in manifest.shards)
-            placed: Sequence[RowId] = ids
-            records: Records | Sequence[Batch | bytes | None] = rows
-        else:
-            records = store.records(placing)
-            placed, shards = range(len(records)), None
-        if len(placed) != self.generation.manifest["inputs"]:
-            raise ValueError(self._renamed)
-        kept: Sequence[int] = range(len(placed))
-        for selection in reversed(selections):
-            if isinstance(selection, RecordSlice):
-                start, stop = selection.bounds(len(kept))
-                kept = kept[start:stop]
-            elif isinstance(selection, HashPart):
-                kept = [position for position in kept if selection.keeps(records[position])]
-        return frozenset(_row_key(placed[position]) for position in kept), shards
-
-    @property
-    def _renamed(self) -> str:
-        return (f"generation {self.generation.url} was filled from inputs {self.stored.describe()} names "
-                f"otherwise here (a stream names its inputs by where it read their shards), so the holdout "
-                "written before it can't pick its inputs from it; publish it from an indexed or memory "
-                "read, or read it where it was filled")

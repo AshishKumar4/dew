@@ -39,8 +39,8 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   index there is refused, naming `Cache(url)`. A holdout part is named by
   what it selects of its source's identity, so selections stacked on one
   another stay apart; a data position saved over a holdout part before is
-  refused as its source changed, and a generation published from one fills
-  again.
+  refused as its source changed, and a generation published from one no
+  longer stands in for it, where a `Cache(url)` over it fills again.
 
 ## 0.1.0
 

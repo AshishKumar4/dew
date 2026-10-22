@@ -199,16 +199,13 @@ def _in_place(generation: Generation, source: Source | Mixture | Phases,
     was published from, `source` itself or one its holdout selections select
     from, read as it was filled; under selections above that source, the
     rows of the inputs they keep, each picked from that source as it is
-    uncached (`_SelectedGeneration`), where no step before it reads its
-    record's index, which the selections number otherwise than that source.
-    Its rows are its source, steps, tokenizers and fill
-    (`Manifest.semantic`); the code and machine that filled it
-    (`Manifest.environment`) do not change them. A step bound to the whole
-    run's facts (scope='run') binds to another run's facts in a generation
-    than in this run, and a step no cache can key (`_keyed`) is in no
-    generation's prefix, so no generation stands for either."""
-    from dew.data.generation import _SelectedGeneration
-    from dew.data.holdout import selecting
+    uncached (`SelectedGeneration`). Its rows are its source, steps,
+    tokenizers and fill (`Manifest.semantic`); the code and machine that
+    filled it (`Manifest.environment`) do not change them. A step bound to
+    the whole run's facts (scope='run') binds to another run's facts in a
+    generation than in this run, and a step no cache can key (`_keyed`) is
+    in no generation's prefix, so no generation stands for either."""
+    from dew.data.holdout import HashPart, RecordSlice, SelectedGeneration, selecting
 
     dependency = record(generation.manifest["dependency"], "generation dependency")
     fill = record(dependency.get("fill", {}), "generation fill")
@@ -216,16 +213,13 @@ def _in_place(generation: Generation, source: Source | Mixture | Phases,
         return None, ("fill",)
     read = READS[READS.index(fill["read"])]
     published = dependency.get("source")
-    depth, stored = next(((depth, candidate) for depth, candidate in enumerate(selecting(source))
-                          if not isinstance(candidate, (Mixture, Phases))
-                          and json_value(_consumed(candidate, read).fingerprint(), "source") == published),
-                         (0, None))
-    if stored is None:
+    chain = list(selecting(source))
+    depth = next((depth for depth, candidate in enumerate(chain)
+                  if not isinstance(candidate, (Mixture, Phases))
+                  and json_value(_consumed(candidate, read).fingerprint(), "source") == published), None)
+    stored = None if depth is None else chain[depth]
+    if stored is None or isinstance(stored, (Mixture, Phases)):
         return None, ("source",)
-    if depth and any(isinstance(stage, MapWithIndex) for stage in prefix):
-        return None, ("steps (a step reads its record's index, which the holdout written before the cache "
-                      "numbers otherwise than the source the generation was published from; give the cache "
-                      "that published it, Cache(url), which fills from the part's own records)",)
     unkeyed = [_identity(stage).name for stage in prefix if not _keyed(stage)
                or (isinstance(stage, Configured) and stage.scope == "run")]
     if unkeyed:
@@ -234,11 +228,23 @@ def _in_place(generation: Generation, source: Source | Mixture | Phases,
     changed = _changed(_semantic(dependency), _prefix_manifest(stored, prefix, read).semantic())
     if changed:
         return None, changed
-    if not depth:
+    selections = tuple(selection for selection in chain[:depth]
+                       if isinstance(selection, (RecordSlice, HashPart)))
+    if not selections:
         return generation.source(), ()
-    if isinstance(source, (Mixture, Phases)):
-        return None, ("source",)
-    return _SelectedGeneration(generation, source, depth, read), ()
+    if any(isinstance(stage, MapWithIndex) for stage in prefix):
+        raise ValueError(
+            f"a step before generation {generation.url} reads its record's index, which the holdout written "
+            "before the cache numbers otherwise than the source the generation was published from; cache "
+            "the part with a Cache(url), which fills from the part's own records")
+    if read == "streamed" and any(isinstance(selection, RecordSlice) for selection in selections):
+        raise ValueError(
+            f"a records holdout numbers its inputs by index, and generation {generation.url} was filled by a "
+            "stream, which numbers them by its shards; publish it from an indexed or memory read")
+    placed = _consumed(stored, read)
+    placing: Read = ("streamed" if read == "streamed"
+                     else "indexed" if placed.supports("indexed") else "memory")
+    return SelectedGeneration(generation, selections, placed, placing), ()
 
 
 def _standing_in(generation: Generation, pipeline: Pipeline, source: Source | Mixture | Phases,
