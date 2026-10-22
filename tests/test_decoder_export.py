@@ -452,25 +452,25 @@ def test_the_export_carries_the_sources_tokenizer(tmp_path):
     assert again.processor.decode(rows) == source.processor.decode(rows)
 
 
-def test_an_export_rewrites_its_tokenizers_nested_files_in_place(tmp_path):
-    """A processor's files under a directory of their own (chat_templates/) are published one file
-    at a time like the rest, so a second export into the same directory replaces them, as a weight
-    reload into a serving directory does, and the export reads back."""
-    from shutil import copyfile, copytree
+def test_the_export_assets_rewrite_a_tokenizers_nested_files_in_place(tmp_path):
+    """A tokenizer's files under a directory of their own (a processor's chat_templates/) are
+    published one file at a time like the rest, so a second export into the same directory replaces
+    them, as a weight reload into a serving directory does."""
+    from dew.interop.hf_decoders import save_export_assets
 
-    directory = tmp_path / "with-templates"
-    copytree(FIXTURES / "mixtral-tiny", directory)
-    for name in ("tokenizer.json", "tokenizer_config.json", "chat_template.jinja"):
-        copyfile(TOKENIZER / name, directory / name)
-    (directory / "chat_templates").mkdir()
-    (directory / "chat_templates" / "brief.jinja").write_text("{{ messages[0]['content'] }}")
+    class Templated:
+        def __init__(self, template):
+            self.template = template
 
-    source = Pretrained.load(str(directory), dtype="float32", attention_impl="reference")
-    export = tmp_path / "exported"
-    source.save(export)
-    source.save(export)
-    assert (export / "chat_templates" / "brief.jinja").read_text() == "{{ messages[0]['content'] }}"
-    assert Pretrained.load(str(export), dtype="float32", attention_impl="reference").processor is not None
+        def save_pretrained(self, directory, /):
+            (Path(directory) / "chat_templates").mkdir()
+            (Path(directory) / "chat_templates" / "brief.jinja").write_text(self.template)
+            (Path(directory) / "tokenizer.json").write_text("{}")
+
+    save_export_assets(tmp_path, tokenizer=Templated("first"))
+    save_export_assets(tmp_path, tokenizer=Templated("second"))
+    assert (tmp_path / "chat_templates" / "brief.jinja").read_text() == "second"
+    assert (tmp_path / "tokenizer.json").read_text() == "{}"
 
 
 def test_an_export_past_its_shard_size_writes_shards_that_transformers_reads(tmp_path):
