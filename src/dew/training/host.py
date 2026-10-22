@@ -198,8 +198,8 @@ def place_leaf(value, target: Sharding | Format) -> jax.Array:
     source pages are given back to the kernel, which is what keeps a large
     checkpoint from being resident twice. A `Format` target, a physical
     layout beside its sharding (a bank's, `dew.inference.banks`), takes the
-    whole value at once, a `HostSource` read whole and released whether or
-    not it lands."""
+    whole value at once: a `HostSource` is read whole and released whether
+    or not it lands, and any other value is put as it is and kept."""
     if isinstance(target, Format):
         try:
             whole = value.read(None) if isinstance(value, HostSource) else value
