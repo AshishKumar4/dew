@@ -434,3 +434,36 @@ def test_the_tpu_kernels_lower_for_a_tpu_on_a_mesh_that_splits_rows_or_heads(axe
 
     lowered = tpu_lowering(jax.grad(loss, argnums=(0, 1, 2, 3)), (query, key, key, extra), mesh)
     assert "tpu_custom_call" in lowered
+
+
+@pytest.mark.parametrize("dtype, width, softcap, backward", [
+    (jnp.bfloat16, 128, True, 1024),
+    (jnp.float32, 128, False, 1024),
+    (jnp.float32, 128, True, 512),
+    (jnp.float32, 256, False, 512),
+    (jnp.bfloat16, 256, True, 512),
+], ids=["bf16-softcap", "fp32", "fp32-softcap", "fp32-256", "bf16-256-softcap"])
+def test_splash_sizes_its_backward_to_a_v5es_scoped_vmem(dtype, width, softcap, backward):
+    """On a v5e, whose Mosaic kernels refuse past 16 MiB of scoped VMEM, splash's fused backward keeps
+    its 1024 blocks where they fit and halves them where they do not: an fp32 softcap at width 128, which
+    the TPU tier's test run refused at 18.6 MiB, and width 256, refused at 16.2 to 22.3 MiB; the forward
+    keeps its own."""
+    from dew.nn.attention import splash_block_sizes
+    from dew.nn.kernels import generation
+
+    with generation.assumed("v5e"):
+        sizes = splash_block_sizes(2048, 2048, width=width, itemsize=jnp.dtype(dtype).itemsize,
+                                   softcap=softcap)
+    assert (sizes.block_q, sizes.block_kv) == (1024, 1024)
+    assert (sizes.block_q_dkv, sizes.block_kv_dkv, sizes.block_kv_dkv_compute) == (backward,) * 3
+
+
+def test_splash_keeps_its_backward_blocks_where_a_tpus_limit_is_unmeasured():
+    """A TPU whose scoped VMEM limit no measurement states (a v6e) keeps the backward's whole blocks:
+    the limit is the target's default, which no TPU reports, so none is assumed."""
+    from dew.nn.attention import splash_block_sizes
+    from dew.nn.kernels import generation
+
+    with generation.assumed("v6e"):
+        sizes = splash_block_sizes(2048, 2048, width=128, itemsize=4, softcap=True)
+    assert (sizes.block_q_dkv, sizes.block_kv_dkv, sizes.block_kv_dkv_compute) == (1024,) * 3
