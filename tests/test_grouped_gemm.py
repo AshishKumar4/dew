@@ -223,6 +223,19 @@ def test_a_named_kernel_refuses_where_the_kernels_do_not_run():
     with generation.chosen(grouped_matmul="triton"), pytest.raises(ValueError, match="GPU of sm80"):
         expert_projection(x, w, sizes, jnp.bfloat16, "auto", None)
 
+def test_a_call_of_no_rows_runs_xla_or_refuses_a_named_kernel():
+    """A projection of no rows launches nothing: XLA gives its empty value, the route saying why, and a
+    kernel `generation.chosen` names for it raises rather than running XLA."""
+    x, w = jnp.ones((0, 16), jnp.bfloat16), jnp.ones((2, 16, 16), jnp.float32)
+    sizes = jnp.zeros((2,), jnp.int32)
+    with generation.assumed("sm80"), generation.routes() as taken:
+        y = expert_projection(x, w, sizes, jnp.bfloat16, "pallas", None)
+    assert y.shape == (0, 16)
+    assert {(route.kernel, route.refusal.detail if route.refusal else None) for route in taken
+            if route.choice == "grouped_matmul"} == {("xla", "the call has no rows")}
+    with generation.assumed("sm80"), generation.chosen(grouped_matmul="triton"), pytest.raises(ValueError):
+        expert_projection(x, w, sizes, jnp.bfloat16, "pallas", None)
+
 def test_a_forced_implementation_runs_or_says_why_it_cannot():
     """'xla' named runs XLA's ragged dot whatever the call asked; a kernel named for a product the
     kernels do not compute (fp32 above the default precision) raises with the reason rather than
