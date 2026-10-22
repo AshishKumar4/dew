@@ -144,7 +144,7 @@ def guarded(plain: Callable, shifted: Callable) -> object:
     walk again with each row's shift (`room`). Ordinary inputs take the plain walk alone, their bits and
     their cost unchanged but for this check; both return the guarded carry (`headroomed`)."""
     carry = plain()
-    state, *rest = carry if isinstance(carry, tuple) else (carry,)
+    state, *rest = (carry,) if isinstance(carry, Partial) else carry
 
     def kept():
         held = headroomed(state)
