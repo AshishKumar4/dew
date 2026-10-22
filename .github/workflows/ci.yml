@@ -73,12 +73,10 @@ jobs:
     - name: Install dependencies
       run: |
         sh tools/install_environment.sh cpu --system
+    # tools/check_gates, side by side; SLOP020's ratchet among them holds the tolerance inventory to main's at
+    # the merge-base and to every parent in the history, and the site's model list and examples to the code.
     - name: Every cheap gate (tools/check.sh), all failures reported
       run: sh tools/check.sh
-    # No commit loosens the tolerance inventory (SLOP020): held to main's at the merge-base and to
-    # every parent in the history. Lanes run it on the PC before a LAND; armada's checkouts are shallow.
-    - name: The tolerance inventory only shrinks
-      run: python tools/lint_slop.py --ratchet --base=origin/main
     - name: Upload the complexity distribution
       uses: actions/upload-artifact@v4
       with:
@@ -90,8 +88,6 @@ jobs:
       run: |
         node site/scripts/sync-docs.mjs --check
         node site/scripts/render-notebooks.mjs --check
-        JAX_PLATFORMS=cpu python site/scripts/gen_models.py --check
-        python site/scripts/gen_examples.py --check
 
   # What PyPI receives, installed the way a user installs it: the sdist and
   # wheel build, pass twine, and name no requirement by URL, which PyPI
