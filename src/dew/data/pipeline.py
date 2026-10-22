@@ -439,6 +439,31 @@ factory."""
 
 
 @dataclasses.dataclass(frozen=True)
+class Runs:
+    """What a stage runs (`runs`): its callable, the identity written for it, and the configured step
+    it was bound from, the one description its plan identity, its cache keyability and `show` read."""
+
+    step: Step
+    identity: str | None = None
+    configured: Bound | None = None
+
+
+def runs(stage: Stage) -> Runs | None:
+    """What `stage` runs, None for a stage that runs no step of its own (an order, a batch, a cache)."""
+    if isinstance(stage, Configured):
+        return Runs(stage.factory)
+    if isinstance(stage, (Map, RandomMap, FlatMap)):
+        return Runs(stage.step, stage.identity, stage.configured)
+    if isinstance(stage, (MapWithIndex, MapBatch, Batched)):
+        return Runs(stage.step, stage.identity)
+    if isinstance(stage, Filter):
+        return Runs(stage.predicate, stage.identity)
+    if isinstance(stage, Native):
+        return Runs(stage.function, stage.identity)
+    return None
+
+
+@dataclasses.dataclass(frozen=True)
 class Mixture:
     pipelines: tuple[Pipeline, ...]
     weights: tuple[float, ...]
