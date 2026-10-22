@@ -3369,15 +3369,21 @@ On the RTX 4080 that one-program kernel ran 6x to 12x slower than XLA as Triton 
 
 Interpreted on the CPU, the Pallas SSD kernel and XLA's scan both compile dots, reductions,
 element-wise and layout ops to YNNPACK fusions by default, and YNNPACK picks their microkernels at run
-time by the host's instruction set. Check 1 between them (`tests/test_ssd_kernel.py`) read the
-one-short case's state gradient at 1.598 (99.9% interval 1.581 to 1.617, 640 seeds) on an AMD EPYC
-Zen 4 host (x86-64-v4, AVX-512) and at 0.77 on a Zen 3 one (x86-64-v3, AVX2). With both arms compiled
-without the fusions (`tests/reference_error.py`'s `without_ynn`), the same two arms' pooled ratios,
-as `tools/ssd_ynn_probe.py` computes them, had their worst leaf at 1.17 over the nine host cases at
-128 draws each on Zen 4, and at 1.20 for the one-short case at 64 draws on Zen 3; check 1 passed
-all nine at their declared seeds on Zen 4.
-Which fused op moved the verdict was not isolated. Without the fusions XLA still compiles for the
-host's instruction set, so the bits can differ by host though the verdicts did not. On one Intel Core
+time by the host's instruction set. `tools/ssd_ynn_probe.py` measures the two arms' pooled ratio per
+leaf, the statistic check 1 pools (`tests/test_ssd_kernel.py`), over 128 draws of each host case, on
+armada at commit 57a0f8666:
+
+| host | fusions | one-short state | whole-chunk state | worst leaf over the nine cases |
+|---|---|---|---|---|
+| AMD EPYC 25/17 (Zen 4, AVX-512) | YNNPACK's | 1.597 | 1.608 | 1.608 |
+| AMD EPYC 25/1 (Zen 3, AVX2) | YNNPACK's | 0.765 | 0.760 | 1.253 (one-chunk B) |
+| AMD EPYC 25/17 | none (`without_ynn`) | 1.002 | 1.002 | 1.175 (whole-chunk A dt) |
+| AMD EPYC 25/1 | none (`without_ynn`) | 1.016 | 1.016 | 1.166 (one-over A dt) |
+
+With YNNPACK's fusions check 1's verdict crossed PARITY by host; without them every leaf of the nine
+sat within 1.18 on both, and check 1 passes all nine at their declared seeds on 25/17. Which fused op
+moved the verdict was not isolated. Without the fusions XLA still compiles for the host's
+instruction set, so the bits can differ by host though the verdicts did not. On one Intel Core
 i9-12900K (AVX2), jaxlib 0.11.2, the one-short case at seed 0 compiled with `--xla_cpu_max_isa=AVX`
 and with no cap differed bitwise in 2090 of the kernel's 4096 outputs and 2111 of the scan's.
 
