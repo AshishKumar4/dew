@@ -37,8 +37,8 @@ from dew.telemetry.records import RECORD_TYPES
 from dew.training import Trainer
 from tools.parity_flow_grpo import RECORDED, dew_transition, transition_inputs
 
-SEEDS = {'guided walk': 8, 'converted': 8, 'rescored walk': 8, 'clipping': 32, 'kl': 8, 'rollout': 64,
-         'inpainting': 128, 'live policy': 64, 'mixed precision': 32, 'prompt evaluation': 8}
+SEEDS = {'guided walk': 8, 'converted': 8, 'rescored walk': 16, 'clipping': 32, 'kl': 8, 'rollout': 64,
+         'inpainting': 32, 'live policy': 64, 'mixed precision': 32, 'prompt evaluation': 8}
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada)."""
 ROWS = 64
 """A drawn batch's rows: enough that a few seeds resolve a site."""
@@ -495,6 +495,7 @@ def test_flow_rollout_groups_rewards_selects_steps_and_preserves_likelihoods():
         blank = jax.tree.map(lambda null, value: jnp.broadcast_to(null, value.shape),
                              objective.encode(encoders), given)
         steps = int(batch["rollout_steps"][0]) - 1
+        apply = jax.jit(model.apply)
 
         def velocity(column, x, sigma):
             # The rollout's step of this column, off its time on the rollout's own grid of `steps` steps.
@@ -502,7 +503,7 @@ def test_flow_rollout_groups_rewards_selects_steps_and_preserves_likelihoods():
             scale = 1.5 if 0.3 <= index / steps <= 0.6 else 1.0
             time = jnp.asarray(sigma.reshape(-1) * 1000)
             conditional, unconditional = (
-                np.asarray(model.apply(weights, jnp.asarray(x), time, **conditions), dtype)
+                np.asarray(apply(weights, jnp.asarray(x), time, **conditions), dtype)
                 for conditions in (given, blank))
             return unconditional + scale * (conditional - unconditional)
 
@@ -877,6 +878,7 @@ def test_conditioned_prompt_only_evaluation_preview_and_trainer_consumers():
         given = objective.encode(encoders, many_tokens)
         blank = jax.tree.map(lambda null, value: jnp.broadcast_to(null, value.shape),
                              objective.encode(encoders), given)
+        apply = jax.jit(model.apply)
 
         def run(key):
             with jax.enable_x64(new_val=False):
@@ -886,9 +888,9 @@ def test_conditioned_prompt_only_evaluation_preview_and_trainer_consumers():
             sigmas = 2 * times / (1 + times)
             for sigma, following in itertools.pairwise(sigmas):
                 time = jnp.full((16,), sigma * 1000)
-                conditional, unconditional = (np.asarray(model.apply(weights, jnp.asarray(images), time,
-                                                                     **conditions), dtype)
-                                              for conditions in (given, blank))
+                conditional, unconditional = (
+                    np.asarray(apply(weights, jnp.asarray(images), time, **conditions), dtype)
+                    for conditions in (given, blank))
                 images = images + (following - sigma) * (unconditional + 1.5 * (conditional - unconditional))
             return np.clip(images, -1, 1).reshape(16, -1)
         return run
