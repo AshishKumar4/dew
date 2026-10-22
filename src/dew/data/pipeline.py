@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Concatenate, Literal, Protocol, TypeGuard, run
 import grain.python as pygrain
 import numpy as np
 
-from dew.data.dataset import Batch
+from dew.data.dataset import Batch, Records
 
 if TYPE_CHECKING:
     import jax
@@ -95,18 +95,32 @@ class Expansion(Protocol):
 type ExpandStep = Expansion | Callable[[Batch], Iterable[Batch | Rejected]]
 
 
+@runtime_checkable
+class Measure(Protocol):
+    """A fact a configured step needs that a memory read measures over a store's records where the
+    store states none (`Configured.measures`): `fact` names it, and calling it on the records gives
+    its value."""
+
+    fact: str
+
+    def __call__(self, records: Records, /) -> int: ...
+
+
 @dataclasses.dataclass(frozen=True)
 class Configured:
     """Resolve one record step from source facts before any record reader opens. `one_to_one`
     states that the step keeps one record for each input whatever the facts, which a cache after it
     and a recipe's order read before it binds; binding it to a step that drops or expands records is
-    refused."""
+    refused. `measures` measures a fact it needs over each store it reads, in a memory read: the
+    whole store, below any holdout, so the parts a run trains and scores on agree; a store's own
+    statement of it gives way to the measure, and a mixture's step binds the largest of its stores'."""
 
     factory: Callable[[Mapping[str, object]], RecordStep | pygrain.RandomMapTransform | Expansion]
     needs: tuple[str, ...]
     scope: Literal["source", "run"] = "source"
     random: bool = False
     one_to_one: bool = False
+    measures: Measure | None = None
 
 
 @dataclasses.dataclass(frozen=True)
