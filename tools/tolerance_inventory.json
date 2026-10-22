@@ -261,10 +261,6 @@
    "comparisons": 6,
    "lane": "Models, Serving & RL"
   },
-  "tests/test_flow_grpo.py": {
-   "comparisons": 29,
-   "lane": "Models, Serving & RL"
-  },
   "tests/test_flow_matching.py": {
    "comparisons": 8,
    "lane": "Training"
@@ -691,10 +687,6 @@
   },
   "tests/test_samplers.py": {
    "comparisons": 9,
-   "lane": "Models, Serving & RL"
-  },
-  "tests/test_schedulers.py": {
-   "comparisons": 18,
    "lane": "Models, Serving & RL"
   },
   "tests/test_sd3_source.py": {
