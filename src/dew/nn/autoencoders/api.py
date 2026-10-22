@@ -17,6 +17,30 @@ type RecordValue = float | np.ndarray | None
 """A value a latent normalization's record keeps: a number, one per channel or position, or absent."""
 
 
+def check_class(config: Mapping[str, object], names: tuple[str, ...], where, *,
+                nameless: bool = False) -> None:
+    """Refuse a published autoencoder's `config` whose `_class_name` is none of `names`, naming the class it
+    holds (a Wan VAE's given to the KL loader); one that names none is taken as `names`' own where
+    `nameless` (an older AutoencoderKL's config)."""
+    named = config.get("_class_name")
+    if named not in names and not (named is None and nameless):
+        raise ValueError(f"{where} holds a {named}, not an {names[0]}")
+
+
+def published_source(name_or_dir, revision, subfolder: str, names: tuple[str, ...], *, weights: bool,
+                     nameless: bool = False):
+    """A published autoencoder's directory and config (`dew.interop.components.component_source`), its
+    config checked first (`check_class`) and its weights fetched only after, so a foreign checkpoint is
+    refused by name before any of its weights is read."""
+    from dew.interop.components import component_source
+
+    directory, config = component_source(name_or_dir, revision, subfolder, weights=False)
+    check_class(config, names, directory, nameless=nameless)
+    if weights:
+        directory, config = component_source(name_or_dir, revision, subfolder, weights=True)
+    return directory, config
+
+
 @dataclasses.dataclass(frozen=True, eq=False)
 class LatentNormalization:
     """A latent normalization, one description: the source values an autoencoder's record keeps
@@ -105,12 +129,11 @@ class AutoEncoder(ABC):
     params: Variables
     model: nn.Module
 
-
     def record_arguments(self) -> dict:
         """The built-in subclass's constructor arguments besides `model` and
         `params`, as it was given them: its compute dtype and latent
         normalization."""
-        raise TypeError(f"{type(self).__name__} needs an explicit autoencoder record declaration")
+        raise TypeError(f"{type(self).__name__} is not a registered built-in (`pretrained.REGISTRATIONS`)")
 
     @property
     def latent_shift(self) -> float | np.ndarray:
@@ -131,14 +154,15 @@ class AutoEncoder(ABC):
         """Return the record of this built-in autoencoder's constructor, without its parameters: its
         registration's name (`pretrained.REGISTRATIONS`), its module's fields and `record_arguments`.
 
-        One no registration declares raises `TypeError`.
+        One no registration names raises `TypeError`.
         """
         from dew.registry import record_fields
 
         from .pretrained import registration
         registered = registration(type(self))
         if registered is None:
-            raise TypeError(f"{type(self).__name__} needs an explicit autoencoder record declaration")
+            raise TypeError(f"{type(self).__name__} is not a registered built-in "
+                            "(`pretrained.REGISTRATIONS`)")
         arguments = {name: np.asarray(value).tolist() if isinstance(value, np.ndarray | jax.Array) else value
                      for name, value in self.record_arguments().items()}
         return {'name': registered.record,
@@ -154,7 +178,8 @@ class AutoEncoder(ABC):
         from .pretrained import registration
         registered = registration(record['name'])
         if registered is None:
-            raise ValueError(f"{record['name']!r} is not a built-in autoencoder declaration")
+            raise ValueError(f"{record['name']!r} is not a registered built-in autoencoder "
+                             "(`pretrained.REGISTRATIONS`)")
         fields = dict(record['fields'])
         model = from_record(registered.module, fields.pop('model'))
         return registered.wrapper(model=model, params=params, **fields)

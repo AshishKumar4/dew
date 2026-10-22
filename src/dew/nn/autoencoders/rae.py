@@ -41,13 +41,17 @@ from dew.nn.precision import float32_dot_general
 from dew.objectives.base import Variables
 
 from ..conv import Conv
-from .api import LatentNormalization, ModuleAutoEncoder, RecordValue
+from .api import LatentNormalization, ModuleAutoEncoder, RecordValue, published_source
 
 if TYPE_CHECKING:
     from dew.interop.streaming import WeightLayout
 
 HEAD_WIDTH = 64
 """Every encoder's attention head width; the source sets the heads from it."""
+
+
+PUBLISHED = ("AutoencoderRAE",)
+"""The `_class_name` a published AutoencoderRAE's config states."""
 
 
 class Encoder(NamedTuple):
@@ -424,7 +428,6 @@ class RAEAutoencoder(ModuleAutoEncoder[RAE]):
     out and its inverse on the way in, per latent position where the
     checkpoint gives per-position statistics."""
 
-
     @property
     def stochastic(self) -> bool:
         return False
@@ -476,11 +479,7 @@ def load_rae(
     Supplied `params` are bound unchanged: only the config is read, and no
     source layouts are returned. `lazy` leaves read ones `SourceLeaf`s for a
     placement to read (`dew.interop.weights.record_layouts`)."""
-    directory, config = component_source(name_or_dir, revision, subfolder, weights=params is None)
-    if config.get("_class_name") != "AutoencoderRAE":
-        raise ValueError(
-            f"{directory} holds a {config.get('_class_name')}, not an AutoencoderRAE"
-        )
+    directory, config = published_source(name_or_dir, revision, subfolder, PUBLISHED, weights=params is None)
     model = RAE(**rae_fields(config), dtype=compute)
     image = jax.ShapeDtypeStruct((1, model.input_size, model.input_size, 3), jnp.float32)
     return bind_component(

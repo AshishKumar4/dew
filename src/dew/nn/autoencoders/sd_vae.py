@@ -16,7 +16,6 @@ def published_normalization(config: dict) -> tuple[float, float]:
 class StableDiffusionVAE(ModuleAutoEncoder[AutoencoderKL]):
     """Encodes and decodes images with a frozen native `AutoencoderKL` and its latent normalization."""
 
-
     def __init__(self, modelname="CompVis/stable-diffusion-v1-4", revision="bf16",
                  dtype=jnp.bfloat16, latent_shift=None, latent_scale=None, params=None,
                  model: AutoencoderKL | None = None):
