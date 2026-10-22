@@ -28,6 +28,10 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   --tokenizer`), one split each; a `train.bin`/`meta.json` directory is
   exported once. Every preset takes `batch=None`, and `prompts`,
   `preferences` and `canvas` take `cache=`.
+- A committed export is named by what it holds, not where its writer put its
+  shards, so hosts that each export the same rows read one store. A data
+  position saved over a committed export before is refused as its source
+  changed, and a cache or generation over one fills again.
 
 ## 0.1.0
 
