@@ -42,8 +42,8 @@ Scope is per rule, because the rules are not all about the same thing:
   the one assertion of the gate (bible §7, `tests/reference_error.py`), so a
   float compared within a tolerance anywhere else is a finding. The files that
   still hold such comparisons are the inventory
-  (`tools/tolerance_inventory.json`), each at its count, lane and date, and it
-  only shrinks.
+  (`tools/tolerance_inventory.json`), each at its count and lane, and it only
+  shrinks.
 
 Every rule fails the gate, and none has a per-finding suppression.
 
@@ -76,7 +76,6 @@ from __future__ import annotations
 
 import argparse
 import ast
-import datetime
 import functools
 import hashlib
 import io
@@ -1826,17 +1825,14 @@ def _loosened(checkout: Path, commit: str, parent: str, mine: dict, theirs: dict
               authorized: dict[str, int] | None = None,
               grants: dict[str, int] | None = None) -> Iterator[tuple[tuple[str, str], str | None]]:
     """How `commit`'s inventory `mine` is looser than `parent`'s `theirs`, each by what it loosens, a
-    (file, "count") for a file added or its count raised, a (file, "date") for its date moved later,
-    ("empty_by", "date") for the inventory's, and how; and a (file, "held") with no finding for each file
-    `theirs` holds an entry for. A file renamed between them carries its entry. Where the
+    (file, "count") for a file added or its count raised, and how; and a (file, "held") with no finding
+    for each file `theirs` holds an entry for. A file renamed between them carries its entry. Where the
     commit changes SLOP020's reading (`RULE`), a file it leaves unchanged may be added or raised: what
     the rule now reads there was in the file all along, and `grants` takes the count it reached. A file
     may also sit at a count `authorized` holds for it, one a commit between `parent` and `commit`
-    reached so (HEAD against its base). No date moves later either way."""
+    reached so (HEAD against its base)."""
     renamed, changed = _changes(checkout, parent, commit)
     reread = RULE in changed
-    if mine["empty_by"] > theirs["empty_by"]:
-        yield ("empty_by", "date"), "moves empty_by later"
     for name, entry in mine["files"].items():
         kept = theirs["files"].get(name) or theirs["files"].get(renamed.get(name, ""))
         held = (authorized or {}).get(name, (authorized or {}).get(renamed.get(name, ""), -1))
@@ -1848,8 +1844,6 @@ def _loosened(checkout: Path, commit: str, parent: str, mine: dict, theirs: dict
                 yield (name, "count"), f"adds {name}"
             continue
         yield (name, "held"), None
-        if entry["by"] > kept["by"]:
-            yield (name, "date"), f"moves {name}'s date later"
         if entry["comparisons"] > kept["comparisons"] and not grown:
             yield (name, "count"), f"raises {name}'s count"
 
@@ -1888,14 +1882,12 @@ def _lineage(checkout: Path, walk: list[tuple[str, list[str]]]) -> dict[str, dic
 
 
 def _merge_loosens(name: str, per_parent: list[dict]) -> str | None:
-    """How a commit loosens `name` (a file, or "empty_by") against all its parents at once (`_loosened`
-    against each, `per_parent`), or None: its count past every parent's (each parent's own raise judged
-    at its own commit, so one parent's allows it), or its date past any parent's holding the entry
-    (dates only come earlier, so a merge keeps the earliest)."""
+    """How a commit loosens the file `name` against all its parents at once (`_loosened` against each,
+    `per_parent`), or None: its count past every parent's (each parent's own raise judged at its own
+    commit, so one parent's allows it)."""
     if (name, "count") in per_parent[0] and all((name, "count") in found for found in per_parent):
         return per_parent[0][(name, "count")]
-    dated = [found for found in per_parent if (name, "held") in found or name == "empty_by"]
-    return next((found[(name, "date")] for found in dated if (name, "date") in found), None)
+    return None
 
 
 def _duplicated(lineage: dict[str, frozenset[str]]) -> Iterator[str]:
@@ -1917,9 +1909,8 @@ def ratchet(checkout: Path, base: str | None = None) -> Iterator[Finding]:
     (`--full-history`, no simplification), to that parent's (`_loosened`), from the commit that first
     made it on, which has no parent's to keep, and no commit removes it once made. A merge is held to
     its loosest parent's count, file by file, each parent's own raise judged at its own commit, so a
-    merge that brings a count another branch raised is no loosening of its own; to every parent's date
-    that holds the entry, dates only coming earlier; and to keeping one entry only once, however its
-    parents renamed it (`_merge_loosens`, `_lineage`). Only a
+    merge that brings a count another branch raised is no loosening of its own; and to keeping one entry
+    only once, however its parents renamed it (`_merge_loosens`, `_lineage`). Only a
     reading of the rule HEAD's own history changed since `base` authorizes a count against it.
     `--ratchet` runs it (CI's lint job, on its whole history); a shallow
     checkout, or one without git, cannot hold the inventory, and it says so rather than passing."""
@@ -1954,7 +1945,7 @@ def ratchet(checkout: Path, base: str | None = None) -> Iterator[Finding]:
         commit, *parents = line.split()
         mine = _inventory_at(checkout, commit)
         # Per parent with an inventory, what the commit loosens against it; a merge loosens a count only
-        # past them all, a date past every parent holding the entry.
+        # past them all.
         loosened = []
         for parent in parents:
             theirs = _inventory_at(checkout, parent)
@@ -1998,10 +1989,9 @@ def _checkout(module: Module) -> Path:
 
 def tolerances(module: Module) -> Iterator[Finding]:
     """SLOP020: a float compared within a tolerance outside the gate (`GATE`, `_tolerance_comparisons`).
-    A file the inventory holds may keep its count until its date and the inventory's own (`empty_by`);
-    past either, or above its count, every comparison is reported; below it, the inventory is told to
-    come down, so the count it keeps is the file's and it only shrinks (`ratchet` holds every commit's
-    inventory to its parents')."""
+    A file the inventory holds may keep its count; above it, every comparison is reported; below it,
+    the inventory is told to come down, so the count it keeps is the file's and it only shrinks
+    (`ratchet` holds every commit's inventory to its parents')."""
     if not module.relative.startswith(("tests/", "tools/")) or module.relative in GATE:
         return
     found = sorted(_tolerance_comparisons(module),
@@ -2012,15 +2002,7 @@ def tolerances(module: Module) -> Iterator[Finding]:
     if entry is None:
         why = "not in the inventory"
     else:
-        due = min(datetime.date.fromisoformat(entry["by"]),
-                  datetime.date.fromisoformat(inventory["empty_by"]))
-        if datetime.date.today() > due and not found:
-            yield Finding(module.relative, 1, 1, "SLOP020",
-                          f"{INVENTORY} still holds this file: remove its entry")
-            return
-        if datetime.date.today() > due:
-            why = f"past the inventory's date for it, {due.isoformat()}"
-        elif len(found) > entry["comparisons"]:
+        if len(found) > entry["comparisons"]:
             why = f"the inventory counts {entry['comparisons']}"
         elif len(found) < entry["comparisons"]:
             yield Finding(module.relative, 1, 1, "SLOP020",
