@@ -489,3 +489,28 @@ def test_the_headroom_guard_leaves_ordinary_inputs_bitwise_unchanged(causal):
         return np.asarray(out)
 
     np.testing.assert_array_equal(walked(headroom=True), walked(headroom=False))
+
+
+@pytest.mark.parametrize("edge", ["small scale", "large scale"])
+def test_the_accurate_form_is_as_exact_as_the_reference_at_its_raw_domains_edges(edge):
+    """The accurate form at scales just outside the raw form's domain (`algebra.RAW_SCALES`), where raw
+    products would overflow their difference (2^-126 over keys near ±2^127) or the factor `scale * log2(e)`
+    (3e38 over products near fp32's least normal): it scales its logits there and holds check 1."""
+    scale, size = (2.0 ** -126, 2.0 ** 127) if edge == "small scale" else (3e38, 2.0 ** -126)
+    spans = template.spans(1, 2, 32)
+
+    def draw(seed: int):
+        streams = jax.random.split(jax.random.key(seed), 3)
+        signs = jnp.asarray([1.0, -1.0], jnp.float32)
+        key = (jax.random.uniform(streams[0], (32, 2), jnp.float32, 0.5, 1.0) * signs * size)[..., None, None]
+        value = jax.random.normal(streams[1], (32, 2, 1, 1), jnp.float32)
+        return jnp.ones((32, 1, 1, 1), jnp.float32), key, value
+
+    def ours(query, key, value):
+        return attention_portable.attend(query, key, value, spans, block_q=32, block_k=32,
+                                         pad=attention_triton.BLOCK, scale=scale, natural=True)
+
+    def reference(query, key, value):
+        return template.reference(query, key, value, spans, scale=scale)
+
+    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, f"accurate form at a {edge}", seeds=8)

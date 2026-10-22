@@ -60,7 +60,8 @@ class Forward:
         natural maximum would have to be divided into raw units, or the scale is not positive (whose raw
         maximum is not the scaled one's), the logits are scaled, the largest's weight held to 1 by a select
         (`weights`). The backward recomputes in the same units (`below`)."""
-        return self.natural and self.score_mod is None and not self.initial and self.scale > 0
+        low, high = RAW_SCALES
+        return self.natural and self.score_mod is None and not self.initial and low <= self.scale <= high
 
     @property
     def base2(self) -> bool:
@@ -228,6 +229,15 @@ def headroom(dtype, keys: int, initial: bool) -> bool:
     return initial or float(jnp.finfo(dtype).max) * (keys + 1) >= 2.0 ** HEADROOM
 
 
+RAW_SCALES = (2.0 ** -120, 2.0 ** 100)
+"""The scales the raw form takes (`Forward.raw`), where its arithmetic weighs every key as the scaled
+logits do. Below: a raw difference past fp32's largest (its products near it, of opposite signs) is -inf,
+its weight 0; the scaled difference is then past `2^128 * 2^-120 = 2^8`, whose exponential is below fp32's
+least subnormal, so both weigh 0, where at a smaller scale the scaled one would be finite. Above: the
+factor `scale * log2(e)` stays finite in fp32, so the largest key's exponent `0 * factor` is 0; a larger
+scale's factor is infinite and that exponent NaN. Outside, the accurate form scales its logits."""
+
+
 HEADROOM = 126
 """The exponent a state's weighted values stay within (`needed`): one below fp32's largest binade, so a
 tile's product adds at most as much again and the sum stays finite."""
@@ -250,13 +260,16 @@ of 2^-62 or more is pushed below fp32's least normal however large the shift."""
 class Room(NamedTuple):
     """A guarded tile's arithmetic (`room`): its weights at `2^-min(shift, WEIGHT_SHIFT)`, the factor the
     state's sums take, the row's new shift and value bound, and `beyond`, the shift past its weights', which
-    the tile's product and weight sums take (`beyond_weights`)."""
+    the tile's product and weight sums take (`beyond_weights`), and `small`, the weights that shift would
+    push below fp32's least normal, unshifted (zero elsewhere), whose product the mainloop issues apart
+    (`small_terms`)."""
 
     weights: jax.Array
     factor: jax.Array
     shift: jax.Array
     reach: jax.Array
     beyond: jax.Array
+    small: jax.Array
 
 
 def beyond_weights(x: jax.Array, room: Room | None) -> jax.Array:
@@ -277,13 +290,25 @@ def tile(state: Partial, alpha: jax.Array, p: jax.Array, value: jax.Array
     return held.weights, held.factor, held
 
 
+def small_terms(held: Room, small_product: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """The small weights' share of a guarded tile (`Room.small`), its product with the values `[bq, Dv]` and
+    its weights' sum `[bq]`, taken to the row's shift after the product: unshifted, a weight below
+    `2^(WEIGHT_SHIFT - 126)` times a value below fp32's largest over a tile of keys stays within fp32, and
+    the shift then scales a product, which holds its exponent where the weight alone would flush."""
+    return (power2(small_product, expand(-held.shift, small_product)),
+            power2(held.small.sum(axis=-1), -held.shift))
+
+
 def stepped(state: Partial, m: jax.Array, factor: jax.Array, p: jax.Array, product: jax.Array,
-            held: Room | None) -> Partial:
+            held: Room | None, small_product: jax.Array | None = None) -> Partial:
     """The state after a tile: its sums taken by `factor` and the tile's `product` of its weights `p` and
-    their sum added at the row's shift (`beyond_weights`; `tile`), the plain walk's arithmetic where
-    `held` is None."""
+    their sum added at the row's shift (`beyond_weights`; `tile`), with the small weights' own product
+    (`small_terms`), the plain walk's arithmetic where `held` is None."""
     denominator = factor * state.total + beyond_weights(p.sum(axis=-1), held)
     acc = rescale(state.acc, factor) + beyond_weights(product, held)
+    if held is not None:
+        small, small_total = small_terms(held, small_product)
+        acc, denominator = acc + small, denominator + small_total
     if held is None:
         return Partial(acc, m, denominator)
     return Partial(acc, m, denominator, held.shift, held.reach, state.live)
@@ -298,7 +323,10 @@ def room(state: Partial, alpha: jax.Array, p: jax.Array, value: jax.Array) -> Ro
     walk's. The weights take at most `WEIGHT_SHIFT` of a shift, the product and weight sums the rest
     (`beyond_weights`), so a weight lost below fp32's least normal is under `2^-62`: a live row's weighted
     values pass `2^128` in some column, so its output there is at least `2^128 / total`, and such a weight
-    on a value at most fp32's largest moves its output by under `2^66 / total`, `2^-62` of that."""
+    on a value at most fp32's largest moves its output by under `2^66 / total`, `2^-62` of that. No weight
+    is lost to the shift: one it would push below fp32's least normal is `small`, whose product the
+    mainloop issues unshifted and shifts after (`small_terms`), so a small column of a row whose other
+    column overflows keeps the reference's resolution."""
     # The largest value magnitude of the keys each row weighs, as a key the row does not see (padding, a
     # stale cache slot, another document) would shift it for nothing.
     largest = jnp.max(jnp.abs(value.astype(jnp.float32)), axis=-1)
@@ -306,8 +334,9 @@ def room(state: Partial, alpha: jax.Array, p: jax.Array, value: jax.Array) -> Ro
     natural = power2(alpha * state.total, state.shift) + p.sum(axis=-1)
     shift = jnp.where(state.live, jnp.maximum(state.shift, needed(natural, reach)), state.shift)
     weight = jnp.minimum(shift, WEIGHT_SHIFT)
-    return Room(power2(p, expand(-weight, p)), power2(alpha, state.shift - shift), shift, reach,
-                weight - shift)
+    small = jnp.where(p < expand(jnp.exp2(weight - 126.0), p), p, 0.0)
+    return Room(power2(p - small, expand(-weight, p)), power2(alpha, state.shift - shift), shift, reach,
+                weight - shift, small)
 
 
 def base2_maximum(m: jax.Array) -> jax.Array:
@@ -442,7 +471,8 @@ def anchor_split(narrowed: jax.Array, at_anchor: jax.Array) -> tuple[jax.Array, 
 
 def split_accumulate(others: jax.Array, own: jax.Array, others_total: jax.Array, alpha: jax.Array,
                      moved: jax.Array, old_value: jax.Array, product: jax.Array, rest: jax.Array,
-                     own_tile: jax.Array, held: Room | None = None) -> tuple[jax.Array, jax.Array, jax.Array]:
+                     own_tile: jax.Array, held: Room | None = None,
+                     small_product: jax.Array | None = None) -> tuple[jax.Array, jax.Array, jax.Array]:
     """A training forward's weighted values kept apart from the anchor key's (`others`, `B`, with the
     initial state's), the anchor's own weight, and the other keys' weights' sum (`others_total`, keys
     alone), after a tile: where the anchor moved to this tile (`moved`), the old anchor's term (its
@@ -456,8 +486,13 @@ def split_accumulate(others: jax.Array, own: jax.Array, others_total: jax.Array,
     total = (alpha * (others_total + jnp.where(moved, own, 0.0))
              + beyond_weights(rest.astype(jnp.float32).sum(axis=-1), held))
     own_tile = beyond_weights(own_tile.astype(jnp.float32), held)
-    return (rescale(others + joined, alpha) + beyond_weights(product, held),
-            jnp.where(moved, own_tile, alpha * own), total)
+    product = beyond_weights(product, held)
+    if held is not None:
+        # The small weights are never the anchor's, which weighs at least 2^-WEIGHT_SHIFT: they join the
+        # other keys' sums (`small_terms`).
+        small, small_total = small_terms(held, small_product)
+        product, total = product + small, total + small_total
+    return rescale(others + joined, alpha) + product, jnp.where(moved, own_tile, alpha * own), total
 
 
 def split_output(others: jax.Array, own: jax.Array, anchor_value: jax.Array) -> jax.Array:
@@ -621,30 +656,36 @@ def off_anchor_start(peak0: jax.Array, total0: jax.Array, term0: jax.Array, maxi
 
 def off_anchor_weights(logits: jax.Array, maximum: jax.Array, at_anchor: jax.Array,
                        dtype, shift: jax.Array, how: Recompute = PLAIN
-                       ) -> tuple[jax.Array, jax.Array, jax.Array]:
+                       ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
     """A tile's weights `exp(s - m)` at the forward's maximum, fp32, at the forward's weights' shift,
     `2^-min(shift, WEIGHT_SHIFT)` (`room`); them narrowed to the values' `dtype` as the forward rounds
-    them, zero at the anchor key (`at_anchor`), the left operand of `B`'s product; and the anchor key's
-    narrowed weight, fp32."""
+    them, zero at the anchor key (`at_anchor`), the left operand of `B`'s product; the anchor key's
+    narrowed weight, fp32; and the weights that shift would push below fp32's least normal, unshifted
+    and narrowed, whose product the mainloop issues apart (`off_anchor`), as the forward's (`room`)."""
     exponentials = below(logits, maximum, how)
-    exponentials = power2(exponentials, expand(-jnp.minimum(shift, WEIGHT_SHIFT), exponentials))
+    weight = expand(jnp.minimum(shift, WEIGHT_SHIFT), exponentials)
+    small = jnp.where(exponentials < jnp.exp2(weight - 126.0), exponentials, 0.0)
+    exponentials = power2(exponentials - small, -weight)
     rounded = exponentials.astype(dtype)
     rest = jnp.where(at_anchor, jnp.zeros_like(rounded), rounded)
     own = jnp.where(at_anchor, rounded, jnp.zeros_like(rounded)).astype(jnp.float32).sum(axis=-1)
-    return exponentials, rest, own
+    return exponentials, rest, own, small.astype(dtype)
 
 
 def off_anchor(state: OffAnchor, exponentials: jax.Array, rest: jax.Array, own: jax.Array,
-               others: jax.Array, shift: jax.Array) -> OffAnchor:
+               others: jax.Array, shift: jax.Array, small: jax.Array, small_others: jax.Array) -> OffAnchor:
     """The first pass after a tile (`off_anchor_weights`), `others` the tile's `rest · V`, its sums taken
-    from the weights' shift to each row's `shift`, as the forward's (`beyond_weights`)."""
+    from the weights' shift to each row's `shift`, as the forward's (`beyond_weights`), and the small
+    weights and their product `small_others` taken there after the product (`small_terms`)."""
     beyond = jnp.minimum(shift, WEIGHT_SHIFT) - shift
 
-    def taken(x):
-        return power2(x, beyond if x.ndim == beyond.ndim else expand(beyond, x))
+    def taken(x, by=beyond):
+        return power2(x, by if x.ndim == by.ndim else expand(by, x))
 
-    return OffAnchor(state.total + taken(exponentials.sum(axis=-1)), state.others + taken(others),
-                     state.others_total + taken(rest.astype(jnp.float32).sum(axis=-1)),
+    small_total = taken(small.astype(jnp.float32).sum(axis=-1), -shift)
+    return OffAnchor(state.total + taken(exponentials.sum(axis=-1)) + small_total,
+                     state.others + taken(others) + taken(small_others, -shift),
+                     state.others_total + taken(rest.astype(jnp.float32).sum(axis=-1)) + small_total,
                      state.own + taken(own))
 
 
