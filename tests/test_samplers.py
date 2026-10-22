@@ -71,7 +71,7 @@ class VPOracle(nn.Module):
     The model is conditioned on the raw timestep for discrete schedules, so
     rates are recomputed from the schedule inside the module.
     """
-    schedule: CosineNoiseScheduler
+    schedule: CosineNoiseScheduler | LinearNoiseScheduler
 
     @nn.compact
     def __call__(self, x, temb):
@@ -158,7 +158,7 @@ def ve_endpoint_process():
 
 def linear_process():
     schedule = LinearNoiseScheduler(1000)
-    return Process(schedule, EpsilonPredictionTransform()), LinearVPOracle(schedule=schedule)
+    return Process(schedule, EpsilonPredictionTransform()), VPOracle(schedule=schedule)
 
 
 class FlowOracle(nn.Module):
@@ -500,17 +500,6 @@ DIFFUSERS_CASES = {
 }
 
 
-class LinearVPOracle(nn.Module):
-    """The epsilon oracle on the linear beta table, the model the reference
-    tool runs under Diffusers' VP-table schedulers."""
-    schedule: LinearNoiseScheduler
-
-    @nn.compact
-    def __call__(self, x, temb):
-        alpha, sigma = broadcast_rates(self.schedule, temb, x)
-        return x * sigma / (alpha**2 * DATA_STD**2 + sigma**2)
-
-
 class VEOracle(nn.Module):
     """The epsilon oracle on a variance-exploding latent x = x_0 + sigma eps,
     read at c_noise = log(sigma) / 4, the model under the k-diffusion
@@ -533,7 +522,7 @@ def reference_process(name: str) -> tuple[Process, nn.Module]:
         prediction = EpsilonPredictionTransform()
         if name.startswith("lcm"):
             prediction = ConsistencyBoundary(prediction)
-        return Process(schedule, prediction), LinearVPOracle(schedule=schedule)
+        return Process(schedule, prediction), VPOracle(schedule=schedule)
     if convention == "ve":
         karras = REFERENCE["karras"]
         return Process(KarrasVENoiseScheduler(karras["sigma_min"], karras["sigma_max"], karras["rho"]),
