@@ -190,11 +190,13 @@ class HashPart:
 
     def manifest(self) -> ShardManifest:
         """The source's shards, each read through the hash. Which of a shard's rows the hash keeps
-        is known only once they are read, so no shard states its rows."""
+        is known only once they are read, so no shard states its rows; the rows it keeps stream in
+        the order its source's do, which is its index order where theirs is (`records`)."""
         manifest = self.source.manifest()
         subdivide = manifest.subdivide
         return ShardManifest(_unsized(manifest.shards), functools.partial(self._reader, manifest),
-                             None if subdivide is None else functools.partial(_unsized_parts, subdivide))
+                             None if subdivide is None else functools.partial(_unsized_parts, subdivide),
+                             index_ordered=manifest.index_ordered)
 
     def _reader(self, manifest: ShardManifest, shard: Shard):
         # The other part's rows are no rejection, as a memory read holds none of them.
@@ -251,11 +253,15 @@ def holdout(dataset: Dataset, fraction: float | None = None, *, key: str | None 
 _SELECTIONS = (HashPart, RecordSlice)
 
 
-def selecting(source: Source | Mixture | Phases) -> Iterator[Source | Mixture | Phases]:
-    """`source`, then each source its holdout selections select from, down to their store."""
-    yield source
-    if isinstance(source, _SELECTIONS):
-        yield from selecting(source.source)
+def selecting(source: Source) -> Iterator[tuple[tuple[RecordSlice | HashPart, ...], Source]]:
+    """`source`, then each source its holdout selections select from, down to their store, each with
+    the selections above it, outermost first."""
+    above: tuple[RecordSlice | HashPart, ...] = ()
+    while True:
+        yield above, source
+        if not isinstance(source, (RecordSlice, HashPart)):
+            return
+        above, source = (*above, source), source.source
 
 
 def _selected(source: Source, kind: str, selection: Mapping[str, object]) -> Mapping[str, object]:
