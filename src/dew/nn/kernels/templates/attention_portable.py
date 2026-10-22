@@ -88,12 +88,12 @@ def forward(spec: algebra.Forward, query: jax.Array, key: jax.Array, value: jax.
         q = jax.lax.dynamic_slice_in_dim(query[row, :, head], first_query, block_q)
         kv_head = head // group
         spans = (start[row, rows], end[row, rows]) if spec.form == "spans" else None
-        row_ids = None if ids is None else ids[0][row, rows]
+        row_ids = None if ids is None else (ids[0][row, rows], ids[1][row])
 
         def keys_at(j) -> algebra.Keys:
             columns = j * block_k + jnp.arange(block_k)
             coords = algebra.Coords(q_pos, columns[None, :], spans,
-                                    None if ids is None else (row_ids, ids[1][row, columns]))
+                                    None if row_ids is None else (row_ids[0], row_ids[1][columns]))
             params = tuple(_tile_param(param, kind, row, head, rows, columns)
                            for param, kind in zip(score_params, score_kinds, strict=True))
             k_tile = jax.lax.dynamic_slice_in_dim(key[row, :, kv_head], j * block_k, block_k)
