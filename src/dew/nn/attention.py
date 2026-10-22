@@ -1839,7 +1839,8 @@ def splash_backward_vmem(block_q: int, block_kv: int, width: int, itemsize: int,
     refused test) it lies past the limit on every config Mosaic refused (16.2 to 22.3 MiB), and within it
     on all it compiled but eight, which take the next smaller block: a bf16 softcap at width 256 at
     batches 1 and 2, an f32 softcap at width 128 (which the tier's test run refused at 18.6 MiB), and
-    f32 at width 256 at batch 1."""
+    f32 at width 256 at batch 1. Those calls were causal; a segment ids' or dense mask's blocks are not
+    in the bound."""
     logits = 4 * block_q * block_kv * (3 if softcap else 2)
     blocks = 2 * itemsize * width * 2 * (block_q + block_kv)
     return logits + blocks + 2 * 4 * width * block_kv
