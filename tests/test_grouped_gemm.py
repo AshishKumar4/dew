@@ -147,12 +147,13 @@ def test_an_expert_projection_runs_the_implementation_chosen_for_it_on_the_cpu(g
     with (generation.assumed(generation_name), generation.chosen(grouped_matmul=implementation),
           generation.routes() as routes):
         operands_ = (jnp.asarray(x, jnp.bfloat16), jnp.asarray(w, jnp.float32))
-        # The CPU's lowering is the interpreted kernels', not XLA's ragged dot compared with itself: an
+        # The CPU's program is the interpreted kernels', not XLA's ragged dot compared with itself: an
         # interpreter runs the grid in loops, Mosaic GPU's through host callbacks; XLA's has neither.
-        lowered = jax.jit(products).lower(*operands_).as_text()
-        assert "stablehlo.while" in lowered
-        assert ("callback" in lowered) == (implementation == "mosaic_gpu")
-        y, dx, dw = jax.jit(products)(*operands_)
+        # Mosaic's ordered callbacks run eagerly: a jitted `linear_call` cannot carry them.
+        traced = str(jax.make_jaxpr(products)(*operands_))
+        assert "while" in traced
+        assert ("callback" in traced) == (implementation == "mosaic_gpu")
+        y, dx, dw = (products if implementation == "mosaic_gpu" else jax.jit(products))(*operands_)
     assert {route.kernel for route in routes if route.choice == "grouped_matmul"} == {implementation}
     assert (y.dtype, dx.dtype, dw.dtype) == (jnp.bfloat16, jnp.bfloat16, jnp.float32)
     for label, got, theirs, truth in zip(("y", "dx", "dw"), (y, dx, dw), reference,
@@ -183,10 +184,12 @@ def test_a_banked_projection_is_its_layers_plain_projection(generation_name: str
                                                          **layer), x, w)
         return (y, *pull(dy))
 
+    # Mosaic's interpreter's ordered callbacks run eagerly: a jitted `linear_call` cannot carry them.
+    staged = (lambda f: f) if implementation == "mosaic_gpu" else jax.jit
     with (generation.assumed(generation_name), generation.chosen(grouped_matmul=implementation),
           generation.routes() as routes):
-        banked = jax.jit(functools.partial(products, layer=jnp.int32(1)))(x, bank)
-        plain = jax.jit(products)(x, bank[1])
+        banked = staged(functools.partial(products, layer=jnp.int32(1)))(x, bank)
+        plain = staged(products)(x, bank[1])
     assert {route.kernel for route in routes if route.choice == "grouped_matmul"} == {implementation}
     for got, want in zip(banked[:2], plain[:2], strict=True):
         np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
