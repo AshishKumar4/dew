@@ -67,7 +67,9 @@ def test_a_head_touching_the_inventory_or_deleting_a_file_it_names_fails_its_cha
     # A file renamed with its comparisons gone, its old name's entry left: Git reads it as a rename.
     git(root, "checkout", "-q", "-b", "renaming", "origin/main")
     git(root, "mv", "tests/test_close.py", "tests/test_near.py")
-    (root / "tests/test_near.py").write_text(CLOSE.replace(", rtol=1e-6", ""))
+    exact = "assert (np.ones(2) == np.ones(2)).all()"
+    (root / "tests/test_near.py").write_text(
+        CLOSE.replace("np.testing.assert_allclose(np.ones(2), np.ones(2), rtol=1e-6)", exact))
     git(root, "commit", "-qam", "a head that renames the held file and drops its comparison")
     renamed = subprocess.run(["git", "diff", "--name-status", "origin/main"], cwd=root, capture_output=True,
                              text=True, check=True).stdout
