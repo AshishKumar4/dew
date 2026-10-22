@@ -23,7 +23,7 @@ import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
-from dew.nn.blocks import Modulation, sinusoidal_time
+from dew.nn.blocks import Modulation, sinusoid_frequencies, sinusoidal_time, sinusoids
 from dew.nn.conv import Conv
 from dew.nn.dense import Dense
 from dew.nn.flops import MissingFlopsCount, matching_lengths, patch_lengths, projection_flops
@@ -56,12 +56,11 @@ def sincos_position(channels: int, grid: int, *, base_size: int):
     """
     steps = jnp.arange(grid, dtype=jnp.float32) / (grid / base_size)
     columns, rows = jnp.meshgrid(steps, steps, indexing="xy")  # width goes first
-    half = channels // 2
-    omega = 1.0 / 10000 ** (jnp.arange(half // 2, dtype=jnp.float32) / (half / 2.0))
+    quarter = channels // 4
+    omega = jnp.asarray(sinusoid_frequencies(quarter, quarter))
 
     def axis(values):
-        angles = values.reshape(-1)[:, None] * omega[None, :]
-        return jnp.concatenate([jnp.sin(angles), jnp.cos(angles)], axis=1)
+        return sinusoids(values.reshape(-1)[:, None] * omega[None, :])
 
     return jnp.concatenate([axis(columns), axis(rows)], axis=1)[None]
 
