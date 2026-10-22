@@ -28,7 +28,7 @@ from jax.sharding import SingleDeviceSharding
 from dew.nn.kernels.options import QuantizedClass
 from dew.nn.protocols import ProjectionGroup, Serving
 from dew.objectives.base import Variables
-from dew.quantization import QUANTIZATION
+from dew.quantization import QUANTIZATION, split_columns
 
 
 def _node(variables: Variables, collection: str, path: Sequence[str]) -> dict:
@@ -304,23 +304,12 @@ def unpacked(model: nn.Module, variables: Variables) -> Variables:
     devices whole (fully addressable, or replicated on every device) splits on the host; any other
     one, sharded across processes or over this process's own devices, splits where it lives. A
     group stored quantized for serving (`TextGeneration.quantized`, Qwix's arrays in place of its
-    kernel) stays packed: such a tree computes only as the served model it was quantized for,
-    which reads it packed, and an export of it is refused where the source's layout reads the
-    members. A tree that holds no group to split is returned as it is."""
-    groups = tuple(group for group in _held_packed(model, variables) if all(
-        isinstance(leaf, (jax.Array, np.ndarray)) for leaf in _node(variables, "params", group.path)[
-            group.packed].values()))
+    kernel) splits as well, each member its own values and scales (`dew.quantization.split_columns`).
+    A tree that holds no group to split is returned as it is."""
+    groups = _held_packed(model, variables)
     if not groups:
         return variables
-
-    def parts(leaf, widths):
-        edges = np.cumsum(widths)[:-1].tolist()
-        if isinstance(leaf, jax.Array) and not (leaf.is_fully_addressable or (
-                leaf.is_fully_replicated and leaf.sharding.has_addressable_devices)):
-            return jnp.split(leaf, edges, axis=-1)
-        return np.split(np.asarray(leaf), edges, axis=-1)
-
-    split = _split(variables, groups, parts)
+    split = _split(variables, groups, split_columns)
     return freeze(split) if isinstance(variables, FrozenDict) else split
 
 

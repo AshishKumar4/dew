@@ -688,10 +688,11 @@ def test_quantizing_packed_pipeline_weights_matches_the_canonical_quantized_mode
     np.testing.assert_allclose(drawn.raw_log_probs, expected.raw_log_probs, atol=2e-6, rtol=2e-6)
 
 
-def test_an_objective_over_a_quantized_packed_task_holds_its_served_tree():
-    """A task's tree quantized for serving computes only as its served model, which reads its
-    projections packed: an objective built over it, a distillation teacher's, holds that tree as it
-    is, and computes the served task's logits."""
+def test_an_objective_over_a_quantized_packed_task_holds_the_canonical_tree():
+    """A task's tree quantized for serving holds its projections packed, as its server reads them;
+    an objective built over it, a distillation teacher's, holds the model's canonical tree, each
+    member its own quantized values and scales (`projections.unpacked`), and computes the served
+    task's logits from it."""
     from pathlib import Path
 
     import dew
@@ -703,8 +704,8 @@ def test_an_objective_over_a_quantized_packed_task_holds_its_served_tree():
         Quantization(weight_only=True, patterns=(".*_proj",)))
     assert "qkv_proj" in served.variables["params"]["layers_0"]["self_attn"]
     held = LMObjective(served.model, 3, variables=served.variables).variables
-    for ours, theirs in zip(jax.tree.leaves(held), jax.tree.leaves(served.variables), strict=True):
-        assert ours is theirs
+    attention = held["params"]["layers_0"]["self_attn"]
+    assert "qkv_proj" not in attention and {"q_proj", "k_proj", "v_proj"} <= set(attention)
     tokens = jnp.asarray([[1, 2, 3]], jnp.int32)
     np.testing.assert_array_equal(served.model.apply(held, tokens),
                                   served.model.apply(served.variables, tokens))
