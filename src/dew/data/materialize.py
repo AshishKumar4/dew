@@ -24,7 +24,7 @@ import grain.python as pygrain
 import numpy as np
 
 from dew.data.analysis import _analyzed, _identity, _label, _name
-from dew.data.dataset import Batch, Records
+from dew.data.dataset import Batch, Ranges, Records
 from dew.data.lowering import (
     _cache_inputs,
     _CachedOutputs,
@@ -113,11 +113,9 @@ class _Memory:
         ):
             raise ValueError("block shuffle needs an unchanged physical shard index")
         sizes, remote = self.original.locality()
-        ends = np.cumsum(sizes)
-        selected = np.bincount(
-            [int(np.searchsorted(ends, identifier[0], side="right")) for identifier in self.identifiers],
-            minlength=len(sizes),
-        )
+        shards = Ranges(tuple(sizes))
+        selected = np.bincount([shards.holding(identifier[0]) for identifier in self.identifiers],
+                               minlength=len(sizes))
         return tuple(int(size) for size in selected), remote
 
     def manifest(self) -> ShardManifest:

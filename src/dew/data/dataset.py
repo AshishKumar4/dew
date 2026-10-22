@@ -1150,6 +1150,45 @@ class GlobalReader(Protocol):
     def identity(self) -> str: ...
 
 
+@dataclasses.dataclass(frozen=True)
+class Ranges:
+    """Consecutive ranges of `counts` items each, as an indexed store's shards hold their records,
+    a run's phases its records and a ramp's stages its batches: which range holds an item
+    (`locate`, or `holding` where a range that runs on follows them), where a range starts
+    (`start`) and the items of them all. A range of no items holds none, so an item is never
+    located in one."""
+
+    counts: tuple[int, ...]
+
+    @classmethod
+    def ending(cls, ends: Sequence[int]) -> Ranges:
+        """The ranges that end at each of `ends`, the first starting at 0."""
+        return cls(tuple(end - start for start, end in itertools.pairwise((0, *ends))))
+
+    @functools.cached_property
+    def ends(self) -> tuple[int, ...]:
+        return tuple(itertools.accumulate(self.counts))
+
+    def __len__(self) -> int:
+        return self.ends[-1] if self.ends else 0
+
+    def start(self, index: int) -> int:
+        """Where range `index` starts: past the last, where the range that runs on after them does."""
+        return self.ends[index - 1] if index else 0
+
+    def locate(self, position: int) -> tuple[int, int]:
+        """The range that holds the item at `position` of them all, and its place in that range."""
+        if not 0 <= position < len(self):
+            raise IndexError(position)
+        index = self.holding(position)
+        return index, position - self.start(index)
+
+    def holding(self, position: int) -> int:
+        """The range that holds the item at `position`, one past the last for an item past them all:
+        the range that runs on after them, as a run's last phase or a ramp's final batch does."""
+        return bisect.bisect_right(self.ends, position)
+
+
 def phase_ends(ends: Sequence[int | None], unit: Literal["step", "record"]) -> tuple[int, ...]:
     """The ends of every phase but the last, which runs on (`None`), each past the one before it and
     above zero, counted in `unit`s: steps where a run writes its phases (`Phases`), records where it
@@ -1187,7 +1226,8 @@ class PhasedStream:
     endless = True
 
     def __init__(self, phases: Sequence[tuple[Callable[[], GlobalReader], int | None]], stop_seconds: float):
-        self._ends = phase_ends([end for _, end in phases], "record")
+        # The phases that end, the last running on after them.
+        self._phases = Ranges.ending(phase_ends([end for _, end in phases], "record"))
         self._streams = [open_stream() for open_stream, _ in phases]
         self._records = 0
         self._current: int | None = None
@@ -1197,10 +1237,10 @@ class PhasedStream:
         return self
 
     def _phase(self, records: int) -> int:
-        return bisect.bisect_right(self._ends, records)
+        return self._phases.holding(records)
 
     def _start(self, phase: int) -> int:
-        return 0 if phase == 0 else self._ends[phase - 1]
+        return self._phases.start(phase)
 
     def __next__(self) -> Batch:
         phase = self._phase(self._records)
@@ -1221,10 +1261,10 @@ class PhasedStream:
         batch = next(stream)
         read = stream.records - before
         self._records += read
-        if phase < len(self._ends) and self._records > self._ends[phase]:
+        if phase < len(self._phases.ends) and self._records > self._phases.ends[phase]:
             raise ValueError(
                 f"a step of {read} records crossed the phase boundary at record "
-                f"{self._ends[phase]}; phases end on step boundaries"
+                f"{self._phases.ends[phase]}; phases end on step boundaries"
             )
         return batch
 
@@ -1232,15 +1272,16 @@ class PhasedStream:
         # The phase of the last record read: at a boundary nothing of the next
         # phase is read yet, so the finished one is still current and a
         # resume may change what follows it or extend it.
-        phase = bisect.bisect_left(self._ends, self._records)
+        phase = self._phases.holding(self._records - 1) if self._records else 0
         plans = [
             position.read(_global_position(stream.get_state())).plan for stream in self._streams[: phase + 1]
         ]
+        completed = zip((stream.order for stream in self._streams), self._phases.ends[:phase], strict=False)
         return position.encode(
             position.Global(
                 records=self._records,
                 order=self._streams[phase].order,
-                completed=tuple((self._streams[index].order, self._ends[index]) for index in range(phase)),
+                completed=tuple(completed),
                 plan={"phases": plans} if any(plan is not None for plan in plans) else None,
             )
         )
@@ -1265,8 +1306,8 @@ class PhasedStream:
         from dew.data.plan import same_order
 
         for index, (order, end) in enumerate(saved.completed):
-            if (index >= len(self._ends) or not same_order(order, self._streams[index].order)
-                    or self._ends[index] != end):
+            if (index >= len(self._phases.ends) or not same_order(order, self._streams[index].order)
+                    or self._phases.ends[index] != end):
                 raise ValueError(
                     f"the saved run finished phase {index} reading {order} to record "
                     f"{end}, and this run's phase {index} is not that; a phase the "
@@ -1279,17 +1320,18 @@ class PhasedStream:
                 f"reading {saved.order}, and this run's phase {phase} reads something "
                 f"else; resume with the order the checkpoint was written in"
             )
-        if phase < len(self._ends) and saved.records > self._ends[phase]:
+        if phase < len(self._phases.ends) and saved.records > self._phases.ends[phase]:
             raise ValueError(
                 f"the saved run has read {saved.records} records, past this run's end "
-                f"of phase {phase} at {self._ends[phase]}"
+                f"of phase {phase} at {self._phases.ends[phase]}"
             )
         self.close()
         self._records = saved.records
 
     def identity(self) -> str:
         return "; ".join(
-            [*(stream.identity() for stream in self._streams), f"phases ending at records {list(self._ends)}"]
+            [*(stream.identity() for stream in self._streams),
+             f"phases ending at records {list(self._phases.ends)}"]
         )
 
     def close(self) -> None:
@@ -1341,7 +1383,8 @@ class RampedStream(Forwarding):
     def __init__(self, source: Resumable, stages: Sequence[Stage], partition: DataPartition):
         self._source = source
         self._stages = tuple(stages)
-        self._starts = tuple(stage.records for stage in stages)
+        # The stages that end, the final batch running on after them.
+        self._ramp = Ranges.ending(tuple(stage.records for stage in stages[1:]))
         self._partition = partition
         self._records = 0
         self._held: Batch | None = None
@@ -1361,7 +1404,7 @@ class RampedStream(Forwarding):
 
     def _stage(self) -> Stage:
         """The stage the records read so far leave the run in."""
-        return self._stages[bisect.bisect_right(self._starts, self._records) - 1]
+        return self._stages[self._ramp.holding(self._records)]
 
     def __next__(self) -> Batch:
         stage = self._stage()
