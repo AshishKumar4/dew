@@ -23,9 +23,19 @@ def test_probe():
         left, right = rng.normal(size=(m, k)).astype(np.float32), rng.normal(size=(k, n)).astype(np.float32)
         print(f"PROBE dot {m}x{k}x{n}", digest(jax.jit(jnp.dot)(left, right)), flush=True)
     reference = dict(np.load("tests/fixtures/mamba2/ssd.npz"))
-    shape, chunk = (2, 63, 4, 8, 8, 2), 64
-    draw = case_draw(reference, "shape", (shape, chunk))
-    xla, truth = parity_functions(chunk, shape[1] + shape[3] + shape[4])
+    case = os.environ.get("PROBE_CASE", "shape:2,63,4,8,8,2:64")
+    kind, *rest = case.split(":")
+    if kind == "shape":
+        shape, chunk = tuple(int(v) for v in rest[0].split(",")), int(rest[1])
+        draw = case_draw(reference, "shape", (shape, chunk))
+        roundings = shape[1] + shape[3] + shape[4]
+    else:
+        chunk, resets = int(rest[0]), rest[1] == "1"
+        draw = case_draw(reference, "fixture", (chunk, resets))
+        _, length, _, width = reference["scan.x"].shape
+        roundings = length + width + reference["scan.B"].shape[-1]
+    print("PROBE case", case, flush=True)
+    xla, truth = parity_functions(chunk, roundings)
     mine = jax.jit(lambda operands, seeded: evaluated(lambda *o: ssd_chunk_scan(*o, chunk, "tpu"), operands, seeded))
     sums = {}
     for seed in range(int(os.environ.get("PROBE_SEEDS", "64"))):
