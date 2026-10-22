@@ -6,11 +6,9 @@ computes. The kernel is written for TPU (a GPU runs mamba_ssm's own kernels,
 `pallas_call(interpret=True)`, which checks shapes, dtypes, resets and state gradients, and holds the
 host cases' numbers to check 1 as the compiled TPU kernel holds its own.
 
-Interpreted, the kernel and XLA's scan are two Dew paths on the CPU, compiled with equal dots
-(`equal_dots`): by default the scan's dots reached XLA:CPU's YNNPACK fusions, which pick their
-microkernels by the host's ISA, and the interpreter's did not, and the one-short state gradient's
-ratio read 1.598 on AMD x86-64-v4 and 0.77 on v3 (ledger row 1349). On equal dots the nine host
-cases' worst leaf is 1.17 on v4, the one-short case's 1.20 on v3.
+Interpreted, the kernel and XLA's scan are two Dew paths on the CPU, each compiled without
+XLA:CPU's YNNPACK fusions (`without_ynn`), whose microkernels follow the host's instruction set, so
+that the host cases' verdicts do not.
 
 One driver (`assert_kernel_parity`) holds every case to the same rule: the
 kernel's forward, final state and all five gradients finite and, by
@@ -31,7 +29,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact, assert_computes_the_oracle, equal_dots
+from reference_error import assert_as_exact, assert_computes_the_oracle, without_ynn
 from ssd_support import ssd_orbit
 
 from dew.nn.kernels.recurrence_chunk import RESET_DECAY
@@ -169,9 +167,13 @@ def evaluated(scan, operands, seeded):
                     (*output, *backward(seeded)), strict=True))
 
 
-def parity_functions(chunk_size: int, roundings: int):
-    """XLA's output, final state and all five gradients, and its independently checked float64 truth."""
-    xla = equal_dots(lambda operands, seeded: evaluated(
+def parity_functions(chunk_size: int, roundings: int, platform: str = "tpu"):
+    """The kernel's output, final state and all five gradients for `platform` (interpreted off it),
+    XLA's, and XLA's independently checked float64 truth: the kernel and the scan, two Dew paths,
+    without YNNPACK fusions on the CPU lane (`without_ynn`)."""
+    mine = without_ynn(lambda operands, seeded: evaluated(
+        lambda *o: ssd_chunk_scan(*o, chunk_size, platform), operands, seeded))
+    xla = without_ynn(lambda operands, seeded: evaluated(
         lambda *o: xla_chunk_scan(*o, chunk_size), operands, seeded))
     recurrence = jax.jit(lambda operands, seeded: evaluated(stepwise_scan, operands, seeded))
 
@@ -183,7 +185,7 @@ def parity_functions(chunk_size: int, roundings: int):
                                       roundings=roundings)
         return exact
 
-    return xla, truth
+    return mine, xla, truth
 
 
 def assert_kernel_parity(draw, chunk_size: int, *, compiled: bool, roundings: int, seeds: int, label: str):
@@ -196,12 +198,7 @@ def assert_kernel_parity(draw, chunk_size: int, *, compiled: bool, roundings: in
         # pallas interprets only for a platform the process holds no device of
         assert any(device.platform == platform for device in jax.devices())
 
-    def kernel(*operands):
-        return ssd_chunk_scan(*operands, chunk_size, platform)
-
-    xla, truth = parity_functions(chunk_size, roundings)
-    # The kernel against XLA's scan, two Dew paths: interpreted, their dots on the same code (`equal_dots`).
-    mine = equal_dots(lambda operands, seeded: evaluated(kernel, operands, seeded))
+    mine, xla, truth = parity_functions(chunk_size, roundings, platform)
     assert_as_exact(mine, xla, draw, label, seeds=seeds, truth_fn=truth)
 
 
@@ -269,19 +266,21 @@ host cases on an AMD x86-64-v4 host."""
 
 
 on_device = pytest.mark.tpu(reason="needs a tpu, the one backend the kernel is chosen on")
+on_host = pytest.mark.cpu(reason="interpreted on the CPU lane, both arms without YNNPACK's fusions")
 
 # (batch, steps, heads, head width, state, groups), chunk: a tail of one step short, whole chunks, a tail
 # of one step over, four chunks with a ragged tail, at widths the kernel takes and fewer groups than heads;
 # then the default chunk at a production head width and state; compiled on a TPU, 1,024 and 4,096 steps at
 # a chunk of 128 over 4 heads of 64 channels and a state of 64, which `ssd_kernel_runs` takes.
 CASES = [
-    *(pytest.param("fixture", (chunk, resets), False, id=f"fixture-{label}{'-resets' if resets else ''}")
+    *(pytest.param("fixture", (chunk, resets), False, id=f"fixture-{label}{'-resets' if resets else ''}",
+                   marks=on_host)
       for chunk, label in ((32, "three-chunks-ragged"), (128, "one-chunk")) for resets in (False, True)),
-    pytest.param("shape", ((2, 63, 4, 8, 8, 2), 64), False, id="one-short"),
-    pytest.param("shape", ((2, 64, 4, 8, 8, 2), 64), False, id="whole-chunk"),
-    pytest.param("shape", ((2, 65, 4, 16, 8, 2), 64), False, id="one-over"),
-    pytest.param("shape", ((2, 193, 4, 16, 8, 2), 64), False, id="four-chunks-ragged"),
-    pytest.param("shape", ((2, 257, 2, 64, 128, 1), 256), False, id="default-chunk"),
+    pytest.param("shape", ((2, 63, 4, 8, 8, 2), 64), False, id="one-short", marks=on_host),
+    pytest.param("shape", ((2, 64, 4, 8, 8, 2), 64), False, id="whole-chunk", marks=on_host),
+    pytest.param("shape", ((2, 65, 4, 16, 8, 2), 64), False, id="one-over", marks=on_host),
+    pytest.param("shape", ((2, 193, 4, 16, 8, 2), 64), False, id="four-chunks-ragged", marks=on_host),
+    pytest.param("shape", ((2, 257, 2, 64, 128, 1), 256), False, id="default-chunk", marks=on_host),
     *(pytest.param("shape", ((1, length, 4, 64, 64, 1), 128), True, id=f"compiled-{length}-steps",
                    marks=on_device) for length in (1024, 4096)),
 ]
@@ -308,13 +307,21 @@ def test_the_kernel_is_as_exact_as_the_xla_scan(reference, kind, case, compiled)
 HOST_CASES = [pytest.param(*param.values[:2], id=param.id) for param in CASES if not param.values[2]]
 
 
+@on_host
+def test_the_interpreted_kernel_and_the_scan_compile_no_ynnpack_fusion():
+    """Both arms of a host case's check 1 run on XLA:CPU's own code, which reads no instruction set
+    at run time (`without_ynn`)."""
+    operands, seeded = case_draw(None, "shape", ((2, 63, 4, 8, 8, 2), 64))(0)
+    for arm in parity_functions(64, 0)[:2]:
+        assert "ynn_fusion" not in arm.lower(operands, seeded).compile().as_text()
+
+
 @pytest.mark.parametrize(("kind", "case"), HOST_CASES)
 def test_the_scan_preserves_resets_and_initial_state_gradients(reference, kind, case):
     """The original host geometries run with every output/gradient shape and dtype intact.
 
     Resets remove entering-state influence exactly, including its final-only cotangent gradient;
-    before a reset a nonzero state still influences the outputs. CPU interpretation checks these
-    exact contracts, while check 1 measures the compiled TPU arithmetic.
+    before a reset a nonzero state still influences the outputs.
     """
     operands, seeded = case_draw(reference, kind, case)(0)
     chunk_size = case[0] if kind == "fixture" else case[1]
