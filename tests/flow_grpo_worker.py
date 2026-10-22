@@ -100,7 +100,6 @@ def main() -> None:
     scores = objective.log_probs(initial.variables, reassembled)
     compared = collective_host((scores, reassembled["old_log_probs"], reassembled["rewards"],
                                 reassembled["advantages"]), phase="flow test likelihoods")
-    error = float(np.max(np.abs(compared[0] - compared[1])))
     data = Loader(
         train=lambda partition: itertools.repeat(local),
         val=lambda partition: iter((local,)),
@@ -121,7 +120,8 @@ def main() -> None:
         "callback_rewards": callback_rewards[0].tolist() if callback_rewards else None,
         "global_rewards": np.asarray(compared[2]).tolist(),
         "global_advantages": np.asarray(compared[3]).tolist(),
-        "density_error": error, "parameter_change": change,
+        "global_scores": np.asarray(compared[0]).tolist(),
+        "global_old_log_probs": np.asarray(compared[1]).tolist(), "parameter_change": change,
         "updates": int(final.updates), "reference_unchanged": frozen,
         "metric_rows": metric.rows, "preview_rows": tracker.preview_rows,
         "validation_mean": tracker.scalars.get("val/pixel_mean"),
