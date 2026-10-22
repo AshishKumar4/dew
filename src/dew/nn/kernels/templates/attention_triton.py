@@ -36,6 +36,7 @@ from dew.nn.kernels.templates.attention import (
     padded_call,
 )
 from dew.nn.kernels.templates.base import Template, dividing
+from dew.nn.precision import float32_products, products_dtype
 
 DTYPES = (jnp.float32, jnp.bfloat16, jnp.float16)
 """The operand dtypes the kernels take, one on queries, keys and values alike."""
@@ -69,10 +70,11 @@ BLOCK = max(max(tiles.block_q for tiles in SPACE), max(tiles.block_k for tiles i
 
 
 def _dot(a: jax.Array, b: jax.Array, interpret: bool) -> jax.Array:
-    """`a @ b` accumulated in fp32: bf16's and fp16's own product, IEEE fp32 for fp32 operands;
-    interpreted, the CPU's own product."""
+    """`a @ b` accumulated in fp32: bf16's and fp16's own product, IEEE fp32 for fp32 operands
+    (`dew.nn.precision.float32_products`); interpreted, the CPU's product at that precision."""
     if interpret:
-        return jnp.dot(a, b, preferred_element_type=jnp.float32)
+        return jnp.dot(a, b, precision=float32_products(products_dtype(a, b)),
+                       preferred_element_type=jnp.float32)
     from jax.experimental.pallas import triton as plgpu
 
     return plgpu.dot(a, b, precision=jax.lax.Precision.HIGHEST).astype(jnp.float32)
@@ -320,7 +322,7 @@ class TritonForward(Template[Tiles]):
             out_specs += [per_row, per_row, per_row, per_value, per_row, per_row]
         # A call's own key count, none included; an op built without one counts its launch's keys.
         spec = algebra.Forward(self.form, keys if self.keys is None else self.keys, ids, self.scale,
-                               self.score_mod, self.natural)
+                               self.score_mod, self.natural, wide=jnp.dtype(query.dtype).itemsize >= 4)
         kernel = functools.partial(
             _forward_kernel, spec=spec, score_kinds=self.score_kinds, output_kinds=self.output_kinds,
             initial=initial, residuals=residuals, output_mod=self.output_mod, block_k=block_k,
