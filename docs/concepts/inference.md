@@ -142,7 +142,7 @@ from dew.sampling import TextToImage
 from dew.quantization import Quantization
 
 pipe = TextToImage.from_pretrained("dewml/hybrid-dit-176m", dtype=jnp.bfloat16,
-                                   revision="9ae074a357738c1634971627608fce3bd7fa3167")
+                                   revision="333948d520f005524bdff336338fe9b361766548")
 served = pipe.quantized(Quantization(dtype="int8", patterns=("^(?!.*spatial_fusion).*",)))
 images = served(["a red fox in a snowy forest"], steps=20, key=0).host().images
 ```
