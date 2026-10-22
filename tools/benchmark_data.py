@@ -35,7 +35,7 @@ import time
 from collections.abc import Iterable
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Annotated, Literal
 
 # Reading data needs no accelerator, and claiming one costs seconds of startup.
 # An explicit JAX_PLATFORMS=cuda selects the same-session A100 measurement.
@@ -142,9 +142,11 @@ def main(config: Benchmark) -> None:
 
 
 @dataclass(frozen=True)
-class Matrix:
-    output: Path = Path("data-matrix.json")
-    work: Path = Path("data-matrix")
+class Measurement:
+    """How an arm is timed and what it reads, the same for a matrix and each worker it starts: its
+    seed, the batches it times after its warmup, the training steps and profiled stage batches,
+    its loading workers, and its batch, tokens, sequence length and image size."""
+
     seed: int = 17
     steps: int = 128
     warmup: int = 8
@@ -155,6 +157,13 @@ class Matrix:
     tokens: int = 16384
     seq_len: int = 128
     image_size: int = 128
+
+
+@dataclass(frozen=True)
+class Matrix:
+    output: Path = Path("data-matrix.json")
+    work: Path = Path("data-matrix")
+    measurement: Annotated[Measurement, tyro.conf.OmitArgPrefixes] = field(default_factory=Measurement)
     engines: tuple[Literal["dew", "dew_memory", "grain", "grain_prepacked"], ...] = ("dew", "grain")
     workloads: tuple[Literal["image", "text"], ...] = ("image", "text")
     cold: bool = True
@@ -169,16 +178,7 @@ class Worker:
     workload: Literal["image", "text"]
     source: Path
     output: Path
-    steps: int = 128
-    warmup: int = 8
-    train_steps: int = 16
-    stage_batches: int = 16
-    workers: int = 2
-    batch: int = 32
-    tokens: int = 16384
-    seq_len: int = 128
-    image_size: int = 128
-    seed: int = 17
+    measurement: Annotated[Measurement, tyro.conf.OmitArgPrefixes] = field(default_factory=Measurement)
     cold: bool = False
     drops: bool = False
     """Dew's corpus read as a chain whose steps can drop records, as a web corpus's decode or a
@@ -213,6 +213,7 @@ def write_images(paths: list[Path], count: int) -> None:
 
 
 def synthetic_inputs(config: Matrix) -> dict:
+    measured = config.measurement
     import numpy as np
 
 
@@ -224,7 +225,7 @@ def synthetic_inputs(config: Matrix) -> dict:
     write_images([path], 4096)
     # No labels in the encoded layout: the image step uses a genuine per-image
     # squared prediction loss, so all loaders read exactly these same bytes.
-    lengths = np.random.default_rng(config.seed).integers(17, 98, 18000)
+    lengths = np.random.default_rng(measured.seed).integers(17, 98, 18000)
     documents = [np.concatenate(((np.arange(size - 1) + index) % 200 + 4, [255])).astype(np.int32)
                  for index, size in enumerate(lengths)]
     from dew.data import Files, Memory
@@ -271,6 +272,7 @@ def evicted_copy(source: Path, workload: str, into: Path) -> Path:
 
 
 def objective_for(config: Worker):
+    measured = config.measurement
     import jax.numpy as jnp
     from flax import linen as nn
 
@@ -291,13 +293,14 @@ def objective_for(config: Worker):
             return jnp.mean(jnp.square(outputs - target), axis=-1)
 
         return Supervised(ImageMean(), loss, inputs=InputSpec(
-            Field("image", (config.image_size, config.image_size, 3))))
+            Field("image", (measured.image_size, measured.image_size, 3))))
     return LMObjective(CausalTransformer(vocab_size=256, emb_features=32, num_layers=1,
-        num_heads=2, mlp_features=64, max_seq_len=config.seq_len),
-        seq_len=config.seq_len)
+        num_heads=2, mlp_features=64, max_seq_len=measured.seq_len),
+        seq_len=measured.seq_len)
 
 
 def dew_reader(config: Worker, objective, loading: Loading):
+    measured = config.measurement
     from dew.data import Files, images, presets
     from dew.data.compile import compile
     from dew.data.dataset import DataPartition
@@ -307,16 +310,17 @@ def dew_reader(config: Worker, objective, loading: Loading):
         chain = _dropping(config)
     elif config.workload == "image":
         # Every record trains, as the Grain arm reads them all, through the steps it runs.
-        records = Files(str(config.source), format="array_record").shuffle(config.seed).repeat()
-        chain = records.pipe(presets.images, config.image_size, batch=config.batch, draft=True, rejects=False,
-                             caption=images.caption(), host=(images.EncodeCaptions(),))
+        stored = Files(str(config.source), format="array_record")
+        records = stored.shuffle(measured.seed).repeat()
+        chain = records.pipe(presets.images, measured.image_size, batch=measured.batch, draft=True,
+                             rejects=False, caption=images.caption(), host=(images.EncodeCaptions(),))
     else:
         # Packed in the store's order, then ordered, as a run reads a packed token store.
-        packed = TokenFiles(str(config.source)).pipe(presets.lm, None, seq_len=config.seq_len, batch=None,
+        packed = TokenFiles(str(config.source)).pipe(presets.lm, None, seq_len=measured.seq_len, batch=None,
                                                      pack="first-fit", bins=32)
-        chain = packed.shuffle(config.seed).repeat().batch(config.batch)
+        chain = packed.shuffle(measured.seed).repeat().batch(measured.batch)
     read = "memory" if config.engine == "dew_memory" else "indexed"
-    data = compile(chain, read=read, provision=True, loading=loading, seed=config.seed,
+    data = compile(chain, read=read, provision=True, loading=loading, seed=measured.seed,
                    objective=objective.data())
     assert data.plan is not None, "a compiled run states its plan"
     plan = data.plan.record()
@@ -330,29 +334,32 @@ def dew_reader(config: Worker, objective, loading: Loading):
 def _dropping(config: Worker):
     """The workload's corpus as a chain whose steps can drop records and keep every one here: an image
     decode that rejects what doesn't decode, or a target count before the pack."""
+    measured = config.measurement
     from dew.data import Files, presets
     from dew.data.pipeline import Pipeline
     from dew.data.sources import TokenFiles
     from dew.data.steps.text import CountTargets
 
     if config.workload == "image":
-        rows = Pipeline(Files(str(config.source), format="array_record")).shuffle(config.seed).repeat()
-        return rows.pipe(presets.images, config.image_size, batch=config.batch, rejects=True)
-    documents = Pipeline(TokenFiles(str(config.source))).shuffle(config.seed).repeat()
+        rows = Pipeline(Files(str(config.source), format="array_record")).shuffle(measured.seed).repeat()
+        return rows.pipe(presets.images, measured.image_size, batch=measured.batch, rejects=True)
+    documents = Pipeline(TokenFiles(str(config.source))).shuffle(measured.seed).repeat()
     documents = documents.filter_map(CountTargets())
-    return documents.pipe(presets.lm, None, seq_len=config.seq_len, batch=config.batch, bins=32)
+    return documents.pipe(presets.lm, None, seq_len=measured.seq_len, batch=measured.batch, bins=32)
 
 
 def grain_options(rows, config: Worker):
+    measured = config.measurement
     import grain.python as grain
 
-    if config.workers:
+    if measured.workers:
         rows = rows.mp_prefetch(grain.MultiprocessingOptions(
-            num_workers=config.workers, per_worker_buffer_size=2))
+            num_workers=measured.workers, per_worker_buffer_size=2))
     return rows
 
 
 def grain_reader(config: Worker, objective, loading: Loading):
+    measured = config.measurement
     import grain.experimental as gx
     import grain.python as grain
 
@@ -362,11 +369,11 @@ def grain_reader(config: Worker, objective, loading: Loading):
     read_options = grain.ReadOptions(loading.threads, loading.read_buffer)
     if config.workload == "image":
         source = grain.ArrayRecordDataSource([str(config.source / "images.array_record")])
-        rows = grain.MapDataset.source(source).shuffle(seed=config.seed).repeat()
+        rows = grain.MapDataset.source(source).shuffle(seed=measured.seed).repeat()
         # The images preset's own record steps, applied by Grain alone.
-        rows = rows.map(images.DecodeImage("image", at_least=config.image_size, rejects=False))
-        rows = rows.map(images.Resize(config.image_size)).map(images.caption())
-        rows = rows.batch(config.batch, drop_remainder=True).map(EncodeCaptions())
+        rows = rows.map(images.DecodeImage("image", at_least=measured.image_size, rejects=False))
+        rows = rows.map(images.Resize(measured.image_size)).map(images.caption())
+        rows = rows.batch(measured.batch, drop_remainder=True).map(EncodeCaptions())
         stream = grain_options(rows.to_iter_dataset(read_options), config)
     elif config.workload == "text" and config.engine == "grain_prepacked":
         import numpy as np
@@ -378,12 +385,12 @@ def grain_reader(config: Worker, objective, loading: Loading):
         documents = [{"text": np.asarray(source[start:end], np.int32)}
                      for start, end in zip(np.concatenate(([0], ends[:-1])), ends, strict=True)]
         rows = grain.MapDataset.source(documents).to_iter_dataset(read_options)
-        packed = gx.FirstFitPackIterDataset(rows, length_struct={"text": config.seq_len + 1},
+        packed = gx.FirstFitPackIterDataset(rows, length_struct={"text": measured.seq_len + 1},
                                            num_packing_bins=32, shuffle_bins=False)
         # A produced packing order is repeated and shuffled by both Dew loaders.
         stored = list(packed)
-        rows = grain.MapDataset.source(stored).shuffle(seed=config.seed).repeat()
-        stream = grain_options(rows.batch(config.batch, drop_remainder=True).to_iter_dataset(read_options),
+        rows = grain.MapDataset.source(stored).shuffle(seed=measured.seed).repeat()
+        stream = grain_options(rows.batch(measured.batch, drop_remainder=True).to_iter_dataset(read_options),
                                config)
     else:
         from dew.data.packing import PackedSource
@@ -392,10 +399,10 @@ def grain_reader(config: Worker, objective, loading: Loading):
 
         source = TokenFiles(str(config.source))
         source.provision()
-        windows = PackedSource.planned(source, Pack(config.seq_len + 1, bins=32)).records("indexed")
+        windows = PackedSource.planned(source, Pack(measured.seq_len + 1, bins=32)).records("indexed")
         rows = grain.MapDataset.source(windows).map(
             lambda row: {name: value for name, value in row.items() if not name.startswith("_dew_")})
-        rows = rows.shuffle(seed=config.seed).repeat().batch(config.batch, drop_remainder=True)
+        rows = rows.shuffle(seed=measured.seed).repeat().batch(measured.batch, drop_remainder=True)
         stream = grain_options(rows.to_iter_dataset(read_options), config)
     reference = ("prepacked in-memory native-Grain first-fit list" if config.engine == "grain_prepacked" else
                  "planned first-fit windows read from token store" if config.workload == "text" else
@@ -403,21 +410,30 @@ def grain_reader(config: Worker, objective, loading: Loading):
     return lambda: iter(stream), {"read": "indexed", "batch_policy": "fixed rows", "reference": reference}
 
 
-def batch_counts(batch) -> dict:
+def objective_batch(batch) -> dict:
+    """`batch` as the objective reads it: a native Grain packing's `text_segment_ids` become the
+    token field its layout reads (`dew.nn.inputs.token_layout`), as Dew's packing's coordinates are."""
+    if "text_segment_ids" not in batch:
+        return batch
+    from dew.nn.inputs import ModelInputs
+
+    rest = {name: value for name, value in batch.items() if name != "text_segment_ids"}
+    segments = {"segment_ids": batch["text_segment_ids"]}
+    return {**rest, "text": ModelInputs(batch["text"], token_fields=segments)}
+
+
+def batch_counts(batch, objective) -> dict:
+    """A batch's rows and its real tokens as the objective counts them (`real_lengths`), the count
+    the trainer's throughput reads, among the slots its inputs hold; an objective that counts no
+    tokens (an image's) counts the rows it marks valid."""
     import numpy as np
 
-    first = next(iter(batch.values()))
-    rows = len(first)
-    tokens = padded = 0
-    if "valid" in batch:
-        tokens, padded = int(np.sum(batch["valid"])), int(np.size(batch["valid"]))
-    elif "text" in batch:
-        padded = int(np.size(batch["text"][:, 1:]))
-        laid = batch.get("text_coordinates")
-        segments = batch.get("text_segment_ids") if laid is None else np.asarray(laid.segments)
-        tokens = padded if segments is None else int(np.sum(
-            (segments[:, 1:] == segments[:, :-1]) & (segments[:, 1:] > 0)))
-    return {"rows": rows, "tokens": tokens, "padded_tokens": padded}
+    rows = len(next(iter(batch.values())))
+    if objective.counts_tokens:
+        tokens = int(np.sum(objective.real_lengths(objective_batch(batch))))
+        return {"rows": rows, "tokens": tokens, "padded_tokens": int(np.size(batch["text"][:, :-1]))}
+    valid = np.asarray(batch["valid"]) if "valid" in batch else np.ones(rows, bool)
+    return {"rows": rows, "tokens": int(np.sum(valid)), "padded_tokens": int(np.size(valid))}
 
 
 def signature(batch) -> tuple:
@@ -456,22 +472,23 @@ class ResidentMemory:
         self.thread.join()
 
 
-def loader_measure(factory, config: Worker) -> dict:
+def loader_measure(factory, config: Worker, objective) -> dict:
+    measured = config.measurement
     first = None
     latencies, counts = [], []
     started = steady_started = time.perf_counter()
     with contextlib.closing(factory()) as reader:
-        for index in range(config.warmup + config.steps):
+        for index in range(measured.warmup + measured.steps):
             before = time.perf_counter()
-            if index == config.warmup:
+            if index == measured.warmup:
                 steady_started = before
             batch = next(reader)
             seconds = time.perf_counter() - before
             if first is None:
                 first = time.perf_counter() - started
-            if index >= config.warmup:
+            if index >= measured.warmup:
                 latencies.append(seconds)
-                counts.append(batch_counts(batch))
+                counts.append(batch_counts(batch, objective))
         # Counted batches are consumer work too: do not turn time spent counting
         # into free prefetch time and overstate steady pipeline throughput.
         seconds = time.perf_counter() - steady_started
@@ -484,7 +501,7 @@ def loader_measure(factory, config: Worker) -> dict:
 
 
 class Counted(Forwarding):
-    def __init__(self, parent, objective=None):
+    def __init__(self, parent, objective):
         self._source = parent
         self.objective = objective
         self.counts = queue.Queue()
@@ -497,14 +514,15 @@ class Counted(Forwarding):
 
     def __next__(self):
         batch = next(self._source)
-        counts = batch_counts(batch)
-        counts["model_flops"] = (None if self.objective is None or counts["tokens"] == 0 else
-                                 self.objective.training_flops(None, batch))
+        counts = batch_counts(batch, self.objective)
+        counts["model_flops"] = (None if counts["tokens"] == 0 else
+                                 self.objective.training_flops(None, objective_batch(batch)))
         self.counts.put(counts)
         return batch
 
 
 def training_measure(factory, objective, config: Worker) -> dict:
+    timed = config.measurement
     import jax
     import optax
 
@@ -520,7 +538,7 @@ def training_measure(factory, objective, config: Worker) -> dict:
     index = 0
     signals, completed_seconds, segment_started = [], 0.0, None
     with DevicePrefetchIterator(counted, trainer.device_mesh) as reader:
-        while len(measured) < config.train_steps:
+        while len(measured) < timed.train_steps:
             start = time.perf_counter()
             batch = next(reader)
             waited = time.perf_counter() - start
@@ -542,9 +560,9 @@ def training_measure(factory, objective, config: Worker) -> dict:
             state, loss, _, finite, accepted = compiled[key](state, batch)[:5]
             dispatched = time.perf_counter() - before
             signals.append((loss, finite, accepted))
-            if cold_shape or index < config.warmup:
+            if cold_shape or index < timed.warmup:
                 jax.block_until_ready((state, loss, finite, accepted))
-            if index >= config.warmup and not cold_shape:
+            if index >= timed.warmup and not cold_shape:
                 if segment_started is None:
                     segment_started = start
                 measured.append({**counts, "wait_seconds": waited,
@@ -594,21 +612,23 @@ def stage_profile(factory, batches: int = 16) -> list[dict]:
 
 
 def matrix_worker(config: Worker) -> dict:
+    measured = config.measurement
     import jax
 
     if config.cold:
         config = replace(config, source=evicted_copy(config.source, config.workload,
                                                      config.output.with_suffix(".inputs")))
     objective = objective_for(config)
-    loading = Loading(workers=config.workers, worker_buffer=2)
+    loading = Loading(workers=measured.workers, worker_buffer=2)
     with ResidentMemory() as rss:
         started = time.perf_counter()
         factory, policy = {"dew": dew_reader, "dew_memory": dew_reader, "grain": grain_reader,
                            "grain_prepacked": grain_reader}[
             config.engine](config, objective, loading)
         opened = time.perf_counter() - started
+        loader = loader_measure(factory, config, objective)
         result = {"engine": config.engine, "workload": config.workload, "config": asdict(config),
-            "policy": policy, "cold_open_seconds": opened, "loader": loader_measure(factory, config),
+            "policy": policy, "cold_open_seconds": opened, "loader": loader,
             "loading": asdict(loading),
             "device": jax.devices()[0].device_kind,
             "cold_scope": ("fresh process and cache home over a fresh copy of the inputs, never provisioned, "
@@ -618,11 +638,11 @@ def matrix_worker(config: Worker) -> dict:
                 "cpu": platform.processor(), "packages": {name: importlib.metadata.version(name)
                     for name in ("jax", "jaxlib", "numpy", "grain", "transformers")}}}
         result["first_batch_from_open_seconds"] = opened + result["loader"]["first_batch_seconds"]
-        if config.train_steps:
+        if measured.train_steps:
             result["training"] = training_measure(factory, objective, config)
-        result["stages"] = stage_profile(factory, config.stage_batches) if config.stage_batches else []
-        result["stage_scope"] = (f"separate untimed {config.stage_batches}-batch parent-thread cProfile; "
-                                 "excludes worker CPU" if config.stage_batches else "not recorded")
+        result["stages"] = stage_profile(factory, measured.stage_batches) if measured.stage_batches else []
+        result["stage_scope"] = (f"separate untimed {measured.stage_batches}-batch parent-thread cProfile; "
+                                 "excludes worker CPU" if measured.stage_batches else "not recorded")
     result["parent_rss_peak_bytes"] = rss.parent_peak
     result["worker_rss_peak_bytes"] = rss.workers_peak
     config.output.write_text(json.dumps(result, default=str, indent=2) + "\n")
@@ -676,9 +696,6 @@ def run_matrix(config: Matrix) -> None:
     prepared = config.work / "inputs.json"
     inputs = json.loads(prepared.read_text()) if prepared.is_file() else synthetic_inputs(config)
     rows = []
-    common = {name: getattr(config, name) for name in ("steps", "warmup", "train_steps", "stage_batches",
-                                                    "workers", "batch", "tokens", "seq_len",
-                                                    "image_size", "seed")}
     cases: list[tuple[Literal["image", "text"], Literal["dew", "dew_memory", "grain", "grain_prepacked"],
                       bool]] = [(workload, engine, False) for workload in config.workloads
                                 for engine in config.engines]
@@ -690,12 +707,14 @@ def run_matrix(config: Matrix) -> None:
         output = config.work / f"{number}-{workload}-{engine}{'-cold' if cold else ''}.json"
         source = Path(inputs[workload]["source"])
         # A cold arm times its open and first batches only.
-        first = {"steps": 4, "warmup": 0, "train_steps": 0, "stage_batches": 0}
-        timed = {**common, **(first if cold else {})}
-        worker = Worker(engine, workload, source.resolve(), output.resolve(), cold=cold, drops=config.drops,
-                        **timed)
+        timed = (replace(config.measurement, steps=4, warmup=0, train_steps=0, stage_batches=0) if cold
+                 else config.measurement)
+        worker = Worker(engine, workload, source.resolve(), output.resolve(), timed, cold=cold,
+                        drops=config.drops)
         args = [sys.executable, str(Path(__file__).resolve()), "worker"]
-        for name, value in asdict(worker).items():
+        # The measurement's flags are its fields' own (`OmitArgPrefixes`).
+        flags = {name: value for name, value in asdict(worker).items() if name != "measurement"}
+        for name, value in {**asdict(timed), **flags}.items():
             flag = "--" + name.replace("_", "-")
             if isinstance(value, bool):
                 # tyro reads a bool as a flag and its --no- form.
@@ -760,9 +779,10 @@ def run_scaling(config: Scaling) -> None:
                  .map(images.DecodeImage("image", at_least=config.image_size, rejects=False))
                  .map(images.Resize(config.image_size)).interleave(cycle).repeat().batch(config.batch))
         data = compile(chain, loading=Loading(workers=0))
-        worker = Worker("dew", "image", directory, config.output, steps=config.steps, warmup=config.warmup,
-                        batch=config.batch, image_size=config.image_size)
-        measured = loader_measure(functools.partial(data.train, DataPartition()), worker)
+        worker = Worker("dew", "image", directory, config.output, Measurement(
+            steps=config.steps, warmup=config.warmup, batch=config.batch, image_size=config.image_size))
+        reader = functools.partial(data.train, DataPartition())
+        measured = loader_measure(reader, worker, objective_for(worker))
         rows.append({"cycle": cycle, **measured})
         print(f"cycle {cycle}: {measured['records_per_second']:.1f} rows/s", flush=True)
     base = rows[0]["records_per_second"]
