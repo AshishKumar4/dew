@@ -114,10 +114,15 @@ of a query alike, and the scorer's shared bias every option's, so the softmax an
 move with either (their float64 values are residue)."""
 
 
-def ragged(seed: int = 0) -> list[Example]:
-    """Ragged rows: one question of a hundred options, seventeen of three and one of
-    twenty-four, their states and answers drawn from `seed` at fixed lengths, so every draw packs
-    alike."""
+RAGGED_COPIES = 4
+"""Rows of each ragged kind a draw holds: enough independent rows that one draw's rounding is not one
+row's (with one of each, the reference's own error from float64 swung 45 times across draws)."""
+
+
+def ragged(seed: int = 0, copies: int = 1) -> list[Example]:
+    """Ragged rows, `copies` of each kind: one question of a hundred options, seventeen of three and
+    one of twenty-four, their states and answers drawn from `seed` at fixed lengths, so every draw
+    packs alike."""
     rng = np.random.default_rng(seed)
 
     def state(prefix):
@@ -126,10 +131,11 @@ def ragged(seed: int = 0) -> list[Example]:
     clauses = Choice("Which clause?", [f"c{index}" for index in range(100)])
     hypotheses = {f"h{index}": Choice(f"Hypothesis {index}?", ["yes", "no", "unsaid"]) for index in range(17)}
     intents = Choice("Which intent?", [f"i{index}" for index in range(24)])
-    return [Example(state("a clause on"), {"clause": clauses}, {"clause": f"c{rng.integers(100)}"}),
-            Example(state("a contract"), hypotheses,
-                    {name: str(rng.choice(["yes", "no", "unsaid"])) for name in hypotheses}),
-            Example(state("book a flight"), {"intent": intents}, {"intent": f"i{rng.integers(24)}"})]
+    return [example for _ in range(copies) for example in (
+        Example(state("a clause on"), {"clause": clauses}, {"clause": f"c{rng.integers(100)}"}),
+        Example(state("a contract"), hypotheses,
+                {name: str(rng.choice(["yes", "no", "unsaid"])) for name in hypotheses}),
+        Example(state("book a flight"), {"intent": intents}, {"intent": f"i{rng.integers(24)}"}))]
 
 
 def ragged_objective() -> DecisionObjective:
@@ -149,11 +155,11 @@ def ragged_objective() -> DecisionObjective:
                              attention_impl="xla"), shuffle_options=False)
 
 
-def ragged_batches(objective: DecisionObjective, seed: int = 0):
-    """The ragged rows of `seed` packed into windows of a grid as many questions deep as a window
-    holds, with their options compacted into the slots its bounds allow (`slotted`) and without
-    (`batch`)."""
-    examples = ragged(seed)
+def ragged_batches(objective: DecisionObjective, seed: int = 0, copies: int = 1):
+    """The ragged rows of `seed`, `copies` of each kind, packed into windows of a grid as many
+    questions deep as a window holds, with their options compacted into the slots its bounds allow
+    (`slotted`) and without (`batch`)."""
+    examples = ragged(seed, copies)
     data = decision_rows(examples, len(examples), examples, objective=objective.data())
     (slotted,) = list(data.val(DataPartition()))
     slotted = {name: value for name, value in slotted.items() if name != VALID_ROWS}
@@ -205,7 +211,7 @@ def test_a_ragged_batch_trains_on_compacted_options_as_on_the_grid():
     initialized = jax.jit(objective.init)
 
     def draw(seed):
-        return initialized(jax.random.key(seed)), *reversed(ragged_batches(objective, seed))
+        return initialized(jax.random.key(seed)), *reversed(ragged_batches(objective, seed, RAGGED_COPIES))
 
     grid = stepped(objective, compact=False)
     # The truth of the algebraic zeros is exactly zero, which each of their rows is held to.
