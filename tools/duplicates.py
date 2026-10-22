@@ -48,6 +48,7 @@ from itertools import pairwise
 from pathlib import Path
 from typing import TYPE_CHECKING
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
 from forked import forked_map
 
 if TYPE_CHECKING:
