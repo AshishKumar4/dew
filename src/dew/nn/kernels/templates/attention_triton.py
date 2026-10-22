@@ -35,6 +35,7 @@ from dew.nn.kernels.templates.attention import (
     kept_dtype,
     kernel_dot,
     padded_call,
+    within,
 )
 from dew.nn.kernels.templates.base import Template, dividing
 
@@ -530,9 +531,8 @@ def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tu
     def tile(index):
         keys = pl.ds(index * block_k, block_k)
         k_pos = index * block_k + jnp.arange(block_k)[None, :]
-        seen = (k_pos >= start[:, None]) & (k_pos < end[:, None])
-        if ids:
-            seen &= query_ids[0][:, None] == id_refs[1][keys][None, :]
+        seen = within(k_pos, start[:, None], end[:, None],
+                      (query_ids[0][:, None], id_refs[1][keys][None, :]) if ids else None)
         params = [_tile_param(ref, kind, head, q_pos, keys)
                   for ref, kind in zip(score_refs, score_kinds, strict=True)]
         return keys, k_pos, seen, params
@@ -639,9 +639,8 @@ def _dkv_kernel(ranges_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: t
         rows = pl.ds(index * block_q, block_q)
         query, dout = query_ref[rows, :], dout_ref[rows, :]
         q_pos = index * block_q + jnp.arange(block_q)[:, None]
-        seen = (k_pos >= start_ref[rows][:, None]) & (k_pos < end_ref[rows][:, None])
-        if ids:
-            seen &= id_refs[0][rows][:, None] == key_ids[0][None, :]
+        seen = within(k_pos, start_ref[rows][:, None], end_ref[rows][:, None],
+                      (id_refs[0][rows][:, None], key_ids[0][None, :]) if ids else None)
         params = [_key_param(ref, kind, head, rows)
                   for ref, kind in zip(score_refs, score_kinds, strict=True)]
         exponentials, weights, cotangents, slopes = _tile_scores(
