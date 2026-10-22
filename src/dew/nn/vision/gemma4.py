@@ -29,14 +29,14 @@ from dew.objectives.base import Variables
 from dew.registry import Record
 
 from .common import (
-    _PROJECTOR_PATHS,
     ProjectorBase,
+    ProjectorLayout,
     TowerBase,
     TowerGeometry,
+    TowerLayout,
     _vision_section,
     activation_name,
     head_width,
-    projector_weight_path,
     rope_base,
     trunk_geometry,
 )
@@ -311,6 +311,10 @@ def gemma4_vision_path(hf_name: str) -> tuple[str, ...] | None:
     return (collection, *path)
 
 
+GEMMA4_PROJECTOR_TENSORS = {"embedding_projection.weight": ("projection", "kernel")}
+"""The Gemma 4 embedder's tensors past `embed_vision.` (or its audio's), each to its leaf."""
+
+
 def gemma4_vision_name(path: tuple[str, ...]) -> str:
     """The Gemma 4 vision tensor name of the leaf at `path`, its collection then its trunk path:
     `gemma4_vision_path`'s inverse, for a tower built natively rather than read."""
@@ -333,7 +337,7 @@ def gemma4_vision_name(path: tuple[str, ...]) -> str:
 
 def gemma4_tower_layouts(variables: Variables) -> tuple[WeightLayout, ...]:
     """The layouts that write a natively built Gemma 4 tower's tensors back from its collections
-    (`gemma4_vision_name`); a read tower's come from its reading (`TOWERS`)."""
+    (`gemma4_vision_name`); a read tower's come from its reading (`Gemma4Vision.checkpoint`)."""
     return native_layouts(variables, gemma4_vision_name, gemma4_vision_path)
 
 
@@ -341,9 +345,9 @@ def gemma4_projector_layouts(params: Variables) -> tuple[WeightLayout, ...]:
     """The layouts that write a natively built Gemma 4 embedder's projection back from its
     parameters, rooted at `params`."""
     names: dict[tuple[str, ...], str] = {("params", *path): name
-                                         for name, path in _PROJECTOR_PATHS["gemma4"].items()}
+                                         for name, path in GEMMA4_PROJECTOR_TENSORS.items()}
     return native_layouts({"params": params}, names.__getitem__,
-                          lambda name: ("params", *projector_weight_path("gemma4", name)))
+                          lambda name: ("params", *GEMMA4_PROJECTOR_TENSORS[name]))
 
 
 def translate_gemma4_projector_weights(
@@ -354,9 +358,9 @@ def translate_gemma4_projector_weights(
     The pre-projection norm carries no scale, so the projection weight is
     the only tensor.
     """
-    if set(hf_tensors) != set(_PROJECTOR_PATHS["gemma4"]):
+    if set(hf_tensors) != set(GEMMA4_PROJECTOR_TENSORS):
         raise ValueError(f"unknown tensor names {sorted(hf_tensors)}")
-    return placed(hf_tensors, lambda name: projector_weight_path("gemma4", name), param_dtype)
+    return placed(hf_tensors, GEMMA4_PROJECTOR_TENSORS.__getitem__, param_dtype)
 
 
 def translate_gemma4_vision_config(hf_config: Mapping[str, object]) -> Record:
@@ -428,3 +432,8 @@ def translate_gemma4_projector_config(vision: Mapping[str, object],
         "text_width": int(text_width),
         "norm_eps": records.number(vision.get("rms_norm_eps", 1e-6), "rms_norm_eps"),
     }}
+
+
+Gemma4Vision.checkpoint = TowerLayout("vision_tower.", gemma4_vision_path)
+Gemma4Projector.checkpoint = ProjectorLayout("embed_vision.", GEMMA4_PROJECTOR_TENSORS,
+                                             read=translate_gemma4_projector_weights)
