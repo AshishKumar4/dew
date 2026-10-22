@@ -527,7 +527,7 @@ def test_a_hybrid_stack_decodes_as_it_scores_in_parallel(rng):
 
     incremental = decode_logits(model, params, ids[:, :4], ids[:, 4:])
     assert jnp.array_equal(full[:, 3:].argmax(-1), incremental.argmax(-1))
-    decoded_against_full(model, 4, "hybrid decode", SEEDS['hybrid decode'], batch=32)
+    decoded_against_full(model, 4, "hybrid decode", SEEDS['hybrid decode'], batch=16)
 
     _, mutated = model.apply({**params, "cache": cache}, ids[:, :4], decode=True, mutable=["cache"])
     kept, _ = model.apply({**params, "cache": mutated["cache"]}, ids[:, 4:5], decode=True, mutable=["cache"])
