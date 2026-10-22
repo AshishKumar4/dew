@@ -122,11 +122,6 @@
    "lane": "Training",
    "by": "2026-11-20"
   },
-  "tests/test_chunked_cross_entropy.py": {
-   "comparisons": 25,
-   "lane": "Models, Serving & RL",
-   "by": "2026-11-13"
-  },
   "tests/test_clip_metrics.py": {
    "comparisons": 10,
    "lane": "Training",
