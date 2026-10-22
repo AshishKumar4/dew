@@ -3374,9 +3374,10 @@ Zen 4 host (x86-64-v4, AVX-512) and at 0.77 on a Zen 3 one (x86-64-v3, AVX2). Wi
 without the fusions (`tests/reference_error.py`'s `without_ynn`), a probe of the same arms at 128
 draws each read the worst leaf over the nine host cases at 1.17 on Zen 4 and the one-short case's at
 1.20 on Zen 3, and check 1 passes all nine at their declared seeds on Zen 4.
-Which fused op moved the verdict was not isolated. The bits still differ by host without the
-fusions, since XLA compiles for the host's instruction set (2090 of 4096 outputs moved between
-`--xla_cpu_max_isa=AVX` and no cap on one host); the verdicts do not.
+Which fused op moved the verdict was not isolated. Without the fusions XLA still compiles for the
+host's instruction set, so the bits can differ by host though the verdicts did not: on one Intel Core
+i9-12900K (AVX2), jaxlib 0.11.2, the one-short case at seed 0 compiled with `--xla_cpu_max_isa=AVX`
+and with no cap differed bitwise in 2090 of the kernel's 4096 outputs and 2111 of the scan's.
 
 ### The Mamba-2 SSD scan on GPU: mamba_ssm's kernels
 
