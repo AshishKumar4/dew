@@ -124,6 +124,13 @@ def comprehended(nodes: Sequence[ast.AST], table: Mapping[str, str], body: Mappi
     return tables
 
 
+def nodes_of(body: Sequence[ast.AST]) -> list[ast.AST]:
+    """Every node one scope's `body` holds: its statements and what they hold, a nested scope's own
+    statement but not its contents."""
+    return [node for statement in body
+            for node in (statement, *(() if isinstance(statement, SCOPES) else own(statement)))]
+
+
 def scoped(body: Sequence[ast.AST], visible: Mapping[str, str], parent: Sequence[str],
            parameters: Sequence[ast.arg] = (), class_body: bool = False
            ) -> Iterator[tuple[ast.AST, Mapping[str, str]]]:
@@ -132,8 +139,7 @@ def scoped(body: Sequence[ast.AST], visible: Mapping[str, str], parent: Sequence
     import replaces its `parameters`; a name it otherwise binds (`binders`:
     an assignment, a definition) stands for no import. A comprehension's
     targets are its own, and a class body's names reach no scope inside it."""
-    nodes = [node for statement in body
-             for node in (statement, *(() if isinstance(statement, SCOPES) else own(statement)))]
+    nodes = nodes_of(body)
     imported: dict[str, str] = {}
     local: set[str] = set()
     for name, by in binders(nodes, parameters).items():
