@@ -3,7 +3,6 @@ axis divides, and a table that reads a class off a prompt."""
 
 from dataclasses import dataclass
 
-import jax
 import jax.numpy as jnp
 import numpy as np
 
@@ -62,12 +61,10 @@ PROMPTS = ["a red bird", "two cats"]
 
 def batch_for(objective, size: int) -> dict:
     """One row per device, the prompts in turn: a batch the data axis divides,
-    in the channels the objective's sample field names."""
-    rows, channels = jax.device_count(), objective.inputs.sample.shape[-1]
-    pixels = np.tile(np.arange(size * size * channels, dtype=np.uint8).reshape(
-        1, size, size, channels), (rows, 1, 1, 1))
-    return {"image": pixels,
-            **objective.inputs.tokenize([PROMPTS[row % len(PROMPTS)] for row in range(rows)])}
+    in the channels the objective's sample field names (`diffusion_support.image_batch`)."""
+    from diffusion_support import image_batch
+
+    return image_batch(objective, PROMPTS, size)
 
 
 def label_table(labels, null: float = 0.0) -> CharTable:
