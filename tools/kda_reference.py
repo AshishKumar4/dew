@@ -116,19 +116,15 @@ def oracle_chunk(query, key, value, g, beta, state, chunk_size=4):
     return jnp.swapaxes(core, 1, 2), s
 
 
-def with_gradients(rule, inputs: dict) -> dict:
+def rule_gradients(rule, inputs: dict) -> dict:
     """`rule`'s output and final state on `inputs`' operands, and the six operands' gradients of their
     sum against `inputs`' cotangents, by name, in JAX at the operands' dtype."""
-    import jax
     import jax.numpy as jnp
+    from reference_error import with_gradients
 
-    def loss(*operands):
-        out, state = rule(*operands)
-        value = jnp.sum(out * inputs["output_cotangent"]) + jnp.sum(state * inputs["state_cotangent"])
-        return value, (out, state)
-
-    (_, (out, state)), gradients = jax.value_and_grad(loss, tuple(range(len(INPUTS))), has_aux=True)(
-        *(jnp.asarray(inputs[name]) for name in INPUTS))
+    (out, state), *gradients = with_gradients(rule)(
+        *(jnp.asarray(inputs[name]) for name in INPUTS),
+        (jnp.asarray(inputs["output_cotangent"]), jnp.asarray(inputs["state_cotangent"])))
     return {"output": out, "state": state} | {f"grad/{name}": grad for name, grad in zip(INPUTS, gradients,
                                                                                          strict=True)}
 
@@ -185,7 +181,7 @@ def main(destination: Path) -> None:
                 return found, truth
 
             def proxy(inputs, rule=rule):
-                return with_gradients(oracle_rule(rule), inputs)
+                return rule_gradients(oracle_rule(rule), inputs)
 
             recorded.update(record_case(f"{rule} rule", rule_inputs, evaluate, proxy, truth_proxy=proxy,
                                         store_inputs=False, summary=True))

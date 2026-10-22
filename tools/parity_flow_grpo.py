@@ -95,8 +95,8 @@ def author_transition(reference, inputs: dict, dtype) -> dict[str, np.ndarray]:
 def dew_transition(inputs: dict) -> dict:
     """Dew's transition on a draw (`transition_inputs`), by `author_transition`'s names: the count the
     recording plans on, and tests/test_flow_grpo.py's arm and, in float64, its truth."""
-    import jax
     import jax.numpy as jnp
+    from reference_error import with_gradients
 
     from dew.sampling.flow import flow_transition
 
@@ -110,7 +110,9 @@ def dew_transition(inputs: dict) -> dict:
         return transition.log_prob(inputs["action"]) / dimensions
 
     transition = flow_transition(inputs["x"], inputs["velocity"], t, s, noise_level=NOISE_LEVEL)
-    gradient = jax.grad(lambda velocity: density(velocity).sum())(inputs["velocity"])
+    # Each row's density pulls back one, exact at every precision, through the gate's pullback.
+    ones = jnp.ones(inputs["velocity"].shape[0], inputs["velocity"].dtype)
+    _, gradient = with_gradients(density)(inputs["velocity"], ones)
     shifted = transition.mean + jnp.asarray(REFERENCE_SHIFT, dtype)
     return {"mean": transition.mean, "variance": transition.variance,
             "mean_log_prob": density(inputs["velocity"]), "velocity_grad": gradient,
