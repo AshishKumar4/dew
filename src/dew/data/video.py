@@ -10,14 +10,16 @@ from __future__ import annotations
 import contextlib
 import dataclasses
 import tempfile
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING
 
 import grain.python as grain
 import numpy as np
 
 from dew.data.dataset import Batch
+from dew.data.facts import shaped
 from dew.data.pipeline import Rejected
+from dew.data.sources.files import Files
 
 if TYPE_CHECKING:
     from dew.data.sources.urls import Fetch
@@ -83,6 +85,10 @@ class PickClip(grain.RandomMapTransform):
     rejects: bool = True
     """Whether media that does not read or is too short is dropped (`filter_map`) rather than an error."""
 
+    def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
+        """Windows `seconds` long, as `[start, stop]` under `to`."""
+        return {**shaped(facts, self.to, [2]), "seconds": self.seconds}
+
     def random_map(self, element: Batch, rng: np.random.Generator) -> Batch | Rejected:
         from dew.data.sources.av_utils import media_info
 
@@ -123,6 +129,10 @@ class DecodeVideo(grain.MapTransform):
     rejects: bool = True
     """Whether a clip that does not decode is dropped (`filter_map`) rather than an error."""
 
+    def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
+        """`frames` RGB frames at `fps`, each a `size` square, under `to`."""
+        return {**shaped(facts, self.to, [self.frames, self.size, self.size, 3]), "fps": self.fps}
+
     def map(self, element: Batch) -> Batch | Rejected:
         from dew.data.sources.av_utils import read_frames
 
@@ -143,3 +153,24 @@ class DecodeVideo(grain.MapTransform):
                                  "pixels on its shorter side")
             return Rejected("too_small")
         return {**element, self.to: fit_frames(frames, self.size)}
+
+
+@dataclasses.dataclass(frozen=True)
+class Row(grain.MapTransform):
+    """A listed media file's path (`video_path`, else `path`) under `mp4`, where the decoders read it,
+    and its caption, `caption` where it states none."""
+
+    caption: str = ""
+
+    def map(self, element: Batch) -> Batch:
+        from dew.records import text
+
+        path = text(element.get("video_path", element.get("path")), "video_path")
+        return {"mp4": path, "caption": element.get("caption", self.caption)}
+
+
+def media(listing: Files, extensions: Sequence[str] = (".mp4", ".avi", ".mov", ".webm")) -> Files:
+    """A listing of files (`Files(url, format="files")`) cut to those whose name ends in one of
+    `extensions`, any case: a directory's media, not the lists and notes beside it, listed when the
+    store is read (`Files.suffixes`), so a chain over media not fetched yet is made and recorded."""
+    return dataclasses.replace(listing, suffixes=tuple(extensions))

@@ -85,23 +85,26 @@ A confidence is a statistic of the answer's distribution, and the task decides w
 ```python
 from dew import Trainer
 from dew.config import OptimConfig
-from dew.decision import ECE, Accuracy, Brier, Choice, DecisionObjective, Decisions, LogLoss
+from dew.data import Hub
+from dew.data.compile import held
+from dew.decision import ECE, Accuracy, Brier, DecisionObjective, LogLoss, decisions
 from dew.interop import Pretrained
 from dew.lora import LoRA
-from dew.data import Hub
-from dew.config.data import HoldOut, loader
 
 qwen = Pretrained.load("Qwen/Qwen3-0.6B").adapt(LoRA(rank=16, modules=("q_proj", "v_proj")), key=0)
-banking77 = Decisions(source=Hub("mteb/banking77"), label="label_text", question="intent",
-                      instructions="Which banking request is this?",
-                      validation=HoldOut(fraction=0.1, by="random", most=400))
+# A tenth of the rows, by the hash of each one's content, the same in every run.
+train, val = Hub("mteb/banking77").holdout(0.1)
+
+def asked(rows):
+    return rows.pipe(decisions, label="label_text", question="intent",
+                     instructions="Which banking request is this?").read("memory")
 
 objective = DecisionObjective(qwen, loss=LogLoss() + 0.5 * Brier())
-data = loader(banking77, batch=32, read="memory", provision=True, objective=objective.data())
 state = Trainer(objective, OptimConfig(learning_rate=1e-4), key=0).fit(
-    data, steps=2_000, eval_every=500, metrics=[Accuracy(), ECE()])
+    asked(train).shuffle(0).repeat().batch(32), steps=2_000, eval_every=500,
+    validation={"val": asked(val).batch(32)}, metrics=[Accuracy(), ECE()])
 
-decide = objective.pipeline(state).calibrated(data.val)
+decide = objective.pipeline(state).calibrated(held(asked(val).batch(32), objective=objective.data()))
 ```
 
 Examples need not come from a table: `objective.dataset` takes any labelled examples, `Example`s or mappings with a `state`, `questions` (as `Question`s or in Jev's wire form) and `answers`, an answer naming its option by key or index.
@@ -135,14 +138,31 @@ A run saves like any other: `Decide.from_run(run)` and `dew.pipeline(run)` rebui
 
 ## From a table, on the command line
 
-`recipes/decision/train.py` is `laya-train --data tickets.csv`:
+`recipes/decision/train.py` fine-tunes on BANKING77 by default:
 
 ```bash
-python recipes/decision/train.py --data.source tickets.csv --data.text text --data.label label \
-    --trainer.batch-size 32 --trainer.epochs 4
+python recipes/decision/train.py --trainer.epochs 3
 ```
 
-It starts from Laya's checkpoint, or from `--pretrained Qwen/Qwen3-0.6B --lora.rank 16 --lora.modules q_proj v_proj`. `Decisions` reads CSV, JSON, JSONL and parquet files and Hub datasets: each row's text is the state, and its label is the answer to one choice question. A tenth of the rows, at most 400, are held out. Validation scores them, and after training they are used to fit the temperatures saved into the run.
+It starts from Laya's checkpoint, or from `--pretrained Qwen/Qwen3-0.6B --lora.rank 16 --lora.modules q_proj v_proj`. A table of your own is a run file that names its chains, which `dew train` reads. `decisions` reads CSV, JSON, JSONL and parquet files and Hub datasets: each row's `text` is the state, and its `label` the answer to one choice question.
+
+<!-- not run: the file `dew train tickets.py` reads -->
+```python
+# tickets.py
+from dew.data import Files
+from dew.decision import decisions
+from dew.decision.config import DecisionRunConfig
+
+train, held = Files("tickets.csv").holdout(0.1)
+run = DecisionRunConfig(data=train.pipe(decisions, question="team").read("memory").shuffle().repeat().batch(32),
+                        validation=held.pipe(decisions, question="team").read("memory").batch(32))
+```
+
+```bash
+dew train tickets.py --set trainer.epochs=4
+```
+
+A tenth of the rows, by the hash of each, are held out. Validation scores them, and after training they are used to fit the temperatures saved into the run. A memory read takes the options from the whole table's labels; another read needs them given (`options=`) or a store's class names.
 
 ## How this relates to Laya
 

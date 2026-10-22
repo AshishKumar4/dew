@@ -27,12 +27,13 @@ import pytest
 from affine_run import BATCH, FEATURES, Counting, Features, Regression, Spread, dataset, raw_leaf, val_batches
 from recording import Preempting, RecordingTracker
 from steady_state import steady_state
+from token_support import write_token_corpus
 
 from dew import position
 from dew.artifacts import Representations
 from dew.checkpoints import Ranking
 from dew.config import OptimConfig
-from dew.config.data import loader
+from dew.data.compile import compile
 from dew.data.dataset import DataPartition, Loader, replayed
 from dew.objectives.base import Aux, EMASpec, Objective, merge, under
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer, TrainState, ema_update
@@ -350,7 +351,7 @@ def test_a_run_that_fails_after_a_failed_write_raises_its_own_error_and_closes_i
 
     from dew.config import RunConfig, TrainerConfig
 
-    run = RunConfig(trainer=TrainerConfig(steps=2, batch_size=BATCH, checkpoint_dir=str(tmp_path),
+    run = RunConfig(trainer=TrainerConfig(steps=2, checkpoint_dir=str(tmp_path),
                                           eval_every=None, checkpoint_every=1))
     run.train(Regression(), dataset(), name="settled")
     settled = threading.active_count()
@@ -608,13 +609,11 @@ def test_a_runs_checkpoint_opens_with_orbax_alone(tmp_path):
 
 
 def test_overlapping_token_windows_resume_in_a_fresh_trainer_bit_exactly(tmp_path):
-    from dew.config.data import TextData
-    from dew.data import Loading
+    from dew.data import Loading, presets
     from dew.data.dataset import Forwarding
+    from dew.data.sources.tokens import TokenFiles
 
-    tokens = np.arange(29, dtype=np.uint16)
-    tokens.tofile(tmp_path / "train.bin")
-    tokens.tofile(tmp_path / "val.bin")
+    corpus = write_token_corpus(tmp_path / "tokens", np.arange(29))
 
     class WindowsRegression(Regression):
         def loss(self, variables, batch, step):
@@ -640,8 +639,9 @@ def test_overlapping_token_windows_resume_in_a_fresh_trainer_bit_exactly(tmp_pat
             self._source.set_state(state)
 
     def dataset(seen):
-        data = loader(TextData(source=str(tmp_path), seq_len=4, stride=1), batch=BATCH, read="memory", seed=7,
-            loading=Loading(workers=0, threads=1, read_buffer=1), validation_records=4 * (BATCH))
+        windows = TokenFiles(corpus.train).pipe(presets.token_windows, seq_len=4, batch=BATCH, stride=1)
+        windows = windows.read("memory").loading(Loading(workers=0, threads=1, read_buffer=1))
+        data = compile(windows, seed=7)
         return dataclasses.replace(data, train=lambda partition: Observed(data.train(partition), seen))
 
     def trainer(directory):
@@ -685,20 +685,15 @@ def test_a_cuda_lm_repeats_and_resumes_bit_exactly_with_deterministic_ops(tmp_pa
     before the backend opens. Check every state leaf, not just parameters.
     bf16 at the default precision runs the head that rounds its logits and
     their gradient to bf16, and resumes bit-exactly too."""
-    from dew.config.data import TextData
-    from dew.data import Loading
+    from dew.data import Loading, presets
+    from dew.data.sources.tokens import TokenFiles
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives.lm import LMObjective
 
-    tokens = np.tile(np.arange(8, dtype=np.uint8), 256)
-    tokens.tofile(tmp_path / "train.bin")
-    tokens[:128].tofile(tmp_path / "val.bin")
-    (tmp_path / "meta.json").write_text(json.dumps({
-        "tokenizer": "symbols", "vocab_size": 8, "dtype": "uint8",
-        "train_tokens": len(tokens), "val_tokens": 128, "eos_id": None,
-    }))
-    data = loader(TextData(source=str(tmp_path), seq_len=16), batch=8, read="memory",
-        loading=Loading(workers=0), validation_records=4 * (8))
+    corpus = write_token_corpus(tmp_path / "tokens", np.tile(np.arange(8), 256), tokenizer="symbols",
+                                vocab_size=8)
+    data = compile(TokenFiles(corpus.train).pipe(presets.token_windows, seq_len=16, batch=8).read(
+        "memory").loading(Loading(workers=0)))
     model = CausalTransformer(vocab_size=8, emb_features=16, num_layers=1,
                               num_heads=2, mlp_features=32, max_seq_len=32, dtype=dtype)
     objective = LMObjective(model, seq_len=16, ema_decay=None)

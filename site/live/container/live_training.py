@@ -1,11 +1,11 @@
 """Bounds a live training cell to a couple of minutes on a shared 4-vCPU host.
 
 A training context runs Dew itself, not the stand-ins of model_client.
-`install` has IPython run each cell with its calls that name a batch, steps
-or log_every, or unpack keywords, passed through `capped`: a Dew `load` or
-`loader` (a dataset's or a recipe's, whose `load` reads its batch through
-`dew.config.data.loader`) reads batches of at most BATCH, and a Dew `fit` runs
-at most STEPS steps, logging at least four times. Each cap prints what it
+`install` has IPython run each cell with its calls' callees passed through
+`capped`, whatever name it calls them by: a preset of `dew.data.presets`, called or given
+to a dataset's `pipe`, and a dataset's own `batch(n)` make batches of at most
+BATCH rows, and a Dew `fit` runs at most STEPS steps, logging at least four
+times. Each cap prints what it
 changed before the run's own output, so the cell's first lines say how this
 run differs from the code on the page.
 """
@@ -14,8 +14,6 @@ import ast
 import inspect
 
 BATCH, STEPS = 8, 20
-CAPPED = ("batch", "steps", "log_every")
-"""The keywords a call names that `Capped` sends through `capped`, beside any `**` it unpacks."""
 
 
 def batch(asked):
@@ -42,31 +40,45 @@ def fitted(steps, log_every):
     return {"steps": steps, "log_every": log_every}
 
 
-def capped(call, /, *args, **options):
-    """`call(*args, **options)`, its keywords capped where `call` is Dew's: a `load` or `loader`'s batch
-    (`batch`), a `fit`'s steps and log_every, the latter its own default where the cell names none
-    (`fitted`). Whatever name the cell calls it by, and however it passes the keywords."""
-    if (getattr(call, "__module__", None) or "").split(".")[0] == "dew":
-        name = getattr(call, "__name__", "")
-        if name in ("load", "loader") and "batch" in options:
+def capped(call):
+    """What a cell's call of `call` reaches: `call` itself, so the call runs in the cell's own frame (a
+    `locals()` or an `exec` reads the cell's, however it is named), unless `call` is a Dew function this
+    caps, then one that caps its arguments first: a preset's batch (`batch`), called or through a
+    dataset's `pipe`, a dataset's `batch(n)` rows, a `fit`'s steps and log_every, the latter its own
+    default where the cell names none (`fitted`). Whatever name the cell calls it by, and however it
+    passes them."""
+    module = getattr(call, "__module__", None) or ""
+    name = getattr(call, "__name__", "")
+    capping_one = module == "dew.data.presets" or name in ("pipe", "batch", "fit")
+    if module.split(".")[0] != "dew" or not capping_one:
+        return call
+
+    def capping(*args, **options):
+        if (module == "dew.data.presets" or name == "pipe") and "batch" in options:
             options["batch"] = batch(options["batch"])
+        elif module == "dew.data.pipeline" and name == "batch":
+            if args:
+                args = (batch(args[0]), *args[1:])
+            elif "size" in options:
+                options["size"] = batch(options["size"])
         elif name == "fit" and "steps" in options:
             default = inspect.signature(call).parameters["log_every"].default
             options.update(fitted(options["steps"], options.get("log_every", default)))
-    return call(*args, **options)
+        return call(*args, **options)
+
+    return capping
 
 
 class Capped(ast.NodeTransformer):
-    """A cell with each call that names one of `CAPPED` or unpacks keywords made through `capped`, as
-    IPython runs every cell of a training context (`install`)."""
+    """A cell with each of its calls' callees passed through `capped` first, as IPython runs every cell of
+    a training context (`install`): which function a name holds is known only as the cell runs."""
 
     def visit_Call(self, node: ast.Call) -> ast.Call:
         self.generic_visit(node)
-        if not any(keyword.arg is None or keyword.arg in CAPPED for keyword in node.keywords):
-            return node
         # This module, as a cell reaches it without binding a name of its own.
         module = ast.Call(ast.Name("__import__", ast.Load()), [ast.Constant("live_training")], [])
-        return ast.Call(ast.Attribute(module, "capped", ast.Load()), [node.func, *node.args], node.keywords)
+        callee = ast.Call(ast.Attribute(module, "capped", ast.Load()), [node.func], [])
+        return ast.Call(callee, node.args, node.keywords)
 
 
 def install():

@@ -69,6 +69,10 @@ class CountTargets(grain.MapTransform):
     pad_id: int | None = None
     rejects = True
 
+    def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
+        """The records as they were, their targets counted."""
+        return facts
+
     def map(self, element: Batch) -> Batch | Rejected:
         count = ValidTargets(role=self.role, pad_id=self.pad_id, measured=False)(element)
         if count == 0:
