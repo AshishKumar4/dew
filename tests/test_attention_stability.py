@@ -20,7 +20,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from attention_oracle import exact_attention
-from reference_error import assert_as_exact, assert_as_exact_as_the_reference
+from reference_error import assert_as_exact, assert_as_exact_as_the_reference, with_gradients
 
 from dew.nn.kernels import decode_attention, generation, tuning
 from dew.nn.kernels.templates import attention as template, attention_portable, attention_triton
@@ -71,11 +71,32 @@ RESUMED = 128
 """The resumed family's rows, more, as each holds one query over two keys."""
 SEEDS = {"ties at scale 1": 64, "ties at scale 1, cotangents near 2**125": 64, "ties at scale 1/2": 64,
          "ties at scale 1/2, cotangents near 2**125": 64, "ties at scale 1/4": 64,
-         "ties at scale 1/4, cotangents near 2**125": 64, "a sink and one key": 64, "logits near 1e4": 32,
-         "a small weight on a large value, float32": 32, "a small weight on a large value, bfloat16": 64,
-         "a resumed state of a large denominator": 64, "a decode step's sink and one key": 64}
-"""Each family's declared seeds past `reference_error.FEWEST_SEEDS`, the fewest over which the reference
-compared with itself resolves check 1's parity (`reference_error.seeds_for`)."""
+         "ties at scale 1/4, cotangents near 2**125": 64, "a logit near fp32's largest": 8,
+         "a logit near fp32's largest at scale 1/4": 8, "values near fp32's largest over 2 equal keys": 8,
+         "values near fp32's largest over 64 equal keys": 8, "one key": 8, "a sink and one key": 64,
+         "a sink near fp32's largest and one key": 8, "a sink and one key, its logit near fp32's largest": 8,
+         "a sink near fp32's largest at scale 1/4": 8, "logits near 1e4": 32, "logits near 1e30": 8,
+         "a small weight on a large value, float32": 128, "a small weight on a large value, bfloat16": 256,
+         "a weight at the exponent's edge on a large value, float32": 256,
+         "a weight at the exponent's edge on a large value, bfloat16": 512,
+         "a small column beside an overflowing one": 64,
+         "a column near fp32's least normal beside an overflowing one": 64,
+         "a cotangent on a small column beside an overflowing one": 64,
+         "a tiny value beside an overflowing column at equal weights": 8,
+         "an anchor-relative share beside an overflowing column": 8,
+         "a column near fp32's least normal under a large cotangent": 8,
+         "a subnormal share of an overflowing row, float32": 32,
+         "a subnormal share of an overflowing row, bfloat16": 32,
+         "a subnormal mass beside its anchor at equal values": 8,
+         "a subnormal share beside 255 equal weights, bfloat16": 32, "a row of no keys": 8,
+         "causal queries before every key": 8, "a row that overflows beside one that does not": 8,
+         "two finite slices whose merge overflows": 8, "a resumed state of a large denominator": 64,
+         "a resumed state beside an overflowing column": 16,
+         "a resumed state of a denominator near fp32's largest beside an overflowing column": 8,
+         "a decode step's sink and one key": 64, "a decode step's sink near fp32's largest and one key": 8,
+         "documents of one key": 8}
+"""Each family's declared seeds, the fewest over which the reference compared with itself resolves check
+1's parity (`reference_error.seeds_for`), sized for every family at the suite's own draws and reference."""
 
 
 def _first(sizes: np.ndarray, width: int) -> np.ndarray:
@@ -372,7 +393,7 @@ def _small_mass_beside_its_anchor(seed: int, rows: int = 64):
 
 def _families() -> dict[str, Family]:
     small = functools.partial(_small_weight, queries=8, logits=(16.0, 21.0), sizes=(3.0, 5.0))
-    edge = functools.partial(_small_weight, queries=1, logits=(80.0, 87.0), sizes=None)
+    edge = functools.partial(_small_weight, queries=1, logits=(80.0, 87.0), sizes=None, rows=1024)
     families = {
         "ties at scale 1": Family(_ties(1, 1.0), _kept(1, 2)),
         "ties at scale 1, cotangents near 2**125": Family(_ties(1, 2.0 ** 125), _kept(1, 2)),
@@ -474,7 +495,7 @@ def _families() -> dict[str, Family]:
     families["documents of one key"] = Family(_drawn(4, 4), _causal(4, 4, ROWS) & (ids[:, None, :, None] ==
                                                                                   ids[:, None, None, :]),
                                               {"causal": True, "segment_ids": ids})
-    return {name: dataclasses.replace(family, seeds=SEEDS.get(name, family.seeds))
+    return {name: dataclasses.replace(family, seeds=SEEDS[name])
             for name, family in families.items()}
 
 
@@ -513,8 +534,9 @@ def _cast(family: Family, draw: Callable[[int], tuple]) -> Callable[[int], tuple
 
 
 def _reference(family: Family, *, anchored: bool) -> Callable:
-    """The reference's output, in the call's dtype as every attention call returns it, and its query, key
-    and value gradients under the cotangent; the float64 truth's derivative `anchored`. The reference arm
+    """The reference's output `(query, key, value, extra) -> out`, in the call's dtype as every attention
+    call returns it, its gradients autodiff's (`reference_error.with_gradients`); the float64 truth's
+    derivative `anchored`. The reference arm
     is jax's own attention (`jax.nn.dot_product_attention`'s xla path, differentiated by autodiff), the
     established computation Dew's is held to at its declared precision, which rounds the probabilities to
     the values' dtype for their products (the gate's ruling, row 1362), wherever its API holds the
@@ -523,18 +545,17 @@ def _reference(family: Family, *, anchored: bool) -> Callable:
     such family fp32, whose probabilities round to nothing)."""
     jax_holds = not anchored and np.asarray(family.keep).any(-1).all()
 
-    def run(query, key, value, extra, dout):
-        def attend(q, k, v):
-            if isinstance(extra, tuple):
-                return _resumed_attention(q, k, v, extra, family.keep)
-            if extra is None and jax_holds:
-                return jax.nn.dot_product_attention(q, k, v, mask=jnp.asarray(family.keep),
-                                                    implementation="xla")
-            return exact_attention(q, k, v, extra, keep=family.keep, anchored=anchored)
-        out, pull = jax.vjp(attend, query, key, value)
-        return (out.astype(query.dtype), *pull(dout.astype(out.dtype)))
+    def attend(query, key, value, extra):
+        if isinstance(extra, tuple):
+            out = _resumed_attention(query, key, value, extra, family.keep)
+        elif extra is None and jax_holds:
+            out = jax.nn.dot_product_attention(query, key, value, mask=jnp.asarray(family.keep),
+                                               implementation="xla")
+        else:
+            out = exact_attention(query, key, value, extra, keep=family.keep, anchored=anchored)
+        return out.astype(query.dtype)
 
-    return run
+    return attend
 
 
 def _resumed_attention(query, key, value, state, keep):
@@ -555,26 +576,55 @@ def _resumed_attention(query, key, value, state, keep):
     return jnp.swapaxes(out, 1, 2)
 
 
+def _differentiated(forward: Callable, backward: Callable) -> Callable:
+    """`(query, key, value, initial) -> out`, a mainloop's `forward` whose derivative is its own
+    `backward` (`template.Gradients`), the initial state's included."""
+    @jax.custom_vjp
+    def attend(query, key, value, initial):
+        return forward(query, key, value, initial)
+
+    def saved(query, key, value, initial):
+        return forward(query, key, value, initial), (query, key, value, initial)
+
+    def pulled(operands, dout):
+        grads = backward(*operands, dout)
+        return grads.query, grads.key, grads.value, grads.initial
+
+    attend.defvjp(saved, pulled)
+    return attend
+
+
 def _mainloops(family: Family, form) -> dict[str, Callable]:
-    """Each template mainloop as `(query, key, value, sinks, dout) -> (out, dq, dk, dv)`."""
+    """Each template mainloop as `(query, key, value, extra) -> out`, its derivative the mainloop's own
+    backward, the sinks' or resumed state's gradient through the softmax's initial state."""
     natural = {} if form is None else {"natural": form}
     tiles = {"block_q": 32, "block_k": 32, "pad": attention_triton.BLOCK}
 
-    def triton(query, key, value, sinks, dout):
-        spans, hooks = _spans(family, query, key), _hooks(query, sinks)
+    def mainloop(forward: Callable, backward: Callable) -> Callable:
+        def run(query, key, value, extra):
+            spans, hooks = _spans(family, query, key), _hooks(query, extra)
+
+            def ahead(query, key, value, initial):
+                return forward(query, key, value, spans, template.Hooks(initial=initial))
+
+            def back(query, key, value, initial, dout):
+                return backward(query, key, value, spans, template.Hooks(initial=initial), dout)
+
+            initial = None if hooks is None else hooks.initial
+            return _differentiated(ahead, back)(query, key, value, initial)
+        return run
+
+    def triton_forward(*operands):
         with tuning.pinned(PINS):
-            out = attention_triton.forward(query, key, value, spans, hooks, interpret=True, **natural)
-            grads = attention_triton.backward(query, key, value, spans, hooks, dout, interpret=True,
-                                              **natural)
-        return out, grads.query, grads.key, grads.value
+            return attention_triton.forward(*operands, interpret=True, **natural)
 
-    def portable(query, key, value, sinks, dout):
-        spans, hooks = _spans(family, query, key), _hooks(query, sinks)
-        out = attention_portable.attend(query, key, value, spans, hooks, **tiles, **natural)
-        grads = attention_portable.backward(query, key, value, spans, hooks, dout, **tiles, **natural)
-        return out, grads.query, grads.key, grads.value
+    def triton_backward(*operands):
+        with tuning.pinned(PINS):
+            return attention_triton.backward(*operands, interpret=True, **natural)
 
-    return {"triton": triton, "portable": portable}
+    return {"triton": mainloop(triton_forward, triton_backward),
+            "portable": mainloop(functools.partial(attention_portable.attend, **tiles, **natural),
+                                 functools.partial(attention_portable.backward, **tiles, **natural))}
 
 
 def _held_empty(family: Family, found, label: str) -> None:
@@ -593,12 +643,13 @@ def test_attention_is_finite_and_as_exact_as_the_reference_at_fp32s_edges(family
     draws; a row that sees nothing, zero."""
     family = FAMILIES[family]
     draw = _cast(family, family.draw)
-    reference = jax.jit(_reference(family, anchored=False))
-    truth = _reference(family, anchored=True)
+    reference = jax.jit(with_gradients(_reference(family, anchored=False)))
+    truth = with_gradients(_reference(family, anchored=True))
     for name, mainloop in _mainloops(family, FORMS[form]).items():
         label = f"{name} {form} {family.dtype}"
-        assert_as_exact(jax.jit(mainloop), reference, draw, label, seeds=family.seeds, truth_fn=truth)
-        _held_empty(family, jax.jit(mainloop)(*draw(0)), label)
+        differentiated = jax.jit(with_gradients(mainloop))
+        assert_as_exact(differentiated, reference, draw, label, seeds=family.seeds, truth_fn=truth)
+        _held_empty(family, differentiated(*draw(0)), label)
 
 
 DECODED = [(family, form) for family, form in RUNS
@@ -623,8 +674,7 @@ def test_decode_is_finite_and_as_exact_as_the_reference_at_fp32s_edges(family, f
     natural = {} if FORMS[form] is None else {"natural": FORMS[form]}
     lengths = family.spans.get("lengths")
 
-    def decoded(query, key, value, sinks, dout):
-        del dout
+    def decoded(query, key, value, sinks):
         count = np.full(query.shape[0], key.shape[1]) if lengths is None else lengths
         # An A100's slice counts, which a launch on a CPU, of no multiprocessors, does not offer.
         pin = {decode_attention.DecodeAttention: decode_attention.Split(family.splits)}
@@ -632,12 +682,13 @@ def test_decode_is_finite_and_as_exact_as_the_reference_at_fp32s_edges(family, f
             return decode_attention.attend(query, _cache(key), _cache(value), jnp.asarray(count, jnp.int32),
                                            sinks=sinks, interpret=True, **natural)
 
-    def output(fn):
-        return lambda *operands: fn(*operands)[0]
+    def forward(seed):
+        # A decode step has no backward: its draw without the cotangent.
+        return _cast(family, family.draw)(seed)[:4]
 
-    assert_as_exact(jax.jit(decoded), jax.jit(output(_reference(family, anchored=False))),
-                    _cast(family, family.draw), f"decode {form} {family.dtype}", seeds=family.seeds,
-                    truth_fn=output(_reference(family, anchored=True)))
+    assert_as_exact(jax.jit(decoded), jax.jit(_reference(family, anchored=False)), forward,
+                    f"decode {form} {family.dtype}", seeds=family.seeds,
+                    truth_fn=_reference(family, anchored=True))
 
 
 @pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
