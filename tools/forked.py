@@ -20,7 +20,8 @@ def forked_map[Item, Result](function: Callable[[Item], Result], items: list[Ite
     parent runs it once first, so what every call loads once (a parser's modules and caches) is loaded before
     the fork and inherited, not loaded again in each worker, and freezes what it holds, which no worker's
     collector then traces: both tripled a reading's time."""
-    function(items[0])
+    for item in items[:1]:
+        function(item)
     gc.freeze()
     context = multiprocessing.get_context("fork")
     with context.Pool(len(os.sched_getaffinity(0)), initializer=collecting_rarely) as pool:
