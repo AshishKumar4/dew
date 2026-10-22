@@ -182,3 +182,63 @@ def test_every_short_conv_config_compiles_on_tritons_compiler_within_each_gpus_b
     found = compile_kernels(conv_config_cases(), target)
     assert len(found) == len(short_conv.TILES) + len(short_conv.WALKS)
     assert not failures(found), "\n".join(failures(found))
+
+
+def test_the_cooperative_grouped_matmul_compiles_for_hopper_within_its_resources():
+    """The GEMM template's Mosaic GPU grouped matmul, lone and cooperative, compiled by Mosaic for a
+    compile-only H100 on this CPU through ptxas (tests/kernel_compile.py): within the multiprocessor's
+    shared memory, no register spilled. The resource gate every Mosaic GPU mainloop takes."""
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    from dew.nn.kernels.templates.gemm import mosaic_gpu
+
+    def case(tiles):
+        def call():
+            def gmm(lhs, rhs, sizes):
+                return mosaic_gpu.gmm(lhs, rhs, sizes, tiles=tiles, transpose_rhs=False,
+                                      out_dtype=jnp.bfloat16, multiprocessors=132)
+
+            return gmm, (jax.ShapeDtypeStruct((1024, 512), jnp.bfloat16),
+                         jax.ShapeDtypeStruct((4, 512, 1024), jnp.bfloat16),
+                         jax.ShapeDtypeStruct((4,), jnp.int32))
+
+        return support.KernelCase(f"gmm {tiles}", call)
+
+    found = compile_mosaic_kernels([case(mosaic_gpu.Tiles(128, 128, 64, 3, 1)),
+                                    case(mosaic_gpu.Tiles(128, 256, 64, 3, 1, warpgroups=2))], "sm90")
+    assert len(found) == 2 and all(record.get("kernels") for record in found), found
+    assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
+
+
+def test_the_resource_gate_refuses_a_spilling_mosaic_kernel():
+    """A record the gate reads (`mosaic_failures`): a kernel past its shared memory, its tensor memory or
+    spilling fails; within all three, none."""
+    from kernel_compile import TMEM_COLUMNS, mosaic_failures
+
+    within = {"kernel": "k", "shared": 1024, "tmem": 256, "registers": 168, "spilled": 0}
+    record = {"name": "case", "limit": 2048, "kernels": [within]}
+    assert not mosaic_failures([record])
+    for past in ({"shared": 4096}, {"tmem": TMEM_COLUMNS + 1}, {"spilled": 40}):
+        assert mosaic_failures([{**record, "kernels": [{**within, **past}]}])
+
+
+def test_splash_compiles_for_a_v5e_with_libtpu():
+    """Dew's splash path, forward and backward, compiled by libtpu for a compile-only v5e on this CPU
+    (tests/kernel_compile.py): within the v5e's scoped VMEM, as the blocks splash takes are sized
+    (`dew.nn.attention.splash_block_sizes`)."""
+    from kernel_compile import compile_tpu_kernels
+
+    from dew.nn.attention import scaled_dot_product_attention
+
+    def call():
+        def step(query, key, value):
+            def loss(q, k, v):
+                return jnp.sum(scaled_dot_product_attention(q, k, v, implementation="tpu", causal=True)
+                               .astype(jnp.float32))
+            return jax.grad(loss, argnums=(0, 1, 2))(query, key, value)
+
+        shape = jax.ShapeDtypeStruct((1, 2048, 4, 128), jnp.float32)
+        return step, (shape, shape, shape)
+
+    found = compile_tpu_kernels([support.KernelCase("splash fp32", call)], "v5e")
+    assert not [record for record in found if "error" in record], found
