@@ -44,8 +44,14 @@ from dew.nn.kv_cache import KVCache, write_cache
 # dsa_kpool reads INDEXER and the expanded cache below. Reading the registry
 # contracts from base avoids importing the kind hub back during this module's
 # initialization, so either kind can be the first imported.
-from dew.nn.mixer_base import MixerBase, MixerContext
-from dew.nn.precision import at_least_fp32
+from dew.nn.mixer_base import ATTENTION_CONTEXT_RESIDUALS, MixerBase, MixerContext
+from dew.nn.precision import (
+    at_least_fp32,
+    compensated_add,
+    compensated_sum,
+    float32_dot_general,
+    float32_products,
+)
 from dew.nn.rope import YarnScaling, deinterleaved, rotate, yarn_query_scale, yarn_rope_freqs
 from dew.nn.sharding import RESIDUAL, LogicalAxes, constrain, down_projection, logical_axes
 from dew.nn.sparse_selection import index_scores, selection_mask, sparse_latent_attention, top_k_selection
@@ -101,7 +107,8 @@ logarithms of the KL."""
 
 
 def indexer_kl(scores, query, key, keep, scale: float):
-    """Per query, KL of the indexer's softmax from the attention: `[B, S]`, fp32.
+    """Per query, KL of the indexer's softmax from the attention: `[B, S]`, at least fp32 (float64
+    for float64 inputs, so a float64 truth computes it in float64).
 
     The indexer's objective (arXiv 2512.02556, eq. 3 and 4; MaxText
     `calculate_indexer_loss`): the target is the main attention's distribution
@@ -115,23 +122,29 @@ def indexer_kl(scores, query, key, keep, scale: float):
     target gives no mass contributes zero, and the gradient is the
     reference's, which the epsilon moves beyond float32 rounding.
     """
-    masked = jnp.finfo(jnp.float32).min
+    wide = at_least_fp32(jnp.result_type(scores, query, key))
+    masked = jnp.finfo(wide).min
     batch, length, total = scores.shape
     keep = jnp.broadcast_to(keep, (batch, length, total))
-    query = jax.lax.stop_gradient(query).astype(jnp.float32) * scale
-    key = jax.lax.stop_gradient(key).astype(jnp.float32)
+    query = jax.lax.stop_gradient(query).astype(wide) * scale
+    key = jax.lax.stop_gradient(key).astype(wide)
 
     def head(summed, projections):
         q, k = projections
-        logits = jnp.where(keep, jnp.einsum('bsd,btd->bst', q, k), masked)
-        return summed + jax.nn.softmax(logits, axis=-1), None
+        product = jnp.einsum('bsd,btd->bst', q, k, precision=float32_products(q.dtype))
+        probabilities = jax.nn.softmax(jnp.where(keep, product, masked), axis=-1)
+        return compensated_add(summed, (probabilities, jnp.zeros_like(probabilities))), None
 
-    summed, _ = jax.lax.scan(
-        head, jnp.zeros((batch, length, total), jnp.float32),
-        (jnp.moveaxis(query, 2, 0), jnp.moveaxis(key, 2, 0)))
-    target = summed / (jnp.sum(summed, axis=-1, keepdims=True) + INDEXER_EPS)
-    indexer = jax.nn.softmax(jnp.where(keep, scores.astype(jnp.float32), masked), axis=-1)
-    return jnp.sum(target * (jnp.log(target + INDEXER_EPS) - jnp.log(indexer + INDEXER_EPS)), axis=-1)
+    # The heads, the target's normalization over the keys and each query's KL over them all sum
+    # rounded once (`compensated_add`, `compensated_sum`): plain sums biased the KL upward, 1.67
+    # times MaxText's error from float64, which sums its heads at once at H times this footprint.
+    zeros = jnp.zeros((batch, length, total), wide)
+    (high, low), _ = jax.lax.scan(head, (zeros, zeros), (jnp.moveaxis(query, 2, 0), jnp.moveaxis(key, 2, 0)))
+    summed = high + low
+    target = summed / (compensated_sum(summed, (summed.ndim - 1,))[..., None] + INDEXER_EPS)
+    indexer = jax.nn.softmax(jnp.where(keep, scores.astype(wide), masked), axis=-1)
+    divergence = target * (jnp.log(target + INDEXER_EPS) - jnp.log(indexer + INDEXER_EPS))
+    return compensated_sum(divergence, (divergence.ndim - 1,))
 
 
 def _rotate(interleave: bool, part, freqs_cos, freqs_sin):
@@ -176,7 +189,8 @@ class SparseIndexer(nn.Module):
                 f"out of heads of width {self.head_dim}, so the heads have "
                 "to be wider")
         dense = functools.partial(
-            Dense, use_bias=False, dtype=self.dtype, precision=self.precision)
+            Dense, use_bias=False, dtype=self.dtype, precision=self.precision,
+            dot_general=float32_dot_general)
         self.wq_b = dense(self.n_heads * self.head_dim, name='wq_b')
         self.wk = dense(self.head_dim, name='wk')
         # A LayerNorm with weight and bias at a hardcoded 1e-6: the reference
@@ -328,7 +342,7 @@ class MultiHeadLatentAttention(nn.Module):
         qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         dense = functools.partial(
             Dense, use_bias=self.attention_bias, dtype=self.dtype,
-            precision=self.precision)
+            precision=self.precision, dot_general=float32_dot_general)
         norm = functools.partial(
             RMSNorm, epsilon=self.norm_eps,
             scale_offset=self.scale_offset,
@@ -338,24 +352,25 @@ class MultiHeadLatentAttention(nn.Module):
             # attention_bias says; only the low-rank projections do.
             self.q_proj = Dense(
                 self.num_heads * qk_head_dim, use_bias=False, dtype=self.dtype,
-                precision=self.precision, name='q_proj')
+                precision=self.precision, name='q_proj', dot_general=float32_dot_general)
         else:
             self.q_a_proj = dense(self.q_lora_rank, name='q_a_proj')
             self.q_a_layernorm = norm(name='q_a_layernorm')
             self.q_b_proj = Dense(
                 self.num_heads * qk_head_dim, use_bias=False, dtype=self.dtype,
-                precision=self.precision, name='q_b_proj')
+                precision=self.precision, name='q_b_proj', dot_general=float32_dot_general)
         self.kv_a_proj_with_mqa = dense(
             self.kv_lora_rank + self.qk_rope_head_dim, name='kv_a_proj_with_mqa')
         self.kv_a_layernorm = norm(name='kv_a_layernorm')
         self.kv_b_proj = Dense(
             self.num_heads * (self.qk_nope_head_dim + self.v_head_dim),
             use_bias=False, dtype=self.dtype, precision=self.precision,
-            name='kv_b_proj')
+            name='kv_b_proj', dot_general=float32_dot_general)
         self.o_proj = dense(self.emb_features, name='o_proj')
         if self.output_gate:
             self.g_proj = Dense(self.num_heads * self.v_head_dim, use_bias=False,
-                                dtype=self.dtype, precision=self.precision, name='g_proj')
+                                dtype=self.dtype, precision=self.precision, name='g_proj',
+                                dot_general=float32_dot_general)
         if self.index_n_heads is not None and self.index_head_dim is not None:
             if self.q_lora_rank is None:
                 raise ValueError(
@@ -440,7 +455,7 @@ class MultiHeadLatentAttention(nn.Module):
         batch, length, _ = x.shape
         qk_head_dim = self.qk_nope_head_dim + self.qk_rope_head_dim
         # The projections carry the names a remat policy saves or offloads
-        # (decoder_block.RESIDUALS); kv_b_proj is the fused K/V one.
+        # (mixer_base.RESIDUALS); kv_b_proj is the fused K/V one.
         if self.q_lora_rank is None:
             q_resid = None
             queries = self.q_proj(x)
@@ -742,7 +757,7 @@ class MLAMixer(MixerBase):
     values norm, a window, an attention scale, a partial rotary) are refused.
     """
 
-    residuals = ('q_proj', 'k_proj', 'v_proj', 'kv_proj', 'o_proj', 'context')
+    residuals = ATTENTION_CONTEXT_RESIDUALS
 
     q_lora_rank: int | None = None
     kv_lora_rank: int = 512

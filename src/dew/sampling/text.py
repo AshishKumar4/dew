@@ -57,6 +57,7 @@ from dew.nn.protocols import (
     Generating,
     Layered,
     Predicting,
+    ProjectionGroup,
     Selective,
     Serving,
 )
@@ -821,7 +822,8 @@ def _check(model: nn.Module, params: Variables, inputs: ModelInputs, max_new_tok
 def _checked(model: nn.Module, params: Variables, inputs: ModelInputs, keys: jax.Array,
              budget: jax.Array, trips: int, pad_id: int, n: int,
              transforms: tuple[LogitsTransform, ...], stopping: decoding.Finishing,
-             strategy: Strategy) -> tuple[checkify.Error, Generation]:
+             strategy: Strategy,
+             packing: tuple[ProjectionGroup, ...] = ()) -> tuple[checkify.Error, Generation]:
     """`_generate` with its device checks discharged into a returned error.
 
     An undefined draw has to reach the caller as an exception rather than a
@@ -830,8 +832,12 @@ def _checked(model: nn.Module, params: Variables, inputs: ModelInputs, keys: jax
     and throwing it costs nothing.
     """
 
+    # dew.inference imports this module, so its packing is imported here.
+    from dew.inference.projections import packed_in_call
+
     def run(params, inputs, keys, budget, transforms, stopping, strategy):
-        return _generate(model, params, inputs, keys, trips, budget, pad_id, n,
+        # The groups a borrowed tree holds unpacked pack here, once a call (`packed_in_call`).
+        return _generate(model, packed_in_call(params, packing), inputs, keys, trips, budget, pad_id, n,
                          transforms, stopping, strategy)
 
     return checkify.checkify(run, errors=checkify.user_checks)(
@@ -842,7 +848,7 @@ def _checked(model: nn.Module, params: Variables, inputs: ModelInputs, keys: jax
 def _compiled(rows: jax.sharding.NamedSharding | None, options: tuple[tuple[str, bool], ...]):
     """The generation program over `rows`, compiled with the model's own XLA `options`
     (`dew.nn.kernels.options.compiler_options`), so a quantized model and another never share it."""
-    return jax.jit(_checked, static_argnames=("model", "trips", "pad_id", "n"),
+    return jax.jit(_checked, static_argnames=("model", "trips", "pad_id", "n", "packing"),
                    in_shardings=(None, rows, rows, None, None, None, None),
                    out_shardings=(None, rows), compiler_options=dict(options))
 
@@ -910,10 +916,13 @@ def generate(model: nn.Module, params: Variables,
     capacity = model.max_seq_len if isinstance(model, Bounded) else None
     if isinstance(model, Layered) and capacity is not None:
         refuse_unassigned(model.kv_cache, plan.count, capacity)
+    from dew.inference.projections import pending
+
     program = _compiled(plan.sharding, tuple(compiler_options(model).items()))
+    # A tree a loader owns arrives packed; one borrowed from a live objective packs in the call.
     failure, output = program(model, decoding_storage(model, params), plan.place(request.padded()),
                               plan.keys(request.key), jnp.int32(max_new_tokens), scanned, sampling.pad, n,
-                              *components)
+                              *components, pending(model, params))
     # The error's flags are the one read a request waits on.
     jax.device_get(failure).throw()
     return replace(output, rows=plan.rows * n)

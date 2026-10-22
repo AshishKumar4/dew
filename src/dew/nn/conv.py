@@ -44,7 +44,7 @@ from jax.sharding import PartitionSpec as P
 from jax.typing import DTypeLike
 
 from .flops import conv_flops
-from .precision import biased
+from .precision import biased, float32_products, products_dtype
 from .sharding import SEQUENCE_AXIS, STAGE_AXIS, auto_part, logical_spec, mesh_axes
 
 # A linear boundary must survive in tangents and cotangents too: dropping it
@@ -70,16 +70,20 @@ def _automatic_axes(mesh: jax.sharding.AbstractMesh) -> list[str]:
             and axis not in mesh.explicit_axes and axis != STAGE_AXIS]
 
 
+def _whole(kernel: jax.Array) -> jax.Array:
+    """`kernel` placed whole on every device (the module docstring's second
+    bug). Where no automatic mesh axis is above size one, it is left as it is."""
+    if _automatic_axes(jax.sharding.get_abstract_mesh()):
+        return jax.lax.with_sharding_constraint(kernel, P())
+    return kernel
+
+
 def _promoted_whole(*arrays: jax.Array | None, dtype: DTypeLike | None = None,
                     inexact: bool = True) -> list[jax.Array | None]:
     """flax's dtype promotion of a convolution's input, kernel and bias,
-    with the kernel then placed whole on every device (the module
-    docstring's second bug). Where no automatic mesh axis is above size
-    one, the kernel is left as it is."""
+    with the kernel then placed whole (`_whole`)."""
     inputs, kernel, bias = promote_dtype(*arrays, dtype=dtype, inexact=inexact)
-    if _automatic_axes(jax.sharding.get_abstract_mesh()):
-        kernel = jax.lax.with_sharding_constraint(kernel, P())
-    return [inputs, kernel, bias]
+    return [inputs, _whole(kernel), bias]
 
 
 def _unreplicated(x: jax.Array, spatial: int) -> jax.Array:
@@ -211,7 +215,7 @@ def _conv_general_dilated(
         return jax.lax.conv_general_dilated(
             x, w, window_strides, padding, lhs_dilation=lhs_dilation, rhs_dilation=rhs_dilation,
             dimension_numbers=dimension_numbers, feature_group_count=feature_group_count,
-            batch_group_count=batch_group_count, precision=precision,
+            batch_group_count=batch_group_count, precision=float32_products(products_dtype(x, w), precision),
             preferred_element_type=preferred_element_type, out_sharding=out_sharding)
 
     dilation = (1, 1) if rhs_dilation is None else tuple(rhs_dilation)
@@ -235,6 +239,30 @@ def _conv_general_dilated(
                  if feature_group_count > 16 else convolve),
             default=convolve)
     return convolve(lhs, rhs)
+
+
+def _placed(inputs: jax.Array, spatial: int, strides: Sequence[int],
+            convolve: Callable[[jax.Array], jax.Array]) -> jax.Array:
+    """`convolve(inputs)` with its input and output split over every mesh
+    axis (the module docstring's first bug) and, on TPU, a barrier at a
+    strided 2D convolution's input (its third)."""
+    inputs = _unreplicated(inputs, spatial)
+    if spatial == 2 and any(stride > 1 for stride in strides):
+        inputs = jax.lax.platform_dependent(inputs, tpu=_barrier, default=lambda x: x)
+    return _unreplicated(convolve(inputs), spatial)
+
+
+def convolution(inputs: jax.Array, kernel: jax.Array, padding: Sequence[tuple[int, int]]) -> jax.Array:
+    """`Conv`'s stride-1 convolution of `inputs` `[batch, *spatial, features]`
+    by a `[*spatial, in, out]` kernel of the inputs' dtype that the caller
+    holds, placed and dispatched as `Conv` places and dispatches its own:
+    the product of a layer that transforms its kernel first
+    (`dew.nn.mp.MPConv`)."""
+    spatial = kernel.ndim - 2
+    letters = "HWD"[:spatial]
+    return _placed(inputs, spatial, (1,) * spatial, lambda x: _conv_general_dilated(
+        x, _whole(kernel), (1,) * spatial, padding,
+        dimension_numbers=(f"N{letters}C", f"{letters}IO", f"N{letters}C")))
 
 
 class Conv(nn.Conv):
@@ -287,13 +315,9 @@ class Conv(nn.Conv):
     def __call__(self, inputs: jax.Array) -> jax.Array:
         kernel_size = (self.kernel_size,) if isinstance(self.kernel_size, int) else tuple(self.kernel_size)
         spatial = len(kernel_size)
-        inputs = _unreplicated(inputs, spatial)
-        if spatial == 2 and self.strides is not None:
-            strided = (self.strides > 1 if isinstance(self.strides, int)
-                       else any(stride > 1 for stride in self.strides))
-            if strided:
-                inputs = jax.lax.platform_dependent(inputs, tpu=_barrier, default=lambda x: x)
-        return _unreplicated(self._convolved(inputs, kernel_size), spatial)
+        strides = 1 if self.strides is None else self.strides
+        strides = (strides,) * spatial if isinstance(strides, int) else tuple(strides)
+        return _placed(inputs, spatial, strides, lambda placed: self._convolved(placed, kernel_size))
 
     @nn.nowrap
     def _convolved(self, inputs: jax.Array, kernel_size: tuple[int, ...]) -> jax.Array:

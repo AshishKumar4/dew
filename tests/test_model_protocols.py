@@ -383,7 +383,6 @@ def test_media_reach_the_logits_through_the_fused_reads(name):
     """The processor's request, images placed as the writer placed them (one
     in the first row, two in the second, `_encode`): the reads fuse the
     images as the call does, and blank pixels move the logits."""
-    pytest.importorskip("torchvision", reason="the vision extra supplies the actual processors")
     source = loaded(name)
     model, variables = source.model, source.variables
     assert source.processor is not None
@@ -430,7 +429,6 @@ def test_a_torchax_models_reads_are_its_forward(tmp_path):
     """A tiny random GPT-NeoX through transformers' own forward: the logits
     read is the call's, its plain head's stored weight contracts to them,
     it writes no cache, and every field past the tokens is refused by name."""
-    pytest.importorskip("torchax")
     import torch
     import transformers
 

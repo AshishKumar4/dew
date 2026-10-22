@@ -17,8 +17,9 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from model_support import largest_difference
-from reference_error import widened
+from reference_error import assert_as_exact, widened
 from sharded import assert_sharded
+from token_support import token_rows
 
 from dew.interop import Pretrained
 from dew.interop.hf_decoders import translate_config
@@ -34,6 +35,8 @@ VOCAB = 64
 SEQ_LEN = 15
 BATCH = 8
 TINY_SHARD = 256
+HOST_STACK_SEEDS = 512
+"""The host-resident stack's check-1 seeds, sized by `seeds_for` on 2026-10-20 on armada."""
 
 FIXTURE_NAMES = ("qwen3-tiny", "deepseek-v3-tiny", "gemma4-e2b", "gemma3n-tiny")
 
@@ -340,8 +343,7 @@ def routed(**overrides):
 
 
 def token_batch(rows: int = BATCH):
-    rng = np.random.default_rng(0)
-    return {"text": rng.integers(0, VOCAB, size=(rows, SEQ_LEN + 1)).astype(np.int32)}
+    return token_rows(VOCAB, rows, SEQ_LEN + 1)
 
 
 # A pipeline of four microbatches over two stages beside a row axis of four
@@ -531,8 +533,6 @@ def test_a_scanned_stack_in_host_memory_reads_and_writes_its_callers_state_as_a_
     and reuse give the resident stack's state, its routing exactly, and its logits, scores
     and cache as exact as the resident's own, both measured from the resident stack in
     float64 (tests/reference_error.py), the two paths compiling the same layers apart."""
-    from reference_error import assert_leaves_as_exact
-
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.nn.backbones.decoder_block import Mixture
 
@@ -551,7 +551,13 @@ def test_a_scanned_stack_in_host_memory_reads_and_writes_its_callers_state_as_a_
     on_host = {**variables, "params": {**variables["params"], **layers}}
     opened = ["moe", "router"]
 
-    def run(model, tree):
+    def draw(seed):
+        """The fixed tokens at seed 0, else tokens drawn uniformly from the vocabulary."""
+        if seed == 0:
+            return (tokens,)
+        return (np.random.default_rng(seed).integers(0, model.vocab_size, tokens.shape).astype(np.int32),)
+
+    def run(model, tree, tokens):
         calls = []
         for _ in range(2):
             logits, state = model.apply(tree, tokens, mutable=opened)
@@ -563,11 +569,14 @@ def test_a_scanned_stack_in_host_memory_reads_and_writes_its_callers_state_as_a_
                                         decode=True, mutable=["cache", *opened])
             calls.append((logits, state))
             cache = {"cache": state["cache"]}
-        return jax.tree.map(np.asarray, calls)
+        return calls
 
-    resident, hosted = run(model, variables), run(model, on_host)
+    compiled = jax.jit(lambda tree, tokens: run(model, tree, tokens))
+    resident, hosted = compiled(variables, tokens), compiled(on_host, tokens)
     with jax.enable_x64(new_val=True):
-        truth = run(model.clone(dtype=jnp.float64), widened(variables))
+        wide = model.clone(dtype=jnp.float64)
+        wide_variables = widened(variables)
+        wide_run = jax.jit(lambda tree, tokens: run(wide, tree, tokens))
     assert jax.tree.structure(hosted) == jax.tree.structure(resident)
     pairs = zip(jax.tree.leaves(hosted), jax.tree.leaves(resident), strict=True)
     exact = [(ours, theirs) for ours, theirs in pairs if not np.issubdtype(theirs.dtype, np.floating)]
@@ -578,4 +587,14 @@ def test_a_scanned_stack_in_host_memory_reads_and_writes_its_callers_state_as_a_
     def floating(tree):
         return [leaf for leaf in jax.tree.leaves(tree) if np.issubdtype(leaf.dtype, np.floating)]
 
-    assert_leaves_as_exact(floating(hosted), floating(resident), floating(truth))
+    def dew_fn(tokens):
+        return floating(compiled(on_host, tokens))
+
+    def reference_fn(tokens):
+        return floating(compiled(variables, tokens))
+
+    def truth_fn(tokens):
+        return floating(wide_run(wide_variables, tokens))
+
+    assert_as_exact(dew_fn, reference_fn, draw, "host-resident scanned stack", seeds=HOST_STACK_SEEDS,
+                    truth_fn=truth_fn)

@@ -120,8 +120,8 @@ def test_flow_objective_uses_converted_predictions(prediction):
                          ids=["epsilon", "consistency_epsilon"])
 def test_a_prediction_undefined_at_pure_noise_is_refused_only_where_a_walk_evaluates_it(prediction):
     """Epsilon's clean sample divides by alpha, inside a consistency boundary or not, and a
-    rectified flow's alpha is 0 at pure noise. A trajectory from there, and an objective whose
-    rollouts start there, are refused before they run, rather than rolling out non-finite states.
+    rectified flow's alpha is 0 at pure noise. A trajectory from there, and a rollout that starts
+    there, are refused before they run, rather than rolling out non-finite states.
     From t = 0.9 the same prediction walks compiled, and each transition rescores, compiled on its
     own, to the density the walk recorded."""
     process = Process(FlowMatchingScheduler(), prediction)
@@ -131,8 +131,9 @@ def test_a_prediction_undefined_at_pure_noise_is_refused_only_where_a_walk_evalu
     solver = FlowSDE(0.5)
     with pytest.raises(ValueError):
         solver.trajectory(denoise, x, 5, key=1)
+    objective = FlowGRPOObjective(model, process, InputSpec(Field("image", (2,))), sde=solver, guidance=None)
     with pytest.raises(ValueError):
-        FlowGRPOObjective(model, process, InputSpec(Field("image", (2,))), sde=solver, guidance=None)
+        FlowRollout(objective, lambda images, batch: np.zeros(len(images)), steps=5)
     times = jnp.linspace(0.9, 0.0, 5)
     _, (states, log_probs) = jax.jit(lambda start: sample(
         denoise, start, solver=solver, key=jax.random.key(1), times=times, final_denoise=False,
