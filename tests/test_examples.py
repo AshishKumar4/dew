@@ -20,6 +20,7 @@ import numpy as np
 import pytest
 from diffusion_stubs import RES, TOKENS, StubText
 from PIL import Image
+from process_support import dew_train, logged_losses
 from test_inference import make_run
 from tool_support import load
 
@@ -224,15 +225,10 @@ def test_a_python_experiment_trains_and_its_record_trains_the_same_losses_in_a_n
                    "PYTHONPATH": os.pathsep.join([str(REPO_ROOT / "src"), str(REPO_ROOT / "examples")])}
 
     def train(*arguments):
-        finished = subprocess.run([sys.executable, "-m", "dew.cli.main", "train", *arguments],
-                                  cwd=tmp_path, env=environment, capture_output=True, text=True, timeout=900)
-        assert finished.returncode == 0, (
-            f"--- stdout ---\n{finished.stdout}\n--- stderr ---\n{finished.stderr}")
+        dew_train(tmp_path, environment, *arguments)
 
     def losses(directory):
-        rows = (directory / "train_supervised" / "tracking" / "scalars.jsonl").read_text().splitlines()
-        scalars = [json.loads(row)["scalars"] for row in rows]
-        return [row["train/loss"] for row in scalars if "train/loss" in row]
+        return logged_losses(directory / "train_supervised")
 
     train(str(REPO_ROOT / "examples" / "train_supervised.py"),
           "--set", f"trainer.checkpoint_dir={tmp_path / 'first'}", "--set", "trainer.steps=6",

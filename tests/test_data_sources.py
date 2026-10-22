@@ -14,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from uuid import uuid4
 
+import grain.python as grain
 import numpy as np
 import psutil
 import pyarrow as pa
@@ -1287,6 +1288,89 @@ def test_a_pool_is_shown_which_part_of_its_plan_differs():
     assert "manifest source" in differing(changed) and "manifest steps" not in differing(changed)
 
 
+class _Drawn(grain.RandomMapTransform):
+    """A record as it is, drawn by the record generator, so a streamed repeat after it stays where it
+    is written, restoring its reader at each pass's start."""
+
+    def random_map(self, element, rng):
+        return element
+
+
+@pytest.mark.parametrize(("kind", "name"), [("jsonl", "rows.jsonl"), ("csv", "rows.csv"),
+                                            ("text", "rows.txt"), ("jsonl", "rows.jsonl.zst")])
+def test_a_streamed_line_file_repeated_reads_every_record_each_pass(tmp_path, kind, name):
+    """A line file streamed and repeated reads its records again in each pass, as the first: Grain
+    restores the reader at its start after a pass, which starts its records over."""
+    import zstandard
+
+    from dew.data.compile import compile
+
+    lines = {"jsonl": [json.dumps({"id": index}) for index in range(3)],
+             "csv": ["id", *(str(index) for index in range(3))],
+             "text": [str(index) for index in range(3)]}[kind]
+    payload = ("\n".join(lines) + "\n").encode()
+    (tmp_path / name).write_bytes(zstandard.ZstdCompressor().compress(payload) if name.endswith(".zst")
+                                  else payload)
+    field = "text" if kind == "text" else "id"
+    reader = compile(Files(str(tmp_path / name), format=kind).random_map(_Drawn()).repeat().batch(1),
+                     read="streamed", loading=Loading(workers=0, threads=1, read_buffer=1)
+                     ).train(DataPartition())
+    try:
+        read = [str(batch[field][0]).strip() for batch in itertools.islice(reader, 9)]
+    finally:
+        reader.close()
+    assert read == ["0", "1", "2"] * 3
+
+
+def test_a_text_file_is_provisioned_by_its_lines_bytes_and_a_line_is_decoded_when_read(tmp_path):
+    """Provisioning a text file finds its lines without decoding them, so a line that is not UTF-8
+    is refused when it is read, not when the file is indexed, and the lines before it read."""
+    (tmp_path / "rows.txt").write_bytes(b"ok\n\xff\nlast\n")
+    files = Files(str(tmp_path / "rows.txt"))
+    files.provision()
+    records = files.records("indexed")
+    assert len(records) == 3
+    assert (records[0], records[2]) == ({"text": "ok\n"}, {"text": "last\n"})
+    with pytest.raises(UnicodeDecodeError):
+        records[1]
+
+
+def test_a_hugging_face_stream_saved_again_before_it_reads_resumes_where_it_was_restored():
+    """A Hugging Face stream restored to a position and saved again before it reads saves that
+    position, not its dataset's start: a resume from it reads on where the first read stopped."""
+    import datasets
+
+    from dew.data.compile import compile
+    from dew.data.sources.hf import from_hf
+
+    native = datasets.Dataset.from_dict({"id": list(range(8))}).to_iterable_dataset()
+    data = compile(from_hf(native, "rows@1").batch(1), read="streamed",
+                   loading=Loading(workers=0, threads=1, read_buffer=0))
+
+    def ids(reader, count):
+        return [int(batch["id"][0]) for batch in itertools.islice(reader, count)]
+
+    first = data.train(DataPartition())
+    try:
+        assert ids(first, 3) == [0, 1, 2]
+        saved = first.get_state()
+        rest = ids(first, 3)
+    finally:
+        first.close()
+    restored = data.train(DataPartition())
+    try:
+        restored.set_state(saved)
+        again = restored.get_state()
+    finally:
+        restored.close()
+    resumed = data.train(DataPartition())
+    try:
+        resumed.set_state(again)
+        assert ids(resumed, 3) == rest == [3, 4, 5]
+    finally:
+        resumed.close()
+
+
 def test_a_same_size_middle_write_changes_a_multifile_readers_identity(tmp_path):
     """An exact multifile reader identifies bytes between every shard's endpoints."""
     from dew.data.compile import compile
@@ -1335,9 +1419,9 @@ def test_torch_source_reads_every_way_and_refuses_a_cache_without_content_identi
 
     from dew.data.cache import Cache
     from dew.data.plan import Manifest
-    from dew.data.sources import Torch
+    from dew.data.sources import from_torch
 
-    rows = Torch(TensorDataset(torch.arange(4)), fields=("id",))
+    rows = from_torch(TensorDataset(torch.arange(4)), ("id",))
     assert rows.supports("streamed")
     assert int(rows.records("indexed")[2]["id"]) == 2
     import grain.python as grain

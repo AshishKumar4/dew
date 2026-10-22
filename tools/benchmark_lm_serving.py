@@ -199,7 +199,7 @@ def dew_points(args):
     from dew.inference.serving import Server
     from dew.nn.kv_cache import KVCache
     from dew.sampling import Sampling
-    from dew.telemetry.benchmark import Compiles
+    from dew.telemetry.instrumentation import Compiles
     from dew.training import MeshSpec
 
     began = time.perf_counter()

@@ -74,7 +74,7 @@ All stored locations are URLs. Plain paths and `file://` select local files; sch
 | Produced ArrayRecord tokens | Materialize records | Producer length index | Physical shards |
 | `Hub` | Prepared Arrow | Prepared Arrow | Hub Parquet shards |
 | `TFDS` | Prepared ArrayRecords | Prepared ArrayRecords | Prepared shard ranges |
-| `Torch` | Map-style samples | Map-style samples | Refused |
+| PyTorch datasets (`from_torch`) | Map-style samples | Map-style samples | Refused |
 
 `read="memory"` explicitly runs deterministic transforms, filtering, expansion and packing over the whole source before training. It keeps a dense record order and the global position contract. Use it for small data.
 

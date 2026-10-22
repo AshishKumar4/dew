@@ -200,3 +200,17 @@ def assert_exits_cleanly(program: str) -> None:
                           timeout=300, env={**os.environ, "JAX_PLATFORMS": "cpu",
                                             "PYTHONPATH": str(REPO_ROOT / "src")})
     assert done.returncode == 0, done.stdout + done.stderr
+
+
+def dew_train(directory, environment: Mapping[str, str], *arguments: str) -> None:
+    """`dew train *arguments` run from `directory` in `environment`, as a user types it; it must succeed."""
+    finished = subprocess.run([sys.executable, "-m", "dew.cli.main", "train", *arguments],
+                              cwd=directory, env=environment, capture_output=True, text=True, timeout=900)
+    assert finished.returncode == 0, f"--- stdout ---\n{finished.stdout}\n--- stderr ---\n{finished.stderr}"
+
+
+def logged_losses(run_directory) -> list[float]:
+    """The training losses a run in `run_directory` logged, in step order (its tracking's scalars)."""
+    rows = (Path(run_directory) / "tracking" / "scalars.jsonl").read_text().splitlines()
+    scalars = [json.loads(row)["scalars"] for row in rows]
+    return [row["train/loss"] for row in scalars if "train/loss" in row]
