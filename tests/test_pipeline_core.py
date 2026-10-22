@@ -2131,6 +2131,13 @@ def test_a_part_cut_between_two_repeats_comes_round_once_the_cut_its_last_repeat
     assert sorted(_ids(loader.train(DataPartition()), loader.records)) == [100, 101, 102, 200, 201, 202]
 
 
+def test_an_order_read_once_too_short_for_a_batch_it_drops_is_refused_an_epoch():
+    """Three records read once in batches of four that drop a short one deliver no step, so a run
+    counted in epochs of them is refused."""
+    with pytest.raises(ValueError):
+        compile(_tagged(1, 3).repeat(1).batch(4), loading=READ).epoch_steps(1)
+
+
 @pytest.mark.parametrize(("keep", "steps"), [(False, 2), (True, 3)])
 def test_an_order_read_once_counts_the_steps_its_batches_deliver(keep, steps):
     """Five records read once in batches of two take two steps where the batch drops its short last
@@ -2357,8 +2364,8 @@ def test_a_mixture_of_one_dataset_reads_that_dataset(by, read):
 @pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
 def test_a_corpus_smaller_than_a_batch_fills_one_by_its_repeats(read):
     """A corpus of two records repeated fills a batch of eight, as Grain's repeat and batch do,
-    and a run counted in steps reads it; a run counted in epochs is refused, since one pass
-    over the two records fills no batch. Repeated after the batch, a pass holds no batch to
+    and a run counted in steps or in epochs reads it, an epoch's one step holding records of the
+    next. Repeated after the batch, a pass holds no batch to
     replay, so the read is refused rather than replaying nothing forever, whatever limit
     follows, in every read; eight records make a batch either way."""
     for count, repeated in ((2, "before"), (2, "after"), (8, "after"), (2, "after, then take"),
@@ -2381,8 +2388,7 @@ def test_a_corpus_smaller_than_a_batch_fills_one_by_its_repeats(read):
         finally:
             stream.close()
         if count < 8:
-            with pytest.raises(ValueError):
-                data.epoch_steps(1)
+            assert data.epoch_steps(1) == 1
 
 
 @pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
