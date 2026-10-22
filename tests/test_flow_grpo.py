@@ -4,10 +4,11 @@ Reference: arXiv:2505.05470v5, equations 8-9, and
 https://github.com/yifan123/flow_grpo/blob/879042cf5707f8b90daa98d147d7deac2317c5da/flow_grpo/diffusers_patch/sd3_sde_with_logprob.py
 The reference averages coordinate log densities for its policy ratio. These
 checks retain the joint density until the objective performs that reduction.
-Each density, loss and gradient is on par with its closed form, or a rollout's
-rescoring with its recording, from the float64 evaluation over drawn inputs
-(check 1, tests/reference_error.py), the closed form evaluated on the walk's
-own states; what is one computation, or exact arithmetic, is held exactly.
+Each density, loss and gradient is on par with its closed form from the
+float64 evaluation over drawn inputs (check 1, tests/reference_error.py), the
+closed form evaluated on the walk's own states from the policy's own
+velocities, a walk's recorded densities and their rescoring alike; what is one
+computation, or exact arithmetic, is held exactly.
 """
 
 import itertools
@@ -74,25 +75,45 @@ class AffineVelocity(nn.Module):
         return gain * x + (temb / 1000)[:, None] * 0.1 + offset
 
 
-def guided_density(trajectory, offset, dtype):
-    """The authors' SDE log density of each recorded transition of a walk of AffineVelocity under
-    FlowMatchingScheduler(shift=3) and CFG(2) inside (0.1, 0.8), in NumPy at `dtype`, from the walk's
-    own states."""
-    offset = np.asarray(offset, dtype)
+def sde_density(x, action, sigma, following, velocity, noise, dtype):
+    """The authors' SDE log density of a transition from `x` to `action` [rows, ...] between the noise
+    rates `sigma` and `following` (one each, or one a row) at the policy's `velocity` there, its noise
+    level `noise`, in NumPy at `dtype`: their `sde_step_with_logprob`, summed over a state's values."""
+    x, action, velocity = (np.asarray(value, dtype) for value in (x, action, velocity))
+    shape = (-1,) + (1,) * (x.ndim - 1)
+    sigma, following = (np.asarray(rate, dtype).reshape(shape) for rate in (sigma, following))
+    dt = following - sigma
+    g_squared = noise**2 * sigma / (1 - np.where(sigma == 1, following, sigma))
+    mean = x + (velocity + g_squared / (2 * sigma) * (x + (1 - sigma) * velocity)) * dt
+    variance = g_squared * -dt
+    density = -0.5 * ((action - mean)**2 / variance + np.log(2 * math.pi * variance))
+    return density.sum(tuple(range(1, x.ndim)))
+
+
+def walk_density(trajectory, rate, velocity, noise, dtype):
+    """`sde_density` of each recorded transition of a walk, from its own states, at the noise rate
+    `rate(t)` of each of its times and the velocity `velocity(index, x, sigma)` at transition `index`'s
+    state `x`, in NumPy at `dtype`."""
     found = []
-    for index in range(4):
+    for index in range(trajectory.states.shape[1] - 1):
         t, s = np.asarray(trajectory.times[index:index + 2], dtype)
-        sigma, following = 3 * t / (1 + 2 * t), 3 * s / (1 + 2 * s)
-        latent = np.asarray(trajectory.states[:, index], dtype)
-        action = np.asarray(trajectory.states[:, index + 1], dtype)
-        scale = 2 if 0.1 <= index / 4 <= 0.8 else 1
-        velocity = 0.25 * latent + 0.1 * sigma + scale * offset
-        dt = following - sigma
-        g_squared = 0.5**2 * sigma / (1 - (following if t == 1 else sigma))
-        mean = latent + (velocity + g_squared / (2 * sigma) * (latent + (1 - sigma) * velocity)) * dt
-        variance = g_squared * -dt
-        found.append((-0.5 * ((action - mean)**2 / variance + np.log(2 * math.pi * variance))).sum(1))
+        sigma, following = rate(t), rate(s)
+        x = np.asarray(trajectory.states[:, index], dtype)
+        found.append(sde_density(x, trajectory.states[:, index + 1], sigma, following,
+                                 velocity(index, x, sigma), noise, dtype))
     return np.stack(found, 1)
+
+
+def guided_density(trajectory, offset, dtype):
+    """`walk_density` of a walk of AffineVelocity under FlowMatchingScheduler(shift=3) and CFG(2) inside
+    (0.1, 0.8)."""
+    offset = np.asarray(offset, dtype)
+
+    def velocity(index, x, sigma):
+        scale = 2 if 0.1 <= index / 4 <= 0.8 else 1
+        return 0.25 * x + 0.1 * sigma + scale * offset
+
+    return walk_density(trajectory, lambda t: 3 * t / (1 + 2 * t), velocity, 0.5, dtype)
 
 
 def test_recorded_trajectory_rescores_under_shifted_guided_process():
@@ -155,24 +176,15 @@ def test_flow_objective_uses_converted_predictions(prediction):
     walk = jax.jit(lambda start: objective.sde.trajectory(denoise, start, 5, key=31))
     rescore = jax.jit(objective.log_probs)
 
+    def velocity(index, x, t):
+        raw = 0.25 * x + 0.1 * t
+        if prediction == "clean":
+            return (x - raw) / t
+        variance = (1 - t)**2 + t**2
+        return ((2 * t - 1) * x + np.sqrt(variance) * raw) / variance
+
     def rectified(trajectory, dtype):
-        found = []
-        for index, (t, s) in enumerate(zip(trajectory.times[:-1], trajectory.times[1:], strict=True)):
-            t, s = np.asarray(t, dtype), np.asarray(s, dtype)
-            x = np.asarray(trajectory.states[:, index], dtype)
-            raw = 0.25 * x + 0.1 * t
-            if prediction == "clean":
-                velocity = (x - raw) / t
-            else:
-                variance = (1 - t)**2 + t**2
-                velocity = ((2 * t - 1) * x + np.sqrt(variance) * raw) / variance
-            dt = s - t
-            g_squared = 0.5**2 * t / (1 - (s if t == 1 else t))
-            mean = x + (velocity + g_squared / (2 * t) * (x + (1 - t) * velocity)) * dt
-            variance = g_squared * -dt
-            action = np.asarray(trajectory.states[:, index + 1], dtype)
-            found.append(-0.5 * (((action - mean)**2 / variance) + np.log(2 * math.pi * variance)).sum(1))
-        density = np.stack(found, 1)
+        density = walk_density(trajectory, lambda t: t, velocity, 0.5, dtype)
         return {"recorded": density, "rescored": density}
 
     def scored(start):
@@ -196,9 +208,10 @@ def test_a_prediction_undefined_at_pure_noise_is_refused_only_where_a_walk_evalu
     """Epsilon's clean sample divides by alpha, inside a consistency boundary or not, and a
     rectified flow's alpha is 0 at pure noise. A trajectory from there, and a rollout that starts
     there, are refused before they run, rather than rolling out non-finite states.
-    From t = 0.9 the same prediction walks compiled, and each transition rescores, compiled on its
-    own, on par with the density the walk recorded over drawn starts (check 1), the truth the
-    rescoring in float64 on the walk's own states."""
+    From t = 0.9 the same prediction walks compiled, and the densities the walk recorded and each
+    transition's rescoring, compiled on its own, are on par with the authors' Gaussian at the
+    prediction's velocity on the walk's own states from its float64 evaluation over drawn starts
+    (check 1)."""
     process = Process(FlowMatchingScheduler(), prediction)
     model = AffineVelocity()
     x = jnp.asarray([[0.2, -0.5], [-0.1, 0.7]])
@@ -221,35 +234,47 @@ def test_a_prediction_undefined_at_pure_noise_is_refused_only_where_a_walk_evalu
 
     assert np.isfinite(np.asarray(walk(x)[0])).all()
 
-    def rescoring(variables):
-        denoise = process.denoiser(model, variables, {})
+    @jax.jit
+    def rescored(states):
+        def one(latent, action, t, s):
+            t, s = jnp.full((latent.shape[0],), t), jnp.full((latent.shape[0],), s)
+            clean, noise = denoise(latent, t)
+            return solver.transition(latent, t, s, clean, noise, process).log_prob(action)
+        return jnp.stack([one(states[index], states[index + 1], times[index], times[index + 1])
+                          for index in range(4)])
 
-        @jax.jit
-        def rescored(states):
-            def one(latent, action, t, s):
-                t, s = jnp.full((latent.shape[0],), t), jnp.full((latent.shape[0],), s)
-                clean, noise = denoise(latent, t)
-                return solver.transition(latent, t, s, clean, noise, process).log_prob(action)
-            return jnp.stack([one(states[index], states[index + 1], times[index], times[index + 1])
-                              for index in range(4)])
-        return rescored
+    def velocity(x, t):
+        # AffineVelocity's epsilon at gain 0.25, its clean sample, and through the boundary
+        # (timestep_scaling 10, sigma_data 0.5) the clean sample and noise it returns instead.
+        raw = 0.25 * x + 0.1 * t
+        clean = (x - t * raw) / (1 - t)
+        if isinstance(prediction, ConsistencyBoundary):
+            scaled = 10 * t
+            clean = scaled / np.sqrt(scaled**2 + 0.25) * clean + 0.25 / (scaled**2 + 0.25) * x
+            return (x - clean * (1 - t)) / t - clean
+        return raw - clean
 
-    rescored, wide = rescoring(variables), rescoring(widened(variables))
+    def closed(states, dtype):
+        grid = np.asarray(times, dtype)
+        density = np.stack([sde_density(states[index], states[index + 1], grid[index], grid[index + 1],
+                                        velocity(np.asarray(states[index], dtype), grid[index]), 0.5, dtype)
+                            for index in range(4)])
+        return {"recorded": density, "rescored": density}
 
-    def truth(start):
-        states = np.asarray(walked_in_float32(walk, start)[0], np.float64)
-        with jax.enable_x64(new_val=True):
-            return wide(jnp.asarray(states))
+    def scored(start):
+        states, log_probs = walk(start)
+        return {"recorded": log_probs, "rescored": rescored(states)}
 
-    assert_as_exact(lambda start: rescored(walk(start)[0]), lambda start: walk(start)[1], drawn_rows((2,)),
+    assert_as_exact(scored, lambda start: closed(walk(start)[0], np.float32), drawn_rows((2,)),
                     f"{type(prediction).__name__} rescored walk", seeds=SEEDS['rescored walk'],
-                    truth_fn=truth)
+                    truth_fn=lambda start: closed(walked_in_float32(walk, start)[0], np.float64))
 
 
-def clipped_objective(gain, states, times, advantages, mask, *, beta):
-    """Flow-GRPO's clipped loss of a policy of `gain` against the walk's `states` under gain 0.25 and
-    a reference of gain 0.1 (`beta` its KL's weight), its means in closed form, averaged over `mask`'s
-    transitions, in jnp at `gain`'s dtype: the clip range 0.001, the advantages clipped to 2."""
+def clipped_terms(gain, frozen, states, times, advantages):
+    """Flow-GRPO's clipped policy term of each transition of a policy of `gain` against the walk's
+    `states` under gain 0.25, its KL to a reference of gain `frozen`, its likelihood ratio and its
+    advantage, its means in closed form, in jnp at `gain`'s dtype: the clip range 0.001, the
+    advantages clipped to 2."""
     dtype = jnp.asarray(gain).dtype
     latent, following = jnp.asarray(states[:, :-1], dtype), jnp.asarray(states[:, 1:], dtype)
     t, s = jnp.asarray(times[:-1], dtype), jnp.asarray(times[1:], dtype)
@@ -261,13 +286,19 @@ def clipped_objective(gain, states, times, advantages, mask, *, beta):
     def mean(gain):
         return offset + (gain * latent + 0.1 * t[None, :, None]) * coefficient
 
-    old, current, reference = mean(jnp.asarray(0.25, dtype)), mean(gain), mean(jnp.asarray(0.1, dtype))
+    old, current, reference = mean(jnp.asarray(0.25, dtype)), mean(gain), mean(jnp.asarray(frozen, dtype))
     log_ratio = (-jnp.square(following - current) + jnp.square(following - old)).mean(-1) / (2 * variance)
     ratio = jnp.exp(log_ratio)
     advantage = jnp.clip(jnp.asarray(advantages, dtype), -2, 2)[:, None]
     policy = jnp.maximum(-advantage * ratio, -advantage * jnp.clip(ratio, 0.999, 1.001))
     kl = jnp.square(current - reference).mean(-1) / (2 * variance)
-    weights = jnp.asarray(mask, dtype)
+    return policy, kl, ratio, advantage
+
+
+def clipped_objective(gain, frozen, states, times, advantages, mask, *, beta):
+    """`clipped_terms`' loss, `beta` its KL's weight, averaged over `mask`'s transitions."""
+    policy, kl, _, _ = clipped_terms(gain, frozen, states, times, advantages)
+    weights = jnp.asarray(mask, policy.dtype)
     return jnp.sum(weights * (policy + beta * kl)) / jnp.sum(weights)
 
 
@@ -313,52 +344,51 @@ def test_flow_objective_matches_clipping_and_conditional_gaussian_kl():
         return {"loss": value, "gradient": gradient,
                 "policy": loss(current["params"]["gain"], without_reference, step.replace(ema=None))}
 
-    def closed(states, times, advantages, mask, gain):
-        terms = (states, times, advantages, mask)
+    # The policies' gains as their parameters hold them, at float32 or widened from it.
+    gains = (current["params"]["gain"], reference["params"]["gain"])
+
+    def closed(states, times, advantages, mask, gain, frozen):
+        terms = (frozen, states, times, advantages, mask)
         value, gradient = jax.value_and_grad(clipped_objective)(gain, *terms, beta=0.2)
         return {"loss": value, "gradient": gradient,
-                "policy": clipped_objective(gain, states, times, advantages, mask, beta=0.0)}
+                "policy": clipped_objective(gain, *terms, beta=0.0)}
 
     def reference_arm(start, advantages, mask):
         trajectory = jax.vmap(walk)(start)
-        return jax.vmap(closed, (0, 0, 0, 0, None))(trajectory.states, trajectory.times, advantages, mask,
-                                                    jnp.float32(0.9))
+        return jax.vmap(closed, (0, 0, 0, 0, None, None))(trajectory.states, trajectory.times, advantages,
+                                                          mask, *gains)
 
     def truth(start, advantages, mask):
         trajectory = walked_in_float32(jax.vmap(walk), start)
         with jax.enable_x64(new_val=True):
-            return jax.vmap(closed, (0, 0, 0, 0, None))(
+            return jax.vmap(closed, (0, 0, 0, 0, None, None))(
                 np.asarray(trajectory.states, np.float64), np.asarray(trajectory.times, np.float64),
-                advantages, mask, jnp.float64(0.9))
+                advantages, mask, *widened(gains))
 
     assert_as_exact(scored, reference_arm, draw, "clipping", seeds=SEEDS['clipping'], truth_fn=truth)
 
     rescore = jax.jit(objective.log_probs)
 
-    def rescored(variables):
-        return lambda start: rescore(variables, trajectory_batch(walk(start), np.ones(ROWS, np.float32)))
+    def scored_walk(start):
+        trajectory = walk(start)
+        return {"recorded": trajectory.log_probs,
+                "rescored": rescore(old, trajectory_batch(trajectory, np.ones(ROWS, np.float32)))}
 
-    def wide_rescored(start):
-        trajectory = walked_in_float32(walk, start)
-        with jax.enable_x64(new_val=True):
-            return rescore(widened(old), widened(trajectory_batch(trajectory, np.ones(ROWS, np.float32))))
+    def walked(trajectory, dtype):
+        density = walk_density(trajectory, lambda t: t, lambda index, x, t: 0.25 * x + 0.1 * t, 0.6, dtype)
+        return {"recorded": density, "rescored": density}
 
-    assert_as_exact(rescored(old), lambda start: walk(start).log_probs, drawn_rows((2,)),
-                    "rescored clipping walk", seeds=SEEDS['rescored walk'], truth_fn=wide_rescored)
+    assert_as_exact(scored_walk, lambda start: walked(walk(start), np.float32), drawn_rows((2,)),
+                    "rescored clipping walk", seeds=SEEDS['rescored walk'],
+                    truth_fn=lambda start: walked(walked_in_float32(walk, start), np.float64))
 
     start, advantages, mask = (value[0] for value in draw(0))
     trajectory = walk(start)
-    latent = np.asarray(trajectory.states[:, :-1], np.float64)
-    following = np.asarray(trajectory.states[:, 1:], np.float64)
-    t, s = (np.asarray(times, np.float64) for times in (trajectory.times[:-1], trajectory.times[1:]))
-    g2 = 0.6**2 * t / (1 - np.where(t == 1, s, t))
-    coefficient = ((1 + g2 * (1 - t) / (2 * t)) * (s - t))[None, :, None]
-    offset = latent * (1 + g2 / (2 * t) * (s - t))[None, :, None]
-    means = [offset + (gain * latent + 0.1 * t[None, :, None]) * coefficient for gain in (0.25, 0.9)]
-    ratio = np.exp((-np.square(following - means[1]) + np.square(following - means[0])).mean(-1)
-                   / (2 * g2 * (t - s)))
-    advantage = np.clip(np.asarray(advantages, np.float64), -2, 2)[:, None]
-    binds = np.maximum(-advantage * ratio, -advantage * np.clip(ratio, 0.999, 1.001)) != -advantage * ratio
+    with jax.enable_x64(new_val=True):
+        policy, _, ratio, advantage = clipped_terms(
+            *widened(gains), np.asarray(trajectory.states, np.float64),
+            np.asarray(trajectory.times, np.float64), np.asarray(advantages, np.float64))
+        binds = np.asarray(policy != -advantage * ratio)
     # The clip binds on some masked transitions and not on all of them.
     bound = int(np.count_nonzero(binds & np.asarray(mask)))
     assert bound not in {0, int(np.count_nonzero(mask))}
@@ -413,13 +443,14 @@ def test_deterministic_rollout_cannot_contribute_policy_gradient():
 
 
 def test_flow_rollout_groups_rewards_selects_steps_and_preserves_likelihoods():
-    """Rescoring reproduces the rollout's likelihoods, on par with them over
-    rollouts (check 1), guidance included: the rollout walks 4 points and
-    guides its step 1 of 3, inside (0.3, 0.6), while the objective's own walk
-    of 7 points would not guide a step 1 of 6, so the rescoring reads the
-    rollout's step count off the batch. Its group advantages are the float64
-    normalization's, rounded once, and its timesteps the 4-point walk's first
-    two, bit for bit."""
+    """The rollout's recorded likelihoods and their rescoring are on par with
+    the authors' Gaussian at the DiT's own guided velocities over rollouts
+    (check 1), guidance included: the rollout walks 4 points and guides its
+    step 1 of 3, inside (0.3, 0.6), while the objective's own walk of 7 points
+    would not guide a step 1 of 6, so the rescoring reads the rollout's step
+    count off the batch. Its group advantages are the float64 normalization's,
+    rounded once, and its timesteps the 4-point walk's first two, bit for
+    bit."""
     from dew.inputs import CharTable, Condition
     from dew.nn.backbones.dit import SimpleDiT
 
@@ -457,7 +488,27 @@ def test_flow_rollout_groups_rewards_selects_steps_and_preserves_likelihoods():
     def rolled(seed):
         return rollout(state, prompts, jax.random.fold_in(jax.random.key(23), seed))
 
-    assert_rescores_as_recorded(objective, variables, rolled, "rollout", SEEDS['rollout'])
+    def guided(variables, batch, dtype):
+        weights, encoders = objective.model_variables(variables), variables["encoders"]
+        given = objective.encode(encoders, {keyword: batch[condition.field]
+                                            for keyword, condition in inputs.conditions.items()})
+        blank = jax.tree.map(lambda null, value: jnp.broadcast_to(null, value.shape),
+                             objective.encode(encoders), given)
+        steps = int(batch["rollout_steps"][0]) - 1
+
+        def velocity(column, x, sigma):
+            # The rollout's step of this column, off its time on the rollout's own grid of `steps` steps.
+            index = int(np.rint((1 - float(batch["timesteps"][0, column])) * steps))
+            scale = 1.5 if 0.3 <= index / steps <= 0.6 else 1.0
+            time = jnp.asarray(sigma.reshape(-1) * 1000)
+            conditional, unconditional = (
+                np.asarray(model.apply(weights, jnp.asarray(x), time, **conditions), dtype)
+                for conditions in (given, blank))
+            return unconditional + scale * (conditional - unconditional)
+
+        return recorded_density(batch, lambda t: 2 * t / (1 + t), velocity, 0.7, dtype)
+
+    assert_rescores_as_walked(objective, variables, rolled, guided, "rollout", SEEDS['rollout'])
     loss, _ = objective.scalar_loss(variables, batch, Step(jnp.asarray(0), jax.random.key(24), None))
     gradients = jax.grad(lambda p: objective.scalar_loss({**variables, "params": p}, batch,
         Step(jnp.asarray(0), jax.random.key(24), None))[0])(variables["params"])
@@ -465,18 +516,37 @@ def test_flow_rollout_groups_rewards_selects_steps_and_preserves_likelihoods():
     assert np.isfinite(float(loss)) and np.isfinite(norm) and norm > 1e-5
 
 
-def assert_rescores_as_recorded(objective, variables, rollout_of, label: str, seeds: int):
-    """Check 1: the objective's rescoring of a rollout's transitions (`rollout_of(seed)`, a batch) on
-    par with the densities the rollout recorded, the truth the rescoring in float64 of the rollout's
-    own states, over rollouts drawn from their keys."""
+def recorded_density(batch, rate, velocity, noise, dtype):
+    """`sde_density` of each transition a rollout's batch records, from its own states and times, at the
+    noise rate `rate(t)` of each time and the velocity `velocity(column, x, sigma)` at column `column`'s
+    state `x`, `sigma` its rates shaped against it, in NumPy at `dtype`."""
+    columns = []
+    for column in range(np.shape(batch["timesteps"])[1]):
+        x = np.asarray(batch["latents"][:, column], dtype)
+        shape = (-1,) + (1,) * (x.ndim - 1)
+        sigma, following = (rate(np.asarray(batch[name][:, column], dtype)).reshape(shape)
+                            for name in ("timesteps", "next_timesteps"))
+        columns.append(sde_density(x, batch["next_latents"][:, column], sigma, following,
+                                   velocity(column, x, sigma), noise, dtype))
+    return np.stack(columns, 1)
+
+
+def assert_rescores_as_walked(objective, variables, rollout_of, density, label: str, seeds: int):
+    """Check 1: the densities a rollout recorded (`rollout_of(seed)`, a batch) and the objective's
+    rescoring of its transitions, on par with `density(variables, batch, dtype)`, the authors' Gaussian
+    at the policy's own velocities on the rollout's own states, from its float64 evaluation over
+    rollouts drawn from their keys."""
     rescore = jax.jit(objective.log_probs)
 
-    def truth(batch):
-        with jax.enable_x64(new_val=True):
-            return rescore(widened(variables), widened(batch))
+    def closed(variables, dtype):
+        def run(batch):
+            found = density(variables, batch, dtype)
+            return {"recorded": found, "rescored": found}
+        return run
 
-    assert_as_exact(lambda batch: rescore(variables, batch), lambda batch: batch["old_log_probs"],
-                    lambda seed: (rollout_of(seed),), label, seeds=seeds, truth_fn=truth)
+    assert_as_exact(lambda batch: {"recorded": batch["old_log_probs"], "rescored": rescore(variables, batch)},
+                    closed(variables, np.float32), lambda seed: (rollout_of(seed),), label, seeds=seeds,
+                    truth_fn=lambda batch: closed(widened(variables), np.float64)(batch))
 
 
 class Inpainting(nn.Module):
@@ -516,8 +586,8 @@ class Pooled(AutoEncoder):
 def test_an_inpainting_rollout_rescores_with_its_masked_image_inputs():
     """Flow-GRPO samples an inpainting model with the masked image and mask its inputs give,
     records them with each transition and rescores the transitions with them: the recorded
-    likelihoods come back, on par over rollouts (check 1), and a policy step through them has a
-    gradient."""
+    likelihoods and their rescoring are on par with the authors' Gaussian at the model's velocity of
+    those inputs over rollouts (check 1), and a policy step through them has a gradient."""
     process = Process(FlowMatchingScheduler(), FlowMatchPredictionTransform())
     inputs = InputSpec(Field("image", (4, 4, 3)), mask=Field("mask", (4, 4, 1)))
     objective = FlowGRPOObjective(Inpainting(), process, inputs, autoencoder=Pooled(), guidance=None, steps=4)
@@ -535,7 +605,14 @@ def test_an_inpainting_rollout_rescores_with_its_masked_image_inputs():
     def rolled(seed):
         return rollout(state, {"image": pixels, "mask": mask}, jax.random.fold_in(jax.random.key(42), seed))
 
-    assert_rescores_as_recorded(objective, variables, rolled, "inpainting", SEEDS['inpainting'])
+    def inpainted(variables, batch, dtype):
+        gain = np.asarray(objective.model_variables(variables)["params"]["gain"], dtype)
+        spatial = {name: np.asarray(value, dtype) for name, value in batch["spatial"].items()}
+        held = 0.3 * spatial["masked_image"] * (1 - spatial["mask"])
+        return recorded_density(batch, lambda t: t, lambda column, x, sigma: gain * x + held + 0.1 * sigma,
+                                0.7, dtype)
+
+    assert_rescores_as_walked(objective, variables, rolled, inpainted, "inpainting", SEEDS['inpainting'])
     step = Step(jnp.asarray(0), jax.random.key(43), None)
     gradients = jax.grad(lambda p: objective.scalar_loss({**variables, "params": p}, batch, step)[0])(
         variables["params"])
@@ -607,7 +684,9 @@ def test_multihost_flow_rollout_reassembles_owned_groups(tmp_path):
                                       expected_advantages.astype(np.float32))
         np.testing.assert_array_equal(report["global_rewards"], raw_callback.astype(np.float32))
         assert not report["x64_enabled"]
-        # The reassembled batch rescores as the one process's does, and keeps its recorded densities.
+        # The reassembled batch rescores as the one process's does, and keeps its recorded densities;
+        # the one process's rescoring and recording of this model and process are check 1's, against
+        # the authors' Gaussian (test_flow_rollout_groups_rewards_selects_steps_and_preserves_likelihoods).
         for name in ("global_scores", "global_old_log_probs"):
             np.testing.assert_array_equal(report[name], baseline[name])
         assert report["updates"] == 1 and report["parameter_change"] > 0
@@ -788,28 +867,35 @@ def test_conditioned_prompt_only_evaluation_preview_and_trainer_consumers():
 
     def evaluated_with(key):
         step = Step(initial.microstep, jax.random.wrap_key_data(key), initial.averaged)
-        return objective.evaluate(initial.variables, many, step).images
+        # Each image one row of check 1, its 16 values.
+        return objective.evaluate(initial.variables, many, step).images.reshape(16, -1)
 
-    def sampled(variables):
+    def walked(variables, dtype):
+        """The live policy's Euler walk in NumPy at `dtype` from the evaluation's noise, the DiT's own
+        raw outputs guided by CFG(1.5) at every step of the shifted grid, clipped."""
+        weights, encoders = objective.model_variables(variables), variables["encoders"]
+        given = objective.encode(encoders, many_tokens)
+        blank = jax.tree.map(lambda null, value: jnp.broadcast_to(null, value.shape),
+                             objective.encode(encoders), given)
+
         def run(key):
-            encoders = variables["encoders"]
-            denoiser = process.denoiser(model, objective.model_variables(variables),
-                                        objective.encode(encoders, many_tokens), objective.encode(encoders))
             with jax.enable_x64(new_val=False):
-                noise_key, sample_key = jax.random.split(jax.random.wrap_key_data(key))
-                noise = np.asarray(process.noise(noise_key, (16, *objective.latent_shape)))
-            dtype = jax.tree.leaves(variables)[0].dtype
-            images = sample(denoiser, jnp.asarray(noise, dtype), objective.steps, solver=objective.solver,
-                            guidance=objective.guidance, key=sample_key)
-            return jnp.clip(images, -1, 1)
+                noise_key, _ = jax.random.split(jax.random.wrap_key_data(key))
+                images = np.asarray(process.noise(noise_key, (16, *objective.latent_shape)), dtype)
+            times = 1 - np.arange(objective.steps, dtype=dtype) / (objective.steps - 1)
+            sigmas = 2 * times / (1 + times)
+            for sigma, following in itertools.pairwise(sigmas):
+                time = jnp.full((16,), sigma * 1000)
+                conditional, unconditional = (np.asarray(model.apply(weights, jnp.asarray(images), time,
+                                                                     **conditions), dtype)
+                                              for conditions in (given, blank))
+                images = images + (following - sigma) * (unconditional + 1.5 * (conditional - unconditional))
+            return np.clip(images, -1, 1).reshape(16, -1)
         return run
 
-    def truth(key):
-        with jax.enable_x64(new_val=True):
-            return sampled(widened(initial.variables))(key)
-
-    assert_as_exact(evaluated_with, sampled(initial.variables), draw, "prompt evaluation",
-                    seeds=SEEDS['prompt evaluation'], truth_fn=truth)
+    assert_as_exact(evaluated_with, walked(initial.variables, np.float32), draw, "prompt evaluation",
+                    seeds=SEEDS['prompt evaluation'],
+                    truth_fn=lambda key: walked(widened(initial.variables), np.float64)(key))
     assert previewed.images.shape == (min(4, count), 4, 4, 1)
     assert len(previewed.captions) == min(4, count)
     data = Loader(
