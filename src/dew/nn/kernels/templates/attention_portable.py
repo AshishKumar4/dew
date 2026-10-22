@@ -105,6 +105,9 @@ def forward(spec: algebra.Forward, query: jax.Array, key: jax.Array, value: jax.
             m, alpha = algebra.peak(spec, state.m, logits)
             v_tile = jax.lax.dynamic_slice_in_dim(value[row, :, kv_head], j * block_k, block_k)
             weights = algebra.weights(spec, logits, m)
+            if state.shift is None:
+                denominator = algebra.total(state.total, alpha, weights)
+                return coords, logits, m, alpha, weights, (denominator,), v_tile
             weights, factor, shift, reach = algebra.room(state, alpha, weights, v_tile)
             sums = algebra.total(state.total, factor, weights), shift, reach
             return coords, logits, m, factor, weights, sums, v_tile
@@ -126,11 +129,21 @@ def forward(spec: algebra.Forward, query: jax.Array, key: jax.Array, value: jax.
                 _dot(others, v_tile), others, own_tile)
             return algebra.Partial(acc, m, *sums), anchor, own, others_total
 
-        if initial is None:
-            state = algebra.empty(block_q, value_width)
-        else:
+        def begun(*, shifted: bool) -> algebra.Partial:
+            if initial is None:
+                empty = algebra.empty(block_q, value_width)
+                return algebra.headroomed(empty) if shifted else empty
             m0, total0, acc0 = initial
-            state = algebra.resumed(spec, m0[row, head, rows], total0[row, head, rows], acc0[row, head, rows])
+            return algebra.resumed(spec, m0[row, head, rows], total0[row, head, rows], acc0[row, head, rows],
+                                   shifted=shifted)
+
+        def walk(*, shifted: bool):
+            if not residuals:
+                return jax.lax.fori_loop(lo, hi, plain, begun(shifted=shifted))
+            nothing = jnp.zeros((block_q,), jnp.float32)
+            carry = begun(shifted=shifted), algebra.no_argmax(block_q), nothing, nothing
+            return jax.lax.fori_loop(lo, hi, step, carry)
+
         if spec.form == "spans":
             lo, hi = blocks_map.lo[row, i], blocks_map.hi[row, i]
         elif spec.form == "causal":
@@ -139,25 +152,32 @@ def forward(spec: algebra.Forward, query: jax.Array, key: jax.Array, value: jax.
             lo, hi = 0, tiles
         out_params = tuple(_output_param(param, kind, row, head, rows)
                            for param, kind in zip(output_params, output_kinds, strict=True))
+        unguarded, guarded = functools.partial(walk, shifted=False), functools.partial(walk, shifted=True)
+        walked = algebra.guarded(unguarded, guarded) if spec.headroom else unguarded()
         if residuals:
-            nothing = jnp.zeros((block_q,), jnp.float32)
-            carry = state, algebra.no_argmax(block_q), nothing, nothing
-            split, arg, own, others_total = jax.lax.fori_loop(lo, hi, step, carry)
+            split, arg, own, others_total = walked
             state = split._replace(acc=algebra.split_output(split.acc, own, value[row, arg.key, kv_head]))
-            kept = arg.key, split.acc, own, others_total, split.shift
+            shift = jnp.zeros_like(own) if split.shift is None else split.shift
+            kept = arg.key, split.acc, own, others_total, shift
         else:
-            state = jax.lax.fori_loop(lo, hi, plain, state)
-            kept = ()
+            state, kept = walked, ()
         out, m, denominator = algebra.finish(spec, state, initial=initial is not None, output_mod=output_mod,
                                              output_params=out_params)
         return (out.astype(query.dtype), m, denominator, *kept) if residuals else out.astype(query.dtype)
 
     mapped = jax.lax.map(program, jnp.arange(blocks * batch * heads))
+    return _unmapped(mapped, (blocks, batch, heads, block_q, value_width), residuals=residuals)
+
+
+def _unmapped(mapped, shape: tuple[int, ...], *, residuals: bool):
+    """The programs' outputs `[blocks * batch * heads, bq, ...]` back to `[B, Qp, H, Dv]`, and with
+    `residuals` theirs to `[B, H, Qp, ...]`, as `forward` returns them; `shape` the programs' grid and
+    tile, `(blocks, batch, heads, block_q, value_width)`."""
+    blocks, batch, heads, block_q, value_width = shape
+    queries = blocks * block_q
     out = mapped[0] if residuals else mapped
-    # [blocks * batch * heads, bq, ...] back to [B, Qp, H, ...] and [B, H, Qp].
     out = out.reshape(blocks, batch, heads, block_q, value_width).transpose(1, 0, 3, 2, 4)
     out = out.reshape(batch, queries, heads, value_width)
-
     if not residuals:
         return out, None
     _, m, denominator, anchors, others, own, others_total, shift = mapped
@@ -188,7 +208,8 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, 
         initial = (call.rows(state.m, -jnp.inf), call.rows(state.total),
                    jnp.pad(call.rows(state.acc), ((0, 0),) * 3 + ((0, call.value.shape[-1] - value_width),)))
     spec = algebra.Forward(spans.form, spans.keys, call.query_ids is not None,
-                           query.shape[3] ** -0.5 if scale is None else scale, hooks.score_mod, natural)
+                           query.shape[3] ** -0.5 if scale is None else scale, hooks.score_mod, natural,
+                           algebra.headroom(value.dtype, call.key.shape[1], hooks.initial is not None))
     out, kept = forward(
         spec, call.query, call.key, call.value, call.start, call.end, call.query_ids, call.key_ids,
         call.score_params, tuple(param.kind for param in hooks.score_params), call.output_params,

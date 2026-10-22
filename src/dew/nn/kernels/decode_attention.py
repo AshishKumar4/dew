@@ -134,14 +134,16 @@ def _capped(softcap: float, logits, q_pos, k_pos):
     return softcap * jnp.tanh(logits / softcap)
 
 
-def _spec(scale: float, softcap: float | None, natural: bool) -> algebra.Forward:
+def _spec(scale: float, softcap: float | None, natural: bool, dtype, capacity: int,
+          sinks: bool) -> algebra.Forward:
     """The algebra's facts for a decode launch: each query block's keys its row's span (`spans`), no
-    documents, the cap as its score hook, the logits `natural` or not (`algebra.Forward.base2`). A
-    decode block's rows are a key head's query heads and positions (`grouped_query`), so the hook takes
-    no query positions."""
+    documents, the cap as its score hook, the logits `natural` or not (`algebra.Forward.base2`), and
+    whether a row's sums over `capacity` keys of `dtype`, with its sinks, need a guard
+    (`algebra.headroom`). A decode block's rows are a key head's query heads and positions
+    (`grouped_query`), so the hook takes no query positions."""
     return algebra.Forward("spans", 0, ids=False, scale=scale,
                            score_mod=None if softcap is None else functools.partial(_capped, softcap),
-                           natural=natural)
+                           natural=natural, headroom=algebra.headroom(dtype, capacity, sinks))
 
 
 def _attend(query: jax.Array, span: tuple, read, block: int, spec: algebra.Forward, steps,
@@ -160,17 +162,27 @@ def _attend(query: jax.Array, span: tuple, read, block: int, spec: algebra.Forwa
         coords = algebra.Coords(rows[:, None], step * block + jnp.arange(block)[None, :], **narrowing)
         logits = algebra.modify(spec, _dot(query, key.T, interpret), coords)
         m, alpha = algebra.peak(spec, state.m, logits)
-        weights, factor, shift, reach = algebra.room(state, alpha, algebra.weights(spec, logits, m), value)
+        weights = algebra.weights(spec, logits, m)
+        if state.shift is None:
+            denominator = algebra.total(state.total, alpha, weights)
+            product = _dot(algebra.narrow(weights, value.dtype), value, interpret)
+            return algebra.Partial(algebra.rescale(state.acc, alpha) + product, m, denominator)
+        weights, factor, shift, reach = algebra.room(state, alpha, weights, value)
         denominator = algebra.total(state.total, factor, weights)
         product = _dot(algebra.narrow(weights, value.dtype), value, interpret)
         return algebra.Partial(algebra.rescale(state.acc, factor) + product, m, denominator, shift, reach)
 
-    start = algebra.empty(QUERIES, query.shape[-1])
-    if sink is not None:
-        real = sink > -jnp.inf
-        start = algebra.resumed(spec, sink, real.astype(jnp.float32), start.acc)
-    first, last = steps
-    return jax.lax.fori_loop(first, last, body, start)
+    def walk(*, shifted: bool) -> algebra.Partial:
+        start = algebra.empty(QUERIES, query.shape[-1])
+        if sink is not None:
+            real = sink > -jnp.inf
+            start = algebra.resumed(spec, sink, real.astype(jnp.float32), start.acc, shifted=shifted)
+        elif shifted:
+            start = algebra.headroomed(start)
+        return jax.lax.fori_loop(*steps, body, start)
+
+    plain, shifted = functools.partial(walk, shifted=False), functools.partial(walk, shifted=True)
+    return algebra.headroomed(algebra.guarded(plain, shifted) if spec.headroom else plain())
 
 
 def _slice(span: tuple, block: int, split, splits: int) -> tuple:
@@ -307,7 +319,7 @@ class DecodeAttention(tuning.KernelOp):
         reduced = pl.BlockSpec((None, None, QUERIES, None), lambda row, head, split: (row, split, 0, head))
         out_shape, out_specs = _outputs(query.shape, query.dtype, splits, 1, queried,
                                         [summed, *[reduced] * 4])
-        spec = _spec(1 / math.sqrt(width), softcap, natural)
+        spec = _spec(1 / math.sqrt(width), softcap, natural, value.dtype, key.shape[1], sinks is not None)
         out = pl.pallas_call(
             lambda *refs: _kernel(*refs, spec=spec, splits=splits, interpret=interpret,
                                   sinks=sinks is not None),
@@ -366,7 +378,8 @@ class PagedDecodeAttention(tuning.KernelOp):
         sunk = [] if sinks is None else [pl.BlockSpec((None, QUERIES), lambda row, head, split: (head, 0))]
         out_shape, out_specs = _outputs(query.shape, query.dtype, splits, 2, queried,
                                         [summed, *[reduced] * 4])
-        spec = _spec(1 / math.sqrt(width), softcap, natural)
+        spec = _spec(1 / math.sqrt(width), softcap, natural, value_pages.dtype, table.shape[1] * page_size,
+                     sinks is not None)
         out = pl.pallas_call(
             lambda *refs: _paged_kernel(*refs, pages=pages, spec=spec, splits=splits, interpret=interpret,
                                         sinks=sinks is not None),

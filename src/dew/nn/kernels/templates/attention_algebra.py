@@ -36,8 +36,9 @@ from dew.nn.kernels.templates.attention import LOG2E, NATURAL, Kind, natural_exp
 class Forward:
     """What the forward's functions specialize on, all static: the spans' `form` ('full', 'causal' or
     'spans', `KeySpans.form`), the call's key count `keys`, whether it packs documents (`ids`), the
-    softmax `scale`, the score hook `score_mod(s, q_pos, k_pos, *params)` on natural logits, and whether
-    the call keeps its logits `natural` (`base2`)."""
+    softmax `scale`, the score hook `score_mod(s, q_pos, k_pos, *params)` on natural logits, whether
+    the call keeps its logits `natural` (`base2`), and whether its weighted values can pass fp32's
+    largest, so a program's walk is `guarded` (`headroom`)."""
 
     form: str
     keys: int
@@ -45,6 +46,7 @@ class Forward:
     scale: float
     score_mod: Callable | None = None
     natural: bool = NATURAL
+    headroom: bool = True
 
     @property
     def base2(self) -> bool:
@@ -104,22 +106,58 @@ class Coords(NamedTuple):
 class Partial(NamedTuple):
     """A query block's softmax state, unhooked: the weighted values `acc` `[..., bq, Dv]`, the running
     maximum `m` `[..., bq]` (in base 2 where the step's logits are) and the denominator `total`
-    `[..., bq]`, fp32, both sums at each row's `2^-shift` (`room`), and the largest value magnitude the
-    row has weighed, `reach` `[..., bq]`. `rescale`, `merge` and `finish` take any leading axes, so
-    states a launch wrote per slice merge in XLA after it."""
+    `[..., bq]`, fp32; on the guarded path (`guarded`) both sums at each row's `2^-shift` (`room`) and
+    the largest value magnitude the row has weighed, `reach` `[..., bq]`, None on the plain path.
+    `rescale`, `merge` and `finish` take any leading axes, so states a launch wrote per slice merge in XLA
+    after it."""
 
     acc: jax.Array
     m: jax.Array
     total: jax.Array
-    shift: jax.Array | float = 0.0
-    reach: jax.Array | float = 0.0
+    shift: jax.Array | None = None
+    reach: jax.Array | None = None
 
 
 def empty(rows: int, width: int) -> Partial:
     """The softmax before any key: `merge`'s identity."""
-    nothing = jnp.zeros((rows,), jnp.float32)
-    return Partial(jnp.zeros((rows, width), jnp.float32), jnp.full((rows,), -jnp.inf, jnp.float32), nothing,
-                   nothing, nothing)
+    return Partial(jnp.zeros((rows, width), jnp.float32), jnp.full((rows,), -jnp.inf, jnp.float32),
+                   jnp.zeros((rows,), jnp.float32))
+
+
+def headroomed(state: Partial) -> Partial:
+    """`state` on the guarded path: no shift and no reach yet where the plain path carried none."""
+    if state.shift is not None:
+        return state
+    nothing = jnp.zeros_like(state.total)
+    return state._replace(shift=nothing, reach=nothing)
+
+
+def overflowed(acc: jax.Array) -> jax.Array:
+    """Whether a program's weighted values `acc` passed fp32's largest on some row, a scalar: the one way a
+    row of finite inputs turns non-finite (an infinite sum stays infinite under every later factor)."""
+    return jnp.logical_not(jnp.all(jnp.isfinite(acc)))
+
+
+def guarded(plain: Callable, shifted: Callable) -> object:
+    """A program's softmax walk under headroom: `plain()`, its walk as ever, whose carry's first element is
+    its `Partial`; where that walk's weighted values overflowed (`overflowed`), `shifted()` instead, the
+    walk again with each row's shift (`room`). Ordinary inputs take the plain walk alone, their bits and
+    their cost unchanged but for this check; both return the guarded carry (`headroomed`)."""
+    carry = plain()
+    state, *rest = carry if isinstance(carry, tuple) else (carry,)
+
+    def kept():
+        held = headroomed(state)
+        return (held, *rest) if rest else held
+
+    return jax.lax.cond(overflowed(state.acc), shifted, kept)
+
+
+def headroom(dtype, keys: int, initial: bool) -> bool:
+    """Whether a call's weighted values can pass fp32's largest: values of `dtype` whose largest times
+    `keys + 1` reaches `2^HEADROOM` (bf16's and fp32's, not fp16's), or an initial state, whose sums may
+    be any size. A call that cannot compiles no guard (`guarded`)."""
+    return initial or float(jnp.finfo(dtype).max) * (keys + 1) >= 2.0 ** HEADROOM
 
 
 HEADROOM = 126
@@ -160,11 +198,15 @@ def room(state: Partial, alpha: jax.Array, p: jax.Array, value: jax.Array
     return p * expand(scale, p), alpha * jnp.exp2(state.shift - shift), shift, reach
 
 
-def resumed(spec: Forward, m: jax.Array, total: jax.Array, acc: jax.Array) -> Partial:
+def resumed(spec: Forward, m: jax.Array, total: jax.Array, acc: jax.Array, *,
+            shifted: bool = False) -> Partial:
     """The softmax resumed from a state `(m, total, acc)` (`Hooks.initial`: sinks, a resumed partial),
-    its maximum taken to base 2 where the step's logits are, its sums shifted as their size needs
-    (`needed`: `acc`'s largest magnitude is its denominator times the values' it weighed)."""
+    its maximum taken to base 2 where the step's logits are; on the guarded path (`shifted`) its sums
+    shifted as their size needs (`needed`: `acc`'s largest magnitude is its denominator times the values
+    it weighed)."""
     m, total, acc = (array.astype(jnp.float32) for array in (m, total, acc))
+    if not shifted:
+        return Partial(acc, m * LOG2E if spec.base2 else m, total)
     largest = jnp.max(jnp.abs(acc), axis=-1)
     reach = jnp.where(total > 0, largest / jnp.where(total > 0, total, 1.0), 0.0)
     shift = needed(total, reach)
@@ -293,6 +335,11 @@ def merge(spec: Forward, first: Partial, second: Partial) -> Partial:
     keys), so `empty` is its identity under every spec."""
     m = jnp.maximum(first.m, second.m)
     safe = jnp.where(m == -jnp.inf, 0.0, m)
+    if first.shift is None and second.shift is None:
+        a, b = spec.carry(first.m - safe), spec.carry(second.m - safe)
+        acc = expand(a, first.acc) * first.acc + expand(b, second.acc) * second.acc
+        return Partial(acc, m, a * first.total + b * second.total)
+    first, second = headroomed(first), headroomed(second)
     reach = jnp.maximum(first.reach, second.reach)
     natural = (spec.carry(first.m - safe) * first.total * jnp.exp2(first.shift)
                + spec.carry(second.m - safe) * second.total * jnp.exp2(second.shift))
@@ -319,7 +366,7 @@ def finish(spec: Forward, state: Partial, *, initial: bool, output_mod: Callable
         out = state.acc / expand(denominator, state.acc)
     if output_mod is not None:
         out = output_mod(out, *output_params)
-    return out, m, denominator * jnp.exp2(state.shift)
+    return out, m, denominator if state.shift is None else denominator * jnp.exp2(state.shift)
 
 
 # The backward's algebra: what lies between its products (S = Q·Kᵀ, dP = dO·Vᵀ, then dV, dK and dQ),
