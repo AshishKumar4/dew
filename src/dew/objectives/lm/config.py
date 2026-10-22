@@ -18,20 +18,27 @@ wrote, which decide the vocabulary.
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Mapping
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
 
-from dew.config import DataSpec, ModelConfig, ObjectiveConfig, OptimConfig, Prepared, RunConfig
-from dew.config.data import TextData
-from dew.data.sources import source
+from dew.config import ModelConfig, ObjectiveConfig, OptimConfig, Prepared, RunConfig
+from dew.data.compile import fitted
 from dew.data.text import HFTokenizer, tokenizer_for
 from dew.records import integer, text
 from dew.registry import DtypeName, objectives, resolve_dtype
 from dew.sampling.text import Sampling
 
 from .objective import Perplexity, Samples
+
+
+class Tokens(NamedTuple):
+    """The token windows an LM run trains on (`LMRunConfig.tokens`)."""
+    tokenizer: str
+    vocab_size: int
+    seq_len: int
+    packed: bool
 
 
 @dataclasses.dataclass(frozen=True)
@@ -43,9 +50,6 @@ class LMRunConfig(RunConfig):
     block_diffusion (the official DiffusionGemma fine-tuning objective)."""
     model: ModelConfig = dataclasses.field(
         default_factory=lambda: ModelConfig("causal_transformer", {"dtype": "bfloat16"}))
-    data: DataSpec = dataclasses.field(default_factory=lambda: TextData(source=""))
-    """The produced token store a run trains on (data:text). First-fit packing
-    keeps document boundaries; weighted stores and phases share one vocabulary."""
     optim: OptimConfig = dataclasses.field(
         default_factory=lambda: OptimConfig(
             learning_rate=6e-4,
@@ -76,11 +80,8 @@ class LMRunConfig(RunConfig):
                                                                              "block_diffusion")):
             raise ValueError(
                 f"--objective {self.objective.name!r} is not lm, masked_diffusion or block_diffusion")
-        if self.objective.name == objectives.paths["block_diffusion"]:
-            if self.pretrained is None:
-                raise ValueError("block_diffusion fine-tuning requires --pretrained")
-            if self.tokens().pack:
-                raise ValueError("block_diffusion trains on spans of the stream, not packed documents")
+        if self.objective.name == objectives.paths["block_diffusion"] and self.pretrained is None:
+            raise ValueError("block_diffusion fine-tuning requires --pretrained")
 
     def prepare(self) -> Prepared:
         """The objective this run names over its token files.
@@ -97,7 +98,9 @@ class LMRunConfig(RunConfig):
         alone. Perplexity scores each validation pass.
         """
         tokens = self.tokens()
-        written, vocab_size = token_vocabulary(tokens)
+        if objectives.label(self.objective.name) == "block_diffusion" and tokens.packed:
+            raise ValueError("block_diffusion trains on spans of the stream, not packed documents")
+        written, vocab_size = tokens.tokenizer, tokens.vocab_size
         if self.tokenizer != written:
             # Decoding with a different tokenizer than the ids were written with
             # produces text that says nothing about the model.
@@ -138,22 +141,31 @@ class LMRunConfig(RunConfig):
             objective = self.objective.build(
                 model=model if source is None else source, seq_len=tokens.seq_len, variables=variables,
                 samples=samples, processor=self.processor(), qk_stats=self.optim.optimizer == "muonclip")
-        loaded = self.loader(objective.data(), tokens)
+        # Compiled once: the run's length and its cadences are read off this loader, which `train` trains on.
+        loaded, held = fitted(self.chain(), self.validation, objective=objective.data(),
+                              seed=self.data_seed)
         if loaded.steps_per_epoch is None and self.trainer.steps is None:
             raise ValueError("this data has no epoch length, so a run cannot count epochs of it: online "
                              "packing or a filter over an indexed or streamed read cuts its order per share. "
-                             "Read it whole first (--data-read memory), read a published packing generation "
+                             "Read it whole first (.read('memory')), read a published packing generation "
                              "by index, or give the run length as --trainer.steps")
-        # The run's own default metric, asked for where its data holds a validation split to score.
-        scored = self.trainer.eval_interval(loaded) is not None and loaded.val is not None
+        # The run's own default metric, asked for where it holds a validation split to score.
+        scored = self.trainer.eval_interval(loaded) is not None and bool(held)
         validation = (Perplexity(),) if scored else ()
-        return Prepared(run, lambda name: run.train(objective, loaded, name=name, metrics=validation))
+        return Prepared(run, lambda name: run.train(objective, loaded, name=name, metrics=validation,
+                                                     validation=held))
 
-    def tokens(self) -> TextData:
-        """The token files this run trains on; any other data is refused."""
-        if not isinstance(self.data, TextData):
-            raise ValueError("an LM run trains on a TextData recipe: data:text")
-        return self.data
+    def tokens(self) -> Tokens:
+        """The token windows this run trains on, as its chain states them (`Dataset.facts`): their
+        tokenizer, vocabulary and length. Raises ValueError for a chain that states none, which an LM
+        run cannot size its model for."""
+        facts = self.chain().facts()
+        missing = [name for name in ("tokenizer", "vocab_size", "seq_len") if facts.get(name) is None]
+        if missing:
+            raise ValueError(f"an LM run trains on token windows (dew.data.presets.lm, sft or "
+                             f"token_windows); this chain states no {', '.join(missing)}")
+        return Tokens(text(facts["tokenizer"], "tokenizer"), integer(facts["vocab_size"], "vocab_size"),
+                      integer(facts["seq_len"], "seq_len"), bool(facts.get("packed", False)))
 
     def processor(self):
         """The run's tokenizer as its checkpoints record it for every loader."""
@@ -248,29 +260,6 @@ class LMRunConfig(RunConfig):
             raise ValueError("seq_len + 1 must equal prompt_length plus whole training canvases")
         return self.objective.build(model=model, num_canvases=response // width, variables=variables,
                                     processor=self.processor())
-
-
-def token_vocabulary(tokens: TextData) -> tuple[str, int]:
-    """One vocabulary shared by every source and phase of a text recipe."""
-    values = [phase.path for phase in tokens.phases] if tokens.phases else [tokens.source]
-    leaves = [leaf for value in values for leaf in (sorted(value) if isinstance(value, Mapping) else [value])]
-    if not leaves or any(leaf == "" for leaf in leaves):
-        raise ValueError("--data.source names the produced token store or text source")
-    recorded = set()
-    for leaf in leaves:
-        metadata = source(leaf).metadata()
-        if metadata.get("token_store"):
-            if "tokenizer" not in metadata or "vocab_size" not in metadata:
-                raise FileNotFoundError(
-                    f"{source(leaf).describe()} needs producer metadata (tokenizer and vocab_size)")
-            recorded.add((text(metadata["tokenizer"], "tokenizer"), integer(metadata["vocab_size"],
-                "vocab_size")))
-        else:
-            recorded.add((tokens.tokenizer, tokenizer_for(tokens.tokenizer).vocab_size))
-    if len(recorded) > 1:
-        raise ValueError(f"the corpora of --data.source feed one embedding table, and record different "
-                         f"(tokenizer, vocab_size): {sorted(recorded)}")
-    return recorded.pop()
 
 
 def same_vocabulary(written: str, loaded, name: str) -> bool:

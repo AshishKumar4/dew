@@ -57,7 +57,6 @@ if TYPE_CHECKING:
     from _typeshed import DataclassInstance
     from flax import linen as nn
 
-    from dew.config.data import RunData as Recipe
     from dew.diffusion.presets import Preset
     from dew.inputs.encoders import ConditionEncoder
     from dew.nn.mixers import MixerBase
@@ -1250,18 +1249,6 @@ solvers: Aliases[type[Solver[Any]], Solver[Any]] = Aliases("solver", {
     "unipc": "dew.sampling.solvers.unipc:UniPC",
     "unmask": "dew.diffusion.discrete:Unmask",
 })
-datasets: Aliases[type[Recipe], Recipe] = Aliases("dataset", {
-    "chat": "dew.config.data:ChatData",
-    "chat_canvases": "dew.config.data:ChatCanvasData",
-    "decisions": "dew.decision.data:Decisions",
-    "images": "dew.config.data:ImageData",
-    "preferences": "dew.config.data:PreferenceData",
-    "prompts": "dew.config.data:PromptData",
-    "records": "dew.config.data:RecordsData",
-    "text": "dew.config.data:TextData",
-    "tiny_shakespeare": "dew.config.data:TinyShakespeareData",
-    "video": "dew.config.data:VideoData",
-}, base="dew.config.data:RunData")
 encoders: Aliases[type[ConditionEncoder[Any]], ConditionEncoder[Any]] = Aliases("encoder", {
     "char_table": "dew.inputs.encoders:CharTable",
     "clip_text": "dew.inputs.encoders:CLIPText",
@@ -1353,8 +1340,8 @@ schedules: Aliases[type[ScheduleBase], ScheduleBase] = Aliases("schedule", {
 }, base="dew.training.optim:ScheduleBase")
 
 
-KINDS: tuple[Aliases, ...] = (models, presets, solvers, datasets, encoders, metrics, objectives, mixers,
-                              towers, projectors, schedules)
+KINDS: tuple[Aliases, ...] = (models, presets, solvers, encoders, metrics, objectives, mixers, towers,
+                              projectors, schedules)
 """Every kind, which a record's alias is looked up across."""
 
 __all__ = [
@@ -1362,7 +1349,6 @@ __all__ = [
     "Aliases",
     "Record",
     "argument_records",
-    "datasets",
     "dtype_name",
     "encoders",
     "from_record",

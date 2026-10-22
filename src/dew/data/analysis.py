@@ -13,10 +13,9 @@ analysis instead of deriving it again.
 The stage facts they share are here too: a pipeline's corpora and steps, a
 step's identity and the manifest a plan or a cache's fill records
 (`_manifest`), which stages draw from the record rng, which drop or make
-rows, which a cache can hold (`_cache_at`), which run inside a cache's or a
-shard's reader, and where a recipe's default order goes (`_order_at`).
-`_capabilities` and `_preferred_read` ask a run's sources which reads they
-support and which they prefer.
+rows, which a cache can hold (`_cacheable`), and which run inside a cache's or
+a shard's reader. `_capabilities` and `_preferred_read` ask a run's sources
+which reads they support and which they prefer.
 """
 
 from __future__ import annotations
@@ -72,7 +71,6 @@ from dew.data.sources.memory import Memory
 from dew.records import json_value, record
 
 if TYPE_CHECKING:
-    from dew.data.cache import Cache
     from dew.data.generation import Generation
 
 _STAGES = get_args(Stage.__value__)
@@ -230,16 +228,6 @@ def _in_place(generation: Generation, source: Source | Mixture | Phases,
     return rebased(source, generation.source(), under=stored), ()
 
 
-def _serves(cache: Cache | Generation | str, source: Source | Mixture | Phases,
-            prefix: Sequence[Stage]) -> bool:
-    """Whether `cache` after `prefix` over `source` holds the rows those
-    steps make: a cache fills what they make, and a named generation holds
-    the rows of the one prefix it was published from (`_in_place`)."""
-    from dew.data.generation import Generation
-
-    return not isinstance(cache, Generation) or _in_place(cache, source, prefix)[0] is not None
-
-
 def _standing_in(generation: Generation, pipeline: Pipeline, source: Source | Mixture | Phases,
                  prefix: Sequence[Stage]) -> Source:
     """The rows of `generation` in place of `prefix` over `source`
@@ -338,11 +326,9 @@ def _ruled(source: Source) -> bool:
     return "count_rules" not in stated or bool(stated["count_rules"])
 
 
-def _preferred_read(compiled: Callable[[Read], Sequence[Pipeline]], *, provision: bool) -> Read:
-    """The read a run takes when it states none, decided here once for
-    compile, validation and load. `compiled` gives the pipelines the run
-    would compile at each read, which differ where a recipe's default order
-    does (`_order_at`), so each read is judged on the pipelines it would run.
+def _preferred_read(pipelines: Sequence[Pipeline], *, provision: bool) -> Read:
+    """The read a run of `pipelines` takes when it states none, decided here
+    once for compile, a held pass and an export.
 
     Each store the run reads, after its published generations are promoted,
     prefers memory for records held in memory (`Memory`, through any source
@@ -358,16 +344,14 @@ def _preferred_read(compiled: Callable[[Read], Sequence[Pipeline]], *, provision
     store whole into memory. Past the preference, where the stages need a
     more eager read than the sources prefer, a read a source takes only once
     provisioned is passed over: JSON lines with a token split, which needs a
-    finite indexed order, and a CSV with a random holdout, which cannot be
+    finite indexed order, and a CSV with a records= holdout, which cannot be
     streamed, read into memory when they have no index. When no read is
     left, the preference stands, and the preparation refuses it with its own
     remedy.
     """
-    def promoted(read: Read) -> tuple[Pipeline, ...]:
-        return tuple(_promoted(pipeline) for pipeline in compiled(read))
-
+    promoted = tuple(_promoted(pipeline) for pipeline in pipelines)
     chosen: list[Read] = []
-    for source in (source for pipeline in promoted(READS[-1]) for _, source in _leaves(pipeline)):
+    for source in (source for pipeline in promoted for _, source in _leaves(pipeline)):
         source = _store(source)
         if _in_memory(source):
             chosen.append("memory")
@@ -379,12 +363,11 @@ def _preferred_read(compiled: Callable[[Read], Sequence[Pipeline]], *, provision
             chosen.append("indexed" if indexed else "streamed")
     preferred = READS.index(max(chosen, key=READS.index))
     for read in READS[preferred::-1]:
-        pipelines = promoted(read)
-        missing = _unsupported(pipelines, read)
+        missing = _unsupported(promoted, read)
         provisionable = all(_provisioner(source, read) is not None for source in missing)
         if read == READS[preferred] and missing and provisionable and not provision:
             return read
-        if (not missing or (provision and provisionable)) and _lowers(pipelines, read):
+        if (not missing or (provision and provisionable)) and _lowers(promoted, read):
             return read
     return READS[preferred]
 
@@ -537,7 +520,7 @@ def _configured(
         if missing:
             raise ValueError(
                 f"{_name(pipeline)} step {_identity(stage).name} needs metadata {missing}; "
-                "provide producer metadata, recipe fields or read='memory'"
+                "provide producer metadata, the step's settings or read='memory'"
             )
         stages.append(_bind(stage, metadata))
     return dataclasses.replace(pipeline, source=source, stages=tuple(stages))
@@ -677,12 +660,6 @@ def _cacheable(stage: Stage) -> bool:
     return isinstance(stage, (*_LOCAL, Configured)) and not _random(stage) and _keyed(stage)
 
 
-def _cache_at(stages: Sequence[Stage]) -> int:
-    """The end of the longest prefix of `stages` a cache can hold, where a
-    recipe's cache goes and before which `_checked` requires any cache."""
-    return next((index for index, stage in enumerate(stages) if not _cacheable(stage)), len(stages))
-
-
 def _one_to_one(stages: Sequence[Stage]) -> bool:
     """Whether a cache after `stages` holds one record for each of its inputs: none of them drops
     or expands records. Such a cache reads as the source's own rows do, by index and in one global
@@ -698,24 +675,6 @@ def _indexed_cache(prefix: Sequence[Stage], read: Read) -> bool:
     one that holds one record for each input (`_one_to_one`), in a memory or indexed read; a
     streamed read fills its cache shard by shard."""
     return read != "streamed" and _one_to_one(prefix)
-
-
-def _order_at(stages: Sequence[Stage], read: Read) -> tuple[int, bool]:
-    """Where a recipe's default order goes, and whether the rows there are
-    indexed so one shuffle can order them all. A memory read orders the rows
-    its deterministic steps made, before the first random step or batch; any other
-    read orders the source's rows right after the cache that keys them, and
-    a cache's rows reach an indexed read by index where it holds one record for each input
-    (`_one_to_one`), else as a stream."""
-    if read == "memory":
-        # Records are ordered before their batch, as before the first random step.
-        boundary = (index for index, stage in enumerate(stages)
-                    if _random(stage) or isinstance(stage, (BatchStage, TokenBudget)))
-        return next(boundary, len(stages)), True
-    cache = _at(stages, Artifact)
-    if cache is None:
-        return 0, read == "indexed"
-    return cache + 1, _indexed_cache(stages[:cache], read)
 
 
 def _random(stage: Stage) -> bool:

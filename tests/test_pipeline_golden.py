@@ -1,9 +1,9 @@
 """Loader batches and RNG against frozen references, with real workers.
 
-Images pin the public-stage recipe. Packed batches pin host Coordinates;
-packed text pins documents cut into pieces that share their boundary token,
-where 66beb5305 lost each piece's first next-token target. The other
-loaders pin 66beb5305.
+Each case is a chain of the public presets and verbs, written as the recipe it replaced compiled:
+the frozen references are the batches the old loaders read. Images pin the public steps. Packed
+batches pin host Coordinates; packed text pins documents cut into pieces that share their boundary
+token, where 66beb5305 lost each piece's first next-token target. The other cases pin 66beb5305.
 """
 
 import gzip
@@ -19,32 +19,28 @@ import numpy as np
 import pyarrow as pa
 import pyarrow.parquet as pq
 import pytest
+import tensorflow_datasets as tfds
 from array_record.python.array_record_module import ArrayRecordWriter
+from token_support import write_token_corpus
 
-from dew.config.data import (
-    Augment,
-    ChatData,
-    HoldOut,
-    ImageData,
-    PreferenceData,
-    PromptData,
-    RecordsData,
-    TextData,
-    loader,
-)
-from dew.data.dataset import DataPartition, DataPhase, Loading
+from dew.data import Memory, images, phases, presets
+from dew.data.compile import compile
+from dew.data.dataset import DataPartition, Loading
+from dew.data.images import EncodeCaptions
 from dew.data.sources.codec import pack_dict_of_byte_arrays
 from dew.data.sources.files import Files
 from dew.data.sources.tfds import TFDS
+from dew.data.sources.tokens import TokenFiles
+from dew.data.steps.generic import Formatting
 
 GOLD = Path(__file__).parent / "fixtures/golden/loaders-66beb5305.json.gz"
 ORACLE = Path(__file__).parents[1] / "tools/measurements/data-pipeline/data_oracle_legacy.py"
 CASES = ("text_windows", "text_packed", "text_phases", "chat", "prompts", "preferences", "images_memory",
          "images_arrayrecord", "images_hf", "images_tfds", "hub_records", "tfds_records")
-"""The recipes the old loaders read alike. Decision rows are not among them: they pack into windows,
-which no old loader did (tests/test_decision_packing.py); nor is the video recipe, whose record the
-media stages changed on purpose (a waveform and its validity in place of per-frame rows and features):
-tests/test_data.py holds that recipe to itself across workers and a resume."""
+"""The corpora the old loaders read alike. Decision rows are not among them: they pack into windows,
+which no old loader did (tests/test_decision_packing.py); nor is video, whose record the media
+stages changed on purpose (a waveform and its validity in place of per-frame rows and features):
+tests/test_data.py holds a video listing to itself across workers and a resume."""
 
 
 def _digest(batch):
@@ -85,58 +81,92 @@ def _image_sources(root, pixels):
     return str(image_root), str(image_file)
 
 
+def _token_corpus(root, name, shift):
+    """The token store the frozen reference read (`token_store`), its streams written as committed
+    exports, each document through its EOS."""
+    legacy = Path(_oracle().token_store(root, name, shift))
+    train, val = (np.frombuffer((legacy / f"{split}.bin").read_bytes(), np.uint16)
+                  for split in ("train", "val"))
+    return write_token_corpus(root / f"{name}-export", train, val, eos_id=255)
+
+
 @pytest.fixture(scope="module")
-def recipes(tmp_path_factory):
+def chains(tmp_path_factory):
+    """Each case's training chain and the chain it validates on, in batches of four, shuffled by
+    seed 7 where the recipe ordered them: before the first random step, else before the batch."""
     root = tmp_path_factory.mktemp("pipeline-golden")
-    token_store = _oracle().token_store
-    tokens, other = token_store(root, "tokens", 0), token_store(root, "other", 10)
-    conversations = tuple({"messages": [{"role": "user", "content": f"question {index}"},
-                                        {"role": "assistant", "content": f"answer {index % 5}"}]}
-                          for index in range(40))
-    prompts = tuple({"prompt": list(range(1, 3 + index % 6)), "data_source": "rule",
-                     "ground_truth": str(index % 3), "extra_info": ""} for index in range(40))
-    pairs = tuple({"chosen": list(range(1, 3 + index % 4)), "rejected": [2, 3, 4],
-                   "chosen_mask": [0] + [1] * (1 + index % 4), "rejected_mask": [0, 1, 1]}
-                  for index in range(40))
+    tokens, other = _token_corpus(root, "tokens", 0), _token_corpus(root, "other", 10)
+    conversations = Memory([{"messages": [{"role": "user", "content": f"question {index}"},
+                                          {"role": "assistant", "content": f"answer {index % 5}"}]}
+                            for index in range(40)])
+    prompts = Memory([{"prompt": list(range(1, 3 + index % 6)), "data_source": "rule",
+                       "ground_truth": str(index % 3), "extra_info": ""} for index in range(40)])
+    pairs = Memory([{"chosen": list(range(1, 3 + index % 4)), "rejected": [2, 3, 4],
+                     "chosen_mask": [0] + [1] * (1 + index % 4), "rejected_mask": [0, 1, 1]}
+                    for index in range(40)])
     pixels = tuple({"image": ((np.arange(16 * 16 * 3).reshape(16, 16, 3) + index * 7) % 256).astype(np.uint8),
                     "label": index % 3, "caption": f"picture {index}"} for index in range(40))
     image_root, image_file = _image_sources(root, pixels)
     table = root / "records.parquet"
     pq.write_table(pa.table({"id": list(range(40)), "x": [[index, index + 1] for index in range(40)]}), table)
-    augment = Augment(backend="host", jitter=True)
+    tfds_images = "tests/fixtures/tfds/dew_images/1.0.0"
+
+    def windows(corpus):
+        return TokenFiles(corpus).shuffle(7).repeat().pipe(presets.token_windows, seq_len=16, batch=None)
+
+    def packed(corpus, batch=None, records=None):
+        return TokenFiles(corpus).pipe(presets.lm, None, seq_len=16, batch=batch, pack="first-fit", bins=8,
+                                       records=records)
+
+    def chat(batch=None, records=None):
+        return conversations.pipe(presets.sft, "tests/fixtures/tokenizers/tiny-chat", seq_len=64, batch=batch,
+                                  long="chunk", bins=8, records=records)
+
+    def pictures(source, size=16, *, augment=True, held=16, templates=()):
+        """The images held out first, the rest jittered and flipped on the host, every caption
+        dropped before a batch reaches the run."""
+        train, val = source.holdout(records=held)
+        caption = images.caption(templates=templates)
+
+        def prepared(part, **options):
+            return part.pipe(presets.images, size, batch=4, rejects=False, caption=caption,
+                             host=(EncodeCaptions(),), **options)
+
+        return (prepared(train.shuffle(7).repeat(), augment=(images.Flip(), images.ColorJitter())),
+                prepared(val))
+
     return {
-        "text_windows": (TextData(tokens, seq_len=16), {"validation_records": 16}),
-        "text_packed": (TextData(tokens, seq_len=16, pack="first-fit"), {"validation_records": 16}),
-        "text_phases": (TextData(phases=(DataPhase(tokens, 3), DataPhase(other)), seq_len=16),
-                        {"validation_records": 16}),
-        "chat": (ChatData(conversations, "tests/fixtures/tokenizers/tiny-chat", seq_len=64, long="chunk",
-                       validation=conversations), {"validation_records": 16}),
-        "prompts": (PromptData(prompts, "byte", max_prompt_len=16, long="truncate"), {}),
-        "preferences": (PreferenceData(pairs, seq_len=16), {}),
-        "images_memory": (ImageData(pixels, image_size=16, augment=augment, validation=HoldOut(records=16)),
-                          {}),
-        "images_arrayrecord": (ImageData(Files(image_root, format="array_record"), image_size=16,
-                                      augment=augment, validation=HoldOut(records=16)), {}),
-        "images_hf": (ImageData(Files(image_file), image_size=16, augment=augment,
-                              validation=HoldOut(records=16)), {}),
-        "images_tfds": (ImageData(TFDS("dew_images", split="all",
-                                       path="tests/fixtures/tfds/dew_images/1.0.0"),
-                                image_size=8, augment=augment, caption_templates=("a photo of a {}",),
-                                validation=HoldOut(records=4)), {}),
-        "hub_records": (RecordsData(Files(str(table))), {}),
-        "tfds_records": (RecordsData(TFDS("dew_images", path="tests/fixtures/tfds/dew_images/1.0.0")), {}),
+        "text_windows": (windows(tokens.train).batch(4),
+                         TokenFiles(tokens.val).pipe(presets.token_windows, seq_len=16, batch=4, records=16)),
+        "text_packed": (packed(tokens.train).shuffle(7).repeat().batch(4), packed(tokens.val, 4, 16)),
+        "text_phases": (phases((windows(tokens.train), 3), (windows(other.train), None)).batch(4),
+                        TokenFiles(tokens.val).pipe(presets.token_windows, seq_len=16, batch=4, records=16)),
+        "chat": (chat().shuffle(7).repeat().batch(4), chat(4, 16)),
+        "prompts": (prompts.pipe(presets.prompts, "byte", max_prompt_len=16, batch=None).shuffle(7).repeat()
+                    .batch(4), None),
+        "preferences": (pairs.pipe(presets.preferences, seq_len=16, batch=None).shuffle(7).repeat().batch(4),
+                        None),
+        "images_memory": pictures(Memory(pixels)),
+        "images_arrayrecord": pictures(Files(image_root, format="array_record")),
+        "images_hf": pictures(Files(image_file)),
+        "images_tfds": pictures(TFDS("dew_images", split="all", path=tfds_images,
+                                     decoders={"image": tfds.decode.SkipDecoding()}),
+                                8, held=4, templates=("a photo of a {}",)),
+        "hub_records": (Files(str(table)).map(Formatting()).shuffle(7).repeat().batch(4), None),
+        "tfds_records": (TFDS("dew_images", path=tfds_images).map(Formatting()).shuffle(7).repeat().batch(4),
+                         None),
     }
 
 
 @pytest.mark.parametrize("name", CASES)
 @pytest.mark.parametrize("workers", [0, 2])
 @pytest.mark.parametrize("shares", [1, 2])
-def test_loader_batches_positions_and_rng_match_the_frozen_reference(recipes, name, workers, shares):
+def test_loader_batches_positions_and_rng_match_the_frozen_reference(chains, name, workers, shares):
     with gzip.open(GOLD, "rt") as source:
         expected = json.load(source)["cases"][name][f"workers={workers},shares={shares}"]
-    recipe, fields = recipes[name]
-    loaded = loader(recipe, batch=4, read="memory", seed=7,
-                  loading=Loading(workers=workers, threads=1, read_buffer=4, worker_buffer=1), **fields)
+    train, validation = chains[name]
+    loaded = compile(train, validation=validation, read="memory", seed=7,
+                     loading=Loading(workers=workers, threads=1, read_buffer=4, worker_buffer=1))
     assert loaded.records == expected["records"]
     assert loaded.held_out == expected["held_out"]
     for share in range(shares):
