@@ -28,6 +28,7 @@ from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
+from jax.core import ShapedArray
 from jax.extend import core as jex
 
 from dew.nn.kernels.templates.attention import LOG2E, NATURAL, Kind, natural_exp
@@ -310,10 +311,13 @@ def _stripped(param):
     re-traced without its custom-derivative calls (`_evaluated`), where it holds one; anything else as
     it is."""
     if isinstance(param, tuple):
-        return tuple(_stripped(item) for item in param)
+        return tuple(_stripped(nested) for nested in param)
     if not isinstance(param, jex.ClosedJaxpr) or not _calls_custom(param.jaxpr):
         return param
-    shapes = [jax.ShapeDtypeStruct(var.aval.shape, var.aval.dtype) for var in param.jaxpr.invars]
+    avals = [var.aval for var in param.jaxpr.invars]
+    if not all(isinstance(aval, ShapedArray) for aval in avals):
+        raise NotImplementedError("a custom-derivative call inside a jaxpr over references or tokens")
+    shapes = [jax.ShapeDtypeStruct(aval.shape, aval.dtype) for aval in avals if isinstance(aval, ShapedArray)]
     return jax.make_jaxpr(lambda *args: _evaluated(param.jaxpr, param.consts, args))(*shapes)
 
 
