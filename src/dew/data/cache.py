@@ -201,8 +201,7 @@ class Cache:
         if record["manifest"] != key.key:
             raise ValueError(f"cache CURRENT manifest differs at {root.url}")
         # Pinned, then its manifest read once, checked against what CURRENT committed.
-        return Generation(root.child(f"generations/{record['generation']}").url, self._mirror_options(),
-                          committed={"bytes": record["bytes"], "sha256": record["sha256"]})
+        return Generation.named(root, record, self._mirror_options())
 
     def publish(
         self,
@@ -483,7 +482,7 @@ class _Writer:
         with self.lock:
             self._flush()
         self.segments = [future.result() for future in self.futures]
-        sealed = seal_facts(self.segments, [_checked(self.root, entry) for entry in self.segments])
+        sealed = seal_facts(self.segments, (_checked(self.root, entry) for entry in self.segments))
         payload = _json(sealed)
         if self.closed:
             raise Abandoned(f"cache writer was abandoned before its seal: {self.writer}")

@@ -249,10 +249,7 @@ def _write_plan(root: Store, name: str, array: np.ndarray) -> Mapping[str, objec
 def _retain_committed(
     root: Store, current: Versioned, completions: dict, shards: dict, pins: ExitStack
 ) -> None:
-    reference = json.loads(current.data)
-    manifest_path = f"generations/{reference['generation']}/manifest.json"
-    _checked(root, {"path": manifest_path, "bytes": reference["bytes"], "sha256": reference["sha256"]})
-    prior = Generation(root.child(f"generations/{reference['generation']}").url, root.storage_options)
+    prior = Generation.named(root, json.loads(current.data), root.storage_options)
     if prior.pin is not None:
         pins.enter_context(prior.pin)
     for page in prior.manifest["pages"].values():
@@ -276,30 +273,31 @@ def _sealed(root: Store, pins: ExitStack) -> tuple[dict, dict]:
         if scheme == "file":
             pins.enter_context(LocalRetention.pin(Path(directory) / "shards" / Path(location).parent.name))
         seal = json.loads(fs.cat_file(location))
-        payloads = []
-        for segment in seal["segments"]:
-            payload = _checked(root, segment)
-            payloads.append(payload)
-            record = json.loads(payload)
-            _checked(root, record["shard"])
-            with closing(
-                ArrayRecords((root.child(record["shard"]["path"]).url,), root.storage_options)
-            ) as rows:
-                if sorted(entry["record"] for entry in record["completions"]) != list(range(len(rows))):
-                    raise ValueError(
-                        f"cache shard has records without one completion: {record['shard']['path']}"
-                    )
-                for entry in record["completions"]:
-                    _completion(entry, rows[entry["record"]])
-                    candidate = {**entry, "shard": record["shard"]["path"]}
-                    existing = completions.get(entry["id"])
-                    if existing is not None and existing["payload_sha256"] != entry["payload_sha256"]:
-                        raise ValueError(f"conflicting cache duplicate for row {entry['id']}")
-                    completions.setdefault(entry["id"], candidate)
-            shards[record["shard"]["path"]] = record["shard"]
-        if seal_facts(seal["segments"], payloads) != seal:
+        segments = (_segment(root, segment, completions, shards) for segment in seal["segments"])
+        if seal_facts(seal["segments"], segments) != seal:
             raise ValueError(f"cache writer seal failed verification: {location}")
     return completions, shards
+
+
+
+def _segment(root: Store, segment: Mapping[str, object], completions: dict, shards: dict) -> bytes:
+    """A sealed segment's bytes, checked with its shard and every completion it records against the
+    shard's records, its completions and shard added to those of the writers read before it."""
+    payload = _checked(root, segment)
+    record = json.loads(payload)
+    _checked(root, record["shard"])
+    with closing(ArrayRecords((root.child(record["shard"]["path"]).url,), root.storage_options)) as rows:
+        if sorted(entry["record"] for entry in record["completions"]) != list(range(len(rows))):
+            raise ValueError(f"cache shard has records without one completion: {record['shard']['path']}")
+        for entry in record["completions"]:
+            _completion(entry, rows[entry["record"]])
+            candidate = {**entry, "shard": record["shard"]["path"]}
+            existing = completions.get(entry["id"])
+            if existing is not None and existing["payload_sha256"] != entry["payload_sha256"]:
+                raise ValueError(f"conflicting cache duplicate for row {entry['id']}")
+            completions.setdefault(entry["id"], candidate)
+    shards[record["shard"]["path"]] = record["shard"]
+    return payload
 
 
 def completion_facts(row_id: str, payload: bytes) -> Mapping[str, object]:
@@ -322,17 +320,21 @@ def completion_facts(row_id: str, payload: bytes) -> Mapping[str, object]:
     }
 
 
-def seal_facts(segments: Sequence[Mapping[str, object]], payloads: Sequence[bytes]) -> Mapping[str, object]:
-    """What a cache writer's seal commits of its `segments`, `payloads` their bytes in order: their
-    count, the hash chain over them and the first and last input they complete. The writer seals
-    by it (`cache._Writer.seal`) and a reader checks a seal against it (`_sealed`)."""
+def seal_facts(segments: Sequence[Mapping[str, object]], payloads: Iterable[bytes]) -> Mapping[str, object]:
+    """What a cache writer's seal commits of its `segments`, `payloads` their bytes in order, each
+    folded in as it comes: their count, the hash chain over them and the first and last input they
+    complete. The writer seals by it (`cache._Writer.seal`) and a reader checks a seal against it
+    (`_sealed`)."""
     chain = b""
-    rows: list[object] = []
+    first = last = None
     for payload in payloads:
         chain = hashlib.sha256(chain + payload).digest()
-        rows.extend(completion["id"] for completion in json.loads(payload)["completions"])
-    return {"count": len(segments), "segments": list(segments), "first": rows[0] if rows else None,
-            "last": rows[-1] if rows else None, "sha256": chain.hex()}
+        completed = json.loads(payload)["completions"]
+        if completed:
+            first = completed[0]["id"] if first is None else first
+            last = completed[-1]["id"]
+    return {"count": len(segments), "segments": list(segments), "first": first, "last": last,
+            "sha256": chain.hex()}
 
 
 def _completion(entry: Mapping[str, object], encoded: Batch | bytes | None) -> None:
@@ -387,6 +389,14 @@ class Generation:
     committed: Mapping[str, object] | None = field(default=None, compare=False, hash=False, repr=False)
     """The size and digest its cache committed its manifest under (`Cache.generation`), which the one
     read of the manifest is checked against."""
+
+    @classmethod
+    def named(cls, root: Store, current: Mapping[str, object],
+              storage_options: Mapping[str, object] | None) -> Generation:
+        """The generation a cache's CURRENT record `current` names under the cache's `root`, its
+        manifest checked, when read, against the size and digest CURRENT committed it under."""
+        return cls(root.child(f"generations/{current['generation']}").url, storage_options,
+                   committed={"bytes": current["bytes"], "sha256": current["sha256"]})
 
     def reference(self, manifest: DependencyManifest) -> str:
         return f"generation {self.url}"
@@ -446,7 +456,8 @@ class Generation:
         return opened
 
     def __getstate__(self) -> Mapping[str, object]:
-        return {"url": self.url, "storage_options": self.storage_options, "_definition": self._definition}
+        return {"url": self.url, "storage_options": self.storage_options, "_definition": self._definition,
+                "committed": self.committed}
 
     def source(self) -> Source:
         return _GenerationSource(self)
