@@ -59,7 +59,7 @@ def _parse_absl_flags() -> None:
 
 _parse_absl_flags()
 
-if TYPE_CHECKING:  # the surface above, with its types, for checkers and editors
+if TYPE_CHECKING:  # written from _EXPORTS (tools/gen_exports.py)
     from dew.artifacts import ImageGrid, Representations, TextSamples, TokenScores, VideoGrid
     from dew.data import Dataset
     from dew.diffusion import Process
@@ -97,8 +97,8 @@ __version__ = "0.1.0"
 _EXPORTS = {
     "Best": "dew.training", "Keep": "dew.training", "Plateau": "dew.training", "EvalSuite": "dew.training",
     "Observe": "dew.training",
-    "Trainer": "dew.training", "TrainState": "dew.training", "Step": "dew.training",
-    "Aux": "dew.training", "EMASpec": "dew.training", "MeshSpec": "dew.training",
+    "Trainer": "dew.training", "TrainState": "dew.training", "Step": "dew.objectives.base",
+    "Aux": "dew.objectives.base", "EMASpec": "dew.objectives.base", "MeshSpec": "dew.training",
     "Layout": "dew.training", "Checkpoints": "dew.training", "Tracker": "dew.training",
     "WandbTracker": "dew.training", "LocalTracker": "dew.training", "Trackers": "dew.training",
     "MLflowTracker": "dew.training", "TensorBoardTracker": "dew.training",
@@ -129,9 +129,9 @@ def __dir__() -> list[str]:
     return list(__all__)
 
 
-# Written out, not derived from _EXPORTS, so a type checker, an editor and
-# `from dew import *` can all read the public surface without running the
-# lazy lookup above.
+# Written from _EXPORTS (tools/gen_exports.py), so a type checker, an editor
+# and `from dew import *` can all read the public surface without running
+# the lazy lookup above.
 __all__ = [
     "CFG",
     "Aux",
