@@ -58,15 +58,10 @@ BLOCK_AFTER = 5
 RECORDS = worker.BATCH * 16
 
 
-def dumped_params(out: Path) -> dict:
-    """The parameter leaves a worker wrote next to its report."""
-    with np.load(out.with_suffix(".npz")) as dump:
-        return {name: dump[name] for name in dump.files}
-
-
-def updates_of(out: Path) -> dict:
-    """The per-parameter update a worker's step took, next to its report."""
-    with np.load(out.with_suffix(".update.npz")) as dump:
+def dumped_params(out: Path, suffix: str = ".npz") -> dict:
+    """The parameter leaves a worker wrote next to its report, or, at suffix ".update.npz", the
+    per-parameter update its step took."""
+    with np.load(out.with_suffix(suffix)) as dump:
         return {name: dump[name] for name in dump.files}
 
 
@@ -1091,8 +1086,8 @@ def test_a_pool_agrees_one_validity_schema_when_only_some_ranks_padded(tmp_path)
                            dumped_params(tmp_path / "single.json"))
 
     # The gradient itself, normalized by its own scale.
-    pooled = updates_of(tmp_path / "pool" / "process0.json")
-    reference = updates_of(tmp_path / "single.json")
+    pooled = dumped_params(tmp_path / "pool" / "process0.json", ".update.npz")
+    reference = dumped_params(tmp_path / "single.json", ".update.npz")
     scale = max(float(np.max(np.abs(leaf))) for leaf in reference.values())
     assert scale == pytest.approx(single["update_scale"]) and scale > 1e-3
     assert relative_difference(pooled, reference) < 1e-4

@@ -94,6 +94,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import lint_scopes as scopes
 import lint_tolerances as tolerance_rules
+from forked import forked_map
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -2063,11 +2064,12 @@ def recorded(checkout: Path, relative: str, path: Path) -> bool:
     return capture["meta"]["script_sha256"] == hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def collect(roots: Sequence[str], checkout: Path = ROOT, package: str = "dew") -> Iterator[Module]:
+def files(roots: Sequence[str], checkout: Path = ROOT) -> Iterator[tuple[Path, str]]:
     """Every Python file under the named roots of `checkout`, or the root
-    itself when it names a file, skipping stub-only trees, the site's
-    installed npm packages (node-gyp ships Python) and a file whose bytes
-    are still those a recording pins (`RECORDED`)."""
+    itself when it names a file, with its path from the checkout, skipping
+    stub-only trees, the site's installed npm packages (node-gyp ships
+    Python) and a file whose bytes are still those a recording pins
+    (`RECORDED`)."""
     for root in roots:
         named = checkout / root
         for path in [named] if named.is_file() else sorted(named.rglob("*.py")):
@@ -2076,7 +2078,27 @@ def collect(roots: Sequence[str], checkout: Path = ROOT, package: str = "dew") -
                 continue
             if recorded(checkout, relative, path):
                 continue
-            yield Module(path, relative, path.read_text(), ast.parse(path.read_text()), package)
+            yield path, relative
+
+
+def parsed(path: Path, relative: str, package: str = "dew") -> Module:
+    return Module(path, relative, path.read_text(), ast.parse(path.read_text()), package)
+
+
+def collect(roots: Sequence[str], checkout: Path = ROOT, package: str = "dew") -> Iterator[Module]:
+    """Every file `files` names, parsed."""
+    for path, relative in files(roots, checkout):
+        yield parsed(path, relative, package)
+
+
+INDEX: ModelIndex | None = None
+"""The model index `checked` reads: built once by `main`, before any fork, and inherited, never sent."""
+
+
+def checked(file: tuple[Path, str, str]) -> list[Finding]:
+    """One file's findings, against the model index `main` built (`INDEX`)."""
+    assert INDEX is not None, "main builds the index before it reads a file"
+    return list(check(parsed(*file), INDEX))
 
 
 def default_roots(package: str) -> list[str]:
@@ -2085,7 +2107,10 @@ def default_roots(package: str) -> list[str]:
     return [f"src/{package}", "tests", "tools", "recipes", "examples", "site", "docs/assets", "kernels"]
 
 
-def main(argv: Sequence[str] | None = None) -> int:
+def main(argv: Sequence[str] | None = None, forked: bool = False) -> int:
+    """The gate, its files read in forked processes when `forked` (`forked_map`), as the script reads them,
+    its findings printed in the files' order, as one process prints them. A caller in a process that may
+    hold threads (a test, under JAX) reads them in its own process."""
     parser = argparse.ArgumentParser(description="Report low-evidence Python, `path:line:col: SLOPxxx`.")
     parser.add_argument("roots", nargs="*", help="directories or files under the checkout; by default the "
                         "package's source, tests, tools, recipes, examples, site, docs/assets and kernels")
@@ -2109,27 +2134,28 @@ def main(argv: Sequence[str] | None = None) -> int:
         return 0
     roots = args.roots or default_roots(args.package)
     counts: dict[str, int] = {}
-    files: dict[str, set[str]] = {}
-    models = ModelIndex.build(list(collect([f"src/{args.package}"], args.root.resolve(), args.package)))
-    seen = set()
-    for module in collect(roots, args.root.resolve(), args.package):
-        seen.add(module.relative)
-        for finding in check(module, models):
-            print(finding)
-            counts[finding.code] = counts.get(finding.code, 0) + 1
-            files.setdefault(finding.code, set()).add(finding.path)
+    coded: dict[str, set[str]] = {}
+    global INDEX
+    INDEX = ModelIndex.build(list(collect([f"src/{args.package}"], args.root.resolve(), args.package)))
+    read = [(path, relative, args.package) for path, relative in files(roots, args.root.resolve())]
+    seen = {relative for _, relative, _ in read}
+    found = forked_map(checked, read) if forked else [checked(file) for file in read]
+    for finding in (finding for each in found for finding in each):
+        print(finding)
+        counts[finding.code] = counts.get(finding.code, 0) + 1
+        coded.setdefault(finding.code, set()).add(finding.path)
     if not args.roots:
         # Every file the inventory names is read on a whole run, so one it names that is gone is stale.
         for relative in sorted(set(_inventory(args.root.resolve()).get("files", {})) - seen):
             print(Finding(INVENTORY, 1, 1, "SLOP020", f"names {relative}, which is gone: remove its entry"))
             counts["SLOP020"] = counts.get("SLOP020", 0) + 1
-            files.setdefault("SLOP020", set()).add(INVENTORY)
+            coded.setdefault("SLOP020", set()).add(INVENTORY)
     for code, count in sorted(counts.items()):
-        print(f"{code}: {count} in {len(files[code])} files", file=sys.stderr)
+        print(f"{code}: {count} in {len(coded[code])} files", file=sys.stderr)
     failures = sum(counts.values())
     print(f"{failures} findings", file=sys.stderr)
     return 1 if failures else 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main(forked=True))
