@@ -284,3 +284,107 @@ def transition(key, w, u, gc, last, kept, issue: Issue = portable):
     dk = key.shape[-1]
     diagonal = jnp.eye(dk, dtype=gc.dtype) * jnp.swapaxes(jnp.exp(gc[..., -1:, :]), -1, -2) * kept
     return diagonal - issue("corrected", decayed, w), issue("write", decayed, u)
+
+
+# A chunk's tiles. The functions below are the same algebra on one chunk of one head, as a mainloop's
+# program holds it: sub-chunks of SUB rows and column blocks, each operand a tile or a `Load`, which a
+# GPU mainloop reads from memory where it is used and the portable mainloop slices. Every mainloop calls
+# them as they are, so two mainloops at the same tiles compute the same values.
+
+SUB = 16
+"""Rows of a sub-chunk: the diagonal blocks the triangular inverse is built from (fla's BC)."""
+
+Load = Callable[..., jax.Array]
+"""A tile read where it is used: `load(i, c)` sub-chunk `i`'s column block `c`, or `load(c)` a chunk's."""
+
+
+def apart(rows, rows_lo, columns, columns_lo):
+    """A compensated prefix's difference between positions, `rows - columns` `[R, C]` from each side's
+    `(hi, lo)` halves (`recurrence.cumulated(compensated=True)`): the his' difference and the los', so
+    the exponent is as precise as its own range."""
+    return (rows[:, None] - columns[None, :]) + (rows_lo[:, None] - columns_lo[None, :])
+
+
+def tril_inverse(diagonal, index):
+    """`(I + D)^-1` of a strictly lower square block `D`, row by row: forward substitution. `index` is
+    the block's `arange` of rows, which the caller's other masks share."""
+    sub = diagonal.shape[0]
+    inverse = -diagonal
+    for i in range(2, sub):
+        row = jnp.sum(jnp.where((index == i)[:, None], -diagonal, 0.0), axis=0)
+        row = jnp.where(index < i, row, 0.0)
+        row = row + jnp.sum(row[:, None] * inverse, axis=0)
+        inverse = jnp.where((index == i)[:, None], row[None, :], inverse)
+    return inverse + (index[:, None] == index[None, :])
+
+
+def solved(keys: Load, gates, lows, betas, columns: int, issue: Issue) -> dict:
+    """`(I + A)^-1`'s blocks `{(i, j): [SUB, SUB]}` for `j <= i` of one chunk's `A = tril(beta_s (k_s .
+    k_t) exp2(g_s - g_t), -1)`, a decay a head: `keys(i, c)` sub-chunk `i`'s key column block `c` of
+    `columns`, `gates`, `lows` and `betas` each sub-chunk's prefix halves and write gates, fp32. Every
+    block of `k k^T` sums its column blocks' products ('intra'); forward substitution inverts each
+    diagonal block (`tril_inverse`), and neighbouring inverses merge as `X_ij = -X_ii sum_m A_im X_mj`
+    ('merge'), nearest the diagonal first."""
+    count = len(gates)
+    index = jnp.arange(gates[0].shape[0])
+    strict = index[:, None] > index[None, :]
+
+    def block(i, j):
+        product = sum(issue("intra", keys(i, c), keys(j, c).T) for c in range(columns))
+        decay = jnp.exp2(apart(gates[i], lows[i], gates[j], lows[j]))
+        product = product * (jnp.where(strict, decay, 0.0) if i == j else decay)
+        return product * betas[i][:, None]
+
+    blocks = {(i, j): block(i, j) for i in range(count) for j in range(i + 1)}
+    inverse = {(i, i): tril_inverse(blocks[i, i], index) for i in range(count)}
+    for distance in range(1, count):
+        for i in range(distance, count):
+            j = i - distance
+            inner = sum(issue("merge", blocks[i, m], inverse[m, j]) for m in range(j, i))
+            inverse[i, j] = -issue("merge", inverse[i, i], inner)
+    return inverse
+
+
+def weighted(name: str, inverse, tile, beta, issue: Issue, decay=None):
+    """`inverse (tile beta [decay])`, the scaled operand rounded to `tile`'s dtype before the product:
+    'apply_u' on the values, 'apply_w' on the keys under their decay `exp2(g)`."""
+    scaled = tile * beta[:, None] if decay is None else tile * beta[:, None] * decay[:, None]
+    return issue(name, inverse, scaled.astype(tile.dtype))
+
+
+def corrected(values, weights: Load, state, dtype, issue: Issue):
+    """A chunk's corrected values `u - w S` `[C, BV]`, fp32: `values` its `u`, `weights(i)` its `w`'s
+    key slice `i` of the memory's (`state`, fp32), each slice cast to `w`'s `dtype` for its product."""
+    predicted = sum(issue("corrected", weights(i), part.astype(dtype)) for i, part in enumerate(state))
+    return values.astype(jnp.float32) - predicted
+
+
+def carried(state, keys: Load, values, decay, dtype, issue: Issue) -> list:
+    """The memory leaving a chunk, slice by key slice: `state[i] decay[i] + keys(i)^T values` ('write'),
+    the values cast to the keys' `dtype`; `decay[i]` scales each slice's rows `[K_i, 1]` or the whole."""
+    return [part * decay[i] + issue("write", keys(i).T, values.astype(dtype)) for i, part in enumerate(state)]
+
+
+def scalar_write(corrected_values, last, gate, last_lo, gate_lo):
+    """A decay a head's write: the corrected values gated by `exp2(g_last - g)` over both halves, and the
+    memory's decay `exp2(g_last)`."""
+    gated = corrected_values * jnp.exp2((last - gate) + (last_lo - gate_lo))[:, None]
+    return gated, jnp.exp2(last)
+
+
+def chunk_output(queries: Load, entered: Load, keys: Load, columns: int, gate, low, value, scale: float,
+                 issue: Issue):
+    """A chunk's output `[C, BV]`, fp32, a decay a head: `scale ((q S) exp2(g) + tril((q k^T) exp2(g_s -
+    g_t)) v)`, the key column blocks `queries(c)`, `entered(c)` (the memory the chunk entered) and
+    `keys(c)` summed into fp32 ('memory', 'scores'), the scores cast to the values' dtype for 'local'."""
+    out = jnp.zeros((gate.shape[0], value.shape[-1]), jnp.float32)
+    scores = jnp.zeros((gate.shape[0], gate.shape[0]), jnp.float32)
+    for c in range(columns):
+        query = queries(c)
+        out += issue("memory", query, entered(c))
+        scores += issue("scores", query, keys(c).T)
+    out = out * jnp.exp2(gate)[:, None]
+    scores = scores * jnp.exp2(apart(gate, low, gate, low))
+    index = jnp.arange(gate.shape[0])
+    scores = jnp.where(index[:, None] >= index[None, :], scores, 0.0)
+    return out * scale + issue("local", scores.astype(value.dtype), value) * scale

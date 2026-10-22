@@ -30,13 +30,12 @@ import jax.numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
 from jax.experimental import pallas as pl
 
-from dew.nn.kernels import recurrence
+from dew.nn.kernels import recurrence, recurrence_algebra as algebra
 from dew.nn.kernels.chunked_launch import (
     _CHUNK,
     Sequences,
     Tiles,
     _aligned,
-    _apart,
     _chunk_of,
     _flat,
     _gates,
@@ -87,8 +86,8 @@ def _weighted_values(v_ref, u_ref, beta, inverse, start, taken, *, chunk: int, b
     for block in range(v_ref.shape[-1] // bv):
         columns = pl.ds(block * bv, bv)
         value = read_rows(_rows(v_ref, start, chunk, columns), taken)
-        scaled = (value * beta[:, None]).astype(value.dtype)
-        write_rows(_rows(u_ref, start, chunk, columns), taken, _dot(inverse, scaled, exact=exact, ieee=ieee))
+        write_rows(_rows(u_ref, start, chunk, columns), taken,
+                   algebra.weighted("apply_u", inverse, value, beta, _issuer(exact, ieee=ieee)))
 
 
 def _dot(a, b, *, exact: bool, ieee: bool = False, solve: jnp.dtype | None = None):
@@ -127,18 +126,22 @@ def _dot(a, b, *, exact: bool, ieee: bool = False, solve: jnp.dtype | None = Non
     return jnp.dot(a, b, preferred_element_type=jnp.float32, precision=precision)
 
 
-def _tril_inverse(diagonal, index):
-    """`(I + D)^-1` of a strictly lower square block `D`, row by row: fla's forward substitution
-    (chunk_fwd.py's solve, chunk_intra.py's for Kimi's delta attention). `index` is the block's
-    `arange` of rows, which the caller's other masks share."""
-    sub = diagonal.shape[0]
-    inverse = -diagonal
-    for i in range(2, sub):
-        row = jnp.sum(jnp.where((index == i)[:, None], -diagonal, 0.0), axis=0)
-        row = jnp.where(index < i, row, 0.0)
-        row = row + jnp.sum(row[:, None] * inverse, axis=0)
-        inverse = jnp.where((index == i)[:, None], row[None, :], inverse)
-    return inverse + (index[:, None] == index[None, :])
+IEEE = frozenset({"apply_u", "memory", "scores", "local"})
+"""The algebra's products the port takes at IEEE fp32 (`_dot`'s `ieee`): fla's `allow_tf32=False` dot of
+`A` with the values, and the output's, which reads its products directly."""
+
+
+def _issuer(exact: bool, solve: jnp.dtype | None = None, *, ieee: bool | None = None):
+    """The port's products by the algebra's names (`recurrence_algebra.PRODUCTS`), each at `_dot`'s
+    precision: the IEEE ones (`IEEE`, or all of them where `ieee` says so) at IEEE fp32, 'merge' at the
+    call's `solve` precision, the rest at the operands' own."""
+    def issue(name, a, b):
+        wide = name in IEEE if ieee is None else ieee
+        return _dot(a, b, exact=exact, ieee=wide, solve=solve if name == "merge" else None)
+    return issue
+
+
+_tril_inverse = algebra.tril_inverse
 
 
 def _kkt_solve_kernel(chunk_ref, k_ref, g_ref, gl_ref, beta_ref, a_ref, *, chunk: int, aligned: bool,
@@ -160,7 +163,6 @@ def _kkt_solve_kernel(chunk_ref, k_ref, g_ref, gl_ref, beta_ref, a_ref, *, chunk
 def _kkt_solve_chunk(k_ref, g_ref, gl_ref, beta_ref, a_ref, start, taken, *, chunk: int, sub: int, bk: int,
                      exact: bool):
     # Triton lowers no slice of a loaded value, so every block is loaded from its ref.
-    width = k_ref.shape[-1]
     count = chunk // sub
 
     def part(ref, i, *rest):
@@ -169,29 +171,8 @@ def _kkt_solve_chunk(k_ref, g_ref, gl_ref, beta_ref, a_ref, start, taken, *, chu
     gates = [_gates(g_ref, start, taken, sub, i * sub) for i in range(count)]
     lows = [_gates(gl_ref, start, taken, sub, i * sub) for i in range(count)]
     betas = [part(beta_ref, i).astype(jnp.float32) for i in range(count)]
-    index = jnp.arange(sub)
-    strict = index[:, None] > index[None, :]
-
-    def keys(i, c):
-        return part(k_ref, i, pl.ds(c * bk, bk))
-
-    def block(i, j):
-        """`A`'s block (i, j), i >= j: the keys' products, gated and scaled by beta."""
-        product = sum(_dot(keys(i, c), keys(j, c).T, exact=exact) for c in range(width // bk))
-        decay = jnp.exp2(_apart(gates[i], lows[i], gates[j], lows[j]))
-        product = product * (jnp.where(strict, decay, 0.0) if i == j else decay)
-        return product * betas[i][:, None]
-
-    blocks = {(i, j): block(i, j) for i in range(count) for j in range(i + 1)}
-
-    inverse = {(i, i): _tril_inverse(blocks[i, i], index) for i in range(count)}
-    for distance in range(1, count):
-        for i in range(distance, count):
-            j = i - distance
-            # X_ij = -X_ii (sum over j <= m < i of A_im X_mj), fla's merge order.
-            inner = sum(_dot(blocks[i, m], inverse[m, j], exact=exact, solve=k_ref.dtype)
-                        for m in range(j, i))
-            inverse[i, j] = -_dot(inverse[i, i], inner, exact=exact, solve=k_ref.dtype)
+    inverse = algebra.solved(lambda i, c: part(k_ref, i, pl.ds(c * bk, bk)), gates, lows, betas,
+                             k_ref.shape[-1] // bk, _issuer(exact, k_ref.dtype))
     # fla zero-fills A before its kernel stores the lower blocks; here the blocks above are stored as zeros.
     for i in range(count):
         for j in range(count):
@@ -270,9 +251,7 @@ def _w_u_kernel(chunk_ref, k_ref, v_ref, beta_ref, a_ref, g_ref, w_ref, u_ref, *
         decay = jnp.exp2(_gates(g_ref, start, taken, chunk))
         for block in range(k_ref.shape[-1] // bk):
             columns = pl.ds(block * bk, bk)
-            key = read(k_ref, columns)
-            scaled = key * beta[:, None] * decay[:, None]
-            product = _dot(inverse, scaled.astype(key.dtype), exact=exact)
+            product = algebra.weighted("apply_w", inverse, read(k_ref, columns), beta, _issuer(exact), decay)
             write_rows(_rows(w_ref, start, chunk, columns), taken, product)
 
 
@@ -363,23 +342,23 @@ def _h_kernel(span_ref, k_ref, u_ref, w_ref, g_ref, gl_ref, h0_ref, h_ref, corre
             slot = jnp.where(n > 0, base + n, entered)
             for i in range(slices):
                 h_ref[slot, pl.ds(i * 64, 64), :] = state[i].astype(h_ref.dtype)
-            predicted = sum(_dot(read(w_ref, pl.ds(i * 64, 64)), state[i].astype(w_ref.dtype), exact=exact)
-                            for i in range(slices))
-            corrected = read(u_ref).astype(jnp.float32) - predicted
+            issue = _issuer(exact)
+            corrected = algebra.corrected(read(u_ref), lambda i: read(w_ref, pl.ds(i * 64, 64)), state,
+                                          w_ref.dtype, issue)
             write_rows(_rows(corrected_ref, begin, chunk), taken, corrected)
             final = begin + taken - 1
 
-            def written(i, values):
-                return _dot(read(k_ref, pl.ds(i * 64, 64)).T, values.astype(k_ref.dtype), exact=exact)
+            def keys(i):
+                return read(k_ref, pl.ds(i * 64, 64))
 
             if per_key:
-                return [state[i] * jnp.exp2(g_ref[final, pl.ds(i * 64, 64)].astype(jnp.float32))[:, None]
-                        + written(i, corrected) for i in range(slices)]
-            last = _row(g_ref, final)
-            gate = _gates(g_ref, begin, taken, chunk)
-            apart = (last - gate) + (_row(gl_ref, final) - _gates(gl_ref, begin, taken, chunk))
-            gated = corrected * jnp.exp2(apart)[:, None]
-            return [state[i] * jnp.exp2(last) + written(i, gated) for i in range(slices)]
+                decay = [jnp.exp2(g_ref[final, pl.ds(i * 64, 64)].astype(jnp.float32))[:, None]
+                         for i in range(slices)]
+                return algebra.carried(state, keys, corrected, decay, k_ref.dtype, issue)
+            gated, decay = algebra.scalar_write(corrected, _row(g_ref, final),
+                                                _gates(g_ref, begin, taken, chunk), _row(gl_ref, final),
+                                                _gates(gl_ref, begin, taken, chunk))
+            return algebra.carried(state, keys, gated, [decay] * slices, k_ref.dtype, issue)
 
         state = jax.lax.fori_loop(0, -(-count // chunk), step, state)
 
@@ -1046,21 +1025,13 @@ def _o_kernel(chunk_ref, q_ref, k_ref, v_ref, h_ref, g_ref, gl_ref, o_ref, *, ch
         def read(ref, *rest):
             return read_rows(_rows(ref, start, chunk, *rest), taken)
 
-        out = jnp.zeros((chunk, v_ref.shape[-1]), jnp.float32)
-        scores = jnp.zeros((chunk, chunk), jnp.float32)
-        for block in range(q_ref.shape[-1] // bk):
-            columns = pl.ds(block * bk, bk)
-            query = read(q_ref, columns)
-            out += _dot(query, h_ref[entered, columns, :], exact=exact, ieee=True)
-            scores += _dot(query, read(k_ref, columns).T, exact=exact, ieee=True)
-        gate = _gates(g_ref, start, taken, chunk)
-        low = _gates(gl_ref, start, taken, chunk)
-        out = out * jnp.exp2(gate)[:, None]
-        scores = scores * jnp.exp2(_apart(gate, low, gate, low))
-        index = jnp.arange(chunk)
-        scores = jnp.where(index[:, None] >= index[None, :], scores, 0.0)
-        value = read(v_ref)
-        out = out * scale + _dot(scores.astype(value.dtype), value, exact=exact, ieee=True) * scale
+        def columns(c):
+            return pl.ds(c * bk, bk)
+
+        out = algebra.chunk_output(lambda c: read(q_ref, columns(c)), lambda c: h_ref[entered, columns(c), :],
+                                   lambda c: read(k_ref, columns(c)), q_ref.shape[-1] // bk,
+                                   _gates(g_ref, start, taken, chunk), _gates(gl_ref, start, taken, chunk),
+                                   read(v_ref), scale, _issuer(exact))
         write_rows(_rows(o_ref, start, chunk), taken, out)
 
 
