@@ -111,10 +111,11 @@ def prepared_inputs(processor: Processor | None, request: Request, *, images: Me
     if isinstance(request, ModelInputs):
         return ModelInputs.from_value(request)
     if isinstance(request, Sequence):
-        if any(isinstance(row, str) for row in request):
+        rows = [row for row in request if not isinstance(row, str)]
+        if len(rows) != len(request):
             raise ValueError("a request cannot mix text prompts and numeric token rows")
         # ModelInputs reads the rows by `dew.nn.inputs.token_id`'s law.
-        return ModelInputs.from_value(request)
+        return ModelInputs.from_value(rows)
     # A resident array stays where it is; a global one cannot be fetched.
     return ModelInputs.from_value(request)
 
