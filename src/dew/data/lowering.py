@@ -1611,15 +1611,19 @@ def _epoch_records(train: Pipeline, build: _Build) -> int | None:
         with _closing(build.records(pipeline, DataPartition())) as rows:
             return len(rows) if isinstance(rows, pygrain.MapDataset) else None
 
-    def covered(pipeline: Pipeline, build: _Build) -> int | None:
-        """The records of `pipeline` read on past its end in which every part comes round once. A
-        view a slice or a limit bounds comes round once its bounded records are read: those the
-        first repeat after its last bound reads, or the bounded order itself where none follows."""
+    def viewed(pipeline: Pipeline) -> int | None:
+        """Where the first repeat after the last slice or limit of `pipeline` reads the view they
+        bound, past its stages where none follows; None where nothing bounds it."""
         stages = pipeline.stages
         bounds = [at for at, stage in enumerate(stages) if _bounds(stage)]
-        if bounds:
-            after = [at for at, stage in enumerate(stages) if at > bounds[-1] and isinstance(stage, Repeat)]
-            return held(dataclasses.replace(pipeline, stages=stages[: after[0]] if after else stages), build)
+        if not bounds:
+            return None
+        return next((at for at, stage in enumerate(stages) if at > bounds[-1] and isinstance(stage, Repeat)),
+                    len(stages))
+
+    def covering(pipeline: Pipeline, build: _Build) -> int | None:
+        """The records of `pipeline` in which every part it mixes, read on past its end, comes round
+        once (`covered`); a corpus's pass."""
         source = pipeline.source
         if not isinstance(source, Mixture):
             return passed(pipeline, build)
@@ -1629,6 +1633,15 @@ def _epoch_records(train: Pipeline, build: _Build) -> int | None:
             return None
         return Proportions.of(_weights(source)).covering(known)
 
+    def covered(pipeline: Pipeline, build: _Build) -> int | None:
+        """The records of a part a mix reads on past its end in which it comes round once: a view a
+        slice or a limit bounds once its bounded records are read, those the first repeat after its
+        last bound reads or the bounded order itself where none follows; else its `covering`."""
+        at = viewed(pipeline)
+        if at is None:
+            return covering(pipeline, build)
+        return held(dataclasses.replace(pipeline, stages=pipeline.stages[:at]), build)
+
     repeated, batched = _until(train.stages, (Repeat,)), _until(train.stages, (BatchStage, TokenBudget))
     order = dataclasses.replace(train, stages=train.stages[:batched])
     # Read on past its end: by a repeat without a count, or as a mix of parts that never end.
@@ -1637,7 +1650,13 @@ def _epoch_records(train: Pipeline, build: _Build) -> int | None:
         isinstance(source, Mixture) and all(_unending(child) for child in source.pipelines))
     # A training order that repeats nowhere repeats for ever at its root (`_Build.batched`).
     rooted = build.training and build.lowering.endless and not build.lowering.repeated
-    count = covered(train, build) if onward or rooted else passed(train, build)
+    if onward or rooted:
+        # A view the order's repeat reads is its epoch; a bound after its last repeat ends the order.
+        at = viewed(order)
+        count = (covering(train, build) if at is None or at == len(order.stages)
+                 else held(dataclasses.replace(order, stages=order.stages[:at]), build))
+    else:
+        count = passed(train, build)
     if count is None or rooted or _unending(order) or (not onward and repeated >= batched):
         return count
     # An order that ends holds no more than it reads before its batch, whatever bounds it after its repeat.
