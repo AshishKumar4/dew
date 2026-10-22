@@ -253,7 +253,8 @@ def row_mix(sources: dict[str, float], *, read: str = "memory", seed: int = 0) -
 def test_a_weighted_mixture_of_two_datasets_holds_each_share_of_every_batch(two_splits):
     big, small = two_splits
     data = row_mix({big: 0.75, small: 0.25})
-    assert data.records == 54 and data.batch == 4 and data.steps_per_epoch == 13
+    # An epoch is the fewest records in which the big split's 40 are read, three in every four: 53.
+    assert data.records == 53 and data.batch == 4 and data.steps_per_epoch == 13
     stream = data.train(DataPartition())
     try:
         batches = taken(stream, 6)
@@ -511,12 +512,14 @@ def test_a_packed_stream_asks_each_corpus_its_position_only_after_the_corpus_rea
 
 
 def test_a_weighted_packed_pass_counts_and_scores_every_corpus(tmp_path):
-    """The pass is the windows in which every corpus has been read once, and
+    """The pass is the fewest windows in which every corpus has been read once, and
     the validation pass reads each held-out window at most once."""
     stores, first, second = weighted_packed(tmp_path, (1.0, 1.0))
     loaded = trained(mixed_packed(stores), batch=2)
     alone = [trained(ordered(packed(url)), batch=2).records for url in (first, second)]
-    assert loaded.records == 2 * max(alone)
+    # At even weights the mix reads its corpora in turn from the first, the larger, whose last
+    # window is the mix's 2 * 20 - 1th.
+    assert alone[0] == max(alone) and loaded.records == 2 * max(alone) - 1
     passed = held(mix([packed(url) for url in stores], weights=list(stores.values()), by="tokens").batch(2)
                   .read("memory").loading(READ))
     scored = [row for batch in passed(DataPartition()) for row in windows_of([batch])[0]]
@@ -1307,9 +1310,9 @@ def test_an_epoch_of_repeated_corpora_ends_where_grains_mix_has_read_every_one_o
 
 
 def test_an_epoch_of_a_mix_of_corpora_written_without_repeats_reads_every_corpus_whole():
-    """A run's mix of corpora written without repeats reads, in an epoch, every record of the corpus it
-    ends on once and every record of the others: the slow corpus's tail is read, not skipped by the
-    mix starting over at its shortest corpus's end."""
+    """A run's mix of corpora written without repeats reads, in an epoch's records, every record of
+    the corpus it ends on once and every record of the others: the slow corpus's tail is read, not
+    skipped by the mix starting over at its shortest corpus's end."""
     from dew.data.compile import fitted
     from dew.data.pipeline import ObjectiveData
 
@@ -1317,7 +1320,8 @@ def test_an_epoch_of_a_mix_of_corpora_written_without_repeats_reads_every_corpus
                for tag, size in ((1, 40), (2, 200))]
     data, _ = fitted(mix(corpora, weights=(1, 10)).batch(4).read("memory").workers(0), None,
                      objective=ObjectiveData())
-    values = [value for step in taken(data.train(DataPartition()), data.steps_per_epoch) for value in step]
+    steps = -(-data.records // 4)
+    values = [value for step in taken(data.train(DataPartition()), steps) for value in step][: data.records]
     slow = sorted(value for value in values if value // 1000 == 1)
     assert slow == [1000 + index for index in range(40)]
     assert {value for value in values if value // 1000 == 2} == {2000 + index for index in range(200)}
