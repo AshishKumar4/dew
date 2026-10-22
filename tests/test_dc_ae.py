@@ -149,9 +149,9 @@ def test_a_latent_run_trains_behind_the_dc_ae_and_leaves_it_frozen(source):
     (a bare `proj_out`) left the run unable to place its variables."""
     import optax
     from diffusion_stubs import STUB_TEXT
+    from diffusion_support import images_of
 
     from dew.config import ModelConfig, ObjectiveConfig, TrainerConfig
-    from dew.config.data import ImageData
     from dew.data.dataset import Loader
     from dew.objectives.diffusion import DiffusionRunConfig, PretrainedAutoencoder, TextCondition
     from dew.sampling import Euler
@@ -163,8 +163,8 @@ def test_a_latent_run_trains_behind_the_dc_ae_and_leaves_it_frozen(source):
             {"patch_size": 1, "emb_features": 16, "num_layers": 1, "num_heads": 2, "mlp_ratio": 1,
              "dtype": "float32", "attention_impl": "reference"},
         ),
-        data=ImageData(source="tfds://oxford_flowers102", image_size=16),
-        trainer=TrainerConfig(batch_size=8, steps=2),
+        data=images_of("tfds://oxford_flowers102", 16, batch=8),
+        trainer=TrainerConfig(steps=2),
         text=TextCondition(encoder=STUB_TEXT, checkpoint="stub-clip"),
         autoencoder=PretrainedAutoencoder(modelname=str(source / "conv"), dtype="float32"),
         objective=ObjectiveConfig("diffusion", {"solver": Euler(), "steps": 2}),

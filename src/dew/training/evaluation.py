@@ -27,6 +27,7 @@ from dew.coordination import (
     from_every_process,
 )
 from dew.data.dataset import Closeable, DataPartition, Reader, rows_of
+from dew.data.pipeline import Dataset
 from dew.objectives.base import (
     VALID_ROWS,
     Batch,
@@ -90,7 +91,7 @@ class Evaluation:
 
     @classmethod
     def run(cls, objective: Objective[Loss, Effects], variables: Variables,
-            batches: Reader | None, *,
+            batches: Reader | Dataset | None, *,
             key: int | jax.Array, metrics: Sequence[Metric] = (),
             step: int | jax.Array = 0, averaged: Variables | None = None,
             preview: bool = False, mesh: Mesh | None = None, split: str = "val",
@@ -102,7 +103,9 @@ class Evaluation:
         Every process calls this with the same objective, metrics and numerical
         settings. `batches` is called with this process's share of the split
         (`DataPartition.of(mesh)`) and returns a fresh iterator, which this call
-        opens and closes; you can pass `Loader.val` directly. Every batch holds
+        opens and closes; you can pass `Loader.val` directly, or a chain
+        (`Dataset`), which compiles here with the objective's own evaluation
+        stages and reads in its own batches (`dew.data.compile.held`). Every batch holds
         `VALID_ROWS` (all True when the reader marked none), and the objective's loss
         and the metrics count only the real rows. A process whose share runs out
         before the others' scores a copy of its last batch in which every row is a
@@ -135,8 +138,11 @@ class Evaluation:
         collective, and a device failure in flight still requires ending the
         distributed runtime.
         """
+        from dew.data.compile import held
         from dew.nn.inputs import request_key
         key = request_key(key)
+        if isinstance(batches, Dataset):
+            batches = held(batches, objective=objective.data())
         started = time.perf_counter()
         root = jax.process_index() == 0
         _agree_configuration(metrics, batches, split, loss=loss, training=training is not None, warm=warm)

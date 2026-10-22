@@ -32,6 +32,7 @@ if TYPE_CHECKING:
 
     from dew.data.dataset import Batch
     from dew.data.pipeline import Dataset
+    from dew.data.sources.base import Read
 
 
 _load_lock = threading.Lock()
@@ -316,7 +317,15 @@ class HFTokenizer:
         return f"{self.__class__.__name__}(name={self.name!r})"
 
 
-def tokenizer_name(tokenizer: str | PreTrainedTokenizerBase) -> str:
+@runtime_checkable
+class SavedTokenizer(Protocol):
+    """A tokenizer object Dew names by the files it saves (`tokenizer_name`), such as a transformers
+    tokenizer: a preset or a step given one reads it by that name."""
+
+    def save_pretrained(self, save_directory: str, /) -> tuple[str, ...]: ...
+
+
+def tokenizer_name(tokenizer: str | SavedTokenizer) -> str:
     """A tokenizer as the name Dew's steps carry: a name as it is, and a
     transformers tokenizer object saved once to a directory named for its
     files' hash, which every worker reads and every run hashes alike."""
@@ -346,7 +355,7 @@ def tokenizer_name(tokenizer: str | PreTrainedTokenizerBase) -> str:
     return str(directory)
 
 
-def tokenize(tokenizer: str | PreTrainedTokenizerBase = "byte", *, field: str = "text",
+def tokenize(tokenizer: str | SavedTokenizer = "byte", *, field: str = "text",
              eos: bool | None = None) -> Tokenize:
     """A record step that encodes the text in `field` to token ids under
     "text", each document ended by the tokenizer's EOS with `eos`, or where
@@ -364,6 +373,14 @@ class Tokenize(grain.MapTransform):
     tokenizer: str = "byte"
     field: str = "text"
     eos: bool | None = False
+
+    def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
+        """Token ids of each document's length under "text", by `tokenizer`, `vocab_size` of them."""
+        from dew.data.facts import unshaped
+
+        ended = self.eos if self.eos is not None else self.vocabulary.eos_id is not None
+        return {**unshaped(facts, self.field, "text"), "tokenizer": self.tokenizer,
+                "vocab_size": self.vocabulary.vocab_size, "eos_id": self.vocabulary.eos_id if ended else None}
 
     @functools.cached_property
     def vocabulary(self) -> ByteTokenizer | HFTokenizer:
@@ -401,6 +418,12 @@ class Chunks:
     _: dataclasses.KW_ONLY
     fields: tuple[str, ...] = ("text",)
     overlap: int = 0
+
+    def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
+        """Pieces of the documents, each of `fields` up to `length` long."""
+        from dew.data.facts import unshaped
+
+        return unshaped(facts, *self.fields)
 
     def __post_init__(self) -> None:
         if not 0 <= self.overlap < self.length:
@@ -461,6 +484,25 @@ class MinChars:
 
     def __call__(self, element: Batch) -> bool:
         return len(str(element[self.field])) >= self.count
+
+
+def export_tokens(dataset: Dataset, url: str, tokenizer: str, *, field: str = "text", eos: bool = True,
+                  rows_per_shard: int = 100_000, read: Read = "streamed", provision: bool = False
+                  ) -> Mapping[str, object]:
+    """`dataset`'s documents in `field` tokenized by `tokenizer` and written to `url` as a committed
+    token store (ArrayRecord shards, each record a document's ids under "text", its manifest naming
+    the tokenizer, vocabulary and EOS), which `dew.data.sources.TokenFiles(url)` reads back and
+    `presets.lm(ds, None, ...)` packs. Each document is ended by the tokenizer's EOS with `eos`.
+    Returns the store's manifest."""
+    from dew.data.compile import iterate
+    from dew.data.sinks import export
+
+    vocabulary = tokenizer_for(tokenizer)
+    documents = dataset.map(Tokenize(tokenizer, field, eos))
+    metadata = {"token_store": True, "tokenizer": tokenizer, "vocab_size": vocabulary.vocab_size,
+                "dtype": "int32", "eos_id": vocabulary.eos_id if eos else None}
+    return export(iterate(documents, read=read, provision=provision), url, format="array_record",
+                  rows_per_shard=rows_per_shard, metadata=metadata, length_field="text")
 
 
 def train_tokenizer(dataset: Dataset, base: str, path: str, *, vocab_size: int, field: str = "text",

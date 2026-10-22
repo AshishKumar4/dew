@@ -9,7 +9,7 @@ import grain.python as grain
 import numpy as np
 from absl import flags
 
-from dew.config.data import Augment
+from dew.data import images
 
 
 def parse_grain_flags() -> None:
@@ -22,7 +22,8 @@ def parse_grain_flags() -> None:
 CAPTION_TEMPLATES = ("a photo of a {}", "a photo of a {} flower", "This is a photo of a {}")
 """More than one, so a test can see which the record's rng drew."""
 
-FLIP_JITTER = Augment(flip=True, jitter=True, backend="host")
+FLIP_JITTER = (images.Flip(), images.ColorJitter())
+"""A flip and a colour jitter on the host, as `presets.images(augment=)` takes them."""
 
 
 def keep_captions(captions):
@@ -44,3 +45,13 @@ def listed(reader, count: int) -> list[dict[str, list]]:
     every field of every record rather than one of them."""
     return [{name: np.asarray(value).tolist() for name, value in batch.items()}
             for batch in itertools.islice(reader, count)]
+
+
+def record_batches(records, batch: int, validation=None, *, loading=None):
+    """`records` (rows or columns) as a run's batches of `batch`, read in memory, with `validation`'s
+    records as its held-out split, its last batch filled out and marked (`dew.data.compile.compile`)."""
+    from dew.data import Memory
+    from dew.data.compile import compile
+
+    held = None if validation is None else Memory(validation).batch(batch)
+    return compile(Memory(records).batch(batch), validation=held, read="memory", loading=loading)
