@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import contextlib
-import fcntl
 import functools
 import hashlib
 import io
@@ -34,7 +33,7 @@ from huggingface_hub.hf_file_system import HfFileSystemResolvedRepositoryPath
 from s3fs import S3FileSystem
 
 from dew.cache import dew_cache_dir
-from dew.data.retention import LocalRetention
+from dew.data.retention import LocalRetention, evictable, read_pin
 from dew.files import write_atomically
 from dew.records import JSON, json_value
 
@@ -76,6 +75,23 @@ def matching(found: ObjectInfo, expected: Mapping[str, object], url: str) -> Non
         raise OSError(f"committed object is corrupt: {url}; bytes={found['bytes']}, "
                       f"sha256={found['sha256']}, expected bytes={expected['bytes']}, "
                       f"sha256={expected['sha256']}")
+
+
+def commit_export(
+    root: Store, *, format: str, codec: int | None, rows: int, files: list[Mapping[str, object]],
+    metadata: Mapping[str, object] | None = None, certified: Mapping[str, JSON] | None = None,
+) -> Mapping[str, object]:
+    """Commit the manifest of an export at `root`, its `files` already written there: its schema,
+    format, record codec, rows, files and metadata, and what its producer `certified` of its rows (an
+    export its count rules and partitioning; a directory of existing ArrayRecord shards nothing);
+    then the success marker its digest names. An export (`dew.data.sinks.export`) and existing
+    shards provisioned in place (`Files.provision`) both commit through it."""
+    manifest = {"schema": 1, "format": format, "codec": codec, "rows": rows, **(certified or {}),
+                "files": files, "metadata": dict(metadata or {})}
+    encoded = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
+    root.child("_dew_manifest.json").put_if_absent(encoded)
+    root.child("_SUCCESS").put_if_absent(hashlib.sha256(encoded).hexdigest().encode())
+    return manifest
 
 
 class TransportStats(TypedDict):
@@ -226,8 +242,7 @@ class BoundedFileCache(WholeFileCacheFileSystem):
                     reservation.unlink(missing_ok=True)
 
     def _dew_pin(self, local: Path, started: float) -> _PinnedReader:
-        pin = local.with_name(local.name + ".pin").open("a+b")
-        fcntl.flock(pin.fileno(), fcntl.LOCK_SH)
+        pin = read_pin(local.with_name(local.name + ".pin"))
         os.utime(local, None)
         self._dew_wait += time.monotonic() - started
         return _PinnedReader(io.FileIO(str(local), "r"), pin)
@@ -236,14 +251,10 @@ class BoundedFileCache(WholeFileCacheFileSystem):
         previous = self._metadata.cached_files[-1].get(path)
         if previous is None:
             return True
-        pin_path = Path(self.storage[-1]) / (previous["fn"] + ".pin")
-        with pin_path.open("a+b") as pin:
-            try:
-                fcntl.flock(pin.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-            except BlockingIOError:
-                return False
-            self.pop_from_cache(path)
-        return True
+        with evictable(Path(self.storage[-1]) / (previous["fn"] + ".pin")) as free:
+            if free:
+                self.pop_from_cache(path)
+            return free
 
     def _dew_download(self, path: str, local: Path, size: int, version: str) -> None:
         descriptor, temporary = tempfile.mkstemp(dir=local.parent, prefix=".download-" + local.name + "-")
@@ -298,10 +309,8 @@ class BoundedFileCache(WholeFileCacheFileSystem):
         for _, path, local, size in sorted(candidates):
             if used + needed <= self._dew_max_bytes:
                 break
-            with (directory / (local.name + ".pin")).open("a+b") as pin:
-                try:
-                    fcntl.flock(pin.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except BlockingIOError:
+            with evictable(directory / (local.name + ".pin")) as free:
+                if not free:
                     continue
                 self.pop_from_cache(path)
                 used -= size

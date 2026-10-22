@@ -302,7 +302,7 @@ def _sealed(root: Store, pins: ExitStack) -> tuple[dict, dict]:
     return completions, shards
 
 
-def completion_facts(row_id: str, payload: bytes) -> dict[str, object]:
+def completion_facts(row_id: str, payload: bytes) -> Mapping[str, object]:
     """What a cache commits of one input's completion, `payload` its encoded outputs, besides where
     it is: the outputs it accepted, their ids, digests, lengths, targets and count rules, and the
     reasons it rejected the rest. The writer records them (`cache._Writer._flush`) and a reader
@@ -322,7 +322,7 @@ def completion_facts(row_id: str, payload: bytes) -> dict[str, object]:
     }
 
 
-def seal_facts(segments: Sequence[Mapping[str, object]], payloads: Sequence[bytes]) -> dict[str, object]:
+def seal_facts(segments: Sequence[Mapping[str, object]], payloads: Sequence[bytes]) -> Mapping[str, object]:
     """What a cache writer's seal commits of its `segments`, `payloads` their bytes in order: their
     count, the hash chain over them and the first and last input they complete. The writer seals
     by it (`cache._Writer.seal`) and a reader checks a seal against it (`_sealed`)."""

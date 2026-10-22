@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import hashlib
 import io
-import json
 import tempfile
 import uuid
 from collections.abc import Iterable, Iterator, Mapping
@@ -22,7 +21,7 @@ from dew.data.sources.base import Source
 from dew.data.sources.codec import encode
 from dew.data.sources.files import _arrow_filesystem
 from dew.data.steps.text import count_rules, stated_rules
-from dew.data.storage import ObjectRef, Store
+from dew.data.storage import ObjectRef, Store, commit_export
 
 if TYPE_CHECKING:
     from dew.data.pipeline import Pipeline
@@ -213,22 +212,12 @@ def export(
                 files.append(
                     {"path": relative, "bytes": len(payload), "sha256": hashlib.sha256(payload).hexdigest()}
                 )
-        manifest = {
-            "schema": 1,
-            "format": format,
-            "codec": 1 if format == "array_record" else None,
-            "rows": count,
-            # The rules other than every target's its rows were counted by, which a pack of them
-            # by a plan of their lengths could not count (`dew.data.analysis._ruled`).
-            "count_rules": [list(rule) for rule in sorted(rules, key=repr)],
-            "partitioning": partitioning,
-            "files": files,
-            "metadata": metadata or {},
-        }
-        encoded = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
-        root.child("_dew_manifest.json").put_if_absent(encoded)
-        root.child("_SUCCESS").put_if_absent(hashlib.sha256(encoded).hexdigest().encode())
-        return manifest
+        # The rules other than every target's its rows were counted by, which a pack of them by a
+        # plan of their lengths could not count (`dew.data.analysis._ruled`).
+        return commit_export(root, format=format, codec=1 if format == "array_record" else None, rows=count,
+                             files=files, metadata=metadata,
+                             certified={"count_rules": [list(rule) for rule in sorted(rules, key=repr)],
+                                        "partitioning": None if partitioning is None else list(partitioning)})
     finally:
         if isinstance(rows, Closeable):
             rows.close()
