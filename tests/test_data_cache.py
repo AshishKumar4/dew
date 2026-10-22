@@ -1558,20 +1558,63 @@ def test_a_step_that_reads_its_index_before_a_generation_under_a_holdout_is_refu
     assert _tags(placed(trained).cache(_cache())) == _tags(placed(trained)) == list(range(8))
 
 
-def test_a_records_holdout_over_a_generation_a_stream_filled_is_refused_and_an_indexed_fill_serves_it():
-    """A stream numbers its inputs by its shards, a records holdout by index: a generation filled by a
-    stream can't place the records held out, and is refused; filled by index, it reads the rows of
-    the inputs each part keeps, as the chain does uncached."""
+def test_a_records_holdout_over_a_stream_filled_generation_serves_where_the_stream_reads_in_index_order(
+        tmp_path):
+    """A stream numbers its inputs by its shards, a records holdout by index: a store whose stream
+    reads its records in index order places the records held out in a generation a stream filled,
+    as the chain reads them uncached; files whose stream has an order of its own are refused it."""
+    from dew.data import Files
     from dew.data.compile import publish
     from dew.data.pipeline import Pipeline
 
-    source = Memory([{"id": index} for index in range(12)])
-    parts = Pipeline(source).holdout(records=5)
-    streamed = publish(_tagged(Pipeline(source)), _cache(), read="streamed")
+    memory = Memory([{"id": index} for index in range(12)])
+    generation = publish(_tagged(Pipeline(memory)), _cache(), read="streamed")
+    parts = Pipeline(memory).holdout(records=5)
+    cached = [_tags(_tagged(part).cache(generation)) for part in parts]
+    assert cached == [_tags(_tagged(part)) for part in parts]
+    (tmp_path / "rows.jsonl").write_text("".join(f'{{"id": {index}}}\n' for index in range(12)))
+    files = Files(str(tmp_path / "rows.jsonl"))
+    streamed = publish(_tagged(Pipeline(files)), _cache(), read="streamed")
+    trained, _ = Pipeline(files).holdout(records=5)
     with pytest.raises(ValueError):
-        _tags(_tagged(parts[0]).cache(streamed))
-    indexed = publish(_tagged(Pipeline(source)), _cache(), read="indexed")
-    assert [_tags(_tagged(part).cache(indexed)) for part in parts] == [_tags(_tagged(part)) for part in parts]
+        _tags(_tagged(trained).cache(streamed))
+
+
+def test_a_hash_part_of_a_generation_reads_in_worker_processes_as_uncached():
+    """Worker processes read a hash part of a generation the rows the parent placed, the ones the
+    chain reads uncached."""
+    from dew.data.compile import compile, publish
+    from dew.data.dataset import DataPartition, Loading
+    from dew.data.pipeline import Pipeline
+
+    source = Memory([{"id": index} for index in range(48)])
+    generation = publish(_tagged(Pipeline(source)), _cache(), read="memory")
+    trained, _ = Pipeline(source).holdout(0.25)
+
+    def epoch(chain):
+        data = compile(chain.batch(4), read="streamed", loading=Loading(workers=2, threads=1, read_buffer=2))
+        reader = data.train(DataPartition())
+        try:
+            return sorted(int(tag) for batch in reader for tag in batch["tag"])
+        finally:
+            reader.close()
+
+    assert epoch(_tagged(trained).cache(generation)) == epoch(_tagged(trained))
+
+
+def test_stacked_records_parts_that_read_other_records_are_other_plans():
+    """The first two records of the store's records past the first, and of those past the second:
+    other records, so other plans, as each part names what it selects of the part it selects from."""
+    from dew.data.compile import compile, iterate
+    from dew.data.dataset import Loading
+    from dew.data.pipeline import Pipeline
+
+    store = Pipeline(Memory([{"id": index} for index in range(12)]))
+    parts = [store.holdout(records=skipped)[0].holdout(records=2)[1] for skipped in (1, 2)]
+    loading = Loading(workers=0)
+    plans = [compile(part.batch(1), read="memory", loading=loading).plan.identity() for part in parts]
+    assert [[int(row["id"]) for row in iterate(part, read="memory")] for part in parts] == [[1, 2], [2, 3]]
+    assert plans[0] != plans[1]
 
 
 @pytest.mark.parametrize("order", ["records of hash", "hash of records"])
