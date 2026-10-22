@@ -565,6 +565,19 @@ class Ramp:
         return steps + whole(max(records - stages[-1].records, 0), final)
 
 
+LONG_RUN = 1024
+"""The run of rejected records or empty shards in a row a read first logs (`logged_run`): longer
+than an ordinary filter's runs or a sharded store's empty files, so a filter that keeps nothing or a
+store of empty files is named from the first line. An endless read reads on through any run; none
+proves the store holds nothing to keep."""
+
+
+def logged_run(run: int, first: int = 1) -> bool:
+    """Whether a read logs a run of `run` empty reads in a row: at `first`, then at each doubling, so a
+    run that goes on is named again ever more rarely."""
+    return run >= first and not run & (run - 1)
+
+
 type Tail = Literal["dropped", "read"]
 """What becomes of the records an epoch leaves short of a whole batch (`Loader.tail`): `read`, where
 an order that reads on carries them into the next epoch's first batch or one that keeps its last
