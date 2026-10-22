@@ -684,6 +684,13 @@ class BankedModel(Protocol):
     def bank_sites(self) -> tuple[DecoderBank, ...]: ...
 
 
+@runtime_checkable
+class ScannedModel(BankedModel, Protocol):
+    """A decoder that says whether it scans its layers' runs (`banked` banks a scanning one's)."""
+
+    scan_layers: bool
+
+
 def bank_sites(model: BankedModel) -> tuple[DecoderBank, ...]:
     """Return the model's declared stacks, deduplicated by canonical namespace.
 
@@ -718,7 +725,7 @@ def bank_sites(model: BankedModel) -> tuple[DecoderBank, ...]:
 
 def banked(model: nn.Module, variables: Variables) -> Variables:
     """`variables` with each scanned run of `model`'s decoder held as one bank (`layers_3_7`, every
-    layer stacked on a leading axis), where the model declares scanned runs (`BankedModel`), in every
+    layer stacked on a leading axis), where the model scans its layers (`ScannedModel`), in every
     collection but its cache; anything else as it is.
 
     A scanned run reads its layers stacked (`dew.nn.backbones.decoder_stack.StackView`), so a store held
@@ -729,7 +736,9 @@ def banked(model: nn.Module, variables: Variables) -> Variables:
     (`bank_sharding`); device leaves on the device, each run its own program, so the stacking holds
     one run beside the tree. The caller's per-layer arrays are not released: a caller that keeps its
     own device tree holds the decoder twice, once per layer and once banked."""
-    if not isinstance(model, BankedModel) or not model.bank_sites:
+    # A stack that does not scan reads its layers one at a time and has nothing to bank; its sites
+    # are not read, which binds the model.
+    if not isinstance(model, ScannedModel) or not model.scan_layers:
         return variables
     sites = [site for site in bank_sites(model)
              if site.scanned and any(count > 1 for _, count in site.view.groups)]

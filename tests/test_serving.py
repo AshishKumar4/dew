@@ -357,24 +357,37 @@ def test_a_scanned_decoder_serves_from_its_banks_what_each_request_draws_alone(d
     assert_same_generation(server(["12"], 6, key=3)[0], bound.bind(other)("12", 6, key=3))
 
 
+BANKED_SEEDS = 8
+"""The banked decoder's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for` on armada."""
+
+
 def test_a_scanned_decoder_reads_its_banks_without_stacking_its_weights_per_call():
-    """A scanned decoder over a banked store computes what it computes over its layers' own tree, bit
-    for bit, and its compiled call holds no stacked copy of the layers' weights among its
+    """A scanned decoder over a banked store is on par (check 1) with itself over its layers' own tree,
+    from its float64 run over drawn weights and tokens (the two compile apart, so their roundings may
+    differ), and its compiled call holds no stacked copy of the layers' weights among its
     temporaries, which the per-layer tree costs it on every call (ledger 1342)."""
     from dew.inference.banks import banked
 
     model = decoder().clone(num_layers=4, scan_layers=True, emb_features=64, mlp_features=256, head_dim=32)
     ids = jnp.ones((2, 8), jnp.int32)
-    layers = model.init(jax.random.key(0), ids)
+    init = jax.jit(model.init)
+    layers = init(jax.random.key(0), ids)
     banks = banked(model, layers)
     assert "layers_0_3" in banks["params"] and "layers_0" not in banks["params"]
     weights = sum(leaf.nbytes for name, tree in layers["params"].items() if name.startswith("layers_")
                   for leaf in jax.tree.leaves(tree))
     called = jax.jit(model.apply)
-    np.testing.assert_array_equal(called(banks, ids), called(layers, ids))
     per_layer = called.lower(layers, ids).compile().memory_analysis()
     stacked = called.lower(banks, ids).compile().memory_analysis()
     assert per_layer.temp_size_in_bytes >= weights > stacked.temp_size_in_bytes
+
+    def draw(seed):
+        tokens = jax.random.randint(jax.random.key(2 * seed + 1), (2, 8), 0, model.vocab_size)
+        return init(jax.random.key(2 * seed), tokens), tokens
+
+    wide = jax.jit(model.clone(dtype=jnp.float64).apply)
+    assert_as_exact(lambda variables, tokens: called(banked(model, variables), tokens), called, draw,
+                    "a banked scanned decoder", seeds=BANKED_SEEDS, truth_fn=wide)
 
 
 def test_host_task_and_server_preserve_nonzero_lora_branches():
