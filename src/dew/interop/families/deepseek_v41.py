@@ -127,7 +127,7 @@ def _deepseek_v41_wrapper(hf_config: Mapping[str, object], used: set[str]) -> Wr
         'projector': translate_deepseek_v41_projector_config(
             hf_config, record_int(text, 'emb_features')),
         'image_token_id': record_int(hf_config, 'image_token_id'),
-        'tokens_per_image': None, **NO_AUDIO}
+        'tokens_per_image': None, 'video_token_id': None, 'extra_placeholder_ids': (), **NO_AUDIO}
 
 
 def _v41_decoder(hf_config: Mapping[str, object], used: set[str], *, media_bias: bool) -> DecoderFields:
