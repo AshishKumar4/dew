@@ -37,7 +37,7 @@ if [ "${1:-}" = --changed ]; then
   # SLOP020's inventory names files across the tree, and a deleted file can leave its entry behind: a head
   # that changes the inventory or deletes a Python file has the whole tree read, as the full run reads it.
   if git diff --quiet "$since" -- tools/tolerance_inventory.json &&
-    [ -z "$(git diff --name-only --diff-filter=D "$since" -- '*.py')" ]; then
+    [ -z "$(git diff --no-renames --name-only --diff-filter=D "$since" -- '*.py')" ]; then
     gate slop sh -c '. tools/lint_inputs.sh; python_changed "$1" $("$2" tools/lint_slop.py --print-roots) |
       JAX_PLATFORMS=cpu xargs -0r "$2" tools/lint_slop.py' _ "$since" "$python"
   else
