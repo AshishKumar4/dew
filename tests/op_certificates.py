@@ -333,7 +333,8 @@ def _enclosure_rounded(x, hi, lo, inside, beyond, exact, name: str, fmt: Format)
     mpmath's interval `exact(iv, x)` at rising precision decides the rest. Outside, inf where `beyond`
     and 0 elsewhere; NaN is NaN."""
     slack = np.abs(hi) * EXP_BOUND
-    lower, upper = rounded(hi, lo - slack, fmt), rounded(hi, lo + slack, fmt)
+    # Each end renormalized: `rounded` reads a double-double whose low part is within half an ulp of hi.
+    lower, upper = (rounded(*two_sum(hi, lo + offset), fmt) for offset in (-slack, slack))
     result = np.where(inside, lower, np.where(beyond, np.inf, 0.0))
     result = np.where(np.isnan(x), np.nan, result)
     decided = ~inside | (lower == upper)
