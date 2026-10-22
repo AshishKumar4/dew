@@ -12,8 +12,9 @@ from pathlib import Path
 TOOLS = Path(__file__).resolve().parents[1] / "tools"
 GATE = ("check.sh", "lint_inputs.sh", "base_history.sh", "lint_slop.py", "lint_scopes.py",
         "lint_tolerances.py", "duplicates.py")
-CLOSE = ("import numpy as np\n\n\ndef test_close():\n"
-         "    np.testing.assert_allclose(np.ones(2), np.ones(2), rtol=1e-6)\n")
+# Twenty lines beside the comparison, so a copy with its comparison gone is still the same file to Git.
+CLOSE = ("import numpy as np\n\n" + "".join(f"WIDTH_{index} = {index}\n" for index in range(20))
+         + "\n\ndef test_close():\n    np.testing.assert_allclose(np.ones(2), np.ones(2), rtol=1e-6)\n")
 HELD = {"tests/test_close.py": {"comparisons": 1, "lane": "Data", "by": "2099-01-01"}}
 
 
@@ -68,4 +69,7 @@ def test_a_head_touching_the_inventory_or_deleting_a_file_it_names_fails_its_cha
     git(root, "mv", "tests/test_close.py", "tests/test_near.py")
     (root / "tests/test_near.py").write_text(CLOSE.replace(", rtol=1e-6", ""))
     git(root, "commit", "-qam", "a head that renames the held file and drops its comparison")
+    renamed = subprocess.run(["git", "diff", "--name-status", "origin/main"], cwd=root, capture_output=True,
+                             text=True, check=True).stdout
+    assert renamed.startswith("R")
     assert changed(root).returncode == 1
