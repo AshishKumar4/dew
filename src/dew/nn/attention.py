@@ -10,7 +10,6 @@ import contextvars
 import dataclasses
 import functools
 import importlib
-import itertools
 import math
 from collections.abc import Callable
 from typing import Literal, get_args
@@ -33,7 +32,7 @@ from .attention_kernels import (
     DECODE,
     SPLASH_BLOCK,
     SPLASH_LANES,
-    TPU_SUPPORTS,
+    TPU_BACKEND,
     AttentionCase,
     decodes,
 )
@@ -82,7 +81,7 @@ from .sharding import (
     sequence_shards,
     split_positions,
 )
-from .visibility import same_chunk, visible, windowed
+from .visibility import same_chunk, visible, window_sides, windowed
 
 AttentionImpl = Literal["auto", "reference", "xla", "cudnn", "triton", "flash", "tpu"]
 """Names which kernel an attention call runs.
@@ -166,20 +165,6 @@ def alibi_bias(key_positions, num_heads: int, *, dtype) -> jax.Array:
     positions = jnp.atleast_2d(key_positions)
     return (jnp.asarray(slopes)[None, :, None, None]
             * positions[:, None, None, :]).astype(dtype)
-
-
-def window_sides(causal: bool, sliding_window: int) -> tuple[int, int]:
-    """The keys a window of `sliding_window` keeps before and after each query,
-    counted as `jax.nn.dot_product_attention`'s `local_window_size` counts them.
-
-    A causal window keeps the query and the w - 1 keys before it. A
-    bidirectional one keeps the keys within w - 1 positions on either side,
-    |q - k| < w: ModernBERT's |q - k| <= local_attention // 2, which is w =
-    local_attention // 2 + 1 (masking_utils.py:141-158, transformers 5.16.1).
-    A model layer passes one only where its kind asks for it
-    (`LayerKind.bidirectional_window`).
-    """
-    return sliding_window - 1, 0 if causal else sliding_window - 1
 
 
 def structural_mask(query_positions, kv_len: int, causal: bool,
@@ -274,20 +259,20 @@ def visible_rows(query_length: int, key_length: int, causal: bool, sliding_windo
         rows = rows.reshape((1,) * (3 - rows.ndim) + rows.shape)
         return jnp.swapaxes(rows, -1, -2)[..., None]
     # The keys row i may see run from 0 to the last one; causality keeps 0 in
-    # reach, and a window ends `left` keys before the row. A row's start must
-    # lie at or before the last key it may see: the last, the row itself
-    # under causality, or `right` keys past it under a two-sided window.
-    left, right = (None, None) if sliding_window is None else window_sides(causal, sliding_window)
+    # reach, and a window ends w - 1 keys before the row (`windowed`). A row's
+    # start must lie at or before the last key it may see: the last, the row
+    # itself under causality, or `right` keys past it under a two-sided window.
+    right = None if sliding_window is None else window_sides(causal, sliding_window)[1]
     rows = np.arange(query_length)[None]
     if key_value_seq_lengths is None and starts is None:
         last = np.full((1, 1), key_length - 1)
-        reach = (last >= 0) if left is None else (rows - left <= last)
+        reach = (last >= 0) if sliding_window is None else windowed(rows, last, sliding_window, causal=True)
         if segment_ids is None:
             return None if reach.all() else jnp.asarray(reach)[:, :, None, None]
         return (jnp.asarray(reach) & (jnp.asarray(segment_ids) != 0))[:, :, None, None]
     last = (jnp.full((1, 1), key_length - 1) if key_value_seq_lengths is None
             else jnp.asarray(key_value_seq_lengths)[:, None] - 1)
-    reach = (last >= 0) if left is None else (rows - left <= last)
+    reach = (last >= 0) if sliding_window is None else windowed(rows, last, sliding_window, causal=True)
     if starts is not None:
         seen = last
         if causal:
@@ -1674,18 +1659,13 @@ def attention_case(query, key, *, dtype=None, precision=None, force_fp32_for_sof
         arithmetic=reference_only(query, dtype, precision, force_fp32_for_softmax),
         narrows=_xla_kernel_narrows(query) or _xla_kernel_chains(query, key),
         folds=folds(query, key, bias, mask, causal, sliding_window),
-        splash=False, shards=sequence_shards())
-    # Splash's descriptor reads a concrete mask on the host, so it is built only for a call under a
-    # name that may choose splash which every requirement of splash's before its tiling takes
-    # (`TPU_SUPPORTS`, in the order a refusal names them): whether splash tiles the call is then the
-    # fact to form, its lengths and its descriptor, and a later refusal is still reported as itself.
-    earlier = itertools.takewhile(lambda need: need.code != 'tiles', TPU_SUPPORTS)
-    if named in ('auto', 'tpu') and all(need.holds(case) for need in earlier):
-        tiled = q_len % SPLASH_LANES == 0 and kv_len % SPLASH_LANES == 0
-        case = dataclasses.replace(case, splash=(
-            tiled and min(q_len, kv_len) >= SPLASH_MIN_LENGTH
-            and splash_mask_descriptor(q_len, kv_len, shard_heads(query), causal, sliding_window,
-                                       mask) is not None))
+        splash_mask=False, shards=sequence_shards())
+    # Splash's descriptor reads a concrete mask on the host, so it is built only where splash may run,
+    # under a name that may choose it on a TPU (`TPU_BACKEND`); its tiling and every other requirement
+    # read the case (`TPU_SUPPORTS`).
+    if named in ('auto', 'tpu') and TPU_BACKEND.holds(case):
+        described = splash_mask_descriptor(q_len, kv_len, shard_heads(query), causal, sliding_window, mask)
+        case = dataclasses.replace(case, splash_mask=described is not None)
     return case
 
 
@@ -1757,13 +1737,6 @@ def cudnn_takes_mask(implementation: str, query, *, softcap=None, sinks: bool = 
 # device memory that grows with the batch. 4 Mi cells is a 16-head 512x512.
 SPLASH_DENSE_MASK_CELLS = 1 << 22
 
-# The shortest sequence 'auto' hands splash. tools/qualify_splash.py on one
-# v6e (jax 0.11.1, bf16, 16 query heads over 8 key heads of width 128, 16384
-# causal tokens a step), a training step: splash 3.24 ms against XLA's 2.62
-# at 256 keys, 2.57 against 4.64 at 512, 28.9 against 144.2 at 16384; width
-# 64 crosses at the same length. Softcap, sinks and packed ids cost splash
-# at most 16% more from 512 to 16384.
-SPLASH_MIN_LENGTH = 512
 
 
 def tpu_attention(query, key, value, bias, mask, causal, sliding_window, *,

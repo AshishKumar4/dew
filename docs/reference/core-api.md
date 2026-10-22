@@ -597,6 +597,6 @@ Splash's mask is a block-sparse descriptor built along with the executable, so a
 
 An additive bias, a mask that is a value of the trace (a KV-cache decode mask, or the striped mask sequence parallelism builds), a mask past the published cell budget, or a length that is not a multiple of 128 sends an explicit `'tpu'` call to the older Pallas flash kernel and keeps `'auto'` on `'xla'`. Splash applies a logit softcap (Gemma 2) and attention sinks (GPT-OSS) itself, and a packed batch reaches it as segment IDs instead of a mask. The flash kernel has neither a softcap nor sinks, so an explicit `'tpu'` call that splash cannot describe refuses them. On a GPU, `'auto'` runs both on `'xla'`, and `'cudnn'` refuses them by name.
 
-Below 512 keys `'auto'` stays on `'xla'`, where XLA's attention measured faster on a v6e (`SPLASH_MIN_LENGTH` in `dew/nn/attention.py`). The parameter tree does not change with the implementation, so checkpoints are interchangeable across hardware.
+Below 512 keys `'auto'` stays on `'xla'`, where XLA's attention measured faster on a v6e (`SPLASH_MIN_LENGTH` in `dew/nn/attention_kernels.py`). The parameter tree does not change with the implementation, so checkpoints are interchangeable across hardware.
 
 The [README model list](https://github.com/AshishKumar4/dew/blob/main/README.md#models) names which model configurations run the whole workflow; each task guide covers its own data and objective.
