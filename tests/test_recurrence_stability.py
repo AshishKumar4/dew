@@ -5,9 +5,9 @@ op under the inputs that break chunked forms, each held to the same recurrence a
 - finite wherever the reference in float64 is finite: no NaN or inf of the chunked form's own, an
   exponent's overflow or an underflow's `0 * inf`;
 - no merging: values it rounds to one fp32 number are apart in float64 by no more than the fp32
-  reference's own rounding noise (four times its RMS error over the leaf, and two roundings at their
-  size), so no underflow or saturation collapses values the reference keeps apart, a collapse spanning
-  orders of magnitude more than two roundings meeting by chance;
+  reference's own error at their size (its error relative to the leaf, check 1's allowance of it, on
+  both values, and two roundings), so no underflow or saturation collapses values the reference keeps
+  apart: a merge of small values is judged at their magnitude, not the leaf's;
 - check 1 (`assert_as_exact`): on par with the reference from float64 over the regime's draws.
 
 The regimes: decays near one, whose memory accumulates, and over a long sequence; decays near zero, whose
@@ -29,7 +29,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact, widened
+from reference_error import PARITY, assert_as_exact, widened
 from test_recurrence_chunk import CHUNK, FORMED, HOOKS, draw, token_by_token
 
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk
@@ -48,26 +48,29 @@ def _decayed(operands: Chunk, hooks, log_decay: float, spread: float, key) -> Ch
     whichever operand the hooks read it from: the log decay itself, the gate's pre-activation (`gated`'s
     `-exp(log_a) softplus(gate + bias)`), or a rated decay's write gate (`rate * dt`)."""
     noise = spread * jax.random.uniform(key, operands.value.shape[:3], minval=-1.0, maxval=1.0)
+    target = jnp.minimum(log_decay + noise, 0.0)
     if hooks.rated:
-        dt = jnp.maximum(log_decay / operands.rate + noise, 0.0)
-        return dataclasses.replace(operands, beta=dt)
+        # The log decay is `rate * dt`: dt the target over each head's rate.
+        return dataclasses.replace(operands, beta=target / operands.rate)
     if hooks.gates is not None:
         # softplus(gate + bias) * exp(log_a) = -log_decay, with log_a = 0 and the bias zero.
-        target = jnp.maximum(-log_decay + noise, 1e-30)
-        gate = jnp.where(target > 20.0, target, jnp.log(jnp.expm1(target)))
+        positive = jnp.maximum(-target, 1e-30)
+        gate = jnp.where(positive > 20.0, positive, jnp.log(jnp.expm1(positive)))
         return dataclasses.replace(operands, gate=gate, log_a=jnp.zeros_like(operands.log_a),
                                    bias=jnp.zeros_like(operands.bias))
     shape = operands.log_decay.shape
-    noise = noise if len(shape) == 3 else noise[..., None] * jnp.ones(shape[-1:])
-    return dataclasses.replace(operands, log_decay=jnp.minimum(log_decay + noise, 0.0))
+    target = target if len(shape) == 3 else target[..., None] * jnp.ones(shape[-1:])
+    return dataclasses.replace(operands, log_decay=target)
 
 
-def _aligned(operands: Chunk, key) -> Chunk:
-    """Every token's key within 1e-3 of one unit vector a row and head, the write gate near one."""
+def _aligned(operands: Chunk, hooks, key) -> Chunk:
+    """Every token's key within 1e-3 of one unit vector a row and head, the write gate near one: 0.999,
+    or its logit where the gates form it through a sigmoid; a write the hooks take as one stays so."""
     base = operands.key[:, :1]
     keys = base + 1e-3 * jax.random.normal(key, operands.key.shape)
     keys = keys / jnp.linalg.norm(keys, axis=-1, keepdims=True)
-    beta = None if operands.beta is None else jnp.full_like(operands.beta, 0.999)
+    near_one = np.log(0.999 / 0.001) if hooks.gates is not None else 0.999
+    beta = None if operands.beta is None else jnp.full_like(operands.beta, near_one)
     return dataclasses.replace(operands, key=keys, beta=beta)
 
 
@@ -98,25 +101,69 @@ REGIMES = {
     'decays near one': (lambda operands, hooks, key: _decayed(operands, hooks, -1e-4, 5e-5, key), None),
     'decays near zero': (lambda operands, hooks, key: _decayed(operands, hooks, -30.0, 5.0, key), None),
     'the decay bound': (lambda operands, hooks, key: _decayed(operands, hooks, -5.0, 0.0, key), None),
-    'aligned keys': (lambda operands, hooks, key: _aligned(operands, key), None),
+    'aligned keys': (lambda operands, hooks, key: _aligned(operands, hooks, key), None),
     'resets on chunk edges': (lambda operands, hooks, key: _reset(operands), None),
     'saturated gates': (lambda operands, hooks, key: _saturated(operands, hooks, key), None),
     'a long sequence': (lambda operands, hooks, key: _decayed(operands, hooks, -1e-3, 5e-4, key), LONG),
 }
 """Each regime's transform of a draw's operands and its tokens (the draw's own where None)."""
 
-SEEDS = {}
-"""Each site's declared seeds for check 1, sized by `seeds_for` on armada; 8 where not yet sized."""
+SEEDS = {
+    ('scalar delta', 'decays near one'): 8,
+    ('scalar delta', 'decays near zero'): 32,
+    ('scalar delta', 'the decay bound'): 32,
+    ('scalar delta', 'aligned keys'): 32,
+    ('scalar delta', 'resets on chunk edges'): 16,
+    ('scalar delta', 'saturated gates'): 32,
+    ('scalar delta', 'a long sequence'): 8,
+    ('vector delta', 'decays near one'): 8,
+    ('vector delta', 'decays near zero'): 32,
+    ('vector delta', 'the decay bound'): 32,
+    ('vector delta', 'aligned keys'): 16,
+    ('vector delta', 'resets on chunk edges'): 8,
+    ('vector delta', 'saturated gates'): 16,
+    ('vector delta', 'a long sequence'): 8,
+    ('scalar write', 'decays near one'): 8,
+    ('scalar write', 'decays near zero'): 32,
+    ('scalar write', 'the decay bound'): 32,
+    ('scalar write', 'aligned keys'): 16,
+    ('scalar write', 'resets on chunk edges'): 16,
+    ('scalar write', 'saturated gates'): 32,
+    ('scalar write', 'a long sequence'): 8,
+    ('gated', 'decays near one'): 8,
+    ('gated', 'decays near zero'): 128,
+    ('gated', 'the decay bound'): 64,
+    ('gated', 'aligned keys'): 64,
+    ('gated', 'resets on chunk edges'): 32,
+    ('gated', 'saturated gates'): 128,
+    ('gated', 'a long sequence'): 8,
+    ('rated', 'decays near one'): 8,
+    ('rated', 'decays near zero'): 128,
+    ('rated', 'the decay bound'): 128,
+    ('rated', 'aligned keys'): 16,
+    ('rated', 'resets on chunk edges'): 64,
+    ('rated', 'saturated gates'): 16,
+    ('rated', 'a long sequence'): 8,
+}
+"""Each site's declared seeds for check 1, sized by `seeds_for` on armada (2026-10-22): the fewest for
+which the token-by-token reference compared with itself resolves the factor in both leaves."""
+
+PORT_DEFECT_PAIRS = ()
+"""(family, regime) pairs the port fails (`PORT_DEFECTS`)."""
 
 
 def assert_kept_apart(ours: np.ndarray, reference: np.ndarray, truth: np.ndarray, label: str):
-    """Every group of entries `ours` rounds to one value spans in float64 no more than four times the fp32
-    `reference`'s RMS error over the leaf and two fp32 spacings at its size: the values it merges are ones
-    the reference's own rounding noise cannot tell apart."""
+    """Every group of entries `ours` rounds to one value spans in float64 no more than the fp32
+    `reference`'s error at the group's size, on each of two values at check 1's allowance (`PARITY`), and
+    two fp32 spacings: the reference's RMS error relative to the leaf's RMS, times the group's largest
+    magnitude. A merge of values far below the leaf's scale is held to their own scale."""
     flat, ref, exact = (np.ravel(x) for x in (ours, reference, truth))
     finite = np.isfinite(flat) & np.isfinite(exact)
     flat, ref, exact = flat[finite], ref[finite], exact[finite]
-    noise = 4.0 * float(np.sqrt(np.mean(np.square(ref - exact)))) if flat.size else 0.0
+    if not flat.size:
+        return
+    scale = float(np.sqrt(np.mean(np.square(exact))))
+    relative = float(np.sqrt(np.mean(np.square(ref - exact)))) / scale if scale else 0.0
     order = np.argsort(flat, kind='stable')
     values = flat[order]
     starts = np.flatnonzero(np.r_[True, values[1:] != values[:-1]])
@@ -124,7 +171,8 @@ def assert_kept_apart(ours: np.ndarray, reference: np.ndarray, truth: np.ndarray
     for start, size in zip(starts[sizes > 1], sizes[sizes > 1], strict=True):
         group = order[start:start + size]
         spread = exact[group].max() - exact[group].min()
-        allowed = noise + 2.0 * float(np.spacing(np.float32(values[start])))
+        size_of = float(np.abs(exact[group]).max())
+        allowed = 2.0 * PARITY * relative * size_of + 2.0 * float(np.spacing(np.float32(values[start])))
         assert spread <= allowed, (f'{label}: {size} entries merged at {values[start]:.6g} span {spread:.3g}'
                                    f' in float64, the reference telling apart {allowed:.3g}')
 
@@ -136,21 +184,23 @@ def stressed(hooks, regime: str, seed: int) -> tuple[Chunk]:
     return (transform(operands, hooks, jax.random.fold_in(jax.random.key(seed), 99)),)
 
 
-PORT_DEFECTS = frozenset({'saturated gates', 'aligned keys', 'resets on chunk edges', 'the decay bound'})
-"""The regimes the port fails and the portable math passes (ledger row 1328, the module docstring)."""
+PORT_DEFECTS = frozenset(PORT_DEFECT_PAIRS)
+"""The families and regimes the port fails and the portable math passes (ledger row 1328, the module
+docstring): measured on armada, each interpreted port arm against the token-by-token reference."""
 
 
-def ported_arms(hooks, regime: str) -> list[bool]:
+def ported_arms(name: str, hooks, regime: str) -> list[bool]:
     """The routes a site runs: the portable math, and the port's kernels interpreted where the hooks take
     them, but over the long sequence, whose interpretation a CPU cannot afford, and in the regimes the port
     fails (`PORT_DEFECTS`)."""
     takes = hooks.delta and hooks.decay != 'none' and not hooks.rated
-    held = takes and REGIMES[regime][1] is None and regime not in PORT_DEFECTS
+    held = takes and REGIMES[regime][1] is None and (name, regime) not in PORT_DEFECTS
     return [False, True] if held else [False]
 
 
 CASES = [pytest.param(name, regime, ported, id=f'{name}-{regime}-{"port" if ported else "portable"}')
-         for name, hooks in SITES.items() for regime in REGIMES for ported in ported_arms(hooks, regime)]
+         for name, hooks in SITES.items() for regime in REGIMES
+         for ported in ported_arms(name, hooks, regime)]
 
 
 @pytest.mark.parametrize('name, regime, ported', CASES)
@@ -171,4 +221,21 @@ def test_the_chunked_op_stays_finite_distinct_and_exact_where_chunked_forms_brea
             finite = np.isfinite(exact)
             assert np.all(np.isfinite(ours)[finite]), f'{leaf}: not finite where float64 is, seed {seed}'
             assert_kept_apart(ours, fp32, exact, f'{leaf}, seed {seed}')
-    assert_as_exact(dew, reference, draws, f'{name} under {regime}', seeds=SEEDS.get((name, regime), 8))
+    assert_as_exact(dew, reference, draws, f'{name} under {regime}', seeds=SEEDS[name, regime])
+
+
+def test_the_merge_check_catches_a_collapse_the_reference_keeps_apart():
+    """`assert_kept_apart` refuses values merged far below the leaf's scale (two small values flushed to
+    zero beside a large one) and a saturation merging values the reference tells apart, and accepts a
+    tie two roundings make by chance."""
+    truth = np.asarray([1e-13, 2e-13, 1.0 + 1e-8])
+    with pytest.raises(AssertionError):
+        assert_kept_apart(np.asarray([0.0, 0.0, 1.0], np.float32), truth.astype(np.float32), truth,
+                          'flushed')
+    truth = np.asarray([0.99, 0.995, 0.5])
+    with pytest.raises(AssertionError):
+        assert_kept_apart(np.asarray([1.0, 1.0, 0.5], np.float32), truth.astype(np.float32), truth,
+                          'saturated')
+    truth = np.asarray([0.875, 0.875 + 2e-7, 0.5])
+    reference = truth.astype(np.float32) * (1 + 1e-6)
+    assert_kept_apart(np.asarray([0.875, 0.875, 0.5], np.float32), reference, truth, 'a tie')
