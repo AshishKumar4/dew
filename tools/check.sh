@@ -64,6 +64,7 @@ gate complexity sh -c "\"$python\" tools/complexity.py src/dew tools/lint_slop.p
 gate api-pages uv run --no-project --with-requirements site/scripts/requirements.txt python site/scripts/gen_api.py --check
 gate install-script "$python" site/scripts/gen_install.py --check
 gate theme "$python" site/scripts/gen_theme.py --check
+gate model-pin "$python" site/scripts/gen_pin.py --check
 gate pythons "$python" tools/armada/ci.py pythons --check
 gate api-tests uv run --no-project --with-requirements site/scripts/requirements.txt --with pytest \
   python -m pytest -q --noconftest tests/test_gen_api.py

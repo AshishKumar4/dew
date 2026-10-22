@@ -1,19 +1,19 @@
 {
 	"about": "The screen finetune.py left on a terminal, written by site/scripts/capture_snippets.py.",
 	"arguments": [],
-	"script_sha256": "e6b615e4e1c91d55eddee8b252cf55cffb10d6c6849e3d21f3fe9e7608309819",
+	"script_sha256": "7391c46e1b1d1dba1d88df8206d0c6c3f659154ecf9784828ac1c09774914707",
 	"meta": {
 		"where": "a 4-vCPU Cloudflare container",
 		"python": "3.12.15",
-		"jax": "0.11.2.post6",
+		"jax": "0.11.2.post11",
 		"flax": "0.12.10",
 		"optax": "0.2.8",
-		"dew": "9e33f6761916e5c34d43c04224fbd831bcd7b01b",
-		"date": "2026-10-20"
+		"dew": "d2adda0186300fcbbe16c47b462a589c4b9dbf96",
+		"date": "2026-10-21"
 	},
 	"hero": {
 		"returncode": 0,
-		"seconds": 131.6,
+		"seconds": 121.5,
 		"columns": 96,
 		"screen": [
 			[
@@ -128,14 +128,14 @@
 					"dim": true
 				},
 				{
-					"text": "  100%  1.1"
+					"text": "  100%  1.4"
 				},
 				{
 					"text": " step/s",
 					"dim": true
 				},
 				{
-					"text": "  0:00:39 "
+					"text": "  0:00:35 "
 				},
 				{
 					"text": "\u2502",
@@ -230,18 +230,18 @@
 					"text": "  "
 				},
 				{
-					"text": "     3.941",
+					"text": "     3.218",
 					"bold": true
 				},
 				{
 					"text": "  "
 				},
 				{
-					"text": "\u2583",
+					"text": "\u2588",
 					"fg": "00afd7"
 				},
 				{
-					"text": "\u2586\u2588",
+					"text": "\u2585\u2586",
 					"fg": "5f87d7"
 				},
 				{
@@ -252,7 +252,7 @@
 					"text": "  "
 				},
 				{
-					"text": "   \u2193 1.7%",
+					"text": "    \u2193 27%",
 					"fg": "5faf5f"
 				},
 				{
@@ -279,18 +279,18 @@
 					"text": "  "
 				},
 				{
-					"text": "     3.941",
+					"text": "     3.218",
 					"bold": true
 				},
 				{
 					"text": "  "
 				},
 				{
-					"text": "\u2583",
+					"text": "\u2588",
 					"fg": "00afd7"
 				},
 				{
-					"text": "\u2586\u2588",
+					"text": "\u2585\u2586",
 					"fg": "5f87d7"
 				},
 				{
@@ -301,7 +301,7 @@
 					"text": "  "
 				},
 				{
-					"text": "   \u2193 1.7%",
+					"text": "    \u2193 27%",
 					"fg": "5faf5f"
 				},
 				{
@@ -328,18 +328,18 @@
 					"text": "  "
 				},
 				{
-					"text": "     51.45",
+					"text": "     24.97",
 					"bold": true
 				},
 				{
 					"text": "  "
 				},
 				{
-					"text": "\u2583",
+					"text": "\u2588",
 					"fg": "00afd7"
 				},
 				{
-					"text": "\u2586\u2588",
+					"text": "\u2584\u2586",
 					"fg": "5f87d7"
 				},
 				{
@@ -350,7 +350,7 @@
 					"text": "  "
 				},
 				{
-					"text": "   \u2193 6.7%",
+					"text": "    \u2193 69%",
 					"fg": "5faf5f"
 				},
 				{
@@ -377,7 +377,7 @@
 					"text": "  "
 				},
 				{
-					"text": "     35.9%",
+					"text": "     40.6%",
 					"bold": true
 				},
 				{
@@ -388,7 +388,7 @@
 					"fg": "00afd7"
 				},
 				{
-					"text": "\u2582\u2587",
+					"text": "\u2584\u2587",
 					"fg": "5f87d7"
 				},
 				{
@@ -399,7 +399,7 @@
 					"text": "  "
 				},
 				{
-					"text": " \u2191 9.4 pt",
+					"text": "\u2191 14.1 pt",
 					"fg": "5faf5f"
 				},
 				{
@@ -426,14 +426,14 @@
 					"text": "  "
 				},
 				{
-					"text": "    0.8988",
+					"text": "     1.059",
 					"bold": true
 				},
 				{
 					"text": "  "
 				},
 				{
-					"text": "\u2582",
+					"text": "\u2581",
 					"fg": "00afd7"
 				},
 				{
@@ -441,14 +441,14 @@
 					"fg": "5f87d7"
 				},
 				{
-					"text": "\u2587",
+					"text": "\u2588",
 					"fg": "875fd7"
 				},
 				{
 					"text": "  "
 				},
 				{
-					"text": "    \u2191 13\u00d7",
+					"text": "    \u2191 35\u00d7",
 					"dim": true
 				},
 				{
@@ -475,7 +475,7 @@
 					"text": "  "
 				},
 				{
-					"text": "     8.477",
+					"text": "     9.280",
 					"bold": true
 				},
 				{
@@ -486,7 +486,7 @@
 					"fg": "00afd7"
 				},
 				{
-					"text": "\u2582\u2586",
+					"text": "\u2581\u2582",
 					"fg": "5f87d7"
 				},
 				{
@@ -497,7 +497,7 @@
 					"text": "  "
 				},
 				{
-					"text": "    \u2193 23%",
+					"text": "    \u2193 17%",
 					"dim": true
 				},
 				{
@@ -524,7 +524,7 @@
 					"text": "  "
 				},
 				{
-					"text": "     6.000",
+					"text": "     12.00",
 					"bold": true
 				},
 				{
@@ -546,7 +546,7 @@
 					"text": "  "
 				},
 				{
-					"text": "    \u2191 20%",
+					"text": "   \u2191 9.1%",
 					"dim": true
 				},
 				{
@@ -629,7 +629,7 @@
 					"text": "  "
 				},
 				{
-					"text": "     903.5",
+					"text": "     767.5",
 					"bold": true
 				},
 				{
@@ -640,18 +640,18 @@
 					"fg": "00afd7"
 				},
 				{
-					"text": "\u2581\u2582",
+					"text": "\u2582\u2581",
 					"fg": "5f87d7"
 				},
 				{
-					"text": "\u2581",
+					"text": "\u2582",
 					"fg": "875fd7"
 				},
 				{
 					"text": "  "
 				},
 				{
-					"text": "    \u2193 31%",
+					"text": "    \u2193 29%",
 					"fg": "5faf5f"
 				},
 				{
@@ -678,7 +678,7 @@
 					"text": "  "
 				},
 				{
-					"text": "     1.107",
+					"text": "     1.303",
 					"bold": true
 				},
 				{
@@ -689,18 +689,18 @@
 					"fg": "00afd7"
 				},
 				{
-					"text": "\u2588\u2587",
+					"text": "\u2587\u2588",
 					"fg": "5f87d7"
 				},
 				{
-					"text": "\u2588",
+					"text": "\u2587",
 					"fg": "875fd7"
 				},
 				{
 					"text": "  "
 				},
 				{
-					"text": "    \u2191 46%",
+					"text": "    \u2191 40%",
 					"fg": "5faf5f"
 				},
 				{
@@ -776,7 +776,7 @@
 					"text": "  "
 				},
 				{
-					"text": "     70.83",
+					"text": "     83.39",
 					"bold": true
 				},
 				{
@@ -787,7 +787,7 @@
 					"fg": "00afd7"
 				},
 				{
-					"text": "\u2588\u2586",
+					"text": "\u2588\u2587",
 					"fg": "5f87d7"
 				},
 				{
@@ -798,7 +798,7 @@
 					"text": "  "
 				},
 				{
-					"text": "    \u2191 46%",
+					"text": "    \u2191 40%",
 					"fg": "5faf5f"
 				},
 				{
@@ -916,7 +916,7 @@
 					"dim": true
 				},
 				{
-					"text": "20 steps in 0:00:41             "
+					"text": "20 steps in 0:00:37             "
 				},
 				{
 					"text": "\u2502",
@@ -936,7 +936,7 @@
 					"dim": true
 				},
 				{
-					"text": "after 23.11 s                   "
+					"text": "after 22.22 s                   "
 				},
 				{
 					"text": "\u2502",
@@ -956,7 +956,7 @@
 					"dim": true
 				},
 				{
-					"text": "1.1 step/s                      "
+					"text": "1.3 step/s                      "
 				},
 				{
 					"text": "\u2502",
@@ -976,7 +976,7 @@
 					"dim": true
 				},
 				{
-					"text": "43.3% of the wall time in steps "
+					"text": "39.5% of the wall time in steps "
 				},
 				{
 					"text": "\u2502",
@@ -996,7 +996,7 @@
 					"dim": true
 				},
 				{
-					"text": "3.941                          ",
+					"text": "3.218                          ",
 					"bold": true
 				},
 				{
@@ -1037,42 +1037,25 @@
 			[],
 			[
 				{
-					"text": "First Citizen:"
+					"text": "BUCKINGHAM:"
 				}
 			],
+			[],
 			[
 				{
-					"text": "First Citizen:"
+					"text": "Hastings:"
 				}
 			],
+			[],
 			[
 				{
-					"text": "First Citizen:"
+					"text": "BUCINGHAM:"
 				}
 			],
+			[],
 			[
 				{
-					"text": "First Citizen:"
-				}
-			],
-			[
-				{
-					"text": "First Citizen:"
-				}
-			],
-			[
-				{
-					"text": "First Citizen:"
-				}
-			],
-			[
-				{
-					"text": "First Citizen:"
-				}
-			],
-			[
-				{
-					"text": "First Citizen"
+					"text": "BUCINGHAM:"
 				}
 			]
 		]

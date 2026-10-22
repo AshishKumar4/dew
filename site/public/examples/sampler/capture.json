@@ -1,19 +1,19 @@
 {
 	"about": "The screen sampler.py left on a terminal, written by site/scripts/capture_snippets.py.",
 	"arguments": [],
-	"script_sha256": "71a95a10f1ccb2d1db64b81a4d2bf7878711efcabe5345205caa9b10b32fca9c",
+	"script_sha256": "99a2c819430ea15fd831fc119cb90ea3cf42b840ff56ff79a155b65a8c6cbc14",
 	"meta": {
-		"where": "a Lambda A100-SXM4-40GB",
+		"where": "one A100",
 		"python": "3.12.15",
-		"jax": "0.11.2.post4",
+		"jax": "0.11.2.post11",
 		"flax": "0.12.10",
 		"optax": "0.2.8",
-		"dew": "8ec5f850a6cf6bd48b482c0b8db926c60482b3ba",
-		"date": "2026-10-20"
+		"dew": "7575f1a0dc1189601ccdadb0ab71233ec771ad74",
+		"date": "2026-10-22"
 	},
 	"hero": {
 		"returncode": 0,
-		"seconds": 92.0,
+		"seconds": 93.0,
 		"columns": 96,
 		"screen": []
 	}
