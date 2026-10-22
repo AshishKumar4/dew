@@ -77,12 +77,9 @@ from __future__ import annotations
 import argparse
 import ast
 import functools
-import gc
 import hashlib
 import io
 import json
-import multiprocessing
-import os
 import re
 import subprocess
 import sys
@@ -94,6 +91,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import lint_scopes as scopes
 import lint_tolerances as tolerance_rules
+from forked import forked_map
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -2075,15 +2073,14 @@ def collect(roots: Sequence[str], checkout: Path = ROOT, package: str = "dew") -
         yield parsed(path, relative, package)
 
 
-FORKED: ModelIndex | None = None
-"""The model index a worker of `main`'s pool reads: built once by the parent before the pool forks, and
-inherited, never sent."""
+INDEX: ModelIndex | None = None
+"""The model index `checked` reads: built once by `main`, before any fork, and inherited, never sent."""
 
 
 def checked(file: tuple[Path, str, str]) -> list[Finding]:
-    """One file's findings, in a worker that inherited the index (`FORKED`)."""
-    assert FORKED is not None, "a worker of main's pool, forked after the index was built"
-    return list(check(parsed(*file), FORKED))
+    """One file's findings, against the model index `main` built (`INDEX`)."""
+    assert INDEX is not None, "main builds the index before it reads a file"
+    return list(check(parsed(*file), INDEX))
 
 
 def default_roots(package: str) -> list[str]:
@@ -2092,10 +2089,10 @@ def default_roots(package: str) -> list[str]:
     return [f"src/{package}", "tests", "tools", "recipes", "examples", "site", "docs/assets", "kernels"]
 
 
-def main(argv: Sequence[str] | None = None, jobs: int = 1) -> int:
-    """The gate, its files read by `jobs` processes: the script runs one a processor, each a fork of a
-    process that holds no threads, and its findings print in the files' order, as one process prints them.
-    A caller in a process that may hold threads (a test, under JAX) reads them in its own process."""
+def main(argv: Sequence[str] | None = None, forked: bool = False) -> int:
+    """The gate, its files read in forked processes when `forked` (`forked_map`), as the script reads them,
+    its findings printed in the files' order, as one process prints them. A caller in a process that may
+    hold threads (a test, under JAX) reads them in its own process."""
     parser = argparse.ArgumentParser(description="Report low-evidence Python, `path:line:col: SLOPxxx`.")
     parser.add_argument("roots", nargs="*", help="directories or files under the checkout; by default the "
                         "package's source, tests, tools, recipes, examples, site, docs/assets and kernels")
@@ -2120,18 +2117,11 @@ def main(argv: Sequence[str] | None = None, jobs: int = 1) -> int:
     roots = args.roots or default_roots(args.package)
     counts: dict[str, int] = {}
     coded: dict[str, set[str]] = {}
-    global FORKED
-    FORKED = ModelIndex.build(list(collect([f"src/{args.package}"], args.root.resolve(), args.package)))
+    global INDEX
+    INDEX = ModelIndex.build(list(collect([f"src/{args.package}"], args.root.resolve(), args.package)))
     read = [(path, relative, args.package) for path, relative in files(roots, args.root.resolve())]
     seen = {relative for _, relative, _ in read}
-    if jobs > 1:
-        # A worker's collector would trace through everything the fork inherited: a worker collects nothing,
-        # and ends after 16 files, so what it leaves uncollected stays small.
-        forked = multiprocessing.get_context("fork")
-        with forked.Pool(jobs, initializer=gc.disable, maxtasksperchild=2) as pool:
-            found = pool.map(checked, read, chunksize=8)
-    else:
-        found = [checked(file) for file in read]
+    found = forked_map(checked, read) if forked else [checked(file) for file in read]
     for finding in (finding for each in found for finding in each):
         print(finding)
         counts[finding.code] = counts.get(finding.code, 0) + 1
@@ -2150,4 +2140,4 @@ def main(argv: Sequence[str] | None = None, jobs: int = 1) -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main(jobs=len(os.sched_getaffinity(0))))
+    raise SystemExit(main(forked=True))

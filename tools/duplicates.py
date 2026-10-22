@@ -34,10 +34,8 @@ It runs the test environment's pylint, which pyproject.toml's test extra pins.
 import argparse
 import ast
 import contextlib
-import gc
 import hashlib
 import io
-import multiprocessing
 import os
 import re
 import subprocess
@@ -49,6 +47,8 @@ from dataclasses import dataclass
 from itertools import pairwise
 from pathlib import Path
 from typing import TYPE_CHECKING
+
+from forked import forked_map
 
 if TYPE_CHECKING:
     from pylint.checkers.symilar import LineSet
@@ -418,28 +418,20 @@ def stripped(file: Path) -> tuple["LineSet", set[int]]:
     return lineset, {hash(window) for window in windows}
 
 
-def text_copies(files: list[Path], jobs: int) -> int:
+def text_copies(files: list[Path], forked: bool) -> int:
     """Print pylint's similarity report on the files of `files` that share a window, and return how many
     lines the copies it finds repeat.
 
-    pylint compares every two files, hashing both each time, which is quadratic in the files; it reports a
+pylint compares every two files, hashing both each time, which is quadratic in the files; it reports a
     copy only where two files share a window one line past its minimum (`stripped`). So each file is stripped
-    and hashed once, by `jobs` processes; files are grouped where they share such a window, transitively; and
-    pylint compares each group's files, in the files' order, as it compares them in a run over all of them: a
-    group shares no file and no line with another, so no copy in one changes what pylint reports in another.
-    A window of the minimum alone would join hundreds of files that share six lines of boilerplate into one
-    group, which pylint then compares pair by pair."""
+    and hashed once, in forked processes when `forked`; files are grouped where they share such a window,
+    transitively; and pylint compares each group's files, in the files' order, as it compares them in a run
+    over all of them: a group shares no file and no line with another, so no copy in one changes what pylint
+    reports in another.
+    """
     from pylint.checkers.symilar import Symilar  # its import alone takes seconds, which the structure skips
 
-    if jobs > 1:
-        # pylint's parser leaves cycles a worker's collector would trace through everything the fork
-        # inherited, which tripled the stripping's time: a worker collects nothing, and ends after 16 files,
-        # so what it leaves uncollected stays small.
-        forked = multiprocessing.get_context("fork")
-        with forked.Pool(jobs, initializer=gc.disable, maxtasksperchild=2) as pool:
-            read = pool.map(stripped, files, chunksize=8)
-    else:
-        read = [stripped(file) for file in files]
+    read = forked_map(stripped, files) if forked else [stripped(file) for file in files]
     # Each file's group, as the first file it shares a window with names it, merged where two groups meet.
     group = list(range(len(read)))
 
@@ -474,10 +466,9 @@ def text_copies(files: list[Path], jobs: int) -> int:
     return repeated
 
 
-def main(arguments: Sequence[str], jobs: int = 1) -> int:
-    """The gate, the text read by `jobs` processes: the script runs one a processor, each a fork of a
-    process that holds no threads; a caller in a process that may hold threads (a test, under JAX) reads
-    it in its own."""
+def main(arguments: Sequence[str], forked: bool = False) -> int:
+    """The gate, the text read in forked processes when `forked` (`forked_map`), as the script reads it; a
+    caller in a process that may hold threads (a test, under JAX) reads it in its own."""
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--base", help="a commit: a structural copy fails if written in more places than at"
                                        " its merge-base with HEAD")
@@ -503,7 +494,7 @@ def main(arguments: Sequence[str], jobs: int = 1) -> int:
     started = time.monotonic()
     text = 0
     if options.reading != "structure":
-        text = text_copies(files, jobs)
+        text = text_copies(files, forked)
     read = time.monotonic()
     hits = [] if options.reading == "text" else found({
         os.path.relpath(file.resolve(), top) if options.base else str(file): file.read_text()
@@ -521,4 +512,4 @@ def main(arguments: Sequence[str], jobs: int = 1) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:], jobs=len(os.sched_getaffinity(0))))
+    sys.exit(main(sys.argv[1:], forked=True))
