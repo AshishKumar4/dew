@@ -243,7 +243,6 @@ print(json.dumps({"saved": True}))
 """
 
 
-@pytest.mark.network
 def test_a_pipeline_is_one_whatever_its_root_config_unless_that_names_a_model(pipelines, tmp_path):
     """A pipeline directory loads as its components whatever else its root holds, a config.json too,
     for a run as for a load (`_pipeline_source`); one whose config.json names a model is that model,
@@ -260,6 +259,7 @@ def test_a_pipeline_is_one_whatever_its_root_config_unless_that_names_a_model(pi
         load_diffusion_source(str(copy), dtype="float32", attention_impl="xla", size=(16, 16))
 
 
+@pytest.mark.network
 def test_a_hub_pipeline_rebound_online_exports_offline_from_its_recorded_headers(tmp_path):
     """A saved tree rebound over a Hub pipeline whose weights it never downloads reads the
     export's headers and file listing over HTTP and records them (`hub_answer`); an offline
