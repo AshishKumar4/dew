@@ -156,12 +156,13 @@ def _mixed_columns(seed: int, rows: int = 128, small: tuple[float, float] = (5e2
 
 
 def _subnormal_share(seed: int, rows: int = 64):
-    # One query a row over 256 keys: 255 of logit 0 (their other entries drawn, which the query reads
-    # nothing of) whose values near fp32's largest in the first column overflow its sum, and one of logit
-    # -84 to -88 whose value near 1e38 sits alone in the second column, its weight over the denominator
-    # below fp32's least normal; the cotangent reads the second column alone, so D is that key's share
-    # and dQ's other entries are D times the other keys' weighted rows.
+    # One query a row over 256 keys: 255 of logits drawn in (-1, 0] (their other entries drawn, which the
+    # query reads nothing of) whose values near fp32's largest in the first column overflow its sum, and
+    # one of logit -84 to -88 whose value near 1e38 sits alone in the second column, its weight over the
+    # denominator below fp32's least normal; the cotangent reads the second column alone, so D is that
+    # key's share and dQ's other entries are D times the other keys' weighted rows.
     key = np.zeros((rows, 256, 1, 16), np.float32)
+    key[:, :255, 0, 0] = -_uniform(seed + 5, 0.0, 1.0, (rows, 255))
     key[:, :255, 0, 1:] = _normal(seed, (rows, 255, 15))[0]
     key[:, 255, 0, 0] = -_uniform(seed + 1, 84.0, 88.0, (rows,))
     value = np.zeros((rows, 256, 1, 16), np.float32)
@@ -605,7 +606,7 @@ def test_decode_is_finite_and_as_exact_as_the_reference_at_fp32s_edges(family, f
 @pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
 def test_a_guarded_rows_split_sums_keep_a_subnormal_share_element_wise(dtype):
     """The subnormal-share family's training forward in both mainloops: every row overflows, so its split
-    sums are the normalized pass's (shift -1, the anchor its first key). The share of the key whose
+    sums are the normalized pass's (shift -1, the anchor its largest logit's key). The share of the key whose
     normalized weight is below fp32's least normal, alone in `B`'s second column, held element-wise to
     float64 as exactly as the reference's own fp32 arithmetic for it (its weight `e / T` and that times the
     value, `assert_as_exact_as_the_reference`): a check of its rows, which a leaf's RMS beside the first
@@ -629,7 +630,7 @@ def test_a_guarded_rows_split_sums_keep_a_subnormal_share_element_wise(dtype):
                                          pad=attention_triton.BLOCK, residuals=True, natural=True)
     for name, (_, _, _, anchors, split) in (("triton", triton), ("portable", portable)):
         np.testing.assert_array_equal(np.asarray(split.shift), -1.0, err_msg=name)
-        np.testing.assert_array_equal(np.asarray(anchors), 0, err_msg=name)
+        np.testing.assert_array_equal(np.asarray(anchors), logits.argmax(axis=-1), err_msg=name)
         found = np.asarray(split.others[..., 1], np.float64)[..., None]
         assert_as_exact_as_the_reference(found, reference[..., None], truth[..., None],
                                          f"{name} {dtype} subnormal share")
