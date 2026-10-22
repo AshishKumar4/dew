@@ -634,7 +634,9 @@ def test_flow_evaluation_and_preview_use_live_policy_with_frozen_reference():
 
     preset = Flow(shift=3)
     process = preset()
-    shape = (2, 16, 1)
+    # Sixteen channels: check 1's rows run along the last axis, and a row of one value is sized by
+    # that value alone.
+    shape = (2, 2, 16)
     objective = FlowGRPOObjective(ConstantVelocity(), preset, InputSpec(Field("image", shape)),
                                   beta=0.1, guidance=None, steps=3)
     reference = objective.init(jax.random.key(51))
