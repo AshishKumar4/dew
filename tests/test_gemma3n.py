@@ -19,6 +19,8 @@ from interop_support import fixture_arrays
 from model_support import gate_margin
 import reference_error as _gate
 
+_probe_model = []
+
 
 def assert_as_exact(dew_fn, reference_fn, draw, label, *, seeds, truth_fn=None):
     import time
@@ -32,6 +34,34 @@ def assert_as_exact(dew_fn, reference_fn, draw, label, *, seeds, truth_fn=None):
             err = np.mean((np.asarray(found[name], np.float64) - np.asarray(truth[name], np.float64)) ** 2)
             per.setdefault(name, []).append(err)
     print(f"TAILTIME {label} {time.time() - started:.0f}s", flush=True)
+    import flax.linen as fnn
+    from model_support import gate_margin  # noqa: F401
+    model, variables = _probe_model[0], _probe_model[1]
+
+    def norms_of(tokens):
+        seen = {}
+
+        def record(next_fun, args, kwargs, context):
+            module = context.module
+            if context.method_name == "__call__" and type(module).__name__ == "RMSNorm" and args:
+                x = np.asarray(args[0], np.float64)
+                rms = np.sqrt(np.mean(x * x, axis=-1))
+                name = "/".join(str(p) for p in module.scope.path[-3:])
+                seen.setdefault(name, []).append(float(rms.min() / np.median(rms)))
+            return next_fun(*args, **kwargs)
+
+        with fnn.intercept_methods(record):
+            model.apply(variables, jnp.asarray(tokens), train=True)
+        return {name: min(v) for name, v in seen.items()}
+
+    table = {}
+    for seed in range(48):
+        rows = draw(seed)[0]
+        for name, value in norms_of(rows[:, :-1]).items():
+            table.setdefault(name, []).append(value)
+    worst = sorted(((min(v), name, int(np.argmin(v))) for name, v in table.items()))[:12]
+    for value, name, seed in worst:
+        print(f"NORM {name} min rms/median {value:.2e} at seed {seed}; seed 22 {table[name][22]:.2e} seed 41 {table[name][41]:.2e} median {np.median(table[name]):.2e}", flush=True)
     rows = sorted(((max(v) / np.median(v), name, len(v)) for name, v in per.items() if np.median(v) > 0), reverse=True)
     for spread, name, n in rows[:10]:
         print(f"TAIL {label} {name} max/median {spread:.1f} worst seed {int(np.argmax(per[name]))}", flush=True)
@@ -241,6 +271,8 @@ def test_a_training_step_updates_the_clamped_altup_coefficients_as_the_reference
             if gate_margin(model, loaded.variables, rows[:, :-1], train=True) > MARGIN:
                 return (rows,)
         raise AssertionError(f"no rows of seed {seed} clear the gates' margin {MARGIN}")
+
+    _probe_model[:] = [model, loaded.variables]
 
     def stepped(rows):
         # The step donates the state it is given: each draw steps from its own copy.
