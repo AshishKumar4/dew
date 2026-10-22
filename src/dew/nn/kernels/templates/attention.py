@@ -509,11 +509,13 @@ class Split(NamedTuple):
     """A training forward's split sums (`attention_algebra.split_accumulate`), residuals the backward
     reads in place of its first pass: the weighted values of every key but each query's anchor key,
     with the initial state's, `others` `[B, H, Q, Dv]`, the anchor's own weight `own` and the other
-    keys' weights' sum `others_total` `[B, H, Q]`, fp32, all at the forward's maximum."""
+    keys' weights' sum `others_total` `[B, H, Q]`, fp32, all at the forward's maximum and at each row's
+    `2^-shift` `[B, H, Q]` (`attention_algebra.room`)."""
 
     others: jax.Array
     own: jax.Array
     others_total: jax.Array
+    shift: jax.Array
 
 
 DQ_GRADS = (Kind.HEAD, Kind.QUERY)
@@ -590,12 +592,13 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
     widened = ((0, 0),) * 3 + ((0, call.value.shape[-1] - value_width),)
     others = jnp.pad(call.rows(split.others.astype(jnp.float32)), widened)
     own, others_total = call.rows(split.own), call.rows(split.others_total)
+    shift = call.rows(split.shift.astype(jnp.float32))
     # The anchor key's value row for each query, `[B, Qp, H, Dvp]`, a key head's for its query heads.
     anchor_value = jnp.take_along_axis(jnp.repeat(call.value, group, axis=2),
                                        jnp.swapaxes(key_index, 1, 2)[..., None], axis=1)
     maximum = call.rows(maxima.astype(jnp.float32))
     outputs = launch(*operands, *(call.rows(start) for start in starts), maximum, key_index, anchor_value,
-                     others, own, others_total, call.rows(totals.astype(jnp.float32)), *rows,
+                     shift, others, own, others_total, call.rows(totals.astype(jnp.float32)), *rows,
                      score_mod=hooks.score_mod, score_kinds=kinds, score_dtypes=dtypes, scale=scale)
     dq, softmax = outputs[0], outputs[1:6]
     grads_out = list(outputs[7:])
