@@ -1205,6 +1205,30 @@ def test_a_streamed_generation_serves_its_files_at_another_mount(tmp_path):
     assert publish(chunked(first).pack(4, bins=2), cache, read="streamed").url != generation.url
 
 
+def test_a_warm_cache_read_by_worker_processes_refuses_a_manifest_rewritten_since_it_was_committed(tmp_path):
+    """Worker processes read a published generation's manifest checked against the size and digest
+    its cache's CURRENT committed it under, as the process that compiled the read does: a manifest
+    rewritten since, the same records in other bytes, is refused, not read."""
+    from dew.data.compile import compile, publish
+    from dew.data.dataset import DataPartition, Loading
+
+    chain = Memory([{"id": index} for index in range(8)]).map(Offset(1))
+    cache = Cache(str(tmp_path / "cache"))
+    publish(chain, cache)
+    loader = compile(chain.cache(cache).repeat().batch(2), read="indexed",
+                     loading=Loading(workers=2, threads=1, read_buffer=2))
+    (manifest,) = (tmp_path / "cache").rglob("generations/*/manifest.json")
+    rewritten = json.dumps(json.loads(manifest.read_bytes()), indent=1).encode()
+    manifest.unlink()
+    manifest.write_bytes(rewritten)
+    reader = loader.train(DataPartition())
+    try:
+        with pytest.raises(OSError):
+            next(reader)
+    finally:
+        reader.close()
+
+
 def test_an_empty_stream_publishes_an_empty_generation():
     """A stream with no records publishes a generation of none, its shards read to their end."""
     from dew.data.compile import publish
