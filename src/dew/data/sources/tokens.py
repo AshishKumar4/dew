@@ -15,7 +15,7 @@ from dew.data.storage import Store, local
 
 from .base import Read, ShardManifest, _indexed_manifest, url_label
 from .files import Files, export_content
-from .index import ArrayIndex
+from .index import ArrayIndex, Ranges
 
 _SPLIT = "train"
 """The split a token export's description, fingerprint, shards and document index have always named
@@ -56,15 +56,18 @@ class TokenRecords:
     def records(self):
         from .records import ArrayRecords
 
-        counts = tuple(len(index.values) for index in self.indexes)
-        return ArrayRecords(self.paths, self.storage_options, counts=counts)
+        return ArrayRecords(self.paths, self.storage_options, counts=self.documents.counts)
+
+    @cached_property
+    def documents(self) -> Ranges:
+        """The documents each shard holds, one range after another."""
+        return Ranges(tuple(len(index.values) for index in self.indexes))
 
     @cached_property
     def shards(self) -> tuple[_TokenShard, ...]:
-        # Each shard's first document's place; an export of no shards has none.
-        starts = np.cumsum([0, *(len(index.values) for index in self.indexes)])[:-1]
-        return tuple(_TokenShard(index.values, int(start))
-                     for index, start in zip(self.indexes, starts, strict=True))
+        # Each shard's first document's place among the export's documents.
+        return tuple(_TokenShard(index.values, self.documents.start(shard))
+                     for shard, index in enumerate(self.indexes))
 
     def _document(self, index: int) -> np.ndarray:
         from .codec import decode
@@ -78,20 +81,21 @@ class TokenRecords:
         return np.asarray(value[self.field], dtype=self.dtype)
 
     @cached_property
-    def shard_ends(self) -> np.ndarray:
-        totals = [int(shard.ends[-1]) if len(shard.ends) else 0 for shard in self.shards]
-        return np.cumsum(totals, dtype=np.int64)
+    def spans(self) -> Ranges:
+        """The tokens each shard holds, one range after another."""
+        return Ranges(tuple(int(shard.ends[-1]) if len(shard.ends) else 0 for shard in self.shards))
 
     def __len__(self) -> int:
-        return int(self.shard_ends[-1]) if len(self.shard_ends) else 0
+        return len(self.spans)
 
     def __getitem__(self, span: slice) -> np.ndarray:
         start, stop, step = span.indices(len(self))
         if step != 1:
             raise ValueError("token stores are read in contiguous spans")
         pieces = []
-        for index in range(int(np.searchsorted(self.shard_ends, start, side="right")), len(self.shards)):
-            beginning = int(self.shard_ends[index - 1]) if index else 0
+        first = self.spans.locate(start)[0] if start < len(self) else len(self.shards)
+        for index in range(first, len(self.shards)):
+            beginning = self.spans.start(index)
             if beginning >= stop:
                 break
             shard = self.shards[index]
@@ -108,7 +112,7 @@ class TokenRecords:
 
     def __getstate__(self) -> Mapping[str, object]:
         """Workers reopen producer indexes instead of pickling their mapped columns."""
-        return {name: value for name, value in self.__dict__.items() if name != "shards"}
+        return {name: value for name, value in self.__dict__.items() if name not in ("shards", "spans")}
 
 
 def _document_ends(tokens: TokenRecords) -> np.ndarray:
