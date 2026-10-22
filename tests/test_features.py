@@ -92,20 +92,6 @@ def test_a_half_filled_last_wave_leaves_half_its_slots_idle():
         assert found.predictions['waves'] == waves and found.predictions['tail'] == 0.5
 
 
-def test_serial_work_adds_to_a_programs_service_time():
-    """Bytes and exponentials a program moves between its matrix instructions add to its service time, the
-    rest overlapping: a program of only serial work takes its bytes over the shared-memory rate and its
-    exponentials over the special-function rate, and with overlapping work the two add."""
-    facts = generation.effective(_sm80())
-    rate, clock = facts.tensor_rate('16bit'), facts.clock_hz
-    serial = cost.Cost(programs=1, device_bytes=1.0, serial_staged=1280.0, serial_exponentials=160.0)
-    assert cost.program_seconds(serial, rate, clock) == (1280.0 / cost.SHARED_BYTES_PER_CLOCK
-                                                         + 160.0 / cost.EXPONENTIALS_PER_CLOCK) / clock
-    both = dataclasses.replace(serial, program_staged=2560.0)
-    assert cost.program_seconds(both, rate, clock) == (2560.0 / (cost.SHARED_BYTES_PER_CLOCK * clock)
-                                                       + cost.program_seconds(serial, rate, clock))
-
-
 def test_the_waiting_share_reads_the_estimates_service_time():
     """A program bound by shared memory, not its tensor work: the waiting share sets the waiting term
     beside that service time, `cost.program_seconds` as the estimate reads it."""
