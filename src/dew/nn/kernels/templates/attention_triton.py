@@ -339,7 +339,7 @@ class TritonForward(Template[Tiles]):
         # The accurate form alone guards its sums (`algebra.Forward.headroom`); the fold walks as ever.
         spec = algebra.Forward(self.form, keys if self.keys is None else self.keys, ids, self.scale,
                                self.score_mod, self.natural,
-                               self.natural and algebra.headroom(value.dtype, initial), initial)
+                               self.natural and algebra.headroom(value.dtype), initial)
         kernel = functools.partial(
             _forward_kernel, spec=spec, score_kinds=self.score_kinds, output_kinds=self.output_kinds,
             initial=initial, residuals=residuals, output_mod=self.output_mod, block_k=block_k,
@@ -990,6 +990,6 @@ def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
     initial = hooks is not None and hooks.initial is not None
     # A guarded forward's live rows carry normalized split sums (`algebra.split_residuals`), which the first
     # pass cannot recompute without the forward's denominator: D comes from them.
-    split = split or (natural and algebra.headroom(value.dtype, initial))
+    split = split or (natural and algebra.headroom(value.dtype))
     launch = functools.partial(_launch, split=split, natural=natural, initial=initial, interpret=interpret)
     return gradients(launch, query, key, value, spans, hooks, dout, residuals, block=BLOCK, scale=scale)

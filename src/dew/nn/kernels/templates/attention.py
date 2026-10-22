@@ -17,9 +17,11 @@ a hook adds no op.
 
 Precision, every implementation's contract: the products of the inputs accumulate in fp32, the logits'
 scale, hooks and softmax run in fp32, and the probabilities round to the values' dtype for each product
-they enter, the output's `P V` and the backward's `P^T dO`, as jax's own attention
-(`jax.nn.dot_product_attention`'s xla path), FlashAttention and cuDNN do; the output normalizes in fp32
-before it rounds to the query's dtype (`reference`).
+they enter, the output's `P V` and the backward's `P^T dO`, as jax's own attention does
+(`jax.nn.dot_product_attention`'s xla path, jax/_src/nn/functions.py:
+`probs = softmax(...).astype(key.dtype)`) and FlashAttention 2's forward (csrc/flash_attn/src/flash_fwd_kernel.h: "Convert acc_s from fp32 to
+fp16/bf16" before the P V product); the output normalizes in fp32 before it rounds to the query's dtype
+(`reference`).
 """
 
 import dataclasses

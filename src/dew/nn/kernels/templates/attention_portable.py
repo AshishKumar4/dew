@@ -189,7 +189,7 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, 
     resumes = initial is not None
     spec = algebra.Forward(spans.form, spans.keys, call.query_ids is not None,
                            query.shape[3] ** -0.5 if scale is None else scale, hooks.score_mod, natural,
-                           natural and algebra.headroom(value.dtype, resumes), resumes)
+                           natural and algebra.headroom(value.dtype), resumes)
     out, kept = forward(
         spec, call.query, call.key, call.value, call.start, call.end, call.query_ids, call.key_ids,
         call.score_params, tuple(param.kind for param in hooks.score_params), call.output_params,
@@ -449,7 +449,7 @@ def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
     initial = hooks is not None and hooks.initial is not None
     # A guarded forward's live rows carry normalized split sums (`algebra.split_residuals`), which the first
     # pass cannot recompute without the forward's denominator: D comes from them.
-    split = split or (natural and algebra.headroom(value.dtype, initial))
+    split = split or (natural and algebra.headroom(value.dtype))
     launch = functools.partial(_launch, block_q=block_q, block_k=block_k, split=split, natural=natural,
                                initial=initial)
     return gradients(launch, query, key, value, spans, hooks, dout, residuals, block=pad, scale=scale)
