@@ -28,11 +28,13 @@ from dew.nn.kernels.templates.attention import (
 
 
 def _normalized_pass(spec: algebra.Forward, state: algebra.Partial, logits_at: Callable, anchor: jax.Array, *,
-                     bounds, initial: bool) -> tuple[jax.Array, jax.Array, jax.Array]:
+                     bounds, initial: tuple[jax.Array, jax.Array] | None
+                     ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """A guarded training walk's live rows' split sums, normalized: a pass over its keys (`logits_at` a
     tile's coordinates, logits and values) at the walk's maximum and natural denominator
-    (`algebra.normalized_terms`), as the Triton mainloop's."""
-    _, maximum, total = algebra.finish(spec, state, initial=initial)
+    (`algebra.normalized_terms`) from the `initial` state's share (`algebra.normalized_start`), as the
+    Triton mainloop's."""
+    _, maximum, total = algebra.finish(spec, state, initial=initial is not None)
 
     def step(j, carry):
         coords, logits, v_tile = logits_at(j)
@@ -41,7 +43,8 @@ def _normalized_pass(spec: algebra.Forward, state: algebra.Partial, logits_at: C
         return carry[0] + _dot(rest, v_tile), carry[1] + own_tile, carry[2] + rest.sum(axis=-1)
     nothing = jnp.zeros_like(total)
     lo, hi = bounds
-    return jax.lax.fori_loop(lo, hi, step, (jnp.zeros_like(state.acc), nothing, nothing))
+    start = algebra.normalized_start(initial, maximum, total, state.acc.shape[-1])
+    return jax.lax.fori_loop(lo, hi, step, (start, nothing, nothing))
 
 
 def _plain(held: algebra.Room | None, value: jax.Array) -> jax.Array | None:
@@ -152,10 +155,11 @@ def forward(spec: algebra.Forward, query: jax.Array, key: jax.Array, value: jax.
                                       _plain(held, v_tile))
             return stepped._replace(acc=acc), anchor, own, others_total
 
+        resumed = None if initial is None else (initial[0][row, head, rows], initial[1][row, head, rows],
+                                                initial[2][row, head, rows])
+
         def walk(live=None):
             # The plain walk where `live` is None, else the guarded one, those rows shifting.
-            resumed = None if initial is None else (initial[0][row, head, rows], initial[1][row, head, rows],
-                                                    initial[2][row, head, rows])
             start = algebra.started(spec, resumed, block_q, value_width, live)
             return algebra.walked(lo, hi, plain, step, start, residuals=residuals)
 
@@ -180,7 +184,8 @@ def forward(spec: algebra.Forward, query: jax.Array, key: jax.Array, value: jax.
             anchor_value = value[row, arg.key, kv_head]
             state = split._replace(acc=algebra.split_output(split.acc, own, anchor_value))
             terms = None if split.shift is None else _normalized_pass(
-                spec, state, logits_at, arg.key, bounds=(lo, hi), initial=initial is not None)
+                spec, state, logits_at, arg.key, bounds=(lo, hi),
+                initial=None if resumed is None else (resumed[0], resumed[2]))
             sums = algebra.split_residuals(split, own, others_total, terms)
             kept = (arg.key, *sums)
         else:
