@@ -52,79 +52,61 @@ def census(out: Path, limit: int) -> None:
     (out / "census.json").write_text(json.dumps(rows))
 
 
-def _route(config: dict) -> tuple[str, str]:
+def _route(config: dict, verified) -> tuple[str, str]:
+    """The census route of `config`: the loader's own decision on the config alone
+    (`dew.interop.pretrained.source_route`), and for a refusal, the refusal's own words. `verified`
+    checks an unregistered model_type against transformers, once per type (`classify`)."""
     from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 
     from dew.interop import decoder_parts, hf_decoders
-    from dew.interop.codecs import source_quantization
+    from dew.interop.pretrained import source_route
 
-    try:
-        # load_pretrained reads the storage format first, and refuses one its
-        # codecs cannot decode (MLX's affine groups) before any family does.
-        source_quantization(config)
-    except ValueError as error:
-        return "refused", f"storage format: {error}"[:300]
     if set(config) <= {"model_type", "architectures"}:
-        # A GGUF repo's stub config.json (MaziyarPanahi/Qwen3-0.6B-GGUF):
-        # load_pretrained names its GGUF files and gguf_file= before reading it.
+        # A GGUF repo's stub config.json (MaziyarPanahi/Qwen3-0.6B-GGUF): the loader reads its config
+        # from the GGUF file `gguf_file=` names, which the census does not fetch.
         return "gguf", "a stub config.json beside GGUF files"
     try:
-        hf_decoders.translate_config(config)
-        return "tier 1", "registered family"
+        route = source_route(config, verified=verified)
     except decoder_parts.DrafterRefused as error:
         return "by design", str(error)[:300]
     except (KeyError, ValueError, TypeError) as error:
-        registered_error = f"{type(error).__name__}: {error}"
+        if config["model_type"] not in CONFIG_MAPPING and config["model_type"] not in hf_decoders.families():
+            return "remote code", "transformers has no class for it"
+        return "refused", f"{type(error).__name__}: {error}"[:300]
+    if route.verified is None:
+        return "tier 1", f"registered {route.kind}"
     try:
-        hf_decoders.translate_wrapper_config(config)
-        return "tier 1", "registered wrapper"
-    except (KeyError, ValueError, TypeError) as error:
-        wrapper_error = f"{type(error).__name__}: {error}"
-    model_type = config.get("model_type")
-    if model_type in hf_decoders.families():
-        return "refused", f"registered family refuses this config: {registered_error}"[:300]
-    if "multimodal wrapper is registered" not in wrapper_error:
-        return "refused", f"registered wrapper refuses this config: {wrapper_error}"[:300]
-    if model_type not in CONFIG_MAPPING:
-        return "remote code", "transformers has no class for it"
-    return "tier 2?", ""
-
-
-def _probed(config: dict) -> "VerifiedMapping | str":
-    """The verified mapping of `config`'s model_type, or why it has none."""
-    from dew.interop import verify
-
-    try:
-        return verify.verify_mapping(config)
-    except (KeyError, ValueError, TypeError) as error:
-        return str(error).split(": ", 1)[-1][:300]
-
-
-def _verified(config: dict, mapping: "VerifiedMapping | str") -> tuple[str, str]:
-    """The route of `config` through its model_type's verified `mapping`, which reads each model's own
-    config as it was verified and refuses a field that one does not carry."""
-    if isinstance(mapping, str):
-        return "refused", mapping
-    try:
-        mapping.translate(config, ())
+        # The census reads the config only; a verified mapping reads the tensors' names beside it.
+        route.verified.translate(config, ())
     except ValueError as error:
         return "refused", str(error)[:300]
-    return "tier 2", f"{mapping.family} {mapping.error:.2e} <= {mapping.bound:.2e}"
+    return "tier 2", f"{route.verified.family} {route.verified.error:.2e} <= {route.verified.bound:.2e}"
 
 
 def classify(out: Path) -> None:
     rows = [row for row in json.loads((out / "census.json").read_text())
             if "config" in row and isinstance(row.get("model_type"), str)]
-    probed: dict[str, VerifiedMapping | str] = {}
+    from dew.interop import verify
+
+    probed: dict[str, VerifiedMapping | Exception] = {}
+
+    def verified(config: dict) -> VerifiedMapping:
+        """`verify.verify_mapping`, run once per model_type on its most downloaded model that no
+        registered family reads (the rows come ranked), its mapping or its refusal reused after."""
+        model_type = config["model_type"]
+        if model_type not in probed:
+            try:
+                probed[model_type] = verify.verify_mapping(config)
+            except (KeyError, ValueError, TypeError) as error:
+                probed[model_type] = error
+        found = probed[model_type]
+        if isinstance(found, Exception):
+            raise found
+        return found
+
     models = []
     for row in rows:
-        route, detail = _route(row["config"])
-        if route == "tier 2?":
-            # The probe runs once per model_type, on its most downloaded
-            # model that no registered family reads.
-            if row["model_type"] not in probed:
-                probed[row["model_type"]] = _probed(row["config"])
-            route, detail = _verified(row["config"], probed[row["model_type"]])
+        route, detail = _route(row["config"], verified)
         models.append({"id": row["id"], "model_type": row["model_type"], "downloads": row["downloads"],
                        "route": route, "detail": detail})
     types: dict[str, dict] = defaultdict(lambda: {"downloads": 0, "models": 0, "routes": defaultdict(int)})
