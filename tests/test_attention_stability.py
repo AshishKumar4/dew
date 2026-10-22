@@ -20,7 +20,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from attention_oracle import exact_attention
-from reference_error import assert_as_exact
+from reference_error import assert_as_exact, assert_as_exact_as_the_reference
 
 from dew.nn.kernels import decode_attention, generation, tuning
 from dew.nn.kernels.templates import attention as template, attention_portable, attention_triton
@@ -600,3 +600,37 @@ def test_decode_is_finite_and_as_exact_as_the_reference_at_fp32s_edges(family, f
     assert_as_exact(jax.jit(decoded), jax.jit(output(_reference(family, anchored=False))),
                     _cast(family, family.draw), f"decode {form} {family.dtype}", seeds=family.seeds,
                     truth_fn=output(_reference(family, anchored=True)))
+
+
+@pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
+def test_a_guarded_rows_split_sums_keep_a_subnormal_share_element_wise(dtype):
+    """The subnormal-share family's training forward in both mainloops: every row overflows, so its split
+    sums are the normalized pass's (shift -1, the anchor its first key). The share of the key whose
+    normalized weight is below fp32's least normal, alone in `B`'s second column, held element-wise to
+    float64 as exactly as the reference's own fp32 arithmetic for it (its weight `e / T` and that times the
+    value, `assert_as_exact_as_the_reference`): a check of its rows, which a leaf's RMS beside the first
+    column's would not see."""
+    query, key, value, _, _ = _cast(Family(_subnormal_share, np.ones((64, 1, 1, 256), bool), dtype=dtype),
+                                    _subnormal_share)(0)
+    spans = template.spans(1, 256, 64)
+    wide = [np.asarray(x, np.float64) for x in (query, key, value)]
+    logits = np.einsum("bqhd,bkhd->bhqk", wide[0], wide[1]) / 4.0
+    weights = np.exp(logits - logits.max(axis=-1, keepdims=True))
+    truth = weights[..., 255] / weights.sum(axis=-1) * wide[2][:, 255, 0, 1][:, None, None]
+    narrow = np.asarray(jnp.einsum("bqhd,bkhd->bhqk", jnp.asarray(query, jnp.float32),
+                                   jnp.asarray(key, jnp.float32)) / 4.0)
+    exponentials = np.exp(narrow - narrow.max(axis=-1, keepdims=True))
+    reference = (exponentials[..., 255] / exponentials.sum(axis=-1)
+                 * np.asarray(value, np.float32)[:, 255, 0, 1][:, None, None])
+    with tuning.pinned(PINS):
+        triton = attention_triton.forward(query, key, value, spans, residuals=True, natural=True,
+                                          interpret=True)
+    portable = attention_portable.attend(query, key, value, spans, block_q=32, block_k=32,
+                                         pad=attention_triton.BLOCK, residuals=True, natural=True)
+    for name, (_, _, _, anchors, split) in (("triton", triton), ("portable", portable)):
+        np.testing.assert_array_equal(np.asarray(split.shift), -1.0, err_msg=name)
+        np.testing.assert_array_equal(np.asarray(anchors), 0, err_msg=name)
+        found = np.asarray(split.others[..., 1], np.float64)[..., None]
+        assert_as_exact_as_the_reference(found, reference[..., None], truth[..., None],
+                                         f"{name} {dtype} subnormal share")
+
