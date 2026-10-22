@@ -315,7 +315,8 @@ def test_a_server_compiles_its_decoding_step_once_and_each_admission_width_once(
     compiled = []
 
     def listener(event, seconds, *, fun_name=None, **_):
-        if event == "/jax/core/compile/backend_compile_duration" and fun_name == "_stepped":
+        # JAX names a jitted function's compile `jit(<name>)`; the step programs are `_stepped`'s.
+        if event == "/jax/core/compile/backend_compile_duration" and fun_name == "jit(_stepped)":
             compiled.append(seconds)
 
     jax.monitoring.register_event_duration_secs_listener(listener)
