@@ -12,7 +12,9 @@ Arms, each on the same operands:
 - `xla`: the portable math in XLA (`chunk(..., ported=False)`, `linear.xla_conv1d`);
 - `fla`: fla's own torch/Triton kernels (`chunk_gated_delta_rule` on the queries and keys repeated
   over the value heads, as the layers hand them to it, `chunk_kda`, `causal_conv1d`);
-- `mamba_ssm`: mamba_ssm's `mamba_chunk_scan_combined`.
+- `mamba_ssm`: mamba_ssm's `mamba_chunk_scan_combined`;
+- `flashqla`: FlashQLA's TileLang kernels (`flash_qla.chunk_gated_delta_rule`, Hopper and Blackwell only),
+  the gated delta rule's queries and keys a key head each, as its API takes them.
 
 An arm that runs out of memory records the error in its row.
 
@@ -76,7 +78,7 @@ SHAPES = {
 }
 """The real shapes. Dory 1.0 4B has none: its layers are attention and MLP (its config.json)."""
 
-ARMS = {'gdn': ('template', 'hand', 'xla', 'fla'), 'kda': ('template', 'hand', 'xla', 'fla'),
+ARMS = {'gdn': ('template', 'hand', 'xla', 'fla', 'flashqla'), 'kda': ('template', 'hand', 'xla', 'fla'),
         'ssd': ('template', 'hand', 'xla', 'mamba_ssm'), 'conv': ('hand', 'xla', 'fla')}
 
 
@@ -213,7 +215,7 @@ def _failure(error: BaseException) -> str:
 
 
 def torch_arm(name: str, shape: Shape, arm: str, warmup: int, repeats: int) -> dict:
-    """fla's or mamba_ssm's kernels on `shape`, timed by CUDA events."""
+    """fla's, FlashQLA's or mamba_ssm's kernels on `shape`, timed by CUDA events."""
     import torch
 
     given = {key: torch.tensor(value, device='cuda') for key, value in operands(shape).items()}
@@ -228,6 +230,16 @@ def torch_arm(name: str, shape: Shape, arm: str, warmup: int, repeats: int) -> d
             return mamba_chunk_scan_combined(x, dt, A, B, C, shape.chunk, D=D, return_final_states=True)
 
         cotangents = (given['dy'].to(bf16), given['dfinal'])
+    elif arm == 'flashqla':
+        from flash_qla import chunk_gated_delta_rule as rule
+
+        leaves = [given['q'].to(bf16), given['k'].to(bf16), given['v'].to(bf16), given['g'],
+                  given['beta'].to(bf16)]
+
+        def run(q, k, v, g, beta):
+            return rule(q=q, k=k, v=v, g=g, beta=beta, scale=shape.key_width ** -0.5, output_final_state=True)
+
+        cotangents = (given['do'].to(bf16), given['dfinal'])
     elif shape.kind == 'conv':
         from fla.modules.convolution import causal_conv1d
 
@@ -325,7 +337,7 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument('mode', choices=('jax', 'torch', 'row'))
     parser.add_argument('runs', nargs='?', help="row mode: the JSON lines the other modes wrote")
     parser.add_argument('--shape', default='all', help=f"one of {sorted(SHAPES)} or 'all'")
-    parser.add_argument('--arm', choices=('fla', 'mamba_ssm'), help='torch mode: whose kernels')
+    parser.add_argument('--arm', choices=('fla', 'flashqla', 'mamba_ssm'), help='torch mode: whose kernels')
     parser.add_argument('--warmup', type=int, default=5)
     parser.add_argument('--repeats', type=int, default=20)
     parser.add_argument('--out', help='append JSON lines here as well as printing them')
