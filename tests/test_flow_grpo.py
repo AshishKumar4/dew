@@ -38,7 +38,7 @@ from dew.training import Trainer
 from tools.parity_flow_grpo import RECORDED, dew_transition, transition_inputs
 
 SEEDS = {'guided walk': 8, 'converted': 8, 'rescored walk': 16, 'clipping': 32, 'kl': 8, 'rollout': 64,
-         'inpainting': 32, 'live policy': 64, 'mixed precision': 32, 'prompt evaluation': 8}
+         'inpainting': 32, 'live policy': 64, 'mixed precision': 32, 'prompt evaluation': 16}
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada)."""
 ROWS = 64
 """A drawn batch's rows: enough that a few seeds resolve a site."""
