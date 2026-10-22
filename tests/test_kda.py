@@ -48,8 +48,10 @@ GROUPS = 32
 
 
 def oracle_layer(x, p, lower_bound, eps, rule):
-    """`Glm5NextTextLinearAttention.forward` in JAX at `x`'s dtype over `rule`."""
+    """`Glm5NextTextLinearAttention.forward` in JAX at `x`'s dtype over `rule`, its heads and head
+    width those of `p`."""
     batch, length, _ = x.shape
+    H, D = p["A_log"].shape[-1], p["o_norm"].shape[-1]
     mixed = jnp.concatenate([x @ p["q_proj"], x @ p["k_proj"], x @ p["v_proj"]], axis=-1)
     taps = jnp.concatenate([p[name][:, 0, :] for name in ("q_conv1d", "k_conv1d", "v_conv1d")])
     padded = jnp.pad(jnp.swapaxes(mixed, 1, 2), ((0, 0), (0, 0), (K - 1, 0)))
@@ -127,8 +129,9 @@ def test_the_recurrent_rule_matches_the_oracle_and_the_chunked_rule():
                     seeds=SEEDS['recurrent oracle'])
 
 
-def layer_and_params(lower_bound, seed=3):
-    """The layer, its parameters drawn from `seed` and its float32 variables."""
+def layer_and_params(lower_bound, seed=3, *, E=E, H=H, D=D):
+    """The layer of width `E`, `H` heads of `D`, its parameters drawn from `seed` and its float32
+    variables."""
     module = KimiDeltaAttention(emb_features=E, num_heads=H, head_dim=D, conv_kernel=K,
                                 lower_bound=lower_bound, chunk_size=4, norm_eps=1e-5)
     rng = np.random.RandomState(seed)
@@ -178,7 +181,10 @@ def test_the_layer_gradients_match_the_oracle():
     gate, the chunked rule across a chunk boundary and the gated norm: on
     par with the transcription's gradients from their float64 evaluation
     over drawn inputs, cotangents and parameters (check 1)."""
-    module, _, _ = layer_and_params(-5.0)
+    # Four heads of eight on a width of sixteen: a gate parameter's gradient is a long sum, whose
+    # error's spread over draws the toy layer's two heads leave unresolved.
+    wide = {"E": 16, "H": 4, "D": 8}
+    module, _, _ = layer_and_params(-5.0, **wide)
 
     def loss_module(x, variables, cotangent):
         return jnp.sum(module.apply(variables, x) * cotangent)
@@ -198,13 +204,12 @@ def test_the_layer_gradients_match_the_oracle():
         grad_x, grad_p = jax.grad(loss_oracle, argnums=(0, 1))(x, p, cotangent)
         return {"x": grad_x, **grad_p}
 
-    params = oracle_params(layer_and_params(-5.0)[2])
+    params = oracle_params(layer_and_params(-5.0, **wide)[2])
     stacked = jax.tree.map(lambda leaf: np.broadcast_to(leaf, (GROUPS, *leaf.shape)), params)
 
     def draw(seed):
-        # GROUPS batches a draw, each its own inputs and cotangent: a parameter's gradient is a row of
-        # a few values, a gate's error a long sum's, whose spread over draws one row leaves unresolved.
-        x, cotangent = np.random.RandomState(seed).randn(2, GROUPS, 16, S, E).astype(np.float32)
+        # GROUPS batches a draw, each its own inputs and cotangent, each gradient a row of its own.
+        x, cotangent = np.random.RandomState(seed).randn(2, GROUPS, 16, S, wide["E"]).astype(np.float32)
         return x, stacked, cotangent
 
     assert_as_exact(ours, theirs, draw, "layer gradients", seeds=SEEDS['layer gradients'])
