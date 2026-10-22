@@ -169,7 +169,7 @@ def test_a_supplied_gradient_is_what_the_trainer_steps_with():
 
 
 ROW_MEAN_SEEDS = 8
-"""Check 1's declared seeds for the row means, sized by `seeds_for` (2026-10-21, on armada)."""
+"""Check 1's declared seeds for the row means, sized by `seeds_for` (on armada)."""
 
 
 def squared_rows(seed: int) -> tuple[np.ndarray]:
