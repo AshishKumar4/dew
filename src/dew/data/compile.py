@@ -60,7 +60,16 @@ from dew.data.dataset import (
     Records,
 )
 from dew.data.facts import merge_facts
-from dew.data.lowering import _as_iter, _Build, _epoch_records, _Locality, _split_spans, _weights, _workers
+from dew.data.lowering import (
+    _as_iter,
+    _Build,
+    _epoch_records,
+    _Locality,
+    _split_spans,
+    _tail,
+    _weights,
+    _workers,
+)
 from dew.data.materialize import _materialize, _Memory
 from dew.data.mixing import CorpusCounts, Proportions
 from dew.data.pipeline import (
@@ -633,6 +642,7 @@ def _compiled(
         statistics=statistics,
         batch_tokens=staged.batch_tokens,
         device=device,
+        tail=_tail(train, build),
     )
 
 
@@ -776,7 +786,8 @@ def _compile_phases(
         phases = [(functools.partial(global_reader, loaded.train), end) for loaded, end in built]
         return PhasedStream(phases, loading.stop_seconds)
 
-    return dataclasses.replace(built[0][0], train=training)
+    # Only the last phase's order can end, so its batch decides what an epoch's short batch does.
+    return dataclasses.replace(built[0][0], train=training, tail=built[-1][0].tail)
 
 
 def _continued(pipeline: Pipeline, consumed: Mapping[str, int]) -> Pipeline:

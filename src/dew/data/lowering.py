@@ -57,6 +57,7 @@ from dew.data.dataset import (
     Loading,
     Ranges,
     Records,
+    Tail,
     _column,
     _shareable,
     _stacked,
@@ -1642,6 +1643,18 @@ def _epoch_records(train: Pipeline, build: _Build) -> int | None:
     # An order that ends holds no more than it reads before its batch, whatever bounds it after its repeat.
     with _closing(build.records(order, DataPartition())) as rows:
         return min(count, len(rows)) if isinstance(rows, pygrain.MapDataset) else count
+
+
+def _tail(train: Pipeline, build: _Build) -> Tail:
+    """What a training read of `train` does with the records an epoch leaves short of a batch: reads
+    them, where its order never ends (`_unending`) or the read repeats it at its root
+    (`_Build.batched`), so they lead the next epoch's batch, or where its batch keeps a short one;
+    drops them where its order ends and its batch drops it."""
+    batched = _until(train.stages, (BatchStage, TokenBudget))
+    order = dataclasses.replace(train, stages=train.stages[:batched])
+    rooted = build.training and build.lowering.endless and not build.lowering.repeated
+    drops = next((stage.drop_remainder for stage in train.stages if isinstance(stage, BatchStage)), True)
+    return "read" if _unending(order) or rooted or not drops else "dropped"
 
 
 def _bounds(stage: Stage) -> bool:
