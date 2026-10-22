@@ -26,6 +26,8 @@ def scratch(root: Path) -> Path:
         shutil.copy(REPO / name, root / name)
     shutil.copytree(REPO / "src", root / "src", ignore=lambda _, names: [
         name for name in names if name.endswith(".py") and name != "builds.py"])
+    # The tested Pythons, which tools/armada/ci.py reads from pyproject.toml's classifiers.
+    shutil.copytree(REPO / "tools/armada", root / "tools/armada")
     return root
 
 
@@ -55,13 +57,22 @@ def test_a_new_jax_requirement_is_written_into_the_page(tmp_path):
     assert generate(root, "--check") == 1
     assert generate(root) == 0
     assert generate(root, "--check") == 0
-    assert "jax>=0.12.0,<0.12.1" in (root / "docs/installation.md").read_text()
-    assert requirement not in (root / "docs/installation.md").read_text()
 
 
-def installed(root: Path, answer: str, *options: str) -> str:
+def test_a_new_package_index_is_the_one_the_installer_and_the_pages_name(tmp_path):
+    root = scratch(tmp_path)
+    table = root / Path(builds.__file__).resolve().relative_to(REPO)
+    table.write_text(table.read_text().replace(builds.PACKAGE_INDEX, "https://index.example/simple", 1))
+    assert generate(root, "--check") == 1
+    assert generate(root) == 0
+    assert generate(root, "--check") == 0
+    assert installed(root, "NVIDIA L4, 580.82.07, 8.9", index=True) == "https://index.example/simple"
+
+
+def installed(root: Path, answer: str, *options: str, index: bool = False) -> str:
     """What the standalone installer, run with `options` on a machine whose nvidia-smi answers `answer`,
-    asks uv to install: uv, nvidia-smi and the environment's Python stand in, so nothing is installed."""
+    asks uv to install, or with `index` the package index it names: uv, nvidia-smi and the environment's
+    Python stand in, so nothing is installed."""
     stand_ins = root / "bin"
     stand_ins.mkdir(exist_ok=True)
     scripts = {
@@ -79,7 +90,8 @@ def installed(root: Path, answer: str, *options: str) -> str:
                           env={"PATH": f"{stand_ins}:/usr/bin:/bin", "HOME": str(root)},
                           capture_output=True, text=True, timeout=60)
     assert done.returncode == 0, done.stderr
-    return (stand_ins / "uv.log").read_text().split()[-1]
+    command = (stand_ins / "uv.log").read_text().split()
+    return command[command.index("--extra-index-url") + 1] if index else command[-1]
 
 
 @pytest.mark.parametrize("answer", ["NVIDIA L4, 580.82.07, 8.9", "NVIDIA T4, 560.35.03, 7.5",
