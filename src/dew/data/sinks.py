@@ -9,7 +9,7 @@ import tempfile
 import uuid
 from collections.abc import Iterable, Iterator, Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
+from typing import TYPE_CHECKING, Literal
 
 import grain.python as grain
 import numpy as np
@@ -17,7 +17,7 @@ import pyarrow as pa
 import pyarrow.dataset as ds
 from array_record.python.array_record_module import ArrayRecordWriter
 
-from dew.data.dataset import Batch
+from dew.data.dataset import Batch, Closeable
 from dew.data.sources.base import Source
 from dew.data.sources.codec import encode
 from dew.data.sources.files import _arrow_filesystem
@@ -26,11 +26,6 @@ from dew.data.storage import ObjectRef, Store
 
 if TYPE_CHECKING:
     from dew.data.pipeline import Pipeline
-
-
-@runtime_checkable
-class _Closeable(Protocol):
-    def close(self) -> None: ...
 
 
 def _chunks(values: Iterable[Batch | bytes | None], rows: int) -> Iterator[list[Batch | bytes | None]]:
@@ -229,5 +224,5 @@ def export(
         root.child("_SUCCESS").put_if_absent(hashlib.sha256(encoded).hexdigest().encode())
         return manifest
     finally:
-        if isinstance(rows, _Closeable):
+        if isinstance(rows, Closeable):
             rows.close()

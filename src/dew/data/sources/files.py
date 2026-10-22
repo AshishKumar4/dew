@@ -29,6 +29,7 @@ from s3fs import S3FileSystem
 
 from dew.data.dataset import Batch, Records
 from dew.data.pipeline import Dataset
+from dew.data.steps.generic import Fields
 from dew.data.storage import Readable, Store, content_version, local
 from dew.records import integer, record
 
@@ -569,10 +570,12 @@ class Files(Dataset):
         return tuple(rows[index] for index in range(len(rows))) if read == "memory" else rows
 
     def _projected(self, rows: Records) -> Records:
-        """`rows` cut to `columns`, which an Arrow source's own reader selects."""
+        """`rows` cut to `columns`, which an Arrow source's own reader selects: each row checked to
+        hold them (`_Columns`), then projected to exactly those fields (`Fields`)."""
         if self.columns is None or self.kind in ("parquet", "arrow"):
             return rows
-        return _ProjectedRows(rows, _Projection(self.columns, self.describe()))
+        return (grain.MapDataset.source(rows).map(_Columns(self.columns, self.describe()))
+                .map(Fields(self.columns)))
 
     @cached_property
     def _arrow_files(self) -> tuple[pafs.FileSystem, tuple[str, ...], Mapping[str, str], str | None]:
@@ -646,7 +649,8 @@ class Files(Dataset):
         if self.kind in ("parquet", "arrow"):
             return grain.MapDataset.source(_ArrowFragment(self, shard.start)).to_iter_dataset()
         rows = self._shard_rows(shard)
-        return rows if self.columns is None else rows.map(_Projection(self.columns, self.describe()))
+        return rows if self.columns is None else rows.map(_Columns(self.columns, self.describe())).map(
+            Fields(self.columns))
 
     def _shard_rows(self, shard: Shard) -> grain.IterDataset:
         if self.kind == "array_record":
@@ -760,35 +764,21 @@ class Files(Dataset):
 
 
 @dataclass(frozen=True)
-class _Projection:
-    """A mapping row's `columns`, as an Arrow reader's projection selects them: a row that is not
-    a mapping, or lacks a column, is refused."""
+class _Columns:
+    """A row that holds `columns`, as an Arrow reader's projection reads them: a row that is not a
+    mapping, or lacks a column, is refused, naming the store."""
 
     columns: tuple[str, ...]
     described: str
 
-    def __call__(self, row: Batch | bytes | None) -> Batch | None:
-        if row is None:
-            return None
+    def __call__(self, row: Batch | bytes) -> Batch:
         if not isinstance(row, Mapping):
             raise ValueError(
                 f"{self.described} reads {type(row).__name__} rows, which have no columns to select")
         missing = [name for name in self.columns if name not in row]
         if missing:
             raise ValueError(f"{self.described} has a row without the columns {missing}")
-        return {name: row[name] for name in self.columns}
-
-
-@dataclass(frozen=True)
-class _ProjectedRows:
-    rows: Records
-    projection: _Projection
-
-    def __len__(self) -> int:
-        return len(self.rows)
-
-    def __getitem__(self, index: int) -> Batch | None:
-        return self.projection(self.rows[index])
+        return row
 
 
 @dataclass(frozen=True)
@@ -862,9 +852,7 @@ class _ArrowRecords:
 class _IndexedLines:
     def __init__(self, source: Files):
         self.source = source
-        self.indexes = (
-            (source.index,) if source.index else tuple(source._index_url(url) for url in source.paths)
-        )
+        self.indexes = source._indexes
         headers = source.__dict__.get("index_headers", {})
         self.index_files = tuple(
             ArrayIndex(url, source.storage_options, headers.get(url)) for url in self.indexes
