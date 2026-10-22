@@ -9,6 +9,8 @@ from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 
+from .visibility import visible
+
 
 class CrossDocuments(NamedTuple):
     """The packed documents of a call whose keys are not its queries
@@ -122,10 +124,6 @@ def cross_document_mask(segment_ids: CrossDocuments, *, causal: bool,
     _, keys = document_ids(segment_ids)
     ordered = _padding_last(keys)
     key_rank = jnp.arange(keys.shape[-1])[None, :] - _searched(ordered, ordered, "left")
-    distance = aligned_places(segment_ids)[:, :, None] - key_rank[:, None, :]
-    keep = document_mask(segment_ids)
-    if causal:
-        keep &= distance >= 0
-    if sliding_window is not None:
-        keep &= (distance < sliding_window) if causal else (jnp.abs(distance) < sliding_window)
+    keep = document_mask(segment_ids) & visible(aligned_places(segment_ids)[:, :, None], key_rank[:, None, :],
+                                                 causal=causal, window=sliding_window)
     return keep[:, None]
