@@ -3,11 +3,11 @@
 from collections.abc import Callable, Sequence
 
 
-def attempted(steps: Sequence[tuple[str, Callable[[], object]]], *,
+def attempted(steps: Sequence[tuple[str, Callable[[], None]]], *,
               primary: BaseException | None = None) -> None:
-    """Run every step, even after one fails, its result unread. Each failure is noted on `primary`,
-    the error its caller is already raising, which stays the one raised; without one the first
-    failure is raised with the later ones noted on it."""
+    """Run every step, even after one fails. Each failure is noted on `primary`, the error its
+    caller is already raising, which stays the one raised; without one the first failure is raised
+    with the later ones noted on it."""
     error = primary
     for label, step in steps:
         try:
