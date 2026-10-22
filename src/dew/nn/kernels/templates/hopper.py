@@ -12,8 +12,8 @@ however many rows a tile holds.
 
 A mainloop that drives its own loads (attention's K and V, released at different points of a step) streams
 each operand through a `Ring` whose counter runs across tiles, takes each warpgroup's role (`roles`), lets
-two consumers take turns at the tensor cores (`turn`), walks its tiles in its own order (`persistent`) and
-stores per-row vectors (`store_vector`).
+two consumers meet between their tensor-core phases (`rendezvous`), walks its tiles in its own order
+(`persistent`) and stores per-row vectors (`store_vector`).
 """
 
 import dataclasses
@@ -197,18 +197,24 @@ def ring(block: tuple, dtype, stages: int, *, consumers: int = 1, transforms: tu
             'consumed': plgpu.Barrier(num_arrivals=consumers, num_barriers=stages)}
 
 
-def roles(wg, consumers: int, consumer, producer, *, registers: tuple[int, int] = (232, 40)) -> None:
+CONSUMER_REGISTERS, PRODUCER_REGISTERS = 232, 40
+"""The registers a thread holds in a cooperative block's two consumer warpgroups and its producer: the
+producer only issues loads, and JAX's warp-specialized pipeline gives the consumers the rest of the
+multiprocessor's (`pipeline._compute_registers(40, 2)`)."""
+
+
+def roles(wg, consumers: int, consumer, producer) -> None:
     """Each warpgroup's role in a cooperative block: the `consumers` first run `consumer(wg)` with their
-    register budget raised to `registers[0]`, the last runs `producer()` with its lowered to
-    `registers[1]` (the producer only issues loads)."""
+    register budget raised to `CONSUMER_REGISTERS`, the last runs `producer()` with its lowered to
+    `PRODUCER_REGISTERS`."""
     @pl.when(wg < consumers)
     def _():
-        plgpu.set_max_registers(registers[0], action="increase")
+        plgpu.set_max_registers(CONSUMER_REGISTERS, action="increase")
         consumer(wg)
 
     @pl.when(wg == consumers)
     def _():
-        plgpu.set_max_registers(registers[1], action="decrease")
+        plgpu.set_max_registers(PRODUCER_REGISTERS, action="decrease")
         producer()
 
 
