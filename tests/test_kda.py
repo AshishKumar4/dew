@@ -51,6 +51,8 @@ SEEDS = {'chunk oracle': 8, 'recurrent oracle': 8, 'safe_gate layer': 8, 'softpl
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada)."""
 ROWS = 64
 """A layer draw's rows: one layer's few outputs a draw leave its error to a handful of values."""
+GROUPS = 32
+"""The layers a gradient draw holds, each with parameters of its own."""
 
 
 def oracle_layer(x, p, lower_bound, eps, rule):
@@ -193,22 +195,26 @@ def test_the_layer_gradients_match_the_oracle():
         return jnp.sum(oracle_layer(x, p, -5.0, 1e-5, partial(oracle_chunk, chunk_size=4)) * cotangent)
 
     @jax.jit
+    @jax.vmap
     def ours(x, p, cotangent):
         grad_x, grad_params = jax.grad(loss_module, argnums=(0, 1))(x, variables_of(p), cotangent)
         return {"x": grad_x, **oracle_params(grad_params)}
 
     @jax.jit
+    @jax.vmap
     def theirs(x, p, cotangent):
         grad_x, grad_p = jax.grad(loss_oracle, argnums=(0, 1))(x, p, cotangent)
         return {"x": grad_x, **grad_p}
 
     def draw(seed):
-        # Each draw's parameters its own, a parameter's gradient one row of a draw, summed over eight
-        # times a layer draw's rows: the gates' gradients sum terms whose tails few rows leave unresolved.
+        # GROUPS layers a draw, each its own parameters, inputs and cotangent: a parameter's gradient is
+        # a row of a few values, and a gate's error a long sum's, whose spread over draws few rows of
+        # it leave unresolved.
         rng = np.random.RandomState(seed)
-        params = oracle_params(layer_and_params(-5.0, seed=1000 + seed)[2])
-        x, cotangent = rng.randn(2, 8 * ROWS, S, E).astype(np.float32)
-        return x, params, cotangent
+        params = [oracle_params(layer_and_params(-5.0, seed=GROUPS * (1 + seed) + group)[2])
+                  for group in range(GROUPS)]
+        x, cotangent = rng.randn(2, GROUPS, ROWS, S, E).astype(np.float32)
+        return x, jax.tree.map(lambda *leaves: np.stack(leaves), *params), cotangent
 
     assert_as_exact(ours, theirs, draw, "layer gradients", seeds=SEEDS['layer gradients'])
 
