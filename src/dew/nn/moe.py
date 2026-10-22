@@ -25,7 +25,7 @@ from collections.abc import Callable, Mapping, Sequence
 import jax
 import jax.numpy as jnp
 from flax import linen as nn, struct
-from flax.linen.dtypes import canonicalize_dtype, promote_dtype
+from flax.linen.dtypes import canonicalize_dtype
 from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 from jax.custom_derivatives import SymbolicZero
@@ -37,7 +37,12 @@ from .activations import GatedActivation, gated_product, relu2, swiglu_clamped
 from .blocks import normal_kernel
 from .flops import MissingFlopsCount, counted_flops, projection_flops
 from .kernels.generation import backend, ran_kernel, route, triton_runs
-from .kernels.grouped_matmul import grouped_projection, kernel_refusal, ragged_dot_refusal, xla_ragged_dot
+from .kernels.grouped_matmul import (
+    grouped_projection,
+    kernel_refusal,
+    portable_projection,
+    ragged_dot_refusal,
+)
 from .kernels.selection import forced
 from .precision import (
     asks_default_precision,
@@ -488,55 +493,9 @@ def expert_projection(x: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
     if chosen == 'pallas' and seen_whole(x) and seen_whole(kernel):
         return grouped_projection(x, kernel, group_sizes, compute, implementation == 'pallas',
                                   not asks_default_precision(resolved, configured=True))
-    return _projection(x, kernel, group_sizes, dtype, resolved)
+    return portable_projection(x, kernel, group_sizes, dtype, resolved)
 
 
-@functools.partial(jax.custom_jvp, nondiff_argnums=(3, 4))
-def _projection(x: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
-                dtype: Dtype | None, precision: PrecisionLike) -> jax.Array:
-    """`expert_projection` in every differentiation mode, on `jax.lax.ragged_dot`."""
-    x, kernel = promote_dtype(x, kernel, dtype=dtype)
-    accumulated = xla_ragged_dot(x, kernel, group_sizes, precision=precision,
-                                 preferred_element_type=jnp.promote_types(x.dtype, jnp.float32))
-    return accumulated.astype(x.dtype)
-
-
-def _projection_jvp(dtype: Dtype | None, precision: PrecisionLike,
-                    primals: tuple[jax.Array, jax.Array, jax.Array],
-                    tangents: tuple[jax.Array, jax.Array, jax.Array]
-                    ) -> tuple[jax.Array, jax.Array | SymbolicZero]:
-    x, kernel, group_sizes = primals
-    dx, dkernel, _ = tangents
-    output = jnp.asarray(_projection(x, kernel, group_sizes, dtype, precision))
-    work = jnp.result_type(output.dtype, x.dtype, kernel.dtype, jnp.float32)
-    # A symbolic zero tangent contributes no term. Only the others pass the
-    # barrier: jax 0.11.2 cannot transpose one that holds a constant zero.
-    live = [(name, tangent) for name, tangent in (('x', dx), ('kernel', dkernel))
-            if not isinstance(tangent, SymbolicZero)]
-    if not live:
-        return output, SymbolicZero(jax.typeof(output))
-    # The tangents keep their dtypes to this point whatever produced them, so
-    # an activation's bf16 cotangent is not fused into a wider expression.
-    held = dict(zip((name for name, _ in live),
-                    jax.lax.optimization_barrier(tuple(tangent for _, tangent in live)),
-                    strict=True))
-    terms = []
-    if 'x' in held:
-        matrix = jnp.asarray(rounded_operand(kernel, output.dtype))
-        terms.append(xla_ragged_dot(
-            held['x'].astype(work), matrix.astype(work), group_sizes, precision=precision,
-            preferred_element_type=work))
-    if 'kernel' in held:
-        inputs = jnp.asarray(rounded_operand(x, output.dtype))
-        terms.append(xla_ragged_dot(
-            inputs.astype(work), held['kernel'].astype(work), group_sizes, precision=precision,
-            preferred_element_type=work))
-    total = terms[0] if len(terms) == 1 else terms[0] + terms[1]
-    tangent = jax.lax.optimization_barrier(total.astype(output.dtype))
-    return output, tangent
-
-
-_projection.defjvp(_projection_jvp, symbolic_zeros=True)
 
 
 class ExpertLinear(nn.Module):
@@ -688,7 +647,7 @@ def _stored_primal_jvp(run, primals, tangents):
     dx, _, dparameters, dweights = tangents
     # Only the live tangents are differentiated; a symbolic zero stays a
     # closed-over primal, since jax 0.11.2 cannot transpose a zero tangent
-    # through `_projection`'s barrier.
+    # through `portable_projection`'s barrier.
     leaves, tree = jax.tree.flatten((x, parameters, input_weights))
     directions = jax.tree.leaves((dx, dparameters, dweights),
                                  is_leaf=lambda leaf: isinstance(leaf, SymbolicZero))
