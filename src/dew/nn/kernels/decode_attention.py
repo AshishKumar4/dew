@@ -143,7 +143,8 @@ def _spec(scale: float, softcap: float | None, natural: bool, dtype, capacity: i
     (`grouped_query`), so the hook takes no query positions."""
     return algebra.Forward("spans", 0, ids=False, scale=scale,
                            score_mod=None if softcap is None else functools.partial(_capped, softcap),
-                           natural=natural, headroom=algebra.headroom(dtype, capacity, sinks))
+                           natural=natural, headroom=natural and algebra.headroom(dtype, capacity, sinks),
+                           initial=sinks)
 
 
 def _attend(query: jax.Array, span: tuple, read, block: int, spec: algebra.Forward, steps,

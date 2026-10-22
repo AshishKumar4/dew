@@ -210,9 +210,11 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, 
         state = hooks.initial
         initial = (call.rows(state.m, -jnp.inf), call.rows(state.total),
                    jnp.pad(call.rows(state.acc), ((0, 0),) * 3 + ((0, call.value.shape[-1] - value_width),)))
+    # The accurate form alone guards its sums (`algebra.Forward.headroom`); the fold walks as ever.
+    resumes = initial is not None
     spec = algebra.Forward(spans.form, spans.keys, call.query_ids is not None,
                            query.shape[3] ** -0.5 if scale is None else scale, hooks.score_mod, natural,
-                           algebra.headroom(value.dtype, call.key.shape[1], hooks.initial is not None))
+                           natural and algebra.headroom(value.dtype, call.key.shape[1], resumes), resumes)
     out, kept = forward(
         spec, call.query, call.key, call.value, call.start, call.end, call.query_ids, call.key_ids,
         call.score_params, tuple(param.kind for param in hooks.score_params), call.output_params,
@@ -247,12 +249,14 @@ def _logits(score_mod, query, key, seen, q_pos, k_pos, params, scale: float, slo
 
 def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_index, anchor_value, shift,
                sums, spans, score_params, *, score_mod, score_kinds: tuple[Kind, ...], scale: float,
-               block_q: int, block_k: int):
+               how: algebra.Recompute, block_q: int, block_k: int):
     """The Triton mainloop's dQ launch (`attention_triton._dq_launch`), a query block and head at a time:
     the first pass at the forward's maximum to each query's denominator and `D - c`
     (`algebra.off_anchor_delta`), then dQ and the dQ program's hook gradients under it, `D` refined once
     from its own sums (`algebra.refinement`)."""
     batch, queries, heads, width = query.shape
+    # The logits' scale as the forward took it: 1 for raw products, scaled in the weights (`how`).
+    factor = scale if how.factor is None else 1.0
     keys, kv_heads = key.shape[1], key.shape[2]
     group = heads // kv_heads
     blocks = queries // block_q
@@ -288,10 +292,10 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
             # D without the forward's split sums: the dQ launch's own pass over the keys.
             def row_terms(j, state):
                 columns, seen, params, k_tile, v_tile = tile(j)
-                logits, _ = _logits(score_mod, q, k_tile, seen, q_pos, columns[None, :], params, scale)
+                logits, _ = _logits(score_mod, q, k_tile, seen, q_pos, columns[None, :], params, factor)
                 at_anchor = columns[None, :] == chosen[:, None]
                 exponentials, rest, own = algebra.off_anchor_weights(logits, maxima, at_anchor, v_tile.dtype,
-                                                                     shifts)
+                                                                     shifts, how)
                 return algebra.off_anchor(state, exponentials, rest, own, _dot(rest, v_tile), shifts)
 
             walked = jax.lax.fori_loop(lo, hi, row_terms, before)
@@ -311,9 +315,9 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
             # mainloop's dQ launch.
             dq, residual, mass, grads, weighed = carry
             columns, seen, params, k_tile, v_tile = tile(j)
-            logits, slopes = _logits(score_mod, q, k_tile, seen, q_pos, columns[None, :], params, scale,
+            logits, slopes = _logits(score_mod, q, k_tile, seen, q_pos, columns[None, :], params, factor,
                                      slopes=True)
-            weights = algebra.normalized(logits, m, jnp.ones_like(m))[0]
+            weights = algebra.normalized(logits, m, jnp.ones_like(m), how)[0]
             cotangents = algebra.grad_scores(weights, _dot(do, v_tile.T), anchor, delta, seen,
                                              columns[None, :] == chosen[:, None], algebra.inverse(prior))
             pulled, pieces = algebra.pulled(cotangents, slopes, seen, score_kinds)
@@ -362,11 +366,14 @@ def _dq_outputs(dq, rows_out, chosen, written, kinds: tuple[Kind, ...], blocks: 
 
 
 def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, spans, score_params, *,
-                score_mod, score_kinds: tuple[Kind, ...], scale: float, block_q: int, block_k: int):
+                score_mod, score_kinds: tuple[Kind, ...], scale: float, how: algebra.Recompute, block_q: int,
+                block_k: int):
     """The Triton mainloop's dK/dV launch (`attention_triton._dkv_launch`), a key block and query head at a
     time, under the dQ launch's softmax at its tiles: the query head's dK, dV `[B, Kp, H, ...]` and the
     key and tile parameters' gradients (`DKV_GRADS`, `[B, H, Kp]` and `[B, H, Qp, Kp]`)."""
     batch, queries, heads, width = query.shape
+    # The logits' scale as the forward took it: 1 for raw products, scaled in the weights (`how`).
+    factor = scale if how.factor is None else 1.0
     keys, kv_heads, value_width = key.shape[1], key.shape[2], value.shape[-1]
     group = heads // kv_heads
     blocks = keys // block_k
@@ -391,8 +398,8 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
                            for param, kind in zip(score_params, score_kinds, strict=True))
             m, denominator = peak[row, head, rows], total[row, head, rows]
             logits, slopes = _logits(score_mod, q, k_tile, seen, rows[:, None], columns[None, :], params,
-                                     scale, slopes=True)
-            exponentials, weights = algebra.normalized(logits, m, denominator)
+                                     factor, slopes=True)
+            exponentials, weights = algebra.normalized(logits, m, denominator, how)
             cotangents = algebra.grad_scores(exponentials, _dot(do, v_tile.T), anchor[row, head, rows],
                                              delta[row, head, rows], seen,
                                              columns[None, :] == key_index[row, head, rows][:, None],
@@ -438,12 +445,15 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
 def _launch(query, key, value, dout, peak, total, initial_term, maximum, key_index, anchor_value, shift,
             others, own, others_total, forward_total, start, end, query_ids, key_ids, score_params, *,
             score_mod, score_kinds: tuple[Kind, ...], score_dtypes: tuple[str, ...], scale: float,
-            block_q: int, block_k: int, split: bool):
-    """The Triton backward's outputs (`TritonBackward`), from this mainloop's two launches."""
+            block_q: int, block_k: int, split: bool, natural: bool, initial: bool):
+    """The Triton backward's outputs (`TritonBackward`), from this mainloop's two launches, recomputing the
+    weights as a forward of the call's form computed them (`algebra.recompute`)."""
     del score_dtypes
     spans = start, end, query_ids, key_ids
-    shared = {"score_mod": score_mod, "score_kinds": score_kinds, "scale": scale, "block_q": block_q,
-              "block_k": block_k}
+    how = algebra.recompute(algebra.Forward("full", 0, ids=False, scale=scale, score_mod=score_mod,
+                                            natural=natural, initial=initial))
+    shared = {"score_mod": score_mod, "score_kinds": score_kinds, "scale": scale, "how": how,
+              "block_q": block_q, "block_k": block_k}
     sums = (others, own, others_total, forward_total) if split else None
     dq, softmax, chosen, dq_grads = _dq_launch(query, key, value, dout, peak, total, initial_term, maximum,
                                                key_index, anchor_value, shift, sums, spans, score_params,
@@ -468,5 +478,7 @@ def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
                                                   block_k=block_k, pad=pad, scale=scale, residuals=True,
                                                   natural=natural)
         residuals = maxima, totals, anchors, sums
-    return gradients(functools.partial(_launch, block_q=block_q, block_k=block_k, split=split), query, key,
-                     value, spans, hooks, dout, residuals, block=pad, scale=scale)
+    initial = hooks is not None and hooks.initial is not None
+    launch = functools.partial(_launch, block_q=block_q, block_k=block_k, split=split, natural=natural,
+                               initial=initial)
+    return gradients(launch, query, key, value, spans, hooks, dout, residuals, block=pad, scale=scale)
