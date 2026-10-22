@@ -291,14 +291,15 @@ of 2^-62 or more is pushed below fp32's least normal however large the shift."""
 
 
 class Room(NamedTuple):
-    """A guarded tile's arithmetic (`room`): its weights at `2^-min(shift, WEIGHT_SHIFT)`, the factor the
-    state's sums take, the row's new shift and value bound, and `beyond`, the shift past its weights', which
-    the tile's product and weight sums take (`beyond_weights`), the tile's weights unshifted, `plain`,
-    whose product the mainloop issues too (`stepped`), the factor `alpha` the unshifted sums take, and the
-    state's guard before the tile, `before`."""
+    """A guarded tile's arithmetic (`room`): its weights at `2^-min(shift, WEIGHT_SHIFT)`, the change of
+    the row's shift its state's sums take after its factor (`drop`, at most 0; `carry_factor`), the row's
+    new shift and value bound, and `beyond`, the shift past its weights', which the tile's product and
+    weight sums take (`beyond_weights`), the tile's weights unshifted, `plain`, whose product the mainloop
+    issues too (`stepped`), the factor `alpha` the state's sums take, and the state's guard before the
+    tile, `before`."""
 
     weights: jax.Array
-    factor: jax.Array
+    drop: jax.Array
     shift: jax.Array
     reach: jax.Array
     beyond: jax.Array
@@ -315,25 +316,36 @@ def beyond_weights(x: jax.Array, room: Room | None) -> jax.Array:
     return power2(x, room.beyond if x.ndim == room.beyond.ndim else expand(room.beyond, x))
 
 
+def carry_factor(x: jax.Array, alpha: jax.Array, held: Room | None) -> jax.Array:
+    """A state's sum before a tile (`[bq, Dv]` or `[bq]`) taken by its factor `alpha` to the tile's
+    maximum and, on the guarded walk, by the change of the row's shift after it (`Room.drop`), a power of
+    two on the product: no factor below fp32's least normal is formed, so a shift that grows by 126
+    binades or more at once keeps a sum the factor alone would flush."""
+    taken = rescale(x, alpha) if x.ndim > alpha.ndim else alpha * x
+    if held is None:
+        return taken
+    return power2(taken, held.drop if taken.ndim == held.drop.ndim else expand(held.drop, taken))
+
+
 def tile(state: Partial, alpha: jax.Array, p: jax.Array, value: jax.Array
          ) -> tuple[jax.Array, jax.Array, Room | None]:
-    """A tile's weights for its product and the factor the state's sums take, with the guarded walk's
-    `Room` (`room`), None on the plain walk, whose weights and factor are `p` and `alpha` as ever."""
+    """A tile's weights for its product and the factor the state's sums take (`carry_factor`), with the
+    guarded walk's `Room` (`room`), None on the plain walk, whose weights are `p` as ever."""
     if state.guard is None:
         return p, alpha, None
     held = room(state.guard, state.total, alpha, p, value)
-    return held.weights, held.factor, held
+    return held.weights, alpha, held
 
 
 def stepped(state: Partial, m: jax.Array, factor: jax.Array, p: jax.Array, product: jax.Array,
             held: Room | None, times: Callable[[jax.Array], jax.Array]) -> Partial:
-    """The state after a tile: its sums taken by `factor` and the tile's `product` of its weights `p` and
-    their sum added at the row's shift (`beyond_weights`; `tile`), with the tile's unshifted weights'
-    product, which the mainloop issues as `times` of them (their product with the tile's values), kept
-    unshifted (`Guard.plain`); the plain walk's arithmetic where `held` is None, which issues no other
-    product."""
-    denominator = factor * state.total + beyond_weights(p.sum(axis=-1), held)
-    acc = rescale(state.acc, factor) + beyond_weights(product, held)
+    """The state after a tile: its sums taken by `factor` (`carry_factor`) and the tile's `product` of its
+    weights `p` and their sum added at the row's shift (`beyond_weights`; `tile`), with the tile's
+    unshifted weights' product, which the mainloop issues as `times` of them (their product with the
+    tile's values), kept unshifted (`Guard.plain`); the plain walk's arithmetic where `held` is None,
+    which issues no other product."""
+    denominator = carry_factor(state.total, factor, held) + beyond_weights(p.sum(axis=-1), held)
+    acc = carry_factor(state.acc, factor, held) + beyond_weights(product, held)
     if held is None:
         return Partial(acc, m, denominator)
     # The unshifted sums beside them: finite in every column the plain walk kept finite (`finish`).
@@ -362,8 +374,8 @@ def room(guard: Guard, total: jax.Array, alpha: jax.Array, p: jax.Array, value: 
     natural = power2(alpha * total, guard.shift) + p.sum(axis=-1)
     shift = jnp.where(guard.live, jnp.maximum(guard.shift, needed(natural, reach)), guard.shift)
     weight = jnp.minimum(shift, WEIGHT_SHIFT)
-    return Room(power2(p, expand(-weight, p)), power2(alpha, guard.shift - shift), shift, reach,
-                weight - shift, p, alpha, guard)
+    return Room(power2(p, expand(-weight, p)), guard.shift - shift, shift, reach, weight - shift, p, alpha,
+                guard)
 
 
 def base2_maximum(m: jax.Array) -> jax.Array:
@@ -648,11 +660,12 @@ def split_accumulate(others: jax.Array, own: jax.Array, others_total: jax.Array,
     past its weights' (`beyond_weights`)."""
     old = old_value.astype(jnp.float32)
     joined = jnp.where(expand(moved, old), expand(own, old) * old, 0.0)
-    total = (alpha * (others_total + jnp.where(moved, own, 0.0))
+    total = (carry_factor(others_total + jnp.where(moved, own, 0.0), alpha, held)
              + beyond_weights(rest.astype(jnp.float32).sum(axis=-1), held))
     own_tile = beyond_weights(own_tile.astype(jnp.float32), held)
     product = beyond_weights(product, held)
-    return rescale(others + joined, alpha) + product, jnp.where(moved, own_tile, alpha * own), total
+    return (carry_factor(others + joined, alpha, held) + product,
+            jnp.where(moved, own_tile, carry_factor(own, alpha, held)), total)
 
 
 def small_shift(dtype) -> int:
@@ -745,9 +758,12 @@ def merge(spec: Forward, first: Partial, second: Partial) -> Partial:
                + power2(factors[1] * second.total, others.shift))
 
     def joined(shift):
-        a, b = power2(factors[0], ones.shift - shift), power2(factors[1], others.shift - shift)
-        acc = expand(a, first.acc) * first.acc + expand(b, second.acc) * second.acc
-        return acc, a * first.total + b * second.total
+        # Each state's factor, then its shift's change as a power of two on the product (`carry_factor`).
+        a, b = factors
+        drops = ones.shift - shift, others.shift - shift
+        acc = (power2(expand(a, first.acc) * first.acc, expand(drops[0], first.acc))
+               + power2(expand(b, second.acc) * second.acc, expand(drops[1], second.acc)))
+        return acc, power2(a * first.total, drops[0]) + power2(b * second.total, drops[1])
 
     a, b = factors
     plain = expand(a, ones.plain) * ones.plain + expand(b, others.plain) * others.plain
