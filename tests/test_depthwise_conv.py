@@ -210,3 +210,17 @@ def test_depthwise_quantization_keeps_the_original_provider_output(training):
             np.testing.assert_array_equal(lhs, rhs)
         before, after = old.apply(old_variables, x), new.apply(new_variables, x)
     np.testing.assert_array_equal(before, after)
+
+
+def test_the_materialized_depthwise_sum_starts_from_a_positive_zero():
+    """The materialized form sums its nine taps onto a positive zero, so taps that are all negative
+    zero (a zero input under a negative kernel) give positive zero, the sign cuDNN's accumulator
+    gives, where the barriered form keeps the first product's."""
+    from dew.nn import conv
+
+    x = jnp.zeros((1, 6, 6, 4), jnp.float32)
+    w = -jnp.ones((3, 3, 1, 4), jnp.float32)
+    for dilation in (1, 2):
+        assert not np.signbit(np.asarray(conv._materialized_depthwise_3x3(x, w, dilation))).any()
+        assert np.signbit(np.asarray(conv._shifted_depthwise_3x3(x, w, dilation))).all()
+

@@ -23,7 +23,7 @@ import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
-from dew.nn.blocks import Modulation, sinusoidal_time
+from dew.nn.blocks import Modulation, sinusoid_frequencies, sinusoidal_time, sinusoids
 from dew.nn.conv import Conv
 from dew.nn.dense import Dense
 from dew.nn.flops import MissingFlopsCount, matching_lengths, patch_lengths, projection_flops
@@ -56,12 +56,11 @@ def sincos_position(channels: int, grid: int, *, base_size: int):
     """
     steps = jnp.arange(grid, dtype=jnp.float32) / (grid / base_size)
     columns, rows = jnp.meshgrid(steps, steps, indexing="xy")  # width goes first
-    half = channels // 2
-    omega = 1.0 / 10000 ** (jnp.arange(half // 2, dtype=jnp.float32) / (half / 2.0))
+    quarter = channels // 4
+    omega = jnp.asarray(sinusoid_frequencies(quarter, quarter))
 
     def axis(values):
-        angles = values.reshape(-1)[:, None] * omega[None, :]
-        return jnp.concatenate([jnp.sin(angles), jnp.cos(angles)], axis=1)
+        return sinusoids(values.reshape(-1)[:, None] * omega[None, :])
 
     return jnp.concatenate([axis(columns), axis(rows)], axis=1)[None]
 
@@ -112,10 +111,7 @@ class SD3Transformer(TextStream, nn.Module):
                  + embedding_flops(rows, TIME_FEATURES, self.features)
                  + embedding_flops(rows, pooled_features, self.features))
         for index in range(self.num_layers):
-            block = DoubleStreamBlock(self.features, self.heads, self.head_dim,
-                                       context_pre_only=index == self.num_layers - 1,
-                                       dual_attention=index in self.dual_attention_layers, parent=None)
-            count += block.multisequence_flops(lengths, context_lengths)
+            count += self._block(index, parent=None).multisequence_flops(lengths, context_lengths)
         return (count + self._output_modulation().model_flops(rows)
                 + projection_flops(lengths, self.features, self.patch_size**2 * self.out_channels))
 
@@ -137,6 +133,15 @@ class SD3Transformer(TextStream, nn.Module):
         top, left = (maximum - height) // 2, (maximum - width) // 2
         cropped = table[:, top:top + height, left:left + width, :]
         return cropped.reshape(1, height * width, self.features)
+
+    @nn.nowrap
+    def _block(self, index: int, **where) -> DoubleStreamBlock:
+        """Joint block `index` as the model runs it, named by `where` (or unbound, `parent=None`, where a
+        FLOP count reads it): one factory, so the count and the execution build the same block."""
+        return DoubleStreamBlock(
+            self.features, self.heads, self.head_dim, qk_norm=self.qk_norm is not None,
+            context_pre_only=index == self.num_layers - 1, dual_attention=index in self.dual_attention_layers,
+            attention_impl=self.attention_impl, dtype=self.dtype, precision=self.precision, **where)
 
     @nn.nowrap
     def _output_modulation(self):
@@ -177,13 +182,9 @@ class SD3Transformer(TextStream, nn.Module):
         context = Dense(self.caption_projection_dim, name="context_embedder", **dense,
                         dot_general=float32_dot_general)(
             conditioning.context)
-        dual = set(self.dual_attention_layers)
         for index in range(self.num_layers):
-            image, context = DoubleStreamBlock(
-                self.features, self.heads, self.head_dim, qk_norm=self.qk_norm is not None,
-                context_pre_only=index == self.num_layers - 1, dual_attention=index in dual,
-                attention_impl=self.attention_impl, name=f"transformer_blocks_{index}", **dense)(
-                    image, context, conditioned)
+            image, context = self._block(index, name=f"transformer_blocks_{index}")(
+                image, context, conditioned)
 
         scale, shift = self._output_modulation()(conditioned)
         image = modulate(layer_norm(self.dtype)(image), shift, scale)
