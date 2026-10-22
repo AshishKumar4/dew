@@ -304,8 +304,9 @@ def unpacked(model: nn.Module, variables: Variables) -> Variables:
     devices whole (fully addressable, or replicated on every device) splits on the host; any other
     one, sharded across processes or over this process's own devices, splits where it lives. A
     group stored quantized for serving (`TextGeneration.quantized`, Qwix's arrays in place of its
-    kernel) splits as well, each member its own values and scales (`dew.quantization.split_columns`).
-    A tree that holds no group to split is returned as it is."""
+    kernel) splits as well, each member its own values and scales (`dew.quantization.split_columns`);
+    one whose output axis is quantized in tiles a member would cut is refused there. A tree that
+    holds no group to split is returned as it is."""
     groups = _held_packed(model, variables)
     if not groups:
         return variables
