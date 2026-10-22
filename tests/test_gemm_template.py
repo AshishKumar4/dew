@@ -598,10 +598,10 @@ def test_a_fused_producers_gradients_are_its_own(producer):
         x = x.at[:4].set(0)  # a ReLU's zero, where its custom derivative differs from max(x, 0)'s
         return x, w, nw
 
-    def loss(gemm):
+    def loss(gemm, transform=lambda value: value):
         def value(x, w, weight):
             return jnp.sum(gemm(producer(x, weight), w).astype(jnp.float32))
-        return jax.grad(value, argnums=(0, 1, 2))
+        return jax.grad(transform(value), argnums=(0, 1, 2))
 
     def fused_gemm(operand, w):
         return fused.fusible_gemm(operand, w, sizes, interpret_on_cpu=True)
@@ -614,24 +614,33 @@ def test_a_fused_producers_gradients_are_its_own(producer):
         return jax.lax.ragged_dot(operand, matrix, sizes, preferred_element_type=operand.dtype)
 
     with generation.assumed("sm80"), generation.routes() as taken:
-        fusing = loss(fused_gemm)
-        assert_as_exact(jax.jit(fuser.fuse(fusing)), jax.jit(loss(plain_gemm)), draw,
+        assert_as_exact(jax.jit(loss(fused_gemm, fuser.fuse)), jax.jit(loss(plain_gemm)), draw,
                         f"{producer.__name__} gradients", seeds=SEEDS, truth_fn=loss(truth_gemm))
     assert {route.kernel for route in taken if route.choice == 'gemm_prologue'} == {'fused'}
 
 
 def test_a_one_row_normed_operand_fuses():
-    """A one-row operand's row statistic keeps its rows axis: the product of one normed row."""
-    x, w, _, nw, *_ = _draw(0)
-    x, sizes = x[:1], jnp.asarray([1] + [0] * (len(SIZES) - 1))
+    """A one-row operand's row statistic keeps its rows axis: the product of one normed row, as exact as
+    the unfused program from float64."""
+    sizes = jnp.asarray([1] + [0] * (len(SIZES) - 1))
+
+    def draw(seed):
+        x, w, _, nw, *_ = _draw(seed)
+        return x[:1], w, nw
 
     def fusing(x, w, weight):
         return fused.fusible_gemm(rms_norm(x, weight), w, sizes, interpret_on_cpu=True)
 
+    def unfused(x, w, weight):
+        return template.gemm(rms_norm(x, weight), w, sizes, out_dtype=jnp.float32)
+
+    def truth(x, w, weight):
+        matrix = w.astype(jnp.bfloat16).astype(x.dtype)
+        return jax.lax.ragged_dot(rms_norm(x, weight), matrix, sizes, preferred_element_type=x.dtype)
+
     with generation.assumed("sm80"), generation.routes() as taken:
-        value = jax.jit(fuser.fuse(fusing))(x, w, nw)
-    expected = template.gemm(rms_norm(x, nw), w, sizes, out_dtype=jnp.float32)
-    np.testing.assert_array_equal(np.asarray(value), np.asarray(expected))
+        assert_as_exact(jax.jit(fuser.fuse(fusing)), jax.jit(unfused), draw, "one normed row", seeds=SEEDS,
+                        truth_fn=truth)
     assert {route.kernel for route in taken if route.choice == 'gemm_prologue'} == {'fused'}
 
 
