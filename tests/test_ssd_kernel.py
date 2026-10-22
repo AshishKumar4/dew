@@ -3,13 +3,14 @@
 `dew.nn.kernels.ssd` computes what `xla_chunk_scan`, transformers' `mamba2_chunk_scan` in its order,
 computes. The kernel is written for TPU (a GPU runs mamba_ssm's own kernels,
 `dew.nn.kernels.mamba_ssd`); a host without one runs it through
-`pallas_call(interpret=True)`, which checks shapes, dtypes, resets and state gradients, and its numbers
-by the per-leaf float64 rule (`assert_interpreted_parity`); the compiled TPU kernel holds check 1 at
-every geometry.
+`pallas_call(interpret=True)`, which checks shapes, dtypes, resets and state gradients, and holds the
+host cases' numbers to check 1 as the compiled TPU kernel holds its own.
 
-CPU interpretation's dots follow the host ISA. The one-short state-gradient RMS ratio was 1.598
-(99.9% interval [1.581, 1.617], 640 seeds) on AMD x86-64-v4, versus 0.77 on v3; one-over's final-state
-ratio was 1.508 ([1.475, 1.543], 160 seeds) on v4. These measure CPU lowering, not TPU arithmetic.
+Interpreted, the kernel and XLA's scan are two Dew paths on the CPU, compiled with equal dots
+(`equal_dots`): by default the scan's dots reached XLA:CPU's YNNPACK fusions, which pick their
+microkernels by the host's ISA, and the interpreter's did not, and the one-short state gradient's
+ratio read 1.598 on AMD x86-64-v4 and 0.77 on v3 (ledger row 1349). On equal dots the nine host
+cases' worst leaf is 1.17 on v4, the one-short case's 1.20 on v3.
 
 One driver (`assert_kernel_parity`) holds every case to the same rule: the
 kernel's forward, final state and all five gradients finite and, by
@@ -30,13 +31,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import (
-    assert_as_exact,
-    assert_computes_the_oracle,
-    assert_leaves_as_exact,
-    equal_dots,
-    float64_terms,
-)
+from reference_error import assert_as_exact, assert_computes_the_oracle, equal_dots
 from ssd_support import ssd_orbit
 
 from dew.nn.kernels.recurrence_chunk import RESET_DECAY
@@ -268,8 +263,9 @@ SEEDS = {
     ("shape", ((1, 1024, 4, 64, 64, 1), 128)): 64,
     ("shape", ((1, 4096, 4, 64, 64, 1), 128)): 256,
 }
-"""Sized by seeds_for on XLA's output, final state and all five gradients (2026-10-20, armada), and
-resolving at these counts against the TPU's own XLA on a v5e (11 cases, 2026-10-21)."""
+"""Sized by seeds_for on XLA's output, final state and all five gradients (on armada), resolving at
+these counts against the TPU's own XLA on a v5e (11 cases) and, interpreted on equal dots, the nine
+host cases on an AMD x86-64-v4 host."""
 
 
 on_device = pytest.mark.tpu(reason="needs a tpu, the one backend the kernel is chosen on")
@@ -291,10 +287,10 @@ CASES = [
 ]
 
 
-@on_device
 @pytest.mark.parametrize(("kind", "case", "compiled"), CASES)
 def test_the_kernel_is_as_exact_as_the_xla_scan(reference, kind, case, compiled):
-    """The compiled TPU kernel against float64, every forward and gradient leaf over declared draws."""
+    """The kernel, interpreted on the host or compiled on a TPU, against float64: every forward and
+    gradient leaf over declared draws (check 1)."""
     if compiled:
         shape, chunk_size = case
         assert ssd_kernel_runs(chunk_size, shape[3], shape[4], jax.default_backend(), dtype=jnp.float32)
@@ -309,60 +305,7 @@ def test_the_kernel_is_as_exact_as_the_xla_scan(reference, kind, case, compiled)
                          roundings=roundings, seeds=SEEDS[kind, case], label=f"{kind} {case}")
 
 
-def assert_interpreted_parity(operands, seeded, chunk_size: int, *, roundings: int):
-    """The interpreted kernel's forward and all five gradients finite and by the per-leaf float64 rule
-    (`assert_leaves_as_exact`) against the stepwise recurrence in float64, the XLA path's fp32 run the
-    reference, the XLA path's arithmetic in float64 first held to the recurrence. This is the rule the
-    host cases held before check 1: there the scan's dots reached XLA:CPU's dot fusions, dispatched by
-    the host's ISA, and the interpreter's did not, which moved check 1's ratio across its factor by the
-    host (one-short's state gradient 1.598 on x86-64-v4, 0.77 on v3); both arms now compile with
-    `equal_dots` (ledger row 1349). The compiled TPU cases hold check 1."""
-    def xla(*operands):
-        return xla_chunk_scan(*operands, chunk_size)
-
-    def kernel(*operands):
-        return ssd_chunk_scan(*operands, chunk_size, "tpu")
-
-    with jax.enable_x64(new_val=True):
-        exact = [jnp.asarray(np.asarray(t), jnp.float64) for t in operands]
-        wide_seeds = tuple(jnp.asarray(np.asarray(t), jnp.float64) for t in seeded)
-        truth = jax.jit(stepwise_scan)(*exact)
-        truth_gradients = jax.jit(lambda *o: jax.vjp(stepwise_scan, *o)[1](wide_seeds))(*exact)
-
-        def twin_and_gradients(*o):
-            return (*xla(*o), *jax.vjp(xla, *o)[1](wide_seeds))
-
-        twin, terms = float64_terms(twin_and_gradients, *exact)
-        truth = [np.asarray(t) for t in (*truth, *truth_gradients)]
-        twin, terms = ([np.asarray(t) for t in values] for values in (twin, terms))
-    # The kernel against XLA's scan, two Dew paths: their dots on the same code (`equal_dots`).
-    theirs = (*equal_dots(xla)(*operands), *equal_dots(lambda *o: jax.vjp(xla, *o)[1](seeded))(*operands))
-    mine = (*equal_dots(kernel)(*operands), *equal_dots(lambda *o: jax.vjp(kernel, *o)[1](seeded))(*operands))
-    reductions = chunk_size * max(operands[0].shape[-1], operands[1].shape[-1])
-    names = ("output", "final", "x", "B", "C", "A dt", "state")
-    for name, ours, xlas, wide, want, summed in zip(names, mine, theirs, twin, truth, terms, strict=True):
-        assert np.all(np.isfinite(np.asarray(ours))), name
-        assert_computes_the_oracle(wide, want, name, roundings=roundings)
-        assert_leaves_as_exact({name: np.asarray(ours)}, {name: np.asarray(xlas)}, {name: want},
-                               reductions=reductions, terms={name: summed})
-
-
 HOST_CASES = [pytest.param(*param.values[:2], id=param.id) for param in CASES if not param.values[2]]
-
-
-@pytest.mark.parametrize(("kind", "case"), HOST_CASES)
-def test_the_interpreted_kernel_keeps_the_float64_rule(reference, kind, case):
-    """The host cases' numbers, interpreted: by the per-leaf float64 rule, the one site of this file
-    left on it until the host-ISA finding (`assert_interpreted_parity`) is diagnosed."""
-    operands, seeded = case_draw(reference, kind, case)(0)
-    if kind == "fixture":
-        chunk_size = case[0]
-        _, length, _, width = reference["scan.x"].shape
-        roundings = length + width + reference["scan.B"].shape[-1]
-    else:
-        shape, chunk_size = case
-        roundings = shape[1] + shape[3] + shape[4]
-    assert_interpreted_parity(operands, seeded, chunk_size, roundings=roundings)
 
 
 @pytest.mark.parametrize(("kind", "case"), HOST_CASES)
