@@ -11,6 +11,7 @@ and the call's queries and keys pad to whole blocks, which their spans leave unr
 """
 
 import dataclasses
+import os
 import functools
 from collections.abc import Callable, Sequence
 
@@ -321,8 +322,10 @@ class TritonForward(Template[Tiles]):
             per_value = pl.BlockSpec((None, None, block_q, value_width), lambda i, b, h: (b, h, i, 0))
             out_specs += [per_row, per_row, per_row, per_value, per_row, per_row]
         # A call's own key count, none included; an op built without one counts its launch's keys.
+        import math
+        shift = math.ceil(math.log2(keys + 2)) if os.environ.get("DEW_SHIFT_MEASURE") else 0
         spec = algebra.Forward(self.form, keys if self.keys is None else self.keys, ids, self.scale,
-                               self.score_mod, self.natural)
+                               self.score_mod, self.natural, shift)
         kernel = functools.partial(
             _forward_kernel, spec=spec, score_kinds=self.score_kinds, output_kinds=self.output_kinds,
             initial=initial, residuals=residuals, output_mod=self.output_mod, block_k=block_k,

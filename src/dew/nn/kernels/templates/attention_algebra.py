@@ -45,6 +45,7 @@ class Forward:
     scale: float
     score_mod: Callable | None = None
     natural: bool = NATURAL
+    shift: int = 0
 
     @property
     def base2(self) -> bool:
@@ -166,7 +167,8 @@ def peak(spec: Forward, m: jax.Array, s: jax.Array) -> tuple[jax.Array, jax.Arra
 
 def weights(spec: Forward, s: jax.Array, m: jax.Array) -> jax.Array:
     """A tile's unnormalized weights `[bq, bk]` under the running maximum `m`, fp32."""
-    return spec.power(s - expand(_safe(spec, m), s))
+    p = spec.power(s - expand(_safe(spec, m), s))
+    return p * 2.0 ** -spec.shift if spec.shift else p
 
 
 def narrow(p: jax.Array, dtype) -> jax.Array:
