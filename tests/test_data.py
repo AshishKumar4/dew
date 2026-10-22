@@ -1271,7 +1271,7 @@ def test_a_batch_encoders_identity_is_the_plan_format_it_has_always_been():
 
     reader = Reader()
     assert EncodeCaptions(reader.captions).identity == (
-        f"dew.encode-captions:{__name__}.test_a_batch_encoders_identity_names_its_reader_as_a_steps_identity_does."
+        f"dew.encode-captions:{__name__}.test_a_batch_encoders_identity_is_the_plan_format_it_has_always_been."
         "<locals>.Reader.captions")
     assert EncodeFields(reader.fields).identity.endswith("<locals>.Reader.fields")
     module = keep_captions.__module__

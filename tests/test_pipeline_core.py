@@ -2051,12 +2051,20 @@ def test_a_streamed_repeat_repeats_where_it_is_written_past_a_limit_or_a_repeat(
 
 
 def test_a_nested_mixture_counts_its_epoch_from_each_part():
-    """A mixture of a corpus and a mixture ends its epoch when the first of its
-    parts comes round, the inner mixture counted the same way: the inner one
-    of 8 and 4 rows at even weights in 16, the outer of 12 and 16 in 32."""
+    """A mixture of a corpus and a mixture, no part of either repeated, ends its
+    epoch where its mix stops, at the first part it reads to its end, the inner
+    mixture counted the same way: the inner one of 8 and 4 rows at even weights
+    in 8, the outer of 12 and those 8 in 16, the records a pass reads."""
     inner = mix([Pipeline(source(8)), Pipeline(source(4))], weights=(1, 1))
     nested = mix([Pipeline(source(12)), inner], weights=(1, 1))
-    assert compile(nested.batch(2), loading=READ).records == 32
+    loader = compile(nested.batch(2), loading=READ)
+    assert loader.records == 16
+    reader = loader.train(DataPartition())
+    try:
+        read = [int(value) for batch in itertools.islice(reader, 16) for value in batch["id"]]
+    finally:
+        reader.close()
+    assert read[16:] == read[:16]
 
 
 def test_a_streamed_training_read_with_a_random_step_and_no_repeat_never_runs_out():
