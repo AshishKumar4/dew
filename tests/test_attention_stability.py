@@ -299,6 +299,24 @@ def _resumed(seed):
             value.astype(np.float32), state, dout * np.float32(2.0 ** -12))
 
 
+def _resumed_beside_overflow(seed):
+    # One query a row of zeros, so both of its keys weigh alike, resumed from a state of denominator 1 at a
+    # drawn maximum in [-1, 1) whose weighted values hold a draw in the second column alone; the keys'
+    # values near fp32's largest in the first column overflow its sum, and the cotangent reads the second
+    # column alone, the state's: a guarded training walk's normalized split sums carry the state's share.
+    m = _uniform(seed, -1.0, 1.0, (RESUMED, 1, 1))
+    acc = np.zeros((RESUMED, 1, 1, 16), np.float32)
+    acc[..., 1] = _uniform(seed + 1, -1.0, 1.0, (RESUMED, 1, 1))
+    value = np.zeros((RESUMED, 2, 1, 16), np.float32)
+    value[..., 0] = _uniform(seed + 2, 2.9e38, 3.4e38, (RESUMED, 2, 1))
+    value[..., 2:] = _uniform(seed + 3, -1.0, 1.0, (RESUMED, 2, 1, 14))
+    key, cotangent = _normal(seed + 4, (RESUMED, 2, 1, 16), (RESUMED, 1, 1))
+    dout = np.zeros((RESUMED, 1, 1, 16), np.float32)
+    dout[..., 1] = cotangent
+    state = (m.astype(np.float32), np.ones((RESUMED, 1, 1), np.float32), acc)
+    return np.zeros((RESUMED, 1, 1, 16), np.float32), key, value, state, dout
+
+
 def _families() -> dict[str, Family]:
     small = functools.partial(_small_weight, queries=8, logits=(16.0, 21.0), sizes=(3.0, 5.0))
     edge = functools.partial(_small_weight, queries=1, logits=(80.0, 87.0), sizes=None)
@@ -376,6 +394,9 @@ def _families() -> dict[str, Family]:
 
     families["a resumed state of a large denominator"] = Family(_resumed, np.ones((RESUMED, 1, 1, 2), bool),
                                                                 folded=False)
+    # The headroom is the accurate form's: the fold's sum of those values overflows.
+    families["a resumed state beside an overflowing column"] = Family(
+        _resumed_beside_overflow, np.ones((RESUMED, 1, 1, 2), bool), folded=False)
     for low, high, label in ((-3.0, 3.0, ""), (1e38, 3e38, " near fp32's largest")):
         # One query a row, so the decode kernel takes the family too.
         name = f"a decode step's sink{label} and one key"
