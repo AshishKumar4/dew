@@ -56,7 +56,7 @@ CONFIG = json.loads((FIXTURES / "config.json").read_text())
 GENERATOR = load("mla_reference")
 """tools/mla_reference.py, whose configs and transformers classes build the reference blocks."""
 
-SEEDS = {"v3 block": 16, "v3n block": 16, "v32 block": 16, "auto": 16, "decode": 16, "value columns": 16,
+SEEDS = {"v3 block": 16, "v3n block": 32, "v32 block": 8, "auto": 64, "decode": 8, "value columns": 8,
          "yarn": 16}
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` on armada: the most any of
 a site's cases took."""
