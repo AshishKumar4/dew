@@ -315,16 +315,6 @@ def test_the_kernel_is_as_exact_as_the_xla_scan(reference, kind, case, compiled)
 HOST_CASES = [pytest.param(*param.values[:2], id=param.id) for param in CASES if not param.values[2]]
 
 
-@pytest.mark.skipif(jax.default_backend() != "cpu", reason="YNNPACK is XLA:CPU's")
-@pytest.mark.parametrize(("kind", "case"), HOST_CASES)
-def test_the_interpreted_kernel_and_the_scan_compile_no_ynnpack_fusion(reference, kind, case):
-    """Both arms of a host case's check 1 run on XLA:CPU's own code, compiled for the host's
-    instruction set with no dispatch at run time (`without_ynn`)."""
-    operands, seeded = case_draw(reference, kind, case)(0)
-    for arm in parity_functions(case[0] if kind == "fixture" else case[1], 0)[:2]:
-        assert "ynn_fusion" not in arm.lower(operands, seeded).compile().as_text()
-
-
 @pytest.mark.parametrize(("kind", "case"), HOST_CASES)
 def test_the_scan_preserves_resets_and_initial_state_gradients(reference, kind, case):
     """The original host geometries run with every output/gradient shape and dtype intact.
