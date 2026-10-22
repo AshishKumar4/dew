@@ -723,11 +723,11 @@ def _parameter_roots(inputs: Mapping[str, object], autoencoder: Mapping[str, obj
     """The parameter roots of a recorded run's tree, which a storage override
     casts: the denoiser's, each condition encoder's own collections and the
     autoencoder's. The rest keep the dtypes they were saved in."""
-    from dew.objectives.base import FROZEN
+    from dew.objectives.base import PARAMETER_ROOTS
     from dew.records import record, text
     from dew.registry import encoders
 
-    roots: list[tuple[str, ...]] = [("params",), (FROZEN,)]
+    roots: list[tuple[str, ...]] = list(PARAMETER_ROOTS)
     for keyword, condition in record(inputs['conditions'], 'conditions').items():
         name = text(record(record(condition, keyword)['encoder'], 'encoder')['class'], 'encoder class')
         collections = encoders[name].parameter_collections
