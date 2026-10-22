@@ -66,6 +66,15 @@ def _uniform(seed: int, low: float, high: float, shape=()) -> np.ndarray:
 ROWS = 32
 """The independent instances a draw holds along its batch, so a family's draw resolves check 1 over its
 seeds (`reference_error.seeds_for`): each row its own drawn values under the family's structure."""
+RESUMED = 128
+"""The resumed family's rows, more, as each holds one query over two keys."""
+SEEDS = {"ties at scale 1": 64, "ties at scale 1, cotangents near 2**125": 64, "ties at scale 1/2": 64,
+         "ties at scale 1/2, cotangents near 2**125": 64, "ties at scale 1/4": 64,
+         "ties at scale 1/4, cotangents near 2**125": 64, "a sink and one key": 64, "logits near 1e4": 32,
+         "a small weight on a large value, float32": 32, "a small weight on a large value, bfloat16": 64,
+         "a resumed state of a large denominator": 64, "a decode step's sink and one key": 64}
+"""Each family's declared seeds past `reference_error.FEWEST_SEEDS`, the fewest over which the reference
+compared with itself resolves check 1's parity (`reference_error.seeds_for`)."""
 
 
 def _first(sizes: np.ndarray, width: int) -> np.ndarray:
@@ -156,23 +165,23 @@ def _families() -> dict[str, Family]:
             return query, key, value, None, dout
         return draw
 
-    def small_weight(dtype):
+    def small_weight(dtype, rows=128):
         # Eight queries a row over 256 keys of which two are seen: a key of logit 0 and one whose logit is
         # each query's drawn size in [3, 5) times its key's -l, l drawn in [16, 21), so its weight is
         # exp(-20) to exp(-105), normal in fp32 and bf16, on a value of 2^e, e drawn in [120, 126]: its
         # share of the output, a weight shifted for the keys' count before it is narrowed would lose.
         def draw(seed):
-            query = _first(_uniform(seed + 4, 3.0, 5.0, (ROWS, 8)), 16)
-            key = np.zeros((ROWS, 256, 1, 16), np.float32)
-            key[:, 1, 0, 0] = -_uniform(seed, 16.0, 21.0, (ROWS,))
-            value = np.zeros((ROWS, 256, 1, 16), np.float32)
-            value[:, 1, 0, 0] = 2.0 ** np.floor(_uniform(seed + 1, 120.0, 127.0, (ROWS,)))
-            value[:, :2, 0, 1:] = _uniform(seed + 3, -1.0, 1.0, (ROWS, 2, 15))
-            (dout,) = _normal(seed + 2, (ROWS, 8, 1, 16))
+            query = _first(_uniform(seed + 4, 3.0, 5.0, (rows, 8)), 16)
+            key = np.zeros((rows, 256, 1, 16), np.float32)
+            key[:, 1, 0, 0] = -_uniform(seed, 16.0, 21.0, (rows,))
+            value = np.zeros((rows, 256, 1, 16), np.float32)
+            value[:, 1, 0, 0] = 2.0 ** np.floor(_uniform(seed + 1, 120.0, 127.0, (rows,)))
+            value[:, :2, 0, 1:] = _uniform(seed + 3, -1.0, 1.0, (rows, 2, 15))
+            (dout,) = _normal(seed + 2, (rows, 8, 1, 16))
             return query, key, value, None, dout
-        seen = np.zeros((ROWS, 1, 8, 256), bool)
+        seen = np.zeros((rows, 1, 8, 256), bool)
         seen[..., :2] = True
-        return Family(draw, seen, {"lengths": np.full(ROWS, 2)}, dtype=dtype)
+        return Family(draw, seen, {"lengths": np.full(rows, 2)}, dtype=dtype)
 
     families = {
         "ties at scale 1": Family(_ties(1, 1.0), kept(1, 2)),
@@ -245,26 +254,27 @@ def _families() -> dict[str, Family]:
         # times a draw in [-1, 1), over two keys of logit 0 whose values are the denominator times a draw:
         # each key's share of the output is about that draw, which a shift for the denominator's size
         # must not flush.
-        total = 2.0 ** np.floor(_uniform(seed, 100.0, 128.0, (ROWS, 1, 1)))
-        acc = total[..., None] * _uniform(seed + 1, -1.0, 1.0, (ROWS, 1, 1, 16))
-        value = total[:, 0, 0, None, None, None] * _uniform(seed + 2, -1.0, 1.0, (ROWS, 2, 1, 16))
+        total = 2.0 ** np.floor(_uniform(seed, 100.0, 128.0, (RESUMED, 1, 1)))
+        acc = total[..., None] * _uniform(seed + 1, -1.0, 1.0, (RESUMED, 1, 1, 16))
+        value = total[:, 0, 0, None, None, None] * _uniform(seed + 2, -1.0, 1.0, (RESUMED, 2, 1, 16))
         # The cotangent drawn times 2^-12, so its product with values near 2^127 stays finite in the
         # reference's backward.
-        (dout,) = _normal(seed + 3, (ROWS, 1, 1, 16))
-        state = (np.zeros((ROWS, 1, 1), np.float32), total.astype(np.float32), acc.astype(np.float32))
-        return (np.zeros((ROWS, 1, 1, 16), np.float32), np.zeros((ROWS, 2, 1, 16), np.float32),
+        (dout,) = _normal(seed + 3, (RESUMED, 1, 1, 16))
+        state = (np.zeros((RESUMED, 1, 1), np.float32), total.astype(np.float32), acc.astype(np.float32))
+        return (np.zeros((RESUMED, 1, 1, 16), np.float32), np.zeros((RESUMED, 2, 1, 16), np.float32),
                 value.astype(np.float32), state, dout * np.float32(2.0 ** -12))
 
-    families["a resumed state of a large denominator"] = Family(resumed, kept(1, 2))
+    families["a resumed state of a large denominator"] = Family(resumed, np.ones((RESUMED, 1, 1, 2), bool))
     for low, high, label in ((-3.0, 3.0, ""), (1e38, 3e38, " near fp32's largest")):
         # One query a row, so the decode kernel takes the family too.
-        families[f"a decode step's sink{label} and one key"] = Family(
-            with_sinks(drawn(1, 1), low, high), kept(1, 1))
+        name = f"a decode step's sink{label} and one key"
+        families[name] = Family(with_sinks(drawn(1, 1, rows=128), low, high), np.ones((128, 1, 1, 1), bool))
     ids = np.tile(np.asarray([[1, 2, 3, 3]], np.int32), (ROWS, 1))
     families["documents of one key"] = Family(drawn(4, 4), _causal(4, 4, ROWS) & (ids[:, None, :, None] ==
                                                                                   ids[:, None, None, :]),
                                               {"causal": True, "segment_ids": ids})
-    return families
+    return {name: dataclasses.replace(family, seeds=SEEDS.get(name, family.seeds))
+            for name, family in families.items()}
 
 
 FAMILIES = _families()

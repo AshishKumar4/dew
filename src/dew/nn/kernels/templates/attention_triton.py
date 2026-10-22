@@ -160,10 +160,14 @@ def _tile_param(ref, kind: Kind, head, queries: jax.Array, keys: pl.Slice | None
 
 def _forward_kernel(*refs, spec: algebra.Forward, score_kinds: tuple[Kind, ...],
                     output_kinds: tuple[Kind, ...], initial: bool, residuals: bool, output_mod, block_k: int,
-                    interpret: bool):
+                    interpret: bool, guard: str):
     """The forward's Triton mainloop: one program a query block and head walks the key tiles its form
     gives it (every tile, the causal diagonal's, or the spans' block map), issuing the tile's two
-    products and calling the algebra between them (`attention_algebra`)."""
+    products and calling the algebra between them (`attention_algebra`). Under headroom
+    (`algebra.Forward.headroom`) the plain launch (`guard` 'flag') also writes which of its rows'
+    weighted values overflowed, and a second launch (`guard` 'rewalk', the plain launch's outputs its
+    own) walks again, each row shifting as it needs, only the programs one of whose rows did; the plain
+    walk itself is unchanged (`guard` 'none' where no row can overflow)."""
     refs = list(refs)
     narrowing, bounds, key_ids = {}, None, {}
     if spec.form == "spans":
@@ -178,7 +182,12 @@ def _forward_kernel(*refs, spec: algebra.Forward, score_kinds: tuple[Kind, ...],
     score_refs = [refs.pop(0) for _ in score_kinds]
     output_refs = [refs.pop(0) for _ in output_kinds]
     initial_refs = [refs.pop(0) for _ in range(3 if initial else 0)]
+    flags_ref = refs.pop(0) if guard == "rewalk" else None
+    if guard == "rewalk":
+        # The plain launch's outputs, which this launch's are (`input_output_aliases`), read by none.
+        del refs[:len(refs) // 2]
     out_ref, *residual_refs = refs
+    flag_ref = residual_refs.pop() if guard == "flag" else None
     block_q = query_ref.shape[0]
     head = pl.program_id(2)
     first_query = pl.program_id(0) * block_q
@@ -244,20 +253,34 @@ def _forward_kernel(*refs, spec: algebra.Forward, score_kinds: tuple[Kind, ...],
 
     output_params = tuple(_tile_param(ref, kind, head, q_pos, None)
                           for ref, kind in zip(output_refs, output_kinds, strict=True))
-    weighted = functools.partial(_weighted, value_ref) if residuals else (lambda state: state.acc)
-    walked = algebra.guarded(walk, walk, weighted) if spec.headroom else walk()
-    state = _split_written(walked, value_ref, residual_refs) if residuals else walked
-    out, m, denominator = algebra.finish(spec, state, initial=initial, output_mod=output_mod,
-                                         output_params=output_params)
-    out_ref[...] = out.astype(out_ref.dtype)
-    if residuals:
-        residual_refs[0][...] = m
-        residual_refs[1][...] = denominator
+
+    def written(walked):
+        if flag_ref is not None:
+            weighted = _weighted(value_ref, walked) if residuals else walked.acc
+            flag_ref[...] = algebra.overflowed(weighted).astype(jnp.float32)
+        state = _split_written(walked, value_ref, residual_refs) if residuals else walked
+        out, m, denominator = algebra.finish(spec, state, initial=initial, output_mod=output_mod,
+                                             output_params=output_params)
+        out_ref[...] = out.astype(out_ref.dtype)
+        if residuals:
+            residual_refs[0][...] = m
+            residual_refs[1][...] = denominator
+
+    if flags_ref is None:
+        written(walk())
+        return
+    live = flags_ref[...] > 0
+
+    @pl.when(jnp.max(live.astype(jnp.int32)) > 0)
+    def _():
+        # Only a program one of whose rows overflowed walks again: each of those rows shifts as it needs,
+        # every other row's bits the plain walk's (`algebra.room`).
+        written(walk(live))
 
 
 def _weighted(value_ref, carry) -> jax.Array:
     """A training walk's weighted values, its split sums joined (`algebra.split_output`), where they
-    overflow (`algebra.guarded`)."""
+    overflow."""
     split, arg, own, _ = carry
     return algebra.split_output(split.acc, own, value_ref[arg.key, :])
 
@@ -353,11 +376,25 @@ class TritonForward(Template[Tiles]):
             _forward_kernel, spec=spec, score_kinds=self.score_kinds, output_kinds=self.output_kinds,
             initial=initial, residuals=residuals, output_mod=self.output_mod, block_k=block_k,
             interpret=interpret)
-        out = pl.pallas_call(
-            kernel, grid=(queries // block_q, batch, heads), in_specs=in_specs, out_specs=out_specs,
-            out_shape=out_shape, interpret=interpret, name="attention_forward",
-            compiler_params=plgpu.CompilerParams(num_warps=config.warps, num_stages=config.stages),
-        )(*arrays)
+        launch = functools.partial(
+            pl.pallas_call, grid=(queries // block_q, batch, heads), interpret=interpret,
+            compiler_params=plgpu.CompilerParams(num_warps=config.warps, num_stages=config.stages))
+        if not spec.headroom:
+            out = launch(functools.partial(kernel, guard="none"), in_specs=in_specs, out_specs=out_specs,
+                         out_shape=out_shape, name="attention_forward")(*arrays)
+            return (tuple(out) if residuals else out[0]), None
+        # The plain launch writes which rows overflowed; the second walks again only the programs with one,
+        # its outputs the plain launch's (`_forward_kernel`).
+        per_row = pl.BlockSpec((None, None, block_q), lambda i, b, h: (b, h, i))
+        flagged = jax.ShapeDtypeStruct((batch, heads, queries), jnp.float32)
+        *out, flags = launch(functools.partial(kernel, guard="flag"), in_specs=in_specs,
+                             out_specs=[*out_specs, per_row], out_shape=[*out_shape, flagged],
+                             name="attention_forward")(*arrays)
+        first = len(arrays) + 1
+        out = launch(functools.partial(kernel, guard="rewalk"), in_specs=[*in_specs, per_row, *out_specs],
+                     out_specs=out_specs, out_shape=out_shape, name="attention_forward_headroom",
+                     input_output_aliases={first + index: index for index in range(len(out))},
+                     )(*arrays, flags, *out)
         return (tuple(out) if residuals else out[0]), None
 
     def space(self, ba: tokamax.BoundArguments) -> Sequence[Tiles]:
