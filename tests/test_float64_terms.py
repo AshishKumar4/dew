@@ -1,13 +1,18 @@
 """What `reference_error.float64_terms` takes for a leaf's terms: the root sum
-of squares of the terms its final sums add, carried into it, and nothing behind them."""
+of squares of the terms its final sums add, carried into it, and nothing behind them;
+and the attention oracle's float64 truth held to an exact evaluation."""
 
 import jax
 import jax.numpy as jnp
+import mpmath
 import numpy as np
 import pytest
+from attention_oracle import anchored_softmax
 from jax.ad_checkpoint import checkpoint_name
 from jax.sharding import Mesh, PartitionSpec as P
 from reference_error import float64_terms
+
+from dew.accuracy import reduction_bound, within
 
 
 def loss_of(keys, query, values):
@@ -132,3 +137,77 @@ def test_a_per_device_program_sums_its_terms_and_its_devices_add_them():
         _, gradient_terms = float64_terms(jax.grad(lambda w, x: jnp.sum(mapped(x, w) * probe)), kernel, rows)
     np.testing.assert_allclose(terms, np.sqrt(np.square(rows) @ np.square(kernel)), rtol=1e-12)
     np.testing.assert_allclose(gradient_terms, np.sqrt(np.square(rows).T @ np.square(probe)), rtol=1e-12)
+
+
+# The attention oracle's float64 truth (`attention_oracle.anchored_softmax`) against an exact evaluation
+# (mpmath at 60 digits): its softmax derivative about each row's largest weight is within its float64
+# rounding bound of exact, where the plain derivative cancels below float64's ulp (logits near 1e4).
+
+DIGITS = 60
+"""The exact evaluation's working precision."""
+
+
+def exact_gradient(logits: np.ndarray, cotangent: np.ndarray) -> np.ndarray:
+    """The softmax's VJP of one row in 60-digit arithmetic: `p (g - sum p g)`, rounded to float64."""
+    mpmath.mp.dps = DIGITS
+    terms = [mpmath.mpf(float(x)) for x in logits]
+    top = max(terms)
+    weights = [mpmath.exp(x - top) for x in terms]
+    total = mpmath.fsum(weights)
+    p = [w / total for w in weights]
+    g = [mpmath.mpf(float(x)) for x in cotangent]
+    mean = mpmath.fsum(pi * gi for pi, gi in zip(p, g, strict=True))
+    return np.asarray([float(pi * (gi - mean)) for pi, gi in zip(p, g, strict=True)])
+
+
+def rows(case: str, count: int):
+    """`count` rows of 16 logits and cotangents, float64: logits near 1e4 (weights spanning 1 to 1e-22
+    and below), or standard-normal ones."""
+    streams = jax.random.split(jax.random.key({"extreme": 0, "ordinary": 1}[case]), 2)
+    with jax.enable_x64(new_val=True):
+        logits = np.asarray(jax.random.normal(streams[0], (count, 16), jnp.float64))
+        cotangents = np.asarray(jax.random.normal(streams[1], (count, 16), jnp.float64))
+    if case == "extreme":
+        logits = logits * 1e4
+        # Each row's runner-up 50 below its largest, a weight near 1e-22 beside one near 1.
+        logits[:, 1] = logits.max(axis=1) - 50.0 - np.arange(count) / count
+    return logits, cotangents
+
+
+def anchored_bound(logits: np.ndarray, cotangent: np.ndarray) -> np.ndarray:
+    """The anchored form's float64 rounding bound, entrywise: with `r = g - g_a` its terms are each weight
+    times `|r_i|` and the weights' sum of `|r_j|`, each rounded through at most `n + 4` operations
+    (the weights' exponential and normalization, the subtraction, the sum, the products), so
+    `|error_i| <= 2 gamma_{n+4} p_i (|r_i| + sum_j p_j |r_j|)` (Higham, Accuracy and Stability of
+    Numerical Algorithms, 3.1 and 4.2): the gate's reduction bound in float64 (`reduction_bound`)."""
+    weights = np.exp(logits - logits.max())
+    weights /= weights.sum()
+    relative = np.abs(cotangent - cotangent[np.argmax(logits)])
+    return reduction_bound(weights * (relative + np.sum(weights * relative)), logits.size + 4, np.float64)
+
+
+@pytest.mark.parametrize("case", ["extreme", "ordinary"])
+def test_the_anchored_truth_is_within_its_bound_and_never_further_than_the_plain_one(case):
+    """Each anchored entry is within its float64 rounding bound of exact (`anchored_bound`), and never
+    further from exact than the plain form's entry except within that bound; on the extreme rows the
+    plain form loses the anchor's gradient, the runner-up's share, past it."""
+    logits, cotangents = rows(case, 32)
+    with jax.enable_x64(new_val=True):
+        def gradient(softmax, logit, cotangent):
+            return np.asarray(jax.vjp(softmax, jnp.asarray(logit))[1](jnp.asarray(cotangent))[0])
+
+        plain = np.asarray([gradient(jax.nn.softmax, x, g) for x, g in zip(logits, cotangents, strict=True)])
+        anchored = np.asarray([gradient(anchored_softmax, x, g)
+                               for x, g in zip(logits, cotangents, strict=True)])
+    exact = np.asarray([exact_gradient(x, g) for x, g in zip(logits, cotangents, strict=True)])
+    bound = np.asarray([anchored_bound(x, g) for x, g in zip(logits, cotangents, strict=True)])
+    anchored_errors, plain_errors = np.abs(anchored - exact), np.abs(plain - exact)
+    assert within(anchored_errors, bound)
+    assert within(anchored_errors, np.maximum(plain_errors, bound))
+    if case == "extreme":
+        # Where an anchor's exact gradient is past the bound, a share float64 resolves, the plain form
+        # cancels it away and the anchored keeps it.
+        anchors = list(zip(range(32), np.argmax(logits, axis=1), strict=True))
+        resolved = [at for at in anchors if not within(exact[at], 2 * bound[at])]
+        assert resolved
+        assert not any(within(plain_errors[at], bound[at]) for at in resolved)
