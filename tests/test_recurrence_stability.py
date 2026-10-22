@@ -328,11 +328,12 @@ def test_the_chunked_op_stays_finite_and_exact_where_chunked_forms_break(name, r
 
 def pulled(fn):
     """`fn`'s gradient with respect to each float operand it reads, through a fixed cotangent on its
-    output and final memory (a key no draw's seed reaches)."""
+    output and final memory (a key no draw's seed reaches), drawn in fp32 whatever the outputs' dtype, so
+    the float64 truth pulls the same cotangent back."""
     def run(operands):
         outputs, pull = jax.vjp(fn, operands)
         keys = jax.random.split(jax.random.fold_in(jax.random.key(0), 1 << 20), len(outputs))
-        (grads,) = pull(tuple(jax.random.normal(key, out.shape, out.dtype)
+        (grads,) = pull(tuple(jax.random.normal(key, out.shape, jnp.float32).astype(out.dtype)
                               for key, out in zip(keys, outputs, strict=True)))
         return {field: getattr(grads, field) for field in GRADIENTS
                 if getattr(operands, field) is not None and getattr(operands, field).dtype.kind == 'f'}
