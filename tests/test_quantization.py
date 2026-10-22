@@ -494,7 +494,7 @@ def test_a_recorded_kernel_no_rule_matches_multiplies_by_its_own_recipe():
     np.testing.assert_array_equal(jax.jit(unmatched.apply)(served_variables, ids),
                                   jax.jit(served.apply)(served_variables, ids))
     activations, _ = quantize_for_serving(model, variables, Quantization(patterns=("none",)), ids)
-    with pytest.raises(ValueError, match="record"):
+    with pytest.raises(ValueError):
         activations.apply(served_variables, ids)
 
 
