@@ -20,6 +20,7 @@ import functools
 import json
 import shutil
 from pathlib import Path
+from types import SimpleNamespace
 
 import jax
 import numpy as np
@@ -81,7 +82,8 @@ def drawn_prompts(seed: int, rows: int = 4) -> list[str]:
 
 
 def text_draw(encoder):
-    """Check 1's draw of drawn prompts' token ids and masks, as `encoder` tokenizes them."""
+    """Check 1's draw of drawn prompts' token ids and masks, as `encoder` (anything with a
+    `tokenize`) tokenizes them."""
     def draw(seed):
         tokens = encoder.tokenize(drawn_prompts(seed))
         return ({name: np.asarray(tokens[name], np.int32) for name in ("input_ids", "attention_mask")},)
@@ -89,14 +91,12 @@ def text_draw(encoder):
 
 
 def image_draw(directory_or_repo, shape):
-    """Check 1's draw of uint8 images of `shape` through `directory_or_repo`'s own processor, with the
-    tiny checkpoint's prompts' token ids beside them."""
-    processor, tokens = image_processor(directory_or_repo), reference(TINY)
+    """Check 1's draw of uint8 images of `shape` through `directory_or_repo`'s own processor."""
+    processor = image_processor(directory_or_repo)
 
     def draw(seed):
         images = np.random.RandomState(seed).randint(0, 256, shape, dtype=np.uint8)
-        return ({"pixel_values": processor(images=images, return_tensors="np")["pixel_values"],
-                 "input_ids": tokens["input_ids"], "attention_mask": tokens["attention_mask"]},)
+        return ({"pixel_values": processor(images=images, return_tensors="np")["pixel_values"]},)
     return draw
 
 
@@ -120,23 +120,26 @@ def precision(dtype):
     return float64() if dtype == torch.float64 else contextlib.nullcontext()
 
 
-def transformers_clip(source, inputs, dtype):
+def transformers_clip(source, inputs, dtype, names):
     """transformers' CLIPModel over `source`'s weights at `dtype`, float64 built and run under
-    `float64`: its text tower's states and pooled row and its text embeddings for `inputs`' token ids
-    and mask, and its image embeddings for their pixel values where they hold some, at `dtype`."""
+    `float64`: of its text tower's states and pooled row and its text embeddings for `inputs`' token
+    ids and mask, and its image embeddings for their pixel values, the outputs `names`, at `dtype`."""
     import torch
 
     model = reference_clip(source, dtype)
+    outputs = {}
     with precision(dtype), torch.no_grad():
-        ids, mask = (torch.from_numpy(np.asarray(inputs[name], np.int64))
-                     for name in ("input_ids", "attention_mask"))
-        text = model.text_model(input_ids=ids, attention_mask=mask)
-        outputs = {"last_hidden_state": text.last_hidden_state, "pooler_output": text.pooler_output,
-                   "text_embeds": model.get_text_features(input_ids=ids, attention_mask=mask).pooler_output}
-        if "pixel_values" in inputs:
+        if {"last_hidden_state", "pooler_output", "text_embeds"} & set(names):
+            ids, mask = (torch.from_numpy(np.asarray(inputs[name], np.int64))
+                         for name in ("input_ids", "attention_mask"))
+            text = model.text_model(input_ids=ids, attention_mask=mask)
+            outputs.update(last_hidden_state=text.last_hidden_state, pooler_output=text.pooler_output)
+            # `get_text_features`' projection of the pooled row, without running the tower again.
+            outputs["text_embeds"] = model.text_projection(text.pooler_output)
+        if "image_embeds" in names:
             pixels = torch.from_numpy(np.asarray(inputs["pixel_values"])).to(dtype)
             outputs["image_embeds"] = model.get_image_features(pixel_values=pixels).pooler_output
-    return {name: value.numpy() for name, value in outputs.items()}
+    return {name: outputs[name].numpy() for name in names}
 
 
 def text_tower(encoder):
@@ -155,10 +158,7 @@ def assert_as_exact_as_transformers(ours, names, source, draw, label: str) -> No
     import torch
 
     def theirs(dtype):
-        def run(inputs):
-            found = transformers_clip(source, inputs, dtype)
-            return {name: found[name] for name in names}
-        return run
+        return lambda inputs: transformers_clip(source, inputs, dtype, names)
 
     assert_as_exact(lambda inputs: {name: np.asarray(value) for name, value in ours(inputs).items()},
                     theirs(torch.float32), draw, label, seeds=SEEDS[label], truth_fn=theirs(torch.float64))
@@ -421,8 +421,7 @@ def test_the_real_checkpoint_matches_the_reference():
 def test_the_real_checkpoint_embeddings_match_the_reference():
     """Both heads of clip-vit-large-patch14, the twenty-four vision layers
     behind one of them, against what transformers computes for the same
-    prompts and the same synthetic images."""
-    expected = reference(REAL)
+    drawn prompts and drawn images (check 1)."""
     repo = json.loads((REAL / "prompts.json").read_text())["repo"]
     model = CLIPModel.from_pretrained(repo)
 
@@ -433,12 +432,19 @@ def test_the_real_checkpoint_embeddings_match_the_reference():
         return {"image_embeds": model.get_image_features(inputs["pixel_values"]),
                 "text_embeds": model.get_text_features(inputs["input_ids"], inputs["attention_mask"])}
 
-    def real_tokens(seed):
-        (inputs,) = draw(seed)
-        return ({**inputs, "input_ids": expected["input_ids"], "attention_mask": expected["attention_mask"]},)
+    from transformers import CLIPTokenizer
 
-    assert_as_exact_as_transformers(embedded, ("image_embeds", "text_embeds"), repo, real_tokens,
-                                    "real embeddings")
+    # The checkpoint's tokenizer alone, padded and truncated as `CLIPText.tokenize` does.
+    tokenizer = CLIPTokenizer.from_pretrained(repo)
+    prompts_of = text_draw(SimpleNamespace(tokenize=lambda texts: tokenizer(
+        texts, padding="max_length", max_length=tokenizer.model_max_length, truncation=True,
+        return_tensors="np")))
+
+    def drawn(seed):
+        # Drawn images and drawn prompts, each its own draw of the seed.
+        return ({**draw(seed)[0], **prompts_of(seed)[0]},)
+
+    assert_as_exact_as_transformers(embedded, ("image_embeds", "text_embeds"), repo, drawn, "real embeddings")
 
 
 def test_a_t5_tower_computes_in_its_compute_dtype_as_the_reference_does():
