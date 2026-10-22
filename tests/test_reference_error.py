@@ -53,7 +53,7 @@ def test_a_torch_arm_pulls_back_the_cotangent_it_is_given():
                                                          (tensors[0],)))
         wanted = torch.autograd.grad(expected, tensors, torch.from_numpy(cotangent).to(dtype))
         np.testing.assert_array_equal(out, expected.detach().numpy())
-        for got, want in zip((grad_x, *grads.values()), wanted, strict=True):
+        for got, want in zip((grad_x, *(grads[name] for name in params)), wanted, strict=True):
             np.testing.assert_array_equal(got, want.numpy())
         np.testing.assert_array_equal(grad_unused, np.zeros_like(unused))
 
