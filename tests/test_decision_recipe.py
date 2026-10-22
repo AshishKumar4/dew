@@ -79,6 +79,7 @@ def test_decisions_read_their_table_as_the_stages_before_them_make_it():
     assert [example.answers["team"] for example in examples] == ["a", "b", "a", "b"]
 
 
+@dataclasses.dataclass(frozen=True)
 class _ClassLabels(Memory):
     """Memory rows whose store states its label column's class names, as a Hub ClassLabel does."""
 
