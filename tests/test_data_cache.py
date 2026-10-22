@@ -1214,9 +1214,9 @@ def test_a_warm_cache_read_by_worker_processes_refuses_a_manifest_rewritten_sinc
     from dew.data.compile import compile, publish
     from dew.data.dataset import DataPartition, Loading
 
-    chain = Memory([{"id": index} for index in range(8)]).map(Offset(1))
-    # A shard for each record, so each worker streams its own.
-    cache = Cache(str(tmp_path / "cache"), shard_bytes=1)
+    # Shards of two records, so each worker streams its own.
+    chain = Memory([{"id": index} for index in range(8)], shard_rows=2).map(Offset(1))
+    cache = Cache(str(tmp_path / "cache"))
     publish(chain, cache, read=read)
     loader = compile(chain.cache(cache).repeat().batch(2), read=read,
                      loading=Loading(workers=2, threads=1, read_buffer=2))
