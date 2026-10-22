@@ -9,11 +9,18 @@ producer never loads a next tile's stage over one an MMA still reads, and meet (
 writes to shared memory are the other's operand. Each consumer's accumulator lives for one output tile
 (`finished`), and a tile's rows reach global memory through `store_rows`, whose stores have static extents
 however many rows a tile holds.
+
+A mainloop that drives its own loads (attention's K and V, released at different points of a step) streams
+each operand through a `Ring` whose counter runs across tiles, takes each warpgroup's role (`roles`), lets
+two consumers take turns at the tensor cores (`turn`), walks its tiles in its own order (`persistent`) and
+stores per-row vectors (`store_vector`).
 """
 
+import dataclasses
 import functools
 import math
 
+from jax import lax, numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
@@ -128,3 +135,93 @@ def store_rows(o_smem, o_gmem, row_start, first, stored, column, most: int) -> N
                                     o_gmem.at[pl.ds(row_start + start, rung), pl.ds(column, o_smem.shape[1])])
 
         start = start + (stored & rung)
+
+
+@dataclasses.dataclass(frozen=True)
+class Ring:
+    """A ring of `stages` shared-memory slots one operand streams through: a producer loads step `counter`
+    into slot `counter % stages` (`load`), a consumer waits for it (`acquire`) and gives it back
+    (`release`). The counter runs across a persistent kernel's tiles, so a tile's first loads reuse the
+    slots the last tile left, and each tile may take its own number of steps (a causal tile's trip range):
+    a slot is free for its first fill and, after, once every consumer released it. Allocated with
+    `ring`."""
+    stages: int
+    smem: object
+    full: object
+    consumed: object
+
+    def slot(self, counter):
+        """The slot step `counter` uses."""
+        return lax.rem(counter, jnp.asarray(self.stages, counter.dtype))
+
+    def load(self, counter, view) -> None:
+        """The producer's load of step `counter` from `view`, once its slot is free."""
+        slot = self.slot(counter)
+        pl.when(counter >= self.stages)(lambda: plgpu.barrier_wait(self.consumed.at[slot]))
+        plgpu.copy_gmem_to_smem(view, self.smem.at[slot], self.full.at[slot])
+
+    def acquire(self, counter):
+        """A consumer's wait for step `counter`'s load: its slot."""
+        slot = self.slot(counter)
+        plgpu.barrier_wait(self.full.at[slot])
+        return self.smem.at[slot]
+
+    def release(self, counter) -> None:
+        """A consumer's release of step `counter`'s slot, whose reads (and MMAs) are done."""
+        plgpu.barrier_arrive(self.consumed.at[self.slot(counter)])
+
+
+def ring(block: tuple, dtype, stages: int, *, consumers: int = 1, transforms: tuple = ()) -> dict:
+    """A `Ring`'s allocations for `pl.run_scoped`: `stages` slots of `block` in `dtype` (`transforms` their
+    shared-memory tiling and swizzle), a load barrier each, and a release barrier each that `consumers`
+    arrive at. `Ring(stages, **allocated)` once scoped."""
+    return {'smem': plgpu.SMEM((stages, *block), dtype, transforms=transforms),
+            'full': plgpu.Barrier(num_barriers=stages),
+            'consumed': plgpu.Barrier(num_arrivals=consumers, num_barriers=stages)}
+
+
+def roles(wg, consumers: int, consumer, producer, *, registers: tuple[int, int] = (232, 40)) -> None:
+    """Each warpgroup's role in a cooperative block: the `consumers` first run `consumer(wg)` with their
+    register budget raised to `registers[0]`, the last runs `producer()` with its lowered to
+    `registers[1]` (the producer only issues loads)."""
+    @pl.when(wg < consumers)
+    def _():
+        plgpu.set_max_registers(registers[0], action="increase")
+        consumer(wg)
+
+    @pl.when(wg == consumers)
+    def _():
+        plgpu.set_max_registers(registers[1], action="decrease")
+        producer()
+
+
+def schedule_barrier():
+    """The barrier two consumers take turns at (`turn`): two arrivals."""
+    return plgpu.Barrier(num_arrivals=2)
+
+
+def turn(barrier) -> None:
+    """One consumer's turn at the schedule barrier: it arrives and waits for the other, so their
+    tensor-core phases alternate (FA3's ping-pong; `attention_mgpu`'s schedule barrier)."""
+    plgpu.barrier_arrive(barrier)
+    plgpu.barrier_wait(barrier)
+
+
+def persistent(count: int, *, collective_axes, order=None):
+    """A persistent loop over `count` tiles, each block taking its share: `body(tile, info)` with the tile
+    `order(index)` names for the loop's linear index (the index itself without one: an LPT or causal
+    order reverses it, a GEMM's planar snake folds it)."""
+    def decorator(body):
+        @plgpu.nd_loop((count,), collective_axes=collective_axes)
+        def _(info: plgpu.NDLoopInfo):
+            index = info.index[0]
+            body(index if order is None else order(index), info)
+    return decorator
+
+
+def store_vector(vector, smem, view) -> None:
+    """A per-row vector (an attention tile's running max or sum) to `view` in global memory through
+    `smem`, its layout's relayout there."""
+    smem[...] = vector.astype(smem.dtype)
+    plgpu.commit_smem()
+    plgpu.copy_smem_to_gmem(smem, view)
