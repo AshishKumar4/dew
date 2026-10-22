@@ -788,28 +788,20 @@ def load_diffusion_source(checkpoint: str, *, dtype: str = "bfloat16", param_dty
     `save`, which read the text encoder, are refused.
     """
     directory = sources.snapshot(checkpoint, revision, weights=False)
-    if not (directory / "model_index.json").is_file():
-        raise ValueError(f"{checkpoint} is not a diffusion pipeline: it has no model_index.json")
-    index = json.loads((directory / "model_index.json").read_text())
     if variables is not None and not text:
         raise ValueError("supplied variables bind every component; text=False skips reading one")
-    if variables is None:
-        skipped = () if text else text_components(
-            pipeline_denoiser(directory, dtype=dtype, attention_impl=attention_impl).text, index)
-        directory = _pipeline_weights(checkpoint, directory, index, skipped)
-    if size is not None:
-        if len(size) not in (2, 3):
-            raise ValueError(f"size is (height, width) or (frames, height, width), not {size}")
-        index = {**index, "dew_height": size[-2], "dew_width": size[-1]}
-        if len(size) == 3:
-            index["dew_frames"] = size[0]
+    if size is not None and len(size) not in (2, 3):
+        raise ValueError(f"size is (height, width) or (frames, height, width), not {size}")
     streaming = variables is None and (mesh is not None or layout is not None)
-    return _published(_assembled_pipeline(
-        directory, index, None if os.path.isdir(checkpoint) else directory.name,
-        lambda values: place(values, mesh, layout) if streaming else values, streaming=streaming,
-        dtype=dtype, attention_impl=attention_impl, param_dtype=param_dtype, variables=variables, text=text,
-        stored=None if variables is None else sources.StoredWeights(checkpoint, directory)),
-        checkpoint, selected=False)
+    loaded = _pipeline_source(
+        checkpoint, directory, None if os.path.isdir(checkpoint) else directory.name, None, None,
+        lambda values: place(values, mesh, layout) if streaming else values, dtype=dtype,
+        attention_impl=attention_impl, param_dtype=param_dtype, streaming=streaming, size=size,
+        variables=variables, text=text)
+    if loaded is None:
+        raise ValueError(f"{checkpoint} is not a diffusion pipeline: it has no model_index.json, or it is "
+                         "the decoder its config.json names")
+    return _published(loaded, checkpoint, selected=False)
 
 
 def _published[K: Pretrained](loaded: K, name_or_dir: str | Path, *, selected: bool) -> K:
@@ -976,7 +968,9 @@ def split_revision(source: str) -> tuple[str, str | None]:
 
 def _pipeline_source(name_or_dir: str | Path, directory: Path, commit: str | None, single_file: str | None,
                      dduf_file: str | None, placed: Callable[[Variables], Variables], *, dtype: str,
-                     attention_impl: str, param_dtype: str, streaming: bool) -> PretrainedPipeline | None:
+                     attention_impl: str, param_dtype: str, streaming: bool,
+                     size: tuple[int, ...] | None = None, variables: Variables | None = None,
+                     text: bool = True) -> PretrainedPipeline | None:
     """The source as a latent diffusion pipeline, or None when it is a decoder.
 
     A single file converts into the pipeline it describes, and a DDUF file
@@ -985,13 +979,21 @@ def _pipeline_source(name_or_dir: str | Path, directory: Path, commit: str | Non
     also ships a pipeline index for its sampler (DiffusionGemma) is loaded as
     the decoder its config names. `placed` puts the pipeline's variables on
     the mesh, and `streaming` has them read one leaf at a time as it does; a
-    single file's conversion is kept only once that succeeds too.
+    single file's conversion is kept only once that succeeds too. `size`,
+    supplied `variables` and `text` are a training run's (`load_diffusion_source`):
+    the geometry the pipeline runs at, a saved tree a directory's components
+    bind instead of downloading their weights, and whether its text encoder
+    is read.
     """
 
-    def pipeline(directory: Path) -> PretrainedPipeline:
+    def pipeline(directory: Path, stored: sources.StoredWeights | None = None) -> PretrainedPipeline:
         index = json.loads((directory / "model_index.json").read_text())
+        if size is not None:
+            index = {**index, "dew_height": size[-2], "dew_width": size[-1],
+                     **({"dew_frames": size[0]} if len(size) == 3 else {})}
         return _assembled_pipeline(directory, index, commit, placed, streaming=streaming, dtype=dtype,
-                                   attention_impl=attention_impl, param_dtype=param_dtype)
+                                   attention_impl=attention_impl, param_dtype=param_dtype,
+                                   variables=variables, text=text, stored=stored)
 
     if dduf_file is not None:
         from dew.interop import dduf
@@ -1008,8 +1010,12 @@ def _pipeline_source(name_or_dir: str | Path, directory: Path, commit: str | Non
                 converted, published):
             return replace(pipeline(converted), source=published)
     if (directory / "model_index.json").is_file() and not (directory / "config.json").is_file():
-        return pipeline(_pipeline_weights(name_or_dir, directory,
-                                          json.loads((directory / "model_index.json").read_text())))
+        if variables is not None:
+            return pipeline(directory, sources.StoredWeights(str(name_or_dir), directory))
+        index = json.loads((directory / "model_index.json").read_text())
+        skipped = () if text else text_components(
+            pipeline_denoiser(directory, dtype=dtype, attention_impl=attention_impl).text, index)
+        return pipeline(_pipeline_weights(name_or_dir, directory, index, skipped))
     return None
 
 
