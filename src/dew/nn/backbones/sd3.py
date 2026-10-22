@@ -28,7 +28,7 @@ from dew.nn.conv import Conv
 from dew.nn.dense import Dense
 from dew.nn.flops import MissingFlopsCount, matching_lengths, patch_lengths, projection_flops
 from dew.nn.precision import at_least_fp32, float32_dot_general
-from dew.nn.rope import inverse_frequencies, sinusoids
+from dew.nn.rope import sincos_grid, sinusoid_frequencies
 from dew.nn.scan_orders import unpatchify
 from dew.nn.sharding import logical_axes
 
@@ -60,12 +60,8 @@ def sincos_position(channels: int, grid: int, *, base_size: int):
     columns, rows = np.meshgrid(steps, steps, indexing="xy")  # width goes first
     # `1 / 10000 ** (i / (half / 2))` over half the channels an axis (an odd half divides by a
     # half-integer, as the reference does).
-    omega = inverse_frequencies(10000.0, channels // 2, channels // 4, dtype=np.float64)
-
-    def axis(values):
-        return sinusoids(values.reshape(-1).astype(np.float64)[:, None] * omega[None, :], xp=np)
-
-    return jnp.asarray(np.concatenate([axis(columns), axis(rows)], axis=1)[None].astype(np.float32))
+    frequencies = sinusoid_frequencies(channels // 4, channels / 4, dtype=np.float64)
+    return jnp.asarray(sincos_grid(frequencies, columns, rows, dtype=np.float32)[None])
 
 
 @logical_axes({("context_embedder",): (None, "embed"), ("proj_out",): ("embed", None),

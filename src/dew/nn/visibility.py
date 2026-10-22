@@ -18,10 +18,10 @@ def windowed(query, key, window: int, *, causal: bool):
 
 def visible(query, key, *, causal: bool, window: int | None = None):
     """Whether a key at coordinate `key` is visible to a query at `query` (broadcast): causality keeps
-    the keys at or before the query, and a window of w keeps those `windowed` keeps. The coordinates are whatever
-    the caller's layout counts: slots, places in a document, banded rows."""
-    shape = None if causal else jnp.broadcast_shapes(jnp.shape(query), jnp.shape(key))
-    keep = (key <= query) if shape is None else jnp.ones(shape, bool)
+    the keys at or before the query, and a window of w keeps those `windowed` keeps. The coordinates
+    are whatever the caller's layout counts: slots, places in a document, banded rows."""
+    shapes = (jnp.shape(query), jnp.shape(key))
+    keep = (key <= query) if causal else jnp.ones(jnp.broadcast_shapes(*shapes), bool)
     return keep if window is None else keep & windowed(query, key, window, causal=causal)
 
 

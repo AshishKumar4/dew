@@ -102,9 +102,12 @@ def test_cpu_depthwise_is_the_library_convolution_bit_for_bit(shape, dilation, d
     16 x 768 maps took 6.4 ms a call as a convolution and 1.4 ms shifted, on
     one core of an i9-12900K."""
     rng = np.random.default_rng(dilation)
-    # A band of zero rows, so outputs whose taps are all signed zeros are compared by their sign too.
-    x = jnp.asarray(rng.normal(size=shape) * (np.arange(shape[1]) % 4 != 1)[None, :, None, None], dtype)
-    kernel = jnp.asarray(rng.normal(size=(3, 3, 1, shape[-1])) * 0.2, dtype)
+    x, kernel = rng.normal(size=shape), rng.normal(size=(3, 3, 1, shape[-1])) * 0.2
+    # Channel 0's corner is zero under negative taps, so the output at (dilation, dilation) sums nine
+    # negative zeros and is compared by its sign too.
+    x[:, :2 * dilation + 1, :2 * dilation + 1, 0] = 0
+    kernel[..., 0] = -np.abs(kernel[..., 0])
+    x, kernel = jnp.asarray(x, dtype), jnp.asarray(kernel, dtype)
     padding = 'SAME' if dilation != 2 else ((2, 2), (2, 2))
     shared = jax.jit(lambda x, kernel: _conv_general_dilated(
         x, kernel, (1, 1), padding, rhs_dilation=(dilation, dilation),
@@ -216,8 +219,8 @@ def test_depthwise_quantization_keeps_the_original_provider_output(training):
 
 def test_the_materialized_depthwise_sum_starts_from_a_positive_zero():
     """The materialized form sums its nine taps onto a positive zero, so taps that are all negative
-    zero (a zero input under a negative kernel) give positive zero, as the form has since it was
-    written, where the barriered form keeps the first product's, as the CPU library's sum does
+    zero (a zero input under a negative kernel) give positive zero, where the barriered form keeps the
+    first product's, as the CPU library's sum does
     (`test_cpu_depthwise_is_the_library_convolution_bit_for_bit`)."""
     x = jnp.zeros((1, 6, 6, 4), jnp.float32)
     w = -jnp.ones((3, 3, 1, 4), jnp.float32)

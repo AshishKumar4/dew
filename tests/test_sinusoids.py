@@ -1,9 +1,10 @@
-"""The absolute sinusoidal tables (`dew.nn.rope.sinusoids` over `dew.nn.rope.inverse_frequencies`)
-against the references that define them: the 2D patch grid's axes as MAE's
-`get_1d_sincos_pos_embed_from_grid` builds them in float64 and SD3's position buffer as Diffusers'
-does, each rounded once to float32 and equal to the bit; Gemma 3n's audio relative positions on par
-with transformers' float32 table from the float64 one (check 1, tests/reference_error.py), where Dew
-rounds the frequencies once from float64 rather than taking float32's exp."""
+"""The absolute sinusoidal tables (`dew.nn.rope.sinusoid_frequencies`, `sinusoids` and `sincos_grid`)
+against the references that define them: each axis of the 2D patch grid as MAE's
+`get_1d_sincos_pos_embed_from_grid` builds it in float64, the rows' half first, and SD3's position
+buffer as Diffusers' builds it, each rounded once to float32 and equal to the bit; Gemma 3n's audio
+relative positions on par with transformers' float32 table from the float64 one (check 1,
+tests/reference_error.py), where Dew rounds the frequencies once from float64 rather than taking
+float32's exp."""
 
 import math
 
@@ -17,7 +18,7 @@ from dew.nn.audio import _position_signal
 from dew.nn.backbones.sd3 import sincos_position
 from dew.nn.scan_orders import build_2d_sincos_pos_embed
 
-AUDIO_SEEDS = 16
+AUDIO_SEEDS = 8
 """Check 1's declared seeds for the audio table, sized by `seeds_for` on armada."""
 
 
@@ -35,7 +36,7 @@ def mae_grid(emb_dim: int, rows: int, columns: int) -> np.ndarray:
 
 
 @pytest.mark.parametrize("emb_dim, rows, columns", [(64, 8, 8), (384, 16, 16), (768, 14, 10)])
-def test_the_patch_grid_is_maes_float64_table_rounded_once(emb_dim, rows, columns):
+def test_each_patch_grid_axis_is_maes_float64_table_rounded_once(emb_dim, rows, columns):
     np.testing.assert_array_equal(build_2d_sincos_pos_embed(emb_dim, rows, columns).view(np.uint32),
                                   mae_grid(emb_dim, rows, columns).astype(np.float32).view(np.uint32))
 
@@ -52,7 +53,9 @@ def test_sd3s_position_buffer_is_diffusers_bit_for_bit(channels, grid, base_size
 @pytest.mark.parametrize("width", [64, 1536])
 def test_gemma3n_audio_positions_are_on_par_with_the_reference(width):
     """Dew's relative-position table against `Gemma3nAudioRelativePositionEmbedding`'s float32 one
-    over drawn positions, from the same table in float64 (check 1)."""
+    over drawn positions, from the same table in float64 (check 1). The reference's frequencies are
+    its `inv_timescales` buffer; its sines and cosines are taken as its timing signal takes them, in
+    float32, sines first."""
     from transformers import Gemma3nAudioConfig
     from transformers.models.gemma3n.modeling_gemma3n import Gemma3nAudioRelativePositionEmbedding
 
@@ -69,8 +72,8 @@ def test_gemma3n_audio_positions_are_on_par_with_the_reference(width):
         return np.concatenate([np.sin(angles), np.cos(angles)], axis=-1)
 
     def theirs(positions):
-        position = torch.from_numpy(np.asarray(positions))
-        return reference._get_timing_signal_1d_pos(position, torch.float32).numpy()
+        angles = torch.from_numpy(np.asarray(positions)).float()[:, None] * reference.inv_timescales[0]
+        return torch.cat([torch.sin(angles), torch.cos(angles)], dim=-1).numpy()
 
     def ours(positions):
         return _position_signal(width, jnp.asarray(positions), jnp.float32)

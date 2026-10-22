@@ -151,6 +151,14 @@ def _taps(padded: jax.Array, kernel: jax.Array, dilation: int, height: int, widt
             * kernel[row, column, 0] for row in range(3) for column in range(3)]
 
 
+def _accumulated(total: jax.Array, products: Sequence[jax.Array]) -> jax.Array:
+    """`total` plus each of `products` in order, one fp32 add at a time: the depthwise schedules'
+    accumulation, each giving its own seed (the first product, or zeros)."""
+    for product in products:
+        total = total + product
+    return total
+
+
 def _shifted_depthwise_3x3(lhs: jax.Array, rhs: jax.Array, dilation: int) -> jax.Array:
     """The depthwise convolution's taps (`_taps`), each product rounded to fp32 before it is added, the
     sum from the first, rounded once to the input's dtype.
@@ -165,10 +173,7 @@ def _shifted_depthwise_3x3(lhs: jax.Array, rhs: jax.Array, dilation: int) -> jax
     height, width = lhs.shape[1:3]
     padded = jnp.pad(lhs, ((0, 0), (dilation, dilation), (dilation, dilation), (0, 0))).astype(jnp.float32)
     products = jax.lax.optimization_barrier(_taps(padded, rhs.astype(jnp.float32), dilation, height, width))
-    total = products[0]
-    for product in products[1:]:
-        total = total + product
-    return total.astype(lhs.dtype)
+    return _accumulated(products[0], products[1:]).astype(lhs.dtype)
 
 
 def _materialized_depthwise_3x3(lhs: jax.Array, rhs: jax.Array, dilation: int) -> jax.Array:
@@ -192,10 +197,10 @@ def _materialized_depthwise_3x3(lhs: jax.Array, rhs: jax.Array, dilation: int) -
     height, width = lhs.shape[1:3]
     border = ((0, 0), (dilation, dilation), (dilation, dilation), (0, 0))
     padded = jnp.pad(_barrier(lhs.astype(jnp.float32)), border)
-    output = jnp.zeros(lhs.shape, jnp.float32)
-    for product in _taps(padded, _barrier(rhs.astype(jnp.float32)), dilation, height, width):
-        output = output + product
-    return _barrier(output).astype(lhs.dtype)
+    # Onto a positive zero: an output whose nine taps are all negative zero is positive zero here and
+    # negative zero in the shifted form, which starts from its first product.
+    products = _taps(padded, _barrier(rhs.astype(jnp.float32)), dilation, height, width)
+    return _barrier(_accumulated(jnp.zeros(lhs.shape, jnp.float32), products)).astype(lhs.dtype)
 
 
 def _conv_general_dilated(
