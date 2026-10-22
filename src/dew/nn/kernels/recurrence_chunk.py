@@ -463,7 +463,8 @@ def _blocked_rule(query, key, value, g, beta, state, starts, *, documents: int |
     # A row's padding after its documents runs as one more sequence of its own.
     spans = None if documents is None else cu_seqlens(starts, B * (documents + 1))
     port = fla_kda.chunk_kda if per_key else fla_gdn.chunk_gated_delta_rule
-    out, final = port(query, key, value, g, beta, state, spans, scale, CHUNK_SIZE,
+    chunk_size = min(CHUNK_SIZE, max(16, 2 * Dk))
+    out, final = port(query, key, value, g, beta, state, spans, scale, chunk_size,
                       not generation.triton_runs(), "delta_memory" not in RECOMPUTED.get(), wide)
     out = out[..., :width].reshape(B, S, Hv, split * width)[..., :Dv]
     final = final[:, :, :Dk, :width]
