@@ -152,7 +152,9 @@ def _reference(case: Case, dtype, *, anchored: bool = False):
         def attend(q, k, v):
             return exact_attention(q, k, v, sinks, keep=case.keep, anchored=anchored)
         out, pull = jax.vjp(attend, query, key, value)
-        return [np.asarray(x) for x in (out, *pull(dout))]
+        # The oracle sums 16-bit operands' products and softmax in fp32; the reference returns its
+        # output in the call's dtype, as every attention call does (its gradients are the operands').
+        return [np.asarray(x) for x in (out.astype(query.dtype), *pull(dout.astype(out.dtype)))]
 
     arrays = [None if x is None else jnp.asarray(np.asarray(x, dtype))
               for x in (*_operands(case), case.sinks)]
