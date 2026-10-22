@@ -209,6 +209,20 @@ def test_the_exp_enclosure_holds_its_proven_bound():
     assert worst <= oc.EXP_BOUND, float(worst)
 
 
+@pytest.mark.parametrize("fmt", FORMATS, ids=lambda fmt: fmt.name)
+def test_the_interval_path_decides_what_the_enclosure_leaves(fmt, monkeypatch):
+    """With the enclosures' bound widened to half `fmt`'s precision, most elements are left undecided
+    and mpmath's interval exp and 2^x decide them, as interval arithmetic does on its own."""
+    rng = np.random.default_rng(9)
+    sample = oc.exact_cast(rng.uniform(-100.0, 80.0, 200), fmt)
+    sample = sample[sample != np.rint(sample)]
+    exp_expected = _interval_rounded(lambda iv, x: iv.exp(x), sample, fmt)
+    exp2_expected = _interval_rounded(lambda iv, x: iv.exp(x * iv.log(2)), sample, fmt)
+    monkeypatch.setattr(oc, "EXP_BOUND", 2.0 ** -(fmt.precision // 2))
+    assert not oc.mismatches(oc.exp_rounded(sample, fmt), exp_expected, fmt).any()
+    assert not oc.mismatches(oc.exp2_rounded(sample, fmt), exp2_expected, fmt).any()
+
+
 def test_the_exp2_enclosure_holds_its_proven_bound():
     """`_exp2_enclosed` against mpmath at 300 bits, on fp32 arguments over its whole range, the integers
     and half-integers its reduction splits at, and the arguments whose results are fp32 subnormals:
