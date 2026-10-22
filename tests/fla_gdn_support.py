@@ -53,16 +53,18 @@ def _case_call(launch, tiles, shape, dtype, *, reverse=False):
     weighted = jax.ShapeDtypeStruct((batch, length, value_heads, width), narrow)
     valued = jax.ShapeDtypeStruct((batch, length, value_heads, columns), narrow)
     gated = jax.ShapeDtypeStruct((batch, length, value_heads), jnp.float32)
+    # The compensated decay prefix (`recurrence.cumulated(compensated=True)`), as the rule passes it.
+    prefix = (gated, gated)
     beta = jax.ShapeDtypeStruct(gated.shape, narrow)
     inverse = jax.ShapeDtypeStruct((batch, length, value_heads, chunk), narrow)
     entered = jax.ShapeDtypeStruct((batch * (length // chunk), value_heads, width, columns), narrow)
     state = jax.ShapeDtypeStruct((batch, value_heads, width, columns), jnp.float32)
     operands = {
         "cumulated": (gated,),
-        "kkt_solve": (keyed, gated, beta),
+        "kkt_solve": (keyed, prefix, beta),
         "recompute_w_u": (keyed, valued, beta, inverse, gated),
-        "chunk_fwd_h": (keyed, weighted, valued, gated, state),
-        "chunk_fwd_o": (keyed, keyed, valued, entered, gated),
+        "chunk_fwd_h": (keyed, weighted, valued, prefix, state),
+        "chunk_fwd_o": (keyed, keyed, valued, entered, prefix),
         "chunk_bwd_dv_local": (keyed, keyed, gated, valued),
         "chunk_bwd_dhu": (keyed, keyed, weighted, gated, state, valued, valued),
         "chunk_bwd_dqkwg": (keyed, keyed, valued, weighted, gated, entered, valued, valued, entered),
@@ -70,7 +72,8 @@ def _case_call(launch, tiles, shape, dtype, *, reverse=False):
     }
     kwargs = {"chunk": chunk, "interpret": False}
     if kernel == "cumulated":
-        kwargs.update(scale=fla_gdn.RCP_LN2, reverse=reverse)
+        # The forward as the rule runs it, compensated (`fla_gdn.prefixed_fwd`); the gradient's from the end.
+        kwargs.update(scale=fla_gdn.LOG2_E, reverse=reverse, compensated=not reverse)
     elif kernel in ("chunk_fwd_o", "chunk_bwd_dv_local", "chunk_bwd_dhu", "chunk_bwd_dqkwg"):
         kwargs["scale"] = width ** -0.5
     return functools.partial(_pinned, launch, tiles, **kwargs), operands[kernel]
