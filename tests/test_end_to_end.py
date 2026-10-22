@@ -49,6 +49,7 @@ from dew.objectives.diffusion.end_to_end import (
 )
 from dew.objectives.diffusion.objective import DISCRIMINATOR
 from dew.sampling import Euler, TextToImage
+from dew.telemetry.instrumentation import Compiles
 from dew.training import Trainer
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
@@ -166,18 +167,22 @@ def test_a_step_moves_the_running_statistics_and_the_task_decodes_with_them():
     later = TextToImage.from_objective(task, {**state.variables, LATENT_STATS: moved})
     assert later.autoencoder == published.autoencoder
     assert hash(later.autoencoder) == hash(published.autoencoder)
-    decode = jax.jit(lambda autoencoder, params, z: autoencoder.decode(params, z), static_argnums=0)
+    def decoded(autoencoder, params, z):
+        return autoencoder.decode(params, z)
+
+    decode = jax.jit(decoded, static_argnums=0)
     z = jax.random.normal(jax.random.PRNGKey(4), (1, *task.latent_shape))
-    for publication, statistics in ((published, after), (later, moved)):
-        shift = np.asarray(statistics["mean"])
-        scale = 1 / np.sqrt(np.asarray(statistics["var"]))
-        np.testing.assert_allclose(np.asarray(publication.autoencoder.running_normalization(
-            publication.variables["autoencoder"])[1]), scale, rtol=1e-6)
-        weights = tuned[TUNED_WEIGHTS]
-        expected = task.autoencoder.decode_batch(weights, z / jnp.asarray(scale) + jnp.asarray(shift))
-        decoded = decode(publication.autoencoder, publication.variables["autoencoder"], z)
-        np.testing.assert_allclose(np.asarray(decoded), np.asarray(expected), rtol=1e-5, atol=1e-6)
-    assert decode._cache_size() == 1
+    with Compiles("decoded") as compiled:
+        for publication, statistics in ((published, after), (later, moved)):
+            shift = np.asarray(statistics["mean"])
+            scale = 1 / np.sqrt(np.asarray(statistics["var"]))
+            np.testing.assert_allclose(np.asarray(publication.autoencoder.running_normalization(
+                publication.variables["autoencoder"])[1]), scale, rtol=1e-6)
+            weights = tuned[TUNED_WEIGHTS]
+            expected = task.autoencoder.decode_batch(weights, z / jnp.asarray(scale) + jnp.asarray(shift))
+            image = decode(publication.autoencoder, publication.variables["autoencoder"], z)
+            np.testing.assert_allclose(np.asarray(image), np.asarray(expected), rtol=1e-5, atol=1e-6)
+    assert compiled.count == 1
 
 
 SIDE, LATENT, PATCH, WIDTH, FEATURES, PROJECTOR, DROPOUT, DISCRIMINATOR_WIDTH = 32, 4, 2, 12, 6, 10, 0.1, 8
