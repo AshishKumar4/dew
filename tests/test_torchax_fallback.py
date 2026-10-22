@@ -169,13 +169,11 @@ def test_trainer_steps_move_the_params_and_place_them_by_name(loaded, tokens):
     assert moved["gpt_neox.embed_in.weight"].sharding.spec == P(("fsdp", "tensor"))
 
 
-def test_a_frozen_torch_base_kept_whole_drops_fsdp_from_the_name_tables_placement(source, loaded, tokens):
+def test_a_frozen_torch_base_kept_whole_drops_fsdp_from_the_name_tables_placement(loaded, tokens):
     """`Layout.frozen_whole` reaches a torch-named tree: TorchLayout's name table picks each
     tensor's axes, and the one placement keeps the frozen tensors whole over fsdp, split over the
     tensor axis as the table splits them, while the trained ones, their moments and one step's
-    update lie as the split layout lays them. The step it takes is the split layout's: every
-    trained parameter as exact as the split step's, both from the same AdamW step taken in
-    float64 over transformers' float64 gradients (tests/reference_error.py)."""
+    update lie as the split layout lays them."""
     from dew.nn.sharding import mesh_axes
     from dew.objectives.base import FROZEN, freeze
     from dew.training.distributed import shard_batch

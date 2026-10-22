@@ -1,5 +1,5 @@
 """tools/kernel_routes.py: every registered decoder family's CPU trace on each emulated device
-(`kernel_routes.DEVICES`) reports the route each choice takes there, and each route is the device's kernel
+(`kernel_routes.audited()`) reports the route each choice takes there, and each route is the device's kernel
 or a refusal a row or an inherent limit explains."""
 
 import json

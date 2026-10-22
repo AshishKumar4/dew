@@ -431,20 +431,14 @@ _BESIDE_THE_TEXT_TOWER = ("vision_model.", "visual_projection.", "text_projectio
 
 def _encoder_layer_path(parts, root: str, norms: Mapping[str, str] = _NORMS,
                         projections: Mapping[str, str] = _PROJECTIONS) -> tuple[str, ...] | None:
-    """`<root>.layers.N...` into the path of a `clip_layer`: two layer norms,
-    biased attention maps and a biased fc1/fc2 MLP, each source name mapped
-    by `norms` or `projections` (CLIP's by default) or onto the MLP's up and
-    down maps."""
-    if (len(parts) < 5 or parts[:2] != [root, "layers"] or not parts[2].isdigit()
-            or parts[-1] not in ("weight", "bias")):
-        return None
-    layer, module, leaf = f"layers_{parts[2]}", parts[3], parts[-1]
-    if len(parts) == 5 and module in norms:
-        return (layer, norms[module], "scale" if leaf == "weight" else "bias")
-    names = projections if module == "self_attn" else _MLP if module == "mlp" else {}
-    if len(parts) == 6 and parts[4] in names:
-        return (layer, module, names[parts[4]], "kernel" if leaf == "weight" else "bias")
-    return None
+    """`<root>.layers.N...` into the path of a `clip_layer` (`block_tensor_path`): two layer norms,
+    biased attention maps and a biased fc1/fc2 MLP, each source name mapped by `norms` or
+    `projections` (CLIP's by default) or onto the MLP's up and down maps."""
+    from dew.nn.vision.common import block_tensor_path
+
+    maps = {**{("self_attn", source): ("self_attn", name) for source, name in projections.items()},
+            **{("mlp", source): ("mlp", name) for source, name in _MLP.items()}}
+    return block_tensor_path(parts, maps, prefix=f"{root}.layers", block="layers", norms=norms)
 
 
 def _tower_path(hf_name: str, prefix: str,

@@ -46,6 +46,7 @@ import argparse
 import json
 import shutil
 import string
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -55,6 +56,9 @@ from transformers import (
     AutoTokenizer, CLIPConfig, CLIPImageProcessorPil, CLIPModel, CLIPTextConfig,
     CLIPTokenizer, CLIPVisionConfig,
 )
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from reference_source import recipe_images
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "clip"
 REAL_MODEL = "openai/clip-vit-large-patch14"
@@ -77,12 +81,6 @@ REAL_PROMPTS = [
 # as a photograph for parity, and a recipe is smaller than pixels.
 TINY_IMAGES = {"seed": 0, "shape": [4, 16, 12, 3]}
 REAL_IMAGES = {"seed": 0, "shape": [3, 64, 48, 3]}
-
-
-def synthetic_images(recipe) -> np.ndarray:
-    """uint8 RGB images from a recipe, reproduced the same way by the tests."""
-    return np.random.RandomState(recipe["seed"]).randint(
-        0, 256, tuple(recipe["shape"]), dtype=np.uint8)
 
 
 def tiny_tokenizer() -> CLIPTokenizer:
@@ -220,7 +218,7 @@ def write_tiny(directory: Path) -> None:
     assert (ids.argmax(axis=-1) != (ids == 1).argmax(axis=-1)).any(), (
         "the argmax and eos branches of the pooled row agree on every prompt, "
         "so this fixture would not tell them apart")
-    reference.update(encode_images(model, processor, synthetic_images(TINY_IMAGES)))
+    reference.update(encode_images(model, processor, recipe_images(TINY_IMAGES)))
 
     np.savez(directory / "reference.npz", **reference)
     (directory / "prompts.json").write_text(json.dumps(
@@ -237,7 +235,7 @@ def write_real(directory: Path) -> None:
     reference = encode(model, tokenizer, REAL_PROMPTS)
     # The pixel values are 1.8 MB of upsampled noise; the test recomputes them
     # with the same processor.
-    images = encode_images(model, processor, synthetic_images(REAL_IMAGES))
+    images = encode_images(model, processor, recipe_images(REAL_IMAGES))
     reference["image_embeds"] = images["image_embeds"]
     np.savez_compressed(directory / "reference.npz", **reference)
     (directory / "prompts.json").write_text(json.dumps(

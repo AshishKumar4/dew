@@ -49,7 +49,7 @@ from dew.nn.inputs import (
 from dew.nn.kernels.selection import select
 from dew.nn.kv_cache import PAGED, PLACES, TABLE, Append, KVCache, KVStore, filled_slots, rotated, write_cache
 from dew.nn.local_attention import local_attention
-from dew.nn.mixer_base import MixerBase, MixerContext
+from dew.nn.mixer_base import QKV_RESIDUALS, MixerBase, MixerContext
 from dew.nn.ngpt import NGPT, gain, unit
 from dew.nn.precision import at_least_fp32, float32_dot_general, rounded_to, scaled
 from dew.nn.protocols import ProjectionGroup
@@ -555,7 +555,7 @@ class CausalSelfAttention(nn.Module):
         positions, segment_ids = tokens.positions if decode else tokens.places(), tokens.segments
         logical_positions = positions
         # The projections and the kernel's output carry the names a remat
-        # policy saves or offloads (decoder_block.RESIDUALS).
+        # policy saves or offloads (mixer_base.RESIDUALS).
         projected_kv = None
         group = self._group()
         if group is not None and self._packed():
@@ -1032,7 +1032,7 @@ class CausalSelfAttention(nn.Module):
         """
         reads = jnp.maximum(positions + 1, 1)
         # The core reads each key head's query heads as its query positions
-        # (`decode_geometry.grouped_query`).
+        # (`decode_attention.grouped_query`).
         attention = scaled_dot_product_attention(
             query, key, value, dtype=self.ctx.dtype, precision=self.ctx.precision,
             force_fp32_for_softmax=self.ctx.force_fp32_for_softmax,
@@ -1142,7 +1142,7 @@ class AttentionMixer(MixerBase):
     (`{"name": "attention", "fields": {"nope": true}}`).
     """
 
-    residuals = ('q_proj', 'k_proj', 'v_proj', 'kv_proj', 'output_gate', 'o_proj', 'context')
+    residuals = (*QKV_RESIDUALS, 'output_gate', 'o_proj', 'context')
 
     bidirectional_images: bool = False
     mrope_section: tuple[int, int, int] | None = None

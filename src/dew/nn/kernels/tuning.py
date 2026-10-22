@@ -552,17 +552,32 @@ def _resource_exhausted(error: Exception) -> bool:
             or "CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES" in message)
 
 
-def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> Timings:
-    """Every config of `ba`'s launch (at its key's shapes), each compiled on a
-    thread and timed alone: the device time CUPTI reads for the launch's own
-    kernels, each run after `FLUSH_BYTES` are read, so every config starts
-    with its operands out of cache."""
-    from jax.experimental.mosaic.gpu import profiler
-
+def materialized(op: KernelOp, ba: tokamax.BoundArguments):
+    """The arrays the tuner times `ba` on, `op.operands` of its `ShapeDtypeStruct` arguments, and
+    `fill(arrays) -> (args, kwargs)`, its arguments with those arrays (or traced ones) in their places."""
     leaves, tree = jax.tree.flatten((ba.args, ba.kwargs),
                                     is_leaf=lambda leaf: isinstance(leaf, jax.ShapeDtypeStruct))
     places = [index for index, leaf in enumerate(leaves) if isinstance(leaf, jax.ShapeDtypeStruct)]
-    arrays = op.operands([leaves[index] for index in places], 0)
+
+    def fill(arrays):
+        filled = list(leaves)
+        for index, array in zip(places, arrays, strict=True):
+            filled[index] = array
+        return jax.tree.unflatten(tree, filled)
+
+    return op.operands([leaves[index] for index in places], 0), fill
+
+
+def _measured(op: KernelOp, ba: tokamax.BoundArguments, profiler=None) -> Timings:
+    """Every config of `ba`'s launch (at its key's shapes), each compiled on a
+    thread and timed alone: the device time CUPTI reads for the launch's own
+    kernels, each run after `FLUSH_BYTES` are read, so every config starts
+    with its operands out of cache. `profiler` is Mosaic GPU's, whose `Cupti`
+    reads the times, or a stand-in with its `Cupti`."""
+    if profiler is None:
+        from jax.experimental.mosaic.gpu import profiler
+
+    arrays, fill = materialized(op, ba)
     flush = jnp.zeros(FLUSH_BYTES // 4, jnp.float32)
     evicting = jax.jit(jnp.sum).lower(flush).compile()
 
@@ -572,10 +587,7 @@ def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> Timings:
         def run(flush, arrays):
             # The launch waits for the flush, which reads the whole buffer through the cache.
             total, arrays = jax.lax.optimization_barrier((jnp.sum(flush), arrays))
-            filled = list(leaves)
-            for index, array in zip(places, arrays, strict=True):
-                filled[index] = array
-            args, kwargs = jax.tree.unflatten(tree, filled)
+            args, kwargs = fill(arrays)
             return total, configured(*args, **kwargs)
 
         start = time.perf_counter()
@@ -593,6 +605,7 @@ def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> Timings:
     # holds it, from the first run or any later one, the launch keeps its
     # heuristic until a later compile.
     cupti = profiler.Cupti(finalize=False)
+    flushes: set[str] = set()
     try:
         flushes = {name for name, _ in _kernel_times(cupti, evicting, flush)}
         for config, future in futures.items():
@@ -611,11 +624,48 @@ def _measured(op: KernelOp, ba: tokamax.BoundArguments) -> Timings:
         return Timings(dict.fromkeys(ba.autotuning_configs, error))
     finally:
         _detach(profiler, evicting, flush)
+        # Every config measured before an exit, a failed one's or another subscriber's too, is logged.
+        observed(op, ba, {**timings, **_benchmarks(read, flushes)}, get_default_device())
+    return Timings({**timings, **_benchmarks(read, flushes)})
+
+
+def _benchmarks(read: Mapping, flushes: set[str]) -> dict[Hashable, tokamax.BenchmarkData]:
+    """The configs `_measured` timed, each run's time the sum of its own kernels', the flush's left out."""
+    benchmarks = {}
     for config, (runs, lowering, compiling) in read.items():
         times = tuple(sum(milliseconds for name, milliseconds in run if name not in flushes) for run in runs)
-        timings[config] = tokamax.BenchmarkData(compile_time_ms=compiling, lower_time_ms=lowering,
-                                                metadata={}, evaluation_times_ms=times)
-    return Timings(timings)
+        benchmarks[config] = tokamax.BenchmarkData(compile_time_ms=compiling, lower_time_ms=lowering,
+                                                   metadata={}, evaluation_times_ms=times)
+    return benchmarks
+
+
+def observed(op: KernelOp, ba: tokamax.BoundArguments, measured: Mapping[Hashable, object],
+             device) -> None:
+    """Log each config `_measured` timed or saw exhaust the device's resources, with the launch's features
+    and estimate where it states them, where `DEW_TIMINGS` asks (`kernels.timings`): after the timing
+    loop, on the measuring thread, so logging never runs beside a measurement and changes no pick. A
+    failure to log raises, failing the tune: logging was asked for."""
+    from . import timings as log
+    if log.directory() is None:
+        return
+    from .templates import cost, features
+
+    target = generation.gpu_target()
+    call = json.dumps(_launch_json(ba), sort_keys=True)
+    rows = []
+    for config, measurement in measured.items():
+        found = features.features(op, ba, config, target)
+        timed = measurement if isinstance(measurement, tokamax.BenchmarkData) else None
+        rows.append(log.observation(
+            type(op).__name__, call, json.dumps(encoded(config), sort_keys=True), device=device,
+            method=log.CUPTI_EVICTED, status='resource_exhausted' if timed is None else 'timed',
+            samples_ms=() if timed is None else tuple(timed.evaluation_times_ms),
+            lower_ms=None if timed is None else timed.lower_time_ms,
+            compile_ms=None if timed is None else timed.compile_time_ms,
+            estimate_s=None if found is None else cost.seconds(found.legacy, target),
+            features=None if found is None else found.row(),
+            error=measurement if isinstance(measurement, BaseException) else None))
+    log.record(rows)
 
 
 def _config(fastest: Timings | None) -> Hashable:

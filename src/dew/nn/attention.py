@@ -37,7 +37,7 @@ from .attention_kernels import (
     decodes,
 )
 from .attention_sinks import sink_softmax
-from .decode_geometry import folded_attention, folds, grouped_query
+from .decode_geometry import folded_attention, folds
 from .documents import (
     CrossDocuments,
     aligned_places,
@@ -351,7 +351,7 @@ def normalized_in_fp32(normalize, static_argnums: tuple[int, ...] = ()):
     the backward pass would keep two fp32 copies of the activations per norm
     (2.35 GiB on one SimpleDiT step). Saving nothing keeps the arguments (the
     bf16 input, the weight and the bias) and leaves the residuals to the policy
-    that recomputes the block (`decoder_block.RESIDUALS`). The wrapped function
+    that recomputes the block (`mixer_base.RESIDUALS`). The wrapped function
     takes arrays first and static arguments last, so no flax lifting sits
     between the checkpoint and the module; forward values are unchanged.
     """
@@ -1212,9 +1212,11 @@ def reference_attention(query, key, value, *, mask=None, bias=None, sinks=None, 
     (modeling_gemma2.py:192-208), and `sinks` `[H]` put one value-free logit
     per head in the softmax's denominator (`sink_softmax`). Keys and values
     may carry fewer heads. Without sinks they repeat to the query's, as flax
-    repeats them, which keeps flax's rounding; a sink layer decodes over its
-    whole cache here, since no fused kernel takes sinks, so there the query
-    heads group over their key head and no key or value repeats.
+    repeats them, which keeps flax's rounding; with sinks the query heads
+    group over their key head and no key or value repeats, as the decode
+    selector (`attention_kernels.decodes`) needs where it routes a sink
+    layer here rather than to the fused decode kernel, which takes sinks on a
+    GPU.
     """
     query, key, value = promote_dtype(query, key, value, dtype=dtype)
     dtype = query.dtype
@@ -1425,8 +1427,10 @@ def _fused_attention(query, key, value, bias, mask, causal, sliding_window, impl
                                        softcap=softcap)
 
         # The kernel has no derivative, so both modes differentiate the attention it stands in for, the
-        # sinks among its operands.
-        out = forward_differentiable(decoded, folded, query, key, value, *([] if sinks is None else [sinks]))
+        # sinks among its operands, at the kernel's arithmetic: IEEE products for fp32 operands
+        # (`decode_attention`), its 16-bit products summed in fp32 otherwise.
+        out = forward_differentiable(decoded, folded, query, key, value, *([] if sinks is None else [sinks]),
+                                     precision="highest" if query.dtype == jnp.float32 else None)
     elif implementation == 'xla' and folds(query, key, bias, mask, causal, sliding_window):
         # Key lengths and the prefix mask they mean take one path here, so where no lengths-only
         # kernel takes the call the two forms agree bitwise.
@@ -1494,7 +1498,7 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
         # The key heads repeated as each shard would hold them (`_per_shard`), so the tensor axes
         # split the groups as they split the query heads.
         key, value = split_with_queries(key, value, tensor_shards(query))
-        return grouped_query(functools.partial(
+        return decode_attention.grouped_query(functools.partial(
             attention_kernel, dtype=dtype, precision=precision, force_fp32_for_softmax=force_fp32_for_softmax,
             implementation=implementation, softcap=softcap, key_value_seq_lengths=key_value_seq_lengths,
             key_value_seq_starts=key_value_seq_starts),
@@ -1528,17 +1532,23 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
     return _read_nothing(forward_differentiable(fused, reference, query, key, value, bias, sinks), live)
 
 
-def forward_differentiable(value, tangent, *arrays):
+def forward_differentiable(value, tangent, *arrays, precision: str | None = None):
     """`value(*arrays)`, whose JVP is `tangent`'s: a kernel that defines only
     its reverse-mode derivative, or none, takes its derivatives from a
-    reference computing the same function, reverse mode as the transposed JVP."""
+    reference computing the same function, reverse mode as the transposed JVP.
+    `precision` is the kernel's own arithmetic, which the reference's products
+    take too (`jax.default_matmul_precision`), so a kernel of IEEE fp32 products
+    is not differentiated by TF32 ones; None leaves the products at the
+    caller's."""
     @jax.custom_jvp
     def attend(*arrays):
         return value(*arrays)
 
     @attend.defjvp
     def rule(primals, tangents):
-        return attend(*primals), jax.jvp(tangent, primals, tangents)[1]
+        with contextlib.nullcontext() if precision is None else jax.default_matmul_precision(precision):
+            differentiated = jax.jvp(tangent, primals, tangents)[1]
+        return attend(*primals), differentiated
 
     return attend(*arrays)
 

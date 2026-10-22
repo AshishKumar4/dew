@@ -473,8 +473,18 @@ class Plan:
         for name in sorted(set(previous) | set(self.derived)) if edited is None else ():
             if previous.get(name) != self.derived.get(name):
                 raise ValueError(f"saved data plan derived order {name} changed")
-        if self.lowering == "per-share" and current["topology"] != saved.get("topology"):
-            raise ValueError("saved per-share data plan topology changed (shares, workers or cycle length)")
+        if self.lowering == "per-share":
+            topology = record(current["topology"], "data plan topology")
+            saved_topology = record(saved.get("topology", {}), "saved data plan topology")
+            # The workers each corpus read in (`pools`): a corpus an edited mix keeps reads in as many.
+            pools = record(topology.get("pools", {}), "data plan pools")
+            saved_pools = record(saved_topology.get("pools", {}), "saved data plan pools")
+            compared = set(pools) & set(saved_pools) if edited is not None else set(pools) | set(saved_pools)
+            if ({name: value for name, value in topology.items() if name != "pools"}
+                    != {name: value for name, value in saved_topology.items() if name != "pools"}
+                    or any(pools.get(name) != saved_pools.get(name) for name in compared)):
+                raise ValueError("saved per-share data plan topology changed (shares, workers or cycle "
+                                 "length)")
         changed = _changed(record(saved.get("manifest"), "saved data manifest"), self.manifest.semantic())
         if edited is not None:
             changed = tuple(name for name in changed if name not in ("source", "steps", "tokenizer"))

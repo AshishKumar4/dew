@@ -99,6 +99,44 @@ Forward and training counters remain separate in prefetched batch metadata;
 the training sum rides the existing interval's single metric read, without an
 extra transfer or a hidden full-FT assumption for LoRA.
 
+## Multi-GPU training and serving, 2026-10-21
+
+These rows come from one booking each of an 8x A100-SXM4-40GB node and a 4x H100 SXM 80GB node, both NVLink. Each training row is one run. MFU is the model's training FLOPs over the step time and the GPUs' summed bf16 peak: 312 TFLOP/s per A100 and 989 per H100. The convention is the one in [Model FLOPs, hardware FLOPs and real tokens](#model-flops-hardware-flops-and-real-tokens).
+
+### Qwen3-8B training
+
+`tools/benchmark_step.py` ran Qwen3-8B's configuration with random weights on random 4096-token rows. The configuration is 8.19B parameters: 36 layers, width 4096, 32 query heads and 8 KV heads of 128, MLP 12288, a vocabulary of 151,936 and an untied head. Settings were bf16 and `optax.adam(1e-4)`, with 20 steps measured after 3 warm-up steps. The step time is the measured window over its steps, dispatched as a run dispatches them. The median of 20 steps that each wait on their result runs 1-4% longer. The A100 rows ran at `4452617368`, the H100 rows at `a1b949f58`.
+
+| GPUs | mesh | batch | ms a step | tokens/s | MFU | peak memory a GPU |
+|---|---|---|---|---|---|---|
+| 8x A100 40GB | FSDP 8 | 8 x 4096 | 1152.3 | 28,438 | 55.9% | 36.1 GiB |
+| 8x A100 40GB | FSDP 4 x TP 2 | 4 x 4096 | 630.5 | 25,984 | 51.0% | 30.4 GiB |
+| 4x H100 80GB | FSDP 4 | 4 x 4096 | 391.3 | 41,873 | 51.9% | 60.6 GiB |
+| 4x H100 80GB | FSDP 2 x TP 2 | 2 x 4096 | 253.4 | 32,329 | 40.1% | 46.1 GiB |
+
+Each mesh holds one row per FSDP shard, so the tensor-parallel rows run half the batch. At that batch they run 4.9 MFU points lower on the A100s and 11.8 lower on the H100s.
+
+### Dory 1.0 4B training
+
+`tools/reference_runs/dew_lm.py --mesh fsdp` ran the looped nGPT with two passes. Settings were bf16, the planner's rematerialization, fp32 Adam moments and 8 x 4096 random ids, for 60 steps with the first 15 as warm-up, at `a1b949f58`.
+
+| GPUs | mesh | ms a step | tokens/s | MFU |
+|---|---|---|---|---|
+| 4x H100 80GB | FSDP 4 | 771.3 | 42,482 | 38.8% |
+| 8x A100 40GB | FSDP 8 | 1031.4 | 31,769 | 45.9% |
+
+### Qwen3-30B-A3B serving, expert-parallel
+
+`tools/benchmark_lm_serving.py --backend dew` served the pretrained Qwen3-30B-A3B in-process. The expert axis spanned every GPU. Each run was two requests a slot, each of 256 prompt tokens and 128 greedy output tokens with EOS ignored, repeated three times, at `0f8360bfe` with JAX 0.11.2.post6.
+
+| GPUs | slots | requests | output tokens/s | wall s | TTFT p50 |
+|---|---|---|---|---|---|
+| 8x A100 40GB, expert 8 | 64 | 128 | 208.3 | 78.7 | 1.02 s |
+| 8x A100 40GB, expert 8 | 128 | 256 | 411.9 | 79.6 | 0.80 s |
+| 4x H100 80GB, expert 4 | 64 | 128 | 382.7 | 42.8 | 0.41 s |
+
+The three repeats agree to 0.1 tokens/s. From 64 to 128 slots, the A100 node does twice the requests in about the same wall time: its decode step takes as long for 128 sequences as for 64. The H100 node spent 2,040 s compiling and warming the 64-slot programs. Its 128-slot run did not finish within the job's minutes. No vLLM row on the same nodes completed, so this section has no reference comparison yet.
+
 ## A CPU cluster against one GPU, 2026-10-08
 
 Could a gang of Cloudflare containers train faster or more cheaply than one A100? `tools/cluster_vs_gpu.py` trains
@@ -1504,7 +1542,7 @@ Qwen3.5-0.8B's real keys (near-aligned keys, beta near one) the powers grew
 as binomials while the inverse's entries stay under 1, and the cancellation
 left its fifth delta-rule layer 1e24 off in fp32 on a 256-token prompt:
 every later layer, the logits and every served request were NaN.
-`strictly_lower_inverse` now joins diagonal-block inverses, doubling their
+`recurrence_algebra.factor` (then `strictly_lower_inverse`) now joins diagonal-block inverses, doubling their
 size, so each product is the size of its entries. Every layer's chunked rule
 is within 8e-7 of a float64 token-by-token run, and the logits within 3.3e-05
 of transformers' fp32 forward with every argmax equal. It is cheaper too. At
@@ -1600,7 +1638,7 @@ Both kernels are gone (2026-10-12). Dew's port of fla 0.5.2's nine kernels
 target row names it (`'gated_delta_rule': 'fla'` on sm80, sm89, sm90 and
 sm120, where it was measured; the row is what qualification reads), on any
 heads, dtypes, chunk sizes and mesh, with keys up to 256 wide in bf16 or
-fp16 and 128 in fp32 (`dew.nn.linear.fla_rule`). The XLA math stays for
+fp16 and 128 in fp32 (`recurrence_chunk.fla_rule`). The XLA math stays for
 CPUs, TPUs, unmeasured GPUs, forward-mode traces, float64 and wider keys,
 and as the tests' oracle (`port_refusal` names each case).
 On a G4 the port's bf16 forward ran 1.32 and 1.18 ms at the 0.8B's (8 x

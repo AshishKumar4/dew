@@ -27,7 +27,8 @@ from model_support import decode_through
 
 from dew.nn.inputs import MixerCall
 from dew.nn.kda import KimiDeltaAttention
-from dew.nn.linear import chunk_gated_delta_rule, l2norm as jax_l2norm, recurrent_delta_rule
+from dew.nn.kernels.recurrence_chunk import chunk_gated_delta_rule, recurrent_delta_rule
+from dew.nn.linear import l2norm as jax_l2norm
 
 BOUND = 1e-4
 B, S, H, D, E, K = 2, 7, 2, 4, 8, 4  # batch, tokens, heads, head dim, model width, conv kernel
