@@ -552,13 +552,9 @@ class Instance:
     cls: griffe.Object
 
 
-@dataclass
-class Bound:
-    """What a file's earlier Python units leave bound for its next: each imported name's dotted path,
-    as Python's scopes read them (tools/lint_scopes.py), and the names bound to an `Instance`."""
-
-    imports: dict[str, str] = field(default_factory=dict)
-    instances: dict[str, Instance] = field(default_factory=dict)
+INSTANCE = "<instance>"
+"""What a name `name = Class(...)` binds stands for in a scope's table (`held`): this, then the class's
+path, which no import's dotted path starts with."""
 
 
 def reached(package: griffe.Module, dotted: str) -> griffe.Object | None:
@@ -577,20 +573,25 @@ def reached(package: griffe.Module, dotted: str) -> griffe.Object | None:
 
 
 def unresolved_uses(package: griffe.Module, home: dict[str, str], pages: dict[str, Page],
-                    code: str, shown: set[int] | None, bound: Bound) -> Iterator[str]:
+                    code: str, shown: set[int] | None, bound: dict[str, str]) -> Iterator[str]:
     """Each dotted use of a Dew name in `code` that does not reach the
     documented API: an attribute a module or class does not have, or a
     module member no page documents. Names come from `import dew...` and
-    `from dew... import ...` as Python's scopes read them: in this unit or an
-    earlier one of the same file (`bound`, which this updates), except where
-    a scope binds the name itself; `name = Class(...)` binds an `Instance`
-    whose calls must be methods."""
+    `from dew... import ...` as Python's scopes read them (tools/lint_scopes.py):
+    in this unit or an earlier one of the same file (`bound`, the module
+    scope's names, which this updates), except where a scope binds the name
+    itself; `name = Class(...)` binds an `Instance` whose calls must be methods."""
     try:
         tree = ast.parse(code)
     except SyntaxError as error:
         yield f"a Python unit does not parse, so none of its names is checked: {error}"
         return
-    tables = {id(node): table for node, table in scopes.scoped(tree.body, bound.imports, ())}
+    imports = {id(node): table for node, table in scopes.scoped(tree.body, bound, ())}
+    tables = {id(node): table for node, table in
+              scopes.scoped(tree.body, bound, (), held=held(tree, imports, package))}
+    if tree.body:
+        bound.clear()
+        bound.update(tables[id(tree.body[0])])
 
     def chain(node: ast.expr) -> list[str] | None:
         if isinstance(node, ast.Name):
@@ -600,22 +601,9 @@ def unresolved_uses(package: griffe.Module, home: dict[str, str], pages: dict[st
             return None if inner is None else [*inner, node.attr]
         return None
 
-    # Where each name an `Instance` holds still holds it, read like the imports: the module scope's
-    # `name = Class(...)` statements left out, so that their names reach every scope that binds none.
-    built = instances(tree, tables, package)
-    holders = {name: built.get(name) or bound.instances[name] for name in {*bound.instances, *built}}
-    rest = [statement for statement in tree.body
-            if not (isinstance(statement, ast.Assign) and len(statement.targets) == 1
-                    and isinstance(statement.targets[0], ast.Name) and statement.targets[0].id in built)]
-    # A held name reads "" in these tables, which no import's dotted path is.
-    held = {id(node): table for node, table in scopes.scoped(rest, dict.fromkeys(holders, ""), ())}
-    # The module scope's names are the next unit's.
-    bound.imports = dict(tables[id(tree.body[0])]) if tree.body else bound.imports
-    module = held[id(rest[0])] if rest else dict.fromkeys(holders, "")
-    bound.instances = {name: holders[name] for name, path in module.items() if path == ""}
     called = {id(node.func) for node in ast.walk(tree) if isinstance(node, ast.Call)}
-
-    # Only the outermost dotted name counts, so a method and its class are not counted twice.
+    # Only the outermost dotted name counts, so a method and its class are not counted twice; one
+    # spelling is checked once a binding.
     inner = {id(node.value) for node in ast.walk(tree) if isinstance(node, ast.Attribute)}
     seen = set()
     for node in ast.walk(tree):
@@ -623,18 +611,16 @@ def unresolved_uses(package: griffe.Module, home: dict[str, str], pages: dict[st
                 or (shown is not None and node.lineno not in shown)):
             continue
         path = chain(node)
-        if path is None or ".".join(path) in seen:
+        target = None if path is None else tables[id(node)].get(path[0])
+        if target is None or (target, *path) in seen:
             continue
-        imported, instance = tables[id(node)].get(path[0]), held.get(id(node), {}).get(path[0]) == ""
-        if imported is None and not instance:
-            continue
+        seen.add((target, *path))
         try:
-            start = reached(package, imported) if imported is not None else holders[path[0]]
-            if start is None:
+            found = reached(package, target.removeprefix(INSTANCE))
+            if found is None:
                 continue
-            seen.add(".".join(path))
-            kept = start if isinstance(start, Instance) else None
-            problem = unresolved_chain(start.cls if kept else start, path, home, pages)
+            kept = Instance(found) if target.startswith(INSTANCE) else None
+            problem = unresolved_chain(kept.cls if kept else found, path, home, pages)
             if problem is None and kept is not None and id(node) in called and len(path) == 2:
                 problem = called_attribute(kept.cls, path)
         except Unresolved as error:
@@ -643,28 +629,23 @@ def unresolved_uses(package: griffe.Module, home: dict[str, str], pages: dict[st
             yield problem
 
 
-def instances(tree: ast.Module, tables: dict[int, Mapping[str, str]], package: griffe.Module
-              ) -> dict[str, Instance]:
-    """The names `tree` binds to an instance of a Dew class, each to that
-    class: a name every assignment of which is `name = Class(...)` for one
-    class the unit's imports reach (`objective = DiffusionObjective(...)`)."""
-    stores: dict[str, int] = {}
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
-            stores[node.id] = stores.get(node.id, 0) + 1
-    built: dict[str, list[griffe.Object]] = {}
+def held(tree: ast.Module, imports: dict[int, Mapping[str, str]], package: griffe.Module) -> dict[int, str]:
+    """Each `name = Class(...)` in `tree` whose class the scope's imports reach as a Dew class: the
+    stored name's node identity, to `INSTANCE` and the class's path (`objective =
+    DiffusionObjective(...)`), which lint_scopes binds the name to where every binding of it in its
+    scope is one such, of one class."""
+    instances: dict[int, str] = {}
     for node in ast.walk(tree):
         if not (isinstance(node, ast.Assign) and len(node.targets) == 1
                 and isinstance(node.targets[0], ast.Name) and isinstance(node.value, ast.Call)):
             continue
         try:
-            made = reached(package, scopes.resolved(node.value.func, tables[id(node.value.func)]))
+            made = reached(package, scopes.resolved(node.value.func, imports[id(node.value.func)]))
         except Unresolved:
             continue
         if made is not None and made.is_class:
-            built.setdefault(node.targets[0].id, []).append(made)
-    return {name: Instance(classes[0]) for name, classes in built.items()
-            if len(classes) == stores[name] and len({cls.path for cls in classes}) == 1}
+            instances[id(node.targets[0])] = INSTANCE + made.path
+    return instances
 
 
 def called_attribute(cls: griffe.Object, path: list[str]) -> str | None:
@@ -789,7 +770,7 @@ def documented(package: griffe.Module) -> tuple[dict[str, Page], dict[str, str]]
 def unresolved_in(file: str, path: Path, package: griffe.Module, pages: dict[str, Page],
                   home: dict[str, str]) -> list[str]:
     """Unresolved code and declaration references, with each Python unit seeing earlier units' bindings."""
-    bound = Bound()
+    bound: dict[str, str] = {}
     problems = [problem for code, shown in usage_code(file, path)
                 for problem in unresolved_uses(package, home, pages, code, shown, bound)]
     if path.suffix == ".md":

@@ -905,7 +905,7 @@ def coverage_report(directory: Path) -> int:
     # A task that wrote no rows or was interrupted left the coverage of its files' later tests out.
     def ran_short(task: Path) -> bool:
         verdict = task / "rows.json"
-        return not verdict.exists() or any(INTERRUPTED in found["output"]
+        return not verdict.exists() or any(found["exitCode"] and found["kind"] == "deadline"
                                            for found in json.loads(verdict.read_text())["rows"])
 
     # armada keeps each task's artifacts in a directory named by its index.

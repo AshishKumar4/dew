@@ -66,6 +66,22 @@ def test_a_name_a_scope_binds_hides_a_dew_import_in_that_scope_alone(gen_api, do
                            "MeshSpec.build_mesh()\n```\n") == [NO_BUILD_MESH]
 
 
+def test_each_scope_reads_the_instances_and_aliases_it_binds_itself(gen_api, documented, tmp_path):
+    """An instance an earlier block bound is held to its class inside a
+    later constructor's arguments, one a function binds is held there, and
+    an alias a function imports is that function's own, however the module
+    spells the same name."""
+    assert unresolved_page(gen_api, documented, tmp_path / "instances.md",
+                           "```python\nfrom dew.training import MeshSpec\nfrom dew import sampling as api\n"
+                           "mesh = MeshSpec()\n```\n\n"
+                           "```python\nother = MeshSpec(mesh.build_mesh())\napi.Sampling\n\n"
+                           "def make():\n    from dew import training as api\n    spec = MeshSpec()\n"
+                           "    spec.not_here\n    return api.Sampling\n```\n") == [
+        "`spec.not_here`: dew.training.distributed.MeshSpec has no not_here",
+        "`api.Sampling`: dew.training has no public Sampling",
+        "`mesh.build_mesh`: dew.training.distributed.MeshSpec has no build_mesh"]
+
+
 def test_an_instance_of_a_dew_class_is_held_to_its_members_across_cells(gen_api, documented, tmp_path):
     """`name = Class(...)` binds an instance: a later cell's attribute it
     does not have is reported, and so is calling a value it holds as though
