@@ -48,6 +48,26 @@ def test_the_flags_pick_a_preset_and_a_solver_and_set_sets_the_chains_settings()
     assert set_.data.facts()["fields"]["image"] == [64, 64, 3] and set_.data.facts()["batch"] == 8
 
 
+def test_set_points_a_recipes_chain_at_another_store():
+    """`--set data.source.<field>` sets a field of the chain's store, as a recipe's command line points
+    its default chain at the caller's own data: a token store's URL, and a TFDS store's path through
+    the holdout it is read under; a field the store does not have is refused."""
+    from dew.data import presets
+    from dew.data.sources import source
+    from dew.data.sources.tokens import TokenFiles
+
+    windows = TokenFiles("data/shakespeare-byte").pipe(presets.lm, None, seq_len=8, batch=2, pack=None)
+    config = LMRunConfig.cli(["--set", "data.source.url=data/mine", "--set", "data.lm.seq_len=16"],
+                             default=LMRunConfig(data=windows))
+    assert config.data.source.url == "data/mine" and config.data.facts()["seq_len"] == 16
+    train, _ = source("tfds://oxford_flowers102").holdout(records=128)
+    flowers = DiffusionRunConfig(data=train.pipe(presets.images, 32, batch=16))
+    moved = flowers.assigned(["data.source.path=/data/tfds"])
+    assert moved.data.source.source.path == "/data/tfds"
+    with pytest.raises(ValueError):
+        flowers.assigned(["data.source.colour=red"])
+
+
 def test_an_lm_run_over_images_is_refused():
     with pytest.raises(ValueError):
         LMRunConfig(data=images_of("tfds://oxford_flowers102", 32)).prepare()

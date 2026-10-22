@@ -262,8 +262,9 @@ def test_prefetch_iterator_resumes_a_packed_dataset_iterator(tmp_path):
     from dew.data.sources.tokens import TokenFiles
 
     corpus = write_token_corpus(tmp_path / "tokens", np.concatenate([np.arange(1, 9), [0]] * 40), eos_id=0)
-    packed = TokenFiles(corpus.train).shuffle(0).repeat().pipe(presets.lm, None, seq_len=8,
-                                                               batch=jax.device_count(), bins=2)
+    # Packed in the store's order, then ordered: the pack is one plan over the store.
+    packed = TokenFiles(corpus.train).pipe(presets.lm, None, seq_len=8, batch=None, bins=2).shuffle(
+        0).repeat().batch(jax.device_count())
     data = compile(packed, read="memory", seed=0, loading=Loading(workers=0))
 
     mesh = MeshSpec().build()
