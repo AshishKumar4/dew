@@ -143,8 +143,8 @@ class Ring:
     into slot `counter % stages` (`load`), a consumer waits for it (`acquire`) and gives it back
     (`release`). The counter runs across a persistent kernel's tiles, so a tile's first loads reuse the
     slots the last tile left, and each tile may take its own number of steps (a causal tile's trip range):
-    a slot is free for its first fill and, after, once every consumer released it. Allocated with
-    `ring`."""
+    a slot is free for its first fill and, after, once every consumer released it; the producer drains the
+    ring after its last load (`drain`). Allocated with `ring`."""
     stages: int
     smem: object
     full: object
@@ -169,6 +169,14 @@ class Ring:
     def release(self, counter) -> None:
         """A consumer's release of step `counter`'s slot, whose reads (and MMAs) are done."""
         plgpu.barrier_arrive(self.consumed.at[self.slot(counter)])
+
+    def drain(self, end) -> None:
+        """The producer's wait, after its last load (step `end - 1`), for the consumers' release of each slot
+        it filled last, so no slot is freed (or reallocated) while a consumer still reads it, and every
+        release is seen."""
+        for back in range(self.stages):
+            step = end - 1 - back
+            pl.when(step >= 0)(lambda step=step: plgpu.barrier_wait(self.consumed.at[self.slot(step)]))
 
 
 def ring(block: tuple, dtype, stages: int, *, consumers: int = 1, transforms: tuple = ()) -> dict:
