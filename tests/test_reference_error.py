@@ -27,25 +27,25 @@ from reference_error import (
 )
 
 
-def test_two_dew_paths_compiled_with_equal_dots_reach_no_dot_fusion():
-    """On the CPU lane `equal_dots` compiles a program whose dots XLA:CPU keeps to its own code, where it
-    would hand them to a YNNPACK or XNNPACK fusion dispatched by the host's ISA (ledger row 1349); on
-    an accelerator lane it is `jax.jit`. Either way a caller's jit options and compiler options pass
-    through, and the result transforms as a jitted function does."""
-    from reference_error import equal_dots
+@pytest.mark.cpu(reason="WITHOUT_YNN is XLA:CPU's")
+def test_without_ynn_compiles_no_ynnpack_fusion_on_the_cpu():
+    """A dot and a reduction, which XLA:CPU otherwise hands to YNNPACK fusions, compile to none."""
+    from reference_error import without_ynn
 
-    left, right = np.ones((16, 48), np.float32), np.ones((48, 4), np.float32)
-    for options in ({}, {"compiler_options": None},
-                    {"compiler_options": {"xla_cpu_enable_fast_math": False}}):
-        text = equal_dots(jnp.dot, **options).lower(left, right).compile().as_text()
-        if jax.default_backend() == "cpu":
-            assert "ynn_fusion" not in text and "xnn_fusion" not in text, options
-        else:
-            assert text == jax.jit(jnp.dot, **options).lower(left, right).compile().as_text(), options
-    # A static argument shapes the output, as only a static one can.
-    np.testing.assert_array_equal(equal_dots(lambda n: jnp.arange(n), static_argnums=0)(3), [0, 1, 2])
-    batched = jax.vmap(equal_dots(jnp.dot))(np.stack([left, left]), np.stack([right, right]))
-    np.testing.assert_array_equal(batched, np.full((2, 16, 4), 48, np.float32))
+    for fn, operands in ((jnp.dot, (np.ones((16, 48), np.float32), np.ones((48, 4), np.float32))),
+                         (jnp.sum, (np.ones((64, 512), np.float32),))):
+        assert "ynn_fusion" in jax.jit(fn).lower(*operands).compile().as_text()
+        assert "ynn_fusion" not in without_ynn(fn).lower(*operands).compile().as_text()
+
+
+@pytest.mark.cpu(reason="WITHOUT_YNN is XLA:CPU's")
+def test_without_ynn_takes_a_callers_compiler_options_over_its_own():
+    """A caller's setting of the fusion option is the one the program compiles under."""
+    from reference_error import without_ynn
+
+    fused = {"xla_cpu_experimental_ynn_fusion_type": "LIBRARY_FUSION_TYPE_DOT"}
+    operands = np.ones((16, 48), np.float32), np.ones((48, 4), np.float32)
+    assert "ynn_fusion" in without_ynn(jnp.dot, compiler_options=fused).lower(*operands).compile().as_text()
 
 
 def test_a_small_row_beside_large_ones_is_held_to_its_own_size():

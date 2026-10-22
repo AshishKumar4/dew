@@ -115,26 +115,27 @@ def widened(tree):
         leaf, np.float64 if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf.dtype), tree)
 
 
-EQUAL_DOTS = {"xla_cpu_experimental_ynn_fusion_type": "", "xla_cpu_experimental_xnn_fusion_type": ""}
-"""XLA:CPU's compiler options under which every dot of a program takes XLA's own code, not a YNNPACK
-or XNNPACK fusion (ledger row 1349). Those libraries pick their microkernels at run time by the
-host's ISA, and reach a program's dots but not the dots inside the loops of Pallas' interpreter: the
-interpreted SSD kernel against XLA's scan, whose own dots reached them, put its state gradient at
-1.586 times the scan's distance from float64 on an AVX-512 host (AMD 25/17) and at 0.765 on an AVX2
-one (AMD 25/1). With both arms on XLA's dots its worst leaf over the nine host cases is 1.17 on
-25/17, and the one-short case's 1.20 on 25/1. The bits still part with the host (Eigen blocks a dot by
-its caches), the verdict no longer."""
+WITHOUT_YNN = {"xla_cpu_experimental_ynn_fusion_type": ""}
+"""XLA:CPU's compiler options with every YNNPACK fusion off (dots, reductions, element-wise and layout
+ops alike), so that a program runs on XLA's own code. YNNPACK picks its microkernels at run time by
+the host's instruction set, and by default both the interpreted SSD kernel and XLA's scan compile
+parts of themselves to its fusions: check 1 between the two read 1.598 on an AMD EPYC Zen 4 host
+(x86-64-v4, AVX-512) and 0.77 on a Zen 3 one (x86-64-v3, AVX2), and without the fusions its worst
+leaf over the nine host cases is 1.17 on the first and the one-short case's 1.20 on the second.
+Which fused op moved the verdict is not isolated. The empty list, not the documented
+`-individual_dot`, because compiler options take no such spelling and that one leaves a scan's
+reductions fused."""
 
 
-def equal_dots(fn, **jit_options):
-    """`fn` jitted, with EQUAL_DOTS on the CPU lane: an arm of a check 1 between two Dew paths, such as
-    an interpreted kernel and the XLA program it replaces, whose dots must reach the same code on any
-    host. On an accelerator lane, where an interpreted kernel runs on the accelerator, it is `jax.jit`:
-    a float64 twin compiled there for the CPU keeps the fusions, and the oracle rule it is held to
-    (`assert_computes_the_oracle`) is what judges it. A program Dew's users run compiles with the
-    fusions, as they do."""
+def without_ynn(fn, **jit_options):
+    """`fn` jitted with WITHOUT_YNN on the CPU lane (`jax.jit` on an accelerator lane): an arm of a
+    check 1 between two Dew paths, such as an interpreted kernel and the XLA program it replaces,
+    neither of them a reference, so that the two judge on the same code on any host. A program Dew's
+    users run compiles with the fusions, as they do. Call it at top level: on the CPU lane its
+    compiler options refuse to be nested in another jit or differentiated through. A caller's own
+    compiler options take precedence over WITHOUT_YNN's."""
     if jax.default_backend() == "cpu":
-        jit_options["compiler_options"] = {**EQUAL_DOTS, **(jit_options.get("compiler_options") or {})}
+        jit_options["compiler_options"] = {**WITHOUT_YNN, **(jit_options.get("compiler_options") or {})}
     return jax.jit(fn, **jit_options)
 
 
