@@ -14,6 +14,7 @@ from reference_error import assert_as_exact
 
 from dew.nn.kernels import recurrence, recurrence_algebra as algebra, recurrence_chunk
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk
+from dew.nn.precision import float32_einsum
 
 ROWS, LENGTH, KEY_HEADS, VALUE_HEADS, KEY_WIDTH, VALUE_WIDTH = 2, 70, 1, 2, 16, 8
 CHUNK = 16
@@ -159,20 +160,22 @@ def test_the_chunked_op_is_as_exact_as_the_recurrence_token_by_token(hooks, pack
                     seeds=SEEDS[hooks, packed])
 
 
-@pytest.mark.parametrize('hooks', [
-    recurrence.Hooks(decay='none', delta=False, write_gate=True, skip=True),
-    recurrence.Hooks(decay='scalar', scale=0.1, skip=True),
-    recurrence.Hooks(decay='scalar', scale=0.1, skip=True, output=recurrence.OutputNorm(1e-6)),
-], ids=str)
-@pytest.mark.parametrize('ported', [False, True], ids=['portable', 'port'])
+ROUNDED_ONCE = [recurrence.Hooks(decay='none', delta=False, write_gate=True, skip=True),
+                recurrence.Hooks(decay='scalar', scale=0.1, skip=True),
+                recurrence.Hooks(decay='scalar', scale=0.1, skip=True, output=recurrence.OutputNorm(1e-6))]
+"""The rounding sites' hooks: a write gate without a decay, which only the portable math takes, and the delta
+rule with a decay, with and without the norm, which the port takes too."""
+
+
+@pytest.mark.parametrize('hooks, ported', [
+    pytest.param(hooks, ported, id=f'{hooks}-{"port" if ported else "portable"}')
+    for hooks in ROUNDED_ONCE for ported in ((False, True) if hooks.delta else (False,))])
 def test_the_output_rounds_once_after_the_epilogue(hooks, ported):
     """The chunked op rounds its output once, after the skip and the norm, as the decode step's reference
     does, on the portable math and on the port (the delta rule with a decay, its kernels interpreted off
     a GPU): a bf16 token whose readout `0.1` (a unit query and key, the write gate or the scale 0.1)
     the skip `-0.10009765625` nearly cancels leaves the reference's residual, and the norm reads it,
     where a readout rounded to bf16 first cancels to zero."""
-    if ported and not hooks.delta:
-        pytest.skip("the port runs the delta rule with a decay")
     unit = jnp.zeros((1, 1, 1, 8), jnp.bfloat16).at[..., 0].set(1.0)
     beta = jnp.full((1, 1, 1), 1.0 if hooks.delta else 0.1, jnp.float32)
     operands = Chunk(unit, unit, jnp.ones((1, 1, 1, 8), jnp.bfloat16),
@@ -260,7 +263,8 @@ def test_composed_chunks_leave_the_memory_the_recurrence_leaves(hooks, packed):
                                          starts=operands.starts, delta=hooks.delta)
         t, w = jax.lax.associative_scan(algebra.compose, algebra.transition(
             steps.key, steps.w, steps.u, steps.gc, steps.last, steps.kept), axis=2)
-        return jnp.einsum('bhkj,bhjv->bhkv', t[:, :, -1], operands.state.astype(t.dtype)) + w[:, :, -1]
+        entered = float32_einsum('bhkj,bhjv->bhkv', t[:, :, -1], operands.state.astype(t.dtype))
+        return entered + w[:, :, -1]
 
     def recurrent(operands):
         return token_by_token(hooks, operands)[1]
