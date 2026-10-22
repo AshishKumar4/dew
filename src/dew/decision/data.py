@@ -167,6 +167,18 @@ class ParseTable:
         }
 
 
+def _named_by(rows, label: str, names: Sequence[object]) -> bool:
+    """Whether every row's `label` names one of `names`, by its index or its name."""
+    known = {str(name) for name in names}
+    for index in range(len(rows)):
+        row = rows[index]
+        value = row.get(label) if isinstance(row, Mapping) else None
+        by_index = isinstance(value, int) and not isinstance(value, bool) and 0 <= value < len(names)
+        if not (by_index or (not isinstance(value, bool) and str(value) in known)):
+            return False
+    return True
+
+
 @dataclass(frozen=True)
 class _DecisionSource:
     """A store's rows read as decisions: `table`'s options and the slots its rows need are inferred
@@ -212,7 +224,10 @@ class _DecisionSource:
                 stated = self.source.metadata().get("class_names", {})
                 names = record(stated, "class names").get(self.table.label)
                 first = rows[0] if len(rows) else None
-                if isinstance(names, (list, tuple)):
+                # The store's class names hold where the stages before keep its labels: a relabelling
+                # map's values are read from its rows instead.
+                if isinstance(names, (list, tuple)) and (not self.before or _named_by(rows, self.table.label,
+                                                                                        names)):
                     self._classes[:] = [str(name) for name in names]
                 elif isinstance(first, Mapping) and "questions" not in first and "example" not in first:
                     if self.table.label not in first:
