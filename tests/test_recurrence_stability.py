@@ -283,6 +283,17 @@ def stressed(hooks, regime: str, seed: int) -> tuple[Chunk]:
     return (operands,)
 
 
+def cotangents(hooks, regime: str, seed: int) -> tuple[Chunk, tuple[jax.Array, jax.Array]]:
+    """Draw `seed`'s operands under `regime` (`stressed`) and fp32 cotangents of their output `[B, S, Hv,
+    Dv]` and final memory `[B, Hv, Dk, Dv]` from the seed's own key, which the float64 truth takes as they
+    are."""
+    (operands,) = stressed(hooks, regime, seed)
+    batch, length, heads, width = operands.value.shape
+    keys = jax.random.split(jax.random.fold_in(jax.random.key(seed), 101))
+    return operands, (jax.random.normal(keys[0], (batch, length, heads, width)),
+                      jax.random.normal(keys[1], (batch, heads, operands.key.shape[-1], width)))
+
+
 def ported(hooks) -> bool:
     """Whether the port takes these hooks: the delta rule with a decay, not rated."""
     return hooks.delta and hooks.decay != 'none' and not hooks.rated
@@ -327,14 +338,11 @@ def test_the_chunked_op_stays_finite_and_exact_where_chunked_forms_break(name, r
 
 
 def pulled(fn):
-    """`fn`'s gradient with respect to each float operand it reads, through a fixed cotangent on its
-    output and final memory (a key no draw's seed reaches), drawn in fp32 whatever the outputs' dtype, so
-    the float64 truth pulls the same cotangent back."""
-    def run(operands):
+    """`fn`'s gradient with respect to each float operand it reads, through the draw's cotangents on its
+    output and final memory (`cotangents`), taken in the outputs' dtype."""
+    def run(operands, cotangent):
         outputs, pull = jax.vjp(fn, operands)
-        keys = jax.random.split(jax.random.fold_in(jax.random.key(0), 1 << 20), len(outputs))
-        (grads,) = pull(tuple(jax.random.normal(key, out.shape, jnp.float32).astype(out.dtype)
-                              for key, out in zip(keys, outputs, strict=True)))
+        (grads,) = pull(tuple(c.astype(out.dtype) for c, out in zip(cotangent, outputs, strict=True)))
         return {field: getattr(grads, field) for field in GRADIENTS
                 if getattr(operands, field) is not None and getattr(operands, field).dtype.kind == 'f'}
     return run
@@ -355,12 +363,12 @@ def test_the_chunked_ops_gradient_is_as_exact_as_the_recurrences(name, regime, a
         return
     dew = jax.jit(pulled(functools.partial(chunk, hooks, chunk_size=CHUNK, ported=arm == 'port')))
     reference = jax.jit(pulled(functools.partial(token_by_token, hooks)))
-    draws = functools.partial(stressed, hooks, regime)
+    draws = functools.partial(cotangents, hooks, regime)
     for seed in range(2):
-        operands = draws(seed)
-        mine = dew(*operands)
+        drawn = draws(seed)
+        mine = dew(*drawn)
         with jax.enable_x64(new_val=True):
-            truth = reference(*widened(operands))
+            truth = reference(*widened(drawn))
         for field, ours in mine.items():
             finite = np.isfinite(np.asarray(truth[field]))
             assert np.all(np.isfinite(np.asarray(ours))[finite]), f'{field}: not finite, seed {seed}'
