@@ -11,6 +11,7 @@ from pathlib import Path
 from tool_support import load
 
 GATE = Path(__file__).resolve().parents[1] / "tools" / "duplicates.py"
+BASE_HISTORY = GATE.with_name("base_history.sh")
 duplicates = load("duplicates")
 
 BLOCK = """\
@@ -65,9 +66,9 @@ def copies(root: Path) -> list:
     return duplicates.structural(sources(root))
 
 
-def added(root: Path) -> list:
-    """The copies `root`'s checkout adds to main's, which the gate held to main refuses."""
-    merged = duplicates.merge_base(root, "main")
+def added(root: Path, base: str = "main") -> list:
+    """The copies `root`'s checkout adds to `base`'s, which the gate held to it refuses."""
+    merged = duplicates.merge_base(root, base)
     return duplicates.named(duplicates.judged(duplicates.found(sources(root)), merged, root)[0])
 
 
@@ -126,6 +127,20 @@ def test_seven_lines_two_files_copy_fail_the_gate_and_six_or_one_owner_pass_it(t
     sharing_six = tree(tmp_path, "sharing_six", {"first.py": f"def first(values, limit):\n{BLOCK}",
                                                  "second.py": f"def second(values, limit):\n{differing}"})
     assert gate(sharing_six).returncode == 0
+
+
+def test_the_structural_reading_alone_skips_the_text_copies_and_keeps_the_structural(tmp_path):
+    """With --structural, for iterating on a head (check.sh --changed), the gate reads no text: seven
+    settings two files write alike, a copy only the text reading sees, pass, and a function two files
+    write under other names still fails."""
+    settings = "".join(f"{name} = {value}\n" for value, name in enumerate(
+        ("alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta")))
+    texts = tree(tmp_path, "texts", {"first.py": settings, "second.py": settings})
+    assert gate(texts).returncode == 1
+    assert gate(texts, "--structural").returncode == 0
+    functions = tree(tmp_path, "functions", {f"{name}.py": f"def {name}(values, limit):\n{BLOCK}"
+                                             for name in ("first", "second")})
+    assert gate(functions, "--structural").returncode == 1
 
 
 def test_a_function_two_files_write_under_other_names_fails_and_one_owner_passes(tmp_path):
@@ -337,6 +352,24 @@ def test_held_to_a_base_only_a_copy_the_base_lacked_fails(tmp_path):
     absolute = subprocess.run([sys.executable, str(GATE), "--base=main", str(root)], cwd=root, timeout=300,
                               capture_output=True)
     assert absolute.returncode == 1
+
+
+def test_a_shallow_checkout_is_held_to_its_base_once_tools_base_history_fetches_it(tmp_path):
+    """A shallow checkout of a head, as armada's are, holds no origin/main to hold it to;
+    tools/base_history.sh fetches main and its history from the checkout's origin, and the gate then
+    fails the head's new copy."""
+    root = repository(tmp_path, {"spread.py": SPREAD, "ranges.py": RANGE_OVER_COUNT})
+    third = RANGE_OVER_COUNT.replace("range_over_count", "third").replace("chosen", "picked")
+    (root / "third.py").write_text(third)
+    commit(root, "a head that copies it again")
+    shallow = tmp_path / "shallow"
+    subprocess.run(["git", "clone", "-q", "--depth", "1", "--branch", "head", root.as_uri(), str(shallow)],
+                   check=True)
+    assert gate(shallow, "--base=origin/main").returncode == 2
+    subprocess.run(["sh", str(BASE_HISTORY)], cwd=shallow, check=True, timeout=120)
+    assert gate(shallow, "--base=origin/main").returncode == 1
+    assert owners(added(shallow, "origin/main")) == [
+        ("function", ["ranges.py range_over_count", "spread.py spread", "third.py third"])]
 
 
 def test_held_to_a_base_a_new_copy_beside_a_held_one_fails(tmp_path):

@@ -16,10 +16,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from decision_support import decision_rows
 from reference_error import assert_as_exact
 from safetensors.numpy import load_file
 
-from dew.config.data import loader
 from dew.data.dataset import DataPartition
 from dew.data.text import ByteTokenizer, HFTokenizer
 from dew.decision import (
@@ -32,7 +32,6 @@ from dew.decision import (
     Question,
     Specials,
 )
-from dew.decision.data import Decisions as DecisionRecipe
 from dew.decision.joint_checkpoint import StoredJointHead
 from dew.decision.layout import compacted
 from dew.decision.task import laid_out
@@ -155,8 +154,7 @@ def ragged_batches(objective: DecisionObjective, seed: int = 0):
     holds, with their options compacted into the slots its bounds allow (`slotted`) and without
     (`batch`)."""
     examples = ragged(seed)
-    data = loader(DecisionRecipe(source=examples, validation=examples), batch=len(examples),
-                read="memory", objective=objective.data())
+    data = decision_rows(examples, len(examples), examples, objective=objective.data())
     (slotted,) = list(data.val(DataPartition()))
     slotted = {name: value for name, value in slotted.items() if name != VALID_ROWS}
     batch = {name: value for name, value in slotted.items() if name not in ("option_slots", "slotted")}

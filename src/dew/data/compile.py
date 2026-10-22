@@ -60,6 +60,7 @@ from dew.data.dataset import (
     Records,
     weight_counts,
 )
+from dew.data.facts import merge_facts
 from dew.data.lowering import _as_iter, _Build, _epoch_records, _Locality, _split_spans, _weights, _workers
 from dew.data.materialize import _materialize, _Memory
 from dew.data.mixing import CorpusCounts
@@ -102,7 +103,7 @@ from dew.data.plan import Plan, StepIdentity, fingerprint, unplaced
 from dew.data.readers import _CanonicalPass, _Host, _PerShare, _Statistics
 from dew.data.sources.base import Read, ShardManifest, Source, _consumed, tokenizer_contract
 from dew.data.steps.generic import Coordinated
-from dew.records import JSON, integer, json_value, record
+from dew.records import JSON, integer, json_value
 
 _DEFAULT_LOADING = Loading()
 
@@ -471,7 +472,7 @@ def compile(
     """Check every leaf before opening readers, then build both branches.
     With no `read`, the sources choose it (`_preferred_read`)."""
     branches = (train,) if validation is None else (train, validation)
-    read = read or train.mode or _preferred_read(lambda _: branches, provision=provision)
+    read = read or train.mode or _preferred_read(branches, provision=provision)
     loading = loading or train._loading or _DEFAULT_LOADING
     if isinstance(train.source, Phases):
         return _compile_phases(
@@ -964,29 +965,11 @@ def _objective_branch(pipeline: Pipeline, objective: ObjectiveData, *, train: bo
 
 
 def _metadata(pipelines: Sequence[Pipeline], read: Read) -> Mapping[str, object]:
-    combined: Batch = {}
-    conflicted: set[str] = set()
-    slots: dict[str, int] = {}
     # A fact a configured step measures binds a mixture's step to the largest of its stores'.
-    measured = {each.measure.fact for pipeline in pipelines for each in _measures(tuple(_steps(pipeline)))}
-    for pipeline in pipelines:
-        for _, source in _leaves(pipeline):
-            if isinstance(source, _Memory) and not source.held:
-                continue
-            facts = source.metadata()
-            for key, value in facts.items():
-                if key == "slots":
-                    for name, size in record(value, "slots").items():
-                        slots[name] = max(slots.get(name, 0), integer(size, f"slots.{name}"))
-                elif key in measured:
-                    combined[key] = max(integer(value, key), integer(combined.get(key, 0), key))
-                elif key not in combined:
-                    combined[key] = value
-                elif combined[key] != value:
-                    # A fact two sources state differently is no fact of the run, whatever a third states.
-                    conflicted.add(key)
-    shared = {key: value for key, value in combined.items() if key not in conflicted}
-    return {**shared, "slots": slots} if slots else shared
+    measured = frozenset(each.measure.fact for pipeline in pipelines
+                         for each in _measures(tuple(_steps(pipeline))))
+    return merge_facts((source.metadata() for pipeline in pipelines for _, source in _leaves(pipeline)
+                        if not (isinstance(source, _Memory) and not source.held)), measured=measured)
 
 
 def _diagnostic(pipeline: Pipeline, *, records: int | None = None) -> _Host:
@@ -995,7 +978,7 @@ def _diagnostic(pipeline: Pipeline, *, records: int | None = None) -> _Host:
     A bounded record pass runs lazily without loader read-ahead or
     eager memory transforms, and leaves its counters in the Grain state.
     """
-    read = pipeline.mode or _preferred_read(lambda _: (pipeline,), provision=True)
+    read = pipeline.mode or _preferred_read((pipeline,), provision=True)
     loading = pipeline._loading or _DEFAULT_LOADING
     if records is not None:
         pipeline = pipeline._then(Limit(records))
@@ -1061,24 +1044,25 @@ def fitted[Entry](
     validation: Dataset | Mapping[str, Dataset | Entry] | None,
     *,
     objective: ObjectiveData,
+    seed: int = 0,
 ) -> tuple[Loader, Mapping[str, Reader | Entry] | None]:
     """`dataset` and each validation dataset as `Trainer.fit` reads them,
-    compiled with the objective's own stages, their stores provisioned. A
-    training dataset without a repeat repeats before its batch, so a run's
-    length is its steps, epochs or tokens; a validation dataset without a
-    batch takes the training batch, and is read and loaded as it asks. A
-    Loader is already compiled, and an entry that is no Dataset (a reader,
-    an evaluation suite) is passed on as it is."""
+    compiled with the objective's own stages and the run's data `seed`,
+    their stores provisioned. A training dataset without a repeat repeats
+    before its batch, so a run's length is its steps, epochs or tokens; a
+    validation dataset without a batch takes the training batch, and is read
+    and loaded as it asks. A Loader is already compiled, and an entry that is
+    no Dataset (a reader, an evaluation suite) is passed on as it is."""
     if isinstance(dataset, Dataset):
         train = _endless(dataset._chain())
-        loader = compile(train, objective=objective, provision=True)
+        loader = compile(train, objective=objective, provision=True, seed=seed)
     else:
         loader = dataset
     named = {"val": validation} if isinstance(validation, Dataset) else validation
     if named is None:
         return loader, None
-    return loader, {name: _held(entry._chain(), loader.batch, objective) if isinstance(entry, Dataset)
-                    else entry for name, entry in named.items()}
+    return loader, {name: held(entry, objective=objective, batch=loader.batch, seed=seed)
+                    if isinstance(entry, Dataset) else entry for name, entry in named.items()}
 
 
 def _endless(chain: Pipeline) -> Pipeline:
@@ -1091,11 +1075,24 @@ def _endless(chain: Pipeline) -> Pipeline:
     return dataclasses.replace(chain, stages=(*chain.stages[:at], Repeat(None), *chain.stages[at:]))
 
 
-def _held(chain: Pipeline, batch: int, objective: ObjectiveData) -> Reader:
-    """`chain` read once to validate on, batched by `batch` where it states no
-    batch, read and loaded as it asks."""
-    return validation(chain, batch=batch, objective=objective, read=chain.mode,
-                      loading=chain._loading or _DEFAULT_LOADING, provision=True)
+def held(dataset: Dataset, *, objective: ObjectiveData | None = None, batch: int | None = None,
+         seed: int = 0) -> Reader:
+    """`dataset` read once to validate or evaluate on, in its own batches, else in batches of `batch`,
+    read and loaded as it asks, its random steps drawing from `seed`; one that states neither batch is
+    refused. A pass reads every record: a batch it fills only in part keeps the records it holds,
+    filled out with copies its `VALID_ROWS` marks, where a training read would drop them."""
+    chain = dataset._chain()
+    if not any(isinstance(stage, (BatchStage, TokenBudget)) for stage in chain.stages):
+        if batch is None:
+            raise ValueError(f"{_name(chain)} states no batch; batch it (`.batch(n)`) or give batch=")
+        chain = chain.batch(batch, drop_remainder=False)
+    batched = (BatchStage, TokenBudget)
+    chain = dataclasses.replace(chain, stages=tuple(
+        dataclasses.replace(stage, drop_remainder=False) if isinstance(stage, batched) else stage
+        for stage in chain.stages))
+    # The chain's own batch is the one it is read in; validation's `batch` adds none to it.
+    return validation(chain, batch=1, objective=objective, read=chain.mode,
+                      loading=chain._loading or _DEFAULT_LOADING, provision=True, seed=seed)
 
 
 def validation(
@@ -1111,7 +1108,7 @@ def validation(
 ) -> Reader:
     """Compile one finite evaluation branch without constructing a training
     stream. With no `read`, the sources choose it (`_preferred_read`)."""
-    read = read or _preferred_read(lambda _: (pipeline,), provision=provision)
+    read = read or _preferred_read((pipeline,), provision=provision)
     if not any(isinstance(stage, (BatchStage, TokenBudget)) for stage in pipeline.stages):
         pipeline = pipeline.batch(batch, drop_remainder=False)
     (pinned,) = _prepared((pipeline,), read, provision=provision, objective=objective, counts=({},))

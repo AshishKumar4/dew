@@ -20,7 +20,7 @@ from jax.sharding import AxisType, Mesh, NamedSharding, PartitionSpec as P
 from model_support import TINY_DECODER
 from recording import RecordingTracker
 from sharded import assert_sharded
-from token_support import repeated_token_batch
+from token_support import repeated_token_batch, write_token_corpus
 
 from dew.checkpoints import Checkpoints
 from dew.data.dataset import Loader
@@ -257,15 +257,17 @@ def native_trainer(mesh, layout, directory, **hybrid) -> Trainer:
 def token_windows(directory):
     """Eight-row batches of windows over a token file, a stream fit
     checkpoints and resumes."""
-    from dew.config.data import TextData, loader
-    from dew.data import Loading
+    from dew.data import Loading, presets
+    from dew.data.compile import compile
+    from dew.data.sources.tokens import TokenFiles
 
-    directory.mkdir(exist_ok=True)
-    tokens = (np.arange(400) * 7 % VOCAB).astype(np.uint16)
-    for split in ("train", "val"):
-        tokens.tofile(directory / f"{split}.bin")
-    return loader(TextData(source=str(directory), seq_len=LENGTH, stride=1), batch=8, read="memory", seed=7,
-                  loading=Loading(workers=0, threads=1, read_buffer=1), validation_records=32)
+    tokens = np.arange(400) * 7 % VOCAB
+    corpus = write_token_corpus(directory, tokens, tokens, vocab_size=VOCAB)
+    train = TokenFiles(corpus.train).shuffle(7).repeat().pipe(presets.token_windows, seq_len=LENGTH,
+                                                               stride=1, batch=8)
+    held = TokenFiles(corpus.val).pipe(presets.token_windows, seq_len=LENGTH, stride=1, batch=8, records=32)
+    return compile(train, validation=held, read="memory", seed=7,
+                   loading=Loading(workers=0, threads=1, read_buffer=1))
 
 
 @pytest.mark.mesh(devices=8)

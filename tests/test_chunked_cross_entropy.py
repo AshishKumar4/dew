@@ -250,7 +250,7 @@ SEEDS = {'bias': 128, 'fused': 512, 'quantized': 64, 'scale and bias': 128, 'voc
          'small vocabulary': 128, 'small vocabulary training': 128, 'bounded': 32, 'saturated': 256,
          'excluded': 32, 'token tiles': 16, 'both outputs': 64, 'gemma': 16, 'bf16 cotangent': 8,
          'whole logits': 512}
-"""Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada, 2026-10-21):
+"""Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada):
 the most any of a site's cases took."""
 
 

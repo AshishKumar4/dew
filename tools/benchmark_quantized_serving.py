@@ -50,6 +50,7 @@ from jax.typing import ArrayLike
 from dew.artifacts import uint8_pixels
 from dew.quantization import Quantization
 from dew.sampling import CFG, DPMSolverMultistep, TextToImage
+from dew.telemetry.benchmark import samples
 
 PROMPTS = (
     "a watercolor painting of a mountain lake at sunrise",
@@ -76,7 +77,7 @@ class Config:
     """Names of modules to leave unquantized, matched anywhere in their path."""
     model: str = "dewml/hybrid-dit-176m"
     """A Hugging Face Hub repository, or a local Dew run directory."""
-    revision: str | None = "9056c18392bd7d906f5ced2bd64ebcbaba8d0989"
+    revision: str | None = "9ae074a357738c1634971627608fce3bd7fa3167"
     """The Hub commit or tag to load; local run directories do not use it."""
     clip: bool = True
     """Sample every prompt at both seeds and score the images with CLIP."""
@@ -109,12 +110,7 @@ def forward(pipe: TextToImage) -> dict:
 
     compiled = jax.jit(step).lower(variables, x, t).compile()
     memory = compiled.memory_analysis()
-    jax.block_until_ready(compiled(variables, x, t))
-    times = []
-    for _ in range(5):
-        started = time.perf_counter()
-        jax.block_until_ready(compiled(variables, x, t))
-        times.append(time.perf_counter() - started)
+    times = samples(compiled, variables, x, t, warmup=1, repeats=5)
     return {"weights_mib": round(nbytes(variables["params"]) / 2**20, 1),
             "forward_ms": round(1e3 * statistics.median(times), 2),
             "arguments_mib": round(memory.argument_size_in_bytes / 2**20, 1),

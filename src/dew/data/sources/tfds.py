@@ -416,11 +416,29 @@ class TFDS(Dataset):
     def manifest(self) -> ShardManifest:
         return _indexed_manifest(self, self.describe(), str(self.builder.data_path), self.shard_rows)
 
-    def metadata(self) -> Mapping[str, object]:
+    def stated(self) -> Mapping[str, object]:
+        """Its builder's info, no data source opened: the dataset's name and version, its class
+        names, and the split's rows the info counts. A split not prepared here, or a remote one not
+        mirrored yet, states nothing: a run's record and model are built where its data may not be."""
+        root = epath.Path(os.path.expanduser(self.directory))
+        # A prepared directory holds the split's metadata, or a data directory the dataset's own.
+        prepared = all((root / name).is_file() for name in METADATA)
+        here = root.is_dir() and (prepared or (root / self.name).is_dir())
+        if not here or (self.remote and not Path(self.directory, "READY").is_file()):
+            return {}
+        described = self.builder.info
+        splits = described.splits
+        counted = splits is not None and self.split in splits
+        rows = {"rows": splits[self.split].num_examples} if counted else {}
+        return {"name": described.name, "version": str(described.version), "class_names": self._class_names,
+                **rows}
+
+    @property
+    def _class_names(self) -> Mapping[str, tuple[str, ...]]:
         import tensorflow_datasets as tfds
 
         features = self.builder.info.features
-        class_names = (
+        return (
             {
                 name: tuple(feature.names)
                 for name, feature in features.items()
@@ -429,6 +447,9 @@ class TFDS(Dataset):
             if isinstance(features, tfds.features.FeaturesDict)
             else {}
         )
+
+    def metadata(self) -> Mapping[str, object]:
+        class_names = self._class_names
         return {
             "name": self.builder.info.name,
             "version": str(self.builder.info.version),

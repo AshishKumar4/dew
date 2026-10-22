@@ -269,12 +269,12 @@ def test_a_mig_slice_keeps_its_generations_tensor_rate():
 
 
 def test_an_unseen_gpu_runs_xla_s_grouped_matmul():
-    """A GPU generation that states no tensor rate (an sm100 the table does not name) runs an expert
+    """A GPU generation that states no tensor rate (an sm103 the table does not name) runs an expert
     projection on XLA's ragged dot, its route saying why, with no estimate asked of the kernels."""
     x = jnp.ones((32, 64), jnp.bfloat16)
     w = jnp.ones((4, 64, 128), jnp.float32)
     sizes = jnp.asarray([8, 8, 8, 8], jnp.int32)
-    with generation.assumed("sm100"), generation.routes() as taken:
+    with generation.assumed("sm103"), generation.routes() as taken:
         jax.jit(lambda x, w: expert_projection(x, w, sizes, jnp.bfloat16, "auto", None)).trace(x, w)
     (route,) = {(route.kernel, route.refusal.detail if route.refusal else None) for route in taken
                 if route.choice == "grouped_matmul"}

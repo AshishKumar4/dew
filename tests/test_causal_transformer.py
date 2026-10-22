@@ -25,6 +25,7 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.hyper_connections import HyperConnections
 from dew.nn.kernels.selection import KernelRefused
 from dew.nn.mixers import AttentionMixer
+from dew.nn.rope import YarnScaling
 
 VOCAB = 37
 SEQ = 12
@@ -445,6 +446,13 @@ def hybrid(**overrides):
                     'linear_num_value_heads': 4, 'linear_key_head_dim': 6,
                     'linear_value_head_dim': 8, 'linear_conv_kernel_dim': 4}}}},
                 **overrides)
+
+
+def test_a_yarn_layer_refuses_a_partial_rotary(rng):
+    """YaRN ramps a whole head's frequencies (`dew.nn.rope.rotary_freqs`), so a layer given YaRN and a
+    partial rotary refuses at its first call."""
+    with pytest.raises(ValueError):
+        tiny(partial_rotary_factor=0.5, yarn=YarnScaling()).init(rng, tokens(rng))
 
 
 def test_a_hybrid_stack_decodes_as_it_scores_in_parallel(rng):

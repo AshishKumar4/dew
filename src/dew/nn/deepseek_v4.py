@@ -64,7 +64,7 @@ from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of, valid_order
 from dew.nn.kv_cache import KVCache, write_cache
 from dew.nn.mixer_base import ATTENTION_CONTEXT_RESIDUALS, MixerBase, MixerContext
 from dew.nn.precision import at_least_fp32, float32_dot_general, float32_einsum
-from dew.nn.rope import YarnScaling, rotate, yarn_rope_freqs
+from dew.nn.rope import YarnScaling, rotary_freqs, rotate
 from dew.nn.sharding import RESIDUAL, LogicalAxes, constrain, down_projection, logical_axes
 from dew.nn.sparse_selection import candidate_pool, index_scores, selection_mask, top_k_keys, top_k_selection
 
@@ -290,8 +290,8 @@ class CompressedEntries(FakeQuantizing):
 
     def rotate(self, latents, windows):
         """Rotate each entry at its window's first position, `window * rate`."""
-        cos, sin = yarn_rope_freqs(windows * self.rate, self.rope_dim, self.rope_theta, self.yarn,
-                                   dtype=at_least_fp32(latents.dtype))
+        cos, sin = rotary_freqs(windows * self.rate, self.rope_dim, self.rope_theta, rope_scaling=self.yarn,
+                                dtype=at_least_fp32(latents.dtype))
         return _rotate_rope(latents, cos, sin)
 
     def entries(self, x, valid=None):
@@ -653,17 +653,17 @@ class DeepseekV4Attention(FakeQuantizing):
         elif cache is None:
             entries, latents = self.compress.entries_and_latents(x, valid)
             windows = jnp.arange(latents.shape[1])
-            keys = self.indexer.keys(latents, *yarn_rope_freqs(windows * rate, self.rope_dim,
-                                                               self.rope_theta, self.yarn,
-                                                               dtype=at_least_fp32(latents.dtype)))
+            keys = self.indexer.keys(latents, *rotary_freqs(windows * rate, self.rope_dim,
+                                                            self.rope_theta, rope_scaling=self.yarn,
+                                                            dtype=at_least_fp32(latents.dtype)))
         else:
             slots, capacity, allocated = cache
             entries, latents, windows = self.compress.cached_entries(x, slots, capacity, allocated)
             held = self.variable('cache', 'index_keys', jnp.zeros,
                                  (x.shape[0], capacity // rate, index_head_dim), latents.dtype)
-            fresh = self.indexer.keys(latents, *yarn_rope_freqs(windows * rate, self.rope_dim,
-                                                                self.rope_theta, self.yarn,
-                                                                dtype=at_least_fp32(latents.dtype)))
+            fresh = self.indexer.keys(latents, *rotary_freqs(windows * rate, self.rope_dim,
+                                                             self.rope_theta, rope_scaling=self.yarn,
+                                                             dtype=at_least_fp32(latents.dtype)))
             if allocated:
                 held.value = write_cache(held.value, fresh, windows)
             keys = held.value
@@ -719,8 +719,8 @@ class DeepseekV4Attention(FakeQuantizing):
                 positions = slots
         positions = jnp.arange(length) if positions is None else jnp.asarray(positions)
         rows = jnp.arange(length)
-        cos, sin = yarn_rope_freqs(positions, self.rope_dim, self.rope_theta, self.yarn,
-                                   dtype=at_least_fp32(x.dtype))
+        cos, sin = rotary_freqs(positions, self.rope_dim, self.rope_theta, rope_scaling=self.yarn,
+                                dtype=at_least_fp32(x.dtype))
 
         # The query latent and the shared key head project the residual down,
         # where `down_projection` places them: on each tensor shard's own
@@ -837,8 +837,8 @@ class DSparkAttention(DeepseekV4Attention):
                 slots, allocated = cache_positions(self, batch, main.shape[1], store.get(DRAFT_VALID))
                 if allocated:
                     cached_key.value = write_cache(cached_key.value, self._window_keys(
-                        main, *yarn_rope_freqs(slots, self.rope_dim, self.rope_theta, self.yarn,
-                                               dtype=at_least_fp32(main.dtype)),
+                        main, *rotary_freqs(slots, self.rope_dim, self.rope_theta, rope_scaling=self.yarn,
+                                            dtype=at_least_fp32(main.dtype)),
                         down_projection(main, self.head_dim)), slots)
             main_keys = cached_key.value
             last = jnp.asarray(self.get_variable('cache', 'cache_index')) - 1
@@ -852,16 +852,17 @@ class DSparkAttention(DeepseekV4Attention):
             real = store.get(DRAFT_VALID)
             places = (jnp.arange(main.shape[1])[None] if real is None
                       else jnp.cumsum(real, axis=1, dtype=jnp.int32) - 1)
-            main_keys = self._window_keys(main, *yarn_rope_freqs(places, self.rope_dim, self.rope_theta,
-                                                                 self.yarn, dtype=at_least_fp32(main.dtype)),
+            main_keys = self._window_keys(main, *rotary_freqs(places, self.rope_dim, self.rope_theta,
+                                                              rope_scaling=self.yarn,
+                                                              dtype=at_least_fp32(main.dtype)),
                                           down_projection(main, self.head_dim))
             last = jnp.broadcast_to(places[:, -1], (batch,))
         length = x.shape[1]
         if length == 0:
             return x
         positions = last[:, None] + 1 + jnp.arange(length)
-        cos, sin = yarn_rope_freqs(positions, self.rope_dim, self.rope_theta, self.yarn,
-                                   dtype=at_least_fp32(x.dtype))
+        cos, sin = rotary_freqs(positions, self.rope_dim, self.rope_theta, rope_scaling=self.yarn,
+                                dtype=at_least_fp32(x.dtype))
         place = down_projection(x, self.q_lora_rank + self.head_dim)
         query, _ = self._queries(x, cos, sin, place)
         window = (places <= last[:, None]) & (places > last[:, None] - self.sliding_window)

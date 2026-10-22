@@ -343,10 +343,11 @@ def _choice_tokens(entry: Mapping[str, object]) -> tuple[tuple[int, ...] | None,
 def listed_ids(entry: Mapping[str, object]) -> tuple[int, ...] | None:
     """A choice's `token_ids` list (SGLang's `return_token_ids`), or None where it has none."""
     listed = entry.get("token_ids")
-    if listed is not None and (not isinstance(listed, list) or any(
-            type(token) is not int or token < 0 for token in listed)):
-        raise ValueError("choice token_ids must be a list of nonnegative ids")
-    return None if listed is None else tuple(listed)
+    if listed is None:
+        return None
+    if not isinstance(listed, list):
+        raise ValueError(f"a choice's token_ids are a list, got {type(listed).__name__}")
+    return tuple(token_id(token, where="a choice's token_ids") for token in listed)
 
 
 def matched_stop(entry: Mapping[str, object]) -> str | int | None:
