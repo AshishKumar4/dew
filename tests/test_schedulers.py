@@ -77,8 +77,8 @@ SCHEDULES = [
 ALL_CASES = SCHEDULES
 ALL_IDS = [cls.__name__ for cls, *_ in SCHEDULES]
 BETAS = dict(np.load(Path(__file__).parent / "fixtures" / "schedules" / "betas.npz"))
-SEEDS = {'invertible': 8, 'diffusion-lm sqrt': 8, 'clean image weighting': 8, 'flow clean image weighting': 8,
-         'karras grid': 8, 'edm weight': 8, 'edm time': 8, 'flow rates': 8}
+SEEDS = {'invertible': 64, 'diffusion-lm sqrt': 128, 'clean image weighting': 256,
+         'flow clean image weighting': 32, 'karras grid': 32, 'edm weight': 8, 'edm time': 8, 'flow rates': 8}
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada)."""
 ROWS = 64
 """A drawn batch's rows: enough that a few seeds resolve a site."""
@@ -90,10 +90,11 @@ def drawn(seed: int, site: int):
 
 
 def assert_follows(draws, law):
-    """Training draws follow `law` (a scipy distribution): over 2^14 or more draws, the one-sample
-    Kolmogorov-Smirnov test does not reject at one in a billion."""
+    """Training draws follow `law` (a scipy distribution): over 2^18 or more draws, the one-sample
+    Kolmogorov-Smirnov test does not reject at one in a billion. Its critical distance there is 0.0064,
+    so a normal's deviation off by 0.05 at 1.2 (a distance of 0.0099) fails it all but surely."""
     draws = np.asarray(draws, np.float64)
-    assert draws.size >= 1 << 14
+    assert draws.size >= 1 << 18
     assert stats.kstest(draws, law.cdf).pvalue > 1e-9
 
 
@@ -167,30 +168,34 @@ def test_sqrt_schedule_is_diffusion_lms_table(steps):
     """Diffusion-LM's own `get_named_beta_schedule("sqrt", T)` (Li et al.
     2022, XiangLi1999/Diffusion-LM at 759889d, run by
     tools/beta_schedule_reference.py): at its step k the cumulative alpha is
-    Dew's alpha^2 at t = (k + 1) / T. Dew's rates at fp32 t over drawn steps
-    are on par with Diffusion-LM's own alpha_bar, 1 - sqrt(t + 1e-4), at the
-    same t in NumPy fp32, normalized as its table telescopes, from the table
-    itself (check 1). The last step is excluded: Diffusion-LM clips its beta
-    at 0.999 where the cumulative alpha crosses zero, and Dew stops at
-    (0, 1). The paper trains the plain x_0 loss: the weight is one."""
+    Dew's alpha^2 at t = (k + 1) / T. Over drawn steps, Dew's rates at that t
+    rounded to fp32 are on par with Diffusion-LM's own alpha_bar,
+    1 - sqrt(t + 1e-4), at the same fp32 t in NumPy, normalized as its table
+    telescopes, from the table itself, the step's exact rates (check 1). The
+    last step is excluded: Diffusion-LM clips its beta at 0.999 where the
+    cumulative alpha crosses zero, and Dew stops at (0, 1). The paper trains
+    the plain x_0 loss: the weight is one."""
     table = np.cumprod(1 - BETAS[f"diffusion_lm_sqrt_{steps}"])
     schedule = SqrtContinuousNoiseScheduler()
 
-    def draw(seed):
-        step = drawn(seed, 1).integers(0, steps - 1, ROWS)
-        return step, ((step + 1) / steps).astype(np.float32)
+    def time(step):
+        # Step k's time (k + 1) / T, rounded once to the arms' float32.
+        return ((step + 1) / steps).astype(np.float32)
 
-    def theirs(step, t):
+    def theirs(step):
         def alpha_bar(t):
             return 1 - np.sqrt(t + 0.0001)
-        cumulative = alpha_bar(t) / alpha_bar(np.zeros_like(t))
+        cumulative = alpha_bar(time(step)) / alpha_bar(np.float32(0))
         return {"alpha": np.sqrt(cumulative), "sigma": np.sqrt(1 - cumulative)}
 
-    def tabled(step, t):
+    def tabled(step):
         return {"alpha": np.sqrt(table[step]), "sigma": np.sqrt(1 - table[step])}
 
-    assert_as_exact(lambda step, t: dict(zip(("alpha", "sigma"), schedule.rates(t), strict=True)), theirs,
-                    draw, "diffusion-lm sqrt", seeds=SEEDS['diffusion-lm sqrt'], truth_fn=tabled)
+    def rates(step):
+        return dict(zip(("alpha", "sigma"), schedule.rates(time(step)), strict=True))
+
+    assert_as_exact(rates, theirs, lambda seed: (drawn(seed, 1).integers(0, steps - 1, ROWS),),
+                    "diffusion-lm sqrt", seeds=SEEDS['diffusion-lm sqrt'], truth_fn=tabled)
     assert schedule.rates(jnp.asarray(1.0)) == (0.0, 1.0)
     np.testing.assert_array_equal(schedule.weight(CONTINUOUS_STEPS), np.ones(4, np.float32))
 
@@ -381,7 +386,7 @@ def test_min_snr_weights_a_flow_velocity_as_the_clean_image_it_reads_out():
 def test_edm_draws_the_sigmas_of_the_space_it_denoises(rng, fields, mean, std):
     """The log of a training sigma is normal at the preset's mean and deviation (`assert_follows`)."""
     schedule = presets.EDM(**fields)().schedule
-    assert_follows(jnp.log(schedule.sigmas(schedule.sample_t(rng, 1 << 15))), stats.norm(mean, std))
+    assert_follows(jnp.log(schedule.sigmas(schedule.sample_t(rng, 1 << 18))), stats.norm(mean, std))
 
 
 def test_a_run_config_draws_pixel_sigmas_without_an_autoencoder_and_latent_ones_with(rng):
@@ -393,7 +398,7 @@ def test_a_run_config_draws_pixel_sigmas_without_an_autoencoder_and_latent_ones_
         (DiffusionRunConfig(preset=presets.EDM(P_mean=-0.8, P_std=0.7)), -0.8, 0.7),
     ):
         schedule = config.preset().schedule
-        assert_follows(jnp.log(schedule.sigmas(schedule.sample_t(rng, 1 << 15))), stats.norm(mean, std))
+        assert_follows(jnp.log(schedule.sigmas(schedule.sample_t(rng, 1 << 18))), stats.norm(mean, std))
 
 
 def test_edm_preset_samples_on_the_karras_grid():
@@ -488,7 +493,7 @@ def test_presets_rebuild_from_their_fields(rng):
     assert_as_exact(lambda t: dict(zip(("alpha", "sigma"), process.schedule.rates(t), strict=True)), shifted,
                     lambda seed: (drawn(seed, 7).uniform(0, 1, ROWS).astype(np.float32),), "flow rates",
                     seeds=SEEDS['flow rates'])
-    draws = process.schedule.sample_t(rng, 1 << 15)
+    draws = process.schedule.sample_t(rng, 1 << 18)
     assert_follows(jnp.log(draws / (1 - draws)), stats.norm(0.5, 0.7))
     with pytest.raises(ValueError):
         registry.build("flow", shfit=3.0)
