@@ -45,8 +45,9 @@ class Pages:
         self.prefix_cache = prefix_cache
         self._free: deque[int] = deque(range(count))
         self._holders = np.zeros(count, np.int32)
-        self._cached: OrderedDict[int, bytes] = OrderedDict()
-        """Pages held by no row whose keys a prefix hash still names, oldest release first."""
+        self._cached: OrderedDict[int, None] = OrderedDict()
+        """Pages held by no row whose keys a prefix hash still names, oldest release first; each
+        one's digest is `_hash_of`'s."""
         self._by_hash: dict[bytes, int] = {}
         self._hash_of: dict[int, bytes] = {}
 
@@ -108,7 +109,7 @@ class Pages:
             if self._holders[page]:
                 continue
             if page in self._hash_of:
-                self._cached[page] = self._hash_of[page]
+                self._cached[page] = None
             else:
                 self._free.append(page)
 
@@ -131,7 +132,7 @@ class Pages:
         if self._free:
             page = self._free.popleft()
         else:
-            page, digest = self._cached.popitem(last=False)
-            del self._by_hash[digest], self._hash_of[page]
+            page, _ = self._cached.popitem(last=False)
+            del self._by_hash[self._hash_of.pop(page)]
         self._holders[page] += 1
         return page

@@ -76,7 +76,7 @@ def test_the_layer_decodes_as_it_prefills():
 def test_state_spaces_mamba_130m_computes_the_references_logits():
     """state-spaces/mamba-130m-hf in fp32 on CPU, in Dew and in
     transformers 5.16.1, on two prompts cut to a common length."""
-    torch = pytest.importorskip("torch")
+    import torch
     import transformers
     source = json.loads((ROOT / 'mamba-130m-hf' / 'source.json').read_text())
     tokenizer = transformers.AutoTokenizer.from_pretrained(source['repo'], revision=source['revision'])

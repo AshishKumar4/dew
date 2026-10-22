@@ -22,6 +22,7 @@ from dew.nn.moe import (
     gather_expert_bias,
     renormalized_softmax,
 )
+from dew.nn.precision import float32_dot_general
 from dew.nn.sharding import LogicalAxes, logical_axes
 
 FUSED_EXPERT_AXES: Mapping[str, LogicalAxes] = {
@@ -135,7 +136,7 @@ class GptOssMLP(nn.Module):
     @nn.compact
     def __call__(self, x: jax.Array, routes: Routes | None = None) -> jax.Array:
         logits = Dense(self.num_local_experts, use_bias=True, dtype=self.dtype,
-                           precision=self.precision, name="router")(x)
+                           precision=self.precision, name="router", dot_general=float32_dot_general)(x)
         k = self.num_experts_per_tok
         indices = chosen_experts(lambda: jax.lax.top_k(logits, k)[1], (*logits.shape[:-1], k), routes)
         return GptOssExperts(

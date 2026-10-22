@@ -15,7 +15,6 @@ lands one fp32 ulp (4.8e-7) from torch's; `LOSS` is two.
 
 import copy
 import math
-from dataclasses import replace
 
 import jax
 import jax.numpy as jnp
@@ -25,7 +24,7 @@ import pytest
 import torch
 import transformers
 from jax.sharding import PartitionSpec as P
-from reference_error import assert_leaves_as_exact, float64_terms, widened
+from reference_error import assert_as_exact, assert_as_exact_as_the_reference, equations
 
 from dew.data.dataset import Loader
 from dew.interop import Pretrained
@@ -38,8 +37,6 @@ from tools.diffusers_wan_reference import float64
 # CI runs this file in tasks of its own: torchax renames torch's privateuse1 backend process-wide.
 pytestmark = pytest.mark.torchax
 
-pytest.importorskip("torchax")
-
 SEQ = 16
 ROWS = 8
 TINY = {"num_hidden_layers": 2, "hidden_size": 64, "num_attention_heads": 4,
@@ -49,6 +46,8 @@ LOSS = 1e-6
 GRADIENT = 1.7e-6
 """Twice the worst leaf's max |Δgrad| over its max |grad| measured on CPU,
 8.3e-7 at the first layer's post-attention norm bias."""
+HEAD_SEEDS, BF16_SEEDS = 256, 256
+"""Each site's check-1 seeds, sized by `seeds_for` on 2026-10-20 on armada."""
 
 
 @pytest.fixture(scope="module")
@@ -83,6 +82,32 @@ def objective_loss(objective, variables, tokens, *, scalar: bool = False):
     loss = objective.reduce_loss(stats)[0]
     return loss if scalar else float(loss)
 
+
+
+def token_draws(tokens):
+    """Check 1's draw of token rows: `tokens` (the fixture's) at seed 0, else rows of their shape
+    drawn uniformly from the vocabulary."""
+    def draw(seed):
+        if seed == 0:
+            return (tokens,)
+        return (np.random.default_rng(seed).integers(0, TINY["vocab_size"], tokens.shape).astype(np.int32),)
+
+    return draw
+
+
+def loss_and_gradients(loaded, model, params):
+    """A draw's LM loss of the fallback-loaded model and its gradient for each parameter `model`
+    (its torch twin) names, the loss as `[1]`: the function check 1 holds against torch's step."""
+    objective = LMObjective(loaded, seq_len=SEQ, ema_decay=None)
+    step = jax.jit(jax.value_and_grad(lambda params, ids: objective_loss(
+        objective, {**loaded.variables, "params": params}, ids, scalar=True)))
+    names = [name for name, _ in model.named_parameters()]
+
+    def dew_fn(ids):
+        value, grads = step(params, ids)
+        return {"loss": value[None]} | {name: grads[name] for name in names}
+
+    return dew_fn
 
 def test_the_logits_and_the_objective_loss_are_transformers(source, loaded, tokens):
     """`apply` is the torch forward, and LMObjective's chunked loss over the
@@ -237,9 +262,7 @@ def test_a_head_trains_as_transformers_does_by_what_it_is(head, tokens, tmp_path
     as exact as transformers' own over the same stored weights, both measured
     from transformers in float64 (tests/reference_error.py); a bf16 store's
     gradients round to bf16 on both sides, as the parameters they update are
-    kept. A leaf whose sum cancels by design (a key bias's gradient, under the
-    softmax's shift invariance) is sized by its float64 terms, which Dew's own
-    forward sums in float64."""
+    kept."""
     module, stored = HEADS[head]
     model = head_model(head)
     model.save_pretrained(tmp_path)
@@ -247,33 +270,29 @@ def test_a_head_trains_as_transformers_does_by_what_it_is(head, tokens, tmp_path
         loaded = Pretrained.load(tmp_path, fallback="torchax", dtype="float32", param_dtype=stored)
     assert type(loaded.model).__name__ == module
 
-    def step(source):
-        objective = LMObjective(source, seq_len=SEQ, ema_decay=None)
-        loss = jax.value_and_grad(lambda params: objective_loss(
-            objective, {**source.variables, "params": params}, tokens, scalar=True))
-        return loss, {name: jnp.asarray(leaf) for name, leaf in source.variables["params"].items()}
+    params = {name: jnp.asarray(leaf) for name, leaf in loaded.variables["params"].items()}
+    dew_fn = loss_and_gradients(loaded, model, params)
 
-    names = [name for name, _ in model.named_parameters()]
-    loss, params = step(loaded)
-    value, grads = loss(params)
-    dew = {"loss": np.asarray([value], np.float64)} | {
-        name: np.asarray(grads[name], np.float64) for name in names}
-    reference = torch_step(copy.deepcopy(model).float(), tokens, getattr(torch, stored))
+    reference_model = copy.deepcopy(model).float()
+
+    def reference_fn(ids):
+        return torch_step(reference_model, ids, getattr(torch, stored))
+
     # Truth: the same weights in a model built in float64, its float32 pins
     # (the loss's logits.float(), an RMS norm's upcast) widened and its
-    # rotary tables rebuilt; Dew's own float64 terms under the same widening.
+    # rotary tables rebuilt.
     with float64():
         wide_model = transformers.AutoModelForCausalLM.from_config(model.config, dtype=torch.float64,
                                                                    attn_implementation="eager").eval()
         wide_model.load_state_dict(model.state_dict())
-        truth = torch_step(wide_model, tokens)
-        with jax.enable_x64(new_val=True):
-            wide = replace(loaded, model=loaded.model.clone(dtype=jnp.float64),
-                           variables=widened(loaded.variables))
-            loss, params = step(wide)
-            _, (loss_terms, grad_terms) = float64_terms(loss, params)
-    terms = {"loss": np.asarray([loss_terms])} | {name: np.asarray(grad_terms[name]) for name in names}
-    assert_leaves_as_exact(dew, reference, truth, reductions=ROWS * SEQ, terms=terms)
+
+    def truth_fn(ids):
+        with float64():
+            return torch_step(wide_model, ids, torch.float64)
+
+    dew = dew_fn(tokens)
+    assert_as_exact(dew_fn, reference_fn, token_draws(tokens), f"torchax {head} LM step", seeds=HEAD_SEEDS,
+                    truth_fn=truth_fn)
     if head in ("zero bias", "bias"):
         assert np.abs(dew["lm_head.bias"]).max() > 0
 
@@ -298,18 +317,25 @@ def test_bf16_compute_gradients_are_as_exact_as_torchs_bf16(family, tokens, tmp_
     model.save_pretrained(tmp_path)
     with pytest.warns(UserWarning):
         loaded = Pretrained.load(tmp_path, fallback="torchax", dtype="bfloat16", param_dtype="bfloat16")
-    objective = LMObjective(loaded, seq_len=SEQ, ema_decay=None)
-    loss, grads = jax.value_and_grad(lambda params: objective_loss(
-        objective, {**loaded.variables, "params": params}, tokens, scalar=True))(loaded.variables["params"])
-    dew = {"loss": np.asarray([loss], np.float64)} | {
-        name: np.asarray(grads[name], np.float64) for name, _ in model.named_parameters()}
-    reference = torch_step(copy.deepcopy(model), tokens, torch.bfloat16)
+
+    dew_fn = loss_and_gradients(loaded, model, loaded.variables["params"])
+
+    reference_model = copy.deepcopy(model)
+
+    def reference_fn(ids):
+        return torch_step(reference_model, ids, torch.bfloat16)
+
     with float64():
         wide = transformers.AutoModelForCausalLM.from_config(model.config, dtype=torch.float64,
                                                              attn_implementation="eager").eval()
         wide.load_state_dict(model.state_dict())
-        truth = torch_step(wide, tokens, torch.float64)
-    assert_leaves_as_exact(dew, reference, truth, reductions=ROWS * SEQ)
+
+    def truth_fn(ids):
+        with float64():
+            return torch_step(wide, ids, torch.float64)
+
+    assert_as_exact(dew_fn, reference_fn, token_draws(tokens), f"torchax bf16 {family} LM step",
+                    seeds=BF16_SEEDS, truth_fn=truth_fn)
 
 
 def test_save_writes_the_source_names_back(source, loaded, tokens, tmp_path):
@@ -346,3 +372,53 @@ def test_the_output_table_scores_as_the_bf16_forward_whatever_dtype_the_states_a
     # A bf16 value is an fp32 one's upper 16 bits, so neighbours differ by one there.
     apart = (scored.view(np.int32) >> 16) - (logits.astype(np.float32).view(np.int32) >> 16)
     assert np.abs(apart).max() <= 1
+
+
+def tied_float32(tmp_path):
+    """Llama's tied head stored and computing in float32, as `TorchTableLM` loads it."""
+    head_model("tied").save_pretrained(tmp_path)
+    with pytest.warns(UserWarning):
+        loaded = Pretrained.load(tmp_path, fallback="torchax", dtype="float32")
+    assert type(loaded.model).__name__ == "TorchTableLM"
+    return loaded
+
+
+def test_a_float32_forward_and_its_output_table_multiply_float32_products(tokens, tmp_path):
+    """A float32 torchax model multiplies every product of its forward, torch's operators that
+    state no precision among them, at HIGHEST, as its output table does, under JAX's own default
+    precision: the two reads of the same logits take the same arithmetic, where the forward ran
+    TF32 on a GPU and the table float32 products."""
+    loaded = tied_float32(tmp_path)
+    ids = jnp.asarray(tokens[:, :SEQ])
+    highest = (jax.lax.Precision.HIGHEST, jax.lax.Precision.HIGHEST)
+    for read in (lambda variables: loaded.model.apply(variables, ids),
+                 lambda variables: loaded.model.apply(variables, method="output_table").logits(
+                     loaded.model.apply(variables, ids, method="hidden_states"))):
+        with jax.default_matmul_precision(None):
+            graph = jax.make_jaxpr(read)(loaded.variables)
+        products = [equation.params["precision"] for equation in equations(graph)
+                    if equation.primitive.name == "dot_general"]
+        assert products and all(precision == highest for precision in products), products
+
+
+@pytest.mark.gpu(reason="TF32 is a GPU's default float32 product")
+def test_a_float32_forwards_logits_and_its_output_tables_are_as_exact_as_torchs(tokens, tmp_path):
+    """On a GPU, a float32 torchax model's own logits and its output table's over the same
+    states are each as exact as torch's float32 forward, from torch's in float64, under JAX's own
+    default precision (the test lane sets 'highest' for every product that states none)."""
+    loaded = tied_float32(tmp_path)
+    ids = tokens[:, :SEQ]
+    model = head_model("tied")
+    with jax.default_matmul_precision(None):
+        direct = np.asarray(loaded.model.apply(loaded.variables, jnp.asarray(ids)), np.float64)
+        hidden = loaded.model.apply(loaded.variables, jnp.asarray(ids), method="hidden_states")
+        table = np.asarray(loaded.model.apply(loaded.variables, method="output_table").logits(hidden),
+                           np.float64)
+    reference = torch_logits(model, ids).astype(np.float64)
+    with float64(), torch.no_grad():
+        wide = transformers.AutoModelForCausalLM.from_config(model.config, dtype=torch.float64,
+                                                             attn_implementation="eager").eval()
+        wide.load_state_dict(model.state_dict())
+        truth = wide(torch.from_numpy(np.asarray(ids, np.int64))).logits.numpy()
+    assert_as_exact_as_the_reference(direct, reference, truth, "the forward's logits")
+    assert_as_exact_as_the_reference(table, reference, truth, "the output table's logits")

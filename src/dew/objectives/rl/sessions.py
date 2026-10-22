@@ -37,21 +37,21 @@ them. A `TRUNCATED` session follows the `truncation` policy:
 from __future__ import annotations
 
 import itertools
-import math
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import Future
 from dataclasses import dataclass, field
 from enum import Enum
-from numbers import Real
 from types import MappingProxyType
-from typing import Protocol
+from typing import Protocol, SupportsFloat
 
 import jax
 import jax.numpy as jnp
 import numpy as np
+from jax.typing import ArrayLike
 
 from dew.data.tokens import first_fit
-from dew.records import json_value, record as section
+from dew.nn.inputs import local_rows
+from dew.records import finite, json_value, record as section
 from dew.rl import group_advantage, rloo_advantage
 
 IDS_KEY = "input_ids"
@@ -105,6 +105,21 @@ return, every call alike; `turn`, one per call from the return still ahead of
 it, compared with the group's members' at the same turn."""
 
 
+
+def finite_reward(value: SupportsFloat) -> float:
+    """A verifier's or reward's score as a float: anything `float` takes (a bool's 1.0 and 0.0, a
+    NumPy or JAX scalar), refused unless finite (`records.finite`)."""
+    return finite(float(value), "a reward")
+
+
+def local_task_ids(batch: Mapping[str, ArrayLike]) -> np.ndarray:
+    """This process's `task_id` rows of `batch`, refused unless a nonempty vector of integers: the
+    rollout's task boundary, which the scheduler and native episode collection both read."""
+    ids = local_rows(batch["task_id"])
+    if ids.ndim != 1 or not ids.size or not np.issubdtype(ids.dtype, np.integer):
+        raise ValueError("task_id must be a nonempty vector of integer task identities")
+    return ids
+
 class Status(Enum):
     """How a session ended, which decides whether it trains.
 
@@ -129,18 +144,6 @@ class Status(Enum):
         trains depends on `pack`'s `truncation` policy.
         """
         return self in (Status.COMPLETED, Status.AGENT_ERROR)
-
-
-def _finite(message: str, value: object) -> float:
-    """Parse a boundary number: any finite real, numpy's included, as a float.
-
-    Records arrive from gateways, JSON and numpy arrays, so anything may land
-    here. A bool is a flag, not a score; it and every non-number, infinity
-    or nan raise a ValueError carrying `message`.
-    """
-    if isinstance(value, bool) or not isinstance(value, Real) or not math.isfinite(value):
-        raise ValueError(f"{message}, got {value!r}")
-    return float(value)
 
 
 def _token_ids(name: str, ids: object) -> None:
@@ -226,11 +229,10 @@ class Call:
                 or len(self.behavior_log_probs) != len(self.sampled_ids)):
             raise ValueError("a call needs one behavior log-probability per sampled id")
         object.__setattr__(self, "behavior_log_probs", tuple(
-            _finite("behavior log-probabilities must be finite numbers", value)
+            finite(value, "a behavior log-probability")
             for value in self.behavior_log_probs))
         if self.reward is not None:
-            object.__setattr__(self, "reward", _finite("a call's reward is a finite number or None",
-                                                       self.reward))
+            object.__setattr__(self, "reward", finite(self.reward, "a call's reward"))
         if self.finish_reason not in FINISH_REASONS:
             raise ValueError(f"finish_reason must be one of {sorted(FINISH_REASONS)}, "
                              f"got {self.finish_reason!r}")
@@ -292,8 +294,7 @@ class Session:
         if not isinstance(self.calls, tuple) or not all(isinstance(call, Call) for call in self.calls):
             raise TypeError("session calls must be a tuple of Call records")
         if self.reward is not None:
-            object.__setattr__(self, "reward", _finite("a session reward is a finite number or None",
-                                                       self.reward))
+            object.__setattr__(self, "reward", finite(self.reward, "a session reward"))
         if self.status.trainable and self.reward is None:
             raise ValueError(f"a {self.status.name} session is scored, so it needs a reward")
         for name in ("sample", "attempt"):
@@ -406,11 +407,17 @@ def check_truncation(truncation: str) -> None:
         raise ValueError(f"truncation must be one of {TRUNCATIONS}, got {truncation!r}")
 
 
+def _trains(status: Status, truncation: str) -> bool:
+    """Whether a session that ended with `status` trains under `truncation`: a trainable status
+    always, a truncated one unless its truncation policy masks it."""
+    return status.trainable or (status is Status.TRUNCATED and truncation != "mask")
+
+
 def _trained_reward(session: Session, truncation: str) -> float | None:
     """The reward `session` trains on under `truncation`, or None when it carries no loss."""
     if session.status.trainable:
         return session.reward
-    if session.status is not Status.TRUNCATED or truncation == "mask":
+    if not _trains(session.status, truncation):
         return None
     if truncation == "zero":
         return 0.0
@@ -603,24 +610,19 @@ def pack(sessions: Sequence[Session], width: int, *, rows: int | None = None,
     for chain in built:
         trainable[chain.session] += sum(1 for call in chain.calls if call >= 0)
     weights = np.zeros(shape, np.float32)
-    for row, numbers in enumerate(placed):
-        start = 0
-        for segment, number in enumerate(numbers, start=1):
-            chain = built[number]
-            stop = start + len(chain.tokens)
-            span = slice(start, stop)
-            sampled = np.asarray(chain.calls) >= 0
-            ids[row, span] = chain.tokens
-            segments[row, span] = segment
-            positions[row, span] = np.arange(len(chain.tokens))
-            mask[row, span] = sampled
-            behavior[row, span] = chain.behavior
-            versions[row, span] = chain.versions
-            session_index[row, span] = chain.session
-            call_index[row, span] = chain.calls
-            advantage[row, span] = values[chain.session][_owners(chain)]
-            weights[row, span] = sampled / max(int(trainable[chain.session]), 1)
-            start = stop
+    for row, segment, start, chain in _spans(built, placed):
+        span = slice(start, start + len(chain.tokens))
+        sampled = np.asarray(chain.calls) >= 0
+        ids[row, span] = chain.tokens
+        segments[row, span] = segment
+        positions[row, span] = np.arange(len(chain.tokens))
+        mask[row, span] = sampled
+        behavior[row, span] = chain.behavior
+        versions[row, span] = chain.versions
+        session_index[row, span] = chain.session
+        call_index[row, span] = chain.calls
+        advantage[row, span] = values[chain.session][_owners(chain)]
+        weights[row, span] = sampled / max(int(trainable[chain.session]), 1)
     return {
         IDS_KEY: ids, SEGMENT_IDS_KEY: segments, POSITIONS_KEY: positions,
         RESPONSE_MASK_KEY: mask, BEHAVIOR_LOG_PROBS_KEY: behavior, VERSIONS_KEY: versions,
@@ -628,6 +630,29 @@ def pack(sessions: Sequence[Session], width: int, *, rows: int | None = None,
         ADVANTAGES_KEY: advantage, SESSION_WEIGHTS_KEY: weights,
         **_engine_records(built, placed, shape, support_capacity),
     }
+
+
+def _spans(built: Sequence[_Chain], placed: Sequence[Sequence[int]]):
+    """Each placed chain as `(row, segment, start, chain)`: its packed row, its 1-based segment in
+    the row, the column its first id takes, and the chain, in packing order."""
+    for row, numbers in enumerate(placed):
+        start = 0
+        for segment, number in enumerate(numbers, start=1):
+            chain = built[number]
+            yield row, segment, start, chain
+            start += len(chain.tokens)
+
+
+def _empty_routing(shape: tuple[int, int], layout: tuple[int, ...], dtype) -> dict[str, np.ndarray]:
+    """The routing record's empty form over packed rows of `shape`: expert ids of zero `[*shape,
+    layers, top_k]` in the engines' dtype, and `routed` false, which the trainer reads as no record."""
+    return {ROUTED_EXPERTS_KEY: np.zeros((*shape, *layout), dtype), ROUTED_KEY: np.zeros(shape, bool)}
+
+
+def _empty_support(rows: int, capacity: int) -> dict[str, np.ndarray]:
+    """The support record's empty form: `rows` rows of `capacity` kept ids and their columns, -1."""
+    return {SUPPORT_KEY: np.full((rows, capacity), -1, np.int32),
+            SUPPORT_COLUMNS_KEY: np.full((rows, capacity), -1, np.int32)}
 
 
 def _engine_records(built: Sequence[_Chain], placed: Sequence[Sequence[int]],
@@ -644,31 +669,22 @@ def _engine_records(built: Sequence[_Chain], placed: Sequence[Sequence[int]],
     """
     records = [chain.routing for chain in built if chain.routing is not None]
     out: dict[str, np.ndarray] = {}
-    routed = covered = None
     if records:
         layout = {record.shape[1:] for record in records}
         if len(layout) != 1:
             raise ValueError(f"routed_experts disagree on [layers, top_k] across calls: {sorted(layout)}")
-        routed = np.zeros((*shape, *layout.pop()), np.result_type(*records))
-        covered = np.zeros(shape, bool)
+        out = _empty_routing(shape, layout.pop(), np.result_type(*records))
     kept: list[list[tuple[int, ...]]] = [[] for _ in range(shape[0])]
     owners: list[list[int]] = [[] for _ in range(shape[0])]
-    for row, numbers in enumerate(placed):
-        start = 0
-        for number in numbers:
-            chain = built[number]
-            if routed is not None and covered is not None and chain.routing is not None:
-                rows_covered = len(chain.routing)
-                routed[row, start:start + rows_covered] = chain.routing
-                covered[row, start:start + rows_covered] = True
-            for position, ids in enumerate(chain.supports):
-                if ids is not None:
-                    kept[row].append(ids)
-                    owners[row].append(start + position)
-            start += len(chain.tokens)
-    if routed is not None and covered is not None:
-        out[ROUTED_EXPERTS_KEY] = routed
-        out[ROUTED_KEY] = covered
+    for row, _, start, chain in _spans(built, placed):
+        if out and chain.routing is not None:
+            rows_covered = len(chain.routing)
+            out[ROUTED_EXPERTS_KEY][row, start:start + rows_covered] = chain.routing
+            out[ROUTED_KEY][row, start:start + rows_covered] = True
+        for position, ids in enumerate(chain.supports):
+            if ids is not None:
+                kept[row].append(ids)
+                owners[row].append(start + position)
     if any(kept):
         totals = [sum(len(group) for group in groups) for groups in kept]
         if support_capacity is None:
@@ -679,15 +695,14 @@ def _engine_records(built: Sequence[_Chain], placed: Sequence[Sequence[int]],
         if max(totals) > support_capacity:
             raise ValueError(f"a row's recorded supports keep {max(totals)} ids, "
                              f"more than support_capacity {support_capacity}")
-        ids = np.full((shape[0], support_capacity), -1, np.int32)
-        columns = np.full((shape[0], support_capacity), -1, np.int32)
+        support = _empty_support(shape[0], support_capacity)
         for row, (groups, total) in enumerate(zip(kept, totals, strict=True)):
-            ids[row, :total] = np.fromiter((token for group in groups for token in group), np.int32, total)
-            columns[row, :total] = np.repeat(
+            support[SUPPORT_KEY][row, :total] = np.fromiter((token for group in groups for token in group),
+                                                            np.int32, total)
+            support[SUPPORT_COLUMNS_KEY][row, :total] = np.repeat(
                 np.asarray(owners[row], np.int32), [len(group) for group in groups]
             )
-        out[SUPPORT_KEY] = ids
-        out[SUPPORT_COLUMNS_KEY] = columns
+        out.update(support)
     return out
 
 
@@ -719,12 +734,10 @@ def agreed_records(packed: dict[str, np.ndarray], support_capacity: int | None) 
     filled = dict(packed)
     if layouts and routed is None:
         (layers, top_k, dtype), = layouts
-        filled[ROUTED_EXPERTS_KEY] = np.zeros((*shape, layers, top_k), np.dtype(dtype))
-        filled[ROUTED_KEY] = np.zeros(shape, bool)
+        filled.update(_empty_routing(shape, (layers, top_k), np.dtype(dtype)))
     if any(share["support"] for share in pool) and SUPPORT_KEY not in packed:
         assert support_capacity is not None, "a peer packed supports, which need a support_capacity"
-        filled[SUPPORT_KEY] = np.full((shape[0], support_capacity), -1, np.int32)
-        filled[SUPPORT_COLUMNS_KEY] = np.full((shape[0], support_capacity), -1, np.int32)
+        filled.update(_empty_support(shape[0], support_capacity))
     return filled
 
 
@@ -785,7 +798,7 @@ def session_metrics(sessions: Sequence[Session], batch: Mapping[str, np.ndarray]
     everything = max(sum(sampled.values()), 1)
     for status in Status:
         metrics[f"status/{status.value}"] = sum(session.status == status for session in sessions) / total
-        if not status.trainable and not (status is Status.TRUNCATED and truncation != "mask"):
+        if not _trains(status, truncation):
             metrics[f"masked/{status.value}"] = sampled[status] / everything
     segments = np.asarray(batch[SEGMENT_IDS_KEY])
     rows = np.arange(segments.shape[0])[:, None] * (segments.shape[1] + 1) + segments
