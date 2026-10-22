@@ -312,7 +312,8 @@ def lm_loss(model, batch, metrics=True):
 # ----------------------------------------------------------------------------
 
 def sincos_2d_pos_embed(dim, H, W):
-    """flax get_2d_sincos_pos_embed as used by scan_ordered_pos_embed (raster)."""
+    """Dew's `build_2d_sincos_pos_embed` as scan_ordered_pos_embed reads it (raster): MAE's per-axis
+    table, the rows' half first."""
     grid_h = np.arange(H, dtype=np.float32)
     grid_w = np.arange(W, dtype=np.float32)
     grid = np.meshgrid(grid_w, grid_h)
@@ -323,7 +324,7 @@ def sincos_2d_pos_embed(dim, H, W):
         omega = 1.0 / 10000 ** omega
         out = np.einsum('m,d->md', pos.reshape(-1), omega)
         return np.concatenate([np.sin(out), np.cos(out)], axis=1)
-    emb = np.concatenate([one_d(dim // 2, grid[0]), one_d(dim // 2, grid[1])], axis=1)
+    emb = np.concatenate([one_d(dim // 2, grid[1]), one_d(dim // 2, grid[0])], axis=1)
     return torch.tensor(emb, dtype=F32)
 
 
