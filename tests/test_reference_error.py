@@ -27,16 +27,24 @@ from reference_error import (
 )
 
 
-def test_the_lane_compiles_for_the_same_cpu_numerics_on_every_host():
-    """Check 1's verdicts on the CPU read no host's ISA: every lane runs XLA:CPU without its
-    run-time-dispatched dot fusions and with code generated for AVX2 (ledger row 1349)."""
-    import os
+def test_every_lane_and_its_workers_run_xla_cpu_without_its_dot_fusions():
+    """Check 1's verdicts on the CPU do not read the host's ISA through XLA:CPU's run-time-dispatched
+    dot fusions (ledger row 1349, `lane_environment.CPU_NUMERICS_FLAGS`): the lane's flags carry them,
+    a caller's own setting of one keeps its value, and a name that only appears inside another flag's
+    value is no setting."""
+    from lane_environment import CPU_NUMERICS_FLAGS, configured, cpu_numerics
 
-    import lane_environment
+    def named(flags):
+        return dict(flag.partition("=")[::2] for flag in flags.split())
 
-    flags = os.environ["XLA_FLAGS"].split()
-    for flag in lane_environment.HOST_INDEPENDENT_CPU_FLAGS:
-        assert flag in flags, flag
+    for given in ({}, {"XLA_FLAGS": "--xla_dump_to=/tmp/--xla_cpu_experimental_ynn_fusion_type"}):
+        flags = named(configured({**given, "JAX_PLATFORMS": "cpu"})["XLA_FLAGS"])
+        for flag in CPU_NUMERICS_FLAGS:
+            name, _, value = flag.partition("=")
+            assert flags[name] == value, flag
+    kept = "--xla_cpu_experimental_ynn_fusion_type=dot"
+    assert named(cpu_numerics(kept))["--xla_cpu_experimental_ynn_fusion_type"] == "dot"
+    assert cpu_numerics(cpu_numerics("--a=1")) == cpu_numerics("--a=1")
 
 
 def test_a_small_row_beside_large_ones_is_held_to_its_own_size():

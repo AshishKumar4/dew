@@ -9,6 +9,7 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
+from lane_environment import cpu_numerics
 from reference_error import FACTOR, distance, float64_forward
 from tool_support import load
 
@@ -33,7 +34,8 @@ def test_an_unchanged_decoder_meets_the_gate_on_the_tokens_it_decoded(tmp_path):
                            "--model", str(tmp_path / "decoder"), "--steps", str(STEPS),
                            "--prompt", str(PROMPT), "--vocab-limit", "200", "--out", str(out)],
                           env={**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(ROOT / "src"),
-                               "XLA_FLAGS": "--xla_force_host_platform_device_count=1"}, cwd=ROOT)
+                               "XLA_FLAGS": cpu_numerics("--xla_force_host_platform_device_count=1")},
+                          cwd=ROOT)
     record = json.loads(out.read_text())
     scored = record["steps_scored"]
     prompt = np.random.default_rng(0).integers(0, 200, (4, PROMPT), dtype=np.int32)[0]

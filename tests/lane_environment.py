@@ -35,16 +35,27 @@ configuration, which cuDNN refuses on an H100, so that test compiles in its
 own process without it (tests/test_quantization.py)."""
 
 
-HOST_INDEPENDENT_CPU_FLAGS = ("--xla_cpu_max_isa=AVX2", "--xla_cpu_experimental_ynn_fusion_type=",
-                              "--xla_cpu_experimental_xnn_fusion_type=")
-"""XLA:CPU's numerics on every lane, whatever the runner's x86 host (ledger row 1349). By default
-XLA:CPU hands a dot to YNNPACK or XNNPACK, whose microkernels it picks at run time by the host's
-ISA: on an AVX-512 host (AMD 25/17, x86-64-v4) they sum a narrow dot's K in other partial sums than
-on an AVX2 one (AMD 25/1, x86-64-v3), and so a check 1 between two arms that reach them unequally
-read the host. The interpreted SSD kernel against XLA's scan put its state gradient at 1.586 times
-the scan's distance on 25/17 and 0.765 on 25/1, the scan's own dots moving; without those fusions,
-and with code generated for AVX2 on every host, at 0.999 and 1.014. A flag of the same name in
-XLA_FLAGS keeps its own setting."""
+CPU_NUMERICS_FLAGS = ("--xla_cpu_experimental_ynn_fusion_type=", "--xla_cpu_experimental_xnn_fusion_type=")
+"""XLA:CPU without its YNNPACK and XNNPACK dot fusions, on every lane and in the processes the suite
+starts (`cpu_numerics`), so that two arms of a check 1 that reach dots alike reach them alike on any
+runner (ledger row 1349). By default XLA:CPU hands a dot to those libraries, which pick their
+microkernels at run time by the host's ISA, and which XLA's own loops (Pallas' interpreter among
+them) do not reach: the interpreted SSD kernel against XLA's scan, whose dots moved, put its state
+gradient at 1.586 times the scan's distance from float64 on AMD 25/17 (AVX-512) and at 0.765 on
+AMD 25/1 (AVX2); on 25/17, four of its nine host cases sat past 1.5 at 128 draws. Without the
+fusions its worst leaf over the nine is 1.17 on 25/17, and the one-short case's 1.20 on 25/1.
+
+The verdicts are what this settles, not the bits: Eigen still blocks a dot by the host's caches, so a
+narrow dot's sums still differ between those two hosts, and XLA's rsqrt and reciprocal start from
+the hardware's estimate, which differs by microarchitecture (ledger row 478); CI runs on 25/17.
+A flag of the same name in the flags given keeps its own setting."""
+
+
+def cpu_numerics(flags: str = "") -> str:
+    """XLA `flags` with each of CPU_NUMERICS_FLAGS that names no flag of `flags` added."""
+    named = {flag.partition("=")[0] for flag in flags.split()}
+    added = [flag for flag in CPU_NUMERICS_FLAGS if flag.partition("=")[0] not in named]
+    return " ".join([flags, *added]).strip()
 
 
 def without_deterministic_ops(flags: str) -> str:
@@ -76,7 +87,6 @@ def configure_lane(environ: MutableMapping[str, str]) -> None:
         # Every rounding the program states, as a run keeps them
         # (`dew.telemetry.devices.keep_roundings`).
         flags.append("--xla_allow_excess_precision=false")
-    flags.extend(flag for flag in HOST_INDEPENDENT_CPU_FLAGS if flag.split("=")[0] not in flags[0])
     local = {"cuda": _local_gpus, "tpu": _local_tpus}
     accelerator = next((name for name in platforms if name in local), None)
     if accelerator is None:
@@ -88,7 +98,7 @@ def configure_lane(environ: MutableMapping[str, str]) -> None:
             environ["JAX_PLATFORMS"] = ",".join([*platforms, "cpu"])
         cpu_devices = local[accelerator](environ)
     flags.append(f"--xla_force_host_platform_device_count={cpu_devices}")
-    environ["XLA_FLAGS"] = " ".join(flags).strip()
+    environ["XLA_FLAGS"] = cpu_numerics(" ".join(flags).strip())
     # XLA:CPU runs every device of a launch on one pool of max(cores,
     # devices) threads (PJRT_NPROC overrides the cores), each held until the
     # launch's collectives meet, and dispatches the next launch on the same

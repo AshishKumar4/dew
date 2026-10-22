@@ -13,7 +13,7 @@ from pathlib import Path
 from types import TracebackType
 
 import pytest
-from lane_environment import MESH_DEVICES, without_deterministic_ops
+from lane_environment import MESH_DEVICES, cpu_numerics, without_deterministic_ops
 from tool_support import load
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -87,7 +87,7 @@ def worker_env(devices: int) -> dict[str, str]:
     """This checkout's source, CPU devices and faulthandler in each worker."""
     return {**os.environ, "JAX_PLATFORMS": "cpu",
             "PYTHONPATH": str(REPO_ROOT / "src"), "PYTHONFAULTHANDLER": "1",
-            "XLA_FLAGS": f"--xla_force_host_platform_device_count={devices}"}
+            "XLA_FLAGS": cpu_numerics(f"--xla_force_host_platform_device_count={devices}")}
 
 
 def start_process(command: Sequence[str], devices: int, *,
