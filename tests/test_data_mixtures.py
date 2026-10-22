@@ -1307,9 +1307,9 @@ def test_an_epoch_of_repeated_corpora_ends_where_grains_mix_has_read_every_one_o
 
 
 def test_an_epoch_of_a_mix_of_corpora_written_without_repeats_reads_every_corpus_whole():
-    """A run's mix of corpora written without repeats repeats each corpus, not the mix: an epoch reads
-    every record of the corpus it ends on once and every record of the others, where a repeat of
-    the mix would start over at its shortest corpus's end and leave the slow corpus's tail unread."""
+    """A run's mix of corpora written without repeats reads, in an epoch, every record of the corpus it
+    ends on once and every record of the others: the slow corpus's tail is read, not skipped by the
+    mix starting over at its shortest corpus's end."""
     from dew.data.compile import fitted
     from dew.data.pipeline import ObjectiveData
 
