@@ -1,5 +1,6 @@
 """Depthwise 3x3 forward and VJP obey the fp32 reduction-order bound."""
 
+import itertools
 from functools import partial
 
 import jax
@@ -113,6 +114,37 @@ def test_cpu_depthwise_is_the_library_convolution_bit_for_bit(shape, dilation, d
     bits = np.uint32 if dtype == jnp.float32 else np.uint16
     np.testing.assert_array_equal(np.asarray(shared(x, kernel)).view(bits), np.asarray(jax.jit(partial(
         convolve, dilation=dilation))(x, kernel)).view(bits))
+
+
+@pytest.mark.skipif(jax.default_backend() != "cpu", reason="the shifted sum is the CPU's path")
+@pytest.mark.parametrize('dtype', [jnp.float32, jnp.bfloat16])
+@pytest.mark.parametrize('dilation, library_sign', [(1, True), (2, True), (3, False)])
+def test_an_all_negative_zero_output_is_the_sums_negative_zero_where_the_librarys_sign_varies(
+        dilation, library_sign, dtype):
+    """Channel 0 of a 1 x 7 x 8 x 17 map is zero over its first 2d + 1 rows and columns under negative
+    taps, so the outputs whose nine taps all read it sum nine negative zeros. Dew's shifted sum gives
+    the IEEE sum's negative zero there; XLA:CPU's library convolution (jax 0.11.2.post3) gives negative
+    zero at dilations 1 and 2 and positive zero at 3 (ledger 1361). Every other output is the
+    library's bit for bit, and those outputs equal it as values."""
+    rng = np.random.default_rng(dilation)
+    x, kernel = rng.normal(size=(1, 7, 8, 17)), rng.normal(size=(3, 3, 1, 17)) * 0.2
+    x[:, :2 * dilation + 1, :2 * dilation + 1, 0] = 0
+    kernel[..., 0] = -np.abs(kernel[..., 0])
+    zero = np.zeros((1, 7, 8, 17), bool)
+    for row, column in itertools.product(range(7), range(8)):
+        taps = [(row + dilation * i, column + dilation * j) for i in (-1, 0, 1) for j in (-1, 0, 1)]
+        # A tap past the border reads the padding's zero; one inside reads the zeroed corner.
+        zero[0, row, column, 0] = all(not (0 <= r < 7 and 0 <= c < 8) or max(r, c) <= 2 * dilation
+                                      for r, c in taps)
+    x, kernel = jnp.asarray(x, dtype), jnp.asarray(kernel, dtype)
+    shared = np.asarray(jax.jit(lambda x, kernel: _conv_general_dilated(
+        x, kernel, (1, 1), 'SAME', rhs_dilation=(dilation, dilation),
+        dimension_numbers=('NHWC', 'HWIO', 'NHWC'), feature_group_count=17))(x, kernel), np.float32)
+    library = np.asarray(jax.jit(partial(convolve, dilation=dilation))(x, kernel), np.float32)
+    assert zero.any() and not shared[zero].any() and not library[zero].any()
+    assert np.signbit(shared[zero]).all()
+    assert (np.signbit(library[zero]) == library_sign).all()
+    np.testing.assert_array_equal(shared[~zero].view(np.uint32), library[~zero].view(np.uint32))
 
 
 
