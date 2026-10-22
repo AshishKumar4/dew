@@ -160,10 +160,10 @@ def _attend(query: jax.Array, span: tuple, read, block: int, spec: algebra.Forwa
         coords = algebra.Coords(rows[:, None], step * block + jnp.arange(block)[None, :], **narrowing)
         logits = algebra.modify(spec, _dot(query, key.T, interpret), coords)
         m, alpha = algebra.peak(spec, state.m, logits)
-        weights = algebra.weights(spec, logits, m)
-        denominator = algebra.total(state.total, alpha, weights)
-        acc = algebra.rescale(state.acc, alpha) + _dot(algebra.narrow(weights, value.dtype), value, interpret)
-        return algebra.Partial(acc, m, denominator)
+        weights, factor, shift, reach = algebra.room(state, alpha, algebra.weights(spec, logits, m), value)
+        denominator = algebra.total(state.total, factor, weights)
+        product = _dot(algebra.narrow(weights, value.dtype), value, interpret)
+        return algebra.Partial(algebra.rescale(state.acc, factor) + product, m, denominator, shift, reach)
 
     start = algebra.empty(QUERIES, query.shape[-1])
     if sink is not None:
@@ -232,24 +232,25 @@ def _paged_kernel(spans_ref, table_ref, query_ref, key_ref, value_ref, *refs, pa
                                    _first_slice_sink(sinks_ref)))
 
 
-def _combined(spec: algebra.Forward, sums, peaks, totals, axis: int):
-    """The slices' states (`[..., splits, ..., QUERIES, D]` sums along `axis`, their maxima and totals)
-    merged in slice order (`algebra.merge`), as the normalized output in fp32: an empty slice's state
-    (a maximum of -inf) merges as nothing."""
-    states = [algebra.Partial(*(jnp.take(part, split, axis=axis) for part in (sums, peaks, totals)))
-              for split in range(sums.shape[axis])]
+def _combined(spec: algebra.Forward, *parts, axis: int):
+    """The slices' states (`[..., splits, ..., QUERIES, D]` sums along `axis`, their maxima, totals,
+    shifts and reaches) merged in slice order (`algebra.merge`), as the normalized output in fp32: an
+    empty slice's state (a maximum of -inf) merges as nothing."""
+    states = [algebra.Partial(*(jnp.take(part, split, axis=axis) for part in parts))
+              for split in range(parts[0].shape[axis])]
     return algebra.finish(spec, functools.reduce(functools.partial(algebra.merge, spec), states),
                           initial=True)[0]
 
 
 def _outputs(shape: tuple[int, ...], dtype, splits: int, at: int, spec, specs):
     """The launch's outputs and their blocks: the output `shape` in `dtype` for one slice, else the
-    slices' fp32 sums, maxima and totals with a slices axis at `at` (`spec` and `specs` the blocks)."""
+    slices' fp32 states (`algebra.Partial`: sums, maxima, totals, shifts and reaches) with a slices axis
+    at `at` (`spec` and `specs` the blocks)."""
     if splits == 1:
         return jax.ShapeDtypeStruct(shape, dtype), spec
     split = (*shape[:at], splits, *shape[at:])
-    return ([jax.ShapeDtypeStruct(split, jnp.float32), jax.ShapeDtypeStruct(split[:-1], jnp.float32),
-             jax.ShapeDtypeStruct(split[:-1], jnp.float32)], specs)
+    rows = jax.ShapeDtypeStruct(split[:-1], jnp.float32)
+    return [jax.ShapeDtypeStruct(split, jnp.float32), rows, rows, rows, rows], specs
 
 
 def _space(programs: int, steps: int, processors: int | None) -> set[Split]:
@@ -305,7 +306,7 @@ class DecodeAttention(tuning.KernelOp):
                               lambda row, head, split: (row, split, 0, head, 0))
         reduced = pl.BlockSpec((None, None, QUERIES, None), lambda row, head, split: (row, split, 0, head))
         out_shape, out_specs = _outputs(query.shape, query.dtype, splits, 1, queried,
-                                        [summed, reduced, reduced])
+                                        [summed, *[reduced] * 4])
         spec = _spec(1 / math.sqrt(width), softcap, natural)
         out = pl.pallas_call(
             lambda *refs: _kernel(*refs, spec=spec, splits=splits, interpret=interpret,
@@ -364,7 +365,7 @@ class PagedDecodeAttention(tuning.KernelOp):
         reduced = pl.BlockSpec((None, None, None, QUERIES), lambda row, head, split: (row, head, split, 0))
         sunk = [] if sinks is None else [pl.BlockSpec((None, QUERIES), lambda row, head, split: (head, 0))]
         out_shape, out_specs = _outputs(query.shape, query.dtype, splits, 2, queried,
-                                        [summed, reduced, reduced])
+                                        [summed, *[reduced] * 4])
         spec = _spec(1 / math.sqrt(width), softcap, natural)
         out = pl.pallas_call(
             lambda *refs: _paged_kernel(*refs, pages=pages, spec=spec, splits=splits, interpret=interpret,
