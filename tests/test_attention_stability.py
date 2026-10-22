@@ -21,7 +21,7 @@ import pytest
 from attention_oracle import exact_attention
 from reference_error import assert_as_exact
 
-from dew.nn.kernels import decode_attention, tuning
+from dew.nn.kernels import decode_attention, generation, tuning
 from dew.nn.kernels.templates import attention as template, attention_portable, attention_triton
 
 PINS = {attention_triton.TritonForward: attention_triton.Tiles(32, 32, 4, 2),
@@ -182,7 +182,9 @@ def _families() -> dict[str, Family]:
         "ties at scale 1/4": Family(_ties(16, 1.0), kept(1, 2), folded=False),
         "ties at scale 1/4, cotangents near 2**125": Family(_ties(16, 2.0 ** 125), kept(1, 2), folded=False),
         "a logit near fp32's largest": Family(near_max_logit(1), kept(1, 1)),
-        "a logit near fp32's largest at scale 1/4": Family(near_max_logit(16), kept(1, 1)),
+        # Folded at scale 1/4, the backward takes the base-2 maximum back to natural units, which near fp32's
+        # largest rounds the key's own weight away from 1, as at logits near 1e30.
+        "a logit near fp32's largest at scale 1/4": Family(near_max_logit(16), kept(1, 1), folded=False),
         "values near fp32's largest over 2 equal keys": Family(large_values(2), kept(1, 2)),
         "values near fp32's largest over 64 equal keys": Family(large_values(64), kept(1, 64)),
         # A key at its row's maximum weighs 1 exactly however its scaling contracts into the subtraction
@@ -246,10 +248,12 @@ def _families() -> dict[str, Family]:
         total = 2.0 ** np.floor(_uniform(seed, 100.0, 128.0, (ROWS, 1, 1)))
         acc = total[..., None] * _uniform(seed + 1, -1.0, 1.0, (ROWS, 1, 1, 16))
         value = total[:, 0, 0, None, None, None] * _uniform(seed + 2, -1.0, 1.0, (ROWS, 2, 1, 16))
+        # The cotangent drawn times 2^-12, so its product with values near 2^127 stays finite in the
+        # reference's backward.
         (dout,) = _normal(seed + 3, (ROWS, 1, 1, 16))
         state = (np.zeros((ROWS, 1, 1), np.float32), total.astype(np.float32), acc.astype(np.float32))
         return (np.zeros((ROWS, 1, 1, 16), np.float32), np.zeros((ROWS, 2, 1, 16), np.float32),
-                value.astype(np.float32), state, dout)
+                value.astype(np.float32), state, dout * np.float32(2.0 ** -12))
 
     families["a resumed state of a large denominator"] = Family(resumed, kept(1, 2))
     for low, high, label in ((-3.0, 3.0, ""), (1e38, 3e38, " near fp32's largest")):
@@ -400,7 +404,9 @@ def test_decode_is_finite_and_as_exact_as_the_reference_at_fp32s_edges(family, f
     def decoded(query, key, value, sinks, dout):
         del dout
         count = np.full(query.shape[0], key.shape[1]) if lengths is None else lengths
-        with tuning.pinned({decode_attention.DecodeAttention: decode_attention.Split(family.splits)}):
+        # An A100's slice counts, which a launch on a CPU, of no multiprocessors, does not offer.
+        pin = {decode_attention.DecodeAttention: decode_attention.Split(family.splits)}
+        with generation.assumed("sm80"), tuning.pinned(pin):
             return decode_attention.attend(query, _cache(key), _cache(value), jnp.asarray(count, jnp.int32),
                                            sinks=sinks, interpret=True, **natural)
 
