@@ -13,11 +13,14 @@
   by one) declares data, so its constants are read as their values: runs alike in shape that declare
   other data are no copy, and a run copied with its data is one.
 
-    python tools/duplicates.py [--base=REF] PATH...
+    python tools/duplicates.py [--base=REF] [--reading=text|structure] PATH...
 
-Every copy is printed, and any fails. With `--base`, a structural copy fails only where it is written in
-more places than at the merge-base of REF and HEAD, wherever those places are: a copy that moved is held,
-and one written beside it, or once more, fails. Main still holds the copies the gate's runs and the
+Every copy is printed, and any fails. `--reading` reads one way alone: tools/check.sh runs the two as gates of
+their own (tools/check_gates), side by side, and its `--changed` the structure alone, in seconds.
+
+With `--base`, a structural copy fails only where it is written in more places than at the merge-base of REF
+and HEAD, wherever those places are: a copy that moved is held, and one written beside it, or once more,
+fails. Main still holds the copies the gate's runs and the
 duplication audits found (ledger 896-1287, 1309), and a head is held to adding none. The text reading has no
 base: main holds no text copy, so any fails. tools/check.sh (CI's lint job, the lanes' lint gate) runs the
 gate held to origin/main until main's last copy goes, then with no base. tests/test_duplicates.py runs it
@@ -393,8 +396,8 @@ def main(arguments: Sequence[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--base", help="a commit: a structural copy fails if written in more places than at"
                                        " its merge-base with HEAD")
-    parser.add_argument("--structural", action="store_true",
-                        help="the structural reading alone, no text (check.sh --changed, for iterating)")
+    parser.add_argument("--reading", choices=("text", "structure"),
+                        help="one reading alone (tools/check_gates' two gates); both by default")
     parser.add_argument("paths", nargs="+")
     options = parser.parse_args(arguments)
     files = python_files(options.paths)
@@ -414,14 +417,15 @@ def main(arguments: Sequence[str]) -> int:
             return 2
     started = time.monotonic()
     text = 0
-    if not options.structural:
-        from pylint.lint import Run  # its import alone takes seconds, which --structural skips
+    if options.reading != "structure":
+        from pylint.lint import Run  # its import alone takes seconds, which the structure alone skips
 
         # pylint reads a directory as a package; the files, as files.
         text = Run([*ARGUMENTS, *map(str, files)], exit=False).linter.msg_status
     read = time.monotonic()
-    hits = found({os.path.relpath(file.resolve(), top) if options.base else str(file): file.read_text()
-                  for file in files})
+    hits = [] if options.reading == "text" else found({
+        os.path.relpath(file.resolve(), top) if options.base else str(file): file.read_text()
+        for file in files})
     failing, held = judged(hits, merged, top) if options.base else (hits, [])
     for hit in named(failing):
         print(report(hit))
