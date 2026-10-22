@@ -22,7 +22,7 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from model_support import TINY_DECODER, decode_steps, model_draw
-from reference_error import assert_as_exact
+from reference_error import assert_as_exact, torch_with_gradients, with_gradients
 
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -896,12 +896,21 @@ def test_metadata_that_restricts_no_visibility_scores_like_no_metadata(rng):
     rotary = jnp.tile(jnp.arange(ids.shape[1]), (ids.shape[0], 1))
 
     def scored(model, **metadata):
-        return jax.jit(lambda tree, ids: jax.grad(lambda tree: jnp.sum(
-            model.apply(tree, ids, **metadata) ** 2))(tree))
+        def run(tree, ids, cotangent):
+            return with_gradients(lambda tree: model.apply(tree, ids, **metadata))(tree, cotangent)[1]
+        return jax.jit(run)
+
+    weights_and_tokens = drawn(model)
+
+    def draw(seed):
+        """A seed's weights and tokens, and a cotangent on the logits drawn with them."""
+        tree, ids = weights_and_tokens(seed)
+        cotangent = np.random.default_rng([0x904, seed]).normal(size=(*ids.shape, VOCAB))
+        return tree, ids, cotangent.astype(np.float32)
 
     assert jnp.array_equal(model.apply(params, ids),
                            model.apply(params, ids, rotary_positions=rotary))
-    assert_as_exact(scored(model, rotary_positions=rotary), scored(model), drawn(model), "spelled rotary",
+    assert_as_exact(scored(model, rotary_positions=rotary), scored(model), draw, "spelled rotary",
                     seeds=SEEDS['metadata'], truth_fn=scored(float64(model)))
 
 
@@ -1092,9 +1101,9 @@ def test_a_cast_then_scale_norm_rounds_under_jit_and_keeps_an_fp32_weight_gradie
         return x, weight, c
 
     def gradient(x, weight, c):
-        def loss(weight):
-            return jnp.sum(norm.apply({"params": {"scale": weight}}, x).astype(jnp.float32) * c)
-        return jax.grad(loss)(weight)
+        def normed(weight):
+            return norm.apply({"params": {"scale": weight}}, x).astype(jnp.float32)
+        return with_gradients(normed)(weight, c)[1]
 
     def summed(x, weight, c):
         rounded = normalized(x)
@@ -1172,7 +1181,7 @@ def test_an_expert_gated_product_rounds_its_projections_and_product_under_jit(ac
     activated = GATED_ACTIVATIONS[activation]
 
     def truth(gate, up, cotangent):
-        d_gate, d_up = jax.grad(lambda gate, up: jnp.sum(activated(gate) * up * cotangent), (0, 1))(gate, up)
+        _, d_gate, d_up = with_gradients(lambda gate, up: activated(gate) * up)(gate, up, cotangent)
         return d_gate, d_gate, d_up, d_up
 
     assert_as_exact(jax.jit(lambda *inputs: _blocks(expert(*inputs)[1])), reference, draw,
@@ -1210,8 +1219,7 @@ def _expert_gated(activation):
         x = jnp.hstack([gate.astype(jnp.float32), eighth_ulp(gate), up.astype(jnp.float32),
                         eighth_ulp(up)]).astype(jnp.bfloat16)
         slot_cotangent = jnp.hstack([cotangent] + [jnp.zeros_like(cotangent)] * 3)
-        out, pull = jax.vjp(lambda x: model.apply(variables, x, weights, indices), x)
-        return out, pull(slot_cotangent)[0]
+        return with_gradients(lambda x: model.apply(variables, x, weights, indices))(x, slot_cotangent)
 
     return run
 
@@ -1224,17 +1232,15 @@ def _blocks(dx):
 def _torch_gated_gradients(activation, gate, up, cotangent):
     """Torch's gradients of its bf16 gated product `act(gate) * up` (transformers' gated MLP, as
     tools/gated_product_reference.py runs it), in the input gradient's four blocks."""
-    import torch
     import torch.nn.functional as F
 
     act = {"swiglu": F.silu, "geglu": functools.partial(F.gelu, approximate="tanh"),
            "geglu_exact": F.gelu}[activation]
-    gate, up, cotangent = (torch.from_numpy(np.asarray(value, np.float32)).bfloat16()
-                           for value in (gate, up, cotangent))
-    gate.requires_grad_()
-    up.requires_grad_()
-    (act(gate) * up).backward(cotangent)
-    d_gate, d_up = (jnp.asarray(value.grad.float().numpy(), jnp.bfloat16) for value in (gate, up))
+    # The bf16 inputs held in float32, which holds them exactly, and cast to bf16 inside the product,
+    # whose bf16 output takes the cotangent at bf16.
+    _, d_gate, d_up = torch_with_gradients(lambda gate, up: act(gate.bfloat16()) * up.bfloat16())(
+        *(np.asarray(value, np.float32) for value in (gate, up, cotangent)))
+    d_gate, d_up = (jnp.asarray(value, jnp.bfloat16) for value in (d_gate, d_up))
     return d_gate, d_gate, d_up, d_up
 
 
@@ -1466,8 +1472,9 @@ def test_the_rotary_rotates_the_halves_as_rotate_half_does(dtype, pairs, scale, 
 
     def forward_and_gradient(rotary):
         def run(x, cos, sin, cotangent):
-            out, pullback = jax.vjp(lambda x: rotary(x, cos, sin, scale=scale), x)
-            return {"forward": out, "gradient": pullback(cotangent.astype(x.dtype))[0]}
+            rotated = with_gradients(lambda x: rotary(x, cos, sin, scale=scale))
+            out, gradient = rotated(x, cotangent.astype(x.dtype))
+            return {"forward": out, "gradient": gradient}
         return jax.jit(run)
 
     found = forward_and_gradient(rotate)(*draw(0))
