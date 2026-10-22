@@ -423,6 +423,13 @@ def test_a_failure_no_agreement_hears_ends_the_peer_after_the_grace():
     assert time.monotonic() - started < 120, output
 
 
+def four_rank_pool(program: str) -> tuple[int, str]:
+    """`program` run by every rank of a pool of four processes of one device each: the launch's exit
+    code and everything it printed."""
+    done = launch("--processes-per-host", "4", "--", sys.executable, "-c", program, devices=1, timeout=300)
+    return done.returncode, done.stdout + done.stderr
+
+
 @pytest.mark.mesh(devices=4)
 def test_a_stopped_pool_ends_its_ranks_without_aborts():
     """Rank 3 fails and the launch stops ranks 0 to 2, which wait. A JAX
@@ -438,9 +445,8 @@ def test_a_stopped_pool_ends_its_ranks_without_aborts():
                "if os.environ['DEW_PROCESS_ID'] == '3':\n"
                "    raise RuntimeError('rank 3 fails')\n"
                "time.sleep(600)\n")
-    done = launch("--processes-per-host", "4", "--", sys.executable, "-c", program, devices=1, timeout=300)
-    output = done.stdout + done.stderr
-    assert done.returncode == 1, output
+    code, output = four_rank_pool(program)
+    assert code == 1, output
 
 
 def stopped_by_sigterm(process: subprocess.Popen, after: str, timeout: float = 300) -> tuple[int, str]:
@@ -567,9 +573,8 @@ def test_a_pool_whose_program_ends_while_its_failure_watches_read_exits_cleanly(
                "coordination.FAILURE_POLL_SECONDS = 0\n"
                "from dew.training.runtime import prepare_process\n"
                "prepare_process()\n")
-    done = launch("--processes-per-host", "4", "--", sys.executable, "-c", program, devices=1, timeout=300)
-    output = done.stdout + done.stderr
-    assert done.returncode == 0, output
+    code, output = four_rank_pool(program)
+    assert code == 0, output
 
 
 @pytest.mark.gpu(reason="the execution bound is XLA's GPU watchdog; CPU pools have none")

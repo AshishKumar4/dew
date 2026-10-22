@@ -1363,19 +1363,18 @@ def alternating(gen, disc):
         def step(state, batch):
             trainable = state.variables["params"]
 
-            def generator(operand):
-                loss, grads = jax.value_and_grad(objective.generator_loss)(trainable, batch)
-                updates, gen_state = gen.update(grads["gen"], state.opt_state["gen"], trainable["gen"])
-                params = {**trainable, "gen": optax.apply_updates(trainable["gen"], updates)}
-                return params, {**state.opt_state, "gen": gen_state}, loss
+            def player(name, optimizer, loss_of):
+                def turn(operand):
+                    # One player's step: its loss's gradient through its own optimizer, the other held.
+                    loss, grads = jax.value_and_grad(loss_of)(trainable, batch)
+                    updates, moved = optimizer.update(grads[name], state.opt_state[name], trainable[name])
+                    params = {**trainable, name: optax.apply_updates(trainable[name], updates)}
+                    return params, {**state.opt_state, name: moved}, loss
+                return turn
 
-            def discriminator(operand):
-                loss, grads = jax.value_and_grad(objective.discriminator_loss)(trainable, batch)
-                updates, disc_state = disc.update(grads["disc"], state.opt_state["disc"], trainable["disc"])
-                params = {**trainable, "disc": optax.apply_updates(trainable["disc"], updates)}
-                return params, {**state.opt_state, "disc": disc_state}, loss
-
-            params, opt_state, loss = jax.lax.cond(state.microstep % 2 == 0, generator, discriminator, None)
+            params, opt_state, loss = jax.lax.cond(
+                state.microstep % 2 == 0, player("gen", gen, objective.generator_loss),
+                player("disc", disc, objective.discriminator_loss), None)
             new_state = state.replace(
                 microstep=state.microstep + 1,
                 updates=state.updates + 1,

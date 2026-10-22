@@ -345,10 +345,6 @@
    "comparisons": 4,
    "lane": "Models, Serving & RL"
   },
-  "tests/test_hyper_connections.py": {
-   "comparisons": 5,
-   "lane": "Models, Serving & RL"
-  },
   "tests/test_image_metrics.py": {
    "comparisons": 5,
    "lane": "Training"
@@ -609,10 +605,6 @@
    "comparisons": 2,
    "lane": "Models, Serving & RL"
   },
-  "tests/test_quantization.py": {
-   "comparisons": 16,
-   "lane": "Models, Serving & RL"
-  },
   "tests/test_quantization_sites.py": {
    "comparisons": 1,
    "lane": "Models, Serving & RL"
@@ -724,10 +716,6 @@
   "tests/test_text_data.py": {
    "comparisons": 1,
    "lane": "Training"
-  },
-  "tests/test_text_encoders.py": {
-   "comparisons": 4,
-   "lane": "Models, Serving & RL"
   },
   "tests/test_text_rollout_contract.py": {
    "comparisons": 14,

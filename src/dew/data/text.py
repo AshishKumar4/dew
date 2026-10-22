@@ -24,6 +24,7 @@ import grain.python as grain
 import numpy as np
 from filelock import FileLock
 
+from dew.data.pipeline import TOKEN_FIELDS
 from dew.data.tokens import chunk_table
 
 if TYPE_CHECKING:
@@ -221,7 +222,7 @@ class ByteTokenizer:
         self.bos_id = None
 
     def dependencies(self) -> Mapping[str, object]:
-        return {"name": "byte", "encoding": "utf-8", "eos": 255}
+        return {"name": "byte", "encoding": "utf-8", "eos": self.eos_id}
 
     def encode(self, text: str, *, add_special_tokens: bool = True) -> list[int]:
         """Return the text's utf-8 bytes as ids.
@@ -416,7 +417,7 @@ class Chunks:
 
     length: int
     _: dataclasses.KW_ONLY
-    fields: tuple[str, ...] = ("text",)
+    fields: tuple[str, ...] = TOKEN_FIELDS
     overlap: int = 0
 
     def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
