@@ -253,8 +253,9 @@ def row_mix(sources: dict[str, float], *, read: str = "memory", seed: int = 0) -
 def test_a_weighted_mixture_of_two_datasets_holds_each_share_of_every_batch(two_splits):
     big, small = two_splits
     data = row_mix({big: 0.75, small: 0.25})
-    # An epoch is the fewest records in which the big split's 40 are read, three in every four: 53.
-    assert data.records == 53 and data.batch == 4 and data.steps_per_epoch == 13
+    # An epoch is the fewest records in which the big split's 40 are read, three in every four: 53,
+    # in 14 steps of four, the last leading into the next epoch.
+    assert data.records == 53 and data.batch == 4 and data.steps_per_epoch == 14
     stream = data.train(DataPartition())
     try:
         batches = taken(stream, 6)
@@ -676,6 +677,17 @@ def test_epochs_under_a_ramp_read_that_many_passes_of_records():
     batches = [stage.batch for stage in ramp.stages(16)]
     assert (data.epoch_steps(1), data.epoch_steps(2)) == (6, 10) and batches == [8, 16]
     assert 4 * 8 + 6 * 16 == 2 * 64
+
+
+@pytest.mark.parametrize(("records", "steps"), [(5, 3), (16, 8), (17, 9), (40, 14), (41, 15)])
+def test_an_epoch_under_a_ramp_counts_the_step_that_completes_it(records, steps):
+    """An order read on past its epoch, its batch ramping from 2 to 4 over the first 16 records,
+    counts the steps that read every record of an epoch: inside the ramp's first stage, at its end,
+    past it, and in the final batch, the last step leading into the next epoch."""
+    ramp = Ramp(start=2, increment=2, samples=16)
+    data = ramped(Loader(train=lambda partition: iter(()), val=None, records=records, batch=4, tail="read"),
+                  ramp)
+    assert data.epoch_steps(1) == steps
 
 
 def indexed_data(records: int, batch: int, seed: int = 0) -> Loader:
@@ -1310,9 +1322,10 @@ def test_an_epoch_of_repeated_corpora_ends_where_grains_mix_has_read_every_one_o
 
 
 def test_an_epoch_of_a_mix_of_corpora_written_without_repeats_reads_every_corpus_whole():
-    """A run's mix of corpora written without repeats reads, in an epoch's records, every record of
-    the corpus it ends on once and every record of the others: the slow corpus's tail is read, not
-    skipped by the mix starting over at its shortest corpus's end."""
+    """A run's mix of corpora written without repeats reads, in an epoch's steps, every record of the
+    corpus it ends on once and every record of the others: the slow corpus's tail is read, not
+    skipped by the mix starting over at its shortest corpus's end, and the epoch's last step, which
+    leads into the next, holds the record that completes it."""
     from dew.data.compile import fitted
     from dew.data.pipeline import ObjectiveData
 
@@ -1320,8 +1333,7 @@ def test_an_epoch_of_a_mix_of_corpora_written_without_repeats_reads_every_corpus
                for tag, size in ((1, 40), (2, 200))]
     data, _ = fitted(mix(corpora, weights=(1, 10)).batch(4).read("memory").workers(0), None,
                      objective=ObjectiveData())
-    steps = -(-data.records // 4)
-    values = [value for step in taken(data.train(DataPartition()), steps) for value in step][: data.records]
+    values = [value for step in taken(data.train(DataPartition()), data.steps_per_epoch) for value in step]
     slow = sorted(value for value in values if value // 1000 == 1)
     assert slow == [1000 + index for index in range(40)]
     assert {value for value in values if value // 1000 == 2} == {2000 + index for index in range(200)}

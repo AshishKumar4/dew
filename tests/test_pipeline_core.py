@@ -2131,6 +2131,29 @@ def test_a_part_cut_between_two_repeats_comes_round_once_the_cut_its_last_repeat
     assert sorted(_ids(loader.train(DataPartition()), loader.records)) == [100, 101, 102, 200, 201, 202]
 
 
+@pytest.mark.parametrize(("keep", "steps"), [(False, 2), (True, 3)])
+def test_an_order_read_once_counts_the_steps_its_batches_deliver(keep, steps):
+    """Five records read once in batches of two take two steps where the batch drops its short last
+    one, and three where it keeps it, filled: an epoch's steps are those its reader delivers."""
+    loader = compile(_tagged(1, 5).repeat(1).batch(2, drop_remainder=not keep), loading=READ)
+    assert loader.steps_per_epoch == steps
+    reader = loader.train(DataPartition())
+    try:
+        assert len(list(reader)) == steps
+    finally:
+        reader.close()
+
+
+def test_an_epoch_of_an_order_read_on_counts_the_step_that_completes_it():
+    """Five records repeated for ever in batches of two take three steps an epoch, the third holding
+    the last record and the next epoch's first, and two epochs five steps: the steps that read
+    every record of each."""
+    loader = compile(_tagged(1, 5).repeat().batch(2), loading=READ)
+    assert (loader.steps_per_epoch, loader.epoch_steps(2)) == (3, 5)
+    read = _ids(loader.train(DataPartition()), loader.steps_per_epoch)
+    assert set(read) == set(range(100, 105))
+
+
 def test_a_mixture_of_a_repeated_corpus_and_one_read_once_counts_what_a_run_reads():
     """A mix of a corpus of 8 repeated and one of 4 written without a repeat, at even weights, ends
     where the one read once does, at 8, and a run reads that many records: the order repeats
