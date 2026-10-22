@@ -68,8 +68,8 @@ def videos(seed=0, batch=2):
         np.random.RandomState(seed).uniform(0, 255, (batch, FRAMES, RES, RES, 3)))
 
 
-SEEDS = {'image token index': 8, 'video token index': 8, 'image predictor': 8, 'video predictor': 8,
-         'adapted features': 8, 'JEPA loss init': 8, 'JEPA loss trainer': 8}
+SEEDS = {'image token index': 8, 'video token index': 8, 'image predictor': 16, 'video predictor': 8,
+         'adapted features': 8, 'JEPA loss init': 256, 'JEPA loss trainer': 256}
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada)."""
 
 
@@ -404,7 +404,7 @@ def health_in(z, dtype):
     return np.asarray([z.std(axis=0).mean(), np.sqrt(np.mean(off ** 2))])
 
 
-HEALTH_SEEDS = 256
+HEALTH_SEEDS = 512
 """Check 1's declared seeds for the health statistics, sized by `seeds_for` (on armada)."""
 
 
@@ -610,22 +610,27 @@ def test_the_loss_is_the_mean_squared_error_to_normalized_targets_of_the_same_bl
         pixels = images(seed)
         return (pixels, *objective.mask.sample(jax.random.fold_in(jax.random.PRNGKey(7), seed), len(pixels)))
 
+    @jax.jit
     def scored(pixels, context_idx, target_idx):
         # The objective reads these masks (`Step.tape`).
         step = step_with(averaged).replace(tape={"context": context_idx, "targets": target_idx})
         return objective.scalar_loss(params, {"image": pixels}, step)[0]
 
     def loss_in(dtype):
-        modules, (live, target) = ((objective, (params, averaged)) if dtype == np.float32
-                                   else (wide, (widened(params), widened(averaged))))
+        modules = objective if dtype == np.float32 else wide
 
-        def run(pixels, context_idx, target_idx):
-            samples = (jnp.asarray(pixels, dtype) - 127.5) / 127.5
-            z = np.asarray(modules.encode(part(target, "context_encoder"), samples), dtype)
+        @jax.jit
+        def outputs(live, target, samples, context_idx, target_idx):
             context = modules.encode(part(live, "context_encoder"), samples, context_idx)
             repeated = (jnp.repeat(context, blocks, axis=0), jnp.repeat(context_idx, blocks, axis=0))
-            predictions = np.asarray(modules.predictor.apply(
-                part(live, "predictor"), *repeated, target_idx.reshape(len(samples) * blocks, -1)), dtype)
+            return modules.encode(part(target, "context_encoder"), samples), modules.predictor.apply(
+                part(live, "predictor"), *repeated, target_idx.reshape(len(samples) * blocks, -1))
+
+        def run(pixels, context_idx, target_idx):
+            live, target = (params, averaged) if dtype == np.float32 else (widened(params), widened(averaged))
+            samples = (jnp.asarray(pixels, dtype) - 127.5) / 127.5
+            z, predictions = (np.asarray(value, dtype)
+                              for value in outputs(live, target, samples, context_idx, target_idx))
             normed = (z - z.mean(-1, keepdims=True)) / np.sqrt(z.var(-1, keepdims=True) + 1e-6)
             targets = np.stack([normed[row][np.asarray(target_idx)[row, block]]
                                 for row in range(len(samples)) for block in range(blocks)])
