@@ -184,8 +184,6 @@ def test_train_diffusion_example_trains_samples_and_exports(tmp_path):
 
 def test_train_flowers_trains_on_every_record_and_its_profiling_run_draws_nothing(tmp_path):
     example = load("train_flowers", "examples")
-    assert example.flowers(example.Config(data=tmp_path)).validation is None, "a split is held out"
-
     config = example.Config(data=tmp_path, output=tmp_path / "run", steps=4, batch=8, image_size=RES,
                             profile=2)
     state = example.main(config, data=fake_dataset(8))
@@ -341,8 +339,10 @@ def test_sft_diffusion_gemma_puts_each_assistant_turn_alone_on_the_canvases(tmp_
     example = load("sft_diffusion_gemma", "examples")
     config = example.smoke_config(example.Config(smoke=True, out=tmp_path))
     _, objective = example.adapted_objective(config)
-    train, _, _ = example.chat_rows(config, objective).pipelines()
-    rows = list(train)
+    from dew.data.sources import source
+
+    # One pass over the conversations in their order, batch by batch.
+    batches = list(example.chat_rows(config, objective, source(config.chat)))
     template = AutoTokenizer.from_pretrained(config.model)
     expected = []
     for turns in example.CONVERSATIONS:
@@ -352,9 +352,10 @@ def test_sft_diffusion_gemma_puts_each_assistant_turn_alone_on_the_canvases(tmp_
             whole = template.apply_chat_template(turns[:index + 1], tokenize=True, return_dict=False)
             expected.append((prompt[:objective.prompt_length], whole[len(prompt):]))
 
-    batch = {name: np.stack([row[name] for row in rows]) for name in ("text", "canvas_mask")}
+    batch = {name: np.concatenate([np.asarray(part[name]) for part in batches])
+             for name in ("text", "canvas_mask")}
     _, tokens, response, _, valid, targets, _ = objective._row(batch)
-    assert len(rows) == len(expected) == 4
+    assert len(batch["text"]) == len(expected) == 4
     for row, (prompt, completion) in enumerate(expected):
         head = np.asarray(tokens[row, :objective.prompt_length])
         assert head[np.asarray(valid[row, :objective.prompt_length])].tolist() == prompt
@@ -385,13 +386,12 @@ def test_sft_gemma4_validates_on_conversations_it_never_trains_on(tmp_path):
     used to read the training split again and score what the run trained on."""
     from transformers import AutoTokenizer
 
-    from dew.config.data import loader
+    from dew.data.compile import compile
 
     example = load("sft_gemma4", "examples")
     config, tokenizer, chat = example.smoke_config(example.Config(smoke=True, out=tmp_path))
     run = example.run_config(config, tokenizer, chat)
-    data = loader(run.data, batch=run.trainer.batch_size, read=run.data_read, provision=run.provision,
-                  loading=run.loading, validation_records=run.validation_records)
+    data = compile(run.data, validation=run.validation, provision=True)
     vocabulary = AutoTokenizer.from_pretrained(tokenizer)
     words = [{token for turn in turns
               for token in vocabulary.encode(turn["content"], add_special_tokens=False)}

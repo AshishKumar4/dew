@@ -109,10 +109,6 @@
    "comparisons": 1,
    "lane": "Models, Serving & RL"
   },
-  "tests/test_data.py": {
-   "comparisons": 1,
-   "lane": "Data"
-  },
   "tests/test_data_av.py": {
    "comparisons": 2,
    "lane": "Data"
@@ -263,10 +259,6 @@
   },
   "tests/test_flaxdiff.py": {
    "comparisons": 6,
-   "lane": "Models, Serving & RL"
-  },
-  "tests/test_flow_grpo.py": {
-   "comparisons": 29,
    "lane": "Models, Serving & RL"
   },
   "tests/test_flow_matching.py": {
@@ -695,10 +687,6 @@
   },
   "tests/test_samplers.py": {
    "comparisons": 9,
-   "lane": "Models, Serving & RL"
-  },
-  "tests/test_schedulers.py": {
-   "comparisons": 18,
    "lane": "Models, Serving & RL"
   },
   "tests/test_sd3_source.py": {
