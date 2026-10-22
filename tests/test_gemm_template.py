@@ -847,11 +847,19 @@ def test_a_cooperative_tiles_exact_sums_add_as_its_plain_sum_does():
 
 def test_a_tile_states_a_schedule_the_kernels_run():
     """A pair of multiprocessors needs two warpgroups; a warpgroup count or cluster outside one or two is
-    refused where the tile is made, and a direct kernel gradient refuses a depth its pairs do not divide."""
+    refused where the tile is made; the kernel gradient's schedule is one multiprocessor's, so its space
+    holds no pair and a direct kernel gradient refuses one."""
     for fields in ({"warpgroups": 1, "cluster": 2}, {"warpgroups": 3}, {"warpgroups": 2, "cluster": 4}):
         with pytest.raises(ValueError):
             mosaic_gpu.Tiles(128, 128, 64, 3, 1, **fields)
-    x = jnp.zeros((ROWS, 384), jnp.bfloat16)
+    launch = grouped_matmul.MosaicTgmm()
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    with generation.assumed("sm90"):
+        space = launch.space(launch.bind(bf16((ROWS, 512)), bf16((ROWS, WIDTH)),
+                                         jax.ShapeDtypeStruct((3,), jnp.int32), out_dtype="float32",
+                                         interpret=False))
+    assert space and all(tile.cluster == 1 for tile in space)
+    x = jnp.zeros((ROWS, 512), jnp.bfloat16)
     with pytest.raises(ValueError):
         mosaic_gpu.tgmm(x, jnp.zeros((ROWS, WIDTH), jnp.bfloat16), jnp.asarray(SIZES),
                         tiles=mosaic_gpu.Tiles(128, 128, 64, 3, 1, warpgroups=2, cluster=2),
