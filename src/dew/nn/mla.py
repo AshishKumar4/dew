@@ -154,6 +154,41 @@ def _rotate(interleave: bool, part, freqs_cos, freqs_sin):
     return rotate(deinterleaved(part) if interleave else part, freqs_cos, freqs_sin)
 
 
+class IndexerFront:
+    """The lightning indexers' shared front end, mixed into each (V3.2's `SparseIndexer`, GLM's
+    k-pool, DeepSeek V4's CSA2): the query residual projected by `wq_b` into `n_heads` heads of
+    `head_dim`, the hidden state by `weights_proj` into a weight a head, and the queries scored
+    against keys by `index_scores`, at least in fp32 and under the indexer's `precision`, the inputs
+    detached as the references detach them. Each indexer declares its own keys (`wk` and its
+    `k_norm`) beside these, turns its queries as its reference does, and selects as it does."""
+
+    # The fields of the module this mixes into, which declares them; a mixin's annotations are no
+    # dataclass fields of their own.
+    n_heads: int
+    head_dim: int
+    dtype: Dtype | None
+    precision: PrecisionLike
+
+    def declare_front(self) -> Callable[..., Dense]:
+        """Declare `wq_b` and `weights_proj`, from the indexer's `setup`, and return the bias-free
+        projection at its `dtype` and `precision` they are, for the indexer's own keys."""
+        dense = functools.partial(Dense, use_bias=False, dtype=self.dtype, precision=self.precision,
+                                  dot_general=float32_dot_general)
+        self.wq_b = dense(self.n_heads * self.head_dim, name='wq_b')
+        self.weights_proj = dense(self.n_heads, name='weights_proj')
+        return dense
+
+    def queries(self, q_resid):
+        """The indexer's queries `[B, S, n_heads, head_dim]` of the detached query residual."""
+        batch, length = q_resid.shape[:2]
+        return self.wq_b(jax.lax.stop_gradient(q_resid)).reshape(batch, length, self.n_heads, self.head_dim)
+
+    def scored(self, query, keys, hidden):
+        """`query`'s scores against `keys` `[B, S, T]`, its heads weighted by `weights_proj` of the
+        detached `hidden` (`index_scores`)."""
+        return index_scores(query, keys, self.weights_proj(jax.lax.stop_gradient(hidden)), self.precision)
+
+
 @logical_axes({
     ("wq_b",): ("qlora", "index"),
     ("wk",): ("embed", "index"),
@@ -162,7 +197,7 @@ def _rotate(interleave: bool, part, freqs_cos, freqs_sin):
     # Maps the hidden states onto one weight per indexer head.
     ("weights_proj",): ("embed", "index"),
 })
-class SparseIndexer(nn.Module):
+class SparseIndexer(IndexerFront, nn.Module):
     """DeepSeek sparse attention's lightning indexer: a score per query and key.
 
     `modeling_deepseek_v32.DeepseekV32Indexer`: `wq_b` reads the query residual,
@@ -188,15 +223,11 @@ class SparseIndexer(nn.Module):
                 f"the indexer rotates a {self.rope_head_dim}-wide rope slice "
                 f"out of heads of width {self.head_dim}, so the heads have "
                 "to be wider")
-        dense = functools.partial(
-            Dense, use_bias=False, dtype=self.dtype, precision=self.precision,
-            dot_general=float32_dot_general)
-        self.wq_b = dense(self.n_heads * self.head_dim, name='wq_b')
+        dense = self.declare_front()
         self.wk = dense(self.head_dim, name='wk')
         # A LayerNorm with weight and bias at a hardcoded 1e-6: the reference
         # names no config for it (modeling_deepseek_v32.py, DeepseekV32Indexer).
         self.k_norm = LayerNorm(epsilon=1e-6, dtype=self.dtype, name='k_norm')
-        self.weights_proj = dense(self.n_heads, name='weights_proj')
 
     def keys(self, hidden):
         """The indexer's keys for these hidden states: `[B, S, head_dim]`."""
@@ -221,15 +252,10 @@ class SparseIndexer(nn.Module):
         fp32: the head weighting multiplies by `n_heads ** -0.5` in fp32 in
         the reference, and the relu keeps only the positive agreements.
         """
-        hidden = jax.lax.stop_gradient(hidden)
-        q_resid = jax.lax.stop_gradient(q_resid)
-        batch, length, _ = hidden.shape
-        query = self.wq_b(q_resid).reshape(
-            batch, length, self.n_heads, self.head_dim)
-        q_rot, q_pass = jnp.split(query, [self.rope_head_dim], axis=-1)
+        q_rot, q_pass = jnp.split(self.queries(q_resid), [self.rope_head_dim], axis=-1)
         query = jnp.concatenate(
             [_rotate(self.rope_interleave, q_rot, freqs_cos, freqs_sin), q_pass], axis=-1)
-        return index_scores(query, keys, self.weights_proj(hidden), self.precision)
+        return self.scored(query, keys, hidden)
 
     def select(self, scores, keep):
         """The top-k keys of each query among those `keep` allows, as

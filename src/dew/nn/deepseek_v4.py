@@ -63,6 +63,7 @@ from dew.nn.fake_quant import FakeQuantizing
 from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of, valid_order
 from dew.nn.kv_cache import KVCache, write_cache
 from dew.nn.mixer_base import ATTENTION_CONTEXT_RESIDUALS, MixerBase, MixerContext
+from dew.nn.mla import IndexerFront
 from dew.nn.precision import at_least_fp32, float32_dot_general, float32_einsum
 from dew.nn.rope import YarnScaling, rotary_freqs, rotate
 from dew.nn.sharding import RESIDUAL, LogicalAxes, constrain, down_projection, logical_axes
@@ -413,7 +414,7 @@ class Compressor(CompressedEntries):
         return entries, jnp.broadcast_to(visible, (x.shape[0], *visible.shape[1:]))
 
 
-class Csa2Indexer(FakeQuantizing):
+class Csa2Indexer(IndexerFront, FakeQuantizing):
     """CSA2's indexer (v41:488-580): queries from the query residual, scored
     against index keys a Full layer projects from its compressor's latent (`wk`,
     `k_norm`) and the other layers read from the store, under V3.2's leaf names.
@@ -434,10 +435,7 @@ class Csa2Indexer(FakeQuantizing):
             raise ValueError(
                 f"the indexer rotates a {self.rope_dim}-wide rope slice out of heads "
                 f"of width {self.head_dim}, so the heads have to be wider")
-        dense = functools.partial(Dense, use_bias=False, dtype=self.dtype, precision=self.precision,
-                                  dot_general=float32_dot_general)
-        self.wq_b = dense(self.n_heads * self.head_dim, name='wq_b')
-        self.weights_proj = dense(self.n_heads, name='weights_proj')
+        dense = self.declare_front()
         if self.owns_keys:
             self.wk = dense(self.head_dim, name='wk')
             self.k_norm = RMSNorm(epsilon=self.norm_eps, scale_after_cast=True,
@@ -453,12 +451,8 @@ class Csa2Indexer(FakeQuantizing):
 
     def scores(self, x, q_resid, keys, cos, sin):
         """Every query's score of every entry, `[B, S, T]` (v41:550-557)."""
-        x, q_resid = jax.lax.stop_gradient(x), jax.lax.stop_gradient(q_resid)
-        batch, length, _ = x.shape
-        query = _rotate_rope(
-            self.wq_b(q_resid).reshape(batch, length, self.n_heads, self.head_dim), cos, sin)
-        return index_scores(self._fp4(query), jax.lax.stop_gradient(keys), self.weights_proj(x),
-                            self.precision)
+        query = _rotate_rope(self.queries(q_resid), cos, sin)
+        return self.scored(self._fp4(query), jax.lax.stop_gradient(keys), x)
 
 
 def _published(kv_store, name: str, layer: str):
@@ -584,7 +578,7 @@ class DeepseekV4Attention(FakeQuantizing):
         # Block-diagonal over the head groups: one `[g, in, o_lora_rank]` kernel, the group its
         # batch dim (`DeepseekV4GroupedLinear`, modeling_deepseek_v4.py:294-323, whose weight
         # `[g * o_lora_rank, in]` is this kernel with each group's block transposed).
-        self.o_a_proj = DenseGeneral(self.o_lora_rank, batch_dims=0, use_bias=False, dtype=self.dtype,
+        self.o_a_proj = DenseGeneral(self.o_lora_rank, batch_dims=(0,), use_bias=False, dtype=self.dtype,
                                      precision=self.precision, dot_general=float32_dot_general,
                                      name='o_a_proj')
         self.o_b_proj = dense(self.emb_features, name='o_b_proj')
