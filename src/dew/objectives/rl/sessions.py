@@ -50,7 +50,7 @@ import numpy as np
 from jax.typing import ArrayLike
 
 from dew.data.tokens import first_fit
-from dew.nn.inputs import local_rows
+from dew.nn.inputs import local_rows, token_id
 from dew.records import finite, json_value, record as section
 from dew.rl import group_advantage, rloo_advantage
 
@@ -146,9 +146,11 @@ class Status(Enum):
         return self in (Status.COMPLETED, Status.AGENT_ERROR)
 
 
-def _token_ids(name: str, ids: object) -> None:
-    if not isinstance(ids, tuple) or any(type(token) is not int or token < 0 for token in ids):
-        raise ValueError(f"{name} must be a tuple of nonnegative integer token ids")
+def _token_ids(name: str, ids: object) -> tuple[int, ...]:
+    """`ids`, a tuple, each read by `dew.nn.inputs.token_id`'s law."""
+    if not isinstance(ids, tuple):
+        raise ValueError(f"{name} must be a tuple of token ids, got {type(ids).__name__}")
+    return tuple(token_id(token, where=name) for token in ids)
 
 
 @dataclass(frozen=True)
@@ -221,8 +223,8 @@ class Call:
     transcript: Transcript | None = None
 
     def __post_init__(self) -> None:
-        _token_ids("prompt_ids", self.prompt_ids)
-        _token_ids("sampled_ids", self.sampled_ids)
+        object.__setattr__(self, "prompt_ids", _token_ids("prompt_ids", self.prompt_ids))
+        object.__setattr__(self, "sampled_ids", _token_ids("sampled_ids", self.sampled_ids))
         if not self.prompt_ids:
             raise ValueError("a model call reads at least one prompt id")
         if (not isinstance(self.behavior_log_probs, tuple)
@@ -253,8 +255,9 @@ class Call:
         if self.support is not None:
             if not isinstance(self.support, tuple) or len(self.support) != len(self.sampled_ids):
                 raise ValueError("support holds one tuple of kept ids per sampled id")
+            kept_ids = tuple(_token_ids("each support", kept) for kept in self.support)
+            object.__setattr__(self, "support", kept_ids)
             for kept, token in zip(self.support, self.sampled_ids, strict=True):
-                _token_ids("each support", kept)
                 if token not in kept:
                     raise ValueError(f"sampled id {token} lies outside its recorded support")
 
