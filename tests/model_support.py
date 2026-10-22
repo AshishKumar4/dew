@@ -1,5 +1,6 @@
 """The tiny decoder and the parameter-tree view several model tests share."""
 
+import functools
 import json
 import os
 import subprocess
@@ -32,6 +33,21 @@ def model_draw(model, shape: tuple[int, ...], vocab: int):
         ids = jax.random.randint(jax.random.fold_in(jax.random.key(1), seed), shape, 0, vocab)
         return init(jax.random.fold_in(jax.random.key(0), seed), ids), ids
     return draw
+
+
+@functools.cache
+def decode_steps(model):
+    """`model`'s decode cache made for a count of rows, and its decode step from a cache, each one
+    compiled program: `made(variables, rows)` the cache, `step(variables, cache, ids)` the logits and
+    the cache after them."""
+    def made(variables, rows):
+        _, made = model.apply(variables, rows, method=CausalTransformer.init_cache, mutable=['cache'])
+        return made['cache']
+
+    def step(variables, cache, ids):
+        logits, mutated = model.apply({**variables, 'cache': cache}, ids, decode=True, mutable=['cache'])
+        return logits, mutated['cache']
+    return jax.jit(made, static_argnums=1), jax.jit(step)
 
 
 def two_documents(rng: np.random.Generator, rows: int, length: int):
