@@ -10,10 +10,9 @@ writes to shared memory are the other's operand. Each consumer's accumulator liv
 (`finished`), and a tile's rows reach global memory through `store_rows`, whose stores have static extents
 however many rows a tile holds.
 
-A mainloop that drives its own loads (attention's K and V, released at different points of a step) streams
-each operand through a `Ring` whose counter runs across tiles, takes each warpgroup's role (`roles`), lets
-two consumers meet between their tensor-core phases (`rendezvous`), walks its tiles in its own order
-(`persistent`) and stores per-row vectors (`store_vector`).
+A mainloop that drives its own loads (the GEMM's kernel gradient, its stages streaming across tiles)
+streams each operand through a `Ring` whose counter runs across tiles, and takes each warpgroup's role
+(`roles`).
 """
 
 import dataclasses
@@ -188,11 +187,10 @@ class Ring:
             pl.when(step >= 0)(lambda step=step: plgpu.barrier_wait(self.consumed.at[self.slot(step)]))
 
 
-def ring(block: tuple, dtype, stages: int, *, consumers: int = 1, transforms: tuple = ()) -> dict:
-    """A `Ring`'s allocations for `pl.run_scoped`: `stages` slots of `block` in `dtype` (`transforms` their
-    shared-memory tiling and swizzle), a load barrier each, and a release barrier each that `consumers`
-    arrive at. `Ring(**allocated)` once scoped."""
-    return {'smem': plgpu.SMEM((stages, *block), dtype, transforms=transforms),
+def ring(block: tuple, dtype, stages: int, *, consumers: int = 1) -> dict:
+    """A `Ring`'s allocations for `pl.run_scoped`: `stages` slots of `block` in `dtype`, a load barrier
+    each, and a release barrier each that `consumers` arrive at. `Ring(**allocated)` once scoped."""
+    return {'smem': plgpu.SMEM((stages, *block), dtype),
             'full': plgpu.Barrier(num_barriers=stages),
             'consumed': plgpu.Barrier(num_arrivals=consumers, num_barriers=stages)}
 
@@ -216,39 +214,3 @@ def roles(wg, consumers: int, consumer, producer) -> None:
     def _():
         plgpu.set_max_registers(PRODUCER_REGISTERS, action="decrease")
         producer()
-
-
-def schedule_barrier():
-    """The barrier two consumers meet at (`rendezvous`): two arrivals."""
-    return plgpu.Barrier(num_arrivals=2)
-
-
-def rendezvous(barrier) -> None:
-    """One consumer's meeting with the other at the schedule barrier: it arrives and waits until both
-    have. Symmetric meetings order nothing; a ping-pong of tensor-core phases is the mainloop's schedule
-    on top of them, its phases offset by a meeting one consumer takes before the loop and the other after
-    it (as `attention_mgpu` does), which each template keeps."""
-    plgpu.barrier_arrive(barrier)
-    plgpu.barrier_wait(barrier)
-
-
-def persistent(count: int, *, collective_axes, order=None):
-    """A persistent loop over `count` tiles, each block taking its share: `body(tile, loop)` with the tile
-    `order(index)` names for the loop's linear index (the index itself without one: an LPT or causal
-    order reverses it, a GEMM's planar snake folds it)."""
-    def decorator(body):
-        @plgpu.nd_loop((count,), collective_axes=collective_axes)
-        def _(loop: plgpu.NDLoopInfo):
-            index = loop.index[0]
-            body(index if order is None else order(index), loop)
-    return decorator
-
-
-def store_vector(vector, smem, view) -> None:
-    """A per-row vector (an attention tile's running max or sum) to `view` in global memory through
-    `smem`, its layout's relayout there, once the store before it has read `smem`. The caller waits for the
-    last store (`plgpu.wait_smem_to_gmem`) before `smem`'s scope ends or the vector is read back."""
-    plgpu.wait_smem_to_gmem(0, wait_read_only=True)
-    smem[...] = vector.astype(smem.dtype)
-    plgpu.commit_smem()
-    plgpu.copy_smem_to_gmem(smem, view)
