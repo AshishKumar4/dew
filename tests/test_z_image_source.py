@@ -34,6 +34,7 @@ from dew.nn.backbones.z_image import ZImageTransformer
 ROOT = Path(__file__).resolve().parents[1]
 CASES = ("padded", "exact", "deep")
 CASE_SEEDS = {"padded": 16, "exact": 16, "deep": 16}
+ROWS = 4
 BUDGET = 64
 
 
@@ -100,16 +101,22 @@ def test_the_flow_and_its_gradients_match_the_source(source, arrays, record, nam
     from tools.diffusers_wan_reference import float64
 
     model, params, layouts = load(source, name)
-    lengths = record["cases"][name]["lengths"]
+    # Each draw holds the case's rows ROWS times over, so a parameter's gradient sums over more of
+    # them and one draw's error varies less (a single draw's did not resolve within 512).
+    cased = len(record["cases"][name]["lengths"])
+    lengths = tuple(record["cases"][name]["lengths"]) * ROWS
     walk = z_image_walk(model, params, lengths)
     tensors = {layout.name.removeprefix("transformer/"): layout for layout in layouts}
     assert {key.removeprefix(f"{name}.grad_param.") for key in arrays
             if key.startswith(f"{name}.grad_param.")} == set(tensors)
     captions = [f"caption.{row}" for row in range(len(lengths))]
-    original = {key: np.array(arrays[f"{name}.{key}"]) for key in ("latents", "times", "probe", *captions)}
+    original = {key: np.concatenate([arrays[f"{name}.{key}"]] * ROWS)
+                for key in ("latents", "times", "probe")}
+    original |= {caption: np.array(arrays[f"{name}.caption.{row % cased}"])
+                 for row, caption in enumerate(captions)}
 
     def draw(seed):
-        """The fixture's inputs at seed 0, else fresh normal draws at `seed`."""
+        """The fixture's inputs, its rows ROWS times over, at seed 0, else fresh normal draws."""
         if seed == 0:
             return (original,)
         generator = torch.Generator().manual_seed(31 + seed)
