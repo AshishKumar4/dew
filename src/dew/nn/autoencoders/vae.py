@@ -17,8 +17,9 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from dew.interop.weights import ParamTree, translate_parameters
+from dew.interop.weights import ParamTree, indexed_path, translate_parameters
 from dew.nn.attention import GroupNorm, projected_heads, projected_output, scaled_dot_product_attention
+from dew.nn.autoencoders.api import check_class
 from dew.nn.conv import Conv
 
 
@@ -223,28 +224,11 @@ def _vae_path(torch_name: str, rank: int) -> tuple[str, ...]:
     """
     parts = torch_name.split(".")
     leaf = "bias" if parts[-1] == "bias" else ("scale" if rank == 1 else "kernel")
-    parts = parts[:-1]
-    path = []
-    index = 0
-    while index < len(parts):
-        name = parts[index]
-        following = parts[index + 1] if index + 1 < len(parts) else None
-        if name == "to_out":
-            # to_out.0 is the projection; there is no second entry.
-            path.append("proj_attn")
-            index += 2
-            continue
-        if name in _VAE_ATTENTION:
-            path.append(_VAE_ATTENTION[name])
-            index += 1
-            continue
-        if following is not None and following.isdigit():
-            path.append(f"{name}_{following}")
-            index += 2
-            continue
-        path.append(name)
-        index += 1
-    return (*path, leaf)
+    names = parts[:-1]
+    # to_out.0 is the projection, the module's last; there is no second entry.
+    if names[-2:] == ["to_out", "0"]:
+        names[-2:] = ["proj_attn"]
+    return (*indexed_path(_VAE_ATTENTION.get(name, name) for name in names), leaf)
 
 
 def translate_vae_weights(torch_tensors: ParamTree) -> ParamTree:
@@ -356,6 +340,9 @@ def _load_from_hub(modelname: str, revision: str, params, errors: list) -> dict 
         try:
             config_path = hf_hub_download(modelname, "config.json",
                                           revision=candidate_revision, subfolder=subfolder)
+            # A foreign autoencoder's config is refused before any of its weights is fetched.
+            with open(config_path) as handle:
+                check_class(json.load(handle), PUBLISHED, modelname, nameless=True)
             # Candidate eligibility must match a source load even when a
             # config exists in a revision that carries no matching weights.
             if params is not None:
@@ -376,6 +363,11 @@ def _load_from_hub(modelname: str, revision: str, params, errors: list) -> dict 
     return None
 
 
+PUBLISHED = ("AutoencoderKL", "FlaxAutoencoderKL")
+"""The `_class_name`s an AutoencoderKL's config states, diffusers' and its Flax port's; an older config
+names none (`check_class`'s `nameless`)."""
+
+
 def load_pretrained_vae(modelname: str, revision: str = "bf16", *, params=None) -> dict:
     """Read a pretrained AutoencoderKL's config and params, local or from the Hub.
 
@@ -384,7 +376,8 @@ def load_pretrained_vae(modelname: str, revision: str = "bf16", *, params=None) 
     `flax`/`bf16` revision. Every 16-channel VAE (SD3.5, Flux) ships torch
     `diffusion_pytorch_model.safetensors` only, which `translate_vae_weights`
     reads. Supplied `params` are authoritative: only the configuration and
-    the repository's file metadata are read then, never weight bytes.
+    the repository's file metadata are read then, never weight bytes. A config naming another
+    autoencoder's class is refused by that name before any weight is read (`check_class`).
 
     `revision` names the flax layout when it is one of `FLAX_REVISIONS`, and
     the torch path then reads the repo's default branch. Any other revision
@@ -395,6 +388,7 @@ def load_pretrained_vae(modelname: str, revision: str = "bf16", *, params=None) 
         directory = Path(modelname)
         with open(directory / "config.json") as handle:
             config = json.load(handle)
+        check_class(config, PUBLISHED, directory, nameless=True)
         return {"config": config, "params": _read_vae_weights(directory) if params is None else params}
 
     errors: list[Exception] = []

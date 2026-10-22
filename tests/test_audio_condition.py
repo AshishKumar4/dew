@@ -15,11 +15,13 @@ import numpy as np
 import optax
 import pytest
 import torch
+from diffusion_support import images_of
 
 from dew.config import ModelConfig, ObjectiveConfig
-from dew.config.data import ImageData, VideoData, loader
-from dew.data import Loading
+from dew.data import Loading, presets
+from dew.data.compile import fitted
 from dew.data.dataset import DataPartition
+from dew.data.sources.files import Files
 from dew.inputs import Condition, HFAudio
 from dew.objectives.base import Step
 from dew.objectives.diffusion import AudioCondition, DiffusionRunConfig
@@ -135,18 +137,20 @@ def test_an_audio_conditioned_video_run_learns_and_samples_from_audio(towers, tm
     this one scored 15.9, on the pixel regime's sigmas a pixel run draws."""
     for hertz in range(220, 1100, 110):
         _clip(tmp_path / f"{hertz}.avi", hertz)
-    data = VideoData(source=str(tmp_path), extensions=(".avi",), frame_size=8, frames=2,
-                 audio_padding=1, audio_model=str(towers / "wav2vec2"))
+    # Two frames at 25 fps, their sound a frame wider on each side, at the rate wav2vec2 reads.
+    data = Files(str(tmp_path), format="files").pipe(
+        presets.video, 2 / 25, frames=2, fps=25, size=8, batch=8, extensions=(".avi",), sample_rate=16_000,
+        context=1 / 25).read("memory").loading(Loading(workers=0))
+    seconds = data.facts()["audio_seconds"]
     config = DiffusionRunConfig(
         model=ModelConfig("video_dit", {"patch_size": 4, "emb_features": 32, "num_layers": 1,
                                         "num_heads": 2, "dtype": "float32", "attention_impl": "reference"}),
-        data=data, text=None, audio=AudioCondition(), val_metrics=(),
+        data=data, text=None, audio=AudioCondition(checkpoint=str(towers / "wav2vec2")), val_metrics=(),
         objective=ObjectiveConfig("diffusion", {"steps": 4, "guidance": CFG(2.0), "ema_decay": None}))
     objective = config.build()
-    assert objective.inputs.conditions["textcontext"].encoder.seconds == data.audio_seconds
-    assert DiffusionRunConfig.from_dict(config.to_dict()) == config
-    dataset = loader(data, batch=8, read="memory", loading=Loading(workers=0),
-                   host=objective.data().train_batch)
+    assert objective.inputs.conditions["textcontext"].encoder.seconds == seconds
+    assert DiffusionRunConfig.from_dict(config.to_dict()).to_dict() == config.to_dict()
+    dataset, _ = fitted(data, None, objective=objective.data())
     batch = next(dataset.train(DataPartition()))
     assert set(batch) == {"video", "audio", "audio_valid"} and set(batch["audio"]) == {"input_values"}
 
@@ -165,7 +169,7 @@ def test_an_audio_conditioned_video_run_learns_and_samples_from_audio(towers, tm
     assert statistic > 7.0, (statistic, drop.mean())
 
     pipe = objective.pipeline(state, ema=False)
-    low, high = (pipe([{"audio": _tone(hertz, data.audio_seconds)}], key=0).host().images
+    low, high = (pipe([{"audio": _tone(hertz, seconds)}], key=0).host().images
                  for hertz in (220, 880))
     assert low.shape == (1, 2, 8, 8, 3)
     assert np.abs(low - high).max() > 1e-3
@@ -174,8 +178,8 @@ def test_an_audio_conditioned_video_run_learns_and_samples_from_audio(towers, tm
 def test_audio_conditioning_is_refused_beside_text_or_without_clip_audio():
     """The audio takes the models' one context keyword, so a run naming text
     too is refused, and so is a dataset whose samples carry no audio."""
+    silent = Files("clips", format="files").pipe(presets.video, 2 / 25, frames=2, fps=25, size=8, batch=8)
     with pytest.raises(ValueError):
-        DiffusionRunConfig(data=VideoData(source="clips"), audio=AudioCondition())
+        DiffusionRunConfig(data=silent, audio=AudioCondition())
     with pytest.raises(ValueError):
-        DiffusionRunConfig(data=ImageData(source="tfds://oxford_flowers102"), text=None,
-                           audio=AudioCondition())
+        DiffusionRunConfig(data=images_of("tfds://oxford_flowers102", 32), text=None, audio=AudioCondition())

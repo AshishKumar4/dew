@@ -63,13 +63,41 @@ class Export:
         return 0
 
 
+def chain_of(named: str, branch: Literal["train", "validation"], trust: tuple[str, ...] = ()):
+    """The chain `named` names as a `dew.data.compile` pipeline: a Python file's `data`, or with
+    `branch="validation"` its `validation` (each a chain, or a function returning one); a chain's
+    record (a `.json` file `dew.data.records` reads); or a store's URL (`dew.data.sources.source`).
+    Raises ValueError for a file that holds no such chain, or a store asked for its validation."""
+    from dew.data import records
+    from dew.data.pipeline import Dataset
+    from dew.data.sources import source
+
+    path = Path(named)
+    if path.suffix == ".py":
+        sys.path.insert(0, str(path.resolve().parent))
+        module = importlib.import_module(path.stem)
+        held = getattr(module, "data" if branch == "train" else "validation", None)
+        chain = held() if callable(held) and not isinstance(held, Dataset) else held
+    elif path.suffix == ".json":
+        chain = records.decode(json.loads(path.read_text()), trust=trust)
+    elif branch == "validation":
+        raise ValueError(f"{named} is a store, which holds no validation chain; name a Python file's")
+    else:
+        chain = source(named)
+    if not isinstance(chain, Dataset):
+        name = "data" if branch == "train" else "validation"
+        raise ValueError(f"{named} holds no {name} chain, but {chain!r}")
+    return chain._chain()
+
+
 @dataclasses.dataclass(frozen=True)
 class DataExport:
-    """Export a recipe's deterministic records to committed storage."""
+    """Export a chain's deterministic records to committed storage."""
 
-    recipe: Positional[str]
+    data: Positional[str]
+    """A Python file whose `data` (or `validation`, `--branch`) is a chain, a chain's `.json` record, or a
+    store's URL (`chain_of`)."""
     destination: Positional[str]
-    fields: str = "{}"
     format: Literal["parquet", "array_record"] | None = None
     """Parquet for records, ArrayRecord for token stores unless explicitly named."""
     rows_per_shard: int = 100_000
@@ -82,29 +110,20 @@ class DataExport:
     def run_command(self) -> int:
         from dew.data.compile import iterate
         from dew.data.sinks import export
-        from dew.records import record
-        from dew.registry import datasets
 
         format = self.format or ("array_record" if self.tokenizer is not None else "parquet")
         if self.tokenizer is not None and format != "array_record":
             raise ValueError("token exports must use --format array_record")
-        recipe = datasets.build(self.recipe, record(json.loads(self.fields), "recipe fields"))
-        train, held, _ = recipe.pipelines()
-        pipeline = train if self.branch == "train" else held
-        if pipeline is None:
-            raise ValueError(f"{self.recipe} has no validation source")
-        metadata = None
+        pipeline = chain_of(self.data, self.branch)
         if self.tokenizer is not None:
-            from dew.data.text import Tokenize, tokenizer_for
+            from dew.data.text import export_tokens
 
-            vocabulary = tokenizer_for(self.tokenizer)
-            pipeline = pipeline.map(Tokenize(self.tokenizer, eos=self.eos))
-            metadata = {"token_store": True, "tokenizer": self.tokenizer,
-                        "vocab_size": vocabulary.vocab_size, "dtype": "int32",
-                        "eos_id": vocabulary.eos_id if self.eos else None}
-        manifest = export(iterate(pipeline, read=self.read, provision=self.provision),
-                          self.destination, format=format, rows_per_shard=self.rows_per_shard,
-                          metadata=metadata, length_field="text" if self.tokenizer is not None else None)
+            manifest = export_tokens(pipeline, self.destination, self.tokenizer, eos=self.eos,
+                                     rows_per_shard=self.rows_per_shard, read=self.read,
+                                     provision=self.provision)
+        else:
+            manifest = export(iterate(pipeline, read=self.read, provision=self.provision), self.destination,
+                              format=format, rows_per_shard=self.rows_per_shard)
         emit(json.dumps(manifest, sort_keys=True))
         return 0
 
@@ -125,11 +144,11 @@ class DataProvision:
 
 @dataclasses.dataclass(frozen=True)
 class DataPublish:
-    """Fill and publish a deterministic recipe prefix to the artifact cache."""
+    """Fill and publish a chain's deterministic prefix to the artifact cache."""
 
-    recipe: Positional[str]
+    data: Positional[str]
+    """A Python file's chain, a chain's `.json` record, or a store's URL, as `DataExport` reads it."""
     destination: Positional[str]
-    fields: str = "{}"
     branch: Literal["train", "validation"] = "train"
     read: Literal["memory", "indexed", "streamed"] = "streamed"
     provision: bool = False
@@ -137,14 +156,8 @@ class DataPublish:
     def run_command(self) -> int:
         from dew.data.cache import Cache
         from dew.data.compile import publish
-        from dew.records import record
-        from dew.registry import datasets
 
-        recipe = datasets.build(self.recipe, record(json.loads(self.fields), "recipe fields"))
-        train, held, _ = recipe.pipelines()
-        pipeline = train if self.branch == "train" else held
-        if pipeline is None:
-            raise ValueError(f"{self.recipe} has no validation source")
+        pipeline = chain_of(self.data, self.branch)
         generation = publish(pipeline, Cache(self.destination), read=self.read, provision=self.provision)
         emit(f"published {generation.url}")
         return 0
@@ -179,8 +192,11 @@ class Train:
                 raise TypeError(f"{self.run}'s run is {built!r}, not a run config")
             if built.trainer.name is None:
                 built = dataclasses.replace(built, trainer=dataclasses.replace(built.trainer, name=path.stem))
-            # What trains is what the record reads back as, so its run.json trains the same run.
-            run = RunConfig.read(built.record(), trust=(*self.trust, path.stem))
+            # What trains is what the record reads back as, so its run.json trains the same run; a chain
+            # the record cannot describe trains as Python built it, and its run.json says why it can't
+            # be rebuilt (`RunConfig.unrecorded`).
+            run = (built if built.unrecorded()
+                   else RunConfig.read(built.record(), trust=(*self.trust, path.stem)))
         run.assigned(self.set).run()
         return 0
 

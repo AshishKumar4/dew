@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Callable, Iterator, Mapping
+from collections.abc import Callable, Container, Iterable, Iterator, Mapping
 from typing import TYPE_CHECKING
 
 import jax
@@ -90,6 +90,21 @@ def checkpoint_array(tensor, param_dtype: str = "float32") -> np.ndarray:
     """Cast a stored floating array directly, without an FP32 intermediate."""
     leaf = np.asarray(tensor)
     return leaf.astype(checkpoint_dtype(leaf.dtype, param_dtype), copy=False)
+
+
+def indexed_path(tokens: Iterable[str], *, indexed: Container[str] | None = None) -> tuple[str, ...]:
+    """A source tensor name's dotted tokens as Linen's path: each numeric token joins the token before it
+    (`down_blocks.0` → `down_blocks_0`) where that token, as folded so far, is one of `indexed` (any token,
+    where None; none, where empty). Unrestricted, consecutive digits all join it (`a.0.1` → `a_0_1`);
+    with `indexed`, the second joins only where the folded token (`a_0`) is itself in it. A leading
+    numeric token, or one after a token `indexed` leaves out, stays its own."""
+    path: list[str] = []
+    for token in tokens:
+        if token.isdigit() and path and (indexed is None or path[-1] in indexed):
+            path[-1] = f"{path[-1]}_{token}"
+        else:
+            path.append(token)
+    return tuple(path)
 
 
 def insert[LeafT](tree: Tree[LeafT], path: tuple[str, ...], leaf: LeafT, name: str) -> None:

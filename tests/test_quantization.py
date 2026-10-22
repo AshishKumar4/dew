@@ -480,6 +480,24 @@ def test_a_convolution_no_rule_quantizes_computes_as_unwrapped_and_as_qwix_does(
     np.testing.assert_array_equal(jax.jit(served.apply)(served_variables, x), plain[0])
 
 
+def test_a_recorded_kernel_no_rule_matches_multiplies_by_its_own_recipe():
+    """A served kernel stored quantized that reaches a matmul under rules naming none of it, as an unpacked
+    task's member does under a rule naming its packed group, multiplies by the recipe it records: its
+    weight-only logits bit for bit those of the rules that quantized it. Rules that quantize activations
+    refuse it, whose recipe the kernel does not record."""
+    pytest.importorskip("qwix")
+    model, _, variables, ids = quantized_forward(Quantization(weight_only=True, patterns=(".*_proj",)))
+    quantized = Quantization(weight_only=True, patterns=(".*_proj",))
+    served, served_variables = quantize_for_serving(model, variables, quantized, ids)
+    nothing = Quantization(weight_only=True, patterns=("none",))
+    unmatched, _ = quantize_for_serving(model, variables, nothing, ids)
+    np.testing.assert_array_equal(jax.jit(unmatched.apply)(served_variables, ids),
+                                  jax.jit(served.apply)(served_variables, ids))
+    activations, _ = quantize_for_serving(model, variables, Quantization(patterns=("none",)), ids)
+    with pytest.raises(ValueError):
+        activations.apply(served_variables, ids)
+
+
 def test_serving_stores_int8_kernels_and_computes_what_training_quantized():
     """Served weights are int8 values with their scales, and the served
     projections reproduce the quantized-training forward they were trained
@@ -933,16 +951,17 @@ def image_batches(batch):
 def diffusion_run(directory, batch=RUN_BATCH, **trainer):
     """The smallest unconditional diffusion run: a tiny DiT over 8-pixel
     images, one step, nothing written but the record."""
+    from diffusion_support import images_of
+
     from dew.config import ModelConfig, TrainerConfig
-    from dew.config.data import ImageData
     from dew.objectives.diffusion import DiffusionRunConfig
 
     return DiffusionRunConfig(
         model=ModelConfig("simple_dit", {"patch_size": 4, "emb_features": 16,
                                          "num_layers": 1, "num_heads": 2, "dtype": "float32"}),
-        data=ImageData(source="tfds://oxford_flowers102", split="all", image_size=RES), text=None,
+        data=images_of("tfds://oxford_flowers102", RES, batch=batch), text=None,
             val_metrics=(),
-        trainer=TrainerConfig(name="quantized", checkpoint_dir=str(directory), batch_size=batch,
+        trainer=TrainerConfig(name="quantized", checkpoint_dir=str(directory),
                               steps=1, eval_every=None, checkpoint_every=None,
                               compilation_cache_dir=None, **trainer), objective=ObjectiveConfig("diffusion",
                               {"guidance": None, "steps": 2}))
@@ -1262,8 +1281,7 @@ def training_on_xla_default_options_flow():
 def assert_step_moves_by_the_hosts_gradient():
     """One SGD step of the trainer over a decoder quantized to int8 moves its weights by the gradient
     of its loss the host computes."""
-    from dew.config.data import RecordsData, loader
-    from dew.data import Loading
+    from dew.data import Loading, Memory
     from dew.training.trainer import Trainer
 
     # Eight rows, one on each of the host's eight test devices.
@@ -1271,8 +1289,8 @@ def assert_step_moves_by_the_hosts_gradient():
     batch = {"text": np.random.default_rng(0).integers(0, VOCAB, (8, length + 1)).astype(np.int32)}
     held = jax.device_get(tiny().init(jax.random.key(0), jnp.ones((1, length), jnp.int32)))
     objective = LMObjective(spec.apply(tiny()), seq_len=length, ema_decay=None, variables=held)
-    data = loader(RecordsData(source=[{"text": row} for row in batch["text"]]), batch=8,
-                  loading=Loading(workers=0, threads=1, read_buffer=1), read="memory")
+    rows = Memory([{"text": row} for row in batch["text"]]).read("memory")
+    data = rows.shuffle().repeat().batch(8).loading(Loading(workers=0, threads=1, read_buffer=1))
     state = Trainer(objective, optax.sgd(1.0), key=0).fit(data, steps=1, log_every=100)
     moved = jax.tree.map(lambda before, after: np.asarray(before, np.float64) - np.asarray(after, np.float64),
                          held["params"], jax.device_get(state.variables["params"]))

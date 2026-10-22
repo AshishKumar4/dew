@@ -118,25 +118,23 @@ Import `TrainState` from `dew.training`.
 
 ## Dataset, Loader and Loading
 
-Import stores, chains, `load` and `Loading` from `dew.data`, `compile` from `dew.data.compile`, and run specs and `loader` from `dew.config.data`. `Loader` and `DataPartition` are in `dew.data.dataset`.
+Import sources, `Dataset`, the step modules, `presets` and `Loading` from `dew.data`, and `compile` from `dew.data.compile`. `Loader` and `DataPartition` are in `dew.data.dataset`.
 
-<!-- api: dew.data.load.load dew.config.data.loader dew.data.compile.compile dew.data.dataset.Loader dew.data.dataset.DataPartition dew.data.Loading -->
+<!-- api: dew.data.Dataset dew.data.presets.lm dew.data.presets.images dew.data.compile.compile dew.data.dataset.Loader dew.data.dataset.DataPartition dew.data.Loading -->
 
-`load("hf/<repo>")` and `load("tfds/<builder>")` read a dataset by name: packed language-model rows where `tokenizer=` or `seq_len=` asks for them, batched records otherwise. Text holds out 1% of document identities before tokenization; records hold out the first 256. `hf/<repo>@<revision>` pins a Hub revision and `tfds/<builder>:<version>` a TFDS version. A `Dataset` is also accepted. Other source locations use `Hub()`, `TFDS()` or `Files()`.
+A source is already a `Dataset`, and every verb returns a new one. A preset of `dew.data.presets` (`images`, `lm`, `sft`, `prompts`, `preferences`, `canvas` or `clips`) is a function from a dataset and its settings to a dataset, applied with `pipe`. It ends in `batch`, so its result goes to `Trainer.fit`, which compiles it into a `Loader`. Validation is a second dataset, `fit(..., validation=)`, usually a part of `holdout` through the same preset; nothing is held out unless the chain says so.
 
-A run spec is a frozen value implementing `RunData.pipelines()`: it returns the training Pipeline, an optional finite validation Pipeline and common host steps. Every data spec has `.load(**options)`, which calls `loader` with that spec. Each spec has an alias in `dew.registry.datasets`, such as `records`, `text`, `chat`, `images` or `video`. Source URLs belong in `source`; `loader` refuses a bare URI. `TextData` defaults to EOS and a 1% token-axis holdout when no validation is named, keeping a token store's own validation split. `ImageData` defaults to a 256-record holdout.
+`batch(tokens=N)` selects token-budget batching: rows of the fixed length a record step declares (`TokenGeometry`), as many as `N` tokens hold. The compiled Loader exposes `batch_tokens`. Row and token budgets are mutually exclusive. A run configuration takes the micro-batch from its chain and `update_tokens` from `TrainerConfig`, and records the derived update/micro accumulation.
 
-`spec.load(batch=None, tokens=N)` selects token-budget batching: rows of the fixed length a record step declares (`TokenGeometry`), as many as `N` tokens hold. The compiled Loader exposes `batch_tokens`. Row and token budgets are mutually exclusive. Run configurations set TrainerConfig.batch_size=None, batch_tokens and update_tokens, and record the derived update/micro accumulation.
-
-`Pipeline(source)` is immutable. Its methods add ordered stages: `map`, `random_map`, `map_with_index`, `filter`, `filter_map`, `random_filter_map`, `flat_map`, `shuffle`, `repeat`, `slice`, `mix`, `interleave`, `windows`, `pack`, `batch`, `workers`, `prefetch`, `take` and `cache`; a `map` after `batch` is a host step on the training batch. `batch` takes the global row batch. Host batch steps run after workers in the training process. `compile(..., host=(step,))` applies common steps to both branches.
+A `Dataset` is immutable. Its methods add ordered stages: `map`, `random_map`, `map_with_index`, `filter`, `filter_map`, `random_filter_map`, `flat_map`, `shuffle`, `repeat`, `slice`, `mix`, `interleave`, `windows`, `pack`, `batch`, `workers`, `prefetch`, `take` and `cache`; a `map` after `batch` is a host step on the training batch. `batch` takes the global row batch. Host batch steps run after workers in the training process. `compile(..., host=(step,))` applies common steps to both branches.
 
 Sources implement `Source`: `Memory` holds records or columns, `Files` opens a format over URLs, `Hub` opens prepared Arrow or physical Hub Parquet shards, `TFDS` opens prepared ArrayRecords, and `Torch` adapts map-style PyTorch samples with explicit tuple field names. A `DataLoader` keeps its own sampler and collator and is refused.
 
-`read="memory"` materializes deterministic transforms and packing. `read="indexed"` requires a producer index or provisioning. `read="streamed"` reads physical shards. The mode applies to every leaf, including validation; with no `read`, the sources choose it. `dew.data.load` provisions what the read needs, logging each artifact it prepares; with `provision=False`, a missing artifact is a named error.
+`read="memory"` materializes deterministic transforms and packing. `read="indexed"` requires a producer index or provisioning. `read="streamed"` reads physical shards. The mode applies to every leaf, including validation; with no `read`, the sources choose it. `Trainer.fit` provisions what the read needs, logging each artifact it prepares; under `compile`'s default, `provision=False`, a missing artifact is a named error.
 
 `Objective.data()` returns `ObjectiveData`, holding train and evaluation record steps and host batch steps for each branch. `ObjectiveData.pack` optionally packs those records into fixed windows, and `ObjectiveData.packed` runs record steps on each window before batching. It does not change `Objective.inputs`. Metadata-dependent steps use `Configured`; the compiler binds their declared facts from the source.
 
-`HoldOut(records=N)` reserves the source's head, `HoldOut(fraction=f, by="hash")` splits immutable record identities, and `Split(name)` opens a named split. An explicit source or Pipeline is also valid. `validation_records` caps accepted records before the share cut.
+`holdout(records=N)` reserves the source's head, `holdout(f)` splits immutable record identities, and `holdout(split=name)` opens a named split. A second dataset of your own is also valid validation. A preset's `records=` caps accepted records before the share cut.
 
 `train(partition)` opens a new training iterator. `val(partition)` opens one finite pass, or is `None` without validation. Its final partial batch is filled with repeats marked by `valid_rows=False`. `DataPartition.of(mesh)` selects the process's share; `DataPartition()` reads all rows.
 
@@ -144,7 +142,7 @@ Sources implement `Source`: `Memory` holds records or columns, `Files` opens a f
 
 A global count-preserving or memory-materialized plan resumes across process counts dividing its batch. A streamed, rejecting, expanding or online-packed plan saves exact Grain iterator state per share and refuses topology changes. Volatile fetches cannot claim exact resume before their bytes are persisted.
 
-`Loading` changes concurrency without changing record order or draws. `dew.data.load` defaults to `Loading(workers=0)`, which reads in the training process; spec `.load()` defaults to Grain's memory-budgeted auto tuning. A multiprocessing program needs a main guard.
+`workers(n)`, `threads(n)`, `prefetch(n)` and `loading(Loading(...))` change concurrency without changing record order or draws. A chain that names none reads in the training process (`workers=0`); `Loading(workers="auto")` takes Grain's memory-budgeted tuning. A multiprocessing program needs a main guard.
 
 Each factory returns an exclusively owned iterator. Final `close()` must not race iteration or checkpoint operations. `request_stop()`, where supplied, is a nonblocking signal safe alongside both. The compiler's host stages forward ownership and position.
 
