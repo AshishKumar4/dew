@@ -385,11 +385,14 @@ class LocalTracker(_OwnedTracker):
         if self._closed:
             return
 
+        def plotted() -> None:
+            self.plot_files()
+
         def closed() -> None:
             self._closed = True
 
         try:
-            plots = [("Journal plots", self.plot_files)] if self.plots else []
+            plots = [("Journal plots", plotted)] if self.plots else []
             attempted([*plots, ("Journal state", closed),
                        *((f"Journal close of {name}", handle.close) for name, handle in self._files.items())])
         finally:
