@@ -67,6 +67,11 @@ COMPARISONS = {
                                      "keep = np.abs(rows - 1) < window", 1),
     "a mask of positions changed in place": ("import numpy as np\nrows = np.arange(n)\nrows[0] = 0.5\n"
                                              "keep = np.abs(rows - 1) < window", 1),
+    # The gate's one-draw rules, a comparison each call until it judges through check 1.
+    "the one-draw rule": ("from reference_error import assert_as_exact_as_the_reference\n"
+                          "assert_as_exact_as_the_reference(dew, reference, truth, 'leaf')", 1),
+    "check 1": ("from reference_error import assert_as_exact\n"
+                "assert_as_exact(dew, reference, draw, 'leaf', seeds=8)", 0),
     # A band around a float target, in an assertion (`_band`), each way round and as a conjunction.
     "a time bounded on both sides": ("assert 2.25 <= long_seconds / short_seconds <= 3.75", 1),
     "a band written the other way": ("assert 3.75 >= ratio >= 2.25", 1),

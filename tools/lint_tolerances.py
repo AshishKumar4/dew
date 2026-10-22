@@ -59,6 +59,12 @@ TOLERANCE_KEYWORDS = frozenset({"atol", "rtol"})
 TOLERANCE_NAME = re.compile(r"(?:^|_)(?:tolerance|tol|atol|rtol)s?$", re.IGNORECASE)
 
 
+ONE_DRAW = frozenset({"reference_error.assert_as_exact_as_the_reference",
+                      "reference_error.assert_leaves_as_exact"})
+"""The gate's one-draw rules, a comparison each call until it judges through check 1's drawn seeds
+(`assert_as_exact`), under the inventory's ratchet (Main's ruling)."""
+
+
 def _called(node: ast.Call, table: Mapping[str, str]) -> str:
     """A call's API through the scope's imports, or its bare built-in name (`abs`)."""
     called = scopes.resolved(node.func, table)
@@ -682,7 +688,8 @@ def comparisons(tree: ast.Module, tables: Mapping[int, Mapping[str, str]], calls
                 ) -> Iterator[tuple[ast.AST, str]]:
     """Each place a file compares floats within a tolerance, and what it is (its nodes' import tables
     `tables`, its calls' definitions `calls`, and what its own file proves of a function it imports,
-    `imported` of its dotted name): a tolerance API not told to
+    `imported` of its dotted name): a call of the gate's one-draw rules (ONE_DRAW), a tolerance API not
+    told to
     compare exactly (`_exact`), `atol` or `rtol` handed to any call, an ordering relation that compares
     within a tolerance (`_relation`), and a name bound to a tolerance. What is known of a value only
     adds findings: nothing is exempted as whole or as a time, so a bound on a count, a time or a mask
@@ -701,7 +708,9 @@ def comparisons(tree: ast.Module, tables: Mapping[int, Mapping[str, str]], calls
             if isinstance(node, ast.Call):
                 called = _called(node, tables.get(id(node), {}))
                 method = isinstance(node.func, ast.Attribute) and node.func.attr in TOLERANT_METHODS
-                if (called in TOLERANT or method) and not _exact(node, called):
+                if called in ONE_DRAW:
+                    yield node, f"`{called.rsplit('.', 1)[1]}`, the one-draw rule, not check 1's drawn seeds"
+                elif (called in TOLERANT or method) and not _exact(node, called):
                     yield node, f"`{called or node.func.attr}`"
                 elif called in BOUNDED and node.args and _erring(node.args[0], scope, reading):
                     yield node, f"`{called}` of an error"
