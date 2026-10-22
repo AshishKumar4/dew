@@ -44,6 +44,9 @@ Scope is per rule, because the rules are not all about the same thing:
   still hold such comparisons are the inventory
   (`tools/tolerance_inventory.json`), each at its count and lane, and it only
   shrinks.
+- SLOP021 is about every file: a private attribute of JAX's own objects
+  (`JAX_PRIVATE`) is read nowhere (bible: no private attributes of other
+  libraries), whose public way the finding names.
 
 Every rule fails the gate, and none has a per-finding suppression.
 
@@ -628,6 +631,21 @@ def mocks(module: Module) -> Iterator[Finding]:
             continue
         yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP008",
                       f"patches {target}; the fix is a seam the test can pass a double to")
+
+
+JAX_PRIVATE = {
+    "_cache_size": "count the programs a jitted function needs with dew.telemetry.instrumentation.Compiles",
+}
+"""The private attributes of JAX's objects Dew has read, each with the public way to what it was read
+for."""
+
+
+def jax_private(module: Module) -> Iterator[Finding]:
+    """SLOP021: a read of a private attribute of JAX's objects (`JAX_PRIVATE`)."""
+    for node in ast.walk(module.tree):
+        if isinstance(node, ast.Attribute) and node.attr in JAX_PRIVATE:
+            yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP021",
+                          f"reads JAX's private {node.attr}; {JAX_PRIVATE[node.attr]}")
 
 
 def size(module: Module) -> Iterator[Finding]:
@@ -2014,7 +2032,7 @@ def tolerances(module: Module) -> Iterator[Finding]:
 
 
 CONTRACT_RULES = (contracts, probes, names, imports, calls, authorities, waits, detections)
-UNIVERSAL_RULES = (suppressions, swallowed, comments, size)
+UNIVERSAL_RULES = (suppressions, swallowed, comments, size, jax_private)
 
 
 def check(module: Module, models: ModelIndex | None = None) -> Iterator[Finding]:
