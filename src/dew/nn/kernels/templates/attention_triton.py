@@ -219,7 +219,7 @@ def _forward_kernel(*refs, spec: algebra.Forward, score_kinds: tuple[Kind, ...],
     def step(index, state: algebra.Partial) -> algebra.Partial:
         _, _, _, m, factor, weights, value, held = softmax(index, state)
         product = _dot(algebra.narrow(weights, value.dtype), value, interpret)
-        return algebra.stepped(state, m, factor, weights, product, held, _small(held, value, interpret))
+        return algebra.stepped(state, m, factor, weights, product, held, _plain(held, value, interpret))
 
     def tracked(index, carry: tuple[algebra.Partial, algebra.Argmax, jax.Array, jax.Array]):
         # A training forward's step: the anchor key and the split sums the backward reads
@@ -233,8 +233,9 @@ def _forward_kernel(*refs, spec: algebra.Forward, score_kinds: tuple[Kind, ...],
         product = _dot(others, value, interpret)
         acc, own, others_total = algebra.split_accumulate(state.acc, own, others_total, factor, moved,
                                                           value_ref[arg.key, :], product, others, own_tile,
-                                                          held, small := _small(held, value, interpret))
-        stepped = algebra.stepped(state, m, factor, weights, jnp.zeros_like(acc), held, small)
+                                                          held)
+        stepped = algebra.stepped(state, m, factor, weights, jnp.zeros_like(acc), held,
+                                  _plain(held, value, interpret))
         return stepped._replace(acc=acc), anchor, own, others_total
 
     def start(live) -> algebra.Partial:
@@ -254,17 +255,9 @@ def _forward_kernel(*refs, spec: algebra.Forward, score_kinds: tuple[Kind, ...],
     output_params = tuple(_tile_param(ref, kind, head, q_pos, None)
                           for ref, kind in zip(output_refs, output_kinds, strict=True))
 
-    def written(walked):
-        if flag_ref is not None:
-            weighted = _weighted(value_ref, walked) if residuals else walked.acc
-            flag_ref[...] = algebra.overflowed(weighted).astype(jnp.float32)
-        state = _split_written(walked, value_ref, residual_refs) if residuals else walked
-        out, m, denominator = algebra.finish(spec, state, initial=initial, output_mod=output_mod,
-                                             output_params=output_params)
-        out_ref[...] = out.astype(out_ref.dtype)
-        if residuals:
-            residual_refs[0][...] = m
-            residual_refs[1][...] = denominator
+    written = functools.partial(_written, spec, value_ref=value_ref, out_ref=out_ref,
+                                residual_refs=residual_refs, flag_ref=flag_ref, residuals=residuals,
+                                initial=initial, output_mod=output_mod, output_params=output_params)
 
     if flags_ref is None:
         written(walk())
@@ -278,9 +271,9 @@ def _forward_kernel(*refs, spec: algebra.Forward, score_kinds: tuple[Kind, ...],
         written(walk(live))
 
 
-def _small(held: algebra.Room | None, value: jax.Array, interpret: bool) -> jax.Array | None:
-    """A guarded tile's small weights' product with its values (`algebra.Room.small`), None unguarded."""
-    return None if held is None else _dot(algebra.narrow(held.small, value.dtype), value, interpret)
+def _plain(held: algebra.Room | None, value: jax.Array, interpret: bool) -> jax.Array | None:
+    """A guarded tile's unshifted weights' product with its values (`algebra.Room.plain`), None unguarded."""
+    return None if held is None else _dot(algebra.narrow(held.plain, value.dtype), value, interpret)
 
 
 def _weighted(value_ref, carry) -> jax.Array:
@@ -290,16 +283,37 @@ def _weighted(value_ref, carry) -> jax.Array:
     return algebra.split_output(split.acc, own, value_ref[arg.key, :])
 
 
-def _split_written(walked, value_ref, residual_refs) -> algebra.Partial:
+def _written(spec, walked, *, value_ref, out_ref, residual_refs, flag_ref, residuals: bool, initial: bool,
+             output_mod, output_params):
+    """A forward walk's output and residuals written: which rows overflowed where the launch flags them,
+    the split sums and anchors of a training walk (`_split_written`), and the normalized output with its
+    maximum and denominator."""
+    if flag_ref is not None:
+        weighted = _weighted(value_ref, walked) if residuals else walked.acc
+        flag_ref[...] = algebra.overflowed(weighted).astype(jnp.float32)
+    if residuals:
+        walked = _split_written(spec, walked, value_ref=value_ref, residual_refs=residual_refs,
+                                initial=initial)
+    out, m, denominator = algebra.finish(spec, walked, initial=initial, output_mod=output_mod,
+                                         output_params=output_params)
+    out_ref[...] = out.astype(out_ref.dtype)
+    if residuals:
+        residual_refs[0][...] = m
+        residual_refs[1][...] = denominator
+
+
+def _split_written(spec, walked, *, value_ref, residual_refs, initial: bool) -> algebra.Partial:
     """A training walk's anchors, split sums and shifts written to their residuals, and its state with the
-    split sums joined, which the output normalizes."""
+    split sums joined, which the output normalizes; a guarded row's split sums normalized from its output
+    (`algebra.normalized_split`)."""
     split, arg, own, others_total = walked
+    anchor_value = value_ref[arg.key, :]
+    state = split._replace(acc=algebra.split_output(split.acc, own, anchor_value))
     residual_refs[2][...] = arg.key
-    residual_refs[3][...] = split.acc
-    residual_refs[4][...] = own
-    residual_refs[5][...] = others_total
-    residual_refs[6][...] = jnp.zeros_like(own) if split.shift is None else split.shift
-    return split._replace(acc=algebra.split_output(split.acc, own, value_ref[arg.key, :]))
+    sums = algebra.split_residuals(spec, split, own, others_total, anchor_value, state, initial=initial)
+    for ref, part in zip(residual_refs[3:7], sums, strict=True):
+        ref[...] = part
+    return state
 
 
 @dataclasses.dataclass(frozen=True)

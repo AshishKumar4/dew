@@ -165,8 +165,8 @@ def _attend(query: jax.Array, span: tuple, read, block: int, spec: algebra.Forwa
         m, alpha = algebra.peak(spec, state.m, logits)
         weights, factor, held = algebra.tile(state, alpha, algebra.weights(spec, logits, m), value)
         product = _dot(algebra.narrow(weights, value.dtype), value, interpret)
-        small = None if held is None else _dot(algebra.narrow(held.small, value.dtype), value, interpret)
-        return algebra.stepped(state, m, factor, weights, product, held, small)
+        plain = None if held is None else _dot(algebra.narrow(held.plain, value.dtype), value, interpret)
+        return algebra.stepped(state, m, factor, weights, product, held, plain)
 
     def walk(live=None) -> algebra.Partial:
         # The plain walk where `live` is None, else the guarded one, those rows shifting.
