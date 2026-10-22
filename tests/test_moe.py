@@ -23,6 +23,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from interop_support import fixture_arrays
 from moe_support import by_expert, router_variables
 
 from dew.nn.mlp import GatedMLP
@@ -41,8 +42,7 @@ difference is 7.63e-06 on outputs that reach 34.9, the summation order's spread.
 
 
 def fixture(name: str) -> dict:
-    with np.load(FIXTURES / f"{name}.npz") as data:
-        return {key: np.asarray(value) for key, value in data.items()}
+    return fixture_arrays(FIXTURES / f"{name}.npz")
 
 
 def sparse_variables(tensors, num_experts):

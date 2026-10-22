@@ -19,7 +19,7 @@ import socket
 import sys
 import threading
 import types
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import TYPE_CHECKING, Literal, overload
 
 import jax
@@ -52,22 +52,29 @@ def _identity(*values: jax.Array) -> tuple[jax.Array, ...]:
     return values
 
 
-def _gather_groups(leaves: list[jax.Array]) -> list[list[int]]:
-    """`leaves`' positions in consecutive groups on one mesh, each of at most
-    GATHER_BYTES or one larger leaf. The same on every rank: it reads the
-    shapes, dtypes and shardings the ranks agreed in the gather plan."""
+def byte_groups[T](arrays: Sequence[T], budget: int, *, nbytes: Callable[[T], int],
+                   joins: Callable[[T, T], bool] = lambda first, array: True) -> list[list[int]]:
+    """`arrays`' positions in consecutive groups of at most `budget` bytes (`nbytes`), in order, an
+    array larger than the budget alone, and an array that `joins(first, array)` refuses to join its
+    group's first array starting a group of its own."""
     groups: list[list[int]] = []
     size = 0
-    for index, leaf in enumerate(leaves):
-        mesh = _mesh(leaf)
-        if (groups and mesh is not None and mesh == _mesh(leaves[groups[-1][0]])
-                and size + leaf.nbytes <= GATHER_BYTES):
+    for index, array in enumerate(arrays):
+        if groups and joins(arrays[groups[-1][0]], array) and size + nbytes(array) <= budget:
             groups[-1].append(index)
-            size += leaf.nbytes
+            size += nbytes(array)
         else:
             groups.append([index])
-            size = leaf.nbytes
+            size = nbytes(array)
     return groups
+
+
+def _gather_groups(leaves: list[jax.Array]) -> list[list[int]]:
+    """`leaves`' positions in consecutive groups on one mesh, each of at most
+    GATHER_BYTES or one larger leaf (`byte_groups`). The same on every rank: it reads the
+    shapes, dtypes and shardings the ranks agreed in the gather plan."""
+    return byte_groups(leaves, GATHER_BYTES, nbytes=lambda leaf: leaf.nbytes,
+                       joins=lambda first, leaf: _mesh(leaf) is not None and _mesh(leaf) == _mesh(first))
 
 
 def _gathered(group: list[jax.Array], held: bool) -> list[np.ndarray] | None:

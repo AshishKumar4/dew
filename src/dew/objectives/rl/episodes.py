@@ -21,12 +21,17 @@ from uuid import uuid4
 import jax
 import jax.numpy as jnp
 import numpy as np
-from jax.experimental import multihost_utils
 
-from dew.coordination import PeerFailure, agree_process_phase, agreed, broadcast_from_process_zero
+from dew.coordination import (
+    PeerFailure,
+    agree_process_phase,
+    agreed,
+    agreed_same,
+    broadcast_from_process_zero,
+)
 from dew.data.dataset import DataPartition
 from dew.inference.rollouts import check_ending
-from dew.nn.inputs import ModelInputs, local_rows, mesh_of
+from dew.nn.inputs import ModelInputs, mesh_of, pad_token_rows
 from dew.objectives.base import Batch, Variables
 from dew.sampling.text import Generation, Sampling
 from dew.training.state import TrainState
@@ -38,7 +43,9 @@ from .sessions import (
     Status,
     Transcript,
     check_credit,
+    finite_reward,
     json_objects,
+    local_task_ids,
     pack,
     sampled_values,
 )
@@ -231,14 +238,6 @@ _P = ParamSpec("_P")
 
 class _StatusStop(RuntimeError):
     """An environment returned an explicit error or cancellation outcome."""
-
-
-def finite_reward(value: float) -> float:
-    """Return a verifier's or reward's score as a float, refusing a non-finite one with ValueError."""
-    reward = float(value)
-    if not math.isfinite(reward):
-        raise ValueError(f"a reward must be a finite number, got {reward}")
-    return reward
 
 
 @dataclass
@@ -463,23 +462,16 @@ class EpisodeRollout:
         occupies its row: the shapes have to match across ranks, and its
         draw is discarded rather than skipped.
         """
-        tokens = np.full((len(slots), self.max_prompt_tokens), self.sampling.pad, np.int32)
-        valid = np.zeros_like(tokens, bool)
-        for row, slot in enumerate(slots):
+        contexts = []
+        for slot in slots:
             context = None
             if len(slot.transitions) == turn and slot.pending is None:
                 context = slot.next_context(max_prompt_tokens=self.max_prompt_tokens)
-            if context is not None:
-                tokens[row, -len(context):] = context
-                valid[row, -len(context):] = True
-            if not valid[row].any():
-                # Keep global row indices and collective shapes stable. The
-                # draw for a finished slot is discarded, never executed or trained.
-                valid[row, -1] = True
-        # Contexts that fill the width leave no padded slot, and a cohort of
-        # those carries no validity field at all.
-        fields = {} if valid.all() else {"attention_mask": jnp.asarray(valid)}
-        return ModelInputs(jnp.asarray(tokens), fields)
+            # A finished slot keeps its row, one padding id, so global row indices and collective
+            # shapes stay stable. Its draw is discarded, never executed or trained.
+            contexts.append([self.sampling.pad] if context is None or not len(context) else context)
+        tokens, fields = pad_token_rows(contexts, pad_id=self.sampling.pad, width=self.max_prompt_tokens)
+        return ModelInputs(jnp.asarray(tokens), {name: jnp.asarray(value) for name, value in fields.items()})
 
     def _advance(self, slots: list[EpisodeProgress], generation: Generation, policy_step: int,
                  binding_id: str, turn: int, run: JournalRun | None) -> None:
@@ -675,20 +667,17 @@ class EpisodeRollout:
             mesh = mesh_of(state.variables)
             if mesh is not None and DataPartition.of(mesh).readers > 1:
                 raise ValueError("native episodes do not support replicated data-share readers")
-            tasks = local_rows(batch["task_id"])
-            if tasks.ndim != 1 or not tasks.size or not np.issubdtype(tasks.dtype, np.integer):
-                raise ValueError("task_id must be a nonempty vector of integer task identities")
+            tasks = local_task_ids(batch)
             policy = self.policy.bind(state.variables)
             signature = (tasks.size, self.groups, self.max_turns, self.max_prompt_tokens,
                          self.max_new_tokens, self.sampling, int(state.step), int(state.updates),
                          tuple(np.asarray(jax.random.key_data(key)).tolist()), self.journal is not None)
-            return tasks, policy, np.frombuffer(hashlib.sha256(repr(signature).encode()).digest(), np.uint8)
-        tasks, policy, signature = agreed("episode preparation", prepare)
+            return tasks, policy, repr(signature)
+        tasks, policy, described = agreed("episode preparation", prepare)
+        described = agreed_same("episode cohort (task counts, budgets, sampling and clocks)",
+                                lambda: described)
+        signature = np.frombuffer(hashlib.sha256(described.encode()).digest(), np.uint8)
         processes, rank = jax.process_count(), jax.process_index()
-        if processes > 1:
-            multihost_utils.assert_equal(
-                signature, "episode task counts, budgets, sampling and clocks must agree"
-            )
         binding_id = broadcast_from_process_zero(uuid4().hex if rank == 0 else None)
         policy_step = int(state.updates)
         slots = self._slots(tasks, state, key, rank)

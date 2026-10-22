@@ -34,12 +34,13 @@ from dew.nn.backbones.decoder_block import Mixture
 
 
 def llama_config(hf_config, used):
-    # LlamaConfig declares attention_bias and no window: LlamaAttention
-    # attends every key. LlamaRotaryEmbedding builds any rope_type the rope
-    # utilities do, YaRN among them (modeling_llama.py:82-86).
+    # LlamaConfig declares attention_bias, mlp_bias and no window: LlamaAttention
+    # attends every key, and LlamaMLP's projections carry mlp_bias's biases.
+    # LlamaRotaryEmbedding builds any rope_type the rope utilities do, YaRN
+    # among them (modeling_llama.py:82-86).
     rope = read_rope(hf_config, used, records.integer(hf_config.get(
         'max_position_embeddings', DEFAULT_MAX_SEQ_LEN), 'max_position_embeddings'))
-    return base_config(hf_config, used, rope=rope, reads=frozenset({'attention_bias'}))
+    return base_config(hf_config, used, rope=rope, reads=frozenset({'attention_bias', 'mlp_bias'}))
 
 
 def ministral_config(hf_config, used):
@@ -80,15 +81,10 @@ def _granitemoe_config(hf_config: Mapping[str, object], used: set[str]) -> Decod
     """Read Granite's embedding, attention, residual and head multipliers.
 
     Every layer uses ordinary GQA and a normalized softmax MoE, without
-    shared experts or a balancing bias. The released activation_function
-    repeats hidden_act (default SiLU). Its router_jitter_noise is absent
-    from the pinned reference; only the released zero is accepted.
+    shared experts or a balancing bias. The reference reads hidden_act, not
+    the released activation_function beside it, and applies no
+    router_jitter_noise, so both are read as the reference reads them: not at all.
     """
-    if hf_config.get('activation_function', hf_config.get('hidden_act', 'silu')) != hf_config.get(
-        'hidden_act', 'silu'):
-        refuse('activation_function', 'it disagrees with hidden_act, which the reference reads')
-    if hf_config.get('router_jitter_noise', 0.0) != 0.0:
-        refuse('router_jitter_noise', 'the Granite reference applies no router jitter')
     used.update(('activation_function', 'router_jitter_noise'))
     config = llama_config(hf_config, used)
     for source, target in (('embedding_multiplier', 'embedding_multiplier'),

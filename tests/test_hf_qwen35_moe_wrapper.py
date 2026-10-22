@@ -63,13 +63,10 @@ def test_images_read_through_a_config_that_leaves_the_merge_size_to_its_default(
     """A Qwen 3.5 config may omit vision_config.spatial_merge_size, whose reference default is 2;
     the tower and merger are built at that default, so the processor places the images at it too
     and the model computes the conditional reference's logits."""
-    from shutil import copytree
+    from interop_support import without_config_field
 
-    checkpoint = tmp_path / 'checkpoint'
-    copytree(DIRECTORY, checkpoint)
-    config = json.loads((checkpoint / 'config.json').read_text())
-    del config['vision_config']['spatial_merge_size']
-    (checkpoint / 'config.json').write_text(json.dumps(config))
+    checkpoint = without_config_field(DIRECTORY, tmp_path / 'checkpoint',
+                                      'vision_config', 'spatial_merge_size')
     loaded = Pretrained.load(checkpoint, dtype='float32', attention_impl='reference')
     assert loaded.processor is not None
     images = np.load(DIRECTORY / 'raw_images.npy')
