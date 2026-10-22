@@ -37,13 +37,16 @@ MARGIN = 1e-4
 """The least gap a draw admits between the scores either side of a policy's cutoff, the top-k's last
 and the first outside it, or the two largest under greedy decoding: past it a float64 forward keeps
 the tokens the float32 policy kept."""
-SEEDS = {'attention cached scores': 8, 'mla cached scores': 8, 'recurrent cached scores': 8,
-         **{f"{kind} registered scores": 8 for kind in sorted(mixers.paths)},
-         'attention positions': 8, 'mla positions': 8, 'recurrent positions': 8,
-         'greedy padded generation': 8, 'sampled padded generation': 8,
-         'attention perplexity': 8, 'recurrent perplexity': 8, 'trainer update': 8,
-         'attention rescored generation': 8, 'mla rescored generation': 8, 'recurrent rescored generation': 8,
-         'attention cache capacity': 8, 'mla cache capacity': 8, 'recurrent cache capacity': 8}
+SEEDS = {'attention cache capacity': 32, 'attention cached scores': 16, 'attention perplexity': 16,
+         'attention positions': 8, 'attention rescored generation': 8, 'greedy padded generation': 32,
+         'mla cache capacity': 8, 'mla cached scores': 8, 'mla positions': 8,
+         'mla rescored generation': 16, 'recurrent cache capacity': 32, 'recurrent cached scores': 32,
+         'recurrent perplexity': 64, 'recurrent positions': 64, 'recurrent rescored generation': 16,
+         'sampled padded generation': 16, 'trainer update': 32, 'attention registered scores': 16,
+         'deepseek_v4 registered scores': 16, 'gated_delta_net registered scores': 64,
+         'kimi_delta_attention registered scores': 64, 'kpool_sparse_attention registered scores': 8,
+         'llama4 registered scores': 8, 'mamba registered scores': 8, 'mamba2 registered scores': 8,
+         'mla registered scores': 8, 'mlp registered scores': 16}
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada)."""
 
 
@@ -271,8 +274,9 @@ def test_padding_repro_greedy_and_seeded_reproducibility(sampling, name):
                         sampling=sampling)
 
     def padded(prompt, key):
-        return generate(model, params, ModelInputs(jnp.asarray(prompt), {"attention_mask": jnp.asarray(
-            np.arange(4)[None, :] >= 2)}), steps, key=jax.random.wrap_key_data(key), sampling=sampling)
+        mask = jnp.asarray(np.broadcast_to(np.arange(4)[None, :] >= 2, prompt.shape))
+        return generate(model, params, ModelInputs(jnp.asarray(prompt), {"attention_mask": mask}), steps,
+                        key=jax.random.wrap_key_data(key), sampling=sampling)
 
     def draw(seed):
         for attempt in range(64):
