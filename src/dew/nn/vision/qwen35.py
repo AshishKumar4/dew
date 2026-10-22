@@ -14,15 +14,18 @@ from dew.registry import Record
 
 from .common import (
     ProjectorBase,
+    ProjectorLayout,
     TowerBase,
     TowerGeometry,
+    TowerLayout,
     _vision_section,
     activation_name,
     block_tensor_path,
     head_width,
+    in_params,
     merger_projector,
 )
-from .vit import MergeProjector, VisionTransformer, ViTLayout
+from .vit import MergeProjector, VisionTransformer, ViTLayout, translate_vit_weights
 
 
 @dataclasses.dataclass(frozen=True)
@@ -146,3 +149,11 @@ def translate_qwen35_projector_config(hf_config: Mapping[str, object],
                                       text_width: int) -> Record:
     """A Qwen 3.5 wrapper's projector fields: trunk width, merge, output (`merger_projector`)."""
     return merger_projector(hf_config, text_width, "qwen3_5")
+
+
+Qwen35Vision.checkpoint = TowerLayout("visual.", in_params(qwen35_vision_path), read=translate_vit_weights)
+Qwen35Projector.checkpoint = ProjectorLayout("visual.merger.", {
+    "norm.weight": ("norm", "scale"), "norm.bias": ("norm", "bias"),
+    "linear_fc1.weight": ("fc1", "kernel"), "linear_fc1.bias": ("fc1", "bias"),
+    "linear_fc2.weight": ("fc2", "kernel"), "linear_fc2.bias": ("fc2", "bias"),
+}, strip="merger.")

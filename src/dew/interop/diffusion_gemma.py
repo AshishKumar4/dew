@@ -47,7 +47,8 @@ from dew.registry import from_record, projectors, towers
 VISION_PREFIX = "model.encoder.vision_tower."
 PROJECTION_PREFIX = "model.encoder.embed_vision."
 """Where a DiffusionGemma checkpoint keeps its Gemma 4 tower's and embedder's tensors: under its
-encoder, by the names a Gemma 4 wrapper gives them (`dew.nn.vision.TOWERS`, `PROJECTOR_PREFIX`)."""
+encoder, by the names a Gemma 4 wrapper gives them (`Gemma4Vision.checkpoint`,
+`Gemma4Projector.checkpoint`)."""
 
 
 # The wrapper config states these three with a default this assembly supplies

@@ -317,8 +317,8 @@ def wrapper_route(name: str, record: WrapperFields) -> tuple[str, str]:
     ones. A family that reads its media bundle whole keeps the decoder's
     tensors unprefixed.
     """
-    tower_prefix = vision_nn.TOWERS[_kind_name(record, "tower")].prefix
-    projector_prefix = vision_nn.PROJECTOR_PREFIX[_kind_name(record, "projector")]
+    tower_prefix = vision_nn.tower_layout(_kind_name(record, "tower")).prefix
+    projector_prefix = vision_nn.projector_layout(_kind_name(record, "projector")).prefix
     audio = record.get("audio") is not None
     bundled = _bundled(record["model_type"])
     bare = name.removeprefix("model.")

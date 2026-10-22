@@ -1,16 +1,88 @@
 """What every vision family shares: the tower and projector bases, the
-geometry a conditioner reads off a tower, the vision-config readers and the
-projector tensor table.
+geometry a conditioner reads off a tower, the vision-config readers, and where
+a kind's tensors sit in a media checkpoint (`TowerLayout`, `ProjectorLayout`),
+which each family's class holds and `dew.registry`'s kinds name.
 """
 
-import dataclasses
-from collections.abc import Collection, Mapping
+from __future__ import annotations
 
+import dataclasses
+from collections.abc import Callable, Collection, Mapping
+from typing import TYPE_CHECKING, ClassVar
+
+import numpy as np
 from flax import linen as nn
 
 from dew import records
 from dew.interop.decoder_parts import read_rope_theta
-from dew.registry import Record
+from dew.interop.weights import placed
+from dew.objectives.base import Variables
+from dew.registry import Record, projectors, towers
+
+if TYPE_CHECKING:
+    from dew.interop.streaming import WeightLayout
+
+type Reader = Callable[[Mapping[str, np.ndarray], Callable[[str], tuple[str, ...] | None], str],
+                       tuple[Variables, tuple[WeightLayout, ...]]]
+"""A tower's tensors into its variables in a storage dtype, with the layouts that write them back:
+`dew.interop.weights.placed`, or a patch-folding ViT's `translate_vit_weights`."""
+
+
+@dataclasses.dataclass(frozen=True)
+class TowerLayout:
+    """Where one tower kind's tensors sit in a media checkpoint and the leaves they fill: `prefix`
+    before every name, and `path` from a name past it to its leaf, rooted at its collection
+    (`params`, and Gemma 4's `constants` beside it). `read` binds them (`placed`, or, for a tower that
+    runs its patch convolution as one Dense map, `translate_vit_weights`). Loading
+    (`tower_variables`), routing a checkpoint's names (`hf_decoders`) and binding an export
+    (`interop.pretrained`) read it alike."""
+
+    prefix: str
+    path: Callable[[str], tuple[str, ...] | None]
+    read: Reader = placed
+
+    def variables(self, hf_tensors: Mapping[str, np.ndarray], param_dtype: str
+                  ) -> tuple[Variables, tuple[WeightLayout, ...]]:
+        """The tower's variables from its tensors, in the requested storage, and the layouts that
+        write each tensor it placed back from them; a tensor the tower does not compute with, as
+        SigLIP's pooling head, has none."""
+        return self.read(hf_tensors, self.path, param_dtype)
+
+
+def in_params(path: Callable[[str], tuple[str, ...] | None]) -> Callable[[str], tuple[str, ...] | None]:
+    """`path`, whose leaves are parameters, rooted at `params`."""
+    def rooted(name: str) -> tuple[str, ...] | None:
+        leaf = path(name)
+        return None if leaf is None else ("params", *leaf)
+    return rooted
+
+
+@dataclasses.dataclass(frozen=True)
+class ProjectorLayout:
+    """Where one projector kind's tensors sit in a media checkpoint and the leaves they fill:
+    `prefix` before every name (or several, whose tensors each keep the name past their own),
+    `tensors` each name's leaf path, `strip` a further prefix a name may carry (a merger's), and
+    `read` the projector's own reader where it checks its tensors (`placed` otherwise)."""
+
+    prefix: str | tuple[str, ...]
+    tensors: Mapping[str, tuple[str, ...]]
+    strip: str = ""
+    read: Callable[..., tuple[Variables, tuple[WeightLayout, ...]]] | None = None
+
+    def path(self, name: str) -> tuple[str, ...]:
+        """The leaf of tensor `name`, shared by load and source export."""
+        name = name.removeprefix(self.strip) if self.strip else name
+        if name not in self.tensors:
+            raise ValueError(f"unknown projector tensor {name!r}")
+        return self.tensors[name]
+
+    def variables(self, hf_tensors: Mapping[str, np.ndarray], param_dtype: str
+                  ) -> tuple[Variables, tuple[WeightLayout, ...]]:
+        """The projector's parameters, in the requested storage, and the layouts that write its
+        tensors back from them."""
+        if self.read is not None:
+            return self.read(hf_tensors, param_dtype=param_dtype)
+        return placed(hf_tensors, self.path, param_dtype)
 
 PIXEL_VALUES_KEY = "pixel_values"
 """The batch field carrying images as the checkpoint's processor emitted them."""
@@ -21,8 +93,11 @@ class ProjectorBase:
 
     Each kind is a frozen dataclass of the reference's field names, with an
     alias in `dew.registry.projectors` (`"gemma"`). `build` turns the value
-    into the Flax module. A record that names no known kind raises.
+    into the Flax module, and `checkpoint` says where its tensors sit. A
+    record that names no known kind raises.
     """
+
+    checkpoint: ClassVar[ProjectorLayout | None] = None
 
     def build(self) -> nn.Module:
         """The Flax module for this value."""
@@ -58,7 +133,10 @@ class TowerGeometry:
 
 
 class TowerBase:
-    """One tower kind's value: its fields, and how it builds its module."""
+    """One tower kind's value: its fields, how it builds its module, and where its tensors sit in a
+    media checkpoint (`checkpoint`, None for a tower read another way, as the audio towers are)."""
+
+    checkpoint: ClassVar[TowerLayout | None] = None
 
     def build(self) -> nn.Module:
         """The Flax module for this value."""
@@ -73,41 +151,6 @@ class TowerBase:
         whether it carries each one.
         """
         return TowerGeometry()
-
-
-_PROJECTOR_PATHS: dict[str, dict[str, tuple[str, ...]]] = {
-    "gemma": {
-        "mm_soft_emb_norm.weight": ("mm_soft_emb_norm", "scale"),
-        "mm_input_projection_weight": ("mm_input_projection", "kernel"),
-    },
-    "llama4": {"linear_1.weight": ("linear", "kernel")},
-    "gemma4": {"embedding_projection.weight": ("projection", "kernel")},
-    "qwen3_5": {
-        "norm.weight": ("norm", "scale"), "norm.bias": ("norm", "bias"),
-        "linear_fc1.weight": ("fc1", "kernel"), "linear_fc1.bias": ("fc1", "bias"),
-        "linear_fc2.weight": ("fc2", "kernel"), "linear_fc2.bias": ("fc2", "bias"),
-    },
-    # MiMo's merger stores no biases (MiMoVisionPatchMerger's released tensors).
-    "mimo": {"ln_q.weight": ("norm", "scale"), "mlp.0.weight": ("fc1", "kernel"),
-             "mlp.2.weight": ("fc2", "kernel")},
-    # Muse Glimmer's adapter and projection, each name its prefix off (`PROJECTOR_PREFIX`).
-    "muse_glimmer": {"fc1.weight": ("adapter", "fc1", "kernel"), "fc2.weight": ("adapter", "fc2", "kernel"),
-                     "weight": ("projection", "kernel")},
-    "gemma3n": {
-        "embedding.weight": ("embedding", "embedding"),
-        "hard_embedding_norm.weight": ("hard_embedding_norm", "scale"),
-        "soft_embedding_norm.weight": ("soft_embedding_norm", "scale"),
-        "embedding_projection.weight": ("embedding_projection", "kernel"),
-    },
-    # The aligner's maps under its `aligner.` prefix, and the span's learned
-    # vectors, which the release keeps at its top level (model.py:1215-1222).
-    "deepseek_v41": {
-        "w1.weight": ("w1", "kernel"), "w1.bias": ("w1", "bias"),
-        "w2.weight": ("w2", "kernel"), "w2.bias": ("w2", "bias"),
-        "image_start": ("image_start",), "image_newline": ("image_newline",),
-        "image_end": ("image_end",),
-    },
-}
 
 
 _BLOCK_NORMS = {"norm1": "input_layernorm", "norm2": "post_attention_layernorm"}
@@ -136,13 +179,26 @@ def block_tensor_path(parts: list[str], maps: Mapping[tuple[str, str], tuple[str
     return None
 
 
+def tower_layout(kind: str) -> TowerLayout:
+    """Where tower kind `kind`'s tensors sit: its class's `checkpoint` (`dew.registry.towers`)."""
+    return _held(towers[kind].checkpoint if kind in towers else None, "tower", kind)
+
+
+def projector_layout(kind: str) -> ProjectorLayout:
+    """Where projector kind `kind`'s tensors sit: its class's `checkpoint`
+    (`dew.registry.projectors`)."""
+    return _held(projectors[kind].checkpoint if kind in projectors else None, "projector", kind)
+
+
+def _held[Layout](layout: Layout | None, what: str, kind: str) -> Layout:
+    if layout is None:
+        raise ValueError(f"{what} kind {kind!r} has no weight map here")
+    return layout
+
+
 def projector_weight_path(kind: str, name: str) -> tuple[str, ...]:
     """The projector's canonical tensor path, shared by load and source export."""
-    if kind in ("qwen3_5", "mimo"):
-        name = name.removeprefix("merger.")
-    if kind not in _PROJECTOR_PATHS or name not in _PROJECTOR_PATHS[kind]:
-        raise ValueError(f"unknown {kind} projector tensor {name!r}")
-    return _PROJECTOR_PATHS[kind][name]
+    return projector_layout(kind).path(name)
 
 
 def _vision_section(hf_config: Mapping[str, object]) -> Mapping[str, object]:
