@@ -33,6 +33,7 @@ import grain.python as pygrain
 
 from dew.data.dataset import Records, SourceSlice
 from dew.data.pipeline import (
+    TOKEN_FIELDS,
     Artifact,
     Batched,
     BatchStage,
@@ -60,6 +61,7 @@ from dew.data.pipeline import (
     Stage,
     TokenBudget,
     TokenSplit,
+    Volatile,
     Windows,
     Workers,
     _declares_rejects,
@@ -337,7 +339,7 @@ def _promoted(pipeline: Pipeline) -> Pipeline:
     ):
         source, stages = PackedSource.planned(source, pack, overlap=overlap), stages[at + 1 :]
     first = stages[0] if stages else None
-    if isinstance(first, Windows) and first.fields == ("text",) and isinstance(source, TokenFiles):
+    if isinstance(first, Windows) and first.fields == TOKEN_FIELDS and isinstance(source, TokenFiles):
         # A token store's own stream, cut where the windows are written: read by index.
         stride = first.seq_len if first.stride is None else first.stride
         source, stages = WindowSource(source, source.tokens, first.seq_len, stride), stages[1:]
@@ -556,8 +558,9 @@ def _bind(stage: Configured, metadata: Mapping[str, object]) -> Map | RandomMap 
 
 def _keyed(stage: Stage) -> bool:
     """Whether a cache can key what `stage` runs (`StepIdentity.keyable`):
-    the steps `_identity` names it by, a configured one's factory included,
-    as `_identity(stage, cache=True)` refuses them."""
+    the step `runs` gives, and a configured one's factory beside it. A cache
+    prefix is refused by it (`_in_place`, `_cacheable`), where a configured
+    factory's own identity is no cache key of its own."""
     ran = runs(stage)
     if ran is None:
         return True
@@ -681,6 +684,13 @@ def _random(stage: Stage) -> bool:
     """Whether a stage draws from the record rng, so what it makes differs
     each epoch and no cache can hold it."""
     return isinstance(stage, RandomMap) or (isinstance(stage, Configured) and stage.random)
+
+
+def _volatile(stage: Stage) -> bool:
+    """Whether `stage` reads what may change between reads (a step that says it is `Volatile`, as a
+    live fetch does), so neither a cache nor a second reader may stand for it: the one test the
+    cache prefix and the plan read."""
+    return isinstance(stage, Map) and isinstance(stage.step, Volatile) and stage.step.volatile
 
 
 def _drops(stage: Stage) -> bool:

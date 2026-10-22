@@ -32,6 +32,7 @@ from dew.data import (
 )
 from dew.data.pipeline import (
     PACK_BINS,
+    PACK_POLICY,
     Cached,
     Configured,
     Dataset,
@@ -48,6 +49,7 @@ from dew.data.pipeline import (
     Windows,
     Workers,
 )
+from dew.data.prompts import PROMPT_LONG, PROMPT_PAD
 from dew.data.sources.base import Source
 from dew.data.text import SavedTokenizer
 
@@ -144,7 +146,7 @@ def _finished(prepared: Dataset, *, batch: int | None, records: int | None, host
 
 def lm(dataset: Dataset, tokenizer: str | SavedTokenizer | None, *, seq_len: int, batch: int | None,
        field: str = "text", eos: bool | None = None,
-       pack: Literal["first-fit", "best-fit", "concat"] | None = "first-fit", bins: int = PACK_BINS,
+       pack: Literal["first-fit", "best-fit", "concat"] | None = PACK_POLICY, bins: int = PACK_BINS,
        stride: int | None = None, cache: str | Cached | None = None,
        records: int | None = None, host: tuple[HostStep, ...] = ()) -> Pipeline:
     """Documents in `field` tokenized, ended by the tokenizer's EOS where it has one (`eos=True`
@@ -204,7 +206,7 @@ def token_windows(dataset: Dataset, *, seq_len: int, batch: int | None, stride: 
 
 def sft(dataset: Dataset, tokenizer: str | SavedTokenizer, *, seq_len: int, batch: int | None,
         messages: str = "messages", long: Literal["chunk", "truncate", "drop"] = "chunk",
-        pack: Literal["first-fit", "best-fit", "concat"] = "first-fit", bins: int = PACK_BINS,
+        pack: Literal["first-fit", "best-fit", "concat"] = PACK_POLICY, bins: int = PACK_BINS,
         cache: str | Cached | None = None, records: int | None = None,
         host: tuple[HostStep, ...] = ()) -> Pipeline:
     """Conversations in `messages` rendered through the tokenizer's chat
@@ -279,7 +281,8 @@ def _conversation_windows(rendered: Dataset, pack: Pack, *, long: Literal["trunc
 
 
 def prompts(dataset: Dataset, tokenizer: str | SavedTokenizer, *, max_prompt_len: int, batch: int | None,
-            pad_id: int = 0, long: Literal["drop", "truncate"] = "truncate", thinking: bool | None = None,
+            pad_id: int = PROMPT_PAD, long: Literal["drop", "truncate"] = PROMPT_LONG,
+            thinking: bool | None = None,
             reward_bytes: int | None = None, cache: str | Cached | None = None, records: int | None = None,
             host: tuple[HostStep, ...] = ()) -> Pipeline:
     """Prompt rows (verl's columns: "prompt", "data_source", "ground_truth", ...) rendered to

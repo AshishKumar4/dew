@@ -298,6 +298,10 @@ GRAIN_KILL_SECONDS = 25
 no setting or reading of: 25 s in grain 0.2.18 (process_prefetch.py), the release tested."""
 
 
+WORKER_BUFFER = 2
+"""The batches each worker process reads ahead where none is asked for (`Loading`, `Pipeline.workers`)."""
+
+
 @dataclasses.dataclass(frozen=True)
 class Loading:
     """Read throughput settings, as Grain's four knobs.
@@ -340,7 +344,7 @@ class Loading:
     workers: int | Literal["auto"] = 0
     threads: int = 16
     read_buffer: int = 16
-    worker_buffer: int = 2
+    worker_buffer: int = WORKER_BUFFER
     ram_budget_mb: int | None = None
     max_workers: int | None = None
 
