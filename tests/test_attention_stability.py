@@ -192,20 +192,25 @@ def _families() -> dict[str, Family]:
         "ties at scale 1/2, cotangents near 2**125": Family(_ties(4, 2.0 ** 125), kept(1, 2), folded=False),
         "ties at scale 1/4": Family(_ties(16, 1.0), kept(1, 2), folded=False),
         "ties at scale 1/4, cotangents near 2**125": Family(_ties(16, 2.0 ** 125), kept(1, 2), folded=False),
-        "a logit near fp32's largest": Family(near_max_logit(1), kept(1, 1)),
+        # The fold's divergences at extreme inputs, which run in the accurate form alone (docs/design/
+        # kernel-templates.md, §3, the exponent's forms): a logit near fp32's largest, whose contracted
+        # weight is 0 or infinite; values near fp32's largest, whose weighted sum overflows; a sink there.
+        "a logit near fp32's largest": Family(near_max_logit(1), kept(1, 1), folded=False),
         # Folded at scale 1/4, the backward takes the base-2 maximum back to natural units, which near fp32's
         # largest rounds the key's own weight away from 1, as at logits near 1e30.
         "a logit near fp32's largest at scale 1/4": Family(near_max_logit(16), kept(1, 1), folded=False),
-        "values near fp32's largest over 2 equal keys": Family(large_values(2), kept(1, 2)),
-        "values near fp32's largest over 64 equal keys": Family(large_values(64), kept(1, 64)),
-        # A key at its row's maximum weighs 1 exactly however its scaling contracts into the subtraction
-        # (`algebra.weights`), so one key's output is its value, folded or natural.
-        "one key": Family(drawn(4, 1), kept(4, 1)),
+        "values near fp32's largest over 2 equal keys": Family(large_values(2), kept(1, 2), folded=False),
+        "values near fp32's largest over 64 equal keys": Family(large_values(64), kept(1, 64), folded=False),
+        # A key at its row's maximum weighs 1 exactly in the accurate form; the fold's contracted weight is
+        # 1 within an ulp of its logit's exponent.
+        "one key": Family(drawn(4, 1), kept(4, 1), folded=False),
         "a sink and one key": Family(with_sinks(drawn(16, 1), -3.0, 3.0), kept(16, 1)),
-        "a sink near fp32's largest and one key": Family(with_sinks(drawn(16, 1), 1e38, 3e38), kept(16, 1)),
+        "a sink near fp32's largest and one key": Family(with_sinks(drawn(16, 1), 1e38, 3e38), kept(16, 1),
+                                                         folded=False),
         "a sink and one key, its logit near fp32's largest": Family(with_sinks(near_max_logit(1), -3.0, 3.0),
-                                                                    kept(1, 1)),
-        "a sink near fp32's largest at scale 1/4": Family(with_sinks(drawn(16, 1), 1e38, 3e38), kept(16, 1)),
+                                                                    kept(1, 1), folded=False),
+        "a sink near fp32's largest at scale 1/4": Family(with_sinks(drawn(16, 1), 1e38, 3e38), kept(16, 1),
+                                                          folded=False),
         "logits near 1e4": Family(near(1e4), _causal(64, 64, 4), {"causal": True}),
         # Folded, the backward takes the base-2 maximum back to natural units, which at 1e30 rounds the
         # anchor's own weight away from 1 by more than any bound states.
@@ -242,7 +247,8 @@ def _families() -> dict[str, Family]:
 
     documents = np.tile(np.asarray([[1, 1, 2, 2, 2, 2]], np.int32), (ROWS, 1))
     families["a row that overflows beside one that does not"] = Family(
-        beside, documents[:, None, :, None] == documents[:, None, None, :], {"segment_ids": documents})
+        beside, documents[:, None, :, None] == documents[:, None, None, :], {"segment_ids": documents},
+        folded=False)
 
     def slices(seed):
         # One query a row over 64 equal keys whose values near 1e37 sum within fp32 over each half and
@@ -252,7 +258,7 @@ def _families() -> dict[str, Family]:
         return (np.zeros((ROWS, 1, 1, 16), np.float32), np.zeros((ROWS, 64, 1, 16), np.float32), value, None,
                 dout * np.float32(2.0 ** -8))
 
-    families["two finite slices whose merge overflows"] = Family(slices, kept(1, 64), splits=2)
+    families["two finite slices whose merge overflows"] = Family(slices, kept(1, 64), splits=2, folded=False)
 
     def resumed(seed):
         # One query a row resumed from a state of denominator 2^100 to 2^127 and weighted values that
@@ -269,11 +275,13 @@ def _families() -> dict[str, Family]:
         return (np.zeros((RESUMED, 1, 1, 16), np.float32), np.zeros((RESUMED, 2, 1, 16), np.float32),
                 value.astype(np.float32), state, dout * np.float32(2.0 ** -12))
 
-    families["a resumed state of a large denominator"] = Family(resumed, np.ones((RESUMED, 1, 1, 2), bool))
+    families["a resumed state of a large denominator"] = Family(resumed, np.ones((RESUMED, 1, 1, 2), bool),
+                                                                folded=False)
     for low, high, label in ((-3.0, 3.0, ""), (1e38, 3e38, " near fp32's largest")):
         # One query a row, so the decode kernel takes the family too.
         name = f"a decode step's sink{label} and one key"
-        families[name] = Family(with_sinks(drawn(1, 1, rows=128), low, high), np.ones((128, 1, 1, 1), bool))
+        families[name] = Family(with_sinks(drawn(1, 1, rows=128), low, high), np.ones((128, 1, 1, 1), bool),
+                                folded=low < 0)
     ids = np.tile(np.asarray([[1, 2, 3, 3]], np.int32), (ROWS, 1))
     families["documents of one key"] = Family(drawn(4, 4), _causal(4, 4, ROWS) & (ids[:, None, :, None] ==
                                                                                   ids[:, None, None, :]),
