@@ -91,7 +91,7 @@ from dew.quantization import (
     measured_fp8_sites,
 )
 from dew.records import finite
-from dew.registry import wrapper_layers
+from dew.registry import rebuilt, wrapper_layers
 
 PEFT_CONFIG = "adapter_config.json"
 PEFT_WEIGHTS = "adapter_model.safetensors"
@@ -285,14 +285,35 @@ class Adapter:
 
     model: nn.Module
     variables: Variables
-    targets: Mapping[Path, Target]
-    rslora: bool = False
-    dropout: float = 0.0
-    layouts: Mapping[str, WeightLayout] = dataclasses.field(default_factory=dict)
-    bases: Mapping[str, AdapterBase] = dataclasses.field(default_factory=dict)
-    """The published model each component was bound to, by component (`""` for a decoder's or a
-    registry-built model's one unnamed component), which `save` names in that component's PEFT
-    config; a component bound to a local directory or a model built from its class has none."""
+
+    @property
+    def _binding(self) -> _Bound:
+        """The settings `model` was adapted with (`_Bound`), the one record its branch computes from and
+        `merge` and `save` read."""
+        adapted = type(self.model)
+        if not isinstance(adapted, AdaptedClass):
+            raise TypeError(f"{adapted.__name__} is not adapted, so it carries no adapter")
+        return adapted._dew_lora_bound
+
+    @property
+    def targets(self) -> Mapping[Path, Target]:
+        return self._binding.targets
+
+    @property
+    def rslora(self) -> bool:
+        return self._binding.rslora
+
+    @property
+    def dropout(self) -> float:
+        return self._binding.dropout
+
+    @property
+    def layouts(self) -> Mapping[str, WeightLayout]:
+        return self._binding.layouts
+
+    @property
+    def bases(self) -> Mapping[str, AdapterBase]:
+        return self._binding.bases
 
     @classmethod
     def bound(cls, model: nn.Module, variables: Variables, targets: Mapping[Path, Target], rslora: bool,
@@ -303,11 +324,9 @@ class Adapter:
         The factors go under `params` and everything else under `FROZEN`. `bases` are the published
         models its components were bound to (`Adapter.bases`).
         """
-        bases = dict(bases or {})
-        adapted = _adapted(model, _Branch(targets, rslora, dropout), layouts, bases)
+        adapted = _adapted(model, _Bound(targets, rslora, dropout, layouts, dict(bases or {})))
         factors = {(*path, factor) for path in targets for factor in FACTORS}
-        return cls(adapted, _fp8_packed(model, freeze(thaw(variables), lambda path: path in factors)),
-                   targets, rslora, dropout, layouts, bases)
+        return cls(adapted, _fp8_packed(model, freeze(thaw(variables), lambda path: path in factors)))
 
     @classmethod
     def from_run(cls, directory: str | FilePath, *, step: int | str | None = None,
@@ -336,10 +355,15 @@ class Adapter:
     def recorded(cls, model: nn.Module, variables: Variables, adapter: AdapterRecord) -> Adapter:
         """Return the adapter a model record's `adapter` describes.
 
-        It goes over the adapted `model` and a checkpoint's `variables`.
+        It goes over the adapted `model` and a checkpoint's `variables`. The model holds the adapter's
+        settings (`_Bound`), so a record that describes other settings than the ones it was adapted
+        with is refused rather than read past.
         """
-        if not isinstance(type(model), AdaptedClass):
-            raise ValueError(f"{type(model).__name__} is not adapted, so it carries no adapter")
+        adapted = type(model)
+        if not isinstance(adapted, AdaptedClass):
+            raise ValueError(f"{adapted.__name__} is not adapted, so it carries no adapter")
+        if _record(adapted._dew_lora_bound) != adapter:
+            raise ValueError(f"the record's adapter is not the one {adapted.__name__} was adapted with")
         targets, layouts = adapter.bound()
         whole = thaw(variables)
         for name, layout in layouts.items():
@@ -355,7 +379,7 @@ class Adapter:
             if found != expected:
                 raise ValueError(f"the recorded binding {name} expects factors {expected}, and the "
                                  f"checkpoint holds {found}")
-        return cls(model, variables, targets, adapter.rslora, adapter.dropout, layouts, dict(adapter.bases))
+        return cls(model, variables)
 
     def scale(self, target: Target) -> float:
         return _scale(target, self.rslora)
@@ -471,14 +495,40 @@ def _target_at(targets: Mapping[Path, Target], path: Path) -> Target | None:
 
 
 @dataclass(frozen=True)
-class _Branch:
-    """The interceptor an adapted model runs under: the adapter branch on
-    every target module's `__call__`."""
+class _Bound:
+    """An adapter's settings, held once by the model it adapts (its branch, `_Branch`) and read by its
+    `Adapter`, `merge`, `save` and the model's record: `targets` the adapted modules' paths with their
+    rank and alpha, `rslora`, `dropout`, `layouts` the bindings by the name a file stores each module
+    under, and `bases` the published model each component was bound to (`""` for a decoder's or a
+    registry-built model's one unnamed component), which `save` names in that component's PEFT config;
+    a component bound to a local directory or a model built from its class has none."""
 
     targets: Mapping[Path, Target]
-    rslora: bool
-    dropout: float
+    rslora: bool = False
+    dropout: float = 0.0
+    layouts: Mapping[str, WeightLayout] = dataclasses.field(default_factory=dict)
+    bases: Mapping[str, AdapterBase] = dataclasses.field(default_factory=dict)
+
+
+@dataclass(frozen=True)
+class _Branch:
+    """The interceptor an adapted model runs under: the adapter branch `bound` describes on every
+    target module's `__call__`."""
+
+    bound: _Bound
     root: Path = ("params",)
+
+    @property
+    def targets(self) -> Mapping[Path, Target]:
+        return self.bound.targets
+
+    @property
+    def rslora(self) -> bool:
+        return self.bound.rslora
+
+    @property
+    def dropout(self) -> float:
+        return self.bound.dropout
 
     def __call__(self, next_fun, args, kwargs, context):
         module = context.module
@@ -551,12 +601,12 @@ def _refusing_counts(model: nn.Module, base: type[nn.Module], *protocols) -> typ
     return type('UncountedAdapter', (base,), methods)
 
 
-def _counted_adapter(model: nn.Module, branch: _Branch,
-                     layouts: Mapping[str, WeightLayout]) -> type[nn.Module]:
+def _counted_adapter(model: nn.Module, branch: _Branch) -> type[nn.Module]:
     """An adapter adds analytical work only to capabilities its wrapped model declares."""
     base = _refusing_counts(model, type(model), CountedImages, CountedMultimodal, CountedSequences,
                             CountedSpatial, CountedConditionedSpatial, CountedVideo)
-    bindings = {layout.paths[0][:-1]: layout for layout in layouts.values() if len(layout.paths) == 1}
+    bindings = {layout.paths[0][:-1]: layout for layout in branch.bound.layouts.values()
+                if len(layout.paths) == 1}
 
     class CountedAdapter(base):
         @nn.nowrap
@@ -671,9 +721,8 @@ def _fp8_packed(model: nn.Module, variables: Variables) -> dict:
     return {**variables, FROZEN: frozen, QUANTIZATION: overlay(variables.get(QUANTIZATION, {}), packed)}
 
 
-def _adapted(model: nn.Module, branch: _Branch, layouts: Mapping[str, WeightLayout],
-             bound_to: Mapping[str, AdapterBase]) -> nn.Module:
-    """Return `model` computing `branch` in every target module.
+def _adapted(model: nn.Module, bound: _Bound) -> nn.Module:
+    """Return `model` computing the adapter branch `bound` describes in every target module.
 
     The result is an instance of a subclass of `model`'s class with the
     same fields and methods, so it builds, checks and generates as the model
@@ -681,24 +730,24 @@ def _adapted(model: nn.Module, branch: _Branch, layouts: Mapping[str, WeightLayo
     `apply` folds `FROZEN` back into `params` and runs under the interceptor;
     `init` (Flax's dispatches through `init_with_output`) runs under it and
     splits what it draws, the factors under `params` and the rest under
-    `FROZEN`. `layouts` are the bindings the class's record (`AdapterRecord`)
-    writes beside the targets, with the models its components were bound to
-    (`bound_to`); the record is written when a run asks for it.
+    `FROZEN`. The class's record (`AdapterRecord`) is `bound`'s, written when a run asks for it.
     """
     base = type(model)
     if isinstance(base, AdaptedClass):
         raise ValueError("The model is already adapted")
-    factors = {(*path, factor) for path in branch.targets for factor in FACTORS}
-    adapted_base = _counted_adapter(model, branch, layouts)
+    branch = _Branch(bound)
+    factors = {(*path, factor) for path in bound.targets for factor in FACTORS}
+    adapted_base = _counted_adapter(model, branch)
 
     class Adapted(adapted_base):
         # Staticmethods, or Flax would wrap the callables as module methods.
         _dew_lora_interceptor: ClassVar[Interceptor] = staticmethod(branch)
+        _dew_lora_bound: ClassVar[_Bound] = bound
         _dew_wrapped: ClassVar[type[nn.Module]] = base
 
         @staticmethod
         def _dew_wrapper() -> AdapterRecord:
-            return _record(branch.targets, branch.rslora, branch.dropout, layouts, bound_to)
+            return _record(bound)
 
         def apply(self, variables, *args, **kwargs):
             with nn.intercept_methods(branch):
@@ -710,9 +759,7 @@ def _adapted(model: nn.Module, branch: _Branch, layouts: Mapping[str, WeightLayo
             return output, _fp8_packed(model, dict(freeze(variables, lambda path: path in factors)))
 
     Adapted.__name__ = Adapted.__qualname__ = base.__name__
-    return Adapted(**{field.name: getattr(model, field.name)
-                      for field in dataclasses.fields(model)
-                      if field.init and field.name not in ("parent", "name")})
+    return rebuilt(Adapted, model)
 
 
 @dataclass(frozen=True)
@@ -754,7 +801,7 @@ class AdapterRecord:
         """`model` adapted as this record says, which is how a recorded run's
         model is rebuilt (`ModelConfig.build`); the checkpoint supplies the factors."""
         targets, layouts = self.bound()
-        return _adapted(model, _Branch(targets, self.rslora, self.dropout), layouts, dict(self.bases))
+        return _adapted(model, _Bound(targets, self.rslora, self.dropout, layouts, dict(self.bases)))
 
     def bound(self) -> tuple[dict[Path, Target], dict[str, WeightLayout]]:
         """The targets by native path and the bindings by the name a file writes them under."""
@@ -765,14 +812,15 @@ class AdapterRecord:
         return targets, layouts
 
 
-def _record(targets: Mapping[Path, Target], rslora: bool, dropout: float,
-            layouts: Mapping[str, WeightLayout], bases: Mapping[str, AdapterBase]) -> AdapterRecord:
+def _record(bound: _Bound) -> AdapterRecord:
     """The bound adapter as a model record holds it."""
-    bindings = {layout.paths[0][:-1]: layout for layout in layouts.values()}
-    return AdapterRecord({'/'.join(path): targets[path] for path in sorted(targets)}, rslora, dropout,
+    targets = bound.targets
+    bindings = {layout.paths[0][:-1]: layout for layout in bound.layouts.values()}
+    return AdapterRecord({'/'.join(path): targets[path] for path in sorted(targets)}, bound.rslora,
+                         bound.dropout,
                          {'/'.join(path): AdapterBinding(bindings[path].name, bindings[path].shape,
                                                          bindings[path].transpose)
-                          for path in sorted(targets) if path in bindings}, dict(bases))
+                          for path in sorted(targets) if path in bindings}, dict(bound.bases))
 
 
 def _site_codes(variables: Variables, path: Path) -> Mapping | None:
@@ -1185,12 +1233,11 @@ def unadapted(model: nn.Module) -> nn.Module:
     base, layers = wrapper_layers(type(model))
     if not any("_dew_lora_interceptor" in vars(layer) for layer in layers):
         return model
-    rebuilt = base(**{field.name: getattr(model, field.name) for field in dataclasses.fields(model)
-                      if field.init and field.name not in ("parent", "name")})
+    model = rebuilt(base, model)
     for layer in reversed(layers):
         if "_dew_lora_interceptor" not in vars(layer):
-            rebuilt = layer._dew_wrapper().apply(rebuilt)
-    return rebuilt
+            model = layer._dew_wrapper().apply(model)
+    return model
 
 
 @runtime_checkable
@@ -1203,6 +1250,7 @@ class AdaptedClass(Protocol):
     """
 
     _dew_lora_interceptor: ClassVar[Interceptor]
+    _dew_lora_bound: ClassVar[_Bound]
 
 
 __all__ = ["Adapter", "AdapterRecord", "LoRA", "PeftConfig", "Target", "unadapted"]
