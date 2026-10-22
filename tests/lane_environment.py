@@ -35,6 +35,18 @@ configuration, which cuDNN refuses on an H100, so that test compiles in its
 own process without it (tests/test_quantization.py)."""
 
 
+HOST_INDEPENDENT_CPU_FLAGS = ("--xla_cpu_max_isa=AVX2", "--xla_cpu_experimental_ynn_fusion_type=",
+                              "--xla_cpu_experimental_xnn_fusion_type=")
+"""XLA:CPU's numerics on every lane, whatever the runner's x86 host (ledger row 1349). By default
+XLA:CPU hands a dot to YNNPACK or XNNPACK, whose microkernels it picks at run time by the host's
+ISA: on an AVX-512 host (AMD 25/17, x86-64-v4) they sum a narrow dot's K in other partial sums than
+on an AVX2 one (AMD 25/1, x86-64-v3), and so a check 1 between two arms that reach them unequally
+read the host. The interpreted SSD kernel against XLA's scan put its state gradient at 1.586 times
+the scan's distance on 25/17 and 0.765 on 25/1, the scan's own dots moving; without those fusions,
+and with code generated for AVX2 on every host, at 0.999 and 1.014. A flag of the same name in
+XLA_FLAGS keeps its own setting."""
+
+
 def without_deterministic_ops(flags: str) -> str:
     """XLA `flags` without `DETERMINISTIC_OPS`."""
     name = DETERMINISTIC_OPS.split("=")[0]
@@ -64,6 +76,7 @@ def configure_lane(environ: MutableMapping[str, str]) -> None:
         # Every rounding the program states, as a run keeps them
         # (`dew.telemetry.devices.keep_roundings`).
         flags.append("--xla_allow_excess_precision=false")
+    flags.extend(flag for flag in HOST_INDEPENDENT_CPU_FLAGS if flag.split("=")[0] not in flags[0])
     local = {"cuda": _local_gpus, "tpu": _local_tpus}
     accelerator = next((name for name in platforms if name in local), None)
     if accelerator is None:

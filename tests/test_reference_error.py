@@ -27,6 +27,18 @@ from reference_error import (
 )
 
 
+def test_the_lane_compiles_for_the_same_cpu_numerics_on_every_host():
+    """Check 1's verdicts on the CPU read no host's ISA: every lane runs XLA:CPU without its
+    run-time-dispatched dot fusions and with code generated for AVX2 (ledger row 1349)."""
+    import os
+
+    import lane_environment
+
+    flags = os.environ["XLA_FLAGS"].split()
+    for flag in lane_environment.HOST_INDEPENDENT_CPU_FLAGS:
+        assert flag in flags, flag
+
+
 def test_a_small_row_beside_large_ones_is_held_to_its_own_size():
     """Dew doubles a row of 5s beside rows of 1e8 that the reference rounds by 8. Every
     tensor-wide distance passes it: its RMS error, 3.5, sits under twice the reference's, 5.7.
