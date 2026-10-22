@@ -608,15 +608,14 @@ def test_a_hook_through_a_custom_vjp_lowers_and_compiles_on_tritons_compiler(tar
     score = template.Hooks(score_mod=lambda s, q_pos, k_pos: custom_softcap(s))
     hooks = template.Hooks(score_mod=score.score_mod, output_mod=custom_softcap)
     shape = jax.ShapeDtypeStruct((1, 256, 2, 64), jnp.float32)
-    pins = tuning.pinned({attention_triton.TritonForward: attention_triton.Tiles(32, 32, 4, 2),
-                          attention_triton.TritonBackward: joint(PINNED[0], PINNED[0])})
+    pins = {attention_triton.TritonForward: PINNED[0], attention_triton.TritonBackward: joint(PINNED[0])}
 
     def forward(query, key, value):
-        with pins:
+        with tuning.pinned(pins):
             return attention_triton.forward(query, key, value, spans, hooks, residuals=True)
 
     def backward(query, key, value, dout):
-        with pins:
+        with tuning.pinned(pins):
             grads = attention_triton.backward(query, key, value, spans, score, dout)
         return grads.query, grads.key, grads.value
 
