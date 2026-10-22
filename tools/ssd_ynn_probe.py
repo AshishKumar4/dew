@@ -27,10 +27,12 @@ def main() -> None:
     parser.add_argument("--draws", type=int, default=128)
     parser.add_argument("--fused", action="store_true")
     args = parser.parse_args()
-    cpu = dict(line.split(":", 1) for line in Path("/proc/cpuinfo").read_text().splitlines()
-               if line.startswith(("cpu family", "model\t")))
-    print("cpu", {key.strip(): value.strip() for key, value in cpu.items()},
-          "fused" if args.fused else "without YNN")
+    lines = Path("/proc/cpuinfo").read_text().splitlines()
+    cpu = {key.strip(): value.strip() for key, value in (line.split(":", 1) for line in lines
+                                                          if line.startswith(("cpu family", "model\t")))}
+    avx512 = any(line.startswith("flags") and " avx512f" in line for line in lines)
+    print("cpu", cpu, "avx512f" if avx512 else "no avx512f", "draws", args.draws,
+          "fused" if args.fused else "without YNN", flush=True)
     reference = dict(np.load(FIXTURES / "ssd.npz"))
     for param in CASES:
         kind, case, compiled = param.values
