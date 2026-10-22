@@ -1254,3 +1254,25 @@ def test_a_run_over_records_in_memory_checkpoints_and_resumes_where_it_stopped(t
     for expected, actual in zip(jax.tree.leaves(whole.variables),
                                 jax.tree.leaves(resumed.variables), strict=True):
         np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
+
+
+def test_a_batch_encoders_identity_names_its_reader_as_a_steps_identity_does():
+    """The encoders that read a batch's captions or fields name the reader they run by its module and
+    qualified name, a method's own: two readers, two identities, and the same reader, one."""
+    from dew.data.images import EncodeCaptions, EncodeFields
+
+    class Reader:
+        def captions(self, captions):
+            return {"n": np.asarray([len(caption) for caption in captions])}
+
+        def fields(self, batch):
+            return {}
+
+    reader = Reader()
+    assert EncodeCaptions(reader.captions).identity == (
+        f"dew.encode-captions:{__name__}.test_a_batch_encoders_identity_names_its_reader_as_a_steps_identity_does."
+        "<locals>.Reader.captions")
+    assert EncodeFields(reader.fields).identity.endswith("<locals>.Reader.fields")
+    module = keep_captions.__module__
+    assert EncodeCaptions(keep_captions).identity == f"dew.encode-captions:{module}.keep_captions"
+    assert EncodeCaptions().identity == "dew.drop-captions@1"
