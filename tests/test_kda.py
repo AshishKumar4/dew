@@ -180,9 +180,10 @@ def test_the_layer_gradients_match_the_oracle():
     """Into the input and every parameter, through the conv, the forget
     gate, the chunked rule across a chunk boundary and the gated norm: on
     par with the transcription's gradients from their float64 evaluation
-    over drawn inputs, cotangents and parameters (check 1)."""
-    # Four heads of eight on a width of sixteen, and a gated norm of eps 1e-2: through a norm of a near
-    # zero row, a gradient's error grows as the row's inverse square, a tail no count of seeds resolves.
+    over drawn inputs and cotangents (check 1)."""
+    # Four heads of eight on a width of sixteen, and a gated norm of eps 1e-2: through the norm of a near
+    # zero row, a gradient's error grows as the row's inverse square, a tail no count of seeds resolves,
+    # and rows of eight values come near zero far more rarely than rows of four.
     wide = {"E": 16, "H": 4, "D": 8, "eps": 1e-2}
     module, _, _ = layer_and_params(-5.0, **wide)
 
