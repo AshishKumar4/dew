@@ -409,14 +409,19 @@ class TritonForward(Template[Tiles]):
         # output and residuals it writes.
         read = sum(leaf.size * jnp.dtype(leaf.dtype).itemsize for leaf in jax.tree.leaves(dict(ba.arguments))
                    if hasattr(leaf, "dtype"))
+        programs = batch * heads * (queries // config.block_q)
+        staged = float(config.block_q * width * size + tiles * config.block_k * (width + value_width) * size)
         return costs.seconds(costs.Cost(
-            programs=batch * heads * (queries // config.block_q),
+            programs=programs,
             device_bytes=read + batch * queries * heads * value_width * size + rows,
             program_flops=tiles * 2.0 * config.block_q * config.block_k * (width + value_width),
-            program_staged=float(config.block_q * width * size
-                                 + tiles * config.block_k * (width + value_width) * size),
+            program_staged=staged,
             program_exponentials=float(tiles * config.block_q * config.block_k),
-            mode=_mode(query.dtype)), target)
+            mode=_mode(query.dtype), steps=tiles, stages=config.stages,
+            resident=costs.resident(target, self.staged_bytes(ba, config), 32 * config.warps,
+                                    self.registers(ba, config)),
+            # Every query block stages its queries and every key tile it walks, from the L2.
+            l2_bytes=programs * staged), target)
 
     def eligible(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> bool:
         return _eligible(ba, target)
