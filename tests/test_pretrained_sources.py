@@ -155,16 +155,14 @@ def test_a_source_is_routed_on_its_config_alone_as_the_loader_reads_it():
     wrapper; DiffusionGemma's its own; an unregistered model_type goes to the verifier given; a
     storage format the codecs cannot decode and a family's refusal are refused on the config, as the
     loader refuses them."""
+    from dew.interop.codecs import StorageRefused
     from dew.interop.pretrained import source_route
 
-    def config(name):
-        return json.loads((FIXTURES / name / "config.json").read_text())
-
-    route = source_route(config("llama-tiny"))
+    route = source_route(fixture_config("llama-tiny"))
     assert route.kind == "decoder" and route.record is not None
-    assert route.record == hf_decoders.translate_config(config("llama-tiny"))
-    assert source_route(config("gemma3-tiny-mm")).kind == "wrapper"
-    assert source_route(config("diffusion-gemma-sft")).kind == "diffusion_gemma"
+    assert route.record == hf_decoders.translate_config(fixture_config("llama-tiny"))
+    assert source_route(fixture_config("gemma3-tiny-mm")).kind == "wrapper"
+    assert source_route(fixture_config("diffusion-gemma-sft")).kind == "diffusion_gemma"
     asked = []
 
     def verifier(unregistered):
@@ -172,11 +170,16 @@ def test_a_source_is_routed_on_its_config_alone_as_the_loader_reads_it():
         raise ValueError("no registered family's convention computes it")
 
     with pytest.raises(ValueError):
-        source_route({**config("llama-tiny"), "model_type": "an_unregistered_decoder"}, verified=verifier)
+        source_route({**fixture_config("llama-tiny"), "model_type": "an_unregistered_decoder"}, verified=verifier)
+    assert asked == ["an_unregistered_decoder"]
+    with pytest.raises(StorageRefused):
+        source_route({**fixture_config("llama-tiny"), "quantization_config": {"quant_method": "mlx", "bits": 4,
+                                                                        "group_size": 64, "mode": "affine"}})
+    with pytest.raises(StorageRefused):
+        # A storage format is refused before the verifier is asked about an unregistered type.
+        source_route({"model_type": "an_unregistered_decoder", "quantization": {"bits": 4, "group_size": 64}},
+                     verified=verifier)
     assert asked == ["an_unregistered_decoder"]
     with pytest.raises(ValueError):
-        source_route({**config("llama-tiny"), "quantization_config": {"quant_method": "mlx", "bits": 4,
-                                                                        "group_size": 64, "mode": "affine"}})
-    with pytest.raises(ValueError):
-        source_route({**config("llama-tiny"), "hidden_act": "a_nonexistent_activation"})
+        source_route({**fixture_config("llama-tiny"), "hidden_act": "a_nonexistent_activation"})
 
