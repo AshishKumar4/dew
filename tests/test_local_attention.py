@@ -28,8 +28,8 @@ from dew.nn.local_attention import local_attention
 SEEDS = {'window': 8, 'chunk': 8, 'packed': 8, 'given places': 8, 'gradients': 8, 'shared split': 8,
          'decode': 8, 'holey chunk': 8, 'diagnostic chunk': 8, 'holey window': 16, 'diagnostic window': 16,
          'prefill window': 16, 'padded split': 8}
-"""Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada and an A100,
-2026-10-21): the most any of a site's cases took."""
+"""Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada and an A100):
+the most any of a site's cases took."""
 
 
 def on_rows(out, rows):
