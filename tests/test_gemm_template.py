@@ -601,6 +601,24 @@ def test_a_normed_operand_runs_in_the_prologue_with_the_programs_value(generatio
     assert {route.kernel for route in taken if route.choice == 'gemm_prologue'} == {'fused'}
 
 
+@lowers("sm90")
+@pytest.mark.parametrize("producer", [rms_norm, dew_rms_norm], ids=lambda producer: producer.__name__)
+def test_a_fused_norm_lowers_for_an_h100(producer):
+    """An RMS norm fused into the Mosaic GPU forward's prologue lowers for an H100 on the CPU: its row
+    statistic, a column the template squeezed, comes back to its tile by a broadcast, which Mosaic GPU's
+    layout inference lays out (a reshape it does not; FUSEDNORM-h100)."""
+    sizes = jnp.asarray(SIZES)
+    x, w, _, nw, *_ = _draw(0)
+
+    def fusing(x, w, weight):
+        return fused.fusible_gemm(producer(x, weight), w, sizes).astype(jnp.bfloat16)
+
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
+    with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh), generation.routes() as taken:
+        jax.jit(fuser.fuse(fusing)).trace(x, w, nw).lower(lowering_platforms=("cuda",))
+    assert {route.kernel for route in taken if route.choice == 'grouped_matmul'} == {'mosaic_gpu'}
+    assert {route.kernel for route in taken if route.choice == 'gemm_prologue'} == {'fused'}
+
 @pytest.mark.parametrize("producer", [rms_norm, dew_rms_norm, relu], ids=lambda producer: producer.__name__)
 def test_a_fused_producers_gradients_are_its_own(producer):
     """Every input's gradient through a producer fused into the prologue is the unfused program's: the
