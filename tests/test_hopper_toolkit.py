@@ -1,8 +1,7 @@
 """Hopper's toolkit (dew.nn.kernels.templates.hopper) under Mosaic GPU's interpreter: a ring streaming one
-operand across persistent tiles of their own trip counts, two consumers sharing its slots and meeting at
-each step, a persistent loop in its own order, per-row vectors stored through one shared-memory buffer.
-The interpreter is coverage, not proof (it treats wgmma_wait as a no-op); each kernel also lowers for an
-H100 here, and runs on one in the GPU gate."""
+operand across persistent tiles of their own trip counts, one consumer or two sharing its slots. The
+interpreter is coverage, not proof (it treats wgmma_wait as a no-op); each kernel also lowers for an H100
+here, and runs on one in the GPU gate."""
 
 import functools
 
@@ -34,20 +33,21 @@ def _first_step(tile):
 
 def _ring_sums(x, *, interpret, consumers: int = 1):
     """Each tile's sum of its steps' blocks of `x` (tile `t` takes `t + 1`), streamed through a ring whose
-    counter runs across the tiles; with two consumers each sums half the columns, meeting at each step."""
+    counter runs across the tiles; with two consumers each sums half the columns."""
     columns = BLOCK[1] // consumers
 
     def body(x_gmem, out_gmem):
         @functools.partial(pl.run_scoped, **hopper.ring(BLOCK, x.dtype, STAGES, consumers=consumers),
                            out_smem=plgpu.SMEM((consumers, BLOCK[0], columns), jnp.float32),
-                           schedule=hopper.schedule_barrier(), collective_axes="wg")
-        def _(smem, full, consumed, out_smem, schedule):
+                           collective_axes="wg")
+        def _(smem, full, consumed, out_smem):
             ring = hopper.Ring(smem, full, consumed)
             wg = jax.lax.axis_index("wg")
 
             def producer():
-                @hopper.persistent(TILES, collective_axes="sm")
-                def _(tile, loop):
+                @plgpu.nd_loop((TILES,), collective_axes="sm")
+                def _(loop: plgpu.NDLoopInfo):
+                    tile = loop.index[0]
                     first = _first_step(tile)
 
                     @pl.loop(0, tile + 1)
@@ -57,16 +57,15 @@ def _ring_sums(x, *, interpret, consumers: int = 1):
                 ring.drain(jnp.int32(_first_step(TILES)))
 
             def consumer(wg):
-                @hopper.persistent(TILES, collective_axes="sm")
-                def _(tile, loop):
+                @plgpu.nd_loop((TILES,), collective_axes="sm")
+                def _(loop: plgpu.NDLoopInfo):
+                    tile = loop.index[0]
                     first = _first_step(tile)
 
                     def step_sum(step, total):
                         slot = ring.acquire(first + step)
                         block = slot[:, pl.ds(wg * columns, columns)].astype(jnp.float32)
                         ring.release(first + step)
-                        if consumers == 2:
-                            hopper.rendezvous(schedule)
                         return total + block
 
                     zero = jnp.zeros((BLOCK[0], columns), jnp.float32)
@@ -106,22 +105,6 @@ def test_a_ring_streams_tiles_of_their_own_trip_counts(consumers):
     x = _stream()
     summed = _ring_sums(x, interpret=INTERPRETED, consumers=consumers)
     np.testing.assert_array_equal(np.asarray(summed), _expected(x))
-
-
-@INTERPRETS
-def test_a_persistent_loop_walks_its_tiles_in_its_order():
-    """A reversed order visits the last tile first: each loop index stores the tile it was given."""
-    def body(out_gmem):
-        @functools.partial(pl.run_scoped, smem=plgpu.SMEM((128,), jnp.float32))
-        def _(smem):
-            @hopper.persistent(TILES, collective_axes="sm", order=lambda index: TILES - 1 - index)
-            def _(tile, loop):
-                hopper.store_vector(jnp.full((128,), tile, jnp.float32), smem, out_gmem.at[loop.index[0]])
-            plgpu.wait_smem_to_gmem(0)
-
-    out = plgpu.kernel(body, out_type=jax.ShapeDtypeStruct((TILES, 128), jnp.float32), grid=(1,),
-                       grid_names=("sm",), compiler_params=hopper.compiler_params(), interpret=INTERPRETED)()
-    np.testing.assert_array_equal(np.asarray(out[:, 0]), np.arange(TILES)[::-1])
 
 
 @pytest.mark.parametrize("consumers", [1, 2])
