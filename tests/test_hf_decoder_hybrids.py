@@ -11,7 +11,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from model_support import flat_tree
-from test_hf_decoders import fixture_config, fp32_decoder, scaled_difference
+from test_hf_decoders import fixture_config, fp32_decoder, recorded_logit_difference, scaled_difference
 
 from dew.interop.hf_decoders import translate_config, translate_weights
 
@@ -31,14 +31,8 @@ def test_gemma4_logits_match_the_reference_implementation(name):
     gemma4-e2b 1.4e-06."""
     directory = FIXTURES / name
     model, variables = fp32_decoder(directory)
-    ids = np.load(directory / "input_ids.npy")
-    reference = np.load(directory / "logits.npy")
-
-    logits = np.asarray(model.apply(variables, jnp.asarray(ids, jnp.int32)))
-
-    difference = float(np.max(np.abs(logits - reference)))
+    difference = recorded_logit_difference(model, variables, directory)
     assert difference < 1e-5, f"max |logit difference| {difference:.3e}"
-    assert np.array_equal(np.argmax(logits, axis=-1), np.argmax(reference, axis=-1))
 
 
 def test_the_router_bias_lands_in_the_moe_collection():
@@ -133,14 +127,8 @@ def test_qwen35_logits_match_the_reference_implementation():
     instead moves the logits by 7.8e-01."""
     directory = FIXTURES / "qwen35-tiny"
     model, variables = fp32_decoder(directory)
-    ids = np.load(directory / "input_ids.npy")
-    reference = np.load(directory / "logits.npy")
-
-    logits = np.asarray(model.apply(variables, jnp.asarray(ids, jnp.int32)))
-
-    difference = float(np.max(np.abs(logits - reference)))
+    difference = recorded_logit_difference(model, variables, directory)
     assert difference < 5e-4, f"max |logit difference| {difference:.3e}"
-    assert np.array_equal(np.argmax(logits, axis=-1), np.argmax(reference, axis=-1))
 
 
 def test_a_qwen35_checkpoint_decodes_as_it_scores_in_parallel():
@@ -281,14 +269,8 @@ def test_gemma3n_logits_match_the_reference_implementation():
     LAuReL leaves and the sharing layer's missing K/V are what the tree
     holds."""
     model, variables = fp32_decoder(GEMMA3N)
-    ids = np.load(GEMMA3N / "input_ids.npy")
-    reference = np.load(GEMMA3N / "logits.npy")
-
-    logits = np.asarray(model.apply(variables, jnp.asarray(ids, jnp.int32)))
-
-    difference = float(np.max(np.abs(logits - reference)))
+    difference = recorded_logit_difference(model, variables, GEMMA3N)
     assert difference < 1e-4, f"max |logit difference| {difference:.3e}"
-    assert np.array_equal(np.argmax(logits, axis=-1), np.argmax(reference, axis=-1))
     params = variables["params"]
     assert {name for name in params if name.startswith("altup")} == {
         "altup_projections_0", "altup_projections_1",

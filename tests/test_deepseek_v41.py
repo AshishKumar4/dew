@@ -105,7 +105,8 @@ def test_the_quantizers_round_fp32_input_as_the_stand_ins(source):
     the kernels on bf16 above, define the rounding: Dew's quantizers match
     them bit for bit (signed zeros included), ties, all-zero blocks and
     saturation included, compiled."""
-    torch = pytest.importorskip("torch")
+    import torch
+
     from tools import deepseek_v41_kernels as kernels
 
     rng = np.random.default_rng(0)

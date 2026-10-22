@@ -21,7 +21,16 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from model_support import decode_through
-from reference_error import PARITY, assert_as_exact_as_the_reference, widened
+from reference_error import (
+    PARITY,
+    assert_as_exact,
+    assert_as_exact_as_the_reference,
+    declared_seeds,
+    indexed_recording,
+    recording,
+    widened,
+)
+from ssd_support import mamba2_draw, mamba2_run
 
 from dew.accuracy import distance
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -30,11 +39,17 @@ from dew.nn.mixers.mamba2 import Mamba2, chunk_ssd, recurrent_ssd
 from dew.objectives.lm import LMObjective
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "mamba2"
+SEEDED = FIXTURES / "ssd_seeded.npz"
 
 
 @pytest.fixture(scope="module")
 def reference():
     return dict(np.load(FIXTURES / "ssd.npz"))
+
+
+@pytest.fixture(scope="module")
+def seeded_reference():
+    return recording(SEEDED)
 
 
 @pytest.fixture(scope="module")
@@ -82,24 +97,26 @@ def operands(reference):
     )
 
 
-def test_the_chunked_scan_matches_the_reference(reference):
-    out, final = chunk_ssd(*operands(reference), None, 32)
-    as_exact((out, final), (reference["scan.output"], reference["scan.final"]),
-             (reference["scan.output_f64"], reference["scan.final_f64"]), "the scan")
+def assert_recorded_as_exact(reference, site):
+    """The recorded reference and its torch-float64 truth on each fresh native-input/orbit draw."""
+    seeds = declared_seeds(SEEDED)[site]
+    # The truth is Dew's float64 path, which the recorder held to transformers' float64 at every seed.
+    draw, recorded, truth = indexed_recording(reference, site, seeds, inputs_of=mamba2_draw,
+                                              truth_fn=jax.jit(lambda inputs: mamba2_run(site, inputs)))
+    run = jax.jit(lambda index, inputs: mamba2_run(site, inputs))
+    assert_as_exact(run, recorded, draw, f"transformers {site}", seeds=seeds, truth_fn=truth)
 
 
-def test_a_carried_state_matches_the_reference(reference):
-    out, final = chunk_ssd(*operands(reference), jnp.asarray(reference["scan.initial"]), 32)
-    as_exact((out, final), (reference["scan.output_carried"], reference["scan.final_carried"]),
-             (reference["scan.output_carried_f64"], reference["scan.final_carried_f64"]), "the carried scan")
+def test_the_chunked_scan_matches_the_reference(seeded_reference):
+    assert_recorded_as_exact(seeded_reference, "scan")
 
 
-def test_one_recurrent_step_matches_selective_state_update(reference):
-    x, step, A, B, C, D = operands(reference)
-    out, final = recurrent_ssd(x[:, :1], step[:, :1], A, B[:, :1], C[:, :1], D,
-                               jnp.asarray(reference["scan.initial"]))
-    as_exact((out[:, 0], final), (reference["step.output"], reference["step.state"]),
-             (reference["step.output_f64"], reference["step.state_f64"]), "the step")
+def test_a_carried_state_matches_the_reference(seeded_reference):
+    assert_recorded_as_exact(seeded_reference, "carried")
+
+
+def test_one_recurrent_step_matches_selective_state_update(seeded_reference):
+    assert_recorded_as_exact(seeded_reference, "step")
 
 
 def test_the_chunked_and_recurrent_forms_agree(reference):
@@ -120,12 +137,22 @@ def test_a_sequence_split_in_two_carries_its_state_across_the_cut(reference):
              in_float64(chunk_ssd, x, step, A, B, C, D, None, 32), "the cut sequence")
 
 
-def test_the_chunk_size_does_not_change_the_scan(reference):
-    x, step, A, B, C, D = operands(reference)
-    at_32 = chunk_ssd(x, step, A, B, C, D, None, 32)
-    truth = in_float64(chunk_ssd, x, step, A, B, C, D, None, 32)
+CHUNK_SIZE_SEEDS = 64
+"""Sized by seeds_for against the 32-token XLA chunk scan (2026-10-20, armada)."""
+
+
+def chunk_size_draw(seed):
+    """Fresh inputs at the fixture geometry under joint head, P-channel and N-coordinate permutations."""
+    arrays = mamba2_draw(seed)
+    arrays["dt"] = jax.nn.softplus(jnp.asarray(arrays["dt"]) + jnp.asarray(arrays["dt_bias"]))
+    return tuple(arrays[name] for name in ("x", "dt", "A", "B", "C", "D"))
+
+
+def test_the_chunk_size_does_not_change_the_scan():
+    at_32 = jax.jit(lambda *inputs: chunk_ssd(*inputs, None, 32))
     for size in (7, 256):
-        as_exact(chunk_ssd(x, step, A, B, C, D, None, size), at_32, truth, f"a chunk of {size}")
+        run = jax.jit(lambda *inputs, size=size: chunk_ssd(*inputs, None, size))
+        assert_as_exact(run, at_32, chunk_size_draw, f"a chunk of {size}", seeds=CHUNK_SIZE_SEEDS)
 
 
 def layer(geometry, **overrides) -> Mamba2:

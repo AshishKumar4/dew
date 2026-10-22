@@ -17,6 +17,7 @@ from dew.data.dataset import Loader
 from dew.data.pipeline import Pipeline
 from dew.diffusion import schedules, transforms
 from dew.diffusion.process import Process
+from dew.inference.projections import unpacked
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.objectives.lm import LMObjective
 from dew.registry import from_record, to_record
@@ -258,8 +259,10 @@ def test_task_from_pretrained_selects_the_requested_snapshot(tmp_path, monkeypat
     monkeypatch.setattr(huggingface_hub, "snapshot_download", lambda repo_id, revision=None:
                         str(tmp_path / ("main" if revision is None else {"pinned": "pinned"}[revision])))
     task = task_type.from_pretrained("user/published-model", revision="pinned", ema=False)
-    assert jax.tree.structure(task.variables) == jax.tree.structure(freeze(selected))
-    for actual, expected in zip(jax.tree.leaves(task.variables), jax.tree.leaves(selected), strict=True):
+    # A loaded task holds its serving layout (projections packed); its canonical tree is the snapshot.
+    restored = unpacked(task.model, task.variables)
+    assert jax.tree.structure(restored) == jax.tree.structure(freeze(selected))
+    for actual, expected in zip(jax.tree.leaves(restored), jax.tree.leaves(selected), strict=True):
         np.testing.assert_array_equal(actual, expected)
 
 

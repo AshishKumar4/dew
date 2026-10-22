@@ -39,6 +39,18 @@ def exchange_worker(script, out, processes, process_id, coordinator):
         [sys.executable, str(script), str(process_id), coordinator, str(out)], devices=1)
 
 
+def assert_exchange_across_processes(worker: Path, tmp_path: Path, bound: float) -> None:
+    """`worker` (a script beside the tests) run in two real CPU processes (`exchange_worker`):
+    each reports two processes, and every error it measured against its one-process reference
+    within `bound`."""
+    from process_support import run_pool
+
+    for report in run_pool(worker, tmp_path, 2, timeout=120, start=exchange_worker):
+        assert report['processes'] == 2
+        for errors in report['errors'].values():
+            assert max(errors) < bound, errors
+
+
 def routing_case(tokens: int, experts: int, top_k: int, skewed: bool):
     rng = np.random.default_rng(219)
     x = rng.normal(size=(tokens, 8)).astype(np.float32)

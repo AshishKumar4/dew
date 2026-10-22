@@ -88,11 +88,12 @@ from dew.training.optim import (
     scaled_solver,
     weight_decay_mask,
 )
+from dew.training.profiling import ProfileWindow
 from dew.training.quantization import quantize_trunk
 from dew.training.selection import Best
 from dew.training.state import TrainState
 from dew.training.tracker import LocalTracker, Tracker, Trackers, WandbTracker
-from dew.training.trainer import ProfileWindow, Rollout, Trainer
+from dew.training.trainer import Rollout, Trainer
 
 JsonDict = Annotated[
     Mapping[str, object],
@@ -328,10 +329,9 @@ def _member_fields(member: type) -> Iterator[tuple[str, Configured, Annotation]]
     metric over its base's fields) has that constructor's arguments, as the
     registry builds it (`registry.record_class`)."""
     if registry.record_class(member) is not None:
-        for field in dataclasses.fields(member):
-            if field.init and field.name not in ("parent", "name"):
-                default = (field.default_factory() if callable(field.default_factory) else field.default)
-                yield field.name, default, declared_type(member, field.name)
+        for field in registry.constructor_fields(member):
+            default = (field.default_factory() if callable(field.default_factory) else field.default)
+            yield field.name, default, declared_type(member, field.name)
         return
     for name, (parameter, owner) in registry.parameters(member)[0].items():
         if parameter.kind is parameter.POSITIONAL_OR_KEYWORD and parameter.default is parameter.empty:

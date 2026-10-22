@@ -399,16 +399,12 @@ def test_a_saved_byte_decision_run_records_no_tokenizer_backed_processor(tmp_pat
     decision task lays out text with ByteTokenizer. Saving that task keeps
     no media processor to reload, and never treats `byte` as a Hub repo.
     """
+    from model_support import tokenized_qwen3
+
     from dew.interop import Pretrained
 
-    fixtures = Path(__file__).parent / "fixtures" / "hf"
-    directory = tmp_path / "source"
-    directory.mkdir()
-    for name in ("config.json", "model.safetensors"):
-        shutil.copyfile(fixtures / "qwen3-tiny" / name, directory / name)
-    for name in ("tokenizer.json", "tokenizer_config.json"):
-        shutil.copyfile(fixtures / "qwen38-dense-tiny" / name, directory / name)
-    source = Pretrained.load(directory, dtype="float32", attention_impl="xla", max_seq_len=128)
+    source = Pretrained.load(tokenized_qwen3(tmp_path / "source"), dtype="float32", attention_impl="xla",
+                             max_seq_len=128)
     base = DecisionObjective(source, tokenizer=TOKENIZER, specials=SPECIALS, layout=LAYOUT)
     task = Decide(base.model, base.init(jax.random.key(0)), LAYOUT, TOKENIZER, SPECIALS,
                   processor=source.processor)

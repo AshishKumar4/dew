@@ -218,8 +218,9 @@ class NativeRolloutServer:
     step. The server takes it while a step runs and seats it at the next one.
     The server's own sampling policy and transforms decide the draws, and a
     draw keeps both the raw and the behavior likelihoods the server records.
-    If the program ends without `close`, an exit hook stops the stepping after
-    the step in progress.
+    The stepping thread starts at the first submission, so constructing the
+    server starts nothing. If the program ends without `close`, an exit hook
+    stops the stepping after the step in progress.
 
     A draw ends on one of the policy's EOS ids or on the id completing one of
     its stop strings, and `Draw.terminated` tells those from a draw cut at its
@@ -249,12 +250,8 @@ class NativeRolloutServer:
         self._outstanding: set[Future[Draw]] = set()
         self._closed = False
         self._failure: BaseException | None = None
-        self._thread = threading.Thread(target=self._run, name="dew-rollout-server", daemon=True)
-        self._thread.start()
-        # A step under way at exit runs to its end inside jaxlib, so the bound is a step's, not a poll's.
-        # The stepping thread stops after the step in progress, which may be a long first compile;
-        # it holds no external call, so exit waits for it rather than finalizing under it.
-        self._withdraw = stop_at_exit(self._thread, self._stop, timeout=None)
+        self._thread: threading.Thread | None = None
+        self._withdraw: Callable[[], None] | None = None
 
     @property
     def sampling(self) -> Sampling:
@@ -278,6 +275,13 @@ class NativeRolloutServer:
                 raise RuntimeError("the rollout server stopped") from self._failure
             if self._closed:
                 raise RuntimeError("the rollout server is closed")
+            if self._thread is None:
+                self._thread = threading.Thread(target=self._run, name="dew-rollout-server", daemon=True)
+                self._thread.start()
+                # A step under way at exit runs to its end inside jaxlib, so the bound is a step's, not a
+                # poll's. The stepping thread stops after the step in progress, which may be a long first
+                # compile; it holds no external call, so exit waits for it rather than finalizing under it.
+                self._withdraw = stop_at_exit(self._thread, self._stop, timeout=None)
             self._outstanding.add(future)
         try:
             with self._loading:
@@ -350,8 +354,11 @@ class NativeRolloutServer:
 
     def close(self) -> None:
         self._stop()
-        self._thread.join()
-        self._withdraw()
+        with self._futures:
+            thread, withdraw = self._thread, self._withdraw
+        if thread is not None and withdraw is not None:
+            thread.join()
+            withdraw()
         cancelled = RuntimeError("the rollout server closed before this draw finished")
         for future in self._detached():
             settled(future, cancelled)
@@ -544,26 +551,36 @@ class Publication:
     runs only after every replica serves the new version, because a gateway
     stamps a call when it arrives, and a stamp ahead of a replica would claim
     weights the call was not sampled from. A failed push or stamp raises and
-    leaves `version` unchanged. The constructor stamps the launch `version`,
-    so a gateway left at a higher version by an earlier run cannot mislabel
-    this run's first calls. Every process calls `load`, and process 0
-    stamps.
+    leaves `version` unchanged. The launch `version` is stamped when the
+    version is first read, which a scheduler does before it submits a draw
+    under it, so a gateway left at a higher version by an earlier run cannot
+    mislabel this run's first calls, and constructing the publication touches
+    no gateway. Every process calls `load`, and process 0 stamps.
     """
 
     def __init__(self, weights: WeightSync, *, version: int = 0, stamp: Callable[[int], None] | None = None):
         self._weights = weights
         self._stamp = stamp
-        self._stamped(version)
         self._version = version
+        # One lock orders the launch stamp against a load, so the gateway always ends at the version
+        # the engines hold.
+        self._published = threading.Lock()
+        self._launch: int | None = version
 
     @property
     def version(self) -> int:
-        return self._version
+        with self._published:
+            if self._launch is not None:
+                self._stamped(self._launch)
+                self._launch = None
+            return self._version
 
     def load(self, variables: Variables, version: int) -> None:
-        self._weights(variables, version)
-        self._stamped(version)
-        self._version = version
+        with self._published:
+            self._weights(variables, version)
+            self._stamped(version)
+            self._launch = None
+            self._version = version
 
     def _stamped(self, version: int) -> None:
         stamp = self._stamp

@@ -26,7 +26,7 @@ from dew.interop.safetensors_io import read_file, write_file
 from dew.nn.backbones.dit import SimpleDiT
 from dew.nn.dit import TextContext
 
-safetensors_numpy = pytest.importorskip("safetensors.numpy")
+safetensors_numpy = import_module("safetensors.numpy")
 safetensors = import_module("safetensors")
 
 
@@ -381,8 +381,10 @@ def assert_transformers_reads_the_run(export, task, ids, *, ordered_export=None)
     with a clean report (`decoder_export_reference.reference_model`) and,
     over the same ids, holds the run's own logits to tests/reference_error.py's
     rule: in fp32 the reference, in float64 the truth. An `ordered_export`
-    holds the trained run over 52 residual orders when one draw can flake;
-    every reference order in float64 must compute the identity's truth.
+    holds the trained run over 52 residual orders when one draw can flake,
+    each order of the run's canonical tree exported and, packed as the run's
+    task holds it, run by Dew; every reference order in float64 must compute
+    the identity's truth.
     """
     from reference_error import (
         ORDERS,
@@ -393,6 +395,7 @@ def assert_transformers_reads_the_run(export, task, ids, *, ordered_export=None)
     )
     from residual_orders import orders, permuted, residual_width
 
+    from dew.inference.projections import inference_projections
     from dew.interop import Pretrained
     from tools.decoder_export_reference import Case, reference_logits
 
@@ -411,12 +414,12 @@ def assert_transformers_reads_the_run(export, task, ids, *, ordered_export=None)
     model = source.model
     roundings = model.num_layers * (4 * model.emb_features + model.mlp_features + ids.shape[1] + 16)
     roundings += 2 * model.emb_features
-    for order in orders(residual_width(task.variables), ORDERS, seed=0):
-        variables = permuted(task.variables, order)
+    for order in orders(residual_width(source.variables), ORDERS, seed=0):
+        variables = permuted(source.variables, order)
         source.save(ordered_export, variables=variables)
         assert_computes_the_oracle(reference_logits(case, ordered_export, ids, wide=True), truth,
                                    "run export logits in order", roundings=roundings)
-        mine.append(distance(forward(variables), truth))
+        mine.append(distance(forward(inference_projections(task.model, variables)), truth))
         theirs.append(distance(reference_logits(case, ordered_export, ids), truth))
     assert_as_exact_over_orders(mine, theirs, "run export logits")
 
@@ -424,9 +427,11 @@ def assert_transformers_reads_the_run(export, task, ids, *, ordered_export=None)
 def test_a_trained_lm_run_exports_and_reloads_at_its_own_logits(tmp_path):
     """The whole way out of a run directory: run.json and the checkpoint in,
     a Hugging Face directory out, and `Pretrained.load` reads it back at the
-    logits the run's own task computes, as transformers does."""
+    logits the run's weights compute, as transformers does; read with its
+    projections packed, as the run's own task holds them, at the task's."""
     from test_inference import make_lm_run
 
+    from dew.inference.projections import inference_projections
     from dew.interop import Pretrained
 
     run = tmp_path / "run"
@@ -435,7 +440,8 @@ def test_a_trained_lm_run_exports_and_reloads_at_its_own_logits(tmp_path):
     task = dew.pipeline(str(run))
     destination = tmp_path / "export"
 
-    Pretrained.from_run(str(run)).save(destination)
+    exported = Pretrained.from_run(str(run))
+    exported.save(destination)
 
     assert {entry.name for entry in destination.iterdir()} == {
         "config.json", "generation_config.json", "model.safetensors"}
@@ -443,7 +449,10 @@ def test_a_trained_lm_run_exports_and_reloads_at_its_own_logits(tmp_path):
     reloaded = Pretrained.load(destination, dtype="float32", attention_impl="reference")
     ids = jnp.asarray([[3, 4, 5, 6]], jnp.int32)
     np.testing.assert_array_equal(np.asarray(reloaded.model.apply(reloaded.variables, ids)),
-                                  np.asarray(task.model.apply(task.variables, ids)))
+                                  np.asarray(exported.model.apply(exported.variables, ids)))
+    np.testing.assert_array_equal(
+        np.asarray(reloaded.model.apply(inference_projections(reloaded.model, reloaded.variables), ids)),
+        np.asarray(task.model.apply(task.variables, ids)))
     assert_transformers_reads_the_run(destination, task, np.asarray([[3, 4, 5, 6, 7, 8, 9, 10]]),
                                       ordered_export=tmp_path / "orders")
 

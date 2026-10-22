@@ -9,6 +9,7 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
+from model_support import parameter_loss
 from reference_error import (
     PARITY,
     assert_as_exact_as_the_reference,
@@ -55,9 +56,7 @@ def assert_update_as_exact(source, directory: Path) -> Variables:
     objective = LMObjective(loaded, inputs.tokens.shape[1] - 1, ema_decay=None, pad_id=0)
     step = Step(step=jnp.int32(0), key=jax.random.key(0), ema=None)
 
-    def loss(variables):
-        statistics, _ = objective.loss({**loaded.variables, "params": variables}, {"text": inputs}, step)
-        return objective.reduce_loss(statistics)[0]
+    loss = parameter_loss(objective, loaded.variables, {"text": inputs}, step)
 
     def stepped(params):
         gradient = jax.grad(loss)(params)

@@ -10,7 +10,6 @@ that write every tensor back, so `Pretrained.save` restores what it read.
 
 from __future__ import annotations
 
-import dataclasses
 import json
 import os
 from collections.abc import Callable, Mapping, Sequence
@@ -57,12 +56,7 @@ from dew.interop.pipeline_assembly import (
     pipeline_denoiser,
     text_components,
 )
-from dew.interop.processors import (
-    HostProcessor as HostProcessor,
-    Processor as Processor,
-    ProcessorCall as ProcessorCall,
-    hosts,
-)
+from dew.interop.processors import Processor, hosts
 from dew.interop.safetensors_io import MAX_SHARD_SIZE
 from dew.interop.streaming import WeightLayout
 from dew.interop.weights import AUTO, declared_dtype
@@ -72,7 +66,7 @@ from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.multimodal import MultimodalTransformer
 from dew.objectives.base import Variables
-from dew.registry import dtype_name, from_record, projectors, resolve_dtype, towers
+from dew.registry import dtype_name, from_record, projectors, rebuilt, resolve_dtype, towers
 from dew.sampling.pipelines import TextToImage
 from dew.sampling.text import Sampling
 
@@ -422,32 +416,8 @@ class Pretrained:
         around (`TrainerConfig.resumes`), as MaxText loads its base parameters only
         for a run with no checkpoint.
         """
-        return cls._load(name_or_dir, dtype=dtype, param_dtype=param_dtype, attention_impl=attention_impl,
-                         max_seq_len=max_seq_len, revision=revision, gguf_file=gguf_file,
-                         single_file=single_file, dduf_file=dduf_file, mesh=mesh, layout=layout,
-                         fallback=fallback, weights=weights, on_host=on_host)
-
-    @classmethod
-    def _load(cls, name_or_dir: str | Path, *, dtype: DTypeLike = jnp.bfloat16,
-              param_dtype: DTypeLike | Literal["auto"] = jnp.float32,
-              attention_impl: str = "auto", max_seq_len: int | None = None,
-              revision: str | None = None, gguf_file: str | None = None, single_file: str | None = None,
-              dduf_file: str | None = None,
-              mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None, fallback: str | None = None,
-              prepare: Callable[[nn.Module, Variables], Variables] | None = None,
-              weights: bool = True, on_host: bool = False) -> Self:
-        """Share the source reader with inference's pre-placement projection packing."""
-        if fallback not in (None, "torchax"):
-            raise ValueError(f"fallback={fallback!r} names no loader; the one fallback is 'torchax', "
-                             "tier 3 through transformers' PyTorch forward")
-        selected = [name for name, given in (("gguf_file", gguf_file), ("single_file", single_file),
-                                             ("dduf_file", dduf_file)) if given is not None]
-        if len(selected) > 1:
-            raise ValueError(f"{' and '.join(selected)} each name the whole payload to load; pass one")
-        if fallback is not None and selected:
-            raise ValueError(f"fallback='torchax' builds the transformers model the repo's config.json "
-                             f"and weights describe, and {' and '.join(selected)} selects another payload; "
-                             "load it without fallback")
+        selected = _selected_payload(fallback, gguf_file=gguf_file, single_file=single_file,
+                                     dduf_file=dduf_file)
         if on_host and (mesh is not None or layout is not None):
             raise ValueError("on_host keeps the variables as host arrays, and mesh and layout place them; "
                              "pass one")
@@ -483,7 +453,7 @@ class Pretrained:
             loaded = _load_native_source(name_or_dir, directory, commit, gguf_file=gguf_file, placed=placed,
                                          streaming=streaming or not weights, dtype=dtype,
                                          param_dtype=param_dtype, attention_impl=attention_impl,
-                                         max_seq_len=max_seq_len, prepare=prepare)
+                                         max_seq_len=max_seq_len)
         if not isinstance(loaded, cls):
             raise TypeError(f"{name_or_dir} is a {type(loaded).__name__} source, not a {cls.__name__}; "
                             f"load it with {type(loaded).__name__}.load or Pretrained.load")
@@ -537,9 +507,12 @@ class Pretrained:
         An adapted bundle (`lora`) writes the source's own tensors with the factors
         merged into their kernels, as PEFT's `merge_and_unload` does, from its
         variables or a trainer's split of them; `adapter.save` writes the factors
-        alone.
+        alone. A loaded task's tree, its projections packed for serving, is written
+        as the source's own members (`dew.inference.projections.unpacked`).
         """
-        values = self.variables if variables is None else variables
+        from dew.inference.projections import unpacked
+
+        values = unpacked(self.model, self.variables if variables is None else variables)
         if self.adapter is not None:
             values = self.adapter.merge(values)
         quantization = self._quantization()
@@ -634,17 +607,18 @@ class PretrainedDecoder(Pretrained):
         `tokenizer` is the vocabulary the weights were trained with, as an object or
         by name. `save` writes its files next to the weights, so the directory that
         `Pretrained.load` reads back includes its processor. `generation_config` is
-        what generation_config.json records, `GENERATION_DEFAULTS` when None.
+        what generation_config.json records; None uses the native defaults with
+        the exported model's cache mode.
         """
         try:
             decoder = from_record(CausalTransformer, model)
         except ValueError as error:
             raise TypeError(f"{type(model).__name__} has no Hugging Face decoder layout") from error
         config = decoders.export_config(decoder)
-        built = {entry.name: getattr(decoder, entry.name) for entry in dataclasses.fields(decoder)
-                 if entry.init and entry.name not in ("parent", "name")}
+        built = rebuilt(dict, decoder)
         return cls(decoder, variables, None, config, None, built,
-                   decoders.GENERATION_DEFAULTS if generation_config is None else generation_config,
+                   {**decoders.GENERATION_DEFAULTS, 'use_cache': config.get('use_cache', decoder.causal)}
+                   if generation_config is None else generation_config,
                    export_adapter=decoders.export_decoder_weights, tokenizer=tokenizer)
 
     def text_generation(self, *, sampling: Sampling | None = None) -> TextGeneration:
@@ -657,8 +631,9 @@ class PretrainedDecoder(Pretrained):
         caller replaced; the source's EOS and pad ids fill the ones it leaves None,
         and `num_return_sequences` still comes from the source.
 
-        The task shares the bundle's weights, and `dew.pipeline` packs its decoder
-        when it places them. An adapted model whose factors are not merged keeps its
+        The task shares the bundle's weights and packs its decoder's projections inside
+        each generation's compiled call; `dew.pipeline`'s task packs them once, after
+        placing them. An adapted model whose factors are not merged keeps its
         projection paths and is not packed.
         """
         rows = return_sequences(self.config, self.generation_config)
@@ -1256,11 +1231,26 @@ def _decoder_source(config: Mapping[str, object], tensors: Mapping[str, np.ndarr
     return _Built(model, variables, record, built, layouts, retained, export_adapter)
 
 
+def _selected_payload(fallback: str | None, **files: str | None) -> list[str]:
+    """The payload `files` `Pretrained.load` was given by name (`gguf_file`, `single_file`,
+    `dduf_file`), refusing more than one, a fallback beside any, and a fallback no loader is."""
+    if fallback not in (None, "torchax"):
+        raise ValueError(f"fallback={fallback!r} names no loader; the one fallback is 'torchax', "
+                         "tier 3 through transformers' PyTorch forward")
+    selected = [name for name, given in files.items() if given is not None]
+    if len(selected) > 1:
+        raise ValueError(f"{' and '.join(selected)} each name the whole payload to load; pass one")
+    if fallback is not None and selected:
+        raise ValueError(f"fallback='torchax' builds the transformers model the repo's config.json "
+                         f"and weights describe, and {' and '.join(selected)} selects another payload; "
+                         "load it without fallback")
+    return selected
+
+
 def _load_native_source(name_or_dir: str | Path, directory: Path, commit: str | None, *,
                         gguf_file: str | None, placed: Callable[[Variables], Variables], streaming: bool,
                         dtype: str, param_dtype: str, attention_impl: str,
-                        max_seq_len: int | None,
-                        prepare: Callable[[nn.Module, Variables], Variables] | None = None) -> Pretrained:
+                        max_seq_len: int | None) -> Pretrained:
     """Decode native source weights and bind their processors and export layout.
 
     Diffusers pipelines and the explicit torchax fallback have already taken
@@ -1316,8 +1306,7 @@ def _load_native_source(name_or_dir: str | Path, directory: Path, commit: str | 
     named = generation_config.get("tokenizer_name") if processor is None else None
 
     def bundle[K: Pretrained](kind: type[K]) -> K:
-        prepared = variables if prepare is None else prepare(model, variables)
-        return kind(model, placed(prepared), processor, config, directory, built, generation_config,
+        return kind(model, placed(variables), processor, config, directory, built, generation_config,
                     layouts, retained, export_adapter, quantized_tensors=quantized_tensors,
                     quantized_scale_dtype=scale_dtype, quantization_grid=grid,
                     # The weights' commit: a pickle repo's may be its conversion's.

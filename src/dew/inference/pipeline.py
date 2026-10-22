@@ -13,7 +13,7 @@ from __future__ import annotations
 
 import json
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Literal
 
 import jax
@@ -127,7 +127,7 @@ def _from_run(root: epath.Path, *, mesh: MeshSpec | Mesh | None, layout: Layout 
 def _from_source(source: str, *, mesh: MeshSpec | Mesh | None, layout: Layout | None,
                  dtype: str | None, param_dtype: str | None,
                  revision: str | None) -> TextToImage | TextGeneration | BlockGeneration | MaskedGeneration:
-    from dew.inference.projections import inference_projections
+    from dew.inference.projections import packed_owned
     from dew.interop import (
         Pretrained,
         PretrainedBlockDecoder,
@@ -135,18 +135,17 @@ def _from_source(source: str, *, mesh: MeshSpec | Mesh | None, layout: Layout | 
         PretrainedMaskedDecoder,
         PretrainedPipeline,
     )
-    from dew.training.distributed import MeshSpec as DefaultMesh, device_mesh
+    from dew.training.distributed import MeshSpec as DefaultMesh
 
     storage = "auto" if param_dtype is None else param_dtype
     placement = DefaultMesh() if mesh is None else mesh
-    def prepared(model, variables):
-        with jax.set_mesh(device_mesh(placement)):
-            return inference_projections(model, variables)
-    loaded = (Pretrained._load(source, revision=revision, param_dtype=storage, mesh=placement, layout=layout,
-                              prepare=prepared)
+    loaded = (Pretrained.load(source, revision=revision, param_dtype=storage, mesh=placement, layout=layout)
               if dtype is None else
-              Pretrained._load(source, revision=revision, dtype=dtype, param_dtype=storage, mesh=placement,
-                               layout=layout, prepare=prepared))
+              Pretrained.load(source, revision=revision, dtype=dtype, param_dtype=storage, mesh=placement,
+                              layout=layout))
+    if not isinstance(loaded, PretrainedPipeline):
+        # The task owns the weights it loaded: their projections pack once, where they were placed.
+        loaded = replace(loaded, variables=packed_owned(loaded.model, loaded.variables))
     match loaded:
         case PretrainedPipeline():
             return loaded.text_to_image()

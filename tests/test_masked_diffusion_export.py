@@ -37,7 +37,7 @@ from pathlib import Path
 import numpy as np
 import pytest
 from interop_support import assert_restores
-from model_support import flat_tree
+from model_support import cached_round_trips, flat_tree
 
 from dew.data import Memory
 from dew.data.compile import compile
@@ -59,14 +59,7 @@ def workspace(tmp_path_factory):
 @pytest.fixture(scope="module")
 def trips(workspace):
     """Each family trained and exported once, shared by every case here."""
-    cache = {}
-
-    def trip(name: str):
-        if name not in cache:
-            cache[name] = tool.round_trip(CASES[name], workspace)
-        return cache[name]
-
-    return trip
+    return cached_round_trips(tool.round_trip, CASES, workspace)
 
 
 @pytest.fixture(params=list(CASES), ids=list(CASES))
@@ -111,6 +104,10 @@ def test_the_derived_config_writer_round_trips_each_family(fixture, tmp_path):
     assert held.keys() == again.keys()
     for name, leaf in again.items():
         assert np.array_equal(np.asarray(leaf), np.asarray(held[name])), name
+    prompt = np.load(FIXTURES / fixture / 'input_ids.npy')[:1, :4]
+    generated = reloaded.text_generation()(prompt, 2, key=7, steps=2).host().tokens
+    np.testing.assert_array_equal(generated[:, :4], prompt)
+    assert generated.shape == (1, 6) and np.all(generated[:, 4:] != source.model.mask_token_id)
 
 
 @pytest.mark.parametrize("fixture", ["llada-tiny", "dream-tiny"])
