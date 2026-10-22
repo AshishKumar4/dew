@@ -29,7 +29,7 @@ from dew.objectives.rl.sessions import ROUTED_EXPERTS_KEY, ROUTED_KEY, Call, Ses
 from dew.training import Layout, MeshSpec
 
 VOCAB, SEQ_LEN, LAYERS, EXPERTS, TOP_K = 64, 16, 4, 8, 2
-SEEDS = {'gate': 8, 'banked': 32, 'pipeline': 8, 'conflicting prefix': 128, 'packed': 64}
+SEEDS = {'gate': 128, 'banked': 32, 'pipeline': 8, 'conflicting prefix': 128, 'packed': 64}
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada, 2026-10-22):
 the most any of a site's cases took."""
 
@@ -163,10 +163,11 @@ def test_replaying_a_forwards_own_routing_changes_nothing():
 
 def test_the_gate_keeps_its_gradient_under_replay():
     """Only the selection is fixed: the replayed loss is smooth in the router
-    kernel, and its gradient is on par with central differences a kernel entry
-    at a time (step 1e-3), over drawn models, tokens and records (check 1), the
-    truth the stack's own central differences in float64 (step 1e-6), which
-    read the loss alone and not the backward under test."""
+    kernel, and its gradient, taken backward, is on par with the one taken
+    forward a kernel entry at a time, over drawn models, tokens and records
+    (check 1), the truth the stack's forward derivatives in float64. The loss
+    is scored from the whole logits, whose head forward mode passes; the tiled
+    head's custom backward is another test's."""
     obj, wide = objective(layers=(1, 3)), objective(layers=(1, 3), dtype=jnp.float64)
     init = jax.jit(obj.init)
 
@@ -177,16 +178,14 @@ def test_the_gate_keeps_its_gradient_under_replay():
         pair = jnp.concatenate([routed, (routed + 1) % EXPERTS], axis=-1)
         return params, tokens_of(2, seed=1000 + seed), pair
 
-    def central(step):
-        # Looped over the kernel's entries: the experts' ragged product has no batching rule past its
-        # first dimension.
-        def differentiate(loss):
-            def run(kernel):
-                basis = step * jnp.eye(kernel.size, dtype=kernel.dtype).reshape(-1, *kernel.shape)
-                return jax.lax.map(lambda nudge: (loss(kernel + nudge) - loss(kernel - nudge)) / (2 * step),
-                                   basis).reshape(kernel.shape)
-            return run
-        return differentiate
+    def forward(loss):
+        # A directional derivative a kernel entry at a time, looped: the experts' ragged product has
+        # no batching rule past its first dimension.
+        def run(kernel):
+            basis = jnp.eye(kernel.size, dtype=kernel.dtype).reshape(-1, *kernel.shape)
+            return jax.lax.map(lambda tangent: jax.jvp(loss, (kernel,), (tangent,))[1], basis).reshape(
+                kernel.shape)
+        return run
 
     def gradient(obj, differentiate):
         def run(params, tokens, routed):
@@ -194,14 +193,14 @@ def test_the_gate_keeps_its_gradient_under_replay():
                 layer = params['params']['layers_1']
                 tree = {**params, 'params': {**params['params'], 'layers_1': {
                     **layer, 'mlp': {**layer['mlp'], 'gate': {'kernel': kernel}}}}}
-                return jnp.sum(replayed_log_probs(obj, tree, tokens, (routed, None)))
+                return -jnp.sum(obj.token_scores(tree, tokens, routes=(routed, None), logits=True).losses)
             return differentiate(loss)(params['params']['layers_1']['mlp']['gate']['kernel'])
         return jax.jit(run)
 
     backward = gradient(obj, jax.grad)
     assert float(jnp.abs(backward(*draw(0))).sum()) > 0
-    assert_as_exact(backward, gradient(obj, central(1e-3)), draw, "gate gradient", seeds=SEEDS['gate'],
-                    truth_fn=gradient(wide, central(1e-6)))
+    assert_as_exact(backward, gradient(obj, forward), draw, "gate gradient", seeds=SEEDS['gate'],
+                    truth_fn=gradient(wide, forward))
 
 
 @pytest.mark.parametrize("parallel", [False, True], ids=["router", "gemma4"])
