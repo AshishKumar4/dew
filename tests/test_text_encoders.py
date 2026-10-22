@@ -20,6 +20,7 @@ import functools
 import json
 import shutil
 from pathlib import Path
+from types import SimpleNamespace
 
 import jax
 import numpy as np
@@ -74,7 +75,8 @@ def drawn_prompts(seed: int, rows: int = 4) -> list[str]:
 
 
 def text_draw(encoder):
-    """Check 1's draw of drawn prompts' token ids and masks, as `encoder` tokenizes them."""
+    """Check 1's draw of drawn prompts' token ids and masks, as `encoder` (anything with a
+    `tokenize`) tokenizes them."""
     def draw(seed):
         tokens = encoder.tokenize(drawn_prompts(seed))
         return ({name: np.asarray(tokens[name], np.int32) for name in ("input_ids", "attention_mask")},)
@@ -125,9 +127,8 @@ def transformers_clip(source, inputs, dtype, names):
                          for name in ("input_ids", "attention_mask"))
             text = model.text_model(input_ids=ids, attention_mask=mask)
             outputs.update(last_hidden_state=text.last_hidden_state, pooler_output=text.pooler_output)
-            if "text_embeds" in names:
-                projected = model.get_text_features(input_ids=ids, attention_mask=mask)
-                outputs["text_embeds"] = projected.pooler_output
+            # `get_text_features`' projection of the pooled row, without running the tower again.
+            outputs["text_embeds"] = model.text_projection(text.pooler_output)
         if "image_embeds" in names:
             pixels = torch.from_numpy(np.asarray(inputs["pixel_values"])).to(dtype)
             outputs["image_embeds"] = model.get_image_features(pixel_values=pixels).pooler_output
@@ -424,7 +425,13 @@ def test_the_real_checkpoint_embeddings_match_the_reference():
         return {"image_embeds": model.get_image_features(inputs["pixel_values"]),
                 "text_embeds": model.get_text_features(inputs["input_ids"], inputs["attention_mask"])}
 
-    prompts_of = text_draw(CLIPText.from_pretrained(repo))
+    from transformers import CLIPTokenizer
+
+    # The checkpoint's tokenizer alone, padded and truncated as `CLIPText.tokenize` does.
+    tokenizer = CLIPTokenizer.from_pretrained(repo)
+    prompts_of = text_draw(SimpleNamespace(tokenize=lambda texts: tokenizer(
+        texts, padding="max_length", max_length=tokenizer.model_max_length, truncation=True,
+        return_tensors="np")))
 
     def drawn(seed):
         # Drawn images and drawn prompts, each its own draw of the seed.
