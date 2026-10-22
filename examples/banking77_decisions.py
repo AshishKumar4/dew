@@ -32,10 +32,10 @@ from dew.decision import (
     Brier,
     Decide,
     DecisionObjective,
-    Decisions,
     Example,
     LogLoss,
     StateFirstLayout,
+    decisions,
 )
 from dew.interop import Pretrained
 from dew.lora import LoRA
@@ -64,23 +64,25 @@ def report(out: str, line: dict) -> None:
 
 
 def main(options: Options) -> None:
-    from dew.config.data import HoldOut, loader
-    from dew.data import Hub
+    from dew.data import Hub, Memory
     from dew.data.compile import iterate
 
-    table = Decisions(source=Hub(BANKING77[0], revision=BANKING77[1]), label="label_text", question="intent",
-                      instructions="Which banking request is this?",
-                      validation=HoldOut(fraction=0.1, by="random", most=400))
-    training, held, _ = table.pipelines()
-    # Each Hub split is downloaded and prepared the first time it is read.
-    train = [Example.of(row["example"]) for row in iterate(training, read="memory", provision=True)]
-    held_out = [] if held is None else [
-        Example.of(row["example"]) for row in iterate(held, read="memory", provision=True)]
+    def examples(rows, **settings) -> list[Example]:
+        """The table's rows as one intent question each, read whole; each Hub split is downloaded
+        and prepared the first time it is read."""
+        asked = rows.pipe(decisions, label="label_text", question="intent",
+                          instructions="Which banking request is this?", **settings)
+        return [Example.of(row["example"]) for row in iterate(asked, read="memory", provision=True)]
+
+    def table(rows: list[Example]):
+        return Memory([{"example": row} for row in rows]).pipe(decisions).read("memory")
+
+    # A tenth of the training split, by the hash of each row, is held out, at most 400 rows of it.
+    training, held = Hub(BANKING77[0], revision=BANKING77[1]).holdout(0.1)
+    train, held_out = examples(training), examples(held)[:400]
     # The test split asks the same 77 options, in the training split's order.
     intents = train[0].questions["intent"].options
-    test_pipeline, _, _ = replace(table, source=Hub(BANKING77[0], revision=BANKING77[1], split="test"),
-                                  validation=None, options=tuple(intents)).pipelines()
-    test = [Example.of(row["example"]) for row in iterate(test_pipeline, read="memory", provision=True)]
+    test = examples(Hub(BANKING77[0], revision=BANKING77[1], split="test"), options=tuple(intents))
 
     if options.backbone == "laya":
         laya = Decide.from_pretrained(LAYA[0], revision=LAYA[1], dtype="bfloat16")
@@ -96,12 +98,11 @@ def main(options: Options) -> None:
         layout = StateFirstLayout(max_len=512, head_max_len=448, option_tokens=12)
         objective = DecisionObjective(qwen, loss=LogLoss() + 0.5 * Brier(), layout=layout)
 
-    data = loader(Decisions(source=train, validation=held_out[:options.batch * 8]), batch=options.batch,
-                read="memory", objective=objective.data())
     checkpoints = Checkpoints(options.run, keep=1)
     state = Trainer(objective, OptimConfig(learning_rate=options.learning_rate), key=0,
                     checkpoints=checkpoints).fit(
-        data, steps=data.epoch_steps(options.epochs), eval_every=options.eval_every,
+        table(train).shuffle().repeat().batch(options.batch), epochs=options.epochs,
+        validation=table(held_out[:options.batch * 8]).batch(options.batch), eval_every=options.eval_every,
         checkpoint_every=datetime.timedelta(minutes=10), metrics=[Accuracy(), ECE(), AURC(), LogLoss()])
     checkpoints.wait()
 

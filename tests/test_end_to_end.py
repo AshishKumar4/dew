@@ -590,10 +590,10 @@ def test_a_run_config_tunes_its_autoencoder_and_from_run_decodes_with_the_tuned_
     running statistics, and samples exactly as the trained objective's own
     task does."""
     from diffusion_stubs import batch_for
+    from diffusion_support import images_of
 
     from dew.checkpoints import Checkpoints
     from dew.config import ModelConfig, ObjectiveConfig, TrainerConfig
-    from dew.config.data import ImageData
     from dew.objectives.diffusion import DiffusionRunConfig, PretrainedAutoencoder, TextCondition
 
     for name in ("tiny_diffusers", "rae"):
@@ -602,8 +602,7 @@ def test_a_run_config_tunes_its_autoencoder_and_from_run_decodes_with_the_tuned_
     config = DiffusionRunConfig(
         model=ModelConfig("simple_dit", {"patch_size": 1, "emb_features": 16, "num_layers": 2, "num_heads": 2,
                                          "mlp_ratio": 1, "dtype": "float32", "attention_impl": "xla"}),
-        data=ImageData(source="tfds://oxford_flowers102",
-                       image_size=32), preset=presets.Flow(), val_metrics=(),
+        data=images_of("tfds://oxford_flowers102", 32), preset=presets.Flow(), val_metrics=(),
         trainer=TrainerConfig(checkpoint_dir=str(tmp_path)),
         text=TextCondition(encoder="char_table", checkpoint="char_table"),
         autoencoder=PretrainedAutoencoder(modelname=str(tmp_path / "tiny_diffusers/sd/vae"), dtype="float32"),

@@ -29,6 +29,8 @@ class _FileInstruction(Protocol):
 class _SplitInfo(Protocol):
     @property
     def file_instructions(self) -> Sequence[_FileInstruction]: ...
+    @property
+    def num_examples(self) -> int: ...
 
 class _DatasetInfo(Protocol):
     @property
