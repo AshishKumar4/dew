@@ -82,7 +82,7 @@ def snn_delays_config() -> OptimConfig:
     rate = OneCycle(peak=5e-3, every=PER_EPOCH)
     b1 = OneCycle(peak=0.85, init=0.95, end=0.95, every=PER_EPOCH)
     return OptimConfig(optimizer="adam", param_groups=(
-        ParamGroup("delays", ("delay",), schedule=Cosine(peak=0.1, warmup_steps=0, every=PER_EPOCH),
+        ParamGroup("delays", ("delay",), rate=Cosine(peak=0.1, warmup_steps=0, every=PER_EPOCH),
                    bounds=(0.0, 3.0)),
         ParamGroup("weights", ("kernel",), schedule=rate, b1=b1, weight_decay=WEIGHT_DECAY),
         ParamGroup("norms", ("*",), schedule=rate, b1=b1),
@@ -134,7 +134,7 @@ def test_grouped_adam_is_torchs_adam_with_param_groups_a_momentum_cycle_and_a_cl
 
 def test_a_bounded_group_clamps_its_parameters_and_no_others():
     params = {"delay": jnp.asarray([0.05, 2.95]), "kernel": jnp.asarray([0.05, 2.95])}
-    config = OptimConfig(optimizer="adam", learning_rate=0.5, param_groups=(
+    config = OptimConfig(optimizer="adam", rate=0.5, param_groups=(
         ParamGroup("delays", ("delay",), bounds=(0.0, 3.0)), ParamGroup("rest", ("*",))))
     solver = config.build(1)
     grads = {"delay": jnp.asarray([1.0, -1.0]), "kernel": jnp.asarray([1.0, -1.0])}
