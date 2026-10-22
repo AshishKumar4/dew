@@ -10,6 +10,7 @@ rescoring with its recording, from the float64 evaluation over drawn inputs
 own states; what is one computation, or exact arithmetic, is held exactly.
 """
 
+import itertools
 import math
 from pathlib import Path
 
@@ -40,6 +41,8 @@ SEEDS = {'guided walk': 8, 'converted': 8, 'rescored walk': 8, 'clipping': 8, 'k
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada)."""
 ROWS = 64
 """A drawn batch's rows: enough that a few seeds resolve a site."""
+BATCHES = 16
+"""The batches a draw of a site holds whose outputs are one number a batch."""
 
 
 def as_float32(tree):
@@ -288,16 +291,18 @@ def test_flow_objective_matches_clipping_and_conditional_gaussian_kl():
                                                           key=jax.random.key(3)))
 
     def draw(seed):
+        # Sixteen batches a draw: each loss and gradient is one number a batch.
         keys = jax.random.split(jax.random.fold_in(jax.random.key(5), seed), 3)
-        return (0.5 * jax.random.normal(keys[0], (ROWS, 2)),
-                jax.random.uniform(keys[1], (ROWS,), minval=-3, maxval=3),
-                jax.random.bernoulli(keys[2], 0.6, (ROWS, 3)))
+        return (0.5 * jax.random.normal(keys[0], (BATCHES, ROWS, 2)),
+                jax.random.uniform(keys[1], (BATCHES, ROWS), minval=-3, maxval=3),
+                jax.random.bernoulli(keys[2], 0.6, (BATCHES, ROWS, 3)))
 
     def batch_of(start, advantages, mask):
         batch = trajectory_batch(walk(start), advantages, mask)
         return {**batch, "old_log_probs": jnp.where(mask, batch["old_log_probs"], jnp.nan)}
 
     @jax.jit
+    @jax.vmap
     def scored(start, advantages, mask):
         batch = batch_of(start, advantages, mask)
 
@@ -315,14 +320,16 @@ def test_flow_objective_matches_clipping_and_conditional_gaussian_kl():
                 "policy": clipped_objective(gain, states, times, advantages, mask, beta=0.0)}
 
     def reference_arm(start, advantages, mask):
-        trajectory = walk(start)
-        return closed(trajectory.states, trajectory.times, advantages, mask, jnp.float32(0.9))
+        trajectory = jax.vmap(walk)(start)
+        return jax.vmap(closed, (0, 0, 0, 0, None))(trajectory.states, trajectory.times, advantages, mask,
+                                                    jnp.float32(0.9))
 
     def truth(start, advantages, mask):
-        trajectory = walked_in_float32(walk, start)
+        trajectory = walked_in_float32(jax.vmap(walk), start)
         with jax.enable_x64(new_val=True):
-            return closed(np.asarray(trajectory.states, np.float64), np.asarray(trajectory.times, np.float64),
-                          advantages, mask, jnp.float64(0.9))
+            return jax.vmap(closed, (0, 0, 0, 0, None))(
+                np.asarray(trajectory.states, np.float64), np.asarray(trajectory.times, np.float64),
+                advantages, mask, jnp.float64(0.9))
 
     assert_as_exact(scored, reference_arm, draw, "clipping", seeds=SEEDS['clipping'], truth_fn=truth)
 
@@ -339,7 +346,7 @@ def test_flow_objective_matches_clipping_and_conditional_gaussian_kl():
     assert_as_exact(rescored(old), lambda start: walk(start).log_probs, drawn_rows((2,)),
                     "rescored clipping walk", seeds=SEEDS['rescored walk'], truth_fn=wide_rescored)
 
-    start, advantages, mask = draw(0)
+    start, advantages, mask = (value[0] for value in draw(0))
     trajectory = walk(start)
     latent = np.asarray(trajectory.states[:, :-1], np.float64)
     following = np.asarray(trajectory.states[:, 1:], np.float64)
@@ -620,16 +627,18 @@ class ConstantVelocity(nn.Module):
 
 def test_flow_evaluation_and_preview_use_live_policy_with_frozen_reference():
     """Evaluation and preview sample the live policy, a constant velocity, not the frozen reference:
-    each image is the noise less the velocity times the walk's whole time, one, clipped, on par with
-    that closed form's from its float64 evaluation over drawn speeds and keys (check 1)."""
+    each image is the noise walked by the velocity through the shifted schedule's steps, one in all,
+    clipped, on par with that Euler walk in NumPy from its float64 evaluation over drawn speeds and
+    keys (check 1)."""
     from dew.diffusion.presets import Flow
 
     preset = Flow(shift=3)
     process = preset()
-    objective = FlowGRPOObjective(ConstantVelocity(), preset, InputSpec(Field("image", (2, 2, 1))),
+    shape = (2, 16, 1)
+    objective = FlowGRPOObjective(ConstantVelocity(), preset, InputSpec(Field("image", shape)),
                                   beta=0.1, guidance=None, steps=3)
     reference = objective.init(jax.random.key(51))
-    batch = {"image": np.zeros((ROWS, 2, 2, 1), np.uint8)}
+    batch = {"image": np.zeros((ROWS, *shape), np.uint8)}
 
     def draw(seed):
         keys = jax.random.split(jax.random.fold_in(jax.random.key(52), seed))
@@ -641,15 +650,21 @@ def test_flow_evaluation_and_preview_use_live_policy_with_frozen_reference():
         return {"evaluated": objective.evaluate(live, batch, step).images,
                 "previewed": objective.preview(live, batch, step).images}
 
-    def closed(speed, key):
+    def walked(speed, key):
         with jax.enable_x64(new_val=False):
             noise_key, _ = jax.random.split(jax.random.wrap_key_data(key))
-            noise = np.asarray(process.noise(noise_key, (ROWS, 2, 2, 1)))
-        images = np.clip(np.asarray(noise, np.asarray(speed).dtype) - speed, -1, 1)
+            noise = np.asarray(process.noise(noise_key, (ROWS, *shape)))
+            times = np.asarray(process.times(objective.steps))
+        dtype = np.asarray(speed).dtype
+        sigmas = [3 * t / (1 + 2 * t) for t in times.astype(dtype)]
+        images = noise.astype(dtype)
+        for sigma, following in itertools.pairwise(sigmas):
+            images = images + (following - sigma) * speed
+        images = np.clip(images, -1, 1)
         return {"evaluated": images, "previewed": images[:4]}
 
-    assert sampled(*draw(0))["previewed"].shape == (4, 2, 2, 1)
-    assert_as_exact(sampled, closed, draw, "live policy", seeds=SEEDS['live policy'])
+    assert sampled(*draw(0))["previewed"].shape == (4, *shape)
+    assert_as_exact(sampled, walked, draw, "live policy", seeds=SEEDS['live policy'])
 
 
 
@@ -692,8 +707,6 @@ def test_mixed_precision_transition_keeps_density_arithmetic_in_float32():
 
 
 def test_float64_callback_distinctions_reach_a_real_policy_update():
-    import itertools
-
     from dew.data.dataset import Loader
     from dew.nn.backbones.dit import SimpleDiT
 
@@ -726,8 +739,6 @@ def test_float64_callback_distinctions_reach_a_real_policy_update():
 
 
 def test_conditioned_prompt_only_evaluation_preview_and_trainer_consumers():
-    import itertools
-
     from dew.artifacts import ImageGrid
     from dew.data.dataset import Loader
     from dew.inputs import CharTable, Condition
