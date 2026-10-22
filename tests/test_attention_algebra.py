@@ -4,6 +4,8 @@
 form and hook. A mainloop that masked, hooked or normalized on its own would part from the other here.
 The algebra's own `merge` is held to one pass over the keys it joins."""
 
+import functools
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -40,17 +42,20 @@ RESIDUALS = ("output", "maximum", "denominator", "anchor key", "split sums")
 """The forward's outputs with `residuals`, in order."""
 
 
-def both(case: dict, names: frozenset, dtype, tiles: attention_triton.Tiles):
+def both(case: dict, names: frozenset, dtype, tiles: attention_triton.Tiles,
+         natural: bool = template.NATURAL):
     """The Triton mainloop's and the plain-JAX mainloop's output and residuals over `case` and the hooks
-    `names`, seed 0."""
+    `names`, seed 0, the exponent `natural` or the fold."""
     queries, keys = geometry(case)
     spans = template.spans(queries, keys, ROWS, **arguments(case))
     hooks = hooks_for(names, queries, 32, gate_of(queries, 32))
     query, key, value = drawing(queries, keys, dtype)(0)
     with tuning.pinned({attention_triton.TritonForward: tiles}):
-        triton = attention_triton.forward(query, key, value, spans, hooks, residuals=True, interpret=True)
+        triton = attention_triton.forward(query, key, value, spans, hooks, residuals=True, natural=natural,
+                                          interpret=True)
     portable = attention_portable.attend(query, key, value, spans, hooks, block_q=tiles.block_q,
-                                         block_k=tiles.block_k, pad=attention_triton.BLOCK, residuals=True)
+                                         block_k=tiles.block_k, pad=attention_triton.BLOCK, residuals=True,
+                                         natural=natural)
     return triton, portable
 
 
@@ -63,19 +68,21 @@ def test_both_mainloops_compute_the_same_bits_over_every_call_form(form, tiles):
         assert_same_bits(mine, theirs, f"{form} {name}")
 
 
+@pytest.mark.parametrize("natural", [False, True], ids=["fold", "natural"])
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16], ids=["float32", "bfloat16"])
 @pytest.mark.parametrize("hooks", HOOKS)
-def test_both_mainloops_compute_the_same_bits_under_every_hook(hooks, dtype):
+def test_both_mainloops_compute_the_same_bits_under_every_hook(hooks, dtype, natural):
     """Each hook (softcap, ALiBi, sinks, the output gate, all at once) over a windowed causal call of
-    packed documents, in both dtypes."""
-    triton, portable = both(CASES["causal-documents-window"], HOOKS[hooks], dtype, TILES[1])
+    packed documents, in both dtypes and both forms of the exponent."""
+    triton, portable = both(CASES["causal-documents-window"], HOOKS[hooks], dtype, TILES[1], natural)
     for name, mine, theirs in zip(RESIDUALS, triton, portable, strict=True):
-        assert_same_bits(mine, theirs, f"{hooks} {jnp.dtype(dtype).name} {name}")
+        assert_same_bits(mine, theirs, f"{hooks} {jnp.dtype(dtype).name} natural {natural} {name}")
 
 
-def both_backward(case: dict, names: tuple, dtype, tiles: attention_triton.Tiles):
+def both_backward(case: dict, names: tuple, dtype, tiles: attention_triton.Tiles,
+                  natural: bool = template.NATURAL):
     """The Triton mainloop's and the plain-JAX mainloop's gradients over `case` and the score hooks
-    `names` at `tiles` (both launches'), seed 0."""
+    `names` at `tiles` (both launches'), seed 0, the exponent `natural` or the fold."""
     queries, keys = geometry(case)
     spans = template.spans(queries, keys, ROWS, **arguments(case))
     score_mod, kinds, draw_hooks = score_hooks(names, queries, keys, 32)
@@ -88,9 +95,10 @@ def both_backward(case: dict, names: tuple, dtype, tiles: attention_triton.Tiles
                                             tiles.warps, tiles.stages)
     # Both mainloops' forwards at the same tiles, whose sums the backwards read (`Split`).
     with tuning.pinned({attention_triton.TritonBackward: config, attention_triton.TritonForward: tiles}):
-        triton = attention_triton.backward(query, key, value, spans, hooks, dout, interpret=True)
+        triton = attention_triton.backward(query, key, value, spans, hooks, dout, natural=natural,
+                                           interpret=True)
     portable = attention_portable.backward(query, key, value, spans, hooks, dout, block_q=tiles.block_q,
-                                           block_k=tiles.block_k, pad=attention_triton.BLOCK)
+                                           block_k=tiles.block_k, pad=attention_triton.BLOCK, natural=natural)
     return triton, portable
 
 
@@ -109,13 +117,15 @@ def test_both_mainloops_compute_the_same_gradients_over_every_call_form(form, ti
     assert_same_bits(triton, portable, form)
 
 
+@pytest.mark.parametrize("natural", [False, True], ids=["fold", "natural"])
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16], ids=["float32", "bfloat16"])
 @pytest.mark.parametrize("hooks", SCORE_HOOKS)
-def test_both_mainloops_compute_the_same_gradients_under_every_score_hook(hooks, dtype):
+def test_both_mainloops_compute_the_same_gradients_under_every_score_hook(hooks, dtype, natural):
     """Each score hook's gradients (its parameters' and the initial state's too) over a windowed causal
-    call of packed documents, in both dtypes."""
-    triton, portable = both_backward(CASES["causal-documents-window"], SCORE_HOOKS[hooks], dtype, TILES[1])
-    assert_same_bits(triton, portable, f"{hooks} {jnp.dtype(dtype).name}")
+    call of packed documents, in both dtypes and both forms of the exponent."""
+    triton, portable = both_backward(CASES["causal-documents-window"], SCORE_HOOKS[hooks], dtype, TILES[1],
+                                     natural)
+    assert_same_bits(triton, portable, f"{hooks} {jnp.dtype(dtype).name} natural {natural}")
 
 
 @pytest.mark.parametrize("hooks", ["none", "sinks", "softcap"])
@@ -520,6 +530,42 @@ def test_the_accurate_form_is_as_exact_as_the_reference_at_its_raw_domains_edges
     assert_as_exact(jax.jit(ours), jax.jit(reference), draw, f"accurate form at a {edge}", seeds=8)
 
 
+def test_a_row_that_does_not_overflow_keeps_the_plain_walks_bits_beside_one_that_does():
+    """Two documents a row of one program: two queries over two drawn keys, and four over four equal keys
+    whose values near 1e38 overflow their weighted sum. The guarded walk shifts only the latter rows
+    (`algebra.room`'s `live`): the former's output and residuals are the unguarded walk's to the bit, in
+    the plain-JAX mainloop and the Triton one, which agree on every row."""
+    streams = jax.random.split(jax.random.key(0), 3)
+    query = jnp.zeros((1, 6, 1, 16), jnp.float32).at[:, :2].set(jax.random.normal(streams[0], (1, 2, 1, 16)))
+    key = jnp.zeros((1, 6, 1, 16), jnp.float32).at[:, :2].set(jax.random.normal(streams[1], (1, 2, 1, 16)))
+    value = jax.random.normal(streams[2], (1, 6, 1, 16), jnp.float32).at[:, 2:, :, 0].set(1e38)
+    documents = jnp.asarray([[1, 1, 2, 2, 2, 2]], jnp.int32)
+    spans = template.spans(6, 6, 1, segment_ids=documents)
+    call = template.padded_call(query, key, value, spans, template.Hooks(), attention_triton.BLOCK)
+
+    def portable(*, headroom: bool):
+        spec = algebra.Forward(spans.form, spans.keys, ids=True, scale=16 ** -0.5, natural=True,
+                               headroom=headroom)
+        out, kept = attention_portable.forward(spec, call.query, call.key, call.value, call.start, call.end,
+                                               call.query_ids, call.key_ids, (), (), (), (), None, block_q=32,
+                                               block_k=32, output_mod=None, residuals=True)
+        return [np.asarray(leaf)[..., :6, :, :16] if leaf.ndim == 4 and leaf.shape[1] == call.queries
+                else np.asarray(leaf) for leaf in jax.tree.leaves((out, kept))]
+
+    guarded, plain = portable(headroom=True), portable(headroom=False)
+    assert not np.isfinite(plain[0][0, 2:]).all() and np.isfinite(guarded[0]).all()
+    for leaf, (mine, theirs) in enumerate(zip(guarded, plain, strict=True)):
+        rows = (slice(None), slice(0, 2)) if leaf == 0 else (slice(None), slice(None), slice(0, 2))
+        np.testing.assert_array_equal(mine[rows], theirs[rows], err_msg=f"leaf {leaf}")
+    with tuning.pinned({attention_triton.TritonForward: TILES[1]}):
+        triton = attention_triton.forward(query, key, value, spans, residuals=True, natural=True,
+                                          interpret=True)
+    ported = attention_portable.attend(query, key, value, spans, block_q=TILES[1].block_q,
+                                       block_k=TILES[1].block_k, pad=attention_triton.BLOCK, residuals=True,
+                                       natural=True)
+    assert_same_bits(triton, ported, "an overflowing row beside one that does not")
+
+
 @pytest.mark.parametrize("raw", [True, False], ids=["raw", "scaled"])
 def test_the_accurate_forms_rescale_takes_the_plain_factor_where_its_correction_is_not_finite(raw):
     """`algebra.carried` compensates a state's factor `exp(m - safe)` for its exponent's rounding and takes
@@ -531,3 +577,24 @@ def test_the_accurate_forms_rescale_takes_the_plain_factor_where_its_correction_
     m = jnp.asarray([-jnp.inf, -1e35, 0.0], jnp.float32)
     found = np.asarray(algebra.carried(spec, m, jnp.zeros(3, jnp.float32)))
     np.testing.assert_array_equal(found, np.asarray([0.0, 0.0, 1.0], np.float32))
+
+
+@pytest.mark.parametrize("raw", [True, False], ids=["raw", "scaled"])
+def test_the_accurate_forms_rescale_is_as_exact_as_its_exponent_rounded_once(raw):
+    """`algebra.carried`'s factor `exp((m - safe) * scale)` for maxima drawn either side of 0, whose
+    difference rounds, compensated for that rounding and, raw, for its product with the scale's: check 1
+    against the factor of the rounded exponent (`Forward.carry`), from float64. A compensation of the
+    wrong sign or scale would err past it."""
+    spec = algebra.Forward("full", 4, ids=False, scale=0.125, natural=True, initial=not raw)
+    assert spec.raw == raw
+
+    def draw(seed):
+        streams = jax.random.split(jax.random.key(seed))
+        return (jax.random.uniform(streams[0], (4096,), jnp.float32, -40.0, 0.0),
+                jax.random.uniform(streams[1], (4096,), jnp.float32, 0.0, 40.0))
+
+    def rounded(m, safe):
+        return spec.carry(m - safe)
+
+    assert_as_exact(jax.jit(functools.partial(algebra.carried, spec)), jax.jit(rounded), draw,
+                    f"the accurate form's rescale, {'raw' if raw else 'scaled'}", seeds=8)

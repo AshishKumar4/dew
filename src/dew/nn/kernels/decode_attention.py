@@ -53,7 +53,7 @@ from . import tuning
 from .generation import INHERENT, gpu_target, triton_runs
 from .selection import Requirement
 from .templates import attention_algebra as algebra
-from .templates.attention import NATURAL, interpreted_dot
+from .templates.attention import NATURAL, kernel_dot
 
 if TYPE_CHECKING:
     # Named in quotes: tokamax reads its ops' `_fwd` annotations as types, which postponed ones are not.
@@ -115,35 +115,21 @@ over an `AttentionCase`): a GPU Dew's Triton kernels run on, at most `QUERIES` p
 power-of-two width from 16 to 256, a capacity of whole blocks and one of its dtypes on both sides."""
 
 
-FULL = jax.lax.Precision.HIGHEST
-"""Each product's precision: IEEE fp32 for fp32 operands, and bf16's or fp16's own product for those."""
-
-
-def _dot(a: jax.Array, b: jax.Array, interpret: bool) -> jax.Array:
-    """`a @ b` in fp32 at `FULL` precision; interpreted, the template's CPU product (`interpreted_dot`)."""
-    if interpret:
-        return interpreted_dot(a, b)
-    from jax.experimental.pallas import triton as plgpu
-
-    return plgpu.dot(a, b, precision=FULL).astype(jnp.float32)
-
-
 def _capped(softcap: float, logits, q_pos, k_pos):
     """Gemma 2's logit cap, `softcap · tanh(logit / softcap)`, the decode kernel's one score hook."""
     del q_pos, k_pos
     return softcap * jnp.tanh(logits / softcap)
 
 
-def _spec(scale: float, softcap: float | None, natural: bool, dtype, capacity: int,
-          sinks: bool) -> algebra.Forward:
+def _spec(scale: float, softcap: float | None, natural: bool, dtype, sinks: bool) -> algebra.Forward:
     """The algebra's facts for a decode launch: each query block's keys its row's span (`spans`), no
     documents, the cap as its score hook, the logits `natural` or not (`algebra.Forward.base2`), and
-    whether a row's sums over `capacity` keys of `dtype`, with its sinks, need a guard
-    (`algebra.headroom`). A decode block's rows are a key head's query heads and positions
-    (`grouped_query`), so the hook takes no query positions."""
+    whether a row's sums of `dtype` values, with its sinks, need a guard (`algebra.headroom`). A decode
+    block's rows are a key head's query heads and positions (`grouped_query`), so the hook takes no query
+    positions."""
     return algebra.Forward("spans", 0, ids=False, scale=scale,
                            score_mod=None if softcap is None else functools.partial(_capped, softcap),
-                           natural=natural, headroom=natural and algebra.headroom(dtype, capacity, sinks),
+                           natural=natural, headroom=natural and algebra.headroom(dtype, sinks),
                            initial=sinks)
 
 
@@ -156,17 +142,14 @@ def _attend(query: jax.Array, span: tuple, read, block: int, spec: algebra.Forwa
     its first term."""
     first_key, length = span
     rows = jnp.arange(QUERIES)
-    narrowing = {"start": jnp.full((QUERIES,), first_key), "end": jnp.full((QUERIES,), length)}
+    spans = jnp.full((QUERIES,), first_key), jnp.full((QUERIES,), length)
 
     def body(step, state):
         key, value = read(step)
-        coords = algebra.Coords(rows[:, None], step * block + jnp.arange(block)[None, :], **narrowing)
-        logits = algebra.modify(spec, _dot(query, key.T, interpret), coords)
-        m, alpha = algebra.peak(spec, state.m, logits)
-        weights, factor, held = algebra.tile(state, alpha, algebra.weights(spec, logits, m), value)
-        product = _dot(algebra.narrow(weights, value.dtype), value, interpret)
-        return algebra.stepped(state, m, factor, weights, product, held,
-                               lambda plain: _dot(algebra.narrow(plain, value.dtype), value, interpret))
+        coords = algebra.Coords(rows[:, None], step * block + jnp.arange(block)[None, :], spans)
+        logits = algebra.modify(spec, kernel_dot(query, key.T, interpret), coords)
+        keys = algebra.Keys(coords, logits, lambda: value, functools.partial(kernel_dot, interpret=interpret))
+        return algebra.plain_step(spec, state, keys)
 
     def walk(live=None) -> algebra.Partial:
         # The plain walk where `live` is None, else the guarded one, those rows shifting.
@@ -322,7 +305,7 @@ class DecodeAttention(tuning.KernelOp):
         summed = pl.BlockSpec((None, None, QUERIES, None, width),
                               lambda row, head, split: (row, split, 0, head, 0))
         reduced = pl.BlockSpec((None, None, QUERIES, None), lambda row, head, split: (row, split, 0, head))
-        spec = _spec(1 / math.sqrt(width), softcap, natural, value.dtype, key.shape[1], sinks is not None)
+        spec = _spec(1 / math.sqrt(width), softcap, natural, value.dtype, sinks is not None)
         out_shape, out_specs = _outputs(query.shape, query.dtype, splits, 1, queried, summed, reduced,
                                         headroom=spec.headroom)
         out = pl.pallas_call(
@@ -381,8 +364,7 @@ class PagedDecodeAttention(tuning.KernelOp):
                               lambda row, head, split: (row, head, split, 0, 0))
         reduced = pl.BlockSpec((None, None, None, QUERIES), lambda row, head, split: (row, head, split, 0))
         sunk = [] if sinks is None else [pl.BlockSpec((None, QUERIES), lambda row, head, split: (head, 0))]
-        spec = _spec(1 / math.sqrt(width), softcap, natural, value_pages.dtype, table.shape[1] * page_size,
-                     sinks is not None)
+        spec = _spec(1 / math.sqrt(width), softcap, natural, value_pages.dtype, sinks is not None)
         out_shape, out_specs = _outputs(query.shape, query.dtype, splits, 2, queried, summed, reduced,
                                         headroom=spec.headroom)
         out = pl.pallas_call(

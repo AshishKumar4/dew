@@ -23,6 +23,7 @@ tile no query's interval cuts takes no mask at all (`masked`); and only a call w
 nothing (spans, a score hook) guards its maxima and denominators against an empty row."""
 
 import dataclasses
+import functools
 from collections.abc import Callable
 from typing import NamedTuple
 
@@ -49,7 +50,7 @@ class Forward:
     scale: float
     score_mod: Callable | None = None
     natural: bool = NATURAL
-    headroom: bool = True
+    headroom: bool = False
     initial: bool = False
 
     @property
@@ -141,14 +142,13 @@ def across(x: jax.Array, like: jax.Array) -> jax.Array:
 class Coords(NamedTuple):
     """A tile's coordinates as the mainloop provides them (in the layout its products give): the query
     indices `q_pos` `[bq, 1]` and key indices `k_pos` `[1, bk]`, and where the spans narrow, each
-    query's interval `start`, `end` `[bq]` and, with documents, the queries' and keys' ids."""
+    query's interval `spans`, its first and past-last keys `[bq]`, and with documents the queries' and
+    keys' ids `ids`, `[bq]` and `[bk]`."""
 
     q_pos: jax.Array
     k_pos: jax.Array
-    start: jax.Array | None = None
-    end: jax.Array | None = None
-    query_ids: jax.Array | None = None
-    key_ids: jax.Array | None = None
+    spans: tuple[jax.Array, jax.Array] | None = None
+    ids: tuple[jax.Array, jax.Array] | None = None
 
 
 class Guard(NamedTuple):
@@ -255,11 +255,11 @@ def power2(x: jax.Array, k: jax.Array) -> jax.Array:
     return x * jnp.exp2(half) * jnp.exp2(k - half)
 
 
-def headroom(dtype, keys: int, initial: bool) -> bool:
-    """Whether a call's weighted values can pass fp32's largest: values of `dtype` whose largest times
-    `keys + 1` reaches `2^HEADROOM` (bf16's and fp32's, not fp16's), or an initial state, whose sums may
+def headroom(dtype, initial: bool) -> bool:
+    """Whether a call's weighted values can pass fp32's largest: values of `dtype` two of which reach
+    `2^HEADROOM` (bf16's and fp32's; fp16's would need 2^110 keys), or an initial state, whose sums may
     be any size. A call that cannot compiles no guard (`guarded`)."""
-    return initial or float(jnp.finfo(dtype).max) * (keys + 1) >= 2.0 ** HEADROOM
+    return initial or float(jnp.finfo(dtype).max) * 2 >= 2.0 ** HEADROOM
 
 
 RAW_SCALES = (2.0 ** -120, 2.0 ** 100)
@@ -404,26 +404,20 @@ def modify(spec: Forward, s: jax.Array, coords: Coords, params: tuple[jax.Array,
     if not masked:
         return logits
     seen = None
-    if spec.form == "spans":
-        start, end = _given(coords.start, coords.end, "its queries' intervals")
+    if coords.spans is not None:
+        # The spans' form: its mainloops give each tile its queries' intervals.
+        start, end = coords.spans
         seen = (coords.k_pos >= expand(start, s)) & (coords.k_pos < expand(end, s))
     elif spec.form == "causal":
         seen = coords.k_pos <= coords.q_pos
     if spec.form != "spans" and spec.keys % s.shape[1]:
         # A tile past the call's last key reads padding.
         seen = coords.k_pos < spec.keys if seen is None else seen & (coords.k_pos < spec.keys)
-    if spec.ids:
-        query_ids, key_ids = _given(coords.query_ids, coords.key_ids, "its queries' and keys' ids")
+    if coords.ids is not None:
+        query_ids, key_ids = coords.ids
         same = expand(query_ids, s) == across(key_ids, s)
         seen = same if seen is None else seen & same
     return logits if seen is None else jnp.where(seen, logits, -jnp.inf)
-
-
-def _given(first: jax.Array | None, second: jax.Array | None, what: str) -> tuple[jax.Array, jax.Array]:
-    """Two of a tile's coordinates its call's form reads, which its mainloop gives it (`Coords`)."""
-    if first is None or second is None:
-        raise ValueError(f"a mainloop gives each tile of this call {what} (`Coords`)")
-    return first, second
 
 
 def _safe(spec: Forward, m: jax.Array) -> jax.Array:
@@ -447,11 +441,12 @@ def carried(spec: Forward, m: jax.Array, safe: jax.Array) -> jax.Array:
     if not spec.natural:
         return spec.carry(m - safe)
     # TwoSum: m - safe is difference + error exactly; raw, the scale's product with it is split exactly too
-    # (TwoProduct); exp's derivative is itself.
+    # (TwoProduct over truncated halves, whose products are exact, so a compiler's contraction of any of
+    # them into a fused multiply-add changes no bit); exp's derivative is itself.
     difference, error = two_sum(m, -safe)
     alpha = spec.carry(difference)
     if spec.raw:
-        product, rounding = two_product(difference, jnp.float32(spec.scale))
+        product, rounding = two_product(difference, jnp.float32(spec.scale), bit_split=True)
         alpha = jnp.exp(product)
         error = rounding + error * spec.scale
     corrected = alpha * (1.0 + error)
@@ -510,14 +505,119 @@ def started(spec: Forward, initial: tuple[jax.Array, jax.Array, jax.Array] | Non
     return state if live is None else headroomed(state, live)
 
 
-def walked(lo, hi, plain: Callable, tracked: Callable, start: Partial, *, residuals: bool):
-    """A program's walk of its key tiles `lo` to `hi` from `start`: the `plain` step's, or with `residuals`
-    the training step's (`tracked`), whose carry also holds the anchor key and the split sums, from none
-    (`split_accumulate`)."""
-    if not residuals:
-        return jax.lax.fori_loop(lo, hi, plain, start)
+class Keys(NamedTuple):
+    """A key tile as a mainloop gives it the algebra: its coordinates and (modified) logits `[bq, bk]`,
+    `load()` its values `[bk, Dv]`, which a step calls after the softmax (where jax's mha loads them), and
+    the mainloop's product `dot(a, b)`, `a @ b` in fp32."""
+
+    coords: Coords
+    logits: jax.Array
+    load: Callable[[], jax.Array]
+    dot: Callable[[jax.Array, jax.Array], jax.Array]
+
+
+Carry = tuple[Partial, Argmax, jax.Array, jax.Array]
+"""A training walk's carry: its state, whose values are `B`, every key's but the anchor's
+(`split_accumulate`), its anchor key, the anchor's own weight and the other keys' weights' sum."""
+
+
+def _times(dot: Callable[[jax.Array, jax.Array], jax.Array], value: jax.Array, p: jax.Array) -> jax.Array:
+    """Weights `p` narrowed to the values' dtype times the tile's `value`s, as the mainloop's `dot`."""
+    return dot(narrow(p, value.dtype), value)
+
+
+def _softmax(spec: Forward, state: Partial, keys: Keys):
+    """A tile's softmax: the running maximum, the factor the state's sums take, the weights for the
+    product (the guarded walk's at the row's shift, `tile`), the tile's values and the guarded `Room`."""
+    m, alpha = peak(spec, state.m, keys.logits)
+    p = weights(spec, keys.logits, m)
+    value = keys.load()
+    p, factor, held = tile(state, alpha, p, value)
+    return m, factor, p, value, held
+
+
+def plain_step(spec: Forward, state: Partial, keys: Keys) -> Partial:
+    """The state after a tile `keys`: its softmax and the product of its weights with its values."""
+    m, factor, p, value, held = _softmax(spec, state, keys)
+    times = functools.partial(_times, keys.dot, value)
+    return stepped(state, m, factor, p, times(p), held, times)
+
+
+def training_step(spec: Forward, carry: Carry, keys: Keys, rows: Callable[[jax.Array], jax.Array]) -> Carry:
+    """A training walk's carry after a tile `keys`: the anchor key and the split sums the backward reads
+    (`split_accumulate`), `rows(key)` each row's value row at its key `[bq]`, the old anchor's where it
+    moved."""
+    state, arg, own, others_total = carry
+    m, factor, p, value, held = _softmax(spec, state, keys)
+    anchor = argmax(arg, keys.logits, keys.coords.k_pos)
+    moved = anchor.peak > arg.peak
+    others, own_tile = anchor_split(narrow(p, value.dtype), keys.coords.k_pos == anchor.key[:, None])
+    product = keys.dot(others, value)
+    acc, own, others_total = split_accumulate(state.acc, own, others_total, factor, moved, rows(arg.key),
+                                              product, others, own_tile, held)
+    times = functools.partial(_times, keys.dot, value)
+    state = stepped(state, m, factor, p, jnp.zeros_like(acc), held, times)
+    return state._replace(acc=acc), anchor, own, others_total
+
+
+def plain_walk(spec: Forward, lo, hi, keys_at: Callable[[jax.Array], Keys], start: Partial) -> Partial:
+    """A program's walk of its key tiles `lo` to `hi` (`keys_at(index)`) from `start`."""
+    return jax.lax.fori_loop(lo, hi, lambda index, state: plain_step(spec, state, keys_at(index)), start)
+
+
+def training_walk(spec: Forward, lo, hi, keys_at: Callable[[jax.Array], Keys],
+                  rows: Callable[[jax.Array], jax.Array], start: Partial) -> Carry:
+    """A training forward's walk (`plain_walk`), its carry also holding the anchor key and the split
+    sums, from none (`training_step`)."""
     nothing = jnp.zeros(start.total.shape, jnp.float32)
-    return jax.lax.fori_loop(lo, hi, tracked, (start, no_argmax(start.total.shape[0]), nothing, nothing))
+    return jax.lax.fori_loop(lo, hi, lambda index, carry: training_step(spec, carry, keys_at(index), rows),
+                             (start, no_argmax(start.total.shape[0]), nothing, nothing))
+
+
+def joined(carry: Carry, rows: Callable[[jax.Array], jax.Array]) -> Partial:
+    """A training walk's state with its split sums joined, the anchor's term added back (`split_output`),
+    the weighted values the output normalizes."""
+    split, arg, own, _ = carry
+    return split._replace(acc=split_output(split.acc, own, rows(arg.key)))
+
+
+def normalized_pass(spec: Forward, carry: Carry, keys_at: Callable[[jax.Array], Keys],
+                    rows: Callable[[jax.Array], jax.Array], bounds,
+                    initial: tuple[jax.Array, jax.Array] | None) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """A guarded training walk's live rows' split sums, normalized (`split_residuals`): a pass over its key
+    tiles `bounds` (`keys_at`) at the walk's own maximum and natural denominator (`normalized_terms`), from
+    the `initial` state's share (`normalized_start`, `(m0, acc0)`): the other keys' weighted values, the
+    anchor's weight and the other keys' weights, over the denominator; a weight below fp32's least normal
+    once normalized takes its product unnormalized, over the denominator after it."""
+    split, arg, _, _ = carry
+    _, maximum, total = finish(spec, joined(carry, rows), initial=initial is not None)
+    inverse_total = inverse(total)
+
+    def walk(index, sums):
+        keys = keys_at(index)
+        value = keys.load()
+        rest, own_tile, small = normalized_terms(keys.logits, maximum, total,
+                                                 keys.coords.k_pos == arg.key[:, None], value.dtype,
+                                                 recompute(spec))
+        small_product = keys.dot(small, value)
+        product = keys.dot(rest, value) + expand(inverse_total, small_product) * small_product
+        others = (rest.astype(jnp.float32).sum(axis=-1)
+                  + inverse_total * small.astype(jnp.float32).sum(axis=-1))
+        return sums[0] + product, sums[1] + own_tile, sums[2] + others
+
+    nothing = jnp.zeros_like(total)
+    lo, hi = bounds
+    start = normalized_start(initial, maximum, total, split.acc.shape[-1])
+    return jax.lax.fori_loop(lo, hi, walk, (start, nothing, nothing))
+
+
+def split_written(carry: Carry, rows: Callable[[jax.Array], jax.Array],
+                  normalized: Callable[[], tuple[jax.Array, jax.Array, jax.Array]]
+                  ) -> tuple[Partial, jax.Array, tuple[jax.Array, ...]]:
+    """A training walk's state with its split sums joined (`joined`), its anchor keys, and its split sums
+    and their shift for the backward (`split_residuals`, a guarded walk's live rows' from `normalized()`)."""
+    split, arg, own, others_total = carry
+    return joined(carry, rows), arg.key, split_residuals(split, own, others_total, normalized)
 
 
 def argmax(state: Argmax, logits: jax.Array, k_pos: jax.Array) -> Argmax:
@@ -557,16 +657,22 @@ def split_accumulate(others: jax.Array, own: jax.Array, others_total: jax.Array,
 
 
 def normalized_terms(logits: jax.Array, maximum: jax.Array, total: jax.Array, at_anchor: jax.Array,
-                     dtype, how: Recompute) -> tuple[jax.Array, jax.Array]:
+                     dtype, how: Recompute) -> tuple[jax.Array, jax.Array, jax.Array]:
     """A tile's normalized weights `exp(s - m) / T` at the walk's maximum and natural denominator, the
-    reference's probabilities, narrowed to the values' `dtype`: zero at the anchor key (`at_anchor`), the
-    left operand of the other keys' sum, and the anchor's own, fp32. Normalized, no sum of them overflows
-    (each is at most the values' largest) and every product is the reference's own, so a column the
-    reference resolves is resolved here, whatever another column's size."""
-    p = below(logits, maximum, how) * expand(inverse(total), logits)
+    reference's probabilities, narrowed to the values' `dtype`: zero at the anchor key (`at_anchor`) and
+    where below fp32's least normal, the left operand of the other keys' sum; the anchor's own, fp32; and
+    the other keys' weights that normalizing takes below fp32's least normal, unnormalized and narrowed,
+    `small`, whose product the pass takes over `T` after it (`normalized_pass`). Normalized, no sum of them
+    overflows (each is at most the values' largest), and a small weight on a large value keeps its share's
+    resolution, so a column the reference resolves is resolved here, whatever another column's size."""
+    exponentials = below(logits, maximum, how)
+    p = exponentials * expand(inverse(total), logits)
+    tiny = (p < float(jnp.finfo(jnp.float32).tiny)) & jnp.logical_not(at_anchor)
     rounded = p.astype(dtype)
-    rest = jnp.where(at_anchor, jnp.zeros_like(rounded), rounded)
-    return rest, jnp.where(at_anchor, rounded, jnp.zeros_like(rounded)).astype(jnp.float32).sum(axis=-1)
+    zero = jnp.zeros_like(rounded)
+    rest = jnp.where(at_anchor | tiny, zero, rounded)
+    small = jnp.where(tiny, exponentials, 0.0).astype(dtype)
+    return rest, jnp.where(at_anchor, rounded, zero).astype(jnp.float32).sum(axis=-1), small
 
 
 def normalized_start(initial: tuple[jax.Array, jax.Array] | None, maximum: jax.Array, total: jax.Array,
@@ -578,7 +684,8 @@ def normalized_start(initial: tuple[jax.Array, jax.Array] | None, maximum: jax.A
     if initial is None:
         return jnp.zeros((total.shape[0], width), jnp.float32)
     m0, acc0 = initial
-    carried = jnp.where(m0 == -jnp.inf, 0.0, jnp.exp(jnp.minimum(m0 - maximum, 0.0)))
+    # The walk's maximum is at least the state's, the same units (the accurate form's, never raw with one).
+    carried = jnp.where(m0 == -jnp.inf, 0.0, jnp.exp(m0 - maximum))
     acc0 = acc0.astype(jnp.float32)
     return expand(carried, acc0) * acc0 * expand(inverse(total), acc0)
 
@@ -594,7 +701,11 @@ def split_residuals(split: Partial, own: jax.Array, others_total: jax.Array,
     sums = split.acc, own, others_total, jnp.zeros_like(own)
     if split.guard is None:
         return sums
-    live, fresh = split.guard.live, (*normalized(), jnp.full_like(own, -1.0))
+    live = split.guard.live
+    # The pass only where some row is live: a guarded program none of whose rows overflowed takes none.
+    terms = jax.lax.cond(jnp.max(live.astype(jnp.int32)) > 0, normalized,
+                         lambda: (jnp.zeros_like(split.acc), jnp.zeros_like(own), jnp.zeros_like(own)))
+    fresh = (*terms, jnp.full_like(own, -1.0))
 
     def chosen(new, old):
         return jnp.where(expand(live, old) if old.ndim > own.ndim else live, new, old)
@@ -703,6 +814,14 @@ def differentiable(score_mod: Callable, q_pos, k_pos, params, floating: list[int
     return hooked
 
 
+def tile_logits(score_mod, product: jax.Array, seen: jax.Array, q_pos, k_pos, params, *, scale: float,
+                slopes: bool = False):
+    """A backward tile's logits from its product `Q·Kᵀ` taken by `scale`, under `score_mod`, -inf where
+    unseen (`seen`), and with `slopes` its entries' derivatives (`scored`)."""
+    logits, derivatives = scored(score_mod, product * scale, q_pos, k_pos, params, slopes=slopes)
+    return jnp.where(seen, logits, -jnp.inf), derivatives
+
+
 def scored(score_mod, logits, q_pos, k_pos, params, *, slopes: bool):
     """`score_mod` on the scaled logits, in fp32, and with `slopes` each entry's derivative of it along
     the logits and along each parameter, a tile apiece: `score_mod` being pointwise in the entries, they
@@ -766,6 +885,7 @@ def off_anchor_start(peak0: jax.Array, total0: jax.Array, term0: jax.Array, maxi
     """The first pass from the softmax's initial state (its maximum, denominator and share of D's
     numerator) weighed at the forward's `maximum`, its sums at each row's `2^-shift` (the forward's,
     `room`), and that state's denominator and share there, unshifted."""
+    # The fold's maximum is the state's taken to base 2 and back, which may round it an ulp below.
     carried = jnp.where(peak0 == -jnp.inf, 0.0, jnp.exp(jnp.minimum(peak0 - maximum, 0.0)))
     state_total, state_share = total0 * carried, term0 * carried
     nothing = jnp.zeros_like(total0)

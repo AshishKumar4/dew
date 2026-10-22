@@ -417,6 +417,16 @@ def natural_exp(x: jax.Array) -> jax.Array:
     return jnp.exp2(x * LOG2E)
 
 
+def kernel_dot(a: jax.Array, b: jax.Array, interpret: bool) -> jax.Array:
+    """`a @ b` accumulated in fp32 as a template's Triton kernels issue it: bf16's and fp16's own product,
+    IEEE fp32 for fp32 operands; interpreted, the template's CPU product (`interpreted_dot`)."""
+    if interpret:
+        return interpreted_dot(a, b)
+    from jax.experimental.pallas import triton as plgpu
+
+    return plgpu.dot(a, b, precision=jax.lax.Precision.HIGHEST).astype(jnp.float32)
+
+
 def interpreted_dot(a: jax.Array, b: jax.Array) -> jax.Array:
     """`a @ b`, fp32, as every CPU arm of the attention template issues it (the plain-JAX mainloop, the
     interpreted kernels): the product its operands declare at the precision policy's precision

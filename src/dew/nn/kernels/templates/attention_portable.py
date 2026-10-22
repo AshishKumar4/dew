@@ -5,7 +5,6 @@ mainloop, in XLA ops, so it runs on any backend and is the boundary test's secon
 same tiles). It takes a call at its launches' padded shapes, as `TritonForward` does."""
 
 import functools
-from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
@@ -25,37 +24,6 @@ from dew.nn.kernels.templates.attention import (
     interpreted_dot,
     padded_call,
 )
-
-
-def _normalized_pass(spec: algebra.Forward, state: algebra.Partial, logits_at: Callable, anchor: jax.Array, *,
-                     bounds, initial: tuple[jax.Array, jax.Array] | None
-                     ) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """A guarded training walk's live rows' split sums, normalized: a pass over its keys (`logits_at` a
-    tile's coordinates, logits and values) at the walk's maximum and natural denominator
-    (`algebra.normalized_terms`) from the `initial` state's share (`algebra.normalized_start`), as the
-    Triton mainloop's."""
-    _, maximum, total = algebra.finish(spec, state, initial=initial is not None)
-
-    def step(j, carry):
-        coords, logits, v_tile = logits_at(j)
-        rest, own_tile = algebra.normalized_terms(logits, maximum, total, coords.k_pos == anchor[:, None],
-                                                  v_tile.dtype, algebra.recompute(spec))
-        return carry[0] + _dot(rest, v_tile), carry[1] + own_tile, carry[2] + rest.sum(axis=-1)
-    nothing = jnp.zeros_like(total)
-    lo, hi = bounds
-    start = algebra.normalized_start(initial, maximum, total, state.acc.shape[-1])
-    return jax.lax.fori_loop(lo, hi, step, (start, nothing, nothing))
-
-
-def _times(weights: jax.Array, *, value: jax.Array) -> jax.Array:
-    """A tile's `weights` narrowed to its values' dtype times its `value`s (a guarded tile's unshifted
-    weights' product, `algebra.stepped`)."""
-    return _dot(algebra.narrow(weights, value.dtype), value)
-
-
-def _dot(a: jax.Array, b: jax.Array) -> jax.Array:
-    """`a @ b`, fp32, the template's CPU product (`interpreted_dot`)."""
-    return interpreted_dot(a, b)
 
 
 def _tile_param(value: jax.Array, kind: Kind, row, head, rows: jax.Array, keys: jax.Array):
@@ -88,6 +56,11 @@ def _output_param(value: jax.Array, kind: Kind, row, head, rows: jax.Array):
             raise ValueError("an output hook's parameter has no key axis")
 
 
+def _weighted(carry: algebra.Carry, *, rows) -> jax.Array:
+    """A training walk's weighted values, its split sums joined (`algebra.joined`), where they overflow."""
+    return algebra.joined(carry, rows).acc
+
+
 def forward(spec: algebra.Forward, query: jax.Array, key: jax.Array, value: jax.Array, start: jax.Array,
             end: jax.Array, query_ids: jax.Array | None, key_ids: jax.Array | None, score_params,
             score_kinds: tuple[Kind, ...], output_params, output_kinds: tuple[Kind, ...], initial, *,
@@ -114,57 +87,28 @@ def forward(spec: algebra.Forward, query: jax.Array, key: jax.Array, value: jax.
         q_pos = rows[:, None]
         q = jax.lax.dynamic_slice_in_dim(query[row, :, head], first_query, block_q)
         kv_head = head // group
-        narrowing = {}
-        if spec.form == "spans":
-            narrowing = {"start": start[row, rows], "end": end[row, rows]}
-        if ids is not None:
-            narrowing["query_ids"] = ids[0][row, rows]
+        spans = (start[row, rows], end[row, rows]) if spec.form == "spans" else None
+        row_ids = None if ids is None else ids[0][row, rows]
 
-        def logits_at(j):
+        def keys_at(j) -> algebra.Keys:
             columns = j * block_k + jnp.arange(block_k)
-            coords = algebra.Coords(q_pos, columns[None, :], **narrowing,
-                                    key_ids=None if ids is None else ids[1][row, columns])
+            coords = algebra.Coords(q_pos, columns[None, :], spans,
+                                    None if ids is None else (row_ids, ids[1][row, columns]))
             params = tuple(_tile_param(param, kind, row, head, rows, columns)
                            for param, kind in zip(score_params, score_kinds, strict=True))
             k_tile = jax.lax.dynamic_slice_in_dim(key[row, :, kv_head], j * block_k, block_k)
             v_tile = jax.lax.dynamic_slice_in_dim(value[row, :, kv_head], j * block_k, block_k)
-            return coords, algebra.modify(spec, _dot(q, k_tile.T), coords, params), v_tile
+            return algebra.Keys(coords, algebra.modify(spec, interpreted_dot(q, k_tile.T), coords, params),
+                                lambda: v_tile, interpreted_dot)
 
-        def softmax(j, state: algebra.Partial):
-            coords, logits, v_tile = logits_at(j)
-            m, alpha = algebra.peak(spec, state.m, logits)
-            weights = algebra.weights(spec, logits, m)
-            weights, factor, held = algebra.tile(state, alpha, weights, v_tile)
-            return coords, logits, m, factor, weights, held, v_tile
-
-        def plain(j, state: algebra.Partial) -> algebra.Partial:
-            _, _, m, factor, weights, held, v_tile = softmax(j, state)
-            product = _dot(algebra.narrow(weights, v_tile.dtype), v_tile)
-            return algebra.stepped(state, m, factor, weights, product, held,
-                                   functools.partial(_times, value=v_tile))
-
-        def step(j, carry: tuple[algebra.Partial, algebra.Argmax, jax.Array, jax.Array]):
-            state, arg, own, others_total = carry
-            coords, logits, m, factor, weights, held, v_tile = softmax(j, state)
-            # The training forward's split sums (`algebra.split_accumulate`), as the Triton mainloop's.
-            anchor = algebra.argmax(arg, logits, coords.k_pos)
-            others, own_tile = algebra.anchor_split(algebra.narrow(weights, v_tile.dtype),
-                                                    coords.k_pos == anchor.key[:, None])
-            acc, own, others_total = algebra.split_accumulate(
-                state.acc, own, others_total, factor, anchor.peak > arg.peak, value[row, arg.key, kv_head],
-                _dot(others, v_tile), others, own_tile, held)
-            stepped = algebra.stepped(state, m, factor, weights, jnp.zeros_like(acc), held,
-                                      functools.partial(_times, value=v_tile))
-            return stepped._replace(acc=acc), anchor, own, others_total
+        def anchor_rows(keys):
+            # Each row's value row at its key (the anchor's).
+            return value[row, keys, kv_head]
 
         resumed = None if initial is None else (initial[0][row, head, rows], initial[1][row, head, rows],
                                                 initial[2][row, head, rows])
 
-        def walk(live=None):
-            # The plain walk where `live` is None, else the guarded one, those rows shifting.
-            start = algebra.started(spec, resumed, block_q, value_width, live)
-            return algebra.walked(lo, hi, plain, step, start, residuals=residuals)
-
+        started = functools.partial(algebra.started, spec, resumed, block_q, value_width)
         if spec.form == "spans":
             lo, hi = blocks_map.lo[row, i], blocks_map.hi[row, i]
         elif spec.form == "causal":
@@ -173,24 +117,27 @@ def forward(spec: algebra.Forward, query: jax.Array, key: jax.Array, value: jax.
             lo, hi = 0, tiles
         out_params = tuple(_output_param(param, kind, row, head, rows)
                            for param, kind in zip(output_params, output_kinds, strict=True))
-        def weighted(carry):
-            # A training walk's weighted values are its split sums joined, where they overflow.
-            if not residuals:
-                return carry.acc
-            split, arg, own, _ = carry
-            return algebra.split_output(split.acc, own, value[row, arg.key, kv_head])
 
-        walked = algebra.guarded(walk, walk, weighted) if spec.headroom else walk()
+        # Each walk is the plain one where `live` is None, else the guarded one, those rows shifting.
+        def plain(live=None):
+            return algebra.plain_walk(spec, lo, hi, keys_at, started(live))
+
+        def training(live=None):
+            return algebra.training_walk(spec, lo, hi, keys_at, anchor_rows, started(live))
+
+        kept = ()
         if residuals:
-            split, arg, own, others_total = walked
-            anchor_value = value[row, arg.key, kv_head]
-            state = split._replace(acc=algebra.split_output(split.acc, own, anchor_value))
-            normalized = functools.partial(_normalized_pass, spec, state, logits_at, arg.key, bounds=(lo, hi),
-                                           initial=None if resumed is None else (resumed[0], resumed[2]))
-            sums = algebra.split_residuals(split, own, others_total, normalized)
-            kept = (arg.key, *sums)
+            # A training walk's weighted values are its split sums joined, where they overflow; a guarded
+            # walk's live rows take their split sums from a normalized pass at its maximum and denominator,
+            # as the Triton mainloop's.
+            weighted = functools.partial(_weighted, rows=anchor_rows)
+            walked = algebra.guarded(training, training, weighted) if spec.headroom else training()
+            normalized = functools.partial(algebra.normalized_pass, spec, walked, keys_at, anchor_rows,
+                                           (lo, hi), None if resumed is None else (resumed[0], resumed[2]))
+            state, anchors, sums = algebra.split_written(walked, anchor_rows, normalized)
+            kept = (anchors, *sums)
         else:
-            state, kept = walked, ()
+            state = algebra.guarded(plain, plain) if spec.headroom else plain()
         out, m, denominator = algebra.finish(spec, state, initial=initial is not None, output_mod=output_mod,
                                              output_params=out_params)
         return (out.astype(query.dtype), m, denominator, *kept) if residuals else out.astype(query.dtype)
@@ -241,7 +188,7 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, 
     resumes = initial is not None
     spec = algebra.Forward(spans.form, spans.keys, call.query_ids is not None,
                            query.shape[3] ** -0.5 if scale is None else scale, hooks.score_mod, natural,
-                           natural and algebra.headroom(value.dtype, call.key.shape[1], resumes), resumes)
+                           natural and algebra.headroom(value.dtype, resumes), resumes)
     out, kept = forward(
         spec, call.query, call.key, call.value, call.start, call.end, call.query_ids, call.key_ids,
         call.score_params, tuple(param.kind for param in hooks.score_params), call.output_params,
@@ -264,14 +211,6 @@ def _seen(spans: tuple[jax.Array, jax.Array, jax.Array | None, jax.Array | None]
     if query_ids is not None and key_ids is not None:
         seen &= query_ids[row, rows][:, None] == key_ids[row, columns][None, :]
     return seen
-
-
-def _logits(score_mod, query, key, seen, q_pos, k_pos, params, scale: float, slopes: bool = False):
-    """A tile's natural logits under `score_mod`, -inf where unseen, and with `slopes` its entries'
-    derivatives: the Triton mainloop's `_tile_logits`."""
-    logits, derivatives = algebra.scored(score_mod, _dot(query, key.T) * scale, q_pos, k_pos, params,
-                                         slopes=slopes)
-    return jnp.where(seen, logits, -jnp.inf), derivatives
 
 
 def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_index, anchor_value, shift,
@@ -319,12 +258,13 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
             # D without the forward's split sums: the dQ launch's own pass over the keys.
             def row_terms(j, state):
                 columns, seen, params, k_tile, v_tile = tile(j)
-                logits, _ = _logits(score_mod, q, k_tile, seen, q_pos, columns[None, :], params, factor)
+                logits, _ = algebra.tile_logits(score_mod, interpreted_dot(q, k_tile.T), seen, q_pos,
+                                                columns[None, :], params, scale=factor)
                 at_anchor = columns[None, :] == chosen[:, None]
                 exponentials, rest, own, small = algebra.off_anchor_weights(logits, maxima, at_anchor,
                                                                             v_tile.dtype, shifts, how)
-                return algebra.off_anchor(state, exponentials, rest, own, _dot(rest, v_tile), shifts, small,
-                                          _dot(small, v_tile))
+                return algebra.off_anchor(state, exponentials, rest, own, interpreted_dot(rest, v_tile),
+                                          shifts, small, interpreted_dot(small, v_tile))
 
             walked = jax.lax.fori_loop(lo, hi, row_terms, before)
             prior = algebra.power2(walked.total, shifts)
@@ -343,13 +283,13 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
             # mainloop's dQ launch.
             dq, residual, mass, grads, weighed = carry
             columns, seen, params, k_tile, v_tile = tile(j)
-            logits, slopes = _logits(score_mod, q, k_tile, seen, q_pos, columns[None, :], params, factor,
-                                     slopes=True)
+            logits, slopes = algebra.tile_logits(score_mod, interpreted_dot(q, k_tile.T), seen, q_pos,
+                                                 columns[None, :], params, scale=factor, slopes=True)
             weights = algebra.normalized(logits, m, jnp.ones_like(m), how)[0]
-            cotangents = algebra.grad_scores(weights, _dot(do, v_tile.T), anchor, delta, seen,
+            cotangents = algebra.grad_scores(weights, interpreted_dot(do, v_tile.T), anchor, delta, seen,
                                              columns[None, :] == chosen[:, None], algebra.inverse(prior))
             pulled, pieces = algebra.pulled(cotangents, slopes, seen, score_kinds)
-            dq = dq + _dot((pulled * scale).astype(k_tile.dtype), k_tile)
+            dq = dq + interpreted_dot((pulled * scale).astype(k_tile.dtype), k_tile)
             grads = tuple(grad + piece if add else grad for grad, add, piece in zip(grads, summed, pieces,
                                                                                    strict=True))
             if any(summed):
@@ -425,16 +365,16 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
             params = tuple(_tile_param(param, kind, row, head, rows, columns)
                            for param, kind in zip(score_params, score_kinds, strict=True))
             m, denominator = peak[row, head, rows], total[row, head, rows]
-            logits, slopes = _logits(score_mod, q, k_tile, seen, rows[:, None], columns[None, :], params,
-                                     factor, slopes=True)
+            logits, slopes = algebra.tile_logits(score_mod, interpreted_dot(q, k_tile.T), seen, rows[:, None],
+                                                 columns[None, :], params, scale=factor, slopes=True)
             exponentials, weights = algebra.normalized(logits, m, denominator, how)
-            cotangents = algebra.grad_scores(exponentials, _dot(do, v_tile.T), anchor[row, head, rows],
-                                             delta[row, head, rows], seen,
+            cotangents = algebra.grad_scores(exponentials, interpreted_dot(do, v_tile.T),
+                                             anchor[row, head, rows], delta[row, head, rows], seen,
                                              columns[None, :] == key_index[row, head, rows][:, None],
                                              algebra.inverse(denominator))
             pulled, pieces = algebra.pulled(cotangents, slopes, seen, score_kinds)
-            dv = dv + _dot(*algebra.value_operands(exponentials, weights, do, denominator))
-            dk = dk + _dot((pulled * scale).astype(q.dtype).T, q)
+            dv = dv + interpreted_dot(*algebra.value_operands(exponentials, weights, do, denominator))
+            dk = dk + interpreted_dot((pulled * scale).astype(q.dtype).T, q)
             tiled = tuple(jax.lax.dynamic_update_slice_in_dim(entries, piece, i * block_q, axis=0)
                           for entries, piece in zip(tiled, (piece for kind, piece in zip(score_kinds, pieces,
                                                                                        strict=True)
@@ -509,7 +449,7 @@ def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
     initial = hooks is not None and hooks.initial is not None
     # A guarded forward's live rows carry normalized split sums (`algebra.split_residuals`), which the first
     # pass cannot recompute without the forward's denominator: D comes from them.
-    split = split or (natural and algebra.headroom(value.dtype, key.shape[1], initial))
+    split = split or (natural and algebra.headroom(value.dtype, initial))
     launch = functools.partial(_launch, block_q=block_q, block_k=block_k, split=split, natural=natural,
                                initial=initial)
     return gradients(launch, query, key, value, spans, hooks, dout, residuals, block=pad, scale=scale)
