@@ -14,6 +14,7 @@ from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from uuid import uuid4
 
+import grain.python as grain
 import numpy as np
 import psutil
 import pyarrow as pa
@@ -1287,8 +1288,17 @@ def test_a_pool_is_shown_which_part_of_its_plan_differs():
     assert "manifest source" in differing(changed) and "manifest steps" not in differing(changed)
 
 
-@pytest.mark.parametrize("kind", ["jsonl", "csv", "text", "jsonl.zst"])
-def test_a_streamed_line_file_repeated_reads_every_record_each_pass(tmp_path, kind):
+class _Drawn(grain.RandomMapTransform):
+    """A record as it is, drawn by the record generator, so a streamed repeat after it stays where it
+    is written, restoring its reader at each pass's start."""
+
+    def random_map(self, element, rng):
+        return element
+
+
+@pytest.mark.parametrize(("kind", "name"), [("jsonl", "rows.jsonl"), ("csv", "rows.csv"),
+                                            ("text", "rows.txt"), ("jsonl", "rows.jsonl.zst")])
+def test_a_streamed_line_file_repeated_reads_every_record_each_pass(tmp_path, kind, name):
     """A line file streamed and repeated reads its records again in each pass, as the first: Grain
     restores the reader at its start after a pass, which starts its records over."""
     import zstandard
@@ -1297,13 +1307,14 @@ def test_a_streamed_line_file_repeated_reads_every_record_each_pass(tmp_path, ki
 
     lines = {"jsonl": [json.dumps({"id": index}) for index in range(3)],
              "csv": ["id", *(str(index) for index in range(3))],
-             "text": [str(index) for index in range(3)]}[kind.split(".")[0]]
+             "text": [str(index) for index in range(3)]}[kind]
     payload = ("\n".join(lines) + "\n").encode()
-    (tmp_path / f"rows.{kind}").write_bytes(zstandard.ZstdCompressor().compress(payload)
-                                            if kind.endswith(".zst") else payload)
+    (tmp_path / name).write_bytes(zstandard.ZstdCompressor().compress(payload) if name.endswith(".zst")
+                                  else payload)
     field = "text" if kind == "text" else "id"
-    reader = compile(Files(str(tmp_path / f"rows.{kind}")).repeat().batch(1), read="streamed",
-                     loading=Loading(workers=0, threads=1, read_buffer=1)).train(DataPartition())
+    reader = compile(Files(str(tmp_path / name), format=kind).random_map(_Drawn()).repeat().batch(1),
+                     read="streamed", loading=Loading(workers=0, threads=1, read_buffer=1)
+                     ).train(DataPartition())
     try:
         read = [str(batch[field][0]).strip() for batch in itertools.islice(reader, 9)]
     finally:
