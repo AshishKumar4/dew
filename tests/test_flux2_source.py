@@ -24,7 +24,7 @@ import numpy as np
 import pytest
 import tool_support
 from interop_support import assert_transformer_exports, extract_fixture, fixture_arrays, source_transformer
-from reference_error import assert_as_exact_as_the_reference, assert_leaves_as_exact
+from reference_error import assert_as_exact, assert_as_exact_as_the_reference
 
 from dew.diffusion.process import DenoisingCondition
 from dew.interop.diffusion import component_tensors, flux2_fields, flux2_path
@@ -34,6 +34,7 @@ from dew.nn.scan_orders import pixel_shuffle
 
 ROOT = Path(__file__).resolve().parents[1]
 CASES = ("dev", "rect", "unguided", "narrow")
+CASE_SEEDS = {"dev": 16, "rect": 16, "unguided": 16, "narrow": 16}
 
 
 @pytest.fixture(scope="module")
@@ -56,13 +57,30 @@ def load(source, name):
     return source_transformer(source, name, Flux2Transformer, flux2_fields, flux2_path)
 
 
-def walk(name, arrays, record):
-    rows, columns = record["cases"][name]["grid"]
-    latent = arrays[f"{name}.latent"].reshape(-1, rows, columns, arrays[f"{name}.latent"].shape[-1])
-    guidance = arrays[f"{name}.guidance"]
-    condition = DenoisingCondition(jnp.asarray(arrays[f"{name}.context"]),
-                                   guidance=jnp.asarray(guidance) if guidance.size else None)
-    return jnp.asarray(latent), jnp.asarray(arrays[f"{name}.times"]), condition, (rows, columns)
+def flux2_walk(model, params, grid):
+    """A compiled native forward and every gradient on a draw: the latent and the probe are the
+    source's packed rows, folded to the grid and back."""
+    rows, columns = grid
+
+    @jax.jit
+    def walk(inputs):
+        batch = inputs["latent"].shape[0]
+        latent = inputs["latent"].reshape(batch, rows, columns, -1)
+        probe = inputs["probe"].reshape(batch, rows, columns, -1)
+        guidance = inputs["guidance"] if inputs["guidance"].size else None
+
+        def objective(params, latent, context):
+            output = model.apply({"params": params}, latent, inputs["times"],
+                                 DenoisingCondition(context, guidance=guidance))
+            return jnp.sum(output * probe), output
+
+        (_, output), gradients = jax.value_and_grad(objective, argnums=(0, 1, 2), has_aux=True)(
+            params, latent, inputs["context"])
+        return {"output": output.reshape(batch, rows * columns, -1),
+                "grad_latent": gradients[1].reshape(batch, rows * columns, -1),
+                "grad_context": gradients[2], "grad_params": gradients[0]}
+
+    return walk
 
 
 @pytest.mark.parametrize("name", CASES)
@@ -73,29 +91,66 @@ def test_every_published_tensor_maps_and_exports_bit_identical(source, name):
 
 @pytest.mark.parametrize("name", CASES)
 def test_the_forward_and_every_gradient_match_the_source(source, arrays, record, name):
+    """The forward, the latent's and the context's gradients and every parameter's, each as near
+    float64 as Diffusers' own float32 walk (`assert_as_exact`), over the fixture's draw and fresh
+    ones: the latent, the context and the probe drawn again, each embedded guidance moved by a unit
+    normal."""
+    import torch
+    from diffusers import Flux2Transformer2DModel
+
+    from tools.diffusers_wan_reference import float64
+
     model, params, layouts = load(source, name)
-    latent, times, condition, (rows, columns) = walk(name, arrays, record)
-    probe = arrays[f"{name}.probe"].reshape(latent.shape[0], rows, columns, -1)
-
-    def objective(params, latent, context):
-        conditioned = DenoisingCondition(context, guidance=condition.guidance)
-        return jnp.sum(model.apply({"params": params}, latent, times, conditioned) * probe)
-
-    def held(value, key):
-        reference = arrays[f"{name}.{key}"]
-        assert_as_exact_as_the_reference(np.asarray(value).reshape(reference.shape), reference,
-                                         arrays[f"{name}.fp64.{key}"], f"{name} {key}")
-
-    held(model.apply({"params": params}, latent, times, condition), "output")
-    grad_params, grad_latent, grad_context = jax.grad(objective, argnums=(0, 1, 2))(
-        params, latent, condition.context)
-    held(grad_latent, "grad_latent")
-    held(grad_context, "grad_context")
+    rows, columns = record["cases"][name]["grid"]
+    walk = flux2_walk(model, params, (rows, columns))
     tensors = {layout.name.removeprefix("transformer/"): layout for layout in layouts}
-    assert_leaves_as_exact(
-        {tensor: np.asarray(layout.export({"params": grad_params})) for tensor, layout in tensors.items()},
-        {tensor: arrays[f"{name}.grad_param.{tensor}"] for tensor in tensors},
-        {tensor: arrays[f"{name}.fp64.grad_param.{tensor}"] for tensor in tensors})
+    original = {key: np.array(arrays[f"{name}.{key}"])
+                for key in ("latent", "context", "times", "guidance", "probe")}
+
+    def draw(seed):
+        """The fixture's inputs at seed 0, else fresh normal draws at `seed`."""
+        if seed == 0:
+            return (original,)
+        generator = torch.Generator().manual_seed(29 + seed)
+        drawn = {key: torch.randn(original[key].shape, generator=generator).numpy()
+                 for key in ("latent", "context", "probe")}
+        guidance = original["guidance"] + torch.randn(original["guidance"].shape, generator=generator).numpy()
+        return ({**drawn, "times": original["times"], "guidance": guidance.astype(np.float32)},)
+
+    checkpoint = source / name / "transformer"
+    narrow_model = Flux2Transformer2DModel.from_pretrained(
+        checkpoint, torch_dtype=torch.float32, local_files_only=True).eval()
+    with float64():
+        wide_model = Flux2Transformer2DModel.from_pretrained(
+            checkpoint, torch_dtype=torch.float64, local_files_only=True).eval()
+    text_ids, image_ids = tool_support.load("diffusers_flux2_reference").ids(rows, columns)
+
+    def reference_walk(model, dtype, drawn):
+        inputs = [torch.tensor(drawn[key], dtype=dtype).requires_grad_() for key in ("latent", "context")]
+        named = list(model.named_parameters())
+        guidance = torch.tensor(drawn["guidance"], dtype=dtype) if drawn["guidance"].size else None
+        output = model(hidden_states=inputs[0], encoder_hidden_states=inputs[1],
+                       timestep=torch.tensor(drawn["times"], dtype=dtype) / 1000, guidance=guidance,
+                       img_ids=image_ids, txt_ids=text_ids, return_dict=False)[0]
+        gradients = torch.autograd.grad((output * torch.tensor(drawn["probe"], dtype=dtype)).sum(),
+                                        inputs + [value for _, value in named])
+        return {"output": output.detach().numpy(), "grad_latent": gradients[0].numpy(),
+                "grad_context": gradients[1].numpy(),
+                **{f"grad_param.{key}": gradient.numpy()
+                   for (key, _), gradient in zip(named, gradients[2:], strict=True)}}
+
+    def truth(inputs):
+        with float64():
+            return reference_walk(wide_model, torch.float64, inputs)
+
+    def native(inputs):
+        values = walk(inputs)
+        gradients = values.pop("grad_params")
+        return {**values, **{f"grad_param.{tensor}": layout.export({"params": gradients})
+                             for tensor, layout in tensors.items()}}
+
+    assert_as_exact(native, lambda inputs: reference_walk(narrow_model, torch.float32, inputs), draw,
+                    f"Flux.2 {name}", seeds=CASE_SEEDS[name], truth_fn=truth)
 
 
 def nhwc(array):
