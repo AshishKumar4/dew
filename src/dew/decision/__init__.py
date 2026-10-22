@@ -16,7 +16,7 @@ reads.
 """
 
 from dew.decision.calibration import Abstention, Binning, Calibration, Scored, Temperatures, bucket
-from dew.decision.data import Decisions, Example
+from dew.decision.data import Example, corpus, decisions, mixture
 from dew.decision.head import HEADS, DecisionHead, Head, JointSchemaHead
 from dew.decision.joint_checkpoint import JointCheckpoint, StoredJointHead
 from dew.decision.laya import LayaCheckpoint
@@ -78,7 +78,6 @@ __all__ = [
     "DecisionInputs",
     "DecisionModel",
     "DecisionObjective",
-    "Decisions",
     "Encoded",
     "Encoding",
     "EntropyConfidence",
@@ -111,6 +110,9 @@ __all__ = [
     "Usage",
     "Weights",
     "bucket",
+    "corpus",
+    "decisions",
     "kind_of",
+    "mixture",
     "render",
 ]

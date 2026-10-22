@@ -37,7 +37,7 @@ from process_support import (
     terminate,
     worker_env as worker_env,
 )
-from token_support import write_token_corpus
+from token_support import Corpus, write_token_corpus
 
 from dew.checkpoints import FROZEN_STORE
 from dew.position import ENVELOPE
@@ -101,7 +101,7 @@ def assert_identical_parameters(left: dict, right: dict) -> None:
         np.testing.assert_array_equal(left[name], right[name], err_msg=name)
 
 
-def token_corpus(directory: Path, records: int, seq_len: int) -> Path:
+def token_corpus(directory: Path, records: int, seq_len: int) -> Corpus:
     """A tokenized corpus whose windows say which record they are.
 
     The stream is a ramp, so the window of record i opens with token
@@ -128,13 +128,14 @@ def test_a_field_no_step_reads_stays_on_the_host_across_processes(tmp_path):
 
 def test_a_real_token_budget_agrees_across_processes_after_logging_ticks(tmp_path):
     corpus = token_corpus(tmp_path / "tokens", records=16, seq_len=4)
-    reports = run_pool("token_budget", tmp_path / "pool", 2, devices=1, tokens=corpus, timeout=60)
+    reports = run_pool("token_budget", tmp_path / "pool", 2, devices=1, tokens=corpus.train, seq_len=4,
+                       timeout=60)
     assert [report["step"] for report in reports] == [3, 3]
     assert [report["updates"] for report in reports] == [3, 3]
     assert [report["logged"] for report in reports] == [3, 0]
 
 
-def document_corpus(directory: Path, documents: int, length) -> Path:
+def document_corpus(directory: Path, documents: int, length) -> Corpus:
     """A corpus whose documents each say which document they are.
 
     Document i is the token value i + 1 repeated `length` times (one length
@@ -232,8 +233,8 @@ def test_processes_read_disjoint_shards_that_cover_the_corpus(tmp_path):
     """
     records, seq_len = 32, 8
     corpus = token_corpus(tmp_path / "corpus", records, seq_len)
-    reports = run_pool("data", tmp_path / "out", 2, tokens=corpus, seq_len=seq_len,
-                       workers=2)
+    reports = run_pool("data", tmp_path / "out", 2, tokens=corpus.train, held_tokens=corpus.val,
+                       seq_len=seq_len, workers=2)
 
     shards = [report["records"] for report in reports]
     for shard in shards:
@@ -264,7 +265,7 @@ def test_processes_read_disjoint_windows_of_one_packing(tmp_path):
     # Each document is six tokens and an eos, so it fills a seven-id window
     # by itself and window i holds document i.
     corpus = document_corpus(tmp_path / "corpus", documents, length=seq_len)
-    reports = run_pool("packed", tmp_path / "out", 2, tokens=corpus,
+    reports = run_pool("packed", tmp_path / "out", 2, tokens=corpus.train, held_tokens=corpus.val,
                        seq_len=seq_len, workers=2)
 
     packed = [report["documents"] for report in reports]
@@ -580,19 +581,21 @@ def packed_checkpoint(tmp_path_factory):
     corpus = document_corpus(directory / "corpus", 48, length=PACKED_SEQ_LEN)
     reports = run_pool("packed_fit", directory / "out", 2, name="packed",
                        run_dir=directory / "run", fsdp_size=1, steps=POOL_STEPS,
-                       tokens=corpus, seq_len=PACKED_SEQ_LEN)
+                       tokens=corpus.train, seq_len=PACKED_SEQ_LEN)
     positions = {report["dataset_state"] for report in reports}
     assert len(positions) == 1, "the processes saved different global positions"
     saved = json.loads(positions.pop())[ENVELOPE]
     assert saved["records"] == POOL_STEPS * worker.BATCH
     # The token store states its documents' lengths, so the run reads it through a plan over the
     # whole store (`PackedSource`), and no Pack stage is left to run per share.
-    from dew.config.data import TextData
+    from dew.data import presets
     from dew.data.analysis import _promoted
     from dew.data.packing import PackedSource
     from dew.data.pipeline import Pack
+    from dew.data.sources.tokens import TokenFiles
 
-    train, _, _ = TextData(source=str(corpus), pack="first-fit", seq_len=PACKED_SEQ_LEN).pipelines()
+    train = TokenFiles(corpus.train).pipe(presets.lm, None, seq_len=PACKED_SEQ_LEN, batch=None,
+                                          pack="first-fit")
     read = _promoted(train)
     assert isinstance(read.source, PackedSource) and isinstance(read.source.plan.pack, Pack)
     assert not any(isinstance(stage, Pack) for stage in read.stages)
@@ -615,7 +618,7 @@ def test_a_packed_pool_position_resumes_on_another_process_count(tmp_path,
     directory = tmp_path / "resumed-run"
     shutil.copytree(packed_checkpoint["run_dir"], directory)
     flags = {"name": "packed", "fsdp_size": 1, "steps": 2 * POOL_STEPS,
-             "tokens": packed_checkpoint["corpus"], "seq_len": PACKED_SEQ_LEN}
+             "tokens": packed_checkpoint["corpus"].train, "seq_len": PACKED_SEQ_LEN}
 
     resumed = run_pool("packed_fit", tmp_path / "resumed", processes,
                        run_dir=directory, **flags)
@@ -639,7 +642,7 @@ def test_a_packed_pool_reads_the_windows_one_process_reads(tmp_path, packed_chec
     """The same claim without a checkpoint in it: the union of the windows a
     pool reads at a step is the step one process reads, row for row."""
     flags = {"name": "packed", "fsdp_size": 1, "steps": POOL_STEPS,
-             "tokens": packed_checkpoint["corpus"], "seq_len": PACKED_SEQ_LEN}
+             "tokens": packed_checkpoint["corpus"].train, "seq_len": PACKED_SEQ_LEN}
     single = run_worker("packed_fit", tmp_path / "single.json", devices=MESH_DEVICES,
                         run_dir=tmp_path / "single-run", **flags)
     pool = run_pool("packed_fit", tmp_path / "pool", 2,
