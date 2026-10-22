@@ -1583,6 +1583,8 @@ def test_a_records_holdout_over_a_stream_filled_generation_serves_where_the_stre
 def test_a_hash_part_of_a_generation_reads_in_worker_processes_as_uncached():
     """Worker processes read a hash part of a generation the rows the parent placed, the ones the
     chain reads uncached."""
+    import itertools
+
     from dew.data.compile import compile, publish
     from dew.data.dataset import DataPartition, Loading
     from dew.data.pipeline import Pipeline
@@ -1592,10 +1594,12 @@ def test_a_hash_part_of_a_generation_reads_in_worker_processes_as_uncached():
     trained, _ = Pipeline(source).holdout(0.25)
 
     def epoch(chain):
-        data = compile(chain.batch(4), read="memory", loading=Loading(workers=2, threads=1, read_buffer=2))
+        data = compile(chain.repeat().batch(4), read="memory", seed=0,
+                       loading=Loading(workers=2, threads=1, read_buffer=2))
         reader = data.train(DataPartition())
         try:
-            return sorted(int(tag) for batch in reader for tag in batch["tag"])
+            return sorted(int(tag) for batch in itertools.islice(reader, data.steps_per_epoch)
+                          for tag in batch["tag"])
         finally:
             reader.close()
 
