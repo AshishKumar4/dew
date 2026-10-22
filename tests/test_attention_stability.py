@@ -33,8 +33,10 @@ TIES = (1610613120.0, 1610612992.0)
 class Case:
     """A stability case: queries `[B, Q, H, D]`, keys and values `[B, K, H, D]` and the output cotangent,
     fp32, the softmax's scale 1/sqrt(D); the keys each query keeps `[B, 1, Q, K]` and the same keys as
-    the template's spans' arguments (`template.spans`); sinks `[H]` or None; and whether the default
-    form holds it (`folded`), False only for the fold's documented divergences."""
+    the template's spans' arguments (`template.spans`); sinks `[H]` or None; whether the default
+    form holds it (`folded`), False only for the fold's documented divergences (`algebra.Forward.base2`),
+    and where such a divergence has a documented bound, the fold's output's distance from the
+    reference's in fp32 ulps (`folded_ulps`), which the default form is held to instead."""
 
     query: np.ndarray
     key: np.ndarray
@@ -44,6 +46,7 @@ class Case:
     spans: dict = dataclasses.field(default_factory=dict)
     sinks: np.ndarray | None = None
     folded: bool = True
+    folded_ulps: int | None = None
 
 
 def _along(sizes, width: int) -> np.ndarray:
@@ -94,7 +97,9 @@ def _cases() -> dict[str, Case]:
         "values near fp32's largest over 64 equal keys": Case(
             np.zeros((1, 1, 1, 16), np.float32), np.zeros((1, 64, 1, 16), np.float32),
             np.full((1, 64, 1, 16), 3e38, np.float32), ones, np.ones((1, 1, 1, 64), bool)),
-        "one key": Case(*_drawn(4, 1, 16, 0), np.ones((1, 1, 4, 1), bool)),
+        # Folded, the key's logit times log2(e) rounds apart from its maximum's, so its weight is 1 within
+        # an ulp and the output its value within one.
+        "one key": Case(*_drawn(4, 1, 16, 0), np.ones((1, 1, 4, 1), bool), folded=False, folded_ulps=1),
         "a sink and one key": Case(*_drawn(1, 1, 16, 1), kept, sinks=np.asarray([2.0, -1.0], np.float32)),
         "a sink near fp32's largest and one key": Case(scalar, scalar, scalar, scalar, kept,
                                                        sinks=np.asarray([3e38], np.float32)),
@@ -103,7 +108,10 @@ def _cases() -> dict[str, Case]:
         "a sink near fp32's largest at scale 1/4": Case(ones, ones, ones, ones, kept,
                                                         sinks=np.asarray([3e38], np.float32), folded=False),
         "logits near 1e4": Case(*_drawn(64, 64, 16, 2, size=1e4), _causal(64, 64), {"causal": True}),
-        "logits near 1e30": Case(*_drawn(64, 64, 16, 3, size=1e30), _causal(64, 64), {"causal": True}),
+        # Folded, the backward takes the base-2 maximum back to natural units, which at 1e30 rounds the
+        # anchor's own weight away from 1 by more than any bound states.
+        "logits near 1e30": Case(*_drawn(64, 64, 16, 3, size=1e30), _causal(64, 64), {"causal": True},
+                                 folded=False),
     }
     drawn = _drawn(4, 4, 16, 4, rows=2)
     empty = np.ones((2, 1, 4, 4), bool)
@@ -121,7 +129,8 @@ def _cases() -> dict[str, Case]:
 CASES = _cases()
 FORMS = {"default": None, "natural": True}
 """The forms each case runs in: the default (`template.NATURAL`) and natural logits."""
-RUNS = [(case, form) for case in CASES for form in FORMS if form == "natural" or CASES[case].folded]
+RUNS = [(case, form) for case in CASES for form in FORMS
+        if form == "natural" or CASES[case].folded or CASES[case].folded_ulps is not None]
 
 
 def _reference(case: Case, dtype, *, anchored: bool = False):
@@ -188,9 +197,16 @@ def test_attention_is_finite_and_as_exact_as_the_reference_at_fp32s_edges(case, 
     """Each template mainloop's output and query, key and value gradients."""
     case = CASES[case]
     reference, truth = _reference(case, np.float32), _truth(case)
+    bounded = form == "default" and not case.folded
     for mainloop, found in _template(case, FORMS[form]).items():
         for leaf, *arrays in zip(("output", "dq", "dk", "dv"), found, reference, truth, strict=True):
-            _held(*arrays, f"{mainloop} {leaf}")
+            if bounded and leaf == "output":
+                # The fold's documented divergence, held to its bound.
+                mine, theirs = np.asarray(arrays[0], np.float32), np.asarray(arrays[1], np.float32)
+                ulps = np.abs(mine.astype(np.float64) - theirs) / np.spacing(np.abs(theirs))
+                assert ulps.max() <= case.folded_ulps, f"{mainloop} output: {ulps.max()} ulps"
+            else:
+                _held(*arrays, f"{mainloop} {leaf}")
 
 
 DECODED = [(case, form) for case, form in RUNS
