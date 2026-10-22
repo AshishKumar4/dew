@@ -402,7 +402,7 @@ def test_edm_preset_samples_on_the_karras_grid():
     par with each closed form in NumPy from its float64 evaluation (check 1):
     the sampling grid with Eq. 5 at rho 5 between the preset's sigma range,
     its ends included; the training weight, EDM's lambda at sigma_data 0.7,
-    and the input scale with the pixel regime's sigma at a training time;
+    and the input scale with the pixel regime's sigma at the training times of sigmas in that range;
     and the time of a sigma with that sigma's inverse."""
     process = presets.EDM(sigma_min=0.01, sigma_max=40.0, rho=5.0, sigma_data=0.7, regime="pixel")()
 
@@ -424,8 +424,10 @@ def test_edm_preset_samples_on_the_karras_grid():
         return {"weight": 1 / 0.7**2 + 1 / sigma**2, "scale": 1 / np.sqrt(0.7**2 + sigma**2)}
 
     def training_times(seed):
-        # ROWS rows of ROWS times: lambda's tail at small sigma takes many values a draw to resolve.
-        return (drawn(seed, 5).standard_normal((ROWS, ROWS)).astype(np.float32),)
+        # The times of sigmas in the preset's range, uniform in log sigma: a normal draw's far tail
+        # makes lambda's error one value's, which no count of seeds resolves.
+        low, high = ((np.log(sigma) + 1.2) / 1.2 for sigma in (0.01, 40.0))
+        return (drawn(seed, 5).uniform(low, high, (ROWS, ROWS)).astype(np.float32),)
 
     assert_as_exact(weighted, edm, training_times, "edm weight", seeds=SEEDS['edm weight'])
 
