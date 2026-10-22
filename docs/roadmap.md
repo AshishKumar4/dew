@@ -107,6 +107,8 @@ The kernel direction (owner, 2026-10-21; [design](design/kernel-templates.md)): 
 - Raise Dory's MFU past 0.5: profile the looped block, its normalizations and the residual barrier. [1308, 648]
 - Let the trainer take any gradient estimator, autodiff or a perturbation estimate, through the objective's existing seam, so backprop-free credit assignment (Dust's activation-space perturbation, qlabs.sh/noise) is a choice of estimator on any model, not a separate trainer. [1315]
 - Make second-order and high-precision training compositions of what Dew has: Gauss-Newton as an Optax-style transform over the objective's Jacobian products, float64 as a precision policy, and Fourier-feature pyramids as an input embedding, so work like arXiv 2509.14185 and 2605.24278 is reproducible in Dew. [1316]
+- Make host-memory offload automatic: the memory planner chooses among remat and offloading activations, optimizer state or parameters to pinned host memory, priced by the device's host-link bandwidth (PCIe, NVLink-C2C), and offloads only where the transfer overlaps compute. Explicit XLA host offload, never managed-memory paging. Never slower when a run fits. [1338]
+- Give serving a host-memory KV tier: evicted prefixes kept on pinned host memory and restored on reuse instead of recomputed, chosen from the link bandwidth and hit rate. [1339]
 - Shard persistent optimizer state on sequence-only meshes. [156]
 - Qualify loss, resume, failure handling and throughput on two physical hosts. [158]
 - Expand training and inference across supported parallelism combinations; replace restrictions with composed support where the mathematics permits it. [226, 245]
@@ -184,7 +186,7 @@ Keep the existing gateway interface. Miles would currently duplicate it: its tra
 - Establish and triage a daily GPU baseline before it replaces batch qualification. Reproduce reference autotune picks in their recorders and qualify FP8 on suitable hardware. [558, 568, TTC-1]
 - Qualify H100, newer-GPU, TPU and paged-decode shard routes at runtime; compile and interpret checks leave those obligations open.
 - The float64 gate is the owner's (2026-10-20): check 1 holds each leaf's RMS error and its worst row within 1.5× the reference's, both measured from float64 truth, over drawn seeds, with no floor. Check 2 holds every element within a certified roundoff bound for Dew's own operation. Both sit behind one assertion, `assert_as_exact`, with `assert_moves` for checks that a change has an effect. [560, 649, 719, 793, 827]
-- One gate generation. The one-draw rule moves to 1.5× on 2026-10-24. A conversion tool then moves the mechanical sites, and the lanes convert the rest. The old assertion families are then deleted, and the tolerance inventory goes to zero. [650, 668–670, 676, 682, 705, 712, 844, 1305]
+- One gate generation. The one-draw rule moves to 1.5×, a conversion tool moves the mechanical sites, and the lanes convert the rest file by file. The old assertion families are then deleted, and the tolerance inventory goes to zero. [650, 668–670, 676, 682, 705, 712, 844, 1305]
 - Root-cause the gate census's ratios past 2 at one draw, in the code or the reference arm: layouts' first-step gradients and Z-Image's padded flow. [833, 837]
 - Replace test-policy violations with observable lifecycle and reference behavior:
 
