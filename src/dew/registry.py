@@ -246,10 +246,8 @@ class Aliases[T: Callable[..., Any], Built](Mapping[str, T]):
         """
         member = self[name]
         given: Mapping[str, object] = {**record, **fields}
-        held = record_class(member)
         with _reading(given):
-            given = (_declared(held, given, dtypes=True) if held is not None
-                     else _arguments(member, given, dtypes=True))
+            given = _taken(member, given, dtypes=True)
         return member(**given)
 
     def from_record(self, record: Mapping[str, object]) -> Built:
@@ -777,16 +775,24 @@ def _member(name: str, held: tuple[type, ...]) -> Callable[..., Configured]:
     raise ValueError(f"{name!r} names {', '.join(map(repr, found))}, not one {wanted}")
 
 
-def _built(member: Callable[..., Configured], fields: Mapping[str, object], *, dtypes: bool) -> Configured:
-    """What `member` builds from a record of its fields: a dataclass's fields
-    as it declares them, a function's or another class's as its parameters."""
+def _taken(member: Callable[..., Configured], fields: Mapping[str, object], *,
+           dtypes: bool) -> Mapping[str, object]:
+    """A record's `fields` as `member` takes them: a dataclass's as it declares
+    them (`_declared`), a function's or another class's as its parameters
+    (`_arguments`)."""
     held = record_class(member)
-    if held is not None:
-        return _construct(held, fields, dtypes=dtypes)
-    built = member(**_arguments(member, fields, dtypes=dtypes))
+    return (_declared(held, fields, dtypes=dtypes) if held is not None
+            else _arguments(member, fields, dtypes=dtypes))
+
+
+def _built(member: Callable[..., Configured], fields: Mapping[str, object], *, dtypes: bool) -> Configured:
+    """What `member` builds from a record of its fields (`_taken`), checked as
+    a configured value (`configured`)."""
+    built = member(**_taken(member, fields, dtypes=dtypes))
     # A plain class of Dew's or a trusted package's is the value its record
     # describes (`to_record` writes it from its constructor's parameters).
-    return built if isinstance(member, type) and _owned(member, called=False) else configured(built)
+    plain = record_class(member) is None and isinstance(member, type) and _owned(member, called=False)
+    return built if plain else configured(built)
 
 
 def _key(annotation: Annotation, key: str) -> RecordKey:
