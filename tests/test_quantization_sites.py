@@ -17,7 +17,7 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from interop_support import NVFP4_QDQ_CASES, nvfp4_qdq_case
-from reference_error import FACTOR, assert_as_exact_as_the_reference, distance, float64_forward
+from reference_error import PARITY, assert_as_exact_as_the_reference, distance, float64_forward
 
 import dew
 from dew.inference.projections import inference_projections, pending, projection_groups
@@ -52,7 +52,7 @@ def test_without_its_scales_the_model_fails_the_rule_every_view_is_held_to(case)
     assert_quantized(loaded.model.apply(loaded.variables, ids), reference, "plain loop")
     bare = {name: tree for name, tree in loaded.variables.items() if name != QUANTIZATION}
     dropped = np.asarray(loaded.model.apply(bare, ids))
-    assert distance(dropped, reference["logits_f64"]) > FACTOR * distance(reference["logits"],
+    assert distance(dropped, reference["logits_f64"]) > PARITY * distance(reference["logits"],
                                                                         reference["logits_f64"])
 
 

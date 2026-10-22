@@ -11,7 +11,7 @@ import jax.numpy as jnp
 import numpy as np
 from model_support import parameter_loss
 from reference_error import (
-    FACTOR,
+    PARITY,
     assert_as_exact_as_the_reference,
     assert_as_exact_over_orders,
     distance,
@@ -95,17 +95,17 @@ def exported(source, directory: Path, written: Path) -> tuple[dict, dict, dict, 
 def assert_greedy_as_exact(source) -> None:
     """Four greedy tokens from both rows, held as tests/test_generate_reference.py holds greedy
     decoding: with E the reference's largest decode logit error from float64, every step's float64
-    top-2 margin exceeds 2 FACTOR E, so the ids are exact, and each chosen token's log probability is
-    within 2 FACTOR E of float64's."""
+    top-2 margin exceeds 2 PARITY E, so the ids are exact, and each chosen token's log probability is
+    within 2 PARITY E of float64's."""
     loaded, inputs, reference = source
     error = float(np.max(np.abs(reference["step_logits"] - reference["step_logits_f64"])))
     ranked = np.sort(reference["step_logits_f64"], -1)
-    assert np.min(ranked[..., -1] - ranked[..., -2]) > 2 * FACTOR * error
+    assert np.min(ranked[..., -1] - ranked[..., -2]) > 2 * PARITY * error
     generated = generate(loaded.model, loaded.variables, inputs, 4, key=jax.random.key(1),
                          sampling=Sampling(temperature=0))
     np.testing.assert_array_equal(np.asarray(generated.tokens)[:, -4:], reference["generated"][:, -4:])
     exact = np.take_along_axis(log_softmax(reference["step_logits_f64"], -1),
                                reference["generated"][:, -4:, None], -1)[..., 0]
     assert (
-        np.max(np.abs(np.asarray(generated.raw_log_probs, np.float64)[:, :4] - exact)) <= 2 * FACTOR * error
+        np.max(np.abs(np.asarray(generated.raw_log_probs, np.float64)[:, :4] - exact)) <= 2 * PARITY * error
     )

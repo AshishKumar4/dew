@@ -9,7 +9,7 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
-from reference_error import FACTOR, distance, float64_forward
+from reference_error import PARITY, distance, float64_forward
 from tool_support import load
 
 from dew.interop.pretrained import PretrainedDecoder
@@ -50,7 +50,7 @@ def test_an_unchanged_decoder_meets_the_gate_on_the_tokens_it_decoded(tmp_path):
     rows = np.asarray(bf16.apply(narrow, jnp.asarray(sequence[:, :-1]))[0, PROMPT - 1:], np.float64)
     shifted = rows - rows.max(-1, keepdims=True)
     forward = (shifted - np.log(np.exp(shifted).sum(-1, keepdims=True)))[np.arange(STEPS), scored["tokens"]]
-    assert distance(scored["reference"], oracle) <= FACTOR * distance(forward, oracle)
+    assert distance(scored["reference"], oracle) <= PARITY * distance(forward, oracle)
     assert record["gate"]["accuracy"]["reference"] > 0, "a reference at the truth measures nothing"
     assert (done.returncode, record["passes"]) == (0, True), record["gate"]
     assert record["reference_embedding_ulp"]["rms"] > 0

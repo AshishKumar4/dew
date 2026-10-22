@@ -22,7 +22,7 @@ import numpy as np
 import pytest
 from model_support import decode_through
 from reference_error import (
-    FACTOR,
+    PARITY,
     assert_as_exact,
     assert_as_exact_as_the_reference,
     declared_seeds,
@@ -58,11 +58,11 @@ def geometry():
 
 
 def outside(wrong, reference, truth, label: str):
-    """`wrong` far outside the rule a test holds: more than FACTOR times `reference`'s RMS distance from
+    """`wrong` far outside the rule a test holds: more than PARITY times `reference`'s RMS distance from
     `truth`, so the test tells the computation it checks from the one that leaves its operands out."""
     mine = distance(np.asarray(wrong), np.asarray(truth))
     theirs = distance(np.asarray(reference), np.asarray(truth))
-    assert mine > FACTOR * theirs, f"{label}: {mine:.3e} from float64, the rule's {FACTOR} x {theirs:.3e}"
+    assert mine > PARITY * theirs, f"{label}: {mine:.3e} from float64, the rule's {PARITY} x {theirs:.3e}"
 
 
 def in_float64(function, *args, **kwargs):

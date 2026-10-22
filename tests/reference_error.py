@@ -1,42 +1,30 @@
 """Dew's rounding error held to the reference's own, both measured from float64.
 
-The gate the suite converts to holds every element over orders (bible §7): a comparison drawn over
-exact symmetries of its computation (`assert_leaves_as_exact_over_orders`), each element against the
-worst admitted member of the reference's ensemble (`assert_elements_as_exact`), and a kernel held where
-it rounds, as a graph of the values it rounds and holds (`assert_graph_as_exact`). The one-draw rules
-below hold the comparisons that have not converted yet.
+The owner's gate (bible §7) is two checks. Check 1, on par (`assert_as_exact`): each
+leaf's RMS error from float64, pooled over a site's declared seeds, within PARITY (1.5) times the
+reference's on the same inputs, its worst row within ROW_FACTOR of the reference's worst, with no floor
+of any kind; a draw may be an orbit's, the same values under an exact symmetry. Check 2, never wrong
+(tests/op_certificates.py): every element within its own operation's certified roundoff bound.
 
 A port that computes what its reference computes, at the same precision,
 differs from it only by rounding: the two sum the same terms in other
 orders and round at other points. The reference evaluated in float64
 (u = 2^-53, nine orders below fp32) is the exact value to every digit an
-fp32 or bf16 run resolves, so both runs are measured from it, and Dew's
-root-mean-square error over all entries may be at most twice the
-reference's:
+fp32 or bf16 run resolves, so both runs are measured from it. Independent
+roundings add in variance, so the RMS error of an output is sqrt(sum of the
+variances of the roundings that reach it); a computation that differs
+rather than rounds (a dropped term, a wrong scale, a format coarser than
+the reference's, a mask one step off) moves it further than PARITY and
+fails.
 
-    rms(dew - f64) <= 2 rms(reference - f64)
-
-Why the root mean square and why twice. Independent roundings add in
-variance, so the RMS error of an output is sqrt(sum of the variances of the
-roundings that reach it), and over the hundreds to thousands of entries of
-a fixture that estimate is stable to a few percent; the largest entry is an
-extreme value and is not (the fp32 decoder fixtures put Dew's largest error
-at 0.9 to 2.2 times the reference's while the RMS ratios sit at 1.06 to
-1.43). A factor of 2 admits four times the reference's error variance, that
-is Dew making up to three roundings of the reference's size for each one
-the reference makes; a computation that differs rather than rounds (a
-dropped term, a wrong scale, a format coarser than the reference's, a mask
-one step off) moves the RMS error by more than that and fails.
-
-Why not once, the reference's own distance plus a floor for summing in
-another order. Measured over the suite (862 float64 comparisons in 85
-files), Dew's distance over the reference's sits at a median of 1.00,
-p25 0.94, p75 1.07 and p95 1.55: exactly as exact, the two
-part by their own rounding draws, so a ratio above one is as likely as
-below. At once, 95 comparisons in 20 files failed with no defect behind
-them, and holding them needed a reduction-length floor of half the
-reference's own error at each, a weaker bound than twice the reference.
-At twice, one comparison failed, a deliberate one (a sinkless MiMo tower).
+Comparisons not yet converted to check 1 hold the one-draw rule at PARITY
+(`assert_as_exact_as_the_reference`), but for five named sites that keep the
+retiring one-draw helper as it was until they convert (`assert_leaves_as_exact`,
+RETIRING_SITES, no new caller), and the K-order and element rules
+(`assert_as_exact_over_orders`, `assert_elements_as_exact`) hold
+ORDER_FACTOR, the factor their order count is derived for, until they judge
+through check 1 over orders. SLOP020 (tools/lint_slop.py)
+counts every comparison still outside check 1 until it is gone.
 
 What the rule cannot see is a difference below that factor: an attention
 softmax taken in bf16 instead of fp32 lands at 1.2 to 1.4 times the
@@ -72,7 +60,10 @@ import numpy as np
 
 from dew.accuracy import distance, reduction_bound, within
 
-FACTOR = 2.0
+PARITY = 1.5
+"""The owner's factor (bible §7): each leaf's RMS error from float64 within 1.5 times the
+reference's, on the same inputs, with no floor of any kind, check 1's (`assert_as_exact`) and every
+rule's here."""
 
 ROW_FACTOR = 4.0
 """How far Dew's worst row may sit from float64 against the reference's worst
@@ -183,11 +174,11 @@ def row_errors(value, truth, terms=None) -> tuple[np.ndarray, np.ndarray]:
     return sizes, rms(np.asarray(value, np.float64) - truth)
 
 
-def rows_over(dew, reference, truth, terms=None, floor: float = 0.0) -> list[str]:
+def rows_over(dew, reference, truth, terms=None, *, floor: float = 0.0) -> list[str]:
     """Where Dew's rows are further from float64 than ROW_FACTOR times the
     reference's (`row_errors`): its worst row over its own size against the
-    reference's worst, at least `floor` (an order floor in the rows' units),
-    and each row of size zero, a sum that cancels exactly before anything its
+    reference's worst (at least `floor`, the retiring helper's order floor, `assert_leaves_as_exact`; zero
+    for every other rule), and each row of size zero, a sum that cancels exactly before anything its
     terms see (a query that keeps one key), against the reference's distance
     on that same row, which is all the evidence such a row has: where the
     reference is exactly the float64 zero, Dew must be too."""
@@ -210,23 +201,18 @@ def rows_over(dew, reference, truth, terms=None, floor: float = 0.0) -> list[str
 
 
 def assert_as_exact_as_the_reference(dew, reference, truth, label: str, *, terms=None) -> None:
-    """Dew within FACTOR times the reference's RMS distance from float64, and
+    """Dew within PARITY times the reference's RMS distance from float64, and
     its rows within ROW_FACTOR times the reference's (`rows_over`), each
     sized by its float64 `terms` where they are given (`float64_terms`)."""
     mine, theirs = distance(dew, truth), distance(reference, truth)
     assert theirs > 0, f"{label}: the reference equals float64, so it measures nothing"
-    assert within(mine, FACTOR * theirs), (
+    assert within(mine, PARITY * theirs), (
         f"{label}: dew is {mine:.3e} from float64 (rms), the reference {theirs:.3e} "
-        f"(ratio {mine / theirs:.2f}, allowed {FACTOR})")
+        f"(ratio {mine / theirs:.2f}, allowed {PARITY})")
     over = rows_over(dew, reference, truth, terms)
     assert not over, f"{label}: " + "; ".join(over)
 
 
-
-PARITY = 1.5
-"""The owner's factor (bible §7): each leaf's RMS error from float64 within 1.5 times the
-reference's, on the same inputs, with no floor of any kind. Check 1 (`assert_as_exact`) holds it now;
-the one-draw rule's FACTOR joins it once every site that rule would then fail has moved to check 1."""
 
 BOOTSTRAP = 2000
 """Resamples of a site's seeds for the pooled ratio's interval (`_interval`), drawn by one fixed key so
@@ -927,10 +913,25 @@ def assert_no_less_exact(dew, reference, truth, label: str) -> None:
         f"{label}: {mine:.3e} from float64 (rms), the unchanged source {theirs:.3e}")
 
 
+RETIRING_FACTOR = 2.0
+"""The retiring one-draw helper's factor (`assert_leaves_as_exact`), today's check at its remaining
+sites until they convert: no other rule reads it."""
+
+RETIRING_SITES = frozenset({"tests/test_architectures.py", "tests/test_flux2_source.py",
+                            "tests/test_z_image_source.py", "tests/test_linear_attention.py",
+                            "tests/test_mixers.py", "tests/test_ssd_kernel.py"})
+"""The sites that keep the retiring one-draw helper until they convert (Main's ruling): every other
+caller is refused (tools/lint_slop.py, SLOP020). tests/test_ssd_kernel.py's is the TPU kernel run
+interpreted on the CPU host, where check 1 measures the host's XLA lowering, not the kernel, and
+parts with the ISA (ledger row 1322); the compiled kernel is held to check 1 on a TPU."""
+
+
 def assert_leaves_as_exact(dew, reference, truth, *, reductions: int = 1, terms=None,
                            rows: bool = True) -> None:
-    """Each leaf of the tree `dew` within FACTOR times the matching leaf of
-    `reference`'s RMS distance from float64 (`truth`), the three trees alike.
+    """The one-draw rule before check 1, kept as it was for the sites that have not converted yet
+    (RETIRING_SITES, Main's ruling) and for no other: tools/lint_slop.py refuses a new caller, and
+    it is deleted when the last of them converts. Each leaf of the tree `dew` within RETIRING_FACTOR
+    times the matching leaf of `reference`'s RMS distance from float64 (`truth`), the three trees alike.
 
     A port that sums `reductions` terms the reference sums in another order
     rounds by up to sqrt(reductions) float32 units of what it sums in RMS,
@@ -955,14 +956,14 @@ def assert_leaves_as_exact(dew, reference, truth, *, reductions: int = 1, terms=
                  sizes, strict=True)
     for (path, mine), theirs, true, summed in leaves:
         scale = max(distance(true, 0), distance(summed, 0))
-        bar = FACTOR * max(distance(theirs, true), spread * unit * scale)
+        bar = RETIRING_FACTOR * max(distance(theirs, true), spread * unit * scale)
         if not within(distance(mine, true), bar):
             over.append(f"{jax.tree_util.keystr(path)}: {distance(mine, true):.3e} from float64 (rms), "
                         f"the reference {distance(theirs, true):.3e}, allowed {bar:.3e}")
         # Each row over its own terms where they are given, the order floor in those units.
         over += [f"{jax.tree_util.keystr(path)}: {row}"
-                 for row in (rows_over(mine, theirs, true, None if terms is None else summed, spread * unit)
-                             if rows else ())]
+                 for row in (rows_over(mine, theirs, true, None if terms is None else summed,
+                                       floor=spread * unit) if rows else ())]
     assert not over, "\n".join(over)
 
 
@@ -1225,10 +1226,17 @@ FALSE_FAILURE = 1e-6
 rule. The suite holds about 150 rules and CI runs it some tens of times a
 day, so this is one false failure in a few hundred days."""
 
+ORDER_FACTOR = 2.0
+"""The K-order and element rules' factor (`assert_as_exact_over_orders`,
+`assert_elements_as_exact`), the one ORDERS is derived for: no parity, which
+is PARITY's alone. These rules judge by it until they judge through check 1
+over orders sized once and declared, validated against null controls and
+injected faults first (bible §10)."""
+
 ORDERS = 52
 """The rounding orders the K-order rule takes on each side: the fewest K
 for which a mean of K squared distances over another such mean exceeds
-FACTOR^2 with probability at most FALSE_FAILURE when both are equally exact.
+ORDER_FACTOR^2 with probability at most FALSE_FAILURE when both are equally exact.
 A squared RMS of Gaussian roundings is a weighted sum of one-degree
 chi-squares, whose spread is widest when one direction carries all of it,
 as a training step's can (Kimi Linear's updated logits spread like 3 to 5
@@ -1239,7 +1247,7 @@ so K holds for any computation (tests/test_bf16_reference.py derives it)."""
 
 
 def assert_as_exact_over_orders(dew, reference, label: str) -> None:
-    """Dew's RMS over ORDERS rounding orders within FACTOR times the
+    """Dew's RMS over ORDERS rounding orders within ORDER_FACTOR times the
     reference's RMS over the same orders.
 
     `dew` and `reference` hold one distance from float64 per order (each a
@@ -1249,9 +1257,9 @@ def assert_as_exact_over_orders(dew, reference, label: str) -> None:
     dew, reference = np.asarray(dew, np.float64), np.asarray(reference, np.float64)
     assert dew.shape == reference.shape == (ORDERS,), f"{label}: {dew.shape} and {reference.shape} orders"
     mine, theirs = float(np.sqrt(np.mean(dew ** 2))), float(np.sqrt(np.mean(reference ** 2)))
-    assert within(mine, FACTOR * theirs), (
+    assert within(mine, ORDER_FACTOR * theirs), (
         f"{label}: dew is {mine:.3e} from float64 (rms over {ORDERS} orders), the reference "
-        f"{theirs:.3e} (allowed {FACTOR} times it)")
+        f"{theirs:.3e} (allowed {ORDER_FACTOR} times it)")
 
 
 def assert_rows_as_exact_over_orders(dew, reference, label: str, sizes=None) -> None:
@@ -1327,8 +1335,8 @@ def assert_elements_as_exact(batch, label: str, *, reference: str = REFERENCE, a
     asked for a stage only while elements stay flagged, up to STAGES.
 
     An element is flagged at a stage where Dew's mean absolute error over its orders is more than
-    FACTOR times the worst admitted member's there: no floor, no error borrowed from its row or from a
-    model of rounding. Two equally exact trees cross a sum's rounding boundaries at different rates, so
+    ORDER_FACTOR times the worst admitted member's there: no floor, no error borrowed from its row or
+    from a model of rounding. Two equally exact trees cross a sum's rounding boundaries at different rates, so
     at an element the reference's own tree can be lucky in every order; the worst admitted member says
     what the reference's accuracy allows there, and a member is admitted only where it is no less exact
     than the reference over its leaf, so the ensemble moves the reference's accuracy between elements
@@ -1369,7 +1377,7 @@ def assert_elements_as_exact(batch, label: str, *, reference: str = REFERENCE, a
             bars.append(worst)
             if stage == 0:
                 report[name] = {"admitted": held, **_inflation(worst, named[reference][index])}
-        over = [mine > FACTOR * bar for mine, bar in zip(mines, bars, strict=True)]
+        over = [mine > ORDER_FACTOR * bar for mine, bar in zip(mines, bars, strict=True)]
         # A confirmation clears an element it does not flag again; one flagged before stays so only if it is.
         flagged = over if flagged is None else [now & then for now, then in zip(over, flagged, strict=True)]
         if not any(leaf.any() for leaf in flagged):
@@ -1377,10 +1385,10 @@ def assert_elements_as_exact(batch, label: str, *, reference: str = REFERENCE, a
     failing = [(name, leaf, mine, bar)
                for name, leaf, mine, bar in zip(paths, flagged, mines, bars, strict=True) if leaf.any()]
     name, leaf, mine, bar = failing[0]
-    at = np.unravel_index(int(np.argmax(np.where(leaf, mine - FACTOR * bar, -np.inf))), leaf.shape)
+    at = np.unravel_index(int(np.argmax(np.where(leaf, mine - ORDER_FACTOR * bar, -np.inf))), leaf.shape)
     count = sum(int(np.count_nonzero(leaf)) for _, leaf, _, _ in failing)
     raise AssertionError(
-        f"{label}: {count} elements past FACTOR {FACTOR:g} times the worst admitted member's error at every "
+        f"{label}: {count} elements past {ORDER_FACTOR:g} times the worst admitted member's error at every "
         f"one of {STAGES} stages of {ORDERS} orders; in {name}, element {tuple(int(i) for i in at)} is "
         f"{mine[at] / ORDERS:.3e} from float64 at the last (mean absolute over its orders), the worst "
         f"admitted member {bar[at] / ORDERS:.3e} ({report[name]['admitted']})")
@@ -1401,12 +1409,12 @@ def assert_graph_as_exact(dew, reference, truth, inputs, orbit, label: str) -> d
        `assert_leaves_as_exact_over_orders`, its permuted output axes taken back (`Sum.follows`); an
        `Ordered` node so over its declared orbit with its order-preserving members beside the
        reference; a `Pointwise` node, or an `Ordered` one with no orbit, once, each element within
-       FACTOR of the worst of the reference's node and its admitted members (within ADMISSION_MARGIN
-       of its RMS), its leaf within FACTOR of the reference's alone. Errors follow
+       ORDER_FACTOR of the worst of the reference's node and its admitted members (within
+       ADMISSION_MARGIN of its RMS), its leaf within ORDER_FACTOR of the reference's alone. Errors follow
        `reference_graph.errors`: a NaN anywhere fails, and matching infinities count zero only at a
        node's sentinel.
-    3. End to end, each output's RMS distance from float64 over ORDERS orders of `orbit` within FACTOR of
-       the reference's alone.
+    3. End to end, each output's RMS distance from float64 over ORDERS orders of `orbit` within
+       ORDER_FACTOR of the reference's alone.
 
     Returns each node's report (`assert_elements_as_exact`'s) by node and parent bundle. The element
     rule's calibration at a test's real element count is still open: the report states each node's
@@ -1488,7 +1496,7 @@ def _assert_node_once(mine, theirs, true, parents, wide, label: str) -> dict:
     """A node no orbit of its own redraws, held once on common `parents` (`assert_graph_as_exact`): one
     draw on each side, so its element rule's confirmations re-read the same values and an element
     flagged once stays flagged. A pointwise node is deterministic there, as it should be; an `Ordered`
-    node held once between equally exact sides flags about one element in twenty at FACTOR 2, which
+    node held once between equally exact sides flags about one element in twenty at ORDER_FACTOR 2, which
     is why an `Ordered` node declares its orbit wherever it has one."""
     from reference_graph import errors
 
@@ -1501,16 +1509,16 @@ def _assert_node_once(mine, theirs, true, parents, wide, label: str) -> dict:
     admitted = [member for member, found in members.items()
                 if member == REFERENCE
                 or float(np.sqrt(np.mean(np.square(found)))) <= ADMISSION_MARGIN * native]
-    assert within(float(np.sqrt(np.mean(np.square(ours)))), FACTOR * native), (
+    assert within(float(np.sqrt(np.mean(np.square(ours)))), ORDER_FACTOR * native), (
         f"{label}: dew is {float(np.sqrt(np.mean(np.square(ours)))):.3e} from float64 (rms), the reference "
-        f"{native:.3e} (allowed {FACTOR} times it)")
+        f"{native:.3e} (allowed {ORDER_FACTOR} times it)")
     return assert_elements_as_exact(lambda stage: ({"node": ours}, {member: {"node": members[member]}
                                                                     for member in admitted}), label)
 
 
 def _assert_end_to_end(dew, reference, truth, inputs, orbit, label: str) -> None:
-    """Each output's RMS from float64 over ORDERS orders of `orbit` within FACTOR of the reference's, and
-    each graph's witness equal to its replay at every order (`assert_graph_as_exact`)."""
+    """Each output's RMS from float64 over ORDERS orders of `orbit` within ORDER_FACTOR of the
+    reference's, and each graph's witness equal to its replay at every order (`assert_graph_as_exact`)."""
     distances = {}
     for order in range(ORDERS):
         moved, back = orbit(order)
@@ -1637,7 +1645,7 @@ def assert_leaves_as_exact_over_orders(draw, label: str, *, terms=None, rows: bo
 
     Every element of every leaf is held by `assert_elements_as_exact`, over batches of ORDERS orders:
     orders 0 to ORDERS - 1 first, and the next ORDERS for each confirmation while an element stays
-    flagged. Over the first batch each leaf's RMS distance is held too, within FACTOR of the
+    flagged. Over the first batch each leaf's RMS distance is held too, within ORDER_FACTOR of the
     reference's (`assert_as_exact_over_orders`), and, unless `rows` is false, its worst row within
     ROW_FACTOR of the reference's worst (`assert_rows_as_exact_over_orders`): supplements, the leaf's
     rule derived for Gaussian roundings independent across orders and the row's uncalibrated (ORDERS,
@@ -1679,16 +1687,16 @@ def assert_leaves_as_exact_over_orders(draw, label: str, *, terms=None, rows: bo
 
 def assert_computes_the_oracle(reference_in_float64, truth, label: str, *, roundings: int) -> None:
     """The reference run in float64 within the float64 rounding of the
-    computation itself of an independent float64 oracle: FACTOR times
-    `roundings` (the longest chain of roundings an output goes through, its
-    reductions' lengths summed along the way) float64 unit roundoffs of the
-    truth's RMS scale. Two float64 runs of one function part by that much at
-    most; any difference in the function moves the twin by many orders of
+    computation itself of an independent float64 oracle: twice `roundings`
+    (the longest chain of roundings an output goes through, its reductions'
+    lengths summed along the way) float64 unit roundoffs of the truth's RMS
+    scale, each run's rounding of the exact value. Two float64 runs of one
+    function part by that much at most; any difference in the function moves the twin by many orders of
     magnitude more. The fp32 error is no measure of it: a near-exact fp32 path
     leaves the float64 runs a few ulps apart all the same."""
     eps = float(np.finfo(np.float64).eps)
     apart, scale = distance(reference_in_float64, truth), float(np.sqrt(np.mean(np.square(truth))))
-    assert within(apart, FACTOR * roundings * eps * scale), (
+    assert within(apart, 2 * roundings * eps * scale), (
         f"{label}: the reference in float64 is {apart:.3e} from the oracle (rms), more than float64 "
         f"rounding over {roundings} steps of its scale {scale:.3e}")
 

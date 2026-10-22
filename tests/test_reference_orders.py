@@ -6,7 +6,7 @@ import jax
 import numpy as np
 import pytest
 from reference_error import (
-    FACTOR,
+    ORDER_FACTOR,
     ORDERS,
     REFERENCE,
     ROW_FACTOR,
@@ -58,7 +58,7 @@ def test_a_comparison_is_held_over_a_whole_batch_of_orders_and_one_rounding_more
 
 def test_a_localized_defect_that_the_leaf_and_row_rules_pass_fails_element_by_element():
     """A port 100 times the reference's rounding on 4 of a row's 4096 elements (0.1%) moves that
-    row's RMS by sqrt(10.999), 3.3 times, inside ROW_FACTOR, and its leaf's by less, inside FACTOR;
+    row's RMS by sqrt(10.999), 3.3 times, inside ROW_FACTOR, and its leaf's by less, inside ORDER_FACTOR;
     the elements are held one by one and fail at every stage."""
     unit = float(np.finfo(np.float32).eps)
 
@@ -87,7 +87,7 @@ def test_a_row_rounding_more_fails_over_orders_where_the_global_rms_passes():
     dew = np.abs(rng.normal(size=(ORDERS, 64)))
     assert_rows_as_exact_over_orders(dew, reference, "alike")
     dew[:, 3] *= 6
-    assert np.sqrt(np.mean(dew ** 2)) <= FACTOR * np.sqrt(np.mean(reference ** 2))
+    assert np.sqrt(np.mean(dew ** 2)) <= ORDER_FACTOR * np.sqrt(np.mean(reference ** 2))
     with pytest.raises(AssertionError):
         assert_rows_as_exact_over_orders(dew, reference, "one row")
 
@@ -104,7 +104,7 @@ def staged(dew, reference):
 
 
 def test_an_element_flagged_by_chance_clears_at_a_confirmation_and_one_rounding_more_does_not():
-    """Each element's mean absolute error over ORDERS orders against FACTOR times the reference's
+    """Each element's mean absolute error over ORDERS orders against ORDER_FACTOR times the reference's
     there (`assert_elements_as_exact`): an element three times the reference's at stage 0 alone is
     re-measured over fresh orders and clears; one three times it at every stage fails, after
     STAGES; elements both compute exactly pass; one Dew rounds where the reference is exact in

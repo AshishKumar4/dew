@@ -47,7 +47,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import FACTOR
+from reference_error import PARITY
 
 from dew.inference import TextGeneration
 from dew.inference.serving import Server
@@ -90,7 +90,7 @@ def test_greedy_generation_emits_transformers_tokens(family):
     error = decode_error(fixture, "greedy")
     ranked = np.sort(fixture["greedy_f64"], -1)
     margin = float(np.min(ranked[..., -1] - ranked[..., -2]))
-    assert margin > 2 * FACTOR * error, (name, margin, error)
+    assert margin > 2 * PARITY * error, (name, margin, error)
 
     result = generate(pretrained.model, pretrained.variables, prompts(fixture), NEW_TOKENS,
                       key=jax.random.key(0), sampling=Sampling(temperature=0))
@@ -98,7 +98,7 @@ def test_greedy_generation_emits_transformers_tokens(family):
     width = fixture["prompt"].shape[1]
     np.testing.assert_array_equal(np.asarray(result.tokens)[:, width:], fixture["greedy_tokens"])
     raw = selected(float64_log_softmax(fixture["greedy_f64"]), fixture["greedy_tokens"])
-    assert np.max(np.abs(np.asarray(result.raw_log_probs, np.float64) - raw)) <= 2 * FACTOR * error
+    assert np.max(np.abs(np.asarray(result.raw_log_probs, np.float64) - raw)) <= 2 * PARITY * error
 
     assert result.tokens.shape == (fixture["prompt"].shape[0], width + NEW_TOKENS)
     assert result.tokens.dtype == jnp.int32
@@ -161,7 +161,7 @@ def test_rows_stop_pad_and_count_as_transformers_generate_ends_them(name):
         stopping = {key: stored[key] for key in stored.files}
     # Every path's float64 top-2 margin clears four fp32 decode errors, so
     # each greedy choice is the model's and not a rounding.
-    assert float(stopping["margin"]) > 2 * FACTOR * decode_error(fixture, "greedy")
+    assert float(stopping["margin"]) > 2 * PARITY * decode_error(fixture, "greedy")
     eos, pad = tuple(int(token) for token in stopping["eos"]), int(stopping["pad"])
     width = fixture["prompt"].shape[1]
 

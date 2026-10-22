@@ -92,8 +92,8 @@ import pytest
 from interop_support import assert_restores, assert_same_stored_tensors
 from model_support import cached_round_trips, flat_tree, streamed_export
 from reference_error import (
-    FACTOR,
     ORDERS,
+    PARITY,
     assert_as_exact_as_the_reference,
     assert_as_exact_over_orders,
     assert_computes_the_oracle,
@@ -350,7 +350,7 @@ def test_the_gradients_match_the_reference_implementation(name, trips):
 
     The gradients are held to the reference's in float64 by the float64
     rule: Dew's deviation from them, entry by entry relative to
-    max(1, |truth|) and pooled over every compared tensor, within FACTOR of
+    max(1, |truth|) and pooled over every compared tensor, within PARITY of
     the reference's own. Pooled, one tensor's rounding draw does not decide
     it, and a wrong tensor still adds its whole error: Dew and the reference
     each sit about 6e-5 from float64 on qwen3_next's first conv taps on an
@@ -363,7 +363,7 @@ def test_the_gradients_match_the_reference_implementation(name, trips):
     assert np.all(np.isfinite(mine)), sorted(tensor for tensor, (ours, _) in errors.items()
                                              if not np.all(np.isfinite(ours)))
     worst = max(errors, key=lambda tensor: float(np.max(np.abs(errors[tensor][0]))))
-    assert within(distance(mine, 0), FACTOR * distance(theirs, 0)), (
+    assert within(distance(mine, 0), PARITY * distance(theirs, 0)), (
         f"dew is {distance(mine, 0):.3e} from float64, the reference {distance(theirs, 0):.3e}; "
         f"dew's largest deviation is on {worst}")
 
