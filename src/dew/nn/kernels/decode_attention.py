@@ -202,8 +202,8 @@ def _write(out_refs, spec: algebra.Forward, state: algebra.Partial):
         out = algebra.finish(spec, state, initial=True)[0]
         out_refs[0][...] = out.astype(out_refs[0].dtype)
     else:
-        # The state's sums, maxima and totals, with its shifts and bounds under headroom; which rows
-        # shifted is the merge's own to find again (`algebra.merge`).
+        # The state's sums, maxima and totals, with its shifts, bounds and small sums under headroom;
+        # which rows shifted is the merge's own to find again (`algebra.merge`).
         for ref, value in zip(out_refs, state[:len(out_refs)], strict=True):
             ref[...] = value
 
@@ -258,14 +258,15 @@ def _combined(spec: algebra.Forward, *parts, axis: int):
 
 def _outputs(shape: tuple[int, ...], dtype, splits: int, at: int, spec, summed, reduced, *, headroom: bool):
     """The launch's outputs and their blocks: the output `shape` in `dtype` for one slice, else the
-    slices' fp32 states (`algebra.Partial`: sums, maxima and totals, with shifts and reaches under
-    headroom) with a slices axis at `at` (`spec`, `summed` and `reduced` the blocks)."""
+    slices' fp32 states (`algebra.Partial`: sums, maxima and totals, with shifts, reaches and the small
+    weights' sums under headroom) with a slices axis at `at` (`spec`, `summed` and `reduced` the blocks)."""
     if splits == 1:
         return jax.ShapeDtypeStruct(shape, dtype), spec
     split = (*shape[:at], splits, *shape[at:])
-    rows = 4 if headroom else 2
-    reduced_shape = jax.ShapeDtypeStruct(split[:-1], jnp.float32)
-    return [jax.ShapeDtypeStruct(split, jnp.float32), *[reduced_shape] * rows], [summed, *[reduced] * rows]
+    sums, rows = jax.ShapeDtypeStruct(split, jnp.float32), jax.ShapeDtypeStruct(split[:-1], jnp.float32)
+    if not headroom:
+        return [sums, rows, rows], [summed, reduced, reduced]
+    return [sums, rows, rows, rows, rows, sums, rows], [summed, *[reduced] * 4, summed, reduced]
 
 
 def _space(programs: int, steps: int, processors: int | None) -> set[Split]:
