@@ -443,69 +443,6 @@ def test_a_generation_of_one_holdout_part_reads_as_that_part():
     assert served == [ids(tagged(train)), ids(tagged(held))]
 
 
-@pytest.mark.parametrize("scored", ["source", "chain", "same source"])
-def test_a_loader_reads_a_generation_where_it_holds_the_rows_and_each_other_source_itself(scored):
-    """A recipe given the generation of its training branch trains on the generation and scores
-    its validation source's own rows, through steps no cache could hold too; a recipe none of whose
-    rows the generation holds is refused."""
-    from dew.config.data import RecordsData, loader
-    from dew.data.compile import publish
-    from dew.data.dataset import DataPartition, Loading
-    from dew.data.pipeline import Pipeline
-
-    read = Loading(workers=0, threads=1, read_buffer=0, worker_buffer=1)
-    trained = Memory([{"id": index} for index in range(8)])
-    held = Memory([{"id": 100 + index} for index in range(4)])
-    recipe = RecordsData(trained, validation={
-        "source": held, "chain": Pipeline(held).map(lambda row: {**row, "scored": 1}),
-        "same source": Pipeline(trained).map(lambda row: {**row, "scored": 1})}[scored])
-    train, _, _ = recipe.pipelines()
-    generation = publish(train, _cache(), read="indexed", loading=read)
-    data = loader(recipe, batch=2, cache=generation, read="indexed", loading=read)
-    assert data.plan.manifest.source["sources"][0]["store"] == "generation"
-    training, validation = data.train(DataPartition()), data.val(DataPartition())
-    try:
-        assert {int(index) for _ in range(4) for index in next(training)["id"]} == set(range(8))
-        scored_ids = sorted(int(index) for batch in validation for index in batch["id"])
-        assert scored_ids == (list(range(8)) if scored == "same source" else [100, 101, 102, 103])
-    finally:
-        training.close()
-        validation.close()
-    with pytest.raises(ValueError):
-        loader(RecordsData(Memory([{"id": -1}])), batch=2, cache=generation, read="indexed", loading=read)
-
-
-@pytest.mark.parametrize("read", ["memory", "indexed"])
-def test_a_loader_reads_a_generation_of_the_store_in_both_parts_of_a_random_holdout(read):
-    """A generation published from the store a recipe holds out from stands in for its steps in
-    the training part and the held part alike, each picking its rows from the generation's."""
-    from dew.config.data import RecordsData, loader
-    from dew.data.compile import iterate, publish
-    from dew.data.dataset import DataPartition, Loading
-    from dew.data.holdout import HoldOut
-    from dew.data.pipeline import Pipeline
-    from dew.data.steps.generic import Formatting
-
-    loading = Loading(workers=0, threads=1, read_buffer=0, worker_buffer=1)
-    source = Memory([{"id": index} for index in range(12)])
-    generation = publish(Pipeline(source).map(Formatting()), _cache(), read=read, loading=loading)
-    recipe = RecordsData(source, validation=HoldOut(records=3, by="random", seed=5))
-    data = loader(recipe, batch=1, cache=generation, read=read, loading=loading)
-    assert data.plan.manifest.source["sources"][0]["store"] == "generation"
-    trained, scored, _ = recipe.pipelines()
-    assert scored is not None
-    parts = [sorted(int(row["id"]) for row in iterate(part, read=read, loading=loading))
-             for part in (trained, scored)]
-    training, validation = data.train(DataPartition()), data.val(DataPartition())
-    try:
-        assert sorted(int(next(training)["id"][0]) for _ in range(9)) == parts[0]
-        assert sorted(int(batch["id"][0]) for batch in validation) == parts[1]
-    finally:
-        training.close()
-        validation.close()
-    assert len(parts[1]) == 3 and sorted(parts[0] + parts[1]) == list(range(12))
-
-
 def test_a_generation_of_a_held_out_part_reads_under_the_holdouts_taken_from_that_part():
     """A generation published from a training part stands in for it under a second holdout taken
     from that part: the second holdout picks from the generation's rows as from the part's."""
@@ -527,20 +464,22 @@ def test_a_generation_of_a_held_out_part_reads_under_the_holdouts_taken_from_tha
         assert ids(cached) == ids(uncached)
 
 
-def test_a_prompt_recipe_reads_the_generation_its_memory_read_published():
-    """A prompt recipe states its reward width by reading its rows, so the generation a memory
-    read of it published stands in for the same recipe's steps when it reads its rows again."""
-    from dew.config.data import PromptData, loader
-    from dew.data.compile import publish
+def test_the_prompts_preset_reads_the_generation_its_memory_read_published():
+    """The prompts preset states its reward width by reading its rows, so the generation a memory
+    read of its rendering published stands in for the same rendering when it reads its rows again."""
+    from dew.data import presets
+    from dew.data.compile import compile, publish
 
-    # Two of the prompts are longer than 8 bytes, which the recipe drops when asked to.
-    recipe = PromptData(tuple({"prompt": "hi " * (1 + index % 3)} for index in range(6)), "byte",
-                        max_prompt_len=8, long="drop")
-    train, _, _ = recipe.pipelines()
-    generation = publish(train, _cache(), read="memory")
-    data = loader(recipe, batch=2, cache=generation, read="memory")
+    # Two of the prompts are longer than 8 bytes, which the preset drops when asked to.
+    prompts = Memory([{"prompt": "hi " * (1 + index % 3)} for index in range(6)])
+
+    def rendered(batch, cache=None):
+        return prompts.pipe(presets.prompts, "byte", max_prompt_len=8, long="drop", batch=batch, cache=cache)
+
+    generation = publish(rendered(None), _cache(), read="memory")
+    data = compile(rendered(2, generation), read="memory")
     assert data.plan.manifest.source["sources"][0]["store"] == "generation"
-    assert data.records == loader(recipe, batch=2, read="memory").records == 4
+    assert data.records == compile(rendered(2), read="memory").records == 4
 
 
 @dataclass(frozen=True)
@@ -735,20 +674,24 @@ def _rows(reader, batches: int) -> set[tuple[bytes, ...]]:
     return rows
 
 
-def test_a_prompt_recipe_with_a_cache_reads_by_index_the_prompts_it_reads_uncached(tmp_path):
-    """A prompt recipe whose rendering drops prompts too long, cached and read by index in the
-    recipe's own loading workers: the cache holds what is left of each input, and the read goes on
-    through every prompt kept, as the uncached recipe's does, however the drops fall among the
-    workers (row 883)."""
-    from dew.config.data import PromptData, loader
-    from dew.data.dataset import DataPartition
+def test_the_prompts_preset_with_a_cache_reads_by_index_the_prompts_it_reads_uncached(tmp_path):
+    """The prompts preset dropping prompts too long, cached and read by index in loading workers: the
+    cache holds what is left of each input, and the read goes on through every prompt kept, as the
+    uncached preset's does, however the drops fall among the workers (row 883)."""
+    from dew.data import presets
+    from dew.data.compile import compile
+    from dew.data.dataset import DataPartition, Loading
 
-    # A third of the twelve prompts are longer than 6 bytes, which the recipe drops: eight are kept.
-    recipe = PromptData(tuple({"prompt": chr(97 + index) + "hi" * (1 + index % 3)} for index in range(12)),
-                        "byte", max_prompt_len=6, long="drop", reward_bytes=8)
-    # The recipe reads in worker processes, which read a cache on disk.
-    cached = loader(recipe, batch=2, cache=str(tmp_path / "cache"), read="indexed")
-    uncached = loader(recipe, batch=2, read="indexed")
+    # A third of the twelve prompts are longer than 6 bytes, which the preset drops: eight are kept.
+    prompts = Memory([{"prompt": chr(97 + index) + "hi" * (1 + index % 3)} for index in range(12)])
+
+    def loaded(cache=None):
+        # Worker processes read the cache on disk.
+        chain = prompts.shuffle(0).repeat().pipe(presets.prompts, "byte", max_prompt_len=6, long="drop",
+                                                 reward_bytes=8, batch=2, cache=cache)
+        return compile(chain, read="indexed", loading=Loading(workers=2))
+
+    cached, uncached = loaded(str(tmp_path / "cache")), loaded()
     assert cached.records == uncached.records
     first, second = cached.train(DataPartition()), uncached.train(DataPartition())
     try:
@@ -760,18 +703,23 @@ def test_a_prompt_recipe_with_a_cache_reads_by_index_the_prompts_it_reads_uncach
         second.close()
 
 
-def test_an_image_recipe_with_a_fixed_caption_and_a_cache_reads_in_its_uncached_order(tmp_path):
-    """An image recipe's fixed caption is a configured step, which binds to one that keeps every
-    image: cached and read by index, it holds one row for each input, so the recipe takes the
+def test_the_images_preset_with_a_fixed_caption_and_a_cache_reads_in_its_uncached_order(tmp_path):
+    """The images preset's fixed caption is a configured step, which binds to one that keeps every
+    image: cached and read by index, it holds one row for each input, so the chain takes the
     global order it takes uncached and reads the same batches."""
-    from dew.config.data import ImageData, loader
+    from dew.data import images as image_steps, presets
+    from dew.data.compile import compile
     from dew.data.dataset import DataPartition
 
     images = [{"image": np.random.default_rng(index).integers(0, 256, (6, 5, 3), np.uint8), "label": index}
               for index in range(80)]
-    recipe = ImageData(Memory(images), image_size=4, caption="a photo", augment=None, validation=None)
-    cached = loader(recipe, batch=4, cache=str(tmp_path / "cache"), read="indexed")
-    uncached = loader(recipe, batch=4, read="indexed")
+
+    def loaded(cache=None):
+        return compile(Memory(images).shuffle(0).repeat().pipe(
+            presets.images, 4, batch=4, caption=image_steps.caption("a photo"), rejects=False, cache=cache),
+            read="indexed")
+
+    cached, uncached = loaded(str(tmp_path / "cache")), loaded()
     first, second = cached.train(DataPartition()), uncached.train(DataPartition())
     try:
         for _ in range(20):
@@ -782,6 +730,25 @@ def test_an_image_recipe_with_a_fixed_caption_and_a_cache_reads_in_its_uncached_
     finally:
         first.close()
         second.close()
+
+
+@pytest.mark.parametrize("read", ["memory", "indexed"])
+def test_a_repeat_before_a_cache_of_one_record_for_each_input_counts_an_epoch_of_its_inputs(read):
+    """A shuffle and a repeat written before a cache that keeps one record for each input, as a
+    preset's cache sits after them: an epoch is one pass over the inputs, every record once."""
+    from dew.data.compile import compile
+    from dew.data.dataset import DataPartition, Loading
+    from dew.data.pipeline import Pipeline
+
+    rows = Memory([{"id": index} for index in range(12)])
+    data = compile(Pipeline(rows).shuffle(0).repeat().map(Same()).cache(_cache()).batch(4), read=read,
+                   loading=Loading(workers=0, threads=1, read_buffer=1))
+    assert data.records == 12 and data.steps_per_epoch == 3
+    reader = data.train(DataPartition())
+    try:
+        assert sorted(int(index) for _ in range(3) for index in next(reader)["id"]) == list(range(12))
+    finally:
+        reader.close()
 
 
 def test_a_cache_followed_by_a_token_split_seals_the_fill_the_split_reads():

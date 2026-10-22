@@ -20,6 +20,7 @@ from reference_error import assert_as_exact_as_the_reference
 from dew.diffusion import presets
 from dew.inputs import Field, InputSpec
 from dew.nn.autoencoders import AutoEncoder, AutoencoderKL, StableDiffusionVAE
+from dew.nn.autoencoders.pretrained import REGISTRATIONS
 from dew.nn.backbones import SimpleDiT
 from dew.objectives.base import Recorder, Step
 
@@ -118,6 +119,18 @@ def test_a_clip_decodes_as_diffusers_decodes_its_frames(contract, sd3_tiny):
                                      contract["fp32.decoded"], contract["fp64.decoded"], "decoded")
 
 
+FIXTURE_ROOT = Path(__file__).resolve().parent / "fixtures"
+
+ARCHIVES = {
+    "dc_ae": ("dc_ae.tar.xz", "conv"),
+    "wan": ("wan_vae.tar.xz", ""),
+    "rae": ("rae.tar.xz", "dinov2"),
+    "flux2": ("flux2_source.tar.xz", "vae"),
+    "qwen_image": ("qwen_image_vae.tar.xz", ""),
+}
+"""Each registered autoencoder's fixture but the SD VAE's: its archive and the folder in it."""
+
+
 def _published(kind: str, directory: Path):
     """A built-in autoencoder and its parameters, built from its fixture at `directory` as a run's
     `PretrainedAutoencoder` builds it: by the class the fixture's config names."""
@@ -125,22 +138,28 @@ def _published(kind: str, directory: Path):
 
     from dew.objectives.diffusion import PretrainedAutoencoder
 
-    fixtures = Path(__file__).resolve().parent / "fixtures"
-    archive, inside = {
-        "dc_ae": ("dc_ae.tar.xz", "conv"),
-        "wan": ("wan_vae.tar.xz", ""),
-        "rae": ("rae.tar.xz", "dinov2"),
-        "flux2": ("flux2_source.tar.xz", "vae"),
-        "qwen_image": ("qwen_image_vae.tar.xz", ""),
-    }[kind]
-    source = extract_fixture(fixtures / archive, directory) / inside
+    archive, inside = ARCHIVES[kind]
+    source = extract_fixture(FIXTURE_ROOT / archive, directory) / inside
     # A scalar normalization takes a run's own statistics, which its record must keep.
     overrides = {"latent_shift": 0.25, "latent_scale": 0.5} if kind == "dc_ae" else {}
     autoencoder = PretrainedAutoencoder(modelname=str(source), dtype="float32", **overrides).build()
     return autoencoder, autoencoder.params
 
 
-@pytest.mark.parametrize("kind", ["sd_vae", "dc_ae", "wan", "rae", "flux2", "qwen_image"])
+RECORDS = tuple(entry.record for entry in REGISTRATIONS)
+"""Every built-in autoencoder's record name, one per registration."""
+
+
+def test_every_registration_is_one_autoencoder_with_a_fixture():
+    """No record name, wrapper or published class registers twice, and every registered autoencoder has
+    its fixture here (`_published`; the SD VAE's is `tiny_vae`)."""
+    published = [name for entry in REGISTRATIONS for name in entry.published]
+    assert len(set(RECORDS)) == len(RECORDS) and len(set(published)) == len(published)
+    assert len({entry.wrapper for entry in REGISTRATIONS}) == len(REGISTRATIONS)
+    assert set(ARCHIVES) | {"sd_vae"} == set(RECORDS)
+
+
+@pytest.mark.parametrize("kind", RECORDS)
 def test_a_stochastic_encoder_samples_at_its_given_noise_and_a_deterministic_one_refuses_it(kind, tmp_path):
     """A training step hands each example's posterior draw to the encoder as `noise`, in the latent's
     own layout: a stochastic encoder's latent is its posterior's sample at it, its mean at zero noise
@@ -181,7 +200,7 @@ def test_a_stochastic_encoder_samples_at_its_given_noise_and_a_deterministic_one
     assert not np.array_equal(sampled, mean)
 
 
-@pytest.mark.parametrize("kind", ["sd_vae", "dc_ae", "wan", "rae", "flux2", "qwen_image"])
+@pytest.mark.parametrize("kind", RECORDS)
 def test_every_built_in_autoencoder_rebuilds_from_its_saved_record_alone(kind, tmp_path):
     """A saved diffusion task records its autoencoder (`to_json`) and a run rebuilds it from that
     record around the checkpoint's parameters (`from_json`), the source it was loaded from gone: the
@@ -206,3 +225,41 @@ def test_every_built_in_autoencoder_rebuilds_from_its_saved_record_alone(kind, t
     np.testing.assert_array_equal(np.asarray(rebuilt.encode(params, image)), np.asarray(latent))
     np.testing.assert_array_equal(np.asarray(rebuilt.decode(params, latent)),
                                   np.asarray(original.decode(params, latent)))
+
+
+@pytest.mark.parametrize("family", ["wan_vae", "qwen_image_vae"])
+def test_a_kl_loader_refuses_another_autoencoders_checkpoint(tmp_path, family):
+    """A Wan or Qwen-Image VAE's directory given to the AutoencoderKL loaders, a pipeline's and a
+    standalone one's, is refused by the class its config names, before its tensors meet the KL tree."""
+    from interop_support import extract_fixture
+
+    from dew.nn.autoencoders.pretrained import load_kl_vae
+
+    source = extract_fixture(Path(__file__).parent / "fixtures" / f"{family}.tar.xz", tmp_path)
+    folder = next(path.parent for path in source.rglob("config.json"))
+    with pytest.raises(ValueError):
+        load_kl_vae(folder, subfolder="")
+    with pytest.raises(ValueError):
+        StableDiffusionVAE(str(folder), dtype=jnp.float32)
+
+
+def test_a_kl_config_naming_no_class_is_an_autoencoder_kls():
+    """An older AutoencoderKL's config names no class; the KL loaders take it as one."""
+    from dew.nn.autoencoders.api import check_class
+    from dew.nn.autoencoders.vae import PUBLISHED
+
+    check_class({"block_out_channels": [64]}, PUBLISHED, "an old checkpoint", nameless=True)
+    with pytest.raises(ValueError):
+        check_class({"_class_name": "AutoencoderKLWan"}, PUBLISHED, "a Wan VAE", nameless=True)
+
+
+def test_a_local_pipelines_autoencoder_loads_from_its_vae_folder(tmp_path):
+    """`load_autoencoder` given a local pipeline's root reads the AutoencoderKL in its `vae/` folder."""
+    from interop_support import extract_fixture
+
+    from dew.nn.autoencoders.pretrained import load_autoencoder
+
+    root = extract_fixture(FIXTURE_ROOT / "sd3_source.tar.xz", tmp_path)
+    pipeline = next(path.parent.parent for path in root.rglob("vae/config.json"))
+    assert isinstance(load_autoencoder(str(pipeline), dtype=jnp.float32), StableDiffusionVAE)
+

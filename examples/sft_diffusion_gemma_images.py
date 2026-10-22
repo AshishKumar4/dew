@@ -5,7 +5,7 @@
 
 This trains a fresh DiffusionGemma, a byte-vocabulary text stack with a small
 Gemma 4 vision tower, with `BlockDiffusionObjective`, the published
-DiffusionGemma SFT loss. It starts from random weights; it does not loader or
+DiffusionGemma SFT loss. It starts from random weights; it does not load or
 fine-tune the released 26B-A4B checkpoint. Flowers has class labels rather
 than human captions, so each target is "a photo of a <class name>". The image
 sits in the clean prompt as placeholder slots that the vision tower's
@@ -35,8 +35,8 @@ import tyro
 
 import dew
 from dew.config import ModelConfig, ObjectiveConfig, OptimConfig, RunConfig, TrainerConfig
-from dew.config.data import Augment, ImageData, loader
-from dew.data import ByteTokenizer, Concatenate, Files, Hub, Loading, Source
+from dew.data import ByteTokenizer, Concatenate, Dataset, Files, Hub, Loading, Source, images, presets
+from dew.data.compile import compile
 from dew.data.dataset import DataPartition, Loader
 from dew.interop.diffusion_gemma import build
 from dew.nn.inputs import ModelInputs
@@ -198,22 +198,27 @@ def class_names(parts: dict[str, Source]) -> tuple[str, ...]:
 
 
 def caption_data(config: Config, parts: dict[str, Source], labels: tuple[str, ...]) -> Loader:
-    """The run's batches: `data_spec`'s splits, read as the run reads them, in the caption layout."""
-    return loader(data_spec(config, parts), batch=config.batch_size, read="memory", provision=True,
-                  loading=loading(config), host=(CaptionLayout(config, labels),))
+    """The run's batches: `image_data`'s splits, read as the run reads them, in the caption layout."""
+    train, test = image_data(config, parts)
+    return compile(train, validation=test, read="memory", provision=True,
+                   host=(CaptionLayout(config, labels),))
 
 
 def loading(config: Config) -> Loading:
     return Loading(workers=0, threads=1 if config.smoke else 8)
 
 
-def data_spec(config: Config, parts: dict[str, Source]) -> ImageData:
+def image_data(config: Config, parts: dict[str, Source]) -> tuple[Dataset, Dataset]:
     """Train on train + validation, score on test, which the run never reads. The crops and flips
     run on the host, before the caption layout reads their pixels into the model's inputs; a device
     augment would run after it, on the batch the layout already made."""
-    return ImageData(source=Concatenate((parts["train"], parts["validation"])), validation=parts["test"],
-                     caption_columns=(), image_size=config.image_size, staging_size=config.staging_size,
-                     augment=Augment(flip=True, crop_scale=(0.6, 1.0), backend="host"))
+    crop = images.RandomCrop(config.image_size, scale=(0.6, 1.0), flip=True, jitter=True)
+    train = (Concatenate((parts["train"], parts["validation"])).shuffle(seed=0).repeat()
+             .pipe(presets.images, config.image_size, batch=config.batch_size,
+                   staging_size=config.staging_size, augment=crop, rejects=False))
+    # rejects=False: an image that does not decode stops the run, so every epoch reads every record.
+    test = parts["test"].pipe(presets.images, config.image_size, batch=config.batch_size, rejects=False)
+    return train.loading(loading(config)), test.loading(loading(config))
 
 
 def captioned(task, data, config: Config, labels) -> list[dict[str, str]]:
@@ -241,20 +246,19 @@ def main(config: Config) -> Path:
     config = sized(config)
     (config.out / "data").mkdir(parents=True, exist_ok=True)
     parts = splits(config)
-    spec = data_spec(config, parts)
+    train, test = image_data(config, parts)
     labels = class_names(parts)
     record = model_config(config)
     model = build(record, dtype="float32" if config.smoke else "bfloat16")
     run = RunConfig(
-        model=ModelConfig.from_model(model), data=spec,
-        loading=loading(config),
+        model=ModelConfig.from_model(model), data=train, validation=test,
         objective=ObjectiveConfig("block_diffusion", {"prompt_length": config.prompt_tokens,
                                                       "pad_token_id": PAD}),
         optim=OptimConfig(weight_decay=0.05, clip_grads=1.0, schedule=Cosine(
             peak=config.learning_rate, warmup_steps=config.warmup_steps, end=config.learning_rate / 20)),
         # A smoke run keeps both of its checkpoints, so what training moved between them can be read.
         trainer=TrainerConfig(checkpoint_dir=str(config.out / "checkpoints"), keep=2 if config.smoke else 1,
-                              batch_size=config.batch_size, steps=config.steps,
+                              steps=config.steps,
                               log_every=1 if config.smoke else 100, eval_every=config.eval_every,
                               checkpoint_every=config.eval_every, mesh=MeshSpec(fsdp=1),
                               multi_host=False, compilation_cache_dir=None))

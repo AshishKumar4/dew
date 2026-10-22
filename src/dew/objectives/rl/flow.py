@@ -31,6 +31,7 @@ from dew.diffusion.process import Process
 from dew.diffusion.schedules.source import SourceGrid
 from dew.inputs import InputSpec
 from dew.nn.autoencoders import AutoEncoder
+from dew.nn.precision import at_least_fp32
 from dew.objectives.base import OMITTED, Aux, Batch, Omitted, Ratio, Shown, Step, Variables
 from dew.objectives.diffusion.objective import DiffusionObjective
 from dew.rl.advantage import group_normalised
@@ -148,13 +149,15 @@ class FlowGRPOObjective(DiffusionObjective):
         """Read and validate one batch's recorded transitions.
 
         Returns the latents, the latents they step to, and both endpoints'
-        times, all detached: a rollout's record is data, not a path the
-        gradient runs back through.
+        times, all detached, in float32 or the latents' dtype where it is
+        wider: a rollout's record is data, not a path the gradient runs back
+        through.
         """
-        latents = jnp.asarray(batch["latents"], jnp.float32)
-        following = jnp.asarray(batch["next_latents"], jnp.float32)
-        times = jnp.asarray(batch["timesteps"], jnp.float32)
-        next_times = jnp.asarray(batch["next_timesteps"], jnp.float32)
+        dtype = at_least_fp32(jnp.result_type(batch["latents"]))
+        latents = jnp.asarray(batch["latents"], dtype)
+        following = jnp.asarray(batch["next_latents"], dtype)
+        times = jnp.asarray(batch["timesteps"], dtype)
+        next_times = jnp.asarray(batch["next_timesteps"], dtype)
         if latents.ndim != len(self.latent_shape) + 2 or latents.shape[2:] != self.latent_shape:
             raise ValueError(f"latents must hold [batch, transitions, {self.latent_shape}]")
         if following.shape != latents.shape:
