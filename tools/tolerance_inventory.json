@@ -697,10 +697,6 @@
    "comparisons": 9,
    "lane": "Models, Serving & RL"
   },
-  "tests/test_schedulers.py": {
-   "comparisons": 18,
-   "lane": "Models, Serving & RL"
-  },
   "tests/test_sd3_source.py": {
    "comparisons": 17,
    "lane": "Models, Serving & RL"
