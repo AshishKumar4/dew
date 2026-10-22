@@ -255,17 +255,19 @@ def test_a_training_step_updates_the_clamped_altup_coefficients_as_the_reference
         trained = loaded.export({**loaded.variables, "params": state.variables["params"]})
         return {name: np.asarray(trained[name], np.float32) for name in names}
 
+    hf_config = AutoConfig.from_pretrained(directory)
+    hf_config.altup_coef_clip = clip
+    loaded_reference = AutoModelForCausalLM.from_pretrained(directory, config=hf_config,
+                                                            attn_implementation="eager").float()
+    with float64():
+        wide = AutoModelForCausalLM.from_config(hf_config, dtype=torch.float64, attn_implementation="eager")
+    references = {torch.float32: loaded_reference, torch.float64: wide}
+    weights = {key: value.clone() for key, value in loaded_reference.state_dict().items()}
+
     def reference(dtype, rows):
-        hf_config = AutoConfig.from_pretrained(directory)
-        hf_config.altup_coef_clip = clip
-        reference = AutoModelForCausalLM.from_pretrained(directory, config=hf_config,
-                                                         attn_implementation="eager").float()
-        if dtype == torch.float64:
-            with float64():
-                wide = AutoModelForCausalLM.from_config(hf_config, dtype=torch.float64,
-                                                        attn_implementation="eager")
-                wide.load_state_dict(reference.state_dict())
-            reference = wide
+        # Each draw steps from the checkpoint's weights, loaded once a precision.
+        reference = references[dtype]
+        reference.load_state_dict(weights)
         reference.train()
         solver = torch.optim.SGD(reference.parameters(), lr=rate, weight_decay=decay)
         tokens = torch.from_numpy(rows).long()
