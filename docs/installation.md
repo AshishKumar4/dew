@@ -226,16 +226,16 @@ The script prints the prepared version directory. Run that export line in the tr
 <!-- not run: needs the prepared TFDS directory the script above writes -->
 ```python
 import os
-from dew.data import Loading, TFDS
-from dew.config.data import Augment, HoldOut, ImageData, loader
+from dew.data import TFDS, images, presets
 
-recipe = ImageData(source=TFDS("oxford_flowers102", split="all", path=os.environ["DEW_FLOWERS_PATH"]),
-                image_size=64, caption_templates=("a photo of a {}",),
-                augment=Augment(flip=True, jitter=True), validation=HoldOut(records=16))
-data = loader(recipe, batch=4, read="memory", loading=Loading(workers=0))
+flowers = TFDS("oxford_flowers102", split="all", path=os.environ["DEW_FLOWERS_PATH"])
+train, val = flowers.holdout(records=16)
+caption = images.caption("a photo of a {label}")
+data = train.shuffle(seed=0).repeat().pipe(presets.images, 64, batch=4, augment=True, caption=caption)
+held = val.pipe(presets.images, 64, batch=4, caption=caption)
 ```
 
-For a run's CLI, --data.source accepts the JSON record of that TFDS value (class dew.data.sources.tfds:TFDS, fields name/path/split). Images uses TFDS's class-label metadata for its caption templates; labels names an explicit alternative label file. Missing shards are named errors. Non-local, non-GCS TFDS stores currently require an explicit local provision mirror; they are not silently materialized.
+The `images` preset takes its caption's class names from TFDS's class-label metadata. Missing shards are named errors. Non-local, non-GCS TFDS stores currently require an explicit local provision mirror; they are not silently materialized.
 
 ## Building the documentation
 

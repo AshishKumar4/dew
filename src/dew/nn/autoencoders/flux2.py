@@ -19,11 +19,11 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from dew.interop.components import bind_component, component_source
+from dew.interop.components import bind_component
 from dew.objectives.base import Variables
 
 from ..scan_orders import pixel_shuffle, pixel_unshuffle
-from .api import ModuleAutoEncoder
+from .api import LatentNormalization, ModuleAutoEncoder, published_source
 from .kl import AutoencoderKL
 
 if TYPE_CHECKING:
@@ -34,17 +34,16 @@ STATISTICS = ("bn.running_mean", "bn.running_var", "bn.num_batches_tracked")
 and it computes nothing else."""
 
 
+PUBLISHED = ("AutoencoderKLFlux2",)
+"""The `_class_name` a published AutoencoderKLFlux2's config states."""
+
+
 class Flux2Autoencoder(ModuleAutoEncoder[AutoencoderKL]):
     """Native FLUX.2 VAE weights, the 2x2 fold and the batch-norm statistics
     as the latent normalization, per folded channel."""
 
-    record_name = 'flux2'
-    record_module = AutoencoderKL
-
     def __init__(self, *, model: AutoencoderKL, params: Variables, mean, variance, epsilon: float):
         super().__init__(model, params)
-        self.statistics = {'mean': np.asarray(mean, np.float32), 'variance': np.asarray(variance, np.float32),
-                           'epsilon': epsilon}
         # `Flux2Pipeline._patchify_latents` and `_unpatchify_latents`, channels last. A posterior's
         # `noise` comes in the folded latent's layout and is unfolded to the one it is drawn in.
         self.encode_single_frame = jax.jit(lambda params, image, key=None, noise=None: pixel_unshuffle(
@@ -52,19 +51,18 @@ class Flux2Autoencoder(ModuleAutoEncoder[AutoencoderKL]):
                                     None if noise is None else pixel_shuffle(noise), method=model.encode))))
         self.decode_single_frame = jax.jit(lambda params, latent: model.apply(
             {"params": params}, pixel_shuffle(latent), method=model.decode))
-        self.latent_shift = np.asarray(mean, np.float32)
-        self.latent_scale = 1.0 / np.sqrt(np.asarray(variance, np.float32) + np.float32(epsilon))
-        if (
-            self.latent_shift.shape != (4 * model.latent_channels,)
-            or self.latent_scale.shape != self.latent_shift.shape
-        ):
+        mean, variance = np.asarray(mean, np.float32), np.asarray(variance, np.float32)
+        scale = 1.0 / np.sqrt(variance + np.float32(epsilon))
+        if mean.shape != (4 * model.latent_channels,) or scale.shape != mean.shape:
             raise ValueError(
-                f"batch-norm statistics {self.latent_shift.shape} do not hold one value per folded "
+                f"batch-norm statistics {mean.shape} do not hold one value per folded "
                 f"channel ({4 * model.latent_channels},)"
             )
+        self.normalization = LatentNormalization({'mean': mean, 'variance': variance, 'epsilon': epsilon},
+                                                 mean, scale)
 
     def record_arguments(self) -> dict:
-        return self.statistics
+        return dict(self.normalization.record)
 
     @property
     def downscale_factor(self) -> int:
@@ -88,11 +86,7 @@ def load_flux2_vae(name_or_dir: str | Path, compute=jnp.float32, *, revision: st
     from dew.interop.safetensors_io import read_weights
     from dew.nn.autoencoders.vae import _vae_path
 
-    directory, config = component_source(name_or_dir, revision, subfolder, weights=True)
-    if config.get("_class_name") != "AutoencoderKLFlux2":
-        raise ValueError(
-            f"{directory} holds a {config.get('_class_name')}, not an AutoencoderKLFlux2"
-        )
+    directory, config = published_source(name_or_dir, revision, subfolder, PUBLISHED, weights=True)
     if tuple(config.get("patch_size", (2, 2))) != (2, 2):
         raise ValueError(f"FLUX.2's pipeline folds 2x2 latent blocks, not {config.get('patch_size')}")
     model = AutoencoderKL.from_diffusers(config, compute)
