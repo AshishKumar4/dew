@@ -53,8 +53,8 @@ def test_apg_walks_diffusers_adaptive_projected_guidance(name):
     first, after = int(case["start"] * steps), int(case["stop"] * steps)
     rows = arrays["x_T"].shape[0]
     process = Process(FlowMatchingScheduler(), FlowMatchPredictionTransform())
-    denoise = process.denoiser(ConditionalSourceOracle(), {}, {"label": jnp.full((rows,), float(arrays["label"]))},
-                               {"label": jnp.zeros((rows,))})
+    condition = {"label": jnp.full((rows,), float(arrays["label"]))}
+    denoise = process.denoiser(ConditionalSourceOracle(), {}, condition, {"label": jnp.zeros((rows,))})
     guidance = APG(case["scale"], eta=case["eta"], norm_threshold=case["norm_threshold"],
                    momentum=case["momentum"], interval=(first / steps, (after - 1) / steps))
     walked = sample(denoise, jnp.asarray(arrays["x_T"]), steps + 1, solver=Euler(),
