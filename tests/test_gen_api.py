@@ -38,25 +38,32 @@ def test_a_name_bound_in_one_cell_is_resolved_in_the_next(gen_api, documented, t
         "`dew.removed_api`: dew has no public removed_api"]
 
 
+def unresolved_page(gen_api, documented, page, text: str) -> list[str]:
+    """What the API check reports of a docs page holding `text`."""
+    page.write_text(text)
+    return gen_api.unresolved_in(page.name, page, *documented)
+
+
+NO_BUILD_MESH = "`MeshSpec.build_mesh`: dew.training.distributed.MeshSpec has no build_mesh"
+
+
 def test_a_docs_page_carries_its_imports_from_block_to_block(gen_api, documented, tmp_path):
-    page = tmp_path / "page.md"
-    page.write_text("```python\nfrom dew.training import MeshSpec\n```\n\nText.\n\n"
-                    "```python\nMeshSpec().build()\nMeshSpec.build_mesh()\n```\n")
-    assert gen_api.unresolved_in("page.md", page, *documented) == [
-        "`MeshSpec.build_mesh`: dew.training.distributed.MeshSpec has no build_mesh"]
+    assert unresolved_page(gen_api, documented, tmp_path / "page.md",
+                           "```python\nfrom dew.training import MeshSpec\n```\n\nText.\n\n"
+                           "```python\nMeshSpec().build()\nMeshSpec.build_mesh()\n```\n") == [NO_BUILD_MESH]
 
 
 def test_a_name_a_scope_binds_hides_a_dew_import_in_that_scope_alone(gen_api, documented, tmp_path):
     """A parameter or a comprehension's target named like an import is the
     scope's own name, as Python reads it (tools/lint_scopes.py), so its uses
-    there are not Dew's; the import still stands everywhere else."""
-    page = tmp_path / "scoped.md"
-    page.write_text("```python\nfrom dew.training import MeshSpec\n\n"
-                    "def build(MeshSpec):\n    return MeshSpec.anything()\n\n"
-                    "names = [MeshSpec.other for MeshSpec in specs]\n"
-                    "MeshSpec.build_mesh()\n```\n")
-    assert gen_api.unresolved_in("scoped.md", page, *documented) == [
-        "`MeshSpec.build_mesh`: dew.training.distributed.MeshSpec has no build_mesh"]
+    there are not Dew's, nor is an instance's name a parameter takes; the
+    import still stands everywhere else."""
+    assert unresolved_page(gen_api, documented, tmp_path / "scoped.md",
+                           "```python\nfrom dew.training import MeshSpec\n\n"
+                           "def build(MeshSpec):\n    return MeshSpec.anything()\n\n"
+                           "names = [MeshSpec.other for MeshSpec in specs]\n"
+                           "mesh = MeshSpec()\n\ndef reads(mesh):\n    return mesh.not_a_member\n\n"
+                           "MeshSpec.build_mesh()\n```\n") == [NO_BUILD_MESH]
 
 
 def test_an_instance_of_a_dew_class_is_held_to_its_members_across_cells(gen_api, documented, tmp_path):
