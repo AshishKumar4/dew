@@ -1021,17 +1021,21 @@ def test_narrow_heads_take_the_kernel_their_target_measured_fastest(generation_n
     assert "row" not in refused
 
 
-def test_a_splash_call_refused_for_its_arithmetic_is_reported_as_that():
-    """On a TPU, a call splash would tile but whose arithmetic only the reference path computes (a
-    HIGHEST matmul precision) is refused by splash for its arithmetic, not for its tiling: the case
-    builder forms the tiling fact from the requirements before it, whatever a later one says."""
+@pytest.mark.parametrize("call, refused", [
+    ({"precision": jax.lax.Precision.HIGHEST}, ["arithmetic"]),
+    ({"key_value_seq_lengths": jnp.array([512])}, ["key_lengths"]),
+    ({"bias": jnp.zeros((1, 4, 512, 512), jnp.bfloat16)}, ["bias"]),
+], ids=["arithmetic", "key lengths", "bias"])
+def test_a_splash_call_tiled_but_refused_otherwise_is_reported_by_its_own_requirement(call, refused):
+    """On a TPU, a call splash's blocking tiles but another of its requirements turns down is refused
+    by that requirement alone, not for its tiling: the case builder forms the tiling fact on a TPU
+    whatever else the call asks (`TPU_BACKEND`)."""
     from dew.nn.attention import attention_case
     from dew.nn.attention_kernels import ATTENTION, kernel_refusals
     from dew.nn.kernels import generation
 
     query = jnp.zeros((1, 512, 4, 64), jnp.bfloat16)
     with generation.assumed("v5e"):
-        case = attention_case(query, query, causal=True, precision=jax.lax.Precision.HIGHEST)
-        refused = [refusal.code for refusal in kernel_refusals(ATTENTION, "tpu", case)]
-    assert case.splash and refused == ["arithmetic"]
-
+        case = attention_case(query, query, causal=True, **call)
+        found = [refusal.code for refusal in kernel_refusals(ATTENTION, "tpu", case)]
+    assert case.splash and found == refused

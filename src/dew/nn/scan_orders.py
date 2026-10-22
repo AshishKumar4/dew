@@ -15,7 +15,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from dew.nn.blocks import sinusoid_frequencies, sinusoids
+from dew.nn.rope import inverse_frequencies, sinusoids
 
 from .sharding import rows_spec
 
@@ -31,7 +31,8 @@ def build_2d_sincos_pos_embed(emb_dim: int, H_P: int, W_P: int) -> np.ndarray:
     """
     assert emb_dim % 4 == 0, f"emb_dim must be divisible by 4 for 2D sincos, got {emb_dim}"
     quarter = emb_dim // 4
-    omega = sinusoid_frequencies(quarter, quarter)
+    # MAE's `1 / 10000 ** (i / quarter)`, rounded once from float64.
+    omega = inverse_frequencies(10000.0, 2 * quarter, quarter, dtype=np.float32)
     rows = sinusoids(np.arange(H_P, dtype=np.float32)[:, None] * omega, xp=np)
     cols = sinusoids(np.arange(W_P, dtype=np.float32)[:, None] * omega, xp=np)
     pos = np.concatenate([np.broadcast_to(rows[:, None], (H_P, W_P, 2 * quarter)),
