@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import bisect
+import itertools
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from functools import cached_property
@@ -63,18 +65,18 @@ class Ranges:
     counts: tuple[int, ...]
 
     @cached_property
-    def ends(self) -> np.ndarray:
-        return np.cumsum(np.asarray(self.counts, np.int64), dtype=np.int64)
+    def ends(self) -> tuple[int, ...]:
+        return tuple(itertools.accumulate(self.counts))
 
     def __len__(self) -> int:
-        return int(self.ends[-1]) if self.counts else 0
+        return self.ends[-1] if self.ends else 0
 
     def start(self, shard: int) -> int:
-        return int(self.ends[shard - 1]) if shard else 0
+        return self.ends[shard - 1] if shard else 0
 
     def locate(self, position: int) -> tuple[int, int]:
         """The range that holds the item at `position` of them all, and its place in that range."""
         if not 0 <= position < len(self):
             raise IndexError(position)
-        shard = int(np.searchsorted(self.ends, position, side="right"))
+        shard = bisect.bisect_right(self.ends, position)
         return shard, position - self.start(shard)

@@ -56,14 +56,17 @@ class TokenRecords:
     def records(self):
         from .records import ArrayRecords
 
-        counts = tuple(len(index.values) for index in self.indexes)
-        return ArrayRecords(self.paths, self.storage_options, counts=counts)
+        return ArrayRecords(self.paths, self.storage_options, counts=self.documents.counts)
+
+    @cached_property
+    def documents(self) -> Ranges:
+        """The documents each shard holds, one range after another."""
+        return Ranges(tuple(len(index.values) for index in self.indexes))
 
     @cached_property
     def shards(self) -> tuple[_TokenShard, ...]:
         # Each shard's first document's place among the export's documents.
-        documents = Ranges(tuple(len(index.values) for index in self.indexes))
-        return tuple(_TokenShard(index.values, documents.start(shard))
+        return tuple(_TokenShard(index.values, self.documents.start(shard))
                      for shard, index in enumerate(self.indexes))
 
     def _document(self, index: int) -> np.ndarray:
