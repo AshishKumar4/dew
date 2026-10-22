@@ -47,6 +47,7 @@ import concurrent.futures
 import contextlib
 import dataclasses
 import enum
+import hashlib
 import importlib
 import json
 import logging
@@ -59,9 +60,11 @@ from typing import ClassVar
 
 import filelock
 import jax
+import jax.core
 import jax.numpy as jnp
 import numpy as np
 import tokamax
+from jax.extend import core as jax_core
 from jax.extend.backend import get_default_device
 
 from dew import cache, coordination, records
@@ -107,6 +110,19 @@ class Timings(dict):
 
 type Rebuilt = Hashable | list | dict
 """What `decoded` rebuilds: an op's field, a launch's argument or a config."""
+
+
+class Unpinnable(ValueError):
+    """A config pinned for a kernel (`pinned`) that a launch of it cannot take: not in its space at the
+    launch's key, or past a bound its legality checks (`KernelOp.unpinnable`)."""
+
+    def __init__(self, kernel: str, config: Hashable, reason: str):
+        super().__init__(f"{kernel} cannot take the pinned config {config}: {reason}")
+        self.kernel, self.config, self.reason = kernel, config, reason
+
+    def __reduce__(self):
+        # Rebuilt from its own fields, as a pickle or a process boundary carries it.
+        return type(self), (self.kernel, self.config, self.reason)
 
 
 class Unreadable(ValueError):
@@ -263,9 +279,14 @@ def _located(name: str) -> type:
 
 
 def _launch_json(ba: tokamax.BoundArguments) -> dict[str, JSON]:
-    """A launch as JSON: its op as its picks name it (`_identity`) and its arguments."""
-    return {"op": encoded(_identity(ba.op)), "arguments": {name: encoded(value)
-                                                           for name, value in ba.arguments.items()}}
+    """A launch as JSON: its op as its picks name it (`_identity`) and its arguments, a hook among them
+    by its presence (`_traced`)."""
+    op = ba.op
+    hooks = op.HOOKS if isinstance(op, KernelOp) else ()
+    return {"op": encoded(_identity(op)),
+            "arguments": {name: encoded(op.traced(name, value) if isinstance(op, KernelOp) and name in hooks
+                                        else value)
+                          for name, value in ba.arguments.items()}}
 
 
 def _launch(entry: object) -> tokamax.BoundArguments:
@@ -371,10 +392,15 @@ class KernelOp(tokamax.Op):
     `ROWS`. `revision` is part of its stored picks' identity: a kernel whose
     speed changes raises it, and picks measured for the old revision stop
     matching. A kernel whose inputs must hold more than random values to run
-    (group sizes, indices) overrides `operands`.
+    (group sizes, indices) overrides `operands`. A template names in `HOOKS`
+    its fields and arguments that hold the plain functions it traces in (a
+    score or epilogue hook, closures as often as not), and keys its picks on
+    what each computes (`traced`, through `program`), never on the function
+    object, so every launch's picks store and read back alike.
     """
 
     ROWS: ClassVar[tuple[str, ...]] = ()
+    HOOKS: ClassVar[tuple[str, ...]] = ()
     supports_batched_args_capture: ClassVar[bool] = False
     supports_symbolic_shapes: ClassVar[bool] = False
     revision: int = 1
@@ -395,15 +421,25 @@ class KernelOp(tokamax.Op):
 
     def chosen(self, ba: tokamax.BoundArguments) -> Hashable:
         """The config a launch of `ba` takes where it traces now: the op's own `config` where it carries
-        one, else a config pinned for its kernel that its key's space holds (`pinned`), else its pick
-        (`_pick`, else `_nearest`), else its own shapes' heuristic."""
+        one, else a config pinned for its kernel (`pinned`, raising `Unpinnable` where its key's legal
+        configs do not hold it), else its pick (`_pick`, else `_nearest`), else its own shapes'
+        heuristic."""
         return self.config if self.config is not None else self._chosen(ba, self.keyed(ba))
 
     def _chosen(self, ba: tokamax.BoundArguments, keyed: tokamax.BoundArguments) -> Hashable:
-        pin = dict(cache.KERNEL_PINS.value).get(type(self))
+        pins = dict(cache.KERNEL_PINS.value)
+        if type(self) in pins:
+            pin = pins[type(self)]
+            if pin not in keyed.autotuning_configs:
+                raise Unpinnable(type(self).__name__, pin, self.unpinnable(keyed, pin))
+            return pin
         pick = _pick(keyed) or self._nearest(keyed)
-        return (pin if pin in keyed.autotuning_configs
-                else ba.heuristics_config if pick is None else pick.fastest_config)
+        return ba.heuristics_config if pick is None else pick.fastest_config
+
+    def unpinnable(self, ba: tokamax.BoundArguments, config: Hashable) -> str:
+        """Why the legal configs of `ba`'s launch do not hold `config`."""
+        del ba, config
+        return "not in its space at this launch's key"
 
     def keyed(self, ba: tokamax.BoundArguments) -> tokamax.BoundArguments:
         """`ba` as its key reads it, where its space, heuristic and measurement
@@ -468,8 +504,15 @@ class KernelOp(tokamax.Op):
 
     def _get_autotuning_cache_key(self, ba: tokamax.BoundArguments) -> Mapping[str, object]:
         key = super()._get_autotuning_cache_key(ba)
-        return type(key)({name: _bucketed(spec) if name in self.ROWS and spec is not None else spec
+        return type(key)({name: _bucketed(spec) if name in self.ROWS and spec is not None
+                          else self.traced(name, spec) if name in self.HOOKS else spec
                           for name, spec in key.items()})
+
+    def traced(self, name: str, value: Callable | str | None) -> str | None:
+        """The hook field or argument `name`'s value as this op's picks key it: what each function in it
+        computes (`program`, at the arguments the template traces it at), the rest of it as it is. An op
+        naming `HOOKS` defines it."""
+        raise NotImplementedError(f"{type(self).__name__} names hooks {self.HOOKS} but no way to trace them")
 
     def operands(self, specs: list[jax.ShapeDtypeStruct], seed: int) -> list[jax.Array]:
         """Arrays at `specs` to time the launch on: normal floats, zero integers."""
@@ -478,10 +521,47 @@ class KernelOp(tokamax.Op):
                 else jnp.zeros(spec.shape, spec.dtype) for key, spec in zip(keys, specs, strict=True)]
 
 
+def program(function: Callable, *arguments: jax.ShapeDtypeStruct) -> str:
+    """What `function` computes, traced at `arguments`, as a key: a digest of its jaxpr's printed form
+    (its primitives, shapes, dtypes and literals) and of the values of the arrays it closes over, the
+    same in every process, so every process keys a launch alike and takes process 0's config
+    (`_settle`). A captured array that is itself traced (a value of the enclosing computation) is data
+    the compiled launch reads, so it keys by its shape and dtype alone."""
+    closed = jax.make_jaxpr(function)(*arguments)
+    digest = hashlib.sha256(str(closed).encode())
+
+    def constants(values) -> None:
+        for constant in values:
+            if isinstance(constant, jax.core.Tracer):
+                digest.update(repr((constant.shape, str(constant.dtype))).encode())
+            else:
+                value = np.asarray(constant)
+                digest.update(repr((value.shape, str(value.dtype))).encode())
+                digest.update(np.ascontiguousarray(value).tobytes())
+
+    def nested(jaxpr) -> None:
+        # A nested computation's own constants (a jitted helper's, a branch's), in program order.
+        for equation in jaxpr.eqns:
+            for parameter in equation.params.values():
+                for inner in parameter if isinstance(parameter, (tuple, list)) else (parameter,):
+                    if isinstance(inner, jax_core.ClosedJaxpr):
+                        constants(inner.consts)
+                        nested(inner.jaxpr)
+                    elif isinstance(inner, jax_core.Jaxpr):
+                        nested(inner)
+
+    constants(closed.consts)
+    nested(closed.jaxpr)
+    return "traced:" + digest.hexdigest()[:16]
+
+
 def _identity(op: tokamax.Op) -> tokamax.Op:
     """`op` as its picks name it: without the config, the vjp and the device
-    check a call sets."""
-    return op.replace(config=None, vjp=None, bypass_device_check=False)
+    check a call sets, its hook fields by what they compute (`KernelOp.traced`)."""
+    fields = {field.name: field for field in dataclasses.fields(op)}
+    hooks = ({name: op.traced(name, getattr(op, name)) for name in op.HOOKS if name in fields}
+             if isinstance(op, KernelOp) else {})
+    return op.replace(config=None, vjp=None, bypass_device_check=False, **hooks)
 
 
 def _kind(ba: tokamax.BoundArguments) -> str:

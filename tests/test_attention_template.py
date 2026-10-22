@@ -404,6 +404,23 @@ def test_a_resumed_partial_is_on_par_with_one_pass_over_its_keys(case, hooks, dt
                     f"template resumed {case} {hooks} {jnp.dtype(dtype).name} {split}", seeds=SEEDS)
 
 
+@pytest.mark.parametrize("case", [CASES[name] for name in CASES], ids=list(CASES))
+def test_the_spans_form_says_what_their_intervals_hold(case):
+    """`KeySpans.form`, which a kernel resolves at trace time, agrees with the spans' own visibility:
+    'full' every key for every query, 'causal' keys 0 to i for query i, 'spans' anything narrower."""
+    queries, keys = geometry(case)
+    spans = template.spans(queries, keys, ROWS, **arguments(case))
+    seen = np.asarray(template.dense(spans))
+    if spans.form == "full":
+        assert seen.all()
+    elif spans.form == "causal":
+        np.testing.assert_array_equal(seen, np.broadcast_to(np.tri(queries, keys, dtype=bool), seen.shape))
+    else:
+        assert spans.form == "spans"
+    plain = {name: value for name, value in case.items() if name != "causal"}
+    assert (spans.form != "spans") == (not plain and case.get("causal") in (None, True))
+
+
 def test_hooks_are_a_pytree_whose_values_a_compiled_call_takes():
     """A compiled call takes the hooks as its argument: new parameter and state values run the one
     program it traced, and their gradients flow back into a `Hooks` of the same structure."""
