@@ -140,12 +140,35 @@ def _polyphase_depthwise_3x3(lhs: jax.Array, rhs: jax.Array, dilation: int) -> j
     return output.reshape(batch, rows * dilation, columns * dilation, features)[:, :height, :width]
 
 
-def _shifted_depthwise_3x3(lhs: jax.Array, rhs: jax.Array, dilation: int) -> jax.Array:
-    """The depthwise convolution as its nine shifted products, summed in the
-    kernel's row-major order in fp32 and rounded once to the input's dtype.
+def _depthwise_taps(lhs: jax.Array, rhs: jax.Array, dilation: int, *, materialized: bool) -> jax.Array:
+    """The depthwise convolution as its nine shifted products in fp32, summed in the kernel's row-major
+    order and rounded once to the input's dtype: the one body both schedules run.
 
-    The optimization barrier rounds each product to fp32 before it is
-    added, where XLA would otherwise contract it into a fused multiply-add.
+    The schedule is where XLA may round: barriered (`materialized=False`), each product is rounded to
+    fp32 before it is added, where XLA would otherwise contract it into a fused multiply-add;
+    materialized, the fp32 input, kernel and output are held in memory (`_barrier`, in the cotangents
+    too), so XLA fuses the products and their weight reductions into kernels of their own rather than
+    into a neighbour's, contracting as it measures fastest."""
+    height, width = lhs.shape[1:3]
+    border = ((0, 0), (dilation, dilation), (dilation, dilation), (0, 0))
+    wide, kernel = lhs.astype(jnp.float32), rhs.astype(jnp.float32)
+    if materialized:
+        wide, kernel = _barrier(wide), _barrier(kernel)
+    padded = jnp.pad(wide, border)
+    products = [padded[:, row * dilation:row * dilation + height, column * dilation:column * dilation + width, :]
+                * kernel[row, column, 0] for row in range(3) for column in range(3)]
+    if not materialized:
+        products = jax.lax.optimization_barrier(products)
+    total = products[0]
+    for product in products[1:]:
+        total = total + product
+    return (_barrier(total) if materialized else total).astype(lhs.dtype)
+
+
+def _shifted_depthwise_3x3(lhs: jax.Array, rhs: jax.Array, dilation: int) -> jax.Array:
+    """The depthwise convolution's taps (`_depthwise_taps`), each product rounded to fp32 before it is
+    added.
+
     For more than 16 features that is XLA:CPU's library convolution's
     arithmetic (YNNPACK, jax 0.11.2), bit for bit in fp32 and bf16, which on
     the hybrid DiT's 2 x 16 x 16 x 768 maps takes 6.4 ms a call against 1.4
@@ -153,23 +176,12 @@ def _shifted_depthwise_3x3(lhs: jax.Array, rhs: jax.Array, dilation: int) -> jax
     convolution. If a jax or YNNPACK release changes that summation,
     tests/test_depthwise_conv.py's
     test_cpu_depthwise_is_the_library_convolution_bit_for_bit fails."""
-    height, width = lhs.shape[1:3]
-    padded = jnp.pad(lhs, ((0, 0), (dilation, dilation), (dilation, dilation), (0, 0))).astype(jnp.float32)
-    kernel = rhs.astype(jnp.float32)
-    products = jax.lax.optimization_barrier([
-        padded[:, i * dilation:i * dilation + height, j * dilation:j * dilation + width, :] * kernel[i, j, 0]
-        for i in range(3) for j in range(3)])
-    total = products[0]
-    for product in products[1:]:
-        total = total + product
-    return total.astype(lhs.dtype)
+    return _depthwise_taps(lhs, rhs, dilation, materialized=False)
 
 
 def _materialized_depthwise_3x3(lhs: jax.Array, rhs: jax.Array, dilation: int) -> jax.Array:
-    """The depthwise convolution as its nine shifted products in fp32, with
-    its fp32 input, kernel and output held in memory (`_barrier`, in the
-    cotangents too), so XLA fuses the products and their weight reductions
-    into kernels of their own rather than into a neighbour's.
+    """The depthwise convolution's taps (`_depthwise_taps`) with its fp32 input, kernel and output held
+    in memory.
 
     CUDA runs a dilated one in this form in fp32 and in the polyphase form
     in bf16: the 176M hybrid DiT's training step on an RTX 4080, ms, with
@@ -184,16 +196,7 @@ def _materialized_depthwise_3x3(lhs: jax.Array, rhs: jax.Array, dilation: int) -
     In fp32 cuDNN runs the polyphase convolutions with its grouped direct
     kernels, 3.8 ms of the 5.2 ms a b16 step spent in those layers, and the
     interleaving transposes 1.3 ms more."""
-    height, width = lhs.shape[1:3]
-    border = ((0, 0), (dilation, dilation), (dilation, dilation), (0, 0))
-    padded = jnp.pad(_barrier(lhs.astype(jnp.float32)), border)
-    kernel = _barrier(rhs.astype(jnp.float32))
-    output = jnp.zeros(lhs.shape, jnp.float32)
-    for row in range(3):
-        for column in range(3):
-            top, left = row * dilation, column * dilation
-            output = output + padded[:, top:top + height, left:left + width, :] * kernel[row, column, 0, :]
-    return _barrier(output).astype(lhs.dtype)
+    return _depthwise_taps(lhs, rhs, dilation, materialized=True)
 
 
 def _conv_general_dilated(
