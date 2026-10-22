@@ -118,14 +118,15 @@ def test_cpu_depthwise_is_the_library_convolution_bit_for_bit(shape, dilation, d
 
 @pytest.mark.skipif(jax.default_backend() != "cpu", reason="the shifted sum is the CPU's path")
 @pytest.mark.parametrize('dtype', [jnp.float32, jnp.bfloat16])
-@pytest.mark.parametrize('dilation, library_sign', [(1, True), (2, True), (3, False)])
+@pytest.mark.parametrize('dilation', [1, 2, 3])
 def test_an_all_negative_zero_output_is_the_sums_negative_zero_where_the_librarys_sign_varies(
-        dilation, library_sign, dtype):
+        dilation, dtype):
     """Channel 0 of a 1 x 7 x 8 x 17 map is zero over its first 2d + 1 rows and columns under negative
     taps, so the outputs whose nine taps all read it sum nine negative zeros. Dew's shifted sum gives
-    the IEEE sum's negative zero there; XLA:CPU's library convolution (jax 0.11.2.post3) gives negative
-    zero at dilations 1 and 2 and positive zero at 3 (ledger 1361). Every other output is the
-    library's bit for bit, and those outputs equal it as values."""
+    the IEEE sum's negative zero there; XLA:CPU's library convolution (jax 0.11.2.post3) gives a zero
+    of either sign, by its kernel and the host it runs on: positive at every dilation on one armada
+    host, negative at dilations 1 and 2 on another (ledger 1361). Every other output is the library's
+    bit for bit."""
     rng = np.random.default_rng(dilation)
     x, kernel = rng.normal(size=(1, 7, 8, 17)), rng.normal(size=(3, 3, 1, 17)) * 0.2
     x[:, :2 * dilation + 1, :2 * dilation + 1, 0] = 0
@@ -143,7 +144,6 @@ def test_an_all_negative_zero_output_is_the_sums_negative_zero_where_the_library
     library = np.asarray(jax.jit(partial(convolve, dilation=dilation))(x, kernel), np.float32)
     assert zero.any() and not shared[zero].any() and not library[zero].any()
     assert np.signbit(shared[zero]).all()
-    assert (np.signbit(library[zero]) == library_sign).all()
     np.testing.assert_array_equal(shared[~zero].view(np.uint32), library[~zero].view(np.uint32))
 
 
