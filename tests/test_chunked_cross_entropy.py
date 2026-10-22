@@ -1,21 +1,18 @@
-"""The chunked language-model head: same numbers, no full logits tensor.
+"""The chunked language-model head: the same numbers, no full logits tensor.
 
 The loss this replaces built the whole `[tokens, vocab]` logits tensor, then
 read it for the logsumexp, the target logit, the top-1 prediction and again
 for the softmax gradient. These tests hold the replacement to the code it
-replaced: the loss to 1e-5, both gradients to 1e-4, and the top-1 prediction
-exactly, including the tie that decides which of two equal logits wins.
+replaced: its losses, log partitions and gradients on par with the whole
+logits' from float64 over each site's declared seeds (check 1,
+tests/reference_error.py), and its top-1 prediction exactly.
 
-The mutation tests are the point of the file. Dropping the target term or one
-chunk of the vocabulary leaves a loss that still looks like a loss, so each
-one is fed through the real chunk loop and shown to fail the parity check.
-The tie rule has its own two tests; a looser comparison would pass either winner.
-
-The backward recomputes tiles rather than taping the logits, so the last
-section runs it against that same full-vocabulary pass, to 1e-5 relative on
-both gradients, on shapes whose last token tile and last column tile are both
-short. The two reductions run in different orders, so nothing there is exact;
-the one case whose head is bf16 rounds at the end and holds to 1e-4.
+The backward recomputes tiles rather than taping the logits, so the later
+sections run it against that same full-vocabulary pass on shapes whose last
+token tile and last column tile are both short, and on a Gemma-sized
+vocabulary. The two reductions run in different orders, so nothing there is
+exact but the predictions, an excluded column's zero gradient, and a float64
+head's float64 arithmetic.
 """
 
 import contextlib
@@ -24,16 +21,19 @@ import math
 import jax
 import jax.extend
 import jax.numpy as jnp
+import ml_dtypes
 import numpy as np
 import optax
 import pytest
+from reference_error import assert_as_exact
+from residual_orders import order
 from sharded import collectives
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.nn.precision import rounded_operand, rounded_to
+from dew.nn.precision import capped_logits, rounded_operand, rounded_to, scaled_logits
 from dew.nn.protocols import OutputTable
 from dew.objectives.lm import chunked
-from dew.objectives.lm.chunked import chunked_cross_entropy, fused_head_loss, tile_columns
+from dew.objectives.lm.chunked import chunked_cross_entropy, fused_head_loss
 
 EXERCISED = {jnp.float32: 'highest', jnp.bfloat16: 'default'}
 """The matmul precision each compute dtype's head is compared under: bf16's
@@ -42,10 +42,39 @@ an A100 runs each fp32 dot at TF32 or at fp32 as XLA picks for the program,
 so a whole head and its tiles would differ by TF32's rounding."""
 
 
+def true_logits(table, states, dtype):
+    """`table`'s logits of `states` (`OutputTable.logits`) for a float64 truth: the states through its
+    input quantizer, taken as exact, and the rest in float64; under bf16 compute, which multiplies bf16
+    operands and rounds the logits to bf16 (`head_product`), the exact product of the bf16 operands
+    rounded to bf16 once, as each head's one product (`bf16_product`) is, its own order aside. Called
+    where x64 is enabled."""
+    with jax.enable_x64(new_val=False):
+        read = np.asarray(table.states(jnp.asarray(states, dtype)))
+    operands = [np.asarray(value, np.float64) for value in (read, table.matrix)]
+    if dtype == jnp.bfloat16:
+        operands = [np.asarray(value.astype(ml_dtypes.bfloat16), np.float64) for value in operands]
+    product = jnp.einsum('...d,vd->...v' if table.vocab_major else '...d,dv->...v', *operands)
+    if dtype == jnp.bfloat16:
+        product = jnp.asarray(np.asarray(product).astype(ml_dtypes.bfloat16), jnp.float64)
+    wide = [None if value is None else jnp.asarray(value, jnp.float64) for value in (table.scale, table.bias)]
+    return capped_logits(scaled_logits(product, *wide), table.softcap)
+
+
+def named_gradients(loss, names, argnums=(0, 1)):
+    """`loss`'s gradients for its arguments `argnums`, by `names`: one tree for check 1."""
+    return lambda *terms: dict(zip(names, jax.grad(loss, argnums=argnums)(*terms), strict=True))
+
+
+def true_losses(table, states, targets, dtype):
+    """The float64 cross entropy of `table`'s logits of `states` (`true_logits`) against `targets`."""
+    return optax.softmax_cross_entropy_with_integer_labels(true_logits(table, states, dtype), targets)
+
+
 @pytest.mark.parametrize('dtype', [jnp.float32, jnp.bfloat16])
 @pytest.mark.parametrize('tied', [False, True])
 def test_vocabulary_bias_is_fp32_after_tied_or_untied_head_products(dtype, tied):
-    """FP32 params keep their vocabulary bias outside the bf16 product."""
+    """FP32 params keep their vocabulary bias outside the bf16 product, and the chunked head's losses
+    over it are on par with the whole logits' over drawn states, biases and targets (check 1)."""
     model = CausalTransformer(vocab_size=97, emb_features=24, num_layers=1, num_heads=3,
                               mlp_features=32, max_seq_len=8, head_bias=True,
                               tie_embeddings=tied, dtype=dtype, qk_norm=False,
@@ -61,14 +90,37 @@ def test_vocabulary_bias_is_fp32_after_tied_or_untied_head_products(dtype, tied)
         actual = OutputTable(table.matrix, table.vocab_major, bias).logits(states)
         np.testing.assert_array_equal(actual, logits)
         for tile in (None, (2, 11)):
-            losses, predicted, _ = chunked_cross_entropy(
+            _, predicted, _ = chunked_cross_entropy(
                 states, OutputTable(table.matrix, vocab_major=table.vocab_major, bias=bias), ids, 4, tile=tile
             )
-            expected = optax.softmax_cross_entropy_with_integer_labels(logits, ids)
-            assert jnp.abs(losses - expected).max() <= 1e-5 * jnp.abs(expected).max()
             np.testing.assert_array_equal(predicted, logits.argmax(-1))
     assert variables['params']['head_bias'].dtype == jnp.float32
     assert not np.array_equal(np.asarray(bias), np.asarray(bias.astype(jnp.bfloat16), np.float32))
+
+    def draw(seed):
+        keys = jax.random.split(jax.random.fold_in(jax.random.key(5), seed), 3)
+        return (jax.random.normal(keys[0], states.shape, dtype), jax.random.normal(keys[1], (97,)) / 17,
+                jax.random.randint(keys[2], ids.shape, 0, 97))
+
+    def head(bias):
+        return OutputTable(table.matrix, vocab_major=table.vocab_major, bias=bias)
+
+    def tiled(states, bias, targets):
+        with jax.default_matmul_precision(EXERCISED[dtype]):
+            return {f'{tile}': chunked_cross_entropy(states, head(bias), targets, 4, tile=tile)[0]
+                    for tile in (None, (2, 11))}
+
+    def whole(states, bias, targets):
+        with jax.default_matmul_precision(EXERCISED[dtype]):
+            losses = optax.softmax_cross_entropy_with_integer_labels(head(bias).logits(states), targets)
+        return {f'{tile}': losses for tile in (None, (2, 11))}
+
+    def truth(states, bias, targets):
+        losses = true_losses(head(bias), states, targets, dtype)
+        return {f'{tile}': losses for tile in (None, (2, 11))}
+
+    assert_as_exact(jax.jit(tiled), jax.jit(whole), draw, f'{dtype} {tied} biased head', seeds=SEEDS['bias'],
+                    truth_fn=truth)
 
 
 @pytest.mark.parametrize('dtype', [jnp.float32, jnp.bfloat16])
@@ -76,27 +128,26 @@ def test_vocabulary_bias_is_fp32_after_tied_or_untied_head_products(dtype, tied)
 def test_the_fused_head_takes_the_whole_heads_loss_and_gradients_under_the_float64_rule(dtype, softcap):
     """The gradient-in-forward head's weighted sum of losses and z-loss, and
     its gradients for the states, the head, the per-token scale and the bias,
-    on par with the whole-logits head's over drawn heads and columns (check 1),
-    over chunks whose last is short, padded weights and a cap; its per-token
-    losses, log Z and top-1 columns are the whole head's."""
-    from reference_error import assert_as_exact
-
-    weights = jnp.asarray([[1, 1, 0, 1, 2], [1, 0, 1, 1, 1]], jnp.float32)
+    and its per-token losses and log Z, on par with the whole-logits head's over
+    drawn heads and columns (check 1), over chunks whose last is short, padded
+    weights and a cap; its top-1 columns are the whole head's."""
     z_loss = 1e-2
 
     def draw(seed):
-        states, matrix, targets = inputs(vocab=37, features=16, tokens=(2, 5), dtype=dtype, seed=seed)
+        states, matrix, targets = inputs(vocab=37, features=16, tokens=(8, 16), dtype=dtype, seed=seed)
+        # Padded tokens weigh nothing, others one or two.
+        weights = jax.random.randint(jax.random.fold_in(jax.random.key(8), seed), targets.shape, 0, 3)
         # Sums exact in any order, so the chunks' products are the whole head's.
-        return (*eighths(states, matrix), *columns(37, seed), targets)
+        return (*eighths(states, matrix), *columns(37, seed), targets, weights.astype(jnp.float32))
 
-    def whole(states, matrix, scale, bias, targets):
+    def whole(states, matrix, scale, bias, targets, weights):
         head = OutputTable(matrix, vocab_major=False, bias=bias, softcap=softcap, scale=scale)
         logits = head.logits(states)
         log_z = jax.nn.logsumexp(logits, axis=-1)
         losses = log_z - jnp.take_along_axis(logits, targets[..., None], axis=-1)[..., 0]
-        return jnp.sum(weights * (losses + z_loss * jnp.square(log_z))), (losses, log_z, logits)
+        return jnp.sum(weights * (losses + z_loss * jnp.square(log_z))), (losses, logits.argmax(-1), log_z)
 
-    def fused(states, matrix, scale, bias, targets):
+    def fused(states, matrix, scale, bias, targets, weights):
         return fused_head_loss(states, OutputTable(matrix, vocab_major=False, bias=bias, softcap=softcap,
                                                    scale=scale),
                                targets, weights, z_loss=z_loss, tile=(3, 11))
@@ -104,21 +155,18 @@ def test_the_fused_head_takes_the_whole_heads_loss_and_gradients_under_the_float
     def held(loss):
         def run(*terms):
             with jax.default_matmul_precision(EXERCISED[dtype]):
-                total, gradients = jax.value_and_grad(lambda *values: loss(*values)[0], argnums=(0, 1, 2, 3))(
-                    *terms)
-            return dict(zip(('loss', 'states', 'head', 'scale', 'bias'), (total, *gradients), strict=True))
+                (total, (losses, _, log_z)), gradients = jax.value_and_grad(loss, argnums=(0, 1, 2, 3),
+                                                                            has_aux=True)(*terms)
+            return dict(zip(('loss', 'losses', 'log Z', 'states', 'head', 'scale', 'bias'),
+                            (total, losses, log_z, *gradients), strict=True))
 
         return run
 
     assert_as_exact(jax.jit(held(fused)), jax.jit(held(whole)), draw, f'{dtype} {softcap} fused head',
-                    seeds=FUSED_SEEDS)
+                    seeds=SEEDS['fused'])
     terms = draw(0)
     with jax.default_matmul_precision(EXERCISED[dtype]):
-        _, (losses, predicted, log_z) = fused(*terms)
-        _, (expected, expected_z, logits) = whole(*terms)
-    np.testing.assert_array_equal(predicted, logits.argmax(-1))
-    np.testing.assert_allclose(losses, expected, rtol=1e-6, atol=1e-6)
-    np.testing.assert_allclose(log_z, expected_z, rtol=1e-6, atol=1e-6)
+        np.testing.assert_array_equal(fused(*terms)[1][1], whole(*terms)[1][1])
 
 
 @pytest.mark.parametrize('kind', ['nvfp4', 'fp8'])
@@ -128,7 +176,8 @@ def test_a_checkpoints_head_input_quantization_reaches_every_head_that_scores_it
     lm_head (ModelOpt's, as `Pretrained` reads it) has its head's input
     rounded by the quantizer in its forward; the table a loss, a scorer and
     a sampler read carries the same quantizer, so the table's logits are the
-    forward's and the tiled loss is the forward's logits' cross entropy."""
+    forward's and the tiled loss is on par with the forward's logits' cross
+    entropy over drawn states and targets (check 1)."""
     from dew.quantization import INPUT_SCALES, QUANTIZATION, InputQuantization
 
     model = InputQuantization(format='modelopt', sites=(('lm_head', kind),)).apply(CausalTransformer(
@@ -145,10 +194,27 @@ def test_a_checkpoints_head_input_quantization_reaches_every_head_that_scores_it
         np.testing.assert_array_equal(chunked.model_logits(model, variables, states), logits)
         unquantized = OutputTable(table.matrix, table.vocab_major, table.bias, compute=table.compute)
         assert not np.array_equal(unquantized.logits(states), logits)
-        losses, predicted, _ = chunked.head_cross_entropy(model, variables, states, ids, 4, tile=(3, 11))
-    expected = optax.softmax_cross_entropy_with_integer_labels(logits, ids)
-    assert jnp.abs(losses - expected).max() <= 1e-5 * jnp.abs(expected).max()
+        _, predicted, _ = chunked.head_cross_entropy(model, variables, states, ids, 4, tile=(3, 11))
     np.testing.assert_array_equal(predicted, logits.argmax(-1))
+
+    def draw(seed):
+        keys = jax.random.split(jax.random.fold_in(jax.random.key(6), seed))
+        return jax.random.normal(keys[0], states.shape, dtype), jax.random.randint(keys[1], ids.shape, 0, 97)
+
+    def tiled(states, targets):
+        with jax.default_matmul_precision(EXERCISED[dtype]):
+            return chunked.head_cross_entropy(model, variables, states, targets, 4, tile=(3, 11))[0]
+
+    def whole(states, targets):
+        with jax.default_matmul_precision(EXERCISED[dtype]):
+            return optax.softmax_cross_entropy_with_integer_labels(
+                chunked.model_logits(model, variables, states), targets)
+
+    def truth(states, targets):
+        return true_losses(table, states, targets, dtype)
+
+    assert_as_exact(jax.jit(tiled), jax.jit(whole), draw, f'{dtype} {kind} quantized head',
+                    seeds=SEEDS['quantized'], truth_fn=truth)
 
 
 @pytest.mark.parametrize('tied', [False, True])
@@ -179,10 +245,13 @@ def columns(vocab: int, seed: int = 0):
             jax.random.normal(bias, (vocab,), jnp.float32) / 17)
 
 
-COLUMN_SEEDS = {"scale and bias": 64, "vocabulary split": 256}
-FUSED_SEEDS = 16
-"""Check 1's declared seeds for the fused head, sized by `seeds_for` (2026-10-21, on armada)."""
-"""Check 1's declared seeds for the head's gradient sites, sized by `seeds_for` (2026-10-21, on armada)."""
+SEEDS = {'bias': 128, 'fused': 512, 'quantized': 64, 'scale and bias': 128, 'vocabulary split': 512,
+         'column orders': 8, 'split bias': 32, 'quantized split': 32, 'backbone states': 16, 'backbone': 128,
+         'small vocabulary': 128, 'small vocabulary training': 128, 'bounded': 32, 'saturated': 256,
+         'excluded': 32, 'token tiles': 16, 'both outputs': 64, 'gemma': 16, 'bf16 cotangent': 8,
+         'whole logits': 512}
+"""Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada, 2026-10-21):
+the most any of a site's cases took."""
 
 
 @pytest.mark.parametrize('dtype', [jnp.float32, jnp.bfloat16])
@@ -191,10 +260,6 @@ def test_the_scale_and_bias_gradients_match_full_logits_under_the_float64_rule(d
     """The per-token scale's and the bias's gradients of the tiled head and of
     the whole-logits head, each taken past the product's rounding, on par with
     the full logits' own over drawn heads and columns (check 1)."""
-    from reference_error import assert_as_exact
-
-    from dew.nn.precision import head_product
-
     # Sums exact in any order: a tile's product is then the whole product on
     # any device, as the oracle takes it, where an fp32 sum's last bit, which
     # a GPU's tile shape picks, can move a bf16 logit a whole bf16 step.
@@ -220,24 +285,16 @@ def test_the_scale_and_bias_gradients_match_full_logits_under_the_float64_rule(d
             return dict(zip(('scale', 'bias'), jax.grad(loss, argnums=(0, 1))(scale, bias), strict=True))
 
     def truth(states, matrix, targets, scale, bias):
-        # For bf16 the rounded product is exact input to the affine head: this
-        # oracle isolates its fp32 scale, bias and softmax gradient, the product
-        # rounded as the head rounds it before it is widened.
-        if dtype == jnp.float32:
-            wide = jnp.einsum('...d,dv->...v', states, matrix, precision=jax.lax.Precision.HIGHEST)
-        else:
-            with jax.enable_x64(new_val=False), jax.default_matmul_precision('default'):
-                rounded = head_product('...d,dv->...v', jnp.asarray(states, dtype),
-                                       jnp.asarray(matrix, jnp.float32), None)
-            wide = jnp.asarray(np.asarray(rounded.astype(jnp.float32)), jnp.float64)
-
+        # For bf16 the rounded product is exact input to the affine head: the
+        # truth isolates its fp32 scale, bias and softmax gradient (`true_logits`).
         def loss(scale, bias):
-            return optax.softmax_cross_entropy_with_integer_labels(wide * scale + bias, targets).mean()
+            head = OutputTable(matrix, vocab_major=False, bias=bias, scale=scale)
+            return true_losses(head, states, targets, dtype).mean()
 
         return dict(zip(('scale', 'bias'), jax.grad(loss, argnums=(0, 1))(scale, bias), strict=True))
 
     assert_as_exact(jax.jit(bounded), jax.jit(full), draw, f'{dtype} vocabulary gradient',
-                    seeds=COLUMN_SEEDS["scale and bias"], truth_fn=truth)
+                    seeds=SEEDS['scale and bias'], truth_fn=truth)
 
 
 @pytest.mark.mesh(devices=2)
@@ -278,7 +335,6 @@ def test_a_vocabulary_split_head_takes_every_gradient_under_the_float64_rule(til
     and no collective carries an array the head's size: each device's columns,
     scale and bias stay in its shard."""
     from jax.sharding import NamedSharding, PartitionSpec as P
-    from reference_error import assert_as_exact
 
     from dew.training import MeshSpec
 
@@ -311,7 +367,7 @@ def test_a_vocabulary_split_head_takes_every_gradient_under_the_float64_rule(til
         with jax.default_matmul_precision('highest'):
             return jax.value_and_grad(whole, argnums=(0, 1, 2, 3))(*terms)
 
-    assert_as_exact(split, alone, draw, 'vocabulary-split head', seeds=COLUMN_SEEDS["vocabulary split"])
+    assert_as_exact(split, alone, draw, 'vocabulary-split head', seeds=SEEDS['vocabulary split'])
     terms = draw(0)
     matrix = terms[1]
     with jax.set_mesh(mesh), jax.default_matmul_precision('highest'):
@@ -325,16 +381,19 @@ def test_a_vocabulary_split_head_takes_every_gradient_under_the_float64_rule(til
 @pytest.mark.parametrize('tile', [None, (2, 64)], ids=['whole', 'tiled'])
 def test_a_heads_terms_and_gradients_are_as_exact_as_logsumexps_over_its_column_orders(tile):
     """One device's head over 512 columns: each token's loss and log Z, and the gradients of a loss
-    of both for the states, the head, the scale and the bias, are as close to float64 over the
-    orders of its columns (the targets relabelled, which reorders every row's sum of exponentials
-    and moves no value) as `jax.nn.logsumexp`'s whole logits are (`assert_as_exact_over_orders`).
-    A row summed in one loop of XLA's CPU reduction with a combine of its own, and a share divided
-    out and then scaled, held the whole head's state gradient 3.9 times as far."""
-    from reference_error import ORDERS, assert_as_exact_over_orders
-
+    of both for the states, the head, the scale and the bias, are on par with `jax.nn.logsumexp`'s
+    whole logits' from float64 over the orders of its columns (check 1 over the orbit: the targets
+    relabelled, which reorders every row's sum of exponentials and moves no value). A row summed in
+    one loop of XLA's CPU reduction with a combine of its own, and a share divided out and then
+    scaled, held the whole head's state gradient 3.9 times as far."""
     states, matrix, targets = inputs(vocab=512, features=16, tokens=(4, 5))
     states, matrix = eighths(states, matrix)
     scale, bias = columns(512)
+
+    def draw(seed):
+        columns_in = order(512, seed)
+        relabel = np.argsort(columns_in)
+        return states, matrix[:, columns_in], scale[columns_in], bias[columns_in], relabel[targets]
 
     def terms(states, matrix, scale, bias, targets):
         head = OutputTable(matrix, vocab_major=False, bias=bias, scale=scale)
@@ -350,87 +409,107 @@ def test_a_heads_terms_and_gradients_are_as_exact_as_logsumexps_over_its_column_
         def loss(*arguments):
             losses, log_z = head(*arguments)
             return jnp.sum(losses + 1e-2 * jnp.square(log_z)), (losses, log_z)
-        return jax.grad(loss, argnums=(0, 1, 2, 3), has_aux=True)
 
-    with jax.default_matmul_precision('highest'):
-        dew, reference = jax.jit(scored(terms)), jax.jit(scored(whole))
-    with jax.enable_x64(new_val=True):
-        exact = jax.jit(scored(whole))
-    def back(scored, relabel):
-        """The terms and gradients of one order in the columns' own order."""
-        (d_states, d_matrix, d_scale, d_bias), outputs = jax.tree.map(
-            lambda leaf: np.asarray(leaf, np.float64), scored)
-        return (*outputs, d_states, d_matrix[:, relabel], d_scale[relabel], d_bias[relabel])
+        def run(*arguments):
+            with jax.default_matmul_precision('highest'):
+                gradients, (losses, log_z) = jax.grad(loss, argnums=(0, 1, 2, 3), has_aux=True)(*arguments)
+            return dict(zip(('losses', 'log Z', 'states', 'head', 'scale', 'bias'),
+                            (losses, log_z, *gradients), strict=True))
 
-    distances = {'dew': [], 'reference': []}
-    for order in range(ORDERS):
-        columns_in = np.random.default_rng(order).permutation(512) if order else np.arange(512)
-        relabel = np.argsort(columns_in)
-        drawn = (states, matrix[:, columns_in], scale[columns_in], bias[columns_in], relabel[targets])
-        with jax.enable_x64(new_val=True):
-            true = back(exact(*(jnp.asarray(term, jnp.float64) for term in drawn[:4]), drawn[4]), relabel)
-        with jax.default_matmul_precision('highest'):
-            for name, arm in (('dew', dew), ('reference', reference)):
-                got = back(arm(*drawn), relabel)
-                distances[name].append([np.sqrt(np.mean(np.square(a - b))) for a, b in zip(got, true,
-                                                                                           strict=True)])
-    for index, name in enumerate(('losses', 'log Z', 'states', 'head', 'scale', 'bias')):
-        assert_as_exact_over_orders(np.asarray(distances['dew'])[:, index],
-                                    np.asarray(distances['reference'])[:, index], f'{tile} {name}')
+        return run
+
+    assert_as_exact(jax.jit(scored(terms)), jax.jit(scored(whole)), draw, f'{tile} column orders',
+                    seeds=SEEDS['column orders'])
+
+
+def split_scores(model, wide_model, shape, vocab: int, objective_of, adjusted, label: str, seeds: int):
+    """A vocabulary-split objective's (`objective_of(model, variables)`) token losses on a two-device
+    mesh on par with one device's over drawn variables and `shape` tokens of `vocab` (check 1), the
+    truth the objective of
+    `wide_model`, `model` in float64, on them widened; its top-1 hits at the first draw one device's.
+    A draw's variables are `model`'s initial ones as `adjusted` sets them. Returns the mesh, and the
+    first draw's variables and batch placed on it."""
+    from dew.training import Layout, MeshSpec
+    from dew.training.distributed import shard_batch
+
+    def draw(seed):
+        tokens = jax.random.randint(jax.random.fold_in(jax.random.key(1), seed), shape, 0, vocab)
+        return adjusted(model.init(jax.random.fold_in(jax.random.key(0), seed), tokens[:, :-1])), tokens
+
+    variables, _ = draw(0)
+    objective, wide = objective_of(model, variables), objective_of(wide_model, variables)
+    mesh = MeshSpec(fsdp=2).build(jax.devices()[:2])
+    shardings = Layout(min_shard=1).shardings(mesh, variables)
+    scored = jax.jit(objective.token_scores)
+
+    def placed(variables, tokens):
+        return jax.device_put(variables, shardings), shard_batch(mesh, {'text': np.asarray(tokens)})['text']
+
+    def split(variables, tokens):
+        with jax.set_mesh(mesh):
+            return scored(*placed(variables, tokens))
+
+    def alone(variables, tokens):
+        wider = jax.tree.leaves(variables)[0].dtype == np.float64
+        return (wide if wider else objective).token_scores(variables, tokens)
+
+    assert_as_exact(lambda *drawn: split(*drawn).losses, jax.jit(lambda *drawn: alone(*drawn).losses), draw,
+                    label, seeds=seeds)
+    np.testing.assert_array_equal(split(*draw(0)).correct, alone(*draw(0)).correct)
+    return mesh, *placed(*draw(0))
 
 
 @pytest.mark.mesh(devices=2)
 def test_vocabulary_split_slices_the_bias_with_its_table_columns():
     from dew.objectives.lm import LMObjective
-    from dew.training import Layout, MeshSpec
-    from dew.training.distributed import shard_batch
 
-    model = CausalTransformer(vocab_size=128, emb_features=8, num_layers=1, num_heads=2,
-                              mlp_features=16, max_seq_len=4, head_bias=True,
-                              qk_norm=False, attention_impl='reference')
-    tokens = jnp.arange(20, dtype=jnp.int32).reshape(4, 5)
-    variables = model.init(jax.random.key(0), tokens[:, :-1])
-    variables['params']['head_bias'] = variables['params']['head_bias'].at[117].set(13.027)
-    objective = LMObjective(model, seq_len=4, variables=variables, head_chunks=4,
-                            head_tile=(2, 11), ema_decay=None)
-    expected = objective.token_scores(variables, tokens)
-    mesh = MeshSpec(fsdp=2).build(jax.devices()[:2])
-    shardings = Layout(min_shard=1).shardings(mesh, variables)
-    with jax.set_mesh(mesh):
-        actual = jax.jit(objective.token_scores)(
-            jax.device_put(variables, shardings), shard_batch(mesh, {'text': np.asarray(tokens)})['text'])
-    assert jnp.abs(actual.losses - expected.losses).max() <= 1e-5 * jnp.abs(expected.losses).max()
-    np.testing.assert_array_equal(actual.correct, expected.correct)
+    def model(dtype):
+        return CausalTransformer(vocab_size=128, emb_features=8, num_layers=1, num_heads=2,
+                                 mlp_features=16, max_seq_len=4, head_bias=True,
+                                 qk_norm=False, attention_impl='reference', dtype=dtype)
+
+    def objective(model, variables):
+        return LMObjective(model, seq_len=4, variables=variables, head_chunks=4, head_tile=(2, 11),
+                           ema_decay=None)
+
+    def spiked(variables):
+        variables['params']['head_bias'] = variables['params']['head_bias'].at[117].set(13.027)
+        return variables
+
+    split_scores(model(jnp.float32), model(jnp.float64), (4, 5), 128, objective, spiked,
+                 'vocabulary-split bias', SEEDS['split bias'])
 
 
 @pytest.mark.mesh(devices=2)
 def test_a_quantized_split_head_scores_as_one_device_and_moves_no_head_sized_array():
     """A head whose input a checkpoint quantizes, split over the vocabulary on
-    a mesh, scores each token as one device does, and no collective of the
-    step carries an array the head's size: tokens and per-token terms cross
-    devices, the head stays in its shards."""
+    a mesh, scores each token on par with one device (`split_scores`), and no
+    collective of the step carries an array the head's size: tokens and
+    per-token terms cross devices, the head stays in its shards."""
     from jax.sharding import NamedSharding, PartitionSpec as P
 
     from dew.objectives.lm import LMObjective
     from dew.quantization import INPUT_SCALES, QUANTIZATION, InputQuantization
-    from dew.training import Layout, MeshSpec
-    from dew.training.distributed import shard_batch
 
-    model = InputQuantization(format='modelopt', sites=(('lm_head', 'fp8'),)).apply(CausalTransformer(
-        vocab_size=512, emb_features=16, num_layers=1, num_heads=2, mlp_features=16, max_seq_len=4,
-        tie_embeddings=False, qk_norm=False, attention_impl='reference'))
+    def quantized(dtype):
+        return InputQuantization(format='modelopt', sites=(('lm_head', 'fp8'),)).apply(CausalTransformer(
+            vocab_size=512, emb_features=16, num_layers=1, num_heads=2, mlp_features=16, max_seq_len=4,
+            tie_embeddings=False, qk_norm=False, attention_impl='reference', dtype=dtype))
+
+    def objective(model, variables):
+        return LMObjective(model, seq_len=4, variables=variables, head_chunks=4, head_tile=(2, 64),
+                           ema_decay=None)
+
+    def scaled(variables):
+        variables[QUANTIZATION]['lm_head'][INPUT_SCALES['fp8']] = jnp.asarray(0.02, jnp.float32)
+        return variables
+
+    model = quantized(jnp.float32)
     tokens = jnp.arange(20, dtype=jnp.int32).reshape(4, 5)
-    variables = model.init(jax.random.key(0), tokens[:, :-1])
-    variables[QUANTIZATION]['lm_head'][INPUT_SCALES['fp8']] = jnp.asarray(0.02, jnp.float32)
-    objective = LMObjective(model, seq_len=4, variables=variables, head_chunks=4,
-                            head_tile=(2, 64), ema_decay=None)
-    expected = objective.token_scores(variables, tokens)
-    mesh = MeshSpec(fsdp=2).build(jax.devices()[:2])
-    shardings = Layout(min_shard=1).shardings(mesh, variables)
+    mesh, placed, _ = split_scores(model, quantized(jnp.float64), (4, 5), 512, objective, scaled,
+                                   'quantized vocabulary split', SEEDS['quantized split'])
+    variables = jax.device_get(placed)
     with jax.set_mesh(mesh):
-        placed = jax.device_put(variables, shardings)
-        batch = shard_batch(mesh, {'text': np.asarray(tokens)})['text']
-        actual = jax.jit(objective.token_scores)(placed, batch)
         states = jax.device_put(model.apply(variables, tokens[:, :-1], method='hidden_states'),
                                 NamedSharding(mesh, P('fsdp')))
         targets = jax.device_put(tokens[:, 1:], NamedSharding(mesh, P('fsdp')))
@@ -441,8 +520,6 @@ def test_a_quantized_split_head_scores_as_one_device_and_moves_no_head_sized_arr
 
         # The head's forward and backward alone: the embedding's own gather is not the head's.
         program = jax.jit(jax.grad(loss, argnums=(0, 1))).lower(placed['params'], states).compile().as_text()
-    assert jnp.abs(actual.losses - expected.losses).max() <= 1e-5 * jnp.abs(expected.losses).max()
-    np.testing.assert_array_equal(actual.correct, expected.correct)
     head = 512 * 16
     moved = [math.prod(shape) for _, shapes in collectives(program) for shape in shapes]
     assert moved and max(moved) < head // 2, moved
@@ -509,79 +586,81 @@ def small_model(**overrides):
 @pytest.mark.parametrize("tie_embeddings", [True, False])
 @pytest.mark.parametrize("chunks", [4, 8])
 def test_bf16_states_from_the_backbone_score_as_the_logits_did(chunks, tie_embeddings, dtype):
-    """Real hidden states and a real head, tied and untied: the model's head
-    multiplies as the chunked loss does under bf16 and fp32 compute."""
+    """Real hidden states and a real head, tied and untied: the chunked loss of the backbone's states
+    is on par with the cross entropy of the model's own head's logits of them over drawn tokens and
+    targets (check 1), under bf16 and fp32 compute, and picks the model's top-1."""
     model = small_model(tie_embeddings=tie_embeddings, dtype=dtype)
     rng = jax.random.PRNGKey(0)
     ids = jax.random.randint(rng, (2, 12), 0, 97)
     variables = model.init(rng, ids)
-    targets = jax.random.randint(jax.random.PRNGKey(1), (2, 12), 0, 97)
+    # The model's own table, whose product the whole logits round as the chunks do.
+    table = chunked.head_table(model, variables)
 
-    logits = model.apply(variables, ids)
-    expected = optax.softmax_cross_entropy_with_integer_labels(logits, targets)
+    def draw(seed):
+        keys = jax.random.split(jax.random.fold_in(jax.random.key(1), seed))
+        drawn = jax.random.randint(keys[0], (2, 12), 0, 97)
+        return (model.apply(variables, drawn, method=CausalTransformer.hidden_states),
+                jax.random.randint(keys[1], (2, 12), 0, 97))
 
+    def tiled(hidden, targets):
+        with jax.default_matmul_precision(EXERCISED[dtype]):
+            return chunked_cross_entropy(hidden, table, targets, chunks)[0]
+
+    def whole(hidden, targets):
+        with jax.default_matmul_precision(EXERCISED[dtype]):
+            return optax.softmax_cross_entropy_with_integer_labels(
+                chunked.model_logits(model, variables, hidden), targets)
+
+    assert_as_exact(jax.jit(tiled), jax.jit(whole), draw,
+                    f'{dtype} {tie_embeddings} {chunks} backbone states', seeds=SEEDS['backbone states'],
+                    truth_fn=lambda hidden, targets: true_losses(table, hidden, targets, dtype))
     hidden = model.apply(variables, ids, method=CausalTransformer.hidden_states)
-    losses, predicted, _ = chunked_cross_entropy(
-        hidden, OutputTable(head_matrix(model, variables), vocab_major=False), targets, chunks
-    )
-
+    matrix = OutputTable(head_matrix(model, variables), vocab_major=False)
+    _, predicted, _ = chunked_cross_entropy(hidden, matrix, ids, chunks)
     assert hidden.dtype == dtype
-    assert jnp.abs(losses - expected).max() <= 1e-5 * jnp.abs(expected).max()
-    assert jnp.array_equal(predicted, jnp.argmax(logits, axis=-1))
+    assert jnp.array_equal(predicted, jnp.argmax(model.apply(variables, ids), axis=-1))
 
 
 def test_the_gradient_reaches_the_backbone_through_the_states_and_the_head():
-    """Both paths a tied head has: the trunk and the embedding table.
-
-    The model computes in bf16, and the gradient into the tied embedding is a
-    scatter-add of bf16 products, which a GPU runs as atomics in no fixed
-    order. Two correct paths can then differ by one bf16 ulp of the largest
-    entry (measured: 2**-9 on 0.44, in some processes and not others). The
-    bound is one bf16 ulp, 2**-8 relative, with a margin: a real divergence of
-    the two paths is orders above it.
+    """Both paths a tied head has, the trunk and the embedding table: every parameter's gradient
+    through the chunked head is on par with the whole logits' over drawn models, tokens and targets
+    (check 1), the truth the model in float64, and none is zero, so each is checked.
 
     The reference takes the logits from the operands the head multiplies,
     rounded to bf16, at the highest precision, and rounds them to bf16 as the
     chunked head does, so its backward rounds the logits' cotangent to bf16
     once, as the chunked head's does.
     """
-    model = small_model()
-    rng = jax.random.PRNGKey(0)
-    ids = jax.random.randint(rng, (2, 12), 0, 97)
-    variables = model.init(rng, ids)
-    targets = jax.random.randint(jax.random.PRNGKey(1), (2, 12), 0, 97)
+    model, wide = small_model(), small_model(dtype=jnp.float64)
+    init = jax.jit(model.init)
 
-    def full(params):
-        hidden = model.apply({'params': params}, ids,
-                             method=CausalTransformer.hidden_states)
+    def draw(seed):
+        keys = jax.random.split(jax.random.fold_in(jax.random.key(0), seed), 3)
+        ids = jax.random.randint(keys[0], (2, 12), 0, 97)
+        return init(keys[1], ids)['params'], ids, jax.random.randint(keys[2], (2, 12), 0, 97)
+
+    def full(params, ids, targets):
+        hidden = model.apply({'params': params}, ids, method=CausalTransformer.hidden_states)
         head = head_matrix(model, {'params': params})
-        operands = (rounded_operand(value.astype(jnp.float32), jnp.bfloat16)
-                    for value in (hidden, head))
+        operands = (rounded_operand(value.astype(jnp.float32), jnp.bfloat16) for value in (hidden, head))
         logits = rounded_to(jnp.einsum('btd,dv->btv', *operands, precision=jax.lax.Precision.HIGHEST),
                             jnp.bfloat16)
-        return jnp.mean(
-            optax.softmax_cross_entropy_with_integer_labels(logits, targets))
+        return jnp.mean(optax.softmax_cross_entropy_with_integer_labels(logits, targets))
 
-    def chunked(params):
-        hidden = model.apply({'params': params}, ids,
-                             method=CausalTransformer.hidden_states)
-        return jnp.mean(
-            chunked_cross_entropy(
-                hidden, OutputTable(head_matrix(model, {'params': params}), vocab_major=False), targets, 4
-            )[0]
-        )
+    def tiled(params, ids, targets):
+        hidden = model.apply({'params': params}, ids, method=CausalTransformer.hidden_states)
+        table = OutputTable(head_matrix(model, {'params': params}), vocab_major=False)
+        return jnp.mean(chunked_cross_entropy(hidden, table, targets, 4)[0])
 
-    expected = jax.grad(full)(variables['params'])
-    got = jax.grad(chunked)(variables['params'])
+    def true(params, ids, targets):
+        logits = wide.apply({'params': params}, ids)
+        return jnp.mean(optax.softmax_cross_entropy_with_integer_labels(logits, targets))
 
-    flat_expected = jax.tree_util.tree_flatten_with_path(expected)[0]
-    flat_got = jax.tree_util.tree_leaves(got)
-    assert len(flat_expected) == len(flat_got)
-    for (path, want), have in zip(flat_expected, flat_got, strict=True):
-        largest = jnp.abs(want).max()
+    assert_as_exact(jax.jit(jax.grad(tiled)), jax.jit(jax.grad(full)), draw, 'backbone gradient',
+                    seeds=SEEDS['backbone'], truth_fn=jax.jit(jax.grad(true)))
+    for path, leaf in jax.tree_util.tree_leaves_with_path(jax.grad(full)(*draw(0))):
         name = jax.tree_util.keystr(path)
-        assert largest > 0, f"{name} has a zero gradient, so nothing is checked"
-        assert jnp.abs(have - want).max() <= 1e-2 * largest, name
+        assert jnp.abs(leaf).max() > 0, f"{name} has a zero gradient, so nothing is checked"
 
 
 # --- the chunk arithmetic itself -------------------------------------------
@@ -596,35 +675,45 @@ def test_nonpositive_chunk_counts_are_refused(chunks):
 @pytest.mark.parametrize("chunks", [4, 8])
 @pytest.mark.parametrize("tile", [None, (3, 2)])
 def test_small_vocabularies_take_any_positive_chunk_count(chunks, tile):
-    """A five-column head's short tail and one-column tiles score every column and gradient."""
-    hidden, head, targets = inputs(vocab=5, features=8, tokens=(2, 4))
-    bias = jax.random.normal(jax.random.key(3), (5,)) / 7
+    """A five-column head's short tail and one-column tiles score every column and gradient: on par
+    with the whole logits over drawn heads (check 1), and the whole logits' top-1."""
+    def draw(seed):
+        hidden, head, targets = inputs(vocab=5, features=8, tokens=(16, 32), seed=seed)
+        return hidden, head, jax.random.normal(jax.random.fold_in(jax.random.key(3), seed), (5,)) / 7, targets
 
-    def tiled(hidden, head, bias):
+    def tiled(hidden, head, bias, targets):
         losses, predicted, log_z = chunked_cross_entropy(
             hidden, OutputTable(head, vocab_major=False, bias=bias, softcap=3.),
             targets, chunks, tile=tile)
         return jnp.sum(losses + .01 * jnp.square(log_z)), (losses, predicted, log_z)
 
-    def whole(hidden, head, bias):
+    def whole(hidden, head, bias, targets):
         logits = OutputTable(head, vocab_major=False, bias=bias, softcap=3.).logits(hidden)
         log_z = jax.nn.logsumexp(logits, axis=-1)
         losses = optax.softmax_cross_entropy_with_integer_labels(logits, targets)
         return jnp.sum(losses + .01 * jnp.square(log_z)), (losses, logits.argmax(-1), log_z)
 
+    def held(loss):
+        def run(*terms):
+            with jax.default_matmul_precision("highest"):
+                gradients, (losses, _, log_z) = jax.grad(loss, argnums=(0, 1, 2), has_aux=True)(*terms)
+            return dict(zip(("losses", "log Z", "hidden", "head", "bias"), (losses, log_z, *gradients),
+                            strict=True))
+        return run
+
+    assert_as_exact(jax.jit(held(tiled)), jax.jit(held(whole)), draw, f"{chunks} {tile} small vocabulary",
+                    seeds=SEEDS["small vocabulary"])
     with jax.default_matmul_precision("highest"):
-        got, gradients = jax.value_and_grad(tiled, argnums=(0, 1, 2), has_aux=True)(hidden, head, bias)
-        want, reference = jax.value_and_grad(whole, argnums=(0, 1, 2), has_aux=True)(hidden, head, bias)
-    np.testing.assert_array_equal(got[1][1], want[1][1])
-    for actual, expected in zip(jax.tree.leaves((got, gradients)),
-                                 jax.tree.leaves((want, reference)), strict=True):
-        np.testing.assert_allclose(actual, expected, rtol=1e-5, atol=1e-6)
+        np.testing.assert_array_equal(tiled(*draw(0))[1][1], whole(*draw(0))[1][1])
 
 
 @pytest.mark.parametrize("chunks", [4, 8])
 def test_lm_training_with_small_vocabularies_matches_the_unchunked_head(chunks):
-    """The objective's chunk count reaches the tiled head in both the loss and optimizer update."""
-    from dew.objectives.base import Step
+    """The objective's chunk count reaches the tiled head in both its token losses and the optimizer's
+    update: each on par with the unchunked head's over drawn batches (check 1), the truth the model in
+    float64. The update's loss is the objective's (`scalar_loss`), its token losses' mean."""
+    from reference_error import widened
+
     from dew.objectives.lm import LMObjective
     from dew.training import Trainer
 
@@ -633,22 +722,34 @@ def test_lm_training_with_small_vocabularies_matches_the_unchunked_head(chunks):
     objective = LMObjective(model, seq_len=4, head_chunks=chunks, head_tile=(3, 2), ema_decay=None)
     trainer = Trainer(objective, optax.sgd(.01), key=jax.random.key(0))
     initial = trainer.initial_state()
-    ids = jnp.tile(jnp.arange(5, dtype=jnp.int32), (jax.device_count(), 1))
-    step = Step(jnp.array(0), jax.random.key(1), None)
 
-    def whole(params):
-        logits = model.apply({**initial.variables, "params": params}, ids[:, :-1])
-        return jnp.mean(optax.softmax_cross_entropy_with_integer_labels(logits, ids[:, 1:]))
+    def draw(seed):
+        key = jax.random.fold_in(jax.random.key(2), seed)
+        return (jax.random.randint(key, (jax.device_count(), 5), 0, 5),)
 
-    want, gradient = jax.value_and_grad(whole)(initial.variables["params"])
-    actual = objective.scalar_loss(initial.variables, {"text": ids}, step)[0]
-    np.testing.assert_allclose(actual, want, rtol=1e-6)
-    expected = jax.tree.map(lambda p, g: p - .01 * g, initial.variables["params"], gradient)
-    trained, _, _, _, accepted, _ = trainer.compile(initial, {"text": ids})(initial, {"text": ids})
-    assert bool(accepted) and int(trained.updates) == 1
-    for actual, reference in zip(jax.tree.leaves(trained.variables["params"]),
-                                 jax.tree.leaves(expected), strict=True):
-        np.testing.assert_allclose(actual, reference, rtol=1e-5, atol=1e-7)
+    compiled = trainer.compile(initial, {"text": draw(0)[0]})
+    scores = jax.jit(lambda ids: objective.token_scores(initial.variables, ids).losses)
+
+    def trained(ids):
+        state, _, _, _, accepted, _ = compiled(jax.tree.map(jnp.copy, initial), {"text": ids})
+        assert bool(accepted) and int(state.updates) == 1
+        return {"losses": scores(ids), "params": state.variables["params"]}
+
+    def stepped(model, variables):
+        def whole(params, ids):
+            logits = model.apply({**variables, "params": params}, ids[:, :-1])
+            losses = optax.softmax_cross_entropy_with_integer_labels(logits, ids[:, 1:])
+            return jnp.mean(losses), losses
+
+        def run(ids):
+            gradient, losses = jax.grad(whole, has_aux=True)(variables["params"], ids)
+            updated = jax.tree.map(lambda p, g: p - .01 * g, variables["params"], gradient)
+            return {"losses": losses, "params": updated}
+        return run
+
+    assert_as_exact(trained, jax.jit(stepped(model, initial.variables)), draw,
+                    f"{chunks} small vocabulary step", seeds=SEEDS["small vocabulary training"],
+                    truth_fn=stepped(model.clone(dtype=jnp.float64), widened(initial.variables)))
 
 
 def test_mismatched_shapes_are_refused():
@@ -680,16 +781,18 @@ def oracle(hidden, head, targets, softcap=None, precision=None):
 @pytest.mark.parametrize("softcap", [None, 30.])
 def test_the_bounded_backward_matches_the_full_vocabulary_pass(
         loss_weight, z_weight, softcap):
-    """Both outputs' gradients, against the pass that holds all the logits."""
-    hidden, head, targets = inputs(
-        vocab=RAGGED_VOCAB, features=7, tokens=(1, RAGGED_TOKENS))
+    """Both outputs, and their gradients, on par with the pass that holds all the logits over drawn
+    heads (check 1); its top-1 the full pass's, and neither short tile's gradient dropped."""
     precision = jax.lax.Precision.HIGHEST
 
-    def full(states, matrix):
-        losses, log_z = oracle(states, matrix, targets, softcap, precision)
-        return jnp.sum(loss_weight * losses + z_weight * jnp.square(log_z))
+    def draw(seed):
+        return inputs(vocab=RAGGED_VOCAB, features=7, tokens=(1, RAGGED_TOKENS), seed=seed)
 
-    def tiled(states, matrix):
+    def full(states, matrix, targets):
+        losses, log_z = oracle(states, matrix, targets, softcap, precision)
+        return jnp.sum(loss_weight * losses + z_weight * jnp.square(log_z)), (losses, log_z)
+
+    def tiled(states, matrix, targets):
         losses, _, log_z = chunked_cross_entropy(
             states,
             OutputTable(matrix, vocab_major=False, softcap=softcap, precision=precision),
@@ -697,12 +800,17 @@ def test_the_bounded_backward_matches_the_full_vocabulary_pass(
             4,
             tile=RAGGED,
         )
-        return jnp.sum(loss_weight * losses + z_weight * jnp.square(log_z))
+        return jnp.sum(loss_weight * losses + z_weight * jnp.square(log_z)), (losses, log_z)
 
-    want_loss, want = jax.value_and_grad(full, argnums=(0, 1))(hidden, head)
-    got_loss, got = jax.jit(jax.value_and_grad(tiled, argnums=(0, 1)))(hidden, head)
+    def held(loss):
+        def run(*terms):
+            gradients, (losses, log_z) = jax.grad(loss, argnums=(0, 1), has_aux=True)(*terms)
+            return dict(zip(("losses", "log Z", "hidden", "head"), (losses, log_z, *gradients), strict=True))
+        return run
 
-    assert jnp.abs(got_loss - want_loss) <= 1e-5 * jnp.abs(want_loss)
+    assert_as_exact(jax.jit(held(tiled)), jax.jit(held(full)), draw,
+                    f"{loss_weight} {z_weight} {softcap} bounded", seeds=SEEDS["bounded"])
+    hidden, head, targets = draw(0)
     _, predicted, _ = chunked_cross_entropy(
         hidden,
         OutputTable(head, vocab_major=False, softcap=softcap, precision=precision),
@@ -712,63 +820,65 @@ def test_the_bounded_backward_matches_the_full_vocabulary_pass(
     )
     _, expected_top1 = reference(hidden, head, targets, softcap=softcap)
     np.testing.assert_array_equal(predicted, expected_top1)
-    for name, expected, actual in zip(("hidden", "head"), want, got, strict=True):
-        largest = jnp.abs(expected).max()
-        assert largest > 0, f"the {name} gradient is zero, so nothing is checked"
-        assert jnp.abs(actual - expected).max() <= 1e-5 * largest, name
-    assert jnp.abs(got[1][:, RAGGED[1]:]).max() > 0, "the short column tile was dropped"
-    assert jnp.abs(got[0][:, RAGGED[0]:]).max() > 0, "the short token tile was dropped"
+    got = held(tiled)(hidden, head, targets)
+    assert jnp.abs(got["head"][:, RAGGED[1]:]).max() > 0, "the short column tile was dropped"
+    assert jnp.abs(got["hidden"][:, RAGGED[0]:]).max() > 0, "the short token tile was dropped"
 
 
 def test_the_softcap_gradient_survives_saturated_logits():
-    """Logits well past the cap: `tanh` still has to pass a gradient back."""
-    hidden, head, targets = inputs(vocab=97, features=8, tokens=(1, 9))
-    hidden, head = hidden * 8, head * 4
+    """Logits well past the cap: `tanh` still has to pass a gradient back, on par with the full pass's
+    for the states, the head and the cap over drawn heads (check 1), and the top-1 the full pass's."""
+    def draw(seed):
+        hidden, head, targets = inputs(vocab=97, features=8, tokens=(1, 9), seed=seed)
+        return hidden * 8, head * 4, targets, jnp.float32(30.)
 
-    def full(states, matrix, cap):
+    def full(states, matrix, targets, cap):
         losses, log_z = oracle(states, matrix, targets, cap)
         return jnp.mean(losses + 0.03 * jnp.square(log_z))
 
-    def tiled(states, matrix, cap):
+    def tiled(states, matrix, targets, cap):
         losses, _, log_z = chunked_cross_entropy(
             states, OutputTable(matrix, vocab_major=False, softcap=cap), targets, 4, tile=RAGGED
         )
         return jnp.mean(losses + 0.03 * jnp.square(log_z))
 
-    expected = jax.grad(full, argnums=(0, 1, 2))(hidden, head, 30.)
-    got = jax.grad(tiled, argnums=(0, 1, 2))(hidden, head, 30.)
+    def held(loss):
+        return named_gradients(loss, ("hidden", "head", "softcap"), (0, 1, 3))
+
+    assert_as_exact(jax.jit(held(tiled)), jax.jit(held(full)), draw, "saturated softcap",
+                    seeds=SEEDS["saturated"])
+    hidden, head, targets, _ = draw(0)
     _, predicted, _ = chunked_cross_entropy(
         hidden, OutputTable(head, vocab_major=False, softcap=30.0), targets, 4, tile=RAGGED
     )
     _, expected_top1 = reference(hidden, head, targets, softcap=30.)
     np.testing.assert_array_equal(predicted, expected_top1)
-    for name, want, have in zip(("hidden", "head", "softcap"), expected, got, strict=True):
-        largest = jnp.abs(want).max()
-        assert largest > 0, f"the {name} gradient is zero, so nothing is checked"
-        assert jnp.abs(have - want).max() <= 1e-5 * largest, name
 
 
 @pytest.mark.parametrize("tile", [RAGGED, None], ids=["tiled", "whole"])
 @pytest.mark.parametrize("excluded", [0, 41, RAGGED_VOCAB - 1], ids=["first", "inside", "last"])
 def test_an_excluded_column_takes_no_mass_in_the_loss_the_prediction_or_the_gradient(tile, excluded):
     """The excluded column leaves the partition and the prediction, in
-    whichever tile holds it: the losses, log partitions, predictions and both
-    gradients are the full pass's with that column's logits at -inf, and its
-    own head column receives no gradient."""
-    hidden, head, targets = inputs(vocab=RAGGED_VOCAB, features=7, tokens=(1, RAGGED_TOKENS))
-    targets = jnp.where(targets == excluded, (excluded + 1) % RAGGED_VOCAB, targets)
+    whichever tile holds it: the losses, log partitions and both gradients
+    are on par with the full pass's with that column's logits at -inf over
+    drawn heads (check 1), the predictions are its, and the excluded head
+    column receives no gradient."""
     precision = jax.lax.Precision.HIGHEST
-    # The excluded column scores highest everywhere, so a prediction that kept it would show.
-    head = head.at[:, excluded].set(jnp.abs(head).max(axis=1) * 4)
 
-    def full(states, matrix):
+    def draw(seed):
+        hidden, head, targets = inputs(vocab=RAGGED_VOCAB, features=7, tokens=(1, RAGGED_TOKENS), seed=seed)
+        # The excluded column scores highest everywhere, so a prediction that kept it would show.
+        return (hidden, head.at[:, excluded].set(jnp.abs(head).max(axis=1) * 4),
+                jnp.where(targets == excluded, (excluded + 1) % RAGGED_VOCAB, targets))
+
+    def full(states, matrix, targets):
         logits = OutputTable(matrix, vocab_major=False, precision=precision).logits(states)
         logits = logits.at[..., excluded].set(-jnp.inf)
         log_z = jax.nn.logsumexp(logits, axis=-1)
         losses = log_z - jnp.take_along_axis(logits, targets[..., None], axis=-1)[..., 0]
         return jnp.sum(losses + 0.7 * jnp.square(log_z)), (losses, log_z, jnp.argmax(logits, axis=-1))
 
-    def chunked_pass(states, matrix):
+    def chunked_pass(states, matrix, targets):
         losses, predicted, log_z = chunked_cross_entropy(
             states,
             OutputTable(matrix, vocab_major=False, precision=precision),
@@ -779,16 +889,19 @@ def test_an_excluded_column_takes_no_mass_in_the_loss_the_prediction_or_the_grad
         )
         return jnp.sum(losses + 0.7 * jnp.square(log_z)), (losses, log_z, predicted)
 
-    (_, want), want_grads = jax.value_and_grad(full, argnums=(0, 1), has_aux=True)(hidden, head)
-    (_, got), got_grads = jax.jit(jax.value_and_grad(chunked_pass, argnums=(0, 1), has_aux=True))(
-        hidden, head)
+    def held(loss):
+        def run(*terms):
+            (_, (losses, log_z, _)), gradients = jax.value_and_grad(loss, argnums=(0, 1),
+                                                                    has_aux=True)(*terms)
+            return dict(zip(("losses", "log Z", "hidden", "head"), (losses, log_z, *gradients), strict=True))
+        return run
 
-    np.testing.assert_allclose(got[0], want[0], rtol=1e-5)
-    np.testing.assert_allclose(got[1], want[1], rtol=1e-5)
-    np.testing.assert_array_equal(got[2], want[2])
+    assert_as_exact(jax.jit(held(chunked_pass)), jax.jit(held(full)), draw, f"{tile} {excluded} excluded",
+                    seeds=SEEDS["excluded"])
+    terms = draw(0)
+    (_, got), got_grads = jax.jit(jax.value_and_grad(chunked_pass, argnums=(0, 1), has_aux=True))(*terms)
+    np.testing.assert_array_equal(got[2], full(*terms)[1][2])
     assert not jnp.any(got[2] == excluded)
-    for expected, actual in zip(want_grads, got_grads, strict=True):
-        assert jnp.abs(actual - expected).max() <= 1e-5 * jnp.abs(expected).max()
     assert jnp.all(got_grads[1][:, excluded] == 0)
 
 
@@ -826,347 +939,274 @@ def test_a_target_at_the_excluded_column_scores_infinity_and_moves_no_logit(path
 def test_the_head_gradient_accumulates_every_token_tile_before_it_rounds(dtype):
     """257 tokens is three tiles; rounding per tile would lose the last ones.
 
-    Held to an fp32 oracle on the same values: a gradient in `dtype` that
-    rounds once, at the end, is within half its ulp of it, plus fp32 sum
-    noise; rounding each tile's partial sum adds up to half an ulp per tile.
-    The products run at HIGHEST, so the logits' cotangent is not rounded to
-    bf16 inside them, which moves a cancelling sum by more than an ulp.
-    Comparing against a gradient rounded to `dtype` would count two
-    roundings, and a near-tie then differs by a whole ulp.
+    The gradients, in `dtype`, are on par over drawn heads (check 1) with an
+    fp32 oracle's on the same values rounded to `dtype` once, at the end,
+    which rounding each tile's partial sum adds to. The products run at
+    HIGHEST, so the logits' cotangent is not rounded to bf16 inside them.
     """
-    hidden, head, targets = inputs(vocab=17, features=7, tokens=(257,), dtype=dtype)
-    head = head.astype(dtype)
     precision = jax.lax.Precision.HIGHEST
 
-    def full(states, matrix):
+    def draw(seed):
+        hidden, head, targets = inputs(vocab=17, features=7, tokens=(257,), dtype=dtype, seed=seed)
+        return hidden, head.astype(dtype), targets
+
+    def full(states, matrix, targets):
         return jnp.mean(oracle(states, matrix, targets, precision=precision)[0])
 
-    def tiled(states, matrix):
+    def tiled(states, matrix, targets):
         return jnp.mean(
             chunked_cross_entropy(
                 states, OutputTable(matrix, vocab_major=False, precision=precision), targets, 4, tile=RAGGED
             )[0]
         )
 
-    expected = jax.grad(full, argnums=(0, 1))(hidden.astype(jnp.float32),
-                                              head.astype(jnp.float32))
-    got = jax.grad(tiled, argnums=(0, 1))(hidden, head)
+    def once(states, matrix, targets):
+        wide = jax.grad(full, argnums=(0, 1))(states.astype(jnp.float32), matrix.astype(jnp.float32), targets)
+        return dict(zip(("hidden", "head"), (gradient.astype(dtype) for gradient in wide), strict=True))
 
-    assert got[0].dtype == hidden.dtype and got[1].dtype == head.dtype == dtype
-    for name, want, have in zip(("hidden", "head"), expected, got, strict=True):
-        largest = jnp.abs(want).max()
-        assert largest > 0, f"the {name} gradient is zero, so nothing is checked"
-        half_ulp = jnp.spacing(jnp.abs(want).astype(dtype)).astype(jnp.float32) / 2
-        noise = 1e-6 * largest
-        assert bool(jnp.all(jnp.abs(have.astype(jnp.float32) - want) <= half_ulp + noise)), name
+    def held(loss):
+        return named_gradients(loss, ("hidden", "head"))
+
+    assert_as_exact(jax.jit(held(tiled)), jax.jit(once), draw, f"{dtype} token tiles",
+                    seeds=SEEDS["token tiles"], truth_fn=held(full))
+    got = held(tiled)(*draw(0))
+    assert got["hidden"].dtype == got["head"].dtype == dtype
 
 
 @pytest.mark.parametrize("tie_embeddings", [True, False])
 def test_the_backbone_receives_both_outputs_gradients(tie_embeddings):
-    model = small_model(dtype=jnp.float32, tie_embeddings=tie_embeddings,
-                        final_logit_softcap=30.)
-    ids = jax.random.randint(jax.random.PRNGKey(31), (1, 7), 0, 97)
-    params = model.init(jax.random.PRNGKey(32), ids)["params"]
-    targets = jnp.roll(ids, -1, axis=-1)
+    """Every parameter's gradient of a loss of both outputs through the tiled head, on par with the
+    whole logits' over drawn models and tokens (check 1), the truth the model in float64."""
+    model, wide = (small_model(dtype=dtype, tie_embeddings=tie_embeddings, final_logit_softcap=30.)
+                   for dtype in (jnp.float32, jnp.float64))
 
-    def full(tree):
-        logits = model.apply({"params": tree}, ids)
+    init = jax.jit(model.init)
+
+    def draw(seed):
+        ids = jax.random.randint(jax.random.fold_in(jax.random.PRNGKey(31), seed), (4, 16), 0, 97)
+        return init(jax.random.fold_in(jax.random.PRNGKey(32), seed), ids)["params"], ids
+
+    def full(tree, ids):
+        targets = jnp.roll(ids, -1, axis=-1)
+        wider = jax.tree.leaves(tree)[0].dtype == jnp.float64
+        logits = (wide if wider else model).apply({"params": tree}, ids)
         log_z = jax.nn.logsumexp(logits, axis=-1)
         picked = jnp.take_along_axis(logits, targets[..., None], axis=-1)[..., 0]
         return jnp.mean(log_z - picked + 0.02 * jnp.square(log_z))
 
-    def tiled(tree):
+    def tiled(tree, ids):
         states = model.apply({"params": tree}, ids,
                              method=CausalTransformer.hidden_states)
         losses, _, log_z = chunked_cross_entropy(
             states,
             OutputTable(head_matrix(model, {"params": tree}), vocab_major=False, softcap=30.0),
-            targets,
+            jnp.roll(ids, -1, axis=-1),
             4,
         )
         return jnp.mean(losses + 0.02 * jnp.square(log_z))
 
-    expected, got = jax.grad(full)(params), jax.grad(tiled)(params)
-    for want, have in zip(jax.tree.leaves(expected), jax.tree.leaves(got),
-                          strict=True):
-        assert jnp.abs(have - want).max() <= 1e-5 * jnp.abs(want).max()
+    assert_as_exact(jax.jit(jax.grad(tiled)), jax.jit(jax.grad(full)), draw, f"{tie_embeddings} both outputs",
+                    seeds=SEEDS["both outputs"])
 
 
-# --- a production vocabulary against float64 ---------------------------------
+# --- a production vocabulary --------------------------------------------------
 
 # Gemma's 262,144 columns. What changes with the width is the length of the
 # reductions: the partition sums 262,144 exponentials and the hidden
-# gradient 262,144 products. The worst-case bound for such a sum, (V - 1) u,
-# is 1.6e-2 and says nothing, so the bounds here are Higham and Mary's
-# probabilistic ones ("A New Approach to Probabilistic Rounding Error
-# Analysis", SIAM J. Sci. Comput. 41(5), 2019, theorem 3.1): a sum of n
-# terms rounded independently in fp32 is off by at most lambda sqrt(n) u
-# times the sum of its absolute terms, except with probability
-# 2 exp(-lambda^2 / 2), which lambda = 6 puts at 3e-8 a sum.
+# gradient 262,144 products.
 GEMMA_VOCAB = 262_144
-LAMBDA = 6.0
-U32 = 2.0 ** -24
+BOUNDARIES = jnp.asarray([0, 65535, 65536, 131071, 131072, 196608, 262143], jnp.int32)
+"""Targets on each side of the 16-chunk head's chunk boundaries, and at its first and last columns."""
 
 
 @pytest.mark.parametrize("softcap", [None, 30.0], ids=["plain", "softcap-30"])
-def test_a_262144_vocabulary_matches_optax_in_float64_on_cpu(softcap):
-    """Seven targets spanning chunk boundaries, losses, log Z and both gradients
-    against Optax's full-vocabulary CE; 1e-12 allows float64 reduction order.
-    """
+def test_a_262144_vocabulary_computes_in_float64_and_picks_optaxs_top1_on_cpu(softcap):
+    """Seven targets spanning chunk boundaries: a float64 head makes no float32 value in its
+    forward or its backward, so it is the float64 truth the gate's other heads are measured from,
+    and its top-1 columns are Optax's full-vocabulary logits'. The losses and gradients of the same
+    boundary targets are held to the whole logits' in fp32 on a Gemma-sized head (check 1,
+    `test_a_gemma_sized_vocabulary_is_as_exact_as_the_whole_logits`)."""
     rng = np.random.default_rng(713)
     with jax.enable_x64(), jax.default_device(jax.devices("cpu")[0]):
         hidden = jnp.asarray(rng.normal(size=(7, 5)), jnp.float64)
         head = jnp.asarray(rng.normal(size=(5, GEMMA_VOCAB)), jnp.float64)
-        targets = jnp.asarray([0, 65535, 65536, 131071, 131072, 196608, 262143], jnp.int32)
         weights = jnp.asarray(rng.uniform(.5, 1.5, 7), jnp.float64)
 
-        def upstream(states, matrix):
-            logits = states @ matrix
-            if softcap is not None:
-                logits = softcap * jnp.tanh(logits / softcap)
-            losses = optax.softmax_cross_entropy_with_integer_labels(logits, targets)
-            return jnp.sum(weights * losses), (
-                losses, jax.nn.logsumexp(logits, -1), logits.argmax(-1).astype(jnp.int32))
-
         def tiled(states, matrix):
-            losses, predictions, log_z = chunked_cross_entropy(
-                states, OutputTable(matrix, vocab_major=False, softcap=softcap), targets, 16, tile=(3, 8192)
-            )
+            table = OutputTable(matrix, vocab_major=False, softcap=softcap)
+            losses, predictions, log_z = chunked_cross_entropy(states, table, BOUNDARIES, 16, tile=(3, 8192))
             return jnp.sum(weights * losses), (losses, log_z, predictions)
 
-        expected = jax.jit(jax.value_and_grad(upstream, (0, 1), has_aux=True))(hidden, head)
-        actual = jax.jit(jax.value_and_grad(tiled, (0, 1), has_aux=True))(hidden, head)
-        for have, want in zip(jax.tree.leaves(actual), jax.tree.leaves(expected), strict=True):
-            assert have.dtype == want.dtype
-            if jnp.issubdtype(want.dtype, jnp.integer):
-                np.testing.assert_array_equal(have, want)
-            else:
-                np.testing.assert_allclose(have, want, rtol=1e-12, atol=1e-12)
-
-
-def float64_cross_entropy(hidden, head, targets, weights, softcap):
-    """Losses, log partitions and both gradients of `sum(weights * losses)`,
-    in NumPy float64, with the sums of absolute terms the bounds scale."""
-    hidden, head = np.asarray(hidden, np.float64), np.asarray(head, np.float64)
-    weights, targets = np.asarray(weights, np.float64), np.asarray(targets)
-    scores = hidden @ head
-    magnitude = np.abs(hidden) @ np.abs(head)
-    logits, slope = scores, np.ones_like(scores)
-    if softcap is not None:
-        logits = softcap * np.tanh(scores / softcap)
-        slope = 1 - np.tanh(scores / softcap) ** 2
-    peak = logits.max(-1, keepdims=True)
-    log_z = (peak + np.log(np.exp(logits - peak).sum(-1, keepdims=True)))[:, 0]
-    rows = np.arange(len(targets))
-    losses = log_z - logits[rows, targets]
-    probabilities = np.exp(logits - log_z[:, None])
-    residual = probabilities.copy()
-    residual[rows, targets] -= 1
-    cotangent = weights[:, None] * residual * slope
-    return {"losses": losses, "log_z": log_z, "hidden": cotangent @ head.T,
-            "head": hidden.T @ cotangent, "magnitude": magnitude, "logits": logits,
-            "probabilities": probabilities, "residual": residual, "slope": slope}
-
-
-def float64_bounds(hidden, head, weights, exact, tiles=None):
-    """The fp32 bound on every loss and gradient entry.
-
-    A logit is a dot over F features, so it is off by at most
-    lambda sqrt(F) u of its absolute terms, plus 3 u of itself through a
-    softcap's divide, tanh and multiply; the largest of a row's is E. The
-    partition's exponentials are each off by |dz| + 2 u relative, and their
-    sum by lambda sqrt(V) u relative more, so log Z is off by at most
-    E + (lambda sqrt(V) + 4 + 3 C) u + u |log Z|: the row's sum carries
-    one rescaling (an exponential, a multiply and an add, 3 u relative) per
-    one of the C column tiles the head walks (`tiles`, 1 for the whole row),
-    and log Z itself is rounded once, as the maximum plus the sum's log. A
-    loss is off by that plus its target
-    logit's error. A probability exp(z - log Z) carries the same E + log Z
-    error plus 2 u relative, and the gradients sum weight * (p - onehot)
-    against the head over V columns and against the states over T tokens.
-    """
-    hidden, head = np.asarray(hidden, np.float64), np.asarray(head, np.float64)
-    weights = np.abs(np.asarray(weights, np.float64))
-    features, vocab = head.shape
-    tokens = hidden.shape[0]
-    logit_error = LAMBDA * np.sqrt(features) * U32 * exact["magnitude"] + 3 * U32 * np.abs(exact["logits"])
-    largest = logit_error.max(-1)
-    z_error = largest + (LAMBDA * np.sqrt(vocab) + 4 + 3 * (tiles or 1)) * U32 + U32 * np.abs(exact["log_z"])
-    probability_error = (largest + z_error + 2 * U32)[:, None] * exact["probabilities"]
-    spread = weights[:, None] * exact["slope"]
-    gradient_error = spread * probability_error
-    terms = spread * np.abs(exact["residual"])
-    return {
-        "losses": z_error + largest + U32 * np.abs(exact["losses"]),
-        "log_z": z_error,
-        "hidden": (gradient_error @ np.abs(head).T
-                   + LAMBDA * np.sqrt(vocab) * U32 * (terms @ np.abs(head).T)),
-        "head": (np.abs(hidden).T @ gradient_error
-                 + LAMBDA * np.sqrt(tokens) * U32 * (np.abs(hidden).T @ terms)),
-    }
-
-
-@pytest.fixture(scope="module")
-def gemma_vocabulary():
-    keys = jax.random.split(jax.random.PRNGKey(7), 4)
-    tokens, features = 32, 64
-    hidden = jax.random.normal(keys[0], (tokens, features), jnp.float32)
-    # Logits of standard deviation 3, so the partition is carried by a few
-    # hundred columns scattered over every chunk rather than by all of them
-    # equally or by one.
-    head = 3 / np.sqrt(features) * jax.random.normal(keys[1], (features, GEMMA_VOCAB), jnp.float32)
-    targets = jax.random.randint(keys[2], (tokens,), 0, GEMMA_VOCAB)
-    weights = jax.random.uniform(keys[3], (tokens,), jnp.float32, 0.5, 1.5)
-    return hidden, head, targets, weights
+        graph = jax.make_jaxpr(jax.value_and_grad(tiled, (0, 1), has_aux=True))(hidden, head)
+        assert float32_values(graph.jaxpr) == 0
+        logits = hidden @ head
+        if softcap is not None:
+            logits = softcap * jnp.tanh(logits / softcap)
+        np.testing.assert_array_equal(jax.jit(tiled)(hidden, head)[1][2], logits.argmax(-1).astype(jnp.int32))
 
 
 TILE = (1024, 8192)
-"""The tiled head's tile in the fp32 bound tests: 1024 tokens by 8192 columns."""
-
-
-def fp32_cross_entropy(hidden, head, targets, weights, softcap, chunks):
-    """Losses, log partitions and both gradients from the chunked head, or
-    with `chunks` None from the full-vocabulary pass it replaced."""
-    def run(states, matrix):
-        if chunks is None:
-            losses, log_z = oracle(states, matrix, targets, softcap)
-        else:
-            losses, _, log_z = chunked_cross_entropy(
-                states, OutputTable(matrix, vocab_major=False, softcap=softcap), targets, chunks, tile=TILE
-            )
-        return jnp.sum(weights * losses), (losses, log_z)
-
-    (_, (losses, log_z)), (d_hidden, d_head) = jax.jit(
-        jax.value_and_grad(run, argnums=(0, 1), has_aux=True))(hidden, head)
-    return {"losses": losses, "log_z": log_z, "hidden": d_hidden, "head": d_head}
+"""The tiled head's tile on the Gemma-sized vocabulary: 1024 tokens by 8192 columns."""
 
 
 @pytest.mark.parametrize("softcap", [None, 30.0], ids=["plain", "softcap-30"])
-@pytest.mark.parametrize("chunks", [None, 4, 16], ids=["unchunked", "4-chunks", "16-chunks"])
-def test_a_gemma_sized_vocabulary_is_within_fp32_rounding_of_float64(gemma_vocabulary, chunks, softcap):
-    """Losses, log partitions and the gradients of both the states and the
-    head, chunked and unchunked, every entry inside its bound. Observed at
-    most 1.2e-2 of the bound on log Z and the losses (errors 1.0e-06 to
-    3.4e-06), 5.5e-3 on the states' gradient and 0.23 on the head's."""
-    hidden, head, targets, weights = gemma_vocabulary
-    exact = float64_cross_entropy(hidden, head, targets, weights, softcap)
-    vocab = head.shape[1]
-    tiles = None if chunks is None else -(-vocab // tile_columns(vocab, chunks, TILE[1]))
-    bounds = float64_bounds(hidden, head, weights, exact, tiles)
+@pytest.mark.parametrize("chunks", [4, 16], ids=["4-chunks", "16-chunks"])
+def test_a_gemma_sized_vocabulary_is_as_exact_as_the_whole_logits(chunks, softcap):
+    """Losses, log partitions and the gradients of both the states and the head of a weighted loss,
+    chunked, on par with the full-vocabulary pass's from float64 over drawn heads and targets, the
+    first seven on the chunks' boundaries (check 1). The head's logits have a standard deviation of
+    3, so the partition is carried by a few hundred columns scattered over every chunk rather than
+    by all of them equally or by one."""
+    tokens, features = 32, 64
 
-    actual = fp32_cross_entropy(hidden, head, targets, weights, softcap, chunks)
+    def draw(seed):
+        keys = jax.random.split(jax.random.fold_in(jax.random.PRNGKey(7), seed), 4)
+        targets = jax.random.randint(keys[2], (tokens,), 0, GEMMA_VOCAB).at[:len(BOUNDARIES)].set(BOUNDARIES)
+        return (jax.random.normal(keys[0], (tokens, features), jnp.float32),
+                3 / np.sqrt(features) * jax.random.normal(keys[1], (features, GEMMA_VOCAB), jnp.float32),
+                targets, jax.random.uniform(keys[3], (tokens,), jnp.float32, 0.5, 1.5))
 
-    for name, value in actual.items():
-        error = np.abs(np.asarray(value, np.float64) - exact[name])
-        assert np.all(error <= bounds[name]), (name, float(np.max(error / bounds[name])))
+    def scored(chunks):
+        def run(hidden, head, targets, weights):
+            def loss(states, matrix):
+                if chunks is None:
+                    losses, log_z = oracle(states, matrix, targets, softcap)
+                else:
+                    losses, _, log_z = chunked_cross_entropy(
+                        states, OutputTable(matrix, vocab_major=False, softcap=softcap), targets, chunks,
+                        tile=TILE)
+                return jnp.sum(weights * losses), (losses, log_z)
+
+            (_, (losses, log_z)), (d_hidden, d_head) = jax.value_and_grad(loss, argnums=(0, 1), has_aux=True)(
+                hidden, head)
+            return {"losses": losses, "log Z": log_z, "hidden": d_hidden, "head": d_head}
+        return jax.jit(run)
+
+    assert_as_exact(scored(chunks), scored(None), draw, f"{chunks} {softcap} gemma vocabulary",
+                    seeds=SEEDS["gemma"])
 
 
 @pytest.mark.parametrize("tile", [None, RAGGED])
 def test_the_bf16_head_rounds_its_logits_and_their_cotangent_once(tile):
     """Under the bf16 algorithm the head takes torch autocast's rounding: the
     logits are bf16 values, and their cotangent is rounded to bf16 once
-    before both products. The reference rounds the logits with
-    `rounded_to`, whose derivative rounds the cotangent where the value
-    rounds, and multiplies at the highest precision. On eighths both sides
-    form the same logits; the softmax's fp32 rounding can still move a
-    cotangent entry across a bf16 rounding boundary, one bf16 ulp, 2^-7 of
-    it at most, so each gradient entry is within 2^-7 of its terms'
-    magnitudes, plus fp32's rounding of them. Kept in fp32 (`highest`) the
-    cotangent misses that bound."""
-    hidden, head, targets = inputs(vocab=RAGGED_VOCAB, features=16, tokens=(RAGGED_TOKENS,))
-    hidden, head = eighths(hidden, head)
-    table = head.T
+    before both products. Its gradients are on par over drawn heads (check 1)
+    with a reference that rounds the logits with `rounded_to`, whose
+    derivative rounds the cotangent where the value rounds, and multiplies at
+    the highest precision; on eighths both form the same logits, and the
+    truth takes their bf16 values as exact, its cotangent unrounded. Kept in
+    fp32 (`highest`) the cotangent is another computation."""
+    def draw(seed):
+        hidden, head, targets = inputs(vocab=RAGGED_VOCAB, features=16, tokens=(RAGGED_TOKENS,), seed=seed)
+        hidden, head = eighths(hidden, head)
+        return hidden, head.T, targets
 
     def strict_or_rounded(round_logits):
-        def loss(states, matrix):
+        def loss(states, matrix, targets):
             logits = jnp.einsum('td,vd->tv', states, matrix, precision=jax.lax.Precision.HIGHEST)
             if round_logits:
                 logits = rounded_to(logits, jnp.bfloat16)
             return jnp.mean(optax.softmax_cross_entropy_with_integer_labels(logits, targets))
         return loss
 
-    rounded = strict_or_rounded(round_logits=True)
-    want_states, want_table = jax.grad(rounded, argnums=(0, 1))(hidden, table)
-    have_states, have_table = jax.grad(
-        lambda states, matrix: jnp.mean(
-            chunked_cross_entropy(
-                states,
-                OutputTable(matrix.T, vocab_major=False, precision=chunked.BF16),
-                targets,
-                4,
-                tile=tile,
-            )[0]
-        ),
-        argnums=(0, 1),
-    )(hidden, table)
-    logits = jnp.einsum('td,vd->tv', hidden, table, precision=jax.lax.Precision.HIGHEST)
-    cotangent = jnp.abs(jax.grad(lambda z: jnp.mean(
-        optax.softmax_cross_entropy_with_integer_labels(z, targets)))(logits))
-    terms_states = jnp.einsum('tv,vd->td', cotangent, jnp.abs(table), precision=jax.lax.Precision.HIGHEST)
-    terms_table = jnp.einsum('tv,td->vd', cotangent, jnp.abs(hidden), precision=jax.lax.Precision.HIGHEST)
-    slack = (2 ** -7 + 64 * 2 ** -24)
+    def chunked_loss(states, matrix, targets):
+        table = OutputTable(matrix.T, vocab_major=False, precision=chunked.BF16)
+        return jnp.mean(chunked_cross_entropy(states, table, targets, 4, tile=tile)[0])
 
-    assert jnp.all(jnp.abs(have_states - want_states) <= slack * terms_states)
-    assert jnp.all(jnp.abs(have_table - want_table) <= slack * terms_table)
-    strict_states, _ = jax.grad(strict_or_rounded(round_logits=False), argnums=(0, 1))(hidden, table)
-    assert not jnp.all(jnp.abs(strict_states - have_states) <= 2 ** -20 * terms_states)
+    def true(states, matrix, targets):
+        logits = jnp.einsum('td,vd->tv', states, matrix)
+        # The logits' bf16 values, exact on eighths, their cotangent passed through unrounded.
+        rounded = jnp.asarray(logits, jnp.bfloat16).astype(logits.dtype)
+        logits = logits + jax.lax.stop_gradient(rounded - logits)
+        return jnp.mean(optax.softmax_cross_entropy_with_integer_labels(logits, targets))
+
+    def held(loss):
+        return named_gradients(loss, ("states", "table"))
+
+    assert_as_exact(jax.jit(held(chunked_loss)), jax.jit(held(strict_or_rounded(round_logits=True))), draw,
+                    f"{tile} bf16 cotangent", seeds=SEEDS["bf16 cotangent"], truth_fn=held(true))
+    terms = draw(0)
+    strict = held(strict_or_rounded(round_logits=False))(*terms)
+    assert not np.array_equal(strict["states"], held(chunked_loss)(*terms)["states"])
 
 
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
 @pytest.mark.parametrize("softcap", [None, 30.0])
 def test_the_whole_logits_head_computes_what_the_tiled_one_does(dtype, softcap):
     """`tile=None` keeps the logits for the backward instead of recomputing
-    them tile by tile. Same losses, predictions, log partitions and
-    gradients: the logits' cotangent stays fp32 into the state product
-    either way, and the head's gradient accumulates in fp32 once."""
-    hidden, head, targets = inputs(vocab=RAGGED_VOCAB, features=16,
-                                   tokens=(RAGGED_TOKENS,), dtype=dtype)
-    # Targets outside the vocabulary pick no column, which the
-    # vocabulary-split head relies on for every shard but the owner.
-    targets = targets.at[:2].set(jnp.asarray([-1, RAGGED_VOCAB + 5], targets.dtype))
+    them tile by tile. The same predictions, and losses, log partitions and
+    gradients on par with the tiled head's over drawn heads (check 1): the
+    logits' cotangent stays fp32 into the state product either way, and the
+    head's gradient accumulates in fp32 once."""
+    def draw(seed):
+        hidden, head, targets = inputs(vocab=RAGGED_VOCAB, features=16, tokens=(RAGGED_TOKENS,), dtype=dtype,
+                                       seed=seed)
+        # Targets outside the vocabulary pick no column, which the
+        # vocabulary-split head relies on for every shard but the owner.
+        outside = targets.at[:2].set(jnp.asarray([-1, RAGGED_VOCAB + 5], targets.dtype))
+        return hidden, head, outside, jnp.float32(30.)
 
     def run(tile):
-        def loss(states, matrix, cap):
-            losses, _, log_z = chunked_cross_entropy(
-                states, OutputTable(matrix, vocab_major=False, softcap=cap), targets, 4, tile=tile
-            )
-            return jnp.mean(losses) + 0.01 * jnp.mean(jnp.square(log_z))
-        outputs = chunked_cross_entropy(
-            hidden, OutputTable(head, vocab_major=False, softcap=softcap), targets, 4, tile=tile
-        )
-        return outputs, jax.grad(loss, argnums=(0, 1, 2) if softcap else (0, 1))(
-            hidden, head, softcap)
+        def scored(hidden, head, targets, cap):
+            def loss(states, matrix, cap):
+                table = OutputTable(matrix, vocab_major=False, softcap=softcap and cap)
+                losses, _, log_z = chunked_cross_entropy(states, table, targets, 4, tile=tile)
+                return jnp.mean(losses) + 0.01 * jnp.mean(jnp.square(log_z)), (losses, log_z)
 
-    # fp32 products at full precision, so the fp32 bound below holds on a
-    # backend whose default fp32 product is TF32 too.
-    with (jax.default_matmul_precision("highest") if dtype == jnp.float32 else contextlib.nullcontext()):
-        (tiled, tiled_grads), (whole, whole_grads) = run(RAGGED), run(None)
+            # fp32 products at full precision, so a backend whose default fp32 product is TF32 runs
+            # both heads alike.
+            highest = dtype == jnp.float32
+            with jax.default_matmul_precision("highest") if highest else contextlib.nullcontext():
+                gradients, (losses, log_z) = jax.grad(loss, argnums=(0, 1, 2) if softcap else (0, 1),
+                                                      has_aux=True)(hidden, head, cap)
+            names = ("losses", "log Z", "hidden", "head", "softcap")[:2 + len(gradients)]
+            return dict(zip(names, (losses, log_z, *gradients), strict=True))
+        return scored
+
+    assert_as_exact(jax.jit(run(None)), jax.jit(run(RAGGED)), draw, f"{dtype} {softcap} whole logits",
+                    seeds=SEEDS["whole logits"])
+    hidden, head, targets, _ = draw(0)
+    table = OutputTable(head, vocab_major=False, softcap=softcap)
+    tiled, whole = (chunked_cross_entropy(hidden, table, targets, 4, tile=tile) for tile in (RAGGED, None))
     assert jnp.array_equal(tiled[1], whole[1])
-    # The two take log Z in a different order, so a probability can move by
-    # an fp32 ulp; where the head's gradient multiplies bf16 operands, that
-    # ulp can flip the cotangent's bf16 rounding: one bf16 ulp of an entry,
-    # which is 2^-7 of an entry sitting at a power of two, the bottom of its
-    # binade, and the flipped entry can be the largest.
-    # In fp32 each path's log Z is one running reduction over its row
-    # (`_row_terms`). A merge rounds the exponential that rescales a partial
-    # sum, the product and the add, three roundings, and XLA's merge order is
-    # not shown here, so its depth is taken as the row's V entries, the
-    # conservative count: the sum of positive terms is off by at most
-    # gamma(3V) relative, which is log Z's absolute error from the sum, and
-    # log Z = m + log(s) rounds twice more, gamma(2) |log Z|. A probability
-    # exp(x - log Z) carries that error relative and three roundings of its
-    # own, and a gradient entry sums V of them, V more roundings. Two paths,
-    # so twice gamma(4V + 5) + gamma(2) max |log Z|, 9.8e-4 here. Measured:
-    # 4.9e-6 of the largest entry on CPU and 1.5e-6 on an RTX 4080.
-    if dtype == jnp.float32:
-        def gamma(steps):
-            return steps * 2.0**-24 / (1 - steps * 2.0**-24)
-        bound = 2 * (gamma(4 * RAGGED_VOCAB + 5) + gamma(2) * float(jnp.abs(tiled[2]).max()))
-    else:
-        bound = 2.0**-7
-    for have, want in [
-        *zip(whole[::2], tiled[::2], strict=True),
-        *zip(whole_grads, tiled_grads, strict=True),
-    ]:
-        have, want = jnp.asarray(have, jnp.float32), jnp.asarray(want, jnp.float32)
-        assert jnp.abs(have - want).max() <= bound * jnp.abs(want).max() + 1e-7
+
+
+def test_an_fp32_whole_heads_overflowed_state_gradient_stays_infinite():
+    """A whole fp32 head sums its state gradient over column blocks (`FP32_STATE_BLOCK`): a block whose
+    product overflows leaves the sum infinite, as one product's is, never inf - inf. One zero state,
+    2048 columns, the target's at -3e38 and the rest at +3e38: a finite loss, log 2048, whose state
+    gradient overflows."""
+    from dew.objectives.lm.chunked import FP32_STATE_BLOCK
+
+    columns = 2 * FP32_STATE_BLOCK
+    head = jnp.full((1, columns), 3e38, jnp.float32).at[0, 0].set(-3e38)
+    hidden, targets = jnp.zeros((1, 1, 1), jnp.float32), jnp.zeros((1, 1), jnp.int32)
+
+    def loss(states):
+        table = OutputTable(head, vocab_major=False)
+        losses, _, _ = chunked_cross_entropy(states, table, targets, 1, tile=None)
+        return jnp.sum(losses)
+
+    with jax.default_matmul_precision("highest"):
+        value, gradient = jax.value_and_grad(loss)(hidden)
+    assert np.isfinite(float(value))
+    assert np.all(np.isinf(np.asarray(gradient))) and not np.any(np.isnan(np.asarray(gradient)))
+
+
+def test_a_fused_heads_overflowed_column_gradient_stays_infinite():
+    """The fused head sums each column term's gradient over its token tiles as a double-float pair: a
+    term that overflows leaves the sum infinite, as a plain sum's is, never inf - inf's NaN. One state
+    of 1, columns at -3e38, 3e38 and 3e38 scaled by 1e-37: logits -30, 30 and 30, a finite loss, and the
+    target column's scale gradient 2 * 3e38, past float32."""
+    matrix = jnp.asarray([[-3e38, 3e38, 3e38]], jnp.float32)
+    hidden, targets, weights = jnp.ones((1, 1), jnp.float32), jnp.zeros((1,), jnp.int32), jnp.full((1,), 2.0)
+
+    def total(scale):
+        head = OutputTable(matrix, vocab_major=False, scale=scale)
+        return fused_head_loss(hidden, head, targets, weights)[0]
+
+    with jax.default_matmul_precision("highest"):
+        value, gradient = jax.value_and_grad(total)(jnp.full((3,), 1e-37, jnp.float32))
+    gradient = np.asarray(gradient)
+    assert np.isfinite(float(value))
+    assert np.isposinf(gradient[0]) and np.all(np.isfinite(gradient[1:]))
