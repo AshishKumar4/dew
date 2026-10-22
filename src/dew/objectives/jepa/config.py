@@ -10,8 +10,9 @@ from __future__ import annotations
 
 import dataclasses
 
-from dew.config import JsonDict, ModelConfig, ObjectiveConfig, OptimConfig, Prepared, RunConfig
-from dew.config.data import ImageData, VideoData
+from dew.config import JsonDict, ModelConfig, ObjectiveConfig, OptimConfig, Prepared, RunConfig, media_field
+from dew.data.compile import fitted
+from dew.data.pipeline import ObjectiveData
 from dew.inputs import Field
 from dew.registry import models
 
@@ -44,19 +45,19 @@ class JepaRunConfig(RunConfig):
     knn_k: int = 20
 
     def sample(self) -> Field:
-        """The batch field the encoder reads, at the resolution the data comes in."""
-        spec = self.data
-        if isinstance(spec, ImageData):
-            return Field("image", (spec.image_size, spec.image_size, 3))
-        if isinstance(spec, VideoData):
-            return Field("video", (spec.frames, spec.frame_size, spec.frame_size, 3))
-        raise ValueError(f"a JEPA run trains on image or video datasets, not {type(spec).__name__}")
+        """The batch field the encoder reads, at the resolution the data comes in (`Dataset.facts`): a
+        clip's video, else an image. Raises ValueError for a chain of neither, or one whose size
+        varies."""
+        return media_field(self.chain(), "JEPA")
 
     def prepare(self) -> Prepared:
         """The encoder, the predictor over its patch grid, the target-block mask
         and the probes, around the objective the run names. The predictor
         computes as the encoder does, its compute dtype and attention kernel."""
-        dataset = self.loader(None)
+        # Compiled once, before the objective, whose EMA ramps over the run's length: JEPA reads its
+        # batches as the chain makes them, with no stages of its own.
+        dataset, held = fitted(self.chain(), self.validation, objective=ObjectiveData(),
+                                seed=self.data_seed)
         sample = self.sample()
         video = sample.key == "video"
         if video != (models[self.model.name] is models["jepa_video_encoder"]):
@@ -76,5 +77,6 @@ class JepaRunConfig(RunConfig):
                                          **ramp)
         probes = () if not self.probe_classes else (
             LinearProbe(self.probe_classes), KnnProbe(self.probe_classes, k=self.knn_k))
-        return Prepared(self, lambda name: self.train(objective, dataset, name=name, metrics=probes))
+        return Prepared(self, lambda name: self.train(objective, dataset, name=name, metrics=probes,
+                                                      validation=held))
 

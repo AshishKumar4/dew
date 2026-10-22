@@ -3375,22 +3375,6 @@
    ],
    "note": "TRL's own DPOTrainer._compute_loss with its DPOConfig defaults, in fp32 and float64."
   },
-  "rl/flow_transition.npz": {
-   "tool": "tools/parity_flow_grpo.py",
-   "sources": [
-    {
-     "repo": "yifan123/flow_grpo",
-     "version": "879042cf5707f8b90daa98d147d7deac2317c5da",
-     "runs": "fetched"
-    },
-    {
-     "repo": "pytorch/pytorch",
-     "version": "2.14.0+cpu",
-     "runs": "torch"
-    }
-   ],
-   "note": "Loads pinned author source via importlib; conditional_kl calls torch.distributions directly; diffusers 0.34.0 supplies schedule inputs."
-  },
   "rl/grpo.npz": {
    "tool": "tools/parity_grpo.py",
    "sources": [
@@ -3690,7 +3674,7 @@
    ],
    "note": "Loads the saved Wan VAE fixture in bfloat16 and records posterior/decode and input gradients."
   },
-  "weighting/weights.npz": {
+  "weighting/recorded_weights.npz": {
    "tool": "tools/weighting_reference.py",
    "sources": [
     {
@@ -3709,7 +3693,7 @@
      "runs": "torch"
     }
    ],
-   "note": "Each repo's own GaussianDiffusion.training_losses at every step; the beta tables in it are inputs."
+   "note": "Each repo's own GaussianDiffusion.training_losses at every step of beta tables check 1 draws (table_inputs), in fp32 and with float64 kept; check 1's evidence of each case over its seeds, summarized."
   },
   "z_image_source.tar.xz": {
    "tool": "tools/diffusers_z_image_reference.py",

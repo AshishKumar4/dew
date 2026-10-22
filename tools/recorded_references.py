@@ -11,7 +11,6 @@ another thing: it records the random draws a reference generator's library makes
 precision reads the same samples.)
 """
 
-import datetime
 import json
 import sys
 from pathlib import Path
@@ -28,10 +27,10 @@ __all__ = ["provenance", "record_case", "record_reference", "save"]
 
 
 def provenance(reference: str, revision: str, device: str, command: str, **details) -> np.ndarray:
-    """A recording's reference, its revision, the date, the device and the public command that
-    reproduces it, as a JSON string array to save beside the recorded arrays."""
+    """A recording's reference, its revision, the device and the public command that reproduces it,
+    as a JSON string array to save beside the recorded arrays."""
     return np.asarray(json.dumps({"reference": reference, "revision": revision, "device": device,
-                                  "date": datetime.date.today().isoformat(), "command": command, **details}))
+                                  "command": command, **details}))
 
 
 def record_reference(label: str, draw, evaluate, proxy, *, package: str, repo: str, tool: str, out: Path,

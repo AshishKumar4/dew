@@ -1,8 +1,8 @@
 """Supervised fine-tuning data: conversations with a role on every token.
 
-The `Chat` recipe reads conversations from a parquet file, a JSONL file or
-an `hf://` Hub dataset, and renders each with the tokenizer's chat
-template. Every token gets the role of the message that wrote it, so
+The sft preset (`dew.data.presets.sft`) reads conversations from any store, a parquet file, a JSONL
+file or a Hub dataset among them, and renders each with the tokenizer's chat template
+(`template`). Every token gets the role of the message that wrote it, so
 `LMObjective` with `loss_role=Role.ASSISTANT` trains on assistant tokens
 only.
 
@@ -14,7 +14,7 @@ stream's position is a global window count, so a run can resume on any
 number of processes.
 
 Block diffusion reads a prompt and the canvases after it instead, so its
-`ChatCanvasData` recipe lays each assistant turn out as a row of its own,
+canvas preset (`dew.data.presets.canvas`) lays each assistant turn out as a row of its own,
 unpacked: the conversation before the turn, then the turn on whole canvases.
 
 A `Message` holds the fields the Hugging Face chat-template contract reads:
@@ -42,7 +42,8 @@ import grain.python as grain
 import numpy as np
 from jinja2 import TemplateError
 
-from dew.data.text import HFTokenizer, tokenizer_name
+from dew.data.facts import unshaped
+from dew.data.text import HFTokenizer, SavedTokenizer, tokenizer_name
 
 if TYPE_CHECKING:
     from transformers import PreTrainedTokenizerBase
@@ -525,6 +526,12 @@ class RenderChat(grain.MapTransform):
     def dependencies(self) -> Mapping[str, object]:
         return {"tokenizer": self.vocabulary.dependencies()}
 
+    def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
+        """Token ids under "text" and their speakers under "text_roles", each conversation's
+        length, from `tokenizer`'s template, in place of its turns."""
+        rendered = unshaped(facts, self.column, "prompt", "tools", "text", ROLES_KEY)
+        return {**rendered, "tokenizer": self.tokenizer}
+
     def map(self, element: Batch) -> Batch:
         messages = element.get(self.column, element.get("prompt"))
         conversation = Conversation.parse(messages, element.get("tools"), self.tokenizer)
@@ -533,7 +540,7 @@ class RenderChat(grain.MapTransform):
         return {**kept, "text": ids, "text_roles": roles}
 
 
-def template(tokenizer: str | PreTrainedTokenizerBase, *, messages: str = "messages") -> RenderChat:
+def template(tokenizer: str | SavedTokenizer, *, messages: str = "messages") -> RenderChat:
     """A record step that renders the conversation in `messages` through the
     tokenizer's chat template to token ids under "text" and each token's
     speaker under "text_roles", which an assistant-only loss reads.

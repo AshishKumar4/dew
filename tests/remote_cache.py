@@ -8,7 +8,7 @@ programs in that file's bundle on the dew-xla-cache Worker (deployed from the pr
 repository), through JAX's own cache directory: one GET as the file is collected writes its last
 run's programs into the directory, and one PUT after it ran, where it compiled any program the
 bundle lacked, sends the programs compiled under it and those fetched for it. Bundles are kept
-under jax's and jaxlib's versions, the backend, the Python minor and the device's kind, beside
+under jaxlib's version, the backend, the Python minor and the device's kind, beside
 JAX's own key of each program and its flags.
 
 JAX keeps a program as one file, `<key>-cache`, in `jax_compilation_cache_dir`, and with no
@@ -329,14 +329,17 @@ def unpacked(bundle: bytes) -> list[tuple[str, bytes]]:
 
 def prefix() -> str:
     """The bundles' leading parts: what a cached executable is only valid for beside JAX's own key,
-    and the device's kind, whose programs are another file's on another GPU. The Python minor is
-    among them because jax 0.11.2 names 3.14's stdlib zstd codec "zlib" in its key
-    (`dew.cache.default_compilation_cache_dir`)."""
+    and the device's kind, whose programs are another file's on another GPU. jax's own version is
+    not among them: JAX's key holds the program and jaxlib's version
+    (jax/_src/cache_key.py), so a release of jax alone that lowers a program differently keys it
+    anew, and one that does not (a post-release of Dew's patch stack) keeps every file's programs.
+    The Python minor is among them because jax 0.11.2 names 3.14's stdlib zstd codec "zlib" in its
+    key (`dew.cache.default_compilation_cache_dir`)."""
     import jax
     import jaxlib
 
     kind = "".join(character if character.isalnum() else "-" for character in jax.devices()[0].device_kind)
-    return f"jax{jax.__version__}/jaxlib{jaxlib.__version__}/{jax.default_backend()}/" \
+    return f"jaxlib{jaxlib.__version__}/{jax.default_backend()}/" \
            f"py{sys.version_info.major}.{sys.version_info.minor}/{kind}"
 
 

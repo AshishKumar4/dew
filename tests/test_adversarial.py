@@ -12,14 +12,13 @@ import numpy as np
 import optax
 import pytest
 from diffusion_stubs import batch_for
-from diffusion_support import saved_after_one_step
+from diffusion_support import images_of, saved_after_one_step
 from flax import linen as nn
 from reference_error import assert_as_exact_as_the_reference, float64_terms, widened
 
 import dew
 from dew.checkpoints import Checkpoints
 from dew.config import ModelConfig, ObjectiveConfig, TrainerConfig
-from dew.config.data import ImageData
 from dew.diffusion.presets import Flow
 from dew.nn.backbones import SimpleDiT
 from dew.objectives.base import TEACHER, Step
@@ -184,7 +183,7 @@ def runs(tmp_path_factory):
         model=ModelConfig("simple_dit",
                           {"patch_size": 2, "emb_features": 16, "num_layers": 2, "num_heads": 2,
                            "dtype": "float32", "attention_impl": "xla"}),
-        data=ImageData(source="tfds://oxford_flowers102", image_size=4), preset=Flow(), val_metrics=(),
+        data=images_of("tfds://oxford_flowers102", 4), preset=Flow(), val_metrics=(),
         trainer=TrainerConfig(checkpoint_dir=str(root)),
         text=TextCondition(encoder="char_table", checkpoint="char_table"),
         objective=ObjectiveConfig("diffusion",
