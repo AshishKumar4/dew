@@ -1237,6 +1237,42 @@ def test_a_corpus_that_recurs_across_phases_continues_its_order_and_repeats_noth
     assert abs(sum(value // 1000 == 2 for value in by_phase[1]) - 68) <= 1
 
 
+def test_corpora_recurring_across_phases_continue_where_grains_weighted_mix_left_each():
+    """Shares of 1, 10 and 15, whose scaling to whole proportions Grain truncates: after two steps
+    of eight records the mix has read 1, 6 and 9 records of its corpora, so the next phase starts
+    each where that left it, and across the switch every corpus reads its own order, nothing
+    repeated and nothing skipped."""
+    from dew.data.pipeline import Phases
+
+    def corpus(tag):
+        return Pipeline(Memory(Indexed(tag, 200)), name=f"corpus-{tag}").shuffle(tag).repeat()
+
+    def mixed():
+        return mix(tuple(corpus(tag) for tag in (1, 2, 3)), weights=(1, 10, 15))
+
+    dataset = compile(Pipeline(Phases((mixed(), mixed()), (2, None))).batch(8), read="memory", seed=0,
+                      loading=READ)
+    read = [value for step in taken(dataset.train(DataPartition()), 6) for value in step]
+    for tag in (1, 2, 3):
+        alone = compile(corpus(tag).batch(1), read="memory", seed=0, loading=READ)
+        mine = [value for value in read if value // 1000 == tag]
+        assert mine == [step[0] for step in taken(alone.train(DataPartition()), len(mine))]
+
+
+@pytest.mark.parametrize("weights", [(1, 10, 15), (0.3, 0.7), (71, 20, 9), (1.0,)])
+def test_dews_weighted_selection_reads_the_records_grains_mix_reads(weights):
+    """The selection Dew mixes indexed corpora by and counts a phase's prefix by reads each position
+    of the mixture from the corpus and record Grain's own weighted mix reads there."""
+    from dew.data.mixing import ProportionalSelection
+
+    parents = [pygrain.MapDataset.range(1000 * (index + 1), 1000 * (index + 1) + 300)
+               for index in range(len(weights))]
+    ours = pygrain.MapDataset.select_from_datasets(
+        parents, ProportionalSelection([len(parent) for parent in parents], weights))
+    grains = pygrain.MapDataset.mix(parents, weights)
+    assert len(ours) == len(grains) and list(ours) == list(grains)
+
+
 def test_one_corpus_starts_past_its_offset_as_a_mixed_one_does():
     """`corpora_dataset` owns how a list of corpora streams, the offset a
     phase gives a recurring corpus included, for one corpus as for several."""
