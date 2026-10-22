@@ -18,6 +18,16 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 - A `BlockDenoiser`'s call and `encode` take `positions`: block generation
   refines and commits each canvas at the logical positions that continue its
   prompt's, as text generation continues them.
+- Data is one API, the chain: a store piped through the presets and steps
+  (`dew.data.presets`), compiled by `dew.data.compile.compile`, and recorded in
+  run.json as written (`dew.data.records`). `dew.config.data` (its recipes,
+  `loader` and `Augment`) and `dew.data.load` are removed; a run config's
+  `data=` is a chain, and `--set data.source.url=...` points it at another
+  store. docs/design/data.md lists what each recipe chose and the chain that
+  states it. A token store is a committed export (`dew data export
+  --tokenizer`), one split each; a `train.bin`/`meta.json` directory is
+  exported once. Every preset takes `batch=None`, and `prompts`,
+  `preferences` and `canvas` take `cache=`.
 
 ## 0.1.0
 
