@@ -32,7 +32,7 @@ VOCAB = 13
 
 @pytest.fixture(scope="module")
 def model():
-    return initialized_decoder()
+    return initialized_decoder(length=3)
 
 
 def next_log_probs(model, params, rows):

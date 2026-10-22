@@ -129,7 +129,7 @@ COLUMNS = ["program_id", "category", "hlo_op_name", "hlo_op_expression", "tf_op_
 
 def captured(tmp_path, cells, peak: float, extra: tuple[str, ...] = ()):
     """A capture's reports under `tmp_path`/profile, as XProf writes them: `cells`, rows of `COLUMNS` and
-    then the `extra` columns, and a roofline of `peak` FLOP/s. Returns the reports directory."""
+    then the `extra` columns, and a roofline of `peak` GFLOP/s. Returns the reports directory."""
     reports = tmp_path / "profile" / "capture-a" / "reports"
     reports.mkdir(parents=True)
     (reports / "hlo_stats.json").write_text(json.dumps([{
