@@ -17,6 +17,7 @@ import numpy as np
 
 from dew.data.dataset import Batch, Records
 from dew.data.pipeline import Record, Rejected
+from dew.data.plan import array_digest
 from dew.data.retention import LocalRetention
 from dew.data.sources.base import Read, Shard, ShardManifest, Source, _indexed_manifest, _uncounted, url_label
 from dew.data.sources.codec import decode, fingerprint
@@ -226,7 +227,7 @@ def _write_plan(root: Store, name: str, array: np.ndarray) -> Mapping[str, objec
     rows = array.reshape(1) if array.ndim == 0 else array
     row_bytes = max(1, int(np.prod(rows.shape[1:])) * array.dtype.itemsize)
     page_rows = min(4096, max(1, 4 * 2**20 // row_bytes))
-    digest = hashlib.sha256(_json({"dtype": array.dtype.str, "shape": list(array.shape)}))
+    digest = array_digest(array.dtype, array.shape)
     pages = []
     for offset in range(0, len(rows), page_rows):
         page = np.ascontiguousarray(rows[offset : offset + page_rows])
@@ -275,11 +276,10 @@ def _sealed(root: Store, pins: ExitStack) -> tuple[dict, dict]:
         if scheme == "file":
             pins.enter_context(LocalRetention.pin(Path(directory) / "shards" / Path(location).parent.name))
         seal = json.loads(fs.cat_file(location))
-        chain = b""
-        collected = []
+        payloads = []
         for segment in seal["segments"]:
             payload = _checked(root, segment)
-            chain = hashlib.sha256(chain + payload).digest()
+            payloads.append(payload)
             record = json.loads(payload)
             _checked(root, record["shard"])
             with closing(
@@ -296,32 +296,53 @@ def _sealed(root: Store, pins: ExitStack) -> tuple[dict, dict]:
                     if existing is not None and existing["payload_sha256"] != entry["payload_sha256"]:
                         raise ValueError(f"conflicting cache duplicate for row {entry['id']}")
                     completions.setdefault(entry["id"], candidate)
-                    collected.append(entry["id"])
             shards[record["shard"]["path"]] = record["shard"]
-        if chain.hex() != seal["sha256"] or len(seal["segments"]) != seal["count"]:
+        if seal_facts(seal["segments"], payloads) != seal:
             raise ValueError(f"cache writer seal failed verification: {location}")
-        if collected and (collected[0] != seal["first"] or collected[-1] != seal["last"]):
-            raise ValueError(f"cache writer row range differs: {location}")
     return completions, shards
 
 
+def completion_facts(row_id: str, payload: bytes) -> dict[str, object]:
+    """What a cache commits of one input's completion, `payload` its encoded outputs, besides where
+    it is: the outputs it accepted, their ids, digests, lengths, targets and count rules, and the
+    reasons it rejected the rest. The writer records them (`cache._Writer._flush`) and a reader
+    checks every one against the record it reads (`_completion`)."""
+    outputs = _decode_outputs(payload)
+    accepted = _accepted(outputs)
+    return {
+        "id": row_id,
+        "fanout": len(accepted),
+        "outputs": [[row_id, index] for index in range(len(accepted))],
+        "sha256": fingerprint(accepted),
+        "payload_sha256": fingerprint(outputs),
+        "lengths": [_fact(value, "_dew_length") for value in accepted],
+        "valid_targets": [_fact(value, "_dew_valid_targets") for value in accepted],
+        "rules": [_rule(value) for value in accepted],
+        "rejections": [value.reason for value in outputs if isinstance(value, Rejected)],
+    }
+
+
+def seal_facts(segments: Sequence[Mapping[str, object]], payloads: Sequence[bytes]) -> dict[str, object]:
+    """What a cache writer's seal commits of its `segments`, `payloads` their bytes in order: their
+    count, the hash chain over them and the first and last input they complete. The writer seals
+    by it (`cache._Writer.seal`) and a reader checks a seal against it (`_sealed`)."""
+    chain = b""
+    rows: list[object] = []
+    for payload in payloads:
+        chain = hashlib.sha256(chain + payload).digest()
+        rows.extend(completion["id"] for completion in json.loads(payload)["completions"])
+    return {"count": len(segments), "segments": list(segments), "first": rows[0] if rows else None,
+            "last": rows[-1] if rows else None, "sha256": chain.hex()}
+
+
 def _completion(entry: Mapping[str, object], encoded: Batch | bytes | None) -> None:
+    """Refuse a committed completion whose record is not what its facts say (`completion_facts`)."""
     if not isinstance(encoded, bytes):
         raise ValueError(f"cache shard record is not bytes for {entry['id']}")
-    values = _decode_outputs(encoded)
-    accepted = _accepted(values)
-    if len(accepted) != entry["fanout"]:
-        raise ValueError(f"cache completion fanout differs for {entry['id']}")
-    if fingerprint(values) != entry["payload_sha256"]:
-        raise ValueError(f"cache completion checksum differs for {entry['id']}")
-    if fingerprint(accepted) != entry["sha256"]:
-        raise ValueError(f"cache accepted-output checksum differs for {entry['id']}")
-    if entry["outputs"] != [[entry["id"], index] for index in range(len(accepted))]:
-        raise ValueError(f"cache completion output IDs differ for {entry['id']}")
-    if (entry["lengths"] != [_fact(value, "_dew_length") for value in accepted]
-            or entry["valid_targets"] != [_fact(value, "_dew_valid_targets") for value in accepted]
-            or entry["rules"] != [_rule(value) for value in accepted]):
-        raise ValueError(f"cache completion metadata differs for {entry['id']}")
+    expected = completion_facts(str(entry["id"]), encoded)
+    differing = sorted(name for name, value in expected.items() if entry.get(name) != value)
+    if differing:
+        raise ValueError(f"cache completion {differing} differ for {entry['id']}")
 
 
 def _source_ids(source: Source, *, streamed: bool = False,

@@ -100,15 +100,21 @@ def _length_index(root: Store, writer: str, number: int, batch, field: str | Non
     return {"path": path, **root.child(path).verified(encoded.getvalue())}
 
 
+def write_array_record(path: Path, payloads: Iterable[bytes]) -> None:
+    """`payloads` written to a local ArrayRecord file at `path`, one record each in their order, the
+    file closed whether or not they all were: the shard an export and a cache fill each upload."""
+    writer = ArrayRecordWriter(str(path), "group_size:1")
+    try:
+        for payload in payloads:
+            writer.write(payload)
+    finally:
+        writer.close()
+
+
 def _array_shard(root: Store, writer: str, number: int, batch, index: ObjectRef | None):
     with tempfile.TemporaryDirectory(prefix="dew-export-") as temporary:
         path = Path(temporary) / "part.array_record"
-        record_writer = ArrayRecordWriter(str(path), "group_size:1")
-        try:
-            for row in batch:
-                record_writer.write(encode(row))
-        finally:
-            record_writer.close()
+        write_array_record(path, (encode(row) for row in batch))
         relative = f"shards/{writer}/part-{number:06d}.array_record"
         return {
             "path": relative,
