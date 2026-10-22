@@ -402,7 +402,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_kda.py": {
-   "comparisons": 11,
+   "comparisons": 1,
    "lane": "Models, Serving & RL"
   },
   "tests/test_kernels.py": {
