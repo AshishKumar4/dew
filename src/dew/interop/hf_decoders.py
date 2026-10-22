@@ -570,7 +570,7 @@ def read_wrapper(
     # Each component's collections hold it under its own name in the wrapper's, and every
     # spelling the source stores of one tensor (`_wrapper_sources` checked them equal) writes
     # from its one leaf.
-    spellings = {name: group for group in alias_groups(aliases) for name in group}
+    spellings = checked_groups(aliases)
 
     def spelled(name: str) -> list[str]:
         return sorted(spellings.get(name, {name}))
