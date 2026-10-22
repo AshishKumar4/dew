@@ -226,8 +226,10 @@ def test_a_mislinked_chain_is_refused_before_anything_trains(tmp_path):
         Stage(name="x", loss="ppo", data=tasks),
         Stage(name="x", loss="dpo", data=pairs(), episodes=episodes),
         Stage(name="x", loss="dpo", data=pairs(), teacher=teacher),
-        # A stage's data must carry its loss's fields: preference pairs are no SFT conversations.
+        # A stage's data must carry its loss's fields: preference pairs are no SFT conversations, and
+        # token windows carry no roles for SFT to score the assistant's turns by.
         Stage(name="x", loss="sft", data=pairs()),
+        Stage(name="x", loss="sft", data=text),
         Stage(name="x", loss="grpo", data=text, reward=len),
         # PPO actions end at an EOS, and this stage's sampling names none.
         Stage(name="x", loss="ppo", data=tasks, max_new_tokens=RESPONSE, episodes=episodes),

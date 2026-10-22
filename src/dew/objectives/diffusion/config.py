@@ -200,7 +200,8 @@ class DiffusionRunConfig(RunConfig):
     audio: AudioCondition | None = None
     """The audio condition, passed under its encoder's keyword in place of text.
 
-    It needs `text` to be None and a `Video` recipe, whose clips hold the audio.
+    It needs `text` to be None and a chain of clips that hold their audio
+    (`dew.data.presets.clips(sample_rate=)`).
     """
     autoencoder: PretrainedAutoencoder | None = None
     """The autoencoder for latent diffusion; None trains in pixel space."""

@@ -184,9 +184,11 @@ class Recipe:
         facts = stage.data.facts()
         stated = facts.get("fields")
         fields = None if stated is None else record(stated, "the chain's fields")
-        # A preference pair's rows, as `preferences.PreferencePair` lays them out.
-        needed = {"pretrain": ("text",), "sft": ("text",), "dpo": ("input_ids", "completion_mask"),
-                  "grpo": ("prompt",), "ppo": ("task_id",)}[stage.loss]
+        # A conversation's rows carry their roles, whose assistant turns alone SFT scores; a preference
+        # pair's are as `preferences.PreferencePair` lays them out.
+        needed = {"pretrain": ("text",), "sft": ("text", "text_roles"),
+                  "dpo": ("input_ids", "completion_mask"), "grpo": ("prompt",),
+                  "ppo": ("task_id",)}[stage.loss]
         if fields is not None and (missing := [name for name in needed if name not in fields]):
             raise ValueError(f"stage {stage.name!r} trains {stage.loss}, whose data carries "
                              f"{', '.join(needed)}; this chain carries no {', '.join(missing)}")
