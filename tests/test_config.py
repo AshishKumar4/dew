@@ -60,6 +60,23 @@ def test_a_chain_the_record_cannot_describe_trains_from_python_and_refuses_to_re
         RunConfig.from_dict(json.loads(json.dumps(record)))
 
 
+def test_named_validation_splits_read_back_in_their_order(tmp_path):
+    """A run's named validation splits are recorded in their order, which a saved run.json keeps: the
+    first is the split a run ranks its checkpoints and calibrates on, so a save must not move another
+    ahead of it."""
+    from dew.data import presets
+    from dew.data.sources.tokens import TokenFiles
+
+    def windows(url):
+        return TokenFiles(url).pipe(presets.token_windows, seq_len=8, batch=2)
+
+    config = RunConfig(data=windows("tokens/train"), trainer=TrainerConfig(steps=1),
+                       validation={"val": windows("tokens/val"), "test": windows("tokens/test")})
+    loaded = RunConfig.load(config.save(str(tmp_path / "run")))
+    assert isinstance(loaded.validation, Mapping) and list(loaded.validation) == ["val", "test"]
+    assert [split.source.url for split in loaded.validation.values()] == ["tokens/val", "tokens/test"]
+
+
 def test_a_record_with_an_unknown_field_or_without_a_required_one_is_refused():
     record = RunConfig().to_dict()
     with pytest.raises(ValueError):

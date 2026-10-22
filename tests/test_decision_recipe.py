@@ -67,6 +67,36 @@ class _NamedSplits(Memory):
         return dataclasses.replace(self, values=self.splits[name])
 
 
+def test_decisions_read_their_table_as_the_stages_before_them_make_it():
+    """A table renamed to the decision columns before `decisions` reads its options from the renamed
+    rows, in a memory read: the stages before it run before its options are inferred."""
+    from dew.data.compile import iterate
+
+    rows = [{"body": f"ticket {index}", "category": "ab"[index % 2]} for index in range(4)]
+    renamed = Memory(rows).rename_columns({"body": "text", "category": "label"})
+    examples = [row["example"] for row in iterate(renamed.pipe(decisions, question="team"), read="memory")]
+    assert list(examples[0].questions["team"].options) == ["a", "b"]
+    assert [example.answers["team"] for example in examples] == ["a", "b", "a", "b"]
+
+
+def test_a_decision_mixture_states_its_weights_and_the_manifest_that_made_it(tmp_path):
+    """`mixture` mixes the corpora of a positive weight and states, through the chain's facts, the
+    weights it mixes them by and the manifest it read, which a run's summary reports."""
+    from dew.decision.data import mixture
+
+    question = {"type": "choice", "instructions": "Which team?", "criteria": ["billing", "technical"]}
+    row = {"state": "charged twice", "questions": {"team": question}, "answers": {"team": "billing"}}
+    manifest = {"weights": {"a": 2.0, "b": 1.0, "c": 0.0}, "slots": {"questions": 1, "options": 2}}
+    (tmp_path / "mixture.json").write_text(json.dumps(manifest))
+    for name in ("a.jsonl", "a.held.jsonl", "b.jsonl", "c.jsonl"):
+        (tmp_path / name).write_text(json.dumps(row) + "\n")
+    train, held = mixture(str(tmp_path))
+    facts = train.facts()
+    assert facts["mixture_weights"] == {"a": 2.0, "b": 1.0}
+    assert facts["mixture_made"] == manifest
+    assert held is not None
+
+
 def test_a_named_validation_split_reads_the_source_s_own_split():
     """A holdout of the store's own named split (`holdout(split="validation")`) opens it through the
     source's `with_split`, and the decisions over it read that split's rows; a source with no native

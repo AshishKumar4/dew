@@ -11,8 +11,9 @@ from typing import Literal
 import numpy as np
 
 from dew import records
-from dew.data.pipeline import Configured, Dataset, Pipeline, mix
-from dew.data.sources.base import Read, ShardManifest, Source, _consumed
+from dew.data.lowering import prepared_rows
+from dew.data.pipeline import Configured, Dataset, Pipeline, Stage, mix
+from dew.data.sources.base import Read, ShardManifest, Source, _consumed, stated as store_facts
 from dew.decision.questions import Choice, Question
 from dew.records import JSON, json_value, record
 
@@ -168,10 +169,21 @@ class ParseTable:
 
 @dataclass(frozen=True)
 class _DecisionSource:
+    """A store's rows read as decisions: `table`'s options and the slots its rows need are inferred
+    in a memory read, from the rows as the stages `before` the decisions make them (a rename, a
+    relabelling); `mixture` is the facts a decision mixture states of itself (`mixture`)."""
+
     source: Source
     slots: Mapping[str, int] | None = None
     table: ParseTable | None = None
     descriptor: Mapping[str, object] = field(default_factory=dict)
+    before: tuple[Stage, ...] = ()
+    mixture: Mapping[str, object] = field(default_factory=dict)
+
+    def stated(self) -> Mapping[str, object]:
+        """What the store states of its records (`Dataset.facts`), with a mixture's weights and the
+        manifest it was made by."""
+        return {**store_facts(self.source), **self.mixture}
 
     def consumed(self, read: Read) -> "_DecisionSource":
         consumed = dataclasses.replace(self, source=_consumed(self.source, read))
@@ -195,21 +207,22 @@ class _DecisionSource:
     def records(self, read: Read):
         records = self.source.records(read)
         if read == "memory" and self.slots is None and not self._facts:
+            rows = prepared_rows(records, self.before) if self.before else records
             if self.table is not None:
                 stated = self.source.metadata().get("class_names", {})
                 names = record(stated, "class names").get(self.table.label)
-                first = records[0] if len(records) else None
+                first = rows[0] if len(rows) else None
                 if isinstance(names, (list, tuple)):
                     self._classes[:] = [str(name) for name in names]
                 elif isinstance(first, Mapping) and "questions" not in first and "example" not in first:
                     if self.table.label not in first:
                         raise ValueError(f"decision table needs column {self.table.label!r}")
                     self._classes[:] = sorted({
-                            str(record(records[index], "decision row")[self.table.label])
-                            for index in range(len(records))
+                            str(record(rows[index], "decision row")[self.table.label])
+                            for index in range(len(rows))
                     })
                     self._valued[:] = [True]
-            self._memory_slots(records)
+            self._memory_slots(rows)
         return records
 
     @functools.cached_property
@@ -282,7 +295,7 @@ def decisions(dataset: Dataset, *, options: Sequence[str] = (), text: str = "tex
         raise ValueError("decisions reads a store's rows; mix decision chains rather than reading a mixture")
     table = ParseTable(tuple(options), text, label, question, instructions)
     wrapped = _DecisionSource(chain.source, {"questions": 1, "options": len(options)} if options else None,
-                              table=table)
+                              table=table, before=tuple(chain.stages))
     return dataclasses.replace(chain, source=wrapped).map(Configured(_ParseConfigured(table), needs=()))
 
 
@@ -310,6 +323,12 @@ def mixture(root_url: str, *, weights: Mapping[str, float] | None = None,
         kept.append(weight)
     if not training:
         raise ValueError(f"no corpus of {root_url} has a positive weight")
+    # Each corpus states the mixture it is read in: its positive weights and the manifest that made
+    # it, which a run's summary reports (`DecisionRunConfig`).
+    made = {"mixture_weights": {name: weight for name, weight in sorted(shares.items()) if weight > 0},
+            "mixture_made": dict(stated)}
+    training = [dataclasses.replace(child, source=dataclasses.replace(child.source, mixture=made))
+                for child in training]
     train = training[0] if len(training) == 1 else mix(training, kept)
     evaluated = None if not held else Pipeline(_DecisionSource(
         Concatenate(tuple(child.source for child in held if isinstance(child.source, Source))),
