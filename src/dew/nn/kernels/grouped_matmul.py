@@ -1249,13 +1249,15 @@ def _portable_projection_jvp(dtype: Dtype | None, precision: PrecisionLike,
                     jax.lax.optimization_barrier(tuple(tangent for _, tangent in live)),
                     strict=True))
     terms = []
+    # Each rounded operand is held in the work dtype, which holds the rounding whatever the operand's own
+    # (an fp16 master's largest value rounds to bf16's 65536, which fp16 does not hold).
     if 'x' in held:
-        matrix = jnp.asarray(rounded_operand(kernel, output.dtype))
+        matrix = jnp.asarray(rounded_operand(kernel.astype(work), output.dtype))
         terms.append(xla_ragged_dot(
             held['x'].astype(work), matrix.astype(work), group_sizes, precision=precision,
             preferred_element_type=work))
     if 'kernel' in held:
-        inputs = jnp.asarray(rounded_operand(x, output.dtype))
+        inputs = jnp.asarray(rounded_operand(x.astype(work), output.dtype))
         terms.append(xla_ragged_dot(
             inputs.astype(work), held['kernel'].astype(work), group_sizes, precision=precision,
             preferred_element_type=work))
