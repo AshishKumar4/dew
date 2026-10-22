@@ -472,36 +472,41 @@ def _gmm_pingpong(lhs, rhs, lengths, shape: tuple, *, tiles: Tiles, transpose_rh
                                      (info.block_start, info.start_within_block, info.actual_size, column,
                                       min(block_m, m)), wg)
 
-                    @pl.when(mine)
+                    @pl.when(mine & active)
                     def _():
                         hopper.rendezvous(schedule)  # this one's products begin
+
                         accumulator = plgpu.WGMMAAccumulatorRef((block_m, block_n))
 
                         @functools.partial(pl.run_scoped, acc_ref=accumulator)
                         def _(acc_ref):
-                            @pl.when(active)
-                            def _():
-                                @pl.loop(0, steps)
-                                def _(step):
-                                    rows_stage = lhs_ring.acquire(counter + step)
-                                    matrix_stage = rhs_ring.acquire(counter + step)
-                                    plgpu.wgmma(acc_ref, rows_stage, matrix_stage.transpose((1, 0))
-                                                if transpose_rhs else matrix_stage)
-                                    # One MMA in flight: the step before's stages are read.
-                                    plgpu.wgmma_wait(_IN_FLIGHT)
+                            @pl.loop(0, steps)
+                            def _(step):
+                                rows_stage = lhs_ring.acquire(counter + step)
+                                matrix_stage = rhs_ring.acquire(counter + step)
+                                plgpu.wgmma(acc_ref, rows_stage, matrix_stage.transpose((1, 0))
+                                            if transpose_rhs else matrix_stage)
+                                # One MMA in flight: the step before's stages are read.
+                                plgpu.wgmma_wait(_IN_FLIGHT)
 
-                                    @pl.when(step > 0)
-                                    def _():
-                                        lhs_ring.release(counter + step - 1)
-                                        rhs_ring.release(counter + step - 1)
+                                @pl.when(step > 0)
+                                def _():
+                                    lhs_ring.release(counter + step - 1)
+                                    rhs_ring.release(counter + step - 1)
 
-                                plgpu.wgmma_wait(0)
-                                lhs_ring.release(counter + steps - 1)
-                                rhs_ring.release(counter + steps - 1)
-
+                            plgpu.wgmma_wait(0)
+                            lhs_ring.release(counter + steps - 1)
+                            rhs_ring.release(counter + steps - 1)
                             hopper.rendezvous(schedule)  # the other's products begin
-                            # The unrouted rows: the epilogue of a zero accumulator.
-                            finish(jnp.where(active, acc_ref[...], 0.0))
+                            finish(acc_ref[...])
+
+                    # The unrouted rows: the epilogue of a zero accumulator, its turn's meetings kept.
+                    @pl.when(mine & ~active)
+                    def _():
+                        hopper.rendezvous(schedule)
+                        hopper.rendezvous(schedule)
+                        zeros = jnp.zeros((block_m, block_n), jnp.float32)
+                        finish(plgpu.layout_cast(zeros, plgpu.Layout.WGMMA))
 
                     return (counter + jnp.where(mine & active, steps, 0), taken + rows.astype(jnp.int32))
 
