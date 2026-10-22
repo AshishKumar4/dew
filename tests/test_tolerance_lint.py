@@ -408,15 +408,16 @@ def test_a_merge_keeps_an_entry_its_parents_renamed_apart_only_once(lint, tmp_pa
     repo = tmp_path / "repo"
     repo.mkdir()
     subprocess.run(["git", "init", "-q", "-b", "main"], cwd=repo, check=True)
-    _commit(repo, _inventory({"tests/test_a.py": 1}), "made",
-            {"tests/test_a.py": "a = 1  # one comparison\n"})
+    _commit(repo, _inventory({"tests/test_a.py": 2}), "made",
+            {"tests/test_a.py": "a = 1  # two comparisons\n"})
     subprocess.run(["git", "checkout", "-q", "-b", "lane"], cwd=repo, check=True)
     subprocess.run(["git", "mv", "tests/test_a.py", "tests/test_b.py"], cwd=repo, check=True)
-    _commit(repo, _inventory({"tests/test_b.py": 1}), "the lane renames it")
+    _commit(repo, _inventory({"tests/test_b.py": 2}), "the lane renames it")
     subprocess.run(["git", "checkout", "-q", "main"], cwd=repo, check=True)
     subprocess.run(["git", "mv", "tests/test_a.py", "tests/test_c.py"], cwd=repo, check=True)
-    _commit(repo, _inventory({"tests/test_c.py": 1}), "main renames it")
-    # Each side edits its copy past git's notice of the rename before the merge.
+    _commit(repo, _inventory({"tests/test_c.py": 2}), "main renames it")
+    # Each side edits its copy past git's notice of the rename before the merge, converting one
+    # comparison, so its inventory changes with it.
     for branch, name in (("lane", "test_b.py"), ("main", "test_c.py")):
         subprocess.run(["git", "checkout", "-q", branch], cwd=repo, check=True)
         _commit(repo, _inventory({f"tests/{name}": 1}), "edited",
