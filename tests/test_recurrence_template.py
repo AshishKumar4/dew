@@ -53,7 +53,7 @@ def test_the_portable_mainloop_is_the_gpu_mainloop_interpreted_bit_for_bit(dtype
                                   compensated=True)
     tiles = {name: launch.PICKS[_dtype(k), _wide()] for name, launch in LAUNCHES.items()}
 
-    gpu = jax.jit(lambda *a: fla_gdn.cumulated_fwd(*a, spans, scale, CHUNK, True))
+    gpu = jax.jit(lambda *a: fla_gdn.cumulated_fwd(*a, spans, scale, CHUNK, interpret=True))
     (out, final), residual = gpu(q, k, v, prefix, beta, h0)
     w, h, corrected = residual[7]
     portable = jax.jit(lambda *a: xla.forward(*a, spans, scale=scale, chunk=CHUNK,
@@ -70,5 +70,6 @@ def test_the_portable_mainloop_is_the_gpu_mainloop_interpreted_bit_for_bit(dtype
                                       err_msg=name)
     chunks = np.asarray(spans.chunks)
     entered = np.unique(chunks[chunks[:, 1] > 0, 2])
-    np.testing.assert_array_equal(np.asarray(h_x)[entered], np.asarray(h)[entered], err_msg="memories entered")
+    np.testing.assert_array_equal(np.asarray(h_x)[entered], np.asarray(h)[entered],
+                                  err_msg="memories entered")
     np.testing.assert_array_equal(np.asarray(final_x), np.asarray(final), err_msg="final memory")
