@@ -97,11 +97,9 @@ class GpuTarget:
     `tensor_rates` the generation's dense tensor-core FLOPs per clock per
     multiprocessor by arithmetic mode ('16bit': fp16 or bf16 operands summed in
     fp32; 'tf32'), which a kernel's cost model reads
-    (`dew.nn.kernels.templates.cost`). `scoped_vmem` is a TPU's scoped VMEM
-    limit, which a Mosaic kernel's blocks are sized to (`scoped_vmem`). This
-    table is the one place a choice is keyed on the hardware generation; any
-    other code reads its facts, a library's support rule the compute capability
-    (`capability`), and a launch config the
+    (`dew.nn.kernels.templates.cost`). This table is the one place a choice is
+    keyed on the hardware generation; any other code reads its facts, a library's
+    support rule the compute capability (`capability`), and a launch config the
     autotuner (`dew.nn.kernels.tuning`), as tools/lint_slop.py's SLOP016 holds.
     """
 
@@ -118,10 +116,12 @@ class GpuTarget:
     memory_bandwidth: float | None = None
     tensor_rates: Mapping[str, int] = dataclasses.field(default_factory=dict)
     load_latency: float | None = None
-    scoped_vmem: int | None = None
     """The generation's global-memory load latency in multiprocessor clocks, as a pointer chase measures
     it (the kernel cost model's waiting term, `dew.nn.kernels.templates.cost`); None where no
     measurement states it."""
+    scoped_vmem: int | None = None
+    """A TPU's scoped VMEM limit in bytes at XLA's default, past which a Mosaic kernel refuses to compile
+    (`scoped_vmem`); None where no measurement states it."""
     int8_triton_gemm: bool = False
     """Whether XLA's Triton GEMM fusion computes int8 dots right on this GPU: on none measured, an
     A100 and an RTX PRO 6000 Blackwell, at jaxlib 0.11.2 (openxla/xla#51016;
@@ -381,8 +381,8 @@ def runtime_facts(target: GpuTarget, device) -> GpuTarget:
 
 
 SCOPED_VMEM = 16 * 2 ** 20
-"""The scoped VMEM a TPU kernel may hold where its target states none: v5e's, the least measured, so a
-kernel sized by it fits wherever it runs until its own generation's is measured."""
+"""The scoped VMEM a TPU kernel may hold where its target states none: v5e's, the one measured, which a
+generation's own measurement replaces."""
 
 
 def scoped_vmem(target: GpuTarget) -> int:
