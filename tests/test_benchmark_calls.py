@@ -1,5 +1,6 @@
 """`dew.telemetry.benchmark`: calls timed from the call until their output is ready, after warm-up
-runs that compile what they trace, laid out by label as tutorial 04 lays out its samplers."""
+runs that compile what they trace, laid out by label as tutorial 04 lays out its samplers; and the
+process's resident memory as the memory benchmarks read it."""
 
 import time
 
@@ -8,7 +9,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 
-from dew.telemetry.benchmark import benchmark
+from dew.telemetry.benchmark import benchmark, resident_memory
 
 
 class Slow:
@@ -58,3 +59,15 @@ def test_pair_labels_lay_out_as_rows_by_columns_in_one_unit():
     slow = Benchmark({"sample": (12.0, 14.0, 13.0), "<script>": (1.0,)}, {})
     assert slow.table().splitlines() == ["          median", "sample    13.0 s", "<script>   1.0 s"]
     assert "&lt;script&gt;" in slow._repr_html_()
+
+
+def test_resident_memory_reads_the_kernel_fields_in_bytes_and_sees_an_allocation():
+    """Each of the kernel's memory fields in bytes under its own name: an array of 64 MiB written
+    through raises the anonymous resident memory by more than half its size, which a field read in
+    the kernel's KiB would not show."""
+    before = resident_memory()
+    assert {"VmRSS", "RssAnon", "RssFile", "VmHWM"} <= set(before)
+    block = np.ones(64 * 2**20, np.uint8)
+    after = resident_memory()
+    assert after["RssAnon"] > before["RssAnon"] + block.nbytes // 2
+    assert after["VmHWM"] >= after["VmRSS"] >= after["RssAnon"]
