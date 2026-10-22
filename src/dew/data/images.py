@@ -16,6 +16,7 @@ from numpy.typing import ArrayLike
 
 from dew.data.dataset import Batch
 from dew.data.facts import resized, shaped, unshaped
+from dew.data.image_augmentation import JITTER
 from dew.data.image_codec import as_rgb, decode_image
 from dew.data.pipeline import DeviceStep, Rejected
 from dew.data.plan import callable_name
@@ -387,9 +388,9 @@ class ColorJitter(grain.RandomMapTransform):
     contrast and saturation factors drawn from [1 - x, 1 + x], applied in a
     random order, rounded once."""
 
-    brightness: float = 0.2
-    contrast: float = 0.05
-    saturation: float = 0.2
+    brightness: float = JITTER.brightness
+    contrast: float = JITTER.contrast
+    saturation: float = JITTER.saturation
     _: dataclasses.KW_ONLY
     field: str = "image"
 
@@ -398,9 +399,9 @@ class ColorJitter(grain.RandomMapTransform):
         return facts
 
     def random_map(self, element: Batch, rng: np.random.Generator) -> Batch:
-        from dew.data.image_augmentation import jitter_host, jitter_ranges
+        from dew.data.image_augmentation import Spread, jitter_host
 
-        ranges = jitter_ranges(self.brightness, self.contrast, self.saturation)
+        ranges = Spread(self.brightness, self.contrast, self.saturation).ranges()
         factors = np.asarray([rng.uniform(low, high) for low, high in ranges])
         pixels = jitter_host(np.asarray(element[self.field]).astype(np.float32), factors, rng.permutation(3))
         return {**element, self.field: np.rint(pixels).astype(np.uint8)}
