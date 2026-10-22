@@ -55,7 +55,7 @@ class RecordSlice:
         return f"{self.source.describe()}[{self.start}:{self.stop}]"
 
     def fingerprint(self) -> Mapping[str, object]:
-        return {**self.source.fingerprint(), "slice": [self.start, self.stop]}
+        return _selected(self.source, "slice", {"slice": [self.start, self.stop]})
 
     def supports(self, read: Read) -> bool:
         return read in self.reads and self.source.supports(read)
@@ -64,10 +64,14 @@ class RecordSlice:
         from dew.data.dataset import SourceSlice
 
         records = self.source.records(read)
-        stop = len(records) if self.stop is None else self.stop
-        if not 0 <= self.start <= stop <= len(records):
-            raise ValueError(f"{self.describe()} exceeds the source's {len(records)} records")
-        return SourceSlice(records, self.start, stop)
+        return SourceSlice(records, *self.bounds(len(records)))
+
+    def bounds(self, records: int) -> tuple[int, int]:
+        """The first and the one past the last of `records` it keeps, refusing a slice past them."""
+        stop = records if self.stop is None else self.stop
+        if not 0 <= self.start <= stop <= records:
+            raise ValueError(f"{self.describe()} exceeds the source's {records} records")
+        return self.start, stop
 
     def metadata(self) -> Mapping[str, object]:
         return {**_uncounted(self.source.metadata()), **({"held_out": self.start} if self.start else {})}
@@ -144,8 +148,9 @@ class HashPart:
         return f"{self.source.describe()} hash holdout={part}"
 
     def fingerprint(self) -> Mapping[str, object]:
-        return {**self.source.fingerprint(), "holdout": [self.low, self.high], "held": self.held,
-                "key": self.key, "content_hash": "sha256:sorted-mappings-v1"}
+        part = {"holdout": [self.low, self.high], "held": self.held, "key": self.key,
+                "content_hash": "sha256:sorted-mappings-v1"}
+        return _selected(self.source, "hash", part)
 
     def supports(self, read: Read) -> bool:
         return read in self.reads and self.source.supports(read)
@@ -154,9 +159,12 @@ class HashPart:
         import grain.python as grain
 
         rows = self.source.records(read)
-        keys = tuple(index for index in range(len(rows)) if (row := rows[index]) is not None
-                     and _inside(row, self.low, self.high, self.key) == self.held)
+        keys = tuple(index for index in range(len(rows)) if self.keeps(rows[index]))
         return grain.MapDataset.source(keys).map(_SelectedRow(rows))
+
+    def keeps(self, row: Batch | bytes | None) -> bool:
+        """Whether this part holds `row`: one that is there, its identity in the part."""
+        return row is not None and _inside(row, self.low, self.high, self.key) == self.held
 
     def metadata(self) -> Mapping[str, object]:
         return _uncounted(self.source.metadata())
@@ -236,9 +244,10 @@ def selecting(source: Source | Mixture | Phases) -> Iterator[Source | Mixture | 
         yield from selecting(source.source)
 
 
-def rebased(source: Source | Mixture | Phases, replacement: Source,
-            under: Source | Mixture | Phases | None = None) -> Source:
-    """The holdout selections of `source` above `under`, its store by default, around `replacement`."""
-    if source is not under and isinstance(source, _SELECTIONS):
-        return dataclasses.replace(source, source=rebased(source.source, replacement, under))
-    return replacement
+def _selected(source: Source, kind: str, selection: Mapping[str, object]) -> Mapping[str, object]:
+    """A selection's identity: its store's with what it selects beside it, or, over another
+    selection, that selection's nested under its own, so selections of one kind stacked don't
+    overwrite one another."""
+    if isinstance(source, _SELECTIONS):
+        return {"selection": kind, "of": source.fingerprint(), **selection}
+    return {**source.fingerprint(), **selection}
