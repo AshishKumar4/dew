@@ -460,6 +460,27 @@ def _prepared(
     return branches
 
 
+def _made(prepared: Sequence[Pipeline], read: Read, counts: Sequence[dict[str, CorpusCounts]], *,
+          training: bool) -> tuple[Pipeline, ...]:
+    """Prepared branches as a memory read makes them, the first training where `training`: their
+    first stages run and their rows held (`_materialize`), counted into `counts`, then the memory
+    reads pinning took let go (`_released`); another read's as they are."""
+    if read != "memory":
+        return tuple(prepared)
+    made = tuple(_materialize(branch, count, training=training and not index)
+                 for index, (branch, count) in enumerate(zip(prepared, counts, strict=True)))
+    _released(prepared)
+    return made
+
+
+def _build(branch: Pipeline, read: Read, loading: Loading, *, batch: int, training: bool, seed: int = 0,
+           lowering: _Lowering | None = None) -> _Build:
+    """The build a reader of a prepared `branch` reads it by, in batches of `batch`: training's, or a
+    scored or published pass's, by the lowering its analysis gives unless `lowering` says otherwise."""
+    lowered = _analyzed(branch, read, validation=not training) if lowering is None else lowering
+    return _Build(read, loading, seed, batch, lowered, training=training)
+
+
 def compile(
     train: Pipeline,
     *,
@@ -538,20 +559,15 @@ def _staged(
         objective=objective,
         counts=(counts,) if validation is None else (counts, validation_counts),
     )
-    train, validation = branches[0], (None if validation is None else branches[1])
-    if not any(isinstance(stage, BatchStage) for stage in train.stages):
+    original = branches[0]
+    if not any(isinstance(stage, BatchStage) for stage in original.stages):
         raise ValueError("compile needs one batch(global_size) stage on the training pipeline")
-    batch = _output_batch(train)
-    original = train
-    if read == "memory":
-        train = _materialize(train, counts)
-        validation = (
-            None if validation is None else _materialize(validation, validation_counts, training=False)
-        )
-        if validation_counts and not any(count.accepted for count in validation_counts.values()):
-            validation = None
-        _released(branches)
-    build = _Build(read, loading, seed, batch, _analyzed(train, read), training=True)
+    train, *scored = _made(branches, read, (counts, validation_counts)[: len(branches)], training=True)
+    validation = scored[0] if scored else None
+    # A memory read that kept none of the scored records scores none.
+    if validation_counts and not any(count.accepted for count in validation_counts.values()):
+        validation = None
+    build = _build(train, read, loading, batch=_output_batch(original), training=True, seed=seed)
     return _Staged(train, validation, original, build, counts, validation_counts, batch_tokens)
 
 
@@ -979,12 +995,10 @@ def _diagnostic(pipeline: Pipeline, *, records: int | None = None) -> _Host:
         pipeline = dataclasses.replace(pipeline, stages=tuple(
             dataclasses.replace(stage, drop_remainder=False) if isinstance(stage, TokenBudget) else stage
             for stage in pipeline.stages))
-    (pinned,) = _prepared((pipeline,), read, provision=True, training=True,
-                          counts=(counts,) if records is None else None)
-    pipeline = pinned
-    if read == "memory" and records is None:
-        pipeline = _materialize(pinned, counts)
-        _released((pinned,))
+    prepared = _prepared((pipeline,), read, provision=True, training=True,
+                         counts=(counts,) if records is None else None)
+    # A bounded pass reads lazily: nothing runs ahead of it in memory.
+    (pipeline,) = prepared if records is not None else _made(prepared, read, (counts,), training=True)
     packed = _coordinated(pipeline)
     lowering = _analyzed(pipeline, read)
     if records is not None:
@@ -992,8 +1006,8 @@ def _diagnostic(pipeline: Pipeline, *, records: int | None = None) -> _Host:
     if finite:
         lowering = _finite(lowering)
     # A token budget is fixed-length rows by now (`_budgeted`).
-    batch = next(stage for stage in pipeline.stages if isinstance(stage, BatchStage)).size
-    build = _Build(read, loading, 0, batch, lowering, training=True).tuned(pipeline).pooled(pipeline)
+    build = _build(pipeline, read, loading, batch=_output_batch(pipeline), training=True,
+                   lowering=lowering).tuned(pipeline).pooled(pipeline)
     return _Host(build.batches(pipeline, DataPartition()), packed + _batch_steps(pipeline)[0])
 
 
@@ -1015,13 +1029,10 @@ def iterate(
         isinstance(stage, (RandomMap, BatchStage, MapBatch, Workers, Repeat)) for stage in _steps(pipeline)
     ):
         raise ValueError("publication needs deterministic, unbatched pipelines without repeat")
-    (pinned,) = _prepared((pipeline,), read, provision=provision, counts=({},))
-    pipeline = pinned
-    if read == "memory":
-        pipeline = _materialize(pinned, {}, training=False)
-        _released((pinned,))
-    lowering = _analyzed(pipeline, read, validation=True)
-    build = _Build(read, loading, 0, 1, lowering, training=False)
+    (pipeline,) = _made(_prepared((pipeline,), read, provision=provision, counts=({},)), read, ({},),
+                        training=False)
+    # Publication reads records, unbatched.
+    build = _build(pipeline, read, loading, batch=1, training=False)
     rows = build.records(pipeline, DataPartition())
     return _as_iter(rows, loading)
 
@@ -1098,16 +1109,11 @@ def validation(
     read = read or _preferred_read((pipeline,), provision=provision)
     if not any(isinstance(stage, (BatchStage, TokenBudget)) for stage in pipeline.stages):
         pipeline = pipeline.batch(batch, drop_remainder=False)
-    (pinned,) = _prepared((pipeline,), read, provision=provision, objective=objective, counts=({},))
-    # A token budget is fixed-length rows by now (`_budgeted`).
-    batch = _output_batch(pinned)
-    pipeline = pinned
-    if read == "memory":
-        pipeline = _materialize(pinned, {}, training=False)
-        _released((pinned,))
+    prepared = _prepared((pipeline,), read, provision=provision, objective=objective, counts=({},))
+    (pipeline,) = _made(prepared, read, ({},), training=False)
     packed = _coordinated(pipeline)
-    lowering = _analyzed(pipeline, read, validation=True)
-    build = _Build(read, loading, seed, batch, lowering, training=False)
+    # A token budget is fixed-length rows by now (`_budgeted`).
+    build = _build(pipeline, read, loading, batch=_output_batch(prepared[0]), training=False, seed=seed)
     return functools.partial(_validation_reader, pipeline=pipeline, build=build.tuned(pipeline),
                              host=packed + _held_steps(pipeline) + host)
 
