@@ -668,21 +668,24 @@ def test_an_indexed_bank_holds_check_1_with_the_plain_calls_value(generation_nam
     assert _kernels(taken) <= {'triton', 'mosaic_gpu', 'mosaic_tpu'} and _kernels(taken)
 
 
-@lowers("sm90")
-def test_an_indexed_bank_lowers_without_slicing_its_layer_for_an_h100():
-    """For an H100 the product reads the bank's layer in place: the lowered program slices no layer out of
-    the bank before its kernels, as a scanned layer stack's would every step."""
+@pytest.mark.parametrize("generation_name",
+                         [pytest.param(name, marks=lowers(name)) for name in ("sm80", "sm90")])
+def test_an_indexed_bank_lowers_without_slicing_its_layer(generation_name):
+    """For an A100 (Triton) and an H100 (Mosaic GPU) the product reads the bank's layer in place: the
+    lowered program slices no layer out of the bank before its kernels, as a scanned layer stack's would
+    every step."""
     x, bank, b, _ = _banked(0)
-    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), generation_name)
 
     def product(x, bank, b, layer):
         return template.gemm(x, bank, jnp.asarray(SIZES), rhs_index=layer, epilogue=biased,
                              epilogue_operands=((b, ('columns',)),), out_dtype=jnp.bfloat16)
 
-    with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
+    on = (generation.assumed(generation_name), jax.sharding.use_abstract_mesh(mesh))
+    with on[0], on[1], generation.routes() as taken:
         lowered = jax.jit(product).trace(x, bank, b, jnp.int32(LAYER)).lower(lowering_platforms=("cuda",))
         text = lowered.as_text()
-    assert "dynamic_slice" not in text
+    assert "dynamic_slice" not in text and _kernels(taken) - {'xla'}
 
 @pytest.mark.parametrize("producer", [rms_norm, dew_rms_norm, relu], ids=lambda producer: producer.__name__)
 def test_a_fused_producers_gradients_are_its_own(producer):
