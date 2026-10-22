@@ -1,9 +1,9 @@
 # Installation
 
-Dew's package name is `dewml` and its import name is `dew`. CI tests Python 3.12 and 3.14.
+Dew's package name is `dewml` and its import name is `dew`.
 
 <!-- BEGIN least Python (site/scripts/gen_install.py) -->
-Dew needs Python 3.12 or newer.
+Dew needs Python 3.12 or newer, and CI tests 3.12 and 3.14.
 <!-- END least Python -->
 
 ## The install script
@@ -22,20 +22,22 @@ curl -LsSf https://dewml.dev/install.sh | sh -s -- -y --venv ~/envs/dew --cuda 1
 
 ## uv or pip
 
-Dew runs on its own build of JAX 0.11.2, which [Dew's package index](#dews-jax-build) serves, so every install names it:
+Dew runs on its own build of JAX ([Dew's JAX build](#dews-jax-build)), which Dew's package index serves, so every install names it:
 
 ```bash
 uv pip install dewml --extra-index-url https://pypi.dewml.dev/simple
 ```
 
-Each command installs that JAX build and the accelerator build of jaxlib 0.11.2 for the hardware:
+Each command installs that JAX build and the matching accelerator build of jaxlib for the hardware:
 
+<!-- BEGIN install commands (site/scripts/gen_install.py) -->
 | Hardware | uv | pip |
 |---|---|---|
 | CPU | `uv pip install dewml --extra-index-url https://pypi.dewml.dev/simple` | `pip install dewml --extra-index-url https://pypi.dewml.dev/simple` |
-| NVIDIA GPU, CUDA 13 | `uv pip install "dewml[cuda13]" --extra-index-url https://pypi.dewml.dev/simple` | `pip install "dewml[cuda13]" --extra-index-url https://pypi.dewml.dev/simple` |
-| NVIDIA GPU, CUDA 12 | `uv pip install "dewml[cuda12]" --extra-index-url https://pypi.dewml.dev/simple` | `pip install "dewml[cuda12]" --extra-index-url https://pypi.dewml.dev/simple` |
+| NVIDIA GPU, driver 580+ (CUDA 13) | `uv pip install "dewml[cuda13]" --extra-index-url https://pypi.dewml.dev/simple` | `pip install "dewml[cuda13]" --extra-index-url https://pypi.dewml.dev/simple` |
+| NVIDIA GPU, driver 525+ (CUDA 12) | `uv pip install "dewml[cuda12]" --extra-index-url https://pypi.dewml.dev/simple` | `pip install "dewml[cuda12]" --extra-index-url https://pypi.dewml.dev/simple` |
 | Google TPU VM | `uv pip install "dewml[tpu]" --extra-index-url https://pypi.dewml.dev/simple` | `pip install "dewml[tpu]" --extra-index-url https://pypi.dewml.dev/simple` |
+<!-- END install commands -->
 
 <!-- BEGIN pip (site/scripts/gen_install.py) -->
 Use pip 26.2.2 or newer and uv 0.13.4 or newer: older ones trust the roots of eMudhra's compromised certificate authorities (October 2026). Update pip from its wheel by hash, so the update holds whatever the older pip trusts, and uv through the system's certificates once they are updated:
@@ -56,7 +58,7 @@ source .venv/bin/activate
 uv pip install dewml --extra-index-url https://pypi.dewml.dev/simple
 ```
 
-To install the current revision of the repository instead of the release, name it: `uv pip install "dewml @ git+https://github.com/AshishKumar4/dew" --extra-index-url https://pypi.dewml.dev/simple`, and pin a commit, `"dewml @ git+https://github.com/AshishKumar4/dew@<commit>"`, to reproduce a run later. Dew installs its JAX build of 0.11.2 and Flax 0.12.10 or a later 0.12 release.
+To install the current revision of the repository instead of the release, name it: `uv pip install "dewml @ git+https://github.com/AshishKumar4/dew" --extra-index-url https://pypi.dewml.dev/simple`, and pin a commit, `"dewml @ git+https://github.com/AshishKumar4/dew@<commit>"`, to reproduce a run later. Dew installs its JAX build and the Flax release pyproject.toml's dependencies allow.
 
 The CPU install is enough for the [Quickstart](getting-started.md).
 
@@ -77,7 +79,7 @@ print("Devices:", jax.devices())
 
 ## GPUs and TPUs
 
-The `cuda13`, `cuda12` and `tpu` extras each install the accelerator build of jaxlib 0.11.2, under Dew's JAX build; they are JAX's own extras of the same names. A later `-U "jax[...]"` would replace it with a release Dew isn't tested on. Extras combine, as in `dewml[cuda13,interop,streaming]`.
+The `cuda13`, `cuda12` and `tpu` extras each install the accelerator build of jaxlib that matches Dew's JAX build; they are JAX's own extras of the same names. A later `-U "jax[...]"` would replace it with a release Dew isn't tested on. Extras combine, as in `dewml[cuda13,interop,streaming]`.
 
 ### Which CUDA build
 
@@ -100,7 +102,7 @@ A run applies it too: on a machine with an NVIDIA GPU, `prepare_process`, or the
 Dew requires `jax>=0.11.2.post11,<0.11.3`.
 <!-- END JAX requirement -->
 
-It is JAX 0.11.2 with fixes no JAX release has yet, built from [AshishKumar4/jax](https://github.com/AshishKumar4/jax) and served by Dew's package index, `https://pypi.dewml.dev/simple`, which serves jax alone. Every other package, jaxlib and its CUDA plugins included, comes from PyPI. The fixes:
+It is the JAX release that requirement names, with fixes no JAX release has yet, built from [AshishKumar4/jax](https://github.com/AshishKumar4/jax) and served by Dew's package index, the one every install above names, which serves jax alone. Every other package, jaxlib and its CUDA plugins included, comes from PyPI. The fixes:
 
 - A computation that spans processes keys the persistent compilation cache alike on every process ([jax-ml/jax#40940](https://github.com/jax-ml/jax/issues/40940), sent as [jax-ml/jax#41776](https://github.com/jax-ml/jax/pull/41776)). The 0.11.2 release keys a compiled step by the topology of the process that compiled it, which on a GPU includes its NVLink links, so in a pool across GPUs linked differently some processes load a step from the cache while the others compile it, and that compile waits forever for every process to join.
 - A Pallas Triton kernel's cache key leaves out its source locations ([jax-ml/jax#41502](https://github.com/jax-ml/jax/issues/41502), sent as [jax-ml/jax#41777](https://github.com/jax-ml/jax/pull/41777)), so two checkouts share one compiled kernel.
@@ -166,11 +168,11 @@ it fails with `operator torchvision::nms does not exist`. Resolving both from th
 CPU index gives them the same build flavor; `--upgrade` also replaces an existing
 torchvision from the wrong index. A package extra cannot select an index.
 
-The `profile` extra installs XProf 2.23.1 or a later release, never 2.23.2. XProf 2.23.2 declares `setuptools<70`, and PyTorch 2.13 and later declare `setuptools>=77.0.3`, so 2.23.2 can't be installed beside the `torch`, `vision`, `diffusers`, `torchax` or `test` extras. Don't upgrade XProf to 2.23.2 by hand in such an environment.
+The `profile` extra installs XProf, never 2.23.2. XProf 2.23.2 declares `setuptools<70`, and PyTorch 2.13 and later declare `setuptools>=77.0.3`, so 2.23.2 can't be installed beside the `torch`, `vision`, `diffusers`, `torchax` or `test` extras. Don't upgrade XProf to 2.23.2 by hand in such an environment.
 
 FlashAttention comes as Dew's own wheel, `dew-flash-attn-cu12` or `dew-flash-attn-cu13` (kernels/flash_attn), for the CUDA major of your jax: FlashAttention-2 for sm8x and sm120, and FlashAttention-3 for Hopper (sm90). The `cuda12` and `cuda13` extras install it on Linux x86_64, the one platform it is built for. With it installed, `"auto"` runs it on the GPUs whose measured kernel it is, for the calls `dew.nn.attention.flash_refusal` admits; a call it turns down on such a GPU is logged once, with why.
 
-tokamax 0.0.15 or later comes with Dew: Dew's Pallas kernels measure their configs through it (`dew.nn.kernels.tuning`). A compile takes the configs measured for its GPU model, else the nearest measured shape's or a heuristic, and measures nothing; `python tools/kernel_picks.py`, or `Trainer(tune_kernels=True)`, measures a model's on a GPU it has to itself. And `"auto"` runs its Pallas-Triton attention on sm80 and later for heads up to 64 wide (`dew.nn.attention.triton_runs`). Earlier releases pin `typeguard==2.13.3`, which tyro excludes, so installing one by hand breaks every recipe's command line.
+tokamax comes with Dew: Dew's Pallas kernels measure their configs through it (`dew.nn.kernels.tuning`). A compile takes the configs measured for its GPU model, else the nearest measured shape's or a heuristic, and measures nothing; `python tools/kernel_picks.py`, or `Trainer(tune_kernels=True)`, measures a model's on a GPU it has to itself. And `"auto"` runs its Pallas-Triton attention on sm80 and later for heads up to 64 wide (`dew.nn.attention.triton_runs`). Earlier releases pin `typeguard==2.13.3`, which tyro excludes, so installing one by hand breaks every recipe's command line.
 
 ## Development install
 
@@ -182,7 +184,7 @@ source .venv/bin/activate
 sh tools/install_environment.sh cpu   # cuda12 or cuda13 on a GPU host
 ```
 
-The `ci` extra is the test suite's environment, every package a test file imports. `tools/lock_environment.sh` locks it in `locks/`, and CI, the GPU nodes and the kernel lab's GPU jobs all install the lock for their host, with the same JAX build CI uses: `constraints.txt` names the patched build of 0.11.2, which the multi-process cache tests need. PyTorch is used only by the reference tests and the image processors; Dew's model computation runs in JAX.
+The `ci` extra is the test suite's environment, every package a test file imports. `tools/lock_environment.sh` locks it in `locks/`, and CI, the GPU nodes and the kernel lab's GPU jobs all install the lock for their host, with the same JAX build CI uses: `constraints.txt` names Dew's JAX build, which the multi-process cache tests need. PyTorch is used only by the reference tests and the image processors; Dew's model computation runs in JAX.
 
 ## Bumping JAX
 
@@ -237,7 +239,7 @@ The `images` preset takes its caption's class names from TFDS's class-label meta
 
 ## Building the documentation
 
-The site at [dewml.dev](https://dewml.dev) is built from `docs/`, the notebooks in `tutorials/` with their recorded outputs, and API pages generated from the docstrings in `src/dew`. It needs Node 22.12 or newer, [pnpm](https://pnpm.io) and uv:
+The site at [dewml.dev](https://dewml.dev) is built from `docs/`, the notebooks in `tutorials/` with their recorded outputs, and API pages generated from the docstrings in `src/dew`. It needs the Node release `engines` names in `site/package.json`, [pnpm](https://pnpm.io) and uv:
 
 ```bash
 cd site

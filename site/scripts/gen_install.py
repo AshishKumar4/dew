@@ -10,10 +10,14 @@ import argparse
 import ast
 import json
 import re
+import sys
 import tomllib
 from pathlib import Path
 
 REPO = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(REPO / "tools" / "armada"))
+from ci import PYTHONS  # the tested Pythons, pyproject.toml's classifiers'
+
 SHELL = ("# BEGIN install facts (site/scripts/gen_install.py)", "# END install facts")
 TABLE = ("<!-- BEGIN CUDA builds (site/scripts/gen_install.py) -->", "<!-- END CUDA builds -->")
 LEAST = ("<!-- BEGIN least Python (site/scripts/gen_install.py) -->", "<!-- END least Python -->")
@@ -21,6 +25,7 @@ CONSTRAINT = ("# BEGIN package index (site/scripts/gen_install.py)", "# END pack
 COLAB = ("// BEGIN package index (site/scripts/gen_install.py)", "// END package index")
 PIP = ("<!-- BEGIN pip (site/scripts/gen_install.py) -->", "<!-- END pip -->")
 JAX = ("<!-- BEGIN JAX requirement (site/scripts/gen_install.py) -->", "<!-- END JAX requirement -->")
+COMMANDS = ("<!-- BEGIN install commands (site/scripts/gen_install.py) -->", "<!-- END install commands -->")
 EXTRAS = ("<!-- BEGIN extras (site/scripts/gen_install.py checks them against pyproject.toml) -->",
           "<!-- END extras -->")
 
@@ -48,6 +53,24 @@ def documented_extras(text: str) -> set[str]:
     the `EXTRAS` markers. The table's descriptions are the page's own; its names are pyproject.toml's."""
     rows = text.split(EXTRAS[0] + "\n")[1].split(EXTRAS[1])[0].splitlines()[2:]
     return {name for row in rows for name in re.findall(r"`([^`]+)`", row.split("|")[1])}
+
+
+def commands(builds: list[tuple[str, int, tuple[int, int]]], index: str) -> list[str]:
+    """The install table: each build's uv and pip command, a CUDA build's row naming its least driver."""
+    rows = [("CPU", "dewml"),
+            *((f"NVIDIA GPU, driver {driver}+ (CUDA {build.removeprefix('cuda')})", f'"dewml[{build}]"')
+              for build, driver, _, _ in builds),
+            ("Google TPU VM", '"dewml[tpu]"')]
+    return ["| Hardware | uv | pip |", "|---|---|---|",
+            *(f"| {hardware} | `uv pip install {package} --extra-index-url {index}` | "
+              f"`pip install {package} --extra-index-url {index}` |" for hardware, package in rows)]
+
+
+def named(text: str, index: str, newest: str) -> str:
+    """`text`, a page, with every install it shows naming Dew's package index, and every environment it makes
+    for Dew (`uv venv --python X` alone on its line) the newest Python CI tests."""
+    text = re.sub(r"--extra-index-url [^\s`'\"]+", f"--extra-index-url {index}", text)
+    return re.sub(r"^uv venv --python [\d.]+$", f"uv venv --python {newest}", text, flags=re.MULTILINE)
 
 
 def between(text: str, markers: tuple[str, str], lines: list[str]) -> str:
@@ -100,7 +123,7 @@ def main() -> None:
     for build, driver, (major, minor), cuda in builds:
         table.append(f"| `{build}` | {cuda // 1000}.{cuda % 1000 // 10} or later | {driver} or later, or an older "
                      f"one under NVIDIA's cuda-compat | {major}.{minor} or later |")
-    least = [f"Dew needs Python {python} or newer."]
+    least = [f"Dew needs Python {python} or newer, and CI tests {' and '.join(PYTHONS)}."]
     advice = [f"Use pip {pip_version} or newer and uv 0.13.4 or newer: older ones trust the roots of "
               "eMudhra's compromised certificate authorities (October 2026). Update pip from its wheel by "
               "hash, so the update holds whatever the older pip trusts, and uv through the system's "
@@ -113,13 +136,16 @@ def main() -> None:
                           ((COLAB, [f"const PACKAGE_INDEX = '{index}';"]),)),
                          (REPO / "site/package.json", ()),
                          (REPO / "docs/installation.md", ((TABLE, table), (LEAST, least), (PIP, advice),
-                                                           (JAX, [f"Dew requires `{jax}`."]))),
-                         (REPO / "README.md", ((LEAST, least), (PIP, advice)))):
+                                                           (JAX, [f"Dew requires `{jax}`."]),
+                                                           (COMMANDS, commands(builds, index)))),
+                         (REPO / "README.md", ((LEAST, least), (PIP, advice), (COMMANDS, commands(builds, index))))):
         original = generated = path.read_text()
         for markers, lines in blocks:
             generated = between(generated, markers, lines)
         if path.name == "package.json":
             generated = indexed(generated, index)
+        if path.suffix == ".md":
+            generated = named(generated, index, PYTHONS[-1])
         if generated != original:
             stale.append(str(path.relative_to(REPO)))
             if not args.check:

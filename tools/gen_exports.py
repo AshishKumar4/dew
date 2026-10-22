@@ -7,43 +7,33 @@ can drift.
 
     python tools/gen_exports.py [--check] [PACKAGE]
 
-The imports are ordered as ruff's isort orders them, and `__all__` as RUF022 does, so the written file is
-the one ruff would leave; `__all__` also names `__version__` where the package assigns it."""
+ruff orders and wraps the imports and `__all__` (I001, RUF022), so the written file is the one the ruff gate
+passes; `__all__` also names `__version__` where the package assigns it."""
 
 import argparse
 import ast
+import subprocess
 import sys
 from pathlib import Path
 
-LINE = 110
-"""pyproject.toml's ruff line-length, which a written import fits or wraps at."""
+REPO = Path(__file__).resolve().parents[1]
 
 
-def member_key(name: str) -> tuple[int, str]:
-    """ruff's isort order of the names one statement imports: constants, then classes, then the rest, each
-    regardless of case."""
-    rank = 0 if name.isupper() and len(name) > 1 else 1 if name[:1].isupper() else 2
-    return rank, name.lower()
-
-
-def all_key(name: str) -> tuple[int, str]:
-    """RUF022's isort-style order of `__all__`: SCREAMING_CASE, then CamelCase, then the rest, each as
-    written."""
-    rank = 0 if name.isupper() and len(name) > 1 else 1 if name[:1].isupper() else 2
-    return rank, name
+def ruffed(text: str, path: Path) -> str:
+    """`text`, the source of `path`, with its imports and `__all__` ordered and wrapped as ruff (the suite's
+    environment's, which the ruff gate runs) orders them under the repository's configuration."""
+    command = [sys.executable, "-m", "ruff", "check", "--fix", "--quiet", "--select", "I001,RUF022",
+               "--config", str(REPO / "pyproject.toml"), "--stdin-filename", str(path), "-"]
+    return subprocess.run(command, input=text, capture_output=True, text=True, check=True).stdout
 
 
 def imports(exports: dict[str, str]) -> list[str]:
-    """The `if TYPE_CHECKING:` block importing each export from its module, one statement a module."""
-    lines = ["if TYPE_CHECKING:  # written from _EXPORTS (tools/gen_exports.py)"]
-    for module in sorted(set(exports.values())):
-        names = sorted((name for name, owner in exports.items() if owner == module), key=member_key)
-        statement = f"    from {module} import {', '.join(names)}"
-        if len(statement) <= LINE:
-            lines.append(statement)
-        else:
-            lines += [f"    from {module} import (", *(f"        {name}," for name in names), "    )"]
-    return lines
+    """The `if TYPE_CHECKING:` block importing each export from its module, one statement a module, in
+    `_EXPORTS`' order; `ruffed` orders and wraps them."""
+    named = {module: [name for name, owner in exports.items() if owner == module]
+             for module in exports.values()}
+    return ["if TYPE_CHECKING:  # written from _EXPORTS (tools/gen_exports.py)",
+            *(f"    from {module} import {', '.join(names)}" for module, names in named.items())]
 
 
 def written(path: Path) -> str:
@@ -53,7 +43,7 @@ def written(path: Path) -> str:
     assigned = {target.id: node for node in tree.body if isinstance(node, ast.Assign)
                 for target in node.targets if isinstance(target, ast.Name)}
     exports = ast.literal_eval(assigned["_EXPORTS"].value)
-    names = sorted([*exports, *(["__version__"] if "__version__" in assigned else [])], key=all_key)
+    names = [*exports, *(["__version__"] if "__version__" in assigned else [])]
     checking = next(node for node in tree.body if isinstance(node, ast.If) and isinstance(node.test, ast.Name)
                     and node.test.id == "TYPE_CHECKING")
     lines = text.splitlines()
@@ -62,7 +52,7 @@ def written(path: Path) -> str:
                      ["__all__ = [", *(f'    "{name}",' for name in names), "]"])], reverse=True)
     for start, end, block in spans:
         lines[start - 1:end] = block
-    return "\n".join(lines) + "\n"
+    return ruffed("\n".join(lines) + "\n", path)
 
 
 def packages(package: Path) -> list[Path]:
@@ -73,8 +63,7 @@ def packages(package: Path) -> list[Path]:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--check", action="store_true", help="Check the written blocks without writing them.")
-    parser.add_argument("package", nargs="?", type=Path,
-                        default=Path(__file__).resolve().parents[1] / "src" / "dew")
+    parser.add_argument("package", nargs="?", type=Path, default=REPO / "src" / "dew")
     args = parser.parse_args()
     stale = []
     for path in packages(args.package):
