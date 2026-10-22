@@ -46,6 +46,19 @@ def test_a_docs_page_carries_its_imports_from_block_to_block(gen_api, documented
         "`MeshSpec.build_mesh`: dew.training.distributed.MeshSpec has no build_mesh"]
 
 
+def test_a_name_a_scope_binds_hides_a_dew_import_in_that_scope_alone(gen_api, documented, tmp_path):
+    """A parameter or a comprehension's target named like an import is the
+    scope's own name, as Python reads it (tools/lint_scopes.py), so its uses
+    there are not Dew's; the import still stands everywhere else."""
+    page = tmp_path / "scoped.md"
+    page.write_text("```python\nfrom dew.training import MeshSpec\n\n"
+                    "def build(MeshSpec):\n    return MeshSpec.anything()\n\n"
+                    "names = [MeshSpec.other for MeshSpec in specs]\n"
+                    "MeshSpec.build_mesh()\n```\n")
+    assert gen_api.unresolved_in("scoped.md", page, *documented) == [
+        "`MeshSpec.build_mesh`: dew.training.distributed.MeshSpec has no build_mesh"]
+
+
 def test_an_instance_of_a_dew_class_is_held_to_its_members_across_cells(gen_api, documented, tmp_path):
     """`name = Class(...)` binds an instance: a later cell's attribute it
     does not have is reported, and so is calling a value it holds as though
