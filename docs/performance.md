@@ -1751,8 +1751,8 @@ rule of `tests/reference_error.py`:
   double the partial products, and their forward cost up to 18% more.
 - Turning YNNPACK's dots off with
   `--xla_cpu_experimental_ynn_fusion_type=-individual_dot` gives every CPU
-  dot Eigen's blocks, and leaves YNNPACK's reduction and layout fusions in
-  place. On two threads, Eigen ran the 176M hybrid DiT's MLP
+  dot, with the ops YNNPACK fused to it, XLA's own code, and leaves its
+  other fusions (reductions, some element-wise ops) in place. On two threads, Eigen ran the 176M hybrid DiT's MLP
   shapes (512 x 768 x 3072) 12% slower. It would also change every CPU
   result, including the live sampler's image.
 
@@ -3371,10 +3371,10 @@ element-wise and layout ops to YNNPACK fusions by default, and YNNPACK picks the
 time by the host's instruction set. Check 1 between them (`tests/test_ssd_kernel.py`) read the
 one-short case's state gradient at 1.598 (99.9% interval 1.581 to 1.617, 640 seeds) on an AMD EPYC
 Zen 4 host (x86-64-v4, AVX-512) and at 0.77 on a Zen 3 one (x86-64-v3, AVX2). With both arms compiled
-without the fusions (`tests/reference_error.py`'s `without_ynn`), the same two arms' pooled ratios
-over 128 draws of each case (`tools/ssd_ynn_probe.py`) had their worst leaf at 1.17 over the nine host
-cases on Zen 4 and at 1.20 for the one-short case on Zen 3, and check 1 passed all nine at their
-declared seeds on Zen 4.
+without the fusions (`tests/reference_error.py`'s `without_ynn`), the same two arms' pooled ratios,
+as `tools/ssd_ynn_probe.py` computes them, had their worst leaf at 1.17 over the nine host cases at
+128 draws each on Zen 4, and at 1.20 for the one-short case at 64 draws on Zen 3; check 1 passed
+all nine at their declared seeds on Zen 4.
 Which fused op moved the verdict was not isolated. Without the fusions XLA still compiles for the
 host's instruction set, so the bits can differ by host though the verdicts did not. On one Intel Core
 i9-12900K (AVX2), jaxlib 0.11.2, the one-short case at seed 0 compiled with `--xla_cpu_max_isa=AVX`
