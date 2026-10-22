@@ -28,21 +28,24 @@ from reference_error import (
 
 
 def test_two_dew_paths_compiled_with_equal_dots_reach_no_dot_fusion():
-    """`equal_dots` compiles a program for the CPU whose dots XLA:CPU keeps to its own code, where it
-    would hand them to a YNNPACK or XNNPACK fusion dispatched by the host's ISA (ledger row 1349),
-    whatever the lane's default backend, and passes a caller's jit options and compiler options
-    through."""
+    """On the CPU lane `equal_dots` compiles a program whose dots XLA:CPU keeps to its own code, where it
+    would hand them to a YNNPACK or XNNPACK fusion dispatched by the host's ISA (ledger row 1349); on
+    an accelerator lane it is `jax.jit`. Either way a caller's jit options and compiler options pass
+    through, and the result transforms as a jitted function does."""
     from reference_error import equal_dots
 
-    cpu = jax.devices("cpu")[0]
-    left, right = (jax.device_put(np.ones(shape, np.float32), cpu) for shape in ((16, 48), (48, 4)))
-    with jax.default_device(cpu):
-        for options in ({}, {"compiler_options": None},
-                        {"compiler_options": {"xla_cpu_enable_fast_math": False}}):
-            text = equal_dots(jnp.dot, **options).lower(left, right).compile().as_text()
+    left, right = np.ones((16, 48), np.float32), np.ones((48, 4), np.float32)
+    for options in ({}, {"compiler_options": None},
+                    {"compiler_options": {"xla_cpu_enable_fast_math": False}}):
+        text = equal_dots(jnp.dot, **options).lower(left, right).compile().as_text()
+        if jax.default_backend() == "cpu":
             assert "ynn_fusion" not in text and "xnn_fusion" not in text, options
-        # A static argument shapes the output, as only a static one can.
-        np.testing.assert_array_equal(equal_dots(lambda n: jnp.arange(n), static_argnums=0)(3), [0, 1, 2])
+        else:
+            assert text == jax.jit(jnp.dot, **options).lower(left, right).compile().as_text(), options
+    # A static argument shapes the output, as only a static one can.
+    np.testing.assert_array_equal(equal_dots(lambda n: jnp.arange(n), static_argnums=0)(3), [0, 1, 2])
+    batched = jax.vmap(equal_dots(jnp.dot))(np.stack([left, left]), np.stack([right, right]))
+    np.testing.assert_array_equal(batched, np.full((2, 16, 4), 48, np.float32))
 
 
 def test_a_small_row_beside_large_ones_is_held_to_its_own_size():
