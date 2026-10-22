@@ -108,7 +108,7 @@ dew tpu copy dew-16 /tmp/dew-first-recipe/tokens '~/dew-tokens' \
 ```bash
 dew tpu train dew-16 --zone us-central2-b --job byte-demo --dry-run -- \
     recipes/lm/train.py \
-    --set data.source.url=/home/you/dew-tokens/train --set data.lm.seq_len=16 --set data.lm.batch=32 \
+    --set data.source.url=/home/you/dew-tokens/train --set data.token_windows.seq_len=16 --set data.token_windows.batch=32 \
     --model.emb-features 16 --model.num-layers 1 --model.num-heads 2 --model.mlp-features 32 \
     --trainer.steps 2 --trainer.log-every 1 --trainer.checkpoint-every 2 \
     --trainer.checkpoint-dir /home/you/dew-checkpoints \

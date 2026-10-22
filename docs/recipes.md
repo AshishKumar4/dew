@@ -56,7 +56,7 @@ Each store's producer manifest records the tokenizer, vocabulary, dtype, row cou
 python "$DEW_REPO/recipes/lm/train.py" --help
 ```
 
-The recipe's data is a chain, which it records with the run. Its settings change with `--set`: `--set data.source.url=tokens/train --set data.lm.seq_len=16 --set data.lm.batch=8` trains on the store above. A run that also validates on a store of its own names both chains in a small run file, which `dew train` reads ([Python experiments](#python-experiments)):
+The recipe's data is a chain, which it records with the run. Its settings change with `--set`: `--set data.source.url=tokens/train --set data.token_windows.seq_len=16 --set data.token_windows.batch=8` trains on the store above. A run that also validates on a store of its own names both chains in a small run file, which `dew train` reads ([Python experiments](#python-experiments)):
 
 <!-- not run: the file `dew train byte_demo.py` reads -->
 ```python
@@ -110,7 +110,7 @@ Every recipe's configuration extends `RunConfig` with five parts:
 | --- | --- | --- |
 | `model` (`ModelConfig`) | The model's class and its constructor fields, compute dtype and attention kernel among them. | `--model causal_transformer --model.num-layers 12` |
 | `objective` (`ObjectiveConfig`) | The objective's class and the constructor arguments the run states. | `--objective lm --objective.ema-decay 0.999` |
-| `data`, `validation` | Chains: a source, its steps and a preset, recorded with the run. | `--set data.lm.seq_len=16` |
+| `data`, `validation` | Chains: a source, its steps and a preset, recorded with the run. | `--set data.token_windows.seq_len=16` |
 | `optim` (`OptimConfig`) | Optimizer, learning rate, schedule, weight decay, clipping, optimizer-state dtype. | `--optim.learning-rate 0.0001` |
 | `trainer` (`TrainerConfig`) | Run length, checkpoint and logging intervals, mesh and layout, tracking. | `--trainer.steps 1000` |
 
@@ -124,7 +124,7 @@ A dotted flag sets a field inside a configuration object, and `--set path=value`
 | `--optim.learning-rate` | `2.7e-4` | The constant rate when no schedule is named. |
 | `--optim.state-dtype` | `float32` | `bfloat16` stores Adam's moments stochastically rounded, for `adam` and `adamw` only. |
 | `--trainer.steps` / `--trainer.epochs` | | Run length; set one, not both. |
-| `--set data.<preset>.batch` | `32` | Global batch across all JAX processes, the preset's (`data.lm.batch`, `data.images.batch`). |
+| `--set data.<preset>.batch` | `32` | Global batch across all JAX processes, the preset's (`data.token_windows.batch`, `data.images.batch`). |
 | `--trainer.eval-every`, `--trainer.checkpoint-every` | `epoch` | A step interval, `epoch`, or `None`. |
 | `--trainer.checkpoint-dir`, `--trainer.name` | `./checkpoints`, none | The run's directory is `<checkpoint-dir>/<name>`. |
 | `--trainer.multi-host` | `None` | Join the JAX process pool: `None` asks and continues alone when no cluster is configured, `True` requires the pool, `False` never asks. |
@@ -144,7 +144,7 @@ With `trainer.wandb` unset, the recipe prints to the terminal and keeps a local 
 
 To train on your own text, export records with the tokenizer the run will use. The producer manifest carries the vocabulary, dtype and length index, so the model does not guess them. The recipe's chain reads the committed store and cuts fixed-width windows.
 
-For whole documents, preserve their boundaries when exporting, or append EOS with the producer's `--eos` flag, and pack them: `--set data.lm.pack=first-fit`. The byte tokenizer's EOS is ID 255, which never occurs in UTF-8 text. Packing resets attention boundaries and positions between documents.
+For whole documents, preserve their boundaries when exporting, or append EOS with the producer's `--eos` flag, and pack them in a run file, which packs in the store's order and orders the packed rows after: `TokenFiles(url).pipe(presets.lm, None, seq_len=256, batch=None, pack="first-fit").shuffle(0).repeat().batch(32)`. The byte tokenizer's EOS is ID 255, which never occurs in UTF-8 text. Packing resets attention boundaries and positions between documents.
 
 `--pretrained` takes a supported Hugging Face model directory, a Hub ID, or `repo@revision` for a branch, tag or commit. A Hub ID can start a download, which may need authentication and a license agreement. `run.json` records a Hub source as `repo@commit`, with the commit it resolved to. To run offline, prepare a local checkpoint and its tokenizer, tokenize the data with that tokenizer, and pass matching `--tokenizer` and `--pretrained` values. The checkpoint decides the architecture, so of its fields `--model.max-seq-len` alone may be set. With any other field, the recipe refuses to load the checkpoint. [Language models](concepts/language_models.md) covers loading and export.
 

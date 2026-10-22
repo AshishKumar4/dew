@@ -516,7 +516,7 @@ Optimizer updates: 1
 
 ```bash
 python recipes/lm/train.py --set data.source.url=data/diffusion-token-windows \
-    --set data.lm.seq_len=511 --objective block_diffusion --objective.prompt-length 256 \
+    --set data.token_windows.seq_len=511 --objective block_diffusion --objective.prompt-length 256 \
     --pretrained google/diffusiongemma-26B-A4B-it \
     --tokenizer google/diffusiongemma-26B-A4B-it \
     --max-new-tokens 0 --optim.learning-rate 0.00015
