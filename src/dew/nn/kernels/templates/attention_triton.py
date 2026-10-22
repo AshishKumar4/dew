@@ -12,6 +12,7 @@ and the call's queries and keys pad to whole blocks, which their spans leave unr
 
 import dataclasses
 import functools
+import os
 from collections.abc import Callable, Sequence
 
 import jax
@@ -67,6 +68,11 @@ first."""
 
 BLOCK = max(max(tiles.block_q for tiles in SPACE), max(tiles.block_k for tiles in SPACE))
 """The largest tile of `SPACE`, the block a call pads to (`padded_call`)."""
+
+
+PROBE = os.environ.get("DEW_TF_PROBE", "")
+"""A measurement branch's switch: '' as the head, 'nogather' without the old anchor's row, 'noargmax'
+without the anchor's tracking, 'plainres' the plain walk writing its sums as residuals."""
 
 
 def _dot(a: jax.Array, b: jax.Array, interpret: bool) -> jax.Array:
@@ -226,7 +232,7 @@ def _forward_kernel(*refs, spec: algebra.Forward, score_kinds: tuple[Kind, ...],
         # (`algebra.split_accumulate`); its state's values are `B`, every key's but the anchor's.
         state, arg, own, others_total = carry
         tile, coords, logits, m, alpha, weights, denominator = softmax(index, state)
-        anchor = algebra.argmax(arg, logits, coords.k_pos)
+        anchor = arg if PROBE == "noargmax" else algebra.argmax(arg, logits, coords.k_pos)
         moved = anchor.peak > arg.peak
         value = value_ref[tile, :]
         others, own_tile = algebra.anchor_split(spec, algebra.narrow(weights, value.dtype),
@@ -234,7 +240,9 @@ def _forward_kernel(*refs, spec: algebra.Forward, score_kinds: tuple[Kind, ...],
         product = _dot(others, value, interpret)
         # The old anchor's value row, read only where the anchor moved: after a row's first tiles it
         # rarely does, and a masked load fetches nothing for the rest.
-        old_value = _masked_rows(value_ref, arg.key, moved, interpret)
+        skipped = PROBE in ("nogather", "noargmax")
+        old_value = (jnp.zeros((arg.key.shape[0], value_ref.shape[-1]), value_ref.dtype) if skipped
+                     else _masked_rows(value_ref, arg.key, moved, interpret))
         acc, own, others_total = algebra.split_accumulate(state.acc, own, others_total, alpha, moved,
                                                           old_value, product, others, own_tile)
         return algebra.Partial(acc, m, denominator), anchor, own, others_total
@@ -243,7 +251,13 @@ def _forward_kernel(*refs, spec: algebra.Forward, score_kinds: tuple[Kind, ...],
              else algebra.empty(block_q, value_ref.shape[-1]))
     output_params = tuple(_tile_param(ref, kind, head, q_pos, None)
                           for ref, kind in zip(output_refs, output_kinds, strict=True))
-    if residuals:
+    if residuals and PROBE == "plainres":
+        state = jax.lax.fori_loop(lo, hi, step, start)
+        residual_refs[2][...] = jnp.zeros((block_q,), jnp.int32)
+        residual_refs[3][...] = state.acc
+        residual_refs[4][...] = jnp.zeros((block_q,), jnp.float32)
+        residual_refs[5][...] = jnp.zeros((block_q,), jnp.float32)
+    elif residuals:
         nothing = jnp.zeros((block_q,), jnp.float32)
         carry = start, algebra.no_argmax(block_q), nothing, nothing
         split, arg, own, others_total = jax.lax.fori_loop(lo, hi, tracked, carry)
