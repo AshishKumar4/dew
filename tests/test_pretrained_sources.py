@@ -147,3 +147,59 @@ np.testing.assert_array_equal(actual,expected)
         timeout=90,
     )
     assert result.returncode == 0, result.stderr[-4000:]
+
+
+def test_a_source_is_routed_on_its_config_alone_as_the_loader_reads_it():
+    """`source_route` is the loader's decision before any weight downloads, which a census of configs
+    reads too: a registered family's config is its decoder, translated; a media wrapper's is the
+    wrapper; DiffusionGemma's its own; an unregistered model_type goes to the verifier given; a
+    storage format the codecs cannot decode and a family's refusal are refused on the config, as the
+    loader refuses them."""
+    from dew.interop.pretrained import source_route
+
+    route = source_route(fixture_config("llama-tiny"))
+    assert route.kind == "decoder" and route.record is not None
+    assert route.record == hf_decoders.translate_config(fixture_config("llama-tiny"))
+    assert source_route(fixture_config("gemma3-tiny-mm")).kind == "wrapper"
+    assert source_route(fixture_config("diffusion-gemma-sft")).kind == "diffusion_gemma"
+    asked = []
+
+    def verifier(unregistered):
+        asked.append(unregistered["model_type"])
+        raise ValueError("no registered family's convention computes it")
+
+    llama = fixture_config("llama-tiny")
+    with pytest.raises(ValueError):
+        source_route({**llama, "model_type": "an_unregistered_decoder"}, verified=verifier)
+    assert asked == ["an_unregistered_decoder"]
+    with pytest.raises(ValueError):
+        source_route({**llama, "quantization_config": {"quant_method": "mlx", "bits": 4, "group_size": 64,
+                                                        "mode": "affine"}})
+    with pytest.raises(ValueError):
+        # A storage format is refused before the verifier is asked about an unregistered type.
+        source_route({"model_type": "an_unregistered_decoder", "quantization": {"bits": 4, "group_size": 64}},
+                     verified=verifier)
+    assert asked == ["an_unregistered_decoder"]
+    with pytest.raises(ValueError):
+        source_route({**fixture_config("llama-tiny"), "hidden_act": "a_nonexistent_activation"})
+
+
+def test_the_hub_census_routes_a_config_as_the_loader_does():
+    """tools/hf_coverage.py classifies a config by the loader's own route (`source_route`): a storage
+    format the codecs refuse is refused before transformers is asked about the type, as is one a
+    codec's own reader refuses (GPTQ at three bits); a type transformers has no class for, asked
+    only after those, is remote code; a registered family's config is tier 1."""
+    from tool_support import load
+
+    census = load("hf_coverage")
+
+    def verifier(config):
+        raise census.NoReference(config["model_type"])
+
+    for quantization in ({"quantization": {"bits": 4, "group_size": 64}},
+                         {"quantization_config": {"quant_method": "gptq", "bits": 3}}):
+        assert census._route({"model_type": "a_custom_decoder", **quantization}, verifier)[0] == "refused"
+    llama = fixture_config("llama-tiny")
+    assert census._route({**llama, "model_type": "a_custom_decoder"}, verifier)[0] == "remote code"
+    assert census._route(llama, verifier)[0] == "tier 1"
+

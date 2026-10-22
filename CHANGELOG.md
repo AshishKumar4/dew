@@ -36,6 +36,42 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   shards, so hosts that each export the same rows read one store. A data
   position saved over a committed export before is refused as its source
   changed, and a cache or generation over one fills again.
+- A holdout written before a published generation picks the inputs it picks
+  without the cache: the generation stands in for the inputs each part keeps,
+  by hash (by a field the cached step drops too) or by records, over missing
+  rows and steps that drop or expand them. A records holdout over a
+  generation a stream filled is served where the store states that its stream
+  reads its records in index order (in-memory, token, TFDS, PyTorch, Grain
+  and Arrow datasets, generations), and refused otherwise: publish those from
+  a memory read, or an indexed one (`provision=True`). A step that reads its
+  record's index there is refused, naming `Cache(url)`. A holdout part is named by
+  what it selects of its source's identity, so selections stacked on one
+  another stay apart; a data position saved over a holdout part before is
+  refused as its source changed, and a generation published from one no
+  longer stands in for it, where a `Cache(url)` over it fills again.
+- A mixture reads its corpora by Grain's weighted selection and counts its
+  epoch by it: until every corpus has come round once where the order reads
+  on past the mix, and at its first corpus's end where a mix of corpora read
+  once ends. Corpora that recur across phases continue where that selection
+  left each, which reads other records after a phase switch for weights whose
+  scaling Grain truncates (1, 10 and 15), so a data position saved by an
+  earlier Dew is refused (data plan version 5).
+- `dew.data` and `dew.data.sources` export `from_torch`, `from_grain`,
+  `from_hf` and `from_iter`, not the `Torch`, `Grain`, `HF` and `Iterated`
+  classes they make, which a recorded chain still names by their modules. A
+  Hugging Face stream saves its position through the iterator bridge every
+  resumable iterator does, and a data position saved over one before is
+  refused.
+- A storage profile whose base is this host's disk (`file` or `local`) is
+  that disk: an export commits to it, and ArrayRecord shards, offset indexes
+  and Arrow files read there by their own readers.
+- A text file is indexed by its lines' bytes, so a line that is not UTF-8 is
+  refused when it is read, not when the file is provisioned.
+- A packing plan a generation publishes is named by the digest a plan held
+  in memory is (`dew.data.plan.fingerprint`). A generation published before
+  keeps the name it stored, and a data position saved over it resumes; one
+  published again from the same documents is named anew, and a position saved
+  over the one before refuses it as its order changed.
 
 ## 0.1.0
 
