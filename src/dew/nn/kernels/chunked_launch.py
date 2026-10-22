@@ -255,6 +255,19 @@ def _row(g_ref, index):
     return g_ref[index].astype(jnp.float32)
 
 
+def _apart(rows, rows_lo, columns, columns_lo):
+    """A compensated prefix's difference between positions, `rows - columns` `[R, C]` from each side's
+    `(hi, lo)` halves (`recurrence.cumulated(compensated=True)`): the his' difference and the los', so
+    the exponent is as precise as its own range."""
+    return (rows[:, None] - columns[None, :]) + (rows_lo[:, None] - columns_lo[None, :])
+
+
+def _halves(g):
+    """A cumulated decay as its `(hi, lo)` halves: a compensated prefix as it is, a plain one with a zero
+    `lo`, whose differences are then the plain ones bit for bit."""
+    return g if isinstance(g, tuple) else (g, jnp.zeros_like(g))
+
+
 def write_rows(view, count, value):
     """`value` into `view`'s rows below `count`, none past them."""
     from jax.experimental.pallas import triton as plgpu

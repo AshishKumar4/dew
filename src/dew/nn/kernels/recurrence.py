@@ -23,6 +23,7 @@ from typing import Any, ClassVar
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from jax.experimental import pallas as pl
 
 from dew.nn.precision import compensated_add
@@ -657,13 +658,57 @@ def step(hooks: Hooks, operands: Step, *, dtype=None):
     return out, history[0] if history else None, state
 
 
-def _cumsum_kernel(chunk_ref, s_ref, o_ref, *, chunk: int, aligned: bool, scale: float | None, reverse: bool):
+def _split(value):
+    """Veltkamp's split of fp32 `value` into halves of 12 significant bits each, whose products are
+    exact in fp32."""
+    spread = value * 4097.0
+    high = spread - (spread - value)
+    return high, value - high
+
+
+def _scaled(token, scale: float | None):
+    """`token * scale` as a `(hi, lo)` pair to fp32's precision squared: `scale` (a Python float, to
+    double precision) split into its fp32 rounding and remainder, the product with the rounding
+    error-free (Dekker's two-product, its halves' products exact), the remainder's product added to the
+    error. Without a scale, the token itself."""
+    if scale is None:
+        return token, jnp.zeros_like(token)
+    scale_hi = float(np.float32(scale))
+    scale_lo = float(np.float32(scale - scale_hi))
+    spread = float(np.float32(scale_hi * 4097.0))
+    scale_high = float(np.float32(spread - float(np.float32(spread - scale_hi))))
+    scale_low = float(np.float32(scale_hi - scale_high))
+    product = token * scale_hi
+    token_high, token_low = _split(token)
+    error = (((token_high * scale_high - product) + token_high * scale_low) + token_low * scale_high
+             + token_low * scale_low)
+    return product, error + token * scale_lo
+
+
+def _cumsum_kernel(chunk_ref, s_ref, o_ref, *refs, chunk: int, aligned: bool, scale: float | None,
+                   reverse: bool):
     """fla's `chunk_local_cumsum_scalar_kernel` (fla/ops/utils/cumsum.py:33-73) for one chunk of one
     head, of each column of a gate per key dimension (fla's vector kernel, :90-133) too: forward, fla's
-    inclusive cumulative sum over its tokens in fp32, then `scale`. `reverse`, the decay's gradient,
-    sums from the end compensated, each running sum a `(hi, lo)` pair (`compensated_add`) taken token
-    by token and stored rounded once."""
+    inclusive cumulative sum over its tokens in fp32, then `scale`; with a second output (`refs`), each
+    token scaled exactly (`_scaled`) and summed compensated token by token, its `(hi, lo)` pair
+    (`compensated_add`) stored whole, so a difference of two positions is as precise as its own range.
+    `reverse`, the decay's gradient, sums from the end compensated and stores each running sum rounded
+    once."""
     start, count = chunked_launch._chunk_of(chunk_ref, chunk, aligned)
+    if refs:
+        (lo_ref,) = refs
+
+        def ahead(i, total):
+            row = start + i
+            token = chunked_launch._rows(s_ref, row, 1)[...].astype(jnp.float32)
+            total = compensated_add(total, _scaled(token, scale))
+            chunked_launch._rows(o_ref, row, 1)[...] = total[0]
+            chunked_launch._rows(lo_ref, row, 1)[...] = total[1]
+            return total
+
+        zero = jnp.zeros((1, *s_ref.shape[1:]), jnp.float32)
+        jax.lax.fori_loop(0, count, ahead, (zero, zero))
+        return
     if not reverse:
         @pl.when(count > 0)
         def _():
@@ -692,13 +737,13 @@ class ChunkLocalCumsum(chunked_launch._Launch):
 
     NAME = "cumulated"
     KEYS, VALUES = None, None
-    revision: int = 2
+    revision: int = 3
     SPACES = chunked_launch._spaces(chunked_launch._tiles([(0, 0)], (1, 2, 4, 8), (1,)))
     PICKS = chunked_launch._picks(chunked_launch.Tiles(0, 0, 2, 1))
 
     def _fwd(self, g: jax.Array, chunk_spans: jax.Array, sequence_spans: jax.Array, *, chunk: int,
              scale: float | None, reverse: bool, interpret: bool, config: chunked_launch.Tiles,
-             return_residuals: bool = False):
+             compensated: bool = False, return_residuals: bool = False):
         from jax.experimental.pallas import triton as plgpu
 
         spans = chunked_launch.Sequences(chunk_spans, sequence_spans)
@@ -709,29 +754,39 @@ class ChunkLocalCumsum(chunked_launch._Launch):
         blocks = [min(64, width) for width in columns]
         tiles = [width // block for width, block in zip(columns, blocks, strict=True)]
         spec = pl.BlockSpec((batch * length, None, *blocks), lambda i_t, h, *i_k: (0, h, *i_k))
+        shape = jax.ShapeDtypeStruct((batch * length, heads, *columns), jnp.float32)
         out = pl.pallas_call(
             functools.partial(_cumsum_kernel, chunk=chunk, aligned=aligned, scale=scale, reverse=reverse),
             grid=(spans.chunks.shape[0], heads, *tiles),
-            in_specs=[chunked_launch._CHUNK, spec], out_specs=spec,
-            out_shape=jax.ShapeDtypeStruct((batch * length, heads, *columns), jnp.float32),
+            in_specs=[chunked_launch._CHUNK, spec], out_specs=[spec] * (1 + compensated),
+            out_shape=[shape] * (1 + compensated),
             compiler_params=plgpu.CompilerParams(num_warps=warps, num_stages=stages),
             interpret=interpret, name="recurrence_cumulated",
         )(spans.chunks, *chunked_launch._flat(g))
-        return out.reshape(g.shape), None
+        if compensated:
+            return tuple(part.reshape(g.shape) for part in out), None
+        return out[0].reshape(g.shape), None
 
 
 _CHUNK_LOCAL_CUMSUM = ChunkLocalCumsum()
 
 
 def cumulated(g, *, chunk: int = 64, scale: float | None = None, reverse: bool = False,
-              spans: chunked_launch.Sequences | None = None, interpret: bool = False):
+              spans: chunked_launch.Sequences | None = None, interpret: bool = False,
+              compensated: bool = False):
     """The chunked recurrences' first stage, their decay's prefix: `g` `[B, T, H]`, or `[B, T, H, K]`
     per key dimension, cumulated within each chunk of `chunk` tokens of each sequence (`spans`, the
     rows where None), fp32: fla's `chunk_local_cumsum`
     (cumsum.py:262-341), `scale` RCP_LN2 for the forward's base-2 decay, `reverse` for its gradient.
     Forward is fla's plain prefix, whose difference between two positions every kernel takes as a
-    range's exponent; `reverse` the sums from the end, each rounded once. fla autotunes only
-    `num_warps` over 1, 2, 4 and 8 here."""
+    range's exponent; `reverse` the sums from the end, each rounded once. `compensated` (forward)
+    returns the prefix as a `(hi, lo)` pair (`compensated_add`), each token scaled exactly (`_scaled`,
+    `scale` to double precision), whose difference between two positions, `(hi_s - hi_t) + (lo_s -
+    lo_t)`, is as precise as the range itself where the plain prefix's carries the chunk's whole
+    magnitude's rounding (ledger row 1328). fla autotunes only `num_warps` over 1, 2, 4 and 8 here."""
+    if compensated and reverse:
+        raise ValueError("the compensated prefix is the forward's")
     batch, length = g.shape[:2]
     spans = chunked_launch.sequences(batch, length, chunk=chunk) if spans is None else spans
-    return _CHUNK_LOCAL_CUMSUM(g, *spans, chunk=chunk, scale=scale, reverse=reverse, interpret=interpret)
+    return _CHUNK_LOCAL_CUMSUM(g, *spans, chunk=chunk, scale=scale, reverse=reverse, interpret=interpret,
+                               compensated=compensated)
