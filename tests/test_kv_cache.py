@@ -256,6 +256,45 @@ def test_a_pool_split_into_groups_reads_what_each_row_wrote():
     np.testing.assert_array_equal(grouped(prompts, 40, key=0).tokens, dense(prompts, 40, key=0).tokens)
 
 
+class Writer(nn.Module):
+    """One attention module's paged store of `capacity` slots a row: write keys and values at the
+    given slots, the rectangular append, or one token a row at its slot, the mixed call's, then read
+    every row back."""
+
+    layout: KVCache
+    capacity: int
+
+    @nn.compact
+    def __call__(self, key, value, positions, mixed=False):
+        rows, _, heads, width = key.shape
+        store = KVStore.open(self, self.layout, rows, self.capacity, heads, width, jnp.float32)
+        if self.has_variable("cache", "written"):
+            if mixed:
+                store.write_tokens(key[:, 0], value[:, 0], jnp.arange(rows), positions[:, 0])
+            else:
+                store.write(key, value, positions)
+        self.variable("cache", "written", lambda: True)
+        return store.read()
+
+
+@pytest.mark.parametrize("mixed", [False, True], ids=["rectangular", "mixed"])
+def test_a_paged_write_past_its_rows_pages_drops_and_leaves_their_slots(mixed):
+    """A slot past a row's last page drops, as a dense cache's past its capacity does (`overflowed`),
+    in the rectangular append and the mixed call alike: every slot the row held reads back as written,
+    where a page index clamped to the row's last page once overwrote that page's first slot."""
+    layout, capacity = KVCache(page_size=8), 16
+    writer = Writer(layout, capacity)
+    keys = jax.random.normal(jax.random.key(0), (2, capacity, 2, 8))
+    full = jnp.broadcast_to(jnp.arange(capacity), (2, capacity))
+    cache = writer.init(jax.random.key(0), keys, keys, full)["cache"]
+    held, mutated = writer.apply({"cache": cache}, keys, keys, full, mutable=["cache"])
+    past = jnp.full((2, 1), capacity, jnp.int32)
+    later = jax.random.normal(jax.random.key(1), (2, 1, 2, 8))
+    read, _ = writer.apply(mutated, later, later, past, mixed, mutable=["cache"])
+    for after, before in zip(read, held, strict=True):
+        np.testing.assert_array_equal(after, before)
+
+
 def test_a_cursor_past_capacity_marks_the_row_whose_appends_overflowed():
     """Two rows decoded through a cache of 16: a prompt of 12 real tokens then 6 single steps
     asks the first row's cache for 18 slots, the second's 5 real tokens and the same steps 11. The

@@ -384,13 +384,14 @@ class KVStore:
                size: int, groups: int) -> jax.Array:
         """The paged `pool` `[heads, pages, page_size, ...]` with each token's `values` `[..., heads,
         ...]` at its row's slot: `rows` and `positions` index the tokens alike, `[rows, tokens]` for a
-        rectangular append or `[tokens]` for a mixed one. A slot at -1, or a row past the table's,
-        drops. The tokens split into `groups` along their first axis, each group scattered into its
-        part of the pool; `size` is the layout's page size."""
+        rectangular append or `[tokens]` for a mixed one. A slot at -1, past the row's pages
+        (`overflowed`), or a row past the table's, drops. The tokens split into `groups` along their
+        first axis, each group scattered into its part of the pool; `size` is the layout's page size."""
         table = self._get(TABLE)
-        inside = (positions >= 0) & (rows < table.shape[0])
         safe = jnp.maximum(positions, 0)
-        page = jnp.where(inside, table[jnp.where(inside, rows, 0), safe // size], DROPPED)
+        inside = (positions >= 0) & (rows < table.shape[0]) & (safe // size < table.shape[1])
+        column = jnp.where(inside, safe // size, 0)
+        page = jnp.where(inside, table[jnp.where(inside, rows, 0), column], DROPPED)
         heads = positions.ndim
 
         def stored(pool: jax.Array, page: jax.Array, offset: jax.Array, incoming: jax.Array) -> jax.Array:
