@@ -8,7 +8,7 @@ stages at each (`staged_bytes`), and the seconds it estimates at each on a targe
 it to (`tuning.tune`); without a measurement the launch takes its heuristic, the same on every run.
 """
 
-from collections.abc import Hashable, Sequence
+from collections.abc import Callable, Hashable, Sequence
 from typing import ClassVar
 
 import tokamax
@@ -64,6 +64,16 @@ class Template[Config: Hashable](tuning.KernelOp):
                                                      default=None), budget, target.generation)
         return fits
 
+    def unpinnable(self, ba: tokamax.BoundArguments, config: Hashable) -> str:
+        """Why `config` is not among `ba`'s legal configs: outside `space`, or staging more shared
+        memory than a block of the GPU holds."""
+        held = [candidate for candidate in self.space(ba) if candidate == config]
+        if not held:
+            return "not in its space at this launch's key"
+        target = generation.gpu_target()
+        return (f"its programs stage {self.staged_bytes(ba, held[0])} bytes of shared memory, past the "
+                f"{generation.shared_budget(target)} a block of {target.generation} holds")
+
     def estimate(self, ba: tokamax.BoundArguments, target: generation.GpuTarget) -> tuple[float, Config]:
         """The seconds `cost` estimates at the launch's fastest fitting config on `target`, and that
         config, the first of `space`'s order where several tie."""
@@ -77,6 +87,14 @@ class Template[Config: Hashable](tuning.KernelOp):
 
     def _get_heuristics_config(self, ba: tokamax.BoundArguments) -> Config:
         return self.estimate(ba, generation.gpu_target())[1]
+
+
+def dividing[C](configs: Sequence[C], extents: tuple[int, ...],
+                blocks: Callable[[C], tuple[int, ...]]) -> tuple[C, ...]:
+    """The configs of `configs` whose blocks (`blocks(config)`) divide the launch's `extents`, place by
+    place, in `configs`' order: a launch's space at its padded shapes."""
+    return tuple(config for config in configs
+                 if all(extent % block == 0 for extent, block in zip(extents, blocks(config), strict=True)))
 
 
 class Unfitted(ValueError):

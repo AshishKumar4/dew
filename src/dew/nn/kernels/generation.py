@@ -41,9 +41,10 @@ def assumed(generation: str | None) -> Iterator[None]:
 
 
 CHOICES = frozenset({'attention', 'attention_narrow', 'attention_packed', 'attention_sinks',
-                     'attention_window', 'decode', 'delta_decode', 'delta_gates', 'gate_up',
-                     'gated_delta_rule', 'grouped_matmul', 'local_attention', 'mla', 'narrow_copies',
-                     'paged_decode', 'rms_norm', 'short_conv', 'ssd', 'ssd_decode', 'swiglu'})
+                     'attention_window', 'decode', 'delta_decode', 'delta_gates', 'gate_up', 'gemm_epilogue',
+                     'gemm_prologue', 'gated_delta_rule', 'grouped_matmul', 'local_attention', 'mla',
+                     'narrow_copies', 'paged_decode', 'rms_norm', 'short_conv', 'ssd', 'ssd_decode',
+                     'swiglu'})
 """The choices `measured_kernel` answers, and so the ones `chosen` may name and a dispatch reports
 (`route`). A choice no generation's row names runs its site's own best kernel."""
 
@@ -96,7 +97,8 @@ class GpuTarget:
     canonical device's boost clock and device-memory bytes per second, and
     `tensor_rates` the generation's dense tensor-core FLOPs per clock per
     multiprocessor by arithmetic mode ('16bit': fp16 or bf16 operands summed in
-    fp32; 'tf32'), which a kernel's cost model reads
+    fp32; 'tf32'; 'fp32': IEEE fp32 on the CUDA cores, the rate a dot at
+    Precision.HIGHEST takes), which a kernel's cost model reads
     (`dew.nn.kernels.templates.cost`). This table is the one place a choice is
     keyed on the hardware generation; any other code reads its facts, a library's
     support rule the compute capability (`capability`), and a launch config the
@@ -151,11 +153,12 @@ class GpuTarget:
         """Dense tensor-core FLOPs per clock per multiprocessor in arithmetic `mode`, or None where
         the generation states none: the generation's, lowered where the SKU's catalogued dense bf16 peak
         is below what its multiprocessors and clock give at that rate, as a GeForce part's half-rate
-        fp32 accumulation reads. A part reporting fewer multiprocessors than its catalogue counts (a
-        MIG slice) keeps the generation's rate: the catalogue never raises it."""
+        fp32 accumulation reads; IEEE fp32 on the CUDA cores keeps its rate. A part reporting fewer
+        multiprocessors than its catalogue counts (a MIG slice) keeps the generation's rate: the
+        catalogue never raises it."""
         rate = self.tensor_rates.get(mode)
         peak = self.bf16_peak
-        if rate is None or not (peak and self.multiprocessors and self.clock_hz):
+        if rate is None or mode == 'fp32' or not (peak and self.multiprocessors and self.clock_hz):
             return rate
         return rate * min(1.0, peak / (self.tensor_rates['16bit'] * self.multiprocessors * self.clock_hz))
 
@@ -181,7 +184,10 @@ class GpuTarget:
 # boost clock: A100 312 TF bf16 -> 2048, TF32 156 -> 1024; A10 125/62.5 -> 1024/512; L4 121/60 ->
 # 1024/512; H100 SXM 989/495 -> 4096/2048; RTX PRO 6000 Blackwell Server 500/250 -> 1024/512.
 # GeForce parts of sm86 and sm89 sum 16-bit products in fp32 at half that rate (the GA102 and Ada
-# whitepapers); their generation's row states the data-center rate.
+# whitepapers); their generation's row states the data-center rate. IEEE fp32 runs an FMA a CUDA-core
+# lane a clock: 64 lanes an SM on GA100 -> 128 (A100 19.5 TF over 108 SMs x 1410 MHz), 128 on GA10x,
+# AD10x, GH100 and GB20x -> 256 (A10 31.2 TF over 72 x 1695 MHz, L4 30.3 TF over 58 x 2040 MHz; the
+# GH100 and Blackwell whitepapers' 128 fp32 lanes an SM).
 # Global-memory load latency in clocks, a pointer chase's (Luo et al., "Benchmarking and Dissecting the
 # Nvidia Hopper GPU Architecture", IPDPS 2024, arXiv 2402.13499, Table IV): A100 466.3, H800 478.8,
 # RTX 4090 541.5; sm86 and the Blackwell generations are unmeasured there.
@@ -209,8 +215,11 @@ class GpuTarget:
 # by 0.7 to 18%, 0.56 ms against 0.47 at 16 rows of 8192); Qwen3.5-0.8B's 8/2 heads of 256,
 # which cuDNN does not take on sm80, the decode kernel at 1.04x the fastest in geometric mean.
 TARGETS = {target.generation: target for target in (
+    # T4: 40 SMs at a 1590 MHz boost, 320 GB/s; 65 TF fp16 summed in fp32 and 8.1 TF fp32 (the T4
+    # datasheet) -> 1024 and 128 an SM a clock.
     GpuTarget('sm75', 'Tesla T4', 64 * 1024, dense_peaks={'Tesla T4': {}, 'NVIDIA Tesla T4': {}},
-              aliases=('gpu:t4', 't4'), multiprocessors=40),
+              aliases=('gpu:t4', 't4'), multiprocessors=40, clock_hz=1590e6, memory_bandwidth=320e9,
+              tensor_rates={'16bit': 1024, 'fp32': 128}),
     GpuTarget('sm80', 'NVIDIA A100-SXM4-80GB', 163 * 1024,
               {'attention': 'flash', 'attention_narrow': 'flash', 'attention_window': 'flash',
                'attention_sinks': 'flash',
@@ -219,17 +228,18 @@ TARGETS = {target.generation: target for target in (
                'gated_delta_rule': 'fla', 'ssd': 'pallas'},
               {'NVIDIA A100': {'bf16': 312e12}}, ('gpu:a100', 'a100'), head_tile=(4096, 8192),
               multiprocessors=108, clock_hz=1410e6, memory_bandwidth=2039e9,
-              tensor_rates={'16bit': 2048, 'tf32': 1024}, load_latency=466.3),
+              tensor_rates={'16bit': 2048, 'tf32': 1024, 'fp32': 128}, load_latency=466.3),
     GpuTarget('sm86', 'NVIDIA A10', 99 * 1024, {'attention_narrow': 'flash'},
               {'NVIDIA A10': {}, 'NVIDIA GeForce RTX 3090': {'bf16': 71e12}}, multiprocessors=72,
-              clock_hz=1695e6, memory_bandwidth=600e9, tensor_rates={'16bit': 1024, 'tf32': 512}),
+              clock_hz=1695e6, memory_bandwidth=600e9,
+              tensor_rates={'16bit': 1024, 'tf32': 512, 'fp32': 256}),
     GpuTarget('sm89', 'NVIDIA L4', 99 * 1024,
               {'attention': 'flash', 'attention_window': 'flash', 'attention_sinks': 'flash',
                'xla_triton_gemm': 'off', 'gated_delta_rule': 'fla'},
               {'NVIDIA L4': {'bf16': 121e12, 'fp8': 242.5e12},
                'NVIDIA GeForce RTX 4080': {'bf16': 97.5e12}}, ('gpu:l4', 'l4'), head_tile=(4096, 8192),
               multiprocessors=58, clock_hz=2040e6, memory_bandwidth=300e9,
-              tensor_rates={'16bit': 1024, 'tf32': 512}, load_latency=541.5),
+              tensor_rates={'16bit': 1024, 'tf32': 512, 'fp32': 256}, load_latency=541.5),
     GpuTarget('sm90', 'NVIDIA H100 80GB HBM3', 227 * 1024,
               {'attention': 'flash', 'attention_narrow': 'flash', 'attention_window': 'flash',
                'attention_sinks': 'flash', 'attention_packed': 'flash', 'xla_triton_gemm': 'off',
@@ -240,8 +250,8 @@ TARGETS = {target.generation: target for target in (
         'NVIDIA H100 NVL': {'bf16': 835e12, 'fp8': 1670.5e12},
         'NVIDIA H200': {'bf16': 989e12, 'fp8': 1979e12},
         'NVIDIA H200 NVL': {'bf16': 835e12, 'fp8': 1670.5e12}}, wgmma=True, multiprocessors=132,
-              clock_hz=1830e6, memory_bandwidth=3350e9, tensor_rates={'16bit': 4096, 'tf32': 2048},
-              load_latency=478.8),
+              clock_hz=1830e6, memory_bandwidth=3350e9,
+              tensor_rates={'16bit': 4096, 'tf32': 2048, 'fp32': 256}, load_latency=478.8),
     # Datasheet facts alone, no routes: what a compile-only sm100 device needs (`tests/kernel_compile.py`),
     # its peaks the scoreboard's MFU; a B200 run states its own clock and bandwidth (`runtime_facts`).
     GpuTarget('sm100', 'NVIDIA B200', 227 * 1024,
@@ -251,12 +261,17 @@ TARGETS = {target.generation: target for target in (
               {'attention': 'flash', 'gated_delta_rule': 'fla'},
               dense_peaks={'NVIDIA RTX PRO 6000 Blackwell': {'bf16': 500e12, 'fp8': 1000e12}},
               aliases=('gpu:g4', 'g4'), multiprocessors=188, clock_hz=2617e6, memory_bandwidth=1792e9,
-              tensor_rates={'16bit': 1024, 'tf32': 512}),
+              tensor_rates={'16bit': 1024, 'tf32': 512, 'fp32': 256}),
     GpuTarget('v2', 'TPU v2', dense_peaks={'TPU v2': {'bf16': 22.5e12}}),
     GpuTarget('v3', 'TPU v3', dense_peaks={'TPU v3': {'bf16': 61.5e12}}),
     GpuTarget('v4', 'TPU v4', dense_peaks={'TPU v4': {'bf16': 275e12}}),
-    # Its scoped VMEM limit read from a Mosaic kernel's refusal on a v5e ("limit 16.00M").
-    GpuTarget('v5e', 'TPU v5 lite', dense_peaks={'TPU v5 lite': {'bf16': 197e12}}, scoped_vmem=16 * 2 ** 20),
+    # Its scoped VMEM limit read from a Mosaic kernel's refusal on a v5e ("limit 16.00M"). One
+    # TensorCore a chip, of four 128 x 128 MXUs, each 16K multiply-adds a cycle, and 800 GiB/s of HBM
+    # (cloud.google.com/tpu/docs/v5e, /tpu/docs/system-architecture-tpu-vm); the clock is 197e12 / 131072,
+    # derived from the peak, no stated clock.
+    GpuTarget('v5e', 'TPU v5 lite', dense_peaks={'TPU v5 lite': {'bf16': 197e12}}, scoped_vmem=16 * 2 ** 20,
+              multiprocessors=1, clock_hz=197e12 / 131072, memory_bandwidth=800 * 2 ** 30,
+              tensor_rates={'16bit': 131072}),
     GpuTarget('v5p', 'TPU v5', dense_peaks={'TPU v5': {'bf16': 459e12}, 'TPU v5p': {'bf16': 459e12}}),
     GpuTarget('v6e', 'TPU v6 lite', dense_peaks={'TPU v6 lite': {'bf16': 918e12}}),
 )}
@@ -394,10 +409,15 @@ launches run on (sm86, sm89 and sm120 hold 99 KiB), so a launch sized by it fits
 
 
 def effective(target: GpuTarget) -> GpuTarget:
-    """The target whose facts a launch on `target` is sized and costed by: its own on a GPU, and the
-    A100's on a target that is no GPU (a CPU, which interprets the kernels as an A100's block), so the
-    interpreted tests run the tiles an A100 takes."""
-    return target if capability(target.generation) is not None else TARGETS['sm80']
+    """The target whose facts a launch on `target` is sized and costed by: its own on a GPU or a TPU,
+    and the A100's on a target that is neither (a CPU, which interprets the GPU kernels as an A100's
+    block), so the interpreted tests run the tiles an A100 takes."""
+    return target if capability(target.generation) is not None or tpu(target) else TARGETS['sm80']
+
+
+def tpu(target: GpuTarget) -> bool:
+    """Whether `target` is a TPU's: its device kind names one ('TPU v5 lite')."""
+    return target.device_kind.startswith('TPU ')
 
 
 def shared_budget(target: GpuTarget) -> int:
@@ -691,7 +711,7 @@ def backend() -> str:
         return placed_platform()
     if generation.startswith('sm'):
         return 'gpu'
-    if generation in TARGETS and TARGETS[generation].device_kind.startswith('TPU '):
+    if generation in TARGETS and tpu(TARGETS[generation]):
         return 'tpu'
     return generation
 
