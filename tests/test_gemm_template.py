@@ -697,6 +697,60 @@ def test_a_dense_bank_reads_its_layer_as_the_plain_product():
     assert _kernels(taken) == {'triton'}
 
 
+@pytest.mark.parametrize("generation_name",
+                         [pytest.param(name, marks=lowers(name)) for name in ("sm80", "sm90")])
+def test_an_indexed_bank_lowers_without_slicing_its_layer(generation_name):
+    """For an A100 (Triton) and an H100 (Mosaic GPU) the product reads the bank's layer in place: the
+    lowered program slices no layer out of the bank before its kernels, as a scanned layer stack's would
+    every step."""
+    x, bank, b, _ = _banked(0)
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), generation_name)
+
+    def product(x, bank, b, layer):
+        return template.gemm(x, bank, jnp.asarray(SIZES), rhs_index=layer, epilogue=biased,
+                             epilogue_operands=((b, ('columns',)),), out_dtype=jnp.bfloat16)
+
+    on = (generation.assumed(generation_name), jax.sharding.use_abstract_mesh(mesh))
+    with on[0], on[1], generation.routes() as taken:
+        lowered = jax.jit(product).trace(x, bank, b, jnp.int32(LAYER)).lower(lowering_platforms=("cuda",))
+        text = lowered.as_text()
+    assert "dynamic_slice" not in text and _kernels(taken) - {'xla'}
+
+
+@pytest.mark.parametrize("producer", [rms_norm, dew_rms_norm, relu], ids=lambda producer: producer.__name__)
+def test_a_fused_producers_gradients_are_its_own(producer):
+    """Every input's gradient through a producer fused into the prologue is the unfused program's: the
+    operand's cotangent goes back through the producer's own VJP, so a norm's two paths from its input
+    join where the producer joins them and a custom derivative (ReLU's at zero) stays its own; Dew's
+    checkpointed norm fuses too (the route says so)."""
+    sizes = jnp.asarray(SIZES)
+
+    def draw(seed):
+        x, w, _, nw, *_ = _draw(seed)
+        x = x.at[:4].set(0)  # a ReLU's zero, where its custom derivative differs from max(x, 0)'s
+        return x, w, nw
+
+    def loss(gemm, transform=lambda value: value):
+        def value(x, w, weight):
+            return jnp.sum(gemm(producer(x, weight), w).astype(jnp.float32))
+        return jax.grad(transform(value), argnums=(0, 1, 2))
+
+    def fused_gemm(operand, w):
+        return fused.fusible_gemm(operand, w, sizes, interpret_on_cpu=True)
+
+    def plain_gemm(operand, w):
+        return template.gemm(operand, w, sizes, out_dtype=jnp.float32)
+
+    def truth_gemm(operand, w):
+        matrix = w.astype(jnp.bfloat16).astype(operand.dtype)
+        return jax.lax.ragged_dot(operand, matrix, sizes, preferred_element_type=operand.dtype)
+
+    with generation.assumed("sm80"), generation.routes() as taken:
+        assert_as_exact(jax.jit(loss(fused_gemm, fuser.fuse)), jax.jit(loss(plain_gemm)), draw,
+                        f"{producer.__name__} gradients", seeds=SEEDS, truth_fn=loss(truth_gemm))
+    assert {route.kernel for route in taken if route.choice == 'gemm_prologue'} == {'fused'}
+
+
 @pytest.mark.parametrize("launch", [grouped_matmul.Gmm(), grouped_matmul.MosaicGmm()],
                          ids=lambda launch: type(launch).__name__)
 def test_an_indexed_launch_prices_the_layer_it_reads(launch):
