@@ -84,10 +84,9 @@ def empty(rows: int, width: int) -> Partial:
 
 
 def resumed(spec: Forward, m: jax.Array, total: jax.Array, acc: jax.Array) -> Partial:
-    """The softmax resumed from a state `(m, total, acc)` (`Hooks.initial`: sinks, a resumed partial),
-    its maximum taken to base 2 where the step's logits are."""
-    m, total, acc = (array.astype(jnp.float32) for array in (m, total, acc))
+    """The softmax resumed from a state `(m, total, acc)` (`Hooks.initial`: sinks, a resumed partial)."""
     del spec
+    m, total, acc = (array.astype(jnp.float32) for array in (m, total, acc))
     return Partial(acc, m, total)
 
 
