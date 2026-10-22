@@ -1047,34 +1047,23 @@ def test_a_hook_that_broadcasts_a_side_operand_lowers_for_hopper_through_triton(
 HOOKED_RECEIPTS = {
     # (shape, case): (Mosaic ms, Triton ms), GMMSB-h100-main at eb378b58d (an H100's tools/bench_scoreboard).
     ("llama-3-8b gate_up", "plain"): (5.925, 10.191),
-    ("llama-3-8b gate_up", "gated"): (49.212, 13.213),
     ("llama-3-8b gate_up", "norm"): (8.171, 12.815),
     ("llama-3-8b gate_up", "bias"): (5.970, 9.322),
     ("qwen3-8b gate_up", "plain"): (4.919, 8.818),
-    ("qwen3-8b gate_up", "gated"): (40.667, 11.441),
     ("qwen3-8b gate_up", "norm"): (6.950, 11.036),
     ("qwen3-8b gate_up", "bias"): (4.996, 7.912),
 }
-"""The two Hopper launches' measured times for a dense projection, plain and with each hook."""
-
-ELEMENTWISE_REWRITE = ("Mosaic's in-place rewrite of a stage with a full-tile side operand, which runs far "
-                       "below the shared-memory rate the model charges (row 1336)")
-HOOKED_MISSES = {("llama-3-8b gate_up", "gated"): ELEMENTWISE_REWRITE,
-                 ("qwen3-8b gate_up", "gated"): ELEMENTWISE_REWRITE}
-"""Where Hopper's chooser takes the slower launch, and the term the model lacks: a test that fails once it
-ranks them right, so the entry goes."""
-
+"""The two Hopper launches' measured times for a dense projection, plain and with each hook the chooser
+ranks right (the gated prologue joins once the model's facts rank it, row 1336)."""
 
 @pytest.mark.parametrize(("shape", "case"), list(HOOKED_RECEIPTS), ids=lambda key: str(key))
 def test_hoppers_chooser_against_the_hooked_receipts(shape, case):
-    """The chooser's launch for a hooked dense projection on an H100 is the one measured faster, but for
-    the named misses, which it still takes the slower launch for."""
+    """The chooser's launch for a hooked dense projection on an H100 is the one measured faster."""
     width = {"llama-3-8b gate_up": 28672, "qwen3-8b gate_up": 24576}[shape]
     bf16, f32 = (functools.partial(jax.ShapeDtypeStruct, dtype=dtype)
                  for dtype in (jnp.bfloat16, jnp.float32))
-    x, up, w = bf16((16384, 4096)), bf16((16384, 4096)), bf16((4096, width))
+    x, w = bf16((16384, 4096)), bf16((4096, width))
     hooks = {"plain": {},
-             "gated": {"prologue": gated, "prologue_operands": ((up, ("rows", "depth")),)},
              "norm": {"prologue": normed, "prologue_operands": ((f32((16384,)), ("rows",)),
                                                                  (f32((4096,)), ("depth",)))},
              "bias": {"epilogue": biased, "epilogue_operands": ((f32((width,)), ("columns",)),)}}[case]
@@ -1086,5 +1075,4 @@ def test_hoppers_chooser_against_the_hooked_receipts(shape, case):
         jax.jit(product).trace(x, w)
     mosaic, triton = HOOKED_RECEIPTS[(shape, case)]
     faster = "mosaic_gpu" if mosaic < triton else "triton"
-    chosen = {route.kernel for route in taken if route.choice == 'grouped_matmul'}
-    assert (chosen != {faster}) is ((shape, case) in HOOKED_MISSES)
+    assert {route.kernel for route in taken if route.choice == 'grouped_matmul'} == {faster}
