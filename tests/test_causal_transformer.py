@@ -527,7 +527,7 @@ def test_a_hybrid_stack_decodes_as_it_scores_in_parallel(rng):
 
     incremental = decode_logits(model, params, ids[:, :4], ids[:, 4:])
     assert jnp.array_equal(full[:, 3:].argmax(-1), incremental.argmax(-1))
-    decoded_against_full(model, 4, "hybrid decode", SEEDS['hybrid decode'])
+    decoded_against_full(model, 4, "hybrid decode", SEEDS['hybrid decode'], batch=16)
 
     _, mutated = model.apply({**params, "cache": cache}, ids[:, :4], decode=True, mutable=["cache"])
     kept, _ = model.apply({**params, "cache": mutated["cache"]}, ids[:, 4:5], decode=True, mutable=["cache"])
@@ -584,9 +584,10 @@ def test_sandwich_norms_normalize_what_the_residual_adds(rng):
     contribution scale-free: an eight times larger o_proj and down_proj (a
     power of two, which rounds nothing) leave the logits on par with the plain
     weights' over drawn weights and tokens (check 1), the same logits in real
-    arithmetic, and without the norms they move them."""
+    arithmetic where the norms add no epsilon, and without the norms they move
+    them."""
     ids = tokens(rng)
-    model = tiny(sandwich_norms=True)
+    model = tiny(sandwich_norms=True, norm_eps=0.0)
     params = model.init(rng, ids)
     amplified = ('o_proj', 'down_proj')
 
