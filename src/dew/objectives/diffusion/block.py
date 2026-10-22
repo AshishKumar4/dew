@@ -279,32 +279,32 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         return self.model.init(key, jnp.zeros((1, self.canvas_size), jnp.int32))
 
     def loss(self, variables: Variables, batch: Batch, step: Step):
-        stats, _ = self._scored(variables, batch, step.key, train=step.training)
+        stats, _ = self._scored(variables, batch, step, train=step.training)
         return stats, Aux(metrics={"canvas_ce": stats.canvas.mean()[0],
                                   "encoder_ce": stats.encoder.mean()[0]})
 
-    def _evaluation_scores(self, params: Variables, batch: Batch, key: jax.Array) -> TokenScores:
+    def _evaluation_scores(self, params: Variables, batch: Batch, step: Step) -> TokenScores:
         """Return the denoiser's cross entropy on every canvas target of the batch.
 
-        One noise level and one canvas per row are drawn from the pass's key,
-        as in training, with dropout off. So `perplexity` over a validation
+        One noise level and one canvas per row are drawn by each example, as
+        in training (`Step.sample`), with dropout off. So `perplexity` over a validation
         pass is the exponential of the denoising loss per target."""
-        _, scores = self._scored(params, batch, key, train=False)
+        _, scores = self._scored(params, batch, step, train=False)
         assert scores is not None
         return scores
 
     def _validation_scores(self, params: Variables, batch: Batch, step: Step
                            ) -> tuple[BlockSFTStatistics, TokenScores]:
-        stats, scores = self._scored(params, batch, step.key, train=False)
+        stats, scores = self._scored(params, batch, step, train=False)
         assert scores is not None
         return stats, scores
 
-    def _scored(self, params: Variables, batch: Batch, key: jax.Array, *, train: bool
+    def _scored(self, params: Variables, batch: Batch, step: Step, *, train: bool
                 ) -> tuple[BlockSFTStatistics, TokenScores | None]:
         """The SFT statistics and, out of training, the canvas targets'
         scores, from one scoring of the batch."""
         canvas_losses, target_mask, encoder_losses, encoder_target_mask, correct = self._token_losses(
-            params, batch, key, train=train)
+            params, batch, step, train=train)
         support = (
             self.decoder_loss_weight * self.row_mean(target_mask, batch).total
             + self.encoder_loss_weight * self.row_mean(encoder_target_mask, batch).total
@@ -357,24 +357,30 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
             response = jnp.where(text_slots[:, self.prompt_length:], response, 0)
         return prepared, tokens, response, validity, full_valid, canvas_mask, text_slots
 
-    def _corrupted(self, response: jax.Array, canvas_mask: jax.Array, key: jax.Array):
-        """Draw one noise level and corrupt the response at it.
+    def _corrupted(self, response: jax.Array, canvas_mask: jax.Array, step: Step):
+        """Draw a noise level for each row and corrupt the response at it, each row's draws its
+        example's own (`Step.sample`).
 
-        Returns the corrupted tokens, the canvas each row scores, and the
-        key the self-conditioning draw still needs.
+        Returns the corrupted tokens, the canvas each row scores, and whether
+        each row conditions on its first pass.
         """
-        time_key, corruption_key, canvas_key, sc_key = jax.random.split(key, 4)
-        time = jax.random.uniform(time_key, (response.shape[0], 1),
-                                  minval=self.safety_epsilon, maxval=1 - self.safety_epsilon)
-        keep_key, noise_key = jax.random.split(corruption_key)
-        keep = jax.random.bernoulli(keep_key, jnp.broadcast_to(1 - time, response.shape), mode="high")
-        noise = jax.random.randint(noise_key, response.shape, 0, self.model.vocab_size)
-        noisy = jnp.where(keep, response, noise)
-        eligible = canvas_mask.reshape(response.shape[0], self.num_canvases, self.canvas_size).any(axis=-1)
+        rows, length = response.shape
+        low, high = self.safety_epsilon, 1 - self.safety_epsilon
+        time = step.sample("times", lambda key: jax.random.uniform(key, (1,), jnp.float32, low, high),
+                           rows=rows)
+        keep = step.sample("kept", jax.random.uniform, (length,), dtype=jnp.float32, rows=rows) < 1 - time
+        vocab = self.model.vocab_size
+        noise = step.sample("noise", lambda key: jax.random.randint(key, (length,), 0, vocab, jnp.int32),
+                            rows=rows)
+        noisy = step.boundary("noised input", jnp.where(keep, response, noise))
+        eligible = canvas_mask.reshape(rows, self.num_canvases, self.canvas_size).any(axis=-1)
         valid_canvases = eligible.sum(axis=-1)
-        rank = jax.random.randint(canvas_key, valid_canvases.shape, 0, jnp.maximum(valid_canvases, 1))
+        rank = (step.sample("canvas uniform", jax.random.uniform, (), dtype=jnp.float32, rows=rows)
+                * jnp.maximum(valid_canvases, 1)).astype(jnp.int32)
         selected = jnp.argmax(jnp.cumsum(eligible, axis=-1) > rank[:, None], axis=-1)
-        return noisy, selected, sc_key
+        use_sc = step.sample("self conditioning uniform", jax.random.uniform, (), dtype=jnp.float32,
+                             rows=rows) < self.self_cond_prob
+        return noisy, step.boundary("canvas", selected), step.boundary("self conditioning", use_sc)
 
     def _encoder_targets(self, batch: Batch, tokens: jax.Array, validity, full_valid: jax.Array,
                          text_slots) -> tuple[jax.Array, jax.Array]:
@@ -401,7 +407,7 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
             )
         return jnp.where(encoder_target_mask != 0, shifted, 0), encoder_target_mask
 
-    def _token_losses(self, params: Variables, batch: Batch, key: jax.Array, *, train: bool
+    def _token_losses(self, params: Variables, batch: Batch, step: Step, *, train: bool
                       ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array, jax.Array | None]:
         """Score both SFT passes over one batch.
 
@@ -411,13 +417,13 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         """
         params = thaw(params)
         prepared, tokens, response, validity, full_valid, canvas_mask, text_slots = self._row(batch)
-        noisy, selected, sc_key = self._corrupted(response, canvas_mask, key)
+        noisy, selected, use_sc = self._corrupted(response, canvas_mask, step)
         fields = prepared.token_fields
         positions, encoder_mask, encoder_keys, decoder_mask, decoder_keys = _cache_geometry(
             full_valid, selected, self.prompt_length, self.canvas_size,
             fields.get("positions"), fields.get("image_groups"))
         model = self.training_model
-        rngs = model_rngs(key, training=train)
+        rngs = model_rngs(step.key, training=train)
         cache = model.apply(params, tokens.shape[0], method=model.init_cache, mutable=["cache"])[1]["cache"]
         encoder_kwargs = prepared.kwargs()
         encoder_kwargs.update(positions=positions, attention_mask=full_valid)
@@ -441,7 +447,6 @@ class BlockDiffusionObjective(Objective[BlockSFTStatistics]):
         # before the head and nothing of that pass is kept for the backward.
         first = jax.lax.stop_gradient(constrain(model_logits(
             model, params, jax.lax.stop_gradient(denoise(zero_logits))), LOGITS))
-        use_sc = jax.random.uniform(sc_key, (tokens.shape[0],)) < self.self_cond_prob
         sc_logits = jnp.where(use_sc[:, None, None], first, zero_logits)
         states = denoise(sc_logits)
         chosen = jnp.arange(response.shape[1])[None, :] // self.canvas_size == selected[:, None]

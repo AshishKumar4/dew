@@ -12,11 +12,22 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from delta_rule_support import NAMES, fla_decay_terms, fla_side, float64_truth, recurrence, rule_math, through
+from delta_rule_support import (
+    NAMES,
+    fla_decay_terms,
+    fla_side,
+    float64_truth,
+    math as portable,
+    recurrence,
+    rule_math,
+    through,
+)
 from jax.core import ShapedArray
 from reference_error import (
+    assert_as_exact,
     assert_as_exact_as_the_reference,
-    assert_leaves_as_exact,
+    assert_computes_the_oracle,
+    chain_roundings,
     equations,
     float64_terms,
     widened,
@@ -24,9 +35,11 @@ from reference_error import (
 from sharded import assert_runs_per_shard, boundary_copies
 from tuned import each_config
 
-from dew.nn import kernels, linear
-from dew.nn.kernels import fla_gdn, fla_kda, generation, tuning
-from dew.nn.linear import GatedDeltaNet, fla_rule, l2norm
+from dew.nn.kda import KimiDeltaAttention
+from dew.nn.kernels import chunked_launch, fla_gdn, fla_kda, generation, recurrence_chunk, tuning
+from dew.nn.kernels.recurrence import ChunkLocalCumsum, cumulated
+from dew.nn.kernels.recurrence_chunk import fla_rule
+from dew.nn.linear import GatedDeltaNet, l2norm
 from dew.training._lowering import triton_calls
 
 pytestmark = pytest.mark.kernel
@@ -59,7 +72,7 @@ def tiled(kernel, call, *operands) -> list:
 
 def cumulated_decay(key, batch, length, value_heads, width=None):
     """A base-2 decay cumulated within each 64-token chunk, per head `[B, T, HV]` or per key dimension
-    `[B, T, HV, K]` (fla's gk), as the kernels take it: fp32 (`fla_gdn.chunk_local_cumsum`), from a
+    `[B, T, HV, K]` (fla's gk), as the kernels take it: fp32 (`cumulated`), from a
     float64 sum."""
     shape = (batch, length, value_heads) + (() if width is None else (width,))
     step = np.asarray(-jnp.exp(jax.random.normal(key, shape) - 3.0) * fla_gdn.RCP_LN2, np.float64)
@@ -79,9 +92,9 @@ def output_operands(batch, length, key_heads, value_heads, width, columns, dtype
 
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32])
 @pytest.mark.parametrize("shape, tiles", [
-    ((2, 128, 2, 2, 64, 64), fla_gdn.Tiles(64, 64, 4, 3)),
-    ((1, 128, 2, 4, 128, 128), fla_gdn.Tiles(128, 128, 8, 3)),
-    ((1, 64, 1, 2, 128, 128), fla_gdn.Tiles(32, 32, 2, 3)),
+    ((2, 128, 2, 2, 64, 64), chunked_launch.Tiles(64, 64, 4, 3)),
+    ((1, 128, 2, 4, 128, 128), chunked_launch.Tiles(128, 128, 8, 3)),
+    ((1, 64, 1, 2, 128, 128), chunked_launch.Tiles(32, 32, 2, 3)),
 ])
 def test_the_output_kernel_computes_flas_expression(dtype, shape, tiles):
     """fla's chunk_fwd_o per chunk and head, grouped value heads included, at each of fla's block
@@ -90,7 +103,7 @@ def test_the_output_kernel_computes_flas_expression(dtype, shape, tiles):
     q, k, v, h, g = output_operands(*shape, dtype)
     scale = shape[4] ** -0.5
     launch = fla_gdn.ChunkFwdO(config=tiles)
-    got = launch(q, k, v, support.entered_states(h), g, *fla_gdn.sequences(*shape[:2]), scale=scale,
+    got = launch(q, k, v, support.entered_states(h), g, *chunked_launch.sequences(*shape[:2]), scale=scale,
                  chunk=64, interpret=INTERPRETED)
     want = support.reference_o(q, k, v, h, g, scale=scale)
     assert got.shape == want.shape and got.dtype == want.dtype
@@ -106,7 +119,7 @@ def test_the_cumsum_kernel_is_flas_chunk_local_cumsum(reverse, columns):
     after the sum, and the gradient's from the end compensated (`compensated_add`), rounded once."""
     g = -jnp.exp(jax.random.normal(jax.random.key(3), (2, 192, 3, *columns)) - 3.0)
     tokens = np.asarray(g, np.float64).reshape(2, 3, 64, 3, *columns)
-    kernel = functools.partial(fla_gdn.chunk_local_cumsum, scale=fla_gdn.RCP_LN2, reverse=reverse,
+    kernel = functools.partial(cumulated, scale=fla_gdn.RCP_LN2, reverse=reverse,
                                interpret=INTERPRETED)
     if reverse:
         want = np.cumsum(tokens[:, :, ::-1] * fla_gdn.RCP_LN2, axis=2)[:, :, ::-1].reshape(g.shape)
@@ -115,7 +128,7 @@ def test_the_cumsum_kernel_is_flas_chunk_local_cumsum(reverse, columns):
         want = (np.cumsum(tokens, axis=2) * fla_gdn.RCP_LN2).reshape(g.shape)
         # fla's prefix rounds once a token: up to 64 roundings of the running sum.
         bound = 64 * np.finfo(np.float32).eps
-    for got in tiled(fla_gdn.ChunkLocalCumsum, kernel, g):
+    for got in tiled(ChunkLocalCumsum, kernel, g):
         assert got.dtype == jnp.float32
         assert relative(got, want) < bound
 
@@ -173,7 +186,7 @@ def test_the_h_kernel_is_flas_recurrence(dtype, shape, per_key):
     g = cumulated_decay(keys[3], batch, length, value_heads, width if per_key else None)
     h0 = 0.1 * jax.random.normal(keys[4], (batch, value_heads, width, columns))
     h, corrected, final = support.reference_h(k, w, u, g, h0)
-    # The port stores each memory at its slot (`fla_gdn.Sequences`).
+    # The port stores each memory at its slot (`chunked_launch.Sequences`).
     want = support.entered_states(h), corrected, final
     kernel = functools.partial(fla_gdn.chunk_fwd_h, interpret=INTERPRETED)
     for got in tiled(fla_gdn.ChunkFwdH, kernel, k, w, u, g, h0):
@@ -200,7 +213,7 @@ def test_the_dhu_kernel_is_flas_reverse_recurrence(dtype, shape, per_key):
     dv = jax.random.normal(keys[6], (batch, length, value_heads, columns)).astype(dtype)
     scale = width ** -0.5
     dh, dh0, dv2 = support.reference_dhu(q, k, w, g, dht, do, dv, scale=scale)
-    # The port stores each memory's gradient at its slot (`fla_gdn.Sequences`).
+    # The port stores each memory's gradient at its slot (`chunked_launch.Sequences`).
     want = support.left_grads(dh), dh0, dv2
     kernel = functools.partial(fla_gdn.chunk_bwd_dhu, scale=scale, interpret=INTERPRETED)
     for got in tiled(fla_gdn.ChunkBwdDhu, kernel, q, k, w, g, dht, do, dv):
@@ -333,7 +346,7 @@ def test_the_wy_backward_gives_the_same_gradients_on_every_call_at_qwen35_08b_sh
     k = l2norm(jax.random.normal(keys[0], (batch, length, heads, width))).astype(jnp.bfloat16)
     v = jax.random.normal(keys[1], (batch, length, heads, width)).astype(jnp.bfloat16)
     beta = jax.nn.sigmoid(jax.random.normal(keys[2], (batch, length, heads))).astype(jnp.bfloat16)
-    g = fla_gdn.chunk_local_cumsum(-jnp.exp(jax.random.normal(keys[3], (batch, length, heads)) - 3.0),
+    g = cumulated(-jnp.exp(jax.random.normal(keys[3], (batch, length, heads)) - 3.0),
                                    scale=fla_gdn.RCP_LN2)
     a = fla_gdn.kkt_solve(k, g, beta)
     dw, du, dk = (jax.random.normal(key, k.shape).astype(jnp.bfloat16) for key in keys[4:])
@@ -453,7 +466,7 @@ def test_a_range_late_in_a_long_decayed_chunk_is_as_exact_as_fla(per_key):
     theirs = fla_side((*inputs, do, dht), None, jnp.float32)
 
     def math(q, k, v, g, beta, h0):
-        return linear.chunk_delta_rule(q, k, v, g if per_key else g[..., None], beta, h0)
+        return recurrence_chunk.chunk_delta_rule(q, k, v, g if per_key else g[..., None], beta, h0)
 
     with jax.enable_x64(new_val=True):
         operands = widened((*inputs, do, dht))
@@ -588,7 +601,7 @@ def test_inside_a_shard_map_that_checks_varying_axes_the_rule_runs_the_portable_
     beta = jax.nn.sigmoid(jax.random.normal(keys[4], (2, 64, 2)))
     do = jax.random.normal(keys[5], v.shape)
     rows = PartitionSpec("data")
-    mapped = jax.shard_map(lambda *operands: linear.chunk_gated_delta_rule(*operands)[0],
+    mapped = jax.shard_map(lambda *operands: recurrence_chunk.chunk_gated_delta_rule(*operands)[0],
                            mesh=Mesh(np.asarray(jax.devices()[:2]), ("data",)), in_specs=(rows,) * 5,
                            out_specs=rows, check_vma=True)
 
@@ -616,7 +629,6 @@ def test_a_cached_continuation_whose_history_varies_in_a_checked_map_runs_the_po
     from jax.sharding import Mesh, PartitionSpec
 
     from dew.nn.inputs import MixerCall
-    from dew.nn.kda import KimiDeltaAttention
 
     layer = (GatedDeltaNet(emb_features=64, num_k_heads=1, num_v_heads=2, head_k_dim=64, head_v_dim=64)
              if kind == "gated delta net" else
@@ -692,42 +704,121 @@ def test_dews_fla_rule_takes_wide_keys_up_to_fla_s_256_in_bf16(width):
     assert relative(out, want_out) < 2e-2 and relative(final, want_final) < 2e-2
 
 
+ROUTES = {
+    # label: the queries', keys' and values' dtypes, the key width, the values' heads and width, the
+    # mode, whether the GPU's row names the port, and whether the rule takes the port there.
+    "mixed dtypes": ((jnp.bfloat16, jnp.float32, jnp.bfloat16), 64, (2, 64), "reverse", True, True),
+    "bf16 keys 256 wide": ((jnp.bfloat16,) * 3, 256, (2, 64), "reverse", True, True),
+    "forward mode": ((jnp.bfloat16,) * 3, 64, (2, 64), "forward", True, False),
+    "fp32 keys 256 wide": ((jnp.float32,) * 3, 256, (2, 64), "reverse", True, False),
+    "bf16 keys 512 wide": ((jnp.bfloat16,) * 3, 512, (2, 64), "reverse", True, False),
+    "a row naming XLA": ((jnp.bfloat16,) * 3, 64, (2, 64), "reverse", False, False),
+}
+
+
+def routed_operands(dtypes, width, heads, seed=0):
+    """A rule's operands over 128 tokens, one key head serving `heads[0]` value heads `heads[1]` wide,
+    each in its dtype, the decay and memory in fp32, beta in the values' dtype."""
+    keys = jax.random.split(jax.random.key(seed), 6)
+    value_heads, columns = heads
+    q, k = (l2norm(jax.random.normal(key, (1, 128, 1, width))).astype(dtype)
+            for key, dtype in zip(keys[:2], dtypes[:2], strict=True))
+    v = jax.random.normal(keys[2], (1, 128, value_heads, columns)).astype(dtypes[2])
+    g = -jnp.exp(jax.random.normal(keys[3], (1, 128, value_heads)) - 3.0)
+    beta = jax.nn.sigmoid(jax.random.normal(keys[4], (1, 128, value_heads))).astype(dtypes[2])
+    h0 = 0.1 * jax.random.normal(keys[5], (1, value_heads, width, columns))
+    return q, k, v, g, beta, h0
+
+
+def run_rule(rule, mode, operands, cotangents):
+    """`rule` on `operands` as a layer runs it: its output, final memory and operands' gradients under
+    `cotangents`, or under `jax.jvp` inside `forward_mode_attention` its output, final memory and
+    their tangents along `cotangents`."""
+    from dew.nn.attention import forward_mode_attention
+
+    if mode == "reverse":
+        return through(rule, *cotangents)(*operands)
+    with forward_mode_attention():
+        return jax.jvp(rule, operands, cotangents)
+
+
+def route_cotangents(mode, operands):
+    """The output's and final memory's cotangents, or each operand's tangent under `jax.jvp`."""
+    if mode == "reverse":
+        drawn = jax.random.split(jax.random.key(7), 2)
+        return tuple(jax.random.normal(key, operands[index].shape)
+                     for key, index in zip(drawn, (2, 5), strict=True))
+    return tuple(jax.random.normal(jax.random.fold_in(jax.random.key(7), index), x.shape, x.dtype)
+                 for index, x in enumerate(operands))
+
+
+@pytest.mark.parametrize("label", sorted(ROUTES))
+def test_the_rule_computes_the_route_its_geometry_selects(label):
+    """The rule a layer calls (`recurrence_chunk.chunk_gated_delta_rule`), its output, final memory and every
+    operand's gradient (its tangents under `jax.jvp`), at each geometry the port takes and each it
+    refuses (`port_refusal`): bit for bit the port's (`fla_rule`) where it takes the rule and the
+    portable math's (`chunk_delta_rule`) where it does not. Each route is held to its reference
+    elsewhere, the port to fla's own runs (`test_where_the_rule_takes_the_port_it_is_as_exact_as_fla`
+    here) and the portable math to `torch_chunk_gated_delta_rule`'s (tests/test_linear_attention.py)."""
+    dtypes, width, heads, mode, names_port, ported = ROUTES[label]
+    operands = routed_operands(dtypes, width, heads)
+    cotangents = route_cotangents(mode, operands)
+    with row_names_port(port=names_port):
+        found = run_rule(recurrence_chunk.chunk_gated_delta_rule, mode, operands, cotangents)
+        want = run_rule(fla_rule if ported else portable, mode, operands, cotangents)
+    jax.tree.map(np.testing.assert_array_equal, found, want)
+
+
+@pytest.mark.parametrize("label", sorted(ROUTES))
+def test_both_routes_return_the_operands_common_dtype(label):
+    """One contract whichever route a GPU's row picks: the port (`fla_rule`), at every geometry it takes
+    (`recurrence_chunk.port_refusal`'s widths), and the portable math (`chunk_delta_rule`), at every geometry,
+    return the output in the queries', keys' and values' common dtype, the final memory in at least
+    fp32, and each operand's gradient in its own."""
+    dtypes, width, heads, _, _, _ = ROUTES[label]
+    operands = routed_operands(dtypes, width, heads)
+    cotangents = route_cotangents("reverse", operands)
+    common = jnp.result_type(*dtypes)
+    want = [common, jnp.promote_types(common, jnp.float32), *(jnp.dtype(x.dtype) for x in operands)]
+    widest = fla_gdn.WIDEST_KEYS if common.itemsize == 2 else fla_gdn.WIDEST
+    for rule in (fla_rule, portable) if width <= widest else (portable,):
+        found = [jnp.dtype(x.dtype) for x in through(rule, *cotangents)(*operands)]
+        assert found == want, (rule.__name__, found, want)
+
+
+@pytest.mark.gpu(reason="float64 distances against fla's own on this GPU")
+@pytest.mark.parametrize("label", sorted(label for label, route in ROUTES.items() if route[5]))
+def test_where_the_rule_takes_the_port_it_is_as_exact_as_fla(label):
+    """The rule a layer calls (`chunk_gated_delta_rule`) at each geometry the port takes, mixed
+    dtypes and the widest bf16 keys: its output, final memory and every operand's gradient as near the
+    float64 recurrence as fla 0.5.2's own run on the same operands in their common dtype (`fla_side`),
+    each sized by its float64 terms (`float64_truth`)."""
+    dtypes, width, heads, _, _, _ = ROUTES[label]
+    operands = routed_operands(dtypes, width, heads)
+    do, dht = route_cotangents("reverse", operands)
+    with row_names_port():
+        rule = recurrence_chunk.chunk_gated_delta_rule
+        mine = [np.asarray(x, np.float64) for x in through(rule, do, dht)(*operands)]
+    inputs = (*operands, do, dht)
+    theirs = fla_side(inputs, None, jnp.result_type(*dtypes))
+    for name, dew, fla, value, summed in zip(NAMES, mine, theirs, *float64_truth(inputs, None), strict=True):
+        assert_as_exact_as_the_reference(dew, fla, value, f"{label} {name}", terms=summed)
+
+
 @generation.chosen(gated_delta_rule="fla")
-def test_a_gpu_runs_the_port_for_every_rule_but_forward_mode_float64_and_the_widest_keys():
-    """Every rule a GPU traces runs on the port (`port_refusal`), whatever its chunk size, dtypes,
-    heads or mesh, except inside `jax.jvp`'s traces, which its custom VJP gives no tangent, in
-    float64, whose rule is the reference math itself, and over keys wider than fla's 256 (128 in
-    fp32)."""
-    from dew.nn.attention import FORWARD_MODE
-
-    x = jnp.zeros((1, 64, 1, 64), jnp.bfloat16)
-    assert linear.on_the_port(x, x.astype(jnp.float32), jnp.zeros((1, 64, 3, 96), jnp.bfloat16))
-    token = FORWARD_MODE.set(True)
-    try:
-        assert not linear.on_the_port(x, x, x)
-    finally:
-        FORWARD_MODE.reset(token)
+def test_float64_operands_compute_the_recurrence_in_float64():
+    """A float64 rule, which the port refuses, is the portable math in float64: its output, final
+    memory and gradients within float64 rounding of the token recurrence's."""
     with jax.enable_x64(new_val=True):
-        wide = jnp.zeros((1, 64, 1, 64), jnp.float64)
-        assert not linear.on_the_port(wide, wide, wide)
-    keys = jnp.zeros((1, 64, 1, 512), jnp.bfloat16)
-    assert not linear.on_the_port(keys, keys, x)
-    keys = jnp.zeros((1, 64, 1, 256), jnp.float32)
-    assert not linear.on_the_port(keys, keys, keys)
-    assert linear.on_the_port(keys.astype(jnp.bfloat16), keys.astype(jnp.bfloat16), x)
-    with row_names_port(port=False):
-        assert not linear.on_the_port(x, x, x)
-
-
-@pytest.mark.parametrize("generation", sorted(name for name in kernels.TARGETS if name.startswith("sm")))
-def test_the_rule_runs_the_port_exactly_where_the_gpus_target_row_names_it(generation):
-    """Routing reads the row qualification reads (`generation.TARGETS`): a GPU generation whose row
-    names 'fla' for the rule runs the port, and one whose row does not runs the portable math and
-    says why."""
-    x = jnp.zeros((1, 64, 1, 64), jnp.bfloat16)
-    with kernels.assumed(generation):
-        ported = linear.on_the_port(x, x, x)
-    assert ported == (kernels.TARGETS[generation].kernels.get("gated_delta_rule") == "fla")
+        operands = widened(routed_operands((jnp.float32,) * 3, 64, (2, 64)))
+        cotangents = tuple(np.asarray(jax.random.normal(jax.random.key(index), shape), np.float64)
+                           for index, shape in enumerate((operands[2].shape, operands[5].shape)))
+        run = through(recurrence_chunk.chunk_gated_delta_rule, *cotangents)
+        roundings = chain_roundings(jax.make_jaxpr(run)(*operands))
+        found = jax.tree.map(np.asarray, run(*operands))
+        truth = jax.tree.map(np.asarray, through(recurrence, *cotangents)(*operands))
+    for index, (mine, exact) in enumerate(zip(found, truth, strict=True)):
+        assert_computes_the_oracle(mine, exact, f"leaf {index}", roundings=roundings)
 
 
 @generation.chosen(gated_delta_rule="fla")
@@ -753,6 +844,21 @@ def test_a_bf16_layer_with_wide_keys_hands_the_port_its_narrowed_operands():
         assert query.dtype == key.dtype == value.dtype == jnp.bfloat16
 
 
+REMAT_ROWS, REMAT_LENGTH = 4, 256
+"""Each remat draw's rows and tokens: at one row of 64 with the parameters held fixed, the reference
+compared with itself did not resolve within 512 seeds on an A100 (`in_proj_b`'s and the norm's
+gradients, a few sums over one draw's few tokens); with fresh parameters a draw, one row of 64 took
+512 seeds, two of 128 took 256, and four of 256 take 64, as eight of 512 do."""
+
+SEEDS = {(1, 1): 64, (2, 1): 64, (2, 2): 64}
+"""Each remat policy's declared seeds for check 1 (`assert_as_exact`), keyed by the
+(`fla_chunk_fwd_h`, `fla_chunk_fwd_o`) launches its gradient is held to, sized by `seeds_for` on an
+A100 (2026-10-21), where the policies' programs differ: the fewest for which the layer's gradient
+without remat compared with itself resolves the factor in every leaf, truth the float64 layer's
+gradient. The three policies share that reference, the draw and the truth, so one sizing gives all
+three. Off a GPU the two are bitwise."""
+
+
 @pytest.mark.parametrize("policy, memories, outputs", [
     (None, 1, 1),
     ({"recompute": ("delta_memory",)}, 2, 1),
@@ -763,47 +869,57 @@ def test_a_remat_policy_saves_the_ports_named_residuals_and_changes_no_gradient(
     """A block's remat policy keeps or recomputes the port's named residuals
     (`decoder_block.RESIDUALS`): without one the layer saves its decay, inverse and memory
     ('delta_memory') for its backward; 'all_but_delta_memory', which the block applies by tracing its
-    layers recomputing that name (`linear.recomputing`) rather than by a checkpoint policy, has the
+    layers recomputing that name (`recurrence_chunk.recomputing`) rather than by a checkpoint policy, has the
     backward recompute the memory alone; a policy saving the output, decay and inverse saves those
     three. Each is read from the kernels the gradient runs: the memory's (`fla_chunk_fwd_h`) once
     where it is saved and again in the backward where it is recomputed; the output's
     (`fla_chunk_fwd_o`) once, but where the policy recomputes the memory, whose recompute re-runs the
-    rule's forward, output and all. Each computes the gradients the layer computes without remat
-    within tests/reference_error.py's rule against the float64 layer's, each leaf sized by its own
-    float64 terms; off a GPU, bitwise. A GPU compiles the remat step as another program, whose
-    roundings differ: on an H100 even the XLA math's A_log gradient moved by 5.4e-5 relative between
-    the two, the remat one nearer float64."""
+    rule's forward, output and all. Each computes the gradients the layer computes without remat, on
+    par with it by check 1 (`assert_as_exact`) over fresh parameters and inputs drawn from each seed
+    (`REMAT_ROWS` rows of `REMAT_LENGTH` tokens), truth the float64 layer's gradient; off a GPU,
+    bitwise. A GPU compiles
+    the remat step as another program, whose roundings differ: on an H100 even the XLA math's A_log
+    gradient moved by 5.4e-5 relative between the two, the remat one nearer float64."""
     from dew.nn.backbones.decoder_block import remat_policy
-    from dew.nn.linear import recomputing
+    from dew.nn.kernels.recurrence_chunk import recomputing
 
     layer = GatedDeltaNet(emb_features=64, num_k_heads=1, num_v_heads=2, head_k_dim=64, head_v_dim=64)
-    x = jax.random.normal(jax.random.key(71), (1, 64, 64))
-    params = layer.init(jax.random.key(73), x)
+    x = jax.random.normal(jax.random.key(71), (REMAT_ROWS, REMAT_LENGTH, 64))
+    initialize = jax.jit(layer.init)
+    params = initialize(jax.random.key(73), x)
 
-    def loss(params):
+    def loss(params, x):
         return jnp.sum(layer.apply(params, x) ** 2)
 
     rung = None if policy is None else remat_policy(policy)
     if rung is None:
         remat = loss
     elif rung.recompute:
-        def remat(params):
+        def remat(params, x):
             with recomputing(rung.recompute):
-                return loss(params)
+                return loss(params, x)
     else:
         remat = jax.checkpoint(loss, policy=rung.checkpoint_policy())
-    graph = jax.make_jaxpr(jax.grad(remat))(params)
+    graph = jax.make_jaxpr(jax.grad(remat))(params, x)
     launched = [str(equation.params["name"]) for equation in equations(graph)
                 if equation.primitive.name == "pallas_call"]
     counted = (launched.count("fla_chunk_fwd_h"), launched.count("fla_chunk_fwd_o"))
     assert counted == (memories, outputs), launched
-    want = jax.jit(jax.grad(loss))(params)
-    got = jax.jit(jax.grad(remat))(params)
-    with jax.enable_x64(new_val=True):
-        wide = layer.clone(dtype=jnp.float64)
-        truth, terms = float64_terms(jax.grad(lambda params: jnp.sum(wide.apply(params, x) ** 2)),
-                                     jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float64), params))
-    assert_leaves_as_exact(got, want, truth, terms=terms)
+    reference_grad, remat_grad = jax.jit(jax.grad(loss)), jax.jit(jax.grad(remat))
+    want, got = reference_grad(params, x), remat_grad(params, x)
+
+    def draw(seed):
+        keys = jax.random.split(jax.random.key(seed))
+        x = jax.random.normal(keys[0], (REMAT_ROWS, REMAT_LENGTH, 64))
+        return initialize(keys[1], x), x
+
+    wide = layer.clone(dtype=jnp.float64)
+
+    def truth(params, x):
+        return jax.grad(lambda params: jnp.sum(wide.apply(params, x) ** 2))(params)
+
+    assert_as_exact(remat_grad, reference_grad, draw, "remat policy gradient",
+                    seeds=SEEDS[(memories, outputs)], truth_fn=jax.jit(truth))
     if jax.default_backend() != "gpu":
         for (path, mine), theirs in zip(jax.tree_util.tree_leaves_with_path(got), jax.tree.leaves(want),
                                         strict=True):
@@ -824,7 +940,7 @@ def test_the_rule_on_the_port_takes_any_chunk_size_and_mixed_dtypes_in_their_com
     v = jax.random.normal(keys[2], (1, 96, 2, 64)).astype(jnp.bfloat16)
     g = -jnp.exp(jax.random.normal(keys[3], v.shape[:3]) - 3.0)
     beta = jax.nn.sigmoid(jax.random.normal(keys[4], v.shape[:3]))
-    got = linear.chunk_gated_delta_rule(q, k, v, g, beta, chunk_size=chunk_size)
+    got = recurrence_chunk.chunk_gated_delta_rule(q, k, v, g, beta, chunk_size=chunk_size)
     want = fla_rule(q, k.astype(jnp.float32), v.astype(jnp.float32), g, beta)
     for mine, theirs in zip(got, want, strict=True):
         assert mine.dtype == jnp.float32
@@ -866,12 +982,16 @@ def test_the_port_keeps_the_kernel_contract_on_a_mesh(axis, split, per_key):
 
 
 @pytest.mark.gpu(reason="the port's kernels lower to Triton calls only on a GPU")
-def test_a_bf16_gated_delta_net_trains_with_no_copy_at_the_ports_edges():
-    """A bf16 GatedDeltaNet at the 0.8B's heads, forward and backward, compiled for this GPU: no copy
-    or transpose feeds one of the port's Triton calls or reads one of its results
-    (`sharded.boundary_copies`), so every operand reaches the kernels in the layout they read."""
-    layer = GatedDeltaNet(emb_features=1024, num_k_heads=16, num_v_heads=16, head_k_dim=128, head_v_dim=128,
-                          dtype=jnp.bfloat16)
+@pytest.mark.parametrize("build", [
+    lambda: GatedDeltaNet(emb_features=1024, num_k_heads=16, num_v_heads=16, head_k_dim=128, head_v_dim=128,
+                          dtype=jnp.bfloat16),
+    lambda: KimiDeltaAttention(emb_features=1024, num_heads=8, head_dim=128, dtype=jnp.bfloat16),
+], ids=["gated delta net at the 0.8B's heads", "kimi delta attention at Kimi Linear's heads"])
+def test_a_bf16_delta_rule_layer_trains_with_no_copy_at_the_ports_edges(build):
+    """A bf16 layer on either port, forward and backward, compiled for this GPU: no copy or transpose
+    feeds one of the port's Triton calls or reads one of its results (`sharded.boundary_copies`), so
+    every operand reaches the kernels in the layout they read."""
+    layer = build()
     x = jax.random.normal(jax.random.key(47), (2, 512, 1024), jnp.bfloat16)
     params = layer.init(jax.random.key(53), x)
 
@@ -948,7 +1068,7 @@ def test_a_timed_launch_draws_the_descriptors_it_reads(read, packed):
     over the drawn chunks bitwise each chunk's run as a row of its own."""
     batch, length = 2, 150
     cuts = jnp.asarray([0, 60, 150, 200, 260, 300], jnp.int32)
-    given = fla_gdn.sequences(batch, length, cuts if packed else None)
+    given = chunked_launch.sequences(batch, length, cuts if packed else None)
     query = jax.ShapeDtypeStruct((batch, length, 2, 64), jnp.bfloat16)
     descriptors = {"chunks": [given.chunks], "spans": [given.spans],
                    "both": [given.chunks, given.spans]}[read]
@@ -974,9 +1094,9 @@ def test_a_timed_launch_draws_the_descriptors_it_reads(read, packed):
     real = taken > 0
     assert (start[real] + taken[real] <= (first + lengths)[owner[real]]).all(), "a chunk crosses a sequence"
     g = jax.random.normal(jax.random.key(0), (batch, length, 2))
-    described = fla_gdn.Sequences(jnp.asarray(chunked), jnp.asarray(spans))
-    found = np.asarray(fla_gdn.chunk_local_cumsum(g, spans=described, interpret=True)).reshape(-1, 2)
+    described = chunked_launch.Sequences(jnp.asarray(chunked), jnp.asarray(spans))
+    found = np.asarray(cumulated(g, spans=described, interpret=True)).reshape(-1, 2)
     flat = g.reshape(1, batch * length, 2)
     for begin, size in zip(start[real], taken[real], strict=True):
-        alone = fla_gdn.chunk_local_cumsum(flat[:, begin:begin + size], interpret=True)
+        alone = cumulated(flat[:, begin:begin + size], interpret=True)
         np.testing.assert_array_equal(found[begin:begin + size], np.asarray(alone)[0], err_msg=f"at {begin}")

@@ -1,7 +1,7 @@
 #!/bin/sh
 # Every cheap gate CI runs on a checkout, all of them, reporting every failure before it exits: the
 # locks, flake8, ruff, slop lint, the fetched fixtures' pins (tools/fetched_fixtures.py), the
-# complexity record (complexity.json), the generated API pages and installer, the tested Python
+# complexity record (complexity.json), the generated API pages, installer and site colors, the tested Python
 # versions, duplicate code (tools/duplicates.py) and pyright. PYTHON names
 # the interpreter of the test suite's environment (tools/install_environment.sh); default: python. A
 # lane runs it before every LAND, and CI's lint job runs it as is.
@@ -35,6 +35,7 @@ gate fixtures "$python" tools/fetched_fixtures.py check
 gate complexity sh -c "\"$python\" tools/complexity.py src/dew tools/lint_slop.py tools/lint_scopes.py examples recipes > complexity.json"
 gate api-pages uv run --no-project --with-requirements site/scripts/requirements.txt python site/scripts/gen_api.py --check
 gate install-script "$python" site/scripts/gen_install.py --check
+gate theme "$python" site/scripts/gen_theme.py --check
 gate pythons "$python" tools/armada/ci.py pythons --check
 gate api-tests uv run --no-project --with-requirements site/scripts/requirements.txt --with pytest \
   python -m pytest -q --noconftest tests/test_gen_api.py

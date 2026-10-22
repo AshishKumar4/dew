@@ -7,8 +7,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from attention_oracle import exact_attention
 from reference_error import assert_as_exact
-from test_attention_splash import exact_attention
 
 from dew.nn.attention import (
     alibi_bias,
@@ -19,6 +19,7 @@ from dew.nn.attention import (
     with_key_starts,
 )
 from dew.nn.documents import CrossDocuments, cross_document_mask, document_ids, document_mask, with_documents
+from dew.nn.inputs import coordinates
 from dew.nn.kernels.templates import attention as template
 
 QUERIES, KEYS = 100, 96
@@ -44,14 +45,6 @@ def cross_documents():
 LENGTHS = jnp.asarray([96, 61], jnp.int32)
 STARTS = jnp.asarray([0, 17], jnp.int32)
 
-
-def document_places(ids) -> jax.Array:
-    """Each token's place in its own document `[B, S]`, counted from the document's first token as Dew's
-    coordinates count a packed row's positions."""
-    ids = np.asarray(ids)
-    index = np.broadcast_to(np.arange(ids.shape[1]), ids.shape)
-    opens = np.concatenate([np.ones((ids.shape[0], 1), bool), ids[:, 1:] != ids[:, :-1]], axis=1)
-    return jnp.asarray(index - np.maximum.accumulate(np.where(opens, index, 0), axis=1), jnp.int32)
 
 CASES = {
     "full": {},
@@ -93,7 +86,8 @@ def arguments(case: dict) -> dict:
     if case.get("starts"):
         keywords["starts"] = STARTS
     if case.get("positions"):
-        places = document_places(keywords["segment_ids"])
+        # Each token's place in its own document, as a packed row's coordinates count it.
+        places = coordinates(segments=keywords["segment_ids"]).positions
         keywords["positions"] = (places, places)
     return keywords
 

@@ -60,10 +60,6 @@ DEFAULT_BLOCK_K = 64
 # block_m. It solves the problem of large groups or very few groups.
 CHUNK_M = 512  # block size to chunk rows into to increase SM participation for very large groups
 
-def cdiv(a, b):
-  return (a + b - 1) // b
-
-
 arange = partial(jnp.arange, dtype=np.int32)
 
 
@@ -215,12 +211,12 @@ def _gpu_ragged_dot_kernel(
       return _summed(acc, xA.astype(acc_dtype), group_sz > 0, exact_sums=exact_sums)
 
     acc = jnp.zeros((block.m, block.n), dtype=acc_dtype)
-    acc = lax.fori_loop(0, cdiv(size.k, block.k), inner_compute, acc)
+    acc = lax.fori_loop(0, pl.cdiv(size.k, block.k), inner_compute, acc)
     stored(acc, ridx, lhs_rows_mask)
 
   # Dew: the epilogue on each fp32 accumulator tile and its side operands' tiles, its outputs stored.
   stored = partial(_store_epilogued, out_refs, epilogue, epilogue_refs, epilogue_axes, pid.j, block, size)
-  lax.fori_loop(0, cdiv(group_sz, block.m), outer_compute, None)
+  lax.fori_loop(0, pl.cdiv(group_sz, block.m), outer_compute, None)
   _store_past_routed(stored, group_metadata_ref, pid, block, size, acc_dtype)
 
 
@@ -268,7 +264,7 @@ def _store_past_routed(stored, group_metadata_ref, pid, block, size, acc_dtype):
       row = last_offset + i * block.m
       stored(jnp.zeros((block.m, block.n), acc_dtype), row, (row + arange(block.m)) < size.m)
 
-    lax.fori_loop(0, cdiv(size.m - last_offset, block.m), store_empty, None)
+    lax.fori_loop(0, pl.cdiv(size.m - last_offset, block.m), store_empty, None)
 
 
 @partial(jax.jit, static_argnames=(
@@ -401,8 +397,9 @@ def _tgmm_ragged_dot_kernel(
 ):
   *prologue_refs, A_bar_ref = refs
   assert A_bar_ref.shape == (block.k, block.n)
-  pid =  SimpleNamespace(gi=pl.program_id(0), r=pl.program_id(1),
-                         c=pl.program_id(2))
+  # Dew: a group's output tiles launch together, its column tiles fastest, so a wave reads one group's
+  # rows from the L2 rather than each group's same tile (upstream put the group on the fastest axis).
+  pid = SimpleNamespace(c=pl.program_id(0), r=pl.program_id(1), gi=pl.program_id(2))
   size = jax.tree.map(partial(np.array, dtype=np.int32), size)
   group_sz = group_sizes_ref[pid.gi]
   compute_dtype = compute_dtype if compute_dtype is not None else x_ref.dtype
@@ -441,7 +438,7 @@ def _tgmm_ragged_dot_kernel(
       return _summed(acc, partial_sum.astype(acc.dtype), group_sz > 0, exact_sums=exact_sums)
 
     acc = jnp.zeros((block.k, block.n), dtype=acc_dtype)
-    acc = lax.fori_loop(0, cdiv(group_sz, block.m), inner_compute, acc)
+    acc = lax.fori_loop(0, pl.cdiv(group_sz, block.m), inner_compute, acc)
     # Dew: upstream casts to y_ref's dtype, the second input's, which fails
     # to store whenever out_dtype differs from it (bf16 inputs, fp32 grad).
     acc = acc.astype(A_bar_ref.dtype)
@@ -501,17 +498,17 @@ def tgmm(
 
   group_offsets = jnp.cumsum(group_sizes) - group_sizes
   in_specs = [
-    pl.BlockSpec((size.m, block_k), lambda i, r, c: (0, r)),
-    pl.BlockSpec((size.m, block_n), lambda i, r, c: (0, c)),
-    pl.BlockSpec((size.g,), lambda i, r, c: (0,)),
-    pl.BlockSpec((size.g,), lambda i, r, c: (0,)),
-    *(pl.BlockSpec(side.shape, lambda i, r, c, ndim=side.ndim: (0,) * ndim) for side in prologue_operands),
+    pl.BlockSpec((size.m, block_k), lambda c, r, i: (0, r)),
+    pl.BlockSpec((size.m, block_n), lambda c, r, i: (0, c)),
+    pl.BlockSpec((size.g,), lambda c, r, i: (0,)),
+    pl.BlockSpec((size.g,), lambda c, r, i: (0,)),
+    *(pl.BlockSpec(side.shape, lambda c, r, i, ndim=side.ndim: (0,) * ndim) for side in prologue_operands),
   ]
 
   out_shape = jax.ShapeDtypeStruct(
     (size.g, size.k, size.n), dtype=out_dtype or x.dtype)
-  out_specs = pl.BlockSpec((None, block_k, block_n), lambda i, r, c: (i, r, c))
-  grid = (size.g, pl.cdiv(size.k, block_k), pl.cdiv(size.n, block_n))
+  out_specs = pl.BlockSpec((None, block_k, block_n), lambda c, r, i: (i, r, c))
+  grid = (pl.cdiv(size.n, block_n), pl.cdiv(size.k, block_k), size.g)
 
   block_sizes = BlockSizes(m=block_m, k=block_k, n=block_n)
   dtype_spec = {"compute_dtype": compute_dtype, "acc_dtype": acc_dtype, "prologue": prologue,

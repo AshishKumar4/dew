@@ -95,26 +95,7 @@ def test_a_fetch_with_threads_of_its_own_fetches_that_many_at_once_in_order_and_
     read, a gone url dropped and counted; leaves the plan as a fetch without threads makes it; a
     position saved part way restores to the same remaining records; and a closed reader leaves no
     thread of its pool running."""
-    lock, active, most = threading.Lock(), [0], [0]
-
-    def handle(request):
-        index = int(request.path.strip("/"))
-        if index == 9:
-            request.send_response(404)
-            request.end_headers()
-            return
-        with lock:
-            active[0] += 1
-            most[0] = max(most[0], active[0])
-        time.sleep(0.2)
-        body = request.path.encode()
-        request.send_response(200)
-        request.send_header("Content-Length", str(len(body)))
-        request.end_headers()
-        request.wfile.write(body)
-        with lock:
-            active[0] -= 1
-
+    handle = Slow(gone="9")
     with serving(handle) as address:
         catalog = Memory([{"url": f"http://{address}/{index}", "id": index} for index in range(17)],
                          shard_rows=17)
@@ -143,7 +124,7 @@ def test_a_fetch_with_threads_of_its_own_fetches_that_many_at_once_in_order_and_
             again = [next(resumed) for _ in range(5)]
         finally:
             resumed.close()
-    assert most[0] == 4
+    assert handle.most == {"": 4}
     kept = [index for index in range(17) if index != 9]
     assert [int(value) for batch in [*first, *rest] for value in batch["id"]] == kept
     assert dropped == {"http_404": 1}
@@ -159,22 +140,7 @@ def test_a_cached_fetch_with_threads_of_its_own_fetches_that_many_at_once(tmp_pa
     """A fetch given four threads of its own before a cache, and another given two after it, each
     fetches as many urls at once as it was given whatever the read's threads, and the run reads
     what the uncached chain reads."""
-    lock, active, most = threading.Lock(), collections.Counter(), collections.Counter()
-
-    def handle(request):
-        side = request.path.strip("/").split("/")[0]
-        with lock:
-            active[side] += 1
-            most[side] = max(most[side], active[side])
-        time.sleep(0.2)
-        body = request.path.encode()
-        request.send_response(200)
-        request.send_header("Content-Length", str(len(body)))
-        request.end_headers()
-        request.wfile.write(body)
-        with lock:
-            active[side] -= 1
-
+    handle = Slow(sides=True)
     with serving(handle) as address:
         catalog = Memory([{"url": f"http://{address}/before/{index}", "id": index} for index in range(12)])
 
@@ -191,9 +157,9 @@ def test_a_cached_fetch_with_threads_of_its_own_fetches_that_many_at_once(tmp_pa
                 reader.close()
 
         uncached = ids(None)
-        most.clear()
+        handle.most.clear()
         assert ids(str(tmp_path / "cache")) == uncached
-    assert most == {"before": 4, "after": 2}
+    assert handle.most == {"before": 4, "after": 2}
 
 
 @dataclass(frozen=True)
@@ -205,6 +171,35 @@ class Again:
 
     def __call__(self, row):
         return {**row, "again": f"http://{self.address}/after/{int(row['id'])}"}
+
+
+class Slow:
+    """A server's answer to each GET: its path, after a pause, or 404 for the path `gone`; it counts
+    the requests in flight, by their path's first part where it reads `sides`, and the most at once."""
+
+    def __init__(self, *, gone: str | None = None, sides: bool = False):
+        self.gone, self.sides = gone, sides
+        self.lock = threading.Lock()
+        self.active, self.most = collections.Counter(), collections.Counter()
+
+    def __call__(self, request):
+        path = request.path.strip("/")
+        if path == self.gone:
+            request.send_response(404)
+            request.end_headers()
+            return
+        side = path.split("/")[0] if self.sides else ""
+        with self.lock:
+            self.active[side] += 1
+            self.most[side] = max(self.most[side], self.active[side])
+        time.sleep(0.2)
+        body = request.path.encode()
+        request.send_response(200)
+        request.send_header("Content-Length", str(len(body)))
+        request.end_headers()
+        request.wfile.write(body)
+        with self.lock:
+            self.active[side] -= 1
 
 
 Parents = collections.namedtuple("Parents", ["first", "second"])
