@@ -61,9 +61,8 @@ class Tiles:
     (`stages`, upstream's `max_concurrent_steps`) and the column tiles in each band of the planar snake
     (`grid_block_n`); Dew: the warpgroups computing a tile (`warpgroups`: 2 halve `block_n` between two
     consumer warpgroups beside a producer that issues the loads, CUTLASS's cooperative sm90 schedule), and
-    the multiprocessors of a cluster (`cluster`: 2 pair two tiles of one group, which load the block of
-    the operand they share once between them, multicast: `gmm`'s row tiles its matrix block, `tgmm`'s depth
-    tiles its cotangent's), only for a cooperative tile."""
+    the multiprocessors of a cluster (`cluster`: 2 pair two row tiles of one group of `gmm`, which load
+    their matrix block once between them, multicast), only for a cooperative tile; `tgmm` takes no pair."""
     block_m: int
     block_n: int
     block_k: int
