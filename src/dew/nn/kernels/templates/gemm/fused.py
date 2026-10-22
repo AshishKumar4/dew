@@ -103,23 +103,38 @@ def _prologue(fusion) -> tuple[jax.Array, dict]:
             generation.route('gemm_prologue', kernel='xla', preferred='fused', refusal=split)
         return fusion(), {}
     generation.route('gemm_prologue', kernel='fused')
-    base, function, sides, axes = split
-    return base, {'prologue': function, 'prologue_operands': tuple(zip(sides, axes, strict=True))}
+    base, function, sides, axes, vjp = split
+    return base, {'prologue': function, 'prologue_operands': tuple(zip(sides, axes, strict=True)),
+                  'prologue_vjp': vjp}
+
+
+CALLS = frozenset({'pjit', 'jit', 'closed_call', 'core_call', 'remat', 'checkpoint', 'custom_jvp_call',
+                   'custom_vjp_call', 'custom_vjp_call_jaxpr'})
+"""The equations whose bodies the split reads through (a jitted, checkpointed or custom-derivative call, as
+Dew's own norms are): their values are their bodies'; their derivatives stay the producer's (`_whole_vjp`)."""
 
 
 def _split(producer, values):
     """`producer(values)`'s kernel stage and what it reads (`_prologue`): the base array, the prologue on its
-    tile and the side arrays' tiles, the side arrays and the launch axes each follows; the refusal where
-    the kernels cannot take it."""
+    tile and the side arrays' tiles, the side arrays, the launch axes each follows, and the producer's whole
+    VJP as the prologue's derivative; the refusal where the kernels cannot take it.
+
+    The side arrays the producer computes (a row's statistics) carry no derivative of their own: the
+    template takes the operand's cotangent back through the producer's own VJP (`_whole_vjp`), so every
+    path from an input joins where the producer joins it, at its precision, its custom derivatives kept."""
     leaves, treedef = jax.tree.flatten(values)
-    closed = jax.make_jaxpr(lambda *leaves: producer(jax.tree.unflatten(treedef, list(leaves))))(*leaves)
+
+    def flat(*leaves):
+        return producer(jax.tree.unflatten(treedef, list(leaves)))
+
+    closed = jax.make_jaxpr(functools.partial(_inlined, jax.make_jaxpr(flat)(*leaves)))(*leaves)
     jaxpr = closed.jaxpr
     [out] = jaxpr.outvars
     shape = tuple(getattr(out.aval, 'shape', ()))
     if len(shape) != 2 or not isinstance(out, jax_core.Var) or not jaxpr.eqns:
         return generation.Refusal('no_producer', "the operand is an array as given")
     stage, inputs = _tile_stage(jaxpr, out, shape)
-    full = [var for var in inputs if tuple(var.aval.shape) == shape]
+    full = [var for var in inputs if tuple(var.aval.shape) == shape and var in jaxpr.invars]
     if not full:
         return generation.Refusal('no_base', "the operand's every element is computed, none loaded")
     base = full[0]
@@ -127,9 +142,18 @@ def _split(producer, values):
         return generation.Refusal('dtype_changes', f"the producer turns its {base.aval.dtype} base into "
                                                    f"{out.aval.dtype}, which the kernels would multiply in")
     sides = [var for var in inputs if var is not base]
-    # What the stage reads, each computed whole in XLA (the operand itself, unread, is left out there).
+    given = {var: index for index, var in enumerate(jaxpr.invars)}
+    read = {given[var] for var in (base, *sides) if var in given}
+    if any(index not in read for index, leaf in enumerate(leaves)
+           if jnp.issubdtype(jnp.result_type(leaf), jnp.inexact)):
+        return generation.Refusal('input_unstaged',
+                                  "an input reaches the operand only through a row or depth value")
+    # What the stage reads, each computed whole in XLA (the operand itself, unread, is left out there); a
+    # computed one with no derivative of its own (the docstring).
     arrays = jax_core.jaxpr_as_fun(jax_core.ClosedJaxpr(jaxpr.replace(outvars=[base, *sides]),
                                                         closed.consts))(*leaves)
+    arrays = [array if var in given else jax.lax.stop_gradient(array)
+              for var, array in zip([base, *sides], arrays, strict=True)]
     whole = functools.partial(_staged, jax_core.ClosedJaxpr(
         jax_core.Jaxpr(jaxpr.constvars, [base, *sides], [out], stage), closed.consts))
     axes = _prologue_axes(whole, arrays, shape)
@@ -140,7 +164,51 @@ def _split(producer, values):
                 for array, side_axes in zip(arrays[1:], axes, strict=True)]
     named = tuple(tuple(axis for axis in side_axes if axis is not None) for side_axes in axes)
     function = functools.partial(_prologue_tile, whole, tuple(jax.typeof(array) for array in arrays), axes)
-    return arrays[0], function, squeezed, named
+    places = tuple(given.get(var) for var in (base, *sides))
+    vjp = functools.partial(_whole_vjp, flat, tuple(leaves), places, tuple(array.shape for array in arrays))
+    return arrays[0], function, squeezed, named, vjp
+
+
+def _whole_vjp(flat, leaves: tuple, places: tuple, shapes: tuple, base, *sides):
+    """The producer's own VJP as the prologue's derivative (`template.gemm`'s `prologue_vjp`): the
+    template's base and side arrays put back among the producer's inputs (`places`, each one's index there,
+    None for a computed one), and a function of the operand's cotangent giving the base's and each side
+    array's, a computed one's zero."""
+    inputs = list(leaves)
+    for place, array, shape in zip(places, (base, *sides), shapes, strict=True):
+        if place is not None:
+            inputs[place] = array.reshape(shape)
+    _, pull = jax.vjp(flat, *inputs)
+
+    def pulled(d_operand):
+        d_inputs = pull(d_operand)
+        return tuple(jnp.zeros_like(array) if place is None else d_inputs[place].reshape(array.shape)
+                     for place, array in zip(places, (base, *sides), strict=True))
+
+    return pulled
+
+
+def _inlined(closed, *args):
+    """`closed` evaluated with every call (`CALLS`) read through to its body, so the split sees a norm's
+    statistics however its producer wraps them."""
+    env = dict(zip(closed.jaxpr.invars, args, strict=True)) | dict(zip(closed.jaxpr.constvars, closed.consts,
+                                                                       strict=True))
+
+    def read(var):
+        return var.val if isinstance(var, jax_core.Literal) else env[var]
+
+    for eqn in closed.jaxpr.eqns:
+        body = (eqn.params.get('jaxpr') or eqn.params.get('call_jaxpr') or eqn.params.get('fun_jaxpr')
+                if eqn.primitive.name in CALLS else None)
+        invals = [read(var) for var in eqn.invars]
+        if body is not None:
+            body = body if isinstance(body, jax_core.ClosedJaxpr) else jax_core.ClosedJaxpr(body, ())
+            outvals = _inlined(body, *invals[len(invals) - len(body.jaxpr.invars):])
+        else:
+            outvals = eqn.primitive.bind(*invals, **eqn.params)
+            outvals = outvals if eqn.primitive.multiple_results else [outvals]
+        env.update(zip(eqn.outvars, outvals, strict=True))
+    return [read(var) for var in closed.jaxpr.outvars]
 
 
 def _staged(closed, *arrays):
@@ -179,7 +247,10 @@ def _prologue_axes(whole, arrays: list, shape: tuple) -> tuple | generation.Refu
     or the producer reads its base at other than the tile or its tile's position."""
     probe = (_probe(shape[0]), _probe(shape[1]))
     spec = pl.BlockSpec(probe, lambda row, depth: (row, depth))
-    tiled, specs, _ = fuser.pull_block_spec(whole, spec, grid_len=2)(*arrays)
+    try:
+        tiled, specs, _ = fuser.pull_block_spec(whole, spec, grid_len=2)(*arrays)
+    except (NotImplementedError, ValueError) as error:  # an equation the fuser cannot tile: XLA's
+        return generation.Refusal('untileable', f"the fuser tiles no block of the producer: {error}"[:200])
     if not _is_tile(specs[0], probe):
         return generation.Refusal('base_untiled', "the producer reads its base at other than the tile")
     axes = []
@@ -189,13 +260,15 @@ def _prologue_axes(whole, arrays: list, shape: tuple) -> tuple | generation.Refu
             return generation.Refusal('value_unblocked', f"a {array.shape} side array has no block")
         named = []
         for block, index, size in zip(block_shape, index_map(1, 2), array.shape, strict=True):
-            if size == 1 and block == 1:
-                named.append(None)
-            elif index in (1, 2) and block == probe[index - 1] and size == shape[index - 1]:
+            if index in (1, 2) and block == probe[index - 1] and size == shape[index - 1]:
                 named.append(PROLOGUE_AXES[index - 1])
+            elif size == 1 and block == 1:
+                named.append(None)
             else:
                 return generation.Refusal(
                     'value_off_axes', f"a {array.shape} side array follows no launch axis tile by tile")
+        if all(axis is None for axis in named):
+            return generation.Refusal('value_off_axes', f"a {array.shape} side array follows no launch axis")
         axes.append(tuple(named))
     blocks = [jax.ShapeDtypeStruct(block.block_shape, array.dtype)
               for block, array in zip(specs, arrays, strict=True)]
