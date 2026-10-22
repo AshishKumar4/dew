@@ -257,6 +257,11 @@ def _fetched_bytes(operands, axes_of, grid: tuple) -> float:
                for operand, axes in zip(operands, axes_of, strict=True))
 
 
+def _layer(layers: tuple):
+    """The layer's index a launch reads its bank of matrices at, or None for a plain set (`launched_gmm`)."""
+    return layers[0] if layers else None
+
+
 def _output_bytes(ba) -> int:
     """The bytes of one output element of each of the launch's outputs, together."""
     return sum(jnp.dtype(dtype).itemsize
@@ -343,7 +348,9 @@ class _Triton(_GroupedLaunch[Tile]):
         # Every CUDA GPU the dispatcher sends the kernels to (`dew.nn.moe.grouped_matmul_kernel`), and
         # a CPU, which interprets them, or traces the CUDA branch a GPU's lowering takes; never a TPU.
         cuda = generation.capability(generation.effective(target).generation) is not None
-        return cuda and _rated(target, ba.arguments['tokens'].dtype)
+        # A dense call's plain kernel takes one matrix, not a bank's layer.
+        banked = bool(ba.arguments.get('layers')) and ba.arguments.get('dense')
+        return cuda and not banked and _rated(target, ba.arguments['tokens'].dtype)
 
     @staticmethod
     @abc.abstractmethod
@@ -435,7 +442,7 @@ class Gmm(_Triton):
     def _dense_extents(ba) -> tuple[int, int]:
         """The depth and width of a dense call's product, which `block_k` and `block_n` tile."""
         kernel = ba.arguments['kernel']
-        return (kernel.shape[2], kernel.shape[1]) if ba.arguments['trans_rhs'] else kernel.shape[1:]
+        return (kernel.shape[-1], kernel.shape[-2]) if ba.arguments['trans_rhs'] else kernel.shape[-2:]
 
     @staticmethod
     def loaded(tile: Tile) -> int:
@@ -461,8 +468,8 @@ class Gmm(_Triton):
         # for every tile of Qwen3-30B-A3B's gate_up within 10% (GMM-h100-3).
         from .ragged_dot import CHUNK_M
         tokens, kernel = ba.arguments['tokens'], ba.arguments['kernel']
-        (rows, depth), groups = tokens.shape, kernel.shape[0]
-        width = kernel.shape[1] if ba.arguments['trans_rhs'] else kernel.shape[2]
+        (rows, depth), groups = tokens.shape, kernel.shape[-3]
+        width = kernel.shape[-2] if ba.arguments['trans_rhs'] else kernel.shape[-1]
         size = jnp.dtype(tokens.dtype).itemsize
         # A dense call's program is one row tile (`triton_dense`), a ragged one's a chunk.
         chunks = _row_tiles(rows, groups, config.block_m if ba.arguments.get('dense') else CHUNK_M)
@@ -501,7 +508,8 @@ class Gmm(_Triton):
             resident=self._resident(ba, config, target))
 
     def _fwd(self, tokens: jax.Array, kernel: jax.Array, sizes: jax.Array,
-             prologue_operands: tuple = (), epilogue_operands: tuple = (), *, out_dtype: str,
+             prologue_operands: tuple = (), epilogue_operands: tuple = (), layers: tuple = (), *,
+             out_dtype: str,
              trans_rhs: bool, interpret: bool, hooks: Hooks = NO_HOOKS, exact_sums: bool = False,
              dense: bool = False, config: Tile, return_residuals: bool = False):
         # Imported at first use: the kernels need jax's Pallas Triton backend,
@@ -518,7 +526,8 @@ class Gmm(_Triton):
             return (outs if hooks.out_dtypes else outs[0]), None
         from . import ragged_dot
         return ragged_dot.gmm(tokens, kernel, sizes, block_m=config.block_m, block_k=config.block_k,
-                              block_n=config.block_n, num_warps=config.warps, num_stages=config.stages,
+                              block_n=config.block_n, layer=_layer(layers), num_warps=config.warps,
+                              num_stages=config.stages,
                               trans_rhs=trans_rhs, interpret=interpret, compute_dtype=tokens.dtype,
                               out_dtype=jnp.dtype(out_dtype), prologue_operands=prologue_operands,
                               epilogue_operands=epilogue_operands, exact_sums=exact_sums,
@@ -707,7 +716,7 @@ class MosaicGmm(_Mosaic):
 
     def space(self, ba) -> tuple[mosaic_gpu.Tiles, ...]:
         kernel = ba.arguments['kernel']
-        depth, width = (kernel.shape[2], kernel.shape[1]) if ba.arguments['trans_rhs'] else kernel.shape[1:]
+        depth, width = kernel.shape[-2:][::-1] if ba.arguments['trans_rhs'] else kernel.shape[-2:]
         return tuple(tile for tile in _modelled(ba)
                      if depth % tile.block_k == 0 and width % tile.block_n == 0)
 
@@ -717,8 +726,8 @@ class MosaicGmm(_Mosaic):
 
     def costed(self, ba, config: mosaic_gpu.Tiles, target) -> cost.Cost:
         tokens, kernel = ba.arguments['tokens'], ba.arguments['kernel']
-        (rows, depth), groups = tokens.shape, kernel.shape[0]
-        width = kernel.shape[1] if ba.arguments['trans_rhs'] else kernel.shape[2]
+        (rows, depth), groups = tokens.shape, kernel.shape[-3]
+        width = kernel.shape[-2] if ba.arguments['trans_rhs'] else kernel.shape[-1]
         size = jnp.dtype(tokens.dtype).itemsize
         # A pair of multiprocessors runs two row tiles of one group, its second empty past the group.
         pair = config.cluster
@@ -737,7 +746,8 @@ class MosaicGmm(_Mosaic):
         return self._cost(ba, config, tiles * columns, depth / config.block_k, moved)
 
     def _fwd(self, tokens: jax.Array, kernel: jax.Array, sizes: jax.Array,
-             prologue_operands: tuple = (), epilogue_operands: tuple = (), *, out_dtype: str,
+             prologue_operands: tuple = (), epilogue_operands: tuple = (), layers: tuple = (), *,
+             out_dtype: str,
              trans_rhs: bool, interpret: bool, hooks: Hooks = NO_HOOKS, exact_sums: bool = False,
              dense: bool = False, config: mosaic_gpu.Tiles, return_residuals: bool = False):
         # Never set: the launch is not eligible for exact sums; a dense call is one group, as any.
@@ -746,7 +756,7 @@ class MosaicGmm(_Mosaic):
                               out_dtype=out_dtype, multiprocessors=self._multiprocessors(interpret),
                               interpret=INTERPRETED if interpret else False,
                               prologue_operands=prologue_operands, epilogue_operands=epilogue_operands,
-                              **hooks.kernel_options()), None
+                              layer=_layer(layers), **hooks.kernel_options()), None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -909,7 +919,7 @@ class MosaicTpuGmm(_MosaicTpu):
 
     def space(self, ba) -> tuple[mosaic_tpu.Blocks, ...]:
         kernel = ba.arguments['kernel']
-        depth, width = (kernel.shape[2], kernel.shape[1]) if ba.arguments['trans_rhs'] else kernel.shape[1:]
+        depth, width = kernel.shape[-2:][::-1] if ba.arguments['trans_rhs'] else kernel.shape[-2:]
         return tuple(blocks for blocks in TPU_BLOCKS
                      if depth % blocks.block_k == 0 and width % blocks.block_n == 0
                      and self._lays_out(ba, blocks))
@@ -931,8 +941,8 @@ class MosaicTpuGmm(_MosaicTpu):
         # over the depth for each column block: the rows are read once a column block, and each slot's
         # group's matrix once a slot (Megablox's own estimate).
         tokens, kernel = ba.arguments['tokens'], ba.arguments['kernel']
-        (rows, depth), groups = tokens.shape, kernel.shape[0]
-        width = kernel.shape[1] if ba.arguments['trans_rhs'] else kernel.shape[2]
+        (rows, depth), groups = tokens.shape, kernel.shape[-3]
+        width = kernel.shape[-2] if ba.arguments['trans_rhs'] else kernel.shape[-1]
         size = jnp.dtype(tokens.dtype).itemsize
         slots, columns = _block_tiles(rows, groups, config.block_m), width // config.block_n
         hooks = ba.arguments['hooks']
@@ -944,7 +954,8 @@ class MosaicTpuGmm(_MosaicTpu):
                           2 * config.block_m * config.block_n * depth, moved, tokens.dtype)
 
     def _fwd(self, tokens: jax.Array, kernel: jax.Array, sizes: jax.Array,
-             prologue_operands: tuple = (), epilogue_operands: tuple = (), *, out_dtype: str,
+             prologue_operands: tuple = (), epilogue_operands: tuple = (), layers: tuple = (), *,
+             out_dtype: str,
              trans_rhs: bool, interpret: bool, hooks: Hooks = NO_HOOKS, exact_sums: bool = False,
              dense: bool = False, config: mosaic_tpu.Blocks, return_residuals: bool = False):
         # Never set: the launch is not eligible for exact sums; a dense call is one group, as any.
@@ -952,7 +963,7 @@ class MosaicTpuGmm(_MosaicTpu):
         return mosaic_tpu.gmm(tokens, kernel, sizes, blocks=config, transpose_rhs=trans_rhs,
                               out_dtype=out_dtype, interpret=TPU_INTERPRETED if interpret else False,
                               prologue_operands=prologue_operands, epilogue_operands=epilogue_operands,
-                              **hooks.kernel_options()), None
+                              layer=_layer(layers), **hooks.kernel_options()), None
 
 
 @dataclasses.dataclass(frozen=True)
@@ -1073,32 +1084,34 @@ _GMMS = (MosaicGmm(), MosaicTpuGmm(), Gmm())
 _TGMMS = (MosaicTgmm(), MosaicTpuTgmm(), Tgmm())
 
 
-def launched_gmm(tokens, kernel, sizes, prologue_operands: tuple = (), epilogue_operands: tuple = (), *,
-                 out_dtype, trans_rhs: bool, hooks: Hooks = NO_HOOKS, interpret: bool, promoted: bool = False,
-                 dense: bool = False):
+def launched_gmm(tokens, kernel, sizes, prologue_operands: tuple = (), epilogue_operands: tuple = (),
+                 layers: tuple = (), *, out_dtype, trans_rhs: bool, hooks: Hooks = NO_HOOKS, interpret: bool,
+                 promoted: bool = False, dense: bool = False):
     """Each group's rows of `tokens` times its matrix of `kernel`, rounded to `tokens`'s dtype, through
     the launch that runs it (`_launch`), with the template's hooks (`templates.gemm.template.gemm`).
     `promoted`, the declared product's (`templates.product.Product`), adds each depth step's partial
     apart (`exact_sums`); `dense`, one group of every row (a dense product), the plain tiled kernel where
-    Triton runs it."""
+    Triton runs it; `layers`, a layer's index (an int32 scalar) where `kernel` is a bank of layers'
+    matrices `[layers, groups, ...]`, which each launch reads in place."""
     launches, arguments, options = _gmm_call(tokens, kernel, sizes, prologue_operands, epilogue_operands,
-                                             out_dtype=out_dtype, trans_rhs=trans_rhs, hooks=hooks,
+                                             layers, out_dtype=out_dtype, trans_rhs=trans_rhs, hooks=hooks,
                                              interpret=interpret, promoted=promoted, dense=dense)
     return _launch(launches, arguments, options)(*arguments, **options)
 
 
 def gmm_refusal(tokens, kernel, sizes, prologue_operands: tuple = (), epilogue_operands: tuple = (),
-                **options) -> str | None:
+                layers: tuple = (), **options) -> str | None:
     """Why no launch takes a `launched_gmm` call (`launch_refusal`), or None where one does."""
-    return launch_refusal(*_gmm_call(tokens, kernel, sizes, prologue_operands, epilogue_operands, **options))
+    return launch_refusal(*_gmm_call(tokens, kernel, sizes, prologue_operands, epilogue_operands, layers,
+                                     **options))
 
 
-def _gmm_call(tokens, kernel, sizes, prologue_operands: tuple, epilogue_operands: tuple, *, out_dtype,
-              trans_rhs: bool, hooks: Hooks = NO_HOOKS, interpret: bool, promoted: bool = False,
+def _gmm_call(tokens, kernel, sizes, prologue_operands: tuple, epilogue_operands: tuple, layers: tuple, *,
+              out_dtype, trans_rhs: bool, hooks: Hooks = NO_HOOKS, interpret: bool, promoted: bool = False,
               dense: bool = False) -> tuple:
     """`launched_gmm`'s launches, arguments and options."""
     arguments = (tokens, kernel.astype(tokens.dtype), sizes, tuple(prologue_operands),
-                 tuple(epilogue_operands))
+                 tuple(epilogue_operands), tuple(layers))
     options = {'out_dtype': jnp.dtype(out_dtype).name, 'trans_rhs': trans_rhs, 'hooks': hooks,
                'interpret': interpret, 'exact_sums': promoted, 'dense': dense}
     return _GMMS, arguments, options

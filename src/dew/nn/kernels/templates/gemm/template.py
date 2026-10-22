@@ -47,16 +47,25 @@ LAUNCH_AXES = {'prologue': ('rows', 'depth'), 'epilogue': ('rows', 'columns')}
 def gemm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None = None, *, transpose_rhs: bool = False,
          prologue=None, prologue_operands: tuple = (), epilogue=None, epilogue_operands: tuple = (),
          out_dtype, out_dtypes: tuple | None = None, precision: PrecisionLike = None,
-         interpret_on_cpu: bool = False, prologue_vjp=None):
+         interpret_on_cpu: bool = False, prologue_vjp=None, rhs_index: jax.Array | None = None):
     """Each group's rows of `lhs` times its matrix of `rhs`, through the hooks (the module's docstring):
     `[rows, width]` in `out_dtype`, or a tuple in `out_dtypes`. A `precision` above the default
     (explicitly or through `jax_default_matmul_precision`) sums an fp32 output in IEEE fp32, in XLA as in
     the kernels: the product `precision` declares (`templates.product.declared`), which every launch of
     the call and of its derivative keeps. `prologue_vjp(lhs, *side_arrays)`, where given, is the prologue's
     derivative in place of the prologue's own: a function of the multiplied operand's cotangent giving
-    `lhs`'s and each side array's (a fused producer's whole VJP, `fused`)."""
+    `lhs`'s and each side array's (a fused producer's whole VJP, `fused`). `rhs_index`, an integer scalar
+    where given, makes `rhs` a bank of layers' matrices (a leading axis before the groups', or before the
+    matrix's for a dense product) whose layer `rhs_index` the launches read in place, where slicing it out
+    would copy it every call (a scanned layer stack's); its derivative is the bank's, zero but at the
+    layer. A bank of another dtype than `lhs`'s is cast a layer at a time."""
     dense = group_sizes is None
-    rhs, group_sizes = _grouped(lhs, rhs, group_sizes)
+    layers = ()
+    if rhs_index is not None and rhs.dtype != lhs.dtype:
+        rhs = jax.lax.dynamic_index_in_dim(rhs, rhs_index, keepdims=False)  # cast one layer, not the bank
+    elif rhs_index is not None:
+        layers = (jnp.asarray(rhs_index, jnp.int32),)
+    rhs, group_sizes = _grouped(lhs, rhs, group_sizes, banked=bool(layers))
     prologue_arrays, prologue_axes = _split(prologue_operands, 'prologue')
     epilogue_arrays, epilogue_axes = _split(epilogue_operands, 'epilogue')
     dtypes = tuple(jnp.dtype(dtype) for dtype in (out_dtypes or (out_dtype,)))
@@ -64,20 +73,21 @@ def gemm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None = None, *
     plain = {'transpose_rhs': transpose_rhs, 'interpret_on_cpu': interpret_on_cpu, 'precision': precision,
              'dense': dense}
 
-    def value(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays):
+    def value(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays, layers):
         return _gemm(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, epilogue,
-                     epilogue_arrays, epilogue_axes, dtypes, several=several, **plain)
+                     epilogue_arrays, epilogue_axes, dtypes, several=several, layers=layers, **plain)
 
-    def portable(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays):
-        return _portable_gemm(lhs, rhs, group_sizes, prologue, prologue_arrays, epilogue, epilogue_arrays,
-                              dtypes, several, transpose_rhs, precision)
+    def portable(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays, layers):
+        return _portable_gemm(lhs, _layer_of(rhs, layers), group_sizes, prologue, prologue_arrays, epilogue,
+                              epilogue_arrays, dtypes, several, transpose_rhs, precision)
 
     def forward(*operands):
         return value(*operands), ()
 
     def backward(saved, operands, cotangent):
         del saved
-        lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays = operands
+        lhs, bank, group_sizes, prologue_arrays, epilogue_arrays, layers = operands
+        rhs = jax.ShapeDtypeStruct(bank.shape[-3:], bank.dtype)  # a layer's matrices
         cotangents = cotangent if several else (cotangent,)
         acc_shape = (lhs.shape[0], rhs.shape[1] if transpose_rhs else rhs.shape[2])
         if epilogue is None:
@@ -85,8 +95,8 @@ def gemm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None = None, *
             narrow = jnp.promote_types(cotangents[0].dtype, lhs.dtype) == lhs.dtype
         else:
             if _reads_accumulator(epilogue, acc_shape, epilogue_arrays):
-                acc = _gemm(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, None, (), (),
-                            (jnp.dtype(jnp.float32),), several=False, **plain)
+                acc = _gemm(lhs, bank, group_sizes, prologue, prologue_arrays, prologue_axes, None, (), (),
+                            (jnp.dtype(jnp.float32),), several=False, layers=layers, **plain)
             else:
                 acc = jnp.zeros(acc_shape, jnp.float32)
             outs, pull = jax.vjp(functools.partial(_tupled, epilogue), acc, *epilogue_arrays)
@@ -98,11 +108,13 @@ def gemm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None = None, *
         # through), wide otherwise, each product rounding once.
         work = lhs.dtype if narrow else jnp.promote_types(d_acc.dtype, jnp.float32)
         d_product = d_acc.astype(work)
-        matrix = rhs.astype(lhs.dtype)
+        # A bank is of `lhs`'s dtype (`gemm`), its layer read in place again.
+        matrix = bank.astype(lhs.dtype)
         # The cotangent of the operand the forward multiplied, `prologue(lhs)` rounded to `lhs`'s dtype.
         d_operand = jnp.asarray(_gemm(d_product, matrix, group_sizes, None, (), (), None, (), (),
                                       (jnp.dtype(lhs.dtype),), several=False, transpose_rhs=not transpose_rhs,
-                                      interpret_on_cpu=interpret_on_cpu, precision=precision, dense=dense))
+                                      interpret_on_cpu=interpret_on_cpu, precision=precision, dense=dense,
+                                      layers=layers))
         if narrow:
             d_rhs = gemm_t(lhs, d_product, None if dense else group_sizes, prologue=prologue,
                            prologue_operands=tuple(zip(prologue_arrays, prologue_axes, strict=True)),
@@ -112,16 +124,20 @@ def gemm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None = None, *
             d_rhs = gemm_t(operand.astype(work), d_product, None if dense else group_sizes,
                            out_dtype=rhs.dtype, precision=precision, interpret_on_cpu=interpret_on_cpu)
         d_rhs = jnp.swapaxes(d_rhs, 1, 2) if transpose_rhs else d_rhs
+        if layers:
+            zeros = jnp.zeros(bank.shape, d_rhs.dtype)
+            d_rhs = jax.lax.dynamic_update_index_in_dim(zeros, d_rhs, layers[0], 0)
         d_lhs, d_prologue = d_operand, ()
         if prologue is not None:
             d_lhs, d_prologue = _prologue_cotangents(prologue, lhs, prologue_arrays, prologue_axes,
                                                      group_sizes, d_operand, prologue_vjp)
         return (d_lhs.astype(lhs.dtype), d_rhs, np.zeros(group_sizes.shape, jax.dtypes.float0),
                 tuple(_as_cotangent(d, a) for d, a in zip(d_prologue, prologue_arrays, strict=True)),
-                tuple(_as_cotangent(d, a) for d, a in zip(d_epilogue, epilogue_arrays, strict=True)))
+                tuple(_as_cotangent(d, a) for d, a in zip(d_epilogue, epilogue_arrays, strict=True)),
+                tuple(np.zeros((), jax.dtypes.float0) for _ in layers))
 
     differentiable = generation.linear_tangent(forward, backward, portable)
-    return differentiable(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays)
+    return differentiable(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays, layers)
 
 
 def gemm_t(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None, *, prologue=None,
@@ -161,9 +177,9 @@ def gemm_t(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None, *, pro
 
 def _gemm(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, epilogue, epilogue_arrays,
           epilogue_axes, dtypes, *, several: bool, transpose_rhs: bool, interpret_on_cpu: bool,
-          precision: PrecisionLike, dense: bool = False):
-    """`gemm`'s value, on grouped operands."""
-    def kernel(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays, *, interpret):
+          precision: PrecisionLike, dense: bool = False, layers: tuple = ()):
+    """`gemm`'s value, on grouped operands (`layers` a bank's layer, `gemm`'s `rhs_index`)."""
+    def kernel(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays, layers, *, interpret):
         before_sides, before_axes, before_broadcast = _launchable(prologue_arrays, prologue_axes)
         after_sides, after_axes, after_broadcast = _launchable(epilogue_arrays, epilogue_axes)
         hooks = grouped_matmul.Hooks(prologue, before_axes, epilogue, after_axes,
@@ -172,18 +188,19 @@ def _gemm(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, epilo
         call = {'out_dtype': dtypes[0], 'trans_rhs': transpose_rhs, 'hooks': hooks, 'interpret': interpret,
                 'promoted': declared(lhs.dtype, precision, outputs=dtypes).promoted, 'dense': dense}
         # A call no launch takes (a TPU's widths its blocks do not divide) runs XLA's program.
-        if not _taken(grouped_matmul.gmm_refusal(lhs, rhs, group_sizes, before_sides, after_sides, **call)):
-            return portable(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays)
-        return grouped_matmul.launched_gmm(lhs, rhs, group_sizes, before_sides, after_sides, **call)
+        sides = (before_sides, after_sides, layers)
+        if not _taken(grouped_matmul.gmm_refusal(lhs, rhs, group_sizes, *sides, **call)):
+            return portable(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays, layers)
+        return grouped_matmul.launched_gmm(lhs, rhs, group_sizes, *sides, **call)
 
-    def portable(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays):
-        return _portable_gemm(lhs, rhs, group_sizes, prologue, prologue_arrays, epilogue, epilogue_arrays,
-                              dtypes, several, transpose_rhs, precision)
+    def portable(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays, layers):
+        return _portable_gemm(lhs, _layer_of(rhs, layers), group_sizes, prologue, prologue_arrays, epilogue,
+                              epilogue_arrays, dtypes, several, transpose_rhs, precision)
 
     if not _kernels_take(lhs.dtype, precision, dtypes):
-        return portable(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays)
+        return portable(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays, layers)
     return _dispatched(kernel, portable, interpret_on_cpu, lhs, rhs, group_sizes, prologue_arrays,
-                       epilogue_arrays)
+                       epilogue_arrays, layers)
 
 
 def _portable_gemm(lhs, rhs, group_sizes, prologue, prologue_arrays, epilogue, epilogue_arrays, dtypes,
@@ -306,11 +323,17 @@ def _tupled(hook, *args) -> tuple:
     return _as_tuple(hook(*args))
 
 
-def _grouped(lhs, rhs, group_sizes):
-    """`rhs` with a group axis and the group sizes: a dense product is one group of every row."""
+def _grouped(lhs, rhs, group_sizes, *, banked: bool = False):
+    """`rhs` with a group axis and the group sizes: a dense product is one group of every row (a bank's
+    group axis after its layers')."""
     if group_sizes is None:
-        return rhs[None], jnp.full((1,), lhs.shape[0], jnp.int32)
+        return jnp.expand_dims(rhs, 1 if banked else 0), jnp.full((1,), lhs.shape[0], jnp.int32)
     return rhs, group_sizes.astype(jnp.int32)
+
+
+def _layer_of(rhs, layers: tuple):
+    """A bank's layer (`gemm`'s `rhs_index`), sliced out for XLA's program, or `rhs` itself."""
+    return jax.lax.dynamic_index_in_dim(rhs, layers[0], keepdims=False) if layers else rhs
 
 
 def _split(operands: tuple, hook: str) -> tuple[tuple, tuple]:
