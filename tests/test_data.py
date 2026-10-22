@@ -1256,9 +1256,10 @@ def test_a_run_over_records_in_memory_checkpoints_and_resumes_where_it_stopped(t
         np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
 
 
-def test_a_batch_encoders_identity_names_its_reader_as_a_steps_identity_does():
+def test_a_batch_encoders_identity_is_the_plan_format_it_has_always_been():
     """The encoders that read a batch's captions or fields name the reader they run by its module and
-    qualified name, a method's own: two readers, two identities, and the same reader, one."""
+    qualified name, a method's own, in the spelling a saved plan holds: a change to it is a change
+    of plan format."""
     from dew.data.images import EncodeCaptions, EncodeFields
 
     class Reader:

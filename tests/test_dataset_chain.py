@@ -1201,5 +1201,5 @@ def test_the_defaults_a_verb_and_its_stage_take_are_the_same_value():
     assert rows.interleave().stages[-1] == Interleave()
     assert rows.pack(8).stages[-1] == Pack(8)
     assert rows.windows(8).stages[-1] == Windows(8)
-    assert rows.prefetch().stages[-1] == Prefetch(64)
+    assert rows.prefetch().stages[-1] == Prefetch()
     assert rows.workers(2).stages[-1] == Workers(2)
