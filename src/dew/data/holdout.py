@@ -245,9 +245,6 @@ def selecting(source: Source | Mixture | Phases) -> Iterator[Source | Mixture | 
 
 
 def _selected(source: Source, kind: str, selection: Mapping[str, object]) -> Mapping[str, object]:
-    """A selection's identity: its store's with what it selects beside it, or, over another
-    selection, that selection's nested under its own, so selections of one kind stacked don't
-    overwrite one another."""
-    if isinstance(source, _SELECTIONS):
-        return {"selection": kind, "of": source.fingerprint(), **selection}
-    return {**source.fingerprint(), **selection}
+    """A selection's identity: what it selects, of its source's identity, so selections stacked on
+    one another each keep their own."""
+    return {"selection": kind, "of": source.fingerprint(), **selection}
