@@ -4,8 +4,7 @@ import numpy as np
 import pytest
 from data_support import keep_captions
 
-from dew.config.data import Augment, HoldOut, ImageData, loader
-from dew.data import Files, Loading, Memory, images
+from dew.data import Files, Loading, Memory, images, presets
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition
 from dew.data.images import EncodeCaptions
@@ -105,8 +104,9 @@ def test_a_bucket_is_the_size_nearest_an_image_s_aspect_covered_and_cut_at_the_c
 
 
 @pytest.mark.parametrize("captions", ["record", "template", "templates", "empty"])
-def test_prepared_arrayrecords_and_public_image_steps_deliver_the_same_batches(tmp_path, captions):
-    """Prepared pixel bytes and class captions follow one chain for training and validation."""
+def test_the_images_preset_over_prepared_arrayrecords_delivers_what_its_public_steps_do(tmp_path, captions):
+    """Prepared pixel bytes and class captions follow one chain for training and validation: the
+    images preset's, and the public steps it is written as."""
     from array_record.python.array_record_module import ArrayRecordWriter
 
     path = tmp_path / "images.array_record"
@@ -120,25 +120,25 @@ def test_prepared_arrayrecords_and_public_image_steps_deliver_the_same_batches(t
             "caption": f"picture {index}".encode(), "url": f"catalog/{index}".encode(),
         }))
     writer.close()
-    settings = {"record": {}, "template": {"caption": "a photo of {label}"},
-                "templates": {"caption_templates": ("a {}", "a photo of {label}")},
-                "empty": {"caption_columns": ()}}[captions]
     classes = ("rose", "tulip")
-    source = Files(str(path))
-    recipe = ImageData(source=source, image_size=16, staging_size=32, augment=None, classes=classes,
-                       validation=HoldOut(records=4), **settings)
+    caption = {"record": images.caption(classes=classes),
+               "template": images.caption("a photo of {label}", classes=classes),
+               "templates": images.caption(templates=("a {}", "a photo of {label}"), classes=classes),
+               "empty": images.caption(classes=classes, columns=())}[captions]
+    train, held = Files(str(path)).holdout(records=4)
     loading = Loading(workers=0, threads=1, read_buffer=2)
     host = (EncodeCaptions(keep_captions),)
-    expected = loader(recipe, batch=4, read="indexed", seed=37, loading=loading, host=host)
-    train, held = source.holdout(records=4)
+
+    def preset(dataset):
+        # Staged at 32 pixels for an augmentation, of which there is none: resized to 16 directly.
+        return dataset.pipe(presets.images, 16, batch=4, staging_size=32, rejects=False, caption=caption)
+
+    expected = compile(preset(train.shuffle(37).repeat()), validation=preset(held), read="indexed", seed=37,
+                       loading=loading, host=host)
 
     def prepared(dataset):
         chain = dataset.map(images.DecodeImage("image", rejects=False)).map(images.Resize(16))
-        if captions == "templates":
-            return chain.random_map(images.caption(templates=settings["caption_templates"], classes=classes))
-        if captions == "empty":
-            return chain.map(images.caption(classes=classes, columns=()))
-        return chain.map(images.caption(settings.get("caption"), classes=classes))
+        return chain.random_map(caption) if captions == "templates" else chain.map(caption)
 
     actual = compile(prepared(train.shuffle(37).repeat()).batch(4),
                      validation=prepared(held).batch(4, drop_remainder=False),
@@ -161,16 +161,15 @@ def test_prepared_arrayrecords_and_public_image_steps_deliver_the_same_batches(t
 
 def test_host_image_augmentation_matches_across_workers_and_resumes_exactly():
     rows = [{**row, "label": np.int64(row["id"] % 3)} for row in pictures().values]
-    recipe = ImageData(source=Memory(rows), image_size=16, staging_size=24,
-                       validation=None,
-                       caption_templates=("a {label}", "a photo of {}"),
-                       classes=("rose", "tulip", "lily"),
-                       augment=Augment(backend="host", crop_scale=(0.6, 0.9)))
+    chain = Memory(rows).shuffle(7).repeat().pipe(
+        presets.images, 16, batch=8, staging_size=24, rejects=False,
+        augment=images.RandomCrop(16, scale=(0.6, 0.9), flip=True, jitter=True),
+        caption=images.caption(templates=("a {label}", "a photo of {}"), classes=("rose", "tulip", "lily")),
+        host=(EncodeCaptions(keep_captions),))
 
     def read(workers, count, state=None):
-        data = loader(recipe, batch=8, read="indexed", seed=7,
-                      loading=Loading(workers=workers, threads=1, read_buffer=2, worker_buffer=1),
-                      host=(EncodeCaptions(keep_captions),))
+        data = compile(chain, read="indexed", seed=7,
+                       loading=Loading(workers=workers, threads=1, read_buffer=2, worker_buffer=1))
         reader = data.train(DataPartition())
         try:
             if state is not None:
@@ -245,10 +244,11 @@ def test_a_saved_position_is_refused_by_a_run_that_tokenizes_its_captions_otherw
             SimpleDiT(patch_size=4, emb_features=16, num_layers=1, num_heads=2, mlp_ratio=1), Flow(),
             InputSpec(Field("image", (16, 16, 3)), conditions={"textcontext": condition}),
             solver=Euler(), steps=2)
-        recipe = ImageData(source=pictures(8), image_size=16, caption="a photograph of a flower in a field",
-                           validation=None)
-        return loader(recipe, batch=4, read="memory", loading=Loading(workers=0, threads=1, read_buffer=1),
-                      objective=objective.data())
+        chain = pictures(8).shuffle(0).repeat().pipe(
+            presets.images, 16, batch=4, augment=True, rejects=False,
+            caption=images.caption("a photograph of a flower in a field"))
+        return compile(chain, read="memory", loading=Loading(workers=0, threads=1, read_buffer=1),
+                       objective=objective.data())
 
     saving = data(8).train(DataPartition())
     try:
