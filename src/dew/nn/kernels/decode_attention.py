@@ -134,14 +134,14 @@ def _capped(softcap: float, logits, q_pos, k_pos):
     return softcap * jnp.tanh(logits / softcap)
 
 
-def _spec(scale: float, softcap: float | None, natural: bool) -> algebra.Forward:
+def _spec(scale: float, softcap: float | None, natural: bool, sinks: bool) -> algebra.Forward:
     """The algebra's facts for a decode launch: each query block's keys its row's span (`spans`), no
-    documents, the cap as its score hook, the logits `natural` or not (`algebra.Forward.base2`). A
-    decode block's rows are a key head's query heads and positions (`grouped_query`), so the hook takes
-    no query positions."""
+    documents, the cap as its score hook, the logits `natural` or not (`algebra.Forward.base2`), the
+    sinks its initial state. A decode block's rows are a key head's query heads and positions
+    (`grouped_query`), so the hook takes no query positions."""
     return algebra.Forward("spans", 0, ids=False, scale=scale,
                            score_mod=None if softcap is None else functools.partial(_capped, softcap),
-                           natural=natural)
+                           natural=natural, initial=sinks)
 
 
 def _attend(query: jax.Array, span: tuple, read, block: int, spec: algebra.Forward, steps,
@@ -306,7 +306,7 @@ class DecodeAttention(tuning.KernelOp):
         reduced = pl.BlockSpec((None, None, QUERIES, None), lambda row, head, split: (row, split, 0, head))
         out_shape, out_specs = _outputs(query.shape, query.dtype, splits, 1, queried,
                                         [summed, reduced, reduced])
-        spec = _spec(1 / math.sqrt(width), softcap, natural)
+        spec = _spec(1 / math.sqrt(width), softcap, natural, sinks is not None)
         out = pl.pallas_call(
             lambda *refs: _kernel(*refs, spec=spec, splits=splits, interpret=interpret,
                                   sinks=sinks is not None),
@@ -365,7 +365,7 @@ class PagedDecodeAttention(tuning.KernelOp):
         sunk = [] if sinks is None else [pl.BlockSpec((None, QUERIES), lambda row, head, split: (head, 0))]
         out_shape, out_specs = _outputs(query.shape, query.dtype, splits, 2, queried,
                                         [summed, reduced, reduced])
-        spec = _spec(1 / math.sqrt(width), softcap, natural)
+        spec = _spec(1 / math.sqrt(width), softcap, natural, sinks is not None)
         out = pl.pallas_call(
             lambda *refs: _paged_kernel(*refs, pages=pages, spec=spec, splits=splits, interpret=interpret,
                                         sinks=sinks is not None),

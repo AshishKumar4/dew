@@ -36,8 +36,9 @@ from dew.nn.kernels.templates.attention import LOG2E, NATURAL, Kind, natural_exp
 class Forward:
     """What the forward's functions specialize on, all static: the spans' `form` ('full', 'causal' or
     'spans', `KeySpans.form`), the call's key count `keys`, whether it packs documents (`ids`), the
-    softmax `scale`, the score hook `score_mod(s, q_pos, k_pos, *params)` on natural logits, and whether
-    the call keeps its logits `natural` (`base2`)."""
+    softmax `scale`, the score hook `score_mod(s, q_pos, k_pos, *params)` on natural logits, whether
+    the call keeps its logits `natural` (`base2`), and whether its softmax resumes from an `initial`
+    state (sinks, a partial; `raw`)."""
 
     form: str
     keys: int
@@ -45,6 +46,7 @@ class Forward:
     scale: float
     score_mod: Callable | None = None
     natural: bool = NATURAL
+    initial: bool = False
 
     @property
     def base2(self) -> bool:
@@ -65,9 +67,31 @@ class Forward:
         call of no keys, one whose spans narrow, or one a score hook may mask."""
         return self.keys == 0 or self.form == "spans" or self.score_mod is not None
 
+    @property
+    def raw(self) -> bool:
+        """Whether the natural form keeps its logits as the raw products, unscaled, so each exponent is a
+        difference of them scaled after it is taken, `(s - m) * scale * log2(e)`: no multiply precedes the
+        subtraction for the compiler to contract into it, so the largest logit's weight is 1 exactly and
+        every difference rounds once (the natural form's own arithmetic). Where a score hook reads the
+        scaled logits, the subtraction follows the hook's own arithmetic, and where the softmax resumes
+        from a state, whose natural maximum (a sink near fp32's largest) raw units could not hold, the
+        scaled logits' (`natural_exp`)."""
+        return not self.base2 and self.score_mod is None and not self.initial
+
     def power(self, x: jax.Array) -> jax.Array:
-        """The exponential the logits are in: exp2 folded, `natural_exp` natural."""
-        return jnp.exp2(x) if self.base2 else natural_exp(x)
+        """The exponential the logits are in: exp2 folded, the raw form's scaled difference, `natural_exp`
+        under a hook."""
+        if self.base2:
+            return jnp.exp2(x)
+        return jnp.exp2(x * (self.scale * LOG2E)) if self.raw else natural_exp(x)
+
+    def units(self, m: jax.Array) -> jax.Array:
+        """A natural maximum in the units the logits are in: base 2 folded, raw products raw."""
+        return m * LOG2E if self.base2 else m / self.scale if self.raw else m
+
+    def naturalized(self, m: jax.Array) -> jax.Array:
+        """A maximum in the logits' units taken back to natural ones (`units`' inverse)."""
+        return m / LOG2E if self.base2 else m * self.scale if self.raw else m
 
 
 def expand(x: jax.Array, like: jax.Array) -> jax.Array:
@@ -114,9 +138,9 @@ def empty(rows: int, width: int) -> Partial:
 
 def resumed(spec: Forward, m: jax.Array, total: jax.Array, acc: jax.Array) -> Partial:
     """The softmax resumed from a state `(m, total, acc)` (`Hooks.initial`: sinks, a resumed partial),
-    its maximum taken to base 2 where the step's logits are."""
+    its maximum taken to the units the step's logits are in (`Forward.units`)."""
     m, total, acc = (array.astype(jnp.float32) for array in (m, total, acc))
-    return Partial(acc, m * LOG2E if spec.base2 else m, total)
+    return Partial(acc, spec.units(m), total)
 
 
 def modify(spec: Forward, s: jax.Array, coords: Coords, params: tuple[jax.Array, ...] = (),
@@ -124,7 +148,7 @@ def modify(spec: Forward, s: jax.Array, coords: Coords, params: tuple[jax.Array,
     """A tile's logits from its products `s` `[bq, bk]` (fp32): scaled (by log2(e) too in base 2), then
     the score hook, then -inf at each key the query does not see. `masked` False is a tile every query
     of the block sees whole (a full tile of the block map), which takes no mask."""
-    logits = s * (spec.scale * LOG2E if spec.base2 else spec.scale)
+    logits = s if spec.raw else s * (spec.scale * LOG2E if spec.base2 else spec.scale)
     if spec.score_mod is not None:
         logits = hooked(spec.score_mod, logits, coords.q_pos, coords.k_pos, params)
     if not masked:
@@ -250,7 +274,7 @@ def finish(spec: Forward, state: Partial, *, initial: bool, output_mod: Callable
     """The block's output `[bq, Dv]` fp32 (its weighted values over its denominator, zero for a query
     that saw nothing and started from no state, then the output hook) and its residuals: the natural
     maximum (0 for such a query, as the reference's) and the denominator."""
-    m = state.m / LOG2E if spec.base2 else state.m
+    m = spec.naturalized(state.m)
     denominator = state.total
     if spec.guarded or initial:
         out = jnp.where(expand(denominator > 0, state.acc),
