@@ -159,14 +159,15 @@ def _forward_kernel(*refs, spec: algebra.Forward, score_kinds: tuple[Kind, ...],
     own) walks again, each row shifting as it needs, only the programs one of whose rows did; the plain
     walk itself is unchanged (`guard` 'none' where no row can overflow)."""
     refs = list(refs)
-    spans = bounds = query_ids = key_ids_ref = None
+    spans = bounds = ids = None
     if spec.form == "spans":
         # Only spans read their block map's bounds and their queries' intervals.
         bounds_ref = refs.pop(0)
         bounds = bounds_ref[0], bounds_ref[1]
         spans = refs.pop(0)[...], refs.pop(0)[...]
     if spec.ids:
-        query_ids, key_ids_ref = refs.pop(0)[...], refs.pop(0)
+        # The queries' ids, and the keys' ref a tile reads its own from.
+        ids = refs.pop(0)[...], refs.pop(0)
     query_ref, key_ref, value_ref = refs.pop(0), refs.pop(0), refs.pop(0)
     score_refs = [refs.pop(0) for _ in score_kinds]
     output_refs = [refs.pop(0) for _ in output_kinds]
@@ -197,7 +198,7 @@ def _forward_kernel(*refs, spec: algebra.Forward, score_kinds: tuple[Kind, ...],
         # jax's mha loads them.
         tile = pl.ds(index * block_k, block_k)
         coords = algebra.Coords(q_pos, index * block_k + jnp.arange(block_k)[None, :], spans,
-                                None if key_ids_ref is None else (query_ids, key_ids_ref[tile]))
+                                None if ids is None else (ids[0], ids[1][tile]))
         params = tuple(_tile_param(ref, kind, head, q_pos, tile)
                        for ref, kind in zip(score_refs, score_kinds, strict=True))
         logits = algebra.modify(spec, kernel_dot(query, key_ref[tile, :].T, interpret), coords, params)
