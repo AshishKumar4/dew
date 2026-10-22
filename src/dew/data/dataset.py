@@ -1146,7 +1146,7 @@ class GlobalReader(Protocol):
     def identity(self) -> str: ...
 
 
-def phase_ends(ends: Sequence[int | None], unit: str) -> tuple[int, ...]:
+def phase_ends(ends: Sequence[int | None], unit: Literal["step", "record"]) -> tuple[int, ...]:
     """The ends of every phase but the last, which runs on (`None`), each past the one before it and
     above zero, counted in `unit`s: steps where a run writes its phases (`Phases`), records where it
     reads them (`PhasedStream`)."""

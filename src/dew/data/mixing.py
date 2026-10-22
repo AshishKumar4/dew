@@ -17,7 +17,7 @@ import grain.experimental as gx
 import grain.python as pygrain
 
 from dew.data.dataset import Batch
-from dew.data.pipeline import Record, Rejected, mix_weights
+from dew.data.pipeline import Record, Rejected
 from dew.records import boolean, integer, record, text
 
 _log = logging.getLogger(__name__)
@@ -296,17 +296,23 @@ class _DeficitIterator(pygrain.DatasetIterator[Batch]):
 
 @dataclasses.dataclass(frozen=True)
 class Members:
-    """A mixture's members as a lowering reads them: one weight and one key each, the weights finite
-    and positive (`mix_weights`), the keys distinct, as a mix saves each member's position and
-    draws under its key (`dew.data.analysis._member_keys`)."""
+    """A mixture's members as a lowering reads them: its weights, which the `Mixture` checked, and a
+    key for each member, distinct, as a mix saves each member's position and draws under its key
+    (`dew.data.analysis._member_keys`)."""
 
     weights: tuple[float, ...]
     keys: tuple[str, ...]
 
     def __post_init__(self) -> None:
-        mix_weights(self.weights, len(self.keys))
-        if len(set(self.keys)) != len(self.keys):
-            raise ValueError(f"a mix needs one distinct key per corpus, not {list(self.keys)}")
+        if len(self.weights) != len(self.keys) or len(set(self.keys)) != len(self.keys):
+            raise ValueError(f"a mix needs one weight and one distinct key per member, not "
+                             f"{len(self.weights)} weights and keys {list(self.keys)}")
+
+    def corpora[Read](self, parents: Sequence[Read]) -> tuple[Read, ...]:
+        """`parents`, one corpus for each member, in the members' order."""
+        if len(parents) != len(self.keys):
+            raise ValueError(f"a mix of {len(self.keys)} members reads {len(parents)} corpora")
+        return tuple(parents)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -333,16 +339,12 @@ class Proportions:
         return tuple(counts)
 
     def at(self, position: int) -> tuple[int, int]:
-        """The corpus position `position` of the mix reads, and which of that corpus's records."""
-        remaining, here, past = sum(self.proportions), position, position + 1
-        for corpus, proportion in enumerate(self.proportions):
-            here_rest = here * (remaining - proportion) // remaining
-            past_rest = past * (remaining - proportion) // remaining
-            if here - here_rest != past - past_rest:
-                return corpus, past - past_rest - 1
-            remaining -= proportion
-            here, past = here_rest, past_rest
-        raise IndexError(position)
+        """The corpus position `position` of the mix reads, the one whose count grows with it, and
+        which of that corpus's records: the next it hasn't read."""
+        before, after = self.counts(position), self.counts(position + 1)
+        grown = (corpus for corpus, (was, now) in enumerate(zip(before, after, strict=True)) if now != was)
+        corpus = next(grown)
+        return corpus, before[corpus]
 
 
 class ProportionalSelection(pygrain.DatasetSelectionMap):
@@ -365,6 +367,9 @@ class ProportionalSelection(pygrain.DatasetSelectionMap):
     def __getitem__(self, index: int) -> tuple[int, int]:
         return self._proportions.at(index)
 
+    def __repr__(self) -> str:
+        return f"ProportionalSelection(proportions={self._proportions.proportions}, length={self._length})"
+
 
 class TokenDeficit(pygrain.IterDataset[Batch]):
     """Pick the corpus furthest below its token share, with index-order ties."""
@@ -380,7 +385,7 @@ class TokenDeficit(pygrain.IterDataset[Batch]):
     ):
         filtered = tuple(
             Accepted(parent, name, label, tokens=tokens)
-            for parent, name, label, _ in zip(parents, names, labels, members.keys, strict=True)
+            for parent, name, label in zip(members.corpora(parents), names, labels, strict=True)
         )
         super().__init__(filtered)
         ratios = tuple(Fraction(weight) for weight in members.weights)
@@ -533,10 +538,9 @@ class PrimedMix(pygrain.IterDataset[Batch]):
     dropped while the others resume where they were."""
 
     def __init__(self, parents: Sequence[pygrain.IterDataset[Batch]], members: Members):
-        if len(parents) != len(members.keys):
-            raise ValueError(f"a mix of {len(members.keys)} members reads {len(parents)} corpora")
-        super().__init__(parents)
-        self._corpora, self._weights, self._keys = tuple(parents), members.weights, members.keys
+        corpora = members.corpora(parents)
+        super().__init__(corpora)
+        self._corpora, self._weights, self._keys = corpora, members.weights, members.keys
 
     def __iter__(self) -> pygrain.DatasetIterator[Batch]:
         group = _PrimeReads([iter(parent) for parent in self._corpora])

@@ -103,6 +103,7 @@ from dew.data.pipeline import (
     Volatile,
     Windows,
     Workers,
+    children,
 )
 from dew.data.plan import Manifest
 from dew.data.readers import _FillShare
@@ -147,15 +148,10 @@ def _dropping(pipeline: Pipeline, lowering: _Lowering) -> bool:
     if lowering.cache is not None and not lowering.one_to_one:
         return True
     if any(_dropping(child, analyzed)
-           for child, analyzed in zip(_corpora(pipeline), lowering.children, strict=True)):
+           for child, analyzed in zip(children(pipeline), lowering.children, strict=True)):
         return True
     batched = _until(pipeline.stages, (BatchStage,))
     return any(_drops(stage) or isinstance(stage, Native) for stage in pipeline.stages[:batched])
-
-
-def _corpora(pipeline: Pipeline) -> tuple[Pipeline, ...]:
-    source = pipeline.source
-    return source.pipelines if isinstance(source, (Mixture, Phases)) else ()
 
 
 def _carried(pipeline: Pipeline, consumed: int, *, marked: bool) -> int:
@@ -1589,8 +1585,8 @@ class _Build:
 def _epoch_records(train: Pipeline, build: _Build) -> int | None:
     """The records in one epoch of a global order: each corpus's indexed order
     up to its first repeat, as the lowering builds it, so a slice, a limit and
-    a token split count exactly; a mixture, nested or not, reads until its
-    first part would come round. A repeat written before a cache counts the
+    a token split count exactly; a mixture, nested or not, reads until every
+    part has come round once, its slowest at its share. A repeat written before a cache counts the
     inputs a pass reads where the cache keeps one record for each, and none
     otherwise, ahead of reading them; phases are counted by none."""
     if not build.global_order:
@@ -1630,9 +1626,8 @@ def _split_spans(pipeline: Pipeline, build: _Build) -> Iterator[list[tuple[int, 
     lowering's own split (`_TokenSplit`) of the indexed order before it, built
     with the analysis of the pipeline it is written in, so they are the
     documents and token offsets a reader of the plan trains on."""
-    if isinstance(pipeline.source, (Mixture, Phases)):
-        for index, child in enumerate(pipeline.source.pipelines):
-            yield from _split_spans(child, build.child(index))
+    for index, child in enumerate(children(pipeline)):
+        yield from _split_spans(child, build.child(index))
     for at, split in enumerate(pipeline.stages):
         if at in build.lowering.splits and isinstance(split, TokenSplit):
             before = dataclasses.replace(pipeline, stages=pipeline.stages[:at])

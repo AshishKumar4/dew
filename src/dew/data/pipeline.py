@@ -426,18 +426,12 @@ class Mixture:
     tokens: Callable[[Batch], int] | None = None
 
     def __post_init__(self) -> None:
-        mix_weights(self.weights, len(self.pipelines))
-
-
-def mix_weights(weights: Sequence[float], members: int) -> None:
-    """Refuse weights that aren't one finite positive share for each of a mix's `members`, at least
-    one: a `Mixture`'s, and the members a lowering reads it by (`dew.data.mixing.Members`)."""
-    if not members:
-        raise ValueError("mix needs at least one dataset")
-    if len(weights) != members:
-        raise ValueError(f"mix has {members} datasets and {len(weights)} weights")
-    if any(not math.isfinite(weight) or weight <= 0 for weight in weights):
-        raise ValueError("mix weights must be finite and positive")
+        if not self.pipelines:
+            raise ValueError("mix needs at least one dataset")
+        if len(self.weights) != len(self.pipelines):
+            raise ValueError(f"mix has {len(self.pipelines)} datasets and {len(self.weights)} weights")
+        if any(not math.isfinite(weight) or weight <= 0 for weight in self.weights):
+            raise ValueError("mix weights must be finite and positive")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -452,12 +446,17 @@ class Phases:
         phase_ends(self.until_steps, "step")
 
 
+def children(pipeline: Pipeline) -> tuple[Pipeline, ...]:
+    """The chains `pipeline`'s mixture or phases read, none where it reads a store."""
+    source = pipeline.source
+    return source.pipelines if isinstance(source, (Mixture, Phases)) else ()
+
+
 def chains(pipeline: Pipeline) -> Iterator[Pipeline]:
     """Every chain of `pipeline`'s tree, children first: each corpus under its mixtures and phases,
     then the chain that mixes or phases them, and `pipeline` last."""
-    if isinstance(pipeline.source, (Mixture, Phases)):
-        for child in pipeline.source.pipelines:
-            yield from chains(child)
+    for child in children(pipeline):
+        yield from chains(child)
     yield pipeline
 
 
@@ -467,8 +466,8 @@ def with_children(pipeline: Pipeline, rewrite: Callable[[Pipeline], Pipeline]) -
     source = pipeline.source
     if not isinstance(source, (Mixture, Phases)):
         return pipeline
-    children = tuple(rewrite(child) for child in source.pipelines)
-    return dataclasses.replace(pipeline, source=dataclasses.replace(source, pipelines=children))
+    rewritten = tuple(rewrite(child) for child in source.pipelines)
+    return dataclasses.replace(pipeline, source=dataclasses.replace(source, pipelines=rewritten))
 
 
 def with_stores(pipeline: Pipeline, store: Callable[[Source], Source]) -> Pipeline:

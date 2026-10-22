@@ -37,9 +37,7 @@ from dew.data.pipeline import (
     DeviceStep,
     HostStep,
     Limit,
-    Mixture,
     Pack,
-    Phases,
     Pipeline,
     Prefetch,
     RandomStep,
@@ -227,24 +225,20 @@ def _documented(dataset: Dataset) -> None:
     """Refuse to pack token documents from a store that states no document ends (neither an index
     of them nor an EOS token), wherever it sits in the chain's sources: its tokens would read as
     one document, whose pieces no producer made."""
+    from dew.data.analysis import _leaves
     from dew.data.sources.tokens import TokenFiles
 
-    for source in _stores(dataset._chain().source):
+    for source in (store for _, leaf in _leaves(dataset._chain()) for store in _stores(leaf)):
         if isinstance(source, TokenFiles) and not source.documented:
             raise ValueError(f"packed text needs producer document boundaries or EOS: {source.describe()}")
 
 
-def _stores(source: Source | Mixture | Phases) -> Iterator[Source]:
-    """Every store under `source`: a mixture's or phases' corpora's, a concatenation's parts, and
-    the store each holdout selection selects from."""
+def _stores(source: Source) -> Iterator[Source]:
+    """Every store `source` reads: a concatenation's parts, and the store each holdout selection
+    selects from."""
     from dew.data.holdout import selecting
-    from dew.data.pipeline import Mixture, Phases
     from dew.data.sources.concatenate import Concatenate
 
-    if isinstance(source, (Mixture, Phases)):
-        for child in source.pipelines:
-            yield from _stores(child.source)
-        return
     for _, selected in selecting(source):
         if isinstance(selected, Concatenate):
             for part in selected.sources:
