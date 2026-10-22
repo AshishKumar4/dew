@@ -98,7 +98,6 @@ def test_the_forward_and_every_gradient_match_the_source(source, arrays, record,
     import torch
     from diffusers import Flux2Transformer2DModel
 
-    from tools.diffusers_flux2_reference import ids
     from tools.diffusers_wan_reference import float64
 
     model, params, layouts = load(source, name)
@@ -124,7 +123,7 @@ def test_the_forward_and_every_gradient_match_the_source(source, arrays, record,
     with float64():
         wide_model = Flux2Transformer2DModel.from_pretrained(
             checkpoint, torch_dtype=torch.float64, local_files_only=True).eval()
-    text_ids, image_ids = ids(rows, columns)
+    text_ids, image_ids = tool_support.load("diffusers_flux2_reference").ids(rows, columns)
 
     def reference_walk(model, dtype, drawn):
         inputs = [torch.tensor(drawn[key], dtype=dtype).requires_grad_() for key in ("latent", "context")]
