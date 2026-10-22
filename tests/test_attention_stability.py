@@ -109,10 +109,8 @@ def _cases() -> dict[str, Case]:
     empty = np.ones((2, 1, 4, 4), bool)
     empty[1] = False
     cases["a row of no keys"] = Case(*drawn, empty, {"lengths": np.asarray([4, 0])})
-    places = np.asarray([[0, 1, 5, 6]]), np.asarray([[2, 3, 4, 5]])
-    before = places[0][0][:, None] >= places[1][0][None, :]
-    cases["causal queries placed before every key"] = Case(
-        *_drawn(4, 4, 16, 5), before[None, None], {"causal": True, "positions": places})
+    cases["causal queries before every key"] = Case(*_drawn(4, 4, 16, 5), _causal(4, 4) & (np.arange(4) >= 2),
+                                                    {"causal": True, "starts": np.asarray([2])})
     ids = np.asarray([[1, 2, 3, 3]], np.int32)
     documents = _causal(4, 4) & (ids[:, None, :, None] == ids[:, None, None, :])
     cases["documents of one key"] = Case(*_drawn(4, 4, 16, 6), documents,
@@ -199,14 +197,21 @@ DECODED = [(case, form) for case, form in RUNS
 """The cases a decode step is: one query a row, a head width the decode kernel takes (16 to 256)."""
 
 
+def _cache(array: np.ndarray) -> jax.Array:
+    """Keys or values `[B, K, H, D]` in a cache of whole decode blocks (`decode_attention.BLOCK`, the
+    capacity its geometry takes), the slots past the keys zeros."""
+    slots = -array.shape[1] % decode_attention.BLOCK
+    return jnp.asarray(np.pad(array, ((0, 0), (0, slots), (0, 0), (0, 0))))
+
+
 @pytest.mark.parametrize("case, form", DECODED, ids=[f"{case}-{form}" for case, form in DECODED])
 def test_decode_is_finite_and_as_exact_as_the_reference_at_fp32s_edges(case, form):
-    """The decode kernel's output, interpreted, each row's keys its first `K`."""
+    """The decode kernel's output, interpreted, each row's keys the first `K` of its cache."""
     case = CASES[case]
     natural = {} if FORMS[form] is None else {"natural": FORMS[form]}
     keys = case.key.shape[1]
     lengths = jnp.full((case.query.shape[0],), keys, jnp.int32)
-    found = decode_attention.attend(jnp.asarray(case.query), jnp.asarray(case.key), jnp.asarray(case.value),
-                                    lengths, sinks=None if case.sinks is None else jnp.asarray(case.sinks),
+    found = decode_attention.attend(jnp.asarray(case.query), _cache(case.key), _cache(case.value), lengths,
+                                    sinks=None if case.sinks is None else jnp.asarray(case.sinks),
                                     interpret=True, **natural)
     _held(found, _reference(case, np.float32)[0], _truth(case)[0], "decode output")
