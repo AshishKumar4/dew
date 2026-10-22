@@ -2089,6 +2089,17 @@ def test_a_nested_mixture_read_a_counted_number_of_times_counts_the_records_its_
     assert len(_ids(loader.train(DataPartition()))) == 16 * epochs
 
 
+@pytest.mark.parametrize("taken", [8, 20])
+def test_a_mixture_repeated_for_ever_then_taken_counts_no_more_than_it_reads(taken):
+    """A mix of corpora of 8 and 4 at even weights, repeated for ever and then cut to its first
+    records, counts the fewest in which every corpus comes round, 15, where the cut holds that
+    many, and the cut where it holds fewer: a run reads that many and ends."""
+    loader = compile(mix([_tagged(1, 8), _tagged(2, 4)], weights=(1, 1)).repeat().take(taken).batch(1),
+                     loading=READ)
+    assert loader.records == min(15, taken)
+    assert len(_ids(loader.train(DataPartition()))) == taken
+
+
 def test_a_mixture_of_a_repeated_corpus_and_one_read_once_counts_what_a_run_reads():
     """A mix of a corpus of 8 repeated and one of 4 written without a repeat, at even weights, ends
     where the one read once does, at 8, and a run reads that many records: the order repeats
