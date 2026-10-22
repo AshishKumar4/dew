@@ -1,16 +1,14 @@
 #!/usr/bin/env python3
-"""Regenerate the Flow-GRPO transition fixture from the pinned author code.
+"""Record the Flow-GRPO transition of the pinned author code over check 1's seeds.
 
 Run with torch and diffusers installed. Downloads one Python source file from
 GitHub; no model, tokenizer, or weights are loaded. The KL oracle uses
-torch.distributions on the actual conditional transition variance.
-
-`recording` records the same transition over check 1's seeds instead
-(tools/recorded_references.py): the author code's float32 run's evidence from
-its float64 run, every float32 pin widened, with that run's sketch, each seed's
+torch.distributions on the actual conditional transition variance. The author
+code's float32 run's evidence from its float64 run, every float32 pin widened,
+is kept with that run's sketch (tools/recorded_references.py), each seed's
 inputs drawn again by tests/test_flow_grpo.py (`transition_inputs`):
 
-    PYTHONPATH=src:tools python tools/parity_flow_grpo.py recording
+    PYTHONPATH=src:tools python tools/parity_flow_grpo.py
 """
 
 from __future__ import annotations
@@ -26,8 +24,7 @@ import numpy as np
 COMMIT = "879042cf5707f8b90daa98d147d7deac2317c5da"
 SOURCE = (f"https://raw.githubusercontent.com/yifan123/flow_grpo/{COMMIT}/"
           "flow_grpo/diffusers_patch/sd3_sde_with_logprob.py")
-FIXTURE = Path(__file__).resolve().parents[1] / "tests/fixtures/rl/flow_transition.npz"
-RECORDED = FIXTURE.with_name("recorded_flow_transition.npz")
+RECORDED = Path(__file__).resolve().parents[1] / "tests/fixtures/rl/recorded_flow_transition.npz"
 SIGMAS = (1.0, 0.7, 0.4, 0.1)
 """The fixture's schedule: each of its rows takes one of these points' transitions to the next."""
 REPEATS = 16
@@ -144,48 +141,8 @@ def write_recording(command: str) -> None:
 
 
 def main() -> None:
-    import diffusers
-    import torch
-    from diffusers import FlowMatchEulerDiscreteScheduler
-
-    parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("mode", nargs="?", choices=("recording",))
-    parser.add_argument("--out", type=Path, default=FIXTURE)
-    parsed = parser.parse_args()
-    if parsed.mode == "recording":
-        write_recording("PYTHONPATH=src:tools python tools/parity_flow_grpo.py recording")
-        return
-    out = parsed.out
-    reference = fetched_reference()
-
-    scheduler = FlowMatchEulerDiscreteScheduler(shift=1.0)
-    scheduler.set_timesteps(sigmas=[1.0, 0.7, 0.4, 0.1])
-    rng = np.random.default_rng(112)
-    x = rng.normal(0, 0.2, (4, 2)).astype(np.float32)
-    velocity = rng.normal(0, 0.2, (4, 2)).astype(np.float32)
-    action = (x - 0.15 * velocity + rng.normal(0, 0.1, (4, 2))).astype(np.float32)
-    v = torch.tensor(velocity, requires_grad=True)
-    _, log_prob, mean, coefficient = reference.sde_step_with_logprob(
-        scheduler, v, scheduler.timesteps, torch.tensor(x), noise_level=0.7,
-        prev_sample=torch.tensor(action))
-    log_prob.sum().backward()
-    if v.grad is None:
-        raise RuntimeError("reference density did not differentiate velocity")
-    t, s = scheduler.sigmas[:-1], scheduler.sigmas[1:]
-    variance = coefficient[:, 0].square() * (t - s)
-    reference_mean = mean.detach() + torch.tensor([[0.1, -0.2]])
-    std = variance.sqrt()[:, None]
-    policy = torch.distributions.Independent(torch.distributions.Normal(mean.detach(), std), 1)
-    frozen = torch.distributions.Independent(torch.distributions.Normal(reference_mean, std), 1)
-    kl = torch.distributions.kl_divergence(policy, frozen)
-    out.parent.mkdir(parents=True, exist_ok=True)
-    np.savez(out, x=x, velocity=velocity, action=action, t=t.numpy(), t_next=s.numpy(),
-             mean=mean.detach().numpy(), variance=variance.numpy(),
-             mean_log_prob=log_prob.detach().numpy(), velocity_grad=v.grad.numpy(),
-             reference_mean=reference_mean.numpy(), conditional_kl=kl.numpy(),
-             noise_level=np.float32(0.7), source=np.asarray(SOURCE),
-             torch_version=np.asarray(torch.__version__), diffusers_version=np.asarray(diffusers.__version__))
-    print(f"{out}: {out.stat().st_size} bytes; torch {torch.__version__}, diffusers {diffusers.__version__}")
+    argparse.ArgumentParser(description=__doc__).parse_args()
+    write_recording("PYTHONPATH=src:tools python tools/parity_flow_grpo.py")
 
 
 if __name__ == "__main__":
