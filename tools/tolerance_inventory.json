@@ -609,10 +609,6 @@
    "comparisons": 2,
    "lane": "Models, Serving & RL"
   },
-  "tests/test_quantization.py": {
-   "comparisons": 16,
-   "lane": "Models, Serving & RL"
-  },
   "tests/test_quantization_sites.py": {
    "comparisons": 1,
    "lane": "Models, Serving & RL"
