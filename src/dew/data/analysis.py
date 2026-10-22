@@ -250,8 +250,8 @@ def _in_place(generation: Generation, source: Source | Mixture | Phases,
             and not placed.manifest().index_ordered):
         raise ValueError(
             f"a records holdout numbers its inputs by index, and generation {generation.url} numbers them by "
-            f"the shards a stream of {placed.describe()} read, in an order of its own; publish it from an "
-            "indexed read")
+            f"the shards a stream of {placed.describe()} read, which it doesn't state is the index order; "
+            "publish it from a memory read, or an indexed one (provision=True)")
     return SelectedGeneration(generation, selections, placed, placing), ()
 
 
