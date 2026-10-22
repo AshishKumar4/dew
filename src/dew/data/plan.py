@@ -62,8 +62,10 @@ def identified(value: dict[str, JSON] | list[JSON] | str | int | float | bool | 
 
 
 def callable_name(step: Callable[..., Batch]) -> str:
-    """`step`'s qualified name: a function's or method's own, else its type's, as `module.qualname`,
-    the name a step's identity is written in."""
+    """`step`'s qualified name, `module.qualname`: a function's or a bound method's own, else its
+    type's, as a batch encoder names the reader it runs. A step's identity (`StepIdentity.of`) names
+    a bound method by its type, as plans have always written it; only a function is named by its
+    own name there."""
     kind = step if inspect.isfunction(step) or inspect.ismethod(step) else type(step)
     return f"{kind.__module__}.{kind.__qualname__}"
 

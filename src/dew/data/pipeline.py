@@ -14,7 +14,7 @@ from typing import TYPE_CHECKING, Concatenate, Literal, Protocol, TypeGuard, run
 import grain.python as pygrain
 import numpy as np
 
-from dew.data.dataset import Batch, Records, phase_ends
+from dew.data.dataset import WORKER_BUFFER, Batch, Records, phase_ends
 
 if TYPE_CHECKING:
     import jax
@@ -53,6 +53,10 @@ class Reasoned(Protocol):
     reason: str
 
 
+PACK_POLICY: Literal["first-fit", "best-fit", "concat"] = "first-fit"
+"""How a pack fills its rows where none is asked for."""
+DROP_REMAINDER = True
+"""Whether a batch a training pass fills only in part is dropped, where none is asked for."""
 TOKEN_FIELDS = ("text",)
 """The per-token fields a pack or a window lays out where none are named."""
 PACK_BINS = 32
@@ -61,20 +65,11 @@ INTERLEAVE = 16
 """The sources an interleave reads at once where none is asked for."""
 PREFETCH = 64
 """The records a prefetch reads ahead where none is asked for."""
-WORKER_BUFFER = 2
-"""The batches each worker process reads ahead where none is asked for."""
 
 
 @runtime_checkable
 class Volatile(Protocol):
     volatile: bool
-
-
-def volatile(stage: Stage) -> bool:
-    """Whether `stage` reads what may change between reads (a step that says it is `Volatile`, as a
-    live fetch does), so neither a cache nor a second reader may stand for it: the one test the
-    cache prefix and the plan read."""
-    return isinstance(stage, Map) and isinstance(stage.step, Volatile) and stage.step.volatile
 
 
 @runtime_checkable
@@ -97,7 +92,7 @@ class TokenBudget:
     length (`TokenGeometry`) divides it into, resolved when it compiles."""
 
     tokens: int
-    drop_remainder: bool = True
+    drop_remainder: bool = DROP_REMAINDER
     batch_fn: Callable[[Sequence[Batch]], Batch] | None = None
 
     def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
@@ -260,7 +255,7 @@ class Interleave:
 @dataclasses.dataclass(frozen=True)
 class BatchStage:
     size: int
-    drop_remainder: bool = True
+    drop_remainder: bool = DROP_REMAINDER
     batch_fn: Callable[[Sequence[Batch]], Batch] | None = None
 
     def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
@@ -287,7 +282,7 @@ class Pack:
     seq_len: int
     fields: tuple[str, ...] = TOKEN_FIELDS
     bins: int = PACK_BINS
-    policy: Literal["first-fit", "best-fit", "concat"] = "first-fit"
+    policy: Literal["first-fit", "best-fit", "concat"] = PACK_POLICY
     segments: int | None = None
     along: tuple[tuple[str, int], ...] = ()
     overlap: int = 0
@@ -347,7 +342,7 @@ class TokenSplit:
 
 @dataclasses.dataclass(frozen=True)
 class Prefetch:
-    buffer: int
+    buffer: int = PREFETCH
 
 
 @dataclasses.dataclass(frozen=True)
@@ -741,7 +736,7 @@ class Dataset:
         size: int | None = None,
         *,
         tokens: int | None = None,
-        drop_remainder: bool = True,
+        drop_remainder: bool = DROP_REMAINDER,
         batch_fn: Callable[[Sequence[Batch]], Batch] | None = None,
     ) -> Pipeline:
         if (size is None) == (tokens is None):
@@ -758,7 +753,7 @@ class Dataset:
         *,
         fields: tuple[str, ...] = TOKEN_FIELDS,
         bins: int = PACK_BINS,
-        policy: Literal["first-fit", "best-fit", "concat"] = "first-fit",
+        policy: Literal["first-fit", "best-fit", "concat"] = PACK_POLICY,
         segments: int | None = None,
         along: tuple[tuple[str, int], ...] = (),
         overlap: int = 0,
@@ -1026,11 +1021,12 @@ type _Step = RecordStep | RandomStep | HostStep | Configured | ExpandStep | Colu
 
 def record_stage(step: RecordStep | pygrain.RandomMapTransform | Expansion, *, identity: str | None = None,
                  configured: Bound | None = None) -> Map | RandomMap | FlatMap:
-    """The stage a record step is applied by, from what it says it is: an expansion's records
-    (`FlatMap`), a generator's draws (`RandomMap`), or one record's replacement (`Map`), dropping
-    records where it says it does (`rejects`). The verbs check the step against the one they are
-    (`map`, `random_map`, `filter_map`, `random_filter_map`, `flat_map`); an objective's steps and a
-    configured step's binding are classified here alone."""
+    """The stage a record step is applied by where no verb names it, from what the step says it is:
+    an expansion's records (`FlatMap`), a generator's draws (`RandomMap`), or one record's
+    replacement (`Map`), dropping records where it says it does (`rejects`). An objective's steps
+    and a configured step's binding are read through it; a verb (`map`, `random_map`, `filter_map`,
+    `random_filter_map`, `flat_map`) builds the stage its name states, which a step of another
+    kind is refused."""
     if isinstance(step, Expansion):
         return FlatMap(step, identity, configured)
     if isinstance(step, pygrain.RandomMapTransform):

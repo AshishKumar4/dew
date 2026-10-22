@@ -46,6 +46,7 @@ from dew.data.analysis import (
     _name,
     _steps,
     _until,
+    _volatile,
 )
 from dew.data.cache import _Mapped
 from dew.data.concurrent import Concurrently
@@ -105,7 +106,6 @@ from dew.data.pipeline import (
     Windows,
     Workers,
     children,
-    volatile,
 )
 from dew.data.plan import Manifest
 from dew.data.readers import _FillShare
@@ -509,7 +509,7 @@ class _Prefix:
 
     @property
     def volatile(self) -> bool:
-        return any(volatile(stage) for stage in self.stages)
+        return any(_volatile(stage) for stage in self.stages)
 
     def __call__(self, index: int, raw: Record) -> tuple[Record, ...]:
         position = _position(raw)

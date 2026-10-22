@@ -45,6 +45,7 @@ from dew.data.analysis import (
     _stated,
     _steps,
     _until,
+    _volatile,
     _written,
 )
 from dew.data.dataset import (
@@ -97,7 +98,6 @@ from dew.data.pipeline import (
     Workers,
     children,
     record_stage,
-    volatile,
     with_children,
     with_stores,
 )
@@ -584,7 +584,7 @@ def _compiled(
         _derived(train, build),
         cache=_cache_references(original, read),
         members=_member_manifests(train, build, host),
-        volatile=any(volatile(stage) for stage in
+        volatile=any(_volatile(stage) for stage in
                      (*_steps(original), *(stage for source in sources for stage in _written(source, ())))),
     )
     tuned = build.tuned(train)
