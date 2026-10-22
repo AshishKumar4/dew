@@ -268,8 +268,8 @@ def test_a_memory_read_of_a_hub_image_split_holds_its_encoded_images(tmp_path, m
     from huggingface_hub.hf_api import GitRefs
     from PIL import Image as PILImage
 
-    from dew.config.data import ImageData, loader
-    from dew.data import Loading
+    from dew.data import Loading, presets
+    from dew.data.compile import compile
     from dew.data.dataset import DataPartition
 
     pixels = [np.full((8, 8, 3), 30 * index, np.uint8) for index in range(4)]
@@ -288,8 +288,8 @@ def test_a_memory_read_of_a_hub_image_split_holds_its_encoded_images(tmp_path, m
     monkeypatch.setattr(datasets, "load_dataset_builder", lambda *args, **kwargs: builder)
     held = Hub("acme/images").records("memory")
     assert [held[index]["image"]["bytes"] for index in range(4)] == [value["bytes"] for value in encoded]
-    data = loader(ImageData(Hub("acme/images"), image_size=8, augment=None, validation=None), batch=4,
-                  read="memory", loading=Loading(workers=0, threads=1, read_buffer=1))
+    chain = Hub("acme/images").shuffle(0).repeat().pipe(presets.images, 8, batch=4, rejects=False)
+    data = compile(chain, read="memory", loading=Loading(workers=0, threads=1, read_buffer=1))
     reader = data.train(DataPartition())
     try:
         batch = next(reader)

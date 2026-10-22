@@ -35,8 +35,6 @@ from flax import linen as nn
 from flax.linen.dtypes import promote_dtype
 from flax.typing import Dtype, PrecisionLike
 
-from dew.nn.dense import Dense
-
 from .attention import (
     LayerNorm,
     cached_validity,
@@ -47,10 +45,10 @@ from .attention import (
 )
 from .inputs import PLAIN_CALL, MixerCall, PredictionPhase, coordinates_of, valid_order
 from .mixer_base import ATTENTION_CONTEXT_RESIDUALS, MixerBase, MixerContext
-from .mla import INDEXER, MultiHeadLatentAttention, latent_refusals, open_mla_cache
-from .precision import at_least_fp32, float32_dot_general, float32_einsum
+from .mla import INDEXER, IndexerFront, MultiHeadLatentAttention, latent_refusals, open_mla_cache
+from .precision import at_least_fp32, float32_einsum
 from .sharding import down_projection
-from .sparse_selection import index_scores, selection_mask, top_k_selection
+from .sparse_selection import selection_mask, top_k_selection
 
 
 def _real_slots(valid, count: int):
@@ -68,7 +66,7 @@ def _real_slots(valid, count: int):
 # wq_b, wk, k_norm and weights_proj carry the V3.2 indexer's declarations
 # under the same names; the pool compression's two tables have no side worth
 # naming and take the shape heuristic.
-class KPoolIndexer(nn.Module):
+class KPoolIndexer(IndexerFront, nn.Module):
     """The k-pool indexer: which keys each query attends, by pools
     (`Glm5NextTextIndexer`, modeling_glm5_next.py:736-1024).
 
@@ -98,13 +96,10 @@ class KPoolIndexer(nn.Module):
             raise ValueError(
                 f"the pool budget is index_topk // index_kpool whole pools, so index_topk "
                 f"({self.top_k}) must be divisible by index_kpool ({self.kpool})")
-        dense = functools.partial(Dense, use_bias=False, dtype=self.dtype, precision=self.precision,
-                                  dot_general=float32_dot_general)
-        self.wq_b = dense(self.n_heads * self.head_dim, name='wq_b')
+        dense = self.declare_front()
         self.wk = dense(self.head_dim, name='wk')
         # A LayerNorm with weight and bias at a hardcoded 1e-6 (modeling_glm5_next.py:763).
         self.k_norm = LayerNorm(epsilon=1e-6, dtype=self.dtype, name='k_norm')
-        self.weights_proj = dense(self.n_heads, name='weights_proj')
         self.index_kpool_compress_ape = self.param(
             'index_kpool_compress_ape', nn.initializers.zeros, (self.kpool, self.head_dim), jnp.float32)
         self.index_kpool_compress_gate = self.param(
@@ -185,9 +180,8 @@ class KPoolIndexer(nn.Module):
         batch, length, _ = x.shape
         total = packed.shape[1]
         valid = packed[..., -1] > 0
-        query = self.wq_b(q_resid).reshape(batch, length, self.n_heads, self.head_dim)
         pool_keys, pool_indices, pool_valid = self._pools(packed)
-        scores = index_scores(query, pool_keys, self.weights_proj(x), self.precision)
+        scores = self.scored(self.queries(q_resid), pool_keys, x)
         # A pool is a candidate iff the query sees its last token
         # (modeling_glm5_next.py:832-839); its indices are clamped only so
         # the gather is legal, the validity test excludes it on its own.

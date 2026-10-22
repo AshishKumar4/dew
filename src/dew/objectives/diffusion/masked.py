@@ -189,7 +189,7 @@ class MaskedDiffusionObjective(Objective[Ratio]):
 
         The model reads every field the batch's `ModelInputs` carries, and a
         model that takes no such field refuses it. A packed batch
-        (``TextData(pack="first-fit")``) lays each window's documents out in
+        (``presets.lm(..., pack="first-fit")``) lays each window's documents out in
         `text_coordinates`, segment 0 for the padded tail, with their
         positions. Each document then attends to itself alone, in both
         directions, with its own positions, and the tail is neither masked

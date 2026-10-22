@@ -15,9 +15,9 @@ import numpy as np
 import pytest
 from transformers import AutoTokenizer
 
-from dew.config.data import ChatData, loader
-from dew.data import Loading
+from dew.data import Files, Loading, presets
 from dew.data.chat import ROLES_KEY, Conversation, Role, render_conversation
+from dew.data.compile import compile
 from dew.data.dataset import DataPartition
 
 TOKENIZER = Path(__file__).resolve().parent / "fixtures" / "tokenizers" / "tiny-chat"
@@ -86,6 +86,19 @@ def test_render_matches_trl_ids_and_assistant_mask(tokenizer, reference):
 
 # --- packing -----------------------------------------------------------------
 
+def packed(path, *, window, bins, batch, read="memory", loading=None, records=None, **settings):
+    """The conversations at `path` packed by the sft preset into `window`-token rows, `bins` open, by
+    its other `settings`, as a run reads them in batches of `batch`, and validating on the first
+    `records` rows they pack."""
+    def rows(**options):
+        return Files(path).pipe(presets.sft, str(TOKENIZER), seq_len=window - 1, bins=bins, **settings,
+                                **options)
+
+    order = rows(batch=None).shuffle(0, window=64 if read == "streamed" else None).repeat()
+    return compile(order.batch(batch), validation=rows(batch=batch, records=records), read=read,
+                   loading=loading or Loading(workers=0))
+
+
 @pytest.mark.parametrize("read", ["memory", "streamed"])
 def test_a_packed_sft_batch_keeps_ids_roles_and_documents_aligned(tmp_path, tokenizer, read):
     """Ids, roles, segment ids and positions pack together, by the memory read's planner or
@@ -98,9 +111,7 @@ def test_a_packed_sft_batch_keeps_ids_roles_and_documents_aligned(tmp_path, toke
         "the fixture tokenizer changed; re-derive the bins below")
     (a_ids, a_roles), (b_ids, b_roles), (c_ids, c_roles) = rendered
 
-    data = loader(ChatData(source=path, tokenizer=str(TOKENIZER), seq_len=window - 1, packing_bins=2,
-        validation=path, long="chunk"), batch=2, read=read, loading=Loading(workers=0),
-            validation_records=4 * (2))
+    data = packed(path, window=window, bins=2, batch=2, read=read, records=8, long="chunk")
     assert data.val is not None
     batches = list(data.val(DataPartition()))
     assert len(batches) == 1
@@ -137,9 +148,7 @@ def test_overlong_conversations_chunk_with_roles_aligned(tmp_path, tokenizer, op
     assert len(ids) > window
     chunks = -(-(len(ids) - 1) // (window - 1))
 
-    data = loader(ChatData(source=path, tokenizer=str(TOKENIZER), seq_len=window - 1, packing_bins=1,
-        validation=path, **options), batch=1, read="memory", loading=Loading(workers=0),
-            validation_records=4 * (1))
+    data = packed(path, window=window, bins=1, batch=1, records=4, **options)
     assert data.records == chunks, "one bin puts every chunk in a window of its own"
     assert data.val is not None
     batches = list(data.val(DataPartition()))
@@ -168,8 +177,7 @@ def test_the_train_stream_runs_end_to_end(tmp_path, tokenizer):
     rendered = {tuple(render(tokenizer, conversation)[0].tolist())
                 for conversation in (SHORT, MEDIUM, LONG)}
     columns = ("text", ROLES_KEY, "text_coordinates")
-    data = loader(ChatData(source=path, tokenizer=str(TOKENIZER), seq_len=95, packing_bins=2, long="chunk"),
-        batch=2, read="memory", loading=Loading(workers=2), validation_records=4 * (2))
+    data = packed(path, window=96, bins=2, batch=2, loading=Loading(workers=2), records=8, long="chunk")
 
     batch = next(data.train(DataPartition()))
 

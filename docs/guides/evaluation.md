@@ -86,21 +86,21 @@ artifact whose type `reads` names. This LM metric measures top-1 accuracy
 from the logits, and the run ranks its checkpoints by it:
 
 ```python
-from dew.data import Loading
-from dew.config.data import RecordsData, loader
 from dew import Checkpoints, Mean
 from dew.artifacts import TokenScores
+from dew.data import Memory
 
 accuracy = Mean(
     lambda scores, batch: (np.sum(scores.correct * scores.weights), np.sum(scores.weights)),
     reads=TokenScores, name="accuracy", better="higher",
 )
 language_model = LMObjective(model, seq_len=8, ema_decay=None)
-accuracy_data = loader(RecordsData(source={"text": train_tokens}, validation={"text": val_tokens}), batch=8, read="memory", loading=Loading(workers=0))
+accuracy_train = Memory({"text": train_tokens}).repeat().batch(8)
+accuracy_val = Memory({"text": val_tokens}).batch(8)
 run = Trainer(language_model, OptimConfig(optimizer="adam", learning_rate=0.01), key=jax.random.key(0),
               checkpoints=Checkpoints("runs/lm-accuracy"))
 state = run.fit(
-    accuracy_data, steps=10, eval_every=5, metrics=[accuracy], best=accuracy,
+    accuracy_train, validation=accuracy_val, steps=10, eval_every=5, metrics=[accuracy], best=accuracy,
 )
 run.checkpoints.wait()
 assert run.checkpoints.best is not None
@@ -189,15 +189,14 @@ The example continues the previous one and reuses `objective`, `data`, `Perplexi
 from dew import Evaluation, LocalTracker
 from dew.config import ModelConfig, OptimConfig, RunConfig, TrainerConfig
 from dew.config.sweep import GridSearch
-from dew.config.data import TextData
 
 config = RunConfig(
-    # The run records the model it trains, and the batches above stand in
-    # for the dataset this names.
+    # The run records the model and the data it trains; the batches above
+    # stand in for the records this chain reads.
     model=ModelConfig.from_model(objective.model),
-    data=TextData(source="", seq_len=8),
+    data=Memory({"text": train_tokens}).repeat().batch(8),
     optim=OptimConfig(optimizer="adam"),
-    trainer=TrainerConfig(name="lm-rate", checkpoint_dir="runs/sweep", steps=10, batch_size=8,
+    trainer=TrainerConfig(name="lm-rate", checkpoint_dir="runs/sweep", steps=10,
                           eval_every=None, checkpoint_every=None),
 )
 

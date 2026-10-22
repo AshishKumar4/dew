@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from functools import cached_property
 
 import grain.python as grain
@@ -11,7 +11,16 @@ import numpy as np
 
 from dew.data.dataset import Records
 from dew.data.pipeline import Dataset
-from dew.data.sources.base import _COUNTS, Read, Shard, ShardManifest, Source, _consumed, tokenizer_contract
+from dew.data.sources.base import (
+    _COUNTS,
+    Read,
+    Shard,
+    ShardManifest,
+    Source,
+    _consumed,
+    stated,
+    tokenizer_contract,
+)
 from dew.data.steps.text import stated_rules
 from dew.records import integer
 
@@ -26,8 +35,7 @@ class Concatenate(Dataset):
     or stores of any kinds. A record's position is its place in that order, every source's shards
     are its shards, and its identity is its sources' in order, so a run resumes on it as on any
     store and a changed source refuses the resume as it would alone. It is a store wherever one is
-    read, a recipe's source (`ImageData(source=...)`) among them; `concat` joins stores as a
-    dataset."""
+    read; `concat` joins stores as a dataset."""
 
     sources: tuple[Source, ...]
 
@@ -60,7 +68,13 @@ class Concatenate(Dataset):
         (`tokenizer_contract`, which refuses two), the rules any part's rows were counted by
         where every part states its own (`count_rules`), and any other fact, class names among
         them, where every source states the one value."""
-        stated = [source.metadata() for source in self.sources]
+        return self._merged([source.metadata() for source in self.sources])
+
+    def stated(self) -> Mapping[str, object]:
+        """What every part states of its records without reading them, merged as `metadata` is."""
+        return self._merged([stated(source) for source in self.sources])
+
+    def _merged(self, stated: Sequence[Mapping[str, object]]) -> Mapping[str, object]:
         contract = tokenizer_contract((source.describe(), facts)
                                       for source, facts in zip(self.sources, stated, strict=True))
         facts: dict[str, object] = dict(contract)
