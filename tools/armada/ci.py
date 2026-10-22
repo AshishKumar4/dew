@@ -507,6 +507,13 @@ def file_of(case: ET.Element) -> str:
     return "/".join(parts[:module + 1]) + ".py"
 
 
+def red_as(kind: str, nodes: list[str]) -> dict:
+    """What turned a red row red, for grading it again (`land.sh`, `suspect.sh`): `kind` "nodes", its
+    `failed` tests alone, by node id; "collect", its file's collection; "deadline", its task's; or
+    "whole", its file otherwise (a test that did not collect, a missing import, pytest's own exit)."""
+    return {"kind": kind, "failed": nodes}
+
+
 def shown(output: str) -> str:
     """The end of a task's output, and the stack faulthandler printed for a test that hung, if one did."""
     stack = output.rfind("Timeout (")
@@ -532,7 +539,8 @@ def collect(python: str, tests: list[str], out: Path, deadline: float) -> int:
         errors = dict.fromkeys(tests, f"pytest --collect-only exited {done.returncode}\n{output[-4000:]}")
     seconds = (time.monotonic() - began) / len(tests)
     rows = [{"name": row(python, name, COLLECT), "exitCode": 1 if name in errors else 0, "seconds": seconds,
-             "output": errors.get(name, "")} for name in tests]
+             "output": errors.get(name, ""), **(red_as(COLLECT, []) if name in errors else {})}
+            for name in tests]
     out.write_text(json.dumps({"rows": rows}))
     return 0
 
@@ -627,24 +635,32 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
     shares = apportioned(own_seconds, time.monotonic() - began, len(tests))
     for name in tests:
         own = [case for case in cases if file_of(case) == name]
+        failed = [(case, kind, node) for case in own for kind in ("failure", "error")
+                  if (node := case.find(kind)) is not None]
         red = [f"{kind.upper()} {case.get('classname')}::{case.get('name')}: {node.get('message')}"
-               for case in own for kind in ("failure", "error") if (node := case.find(kind)) is not None]
-        red += [f"SKIPPED on a missing import {case.get('classname')}::{case.get('name')}: "
-                f"{node.get('message')}" for case in own for node in case.iter("skipped")
-                if "could not import" in f"{node.get('message')} {node.text}"]
+               for case, kind, node in failed]
+        skipped = [f"SKIPPED on a missing import {case.get('classname')}::{case.get('name')}: "
+                   f"{node.get('message')}" for case in own for node in case.iter("skipped")
+                   if "could not import" in f"{node.get('message')} {node.text}"]
         # pytest exits 1 for failed tests and 5 for none collected; any other exit (a crash, a signal,
         # an internal error) leaves even a written report untrustworthy, so every row it holds is red.
-        if done.returncode not in (0, 1, 5) or (not own and done.returncode == 1):
-            red.append(f"pytest exited {done.returncode}" + ("" if own else f" with no report of {name}"))
+        exited = ([f"pytest exited {done.returncode}" + ("" if own else f" with no report of {name}")]
+                  if done.returncode not in (0, 1, 5) or (not own and done.returncode == 1) else [])
+        red += skipped + exited
         if expired:
             red.append(f"{INTERRUPTED} of {deadline:.0f} s and was interrupted")
+        # A failed case with no class path is a file that did not collect, no test of it.
+        nodes = sorted({node_of(case) for case, _, _ in failed if case.get("classname")})
+        whole = skipped or exited or not nodes or any(not case.get("classname") for case, _, _ in failed)
+        cause = ({} if not red else red_as("deadline", []) if expired else red_as("whole", []) if whole
+                 else red_as("nodes", nodes))
         seconds = shares[name]
         # armada times a file at the sum of its rows' timings, a split file's groups together, each
         # Python's apart.
         ran.append({"name": row(python, name, split), "exitCode": 1 if red else 0, "seconds": seconds,
                      "output": "\n".join(red + ([shown(output)] if red else [])),
                      "tests": {node_of(case): float(case.get("time") or 0) for case in own},
-                     "timings": {row(python, name, ""): seconds}})
+                     "timings": {row(python, name, ""): seconds}, **cause})
     out.write_text(json.dumps({"rows": rows + ran}))
     if coverage is None:
         # A traced run's rows, timed under tracing, are no rows to reuse.
