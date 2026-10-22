@@ -12,6 +12,7 @@ import numpy as np
 
 from dew.data.chat import ROLES_KEY, Role
 from dew.data.dataset import Batch
+from dew.data.facts import shaped, unshaped
 from dew.data.pipeline import Rejected
 from dew.data.prompts import (
     FIELDS as PROMPT_FIELDS,
@@ -55,6 +56,13 @@ class ResponseCanvases:
         if min(self.prompt_length, self.canvas_size, self.count) < 1:
             raise ValueError("response canvases need a positive prompt_length, canvas_size and count")
 
+    def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
+        """A row for each assistant turn: its context and completion canvases as `text`, the
+        canvases filled as `canvas_mask`."""
+        width = self.prompt_length + self.count * self.canvas_size
+        return shaped(shaped(unshaped(facts, ROLES_KEY), "text", [width]), "canvas_mask",
+                      [self.count * self.canvas_size])
+
     def flat_map(self, element: Batch) -> Sequence[Batch]:
         ids = np.asarray(element["text"], np.int32)
         assistant = (np.asarray(element[ROLES_KEY]) == Role.ASSISTANT).astype(np.int8)
@@ -74,6 +82,16 @@ class ResponseCanvases:
                          **({"_dew_truncated": True} if cut else {})})
         return rows
 
+
+
+def prompt_facts(facts: Mapping[str, object], tokenizer: str, max_prompt_len: int,
+                 reward_bytes: int | None) -> Mapping[str, object]:
+    """The facts of rendered prompts: `max_prompt_len` ids and their length, and the reward fields
+    `reward_bytes` wide where known, in place of the prompt's columns."""
+    rows = shaped(shaped(unshaped(facts, *PROMPT_FIELDS), PROMPT_KEY, [max_prompt_len]), LENGTH_KEY, [])
+    for name in (SOURCE_KEY, TRUTH_KEY, INFO_KEY):
+        rows = unshaped(rows, name) if reward_bytes is None else shaped(rows, name, [reward_bytes])
+    return {**rows, "tokenizer": tokenizer}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -97,6 +115,9 @@ class RenderPrompt(grain.MapTransform):
 
     def dependencies(self) -> Mapping[str, object]:
         return {"tokenizer": self.vocabulary.dependencies()}
+
+    def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
+        return prompt_facts(facts, self.tokenizer, self.max_prompt_len, self.reward_bytes)
 
     def map(self, element: Batch) -> Batch | Rejected:
         element = record(element, "prompt row")
@@ -130,6 +151,12 @@ class ConfigurePrompt:
     pad_id: int
     long: Literal["drop", "truncate"]
     thinking: bool | None
+
+    def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
+        """What the step it binds makes: its reward width the facts state, else measured."""
+        width = facts.get("reward_bytes")
+        stated = width if isinstance(width, int) else None
+        return prompt_facts(facts, self.tokenizer, self.max_prompt_len, stated)
 
     def __call__(self, metadata: Mapping[str, object]) -> RenderPrompt:
         return RenderPrompt(

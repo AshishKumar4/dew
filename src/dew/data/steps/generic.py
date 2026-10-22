@@ -1,4 +1,4 @@
-"""Field selection and record filtering shared by the typed recipes."""
+"""Field selection, formatting and record filtering, steps any chain takes."""
 
 from __future__ import annotations
 
@@ -24,6 +24,15 @@ class Fields(grain.MapTransform):
     rename: tuple[tuple[str, str], ...] = ()
     remove: tuple[str, ...] = ()
     bookkeeping: bool = False
+
+    def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
+        """The shapes of the fields kept, under their new names."""
+        shapes = record(facts.get("fields", {}), "fields")
+        names = tuple(shapes) if self.names is None else self.names
+        kept = {name: shapes[name] for name in names if name in shapes and name not in self.remove}
+        renamed = dict(self.rename)
+        return {**facts, "fields": {**{name: shape for name, shape in kept.items() if name not in renamed},
+                                    **{new: kept[old] for old, new in self.rename if old in kept}}}
 
     def map(self, element: Batch) -> Batch:
         renamed = dict(self.rename)

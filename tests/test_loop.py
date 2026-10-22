@@ -5,13 +5,12 @@ checkpointed passes, which compute it another way, are on par with it from
 float64 over drawn models and tokens (check 1)."""
 
 import dataclasses
-import functools
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from model_support import TINY_DECODER
+from model_support import TINY_DECODER, decode_steps, model_draw
 from reference_error import assert_as_exact
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -30,18 +29,13 @@ def tokens(rng, length=12, rows=2):
 
 
 SEEDS = {'decode': 64, 'scanned': 64, 'checkpointed': 256, 'block decode': 32}
-"""Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada, 2026-10-21):
+"""Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada):
 the most any of a site's cases took."""
 
 
 def drawn(model, length=12, rows=2):
     """Check 1's draw for `model`: a seed's parameters and `rows` rows of `length` tokens."""
-    init = jax.jit(model.init)
-
-    def draw(seed):
-        ids = tokens(jax.random.fold_in(jax.random.key(1), seed), length, rows)
-        return init(jax.random.fold_in(jax.random.key(0), seed), ids), ids
-    return draw
+    return model_draw(model, (rows, length), VOCAB)
 
 
 def wide(model):
@@ -50,25 +44,16 @@ def wide(model):
     return jax.jit(model.clone(dtype=jnp.float64).apply)
 
 
-@functools.cache
-def stepping(model):
-    """`model`'s cache made, and its decode step, each one compiled program."""
-    return (jax.jit(lambda params, rows: model.apply(params, rows, method=CausalTransformer.init_cache,
-                                                     mutable=['cache'])[1], static_argnums=1),
-            jax.jit(lambda params, ids: model.apply(params, ids, decode=True, mutable=['cache'])))
-
-
 def decoded(model, params, ids, prompt=4):
     """Prefill `prompt` tokens, then decode the rest one at a time: each
     position's logits and the cache after the last."""
-    made, step = stepping(model)
-    cache = made(params, ids.shape[0])
-    logits, cache = step({**params, **cache}, ids[:, :prompt])
+    made, step = decode_steps(model)
+    logits, cache = step(params, made(params, ids.shape[0]), ids[:, :prompt])
     steps = [logits]
     for position in range(prompt, ids.shape[1]):
-        logits, cache = step({**params, **cache}, ids[:, position:position + 1])
+        logits, cache = step(params, cache, ids[:, position:position + 1])
         steps.append(logits)
-    return jnp.concatenate(steps, axis=1), cache['cache']
+    return jnp.concatenate(steps, axis=1), cache
 
 
 def unrolled(params, steps):

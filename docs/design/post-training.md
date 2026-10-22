@@ -174,7 +174,7 @@ DPO carries a swapped-halves test guarding the pair order; GRPO carries one fail
 
 ## 12. Staged runs
 
-`Recipe` is an ordered tuple of `Stage` values over one decoder. It composes the existing objectives, rollouts and data classes and adds no second plan object. The data type selects the objective in `Recipe._build`: `TextData` pretraining, `ChatData` SFT, `PreferenceData` DPO, `PromptData` GRPO, and `RecordsData` with `Episodes` PPO. A `Teacher` distills a pretraining or SFT stage.
+`Recipe` is an ordered tuple of `Stage` values over one decoder. Each stage names its loss, and its data is a chain ending in that loss's preset: `"pretrain"` over `presets.lm`, `"sft"` over `presets.sft`, `"dpo"` over `presets.preferences`, `"grpo"` over `presets.prompts`, and `"ppo"` over rows of task ids with `Episodes`. `Recipe.run` checks each stage's data against its loss through the chain's facts, the fields its preset writes, and refuses a mismatch by name. A `Teacher` distills a pretraining or SFT stage.
 
 Each stage has its own checkpoint directory and a restarted optimizer. `Objective.model_variables` defines the handoff: PPO passes its policy without the critic; distillation passes the student without the teacher. The next stage initializes from those variables and freezes its own reference where required. `Recipe.run` builds all stages' objectives and rollouts before the first stage trains, so invalid data or settings fail before work begins.
 
