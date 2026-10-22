@@ -73,7 +73,8 @@ def _ring_sums(x, *, interpret, consumers: int = 1):
                     # Each consumer's own staging buffer: the warpgroups share the scope's allocations.
                     out_smem[wg] = total
                     plgpu.commit_smem()
-                    plgpu.copy_smem_to_gmem(out_smem.at[wg], out_gmem.at[tile, :, pl.ds(wg * columns, columns)])
+                    mine = out_gmem.at[tile, :, pl.ds(wg * columns, columns)]
+                    plgpu.copy_smem_to_gmem(out_smem.at[wg], mine)
                 plgpu.wait_smem_to_gmem(0)
 
             hopper.roles(wg, consumers, consumer, producer)
