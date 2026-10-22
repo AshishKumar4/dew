@@ -220,16 +220,26 @@ def test_the_resource_gate_refuses_a_spilling_mosaic_kernel():
     from kernel_compile import mosaic_failures, mosaic_kernels
 
     within = {"kernel": "k", "unread": [], "shared": 1024, "tmem": 256, "registers": 168, "spilled": 0}
-    record = {"name": "case", "limit": 2048, "tmem_limit": 512, "kernels": [within]}
+    record = {"name": "case", "limit": 2048, "shared": 0, "tmem_limit": 512, "kernels": [within]}
     assert not mosaic_failures([record])
     for past in ({"shared": 4096}, {"tmem": 513}, {"spilled": 40}):
         assert mosaic_failures([{**record, "kernels": [{**within, **past}]}])
-    # A report without its ptxas log, or without a field, is read as missing, not as within.
+    # The program's own refusal of a block past shared memory fails it whatever its Mosaic kernels say.
+    assert mosaic_failures([{**record, "shared": 4096}])
+    # Either report without the other, or a report without a field, is read as missing, not as within.
+    complete = ("smem_scratch_bytes=1024 tmem_scratch_cols=0, tmem_collective_scratch_cols=0",
+                "Used 168 registers\n0 bytes spill stores, 0 bytes spill loads")
     with tempfile.TemporaryDirectory() as directory:
-        Path(directory, "k.resources.txt").write_text("smem_scratch_bytes=1024")
-        [kernel] = mosaic_kernels(directory)
-        assert set(kernel["unread"]) == {"tensor memory columns", "registers", "spills"}
-        assert mosaic_failures([{**record, "kernels": [kernel]}])
+        Path(directory, "a.resources.txt").write_text(complete[0])
+        Path(directory, "a.ptxas").write_text(complete[1])
+        spilling = "Used 255 registers\n40 bytes spill stores, 40 bytes spill loads"
+        Path(directory, "b.ptxas").write_text(spilling)
+        Path(directory, "c.resources.txt").write_text("smem_scratch_bytes=1024")
+        a, b, c = mosaic_kernels(directory)
+        assert not a["unread"]
+        assert set(b["unread"]) == {"shared bytes", "tensor memory columns"}
+        assert set(c["unread"]) == {"tensor memory columns", "registers", "spills"}
+        assert len(mosaic_failures([{**record, "kernels": [a, b, c]}])) == 2
 
 
 def test_splash_compiles_for_a_v5e_with_libtpu():
