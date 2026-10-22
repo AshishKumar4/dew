@@ -2154,6 +2154,13 @@ def test_an_epoch_of_an_order_read_on_counts_the_step_that_completes_it():
     assert set(read) == set(range(100, 105))
 
 
+def test_a_mixture_a_run_cuts_without_a_repeat_counts_its_cut():
+    """A mix of two corpora of 8 cut to its first 3 records and written without a repeat counts those
+    3 an epoch: the run's own repeat reads the cut."""
+    loader = compile(mix([_tagged(1, 8), _tagged(2, 8)], weights=(1, 1)).take(3).batch(1), loading=READ)
+    assert loader.records == 3
+
+
 def test_a_mixture_of_a_repeated_corpus_and_one_read_once_counts_what_a_run_reads():
     """A mix of a corpus of 8 repeated and one of 4 written without a repeat, at even weights, ends
     where the one read once does, at 8, and a run reads that many records: the order repeats
