@@ -310,6 +310,26 @@ def test_a_packed_batch_scores_the_kl_of_its_documents_alone():
             float(alone.metrics["indexer_kl"]), rel=1e-5), phase
 
 
+def test_a_float64_kl_is_summed_in_float64():
+    """The objective sums its layers' sown indexer KLs at their own width, at least fp32: a float64
+    model's per-query KLs give a float64 total, the float64 sum over the counted queries, where an
+    fp32 one stays fp32."""
+    import math
+
+    from dew.objectives.lm.objective import batch_text
+
+    objective = LMObjective(deepseek_stack(4), SEQ, indexer=IndexerTraining("sparse"))
+    batch = token_batch()
+    prepared = batch_text(batch)
+    with jax.enable_x64(new_val=True):
+        kl = jnp.asarray(np.random.default_rng(7).random((4, SEQ)) * 1e-3 + 1.0, jnp.float64)
+        total, mass = objective._indexer_term({"layer": {"kl": (kl,)}}, prepared, batch)
+        assert total.dtype == jnp.float64
+        assert float(total) == math.fsum(np.asarray(kl).ravel()) and float(mass) == 4 * SEQ
+        narrow, _ = objective._indexer_term({"layer": {"kl": (kl.astype(jnp.float32),)}}, prepared, batch)
+        assert narrow.dtype == jnp.float32
+
+
 @pytest.mark.parametrize("phase, topk", [("warmup", None), ("sparse", 4)])
 def test_packing_carried_by_the_model_inputs_scores_the_same_kl(phase, topk):
     """Either phase reads a packed row's documents off its `ModelInputs` as

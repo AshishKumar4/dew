@@ -48,6 +48,7 @@ from dew.nn.precision import (
     capped_logits,
     compensated_add,
     compensated_sum,
+    compensated_total,
     head_product,
     rounded_operand,
     rounds_to_bf16,
@@ -579,12 +580,39 @@ def _whole_head_bwd(chunks, precision, predict, temperature, picked, group, resi
         logits, 0, excluded, peaks, masses, targets.reshape(-1), loss_cotangent.reshape(-1),
         partition_cotangent.reshape(-1), picked))
     d_raw = _logits_cotangent(d_raw, precision)
-    d_states = jnp.einsum('tv,vd->td', d_raw, table.astype(operands), precision=precision,
-                          preferred_element_type=work)
+    d_states = _state_product(d_raw, table.astype(operands), precision, work,
+                              None if precision is BF16 else FP32_STATE_BLOCK)
     d_table = jnp.einsum('tv,td->vd', d_raw, hidden.reshape(-1, features).astype(operands),
                          precision=precision, preferred_element_type=work)
     return (d_states.reshape(hidden.shape).astype(hidden.dtype), d_table.astype(table.dtype),
             None, None, d_cap, d_columns)
+
+
+FP32_STATE_BLOCK = 1024
+"""The columns an fp32 whole head's state gradient sums each block of before a compensated sum over
+the blocks (`_state_product`). One product over a whole vocabulary rounds its long sum alone: 131
+tokens over 2053 columns sat 1.60 times as far from float64 as the tiled head on XLA:CPU, 1.11 times
+over 1024-column blocks and 0.90 over 512 (24 seeds), check 1 passing at both. On one A100-40GB,
+Qwen3-0.6B's head (151936 columns, 1024 wide, 4096 tokens) in fp32 took 53.7 ms forward and backward
+at 1024, 64.2 at 512, against 57.1 tiled and 40.0 for one product (node receipts
+TR-head-blocks-float32, 2026-10-21); in bf16, where one product passes check 1, it took 23.9 ms
+against 29.9 tiled and 36.7 at 1024, so a bf16 head keeps one product."""
+
+
+def _state_product(d_raw, table, precision, work, block: int | None) -> jax.Array:
+    """The state gradient `d_raw @ table` over the vocabulary: one product, or with `block` the
+    vocabulary cut into blocks of that many columns (`FP32_STATE_BLOCK`), every block's product taken
+    at once (`[blocks, tokens, features]`) and the blocks summed as a double-float pair
+    (`compensated_sum`)."""
+    if block is None or table.shape[0] <= block:
+        return jnp.einsum('tv,vd->td', d_raw, table, precision=precision, preferred_element_type=work)
+    count = -(-table.shape[0] // block)
+    pad = count * block - table.shape[0]
+    blocks = jnp.pad(d_raw, ((0, 0), (0, pad))).reshape(d_raw.shape[0], count, block)
+    rows = jnp.pad(table, ((0, pad), (0, 0))).reshape(count, block, table.shape[1])
+    parts = jnp.einsum('tnb,nbd->ntd', blocks, rows, precision=precision, preferred_element_type=work)
+    # One reduction whose accumulator is a double-float pair, an overflowed block's infinity kept.
+    return compensated_sum(parts, (0,))
 
 
 _whole_head = jax.custom_vjp(_whole_head_impl, nondiff_argnums=(5, 6, 7, 8, 10, 11))
@@ -768,9 +796,11 @@ def _fused_terms(hidden, table, labels, weights, z_loss: float, cap, columns: _C
             d_raw, terms = pullback(cotangent)
             # Each column term's running sum over the token tiles as a double-float pair, rounded once at
             # the end: summed tile after tile in fp32, 43 tiles of a 128-token f32 head left the scale
-            # and bias gradients 1.5 times as far from float64 as the whole head's.
-            d_columns = jax.tree.map(lambda pair, term: jnp.stack(compensated_add(
-                (pair[0], pair[1]), (term.astype(work), jnp.zeros(term.shape, work)))), d_columns, terms)
+            # and bias gradients 1.5 times as far from float64 as the whole head's. The plain sum beside
+            # it keeps an overflowed term's infinity (`compensated_total`).
+            d_columns = jax.tree.map(lambda held, term: jnp.stack((*compensated_add(
+                (held[0], held[1]), (term.astype(work), jnp.zeros(term.shape, work))),
+                held[2] + term.astype(work))), d_columns, terms)
             d_raw = _logits_cotangent(d_raw, precision)
             values.append(jnp.einsum('tv,vd->td', d_raw, product_matrix, precision=precision,
                                      preferred_element_type=work))
@@ -787,9 +817,10 @@ def _fused_terms(hidden, table, labels, weights, z_loss: float, cap, columns: _C
     if gradients:
         outputs += (jnp.zeros((count, features), work),)
     d_table = jnp.zeros(table.shape, work) if gradients else None
-    d_columns = jax.tree.map(lambda terms: jnp.zeros((2, *terms.shape), work), columns) if gradients else None
+    d_columns = jax.tree.map(lambda terms: jnp.zeros((3, *terms.shape), work), columns) if gradients else None
     outputs, d_table, d_columns = _over_tiles((outputs, d_table, d_columns), count, chunk, tokens)
-    summed = None if d_columns is None else jax.tree.map(lambda pair: pair[0] + pair[1], d_columns)
+    summed = None if d_columns is None else jax.tree.map(
+        lambda held: compensated_total((held[0], held[1]), held[2]), d_columns)
     return outputs, d_table, summed
 
 
