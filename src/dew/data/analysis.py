@@ -65,6 +65,7 @@ from dew.data.pipeline import (
     Workers,
     _declares_rejects,
     chains,
+    children,
     with_children,
 )
 from dew.data.plan import Manifest, StepIdentity, _changed, _semantic, identified
@@ -100,7 +101,7 @@ class _RestrictedReads(Protocol):
 
 
 @dataclasses.dataclass(frozen=True)
-class _Members:
+class _ConcatenationPreparers:
     """A concatenation's stores that cannot take a read, each prepared by its own preparer
     (`_provisioner`), so the concatenation takes it once they have."""
 
@@ -127,7 +128,8 @@ def _provisioner(source: Source, read: Read) -> _Provisionable | None:
         preparers = [_provisioner(member, read) for member in source.sources if not member.supports(read)]
         if not preparers or any(preparer is None for preparer in preparers):
             return None
-        return _Members(source, tuple(preparer for preparer in preparers if preparer is not None))
+        ready = tuple(preparer for preparer in preparers if preparer is not None)
+        return _ConcatenationPreparers(source, ready)
     return source if isinstance(source, _Provisionable) and source.can_provision(read) else None
 
 
@@ -793,7 +795,7 @@ def _analyzed(
     one a memory read runs eagerly; a scored branch reads its whole order in
     one canonical pass, so its split is whole."""
     source = pipeline.source
-    nested = source.pipelines if isinstance(source, (Mixture, Phases)) else ()
+    nested = children(pipeline)
     if isinstance(source, Mixture):
         # A mixture reads its members' records and makes one batch of its own, so a member's batch,
         # and every stage after it, would never run.
@@ -801,7 +803,7 @@ def _analyzed(
         if batched is not None:
             raise ValueError(f"mixture member {_name(batched)} is batched; a mixture batches once, after "
                              f"mix: move the member's batch and the stages after it onto the mixture")
-    children = tuple(_analyzed(child, read, validation=validation, promotion=promotion) for child in nested)
+    lowered = tuple(_analyzed(child, read, validation=validation, promotion=promotion) for child in nested)
     ancestry = tuple(stage for child in nested for stage in _steps(child))
     stages = pipeline.stages
     cache = _at(stages, Artifact)
@@ -817,8 +819,8 @@ def _analyzed(
     per_share = _checked(pipeline, read, ancestry, eager, validation=validation, promotion=promotion)
     if isinstance(source, Mixture) and source.tokens is not None:
         per_share = per_share or not all(_states_its_targets(child) for child in nested)
-    per_share = per_share or any(child.per_share for child in children)
-    children = tuple(_cut(child, per_share) for child in children)
+    per_share = per_share or any(child.per_share for child in lowered)
+    lowered = tuple(_cut(child, per_share) for child in lowered)
     steps = (*ancestry, *stages)
     repeats = [stage.epochs for stage in steps if isinstance(stage, Repeat)]
     endless = not any(isinstance(stage, Limit) for stage in steps) and (
@@ -835,7 +837,7 @@ def _analyzed(
     epochs = None if written is None else 1 if absorbed is None else absorbed[1].epochs
     if isinstance(source, Phases):
         order: Mapping[str, object] = {
-            "phases": [child.order for child in children],
+            "phases": [child.order for child in lowered],
             "members": _members(source.pipelines),
             "until_steps": list(source.until_steps),
         }
@@ -844,7 +846,7 @@ def _analyzed(
         order = {
             **(
                 {
-                    "corpora": [child.order for child in children],
+                    "corpora": [child.order for child in lowered],
                     "members": _members(source.pipelines),
                     "weights": list(source.weights),
                     "shares": "tokens" if source.tokens is not None else "accepted rows",
@@ -860,7 +862,7 @@ def _analyzed(
         }
     lowering = _Lowering(
         per_share,
-        children,
+        lowered,
         cache,
         eager,
         _at(stages, Interleave),

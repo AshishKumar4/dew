@@ -97,6 +97,7 @@ from dew.data.pipeline import (
     Windows,
     Workers,
     _declares_rejects,
+    children,
     with_children,
     with_stores,
 )
@@ -265,8 +266,8 @@ def _row_tokens(pipeline: Pipeline) -> int | None:
     ]
     if declared:
         return declared[-1].max_length
-    if isinstance(pipeline.source, (Mixture, Phases)):
-        lengths = {_row_tokens(child) for child in pipeline.source.pipelines}
+    if nested := children(pipeline):
+        lengths = {_row_tokens(child) for child in nested}
         if len(lengths) > 1:
             raise ValueError(f"a token budget needs rows of one length, and the corpora's are {lengths}")
         return lengths.pop()
