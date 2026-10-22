@@ -37,12 +37,12 @@ arithmetic.
 """
 
 import argparse
-import importlib.util
 import sys
 import types
 from pathlib import Path
 
 import numpy as np
+from reference_source import module_at
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "rl"
 VERL = Path("/tmp/design/verl")
@@ -298,20 +298,6 @@ def registering(*_):
     return lambda function: function
 
 
-def compile_reference(name, path):
-    """Compile a reference file under its own module name, imports stubbed."""
-    spec = importlib.util.spec_from_file_location(name, path)
-    if spec is None or spec.loader is None:
-        raise ImportError(f"{path} is not a Python source file; is the clone checked out?")
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    parent, _, leaf = name.rpartition(".")
-    if parent in sys.modules:
-        setattr(sys.modules[parent], leaf, module)
-    spec.loader.exec_module(module)
-    return module
-
-
 def load_verl(verl=VERL):
     """verl's core_algos and the masked reductions it calls, from the clone at `verl`."""
     stub("ray")
@@ -328,9 +314,9 @@ def load_verl(verl=VERL):
     stub("verl.workers")
     stub("verl.workers.config", ActorConfig=ActorConfig)
 
-    compile_reference("verl.utils.torch_functional",
+    module_at("verl.utils.torch_functional",
                       verl / "verl" / "utils" / "torch_functional.py")
-    return compile_reference("verl.trainer.ppo.core_algos",
+    return module_at("verl.trainer.ppo.core_algos",
                              verl / "verl" / "trainer" / "ppo" / "core_algos.py")
 
 
@@ -350,10 +336,10 @@ def load_tunix():
     stub("tunix.rl.function_registry", default_registry=Registry(),
          register_policy_loss_fn=registering, register_value_loss_fn=registering,
          register_advantage_estimator=registering)
-    compile_reference("tunix.oss.utils", TUNIX / "tunix" / "oss" / "utils.py")
-    compile_reference("tunix.sft.utils", TUNIX / "tunix" / "sft" / "utils.py")
-    common = compile_reference("tunix.rl.common", TUNIX / "tunix" / "rl" / "common.py")
-    algo_core = compile_reference("tunix.rl.algo_core",
+    module_at("tunix.oss.utils", TUNIX / "tunix" / "oss" / "utils.py")
+    module_at("tunix.sft.utils", TUNIX / "tunix" / "sft" / "utils.py")
+    common = module_at("tunix.rl.common", TUNIX / "tunix" / "rl" / "common.py")
+    algo_core = module_at("tunix.rl.algo_core",
                                   TUNIX / "tunix" / "rl" / "algo_core.py")
     return algo_core, common
 

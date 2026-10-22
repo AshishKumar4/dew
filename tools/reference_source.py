@@ -101,6 +101,10 @@ def module_at(name: str, path: Path) -> ModuleType:
     spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
     sys.modules[name] = module
+    # A dotted name is also its parent package's attribute, as Python's import binds it.
+    parent, _, leaf = name.rpartition(".")
+    if parent in sys.modules:
+        setattr(sys.modules[parent], leaf, module)
     spec.loader.exec_module(module)
     return module
 

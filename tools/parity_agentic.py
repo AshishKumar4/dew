@@ -33,7 +33,8 @@ from pathlib import Path
 import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from parity_rl import ActorConfig, compile_reference, load_verl, stub
+from parity_rl import ActorConfig, load_verl, stub
+from reference_source import module_at
 from reference_runs.common import git_head
 
 SOURCES = Path.home() / ".cache/dew/research/src"
@@ -98,11 +99,11 @@ def load():
     stub("verl.protocol", DataProto=object)
     stub("verl.trainer.config.algorithm", RolloutCorrectionConfig=object)
     stub("verl.workers.config.actor", PolicyLossConfig=object)
-    helper = compile_reference("verl.trainer.ppo.rollout_corr_helper",
+    helper = module_at("verl.trainer.ppo.rollout_corr_helper",
                                VERL / "verl/trainer/ppo/rollout_corr_helper.py")
     stub("agentlightning")
     stub("agentlightning.verl")
-    lightning = compile_reference("agentlightning.verl.per_rollout_loss",
+    lightning = module_at("agentlightning.verl.per_rollout_loss",
                                   LIGHTNING / "agentlightning/verl/per_rollout_loss.py")
     return core, helper, lightning
 
