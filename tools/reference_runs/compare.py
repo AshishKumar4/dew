@@ -70,11 +70,16 @@ def conditions(records: dict[str, dict]) -> list[str]:
         if len({json.dumps(value) for value in values.values()}) > 1:
             problems.append(f"{key}: {values}")
     for name in names[1:]:
+        # Torch logs its schedule's float64, Dew its float32 one: each run's value as a float32 is the
+        # base run's, exactly, element by element; any difference, the next float32 included, is one.
         steps = min(len(base["lr"]), len(records[name]["lr"]))
-        gap = np.max(np.abs(np.subtract(base["lr"][:steps], records[name]["lr"][:steps])) /
-                     np.maximum(np.abs(base["lr"][:steps]), 1e-30))
-        if gap > 1e-6:
-            problems.append(f"lr of {name} parts from {names[0]} by {gap:.2e} (relative)")
+        ours = np.asarray(records[name]["lr"][:steps], np.float64).astype(np.float32)
+        theirs = np.asarray(base["lr"][:steps], np.float64).astype(np.float32)
+        parted = np.flatnonzero(ours != theirs)
+        if parted.size:
+            first = int(parted[0])
+            problems.append(f"lr of {name} parts from {names[0]} at {parted.size} of {steps} steps, first at "
+                            f"step {first}: {records[name]['lr'][first]!r} against {base['lr'][first]!r}")
     return problems
 
 
