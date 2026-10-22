@@ -485,31 +485,29 @@ def split_accumulate(others: jax.Array, own: jax.Array, others_total: jax.Array,
     return rescale(others + joined, alpha) + product, jnp.where(moved, own_tile, alpha * own), total
 
 
-def normalized_split(out: jax.Array, own: jax.Array, others_total: jax.Array, total: jax.Array,
-                     natural: jax.Array, anchor_value: jax.Array) -> tuple[jax.Array, ...]:
-    """A guarded row's split sums for the backward (`split_delta`), from its output `out` `[bq, Dv]` (fp32,
-    each element the plain walk's where finite, `finish`), its anchor's own weight, the other keys' weights'
-    sum and their denominator `total` (shifted alike) and its natural denominator `natural`: every sum
-    normalized and taken to `natural / 2^s`, `s = ceil(log2(natural))`, which is the residual's shift, so
-    the backward's arithmetic reads them as any shifted sums. Normalized, no sum overflows (each is at most
-    the values' largest) and none loses a column the output resolves to more than its lowest binade."""
-    own_n, others_total_n = own * inverse(total), others_total * inverse(total)
-    shift = jnp.ceil(jnp.log2(jnp.where(natural > 0, natural, 1.0)))
-    ratio = power2(natural, -shift)
-    others = (out - expand(own_n, out) * anchor_value.astype(jnp.float32)) * expand(ratio, out)
-    return others, own_n * ratio, others_total_n * ratio, shift
+def normalized_terms(logits: jax.Array, maximum: jax.Array, total: jax.Array, at_anchor: jax.Array,
+                     dtype, how: Recompute) -> tuple[jax.Array, jax.Array]:
+    """A tile's normalized weights `exp(s - m) / T` at the walk's maximum and natural denominator, the
+    reference's probabilities, narrowed to the values' `dtype`: zero at the anchor key (`at_anchor`), the
+    left operand of the other keys' sum, and the anchor's own, fp32. Normalized, no sum of them overflows
+    (each is at most the values' largest) and every product is the reference's own, so a column the
+    reference resolves is resolved here, whatever another column's size."""
+    p = below(logits, maximum, how) * expand(inverse(total), logits)
+    rounded = p.astype(dtype)
+    rest = jnp.where(at_anchor, jnp.zeros_like(rounded), rounded)
+    return rest, jnp.where(at_anchor, rounded, jnp.zeros_like(rounded)).astype(jnp.float32).sum(axis=-1)
 
 
-def split_residuals(spec: Forward, split: Partial, own: jax.Array, others_total: jax.Array,
-                    anchor_value: jax.Array, state: Partial, *, initial: bool) -> tuple[jax.Array, ...]:
-    """A training walk's split sums for the backward and their shift: as the walk left them (`split`'s,
-    shift 0 unguarded), a guarded live row's normalized from its output (`normalized_split`; `state` the
-    walk's with its split sums joined)."""
+def split_residuals(split: Partial, own: jax.Array, others_total: jax.Array,
+                    normalized: tuple[jax.Array, jax.Array, jax.Array] | None) -> tuple[jax.Array, ...]:
+    """A training walk's split sums for the backward and their shift: as the walk left them (shift 0
+    unguarded), and a guarded live row's `normalized` ones (the other keys' weighted values, the anchor's
+    weight and the other keys' weights over the natural denominator, `normalized_terms`) with shift -1,
+    which tells `split_delta` they are normalized."""
     sums = split.acc, own, others_total, jnp.zeros_like(own)
     if split.shift is None:
         return sums
-    out, _, natural = finish(spec, state, initial=initial)
-    fresh = normalized_split(out, own, others_total, split.total, natural, anchor_value)
+    fresh = (*normalized, jnp.full_like(own, -1.0))
 
     def chosen(new, old):
         return jnp.where(expand(split.live, old) if old.ndim > own.ndim else split.live, new, old)
@@ -758,8 +756,12 @@ def split_delta(others: jax.Array, own: jax.Array, others_total: jax.Array, tota
     at the forward's maximum. D's numerator about 0 is `(B + own v_c) · dO`, about `c = v_c · dO` it is
     `(B - others_total v_c) · dO - state_total c`, its terms kept apart so a state or keys that weigh
     little beside the anchor are not lost from a total; each query takes the one nearer its D. The split
-    sums are at each row's `2^-shift` (`room`), and `total` and `state_total` are taken there."""
-    total, state_total = power2(total, -shift), power2(state_total, -shift)
+    sums are at each row's `2^-shift` (`room`), and `total` and `state_total` are taken there; a row whose
+    shift is negative holds normalized sums (`split_residuals`), its total 1 and its state's share over
+    `total`."""
+    normalized = shift < 0
+    total, state_total = (jnp.where(normalized, 1.0, power2(total, -shift)),
+                          jnp.where(normalized, state_total * inverse(total), power2(state_total, -shift)))
     cotangent = dout.astype(jnp.float32)
     anchor_value = anchor_value.astype(jnp.float32)
     anchor = jnp.sum(anchor_value * cotangent, axis=-1)

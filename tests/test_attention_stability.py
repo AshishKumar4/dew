@@ -160,6 +160,38 @@ def _tiny_beside_large(seed: int, rows: int = 128):
             dout * np.float32(2.0 ** -8))
 
 
+def _anchor_relative(seed: int, rows: int = 64):
+    """One query a row over 33 keys: 32 whose logit is a drawn -10 to -9 and whose values hold a draw near
+    fp32's largest in the first column and a draw near 2 in the second, then one whose logit is 40 and whose
+    value holds a draw near 1 in the second column, the cotangent on the second column alone. The first
+    tile overflows the first column; D is the second column's anchor-relative share, which the backward
+    must read from sums kept apart from the anchor's (`algebra.normalized_terms`)."""
+    key = np.zeros((rows, 33, 1, 16), np.float32)
+    key[:, :32, 0, 0] = _uniform(seed, -10.0, -9.0, (rows, 32))
+    key[:, 32, 0, 0] = 40.0
+    value = np.zeros((rows, 33, 1, 16), np.float32)
+    value[:, :32, 0, 0] = _uniform(seed + 1, 2.5e38, 3.4e38, (rows, 32))
+    value[:, :32, 0, 1] = _uniform(seed + 2, 1.5, 2.5, (rows, 32))
+    value[:, 32, 0, 1] = _uniform(seed + 3, 0.5, 1.5, (rows,))
+    dout = np.zeros((rows, 1, 1, 16), np.float32)
+    dout[..., 1] = _uniform(seed + 4, 0.5, 1.5, (rows, 1, 1))
+    return _first(np.full((rows, 1), 4.0, np.float32), 16), key, value, None, dout
+
+
+def _least_normal_column(seed: int, rows: int = 64):
+    """One query a row over three keys of equal logits whose values' first column is a draw near fp32's
+    largest and whose middle key's second column is 3 times 2^-126 times a draw in [1, 2): that column's
+    output is near fp32's least normal, and the cotangent on it a draw near 2^100, so D is resolved only if
+    the backward keeps that column out of the subnormal range."""
+    value = np.zeros((rows, 3, 1, 16), np.float32)
+    value[:, :, 0, 0] = _uniform(seed, 2.5e38, 3.4e38, (rows, 3))
+    value[:, 1, 0, 1] = 3.0 * 2.0 ** -126 * _uniform(seed + 1, 1.0, 2.0, (rows,))
+    dout = np.zeros((rows, 1, 1, 16), np.float32)
+    dout[..., 1] = 2.0 ** 100 * _uniform(seed + 2, 1.0, 2.0, (rows, 1, 1))
+    return (np.zeros((rows, 1, 1, 16), np.float32), np.zeros((rows, 3, 1, 16), np.float32), value, None,
+            dout)
+
+
 def _families() -> dict[str, Family]:
     def kept(queries: int, keys: int) -> np.ndarray:
         return np.ones((ROWS, 1, queries, keys), bool)
@@ -284,6 +316,10 @@ def _families() -> dict[str, Family]:
             folded=False),
         "a tiny value beside an overflowing column at equal weights": Family(
             _tiny_beside_large, np.ones((128, 1, 1, 4), bool), folded=False),
+        "an anchor-relative share beside an overflowing column": Family(
+            _anchor_relative, np.ones((64, 1, 1, 33), bool), folded=False),
+        "a column near fp32's least normal under a large cotangent": Family(
+            _least_normal_column, np.ones((64, 1, 1, 3), bool), folded=False),
     }
     lengths = np.tile([4, 0], ROWS // 2)
     empty = np.broadcast_to((lengths > 0)[:, None, None, None], (ROWS, 1, 4, 4))

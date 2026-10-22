@@ -201,13 +201,16 @@ def _forward_kernel(*refs, spec: algebra.Forward, score_kinds: tuple[Kind, ...],
     query = query_ref[...]
     q_pos = first_query + jnp.arange(block_q)[:, None]
 
-    def softmax(index, state: algebra.Partial):
+    def logits_at(index):
         tile = pl.ds(index * block_k, block_k)
         coords = algebra.Coords(q_pos, index * block_k + jnp.arange(block_k)[None, :], **narrowing,
                                 key_ids=key_ids["ref"][tile] if spec.ids else None)
         params = tuple(_tile_param(ref, kind, head, q_pos, tile)
                        for ref, kind in zip(score_refs, score_kinds, strict=True))
-        logits = algebra.modify(spec, _dot(query, key_ref[tile, :].T, interpret), coords, params)
+        return tile, coords, algebra.modify(spec, _dot(query, key_ref[tile, :].T, interpret), coords, params)
+
+    def softmax(index, state: algebra.Partial):
+        tile, coords, logits = logits_at(index)
         m, alpha = algebra.peak(spec, state.m, logits)
         weights = algebra.weights(spec, logits, m)
         # The values load after the softmax, where jax's mha loads them; on the guarded walk the weights
@@ -264,11 +267,23 @@ def _forward_kernel(*refs, spec: algebra.Forward, score_kinds: tuple[Kind, ...],
         return
     live = flags_ref[...] > 0
 
+    def normalized(index, carry, *, maximum, total, anchor):
+        # The backward's split sums of a guarded row, normalized (`algebra.normalized_terms`).
+        tile, coords, logits = logits_at(index)
+        value = value_ref[tile, :]
+        rest, own_tile = algebra.normalized_terms(logits, maximum, total, coords.k_pos == anchor[:, None],
+                                                  value.dtype, algebra.recompute(spec))
+        return carry[0] + _dot(rest, value, interpret), carry[1] + own_tile, carry[2] + rest.sum(axis=-1)
+
     @pl.when(jnp.max(live.astype(jnp.int32)) > 0)
     def _():
         # Only a program one of whose rows overflowed walks again: each of those rows shifts as it needs,
-        # every other row's bits the plain walk's (`algebra.room`).
-        written(walk(live))
+        # every other row's bits the plain walk's (`algebra.room`); a training walk's live rows take their
+        # split sums from a normalized pass at the walk's maximum and denominator.
+        walked = walk(live)
+        terms = (_normalized_pass(spec, walked, normalized, value_ref=value_ref, bounds=(lo, hi),
+                                  initial=initial) if residuals else None)
+        written(walked, normalized=terms)
 
 
 def _plain(held: algebra.Room | None, value: jax.Array, interpret: bool) -> jax.Array | None:
@@ -284,7 +299,7 @@ def _weighted(value_ref, carry) -> jax.Array:
 
 
 def _written(spec, walked, *, value_ref, out_ref, residual_refs, flag_ref, residuals: bool, initial: bool,
-             output_mod, output_params):
+             output_mod, output_params, normalized=None):
     """A forward walk's output and residuals written: which rows overflowed where the launch flags them,
     the split sums and anchors of a training walk (`_split_written`), and the normalized output with its
     maximum and denominator."""
@@ -292,8 +307,8 @@ def _written(spec, walked, *, value_ref, out_ref, residual_refs, flag_ref, resid
         weighted = _weighted(value_ref, walked) if residuals else walked.acc
         flag_ref[...] = algebra.overflowed(weighted).astype(jnp.float32)
     if residuals:
-        walked = _split_written(spec, walked, value_ref=value_ref, residual_refs=residual_refs,
-                                initial=initial)
+        walked = _split_written(walked, value_ref=value_ref, residual_refs=residual_refs,
+                                normalized=normalized)
     out, m, denominator = algebra.finish(spec, walked, initial=initial, output_mod=output_mod,
                                          output_params=output_params)
     out_ref[...] = out.astype(out_ref.dtype)
@@ -302,15 +317,26 @@ def _written(spec, walked, *, value_ref, out_ref, residual_refs, flag_ref, resid
         residual_refs[1][...] = denominator
 
 
-def _split_written(spec, walked, *, value_ref, residual_refs, initial: bool) -> algebra.Partial:
+def _normalized_pass(spec, walked, step, *, value_ref, bounds, initial: bool):
+    """A guarded training walk's live rows' split sums, normalized: a pass over its keys (`step`) at the
+    walk's own maximum and natural denominator (`algebra.normalized_terms`)."""
+    split, arg, own, _ = walked
+    joined = split._replace(acc=algebra.split_output(split.acc, own, value_ref[arg.key, :]))
+    _, maximum, total = algebra.finish(spec, joined, initial=initial)
+    nothing = jnp.zeros_like(own)
+    walk = functools.partial(step, maximum=maximum, total=total, anchor=arg.key)
+    return jax.lax.fori_loop(*bounds, walk, (jnp.zeros_like(split.acc), nothing, nothing))
+
+
+def _split_written(walked, *, value_ref, residual_refs, normalized) -> algebra.Partial:
     """A training walk's anchors, split sums and shifts written to their residuals, and its state with the
-    split sums joined, which the output normalizes; a guarded row's split sums normalized from its output
-    (`algebra.normalized_split`)."""
+    split sums joined, which the output normalizes; a guarded live row's split sums the `normalized` ones
+    (`algebra.split_residuals`)."""
     split, arg, own, others_total = walked
     anchor_value = value_ref[arg.key, :]
     state = split._replace(acc=algebra.split_output(split.acc, own, anchor_value))
     residual_refs[2][...] = arg.key
-    sums = algebra.split_residuals(spec, split, own, others_total, anchor_value, state, initial=initial)
+    sums = algebra.split_residuals(split, own, others_total, normalized)
     for ref, part in zip(residual_refs[3:7], sums, strict=True):
         ref[...] = part
     return state
@@ -1052,5 +1078,8 @@ def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
                                                    residuals=True, natural=natural, interpret=interpret)
         residuals = maxima, totals, anchors, sums
     initial = hooks is not None and hooks.initial is not None
+    # A guarded forward's live rows carry normalized split sums (`algebra.split_residuals`), which the first
+    # pass cannot recompute without the forward's denominator: D comes from them.
+    split = split or (natural and algebra.headroom(value.dtype, key.shape[1], initial))
     launch = functools.partial(_launch, split=split, natural=natural, initial=initial, interpret=interpret)
     return gradients(launch, query, key, value, spans, hooks, dout, residuals, block=BLOCK, scale=scale)
