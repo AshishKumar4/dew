@@ -580,7 +580,7 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles
 
 def _tgmm_cooperative(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles, out_dtype,
                       multiprocessors: int, interpret, prologue, prologue_operands: tuple,
-                      prologue_axes: tuple, exact_sums: bool) -> jax.Array:
+                      prologue_axes: tuple, exact_sums: bool, row_split: bool = False) -> jax.Array:
     """Dew: `tgmm`'s product at a tile two consumer warpgroups compute, each a half of its columns, beside a
     producer warpgroup issuing the loads (CUTLASS's cooperative sm90 schedule), the operand stages
     streaming across the persistent loop's tiles (`hopper.Ring`): the producer loads the next tile's first
@@ -594,6 +594,9 @@ def _tgmm_cooperative(operands: tuple, groups: tuple, shape: tuple, *, tiles: Ti
     _, m, n, g = shape
     block_m, block_n, block_k = tiles.block_m, tiles.block_n, tiles.block_k
     half, depth_half = block_n // 2, block_m // 2
+    # Each consumer's part of the tile: half its columns, or with `row_split` half its depth (one m64n256
+    # MMA a step where the columns' halves take two m64n128s).
+    part = (depth_half, block_n) if row_split else (block_m, half)
     grid = (m // block_m, n // block_n)
     stepped = tuple(i for i, axes in enumerate(prologue_axes) if 'rows' in axes)
     fixed = tuple(i for i, axes in enumerate(prologue_axes) if 'rows' not in axes)
@@ -624,7 +627,7 @@ def _tgmm_cooperative(operands: tuple, groups: tuple, shape: tuple, *, tiles: Ti
 
         @functools.partial(
             pl.run_scoped,
-            o_smem=plgpu.SMEM((2, block_m, half), out_dtype),
+            o_smem=plgpu.SMEM((2, *part), out_dtype),
             **hopper.staging('fixed', [(tuple(extent[axis] for axis in prologue_axes[i]), side_gmems[i])
                                  for i in fixed]),
             halves=plgpu.Barrier(num_arrivals=2, num_barriers=2),
@@ -659,8 +662,11 @@ def _tgmm_cooperative(operands: tuple, groups: tuple, shape: tuple, *, tiles: Ti
                     plgpu.wait_smem_to_gmem(0, wait_read_only=True)
                     o_smem[wg] = acc.astype(o_smem.dtype)
                     plgpu.commit_smem()
-                    mine = pl.ds(columns.start + wg * half, half)
-                    plgpu.copy_smem_to_gmem(o_smem.at[wg], o_gmem.at[g_i, depth, mine])
+                    if row_split:
+                        mine = (pl.ds(depth.start + wg * depth_half, depth_half), columns)
+                    else:
+                        mine = (depth, pl.ds(columns.start + wg * half, half))
+                    plgpu.copy_smem_to_gmem(o_smem.at[wg], o_gmem.at[(g_i, *mine)])
 
                 hook = None if prologue is None else (prologue, prologue_axes, stepped, fixed, fixed_refs)
 
@@ -679,8 +685,8 @@ def _tgmm_cooperative(operands: tuple, groups: tuple, shape: tuple, *, tiles: Ti
                     _streamed_gradient(
                         lambda counter, step: _staged_halves(
                             [ring.acquire(counter) for ring in streams], (step, start, end, steps, block_k),
-                            (mine_depth, mine_columns), hook, halves),
-                        release, steps, carry, (block_m, half), exact_sums,
+                            (mine_depth, mine_columns), hook, halves, row_split),
+                        release, steps, carry, part, exact_sums,
                         lambda acc: store(acc, g_i, depth, columns))
                     return carry + steps
 
@@ -693,13 +699,16 @@ def _tgmm_cooperative(operands: tuple, groups: tuple, shape: tuple, *, tiles: Ti
     return kernel(*groups, lhs, rhs, *prologue_operands)
 
 
-def _staged_halves(stages: list, group: tuple, mine: tuple, hook, halves) -> tuple:
+def _staged_halves(stages: list, group: tuple, mine: tuple, hook, halves,
+                   row_split: bool = False) -> tuple:
     """Dew: a streamed kernel gradient step's operands for one consumer warpgroup, from its `stages` (the
     rows', the cotangent's, then each side operand's with rows): this warpgroup's depth half of the rows
     rewritten by the prologue (`hook`: it, its operands' axes, which are stepped and which fixed, and the
     fixed ones' tiles), the neighbouring groups' rows zeroed in its halves (`group`: the step, the group's
     first and last row, its steps, the rows a step takes; `mine`: its depth and column halves), and the
-    other's halves awaited at `halves` where it rewrote any: the rows (whole) and its cotangent columns."""
+    other's halves awaited at `halves` where it rewrote any: the rows (whole) and its cotangent columns,
+    or with `row_split` its depth half of the rows and the whole cotangent (whose other half it awaits
+    only where it zeroed any)."""
     rows_stage, cotangent_stage, *side_stages = stages
     mine_depth, mine_columns = mine
     if hook is not None:
@@ -709,10 +718,12 @@ def _staged_halves(stages: list, group: tuple, mine: tuple, hook, halves) -> tup
     halves_of = (rows_stage.at[:, mine_depth], cotangent_stage.at[:, mine_columns])
     boundary = _zero_neighbours_of(halves_of, *group)
     plgpu.commit_smem()
-    if hook is not None:
+    if hook is not None and not row_split:
         hopper.meet(halves)
     else:
         pl.when(boundary)(lambda: hopper.meet(halves))
+    if row_split:
+        return rows_stage.at[:, mine_depth].transpose((1, 0)), cotangent_stage
     return rows_stage.transpose((1, 0)), cotangent_stage.at[:, mine_columns]
 
 def _streamed_gradient(staged, release, steps, first, shape: tuple, exact_sums: bool, store) -> None:
