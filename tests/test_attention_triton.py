@@ -445,19 +445,21 @@ def test_cotangents_that_cancel_across_a_key_cancel_within_the_sums_bound(dtype)
     fp32 reduction bound of the shares' magnitudes (`assert_fp32_reduction_bound`), and cotangents drawn to
     cancel the same way hold check 1."""
     spans = template.spans(3, 3, 1)
-    zeros = jnp.zeros((1, 3, 1, 1), dtype)
 
     def ours(value, dout):
+        zeros = jnp.zeros((1, 3, 1, 1), value.dtype)
         with tuning.pinned({attention_triton.TritonBackward: joint(PINNED[0])}):
             return attention_triton.backward(zeros, zeros, value, spans, None, dout, scale=1.0,
                                              interpret=not ON_GPU).value
 
     def theirs(value, dout):
         def attend(value):
+            zeros = jnp.zeros((1, 3, 1, 1), value.dtype)
             return template.reference(zeros, zeros, value, spans, scale=1.0)
 
         return jax.vjp(attend, value)[1](dout)[0]
 
+    zeros = jnp.zeros((1, 3, 1, 1), dtype)
     dout = jnp.asarray([1.0, 2.0, -3.0], dtype).reshape(1, 3, 1, 1)
     shares = np.full((1, 3, 1, 1), np.abs(np.asarray(dout, np.float64)).sum() / 3)
     for found in (ours(zeros, dout), theirs(zeros, dout)):
