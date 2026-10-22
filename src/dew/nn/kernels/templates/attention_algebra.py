@@ -402,9 +402,43 @@ def _safe(spec: Forward, m: jax.Array) -> jax.Array:
 
 def peak(spec: Forward, m: jax.Array, s: jax.Array) -> tuple[jax.Array, jax.Array]:
     """The running maximum after a tile's logits `s`, and `alpha`, the factor the state before it
-    takes to the new maximum."""
+    takes to the new maximum. In the accurate form the exponent `m - new` is compensated (its subtraction's
+    rounding, by TwoSum, carried to first order): every weight before the new maximum shares this one
+    factor, so its exponent's rounding would not average out over them as the reference's per-key exponents'
+    do, an error some sqrt(keys) times the reference's where the maximum jumps far."""
     new = jnp.maximum(m, s.max(axis=-1))
-    return new, spec.carry(m - _safe(spec, new))
+    return new, carried(spec, m, _safe(spec, new))
+
+
+def carried(spec: Forward, m: jax.Array, safe: jax.Array) -> jax.Array:
+    """The factor `exp(m - safe)` a state takes from its maximum `m` to `safe` (`peak`, `merge`), in the
+    accurate form with its exponent compensated (`peak`)."""
+    difference = m - safe
+    alpha = spec.carry(difference)
+    if not spec.natural:
+        return alpha
+    # TwoSum: m - safe is difference + error exactly; raw, the scale's product with it is split exactly too
+    # (TwoProduct); exp's derivative is itself.
+    back = difference - m
+    error = (m - (difference - back)) + (-safe - back)
+    if spec.raw:
+        product, rounding = two_product(difference, jnp.float32(spec.scale))
+        alpha = jnp.exp(product)
+        error = rounding + error * spec.scale
+    corrected = alpha * (1.0 + error)
+    return jnp.where(jnp.isfinite(corrected), corrected, spec.carry(difference))
+
+
+def two_product(a: jax.Array, b: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """`a * b` as its fp32 rounding and the rounding's error, `a * b = product + error` exactly (Dekker's
+    TwoProduct over Veltkamp's split, no FMA needed); not finite where `4097 a` or `4097 b` overflows."""
+    def split(x):
+        wide = 4097.0 * x
+        high = wide - (wide - x)
+        return high, x - high
+    product = a * b
+    (a_high, a_low), (b_high, b_low) = split(a), split(b)
+    return product, ((a_high * b_high - product) + a_high * b_low + a_low * b_high) + a_low * b_low
 
 
 def weights(spec: Forward, s: jax.Array, m: jax.Array) -> jax.Array:
@@ -526,21 +560,21 @@ def merge(spec: Forward, first: Partial, second: Partial) -> Partial:
     m = jnp.maximum(first.m, second.m)
     safe = jnp.where(m == -jnp.inf, 0.0, m)
     if first.shift is None and second.shift is None:
-        a, b = spec.carry(first.m - safe), spec.carry(second.m - safe)
+        a, b = carried(spec, first.m, safe), carried(spec, second.m, safe)
         acc = expand(a, first.acc) * first.acc + expand(b, second.acc) * second.acc
         return Partial(acc, m, a * first.total + b * second.total)
     first, second = headroomed(first), headroomed(second)
     reach = jnp.maximum(first.reach, second.reach)
-    carried = spec.carry(first.m - safe), spec.carry(second.m - safe)
-    natural = (power2(carried[0] * first.total, first.shift)
-               + power2(carried[1] * second.total, second.shift))
+    factors = carried(spec, first.m, safe), carried(spec, second.m, safe)
+    natural = (power2(factors[0] * first.total, first.shift)
+               + power2(factors[1] * second.total, second.shift))
 
     def joined(shift):
-        a, b = power2(carried[0], first.shift - shift), power2(carried[1], second.shift - shift)
+        a, b = power2(factors[0], first.shift - shift), power2(factors[1], second.shift - shift)
         acc = expand(a, first.acc) * first.acc + expand(b, second.acc) * second.acc
         return acc, a * first.total + b * second.total
 
-    a, b = carried
+    a, b = factors
     plain = expand(a, first.plain) * first.plain + expand(b, second.plain) * second.plain
     plain_total = a * first.plain_total + b * second.plain_total
 
