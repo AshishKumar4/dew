@@ -38,8 +38,9 @@ class Forward:
     """What the forward's functions specialize on, all static: the spans' `form` ('full', 'causal' or
     'spans', `KeySpans.form`), the call's key count `keys`, whether it packs documents (`ids`), the
     softmax `scale`, the score hook `score_mod(s, q_pos, k_pos, *params)` on natural logits, whether
-    the call keeps its logits `natural` (`base2`), and whether its weighted values can pass fp32's
-    largest, so a program's walk is `guarded` (`headroom`)."""
+    the call keeps its logits `natural` (`base2`), the accurate form, whether its weighted values can pass
+    fp32's largest, so a program's walk is `guarded` (`headroom`, the accurate form's alone), and whether
+    its softmax resumes from an `initial` state (`raw`)."""
 
     form: str
     keys: int
@@ -48,6 +49,18 @@ class Forward:
     score_mod: Callable | None = None
     natural: bool = NATURAL
     headroom: bool = True
+    initial: bool = False
+
+    @property
+    def raw(self) -> bool:
+        """Whether the accurate form (`natural`) keeps its logits as the raw products, each exponent a
+        difference of them scaled after it is taken, `(s - m) * scale * log2(e)`: no multiply precedes the
+        subtraction for a compiler to contract into it, so the largest logit's weight is 1 exactly and
+        every difference rounds once. Where a score hook reads the scaled logits, or an initial state's
+        natural maximum would have to be divided into raw units, or the scale is not positive (whose raw
+        maximum is not the scaled one's), the logits are scaled, the largest's weight held to 1 by a select
+        (`weights`). The backward recomputes in the same units (`below`)."""
+        return self.natural and self.score_mod is None and not self.initial and self.scale > 0
 
     @property
     def base2(self) -> bool:
@@ -71,14 +84,44 @@ class Forward:
         return self.keys == 0 or self.form == "spans" or self.score_mod is not None
 
     def power(self, x: jax.Array) -> jax.Array:
-        """The exponential the logits are in: exp2 folded, `natural_exp` natural."""
-        return jnp.exp2(x) if self.base2 else natural_exp(x)
+        """The exponential the logits are in: exp2 folded, the raw form's scaled difference, `natural_exp`
+        natural."""
+        if self.base2:
+            return jnp.exp2(x)
+        return jnp.exp2(x * (self.scale * LOG2E)) if self.raw else natural_exp(x)
 
     def carry(self, x: jax.Array) -> jax.Array:
         """The factor a softmax state takes from one maximum to another `x` below it: exp2 folded, and
         natural, `jnp.exp`, the reference's own, whose state (a resumed partial, a sink) may be any size, so
         `natural_exp`'s extra rounding of `x * log2(e)`, about `|x|` ulps, would reach it."""
-        return jnp.exp2(x) if self.base2 else jnp.exp(x)
+        if self.base2:
+            return jnp.exp2(x)
+        return jnp.exp(x * self.scale) if self.raw else jnp.exp(x)
+
+    def naturalized(self, m: jax.Array) -> jax.Array:
+        """A maximum in the logits' units taken to natural ones: from base 2 folded, from raw products
+        raw."""
+        if self.base2:
+            return m / LOG2E
+        return m * self.scale if self.raw else m
+
+
+class Recompute(NamedTuple):
+    """How the backward recomputes a tile's weights, as its forward computed them: from raw products
+    whose difference it scales by `factor` (`Forward.raw`; None, from scaled logits), and whether the
+    largest logit weighs 1 exactly (`exact`, the accurate form's, `Forward.natural`)."""
+
+    factor: float | None = None
+    exact: bool = False
+
+
+def recompute(spec: Forward) -> Recompute:
+    """The backward's recomputation for a forward of `spec`."""
+    return Recompute(spec.scale if spec.raw else None, spec.natural)
+
+
+PLAIN = Recompute()
+"""The default fold's recomputation: scaled logits, the largest logit's weight as its arithmetic gives it."""
 
 
 def expand(x: jax.Array, like: jax.Array) -> jax.Array:
@@ -295,10 +338,11 @@ def resumed(spec: Forward, m: jax.Array, total: jax.Array, acc: jax.Array, *,
 
 def modify(spec: Forward, s: jax.Array, coords: Coords, params: tuple[jax.Array, ...] = (),
            masked: bool = True) -> jax.Array:
-    """A tile's logits from its products `s` `[bq, bk]` (fp32): scaled (by log2(e) too in base 2), then
-    the score hook, then -inf at each key the query does not see. `masked` False is a tile every query
-    of the block sees whole (a full tile of the block map), which takes no mask."""
-    logits = s * (spec.scale * LOG2E if spec.base2 else spec.scale)
+    """A tile's logits from its products `s` `[bq, bk]` (fp32): scaled (by log2(e) too in base 2; raw in
+    the raw form, `Forward.raw`), then the score hook, then -inf at each key the query does not see.
+    `masked` False is a tile every query of the block sees whole (a full tile of the block map), which
+    takes no mask."""
+    logits = s if spec.raw else s * (spec.scale * LOG2E if spec.base2 else spec.scale)
     if spec.score_mod is not None:
         logits = hooked(spec.score_mod, logits, coords.q_pos, coords.k_pos, params)
     if not masked:
@@ -339,13 +383,17 @@ def peak(spec: Forward, m: jax.Array, s: jax.Array) -> tuple[jax.Array, jax.Arra
 
 
 def weights(spec: Forward, s: jax.Array, m: jax.Array) -> jax.Array:
-    """A tile's unnormalized weights `[bq, bk]` under the running maximum `m`, fp32. A logit equal to its
-    row's maximum weighs 1 exactly: a compiler may contract the scaling of a logit into its subtraction
-    (`fma(s, c, -m)`, FlashAttention 2's by design), whose exact product less the rounded maximum is the
-    product's rounding, up to an ulp of the logit, 2^104 at fp32's largest, which an exponential takes to
-    0 or infinity; below the maximum the difference is negative either way."""
+    """A tile's unnormalized weights `[bq, bk]` under the running maximum `m`, fp32. The fold computes
+    `exp2(s c - m)`, which a compiler contracts to `fma(s, c, -m)` (FlashAttention 2's by design): the
+    largest logit's exponent is then its product's rounding, up to an ulp of the logit, so at logits near
+    fp32's largest its weight is 0 or infinite, one of the fold's documented divergences. In the accurate
+    form (`Forward.natural`) the largest logit weighs 1 exactly: raw logits subtract before they scale
+    (`Forward.raw`), and scaled ones (under a hook or an initial state) hold it to 1 by a select."""
     peak = expand(_safe(spec, m), s)
-    return spec.power(jnp.where(s < peak, s - peak, 0.0))
+    if spec.natural and not spec.raw:
+        # The accurate form's scaled logits: the largest's weight held to 1 against the contraction.
+        return spec.power(jnp.where(s < peak, s - peak, 0.0))
+    return spec.power(s - peak)
 
 
 def narrow(p: jax.Array, dtype) -> jax.Array:
@@ -451,10 +499,11 @@ def merge(spec: Forward, first: Partial, second: Partial) -> Partial:
 def finish(spec: Forward, state: Partial, *, initial: bool, output_mod: Callable | None = None,
            output_params: tuple[jax.Array, ...] = ()) -> tuple[jax.Array, jax.Array, jax.Array]:
     """The block's output `[bq, Dv]` fp32 (its weighted values over its denominator, zero for a query
-    that saw nothing and started from no state, then the output hook) and its residuals: the natural
-    maximum (0 for such a query, as the reference's) and the denominator, unshifted (`room`); the output
-    is the shifted sums' ratio, which the shift leaves."""
-    m = state.m / LOG2E if spec.base2 else state.m
+    that saw nothing and started from no state, then the output hook) and its residuals: the maximum (0
+    for such a query, as the reference's) in the units the backward recomputes its logits in, natural, or
+    raw products where the forward's are (`Forward.raw`), and the denominator, unshifted (`room`); the
+    output is the shifted sums' ratio, which the shift leaves."""
+    m = state.m if spec.raw else spec.naturalized(state.m)
     denominator = state.total
     if spec.guarded or initial:
         out = jnp.where(expand(denominator > 0, state.acc),
@@ -571,12 +620,13 @@ def off_anchor_start(peak0: jax.Array, total0: jax.Array, term0: jax.Array, maxi
 
 
 def off_anchor_weights(logits: jax.Array, maximum: jax.Array, at_anchor: jax.Array,
-                       dtype, shift: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
+                       dtype, shift: jax.Array, how: Recompute = PLAIN
+                       ) -> tuple[jax.Array, jax.Array, jax.Array]:
     """A tile's weights `exp(s - m)` at the forward's maximum, fp32, at the forward's weights' shift,
     `2^-min(shift, WEIGHT_SHIFT)` (`room`); them narrowed to the values' `dtype` as the forward rounds
     them, zero at the anchor key (`at_anchor`), the left operand of `B`'s product; and the anchor key's
     narrowed weight, fp32."""
-    exponentials = below(logits, maximum)
+    exponentials = below(logits, maximum, how)
     exponentials = power2(exponentials, expand(-jnp.minimum(shift, WEIGHT_SHIFT), exponentials))
     rounded = exponentials.astype(dtype)
     rest = jnp.where(at_anchor, jnp.zeros_like(rounded), rounded)
@@ -674,19 +724,25 @@ def dq_finish(sums: DqSums, prior: jax.Array, state_total: jax.Array, peak0: jax
     return sums.dq * expand(ratio, sums.dq), delta + refined, total, mass, grads
 
 
-def below(logits: jax.Array, peak: jax.Array) -> jax.Array:
+def below(logits: jax.Array, peak: jax.Array, how: Recompute = PLAIN) -> jax.Array:
     """`exp(s - m)` for a tile's logits recomputed in the backward against the forward's maximum `m`,
-    fp32: `m` is every key's maximum, so a logit past it by the rounding the two passes do not share (the
-    forward's maximum taken in base 2 and back, or another tile shape's product) is the maximum itself,
-    its weight 1, never past it, and one at it weighs 1 however a compiler contracts its scaling into the
-    subtraction (`weights`)."""
+    fp32, in the forward's units (`Recompute`): `m` is every key's maximum, so a logit past it by the
+    rounding the two passes do not share (the forward's maximum taken in base 2 and back, or another tile
+    shape's product) is the maximum itself, its weight 1, never past it; in the accurate form one at it
+    weighs 1 however a compiler contracts its scaling into the subtraction (`weights`)."""
     peak = expand(peak, logits)
-    return jnp.exp(jnp.where(logits < peak, logits - peak, 0.0))
+    if how.factor is not None:
+        # Raw products: the difference is taken first, so the largest's is exactly 0.
+        return jnp.exp(jnp.minimum(logits - peak, 0.0) * how.factor)
+    if how.exact:
+        return jnp.exp(jnp.where(logits < peak, logits - peak, 0.0))
+    return jnp.exp(jnp.minimum(logits - peak, 0.0))
 
 
-def normalized(logits: jax.Array, peak: jax.Array, total: jax.Array) -> tuple[jax.Array, jax.Array]:
+def normalized(logits: jax.Array, peak: jax.Array, total: jax.Array, how: Recompute = PLAIN
+               ) -> tuple[jax.Array, jax.Array]:
     """A tile's unnormalized weights `exp(s - m)` (`below`) and its weights `p`, fp32."""
-    exponentials = below(logits, peak)
+    exponentials = below(logits, peak, how)
     return exponentials, exponentials * expand(inverse(total), exponentials)
 
 
