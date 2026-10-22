@@ -47,6 +47,11 @@ with a write gate and no delta rule, the gated delta net's formed gates, and Mam
 LONG = 1024
 """A long sequence's tokens: 64 chunks, the memory carried through all of them."""
 
+NEAR_ZERO = 256
+"""Decays near zero's tokens: each token's own write dominates its output and its gate's gradient is a
+few tokens' terms, so a draw averages more of them (at the draw's 70 the gated delta net's gate gradient
+compared with itself did not resolve within 512 seeds)."""
+
 
 def _decayed(operands: Chunk, hooks, log_decay: float, spread: float, key) -> Chunk:
     """`operands` with every token's log decay near `log_decay` (within `spread` of it), formed through
@@ -115,7 +120,7 @@ def _spread(operands: Chunk, hooks, key) -> Chunk:
 
 REGIMES = {
     'decays near one': (lambda operands, hooks, key: _decayed(operands, hooks, -1e-4, 5e-5, key), None),
-    'decays near zero': (lambda operands, hooks, key: _decayed(operands, hooks, -30.0, 5.0, key), None),
+    'decays near zero': (lambda operands, hooks, key: _decayed(operands, hooks, -30.0, 5.0, key), NEAR_ZERO),
     'the decay bound': (lambda operands, hooks, key: _decayed(operands, hooks, -5.0, 0.0, key), None),
     'aligned keys': (lambda operands, hooks, key: _aligned(operands, hooks, key), None),
     'resets on chunk edges': (lambda operands, hooks, key: _reset(operands), None),
@@ -126,7 +131,53 @@ REGIMES = {
 }
 """Each regime's transform of a draw's operands and its tokens (the draw's own where None)."""
 
-GRADIENT_SEEDS = {}
+GRADIENT_SEEDS = {
+    ('scalar delta', 'decays near zero'): 8,
+    ('vector delta', 'decays near zero'): 8,
+    ('scalar write', 'decays near zero'): 8,
+    ('gated', 'decays near zero'): 8,
+    ('rated', 'decays near zero'): 8,
+    ('scalar delta', 'decays near one'): 32,
+    ('scalar delta', 'the decay bound'): 8,
+    ('scalar delta', 'aligned keys'): 128,
+    ('scalar delta', 'resets on chunk edges'): 8,
+    ('scalar delta', 'saturated gates'): 16,
+    ('scalar delta', 'spread gates'): 16,
+    ('scalar delta', 'a long sequence'): 8,
+    ('scalar delta', 'a fading memory'): 8,
+    ('vector delta', 'decays near one'): 8,
+    ('vector delta', 'the decay bound'): 8,
+    ('vector delta', 'aligned keys'): 16,
+    ('vector delta', 'resets on chunk edges'): 8,
+    ('vector delta', 'saturated gates'): 8,
+    ('vector delta', 'spread gates'): 8,
+    ('vector delta', 'a long sequence'): 8,
+    ('vector delta', 'a fading memory'): 8,
+    ('scalar write', 'decays near one'): 32,
+    ('scalar write', 'the decay bound'): 8,
+    ('scalar write', 'aligned keys'): 16,
+    ('scalar write', 'resets on chunk edges'): 8,
+    ('scalar write', 'saturated gates'): 16,
+    ('scalar write', 'spread gates'): 16,
+    ('scalar write', 'a long sequence'): 16,
+    ('scalar write', 'a fading memory'): 8,
+    ('gated', 'decays near one'): 32,
+    ('gated', 'the decay bound'): 64,
+    ('gated', 'aligned keys'): 256,
+    ('gated', 'resets on chunk edges'): 128,
+    ('gated', 'saturated gates'): 128,
+    ('gated', 'spread gates'): 512,
+    ('gated', 'a long sequence'): 8,
+    ('gated', 'a fading memory'): 8,
+    ('rated', 'decays near one'): 128,
+    ('rated', 'the decay bound'): 128,
+    ('rated', 'aligned keys'): 64,
+    ('rated', 'resets on chunk edges'): 128,
+    ('rated', 'saturated gates'): 8,
+    ('rated', 'spread gates'): 256,
+    ('rated', 'a long sequence'): 128,
+    ('rated', 'a fading memory'): 128,
+}
 """Each site's declared seeds for its gradient's check 1, sized by `seeds_for` on armada."""
 
 SEEDS = {
