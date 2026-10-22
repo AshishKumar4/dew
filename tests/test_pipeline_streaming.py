@@ -23,6 +23,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
+from model_support import streamed_export
 from reference_error import assert_as_exact_as_the_reference
 
 from dew.interop.pretrained import Pretrained, load_diffusion_source
@@ -176,20 +177,6 @@ def test_a_sharded_pipeline_export_holds_a_few_shards_on_the_host(extracted, tmp
     export first rose 0.30 GB. Its resident memory also holds the pages of the
     source files it maps, which the host's page cache and load move, so the
     bound reads its anonymous memory."""
-    import json
-    import os
-    import subprocess
-    import sys
-
-    env = {**{name: value for name, value in os.environ.items() if name != "XLA_FLAGS"},
-           "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(ROOT / "src")}
-    written = subprocess.run([sys.executable, "-c", WIDER_FLUX, str(extracted["flux"]),
-                              str(tmp_path / "source")], capture_output=True, text=True, env=env)
-    assert written.returncode == 0, written.stderr[-2000:]
-    run = subprocess.run([sys.executable, str(ROOT / "tools" / "benchmark_streaming_export.py"),
-                          str(tmp_path / "source"), "25MB", str(tmp_path / "out")],
-                         capture_output=True, text=True, env=env)
-    assert run.returncode == 0, run.stderr[-2000:]
-    measured = json.loads(run.stdout.splitlines()[-1])
+    measured = streamed_export(WIDER_FLUX, extracted["flux"], tmp_path, "25MB")
     assert measured["shards"] > 8
     assert measured["anon_rise_gb"] < 4 * 25e6 / 2**30, measured

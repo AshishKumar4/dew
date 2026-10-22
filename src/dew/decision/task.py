@@ -436,8 +436,8 @@ class Decide:
 
         If asked, it also fits a binning map and abstention thresholds that keep the
         error of the accepted answers at `target_error`, as `Calibration`'s parts fit
-        them. `held_out` is labelled examples, or a dataset's validation reader
-        (``load(recipe, objective=...).val``), whose rows are already laid out. The
+        them. `held_out` is labelled examples, or a validation reader of decision rows already laid
+        out (``dew.data.compile.held(chain, objective=objective.data())``). The
         minimum counts are Laya's: a type's temperature needs `type_minimum` answers
         and a bucket's `bucket_minimum`.
         """

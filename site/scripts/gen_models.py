@@ -77,6 +77,8 @@ DECODERS = {
     "mamba": ("Mamba", "Hybrid and linear attention"),
     "mamba2": ("Mamba-2", "Hybrid and linear attention"),
     "llada": ("LLaDA", "Diffusion language models"),
+    "llada_moe_v2": ("LLaDA-MoE v2", "Diffusion language models"),
+    "llada2_moe": ("LLaDA2 MoE", "Diffusion language models"),
     "dream": ("Dream", "Diffusion language models"),
     "Dream": ("Dream", "Diffusion language models"),
     "diffusion_gemma_text": ("Diffusion Gemma", "Diffusion language models"),

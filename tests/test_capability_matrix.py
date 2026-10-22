@@ -231,9 +231,10 @@ def user(module, **fields) -> Callable[[], Loaded]:
 
 def torch_fallback() -> Loaded:
     """A random tiny GPT-NeoX, which no Dew family reads, through the torchax fallback."""
-    torch = pytest.importorskip("torch")
-    pytest.importorskip("torchax")
-    transformers = pytest.importorskip("transformers")
+    # The fallback and its reference are the suite's own dependencies (the ci extra): a missing one
+    # fails here, or at the load that imports torchax, rather than skipping the cell.
+    import torch
+    import transformers
     torch.manual_seed(0)
     config = transformers.GPTNeoXConfig(num_hidden_layers=1, hidden_size=16, num_attention_heads=2,
                                         intermediate_size=32, vocab_size=256, max_position_embeddings=64)
@@ -340,6 +341,14 @@ FAMILIES: Mapping[str, tuple[Family, ...]] = {
                released("modernbert-tiny")),
         Family("causal_transformer+llada", "causal_transformer", BIDIRECTIONAL_LM | {MASK_TOKEN}, 128,
                released("llada-tiny")),
+        Family("causal_transformer+llada_moe", "causal_transformer", BIDIRECTIONAL_LM | {MASK_TOKEN}, 128,
+               released("llada-moe-tiny")),
+        Family("causal_transformer+llada_moe_v2", "causal_transformer", BIDIRECTIONAL_LM | {MASK_TOKEN}, 128,
+               released("llada-moe-v2-tiny")),
+        Family("causal_transformer+llada2_moe", "causal_transformer", BIDIRECTIONAL_LM | {MASK_TOKEN}, 128,
+               released("llada2-tiny")),
+        Family("causal_transformer+llada22_moe", "causal_transformer", BIDIRECTIONAL_LM | {MASK_TOKEN}, 128,
+               released("llada22-tiny")),
         Family("causal_transformer+dream", "causal_transformer", BIDIRECTIONAL_LM | {MASK_TOKEN}, 128,
                released("dream-tiny")),
     ),

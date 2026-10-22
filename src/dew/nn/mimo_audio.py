@@ -23,6 +23,7 @@ from dew import records
 from dew.interop.weights import translate_parameters
 from dew.nn.conv import Conv
 from dew.nn.dense import Dense
+from dew.nn.precision import float32_dot_general
 from dew.registry import Record
 
 from .activations import gelu_exact
@@ -243,7 +244,8 @@ class MiMoAudioCodeEncoder(nn.Module):
         if cfg.add_post_norm:
             x = RMSNorm(epsilon=cfg.rms_norm_eps, scale_after_cast=True, dtype=self.dtype, name="norm")(x)
         x = x.reshape(batch, groups, cfg.group_size * cfg.input_local_dim)
-        dense = functools.partial(Dense, use_bias=False, dtype=self.dtype, precision=self.precision)
+        dense = functools.partial(Dense, use_bias=False, dtype=self.dtype, precision=self.precision,
+                                  dot_general=float32_dot_general)
         if cfg.projection_layers == 1:
             return dense(cfg.out_hidden_size, name="projection")(x)
         hidden = dense(4 * cfg.group_size * cfg.input_local_dim, name="projection_fc1")(x)

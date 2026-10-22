@@ -12,11 +12,12 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew import records
-from dew.nn.activations import gelu_exact
 from dew.nn.attention import LayerNorm
 from dew.nn.dense import Dense
 from dew.nn.inputs import AttentionMetadata
+from dew.nn.precision import float32_dot_general
 from dew.nn.text_encoders import _encoder_layer_path, checked_image, clip_layer
+from dew.nn.vision.vit import MergeProjector
 from dew.registry import Record
 
 from .common import (
@@ -50,44 +51,6 @@ def pixel_shuffle(patches: jax.Array, ratio: float) -> jax.Array:
     return shuffled.reshape(batch, (side // block) ** 2, grown)
 
 
-class Llama4VisionAdapterMLP(nn.Module):
-    """The tower's own projector: no-bias maps around an exact GELU."""
-
-    input_dim: int
-    output_dim: int
-    dtype: Dtype | None = None
-    precision: PrecisionLike = None
-
-    def setup(self):
-        dense = functools.partial(Dense, use_bias=False,
-                                  dtype=self.dtype, precision=self.precision)
-        self.fc1 = dense(self.input_dim, name="fc1")
-        self.fc2 = dense(self.output_dim, name="fc2")
-
-    def __call__(self, hidden_states):
-        # The reference gels after both maps, including the last one
-        # (modeling_llama4.py, Llama4VisionMLP2.forward).
-        return gelu_exact(self.fc2(gelu_exact(self.fc1(hidden_states))))
-
-
-class Llama4VisionAdapter(nn.Module):
-    """Pixel shuffle into the adapter MLP, the tower's last stage."""
-
-    ratio: float
-    input_dim: int
-    output_dim: int
-    dtype: Dtype | None = None
-    precision: PrecisionLike = None
-
-    def setup(self):
-        self.mlp = Llama4VisionAdapterMLP(
-            self.input_dim, self.output_dim, dtype=self.dtype,
-            precision=self.precision, name="mlp")
-
-    def __call__(self, encoded_patches) -> jax.Array:
-        return self.mlp(pixel_shuffle(encoded_patches, self.ratio))
-
-
 class Llama4VisionTransformer(nn.Module):
     """The Llama 4 vision trunk, param layout of `Llama4VisionConfig`.
 
@@ -112,7 +75,7 @@ class Llama4VisionTransformer(nn.Module):
                 f"({cfg.patch_size})")
         self.patch_embedding = Dense(
             cfg.hidden_size, use_bias=False, dtype=self.dtype,
-            precision=self.precision, name="patch_embedding")
+            precision=self.precision, name="patch_embedding", dot_general=float32_dot_general)
         self.class_embedding = self.param(
             "class_embedding", nn.initializers.normal(cfg.hidden_size ** -0.5),
             (cfg.hidden_size,))
@@ -133,8 +96,11 @@ class Llama4VisionTransformer(nn.Module):
                        precision=self.precision, name=f"layers_{index}")
             for index in range(cfg.num_layers)]
         self.layernorm_post = norm(name="layernorm_post")
-        self.vision_adapter = Llama4VisionAdapter(
-            cfg.pixel_shuffle_ratio, cfg.projector_input_dim, cfg.projector_output_dim,
+        # The reference's adapter maps the shuffled patches through two bias-free maps with an
+        # exact GELU after each, the last one included (modeling_llama4.py, Llama4VisionMLP2).
+        self.vision_adapter = MergeProjector(
+            round(cfg.hidden_size / cfg.pixel_shuffle_ratio ** 2), 1, cfg.projector_input_dim,
+            cfg.projector_output_dim, norm=False, bias=False, activation="gelu", activation_after=True,
             dtype=self.dtype, precision=self.precision, name="vision_adapter")
 
     def __call__(self, pixel_values) -> jax.Array:
@@ -162,7 +128,7 @@ class Llama4VisionTransformer(nn.Module):
         for layer in self.layers:
             hidden_states = layer(hidden_states, attention_metadata=metadata)
         hidden_states = self.layernorm_post(hidden_states)[:, :-1, :]
-        return self.vision_adapter(hidden_states)
+        return self.vision_adapter(pixel_shuffle(hidden_states, cfg.pixel_shuffle_ratio))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -200,7 +166,7 @@ class Llama4ProjectorModule(nn.Module):
     def setup(self):
         self.linear = Dense(
             self.text_width, use_bias=False, dtype=self.dtype,
-            precision=self.precision, name="linear")
+            precision=self.precision, name="linear", dot_general=float32_dot_general)
 
     def __call__(self, image_features) -> jax.Array:
         return self.linear(image_features)
@@ -227,8 +193,8 @@ _LLAMA4_VISION_TENSORS = {
     "layernorm_pre.bias": ("layernorm_pre", "bias"),
     "layernorm_post.weight": ("layernorm_post", "scale"),
     "layernorm_post.bias": ("layernorm_post", "bias"),
-    "vision_adapter.mlp.fc1.weight": ("vision_adapter", "mlp", "fc1", "kernel"),
-    "vision_adapter.mlp.fc2.weight": ("vision_adapter", "mlp", "fc2", "kernel"),
+    "vision_adapter.mlp.fc1.weight": ("vision_adapter", "fc1", "kernel"),
+    "vision_adapter.mlp.fc2.weight": ("vision_adapter", "fc2", "kernel"),
 }
 
 

@@ -68,6 +68,54 @@ def test_set_points_a_recipes_chain_at_another_store():
         flowers.assigned(["data.source.colour=red"])
 
 
+def test_a_chains_settings_are_set_together():
+    """Settings of one chain valid only together are one point: an augmented images chain's size and
+    staging size move as a pair, read back once."""
+    from dew.data import presets
+    from dew.data.sources import source
+
+    flowers = source("tfds://oxford_flowers102").pipe(presets.images, 64, staging_size=64, augment=True,
+                                                     batch=8)
+    moved = DiffusionRunConfig(data=flowers).assigned(["data.images.size=128",
+                                                        "data.images.staging_size=128"])
+    assert moved.data.facts()["fields"]["image"] == [128, 128, 3]
+
+
+def test_a_point_sets_a_runs_fields_and_its_chains_settings_together():
+    """A run's own fields and its chain's settings are one point, built once: audio conditioning and
+    clips that carry audio are valid only together, and a point that sets both reads as both."""
+    from dew.data import presets
+    from dew.objectives.diffusion import AudioCondition
+
+    clips = Files("clips", format="files").pipe(presets.clips, 2 / 25, frames=2, fps=25, size=8, batch=8)
+    audio = DiffusionRunConfig(text=None, audio=AudioCondition()).to_dict()["audio"]
+    moved = DiffusionRunConfig(data=clips).override({"text": None, "audio": audio,
+                                                     "data.clips.sample_rate": 16000})
+    assert moved.audio is not None and moved.data is not None and "audio" in moved.data.facts()["fields"]
+
+
+def test_a_python_run_whose_chain_is_unrecorded_trains_from_dew_train(tmp_path):
+    """`dew train run.py` trains a run whose chain holds a step only Python has (a lambda) as the file
+    built it, and its run.json says why it can't be rebuilt from the record."""
+    from dew.cli.main import main
+
+    (tmp_path / "unrecorded_run.py").write_text(
+        "import dataclasses\n"
+        "import numpy as np\n"
+        "from autoencoder_experiment import FEATURES, run as experiment\n"
+        "from dew.data import Memory\n"
+        "rows = [{'x': np.full((FEATURES,), index / 32, np.float32)} for index in range(32)]\n"
+        "run = dataclasses.replace(experiment(), validation=None,\n"
+        "                          data=Memory(rows).map(lambda row: row).shuffle().repeat().batch(8))\n")
+    assert main(["train", str(tmp_path / "unrecorded_run.py"), "--set", "trainer.steps=1",
+                 "--set", f"trainer.checkpoint_dir={tmp_path / 'runs'}", "--set", "trainer.eval_every=None",
+                 "--set", "trainer.checkpoint_every=1"]) == 0
+    record = json.loads((tmp_path / "runs" / "unrecorded_run" / "run.json").read_text())
+    assert set(record["fields"]["data"]) == {"unrecorded"}
+    with pytest.raises(ValueError):
+        RunConfig.load(str(tmp_path / "runs" / "unrecorded_run"))
+
+
 def test_an_lm_run_over_images_is_refused():
     with pytest.raises(ValueError):
         LMRunConfig(data=images_of("tfds://oxford_flowers102", 32)).prepare()

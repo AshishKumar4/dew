@@ -27,9 +27,15 @@ from dew.diffusion.presets import Flow, ResolutionShift
 from dew.diffusion.process import Process
 from dew.diffusion.schedules.source import SourceSchedule
 from dew.objectives import Step
-from dew.objectives.diffusion import Alignment, DiffusionObjective, DiffusionRunConfig, TextCondition
+from dew.objectives.diffusion import (
+    Alignment,
+    DiffusionObjective,
+    DiffusionRunConfig,
+    FlowRolloutConfig,
+    TextCondition,
+)
 from dew.objectives.diffusion.end_to_end import AUTOENCODER, LATENT_STATS, TUNED_WEIGHTS, EndToEnd
-from dew.objectives.rl.flow import FlowGRPOObjective
+from dew.objectives.rl.flow import OLD_LOG_PROBS_KEY, REWARDS_KEY, FlowGRPOObjective
 from dew.registry import to_record
 from dew.sampling import Euler, TextToImage
 from dew.sampling.pipelines import ImageSettings
@@ -530,9 +536,9 @@ def grpo_run(beta: float = 0.0, directory: str = "./checkpoints") -> DiffusionRu
         data=images_of("tfds://oxford_flowers102", 4), preset=Flow(), val_metrics=(),
         trainer=TrainerConfig(checkpoint_dir=directory),
         text=TextCondition(encoder="char_table", checkpoint="char_table"),
-        objective=ObjectiveConfig("flow_grpo",
-                                  {"reward": "psnr", "groups": 2, "rollout_steps": 3, "clip_range": 0.2,
-                                   "beta": beta, "solver": Euler(), "guidance": None, "steps": 2}))
+        objective=ObjectiveConfig("flow_grpo", {"clip_range": 0.2, "beta": beta, "solver": Euler(),
+                                                "guidance": None, "steps": 2}),
+        rollout=FlowRolloutConfig(reward="psnr", groups=2, steps=3))
 
 
 def grpo_step(objective, rollout, **trainer):
@@ -553,12 +559,31 @@ def test_flow_grpo_trains_from_the_run_config_on_a_registered_reward():
     one policy step on the transitions the rollout cut."""
     config = grpo_run()
     objective = config.build()
-    assert isinstance(objective, FlowGRPOObjective)
-    prepared, started, state = grpo_step(objective, objective.rollout())
+    assert isinstance(objective, FlowGRPOObjective) and config.rollout is not None
+    prepared, started, state = grpo_step(objective, config.rollout.build(objective))
     assert prepared["latents"].shape[:2] == (jax.device_count() * 2, 2)
     assert np.all(np.isfinite(prepared["rewards"]))
     assert any(not np.array_equal(after, before) for after, before in zip(
         jax.tree.leaves(state.variables["params"]), started, strict=True))
+
+
+def test_a_flow_grpo_runs_rollout_is_its_own_record_beside_the_objective():
+    """A Flow-GRPO run's rollout is the run's `rollout` record, which the objective's record does
+    not hold: a run naming none states the default, a rollout setting on the objective is no
+    argument of it, and a rollout on a run whose objective trains on its data is refused."""
+    stated = dataclasses.replace(grpo_run(), rollout=None)
+    assert stated.rollout == FlowRolloutConfig()
+    assert DiffusionRunConfig.from_dict(stated.to_dict()).rollout == FlowRolloutConfig()
+    with pytest.raises(ValueError):
+        dataclasses.replace(grpo_run(), objective=ObjectiveConfig("flow_grpo", {"reward": "psnr"}))
+    with pytest.raises(ValueError):
+        dataclasses.replace(grpo_run(), objective=ObjectiveConfig("diffusion", {}))
+    with pytest.raises(ValueError):
+        FlowRolloutConfig(reward="no_such_metric")
+    parsed = DiffusionRunConfig.cli(["preset:flow", "--objective", "flow_grpo", "--rollout.reward", "psnr",
+                                     "--rollout.groups", "2", "--rollout.train-steps", "3"])
+    assert parsed.rollout == FlowRolloutConfig(reward="psnr", groups=2, train_steps=3)
+    assert DiffusionRunConfig.from_dict(parsed.to_dict()).rollout == parsed.rollout
 
 
 def test_a_saved_flow_grpo_run_restores_its_policy_and_not_its_kl_reference(tmp_path):
@@ -570,8 +595,9 @@ def test_a_saved_flow_grpo_run_restores_its_policy_and_not_its_kl_reference(tmp_
 
     config = grpo_run(beta=0.1, directory=str(tmp_path))
     objective = config.build()
+    assert isinstance(objective, FlowGRPOObjective) and config.rollout is not None
     checkpoints = Checkpoints(str(tmp_path / "run"))
-    _, started, state = grpo_step(objective, objective.rollout(), checkpoints=checkpoints)
+    _, started, state = grpo_step(objective, config.rollout.build(objective), checkpoints=checkpoints)
     checkpoints.save(1, state, None, {}, artifact=objective.inference_record())
     checkpoints.wait()
     config.save(str(tmp_path / "run"))
@@ -584,22 +610,92 @@ def test_a_saved_flow_grpo_run_restores_its_policy_and_not_its_kl_reference(tmp_
                for got, before in zip(restored, started, strict=True))
 
 
-def test_flow_grpo_over_a_loaded_pipeline_samples_on_the_pipelines_grid(pipelines):
-    """Flow-GRPO built over a loaded flow pipeline directly, its solver, steps and guidance given and
-    its grid left out, samples its evaluation and published task on the pipeline's own grid, as the
-    denoising objective over it does; `grid=None` asks for the training process's times."""
+def test_flow_grpo_over_a_loaded_pipeline_samples_on_the_pipelines_grid(pipelines, tmp_path):
+    """Flow-GRPO built over a published pipeline, its grid left out, evaluates on the pipeline's own
+    grid as the denoising objective over it does, and its published task and the task a saved run
+    restores draw what the pipeline's own task draws from the same noise. `grid=None` evaluates on
+    the training process's times instead, as the denoising objective with that grid does, which
+    the pipeline's grid does not draw. The SDE rollout walks the process's own times either way."""
+    from dew.checkpoints import Checkpoints
     from dew.interop.pretrained import load_diffusion_source
 
-    source = load_diffusion_source(str(pipelines / "sd3" / "pipeline"), dtype="float32",
-                                   attention_impl="xla", size=(16, 16))
-    settings = {"reward": "psnr", "groups": 2, "rollout_steps": 3, "solver": Euler(), "guidance": None,
-                "steps": 2}
-    grpo = FlowGRPOObjective(source, source.process, source.inputs, autoencoder=source.autoencoder,
-                             variables=source.variables, **settings)
-    plain = DiffusionObjective(source, solver=Euler(), guidance=None, steps=2)
-    assert grpo.grid is not None and plain.grid is not None
-    assert to_record(grpo.grid, type(grpo.grid)) == to_record(plain.grid, type(plain.grid))
-    assert grpo.final_denoise is False
-    unset = FlowGRPOObjective(source, source.process, source.inputs, autoencoder=source.autoencoder,
-                              variables=source.variables, grid=None, **settings)
-    assert unset.grid is None and unset.final_denoise is True
+    directory = pipelines / "sd3" / "pipeline"
+    settings = {"solver": Euler(), "guidance": None, "steps": 2}
+    rollout = FlowRolloutConfig(reward="psnr", groups=2, steps=3)
+    source = load_diffusion_source(str(directory), dtype="float32", attention_impl="xla", size=(16, 16))
+    step = Step(jnp.asarray(0), jax.random.PRNGKey(5), None)
+
+    def built(**grid):
+        grpo = FlowGRPOObjective(source, source.process, source.inputs, autoencoder=source.autoencoder,
+                                 variables=source.variables, **settings, **grid)
+        plain = DiffusionObjective(source, solver=Euler(), guidance=None, steps=2, **grid)
+        return grpo, plain
+
+    def started(objective):
+        return Trainer(objective, optax.sgd(1e-2), key=jax.random.PRNGKey(3)).initial_state()
+
+    def evaluated(objective):
+        state = started(objective)
+        images = np.asarray(objective.evaluate(state.variables, batch_for(objective, 16), step).images)
+        assert np.all(np.isfinite(images))
+        return images
+
+    def rolled(objective):
+        state = started(objective)
+        drawn = rollout.build(objective)(state, batch_for(objective, 16), jax.random.PRNGKey(2))
+        fields = {name: np.asarray(drawn[name]) for name in (
+            "latents", "next_latents", "timesteps", "next_timesteps", OLD_LOG_PROBS_KEY, REWARDS_KEY)}
+        assert all(np.all(np.isfinite(field)) for field in fields.values())
+        return fields
+
+    (inherited, plain), (unset, plain_unset) = built(), built(grid=None)
+    on_grid, on_times = evaluated(inherited), evaluated(unset)
+    np.testing.assert_array_equal(on_grid, evaluated(plain))
+    np.testing.assert_array_equal(on_times, evaluated(plain_unset))
+    assert not np.array_equal(on_grid, on_times)
+    # The rollout walks the process's own times, whatever grid evaluation samples on.
+    on_grid_rollout, on_times_rollout = rolled(inherited), rolled(unset)
+    for name, field in on_grid_rollout.items():
+        np.testing.assert_array_equal(field, on_times_rollout[name], err_msg=name)
+    times = np.asarray(source.process.times(rollout.steps))
+    np.testing.assert_array_equal(on_grid_rollout["timesteps"][0], times[:-1])
+    np.testing.assert_array_equal(on_grid_rollout["next_timesteps"][0], times[1:])
+
+    prompts = list(PROMPTS[:2])
+    pipeline = source.text_to_image()
+    reference = np.asarray(pipeline(prompts, steps=2, guidance=None, solver=Euler(), key=7).images)
+    published = np.asarray(inherited.build_task(started(inherited).variables)(prompts, key=7).images)
+    assert np.all(np.isfinite(reference)) and np.all(np.isfinite(published))
+    np.testing.assert_array_equal(published, reference)
+
+    config = DiffusionRunConfig(pretrained=str(directory), preset=None, model=precision(),
+                                data=images_of("tfds://oxford_flowers102", 16),
+                                val_metrics=(),
+                                trainer=TrainerConfig(checkpoint_dir=str(tmp_path)),
+                                objective=ObjectiveConfig("flow_grpo", settings), rollout=rollout)
+    saved = config.build()
+    initial = started(saved)
+    # The run's step-0 state is the pipeline's weights, leaf for leaf.
+    for (path, held), weight in zip(jax.tree_util.tree_leaves_with_path(initial.variables),
+                                    jax.tree.leaves(source.variables), strict=True):
+        assert np.all(np.isfinite(np.asarray(held))), jax.tree_util.keystr(path)
+        np.testing.assert_array_equal(np.asarray(held), np.asarray(weight),
+                                      err_msg=jax.tree_util.keystr(path))
+    checkpoints = Checkpoints(str(tmp_path / "run"))
+    checkpoints.save(0, initial, None, {}, artifact=saved.inference_record())
+    checkpoints.wait()
+    config.save(str(tmp_path / "run"))
+    # The restored task runs where its weights were restored, over every device: the pipeline's task
+    # over those weights, run there too, draws what it does.
+    restored = TextToImage.from_run(str(tmp_path / "run"))
+    published_variables = saved.pipeline(initial).variables
+    for got, want in zip(jax.tree.leaves(restored.variables), jax.tree.leaves(published_variables),
+                         strict=True):
+        assert np.all(np.isfinite(np.asarray(got)))
+        np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
+    drawn = np.asarray(restored(prompts, key=7).host().images)
+    assert np.all(np.isfinite(drawn))
+    np.testing.assert_array_equal(
+        drawn,
+        pipeline.bind(restored.variables)(prompts, steps=2, guidance=None, solver=Euler(),
+                                          key=7).host().images)

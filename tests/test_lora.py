@@ -28,9 +28,11 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from affine_run import Replaying
 from flax import linen as nn
 from interop_support import extract_fixture, hub_cache
-from reference_error import assert_as_exact_as_the_reference
+from model_support import flat_tree
+from reference_error import assert_as_exact_as_the_reference, widened
 from safetensors.numpy import load_file
 from test_joined import row_joins
 
@@ -40,10 +42,12 @@ from dew.diffusion.process import DenoisingCondition
 from dew.interop.pretrained import Pretrained
 from dew.interop.safetensors_io import read_file, write_file
 from dew.lora import Adapter, AdapterBase, LoRA, Target
+from dew.nn.sharding import ADAPTER_RANK, declarations, declared_axes, parameter_path
 from dew.objectives.base import FROZEN, Step, merge, thaw
 from dew.objectives.diffusion import DiffusionObjective
 from dew.objectives.lm import LMObjective
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer
+from dew.training.optim import OPTIMIZER_MAP, muon_weight_dimension_numbers
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "tests" / "fixtures" / "lora"
@@ -276,7 +280,7 @@ def test_a_source_fine_tunes_through_its_own_adapted_bundle(decoder, reference, 
         log_every=2,
     )
 
-    assert set(_flat(state.variables["params"])) == {
+    assert set(flat_tree(state.variables["params"])) == {
         f"{'.'.join(target[1:])}.{factor}" for target in tuned.adapter.targets for factor in lora.FACTORS}
     for before, after in zip(
         jax.tree.leaves(initial.variables[FROZEN]), jax.tree.leaves(state.variables[FROZEN]), strict=True
@@ -285,8 +289,8 @@ def test_a_source_fine_tunes_through_its_own_adapted_bundle(decoder, reference, 
     trained = thaw(state.variables)
     tuned.adapter.save(state.variables, tmp_path / "adapter")
     read = LoRA.load(source.model, source.variables, tmp_path / "adapter", layouts=source.layouts)
-    for name, leaf in _flat(thaw(read.variables)).items():
-        np.testing.assert_array_equal(np.asarray(leaf), np.asarray(_flat(trained)[name]), err_msg=name)
+    for name, leaf in flat_tree(thaw(read.variables)).items():
+        np.testing.assert_array_equal(np.asarray(leaf), np.asarray(flat_tree(trained)[name]), err_msg=name)
     # The export is the merged weights in the source's layout, so the reload
     # computes exactly what the source model computes on them; how close the
     # merge is to the adapted forward is the PEFT parity test's to bound.
@@ -440,6 +444,66 @@ with torch.no_grad():
     logits = PeftModel.from_pretrained(base, directory).eval()(torch.as_tensor(np.load(sys.argv[2]))).logits
 np.save(directory + "/peft.npy", logits.numpy())
 """
+
+
+@pytest.mark.mesh(devices=2)
+def test_an_adapters_factors_take_their_kernels_axes_on_each_side_of_the_rank(loaded):
+    """Each factor of an adapted projection takes its kernel's axes on its own side of the rank,
+    `lora_A` `[in, r]` the input's and `lora_B` `[r, out]` the output's, and the rank its own axis,
+    which no rule places: over an fsdp mesh `lora_A` splits its input as the kernel does and the
+    rank stays whole, and Muon orthogonalizes each as a matrix from one side to the other. The
+    factors took the module's two kernel axes as they stood, so `lora_B`'s rank was named the
+    kernel's input and split over fsdp."""
+    variables = loaded.variables
+    declared = declarations(variables)
+    factors = {"/".join(parameter_path(path)[-2:]): (path, leaf)
+               for path, leaf in jax.tree_util.tree_leaves_with_path(variables)
+               if parameter_path(path)[-1] in lora.FACTORS and "layers_0" in parameter_path(path)}
+    assert {name: declared_axes(path, leaf.ndim, declared) for name, (path, leaf) in factors.items()} == {
+        "q_proj/lora_A": ("embed", ADAPTER_RANK), "q_proj/lora_B": (ADAPTER_RANK, "heads"),
+        "v_proj/lora_A": ("embed", ADAPTER_RANK), "v_proj/lora_B": (ADAPTER_RANK, "kv"),
+        "down_proj/lora_A": ("mlp", ADAPTER_RANK), "down_proj/lora_B": (ADAPTER_RANK, "embed")}
+    mesh = MeshSpec(fsdp=2).build(jax.devices()[:2])
+    placed = Layout(min_shard=1).shardings(mesh, variables)
+    specs = {"/".join(parameter_path(path)[-2:]): sharding.spec
+             for path, sharding in jax.tree_util.tree_leaves_with_path(placed)
+             if "/".join(parameter_path(path)[-2:]) in factors and "layers_0" in parameter_path(path)}
+    assert specs["q_proj/lora_A"][0] == specs["v_proj/lora_A"][0] == "fsdp", specs
+    assert all(not spec or spec[0] is None for name, spec in specs.items() if name.endswith("lora_B")), specs
+    muon = muon_weight_dimension_numbers(variables["params"])
+    for name, (path, _) in factors.items():
+        numbers = muon
+        for key in path[1:]:
+            numbers = numbers[key.key]
+        assert (numbers.reduction_axis, numbers.output_axis) == ((0,), (1,)), name
+
+
+def test_muon_steps_an_adapted_head_whose_factors_it_splits_between_its_optimizers(decoder, reference):
+    """An adapter on the vocabulary head as well as q_proj: Muon takes the head's `lora_A`
+    ('embed', rank) as a matrix and AdamW its `lora_B` (rank, 'vocab'), a lookup, and optax hands
+    each optimizer its own masked tree, so a factor's axes are read off it alone. They were read
+    off both factors, so the masked tree raised on Muon's first update."""
+    adapter = LoRA(rank=2, modules=("q_proj", "lm_head")).apply(
+        decoder.model, decoder.variables, key=0, layouts=decoder.layouts)
+    # A fresh adapter's B is zero, which leaves A's gradient zero; a drawn B moves both.
+    factors = jax.tree_util.tree_map_with_path(
+        lambda path, leaf: jax.random.normal(jax.random.key(7), leaf.shape, leaf.dtype)
+        if path[-1].key == "lora_B" else leaf, adapter.variables["params"])
+    numbers = muon_weight_dimension_numbers(factors)
+    assert numbers["lm_head"]["lora_A"] is not None and numbers["lm_head"]["lora_B"] is None
+    optimizer = OPTIMIZER_MAP["muon"](1e-3)
+    tokens = jnp.asarray(reference["input_ids"])
+
+    def loss(moving):
+        return jnp.mean(jnp.square(adapter.model.apply({**adapter.variables, "params": moving}, tokens)))
+
+    updates, _ = optimizer.update(jax.grad(loss)(factors), optimizer.init(factors), factors)
+    moved = optax.apply_updates(factors, updates)
+    for path, before in jax.tree_util.tree_leaves_with_path(factors):
+        after = moved
+        for key in path:
+            after = after[key.key]
+        assert not np.array_equal(np.asarray(after), np.asarray(before)), jax.tree_util.keystr(path)
 
 
 def test_a_fresh_adapter_is_the_identity_and_matches_by_suffix(decoder, reference):
@@ -678,11 +742,13 @@ REGISTRY_FIELDS = {"vocab_size": 256, "emb_features": 16, "num_layers": 2, "num_
                    "head_dim": 8, "mlp_features": 32, "max_seq_len": 16}
 
 
-def _flat(tree):
-    """Every leaf by its dotted path, for comparing two trees leaf by leaf."""
-    return {".".join(str(entry.key) for entry in path): leaf
-            for path, leaf in jax.tree_util.tree_flatten_with_path(tree)[0]}
 
+def squared_output(model, variables, inputs):
+    """The mean squared output of `model` over `inputs`, in float32, as a loss's ratio."""
+    from dew.objectives.base import Ratio
+
+    outputs = model.apply(variables, inputs)
+    return Ratio(jnp.sum(outputs.astype(jnp.float32) ** 2), jnp.asarray(outputs.size, jnp.float32))
 
 def _registry_decoder():
     """A tiny causal transformer and its variables, built from the registry:
@@ -731,28 +797,75 @@ def test_a_registry_model_adapts_through_the_names_its_own_kernels_carry(tmp_pat
         unnamed.save(adapted, tmp_path / "unnamed")
 
 
-def test_factors_keep_one_storage_dtype_whether_attached_or_rebuilt_from_the_record():
-    """An adapter's factors are stored in float32 under bfloat16 base weights, as attached and as
-    the model rebuilt from its record initializes them, so a run restoring trained factors onto
-    the rebuilt model's template keeps every bit; the rebuilt model computes what the attached one
-    does over the attached variables."""
+def test_trained_factors_over_a_bf16_base_resume_on_the_rebuilt_model_as_an_uninterrupted_run(tmp_path):
+    """Factors trained over bfloat16 base weights: a run checkpointed after two steps resumes on the
+    model rebuilt from its record (`ModelConfig.from_model`), whose own initializer draws the
+    restore template, its factors stored in float32 as attached. The restored state is the first
+    run's step-2 state bit for bit, and its next two steps reach every leaf and the outputs an
+    uninterrupted four-step run reaches, bit for bit. A template whose factors took the base's
+    bfloat16 would round the restored factors; a resume that drew afresh would start elsewhere."""
     from dew.config import ModelConfig
+    from dew.inputs import Field, InputSpec
+    from dew.objectives.base import Objective
 
     model = nn.Sequential([nn.Dense(8, param_dtype=jnp.bfloat16), nn.Dense(4, param_dtype=jnp.bfloat16)])
-    inputs = jax.random.normal(jax.random.key(1), (2, 6))
-    variables = model.init(jax.random.key(0), inputs)
-    adapter = LoRA(rank=2, modules=("layers_0", "layers_1")).apply(model, variables, key=0)
+    rows = 2 * jax.device_count()
+    inputs = np.asarray(jax.random.normal(jax.random.key(1), (rows, 6)))
+    adapter = LoRA(rank=2, modules=("layers_0", "layers_1")).apply(
+        model, model.init(jax.random.key(0), inputs), key=0)
     rebuilt = ModelConfig.from_model(adapter.model).build()
-    template = rebuilt.init(jax.random.key(0), inputs)
+
+    class Squared(Objective):
+        """The mean squared output; its variables those given, or its model's own draw."""
+
+        inputs = InputSpec(Field("x", (6,)))
+
+        def __init__(self, model, variables=None):
+            self.model, self.variables = model, variables
+
+        def init(self, key, variables=None):
+            if variables is not None:
+                return variables
+            return self.model.init(key, inputs) if self.variables is None else self.variables
+
+        def loss(self, variables, batch, step):
+            return squared_output(self.model, variables, batch["x"])
+
+    def data():
+        # A stream that keeps its position, so a resume continues where the checkpoint left it;
+        # each step's batch is its own, so a resume that restarted the data would diverge.
+        return Loader(train=lambda partition: Replaying(lambda step: {"x": inputs * (1 + step)}), val=None,
+                      records=rows, batch=rows)
+
+    def trainer(objective, directory):
+        return Trainer(objective, optax.adam(1e-2), key=jax.random.key(3), mesh=MeshSpec(),
+                       checkpoints=Checkpoints(str(directory)))
 
     def factors(tree):
-        return {name: leaf.dtype for name, leaf in _flat(tree["params"]).items()
-                if name.endswith(lora.FACTORS)}
+        return {name: leaf for name, leaf in flat_tree(tree["params"]).items() if name.endswith(lora.FACTORS)}
 
-    attached = factors(adapter.variables)
-    assert factors(template) == attached == dict.fromkeys(attached, jnp.float32)
-    np.testing.assert_array_equal(np.asarray(rebuilt.apply(adapter.variables, inputs)),
-                                  np.asarray(adapter.model.apply(adapter.variables, inputs)))
+    whole = trainer(Squared(adapter.model, adapter.variables), tmp_path / "whole").fit(data(), steps=4,
+                                                                                      log_every=4)
+    first = trainer(Squared(adapter.model, adapter.variables), tmp_path / "split")
+    halfway = first.fit(data(), steps=2, log_every=2, checkpoint_every=2)
+    first.checkpoints.wait()
+
+    resumed = trainer(Squared(rebuilt), tmp_path / "split")
+    template = factors(Squared(rebuilt).init(jax.random.key(3)))
+    assert {leaf.dtype for leaf in template.values()} == {jnp.dtype(jnp.float32)}
+    restored, _, _ = resumed.place()
+    assert int(restored.step) == 2
+    for name, leaf in factors(halfway.variables).items():
+        ours = factors(restored.variables)[name]
+        assert ours.dtype == leaf.dtype and np.array_equal(np.asarray(ours), np.asarray(leaf)), name
+    continued = resumed.fit(data(), steps=4, log_every=2)
+    assert int(continued.step) == 4
+    for (path, ours), theirs in zip(jax.tree_util.tree_leaves_with_path(continued.variables),
+                                    jax.tree.leaves(whole.variables), strict=True):
+        assert ours.dtype == theirs.dtype and np.array_equal(np.asarray(ours), np.asarray(theirs)), \
+            jax.tree_util.keystr(path)
+    np.testing.assert_array_equal(np.asarray(rebuilt.apply(continued.variables, inputs)),
+                                  np.asarray(adapter.model.apply(whole.variables, inputs)))
 
 
 def test_the_branch_reaches_every_layer_of_a_scanned_run(decoder, reference):
@@ -813,12 +926,6 @@ def _sampled(task) -> np.ndarray:
     return np.asarray(task(PROMPTS, steps=2, key=1).host().images)
 
 
-def _wider(tree):
-    """Every floating leaf of `tree` in float64."""
-    return jax.tree.map(
-        lambda leaf: leaf.astype(jnp.float64) if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf, tree)
-
-
 def _moved_b(tuned, seed: int):
     """The tuned variables with every B drawn away from zero, as a run leaves them."""
     keys = iter(jax.random.split(jax.random.key(seed), len(tuned.adapter.targets)))
@@ -858,8 +965,8 @@ def test_a_pipeline_adapts_its_denoiser_alone_and_starts_as_the_source(family, p
 
     with jax.enable_x64():
         wide = dataclasses.replace(source, model=source.model.clone(dtype=jnp.float64),
-                                   variables=_wider(source.variables))
-        truth = sampled(wide, _wider(prepared))
+                                   variables=widened(source.variables))
+        truth = sampled(wide, widened(prepared))
     assert_as_exact_as_the_reference(sampled(tuned, prepared), sampled(source, prepared), truth, family)
     with pytest.raises(ValueError):
         source.adapt(LoRA(rank=2, modules=("q_proj",)), key=0)
@@ -884,13 +991,13 @@ def test_a_pipeline_lora_run_moves_its_factors_and_nothing_else(family, pipeline
     data = Loader(train=lambda partition: iter([batch] * 3), val=None, records=rows, batch=rows)
     state = trainer.fit(data, steps=3, log_every=3)
 
-    assert set(_flat(state.variables["params"])) == {
+    assert set(flat_tree(state.variables["params"])) == {
         f"{'.'.join(path[1:])}.{factor}" for path in tuned.adapter.targets for factor in lora.FACTORS}
     for collection in (FROZEN, "encoders", "autoencoder"):
         for before, after in zip(jax.tree.leaves(initial.variables[collection]),
                                  jax.tree.leaves(state.variables[collection]), strict=True):
             np.testing.assert_array_equal(np.asarray(before), np.asarray(after), err_msg=collection)
-    assert all(bool(jnp.any(leaf)) for name, leaf in _flat(state.variables["params"]).items()
+    assert all(bool(jnp.any(leaf)) for name, leaf in flat_tree(state.variables["params"]).items()
                if name.endswith("lora_B"))
     assert np.isfinite(_sampled(objective.pipeline(state))).all()
 
@@ -910,9 +1017,9 @@ def test_a_tuned_pipeline_saves_its_adapter_and_its_merged_weights(family, pipel
     assert json.loads(metadata[lora.DIFFUSERS_METADATA])["transformer.r"] == 2
     loaded = LoRA.load(source.model, source.variables, tmp_path / "adapter", layouts=source.layouts)
     assert (loaded.targets, loaded.layouts) == (tuned.adapter.targets, tuned.adapter.layouts)
-    for name, leaf in _flat(thaw(loaded.variables)).items():
+    for name, leaf in flat_tree(thaw(loaded.variables)).items():
         if "lora_" in name:
-            np.testing.assert_array_equal(np.asarray(leaf), np.asarray(_flat(thaw(variables))[name]),
+            np.testing.assert_array_equal(np.asarray(leaf), np.asarray(flat_tree(thaw(variables))[name]),
                                           err_msg=name)
 
     tuned.save(tmp_path / "merged", variables=variables)
@@ -1068,9 +1175,9 @@ def test_a_pretrained_pipeline_run_from_the_command_line_trains_its_lora(pipelin
 
     source = load_diffusion_source(str(directory), dtype="float32", attention_impl="xla", size=(16, 16))
     tuned = source.adapt(config.lora, key=config.trainer.key)
-    moved = _flat(state.variables["params"])
+    moved = flat_tree(state.variables["params"])
     assert moved and all(name.endswith(lora.FACTORS) for name in moved)
-    assert all(bool(jnp.any(leaf != _flat(tuned.variables["params"])[name]))
+    assert all(bool(jnp.any(leaf != flat_tree(tuned.variables["params"])[name]))
                for name, leaf in moved.items() if name.endswith("lora_B"))
     for collection in (FROZEN, "encoders", "autoencoder"):
         for before, after in zip(jax.tree.leaves(tuned.variables[collection]),
@@ -1089,7 +1196,7 @@ def test_a_custom_objective_trains_only_an_adapters_factors(decoder, reference):
     itself, so the optimizer moves the factors alone and the base comes
     back bitwise."""
     from dew.inputs import Field, InputSpec
-    from dew.objectives.base import Objective, Ratio
+    from dew.objectives.base import Objective
 
     tokens = np.asarray(reference["input_ids"])
 
@@ -1105,8 +1212,7 @@ def test_a_custom_objective_trains_only_an_adapters_factors(decoder, reference):
             return self.variables if variables is None else variables
 
         def loss(self, variables, batch, step):
-            logits = self.model.apply(variables, batch["text"])
-            return Ratio(jnp.sum(logits.astype(jnp.float32) ** 2), jnp.asarray(logits.size, jnp.float32))
+            return squared_output(self.model, variables, batch["text"])
 
     adapter = LoRA(rank=2, modules=("q_proj", "v_proj")).apply(decoder.model, decoder.variables, key=0,
                                                                layouts=decoder.layouts)
@@ -1117,11 +1223,11 @@ def test_a_custom_objective_trains_only_an_adapters_factors(decoder, reference):
     initial = trainer.initial_state()
     state = trainer.fit(data, steps=2, log_every=2)
 
-    assert set(_flat(state.variables["params"])) == {
+    assert set(flat_tree(state.variables["params"])) == {
         f"{'.'.join(target[1:])}.{factor}" for target in adapter.targets for factor in lora.FACTORS}
-    before = _flat(initial.variables["params"])
-    assert all(bool(jnp.any(leaf != before[name])) for name, leaf in _flat(state.variables["params"]).items()
-               if name.endswith("lora_B"))
+    before = flat_tree(initial.variables["params"])
+    assert all(bool(jnp.any(leaf != before[name]))
+               for name, leaf in flat_tree(state.variables["params"]).items() if name.endswith("lora_B"))
     for before, after in zip(jax.tree.leaves(initial.variables[FROZEN]),
                              jax.tree.leaves(state.variables[FROZEN]), strict=True):
         np.testing.assert_array_equal(np.asarray(before), np.asarray(after))
@@ -1144,7 +1250,7 @@ def test_a_scratch_diffusion_run_from_the_command_line_trains_its_lora(tmp_path)
         "--lora.modules", "final_proj")
     assert config.lora == LoRA(rank=2, modules=("final_proj",))
 
-    moved = _flat(state.variables["params"])
+    moved = flat_tree(state.variables["params"])
     assert set(moved) == {f"output.final_proj.{factor}" for factor in lora.FACTORS}
     plain = dataclasses.replace(config, lora=None).build()
     key = jax.random.key(config.trainer.key)
@@ -1153,8 +1259,8 @@ def test_a_scratch_diffusion_run_from_the_command_line_trains_its_lora(tmp_path)
                              strict=True):
         np.testing.assert_array_equal(np.asarray(before), np.asarray(after))
     adapter = config.lora.apply(plain.model, drawn, key=jax.random.fold_in(key, 1))
-    assert all(bool(jnp.any(leaf != _flat(adapter.variables["params"])[name])) for name, leaf in moved.items()
-               if name.endswith("lora_B"))
+    assert all(bool(jnp.any(leaf != flat_tree(adapter.variables["params"])[name]))
+               for name, leaf in moved.items() if name.endswith("lora_B"))
     adapter.save(state.variables, tmp_path / "in-process")
     rebuilt = Adapter.from_run(tmp_path / "run")
     rebuilt.save(rebuilt.variables, tmp_path / "from-run")

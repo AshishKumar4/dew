@@ -28,7 +28,7 @@
   "summary_type": "cls_index",
   "summary_use_proj": true,
   "tie_word_embeddings": true,
-  "transformers_version": "5.16.1",
+  "transformers_version": "5.17.0",
   "use_cache": true,
   "vocab_size": 128
 }

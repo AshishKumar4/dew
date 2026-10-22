@@ -192,8 +192,11 @@ class Train:
                 raise TypeError(f"{self.run}'s run is {built!r}, not a run config")
             if built.trainer.name is None:
                 built = dataclasses.replace(built, trainer=dataclasses.replace(built.trainer, name=path.stem))
-            # What trains is what the record reads back as, so its run.json trains the same run.
-            run = RunConfig.read(built.record(), trust=(*self.trust, path.stem))
+            # What trains is what the record reads back as, so its run.json trains the same run; a chain
+            # the record cannot describe trains as Python built it, and its run.json says why it can't
+            # be rebuilt (`RunConfig.unrecorded`).
+            run = (built if built.unrecorded()
+                   else RunConfig.read(built.record(), trust=(*self.trust, path.stem)))
         run.assigned(self.set).run()
         return 0
 
