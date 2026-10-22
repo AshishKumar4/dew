@@ -188,16 +188,16 @@ class GRPOObjective(TokenScorer):
         self.epsilon_low = epsilon_low
         self.epsilon_high = epsilon_high
         self.dual_clip = dual_clip
-        self.behavior_importance = behavior_importance
-        self._cap: float | None = None
-        self._band: tuple[float, float] | None = None
         if isinstance(behavior_importance, tuple):
-            self._band = _band("behavior_importance", behavior_importance)
+            behavior_importance = _band("behavior_importance", behavior_importance)
         elif behavior_importance is not None:
             if isinstance(behavior_importance, bool) or not behavior_importance > 0:
                 raise ValueError("behavior_importance is a positive TIS cap, a (low, high) IcePop band, "
                                  "or None to disable correction")
-            self._cap = float(behavior_importance)
+            behavior_importance = float(behavior_importance)
+        self.behavior_importance: float | tuple[float, float] | None = behavior_importance
+        """The off-policy correction, normalised: a TIS cap (a float), an IcePop band (low, high),
+        or None; the scheduler and the loss read this one value."""
         self.sequence_mask = _band("sequence_mask", sequence_mask)
         self.geometric_mask = _band("geometric_mask", geometric_mask)
         self.policy_loss = policy_loss
@@ -268,7 +268,8 @@ class GRPOObjective(TokenScorer):
         """
         terms = self._terms(variables, batch)
         mask = terms.mask
-        if self._cap is not None and not terms.proximal:
+        correction = self.behavior_importance
+        if isinstance(correction, float) and not terms.proximal:
             raise ValueError(
                 "without old_log_probs the ratio is already current over behavior, so a TIS cap "
                 "would count the correction twice (verl's bypass mode applies no IS weight); "
@@ -289,12 +290,12 @@ class GRPOObjective(TokenScorer):
         # Weights and diagnostics read every trainable token, as verl's do;
         # rejection reaches the loss through `effective` alone.
         importance = None
-        if self._cap is not None:
-            importance = behavior_importance_weights(proximal, terms.behavior, mask, self._cap)
-        elif self._band is not None:
-            importance = behavior_band_weights(proximal, terms.behavior, mask, *self._band)
+        if isinstance(correction, float):
+            importance = behavior_importance_weights(proximal, terms.behavior, mask, correction)
+        elif isinstance(correction, tuple):
+            importance = behavior_band_weights(proximal, terms.behavior, mask, *correction)
             metrics["masked/band"] = masked_mean(importance == 0, mask)
-        cap = self._cap if self._band is None else self._band[1]
+        cap = correction[1] if isinstance(correction, tuple) else correction
         mismatch = mismatch_metrics(proximal, terms.behavior, mask, importance, cap)
         metrics.update({f"mismatch/{key}": value for key, value in mismatch.items()})
         if importance is not None and not terms.proximal:

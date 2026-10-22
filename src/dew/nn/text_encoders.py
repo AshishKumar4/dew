@@ -52,6 +52,7 @@ from dew.nn.inputs import AttentionMetadata, coordinates
 from dew.nn.mixer_base import MixerContext
 from dew.nn.mixers.attention import CausalSelfAttention
 from dew.nn.mlp import GatedMLP
+from dew.nn.precision import float32_dot_general
 from dew.nn.sharding import logical_axes
 from dew.registry import resolve_dtype
 
@@ -235,12 +236,14 @@ class CLIPVisionTransformer(nn.Module):
     layer_norm_eps: float = 1e-5
     dtype: Dtype | None = None
     precision: PrecisionLike = None
+    activation: str = "quick_gelu"
 
     @nn.nowrap
     def _layer(self, name=None):
         patches = (self.image_size // self.patch_size) ** 2
         return clip_layer(self.hidden_size, self.num_heads, self.intermediate_size, patches + 1,
-                          eps=self.layer_norm_eps, dtype=self.dtype, precision=self.precision, name=name)
+                          activation=tower_activation(self.activation), eps=self.layer_norm_eps,
+                          dtype=self.dtype, precision=self.precision, name=name)
 
     @nn.nowrap
     def _patch_embedding(self, **scope):
@@ -308,7 +311,7 @@ class CLIP(nn.Module):
 
     def setup(self):
         dense = functools.partial(Dense, self.projection_dim, use_bias=False,
-                                  dtype=self.dtype, precision=self.precision)
+                                  dtype=self.dtype, precision=self.precision, dot_general=float32_dot_general)
         self.text_projection = dense(name="text_projection")
         self.visual_projection = dense(name="visual_projection")
 
@@ -329,14 +332,6 @@ class CLIPFields(TypedDict):
     text: NativeFields[CLIPTextTransformer]
     vision: NativeFields[CLIPVisionTransformer]
     projection_dim: int
-
-
-def _quick_gelu_only(config: Mapping[str, object]) -> None:
-    activation = config.get("hidden_act", "quick_gelu")
-    if activation != "quick_gelu":
-        raise ValueError(
-            f"hidden_act {activation!r} is not expressible: this MLP is CLIP's "
-            "quick-GELU")
 
 
 def translate_config(hf_config: Mapping[str, object]) -> NativeFields[CLIPTextTransformer]:
@@ -379,7 +374,6 @@ def translate_vision_config(hf_config: Mapping[str, object]) -> NativeFields[CLI
     config or from a `CLIPVisionConfig` on its own."""
     vision = records.record(hf_config.get("vision_config", hf_config), "vision_config")
 
-    _quick_gelu_only(vision)
     return native_fields(CLIPVisionTransformer)(
         hidden_size=records.integer(vision["hidden_size"], "hidden_size"),
         intermediate_size=records.integer(vision["intermediate_size"], "intermediate_size"),
@@ -389,6 +383,7 @@ def translate_vision_config(hf_config: Mapping[str, object]) -> NativeFields[CLI
         patch_size=records.integer(vision["patch_size"], "patch_size"),
         num_channels=records.integer(vision.get("num_channels", 3), "num_channels"),
         layer_norm_eps=records.number(vision.get("layer_norm_eps", 1e-5), "layer_norm_eps"),
+        activation=records.text(vision.get("hidden_act", "quick_gelu"), "hidden_act"),
     )
 
 
@@ -436,20 +431,14 @@ _BESIDE_THE_TEXT_TOWER = ("vision_model.", "visual_projection.", "text_projectio
 
 def _encoder_layer_path(parts, root: str, norms: Mapping[str, str] = _NORMS,
                         projections: Mapping[str, str] = _PROJECTIONS) -> tuple[str, ...] | None:
-    """`<root>.layers.N...` into the path of a `clip_layer`: two layer norms,
-    biased attention maps and a biased fc1/fc2 MLP, each source name mapped
-    by `norms` or `projections` (CLIP's by default) or onto the MLP's up and
-    down maps."""
-    if (len(parts) < 5 or parts[:2] != [root, "layers"] or not parts[2].isdigit()
-            or parts[-1] not in ("weight", "bias")):
-        return None
-    layer, module, leaf = f"layers_{parts[2]}", parts[3], parts[-1]
-    if len(parts) == 5 and module in norms:
-        return (layer, norms[module], "scale" if leaf == "weight" else "bias")
-    names = projections if module == "self_attn" else _MLP if module == "mlp" else {}
-    if len(parts) == 6 and parts[4] in names:
-        return (layer, module, names[parts[4]], "kernel" if leaf == "weight" else "bias")
-    return None
+    """`<root>.layers.N...` into the path of a `clip_layer` (`block_tensor_path`): two layer norms,
+    biased attention maps and a biased fc1/fc2 MLP, each source name mapped by `norms` or
+    `projections` (CLIP's by default) or onto the MLP's up and down maps."""
+    from dew.nn.vision.common import block_tensor_path
+
+    maps = {**{("self_attn", source): ("self_attn", name) for source, name in projections.items()},
+            **{("mlp", source): ("mlp", name) for source, name in _MLP.items()}}
+    return block_tensor_path(parts, maps, prefix=f"{root}.layers", block="layers", norms=norms)
 
 
 def _tower_path(hf_name: str, prefix: str,

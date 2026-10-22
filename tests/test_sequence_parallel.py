@@ -24,6 +24,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from model_support import two_documents
+from token_support import token_rows
 
 from dew.nn.attention import (
     NormalAttention,
@@ -50,8 +51,7 @@ TOLERANCE = 1e-6
 
 
 def dense_batch():
-    rng = np.random.default_rng(0)
-    return {"text": rng.integers(1, VOCAB, size=(BATCH, SEQ_LEN + 1)).astype(np.int32)}
+    return token_rows(VOCAB, BATCH, SEQ_LEN + 1, low=1)
 
 
 def packed_batch():

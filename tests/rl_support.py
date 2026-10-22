@@ -3,6 +3,7 @@ causal stack's scoring contract, and verl's token-mean reduction of the
 surrogate terms they check `dew.rl` against."""
 
 import jax.numpy as jnp
+import numpy as np
 from flax import linen as nn
 
 from dew.nn.protocols import OutputTable
@@ -68,3 +69,18 @@ def clipped_surrogate(log_ratio, advantages, mask, module=surrogate, **clip):
     """The token-mean reduction of the dual-clipped policy terms."""
     terms, aux = module.clipped_surrogate_terms(log_ratio, advantages, mask, **clip)
     return token_mean(terms, mask), aux
+
+
+def prompt_inputs(records):
+    """A batch's left-padded prompts (`prompt`, `prompt_length`) as model inputs, each row's real
+    tokens the last `prompt_length` and the rest masked out."""
+    from dew.nn.inputs import ModelInputs
+
+    tokens = jnp.asarray(records["prompt"])
+    padding = tokens.shape[1] - jnp.asarray(records["prompt_length"])[:, None]
+    return ModelInputs(tokens, {"attention_mask": jnp.arange(tokens.shape[1])[None, :] >= padding})
+
+
+def padded_text(text: str, width: int) -> np.ndarray:
+    """`text`'s UTF-8 bytes as int32 ids, zero-padded to `width`: a string field of a token batch."""
+    return np.pad(np.frombuffer(text.encode(), np.uint8).astype(np.int32), (0, width - len(text)))

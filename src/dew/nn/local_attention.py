@@ -21,7 +21,7 @@ from .attention import (
     tensor_shards,
 )
 from .documents import with_documents
-from .inputs import valid_order
+from .inputs import sequence_blocks, valid_order
 from .kernels.selection import forced
 from .sharding import (
     HEADS,
@@ -34,12 +34,6 @@ from .sharding import (
     rows_spec,
     sequence_shards,
 )
-
-
-def _blocks(x, block: int, blocks: int):
-    """`[B, S, ...]` padded at the end to `blocks * block` rows, as `[B, blocks, block, ...]`."""
-    x = jnp.pad(x, [(0, 0), (0, blocks * block - x.shape[1])] + [(0, 0)] * (x.ndim - 2))
-    return x.reshape(x.shape[0], blocks, block, *x.shape[2:])
 
 
 def _banded(x, before=None):
@@ -309,7 +303,7 @@ def _local_blocks(kernel, query, key, value, *, window, chunk, places, segment_i
         return x.reshape(batch * blocks, width, *x.shape[3:])
 
     def row_blocks(x):
-        return _blocks(jnp.broadcast_to(jnp.asarray(x), (batch, length)), span, blocks)
+        return sequence_blocks(jnp.broadcast_to(jnp.asarray(x), (batch, length)), span, blocks)
 
     def preceding(index):
         # The halo field at `index`, as the one block before the first.
@@ -327,7 +321,7 @@ def _local_blocks(kernel, query, key, value, *, window, chunk, places, segment_i
                 keep = keep & row_blocks(jnp.asarray(valid, bool))[..., None, :]
             mask = keep.reshape(batch * blocks, 1, span, span)
             implementation = masked
-        out = kernel(*(folded(_blocks(x, span, blocks), span) for x in (query, key, value)),
+        out = kernel(*(folded(sequence_blocks(x, span, blocks), span) for x in (query, key, value)),
                      implementation=implementation, causal=True, mask=mask)
     else:
         rows = offset + jnp.arange(blocks * span).reshape(1, blocks, span)
@@ -351,9 +345,9 @@ def _local_blocks(kernel, query, key, value, *, window, chunk, places, segment_i
         if valid is not None:
             keep = keep & _banded(row_blocks(jnp.asarray(valid, bool)),
                                   preceding(4))[..., None, :]
-        out = kernel(folded(_blocks(query, span, blocks), span),
-                     folded(_banded(_blocks(key, span, blocks), preceding(0)), 2 * span),
-                     folded(_banded(_blocks(value, span, blocks), preceding(1)), 2 * span),
+        out = kernel(folded(sequence_blocks(query, span, blocks), span),
+                     folded(_banded(sequence_blocks(key, span, blocks), preceding(0)), 2 * span),
+                     folded(_banded(sequence_blocks(value, span, blocks), preceding(1)), 2 * span),
                      implementation=masked,
                      mask=keep.reshape(batch * blocks, 1, span, 2 * span))
     unfolded = (batch, blocks * span, *out.shape[2:])

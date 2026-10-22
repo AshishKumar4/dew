@@ -18,6 +18,7 @@ from dew import records
 from dew.interop.weights import placed
 from dew.nn.attention import RMSNorm
 from dew.nn.dense import Dense
+from dew.nn.precision import float32_dot_general
 from dew.registry import Record, from_record
 
 from ..mobilenet import _ARCHITECTURE, MobileNetV5, MobileNetV5Encoder
@@ -64,7 +65,7 @@ class Gemma3nProjectorModule(nn.Module):
         self.soft_embedding_norm = norm(name="soft_embedding_norm")
         self.embedding_projection = Dense(self.text_width, use_bias=False,
                                               dtype=self.dtype, precision=self.precision,
-                                              name="embedding_projection")
+                                              name="embedding_projection", dot_general=float32_dot_general)
         self.embedding_post_projection_norm = norm(with_scale=False,
                                                    name="embedding_post_projection_norm")
 
@@ -187,10 +188,7 @@ def _gemma3n_vision_record(
             "vocab_size", "vocab_offset", "rms_norm_eps"}
     # These are serialized HF metadata. Vocabulary and RMS fields above feed
     # the vision embedder; construction fields feed the MobileNet encoder.
-    metadata = {"architectures", "transformers_version", "torch_dtype", "dtype",
-                "initializer_range", "label_names", "num_classes", "id2label",
-                "label2id", "output_hidden_states", "output_attentions", "return_dict",
-                "is_encoder_decoder", "problem_type", "chunk_size_feed_forward"}
+    metadata = records.HF_METADATA | {"initializer_range", "label_names", "num_classes"}
     unknown = (set(vision) - used - metadata
                - {key for key in vision if str(key).startswith("_")})
     if unknown:
