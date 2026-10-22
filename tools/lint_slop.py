@@ -47,6 +47,15 @@ Scope is per rule, because the rules are not all about the same thing:
 - SLOP021 is about every file: a private attribute of JAX's own objects
   (`JAX_PRIVATE`) is read nowhere (bible: no private attributes of other
   libraries), whose public way the finding names.
+- SLOP022 is about `tests` and `tools`: an arm of a check 1 (`assert_as_exact`'s
+  Dew, reference and truth functions, and those of an assertion that passes
+  its own to them) differentiates nothing itself. Its gradients come from the
+  gate's `with_gradients` or `torch_with_gradients`, which pull back the
+  cotangent the draw holds, so that every arm and the truth pull back the
+  same values; an arm that reaches a reverse-mode transform (`PULLS`,
+  `TORCH_PULLS`) through the functions it names, in its file or in a module
+  of the suite it imports one from, is a finding. A module loaded by name
+  at run time is past what it reads.
 
 Every rule fails the gate, and none has a per-finding suppression.
 
@@ -647,6 +656,214 @@ def jax_private(module: Module) -> Iterator[Finding]:
         if isinstance(node, ast.Attribute) and node.attr in JAX_PRIVATE:
             yield Finding(module.relative, node.lineno, node.col_offset + 1, "SLOP021",
                           f"reads JAX's private {node.attr}; {JAX_PRIVATE[node.attr]}")
+
+
+PULLS = frozenset({"grad", "vjp", "value_and_grad", "jacrev", "linear_transpose"})
+"""JAX's reverse-mode transforms, whose cotangent a check-1 arm takes from the gate, never chooses."""
+TORCH_PULLS = frozenset({"backward"})
+"""Torch's, called as `torch.autograd.grad`, `torch.autograd.backward` or a tensor's `backward`."""
+ARM_KEYWORDS = ("dew_fn", "reference_fn", "truth_fn")
+
+
+def _scoped(body) -> Iterator[ast.AST]:
+    """The nodes of a scope's body, not those of the functions, lambdas and classes it defines."""
+    pending = list(body)
+    while pending:
+        node = pending.pop()
+        yield node
+        if not isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda | ast.ClassDef):
+            pending += ast.iter_child_nodes(node)
+
+
+class _Reach:
+    """What a name reaches in one file's AST: its definitions by lexical scope (functions, lambdas and
+    the values of plain assignments), each name read in the scope that reads it; a parameter, a loop's
+    or an unpacking's target binds nothing it could follow, so a lookup stops at it, and a name imported
+    from a module of the suite (`tests/`, `tools/`) is followed into that file (`_imported_pull`)."""
+
+    FUNCTIONS = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)
+
+    def __init__(self, tree: ast.Module):
+        self.tree = tree
+        self.scopes: dict[ast.AST, dict[str, list]] = {}
+        self.owner: dict[ast.AST, ast.AST] = {}
+        for scope in [tree, *(node for node in ast.walk(tree) if isinstance(node, self.FUNCTIONS))]:
+            body = scope.body if isinstance(scope.body, list) else [scope.body]
+            names = self.scopes.setdefault(scope, {})
+            if scope is not tree:
+                arguments = scope.args
+                for argument in (*arguments.posonlyargs, *arguments.args, *arguments.kwonlyargs,
+                                 *(each for each in (arguments.vararg, arguments.kwarg) if each)):
+                    names.setdefault(argument.arg, [])
+                for child in ast.walk(arguments):
+                    self.owner[child] = scope
+            for node in _scoped(body):
+                self.owner[node] = scope
+                if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef):
+                    names.setdefault(node.name, []).append(node)
+                elif isinstance(node, ast.Assign) and all(isinstance(t, ast.Name) for t in node.targets):
+                    for target in node.targets:
+                        names.setdefault(target.id, []).append(node.value)
+                elif isinstance(node, ast.Name) and isinstance(node.ctx, ast.Store):
+                    names.setdefault(node.id, [])
+                elif isinstance(node, ast.ImportFrom):
+                    for alias in node.names:
+                        imported = ("import", node.module, alias.name)
+                        names.setdefault(alias.asname or alias.name, []).append(imported)
+                elif isinstance(node, ast.Import):
+                    for alias in node.names:
+                        names.setdefault((alias.asname or alias.name).split(".")[0], [])
+        self.pulls = frozenset(alias.asname or alias.name for node in ast.walk(tree)
+                               if isinstance(node, ast.ImportFrom) and node.module == "jax"
+                               for alias in node.names if alias.name in PULLS)
+
+    def chain(self, scope: ast.AST) -> Iterator[ast.AST]:
+        while scope is not self.tree:
+            yield scope
+            scope = self.owner.get(scope, self.tree)
+        yield self.tree
+
+    def reached(self, start: ast.AST) -> Iterator[ast.AST | tuple]:
+        """The nodes `start` reaches, itself first, and the (module, name) imports it reads."""
+        seen, pending = set(), [start]
+        while pending:
+            node = pending.pop()
+            if isinstance(node, tuple):
+                yield node
+                continue
+            if id(node) in seen:
+                continue
+            seen.add(id(node))
+            yield node
+            for name in (each for each in ast.walk(node)
+                         if isinstance(each, ast.Name) and isinstance(each.ctx, ast.Load)):
+                for scope in self.chain(self.owner.get(name, self.tree)):
+                    if name.id in self.scopes.get(scope, {}):
+                        pending += self.scopes[scope][name.id]
+                        break
+
+    def pull(self, start: ast.AST, checkout: Path, seen: set) -> tuple[str, int, str] | None:
+        """The first reverse-mode call `start` reaches, in this file (where, line, transform) or in a
+        suite module it imports a name from."""
+        for node in self.reached(start):
+            if isinstance(node, tuple):
+                found = _imported_pull(checkout, node[1], node[2], seen)
+                if found:
+                    return found
+                continue
+            for inner in ast.walk(node):
+                pulled = _pulls(inner, self.pulls)
+                if pulled:
+                    return "", inner.lineno, pulled
+        return None
+
+
+def _imported_pull(checkout: Path, module: str | None, name: str, seen: set) -> tuple[str, int, str] | None:
+    """The reverse-mode call that `module`'s `name` reaches, if `module` is a file of the suite."""
+    if not module or (module, name) in seen:
+        return None
+    seen.add((module, name))
+    for root in ("tests", "tools"):
+        path = checkout / root / (module.removeprefix(f"{root}.").replace(".", "/") + ".py")
+        if path.is_file():
+            relative = f"{root}/{path.relative_to(checkout / root)}"
+            if relative in GATE:
+                return None
+            reach = _Reach(ast.parse(path.read_text()))
+            for definition in reach.scopes[reach.tree].get(name, []):
+                if not isinstance(definition, tuple):
+                    found = reach.pull(definition, checkout, seen)
+                    if found:
+                        return (found[0] or relative), found[1], found[2]
+            return None
+    return None
+
+
+def _pulls(node: ast.AST, imported: frozenset[str]) -> str | None:
+    """The transform `node` calls to pull back a cotangent, if it is one."""
+    if not isinstance(node, ast.Call):
+        return None
+    function = node.func
+    if isinstance(function, ast.Attribute) and (
+            ast.unparse(function) in ("torch.autograd.grad", "torch.autograd.backward")
+            or function.attr in TORCH_PULLS):
+        return ast.unparse(function)
+    for value in (function, *node.args, *(word.value for word in node.keywords)):
+        named = isinstance(value, ast.Attribute) and value.attr in PULLS
+        if named and ast.unparse(value) == f"jax.{value.attr}":
+            return ast.unparse(value)
+        if isinstance(value, ast.Name) and value.id in imported:
+            return value.id
+    return None
+
+
+ASSERTION = ("assert_as_exact", frozenset({0, 1}), frozenset(ARM_KEYWORDS))
+"""Check 1's assertion and its arms: the positions and the keywords that take one."""
+
+
+def _wrappers(tree: ast.Module, checkout: Path, seen: frozenset = frozenset()) -> dict[str, tuple]:
+    """The assertions of a file that take check-1 arms: check 1 itself, each one a suite module it
+    imports from defines, and each function of the file that passes a parameter of its own to an arm
+    of one of them, with that parameter's position and keyword (to a fixpoint)."""
+    found = {ASSERTION[0]: ASSERTION[1:]}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom) and node.module and node.module not in seen:
+            for root in ("tests", "tools"):
+                path = checkout / root / (node.module.removeprefix(f"{root}.").replace(".", "/") + ".py")
+                if path.is_file() and f"{root}/{path.relative_to(checkout / root)}" not in GATE:
+                    theirs = _wrappers(ast.parse(path.read_text()), checkout, seen | {node.module})
+                    for alias in node.names:
+                        if alias.name in theirs and alias.name != ASSERTION[0]:
+                            found[alias.asname or alias.name] = theirs[alias.name]
+    definitions = [node for node in ast.walk(tree)
+                   if isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef)]
+    changed = True
+    while changed:
+        changed = False
+        for definition in definitions:
+            parameters = [a.arg for a in (*definition.args.posonlyargs, *definition.args.args)]
+            keywords = {*parameters, *(a.arg for a in definition.args.kwonlyargs)}
+            for call in ast.walk(definition):
+                if not isinstance(call, ast.Call):
+                    continue
+                taken = found.get(ast.unparse(call.func).split(".")[-1])
+                if not taken:
+                    continue
+                arms = [arm for index, arm in enumerate(call.args) if index in taken[0]]
+                arms += [word.value for word in call.keywords if word.arg in taken[1]]
+                names = {each.id for arm in arms for each in ast.walk(arm) if isinstance(each, ast.Name)}
+                positions = frozenset(index for index, name in enumerate(parameters) if name in names)
+                words = frozenset(name for name in keywords if name in names)
+                old = found.get(definition.name, (frozenset(), frozenset()))
+                new = (old[0] | positions, old[1] | words)
+                if (positions or words) and new != old:
+                    found[definition.name], changed = new, True
+    return found
+
+
+def arms_pull_back(module: Module) -> Iterator[Finding]:
+    """SLOP022: a check-1 arm that pulls back a cotangent itself, in its own body or in a function it
+    reaches by name, in its file or in a module of the suite it imports one from (`_Reach`)."""
+    if module.relative in GATE or not module.relative.startswith(("tests/", "tools/")):
+        return
+    reach, checkout, found = _Reach(module.tree), _checkout(module), set()
+    wrappers = _wrappers(module.tree, checkout)
+    for call in ast.walk(module.tree):
+        taken = isinstance(call, ast.Call) and wrappers.get(ast.unparse(call.func).split(".")[-1])
+        if not taken:
+            continue
+        arms = [arm for index, arm in enumerate(call.args) if index in taken[0]]
+        for arm in [*arms, *(word.value for word in call.keywords if word.arg in taken[1])]:
+            pulled = reach.pull(arm, checkout, set())
+            if pulled and (pulled[0], pulled[1]) not in found:
+                found.add((pulled[0], pulled[1]))
+                where = f" ({pulled[0]}:{pulled[1]})" if pulled[0] else ""
+                line = pulled[1] if not pulled[0] else arm.lineno
+                yield Finding(module.relative, line, 1, "SLOP022",
+                              f"an arm of the check 1 at line {call.lineno} pulls back its own cotangent "
+                              f"({pulled[2]}{where}); return its forward and take its gradients from "
+                              "reference_error.with_gradients (torch_with_gradients for torch), whose "
+                              "cotangent is the draw's")
 
 
 def size(module: Module) -> Iterator[Finding]:
@@ -2033,7 +2250,7 @@ def tolerances(module: Module) -> Iterator[Finding]:
 
 
 CONTRACT_RULES = (contracts, probes, names, imports, calls, authorities, waits, detections)
-UNIVERSAL_RULES = (suppressions, swallowed, comments, size, jax_private)
+UNIVERSAL_RULES = (suppressions, swallowed, comments, size, jax_private, arms_pull_back)
 
 
 def check(module: Module, models: ModelIndex | None = None) -> Iterator[Finding]:

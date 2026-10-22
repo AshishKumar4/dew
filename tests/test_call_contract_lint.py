@@ -102,3 +102,63 @@ def test_a_read_of_jaxs_private_cache_size_is_reported(lint, body, reported, tmp
     [module] = lint.collect(["tests"], tmp_path, "dew")
     assert any(finding.code == "SLOP021" for finding in lint.check(module)) is reported
 
+
+PULLED_AS_IT_WAS = """
+import jax
+from reference_error import assert_as_exact
+
+
+def pulled(fn):
+    def run(operands):
+        outputs, pull = jax.vjp(fn, operands)
+        keys = jax.random.split(jax.random.fold_in(jax.random.key(0), 1 << 20), len(outputs))
+        (grads,) = pull(tuple(jax.random.normal(key, out.shape, out.dtype)
+                              for key, out in zip(keys, outputs, strict=True)))
+        return grads
+    return run
+
+
+def test_gradients(dew, reference, draw):
+    assert_as_exact(pulled(dew), pulled(reference), draw, "gradients", seeds=8, truth_fn=pulled(reference))
+"""
+"""The recurrence stability suite's gradient site as it was: each arm drew its own cotangent at its own
+output's dtype, so the float64 truth pulled back other values than the arms and every ratio sat at one
+for nothing."""
+
+
+@pytest.mark.parametrize("files, reported", [
+    ({"test_site.py": PULLED_AS_IT_WAS}, True),
+    ({"test_site.py": "import jax\nfrom reference_error import assert_as_exact\n\n\n"
+                      "def test_g(f, draw):\n"
+                      "    assert_as_exact(jax.jit(jax.grad(f)), f, draw, 'g', seeds=8)\n"}, True),
+    ({"test_site.py": "from jax import value_and_grad\nfrom reference_error import assert_as_exact\n\n\n"
+                      "def loss(f):\n    return value_and_grad(f)\n\n\n"
+                      "def test_g(f, draw):\n    assert_as_exact(loss(f), f, draw, 'g', seeds=8)\n"}, True),
+    ({"test_site.py": "import jax\nfrom checks import judged\n\n\n"
+                      "def test_g(f, draw):\n    judged(jax.grad(f), draw)\n",
+      "checks.py": "from reference_error import assert_as_exact\n\n\n"
+                   "def judged(fn, draw):\n    assert_as_exact(fn, fn, draw, 'g', seeds=8)\n"}, True),
+    ({"test_site.py": "from support import pulled\nfrom reference_error import assert_as_exact\n\n\n"
+                      "def test_g(f, draw):\n    assert_as_exact(pulled(f), f, draw, 'g', seeds=8)\n",
+      "support.py": "import torch\n\n\ndef pulled(f):\n"
+                    "    return lambda x: torch.autograd.grad(f(x).sum(), x)\n"}, True),
+    ({"test_site.py": "from reference_error import assert_as_exact, with_gradients\n\n\n"
+                      "def test_g(f, draw):\n"
+                      "    pulled = with_gradients(f)\n"
+                      "    assert_as_exact(pulled, pulled, draw, 'g', seeds=8)\n"}, False),
+    ({"test_site.py": "import jax\nfrom reference_error import assert_as_exact\n\n\n"
+                      "def test_g(f, draw):\n    grads = jax.grad(f)(1.0)\n"
+                      "    assert_as_exact(f, f, draw, 'g', seeds=8)\n"}, False),
+], ids=["the recurrence site as it was", "an arm's own grad", "a helper's imported grad",
+        "an assertion that passes its arm on", "a support module's torch autograd", "the gate's pull",
+        "a gradient beside the check"])
+def test_a_check_1_arm_that_pulls_back_its_own_cotangent_is_reported(lint, files, reported, tmp_path):
+    """SLOP022: an arm of a check 1 takes its gradients from the gate (`with_gradients`), whose
+    cotangent is the draw's; one that reaches a reverse-mode transform itself, through its own file's
+    functions, an assertion that passes it on, or a suite module's, is reported."""
+    (tmp_path / "tests").mkdir()
+    for name, body in files.items():
+        (tmp_path / "tests" / name).write_text(body)
+    [module] = [module for module in lint.collect(["tests"], tmp_path, "dew")
+                if module.path.stem == "test_site"]
+    assert any(finding.code == "SLOP022" for finding in lint.check(module)) is reported
