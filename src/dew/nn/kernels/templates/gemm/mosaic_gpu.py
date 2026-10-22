@@ -263,7 +263,8 @@ def _gmm_alone(lhs, rhs, lengths, shape: tuple, *, tiles: Tiles, transpose_rhs: 
 
 
 def _gmm_cooperative(lhs, rhs, lengths, shape: tuple, *, tiles: Tiles, transpose_rhs: bool, dtypes: tuple,
-                     multiprocessors: int, interpret, hooks: tuple, sides: tuple) -> tuple:
+                     multiprocessors: int, interpret, hooks: tuple, sides: tuple,
+                     row_split: bool = False) -> tuple:
     """Dew: `gmm` at a tile two consumer warpgroups compute (half its columns each) beside a producer
     issuing the loads (as `hopper_matmul_mgpu`); `tiles.cluster` 2 pairs two row tiles of one group, which
     load each matrix block once, multicast. A prologue's consumers each rewrite half the rows' shared stage,
@@ -273,7 +274,11 @@ def _gmm_cooperative(lhs, rhs, lengths, shape: tuple, *, tiles: Tiles, transpose
     m, n, k, g = shape
     block_m, block_n, block_k, pair = tiles.block_m, tiles.block_n, tiles.block_k, tiles.cluster
     half, rows_half = block_n // 2, block_m // 2
-    side_shapes = [tuple({'rows': block_m, 'columns': half}[axis] for axis in axes) for axes in epilogue_axes]
+    # Each consumer's part of the tile: half its columns, or with `row_split` half its rows (CUTLASS's
+    # cooperative split, one m64n256 MMA a step where the columns' halves take two m64n128s).
+    part = (rows_half, block_n) if row_split else (block_m, half)
+    side_shapes = [tuple({'rows': part[0], 'columns': part[1]}[axis] for axis in axes)
+                   for axes in epilogue_axes]
     # A pipeline's operands each follow its steps: a prologue side operand without depth is loaded once a
     # tile.
     stepped = tuple(i for i, axes in enumerate(prologue_axes) if 'depth' in axes)
@@ -296,7 +301,7 @@ def _gmm_cooperative(lhs, rhs, lengths, shape: tuple, *, tiles: Tiles, transpose
             allocations=pipeline(hopper.ignore, hopper.ignore).get_allocations(
                 lhs_gmem.at[pl.ds(0, block_m)], rhs_columns(rhs_gmem.at[0], 0),
                 *stepped_views(pl.ds(0, block_m))),
-            o_smems=[plgpu.SMEM((2, block_m, half), gmem.dtype) for gmem in o_gmems],
+            o_smems=[plgpu.SMEM((2, *part), gmem.dtype) for gmem in o_gmems],
             **hopper.staging('side', zip(side_shapes, side_gmems, strict=True)),
             **hopper.staging('fixed', [(tuple(extent[axis] for axis in prologue_axes[i]), prologue_gmems[i])
                                  for i in fixed]),
@@ -318,36 +323,43 @@ def _gmm_cooperative(lhs, rhs, lengths, shape: tuple, *, tiles: Tiles, transpose
                 # This multiprocessor's row tile of the pair and its group's rows there.
                 row_block = group_info.block * pair + cta
                 row_start = row_block * block_m
-                first = jnp.clip(group_info.actual_start - row_start, 0, block_m)
-                stored = jnp.clip(group_info.actual_end - row_start, 0, block_m) - first
-                column = ni * block_n + wg * half
+                # This consumer's part of the tile: its first row and column, and its group's rows there.
+                part_row = row_start + (wg * rows_half if row_split else 0)
+                column = ni * block_n + (0 if row_split else wg * half)
+                first = jnp.clip(group_info.actual_start - part_row, 0, part[0])
+                stored = jnp.clip(group_info.actual_end - part_row, 0, part[0]) - first
 
                 def finish(acc):
-                    origins = {'rows': pl.ds(row_start, block_m), 'columns': pl.ds(column, half)}
+                    origins = {'rows': pl.ds(part_row, part[0]), 'columns': pl.ds(column, part[1])}
                     views = [gmem.at[tuple(origins[axis] for axis in axes)]
                              for gmem, axes in zip(side_gmems, epilogue_axes, strict=True)]
                     _finish_half(acc, epilogue, (views, side_smems, side_barriers), (o_gmems, o_smems),
-                                 (row_start, first, stored, column, min(block_m, m)), wg)
+                                 (part_row, first, stored, column, min(part[0], m)), wg)
 
                 def context(run):
                     hopper.load_fixed([prologue_gmems[i].at[pl.ds(row_start, block_m)] for i in fixed],
                                       fixed_refs, fixed_barriers, wg)
 
-                    hopper.finished(run, (block_m, half), drained, finish)
+                    hopper.finished(run, part, drained, finish)
 
                 def mma(_, lhs_smem, rhs_smem, *rest):
                     *side_smems, acc_ref = rest
                     if prologue is not None:
-                        # This warpgroup's half of the rows, then the other's, before an MMA reads them all.
+                        # This warpgroup's half of the rows, then (where it reads them all) the other's.
                         tiles_of = dict(zip(stepped, side_smems, strict=True)) | dict(zip(fixed, fixed_refs,
                                                                                           strict=True))
                         _rewritten(prologue, prologue_axes, lhs_smem.at[mine_rows], tiles_of, 'rows',
                                    mine_rows)
-                        hopper.meet(halves)
-                    columns = pl.ds(wg * half, half)
-                    matrix = (rhs_smem.at[columns].transpose((1, 0)) if transpose_rhs
-                              else rhs_smem.at[:, columns])
-                    plgpu.wgmma(acc_ref, lhs_smem, matrix)
+                        if not row_split:
+                            hopper.meet(halves)
+                    if row_split:
+                        rows, matrix = lhs_smem.at[mine_rows], (rhs_smem.transpose((1, 0)) if transpose_rhs
+                                                                else rhs_smem)
+                    else:
+                        columns = pl.ds(wg * half, half)
+                        rows, matrix = lhs_smem, (rhs_smem.at[columns].transpose((1, 0)) if transpose_rhs
+                                                  else rhs_smem.at[:, columns])
+                    plgpu.wgmma(acc_ref, rows, matrix)
                     # An MMA in flight: the next stage is prepared while this one runs.
                     plgpu.wgmma_wait(_IN_FLIGHT)
                     return acc_ref
@@ -367,7 +379,7 @@ def _gmm_cooperative(lhs, rhs, lengths, shape: tuple, *, tiles: Tiles, transpose
                 # The unrouted rows, and a slot past the last tile, multiply nothing.
                 @pl.when(~active & (wg < 2))
                 def _():
-                    finish(jnp.zeros((block_m, half), jnp.float32))
+                    finish(jnp.zeros(part, jnp.float32))
 
         plgpu.wait_smem_to_gmem(0, wait_read_only=True)
 
