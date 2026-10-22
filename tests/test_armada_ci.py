@@ -136,6 +136,24 @@ def test_a_collect_task_rows_each_file_red_where_it_would_not_import(ci, tmp_pat
         "3.14:tests/test_missing.py#collect": ("collect", [])}
 
 
+def test_a_targeted_pytest_selects_the_tests_a_task_would_and_its_own_arguments_override(ci, tmp_path):
+    """`ci.py pytest`, which a lane's targeted run uses (tmp/run_tests.py), runs the tests a CI task would,
+    with the task's own marker selection: a network test is deselected; a `-m` of the caller's own, after
+    the selection, chooses instead. Its exit status is pytest's."""
+    written(tmp_path, {"test_marked.py": "import pytest\n\ndef test_offline():\n    pass\n\n\n"
+                                         "@pytest.mark.network\ndef test_online():\n    pass\n"})
+    interpreter(tmp_path, "3.12")
+
+    def ran(*arguments: str) -> tuple[int, list[str]]:
+        report = tmp_path / "report.xml"
+        status = ci.targeted("3.12", ["tests/test_marked.py", *arguments], report)
+        return status, [case.get("name") for case in ET.parse(report).iter("testcase")]
+
+    assert ran() == (0, ["test_offline"])
+    assert ran("-m", "network") == (0, ["test_online"])
+    assert ran("-k", "nothing_matches")[0] == 5
+
+
 def test_a_task_rows_each_file_red_where_ci_would_fail(ci, tmp_path):
     """A failed test, a skip on a missing import and a file that does not
     collect each turn their own file's row red; a passing file and an

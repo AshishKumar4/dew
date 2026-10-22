@@ -1089,26 +1089,10 @@ def _group_scaled_convolution() -> type:
 
 
 @functools.cache
-def _providers() -> tuple[type, type]:
-    """Qwix's quantized-training and serving providers with Dew's grouped
-    convolution; importing Qwix here keeps it optional.
-
-    Both pass a matmul with a complex operand through unquantized, as the
-    hybrid DiT's S5 scan needs: Qwix 0.1.8's serving raises on one, and its
-    quantized training quantized the real operand of the scan's
-    real-by-complex input projection, after which `jax.grad` failed on the
-    complex gradient Qwix returned for it. The training provider
-    differentiates a grouped convolution (`_grouped_convolution_gradient`).
-
-    The serving provider casts a quantized kernel's scales to the dtype a
-    module promotes its kernel to, where Qwix 0.1.8 passes the kernel
-    through: a bf16 module then multiplied bf16 activations by fp32
-    dequantized kernels, so its matmuls ran in fp32 (50.4 ms against 34.8 for
-    the plain bf16 176M DiT forward at batch 24 on the RTX 4080). And it
-    scales two quantized operands' product in float32
-    (`_scaled_in_float32`)."""
+def _complex_in_float() -> type:
+    """The providers' shared base (`ComplexInFloat`): a complex matmul unquantized, and the call's contract
+    honoured on a quantized one (`_providers`)."""
     qwix = _qwix()
-    group_scaled = _group_scaled_convolution()
 
     class ComplexInFloat(qwix.QuantizationProvider):
         """Passes a matmul with a complex operand through unquantized, and
@@ -1161,10 +1145,17 @@ def _providers() -> tuple[type, type]:
             out = super().einsum(einsum_str, *_widened(operands, preferred), **kwargs)
             return _honoured(out, preferred, out_sharding)
 
-    class QtProvider(group_scaled, ComplexInFloat, _grouped_convolution_gradient()):
-        pass
+    return ComplexInFloat
 
-    class PtqProvider(group_scaled, ComplexInFloat, qwix.PtqProvider):
+
+@functools.cache
+def _serving_provider() -> type:
+    """The serving provider (`_providers`): Qwix's post-training quantization with Dew's grouped
+    convolution, its products scaled in float32 (`_scaled_in_float32`), a quantized kernel no rule matches
+    multiplied by its own recorded recipe, and a quantized kernel's scales promoted with the module's."""
+    qwix = _qwix()
+
+    class PtqProvider(_group_scaled_convolution(), _complex_in_float(), qwix.PtqProvider):
         keeps_out_sharding: ClassVar[bool] = True  # ptq.py:180 passes it on
 
         def __init__(self, rules: Sequence[object]) -> None:
@@ -1172,6 +1163,37 @@ def _providers() -> tuple[type, type]:
                 rules, _dot_general_fn=_scaled_in_float32(qwix.dot_general),
                 _einsum_fn=_scaled_in_float32(qwix.einsum),
                 _conv_general_dilated_fn=_scaled_in_float32(qwix.conv_general_dilated))
+
+        def _recorded(self, op: str, weight) -> bool:
+            """Whether `weight` is a stored quantized kernel that reaches `op` with no rule matching
+            it, as an unpacked task's member does under a rule that names its packed group
+            (`dew.inference.projections.unpacked`): it multiplies by the recipe it records, its
+            activation unquantized, where every rule leaves activations so; a rule that quantizes
+            them records no recipe a member could take, which refuses."""
+            if not isinstance(weight, Annotated) or self._matched(op):
+                return False
+            if any(rule.act_qtype is not None for rule in self._rules):
+                raise ValueError(f"a quantized kernel reached a {op} no rule matches, and the rules quantize "
+                                 "activations, whose recipe the kernel does not record; name its members in "
+                                 "the patterns")
+            return True
+
+        def dot_general(self, lhs, rhs, dimension_numbers, precision=None,
+                        preferred_element_type=None, *, out_sharding=None):
+            if not self._recorded("dot_general", rhs):
+                return super().dot_general(lhs, rhs, dimension_numbers, precision, preferred_element_type,
+                                           out_sharding=out_sharding)
+            out = self._dot_general_fn(*_widened((lhs, rhs.array), preferred_element_type),
+                                       dimension_numbers, out_sharding=out_sharding)
+            return _honoured(out, preferred_element_type, None)
+
+        def einsum(self, einsum_str, *operands, **kwargs):
+            if len(operands) != 2 or not self._recorded("einsum", operands[1]):
+                return super().einsum(einsum_str, *operands, **kwargs)
+            preferred = kwargs.pop("preferred_element_type", None)
+            out_sharding = kwargs.pop("out_sharding", None)
+            out = self._einsum_fn(einsum_str, *_widened((operands[0], operands[1].array), preferred))
+            return _honoured(out, preferred, out_sharding)
 
         def promote_dtype(self, *args, **kwargs):
             # Qwix 0.1.8 passes a quantized kernel through, and its wrapper's own `astype` raises on
@@ -1188,7 +1210,33 @@ def _providers() -> tuple[type, type]:
             return jax.tree.map(lambda value: value.astype(dtype) if quantized(value) else value,
                                 promoted, is_leaf=quantized)
 
-    return QtProvider, PtqProvider
+    return PtqProvider
+
+
+@functools.cache
+def _providers() -> tuple[type, type]:
+    """Qwix's quantized-training and serving providers with Dew's grouped
+    convolution; importing Qwix here keeps it optional.
+
+    Both pass a matmul with a complex operand through unquantized, as the
+    hybrid DiT's S5 scan needs: Qwix 0.1.8's serving raises on one, and its
+    quantized training quantized the real operand of the scan's
+    real-by-complex input projection, after which `jax.grad` failed on the
+    complex gradient Qwix returned for it. The training provider
+    differentiates a grouped convolution (`_grouped_convolution_gradient`).
+
+    The serving provider casts a quantized kernel's scales to the dtype a
+    module promotes its kernel to, where Qwix 0.1.8 passes the kernel
+    through: a bf16 module then multiplied bf16 activations by fp32
+    dequantized kernels, so its matmuls ran in fp32 (50.4 ms against 34.8 for
+    the plain bf16 176M DiT forward at batch 24 on the RTX 4080). And it
+    scales two quantized operands' product in float32
+    (`_scaled_in_float32`)."""
+
+    class QtProvider(_group_scaled_convolution(), _complex_in_float(), _grouped_convolution_gradient()):
+        pass
+
+    return QtProvider, _serving_provider()
 
 
 @runtime_checkable
