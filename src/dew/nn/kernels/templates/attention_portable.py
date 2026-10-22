@@ -128,19 +128,20 @@ def forward(spec: algebra.Forward, query: jax.Array, key: jax.Array, value: jax.
                 _dot(others, v_tile), others, own_tile)
             return algebra.Partial(acc, m, *sums), anchor, own, others_total
 
-        def begun(*, shifted: bool) -> algebra.Partial:
+        def begun(live) -> algebra.Partial:
             if initial is None:
                 empty = algebra.empty(block_q, value_width)
-                return algebra.headroomed(empty) if shifted else empty
+                return empty if live is None else algebra.headroomed(empty, live)
             m0, total0, acc0 = initial
             return algebra.resumed(spec, m0[row, head, rows], total0[row, head, rows], acc0[row, head, rows],
-                                   shifted=shifted)
+                                   live=live)
 
-        def walk(*, shifted: bool):
+        def walk(live=None):
+            # The plain walk where `live` is None, else the guarded one, those rows shifting.
             if not residuals:
-                return jax.lax.fori_loop(lo, hi, plain, begun(shifted=shifted))
+                return jax.lax.fori_loop(lo, hi, plain, begun(live))
             nothing = jnp.zeros((block_q,), jnp.float32)
-            carry = begun(shifted=shifted), algebra.no_argmax(block_q), nothing, nothing
+            carry = begun(live), algebra.no_argmax(block_q), nothing, nothing
             return jax.lax.fori_loop(lo, hi, step, carry)
 
         if spec.form == "spans":
@@ -158,8 +159,7 @@ def forward(spec: algebra.Forward, query: jax.Array, key: jax.Array, value: jax.
             split, arg, own, _ = carry
             return algebra.split_output(split.acc, own, value[row, arg.key, kv_head])
 
-        unguarded, guarded = functools.partial(walk, shifted=False), functools.partial(walk, shifted=True)
-        walked = algebra.guarded(unguarded, guarded, weighted) if spec.headroom else unguarded()
+        walked = algebra.guarded(walk, walk, weighted) if spec.headroom else walk()
         if residuals:
             split, arg, own, others_total = walked
             state = split._replace(acc=algebra.split_output(split.acc, own, value[row, arg.key, kv_head]))
