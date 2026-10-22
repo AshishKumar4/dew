@@ -20,15 +20,14 @@ Each array file stores fp32 and float64 references, IEEE products.
 """
 
 import argparse
-import importlib.util
 import json
 import sys
-import types
 from pathlib import Path
 from types import SimpleNamespace
 
 import numpy as np
 import torch
+from reference_source import module_at, packaged
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "hf"
 AUDIO_FIXTURE = FIXTURES / "mimo-audio-tiny"
@@ -72,15 +71,9 @@ def mimo_module():
     """MiMo's modeling module, fetched at MIMO_REVISION and imported as a package beside its config."""
     from huggingface_hub import hf_hub_download
 
-    package = types.ModuleType("mimo_v2")
-    package.__path__ = []
-    sys.modules["mimo_v2"] = package
+    packaged(("mimo_v2",))
     for name in ("configuration_mimo_v2", "modeling_mimo_v2"):
-        path = hf_hub_download(MIMO_REPO, f"{name}.py", revision=MIMO_REVISION)
-        spec = importlib.util.spec_from_file_location(f"mimo_v2.{name}", path)
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[f"mimo_v2.{name}"] = module
-        spec.loader.exec_module(module)
+        module_at(f"mimo_v2.{name}", Path(hf_hub_download(MIMO_REPO, f"{name}.py", revision=MIMO_REVISION)))
     return sys.modules["mimo_v2.modeling_mimo_v2"]
 
 

@@ -300,14 +300,12 @@ def write_classic_tiny(name: str, model: PreTrainedModel) -> None:
     so that output is recorded separately from the intended continuation.
     """
     from diffusers_wan_reference import float64
+    from reference_source import left_padded
 
     write_tiny(name, model)
     directory = FIXTURES / name
     ids = np.load(directory / 'input_ids.npy')
-    mask = np.ones_like(ids, bool)
-    mask[1, :3] = False
-    padded = np.where(mask, ids, 0)
-    positions = np.maximum(np.cumsum(mask, axis=-1) - 1, 0)
+    mask, padded, positions = left_padded(ids)
     positioned = ({} if model.config.model_type == 'bloom' else
                   {'position_ids': torch.from_numpy(positions).long()})
     np.save(directory / 'padded_ids.npy', padded)
@@ -375,7 +373,6 @@ def write_minimax_m2() -> None:
     """The fixed MiniMax rotary port, saved under the released per-expert names."""
     from diffusers_wan_reference import float64
     from safetensors.torch import save_file
-    import transformers
     from transformers import MiniMaxM2Config, MiniMaxM2ForCausalLM
 
     from reference_releases import require

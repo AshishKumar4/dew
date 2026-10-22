@@ -14,14 +14,14 @@ released configs, which the translation is held to.
 """
 
 import shutil
-import sys
-import tempfile
 from pathlib import Path
 
 import numpy as np
 import torch
 from diffusers_wan_reference import float64
 from huggingface_hub import hf_hub_download
+
+from reference_source import hub_code, left_padded
 
 from dew.interop.verify import probe_ids, scatter_weights
 
@@ -33,12 +33,7 @@ FIXTURES = Path(__file__).resolve().parents[1] / 'tests' / 'fixtures' / 'hf'
 
 def remote():
     """K2 Horizon's modeling module, imported from the pinned remote code as a package."""
-    package = Path(tempfile.mkdtemp()) / 'k2_horizon_remote'
-    package.mkdir()
-    (package / '__init__.py').write_text('')
-    for name in ('configuration_k2_horizon.py', 'modeling_k2_horizon.py'):
-        shutil.copy(hf_hub_download(REPO, name, revision=REVISION), package / name)
-    sys.path.insert(0, str(package.parent))
+    hub_code(REPO, REVISION, 'k2_horizon_remote', ('configuration_k2_horizon.py', 'modeling_k2_horizon.py'))
     import k2_horizon_remote.modeling_k2_horizon as modeling
     return modeling
 
@@ -69,10 +64,7 @@ def write_tiny(modeling) -> None:
     scatter_weights(model, 1234)
     model.save_pretrained(directory, safe_serialization=True)
     ids = probe_ids(config.vocab_size)
-    mask = np.ones_like(ids, bool)
-    mask[1, :3] = False
-    padded = np.where(mask, ids, 0)
-    positions = np.maximum(np.cumsum(mask, axis=-1) - 1, 0)
+    mask, padded, positions = left_padded(ids)
     arrays = {'input_ids': ids, 'padded_ids': padded, 'attention_mask': mask,
               'logits': logits(model, ids), 'padded_logits': logits(model, padded, mask, positions)}
     with torch.no_grad():

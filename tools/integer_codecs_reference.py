@@ -36,11 +36,8 @@ for gptqmodel's pack extension. Run from the checkout:
 """
 
 import copy
-import importlib.util
 import os
 import re
-import sys
-import types
 from pathlib import Path
 
 import gptqmodel
@@ -51,7 +48,7 @@ from gptqmodel.nn_modules.qlinear.torch import TorchLinear
 from gptqmodel.quantization.config import QuantizeConfig
 from gptqmodel.utils.model import convert_gptq_v1_to_v2_format_module, convert_gptq_v2_to_v1_format_module
 from safetensors.numpy import load_file
-from reference_source import CACHE as UPSTREAM, saved_fixture, verified
+from reference_source import CACHE as UPSTREAM, imported, packaged, saved_fixture
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / "tests" / "fixtures" / "codecs" / "integer.npz"
@@ -69,20 +66,12 @@ PROJECTION = re.compile(r"(q|k|v|o|gate|up|down)_proj\.weight$")
 
 def autoawq():
     """AutoAWQ's gemm modules at `AWQ_COMMIT`, under empty package modules."""
-    for package in ("awq", "awq.utils", "awq.modules", "awq.modules.linear"):
-        module = types.ModuleType(package)
-        module.__path__ = []
-        sys.modules[package] = module
+    packaged(("awq", "awq.utils", "awq.modules", "awq.modules.linear"))
     loaded = {}
     for path, digest in AWQ_FILES.items():
-        local = verified(f"https://raw.githubusercontent.com/{AWQ_REPO}/{AWQ_COMMIT}/{path}",
-                         CACHE / path, digest)
         name = path.removesuffix(".py").replace("/", ".")
-        spec = importlib.util.spec_from_file_location(name, local)
-        module = importlib.util.module_from_spec(spec)
-        sys.modules[name] = module
-        spec.loader.exec_module(module)
-        loaded[name] = module
+        loaded[name] = imported(f"https://raw.githubusercontent.com/{AWQ_REPO}/{AWQ_COMMIT}/{path}",
+                                CACHE / path, digest, name)
     gemm = loaded["awq.modules.linear.gemm"]
     if gemm.awq_ext is not None or gemm.TRITON_AVAILABLE:
         raise RuntimeError("AutoAWQ found its CUDA or triton kernels; the fixture records its torch "

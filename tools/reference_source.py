@@ -10,7 +10,8 @@ scope; a generator that retargets a dtype, drops a decorator or builds a
 class around them does so between `selected` and `ran`. `simple_statements`
 takes single lines out of a published function. `verified` keeps a reference
 file on disk, fetched once and checked against its pinned SHA-256 on every
-use, and `imported` runs such a file as a module of its own.
+use; `imported` runs such a file as a module of its own, and `packaged` and
+`module_at` let an upstream's files import each other.
 `stub_torch_utils` stands in for the two `torch_utils` names NVIDIA's EDM and
 EDM2 networks import. `saved_fixture` writes a generator's arrays with its
 provenance as the suite reads them, and `recipe_images` draws the images a
@@ -22,9 +23,11 @@ from __future__ import annotations
 import ast
 import hashlib
 import importlib.util
+import sys
 import urllib.request
 from collections.abc import Iterable
 from pathlib import Path
+from types import ModuleType
 
 TIMEOUT = 120
 """Seconds a fetch may take."""
@@ -90,13 +93,55 @@ def verified(url: str, local: Path, digest: str) -> Path:
     return local
 
 
-def imported(url: str, local: Path, digest: str, name: str):
-    """The file at `url`, kept at `local` and checked against `digest` (`verified`), run as the module
-    `name`."""
-    spec = importlib.util.spec_from_file_location(name, verified(url, local, digest))
+def module_at(name: str, path: Path) -> ModuleType:
+    """The file at `path` run as the module `name`, registered under it before it runs, so the modules it
+    imports, and those that import it, find it."""
+    spec = importlib.util.spec_from_file_location(name, path)
     module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
     spec.loader.exec_module(module)
     return module
+
+
+def imported(url: str, local: Path, digest: str, name: str) -> ModuleType:
+    """The file at `url`, kept at `local` and checked against `digest` (`verified`), run as the module
+    `name` (`module_at`)."""
+    return module_at(name, verified(url, local, digest))
+
+
+def packaged(names: Iterable[str]) -> None:
+    """Empty packages named `names`, registered, for an upstream's modules run one by one (`module_at`) to
+    import each other under their own package names."""
+    for name in names:
+        package = ModuleType(name)
+        package.__path__ = []
+        sys.modules[name] = package
+
+
+def hub_code(repo: str, revision: str, package: str, files: Iterable[str]) -> None:
+    """A Hub repository's remote-code `files` at `revision`, copied into a fresh package `package` on the
+    import path, for the caller to import as `package.<module>`."""
+    import shutil
+    import tempfile
+
+    from huggingface_hub import hf_hub_download
+
+    directory = Path(tempfile.mkdtemp()) / package
+    directory.mkdir()
+    (directory / "__init__.py").write_text("")
+    for name in files:
+        shutil.copy(hf_hub_download(repo, name, revision=revision), directory / name)
+    sys.path.insert(0, str(directory.parent))
+
+
+def left_padded(ids):
+    """`ids` as the recorders run them left-padded: the second row's first three tokens padded away. The
+    attention mask, the padded ids (0 where masked) and each token's position among its row's kept ones."""
+    import numpy as np
+
+    mask = np.ones_like(ids, bool)
+    mask[1, :3] = False
+    return mask, np.where(mask, ids, 0), np.maximum(np.cumsum(mask, axis=-1) - 1, 0)
 
 
 def _defined(node: ast.stmt) -> set[str]:
