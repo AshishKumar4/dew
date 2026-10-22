@@ -311,7 +311,7 @@ def test_configured_cosine_rate_is_the_last_applied_update(every, monkeypatch):
     monkeypatch.setattr(wandb, 'init', lambda **_: run)
     schedule = Cosine(peak=.1, init=.01, end=.005, warmup_steps=1, every=every)
     with WandbTracker('dew', 'scheduled', offline=True) as sink:
-        trainer = Trainer(Squared(), OptimConfig(schedule=schedule), key=0, tracker=sink, accumulation=2)
+        trainer = Trainer(Squared(), OptimConfig(rate=schedule), key=0, tracker=sink, accumulation=2)
         trainer.fit(targets([1.] * 16), steps=16, log_every=1)
     oracle = optax.warmup_cosine_decay_schedule(
         init_value=.01, peak_value=.1, warmup_steps=1, decay_steps=8 // every, end_value=.005)

@@ -39,8 +39,7 @@
     "optim": {
       "optimizer": "adamw",
       "optimizer_opts": {},
-      "learning_rate": 0.0001,
-      "schedule": null,
+      "rate": 0.0001,
       "weight_decay": null,
       "b1": null,
       "b2": null,
