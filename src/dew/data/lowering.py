@@ -115,7 +115,7 @@ from dew.data.readers import _FillShare
 from dew.data.sources.base import Read, Shard, ShardManifest, Source, materialized
 from dew.data.sources.urls import Fetch
 from dew.data.steps.generic import Fields
-from dew.data.steps.text import LayoutRule, ValidTargets, recounted
+from dew.data.steps.text import LayoutRule, ValidTargets, counted_window, recounted
 from dew.data.text import Chunks
 from dew.data.tokens import _WrappingDataset
 from dew.records import boolean, integer, integers, record, strings
@@ -760,7 +760,7 @@ def _packed(documents: pygrain.IterDataset, stage: Pack) -> pygrain.IterDataset:
 
 class _Ruled(pygrain.IterDataset):
     """The windows a pack or windows stage makes of `documents`, each counted by the one rule its
-    documents' targets were counted by (`CountRule`), as a memory read counts them
+    documents' targets were counted by (`counted_window`), as a memory read counts them
     (`materialize._targeted`): a document's count describes no window."""
 
     def __init__(self, documents: pygrain.IterDataset, stage: Pack | Windows):
@@ -783,8 +783,7 @@ class _RuledIterator(pygrain.DatasetIterator):
         self._windows, self._seen, self._field = windows, seen, field
 
     def __next__(self) -> Batch:
-        window = next(self._windows)
-        return window if self._seen.rule is None else self._seen.rule.counted(window, self._field)
+        return counted_window(next(self._windows), self._seen.rule, self._field)
 
     def get_state(self) -> Mapping[str, object]:
         return {"windows": self._windows.get_state(), "rule": self._seen.state()}
