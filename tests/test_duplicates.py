@@ -129,18 +129,21 @@ def test_seven_lines_two_files_copy_fail_the_gate_and_six_or_one_owner_pass_it(t
     assert gate(sharing_six).returncode == 0
 
 
-def test_the_structural_reading_alone_skips_the_text_copies_and_keeps_the_structural(tmp_path):
-    """With --structural, for iterating on a head (check.sh --changed), the gate reads no text: seven
-    settings two files write alike, a copy only the text reading sees, pass, and a function two files
-    write under other names still fails."""
+def test_each_reading_alone_fails_its_own_copies_and_passes_the_others(tmp_path):
+    """One reading alone (tools/check_gates' two gates; check.sh --changed runs the structure): seven
+    settings two files write alike, a copy only the text reading sees, fail the text and pass the structure;
+    a function two files write under other names, a copy only the structure sees, fails the structure and
+    passes the text."""
     settings = "".join(f"{name} = {value}\n" for value, name in enumerate(
         ("alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta")))
     texts = tree(tmp_path, "texts", {"first.py": settings, "second.py": settings})
     assert gate(texts).returncode == 1
-    assert gate(texts, "--structural").returncode == 0
-    functions = tree(tmp_path, "functions", {f"{name}.py": f"def {name}(values, limit):\n{BLOCK}"
-                                             for name in ("first", "second")})
-    assert gate(functions, "--structural").returncode == 1
+    assert gate(texts, "--reading=text").returncode == 1
+    assert gate(texts, "--reading=structure").returncode == 0
+    functions = tree(tmp_path, "functions", {"spread.py": SPREAD, "ranges.py": RANGE_OVER_COUNT})
+    assert gate(functions).returncode == 1
+    assert gate(functions, "--reading=structure").returncode == 1
+    assert gate(functions, "--reading=text").returncode == 0
 
 
 def test_a_function_two_files_write_under_other_names_fails_and_one_owner_passes(tmp_path):
