@@ -1664,3 +1664,58 @@ def test_a_generation_a_stream_filled_from_files_mounted_elsewhere_is_refused_un
     elsewhere, _ = Pipeline(Files(str(tmp_path / "b"), format="parquet")).holdout(0.25)
     with pytest.raises(ValueError):
         _tags(_tagged(elsewhere).cache(generation), "streamed")
+
+
+def test_a_generation_a_memory_read_filled_from_unindexed_files_serves_hash_and_records_holdouts(tmp_path):
+    """Files with no index, and a hash part, read in memory: the generation a memory read filled
+    numbers their inputs by place, so hash and records holdouts over it read the rows of the inputs
+    they keep, as the chain does uncached."""
+    from dew.data import Files
+    from dew.data.compile import publish
+    from dew.data.pipeline import Pipeline
+
+    (tmp_path / "rows.jsonl").write_text("".join(f'{{"id": {index}}}\n' for index in range(24)))
+    files = Pipeline(Files(str(tmp_path / "rows.jsonl")))
+    generation = publish(_tagged(files), _cache(), read="memory")
+    for parts in (files.holdout(0.25), files.holdout(records=5)):
+        uncached = [_tags(_tagged(part)) for part in parts]
+        assert all(uncached)
+        assert [_tags(_tagged(part).cache(generation)) for part in parts] == uncached
+    trained, _ = files.holdout(0.25)
+    part = publish(_tagged(trained), _cache(), read="memory")
+    stacked = trained.holdout(records=3)
+    uncached = [_tags(_tagged(selected)) for selected in stacked]
+    assert all(uncached)
+    assert [_tags(_tagged(selected).cache(part)) for selected in stacked] == uncached
+
+
+def test_a_named_stream_that_holds_other_inputs_than_its_generation_is_refused_under_a_holdout():
+    """A stream named for its content, which reads more records than the generation published under
+    that name was filled from: under a holdout the generation can't place them, and is refused."""
+    from dew.data import from_iter
+    from dew.data.compile import publish
+    from dew.data.pipeline import Pipeline
+
+    def stream(count):
+        return from_iter(lambda: iter([{"id": index} for index in range(count)]), name="rows@1", replay=True)
+
+    generation = publish(_tagged(Pipeline(stream(10))), _cache(), read="streamed")
+    trained, _ = Pipeline(stream(12)).holdout(0.25)
+    with pytest.raises(ValueError):
+        _tags(_tagged(trained).cache(generation), "streamed")
+
+
+def test_a_worker_reads_a_part_of_a_generation_without_its_store():
+    """The reader a worker takes for a part of a generation holds the rows it reads, not the store
+    whose inputs placed them: a store of large records pickles large, its part's reader small."""
+    import pickle
+
+    from dew.data.analysis import _promoted
+    from dew.data.compile import publish
+    from dew.data.pipeline import Pipeline
+
+    source = Memory([{"id": index, "blob": bytes(1 << 16)} for index in range(32)])
+    generation = publish(_tagged(Pipeline(source)), _cache(), read="memory")
+    trained, _ = Pipeline(source).holdout(0.25)
+    part = _promoted(_tagged(trained).cache(generation)).source
+    assert len(pickle.dumps(part.manifest().reader)) * 100 < len(pickle.dumps(source))
