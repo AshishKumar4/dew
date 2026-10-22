@@ -539,10 +539,23 @@ def test_the_fused_epilogue_keeps_the_programs_value(generation_name, consumer):
 
 
 def rms_norm(x, weight, epsilon=1e-6):
-    """An RMS norm of the residual stream as a model writes it: fp32 statistics, one rounding."""
-    wide = x.astype(jnp.float32)
+    """An RMS norm of the residual stream as a model writes it: statistics at least fp32 (float64 for the
+    float64 truth), one rounding."""
+    wide = _wide(x)
     mean_square = jnp.mean(wide * wide, axis=-1, keepdims=True)
     return (wide * jax.lax.rsqrt(mean_square + epsilon) * weight).astype(x.dtype)
+
+
+def dew_rms_norm(x, weight):
+    """Dew's own RMS norm (its XLA body, checkpointed), as a model's block calls it."""
+    from dew.nn.attention import rms_normalized
+    return rms_normalized(x, weight, 1e-6, x.dtype, scale_offset=False, scale_after_cast=False,
+                          fp32_statistics=True, implementation="xla")
+
+
+def relu(x, weight):
+    """A producer with a custom derivative (ReLU's, zero at zero) and a depth weight."""
+    return (jax.nn.relu(_wide(x)) * weight).astype(x.dtype)
 
 
 @pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))
@@ -569,6 +582,56 @@ def test_a_normed_operand_runs_in_the_prologue_with_the_programs_value(generatio
     with generation.assumed(generation_name), generation.routes() as taken:
         assert_as_exact(jax.jit(fuser.fuse(fusing)), jax.jit(unfused), draw, "normed operand", seeds=SEEDS,
                         truth_fn=truth)
+    assert {route.kernel for route in taken if route.choice == 'gemm_prologue'} == {'fused'}
+
+
+@pytest.mark.parametrize("producer", [rms_norm, dew_rms_norm, relu], ids=lambda producer: producer.__name__)
+def test_a_fused_producers_gradients_are_its_own(producer):
+    """Every input's gradient through a producer fused into the prologue is the unfused program's: the
+    operand's cotangent goes back through the producer's own VJP, so a norm's two paths from its input
+    join where the producer joins them and a custom derivative (ReLU's at zero) stays its own; Dew's
+    checkpointed norm fuses too (the route says so)."""
+    sizes = jnp.asarray(SIZES)
+
+    def draw(seed):
+        x, w, _, nw, *_ = _draw(seed)
+        x = x.at[:4].set(0)  # a ReLU's zero, where its custom derivative differs from max(x, 0)'s
+        return x, w, nw
+
+    def loss(gemm):
+        def value(x, w, weight):
+            return jnp.sum(gemm(producer(x, weight), w).astype(jnp.float32))
+        return jax.grad(value, argnums=(0, 1, 2))
+
+    def fused_gemm(operand, w):
+        return fused.fusible_gemm(operand, w, sizes, interpret_on_cpu=True)
+
+    def plain_gemm(operand, w):
+        return template.gemm(operand, w, sizes, out_dtype=jnp.float32)
+
+    def truth_gemm(operand, w):
+        matrix = w.astype(jnp.bfloat16).astype(operand.dtype)
+        return jax.lax.ragged_dot(operand, matrix, sizes, preferred_element_type=operand.dtype)
+
+    with generation.assumed("sm80"), generation.routes() as taken:
+        fusing = loss(fused_gemm)
+        assert_as_exact(jax.jit(fuser.fuse(fusing)), jax.jit(loss(plain_gemm)), draw,
+                        f"{producer.__name__} gradients", seeds=SEEDS, truth_fn=loss(truth_gemm))
+    assert {route.kernel for route in taken if route.choice == 'gemm_prologue'} == {'fused'}
+
+
+def test_a_one_row_normed_operand_fuses():
+    """A one-row operand's row statistic keeps its rows axis: the product of one normed row."""
+    x, w, _, nw, *_ = _draw(0)
+    x, sizes = x[:1], jnp.asarray([1] + [0] * (len(SIZES) - 1))
+
+    def fusing(x, w, weight):
+        return fused.fusible_gemm(rms_norm(x, weight), w, sizes, interpret_on_cpu=True)
+
+    with generation.assumed("sm80"), generation.routes() as taken:
+        value = jax.jit(fuser.fuse(fusing))(x, w, nw)
+    expected = template.gemm(rms_norm(x, nw), w, sizes, out_dtype=jnp.float32)
+    np.testing.assert_array_equal(np.asarray(value), np.asarray(expected))
     assert {route.kernel for route in taken if route.choice == 'gemm_prologue'} == {'fused'}
 
 
