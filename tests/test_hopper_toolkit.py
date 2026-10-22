@@ -37,7 +37,7 @@ def _ring_sums(x, *, interpret, consumers: int = 1):
 
     def body(x_gmem, out_gmem):
         @functools.partial(pl.run_scoped, **hopper.ring(BLOCK, x.dtype, STAGES, consumers=consumers),
-                           out_smem=plgpu.SMEM((BLOCK[0], columns), jnp.float32),
+                           out_smem=plgpu.SMEM((consumers, BLOCK[0], columns), jnp.float32),
                            schedule=hopper.schedule_barrier(), collective_axes="wg")
         def _(smem, full, consumed, out_smem, schedule):
             ring = hopper.Ring(STAGES, smem, full, consumed)
@@ -70,9 +70,10 @@ def _ring_sums(x, *, interpret, consumers: int = 1):
                     zero = jnp.zeros((BLOCK[0], columns), jnp.float32)
                     total = jax.lax.fori_loop(0, tile + 1, step_sum, zero)
                     plgpu.wait_smem_to_gmem(0)
-                    out_smem[...] = total
+                    # Each consumer's own staging buffer: the warpgroups share the scope's allocations.
+                    out_smem[wg] = total
                     plgpu.commit_smem()
-                    plgpu.copy_smem_to_gmem(out_smem, out_gmem.at[tile, :, pl.ds(wg * columns, columns)])
+                    plgpu.copy_smem_to_gmem(out_smem.at[wg], out_gmem.at[tile, :, pl.ds(wg * columns, columns)])
                 plgpu.wait_smem_to_gmem(0)
 
             hopper.roles(wg, consumers, consumer, producer)
