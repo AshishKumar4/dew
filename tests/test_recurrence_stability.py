@@ -181,7 +181,7 @@ GRADIENT_SEEDS = {
     ('rated', 'a long sequence'): 128,
     ('rated', 'a fading memory'): 128,
 }
-"""Each site's declared seeds for its gradient's check 1, sized by `seeds_for` on armada (2026-10-22)."""
+"""Each site's declared seeds for its gradient's check 1, sized by `seeds_for`."""
 
 SEEDS = {
     ('scalar delta', 'decays near one'): 8,
@@ -230,7 +230,7 @@ SEEDS = {
     ('rated', 'spread gates'): 64,
     ('rated', 'a fading memory'): 128,
 }
-"""Each site's declared seeds for check 1, sized by `seeds_for` on armada (2026-10-22): the fewest for
+"""Each site's declared seeds for check 1, sized by `seeds_for`: the fewest for
 which the token-by-token reference compared with itself resolves the factor in both leaves."""
 
 

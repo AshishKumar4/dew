@@ -47,14 +47,13 @@ parallelism, and 64 is what the reference's kernels assume."""
 
 
 def held_chunk(chunk_size: int, key_width: int) -> int:
-    """The longest chunk the delta rule holds at `key_width`: `chunk_size`, at most twice the keys' width
-    and at least a sub-chunk of 16. A chunk's keys span at most `key_width` dimensions, so past it its
-    triangular system's inverse grows and the memory's update, `S exp(G) - (k last)^T (W S)`, cancels
-    to a far smaller value: over a long sequence (1024 tokens, the decay near one) 64-token chunks of
-    16-wide keys put the final memory 1.7 to 1.8 times the token-by-token recurrence's error from
-    float64, chunks of 32 and 16 held it, and so did 64-token chunks of 32-, 64- and 128-wide keys
-    (armada, every delta family)."""
-    return min(chunk_size, max(16, 2 * key_width))
+    """The delta rule's chunk at `key_width`: `chunk_size`, at most twice the keys' width. A measured
+    sizing policy, not a conditioning bound: over a long sequence (1024 tokens, the decay near one),
+    64-token chunks of 16-wide keys put the final memory 1.7 to 1.8 times the token-by-token
+    recurrence's error from float64 under every delta family, where chunks of 32 and 16 held it, and so
+    did 64-token chunks of 32-, 64- and 128-wide keys (tests/test_recurrence_stability.py, its long
+    sequence). The port's chunk is the power of two at or under it (`_blocked_rule`)."""
+    return min(chunk_size, 2 * key_width)
 
 
 def xla_chunk_states(key, k_cumdecay, out_vals, gc, last_decay, state, kept):
@@ -326,6 +325,11 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
     return recurrence.normed(hooks, out, given, work).astype(dtype), final
 
 
+NARROWEST_KEYS = 8
+"""The narrowest keys the port takes: their chunk, twice their width (`held_chunk`), a whole sub-chunk of
+16 (fla's BC)."""
+
+
 def port_refusal(query, key, value, *, per_key: bool = False, floor: float | None = None) -> Refusal | None:
     """Why a rule over these operands runs the portable math rather than the
     port (`fla_rule`) on a target whose row names the port, or None where the
@@ -337,7 +341,8 @@ def port_refusal(query, key, value, *, per_key: bool = False, floor: float | Non
     over operands that vary, where a Pallas call, which states no varying
     type for its results, cannot run; float64 operands, whose rule is the
     reference math itself; and keys wider than the port takes in their
-    dtype. Packed documents take the port at any bound: it stores the
+    dtype, or narrower than `NARROWEST_KEYS`, whose chunk (`held_chunk`) is under a sub-chunk of 16.
+    Packed documents take the port at any bound: it stores the
     memories by where they pass, as many as the tokens' chunks, a row's and
     one, whatever the bound (`chunked_launch.Sequences`)."""
     widest = fla_gdn.WIDEST_KEYS if jnp.result_type(query, key, value).itemsize == 2 else fla_gdn.WIDEST
@@ -349,8 +354,8 @@ def port_refusal(query, key, value, *, per_key: bool = False, floor: float | Non
          "varying type for its results"),
         (all(jnp.dtype(x.dtype) != jnp.float64 for x in (query, key, value)), 'float64',
          "float64 operands, whose rule is the reference math itself"),
-        (key.shape[-1] <= widest, 'key_width',
-         f"keys {key.shape[-1]} wide; the port takes at most {widest} in "
+        (NARROWEST_KEYS <= key.shape[-1] <= widest, 'key_width',
+         f"keys {key.shape[-1]} wide; the port takes {NARROWEST_KEYS} to {widest} in "
          f"{jnp.result_type(query, key, value).name}"),
         (not per_key or (floor is not None and floor >= fla_kda.DECAY_FLOOR), 'decay_floor',
          f"a decay per key dimension with floor {floor} a token; the port takes "
@@ -474,8 +479,10 @@ def _blocked_rule(query, key, value, g, beta, state, starts, *, documents: int |
     state = _padded(_padded(state, 2, blocks[0]), 3, blocks[1])
     # A row's padding after its documents runs as one more sequence of its own.
     spans = None if documents is None else cu_seqlens(starts, B * (documents + 1))
+    # Whole sub-chunks of 16, a power of two the kernels' blocks take; keys under 8 wide are refused.
+    chunk = 1 << (held_chunk(CHUNK_SIZE, Dk).bit_length() - 1)
     port = fla_kda.chunk_kda if per_key else fla_gdn.chunk_gated_delta_rule
-    out, final = port(query, key, value, g, beta, state, spans, scale, held_chunk(CHUNK_SIZE, Dk),
+    out, final = port(query, key, value, g, beta, state, spans, scale, chunk,
                       not generation.triton_runs(), "delta_memory" not in RECOMPUTED.get(), wide)
     out = out[..., :width].reshape(B, S, Hv, split * width)[..., :Dv]
     final = final[:, :, :Dk, :width]

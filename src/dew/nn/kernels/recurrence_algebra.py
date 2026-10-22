@@ -63,7 +63,7 @@ range its decay's bound keeps exact, or as the weighed sum."""
 
 def portable(name: str, left, right):
     """XLA's product, the portable math's issuer: `left @ right`, float32 products in float32 on a GPU,
-    as torch's are, not TF32 (`dew.nn.precision.float32_matmul`, ledger row 1327); the portable math takes
+    as torch's are, not TF32 (`dew.nn.precision.float32_matmul`); the portable math takes
     its operands in at least float32 (`recurrence_chunk.chunked`)."""
     del name
     return float32_matmul(left, right)
