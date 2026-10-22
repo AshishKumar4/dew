@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import logging
 import sqlite3
@@ -21,7 +20,6 @@ from typing import Literal, TypedDict, overload
 
 import grain.python as grain
 import numpy as np
-from array_record.python.array_record_module import ArrayRecordWriter
 
 from dew.data.concurrent import Concurrently
 from dew.data.dataset import _QUIET_STOP_SECONDS
@@ -30,20 +28,20 @@ from dew.data.generation import (
     Generation,
     Outputs,
     RowId,
-    _accepted,
     _checked,
     _decode_outputs,
-    _fact,
     _hash,
     _json,
     _publish,
     _row_key,
-    _rule,
+    completion_facts,
+    seal_facts,
 )
 from dew.data.pipeline import Record, Rejected, Volatile
 from dew.data.retention import LocalRetention
+from dew.data.sinks import write_array_record
 from dew.data.sources.base import Shard, Source
-from dew.data.sources.codec import encode, fingerprint
+from dew.data.sources.codec import encode
 from dew.data.sources.records import ArrayRecords
 from dew.data.storage import PreconditionFailed, Store, _byte_size
 
@@ -388,30 +386,13 @@ class _Writer:
             return
         number = len(self.futures)
         path = Path(self.directory.name) / f"{number}.array_record"
-        writer = ArrayRecordWriter(str(path), "group_size:1")
+        write_array_record(path, self.pending.values())
         entries = []
         positions = []
         used = self.pending_bytes
         for offset, (row_id, payload) in enumerate(self.pending.items()):
-            outputs = _decode_outputs(payload)
-            writer.write(payload)
-            accepted = _accepted(outputs)
-            entries.append(
-                {
-                    "id": row_id,
-                    "fanout": len(accepted),
-                    "record": offset,
-                    "outputs": [[row_id, index] for index in range(len(accepted))],
-                    "sha256": fingerprint(accepted),
-                    "payload_sha256": fingerprint(outputs),
-                    "lengths": [_fact(value, "_dew_length") for value in accepted],
-                    "valid_targets": [_fact(value, "_dew_valid_targets") for value in accepted],
-                    "rules": [_rule(value) for value in accepted],
-                    "rejections": [value.reason for value in outputs if isinstance(value, Rejected)],
-                }
-            )
+            entries.append({**completion_facts(row_id, payload), "record": offset})
             positions.append((row_id, number, offset, _hash(payload)))
-        writer.close()
         actual = path.stat().st_size
         if not self._reserve_shard(actual, used, path):
             self.pending.clear()
@@ -502,21 +483,8 @@ class _Writer:
         with self.lock:
             self._flush()
         self.segments = [future.result() for future in self.futures]
-        chain = b""
-        rows = []
-        for entry in self.segments:
-            payload = _checked(self.root, entry)
-            chain = hashlib.sha256(chain + payload).digest()
-            rows.extend(completion["id"] for completion in json.loads(payload)["completions"])
-        payload = _json(
-            {
-                "count": len(self.segments),
-                "segments": self.segments,
-                "first": rows[0] if rows else None,
-                "last": rows[-1] if rows else None,
-                "sha256": chain.hex(),
-            }
-        )
+        sealed = seal_facts(self.segments, [_checked(self.root, entry) for entry in self.segments])
+        payload = _json(sealed)
         if self.closed:
             raise Abandoned(f"cache writer was abandoned before its seal: {self.writer}")
         try:

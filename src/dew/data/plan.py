@@ -35,10 +35,25 @@ def _canonical(value: JSON | Mapping[str, object]) -> bytes:
     ).encode()
 
 
+class Digest(Protocol):
+    """A running hash, as `hashlib`'s are."""
+
+    def update(self, data: bytes, /) -> None: ...
+
+    def hexdigest(self) -> str: ...
+
+
+def array_digest(dtype: np.dtype, shape: Sequence[int]) -> Digest:
+    """The digest an array of `dtype` and `shape` is fingerprinted by, its header taken: its
+    elements' bytes follow in C order, whole (`fingerprint`) or page by page as a published plan
+    writes them (`generation._write_plan`), to the same hash."""
+    return hashlib.sha256(_canonical([dtype.str, list(shape)]))
+
+
 def fingerprint(value: JSON | Mapping[str, object] | np.ndarray) -> str:
     """Hash order metadata, including an array's shape and dtype."""
     if isinstance(value, np.ndarray):
-        digest = hashlib.sha256(_canonical([value.dtype.str, list(value.shape)]))
+        digest = array_digest(value.dtype, value.shape)
         if value.dtype.hasobject:
             digest.update(_canonical(value.tolist()))
         else:
