@@ -35,8 +35,12 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 - A holdout written before a published generation picks the inputs it picks
   without the cache: the generation stands in for the inputs each part keeps,
   by hash (by a field the cached step drops too) or by records, over missing
-  rows and steps that drop or expand them. A step that reads its record's
-  index there is refused, naming `Cache(url)`. A holdout part is named by
+  rows and steps that drop or expand them. A records holdout over a
+  generation a stream filled is served where the store streams its records
+  in index order (memory, token, TFDS, Grain, Arrow and generation stores),
+  and refused for files that stream in an order of their own: publish those
+  from an indexed read. A step that reads its record's index there is
+  refused, naming `Cache(url)`. A holdout part is named by
   what it selects of its source's identity, so selections stacked on one
   another stay apart; a data position saved over a holdout part before is
   refused as its source changed, and a generation published from one no
