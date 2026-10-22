@@ -435,7 +435,7 @@ def selection_margin(case: Case, variables_by_step, tokens) -> float:
     from flax import linen as nn
 
     from dew.nn.mla import SparseIndexer
-    from dew.nn.mlp import MLP
+    from dew.nn.mlp import GatedMLP
 
     fields = case.config.get("mixer", {}).get("fields", {})
     sparsities = case.config.get("activation_sparsity_pattern", ())
@@ -444,14 +444,15 @@ def selection_margin(case: Case, variables_by_step, tokens) -> float:
     def selecting(module, method):
         parent = module.parent
         return method == "__call__" and (isinstance(module, SparseIndexer) or (
-            isinstance(module, nn.Dense) and module.name == "gate_proj" and isinstance(parent, MLP)
+            isinstance(module, nn.Dense) and module.name == "gate_proj" and isinstance(parent, GatedMLP)
             and bool(parent.activation_sparsity)))
 
-    margin = np.inf
+    margin, seen = np.inf, 0
     for variables in variables_by_step:
         _, captured = model.apply(variables, jnp.asarray(tokens[:, :-1]), capture_intermediates=selecting,
                                   mutable=["intermediates"])
         for path, values in jax.tree_util.tree_flatten_with_path(captured["intermediates"])[0]:
+            seen += 1
             names = [str(getattr(part, "key", part)) for part in path]
             values = np.asarray(values, np.float64)
             if "gate_proj" in names:
@@ -474,6 +475,8 @@ def selection_margin(case: Case, variables_by_step, tokens) -> float:
             decided = np.isfinite(rejected) & ~((kept == 0) & (rejected == 0))
             scale = np.maximum(np.abs(ranked[..., 0]), np.finfo(np.float32).tiny)
             margin = min(margin, float(np.min(np.where(decided, (kept - rejected) / scale, np.inf))))
+    # A model that selects shows its selections here, or the draw would pass unfiltered.
+    assert seen, f"{case.name}: no selection was captured"
     return margin
 
 
