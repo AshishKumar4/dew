@@ -1,0 +1,67 @@
+"""tools/check.sh --changed, the gates a head's own files decide, run on a scratch checkout of the gate's
+own tools: a head that touches SLOP020's inventory, or deletes a file it names, fails as the full run
+fails it."""
+
+import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+TOOLS = Path(__file__).resolve().parents[1] / "tools"
+GATE = ("check.sh", "lint_inputs.sh", "base_history.sh", "lint_slop.py", "lint_scopes.py",
+        "lint_tolerances.py", "duplicates.py")
+CLOSE = ("import numpy as np\n\n\ndef test_close():\n"
+         "    np.testing.assert_allclose(np.ones(2), np.ones(2), rtol=1e-6)\n")
+HELD = {"tests/test_close.py": {"comparisons": 1, "lane": "Data", "by": "2099-01-01"}}
+
+
+def inventory(files: dict) -> str:
+    return json.dumps({"about": "SLOP020's held comparisons", "empty_by": "2099-01-01", "files": files})
+
+
+def git(root: Path, *arguments: str) -> None:
+    subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", *arguments], cwd=root, check=True,
+                   capture_output=True)
+
+
+def checkout(tmp_path: Path) -> Path:
+    """A checkout whose main holds one test comparing floats within a tolerance, held by the inventory, with
+    main as origin/main, so tools/base_history.sh fetches nothing."""
+    root = tmp_path / "checkout"
+    for name in ("src/dew", "tools", "tests", "examples", "site"):
+        (root / name).mkdir(parents=True)
+    for name in GATE:
+        shutil.copy(TOOLS / name, root / "tools" / name)
+    (root / "src/dew/__init__.py").write_text('"""Dew."""\n')
+    (root / "tests/test_close.py").write_text(CLOSE)
+    (root / "tools/tolerance_inventory.json").write_text(inventory(HELD))
+    git(root, "init", "-q", "-b", "main")
+    git(root, "add", "-A")
+    git(root, "commit", "-qm", "main")
+    git(root, "update-ref", "refs/remotes/origin/main", "HEAD")
+    return root
+
+
+def changed(root: Path) -> subprocess.CompletedProcess:
+    return subprocess.run(["sh", "tools/check.sh", "--changed"], cwd=root, capture_output=True, text=True,
+                          timeout=600, env={**os.environ, "PYTHON": sys.executable})
+
+
+def test_a_head_touching_the_inventory_or_deleting_a_file_it_names_fails_its_changed_check(tmp_path):
+    root = checkout(tmp_path)
+    assert changed(root).returncode == 0
+    # Uncommitted: the inventory no longer holds the comparison.
+    (root / "tools/tolerance_inventory.json").write_text(inventory({}))
+    dropped = changed(root)
+    assert dropped.returncode == 1 and "=== slop FAILED" in dropped.stdout
+    # Committed: the same.
+    git(root, "commit", "-qam", "a head that drops the entry")
+    assert changed(root).returncode == 1
+    # A deleted file whose entry stays.
+    git(root, "checkout", "-q", "-b", "deleting", "main")
+    (root / "tests/test_close.py").unlink()
+    git(root, "commit", "-qam", "a head that deletes the held file")
+    gone = changed(root)
+    assert gone.returncode == 1 and "=== slop FAILED" in gone.stdout
