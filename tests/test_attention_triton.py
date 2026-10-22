@@ -6,7 +6,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact
+from reference_error import assert_as_exact, assert_fp32_reduction_bound
 from test_attention_template import CASES, ROWS, SINKS, SOFTCAP, arguments, geometry as core_geometry
 
 from dew.nn.attention import alibi_bias
@@ -438,19 +438,39 @@ def test_many_fp16_cotangents_too_small_once_normalized_still_sum_into_dv():
 
 
 @pytest.mark.parametrize("dtype", attention_triton.DTYPES, ids=DTYPE_IDS)
-def test_cotangents_that_cancel_across_a_key_still_cancel_in_dv(dtype):
+def test_cotangents_that_cancel_across_a_key_cancel_within_the_sums_bound(dtype):
     """Three queries over three equal keys, cotangents 1, 2 and -3: each key's gradient is the queries'
-    equal shares of them, which cancel, 0, as the reference's derivative gives."""
+    equal shares of them, which cancel in float64. A cancellation's zero is no structure: each
+    implementation's gradient is its sums' rounding, so Dew's and the reference's are each within the
+    fp32 reduction bound of the shares' magnitudes (`assert_fp32_reduction_bound`), and cotangents drawn to
+    cancel the same way hold check 1."""
     spans = template.spans(3, 3, 1)
     zeros = jnp.zeros((1, 3, 1, 1), dtype)
+
+    def ours(value, dout):
+        with tuning.pinned({attention_triton.TritonBackward: joint(PINNED[0])}):
+            return attention_triton.backward(zeros, zeros, value, spans, None, dout, scale=1.0,
+                                             interpret=not ON_GPU).value
+
+    def theirs(value, dout):
+        def attend(value):
+            return template.reference(zeros, zeros, value, spans, scale=1.0)
+
+        return jax.vjp(attend, value)[1](dout)[0]
+
     dout = jnp.asarray([1.0, 2.0, -3.0], dtype).reshape(1, 3, 1, 1)
-    with tuning.pinned({attention_triton.TritonBackward: joint(PINNED[0])}):
-        ours = attention_triton.backward(zeros, zeros, zeros, spans, None, dout, scale=1.0,
-                                         interpret=not ON_GPU).value
-    _, pull = jax.vjp(lambda value: template.reference(zeros, zeros, value, spans, scale=1.0), zeros)
-    [theirs] = pull(dout)
-    np.testing.assert_array_equal(np.asarray(theirs, np.float32), 0)
-    np.testing.assert_array_equal(np.asarray(ours, np.float32), 0)
+    shares = np.full((1, 3, 1, 1), np.abs(np.asarray(dout, np.float64)).sum() / 3)
+    for found in (ours(zeros, dout), theirs(zeros, dout)):
+        assert_fp32_reduction_bound(np.zeros((1, 3, 1, 1)), np.asarray(found, np.float64), shares, terms=3)
+
+    def draw(seed: int):
+        # Two cotangents drawn a channel, the third their negated sum: equal keys share them alike.
+        drawn = jax.random.normal(jax.random.key(seed), (1, 2, 1, 8), jnp.float32)
+        cancelling = jnp.concatenate([drawn, -drawn.sum(axis=1, keepdims=True)], axis=1).astype(dtype)
+        return jnp.zeros((1, 3, 1, 8), dtype), cancelling
+
+    assert_as_exact(jax.jit(ours), jax.jit(theirs), draw, f"cancelling cotangents {jnp.dtype(dtype).name}",
+                    seeds=8)
 
 
 def test_an_fp32_weight_that_normalizing_would_lose_still_reaches_dv():
