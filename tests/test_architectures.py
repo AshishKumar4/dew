@@ -124,7 +124,9 @@ LONG_SEQ_LEN = 128
 of it (Gemma 3n's, where float32 now and then takes the other branch of the AltUp clamp or the
 sparsity cutoff than float64 does, and Qwen 3.5's): longer rows put more such events in each draw,
 so check 1's pooled ratio resolves over a sized count of draws, where SEQ_LEN's rows left the
-reference compared with itself unresolved within 512."""
+reference compared with itself unresolved within 512. Qwen 3.5's rows are twice as long: at 128 its
+embedding's momentum still did not resolve within 512. Gemma 3n's draws also clear the sparsity
+cutoff by a margin (`selection_margin`)."""
 LM = {"vocab_size": VOCAB, "emb_features": 32, "num_layers": 2, "num_heads": 2,
       "num_kv_heads": 1, "mlp_features": 64, "max_seq_len": SEQ_LEN}
 
@@ -248,7 +250,7 @@ CASES = [
             "class": "gated_delta_net", "fields": {"linear_num_key_heads": 2,
             "linear_num_value_heads": 4, "linear_key_head_dim": 8,
             "linear_value_head_dim": 8, "linear_conv_kernel_dim": 4}}}},
-        "max_seq_len": LONG_SEQ_LEN}, seq_len=LONG_SEQ_LEN, label="qwen35"),
+        "max_seq_len": 2 * LONG_SEQ_LEN}, seq_len=2 * LONG_SEQ_LEN, label="qwen35"),
 ]
 
 IDS = [case.name for case in CASES]
