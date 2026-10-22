@@ -94,21 +94,25 @@ def _families() -> dict[str, Family]:
     every = np.ones((1, 1, 1, 1), bool)
 
     def near_max_logit(width: int):
-        # One key whose logit is a drawn fp32 near its largest: the output is the key's value.
+        # One key whose product with the query is a drawn fp32 near its largest (its key's first entry in
+        # [1/2, 1) times a query near fp32's largest): the output is the key's value.
         def draw(seed):
-            size = _uniform(seed, 1e38, 3e38) * np.sqrt(width)
-            key, value, dout = _normal(seed + 1, (1, 1, 1, width), (1, 1, 1, width), (1, 1, 1, width))
-            return _first(np.asarray([size], np.float32), width), np.abs(key) + 0.5, value, None, dout
+            size = _uniform(seed, 1e38, 3e38)
+            key = _first(_uniform(seed + 1, 0.5, 1.0, (1,)), width)
+            value, dout = _normal(seed + 2, (1, 1, 1, width), (1, 1, 1, width))
+            return _first(np.asarray([size], np.float32), width), key, value, None, dout
         return draw
 
     def large_values(keys: int):
         # Equal logits over values drawn within a few percent of fp32's largest, one sign: the sum of the
-        # weighted values passes fp32's largest where the reference's normalized one does not.
+        # weighted values passes fp32's largest where the reference's normalized one does not. The
+        # cotangent is drawn times 2^-8, so the cotangent's product with the values stays finite in the
+        # reference's backward too.
         def draw(seed):
             value = _uniform(seed, 3.0e38, 3.4e38, (1, keys, 1, 16))
             (dout,) = _normal(seed + 1, (1, 1, 1, 16))
             return (np.zeros((1, 1, 1, 16), np.float32), np.zeros((1, keys, 1, 16), np.float32), value, None,
-                    dout)
+                    dout * np.float32(2.0 ** -8))
         return draw
 
     def drawn(queries, keys, width=16, rows=1, size=1.0):
@@ -194,7 +198,8 @@ RUNS = [(family, form) for family in FAMILIES for form in FORMS
 
 
 def _spans(family: Family, query, key) -> template.KeySpans:
-    arguments = {name: jax.tree.map(jnp.asarray, value) for name, value in family.spans.items()}
+    arguments = {name: jnp.asarray(value) if isinstance(value, np.ndarray) else value
+                 for name, value in family.spans.items()}
     return template.spans(query.shape[1], key.shape[1], query.shape[0], **arguments)
 
 
