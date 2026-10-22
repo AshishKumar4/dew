@@ -1582,12 +1582,12 @@ def test_a_records_holdout_over_a_stream_filled_generation_serves_where_the_stre
 
 def test_a_hash_part_of_a_generation_reads_in_worker_processes_as_uncached():
     """Worker processes read a hash part of a generation the rows the parent placed, the ones the
-    chain reads uncached."""
+    chain reads uncached, from a store of as many shards as workers."""
     from dew.data.compile import compile, publish
     from dew.data.dataset import DataPartition, Loading
     from dew.data.pipeline import Pipeline
 
-    source = Memory([{"id": index} for index in range(48)])
+    source = Memory([{"id": index} for index in range(48)], shard_rows=24)
     generation = publish(_tagged(Pipeline(source)), _cache(), read="memory")
     trained, _ = Pipeline(source).holdout(0.25)
 
