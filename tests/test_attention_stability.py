@@ -155,14 +155,16 @@ def _mixed_columns(seed: int, rows: int = 128, small: tuple[float, float] = (5e2
     return _first(np.full((rows, 1), 4.0, np.float32), 16), key, value, None, dout * np.float32(2.0 ** -8)
 
 
-def _subnormal_share(seed: int, rows: int = 64):
-    # One query a row over 256 keys: 255 of logits drawn in (-1, 0] (their other entries drawn, which the
-    # query reads nothing of) whose values near fp32's largest in the first column overflow its sum, and
-    # one of logit -84 to -88 whose value near 1e38 sits alone in the second column, its weight over the
-    # denominator below fp32's least normal; the cotangent reads the second column alone, so D is that
-    # key's share and dQ's other entries are D times the other keys' weighted rows.
+def _subnormal_share(seed: int, rows: int = 64, *, equal: bool = False):
+    # One query a row over 256 keys: 255 of logits drawn in (-1, 0] (`equal`, all 0, so each weighs
+    # 1/255, which bf16 rounds by 2^-8; their other entries drawn, which the query reads nothing of)
+    # whose values near fp32's largest in the first column overflow its sum, and one of logit -84 to -88
+    # whose value near 1e38 sits alone in the second column, its weight over the denominator below fp32's
+    # least normal; the cotangent reads the second column alone, so D is that key's share and dQ's other
+    # entries are D times the other keys' weighted rows.
     key = np.zeros((rows, 256, 1, 16), np.float32)
-    key[:, :255, 0, 0] = -_uniform(seed + 5, 0.0, 1.0, (rows, 255))
+    if not equal:
+        key[:, :255, 0, 0] = -_uniform(seed + 5, 0.0, 1.0, (rows, 255))
     key[:, :255, 0, 1:] = _normal(seed, (rows, 255, 15))[0]
     key[:, 255, 0, 0] = -_uniform(seed + 1, 84.0, 88.0, (rows,))
     value = np.zeros((rows, 256, 1, 16), np.float32)
@@ -414,6 +416,10 @@ def _families() -> dict[str, Family]:
             _subnormal_share, np.ones((64, 1, 1, 256), bool), folded=False),
         "a subnormal share of an overflowing row, bfloat16": Family(
             _subnormal_share, np.ones((64, 1, 1, 256), bool), folded=False, dtype="bfloat16"),
+        # Every weight but one 1/255, bf16's worst rounding of a weight, beside the subnormal share.
+        "a subnormal share beside 255 equal weights, bfloat16": Family(
+            functools.partial(_subnormal_share, equal=True), np.ones((64, 1, 1, 256), bool), folded=False,
+            dtype="bfloat16"),
     }
     lengths = np.tile([4, 0], ROWS // 2)
     empty = np.broadcast_to((lengths > 0)[:, None, None, None], (ROWS, 1, 4, 4))
@@ -488,11 +494,22 @@ def _cast(family: Family, draw: Callable[[int], tuple]) -> Callable[[int], tuple
 
 def _reference(family: Family, *, anchored: bool) -> Callable:
     """The reference's output, in the call's dtype as every attention call returns it, and its query, key
-    and value gradients under the cotangent; the float64 truth's derivative `anchored`."""
+    and value gradients under the cotangent; the float64 truth's derivative `anchored`. The reference arm
+    is jax's own attention (`jax.nn.dot_product_attention`'s xla path, differentiated by autodiff), the
+    established computation Dew's is held to at its declared precision, which rounds the probabilities to
+    the values' dtype for their products (the gate's ruling, row 1362), wherever its API holds the
+    family; the written-out one where a family has sinks or a resumed state, which it has no input for,
+    or a query of no keys, to which it gives the values' mean where Dew and the truth give zeros (every
+    such family fp32, whose probabilities round to nothing)."""
+    jax_holds = not anchored and np.asarray(family.keep).any(-1).all()
+
     def run(query, key, value, extra, dout):
         def attend(q, k, v):
             if isinstance(extra, tuple):
                 return _resumed_attention(q, k, v, extra, family.keep)
+            if extra is None and jax_holds:
+                return jax.nn.dot_product_attention(q, k, v, mask=jnp.asarray(family.keep),
+                                                    implementation="xla")
             return exact_attention(q, k, v, extra, keep=family.keep, anchored=anchored)
         out, pull = jax.vjp(attend, query, key, value)
         return (out.astype(query.dtype), *pull(dout.astype(out.dtype)))
