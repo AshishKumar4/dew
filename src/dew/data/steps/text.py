@@ -94,6 +94,10 @@ _BOUND = "_dew_target_fields"
 """Where a counted record names the fields its targets were counted from, as projections since
 renamed them (`rebound`), one entry each of `_COUNTED`; an empty name is one a projection removed."""
 
+_CARRIED = ("_dew_valid_targets", *_RULE, _BOUND)
+"""What a counted record carries of its count: the count, its rule and the fields it was counted
+from (`recounted`)."""
+
 
 def _bound(row: Batch) -> tuple[str, ...]:
     return tuple(row.get(_BOUND, _COUNTED))
@@ -123,11 +127,17 @@ def targets_changed(given: Batch, output: Batch) -> bool:
 
 
 def recounted(given: Batch, output: Batch) -> Batch:
-    """`output` with the targets counted on `given` (`CountTargets`): kept while the step left every
-    field they were counted from as it was, as a map of a record's other fields or a projection
-    does, and counted again by the rule that counted them where it changed one in place, as a crop
-    does, from the fields as they are named now."""
-    if "_dew_valid_targets" not in output or not targets_changed(given, output):
+    """`output` with the targets counted on `given` (`CountTargets`): carried onto a record the step
+    made anew without them, with the rule and the names they were counted by; kept while the step
+    left every field they were counted from as it was, as a map of a record's other fields or a
+    projection does; and counted again by the rule that counted them where it changed one in place,
+    as a crop does, from the fields as they are named now. Every read carries a count so, a memory
+    read's among them, which keeps no count of its own beside its records."""
+    if "_dew_valid_targets" not in given:
+        return output
+    if "_dew_valid_targets" not in output:
+        output = {**output, **{name: given[name] for name in _CARRIED if name in given}}
+    if not targets_changed(given, output):
         return output
     return {**output, "_dew_valid_targets": _scored(output)}
 
@@ -195,6 +205,14 @@ def stated_rules(value: object) -> set[tuple[int | None, int | None]]:
     return rules
 
 
+def counted_window(window: Batch, rule: CountRule | None, field: str) -> Batch:
+    """A window a pack or windows stage made, its targets of its token `field` counted as the loss
+    scores them and carried on it, by the rule its documents were counted by (`CountRule`), or every
+    target's where nothing counted them: a later step, the read that accepts it (a memory read's,
+    `dew.data.lowering._Build.targeted`) and a mixture by tokens read them as a counted record's."""
+    return (rule or CountRule(None, None, "")).counted(window, field)
+
+
 class LayoutRule:
     """The one rule the documents a pack or windows stage lays out were counted by (`CountRule`),
     or None where nothing counted them, as each document passes. Documents counted by two rules,
@@ -203,6 +221,14 @@ class LayoutRule:
     def __init__(self) -> None:
         self.seen = False
         self.rule: CountRule | None = None
+
+    @classmethod
+    def of(cls, documents: Iterable[Batch]) -> CountRule | None:
+        """The one rule `documents` were counted by, all of them passing."""
+        seen = cls()
+        for document in documents:
+            seen(document)
+        return seen.rule
 
     def __call__(self, document: Batch) -> Batch:
         rule = CountRule.of(document)
