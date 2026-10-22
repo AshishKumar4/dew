@@ -42,12 +42,13 @@ def tokens(rng, batch=2, length=SEQ):
     return jax.random.randint(rng, (batch, length), 0, VOCAB)
 
 
-SEEDS = {'decode': 8, 'kernels': 8, 'window kernels': 8, 'softcap': 8, 'routed softcap': 8, 'grouped': 8,
-         'sliding decode': 8, 'hybrid decode': 8, 'sandwich': 8, 'packed alone': 8, 'metadata': 8,
-         'packed kernels': 8, 'bf16 head': 8, 'strict head': 8, 'norm gradient': 8, 'xsa': 8,
-         'xsa decode': 8, 'grouped decode': 8, 'cached prefill': 8, 'packed cudnn': 8,
-         'cudnn decode': 8, 'padded prefill': 8, 'right padded': 8, 'rotary': 8}
-"""Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada)."""
+SEEDS = {'decode': 16, 'kernels': 16, 'window kernels': 8, 'softcap': 32, 'routed softcap': 64,
+         'grouped': 32, 'sliding decode': 16, 'hybrid decode': 512, 'sandwich': 8, 'packed alone': 16,
+         'metadata': 128, 'packed kernels': 16, 'bf16 head': 8, 'strict head': 8, 'norm gradient': 8,
+         'xsa': 32, 'xsa decode': 8, 'grouped decode': 32, 'cached prefill': 8, 'packed cudnn': 8,
+         'cudnn decode': 16, 'padded prefill': 8, 'right padded': 16, 'rotary': 8}
+"""Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada, and the GPU
+sites on an A100, 2026-10-22): the most any of a site's cases took."""
 
 
 def drawn(model, batch=2, length=SEQ):
