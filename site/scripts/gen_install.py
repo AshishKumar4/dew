@@ -102,9 +102,9 @@ def main() -> None:
                      f"one under NVIDIA's cuda-compat | {major}.{minor} or later |")
     least = [f"Dew needs Python {python} or newer."]
     advice = [f"Use pip {pip_version} or newer and uv 0.13.4 or newer: older ones trust the roots of "
-              "eMudhra's compromised certificate authorities (October 2026). Update pip from its wheel by hash, so "
-              "the update holds whatever the older pip trusts, and uv through the system's certificates "
-              "once they are updated:", "",
+              "eMudhra's compromised certificate authorities (October 2026). Update pip from its wheel by "
+              "hash, so the update holds whatever the older pip trusts, and uv through the system's "
+              "certificates once they are updated:", "",
               "```bash", f'python -m pip install "{pip}"', "UV_SYSTEM_CERTS=true uv self update", "```"]
     stale = []
     for path, blocks in ((REPO / "site/public/install.sh", ((SHELL, shell),)),

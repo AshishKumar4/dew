@@ -4,9 +4,9 @@ So reading Hub metadata or a safetensors file does not import the decoder
 translators or the diffusion pipeline loader.
 """
 
-from collections.abc import Callable
-from importlib import import_module
 from typing import TYPE_CHECKING
+
+from dew._exports import lookup as _lookup
 
 if TYPE_CHECKING:  # written from _EXPORTS (tools/gen_exports.py)
     from dew.interop.hf_decoders import translate_config, translate_weights
@@ -34,11 +34,7 @@ _EXPORTS = {
 }
 
 
-def __getattr__(name: str) -> type | Callable:
-    module = _EXPORTS.get(name)
-    if module is None:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    return getattr(import_module(module), name)
+__getattr__ = _lookup(__name__, _EXPORTS)
 
 
 def __dir__() -> list[str]:
