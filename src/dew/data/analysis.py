@@ -209,7 +209,7 @@ def _in_place(generation: Generation, source: Source | Mixture | Phases,
     facts in a generation than in this run, and a step no cache can key
     (`_keyed`) is in no generation's prefix, so no generation stands for
     either."""
-    from dew.data.holdout import HashPart, RecordSlice, SelectedGeneration, selecting
+    from dew.data.holdout import RecordSlice, SelectedGeneration, selecting
 
     dependency = record(generation.manifest["dependency"], "generation dependency")
     fill = record(dependency.get("fill", {}), "generation fill")
@@ -217,13 +217,12 @@ def _in_place(generation: Generation, source: Source | Mixture | Phases,
         return None, ("fill",)
     read = READS[READS.index(fill["read"])]
     published = dependency.get("source")
-    chain = list(selecting(source))
-    depth = next((depth for depth, candidate in enumerate(chain)
-                  if not isinstance(candidate, (Mixture, Phases))
-                  and json_value(_consumed(candidate, read).fingerprint(), "source") == published), None)
-    stored = None if depth is None else chain[depth]
-    if stored is None or isinstance(stored, (Mixture, Phases)):
+    found = None if isinstance(source, (Mixture, Phases)) else next(
+        ((above, candidate) for above, candidate in selecting(source)
+         if json_value(_consumed(candidate, read).fingerprint(), "source") == published), None)
+    if found is None:
         return None, ("source",)
+    selections, stored = found
     unkeyed = [_identity(stage).name for stage in prefix if not _keyed(stage)
                or (isinstance(stage, Configured) and stage.scope == "run")]
     if unkeyed:
@@ -232,8 +231,6 @@ def _in_place(generation: Generation, source: Source | Mixture | Phases,
     changed = _changed(_semantic(dependency), _prefix_manifest(stored, prefix, read).semantic())
     if changed:
         return None, changed
-    selections = tuple(selection for selection in chain[:depth]
-                       if isinstance(selection, (RecordSlice, HashPart)))
     if not selections:
         return generation.source(), ()
     if any(isinstance(stage, MapWithIndex) for stage in prefix):

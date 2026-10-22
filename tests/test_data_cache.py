@@ -1745,3 +1745,24 @@ def test_a_records_holdout_over_a_stream_filled_generation_of_a_dataset_read_in_
     uncached = [_tags(_tagged(part)) for part in parts]
     assert all(uncached)
     assert [_tags(_tagged(part).cache(generation)) for part in parts] == uncached
+
+
+@pytest.mark.parametrize("store", ["hash part", "concatenation"])
+def test_a_records_holdout_over_a_stream_filled_generation_of_a_part_or_a_concatenation_serves(store):
+    """A hash part of a store in memory, and a concatenation of stores in memory, stream their records
+    in index order, as their stores do: a records holdout over a generation a stream filled from
+    either reads the rows of the inputs it keeps, as the chain does uncached."""
+    from dew.data import concat
+    from dew.data.compile import publish
+    from dew.data.pipeline import Pipeline
+
+    rows = [{"id": index} for index in range(24)]
+    if store == "hash part":
+        source, _ = Pipeline(Memory(rows)).holdout(0.25)
+    else:
+        source = concat([Memory(rows[:10]), Memory(rows[10:])])
+    generation = publish(_tagged(source), _cache(), read="streamed")
+    parts = source.holdout(records=5)
+    uncached = [_tags(_tagged(part)) for part in parts]
+    assert all(uncached)
+    assert [_tags(_tagged(part).cache(generation)) for part in parts] == uncached
