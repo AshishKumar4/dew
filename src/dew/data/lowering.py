@@ -23,7 +23,6 @@ import functools
 import hashlib
 import logging
 import math
-import sys
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING, Protocol, overload, runtime_checkable
 
@@ -1584,33 +1583,19 @@ class _Build:
 def _epoch_records(train: Pipeline, build: _Build) -> int | None:
     """The records in one epoch of a global order: each corpus's indexed order
     up to its first repeat, as the lowering builds it, so a slice, a limit and
-    a token split count exactly. A mixture, nested or not, read on past its
-    end, as a training order that repeats for ever reads it, reads each part on
-    from where it was, so it counts until every part has come round once
-    (`Proportions.covering`), as it does where every part repeats; one read
-    once ends where its first part does. A repeat written before a cache counts the inputs a pass
-    reads where the cache keeps one record for each, and none otherwise,
-    ahead of reading them; phases are counted by none."""
+    a token split count exactly. A mixture read once counts the records its mix
+    reads before it ends, as the lowering builds it. One read on past its end,
+    by a repeat that never ends, a training order's own (`_Build.batched`), or a
+    mix of parts that never end, reads each part on from where it was, so it
+    counts until every part has come round once (`Proportions.covering`), the
+    parts it mixes counted alike. A repeat written before a cache counts the
+    inputs a pass reads where the cache keeps one record for each, and none
+    otherwise, ahead of reading them; phases are counted by none."""
     if not build.global_order:
         return None
 
-    def counted(pipeline: Pipeline, build: _Build) -> int | None:
-        source = pipeline.source
-        if isinstance(source, Mixture):
-            sizes = [counted(child, build.child(index))
-                     for index, child in enumerate(source.pipelines)]
-            known = [size for size in sizes if size is not None]
-            if len(known) != len(sizes):
-                return None
-            # The mix reads by `Proportions` (`ProportionalSelection`), on past its end where its order
-            # repeats for ever: every corpus until each has come round once; where one is read once
-            # and the order ends, until the mix stops at its end.
-            repeats = [any(isinstance(stage, Repeat) for stage in child.stages) for child in source.pipelines]
-            if build.lowering.endless or all(repeats):
-                return Proportions.of(_weights(source)).covering(known)
-            lengths = [sys.maxsize if repeated else size
-                       for size, repeated in zip(known, repeats, strict=True)]
-            return len(ProportionalSelection(lengths, _weights(source)))
+    def passed(pipeline: Pipeline, build: _Build) -> int | None:
+        """The records `pipeline` reads up to its first repeat, as the lowering builds them."""
         at = _until(pipeline.stages, (Repeat,))
         cache = build.lowering.cache
         if cache is not None and cache >= at:
@@ -1625,7 +1610,31 @@ def _epoch_records(train: Pipeline, build: _Build) -> int | None:
                                     DataPartition())) as rows:
             return len(rows) if isinstance(rows, pygrain.MapDataset) else None
 
-    return counted(train, build)
+    def covered(pipeline: Pipeline, build: _Build) -> int | None:
+        """The records of `pipeline` read on past its end in which every part comes round once."""
+        source = pipeline.source
+        if not isinstance(source, Mixture):
+            return passed(pipeline, build)
+        sizes = [covered(child, build.child(index)) for index, child in enumerate(source.pipelines)]
+        known = [size for size in sizes if size is not None]
+        if len(known) != len(sizes):
+            return None
+        return Proportions.of(_weights(source)).covering(known)
+
+    unending = isinstance(train.source, Mixture) and _unending(train)
+    # A training order that repeats nowhere repeats for ever at its root (`_Build.batched`).
+    if unending or (build.training and build.lowering.endless and not build.lowering.repeated):
+        return covered(train, build)
+    return passed(train, build)
+
+
+def _unending(pipeline: Pipeline) -> bool:
+    """Whether `pipeline` reads for ever by itself: by a repeat without a count, or as a mixture of
+    parts that each do, whose mix never ends."""
+    if any(isinstance(stage, Repeat) and stage.epochs is None for stage in pipeline.stages):
+        return True
+    source = pipeline.source
+    return isinstance(source, Mixture) and all(_unending(child) for child in source.pipelines)
 
 
 def _split_spans(pipeline: Pipeline, build: _Build) -> Iterator[list[tuple[int, int, int]]]:
