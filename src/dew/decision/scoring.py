@@ -160,3 +160,11 @@ class Combined(ScoringRule):
         return Combined(tuple((float(weight) * held, rule) for held, rule in self.terms))
 
     __rmul__ = __mul__
+
+
+def default_metrics() -> list:
+    """A decision model's default held-out suite, fresh: accuracy, calibration error, the
+    risk-coverage area and the log loss, in that order."""
+    from dew.decision.metrics import AURC, ECE, Accuracy
+
+    return [Accuracy(), ECE(), AURC(), LogLoss()]
