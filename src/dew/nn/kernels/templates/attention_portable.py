@@ -104,29 +104,26 @@ def forward(spec: algebra.Forward, query: jax.Array, key: jax.Array, value: jax.
             m, alpha = algebra.peak(spec, state.m, logits)
             v_tile = jax.lax.dynamic_slice_in_dim(value[row, :, kv_head], j * block_k, block_k)
             weights = algebra.weights(spec, logits, m)
-            if state.shift is None:
-                denominator = algebra.total(state.total, alpha, weights)
-                return coords, logits, m, alpha, weights, (denominator,), v_tile
-            weights, factor, shift, reach = algebra.room(state, alpha, weights, v_tile)
-            sums = algebra.total(state.total, factor, weights), shift, reach
-            return coords, logits, m, factor, weights, sums, v_tile
+            weights, factor, held = algebra.tile(state, alpha, weights, v_tile)
+            return coords, logits, m, factor, weights, held, v_tile
 
         def plain(j, state: algebra.Partial) -> algebra.Partial:
-            _, _, m, factor, weights, sums, v_tile = softmax(j, state)
-            acc = algebra.rescale(state.acc, factor) + _dot(algebra.narrow(weights, v_tile.dtype), v_tile)
-            return algebra.Partial(acc, m, *sums)
+            _, _, m, factor, weights, held, v_tile = softmax(j, state)
+            product = _dot(algebra.narrow(weights, v_tile.dtype), v_tile)
+            return algebra.stepped(state, m, factor, weights, product, held)
 
         def step(j, carry: tuple[algebra.Partial, algebra.Argmax, jax.Array, jax.Array]):
             state, arg, own, others_total = carry
-            coords, logits, m, factor, weights, sums, v_tile = softmax(j, state)
+            coords, logits, m, factor, weights, held, v_tile = softmax(j, state)
             # The training forward's split sums (`algebra.split_accumulate`), as the Triton mainloop's.
             anchor = algebra.argmax(arg, logits, coords.k_pos)
             others, own_tile = algebra.anchor_split(algebra.narrow(weights, v_tile.dtype),
                                                     coords.k_pos == anchor.key[:, None])
             acc, own, others_total = algebra.split_accumulate(
                 state.acc, own, others_total, factor, anchor.peak > arg.peak, value[row, arg.key, kv_head],
-                _dot(others, v_tile), others, own_tile)
-            return algebra.Partial(acc, m, *sums), anchor, own, others_total
+                _dot(others, v_tile), others, own_tile, held)
+            stepped = algebra.stepped(state, m, factor, weights, jnp.zeros_like(acc), held)
+            return stepped._replace(acc=acc), anchor, own, others_total
 
         def begun(live) -> algebra.Partial:
             if initial is None:
@@ -295,10 +292,10 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
                 at_anchor = columns[None, :] == chosen[:, None]
                 exponentials, rest, own = algebra.off_anchor_weights(logits, maxima, at_anchor, v_tile.dtype,
                                                                      shifts)
-                return algebra.off_anchor(state, exponentials, rest, own, _dot(rest, v_tile))
+                return algebra.off_anchor(state, exponentials, rest, own, _dot(rest, v_tile), shifts)
 
             walked = jax.lax.fori_loop(lo, hi, row_terms, before)
-            prior = walked.total * jnp.exp2(shifts)
+            prior = algebra.power2(walked.total, shifts)
             anchor, delta, chosen = algebra.off_anchor_delta(walked, anchor_rows, do, state_total,
                                                              state_share, chosen, shifts)
         else:
