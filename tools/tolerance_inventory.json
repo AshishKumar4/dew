@@ -538,7 +538,7 @@
    "by": "2026-11-13"
   },
   "tests/test_linear_attention.py": {
-   "comparisons": 33,
+   "comparisons": 32,
    "lane": "Kernels",
    "by": "2026-11-06"
   },
