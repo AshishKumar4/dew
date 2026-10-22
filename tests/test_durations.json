@@ -6510,7 +6510,6 @@
 "tests/test_moe_precision.py::test_both_dispatches_take_the_same_adam_steps_in_bf16[xla-8-1-True-True-0.7-geglu]": 1.199,
 "tests/test_moe_precision.py::test_both_dispatches_take_the_same_adam_steps_in_bf16[xla-8-1-True-True-0.7-geglu_exact]": 1.464,
 "tests/test_moe_precision.py::test_both_dispatches_take_the_same_adam_steps_in_bf16[xla-8-1-True-True-0.7-swiglu]": 1.498,
-"tests/test_moe_precision.py::test_every_tile_of_the_grouped_kernels_holds_the_float64_gate[GmmTransposed]": 0,
 "tests/test_moe_precision.py::test_every_tile_of_the_grouped_kernels_holds_the_float64_gate[Gmm]": 0,
 "tests/test_moe_precision.py::test_every_tile_of_the_grouped_kernels_holds_the_float64_gate[Tgmm]": 0,
 "tests/test_moe_precision.py::test_gpt_oss_infers_one_compute_dtype_from_all_expert_operands": 0.1,
