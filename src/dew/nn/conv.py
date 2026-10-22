@@ -169,10 +169,10 @@ def _shifted_depthwise_3x3(lhs: jax.Array, rhs: jax.Array, dilation: int) -> jax
     here; it sums 16 features or fewer otherwise, so those keep the
     convolution. If a jax or YNNPACK release changes that summation,
     tests/test_depthwise_conv.py's
-    test_cpu_depthwise_is_the_library_convolution_bit_for_bit fails. One
-    sign differs: an output whose nine taps are all negative zero is the
-    sum's negative zero here, where the library gives a zero of either sign
-    by its kernel and the host it runs on (ledger 1361)."""
+    test_cpu_depthwise_is_the_library_convolution_bit_for_bit fails. An
+    output whose nine taps are all negative zero is the sum's negative zero
+    here, where the library gives a zero of either sign by its kernel and
+    the host it runs on."""
     height, width = lhs.shape[1:3]
     padded = jnp.pad(lhs, ((0, 0), (dilation, dilation), (dilation, dilation), (0, 0))).astype(jnp.float32)
     products = jax.lax.optimization_barrier(_taps(padded, rhs.astype(jnp.float32), dilation, height, width))
@@ -200,10 +200,9 @@ def _materialized_depthwise_3x3(lhs: jax.Array, rhs: jax.Array, dilation: int) -
     height, width = lhs.shape[1:3]
     border = ((0, 0), (dilation, dilation), (dilation, dilation), (0, 0))
     padded = jnp.pad(_barrier(lhs.astype(jnp.float32)), border)
-    # Onto a positive zero, as main summed. XLA:CPU keeps it, so an output whose nine taps are all
-    # negative zero is positive zero there; XLA:CUDA, where this form runs, drops the zero, so the
-    # output is the sum's negative zero, as the shifted form's is (H100), where cuDNN's convolution
-    # gives positive zero (ledger 1361).
+    # Onto a positive zero, as the form has summed: XLA:CPU keeps it, so an output whose nine taps
+    # are all negative zero is positive zero there, and XLA:CUDA, where this form runs, drops it (A100
+    # and H100), so the output is the sum's negative zero, as the shifted form's is.
     products = _taps(padded, _barrier(rhs.astype(jnp.float32)), dilation, height, width)
     return _barrier(_accumulated(jnp.zeros(lhs.shape, jnp.float32), products)).astype(lhs.dtype)
 
