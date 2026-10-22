@@ -1584,9 +1584,11 @@ class _Build:
 def _epoch_records(train: Pipeline, build: _Build) -> int | None:
     """The records in one epoch of a global order: each corpus's indexed order
     up to its first repeat, as the lowering builds it, so a slice, a limit and
-    a token split count exactly; a mixture, nested or not, reads until every
-    repeated part has come round once (`Proportions.covering`), or until a part
-    read once ends. A repeat written before a cache counts the inputs a pass
+    a token split count exactly. A mixture, nested or not, read on past its
+    end, as a training order that repeats for ever reads it, reads each part on
+    from where it was, so it counts until every part has come round once
+    (`Proportions.covering`), as it does where every part repeats; one read
+    once ends where its first part does. A repeat written before a cache counts the inputs a pass
     reads where the cache keeps one record for each, and none otherwise,
     ahead of reading them; phases are counted by none."""
     if not build.global_order:
@@ -1600,10 +1602,11 @@ def _epoch_records(train: Pipeline, build: _Build) -> int | None:
             known = [size for size in sizes if size is not None]
             if len(known) != len(sizes):
                 return None
-            # The mix reads by `Proportions` (`ProportionalSelection`): repeated corpora until every
-            # one has come round once; where one is read once, until the mix stops at its end.
+            # The mix reads by `Proportions` (`ProportionalSelection`), on past its end where its order
+            # repeats for ever: every corpus until each has come round once; where one is read once
+            # and the order ends, until the mix stops at its end.
             repeats = [any(isinstance(stage, Repeat) for stage in child.stages) for child in source.pipelines]
-            if all(repeats):
+            if build.lowering.endless or all(repeats):
                 return Proportions.of(_weights(source)).covering(known)
             lengths = [sys.maxsize if repeated else size
                        for size, repeated in zip(known, repeats, strict=True)]
