@@ -241,11 +241,11 @@ def _measured(pipeline: Pipeline, above: tuple[Measuring, ...] = ()) -> dict[int
     through before that step, by the store's identity."""
     passed = tuple(dataclasses.replace(each, before=(*pipeline.stages, *each.before)) for each in above)
     measuring = (*_measures(pipeline.stages), *passed)
-    source = pipeline.source
-    if not isinstance(source, (Mixture, Phases)):
-        return {id(source): measuring}
+    nested = children(pipeline)
+    if not nested:
+        return {id(pipeline.source): measuring}
     found: dict[int, tuple[Measuring, ...]] = {}
-    for child in source.pipelines:
+    for child in nested:
         for key, child_measuring in _measured(child, measuring).items():
             found[key] = (*found.get(key, ()), *child_measuring)
     return found
@@ -1041,9 +1041,13 @@ def fitted[Entry](
 
 
 def _endless(chain: Pipeline) -> Pipeline:
-    """`chain` read endlessly: a repeat before its batch where it has none."""
+    """`chain` read endlessly: a repeat before its batch where it has none; a mixture's at each of its
+    corpora, so every corpus is read whole at its share, where a repeat of the mix would start over
+    at the end of its shortest."""
     if any(isinstance(stage, Repeat) for stage in chain.stages):
         return chain
+    if isinstance(chain.source, Mixture):
+        return with_children(chain, _endless)
     batching = [index for index, stage in enumerate(chain.stages)
                 if isinstance(stage, (BatchStage, TokenBudget))]
     at = batching[0] if batching else len(chain.stages)
