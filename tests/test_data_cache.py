@@ -1473,3 +1473,96 @@ def test_real_r2_generation_publication_mirror_and_cleanup(tmp_path):
         for object_path in fs.find(path):
             fs.rm(object_path)
         assert not fs.exists(path + "/CURRENT")
+
+
+def _tagged(pipeline):
+    """`pipeline`'s rows with a tag beside their id: other rows than its inputs, one for each."""
+    return pipeline.map(lambda row: {**row, "tag": row["id"] * 10}, identity="tag@1")
+
+
+def _tags(pipeline, read="memory"):
+    from dew.data.compile import iterate
+    from dew.data.dataset import Loading
+
+    return [int(row["tag"]) for row in iterate(pipeline, read=read, loading=Loading(workers=0))]
+
+
+@pytest.mark.parametrize("read", ["memory", "streamed"])
+def test_a_generation_of_the_store_stands_in_for_both_parts_of_a_hash_holdout(read):
+    """A generation published from the store a hash holdout is taken from, its step making other rows
+    than its inputs: under the holdout each part reads the rows of the inputs its hash placed there,
+    the parts the chain reads uncached, in every read."""
+    from dew.data.compile import publish
+    from dew.data.pipeline import Pipeline
+
+    source = Memory([{"id": index} for index in range(24)])
+    generation = publish(_tagged(Pipeline(source)), _cache(), read="memory")
+    parts = Pipeline(source).holdout(0.25)
+    uncached = [_tags(_tagged(part)) for part in parts]
+    assert uncached[0] and uncached[1]
+    assert [_tags(_tagged(part).cache(generation), read) for part in parts] == uncached
+
+
+def test_a_holdout_by_a_field_its_cached_step_drops_reads_the_parts_it_reads_uncached():
+    """A hash holdout by `id` written before a step that keeps only a tag: the holdout reads `id` on
+    the inputs, so the generation of that step stands in for both parts as the step does."""
+    from dew.data.compile import publish
+    from dew.data.pipeline import Pipeline
+
+    def renamed(pipeline):
+        return pipeline.map(lambda row: {"tag": row["id"] * 10}, identity="renamed@1")
+
+    source = Memory([{"id": index} for index in range(24)])
+    generation = publish(renamed(Pipeline(source)), _cache(), read="memory")
+    parts = Pipeline(source).holdout(0.25, key="id")
+    cached = [_tags(renamed(part).cache(generation)) for part in parts]
+    assert cached == [_tags(renamed(part)) for part in parts]
+
+
+def test_a_records_holdout_over_missing_rows_and_a_dropping_step_reads_the_inputs_it_holds_out():
+    """A store with missing rows and a step that drops odd ids: the generation holds the rows of the
+    inputs the step kept, none for a missing one, so the first five inputs held out read their
+    rows from it, not the generation's first rows, as the chain does uncached."""
+    from dew.data.compile import publish
+    from dew.data.pipeline import Pipeline
+
+    def even(pipeline):
+        return pipeline.filter_map(
+            lambda row: {**row, "tag": row["id"] * 10} if row["id"] % 2 == 0 else Rejected("odd"),
+            identity="even@1")
+
+    source = Memory([None if index in (1, 4) else {"id": index} for index in range(16)])
+    generation = publish(even(Pipeline(source)), _cache(), read="memory")
+    parts = Pipeline(source).holdout(records=5)
+    assert [_tags(even(part).cache(generation)) for part in parts] == [_tags(even(part)) for part in parts]
+
+
+def test_a_step_that_reads_its_index_before_a_generation_under_a_holdout_is_refused():
+    """A step that tags each row with its position sees the holdout's positions uncached and the
+    store's in a generation of the whole store, so the generation can't stand in under the holdout;
+    a cache of the part, which fills from the part's own positions, reads what the chain reads."""
+    from dew.data.compile import publish
+    from dew.data.pipeline import Pipeline
+
+    def placed(pipeline):
+        return pipeline.map_with_index(lambda index, row: {**row, "tag": index}, identity="placed@1")
+
+    source = Memory([{"id": index} for index in range(12)])
+    generation = publish(placed(Pipeline(source)), _cache(), read="memory")
+    trained, _ = Pipeline(source).holdout(records=4)
+    with pytest.raises(ValueError):
+        _tags(placed(trained).cache(generation))
+    assert _tags(placed(trained).cache(_cache())) == _tags(placed(trained)) == list(range(8))
+
+
+def test_a_generation_a_stream_filled_stands_in_under_a_records_holdout():
+    """A generation filled by a streamed read keys its inputs by shard and row; under a records
+    holdout it reads the rows of the inputs held out, as the chain does uncached."""
+    from dew.data.compile import publish
+    from dew.data.pipeline import Pipeline
+
+    source = Memory([{"id": index} for index in range(12)])
+    generation = publish(_tagged(Pipeline(source)), _cache(), read="streamed")
+    parts = Pipeline(source).holdout(records=5)
+    cached = [_tags(_tagged(part).cache(generation)) for part in parts]
+    assert cached == [_tags(_tagged(part)) for part in parts]
