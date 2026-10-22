@@ -12,12 +12,11 @@ import numpy as np
 import optax
 import pytest
 from diffusion_stubs import batch_for
-from diffusion_support import images_of, saved_after_one_step
+from diffusion_support import TanhLayer, images_of, saved_after_one_step
 from flax import linen as nn
 from reference_error import assert_as_exact_as_the_reference, float64_terms, widened
 
 import dew
-from dew.checkpoints import Checkpoints
 from dew.config import ModelConfig, ObjectiveConfig, TrainerConfig
 from dew.diffusion.presets import Flow
 from dew.nn.backbones import SimpleDiT
@@ -62,12 +61,6 @@ def test_a_head_is_stylegan_ts_at_grid_height_one():
 STEP = np.load(Path(__file__).resolve().parent / "fixtures" / "ladd" / "step.npz")
 
 
-class Layer(nn.Module):
-    @nn.compact
-    def __call__(self, tokens):
-        return jnp.tanh(tokens @ self.param("kernel", nn.initializers.zeros, (tokens.shape[-1],) * 2))
-
-
 class Tokens(nn.Module):
     """`tools/ladd_reference.py`'s stand-in velocity network at Dew's model
     time (t times 1000): the sample as one token plus the time, two layers
@@ -82,7 +75,7 @@ class Tokens(nn.Module):
         tokens = (flat @ self.param("embed", nn.initializers.zeros, (flat.shape[-1], self.width))
                   + (time / 1000).reshape(-1, 1, 1)
                   * self.param("time", nn.initializers.zeros, (self.width,)))
-        layer_b = Layer(name="layer_b")(Layer(name="layer_a")(tokens))
+        layer_b = TanhLayer(name="layer_b")(TanhLayer(name="layer_a")(tokens))
         head = self.param("head", nn.initializers.zeros, (self.width, flat.shape[-1]))
         return (layer_b @ head).reshape(x.shape)
 
@@ -188,15 +181,8 @@ def runs(tmp_path_factory):
         text=TextCondition(encoder="char_table", checkpoint="char_table"),
         objective=ObjectiveConfig("diffusion",
                                   {"solver": Euler(), "guidance": None, "steps": 2, "ema_decay": None}))
-    objective = teacher.build()
-    trainer = Trainer(objective, optax.adam(1e-2), key=jax.random.PRNGKey(0))
-    state = trainer.initial_state()
-    batch = batch_for(objective, 4)
-    state, *_ = trainer.compile(state, batch)(state, batch)
-    checkpoints = Checkpoints(str(root / "teacher"))
-    checkpoints.save(1, state, None, artifact=objective.inference_record())
-    checkpoints.wait()
-    teacher.save(str(root / "teacher"))
+    _, _, batch = saved_after_one_step(teacher, lambda task: batch_for(task, 4), root / "teacher", 1e-2,
+                                       key=0)
     student = dataclasses.replace(teacher, objective=ObjectiveConfig("ladd", {
         "teacher_run": str(root / "teacher"), "feature_layers": ["dit_block_0", "dit_block_1"], "cmap_dim": 8,
         "kernel_size": [3, 3], "solver": Consistency(), "steps": 2, "ema_decay": None}))
@@ -253,7 +239,7 @@ def test_each_side_trains_on_its_own_loss(runs):
 
 def test_a_saved_student_samples_in_one_step(runs, tmp_path):
     config, batch = runs
-    task, state = saved_after_one_step(config, batch, tmp_path / "student", 1e-3)
+    task, state, _ = saved_after_one_step(config, batch, tmp_path / "student", 1e-3)
     restored = TextToImage.from_run(str(tmp_path / "student"))
     assert TEACHER not in restored.variables and DISCRIMINATOR not in restored.variables["params"]
     expected = task.pipeline(state, ema=False)(["a red bird"], key=9).host().images
