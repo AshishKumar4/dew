@@ -30,6 +30,7 @@ from dew.inference.banks import SafetensorsBanks
 from dew.interop.hf_decoders import translate_config
 from dew.objectives.base import merge
 from dew.registry import models
+from dew.telemetry.benchmark import resident_memory
 from dew.training import Layout, MeshSpec
 
 
@@ -50,12 +51,8 @@ class DiskConfig:
 
 
 def resident_status():
-    with open("/proc/self/status") as handle:
-        wanted = {"VmRSS", "RssAnon", "RssFile", "VmHWM"}
-        return {name.rstrip(":"): int(rest.split()[0]) * 1024
-                for line in handle if (fields := line.split(None, 1))
-                and (name := fields[0].rstrip(":")) in wanted
-                for rest in fields[1:]}
+    memory = resident_memory()
+    return {name: memory[name] for name in ("VmRSS", "RssAnon", "RssFile", "VmHWM")}
 
 
 def storage_reads():

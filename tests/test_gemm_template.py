@@ -538,6 +538,130 @@ def test_the_fused_epilogue_keeps_the_programs_value(generation_name, consumer):
                         seeds=SEEDS, truth_fn=truth)
 
 
+def rms_norm(x, weight, epsilon=1e-6):
+    """An RMS norm of the residual stream as a model writes it: statistics at least fp32 (float64 for the
+    float64 truth), one rounding."""
+    wide = _wide(x)
+    mean_square = jnp.mean(wide * wide, axis=-1, keepdims=True)
+    return (wide * jax.lax.rsqrt(mean_square + epsilon) * weight).astype(x.dtype)
+
+
+def _normed_truth(sizes, x, w, weight):
+    """The float64 truth of a normed operand's grouped product."""
+    matrix = w.astype(jnp.bfloat16).astype(x.dtype)
+    return jax.lax.ragged_dot(rms_norm(x, weight), matrix, sizes, preferred_element_type=x.dtype)
+
+
+def dew_rms_norm(x, weight):
+    """Dew's own RMS norm (its XLA body, checkpointed), as a model's block calls it."""
+    from dew.nn.attention import rms_normalized
+    return rms_normalized(x, weight, 1e-6, x.dtype, scale_offset=False, scale_after_cast=False,
+                          fp32_statistics=True, implementation="xla")
+
+
+def relu(x, weight):
+    """A producer with a custom derivative (ReLU's, zero at zero) and a depth weight."""
+    return (jax.nn.relu(_wide(x)) * weight).astype(x.dtype)
+
+
+@pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))
+def test_a_normed_operand_runs_in_the_prologue_with_the_programs_value(generation_name):
+    """Under `fuser.fuse`, an RMS norm producing the product's left operand runs in the kernels' prologue
+    on each loaded tile, its row statistic in XLA before the product (the route says so), with the
+    unfused program's value: as exact as it, from float64."""
+    sizes = jnp.asarray(SIZES)
+
+    def draw(seed):
+        x, w, _, nw, *_ = _draw(seed)
+        return x, w, nw
+
+    def fusing(x, w, weight):
+        return fused.fusible_gemm(rms_norm(x, weight), w, sizes, interpret_on_cpu=True).astype(jnp.bfloat16)
+
+    def unfused(x, w, weight):
+        return template.gemm(rms_norm(x, weight), w, sizes, out_dtype=jnp.bfloat16)
+
+
+    with generation.assumed(generation_name), generation.routes() as taken:
+        assert_as_exact(jax.jit(fuser.fuse(fusing)), jax.jit(unfused), draw, "normed operand", seeds=SEEDS,
+                        truth_fn=functools.partial(_normed_truth, sizes))
+    assert {route.kernel for route in taken if route.choice == 'gemm_prologue'} == {'fused'}
+
+
+@pytest.mark.parametrize("producer", [rms_norm, dew_rms_norm, relu], ids=lambda producer: producer.__name__)
+def test_a_fused_producers_gradients_are_its_own(producer):
+    """Every input's gradient through a producer fused into the prologue is the unfused program's: the
+    operand's cotangent goes back through the producer's own VJP, so a norm's two paths from its input
+    join where the producer joins them and a custom derivative (ReLU's at zero) stays its own; Dew's
+    checkpointed norm fuses too (the route says so)."""
+    sizes = jnp.asarray(SIZES)
+
+    def draw(seed):
+        x, w, _, nw, *_ = _draw(seed)
+        x = x.at[:4].set(0)  # a ReLU's zero, where its custom derivative differs from max(x, 0)'s
+        return x, w, nw
+
+    def loss(gemm, transform=lambda value: value):
+        def value(x, w, weight):
+            return jnp.sum(gemm(producer(x, weight), w).astype(jnp.float32))
+        return jax.grad(transform(value), argnums=(0, 1, 2))
+
+    def fused_gemm(operand, w):
+        return fused.fusible_gemm(operand, w, sizes, interpret_on_cpu=True)
+
+    def plain_gemm(operand, w):
+        return template.gemm(operand, w, sizes, out_dtype=jnp.float32)
+
+    def truth_gemm(operand, w):
+        matrix = w.astype(jnp.bfloat16).astype(operand.dtype)
+        return jax.lax.ragged_dot(operand, matrix, sizes, preferred_element_type=operand.dtype)
+
+    with generation.assumed("sm80"), generation.routes() as taken:
+        assert_as_exact(jax.jit(loss(fused_gemm, fuser.fuse)), jax.jit(loss(plain_gemm)), draw,
+                        f"{producer.__name__} gradients", seeds=SEEDS, truth_fn=loss(truth_gemm))
+    assert {route.kernel for route in taken if route.choice == 'gemm_prologue'} == {'fused'}
+
+
+def test_a_one_row_normed_operand_fuses():
+    """A one-row operand's row statistic keeps its rows axis: the product of one normed row, as exact as
+    the unfused program from float64."""
+    sizes = jnp.asarray([1] + [0] * (len(SIZES) - 1))
+
+    def draw(seed):
+        x, w, _, nw, *_ = _draw(seed)
+        return x[:1], w, nw
+
+    def fusing(x, w, weight):
+        return fused.fusible_gemm(rms_norm(x, weight), w, sizes, interpret_on_cpu=True)
+
+    def unfused(x, w, weight):
+        return template.gemm(rms_norm(x, weight), w, sizes, out_dtype=jnp.float32)
+
+
+    with generation.assumed("sm80"), generation.routes() as taken:
+        assert_as_exact(jax.jit(fuser.fuse(fusing)), jax.jit(unfused), draw, "one normed row", seeds=SEEDS,
+                        truth_fn=functools.partial(_normed_truth, sizes))
+    assert {route.kernel for route in taken if route.choice == 'gemm_prologue'} == {'fused'}
+
+
+@pytest.mark.parametrize(("consumer", "kernel", "code"), [(bias_cast, 'fused', None),
+                                                          (positional, 'xla', 'reads_position')],
+                         ids=("tiled", "positional"))
+def test_a_consumer_the_kernels_cannot_take_reports_its_route(consumer, kernel, code):
+    """A consumer fused into the epilogue reports so; one left to XLA reports why, so a model that loses
+    its fusion shows where (`generation.route`'s 'gemm_epilogue')."""
+    sizes = jnp.asarray(SIZES)
+    x, w, _, _, b, u, *_ = _draw(0)
+
+    def fusing(x, w, b, r):
+        return consumer(fused.fusible_gemm(x, w, sizes, interpret_on_cpu=True), b, r)
+
+    with generation.assumed("sm80"), generation.routes() as taken:
+        jax.jit(fuser.fuse(fusing)).trace(x, w, b, u[:, :WIDTH])
+    [found] = [route for route in taken if route.choice == 'gemm_epilogue']
+    assert found.kernel == kernel and (found.refusal is None if code is None else found.refusal.code == code)
+
+
 @lowers("sm90")
 @pytest.mark.parametrize("launch", [grouped_matmul.MosaicGmm(), grouped_matmul.MosaicTgmm()],
                          ids=lambda launch: type(launch).__name__)
@@ -1078,3 +1202,37 @@ def test_an_interpreted_fp32_sum_that_cancels_at_mixed_magnitudes_is_within_its_
     terms = 2.0 ** 61 + 1.0
     gamma = 3 * np.finfo(np.float64).eps / (1 - 3 * np.finfo(np.float64).eps)
     assert abs(found - 1.0) <= gamma * terms
+
+
+HOOKED_RECEIPTS = {
+    # (shape, case): (Mosaic ms, Triton ms), GMMSB-h100-main at eb378b58d (an H100's tools/bench_scoreboard).
+    ("llama-3-8b gate_up", "plain"): (5.925, 10.191),
+    ("llama-3-8b gate_up", "norm"): (8.171, 12.815),
+    ("llama-3-8b gate_up", "bias"): (5.970, 9.322),
+    ("qwen3-8b gate_up", "plain"): (4.919, 8.818),
+    ("qwen3-8b gate_up", "norm"): (6.950, 11.036),
+    ("qwen3-8b gate_up", "bias"): (4.996, 7.912),
+}
+"""The two Hopper launches' measured times for a dense projection, plain and with each hook the chooser
+ranks right (the gated prologue joins once the model's facts rank it, row 1336)."""
+
+@pytest.mark.parametrize(("shape", "case"), list(HOOKED_RECEIPTS), ids=lambda key: str(key))
+def test_hoppers_chooser_against_the_hooked_receipts(shape, case):
+    """The chooser's launch for a hooked dense projection on an H100 is the one measured faster."""
+    width = {"llama-3-8b gate_up": 28672, "qwen3-8b gate_up": 24576}[shape]
+    bf16, f32 = (functools.partial(jax.ShapeDtypeStruct, dtype=dtype)
+                 for dtype in (jnp.bfloat16, jnp.float32))
+    x, w = bf16((16384, 4096)), bf16((4096, width))
+    hooks = {"plain": {},
+             "norm": {"prologue": normed, "prologue_operands": ((f32((16384,)), ("rows",)),
+                                                                 (f32((4096,)), ("depth",)))},
+             "bias": {"epilogue": biased, "epilogue_operands": ((f32((width,)), ("columns",)),)}}[case]
+
+    def product(x, w):
+        return template.gemm(x, w, None, out_dtype=jnp.bfloat16, **hooks)
+
+    with generation.assumed("sm90"), generation.routes() as taken:
+        jax.jit(product).trace(x, w)
+    mosaic, triton = HOOKED_RECEIPTS[(shape, case)]
+    faster = "mosaic_gpu" if mosaic < triton else "triton"
+    assert {route.kernel for route in taken if route.choice == 'grouped_matmul'} == {faster}

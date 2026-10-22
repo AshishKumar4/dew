@@ -20,7 +20,7 @@ from collections.abc import Mapping
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import base, cost
 
-SCHEMA = 1
+SCHEMA = 2
 """The features' format, raised when a field changes meaning."""
 
 
@@ -72,7 +72,8 @@ def _predictions(costed: cost.Cost, facts: generation.GpuTarget) -> dict[str, fl
       (above one, the launch is the tensor cores' to bound, below, memory's);
     - `waves`, the programs over what the multiprocessors hold at once, and `tail`, the share of the
       last wave's slots no program fills;
-    - `staged_per_step`, shared-memory bytes a program moves per pipeline step;
+    - `staged_per_step`, shared-memory bytes a program moves per pipeline step beside its matrix
+      instructions, and `serial_per_step`, those it moves between them, which they wait for;
     - `hidden_steps`, the steps a stage in flight covers (`stages - 1`) and `waiting_share`, the waiting
       term's share beside the resident programs' service time (`cost.program_seconds`,
       `cost.waiting_seconds`, as `cost.seconds` reads them)."""
@@ -97,6 +98,7 @@ def _predictions(costed: cost.Cost, facts: generation.GpuTarget) -> dict[str, fl
         'ridge': intensity / balance if intensity is not None and balance else None,
         'waves': waves, 'tail': tail,
         'staged_per_step': costed.program_staged / costed.steps if costed.steps else None,
+        'serial_per_step': costed.serial_staged / costed.steps if costed.steps else None,
         'hidden_steps': max(costed.stages - 1, 1),
         'waiting_share': (waiting / (waiting + costed.resident * program)
                           if waiting is not None and program is not None and waiting + program else None),

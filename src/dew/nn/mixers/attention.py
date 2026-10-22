@@ -53,15 +53,7 @@ from dew.nn.mixer_base import QKV_RESIDUALS, MixerBase, MixerContext
 from dew.nn.ngpt import NGPT, gain, unit
 from dew.nn.precision import at_least_fp32, float32_dot_general, rounded_to, scaled
 from dew.nn.protocols import ProjectionGroup
-from dew.nn.rope import (
-    LongRopeScaling,
-    axis_halves,
-    axis_tables,
-    mrope_tables,
-    rotary_freqs,
-    rotate,
-    yarn_rope_freqs,
-)
+from dew.nn.rope import LongRopeScaling, axis_halves, axis_tables, mrope_tables, rotary_freqs, rotate
 from dew.nn.sharding import HEADS, KV_HEADS, constrain, logical_axes
 
 
@@ -470,17 +462,13 @@ class CausalSelfAttention(nn.Module):
                 raise ValueError("M-RoPE requires default partial rotary")
             return mrope_tables(rotary_positions, self.mrope_section, self._rot_dim() or self.ctx.head_dim,
                                 self.ctx.rope_theta, dtype=dtype)
-        if self.ctx.yarn is None:
-            return rotary_freqs(
-                rotary_positions, self.ctx.head_dim, self.ctx.rope_theta, rot_dim=self._rot_dim(),
-                partial_rotary_type=self.ctx.partial_rotary_type, rope_scaling=self.ctx.rope_scaling,
-                dtype=dtype, reach=reach)
-        if self.ctx.partial_rotary_factor is not None or self.ctx.rope_scaling is not None:
-            raise ValueError(
-                "yarn rotates whole heads at its own frequencies, so it takes "
-                "neither partial_rotary_factor nor rope_scaling")
-        return yarn_rope_freqs(rotary_positions, self.ctx.head_dim, self.ctx.rope_theta, self.ctx.yarn,
-                               dtype=dtype)
+        if self.ctx.yarn is not None and self.ctx.rope_scaling is not None:
+            raise ValueError("yarn and rope_scaling are two rope scalings; a layer takes one")
+        return rotary_freqs(
+            rotary_positions, self.ctx.head_dim, self.ctx.rope_theta, rot_dim=self._rot_dim(),
+            partial_rotary_type=self.ctx.partial_rotary_type,
+            rope_scaling=self.ctx.rope_scaling if self.ctx.yarn is None else self.ctx.yarn,
+            dtype=dtype, reach=reach)
 
     def _metadata_mask(self, metadata: AttentionMetadata | None, slots, counted,
                        batch: int, length: int, key_length: int, decode: bool):

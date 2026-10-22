@@ -25,8 +25,6 @@ likelihood, which only the trainer's rescoring has.
 from __future__ import annotations
 
 import math
-import os
-import shutil
 import threading
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
@@ -377,8 +375,8 @@ class SafetensorsReload:
     `source.save` writes the weights, the derived config and the tokenizer
     files into `directory`, the directory every replica was launched on (a
     shared one when replicas span hosts). Floating-point leaves are cast to
-    `dtype` first. The files are staged beside `directory` and moved in with
-    `os.replace`, so no engine reads a half-written file. `engines` are the
+    `dtype` first. The source's writers replace each file whole (`dew.files.replacing`) and
+    publish a sharded index last, so no engine reads a half-written file. `engines` are the
     replicas' root URLs, not their `/v1` API URLs, and `timeout` bounds each
     HTTP call in seconds. The push fails if a call answers with any status
     but 200, or, for a call that reports its outcome, with a `success` that
@@ -426,14 +424,7 @@ class SafetensorsReload:
         agreed("weight export", lambda: None if served is None else self._save(served))
 
     def _save(self, variables: Variables) -> None:
-        directory = Path(self.directory)
-        staging = directory.with_name(f".{directory.name}.staging")
-        shutil.rmtree(staging, ignore_errors=True)
-        self.source.save(staging, variables=variables)
-        directory.mkdir(parents=True, exist_ok=True)
-        for written in staging.iterdir():
-            os.replace(written, directory / written.name)
-        staging.rmdir()
+        self.source.save(self.directory, variables=variables)
 
     def __call__(self, variables: Variables, version: int) -> None:
         self.write(variables)
