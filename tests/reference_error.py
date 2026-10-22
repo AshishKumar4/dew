@@ -1,6 +1,6 @@
 """Dew's rounding error held to the reference's own, both measured from float64.
 
-The owner's gate (bible §7, 2026-10-20) is two checks. Check 1, on par (`assert_as_exact`): each
+The owner's gate (bible §7) is two checks. Check 1, on par (`assert_as_exact`): each
 leaf's RMS error from float64, pooled over a site's declared seeds, within PARITY (1.5) times the
 reference's on the same inputs, its worst row within ROW_FACTOR of the reference's worst, with no floor
 of any kind; a draw may be an orbit's, the same values under an exact symmetry. Check 2, never wrong
@@ -23,7 +23,7 @@ retiring one-draw helper as it was until they convert (`assert_leaves_as_exact`,
 RETIRING_SITES, no new caller), and the K-order and element rules
 (`assert_as_exact_over_orders`, `assert_elements_as_exact`) hold
 ORDER_FACTOR, the factor their order count is derived for, until they judge
-through check 1 over orders (target 2026-10-28). SLOP020 (tools/lint_slop.py)
+through check 1 over orders. SLOP020 (tools/lint_slop.py)
 counts every comparison still outside check 1 until it is gone.
 
 What the rule cannot see is a difference below that factor: an attention
@@ -61,7 +61,7 @@ import numpy as np
 from dew.accuracy import distance, reduction_bound, within
 
 PARITY = 1.5
-"""The owner's factor (bible §7, 2026-10-20): each leaf's RMS error from float64 within 1.5 times the
+"""The owner's factor (bible §7): each leaf's RMS error from float64 within 1.5 times the
 reference's, on the same inputs, with no floor of any kind, check 1's (`assert_as_exact`) and every
 rule's here."""
 
@@ -71,7 +71,7 @@ row (`rows_over`). An RMS over every entry averages a few wrong rows into a
 large tensor, so each comparison also holds Dew's worst row to the
 reference's. The worst of many rows is an extreme value, not an average,
 and parts further by chance: over the suite's 3,660 comparisons whose rows
-differ from float64 at all (99 files, 2026-10-14), Dew's worst row over the
+differ from float64 at all (99 files), Dew's worst row over the
 reference's sat at a median of 0.21, p99 1.55 and at most 2.42 (Mixtral's
 exported logits). A row that differs rather than rounds moves further: the
 suite's deliberate failures, a GDN chunk's plain fp32 prefix and a MiMo tower
@@ -279,7 +279,7 @@ def _status(ratio: float, low: float, high: float, *, contained: bool = True) ->
     pass certifies the ratio's high end at most PARITY², whether the interval lies wholly at or under
     PARITY or is resolved (no wider than PARITY) with the ratio under it, and an over its low end above
     one. Straddling PARITY and wider than it, the leaf is inconclusive, as is a ratio or end that is not
-    a number. Not `contained`, the rule before 2026-10-21: the interval as it is, a leaf over PARITY
+    a number. Not `contained`, the earlier rule: the interval as it is, a leaf over PARITY
     by its ratio wherever the interval does not straddle it unresolved."""
     if not contained:
         if low <= PARITY < high and not _resolves(low, high):
@@ -541,7 +541,7 @@ def _staged(drawn, seeds: int, label: str, *, two_stage: bool = True) -> tuple[l
     `seeds`, a site whose every leaf passes (`_judgement`: its ratio, rows and values) passes; any leaf
     that does not draws the second stage, REDRAW times as many further seeds, and every leaf is judged
     again over all of them, that verdict final. Its findings, the leaves left inconclusive and the stage
-    reached. With `two_stage` false, the procedure before it (2026-10-21), for comparison: tails
+    reached. With `two_stage` false, the procedure before it, for comparison: tails
     PREVIOUS_TAILS, the interval as it is, only a leaf whose ratio is over PARITY drawing again."""
     tails = (LOWER_TAIL, UPPER_TAIL) if two_stage else PREVIOUS_TAILS
     draws = drawn(0, seeds)
@@ -572,7 +572,7 @@ def _logged(label: str, stage: int, verdict: str) -> None:
 
 
 def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn=None) -> None:
-    """Check 1 of the owner's gate (bible §7, 2026-10-20): on par. Each leaf's RMS error from float64,
+    """Check 1 of the owner's gate (bible §7): on par. Each leaf's RMS error from float64,
     pooled over the site's declared seeds, within PARITY times the reference's, and its worst row over
     those seeds within ROW_FACTOR times the reference's worst; each row of float64 zero (below RESOLUTION
     of its leaf where a live reference does not measure it, `_paired`) no further from it than
@@ -920,7 +920,7 @@ sites until they convert: no other rule reads it."""
 RETIRING_SITES = frozenset({"tests/test_architectures.py", "tests/test_flux2_source.py",
                             "tests/test_z_image_source.py", "tests/test_linear_attention.py",
                             "tests/test_mixers.py", "tests/test_ssd_kernel.py"})
-"""The sites that keep the retiring one-draw helper until they convert (Main, 2026-10-21): every other
+"""The sites that keep the retiring one-draw helper until they convert (Main's ruling): every other
 caller is refused (tools/lint_slop.py, SLOP020). tests/test_ssd_kernel.py's is the TPU kernel run
 interpreted on the CPU host, where check 1 measures the host's XLA lowering, not the kernel, and
 parts with the ISA (ledger row 1322); the compiled kernel is held to check 1 on a TPU."""
@@ -929,7 +929,7 @@ parts with the ISA (ledger row 1322); the compiled kernel is held to check 1 on 
 def assert_leaves_as_exact(dew, reference, truth, *, reductions: int = 1, terms=None,
                            rows: bool = True) -> None:
     """The one-draw rule before check 1, kept as it was for the sites that have not converted yet
-    (RETIRING_SITES, Main 2026-10-21) and for no other: tools/lint_slop.py refuses a new caller, and
+    (RETIRING_SITES, Main's ruling) and for no other: tools/lint_slop.py refuses a new caller, and
     it is deleted when the last of them converts. Each leaf of the tree `dew` within RETIRING_FACTOR
     times the matching leaf of `reference`'s RMS distance from float64 (`truth`), the three trees alike.
 
@@ -1231,7 +1231,7 @@ ORDER_FACTOR = 2.0
 `assert_elements_as_exact`), the one ORDERS is derived for: no parity, which
 is PARITY's alone. These rules judge by it until they judge through check 1
 over orders sized once and declared, validated against null controls and
-injected faults first (bible §10); target 2026-10-28."""
+injected faults first (bible §10)."""
 
 ORDERS = 52
 """The rounding orders the K-order rule takes on each side: the fewest K
@@ -1292,7 +1292,7 @@ def _assert_rows_over_orders(dew, members, label: str, sizes=None) -> None:
 STAGES = 4
 """The batches of ORDERS fresh orders an element is measured over before it fails
 (`assert_elements_as_exact`): the first, and a confirmation of each element still flagged in each of
-the rest. Provisional, from the review of the rule (2026-10-19): with errors independent across
+the rest. Provisional, from the review of the rule: with errors independent across
 elements and orders, K = ORDERS a side needs three stages for a familywise FALSE_FAILURE at Dory's
 43.5M elements where the errors are Gaussian, and four where they are Laplace. Shapes with heavier
 or rarer tails (a Student t of 3 degrees, rare bf16 flips) are certified at none of these: the stage
