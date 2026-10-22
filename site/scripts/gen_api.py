@@ -563,16 +563,16 @@ class Bound:
 
 def reached(package: griffe.Module, dotted: str) -> griffe.Object | None:
     """The Dew object an import's dotted path names, or None for another package's name or one Dew
-    does not have."""
+    does not have; an alias that does not resolve raises `Unresolved`."""
     head, *parts = dotted.split(".")
     if head != P.package:
         return None
     current: griffe.Object = package
-    try:
-        for part in parts:
-            current = resolve(current.members[part])
-    except (KeyError, Unresolved):
-        return None
+    for part in parts:
+        member = current.members.get(part)
+        if member is None:
+            return None
+        current = resolve(member)
     return current
 
 
@@ -600,12 +600,17 @@ def unresolved_uses(package: griffe.Module, home: dict[str, str], pages: dict[st
             return None if inner is None else [*inner, node.attr]
         return None
 
-    # The module scope's names: the next unit's, where this one neither imports nor binds them otherwise.
-    module = scopes.nodes_of(tree.body)
-    rebound = set(scopes.binders(module))
+    # Where each name an `Instance` holds still holds it, read like the imports: the module scope's
+    # `name = Class(...)` statements left out, so that their names reach every scope that binds none.
     built = instances(tree, tables, package)
-    bound.instances = {name: held for name, held in bound.instances.items() if name not in rebound} | built
+    holders = {name: built.get(name) or bound.instances[name] for name in {*bound.instances, *built}}
+    rest = [statement for statement in tree.body
+            if not (isinstance(statement, ast.Assign) and len(statement.targets) == 1
+                    and isinstance(statement.targets[0], ast.Name) and statement.targets[0].id in built)]
+    held = {id(node): table for node, table in scopes.scoped(rest, dict.fromkeys(holders, ""), ())}
+    # The module scope's names are the next unit's.
     bound.imports = dict(tables[id(tree.body[0])]) if tree.body else bound.imports
+    bound.instances = {name: holders[name] for name in (held[id(rest[0])] if rest else holders)}
     called = {id(node.func) for node in ast.walk(tree) if isinstance(node, ast.Call)}
 
     # Only the outermost dotted name counts, so a method and its class are not counted twice.
@@ -618,17 +623,18 @@ def unresolved_uses(package: griffe.Module, home: dict[str, str], pages: dict[st
         path = chain(node)
         if path is None or ".".join(path) in seen:
             continue
-        table = tables[id(node)]
-        start = (reached(package, table[path[0]]) if path[0] in table
-                 else bound.instances.get(path[0]))
-        if start is None:
+        imported, instance = tables[id(node)].get(path[0]), path[0] in held.get(id(node), {})
+        if imported is None and not instance:
             continue
-        seen.add(".".join(path))
-        held = start if isinstance(start, Instance) else None
         try:
-            problem = unresolved_chain(start.cls if held else start, path, home, pages)
-            if problem is None and held is not None and id(node) in called and len(path) == 2:
-                problem = called_attribute(held.cls, path)
+            start = reached(package, imported) if imported is not None else holders[path[0]]
+            if start is None:
+                continue
+            seen.add(".".join(path))
+            kept = start if isinstance(start, Instance) else None
+            problem = unresolved_chain(start.cls if kept else start, path, home, pages)
+            if problem is None and kept is not None and id(node) in called and len(path) == 2:
+                problem = called_attribute(kept.cls, path)
         except Unresolved as error:
             problem = f"`{'.'.join(path)}`: {error}"
         if problem:
@@ -649,7 +655,10 @@ def instances(tree: ast.Module, tables: dict[int, Mapping[str, str]], package: g
         if not (isinstance(node, ast.Assign) and len(node.targets) == 1
                 and isinstance(node.targets[0], ast.Name) and isinstance(node.value, ast.Call)):
             continue
-        made = reached(package, scopes.resolved(node.value.func, tables[id(node.value.func)]))
+        try:
+            made = reached(package, scopes.resolved(node.value.func, tables[id(node.value.func)]))
+        except Unresolved:
+            continue
         if made is not None and made.is_class:
             built.setdefault(node.targets[0].id, []).append(made)
     return {name: Instance(classes[0]) for name, classes in built.items()
