@@ -25,7 +25,6 @@ time: `1 - u` for a uniform, the negated normal for a logit-normal.
 from __future__ import annotations
 
 import ast
-import contextlib
 import json
 import tarfile
 import types
@@ -37,7 +36,7 @@ import torch
 from diffusers import FlowMatchEulerDiscreteScheduler
 from diffusers.training_utils import compute_density_for_timestep_sampling, compute_loss_weighting_for_sd3
 from reference_source import CACHE, selected, simple_statements, verified
-from torch_precision import replaced
+from recorded_draws import fixed
 
 from dew.diffusion.presets import Flow
 
@@ -86,14 +85,6 @@ def statements(text: str) -> tuple[str, str]:
     return ast.get_source_segment(text, helper), "\n".join(simple_statements(text, main, STATEMENTS))
 
 
-@contextlib.contextmanager
-def drawn(base: np.ndarray):
-    """`torch.normal(mean, std, size)` and `torch.rand(size)` return `base`'s values."""
-    with replaced((torch, "normal", lambda mean, std, size, **_: mean + std * torch.from_numpy(base)),
-                  (torch, "rand", lambda size, **_: torch.from_numpy(base))):
-        yield
-
-
 def scheduler(name: str) -> FlowMatchEulerDiscreteScheduler:
     with tarfile.open(ROOT / "tests" / "fixtures" / f"{name}_source.tar.xz") as archive:
         config = json.loads(archive.extractfile("pipeline/scheduler/scheduler_config.json").read())
@@ -118,7 +109,7 @@ def main() -> None:
                  "noise_scheduler_copy": scheduler(name),
                  "accelerator": types.SimpleNamespace(device="cpu"),
                  "model_input": torch.zeros((DRAWS, 4, 2, 2))}
-        with drawn(base):
+        with fixed(torch.from_numpy(base)):
             exec(helper, scope)
             exec(lines, scope)
         weighting = np.broadcast_to(scope["weighting"].flatten().numpy(), (DRAWS,)).copy()

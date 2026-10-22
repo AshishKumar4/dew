@@ -8,17 +8,20 @@ upstream definition fails the generator instead of leaving a stale one in
 scope. `defined_in` (`definitions` for a URL) runs them in the generator's
 scope; a generator that retargets a dtype, drops a decorator or builds a
 class around them does so between `selected` and `ran`. `simple_statements`
-takes single lines out of a published function. `verified` keeps a
-reference file on disk, fetched once and checked against its pinned SHA-256
-on every use. `stub_torch_utils` stands in for the two `torch_utils` names
-NVIDIA's EDM and EDM2 networks import. `saved_fixture` writes a generator's
-arrays with its provenance as the suite reads them, and `recipe_images` draws the images a recipe names.
+takes single lines out of a published function. `verified` keeps a reference
+file on disk, fetched once and checked against its pinned SHA-256 on every
+use, and `imported` runs such a file as a module of its own.
+`stub_torch_utils` stands in for the two `torch_utils` names NVIDIA's EDM and
+EDM2 networks import. `saved_fixture` writes a generator's arrays with its
+provenance as the suite reads them, and `recipe_images` draws the images a
+recipe names.
 """
 
 from __future__ import annotations
 
 import ast
 import hashlib
+import importlib.util
 import urllib.request
 from collections.abc import Iterable
 from pathlib import Path
@@ -85,6 +88,15 @@ def verified(url: str, local: Path, digest: str) -> Path:
     if found != digest:
         raise RuntimeError(f"{local} has SHA-256 {found}, not the pinned {digest}")
     return local
+
+
+def imported(url: str, local: Path, digest: str, name: str):
+    """The file at `url`, kept at `local` and checked against `digest` (`verified`), run as the module
+    `name`."""
+    spec = importlib.util.spec_from_file_location(name, verified(url, local, digest))
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
 
 
 def _defined(node: ast.stmt) -> set[str]:

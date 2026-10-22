@@ -23,13 +23,12 @@ from the checkout with any torch that has float8_e4m3fn on the CPU:
     python tools/deepgemm_fp8_reference.py
 """
 
-import importlib.util
 from pathlib import Path
 
 import ml_dtypes
 import numpy as np
 import torch
-from reference_source import CACHE as UPSTREAM, saved_fixture, verified
+from reference_source import CACHE as UPSTREAM, imported, saved_fixture
 
 REPO = "deepseek-ai/DeepGEMM"
 COMMIT = "057ca5964aae0879ff2e0eb71ee05a3cb0ba3df7"
@@ -42,11 +41,8 @@ RANDOM = (((256, 384), 128), ((130, 259), 128), ((5, 7), 128), ((48, 32), 16), (
 
 def upstream():
     """DeepGEMM's math.py at `COMMIT`, fetched once and checked."""
-    path = verified(f"https://raw.githubusercontent.com/{REPO}/{COMMIT}/{SOURCE}", CACHE / SOURCE, SHA256)
-    spec = importlib.util.spec_from_file_location("deepgemm_math", path)
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
-    return module
+    return imported(f"https://raw.githubusercontent.com/{REPO}/{COMMIT}/{SOURCE}", CACHE / SOURCE, SHA256,
+                    "deepgemm_math")
 
 
 def spread(shape, seed):
