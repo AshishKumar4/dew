@@ -101,6 +101,7 @@ from dew.data.pipeline import (
     Shuffle,
     Slice,
     Stage,
+    TokenBudget,
     TokenSplit,
     Windows,
     Workers,
@@ -1588,7 +1589,9 @@ def _epoch_records(train: Pipeline, build: _Build) -> int | None:
     by a repeat that never ends, a training order's own (`_Build.batched`), or a
     mix of parts that never end, reads each part on from where it was, so it
     counts until every part has come round once (`Proportions.covering`), the
-    parts it mixes counted alike. A repeat written before a cache counts the
+    parts it mixes counted alike, unless a slice or a limit before its repeat
+    reads a view of the mix, whose pass it counts. An order a slice or a limit
+    bounds after its repeat counts no more than it reads. A repeat written before a cache counts the
     inputs a pass reads where the cache keeps one record for each, and none
     otherwise, ahead of reading them; phases are counted by none."""
     if not build.global_order:
@@ -1613,7 +1616,8 @@ def _epoch_records(train: Pipeline, build: _Build) -> int | None:
     def covered(pipeline: Pipeline, build: _Build) -> int | None:
         """The records of `pipeline` read on past its end in which every part comes round once."""
         source = pipeline.source
-        if not isinstance(source, Mixture):
+        once = pipeline.stages[:_until(pipeline.stages, (Repeat,))]
+        if not isinstance(source, Mixture) or any(isinstance(stage, (Slice, Limit)) for stage in once):
             return passed(pipeline, build)
         sizes = [covered(child, build.child(index)) for index, child in enumerate(source.pipelines)]
         known = [size for size in sizes if size is not None]
@@ -1624,8 +1628,17 @@ def _epoch_records(train: Pipeline, build: _Build) -> int | None:
     unending = isinstance(train.source, Mixture) and _unending(train)
     # A training order that repeats nowhere repeats for ever at its root (`_Build.batched`).
     if unending or (build.training and build.lowering.endless and not build.lowering.repeated):
-        return covered(train, build)
-    return passed(train, build)
+        count = covered(train, build)
+    else:
+        count = passed(train, build)
+    repeated, batched = _until(train.stages, (Repeat,)), _until(train.stages, (BatchStage, TokenBudget))
+    bounds = [stage for stage in train.stages[repeated:batched] if isinstance(stage, (Slice, Limit))]
+    if count is None or not bounds:
+        return count
+    # The records the bounded order holds, all of them read before its batch.
+    order = dataclasses.replace(train, stages=train.stages[:batched])
+    with _closing(build.records(order, DataPartition())) as rows:
+        return min(count, len(rows)) if isinstance(rows, pygrain.MapDataset) else count
 
 
 def _unending(pipeline: Pipeline) -> bool:
