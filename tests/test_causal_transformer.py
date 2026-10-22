@@ -48,7 +48,7 @@ SEEDS = {'decode': 16, 'kernels': 16, 'window kernels': 8, 'softcap': 32, 'route
          'xsa': 32, 'xsa decode': 8, 'grouped decode': 32, 'cached prefill': 8, 'packed cudnn': 8,
          'cudnn decode': 16, 'padded prefill': 8, 'right padded': 16, 'rotary': 8}
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada, and the GPU
-sites on an A100, 2026-10-22): the most any of a site's cases took."""
+sites on an A100): the most any of a site's cases took."""
 
 
 def drawn(model, batch=2, length=SEQ):
@@ -1409,7 +1409,7 @@ def test_right_padded_rows_attend_causally_with_no_mask(rng, causal):
 
 
 def _rotate_half_reference(x, freqs_cos, freqs_sin, scale=None):
-    """`dew.nn.rope`'s rotate-half as it was through 2026-10-06, and as the HF
+    """`dew.nn.rope`'s rotate-half as it was before its halves rotated in place, and as the HF
     decoders write it, `x cos + rotate_half(x) sin`, at least fp32."""
     cos = jnp.concatenate([freqs_cos, freqs_cos], axis=-1)
     sin = jnp.concatenate([freqs_sin, freqs_sin], axis=-1)
