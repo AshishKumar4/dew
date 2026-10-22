@@ -200,10 +200,9 @@ def test_a_mixture_that_is_not_one_is_refused(count, weights):
         mix(corpora, weights=weights)
 
 
-@pytest.mark.parametrize("weights, keys", [((1.0, 0.0), ("0:a", "0:b")), ((1.0, 2.0), ("0:a", "0:a")),
-                                           ((1.0,), ("0:a", "0:b"))])
-def test_the_members_a_mix_is_read_by_hold_one_positive_weight_and_one_distinct_key_each(weights, keys):
-    """What a lowering reads a mix by holds what a mixture does, and a key for each member that no
+@pytest.mark.parametrize("weights, keys", [((1.0, 2.0), ("0:a", "0:a")), ((1.0,), ("0:a", "0:b"))])
+def test_the_members_a_mix_is_read_by_hold_one_weight_and_one_distinct_key_each(weights, keys):
+    """What a lowering reads a mix by holds a mixture's weights, and a key for each member that no
     other member shares, as a mix saves each member's position under it."""
     from dew.data.mixing import Members
 
@@ -1271,18 +1270,22 @@ def test_corpora_recurring_across_phases_continue_where_grains_weighted_mix_left
         assert mine == [step[0] for step in taken(alone.train(DataPartition()), len(mine))]
 
 
-@pytest.mark.parametrize("weights", [(1, 10, 15), (0.3, 0.7), (71, 20, 9), (1.0,)])
-def test_dews_weighted_selection_reads_the_records_grains_mix_reads(weights):
+@pytest.mark.parametrize("weights, lengths", [((1, 10, 15), (300, 40, 900)), ((0.3, 0.7), (300, 300)),
+                                              ((71, 20, 9), (50, 800, 7)), ((1.0,), (12,))])
+def test_dews_weighted_selection_reads_the_records_grains_mix_reads(weights, lengths):
     """The selection Dew mixes indexed corpora by and counts a phase's prefix by reads each position
-    of the mixture from the corpus and record Grain's own weighted mix reads there."""
+    of the mixture from the corpus and record Grain's own weighted mix reads there, until the corpus
+    Grain's mix stops at would read a record twice; a corpus of no records is refused, as Grain
+    refuses it."""
     from dew.data.mixing import ProportionalSelection
 
-    parents = [pygrain.MapDataset.range(1000 * (index + 1), 1000 * (index + 1) + 300)
-               for index in range(len(weights))]
-    ours = pygrain.MapDataset.select_from_datasets(
-        parents, ProportionalSelection([len(parent) for parent in parents], weights))
+    parents = [pygrain.MapDataset.range(1000 * (index + 1), 1000 * (index + 1) + length)
+               for index, length in enumerate(lengths)]
+    ours = pygrain.MapDataset.select_from_datasets(parents, ProportionalSelection(lengths, weights))
     grains = pygrain.MapDataset.mix(parents, weights)
     assert len(ours) == len(grains) and list(ours) == list(grains)
+    with pytest.raises(ValueError):
+        ProportionalSelection((*lengths[:-1], 0), weights)
 
 
 def test_one_corpus_starts_past_its_offset_as_a_mixed_one_does():
