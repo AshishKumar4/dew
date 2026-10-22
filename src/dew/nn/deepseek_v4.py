@@ -57,7 +57,7 @@ from dew.nn.attention import (
     unweighted_rmsnorm,
 )
 from dew.nn.attention_sinks import sink_softmax
-from dew.nn.dense import Dense
+from dew.nn.dense import Dense, DenseGeneral
 from dew.nn.documents import document_mask
 from dew.nn.fake_quant import FakeQuantizing
 from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of, valid_order
@@ -199,26 +199,6 @@ def append_windows(kv, gate, slots, buffers, previous, rate: int, width: int):
         step, (buffers, previous, pooled, emitted, counts),
         (jnp.swapaxes(kv, 0, 1), jnp.swapaxes(gate, 0, 1), jnp.swapaxes(slots, 0, 1)))
     return pooled, emitted, buffers, previous
-
-
-class GroupedLinear(nn.Module):
-    """Block-diagonal grouped projection: `[..., g, in]` to `[..., g, features]`
-    through one `[g, in, features]` kernel (`DeepseekV4GroupedLinear`,
-    modeling_deepseek_v4.py:294-323, whose weight `[g * features, in]` is
-    this kernel with each group's block transposed)."""
-
-    groups: int
-    features: int
-    dtype: Dtype | None = None
-    precision: PrecisionLike = None
-
-    @nn.compact
-    def __call__(self, x):
-        kernel = self.param('kernel', nn.initializers.lecun_normal(),
-                            (self.groups, x.shape[-1], self.features), jnp.float32)
-        dtype = x.dtype if self.dtype is None else self.dtype
-        return float32_einsum('...gi,gio->...go', x.astype(dtype), kernel.astype(dtype),
-                          precision=self.precision)
 
 
 class CompressedEntries(FakeQuantizing):
@@ -601,8 +581,12 @@ class DeepseekV4Attention(FakeQuantizing):
         self.q_b_proj = dense(self.num_heads * self.head_dim, name='q_b_proj')
         self.kv_proj = dense(self.head_dim, name='kv_proj')
         self.kv_norm = norm(name='kv_norm')
-        self.o_a_proj = GroupedLinear(groups=self.o_groups, features=self.o_lora_rank,
-                                      dtype=self.dtype, precision=self.precision, name='o_a_proj')
+        # Block-diagonal over the head groups: one `[g, in, o_lora_rank]` kernel, the group its
+        # batch dim (`DeepseekV4GroupedLinear`, modeling_deepseek_v4.py:294-323, whose weight
+        # `[g * o_lora_rank, in]` is this kernel with each group's block transposed).
+        self.o_a_proj = DenseGeneral(self.o_lora_rank, batch_dims=0, use_bias=False, dtype=self.dtype,
+                                     precision=self.precision, dot_general=float32_dot_general,
+                                     name='o_a_proj')
         self.o_b_proj = dense(self.emb_features, name='o_b_proj')
         self.sinks = self.param('sinks', nn.initializers.zeros, (self.num_heads,), jnp.float32)
         if self.compressor == 'csa2':
@@ -798,7 +782,8 @@ class DeepseekV4Attention(FakeQuantizing):
         # The values are the rotated keys, so the rope slice of the output is
         # turned back at the query's position (:853-859).
         context = _rotate_rope(checkpoint_name(context, 'context'), cos, -sin)
-        mixed = self.o_a_proj(context.reshape(batch, length, self.o_groups, -1))
+        grouped = jnp.moveaxis(context.reshape(batch, length, self.o_groups, -1), 2, 0)
+        mixed = jnp.moveaxis(self.o_a_proj(grouped), 0, 2)
         return checkpoint_name(self.o_b_proj(mixed.reshape(batch, length, -1)), 'o_proj')
 
 
