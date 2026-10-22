@@ -627,6 +627,38 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
         raise Inconclusive("\n".join(unresolved))
 
 
+def merges(ours: np.ndarray, truth: np.ndarray) -> int:
+    """The entries `ours` merges that float64 keeps apart: in every group of entries rounded to one fp32
+    value, the entries past the first whose group spans more than two fp32 spacings in float64."""
+    flat, exact = np.ravel(ours), np.ravel(truth)
+    finite = np.isfinite(flat) & np.isfinite(exact)
+    flat, exact = flat[finite], exact[finite]
+    order = np.argsort(flat, kind="stable")
+    values = flat[order]
+    starts = np.flatnonzero(np.r_[True, values[1:] != values[:-1]])
+    sizes = np.diff(np.r_[starts, values.size])
+    merged = 0
+    for start, size in zip(starts[sizes > 1], sizes[sizes > 1], strict=True):
+        group = exact[order[start:start + size]]
+        if group.max() - group.min() > 2.0 * float(np.spacing(np.float32(values[start]))):
+            merged += int(size) - 1
+    return merged
+
+
+def assert_kept_apart(ours: int, reference: int, label: str) -> None:
+    """The stability invariant's second half, beside finiteness where float64 is: Dew's merges (`merges`)
+    over a site's draws no more than check 1's factor of the fp32 reference's own and a handful. Two
+    values meet by chance under either's rounding about as often, where an underflow or a saturation the
+    reference does not share merges whole runs of them."""
+    assert ours <= PARITY * reference + MERGE_SLACK, (
+        f"{label}: {ours} entries merged that float64 keeps apart, the reference {reference}")
+
+
+MERGE_SLACK = 8
+"""The merges allowed beyond the reference's, over a site's draws: chance ties under Dew's rounding that
+the reference's draws happen not to show."""
+
+
 def _moved(draws: _Draws, stage: int) -> tuple[list[str], list[str], bool]:
     """The leaves a change moves beyond rounding (`assert_moves`), why each other one does not, and
     whether any of those is unresolved (its interval still reaching above PARITY). A stage spends half of

@@ -13,6 +13,7 @@ from reference_error import (
     Inconclusive,
     assert_as_exact,
     assert_as_exact_as_the_reference,
+    assert_kept_apart,
     assert_leaves_as_exact,
     assert_moves,
     assert_same_artifact,
@@ -20,6 +21,7 @@ from reference_error import (
     distance,
     indexed_recording,
     input_digest,
+    merges,
     null_rate_bound,
     null_runs,
     seeds_for,
@@ -676,3 +678,21 @@ def test_a_change_moves_by_its_intervals_lower_end_and_one_leaf_is_enough():
 
     with pytest.raises(AssertionError):
         assert_moves(reference, infinite, errors, "infinite", seeds=8, truth_fn=truth)
+
+
+def test_the_merge_check_catches_a_collapse_the_reference_keeps_apart():
+    """The merge check refuses a run of small values flushed to zero and a run of gates saturated to one,
+    which the reference keeps apart, and passes a tie two roundings make by chance."""
+    rng = np.random.default_rng(0)
+    truth = np.concatenate([rng.uniform(1e-12, 1e-11, 64), rng.normal(size=64)])
+    reference = truth.astype(np.float32)
+    flushed = np.concatenate([np.zeros(64), truth[64:]]).astype(np.float32)
+    with pytest.raises(AssertionError):
+        assert_kept_apart(merges(flushed, truth), merges(reference, truth), "flushed")
+    gates = 1.0 - rng.uniform(1e-6, 1e-3, 64)
+    with pytest.raises(AssertionError):
+        assert_kept_apart(merges(np.ones(64, np.float32), gates), merges(gates.astype(np.float32), gates),
+                          "saturated")
+    truth = np.asarray([0.875, 0.875 + 2e-7, 0.5])
+    assert_kept_apart(merges(np.asarray([0.875, 0.875, 0.5], np.float32), truth),
+                      merges(truth.astype(np.float32), truth), "a tie")
