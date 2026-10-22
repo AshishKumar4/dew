@@ -200,8 +200,10 @@ def _materialized_depthwise_3x3(lhs: jax.Array, rhs: jax.Array, dilation: int) -
     height, width = lhs.shape[1:3]
     border = ((0, 0), (dilation, dilation), (dilation, dilation), (0, 0))
     padded = jnp.pad(_barrier(lhs.astype(jnp.float32)), border)
-    # Onto a positive zero: an output whose nine taps are all negative zero is positive zero here and
-    # negative zero in the shifted form, which starts from its first product.
+    # Onto a positive zero, as main summed. XLA:CPU keeps it, so an output whose nine taps are all
+    # negative zero is positive zero there; XLA:CUDA, where this form runs, drops the zero, so the
+    # output is the sum's negative zero, as the shifted form's is (H100), where cuDNN's convolution
+    # gives positive zero (ledger 1361).
     products = _taps(padded, _barrier(rhs.astype(jnp.float32)), dilation, height, width)
     return _barrier(_accumulated(jnp.zeros(lhs.shape, jnp.float32), products)).astype(lhs.dtype)
 

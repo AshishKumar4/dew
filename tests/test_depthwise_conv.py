@@ -247,10 +247,12 @@ def test_depthwise_quantization_keeps_the_original_provider_output(training):
     np.testing.assert_array_equal(before, after)
 
 
+@pytest.mark.skipif(jax.default_backend() != "cpu", reason="XLA:CUDA drops the zero (ledger 1361)")
 def test_the_materialized_depthwise_sum_starts_from_a_positive_zero():
-    """The materialized form sums its nine taps onto a positive zero, so taps that are all negative
-    zero (a zero input under a negative kernel) give positive zero, where the barriered form keeps the
-    first product's, the sum's IEEE sign."""
+    """On the CPU the materialized form sums its nine taps onto a positive zero, so taps that are all
+    negative zero (a zero input under a negative kernel) give positive zero, where the barriered form
+    keeps the first product's, the sum's IEEE sign. XLA:CUDA drops the zero, and there both give
+    negative zero (the H100 old-against-new run)."""
     x = jnp.zeros((1, 6, 6, 4), jnp.float32)
     w = -jnp.ones((3, 3, 1, 4), jnp.float32)
     for dilation in (1, 2):
