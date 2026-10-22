@@ -381,10 +381,6 @@
    "comparisons": 8,
    "lane": "Training"
   },
-  "tests/test_jepa.py": {
-   "comparisons": 16,
-   "lane": "Models, Serving & RL"
-  },
   "tests/test_jit.py": {
    "comparisons": 2,
    "lane": "Training"
