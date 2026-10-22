@@ -1610,6 +1610,11 @@ def modelopt_nvfp4(config: Mapping[str, object], quantization: Mapping[str, obje
 # Dispatch from quantization_config
 # --------------------------------------------------------------------------
 
+class StorageRefused(ValueError):
+    """A source's storage format, named by its config, that the codecs cannot decode: refused before any
+    weight downloads (`source_quantization`)."""
+
+
 def _refuse_mlx(config: Mapping[str, object]) -> None:
     """Refuse MLX quantization by name.
 
@@ -1625,7 +1630,7 @@ def _refuse_mlx(config: Mapping[str, object]) -> None:
             and "quant_method" not in entry
             and {"bits", "group_size"} <= entry.keys()
         ):
-            raise ValueError(
+            raise StorageRefused(
                 f"{key} {dict(entry)!r} is MLX quantization ({entry['bits']}-bit weights in groups "
                 f"of {entry['group_size']}), which Dew does not dequantize; load the unquantized "
                 "safetensors repo it was converted from (the model card's base_model)")
@@ -1651,7 +1656,7 @@ def source_quantization(config: Mapping[str, object], *, scale_dtype: str | None
     if quantization is None:
         return None
     if not isinstance(quantization, Mapping):
-        raise ValueError(f"quantization_config must be an object, got {quantization!r}")
+        raise StorageRefused(f"quantization_config must be an object, got {quantization!r}")
     method = quantization.get("quant_method")
     if method == "fp8" and ("expert_dtype" in quantization or "expert_dtype" in config):
         # `fp8_format`'s blocks under ue8m0 scales, the only kind an E8M0
@@ -1662,11 +1667,11 @@ def source_quantization(config: Mapping[str, object], *, scale_dtype: str | None
         side = _square(block, "DeepSeek-V4's")
         experts = quantization.get("expert_dtype", config.get("expert_dtype"))
         if not ue8m0:
-            raise ValueError(
+            raise StorageRefused(
                 f"quantization_config declares expert_dtype, DeepSeek-V4's `.scale` storage, with scale_fmt "
                 f"{quantization.get('scale_fmt')!r}; those scales are powers of two, scale_fmt 'ue8m0'")
         if experts not in ("fp4", "fp8", None):
-            raise ValueError(f"expert_dtype {experts!r}: DeepSeek-V4 ships routed experts as fp4 E2M1 "
+            raise StorageRefused(f"expert_dtype {experts!r}: DeepSeek-V4 ships routed experts as fp4 E2M1 "
                              f"pairs or as fp8 blocks and nothing else")
         return deepseek_v4(side, fp4_experts=experts == "fp4", scale_dtype=scale_dtype)
     if method == "fp8" and quantization.get("store_dtype") is not None:
@@ -1674,7 +1679,7 @@ def source_quantization(config: Mapping[str, object], *, scale_dtype: str | None
         side = _square(block, "MiMo-V2.6's")
         stored, group = quantization["store_dtype"], quantization.get("mxfp4_block_size", GROUP)
         if stored != "mxfp4" or group != GROUP or ue8m0:
-            raise ValueError(f"quantization_config stores fp8 as {stored!r} in groups of {group!r}; this "
+            raise StorageRefused(f"quantization_config stores fp8 as {stored!r} in groups of {group!r}; this "
                              f"loader reads store_dtype 'mxfp4' in groups of {GROUP} beside float32 FP8 "
                              f"block scales")
         heads = config.get("num_key_value_heads")
@@ -1694,14 +1699,14 @@ def source_quantization(config: Mapping[str, object], *, scale_dtype: str | None
         # it from g_idx, so any group_size holds there.
         group = quantization.get("group_size")
         if not isinstance(group, int) or isinstance(group, bool) or group <= 0:
-            raise ValueError(f"awq group_size {group!r}: a positive group of inputs per scale")
+            raise StorageRefused(f"awq group_size {group!r}: a positive group of inputs per scale")
         return awq(_integer_bits(quantization, method), group, grid)
     if method == "gptq":
         return gptq(_integer_bits(quantization, method),
                     v1=quantization.get("checkpoint_format", "gptq") == "gptq", grid=grid)
     if method == "modelopt":
         return modelopt_nvfp4(config, quantization, grid)
-    raise ValueError(
+    raise StorageRefused(
         f"quantization_config names quant_method {method!r}; this loader reads fp8 (DeepSeek's "
         f"blocks and V4 `.scale` storage), mxfp4 (GPT OSS), compressed-tensors "
         f"({', '.join(COMPRESSED_TENSORS_FORMATS)} and mxfp4-pack-quantized), awq (AutoAWQ's gemm), "

@@ -59,6 +59,7 @@ def _route(config: dict, verified) -> tuple[str, str]:
     from transformers.models.auto.configuration_auto import CONFIG_MAPPING
 
     from dew.interop import decoder_parts, hf_decoders
+    from dew.interop.codecs import StorageRefused
     from dew.interop.pretrained import source_route
 
     if set(config) <= {"model_type", "architectures"}:
@@ -69,6 +70,8 @@ def _route(config: dict, verified) -> tuple[str, str]:
         route = source_route(config, verified=verified)
     except decoder_parts.DrafterRefused as error:
         return "by design", str(error)[:300]
+    except StorageRefused as error:
+        return "refused", f"storage format: {error}"[:300]
     except (KeyError, ValueError, TypeError) as error:
         if config["model_type"] not in CONFIG_MAPPING and config["model_type"] not in hf_decoders.families():
             return "remote code", "transformers has no class for it"
@@ -88,20 +91,22 @@ def classify(out: Path) -> None:
             if "config" in row and isinstance(row.get("model_type"), str)]
     from dew.interop import verify
 
-    probed: dict[str, VerifiedMapping | Exception] = {}
+    probed: dict[str, VerifiedMapping | tuple[type[Exception], tuple]] = {}
 
     def verified(config: dict) -> VerifiedMapping:
         """`verify.verify_mapping`, run once per model_type on its most downloaded model that no
-        registered family reads (the rows come ranked), its mapping or its refusal reused after."""
+        registered family reads (the rows come ranked), its mapping or its refusal reused after; a
+        refusal is kept as its type and arguments, not the probe's frames, and raised afresh."""
         model_type = config["model_type"]
         if model_type not in probed:
             try:
                 probed[model_type] = verify.verify_mapping(config)
             except (KeyError, ValueError, TypeError) as error:
-                probed[model_type] = error
+                probed[model_type] = (type(error), error.args)
         found = probed[model_type]
-        if isinstance(found, Exception):
-            raise found
+        if isinstance(found, tuple):
+            kind, arguments = found
+            raise kind(*arguments)
         return found
 
     models = []
