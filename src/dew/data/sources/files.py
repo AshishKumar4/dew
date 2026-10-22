@@ -457,27 +457,8 @@ class Files(Dataset):
             fs, path = Store(url, self.storage_options).resolve()
             offsets = []
             with _open_lines(fs, path) as file:
-                if self.kind == "csv":
-                    reader = csv.DictReader(_CsvLines(file))
-                    _ = reader.fieldnames
-                    while True:
-                        start = file.tell()
-                        try:
-                            next(reader)
-                        except StopIteration:
-                            break
-                        offsets.append((0, start, file.tell() - start))
-                else:
-                    while True:
-                        start = file.tell()
-                        line = file.readline()
-                        if not line:
-                            break
-                        if self.kind == "jsonl":
-                            if not line.strip():
-                                continue
-                            json.loads(line)
-                        offsets.append((0, start, len(line)))
+                names = _header(file) if self.kind == "csv" else None
+                offsets = [(0, start, size) for _, start, size in _line_records(self.kind, file, names)]
             encoded = io.BytesIO()
             np.save(
                 encoded,
@@ -871,7 +852,7 @@ class _IndexedLines:
         for url in self.source.paths:
             fs, path, _ = Store(url, self.source.storage_options).readable()
             with _open_lines(fs, path) as file:
-                headers.append(tuple(next(csv.reader(_CsvLines(file)))))
+                headers.append(_header(file))
         return tuple(headers)
 
     def __len__(self) -> int:
@@ -891,9 +872,39 @@ class _IndexedLines:
                 payload = file.read(int(entry["bytes"]))
         else:
             payload = fs.cat_file(path, start=offset, end=offset + int(entry["bytes"]))
-        if names is not None:
-            return next(csv.DictReader(io.StringIO(payload.decode()), fieldnames=names))
-        return json.loads(payload) if self.source.kind == "jsonl" else {"text": payload.decode()}
+        ((record, _, _),) = _line_records(self.source.kind, io.BytesIO(payload), names)
+        return record
+
+
+def _header(file: BinaryIO) -> tuple[str, ...]:
+    """A CSV file's field names, its first row, read from `file`, which is left past it."""
+    return tuple(next(csv.reader(_CsvLines(file)), ()))
+
+
+def _line_records(kind: str, file: BinaryIO, names: Sequence[str] | None = None,
+                  stop: int | None = None) -> Iterator[tuple[Batch, int, int]]:
+    """Each record of a `kind` line file from `file`'s position, with where its bytes start and how
+    many they are, until a record would start at `stop`: a CSV row of the fields `names` (its
+    quoted newlines its own), a JSON line (blank lines skipped) or a text line. The offsets an index
+    provisions, an indexed read of one record's bytes and a stream all read records by it."""
+    if kind == "csv":
+        reader = csv.DictReader(_CsvLines(file), fieldnames=names)
+        while stop is None or file.tell() < stop:
+            start = file.tell()
+            row = next(reader, None)
+            if row is None:
+                return
+            yield row, start, file.tell() - start
+        return
+    while stop is None or file.tell() < stop:
+        start = file.tell()
+        line = file.readline()
+        if not line:
+            return
+        if kind == "text":
+            yield {"text": line.decode()}, start, len(line)
+        elif line.strip():
+            yield json.loads(line), start, len(line)
 
 
 class _CsvLines(Iterator[str]):
@@ -928,29 +939,16 @@ class _LineIterator(grain.DatasetIterator):
         self.compression = infer_compression(self.path.lower())
         self.file = _open_lines(self.fs, self.path)
         self._opened = True
-        self.csv = csv.DictReader(_CsvLines(self.file)) if source.kind == "csv" else None
-        if self.csv is not None:
-            _ = self.csv.fieldnames
-        elif shard.start:
+        self.names = _header(self.file) if source.kind == "csv" else None
+        if self.names is None and shard.start:
             self.file.seek(shard.start - 1)
             if self.file.read(1) != b"\n":
                 self.file.readline()
+        self.records = _line_records(source.kind, self.file, self.names, shard.stop)
 
     def __next__(self) -> Batch:
-        if self.shard.stop is not None and self.file.tell() >= self.shard.stop:
-            raise StopIteration
-        if self.csv is not None:
-            return next(self.csv)
-        while True:
-            line = self.file.readline()
-            if not line:
-                raise StopIteration
-            if self.source.kind == "text":
-                return {"text": line.decode()}
-            if line.strip():
-                return json.loads(line)
-            if self.shard.stop is not None and self.file.tell() >= self.shard.stop:
-                raise StopIteration
+        record, _, _ = next(self.records)
+        return record
 
     def get_state(self) -> dict[str, int]:
         return {"offset": self.file.tell()}
@@ -963,8 +961,7 @@ class _LineIterator(grain.DatasetIterator):
             # Zstandard streams seek forward only; restoration starts from a fresh decoder.
             self.file.close()
             self.file = _open_lines(self.fs, self.path)
-            if self.csv is not None:
-                self.csv = csv.DictReader(_CsvLines(self.file), fieldnames=self.csv.fieldnames)
+            self.records = _line_records(self.source.kind, self.file, self.names, self.shard.stop)
         _seek_lines(self.file, offset)
 
     def close(self) -> None:
