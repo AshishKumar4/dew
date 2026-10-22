@@ -358,14 +358,19 @@ def token_data(args, *, packed: bool, loading: Loading) -> Loader:
     from dew.data.compile import compile
     from dew.data.sources.tokens import TokenFiles
 
-    def windows(store):
+    def held(store):
         if packed:
             return store.pipe(presets.lm, None, seq_len=args.seq_len, batch=BATCH)
         return store.pipe(presets.token_windows, seq_len=args.seq_len, batch=BATCH)
 
-    held = None if args.held_tokens is None else windows(TokenFiles(args.held_tokens))
-    return compile(windows(TokenFiles(args.tokens).shuffle(0).repeat()), validation=held, read="memory",
-                   loading=loading)
+    store = TokenFiles(args.tokens)
+    # Packed in the store's order and ordered after, so the pack is one plan over the whole store
+    # (`PackedSource`) whose windows the processes share; windows read by index are ordered first.
+    train = (store.pipe(presets.lm, None, seq_len=args.seq_len, batch=None).shuffle(0).repeat().batch(BATCH)
+             if packed else store.shuffle(0).repeat().pipe(presets.token_windows, seq_len=args.seq_len,
+                                                            batch=BATCH))
+    validation = None if args.held_tokens is None else held(TokenFiles(args.held_tokens))
+    return compile(train, validation=validation, read="memory", loading=loading)
 
 
 def mode_data(args) -> dict:
