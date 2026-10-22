@@ -65,3 +65,16 @@ class DiscreteNoiseScheduler(NoiseScheduler):
 
     def weight(self, t):
         return rows_taken(self.p2_loss_weights, self.index(t))
+
+
+class BetaTable(DiscreteNoiseScheduler):
+    """A schedule whose betas a named table makes from the step count and two endpoints (`table`),
+    the three kept as the schedule's record. The P2 weight arguments are `DiscreteNoiseScheduler`'s."""
+
+    table: staticmethod
+
+    def __init__(self, timesteps: int, beta_start: float, beta_end: float,
+                 p2_loss_weight_k: float = 1, p2_loss_weight_gamma: float = 1):
+        super().__init__(type(self).table(timesteps, beta_start, beta_end),
+                         p2_loss_weight_k=p2_loss_weight_k, p2_loss_weight_gamma=p2_loss_weight_gamma)
+        self.timesteps, self.beta_start, self.beta_end = timesteps, beta_start, beta_end

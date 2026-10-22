@@ -16,20 +16,24 @@ import shlex
 from dew.telemetry.builds import PACKAGE_INDEX
 
 #: Paths the remote side owns, and the only thing the commands agree on.
-VENV = "$HOME/dew-venv"
-ENV_FILE = "$HOME/.dew-env"
+VENV_NAME = "dew-venv"
+VENV = f"$HOME/{VENV_NAME}"
+ENV_NAME = ".dew-env"
+ENV_FILE = f"$HOME/{ENV_NAME}"
 RUNS = "dew-runs"
 RUNS_DIR = f"$HOME/{RUNS}"
 MOUNT_PATH = "$HOME/gcs_mount"
 DISK_MOUNT = "/mnt/persist"
+OPEN_FILES = 1048576
+"""The open-file limit a worker's shell, its PAM sessions and its systemd manager all take."""
 
 PACKAGE = "dewml"
 
 _ENV_LINES = (
-    'export PATH="$HOME/dew-venv/bin:$HOME/.local/bin:$PATH"',
+    f'export PATH="{VENV}/bin:$HOME/.local/bin:$PATH"',
     "export TOKENIZERS_PARALLELISM=false",
     "export WANDB_CACHE_DIR=/tmp/wandb-cache",
-    "ulimit -n 1048576 2>/dev/null || true",
+    f"ulimit -n {OPEN_FILES} 2>/dev/null || true",
 )
 
 _GCSFUSE_YML = """\
@@ -64,12 +68,12 @@ step "open file limits"
 limits=/etc/security/limits.conf
 grep -q "dew nofile" "$limits" || sudo -n tee -a "$limits" >/dev/null <<'LIMITS'
 # dew nofile
-* soft nofile 1048576
-* hard nofile 1048576
+* soft nofile @OPEN_FILES@
+* hard nofile @OPEN_FILES@
 LIMITS
 override=/etc/systemd/system.conf.d/99-dew-nofile.conf
 wanted="[Manager]
-DefaultLimitNOFILE=1048576"
+DefaultLimitNOFILE=@OPEN_FILES@"
 if [ "$(cat $override 2>/dev/null)" != "$wanted" ]; then
   sudo -n mkdir -p /etc/systemd/system.conf.d
   sudo -n tee "$override" >/dev/null <<<"$wanted"
@@ -101,7 +105,7 @@ step "environment"
 cat > "$ENV_FILE" <<'DEW_ENV'
 @ENV_LINES@
 DEW_ENV
-grep -q '.dew-env' "$HOME/.bashrc" || echo '. $HOME/.dew-env' >> "$HOME/.bashrc"
+grep -q '@ENV_NAME@' "$HOME/.bashrc" || echo '. @ENV_FILE@' >> "$HOME/.bashrc"
 mkdir -p "$RUNS_DIR"
 
 if [ -n "$GCS_BUCKET" ]; then
@@ -138,7 +142,7 @@ sudo -n kill -9 $pids
 STATUS = (
     "printf '%s|%s|%s|%s\\n' "
     '"$(uptime -p 2>/dev/null | sed s/^up.//)" '
-    '"$(pgrep -fc \'[d]ew-venv/bin/python\' || true)" '
+    f'"$(pgrep -fc \'[{VENV_NAME[0]}]{VENV_NAME[1:]}/bin/python\' || true)" '
     '"$(sudo -n lsof -t /dev/accel* 2>/dev/null | sort -u | wc -l)" '
     '"$(ls /dev/accel* 2>/dev/null | wc -l)"'
 )
@@ -173,7 +177,8 @@ def render(
         f'RUNS_DIR="{RUNS_DIR}"',
         f'MOUNT_PATH="{MOUNT_PATH}"',
     ]
-    body = _BODY.replace("@ENV_LINES@", "\n".join(_ENV_LINES))
+    body = (_BODY.replace("@ENV_LINES@", "\n".join(_ENV_LINES)).replace("@OPEN_FILES@", str(OPEN_FILES))
+            .replace("@ENV_FILE@", ENV_FILE).replace("@ENV_NAME@", ENV_NAME))
     body = body.replace("@GCSFUSE_YML@", _GCSFUSE_YML.rstrip("\n"))
     return "\n".join(header) + body
 
