@@ -49,9 +49,9 @@ from dew.nn.inputs import (
 from dew.nn.kernels.selection import select
 from dew.nn.kv_cache import PAGED, PLACES, TABLE, Append, KVCache, KVStore, filled_slots, rotated, write_cache
 from dew.nn.local_attention import local_attention
-from dew.nn.mixer_base import MixerBase, MixerContext
+from dew.nn.mixer_base import QKV_RESIDUALS, MixerBase, MixerContext
 from dew.nn.ngpt import NGPT, gain, unit
-from dew.nn.precision import at_least_fp32, rounded_to, scaled
+from dew.nn.precision import at_least_fp32, float32_dot_general, rounded_to, scaled
 from dew.nn.protocols import ProjectionGroup
 from dew.nn.rope import (
     LongRopeScaling,
@@ -215,7 +215,7 @@ class CausalSelfAttention(nn.Module):
     """Whether the queries, keys and values project through one kernel,
     `qkv_proj`, at init as from a checkpoint that stores them so (the Qwen 3.5
     and DeepSeek-V4.1 vision towers)."""
-    linear: Callable[..., Dense] = Dense
+    linear: Callable[..., Dense] = functools.partial(Dense, dot_general=float32_dot_general)
     """The projections' module: Gemma 4's vision tower clips their inputs and
     outputs (`dew.nn.vision.gemma4.Gemma4ClippableLinear`)."""
     nope: bool = False
@@ -555,7 +555,7 @@ class CausalSelfAttention(nn.Module):
         positions, segment_ids = tokens.positions if decode else tokens.places(), tokens.segments
         logical_positions = positions
         # The projections and the kernel's output carry the names a remat
-        # policy saves or offloads (decoder_block.RESIDUALS).
+        # policy saves or offloads (mixer_base.RESIDUALS).
         projected_kv = None
         group = self._group()
         if group is not None and self._packed():
@@ -1142,7 +1142,7 @@ class AttentionMixer(MixerBase):
     (`{"name": "attention", "fields": {"nope": true}}`).
     """
 
-    residuals = ('q_proj', 'k_proj', 'v_proj', 'kv_proj', 'output_gate', 'o_proj', 'context')
+    residuals = (*QKV_RESIDUALS, 'output_gate', 'o_proj', 'context')
 
     bidirectional_images: bool = False
     mrope_section: tuple[int, int, int] | None = None

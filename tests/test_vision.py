@@ -70,21 +70,29 @@ def load_fixture(name):
     }
 
 
-def test_siglip_tower_matches_the_reference_implementation():
-    """fp32 parity on the tiny SigLIP trunk, and the positions are live: with
-    them zeroed the trunk leaves the reference by more than 0.01."""
-    fixture = load_fixture("siglip-tiny")
-    record = siglip.translate_siglip_vision_config(fixture["config"])
-    tower = towers.from_record(record).build()
-    variables, _ = tower_variables("siglip", fixture["tensors"], "float32")
+def assert_tower_with_live_positions(tower, variables, fixture, positions: str) -> None:
+    """`tower`'s features of the fixture's pixels within 1e-4 of its reference's everywhere, and,
+    with the parameters named `positions` zeroed, more than 0.01 away somewhere: the positions are
+    live."""
     assert np.max(np.abs(
         np.asarray(tower.apply(variables, fixture["pixels"])) - fixture["tower_ref"])) < 1e-4
     unpositioned = jax.tree_util.tree_map_with_path(
-        lambda path, leaf: jnp.zeros_like(leaf)
-        if path[-1].key == "embedding" else leaf, variables)
+        lambda path, leaf: jnp.zeros_like(leaf) if path[-1].key == positions else leaf, variables)
     assert np.max(np.abs(
-        np.asarray(tower.apply(unpositioned, fixture["pixels"]))
-        - fixture["tower_ref"])) > 1e-2
+        np.asarray(tower.apply(unpositioned, fixture["pixels"])) - fixture["tower_ref"])) > 1e-2
+
+
+@pytest.mark.parametrize("name, family, translate, positions", [
+    ("siglip-tiny", "siglip", siglip.translate_siglip_vision_config, "embedding"),
+    ("llama4-vision-tiny", "llama4", llama4.translate_llama4_vision_config, "positional_embedding"),
+], ids=["siglip", "llama4"])
+def test_a_tower_matches_the_reference_implementation(name, family, translate, positions):
+    """fp32 parity on the tiny SigLIP and Llama 4 trunks, and their positions (Llama 4's grid
+    positions) are live: with them zeroed the trunk leaves the reference by more than 0.01."""
+    fixture = load_fixture(name)
+    tower = towers.from_record(translate(fixture["config"])).build()
+    variables, _ = tower_variables(family, fixture["tensors"], "float32")
+    assert_tower_with_live_positions(tower, variables, fixture, positions)
 
 
 def test_a_siglip_tower_runs_any_layer_activation_and_an_inactive_dropout_as_the_reference_does():
@@ -135,23 +143,6 @@ def test_gemma_projector_matches_the_reference_implementation():
     assert np.max(np.abs(np.asarray(
         projector.apply(unnormed, fixture["tower_ref"]))
         - fixture["projector_ref"])) > 0.1
-
-
-def test_llama4_tower_matches_the_reference_implementation():
-    """fp32 parity on the tiny Llama 4 trunk, and the grid positions are live:
-    with them zeroed the trunk leaves the reference by more than 0.01."""
-    fixture = load_fixture("llama4-vision-tiny")
-    record = llama4.translate_llama4_vision_config(fixture["config"])
-    tower = towers.from_record(record).build()
-    variables, _ = tower_variables("llama4", fixture["tensors"], "float32")
-    assert np.max(np.abs(
-        np.asarray(tower.apply(variables, fixture["pixels"])) - fixture["tower_ref"])) < 1e-4
-    unpositioned = jax.tree_util.tree_map_with_path(
-        lambda path, leaf: jnp.zeros_like(leaf)
-        if path[-1].key == "positional_embedding" else leaf, variables)
-    assert np.max(np.abs(
-        np.asarray(tower.apply(unpositioned, fixture["pixels"]))
-        - fixture["tower_ref"])) > 1e-2
 
 
 def test_llama4_projector_matches_the_reference_implementation():

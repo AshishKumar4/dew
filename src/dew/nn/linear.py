@@ -51,7 +51,7 @@ from .joined import joined_dense, joins
 from .kernels import generation
 from .kernels.generation import first_refusal, measured_kernel, refused, route, triton_runs
 from .kernels.recurrence_chunk import CHUNK_SIZE, chunk_gated_delta_rule, on_the_port, recurrent_delta_rule
-from .precision import asks_default_precision, at_least_fp32
+from .precision import asks_default_precision, at_least_fp32, float32_dot_general
 from .sharding import (
     HEADS,
     MLP_HIDDEN,
@@ -143,7 +143,7 @@ def causal_conv1d(x, kernel, activation: bool = True, bias=None, *, valid=None, 
         else:
             out = xla_conv1d(x, kernel, activation, bias, valid=valid, segments=segments, parts=parts,
                              dtype=dtype)
-    # The conv's output, which a remat policy may keep (`dew.nn.backbones.decoder_block.RESIDUALS`).
+    # The conv's output, which a remat policy may keep (`dew.nn.mixer_base.RESIDUALS`).
     return jax.tree.map(lambda piece: checkpoint_name(piece, 'conv'), out)
 
 
@@ -564,7 +564,8 @@ class GatedDeltaNet(nn.Module):
                 "gate_activation must be 'silu' or 'sigmoid' (the reference's "
                 f"output_gate_type), got {self.gate_activation!r}")
         dense = functools.partial(
-            Dense, use_bias=False, dtype=self.dtype, precision=self.precision)
+            Dense, use_bias=False, dtype=self.dtype, precision=self.precision,
+            dot_general=float32_dot_general)
         for name, (_, outputs) in self.projections().items():
             setattr(self, name, dense(outputs, name=name))
         self.conv1d = DepthwiseConv1d(features=self.conv_features,

@@ -1,5 +1,5 @@
 {
-  "transformers_version": "5.16.1",
+  "transformers_version": "5.17.0",
   "architectures": null,
   "output_hidden_states": false,
   "return_dict": true,
@@ -115,8 +115,8 @@
     "attention_bias": false,
     "attention_dropout": 0.0,
     "rope_parameters": {
-      "rope_type": "default",
-      "rope_theta": 100.0
+      "rope_theta": 100.0,
+      "rope_type": "axial"
     },
     "pooling_kernel_size": 2,
     "patch_size": 8,

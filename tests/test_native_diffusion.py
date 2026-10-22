@@ -12,16 +12,15 @@ from pathlib import Path
 
 import numpy as np
 import pytest
+from interop_support import extract_fixture
 
 ROOT = Path(__file__).resolve().parents[1]
 
 
 @pytest.fixture(scope="module")
 def saved_pipelines(tmp_path_factory):
-    destination = tmp_path_factory.mktemp("saved-diffusion")
-    with tarfile.open(ROOT / "tests/fixtures/tiny_diffusers.tar.xz") as archive:
-        archive.extractall(destination, filter="data")
-    return destination
+    return extract_fixture(ROOT / "tests/fixtures/tiny_diffusers.tar.xz",
+                           tmp_path_factory.mktemp("saved-diffusion"))
 
 
 def run_check(*arguments):

@@ -3,6 +3,7 @@ bytes, a source autoencoder's vector-Jacobian products and the audio features
 a checkpoint's own extractor makes; and a Hub cache an offline process
 resolves a repo from."""
 
+import functools
 import json
 import shutil
 import tarfile
@@ -59,6 +60,25 @@ def hub_cache(cache: Path, repo_id: str, source: Path) -> str:
                                                          "blob_id": f"{index:040x}"}
                   for index, path in enumerate(files)}}))
     return commit
+
+
+def without_config_field(source: Path, directory: Path, *path: str) -> Path:
+    """`source`'s checkpoint copied to `directory` with the config field at `path` (a key, nested
+    keys after it) left out, as a config that leaves it to its default writes it."""
+    shutil.copytree(source, directory)
+    config = json.loads((directory / "config.json").read_text())
+    section = config
+    for key in path[:-1]:
+        section = section[key]
+    del section[path[-1]]
+    (directory / "config.json").write_text(json.dumps(config))
+    return directory
+
+
+def fixture_with_meta(path: Path) -> tuple[dict[str, np.ndarray], dict]:
+    """A recorded fixture's arrays and its JSON `meta` record, which it stores as bytes."""
+    arrays = fixture_arrays(path)
+    return arrays, json.loads(arrays.pop("meta").tobytes())
 
 
 def fixture_arrays(path: Path) -> dict[str, np.ndarray]:
@@ -123,6 +143,68 @@ def assert_layout_tensors(layouts, variables, tensors, prefix: str) -> None:
     assert {layout.name for layout in layouts} == {f"{prefix}{name}" for name in tensors}
     assert_same_stored_tensors(
         {layout.name.removeprefix(prefix): layout.export(variables) for layout in layouts}, tensors)
+
+
+def source_transformer(source: Path, name: str, model_class, fields, path) -> tuple:
+    """A Diffusers case's transformer read from its source (`source`/`name`/transformer): the model
+    `fields(config)` builds, its parameters read through `path`, and their layouts."""
+    from dew.interop.diffusion import component_tensors, read_transformer
+
+    config = json.loads((source / name / "transformer" / "config.json").read_text())
+    model = model_class(**fields(config, dtype="float32", attention_impl="xla"))
+    params, layouts = read_transformer(component_tensors(source / name, "transformer"), path)
+    return model, params, layouts
+
+
+def assert_transformer_exports(source: Path, name: str, layouts, params) -> None:
+    """Every tensor a Diffusers case's transformer publishes maps to a layout that exports it bit
+    for bit (`assert_layout_tensors`)."""
+    from dew.interop.diffusion import component_tensors
+
+    assert_layout_tensors(layouts, {"params": params}, component_tensors(source / name, "transformer"),
+                          "transformer/")
+
+
+def channels_last(array) -> np.ndarray:
+    """A channels-first source array `[B, C, ...]` channels last `[B, ..., C]`."""
+    return np.moveaxis(np.asarray(array), 1, -1)
+
+
+def posterior_of(moments) -> tuple[jax.Array, jax.Array]:
+    """The posterior's mean and standard deviation, split from an encoder's stacked moments as
+    Diffusers' `DiagonalGaussianDistribution` splits them."""
+    mean, log_variance = jnp.split(moments, 2, axis=-1)
+    return mean, jnp.exp(0.5 * jnp.clip(log_variance, -30.0, 20.0))
+
+
+def assert_coder_vjps(loaded, reference, operand: str, posterior, bound: float) -> None:
+    """A source KL autoencoder's recorded encode and decode vector-Jacobian products
+    (`assert_autoencoder_vjp`) for its `loaded` (autoencoder, parameters, layouts, config):
+    `posterior(model, params, x)`'s mean and standard deviation against the source's `probe_mean`
+    and `probe_std` from its `operand` (`image`, `video`), and the decode against its `probe` from
+    its `latent`, each array channels last."""
+    autoencoder, params, layouts, _ = loaded
+    model = autoencoder.model
+
+    def decode(params, latent):
+        return model.apply({"params": params}, latent, method=model.decode)
+
+    assert_autoencoder_vjp(
+        "encode", functools.partial(posterior, model), params, channels_last(reference[operand]),
+        [channels_last(reference[f"probe_{name}"]) for name in ("mean", "std")], layouts, reference,
+        channels_last(reference[f"encode.grad_{operand}"]), bound)
+    assert_autoencoder_vjp(
+        "decode", decode, params, channels_last(reference["latent"]), [channels_last(reference["probe"])],
+        layouts, reference, channels_last(reference["decode.grad_latent"]), bound)
+
+
+def recorded_gradients(part, precision: str, inputs, names) -> np.ndarray:
+    """A source's recorded gradients at `precision` (`fp32`, `fp64`), raveled in one order: its
+    `inputs`' (`{precision}.grad_<input>`) then its parameters' (`{precision}.grad_param.<name>`),
+    each read through `part`."""
+    leaves = [part(f"{precision}.grad_{name}") for name in inputs]
+    leaves += [part(f"{precision}.grad_param.{name}") for name in names]
+    return np.concatenate([np.ravel(leaf) for leaf in leaves])
 
 
 def scaled_gap(actual, expected) -> float:
