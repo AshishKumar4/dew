@@ -24,6 +24,7 @@ from dew.nn.kernels.templates import attention_algebra as algebra, cost as costs
 from dew.nn.kernels.templates.attention import (
     DKV_GRADS,
     DQ_GRADS,
+    NATURAL,
     Gradients,
     Hooks,
     KeySpans,
@@ -254,7 +255,8 @@ class TritonForward(Template[Tiles]):
     score and output hooks' parameters (`score_params`, `output_params`, laid out by `score_kinds` and
     `output_kinds`) and the softmax's initial state. Returns the output `[B, Qp, H, Dvp]` and, with
     `residuals`, each query's running maximum and denominator `[B, H, Qp]`, fp32, and the first key
-    holding the keys' maximum `[B, H, Qp]` int32, the backward's anchor (`algebra.Argmax`)."""
+    holding the keys' maximum `[B, H, Qp]` int32, the backward's anchor (`algebra.Argmax`). `natural`
+    keeps the logits natural (`algebra.Forward.base2`)."""
 
     HOOKS = ("score_mod", "output_mod")
     name = "triton"
@@ -269,6 +271,7 @@ class TritonForward(Template[Tiles]):
     output_dtypes: tuple[str, ...] = ()
     output_width: int = TRACED_TILE
     scale: float = 1.0
+    natural: bool = NATURAL
 
     def _fwd(self, query, key, value, start, end, query_ids, key_ids, score_params, output_params, m0, total0,
              acc0, *, residuals: bool, interpret: bool, config: Tiles, return_residuals: bool = False):
@@ -317,7 +320,7 @@ class TritonForward(Template[Tiles]):
             out_specs += [per_row, per_row, per_row, per_value, per_row, per_row]
         # A call's own key count, none included; an op built without one counts its launch's keys.
         spec = algebra.Forward(self.form, keys if self.keys is None else self.keys, ids, self.scale,
-                               self.score_mod)
+                               self.score_mod, self.natural)
         kernel = functools.partial(
             _forward_kernel, spec=spec, score_kinds=self.score_kinds, output_kinds=self.output_kinds,
             initial=initial, residuals=residuals, output_mod=self.output_mod, block_k=block_k,
@@ -405,13 +408,15 @@ def _param_spec(kind: Kind, param: jax.Array, block_q: int, keys: int) -> pl.Blo
 
 
 def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None,
-            *, scale: float | None = None, residuals: bool = False, interpret: bool = False):
+            *, scale: float | None = None, residuals: bool = False, natural: bool = NATURAL,
+            interpret: bool = False):
     """The template's forward (`TritonForward`) on `query` `[B, Q, H, D]` over `key` and `value`
     `[B, K, Hk, D]` and `[B, K, Hk, Dv]` and the keys `spans` leaves each query: as
     `dew.nn.kernels.templates.attention.reference` computes it, with `residuals` its running maxima and
     denominators `[B, H, Q]` too, and each query's anchor key `[B, H, Q]` int32 (`backward` reads them
     all). The operands pad to whole blocks of the largest tile and to power-of-two
-    head widths (`padded_call`). `interpret` runs it on the CPU."""
+    head widths (`padded_call`). `natural` keeps the logits natural (`algebra.Forward.base2`).
+    `interpret` runs it on the CPU."""
     hooks = Hooks() if hooks is None else hooks
     call = padded_call(query, key, value, spans, hooks, BLOCK)
     queries, value_width = call.queries, value.shape[-1]
@@ -427,7 +432,7 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
                        output_dtypes=tuple(kept_dtype(param.value.dtype) for param in hooks.output_params),
                        output_width=call.value.shape[-1],
                        scale=query.shape[3] ** -0.5 if scale is None else scale, form=spans.form,
-                       keys=spans.keys)
+                       keys=spans.keys, natural=natural)
     out = op(call.query, call.key, call.value, call.start, call.end, call.query_ids, call.key_ids,
              call.score_params, call.output_params, m0, total0, acc0, residuals=residuals,
              interpret=interpret)
@@ -938,15 +943,17 @@ def _launch(*arrays, score_mod, score_kinds: tuple[Kind, ...], score_dtypes: tup
 
 def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None,
              dout: jax.Array, *, residuals: tuple[jax.Array, jax.Array, jax.Array, Split] | None = None,
-             split: bool = True, scale: float | None = None, interpret: bool = False) -> Gradients:
+             split: bool = True, scale: float | None = None, natural: bool = NATURAL,
+             interpret: bool = False) -> Gradients:
     """The template's backward on the Triton mainloop (`gradients`, `TritonBackward`), from the forward's
     `residuals`: its maxima, denominators, anchor keys and split sums (`forward`'s, which it takes again
     where None). With `split`, D comes from the split sums; without, the dQ launch takes its own first pass
-    over the keys (`algebra.off_anchor`). `interpret` runs it on the CPU."""
+    over the keys (`algebra.off_anchor`). `natural` keeps the forward's logits natural. `interpret` runs
+    it on the CPU."""
     if residuals is None:
         plain = Hooks() if hooks is None else Hooks(hooks.score_mod, hooks.score_params, hooks.initial)
         _, maxima, totals, anchors, sums = forward(query, key, value, spans, plain, scale=scale,
-                                                   residuals=True, interpret=interpret)
+                                                   residuals=True, natural=natural, interpret=interpret)
         residuals = maxima, totals, anchors, sums
     return gradients(functools.partial(_launch, split=split, interpret=interpret), query, key, value, spans,
                      hooks, dout, residuals, block=BLOCK, scale=scale)
