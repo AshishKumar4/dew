@@ -30,7 +30,13 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact, assert_computes_the_oracle, assert_leaves_as_exact, float64_terms
+from reference_error import (
+    assert_as_exact,
+    assert_computes_the_oracle,
+    assert_leaves_as_exact,
+    equal_dots,
+    float64_terms,
+)
 from ssd_support import ssd_orbit
 
 from dew.nn.kernels.recurrence_chunk import RESET_DECAY
@@ -170,7 +176,7 @@ def evaluated(scan, operands, seeded):
 
 def parity_functions(chunk_size: int, roundings: int):
     """XLA's output, final state and all five gradients, and its independently checked float64 truth."""
-    xla = jax.jit(lambda operands, seeded: evaluated(
+    xla = equal_dots(lambda operands, seeded: evaluated(
         lambda *o: xla_chunk_scan(*o, chunk_size), operands, seeded))
     recurrence = jax.jit(lambda operands, seeded: evaluated(stepwise_scan, operands, seeded))
 
@@ -199,7 +205,8 @@ def assert_kernel_parity(draw, chunk_size: int, *, compiled: bool, roundings: in
         return ssd_chunk_scan(*operands, chunk_size, platform)
 
     xla, truth = parity_functions(chunk_size, roundings)
-    mine = jax.jit(lambda operands, seeded: evaluated(kernel, operands, seeded))
+    # The kernel against XLA's scan, two Dew paths: interpreted, their dots on the same code (`equal_dots`).
+    mine = equal_dots(lambda operands, seeded: evaluated(kernel, operands, seeded))
     assert_as_exact(mine, xla, draw, label, seeds=seeds, truth_fn=truth)
 
 
