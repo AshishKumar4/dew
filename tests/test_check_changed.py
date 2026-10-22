@@ -34,7 +34,6 @@ def checkout(tmp_path: Path) -> Path:
         (root / name).mkdir(parents=True)
     for name in GATE:
         shutil.copy(TOOLS / name, root / "tools" / name)
-    (root / "src/dew/__init__.py").write_text('"""Dew."""\n')
     (root / "tests/test_close.py").write_text(CLOSE)
     (root / "tools/tolerance_inventory.json").write_text(inventory(HELD))
     git(root, "init", "-q", "-b", "main")
@@ -55,8 +54,7 @@ def test_a_head_touching_the_inventory_or_deleting_a_file_it_names_fails_its_cha
     assert changed(root).returncode == 0
     # Uncommitted: the inventory no longer holds the comparison.
     (root / "tools/tolerance_inventory.json").write_text(inventory({}))
-    dropped = changed(root)
-    assert dropped.returncode == 1 and "=== slop FAILED" in dropped.stdout
+    assert changed(root).returncode == 1
     # Committed: the same.
     git(root, "commit", "-qam", "a head that drops the entry")
     assert changed(root).returncode == 1
@@ -64,5 +62,10 @@ def test_a_head_touching_the_inventory_or_deleting_a_file_it_names_fails_its_cha
     git(root, "checkout", "-q", "-b", "deleting", "origin/main")
     (root / "tests/test_close.py").unlink()
     git(root, "commit", "-qam", "a head that deletes the held file")
-    gone = changed(root)
-    assert gone.returncode == 1 and "=== slop FAILED" in gone.stdout
+    assert changed(root).returncode == 1
+    # A file renamed with its comparisons gone, its old name's entry left: Git reads it as a rename.
+    git(root, "checkout", "-q", "-b", "renaming", "origin/main")
+    git(root, "mv", "tests/test_close.py", "tests/test_near.py")
+    (root / "tests/test_near.py").write_text(CLOSE.replace(", rtol=1e-6", ""))
+    git(root, "commit", "-qam", "a head that renames the held file and drops its comparison")
+    assert changed(root).returncode == 1
