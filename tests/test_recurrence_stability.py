@@ -1,13 +1,14 @@
 """The recurrence template's stability (bible §6: accuracy, performance and stability together): the chunked
 op under the inputs that break chunked forms, each held to the same recurrence a token at a time
-(`test_recurrence_chunk.token_by_token`, the decode step's reference) three ways:
+(`test_recurrence_chunk.token_by_token`, the decode step's reference) two ways:
 
 - finite wherever the reference in float64 is finite: no NaN or inf of the chunked form's own, an
   exponent's overflow or an underflow's `0 * inf`;
-- no merging: over the site's draws, values it rounds to one fp32 number that float64 keeps more than two
-  roundings apart are no more than check 1's factor of the fp32 reference's own and a handful, so no
-  underflow or saturation collapses values the reference keeps apart;
 - check 1 (`assert_as_exact`): on par with the reference from float64 over the regime's draws.
+
+No merging of values the reference keeps apart is check 2's: every element within its operation's
+certified bound of its float64 value keeps apart any two that float64 holds more than two fp32 spacings
+apart, so the suite takes it with the chunk ops' certificates (`tests/op_certificates.py`).
 
 The regimes: decays near one, whose memory accumulates, and over a long sequence; decays near zero, whose
 pairs within a chunk span tens of e-folds; every token at the decay's range bound (Kimi delta
@@ -28,7 +29,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact, assert_kept_apart, merges, widened
+from reference_error import assert_as_exact, widened
 from test_recurrence_chunk import CHUNK, KEY_WIDTH, draw, token_by_token
 
 from dew.nn.kernels import recurrence
@@ -187,26 +188,21 @@ CASES = [pytest.param(name, regime, id=f'{name}-{regime}') for name in SITES for
 
 
 @pytest.mark.parametrize('name, regime', CASES)
-def test_the_chunked_op_stays_finite_distinct_and_exact_where_chunked_forms_break(name, regime):
-    """The portable math finite wherever the float64 reference is and keeping apart what it keeps apart on
-    every declared seed, and on par with it from float64 (module docstring)."""
+def test_the_chunked_op_stays_finite_and_exact_where_chunked_forms_break(name, regime):
+    """The portable math finite wherever the float64 reference is on every declared seed, and on par with
+    it from float64 (module docstring)."""
     hooks = SITES[name]
     dew = jax.jit(functools.partial(chunk, hooks, chunk_size=CHUNK, ported=False))
     reference = jax.jit(functools.partial(token_by_token, hooks))
     draws = functools.partial(stressed, hooks, regime)
-    merged = {'output': [0, 0], 'final memory': [0, 0]}
     for seed in range(SEEDS[name, regime]):
         operands = draws(seed)
-        mine, theirs = dew(*operands), reference(*operands)
+        mine = dew(*operands)
         with jax.enable_x64(new_val=True):
             truth = reference(*widened(operands))
-        for leaf, ours, fp32, exact in zip(('output', 'final memory'), mine, theirs, truth, strict=True):
-            ours, fp32, exact = (np.asarray(x) for x in (ours, fp32, exact))
-            finite = np.isfinite(exact)
-            assert np.all(np.isfinite(ours)[finite]), f'{leaf}: not finite where float64 is, seed {seed}'
-            merged[leaf][0] += merges(ours, exact)
-            merged[leaf][1] += merges(fp32, exact)
-    for leaf, (ours, theirs) in merged.items():
-        assert_kept_apart(ours, theirs, leaf)
+        for leaf, ours, exact in zip(('output', 'final memory'), mine, truth, strict=True):
+            finite = np.isfinite(np.asarray(exact))
+            assert np.all(np.isfinite(np.asarray(ours))[finite]), (
+                f'{leaf}: not finite where float64 is, seed {seed}')
     assert_as_exact(dew, reference, draws, f'the portable math, {name} under {regime}',
                     seeds=SEEDS[name, regime])
