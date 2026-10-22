@@ -10,8 +10,8 @@
 #
 # The full run starts the gates side by side, as many at once as this process may use processors (nproc),
 # and prints each one's verdict and, where it failed, its output, in the file's order: it takes about as long
-# as its slowest gate. --gate NAME runs one gate and exits with its status (the lanes' lint gate runs each gate on a container
-# of its own); --list prints the gates' names.
+# as its slowest gate. --gate NAME runs one gate and exits with its status (the lanes' lint gate runs each
+# gate on a container of its own); --list prints the gates' names.
 #
 # --changed: the gates a head's own Python files decide, in seconds, for iterating on it: ruff and slop lint
 # over the Python files that differ from its merge-base with origin/main (committed or not, untracked
