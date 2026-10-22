@@ -41,6 +41,8 @@ B, S, H, D, E, K = 2, 7, 2, 4, 8, 4  # batch, tokens, heads, head dim, model wid
 SEEDS = {'chunk oracle': 8, 'recurrent oracle': 8, 'safe_gate layer': 8, 'softplus layer': 8,
          'layer gradients': 8, 'decode': 8, 'padded rows': 8}
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada)."""
+ROWS = 64
+"""A layer draw's rows: one layer's few outputs a draw leave its error to a handful of values."""
 
 
 def oracle_layer(x, p, lower_bound, eps, rule):
@@ -160,7 +162,7 @@ def test_the_layer_matches_the_oracle_in_both_forget_gate_forms(lower_bound):
     params = oracle_params(variables)
 
     def draw(seed):
-        return (np.random.RandomState(seed).randn(B, S, E).astype(np.float32), params)
+        return (np.random.RandomState(seed).randn(ROWS, S, E).astype(np.float32), params)
 
     label = f"{'safe_gate' if lower_bound is not None else 'softplus'} layer"
     assert_as_exact(lambda x, p: layer(variables, x), oracle, draw, label, seeds=SEEDS[label])
@@ -195,7 +197,7 @@ def test_the_layer_gradients_match_the_oracle():
 
     def draw(seed):
         rng = np.random.RandomState(seed)
-        return rng.randn(B, S, E).astype(np.float32), params, rng.randn(B, S, E).astype(np.float32)
+        return rng.randn(ROWS, S, E).astype(np.float32), params, rng.randn(ROWS, S, E).astype(np.float32)
 
     assert_as_exact(ours, theirs, draw, "layer gradients", seeds=SEEDS['layer gradients'])
 
@@ -209,7 +211,7 @@ def test_prefill_then_token_steps_reproduce_the_parallel_layer():
     params = oracle_params(variables)
 
     def draw(seed):
-        return (np.random.RandomState(seed).randn(B, S, E).astype(np.float32),)
+        return (np.random.RandomState(seed).randn(ROWS, S, E).astype(np.float32),)
 
     _, allocated, _ = decode_through(module, variables, jnp.asarray(draw(0)[0]), prefill=3)
     assert not np.asarray(allocated["recurrent_state"]).any()
@@ -228,11 +230,11 @@ def test_padded_rows_preserve_the_memory_and_the_history():
 
     module, _, variables = layer_and_params(-5.0)
     params = oracle_params(variables)
-    valid = jnp.array([[True, True, False, True, True, False]])
+    valid = jnp.tile(jnp.array([[True, True, False, True, True, False]]), (ROWS, 1))
     real = jnp.array([0, 1, 3, 4])
 
     def draw(seed):
-        return (np.random.RandomState(seed).randn(1, 6, E).astype(np.float32),)
+        return (np.random.RandomState(seed).randn(ROWS, 6, E).astype(np.float32),)
 
     def gapped(x):
         out = module.apply(variables, x, MixerCall(AttentionMetadata(coordinates=coordinates(valid=valid))))
