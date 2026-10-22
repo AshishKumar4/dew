@@ -6,14 +6,13 @@ import dataclasses
 import functools
 import hashlib
 import itertools
-import json
 from collections.abc import Callable, Iterator, Mapping, Sequence
 from typing import ClassVar, Protocol, runtime_checkable
 
 import numpy as np
 
 from dew.data.dataset import Batch, Records
-from dew.data.generation import Generation, RowId, _GenerationSource, _row_key, _source_ids
+from dew.data.generation import Generation, RowId, _GenerationSource, _row_key, _shard_inputs, _source_ids
 from dew.data.pipeline import Dataset, Mixture, Phases, Pipeline
 from dew.data.sources.base import (
     Read,
@@ -77,6 +76,10 @@ class RecordSlice:
 
         records = self.source.records(read)
         return SourceSlice(records, *self.bounds(len(records)))
+
+    def admits(self, position: int, row: Batch | bytes | None) -> bool:
+        """Whether the record at `position` among its source's is in this slice."""
+        return self.start <= position and (self.stop is None or position < self.stop)
 
     def bounds(self, records: int) -> tuple[int, int]:
         """The first and the one past the last of `records` it keeps, refusing a slice past them."""
@@ -164,6 +167,10 @@ class HashPart:
     def keeps(self, row: Batch | bytes | None) -> bool:
         """Whether this part holds `row`: one that is there, its identity in the part."""
         return row is not None and _inside(row, self.low, self.high, self.key) == self.held
+
+    def admits(self, position: int, row: Batch | bytes | None) -> bool:
+        """Whether this part holds `row`, wherever it is (`keeps`)."""
+        return self.keeps(row)
 
     def metadata(self) -> Mapping[str, object]:
         return _uncounted(self.source.metadata())
@@ -255,9 +262,10 @@ class SelectedGeneration:
     """The rows `generation` holds for the inputs of `stored`, the source it was published from, that
     the holdout `selections` keep (outermost first, `stored` below the last), in their order: the
     generation standing in for its steps under selections written before it, each picking the
-    inputs it picks uncached (`dew.data.analysis._in_place`). `placing` is the read that numbers
-    `stored`'s inputs as the generation's fill did (`_source_ids`); the ids are checked against the
-    generation's, so ids that name other inputs than its fill's are refused rather than read as none."""
+    inputs it picks uncached (`dew.data.analysis._in_place`). The selections name the part, as the
+    run wrote them; `stored` is read as the fill read it (`_consumed`), numbering its inputs by
+    index where `placing` is "indexed" and by its shards' rows where it is "streamed", as the fill
+    did (`_source_ids`). Ids that name other inputs than the fill's are refused, never read as none."""
 
     generation: Generation
     selections: tuple[RecordSlice | HashPart, ...]
@@ -294,12 +302,12 @@ class SelectedGeneration:
         return self
 
     def records(self, read: Read) -> Records:
-        import grain.python as grain
-
-        return grain.MapDataset.source(self._dense).map(_SelectedRow(self.generation))
+        return _Placed(self.generation, self._dense).rows()
 
     def manifest(self) -> ShardManifest:
-        return _indexed_manifest(self, f"{self.generation.url}#selected", self.generation.url, 4096)
+        # A worker reads the placed rows alone (`_Placed`), not the store that placed them.
+        return _indexed_manifest(self, f"{self.generation.url}#selected", self.generation.url, 4096,
+                                 _Placed(self.generation, self._dense))
 
     def metadata(self) -> Mapping[str, object]:
         """The selections' facts, as uncached (what they hold out included), with this part's rows and
@@ -323,67 +331,76 @@ class SelectedGeneration:
 
     @functools.cached_property
     def _dense(self) -> np.ndarray:
-        """The generation's rows of the inputs the selections keep, in its order, which is theirs. The
-        selections apply innermost first, as the inputs stream past: a records holdout keeps the
-        inputs it reaches within its bounds (`RecordSlice.bounds`), a hash holdout those its part
-        holds (`HashPart.keeps`); only a hash holdout reads the rows."""
+        """The indices of the generation's rows of the inputs the selections keep. The generation's
+        rows are its inputs' outputs in input order (`_publish`), so they are walked in step with
+        the inputs (`_admitted`), each row the next input's that names it."""
+        admitted = self._admitted()
+        dense = []
+        current, kept = None, False
+        index = inputs = 0
+        for page in range(len(self.generation.manifest["row_pages"])):
+            for entry in self.generation._rows(page):
+                while entry["id"] != current:
+                    current, kept = next(admitted, (None, False))
+                    inputs += current is not None
+                    if current is None:
+                        raise ValueError(
+                            f"generation {self.generation.url} holds input {entry['id']}, which "
+                            f"{self.stored.describe()} doesn't name here (a stream names its inputs by "
+                            "where it read their shards), so the holdout written before it can't pick its "
+                            "inputs from it; publish it from an indexed read, or read it where it was filled")
+                if kept:
+                    dense.append(index)
+                index += 1
+        inputs += sum(1 for _ in admitted)
+        filled = self.generation.manifest["inputs"]
+        if inputs != filled:
+            raise ValueError(f"generation {self.generation.url} was filled from {filled} inputs, and "
+                             f"{self.stored.describe()} holds {inputs} here, so the holdout written before "
+                             "it can't pick its inputs from it")
+        return np.asarray(dense, np.int64)
+
+    def _admitted(self) -> Iterator[tuple[str, bool]]:
+        """Each input of `stored`, by the key the fill gave it (`_row_key`), and whether the selections
+        keep it: they apply innermost first as the inputs stream past, each at its own position among
+        the inputs the ones within it admitted (`admits`); only a hash holdout reads the rows."""
         inner = self.selections[::-1]
         hashed = any(isinstance(selection, HashPart) for selection in inner)
-        streamed = self.placing == "streamed"
-        if streamed:
+        if self.placing == "indexed":
+            records = self.stored.records("indexed")
             inputs: Iterator[tuple[RowId, Batch | bytes | None]] = (
-                _streamed_rows(self.stored) if hashed
-                else ((row_id, None) for row_id in _source_ids(self.stored, streamed=True)))
+                (index, records[index] if hashed else None) for index in range(len(records)))
+        elif hashed:
+            manifest = self.stored.manifest()
+            inputs = (pair for shard in manifest.shards for pair in _shard_inputs(manifest, shard))
         else:
-            records = self.stored.records(self.placing)
-            inputs = ((index, records[index] if hashed else None) for index in range(len(records)))
+            inputs = ((row_id, None) for row_id in _source_ids(self.stored, streamed=True))
         reached = [0] * len(inner)
-        kept: set[str] = set()
-        shards: set[str] = set()
-        count = 0
         for row_id, row in inputs:
-            count += 1
-            if isinstance(row_id, tuple):
-                shards.add(row_id[0])
+            admitted = True
             for level, selection in enumerate(inner):
-                if isinstance(selection, RecordSlice):
-                    position, reached[level] = reached[level], reached[level] + 1
-                    if not selection.start <= position < (selection.stop if selection.stop is not None
-                                                          else position + 1):
-                        break
-                elif not selection.keeps(row):
+                position, reached[level] = reached[level], reached[level] + 1
+                if not selection.admits(position, row):
+                    admitted = False
                     break
-            else:
-                kept.add(_row_key(row_id))
+            yield _row_key(row_id), admitted
         for level, selection in enumerate(inner):
             if isinstance(selection, RecordSlice):
                 selection.bounds(reached[level])
-        filled = self.generation.manifest["inputs"]
-        if count != filled:
-            raise ValueError(f"generation {self.generation.url} was filled from {filled} inputs, and "
-                             f"{self.stored.describe()} holds {count} here, so the holdout written before "
-                             "it can't pick its inputs from it")
-        dense = []
-        for page in range(len(self.generation.manifest["row_pages"])):
-            for offset, entry in enumerate(self.generation._rows(page)):
-                if streamed and json.loads(entry["id"])[0] not in shards:
-                    raise ValueError(
-                        f"generation {self.generation.url} names its inputs by shards "
-                        f"{self.stored.describe()} names otherwise here (a stream names them by where it "
-                        "read them), so the holdout written before it can't pick its inputs from it; "
-                        "publish it from an indexed or memory read, or read it where it was filled")
-                if entry["id"] in kept:
-                    dense.append(page * 4096 + offset)
-        return np.asarray(dense, np.int64)
 
 
-def _streamed_rows(source: Source) -> Iterator[tuple[RowId, Batch | bytes | None]]:
-    """Each row of `source` as a stream reads it, with the id a streamed fill gives it (`_source_ids`)."""
-    manifest = source.manifest()
-    for shard in manifest.shards:
-        reader = iter(manifest.reader(shard))
-        try:
-            for index, row in enumerate(reader):
-                yield (shard.id, index), row
-        finally:
-            reader.close()
+@dataclasses.dataclass(frozen=True)
+class _Placed:
+    """The rows of `generation` at `indices`: a selected generation's records (`rows`), and the reader
+    of a shard of them a worker takes, holding nothing of the store that placed them."""
+
+    generation: Generation
+    indices: np.ndarray
+
+    def rows(self):
+        import grain.python as grain
+
+        return grain.MapDataset.source(self.indices).map(_SelectedRow(self.generation))
+
+    def __call__(self, shard: Shard):
+        return self.rows()[shard.start : shard.stop].to_iter_dataset()
