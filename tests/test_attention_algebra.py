@@ -400,3 +400,22 @@ def test_a_logit_the_reference_keeps_stays_finite_and_apart(keys, query_size, ke
     for found in (triton, portable):
         for leaf in (found.query, found.key, found.value):
             assert np.isfinite(np.asarray(leaf)).all()
+
+
+@pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
+def test_an_fp32_cpu_arm_is_as_exact_as_the_reference_at_aligned_tiles(causal):
+    """fp32, width 128, 300 keys walked in 128-key tiles: XLA's CPU dot picks its accumulation by shape,
+    and its 128-aligned path is 1.86 times less exact than the unaligned one the reference's einsum takes,
+    which left every CPU arm 1.6 times the reference (check 1 allows 1.5) where the compiled kernels pass
+    on an A100. The template's CPU products sum fp32 exactly (`template.interpreted_dot`)."""
+    spans = template.spans(200, 300, ROWS, causal=causal)
+
+    def ours(query, key, value):
+        return attention_portable.attend(query, key, value, spans, block_q=128, block_k=128, pad=128)
+
+    def reference(query, key, value):
+        return template.reference(query, key, value, spans)
+
+    draw = drawing(200, 300, jnp.float32, width=128, value_width=128)
+    assert_as_exact(jax.jit(ours), jax.jit(reference), draw,
+                    f"plain mainloop fp32 width 128 {'causal' if causal else 'full'}", seeds=8)
