@@ -699,15 +699,17 @@ def test_a_dense_bank_reads_its_layer_as_the_plain_product():
 
 @lowers("sm90")
 def test_a_wide_input_gradient_widens_one_layer_not_the_bank():
-    """An fp32 output's input gradient multiplies its fp32 cotangent by the bank's layer widened, the
-    layer sliced out first: the program lowered for an H100 holds no fp32 copy of the whole bank, and a
-    launch prices one layer, as the plain call does."""
+    """An fp32 output's input gradient summed exactly (above the default precision, which Triton's launch
+    takes) multiplies its fp32 cotangent by the bank's layer widened, the layer sliced out first: the
+    program lowered for an H100 holds no fp32 copy of the whole bank, and a launch prices one layer, as
+    the plain call does."""
     x, bank, *_ = _banked(0)
     sizes = jnp.asarray(SIZES)
     mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
 
     def loss(x, bank):
-        return jnp.sum(template.gemm(x, bank, sizes, rhs_index=jnp.int32(LAYER), out_dtype=jnp.float32))
+        return jnp.sum(template.gemm(x, bank, sizes, rhs_index=jnp.int32(LAYER), out_dtype=jnp.float32,
+                                     precision="highest"))
 
     with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
         lowered = jax.jit(jax.grad(loss, argnums=(0, 1))).trace(x, bank).lower(lowering_platforms=("cuda",))
