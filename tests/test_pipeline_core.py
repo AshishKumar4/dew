@@ -2050,23 +2050,52 @@ def test_a_streamed_repeat_repeats_where_it_is_written_past_a_limit_or_a_repeat(
     assert len(ids(twice, "streamed")) == len(ids(twice, "indexed")) == 48
 
 
-def test_a_nested_mixture_counts_its_epoch_from_each_part():
-    """A mixture of a corpus and a mixture ends its epoch when every one of its
-    parts has come round, the inner mixture counted the same way: the inner one
-    of 8 and 4 rows at even weights in 16, the outer of 12 and 16 in 32. A run
-    reads each part on from where it was past the mix's end, so the epoch's 32
-    records hold every record of the outer corpus."""
-    inner = mix([Pipeline(source(8)), Pipeline(source(4))], weights=(1, 1))
-    nested = mix([Pipeline(source(12)), inner], weights=(1, 1))
-    loader = compile(nested.batch(2), loading=READ)
-    assert loader.records == 32
-    reader = loader.train(DataPartition())
+def _tagged(tag, count):
+    """`count` records whose ids say they are corpus `tag`'s: 100 * tag on."""
+    return Pipeline(Memory(tuple({"id": np.int32(100 * tag + index)} for index in range(count))))
+
+
+def _nested():
+    """A mix at even weights of a corpus of 12 and a mix at even weights of corpora of 8 and 4."""
+    return mix([_tagged(1, 12), mix([_tagged(2, 8), _tagged(3, 4)], weights=(1, 1))], weights=(1, 1))
+
+
+def _ids(reader, batches=None):
     try:
-        read = [int(value) for batch in itertools.islice(reader, 16) for value in batch["id"]]
+        return [int(value) for batch in itertools.islice(reader, batches) for value in batch["id"]]
     finally:
         reader.close()
-    # The outer corpus holds the even positions of an even mix.
-    assert sorted(set(read[::2])) == list(range(12))
+
+
+def test_a_nested_mixture_a_run_reads_on_counts_its_epoch_until_every_corpus_has_come_round():
+    """A run reads a mixture on past its end, each part on from where it was, so its epoch is the
+    fewest records in which every part comes round once, the inner mixture counted the same way:
+    the inner one of 8 and 4 at even weights in 15, the outer of 12 and those 15 in 30. Every
+    record of every corpus is read in it."""
+    loader = compile(_nested().batch(2), loading=READ)
+    assert loader.records == 30
+    read = _ids(loader.train(DataPartition()), 15)
+    corpora = {1: 12, 2: 8, 3: 4}
+    assert {tag: len({value for value in read if value // 100 == tag}) for tag in corpora} == corpora
+
+
+@pytest.mark.parametrize("epochs", [1, 2])
+def test_a_nested_mixture_read_a_counted_number_of_times_counts_the_records_its_mix_reads(epochs):
+    """A mixture repeated a counted number of times reads its mix to its end each time, where its
+    first corpus ends, the inner mixture's at its own: the inner one of 8 and 4 ends at 8, the
+    outer of 12 and those 8 at 16, and the run reads that many records each epoch and no more."""
+    loader = compile(_nested().repeat(epochs).batch(2), loading=READ)
+    assert loader.records == 16
+    assert len(_ids(loader.train(DataPartition()))) == 16 * epochs
+
+
+def test_a_mixture_of_a_repeated_corpus_and_one_read_once_counts_what_a_run_reads():
+    """A run of a corpus of 8 repeated and one of 4 written without a repeat, at even weights, counts
+    an epoch in which a run reads every record of both."""
+    loader = compile(mix([_tagged(1, 8).repeat(), _tagged(2, 4)], weights=(1, 1)).batch(1), loading=READ)
+    read = _ids(loader.train(DataPartition()), loader.records)
+    assert len(read) == loader.records
+    assert sorted(set(read)) == [*range(100, 108), *range(200, 204)]
 
 def test_a_streamed_training_read_with_a_random_step_and_no_repeat_never_runs_out():
     """A training order that writes no repeat repeats for ever, as its plan

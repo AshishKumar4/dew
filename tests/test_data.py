@@ -1256,24 +1256,40 @@ def test_a_run_over_records_in_memory_checkpoints_and_resumes_where_it_stopped(t
         np.testing.assert_array_equal(np.asarray(actual), np.asarray(expected))
 
 
-def test_a_batch_encoders_identity_is_the_plan_format_it_has_always_been():
-    """The encoders that read a batch's captions or fields name the reader they run by its module and
-    qualified name, a method's own, in the spelling a saved plan holds: a change to it is a change
-    of plan format."""
-    from dew.data.images import EncodeCaptions, EncodeFields
+def test_a_batch_encoders_reader_is_part_of_the_plan_a_resume_checks():
+    """A batch encoder names the reader it runs in the run's plan: a run resumed with the same reader
+    reads on as it did, and one given another reader, the same words handed back by another
+    function, is refused before it reads."""
 
-    class Reader:
-        def captions(self, captions):
-            return {"n": np.asarray([len(caption) for caption in captions])}
+    def run(reader):
+        rows = Pipeline(Memory(_Images(16))).shuffle(3).repeat()
+        caption = images.caption(templates=CAPTION_TEMPLATES, classes=_CLASSES)
+        pictures = presets.images(rows, 8, batch=4, augment=False, rejects=False, caption=caption,
+                                  host=(EncodeCaptions(reader),))
+        return compile(pictures, read="indexed", seed=3, **WORKERS).train(DataPartition())
 
-        def fields(self, batch):
-            return {}
+    stream = run(keep_captions)
+    try:
+        next(stream)
+        saved = stream.get_state()
+        expected = _rows(next(stream))
+    finally:
+        stream.close()
+    resumed = run(keep_captions)
+    try:
+        resumed.set_state(saved)
+        assert _rows(next(resumed)) == expected
+    finally:
+        resumed.close()
+    other = run(_captions_again)
+    try:
+        with pytest.raises(ValueError):
+            other.set_state(saved)
+    finally:
+        other.close()
 
-    reader = Reader()
-    assert EncodeCaptions(reader.captions).identity == (
-        f"dew.encode-captions:{__name__}.test_a_batch_encoders_identity_is_the_plan_format_it_has_always_been."
-        "<locals>.Reader.captions")
-    assert EncodeFields(reader.fields).identity.endswith("<locals>.Reader.fields")
-    module = keep_captions.__module__
-    assert EncodeCaptions(keep_captions).identity == f"dew.encode-captions:{module}.keep_captions"
-    assert EncodeCaptions().identity == "dew.drop-captions@1"
+
+def _captions_again(captions):
+    """The words a batch's captions hold, handed back as `keep_captions` hands them: another reader
+    of the same output."""
+    return {"caption": np.asarray(captions)}
