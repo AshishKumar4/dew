@@ -54,23 +54,32 @@ def changed(root: Path) -> subprocess.CompletedProcess:
     return check(root, "--changed")
 
 
-def test_the_gates_are_one_file_run_together_one_at_a_time_or_listed(tmp_path):
+COPIED = ("def {name}(values, limit):\n    total = 0\n    for index, value in enumerate(values):\n"
+          "        if value > limit:\n            total += value * index\n        else:\n"
+          "            total -= value\n    return total\n")
+
+
+def test_the_registrys_gates_run_together_or_one_at_a_time(tmp_path):
+    """check.sh runs tools/check_gates' gates: all of them together, its verdict any one's failure, or one by
+    name (the lanes' lint gate runs each on a container of its own). Here the registry holds the real gates
+    a scratch checkout has the tools for."""
     root = checkout(tmp_path)
+    lines = (TOOLS / "check_gates").read_text().splitlines()
     (root / "tools/check_gates").write_text(
-        "# a comment, no gate\n"
-        "green\techo \"read with $PYTHON, held to $BASE\"\n"
-        "red\techo a copy in $duplicate_roots; exit 1\n")
-    assert check(root, "--list").stdout == "green\nred\n"
-    one = check(root, "--gate", "green", BASE="base/producer")
-    assert (one.returncode, one.stdout) == (0, f"read with {sys.executable}, held to base/producer\n")
-    red = check(root, "--gate", "red")
-    assert (red.returncode, red.stdout) == (1, "a copy in src/dew tools tests examples site\n")
-    missing = check(root, "--gate", "blue")
-    assert (missing.returncode, missing.stdout) == (2, "no gate blue in tools/check_gates\n")
-    every = check(root)
-    assert every.returncode == 1
-    assert every.stdout.splitlines() == [
-        "=== green ok", "=== red FAILED", "a copy in src/dew tools tests examples site", "check: FAILED red"]
+        "".join(f"{line}\n" for line in lines if line.split("\t")[0] in ("ratchet", "duplicate-structure")))
+    git(root, "commit", "-qam", "the gates this checkout has the tools for")
+    assert check(root, "--list").stdout.split() == ["ratchet", "duplicate-structure"]
+    assert check(root).returncode == 0
+    assert check(root, "--gate", "duplicate-structure").returncode == 0
+    # One function written in two files: the structure gate fails, alone and in the whole run.
+    for name in ("first", "second"):
+        (root / "src/dew" / f"{name}.py").write_text(COPIED.format(name=name))
+    git(root, "add", "-A")
+    git(root, "commit", "-qm", "a head that writes one function twice")
+    assert check(root, "--gate", "duplicate-structure").returncode == 1
+    assert check(root, "--gate", "ratchet").returncode == 0
+    assert check(root).returncode == 1
+    assert check(root, "--gate", "a-gate-no-line-names").returncode != 0
 
 
 def test_the_ratchet_gate_alone_fetches_the_history_it_reads_into_a_shallow_clone(tmp_path):
