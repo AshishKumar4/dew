@@ -404,16 +404,17 @@ def judged(hits: list[Hit], merged: str, top: Path) -> tuple[list[Hit], list[Hit
 
 
 def stripped(file: Path) -> tuple["LineSet", set[int]]:
-    """`file`'s lines as the text reading compares them (`SIMILARITY`), and the hashes of their windows of
-    `min_lines` lines, as pylint's comparison of two files hashes them (`hash_lineset`), read in a process of
-    its own (a fork, which hashes text as its parent does)."""
+    """`file`'s lines as the text reading compares them (`SIMILARITY`), and the hashes of their windows of one
+    line past `min_lines`, as pylint hashes a window (`hash_lineset`), read in a process of its own (a fork,
+    which hashes text as its parent does). pylint reports a run of lines two files share only past
+    `min_lines` lines, so the two share such a window."""
     from pylint.checkers.symilar import Symilar, hash_lineset
 
     reading = Symilar(**SIMILARITY)
     with file.open(encoding="utf-8") as stream:
         reading.append_stream(str(file), stream)
     [lineset] = reading.get_map_data()
-    windows, _ = hash_lineset(lineset, SIMILARITY["min_lines"])
+    windows, _ = hash_lineset(lineset, SIMILARITY["min_lines"] + 1)
     return lineset, {hash(window) for window in windows}
 
 
@@ -421,11 +422,13 @@ def text_copies(files: list[Path], jobs: int) -> int:
     """Print pylint's similarity report on the files of `files` that share a window, and return how many
     lines the copies it finds repeat.
 
-    pylint compares every two files, hashing both each time, which is quadratic in the files; it finds a
-    copy only where two files share a window's hash. So each file is stripped and hashed once, by `jobs`
-    processes; files are grouped where they share a window, transitively; and pylint compares each group's
-    files, in the files' order, as it compares them in a run over all of them: a group shares no file and no
-    line with another, so no copy in one changes what pylint reports in another."""
+    pylint compares every two files, hashing both each time, which is quadratic in the files; it reports a
+    copy only where two files share a window one line past its minimum (`stripped`). So each file is stripped
+    and hashed once, by `jobs` processes; files are grouped where they share such a window, transitively; and
+    pylint compares each group's files, in the files' order, as it compares them in a run over all of them: a
+    group shares no file and no line with another, so no copy in one changes what pylint reports in another.
+    A window of the minimum alone would join hundreds of files that share six lines of boilerplate into one
+    group, which pylint then compares pair by pair."""
     from pylint.checkers.symilar import Symilar  # its import alone takes seconds, which the structure skips
 
     if jobs > 1:
