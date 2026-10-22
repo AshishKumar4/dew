@@ -550,22 +550,38 @@ def test_a_token_export_reads_as_its_one_split_and_refuses_another(tmp_path):
         source(str(tmp_path), split="validation")
 
 
-def test_two_exports_of_the_same_rows_are_the_same_store_and_of_other_rows_another(tmp_path):
+@pytest.mark.parametrize("transport", ["local", "memory"])
+def test_two_exports_of_the_same_rows_are_the_same_store_and_of_other_rows_another(tmp_path, transport):
     """Each host of a run exports its corpus itself, and the run checks that every host reads the same
     data: two exports of the same rows, each writer naming its shards its own way, are one store,
-    as tokens and as files; an export of other rows is another."""
+    as tokens and as files, on a host's disk or remote; an export of other rows is another."""
     from dew.data.sources import Files, TokenFiles
 
     metadata = {"token_store": True, "dtype": "int32", "tokenizer": "byte", "vocab_size": 256, "eos_id": 0}
+    base = str(tmp_path) if transport == "local" else f"memory://exports-{uuid4().hex}"
 
     def exported(name, last):
         rows = [{"text": np.asarray([1, 2, 0], np.int32)}, {"text": np.asarray([3, last, 0], np.int32)}]
-        export(rows, str(tmp_path / name), format="array_record", length_field="text", metadata=metadata)
-        return str(tmp_path / name)
+        export(rows, f"{base}/{name}", format="array_record", length_field="text", metadata=metadata)
+        return f"{base}/{name}"
 
     one, again, other = exported("one", 4), exported("again", 4), exported("other", 5)
     assert TokenFiles(one).fingerprint() == TokenFiles(again).fingerprint() != TokenFiles(other).fingerprint()
     assert Files(one).fingerprint() == Files(again).fingerprint() != Files(other).fingerprint()
+
+
+def test_partitioned_exports_of_the_same_values_under_other_partitions_are_other_stores(tmp_path):
+    """Rows exported partitioned by a field keep that field in the partition's directory alone, so
+    two exports whose files hold the same bytes under other partitions read other rows: other
+    stores; the same rows under the same partitions are one."""
+    from dew.data.sources import Files
+
+    def exported(name, language):
+        export([{"text": "hello", "language": language}], str(tmp_path / name), partitioning=("language",))
+        return Files(str(tmp_path / name)).fingerprint()
+
+    english, again, french = exported("en", "en"), exported("en-again", "en"), exported("fr", "fr")
+    assert english == again != french
 
 
 def test_a_token_export_of_no_documents_reads_as_an_empty_corpus(tmp_path):

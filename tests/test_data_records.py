@@ -181,6 +181,25 @@ def test_an_override_points_a_chain_at_another_store_through_its_holdout(tmp_pat
         override(windows, "source.url", 3)
 
 
+def test_an_override_reads_a_number_as_its_field_and_refuses_a_list_where_no_member_is_one(tmp_path):
+    """A hash holdout's bound set to a whole number reads as the fraction it is; a store's field that
+    is a name or nothing refuses a list, which none of its kinds is."""
+    from dew.data.sources.tokens import TokenFiles
+
+    trained, _ = _documents().holdout(0.25)
+    held_out = encode(trained.shuffle(0).repeat().pipe(presets.lm, "byte", seq_len=8, batch=2))
+    assert not isinstance(held_out, Unrecorded)
+    assert decode(override(held_out, "source.low", 0))._chain().source.low == 0
+    store = TokenFiles(str(tmp_path))
+    windows = encode(store.shuffle(0).repeat().pipe(presets.token_windows, seq_len=8, batch=2))
+    assert not isinstance(windows, Unrecorded)
+    named = override(windows, "source.field", "ids")
+    assert named["source"]["input"]["source"]["fields"]["field"] == "ids"
+    decode(named)
+    with pytest.raises(ValueError):
+        override(windows, "source.field", ["ids"])
+
+
 def test_a_call_whose_argument_changed_since_is_recorded_as_the_stages_it_made():
     """A rename by a mapping changed after the call: the call made again would rename otherwise, so
     the record writes the stages it made, which read back as they were."""
