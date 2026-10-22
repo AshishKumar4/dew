@@ -642,23 +642,26 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         prologue_sides = ba.arguments['prologue_operands']
         epilogue_sides = ba.arguments.get('epilogue_operands', ())
         lhs = (extents['rows'], extents['depth'])
-        # Each step's blocks are written by TMA and read once by the warpgroup's MMA; a prologue reads
-        # the stage of `lhs` and its side tiles and writes the stage back.
+        # Each step's blocks are written by TMA and read once by the warpgroup's MMA. A prologue reads
+        # the stage of `lhs` and its side tiles and writes the stage back before the MMA may read it
+        # (a commit to shared memory, and the consumers' meet): serial with the MMAs, not beside them
+        # (GMMSB-h100-main: a gated prologue at 3.7x the Triton launch's time).
         step = 2 * (config.block_m + config.block_n) * config.block_k * size
+        rewritten = 0.0
         if hooks.prologue is not None:
-            sides = _side_tile_bytes(prologue_sides, hooks.prologue_axes, extents)
-            step += 2 * math.prod(lhs) * size + 2 * sides
-        exponentials = (steps * math.prod(lhs) * _hook_work(hooks.before(), tokens.dtype, prologue_sides,
-                                                            hooks.prologue_axes, lhs, extents)
-                        + config.block_m * config.block_n * _hook_work(
-                            hooks.after(), jnp.float32, epilogue_sides, hooks.epilogue_axes,
-                            (config.block_m, config.block_n), extents))
+            rewritten = steps * (2 * math.prod(lhs) * size
+                                 + 2 * _side_tile_bytes(prologue_sides, hooks.prologue_axes, extents))
+        prologue_exponentials = steps * math.prod(lhs) * _hook_work(
+            hooks.before(), tokens.dtype, prologue_sides, hooks.prologue_axes, lhs, extents)
+        epilogue_exponentials = config.block_m * config.block_n * _hook_work(
+            hooks.after(), jnp.float32, epilogue_sides, hooks.epilogue_axes, (config.block_m, config.block_n),
+            extents)
         return cost.Cost(
             programs=tiles, device_bytes=moved,
             program_flops=2 * steps * config.block_m * config.block_n * config.block_k,
             program_staged=steps * step + config.block_m * config.block_n * out,
-            program_exponentials=exponentials, mode=_mode(tokens.dtype), steps=steps,
-            stages=config.stages)
+            program_exponentials=epilogue_exponentials, mode=_mode(tokens.dtype), steps=steps,
+            stages=config.stages, serial_staged=rewritten, serial_exponentials=prologue_exponentials)
 
     def _multiprocessors(self, interpret: bool) -> int:
         # The interpreter runs one block (jax/_src/pallas/mosaic_gpu/interpret).
