@@ -103,26 +103,28 @@ def forward(spec: algebra.Forward, query: jax.Array, key: jax.Array, value: jax.
             k_tile = jax.lax.dynamic_slice_in_dim(key[row, :, kv_head], j * block_k, block_k)
             logits = algebra.modify(spec, _dot(q, k_tile.T), coords, params)
             m, alpha = algebra.peak(spec, state.m, logits)
-            weights = algebra.weights(spec, logits, m)
             v_tile = jax.lax.dynamic_slice_in_dim(value[row, :, kv_head], j * block_k, block_k)
-            return coords, logits, m, alpha, weights, algebra.total(state.total, alpha, weights), v_tile
+            weights = algebra.weights(spec, logits, m)
+            weights, factor, shift, reach = algebra.room(state, alpha, weights, v_tile)
+            sums = algebra.total(state.total, factor, weights), shift, reach
+            return coords, logits, m, factor, weights, sums, v_tile
 
         def plain(j, state: algebra.Partial) -> algebra.Partial:
-            _, _, m, alpha, weights, denominator, v_tile = softmax(j, state)
-            acc = algebra.rescale(state.acc, alpha) + _dot(algebra.narrow(weights, v_tile.dtype), v_tile)
-            return algebra.Partial(acc, m, denominator)
+            _, _, m, factor, weights, sums, v_tile = softmax(j, state)
+            acc = algebra.rescale(state.acc, factor) + _dot(algebra.narrow(weights, v_tile.dtype), v_tile)
+            return algebra.Partial(acc, m, *sums)
 
         def step(j, carry: tuple[algebra.Partial, algebra.Argmax, jax.Array, jax.Array]):
             state, arg, own, others_total = carry
-            coords, logits, m, alpha, weights, denominator, v_tile = softmax(j, state)
+            coords, logits, m, factor, weights, sums, v_tile = softmax(j, state)
             # The training forward's split sums (`algebra.split_accumulate`), as the Triton mainloop's.
             anchor = algebra.argmax(arg, logits, coords.k_pos)
             others, own_tile = algebra.anchor_split(algebra.narrow(weights, v_tile.dtype),
                                                     coords.k_pos == anchor.key[:, None])
             acc, own, others_total = algebra.split_accumulate(
-                state.acc, own, others_total, alpha, anchor.peak > arg.peak, value[row, arg.key, kv_head],
+                state.acc, own, others_total, factor, anchor.peak > arg.peak, value[row, arg.key, kv_head],
                 _dot(others, v_tile), others, own_tile)
-            return algebra.Partial(acc, m, denominator), anchor, own, others_total
+            return algebra.Partial(acc, m, *sums), anchor, own, others_total
 
         if initial is None:
             state = algebra.empty(block_q, value_width)
@@ -142,7 +144,7 @@ def forward(spec: algebra.Forward, query: jax.Array, key: jax.Array, value: jax.
             carry = state, algebra.no_argmax(block_q), nothing, nothing
             split, arg, own, others_total = jax.lax.fori_loop(lo, hi, step, carry)
             state = split._replace(acc=algebra.split_output(split.acc, own, value[row, arg.key, kv_head]))
-            kept = arg.key, split.acc, own, others_total
+            kept = arg.key, split.acc, own, others_total, split.shift
         else:
             state = jax.lax.fori_loop(lo, hi, plain, state)
             kept = ()
@@ -158,13 +160,14 @@ def forward(spec: algebra.Forward, query: jax.Array, key: jax.Array, value: jax.
 
     if not residuals:
         return out, None
-    _, m, denominator, anchors, others, own, others_total = mapped
+    _, m, denominator, anchors, others, own, others_total, shift = mapped
 
     def rowwise(x):
         return x.reshape(blocks, batch, heads, block_q).transpose(1, 2, 0, 3).reshape(batch, heads, queries)
 
     others = others.reshape(blocks, batch, heads, block_q, value_width).transpose(1, 2, 0, 3, 4)
-    split = Split(others.reshape(batch, heads, queries, value_width), rowwise(own), rowwise(others_total))
+    split = Split(others.reshape(batch, heads, queries, value_width), rowwise(own), rowwise(others_total),
+                  rowwise(shift))
     return out, (rowwise(m), rowwise(denominator), rowwise(anchors), split)
 
 
@@ -195,7 +198,7 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, 
         return out[:, :queries, :, :value_width]
     m, denominator, anchors, split = kept
     sums = Split(split.others[:, :, :queries, :value_width], split.own[:, :, :queries],
-                 split.others_total[:, :, :queries])
+                 split.others_total[:, :, :queries], split.shift[:, :, :queries])
     return (out[:, :queries, :, :value_width], m[:, :, :queries], denominator[:, :, :queries],
             anchors[:, :, :queries], sums)
 
@@ -218,9 +221,9 @@ def _logits(score_mod, query, key, seen, q_pos, k_pos, params, scale: float, slo
     return jnp.where(seen, logits, -jnp.inf), derivatives
 
 
-def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_index, anchor_value, sums,
-               spans, score_params, *, score_mod, score_kinds: tuple[Kind, ...], scale: float, block_q: int,
-               block_k: int):
+def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_index, anchor_value, shift,
+               sums, spans, score_params, *, score_mod, score_kinds: tuple[Kind, ...], scale: float,
+               block_q: int, block_k: int):
     """The Triton mainloop's dQ launch (`attention_triton._dq_launch`), a query block and head at a time:
     the first pass at the forward's maximum to each query's denominator and `D - c`
     (`algebra.off_anchor_delta`), then dQ and the dQ program's hook gradients under it, `D` refined once
@@ -243,6 +246,7 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
         do = jax.lax.dynamic_slice_in_dim(dout[row, :, head], i * block_q, block_q)
         peak0, total0, term0 = peak[row, head, rows], total[row, head, rows], initial_term[row, head, rows]
         maxima, chosen = maximum[row, head, rows], key_index[row, head, rows]
+        shifts = shift[row, head, rows]
         anchor_rows = jax.lax.dynamic_slice_in_dim(anchor_value[row, :, head], i * block_q, block_q)
         lo, hi = bounds.lo[row, i], bounds.hi[row, i]
 
@@ -255,25 +259,26 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
             return columns, _seen(spans, row, rows, columns), params, k_tile, v_tile
 
         before, state_total, state_share = algebra.off_anchor_start(peak0, total0, term0, maxima,
-                                                                    value.shape[-1])
+                                                                    value.shape[-1], shifts)
         if sums is None:
             # D without the forward's split sums: the dQ launch's own pass over the keys.
             def row_terms(j, state):
                 columns, seen, params, k_tile, v_tile = tile(j)
                 logits, _ = _logits(score_mod, q, k_tile, seen, q_pos, columns[None, :], params, scale)
                 at_anchor = columns[None, :] == chosen[:, None]
-                exponentials, rest, own = algebra.off_anchor_weights(logits, maxima, at_anchor, v_tile.dtype)
+                exponentials, rest, own = algebra.off_anchor_weights(logits, maxima, at_anchor, v_tile.dtype,
+                                                                     shifts)
                 return algebra.off_anchor(state, exponentials, rest, own, _dot(rest, v_tile))
 
             walked = jax.lax.fori_loop(lo, hi, row_terms, before)
-            prior = walked.total
+            prior = walked.total * jnp.exp2(shifts)
             anchor, delta, chosen = algebra.off_anchor_delta(walked, anchor_rows, do, state_total,
-                                                             state_share, chosen)
+                                                             state_share, chosen, shifts)
         else:
             # The forward took the first pass (`algebra.split_delta`).
             others, own, others_total, prior = (part[row, head, rows] for part in sums)
             anchor, delta, chosen = algebra.split_delta(others, own, others_total, prior, state_total,
-                                                        anchor_rows, do, chosen)
+                                                        anchor_rows, do, chosen, shifts)
         m = maxima
 
         def step(j, carry):
@@ -406,10 +411,10 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
                                        else tiles(grad) for grad, kind in zip(written, kinds, strict=True))
 
 
-def _launch(query, key, value, dout, peak, total, initial_term, maximum, key_index, anchor_value, others, own,
-            others_total, forward_total, start, end, query_ids, key_ids, score_params, *, score_mod,
-            score_kinds: tuple[Kind, ...], score_dtypes: tuple[str, ...], scale: float, block_q: int,
-            block_k: int, split: bool):
+def _launch(query, key, value, dout, peak, total, initial_term, maximum, key_index, anchor_value, shift,
+            others, own, others_total, forward_total, start, end, query_ids, key_ids, score_params, *,
+            score_mod, score_kinds: tuple[Kind, ...], score_dtypes: tuple[str, ...], scale: float,
+            block_q: int, block_k: int, split: bool):
     """The Triton backward's outputs (`TritonBackward`), from this mainloop's two launches."""
     del score_dtypes
     spans = start, end, query_ids, key_ids
@@ -417,7 +422,8 @@ def _launch(query, key, value, dout, peak, total, initial_term, maximum, key_ind
               "block_k": block_k}
     sums = (others, own, others_total, forward_total) if split else None
     dq, softmax, chosen, dq_grads = _dq_launch(query, key, value, dout, peak, total, initial_term, maximum,
-                                               key_index, anchor_value, sums, spans, score_params, **shared)
+                                               key_index, anchor_value, shift, sums, spans, score_params,
+                                               **shared)
     delta, anchor, m, denominator, _ = softmax
     dk, dv, key_grads = _dkv_launch(query, key, value, dout, m, denominator, anchor, delta, chosen, spans,
                                     score_params, **shared)

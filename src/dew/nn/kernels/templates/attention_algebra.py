@@ -104,25 +104,65 @@ class Coords(NamedTuple):
 class Partial(NamedTuple):
     """A query block's softmax state, unhooked: the weighted values `acc` `[..., bq, Dv]`, the running
     maximum `m` `[..., bq]` (in base 2 where the step's logits are) and the denominator `total`
-    `[..., bq]`, fp32. `rescale`, `merge` and `finish` take any leading axes, so states a launch wrote
-    per slice merge in XLA after it."""
+    `[..., bq]`, fp32, both sums at each row's `2^-shift` (`room`), and the largest value magnitude the
+    row has weighed, `reach` `[..., bq]`. `rescale`, `merge` and `finish` take any leading axes, so
+    states a launch wrote per slice merge in XLA after it."""
 
     acc: jax.Array
     m: jax.Array
     total: jax.Array
+    shift: jax.Array | float = 0.0
+    reach: jax.Array | float = 0.0
 
 
 def empty(rows: int, width: int) -> Partial:
     """The softmax before any key: `merge`'s identity."""
-    return Partial(jnp.zeros((rows, width), jnp.float32), jnp.full((rows,), -jnp.inf, jnp.float32),
-                   jnp.zeros((rows,), jnp.float32))
+    nothing = jnp.zeros((rows,), jnp.float32)
+    return Partial(jnp.zeros((rows, width), jnp.float32), jnp.full((rows,), -jnp.inf, jnp.float32), nothing,
+                   nothing, nothing)
+
+
+HEADROOM = 126
+"""The exponent a state's weighted values stay within (`needed`): one below fp32's largest binade, so a
+tile's product adds at most as much again and the sum stays finite."""
+
+
+def needed(total: jax.Array, reach: jax.Array) -> jax.Array:
+    """The shift a row's sums need, `[...]` fp32 integers: none while its natural denominator `total` times
+    the largest value it weighs, `reach`, is below `2^HEADROOM`, the weighted values' bound; past it, as
+    many binades as that product passes it by (log2 rounded up, so the bound holds whatever their
+    rounding)."""
+    binades = jnp.ceil(jnp.log2(total) + jnp.log2(reach)) - HEADROOM
+    return jnp.where(jnp.isfinite(binades) & (binades > 0), binades, 0.0)
+
+
+def room(state: Partial, alpha: jax.Array, p: jax.Array, value: jax.Array
+         ) -> tuple[jax.Array, jax.Array, jax.Array, jax.Array]:
+    """A tile's weights `p` (`weights`) and the factor its state's sums take (`alpha`, `peak`'s) with
+    each row's shift for the tile (`needed`): the shifted weights, the sums' factor, and the row's new
+    shift and reach. The weighted values of a row can pass fp32's largest only where its values are
+    near it (a sum of up to `total` of them); a shift of `2^-k` on every weight keeps them within it,
+    exactly, as a power of two scales, and leaves every ratio the softmax takes, so the output is the
+    unshifted one. A row whose values are ordinary takes `k = 0`, its bits the unshifted ones; a row
+    that takes one shifts its weights only once its values need it, so a weight it pushes below the
+    narrowed dtype's least subnormal (or fp32's) was below an ulp of the row's sums."""
+    reach = jnp.maximum(state.reach, jnp.max(jnp.abs(value.astype(jnp.float32))))
+    natural = alpha * state.total * jnp.exp2(state.shift) + p.sum(axis=-1)
+    shift = jnp.maximum(state.shift, needed(natural, reach))
+    scale = jnp.exp2(-shift)
+    return p * expand(scale, p), alpha * jnp.exp2(state.shift - shift), shift, reach
 
 
 def resumed(spec: Forward, m: jax.Array, total: jax.Array, acc: jax.Array) -> Partial:
     """The softmax resumed from a state `(m, total, acc)` (`Hooks.initial`: sinks, a resumed partial),
-    its maximum taken to base 2 where the step's logits are."""
+    its maximum taken to base 2 where the step's logits are, its sums shifted as their size needs
+    (`needed`: `acc`'s largest magnitude is its denominator times the values' it weighed)."""
     m, total, acc = (array.astype(jnp.float32) for array in (m, total, acc))
-    return Partial(acc, m * LOG2E if spec.base2 else m, total)
+    largest = jnp.max(jnp.abs(acc), axis=-1)
+    reach = jnp.where(total > 0, largest / jnp.where(total > 0, total, 1.0), 0.0)
+    shift = needed(total, reach)
+    scale = jnp.exp2(-shift)
+    return Partial(acc * expand(scale, acc), m * LOG2E if spec.base2 else m, total * scale, shift, reach)
 
 
 def modify(spec: Forward, s: jax.Array, coords: Coords, params: tuple[jax.Array, ...] = (),
@@ -246,16 +286,22 @@ def merge(spec: Forward, first: Partial, second: Partial) -> Partial:
     keys), so `empty` is its identity under every spec."""
     m = jnp.maximum(first.m, second.m)
     safe = jnp.where(m == -jnp.inf, 0.0, m)
-    a, b = spec.carry(first.m - safe), spec.carry(second.m - safe)
+    reach = jnp.maximum(first.reach, second.reach)
+    natural = (spec.carry(first.m - safe) * first.total * jnp.exp2(first.shift)
+               + spec.carry(second.m - safe) * second.total * jnp.exp2(second.shift))
+    shift = jnp.maximum(jnp.maximum(first.shift, second.shift), needed(natural, reach))
+    a = spec.carry(first.m - safe) * jnp.exp2(first.shift - shift)
+    b = spec.carry(second.m - safe) * jnp.exp2(second.shift - shift)
     acc = expand(a, first.acc) * first.acc + expand(b, second.acc) * second.acc
-    return Partial(acc, m, a * first.total + b * second.total)
+    return Partial(acc, m, a * first.total + b * second.total, shift, reach)
 
 
 def finish(spec: Forward, state: Partial, *, initial: bool, output_mod: Callable | None = None,
            output_params: tuple[jax.Array, ...] = ()) -> tuple[jax.Array, jax.Array, jax.Array]:
     """The block's output `[bq, Dv]` fp32 (its weighted values over its denominator, zero for a query
     that saw nothing and started from no state, then the output hook) and its residuals: the natural
-    maximum (0 for such a query, as the reference's) and the denominator."""
+    maximum (0 for such a query, as the reference's) and the denominator, unshifted (`room`); the output
+    is the shifted sums' ratio, which the shift leaves."""
     m = state.m / LOG2E if spec.base2 else state.m
     denominator = state.total
     if spec.guarded or initial:
@@ -266,7 +312,7 @@ def finish(spec: Forward, state: Partial, *, initial: bool, output_mod: Callable
         out = state.acc / expand(denominator, state.acc)
     if output_mod is not None:
         out = output_mod(out, *output_params)
-    return out, m, denominator
+    return out, m, denominator * jnp.exp2(state.shift)
 
 
 # The backward's algebra: what lies between its products (S = Q·Kᵀ, dP = dO·Vᵀ, then dV, dK and dQ),
@@ -360,22 +406,25 @@ class OffAnchor(NamedTuple):
 
 
 def off_anchor_start(peak0: jax.Array, total0: jax.Array, term0: jax.Array, maximum: jax.Array,
-                     width: int) -> tuple[OffAnchor, jax.Array, jax.Array]:
+                     width: int, shift: jax.Array) -> tuple[OffAnchor, jax.Array, jax.Array]:
     """The first pass from the softmax's initial state (its maximum, denominator and share of D's
-    numerator) weighed at the forward's `maximum`, and that state's denominator and share there."""
+    numerator) weighed at the forward's `maximum`, its sums at each row's `2^-shift` (the forward's,
+    `room`), and that state's denominator and share there, unshifted."""
     carried = jnp.where(peak0 == -jnp.inf, 0.0, jnp.exp(jnp.minimum(peak0 - maximum, 0.0)))
     state_total, state_share = total0 * carried, term0 * carried
     nothing = jnp.zeros_like(total0)
-    return OffAnchor(state_total, jnp.zeros((total0.shape[0], width), jnp.float32), nothing, nothing), \
-        state_total, state_share
+    first = OffAnchor(state_total * jnp.exp2(-shift), jnp.zeros((total0.shape[0], width), jnp.float32),
+                      nothing, nothing)
+    return first, state_total, state_share
 
 
 def off_anchor_weights(logits: jax.Array, maximum: jax.Array, at_anchor: jax.Array,
-                       dtype) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """A tile's weights `exp(s - m)` at the forward's maximum, fp32; them narrowed to the values'
-    `dtype` as the forward rounds them, zero at the anchor key (`at_anchor`), the left operand of `B`'s
-    product; and the anchor key's narrowed weight, fp32."""
+                       dtype, shift: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
+    """A tile's weights `exp(s - m)` at the forward's maximum, fp32, at each row's `2^-shift` (`room`);
+    them narrowed to the values' `dtype` as the forward rounds them, zero at the anchor key
+    (`at_anchor`), the left operand of `B`'s product; and the anchor key's narrowed weight, fp32."""
     exponentials = below(logits, maximum)
+    exponentials = exponentials * expand(jnp.exp2(-shift), exponentials)
     rounded = exponentials.astype(dtype)
     rest = jnp.where(at_anchor, jnp.zeros_like(rounded), rounded)
     own = jnp.where(at_anchor, rounded, jnp.zeros_like(rounded)).astype(jnp.float32).sum(axis=-1)
@@ -390,15 +439,18 @@ def off_anchor(state: OffAnchor, exponentials: jax.Array, rest: jax.Array, own: 
 
 
 def off_anchor_delta(state: OffAnchor, anchor_value: jax.Array, dout: jax.Array, state_total: jax.Array,
-                     state_share: jax.Array, key_index: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
+                     state_share: jax.Array, key_index: jax.Array,
+                     shift: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
     """Each query's anchor c (`v_c · dO`, or 0), `D - c`, and the anchor key's index (-1 where c is 0),
     from the first pass. D's numerator two ways: about 0, `sum_j e_j v_j · dO`, as the output's own
     product with dO rounds it, which suits a query whose weights spread over many keys; and about
     `c = v_c · dO`, `sum_{j != c} e_j (v_j - v_c) · dO`, where c enters as exactly 0, which suits one
-    whose weight sits on c. Each query takes the one nearer its D, the one whose terms cancel less."""
+    whose weight sits on c. Each query takes the one nearer its D, the one whose terms cancel less. The
+    pass's sums are at each row's `2^-shift` (`room`), and the state's are taken there."""
     cotangent = dout.astype(jnp.float32)
     anchor_value = anchor_value.astype(jnp.float32)
     anchor = jnp.sum(anchor_value * cotangent, axis=-1)
+    state_total, state_share = state_total * jnp.exp2(-shift), state_share * jnp.exp2(-shift)
     own, others_total = expand(state.own, anchor_value), expand(state.others_total, anchor_value)
     about_zero = jnp.sum((state.others + own * anchor_value) * cotangent, axis=-1) + state_share
     about_anchor = (jnp.sum((state.others - others_total * anchor_value) * cotangent, axis=-1)
@@ -411,13 +463,15 @@ def off_anchor_delta(state: OffAnchor, anchor_value: jax.Array, dout: jax.Array,
 
 def split_delta(others: jax.Array, own: jax.Array, others_total: jax.Array, total: jax.Array,
                 state_total: jax.Array, anchor_value: jax.Array, dout: jax.Array,
-                key_index: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
+                key_index: jax.Array, shift: jax.Array) -> tuple[jax.Array, jax.Array, jax.Array]:
     """`off_anchor_delta` from a training forward's split sums (`split_accumulate`), the backward's first
     pass taken by the forward: `B` with the initial state's share inside it, the other keys' weights'
     sum, the anchor's own weight, the denominator `total` and the initial state's own `state_total`, all
     at the forward's maximum. D's numerator about 0 is `(B + own v_c) · dO`, about `c = v_c · dO` it is
     `(B - others_total v_c) · dO - state_total c`, its terms kept apart so a state or keys that weigh
-    little beside the anchor are not lost from a total; each query takes the one nearer its D."""
+    little beside the anchor are not lost from a total; each query takes the one nearer its D. The split
+    sums are at each row's `2^-shift` (`room`), and `total` and `state_total` are taken there."""
+    total, state_total = total * jnp.exp2(-shift), state_total * jnp.exp2(-shift)
     cotangent = dout.astype(jnp.float32)
     anchor_value = anchor_value.astype(jnp.float32)
     anchor = jnp.sum(anchor_value * cotangent, axis=-1)
