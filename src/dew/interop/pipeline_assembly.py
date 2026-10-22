@@ -41,7 +41,7 @@ from dew.interop.components import bind_component
 from dew.interop.decoder_bindings import decoder_layouts
 from dew.interop.safetensors_io import LazyTensors
 from dew.interop.sources import StoredWeights
-from dew.interop.streaming import WeightLayout
+from dew.interop.streaming import LazyTree, WeightLayout
 from dew.interop.weights import AUTO, ParamTree, source_alias
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -462,11 +462,8 @@ def _unet_denoiser(directory: Path, *, dtype: str | None, attention_impl: str) -
     config = _component_config(directory, "unet")
     fields = diffusion.unet_fields(config, dtype=dtype, attention_impl=attention_impl)
     model = fields.value
-
-    def weights(param_dtype: str, lazy: bool) -> tuple[Variables, tuple[WeightLayout, ...]]:
-        params, layouts = diffusion.translate_unet_weights(
-            diffusion.component_tensors(directory, "unet"), model, param_dtype=param_dtype, lazy=lazy)
-        return {"params": params}, layouts
+    weights = _component_weights(directory, "unet", functools.partial(diffusion.translate_unet_weights,
+                                                                      model=model))
 
     pooled = model.additional_time_features > 0
     built = {"class": "unet_2d_condition",
@@ -511,11 +508,23 @@ def _transformer_source(directory: Path, path_of: Callable[[str, int], tuple[str
     same layouts from the stored shapes alone (`_Denoiser.plan`)."""
     from dew.interop import diffusion
 
-    def weights(param_dtype: str, lazy: bool) -> tuple[Variables, tuple[WeightLayout, ...]]:
-        params, layouts = diffusion.read_transformer(diffusion.component_tensors(directory, "transformer"),
-                                                     path_of, param_dtype=param_dtype, lazy=lazy)
-        return {"params": params}, layouts
+    weights = _component_weights(directory, "transformer", functools.partial(diffusion.read_transformer,
+                                                                             path_of=path_of))
     return weights, functools.partial(diffusion.transformer_layouts, path_of=path_of)
+
+
+def _component_weights(directory: Path, component: str,
+                       read: Callable[..., tuple[LazyTree, tuple[WeightLayout, ...]]]
+                       ) -> Callable[[str, bool], tuple[Variables, tuple[WeightLayout, ...]]]:
+    """A denoiser's `weights(param_dtype, lazy)`: its `component`'s tensors read by `read`, the
+    parameters under `params`, beside their layouts."""
+    from dew.interop import diffusion
+
+    def weights(param_dtype: str, lazy: bool) -> tuple[Variables, tuple[WeightLayout, ...]]:
+        params, layouts = read(diffusion.component_tensors(directory, component), param_dtype=param_dtype,
+                               lazy=lazy)
+        return {"params": params}, layouts
+    return weights
 
 
 def _transformer_denoiser(name: str, model: nn.Module, fields: Mapping[str, object], config: dict,

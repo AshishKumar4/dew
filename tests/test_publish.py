@@ -16,7 +16,6 @@ import pytest
 
 import dew.io
 from dew.checkpoints import FROZEN_STORE, RUN_FILE, Checkpoints
-from dew.config.data import RecordsData, loader
 
 
 class Artifact:
@@ -155,7 +154,8 @@ def test_a_published_lora_run_downloads_to_a_run_that_loads_and_restores(tmp_pat
     import optax
     import wandb as library
 
-    from dew.data import Loading
+    from dew.data import Loading, Memory
+    from dew.data.compile import compile
     from dew.lora import Adapter, LoRA
     from dew.nn.backbones.causal_transformer import CausalTransformer
     from dew.objectives.lm import LMObjective
@@ -171,8 +171,8 @@ def test_a_published_lora_run_downloads_to_a_run_that_loads_and_restores(tmp_pat
     run = tmp_path / "run"
     checkpoints = Checkpoints(str(run))
     state = Trainer(objective, optax.sgd(1.0), key=0, checkpoints=checkpoints).fit(
-        loader(RecordsData(source=rows), batch=8, loading=Loading(workers=0, threads=1, read_buffer=1),
-            read="memory"),
+        compile(Memory(rows).shuffle(0).repeat().batch(8), read="memory",
+                loading=Loading(workers=0, threads=1, read_buffer=1)),
         steps=2, checkpoint_every=1, log_every=100)
     checkpoints.wait()
     original, _ = checkpoints.restore()

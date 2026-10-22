@@ -66,8 +66,10 @@ def test_a_files_programs_reach_the_next_process_in_one_bundle(cache_worker, tmp
     """With jax as Dew pins it: `install` keeps JAX's own cache directory, a
     file's compilations reach the Worker as one bundle under the version and
     device prefix, and a process with an empty local cache reads them back
-    instead of compiling, its programs all held, so it writes nothing back. A
-    program the bundle lacked is written back with the rest."""
+    instead of compiling, its programs all held, so it writes nothing back,
+    under another release of jax with the same jaxlib too (a post-release of
+    Dew's patch stack). A program the bundle lacked is written back with the
+    rest."""
     import os
     import subprocess
     import sys
@@ -76,6 +78,8 @@ def test_a_files_programs_reach_the_next_process_in_one_bundle(cache_worker, tmp
     script = """
 import sys
 import jax
+if sys.argv[4] == "bumped":
+    jax.__version__ += ".post999"
 import remote_cache
 from dew.cache import enable_compilation_cache
 from dew.telemetry.instrumentation import compilation_cache_counts, count_compilation_cache
@@ -94,8 +98,8 @@ print(remote.programs_fetched, remote.uploaded, int(counts.get("train/cache_miss
     path = os.pathsep.join([os.path.dirname(__file__), os.environ.get("PYTHONPATH", "")])
     env = {**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": path}
 
-    def run(local, more="-"):
-        done = subprocess.run([sys.executable, "-c", script, str(tmp_path / local), url, more],
+    def run(local, more="-", release="pinned"):
+        done = subprocess.run([sys.executable, "-c", script, str(tmp_path / local), url, more, release],
                               env=env, capture_output=True, text=True, timeout=300)
         assert done.returncode == 0, done.stderr[-2000:]
         return done.stdout.split()
@@ -103,12 +107,13 @@ print(remote.programs_fetched, remote.uploaded, int(counts.get("train/cache_miss
     value, fetched, uploaded, compiled = run("first")
     assert (value, fetched, uploaded) == ("18.0", "0", "1") and int(compiled) >= 1
     [key] = stored
-    assert key.startswith(f"/jax{__import__('jax').__version__}/")
+    assert key.startswith(f"/jaxlib{__import__('jaxlib').__version__}/")
     assert key.endswith("/cpu/bundles/tests/test_step.py")
     programs = len(list(remote_cache.unpacked(stored[key])))
     assert programs >= 1
     # Read back, nothing compiles: JAX's persistent cache misses nothing.
     assert run("second") == ["18.0", str(programs), "0", "0"]
+    assert run("bumped", release="bumped") == ["18.0", str(programs), "0", "0"]
     assert run("third", "more") == ["18.0", str(programs), "1", "1"]
     assert len(list(remote_cache.unpacked(stored[key]))) > programs
 
