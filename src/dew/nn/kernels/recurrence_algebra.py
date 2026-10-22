@@ -38,13 +38,7 @@ import jax
 import jax.numpy as jnp
 from jax.custom_derivatives import linear_call
 
-from dew.nn.precision import (
-    compensated_add,
-    compensated_difference,
-    float32_matmul,
-    float32_products,
-    products_dtype,
-)
+from dew.nn.precision import compensated_add, compensated_difference, float32_einsum, float32_matmul
 
 Issue = Callable[[str, jax.Array, jax.Array], jax.Array]
 """A mainloop's product: `issue(name, left, right)` is `left @ right` over the last two axes, the product
@@ -235,8 +229,7 @@ def paired(name: str, left, right, decay, issue: Issue = portable):
     scales the product `name` after it, one per key dimension weighs each term of it."""
     if decay.shape[-1] == 1:
         return issue(name, left, jnp.swapaxes(right, -1, -2)) * decay[..., 0]
-    return jnp.einsum('...sd,...td,...std->...st', left, right, decay,
-                      precision=float32_products(products_dtype(left, right, decay)))
+    return float32_einsum('...sd,...td,...std->...st', left, right, decay)
 
 
 def intra(key, keyed, pairs, issue: Issue = portable):
