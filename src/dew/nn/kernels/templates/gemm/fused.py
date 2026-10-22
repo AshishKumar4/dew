@@ -15,7 +15,9 @@ The fuser hands the consumer over as one function of the product and the arrays 
 evaluates the consumer on tiles, so the epilogue is a plain JAX function that tiles itself at whatever
 block the kernel traces it with (`acc.shape`), and runs whole where XLA does. A consumer the kernels
 cannot take tile by tile (one that reads the tile's position, a captured array that follows no launch
-axis, scalar prefetch) runs in XLA after the template's product, the value the same.
+axis, scalar prefetch) runs in XLA after the template's product, the value the same, and the call reports
+it (`generation.route`'s 'gemm_epilogue', XLA's with the refusal's reason), so a model that loses its
+fusion shows where it does.
 """
 
 import functools
@@ -25,6 +27,7 @@ import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import fuser
 
+from dew.nn.kernels import generation
 from dew.nn.kernels.templates.gemm import template
 
 AXES = ('rows', 'columns')
@@ -53,11 +56,14 @@ def _product(transpose_rhs: bool, interpret_on_cpu: bool, dense: bool, *fusions)
     acc = jax.ShapeDtypeStruct((lhs.shape[0], width), jnp.float32)
     consumer, values, prefetch = fuser.get_fusion_values(out_fusion, acc)
     leaves, treedef = jax.tree.flatten(values)
-    axes = _axes(consumer, values, acc) if not prefetch else None
-    if axes is None:
+    axes = (generation.Refusal('scalar_prefetch', "the consumer reads scalar prefetch") if prefetch
+            else _axes(consumer, values, acc))
+    if isinstance(axes, generation.Refusal):
+        generation.route('gemm_epilogue', kernel='xla', preferred='fused', refusal=axes)
         summed = template.gemm(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs, out_dtype=jnp.float32,
                                interpret_on_cpu=interpret_on_cpu)
         return consumer(values, summed)
+    generation.route('gemm_epilogue', kernel='fused')
     out_leaves, out_treedef = jax.tree.flatten(jax.eval_shape(consumer, values, acc))
     value_types = tuple(jax.typeof(leaf) for leaf in leaves)
     epilogue = functools.partial(_tiled, consumer, treedef, value_types, out_treedef, acc.shape)
@@ -69,30 +75,32 @@ def _product(transpose_rhs: bool, interpret_on_cpu: bool, dense: bool, *fusions)
     return jax.tree.unflatten(out_treedef, consumed if several else (consumed,))
 
 
-def _axes(consumer, values, acc) -> tuple | None:
+def _axes(consumer, values, acc) -> tuple | generation.Refusal:
     """The launch axes each captured array follows, one per dimension, from its block spec at a probe
-    tile; None where the product's own block is not the tile at its place (a transpose), a captured
-    array follows no launch axis (a scalar) or its block is not the tile's, or the consumer reads the
-    tile's position."""
+    tile; the refusal where the product's own block is not the tile at its place (a transpose), a
+    captured array follows no launch axis (a scalar) or its block is not the tile's, or the consumer reads
+    the tile's position."""
     probe = (_probe(acc.shape[0]), _probe(acc.shape[1]))
     tiled, (value_specs, acc_spec), _ = fuser.pull_block_spec(consumer, _specs(consumer, values, acc, probe),
                                                               grid_len=2)(values, acc)
     if not _is_tile(acc_spec, probe):
-        return None
+        return generation.Refusal('product_untiled',
+                                  "the consumer reads the product at other than its tile")
     axes = []
     specs = jax.tree.leaves(value_specs, is_leaf=_is_spec)
     for leaf, leaf_spec in zip(jax.tree.leaves(values), specs, strict=True):
         block_shape, index_map = _block_and_map(leaf_spec)
         if block_shape is None or index_map is None:
-            return None
+            return generation.Refusal('value_unblocked', f"a captured {leaf.shape} array has no block")
         named = []
         for block, index, size in zip(block_shape, index_map(1, 2), leaf.shape, strict=True):
             if index not in (1, 2) or block != probe[index - 1] or size != acc.shape[index - 1]:
-                return None
+                return generation.Refusal(
+                    'value_off_axes', f"a captured {leaf.shape} array follows no launch axis tile by tile")
             named.append(AXES[index - 1])
         axes.append(tuple(named))
     if _reads_position(tiled, value_specs, values, probe):
-        return None
+        return generation.Refusal('reads_position', "the consumer reads its tile's position")
     return tuple(axes)
 
 

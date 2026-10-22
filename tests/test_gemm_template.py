@@ -538,6 +538,24 @@ def test_the_fused_epilogue_keeps_the_programs_value(generation_name, consumer):
                         seeds=SEEDS, truth_fn=truth)
 
 
+@pytest.mark.parametrize(("consumer", "kernel", "code"), [(bias_cast, 'fused', None),
+                                                          (positional, 'xla', 'reads_position')],
+                         ids=("tiled", "positional"))
+def test_a_consumer_the_kernels_cannot_take_reports_its_route(consumer, kernel, code):
+    """A consumer fused into the epilogue reports so; one left to XLA reports why, so a model that loses
+    its fusion shows where (`generation.route`'s 'gemm_epilogue')."""
+    sizes = jnp.asarray(SIZES)
+    x, w, _, _, b, u, *_ = _draw(0)
+
+    def fusing(x, w, b, r):
+        return consumer(fused.fusible_gemm(x, w, sizes, interpret_on_cpu=True), b, r)
+
+    with generation.assumed("sm80"), generation.routes() as taken:
+        jax.jit(fuser.fuse(fusing)).trace(x, w, b, u[:, :WIDTH])
+    [found] = [route for route in taken if route.choice == 'gemm_epilogue']
+    assert found.kernel == kernel and (found.refusal is None if code is None else found.refusal.code == code)
+
+
 @lowers("sm90")
 @pytest.mark.parametrize("launch", [grouped_matmul.MosaicGmm(), grouped_matmul.MosaicTgmm()],
                          ids=lambda launch: type(launch).__name__)
