@@ -1234,7 +1234,10 @@ def test_published_generation_exposes_only_declared_order_metadata_and_plan():
     assert generation.plan("offsets").tolist() == [0, 1, 2, 3, 4]
     assert generation.plan_length("offsets") == 5
     assert generation.plan_at("offsets", 3).item() == 3
-    assert len(generation.plan_hash("offsets")) == 64
+    # A plan published page by page is named as the same array held whole is (`plan.fingerprint`).
+    from dew.data.plan import fingerprint
+
+    assert generation.plan_hash("offsets") == fingerprint(np.arange(5))
 
 
 def test_transient_failures_never_certify_cache_coverage_but_permanent_rejections_do():
