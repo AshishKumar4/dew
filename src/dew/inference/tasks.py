@@ -313,71 +313,58 @@ def saved_settings[SettingsT](record: Mapping[str, object], settings: type[Setti
 
 
 @dataclass(frozen=True, kw_only=True)
-class TextSettings:
-    """What a causal decoder's run records beside its model, and its task is built with
-    (`TextGeneration.from_settings`).
-
-    `seq_len` is the decoder's training row length, `max_new_tokens` its
-    previews' budget (0 for none) and `sampling` their policy. `tokenizer`
-    names the run tokenizer (`recorded_tokenizer`) and `processor` a
-    checkpoint's own processor source (`recorded_processor`); either may be
-    None.
-    """
+class TaskSettings:
+    """What every generation run records beside its model: `seq_len`, its training row length,
+    `max_new_tokens`, its task's response budget (0 for none), and its host processor's source:
+    `tokenizer` names the run tokenizer (`recorded_tokenizer`) and `processor` a checkpoint's own
+    processor source (`recorded_processor`); either may be None. Each task's settings add what its
+    generation reads."""
 
     seq_len: int
     max_new_tokens: int
-    sampling: Sampling
     tokenizer: str | None
     processor: str | None
 
     def __post_init__(self) -> None:
-        _budget_checked(self.max_new_tokens)
+        if type(self.max_new_tokens) is not int or self.max_new_tokens < 0:
+            raise ValueError("max_new_tokens must be a nonnegative integer")
 
 
 @dataclass(frozen=True, kw_only=True)
-class MaskedSettings:
-    """What a masked-diffusion run records beside its model, and its task is built with
-    (`MaskedGeneration.from_settings`): the row length, the response budget, the tokenizer or
-    source processor as `TextSettings` holds them, the masking process, the unmasking solver
-    and its step count."""
+class TextSettings(TaskSettings):
+    """A causal decoder's run's settings (`TextGeneration.from_settings`): its previews' sampling
+    policy beside the common ones."""
 
-    seq_len: int
-    max_new_tokens: int
+    sampling: Sampling
+
+
+@dataclass(frozen=True, kw_only=True)
+class MaskedSettings(TaskSettings):
+    """A masked-diffusion run's settings (`MaskedGeneration.from_settings`): the masking process,
+    the unmasking solver and its step count beside the common ones."""
+
     process: DiscreteProcess
     solver: Solver
     sampling_steps: int
-    tokenizer: str | None
-    processor: str | None
 
     def __post_init__(self) -> None:
-        _budget_checked(self.max_new_tokens)
+        super().__post_init__()
         integer(self.sampling_steps, "sampling_steps")
         if not isinstance(self.solver, Unmask):
             raise ValueError("a masked run's task unmasks with an Unmask solver")
 
 
 @dataclass(frozen=True, kw_only=True)
-class BlockSettings:
-    """What a block-diffusion run records beside its model, and its task is built with
-    (`BlockGeneration.from_settings`): the sequence length, the canvas budget, the tokenizer or
-    source processor as `TextSettings` holds them, the block process and the pad id."""
+class BlockSettings(TaskSettings):
+    """A block-diffusion run's settings (`BlockGeneration.from_settings`): the block process and
+    the pad id beside the common ones."""
 
-    seq_len: int
-    max_new_tokens: int
     process: BlockProcess
     pad_token_id: int
-    tokenizer: str | None
-    processor: str | None
 
     def __post_init__(self) -> None:
-        _budget_checked(self.max_new_tokens)
+        super().__post_init__()
         integer(self.pad_token_id, "pad_token_id")
-
-
-def _budget_checked(budget: int) -> None:
-    """Refuse a recorded token budget that is not a nonnegative integer."""
-    if type(budget) is not int or budget < 0:
-        raise ValueError("max_new_tokens must be a nonnegative integer")
 
 
 def saved_model(record: Mapping[str, object], dtype: DTypeLike | None) -> ModelConfig:
@@ -411,8 +398,7 @@ def recorded_processor(processor: Processor | None) -> str | None:
     return processor.source if isinstance(processor, SourceProcessor) else None
 
 
-def _saved_processor(settings: TextSettings | MaskedSettings | BlockSettings,
-                     config: ModelConfig) -> Processor | None:
+def _saved_processor(settings: TaskSettings, config: ModelConfig) -> Processor | None:
     """Build the run's host processor: the checkpoint's own, reloaded from the
     source it recorded beside `config`'s model, or its run tokenizer."""
     from dew.data.text import tokenizer_for
