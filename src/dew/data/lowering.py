@@ -55,6 +55,7 @@ from dew.data.dataset import (
     DataPartition,
     FilledBatch,
     Loading,
+    Ranges,
     Records,
     _column,
     _shareable,
@@ -383,8 +384,8 @@ def _positioned(manifest: ShardManifest) -> ShardManifest:
     rows = [shard.rows for shard in manifest.shards if shard.rows is not None]
     if len(rows) != len(manifest.shards):
         raise ValueError("map_with_index over a streamed read needs every shard to state its rows")
-    starts = np.cumsum([0, *rows[:-1]])
-    placed = {shard.id: int(start) for shard, start in zip(manifest.shards, starts, strict=True)}
+    shards = Ranges(tuple(rows))
+    placed = {shard.id: shards.start(index) for index, shard in enumerate(manifest.shards)}
     return dataclasses.replace(manifest, reader=_PlacedShards(manifest.reader, placed))
 
 
@@ -1405,14 +1406,15 @@ class _Build:
             raise ValueError("block shuffle needs a block_shards size")
         sizes, _ = pipeline.source.locality()
         if not self.global_order and self.training:
-            starts = np.cumsum((0, *sizes[:-1]))
+            # Each shard's records this share holds: every count-th from its index on.
+            shards = Ranges(tuple(sizes))
             sizes = tuple(
                 max(
                     0,
-                    math.ceil((int(start) + size - partition.index) / partition.count)
-                    - math.ceil((int(start) - partition.index) / partition.count),
+                    math.ceil((shards.start(index) + size - partition.index) / partition.count)
+                    - math.ceil((shards.start(index) - partition.index) / partition.count),
                 )
-                for start, size in zip(starts, sizes, strict=True)
+                for index, size in enumerate(sizes)
             )
         return BlockShuffle(rows, sizes, stage.block_shards, stage.seed)
 
