@@ -596,10 +596,15 @@ def normalized_pass(spec: Forward, carry: Carry, keys_at: Callable[[jax.Array], 
     """A guarded training walk's live rows' split sums, normalized (`split_residuals`): a pass over its key
     tiles `bounds` (`keys_at`) at the walk's own maximum and natural denominator (`normalized_terms`), from
     the `initial` state's share (`normalized_start`, `(m0, acc0)`): the other keys' weighted values, the
-    anchor's weight and the other keys' weights, over the denominator; a weight below its dtype's least
-    normal once normalized takes its product raised and in fp32, taken back after it (`SMALL_SHIFT`)."""
+    anchor's weight and the other keys' weights, over the denominator. A weight below its dtype's least
+    normal once normalized enters raised and in fp32 (`SMALL_SHIFT`), about the anchor's value: its
+    weighted value less its weight times the anchor's, taken back after, and no weight in the sum, so
+    `split_delta`'s `B - others_total v_c` holds it whole where its weight alone would flush and its
+    weighted value would not; `B + own v_c` then lacks its weight times `v_c`, at most `n^2 2^-126` of the
+    anchor's own term over `n` keys, far below that term's rounding."""
     split, arg, _, _ = carry
     _, maximum, total = finish(spec, joined(carry, rows), initial=initial is not None)
+    anchor_value = rows(arg.key).astype(jnp.float32)
 
     def walk(index, sums):
         keys = keys_at(index)
@@ -607,10 +612,10 @@ def normalized_pass(spec: Forward, carry: Carry, keys_at: Callable[[jax.Array], 
         rest, own_tile, small = normalized_terms(keys.logits, maximum, total,
                                                  keys.coords.k_pos == arg.key[:, None], value.dtype,
                                                  recompute(spec))
-        lowered = jnp.float32(-SMALL_SHIFT)
-        product = keys.dot(rest, value) + power2(keys.dot(small, value.astype(jnp.float32)), lowered)
-        others = rest.astype(jnp.float32).sum(axis=-1) + power2(small.sum(axis=-1), lowered)
-        return sums[0] + product, sums[1] + own_tile, sums[2] + others
+        about_anchor = (keys.dot(small, value.astype(jnp.float32))
+                        - expand(small.sum(axis=-1), anchor_value) * anchor_value)
+        product = keys.dot(rest, value) + power2(about_anchor, jnp.float32(-SMALL_SHIFT))
+        return sums[0] + product, sums[1] + own_tile, sums[2] + rest.astype(jnp.float32).sum(axis=-1)
 
     nothing = jnp.zeros_like(total)
     lo, hi = bounds
