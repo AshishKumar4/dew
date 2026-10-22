@@ -590,9 +590,8 @@ def test_a_run_config_tunes_its_autoencoder_and_from_run_decodes_with_the_tuned_
     running statistics, and samples exactly as the trained objective's own
     task does."""
     from diffusion_stubs import batch_for
-    from diffusion_support import images_of
+    from diffusion_support import images_of, saved_after_one_step
 
-    from dew.checkpoints import Checkpoints
     from dew.config import ModelConfig, ObjectiveConfig, TrainerConfig
     from dew.objectives.diffusion import DiffusionRunConfig, PretrainedAutoencoder, TextCondition
 
@@ -611,16 +610,8 @@ def test_a_run_config_tunes_its_autoencoder_and_from_run_decodes_with_the_tuned_
                                    resolution=112),
             "end_to_end": EndToEnd(perceptual_weight=0.0, discriminator_width=8), "solver": Euler(),
             "guidance": None, "steps": 2, "ema_decay": None}))
-    task = config.build()
-    trainer = Trainer(task, optax.adam(1e-2), key=jax.random.PRNGKey(3))
-    state = trainer.initial_state()
-    batch = batch_for(task, 32)
-    state, *_ = trainer.compile(state, batch)(state, batch)
     run = tmp_path / "run"
-    checkpoints = Checkpoints(str(run))
-    checkpoints.save(1, state, None, artifact=task.inference_record())
-    checkpoints.wait()
-    config.save(str(run))
+    task, state, _ = saved_after_one_step(config, lambda task: batch_for(task, 32), run, 1e-2)
 
     # The saved tree carries the encoder's weights, so restoring reads its
     # checkpoint's config and nothing else.

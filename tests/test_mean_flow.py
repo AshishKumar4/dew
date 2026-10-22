@@ -61,15 +61,12 @@ def test_the_objective_trains_the_duration_and_one_step_samples_the_interval():
 
 
 def test_a_run_config_trains_meanflow_and_its_saved_task_samples_in_one_step(tmp_path):
-    import optax
     from diffusion_stubs import batch_for
-    from diffusion_support import images_of
+    from diffusion_support import images_of, saved_after_one_step
 
-    from dew.checkpoints import Checkpoints
     from dew.config import ModelConfig, ObjectiveConfig, TrainerConfig
     from dew.objectives.diffusion import DiffusionRunConfig, TextCondition
     from dew.sampling import TextToImage
-    from dew.training import Trainer
 
     config = DiffusionRunConfig(
         model=ModelConfig(
@@ -86,17 +83,9 @@ def test_a_run_config_trains_meanflow_and_its_saved_task_samples_in_one_step(tmp
                                   {"omega": 2.0, "kappa": 0.5, "solver": Euler(), "steps": 2,
                                    "ema_decay": None}),
     )
-    task = config.build()
-    assert isinstance(task, MeanFlowObjective) and task.model.interval
-    trainer = Trainer(task, optax.adam(1e-2), key=jax.random.PRNGKey(3))
-    state = trainer.initial_state()
-    batch = batch_for(task, 4)
-    state, *_ = trainer.compile(state, batch)(state, batch)
     run = tmp_path / "run"
-    checkpoints = Checkpoints(str(run))
-    checkpoints.save(1, state, None, artifact=task.inference_record())
-    checkpoints.wait()
-    config.save(str(run))
+    task, state, _ = saved_after_one_step(config, lambda task: batch_for(task, 4), run, 1e-2)
+    assert isinstance(task, MeanFlowObjective) and task.model.interval
     expected = task.pipeline(state, ema=False)(["a red bird"], key=9).host().images
     np.testing.assert_array_equal(
         TextToImage.from_run(str(run))(["a red bird"], key=9).host().images, expected

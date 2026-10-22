@@ -122,21 +122,39 @@ NAMELESS = "\n".join([
 ])
 
 
+COLUMNS = ["program_id", "category", "hlo_op_name", "hlo_op_expression", "tf_op_name", "occurrences",
+           "total_self_time", "source_info"]
+"""XProf's hlo_stats columns every capture here reports, in its order."""
+
+
+def captured(tmp_path, cells, peak: float, extra: tuple[str, ...] = ()):
+    """A capture's reports under `tmp_path`/profile, as XProf writes them: `cells`, rows of `COLUMNS` and
+    then the `extra` columns, and a roofline of `peak` FLOP/s. Returns the reports directory."""
+    reports = tmp_path / "profile" / "capture-a" / "reports"
+    reports.mkdir(parents=True)
+    (reports / "hlo_stats.json").write_text(json.dumps([{
+        "cols": [{"id": name} for name in (*COLUMNS, *extra)],
+        "rows": [{"c": [{"v": value} for value in values]} for values in cells]}]))
+    (reports / "roofline_model.json").write_text(json.dumps({"p": {"peak_flop_rate": peak}}))
+    return reports
+
+
+def dumped(tmp_path, name: str, text: str):
+    """An XLA dump directory under `tmp_path` holding one optimized module `name`."""
+    dump = tmp_path / "hlo"
+    dump.mkdir()
+    (dump / name).write_text(text)
+    return dump
+
+
 def test_a_nameless_fusion_is_attributed_by_the_ops_it_fuses(tmp_path):
     """A multi-output fusion carries no op_name of its own (that step's 50 ms of
     "other"): its part and direction come from the ops fused inside it."""
-    reports = tmp_path / "profile" / "capture-a" / "reports"
-    reports.mkdir(parents=True)
-    columns = ["program_id", "category", "hlo_op_name", "hlo_op_expression", "tf_op_name", "occurrences",
-               "total_self_time", "source_info"]
-    cells = [("15", "input fusion", "input_reduce_fusion.4", "%input_reduce_fusion.4 = (f32[8,3072]{1,0}, "
-              "f32[8,3072,1024]{2,1,0}) fusion(f32[8,3072,1024]{2,1,0} %p0)", "", "1", 2000.0, "")]
-    (reports / "hlo_stats.json").write_text(json.dumps([{"cols": [{"id": name} for name in columns],
-                                                         "rows": [{"c": [{"v": v} for v in cells[0]]}]}]))
-    (reports / "roofline_model.json").write_text(json.dumps({"p": {"peak_flop_rate": 311869.0}}))
-    dump = tmp_path / "hlo"
-    dump.mkdir()
-    (dump / "module_0015.jit_step.sm_8.0_gpu_after_optimizations.txt").write_text(NAMELESS)
+    fusion = ("%input_reduce_fusion.4 = (f32[8,3072]{1,0}, f32[8,3072,1024]{2,1,0}) "
+              "fusion(f32[8,3072,1024]{2,1,0} %p0)")
+    captured(tmp_path, [("15", "input fusion", "input_reduce_fusion.4", fusion, "", "1", 2000.0, "")],
+             311869.0)
+    dump = dumped(tmp_path, "module_0015.jit_step.sm_8.0_gpu_after_optimizations.txt", NAMELESS)
     out = tmp_path / "attribution.json"
     assert attribute.main(["--trace", str(tmp_path / "profile"), "--hlo", str(dump), "--out", str(out)]) == 0
     time = json.loads(out.read_text())["time"]
@@ -175,19 +193,12 @@ def test_a_fusion_that_reads_optimizer_state_is_the_optimizers(tmp_path):
     """AdamW's update of a leaf is one fusion, named by its root, the parameter narrowed for
     the next step's compute (that step's 12 ms of "other" on an A100): the moments it reads say it is
     the optimizer's."""
-    reports = tmp_path / "profile" / "capture-a" / "reports"
-    reports.mkdir(parents=True)
-    columns = ["program_id", "category", "hlo_op_name", "hlo_op_expression", "tf_op_name", "occurrences",
-               "total_self_time", "source_info"]
-    cells = ("3", "loop fusion", "loop_convert_fusion.7", "%loop_convert_fusion.7 = bf16[1024]{0} fusion("
-             "f32[1024]{0} %w, f32[1024]{0} %mu, f32[1024]{0} %bitcast.6)", "jit(step)/convert_element_type",
-             "1", 3000.0, "src/dew/training/narrow.py:94")
-    (reports / "hlo_stats.json").write_text(json.dumps([{"cols": [{"id": name} for name in columns],
-                                                         "rows": [{"c": [{"v": v} for v in cells]}]}]))
-    (reports / "roofline_model.json").write_text(json.dumps({"p": {"peak_flop_rate": 311869.0}}))
-    dump = tmp_path / "hlo"
-    dump.mkdir()
-    (dump / "module_0003.jit_step.sm_8.0_gpu_after_optimizations.txt").write_text(UPDATE)
+    fusion = ("%loop_convert_fusion.7 = bf16[1024]{0} fusion(f32[1024]{0} %w, f32[1024]{0} %mu, "
+              "f32[1024]{0} %bitcast.6)")
+    captured(tmp_path, [("3", "loop fusion", "loop_convert_fusion.7", fusion,
+                         "jit(step)/convert_element_type", "1", 3000.0, "src/dew/training/narrow.py:94")],
+             311869.0)
+    dump = dumped(tmp_path, "module_0003.jit_step.sm_8.0_gpu_after_optimizations.txt", UPDATE)
     out = tmp_path / "attribution.json"
     assert attribute.main(["--trace", str(tmp_path / "profile"), "--hlo", str(dump), "--out", str(out)]) == 0
     assert json.loads(out.read_text())["time"]["by_part_kind_ms"] == {"optimizer": {"elementwise": 3.0}}
@@ -195,28 +206,19 @@ def test_a_fusion_that_reads_optimizer_state_is_the_optimizers(tmp_path):
 
 def test_a_capture_attributes_its_time_by_part_and_kind(tmp_path):
     """Through the command: the step's time by kind and by part and kind, each op once."""
-    reports = tmp_path / "profile" / "capture-a" / "reports"
-    reports.mkdir(parents=True)
-    columns = ["program_id", "category", "hlo_op_name", "hlo_op_expression", "tf_op_name", "occurrences",
-               "total_self_time", "source_info", "hbm_bw"]
     times = {"flash backward": 6000.0, "Pallas recurrence": 2000.0, "transposing fusion": 1000.0,
              "weight-gradient GEMM": 500.0}
     cells = [("15", found["category"], found["hlo_op_name"], found["hlo_op_expression"], found["tf_op_name"],
               "2", time * 2, "", 1500.0) for case, time in times.items() for found in [ROWS[case][0]]]
     cells.append(("7", "custom-call", "other.1", "", "other program", "1", 15000.0, "", 0))
-    rows = [{"c": [{"v": value} for value in values]} for values in cells]
-    (reports / "hlo_stats.json").write_text(json.dumps([{"cols": [{"id": name} for name in columns],
-                                                         "rows": rows}]))
-    (reports / "roofline_model.json").write_text(json.dumps({"p": {"peak_flop_rate": 311869.0}}))
+    reports = captured(tmp_path, cells, 311869.0, extra=("hbm_bw",))
     idle_columns = ["host_or_device", "type", "total_self_time"]
     idle_rows = [("Device", "IDLE", 2000), ("Device", "IDLE", 1000),
                  ("Host", "IDLE", 10000), ("Device", "compute", 50000)]
     (reports / "framework_op_stats.json").write_text(json.dumps([{
         "cols": [{"id": name} for name in idle_columns],
         "rows": [{"c": [{"v": value} for value in values]} for values in idle_rows]}]))
-    dump = tmp_path / "hlo"
-    dump.mkdir()
-    (dump / "module_0015.jit_step.sm_8.0_gpu_after_optimizations.txt").write_text(MODULE)
+    dump = dumped(tmp_path, "module_0015.jit_step.sm_8.0_gpu_after_optimizations.txt", MODULE)
     out = tmp_path / "attribution.json"
     assert attribute.main(["--trace", str(tmp_path / "profile"), "--hlo", str(dump),
                            "--out", str(out), "--steps", "2"]) == 0
@@ -236,15 +238,9 @@ def test_the_peak_is_dews_dense_bf16_figure_for_a_named_device(tmp_path):
     """XProf's roofline gives an RTX PRO 6000 a 3,742 TFLOP/s peak, a sparse low-precision figure:
     every MFU field reads Dew's dense bf16 table where the entry names the device, and none is
     written where it does not, XProf's figure kept beside for reference."""
-    reports = tmp_path / "profile" / "capture-a" / "reports"
-    reports.mkdir(parents=True)
-    columns = ["program_id", "category", "hlo_op_name", "hlo_op_expression", "tf_op_name", "occurrences",
-               "total_self_time", "source_info"]
-    cells = ("15", "custom-call", "custom-call.1", "%custom-call.1 = bf16[8,8]{1,0} custom-call()",
-             "jit(step)/dot_general", "1", 1000.0, "")
-    (reports / "hlo_stats.json").write_text(json.dumps([{"cols": [{"id": name} for name in columns],
-                                                         "rows": [{"c": [{"v": v} for v in cells]}]}]))
-    (reports / "roofline_model.json").write_text(json.dumps({"p": {"peak_flop_rate": 3742430.0}}))
+    gemm = "%custom-call.1 = bf16[8,8]{1,0} custom-call()"
+    captured(tmp_path, [("15", "custom-call", "custom-call.1", gemm, "jit(step)/dot_general", "1", 1000.0,
+                         "")], 3742430.0)
     entry = tmp_path / "entry.json"
     entry.write_text(json.dumps({"model_flops_per_step": 2.5e11,
                                  "device": "NVIDIA RTX PRO 6000 Blackwell Server Edition"}))
@@ -289,25 +285,16 @@ def test_a_gemm_is_judged_at_its_compiled_flops_against_its_own_precisions_peak(
     of that step at 4x its work, and its normalized rate scales by bf16's peak over its own guess of the
     op's precision (a later run's GEMMs at 1.127 of the A100's). Each GEMM's fraction is of its own
     precision's peak in Dew's table, as mfu_mixed counts it."""
-    reports = tmp_path / "profile" / "capture-a" / "reports"
-    reports.mkdir(parents=True)
-    columns = ["program_id", "category", "hlo_op_name", "hlo_op_expression", "tf_op_name", "occurrences",
-               "total_self_time", "source_info", "normalized_flop_rate", "model_flop_rate"]
     cells = [("15", "custom-call", "custom-call.1", '%custom-call.1 = f32[8,8]{1,0} custom-call('
               'f32[8,8]{1,0} %a, f32[8,8]{1,0} %b), custom_call_target="__cublas$gemm"',
               "jit(step)/dot_general", "1", 1000.0, "", 8.0e6, 1.0e6),
              ("15", "custom-call", "custom-call.2", '%custom-call.2 = bf16[8,8]{1,0} custom-call('
               'f8e4m3fn[8,8]{1,0} %a, f8e4m3fn[8,8]{1,0} %b), custom_call_target="__cublas$lt$matmul$f8"',
               "jit(step)/dot_general", "1", 1000.0, "", 4.0e5, 3.2e6)]
-    rows = [{"c": [{"v": v} for v in row]} for row in cells]
-    (reports / "hlo_stats.json").write_text(json.dumps([{"cols": [{"id": name} for name in columns],
-                                                         "rows": rows}]))
-    (reports / "roofline_model.json").write_text(json.dumps({"p": {"peak_flop_rate": 3742430.0}}))
+    captured(tmp_path, cells, 3742430.0, extra=("normalized_flop_rate", "model_flop_rate"))
     entry = tmp_path / "entry.json"
     entry.write_text(json.dumps({"model_flops_per_step": 1.05e12, "device": "NVIDIA RTX PRO 6000 Blackwell"}))
-    dump = tmp_path / "hlo"
-    dump.mkdir()
-    (dump / "module_0015.jit_step.sm_12.0_gpu_after_optimizations.txt").write_text(GEMMS)
+    dump = dumped(tmp_path, "module_0015.jit_step.sm_12.0_gpu_after_optimizations.txt", GEMMS)
     out = tmp_path / "attribution.json"
     command = ["--trace", str(tmp_path / "profile"), "--hlo", str(dump), "--out", str(out),
                "--entry", str(entry)]
