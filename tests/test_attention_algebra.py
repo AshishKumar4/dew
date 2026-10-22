@@ -348,28 +348,43 @@ def test_a_logit_past_the_forwards_rounded_maximum_weighs_one_in_the_backward():
 
 @pytest.mark.parametrize("natural", [False, True], ids=["default", "natural"])
 def test_a_resumed_state_carried_far_is_as_exact_as_the_references(natural):
-    """fp32, one query of 87 over one key of 1 (value 0), scale 1, resumed from a state of maximum 0,
-    denominator 1 and weighted values 2^100: the output is the state's share, 2^100 exp(-87) over about
-    1. The factor the state takes to the key's maximum is the reference's `exp(-87)` (`Forward.carry`):
-    each mainloop's output is no further from float64 than the reference's. `exp2(-87 * log2(e))`, the
-    natural form's forward exponential, rounds its argument 2.2e-6 away on a GPU (`natural_exp`)."""
-    spans = template.spans(1, 1, 1)
-    query = jnp.full((1, 1, 1, 1), 87.0, jnp.float32)
-    key = jnp.ones((1, 1, 1, 1), jnp.float32)
-    value = jnp.zeros((1, 1, 1, 1), jnp.float32)
-    state = template.Initial(jnp.zeros((1, 1, 1)), jnp.ones((1, 1, 1)), jnp.full((1, 1, 1, 1), 2.0 ** 100))
-    hooks = template.Hooks(initial=state)
-    reference = float(template.reference(query, key, value, spans, hooks, scale=1.0)[0, 0, 0, 0])
-    truth = 2.0 ** 100 * np.exp(-87.0) / (np.exp(-87.0) + 1.0)
-    tiles = attention_triton.Tiles(32, 32, 4, 2)
-    # Compiled on a GPU, whose exp2 is the hardware's own; XLA's CPU computes exp2 through exp.
-    with tuning.pinned({attention_triton.TritonForward: tiles}):
-        triton = attention_triton.forward(query, key, value, spans, hooks, scale=1.0, natural=natural,
-                                          interpret=jax.default_backend() != "gpu")
-    portable = attention_portable.attend(query, key, value, spans, hooks, block_q=32, block_k=32,
-                                         pad=attention_triton.BLOCK, scale=1.0, natural=natural)
-    for found in (triton, portable):
-        assert abs(float(found[0, 0, 0, 0]) - truth) <= abs(reference - truth)
+    """fp32, one query over one key whose logit is 40 to 87 above a resumed state's maximum (0), the
+    state's weighted values 2^60 to 2^100 times a normal draw and its denominator 1, the key's value a
+    normal draw: the output is the state's share carried over that distance. The factor the state takes
+    to the key's maximum is the reference's `exp` (`Forward.carry`), so each mainloop holds check 1
+    against the reference; `exp2(x * log2(e))`, the natural form's key-weight exponential, rounds its
+    argument about `|x|` ulps away on a GPU (`natural_exp`). The Triton mainloop compiles on a GPU, whose
+    exp2 is the hardware's own; XLA's CPU computes exp2 through exp."""
+    spans = template.spans(1, 1, 4)
+
+    def draw(seed: int):
+        streams = jax.random.split(jax.random.key(seed), 4)
+        distance = jax.random.uniform(streams[0], (4, 1, 1, 1), jnp.float32, 40.0, 87.0)
+        size = jnp.exp2(jnp.round(jax.random.uniform(streams[1], (4, 1, 1), jnp.float32, 60.0, 100.0)))
+        acc = jax.random.normal(streams[2], (4, 1, 1, 8), jnp.float32) * size[..., None]
+        value = jax.random.normal(streams[3], (4, 1, 1, 8), jnp.float32)
+        return distance, value, acc
+
+    def state(acc):
+        return template.Hooks(initial=template.Initial(jnp.zeros((4, 1, 1)), jnp.ones((4, 1, 1)), acc))
+
+    def triton(distance, value, acc):
+        with tuning.pinned({attention_triton.TritonForward: attention_triton.Tiles(32, 32, 4, 2)}):
+            return attention_triton.forward(distance, jnp.ones_like(distance), value, spans, state(acc),
+                                            scale=1.0, natural=natural,
+                                            interpret=jax.default_backend() != "gpu")
+
+    def portable(distance, value, acc):
+        return attention_portable.attend(distance, jnp.ones_like(distance), value, spans, state(acc),
+                                         block_q=32, block_k=32, pad=attention_triton.BLOCK, scale=1.0,
+                                         natural=natural)
+
+    def reference(distance, value, acc):
+        return template.reference(distance, jnp.ones_like(distance), value, spans, state(acc), scale=1.0)
+
+    for name, ours in (("triton", triton), ("portable", portable)):
+        assert_as_exact(jax.jit(ours), jax.jit(reference), draw,
+                        f"{name} resumed state carried far {'natural' if natural else 'default'}", seeds=8)
 
 
 def test_a_large_initial_maximum_gives_the_references_state_gradients():
