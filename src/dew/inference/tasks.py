@@ -33,7 +33,7 @@ from dew.diffusion.block import BlockProcess, CanvasGeneration, refuse_non_denoi
 from dew.diffusion.discrete import MDLM_STEPS, DiscreteProcess, Unmask, refuse_causal
 from dew.inference.projections import packed_owned
 from dew.interop.weights import decoding_storage
-from dew.nn.inputs import Media, ModelInputs, default_placement, mesh_of, request_key, token_id
+from dew.nn.inputs import Media, ModelInputs, default_placement, mesh_of, request_key
 from dew.nn.protocols import Bounded, CacheCapacity, TokenModel
 from dew.objectives.base import UNREAD, Variables, thaw
 from dew.records import integer, record as named_fields, text as named
@@ -111,14 +111,9 @@ def prepared_inputs(processor: Processor | None, request: Request, *, images: Me
     if isinstance(request, ModelInputs):
         return ModelInputs.from_value(request)
     if isinstance(request, Sequence):
-        for row in request:
-            if isinstance(row, str):
-                raise ValueError("a request cannot mix text prompts and numeric token rows")
-            if isinstance(row, np.ndarray) and not np.issubdtype(row.dtype, np.integer):
-                raise ValueError("token rows must contain integers")
-            if isinstance(row, Sequence):
-                for token in row:
-                    token_id(token, where="a token row")
+        if any(isinstance(row, str) for row in request):
+            raise ValueError("a request cannot mix text prompts and numeric token rows")
+        # ModelInputs reads the rows by `dew.nn.inputs.token_id`'s law.
         return ModelInputs.from_value(np.asarray(request))
     # A resident array stays where it is; a global one cannot be fetched.
     return ModelInputs.from_value(request)
