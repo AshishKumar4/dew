@@ -717,11 +717,6 @@
    "lane": "Kernels",
    "by": "2026-11-06"
   },
-  "tests/test_objectives.py": {
-   "comparisons": 5,
-   "lane": "Models, Serving & RL",
-   "by": "2026-11-13"
-  },
   "tests/test_ollama_interop.py": {
    "comparisons": 1,
    "lane": "Models, Serving & RL",
