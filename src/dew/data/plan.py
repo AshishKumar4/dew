@@ -11,7 +11,7 @@ import logging
 import platform
 import re
 import subprocess
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 from typing import TYPE_CHECKING, ClassVar, Literal, Protocol, runtime_checkable
 
@@ -25,6 +25,8 @@ _log = logging.getLogger(__name__)
 
 if TYPE_CHECKING:
     from _typeshed import DataclassInstance
+
+    from dew.data.dataset import Batch
 
 
 def _canonical(value: JSON | Mapping[str, object]) -> bytes:
@@ -57,6 +59,13 @@ def identified(value: dict[str, JSON] | list[JSON] | str | int | float | bool | 
     if isinstance(value, list):
         return all(identified(child) for child in value)
     return True
+
+
+def callable_name(step: Callable[..., Batch]) -> str:
+    """`step`'s qualified name: a function's or method's own, else its type's, as `module.qualname`,
+    the name a step's identity is written in."""
+    kind = step if inspect.isfunction(step) or inspect.ismethod(step) else type(step)
+    return f"{kind.__module__}.{kind.__qualname__}"
 
 
 @dataclasses.dataclass(frozen=True)

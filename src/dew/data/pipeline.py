@@ -53,9 +53,28 @@ class Reasoned(Protocol):
     reason: str
 
 
+TOKEN_FIELDS = ("text",)
+"""The per-token fields a pack or a window lays out where none are named."""
+PACK_BINS = 32
+"""The rows a pack holds open at once where none is asked for."""
+INTERLEAVE = 16
+"""The sources an interleave reads at once where none is asked for."""
+PREFETCH = 64
+"""The records a prefetch reads ahead where none is asked for."""
+WORKER_BUFFER = 2
+"""The batches each worker process reads ahead where none is asked for."""
+
+
 @runtime_checkable
 class Volatile(Protocol):
     volatile: bool
+
+
+def volatile(stage: Stage) -> bool:
+    """Whether `stage` reads what may change between reads (a step that says it is `Volatile`, as a
+    live fetch does), so neither a cache nor a second reader may stand for it: the one test the
+    cache prefix and the plan read."""
+    return isinstance(stage, Map) and isinstance(stage.step, Volatile) and stage.step.volatile
 
 
 @runtime_checkable
@@ -235,7 +254,7 @@ class Slice:
 
 @dataclasses.dataclass(frozen=True)
 class Interleave:
-    cycle_length: int = 16
+    cycle_length: int = INTERLEAVE
 
 
 @dataclasses.dataclass(frozen=True)
@@ -266,8 +285,8 @@ class Pack:
     """
 
     seq_len: int
-    fields: tuple[str, ...] = ("text",)
-    bins: int = 32
+    fields: tuple[str, ...] = TOKEN_FIELDS
+    bins: int = PACK_BINS
     policy: Literal["first-fit", "best-fit", "concat"] = "first-fit"
     segments: int | None = None
     along: tuple[tuple[str, int], ...] = ()
@@ -302,7 +321,7 @@ class Pack:
 class Windows:
     seq_len: int
     stride: int | None = None
-    fields: tuple[str, ...] = ("text",)
+    fields: tuple[str, ...] = TOKEN_FIELDS
 
     def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
         """Windows of `seq_len` inputs and their targets along `fields`."""
@@ -319,7 +338,7 @@ class Windows:
 class TokenSplit:
     fraction: float
     held: bool
-    fields: tuple[str, ...] = ("text",)
+    fields: tuple[str, ...] = TOKEN_FIELDS
 
     def __post_init__(self) -> None:
         if not 0 <= self.fraction < 1:
@@ -334,7 +353,7 @@ class Prefetch:
 @dataclasses.dataclass(frozen=True)
 class Workers:
     count: int
-    buffer: int = 2
+    buffer: int = WORKER_BUFFER
 
 
 @dataclasses.dataclass(frozen=True)
@@ -505,7 +524,7 @@ class Dataset:
 
     def holdout(self, fraction: float | None = None, *, key: str | None = None, records: int | None = None,
                 split: str | tuple[str, ...] | None = None, tokens: float | None = None,
-                fields: tuple[str, ...] = ("text",), **named: float) -> tuple[Dataset, ...]:
+                fields: tuple[str, ...] = TOKEN_FIELDS, **named: float) -> tuple[Dataset, ...]:
         """This dataset split into the records a run trains on and the ones it
         scores, with the steps it has replayed on each, so hold out before
         preparing.
@@ -689,7 +708,7 @@ class Dataset:
     def repeat(self, epochs: int | None = None) -> Pipeline:
         return self._then(Repeat(epochs))
 
-    def interleave(self, cycle_length: int = 16) -> Pipeline:
+    def interleave(self, cycle_length: int = INTERLEAVE) -> Pipeline:
         return self._then(Interleave(cycle_length))
 
     def batch(
@@ -712,8 +731,8 @@ class Dataset:
         self,
         seq_len: int,
         *,
-        fields: tuple[str, ...] = ("text",),
-        bins: int = 32,
+        fields: tuple[str, ...] = TOKEN_FIELDS,
+        bins: int = PACK_BINS,
         policy: Literal["first-fit", "best-fit", "concat"] = "first-fit",
         segments: int | None = None,
         along: tuple[tuple[str, int], ...] = (),
@@ -728,14 +747,14 @@ class Dataset:
         return self._then(Pack(seq_len, fields, bins, policy, segments, along, overlap))
 
     def windows(
-        self, seq_len: int, *, stride: int | None = None, fields: tuple[str, ...] = ("text",)
+        self, seq_len: int, *, stride: int | None = None, fields: tuple[str, ...] = TOKEN_FIELDS
     ) -> Pipeline:
         return self._then(Windows(seq_len, stride, fields))
 
-    def prefetch(self, buffer: int = 64) -> Pipeline:
+    def prefetch(self, buffer: int = PREFETCH) -> Pipeline:
         return self._then(Prefetch(buffer))
 
-    def workers(self, count: int, *, buffer: int = 2) -> Pipeline:
+    def workers(self, count: int, *, buffer: int = WORKER_BUFFER) -> Pipeline:
         return self._then(Workers(count, buffer))
 
     def take(self, count: int) -> Pipeline:
@@ -978,6 +997,20 @@ class ObjectiveData:
 
 
 type _Step = RecordStep | RandomStep | HostStep | Configured | ExpandStep | ColumnStep
+
+
+def record_stage(step: RecordStep | pygrain.RandomMapTransform | Expansion, *, identity: str | None = None,
+                 configured: Bound | None = None) -> Map | RandomMap | FlatMap:
+    """The stage a record step is applied by, from what it says it is: an expansion's records
+    (`FlatMap`), a generator's draws (`RandomMap`), or one record's replacement (`Map`), dropping
+    records where it says it does (`rejects`). The verbs check the step against the one they are
+    (`map`, `random_map`, `filter_map`, `random_filter_map`, `flat_map`); an objective's steps and a
+    configured step's binding are classified here alone."""
+    if isinstance(step, Expansion):
+        return FlatMap(step, identity, configured)
+    if isinstance(step, pygrain.RandomMapTransform):
+        return RandomMap(step, identity, _declares_rejects(step), configured)
+    return Map(step, identity, _declares_rejects(step), configured)
 
 
 def _named_step(step: _Step) -> str:
