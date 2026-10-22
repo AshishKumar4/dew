@@ -58,12 +58,11 @@ from dew.data.dataset import (
     PhasedStream,
     Reader,
     Records,
-    weight_counts,
 )
 from dew.data.facts import merge_facts
 from dew.data.lowering import _as_iter, _Build, _epoch_records, _Locality, _split_spans, _weights, _workers
 from dew.data.materialize import _materialize, _Memory
-from dew.data.mixing import CorpusCounts
+from dew.data.mixing import CorpusCounts, Proportions
 from dew.data.pipeline import (
     Artifact,
     Batched,
@@ -98,6 +97,8 @@ from dew.data.pipeline import (
     Windows,
     Workers,
     _declares_rejects,
+    with_children,
+    with_stores,
 )
 from dew.data.plan import Plan, StepIdentity, fingerprint, unplaced
 from dew.data.readers import _CanonicalPass, _Host, _PerShare, _Statistics
@@ -230,16 +231,7 @@ def _pin_sources(pipelines: Sequence[Pipeline], read: Read) -> tuple[Pipeline, .
     with ThreadPoolExecutor(max_workers=min(8, max(1, len(sources)))) as readers:
         pinned = dict(zip(sources, readers.map(pin, sources.values()), strict=True))
 
-    def replace(branch: Pipeline) -> Pipeline:
-        source = branch.source
-        source = (
-            dataclasses.replace(source, pipelines=tuple(replace(child) for child in source.pipelines))
-            if isinstance(source, (Mixture, Phases))
-            else pinned[id(source)]
-        )
-        return dataclasses.replace(branch, source=source)
-
-    return tuple(replace(branch) for branch in pipelines)
+    return tuple(with_stores(branch, lambda source: pinned[id(source)]) for branch in pipelines)
 
 
 def _measured(pipeline: Pipeline, above: tuple[Measuring, ...] = ()) -> dict[int, tuple[Measuring, ...]]:
@@ -792,8 +784,7 @@ def _continued(pipeline: Pipeline, consumed: Mapping[str, int]) -> Pipeline:
     if isinstance(pipeline.source, Phases):
         raise ValueError("nested phases are not an indexed record order")
     if isinstance(pipeline.source, Mixture):
-        children = tuple(_continued(child, consumed) for child in pipeline.source.pipelines)
-        return dataclasses.replace(pipeline, source=dataclasses.replace(pipeline.source, pipelines=children))
+        return with_children(pipeline, functools.partial(_continued, consumed=consumed))
     offset = consumed.get(_name(pipeline), 0)
     if not offset:
         return pipeline
@@ -811,9 +802,9 @@ def _delivered(pipeline: Pipeline, count: int, consumed: dict[str, int]) -> None
     if isinstance(source, Phases):
         raise ValueError("nested phases have no single corpus share")
     if isinstance(source, Mixture):
-        lowered = _weights(source)
-        weights = tuple(weight / sum(lowered) for weight in lowered)
-        for child, taken in zip(source.pipelines, weight_counts(weights, count), strict=True):
+        # The counts the indexed mix reads its corpora by (`ProportionalSelection`).
+        counts = Proportions.of(_weights(source)).counts(count)
+        for child, taken in zip(source.pipelines, counts, strict=True):
             _delivered(child, taken, consumed)
     else:
         name = _name(pipeline)
@@ -906,10 +897,8 @@ def objective_steps(pipeline: Pipeline, objective: ObjectiveData, *, train: bool
     own = any(isinstance(stage, (Map, RandomMap, FlatMap, Filter, Pack, Windows, Native, Batched))
               for stage in pipeline.stages[:batched])
     if isinstance(pipeline.source, (Mixture, Phases)) and not own:
-        children = tuple(
-            objective_steps(child, objective, train=train, read=read) for child in pipeline.source.pipelines
-        )
-        return dataclasses.replace(pipeline, source=dataclasses.replace(pipeline.source, pipelines=children))
+        return with_children(pipeline, functools.partial(objective_steps, objective=objective, train=train,
+                                                         read=read))
     boundary = (
         (Shuffle, Repeat, BatchStage, TokenBudget)
         if read == "memory"
