@@ -169,7 +169,10 @@ def _shifted_depthwise_3x3(lhs: jax.Array, rhs: jax.Array, dilation: int) -> jax
     here; it sums 16 features or fewer otherwise, so those keep the
     convolution. If a jax or YNNPACK release changes that summation,
     tests/test_depthwise_conv.py's
-    test_cpu_depthwise_is_the_library_convolution_bit_for_bit fails."""
+    test_cpu_depthwise_is_the_library_convolution_bit_for_bit fails. One
+    sign differs: an output whose nine taps are all negative zero is the
+    sum's negative zero here, which the library gives at dilations 1 and 2
+    and not at 3 on a 1 x 7 x 8 x 17 map, where it gives positive zero."""
     height, width = lhs.shape[1:3]
     padded = jnp.pad(lhs, ((0, 0), (dilation, dilation), (dilation, dilation), (0, 0))).astype(jnp.float32)
     products = jax.lax.optimization_barrier(_taps(padded, rhs.astype(jnp.float32), dilation, height, width))
