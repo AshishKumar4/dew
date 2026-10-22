@@ -1,8 +1,8 @@
 """Hopper's toolkit (dew.nn.kernels.templates.hopper) under Mosaic GPU's interpreter: a ring streaming one
-operand across persistent tiles of their own trip counts, two consumers sharing its slots and taking turns,
-a persistent loop in its own order, a per-row vector stored through shared memory. The interpreter is
-coverage, not proof (it treats wgmma_wait as a no-op); each kernel also lowers for an H100 here, and runs on
-one in the GPU gate."""
+operand across persistent tiles of their own trip counts, two consumers sharing its slots and meeting at
+each step, a persistent loop in its own order, per-row vectors stored through one shared-memory buffer.
+The interpreter is coverage, not proof (it treats wgmma_wait as a no-op); each kernel also lowers for an
+H100 here, and runs on one in the GPU gate."""
 
 import functools
 
@@ -18,6 +18,8 @@ from jax.sharding import Mesh
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates import hopper
 
+pytestmark = pytest.mark.kernel
+
 BLOCK = (64, 64)
 INTERPRETED = plgpu.InterpretGPUParams()
 """Mosaic GPU's own interpreter, which models warpgroups, barriers and shared memory."""
@@ -32,7 +34,7 @@ def _first_step(tile):
 
 def _ring_sums(x, *, interpret, consumers: int = 1):
     """Each tile's sum of its steps' blocks of `x` (tile `t` takes `t + 1`), streamed through a ring whose
-    counter runs across the tiles; with two consumers each sums half the columns, taking turns."""
+    counter runs across the tiles; with two consumers each sums half the columns, meeting at each step."""
     columns = BLOCK[1] // consumers
 
     def body(x_gmem, out_gmem):
@@ -40,12 +42,12 @@ def _ring_sums(x, *, interpret, consumers: int = 1):
                            out_smem=plgpu.SMEM((consumers, BLOCK[0], columns), jnp.float32),
                            schedule=hopper.schedule_barrier(), collective_axes="wg")
         def _(smem, full, consumed, out_smem, schedule):
-            ring = hopper.Ring(STAGES, smem, full, consumed)
+            ring = hopper.Ring(smem, full, consumed)
             wg = jax.lax.axis_index("wg")
 
             def producer():
                 @hopper.persistent(TILES, collective_axes="sm")
-                def _(tile, info):
+                def _(tile, loop):
                     first = _first_step(tile)
 
                     @pl.loop(0, tile + 1)
@@ -56,7 +58,7 @@ def _ring_sums(x, *, interpret, consumers: int = 1):
 
             def consumer(wg):
                 @hopper.persistent(TILES, collective_axes="sm")
-                def _(tile, info):
+                def _(tile, loop):
                     first = _first_step(tile)
 
                     def step_sum(step, total):
@@ -64,7 +66,7 @@ def _ring_sums(x, *, interpret, consumers: int = 1):
                         block = slot[:, pl.ds(wg * columns, columns)].astype(jnp.float32)
                         ring.release(first + step)
                         if consumers == 2:
-                            hopper.turn(schedule)
+                            hopper.rendezvous(schedule)
                         return total + block
 
                     zero = jnp.zeros((BLOCK[0], columns), jnp.float32)
@@ -90,16 +92,17 @@ def _expected(x):
 
 
 def _stream():
+    """Small integers, so any tile's sum is exact in fp32 whatever its order."""
     steps = _first_step(TILES)
-    return jax.random.normal(jax.random.key(0), (steps * BLOCK[0], BLOCK[1])).astype(jnp.bfloat16)
+    return jax.random.randint(jax.random.key(0), (steps * BLOCK[0], BLOCK[1]), -64, 64).astype(jnp.bfloat16)
 
 
 @INTERPRETS
 @pytest.mark.parametrize("consumers", [1, 2])
 def test_a_ring_streams_tiles_of_their_own_trip_counts(consumers):
     """A ring's counter runs across persistent tiles of one, two and three steps over two slots: each
-    tile sums exactly its own steps' blocks (sums of bf16 values, exact in fp32), one consumer or two
-    sharing each slot and taking turns."""
+    tile sums exactly its own steps' blocks, one consumer or two sharing each slot and meeting at each
+    step."""
     x = _stream()
     summed = _ring_sums(x, interpret=INTERPRETED, consumers=consumers)
     np.testing.assert_array_equal(np.asarray(summed), _expected(x))
@@ -112,9 +115,8 @@ def test_a_persistent_loop_walks_its_tiles_in_its_order():
         @functools.partial(pl.run_scoped, smem=plgpu.SMEM((128,), jnp.float32))
         def _(smem):
             @hopper.persistent(TILES, collective_axes="sm", order=lambda index: TILES - 1 - index)
-            def _(tile, info):
-                plgpu.wait_smem_to_gmem(0)
-                hopper.store_vector(jnp.full((128,), tile, jnp.float32), smem, out_gmem.at[info.index[0]])
+            def _(tile, loop):
+                hopper.store_vector(jnp.full((128,), tile, jnp.float32), smem, out_gmem.at[loop.index[0]])
             plgpu.wait_smem_to_gmem(0)
 
     out = plgpu.kernel(body, out_type=jax.ShapeDtypeStruct((TILES, 128), jnp.float32), grid=(1,),
@@ -137,6 +139,7 @@ ON_HOPPER = pytest.mark.skipif(generation.device_generation() != "sm90",
 
 
 @ON_HOPPER
+@pytest.mark.gpu(reason="runs the toolkit's kernels compiled, on an H100")
 @pytest.mark.parametrize("consumers", [1, 2])
 def test_a_ring_streams_tiles_of_their_own_trip_counts_on_an_h100(consumers):
     """The ring's kernel compiled and run on an H100, where the interpreter's no-op waits are real."""
