@@ -296,8 +296,8 @@ def solid_colour_images(rs, n):
 
 
 def context_ablation(objective, params, ema, data, mask, rng, draws=8):
-    """Each example's prediction error from its own context and from another image's, over `draws`
-    mask draws: two arrays of `draws` times the examples, pair by pair."""
+    """Each pair of consecutive images' mean prediction error from their own contexts and from each
+    other's, over `draws` mask draws: two arrays of a value a pair, pairs being independent draws."""
     n, blocks = data.shape[0], mask.num_targets
     full = normalize_targets(objective.encode(part(ema, "context_encoder"), data))
 
@@ -315,14 +315,16 @@ def context_ablation(objective, params, ema, data, mask, rng, draws=8):
     for key in jax.random.split(rng, draws):
         context_idx, target_idx = mask.sample(key, n)
         context = objective.encode(part(params, "context_encoder"), data, context_idx)
+        swapped = context.reshape(n // 2, 2, *context.shape[1:])[:, ::-1].reshape(context.shape)
         own.append(error(context, context_idx, target_idx))
-        other.append(error(jnp.roll(context, 1, axis=0), context_idx, target_idx))
-    return np.concatenate(own), np.concatenate(other)
+        other.append(error(swapped, context_idx, target_idx))
+    return tuple(np.mean(errors, axis=0).reshape(n // 2, 2).mean(axis=1) for errors in (own, other))
 
 
 def paired_statistic(differences) -> float:
-    """Student's t statistic of paired differences, their mean over its standard error: over 256
-    pairs, 7.0 is past scipy.stats.t.isf(1e-9, 255), so a mean of zero clears it once in a billion."""
+    """Student's t statistic of paired differences, their mean over its standard error: over 64
+    independent pairs, 7.0 is past scipy.stats.t.isf(1e-9, 63), so a mean of zero clears it once in a
+    billion."""
     differences = np.asarray(differences, np.float64)
     return float(differences.mean() / (differences.std(ddof=1) / np.sqrt(differences.size)))
 
@@ -351,19 +353,22 @@ def test_a_video_objective_steps_on_an_explicit_data_axis(mask):
 def test_training_makes_the_prediction_depend_on_the_context(mask):
     """The loss can be driven down by predicting the average target while
     ignoring the context entirely, which would teach the encoder nothing.
-    Training must lower each held-out example's prediction error, and widen
-    what swapping in another image's context costs it, each by a paired test
-    over 32 images and 8 mask draws (`paired_statistic`)."""
+    Over 64 held-out pairs of images, each pair's errors averaged over 8 mask
+    draws, by paired tests of their logarithms (`paired_statistic`): a fresh
+    predictor's cost of the other image's context stays under 1.5 times, and
+    training at least halves the error and makes that cost over five times."""
     rs = np.random.RandomState(0)
-    train_x, test_x = solid_colour_images(rs, 128), solid_colour_images(rs, 32)
+    train_x, test_x = solid_colour_images(rs, 128), solid_colour_images(rs, 128)
     normalized_test = (test_x - 127.5) / 127.5
 
     trainer = make_jepa_trainer(mask, learning_rate=3e-3,
                                 momentum=(0.9, 0.99), momentum_steps=150)
     objective = trainer.objective
     initial = trainer.initial_state()
-    before = context_ablation(objective, initial.variables, initial.ema,
-                              normalized_test, mask, jax.random.PRNGKey(9))
+    before = np.log(context_ablation(objective, initial.variables, initial.ema,
+                                     normalized_test, mask, jax.random.PRNGKey(9)))
+    fresh = paired_statistic(np.log(1.5) - (before[1] - before[0]))
+    assert fresh > 7.0, f"a fresh predictor favours its own context (t = {fresh:.1f})"
 
     def batches():
         while True:
@@ -378,15 +383,15 @@ def test_training_makes_the_prediction_depend_on_the_context(mask):
         lambda value: value + 0.1, initial.averaged["params"]["context_encoder"])}}
     other = float(objective.scalar_loss(params, batch, step_with(merge(initial.averaged, moved)))[0])
     # The loss reads the averaged context encoder: moving it moves the loss.
-    assert other != same
+    assert np.isfinite(other) and other != same
 
     state = trainer.fit(dataset(batches, batch=16), steps=150, log_every=50)
 
-    after = context_ablation(objective, state.variables, state.ema,
-                             normalized_test, mask, jax.random.PRNGKey(9))
-    fell = paired_statistic(before[0] - after[0])
-    assert fell > 7.0, f"held-out prediction error did not fall (t = {fell:.1f})"
-    cost = paired_statistic((after[1] - after[0]) - (before[1] - before[0]))
+    after = np.log(context_ablation(objective, state.variables, state.ema,
+                                    normalized_test, mask, jax.random.PRNGKey(9)))
+    halved = paired_statistic(before[0] - after[0] - np.log(2))
+    assert halved > 7.0, f"held-out prediction error did not halve (t = {halved:.1f})"
+    cost = paired_statistic(after[1] - after[0] - np.log(5))
     assert cost > 7.0, f"the predictor still ignores its context (t = {cost:.1f})"
 
 
