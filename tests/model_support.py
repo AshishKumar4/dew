@@ -188,3 +188,33 @@ def parameter_loss(objective, variables, batch, step) -> Callable:
         return objective.reduce_loss(statistics)[0]
 
     return loss
+
+
+def gate_margin(model, variables, tokens) -> float:
+    """The smallest gap, over the forward of `tokens`, between a gaussian top-k gate's cutoff (the row's
+    mean plus the sparsity's normal quantile times its population deviation, as
+    `dew.nn.mlp.gaussian_topk` forms it) and the units it keeps or drops, over that deviation: a unit
+    nearer it may land on either side in float32 and in float64, a step the two compute differently."""
+    from statistics import NormalDist
+
+    from dew.nn.mlp import GatedMLP
+
+    def selecting(module, method):
+        parent = module.parent
+        return (method == "__call__" and isinstance(module, nn.Dense) and module.name == "gate_proj"
+                and isinstance(parent, GatedMLP) and bool(parent.activation_sparsity))
+
+    _, captured = model.apply(variables, jnp.asarray(tokens), capture_intermediates=selecting,
+                              mutable=["intermediates"])
+    margin = np.inf
+    for path, values in jax.tree_util.tree_flatten_with_path(captured["intermediates"])[0]:
+        layer = next(str(part.key) for part in path if str(getattr(part, "key", "")).startswith("layers_"))
+        sparsity = model.activation_sparsity_pattern[int(layer.split("_")[1])]
+        values = np.asarray(values, np.float64)
+        deviation = values.std(-1, keepdims=True)
+        cutoff = values.mean(-1, keepdims=True) + NormalDist().inv_cdf(sparsity) * deviation
+        # The least kept unit's height above the cutoff and the cutoff's above the largest dropped one.
+        kept = values > cutoff
+        margin = min(margin, float(np.min(np.where(kept, values - cutoff, np.inf) / deviation)),
+                     float(np.min(np.where(kept, np.inf, cutoff - values) / deviation)))
+    return margin
