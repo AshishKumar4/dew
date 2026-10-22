@@ -609,7 +609,7 @@ def _dv_local_kernel(chunk_ref, q_ref, k_ref, g_ref, gl_ref, do_ref, dv_ref, *, 
             columns = pl.ds(block * bk, bk)
             scores += _dot(read(k_ref, columns), read(q_ref, columns).T, exact=exact) * scale
         gate, low = _gates(g_ref, start, taken, chunk), _gates(gl_ref, start, taken, chunk)
-        scores = scores * jnp.exp2(-_apart(gate, low, gate, low))
+        scores = scores * jnp.exp2(-algebra.apart(gate, low, gate, low))
         index = jnp.arange(chunk)
         scores = jnp.where(index[:, None] <= index[None, :], scores, 0.0).astype(do_ref.dtype)
         for block in range(do_ref.shape[-1] // bv):
@@ -744,7 +744,7 @@ def _dqkwg_kernel(chunk_ref, q_ref, k_ref, v_ref, g_ref, gl_ref, h_ref, do_ref, 
             last_low = _row(gl_ref, (start + taken - 1, head))
             dq = dq * jnp.exp2(gate)[:, None] * scale
             dk = dk * jnp.exp2((last - gate) + (last_low - low))[:, None]
-            ds = jnp.where(causal, ds * jnp.exp2(_apart(gate, low, gate, low)), 0.0) * scale
+            ds = jnp.where(causal, ds * jnp.exp2(algebra.apart(gate, low, gate, low)), 0.0) * scale
             # The keys' writes into the memory the chunk leaves run through (s, end]: the last row's pairs.
             leaving = jnp.sum(dk * keys.astype(jnp.float32), axis=1)
             pairs = (jnp.where(strict, ds * scores, 0.0)
@@ -913,7 +913,7 @@ def _wy_bwd_kernel(chunk_ref, k_ref, v_ref, beta_ref, g_ref, gl_ref, a_ref, dw_r
         d_x = _dot(d_x.astype(inverse_t.dtype), inverse_t, exact=exact)
         d_x = _dot(inverse_t, d_x.astype(inverse_t.dtype), exact=exact)
         low = _gates(gl_ref, start, taken, chunk)
-        d_x = d_x * jnp.exp2(_apart(gate, low, gate, low))
+        d_x = d_x * jnp.exp2(algebra.apart(gate, low, gate, low))
         d_l = jnp.where(strict, -d_x, 0.0).astype(k_ref.dtype)
         def keys_grad(block, carry):
             products, d_beta = carry
