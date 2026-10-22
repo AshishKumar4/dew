@@ -52,6 +52,8 @@ def _ring_sums(x, *, interpret, consumers: int = 1):
                     def _(step):
                         ring.load(first + step, x_gmem.at[pl.ds((first + step) * BLOCK[0], BLOCK[0])])
 
+                ring.drain(jnp.int32(_first_step(TILES)))
+
             def consumer(wg):
                 @hopper.persistent(TILES, collective_axes="sm")
                 def _(tile, info):
