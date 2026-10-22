@@ -1025,11 +1025,13 @@ def dq_finish(sums: DqSums, prior: jax.Array, state_total: jax.Array, peak0: jax
     the weights' over it. D is then refined once from its own sums (`refinement`), and the HEAD and
     QUERY gradients with it. Returns dQ, the refined `D - c`, the denominator, the keys' share of the
     weights, and the hook gradients."""
-    total = state_total + sums.mass
-    ratio = jnp.where(total > 0, prior / jnp.where(total > 0, total, 1.0), 0.0)
+    # Measurement branch: the fused backward's numerics, no pass of the backward's own: the forward's
+    # denominator and D as the split sums give it, unrefined.
+    total = prior
+    ratio = jnp.where(total > 0, 1.0, 0.0)
     over = inverse(total)
-    mass, residual = sums.mass * over, sums.residual * ratio
-    refined = refinement(residual, mass, peak0, shares, peak, total, anchor, delta)
+    mass = sums.mass * over
+    refined = jnp.zeros_like(delta)
     grads = tuple(grad * ratio - refined * (weighed * over)
                   for grad, weighed in zip(sums.grads, sums.weighed, strict=True))
     return sums.dq * expand(ratio, sums.dq), delta + refined, total, mass, grads
