@@ -139,11 +139,13 @@ def _spec(scale: float, softcap: float | None, natural: bool, dtype, capacity: i
     """The algebra's facts for a decode launch: each query block's keys its row's span (`spans`), no
     documents, the cap as its score hook, the logits `natural` or not (`algebra.Forward.base2`), and
     whether a row's sums over `capacity` keys of `dtype`, with its sinks, need a guard
-    (`algebra.headroom`). A decode block's rows are a key head's query heads and positions
-    (`grouped_query`), so the hook takes no query positions."""
+    (`algebra.headroom`), its operands' width deciding the exponent's form (`algebra.Forward.base2`). A
+    decode block's rows are a key head's query heads and positions (`grouped_query`), so the hook takes
+    no query positions."""
     return algebra.Forward("spans", 0, ids=False, scale=scale,
                            score_mod=None if softcap is None else functools.partial(_capped, softcap),
-                           natural=natural, headroom=algebra.headroom(dtype, capacity, sinks))
+                           natural=natural, headroom=algebra.headroom(dtype, capacity, sinks),
+                           wide=jnp.dtype(dtype).itemsize >= 4)
 
 
 def _attend(query: jax.Array, span: tuple, read, block: int, spec: algebra.Forward, steps,
