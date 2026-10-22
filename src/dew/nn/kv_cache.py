@@ -378,16 +378,16 @@ class KVStore:
         if self.layout.page_size is None:
             return write_cache(buffer, values, positions)
         rows = jnp.broadcast_to(jnp.arange(positions.shape[0])[:, None], positions.shape)
-        return self._paged(buffer, values, rows, positions, self.layout.groups)
+        return self._paged(buffer, values, rows, positions, self.layout.page_size, self.layout.groups)
 
     def _paged(self, pool: jax.Array, values: jax.Array, rows: jax.Array, positions: jax.Array,
-               groups: int) -> jax.Array:
+               size: int, groups: int) -> jax.Array:
         """The paged `pool` `[heads, pages, page_size, ...]` with each token's `values` `[..., heads,
         ...]` at its row's slot: `rows` and `positions` index the tokens alike, `[rows, tokens]` for a
         rectangular append or `[tokens]` for a mixed one. A slot at -1, or a row past the table's,
         drops. The tokens split into `groups` along their first axis, each group scattered into its
-        part of the pool."""
-        size, table = self.layout.page_size, self._get(TABLE)
+        part of the pool; `size` is the layout's page size."""
+        table = self._get(TABLE)
         inside = (positions >= 0) & (rows < table.shape[0])
         safe = jnp.maximum(positions, 0)
         page = jnp.where(inside, table[jnp.where(inside, rows, 0), safe // size], DROPPED)
@@ -428,8 +428,9 @@ class KVStore:
         """
         for name, incoming in (("cached_key", key), ("cached_value", value)):
             pool = self._get(name)
-            self._put(name, write_tokens(pool, incoming, rows, positions) if self.layout.page_size is None
-                      else self._paged(pool, incoming, rows, positions, 1))
+            size = self.layout.page_size
+            self._put(name, write_tokens(pool, incoming, rows, positions) if size is None
+                      else self._paged(pool, incoming, rows, positions, size, 1))
 
     def read_rows(self, rows: jax.Array) -> tuple[jax.Array, jax.Array]:
         """Return what `read` returns for only `rows`, `[len(rows), capacity, kv_heads, head_dim]`.
