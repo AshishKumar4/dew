@@ -512,18 +512,20 @@ def gemma4_export_weights(family: DecoderFamily, model: CausalTransformer, varia
     and nothing else in `constants`, before the shared writer reads them.
     """
     mode = model.layer_scalar
-    if mode not in ('frozen', 'trainable'):
+    if mode not in LAYER_SCALAR_COLLECTIONS:
         raise ValueError('Gemma4 tensor export requires an explicit layer_scalar mode')
-    params = variables.get('params', variables)
-    constants = variables.get('constants', {})
-    if not isinstance(params, Mapping) or not isinstance(constants, Mapping):
-        raise ValueError('params and constants must contain native variable trees')
-    fixed = set(flatten_dict(dict(constants), sep='.'))
+    found: dict[str, set[str]] = {}
+    for each, collection in LAYER_SCALAR_COLLECTIONS.items():
+        # A bare parameter tree is its own `params`.
+        tree = variables.get(collection, variables if collection == 'params' else {})
+        if not isinstance(tree, Mapping):
+            raise ValueError('params and constants must contain native variable trees')
+        found[each] = set(flatten_dict(dict(tree), sep='.'))
     scalars = {f'layers_{index}.layer_scalar' for index in range(model.num_layers)}
-    if fixed - scalars:
-        raise ValueError(f'unrepresented Gemma4 constants: {sorted(fixed - scalars)}')
-    trained = set(flatten_dict(dict(params), sep='.')) & scalars
-    held, stray = (fixed, trained) if mode == 'frozen' else (trained, fixed)
+    if found['frozen'] - scalars:
+        raise ValueError(f'unrepresented Gemma4 constants: {sorted(found["frozen"] - scalars)}')
+    held = found[mode] & scalars
+    stray = set().union(*(names & scalars for each, names in found.items() if each != mode))
     if held != scalars or stray:
         raise ValueError(f"layer_scalar={mode} keeps every layer scalar in "
                          f"{LAYER_SCALAR_COLLECTIONS[mode]} alone")

@@ -799,8 +799,8 @@ def load_diffusion_source(checkpoint: str, *, dtype: str = "bfloat16", param_dty
         attention_impl=attention_impl, param_dtype=param_dtype, streaming=streaming, size=size,
         variables=variables, text=text)
     if loaded is None:
-        raise ValueError(f"{checkpoint} is not a diffusion pipeline: it has no model_index.json, or it is "
-                         "the decoder its config.json names")
+        raise ValueError(f"{checkpoint} is not a diffusion pipeline: it has no model_index.json, or its "
+                         "config.json names the model it is")
     return _published(loaded, checkpoint, selected=False)
 
 
@@ -974,10 +974,10 @@ def _pipeline_source(name_or_dir: str | Path, directory: Path, commit: str | Non
     """The source as a latent diffusion pipeline, or None when it is a decoder.
 
     A single file converts into the pipeline it describes, and a DDUF file
-    unpacks into the one it packs; a directory with
-    a model_index.json and no config.json of its own is one. A decoder that
-    also ships a pipeline index for its sampler (DiffusionGemma) is loaded as
-    the decoder its config names. `placed` puts the pipeline's variables on
+    unpacks into the one it packs; a directory with a model_index.json is
+    one unless its own config.json names a model (`_names_a_model`): a
+    decoder that also ships a pipeline index for its sampler (DiffusionGemma)
+    is loaded as the decoder its config names. `placed` puts the pipeline's variables on
     the mesh, and `streaming` has them read one leaf at a time as it does; a
     single file's conversion is kept only once that succeeds too. `size`,
     supplied `variables` and `text` are a training run's (`load_diffusion_source`):
@@ -1009,7 +1009,7 @@ def _pipeline_source(name_or_dir: str | Path, directory: Path, commit: str | Non
         with original.unpacked(sources.repo_file(name_or_dir, directory, single_file), configs, hub) as (
                 converted, published):
             return replace(pipeline(converted), source=published)
-    if (directory / "model_index.json").is_file() and not (directory / "config.json").is_file():
+    if (directory / "model_index.json").is_file() and not _names_a_model(directory):
         if variables is not None:
             return pipeline(directory, sources.StoredWeights(str(name_or_dir), directory))
         index = json.loads((directory / "model_index.json").read_text())
@@ -1017,6 +1017,12 @@ def _pipeline_source(name_or_dir: str | Path, directory: Path, commit: str | Non
             pipeline_denoiser(directory, dtype=dtype, attention_impl=attention_impl).text, index)
         return pipeline(_pipeline_weights(name_or_dir, directory, index, skipped))
     return None
+
+
+def _names_a_model(directory: Path) -> bool:
+    """Whether `directory`'s own config.json names a model by its `model_type`."""
+    path = directory / "config.json"
+    return path.is_file() and "model_type" in records.record(json.loads(path.read_text()), "config.json")
 
 
 def _source_config(name_or_dir: str | Path, directory: Path, commit: str | None,
