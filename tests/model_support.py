@@ -110,6 +110,12 @@ def decoder(kind: str = "attention") -> CausalTransformer:
                              dtype="float32", mixer=mixer)
 
 
+def initialized_decoder(kind: str = "attention", length: int = 2) -> tuple[CausalTransformer, dict]:
+    """`decoder(kind)` and its parameters, initialized from key 0 over `length` tokens."""
+    module = decoder(kind)
+    return module, module.init(jax.random.key(0), jnp.ones((1, length), jnp.int32))
+
+
 class Digits:
     def encode(self, text):
         return [int(character) for character in text]
