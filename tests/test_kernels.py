@@ -1019,3 +1019,19 @@ def test_narrow_heads_take_the_kernel_their_target_measured_fastest(generation_n
     assert route.preferred == narrow
     # The row qualifies the preferred kernel: only host facts (backend, wheel) may turn it down here.
     assert "row" not in refused
+
+
+def test_a_splash_call_refused_for_its_arithmetic_is_reported_as_that():
+    """On a TPU, a call splash would tile but whose arithmetic only the reference path computes (a
+    HIGHEST matmul precision) is refused by splash for its arithmetic, not for its tiling: the case
+    builder forms the tiling fact from the requirements before it, whatever a later one says."""
+    from dew.nn.attention import attention_case
+    from dew.nn.attention_kernels import ATTENTION, kernel_refusals
+    from dew.nn.kernels import generation
+
+    query = jnp.zeros((1, 512, 4, 64), jnp.bfloat16)
+    with generation.assumed("v5e"):
+        case = attention_case(query, query, causal=True, precision=jax.lax.Precision.HIGHEST)
+        refused = [refusal.code for refusal in kernel_refusals(ATTENTION, "tpu", case)]
+    assert case.splash and refused == ["arithmetic"]
+
