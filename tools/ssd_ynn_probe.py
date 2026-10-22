@@ -13,6 +13,7 @@ prints the host's CPU family and model, which docs/performance.md's figures name
 """
 
 import argparse
+import os
 from pathlib import Path
 
 import jax
@@ -31,8 +32,8 @@ def main() -> None:
     cpu = {key.strip(): value.strip() for key, value in (line.split(":", 1) for line in lines
                                                           if line.startswith(("cpu family", "model\t")))}
     avx512 = any(line.startswith("flags") and " avx512f" in line for line in lines)
-    print("cpu", cpu, "avx512f" if avx512 else "no avx512f", "draws", args.draws,
-          "fused" if args.fused else "without YNN", flush=True)
+    print("cpu", cpu, "avx512f" if avx512 else "no avx512f", "usable cpus", len(os.sched_getaffinity(0)),
+          "draws", args.draws, "fused" if args.fused else "without YNN", flush=True)
     reference = dict(np.load(FIXTURES / "ssd.npz"))
     for param in CASES:
         kind, case, compiled = param.values
