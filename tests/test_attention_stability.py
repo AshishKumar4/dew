@@ -76,16 +76,18 @@ def _ties(width: int, cotangent: float) -> Callable[[int], tuple]:
     """One query of 1 over two keys whose logits are a drawn fp32 near 2^30 and the one a drawn 1 to 4
     ulps below it (Sol's case: the reference weighs the first alone, which a base-2 fold rounding each
     logit at log2(e) times its size can tie), their keys scaled by sqrt(`width`) so the logits are those
-    at every scale; drawn values, the cotangent drawn times `cotangent`."""
+    at every scale; values and cotangent in their first entry, drawn in [-1, 1), the cotangent times
+    `cotangent`, so their products stay finite in the reference's backward."""
     def draw(seed: int):
         top = np.float32(_uniform(seed, 2.0 ** 30, 2.0 ** 31))
         below = top
         for _ in range(int(_uniform(seed + 1, 1, 5))):
             below = np.nextafter(below, np.float32(0))
-        value, dout = _normal(seed + 2, (1, 2, 1, width), (1, 1, 1, width))
+        value = _first(_uniform(seed + 2, -1.0, 1.0, (2,)), width)
+        dout = _first(_uniform(seed + 3, -1.0, 1.0, (1,)) * np.float32(cotangent), width)
         root = np.float32(np.sqrt(width))
         return (_first(np.ones(1, np.float32), width), _first(np.asarray([top, below]) * root, width), value,
-                None, dout * np.float32(cotangent))
+                None, dout)
 
     return draw
 
@@ -162,12 +164,13 @@ def _families() -> dict[str, Family]:
         # subtraction), so its weight is 1 within an ulp and the output its value within one ulp: a bound
         # check 2 holds where the gate's exp2 oracle states it (`algebra.Forward.base2`).
         "one key": Family(drawn(4, 1), np.ones((1, 1, 4, 1), bool), folded=False),
-        "a sink and one key": Family(with_sinks(drawn(1, 1), -3.0, 3.0), every),
-        "a sink near fp32's largest and one key": Family(with_sinks(drawn(1, 1), 1e38, 3e38), every),
+        "a sink and one key": Family(with_sinks(drawn(16, 1), -3.0, 3.0), np.ones((1, 1, 16, 1), bool)),
+        "a sink near fp32's largest and one key": Family(with_sinks(drawn(16, 1), 1e38, 3e38),
+                                                         np.ones((1, 1, 16, 1), bool)),
         "a sink and one key, its logit near fp32's largest": Family(
             with_sinks(near_max_logit(1), -3.0, 3.0), every),
-        "a sink near fp32's largest at scale 1/4": Family(with_sinks(drawn(1, 1), 1e38, 3e38), every,
-                                                          folded=False),
+        "a sink near fp32's largest at scale 1/4": Family(with_sinks(drawn(16, 1), 1e38, 3e38),
+                                                          np.ones((1, 1, 16, 1), bool)),
         "logits near 1e4": Family(drawn(64, 64, size=1e4), _causal(64, 64), {"causal": True}),
         # Folded, the backward takes the base-2 maximum back to natural units, which at 1e30 rounds the
         # anchor's own weight away from 1 by more than any bound states.

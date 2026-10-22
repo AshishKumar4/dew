@@ -52,14 +52,15 @@ class Forward:
     def base2(self) -> bool:
         """Whether the logits fold log2(e) into the scale for exp2, the fast form and the default
         (FlashAttention 2's and jax's mha's arithmetic): unless the call keeps them `natural`, where no
-        hook reads them and the scale times log2(e) is at most 1, so the fold takes no logit the
-        reference keeps finite past fp32's largest. Otherwise they stay natural, each exponential taken
+        hook reads them and the scale times log2(e) is below 1, so the fold takes no logit the reference
+        keeps finite past fp32's largest, and every folded logit is at least an ulp of fp32's largest
+        below it (`base2_maximum`). Otherwise they stay natural, each exponential taken
         of their difference (`natural_exp`), as the reference's. The fold rounds each logit at log2(e)
         times its size, so logits the reference keeps apart can tie: keys of 2 * 1610613120 and 2 * 1610612992
         under a query of 1 at scale 0.5 weigh 1 and 0 in the reference and 0.5 each folded, and a
         cotangent of 2**125 then overflows its backward (docs/design/kernel-templates.md, the forms'
         divergences). On drawn inputs both forms pass check 1."""
-        return not self.natural and self.score_mod is None and self.scale * LOG2E <= 1.0
+        return not self.natural and self.score_mod is None and self.scale * LOG2E < 1.0
 
     @property
     def guarded(self) -> bool:
@@ -200,6 +201,17 @@ def room(state: Partial, alpha: jax.Array, p: jax.Array, value: jax.Array
     return p * expand(scale, p), alpha * jnp.exp2(state.shift - shift), shift, reach
 
 
+def base2_maximum(m: jax.Array) -> jax.Array:
+    """A natural initial maximum (a sink's logit, a partial's) in base 2, `m * log2(e)`, saturated at fp32's
+    largest where that product passes it. Exact as far as any key reads it: a folded logit is at most fp32's
+    largest less an ulp (`Forward.base2`), so a maximum past fp32's largest in base 2 exceeds every key's
+    by over an ulp there, 2^104, as its saturation does, and every key's weight is zero under either, the
+    state's own one; one past its negative is below every key's alike."""
+    folded = m * LOG2E
+    largest = float(jnp.finfo(jnp.float32).max)
+    return jnp.where(jnp.isinf(folded) & jnp.isfinite(m), jnp.sign(m) * largest, folded)
+
+
 def resumed(spec: Forward, m: jax.Array, total: jax.Array, acc: jax.Array, *,
             shifted: bool = False) -> Partial:
     """The softmax resumed from a state `(m, total, acc)` (`Hooks.initial`: sinks, a resumed partial),
@@ -208,12 +220,13 @@ def resumed(spec: Forward, m: jax.Array, total: jax.Array, acc: jax.Array, *,
     it weighed)."""
     m, total, acc = (array.astype(jnp.float32) for array in (m, total, acc))
     if not shifted:
-        return Partial(acc, m * LOG2E if spec.base2 else m, total)
+        return Partial(acc, base2_maximum(m) if spec.base2 else m, total)
     largest = jnp.max(jnp.abs(acc), axis=-1)
     reach = jnp.where(total > 0, largest / jnp.where(total > 0, total, 1.0), 0.0)
     shift = needed(total, reach)
     scale = jnp.exp2(-shift)
-    return Partial(acc * expand(scale, acc), m * LOG2E if spec.base2 else m, total * scale, shift, reach)
+    return Partial(acc * expand(scale, acc), base2_maximum(m) if spec.base2 else m, total * scale, shift,
+                   reach)
 
 
 def modify(spec: Forward, s: jax.Array, coords: Coords, params: tuple[jax.Array, ...] = (),
