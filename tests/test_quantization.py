@@ -164,7 +164,7 @@ def test_an_int8_trunk_trains_down():
     assert all(later < earlier for earlier, later in itertools.pairwise(losses)), losses
 
 
-CONVOLUTION_SEEDS = 8
+CONVOLUTION_SEEDS = 64
 """The quantized convolutions' declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for`
 on armada."""
 
