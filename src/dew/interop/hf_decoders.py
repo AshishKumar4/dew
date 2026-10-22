@@ -769,7 +769,7 @@ def save_export_assets(
     if writer is not None:
         # The tokenizer writes its files beside the directory, and each replaces its old one whole,
         # so an engine reading the directory never reads one half written.
-        with tempfile.TemporaryDirectory(dir=directory) as staged:
+        with tempfile.TemporaryDirectory(prefix=".dew-", dir=directory) as staged:
             writer.save_pretrained(staged)
             for written in Path(staged).iterdir():
                 os.replace(written, Path(directory) / written.name)
