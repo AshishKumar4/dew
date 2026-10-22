@@ -59,27 +59,11 @@ def make_objective():
     devices, and this module is imported before the pool is joined.
     """
     import jax.numpy as jnp
-    import optax
+    from diffusion_support import DeterministicObjective
 
     from dew.artifacts import Representations
-    from dew.inputs import unit_range
-    from dew.nn.backbones.dit import SimpleDiT
-    from dew.objectives.base import Aux, EMASpec, Objective
 
-    class Reconstruction(Objective):
-        def __init__(self):
-            self.model = SimpleDiT(patch_size=4, emb_features=32, num_layers=1, num_heads=2,
-                                   mlp_ratio=1)
-            self.ema = EMASpec(decay=optax.constant_schedule(0.999))
-
-        def fresh_variables(self, key, held):
-            return self.model.init(key, jnp.ones((1, RES, RES, 3)), jnp.zeros((1,)))
-
-        def loss(self, variables, batch, step):
-            data = unit_range(batch["image"])
-            preds = self.model.apply(variables, data, jnp.zeros((data.shape[0],), jnp.float32))
-            return jnp.mean((preds - data) ** 2), Aux({})
-
+    class Reconstruction(DeterministicObjective):
         def evaluate(self, params, batch, step):
             # The validation split here is a token split whose contents the
             # objective has no use for: what the pass exercises is its length.
@@ -1565,17 +1549,9 @@ def mode_rollout(args) -> dict:
     rows = len(batch["prompt"]) // processes
     local = {name: value[rank * rows:(rank + 1) * rows] for name, value in batch.items()}
     # Select a real first token as EOS; other rows reach it at different steps.
-    from dew.nn.inputs import ModelInputs
+    from rl_support import prompt_inputs
 
-    def inputs_for(records):
-        tokens = jnp.asarray(records["prompt"])
-        mask = (
-            jnp.arange(tokens.shape[1])[None, :]
-            >= tokens.shape[1] - jnp.asarray(records["prompt_length"])[:, None]
-        )
-        return ModelInputs(tokens, {"attention_mask": mask})
-
-    greedy = generate(model, params, inputs_for(batch), 4, key=jax.random.key(1),
+    greedy = generate(model, params, prompt_inputs(batch), 4, key=jax.random.key(1),
                       sampling=Sampling(temperature=0))
     eos = int(np.asarray(greedy.tokens)[0, 4])
     sampling = Sampling(temperature=0, eos_token_ids=eos, pad_token_id=12)
@@ -1594,7 +1570,7 @@ def mode_rollout(args) -> dict:
     arrivals = multihost_utils.process_allgather(np.asarray(rank, np.int64))
     # Stochastic draws over the placed parameters: keys fold in the global
     # row index, so the pool draws what one process draws for the same rows.
-    drawn = generate(model, state.variables, inputs_for(local), 4, key=jax.random.key(21),
+    drawn = generate(model, state.variables, prompt_inputs(local), 4, key=jax.random.key(21),
                      sampling=Sampling(temperature=0.8, top_k=5, eos_token_ids=eos, pad_token_id=12)).host()
     # A resident global array reaches the task as it is: a process cannot
     # fetch the rows the other process's devices hold, so a host round trip
@@ -1612,7 +1588,7 @@ def mode_rollout(args) -> dict:
     ).host()
     invalid_errors, meshless = {}, {}
     if processes > 1:
-        invalid_errors = _rejected_inputs(model, state, local, rollout, sampling, inputs_for, rank)
+        invalid_errors = _rejected_inputs(model, state, local, rollout, sampling, prompt_inputs, rank)
         meshless = _meshless_rollout(trainer.initial_state(), local, rollout, rank)
     single = None
     if processes == 1:
@@ -1757,13 +1733,13 @@ def mode_continuations(args) -> dict:
     rows = len(prompts) // processes
     local = slice(rank * rows, (rank + 1) * rows)
 
-    def inputs_for(tokens, real):
+    def prompt_inputs(tokens, real):
         mask = np.arange(tokens.shape[1])[None, :] >= tokens.shape[1] - real[:, None]
         return ModelInputs(jnp.asarray(tokens), {"attention_mask": jnp.asarray(mask)})
 
     task = TextGeneration(model, placed, sampling=Sampling(temperature=0.9, top_k=5,
                                                            eos_token_ids=11, pad_token_id=12), n=3)
-    request = inputs_for(prompts[local], lengths[local])
+    request = prompt_inputs(prompts[local], lengths[local])
     result = task(request, 4, key=7)
     host = result.host()
     rejected = []

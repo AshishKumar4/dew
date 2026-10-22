@@ -19,6 +19,7 @@ from dew.interop.weights import checkpoint_array
 from dew.nn.attention import LayerNorm, RMSNorm
 from dew.nn.conv import Conv
 from dew.nn.dense import Dense
+from dew.nn.precision import float32_dot_general
 from dew.nn.text_encoders import (
     TOWER_ACTIVATIONS,
     _encoder_layer_path,
@@ -139,7 +140,7 @@ class GemmaProjectorModule(nn.Module):
             name="mm_soft_emb_norm")
         self.mm_input_projection = Dense(
             self.text_width, use_bias=False, dtype=self.dtype,
-            precision=self.precision, name="mm_input_projection")
+            precision=self.precision, name="mm_input_projection", dot_general=float32_dot_general)
 
     def __call__(self, vision_outputs) -> jax.Array:
         batch, length, width = vision_outputs.shape

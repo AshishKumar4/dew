@@ -1,5 +1,5 @@
 {
-  "transformers_version": "5.16.1",
+  "transformers_version": "5.17.0",
   "architectures": null,
   "output_hidden_states": false,
   "return_dict": true,

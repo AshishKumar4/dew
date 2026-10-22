@@ -10,6 +10,7 @@ from flax import linen as nn
 
 from dew import records
 from dew.interop.decoder_parts import read_rope_theta
+from dew.registry import Record
 
 PIXEL_VALUES_KEY = "pixel_values"
 """The batch field carrying images as the checkpoint's processor emitted them."""
@@ -113,20 +114,25 @@ _BLOCK_NORMS = {"norm1": "input_layernorm", "norm2": "post_attention_layernorm"}
 """A ViT block's two norms as `clip_layer`'s decoder block names them."""
 
 
-def block_tensor_path(parts: list[str], maps: Mapping[tuple[str, str], tuple[str, str]], *,
-                      prefix: str = "blocks", norm_bias: bool = True) -> tuple[str, ...] | None:
-    """A shared-trunk ViT's block tensor, `{prefix}.N.norm1|norm2.weight|bias` or
+def block_tensor_path(parts: list[str], maps: Mapping[tuple[str, str], tuple[str, ...]], *,
+                      prefix: str = "blocks", norm_bias: bool = True, block: str = "blocks",
+                      norms: Mapping[str, str] = _BLOCK_NORMS) -> tuple[str, ...] | None:
+    """An indexed block's tensor, `{prefix}.N.<norm>.weight|bias` or
     `{prefix}.N.<module>.<linear>.weight|bias`, its name split on dots, into its path under
-    `blocks_N`: `maps` places each release's (module, linear) pair, and a release whose norms carry
-    no bias says so (`norm_bias`). None for any other name, which the family reads or refuses."""
-    if (len(parts) not in (4, 5) or parts[0] != prefix or not parts[1].isdigit()
+    `{block}_N`: `norms` names each norm's module (a shared-trunk ViT's `norm1` and `norm2` by
+    default), `maps` places each release's (module, linear) pair, and a release whose norms carry
+    no bias says so (`norm_bias`). `prefix` may hold dots (a text encoder's `encoder.layers`). None
+    for any other name, which the family reads or refuses."""
+    root = prefix.split(".")
+    depth = len(root)
+    if (len(parts) not in (depth + 3, depth + 4) or parts[:depth] != root or not parts[depth].isdigit()
             or parts[-1] not in ("weight", "bias")):
         return None
-    block, leaf = f"blocks_{parts[1]}", parts[-1]
-    if len(parts) == 4 and parts[2] in _BLOCK_NORMS and (norm_bias or leaf == "weight"):
-        return (block, _BLOCK_NORMS[parts[2]], "scale" if leaf == "weight" else "bias")
-    if len(parts) == 5 and (parts[2], parts[3]) in maps:
-        return (block, *maps[parts[2], parts[3]], "kernel" if leaf == "weight" else "bias")
+    name, module, leaf = f"{block}_{parts[depth]}", parts[depth + 1], parts[-1]
+    if len(parts) == depth + 3 and module in norms and (norm_bias or leaf == "weight"):
+        return (name, norms[module], "scale" if leaf == "weight" else "bias")
+    if len(parts) == depth + 4 and (module, parts[depth + 2]) in maps:
+        return (name, *maps[module, parts[depth + 2]], "kernel" if leaf == "weight" else "bias")
     return None
 
 
@@ -142,6 +148,23 @@ def projector_weight_path(kind: str, name: str) -> tuple[str, ...]:
 def _vision_section(hf_config: Mapping[str, object]) -> Mapping[str, object]:
     """The vision half of a wrapper config, or a bare vision config."""
     return records.record(hf_config.get("vision_config", hf_config), "vision_config")
+
+
+def merger_projector(hf_config: Mapping[str, object], text_width: int, kind: str) -> Record:
+    """The `kind` projector record of a wrapper whose vision tower ends in its own merger
+    (`out_hidden_size`, `spatial_merge_size`), as Qwen 3.5's and MiMo-V2's do: the merged
+    features enter the text embeddings as they are, so a merger width beside the decoder width
+    refuses."""
+    vision = _vision_section(hf_config)
+    merged = records.integer(vision["out_hidden_size"], "out_hidden_size")
+    if merged != int(text_width):
+        raise ValueError(f"out_hidden_size ({merged}) is not the decoder width ({text_width}), "
+                         "the merger output enters the text embeddings as it is")
+    return {"class": kind, "fields": {
+        "vision_width": records.integer(vision["hidden_size"], "hidden_size"),
+        "merge_size": records.integer(vision.get("spatial_merge_size", 2), "spatial_merge_size"),
+        "out_width": merged,
+    }}
 
 
 def _side(value: object, field: str) -> int:
@@ -178,15 +201,22 @@ def activation_name(config: Mapping[str, object], runs: Collection[str], default
 
 
 
-def rope_base(vision: Mapping[str, object], default: float) -> float:
+def rope_base(vision: Mapping[str, object], default: float, *, axial: bool = False) -> float:
     """A trunk's plain rotary base: `rope_parameters`' rope_theta, else the
     flat field, else the family's `default`. A scaled rope refuses, as any
     rope does where only plain rotary has a place (`read_rope_theta`), and so
     does the decoders' 'none' alias: the towers dispatch any type but
     'default' to Transformers' rope initializers, which name no 'none'
-    (modeling_gemma4.py:716-719)."""
+    (modeling_gemma4.py:716-719). An `axial` tower's rotary, its grid's rows
+    and columns each over half the head, is named 'axial' too: Transformers
+    5.17 writes that name where earlier releases wrote 'default', and reads
+    either as the one its vision rotary runs (configuration_gemma4.py's
+    `default_rope_type`, modeling_gemma4.py's Gemma4VisionRotaryEmbedding)."""
     entry = records.record(vision.get("rope_parameters") or {}, "rope_parameters")
-    if entry.get("rope_type", entry.get("type")) == "none":
+    kind = entry.get("rope_type", entry.get("type"))
+    if kind == "none":
         raise ValueError("rope_parameters: a vision tower's rotary type is 'default', not 'none'")
+    if axial and kind == "axial":
+        entry = {**{name: value for name, value in entry.items() if name != "type"}, "rope_type": "default"}
     theta = read_rope_theta(entry, "rope_parameters")
     return records.number(vision.get("rope_theta", default), "rope_theta") if theta is None else theta

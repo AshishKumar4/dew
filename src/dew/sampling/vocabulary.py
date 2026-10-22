@@ -67,7 +67,7 @@ class Fast(Protocol):
 class Referencing(Protocol):
     """A processor that holds the source's own processor or tokenizer as `reference`.
 
-    `dew.interop.pretrained.Processor` is one.
+    `dew.interop.processors.Processor` is one.
     """
 
     @property

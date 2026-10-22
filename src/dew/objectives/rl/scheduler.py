@@ -127,6 +127,7 @@ from .sessions import (
     check_credit,
     check_estimator,
     check_truncation,
+    local_task_ids,
     pack,
     rows_needed,
     session_metrics,
@@ -185,15 +186,9 @@ class SchedulerRecord:
 
 
 def task_ids(batch: Batch) -> list[Task]:
-    """Return one task per integer `task_id` row of `batch`, named by the id in decimal.
-
-    Raises ValueError unless this process's `task_id` rows are a nonempty
-    vector of integers.
-    """
-    ids = local_rows(batch["task_id"])
-    if ids.ndim != 1 or not ids.size or not np.issubdtype(ids.dtype, np.integer):
-        raise ValueError("task_id must be a nonempty vector of integer task identities")
-    return [Task(str(int(value))) for value in ids]
+    """Return one task per integer `task_id` row of `batch` (`local_task_ids`), named by the id in
+    decimal."""
+    return [Task(str(int(value))) for value in local_task_ids(batch)]
 
 
 @dataclass(eq=False)

@@ -56,7 +56,14 @@ from dew.interop.safetensors_io import read_file, write_file
 from dew.interop.streaming import WeightLayout
 from dew.nn.backbones.layer_plan import group_layers
 from dew.nn.dense import Dense, DenseGeneral
-from dew.nn.flops import MissingFlopsCount, counted_flops, parameter_flops, projection_flops
+from dew.nn.flops import (
+    MissingFlopsCount,
+    counted_flops,
+    frozen_training_flops,
+    parameter_flops,
+    projection_flops,
+)
+from dew.nn.precision import float32_dot_general
 from dew.nn.protocols import (
     Counted,
     CountedConditionedSpatial,
@@ -74,6 +81,7 @@ from dew.nn.protocols import (
     CountedTraining,
     CountedVideo,
 )
+from dew.nn.sharding import LOW_RANK_FACTORS
 from dew.objectives.base import FROZEN, Path, Variables, freeze, merge as overlay, select, thaw
 from dew.quantization import (
     FROZEN_FP8,
@@ -82,6 +90,7 @@ from dew.quantization import (
     frozen_fp8_kernel,
     measured_fp8_sites,
 )
+from dew.records import finite
 from dew.registry import wrapper_layers
 
 PEFT_CONFIG = "adapter_config.json"
@@ -90,7 +99,7 @@ PEFT_PREFIX = "base_model.model."
 DIFFUSERS_WEIGHTS = "pytorch_lora_weights.safetensors"
 DIFFUSERS_METADATA = "lora_adapter_metadata"
 
-FACTORS = ("lora_A", "lora_B")
+FACTORS = LOW_RANK_FACTORS
 # PEFT's init: A as torch's Linear default, kaiming-uniform with a=sqrt(5),
 # which is uniform on +-1/sqrt(fan_in); B zero, so a fresh adapter is the
 # identity.
@@ -116,13 +125,6 @@ def _rank(owner: str, rank: object) -> int:
     if isinstance(rank, bool) or not isinstance(rank, int) or rank < 1:
         raise ValueError(f"{owner}: rank must be a positive integer, not {rank!r}")
     return rank
-
-
-def _alpha(owner: str, alpha: object) -> float:
-    """`alpha` as a float, refused unless a finite number."""
-    if isinstance(alpha, bool) or not isinstance(alpha, numbers.Real) or not math.isfinite(alpha):
-        raise ValueError(f"{owner}: alpha must be a finite number, not {alpha!r}")
-    return float(alpha)
 
 
 def _dropout(owner: str, dropout: object) -> float:
@@ -160,7 +162,7 @@ class LoRA:
         object.__setattr__(self, "modules", tuple(self.modules))
         _rank("LoRA", self.rank)
         if self.alpha is not None:
-            _alpha("LoRA", self.alpha)
+            finite(self.alpha, "LoRA: alpha")
         _dropout("LoRA", self.dropout)
         if not self.modules or any(not isinstance(module, str) or not module for module in self.modules):
             raise ValueError("modules names at least one projection")
@@ -531,9 +533,9 @@ class _Branch:
         if self.dropout and module.has_rng("dropout"):
             x = nn.Dropout(self.dropout, deterministic=False)(x)
         x, a, b = promote_dtype(x, a, b, dtype=module.dtype)
-        hidden = jax.lax.dot_general(x, a, ((axes, tuple(range(len(axes)))), ((), ())),
+        hidden = float32_dot_general(x, a, ((axes, tuple(range(len(axes)))), ((), ())),
                                      precision=module.precision)
-        delta = jax.lax.dot_general(hidden, b, (((hidden.ndim - 1,), (0,)), ((), ())),
+        delta = float32_dot_general(hidden, b, (((hidden.ndim - 1,), (0,)), ((), ())),
                                     precision=module.precision)
         return output + jnp.asarray(_scale(target, self.rslora), delta.dtype) * delta
 
@@ -598,7 +600,7 @@ def _counted_adapter(model: nn.Module, branch: _Branch,
             original = unadapted(self)
             forward = counted_flops(original, lengths)
             learned = parameter_flops(original, lengths)
-            return 3 * forward - learned + 3 * self._adapter_forward(lengths)
+            return frozen_training_flops(forward, learned, self._adapter_forward(lengths))
 
     class LogitsAdapter(CountedAdapter):
         @nn.nowrap
@@ -627,7 +629,7 @@ def _counted_adapter(model: nn.Module, branch: _Branch,
             forward = original.prediction_flops(lengths, prediction_lengths=prediction_lengths)
             learned = original.prediction_parameter_flops(lengths, prediction_lengths=prediction_lengths)
             usage = partial(original.prediction_matrix_usage, prediction_lengths=prediction_lengths)
-            return 3 * forward - learned + 3 * self._adapter_forward(lengths, usage=usage)
+            return frozen_training_flops(forward, learned, self._adapter_forward(lengths, usage=usage))
 
         @nn.nowrap
         def logits_flops(self, lengths) -> float:
@@ -641,7 +643,9 @@ def _counted_adapter(model: nn.Module, branch: _Branch,
             original = unadapted(self)
             if not isinstance(original, CountedLogits):
                 raise MissingFlopsCount(f"{type(original).__name__} has no declared vocabulary-head work")
-            return 2 * original.logits_flops(lengths) + 3 * self._adapter_forward(lengths, logits=True)
+            # The vocabulary head is frozen whole: all its forward work takes no weight gradient.
+            head = original.logits_flops(lengths)
+            return frozen_training_flops(head, head, self._adapter_forward(lengths, logits=True))
 
     if isinstance(model, CountedLogits):
         return LogitsAdapter
@@ -738,7 +742,7 @@ class AdapterRecord:
     def __post_init__(self) -> None:
         for module, target in self.targets.items():
             _rank(f"the adapter record's {module}", target.rank)
-            _alpha(f"the adapter record's {module}", target.alpha)
+            finite(target.alpha, f"the adapter record's {module}: alpha")
         _dropout("the adapter record", self.dropout)
         if not self.targets or any(not name or name in ('.', '..')
                                    for module in self.targets for name in module.split('/')):
@@ -973,10 +977,10 @@ class _Config:
         name, revision = config.get("base_model_name_or_path"), config.get("revision")
         if not isinstance(name, str | None) or not isinstance(revision, str | None):
             raise ValueError(f"{where} names its base model and revision as strings or not at all")
-        return cls(_rank(where, rank), _alpha(where, alpha),
+        return cls(_rank(where, rank), finite(alpha, f"{where}: alpha"),
                    {module: _rank(f"{where} rank_pattern {module}", value)
                     for module, value in rank_pattern.items()},
-                   {module: _alpha(f"{where} alpha_pattern {module}", value)
+                   {module: finite(value, f"{where} alpha_pattern {module}: alpha")
                     for module, value in alpha_pattern.items()},
                    rslora, _dropout(where, dropout), None if name is None else AdapterBase(name, revision))
 

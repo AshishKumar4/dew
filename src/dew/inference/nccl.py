@@ -46,7 +46,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.sharding import SingleDeviceSharding
 
-from dew.coordination import agreed, collective_host
+from dew.coordination import agreed, byte_groups, collective_host
 from dew.nn.inputs import mesh_of
 from dew.objectives.base import Variables
 from dew.records import JSON
@@ -381,14 +381,8 @@ class NCCLPush:
         receive (`receives`) has failed. Each tensor goes to every group, and
         the next waits until each group has issued it (`_Library.ready`).
         """
-        chunks: list[list[np.ndarray]] = [[]]
-        size = 0
-        for tensor in tensors:
-            if chunks[-1] and size + tensor.nbytes > self.chunk:
-                chunks.append([])
-                size = 0
-            chunks[-1].append(tensor)
-            size += tensor.nbytes
+        chunks = [[tensors[index] for index in group]
+                  for group in byte_groups(tensors, self.chunk, nbytes=lambda tensor: tensor.nbytes)] or [[]]
         groups = list(self._groups.values())
         placed = jax.device_put(chunks[0], target)
         for index in range(len(chunks)):

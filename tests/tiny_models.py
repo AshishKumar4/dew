@@ -21,7 +21,7 @@ from dew.registry import models, resolve_dtype
 import_module("dew.nn.multimodal")  # registers the fixture kind
 
 
-TINY = {"emb_features": 32, "precision": "default"}
+TINY = {"emb_features": 32}
 DIT = {"output_channels": 3, "patch_size": 4, "num_layers": 1, "num_heads": 2}
 UNET = {"output_channels": 3, "feature_depths": [8, 16],
         "attention_configs": [None, {"heads": 2}],
@@ -30,7 +30,7 @@ LM = {"num_layers": 1, "num_heads": 2, "vocab_size": 32, "max_seq_len": 16}
 PER_ARCH = {
     "unet": UNET,
     "unet_2d_condition": {"stages": [{"features": 32, "heads": 2}, {"features": 64, "heads": 4}],
-                           "blocks_per_level": 1, "precision": "default"},
+                           "blocks_per_level": 1},
     "unet_3d": {**UNET, "temporal_heads": 2},
     "edm2_unet": {"output_channels": 3, "model_channels": 8, "channel_mult": [1, 2], "num_blocks": 1,
                   "attn_resolutions": [8], "channels_per_head": 8},

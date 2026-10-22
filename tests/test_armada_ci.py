@@ -115,7 +115,8 @@ def test_the_plan_runs_every_file_on_the_floor_and_the_newest_python_on_its_own(
 def test_a_collect_task_rows_each_file_red_where_it_would_not_import(ci, tmp_path):
     """The newest Python's collect-only task turns a file's row red where
     the file does not import or skips on a missing import, and keeps one
-    that imports green, without running any test."""
+    that imports green, without running any test; a red row says it is a
+    collection's, failing no test of its own."""
     files = {
         "test_fine.py": "def test_never_run(): raise SystemExit('ran')\n",
         "test_broken.py": "import no_such_module_anywhere\n",
@@ -130,12 +131,16 @@ def test_a_collect_task_rows_each_file_red_where_it_would_not_import(ci, tmp_pat
     assert {name: row["exitCode"] for name, row in rows.items()} == {
         "3.14:tests/test_fine.py#collect": 0, "3.14:tests/test_broken.py#collect": 1,
         "3.14:tests/test_missing.py#collect": 1}
+    assert {name: (row["kind"], row["failed"]) for name, row in rows.items() if row["exitCode"]} == {
+        "3.14:tests/test_broken.py#collect": ("collect", []),
+        "3.14:tests/test_missing.py#collect": ("collect", [])}
 
 
 def test_a_task_rows_each_file_red_where_ci_would_fail(ci, tmp_path):
     """A failed test, a skip on a missing import and a file that does not
     collect each turn their own file's row red; a passing file and an
-    ordinary skip stay green, timed."""
+    ordinary skip stay green, timed. A red row names the tests that failed
+    where they alone turned it red, and the whole file otherwise."""
     files = {
         "test_pass.py": "import pytest\ndef test_ok(): pass\n"
                         "def test_skip(): pytest.skip('a GPU test on a CPU run')\n",
@@ -152,6 +157,9 @@ def test_a_task_rows_each_file_red_where_ci_would_fail(ci, tmp_path):
     assert {name: row["exitCode"] for name, row in rows.items()} == {
         "3.12:tests/test_pass.py": 0, "3.12:tests/test_fail.py": 1, "3.12:tests/test_missing.py": 1,
         "3.12:tests/test_broken.py": 1}
+    assert {name: (row["kind"], row["failed"]) for name, row in rows.items() if row["exitCode"]} == {
+        "3.12:tests/test_fail.py": ("nodes", ["tests/test_fail.py::test_wrong"]),
+        "3.12:tests/test_missing.py": ("whole", []), "3.12:tests/test_broken.py": ("whole", [])}
     assert rows["3.12:tests/test_pass.py"]["timings"].keys() == {"3.12:tests/test_pass.py"}
     assert rows["3.12:tests/test_pass.py"]["tests"].keys() == {"tests/test_pass.py::test_ok",
                                                                "tests/test_pass.py::test_skip"}
@@ -161,8 +169,8 @@ def test_a_task_rows_each_file_red_where_ci_would_fail(ci, tmp_path):
     (tmp_path / "tests/test_dies.py").write_text("import atexit, os\natexit.register(lambda: os._exit(3))\n"
                                                  "def test_ok(): pass\n")
     ci.task("3.12", ["tests/test_pass.py", "tests/test_dies.py"], "", out, 600.0)
-    assert {row["name"]: row["exitCode"] for row in json.loads(out.read_text())["rows"]} == {
-        "3.12:tests/test_pass.py": 1, "3.12:tests/test_dies.py": 1}
+    assert {row["name"]: (row["exitCode"], row["kind"]) for row in json.loads(out.read_text())["rows"]} == {
+        "3.12:tests/test_pass.py": (1, "whole"), "3.12:tests/test_dies.py": (1, "whole")}
 
 
 def install_compiler(directory: Path) -> None:
@@ -531,6 +539,8 @@ def test_coverage_combines_each_tasks_branches_into_one_report_a_module_a_line(c
     ci.task("3.12", ["tests/test_slow.py"], "", tmp_path / "runs/2/rows.json", 1.0, cache=False, grace=5.0,
             coverage=tmp_path / "runs/2")
     assert ci.coverage_report(tmp_path / "runs") == 1
+    [interrupted] = json.loads((tmp_path / "runs/2/rows.json").read_text())["rows"]
+    assert (interrupted["kind"], interrupted["failed"]) == ("deadline", [])
 
 
 def test_a_coverage_task_has_a_deadline_for_tracing(ci, tmp_path):

@@ -9,7 +9,7 @@ import numpy as np
 import optax
 import pytest
 from model_support import decoder
-from rl_support import clipped_surrogate
+from rl_support import clipped_surrogate, prompt_inputs
 from test_mixers import KIND_FIELDS, tiny
 
 from dew.data.dataset import Loader
@@ -31,21 +31,13 @@ def prompts():
             "extra_info": np.zeros((2, 1), np.int32)}
 
 
-def model_inputs(batch):
-    tokens = jnp.asarray(batch["prompt"])
-    mask = (
-        jnp.arange(tokens.shape[1])[None, :] >= tokens.shape[1] - jnp.asarray(batch["prompt_length"])[:, None]
-    )
-    return ModelInputs(tokens, {"attention_mask": mask})
-
-
 @pytest.mark.parametrize("kind", ["attention", "mla", "recurrent"])
 def test_padding_and_cached_likelihoods_match_unpadded_full_forwards(kind):
     model = decoder(kind)
     params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
     batch = prompts()
     sampling = Sampling(temperature=0.7, top_k=5)
-    result = generate(model, params, model_inputs(batch), 3, key=jax.random.key(1), sampling=sampling)
+    result = generate(model, params, prompt_inputs(batch), 3, key=jax.random.key(1), sampling=sampling)
     np.testing.assert_array_equal(result.lengths, [3, 3])
     np.testing.assert_array_equal(result.terminated, [False, False])
     for row, length in enumerate(batch["prompt_length"]):
@@ -76,7 +68,7 @@ def test_every_registered_mixer_draws_padded_rows_as_their_unpadded_full_forward
     params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
     batch = prompts()
     sampling = Sampling(temperature=0.7, top_k=5)
-    result = generate(model, params, model_inputs(batch), 3, key=jax.random.key(1), sampling=sampling)
+    result = generate(model, params, prompt_inputs(batch), 3, key=jax.random.key(1), sampling=sampling)
     for row, length in enumerate(batch["prompt_length"]):
         context = jnp.asarray(batch["prompt"][row:row + 1, 4 - length:])
         for index, action in enumerate(np.asarray(result.tokens)[row, 4:4 + int(result.lengths[row])]):
@@ -131,7 +123,7 @@ def test_eos_counts_as_action_and_reward_excludes_eos_and_padding():
     objective = GRPOObjective(model, seq_len=7)
     params = objective.init(jax.random.key(0))
     batch = prompts()
-    plain = generate(model, params, model_inputs(batch), 4, key=jax.random.key(1),
+    plain = generate(model, params, prompt_inputs(batch), 4, key=jax.random.key(1),
                      sampling=Sampling(temperature=0))
     eos = int(plain.tokens[0, 4])
     seen = []

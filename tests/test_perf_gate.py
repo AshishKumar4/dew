@@ -45,6 +45,9 @@ def standing_in(gate, monkeypatch, *, passed: bool) -> list:
     outputs = {
         "benchmark_step.py": lambda command: [{"ms_per_step": 5.0, "compile_seconds": 30.0}],
         "benchmark_forward.py": lambda command: {after(command, "--cases"): 5.0},
+        "benchmark_serving_compile.py": lambda command: {
+            "construction_seconds": 8.0, "warm_seconds": 40.0,
+            "by_admission_width": {f"admission {rows}": 8.0 for rows in (1, 2, 4, 8)}},
         "benchmark_lm_serving.py": lambda command: {"sweep": [
             {"slots": int(slots), "repeats": [{"output_tokens_per_second": rate} for rate in (5.0, 6.0)]}
             for slots in after(command, "--slots").split(",")]},
@@ -358,3 +361,25 @@ def test_a_gate_keeps_each_trees_compiles_apart_and_judges_compile_rows_on_the_f
         assert compiles == [True, False, False], (tree, compiles)
     assert set(results["seconds"]) == {"first round", "later rounds"}
     assert gate.report(SimpleNamespace(results=out, table=None, claim=False)) == 0
+
+
+def test_a_probe_measuring_compiles_alone_runs_in_the_first_round_alone(gate, tmp_path, monkeypatch):
+    """A probe whose every row is a first round's compile, the Server's program by program, runs once
+    per tree: a later round would recompile it uncached and read nothing. Each of its programs is a
+    row of its own, and the whole warm is shown beside them, ungated."""
+    from types import SimpleNamespace
+
+    _, rows = standing_in_environments(gate, monkeypatch)
+    trees = {name: locked_tree(tmp_path / name) for name in ("main", "head")}
+    out = tmp_path / "gate.json"
+    args = SimpleNamespace(base=f"main={trees['main']}", head=f"head={trees['head']}", rounds=3,
+                           only=["compile serve"], claim=False, model="unused", flowers="unused",
+                           torch_python="", out=str(out), environments=str(tmp_path / "environments"))
+    assert gate.run(args) == 0
+    served = [command for _, command, _ in rows if Path(command[1]).name == "benchmark_serving_compile.py"]
+    assert len(served) == len(trees)
+    gated = {row.name: row for probe in gate.PROBES for row in probe.rows if "compile serve" in row.name}
+    assert sorted(name for name, row in gated.items() if row.gated) == sorted(
+        f"compile serve dory-1.0-4b {program}"
+        for program in ("construction", "admission 1", "admission 2", "admission 4", "admission 8"))
+    assert not gated["compile serve dory-1.0-4b warm 16 slots"].gated
