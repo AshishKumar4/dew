@@ -369,7 +369,8 @@ def test_a_training_context_caps_the_batch_of_every_way_a_cell_loads_data_and_it
     """In a training context (live_training.install), a cell's dataset batched itself, by any name and
     with its size passed either way, a preset called and a preset through `pipe` each read batches of
     BATCH rows, and its fit, called by another name with its steps unpacked, trains STEPS steps, each
-    saying so first: IPython runs the cell with its calls capped, and Dew's own functions are untouched."""
+    saying so first: IPython runs the cell with its calls capped, and Dew's own functions are untouched;
+    a call that reads its caller's frame (`locals`, however named) still reads the cell's."""
     cell = """
 import numpy as np
 from dew import Trainer
@@ -390,7 +391,9 @@ model = CausalTransformer(vocab_size=400, emb_features=8, num_layers=1, num_head
                           max_seq_len=4)
 run = Trainer(LMObjective(model, seq_len=4), OptimConfig(learning_rate=1e-3), key=0).fit
 state = run(tokens.pipe(presets.lm, None, batch=64, **windows), **dict(steps=1000))
-print("ran", json.dumps([batches, int(state.step), presets.lm is dew.data.presets.lm]))
+read, import_builtins = locals, __import__("builtins")
+frames = ["records" in read(), "records" in import_builtins.locals(), "records" in locals()]
+print("ran", json.dumps([batches, int(state.step), presets.lm is dew.data.presets.lm, frames]))
 """
     code = f"""
 import json, sys
@@ -406,7 +409,7 @@ shell.run_cell({cell!r}).raise_error()
                           env={**os.environ, "JAX_PLATFORMS": "cpu"})
     assert done.returncode == 0, done.stderr[-4000:]
     lines = done.stdout.strip().splitlines()
-    assert json.loads(lines[-1].removeprefix("ran ")) == [[8, 8, 8, 8, 8], 20, True]
+    assert json.loads(lines[-1].removeprefix("ran ")) == [[8, 8, 8, 8, 8], 20, True, [True, True, True]]
     assert [line for line in lines if line.startswith("Live run:")] == [
         "Live run: batch 64 -> 8, so it fits a shared 4-vCPU host."] * 6 + [
         "Live run: steps 1000 -> 20, log_every 100 -> 5, so it finishes in about two minutes."]
