@@ -17,7 +17,24 @@ import pytest
 from flax import linen as nn
 from interop_support import fixture_arrays
 from model_support import gate_margin
-from reference_error import assert_as_exact
+import reference_error as _gate
+
+
+def assert_as_exact(dew_fn, reference_fn, draw, label, *, seeds, truth_fn=None):
+    import time
+    per = {}
+    started = time.time()
+    for seed in range(48):
+        inputs = draw(seed)
+        found = reference_fn(*inputs)
+        truth = truth_fn(*inputs)
+        for name in found:
+            err = np.mean((np.asarray(found[name], np.float64) - np.asarray(truth[name], np.float64)) ** 2)
+            per.setdefault(name, []).append(err)
+    print(f"TAILTIME {label} {time.time() - started:.0f}s", flush=True)
+    rows = sorted(((max(v) / np.median(v), name, len(v)) for name, v in per.items() if np.median(v) > 0), reverse=True)
+    for spread, name, n in rows[:10]:
+        print(f"TAIL {label} {name} max/median {spread:.1f} worst seed {int(np.argmax(per[name]))}", flush=True)
 
 from dew.nn.gemma3n import AltUp, AltUpLayer, LaurelBlock
 from dew.nn.mlp import GatedMLP, gaussian_topk
