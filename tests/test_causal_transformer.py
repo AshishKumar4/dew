@@ -21,7 +21,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
-from model_support import TINY_DECODER, model_draw
+from model_support import TINY_DECODER, decode_steps, model_draw
 from reference_error import assert_as_exact
 
 from dew.nn.attention import scaled_dot_product_attention
@@ -240,39 +240,31 @@ def test_decoder_dropout_rates_must_be_probabilities(rng, field, rate):
         tiny(**{field: rate}).init(rng, tokens(rng, length=4))
 
 
-@functools.cache
-def stepping(model):
-    """`model`'s cache made, and its decode step, each one compiled program."""
-    return (jax.jit(lambda params, rows: model.apply(params, rows, method=CausalTransformer.init_cache,
-                                                     mutable=['cache'])[1]['cache'], static_argnums=1),
-            jax.jit(lambda params, cache, ids: model.apply({**params, 'cache': cache}, ids, decode=True,
-                                                           mutable=['cache'])))
-
-
 def decode_logits(model, params, prompt, rest):
     """Prefill `prompt`, then feed `rest` one token at a time: [B, 1 + len(rest), V]."""
-    made, step = stepping(model)
-    logits, mutated = step(params, made(params, prompt.shape[0]), prompt)
+    made, step = decode_steps(model)
+    logits, cache = step(params, made(params, prompt.shape[0]), prompt)
     steps = [logits[:, -1]]
-    cache = mutated['cache']
     for position in range(rest.shape[1]):
-        logits, mutated = step(params, cache, rest[:, position:position + 1])
-        cache = mutated['cache']
+        logits, cache = step(params, cache, rest[:, position:position + 1])
         steps.append(logits[:, -1])
     return jnp.stack(steps, axis=1)
 
 
 def decoded_against_full(model, prompt: int, label: str, seeds: int, length=SEQ, **shape):
     """Check 1: `model`'s prefill of `prompt` tokens and single-token steps on par with its full pass
-    from position `prompt - 1` over drawn variables and tokens, the truth the model in float64."""
+    from position `prompt - 1` over drawn variables and tokens, the truth the model in float64. A
+    model whose logits a scaling divides is run unscaled in float64 and divided there, since the model
+    divides its states in fp32."""
     def decoded(params, ids):
         return decode_logits(model, params, ids[:, :prompt], ids[:, prompt:])
 
-    def full(model):
-        return jax.jit(lambda params, ids: model.apply(params, ids)[:, prompt - 1:])
+    def full(model, divided=1.0):
+        return jax.jit(lambda params, ids: model.apply(params, ids)[:, prompt - 1:] / divided)
 
+    wide = float64(model.clone(logits_scaling=1.0))
     assert_as_exact(decoded, full(model), drawn(model, length=length, **shape), label, seeds=seeds,
-                    truth_fn=full(float64(model)))
+                    truth_fn=full(wide, model.logits_scaling))
 
 
 def test_logits_ignore_every_later_token(rng):
@@ -317,15 +309,13 @@ def test_a_cached_prompt_reads_its_cache_through_flash_where_its_row_names_it(rn
     ids = tokens(rng)
     params = model.init(rng, ids)
     prompt = ids[:, :6]
-    made, _ = stepping(model)
-    prefill = jax.jit(lambda params, cache, prompt: model.apply(
-        {**params, 'cache': cache}, prompt, decode=True, mutable=['cache'])[0])
-    compiled = prefill.lower(params, made(params, prompt.shape[0]), prompt).compile().as_text()
+    made, step = decode_steps(model)
+    compiled = step.lower(params, made(params, prompt.shape[0]), prompt).compile().as_text()
     flash = (measured_kernel('attention_packed', 'xla') == 'flash'
              and measured_kernel('attention', 'cudnn') == 'flash')
     # FlashAttention-2's and -3's packed calls (dew_flash_attn's custom-call targets).
     assert bool(re.search(r'dew_flash3?_mha_varlen_fwd', compiled)) == flash
-    assert_as_exact(lambda params, prompt: prefill(params, made(params, prompt.shape[0]), prompt),
+    assert_as_exact(lambda params, prompt: step(params, made(params, prompt.shape[0]), prompt)[0],
                     applied(model.clone(attention_impl='xla')), drawn(model, length=6), "cached prefill",
                     seeds=SEEDS['cached prefill'], truth_fn=applied(float64(model)))
 
@@ -386,10 +376,18 @@ def test_a_softcapped_call_is_the_capped_softmax_on_every_path_it_takes(rng, mon
         assert_as_exact(jax.jit(attention(implementation)), jax.jit(equation), draw,
                         f"{implementation} softcap", seeds=SEEDS['softcap'])
 
+    def bf16_equation(query, key, value):
+        # The equation on the bf16 operands in fp32, its output rounded to bf16, as a bf16 call returns.
+        halves = [x.astype(jnp.bfloat16).astype(jnp.float32) for x in (query, key, value)]
+        return equation(*halves).astype(jnp.bfloat16).astype(query.dtype)
+
     monkeypatch.setattr(jax, "default_backend", lambda: "gpu")
-    assert_as_exact(attention('auto', dtype=jnp.bfloat16), attention('reference', dtype=jnp.bfloat16), draw,
+    assert_as_exact(attention('auto', dtype=jnp.bfloat16), jax.jit(bf16_equation), draw,
                     "routed bf16 softcap", seeds=SEEDS['routed softcap'], truth_fn=equation)
     halves = (query.astype(jnp.bfloat16), key.astype(jnp.bfloat16), value.astype(jnp.bfloat16))
+    routed, plain = (scaled_dot_product_attention(*halves, causal=True, softcap=2.0, implementation=name)
+                     for name in ('auto', 'reference'))
+    np.testing.assert_array_equal(np.asarray(routed), np.asarray(plain))
     with pytest.raises(ValueError):
         scaled_dot_product_attention(*halves, causal=True, softcap=2.0, implementation='cudnn')
 
@@ -1371,7 +1369,7 @@ def test_a_padded_prefill_attends_through_cudnn_where_it_runs(rng, without_deter
     the model in float64 (check 1)."""
     model = tiny(dtype=jnp.bfloat16, num_kv_heads=2, head_dim=32)
     valid = jnp.ones((2, SEQ), bool).at[0, :3].set(False)
-    made, _ = stepping(model)
+    made, _ = decode_steps(model)
     prefill = jax.jit(lambda params, cache, ids: model.apply(
         {**params, 'cache': cache}, ids, attention_mask=valid, decode=True, mutable=['cache'])[0])
 
