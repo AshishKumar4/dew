@@ -68,8 +68,8 @@ SCHEDULES = [
 ALL_CASES = SCHEDULES
 ALL_IDS = [cls.__name__ for cls, *_ in SCHEDULES]
 BETAS = dict(np.load(Path(__file__).parent / "fixtures" / "schedules" / "betas.npz"))
-SEEDS = {'invertible': 8, 'diffusion-lm sqrt': 8, 'clean image weighting': 8, 'flow clean image weighting': 8,
-         'karras grid': 8, 'edm weight': 8, 'edm time': 8, 'flow rates': 8}
+SEEDS = {'invertible': 64, 'diffusion-lm sqrt': 128, 'clean image weighting': 256,
+         'flow clean image weighting': 32, 'karras grid': 32, 'edm weight': 8, 'edm time': 8, 'flow rates': 8}
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada)."""
 ROWS = 64
 """A drawn batch's rows: enough that a few seeds resolve a site."""
