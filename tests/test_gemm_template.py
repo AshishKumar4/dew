@@ -1174,7 +1174,9 @@ def test_an_interpreted_fp32_product_at_highest_rounds_its_exact_sum_once(column
     once, at every shape, where XLA's CPU dot takes a less exact fp32 accumulation at a 128-aligned shape
     than at another. The operands are 12-bit integers at scales 2^-4 to 2^4, so every product and partial
     sum is a multiple of 2^-8 below 2^37, exact in float64 in any order and past fp32's 24 bits: the
-    product is the exact sum rounded once to fp32, to the bit. A 16-bit product keeps an fp32 sum."""
+    product is the exact sum rounded once to fp32, to the bit. That is the contract under test, the float64
+    accumulation: an fp32 one would round the partial sums, so equality is no claim that fp32 accumulation
+    is exact here. A 16-bit product keeps an fp32 sum."""
     generator = np.random.default_rng(0)
 
     def drawn(shape):

@@ -165,8 +165,8 @@ def _attend(query: jax.Array, span: tuple, read, block: int, spec: algebra.Forwa
         m, alpha = algebra.peak(spec, state.m, logits)
         weights, factor, held = algebra.tile(state, alpha, algebra.weights(spec, logits, m), value)
         product = _dot(algebra.narrow(weights, value.dtype), value, interpret)
-        plain = None if held is None else _dot(algebra.narrow(held.plain, value.dtype), value, interpret)
-        return algebra.stepped(state, m, factor, weights, product, held, plain)
+        return algebra.stepped(state, m, factor, weights, product, held,
+                               lambda plain: _dot(algebra.narrow(plain, value.dtype), value, interpret))
 
     def walk(live=None) -> algebra.Partial:
         # The plain walk where `live` is None, else the guarded one, those rows shifting.
@@ -205,7 +205,7 @@ def _write(out_refs, spec: algebra.Forward, state: algebra.Partial):
     else:
         # The state's sums, maxima and totals, with its shifts, bounds and small sums under headroom;
         # which rows shifted is the merge's own to find again (`algebra.merge`).
-        for ref, value in zip(out_refs, state[:len(out_refs)], strict=True):
+        for ref, value in zip(out_refs, algebra.exported(state), strict=True):
             ref[...] = value
 
 
@@ -251,7 +251,7 @@ def _combined(spec: algebra.Forward, *parts, axis: int):
     """The slices' states (`[..., splits, ..., QUERIES, D]` sums along `axis`, their maxima, totals,
     shifts and reaches) merged in slice order (`algebra.merge`), as the normalized output in fp32: an
     empty slice's state (a maximum of -inf) merges as nothing."""
-    states = [algebra.Partial(*(jnp.take(part, split, axis=axis) for part in parts))
+    states = [algebra.imported(tuple(jnp.take(part, split, axis=axis) for part in parts))
               for split in range(parts[0].shape[axis])]
     return algebra.finish(spec, functools.reduce(functools.partial(algebra.merge, spec), states),
                           initial=True)[0]

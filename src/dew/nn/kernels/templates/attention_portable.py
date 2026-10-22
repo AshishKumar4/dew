@@ -47,9 +47,10 @@ def _normalized_pass(spec: algebra.Forward, state: algebra.Partial, logits_at: C
     return jax.lax.fori_loop(lo, hi, step, (start, nothing, nothing))
 
 
-def _plain(held: algebra.Room | None, value: jax.Array) -> jax.Array | None:
-    """A guarded tile's unshifted weights' product with its values (`algebra.Room.plain`), None unguarded."""
-    return None if held is None else _dot(algebra.narrow(held.plain, value.dtype), value)
+def _times(weights: jax.Array, *, value: jax.Array) -> jax.Array:
+    """A tile's `weights` narrowed to its values' dtype times its `value`s (a guarded tile's unshifted
+    weights' product, `algebra.stepped`)."""
+    return _dot(algebra.narrow(weights, value.dtype), value)
 
 
 def _dot(a: jax.Array, b: jax.Array) -> jax.Array:
@@ -139,7 +140,8 @@ def forward(spec: algebra.Forward, query: jax.Array, key: jax.Array, value: jax.
         def plain(j, state: algebra.Partial) -> algebra.Partial:
             _, _, m, factor, weights, held, v_tile = softmax(j, state)
             product = _dot(algebra.narrow(weights, v_tile.dtype), v_tile)
-            return algebra.stepped(state, m, factor, weights, product, held, _plain(held, v_tile))
+            return algebra.stepped(state, m, factor, weights, product, held,
+                                   functools.partial(_times, value=v_tile))
 
         def step(j, carry: tuple[algebra.Partial, algebra.Argmax, jax.Array, jax.Array]):
             state, arg, own, others_total = carry
@@ -152,7 +154,7 @@ def forward(spec: algebra.Forward, query: jax.Array, key: jax.Array, value: jax.
                 state.acc, own, others_total, factor, anchor.peak > arg.peak, value[row, arg.key, kv_head],
                 _dot(others, v_tile), others, own_tile, held)
             stepped = algebra.stepped(state, m, factor, weights, jnp.zeros_like(acc), held,
-                                      _plain(held, v_tile))
+                                      functools.partial(_times, value=v_tile))
             return stepped._replace(acc=acc), anchor, own, others_total
 
         resumed = None if initial is None else (initial[0][row, head, rows], initial[1][row, head, rows],
@@ -183,10 +185,9 @@ def forward(spec: algebra.Forward, query: jax.Array, key: jax.Array, value: jax.
             split, arg, own, others_total = walked
             anchor_value = value[row, arg.key, kv_head]
             state = split._replace(acc=algebra.split_output(split.acc, own, anchor_value))
-            terms = None if split.shift is None else _normalized_pass(
-                spec, state, logits_at, arg.key, bounds=(lo, hi),
-                initial=None if resumed is None else (resumed[0], resumed[2]))
-            sums = algebra.split_residuals(split, own, others_total, terms)
+            normalized = functools.partial(_normalized_pass, spec, state, logits_at, arg.key, bounds=(lo, hi),
+                                           initial=None if resumed is None else (resumed[0], resumed[2]))
+            sums = algebra.split_residuals(split, own, others_total, normalized)
             kept = (arg.key, *sums)
         else:
             state, kept = walked, ()
