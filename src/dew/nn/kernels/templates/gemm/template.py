@@ -201,10 +201,12 @@ def _portable_gemm(lhs, rhs, group_sizes, prologue, prologue_arrays, epilogue, e
                    several: bool, transpose_rhs: bool, precision: PrecisionLike, compute=None):
     """`gemm`'s arithmetic in XLA: the kernels' products of `lhs`'s dtype summed in fp32, one rounding;
     with `compute`, the products of the operands rounded to it, its tangent the MoE projection's
-    (`grouped_matmul.portable_projection`, whose fp32 sum it reads)."""
+    (`grouped_matmul.portable_projection`, whose sum, at least fp32, it reads)."""
     matrix = jnp.swapaxes(rhs, 1, 2) if transpose_rhs else rhs
     if compute is not None:
-        summed = grouped_matmul.portable_projection(lhs, matrix, group_sizes, compute, precision, jnp.float32)
+        # Summed and kept at least fp32 (an fp64 product's in fp64), the accumulator the epilogue reads.
+        wide = jnp.promote_types(compute, jnp.float32)
+        summed = grouped_matmul.portable_projection(lhs, matrix, group_sizes, compute, precision, wide)
     else:
         product = lhs if prologue is None else prologue(lhs, *prologue_arrays).astype(lhs.dtype)
         summed = grouped_matmul.xla_ragged_dot(product, matrix.astype(lhs.dtype), group_sizes,
