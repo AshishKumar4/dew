@@ -21,15 +21,14 @@ from dew.nn.kernels.templates.attention import (
     Split,
     block_map,
     gradients,
+    interpreted_dot,
     padded_call,
 )
-from dew.nn.precision import float32_products, products_dtype
 
 
 def _dot(a: jax.Array, b: jax.Array) -> jax.Array:
-    """`a @ b` accumulated in fp32 at its operands' precision (`dew.nn.precision.float32_products`: fp32
-    products for fp32 operands), the product every mainloop takes."""
-    return jnp.dot(a, b, precision=float32_products(products_dtype(a, b)), preferred_element_type=jnp.float32)
+    """`a @ b`, fp32, the template's CPU product (`interpreted_dot`)."""
+    return interpreted_dot(a, b)
 
 
 def _tile_param(value: jax.Array, kind: Kind, row, head, rows: jax.Array, keys: jax.Array):
