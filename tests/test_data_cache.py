@@ -1205,6 +1205,33 @@ def test_a_streamed_generation_serves_its_files_at_another_mount(tmp_path):
     assert publish(chunked(first).pack(4, bins=2), cache, read="streamed").url != generation.url
 
 
+@pytest.mark.parametrize("read", ["indexed", "streamed"])
+def test_a_warm_cache_read_by_worker_processes_refuses_a_manifest_rewritten_since_it_was_committed(
+        tmp_path, read):
+    """Worker processes read a published generation's manifest checked against the size and digest
+    its cache's CURRENT committed it under, as the process that compiled the read does: a manifest
+    rewritten since, the same records in other bytes, is refused, not read."""
+    from dew.data.compile import compile, publish
+    from dew.data.dataset import DataPartition, Loading
+
+    # Shards of two records, so each worker streams its own.
+    chain = Memory([{"id": index} for index in range(8)], shard_rows=2).map(Offset(1))
+    cache = Cache(str(tmp_path / "cache"))
+    publish(chain, cache, read=read)
+    loader = compile(chain.cache(cache).repeat().batch(2), read=read,
+                     loading=Loading(workers=2, threads=1, read_buffer=2))
+    (manifest,) = (tmp_path / "cache").rglob("generations/*/manifest.json")
+    rewritten = json.dumps(json.loads(manifest.read_bytes()), indent=1).encode()
+    manifest.unlink()
+    manifest.write_bytes(rewritten)
+    reader = loader.train(DataPartition())
+    try:
+        with pytest.raises(OSError):
+            next(reader)
+    finally:
+        reader.close()
+
+
 def test_an_empty_stream_publishes_an_empty_generation():
     """A stream with no records publishes a generation of none, its shards read to their end."""
     from dew.data.compile import publish
@@ -1234,7 +1261,10 @@ def test_published_generation_exposes_only_declared_order_metadata_and_plan():
     assert generation.plan("offsets").tolist() == [0, 1, 2, 3, 4]
     assert generation.plan_length("offsets") == 5
     assert generation.plan_at("offsets", 3).item() == 3
-    assert len(generation.plan_hash("offsets")) == 64
+    # A plan published page by page is named as the same array held whole is (`plan.fingerprint`).
+    from dew.data.plan import fingerprint
+
+    assert generation.plan_hash("offsets") == fingerprint(np.arange(5))
 
 
 def test_transient_failures_never_certify_cache_coverage_but_permanent_rejections_do():
@@ -1742,6 +1772,27 @@ def test_a_records_holdout_over_a_stream_filled_generation_of_a_dataset_read_in_
               else from_hf(datasets.Dataset.from_list(rows), name="rows@1"))
     generation = publish(_tagged(Pipeline(source)), _cache(), read="streamed")
     parts = Pipeline(source).holdout(records=5)
+    uncached = [_tags(_tagged(part)) for part in parts]
+    assert all(uncached)
+    assert [_tags(_tagged(part).cache(generation)) for part in parts] == uncached
+
+
+@pytest.mark.parametrize("store", ["hash part", "concatenation"])
+def test_a_records_holdout_over_a_stream_filled_generation_of_a_part_or_a_concatenation_serves(store):
+    """A hash part of a store in memory, and a concatenation of stores in memory, stream their records
+    in index order, as their stores do: a records holdout over a generation a stream filled from
+    either reads the rows of the inputs it keeps, as the chain does uncached."""
+    from dew.data import concat
+    from dew.data.compile import publish
+    from dew.data.pipeline import Pipeline
+
+    rows = [{"id": index} for index in range(24)]
+    if store == "hash part":
+        source, _ = Pipeline(Memory(rows)).holdout(0.25)
+    else:
+        source = concat([Memory(rows[:10]), Memory(rows[10:])])
+    generation = publish(_tagged(source), _cache(), read="streamed")
+    parts = source.holdout(records=5)
     uncached = [_tags(_tagged(part)) for part in parts]
     assert all(uncached)
     assert [_tags(_tagged(part).cache(generation)) for part in parts] == uncached

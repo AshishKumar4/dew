@@ -27,6 +27,15 @@ class SourceOracle(nn.Module):
         return jnp.sin(x) * 0.07 + expand(temb, x) * 0.001
 
 
+class ConditionalSourceOracle(nn.Module):
+    """`SourceOracle` offset by its condition, so a guided walk reads back the combination that was
+    applied (`tools/guidance_reference.py` walks APG over it)."""
+
+    @nn.compact
+    def __call__(self, x, temb, label):
+        return SourceOracle()(x, temb) + expand(label, x)
+
+
 
 def walk(solver, process, model, x_T, times, key=0):
     """Each solver interval's new state, without the closing denoise, through `sample`'s own walk with
@@ -54,14 +63,25 @@ def images_of(url: str, size: int, batch: int = 32):
     return source(url).pipe(presets.images, size, batch=batch)
 
 
-def image_batch(loaded, prompts) -> dict:
-    """One image a device, its pixels a ramp over the source's sample shape, with `prompts` in turn,
-    so a device count that is odd, one GPU included, still gets a prompt for every image."""
-    height, width, channels = loaded.inputs.sample.shape
+class TanhLayer(nn.Module):
+    """A reference stand-in network's layer: tanh of the tokens through one square kernel, zero at init."""
+
+    @nn.compact
+    def __call__(self, tokens):
+        return jnp.tanh(tokens @ self.param("kernel", nn.initializers.zeros, (tokens.shape[-1],) * 2))
+
+
+def image_batch(owner, prompts, size: int | None = None) -> dict:
+    """One image a device, its pixels a ramp over `owner`'s (a loaded source's or an objective's) sample
+    shape, `size` square where given, with `prompts` in turn, so a device count that is odd, one GPU
+    included, still gets a prompt for every image."""
+    height, width, channels = owner.inputs.sample.shape[-3:]
+    if size is not None:
+        height = width = size
     rows = jax.device_count()
     pixels = np.tile(np.arange(height * width * channels, dtype=np.uint8).reshape(1, height, width, channels),
                      (rows, 1, 1, 1))
-    return {"image": pixels, **loaded.inputs.tokenize([prompts[row % len(prompts)] for row in range(rows)])}
+    return {"image": pixels, **owner.inputs.tokenize([prompts[row % len(prompts)] for row in range(rows)])}
 
 
 def source_objective(source):
@@ -119,22 +139,24 @@ def trained_step(objective, batch, checkpoints=None):
     return started, state
 
 
-def saved_after_one_step(config, batch, directory, rate: float):
-    """`config`'s task stepped once by Adam at `rate` over `batch` and saved as a run in `directory`,
-    with the record its inference reads. Returns the task and its stepped state."""
+def saved_after_one_step(config, batch, directory, rate: float, key: int = 3):
+    """`config`'s task stepped once by Adam at `rate` from the state `key` initializes, over `batch`
+    (or the batch `batch(task)` makes), and saved as a run in `directory`, with the record its
+    inference reads. Returns the task, its stepped state and the batch."""
     import optax
 
     from dew.training import Checkpoints, Trainer
 
     task = config.build()
-    trainer = Trainer(task, optax.adam(rate), key=jax.random.PRNGKey(3))
+    batch = batch(task) if callable(batch) else batch
+    trainer = Trainer(task, optax.adam(rate), key=jax.random.PRNGKey(key))
     state = trainer.initial_state()
     state, *_ = trainer.compile(state, batch)(state, batch)
     checkpoints = Checkpoints(str(directory))
     checkpoints.save(1, state, None, artifact=task.inference_record())
     checkpoints.wait()
     config.save(str(directory))
-    return task, state
+    return task, state, batch
 
 
 class DeterministicObjective(Objective):

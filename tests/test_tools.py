@@ -706,6 +706,29 @@ def test_a_plugin_package_checks_its_own_source_with_dews_rules(tmp_path):
     assert lint.main(["--root", str(tmp_path), "--package", "sparx"]) == 1
 
 
+def test_the_script_reads_its_files_in_processes_and_reports_as_one_process_does(tmp_path, capsys):
+    """tools/lint_slop.py run as a script reads its files in a pool of processes, one a processor; its
+    findings, their order and its counts are those main reports reading them in its caller's process."""
+    lint = load("lint_slop")
+    (tmp_path / "src" / "sparx").mkdir(parents=True)
+    (tmp_path / "tests").mkdir()
+    for index in range(40):
+        (tmp_path / "src" / "sparx" / f"graph_{index}.py").write_text(
+            f"def edges_{index}(table: dict[str, object]):\n    return table\n")
+        patched = f"sparx.graph_{index}.edges_{index}"
+        (tmp_path / "tests" / f"test_graph_{index}.py").write_text(
+            f"def test_edges(monkeypatch):\n    monkeypatch.setattr('{patched}', len)\n")
+    arguments = ["--root", str(tmp_path), "--package", "sparx"]
+    assert lint.main(arguments) == 1
+    serial = capsys.readouterr()
+    script = subprocess.run([sys.executable, str(REPO_ROOT / "tools" / "lint_slop.py"), *arguments],
+                            capture_output=True, text=True, timeout=300)
+    assert script.returncode == 1
+    assert (script.stdout, script.stderr) == (serial.out, serial.err)
+    # One finding a file, eighty files.
+    assert len(serial.out.splitlines()) == 80
+
+
 def _linted(tmp_path, files: dict[str, str]) -> list[tuple[str, int, str]]:
     """Write `files` into a sparx checkout and return each finding as (path, line, code)."""
     lint = load("lint_slop")
