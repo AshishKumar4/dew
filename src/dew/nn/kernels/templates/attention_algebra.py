@@ -446,7 +446,7 @@ def carried(spec: Forward, m: jax.Array, safe: jax.Array) -> jax.Array:
     difference, error = two_sum(m, -safe)
     alpha = spec.carry(difference)
     if spec.raw:
-        product, rounding = two_product(difference, jnp.float32(spec.scale), bit_split=True)
+        product, rounding = two_product(difference, np.float32(spec.scale), bit_split=True)
         alpha = jnp.exp(product)
         error = rounding + error * spec.scale
     corrected = alpha * (1.0 + error)
