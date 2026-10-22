@@ -36,8 +36,8 @@ from dew.telemetry.records import RECORD_TYPES
 from dew.training import Trainer
 from tools.parity_flow_grpo import RECORDED, dew_transition, transition_inputs
 
-SEEDS = {'guided walk': 8, 'converted': 8, 'rescored walk': 8, 'clipping': 8, 'kl': 8, 'rollout': 8,
-         'inpainting': 8, 'live policy': 8, 'mixed precision': 8, 'prompt evaluation': 8}
+SEEDS = {'guided walk': 8, 'converted': 8, 'rescored walk': 8, 'clipping': 32, 'kl': 8, 'rollout': 64,
+         'inpainting': 128, 'live policy': 64, 'mixed precision': 32, 'prompt evaluation': 8}
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada)."""
 ROWS = 64
 """A drawn batch's rows: enough that a few seeds resolve a site."""
