@@ -24,6 +24,7 @@ from dew.nn.inputs import AttentionMetadata, coordinates
 from dew.nn.mixer_base import MixerContext
 from dew.nn.mixers.attention import CausalSelfAttention
 from dew.nn.mlp import GatedMLP
+from dew.nn.precision import float32_dot_general
 from dew.objectives.base import Variables
 from dew.registry import Record
 
@@ -111,11 +112,12 @@ class Gemma4VisionTransformer(nn.Module):
                 f"({cfg.num_key_value_heads})")
         self.patch_embed = Dense(
             cfg.hidden_size, use_bias=False, dtype=self.dtype,
-            precision=self.precision, name="patch_embed")
+            precision=self.precision, name="patch_embed", dot_general=float32_dot_general)
         self.position_table = self.param(
             "position_table", nn.initializers.normal(0.02),
             (2, cfg.position_embedding_size, cfg.hidden_size))
-        linear = functools.partial(Gemma4ClippableLinear, use_clipped_linears=cfg.use_clipped_linears)
+        linear = functools.partial(Gemma4ClippableLinear, use_clipped_linears=cfg.use_clipped_linears,
+                                   dot_general=float32_dot_general)
         attention = functools.partial(
             CausalSelfAttention, ctx=MixerContext(
                 emb_features=cfg.hidden_size, num_heads=cfg.num_heads, num_kv_heads=cfg.num_key_value_heads,
@@ -235,7 +237,7 @@ class Gemma4ProjectorModule(nn.Module):
                                 dtype=self.dtype, name="pre_norm")
         self.projection = Dense(
             self.text_width, use_bias=False, dtype=self.dtype,
-            precision=self.precision, name="projection")
+            precision=self.precision, name="projection", dot_general=float32_dot_general)
 
     def __call__(self, image_features) -> jax.Array:
         return self.projection(self.pre_norm(image_features))
@@ -354,7 +356,7 @@ def translate_gemma4_vision_config(hf_config: Mapping[str, object]) -> Record:
         "hidden_act": activation_name(vision, ("gelu_pytorch_tanh", "gelu"), "gelu_pytorch_tanh",
                                       ("hidden_activation", "hidden_act")),
         "rms_norm_eps": records.number(vision.get("rms_norm_eps", 1e-6), "rms_norm_eps"),
-        "rope_theta": rope_base(vision, 100.0),
+        "rope_theta": rope_base(vision, 100.0, axial=True),
         "standardize": bool(vision.get("standardize", False)),
         "use_clipped_linears": bool(vision.get("use_clipped_linears", False)),
     }}

@@ -1,7 +1,13 @@
 from .adversarial import AdversarialDistillationObjective
 from .alignment import Alignment
 from .block import BlockDiffusionObjective
-from .config import AudioCondition, DiffusionRunConfig, PretrainedAutoencoder, TextCondition
+from .config import (
+    AudioCondition,
+    DiffusionRunConfig,
+    FlowRolloutConfig,
+    PretrainedAutoencoder,
+    TextCondition,
+)
 from .consistency import ConsistencyDistillationObjective
 from .end_to_end import EndToEnd
 from .few_step import MeanFlowObjective, ShortcutObjective
@@ -19,6 +25,7 @@ __all__ = [
     "DiffusionObjective",
     "DiffusionRunConfig",
     "EndToEnd",
+    "FlowRolloutConfig",
     "GuidanceDistillationObjective",
     "MaskedDiffusionObjective",
     "MeanFlowObjective",

@@ -10,7 +10,6 @@ tests/reference_error.py's rule: no further from float64 than twice the
 float32 reference.
 """
 
-import json
 from pathlib import Path
 
 import jax
@@ -18,6 +17,7 @@ import jax.numpy as jnp
 import ml_dtypes
 import numpy as np
 import pytest
+from interop_support import fixture_with_meta, recorded_gradients
 from reference_error import assert_as_exact_as_the_reference
 from torch_layout import QKV, case_arrays, dew_leaf, join_qkv, leaf, split_qkv, torch_leaf
 
@@ -30,9 +30,7 @@ CASES = ("published", "variant")
 
 @pytest.fixture(scope="module")
 def reference():
-    with np.load(FIXTURE) as loaded:
-        arrays = dict(loaded)
-    return arrays, json.loads(arrays.pop("meta").tobytes())
+    return fixture_with_meta(FIXTURE)
 
 
 def dew_path(name: str) -> tuple[str, ...]:
@@ -121,9 +119,7 @@ def test_the_output_and_every_gradient_are_as_exact_as_u_vits(reference, case):
                                      part("fp64.output"), f"{case} output")
 
     def source_order(precision: str) -> np.ndarray:
-        leaves = [part(f"{precision}.grad_image"), part(f"{precision}.grad_context")]
-        leaves += [part(f"{precision}.grad_param.{name}") for name in names]
-        return np.concatenate([np.ravel(leaf) for leaf in leaves])
+        return recorded_gradients(part, precision, ("image", "context"), names)
 
     native = [np.asarray(grads[1]).transpose(0, 3, 1, 2), np.asarray(grads[2])]
     native += [from_dew(name, grads[0]) for name in names]

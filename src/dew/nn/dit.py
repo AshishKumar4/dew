@@ -29,18 +29,16 @@ from .blocks import FourierEmbedding, TimeProjection, modulation
 from .conv import Conv
 from .flops import MissingFlopsCount, counted_flops, projection_flops, real_lengths
 from .mlp import GatedMLP
-from .precision import at_least_fp32, fp32_result_dot_general
+from .precision import at_least_fp32, float32_dot_general, fp32_result_dot_general
 from .rope import rotary_freqs
 from .scan_orders import (
     ScanOrder,
     build_2d_sincos_pos_embed,
     hilbert_indices,
-    hilbert_patchify,
     hilbert_unpatchify,
     inverse_permutation,
     unpatchify,
     zigzag_indices,
-    zigzag_patchify,
 )
 from .sharding import RESIDUAL, constrain, logical_axes
 from .ssm import BidirectionalS5Layer, S5Layer, SpatialFusionConv
@@ -74,6 +72,19 @@ def scan_indices(scan_order: str, H_P: int, W_P: int):
     if scan_order == 'zigzag':
         return zigzag_indices(H_P, W_P)
     return None
+
+
+def scan_ordered(tokens: jax.Array, scan_order: str, H_P: int, W_P: int
+                 ) -> tuple[jax.Array, np.ndarray | None]:
+    """Row-major patch tokens `[B, H_P * W_P, D]` gathered into `scan_order`,
+    and the inverse permutation that restores row-major order (None for
+    raster): every order embeds its patches through the one projection."""
+    order = scan_indices(scan_order, H_P, W_P)
+    if order is None:
+        return tokens, None
+    # A permutation reads each row once, so the gradient's scatter needs
+    # no atomic adds.
+    return jnp.take(tokens, order, axis=1, unique_indices=True), inverse_permutation(order)
 
 
 def scan_ordered_pos_embed(emb_dim: int, H_P: int, W_P: int, scan_order: str):
@@ -143,7 +154,8 @@ class PatchEmbedding(nn.Module):
                  dtype=self.dtype,
                  precision=self.precision)(x)
         if self.bottleneck is not None:
-            x = Dense(self.embedding_dim, dtype=self.dtype, precision=self.precision)(x)
+            x = Dense(self.embedding_dim, dtype=self.dtype, precision=self.precision,
+                      dot_general=float32_dot_general)(x)
         # The token count is named, not inferred: a reshape cannot infer it from a batch of no rows,
         # which a shortcut objective's bootstrap slice is below `bootstrap_every` rows.
         return jnp.reshape(x, (batch, x.shape[1] * x.shape[2], self.embedding_dim))
@@ -175,11 +187,11 @@ class AdaLNParams(nn.Module):
 
 @logical_axes({("patch_embed", "Conv_0"): (None, None, None, "embed")})
 class PatchSequenceEmbed(nn.Module):
-    """Patchify in raster/hilbert/zigzag order and add the 2D sincos signal.
+    """Patchify through `PatchEmbedding`, gather the tokens into
+    raster/hilbert/zigzag order (`scan_ordered`) and add the 2D sincos signal.
 
     Returns `(tokens, inv_idx)`; `inv_idx` restores row-major order on the
-    way out and is None for raster. `bottleneck` is `PatchEmbedding`'s, in
-    raster order only.
+    way out and is None for raster. `bottleneck` is `PatchEmbedding`'s.
     """
     patch_size: int
     emb_features: int
@@ -195,41 +207,19 @@ class PatchSequenceEmbed(nn.Module):
 
     def setup(self):
         assert self.scan_order in get_args(ScanOrder), f"Unknown scan order {self.scan_order}"
-        if self.scan_order == 'raster':
-            self.patch_embed = PatchEmbedding(
-                patch_size=self.patch_size,
-                embedding_dim=self.emb_features,
-                dtype=self.dtype,
-                precision=self.precision,
-                bottleneck=self.bottleneck,
-                name="patch_embed",
-            )
-        elif self.bottleneck is not None:
-            raise ValueError(f"a patch bottleneck embeds raster patches, not {self.scan_order} ones")
-        else:
-            # The patches arrive already permuted, so a dense projection of
-            # the raw pixels replaces the strided convolution.
-            self.scan_proj = Dense(
-                features=self.emb_features,
-                dtype=self.dtype,
-                precision=self.precision,
-                name="hilbert_projection",
-            )
+        self.patch_embed = PatchEmbedding(
+            patch_size=self.patch_size,
+            embedding_dim=self.emb_features,
+            dtype=self.dtype,
+            precision=self.precision,
+            bottleneck=self.bottleneck,
+            name="patch_embed",
+        )
 
     def __call__(self, x):
         _, H, W, _ = x.shape
         H_P, W_P = H // self.patch_size, W // self.patch_size
-
-        inv_idx = None
-        if self.scan_order == 'hilbert':
-            patches_raw, inv_idx = hilbert_patchify(x, self.patch_size)
-            tokens = self.scan_proj(patches_raw)
-        elif self.scan_order == 'zigzag':
-            patches_raw, inv_idx = zigzag_patchify(x, self.patch_size)
-            tokens = self.scan_proj(patches_raw)
-        else:
-            tokens = self.patch_embed(x)
-
+        tokens, inv_idx = scan_ordered(self.patch_embed(x), self.scan_order, H_P, W_P)
         pos_embed = scan_ordered_pos_embed(
             self.emb_features, H_P, W_P, self.scan_order)
         tokens = tokens + jnp.asarray(pos_embed, dtype=tokens.dtype)[None, :, :]
@@ -272,7 +262,8 @@ class ConditioningEmbed(nn.Module):
                 FourierEmbedding(features=self.emb_features, scale=self.time_scale, dtype=self.dtype),
                 TimeProjection(features=self.emb_features * self.mlp_ratio,
                                dtype=self.dtype, precision=self.precision),
-                Dense(features=self.emb_features, dtype=self.dtype, precision=self.precision),
+                Dense(features=self.emb_features, dtype=self.dtype, precision=self.precision,
+                      dot_general=float32_dot_general),
             ], name=name)
 
         if self.interval:
@@ -280,7 +271,7 @@ class ConditioningEmbed(nn.Module):
         self.time_embed = time_embedding("time_embed")
         self.text_proj = Dense(
             features=self.emb_features, dtype=self.dtype,
-            precision=self.precision, name="text_context_proj")
+            precision=self.precision, name="text_context_proj", dot_general=float32_dot_general)
 
     def __call__(self, temb, textcontext: TextContext | None = None, duration=None):
         cond_emb = self.time_embed(temb)

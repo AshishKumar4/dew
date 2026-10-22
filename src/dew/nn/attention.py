@@ -48,13 +48,23 @@ from .documents import (
     query_order,
     with_documents,
 )
-from .flops import attention_flops, cross_attention_flops, projection_flops
+from .flops import cross_attention_flops, projection_flops, self_attention_flops
 from .inputs import cu_seqlens
 from .kernels import decode_attention, generation, norm_swiglu
 from .kernels.generation import bf16_dot_runs, gpu_placed
 from .kernels.selection import forced, select
 from .kv_cache import Append, KVCache, KVStore, filled_slots
-from .precision import asks_default_precision, at_default_precision, at_least_fp32, rounded_to
+from .precision import (
+    asks_default_precision,
+    at_default_precision,
+    at_least_fp32,
+    configured_precision,
+    float32_dot_general,
+    float32_einsum,
+    float32_products,
+    operand_precision,
+    rounded_to,
+)
 from .rope import rotate
 from .sharding import (
     HEADS,
@@ -324,7 +334,7 @@ def max_attention_logits(query: jax.Array, key: jax.Array, *, causal: bool = Fal
     scale = 1.0 / math.sqrt(query.shape[-1])
     logits = jnp.einsum('...qhd,...khd->...hqk',
                         query.astype(jnp.float32) * jnp.asarray(scale, jnp.float32),
-                        key.astype(jnp.float32))
+                        key.astype(jnp.float32), precision=operand_precision(jnp.float32))
     if bias is not None:
         logits = logits + bias.astype(jnp.float32)
     combined = combined_attention_mask(
@@ -341,7 +351,7 @@ def normalized_in_fp32(normalize, static_argnums: tuple[int, ...] = ()):
     the backward pass would keep two fp32 copies of the activations per norm
     (2.35 GiB on one SimpleDiT step). Saving nothing keeps the arguments (the
     bf16 input, the weight and the bias) and leaves the residuals to the policy
-    that recomputes the block (`decoder_block.RESIDUALS`). The wrapped function
+    that recomputes the block (`mixer_base.RESIDUALS`). The wrapped function
     takes arrays first and static arguments last, so no flax lifting sits
     between the checkpoint and the module; forward values are unchanged.
     """
@@ -1167,7 +1177,7 @@ def weighted_values(equation, weights, value, *, precision=None) -> jax.Array:
     if equation != '...hqk,...khd->...qhd':
         raise ValueError(f"weighted_values takes flax's value product, got {equation!r}")
     weights = weights.astype(value.dtype)
-    plain = functools.partial(jnp.einsum, equation, precision=precision)
+    plain = functools.partial(float32_einsum, equation, precision=precision)
     if value.dtype != jnp.float32 or value.shape[-3] <= VALUE_BLOCK or generation.backend() != 'cpu':
         return plain(weights, value)
     # Both modes differentiate the plain product: neither sums over the keys, and the blocked
@@ -1185,7 +1195,7 @@ def _blocked_values(weights, value, precision) -> jax.Array:
     value = jnp.pad(value, [(0, 0)] * (value.ndim - 3) + [(0, pad), (0, 0), (0, 0)])
     weights = weights.reshape(*weights.shape[:-1], blocks, VALUE_BLOCK)
     value = value.reshape(*value.shape[:-3], blocks, VALUE_BLOCK, *value.shape[-2:])
-    return jnp.einsum('...hqck,...ckhd->...qhdc', weights, value, precision=precision).sum(-1)
+    return float32_einsum('...hqck,...ckhd->...qhdc', weights, value, precision=precision).sum(-1)
 
 
 
@@ -1202,9 +1212,11 @@ def reference_attention(query, key, value, *, mask=None, bias=None, sinks=None, 
     (modeling_gemma2.py:192-208), and `sinks` `[H]` put one value-free logit
     per head in the softmax's denominator (`sink_softmax`). Keys and values
     may carry fewer heads. Without sinks they repeat to the query's, as flax
-    repeats them, which keeps flax's rounding; a sink layer decodes over its
-    whole cache here, since no fused kernel takes sinks, so there the query
-    heads group over their key head and no key or value repeats.
+    repeats them, which keeps flax's rounding; with sinks the query heads
+    group over their key head and no key or value repeats, as the decode
+    selector (`attention_kernels.decodes`) needs where it routes a sink
+    layer here rather than to the fused decode kernel, which takes sinks on a
+    GPU.
     """
     query, key, value = promote_dtype(query, key, value, dtype=dtype)
     dtype = query.dtype
@@ -1213,10 +1225,10 @@ def reference_attention(query, key, value, *, mask=None, bias=None, sinks=None, 
     scaled_query = query / jnp.sqrt(width).astype(dtype)
     if sinks is None:
         key, value = repeat_kv_heads(key, heads), repeat_kv_heads(value, heads)
-        logits = jnp.einsum('...qhd,...khd->...hqk', scaled_query, key, precision=precision)
+        logits = float32_einsum('...qhd,...khd->...hqk', scaled_query, key, precision=precision)
     else:
         grouped = scaled_query.reshape(*rows, length, kv_heads, heads // kv_heads, width)
-        logits = jnp.einsum('...tkgd,...skd->...kgts', grouped, key, precision=precision).reshape(
+        logits = float32_einsum('...tkgd,...skd->...kgts', grouped, key, precision=precision).reshape(
             *rows, heads, length, keys)
     if softcap is not None:
         logits = jnp.tanh(logits / softcap) * softcap
@@ -1243,7 +1255,7 @@ def reference_attention(query, key, value, *, mask=None, bias=None, sinks=None, 
     if sinks is None:
         return weighted_values('...hqk,...khd->...qhd', weights, value, precision=precision)
     groups = weights.astype(value.dtype).reshape(*rows, kv_heads, heads // kv_heads, length, keys)
-    return jnp.einsum('...kgts,...skd->...tkgd', groups, value, precision=precision).reshape(
+    return float32_einsum('...kgts,...skd->...tkgd', groups, value, precision=precision).reshape(
         *rows, length, heads, value.shape[-1])
 
 
@@ -1415,8 +1427,10 @@ def _fused_attention(query, key, value, bias, mask, causal, sliding_window, impl
                                        softcap=softcap)
 
         # The kernel has no derivative, so both modes differentiate the attention it stands in for, the
-        # sinks among its operands.
-        out = forward_differentiable(decoded, folded, query, key, value, *([] if sinks is None else [sinks]))
+        # sinks among its operands, at the kernel's arithmetic: IEEE products for fp32 operands
+        # (`decode_attention`), its 16-bit products summed in fp32 otherwise.
+        out = forward_differentiable(decoded, folded, query, key, value, *([] if sinks is None else [sinks]),
+                                     precision="highest" if query.dtype == jnp.float32 else None)
     elif implementation == 'xla' and folds(query, key, bias, mask, causal, sliding_window):
         # Key lengths and the prefix mask they mean take one path here, so where no lengths-only
         # kernel takes the call the two forms agree bitwise.
@@ -1425,11 +1439,14 @@ def _fused_attention(query, key, value, bias, mask, causal, sliding_window, impl
     elif implementation == 'xla':
         # A window of (l, r) keeps the l keys before the query and the r after
         # it on both the xla and the cudnn path, the sides `window_sides` counts.
-        out = jax.nn.dot_product_attention(
-            query, key, value, bias=bias, mask=mask, is_causal=causal,
-            key_value_seq_lengths=key_value_seq_lengths,
-            local_window_size=None if sliding_window is None else window_sides(causal, sliding_window),
-            implementation='xla')
+        # jax.nn's products take the precision their dtype does (`float32_products`) through the
+        # matmul config, which it reads for float32 operands.
+        with configured_precision(float32_products(query.dtype)):
+            out = jax.nn.dot_product_attention(
+                query, key, value, bias=bias, mask=mask, is_causal=causal,
+                key_value_seq_lengths=key_value_seq_lengths,
+                local_window_size=None if sliding_window is None else window_sides(causal, sliding_window),
+                implementation='xla')
     else:  # 'tpu'
         if key_value_seq_lengths is not None:
             mask = with_key_lengths(mask, key_value_seq_lengths, key.shape[-3])
@@ -1515,17 +1532,23 @@ def attention_kernel(query, key, value, dtype=None, precision=None,
     return _read_nothing(forward_differentiable(fused, reference, query, key, value, bias, sinks), live)
 
 
-def forward_differentiable(value, tangent, *arrays):
+def forward_differentiable(value, tangent, *arrays, precision: str | None = None):
     """`value(*arrays)`, whose JVP is `tangent`'s: a kernel that defines only
     its reverse-mode derivative, or none, takes its derivatives from a
-    reference computing the same function, reverse mode as the transposed JVP."""
+    reference computing the same function, reverse mode as the transposed JVP.
+    `precision` is the kernel's own arithmetic, which the reference's products
+    take too (`jax.default_matmul_precision`), so a kernel of IEEE fp32 products
+    is not differentiated by TF32 ones; None leaves the products at the
+    caller's."""
     @jax.custom_jvp
     def attend(*arrays):
         return value(*arrays)
 
     @attend.defjvp
     def rule(primals, tangents):
-        return attend(*primals), jax.jvp(tangent, primals, tangents)[1]
+        with contextlib.nullcontext() if precision is None else jax.default_matmul_precision(precision):
+            differentiated = jax.jvp(tangent, primals, tangents)[1]
+        return attend(*primals), differentiated
 
     return attend(*arrays)
 
@@ -1800,7 +1823,9 @@ def splash_attention(query, key, value, descriptor, *, softcap, sinks, segment_i
     from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_kernel
 
     kernel = splash_attention_kernel.make_splash_mha(
-        descriptor, block_sizes=splash_block_sizes(query.shape[-3], key.shape[-3]),
+        descriptor, block_sizes=splash_block_sizes(query.shape[-3], key.shape[-3], width=query.shape[-1],
+                                                   itemsize=query.dtype.itemsize,
+                                                   softcap=softcap is not None),
         head_shards=1, q_seq_shards=1, attn_logits_soft_cap=softcap, interpret=interpret)
     scale = jnp.asarray(1.0 / math.sqrt(query.shape[-1]), query.dtype)
     segments = (None if segment_ids is None
@@ -1820,7 +1845,23 @@ def splash_attention(query, key, value, descriptor, *, softcap, sinks, segment_i
     return jnp.moveaxis(attended, -3, -2)
 
 
-def splash_block_sizes(q_len: int, kv_len: int):
+def splash_backward_vmem(block_q: int, block_kv: int, width: int, itemsize: int, softcap: bool) -> int:
+    """A bound on the scoped VMEM splash's fused backward kernel plans at XLA's default limit, in bytes:
+    its fp32 logits blocks (two, three with a softcap's derivative), each `block_q` by `block_kv`; its
+    query, output-gradient, key and value blocks, each double-buffered in the operands' dtype; and its
+    key and value gradients' fp32 scratch. On a v5e at the 16 MiB default (2026-10-21, 96 configs of
+    widths 64 to 256, both dtypes, a softcap and batches 1 to 8, Dew's own path, and the TPU tier's
+    refused test) it lies past the limit on every config Mosaic refused (16.2 to 22.3 MiB), and within it
+    on all it compiled but eight, which take the next smaller block: a bf16 softcap at width 256 at
+    batches 1 and 2, an f32 softcap at width 128 (which the tier's test run refused at 18.6 MiB), and
+    f32 at width 256 at batch 1. Those calls were causal; a segment ids' or dense mask's blocks are not
+    in the bound."""
+    logits = 4 * block_q * block_kv * (3 if softcap else 2)
+    blocks = 2 * itemsize * width * 2 * (block_q + block_kv)
+    return logits + blocks + 2 * 4 * width * block_kv
+
+
+def splash_block_sizes(q_len: int, kv_len: int, *, width: int, itemsize: int, softcap: bool):
     """Narrow `SPLASH_BLOCK` to a divisor of each sequence, forward and backward.
 
     The greatest common divisor divides its sequence, as the mask blocking
@@ -1828,14 +1869,25 @@ def splash_block_sizes(q_len: int, kv_len: int):
     requires. The backward runs as one kernel for dq, dk and dv, which reads
     each logits block once where separate dq and dkv kernels read it twice;
     its blocks are set because a kernel built without them raises "Need to
-    specify backward blocks." at its first gradient.
+    specify backward blocks." at its first gradient. On a TPU whose scoped
+    VMEM limit is measured (`GpuTarget.scoped_vmem`), past which a kernel fails
+    to compile, they halve together, as measured (half of `SPLASH_BLOCK`
+    compiled on every config), while they stay whole lanes, until its plan fits
+    it (`splash_backward_vmem`). Splash takes no VMEM limit of its own (its
+    kernels set none), so the limit is the target's default, which a TPU does
+    not report: where it is unmeasured the blocks stay whole.
     """
     from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_kernel
 
     block_q, block_kv = math.gcd(SPLASH_BLOCK, q_len), math.gcd(SPLASH_BLOCK, kv_len)
+    budget = generation.gpu_target().scoped_vmem
+    back_q, back_kv = block_q, block_kv
+    while (budget is not None and splash_backward_vmem(back_q, back_kv, width, itemsize, softcap) > budget
+           and min(back_q, back_kv) > SPLASH_LANES):
+        back_q, back_kv = back_q // 2, back_kv // 2
     return splash_attention_kernel.BlockSizes(
         block_q=block_q, block_kv=block_kv, block_kv_compute=block_kv,
-        block_q_dkv=block_q, block_kv_dkv=block_kv, block_kv_dkv_compute=block_kv,
+        block_q_dkv=back_q, block_kv_dkv=back_kv, block_kv_dkv_compute=back_kv,
         use_fused_bwd_kernel=True)
 
 
@@ -1951,10 +2003,11 @@ def projected_heads(x, name: str, heads: int, head_dim: int, *, flat: bool, bias
     """
     width = heads * head_dim
     if flat:
-        projected = Dense(width, use_bias=bias, dtype=dtype, precision=precision, name=name)(x)
+        projected = Dense(width, use_bias=bias, dtype=dtype, precision=precision, name=name,
+                          dot_general=float32_dot_general)(x)
     else:
         projected = DenseGeneral((heads, head_dim), use_bias=bias, dtype=dtype, precision=precision,
-                                 name=name)(x)
+                                 name=name, dot_general=float32_dot_general)(x)
     if norm is not None and across_heads:
         projected = norm(projected.reshape(*x.shape[:-1], width))
     projected = projected.reshape(*x.shape[:-1], heads, head_dim)
@@ -1968,10 +2021,11 @@ def projected_output(attended, name: str, features: int, *, flat: bool, bias: bo
     own: `[heads * head_dim, features]` flat, else `[heads, head_dim, features]`."""
     if flat:
         # The width is named, not inferred: an empty stream (no context tokens) has nothing to infer it from.
-        return Dense(features, use_bias=bias, dtype=dtype, precision=precision, name=name)(
+        return Dense(features, use_bias=bias, dtype=dtype, precision=precision, name=name,
+                     dot_general=float32_dot_general)(
             attended.reshape(*attended.shape[:-2], math.prod(attended.shape[-2:])))
     return DenseGeneral(features, axis=(-2, -1), use_bias=bias, dtype=dtype, precision=precision,
-                        name=name)(attended)
+                        name=name, dot_general=float32_dot_general)(attended)
 
 
 @logical_axes({
@@ -2017,8 +2071,7 @@ class NormalAttention(nn.Module):
     @nn.nowrap
     def model_flops(self, lengths) -> float:
         """Self-attention maps and its full QK/AV products on real rows."""
-        return (sum(projection_flops(lengths, *shape) for shape in self.projections().values())
-                + attention_flops(lengths, self.heads, self.dim_head, self.dim_head, causal=False))
+        return self_attention_flops(lengths, self.projections(), self.heads, self.dim_head)
 
     @nn.nowrap
     def cross_flops(self, lengths, context_lengths, context_features: int) -> float:
@@ -2092,7 +2145,8 @@ class FlaxGEGLU(nn.Module):
         return projection_flops(lengths, *self.projections()["proj"])
 
     def setup(self):
-        self.proj = Dense(self.projections()["proj"][1], dtype=self.dtype, precision=self.precision)
+        self.proj = Dense(self.projections()["proj"][1], dtype=self.dtype, precision=self.precision,
+                          dot_general=float32_dot_general)
 
     def __call__(self, hidden_states):
         hidden_states = self.proj(hidden_states)
@@ -2129,7 +2183,8 @@ class FlaxFeedForward(nn.Module):
         self.net_0 = FlaxGEGLU(
             self.dim, dtype=self.dtype, precision=self.precision, approximate=self.approximate_gelu
         )
-        self.net_2 = Dense(self.projections()["net_2"][1], dtype=self.dtype, precision=self.precision)
+        self.net_2 = Dense(self.projections()["net_2"][1], dtype=self.dtype, precision=self.precision,
+                           dot_general=float32_dot_general)
         self.dropout_layer = nn.Dropout(self.dropout)
 
     def __call__(self, hidden_states, *, train: bool = False):
@@ -2284,7 +2339,7 @@ class TransformerBlock(nn.Module):
 
         def project(features: int, name: str):
             return Dense(features=features, use_bias=False, precision=self.precision,
-                         dtype=self.dtype, name=name)
+                         dtype=self.dtype, name=name, dot_general=float32_dot_general)
 
         if self.use_projection:
             inner_dim = self.heads * self.dim_head

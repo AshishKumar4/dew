@@ -15,7 +15,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from jax.sharding import NamedSharding, PartitionSpec as P
-from moe_support import exchange_worker, objective, routing_case
+from moe_support import assert_exchange_across_processes, objective, routing_case
 from reference_error import assert_as_exact_as_the_reference, assert_computes_the_oracle
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -252,11 +252,4 @@ def test_capacity_drops_compute_maxtexts_experts(maxtext, case, dispatch, spec):
 
 
 def test_exchange_collectives_work_across_two_real_processes(tmp_path):
-    from process_support import run_pool
-
-    reports = run_pool(Path(__file__).with_name('moe_exchange_worker.py'), tmp_path, 2,
-                       timeout=120, start=exchange_worker)
-    for report in reports:
-        assert report['processes'] == 2
-        for errors in report['errors'].values():
-            assert max(errors) < 3e-5, errors
+    assert_exchange_across_processes(Path(__file__).with_name('moe_exchange_worker.py'), tmp_path, 3e-5)

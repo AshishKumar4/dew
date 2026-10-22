@@ -12,7 +12,7 @@ from jax.typing import ArrayLike
 from dew.diffusion.discrete import DiscreteDenoiser
 from dew.diffusion.process import Denoiser
 from dew.sampling.guidance import Guidance, Walk
-from dew.sampling.solvers import Solver
+from dew.sampling.solvers import RowKeys, RowSolver, Solver
 
 
 @overload
@@ -23,7 +23,7 @@ def sample[StateT](
     *,
     solver: Solver[StateT],
     guidance: Guidance | None = None,
-    key: int | jax.Array,
+    key: int | jax.Array | RowKeys,
     times: ArrayLike | Sequence[float] | None = None,
     initial: StateT | None = None,
     final_denoise: bool = True,
@@ -39,7 +39,7 @@ def sample[StateT, RecordT](
     *,
     solver: Solver[StateT],
     guidance: Guidance | None = None,
-    key: int | jax.Array,
+    key: int | jax.Array | RowKeys,
     times: ArrayLike | Sequence[float] | None = None,
     initial: StateT | None = None,
     final_denoise: bool = True,
@@ -54,7 +54,7 @@ def sample[StateT, RecordT](
     *,
     solver: Solver[StateT],
     guidance: Guidance | None = None,
-    key: int | jax.Array,
+    key: int | jax.Array | RowKeys,
     times: ArrayLike | Sequence[float] | None = None,
     initial: StateT | None = None,
     final_denoise: bool = True,
@@ -90,6 +90,11 @@ def sample[StateT, RecordT](
     folded with the step index, so a trajectory is reproducible from one
     key.
 
+    `key` may be `RowKeys`, one key a row, for a solver that draws row by row
+    (`RowSolver`, `Unmask`): each row's draws are its own key's, folded with the
+    step index, while the model still runs once over the batch. Another
+    solver refuses them by name.
+
     The trajectory is one `lax.scan`, traced at each call. Under a caller's
     `jax.jit` it compiles once, which is how the pipelines and objectives
     call it. Called eagerly, it traces and compiles the scan again every
@@ -99,8 +104,7 @@ def sample[StateT, RecordT](
         raise ValueError("pass exactly one of steps and times")
     if steps is not None and (type(steps) is not int or steps < 1):
         raise ValueError("steps must be a positive integer")
-    from dew.nn.inputs import request_key
-    key = request_key(key)
+    key = _sampling_key(key, solver, x_T.shape[0])
     process = denoise.process
 
     # A process whose model predicts over an interval reads, at each step,
@@ -142,8 +146,8 @@ def sample[StateT, RecordT](
             t_next = jnp.full((batch,), t_next)
             stepping = walk if spanned is None else Walk.over(spanned.spanning(t, t_next), guidance, count)
             (denoised, eps), guided = stepping.step(x, t, index, guided)
-            x, state = solver.step(x, t, t_next, denoised, eps, state, jax.random.fold_in(key, index),
-                                   process, stepping.at(guided, index))
+            x, state = _stepped(solver, key, index)(x, t, t_next, denoised, eps, state,
+                                                    process=process, denoise=stepping.at(guided, index))
             return (x, state, guided), read(x, state)
 
         (x, _, walked), readings = lax.scan(
@@ -156,3 +160,32 @@ def sample[StateT, RecordT](
     if record is None:
         return scanned(lambda x, state: None)[0]
     return scanned(record)
+
+
+def _sampling_key(key: int | jax.Array | RowKeys, solver: Solver, rows: int) -> jax.Array | RowKeys:
+    """`key` as `sample` steps from it: one typed key, or `RowKeys` of typed keys for a solver that
+    draws row by row (`RowSolver`), which another solver refuses by name."""
+    from dew.nn.inputs import request_key, request_rows
+
+    if not isinstance(key, RowKeys):
+        return request_key(key)
+    if not isinstance(solver, RowSolver):
+        raise ValueError(f"row keys draw each row by its own key, which a solver does in step_rows "
+                         f"(RowSolver), and {type(solver).__name__} draws the batch from one key")
+    keys = request_rows(jnp.asarray(key.keys) if isinstance(key.keys, (list, tuple)) else key.keys)
+    if keys.shape != (rows,):
+        raise ValueError(f"row keys are one key per row: {rows} rows, keys {keys.shape}")
+    return RowKeys(keys)
+
+
+def _stepped(solver: Solver, key: jax.Array | RowKeys, index: jax.Array) -> Callable[..., tuple]:
+    """`solver`'s step at the step `index`, from `key` folded with it: `step_rows` over each row's
+    key folded alike for `RowKeys`, `step` over the one key otherwise."""
+    if isinstance(key, RowKeys):
+        assert isinstance(solver, RowSolver)
+        keys = jax.vmap(jax.random.fold_in, in_axes=(0, None))(key.keys, index)
+        return lambda x, t, t_next, denoised, eps, state, *, process, denoise: solver.step_rows(
+            x, t, t_next, denoised, eps, state, keys, process, denoise)
+    folded = jax.random.fold_in(key, index)
+    return lambda x, t, t_next, denoised, eps, state, *, process, denoise: solver.step(
+        x, t, t_next, denoised, eps, state, folded, process, denoise)

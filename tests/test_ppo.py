@@ -1,5 +1,6 @@
 """PPO actor/critic math against pinned verl and a real episode training run."""
 
+import functools
 import itertools
 from dataclasses import replace
 from pathlib import Path
@@ -22,7 +23,7 @@ from episode_support import (
     verify,
 )
 from flax import linen as nn
-from reference_error import assert_as_exact_as_the_reference
+from reference_error import assert_as_exact, assert_as_exact_as_the_reference
 from rl_support import clipped_surrogate, token_mean
 
 from dew.data.dataset import Loader
@@ -155,9 +156,7 @@ def test_episode_advantages_hold_at_values_and_rewards_far_above_them():
     """PPORollout whitens the GAE recursion's own advantages, from centred moments over every process.
     With every value and every reward 1e8 higher, all exact in float32, each temporal difference is
     the same, and so is each whitened advantage, bit for bit, where returns less values would round
-    every advantage below 4 away. Undiscounted (gamma = lambda = 1), with every reward 10001 higher and
-    the values still at zero, every advantage is 10001 higher and whitening, which a shift leaves
-    alone, gives the same advantages, where moments of the raw squares cancel to a wrong variance."""
+    every advantage below 4 away."""
     def advantages(value_shift, reward_shift, lam=.9):
         trainer, rollout = build_ppo(lambda episode: reward_shift + 8 * verify(episode), gamma=1., lam=lam)
         state = trainer.initial_state()
@@ -174,7 +173,68 @@ def test_episode_advantages_hold_at_values_and_rewards_far_above_them():
     level = advantages(0., 0.)
     assert np.unique(level).size > 2
     np.testing.assert_array_equal(advantages(1e8, 1e8), level)
-    np.testing.assert_allclose(advantages(0., 10001., lam=1.), advantages(0., 0., lam=1.), rtol=0, atol=2e-6)
+
+
+def whitened(rewards, values, gamma, lam, dtype):
+    """verl's masked GAE over each episode's actions (`episode_returns` less the values), then
+    whitened over all of them in `dtype`: centred on their mean, scaled by their unbiased deviation,
+    as Tunix and verl whiten."""
+    raw = np.concatenate([episode_returns(reward, value, gamma, lam, dtype) - np.asarray(value, dtype)
+                          for reward, value in zip(rewards, values, strict=True)])
+    count = dtype(raw.size)
+    mean = raw.sum(dtype=dtype) / (count + dtype(1e-8))
+    variance = np.square(raw - mean).sum(dtype=dtype) / (count + dtype(1e-8))
+    return (raw - mean) / np.sqrt(variance * (count / (count - 1)) + dtype(1e-8))
+
+
+PPO_SHIFT_SEEDS = 16
+"""The shifted-reward site's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for`
+(2026-10-21, on armada)."""
+
+
+def test_whitened_advantages_of_rewards_far_above_the_values_are_as_exact_as_the_equations():
+    """Undiscounted (gamma = lambda = 1), every reward 10001 higher than the values at zero: each
+    advantage is 10001 higher and whitening, which a shift leaves alone, gives the same advantages,
+    where moments of the raw squares cancel to a wrong variance. Over rollouts each declared seed
+    draws, PPORollout's whitened advantages are as exact as verl's equations in float32 (check 1),
+    truth the same equations in float64 on the same rewards and values."""
+    trainer, rollout = build_ppo(lambda episode: 10001. + 8 * verify(episode), gamma=1., lam=1.)
+    initial = trainer.initial_state()
+    params = initial.variables["params"]
+    value = params["critic"]["value"]
+    zero = {"kernel": jnp.zeros_like(value["kernel"]), "bias": jnp.zeros_like(value["bias"])}
+    state = initial.replace(variables={**initial.variables,
+                                       "params": {**params, "critic": {**params["critic"], "value": zero}}})
+    # Sixteen prompts a draw: over one, the reference compared with itself did not resolve within 512.
+    task = {"task_id": np.arange(16, dtype=np.int32)}
+
+    @functools.cache
+    def drawn(seed):
+        """One rollout's whitened advantages and, per completed episode, its rewards and values."""
+        batch = rollout(state, task, jax.random.key(seed))
+        episodes = rollout.episodes.collect(state, task, jax.random.key(seed))
+        advantages, rewards, values = [], [], []
+        for index, episode in enumerate(episodes):
+            ids = [(turn, position) for turn, transition in enumerate(episode.transitions)
+                   for position in range(len(transition.action.tokens))]
+            if not ids:
+                continue
+            rows, positions = [index * TURNS + turn for turn, _ in ids], [position for _, position in ids]
+            # An episode the rollout truncated scores nothing, as PPORollout scores it.
+            paid = np.zeros(len(ids))
+            paid[-1] = 0. if episode.reward is None else episode.reward
+            rewards.append(paid)
+            values.append(per_call(batch, OLD_VALUES_KEY, episodes)[rows, positions])
+            advantages.append(per_call(batch, "advantages", episodes)[rows, positions])
+        assert sum(len(reward) for reward in rewards) == np.count_nonzero(batch["response_mask"])
+        return np.concatenate(advantages), rewards, values
+
+    def equations(dtype):
+        return lambda seed: {"advantages": whitened(*drawn(int(seed))[1:], 1., 1., dtype)}
+
+    assert_as_exact(lambda seed: {"advantages": drawn(int(seed))[0]}, equations(np.float32),
+                    lambda seed: (np.int32(seed),), "whitened advantages of shifted rewards",
+                    seeds=PPO_SHIFT_SEEDS, truth_fn=equations(np.float64))
 
 
 def test_ppo_trains_policy_and_critic_with_a_frozen_policy_reference():

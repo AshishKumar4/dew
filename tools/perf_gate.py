@@ -20,8 +20,8 @@ regression.
 
 The battery is the training step (a dense and an MoE decoder, a DiT, an
 MM-DiT, FLUX.2 and Wan), the forward pass of three vision towers and the SD
-VAE's decoder, LM serving at 32 and 128 slots, attention forward and
-backward, the image input pipeline and a checkpoint's save and restore.
+VAE's decoder, LM serving at 32 and 128 slots, a full-depth Dory server's warm compile,
+attention forward and backward, the image input pipeline and a checkpoint's save and restore.
 docs/performance.md, "The performance gate", says how it runs before main
 takes a commit.
 """
@@ -200,6 +200,20 @@ PROBES = [
           lambda args, out: ["--backend", "dew", "--model", args.model, "--slots", ",".join(map(str, SLOTS)),
                              "--repeats", "5", "--out", str(out)],
           lambda _, out: _served(out)),
+    # The Server's warm compiles over Dory 1.0 4B as released (random weights), program by program: its
+    # construction's decode step, then each admission width's prefill. XLA's fusion of nGPT's per-layer
+    # normalization grew the prefill's compile quadratically with depth at the released width, a warm of
+    # 3012 s on an A100, where a narrow width showed none of it (ledger 635); the whole warm is shown
+    # beside them.
+    Probe((*(Row(f"compile serve dory-1.0-4b {program}", "s", "benchmark_serving_compile.py",
+                 floor=COMPILE_FLOOR, first_round=True)
+             for program in ("construction", *(f"admission {rows}" for rows in (1, 2, 4, 8)))),
+           Row("compile serve dory-1.0-4b warm 16 slots", "s", "benchmark_serving_compile.py",
+               gated=False, first_round=True)),
+          lambda _, out: ["--family", "dory-1.0-4b", "--slots", "16", "--json-out", str(out)],
+          lambda _, out: (lambda record: (record["construction_seconds"],
+                                          *record["by_admission_width"].values(),
+                                          record["warm_seconds"]))(json.loads(out.read_text()))),
     Probe(tuple(Row(f"attention {implementation} S=2048 D=128 causal fwd+bwd", "ms", "benchmark_attention.py")
                 for implementation in ATTENTION),
           lambda _, out: ["--implementations", *ATTENTION, "--sequence-lengths", "2048", "--head-dims", "128",
@@ -279,6 +293,8 @@ def measure(tree: Path, python: Path, args: argparse.Namespace, newer: Path, is_
             claiming = args.claim and any(row.hardware for row in probe.rows)
             if args.only and not claiming and not any(word in name for name in names for word in args.only):
                 continue
+            if not first and all(row.first_round for row in probe.rows):
+                continue  # every row it measures is a first round's compile
             done = None
             try:
                 unsupported = {row.name: hardware_status(row, hardware()) for row in probe.rows
