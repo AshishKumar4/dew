@@ -188,14 +188,16 @@ def test_every_tile_of_the_grouped_kernels_holds_the_float64_gate(kernel, width,
     from float64 sums of the same bf16 operands, over the site's draws. The
     space declares only tiles proven here. Triton's widths are ragged
     against its tiles, which mask them; Mosaic's divide by every tile width
-    of its space (64 to 256, and a pair's 256 rows of depth), which it needs,
-    so its cooperative tiles and pairs are among those checked."""
+    of its space (64 to 256, and a pair's 256 rows), which it needs, so its
+    cooperative tiles and the forward's pairs are among those checked."""
     gate = _tile_gate(kernel, width, features)
     with kernel_choices(grouped_matmul=kernel.name):
         configs = each_config(kernel, _tile_gate_arm('pallas'), *gate.draw(0))
     assert len(configs) > 1
     if kernel.name == 'mosaic_gpu':
-        assert {(c.warpgroups, c.cluster) for c in configs} == {(1, 1), (2, 1), (2, 2)}
+        # The kernel gradient's schedule is one multiprocessor's (`MosaicTgmm.space`).
+        paired = set() if kernel is grouped_matmul.MosaicTgmm else {(2, 2)}
+        assert {(c.warpgroups, c.cluster) for c in configs} == {(1, 1), (2, 1)} | paired
     for config in configs:
         gate.check(config)
 
