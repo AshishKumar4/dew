@@ -28,8 +28,6 @@ from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
-from jax.core import ShapedArray
-from jax.extend import core as jex
 
 from dew.nn.kernels.templates.attention import LOG2E, NATURAL, Kind, natural_exp
 
@@ -261,7 +259,7 @@ def finish(spec: Forward, state: Partial, *, initial: bool, output_mod: Callable
     else:
         out = state.acc / expand(denominator, state.acc)
     if output_mod is not None:
-        out = primal(output_mod)(out, *output_params)
+        out = output_mod(out, *output_params)
     return out, m, denominator
 
 
@@ -279,81 +277,10 @@ def floating_params(params) -> list[int]:
     return [index for index, param in enumerate(params) if jnp.issubdtype(param.dtype, jnp.floating)]
 
 
-INLINED = (jex.primitives.custom_vjp_call_p, jex.primitives.custom_jvp_call_p)
-"""The custom-derivative calls a kernel evaluates as their primal functions (`primal`)."""
-
-
-def primal(fn: Callable) -> Callable:
-    """`fn` with each `jax.custom_vjp` and `jax.custom_jvp` call it makes, however nested, evaluated as
-    its primal function: no Pallas Triton lowering takes a custom-derivative call, and a call's value is
-    its primal's by the rules' own contract. A hook's forward rule that calls the hook again, as
-    `jax.custom_vjp`'s documented pattern does, leaves such a call even in a pullback's trace. In a
-    kernel any derivative is already taken (`scored`), so no rule is lost."""
-    def evaluated(*args):
-        closed, shapes = jax.make_jaxpr(fn, return_shape=True)(*args)
-        out = _evaluated(closed.jaxpr, closed.consts, jax.tree.leaves(args))
-        return jax.tree.unflatten(jax.tree.structure(shapes), out)
-
-    return evaluated
-
-
-def _evaluated(jaxpr: jex.Jaxpr, consts, args) -> list:
-    """`jaxpr` evaluated on `args` in the current trace, its custom-derivative calls by their primal
-    jaxprs (`INLINED`) and every other equation bound as it is, its nested jaxprs likewise (`_stripped`)."""
-    env = dict(zip(jaxpr.constvars, consts, strict=True)) | dict(zip(jaxpr.invars, args, strict=True))
-
-    def read(atom):
-        return atom.val if isinstance(atom, jex.Literal) else env[atom]
-
-    for eqn in jaxpr.eqns:
-        values = [read(atom) for atom in eqn.invars]
-        if eqn.primitive in INLINED:
-            call = eqn.params["call_jaxpr"]
-            outs = _evaluated(call.jaxpr, call.consts, values)
-        else:
-            params = {name: _stripped(value) for name, value in eqn.params.items()}
-            outs = eqn.primitive.bind(*values, **eqn.primitive.get_bind_params(params))
-            outs = outs if eqn.primitive.multiple_results else [outs]
-        env.update((var, out) for var, out in zip(eqn.outvars, outs, strict=True)
-                   if not isinstance(var, jex.DropVar))
-    return [read(atom) for atom in jaxpr.outvars]
-
-
-def _stripped(param):
-    """An equation's parameter with each closed jaxpr in it (a jitted call's, a branch's, a loop body's)
-    re-traced without its custom-derivative calls (`_evaluated`), where it holds one; anything else as
-    it is."""
-    if isinstance(param, tuple):
-        return tuple(_stripped(nested) for nested in param)
-    if not isinstance(param, jex.ClosedJaxpr) or not _calls_custom(param.jaxpr):
-        return param
-    avals = [var.aval for var in param.jaxpr.invars]
-    if not all(isinstance(aval, ShapedArray) for aval in avals):
-        raise NotImplementedError("a custom-derivative call inside a jaxpr over references or tokens")
-    shapes = [jax.ShapeDtypeStruct(aval.shape, aval.dtype) for aval in avals if isinstance(aval, ShapedArray)]
-    return jax.make_jaxpr(lambda *args: _evaluated(param.jaxpr, param.consts, args))(*shapes)
-
-
-def _calls_custom(jaxpr: jex.Jaxpr) -> bool:
-    """Whether `jaxpr` or a jaxpr nested in it makes a custom-derivative call."""
-    return any(eqn.primitive in INLINED or any(_calls_custom(inner) for inner in _nested(eqn.params.values()))
-               for eqn in jaxpr.eqns)
-
-
-def _nested(values) -> list[jex.Jaxpr]:
-    """The jaxprs among an equation's parameter `values`, closed or open, in a tuple or alone."""
-    found = []
-    for value in values:
-        if isinstance(value, tuple):
-            found += _nested(value)
-        elif isinstance(value, jex.ClosedJaxpr | jex.Jaxpr):
-            found.append(value.jaxpr if isinstance(value, jex.ClosedJaxpr) else value)
-    return found
-
-
 def hooked(score_mod: Callable, logits: jax.Array, q_pos, k_pos, params) -> jax.Array:
-    """`score_mod` on a tile, a custom-derivative call in it evaluated as its primal (`primal`)."""
-    return primal(score_mod)(logits, q_pos, k_pos, *params)
+    """`score_mod` on a tile; a custom-derivative call in it lowers as its primal function (Dew's JAX
+    build, constraints.txt)."""
+    return score_mod(logits, q_pos, k_pos, *params)
 
 
 def differentiable(score_mod: Callable, q_pos, k_pos, params, floating: list[int]) -> Callable:
@@ -381,23 +308,18 @@ def scored(score_mod, logits, q_pos, k_pos, params, *, slopes: bool):
     if not slopes:
         return hooked(score_mod, logits, q_pos, k_pos, params).astype(jnp.float32), None
     floating = floating_params(params)
+    inputs = (logits, *(params[index] for index in floating))
+    out, pull = jax.vjp(differentiable(score_mod, q_pos, k_pos, params, floating), *inputs)
+    along = jax.linear_transpose(pull, out)
 
-    def sloped(logits, *params):
-        inputs = (logits, *(params[index] for index in floating))
-        out, pull = jax.vjp(differentiable(score_mod, q_pos, k_pos, params, floating), *inputs)
-        along = jax.linear_transpose(pull, out)
+    def slope(index):
+        [entries] = along(tuple(jnp.ones_like(x) if place == index else jnp.zeros_like(x)
+                                for place, x in enumerate(inputs)))
+        return entries.astype(jnp.float32)
 
-        def slope(index):
-            [entries] = along(tuple(jnp.ones_like(x) if place == index else jnp.zeros_like(x)
-                                    for place, x in enumerate(inputs)))
-            return entries.astype(jnp.float32)
-
-        differentiated = {index: slope(place + 1) for place, index in enumerate(floating)}
-        return out.astype(jnp.float32), (slope(0), *(differentiated.get(index, jnp.zeros_like(logits))
-                                                      for index in range(len(params))))
-
-    # The pullback's trace keeps the custom-derivative calls a hook's rules make (`primal`).
-    return primal(sloped)(logits, *params)
+    differentiated = {index: slope(place + 1) for place, index in enumerate(floating)}
+    return out.astype(jnp.float32), (slope(0), *(differentiated.get(index, jnp.zeros_like(logits))
+                                                  for index in range(len(params))))
 
 
 def pulled(cotangents, slopes, seen, kinds: tuple[Kind, ...]):
