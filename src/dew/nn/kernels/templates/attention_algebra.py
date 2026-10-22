@@ -182,6 +182,9 @@ def headroom(dtype, keys: int, initial: bool) -> bool:
     """Whether a call's weighted values can pass fp32's largest: values of `dtype` whose largest times
     `keys + 1` reaches `2^HEADROOM` (bf16's and fp32's, not fp16's), or an initial state, whose sums may
     be any size. A call that cannot compiles no guard (`guarded`)."""
+    import os
+    if os.environ.get("DEW_NO_GUARD"):
+        return False
     return initial or float(jnp.finfo(dtype).max) * (keys + 1) >= 2.0 ** HEADROOM
 
 
@@ -298,7 +301,11 @@ def modify(spec: Forward, s: jax.Array, coords: Coords, params: tuple[jax.Array,
     """A tile's logits from its products `s` `[bq, bk]` (fp32): scaled (by log2(e) too in base 2), then
     the score hook, then -inf at each key the query does not see. `masked` False is a tile every query
     of the block sees whole (a full tile of the block map), which takes no mask."""
-    logits = s * (spec.scale * LOG2E if spec.base2 else spec.scale)
+    import os
+    if os.environ.get("DEW_WEIGHTS") == "raw" and spec.base2:
+        logits = s
+    else:
+        logits = s * (spec.scale * LOG2E if spec.base2 else spec.scale)
     if spec.score_mod is not None:
         logits = hooked(spec.score_mod, logits, coords.q_pos, coords.k_pos, params)
     if not masked:
@@ -335,6 +342,9 @@ def peak(spec: Forward, m: jax.Array, s: jax.Array) -> tuple[jax.Array, jax.Arra
     """The running maximum after a tile's logits `s`, and `alpha`, the factor the state before it
     takes to the new maximum."""
     new = jnp.maximum(m, s.max(axis=-1))
+    import os
+    if os.environ.get("DEW_WEIGHTS") == "raw" and spec.base2:
+        return new, spec.carry((m - _safe(spec, new)) * (spec.scale * LOG2E))
     return new, spec.carry(m - _safe(spec, new))
 
 
@@ -345,6 +355,12 @@ def weights(spec: Forward, s: jax.Array, m: jax.Array) -> jax.Array:
     product's rounding, up to an ulp of the logit, 2^104 at fp32's largest, which an exponential takes to
     0 or infinity; below the maximum the difference is negative either way."""
     peak = expand(_safe(spec, m), s)
+    import os
+    mode = os.environ.get("DEW_WEIGHTS", "where")
+    if mode == "raw" and spec.base2:
+        return spec.power((s - peak) * (spec.scale * LOG2E))
+    if mode == "fma":
+        return spec.power(s - peak)
     return spec.power(jnp.where(s < peak, s - peak, 0.0))
 
 
