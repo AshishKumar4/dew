@@ -60,7 +60,8 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
     value_width = value.shape[-1]
     call = padded_call(query, key, value, spans, Hooks(), max(tiles.block_q, tiles.block_k))
     spec = algebra.Forward(spans.form, spans.keys, ids=False,
-                           scale=query.shape[3] ** -0.5 if scale is None else scale, natural=natural)
+                           scale=query.shape[3] ** -0.5 if scale is None else scale, natural=natural,
+                           wide=jnp.dtype(query.dtype).itemsize >= 4)
     # Heads ahead of tokens, so a block's two minor axes are its tokens and a head width of whole lanes.
     query, key, value = (jnp.pad(jnp.swapaxes(array, 1, 2), ((0, 0),) * 3 + ((0, -array.shape[3] % LANES),))
                          for array in (call.query, call.key, call.value))
@@ -96,7 +97,8 @@ def _kernel(q_ref, k_ref, v_ref, out_ref, acc_ref, m_ref, total_ref, *, spec: al
         total_ref[...] = algebra.total(total_ref[...], alpha, weights)
         value = v_ref[...]
         acc_ref[...] = algebra.rescale(acc_ref[...], alpha) + jnp.dot(
-            algebra.narrow(weights, value.dtype), value, precision=precision, preferred_element_type=jnp.float32)
+            algebra.narrow(weights, value.dtype), value, precision=precision,
+            preferred_element_type=jnp.float32)
         m_ref[...] = m
 
     # A block every query of the query block sees whole, before the diagonal and the keys' padding, takes
