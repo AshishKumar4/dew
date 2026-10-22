@@ -30,7 +30,7 @@ from dew.nn.hyper_connections import (
 
 H, D, B, S = 3, 8, 2, 5
 SPEC = HyperConnections(hc_mult=H, hc_eps=1e-6, hc_sinkhorn_iters=5)
-SEEDS = {"site": 16, "head": 16, "mean": 16}
+SEEDS = {"site": 256, "head": 8, "mean": 16}
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` on armada."""
 
 
