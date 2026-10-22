@@ -19,7 +19,9 @@ with a hook needs a module-level hook (`tuning.encoded`).
 
 Each call runs the launch the cost model picks among the implementations that take it
 (`grouped_matmul`'s Triton and Mosaic GPU launches) where it lowers for CUDA, interpreted on the CPU
-where `interpret_on_cpu` asks, and XLA's ragged dot with the hooks applied around it everywhere else.
+where `interpret_on_cpu` asks (an assumed TPU's, the TPU launches on Megablox's schedule), and XLA's
+ragged dot with the hooks applied around it everywhere else, a TPU's own lowering included until a
+scoreboard row measures its launches.
 `gemm` is differentiable at every order (`generation.linear_tangent`): its reverse mode runs the
 template's own launches with the arithmetic of the portable program's derivative, the products'
 cotangents through `gemm` and `gemm_t` and the hooks' through their VJPs in XLA, recomputing the
@@ -136,9 +138,11 @@ def gemm_t(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None, *, pro
     def kernel(lhs, rhs, group_sizes, prologue_arrays, *, interpret):
         sides, axes, broadcast = _launchable(prologue_arrays, prologue_axes)
         hooks = grouped_matmul.Hooks(prologue, axes, prologue_broadcast=broadcast)
-        promoted = declared(lhs.dtype, precision, outputs=(out_dtype,)).promoted
-        return grouped_matmul.launched_tgmm(lhs, rhs, group_sizes, sides, out_dtype=out_dtype, hooks=hooks,
-                                            interpret=interpret, promoted=promoted, dense=dense)
+        call = {'out_dtype': out_dtype, 'hooks': hooks, 'interpret': interpret,
+                'promoted': declared(lhs.dtype, precision, outputs=(out_dtype,)).promoted, 'dense': dense}
+        if not _taken(grouped_matmul.tgmm_refusal(lhs, rhs, group_sizes, sides, **call)):
+            return portable(lhs, rhs, group_sizes, prologue_arrays)
+        return grouped_matmul.launched_tgmm(lhs, rhs, group_sizes, sides, **call)
 
     def portable(lhs, rhs, group_sizes, prologue_arrays):
         routed = _routed(group_sizes, lhs.shape[0])
@@ -150,7 +154,7 @@ def gemm_t(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None, *, pro
             lhs, matrix, group_sizes, precision=precision, preferred_element_type=jnp.float32), matrix)
         return pullback(rhs.astype(lhs.dtype).astype(jnp.float32))[0].astype(out_dtype)
 
-    if not _kernels_take(lhs.dtype, precision):
+    if not _kernels_take(lhs.dtype, precision, (out_dtype,)):
         return portable(lhs, rhs, group_sizes, prologue_arrays)
     return _dispatched(kernel, portable, interpret_on_cpu, lhs, rhs, group_sizes, prologue_arrays)
 
@@ -165,17 +169,18 @@ def _gemm(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, epilo
         hooks = grouped_matmul.Hooks(prologue, before_axes, epilogue, after_axes,
                                      tuple(dtype.name for dtype in dtypes) if several else None,
                                      prologue_broadcast=before_broadcast, epilogue_broadcast=after_broadcast)
-        return grouped_matmul.launched_gmm(lhs, rhs, group_sizes, before_sides, after_sides,
-                                           out_dtype=dtypes[0], trans_rhs=transpose_rhs, hooks=hooks,
-                                           interpret=interpret, promoted=declared(lhs.dtype, precision,
-                                                                                  outputs=dtypes).promoted,
-                                           dense=dense)
+        call = {'out_dtype': dtypes[0], 'trans_rhs': transpose_rhs, 'hooks': hooks, 'interpret': interpret,
+                'promoted': declared(lhs.dtype, precision, outputs=dtypes).promoted, 'dense': dense}
+        # A call no launch takes (a TPU's widths its blocks do not divide) runs XLA's program.
+        if not _taken(grouped_matmul.gmm_refusal(lhs, rhs, group_sizes, before_sides, after_sides, **call)):
+            return portable(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays)
+        return grouped_matmul.launched_gmm(lhs, rhs, group_sizes, before_sides, after_sides, **call)
 
     def portable(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays):
         return _portable_gemm(lhs, rhs, group_sizes, prologue, prologue_arrays, epilogue, epilogue_arrays,
                               dtypes, several, transpose_rhs, precision)
 
-    if not _kernels_take(lhs.dtype, precision):
+    if not _kernels_take(lhs.dtype, precision, dtypes):
         return portable(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays)
     return _dispatched(kernel, portable, interpret_on_cpu, lhs, rhs, group_sizes, prologue_arrays,
                        epilogue_arrays)
@@ -270,11 +275,18 @@ def _needed(jaxpr, outvars) -> set:
     return needed
 
 
-def _kernels_take(compute, precision: PrecisionLike) -> bool:
-    """Whether the kernels compute the product `precision` declares in `compute`
-    (`templates.product.declared`): one they refuse runs XLA's portable program, reported as the
+def _kernels_take(compute, precision: PrecisionLike, outputs: tuple) -> bool:
+    """Whether the kernels compute the product `precision` declares in `compute` with `outputs`
+    (`templates.product.declared`) on this target (`grouped_matmul.kernel_refusal`: a TPU's launches take
+    16-bit products not added step by step): one they refuse runs XLA's portable program, reported as the
     dispatch's route with the reason, and a kernel `generation.chosen` names for it raises."""
-    refusal = declared(compute, precision).refusal
+    product = declared(compute, precision, outputs=outputs)
+    return _taken(product.refusal or grouped_matmul.kernel_refusal(compute, product.promoted))
+
+
+def _taken(refusal: str | None) -> bool:
+    """Whether the kernels take a call `refusal` does not turn down; one turned down is reported as the
+    dispatch's route to XLA, and a kernel `generation.chosen` names for it raises."""
     if refusal is None:
         return True
     named = forced('grouped_matmul')
