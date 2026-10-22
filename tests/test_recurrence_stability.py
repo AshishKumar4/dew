@@ -1,13 +1,14 @@
 """The recurrence template's stability (bible §6: accuracy, performance and stability together): the chunked
 op under the inputs that break chunked forms, each held to the same recurrence a token at a time
-(`test_recurrence_chunk.token_by_token`, the decode step's reference) three ways:
+(`test_recurrence_chunk.token_by_token`, the decode step's reference) two ways:
 
 - finite wherever the reference in float64 is finite: no NaN or inf of the chunked form's own, an
   exponent's overflow or an underflow's `0 * inf`;
-- no merging: over the site's draws, values it rounds to one fp32 number that float64 keeps more than two
-  roundings apart are no more than check 1's factor of the fp32 reference's own and a handful, so no
-  underflow or saturation collapses values the reference keeps apart;
 - check 1 (`assert_as_exact`): on par with the reference from float64 over the regime's draws.
+
+No merging of values the reference keeps apart is check 2's: every element within its operation's
+certified bound of its float64 value keeps apart any two that float64 holds more than two fp32 spacings
+apart, so the suite takes it with the chunk ops' certificates (`tests/op_certificates.py`).
 
 The regimes: decays near one, whose memory accumulates, and over a long sequence; decays near zero, whose
 pairs within a chunk span tens of e-folds; every token at the decay's range bound (Kimi delta
@@ -19,8 +20,10 @@ Each runs the portable math, and the port of fla's kernels (`recurrence_chunk.fl
 take it (the delta rule with a decay), both forward and through their gradient, held to the recurrence's
 gradient by check 1. The port runs where its route takes the regime's declared decay floor (`FLOORS`): a
 decay a key dimension steeper than its domain, -5 a token, it refuses (`fla_kda.DECAY_FLOOR`), which the
-port's arm asserts. Ledger row 1328: the port's prefix difference uncompensated in base 2 failed check 1
-under saturated write gates, aligned keys, resets on chunk edges and the decay bound; compensated, it passes.
+port's arm asserts. The port's prefix difference uncompensated in base 2 failed check 1 under saturated
+write gates, aligned keys, resets on chunk edges and the decay bound, and its 64-token chunks of the
+suite's 16-wide keys over a long sequence; compensated, and its chunk no longer than twice the keys' width
+(`recurrence_chunk.held_chunk`), it passes.
 """
 
 import dataclasses
@@ -30,7 +33,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import PARITY, assert_as_exact, widened
+from reference_error import assert_as_exact, widened
 from test_recurrence_chunk import CHUNK, KEY_WIDTH, draw, token_by_token
 
 from dew.nn.kernels import recurrence
@@ -232,37 +235,6 @@ which the token-by-token reference compared with itself resolves the factor in b
 
 
 
-def merges(ours: np.ndarray, truth: np.ndarray) -> int:
-    """The entries `ours` merges that float64 keeps apart: in every group of entries rounded to one fp32
-    value, the entries past the first whose group spans more than two fp32 spacings in float64."""
-    flat, exact = np.ravel(ours), np.ravel(truth)
-    finite = np.isfinite(flat) & np.isfinite(exact)
-    flat, exact = flat[finite], exact[finite]
-    order = np.argsort(flat, kind='stable')
-    values = flat[order]
-    starts = np.flatnonzero(np.r_[True, values[1:] != values[:-1]])
-    sizes = np.diff(np.r_[starts, values.size])
-    merged = 0
-    for start, size in zip(starts[sizes > 1], sizes[sizes > 1], strict=True):
-        group = exact[order[start:start + size]]
-        if group.max() - group.min() > 2.0 * float(np.spacing(np.float32(values[start]))):
-            merged += int(size) - 1
-    return merged
-
-
-def assert_kept_apart(ours: int, reference: int, label: str):
-    """Dew's merges (`merges`) over a site's draws no more than check 1's factor of the fp32 reference's
-    own and a handful: two values meet by chance under either's rounding about as often, where an
-    underflow or a saturation the reference does not share merges whole runs of them."""
-    assert ours <= PARITY * reference + MERGE_SLACK, (
-        f'{label}: {ours} entries merged that float64 keeps apart, the reference {reference}')
-
-
-MERGE_SLACK = 8
-"""The merges allowed beyond the reference's, over a site's draws: chance ties under Dew's rounding that
-the reference's draws happen not to show."""
-
-
 FLOORS = {'decays near one': -1.5e-4, 'decays near zero': -35.0, 'the decay bound': -5.0,
           'a long sequence': -1.5e-3, 'a fading memory': -0.15}
 """Each regime's declared per-token log decay floor, the steepest it draws: its decays' target less their
@@ -305,10 +277,9 @@ def refusal(hooks, regime: str, arm: str):
 
 
 @pytest.mark.parametrize('name, regime, arm', CASES)
-def test_the_chunked_op_stays_finite_distinct_and_exact_where_chunked_forms_break(name, regime, arm):
-    """The arm finite wherever the float64 reference is and keeping apart what it keeps apart on every
-    declared seed, and on par with it from float64 (module docstring); the port, where its route refuses
-    the regime's floor, refuses it."""
+def test_the_chunked_op_stays_finite_and_exact_where_chunked_forms_break(name, regime, arm):
+    """The arm finite wherever the float64 reference is on every declared seed, and on par with it from
+    float64 (module docstring); the port, where its route refuses the regime's floor, refuses it."""
     hooks = SITES[name]
     if (refused := refusal(hooks, regime, arm)) is not None:
         assert refused.code == 'decay_floor', refused
@@ -316,20 +287,15 @@ def test_the_chunked_op_stays_finite_distinct_and_exact_where_chunked_forms_brea
     dew = jax.jit(functools.partial(chunk, hooks, chunk_size=CHUNK, ported=arm == 'port'))
     reference = jax.jit(functools.partial(token_by_token, hooks))
     draws = functools.partial(stressed, hooks, regime)
-    merged = {'output': [0, 0], 'final memory': [0, 0]}
     for seed in range(SEEDS[name, regime]):
         operands = draws(seed)
-        mine, theirs = dew(*operands), reference(*operands)
+        mine = dew(*operands)
         with jax.enable_x64(new_val=True):
             truth = reference(*widened(operands))
-        for leaf, ours, fp32, exact in zip(('output', 'final memory'), mine, theirs, truth, strict=True):
-            ours, fp32, exact = (np.asarray(x) for x in (ours, fp32, exact))
-            finite = np.isfinite(exact)
-            assert np.all(np.isfinite(ours)[finite]), f'{leaf}: not finite where float64 is, seed {seed}'
-            merged[leaf][0] += merges(ours, exact)
-            merged[leaf][1] += merges(fp32, exact)
-    for leaf, (ours, theirs) in merged.items():
-        assert_kept_apart(ours, theirs, leaf)
+        for leaf, ours, exact in zip(('output', 'final memory'), mine, truth, strict=True):
+            finite = np.isfinite(np.asarray(exact))
+            assert np.all(np.isfinite(np.asarray(ours))[finite]), (
+                f'{leaf}: not finite where float64 is, seed {seed}')
     assert_as_exact(dew, reference, draws, f'the {arm} arm, {name} under {regime}',
                     seeds=SEEDS[name, regime])
 
@@ -373,21 +339,3 @@ def test_the_chunked_ops_gradient_is_as_exact_as_the_recurrences(name, regime, a
             assert np.all(np.isfinite(np.asarray(ours))[finite]), f'{field}: not finite, seed {seed}'
     assert_as_exact(dew, reference, draws, f'the {arm} arm\'s gradient, {name} under {regime}',
                     seeds=GRADIENT_SEEDS[name, regime])
-
-
-def test_the_merge_check_catches_a_collapse_the_reference_keeps_apart():
-    """The merge check refuses a run of small values flushed to zero and a run of gates saturated to one,
-    which the reference keeps apart, and passes a tie two roundings make by chance."""
-    rng = np.random.default_rng(0)
-    truth = np.concatenate([rng.uniform(1e-12, 1e-11, 64), rng.normal(size=64)])
-    reference = truth.astype(np.float32)
-    flushed = np.where(np.abs(truth) < 1e-10, 0.0, truth).astype(np.float32)
-    with pytest.raises(AssertionError):
-        assert_kept_apart(merges(flushed, truth), merges(reference, truth), 'flushed')
-    gates = 1.0 - rng.uniform(1e-6, 1e-3, 64)
-    with pytest.raises(AssertionError):
-        assert_kept_apart(merges(np.ones(64, np.float32), gates), merges(gates.astype(np.float32), gates),
-                          'saturated')
-    truth = np.asarray([0.875, 0.875 + 2e-7, 0.5])
-    assert_kept_apart(merges(np.asarray([0.875, 0.875, 0.5], np.float32), truth),
-                      merges(truth.astype(np.float32), truth), 'a tie')

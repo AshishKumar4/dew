@@ -46,6 +46,17 @@ recurrent form agree at any size; the size only trades memory for
 parallelism, and 64 is what the reference's kernels assume."""
 
 
+def held_chunk(chunk_size: int, key_width: int) -> int:
+    """The longest chunk the delta rule holds at `key_width`: `chunk_size`, at most twice the keys' width
+    and at least a sub-chunk of 16. A chunk's keys span at most `key_width` dimensions, so past it its
+    triangular system's inverse grows and the memory's update, `S exp(G) - (k last)^T (W S)`, cancels
+    to a far smaller value: over a long sequence (1024 tokens, the decay near one) 64-token chunks of
+    16-wide keys put the final memory 1.7 to 1.8 times the token-by-token recurrence's error from
+    float64, chunks of 32 and 16 held it, and so did 64-token chunks of 32-, 64- and 128-wide keys
+    (armada, every delta family)."""
+    return min(chunk_size, max(16, 2 * key_width))
+
+
 def xla_chunk_states(key, k_cumdecay, out_vals, gc, last_decay, state, kept):
     """The memory crossing chunks, the one sequential part of the chunked
     rule, as a `lax.scan` over the algebra's `carry`: per chunk the reference's corrected values
@@ -264,7 +275,8 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
     of mamba_ssm's kernels where it takes the call (`ssd_port_refusal`), or on a TPU's Pallas scan
     where its tiling covers the geometry (`ssd_kernel_platform`), unless `ported` is False; else the
     portable math
-    (`chunk_delta_rule`, in `chunk_size` chunks, which a port's need not match). Packed documents
+    (`chunk_delta_rule`, in `chunk_size` chunks, the delta rule's no longer than `held_chunk`, which a
+    port's need not match). Packed documents
     (`starts`, at most `max_segments` a row) each compute as they would alone. A conv runs before the
     op: it takes the conv's output. The operands the hooks read are checked as the decode step's
     (`recurrence.read`), and a rated decay is taken on its declared domain, a contraction."""
@@ -305,8 +317,9 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
             group = value.shape[2] // key.shape[2]
             if group > 1:
                 query, key = (jnp.repeat(x, group, axis=2) for x in (query, key))
+            size = held_chunk(chunk_size, key.shape[-1]) if hooks.delta else chunk_size
             out, final = chunk_delta_rule(query, key, value, g.reshape(*value.shape[:3], -1), beta, state,
-                                          chunk_size, starts=starts, delta=hooks.delta, scale=scale,
+                                          size, starts=starts, delta=hooks.delta, scale=scale,
                                           dtype=work)
         out = recurrence.skipped(hooks, out.astype(work), value, given, work)
     # The epilogue in the working precision, and the output rounded once.
@@ -374,15 +387,14 @@ def fla_rule(query, key, value, g, beta, state=None, *, starts=None, max_segment
     each document and the row's padding; the memories they keep are not
     (`chunked_launch.Sequences`).
 
-    A known defect (ledger row 1328, its measured ratios and reproduction):
-    fla's arithmetic, which the port is, holds the recurrence less exactly
-    than the portable math, check 1 against the token-by-token reference,
-    under saturated write gates (5.8 to 5.9 times the reference's error from
-    float64, every family), aligned keys under a decay a key dimension
-    (5.4), documents resetting on chunk edges (1.6, every family) and every
-    token at the decay's bound (a row 8e-7 from float64 over its size, a
-    decay a head and a key dimension). Its error grows with the chunk's
-    length, its prefix difference `exp2(gc_s - gc_t)` uncompensated.
+    Two departures from fla's arithmetic hold the recurrence as the portable
+    math does (check 1 against the token-by-token reference): the prefix is
+    compensated in base 2 (`recurrence.cumulated`), where fla's
+    uncompensated `exp2(gc_s - gc_t)` put saturated write gates 5.8 to 5.9
+    times the reference's error from float64, aligned keys under a decay a
+    key dimension 5.4, documents resetting on chunk edges 1.6 and a row at
+    the decay's bound 8e-7 from float64 over its size; and a chunk is no
+    longer than twice the keys' width (`held_chunk`).
 
     The operands go to their common dtype, beta with them, as fla's layer
     holds them. On a mesh the rule runs per shard (`manual_map`): rows where
@@ -463,7 +475,7 @@ def _blocked_rule(query, key, value, g, beta, state, starts, *, documents: int |
     # A row's padding after its documents runs as one more sequence of its own.
     spans = None if documents is None else cu_seqlens(starts, B * (documents + 1))
     port = fla_kda.chunk_kda if per_key else fla_gdn.chunk_gated_delta_rule
-    out, final = port(query, key, value, g, beta, state, spans, scale, CHUNK_SIZE,
+    out, final = port(query, key, value, g, beta, state, spans, scale, held_chunk(CHUNK_SIZE, Dk),
                       not generation.triton_runs(), "delta_memory" not in RECOMPUTED.get(), wide)
     out = out[..., :width].reshape(B, S, Hv, split * width)[..., :Dv]
     final = final[:, :, :Dk, :width]
