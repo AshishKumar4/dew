@@ -19,6 +19,7 @@ from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax.typing import Dtype, PrecisionLike
 from jax.typing import DTypeLike
 
@@ -245,6 +246,11 @@ def two_product(left, right, *, bit_split: bool = False, subtract: bool = False,
         return value if rounding is None else rounding(value)
 
     def split(value):
+        if bit_split and isinstance(value, np.generic | np.ndarray):
+            # A constant (a kernel's static factor) splits where it is known, on the host.
+            constant = np.asarray(value, np.float32)
+            high = (constant.view(np.uint32) & np.uint32(0xfffff000)).view(np.float32)
+            return jnp.asarray(high), jnp.asarray(constant - high)
         if bit_split:
             bits = jax.lax.bitcast_convert_type(value, jnp.uint32) & jnp.uint32(0xfffff000)
             high = jax.lax.bitcast_convert_type(bits, jnp.float32)
