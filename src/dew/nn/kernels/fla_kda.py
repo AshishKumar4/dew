@@ -60,6 +60,13 @@ from dew.nn.kernels.fla_gdn import _dot, _tril_inverse, _weighted_values
 SUB = 16
 """fla's BC: the sub-chunk the intra-chunk kernels build their 16 x 16 blocks over."""
 
+DECAY_FLOOR = -5.0
+"""The steepest per-token log decay the port takes, Kimi Linear's bound (`dew.nn.kda`'s `lower_bound`):
+its backward factors each block below a sub-chunk's diagonal through the sub-chunk's first row
+(`_bwd_intra_kernel`), `exp2(+-SUB g log2(e))`, past fp32's range beyond -5.5 a token; at -30 its decay
+gradient sat 5.0e4 times the token-by-token recurrence's error from float64 (ledger row 1328). A
+decay with no declared floor at or above it runs the portable math (`recurrence_chunk.port_refusal`)."""
+
 
 def _intra_rows_kernel(chunk_ref, q_ref, k_ref, g_ref, gl_ref, beta_ref, aqk_ref, akk_ref, *,
                        chunk: int, aligned: bool, scale: float):

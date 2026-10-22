@@ -296,8 +296,8 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
         out, final = _rated_scan(hooks, query, key, value, g, beta, given, state, starts, chunk_size, work,
                                  kernels=ported is not False)
     else:
-        if hooks.delta and hooks.decay != 'none' and (on_the_port(query, key, value) if ported is None
-                                                      else ported):
+        takes = on_the_port(query, key, value, per_key=hooks.decay == 'vector') if ported is None else ported
+        if hooks.delta and hooks.decay != 'none' and takes:
             # Unrounded where an epilogue follows, as on the portable math.
             out, final = fla_rule(query, key, value, g, beta, state, starts=starts, max_segments=max_segments,
                                   scale=scale, wide=epilogue)
@@ -313,10 +313,12 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
     return recurrence.normed(hooks, out, given, work).astype(dtype), final
 
 
-def port_refusal(query, key, value) -> Refusal | None:
+def port_refusal(query, key, value, *, per_key: bool = False, floor: float | None = None) -> Refusal | None:
     """Why a rule over these operands runs the portable math rather than the
     port (`fla_rule`) on a target whose row names the port, or None where the
     port takes it: every shape, dtype, chunk size and mesh, except
+    a decay per key dimension (`per_key`) whose declared per-token `floor` is
+    absent or steeper than the port's (`fla_kda.DECAY_FLOOR`), and
     inside `jax.jvp`'s traces (`FORWARD_MODE`), which the port's custom VJP
     gives no tangent; inside a caller's `shard_map` that checks varying axes
     over operands that vary, where a Pallas call, which states no varying
@@ -337,15 +339,19 @@ def port_refusal(query, key, value) -> Refusal | None:
         (key.shape[-1] <= widest, 'key_width',
          f"keys {key.shape[-1]} wide; the port takes at most {widest} in "
          f"{jnp.result_type(query, key, value).name}"),
+        (not per_key or (floor is not None and floor >= fla_kda.DECAY_FLOOR), 'decay_floor',
+         f"a decay per key dimension with floor {floor} a token; the port takes "
+         f"{fla_kda.DECAY_FLOOR} or above"),
     )
 
 
-def on_the_port(query, key, value) -> bool:
+def on_the_port(query, key, value, *, per_key: bool = False, floor: float | None = None) -> bool:
     """Whether the rule runs on the port: where the target's row names it (`measured_kernel`, the table
     qualification reads) and the call has no refusal (`port_refusal`), reported as the target's route
-    (`generation.route`), which logs a call the row's port turns down the first time."""
+    (`generation.route`), which logs a call the row's port turns down the first time. A decay per key
+    dimension (`per_key`) states its per-token `floor` (`port_refusal`)."""
     preferred = measured_kernel('gated_delta_rule', 'xla')
-    refusal = port_refusal(query, key, value) if preferred == 'fla' else None
+    refusal = port_refusal(query, key, value, per_key=per_key, floor=floor) if preferred == 'fla' else None
     kernel = 'fla' if preferred == 'fla' and refusal is None else 'xla'
     return route('gated_delta_rule', kernel=kernel, refusal=refusal).kernel == 'fla'
 

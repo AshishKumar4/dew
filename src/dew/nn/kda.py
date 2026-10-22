@@ -183,7 +183,8 @@ class KimiDeltaAttention(nn.Module):
             # A held history can make the convolved operands vary where the projections did not, so the
             # route is asked again of them.
             return chunk_gated_delta_rule(query, key, value, g, beta, held, self.chunk_size,
-                                          ported=ported and on_the_port(query, key, value),
+                                          ported=ported and on_the_port(query, key, value, per_key=True,
+                                                                        floor=self.lower_bound),
                                           starts=starts, max_segments=tokens.max_segments)
 
         # The decode state is GatedDeltaNet's pair, here in fp32; the
@@ -191,7 +192,8 @@ class KimiDeltaAttention(nn.Module):
         # normalises the queries and keys (`l2norm`) and rounds once, to the
         # dtype the rule takes: the projections' where the port runs it, as
         # fla's layer hands them over, the wide one for the math.
-        ported = S > 1 and on_the_port(*(split(part) for part in jnp.split(projected, 3, axis=-1)))
+        ported = S > 1 and on_the_port(*(split(part) for part in jnp.split(projected, 3, axis=-1)),
+                                       per_key=True, floor=self.lower_bound)
         heads = ((self.qkv_features, self.head_dim),) * 2 + ((self.qkv_features, None),)
         out = held_scan(self, projected, taps, None, scan,
                         (self.num_heads, self.head_dim, self.head_dim), decode=decode, coordinates=tokens,

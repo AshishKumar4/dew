@@ -15,10 +15,12 @@ attention's lower bound, -5 a token); near-collinear keys with the write gate ne
 grows as binomials; documents reset on chunks' first and last tokens; and saturated gates (write gates at
 0 and 1, Mamba's step through softplus at 30), and pre-activations spread over [-20, 20], which keep
 gates near 0 and 1 apart; and a memory fading over a long sequence, whose output falls far below its scale.
-Each runs the portable math. The port of fla's kernels (`recurrence_chunk.fla_rule`) is not run here: it
-fails check 1 under saturated write gates, aligned keys a key dimension, resets on chunk edges and the decay
-bound (ledger row 1328, its measured ratios and reproduction), and its arms join the suite with the head
-that fixes it, which must pass them.
+Each runs the portable math, and the port of fla's kernels (`recurrence_chunk.fla_rule`) where the hooks
+take it (the delta rule with a decay), both forward and through their gradient, held to the recurrence's
+gradient by check 1. The port runs where its route takes the regime's declared decay floor (`FLOORS`): a
+decay a key dimension steeper than its domain, -5 a token, it refuses (`fla_kda.DECAY_FLOOR`), which the
+port's arm asserts. Ledger row 1328: the port's prefix difference uncompensated in base 2 failed check 1
+under saturated write gates, aligned keys, resets on chunk edges and the decay bound; compensated, it passes.
 """
 
 import dataclasses
@@ -32,7 +34,7 @@ from reference_error import PARITY, assert_as_exact, widened
 from test_recurrence_chunk import CHUNK, KEY_WIDTH, draw, token_by_token
 
 from dew.nn.kernels import recurrence
-from dew.nn.kernels.recurrence_chunk import Chunk, chunk
+from dew.nn.kernels.recurrence_chunk import Chunk, chunk, port_refusal
 
 SITES = {'scalar delta': recurrence.Hooks(decay='scalar', scale=KEY_WIDTH ** -0.5),
          'vector delta': recurrence.Hooks(decay='vector', scale=KEY_WIDTH ** -0.5),
@@ -124,6 +126,9 @@ REGIMES = {
 }
 """Each regime's transform of a draw's operands and its tokens (the draw's own where None)."""
 
+GRADIENT_SEEDS = {}
+"""Each site's declared seeds for its gradient's check 1, sized by `seeds_for` on armada."""
+
 SEEDS = {
     ('scalar delta', 'decays near one'): 8,
     ('scalar delta', 'decays near zero'): 32,
@@ -207,22 +212,57 @@ MERGE_SLACK = 8
 the reference's draws happen not to show."""
 
 
+FLOORS = {'decays near one': -1.5e-4, 'decays near zero': -35.0, 'the decay bound': -5.0,
+          'a long sequence': -1.5e-3, 'a fading memory': -0.15}
+"""Each regime's declared per-token log decay floor, the steepest it draws: its decays' target less their
+spread, or Kimi Linear's bound (-5, `dew.nn.kda`'s `lower_bound`) where the regime keeps the draw's own
+decays, which a decay per key dimension is clipped to (`stressed`)."""
+
+
+def floor(regime: str) -> float:
+    return FLOORS.get(regime, -5.0)
+
+
 def stressed(hooks, regime: str, seed: int) -> tuple[Chunk]:
-    """Draw `seed`'s operands for `hooks` under `regime`."""
+    """Draw `seed`'s operands for `hooks` under `regime`, a decay per key dimension no steeper than the
+    regime's floor (`FLOORS`)."""
     transform, length = REGIMES[regime]
     (operands,) = draw(hooks, packed=False, seed=seed, **({} if length is None else {'length': length}))
-    return (transform(operands, hooks, jax.random.fold_in(jax.random.key(seed), 99)),)
+    operands = transform(operands, hooks, jax.random.fold_in(jax.random.key(seed), 99))
+    if hooks.decay == 'vector':
+        operands = dataclasses.replace(operands, log_decay=jnp.maximum(operands.log_decay, floor(regime)))
+    return (operands,)
 
 
-CASES = [pytest.param(name, regime, id=f'{name}-{regime}') for name in SITES for regime in REGIMES]
+def ported(hooks) -> bool:
+    """Whether the port takes these hooks: the delta rule with a decay, not rated."""
+    return hooks.delta and hooks.decay != 'none' and not hooks.rated
 
 
-@pytest.mark.parametrize('name, regime', CASES)
-def test_the_chunked_op_stays_finite_distinct_and_exact_where_chunked_forms_break(name, regime):
-    """The portable math finite wherever the float64 reference is and keeping apart what it keeps apart on
-    every declared seed, and on par with it from float64 (module docstring)."""
+CASES = [pytest.param(name, regime, arm, id=f'{name}-{regime}-{arm}') for name, hooks in SITES.items()
+         for regime in REGIMES for arm in (('portable', 'port') if ported(hooks) else ('portable',))]
+
+
+def refusal(hooks, regime: str, arm: str):
+    """Why the port's route turns the regime down (`recurrence_chunk.port_refusal`), or None where the
+    arm runs: the portable math always."""
+    if arm == 'portable':
+        return None
+    (operands,) = stressed(hooks, regime, 0)
+    return port_refusal(operands.query, operands.key, operands.value, per_key=hooks.decay == 'vector',
+                        floor=floor(regime))
+
+
+@pytest.mark.parametrize('name, regime, arm', CASES)
+def test_the_chunked_op_stays_finite_distinct_and_exact_where_chunked_forms_break(name, regime, arm):
+    """The arm finite wherever the float64 reference is and keeping apart what it keeps apart on every
+    declared seed, and on par with it from float64 (module docstring); the port, where its route refuses
+    the regime's floor, refuses it."""
     hooks = SITES[name]
-    dew = jax.jit(functools.partial(chunk, hooks, chunk_size=CHUNK, ported=False))
+    if (refused := refusal(hooks, regime, arm)) is not None:
+        assert refused.code == 'decay_floor', refused
+        return
+    dew = jax.jit(functools.partial(chunk, hooks, chunk_size=CHUNK, ported=arm == 'port'))
     reference = jax.jit(functools.partial(token_by_token, hooks))
     draws = functools.partial(stressed, hooks, regime)
     merged = {'output': [0, 0], 'final memory': [0, 0]}
@@ -239,8 +279,49 @@ def test_the_chunked_op_stays_finite_distinct_and_exact_where_chunked_forms_brea
             merged[leaf][1] += merges(fp32, exact)
     for leaf, (ours, theirs) in merged.items():
         assert_kept_apart(ours, theirs, leaf)
-    assert_as_exact(dew, reference, draws, f'the portable math, {name} under {regime}',
+    assert_as_exact(dew, reference, draws, f'the {arm} arm, {name} under {regime}',
                     seeds=SEEDS[name, regime])
+
+
+def pulled(fn):
+    """`fn`'s gradient with respect to each float operand it reads, through a fixed cotangent on its
+    output and final memory (a key no draw's seed reaches)."""
+    def run(operands):
+        outputs, pull = jax.vjp(fn, operands)
+        keys = jax.random.split(jax.random.fold_in(jax.random.key(0), 1 << 20), len(outputs))
+        (grads,) = pull(tuple(jax.random.normal(key, out.shape, out.dtype)
+                              for key, out in zip(keys, outputs, strict=True)))
+        return {field: getattr(grads, field) for field in GRADIENTS
+                if getattr(operands, field) is not None and getattr(operands, field).dtype.kind == 'f'}
+    return run
+
+
+GRADIENTS = ('query', 'key', 'value', 'log_decay', 'gate', 'beta', 'state')
+"""The operands whose gradients a site holds, each where the hooks read it."""
+
+
+@pytest.mark.parametrize('name, regime, arm', CASES)
+def test_the_chunked_ops_gradient_is_as_exact_as_the_recurrences(name, regime, arm):
+    """The arm's gradient finite wherever the reference's in float64 is, and on par with the token-by-token
+    recurrence's from float64 (check 1) over the site's declared seeds; the port, where its route refuses
+    the regime's floor, refuses it."""
+    hooks = SITES[name]
+    if (refused := refusal(hooks, regime, arm)) is not None:
+        assert refused.code == 'decay_floor', refused
+        return
+    dew = jax.jit(pulled(functools.partial(chunk, hooks, chunk_size=CHUNK, ported=arm == 'port')))
+    reference = jax.jit(pulled(functools.partial(token_by_token, hooks)))
+    draws = functools.partial(stressed, hooks, regime)
+    for seed in range(2):
+        operands = draws(seed)
+        mine = dew(*operands)
+        with jax.enable_x64(new_val=True):
+            truth = reference(*widened(operands))
+        for field, ours in mine.items():
+            finite = np.isfinite(np.asarray(truth[field]))
+            assert np.all(np.isfinite(np.asarray(ours))[finite]), f'{field}: not finite, seed {seed}'
+    assert_as_exact(dew, reference, draws, f'the {arm} arm\'s gradient, {name} under {regime}',
+                    seeds=GRADIENT_SEEDS[name, regime])
 
 
 def test_the_merge_check_catches_a_collapse_the_reference_keeps_apart():
