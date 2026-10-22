@@ -443,16 +443,18 @@ def selection_margin(case: Case, variables_by_step, tokens) -> float:
     model = models.build(case.architecture, **case.config)
 
     def selecting(module, method):
+        # The indexer's scores come from its `scores` method, the gate's from the gated MLP's Dense.
+        if isinstance(module, SparseIndexer):
+            return method == "scores"
         parent = module.parent
-        return method == "__call__" and (isinstance(module, SparseIndexer) or (
-            isinstance(module, nn.Dense) and module.name == "gate_proj" and isinstance(parent, GatedMLP)
-            and bool(parent.activation_sparsity)))
+        gated = isinstance(parent, GatedMLP) and bool(parent.activation_sparsity)
+        return method == "__call__" and isinstance(module, nn.Dense) and module.name == "gate_proj" and gated
 
     margin, seen = np.inf, 0
     for variables in variables_by_step:
         _, captured = model.apply(variables, jnp.asarray(tokens[:, :-1]), capture_intermediates=selecting,
                                   mutable=["intermediates"])
-        for path, values in jax.tree_util.tree_flatten_with_path(captured["intermediates"])[0]:
+        for path, values in jax.tree_util.tree_flatten_with_path(captured.get("intermediates", {}))[0]:
             seen += 1
             names = [str(getattr(part, "key", part)) for part in path]
             values = np.asarray(values, np.float64)
