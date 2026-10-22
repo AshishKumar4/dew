@@ -420,7 +420,7 @@ def test_a_generation_reads_in_place_of_the_steps_it_ran_and_of_no_others(change
 def test_a_generation_of_one_holdout_part_reads_as_that_part():
     """A generation published from a holdout part holds that part's rows, so it reads in place of
     that part whole, and the other part, whose rows it does not hold, is refused it; one published
-    from the store the parts select from serves both (`rebased`)."""
+    from the store the parts select from serves both, each the rows of the inputs it keeps."""
     from dew.data.compile import iterate, publish
     from dew.data.pipeline import Pipeline
 
@@ -1515,8 +1515,9 @@ def test_a_holdout_by_a_field_its_cached_step_drops_reads_the_parts_it_reads_unc
     source = Memory([{"id": index} for index in range(24)])
     generation = publish(renamed(Pipeline(source)), _cache(), read="memory")
     parts = Pipeline(source).holdout(0.25, key="id")
-    cached = [_tags(renamed(part).cache(generation)) for part in parts]
-    assert cached == [_tags(renamed(part)) for part in parts]
+    uncached = [_tags(renamed(part)) for part in parts]
+    assert all(uncached)
+    assert [_tags(renamed(part).cache(generation)) for part in parts] == uncached
 
 
 def test_a_records_holdout_over_missing_rows_and_a_dropping_step_reads_the_inputs_it_holds_out():
@@ -1534,7 +1535,9 @@ def test_a_records_holdout_over_missing_rows_and_a_dropping_step_reads_the_input
     source = Memory([None if index in (1, 4) else {"id": index} for index in range(16)])
     generation = publish(even(Pipeline(source)), _cache(), read="memory")
     parts = Pipeline(source).holdout(records=5)
-    assert [_tags(even(part).cache(generation)) for part in parts] == [_tags(even(part)) for part in parts]
+    uncached = [_tags(even(part)) for part in parts]
+    assert uncached == [[60, 80, 100, 120, 140], [0, 20]]
+    assert [_tags(even(part).cache(generation)) for part in parts] == uncached
 
 
 def test_a_step_that_reads_its_index_before_a_generation_under_a_holdout_is_refused():
@@ -1555,14 +1558,65 @@ def test_a_step_that_reads_its_index_before_a_generation_under_a_holdout_is_refu
     assert _tags(placed(trained).cache(_cache())) == _tags(placed(trained)) == list(range(8))
 
 
-def test_a_generation_a_stream_filled_stands_in_under_a_records_holdout():
-    """A generation filled by a streamed read keys its inputs by shard and row; under a records
-    holdout it reads the rows of the inputs held out, as the chain does uncached."""
+def test_a_records_holdout_over_a_generation_a_stream_filled_is_refused_and_an_indexed_fill_serves_it():
+    """A stream numbers its inputs by its shards, a records holdout by index: a generation filled by a
+    stream can't place the records held out, and is refused; filled by index, it reads the rows of
+    the inputs each part keeps, as the chain does uncached."""
     from dew.data.compile import publish
     from dew.data.pipeline import Pipeline
 
     source = Memory([{"id": index} for index in range(12)])
-    generation = publish(_tagged(Pipeline(source)), _cache(), read="streamed")
     parts = Pipeline(source).holdout(records=5)
-    cached = [_tags(_tagged(part).cache(generation)) for part in parts]
-    assert cached == [_tags(_tagged(part)) for part in parts]
+    streamed = publish(_tagged(Pipeline(source)), _cache(), read="streamed")
+    with pytest.raises(ValueError):
+        _tags(_tagged(parts[0]).cache(streamed))
+    indexed = publish(_tagged(Pipeline(source)), _cache(), read="indexed")
+    assert [_tags(_tagged(part).cache(indexed)) for part in parts] == [_tags(_tagged(part)) for part in parts]
+
+
+@pytest.mark.parametrize("order", ["records of hash", "hash of records"])
+def test_stacked_holdouts_over_a_generation_pick_the_inputs_they_pick_uncached(order):
+    """A records holdout of a hash part, and a hash holdout of a records part: each stacked part reads
+    the rows of the inputs both selections keep, as uncached, and says how many records it holds out."""
+    from dew.data.compile import compile, publish
+    from dew.data.dataset import Loading
+    from dew.data.pipeline import Pipeline
+
+    source = Memory([{"id": index} for index in range(40)])
+    generation = publish(_tagged(Pipeline(source)), _cache(), read="memory")
+    store = Pipeline(source)
+    first = store.holdout(0.25) if order == "records of hash" else store.holdout(records=6)
+    stacked = [part for outer in first for part in
+               (outer.holdout(records=3) if order == "records of hash" else outer.holdout(0.5))]
+    uncached = [_tags(_tagged(part)) for part in stacked]
+    assert all(uncached)
+    assert [_tags(_tagged(part).cache(generation)) for part in stacked] == uncached
+    def held_out(chain):
+        return compile(chain.repeat().batch(1), read="memory", loading=Loading(workers=0)).held_out
+
+    for part in stacked:
+        assert held_out(_tagged(part).cache(generation)) == held_out(_tagged(part))
+
+
+def test_a_generation_a_stream_filled_from_files_mounted_elsewhere_is_refused_under_a_holdout(tmp_path):
+    """The same files mounted at another path read as the store the generation was published from, but
+    a stream names its inputs by where it read their shards, so under a holdout the generation can't
+    place them there, and is refused rather than read as no rows; at its own mount it serves."""
+    import shutil
+
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    from dew.data import Files
+    from dew.data.compile import publish
+    from dew.data.pipeline import Pipeline
+
+    (tmp_path / "a").mkdir()
+    pq.write_table(pa.table({"id": list(range(24))}), tmp_path / "a" / "rows.parquet")
+    shutil.copytree(tmp_path / "a", tmp_path / "b")
+    generation = publish(_tagged(Pipeline(Files(str(tmp_path / "a")))), _cache(), read="streamed")
+    here, _ = Pipeline(Files(str(tmp_path / "a"))).holdout(0.25)
+    assert _tags(_tagged(here).cache(generation), "streamed") == _tags(_tagged(here), "streamed")
+    elsewhere, _ = Pipeline(Files(str(tmp_path / "b"))).holdout(0.25)
+    with pytest.raises(ValueError):
+        _tags(_tagged(elsewhere).cache(generation), "streamed")
