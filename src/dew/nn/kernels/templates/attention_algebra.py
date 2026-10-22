@@ -207,7 +207,8 @@ def argmax(state: Argmax, logits: jax.Array, k_pos: jax.Array) -> Argmax:
     """`Argmax` after a tile's logits (-inf where unseen) at its keys' indices `k_pos` `[1, bk]`: one
     reduction to each row's first maximum (`jnp.argmax`'s ties to the first)."""
     tile_peak = logits.max(axis=-1)
-    first = (k_pos[0, 0] + jnp.argmax(logits, axis=-1)).astype(jnp.int32)
+    # The tile's first key, by a reduction: a kernel lowers no slice of a tile.
+    first = (jnp.min(k_pos) + jnp.argmax(logits, axis=-1)).astype(jnp.int32)
     return Argmax(jnp.maximum(state.peak, tile_peak), jnp.where(tile_peak > state.peak, first, state.key))
 
 
