@@ -183,19 +183,21 @@ def no_argmax(rows: int) -> Argmax:
 
 
 def argmax(state: Argmax, logits: jax.Array, k_pos: jax.Array) -> Argmax:
-    """`Argmax` after a tile's logits (-inf where unseen) at its keys' indices `k_pos` `[1, bk]`."""
+    """`Argmax` after a tile's logits (-inf where unseen) at its keys' indices `k_pos` `[1, bk]`: one
+    reduction to each row's first maximum (`jnp.argmax`'s ties to the first)."""
     tile_peak = logits.max(axis=-1)
-    first = jnp.min(jnp.where(logits == tile_peak[:, None], k_pos, jnp.iinfo(jnp.int32).max), axis=-1)
-    return Argmax(jnp.maximum(state.peak, tile_peak),
-                  jnp.where(tile_peak > state.peak, first.astype(jnp.int32), state.key))
+    first = k_pos[0, 0] + jnp.argmax(logits, axis=-1).astype(jnp.int32)
+    return Argmax(jnp.maximum(state.peak, tile_peak), jnp.where(tile_peak > state.peak, first, state.key))
 
 
-def anchor_split(narrowed: jax.Array, at_anchor: jax.Array) -> tuple[jax.Array, jax.Array]:
+def anchor_split(spec: Forward, narrowed: jax.Array, at_anchor: jax.Array, anchor: "Argmax",
+                 m: jax.Array) -> tuple[jax.Array, jax.Array]:
     """A tile's narrowed weights split at the anchor key (`at_anchor`): the others, the left operand of
-    the product that adds to `B = sum_{j != c} e_j v_j`, and the anchor's own weight `[bq]`, fp32."""
-    zero = jnp.zeros_like(narrowed)
-    return (jnp.where(at_anchor, zero, narrowed),
-            jnp.where(at_anchor, narrowed, zero).astype(jnp.float32).sum(axis=-1))
+    the product that adds to `B = sum_{j != c} e_j v_j`, and the anchor's own weight `[bq]`, fp32, its
+    logit the anchor's peak, so no reduction finds it (where the anchor is not in the tile it is unread,
+    `split_accumulate`)."""
+    own = narrow(weights(spec, anchor.peak[:, None], m), narrowed.dtype).astype(jnp.float32)[:, 0]
+    return jnp.where(at_anchor, jnp.zeros_like(narrowed), narrowed), own
 
 
 def split_accumulate(others: jax.Array, own: jax.Array, others_total: jax.Array, alpha: jax.Array,

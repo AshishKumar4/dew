@@ -114,8 +114,8 @@ def forward(spec: algebra.Forward, query: jax.Array, key: jax.Array, value: jax.
             coords, logits, m, alpha, weights, denominator, v_tile = softmax(j, state)
             # The training forward's split sums (`algebra.split_accumulate`), as the Triton mainloop's.
             anchor = algebra.argmax(arg, logits, coords.k_pos)
-            others, own_tile = algebra.anchor_split(algebra.narrow(weights, v_tile.dtype),
-                                                    coords.k_pos == anchor.key[:, None])
+            others, own_tile = algebra.anchor_split(spec, algebra.narrow(weights, v_tile.dtype),
+                                                    coords.k_pos == anchor.key[:, None], anchor, m)
             acc, own, others_total = algebra.split_accumulate(
                 state.acc, own, others_total, alpha, anchor.peak > arg.peak, value[row, arg.key, kv_head],
                 _dot(others, v_tile), others, own_tile)
