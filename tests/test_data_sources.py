@@ -554,20 +554,28 @@ def test_a_token_export_reads_as_its_one_split_and_refuses_another(tmp_path):
 def test_two_exports_of_the_same_rows_are_the_same_store_and_of_other_rows_another(tmp_path, transport):
     """Each host of a run exports its corpus itself, and the run checks that every host reads the same
     data: two exports of the same rows, each writer naming its shards its own way, are one store,
-    as tokens and as files, on a host's disk or remote; an export of other rows is another."""
+    as tokens and as files. On a host's disk, wherever each mounted it; remote, where a store is
+    named by its URL, the same rows written again in its place. An export of other rows is another."""
+    import fsspec
+
     from dew.data.sources import Files, TokenFiles
 
     metadata = {"token_store": True, "dtype": "int32", "tokenizer": "byte", "vocab_size": 256, "eos_id": 0}
     base = str(tmp_path) if transport == "local" else f"memory://exports-{uuid4().hex}"
 
     def exported(name, last):
+        url = f"{base}/{name}"
         rows = [{"text": np.asarray([1, 2, 0], np.int32)}, {"text": np.asarray([3, last, 0], np.int32)}]
-        export(rows, f"{base}/{name}", format="array_record", length_field="text", metadata=metadata)
-        return f"{base}/{name}"
+        export(rows, url, format="array_record", length_field="text", metadata=metadata)
+        return url, TokenFiles(url).fingerprint(), Files(url).fingerprint()
 
-    one, again, other = exported("one", 4), exported("again", 4), exported("other", 5)
-    assert TokenFiles(one).fingerprint() == TokenFiles(again).fingerprint() != TokenFiles(other).fingerprint()
-    assert Files(one).fingerprint() == Files(again).fingerprint() != Files(other).fingerprint()
+    url, *one = exported("one", 4)
+    if transport == "memory":
+        fsspec.filesystem("memory").rm(url, recursive=True)
+    _, *again = exported("one" if transport == "memory" else "again", 4)
+    _, *other = exported("other", 5)
+    assert one == again
+    assert one[0] != other[0] and one[1] != other[1]
 
 
 def test_partitioned_exports_of_the_same_values_under_other_partitions_are_other_stores(tmp_path):
