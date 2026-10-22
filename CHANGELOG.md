@@ -45,6 +45,13 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   another stay apart; a data position saved over a holdout part before is
   refused as its source changed, and a generation published from one no
   longer stands in for it, where a `Cache(url)` over it fills again.
+- A mixture reads its corpora by Grain's weighted selection and counts its
+  epoch by it: until every corpus has come round once where the order reads
+  on past the mix, and at its first corpus's end where a mix of corpora read
+  once ends. Corpora that recur across phases continue where that selection
+  left each, which reads other records after a phase switch for weights whose
+  scaling Grain truncates (1, 10 and 15), so a data position saved by an
+  earlier Dew is refused (data plan version 5).
 - `dew.data` and `dew.data.sources` export `from_torch`, `from_grain`,
   `from_hf` and `from_iter`, not the `Torch`, `Grain`, `HF` and `Iterated`
   classes they make, which a recorded chain still names by their modules. A
