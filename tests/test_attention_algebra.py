@@ -194,14 +194,14 @@ def test_two_states_merged_are_on_par_with_one_pass_over_their_keys():
         np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs))
 
 
-def forwards(query, key, value, spans, hooks=None, *, residuals=False):
+def forwards(query, key, value, spans, hooks=None, *, residuals=False, scale=None):
     """The Triton mainloop's forward, interpreted, and the plain-JAX one's, at 32 by 32 tiles."""
     tiles = attention_triton.Tiles(32, 32, 4, 2)
     with tuning.pinned({attention_triton.TritonForward: tiles}):
         triton = attention_triton.forward(query, key, value, spans, hooks, residuals=residuals,
-                                          interpret=True)
+                                          interpret=True, scale=scale)
     portable = attention_portable.attend(query, key, value, spans, hooks, block_q=32, block_k=32,
-                                         pad=attention_triton.BLOCK, residuals=residuals)
+                                         pad=attention_triton.BLOCK, residuals=residuals, scale=scale)
     return triton, portable
 
 
@@ -372,3 +372,31 @@ def test_a_large_initial_maximum_gives_the_references_state_gradients():
         for mine, theirs in zip(jax.tree.leaves(found.initial), jax.tree.leaves(reference), strict=True):
             assert np.isfinite(np.asarray(mine)).all()
             np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs))
+
+
+@pytest.mark.parametrize("keys, query_size, key_sizes, out", [
+    (2, 1.0, (1610613120.0, 1610612992.0), 1.0),
+    (1, 3e38, (1.0,), 1.0),
+], ids=["one ulp apart at 1.6e9", "a logit near fp32's largest"])
+def test_a_logit_the_reference_keeps_stays_finite_and_apart(keys, query_size, key_sizes, out):
+    """fp32, one query of `query_size` over keys of `key_sizes`, the first's value 1 and the rest 0, scale 1
+    (past 1/log2(e), so the natural form, `Forward.base2`): the reference weighs the larger logit alone
+    (out 1), keeping logits one ulp apart at 1.6e9 apart and a logit near fp32's largest finite. Both
+    mainloops keep the logits natural, as the reference does, and give its output and finite gradients
+    under an output cotangent of 1."""
+    spans = template.spans(1, keys, 1)
+    query = jnp.full((1, 1, 1, 1), query_size, jnp.float32)
+    key = jnp.asarray(key_sizes, jnp.float32).reshape(1, keys, 1, 1)
+    value = jnp.zeros((1, keys, 1, 1), jnp.float32).at[0, 0].set(1.0)
+    dout = jnp.ones((1, 1, 1, 1), jnp.float32)
+    for found in forwards(query, key, value, spans, scale=1.0):
+        np.testing.assert_array_equal(np.asarray(found), out)
+    pins = {attention_triton.TritonBackward: attention_triton.BackwardTiles(32, 32, 4, 2, 4, 2),
+            attention_triton.TritonForward: attention_triton.Tiles(32, 32, 4, 2)}
+    with tuning.pinned(pins):
+        triton = attention_triton.backward(query, key, value, spans, None, dout, scale=1.0, interpret=True)
+    portable = attention_portable.backward(query, key, value, spans, None, dout, block_q=32, block_k=32,
+                                           pad=attention_triton.BLOCK, scale=1.0)
+    for found in (triton, portable):
+        for leaf in (found.query, found.key, found.value):
+            assert np.isfinite(np.asarray(leaf)).all()

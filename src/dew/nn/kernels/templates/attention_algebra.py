@@ -50,11 +50,11 @@ class Forward:
     @property
     def base2(self) -> bool:
         """Whether the logits stay in base 2 (log2(e) folded into the scale, then exp2, jax's mha's and
-        FlashAttention 2's arithmetic): no hook reads them. Its known limits, where the reference stays
-        finite and apart: a scale of 1/log2(e) (0.69) or more takes a product near fp32's largest past
-        it, and the fold's rounding can tie two logits one ulp apart (1610613120 and 1610612992 at scale
-        1, which the reference weighs 1 and 0)."""
-        return self.score_mod is None
+        FlashAttention 2's arithmetic): no hook reads them, and the scale times log2(e) is at most 1, so
+        no product the reference keeps finite passes fp32's largest (a scale past 1/log2(e), 0.69, takes
+        the natural form instead). Its known limit, where the reference stays apart: the fold's rounding
+        can tie two logits an ulp apart that the scale's alone does not."""
+        return self.score_mod is None and self.scale * LOG2E <= 1.0
 
     @property
     def guarded(self) -> bool:
