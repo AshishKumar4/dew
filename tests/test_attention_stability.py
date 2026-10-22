@@ -51,7 +51,7 @@ class Family:
 def _normal(seed: int, *shapes) -> list[np.ndarray]:
     """Standard-normal fp32 arrays of `shapes`, one stream each."""
     streams = jax.random.split(jax.random.key(seed), len(shapes))
-    return [np.asarray(jax.random.normal(stream, shape), np.float32)
+    return [np.array(jax.random.normal(stream, shape), np.float32)
             for stream, shape in zip(streams, shapes, strict=True)]
 
 
@@ -139,6 +139,20 @@ def _families() -> dict[str, Family]:
             return query, key, value, _uniform(seed + 7, low, high, (query.shape[2],)), dout
         return draw
 
+    def near(size: float):
+        # Logits of `size` a row spread over 60 below it: each query's first entry a drawn `4 size`, each
+        # key's 1 there and a drawn -240 to 0 in its second, where the query holds 1, the rest standard
+        # normal, so every row weighs many keys at magnitudes fp32 rounds at `size`'s ulp.
+        def draw(seed):
+            query, key, value, dout = _normal(seed, (4, 64, 2, 16), (4, 64, 2, 16), (4, 64, 2, 16),
+                                              (4, 64, 2, 16))
+            query[..., 0] = 4 * _uniform(seed + 5, size / 2, size, query.shape[:-1])
+            query[..., 1] = 1.0
+            key[..., 0] = 1.0
+            key[..., 1] = _uniform(seed + 6, -240.0, 0.0, key.shape[:-1])
+            return query, key, value, None, dout
+        return draw
+
     def small_weight(dtype):
         # Eight queries a row over 256 keys of which two are seen: a key of logit 0 and one whose logit is
         # each query's drawn size in [3, 5) times its key's -l, l drawn in [16, 21), so its weight is
@@ -176,7 +190,7 @@ def _families() -> dict[str, Family]:
         "a sink and one key, its logit near fp32's largest": Family(with_sinks(near_max_logit(1), -3.0, 3.0),
                                                                     kept(1, 1)),
         "a sink near fp32's largest at scale 1/4": Family(with_sinks(drawn(16, 1), 1e38, 3e38), kept(16, 1)),
-        "logits near 1e4": Family(drawn(64, 64, rows=16, size=1e4), _causal(64, 64, 16), {"causal": True}),
+        "logits near 1e4": Family(near(1e4), _causal(64, 64, 4), {"causal": True}),
         # Folded, the backward takes the base-2 maximum back to natural units, which at 1e30 rounds the
         # anchor's own weight away from 1 by more than any bound states.
         "logits near 1e30": Family(drawn(64, 64, rows=4, size=1e30), _causal(64, 64, 4), {"causal": True},

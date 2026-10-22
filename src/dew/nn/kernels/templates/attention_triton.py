@@ -204,31 +204,29 @@ def _forward_kernel(*refs, spec: algebra.Forward, score_kinds: tuple[Kind, ...],
         # The values load after the softmax, where jax's mha loads them; on the guarded walk the weights
         # take the row's shift their sizes need (`algebra.room`).
         value = value_ref[tile, :]
-        if state.shift is None:
-            denominator = algebra.total(state.total, alpha, weights)
-            return tile, coords, logits, m, alpha, weights, value, (denominator,)
-        weights, factor, shift, reach = algebra.room(state, alpha, weights, value)
-        denominator = algebra.total(state.total, factor, weights)
-        return tile, coords, logits, m, factor, weights, value, (denominator, shift, reach)
+        weights, factor, held = algebra.tile(state, alpha, weights, value)
+        return tile, coords, logits, m, factor, weights, value, held
 
     def step(index, state: algebra.Partial) -> algebra.Partial:
-        _, _, _, m, factor, weights, value, sums = softmax(index, state)
+        _, _, _, m, factor, weights, value, held = softmax(index, state)
         product = _dot(algebra.narrow(weights, value.dtype), value, interpret)
-        return algebra.Partial(algebra.rescale(state.acc, factor) + product, m, *sums)
+        return algebra.stepped(state, m, factor, weights, product, held)
 
     def tracked(index, carry: tuple[algebra.Partial, algebra.Argmax, jax.Array, jax.Array]):
         # A training forward's step: the anchor key and the split sums the backward reads
         # (`algebra.split_accumulate`); its state's values are `B`, every key's but the anchor's.
         state, arg, own, others_total = carry
-        _, coords, logits, m, factor, weights, value, sums = softmax(index, state)
+        _, coords, logits, m, factor, weights, value, held = softmax(index, state)
         anchor = algebra.argmax(arg, logits, coords.k_pos)
         moved = anchor.peak > arg.peak
         others, own_tile = algebra.anchor_split(algebra.narrow(weights, value.dtype),
                                                 coords.k_pos == anchor.key[:, None])
         product = _dot(others, value, interpret)
         acc, own, others_total = algebra.split_accumulate(state.acc, own, others_total, factor, moved,
-                                                          value_ref[arg.key, :], product, others, own_tile)
-        return algebra.Partial(acc, m, *sums), anchor, own, others_total
+                                                          value_ref[arg.key, :], product, others, own_tile,
+                                                          held)
+        stepped = algebra.stepped(state, m, factor, weights, jnp.zeros_like(acc), held)
+        return stepped._replace(acc=acc), anchor, own, others_total
 
     def start(live) -> algebra.Partial:
         if initial:
@@ -555,7 +553,7 @@ def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tu
         value = value_ref[keys, :]
         exponentials, rest, own = algebra.off_anchor_weights(logits, maximum, k_pos == key_index[:, None],
                                                              value.dtype, shift)
-        return algebra.off_anchor(state, exponentials, rest, own, _dot(rest, value, interpret))
+        return algebra.off_anchor(state, exponentials, rest, own, _dot(rest, value, interpret), shift)
 
     # From the softmax's initial state (`gradients`): its maximum, denominator and share of D's numerator.
     key_index = index_ref[...]
@@ -572,7 +570,7 @@ def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tu
             dout, key_index, shift)
     else:
         state = jax.lax.fori_loop(bounds_ref[0], bounds_ref[1], row_terms, before)
-        prior = state.total * jnp.exp2(shift)
+        prior = algebra.power2(state.total, shift)
         anchor, delta, key_index = algebra.off_anchor_delta(state, anchor_value_ref[...], dout, state_total,
                                                             state_share, key_index, shift)
     peak = maximum
