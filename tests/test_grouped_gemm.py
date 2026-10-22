@@ -231,6 +231,28 @@ def test_every_tile_of_the_hopper_grouped_matmuls_lowers_for_an_h100(launch, tra
                 lowering_platforms=("cuda",))
 
 
+def test_the_kernels_forward_mode_keeps_the_projections_law():
+    """An expert projection's tangent through the template is the portable projection's, bit for bit:
+    `dx @ Q(kernel) + Q(x) @ dkernel` with the tangents unrounded, where a cast's own tangent would round
+    an fp32 input's to bf16 first (an fp32 1 + 2^-8 times 1.5 is 1.5078125, rounded first 1.5)."""
+    sizes = jnp.asarray([1, 2], jnp.int32)
+    x, w = jnp.zeros((3, 2), jnp.float32), jnp.full((2, 2, 2), 1.5, jnp.float32)
+    dx, dw = jnp.full((3, 2), 1 + 2.0 ** -8, jnp.float32), jnp.zeros((2, 2, 2), jnp.float32)
+    tangents = {implementation: jax.jvp(lambda x, w, implementation=implementation: expert_projection(
+        x, w, sizes, jnp.bfloat16, implementation, None), (x, w), (dx, dw))[1]
+        for implementation in ("auto", "xla")}
+    np.testing.assert_array_equal(np.asarray(tangents["auto"], np.float32),
+                                  np.asarray(tangents["xla"], np.float32))
+    assert np.asarray(tangents["xla"], np.float32)[0, 0] == np.float32(1.5078125).astype(jnp.bfloat16)
+
+
+def test_a_named_kernel_refuses_where_the_kernels_do_not_run():
+    """A kernel `generation.chosen` names for a call no kernel runs (a CPU's without 'pallas', which alone
+    interprets them) raises with the reason, rather than running XLA."""
+    x, w, sizes = jnp.ones((8, 16), jnp.bfloat16), jnp.ones((2, 16, 16), jnp.float32), jnp.asarray([4, 4])
+    with generation.chosen(grouped_matmul="triton"), pytest.raises(ValueError, match="GPU of sm80"):
+        expert_projection(x, w, sizes, jnp.bfloat16, "auto", None)
+
 def test_a_forced_implementation_runs_or_says_why_it_cannot():
     """'xla' named runs XLA's ragged dot whatever the call asked; a kernel named for a product the
     kernels do not compute (fp32 above the default precision) raises with the reason rather than

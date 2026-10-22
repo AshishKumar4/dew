@@ -13,6 +13,7 @@ import numpy as np
 import pytest
 from generation_support import INTERPRETS, SUMS_IN_IEEE, generations, lowers, runs
 from jax.experimental.pallas import fuser
+from jax.extend import core as jax_core
 from jax.sharding import AbstractDevice, AbstractMesh, AxisType, Mesh
 from reference_error import assert_as_exact
 
@@ -667,6 +668,62 @@ def test_an_indexed_bank_holds_check_1_with_the_plain_calls_value(generation_nam
                         truth_fn=_indexed_program(indexed=False, truth=True))
     assert _kernels(taken) <= {'triton', 'mosaic_gpu', 'mosaic_tpu'} and _kernels(taken)
 
+
+@runs("sm80")
+def test_a_dense_bank_reads_its_layer_as_the_plain_product():
+    """A dense product of a bank's layer (`rhs_index`, no groups) runs Triton's grouped kernel on the bank
+    in place, as exact as the layer's plain product from float64 truth."""
+    def draw(seed):
+        x, bank, b, cotangent = _banked(seed)
+        return x, bank[:, 0], b, cotangent
+
+    def run(indexed: bool, truth: bool = False):
+        def product(x, bank, b):
+            if truth:
+                return biased(_wide(x).astype(jnp.float64) @ bank[LAYER].astype(jnp.float64), b)
+            if indexed:
+                return template.gemm(x, bank, None, rhs_index=jnp.int32(LAYER), epilogue=biased,
+                                     epilogue_operands=((b, ('columns',)),), out_dtype=jnp.bfloat16,
+                                     interpret_on_cpu=True)
+            return biased(jnp.dot(x, bank[LAYER], preferred_element_type=jnp.float32), b).astype(jnp.bfloat16)
+
+        def program(x, bank, b, cotangent):
+            out, pull = jax.vjp(product, x, bank, b)
+            return (out, *pull(cotangent.astype(out.dtype)))
+        return program
+
+    with generation.assumed("sm80"), generation.routes() as taken:
+        assert_as_exact(jax.jit(run(indexed=True)), jax.jit(run(indexed=False)), draw, "dense bank",
+                        seeds=SEEDS, truth_fn=run(indexed=False, truth=True))
+    assert _kernels(taken) == {'triton'}
+
+
+def test_a_wide_input_gradient_widens_one_layer_not_the_bank():
+    """An fp32 output's input gradient multiplies its fp32 cotangent by the bank's layer widened, the
+    layer sliced out first: no fp32 copy of the whole bank, and a launch prices one layer, as the plain
+    call does."""
+    x, bank, *_ = _banked(0)
+    sizes = jnp.asarray(SIZES)
+
+    def loss(x, bank):
+        return jnp.sum(template.gemm(x, bank, sizes, rhs_index=jnp.int32(LAYER), out_dtype=jnp.float32))
+
+    with generation.assumed("sm90"):
+        jaxpr = jax.make_jaxpr(jax.grad(loss, argnums=(0, 1)))(x, bank).jaxpr
+        widened = [eqn for eqn in _equations(jaxpr) if eqn.primitive.name == 'convert_element_type'
+                   and eqn.outvars[0].aval.shape == bank.shape and eqn.outvars[0].aval.dtype == jnp.float32]
+        launch, target = grouped_matmul.MosaicGmm(), generation.gpu_target()
+        options = {"out_dtype": "bfloat16", "trans_rhs": False, "interpret": False}
+        banked = launch.estimate(launch.bind(x, bank, sizes, (), (), (jnp.int32(LAYER),), **options), target)
+        plain = launch.estimate(launch.bind(x, bank[LAYER], sizes, **options), target)
+    assert not widened and banked == plain
+
+
+def _equations(jaxpr):
+    for eqn in jaxpr.eqns:
+        yield eqn
+        for sub in jax_core.jaxprs_in_params(eqn.params):
+            yield from _equations(sub)
 
 @pytest.mark.parametrize("generation_name",
                          [pytest.param(name, marks=lowers(name)) for name in ("sm80", "sm90")])
