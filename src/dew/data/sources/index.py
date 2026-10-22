@@ -9,7 +9,7 @@ from functools import cached_property
 
 import numpy as np
 
-from dew.data.storage import Store
+from dew.data.storage import Store, local
 
 
 @dataclass(frozen=True)
@@ -25,8 +25,7 @@ class ArrayIndex:
         snapshot = None
         if self.metadata is not None:
             snapshot = {"size": self.metadata.get("bytes", self.metadata.get("size")), **self.metadata}
-        protocols = (fs.protocol,) if isinstance(fs.protocol, str) else fs.protocol
-        if "file" not in protocols or self.metadata is not None:
+        if not local(fs) or self.metadata is not None:
             fs, path = store.cached().resolve()
         opened = fs.open(path, "rb", source_snapshot=snapshot)
         if not isinstance(opened.name, str):
@@ -59,3 +58,29 @@ class ArrayIndex:
 
     def __getstate__(self) -> Mapping[str, object]:
         return {"url": self.url, "storage_options": self.storage_options, "metadata": self.metadata}
+
+
+@dataclass(frozen=True)
+class Ranges:
+    """Consecutive ranges of `counts` items each, as an indexed store's shards hold their records:
+    which range holds an item (`locate`), where a range starts (`start`) and the items of them all.
+    A range of no items holds none, so an item is never located in one."""
+
+    counts: tuple[int, ...]
+
+    @cached_property
+    def ends(self) -> np.ndarray:
+        return np.cumsum(np.asarray(self.counts, np.int64), dtype=np.int64)
+
+    def __len__(self) -> int:
+        return int(self.ends[-1]) if self.counts else 0
+
+    def start(self, shard: int) -> int:
+        return int(self.ends[shard - 1]) if shard else 0
+
+    def locate(self, item: int) -> tuple[int, int]:
+        """The range that holds `item`, and its place in that range."""
+        if not 0 <= item < len(self):
+            raise IndexError(item)
+        shard = int(np.searchsorted(self.ends, item, side="right"))
+        return shard, item - self.start(shard)

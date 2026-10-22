@@ -2,9 +2,7 @@
 
 from __future__ import annotations
 
-import bisect
 import io
-import itertools
 import threading
 from collections import OrderedDict
 from collections.abc import Mapping, Sequence
@@ -14,9 +12,10 @@ from functools import cached_property
 import grain.python as grain
 
 from dew.data.dataset import Batch, Loading
-from dew.data.storage import Store
+from dew.data.storage import Store, local, on_gcs
 
 from .codec import decode
+from .index import Ranges
 
 _MAX_OPEN_SHARDS = Loading().threads
 
@@ -62,18 +61,17 @@ class ArrayRecords:
         self._lock = threading.Condition(threading.Lock())
 
     @cached_property
-    def ends(self) -> tuple[int, ...]:
-        return tuple(itertools.accumulate(self.counts or ()))
+    def ranges(self) -> Ranges:
+        return Ranges(self.counts or ())
 
     @cached_property
     def reader(self):
         paths = []
         for url in self.urls:
             fs, path = Store(url, self.storage_options).resolve()
-            protocols = (fs.protocol,) if isinstance(fs.protocol, str) else fs.protocol
-            if "file" in protocols:
+            if local(fs):
                 paths.append(path)
-            elif "gs" in protocols or "gcs" in protocols:
+            elif on_gcs(fs):
                 paths.append("gs://" + path)
             else:
                 fs, path = Store(url, self.storage_options).cached().resolve()
@@ -91,13 +89,13 @@ class ArrayRecords:
     def __len__(self) -> int:
         if not self.urls:
             return 0
-        return self.ends[-1] if self.counts is not None else len(self.reader)
+        return len(self.ranges) if self.counts is not None else len(self.reader)
 
     def __getitem__(self, index: int) -> Batch | bytes | None:
         if not 0 <= index < len(self):
             raise IndexError(index)
         if self.counts is not None:
-            shard = bisect.bisect_right(self.ends, index)
+            shard, row = self.ranges.locate(index)
             with self._lock:
                 while (
                     shard not in self._opened
@@ -122,7 +120,7 @@ class ArrayRecords:
                 opened_shard = self._opened[shard]
                 opened_shard.reads += 1
             try:
-                return opened_shard.reader[index - (self.ends[shard - 1] if shard else 0)]
+                return opened_shard.reader[row]
             finally:
                 with self._lock:
                     opened_shard.reads -= 1

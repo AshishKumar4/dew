@@ -357,6 +357,20 @@ def local(fs: AbstractFileSystem) -> bool:
     return isinstance(fs, LocalFileSystem)
 
 
+def on_gcs(fs: AbstractFileSystem) -> bool:
+    """Whether `fs` is Google Cloud Storage, which ArrayRecord's and Arrow's own readers open by URL."""
+    return bool({"gs", "gcs"}.intersection(_protocols(fs)))
+
+
+def in_memory(fs: AbstractFileSystem) -> bool:
+    """Whether `fs` is fsspec's in-process memory store: neither this host's disk nor the network."""
+    return "memory" in _protocols(fs)
+
+
+def _protocols(fs: AbstractFileSystem) -> tuple[str, ...]:
+    return (fs.protocol,) if isinstance(fs.protocol, str) else tuple(fs.protocol)
+
+
 @dataclass(frozen=True)
 class Versioned:
     data: bytes

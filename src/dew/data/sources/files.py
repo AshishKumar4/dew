@@ -30,11 +30,11 @@ from s3fs import S3FileSystem
 from dew.data.dataset import Batch, Records
 from dew.data.pipeline import Dataset
 from dew.data.steps.generic import Fields
-from dew.data.storage import Readable, Store, content_version, local
+from dew.data.storage import Readable, Store, content_version, in_memory, local, on_gcs
 from dew.records import integer, record
 
 from .base import Read, Shard, ShardManifest, preparing, url_label
-from .index import ArrayIndex
+from .index import ArrayIndex, Ranges
 
 type Format = Literal["jsonl", "text", "csv", "parquet", "arrow", "array_record", "files", "webdataset"]
 
@@ -71,8 +71,7 @@ def _arrow_filesystem(fs: AbstractFileSystem) -> pafs.FileSystem:
     carries every setting `fs` reads with (`_native_s3`, `_native_gcs`), as
     it reads Parquet row groups 1.4x (S3) to 2.1x (GCS) faster than Arrow
     over fsspec does; Arrow over `fs` itself otherwise, which keeps them all."""
-    protocols = (fs.protocol,) if isinstance(fs.protocol, str) else fs.protocol
-    if "file" in protocols:
+    if local(fs):
         return pafs.LocalFileSystem()
     if isinstance(fs, S3FileSystem) and _native_s3(fs):
         endpoint = urlsplit(fs.endpoint_url or fs.client_kwargs.get("endpoint_url") or "")
@@ -411,8 +410,8 @@ class Files(Dataset):
                 return True
             for url in self.paths:
                 fs, _ = Store(url, self.storage_options).resolve()
-                protocols = (fs.protocol,) if isinstance(fs.protocol, str) else fs.protocol
-                if not {"file", "gs", "gcs"}.intersection(protocols):
+                # ArrayRecord's own reader opens a local path or a GCS URL (`ArrayRecords.reader`).
+                if not (local(fs) or on_gcs(fs)):
                     return False
             return True
         if self.where is not None:
@@ -675,8 +674,7 @@ class Files(Dataset):
         remote = False
         for url in self.paths:
             fs, _ = Store(url, self.storage_options).resolve()
-            protocols = (fs.protocol,) if isinstance(fs.protocol, str) else fs.protocol
-            remote |= "file" not in protocols and "memory" not in protocols
+            remote |= not (local(fs) or in_memory(fs))
         if self.kind in ("parquet", "arrow") and self.where is None:
             return tuple(_fragment_rows(fragment) for fragment in self.fragments), remote
         if self.kind in ("jsonl", "text", "csv") and self.supports("indexed"):
@@ -826,7 +824,7 @@ class _ArrowFragment:
 class _ArrowRecords:
     def __init__(self, source: Files):
         self.source = source
-        self.offsets = np.cumsum([0, *(_fragment_rows(fragment) for fragment in source.fragments)])
+        self.ranges = Ranges(tuple(_fragment_rows(fragment) for fragment in source.fragments))
 
     @cached_property
     def _group(self):
@@ -840,13 +838,11 @@ class _ArrowRecords:
         return {key: value for key, value in self.__dict__.items() if key != "_group"}
 
     def __len__(self) -> int:
-        return int(self.offsets[-1])
+        return len(self.ranges)
 
     def __getitem__(self, index: int) -> Batch:
-        if not 0 <= index < len(self):
-            raise IndexError(index)
-        group = bisect.bisect_right(self.offsets, index) - 1
-        return self._group(group)[index - int(self.offsets[group])]
+        group, row = self.ranges.locate(index)
+        return self._group(group)[row]
 
 
 class _IndexedLines:
@@ -858,7 +854,7 @@ class _IndexedLines:
             ArrayIndex(url, source.storage_options, headers.get(url)) for url in self.indexes
         )
         self.tables = tuple(index.values for index in self.index_files)
-        self.offsets = np.cumsum([0, *(len(index) for index in self.tables)])
+        self.ranges = Ranges(tuple(len(index) for index in self.tables))
 
     def __getstate__(self) -> Mapping[str, object]:
         return {"source": self.source}
@@ -879,13 +875,11 @@ class _IndexedLines:
         return tuple(headers)
 
     def __len__(self) -> int:
-        return int(self.offsets[-1])
+        return len(self.ranges)
 
     def __getitem__(self, index: int) -> Batch:
-        if not 0 <= index < len(self):
-            raise IndexError(index)
-        group = bisect.bisect_right(self.offsets, index) - 1
-        entry = self.tables[group][index - int(self.offsets[group])]
+        group, row = self.ranges.locate(index)
+        entry = self.tables[group][row]
         shard = int(entry["shard"]) if self.source.index else group
         fs, path, _ = Store(self.source.paths[shard], self.source.storage_options).readable()
         names = self.fieldnames[shard] if self.source.kind == "csv" else None
