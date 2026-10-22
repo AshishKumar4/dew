@@ -1112,7 +1112,9 @@ def with_triton_gemms(flow) -> None:
     run = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=1200,
                          cwd=here, env={**os.environ, "XLA_FLAGS": " ".join(flags),
                                         "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
-                                        "PYTHONPATH": os.pathsep.join([str(here.parent / "src"), str(here)])})
+                                        # pytest's own path (pyproject's `pythonpath`) and this directory.
+                                        "PYTHONPATH": os.pathsep.join([str(here.parent / "src"), str(here.parent),
+                                                                       str(here)])})
     assert run.returncode == 0, run.stderr[-4000:]
 
 
