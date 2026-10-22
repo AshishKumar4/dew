@@ -29,8 +29,9 @@ from dew.objectives.rl.sessions import ROUTED_EXPERTS_KEY, ROUTED_KEY, Call, Ses
 from dew.training import Layout, MeshSpec
 
 VOCAB, SEQ_LEN, LAYERS, EXPERTS, TOP_K = 64, 16, 4, 8, 2
-SEEDS = {'gate': 8, 'banked': 8, 'pipeline': 8, 'conflicting prefix': 8, 'packed': 8}
-"""Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada)."""
+SEEDS = {'gate': 8, 'banked': 32, 'pipeline': 8, 'conflicting prefix': 128, 'packed': 64}
+"""Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada, 2026-10-22):
+the most any of a site's cases took."""
 
 
 def objective(scan: bool = False, dtype=None, layers: tuple[int, ...] | None = None,
