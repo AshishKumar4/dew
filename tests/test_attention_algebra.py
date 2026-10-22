@@ -380,7 +380,7 @@ def test_a_large_initial_maximum_gives_the_references_state_gradients():
 ], ids=["one ulp apart at 1.6e9", "a logit near fp32's largest"])
 def test_a_logit_the_reference_keeps_stays_finite_and_apart(keys, query_size, key_sizes, out):
     """fp32, one query of `query_size` over keys of `key_sizes`, the first's value 1 and the rest 0, scale 1
-    (past 1/log2(e), so the natural form, `Forward.base2`): the reference weighs the larger logit alone
+    the reference weighs the larger logit alone
     (out 1), keeping logits one ulp apart at 1.6e9 apart and a logit near fp32's largest finite. Both
     mainloops keep the logits natural, as the reference does, and give its output and finite gradients
     under an output cotangent of 1."""
