@@ -31,7 +31,6 @@ Run with Torch 2.14.0 CPU and NumPy:
 
 import argparse
 import importlib
-import math
 import sys
 import tempfile
 import urllib.request
@@ -69,17 +68,15 @@ def table_inputs(table: str, seed: int) -> dict[str, np.ndarray]:
     linear betas from a drawn first one in [5e-5, 2e-4] to a drawn last one in [0.01, 0.03], or
     improved-diffusion's cosine betas (clipped at 0.999) at a drawn offset in [0.004, 0.016] with the
     last beta one."""
+    from dew.diffusion.schedules.cosine import cosine_beta_schedule
+
     rng = np.random.default_rng([160, TABLES.index(table), seed])
     if table == "linear":
         return {"betas": np.linspace(rng.uniform(5e-5, 2e-4), rng.uniform(0.01, 0.03), STEPS)}
-    offset = rng.uniform(0.004, 0.016)
-
-    def alpha_bar(t):
-        return math.cos((t + offset) / (1 + offset) * math.pi / 2) ** 2
-
-    betas = [min(1 - alpha_bar((i + 1) / STEPS) / alpha_bar(i / STEPS), 0.999) for i in range(STEPS)]
+    # improved-diffusion's arithmetic to the bit (`cosine_beta_schedule`), at the drawn offset.
+    betas = cosine_beta_schedule(STEPS, start_angle=rng.uniform(0.004, 0.016))
     betas[-1] = 1.0
-    return {"betas": np.asarray(betas, np.float64)}
+    return {"betas": betas}
 
 
 def closed_form(name: str, mean: str, options: dict, inputs: dict, dtype) -> dict:
