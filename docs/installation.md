@@ -46,25 +46,7 @@ UV_SYSTEM_CERTS=true uv self update
 ```
 <!-- END pip -->
 
-Without the index the install stops before it installs anything, at resolving jax, since PyPI has no JAX build Dew accepts. uv says:
-
-```
-  × No solution found when resolving dependencies:
-  ╰─▶ Because only the following versions of jax are available:
-          jax<0.11.2.post6
-          jax>0.11.3
-      and dewml==0.1.0 depends on jax>=0.11.2.post6,<0.11.3, we can conclude
-      that dewml==0.1.0 cannot be used.
-```
-
-and pip:
-
-```
-ERROR: Could not find a version that satisfies the requirement jax<0.11.3,>=0.11.2.post6 (from dewml) (from versions: ...)
-ERROR: No matching distribution found for jax<0.11.3,>=0.11.2.post6
-```
-
-Add `--extra-index-url https://pypi.dewml.dev/simple` and run it again.
+Without the index the install stops before it installs anything, at resolving jax, since PyPI has no JAX build Dew accepts ([Dew's JAX build](#dews-jax-build)): uv reports `No solution found when resolving dependencies` and names dewml's jax requirement, and pip reports `No matching distribution found for jax`. Add `--extra-index-url https://pypi.dewml.dev/simple` and run it again.
 
 [Which CUDA build](#which-cuda-build) explains the choice between the two. With uv, make an environment first:
 
@@ -114,7 +96,11 @@ A run applies it too: on a machine with an NVIDIA GPU, `prepare_process`, or the
 
 ### Dew's JAX build
 
-Dew requires `jax>=0.11.2.post6,<0.11.3`: JAX 0.11.2 with fixes no JAX release has yet, built from [AshishKumar4/jax](https://github.com/AshishKumar4/jax) and served by Dew's package index, `https://pypi.dewml.dev/simple`, which serves jax alone. Every other package, jaxlib and its CUDA plugins included, comes from PyPI. The fixes:
+<!-- BEGIN JAX requirement (site/scripts/gen_install.py) -->
+Dew requires `jax>=0.11.2.post11,<0.11.3`.
+<!-- END JAX requirement -->
+
+It is JAX 0.11.2 with fixes no JAX release has yet, built from [AshishKumar4/jax](https://github.com/AshishKumar4/jax) and served by Dew's package index, `https://pypi.dewml.dev/simple`, which serves jax alone. Every other package, jaxlib and its CUDA plugins included, comes from PyPI. The fixes:
 
 - A computation that spans processes keys the persistent compilation cache alike on every process ([jax-ml/jax#40940](https://github.com/jax-ml/jax/issues/40940), sent as [jax-ml/jax#41776](https://github.com/jax-ml/jax/pull/41776)). The 0.11.2 release keys a compiled step by the topology of the process that compiled it, which on a GPU includes its NVLink links, so in a pool across GPUs linked differently some processes load a step from the cache while the others compile it, and that compile waits forever for every process to join.
 - A Pallas Triton kernel's cache key leaves out its source locations ([jax-ml/jax#41502](https://github.com/jax-ml/jax/issues/41502), sent as [jax-ml/jax#41777](https://github.com/jax-ml/jax/pull/41777)), so two checkouts share one compiled kernel.
@@ -126,8 +112,11 @@ Each fix goes from the build once a JAX release has it, and Dew then returns to 
 
 The plain install includes Transformers, the Hugging Face Hub client and the image libraries. These extras add more:
 
+<!-- BEGIN extras (site/scripts/gen_install.py checks them against pyproject.toml) -->
 | Extra | Adds |
 |---|---|
+| `cuda12`, `cuda13` | JAX's CUDA build and Dew's FlashAttention wheel for that CUDA major ([Which CUDA build](#which-cuda-build)) |
+| `tpu` | libtpu, for [Cloud TPUs](tpu.md) |
 | `interop` | safetensors reading and writing |
 | `torch` | PyTorch on the host, to read `pytorch_model.bin` files and to check unregistered decoders against Transformers |
 | `diffusers` | Loading original-format single-file diffusion checkpoints (`Pretrained.load(..., single_file=)`) |
@@ -136,19 +125,28 @@ The plain install includes Transformers, the Hugging Face Hub client and the ima
 | `torchax` | `Pretrained.load(fallback="torchax")`, which runs a Transformers PyTorch model lowered to JAX |
 | `guided` | Regex and JSON-schema guided decoding (`dew.sampling.guided`) |
 | `streaming` | Hugging Face `datasets` and online sources |
+| `delta` | deltalake, to read Delta tables |
 | `tfds` | Reading prepared TFDS ArrayRecords without TensorFlow |
 | `av` | Video readers (moviepy, with ffmpeg) |
 | `vision` | Hugging Face image processors, run with torchvision on the host |
-| `metrics` | SciPy and downloads for image metrics |
+| `augment` | Albumentations pipelines as a seeded random step (`dew.data.images.Albumentations`) |
+| `metrics` | requests, which downloads FID's Inception weights |
 | `wandb`, `mlflow`, `tensorboard` | Experiment trackers |
 | `inference-clients` | The Ollama and OpenAI Python clients, including vLLM-compatible endpoints |
 | `serve` | Starlette and uvicorn, for serving a decision model in Jev's wire format (`examples/serve_decisions.py`) |
+| `environments` | Agent environments and remote sandboxes for rollouts: OpenEnv and the Modal, E2B and Daytona SDKs |
 | `hpo` | Optuna, for `dew.config.sweep` |
 | `eval-harness` | lm-evaluation-harness tasks through `dew.eval.harness.DewLM` |
 | `profile` | The xprof profiler |
 | `quantization` | Qwix, for quantized training and serving (`dew.quantization`) |
 | `test` | The test suite's dependencies and pinned reference libraries |
 | `ci` | The test suite's whole environment: `test` and every extra a test file imports |
+| `kernel-compile` | JAX's CUDA plugin, CUDA's compiler and libtpu, to compile every kernel config on a host with no accelerator |
+| `mutation` | cosmic-ray, for mutation testing (`tools/mutation.py`) |
+| `notebooks` | nbclient, nbformat and an IPython kernel, to execute notebooks |
+| `tutorials` | The tutorial notebooks' environment outside Colab: `streaming`, `interop`, `notebooks` and matplotlib |
+| `live` | The live site container's bridge: its WebSocket release, the kernel gateway, an IPython kernel and ipywidgets |
+<!-- END extras -->
 
 ```bash
 uv pip install 'dewml[interop,streaming] @ git+https://github.com/AshishKumar4/dew' --extra-index-url https://pypi.dewml.dev/simple

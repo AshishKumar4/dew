@@ -1,9 +1,10 @@
 """Generate the install facts other files repeat from their owners: the CUDA builds' minima
 (dew.telemetry.builds.CUDA_BUILDS), Dew's package index (dew.telemetry.builds.PACKAGE_INDEX),
-Dew's least Python (pyproject.toml's requires-python) and the pip every pip install takes first
-(tools/pip.txt), into the standalone installer, constraints.txt, the Colab notebooks' install, the site's
-scripts that install Dew (site/package.json), docs/installation.md's table, and the least Python and
-the pip the README and docs/installation.md state."""
+Dew's least Python (pyproject.toml's requires-python), the JAX it requires (its dependencies) and the pip
+every pip install takes first (tools/pip.txt), into the standalone installer, constraints.txt, the Colab
+notebooks' install, the site's scripts that install Dew (site/package.json), docs/installation.md's table
+and JAX requirement, and the least Python and the pip the README and docs/installation.md state; and holds
+docs/installation.md's extras table to the extras pyproject.toml declares."""
 
 import argparse
 import ast
@@ -19,6 +20,9 @@ LEAST = ("<!-- BEGIN least Python (site/scripts/gen_install.py) -->", "<!-- END 
 CONSTRAINT = ("# BEGIN package index (site/scripts/gen_install.py)", "# END package index")
 COLAB = ("// BEGIN package index (site/scripts/gen_install.py)", "// END package index")
 PIP = ("<!-- BEGIN pip (site/scripts/gen_install.py) -->", "<!-- END pip -->")
+JAX = ("<!-- BEGIN JAX requirement (site/scripts/gen_install.py) -->", "<!-- END JAX requirement -->")
+EXTRAS = ("<!-- BEGIN extras (site/scripts/gen_install.py checks them against pyproject.toml) -->",
+          "<!-- END extras -->")
 
 
 def facts() -> tuple[list[tuple[str, int, tuple[int, int]]], str, str]:
@@ -37,6 +41,13 @@ def facts() -> tuple[list[tuple[str, int, tuple[int, int]]], str, str]:
     if least is None:
         raise SystemExit(f"gen_install reads a requires-python of the form >=X.Y, not {required!r}")
     return builds, index, least[1]
+
+
+def documented_extras(text: str) -> set[str]:
+    """The extras docs/installation.md's table names: each backquoted name in a row's first cell, between
+    the `EXTRAS` markers. The table's descriptions are the page's own; its names are pyproject.toml's."""
+    rows = text.split(EXTRAS[0] + "\n")[1].split(EXTRAS[1])[0].splitlines()[2:]
+    return {name for row in rows for name in re.findall(r"`([^`]+)`", row.split("|")[1])}
 
 
 def between(text: str, markers: tuple[str, str], lines: list[str]) -> str:
@@ -71,8 +82,17 @@ def main() -> None:
     parser.add_argument("--check", action="store_true", help="Check the generated blocks without writing them.")
     args = parser.parse_args()
     builds, index, python = facts()
+    project = tomllib.loads((REPO / "pyproject.toml").read_text())["project"]
     pip = next(line for line in (REPO / "tools/pip.txt").read_text().splitlines()
                if line and not line.startswith("#"))
+    pip_version = re.search(r"/pip-([\d.]+)-", pip)[1]
+    jax = next(requirement for requirement in project["dependencies"] if re.match(r"jax\b", requirement))
+    page = (REPO / "docs/installation.md").read_text()
+    extras = set(project["optional-dependencies"])
+    if documented_extras(page) != extras:
+        raise SystemExit(f"gen_install: docs/installation.md's extras table lacks "
+                         f"{sorted(extras - documented_extras(page))} and names "
+                         f"{sorted(documented_extras(page) - extras)}, which pyproject.toml does not declare")
     shell = [f"python_min={python}", f"package_index={index}", f"pip_least='{pip}'"]
     table = ["| Build | CUDA | NVIDIA driver | GPU (SM) |", "|---|---|---|---|"]
     for build, driver, (major, minor), cuda in builds:
@@ -80,8 +100,8 @@ def main() -> None:
         table.append(f"| `{build}` | {cuda // 1000}.{cuda % 1000 // 10} or later | {driver} or later, or an older "
                      f"one under NVIDIA's cuda-compat | {major}.{minor} or later |")
     least = [f"Dew needs Python {python} or newer."]
-    advice = ["Use pip 26.2.2 or newer and uv 0.13.4 or newer: older ones trust the roots of eMudhra's "
-              "compromised certificate authorities (October 2026). Update pip from its wheel by hash, so "
+    advice = [f"Use pip {pip_version} or newer and uv 0.13.4 or newer: older ones trust the roots of "
+              "eMudhra's compromised certificate authorities (October 2026). Update pip from its wheel by hash, so "
               "the update holds whatever the older pip trusts, and uv through the system's certificates "
               "once they are updated:", "",
               "```bash", f'python -m pip install "{pip}"', "UV_SYSTEM_CERTS=true uv self update", "```"]
@@ -91,7 +111,8 @@ def main() -> None:
                          (REPO / "site/scripts/colab-notebooks.mjs",
                           ((COLAB, [f"const PACKAGE_INDEX = '{index}';"]),)),
                          (REPO / "site/package.json", ()),
-                         (REPO / "docs/installation.md", ((TABLE, table), (LEAST, least), (PIP, advice))),
+                         (REPO / "docs/installation.md", ((TABLE, table), (LEAST, least), (PIP, advice),
+                                                           (JAX, [f"Dew requires `{jax}`."]))),
                          (REPO / "README.md", ((LEAST, least), (PIP, advice)))):
         original = generated = path.read_text()
         for markers, lines in blocks:
