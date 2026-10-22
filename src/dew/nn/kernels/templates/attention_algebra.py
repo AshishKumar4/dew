@@ -69,6 +69,12 @@ class Forward:
         """The exponential the logits are in: exp2 folded, `natural_exp` natural."""
         return jnp.exp2(x) if self.base2 else natural_exp(x)
 
+    def carry(self, x: jax.Array) -> jax.Array:
+        """The factor a softmax state takes from one maximum to another `x` below it: exp2 folded, and
+        natural, `jnp.exp`, the reference's own, whose state (a resumed partial, a sink) may be any size, so
+        `natural_exp`'s extra rounding of `x * log2(e)`, about `|x|` ulps, would reach it."""
+        return jnp.exp2(x) if self.base2 else jnp.exp(x)
+
 
 def expand(x: jax.Array, like: jax.Array) -> jax.Array:
     """A per-row `x` (each query's, `[..., bq]`) broadcast over `like`'s trailing axis, as `x[..., None]`
@@ -161,7 +167,7 @@ def peak(spec: Forward, m: jax.Array, s: jax.Array) -> tuple[jax.Array, jax.Arra
     """The running maximum after a tile's logits `s`, and `alpha`, the factor the state before it
     takes to the new maximum."""
     new = jnp.maximum(m, s.max(axis=-1))
-    return new, spec.power(m - _safe(spec, new))
+    return new, spec.carry(m - _safe(spec, new))
 
 
 def weights(spec: Forward, s: jax.Array, m: jax.Array) -> jax.Array:
@@ -240,7 +246,7 @@ def merge(spec: Forward, first: Partial, second: Partial) -> Partial:
     keys), so `empty` is its identity under every spec."""
     m = jnp.maximum(first.m, second.m)
     safe = jnp.where(m == -jnp.inf, 0.0, m)
-    a, b = spec.power(first.m - safe), spec.power(second.m - safe)
+    a, b = spec.carry(first.m - safe), spec.carry(second.m - safe)
     acc = expand(a, first.acc) * first.acc + expand(b, second.acc) * second.acc
     return Partial(acc, m, a * first.total + b * second.total)
 
