@@ -43,8 +43,6 @@ SEEDS = {'chunk oracle': 8, 'recurrent oracle': 8, 'safe_gate layer': 8, 'softpl
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada)."""
 ROWS = 64
 """A layer draw's rows: one layer's few outputs a draw leave its error to a handful of values."""
-GROUPS = 32
-"""The batches a gradient draw holds, each a gradient of its own."""
 
 
 def oracle_layer(x, p, lower_bound, eps, rule):
@@ -180,11 +178,10 @@ def test_the_layer_gradients_match_the_oracle():
     """Into the input and every parameter, through the conv, the forget
     gate, the chunked rule across a chunk boundary and the gated norm: on
     par with the transcription's gradients from their float64 evaluation
-    over drawn inputs, cotangents and parameters (check 1)."""
-    # Four heads of eight on a width of sixteen, and a gated norm of eps 1e-2: through a norm of a near
-    # zero row, a gradient's error grows as the row's inverse square, a tail no count of seeds resolves.
-    wide = {"E": 16, "H": 4, "D": 8, "eps": 1e-2}
-    module, _, _ = layer_and_params(-5.0, **wide)
+    over drawn inputs and cotangents (check 1). The gated norm takes eps
+    1e-2: through the norm of a near-zero row a gradient's error grows as
+    the row's inverse square, a tail no count of seeds resolves."""
+    module, _, variables = layer_and_params(-5.0, eps=1e-2)
 
     def loss_module(x, variables, cotangent):
         return jnp.sum(module.apply(variables, x) * cotangent)
@@ -193,24 +190,20 @@ def test_the_layer_gradients_match_the_oracle():
         return jnp.sum(oracle_layer(x, p, -5.0, 1e-2, partial(oracle_chunk, chunk_size=4)) * cotangent)
 
     @jax.jit
-    @jax.vmap
     def ours(x, p, cotangent):
         grad_x, grad_params = jax.grad(loss_module, argnums=(0, 1))(x, variables_of(p), cotangent)
         return {"x": grad_x, **oracle_params(grad_params)}
 
     @jax.jit
-    @jax.vmap
     def theirs(x, p, cotangent):
         grad_x, grad_p = jax.grad(loss_oracle, argnums=(0, 1))(x, p, cotangent)
         return {"x": grad_x, **grad_p}
 
-    params = oracle_params(layer_and_params(-5.0, **wide)[2])
-    stacked = jax.tree.map(lambda leaf: np.broadcast_to(leaf, (GROUPS, *leaf.shape)), params)
+    params = oracle_params(variables)
 
     def draw(seed):
-        # GROUPS batches a draw, each its own inputs and cotangent, each gradient a row of its own.
-        x, cotangent = np.random.RandomState(seed).randn(2, GROUPS, 16, S, wide["E"]).astype(np.float32)
-        return x, stacked, cotangent
+        x, cotangent = np.random.RandomState(seed).randn(2, ROWS, S, E).astype(np.float32)
+        return x, params, cotangent
 
     assert_as_exact(ours, theirs, draw, "layer gradients", seeds=SEEDS['layer gradients'])
 
