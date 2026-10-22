@@ -161,13 +161,16 @@ def mosaic_dumps(directory: str):
 def mosaic_kernels(directory: str) -> list[dict]:
     """Each Mosaic GPU kernel's report in `directory`: its shared bytes and tensor memory columns (Mosaic's
     resource estimate), its registers a thread and its spilled bytes (ptxas's), or `unread`, what a
-    report lacks: a resource estimate without its ptxas log, or a field neither states, is no
-    evidence the kernel is within its resources."""
+    report lacks: either report without the other, or a field neither states, is no evidence the kernel
+    is within its resources."""
     kernels = []
-    for resources in sorted(Path(directory).glob("*.resources.txt")):
-        name = resources.name.removesuffix(".resources.txt")
-        ptxas = resources.with_name(name + ".ptxas")
-        text, log = resources.read_text(), ptxas.read_text() if ptxas.exists() else ""
+    reports = Path(directory)
+    names = {path.name.removesuffix(".resources.txt") for path in reports.glob("*.resources.txt")}
+    names |= {path.name.removesuffix(".ptxas") for path in reports.glob("*.ptxas")}
+    for name in sorted(names):
+        resources, ptxas = reports / f"{name}.resources.txt", reports / f"{name}.ptxas"
+        text = resources.read_text() if resources.exists() else ""
+        log = ptxas.read_text() if ptxas.exists() else ""
         shared, tmem = SMEM.search(text), TMEM_USED.search(text)
         registers, spills = REGISTERS.findall(log), SPILLS.findall(log)
         unread = [field for field, found in (("shared bytes", shared), ("tensor memory columns", tmem),
@@ -197,14 +200,15 @@ def compile_mosaic_kernels(cases, generation: str) -> list[dict]:
 
 
 def mosaic_failures(found: list[dict]) -> list[str]:
-    """Each Mosaic GPU record's failure: its error, no kernel compiled, a kernel whose report lacks a
-    field (`mosaic_kernels`), or a kernel past its multiprocessor's shared memory or tensor memory, or
+    """Each Mosaic GPU record's failure: the program's own (`failures`: its error, or XLA's refusal of a
+    block past shared memory), no Mosaic kernel compiled, a kernel whose reports lack a field
+    (`mosaic_kernels`), or a kernel past its multiprocessor's shared memory or tensor memory, or
     spilling registers."""
-    failed = []
+    failed = failures(found)
     for record in found:
-        if "error" in record:
-            failed.append(f"{record['name']}: {record['error']}")
-        elif not record["kernels"]:
+        if "error" in record or not record["shared"] <= record["limit"]:
+            continue
+        if not record["kernels"]:
             failed.append(f"{record['name']}: no Mosaic GPU kernel compiled")
         for kernel in record.get("kernels", ()):
             where = f"{record['name']} {kernel['kernel']}"
