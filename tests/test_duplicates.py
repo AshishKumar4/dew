@@ -146,6 +146,13 @@ def test_each_reading_alone_fails_its_own_copies_and_passes_the_others(tmp_path)
     assert gate(functions, "--reading=text").returncode == 0
 
 
+def test_a_tree_without_a_python_file_passes_both_readings(tmp_path):
+    """The script reads its files in forked processes (tools/forked.py), which an empty tree gives none."""
+    empty = tree(tmp_path, "empty", {})
+    assert gate(empty, "--reading=text").returncode == 0
+    assert gate(empty).returncode == 0
+
+
 def test_no_pragma_holds_a_text_copy(tmp_path):
     """The text reading reads no `pylint: disable=duplicate-code`: a copy is fixed, never silenced."""
     settings = "".join(f"{name} = {value}\n" for value, name in enumerate(
