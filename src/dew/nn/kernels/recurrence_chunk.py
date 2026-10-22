@@ -368,6 +368,14 @@ def fla_rule(query, key, value, g, beta, state=None, *, starts=None, max_segment
     each document and the row's padding; the memories they keep are not
     (`chunked_launch.Sequences`).
 
+    A known defect (ledger row 1328): fla's arithmetic, which the port is,
+    holds the recurrence less exactly than the portable math under saturated
+    write gates (5.8 to 6.1 times the token-by-token reference's error from
+    float64), aligned keys (5.4 under a decay a key dimension, 1.8 gated),
+    documents resetting on chunk edges (1.6) and every token at the decay's
+    bound (tests/test_recurrence_stability.py, `PORT_DEFECTS`); the
+    template's mainloop on the compensated algebra replaces it.
+
     The operands go to their common dtype, beta with them, as fla's layer
     holds them. On a mesh the rule runs per shard (`manual_map`): rows where
     the rules split them, and value heads with the key heads they read where
