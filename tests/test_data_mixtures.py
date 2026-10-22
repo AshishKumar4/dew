@@ -1045,11 +1045,12 @@ def test_a_ramp_stage_begins_where_an_update_does_and_an_update_pools_one_stage(
 def test_a_configured_run_counts_its_ramped_epochs_in_stages_aligned_to_its_updates():
     """A config's run length and its epoch intervals count a ramp's steps as the trainer's stream cuts
     them, each stage beginning where an update of its accumulation does: an epoch of 64 records ramped
-    from 8 to 16 is five steps read one at a time and six read two to an update."""
+    from 8 to 16 is six steps read one at a time, three of 8 and three of 16, the last leading into
+    the next epoch, and six read two to an update, four of 8 and two of 16."""
     from dew.config import TrainerConfig
 
     data = ramped(indexed_data(64, 16), Ramp(start=8, increment=8, samples=24))
-    assert TrainerConfig(epochs=1).total_steps(data) == 5
+    assert TrainerConfig(epochs=1).total_steps(data) == 6
     config = TrainerConfig(epochs=1, accumulation=2)
     assert config.total_steps(data) == config.eval_interval(data) == config.checkpoint_interval(data) == 6
     with pytest.raises(ValueError):
