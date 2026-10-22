@@ -38,8 +38,8 @@ from tools.kda_reference import (
 )
 
 B, S, H, D, E, K = 2, 7, 2, 4, 8, 4  # batch, tokens, heads, head dim, model width, conv kernel
-SEEDS = {'chunk oracle': 8, 'recurrent oracle': 8, 'safe_gate layer': 8, 'softplus layer': 8,
-         'layer gradients': 8, 'decode': 8, 'padded rows': 8}
+SEEDS = {'chunk oracle': 64, 'recurrent oracle': 64, 'safe_gate layer': 32, 'softplus layer': 8,
+         'layer gradients': 8, 'decode': 32, 'padded rows': 64}
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada)."""
 ROWS = 64
 """A layer draw's rows: one layer's few outputs a draw leave its error to a handful of values."""
