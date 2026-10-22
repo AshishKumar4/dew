@@ -56,6 +56,7 @@ The kernel direction (owner, 2026-10-21; [design](design/kernel-templates.md)): 
 7. Record compile time beside execution time, keep programs bounded in depth and remove measured split-KV compiler growth, and show the serving barrier that bounds nGPT's depth leaves its training step unchanged. The persistent compilation cache is on by default, with an opt-out. [635, 641, 829]
 
 - At each jax bump, check for openxla/xla#49498 (deterministic GPU scatter); then write the paged pool unmapped and drop linear.py's padded-row gather. [951]
+- After the templates land, take them past one kernel per operation: a persistent megakernel that schedules the templates' tile functions as instructions across a whole layer or decode step, so no launch gap or bubble separates operations and memory-bound work overlaps compute-bound work on the same SMs (Hazy Research's megakernels, Mirage's persistent kernel, Flapping Airplanes' framework). First a decode step for one model family on H100, measured against vLLM; then rollout inference overlapped with training for RL. It builds on the templates' algebra and toolkit, not beside them.
 - Close the grouped GEMM's gap to CUTLASS on Hopper through the GEMM template's cooperative mainloop. [153]
 - Improve one-row decode: M=1 products, repeated output-weight layout conversion and launch overhead. [483]
 - Measure pairwise KDA decay gradients under the same accuracy and performance gates before changing their reduction. [551]
