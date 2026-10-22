@@ -538,6 +538,40 @@ def test_the_fused_epilogue_keeps_the_programs_value(generation_name, consumer):
                         seeds=SEEDS, truth_fn=truth)
 
 
+def rms_norm(x, weight, epsilon=1e-6):
+    """An RMS norm of the residual stream as a model writes it: fp32 statistics, one rounding."""
+    wide = x.astype(jnp.float32)
+    mean_square = jnp.mean(wide * wide, axis=-1, keepdims=True)
+    return (wide * jax.lax.rsqrt(mean_square + epsilon) * weight).astype(x.dtype)
+
+
+@pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))
+def test_a_normed_operand_runs_in_the_prologue_with_the_programs_value(generation_name):
+    """Under `fuser.fuse`, an RMS norm producing the product's left operand runs in the kernels' prologue
+    on each loaded tile, its row statistic in XLA before the product (the route says so), with the
+    unfused program's value: as exact as it, from float64."""
+    sizes = jnp.asarray(SIZES)
+
+    def draw(seed):
+        x, w, _, nw, *_ = _draw(seed)
+        return x, w, nw
+
+    def fusing(x, w, weight):
+        return fused.fusible_gemm(rms_norm(x, weight), w, sizes, interpret_on_cpu=True).astype(jnp.bfloat16)
+
+    def unfused(x, w, weight):
+        return template.gemm(rms_norm(x, weight), w, sizes, out_dtype=jnp.bfloat16)
+
+    def truth(x, w, weight):
+        matrix = w.astype(jnp.bfloat16).astype(x.dtype)
+        return jax.lax.ragged_dot(rms_norm(x, weight), matrix, sizes, preferred_element_type=x.dtype)
+
+    with generation.assumed(generation_name), generation.routes() as taken:
+        assert_as_exact(jax.jit(fuser.fuse(fusing)), jax.jit(unfused), draw, "normed operand", seeds=SEEDS,
+                        truth_fn=truth)
+    assert {route.kernel for route in taken if route.choice == 'gemm_prologue'} == {'fused'}
+
+
 @pytest.mark.parametrize(("consumer", "kernel", "code"), [(bias_cast, 'fused', None),
                                                           (positional, 'xla', 'reads_position')],
                          ids=("tiled", "positional"))

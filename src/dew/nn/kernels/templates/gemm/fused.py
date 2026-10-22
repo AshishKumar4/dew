@@ -1,5 +1,5 @@
 """The grouped GEMM template under `jax.experimental.pallas.fuser`: a call site's consumers of the
-product become the template's epilogue.
+product become the template's epilogue, and its left operand's producer the template's prologue.
 
 Inside a function `fuser.fuse` transforms, `fusible_gemm(lhs, rhs, group_sizes)` is `template.gemm`'s
 fp32 product, and whatever the function computes from it elementwise or by broadcasting (a bias, a scale,
@@ -18,6 +18,14 @@ cannot take tile by tile (one that reads the tile's position, a captured array t
 axis, scalar prefetch) runs in XLA after the template's product, the value the same, and the call reports
 it (`generation.route`'s 'gemm_epilogue', XLA's with the refusal's reason), so a model that loses its
 fusion shows where it does.
+
+The left operand's producer, where it is one (an RMS or layer norm of the residual stream), is split in
+two: what it computes of each whole row or each depth position alone (a row's mean square and its inverse
+root, a norm's weight) runs in XLA before the product, a row or a depth vector each; what it computes of
+each element of the operand (the scaling of the loaded tile by them) runs in the kernel's prologue on each
+loaded tile, so the normalized operand never reaches global memory. A producer the kernels cannot take tile
+by tile, or whose operand changes its base's dtype, runs in XLA before the product, reported as the
+epilogue's is ('gemm_prologue').
 """
 
 import functools
@@ -26,6 +34,7 @@ import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 from jax.experimental.pallas import fuser
+from jax.extend import core as jax_core
 
 from dew.nn.kernels import generation
 from dew.nn.kernels.templates.gemm import template
@@ -47,11 +56,13 @@ def _product(transpose_rhs: bool, interpret_on_cpu: bool, dense: bool, *fusions)
     """The fusible product: its operands from their fusions, its consumers (`fusions`' last) as the
     template's epilogue where the kernels take them tile by tile, after its product in XLA otherwise."""
     *operand_fusions, out_fusion = fusions
-    lhs, rhs, *rest = (fusion() for fusion in operand_fusions)
+    lhs_fusion, *rest_fusions = operand_fusions
+    lhs, prologue = _prologue(lhs_fusion)
+    rhs, *rest = (fusion() for fusion in rest_fusions)
     group_sizes = None if dense else rest[0]
     if out_fusion is None:
         return template.gemm(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs, out_dtype=jnp.float32,
-                             interpret_on_cpu=interpret_on_cpu)
+                             interpret_on_cpu=interpret_on_cpu, **prologue)
     width = rhs.shape[-2] if transpose_rhs else rhs.shape[-1]
     acc = jax.ShapeDtypeStruct((lhs.shape[0], width), jnp.float32)
     consumer, values, prefetch = fuser.get_fusion_values(out_fusion, acc)
@@ -61,7 +72,7 @@ def _product(transpose_rhs: bool, interpret_on_cpu: bool, dense: bool, *fusions)
     if isinstance(axes, generation.Refusal):
         generation.route('gemm_epilogue', kernel='xla', preferred='fused', refusal=axes)
         summed = template.gemm(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs, out_dtype=jnp.float32,
-                               interpret_on_cpu=interpret_on_cpu)
+                               interpret_on_cpu=interpret_on_cpu, **prologue)
         return consumer(values, summed)
     generation.route('gemm_epilogue', kernel='fused')
     out_leaves, out_treedef = jax.tree.flatten(jax.eval_shape(consumer, values, acc))
@@ -71,8 +82,139 @@ def _product(transpose_rhs: bool, interpret_on_cpu: bool, dense: bool, *fusions)
     several = len(dtypes) > 1
     consumed = template.gemm(lhs, rhs, group_sizes, transpose_rhs=transpose_rhs, epilogue=epilogue,
                              epilogue_operands=tuple(zip(leaves, axes, strict=True)), out_dtype=dtypes[0],
-                             out_dtypes=dtypes if several else None, interpret_on_cpu=interpret_on_cpu)
+                             out_dtypes=dtypes if several else None, interpret_on_cpu=interpret_on_cpu,
+                             **prologue)
     return jax.tree.unflatten(out_treedef, consumed if several else (consumed,))
+
+
+PROLOGUE_AXES = ('rows', 'depth')
+"""The prologue's launch axes, in a tile's order."""
+
+
+def _prologue(fusion) -> tuple[jax.Array, dict]:
+    """The left operand's base array and the template's prologue arguments that give the operand from it
+    (the module's docstring), or the operand itself and none where the kernels cannot take its producer,
+    each reported ('gemm_prologue')."""
+    producer, values, prefetch = fuser.get_fusion_values(fusion)
+    split = (generation.Refusal('scalar_prefetch', "the producer reads scalar prefetch") if prefetch
+             else _split(producer, values))
+    if isinstance(split, generation.Refusal):
+        if split.code != 'no_producer':
+            generation.route('gemm_prologue', kernel='xla', preferred='fused', refusal=split)
+        return fusion(), {}
+    generation.route('gemm_prologue', kernel='fused')
+    base, function, sides, axes = split
+    return base, {'prologue': function, 'prologue_operands': tuple(zip(sides, axes, strict=True))}
+
+
+def _split(producer, values):
+    """`producer(values)`'s kernel stage and what it reads (`_prologue`): the base array, the prologue on its
+    tile and the side arrays' tiles, the side arrays and the launch axes each follows; the refusal where
+    the kernels cannot take it."""
+    leaves, treedef = jax.tree.flatten(values)
+    closed = jax.make_jaxpr(lambda *leaves: producer(jax.tree.unflatten(treedef, list(leaves))))(*leaves)
+    jaxpr = closed.jaxpr
+    [out] = jaxpr.outvars
+    shape = tuple(getattr(out.aval, 'shape', ()))
+    if len(shape) != 2 or not isinstance(out, jax_core.Var) or not jaxpr.eqns:
+        return generation.Refusal('no_producer', "the operand is an array as given")
+    stage, inputs = _tile_stage(jaxpr, out, shape)
+    full = [var for var in inputs if tuple(var.aval.shape) == shape]
+    if not full:
+        return generation.Refusal('no_base', "the operand's every element is computed, none loaded")
+    base = full[0]
+    if base.aval.dtype != out.aval.dtype:
+        return generation.Refusal('dtype_changes', f"the producer turns its {base.aval.dtype} base into "
+                                                   f"{out.aval.dtype}, which the kernels would multiply in")
+    sides = [var for var in inputs if var is not base]
+    # What the stage reads, each computed whole in XLA (the operand itself, unread, is left out there).
+    arrays = jax_core.jaxpr_as_fun(jax_core.ClosedJaxpr(jaxpr.replace(outvars=[base, *sides]),
+                                                        closed.consts))(*leaves)
+    whole = functools.partial(_staged, jax_core.ClosedJaxpr(
+        jax_core.Jaxpr(jaxpr.constvars, [base, *sides], [out], stage), closed.consts))
+    axes = _prologue_axes(whole, arrays, shape)
+    if isinstance(axes, generation.Refusal):
+        return axes
+    squeezed = [array.reshape(tuple(size for size, axis in zip(array.shape, side_axes, strict=True)
+                                    if axis is not None))
+                for array, side_axes in zip(arrays[1:], axes, strict=True)]
+    named = tuple(tuple(axis for axis in side_axes if axis is not None) for side_axes in axes)
+    function = functools.partial(_prologue_tile, whole, tuple(jax.typeof(array) for array in arrays), axes)
+    return arrays[0], function, squeezed, named
+
+
+def _staged(closed, *arrays):
+    """The producer's kernel stage evaluated on whole arrays or on tiles (under `pull_block_spec`)."""
+    return jax_core.jaxpr_as_fun(closed)(*arrays)[0]
+
+
+def _tile_stage(jaxpr, out, shape: tuple) -> tuple[list, list]:
+    """The equations computing `out` element by element, backward from it until a variable is not of its
+    `shape` (a row's or a depth's value, which XLA computes whole) or is an input; and the stage's inputs,
+    the producer's constants aside."""
+    producers = {var: eqn for eqn in jaxpr.eqns for var in eqn.outvars}
+    constants = set(jaxpr.constvars)
+    stage, inputs, seen = [], [], set()
+
+    def visit(var):
+        if not isinstance(var, jax_core.Var) or var in seen or var in constants:
+            return
+        seen.add(var)
+        eqn = producers.get(var)
+        if eqn is None or tuple(var.aval.shape) != shape:
+            inputs.append(var)
+            return
+        for operand in eqn.invars:
+            visit(operand)
+        if eqn not in stage:
+            stage.append(eqn)
+
+    visit(out)
+    return stage, inputs
+
+
+def _prologue_axes(whole, arrays: list, shape: tuple) -> tuple | generation.Refusal:
+    """The launch axes each side array follows, one per dimension (None for a dimension of one the tile
+    broadcasts), from its block spec at a probe tile of the operand; the refusal where one follows none,
+    or the producer reads its base at other than the tile or its tile's position."""
+    probe = (_probe(shape[0]), _probe(shape[1]))
+    spec = pl.BlockSpec(probe, lambda row, depth: (row, depth))
+    tiled, specs, _ = fuser.pull_block_spec(whole, spec, grid_len=2)(*arrays)
+    if not _is_tile(specs[0], probe):
+        return generation.Refusal('base_untiled', "the producer reads its base at other than the tile")
+    axes = []
+    for array, side_spec in zip(arrays[1:], specs[1:], strict=True):
+        block_shape, index_map = _block_and_map(side_spec)
+        if block_shape is None or index_map is None:
+            return generation.Refusal('value_unblocked', f"a {array.shape} side array has no block")
+        named = []
+        for block, index, size in zip(block_shape, index_map(1, 2), array.shape, strict=True):
+            if size == 1 and block == 1:
+                named.append(None)
+            elif index in (1, 2) and block == probe[index - 1] and size == shape[index - 1]:
+                named.append(PROLOGUE_AXES[index - 1])
+            else:
+                return generation.Refusal(
+                    'value_off_axes', f"a {array.shape} side array follows no launch axis tile by tile")
+        axes.append(tuple(named))
+    blocks = [jax.ShapeDtypeStruct(block.block_shape, array.dtype)
+              for block, array in zip(specs, arrays, strict=True)]
+    ids = (jnp.int32(0), jnp.int32(0))
+    closed = jax.make_jaxpr(lambda ids, *blocks: tiled(ids, (), *blocks))(ids, *blocks)
+    if any(var in template._needed(closed.jaxpr, closed.jaxpr.outvars) for var in closed.jaxpr.invars[:2]):
+        return generation.Refusal('reads_position', "the producer reads its tile's position")
+    return tuple(axes)
+
+
+def _prologue_tile(whole, types: tuple, axes: tuple, tile, *side_tiles):
+    """The producer's kernel stage on one loaded tile of its base and its side arrays' tiles beside it,
+    each side tile given back the dimensions of one the template squeezed (`_split`)."""
+    shaped = [side.reshape(tuple(1 if axis is None else tile.shape[PROLOGUE_AXES.index(axis)]
+                                 for axis in side_axes))
+              for side, side_axes in zip(side_tiles, axes, strict=True)]
+    tiled, _, _ = fuser.pull_block_spec(whole, pl.BlockSpec(tile.shape, lambda row, depth: (row, depth)),
+                                        grid_len=2)(*types)
+    return tiled((jnp.int32(0), jnp.int32(0)), (), tile, *shaped)
 
 
 def _axes(consumer, values, acc) -> tuple | generation.Refusal:
