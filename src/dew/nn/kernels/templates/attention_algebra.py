@@ -563,6 +563,20 @@ def normalized_terms(logits: jax.Array, maximum: jax.Array, total: jax.Array, at
     return rest, jnp.where(at_anchor, rounded, jnp.zeros_like(rounded)).astype(jnp.float32).sum(axis=-1)
 
 
+def normalized_start(initial: tuple[jax.Array, jax.Array] | None, maximum: jax.Array, total: jax.Array,
+                     width: int) -> jax.Array:
+    """The normalized split sums' start (`normalized_terms`): the initial state's weighted values at the
+    walk's maximum over its natural denominator, `acc0 exp(m0 - m) / T` from `initial` `(m0, acc0)` (its
+    share of `B`, which `split_delta` reads inside it), zero without one. The factor is at most 1 and the
+    product is taken before the division, so it stays within `acc0`'s magnitude."""
+    if initial is None:
+        return jnp.zeros((total.shape[0], width), jnp.float32)
+    m0, acc0 = initial
+    carried = jnp.where(m0 == -jnp.inf, 0.0, jnp.exp(jnp.minimum(m0 - maximum, 0.0)))
+    acc0 = acc0.astype(jnp.float32)
+    return expand(carried, acc0) * acc0 * expand(inverse(total), acc0)
+
+
 def split_residuals(split: Partial, own: jax.Array, others_total: jax.Array,
                     normalized: tuple[jax.Array, jax.Array, jax.Array] | None) -> tuple[jax.Array, ...]:
     """A training walk's split sums for the backward and their shift: as the walk left them (shift 0

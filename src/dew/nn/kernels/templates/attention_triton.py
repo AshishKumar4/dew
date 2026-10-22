@@ -273,8 +273,9 @@ def _forward_kernel(*refs, spec: algebra.Forward, score_kinds: tuple[Kind, ...],
         # every other row's bits the plain walk's (`algebra.room`); a training walk's live rows take their
         # split sums from a normalized pass at the walk's maximum and denominator.
         walked = walk(live)
+        resumed = (initial_refs[0][...], initial_refs[2][...]) if initial else None
         terms = (_normalized_pass(spec, walked, normalized, value_ref=value_ref, bounds=(lo, hi),
-                                  initial=initial) if residuals else None)
+                                  initial=resumed) if residuals else None)
         written(walked, normalized=terms)
 
 
@@ -309,16 +310,18 @@ def _written(spec, walked, *, value_ref, out_ref, residual_refs, flag_ref, resid
         residual_refs[1][...] = denominator
 
 
-def _normalized_pass(spec, walked, step, *, value_ref, bounds, initial: bool):
+def _normalized_pass(spec, walked, step, *, value_ref, bounds, initial: tuple[jax.Array, jax.Array] | None):
     """A guarded training walk's live rows' split sums, normalized: a pass over its keys (`step`) at the
-    walk's own maximum and natural denominator (`algebra.normalized_terms`)."""
+    walk's own maximum and natural denominator (`algebra.normalized_terms`) from the `initial` state's
+    share (`algebra.normalized_start`)."""
     split, arg, own, _ = walked
     joined = split._replace(acc=algebra.split_output(split.acc, own, value_ref[arg.key, :]))
-    _, maximum, total = algebra.finish(spec, joined, initial=initial)
+    _, maximum, total = algebra.finish(spec, joined, initial=initial is not None)
     nothing = jnp.zeros_like(own)
     walk = functools.partial(step, maximum=maximum, total=total, anchor=arg.key)
     lo, hi = bounds
-    return jax.lax.fori_loop(lo, hi, walk, (jnp.zeros_like(split.acc), nothing, nothing))
+    start = algebra.normalized_start(initial, maximum, total, split.acc.shape[-1])
+    return jax.lax.fori_loop(lo, hi, walk, (start, nothing, nothing))
 
 
 def _split_written(walked, *, value_ref, residual_refs, normalized) -> algebra.Partial:
