@@ -160,10 +160,11 @@ def gemm_t(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None, *, pro
         if prologue is not None:
             lhs = prologue(lhs, *prologue_arrays).astype(lhs.dtype)
         lhs = jnp.where(routed[:, None], lhs, 0)
-        matrix = jnp.zeros((group_sizes.shape[0], lhs.shape[1], rhs.shape[1]), jnp.float32)
+        wide = jnp.promote_types(lhs.dtype, jnp.float32)  # an fp64 product's sum in fp64
+        matrix = jnp.zeros((group_sizes.shape[0], lhs.shape[1], rhs.shape[1]), wide)
         _, pullback = jax.vjp(lambda matrix: grouped_matmul.xla_ragged_dot(
-            lhs, matrix, group_sizes, precision=precision, preferred_element_type=jnp.float32), matrix)
-        return pullback(rhs.astype(lhs.dtype).astype(jnp.float32))[0].astype(out_dtype)
+            lhs, matrix, group_sizes, precision=precision, preferred_element_type=wide), matrix)
+        return pullback(rhs.astype(lhs.dtype).astype(wide))[0].astype(out_dtype)
 
     if not _kernels_take(lhs.dtype, precision, (out_dtype,), (lhs.dtype, rhs.dtype), lhs.shape[0]):
         return portable(lhs, rhs, group_sizes, prologue_arrays)
@@ -199,7 +200,8 @@ def _gemm(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, epilo
 
 def _portable_gemm(lhs, rhs, group_sizes, prologue, prologue_arrays, epilogue, epilogue_arrays, dtypes,
                    several: bool, transpose_rhs: bool, precision: PrecisionLike, compute=None):
-    """`gemm`'s arithmetic in XLA: the kernels' products of `lhs`'s dtype summed in fp32, one rounding;
+    """`gemm`'s arithmetic in XLA: the kernels' products of `lhs`'s dtype summed in at least fp32 (an fp64
+    product's in fp64, which no kernel takes), one rounding;
     with `compute`, the products of the operands rounded to it, its tangent the MoE projection's
     (`grouped_matmul.portable_projection`, whose sum, at least fp32, it reads)."""
     matrix = jnp.swapaxes(rhs, 1, 2) if transpose_rhs else rhs
@@ -209,8 +211,9 @@ def _portable_gemm(lhs, rhs, group_sizes, prologue, prologue_arrays, epilogue, e
         summed = grouped_matmul.portable_projection(lhs, matrix, group_sizes, compute, precision, wide)
     else:
         product = lhs if prologue is None else prologue(lhs, *prologue_arrays).astype(lhs.dtype)
+        wide = jnp.promote_types(lhs.dtype, jnp.float32)
         summed = grouped_matmul.xla_ragged_dot(product, matrix.astype(lhs.dtype), group_sizes,
-                                               precision=precision, preferred_element_type=jnp.float32)
+                                               precision=precision, preferred_element_type=wide)
     outs = _as_tuple(summed if epilogue is None else epilogue(summed, *epilogue_arrays))
     outs = tuple(out.astype(dtype) for out, dtype in zip(outs, dtypes, strict=True))
     return outs if several else outs[0]
