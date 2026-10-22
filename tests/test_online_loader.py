@@ -178,7 +178,9 @@ class Again:
 
 class Slow:
     """A server's answer to each GET: its path, after a pause, or 404 for the path `gone`; it counts
-    the requests in flight, by their path's first part where it reads `sides`, and the most at once."""
+    the requests in flight, by their path's first part where it reads `sides`, and the most at once.
+    A request is in flight from its arrival until its answer starts, so a client that has its answer
+    and asks again is never counted twice, however late its handler's thread finishes."""
 
     def __init__(self, *, gone: str | None = None, sides: bool = False):
         self.gone, self.sides = gone, sides
@@ -196,13 +198,15 @@ class Slow:
             self.active[side] += 1
             self.most[side] = max(self.most[side], self.active[side])
         time.sleep(0.2)
+        with self.lock:
+            self.active[side] -= 1
         body = request.path.encode()
         request.send_response(200)
         request.send_header("Content-Length", str(len(body)))
         request.end_headers()
         request.wfile.write(body)
-        with self.lock:
-            self.active[side] -= 1
+        # Widened: the handler finishes after its client has the answer, as a loaded host schedules it.
+        time.sleep(0.05)
 
 
 Parents = collections.namedtuple("Parents", ["first", "second"])
