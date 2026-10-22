@@ -247,23 +247,34 @@ def _forward_kernel(*refs, spec: algebra.Forward, score_kinds: tuple[Kind, ...],
     output_params = tuple(_tile_param(ref, kind, head, q_pos, None)
                           for ref, kind in zip(output_refs, output_kinds, strict=True))
     plain, shifted = functools.partial(walk, shifted=False), functools.partial(walk, shifted=True)
-    walked = algebra.guarded(plain, shifted) if spec.headroom else plain()
-    if residuals:
-        split, arg, own, others_total = walked
-        residual_refs[2][...] = arg.key
-        residual_refs[3][...] = split.acc
-        residual_refs[4][...] = own
-        residual_refs[5][...] = others_total
-        residual_refs[6][...] = jnp.zeros_like(own) if split.shift is None else split.shift
-        state = split._replace(acc=algebra.split_output(split.acc, own, value_ref[arg.key, :]))
-    else:
-        state = walked
+    weighted = functools.partial(_weighted, value_ref) if residuals else (lambda state: state.acc)
+    walked = algebra.guarded(plain, shifted, weighted) if spec.headroom else plain()
+    state = _split_written(walked, value_ref, residual_refs) if residuals else walked
     out, m, denominator = algebra.finish(spec, state, initial=initial, output_mod=output_mod,
                                          output_params=output_params)
     out_ref[...] = out.astype(out_ref.dtype)
     if residuals:
         residual_refs[0][...] = m
         residual_refs[1][...] = denominator
+
+
+def _weighted(value_ref, carry) -> jax.Array:
+    """A training walk's weighted values, its split sums joined (`algebra.split_output`), where they
+    overflow (`algebra.guarded`)."""
+    split, arg, own, _ = carry
+    return algebra.split_output(split.acc, own, value_ref[arg.key, :])
+
+
+def _split_written(walked, value_ref, residual_refs) -> algebra.Partial:
+    """A training walk's anchors, split sums and shifts written to their residuals, and its state with the
+    split sums joined, which the output normalizes."""
+    split, arg, own, others_total = walked
+    residual_refs[2][...] = arg.key
+    residual_refs[3][...] = split.acc
+    residual_refs[4][...] = own
+    residual_refs[5][...] = others_total
+    residual_refs[6][...] = jnp.zeros_like(own) if split.shift is None else split.shift
+    return split._replace(acc=algebra.split_output(split.acc, own, value_ref[arg.key, :]))
 
 
 @dataclasses.dataclass(frozen=True)

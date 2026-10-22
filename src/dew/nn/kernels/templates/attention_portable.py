@@ -152,8 +152,15 @@ def forward(spec: algebra.Forward, query: jax.Array, key: jax.Array, value: jax.
             lo, hi = 0, tiles
         out_params = tuple(_output_param(param, kind, row, head, rows)
                            for param, kind in zip(output_params, output_kinds, strict=True))
+        def weighted(carry):
+            # A training walk's weighted values are its split sums joined, where they overflow.
+            if not residuals:
+                return carry.acc
+            split, arg, own, _ = carry
+            return algebra.split_output(split.acc, own, value[row, arg.key, kv_head])
+
         unguarded, guarded = functools.partial(walk, shifted=False), functools.partial(walk, shifted=True)
-        walked = algebra.guarded(unguarded, guarded) if spec.headroom else unguarded()
+        walked = algebra.guarded(unguarded, guarded, weighted) if spec.headroom else unguarded()
         if residuals:
             split, arg, own, others_total = walked
             state = split._replace(acc=algebra.split_output(split.acc, own, value[row, arg.key, kv_head]))

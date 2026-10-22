@@ -135,14 +135,16 @@ def headroomed(state: Partial) -> Partial:
 def overflowed(acc: jax.Array) -> jax.Array:
     """Whether a program's weighted values `acc` passed fp32's largest on some row, a scalar: the one way a
     row of finite inputs turns non-finite (an infinite sum stays infinite under every later factor)."""
-    return jnp.logical_not(jnp.all(jnp.isfinite(acc)))
+    # A maximum, the reduction every mainloop lowers (Pallas Triton takes no `jnp.all`).
+    return jnp.max(jnp.where(jnp.isfinite(acc), 0.0, 1.0)) > 0
 
 
-def guarded(plain: Callable, shifted: Callable) -> object:
+def guarded(plain: Callable, shifted: Callable, weighted: Callable = lambda state: state.acc) -> object:
     """A program's softmax walk under headroom: `plain()`, its walk as ever, whose carry's first element is
-    its `Partial`; where that walk's weighted values overflowed (`overflowed`), `shifted()` instead, the
-    walk again with each row's shift (`room`). Ordinary inputs take the plain walk alone, their bits and
-    their cost unchanged but for this check; both return the guarded carry (`headroomed`)."""
+    its `Partial`; where that walk's weighted values, `weighted(carry)` (a training walk's split sums
+    joined, `split_output`), overflowed (`overflowed`), `shifted()` instead, the walk again with each
+    row's shift (`room`). Ordinary inputs take the plain walk alone, their bits and their cost unchanged
+    but for this check; both return the guarded carry (`headroomed`)."""
     carry = plain()
     state, *rest = (carry,) if isinstance(carry, Partial) else carry
 
@@ -150,7 +152,7 @@ def guarded(plain: Callable, shifted: Callable) -> object:
         held = headroomed(state)
         return (held, *rest) if rest else held
 
-    return jax.lax.cond(overflowed(state.acc), shifted, kept)
+    return jax.lax.cond(overflowed(weighted(carry)), shifted, kept)
 
 
 def headroom(dtype, keys: int, initial: bool) -> bool:
