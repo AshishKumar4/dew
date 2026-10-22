@@ -13,12 +13,12 @@ import jax
 import numpy as np
 import optax
 import pytest
+from decision_support import decision_rows
 from PIL import Image
 from reference_error import assert_as_exact_as_the_reference, float64_forward, ieee_fixture
 from safetensors.numpy import load_file
 
 from dew.checkpoints import Checkpoints
-from dew.config.data import loader
 from dew.data.text import HFTokenizer
 from dew.decision import (
     Choice,
@@ -35,7 +35,6 @@ from dew.decision import (
     TopProbability,
 )
 from dew.decision.calibration import softmax
-from dew.decision.data import Decisions
 from dew.decision.images import Images
 from dew.decision.joint_checkpoint import StoredJointHead
 from dew.nn.kernels.generation import measured_kernel
@@ -254,8 +253,7 @@ def test_a_joint_release_fine_tunes_and_reloads_from_the_run(tmp_path):
     # Training pads every row to the layout's max_len; the release serves up to 16384.
     objective = DecisionObjective(Decide.from_pretrained(release, attention_impl="xla"),
                                   layout=JointLayout(max_len=1024))
-    data = loader(Decisions(source=examples, validation=examples), batch=8, read="memory",
-        objective=objective.data())
+    data = decision_rows(examples, 8, examples, objective=objective.data())
     run = tmp_path / "run"
     checkpoints = Checkpoints(str(run), keep=1)
     start = objective.init(jax.random.key(0))

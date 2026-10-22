@@ -31,8 +31,8 @@ import tensorflow_datasets as tfds
 import tyro
 from PIL import Image
 
-from dew.config.data import Augment, ImageData, loader
-from dew.data import TFDS, Loading
+from dew.data import TFDS, Loading, images, presets
+from dew.data.compile import compile
 from dew.data.dataset import DataPartition
 from dew.data.image_augmentation import ImageParameters, apply_device, apply_host
 from dew.data.image_codec import decode_image
@@ -144,12 +144,30 @@ def device_steps(steps):
     return augmented
 
 
+def flowers(config, backend, crop_scale=(1.0, 1.0)):
+    """Oxford Flowers in a run's order, each JPEG decoded by Dew at a reduced scale no smaller than
+    `config.image_size`, resized to it and captioned by class from a template, then cropped to
+    `crop_scale` of its area, flipped and colour-jittered on the `backend`, "host" or "device"; the
+    caption is dropped before a batch reaches the run."""
+    size = config.image_size
+    if backend == "device":
+        augment = images.DeviceAugment(size, crop_scale=crop_scale, flip=True, jitter=True)
+    elif crop_scale != (1.0, 1.0):
+        augment = images.RandomCrop(size, scale=crop_scale, flip=True, jitter=True)
+    else:
+        augment = (images.Flip(), images.ColorJitter())
+    source = TFDS("oxford_flowers102", path=config.flowers, split="all",
+                  decoders={"image": tfds.decode.SkipDecoding()})
+    chain = source.shuffle(0).repeat().pipe(presets.images, size, batch=config.batch, augment=augment,
+                                            draft=True, rejects=False,
+                                            caption=images.caption(templates=("a photo of a {}",)),
+                                            host=(images.EncodeCaptions(),))
+    return compile(chain, read="memory",
+                   loading=Loading(workers=0, threads=config.threads, read_buffer=2 * config.batch))
+
+
 def pipeline_timing(config, backend, crop_scale):
-    spec = ImageData(source=TFDS("oxford_flowers102", path=config.flowers, split="all"),
-                  image_size=config.image_size, caption_templates=("a photo of a {}",),
-                  augment=Augment(flip=True, jitter=True, backend=backend, crop_scale=crop_scale))
-    data = loader(spec, batch=config.batch, read="memory",
-                  loading=Loading(workers=0, threads=config.threads, read_buffer=2 * config.batch))
+    data = flowers(config, backend, crop_scale)
     stream = data.train(DataPartition())
     augmented = device_steps(data.device)
     reduce = jax.jit(lambda pixels: jnp.mean(pixels.astype(jnp.float32)))
@@ -186,9 +204,6 @@ def training_timing(config, backend):
     from dew.training import Trainer
     from dew.training.distributed import DevicePrefetchIterator
 
-    spec = ImageData(source=TFDS("oxford_flowers102", path=config.flowers, split="all"),
-                  image_size=config.image_size, caption_templates=("a photo of a {}",),
-                  augment=Augment(flip=True, jitter=True, backend=backend))
     model = SimpleDiT(patch_size=16, emb_features=32, num_layers=1, num_heads=4,
                       dtype=jnp.float32, precision=jax.lax.Precision.HIGHEST, attention_impl="reference")
     objective = DiffusionObjective(model, EDM(regime="pixel"),
@@ -196,8 +211,7 @@ def training_timing(config, backend):
                                   ema_decay=None)
     trainer = Trainer(objective, optax.adamw(1e-3), key=jax.random.key(0))
     state, _, _ = trainer.place()
-    data = loader(spec, batch=config.batch, read="memory",
-                  loading=Loading(workers=0, threads=config.threads, read_buffer=2 * config.batch))
+    data = flowers(config, backend)
     source = data.train(DataPartition.of(trainer.device_mesh))
     # The loader's device steps, augmentation among them, run in their own compiled dispatch
     # before each update; `Trainer.fit` runs them inside it.

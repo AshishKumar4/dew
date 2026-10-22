@@ -255,10 +255,10 @@ def test_an_objective_on_a_loaded_pipeline_samples_on_the_pipelines_own_grid(sav
     import jax
     import jax.numpy as jnp
     from diffusion_stubs import PROMPTS, batch_for
+    from diffusion_support import images_of
     from reference_error import assert_as_exact_as_the_reference, widened
 
     from dew.config import ObjectiveConfig
-    from dew.config.data import ImageData
     from dew.diffusion.schedules import DiscreteNoiseScheduler
     from dew.interop.pretrained import load_diffusion_source
     from dew.objectives import Step
@@ -284,7 +284,7 @@ def test_an_objective_on_a_loaded_pipeline_samples_on_the_pipelines_own_grid(sav
         pretrained=str(directory), preset=None,
         model=dataclasses.replace(model, fields={**model.fields, "dtype": "float32",
                                                  "attention_impl": "xla"}),
-        data=ImageData(source="tfds://oxford_flowers102", image_size=size), val_metrics=(),
+        data=images_of("tfds://oxford_flowers102", size), val_metrics=(),
         objective=ObjectiveConfig("diffusion", {**settings, "unconditional_prob": 0.0})).build()
     variables = source.variables
     batch = batch_for(objective, size)

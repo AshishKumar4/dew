@@ -8,16 +8,16 @@ from pathlib import Path
 from typing import Annotated
 
 import pytest
+from diffusion_support import images_of
 
 from dew.config import RunConfig, ScheduleSpec
-from dew.config.data import Augment, HoldOut, ImageData, TextData
 from dew.data import Files
 from dew.data.dataset import Loader, record_argument
 from dew.diffusion.presets import Flow
 from dew.objectives.diffusion import DiffusionRunConfig
 from dew.objectives.jepa import JepaRunConfig
 from dew.objectives.lm import LMRunConfig
-from dew.registry import datasets, import_path
+from dew.registry import import_path
 from dew.sampling import Heun
 from dew.training import MeshSpec
 
@@ -30,29 +30,95 @@ def parse(cls, args):
     return cls.cli(args)
 
 
-def test_the_flags_pick_a_dataset_a_preset_and_a_solver_from_the_registries():
+def test_the_flags_pick_a_preset_and_a_solver_and_set_sets_the_chains_settings():
     config = parse(DiffusionRunConfig, [
-        "--data.image-size", "64", "--data.augment.crop-scale", "0.8", "1.0",
         "preset:flow", "--preset.shift", "3.0", "--objective.solver", '{"class": "heun"}',
         "--objective.guidance", '{"class": "dew.sampling.guidance:CFG", "fields": {"scale": 2.5}}',
-        "--trainer.batch-size", "8", "--trainer.steps", "10", "--trainer.mesh.fsdp", "2",
+        "--trainer.steps", "10", "--trainer.mesh.fsdp", "2",
         "--model", "simple_dit", "--model.scan_order", "hilbert"])
 
-    assert config.data == dataclasses.replace(DiffusionRunConfig().data, image_size=64,
-                                               augment=Augment(jitter=True, crop_scale=(0.8, 1.0)))
     assert config.preset == Flow(shift=3.0)
     assert config.objective.fields["solver"]["class"] == import_path(Heun)
     assert config.objective.fields["guidance"]["fields"]["scale"] == 2.5
-    assert config.trainer.batch_size == 8 and config.trainer.mesh == MeshSpec(fsdp=2)
+    assert config.trainer.mesh == MeshSpec(fsdp=2)
     assert config.model.fields["scan_order"] == "hilbert"
+    # The data's settings are its chain's calls', set by name (`dew.data.records.override`).
+    chained = dataclasses.replace(config, data=images_of("tfds://oxford_flowers102", 32, batch=16))
+    set_ = chained.assigned(["data.images.size=64", "data.images.batch=8"])
+    assert set_.data.facts()["fields"]["image"] == [64, 64, 3] and set_.data.facts()["batch"] == 8
 
 
-def test_another_dataset_is_its_subcommand():
-    config = parse(LMRunConfig, ["data:text", "--data.source", "d", "--data.pack", "first-fit",
-                                 "--data.seq-len", "64", "--data.packing-bins", "2"])
-    assert config.data == TextData(source="d", seq_len=64, packing_bins=2, pack="first-fit")
+def test_set_points_a_recipes_chain_at_another_store():
+    """`--set data.source.<field>` sets a field of the chain's store, as a recipe's command line points
+    its default chain at the caller's own data: a token store's URL, and a TFDS store's path through
+    the holdout it is read under; a field the store does not have is refused."""
+    from dew.data import presets
+    from dew.data.sources import source
+    from dew.data.sources.tokens import TokenFiles
+
+    windows = TokenFiles("data/shakespeare-byte").pipe(presets.lm, None, seq_len=8, batch=2, pack=None)
+    config = LMRunConfig.cli(["--set", "data.source.url=data/mine", "--set", "data.lm.seq_len=16"],
+                             default=LMRunConfig(data=windows))
+    assert config.data.source.url == "data/mine" and config.data.facts()["seq_len"] == 16
+    train, _ = source("tfds://oxford_flowers102").holdout(records=128)
+    flowers = DiffusionRunConfig(data=train.pipe(presets.images, 32, batch=16))
+    moved = flowers.assigned(["data.source.path=/data/tfds"])
+    assert moved.data.source.source.path == "/data/tfds"
     with pytest.raises(ValueError):
-        LMRunConfig(data=ImageData(source="tfds://oxford_flowers102")).prepare()
+        flowers.assigned(["data.source.colour=red"])
+
+
+def test_a_chains_settings_are_set_together():
+    """Settings of one chain valid only together are one point: an augmented images chain's size and
+    staging size move as a pair, read back once."""
+    from dew.data import presets
+    from dew.data.sources import source
+
+    flowers = source("tfds://oxford_flowers102").pipe(presets.images, 64, staging_size=64, augment=True,
+                                                     batch=8)
+    moved = DiffusionRunConfig(data=flowers).assigned(["data.images.size=128",
+                                                        "data.images.staging_size=128"])
+    assert moved.data.facts()["fields"]["image"] == [128, 128, 3]
+
+
+def test_a_point_sets_a_runs_fields_and_its_chains_settings_together():
+    """A run's own fields and its chain's settings are one point, built once: audio conditioning and
+    clips that carry audio are valid only together, and a point that sets both reads as both."""
+    from dew.data import presets
+    from dew.objectives.diffusion import AudioCondition
+
+    clips = Files("clips", format="files").pipe(presets.clips, 2 / 25, frames=2, fps=25, size=8, batch=8)
+    audio = DiffusionRunConfig(text=None, audio=AudioCondition()).to_dict()["audio"]
+    moved = DiffusionRunConfig(data=clips).override({"text": None, "audio": audio,
+                                                     "data.clips.sample_rate": 16000})
+    assert moved.audio is not None and moved.data is not None and "audio" in moved.data.facts()["fields"]
+
+
+def test_a_python_run_whose_chain_is_unrecorded_trains_from_dew_train(tmp_path):
+    """`dew train run.py` trains a run whose chain holds a step only Python has (a lambda) as the file
+    built it, and its run.json says why it can't be rebuilt from the record."""
+    from dew.cli.main import main
+
+    (tmp_path / "unrecorded_run.py").write_text(
+        "import dataclasses\n"
+        "import numpy as np\n"
+        "from autoencoder_experiment import FEATURES, run as experiment\n"
+        "from dew.data import Memory\n"
+        "rows = [{'x': np.full((FEATURES,), index / 32, np.float32)} for index in range(32)]\n"
+        "run = dataclasses.replace(experiment(), validation=None,\n"
+        "                          data=Memory(rows).map(lambda row: row).shuffle().repeat().batch(8))\n")
+    assert main(["train", str(tmp_path / "unrecorded_run.py"), "--set", "trainer.steps=1",
+                 "--set", f"trainer.checkpoint_dir={tmp_path / 'runs'}", "--set", "trainer.eval_every=None",
+                 "--set", "trainer.checkpoint_every=1"]) == 0
+    record = json.loads((tmp_path / "runs" / "unrecorded_run" / "run.json").read_text())
+    assert set(record["fields"]["data"]) == {"unrecorded"}
+    with pytest.raises(ValueError):
+        RunConfig.load(str(tmp_path / "runs" / "unrecorded_run"))
+
+
+def test_an_lm_run_over_images_is_refused():
+    with pytest.raises(ValueError):
+        LMRunConfig(data=images_of("tfds://oxford_flowers102", 32)).prepare()
 
 
 def test_a_spec_field_the_dataset_lacks_is_a_command_line_error():
@@ -62,29 +128,37 @@ def test_a_spec_field_the_dataset_lacks_is_a_command_line_error():
 
 @pytest.mark.parametrize("name", ["diffusion", "lm", "jepa"])
 def test_a_run_config_round_trips_through_its_json_record(name):
+    from dew.data import presets
+    from dew.data.sources.tokens import TokenFiles
+
     cls = {"diffusion": DiffusionRunConfig, "lm": LMRunConfig, "jepa": JepaRunConfig}[name]
     args = {"diffusion": ["preset:karras", "--preset.sigma-data", "0.6",
                           "--objective.unconditional-prob", "0.2"],
-            "lm": ["--data.source", "d", "--max-new-tokens", "4", "--objective.ema-decay", "0.9"],
+            "lm": ["--max-new-tokens", "4", "--objective.ema-decay", "0.9"],
             "jepa": ["--probe-classes", "7", "--objective.momentum", "0.9", "0.99"]}[name]
-    config = parse(cls, [*args, "--trainer.steps", "5"])
+    data = (TokenFiles("d").pipe(presets.lm, None, seq_len=64, batch=8, pack=None) if name == "lm"
+            else images_of("tfds://oxford_flowers102", 32))
+    config = dataclasses.replace(parse(cls, [*args, "--trainer.steps", "5"]), data=data)
 
     record = json.loads(json.dumps(config.record()))
 
-    assert RunConfig.read(record) == config
-    assert record["fields"]["data"]["class"] == import_path(type(config.data))
+    assert RunConfig.read(record).record() == record
+    preset = "lm" if name == "lm" else "images"
+    assert record["fields"]["data"]["stages"][-1]["pipe"] == f"dew.data.presets:{preset}"
 
 
 def test_a_run_over_url_datasets_round_trips_through_its_json_record():
     """A diffusion run may train on any hub table of urls; its record has to
     name the sources, so the run and its solvers rebuild from run.json."""
-    config = DiffusionRunConfig(data=ImageData(source=Files("hf://datasets/user/images/train.parquet",
-        format="parquet"), image_size=64))
+    from dew.data import presets
+
+    config = DiffusionRunConfig(data=Files("hf://datasets/user/images/train.parquet", format="parquet").pipe(
+        presets.images, 64, batch=32))
 
     record = json.loads(json.dumps(config.to_dict()))
 
-    assert DiffusionRunConfig.from_dict(record) == config
-    assert record["data"]["class"] == datasets.paths["images"]
+    assert DiffusionRunConfig.from_dict(record).to_dict() == record
+    assert record["data"]["source"]["fields"]["url"] == "hf://datasets/user/images/train.parquet"
 
 
 def test_steps_and_epochs_are_one_choice():
@@ -99,11 +173,9 @@ def test_steps_and_epochs_are_one_choice():
         )
 
 
-def test_the_cli_selects_a_token_budget_without_selecting_a_row_batch():
-    config = parse(RunConfig, ["--trainer.batch-size", "None", "--trainer.batch-tokens", "24576",
-                              "--trainer.update-tokens", "98304", "--trainer.steps", "1"])
-    assert config.trainer.batch_size is None
-    assert config.trainer.accumulation == 4
+def test_the_cli_sets_a_token_budget_the_datas_token_batches_divide():
+    config = parse(RunConfig, ["--trainer.update-tokens", "98304", "--trainer.steps", "1"])
+    assert config.trainer.update_tokens == 98304
     assert RunConfig.from_dict(json.loads(json.dumps(config.to_dict()))) == config
 
 
@@ -112,18 +184,22 @@ def test_a_jepa_run_without_probes_trains_and_validates_its_loss(tmp_path):
     import numpy as np
 
     from dew.config import ModelConfig, TrainerConfig
-    from dew.data import TFDS, Loading
+    from dew.data import TFDS, Loading, presets
+
+    images = TFDS("dew_images", path=str(REPO_ROOT / "tests" / "fixtures" / "tfds" / "dew_images" / "1.0.0"),
+                  split="all")
+    train, held = images.holdout(records=4)
+
+    def prepared(chain):
+        return chain.pipe(presets.images, 16, batch=8).read("memory").loading(Loading(workers=0))
 
     run = JepaRunConfig(
         model=ModelConfig("jepa_encoder", {"patch_size": 2, "emb_features": 16, "num_layers": 1,
                                            "num_heads": 2, "mlp_ratio": 2, "dtype": "float32",
                                            "attention_impl": "xla"}),
         predictor={"num_layers": 1, "predictor_features": 8}, num_target_blocks=2,
-        data=ImageData(source=TFDS("dew_images", path=str(
-            REPO_ROOT / "tests" / "fixtures" / "tfds" / "dew_images" / "1.0.0"), split="all"),
-                       image_size=16, augment=None, validation=HoldOut(records=4)),
-        loading=Loading(workers=0), data_read="memory",
-        trainer=TrainerConfig(checkpoint_dir=str(tmp_path), batch_size=8, steps=1, log_every=1,
+        data=prepared(train), validation=prepared(held),
+        trainer=TrainerConfig(checkpoint_dir=str(tmp_path), steps=1, log_every=1,
                               eval_every=1, checkpoint_every=None))
     trained = run.prepare().train("jepa-loss")
     assert int(trained.updates) == 1

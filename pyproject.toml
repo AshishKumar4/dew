@@ -233,11 +233,14 @@ augment = ["albumentations>=2"]
 torchax = ["torch>=2.14,<2.15", "torchax==0.0.14.dev20260922"]
 # tests/kernel_compile.py compiles every declared Pallas kernel config for each GPU generation with the
 # compiler the GPU runs, XLA's CUDA backend of this jaxlib for a compile-only device (the Triton jaxlib
-# bundles, CUDA's libdevice and ptxas from the nvcc wheel), on a host with no GPU: locks/cpu.txt takes
-# this extra, and a GPU host's lock has its own CUDA plugin already (tools/lock_environment.sh).
+# bundles, CUDA's libdevice and ptxas from the nvcc wheel, which Mosaic GPU's kernels compile through
+# too), and each Mosaic TPU kernel with libtpu for a compile-only TPU, on a host with no accelerator:
+# locks/cpu.txt takes this extra, and a GPU host's lock has its own CUDA plugin already
+# (tools/lock_environment.sh).
 kernel-compile = ["jax-cuda12-plugin==0.11.2; sys_platform == 'linux' and platform_machine == 'x86_64'",
                   "jax-cuda12-pjrt==0.11.2; sys_platform == 'linux' and platform_machine == 'x86_64'",
-                  "nvidia-cuda-nvcc-cu12~=12.9; sys_platform == 'linux' and platform_machine == 'x86_64'"]
+                  "nvidia-cuda-nvcc-cu12~=12.9; sys_platform == 'linux' and platform_machine == 'x86_64'",
+                  "libtpu==0.0.48.*; sys_platform == 'linux' and platform_machine == 'x86_64'"]
 # The test suite's one environment: every package a test file imports, so no test skips for want
 # of one. CI's jobs, armada's (tools/armada/install.sh), the GPU nodes' and dew-ops' GPU jobs install
 # it under constraints.txt, locked in locks/ (tools/lock_environment.sh).

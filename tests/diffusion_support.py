@@ -45,6 +45,15 @@ def relative_gap(actual, expected) -> float:
     return max(scaled_gap(a, e) for a, e in zip(np.asarray(actual), np.asarray(expected), strict=True))
 
 
+def images_of(url: str, size: int, batch: int = 32):
+    """A run's data of `size` squares from the images `url` names (`dew.data.presets.images`), in batches
+    of `batch`: what a diffusion or JEPA run's config trains on, which most tests only build from."""
+    from dew.data import presets
+    from dew.data.sources import source
+
+    return source(url).pipe(presets.images, size, batch=batch)
+
+
 def image_batch(loaded, prompts) -> dict:
     """One image a device, its pixels a ramp over the source's sample shape, with `prompts` in turn,
     so a device count that is odd, one GPU included, still gets a prompt for every image."""
