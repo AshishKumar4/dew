@@ -45,13 +45,8 @@ def import_opencv() -> None:
 def resize_image(image: np.ndarray, size: int | tuple[int, int]) -> np.ndarray:
     """`image` at `size`, a square side or (height, width); area interpolation
     where it shrinks along either side, cubic where it only grows."""
-    import cv2
-
     height, width = (size, size) if isinstance(size, int) else size
-    if image.shape[:2] == (height, width):
-        return image
-    shrinks = image.shape[0] > height or image.shape[1] > width
-    return cv2.resize(image, (width, height), interpolation=cv2.INTER_AREA if shrinks else cv2.INTER_CUBIC)
+    return resized_to(image, height, width, None)
 
 
 def fetch(url: str = "url", to: str = "jpg", *, timeout: float = 10.0, max_bytes: int = 64 * 2**20,
@@ -179,12 +174,30 @@ _INTERPOLATIONS = {"area": "INTER_AREA", "bilinear": "INTER_LINEAR", "bicubic": 
 type Interpolation = Literal["area", "bilinear", "bicubic", "nearest", "lanczos"]
 
 
-def _resized(image: np.ndarray, height: int, width: int, method: Interpolation) -> np.ndarray:
+def resized_to(image: np.ndarray, height: int, width: int, method: Interpolation | None) -> np.ndarray:
+    """`image` at `height` x `width` by OpenCV's `method` interpolation; where None, area where it
+    shrinks along either side and bicubic where it only grows. The one resize every image and video
+    step reads."""
     import cv2
 
     if image.shape[:2] == (height, width):
         return image
+    if method is None:
+        method = "area" if image.shape[0] > height or image.shape[1] > width else "bicubic"
     return cv2.resize(image, (width, height), interpolation=getattr(cv2, _INTERPOLATIONS[method]))
+
+
+def _cropped(image: np.ndarray, rows: int, columns: int, method: Interpolation,
+             resize: Literal["cover", "grow"]) -> np.ndarray:
+    """`image` cut to `rows` x `columns` at its centre, first resized by `method`, in proportion, to
+    cover them: always (`cover`), or only where it is smaller (`grow`)."""
+    height, width = image.shape[:2]
+    if resize == "cover" or height < rows or width < columns:
+        scale = max(rows / height, columns / width)
+        height, width = max(rows, round(height * scale)), max(columns, round(width * scale))
+        image = resized_to(image, height, width, method)
+    top, left = (height - rows) // 2, (width - columns) // 2
+    return image[top : top + rows, left : left + columns]
 
 
 @dataclasses.dataclass(frozen=True)
@@ -202,11 +215,9 @@ class Resize(grain.MapTransform):
         return resized(facts, self.field, height, width)
 
     def map(self, element: Batch) -> Batch:
-        image = np.asarray(element[self.field])
-        if self.method is None:
-            return {**element, self.field: resize_image(image, self.size)}
         height, width = (self.size, self.size) if isinstance(self.size, int) else self.size
-        return {**element, self.field: _resized(image, height, width, self.method)}
+        image = np.asarray(element[self.field])
+        return {**element, self.field: resized_to(image, height, width, self.method)}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -225,16 +236,11 @@ class Fit(grain.MapTransform):
         return resized(facts, self.field, self.size, self.size)
 
     def map(self, element: Batch) -> Batch:
-        import cv2
-
         image = np.asarray(element[self.field])
         height, width = image.shape[:2]
-        longer = max(height, width)
-        scale = self.size / longer
+        scale = self.size / max(height, width)
         fitted = (max(1, round(height * scale)), max(1, round(width * scale)))
-        resized = cv2.resize(image, fitted[::-1],
-                             interpolation=cv2.INTER_AREA if longer > self.size else cv2.INTER_CUBIC)
-        resized = resized.reshape(*fitted, *image.shape[2:])
+        resized = resized_to(image, *fitted, None).reshape(*fitted, *image.shape[2:])
         tall, wide = self.size - fitted[0], self.size - fitted[1]
         padding = ((tall // 2, tall - tall // 2), (wide // 2, wide - wide // 2),
                    *((0, 0) for _ in image.shape[2:]))
@@ -257,13 +263,7 @@ class CenterCrop(grain.MapTransform):
 
     def map(self, element: Batch) -> Batch:
         image = np.asarray(element[self.field])
-        height, width = image.shape[:2]
-        if min(height, width) < self.size:
-            scale = self.size / min(height, width)
-            height, width = max(self.size, round(height * scale)), max(self.size, round(width * scale))
-            image = _resized(image, height, width, self.method)
-        top, left = (height - self.size) // 2, (width - self.size) // 2
-        return {**element, self.field: image[top : top + self.size, left : left + self.size]}
+        return {**element, self.field: _cropped(image, self.size, self.size, self.method, "grow")}
 
 
 @dataclasses.dataclass(frozen=True)
@@ -309,12 +309,8 @@ class Bucket(grain.MapTransform):
         aspect = np.log(width / height)
         index = int(np.argmin([abs(np.log(columns / rows) - aspect) for rows, columns in self.sizes]))
         rows, columns = self.sizes[index]
-        scale = max(rows / height, columns / width)
-        height, width = max(rows, round(height * scale)), max(columns, round(width * scale))
-        image = _resized(image, height, width, self.method)
-        top, left = (height - rows) // 2, (width - columns) // 2
-        cut = image[top : top + rows, left : left + columns]
-        return {**element, self.field: cut, self.to: np.int32(index)}
+        return {**element, self.field: _cropped(image, rows, columns, self.method, "cover"),
+                self.to: np.int32(index)}
 
 
 def bucket(sizes: Sequence[tuple[int, int]], method: Interpolation = "area", *, field: str = "image",
@@ -364,7 +360,7 @@ class RandomResizedCrop(grain.RandomMapTransform):
                 crop_width, crop_height = width, height
             top, left = (height - crop_height) // 2, (width - crop_width) // 2
         crop = image[top : top + crop_height, left : left + crop_width]
-        return {**element, self.field: _resized(crop, self.size, self.size, self.method)}
+        return {**element, self.field: resized_to(crop, self.size, self.size, self.method)}
 
 
 @dataclasses.dataclass(frozen=True)
