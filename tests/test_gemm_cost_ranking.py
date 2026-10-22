@@ -95,7 +95,7 @@ def _config(text: str):
 
 
 def _cases():
-    for generation_name in ("sm80", "sm90"):
+    for generation_name in ("sm80", "sm86", "sm89", "sm90"):
         for record in json.loads((SWEEPS / f"{generation_name}.json").read_text())["records"]:
             name = f"{generation_name}-{record['implementation']}-{record['shape']}-{record['product']}"
             yield pytest.param(generation_name, record, id=name)
