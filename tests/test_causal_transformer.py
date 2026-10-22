@@ -977,10 +977,14 @@ def test_the_tied_head_rounds_its_bf16_product_to_bf16_logits_under_bf16_compute
     )
 
     def head(model, dtype, finish, *, rounded):
+        # The states as the compiled model computes them: on a GPU an uncompiled bf16 stack fuses
+        # otherwise, and the head's input is the compiled one's.
+        states = jax.jit(lambda params, ids: model.apply(params, ids, method=CausalTransformer.hidden_states))
+
         def run(params, ids):
             narrow = jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float32), params)
             with jax.enable_x64(new_val=False):
-                hidden = model.apply(narrow, ids, method=CausalTransformer.hidden_states)
+                hidden = states(narrow, ids)
             hidden = np.asarray(hidden, np.float32)
             table = np.asarray(params["params"]["embed_tokens"]["embedding"], np.float32)
             if rounded:
