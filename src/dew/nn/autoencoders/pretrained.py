@@ -111,7 +111,7 @@ LOADERS: Mapping[str, Loader] = MappingProxyType({
 (`dew.interop.pipeline_assembly`) builds from, a config naming none taken as an AutoencoderKL's."""
 
 
-def registration(of: type[AutoEncoder] | str) -> Registration | None:
+def registration(of: type[AutoEncoder] | str | None) -> Registration | None:
     """The registration of a wrapper class, a record's name or a published `_class_name` (None, an
     AutoencoderKL's: `Registration.nameless`), None for one no built-in registers."""
     return next((entry for entry in REGISTRATIONS if of in (entry.wrapper, entry.record)
