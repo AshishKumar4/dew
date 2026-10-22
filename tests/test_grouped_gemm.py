@@ -4,13 +4,15 @@ rounded operands; the MoE dispatcher's routes to each implementation; the produc
 kernels write them; and the cost model (`dew.nn.kernels.templates.cost`) on analytic launches."""
 
 import dataclasses
+import functools
 import itertools
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from generation_support import INTERPRETS, generations
+from generation_support import INTERPRETS, generations, lowers
+from jax.sharding import Mesh
 from reference_error import assert_as_exact_as_the_reference, equations
 
 from dew.nn.kernels import generation, grouped_matmul
@@ -108,6 +110,44 @@ def test_the_kernel_gradient_keeps_a_neighbours_non_finite_rows_out():
     assert np.all(np.isfinite(np.asarray(got)))
     assert_as_exact_as_the_reference(np.asarray(got, np.float64), np.asarray(reference, np.float64), truth,
                                       "kernel gradient")
+
+
+@lowers("sm90")
+@pytest.mark.parametrize("launch,trans_rhs", [(grouped_matmul.MosaicGmm(), False),
+                                              (grouped_matmul.MosaicGmm(), True),
+                                              (grouped_matmul.MosaicTgmm(), None)],
+                         ids=["MosaicGmm", "MosaicGmm-transposed", "MosaicTgmm"])
+def test_every_tile_of_the_hopper_grouped_matmuls_lowers_for_an_h100(launch, trans_rhs):
+    """The tiles the Mosaic GPU launches may pick at an expert layer's shapes lower for an H100 on the
+    CPU, as a GPU session's compile would, over rows no multiple of 8: every block shape and every
+    schedule among those that fit an H100's block (`Template.fitting`). The interpreter takes kernels
+    Mosaic GPU's layout inference and TMA descriptors refuse; the GPU's tile gate runs each one
+    (test_moe_precision)."""
+    # Rows not a multiple of 8, which a TMA descriptor tiles by.
+    rows, depth, width, groups = 2044, 768, 1536, 8
+    bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
+    sizes, matrices = jax.ShapeDtypeStruct((groups,), jnp.int32), bf16((groups, depth, width))
+    if isinstance(launch, grouped_matmul.MosaicTgmm):
+        args, options = (bf16((rows, depth)), bf16((rows, width)), sizes), {"out_dtype": "float32"}
+    elif trans_rhs:
+        args, options = (bf16((rows, width)), matrices, sizes), {"trans_rhs": True}
+    else:
+        args, options = (bf16((rows, depth)), matrices, sizes), {"trans_rhs": False}
+    options = {"out_dtype": "bfloat16", **options, "interpret": False}
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
+    with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
+        fits = launch.fitting(launch.bind(*args, **options), generation.gpu_target())
+        # A fitting tile of every block shape and of every schedule: what the lowering depends on
+        # (shared memory, the snake's index arithmetic), each value once.
+        covering = set({(c.block_m, c.block_n): c for c in reversed(fits)}.values())
+        covering |= set({(c.stages, c.grid_block_n): c for c in reversed(fits)}.values())
+        covering |= set({(c.warpgroups, c.cluster, c.block_n): c for c in reversed(fits)}.values())
+        assert {(c.block_m, c.block_n) for c in covering} == {(c.block_m, c.block_n) for c in fits}
+        assert {(c.stages, c.grid_block_n) for c in covering} == {(c.stages, c.grid_block_n) for c in fits}
+        assert {(c.warpgroups, c.cluster) for c in covering} == {(c.warpgroups, c.cluster) for c in fits}
+        for config in sorted(covering, key=repr):
+            jax.jit(functools.partial(launch.replace(config=config), **options)).trace(*args).lower(
+                lowering_platforms=("cuda",))
 
 
 def test_the_portable_branch_writes_each_gradient_from_the_rounded_operands():
