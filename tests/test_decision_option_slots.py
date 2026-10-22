@@ -105,56 +105,84 @@ def test_the_stored_joint_head_scores_compacted_options_as_it_scores_the_grid():
     assert drawn[0] == drawn[1] == drawn[2]
 
 
-def ragged() -> list[Example]:
+SLOT_SEEDS = 8
+"""The compacted-options site's declared draws (`seeds_for`): each draw is the objective's
+initialization and the ragged rows' states and answers from its seed."""
+
+ALGEBRAIC_ZEROS = ("to_k", "scorer_out")
+"""The head's modules whose bias gradient is zero by algebra: a key's bias shifts every key's logit
+of a query alike, and the scorer's shared bias every option's, so the softmax and the loss do not
+move with either (their float64 values are residue)."""
+
+
+def ragged(seed: int = 0) -> list[Example]:
     """Ragged rows: one question of a hundred options, seventeen of three and one of
-    twenty-four."""
+    twenty-four, their states and answers drawn from `seed` at fixed lengths, so every draw packs
+    alike."""
+    rng = np.random.default_rng(seed)
+
+    def state(prefix):
+        return prefix + " " + "".join(rng.choice(list("abcdefghij"), 12))
+
     clauses = Choice("Which clause?", [f"c{index}" for index in range(100)])
     hypotheses = {f"h{index}": Choice(f"Hypothesis {index}?", ["yes", "no", "unsaid"]) for index in range(17)}
     intents = Choice("Which intent?", [f"i{index}" for index in range(24)])
-    return [Example("a clause on fees", {"clause": clauses}, {"clause": "c7"}),
-            Example("a contract", hypotheses, dict.fromkeys(hypotheses, "unsaid")),
-            Example("book a flight", {"intent": intents}, {"intent": "i3"})]
+    return [Example(state("a clause on"), {"clause": clauses}, {"clause": f"c{rng.integers(100)}"}),
+            Example(state("a contract"), hypotheses,
+                    {name: str(rng.choice(["yes", "no", "unsaid"])) for name in hypotheses}),
+            Example(state("book a flight"), {"intent": intents}, {"intent": f"i{rng.integers(24)}"})]
 
 
-SLOT_SEEDS = 8
-"""The compacted-options site's declared draws (`seeds_for`): each draw is the objective's
-initialization from its seed."""
-
-
-def ragged_site():
-    """Rows of 100, 17 x 3 and 24 real options packed into windows of a grid as many questions deep as
-    a window holds, the objective over them, and that packing's batch with the options compacted into
-    the slots its bounds allow (`slotted`) and without (`batch`)."""
+def ragged_objective() -> DecisionObjective:
+    """A small decoder and joint head over the ragged rows, a window as long as their longest row."""
     tokenizer = ByteTokenizer()
     specials = Specials(begin=None, separator=10, marker=0, marker_text="\x00", pad=255)
-    examples = ragged()
     # Rows as long as the longest needs, since each attention here holds its
     # whole [rows, heads, queries, keys] score on the CPU.
     layout = JointLayout(max_len=16384)
-    length = max(len(row.tokens) for example in examples
+    length = max(len(row.tokens) for example in ragged()
                  for row in layout.rows(tokenizer, specials, example.state, example.questions))
-    objective = DecisionObjective(
+    return DecisionObjective(
         CausalTransformer(vocab_size=256, emb_features=16, num_layers=1, num_heads=1, mlp_features=24,
                           max_seq_len=length, attention_impl="xla"),
         tokenizer=tokenizer, specials=specials, layout=JointLayout(max_len=length),
         head=JointSchemaHead(hidden_size=16, width=16, routing_layers=2, layers=1, heads=1, feedforward=24,
                              attention_impl="xla"), shuffle_options=False)
+
+
+def ragged_batches(objective: DecisionObjective, seed: int = 0):
+    """The ragged rows of `seed` packed into windows of a grid as many questions deep as a window
+    holds, with their options compacted into the slots its bounds allow (`slotted`) and without
+    (`batch`)."""
+    examples = ragged(seed)
     data = loader(DecisionRecipe(source=examples, validation=examples), batch=len(examples),
                 read="memory", objective=objective.data())
     (slotted,) = list(data.val(DataPartition()))
     slotted = {name: value for name, value in slotted.items() if name != VALID_ROWS}
     batch = {name: value for name, value in slotted.items() if name not in ("option_slots", "slotted")}
-    return objective, slotted, batch
+    return slotted, batch
 
 
-def stepped(objective, compact: bool):
-    """The loss and every parameter's gradient over the compacted options, or over the grid."""
+def stepped(objective: DecisionObjective, compact: bool):
+    """Each real option's logit (0 at a slot with none) and every parameter's gradient of the loss,
+    over the compacted options or over the grid: the forward's every option a row of its own."""
     step = Step(jnp.asarray(0), jax.random.key(0), None)
 
     def run(variables, grid, slotted):
-        return jax.value_and_grad(lambda held: objective.scalar_loss(held, slotted if compact else grid,
-                                                                     step)[0])(variables)
+        rows = slotted if compact else grid
+        inputs = laid_out(rows, objective.bounds.segments)
+        logits = jnp.where(inputs.options, objective.model.logits(variables, inputs), 0.0)
+        gradient = jax.grad(lambda held: objective.scalar_loss(held, rows, step)[0])(variables)
+        return logits, gradient
     return jax.jit(run)
+
+
+def zeroed(tree):
+    """`tree` with the algebraic zeros' bias gradients (`ALGEBRAIC_ZEROS`) exactly zero."""
+    def exact(path, leaf):
+        names = [getattr(entry, "key", None) for entry in path]
+        return leaf * 0 if names[-1:] == ["bias"] and any(name in ALGEBRAIC_ZEROS for name in names) else leaf
+    return jax.tree_util.tree_map_with_path(exact, tree)
 
 
 def test_a_ragged_batch_trains_on_compacted_options_as_on_the_grid():
@@ -162,7 +190,8 @@ def test_a_ragged_batch_trains_on_compacted_options_as_on_the_grid():
     and every parameter's gradient, backbone's and head's, over them are on par with the grid's from
     float64 (check 1, over draws of the objective's initialization): the compaction only reorders the
     sums over the grid's option slots. The loss reads only the real options."""
-    objective, slotted, batch = ragged_site()
+    objective = ragged_objective()
+    slotted, _ = ragged_batches(objective)
     options = np.asarray(slotted["options"])
     bounds = objective.bounds
     assert options.shape[1:] == (bounds.questions, 100)
@@ -175,11 +204,15 @@ def test_a_ragged_batch_trains_on_compacted_options_as_on_the_grid():
     capacity = -(-bounds.options // 128) * 128
     assert laid_out(slotted, bounds.segments).option_slots.shape == (len(options), capacity)
 
-    def draw(seed):
-        return objective.init(jax.random.key(seed)), batch, slotted
+    initialized = jax.jit(objective.init)
 
-    assert_as_exact(stepped(objective, compact=True), stepped(objective, compact=False), draw,
-                    "compacted options loss and gradient", seeds=SLOT_SEEDS)
+    def draw(seed):
+        return initialized(jax.random.key(seed)), *reversed(ragged_batches(objective, seed))
+
+    grid = stepped(objective, compact=False)
+    # The truth of the algebraic zeros is exactly zero, which each of their rows is held to.
+    assert_as_exact(stepped(objective, compact=True), grid, draw, "compacted options logits and gradient",
+                    seeds=SLOT_SEEDS, truth_fn=lambda *inputs: zeroed(grid(*inputs)))
 
     variables = objective.init(jax.random.key(0))
     step = Step(jnp.asarray(0), jax.random.key(0), None)
