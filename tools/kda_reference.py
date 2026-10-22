@@ -23,8 +23,9 @@ SOURCE = f"https://raw.githubusercontent.com/huggingface/transformers/{REVISION}
 RECORDED = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "kda" / "recorded_rules.npz"
 INPUTS = ("query", "key", "value", "g", "beta", "state")
 RULES = ("chunk", "recurrent")
-ROWS = 16
-"""A draw's rows: a gradient of a few values a row takes many to resolve."""
+ROWS = 256
+"""A draw's rows: a gradient of a few values a row takes many to resolve, and a recording of many draws
+exceeds what git holds."""
 
 
 def rule_inputs(seed: int) -> dict[str, np.ndarray]:
