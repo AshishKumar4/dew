@@ -39,8 +39,6 @@ from dataclasses import dataclass
 from itertools import pairwise
 from pathlib import Path
 
-from pylint.lint import Run
-
 ARGUMENTS = ("--disable=all", "--enable=duplicate-code", "--min-similarity-lines=6", "--ignore-imports=y",
              "--ignore-signatures=y", "--ignore-docstrings=y", "--ignore-comments=y", "--score=n")
 """The text reading: pylint's similarity check, as the gate runs it."""
@@ -395,6 +393,8 @@ def main(arguments: Sequence[str]) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     parser.add_argument("--base", help="a commit: a structural copy fails if written in more places than at"
                                        " its merge-base with HEAD")
+    parser.add_argument("--structural", action="store_true",
+                        help="the structural reading alone, no text (check.sh --changed, for iterating)")
     parser.add_argument("paths", nargs="+")
     options = parser.parse_args(arguments)
     files = python_files(options.paths)
@@ -413,8 +413,12 @@ def main(arguments: Sequence[str]) -> int:
                   " checkout fetches it first: sh tools/base_history.sh")
             return 2
     started = time.monotonic()
-    # pylint reads a directory as a package; the files, as files.
-    text = Run([*ARGUMENTS, *map(str, files)], exit=False).linter.msg_status
+    text = 0
+    if not options.structural:
+        from pylint.lint import Run  # its import alone takes seconds, which --structural skips
+
+        # pylint reads a directory as a package; the files, as files.
+        text = Run([*ARGUMENTS, *map(str, files)], exit=False).linter.msg_status
     read = time.monotonic()
     hits = found({os.path.relpath(file.resolve(), top) if options.base else str(file): file.read_text()
                   for file in files})
