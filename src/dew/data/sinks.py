@@ -183,7 +183,7 @@ def export(
 
         # A store exports as a chain of it does, by a read it supports, physical shards or none.
         chain = values._chain() if isinstance(values, Dataset) else Pipeline(values)
-        read = chain.mode or _preferred_read(lambda _: (chain,), provision=True)
+        read = chain.mode or _preferred_read((chain,), provision=True)
         rows = iter(iterate(chain, read=read, provision=True, loading=chain._loading or Loading()))
     else:
         rows = iter(values)

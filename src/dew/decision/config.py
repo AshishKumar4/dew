@@ -7,10 +7,10 @@ and head. `pretrained` names another: a Laya-style repository (one with an
 fresh, with `lora` to train an adapter in place of the whole model. A fresh
 head is Laya's, reading the layout the backbone's order asks for, or with
 `head` the joint schema head, reading every question of an example in one
-row (`JointLayout`). A `Decisions` recipe reads a table or a mixture manifest
-whose sets contribute their recorded shares. A tenth
-of the table's rows, at most 400, are held out by the default `HoldOut`;
-validation scores them, and after training they fit the temperatures the
+row (`JointLayout`). Its data is a chain through `decisions` over a table, or `mixture`'s over a
+mixture manifest whose sets contribute their recorded shares, and its validation the rows a
+`holdout` keeps or a store's own split; validation scores them, and after training they fit the
+temperatures the
 task divides its logits by, saved into the run, so `Decide.from_run` and
 `dew.pipeline` answer calibrated. A question type's temperature needs ten
 held-out answers and a bucket's 2000, Laya's floors.
@@ -19,7 +19,6 @@ held-out answers and a bucket's 2000, Laya's floors.
 from __future__ import annotations
 
 import dataclasses
-import json
 import os
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -27,10 +26,8 @@ from typing import TYPE_CHECKING
 import jax
 
 from dew.config import ModelConfig, ObjectiveConfig, OptimConfig, Prepared, RunConfig
-from dew.config.data import HoldOut
-from dew.data.storage import Store
+from dew.data.compile import fitted
 from dew.data.text import HFTokenizer
-from dew.decision.data import Decisions
 from dew.decision.head import DecisionHead, JointSchemaHead
 from dew.decision.laya import LayaCheckpoint
 from dew.decision.layout import Layout, default_layout
@@ -69,8 +66,6 @@ class DecisionRunConfig(RunConfig):
     objective: ObjectiveConfig = dataclasses.field(default_factory=lambda: ObjectiveConfig("decision"))
     """The decision objective and its arguments: its scoring rule (`loss`),
     label smoothing, option shuffling and none-of-the-above rate."""
-    data: Decisions = dataclasses.field(default_factory=lambda: Decisions(
-        source="tickets.csv", validation=HoldOut(fraction=0.1, by="random", most=400)))
     optim: OptimConfig = dataclasses.field(default_factory=lambda: OptimConfig(learning_rate=2.5e-5))
     model: ModelConfig = dataclasses.field(
         default_factory=lambda: ModelConfig("causal_transformer", {"dtype": "bfloat16"}))
@@ -173,16 +168,16 @@ class DecisionRunConfig(RunConfig):
         objective = self.objective.build(backbone=start, **derived)
         assert isinstance(objective, DecisionObjective), "a decision run's objective is a DecisionObjective"
         summary: dict[str, object] = {"pretrained": self.pretrained}
-        if isinstance(self.data.source, str):
-            manifest = Store(self.data.source).child("mixture.json")
-            fs, path = manifest.resolve()
-            if fs.exists(path):
-                made = record(json.loads(manifest.read()), "mixture.json")
-                weights = {name: number(value, f"weights.{name}") for name, value in
-                           record(made.get("weights", {}), "weights").items()} | dict(self.data.weights)
-                summary["mixture"] = {name: value for name, value in weights.items() if value > 0}
-                summary["made"] = made
-        dataset = self.loader(objective.data())
+        # A mixture's weights and the manifest it was made by, as the chain states them (`Dataset.facts`).
+        facts = self.chain().facts()
+        if "mixture_weights" in facts:
+            weights = record(facts["mixture_weights"], "mixture_weights")
+            summary["mixture"] = {name: value for name, value in weights.items()
+                                  if number(value, f"mixture_weights.{name}") > 0}
+            summary["made"] = record(facts.get("mixture_made", {}), "mixture_made")
+        # Compiled once: `train` reads the run's length and cadences off this loader and trains on it.
+        dataset, held = fitted(self.chain(), self.validation, objective=objective.data(),
+                                seed=self.data_seed)
         summary["records"] = dataset.records
         unfit = {name: counter.rejected.get("unfit", 0) for name, counter in dataset.counts.items()}
         unfit["held out"] = sum(counter.rejected.get("unfit",
@@ -194,16 +189,18 @@ class DecisionRunConfig(RunConfig):
             """Fit the task's temperatures on the held-out rows; process zero saves them into the run."""
             task = objective.pipeline(state)
             assert isinstance(task, Decide), "a decision objective's task is a Decide"
-            assert dataset.val is not None
-            calibrated = dataclasses.replace(task.calibrated(dataset.val), name=os.path.basename(directory))
+            assert held
+            # The first held-out split the run scores is the one it calibrates on.
+            calibrated = dataclasses.replace(task.calibrated(next(iter(held.values()))),
+                                             name=os.path.basename(directory))
             if jax.process_index() == 0:
                 calibrated.save(directory)
 
         # The task's own default metrics, asked for where its data holds held-out rows to score.
-        metrics = (Accuracy(), ECE(), AURC(), LogLoss()) if dataset.val is not None else ()
-        fitted = calibrate if self.calibrate and dataset.val is not None else None
+        metrics = (Accuracy(), ECE(), AURC(), LogLoss()) if held else ()
+        after = calibrate if self.calibrate and held else None
         return Prepared(self, lambda name: self.train(objective, dataset, name=name, metrics=metrics,
-                                                      summary=summary, after=fitted))
+                                                      summary=summary, after=after, validation=held))
 
 
 def looping(start: Pretrained, steps: int | None, layers: tuple[int, int] | None, *,

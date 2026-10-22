@@ -1986,9 +1986,7 @@ nine of them in under an hour.
 ```
 curl -o data/shakespeare.txt --create-dirs \
     https://raw.githubusercontent.com/karpathy/char-rnn/master/data/tinyshakespeare/input.txt
-dew data export records data/shakespeare-byte \
-    --fields '{"source": "data/shakespeare.txt"}' \
-    --format array_record --tokenizer byte --read memory
+dew data export data/shakespeare.txt data/shakespeare-byte --tokenizer byte --read memory
 JAX_PLATFORMS=cpu taskset -c 0-5 python tools/optimizer_curve.py \
     --dataset data/shakespeare-byte --optimizer muon --learning-rate 3e-3 \
     --steps 2000 --emb-features 128 --num-layers 2 --num-heads 2 --seed 0 \
