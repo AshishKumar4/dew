@@ -52,7 +52,7 @@ SEEDS = {'chunk oracle': 8, 'recurrent oracle': 8, 'safe_gate layer': 8, 'softpl
 ROWS = 64
 """A layer draw's rows: one layer's few outputs a draw leave its error to a handful of values."""
 GROUPS = 32
-"""The layers a gradient draw holds, each with parameters of its own."""
+"""The batches a gradient draw holds, each a gradient of its own."""
 
 
 def oracle_layer(x, p, lower_bound, eps, rule):
@@ -206,15 +206,14 @@ def test_the_layer_gradients_match_the_oracle():
         grad_x, grad_p = jax.grad(loss_oracle, argnums=(0, 1))(x, p, cotangent)
         return {"x": grad_x, **grad_p}
 
+    params = oracle_params(layer_and_params(-5.0)[2])
+    stacked = jax.tree.map(lambda leaf: np.broadcast_to(leaf, (GROUPS, *leaf.shape)), params)
+
     def draw(seed):
-        # GROUPS layers a draw, each its own parameters, inputs and cotangent: a parameter's gradient is
-        # a row of a few values, and a gate's error a long sum's, whose spread over draws few rows of
-        # it leave unresolved.
-        rng = np.random.RandomState(seed)
-        params = [oracle_params(layer_and_params(-5.0, seed=GROUPS * (1 + seed) + group)[2])
-                  for group in range(GROUPS)]
-        x, cotangent = rng.randn(2, GROUPS, ROWS, S, E).astype(np.float32)
-        return x, jax.tree.map(lambda *leaves: np.stack(leaves), *params), cotangent
+        # GROUPS batches a draw, each its own inputs and cotangent: a parameter's gradient is a row of
+        # a few values, a gate's error a long sum's, whose spread over draws one row leaves unresolved.
+        x, cotangent = np.random.RandomState(seed).randn(2, GROUPS, 16, S, E).astype(np.float32)
+        return x, stacked, cotangent
 
     assert_as_exact(ours, theirs, draw, "layer gradients", seeds=SEEDS['layer gradients'])
 
