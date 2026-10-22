@@ -72,6 +72,12 @@ def oracle_layer(x, p, lower_bound, eps, rule):
     return normed.reshape(batch, length, H * D) @ p["o_proj"]
 
 
+def oracle_loss(x, p, cotangent, *, eps):
+    """`oracle_layer`'s output with the safe gate over the chunked transcription, summed against
+    `cotangent`: the loss whose gradients the gradient sites hold."""
+    return jnp.sum(oracle_layer(x, p, -5.0, eps, partial(oracle_chunk, chunk_size=4)) * cotangent)
+
+
 def oracle_params(variables) -> dict:
     """The layer's parameters as `oracle_layer` takes them, at their own dtype."""
     return {name: (leaf["kernel"] if "kernel" in leaf else leaf["weight"]) if isinstance(leaf, dict) else leaf
@@ -194,8 +200,7 @@ def test_the_layer_gradients_match_the_oracle():
     def loss_module(x, variables, cotangent):
         return jnp.sum(module.apply(variables, x) * cotangent)
 
-    def loss_oracle(x, p, cotangent):
-        return jnp.sum(oracle_layer(x, p, -5.0, 1e-2, partial(oracle_chunk, chunk_size=4)) * cotangent)
+    loss_oracle = partial(oracle_loss, eps=1e-2)
 
     @jax.jit
     @jax.vmap
@@ -243,7 +248,7 @@ def test_default_eps_gradients_hold_their_prior_bound():
         return jnp.sum(module.apply(variables, x) * cotangent)
 
     def loss_oracle(x, p):
-        return jnp.sum(oracle_layer(x, p, -5.0, 1e-5, partial(oracle_chunk, chunk_size=4)) * cotangent)
+        return oracle_loss(x, p, cotangent, eps=1e-5)
 
     grad_x, grad_params = jax.grad(loss_module, argnums=(0, 1))(x, variables)
     ours = {"x": grad_x, **oracle_params(grad_params)}
