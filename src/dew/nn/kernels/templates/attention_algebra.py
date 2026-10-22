@@ -160,6 +160,9 @@ def headroom(dtype, keys: int, initial: bool) -> bool:
     """Whether a call's weighted values can pass fp32's largest: values of `dtype` whose largest times
     `keys + 1` reaches `2^HEADROOM` (bf16's and fp32's, not fp16's), or an initial state, whose sums may
     be any size. A call that cannot compiles no guard (`guarded`)."""
+    import os
+    if os.environ.get("DEW_NO_GUARD"):
+        return False
     return initial or float(jnp.finfo(dtype).max) * (keys + 1) >= 2.0 ** HEADROOM
 
 
@@ -281,6 +284,9 @@ def weights(spec: Forward, s: jax.Array, m: jax.Array) -> jax.Array:
     product's rounding, up to an ulp of the logit, 2^104 at fp32's largest, which an exponential takes to
     0 or infinity; below the maximum the difference is negative either way."""
     peak = expand(_safe(spec, m), s)
+    import os
+    if os.environ.get("DEW_PLAIN_WEIGHTS"):
+        return spec.power(s - peak)
     return spec.power(jnp.where(s < peak, s - peak, 0.0))
 
 
