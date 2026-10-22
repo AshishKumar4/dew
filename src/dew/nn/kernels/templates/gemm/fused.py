@@ -108,8 +108,8 @@ def _prologue(fusion) -> tuple[jax.Array, dict]:
                   'prologue_vjp': vjp}
 
 
-CALLS = frozenset({'pjit', 'jit', 'closed_call', 'core_call', 'remat', 'checkpoint', 'custom_jvp_call',
-                   'custom_vjp_call', 'custom_vjp_call_jaxpr'})
+CALLS = frozenset({'pjit', 'jit', 'closed_call', 'core_call', 'remat', 'remat2', 'checkpoint',
+                   'custom_jvp_call', 'custom_vjp_call', 'custom_vjp_call_jaxpr'})
 """The equations whose bodies the split reads through (a jitted, checkpointed or custom-derivative call, as
 Dew's own norms are): their values are their bodies'; their derivatives stay the producer's (`_whole_vjp`)."""
 
