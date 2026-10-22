@@ -194,9 +194,9 @@ HOPPER = pytest.mark.skipif(not (triton_runs() and gpu_target().wgmma),
 @pytest.mark.skipif(not triton_runs(), reason="needs a GPU the Pallas kernels compile for")
 @pytest.mark.parametrize("kernel,width,features", [
     (grouped_matmul.Gmm, 192, 320), (grouped_matmul.GmmTransposed, 192, 320), (grouped_matmul.Tgmm, 192, 320),
-    pytest.param(grouped_matmul.MosaicGmm, 384, 768, marks=HOPPER),
-    pytest.param(grouped_matmul.MosaicGmmTransposed, 384, 768, marks=HOPPER),
-    pytest.param(grouped_matmul.MosaicTgmm, 384, 768, marks=HOPPER)])
+    pytest.param(grouped_matmul.MosaicGmm, 768, 768, marks=HOPPER),
+    pytest.param(grouped_matmul.MosaicGmmTransposed, 768, 768, marks=HOPPER),
+    pytest.param(grouped_matmul.MosaicTgmm, 768, 768, marks=HOPPER)])
 def test_every_tile_of_the_grouped_kernels_holds_the_float64_gate(kernel, width, features):
     """Each tile the tuner may pick for a launch, of the implementation the
     launch is forced to, over groups ragged against every tile size, one
@@ -205,11 +205,14 @@ def test_every_tile_of_the_grouped_kernels_holds_the_float64_gate(kernel, width,
     from float64 sums of the same bf16 operands, over the site's draws. The
     space declares only tiles proven here. Triton's widths are ragged
     against its tiles, which mask them; Mosaic's divide by every tile width
-    of its space (64, 128 and 192), which it needs."""
+    of its space (64 to 256, and a pair's 256 rows of depth), which it needs,
+    so its cooperative tiles and pairs are among those checked."""
     gate = _tile_gate(kernel, width, features)
     with kernel_choices(grouped_matmul=kernel.name):
         configs = each_config(kernel, _tile_gate_arm('pallas'), *gate.draw(0))
     assert len(configs) > 1
+    if kernel.name == 'mosaic_gpu':
+        assert {(c.warpgroups, c.cluster) for c in configs} == {(1, 1), (2, 1), (2, 2)}
     for config in configs:
         gate.check(config)
 
