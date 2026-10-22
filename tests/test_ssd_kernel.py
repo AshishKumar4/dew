@@ -3,12 +3,12 @@
 `dew.nn.kernels.ssd` computes what `xla_chunk_scan`, transformers' `mamba2_chunk_scan` in its order,
 computes. The kernel is written for TPU (a GPU runs mamba_ssm's own kernels,
 `dew.nn.kernels.mamba_ssd`); a host without one runs it through
-`pallas_call(interpret=True)`, which checks shapes, dtypes, resets and state gradients, and holds the
-host cases' numbers to check 1 as the compiled TPU kernel holds its own.
+`pallas_call(interpret=True)`, which checks shapes, dtypes, resets and state gradients. Check 1 holds
+every geometry's numbers on a TPU, compiled, and the host geometries' on the CPU lane too, interpreted.
 
 Interpreted, the kernel and XLA's scan are two Dew paths on the CPU, each compiled without
 XLA:CPU's YNNPACK fusions (`without_ynn`), whose microkernels follow the host's instruction set, so
-that the host cases' verdicts do not.
+that the host geometries' verdicts do not.
 
 One driver (`assert_kernel_parity`) holds every case to the same rule: the
 kernel's forward, final state and all five gradients finite and, by
@@ -169,8 +169,8 @@ def evaluated(scan, operands, seeded):
 
 def parity_functions(chunk_size: int, roundings: int, platform: str = "tpu"):
     """The kernel's output, final state and all five gradients for `platform` (interpreted off it),
-    XLA's, and XLA's independently checked float64 truth: the kernel and the scan, two Dew paths,
-    without YNNPACK fusions on the CPU lane (`without_ynn`)."""
+    XLA's, and XLA's independently checked float64 truth. The kernel and the scan, two Dew paths,
+    compile without YNNPACK fusions on the CPU lane (`without_ynn`)."""
     mine = without_ynn(lambda operands, seeded: evaluated(
         lambda *o: ssd_chunk_scan(*o, chunk_size, platform), operands, seeded))
     xla = without_ynn(lambda operands, seeded: evaluated(
@@ -261,12 +261,13 @@ SEEDS = {
     ("shape", ((1, 4096, 4, 64, 64, 1), 128)): 256,
 }
 """Sized by seeds_for on XLA's output, final state and all five gradients (on armada), resolving at
-these counts against the TPU's own XLA on a v5e (11 cases) and, interpreted on equal dots, the nine
-host cases on an AMD x86-64-v4 host."""
+these counts against the TPU's own XLA on a v5e (11 cases) and, interpreted without YNNPACK's
+fusions, the nine host cases on an AMD x86-64-v4 host."""
 
 
 on_device = pytest.mark.tpu(reason="needs a tpu, the one backend the kernel is chosen on")
-on_host = pytest.mark.cpu(reason="interpreted on the CPU lane, both arms without YNNPACK's fusions")
+interpreted = pytest.mark.skipif(jax.default_backend() == "gpu", reason="a GPU runs mamba_ssm's kernels, "
+                                 "and this one is measured interpreted on the CPU lane")
 
 # (batch, steps, heads, head width, state, groups), chunk: a tail of one step short, whole chunks, a tail
 # of one step over, four chunks with a ragged tail, at widths the kernel takes and fewer groups than heads;
@@ -274,19 +275,24 @@ on_host = pytest.mark.cpu(reason="interpreted on the CPU lane, both arms without
 # a chunk of 128 over 4 heads of 64 channels and a state of 64, which `ssd_kernel_runs` takes.
 CASES = [
     *(pytest.param("fixture", (chunk, resets), False, id=f"fixture-{label}{'-resets' if resets else ''}",
-                   marks=on_host)
+                   marks=interpreted)
       for chunk, label in ((32, "three-chunks-ragged"), (128, "one-chunk")) for resets in (False, True)),
-    pytest.param("shape", ((2, 63, 4, 8, 8, 2), 64), False, id="one-short", marks=on_host),
-    pytest.param("shape", ((2, 64, 4, 8, 8, 2), 64), False, id="whole-chunk", marks=on_host),
-    pytest.param("shape", ((2, 65, 4, 16, 8, 2), 64), False, id="one-over", marks=on_host),
-    pytest.param("shape", ((2, 193, 4, 16, 8, 2), 64), False, id="four-chunks-ragged", marks=on_host),
-    pytest.param("shape", ((2, 257, 2, 64, 128, 1), 256), False, id="default-chunk", marks=on_host),
+    pytest.param("shape", ((2, 63, 4, 8, 8, 2), 64), False, id="one-short", marks=interpreted),
+    pytest.param("shape", ((2, 64, 4, 8, 8, 2), 64), False, id="whole-chunk", marks=interpreted),
+    pytest.param("shape", ((2, 65, 4, 16, 8, 2), 64), False, id="one-over", marks=interpreted),
+    pytest.param("shape", ((2, 193, 4, 16, 8, 2), 64), False, id="four-chunks-ragged", marks=interpreted),
+    pytest.param("shape", ((2, 257, 2, 64, 128, 1), 256), False, id="default-chunk", marks=interpreted),
     *(pytest.param("shape", ((1, length, 4, 64, 64, 1), 128), True, id=f"compiled-{length}-steps",
                    marks=on_device) for length in (1024, 4096)),
 ]
 
 
-@pytest.mark.parametrize(("kind", "case", "compiled"), CASES)
+# The host geometries again on a TPU, where the kernel compiles, for the tier selects its tests by mark.
+ON_DEVICE = [pytest.param(*param.values, id=f"tpu-{param.id}", marks=on_device)
+             for param in CASES if not param.values[2]]
+
+
+@pytest.mark.parametrize(("kind", "case", "compiled"), CASES + ON_DEVICE)
 def test_the_kernel_is_as_exact_as_the_xla_scan(reference, kind, case, compiled):
     """The kernel, interpreted on the host or compiled on a TPU, against float64: every forward and
     gradient leaf over declared draws (check 1)."""
@@ -307,10 +313,10 @@ def test_the_kernel_is_as_exact_as_the_xla_scan(reference, kind, case, compiled)
 HOST_CASES = [pytest.param(*param.values[:2], id=param.id) for param in CASES if not param.values[2]]
 
 
-@on_host
+@pytest.mark.skipif(jax.default_backend() != "cpu", reason="YNNPACK is XLA:CPU's")
 def test_the_interpreted_kernel_and_the_scan_compile_no_ynnpack_fusion():
-    """Both arms of a host case's check 1 run on XLA:CPU's own code, which reads no instruction set
-    at run time (`without_ynn`)."""
+    """Both arms of a host case's check 1 run on XLA:CPU's own code, compiled for the host's
+    instruction set with no dispatch at run time (`without_ynn`)."""
     operands, seeded = case_draw(None, "shape", ((2, 63, 4, 8, 8, 2), 64))(0)
     for arm in parity_functions(64, 0)[:2]:
         assert "ynn_fusion" not in arm.lower(operands, seeded).compile().as_text()

@@ -27,7 +27,7 @@ from reference_error import (
 )
 
 
-@pytest.mark.cpu(reason="WITHOUT_YNN is XLA:CPU's")
+@pytest.mark.skipif(jax.default_backend() != "cpu", reason="WITHOUT_YNN is XLA:CPU's")
 def test_without_ynn_compiles_no_ynnpack_fusion_on_the_cpu():
     """A dot and a reduction, which XLA:CPU otherwise hands to YNNPACK fusions, compile to none."""
     from reference_error import without_ynn
@@ -38,7 +38,7 @@ def test_without_ynn_compiles_no_ynnpack_fusion_on_the_cpu():
         assert "ynn_fusion" not in without_ynn(fn).lower(*operands).compile().as_text()
 
 
-@pytest.mark.cpu(reason="WITHOUT_YNN is XLA:CPU's")
+@pytest.mark.skipif(jax.default_backend() != "cpu", reason="WITHOUT_YNN is XLA:CPU's")
 def test_without_ynn_takes_a_callers_compiler_options_over_its_own():
     """A caller's setting of the fusion option is the one the program compiles under."""
     from reference_error import without_ynn

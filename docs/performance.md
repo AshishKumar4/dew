@@ -3363,6 +3363,19 @@ Kernel matrix, 2026-09-22, jax 0.11.2, forward plus backward medians, every cell
 
 On the RTX 4080 that one-program kernel ran 6x to 12x slower than XLA as Triton wherever it compiled (chunk 64, width 32: 1.39 against 0.22 ms; at batch 8 and 16 heads, 22.7 against 2.2 ms), and every chunk of 128 or 256 asked for 131 to 590 KB of shared memory. So it runs on TPU only, and a GPU runs mamba_ssm's own decomposition.
 
+### The SSD kernel's host check 1 without YNNPACK
+
+Interpreted on the CPU, the Pallas SSD kernel and XLA's scan both compile dots, reductions,
+element-wise and layout ops to YNNPACK fusions by default, and YNNPACK picks their microkernels at run
+time by the host's instruction set. Check 1 between them (`tests/test_ssd_kernel.py`) read the
+one-short case's state gradient at 1.598 (99.9% interval 1.581 to 1.617, 640 seeds) on an AMD EPYC
+Zen 4 host (x86-64-v4, AVX-512) and at 0.77 on a Zen 3 one (x86-64-v3, AVX2). With both arms compiled
+without the fusions (`tests/reference_error.py`'s `without_ynn`), the worst leaf over the nine host
+cases was 1.17 at 128 draws each on Zen 4, and the one-short case's worst 1.20 at 128 draws on Zen 3.
+Which fused op moved the verdict was not isolated. The bits still differ by host without the
+fusions, since XLA compiles for the host's instruction set (2090 of 4096 outputs moved between
+`--xla_cpu_max_isa=AVX` and no cap on one host); the verdicts do not.
+
 ### The Mamba-2 SSD scan on GPU: mamba_ssm's kernels
 
 `dew.nn.kernels.mamba_ssd` ports mamba_ssm 2.3.2.post1's Triton SSD (`mamba_chunk_scan_combined`) kernel for kernel to Pallas: five forward and nine backward launches, each a tuner `KernelOp`. `chunk_ssd` runs it wherever the GPU's target row names `'ssd': 'pallas'` (sm80 and sm90, measured below), and the XLA scan stays the oracle and the CPU and unmeasured-GPU path. Mamba-2 hands the scan its compute dtype, as mamba_ssm's conv hands its scan, so a bf16 model's `x`, `B` and `C` reach it in bf16. `chunk_ssd` forward, and forward plus backward of a sum of its output, bf16 `x`, `B`, `C` and fp32 step, median of 20 after a warmup, 2026-10-13, jax 0.11.2.post3. XLA is main `8ccb9cdfd`, whose scan casts every operand to fp32. mamba_ssm ran on torch 2.14 and Triton 3.8 on the same GPU in the same session. The port ran at its heuristic configs:
