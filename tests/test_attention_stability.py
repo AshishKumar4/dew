@@ -32,12 +32,14 @@ PINS = {attention_triton.TritonForward: attention_triton.Tiles(32, 32, 4, 2),
 @dataclasses.dataclass(frozen=True)
 class Family:
     """A stability family: `draw(seed)` gives the queries `[B, Q, H, D]`, keys and values `[B, K, H, D]`,
-    the sinks `[H]` or None and the output cotangent, fp32, run in `dtype`, the softmax's scale
+    the sinks `[H]`, a resumed state `(m [B, H, Q], total, acc [B, H, Q, D])` or None, and the output
+    cotangent, fp32, run in `dtype`, the softmax's scale
     1/sqrt(D); the keys each query keeps `[B, 1, Q, K]` and the same keys as the template's spans'
     arguments (`template.spans`); the rows `[B, Q]` that see no key, whose output and gradients are
     zero (`empty`); whether the default form holds it (`folded`), False only for the fold's documented
-    divergences (`algebra.Forward.base2`), which run natural alone; and its declared seeds, sized by
-    `reference_error.seeds_for`."""
+    divergences (`algebra.Forward.base2`), which run natural alone; its declared seeds, sized by
+    `reference_error.seeds_for`; and the slices the decode kernel cuts each row's keys into (`splits`),
+    whose states it merges."""
 
     draw: Callable[[int], tuple]
     keep: np.ndarray
@@ -46,6 +48,7 @@ class Family:
     folded: bool = True
     dtype: str = "float32"
     seeds: int = 8
+    splits: int = 1
 
 
 def _normal(seed: int, *shapes) -> list[np.ndarray]:
@@ -206,6 +209,53 @@ def _families() -> dict[str, Family]:
     families["causal queries before every key"] = Family(
         drawn(4, 4), before, {"causal": True, "starts": np.full(ROWS, 2)},
         empty=np.broadcast_to(np.asarray([True, True, False, False]), (ROWS, 4)))
+    def beside(seed):
+        # Two documents a row: two queries over a key of logit 0 and value near 1e38 and one of logit -87
+        # and value near 1e30 in another column, which no overflow touches; four queries over four equal
+        # keys whose values near 1e38 overflow their sum. Only the latter rows may shift.
+        query, key, value, dout = _normal(seed, (ROWS, 6, 1, 16), (ROWS, 6, 1, 16), (ROWS, 6, 1, 16),
+                                          (ROWS, 6, 1, 16))
+        query[:, :2], query[:, :2, 0, 0] = 0.0, 1.0
+        query[:, 2:] = 0.0
+        key[:, 0], key[:, 1] = 0.0, 0.0
+        key[:, 1, 0, 0] = -87.0 * 4
+        value[:, 0, 0, 0] = _uniform(seed + 5, 5e37, 1e38, (ROWS,))
+        value[:, 1, 0, 1] = _uniform(seed + 6, 5e29, 1e30, (ROWS,))
+        value[:, 2:, 0, 0] = _uniform(seed + 7, 9e37, 1e38, (ROWS, 4))
+        return query, key, value, None, dout * np.float32(2.0 ** -8)
+
+    documents = np.tile(np.asarray([[1, 1, 2, 2, 2, 2]], np.int32), (ROWS, 1))
+    families["a row that overflows beside one that does not"] = Family(
+        beside, documents[:, None, :, None] == documents[:, None, None, :], {"segment_ids": documents})
+
+    def slices(seed):
+        # One query a row over 64 equal keys whose values near 1e37 sum within fp32 over each half and
+        # past it over both: two decode slices each finite, whose merge overflows.
+        value = np.array(_uniform(seed, 6e36, 1e37, (ROWS, 64, 1, 16)))
+        (dout,) = _normal(seed + 1, (ROWS, 1, 1, 16))
+        return (np.zeros((ROWS, 1, 1, 16), np.float32), np.zeros((ROWS, 64, 1, 16), np.float32), value, None,
+                dout * np.float32(2.0 ** -8))
+
+    families["two finite slices whose merge overflows"] = Family(slices, kept(1, 64), splits=2)
+
+    def resumed(seed):
+        # One query a row resumed from a state of denominator 2^100 to 2^127 and weighted values that
+        # times a draw in [-1, 1), over two keys of logit 0 whose values are the denominator times a draw:
+        # each key's share of the output is about that draw, which a shift for the denominator's size
+        # must not flush.
+        total = 2.0 ** np.floor(_uniform(seed, 100.0, 128.0, (ROWS, 1, 1)))
+        acc = total[..., None] * _uniform(seed + 1, -1.0, 1.0, (ROWS, 1, 1, 16))
+        value = total[:, 0, 0, None, None, None] * _uniform(seed + 2, -1.0, 1.0, (ROWS, 2, 1, 16))
+        (dout,) = _normal(seed + 3, (ROWS, 1, 1, 16))
+        state = (np.zeros((ROWS, 1, 1), np.float32), total.astype(np.float32), acc.astype(np.float32))
+        return (np.zeros((ROWS, 1, 1, 16), np.float32), np.zeros((ROWS, 2, 1, 16), np.float32),
+                value.astype(np.float32), state, dout)
+
+    families["a resumed state of a large denominator"] = Family(resumed, kept(1, 2))
+    for low, high, label in ((-3.0, 3.0, ""), (1e38, 3e38, " near fp32's largest")):
+        # One query a row, so the decode kernel takes the family too.
+        families[f"a decode step's sink{label} and one key"] = Family(
+            with_sinks(drawn(1, 1), low, high), kept(1, 1))
     ids = np.tile(np.asarray([[1, 2, 3, 3]], np.int32), (ROWS, 1))
     families["documents of one key"] = Family(drawn(4, 4), _causal(4, 4, ROWS) & (ids[:, None, :, None] ==
                                                                                   ids[:, None, None, :]),
@@ -226,20 +276,23 @@ def _spans(family: Family, query, key) -> template.KeySpans:
     return template.spans(query.shape[1], key.shape[1], query.shape[0], **arguments)
 
 
-def _hooks(query, sinks) -> template.Hooks | None:
-    if sinks is None:
+def _hooks(query, extra) -> template.Hooks | None:
+    """The template's hooks for a draw's sinks `[H]` or resumed state `(m, total, acc)`."""
+    if extra is None:
         return None
+    if isinstance(extra, tuple):
+        return template.Hooks(initial=template.Initial(*extra))
     batch, queries, _, width = query.shape
-    return template.Hooks(initial=template.sinks(sinks, batch, queries, width))
+    return template.Hooks(initial=template.sinks(extra, batch, queries, width))
 
 
 def _cast(family: Family, draw: Callable[[int], tuple]) -> Callable[[int], tuple]:
     """`draw` with its operands rounded to the family's dtype, the sinks fp32."""
     def cast(seed: int):
-        query, key, value, sinks, dout = draw(seed)
+        query, key, value, extra, dout = draw(seed)
         operands = (jnp.asarray(x, jnp.dtype(family.dtype)) for x in (query, key, value, dout))
         query, key, value, dout = operands
-        return query, key, value, None if sinks is None else jnp.asarray(sinks), dout
+        return query, key, value, jax.tree.map(jnp.asarray, extra), dout
 
     return cast
 
@@ -247,13 +300,33 @@ def _cast(family: Family, draw: Callable[[int], tuple]) -> Callable[[int], tuple
 def _reference(family: Family, *, anchored: bool) -> Callable:
     """The reference's output, in the call's dtype as every attention call returns it, and its query, key
     and value gradients under the cotangent; the float64 truth's derivative `anchored`."""
-    def run(query, key, value, sinks, dout):
+    def run(query, key, value, extra, dout):
         def attend(q, k, v):
-            return exact_attention(q, k, v, sinks, keep=family.keep, anchored=anchored)
+            if isinstance(extra, tuple):
+                return _resumed_attention(q, k, v, extra, family.keep)
+            return exact_attention(q, k, v, extra, keep=family.keep, anchored=anchored)
         out, pull = jax.vjp(attend, query, key, value)
         return (out.astype(query.dtype), *pull(dout.astype(out.dtype)))
 
     return run
+
+
+def _resumed_attention(query, key, value, state, keep):
+    """Attention resumed from a softmax state `(m, total, acc)` (one query head a key head), written apart
+    from Dew with normalized weights, so a state whose sums are near fp32's largest stays finite: the
+    state's weight `total e^(m - M)` and each kept key's `e^(s - M)` over their sum, the state reading its
+    values' mean `acc / total`."""
+    m, total, acc = (jnp.asarray(x, query.dtype) for x in state)
+    logits = jnp.einsum("bqhd,bkhd->bhqk", query, key) / jnp.sqrt(jnp.asarray(query.shape[-1], query.dtype))
+    logits = jnp.where(keep, logits, -jnp.inf)
+    top = jnp.maximum(m, jnp.max(logits, axis=-1))
+    own = total * jnp.exp(m - top)
+    weights = jnp.exp(logits - top[..., None])
+    denominator = own + weights.sum(axis=-1)
+    mean = acc / total[..., None]
+    shares = weights / denominator[..., None]
+    out = mean * (own / denominator)[..., None] + jnp.einsum("bhqk,bkhd->bhqd", shares, value)
+    return jnp.swapaxes(out, 1, 2)
 
 
 def _mainloops(family: Family, form) -> dict[str, Callable]:
@@ -302,9 +375,11 @@ def test_attention_is_finite_and_as_exact_as_the_reference_at_fp32s_edges(family
         _held_empty(family, jax.jit(mainloop)(*draw(0)), label)
 
 
-DECODED = [(family, form) for family, form in RUNS if FAMILIES[family].draw(0)[0].shape[1] == 1
-           and FAMILIES[family].draw(0)[0].shape[3] >= 16]
-"""The families a decode step is: one query a row, a head width the decode kernel takes (16 to 256)."""
+DECODED = [(family, form) for family, form in RUNS
+           if FAMILIES[family].draw(0)[0].shape[1] == 1 and FAMILIES[family].draw(0)[0].shape[3] >= 16
+           and not isinstance(FAMILIES[family].draw(0)[3], tuple)]
+"""The families a decode step is: one query a row, a head width the decode kernel takes (16 to 256),
+sinks or none (a resumed state is the template's)."""
 
 
 def _cache(array: jax.Array) -> jax.Array:
@@ -325,8 +400,9 @@ def test_decode_is_finite_and_as_exact_as_the_reference_at_fp32s_edges(family, f
     def decoded(query, key, value, sinks, dout):
         del dout
         count = np.full(query.shape[0], key.shape[1]) if lengths is None else lengths
-        return decode_attention.attend(query, _cache(key), _cache(value), jnp.asarray(count, jnp.int32),
-                                       sinks=sinks, interpret=True, **natural)
+        with tuning.pinned({decode_attention.DecodeAttention: decode_attention.Split(family.splits)}):
+            return decode_attention.attend(query, _cache(key), _cache(value), jnp.asarray(count, jnp.int32),
+                                           sinks=sinks, interpret=True, **natural)
 
     def output(fn):
         return lambda *operands: fn(*operands)[0]

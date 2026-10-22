@@ -460,3 +460,13 @@ def test_an_fp32_cpu_arm_is_as_exact_as_the_reference_at_aligned_tiles(causal):
     draw = drawing(200, 300, jnp.float32, width=128, value_width=128)
     assert_as_exact(jax.jit(ours), jax.jit(reference), draw,
                     f"plain mainloop fp32 width 128 {'causal' if causal else 'full'}", seeds=8)
+
+
+def test_the_fold_reads_its_factor_as_the_kernel_rounds_it():
+    """A scale whose product with log2(e) is below 1 but rounds to 1 in fp32 does not fold: the fold's
+    exactness (`algebra.base2_maximum`) needs every folded logit an ulp below fp32's largest, which a
+    factor of 1 does not give."""
+    just_below = (1 - 2.0 ** -40) / algebra.LOG2E
+    assert just_below * algebra.LOG2E < 1
+    assert not algebra.Forward("full", 1, ids=False, scale=just_below).base2
+    assert algebra.Forward("full", 1, ids=False, scale=0.5).base2
