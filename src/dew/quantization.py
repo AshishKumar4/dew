@@ -1173,6 +1173,37 @@ def _providers() -> tuple[type, type]:
                 _einsum_fn=_scaled_in_float32(qwix.einsum),
                 _conv_general_dilated_fn=_scaled_in_float32(qwix.conv_general_dilated))
 
+        def _recorded(self, op: str, weight) -> bool:
+            """Whether `weight` is a stored quantized kernel that reaches `op` with no rule matching
+            it, as an unpacked task's member does under a rule that names its packed group
+            (`dew.inference.projections.unpacked`): it multiplies by the recipe it records, its
+            activation unquantized, where every rule leaves activations so; a rule that quantizes
+            them records no recipe a member could take, which refuses."""
+            if not isinstance(weight, Annotated) or self._matched(op):
+                return False
+            if any(rule.act_qtype is not None for rule in self._rules):
+                raise ValueError(f"a quantized kernel reached a {op} no rule matches, and the rules quantize "
+                                 "activations, whose recipe the kernel does not record; name its members in "
+                                 "the patterns")
+            return True
+
+        def dot_general(self, lhs, rhs, dimension_numbers, precision=None,
+                        preferred_element_type=None, *, out_sharding=None):
+            if not self._recorded("dot_general", rhs):
+                return super().dot_general(lhs, rhs, dimension_numbers, precision, preferred_element_type,
+                                           out_sharding=out_sharding)
+            out = self._dot_general_fn(*_widened((lhs, rhs.array), preferred_element_type),
+                                       dimension_numbers, out_sharding=out_sharding)
+            return _honoured(out, preferred_element_type, None)
+
+        def einsum(self, einsum_str, *operands, **kwargs):
+            if len(operands) != 2 or not self._recorded("einsum", operands[1]):
+                return super().einsum(einsum_str, *operands, **kwargs)
+            preferred = kwargs.pop("preferred_element_type", None)
+            out_sharding = kwargs.pop("out_sharding", None)
+            out = self._einsum_fn(einsum_str, *_widened((operands[0], operands[1].array), preferred))
+            return _honoured(out, preferred, out_sharding)
+
         def promote_dtype(self, *args, **kwargs):
             # Qwix 0.1.8 passes a quantized kernel through, and its wrapper's own `astype` raises on
             # the QArray inside it (`flax_util.update_boxed` accepts boxes and arrays only): the
