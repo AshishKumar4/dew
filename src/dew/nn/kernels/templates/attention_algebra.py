@@ -49,11 +49,14 @@ class Forward:
 
     @property
     def base2(self) -> bool:
-        """Whether the logits stay in base 2 (log2(e) folded into the scale, then exp2, jax's mha's and
-        FlashAttention 2's arithmetic): no hook reads them, and the scale times log2(e) is at most 1, so
-        no product the reference keeps finite passes fp32's largest (a scale past 1/log2(e), 0.69, takes
-        the natural form instead). Its known limit, where the reference stays apart: the fold's rounding
-        can tie two logits an ulp apart that the scale's alone does not."""
+        """Whether the logits stay in base 2 (log2(e) folded into the scale, then exp2: FlashAttention 2's
+        and jax's mha's arithmetic): no hook reads them, and the scale times log2(e) is at most 1, so the
+        fold takes no product the reference keeps finite past fp32's largest (a scale past 1/log2(e),
+        0.69, takes the natural form). That guard covers only that overflow: the fold's extra rounding
+        remains at every scale, so at logit magnitudes near 1e9, or values near overflow, it can differ
+        from the reference (keys of 2 * 1610613120 and 2 * 1610612992 under a query of 1 at scale 0.5:
+        the reference weighs them 1 and 0, the fold 0.5 each, and a cotangent of 2**125 then overflows
+        its backward). On drawn inputs it passes check 1."""
         return self.score_mod is None and self.scale * LOG2E <= 1.0
 
     @property
