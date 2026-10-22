@@ -302,13 +302,7 @@ def test_a_bf16_projection_at_the_highest_precision_holds_the_contract(sizes):
     dy = rounded(rng.normal(size=(24, 16)))
     sizes = sizes.astype(np.int32)
     # Rows past the routed ones belong to no expert and come back zero.
-    rows = np.searchsorted(np.cumsum(sizes), np.arange(24), side='right')
-    forward, input_oracle = np.zeros((24, 16)), np.zeros((24, 16))
-    kernel_oracle = np.zeros((8, 16, 16))
-    for row in np.flatnonzero(np.arange(24) < sizes.sum()):
-        forward[row] = x[row] @ kernel[rows[row]]
-        input_oracle[row] = dy[row] @ kernel[rows[row]].T
-        kernel_oracle[rows[row]] += np.outer(x[row], dy[row])
+    forward, input_oracle, kernel_oracle = oracle.products(x, kernel, dy, sizes)
 
     def loss(x, kernel):
         projected = expert_projection(x, kernel, jnp.asarray(sizes), jnp.bfloat16, 'xla', 'highest')
