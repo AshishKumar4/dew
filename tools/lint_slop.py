@@ -1754,7 +1754,7 @@ GATE = frozenset({"tests/reference_error.py", "tests/op_certificates.py", "tools
                   "tests/test_reference_orders.py", "tests/test_reference_graph.py",
                   "tests/test_gate_calibration.py", "tests/test_float64_terms.py"})
 """The gate's modules and the tests of the gate itself, the one place a float is compared within a
-bound (bible §7, 2026-10-20): every other comparison goes through its assertion."""
+bound (bible §7): every other comparison goes through its assertion."""
 INVENTORY = "tools/tolerance_inventory.json"
 RULE = "tools/lint_tolerances.py"
 """SLOP020's reading of a file (`tolerance_rules`), whose change may grow what the inventory holds."""
@@ -2033,7 +2033,7 @@ RECORDED = {"site/src/data/hero.py": "site/src/data/capture.json"}
 """Python files whose bytes a recording pins, each with the recording that names their sha256
 (`meta.script_sha256`): the landing hero's script, whose capture the site's build checks it against
 (site/src/pages/index.astro), so an edit fails the build until the hero is recorded again on a host as
-fast as the recording's (user, 2026-10-16: the 60 s recording stays). The gate reads such a file only
+fast as the recording's (the owner keeps the 60 s recording). The gate reads such a file only
 once its bytes are no longer the recorded ones, which an edit makes them."""
 
 
