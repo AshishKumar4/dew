@@ -357,7 +357,7 @@ def test_a_scanned_decoder_serves_from_its_banks_what_each_request_draws_alone(d
     assert_same_generation(server(["12"], 6, key=3)[0], bound.bind(other)("12", 6, key=3))
 
 
-BANKED_SEEDS = 8
+BANKED_SEEDS = 16
 """The banked decoder's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for` on armada."""
 
 
