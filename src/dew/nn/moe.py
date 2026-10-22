@@ -33,7 +33,7 @@ from jax.sharding import PartitionSpec as P
 
 from dew.nn.dense import Dense
 
-from .activations import GatedActivation, gated_product, relu2
+from .activations import GatedActivation, gated_product, relu2, swiglu_clamped
 from .blocks import normal_kernel
 from .flops import MissingFlopsCount, counted_flops, projection_flops
 from .kernels.generation import backend, ran_kernel, route, triton_runs
@@ -978,16 +978,14 @@ class ExpertMLP(nn.Module):
                 x, kernel, sizes, dtype, self.implementation, self.precision))
 
         # The same residual names as the dense MLP's, so one remat policy
-        # covers both (decoder_block.RESIDUALS).
+        # covers both (mixer_base.RESIDUALS).
         if self.activation == 'relu2':
             up = checkpoint_name(linear(tokens, kernels[0]), 'up_proj')
             hidden = relu2(up)
             return checkpoint_name(linear(hidden, kernels[1]), 'down_proj')
         gate = checkpoint_name(linear(tokens, kernels[0]), 'gate_proj')
         up = checkpoint_name(linear(tokens, kernels[1]), 'up_proj')
-        if self.swiglu_limit is not None:
-            gate = jnp.minimum(gate, self.swiglu_limit)
-            up = jnp.clip(up, -self.swiglu_limit, self.swiglu_limit)
+        gate, up = swiglu_clamped(gate, up, self.swiglu_limit)
         return checkpoint_name(linear(gated_product(self.activation)(gate, up), kernels[2]), 'down_proj')
 
     def _combine(self, slots: jax.Array, weights: jax.Array) -> jax.Array:

@@ -13,6 +13,7 @@ read, and `sparse_latent_attention` attends it without that mask.
 import jax
 import jax.numpy as jnp
 
+from dew.nn.inputs import sequence_blocks
 from dew.nn.precision import at_least_fp32, float32_einsum, float32_products
 from dew.nn.scatter import DROPPED
 
@@ -115,8 +116,7 @@ def sparse_latent_attention(query_nope, query_rot, latent, rot, key_weight, valu
     blocks = -(-length // block)
 
     def blocked(x):
-        x = jnp.pad(x, [(0, 0), (0, blocks * block - length)] + [(0, 0)] * (x.ndim - 2))
-        return jnp.moveaxis(x.reshape(batch, blocks, block, *x.shape[2:]), 1, 0)
+        return sequence_blocks(x, block, blocks, leading=True)
 
     def gathered(table, where):
         return jax.vmap(lambda rows, at: rows[at])(table, where)

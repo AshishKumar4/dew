@@ -13,7 +13,17 @@ from dew.data.dataset import DataPartition
 from dew.diffusion import presets
 from dew.inputs import CharTable, Condition, Field, InputSpec
 from dew.nn.backbones import SimpleDiT
-from dew.objectives.base import EXAMPLE_ROWS, Aux, Objective, Ratio, Recorder, Step, example_stream, stream
+from dew.objectives.base import (
+    EXAMPLE_ROWS,
+    EXAMPLE_STREAM,
+    Aux,
+    Objective,
+    Ratio,
+    Recorder,
+    Step,
+    example_stream,
+    stream,
+)
 from dew.objectives.diffusion.few_step import MeanFlowObjective, ShortcutObjective
 from dew.training.distributed import marked
 from dew.training.transaction import example_places
@@ -346,3 +356,125 @@ def test_a_distilled_inpainting_step_reads_no_draw_of_its_attempt():
         return np.asarray(stats.total)
 
     np.testing.assert_array_equal(loss(1), loss(2))
+
+
+class Witnessed(Objective):
+    """A loss of one weight against each row's own uniform draw and a boundary of its noised target,
+    whose statistics are a pair it reduces itself, which an accumulation window keeps by replaying
+    its batches at the commit."""
+
+    def fresh_variables(self, key, held):
+        return {"params": {"w": jnp.asarray(.2)}}
+
+    def loss(self, variables, batch, step):
+        w, rows = variables["params"]["w"], batch["y"].shape[0]
+        noise = step.sample("noise", jax.random.uniform, (), dtype=jnp.float32, rows=rows)
+        target = step.boundary("target", batch["y"] + noise)
+        return (jnp.sum((w - target) ** 2), jnp.asarray(rows, jnp.float32)), Aux({})
+
+    def reduce_loss(self, stats):
+        total, mass = stats
+        return total / mass, mass > 0
+
+
+@pytest.mark.parametrize("host", [False, True])
+def test_a_recording_step_returns_what_each_evaluation_drew_its_replays_each_their_own(host):
+    """`Trainer(record=True)` returns, under its metrics' `RECORD`, each evaluation's samples and
+    boundaries by name, its rows' places and its column check: an accepted microbatch's own, then at
+    the commit the window's other microbatches as replayed, each equal to what it drew when it ran
+    and to the example's own draw, resident and host-master alike."""
+    from dew.objectives.base import taken_record
+    from dew.training import Layout, MeshSpec, Trainer
+
+    layout = Layout(host=("variables",) if host else (), min_shard=1, tolerance=1.)
+    trainer = Trainer(Witnessed(), optax.sgd(.1), key=jax.random.key(4), accumulation=2, layout=layout,
+                      checkpoints=None, tracker=None, record=True)
+    trainer.device_mesh = MeshSpec().build(jax.devices()[:1])
+    state = trainer.initial_state()
+    first = {"y": jnp.arange(4, dtype=jnp.float32), EXAMPLE_ROWS: jnp.arange(4, dtype=jnp.int32)}
+    second = {"y": jnp.arange(4, 8, dtype=jnp.float32), EXAMPLE_ROWS: jnp.arange(4, dtype=jnp.int32)}
+    run = trainer.compile(state, first)
+    key = jax.random.fold_in(jax.random.fold_in(jax.random.fold_in(state.key, EXAMPLE_STREAM), 0), 0)
+    state, _, opened, *_ = run(state, first)
+    state, _, closed, *_ = run(state, second)
+    assert int(state.updates) == 1
+    opened, closed = (jax.device_get(taken_record(metrics)[0]) for metrics in (opened, closed))
+    # The first attempt: its own evaluation, and no replay (the window has not committed).
+    np.testing.assert_array_equal(opened["evaluated"], [True, False])
+    np.testing.assert_array_equal(opened["example_index"][0], np.arange(4))
+    # The commit: its own microbatch, the second slot's, then the first slot's replay.
+    np.testing.assert_array_equal(closed["evaluated"], [True, True])
+    np.testing.assert_array_equal(closed["example_index"], [np.arange(4, 8), np.arange(4)])
+    assert bool(np.all(opened["column_ok"][:1])) and bool(np.all(closed["column_ok"]))
+    np.testing.assert_array_equal(closed["values"]["noise"][1], opened["values"]["noise"][0])
+    np.testing.assert_array_equal(closed["values"]["target"][1], opened["values"]["target"][0])
+    # Each value is the example's own draw (`Step.sample`), by its place.
+    own = Step(jnp.asarray(0), jax.random.key(0), None, example_key=key,
+               example_index=jnp.arange(8, dtype=jnp.int32), example_count=8)
+    drawn = np.asarray(own.sample("noise", jax.random.uniform, (), dtype=jnp.float32, rows=8))
+    noise = closed["values"]["noise"]
+    np.testing.assert_array_equal(np.concatenate([noise[1], noise[0]]), drawn)
+
+
+def test_a_record_flags_rows_placed_apart_from_their_slot_and_column():
+    """A recording step holds each evaluation's places to the ones its window slot and its batch's column
+    give it (`recorded`): two rows' places swapped, or a microbatch read under another slot's places,
+    fail the check; the places its slot gives pass."""
+    from dew.objectives.base import Evaluated
+    from dew.training.transaction import recorded
+
+    column = jnp.arange(2, dtype=jnp.int32)
+
+    def flags(*indices):
+        evaluations = [(Evaluated(values={"noise": jnp.zeros((2,))},
+                                  example_index=jnp.asarray(index, jnp.int32), column=column),
+                        example_places(slot, 1, 2, column)) for slot, index in enumerate(indices)]
+        return np.asarray(recorded(evaluations, jnp.ones((len(indices),), bool))["column_ok"]).tolist()
+
+    assert flags([0, 1], [2, 3]) == [True, True]
+    assert flags([1, 0], [2, 3]) == [False, True]
+    assert flags([2, 3], [0, 1]) == [False, False]
+
+
+class WitnessedMean(Witnessed):
+    """`Witnessed` pooling a shared mean, which a window sums and never replays."""
+
+    def loss(self, variables, batch, step):
+        (total, mass), aux = super().loss(variables, batch, step)
+        return Ratio(total, mass), aux
+
+    def reduce_loss(self, stats):
+        return stats.mean()
+
+
+def test_a_split_recording_step_returns_every_microbatchs_evaluation():
+    """A step read in two microbatches returns both evaluations in the order they ran, each at the rows
+    its part reads, every row once, at the example's own draw."""
+    from dew.objectives.base import taken_record
+    from dew.training import MeshSpec, Trainer
+
+    trainer = Trainer(WitnessedMean(), optax.sgd(.1), key=jax.random.key(4), split=2, checkpoints=None,
+                      tracker=None, record=True)
+    trainer.device_mesh = MeshSpec().build(jax.devices()[:1])
+    state = trainer.initial_state()
+    batch = {"y": jnp.arange(4, dtype=jnp.float32), EXAMPLE_ROWS: jnp.arange(4, dtype=jnp.int32)}
+    key = jax.random.fold_in(jax.random.fold_in(jax.random.fold_in(state.key, EXAMPLE_STREAM), 0), 0)
+    _, _, metrics, *_ = trainer.compile(state, batch)(state, batch)
+    record = jax.device_get(taken_record(metrics)[0])
+    np.testing.assert_array_equal(record["example_index"], [[0, 2], [1, 3]])
+    np.testing.assert_array_equal(record["evaluated"], [True, True])
+    assert bool(np.all(record["column_ok"]))
+    own = Step(jnp.asarray(0), jax.random.key(0), None, example_key=key,
+               example_index=jnp.arange(4, dtype=jnp.int32), example_count=4)
+    drawn = np.asarray(own.sample("noise", jax.random.uniform, (), dtype=jnp.float32, rows=4))
+    np.testing.assert_array_equal(record["values"]["noise"], drawn[[[0, 2], [1, 3]]])
+
+
+def test_a_custom_step_refuses_the_trainers_record():
+    """A custom step builds its own Steps, which the trainer's record cannot reach: asking for both is
+    refused before anything is built."""
+    from dew.training import Trainer
+
+    with pytest.raises(ValueError):
+        Trainer(Witnessed(), optax.sgd(.1), key=jax.random.key(0), step=lambda objective, optimizer: None,
+                record=True)

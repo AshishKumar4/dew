@@ -46,7 +46,7 @@ from .attention import (
     scaled_dot_product_attention,
 )
 from .inputs import PLAIN_CALL, MixerCall, PredictionPhase, coordinates_of, valid_order
-from .mixer_base import MixerBase, MixerContext
+from .mixer_base import ATTENTION_CONTEXT_RESIDUALS, MixerBase, MixerContext
 from .mla import INDEXER, MultiHeadLatentAttention, latent_refusals, open_mla_cache
 from .precision import at_least_fp32, float32_dot_general, float32_einsum
 from .sharding import down_projection
@@ -375,7 +375,7 @@ class KPoolSparseAttentionMixer(MixerBase):
     indexer.
     """
 
-    residuals = ('q_proj', 'k_proj', 'v_proj', 'kv_proj', 'o_proj', 'context')
+    residuals = ATTENTION_CONTEXT_RESIDUALS
 
     q_lora_rank: int = 1536
     kv_lora_rank: int = 512

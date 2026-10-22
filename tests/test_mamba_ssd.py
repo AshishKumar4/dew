@@ -14,8 +14,10 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_leaves_as_exact, float64_terms, ieee_fixture, widened
+from reference_error import PRECISION, assert_as_exact, declared_seeds, indexed_recording, recording, widened
 from sharded import assert_runs_per_shard
+from ssd_support import mamba_ssd_draw, mamba_ssd_operands, mamba_ssd_xla, ssd_value_and_grad
+from tool_support import load
 from tuned import each_config
 
 from dew.nn.inputs import AttentionMetadata, MixerCall, coordinates
@@ -26,6 +28,7 @@ pytestmark = pytest.mark.kernel
 
 FIXTURES = Path(__file__).resolve().parent / "fixtures" / "mamba2"
 INTERPRETED = jax.default_backend() != "gpu"
+SEEDED = FIXTURES / "ssd_mamba_ssm_seeded.npz"
 
 
 def row_names_port(*, port: bool = True):
@@ -64,14 +67,9 @@ def scan_operands(batch, length, heads, width, groups, state, *, documents: bool
 
 def through(chunk: int, starts, dy, dfinal):
     """`chunk_ssd`'s output, final state and its seven operands' gradients under the cotangents."""
-    def loss(*args):
-        out, final = chunk_ssd(*args, chunk_size=chunk, starts=starts)
-        return jnp.sum(out * dy) + jnp.sum(final * dfinal), (out, final)
-
     def run(*args):
-        (_, (out, final)), grads = jax.value_and_grad(loss, argnums=range(len(args)), has_aux=True)(*args)
-        named = dict(zip(("x", "dt", "A", "B", "C", "D", "h0"), grads, strict=True))
-        return {"y": out, "final": final, **named}
+        return ssd_value_and_grad(lambda *values: chunk_ssd(*values, chunk_size=chunk, starts=starts),
+                                  args, dy, dfinal)
 
     return run
 
@@ -90,55 +88,62 @@ CASES = [
 ]
 
 
+def test_the_seeded_draw_preserves_the_mamba_ssm_native_inputs():
+    """The torch-free draw keeps every bit of the original recorder's fp32 and bf16 operands."""
+    recorder = load("mamba_ssd_reference")
+    rng = np.random.default_rng(recorder.SEED)
+    with np.load(FIXTURES / "ssd_mamba_ssm.npz") as stored:
+        for case in recorder.CASES:
+            batch, length, heads, width = stored[f"{case}.x"].shape
+            groups, state = stored[f"{case}.B"].shape[2:]
+            dtype = jnp.dtype(str(stored[f"{case}.dtype"]))
+            inputs = mamba_ssd_operands(rng, (batch, length, heads, width, groups, state), dtype,
+                                        f"{case}.seq" in stored)
+            for name, value in inputs.items():
+                other = stored[f"{case}.{name}"]
+                assert (value.dtype == other.dtype and value.shape == other.shape
+                        and value.tobytes() == other.tobytes()), f"{case}: {name} differs"
+
+
 @pytest.mark.parametrize("case, heads", CASES)
 def test_the_port_is_as_exact_as_mamba_ssm(case, heads):
-    """mamba_ssm's own numbers at IEEE products (tools/mamba_ssd_reference.py, its kernels on a GPU):
-    the port's output, final state and every gradient each within the float64 gate of mamba_ssm's
-    distance from the same scan in float64, each entry sized by its own float64 terms, and `A` and `D`,
-    which sum their cotangents over every token, held to the rounding of as many terms. With `heads` the
-    kernels that sum a group's heads take that many a program."""
-    stored = ieee_fixture(FIXTURES / "ssd_mamba_ssm.npz")
-    fixture = {name.removeprefix(f"{case}."): value
-               for name, value in stored.items() if name.startswith(f"{case}.")}
-    chunk, dtype = int(fixture["chunk"]), jnp.dtype(str(fixture["dtype"]))
-    seq = jnp.asarray(fixture["seq"]) if "seq" in fixture else None
+    """Every output and gradient on par with recorded mamba_ssm on fresh input and exact orbit draws.
+
+    The truth is mamba_ssm's minimal torch reference in float64. With `heads`, kernels summing a group's heads
+    take that many a program; both configured forms see the same declared draws and every leaf.
+    """
+    stored = recording(SEEDED)
+    precision = str(stored.pop(PRECISION, "no precision"))
+    if precision != "ieee":
+        raise ValueError(f"{SEEDED} records {precision!r} for its matmuls, not 'ieee'; "
+                         "regenerate it with IEEE matmuls")
+    seeds = declared_seeds(SEEDED)[case]
+    chunk, dtype = int(stored[f"{case}.chunk"]), jnp.dtype(str(stored[f"{case}.dtype"]))
+    shape, documents = tuple(stored[f"{case}.shape"]), bool(stored[f"{case}.documents"])
+    # The truth is Dew's float64 path, which the recorder held to mamba_ssm's float64 oracle at every seed.
+    draw, reference, truth = indexed_recording(
+        stored, case, seeds, inputs_of=lambda seed: mamba_ssd_draw(seed, shape, dtype, documents),
+        truth_fn=jax.jit(lambda inputs: mamba_ssd_xla(inputs, chunk)))
     names = ("x", "dt", "A", "B", "C", "D", "h0")
-    inputs = [fixture[name] for name in names]
-    narrow = [jnp.asarray(value, dtype if name in "xBC" else jnp.float32)
-              for name, value in zip(names, inputs, strict=True)]
-    dy, dfinal = jnp.asarray(fixture["dy"], dtype), jnp.asarray(fixture["dfinal"])
-    starts = None if seq is None else jnp.concatenate([seq[:, :1] > 0, seq[:, 1:] > seq[:, :-1]], axis=1)
 
-    def run(*args):
-        def loss(*args):
-            out, final = mamba_ssd.ssd_scan(*args, seq, chunk, INTERPRETED)
-            return jnp.sum(out * dy) + jnp.sum(final * dfinal), (out, final)
-
-        (_, (out, final)), grads = jax.value_and_grad(loss, argnums=range(7), has_aux=True)(*args)
-        return {"y": out, "final": final, **dict(zip(names, grads, strict=True))}
+    def run(index, arrays):
+        inputs = tuple(jnp.asarray(arrays[name], dtype if name in ("x", "B", "C") else jnp.float32)
+                       for name in names)
+        seq = arrays.get("seq")
+        return ssd_value_and_grad(lambda *values: mamba_ssd.ssd_scan(*values, seq, chunk, INTERPRETED),
+                                  inputs, jnp.asarray(arrays["dy"], dtype), jnp.asarray(arrays["dfinal"]))
 
     pins = {}
     if heads:
-        rows, state = min(64, chunk), min(32, inputs[3].shape[-1])
+        _, inputs = draw(0)
+        rows, state = min(64, chunk), min(32, inputs["B"].shape[-1])
         pins = {mamba_ssd.ChunkStateBwdDb: mamba_ssd.Tiles(rows, state, 0, 4, 3, heads),
                 mamba_ssd.ChunkScanBwdDc: mamba_ssd.Tiles(rows, state, 0, 4, 3, heads),
                 mamba_ssd.ChunkScanBwdDcb: mamba_ssd.Tiles(rows, min(32, chunk), 0, 4, 3, heads)}
-        assert all(pin in each_config(kernel, run, *narrow) for kernel, pin in pins.items())
+        assert all(pin in each_config(kernel, run, *draw(0)) for kernel, pin in pins.items())
     with tuning.pinned(pins):
-        ported = jax.tree.map(np.asarray, jax.jit(run)(*narrow))
-    # The scan in float64 and each entry's terms, the XLA scan's own sums (`float64_terms`).
-    with jax.enable_x64(new_val=True):
-        cotangents = widened((fixture["dy"], fixture["dfinal"]))
-        truth, terms = jax.tree.map(np.asarray, float64_terms(through(chunk, starts, *cotangents),
-                                                              *widened(inputs)))
-    reference = {name: fixture[f"mamba.{name}"] for name in ported}
-    # A chunk's entries sum within it; `A` and `D` sum every token's, in another order than mamba_ssm's.
-    batch, length = inputs[0].shape[:2]
-    everywhere = {"A", "D"}
-    for leaves, reductions in ((set(ported) - everywhere, chunk), (everywhere, batch * length)):
-        mine, theirs, true, summed = ({name: tree[name] for name in sorted(leaves)}
-                                      for tree in (ported, reference, truth, terms))
-        assert_leaves_as_exact(mine, theirs, true, reductions=reductions, terms=summed)
+        assert_as_exact(jax.jit(run), reference, draw, f"mamba_ssm {case}, heads={heads}",
+                        seeds=seeds, truth_fn=truth)
 
 
 @pytest.mark.parametrize("dtype, bound", [(jnp.float32, 1e-4), (jnp.bfloat16, 5e-2)])

@@ -21,8 +21,10 @@ import numpy as np
 from flax import linen as nn, struct
 from flax.typing import Dtype, PrecisionLike
 
+from dew import records
 from dew.interop.weights import ParamTree, placed
 from dew.nn.dense import Dense
+from dew.nn.inputs import sequence_blocks
 from dew.nn.precision import float32_dot_general, float32_products, products_dtype
 from dew.registry import from_record
 
@@ -244,13 +246,6 @@ def _block_context(x, chunk: int, left: int, right: int):
     return x[:, indices]
 
 
-def _queries(x, chunk: int):
-    """Split the frames into whole chunks: `[B, blocks, chunk, ...]`."""
-    blocks = -(-x.shape[1] // chunk)
-    x = jnp.pad(x, ((0, 0), (0, blocks * chunk - x.shape[1])) + ((0, 0),) * (x.ndim - 2))
-    return x.reshape(x.shape[0], blocks, chunk, *x.shape[2:])
-
-
 def _position_signal(width: int, positions, dtype):
     """Embed each relative position as `width` sinusoids, sines then cosines."""
     half = width // 2
@@ -298,7 +293,7 @@ def _chunked_attention(query, key, value, positional, valid, chunk: int, left: i
     dtype (modeling_gemma3n.py:523, modeling_gemma4.py:348).
     """
     batch, length, heads, dim = query.shape
-    query = _queries(query, chunk)
+    query = sequence_blocks(query, chunk)
     key, value = (_block_context(z, chunk, left, right) for z in (key, value))
     logits = _relative_logits(query, key, positional, precision)
     logits = jnp.tanh(logits / cap) * cap
@@ -552,9 +547,7 @@ class Gemma4AudioEncoder(nn.Module):
         return AudioEncoding(x, mask)
 
 
-_METADATA = frozenset({"model_type", "architectures", "transformers_version", "torch_dtype", "dtype",
-                       "output_hidden_states", "output_attentions", "return_dict", "is_encoder_decoder",
-                       "id2label", "label2id", "problem_type", "chunk_size_feed_forward"})
+_METADATA = records.HF_METADATA | {"model_type"}
 
 
 def audio_config(record: Mapping[str, object]) -> Gemma3nAudio | Gemma4Audio:

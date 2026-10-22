@@ -69,6 +69,7 @@ from ..inputs import (
     numbered_blocks,
 )
 from ..kv_cache import KVCache
+from ..mixer_base import MLP_RESIDUALS, RESIDUALS
 from ..mixers import AttentionMixer, MixerBase, MixerContext
 from ..mixers.mamba2 import Mamba2Mixer
 from ..mixers.mlp import MLPMixer
@@ -97,9 +98,7 @@ from ..sharding import (
 )
 from .decoder_block import (
     DECODER_REMAT,
-    MLP_RESIDUALS,
     NORM_SITES,
-    RESIDUALS,
     BlockWiring,
     DecoderBlock,
     Mixture,

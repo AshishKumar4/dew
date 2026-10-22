@@ -23,12 +23,8 @@ def launches(function, *args) -> list:
 
 
 def timed(ba) -> tuple:
-    """The launch `ba` run on the arrays the tuner times it on (`KernelOp.operands`), the way it
-    fills them into the launch's arguments."""
-    leaves, tree = jax.tree.flatten((ba.args, ba.kwargs),
-                                    is_leaf=lambda leaf: isinstance(leaf, jax.ShapeDtypeStruct))
-    places = [index for index, leaf in enumerate(leaves) if isinstance(leaf, jax.ShapeDtypeStruct)]
-    for index, array in zip(places, ba.op.operands([leaves[index] for index in places], 0), strict=True):
-        leaves[index] = array
-    args, kwargs = jax.tree.unflatten(tree, leaves)
+    """The launch `ba` run on the arrays the tuner times it on, filled into its arguments as the tuner
+    fills them (`tuning.materialized`)."""
+    arrays, fill = tuning.materialized(ba.op, ba)
+    args, kwargs = fill(arrays)
     return ba.op(*args, **kwargs)

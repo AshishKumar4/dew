@@ -34,7 +34,8 @@ from ..hyper_connections import (
     mix_streams,
 )
 from ..inputs import LayerInputs, MixerCall, PredictionPhase, routing_blocks
-from ..linear import recomputing
+from ..kernels.recurrence_chunk import recomputing
+from ..mixer_base import ATTENTION_RESIDUALS, MLP_RESIDUALS, QKV_RESIDUALS, RESIDUALS
 from ..moe import EXPERT_DISPATCHES, GROUPED_MATMULS, SparseMLP
 from ..ngpt import NGPT, stepped
 from ..precision import float32_dot_general, scaled
@@ -343,23 +344,6 @@ class BlockWiring:
             raise ValueError("layer_scalar must be None, frozen or trainable")
 
 
-QKV_RESIDUALS = ('q_proj', 'k_proj', 'v_proj', 'kv_proj')
-ATTENTION_RESIDUALS = (*QKV_RESIDUALS, 'o_proj')
-MLP_RESIDUALS = ('gate_proj', 'up_proj', 'down_proj')
-DELTA_RESIDUALS = ('delta_decay', 'delta_inverse', 'delta_memory')
-RESIDUALS = (*ATTENTION_RESIDUALS, 'context', 'conv', *DELTA_RESIDUALS, *MLP_RESIDUALS)
-"""The values a block names as it runs, each after the projection that
-produced it: `kv_proj` is latent attention's fused `kv_b_proj`, `context`
-the attention kernel's or the gated delta rule's output before `o_proj`,
-`conv` a linear-attention or SSM mixer's short conv output (`causal_conv1d`,
-its queries, keys and values for a delta rule), `delta_decay`,
-`delta_inverse` and `delta_memory` the rule's cumulated decay, chunk inverse
-and memory (with `w` and the corrected values) the port saves for its
-backward (`dew.nn.kernels.fla_gdn`), and the MLP names cover the dense MLP
-and the routed experts alike. A remat policy picks from these; a
-name off the list is a typo that would otherwise recompute silently."""
-
-
 @dataclasses.dataclass(frozen=True)
 class RematPolicy:
     """What a recomputed block keeps for its backward pass, and where it keeps it.
@@ -369,7 +353,7 @@ class RematPolicy:
     `offload` names those to move to pinned host memory. Both empty is
     MaxText's `full`. `recompute` instead names the only residuals recomputed,
     each by the layer that computes it (a delta rule its memory,
-    `dew.nn.linear.RECOMPUTED`), the block running without remat and keeping
+    `dew.nn.kernels.recurrence_chunk.RECOMPUTED`), the block running without remat and keeping
     every other value; it takes neither list. A checkpoint policy cannot
     say it: one that saves anything but a name saves the value the name
     marks from the op that made it.

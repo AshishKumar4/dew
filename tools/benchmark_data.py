@@ -42,6 +42,7 @@ os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
 import tyro
 from absl import flags
+from token_corpus import write_token_meta
 
 from dew.data import Loading
 from dew.data.dataset import Forwarding
@@ -154,6 +155,8 @@ class Matrix:
     workloads: tuple[Literal["image", "text"], ...] = ("image", "text")
     cold: bool = True
     """Also open each arm cold: a fresh copy of its inputs, never provisioned, out of the page cache."""
+    drops: bool = False
+    """Read Dew's arms as chains whose steps can drop records (`Worker.drops`)."""
 
 
 @dataclass(frozen=True)
@@ -173,6 +176,10 @@ class Worker:
     image_size: int = 128
     seed: int = 17
     cold: bool = False
+    drops: bool = False
+    """Dew's corpus read as a chain whose steps can drop records, as a web corpus's decode or a
+    target count before a pack can, though these keep every record: its loading workers hand on
+    rows and the reading process lays them out and batches them (row 883)."""
 
 
 def file_fact(path: Path) -> dict:
@@ -221,8 +228,7 @@ def synthetic_inputs(config: Matrix) -> dict:
     held = np.full(129, 42, np.uint16)
     held[-1] = 255
     held.tofile(text / "val.bin")
-    (text / "meta.json").write_text(json.dumps({"tokenizer": "byte", "dtype": "uint16",
-        "vocab_size": 256, "eos_id": 255, "train_tokens": len(ids), "val_tokens": len(held)}) + "\n")
+    write_token_meta(text, len(ids), len(held), eos_id=255)
     from dew.data import Files
 
     Files(str(image), format="array_record").provision()
@@ -282,6 +288,7 @@ def objective_for(config: Worker):
 def dew_reader(config: Worker, objective, loading: Loading):
     from dew.config.data import ImageData, TextData, loader
     from dew.data import Files
+    from dew.data.compile import compile
     from dew.data.dataset import DataPartition
     from dew.data.sources import TokenFiles
 
@@ -293,8 +300,12 @@ def dew_reader(config: Worker, objective, loading: Loading):
         recipe = TextData(TokenFiles(str(config.source)), tokenizer="byte", seq_len=config.seq_len,
                           pack="first-fit", packing_bins=32)
     read = "memory" if config.engine == "dew_memory" else "indexed"
-    data = loader(recipe, batch=config.batch, read=read, provision=True, loading=loading, seed=config.seed,
-                  objective=objective.data())
+    if config.drops:
+        data = compile(_dropping(config), read=read, provision=True, loading=loading, seed=config.seed,
+                       objective=objective.data())
+    else:
+        data = loader(recipe, batch=config.batch, read=read, provision=True, loading=loading,
+                      seed=config.seed, objective=objective.data())
     assert data.plan is not None, "a compiled run states its plan"
     plan = data.plan.record()
     return lambda: iter(data.train(DataPartition())), {
@@ -302,6 +313,22 @@ def dew_reader(config: Worker, objective, loading: Loading):
         "plan_sha256": hashlib.sha256(json.dumps(plan, sort_keys=True).encode()).hexdigest(),
         "lowering": plan["lowering"], "exact": plan["exact"],
     }
+
+
+def _dropping(config: Worker):
+    """The workload's corpus as a chain whose steps can drop records and keep every one here: an image
+    decode that rejects what doesn't decode, or a target count before the pack."""
+    from dew.data import Files, presets
+    from dew.data.pipeline import Pipeline
+    from dew.data.sources import TokenFiles
+    from dew.data.steps.text import CountTargets
+
+    if config.workload == "image":
+        rows = Pipeline(Files(str(config.source), format="array_record")).shuffle(config.seed).repeat()
+        return rows.pipe(presets.images, config.image_size, batch=config.batch, rejects=True)
+    documents = Pipeline(TokenFiles(str(config.source))).shuffle(config.seed).repeat()
+    documents = documents.filter_map(CountTargets())
+    return documents.pipe(presets.lm, None, seq_len=config.seq_len, batch=config.batch, bins=32)
 
 
 def grain_options(rows, config: Worker):
@@ -651,7 +678,8 @@ def run_matrix(config: Matrix) -> None:
         # A cold arm times its open and first batches only.
         first = {"steps": 4, "warmup": 0, "train_steps": 0, "stage_batches": 0}
         timed = {**common, **(first if cold else {})}
-        worker = Worker(engine, workload, source.resolve(), output.resolve(), cold=cold, **timed)
+        worker = Worker(engine, workload, source.resolve(), output.resolve(), cold=cold, drops=config.drops,
+                        **timed)
         args = [sys.executable, str(Path(__file__).resolve()), "worker"]
         for name, value in asdict(worker).items():
             flag = "--" + name.replace("_", "-")

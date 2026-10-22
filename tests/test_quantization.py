@@ -21,6 +21,7 @@ import numpy as np
 import optax
 import pytest
 from flax import linen as nn
+from model_support import largest_difference
 from reference_error import assert_as_exact_as_the_reference, assert_fp32_reduction_bound
 from token_support import token_rows
 
@@ -901,17 +902,13 @@ def test_an_objective_rounds_its_gradients_from_the_step_key():
         return jax.jit(jax.grad(lambda params: objective.scalar_loss(
             {**variables, "params": params}, batch, step), has_aux=True))(variables["params"])[0]
 
-    def apart(first, second):
-        return max(float(jnp.max(jnp.abs(a - b)))
-                   for a, b in zip(jax.tree.leaves(first), jax.tree.leaves(second), strict=True))
-
     stochastic = Quantization(bwd_qtype="int8", bwd_stochastic_rounding="uniform")
     drawn = gradients(stochastic, jax.random.key(0))
     assert all(bool(jnp.all(jnp.isfinite(leaf))) for leaf in jax.tree.leaves(drawn))
-    repeat = apart(drawn, gradients(stochastic, jax.random.key(0)))
-    moved = apart(drawn, gradients(stochastic, jax.random.key(1)))
+    repeat = largest_difference(drawn, gradients(stochastic, jax.random.key(0)))
+    moved = largest_difference(drawn, gradients(stochastic, jax.random.key(1)))
     fixed = Quantization(bwd_qtype="int8")
-    still = apart(gradients(fixed, jax.random.key(0)), gradients(fixed, jax.random.key(1)))
+    still = largest_difference(gradients(fixed, jax.random.key(0)), gradients(fixed, jax.random.key(1)))
     assert moved > 100 * max(repeat, still, 1e-9), (moved, repeat, still)
 
 
@@ -1121,10 +1118,11 @@ def with_triton_gemms(flow) -> None:
     flags = [flag for flag in os.environ.get("XLA_FLAGS", "").split()
              if not flag.startswith(("--xla_gpu_deterministic_ops", "--xla_gpu_enable_triton_gemm"))]
     script = f"import {Path(__file__).stem} as tests; tests.{flow.__name__}()"
+    # pytest's own path (pyproject's `pythonpath`: the sources and the repository root) and this directory.
+    path = os.pathsep.join([str(here.parent / "src"), str(here.parent), str(here)])
     run = subprocess.run([sys.executable, "-c", script], capture_output=True, text=True, timeout=1200,
                          cwd=here, env={**os.environ, "XLA_FLAGS": " ".join(flags),
-                                        "XLA_PYTHON_CLIENT_PREALLOCATE": "false",
-                                        "PYTHONPATH": os.pathsep.join([str(here.parent / "src"), str(here)])})
+                                        "XLA_PYTHON_CLIENT_PREALLOCATE": "false", "PYTHONPATH": path})
     assert run.returncode == 0, run.stderr[-4000:]
 
 
