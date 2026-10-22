@@ -620,7 +620,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
             ba.arguments['prologue_operands'], hooks.prologue_axes, extents)
         epilogue = _side_tile_bytes(ba.arguments.get('epilogue_operands', ()), hooks.epilogue_axes, extents)
         # One warpgroup stages each output in turn; two hold every output's staging buffer at once, and
-        # each consumer its own copy of an epilogue side tile without columns (`mosaic_gpu._staging`; a
+        # each consumer its own copy of an epilogue side tile without columns (`hopper.staging`; a
         # prologue side's per-consumer copies are within the stages' count of it).
         staged_outs = sum(outs) if config.warpgroups == 2 else max(outs)
         if config.warpgroups == 2:
