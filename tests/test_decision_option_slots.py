@@ -12,12 +12,13 @@ import dataclasses
 import json
 from pathlib import Path
 
+import flax.linen as nn
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
 from decision_support import decision_rows
-from reference_error import assert_as_exact
+from reference_error import assert_as_exact, widened, with_gradients
 from safetensors.numpy import load_file
 
 from dew.data.dataset import DataPartition
@@ -163,17 +164,55 @@ def ragged_batches(objective: DecisionObjective, seed: int = 0):
 
 
 def stepped(objective: DecisionObjective, compact: bool):
-    """Each real option's logit (0 at a slot with none) and every parameter's gradient of the loss,
-    over the compacted options or over the grid: the forward's every option a row of its own."""
+    """The forward over the compacted options or over the grid, each real option's logit (0 at a slot
+    with none) and the loss, and every parameter's gradient under the draw's cotangent
+    (`reference_error.with_gradients`): the forward's every option a row of its own."""
     step = Step(jnp.asarray(0), jax.random.key(0), None)
 
-    def run(variables, grid, slotted):
+    def run(variables, grid, slotted, cotangent):
         rows = slotted if compact else grid
-        inputs = laid_out(rows, objective.bounds.segments)
-        logits = jnp.where(inputs.options, objective.model.logits(variables, inputs), 0.0)
-        gradient = jax.grad(lambda held: objective.scalar_loss(held, rows, step)[0])(variables)
-        return logits, gradient
+
+        def forward(held):
+            inputs = laid_out(rows, objective.bounds.segments)
+            logits = jnp.where(inputs.options, objective.model.logits(held, inputs), 0.0)
+            return logits, objective.scalar_loss(held, rows, step)[0]
+
+        return with_gradients(forward)(variables, cotangent)
     return jax.jit(run)
+
+
+SCORER_MARGIN = 1e-4
+"""The least gap a draw admits between a scorer feature's two sides at a real option (`scorer_gap`):
+a hundred times the fp32 rounding of `repeated - options` (seed 225 of the unmargined draw rounded a
+7.8e-7 difference to 0, which flips `abs`'s slope and moved every gradient by its upstream value), so
+float32 and float64 take one slope. What it excludes, the slope at a difference that rounds to zero,
+is `abs`'s own convention and no compaction's; the scorer's features themselves are held to Laya's
+(tests/test_decision_laya.py::test_laya_logits_match_laya_under_the_float64_rule)."""
+
+
+def scorer_gap(objective: DecisionObjective, variables, grid) -> float:
+    """The least gap, over the grid's real option slots and the scorer's width, between the two sides
+    of its `abs(repeated - options)` feature in float64: read off the features `scorer_hidden` takes
+    (`nn.intercept_methods`), whose first two quarters are `repeated` and `options`."""
+    seen = []
+
+    def record(next_fun, args, kwargs, context):
+        if context.method_name == "__call__" and context.module.name == "scorer_hidden":
+            seen.append(args[0])
+        return next_fun(*args, **kwargs)
+
+    with jax.enable_x64(new_val=True):
+        wide_variables, wide_grid = widened((variables, grid))
+        inputs = laid_out(wide_grid, objective.bounds.segments)
+        with nn.intercept_methods(record):
+            objective.model.logits(wide_variables, inputs)
+    features = np.asarray(seen[0])
+    width = features.shape[-1] // 4
+    difference = features[..., :width] - features[..., width:2 * width]
+    options = np.asarray(inputs.options).reshape(difference.shape[:-1])
+    real = np.broadcast_to(options[..., None], difference.shape)
+    above, below = difference[real & (difference >= 0)], difference[real & (difference < 0)]
+    return float(min(np.min(above, initial=np.inf), np.min(-below, initial=np.inf)))
 
 
 def zeroed(tree):
@@ -206,7 +245,17 @@ def test_a_ragged_batch_trains_on_compacted_options_as_on_the_grid():
     variables = objective.init(jax.random.key(0))
 
     def draw(seed):
-        return variables, *reversed(ragged_batches(objective, seed))
+        """A seed's rows and a cotangent drawn apart from them (each real option's, the loss's 1), from
+        the first of its candidate rows whose scorer gap clears SCORER_MARGIN. The candidates are
+        ragged's seeds past 0, which the structure above reads."""
+        for attempt in range(64):
+            index = 1 + 64 * seed + attempt
+            slotted, grid = ragged_batches(objective, index)
+            if scorer_gap(objective, variables, grid) > SCORER_MARGIN:
+                options = np.asarray(grid["options"]).astype(bool)
+                readout = np.random.default_rng([0x5107, index]).standard_normal(options.shape, np.float32)
+                return variables, grid, slotted, (readout * options, np.float32(1.0))
+        raise AssertionError(f"no candidate of seed {seed} has its scorer gap above {SCORER_MARGIN}")
 
     grid = stepped(objective, compact=False)
     # The truth of the algebraic zeros is exactly zero, which each of their rows is held to.
