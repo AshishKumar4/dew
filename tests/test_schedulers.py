@@ -423,8 +423,11 @@ def test_edm_preset_samples_on_the_karras_grid():
         sigma = np.exp(t * 1.2 + -1.2)
         return {"weight": 1 / 0.7**2 + 1 / sigma**2, "scale": 1 / np.sqrt(0.7**2 + sigma**2)}
 
-    assert_as_exact(weighted, edm, lambda seed: (drawn(seed, 5).standard_normal(ROWS).astype(np.float32),),
-                    "edm weight", seeds=SEEDS['edm weight'])
+    def training_times(seed):
+        # ROWS rows of ROWS times: lambda's tail at small sigma takes many values a draw to resolve.
+        return (drawn(seed, 5).standard_normal((ROWS, ROWS)).astype(np.float32),)
+
+    assert_as_exact(weighted, edm, training_times, "edm weight", seeds=SEEDS['edm weight'])
 
     def sigmas(seed):
         return (np.exp(drawn(seed, 6).uniform(np.log(0.01), np.log(40.0), ROWS)).astype(np.float32),)
