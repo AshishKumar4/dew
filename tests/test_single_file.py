@@ -26,8 +26,6 @@ import pytest
 from dew.interop import Pretrained, single_file
 from dew.interop.safetensors_io import read_file, write_file
 
-pytest.importorskip("diffusers", reason="single-file conversion runs diffusers' own key maps")
-
 FIXTURE = Path(__file__).parent / "fixtures" / "single_file"
 WEIGHTS = {"unet": "diffusion_pytorch_model.safetensors", "vae": "diffusion_pytorch_model.safetensors",
            "transformer": "diffusion_pytorch_model.safetensors", "text_encoder": "model.safetensors",
