@@ -1657,9 +1657,10 @@ def test_a_generation_a_stream_filled_from_files_mounted_elsewhere_is_refused_un
     (tmp_path / "a").mkdir()
     pq.write_table(pa.table({"id": list(range(24))}), tmp_path / "a" / "rows.parquet")
     shutil.copytree(tmp_path / "a", tmp_path / "b")
-    generation = publish(_tagged(Pipeline(Files(str(tmp_path / "a")))), _cache(), read="streamed")
-    here, _ = Pipeline(Files(str(tmp_path / "a"))).holdout(0.25)
+    generation = publish(_tagged(Pipeline(Files(str(tmp_path / "a"), format="parquet"))), _cache(),
+                         read="streamed")
+    here, _ = Pipeline(Files(str(tmp_path / "a"), format="parquet")).holdout(0.25)
     assert _tags(_tagged(here).cache(generation), "streamed") == _tags(_tagged(here), "streamed")
-    elsewhere, _ = Pipeline(Files(str(tmp_path / "b"))).holdout(0.25)
+    elsewhere, _ = Pipeline(Files(str(tmp_path / "b"), format="parquet")).holdout(0.25)
     with pytest.raises(ValueError):
         _tags(_tagged(elsewhere).cache(generation), "streamed")
