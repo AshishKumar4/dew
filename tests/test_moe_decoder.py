@@ -18,6 +18,7 @@ import optax
 import pytest
 from recording import RecordingTracker
 from sharded import assert_sharded
+from token_support import repeated_token_batch
 
 from dew.data.dataset import Loader
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -105,10 +106,7 @@ def moe_config() -> dict:
 
 
 def token_batches():
-    rng = np.random.default_rng(0)
-    batch = {"text": rng.integers(0, VOCAB, size=(BATCH, SEQ_LEN + 1)).astype(np.int32)}
-    while True:
-        yield batch
+    return repeated_token_batch(VOCAB, BATCH, SEQ_LEN + 1)
 
 
 def moe_trainer(expert_size, fsdp_size, tracker=None, bias=False, learning_rate=1e-3):

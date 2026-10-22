@@ -43,8 +43,8 @@ from .flops import conv_flops, delta_flops, projection_flops
 from .inputs import PLAIN_CALL, MixerCall, coordinates_of
 from .kernels.recurrence_chunk import CHUNK_SIZE, chunk_gated_delta_rule, on_the_port, recurrent_delta_rule
 from .linear import DepthwiseConv1d, RMSNormGated, held_scan
-from .mixer_base import MixerBase, MixerContext
-from .precision import at_least_fp32
+from .mixer_base import DELTA_RULE_RESIDUALS, MixerBase, MixerContext
+from .precision import at_least_fp32, float32_dot_general
 from .sharding import logical_axes
 
 
@@ -110,7 +110,8 @@ class KimiDeltaAttention(nn.Module):
                 + delta_flops(lengths, self.num_heads, self.head_dim, self.head_dim))
 
     def setup(self):
-        dense = functools.partial(Dense, use_bias=False, dtype=self.dtype, precision=self.precision)
+        dense = functools.partial(Dense, use_bias=False, dtype=self.dtype, precision=self.precision,
+                                  dot_general=float32_dot_general)
         self.q_proj = dense(self.qkv_features, name='q_proj')
         self.k_proj = dense(self.qkv_features, name='k_proj')
         self.v_proj = dense(self.qkv_features, name='v_proj')
@@ -211,7 +212,7 @@ class KimiDeltaAttentionMixer(MixerBase):
     window and the forget gate's lower bound (configuration_glm5_next.py:143-146),
     and Kimi K3's `use_full_rank_gate` output gate."""
 
-    residuals = ('context', 'conv', 'delta_decay', 'delta_inverse', 'delta_memory')
+    residuals = DELTA_RULE_RESIDUALS
 
     linear_num_heads: int = 64
     linear_head_dim: int = 128

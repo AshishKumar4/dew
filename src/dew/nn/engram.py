@@ -37,8 +37,9 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew.nn.dense import Dense
+from dew.nn.inputs import real_places, valid_order
 
-from .precision import at_least_fp32
+from .precision import at_least_fp32, float32_dot_general
 from .sharding import logical_axes
 
 _DEAD = -1
@@ -191,7 +192,7 @@ def _lookback(compressed, valid, positions, size: int, history=None):
     if history is None:
         history = jnp.full((batch, size - 1), _DEAD, jnp.int32)
     # The valid tokens packed to the front, after the history they follow.
-    order = jnp.argsort(~valid, axis=1, stable=True)
+    order, _ = valid_order(valid)
     packed = jnp.concatenate(
         [history, jnp.take_along_axis(jnp.where(valid, compressed, _DEAD), order, axis=1)], axis=1)
     rank = jnp.cumsum(valid, axis=1) - 1 + (size - 1)
@@ -241,7 +242,7 @@ class EngramHashes(nn.Module):
                 # The history knows where a row starts; a call's positions do not.
                 positions = jnp.full(tokens.shape, size, jnp.int32)
         elif positions is None:
-            positions = jnp.maximum(jnp.cumsum(valid, axis=1) - 1, 0)
+            positions = real_places(valid)
         ids, blocked, history = _lookback(compressed, valid, jnp.asarray(positions), size, history)
         if held is not None and allocated:
             held.value = history
@@ -279,7 +280,7 @@ class EngramLayer(nn.Module):
         dtype = streams.dtype if self.dtype is None else self.dtype
         looked = table(hash_ids).astype(dtype).reshape(*hash_ids.shape[:2], -1)
         kv = Dense(self.emb_features * (self.hc_mult + 1), use_bias=False, dtype=self.dtype,
-                   precision=self.precision, name='wkv')(looked)
+                   precision=self.precision, name='wkv', dot_general=float32_dot_general)(looked)
         q_weight = self.param(
             "q_weight", nn.initializers.ones, (self.hc_mult, self.emb_features), jnp.float32
         )
