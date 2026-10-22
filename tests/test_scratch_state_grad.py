@@ -2,7 +2,13 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+import functools
+
 import test_recurrence_stability as st
+from reference_error import with_gradients
+from test_recurrence_chunk import token_by_token
+
+from dew.nn.kernels.recurrence_chunk import chunk
 
 
 def variants(q, g, do, dfinal, chunk):
@@ -44,8 +50,12 @@ def variants(q, g, do, dfinal, chunk):
 def test_state(regime):
     hooks = st.SITES["scalar write"]
     errs = {}
+    portable = jax.jit(with_gradients(functools.partial(chunk, hooks, chunk_size=16, ported=False)))
+    reference = jax.jit(with_gradients(functools.partial(token_by_token, hooks)))
     for seed in range(64):
         operands, (dout, dfinal) = st.cotangents(hooks, regime, seed)
+        whole = {"portable": portable(operands, (dout, dfinal))[1].state,
+                 "reference": reference(operands, (dout, dfinal))[1].state}
         for b in range(operands.value.shape[0]):
             for h in range(operands.value.shape[2]):
                 q = operands.query[b, :, h // (operands.value.shape[2] // operands.key.shape[2])]
@@ -54,6 +64,7 @@ def test_state(regime):
                 with jax.enable_x64(True):
                     truth = {k: np.asarray(v) for k, v in variants(*(jnp.asarray(np.asarray(x), jnp.float64) for x in (q, g, do, df)), 16).items()}
                 mine = variants(q, g, do, df, 16)
+                mine.update({k: v[b, h] for k, v in whole.items()})
                 t = truth["horner"]
                 for k, v in mine.items():
                     errs.setdefault(k, []).append(float(np.sum((np.asarray(v, np.float64) - t) ** 2)))
