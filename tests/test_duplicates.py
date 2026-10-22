@@ -146,6 +146,15 @@ def test_each_reading_alone_fails_its_own_copies_and_passes_the_others(tmp_path)
     assert gate(functions, "--reading=text").returncode == 0
 
 
+def test_no_pragma_holds_a_text_copy(tmp_path):
+    """The text reading reads no `pylint: disable=duplicate-code`: a copy is fixed, never silenced."""
+    settings = "".join(f"{name} = {value}\n" for value, name in enumerate(
+        ("alpha", "beta", "gamma", "delta", "epsilon", "zeta", "eta")))
+    silenced = "# pylint: disable=duplicate-code\n" + settings
+    texts = tree(tmp_path, "silenced", {"first.py": silenced, "second.py": silenced})
+    assert gate(texts, "--reading=text").returncode == 1
+
+
 def test_a_function_two_files_write_under_other_names_fails_and_one_owner_passes(tmp_path):
     copied = tree(tmp_path, "copied", {"spread.py": SPREAD, "ranges.py": RANGE_OVER_COUNT})
     assert gate(copied).returncode == 1

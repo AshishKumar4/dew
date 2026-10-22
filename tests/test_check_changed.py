@@ -64,9 +64,9 @@ def test_the_gates_are_one_file_run_together_one_at_a_time_or_listed(tmp_path):
     one = check(root, "--gate", "green", BASE="base/producer")
     assert (one.returncode, one.stdout) == (0, f"read with {sys.executable}, held to base/producer\n")
     red = check(root, "--gate", "red")
-    assert red.returncode == 1 and "a copy in src/dew tools tests examples site" in red.stdout
+    assert (red.returncode, red.stdout) == (1, "a copy in src/dew tools tests examples site\n")
     missing = check(root, "--gate", "blue")
-    assert missing.returncode == 2 and "no gate blue" in missing.stdout
+    assert (missing.returncode, missing.stdout) == (2, "no gate blue in tools/check_gates\n")
     every = check(root)
     assert every.returncode == 1
     assert every.stdout.splitlines() == [

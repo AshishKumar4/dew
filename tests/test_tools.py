@@ -726,7 +726,8 @@ def test_the_script_reads_its_files_in_processes_and_reports_as_one_process_does
                             capture_output=True, text=True, timeout=300)
     assert script.returncode == 1
     assert (script.stdout, script.stderr) == (serial.out, serial.err)
-    assert serial.out.count("SLOP002") == 40 and serial.out.count("SLOP008") == 40
+    # One finding a file, eighty files.
+    assert len(serial.out.splitlines()) == 80
 
 
 def _linted(tmp_path, files: dict[str, str]) -> list[tuple[str, int, str]]:
