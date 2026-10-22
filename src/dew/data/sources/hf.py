@@ -91,7 +91,7 @@ class HF(Dataset):
 
         if not isinstance(self.dataset, Arrow):
             raise ValueError(f"{self.describe()} is an IterableDataset, read only as a stream")
-        return grain.MapDataset.source(_undecoded(self.dataset)).map(_record)
+        return arrow_rows(self.dataset)
 
     def manifest(self) -> ShardManifest:
         from datasets import Dataset as Arrow
@@ -112,7 +112,7 @@ class HF(Dataset):
         from datasets import Dataset as Arrow
 
         if isinstance(self.dataset, Arrow):
-            return grain.MapDataset.source(_undecoded(self.dataset)).map(_record).to_iter_dataset()
+            return arrow_rows(self.dataset).to_iter_dataset()
         if not isinstance(shard, _HFShard):
             raise ValueError("a Hugging Face stream needs its own shard descriptor")
         return _Streamed(_undecoded(self.dataset), shard)
@@ -127,6 +127,13 @@ class HF(Dataset):
 
     def lengths(self) -> np.ndarray | None:
         return None
+
+
+def arrow_rows(dataset: datasets.Dataset) -> grain.MapDataset:
+    """An Arrow dataset's rows by index, as Dew reads them: its image columns undecoded, which Dew's
+    own steps decode, and each row a record (`_record`). A Hugging Face dataset and a prepared Hub
+    split read their rows through it."""
+    return grain.MapDataset.source(_undecoded(dataset)).map(_record)
 
 
 def _undecoded[D: (datasets.Dataset, datasets.IterableDataset)](dataset: D) -> D:
