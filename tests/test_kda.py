@@ -68,7 +68,7 @@ def oracle_layer(x, p, lower_bound, eps, rule):
 
 def oracle_params(variables) -> dict:
     """The layer's parameters as `oracle_layer` takes them, at their own dtype."""
-    return {name: leaf["kernel"] if "kernel" in leaf else leaf["weight"] if isinstance(leaf, dict) else leaf
+    return {name: (leaf["kernel"] if "kernel" in leaf else leaf["weight"]) if isinstance(leaf, dict) else leaf
             for name, leaf in variables["params"].items()}
 
 
