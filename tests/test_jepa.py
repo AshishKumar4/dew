@@ -136,21 +136,23 @@ def test_every_target_is_a_rectangle_of_the_grid_in_the_encoders_scan_order(scan
 
 # --- the encoders and the predictor ----------------------------------------
 
+def shuffled_encodings(encoder, x, rng):
+    """`encoder`'s encoding of `x` whole and of every grid token in an order drawn per row from `rng`,
+    under parameters moved off their init, and that order."""
+    every = jnp.arange(GRID[0] * GRID[1], dtype=jnp.int32)
+    shuffled = jnp.stack([jax.random.permutation(jax.random.fold_in(rng, i), every)
+                          for i in range(x.shape[0])])
+    params = jax.tree.map(lambda p: p + 0.05, encoder.init(rng, x, shuffled))
+    return encoder.apply(params, x), encoder.apply(params, x, shuffled), shuffled
+
+
 def test_the_token_index_selects_tokens_with_their_positions(rng):
     """`token_idx` is a set of grid positions, and the encoder attends over
     whatever set it is given: asking for every token in a shuffled order gives
     the full encoding shuffled the same way, which holds only if each gathered
     token carries the sincos signal of its own grid position and no rotation
     by sequence index is applied."""
-    encoder = make_encoder()
-    x = images()
-    every = jnp.arange(GRID[0] * GRID[1], dtype=jnp.int32)
-    shuffled = jnp.stack([jax.random.permutation(jax.random.fold_in(rng, i), every)
-                          for i in range(x.shape[0])])
-    params = jax.tree.map(lambda p: p + 0.05, encoder.init(rng, x, shuffled))
-
-    full = encoder.apply(params, x)
-    subset = encoder.apply(params, x, shuffled)
+    full, subset, shuffled = shuffled_encodings(make_encoder(), images(), rng)
     assert float(jnp.max(jnp.abs(full))) > 0.1
     # 1.5e-6 observed: the softmax sums in another order.
     assert jnp.allclose(subset, jnp.take_along_axis(full, shuffled[..., None], axis=1), atol=1e-5)
@@ -162,14 +164,7 @@ def test_the_video_token_index_selects_the_same_tubelet_in_every_frame(rng):
     each frame."""
     encoder = JepaVideoEncoder(patch_size=PATCH, emb_features=32, num_layers=1,
                                num_heads=2, mlp_ratio=2)
-    x = videos()
-    every = jnp.arange(GRID[0] * GRID[1], dtype=jnp.int32)
-    shuffled = jnp.stack([jax.random.permutation(jax.random.fold_in(rng, i), every)
-                          for i in range(x.shape[0])])
-    params = jax.tree.map(lambda p: p + 0.05, encoder.init(rng, x, shuffled))
-
-    full = encoder.apply(params, x)
-    subset = encoder.apply(params, x, shuffled)
+    full, subset, shuffled = shuffled_encodings(encoder, videos(), rng)
     expected = jnp.take_along_axis(full, shuffled[:, None, :, None], axis=2)
     assert jnp.allclose(subset, expected, atol=1e-5)
 
