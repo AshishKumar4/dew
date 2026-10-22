@@ -619,6 +619,71 @@ def test_a_fused_norm_lowers_for_an_h100(producer):
     assert 'mosaic_gpu' in {route.kernel for route in taken if route.choice == 'grouped_matmul'}
     assert {route.kernel for route in taken if route.choice == 'gemm_prologue'} == {'fused'}
 
+LAYERS, LAYER = 3, 1
+"""A bank of three layers' matrices, read at the second (`gemm`'s `rhs_index`)."""
+
+
+def _banked(seed):
+    """A draw with its matrices a bank: the drawn ones at `LAYER`, others beside them."""
+    x, w, _, _, b, *_ = _draw(seed)
+    rng = np.random.default_rng(seed + 1000)
+    bank = jnp.asarray(rng.normal(size=(LAYERS, *w.shape)) / np.sqrt(DEPTH), jnp.bfloat16)
+    cotangent = jnp.asarray(rng.normal(size=(ROWS, WIDTH)), jnp.bfloat16)
+    return x, bank.at[LAYER].set(w.astype(jnp.bfloat16)), b, cotangent
+
+
+def _indexed_program(*, indexed: bool, truth: bool = False, interpret_on_cpu: bool = False):
+    """The biased product of the bank's layer and its every input's cotangent: through the bank read in
+    place (`indexed`), or through the layer sliced out, which XLA computes (in float64 as truth)."""
+    sizes = jnp.asarray(SIZES)
+
+    def product(x, bank, b):
+        if truth:
+            wide = (_wide(x).astype(jnp.float64), bank[LAYER].astype(jnp.float64))
+            return biased(grouped_matmul.xla_ragged_dot(*wide, sizes, preferred_element_type=jnp.float64), b)
+        if indexed:
+            return template.gemm(x, bank, sizes, rhs_index=jnp.int32(LAYER), epilogue=biased,
+                                 epilogue_operands=((b, ('columns',)),), out_dtype=jnp.bfloat16,
+                                 interpret_on_cpu=interpret_on_cpu)
+        summed = grouped_matmul.xla_ragged_dot(x, bank[LAYER], sizes, preferred_element_type=jnp.float32)
+        return biased(summed, b).astype(jnp.bfloat16)
+
+    def run(x, bank, b, cotangent):
+        out, pull = jax.vjp(product, x, bank, b)
+        return (out, *pull(cotangent.astype(out.dtype)))
+    return run
+
+
+@pytest.mark.parametrize("generation_name", generations("sm80", "sm90", "v5e"))
+def test_an_indexed_bank_holds_check_1_with_the_plain_calls_value(generation_name):
+    """A product reading its matrices from a bank's layer in place (`rhs_index`), and its derivative (the
+    bank's zero but at the layer), are as exact as the same product of the layer sliced out, from float64
+    truth, through the launches the generation runs."""
+    with generation.assumed(generation_name), generation.routes() as taken:
+        dew = _indexed_program(indexed=True, interpret_on_cpu=True)
+        assert_as_exact(dew if generation_name != "sm80" else jax.jit(dew),
+                        jax.jit(_indexed_program(indexed=False)), _banked,
+                        f"indexed bank on {generation_name}", seeds=SEEDS,
+                        truth_fn=_indexed_program(indexed=False, truth=True))
+    assert _kernels(taken) <= {'triton', 'mosaic_gpu', 'mosaic_tpu'} and _kernels(taken)
+
+
+@lowers("sm90")
+def test_an_indexed_bank_lowers_without_slicing_its_layer_for_an_h100():
+    """For an H100 the product reads the bank's layer in place: the lowered program slices no layer out of
+    the bank before its kernels, as a scanned layer stack's would every step."""
+    x, bank, b, _ = _banked(0)
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
+
+    def product(x, bank, b, layer):
+        return template.gemm(x, bank, jnp.asarray(SIZES), rhs_index=layer, epilogue=biased,
+                             epilogue_operands=((b, ('columns',)),), out_dtype=jnp.bfloat16)
+
+    with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
+        lowered = jax.jit(product).trace(x, bank, b, jnp.int32(LAYER)).lower(lowering_platforms=("cuda",))
+        text = lowered.as_text()
+    assert "dynamic_slice" not in text
+
 @pytest.mark.parametrize("producer", [rms_norm, dew_rms_norm, relu], ids=lambda producer: producer.__name__)
 def test_a_fused_producers_gradients_are_its_own(producer):
     """Every input's gradient through a producer fused into the prologue is the unfused program's: the
