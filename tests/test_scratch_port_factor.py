@@ -65,3 +65,21 @@ def test_port_variant(name, regime, variant, monkeypatch):
     except AssertionError as error:
         verdict = str(error).split("\n")[0][:220]
     raise AssertionError(f"VARIANT|{name}|{regime}|{variant}|{verdict}")
+
+
+@pytest.mark.parametrize("size", [16, 64])
+@pytest.mark.parametrize("name, regime", [("vector delta", "aligned keys"), ("gated", "aligned keys"),
+                                          ("scalar delta", "saturated gates"), ("gated", "saturated gates"),
+                                          ("scalar delta", "resets on chunk edges"),
+                                          ("scalar delta", "the decay bound")])
+def test_portable_chunk(name, regime, size):
+    hooks = st.SITES[name]
+    dew = jax.jit(functools.partial(chunk, hooks, chunk_size=size, ported=False))
+    reference = jax.jit(functools.partial(token_by_token, hooks))
+    try:
+        assert_as_exact(dew, reference, functools.partial(st.stressed, hooks, regime), f"{name} {regime}",
+                        seeds=8)
+        verdict = "passes"
+    except AssertionError as error:
+        verdict = str(error).split("\n")[0][:220]
+    raise AssertionError(f"PORTABLE|{name}|{regime}|{size}|{verdict}")
