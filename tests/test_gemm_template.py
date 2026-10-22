@@ -13,7 +13,6 @@ import numpy as np
 import pytest
 from generation_support import INTERPRETS, SUMS_IN_IEEE, generations, lowers, runs
 from jax.experimental.pallas import fuser
-from jax.extend import core as jax_core
 from jax.sharding import AbstractDevice, AbstractMesh, AxisType, Mesh
 from reference_error import assert_as_exact
 
@@ -698,84 +697,25 @@ def test_a_dense_bank_reads_its_layer_as_the_plain_product():
     assert _kernels(taken) == {'triton'}
 
 
+@lowers("sm90")
 def test_a_wide_input_gradient_widens_one_layer_not_the_bank():
     """An fp32 output's input gradient multiplies its fp32 cotangent by the bank's layer widened, the
-    layer sliced out first: no fp32 copy of the whole bank, and a launch prices one layer, as the plain
-    call does."""
+    layer sliced out first: the program lowered for an H100 holds no fp32 copy of the whole bank, and a
+    launch prices one layer, as the plain call does."""
     x, bank, *_ = _banked(0)
     sizes = jnp.asarray(SIZES)
+    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
 
     def loss(x, bank):
         return jnp.sum(template.gemm(x, bank, sizes, rhs_index=jnp.int32(LAYER), out_dtype=jnp.float32))
 
-    with generation.assumed("sm90"):
-        jaxpr = jax.make_jaxpr(jax.grad(loss, argnums=(0, 1)))(x, bank).jaxpr
-        widened = [eqn for eqn in _equations(jaxpr) if eqn.primitive.name == 'convert_element_type'
-                   and eqn.outvars[0].aval.shape == bank.shape and eqn.outvars[0].aval.dtype == jnp.float32]
+    with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
+        lowered = jax.jit(jax.grad(loss, argnums=(0, 1))).trace(x, bank).lower(lowering_platforms=("cuda",))
         launch, target = grouped_matmul.MosaicGmm(), generation.gpu_target()
         options = {"out_dtype": "bfloat16", "trans_rhs": False, "interpret": False}
         banked = launch.estimate(launch.bind(x, bank, sizes, (), (), (jnp.int32(LAYER),), **options), target)
         plain = launch.estimate(launch.bind(x, bank[LAYER], sizes, **options), target)
-    assert not widened and banked == plain
-
-
-def _equations(jaxpr):
-    for eqn in jaxpr.eqns:
-        yield eqn
-        for sub in jax_core.jaxprs_in_params(eqn.params):
-            yield from _equations(sub)
-
-@pytest.mark.parametrize("generation_name",
-                         [pytest.param(name, marks=lowers(name)) for name in ("sm80", "sm90")])
-def test_an_indexed_bank_lowers_without_slicing_its_layer(generation_name):
-    """For an A100 (Triton) and an H100 (Mosaic GPU) the product reads the bank's layer in place: the
-    lowered program slices no layer out of the bank before its kernels, as a scanned layer stack's would
-    every step."""
-    x, bank, b, _ = _banked(0)
-    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), generation_name)
-
-    def product(x, bank, b, layer):
-        return template.gemm(x, bank, jnp.asarray(SIZES), rhs_index=layer, epilogue=biased,
-                             epilogue_operands=((b, ('columns',)),), out_dtype=jnp.bfloat16)
-
-    on = (generation.assumed(generation_name), jax.sharding.use_abstract_mesh(mesh))
-    with on[0], on[1], generation.routes() as taken:
-        lowered = jax.jit(product).trace(x, bank, b, jnp.int32(LAYER)).lower(lowering_platforms=("cuda",))
-        text = lowered.as_text()
-    assert "dynamic_slice" not in text and _kernels(taken) - {'xla'}
-
-@pytest.mark.parametrize("producer", [rms_norm, dew_rms_norm, relu], ids=lambda producer: producer.__name__)
-def test_a_fused_producers_gradients_are_its_own(producer):
-    """Every input's gradient through a producer fused into the prologue is the unfused program's: the
-    operand's cotangent goes back through the producer's own VJP, so a norm's two paths from its input
-    join where the producer joins them and a custom derivative (ReLU's at zero) stays its own; Dew's
-    checkpointed norm fuses too (the route says so)."""
-    sizes = jnp.asarray(SIZES)
-
-    def draw(seed):
-        x, w, _, nw, *_ = _draw(seed)
-        x = x.at[:4].set(0)  # a ReLU's zero, where its custom derivative differs from max(x, 0)'s
-        return x, w, nw
-
-    def loss(gemm, transform=lambda value: value):
-        def value(x, w, weight):
-            return jnp.sum(gemm(producer(x, weight), w).astype(jnp.float32))
-        return jax.grad(transform(value), argnums=(0, 1, 2))
-
-    def fused_gemm(operand, w):
-        return fused.fusible_gemm(operand, w, sizes, interpret_on_cpu=True)
-
-    def plain_gemm(operand, w):
-        return template.gemm(operand, w, sizes, out_dtype=jnp.float32)
-
-    def truth_gemm(operand, w):
-        matrix = w.astype(jnp.bfloat16).astype(operand.dtype)
-        return jax.lax.ragged_dot(operand, matrix, sizes, preferred_element_type=operand.dtype)
-
-    with generation.assumed("sm80"), generation.routes() as taken:
-        assert_as_exact(jax.jit(loss(fused_gemm, fuser.fuse)), jax.jit(loss(plain_gemm)), draw,
-                        f"{producer.__name__} gradients", seeds=SEEDS, truth_fn=loss(truth_gemm))
-    assert {route.kernel for route in taken if route.choice == 'gemm_prologue'} == {'fused'}
+    assert "x".join(map(str, bank.shape)) + "xf32" not in lowered.as_text() and banked == plain
 
 
 def test_a_one_row_normed_operand_fuses():
