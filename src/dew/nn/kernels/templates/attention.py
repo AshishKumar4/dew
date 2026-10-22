@@ -417,6 +417,20 @@ def natural_exp(x: jax.Array) -> jax.Array:
     return jnp.exp2(x * LOG2E)
 
 
+def interpreted_dot(a: jax.Array, b: jax.Array) -> jax.Array:
+    """`a @ b`, fp32, as every CPU arm of the attention template issues it (the plain-JAX mainloop, the
+    interpreted kernels): the product its operands declare at the precision policy's precision
+    (`dew.nn.precision.float32_products`), issued off a GPU by the declaration's owner
+    (`product.interpreted`), so an fp32 product accumulates in float64, within that sum's rounding bound
+    whatever the tile."""
+    from dew.nn.kernels.templates import product
+    from dew.nn.precision import float32_products, products_dtype
+
+    dtype = products_dtype(a, b)
+    declared = product.declared(dtype, float32_products(dtype), outputs=(jnp.float32,))
+    return product.interpreted(declared, a, b, (((a.ndim - 1,), (0,)), ((), ())))
+
+
 def power_of_two(width: int) -> int:
     """The power of two from 16 that holds `width`: a head width a kernel tiles."""
     return max(16, 1 << (width - 1).bit_length())
