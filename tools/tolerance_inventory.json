@@ -119,7 +119,7 @@
   },
   "tests/test_dataset_chain.py": {
    "comparisons": 1,
-   "lane": "Training"
+   "lane": "Data"
   },
   "tests/test_dc_ae.py": {
    "comparisons": 4,
@@ -739,10 +739,6 @@
   },
   "tests/test_text_encoders.py": {
    "comparisons": 4,
-   "lane": "Models, Serving & RL"
-  },
-  "tests/test_text_rollout_contract.py": {
-   "comparisons": 14,
    "lane": "Models, Serving & RL"
   },
   "tests/test_token_accuracy.py": {
