@@ -59,7 +59,7 @@ def _draw(seed):
             jnp.asarray(rng.uniform(0.5, 2.0, size=(ROWS,)), jnp.float32))
 
 
-def _mainloop(case: str, tiles):
+def _mainloop(case: str, tiles, *, interpret=INTERPRETED, multiprocessors: int = 1):
     sides, epilogue, dtypes = CASES[case]
 
     def run(*inputs):
@@ -67,7 +67,7 @@ def _mainloop(case: str, tiles):
         w = jnp.swapaxes(drawn["w"], 1, 2) if case == "transposed" else drawn["w"]
         outs = mosaic_blackwell.gmm(drawn["x"], w, jnp.asarray(SIZES), tiles=tiles,
                                     transpose_rhs=case == "transposed", out_dtype=dtypes[0],
-                                    multiprocessors=1, interpret=INTERPRETED, epilogue=epilogue,
+                                    multiprocessors=multiprocessors, interpret=interpret, epilogue=epilogue,
                                     epilogue_operands=tuple(drawn[name] for name, _ in sides),
                                     epilogue_axes=tuple(axes for _, axes in sides),
                                     out_dtypes=dtypes if len(dtypes) > 1 else None)
@@ -101,6 +101,23 @@ def test_the_blackwell_gmm_holds_check_1(case, tiles):
     """Each case through the mainloop, interpreted: as exact as the plain program from float64 truth, the
     empty groups, the group of one row and the rows past the routed ones included."""
     assert_as_exact(_mainloop(case, tiles), jax.jit(_plain(case)), _draw, f"{case} at {tiles}", seeds=SEEDS,
+                    truth_fn=_plain(case, truth=True))
+
+
+ON_BLACKWELL = pytest.mark.skipif(generation.device_generation() != "sm100",
+                                  reason="runs the mainloop compiled, on a B200")
+
+
+@ON_BLACKWELL
+@pytest.mark.gpu(reason="runs the Blackwell mainloop compiled, on a B200")
+@pytest.mark.parametrize("tiles", TILES, ids=lambda tiles: f"{tiles.block_n}x{tiles.stages}")
+@pytest.mark.parametrize("case", list(CASES))
+def test_the_blackwell_gmm_holds_check_1_on_a_b200(case, tiles):
+    """Each case compiled and run on a B200, its tiles over every multiprocessor, where the interpreter's
+    synchronization is the hardware's: as exact as the plain program from float64 truth."""
+    run = _mainloop(case, tiles, interpret=False,
+                    multiprocessors=generation.gpu_target().multiprocessors)
+    assert_as_exact(jax.jit(run), jax.jit(_plain(case)), _draw, f"{case} at {tiles} on a B200", seeds=SEEDS,
                     truth_fn=_plain(case, truth=True))
 
 
