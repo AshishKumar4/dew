@@ -147,6 +147,9 @@ def room(state: Partial, alpha: jax.Array, p: jax.Array, value: jax.Array
     unshifted one. A row whose values are ordinary takes `k = 0`, its bits the unshifted ones; a row
     that takes one shifts its weights only once its values need it, so a weight it pushes below the
     narrowed dtype's least subnormal (or fp32's) was below an ulp of the row's sums."""
+    import os
+    if os.environ.get("DEW_NO_HEADROOM"):
+        return p, alpha, state.shift, state.reach
     # The largest value magnitude of the keys each row weighs, as a key the row does not see (padding, a
     # stale cache slot, another document) would shift it for nothing.
     largest = jnp.max(jnp.abs(value.astype(jnp.float32)), axis=-1)
