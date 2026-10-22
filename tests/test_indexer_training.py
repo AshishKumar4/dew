@@ -45,7 +45,7 @@ VOCAB = 64
 TINY_SHARD = 256
 SEEDS = {'covering': 256, 'covered positions': 512, 'dropped': 256, 'dropped positions': 256, 'packed': 64,
          'packed alone': 128, 'total': 512, 'documents alone': 512, 'split tree': 8, 'per query': 64}
-"""Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada, 2026-10-21):
+"""Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada):
 the most any of a site's cases took."""
 
 
