@@ -14,6 +14,7 @@ from model_support import decoder, greedy_walk as walk
 from dew.sampling import Beam, Sample, Sampling, decoding, generate
 from dew.sampling.decoding import StepState
 from dew.sampling.strategies import draw
+from dew.telemetry.instrumentation import Compiles
 
 VOCAB = 13
 
@@ -156,7 +157,6 @@ def test_other_values_of_shape_free_controls_run_the_walk_the_first_compiled(mod
     """A temperature, a filter's mass, a penalty and a length or count reach
     the walk as data (`decoding.as_pytree`): other values of every one draw
     from the program the first values compiled, and draw differently."""
-    from dew.sampling import text
 
     module, params = model
     prompt = jnp.asarray([[1, 2, 3]], jnp.int32)
@@ -176,10 +176,10 @@ def test_other_values_of_shape_free_controls_run_the_walk_the_first_compiled(mod
                         stopping=(decoding.MaxNewTokens(budget), decoding.MaxLength(4 + budget)))
 
     first = draw(1.0, 4)
-    compiled = text._compiled(None, ())
-    traced = compiled._cache_size()
-    second = draw(1.5, 5)
-    assert compiled._cache_size() == traced
+    # The generation program is `dew.sampling.text._checked`'s.
+    with Compiles("_checked") as compiled:
+        second = draw(1.5, 5)
+    assert compiled.count == 0
     np.testing.assert_array_equal(np.asarray(first.lengths), [4])
     np.testing.assert_array_equal(np.asarray(second.lengths), [5])
     assert not np.allclose(np.asarray(first.behavior_log_probs)[:, :4],
