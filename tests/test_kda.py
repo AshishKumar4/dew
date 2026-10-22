@@ -22,7 +22,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from model_support import decode_through
-from reference_error import assert_as_exact, declared_seeds, indexed_recording, recording
+from reference_error import assert_as_exact, declared_seeds, indexed_recording, recording, widened
 
 from dew.nn.inputs import MixerCall
 from dew.nn.kda import KimiDeltaAttention
@@ -218,6 +218,40 @@ def test_the_layer_gradients_match_the_oracle():
         return x, stacked, cotangent
 
     assert_as_exact(ours, theirs, draw, "layer gradients", seeds=SEEDS['layer gradients'])
+
+
+BOUND = 1e-4
+"""The retiring site's bound (`test_default_eps_gradients_hold_their_prior_bound`), its gradients'
+largest error over their largest value."""
+
+
+def scaled(actual, wanted) -> float:
+    return float(np.max(np.abs(np.asarray(actual, np.float64) - wanted)) / np.max(np.abs(wanted)))
+
+
+def test_default_eps_gradients_hold_their_prior_bound():
+    """A retiring site (ledger row 1343): at the gated norm's own eps 1e-5, a gradient through the norm
+    of a near-zero row errs as the row's inverse square, a tail check 1 cannot resolve, so the layer's
+    gradients there keep the prior bound, their largest error within BOUND of their largest value from
+    the transcription's float64 gradients (its autodiff, where central differences were), until the
+    zero-element certificate (tests/zero_elements.py) judges those rows."""
+    module, _, variables = layer_and_params(-5.0)
+    x = jnp.asarray(np.random.RandomState(4).randn(B, S, E), jnp.float32)
+    cotangent = jnp.asarray(np.random.RandomState(5).randn(B, S, E), jnp.float32)
+
+    def loss_module(x, variables):
+        return jnp.sum(module.apply(variables, x) * cotangent)
+
+    def loss_oracle(x, p):
+        return jnp.sum(oracle_layer(x, p, -5.0, 1e-5, partial(oracle_chunk, chunk_size=4)) * cotangent)
+
+    grad_x, grad_params = jax.grad(loss_module, argnums=(0, 1))(x, variables)
+    ours = {"x": grad_x, **oracle_params(grad_params)}
+    with jax.enable_x64(new_val=True):
+        wanted_x, wanted = jax.grad(loss_oracle, argnums=(0, 1))(*widened((x, oracle_params(variables))))
+        wanted = {"x": wanted_x, **wanted}
+    for name, value in ours.items():
+        assert scaled(value, np.asarray(wanted[name])) < BOUND, name
 
 
 def test_prefill_then_token_steps_reproduce_the_parallel_layer():

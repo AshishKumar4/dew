@@ -401,6 +401,10 @@
    "comparisons": 1,
    "lane": "Models, Serving & RL"
   },
+  "tests/test_kda.py": {
+   "comparisons": 1,
+   "lane": "Models, Serving & RL"
+  },
   "tests/test_kernels.py": {
    "comparisons": 9,
    "lane": "Kernels"
