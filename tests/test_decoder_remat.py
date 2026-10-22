@@ -26,6 +26,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from model_support import largest_difference
 
 from dew.checkpoints import Checkpoints
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -60,11 +61,6 @@ def model_for(shape, **overrides):
 def batch():
     return {"text": jnp.asarray(np.random.default_rng(5).integers(1, 32, (8, 9)),
                                 jnp.int32)}
-
-
-def difference(left, right):
-    return max(float(jnp.max(jnp.abs(a - b))) for a, b in zip(
-        jax.tree.leaves(left), jax.tree.leaves(right), strict=True))
 
 
 def objective_for(model):
@@ -126,8 +122,8 @@ def test_recomputed_blocks_train_the_same_model(shape, scan):
     variables = plain.init(jax.random.key(0), ids)
     recomputed = remat.init(jax.random.key(0), ids)
     assert jax.tree.structure(variables) == jax.tree.structure(recomputed)
-    assert difference(variables, recomputed) == 0
-    assert difference(jax.jit(plain.apply)(variables, ids),
+    assert largest_difference(variables, recomputed) == 0
+    assert largest_difference(jax.jit(plain.apply)(variables, ids),
                       jax.jit(remat.apply)(variables, ids)) < 2e-5
     run, solver = training_step(plain)
     rerun, _ = training_step(remat)
@@ -139,18 +135,18 @@ def test_recomputed_blocks_train_the_same_model(shape, scan):
         recomputed, other_state, other_loss, other_grads, other_aux = rerun(
             variables, state, tokens, key)
         assert abs(float(loss - other_loss)) < 2e-5
-        assert difference(grads, other_grads) < 3e-5
-        assert difference(moved, recomputed) < 2e-5
-        assert difference(next_state, other_state) < 2e-5
-        assert difference(aux.metrics, other_aux.metrics) < 1e-4
-        assert difference(aux.qk_stats, other_aux.qk_stats) < 1e-4
+        assert largest_difference(grads, other_grads) < 3e-5
+        assert largest_difference(moved, recomputed) < 2e-5
+        assert largest_difference(next_state, other_state) < 2e-5
+        assert largest_difference(aux.metrics, other_aux.metrics) < 1e-4
+        assert largest_difference(aux.qk_stats, other_aux.qk_stats) < 1e-4
         if shape == "sparse":
             # Router slot counts are integers; recomputation routes identically.
-            assert difference(aux.effects, other_aux.effects) == 0
+            assert largest_difference(aux.effects, other_aux.effects) == 0
         variables, state = moved, next_state
-    assert difference(original["params"], variables["params"]) > 1e-4
+    assert largest_difference(original["params"], variables["params"]) > 1e-4
     if shape == "sparse":
-        assert difference(original["moe"], variables["moe"]) > 0
+        assert largest_difference(original["moe"], variables["moe"]) > 0
 
 
 @pytest.mark.parametrize("shape", ["dense", "shared", "altup"])
@@ -166,7 +162,7 @@ def test_remat_prefills_and_appends_the_same_cache(shape, scan):
                                        decode=True, mutable=["cache"])
         actual, recomputed_cache = remat.apply(remat_vars, ids[:, start:end],
                                                decode=True, mutable=["cache"])
-        assert difference(actual, expected) == 0
+        assert largest_difference(actual, expected) == 0
 
         plain_vars = {**plain_vars, **cache}
         remat_vars = {**remat_vars, **recomputed_cache}
@@ -192,10 +188,10 @@ def test_recomputed_pipeline_preserves_updates_and_sown_values(shape, scan):
         left = run(variables, state, tokens, jax.random.key(7))
         right = rerun(variables, state, tokens, jax.random.key(7))
     assert abs(float(left[2] - right[2])) < 2e-5
-    assert difference(left[0], right[0]) < 2e-5
-    assert difference(left[3], right[3]) < 3e-5
-    assert difference(left[4].qk_stats, right[4].qk_stats) < 1e-4
-    assert difference(left[4].metrics, right[4].metrics) < 1e-4
+    assert largest_difference(left[0], right[0]) < 2e-5
+    assert largest_difference(left[3], right[3]) < 3e-5
+    assert largest_difference(left[4].qk_stats, right[4].qk_stats) < 1e-4
+    assert largest_difference(left[4].metrics, right[4].metrics) < 1e-4
 
 
 @pytest.mark.parametrize("saved_remat", [None, 'full'])
@@ -222,7 +218,7 @@ def test_checkpoint_resumes_with_remat_switched(tmp_path, saved_remat):
     resume, _ = training_step(resumed_model)
     actual = resume(restored.variables, restored.opt_state, batch(), restored.key)
     assert abs(float(actual[2] - expected[2])) < 2e-5
-    assert difference(actual[0], expected[0]) < 2e-5
+    assert largest_difference(actual[0], expected[0]) < 2e-5
 
 
 NAMED = [name for name in REMAT_POLICIES if name != 'full']
@@ -250,7 +246,7 @@ def test_named_policies_train_the_same_model_as_full(policy, scan):
     (other_loss, other_aux), other_grads = gradient_step(
         full.clone(remat=policy), variables, key)
     assert abs(float(loss - other_loss)) < 2e-6
-    assert difference(grads, other_grads) < 2e-6
+    assert largest_difference(grads, other_grads) < 2e-6
     for name, value in aux.metrics.items():
         other = other_aux.metrics[name]
         if name == "perplexity":

@@ -115,6 +115,16 @@ def widened(tree):
         leaf, np.float64 if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf.dtype), tree)
 
 
+def with_gradients(fn):
+    """`fn` as `run(*inputs, cotangent)`, which returns `fn(*inputs)` and the gradients of its inputs
+    under the cotangent passed last: a differentiated call's leaves, as the gate compares them."""
+    def run(*arguments):
+        out, pull = jax.vjp(fn, *arguments[:-1])
+        return out, *pull(arguments[-1])
+
+    return run
+
+
 def equations(graph):
     """Every equation of a jaxpr, its sub-jaxprs' (scan, cond, custom rules) in turn."""
     if hasattr(graph, "eqns"):
@@ -377,14 +387,16 @@ def sketch_rounding(magnitude: float) -> float:
 class RecordedLeaf:
     """A recorded reference's evidence for one leaf at one seed, all check 1 reads of it (`_drawn`): its
     mean squared error from its own float64 truth, its worst sized row over its size, its RMS error on
-    each row of float64 zero by the row's index (the zero-row rule), and whether it and its truth were
-    finite."""
+    each row the truth sizes zero (below RESOLUTION of its leaf) by the row's index, and whether it and
+    its truth were finite; read from a leaf here (`leaf_summary`), also the truth's own RMS on each of
+    those rows, which decides whether a row a live reference measures is zero (`_paired`)."""
     mse: float
     worst: float
     zero_rows: np.ndarray
     zero_errors: np.ndarray
     finite: bool
     dtype: str
+    zero_sizes: np.ndarray | None = None
 
 
 def leaf_summary(reference, truth) -> RecordedLeaf:
@@ -398,10 +410,13 @@ def leaf_summary(reference, truth) -> RecordedLeaf:
         return RecordedLeaf(0.0, 0.0, np.zeros(0, np.int64), np.zeros(0), finite=True, dtype=dtype)
     sizes, rows = row_errors(reference, truth)
     sized = sizes > 0
+    own = (np.sqrt(np.mean(np.square(truth.reshape(-1, truth.shape[-1])), axis=1)) if truth.ndim >= 2
+           else np.zeros(0))
     return RecordedLeaf(float(np.mean(np.square(reference - truth))),
                         float(np.max(rows[sized] / sizes[sized])) if sized.any() else 0.0,
                         np.flatnonzero(~sized), rows[~sized],
-                        finite=bool(np.isfinite(reference).all() and np.isfinite(truth).all()), dtype=dtype)
+                        finite=bool(np.isfinite(reference).all() and np.isfinite(truth).all()), dtype=dtype,
+                        zero_sizes=own[~sized])
 
 
 def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=None) -> _Draws:
@@ -458,9 +473,18 @@ def _paired(name: str, mine: RecordedLeaf, theirs: RecordedLeaf, *, paired: bool
     """One seed's evidence of a leaf for check 1 (`_Draws`), Dew's and the reference's alike from
     `leaf_summary`: their mean squared errors, their worst sized rows, how many rows of float64 zero Dew
     is further from than ROW_FACTOR times the reference is on that same row (`rows_over`'s rule for
-    them), and whether every value was finite. A row of zero in Dew's truth the reference's lacks (a
-    recorded truth recomputed otherwise) is refused. Not `paired`, the two held to truths of their own
-    draws (`null_runs`), no row is paired."""
+    them), and whether every value was finite. A row the truth sizes zero (below RESOLUTION of its leaf)
+    is one of float64 zero unless a live reference measures it: its error there below the row's own
+    float64 RMS, so it carries the row better than zero would. That is an engineering definition of a
+    measured row, not a proof of float64's accuracy on it; a sum that cancels to float64's residue is
+    never measured so, and a product far below its leaf, which float64 holds to its own precision, is.
+    A measured row is judged at its own size as any row is, its error over its size entering both worst
+    rows: against the reference's worst row over the leaf, which holds it with less power than the zero
+    rows' rule held it against the reference's own error on it. Both arms are classified alike, from the
+    one truth they share. A recorded reference keeps no row's own size, and the recording's sketch holds
+    the truth at the leaf's scale, not a tiny row's, so its rows keep the zero rows' rule. A row of zero
+    in Dew's truth the reference's lacks (a recorded truth recomputed otherwise) is refused. Not
+    `paired`, the two held to truths of their own draws (`null_runs`), no row is paired."""
     if not paired:
         return mine.mse, theirs.mse, mine.worst, theirs.worst, 0, mine.finite and theirs.finite
     at_zero = dict(zip(theirs.zero_rows.tolist(), theirs.zero_errors.tolist(), strict=True))
@@ -468,9 +492,16 @@ def _paired(name: str, mine: RecordedLeaf, theirs: RecordedLeaf, *, paired: bool
     if unrecorded:
         raise AssertionError(f"{name}: the truth holds rows of float64 zero the reference's did not, "
                              f"{unrecorded[:4]}")
-    zero = sum(1 for at, error in zip(mine.zero_rows.tolist(), mine.zero_errors.tolist(), strict=True)
-               if not error <= ROW_FACTOR * at_zero[at])
-    return mine.mse, theirs.mse, mine.worst, theirs.worst, zero, mine.finite and theirs.finite
+    sizes = (dict(zip(theirs.zero_rows.tolist(), theirs.zero_sizes.tolist(), strict=True))
+             if theirs.zero_sizes is not None else {})
+    worst, their_worst, zero = mine.worst, theirs.worst, 0
+    for at, error in zip(mine.zero_rows.tolist(), mine.zero_errors.tolist(), strict=True):
+        size = sizes.get(at, 0.0)
+        if at_zero[at] < size:
+            worst, their_worst = max(worst, error / size), max(their_worst, at_zero[at] / size)
+        elif not error <= ROW_FACTOR * at_zero[at]:
+            zero += 1
+    return mine.mse, theirs.mse, worst, their_worst, zero, mine.finite and theirs.finite
 
 
 def _judged(draws: _Draws, index: int, tails: tuple[float, float] = (LOWER_TAIL, UPPER_TAIL)
@@ -557,8 +588,9 @@ def _logged(label: str, stage: int, verdict: str) -> None:
 def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn=None) -> None:
     """Check 1 of the owner's gate (bible §7, 2026-10-20): on par. Each leaf's RMS error from float64,
     pooled over the site's declared seeds, within PARITY times the reference's, and its worst row over
-    those seeds within ROW_FACTOR times the reference's worst; each row of float64 zero no further from
-    it than ROW_FACTOR times the reference on that row; every value finite.
+    those seeds within ROW_FACTOR times the reference's worst; each row of float64 zero (below RESOLUTION
+    of its leaf where a live reference does not measure it, `_paired`) no further from it than
+    ROW_FACTOR times the reference on that row; every value finite.
 
     `draw(seed)` returns the inputs of one draw, the same for a seed on every run; `dew_fn(*inputs)`
     and `reference_fn(*inputs)` return the same tree, and truth is `reference_fn` on the inputs
@@ -593,6 +625,58 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
         raise AssertionError("\n".join(over + unresolved))
     if unresolved:
         raise Inconclusive("\n".join(unresolved))
+
+
+def _moved(draws: _Draws, stage: int) -> tuple[list[str], list[str], bool]:
+    """The leaves a change moves beyond rounding (`assert_moves`), why each other one does not, and
+    whether any of those is unresolved (its interval still reaching above PARITY). A stage spends half of
+    LOWER_TAIL, shared among the leaves, so the two looks over every leaf spend no more than check 1's."""
+    moved, kept, unresolved = [], [], False
+    tail = LOWER_TAIL / 2 / max(len(draws.names), 1)
+    for index, name in enumerate(draws.names):
+        mine, theirs = draws.mine[:, index], draws.theirs[:, index]
+        if not draws.finite[:, index].all():
+            kept.append(f"{name}: a value not finite, which moves nothing a ratio can show")
+            unresolved = True
+        elif np.sum(theirs) == 0:
+            # The original holds the float64 truth exactly: any move off it is past its rounding.
+            (moved if np.sum(mine) > 0 else kept).append(
+                f"{name}: {'moved off' if np.sum(mine) > 0 else 'kept'} the original's exact value")
+        else:
+            ratio = _pooled(mine, theirs)
+            low, high = _interval(mine, theirs, tails=(tail, UPPER_TAIL))
+            (moved if low > PARITY else kept).append(
+                f"{name}: at stage {stage}, the changed RMS distance from the original's float64 run is "
+                f"{ratio:.3f} times the original's own, its lower end {low:.3f}")
+            unresolved |= low <= PARITY and max(high, ratio) > PARITY
+    return moved, kept, unresolved
+
+
+def assert_moves(original_fn, changed_fn, draw, label: str, *, seeds: int, truth_fn=None) -> None:
+    """A change that must move the result beyond rounding (a sensitivity check): over check 1's draws
+    (`assert_as_exact`), some leaf of `changed_fn` sits further from the original's float64 run than
+    PARITY times `original_fn`'s own rounding, by the lower end of its pooled ratio's interval, so a
+    change rounding could account for passes at a nominal 5e-4 at most over its leaves and both stages
+    (`_moved`). The truth is `original_fn` on the inputs widened to float64, or `truth_fn`, which must be
+    the original's own float64 semantics (an output dtype it closes over), never another computation's.
+    A leaf the original holds exactly moves on any departure from it. Two pre-declared stages, as check
+    1's: at `seeds`, then, where no leaf moved, REDRAW times as many further seeds; still unmoved, it
+    fails, or is Inconclusive where a leaf's interval still reaches above PARITY. Where the change is
+    structural and the alternative is bitwise identity (another seed, another mask), exact inequality
+    says enough and this is not needed."""
+    if seeds < FEWEST_SEEDS:
+        raise Inconclusive(f"{label}: {seeds} seeds cannot be judged; check 1 takes at least {FEWEST_SEEDS} "
+                           f"(`seeds_for`)")
+    draws = _drawn(changed_fn, original_fn, draw, range(seeds), truth_fn)
+    moved, kept, unresolved = _moved(draws, 1)
+    if not moved:
+        further = range(seeds, (1 + REDRAW) * seeds)
+        draws = draws.joined(_drawn(changed_fn, original_fn, draw, further, truth_fn))
+        moved, kept, unresolved = _moved(draws, 2)
+    if not moved:
+        found = (f"{label}: the change moves no leaf beyond rounding over {len(draws.mine)} seeds:\n"
+                 + "\n".join(kept))
+        raise Inconclusive(found) if unresolved else AssertionError(found)
 
 
 def seeds_for(reference_fn, draw, label: str, *, start: int = FEWEST_SEEDS, most: int = 512,
@@ -1607,6 +1691,18 @@ def assert_computes_the_oracle(reference_in_float64, truth, label: str, *, round
     assert within(apart, FACTOR * roundings * eps * scale), (
         f"{label}: the reference in float64 is {apart:.3e} from the oracle (rms), more than float64 "
         f"rounding over {roundings} steps of its scale {scale:.3e}")
+
+
+def assert_same_artifact(recomputed, committed, f64, name: str) -> None:
+    """A committed fixture is an evaluation of its reference at its own precision (an artifact check, not
+    a parity): its largest error from the float64 run `f64` at most twice `recomputed`'s, the reference
+    run again here. Another torch build sums in another order, so the two need not agree bit for bit
+    across machines; a fixture that is not this reference's output sits orders further."""
+    fresh, stored = (float(np.max(np.abs(value - f64))) for value in (recomputed, committed))
+    print(f"{name}: committed {stored:.3e} and recomputed {fresh:.3e} from float64, "
+          f"{float(np.max(np.abs(recomputed - committed))):.3e} apart")
+    if stored > 2 * fresh:
+        raise AssertionError(f"{name}: the committed fixture is not this reference's output")
 
 
 def chain_roundings(closed_jaxpr) -> int:

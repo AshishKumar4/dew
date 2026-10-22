@@ -11,7 +11,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
-from reference_error import assert_as_exact, assert_as_exact_as_the_reference
+from reference_error import assert_as_exact_as_the_reference
 
 from dew.nn.conv import Conv
 from dew.nn.dense import Dense, DenseGeneral
@@ -109,43 +109,6 @@ def test_a_bias_sums_its_gradient_over_every_position_at_fp32(layer, shape):
     truth = terms.sum(0).reshape(got.shape)
     reference = np.asarray(jnp.asarray(terms.astype(np.float32).sum(0), jnp.bfloat16), np.float64)
     assert_as_exact_as_the_reference(got, reference.reshape(got.shape), truth, "bias gradient")
-
-
-SPLIT = {"conv": (Conv(3, (3, 3)), (8, 32, 32, 4), 256), "dense": (Dense(3), (8, 32, 32, 4), 256)}
-"""Each split bias gradient's layer, input shape and declared seeds for check 1 (`assert_as_exact`),
-sized by `seeds_for` (2026-10-20, on armada): a U-ViT's output convolution, and a projection over the same
-positions. Three elements a draw take 256 draws to resolve the factor."""
-
-
-@pytest.mark.mesh(devices=8)
-@pytest.mark.parametrize("site", sorted(SPLIT))
-def test_a_bias_gradient_is_as_exact_however_its_positions_are_split(site):
-    """A bias's gradient sums its cotangents over every position, and is as exact with the batch
-    split over eight devices as on one: check 1 over the site's seeds, truth the cotangents' float64
-    sum. A plain sum of each device's shard was 5.7 times as far from float64 (ledger 833)."""
-    layer, shape, seeds = SPLIT[site]
-    variables = layer.init(jax.random.key(0), jnp.zeros(shape, jnp.float32))
-    out = jax.eval_shape(layer.apply, variables, jnp.zeros(shape, jnp.float32)).shape
-    mesh = jax.sharding.Mesh(np.array(jax.devices()[:8]), ("batch",))
-    rows = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec("batch"))
-    whole = jax.sharding.NamedSharding(mesh, jax.sharding.PartitionSpec())
-
-    def gradient(x, cotangent):
-        def loss(params):
-            return jnp.sum(layer.apply({"params": params}, x) * cotangent)
-        return {"bias": jax.grad(loss)(variables["params"])["bias"]}
-
-    def draw(seed):
-        rng = np.random.default_rng(seed)
-        return rng.standard_normal(shape).astype(np.float32), rng.standard_normal(out).astype(np.float32)
-
-    split = jax.jit(gradient, in_shardings=(rows, rows), out_shardings=whole)
-    alone = jax.jit(gradient)
-
-    def truth(x, cotangent):
-        return {"bias": np.asarray(cotangent, np.float64).reshape(-1, out[-1]).sum(0)}
-
-    assert_as_exact(split, alone, draw, f"{site} bias gradient", seeds=seeds, truth_fn=truth)
 
 
 @pytest.mark.parametrize("layer", [

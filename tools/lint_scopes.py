@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import ast
 from collections.abc import Iterable, Iterator, Mapping, Sequence
+from types import MappingProxyType
 
 SCOPES = (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda, ast.ClassDef)
 COMPREHENSIONS = (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)
@@ -124,21 +125,34 @@ def comprehended(nodes: Sequence[ast.AST], table: Mapping[str, str], body: Mappi
     return tables
 
 
+def nodes_of(body: Sequence[ast.AST]) -> list[ast.AST]:
+    """Every node one scope's `body` holds: its statements and what they hold, a nested scope's own
+    statement but not its contents."""
+    return [node for statement in body
+            for node in (statement, *(() if isinstance(statement, SCOPES) else own(statement)))]
+
+
 def scoped(body: Sequence[ast.AST], visible: Mapping[str, str], parent: Sequence[str],
-           parameters: Sequence[ast.arg] = (), class_body: bool = False
-           ) -> Iterator[tuple[ast.AST, Mapping[str, str]]]:
+           parameters: Sequence[ast.arg] = (), class_body: bool = False, *,
+           held: Mapping[int, str] = MappingProxyType({})) -> Iterator[tuple[ast.AST, Mapping[str, str]]]:
     """Every node of a scope's `body` and of the scopes in it, with what each
     name imported there stands for (`visible` around it). A scope's own
     import replaces its `parameters`; a name it otherwise binds (`binders`:
-    an assignment, a definition) stands for no import. A comprehension's
-    targets are its own, and a class body's names reach no scope inside it."""
-    nodes = [node for statement in body
-             for node in (statement, *(() if isinstance(statement, SCOPES) else own(statement)))]
+    an assignment, a definition) stands for no import, unless every such
+    binding is a stored name `held` gives one same path, keyed by its node's
+    identity, which the name then stands for as an import's would. A
+    comprehension's targets are its own, and a class body's names reach no
+    scope inside it."""
+    nodes = nodes_of(body)
     imported: dict[str, str] = {}
     local: set[str] = set()
     for name, by in binders(nodes, parameters).items():
         importers = [node for node in by if isinstance(node, ast.Import | ast.ImportFrom)]
-        if any(not isinstance(node, ast.arg | ast.Import | ast.ImportFrom) for node in by):
+        others = [node for node in by if not isinstance(node, ast.arg | ast.Import | ast.ImportFrom)]
+        paths = {held.get(id(node)) for node in others}
+        if others and not importers and len(paths) == 1 and None not in paths:
+            imported[name] = paths.pop()
+        elif others:
             local.add(name)
         elif importers:
             imported[name] = bound_by(importers[-1], parent)[name]
@@ -150,11 +164,11 @@ def scoped(body: Sequence[ast.AST], visible: Mapping[str, str], parent: Sequence
         here = inside.get(id(node), table)
         yield node, here
         if isinstance(node, SCOPES):
-            yield from scoped(outside(node), here, parent)
+            yield from scoped(outside(node), here, parent, held=held)
             inner = node.body if isinstance(node.body, list) else [node.body]
             bound = () if isinstance(node, ast.ClassDef) else arguments(node)
             yield from scoped(inner, visible if class_body else here, parent, bound,
-                              isinstance(node, ast.ClassDef))
+                              isinstance(node, ast.ClassDef), held=held)
 
 
 def resolved(node: ast.expr, table: Mapping[str, str]) -> str:

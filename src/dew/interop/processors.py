@@ -253,7 +253,7 @@ class Processor:
             "text": text if isinstance(text, str) else list(text),
             "padding": not isinstance(text, str) and len(text) > 1,
             "truncation": False,
-            "return_tensors": "pt",
+            "return_tensors": self._media_tensors,
         }
         if audio is not None:
             arguments["audio"] = audio
@@ -261,7 +261,7 @@ class Processor:
             arguments["videos"] = videos
         if video_metadata is not None:
             arguments["video_metadata"] = video_metadata
-        return self._from_tensors(self.media(images=images, **arguments))
+        return self._from_arrays(self.media(images=images, **arguments))
 
     def chat(self, messages: Sequence[Mapping[str, object]], *, add_generation_prompt: bool = True,
              **template_options: JSON) -> ModelInputs:
@@ -280,20 +280,41 @@ class Processor:
                     for part in content)
         reference = self._media_reference if media else self.reference
         values = reference.apply_chat_template(
-            messages, tokenize=True, return_dict=True, return_tensors="pt" if media else "np",
+            messages, tokenize=True, return_dict=True, return_tensors=self._media_tensors if media else "np",
             add_generation_prompt=add_generation_prompt, **template_options)
         if not isinstance(values, Mapping):
             raise TypeError("the source chat processor must return named numeric inputs")
-        return self._from_tensors(values) if media else self.from_hf(values)
+        return self._from_arrays(values) if media else self.from_hf(values)
 
-    def _from_tensors(self, values: Mapping[str, object]) -> ModelInputs:
-        import torch
+    @property
+    def _media_tensors(self) -> Literal["np", "pt"]:
+        """The tensor type the media processor is asked for: NumPy, so a processor that computes on
+        the host needs no PyTorch, unless an image or video processor of it computes in PyTorch
+        (Transformers' torchvision backend, whose bfloat16 pixels NumPy cannot hold), which
+        installs PyTorch itself and whose tensors `_from_arrays` reads."""
+        from transformers.image_processing_backends import TorchvisionBackend
 
+        parts = vars(self._media_reference).values()
+        return "pt" if any(isinstance(part, TorchvisionBackend) for part in parts) else "np"
+
+    def _from_arrays(self, values: Mapping[str, object]) -> ModelInputs:
+        """A media processor's fields on the host, in their own dtypes: NumPy arrays as they are, and
+        the tensors of a processor that computes in PyTorch (`_media_tensors`) read by PyTorch, which
+        that processor installs, a bfloat16 one (Llama 4's pixels) widened to float32, which is exact.
+        A field neither is refused naming the processor."""
         arrays: dict[str, np.ndarray] = {}
         for name, value in values.items():
+            if isinstance(value, np.ndarray):
+                arrays[name] = value
+                continue
+            if self._media_tensors != "pt":
+                raise TypeError(f"{type(self._media_reference).__name__} returned {name!r} as "
+                                f"{type(value).__name__}, not the NumPy array Dew asks it for")
+            import torch
+
             if not isinstance(value, torch.Tensor):
-                raise TypeError(f"processor field {name!r} is not a tensor")
-            # Llama 4's processor emits bf16; float32 widening is exact.
+                raise TypeError(f"{type(self._media_reference).__name__} returned {name!r} as "
+                                f"{type(value).__name__}, which is no tensor")
             arrays[name] = (value.float() if value.dtype == torch.bfloat16 else value).numpy()
         return self.from_hf(arrays)
 
