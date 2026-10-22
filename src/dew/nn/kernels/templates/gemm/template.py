@@ -180,7 +180,7 @@ def gemm_t(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None, *, pro
             lhs, matrix, group_sizes, precision=precision, preferred_element_type=jnp.float32), matrix)
         return pullback(rhs.astype(lhs.dtype).astype(jnp.float32))[0].astype(out_dtype)
 
-    if not _kernels_take(lhs.dtype, precision, (out_dtype,)):
+    if not _kernels_take(lhs.dtype, precision, (out_dtype,), lhs.shape[0]):
         return portable(lhs, rhs, group_sizes, prologue_arrays)
     return _dispatched(kernel, portable, interpret_on_cpu, lhs, rhs, group_sizes, prologue_arrays)
 
@@ -207,7 +207,7 @@ def _gemm(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, epilo
         return _portable_gemm(lhs, _layer_of(rhs, layers), group_sizes, prologue, prologue_arrays, epilogue,
                               epilogue_arrays, dtypes, several, transpose_rhs, precision)
 
-    if not _kernels_take(lhs.dtype, precision, dtypes):
+    if not _kernels_take(lhs.dtype, precision, dtypes, lhs.shape[0]):
         return portable(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays, layers)
     return _dispatched(kernel, portable, interpret_on_cpu, lhs, rhs, group_sizes, prologue_arrays,
                        epilogue_arrays, layers)
@@ -302,11 +302,15 @@ def _needed(jaxpr, outvars) -> set:
     return needed
 
 
-def _kernels_take(compute, precision: PrecisionLike, outputs: tuple) -> bool:
+def _kernels_take(compute, precision: PrecisionLike, outputs: tuple, rows: int) -> bool:
     """Whether the kernels compute the product `precision` declares in `compute` with `outputs`
     (`templates.product.declared`) on this target (`grouped_matmul.kernel_refusal`: a TPU's launches take
     16-bit products not added step by step): one they refuse runs XLA's portable program, reported as the
-    dispatch's route with the reason, and a kernel `generation.chosen` names for it raises."""
+    dispatch's route with the reason, and a kernel `generation.chosen` names for it raises. A call of no
+    `rows` launches nothing: XLA's program gives its empty value."""
+    if not rows:
+        generation.ran_kernel('grouped_matmul', 'xla', "the call has no rows")  # nothing to launch
+        return False
     product = declared(compute, precision, outputs=outputs)
     return _taken(product.refusal or grouped_matmul.kernel_refusal(compute, product.promoted))
 
