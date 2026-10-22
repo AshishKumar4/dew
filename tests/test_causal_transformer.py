@@ -21,7 +21,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from flax import linen as nn
-from model_support import TINY_DECODER, decode_steps, model_draw
+from model_support import TINY_DECODER, decode_steps, model_draw, with_logit_cotangent
 from reference_error import assert_as_exact, torch_with_gradients, with_gradients
 
 from dew.nn.attention import scaled_dot_product_attention
@@ -900,14 +900,7 @@ def test_metadata_that_restricts_no_visibility_scores_like_no_metadata(rng):
             return with_gradients(lambda tree: model.apply(tree, ids, **metadata))(tree, cotangent)[1]
         return jax.jit(run)
 
-    weights_and_tokens = drawn(model)
-
-    def draw(seed):
-        """A seed's weights and tokens, and a cotangent on the logits drawn with them."""
-        tree, ids = weights_and_tokens(seed)
-        cotangent = np.random.default_rng([0x904, seed]).normal(size=(*ids.shape, VOCAB))
-        return tree, ids, cotangent.astype(np.float32)
-
+    draw = with_logit_cotangent(drawn(model), VOCAB, 0x904)
     assert jnp.array_equal(model.apply(params, ids),
                            model.apply(params, ids, rotary_positions=rotary))
     assert_as_exact(scored(model, rotary_positions=rotary), scored(model), draw, "spelled rotary",

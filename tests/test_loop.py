@@ -10,7 +10,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from model_support import TINY_DECODER, decode_steps, model_draw
+from model_support import TINY_DECODER, decode_steps, model_draw, with_logit_cotangent
 from reference_error import assert_as_exact, with_gradients
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -138,14 +138,7 @@ def test_checkpointed_passes_preserve_logits_and_gradients(backprop_steps, scan_
         return jax.jit(run)
 
     # Eight rows of sixteen tokens: a norm's scale sums its gradient over enough of them to resolve.
-    tokens = drawn(plain, 16, 8)
-
-    def draw(seed):
-        """A seed's parameters and tokens, and a cotangent on the logits drawn with them."""
-        tree, ids = tokens(seed)
-        cotangent = np.random.default_rng([0x100, seed]).normal(size=(*ids.shape, VOCAB))
-        return tree, ids, cotangent.astype(np.float32)
-
+    draw = with_logit_cotangent(drawn(plain, 16, 8), VOCAB, 0x100)
     assert_as_exact(result(checkpointed), result(plain), draw,
                     f'{scan_layers} {backprop_steps} checkpointed', seeds=SEEDS['checkpointed'],
                     truth_fn=result(plain.clone(dtype=jnp.float64)))
