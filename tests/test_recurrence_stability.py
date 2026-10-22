@@ -15,8 +15,9 @@ pairs within a chunk span tens of e-folds; every token at the decay's range boun
 attention's lower bound, -5 a token); near-collinear keys with the write gate near one, whose WY system
 grows as binomials; documents reset on chunks' first and last tokens; and saturated gates (write gates at
 0 and 1, Mamba's step through softplus at 30), and pre-activations spread over [-20, 20], which keep
-gates near 0 and 1 apart; and a memory fading over a long sequence, whose output falls far below its scale.
-Each runs the portable math, and the port of fla's kernels (`recurrence_chunk.fla_rule`) where the hooks
+gates near 0 and 1 apart; a memory fading over a long sequence, whose output falls far below its scale;
+and a steep decay every eighth token between mild ones, whose pairs after it are differences of large,
+nearly equal prefixes. Each runs the portable math, and the port of fla's kernels (`recurrence_chunk.fla_rule`) where the hooks
 take it (the delta rule with a decay), both forward and through their gradient, held to the recurrence's
 gradient by check 1. The port runs where its route takes the regime's declared decay floor (`FLOORS`): a
 decay a key dimension steeper than its domain, -5 a token, it refuses (`fla_kda.DECAY_FLOOR`), which the
@@ -61,7 +62,21 @@ def _decayed(operands: Chunk, hooks, log_decay: float, spread: float, key) -> Ch
     whichever operand the hooks read it from: the log decay itself, the gate's pre-activation (`gated`'s
     `-exp(log_a) softplus(gate + bias)`), or a rated decay's write gate (`rate * dt`)."""
     noise = spread * jax.random.uniform(key, operands.value.shape[:3], minval=-1.0, maxval=1.0)
-    target = jnp.minimum(log_decay + noise, 0.0)
+    return _formed(operands, hooks, jnp.minimum(log_decay + noise, 0.0))
+
+
+def _steep(operands: Chunk, hooks, key) -> Chunk:
+    """Every eighth token's log decay steep, -1000, so the memory passes it all but nothing, and every other
+    token's mild, near -0.02: after a steep token a chunk's prefix is large and each mild pair's decay a
+    difference of two nearly equal prefixes (a decay a key dimension clipped to its floor, `stressed`)."""
+    steep = jnp.arange(operands.value.shape[1]) % 8 == 0
+    mild = -0.02 + 0.01 * jax.random.uniform(key, operands.value.shape[:3], minval=-1.0, maxval=1.0)
+    return _formed(operands, hooks, jnp.where(steep[None, :, None], -1000.0, mild))
+
+
+def _formed(operands: Chunk, hooks, target) -> Chunk:
+    """`operands` with every token's log decay `target` `[B, T, H]`, formed through whichever operand the
+    hooks read it from (`_decayed`)."""
     if hooks.rated:
         # The log decay is `rate * dt`: dt the target over each head's rate.
         return dataclasses.replace(operands, beta=target / operands.rate)
@@ -131,10 +146,13 @@ REGIMES = {
     'spread gates': (lambda operands, hooks, key: _spread(operands, hooks, key), None),
     'a long sequence': (lambda operands, hooks, key: _decayed(operands, hooks, -1e-3, 5e-4, key), LONG),
     'a fading memory': (lambda operands, hooks, key: _decayed(operands, hooks, -0.1, 0.05, key), LONG),
+    'steep then mild': (lambda operands, hooks, key: _steep(operands, hooks, key), None),
 }
 """Each regime's transform of a draw's operands and its tokens (the draw's own where None)."""
 
 GRADIENT_SEEDS = {
+    **{(name, 'steep then mild'): 8 for name in ('scalar delta', 'vector delta', 'scalar write', 'gated', 'rated')},
+    **{(name, 'steep then mild'): 8 for name in ('scalar delta', 'vector delta', 'scalar write', 'gated', 'rated')},
     ('scalar delta', 'decays near zero'): 512,
     ('vector delta', 'decays near zero'): 512,
     ('scalar write', 'decays near zero'): 512,
@@ -239,7 +257,8 @@ FLOORS = {'decays near one': -1.5e-4, 'decays near zero': -35.0, 'the decay boun
           'a long sequence': -1.5e-3, 'a fading memory': -0.15}
 """Each regime's declared per-token log decay floor, the steepest it draws: its decays' target less their
 spread, or Kimi Linear's bound (-5, `dew.nn.kda`'s `lower_bound`) where the regime keeps the draw's own
-decays, which a decay per key dimension is clipped to (`stressed`)."""
+decays or draws steeper ones (steep then mild's -1000), which a decay per key dimension is clipped to
+(`stressed`)."""
 
 
 def floor(regime: str) -> float:
