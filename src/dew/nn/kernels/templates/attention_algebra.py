@@ -111,7 +111,7 @@ def modify(spec: Forward, s: jax.Array, coords: Coords, params: tuple[jax.Array,
     of the block sees whole (a full tile of the block map), which takes no mask."""
     logits = s * (spec.scale * LOG2E if spec.base2 else spec.scale)
     if spec.score_mod is not None:
-        logits = spec.score_mod(logits, coords.q_pos, coords.k_pos, *params)
+        logits = hooked(spec.score_mod, logits, coords.q_pos, coords.k_pos, params)
     if not masked:
         return logits
     seen = None
@@ -261,6 +261,15 @@ def floating_params(params) -> list[int]:
     return [index for index, param in enumerate(params) if jnp.issubdtype(param.dtype, jnp.floating)]
 
 
+def hooked(score_mod: Callable, logits: jax.Array, q_pos, k_pos, params) -> jax.Array:
+    """`score_mod` on a tile, traced through its forward rule where it is a `jax.custom_vjp` (whose own
+    call no kernel lowering takes), its residuals left for the compiler to drop: its forward rule's
+    value is its value, as `jax.custom_vjp` requires."""
+    floating = floating_params(params)
+    inputs = (logits, *(params[index] for index in floating))
+    return jax.vjp(differentiable(score_mod, q_pos, k_pos, params, floating), *inputs)[0]
+
+
 def differentiable(score_mod: Callable, q_pos, k_pos, params, floating: list[int]) -> Callable:
     """`score_mod` at the tile's coordinates as a function of its logits and its floating parameters
     (`floating`) alone, the others held: what `jax.vjp` takes."""
@@ -284,7 +293,7 @@ def scored(score_mod, logits, q_pos, k_pos, params, *, slopes: bool):
     if score_mod is None:
         return logits, None
     if not slopes:
-        return score_mod(logits, q_pos, k_pos, *params).astype(jnp.float32), None
+        return hooked(score_mod, logits, q_pos, k_pos, params).astype(jnp.float32), None
     floating = floating_params(params)
     inputs = (logits, *(params[index] for index in floating))
     out, pull = jax.vjp(differentiable(score_mod, q_pos, k_pos, params, floating), *inputs)

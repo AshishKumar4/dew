@@ -121,8 +121,9 @@ def test_both_mainloops_compute_the_same_gradients_under_every_score_hook(hooks,
 @pytest.mark.parametrize("hooks", ["none", "sinks", "softcap"])
 def test_the_forwards_split_sums_give_the_first_passes_gradients(hooks):
     """The backward from the forward's split sums (`algebra.split_delta`) and from the dQ launch's own
-    first pass over the keys (`algebra.off_anchor_delta`) on par with each other's reference (check 1),
-    over a windowed causal call of packed documents: the training forward's sums are the first pass."""
+    first pass over the keys (`algebra.off_anchor_delta`) on par (check 1, the reference's float64 gradients
+    the truth), over a windowed causal call of packed documents: the training forward's sums are the first
+    pass."""
     queries, keys = geometry(CASES["causal-documents-window"])
     spans = template.spans(queries, keys, ROWS, **arguments(CASES["causal-documents-window"]))
     score_mod, kinds, draw_hooks = score_hooks(SCORE_HOOKS[hooks], queries, keys, 32)
@@ -142,7 +143,17 @@ def test_the_forwards_split_sums_give_the_first_passes_gradients(hooks):
 
         return jax.jit(run)
 
-    assert_as_exact(grads(split=True), grads(split=False), draw, f"split sums {hooks}", seeds=SPLIT_SEEDS)
+    def truth(query, key, value, dout, params, initial):
+        # The reference's own gradients, in the float64 the gate widens to.
+        def attend(query, key, value, params, initial):
+            given = tuple(template.Param(value, kind) for value, kind in zip(params, kinds, strict=True))
+            return template.reference(query, key, value, spans, template.Hooks(score_mod, given, initial))
+
+        pull = jax.vjp(attend, query, key, value, params, initial)[1]
+        return pull(dout)
+
+    assert_as_exact(grads(split=True), grads(split=False), draw, f"split sums {hooks}", seeds=SPLIT_SEEDS,
+                    truth_fn=truth)
 
 
 SPLIT_SEEDS = 8
