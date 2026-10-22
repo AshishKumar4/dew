@@ -579,10 +579,14 @@ class Store:
         fs, path = self.resolve()
         while isinstance(fs, CachingFileSystem):
             fs = fs.fs
-        protocol = "conditional" if issubclass(type(fs), ConditionalWrites) else fs.protocol
-        schemes = (protocol,) if isinstance(protocol, str) else protocol
-        for scheme in ("conditional", "file", "memory", "s3", "gs", "gcs", "hf"):
-            if scheme in schemes:
+        if issubclass(type(fs), ConditionalWrites):
+            return fs, path, "conditional"
+        if local(fs):
+            return fs, path, "file"
+        if in_memory(fs):
+            return fs, path, "memory"
+        for scheme in ("s3", "gs", "gcs", "hf"):
+            if scheme in _protocols(fs):
                 return fs, path, scheme
         raise ValueError(f"conditional publication is unavailable for {self.url}")
 

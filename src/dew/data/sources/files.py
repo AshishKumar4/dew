@@ -455,10 +455,9 @@ class Files(Dataset):
         preparing(self, sum(fs.size(path) or 0 for fs, path in stores), "an offset index beside each file")
         for url in self.paths:
             fs, path = Store(url, self.storage_options).resolve()
-            offsets = []
             with _open_lines(fs, path) as file:
                 names = _header(file) if self.kind == "csv" else None
-                offsets = [(0, start, size) for _, start, size in _line_records(self.kind, file, names)]
+                offsets = [(0, start, size) for _, start, size in _lines(self.kind, file, names)]
             encoded = io.BytesIO()
             np.save(
                 encoded,
@@ -558,7 +557,8 @@ class Files(Dataset):
         read from huggingface_hub's cache where it holds every one, and from the Hub otherwise."""
         stores = [Store(url, self.storage_options) for url in self.paths]
         located = [store.readable() for store in stores]
-        if any(place.fs.protocol != located[0].fs.protocol for place in located):
+        # Some of a Hub dataset's files in huggingface_hub's cache, on this host's disk, and some not.
+        if len({local(place.fs) for place in located}) > 1:
             located = [Readable(*store.resolve(), None) for store in stores]
         filesystem = _arrow_filesystem(located[0].fs)
         paths = tuple(filesystem.normalize_path(place.path) for place in located)
@@ -738,7 +738,8 @@ class Files(Dataset):
 @dataclass(frozen=True)
 class _Columns:
     """A row that holds `columns`, as an Arrow reader's projection reads them: a row that is not a
-    mapping, or lacks a column, is refused, naming the store."""
+    mapping, or lacks a column, is refused, naming the store. A missing row (`None`, which a store's
+    records may hold) never reaches it: Grain's maps pass one on as it is."""
 
     columns: tuple[str, ...]
     described: str
@@ -865,8 +866,11 @@ class _IndexedLines:
                 payload = file.read(int(entry["bytes"]))
         else:
             payload = fs.cat_file(path, start=offset, end=offset + int(entry["bytes"]))
-        ((record, _, _),) = _line_records(self.source.kind, io.BytesIO(payload), names)
-        return record
+        held = [line for line, _, _ in _lines(self.source.kind, io.BytesIO(payload), names)]
+        if len(held) != 1:
+            raise ValueError(f"{self.source.describe()}'s index names {len(held)} records, not one, at byte "
+                             f"{offset} of {path}: provision it again")
+        return _decoded(self.source.kind, held[0])
 
 
 def _header(file: BinaryIO) -> tuple[str, ...]:
@@ -874,12 +878,13 @@ def _header(file: BinaryIO) -> tuple[str, ...]:
     return tuple(next(csv.reader(_CsvLines(file)), ()))
 
 
-def _line_records(kind: str, file: BinaryIO, names: Sequence[str] | None = None,
-                  stop: int | None = None) -> Iterator[tuple[Batch, int, int]]:
-    """Each record of a `kind` line file from `file`'s position, with where its bytes start and how
-    many they are, until a record would start at `stop`: a CSV row of the fields `names` (its
-    quoted newlines its own), a JSON line (blank lines skipped) or a text line. The offsets an index
-    provisions, an indexed read of one record's bytes and a stream all read records by it."""
+def _lines(kind: str, file: BinaryIO, names: Sequence[str] | None = None,
+           stop: int | None = None) -> Iterator[tuple[bytes | dict[str, str], int, int]]:
+    """Each record of a `kind` line file from `file`'s position, undecoded (`_decoded`), with where
+    its bytes start and how many they are, until a record would start at `stop`: a CSV row of the
+    fields `names` (its quoted newlines its own, so it is parsed to be found), a JSON line's bytes
+    (blank lines skipped) or a text line's. The offsets an index provisions, an indexed read of one
+    record's bytes and a stream all find records by it; only a read decodes them."""
     if kind == "csv":
         reader = csv.DictReader(_CsvLines(file), fieldnames=names)
         while stop is None or file.tell() < stop:
@@ -894,10 +899,16 @@ def _line_records(kind: str, file: BinaryIO, names: Sequence[str] | None = None,
         line = file.readline()
         if not line:
             return
-        if kind == "text":
-            yield {"text": line.decode()}, start, len(line)
-        elif line.strip():
-            yield json.loads(line), start, len(line)
+        if kind == "text" or line.strip():
+            yield line, start, len(line)
+
+
+def _decoded(kind: str, line: bytes | dict[str, str]) -> Batch:
+    """The record a line `_lines` found holds: a CSV row as parsed, a JSON line's object or a text
+    line's text."""
+    if isinstance(line, dict):
+        return line
+    return {"text": line.decode()} if kind == "text" else json.loads(line)
 
 
 class _CsvLines(Iterator[str]):
@@ -937,11 +948,11 @@ class _LineIterator(grain.DatasetIterator):
             self.file.seek(shard.start - 1)
             if self.file.read(1) != b"\n":
                 self.file.readline()
-        self.records = _line_records(source.kind, self.file, self.names, shard.stop)
+        self.records = _lines(source.kind, self.file, self.names, shard.stop)
 
     def __next__(self) -> Batch:
-        record, _, _ = next(self.records)
-        return record
+        line, _, _ = next(self.records)
+        return _decoded(self.source.kind, line)
 
     def get_state(self) -> dict[str, int]:
         return {"offset": self.file.tell()}
@@ -954,8 +965,9 @@ class _LineIterator(grain.DatasetIterator):
             # Zstandard streams seek forward only; restoration starts from a fresh decoder.
             self.file.close()
             self.file = _open_lines(self.fs, self.path)
-            self.records = _line_records(self.source.kind, self.file, self.names, self.shard.stop)
         _seek_lines(self.file, offset)
+        # The records read on from the restored offset, after a pass that read them all too.
+        self.records = _lines(self.source.kind, self.file, self.names, self.shard.stop)
 
     def close(self) -> None:
         if self._opened:

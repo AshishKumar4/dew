@@ -45,6 +45,17 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   another stay apart; a data position saved over a holdout part before is
   refused as its source changed, and a generation published from one no
   longer stands in for it, where a `Cache(url)` over it fills again.
+- `dew.data` and `dew.data.sources` export `from_torch`, `from_grain`,
+  `from_hf` and `from_iter`, not the `Torch`, `Grain`, `HF` and `Iterated`
+  classes they make, which a recorded chain still names by their modules. A
+  Hugging Face stream saves its position through the iterator bridge every
+  resumable iterator does, and a data position saved over one before is
+  refused.
+- A storage profile whose base is this host's disk (`file` or `local`) is
+  that disk: an export commits to it, and ArrayRecord shards, offset indexes
+  and Arrow files read there by their own readers.
+- A text file is indexed by its lines' bytes, so a line that is not UTF-8 is
+  refused when it is read, not when the file is provisioned.
 - A packing plan a generation publishes is named by the digest a plan held
   in memory is (`dew.data.plan.fingerprint`). A generation published before
   keeps the name it stored, and a data position saved over it resumes; one

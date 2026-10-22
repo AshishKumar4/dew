@@ -10,13 +10,13 @@ from typing import TYPE_CHECKING
 import grain.python as grain
 import numpy as np
 
-from dew.data.dataset import Batch, Records
+from dew.data.dataset import Batch, Closeable, Records
 from dew.data.pipeline import Dataset
 from dew.records import record
 
 from .base import Read, Shard, ShardManifest
 from .codec import Value
-from .iterator import Iterated, _StreamIterator
+from .iterator import _StreamIterator
 from .memory import _record
 
 if TYPE_CHECKING:
@@ -180,7 +180,8 @@ class _Streamed(grain.IterDataset):
             dataset = self._dataset.shard(num_shards=1, index=0, contiguous=True)
             dataset = split_dataset_by_node(dataset, rank=shard.index, world_size=shard.count)
         # The iterator bridge reads it (`iterator._StreamIterator`), its position the dataset's own.
-        return _StreamIterator(Iterated(functools.partial(_Rows, dataset), shard.id, _state, _resume))
+        return _StreamIterator(functools.partial(_Rows, dataset), shard.id, state=_Rows.state,
+                               load_state=_Rows.resume)
 
 
 class _Rows(Iterator[Batch]):
@@ -190,6 +191,8 @@ class _Rows(Iterator[Batch]):
     def __init__(self, dataset: datasets.IterableDataset):
         self._dataset = dataset
         self._rows: Iterator[Batch] | None = None
+        # The position resumed from, which the dataset reports as its own only once it reads.
+        self._resumed: Value | None = None
 
     def __next__(self) -> Batch:
         if self._rows is None:
@@ -197,24 +200,19 @@ class _Rows(Iterator[Batch]):
         return next(self._rows)
 
     def state(self) -> Value:
+        """Where the rows are: the position they resumed from until they read, which an
+        `IterableDataset` reports as its own only once its iterator starts."""
+        if self._rows is None and self._resumed is not None:
+            return self._resumed
         return self._dataset.state_dict()
 
     def resume(self, position: Value) -> None:
         self._dataset.load_state_dict(dict(record(position, "a Hugging Face stream's state_dict")))
+        self._resumed = position
 
-
-def _state(rows: Iterator[Batch]) -> Value:
-    """The position of a Hugging Face stream's rows (`_Rows`), the bridge's `state`."""
-    if not isinstance(rows, _Rows):
-        raise TypeError(f"a Hugging Face stream's position is its own rows', not {type(rows).__name__}'s")
-    return rows.state()
-
-
-def _resume(rows: Iterator[Batch], position: Value) -> None:
-    """A Hugging Face stream's rows (`_Rows`) moved to `position`, the bridge's `load_state`."""
-    if not isinstance(rows, _Rows):
-        raise TypeError(f"a Hugging Face stream resumes its own rows, not {type(rows).__name__}")
-    rows.resume(position)
+    def close(self) -> None:
+        if isinstance(self._rows, Closeable):
+            self._rows.close()
 
 
 def from_hf(dataset: datasets.Dataset | datasets.IterableDataset, name: str | None = None) -> HF:
