@@ -19,11 +19,11 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from dew.interop.components import bind_component, component_source
+from dew.interop.components import bind_component
 from dew.objectives.base import Variables
 
 from ..scan_orders import pixel_shuffle, pixel_unshuffle
-from .api import LatentNormalization, ModuleAutoEncoder
+from .api import LatentNormalization, ModuleAutoEncoder, published_source
 from .kl import AutoencoderKL
 
 if TYPE_CHECKING:
@@ -34,10 +34,13 @@ STATISTICS = ("bn.running_mean", "bn.running_var", "bn.num_batches_tracked")
 and it computes nothing else."""
 
 
+PUBLISHED = ("AutoencoderKLFlux2",)
+"""The `_class_name` a published AutoencoderKLFlux2's config states."""
+
+
 class Flux2Autoencoder(ModuleAutoEncoder[AutoencoderKL]):
     """Native FLUX.2 VAE weights, the 2x2 fold and the batch-norm statistics
     as the latent normalization, per folded channel."""
-
 
     def __init__(self, *, model: AutoencoderKL, params: Variables, mean, variance, epsilon: float):
         super().__init__(model, params)
@@ -83,11 +86,7 @@ def load_flux2_vae(name_or_dir: str | Path, compute=jnp.float32, *, revision: st
     from dew.interop.safetensors_io import read_weights
     from dew.nn.autoencoders.vae import _vae_path
 
-    directory, config = component_source(name_or_dir, revision, subfolder, weights=True)
-    if config.get("_class_name") != "AutoencoderKLFlux2":
-        raise ValueError(
-            f"{directory} holds a {config.get('_class_name')}, not an AutoencoderKLFlux2"
-        )
+    directory, config = published_source(name_or_dir, revision, subfolder, PUBLISHED, weights=True)
     if tuple(config.get("patch_size", (2, 2))) != (2, 2):
         raise ValueError(f"FLUX.2's pipeline folds 2x2 latent blocks, not {config.get('patch_size')}")
     model = AutoencoderKL.from_diffusers(config, compute)

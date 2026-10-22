@@ -7,7 +7,7 @@ configuration and checkpoint files; no external model implementation runs.
 
 import json
 import os
-from collections.abc import Mapping, Sequence
+from collections.abc import Sequence
 from functools import partial
 from pathlib import Path
 from typing import Literal
@@ -19,6 +19,7 @@ import numpy as np
 
 from dew.interop.weights import ParamTree, indexed_path, translate_parameters
 from dew.nn.attention import GroupNorm, projected_heads, projected_output, scaled_dot_product_attention
+from dew.nn.autoencoders.api import check_class
 from dew.nn.conv import Conv
 
 
@@ -339,6 +340,9 @@ def _load_from_hub(modelname: str, revision: str, params, errors: list) -> dict 
         try:
             config_path = hf_hub_download(modelname, "config.json",
                                           revision=candidate_revision, subfolder=subfolder)
+            # A foreign autoencoder's config is refused before any of its weights is fetched.
+            with open(config_path) as handle:
+                check_class(json.load(handle), PUBLISHED, modelname, nameless=True)
             # Candidate eligibility must match a source load even when a
             # config exists in a revision that carries no matching weights.
             if params is not None:
@@ -359,18 +363,9 @@ def _load_from_hub(modelname: str, revision: str, params, errors: list) -> dict 
     return None
 
 
-KL_CLASSES = ("AutoencoderKL", "FlaxAutoencoderKL")
-"""The `_class_name`s an AutoencoderKL's config states: diffusers' and its Flax port's."""
-
-
-def kl_config[ConfigT: Mapping](config: ConfigT, where: str | Path) -> ConfigT:
-    """`config`, an AutoencoderKL's (`KL_CLASSES`, diffusers' and its Flax port's): one that names
-    another class (`_class_name`, a Wan or Qwen-Image VAE's) is refused, naming it, before its tensors
-    meet the KL tree; one that names none is taken as the AutoencoderKL older checkpoints are."""
-    named = config.get("_class_name")
-    if named is not None and named not in KL_CLASSES:
-        raise ValueError(f"{where} holds a {named}, not an AutoencoderKL")
-    return config
+PUBLISHED = ("AutoencoderKL", "FlaxAutoencoderKL")
+"""The `_class_name`s an AutoencoderKL's config states, diffusers' and its Flax port's; an older config
+names none (`check_class`'s `nameless`)."""
 
 
 def load_pretrained_vae(modelname: str, revision: str = "bf16", *, params=None) -> dict:
@@ -381,7 +376,8 @@ def load_pretrained_vae(modelname: str, revision: str = "bf16", *, params=None) 
     `flax`/`bf16` revision. Every 16-channel VAE (SD3.5, Flux) ships torch
     `diffusion_pytorch_model.safetensors` only, which `translate_vae_weights`
     reads. Supplied `params` are authoritative: only the configuration and
-    the repository's file metadata are read then, never weight bytes.
+    the repository's file metadata are read then, never weight bytes. A config naming another
+    autoencoder's class is refused by that name before any weight is read (`check_class`).
 
     `revision` names the flax layout when it is one of `FLAX_REVISIONS`, and
     the torch path then reads the repo's default branch. Any other revision
@@ -391,13 +387,13 @@ def load_pretrained_vae(modelname: str, revision: str = "bf16", *, params=None) 
     if os.path.isdir(modelname):
         directory = Path(modelname)
         with open(directory / "config.json") as handle:
-            config = kl_config(json.load(handle), directory)
+            config = json.load(handle)
+        check_class(config, PUBLISHED, directory, nameless=True)
         return {"config": config, "params": _read_vae_weights(directory) if params is None else params}
 
     errors: list[Exception] = []
     loaded = _load_from_hub(modelname, revision, params, errors)
     if loaded is not None:
-        kl_config(loaded["config"], modelname)
         return loaded
     last_error = errors[-1] if errors else None
     pinned = revision not in FLAX_REVISIONS

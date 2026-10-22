@@ -35,17 +35,21 @@ import numpy as np
 from flax.typing import Dtype
 
 from dew import records
-from dew.interop.components import bind_component, component_source
+from dew.interop.components import bind_component
 from dew.interop.weights import indexed_path
 from dew.objectives.base import Variables
 
 from ..attention import l2_normalized, scaled_dot_product_attention
 from ..conv import Conv
-from .api import AutoEncoder, LatentNormalization
+from .api import AutoEncoder, LatentNormalization, published_source
 from .kl import posterior_latent
 
 if TYPE_CHECKING:
     from dew.interop.streaming import WeightLayout
+
+
+PUBLISHED = ("AutoencoderKLWan",)
+"""The `_class_name` a published AutoencoderKLWan's config states."""
 
 
 class WanRMSNorm(nn.Module):
@@ -424,7 +428,6 @@ class WanAutoencoder(AutoEncoder):
     `chunked_decode`), so a clip's length does not set the memory they hold.
     """
 
-
     def __init__(self, *, model: WanVAE, params: Variables, latents_mean, latents_std):
         self.model = model
         self.params = params
@@ -485,11 +488,7 @@ def load_wan_vae(name_or_dir: str | Path, compute=jnp.float32, *, revision: str 
     Supplied `params` are bound unchanged: only the config is read, and no
     source layouts are returned. `lazy` leaves read ones `SourceLeaf`s for a
     placement to read (`dew.interop.weights.record_layouts`)."""
-    directory, config = component_source(name_or_dir, revision, subfolder, weights=params is None)
-    if config.get("_class_name") != "AutoencoderKLWan":
-        raise ValueError(
-            f"{directory} holds a {config.get('_class_name')}, not an AutoencoderKLWan"
-        )
+    directory, config = published_source(name_or_dir, revision, subfolder, PUBLISHED, weights=params is None)
     model = WanVAE(**wan_vae_fields(config), dtype=compute)
     video = jax.ShapeDtypeStruct(
         (1, 1 + model.temporal_factor, model.downscale_factor, model.downscale_factor, 3), jnp.float32

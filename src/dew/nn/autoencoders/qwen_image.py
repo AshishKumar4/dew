@@ -25,17 +25,21 @@ import numpy as np
 from flax.typing import Dtype
 
 from dew import records
-from dew.interop.components import bind_component, component_source
+from dew.interop.components import bind_component
 from dew.interop.weights import indexed_path
 from dew.objectives.base import Variables
 
-from .api import LatentNormalization, ModuleAutoEncoder
+from .api import LatentNormalization, ModuleAutoEncoder, published_source
 from .kl import posterior_latent
 from .vae import FlaxDownsample2D, FlaxUpsample2D
 from .wan import WanMidBlock, WanResidualBlock, WanRMSNorm, causal_conv
 
 if TYPE_CHECKING:
     from dew.interop.streaming import WeightLayout
+
+
+PUBLISHED = ("AutoencoderKLQwenImage21",)
+"""The `_class_name` a published AutoencoderKLQwenImage21's config states."""
 
 
 def _conv(features: int, kernel: int, dtype: Dtype, name: str | None) -> nn.Module:
@@ -331,7 +335,6 @@ class QwenImageAutoencoder(ModuleAutoEncoder[QwenImageVAE]):
     latent normalization, `(z - latents_mean) / latents_std` on the way out
     and `z * latents_std + latents_mean` on the way in."""
 
-
     def __init__(self, *, model: QwenImageVAE, params: Variables,
                  latents_mean: Sequence[float], latents_std: Sequence[float]):
         super().__init__(model, params)
@@ -360,11 +363,7 @@ def load_qwen_image_vae(name_or_dir: str | Path, compute=jnp.float32, *, revisio
     in the shape it declares. Supplied `params` are bound without a weight read;
     `lazy` leaves read ones `SourceLeaf`s for a placement to read
     (`dew.interop.weights.record_layouts`)."""
-    directory, config = component_source(name_or_dir, revision, subfolder, weights=params is None)
-    if config.get("_class_name") != "AutoencoderKLQwenImage21":
-        raise ValueError(
-            f"{directory} holds a {config.get('_class_name')}, not an AutoencoderKLQwenImage21"
-        )
+    directory, config = published_source(name_or_dir, revision, subfolder, PUBLISHED, weights=params is None)
     model = QwenImageVAE(**qwen_image_vae_fields(config), dtype=compute)
     frame = jax.ShapeDtypeStruct((1, model.downscale_factor, model.downscale_factor, model.image_channels),
                                  jnp.float32)

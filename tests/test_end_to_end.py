@@ -30,13 +30,10 @@ from dew.eval.lpips import variables_from_torch
 from dew.inputs import Condition, Field, InputSpec, unit_range
 from dew.nn.autoencoders.api import AutoEncoder
 from dew.nn.autoencoders.dc_ae import DCAE, DCAutoencoder
-from dew.nn.autoencoders.flux2 import Flux2Autoencoder
 from dew.nn.autoencoders.kl import AutoencoderKL
-from dew.nn.autoencoders.qwen_image import QwenImageAutoencoder
-from dew.nn.autoencoders.rae import RAEAutoencoder
+from dew.nn.autoencoders.pretrained import REGISTRATIONS
 from dew.nn.autoencoders.sd_vae import StableDiffusionVAE
 from dew.nn.autoencoders.vae import translate_vae_weights
-from dew.nn.autoencoders.wan import WanAutoencoder
 from dew.nn.backbones import SimpleDiT
 from dew.objectives.base import Step
 from dew.objectives.diffusion import Alignment, DiffusionObjective
@@ -643,9 +640,8 @@ def test_a_run_config_tunes_its_autoencoder_and_from_run_decodes_with_the_tuned_
     np.testing.assert_array_equal(restored(["a red bird"], key=9).host().images, expected)
 
 
-BUILT_INS = (StableDiffusionVAE, DCAutoencoder, WanAutoencoder, RAEAutoencoder, Flux2Autoencoder,
-             QwenImageAutoencoder)
-"""Every built-in autoencoder (`AutoEncoder.from_json`'s)."""
+BUILT_INS = tuple(entry.wrapper for entry in REGISTRATIONS)
+"""Every built-in autoencoder, one per registration (`AutoEncoder.from_json`'s)."""
 
 
 def test_only_the_kl_autoencoders_with_a_posterior_reach_end_to_end_tuning():
