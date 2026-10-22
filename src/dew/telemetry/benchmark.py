@@ -1,6 +1,7 @@
 """Wall-clock timing of calls: `samples`, which every benchmark tool in Dew measures with, and
-`benchmark`, which lays out many calls' timings as a table; and the process's resident memory as
-the kernel reports it (`resident_memory`), which the memory benchmarks read.
+`benchmark`, which lays out many calls' timings as a table; and the host memory the process holds
+(`resident_memory`), which the memory benchmarks read, and may still take (`available_memory`), which
+a server's host tier sizes itself by.
 
 A run is timed from the call to the moment its output is ready on the devices
 (`jax.block_until_ready`), so an asynchronous dispatch is timed as the work it
@@ -16,6 +17,7 @@ import html
 import statistics
 import time
 from collections.abc import Callable, Hashable, Mapping
+from pathlib import Path
 
 import jax
 import jax.numpy as jnp
@@ -90,6 +92,18 @@ def resident_memory() -> dict[str, int]:
                 case [amount, "kB"]:
                     fields[name] = int(amount) * 1024
     return fields
+
+
+def available_memory() -> int:
+    """Bytes of host memory this process may still take: Linux's MemAvailable, or what its cgroup's
+    limit (cgroup v2 `memory.max`) leaves beside what the group uses, where that is less."""
+    with open("/proc/meminfo") as handle:
+        free = next(int(line.split()[1]) * 1024 for line in handle if line.startswith("MemAvailable:"))
+    group = Path("/sys/fs/cgroup")
+    limit = group / "memory.max"
+    if limit.is_file() and limit.read_text().strip() != "max":
+        free = min(free, int(limit.read_text()) - int((group / "memory.current").read_text()))
+    return max(free, 0)
 
 
 def largest_difference(left, right) -> float:

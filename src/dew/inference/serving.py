@@ -81,12 +81,14 @@ from jax.sharding import Mesh, NamedSharding, PartitionSpec as P
 from jax.typing import ArrayLike
 
 from dew.inference.banks import banked, shape_rows, spread
-from dew.inference.pages import Pages
+from dew.inference.host_pages import PagesOnHost, holds_host_memory, landed, pool_formats, pool_of, with_pool
+from dew.inference.pages import HostPage, HostTier, Pages
 from dew.inference.projections import pack_projections, packed_layout
 from dew.inference.serving_kernel import (
     Admission,
     Dense,
     Draws,
+    Formats,
     Paged,
     Placement,
     decode_programs,
@@ -119,6 +121,7 @@ from dew.sampling.decoding import Finishing, LogitsTransform, StopStrings
 from dew.sampling.guided import Grammar
 from dew.sampling.strategies import Sample
 from dew.sampling.text import Generation, Sampling, check_inputs, rebuild_position, resolve
+from dew.telemetry.benchmark import available_memory
 
 Prompt = str | Sequence[int] | ArrayLike | ModelInputs
 """One request: text for the processor, one row of token ids, or one prepared row."""
@@ -258,6 +261,10 @@ class _Row:
     weights: int = 0
     """The weights the row's prompt keys are written under: how many reloads came before its seat."""
     group: int = 0
+    loads: list[HostPage] = field(default_factory=list)
+    """The host pages the row's prompt continues into, each loaded into its page before it prefills."""
+    staged: dict[int, list[jax.Array]] = field(default_factory=dict)
+    """Each host batch the row loads from, on its way to the devices; the row prefills once all land."""
     """The group of slots the row is seated in, whose part of a paged pool its pages are."""
 
 
@@ -368,12 +375,12 @@ class PagedRows:
         while queue:
             row = queue[0]
             open_groups = sorted((group for group, slots in enumerate(free) if taken[group] < len(slots)),
-                                 key=lambda group: (len(self.pages[group].shared(row.prompt)),
+                                 key=lambda group: (self.pages[group].chain(row.prompt),
                                                     self.pages[group].available), reverse=True)
             for group in open_groups:
                 reserved = self.pages[group].reserve(row.prompt, len(row.prompt) + row.budget)
                 if reserved is not None:
-                    row.pages, row.prefilled = reserved
+                    row.pages, row.prefilled, row.loads = reserved
                     row.weights = self.weights
                     break
             else:
@@ -393,15 +400,89 @@ class PagedRows:
             self.pages[row.group].publish(row.prompt, row.pages)
 
     def release(self, row: _Row) -> None:
-        self.pages[row.group].release(row.pages)
+        part = self.pages[row.group]
+        part.release(row.pages)
+        if part.host is not None:
+            for load in row.loads:
+                part.host.release(load.batch)
+        row.loads, row.staged = [], {}
 
     def reloaded(self) -> None:
         self.weights += 1
         for part in self.pages:
             part.forget()
+        if self.pages[0].host is not None:
+            self.pages[0].host.forget()
 
 
 Rows = DenseRows | PagedRows
+
+
+def _refuse_unserved_meshes(mesh: Mesh | None) -> None:
+    """Refuse the meshes a server cannot schedule over (`Server.from_task`)."""
+    if mesh is None:
+        return
+    if mesh.shape.get(STAGE_AXIS, 1) > 1:
+        raise ValueError(
+            "a server decodes through the whole layer stack every step; the stage axis "
+            "runs the stack as the training pipeline, which the decoder refuses to decode "
+            "through (one token a step leaves no microbatches to pipeline). Serve on a "
+            "mesh with stage=1"
+        )
+    if mesh.shape.get(SEQUENCE_AXIS, 1) > 1:
+        raise ValueError("a server keeps each row's cached keys whole on the devices of its group, "
+                         "and a decoder refuses to decode under a sequence axis, which splits a "
+                         "sequence's positions. Serve on a mesh with sequence=1")
+    if not NamedSharding(mesh, P()).is_fully_addressable:
+        raise ValueError("a server schedules its rows from one process; a mesh over several "
+                         "processes would need them to agree on every step's admission")
+
+
+def _paged_rows[Model: Layered](model: Model, layout: KVCache, page_size: int, slots: int, capacity: int,
+                               groups: int, *, chunk: int | None, prefix_cache: bool,
+                               host_cache: int | None) -> tuple[Model, PagedRows]:
+    """`model` over a pool of `page_size` pages, every slot's `capacity` by default, split over the
+    row groups, and the rows that ledger it, with a host tier where a prefix cache keeps one
+    (`Server.from_task`)."""
+    count = slots * (capacity // page_size) if layout.pages is None else layout.pages
+    served = model.with_kv_cache(dataclasses.replace(layout, pages=count, groups=groups))
+    # Half the host memory free now, the rest left to the process (weights held on the host, loaders)
+    # and its neighbours.
+    budget = available_memory() // 2 if host_cache is None else host_cache
+    host = HostTier(budget) if prefix_cache and groups == 1 and budget > 0 else None
+    ledgers = [Pages(count // groups, page_size, prefix_cache=prefix_cache, group=group, host=host)
+               for group in range(groups)]
+    return served, PagedRows(ledgers, chunk, capacity // page_size)
+
+
+class _PrefillRate:
+    """Seconds a step spends per prompt token it prefills, fit to the steps a server has run: each
+    call's time against the tokens it prefilled, least squares over the last WINDOW calls."""
+
+    WINDOW = 64
+    FEWEST = 8
+    """Calls fit before the rate is read: fewer leave the slope to a step or two's noise."""
+
+    def __init__(self) -> None:
+        self._calls: deque[tuple[int, float]] = deque(maxlen=self.WINDOW)
+
+    def add(self, tokens: int, seconds: float) -> None:
+        self._calls.append((tokens, seconds))
+
+    def per_token(self) -> float | None:
+        """The fitted seconds a prefilled token adds to a call, or None before FEWEST calls with
+        differing prefills."""
+        tokens = np.asarray([call[0] for call in self._calls], np.float64)
+        if len(tokens) < self.FEWEST or np.ptp(tokens) == 0:
+            return None
+        seconds = np.asarray([call[1] for call in self._calls], np.float64)
+        return max(float(np.polyfit(tokens, seconds, 1)[0]), 0.0)
+
+    def pays(self, round_trip: float, page_size: int) -> bool:
+        """Whether a page's round trip to the host costs less than prefilling its tokens; before the
+        rate is known, it is taken to."""
+        rate = self.per_token()
+        return rate is None or round_trip < rate * page_size
 
 
 def _refuse_unserved_modes(model: nn.Module, *, paged: bool = False, chunked: bool = False,
@@ -494,6 +575,15 @@ class Server:
         self.grammar = grammar
         self.prefix_hits = 0
         """The number of prompt tokens served from shared prefix pages instead of prefilled."""
+        self.host_hits = 0
+        """The number of prompt tokens loaded from the host tier's pages instead of prefilled."""
+        self._host: PagesOnHost | None = None
+        self._rate = _PrefillRate()
+        self._admitted_tokens = 0
+        self._pending_tokens = 0
+        self._settled_at: float | None = None
+        self._round_trip = 0.0
+        """Seconds a page takes out to the host and back, measured at the start."""
         self._admitted = (
             None if self.mesh is None else NamedSharding(self.mesh, P(batch_axes(self.mesh) or None))
         )
@@ -532,6 +622,24 @@ class Server:
                 self._step = chosen
             self._resident, self._carried = split_donated(
                 opened_in(formats)(model, self.variables, self.pad_id, slots, capacity))
+        self._open_host_tier(formats)
+
+    def _open_host_tier(self, formats: Formats) -> None:
+        """Compile the host tier's copies and measure their round trip, where the rows keep one (a
+        paged prefix cache of one group, `from_task`) and the pool's devices address pinned host
+        memory; else the rows keep none."""
+        rows = self.rows
+        if not isinstance(rows, PagedRows) or rows.pages[0].host is None:
+            return
+        pool = pool_of(self._resident)
+        if not pool or not holds_host_memory(list(pool.values())):
+            for part in rows.pages:
+                part.host = None
+            return
+        self._host = PagesOnHost(pool, pool_formats(formats), self.admission * rows.width)
+        probe = list(range(min(8, rows.pages[0].count)))
+        pool, self._round_trip = self._host.round_trip(pool, probe)
+        self._resident = with_pool(self._resident, pool)
 
     def _context(self) -> contextlib.AbstractContextManager[None]:
         """The mesh the model traces under, so a layer that reads it, such as an expert exchange, finds it."""
@@ -540,7 +648,8 @@ class Server:
     @classmethod
     def from_task(cls, task: TextGeneration, *, slots: int, capacity: int,
                   admission: int | None = None, kv_cache: KVCache | None = None,
-                  chunk: int | None = None, prefix_cache: bool = False, decode_steps: int = 1) -> Server:
+                  chunk: int | None = None, prefix_cache: bool = False, decode_steps: int = 1,
+                  host_cache: int | None = None) -> Server:
         """Build a server over the task's model, weights, processor and policy.
 
         `capacity` is rounded up to whole 64-slot tiles and whole pages, and
@@ -555,6 +664,15 @@ class Server:
         where the admitting step is mixed. `prefix_cache` lets a request reuse
         the pages of a prompt prefix an earlier request computed, and needs a
         paged cache.
+
+        A prefix cache keeps the pages it reclaims in host memory, up to
+        `host_cache` bytes, and loads a later prompt's pages back from there
+        instead of prefilling them (`dew.inference.pages.HostTier`). None
+        sizes it at half the host memory free at the start (`dew.telemetry.
+        benchmark.available_memory`), 0 keeps none. It is kept over a pool of
+        one row group whose devices address pinned host memory, and copies a
+        page out only while a round trip, measured at the start, costs less
+        than prefilling the page, measured from the steps served.
 
         Weights on a mesh are served on that mesh. The slots, the admission
         and the pages are split over its row axes, so the number of row
@@ -578,21 +696,7 @@ class Server:
         to fill (docs/performance.md).
         """
         mesh = mesh_of(task.variables)
-        if mesh is not None:
-            if mesh.shape.get(STAGE_AXIS, 1) > 1:
-                raise ValueError(
-                    "a server decodes through the whole layer stack every step; the stage axis "
-                    "runs the stack as the training pipeline, which the decoder refuses to decode "
-                    "through (one token a step leaves no microbatches to pipeline). Serve on a "
-                    "mesh with stage=1"
-                )
-            if mesh.shape.get(SEQUENCE_AXIS, 1) > 1:
-                raise ValueError("a server keeps each row's cached keys whole on the devices of its group, "
-                                 "and a decoder refuses to decode under a sequence axis, which splits a "
-                                 "sequence's positions. Serve on a mesh with sequence=1")
-            if not NamedSharding(mesh, P()).is_fully_addressable:
-                raise ValueError("a server schedules its rows from one process; a mesh over several "
-                                 "processes would need them to agree on every step's admission")
+        _refuse_unserved_meshes(mesh)
         if task.n != 1:
             raise ValueError("a served request draws one continuation; submit a prompt once per draw")
         policy, chain, criteria = task._controls(None, None, None)
@@ -630,12 +734,10 @@ class Server:
                                  "serve with kv_cache=KVCache(page_size=...)")
             rows = DenseRows(groups, chunk)
         else:
-            count = slots * (rounded // layout.page_size) if layout.pages is None else layout.pages
             # Only a model that declares its layout has a paged one; the default pages nothing.
             assert isinstance(model, Layered)
-            model = model.with_kv_cache(dataclasses.replace(layout, pages=count, groups=groups))
-            rows = PagedRows([Pages(count // groups, layout.page_size, prefix_cache=prefix_cache)
-                              for _ in range(groups)], chunk, rounded // layout.page_size)
+            model, rows = _paged_rows(model, layout, layout.page_size, slots, rounded, groups, chunk=chunk,
+                                      prefix_cache=prefix_cache, host_cache=host_cache)
         return cls(
             model,
             task.placed,
@@ -787,6 +889,7 @@ class Server:
         self.steps += self.decode_steps
         self._settle()
         self._pending = (error, draws)
+        self._pending_tokens = self._admitted_tokens
 
     def run(self) -> None:
         """Step until every queued and running request has resolved."""
@@ -835,15 +938,21 @@ class Server:
                 # Cancelled while it waited: its slot stays free, and its reservation goes back.
                 self.rows.release(row)
                 continue
-            self.prefix_hits += row.prefilled
+            rows = self.rows
+            hosted = len(row.loads) * rows.pages[row.group].size if isinstance(rows, PagedRows) else 0
+            self.prefix_hits += row.prefilled - hosted
+            self.host_hits += hosted
             row.ticket.admitted = now
             self._rows[slot] = row
+        self._carry_host_pages()
         pending: list[list[tuple[int, _Row]]] = [[] for _ in range(self.groups)]
         for slot, row in self._rows.items():
             waiting = pending[slot // size]
-            if row.prefilled < len(row.prompt) and len(waiting) < share:
+            # A row whose host pages are still on their way prefills once they land.
+            if row.prefilled < len(row.prompt) and not row.loads and len(waiting) < share:
                 waiting.append((slot, row))
         if not any(pending):
+            self._admitted_tokens = 0
             return None
         # Padded to the fewest rows that hold every group's pieces, not to the
         # whole admission: a request arriving alone prefills one row.
@@ -887,6 +996,7 @@ class Server:
             history_valid[index, capacity - len(row.prompt):] = True
             if final[index]:
                 self.rows.prefilled(row)
+        self._admitted_tokens = int(valid.sum())
         placed = jax.device_put(
             [
                 tokens,
@@ -904,6 +1014,43 @@ class Server:
         )
         return Admission(ModelInputs(placed[0], {"attention_mask": placed[1]}), *placed[2:])
 
+    def _carry_host_pages(self) -> None:
+        """Copy the cached pages this admission's seating reclaimed out to the host tier, start the
+        loads of rows seated with host pages, and write each load that has landed into its row's pages:
+        all before the step that follows donates the pool, so a copy reads the keys the pool holds now.
+        A copy out runs while it pays (`_PrefillRate.pays`); a load waits for its batch to land without
+        the step waiting on it (`jax.Array.is_ready`)."""
+        rows = self.rows
+        if self._host is None or not isinstance(rows, PagedRows):
+            return
+        part = rows.pages[0]
+        tier = part.host
+        assert tier is not None
+        reclaimed = part.reclaimed()
+        if reclaimed:
+            if self._rate.pays(self._round_trip, part.size):
+                pages = [page for page, _ in reclaimed]
+                payload, nbytes = self._host.copy_out(pool_of(self._resident), pages)
+                tier.add(payload, [(part.group, digest) for _, digest in reclaimed], nbytes)
+            else:
+                tier.dropped["unpaid"] += len(reclaimed)
+        for row in self._rows.values():
+            if not row.loads:
+                continue
+            if not row.staged:
+                row.staged = {number: self._host.stage(tier.batch(number).payload)
+                              for number in {load.batch for load in row.loads}}
+            elif all(landed(staged) for staged in row.staged.values()):
+                pool = pool_of(self._resident)
+                for number, staged in row.staged.items():
+                    taken = [load for load in row.loads if load.batch == number]
+                    pool = self._host.load(pool, staged, [load.row for load in taken],
+                                           [load.page for load in taken])
+                self._resident = with_pool(self._resident, pool)
+                for load in row.loads:
+                    tier.release(load.batch)
+                row.loads, row.staged = [], {}
+
     def _settle(self) -> None:
         """Read the previous call's draws into their rows, iteration by
         iteration; resolve the rows that ended."""
@@ -911,6 +1058,12 @@ class Server:
             return
         error, draws = jax.device_get(self._pending)
         self._pending = None
+        settled_at = time.perf_counter()
+        if self._settled_at is not None:
+            # The call just read ran from the last read to this one, the devices kept busy by the call
+            # queued behind it: its time against the prompt tokens it prefilled.
+            self._rate.add(self._pending_tokens, settled_at - self._settled_at)
+        self._settled_at = settled_at
         try:
             error.throw()
         except BaseException as failure:

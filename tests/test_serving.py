@@ -1073,6 +1073,69 @@ def test_reloaded_weights_share_no_prefix_page_the_old_weights_wrote(finished):
     assert_same_generation(ticket.result(), bound.bind(other)("1234567", 8, key=0))
 
 
+HOSTED = "123456789012345"
+"""A prompt of three full pages of four beside its last token, whose pages a small pool reclaims."""
+CROWD = ["9876543210987", "5555666677778", "4444333322221"]
+"""Prompts that take every page a pool of eight leaves, so the first prompt's cached pages go."""
+
+
+def host_served(pages: int, host_cache: int | None = None):
+    """A one-slot server over a pool of `pages` pages of four with a prefix cache: HOSTED, then the
+    crowd one at a time, then HOSTED again; its server and the two HOSTED draws."""
+    server = Server.from_task(task(), slots=1, capacity=128, admission=1,
+                              kv_cache=KVCache(page_size=4, pages=pages), prefix_cache=True,
+                              host_cache=host_cache)
+    first = server([HOSTED], 6, key=0)[0]
+    for prompt in CROWD:
+        server([prompt], 4, key=1)
+    return server, first, server([HOSTED], 6, key=0)[0]
+
+
+def test_a_reclaimed_prefix_comes_back_from_the_host_as_the_device_cache_serves_it():
+    """A pool too small to keep a prompt's pages while other prompts run reclaims them, and its host
+    tier keeps them: the prompt served again loads its three pages from the host instead of
+    prefilling them, and draws, bit for bit, what the same schedule draws over a pool large enough
+    to keep them on the device, whose server serves them from its own cache."""
+    small, first, again = host_served(pages=8)
+    large, kept_first, kept_again = host_served(pages=64)
+    assert small.host_hits == 12 and small.prefix_hits == 0
+    assert large.host_hits == 0 and large.prefix_hits == 12
+    for served, kept in ((first, kept_first), (again, kept_again)):
+        np.testing.assert_array_equal(served.tokens, kept.tokens)
+        np.testing.assert_array_equal(served.raw_log_probs, kept.raw_log_probs)
+    assert small.rows.pages[0].host.held > 0
+
+
+def test_a_host_tier_within_its_budget_drops_what_does_not_fit_and_serves_alike():
+    """A host budget smaller than one reclaimed batch keeps nothing: the reclaimed pages are dropped,
+    counted by reason, the prompt prefills again, and every draw is the lone task call's. A budget of
+    zero keeps no tier at all."""
+    server, first, again = host_served(pages=8, host_cache=1)
+    tier = server.rows.pages[0].host
+    assert server.host_hits == 0 and tier.held == 0 and tier.dropped["budget"] > 0
+    alone = task()(HOSTED, 6, key=0)
+    for served in (first, again):
+        assert_same_generation(served, alone)
+    off, _, _ = host_served(pages=8, host_cache=0)
+    assert off.rows.pages[0].host is None and off.host_hits == 0
+
+
+def test_a_reload_forgets_the_host_pages_the_old_weights_wrote():
+    """The host tier's pages hold keys the old weights computed: after a reload the prompt prefills
+    again, from neither tier, and draws what the new weights draw alone."""
+    server, _, _ = host_served(pages=8)
+    bound = task()
+    other = bound.variables.copy({"params": jax.tree.map(lambda leaf: leaf * 1.5, bound.variables["params"])})
+    server.reload(other)
+    hits = server.host_hits, server.prefix_hits
+    assert server.rows.pages[0].host.held == 0
+    for prompt in CROWD:
+        server([prompt], 4, key=1)
+    again = server([HOSTED], 6, key=0)[0]
+    assert (server.host_hits, server.prefix_hits) == hits
+    assert_same_generation(again, bound.bind(other)(HOSTED, 6, key=0))
+
+
 @pytest.mark.parametrize("options", [{}, {"kv_cache": KVCache(page_size=4, pages=3), "prefix_cache": True}],
                          ids=["dense", "paged"])
 def test_a_request_cancelled_while_it_waits_leaves_its_peers_running(options):
