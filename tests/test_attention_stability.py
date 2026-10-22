@@ -160,10 +160,9 @@ def _families() -> dict[str, Family]:
         "values near fp32's largest over 2 equal keys": Family(large_values(2), np.ones((1, 1, 1, 2), bool)),
         "values near fp32's largest over 64 equal keys": Family(large_values(64),
                                                                 np.ones((1, 1, 1, 64), bool)),
-        # Folded, the key's logit times log2(e) and its maximum round apart (the product contracts into the
-        # subtraction), so its weight is 1 within an ulp and the output its value within one ulp: a bound
-        # check 2 holds where the gate's exp2 oracle states it (`algebra.Forward.base2`).
-        "one key": Family(drawn(4, 1), np.ones((1, 1, 4, 1), bool), folded=False),
+        # A key at its row's maximum weighs 1 exactly however its scaling contracts into the subtraction
+        # (`algebra.weights`), so one key's output is its value, folded or natural.
+        "one key": Family(drawn(4, 1), np.ones((1, 1, 4, 1), bool)),
         "a sink and one key": Family(with_sinks(drawn(16, 1), -3.0, 3.0), np.ones((1, 1, 16, 1), bool)),
         "a sink near fp32's largest and one key": Family(with_sinks(drawn(16, 1), 1e38, 3e38),
                                                          np.ones((1, 1, 16, 1), bool)),
