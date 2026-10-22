@@ -245,11 +245,11 @@ def _stores(source: Source | Mixture | Phases) -> Iterator[Source]:
         for child in source.pipelines:
             yield from _stores(child.source)
         return
-    for selected in selecting(source):
+    for _, selected in selecting(source):
         if isinstance(selected, Concatenate):
             for part in selected.sources:
                 yield from _stores(part)
-        elif not isinstance(selected, (Mixture, Phases)):
+        else:
             yield selected
 
 
