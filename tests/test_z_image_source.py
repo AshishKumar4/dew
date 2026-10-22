@@ -33,7 +33,8 @@ from dew.nn.backbones.z_image import ZImageTransformer
 
 ROOT = Path(__file__).resolve().parents[1]
 CASES = ("padded", "exact", "deep")
-CASE_SEEDS = {"padded": 16, "exact": 16, "deep": 16}
+CASE_SEEDS = {"padded": 512, "exact": 256, "deep": 512}
+"""Check 1's declared seeds for each case, sized by `seeds_for` on armada."""
 ROWS = 4
 HEIGHT = 3
 BUDGET = 64
