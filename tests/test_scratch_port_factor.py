@@ -83,3 +83,23 @@ def test_portable_chunk(name, regime, size):
     except AssertionError as error:
         verdict = str(error).split("\n")[0][:220]
     raise AssertionError(f"PORTABLE|{name}|{regime}|{size}|{verdict}")
+
+
+@pytest.mark.parametrize("size", [16, 32, 64])
+@pytest.mark.parametrize("name, regime", [("vector delta", "aligned keys"), ("scalar delta", "saturated gates"),
+                                          ("scalar delta", "resets on chunk edges"),
+                                          ("scalar delta", "the decay bound")])
+def test_port_chunk(name, regime, size, monkeypatch):
+    """The port at `size`-token chunks: whether its defects grow with the chunk's prefix magnitude."""
+    from dew.nn.kernels import recurrence_chunk
+    monkeypatch.setattr(recurrence_chunk, "CHUNK_SIZE", size)
+    hooks = st.SITES[name]
+    dew = jax.jit(functools.partial(chunk, hooks, chunk_size=CHUNK, ported=True))
+    reference = jax.jit(functools.partial(token_by_token, hooks))
+    try:
+        assert_as_exact(dew, reference, functools.partial(st.stressed, hooks, regime), f"{name} {regime}",
+                        seeds=8)
+        verdict = "passes"
+    except AssertionError as error:
+        verdict = str(error).split("\n")[0][:220]
+    raise AssertionError(f"PORTCHUNK|{name}|{regime}|{size}|{verdict}")
