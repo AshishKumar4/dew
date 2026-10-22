@@ -421,7 +421,8 @@ def interpreted_dot(a: jax.Array, b: jax.Array) -> jax.Array:
     """`a @ b`, fp32, as every CPU arm of the attention template issues it (the plain-JAX mainloop, the
     interpreted kernels): the product its operands declare at the precision policy's precision
     (`dew.nn.precision.float32_products`), issued off a GPU by the declaration's owner
-    (`product.interpreted`), so an fp32 product is the correctly rounded sum whatever the tile."""
+    (`product.interpreted`), so an fp32 product accumulates in float64, within that sum's rounding bound
+    whatever the tile."""
     from dew.nn.kernels.templates import product
     from dew.nn.precision import float32_products, products_dtype
 
