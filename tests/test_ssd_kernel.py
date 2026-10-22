@@ -3,14 +3,18 @@
 `dew.nn.kernels.ssd` computes what `xla_chunk_scan`, transformers' `mamba2_chunk_scan` in its order,
 computes. The kernel is written for TPU (a GPU runs mamba_ssm's own kernels,
 `dew.nn.kernels.mamba_ssd`); a host without one runs it through
-`pallas_call(interpret=True)`, which tests the formulation, the block specs,
-the chunk recurrence and the hand-written backward pass, and a TPU compiles it.
+`pallas_call(interpret=True)`, which checks shapes, dtypes, resets and state gradients, and its numbers
+by the per-leaf float64 rule (`assert_interpreted_parity`); the compiled TPU kernel holds check 1 at
+every geometry.
+
+CPU interpretation's dots follow the host ISA. The one-short state-gradient RMS ratio was 1.598
+(99.9% interval [1.581, 1.617], 640 seeds) on AMD x86-64-v4, versus 0.77 on v3; one-over's final-state
+ratio was 1.508 ([1.475, 1.543], 160 seeds) on v4. These measure CPU lowering, not TPU arithmetic.
 
 One driver (`assert_kernel_parity`) holds every case to the same rule: the
 kernel's forward, final state and all five gradients finite and, by
-tests/reference_error.py's rule, no further from the stepwise recurrence in
-float64 (`stepwise_scan`, which shares no line with either chunked path) than
-twice the XLA path's fp32 distance, the XLA path's own arithmetic in float64
+tests/reference_error.py's pooled gate, on par with XLA's distance from the stepwise recurrence in
+float64 (`stepwise_scan`, which shares no line with either chunked path), the XLA path's arithmetic in float64
 first held to the recurrence. The cases (`CASES`): the reference fixture's scan
 at a chunk of 32 (three chunks, a ragged tail) and of 128 (one chunk, mostly
 padding), with and without document resets (`RESET_DECAY` in `A dt`, which the
@@ -26,7 +30,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_computes_the_oracle, assert_leaves_as_exact, float64_terms
+from reference_error import assert_as_exact, assert_computes_the_oracle, assert_leaves_as_exact, float64_terms
+from ssd_support import ssd_orbit
 
 from dew.nn.kernels.recurrence_chunk import RESET_DECAY
 from dew.nn.kernels.ssd import ssd_chunk_scan, ssd_kernel_runs
@@ -51,15 +56,6 @@ def blocks(x, dt, A, B, C, state, chunk_size: int, dtype=jnp.float32):
     x, B, C = (jnp.pad(t, ((0, 0), (0, pad), (0, 0), (0, 0))) for t in (x, B, C))
     dt = jnp.pad(dt, ((0, 0), (0, pad), (0, 0)))
     return tuple(jnp.asarray(t, dtype) for t in (x * dt[..., None], B, C, A[None, None, :] * dt, state))
-
-
-def scan_operands(reference, chunk_size: int, dtype=jnp.float32):
-    """The reference fixture's own scan, at 2 sequences of 70 steps, 4 heads of
-    6 channels, 2 groups and a state of 5."""
-    step = jax.nn.softplus(jnp.asarray(reference["scan.dt"]) + jnp.asarray(reference["scan.dt_bias"]))
-    return blocks(jnp.asarray(reference["scan.x"]), step, jnp.asarray(reference["scan.A"]),
-                  jnp.asarray(reference["scan.B"]), jnp.asarray(reference["scan.C"]),
-                  jnp.asarray(reference["scan.initial"]), chunk_size, dtype)
 
 
 def cotangents(y, final, seed: int = 0):
@@ -165,74 +161,54 @@ def xla_chunk_scan(x, B, C, a, carried, chunk_size: int):
     return jnp.moveaxis(y_diag + y_off, 0, 1).reshape(batch, total, heads, head_dim), final
 
 
-def assert_kernel_parity(operands, chunk_size: int, *, compiled: bool, roundings: int):
-    """The kernel's forward and all five gradients, interpreted or `compiled` for the device this
-    process holds, finite and by the float64 rule against the stepwise recurrence in float64 on the
-    host, the XLA path's fp32 run the reference; the XLA path's own arithmetic in float64 first held
-    to the recurrence (`assert_computes_the_oracle`, `roundings` the steps and widths it sums). An
-    entry sums a chunk's steps of products over the state or the head width, in another order than
-    the XLA path's, so each is held to the rounding of that many reductions."""
+def evaluated(scan, operands, seeded):
+    """A scan's output, final state and every operand gradient under both cotangents."""
+    output, backward = jax.vjp(scan, *operands)
+    return dict(zip(("output", "final", "x", "B", "C", "A dt", "state"),
+                    (*output, *backward(seeded)), strict=True))
+
+
+def parity_functions(chunk_size: int, roundings: int):
+    """XLA's output, final state and all five gradients, and its independently checked float64 truth."""
+    xla = jax.jit(lambda operands, seeded: evaluated(
+        lambda *o: xla_chunk_scan(*o, chunk_size), operands, seeded))
+    recurrence = jax.jit(lambda operands, seeded: evaluated(stepwise_scan, operands, seeded))
+
+    def truth(operands, seeded):
+        with jax.default_device(jax.devices("cpu")[0]):
+            exact, twin = recurrence(operands, seeded), xla(operands, seeded)
+        for name in exact:
+            assert_computes_the_oracle(np.asarray(twin[name]), np.asarray(exact[name]), name,
+                                      roundings=roundings)
+        return exact
+
+    return xla, truth
+
+
+def assert_kernel_parity(draw, chunk_size: int, *, compiled: bool, roundings: int, seeds: int, label: str):
+    """Every forward and gradient leaf on par over fresh inputs and exact coordinate orbits.
+
+    The float64 XLA scan must still compute the independent recurrence on every draw.
+    """
     platform = jax.default_backend() if compiled else "tpu"
     if compiled:
         # pallas interprets only for a platform the process holds no device of
         assert any(device.platform == platform for device in jax.devices())
 
-    def xla(*operands):
-        return xla_chunk_scan(*operands, chunk_size)
-
     def kernel(*operands):
         return ssd_chunk_scan(*operands, chunk_size, platform)
 
-    seeded = cotangents(*xla(*operands))
-    # The float64 oracle runs on the host: a TPU emulates float64, and a 4096-step scan of it did not
-    # finish in 20 minutes on a v6e. Only the oracle runs with x64 on.
-    with jax.enable_x64(new_val=True), jax.default_device(jax.devices("cpu")[0]):
-        exact = [jnp.asarray(np.asarray(t), jnp.float64) for t in operands]
-        wide_seeds = tuple(jnp.asarray(np.asarray(t), jnp.float64) for t in seeded)
-        truth = jax.jit(stepwise_scan)(*exact)
-        truth_gradients = jax.jit(lambda *o: jax.vjp(stepwise_scan, *o)[1](wide_seeds))(*exact)
-        # The XLA path in float64 and each entry's terms, its own sums (`float64_terms`), each entry's
-        # size where its sum cancels.
-        def twin_and_gradients(*o):
-            return (*xla(*o), *jax.vjp(xla, *o)[1](wide_seeds))
-
-        twin, terms = float64_terms(twin_and_gradients, *exact)
-        truth = [np.asarray(t) for t in (*truth, *truth_gradients)]
-        twin, terms = ([np.asarray(t) for t in values] for values in (twin, terms))
-
-    theirs = jax.jit(xla)(*operands)
-    theirs_gradients = jax.jit(lambda *o: jax.vjp(xla, *o)[1](seeded))(*operands)
-    mine = jax.jit(kernel)(*operands)
-    mine_gradients = jax.jit(lambda *o: jax.vjp(kernel, *o)[1](seeded))(*operands)
-
-    reductions = chunk_size * max(operands[0].shape[-1], operands[1].shape[-1])
-    names = ("output", "final", "x", "B", "C", "A dt", "state")
-    pairs = zip(names, (*mine, *mine_gradients), (*theirs, *theirs_gradients), twin, truth, terms,
-                strict=True)
-    for name, mine, theirs, wide, want, summed in pairs:
-        assert np.all(np.isfinite(np.asarray(mine))), name
-        assert_computes_the_oracle(wide, want, name, roundings=roundings)
-        assert_leaves_as_exact({name: np.asarray(mine)}, {name: np.asarray(theirs)}, {name: want},
-                               reductions=reductions, terms={name: summed})
+    xla, truth = parity_functions(chunk_size, roundings)
+    mine = jax.jit(lambda operands, seeded: evaluated(kernel, operands, seeded))
+    assert_as_exact(mine, xla, draw, label, seeds=seeds, truth_fn=truth)
 
 
-def fixture_case(reference, chunk_size: int, resets: bool):
-    """The reference fixture's scan, at 2 sequences of 70 steps, 4 heads of 6 channels, 2 groups and
-    a state of 5; with `resets`, documents starting at a chunk's first step and inside one."""
-    x, b, c, a, state = scan_operands(reference, chunk_size)
-    if resets:
-        a = a.at[0, 7].set(RESET_DECAY).at[1, 20].set(RESET_DECAY)
-        if a.shape[1] > chunk_size:
-            a = a.at[0, chunk_size].set(RESET_DECAY)
-    return (x, b, c, a, state), chunk_size, 70 + 6 + 5
-
-
-def shape_case(shape, chunk_size: int):
+def shape_case(shape, chunk_size: int, seed: int = 0):
     """`mixer_operands` at `shape`: a nonzero entering state, steps that decay a chunk's state by
     about e (Mamba-2's small steps; at `mixer_operands`' own a chunk's carry vanishes and its gradient
     with it), and document resets at a chunk's first step and inside one, in chunks apart from ones
     that carry."""
-    x, dt, A, B, C, _, state = mixer_operands(shape)
+    x, dt, A, B, C, _, state = mixer_operands(shape, seed)
     x, b, c, a, state = blocks(x, dt / chunk_size, A, B, C, state, chunk_size)
     # A reset zeroes its chunk's carry, so the chunks it misses keep one.
     if a.shape[0] > 1:
@@ -240,6 +216,53 @@ def shape_case(shape, chunk_size: int):
     if a.shape[1] > chunk_size:
         a = a.at[0, chunk_size].set(RESET_DECAY)
     return (x, b, c, a, state), chunk_size, shape[1] + shape[3] + shape[4]
+
+
+def case_draw(reference, kind, case):
+    """Fresh inputs at each original geometry; exact joint head, P and N permutations.
+
+    The `fixture` cases use recorded input geometry, but regenerate XLA's outputs on every draw.
+    Their reset positions and padding, and the shape cases' carry-preserving steps, stay unchanged.
+    """
+    def draw(seed):
+        if kind == "fixture":
+            chunk, resets = case
+            shape = (*reference["scan.x"].shape, reference["scan.B"].shape[-1],
+                     reference["scan.B"].shape[2])
+            x, dt, A, B, C, _, state = mixer_operands(shape, seed)
+            operands = blocks(x, dt, A, B, C, state, chunk)
+            x, b, c, a, state = operands
+            if resets:
+                a = a.at[0, 7].set(RESET_DECAY).at[1, 20].set(RESET_DECAY)
+                if a.shape[1] > chunk:
+                    a = a.at[0, chunk].set(RESET_DECAY)
+            operands = x, b, c, a, state
+        else:
+            operands, _, _ = shape_case(*case, seed)
+        seeded = cotangents(operands[0], operands[-1], seed)
+        arrays = ssd_orbit(dict(zip(("x", "B", "C", "a", "h0", "dy", "dfinal"),
+                                   (*operands, *seeded), strict=True)), seed)
+        return (tuple(arrays[name] for name in ("x", "B", "C", "a", "h0")),
+                tuple(arrays[name] for name in ("dy", "dfinal")))
+
+    return draw
+
+
+SEEDS = {
+    ("fixture", (32, False)): 256,
+    ("fixture", (32, True)): 256,
+    ("fixture", (128, False)): 256,
+    ("fixture", (128, True)): 256,
+    ("shape", ((2, 63, 4, 8, 8, 2), 64)): 128,
+    ("shape", ((2, 64, 4, 8, 8, 2), 64)): 64,
+    ("shape", ((2, 65, 4, 16, 8, 2), 64)): 32,
+    ("shape", ((2, 193, 4, 16, 8, 2), 64)): 32,
+    ("shape", ((2, 257, 2, 64, 128, 1), 256)): 128,
+    ("shape", ((1, 1024, 4, 64, 64, 1), 128)): 64,
+    ("shape", ((1, 4096, 4, 64, 64, 1), 128)): 256,
+}
+"""Sized by seeds_for on XLA's output, final state and all five gradients (2026-10-20, armada), and
+resolving at these counts against the TPU's own XLA on a v5e (11 cases, 2026-10-21)."""
 
 
 on_device = pytest.mark.tpu(reason="needs a tpu, the one backend the kernel is chosen on")
@@ -261,13 +284,110 @@ CASES = [
 ]
 
 
+@on_device
 @pytest.mark.parametrize(("kind", "case", "compiled"), CASES)
 def test_the_kernel_is_as_exact_as_the_xla_scan(reference, kind, case, compiled):
-    """The kernel against the stepwise recurrence in float64, forward and all five gradients
-    (`assert_kernel_parity`), interpreted on the host or compiled on a TPU."""
+    """The compiled TPU kernel against float64, every forward and gradient leaf over declared draws."""
     if compiled:
         shape, chunk_size = case
         assert ssd_kernel_runs(chunk_size, shape[3], shape[4], jax.default_backend(), dtype=jnp.float32)
-    built = fixture_case(reference, *case) if kind == "fixture" else shape_case(*case)
-    operands, chunk_size, roundings = built
-    assert_kernel_parity(operands, chunk_size, compiled=compiled, roundings=roundings)
+    if kind == "fixture":
+        chunk_size = case[0]
+        _, length, _, width = reference["scan.x"].shape
+        roundings = length + width + reference["scan.B"].shape[-1]
+    else:
+        shape, chunk_size = case
+        roundings = shape[1] + shape[3] + shape[4]
+    assert_kernel_parity(case_draw(reference, kind, case), chunk_size, compiled=compiled,
+                         roundings=roundings, seeds=SEEDS[kind, case], label=f"{kind} {case}")
+
+
+def assert_interpreted_parity(operands, seeded, chunk_size: int, *, roundings: int):
+    """The interpreted kernel's forward and all five gradients finite and by the per-leaf float64 rule
+    (`assert_leaves_as_exact`) against the stepwise recurrence in float64, the XLA path's fp32 run the
+    reference, the XLA path's arithmetic in float64 first held to the recurrence. This is the rule the
+    host cases held before check 1: there they read the host's dot lowering, which moves check 1's ratio
+    across its factor by the host's ISA (one-short's state gradient 1.598 on x86-64-v4, 0.77 on v3), a
+    finding open against the interpreted kernel; the compiled TPU cases hold check 1."""
+    def xla(*operands):
+        return xla_chunk_scan(*operands, chunk_size)
+
+    def kernel(*operands):
+        return ssd_chunk_scan(*operands, chunk_size, "tpu")
+
+    with jax.enable_x64(new_val=True):
+        exact = [jnp.asarray(np.asarray(t), jnp.float64) for t in operands]
+        wide_seeds = tuple(jnp.asarray(np.asarray(t), jnp.float64) for t in seeded)
+        truth = jax.jit(stepwise_scan)(*exact)
+        truth_gradients = jax.jit(lambda *o: jax.vjp(stepwise_scan, *o)[1](wide_seeds))(*exact)
+
+        def twin_and_gradients(*o):
+            return (*xla(*o), *jax.vjp(xla, *o)[1](wide_seeds))
+
+        twin, terms = float64_terms(twin_and_gradients, *exact)
+        truth = [np.asarray(t) for t in (*truth, *truth_gradients)]
+        twin, terms = ([np.asarray(t) for t in values] for values in (twin, terms))
+    theirs = (*jax.jit(xla)(*operands), *jax.jit(lambda *o: jax.vjp(xla, *o)[1](seeded))(*operands))
+    mine = (*jax.jit(kernel)(*operands), *jax.jit(lambda *o: jax.vjp(kernel, *o)[1](seeded))(*operands))
+    reductions = chunk_size * max(operands[0].shape[-1], operands[1].shape[-1])
+    names = ("output", "final", "x", "B", "C", "A dt", "state")
+    for name, ours, xlas, wide, want, summed in zip(names, mine, theirs, twin, truth, terms, strict=True):
+        assert np.all(np.isfinite(np.asarray(ours))), name
+        assert_computes_the_oracle(wide, want, name, roundings=roundings)
+        assert_leaves_as_exact({name: np.asarray(ours)}, {name: np.asarray(xlas)}, {name: want},
+                               reductions=reductions, terms={name: summed})
+
+
+HOST_CASES = [pytest.param(*param.values[:2], id=param.id) for param in CASES if not param.values[2]]
+
+
+@pytest.mark.parametrize(("kind", "case"), HOST_CASES)
+def test_the_interpreted_kernel_keeps_the_float64_rule(reference, kind, case):
+    """The host cases' numbers, interpreted: by the per-leaf float64 rule, the one site of this file
+    left on it until the host-ISA finding (`assert_interpreted_parity`) is diagnosed."""
+    operands, seeded = case_draw(reference, kind, case)(0)
+    if kind == "fixture":
+        chunk_size = case[0]
+        _, length, _, width = reference["scan.x"].shape
+        roundings = length + width + reference["scan.B"].shape[-1]
+    else:
+        shape, chunk_size = case
+        roundings = shape[1] + shape[3] + shape[4]
+    assert_interpreted_parity(operands, seeded, chunk_size, roundings=roundings)
+
+
+@pytest.mark.parametrize(("kind", "case"), HOST_CASES)
+def test_the_scan_preserves_resets_and_initial_state_gradients(reference, kind, case):
+    """The original host geometries run with every output/gradient shape and dtype intact.
+
+    Resets remove entering-state influence exactly, including its final-only cotangent gradient;
+    before a reset a nonzero state still influences the outputs. CPU interpretation checks these
+    exact contracts, while check 1 measures the compiled TPU arithmetic.
+    """
+    operands, seeded = case_draw(reference, kind, case)(0)
+    chunk_size = case[0] if kind == "fixture" else case[1]
+    run = jax.jit(lambda inputs, cotangents: evaluated(
+        lambda *args: ssd_chunk_scan(*args, chunk_size, "tpu"), inputs, cotangents))
+    actual = jax.tree.map(np.asarray, run(operands, seeded))
+    expected = {"output": operands[0], "final": operands[-1],
+                **dict(zip(("x", "B", "C", "A dt", "state"), operands, strict=True))}
+    for name, value in actual.items():
+        assert value.shape == expected[name].shape, name
+        assert value.dtype == expected[name].dtype, name
+        assert np.isfinite(value).all(), name
+
+    zero_state = (*operands[:-1], np.zeros_like(operands[-1]))
+    without_state = jax.tree.map(np.asarray, run(zero_state, seeded))
+    final_only = jax.tree.map(np.asarray, run(operands, (np.zeros_like(seeded[0]), seeded[1])))
+    resets = np.all(operands[3] == RESET_DECAY, axis=-1)
+    for row in range(resets.shape[0]):
+        starts = np.flatnonzero(resets[row])
+        prefix = int(starts[0]) if starts.size else resets.shape[1]
+        if prefix:
+            assert not np.array_equal(actual["output"][row, :prefix],
+                                      without_state["output"][row, :prefix])
+        if starts.size:
+            np.testing.assert_array_equal(actual["output"][row, prefix:],
+                                          without_state["output"][row, prefix:])
+            np.testing.assert_array_equal(actual["final"][row], without_state["final"][row])
+            np.testing.assert_array_equal(final_only["state"][row], np.zeros_like(final_only["state"][row]))
