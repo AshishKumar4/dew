@@ -1288,6 +1288,41 @@ def test_dews_weighted_selection_reads_the_records_grains_mix_reads(weights, len
         ProportionalSelection((*lengths[:-1], 0), weights)
 
 
+@pytest.mark.parametrize("weights, sizes", [((1, 10, 15), (50, 200, 400)), ((1.0, 1.0), (300, 40)),
+                                            ((0.3, 0.7), (1000, 1000))])
+def test_an_epoch_of_repeated_corpora_ends_where_grains_mix_has_read_every_one_once(weights, sizes):
+    """A mix of repeated corpora counts an epoch as the positions of Grain's own mix by which every
+    corpus has been read once, its slowest at its share: no fewer, no more."""
+    corpora = [Pipeline(Memory(Indexed(tag, size)), name=f"corpus-{tag}").repeat()
+               for tag, size in enumerate(sizes, start=1)]
+    data = compile(mix(corpora, weights=weights).batch(1), read="memory", loading=READ)
+    # Each position of Grain's mix of repeated corpora says which corpus it reads (its tag).
+    grains = pygrain.MapDataset.mix([pygrain.MapDataset.range(1).map(lambda _, tag=tag: tag).repeat()
+                                     for tag in range(len(sizes))], weights)
+    reads, covered = [0] * len(sizes), 0
+    while any(read < size for read, size in zip(reads, sizes, strict=True)):
+        reads[grains[covered]] += 1
+        covered += 1
+    assert data.records == covered
+
+
+def test_an_epoch_of_a_mix_of_corpora_written_without_repeats_reads_every_corpus_whole():
+    """A run's mix of corpora written without repeats repeats each corpus, not the mix: an epoch reads
+    every record of the corpus it ends on once and every record of the others, where a repeat of
+    the mix would start over at its shortest corpus's end and leave the slow corpus's tail unread."""
+    from dew.data.compile import fitted
+    from dew.objectives.base import ObjectiveData
+
+    corpora = [Pipeline(Memory(Indexed(tag, size)), name=f"corpus-{tag}")
+               for tag, size in ((1, 40), (2, 200))]
+    data, _ = fitted(mix(corpora, weights=(1, 10)).batch(4).read("memory").workers(0), None,
+                     objective=ObjectiveData())
+    values = [value for step in taken(data.train(DataPartition()), data.steps_per_epoch) for value in step]
+    slow = sorted(value for value in values if value // 1000 == 1)
+    assert slow == [1000 + index for index in range(40)]
+    assert {value for value in values if value // 1000 == 2} == {2000 + index for index in range(200)}
+
+
 def test_one_corpus_starts_past_its_offset_as_a_mixed_one_does():
     """`corpora_dataset` owns how a list of corpora streams, the offset a
     phase gives a recurring corpus included, for one corpus as for several."""
