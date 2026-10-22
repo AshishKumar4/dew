@@ -1591,22 +1591,20 @@ def _epoch_records(train: Pipeline, build: _Build) -> int | None:
 
     def passed(pipeline: Pipeline, build: _Build) -> int | None:
         """The records `pipeline` reads up to its first repeat, as the lowering builds them."""
-        at = _until(pipeline.stages, (Repeat,))
+        once = pipeline.stages[:_until(pipeline.stages, (Repeat,))]
+        return held(dataclasses.replace(pipeline, stages=once), build)
+
+    def held(pipeline: Pipeline, build: _Build) -> int | None:
+        """The records `pipeline` holds through all its stages, as the lowering builds them."""
         cache = build.lowering.cache
-        if cache is not None and cache >= at:
-            # A repeat of the inputs before their cache, as a preset's cache follows the order written
-            # before it: a pass reads each input once, and a cache of one record for each input holds
-            # that many, where one that drops or expands them counts none ahead of reading them.
+        if cache is not None and cache >= len(pipeline.stages):
+            # A cache after the stages counted, as a preset's cache follows the order written before
+            # it: a pass reads each input once, and a cache of one record for each input holds that
+            # many, where one that drops or expands them counts none ahead of reading them.
             if not build.lowering.one_to_one:
                 return None
             build = dataclasses.replace(build, lowering=dataclasses.replace(build.lowering, cache=None))
         # A token split reads its rows as it is built, filling a cache before it; the probe seals it.
-        with _closing(build.records(dataclasses.replace(pipeline, stages=pipeline.stages[:at]),
-                                    DataPartition())) as rows:
-            return len(rows) if isinstance(rows, pygrain.MapDataset) else None
-
-    def held(pipeline: Pipeline, build: _Build) -> int | None:
-        """The records `pipeline` holds through all its stages, as the lowering builds them."""
         with _closing(build.records(pipeline, DataPartition())) as rows:
             return len(rows) if isinstance(rows, pygrain.MapDataset) else None
 
@@ -1650,9 +1648,11 @@ def _epoch_records(train: Pipeline, build: _Build) -> int | None:
     # A training order that repeats nowhere repeats for ever at its root (`_Build.batched`).
     rooted = build.training and build.lowering.endless and not build.lowering.repeated
     if onward or rooted:
-        # A view the order's repeat reads is its epoch; a bound after its last repeat ends the order.
+        # A view the order's repeat reads is its epoch, the read's own root repeat reading the whole
+        # order; a bound after its last written repeat ends the order.
         at = viewed(order)
-        count = (covering(train, build) if at is None or at == len(order.stages)
+        whole = at == len(order.stages) and not rooted
+        count = (covering(train, build) if at is None or whole
                  else held(dataclasses.replace(order, stages=order.stages[:at]), build))
     else:
         count = passed(train, build)

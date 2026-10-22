@@ -943,8 +943,9 @@ def describe(source: Indexed | pygrain.MapDataset[Batch]) -> str:
 
 class FilledBatch(pygrain.MapTransform):
     """A batch of fewer than `rows` records filled out with repeats of its
-    own rows (`RowPlan.pad`), and `VALID_ROWS` marking the real ones. Without
-    `real` every row is a repeat."""
+    own rows (`RowPlan.pad`), and `VALID_ROWS` marking the real ones: those of
+    its own a batch that marks them already marks real. Without `real` every
+    row is a repeat."""
 
     def __init__(self, rows: int, *, real: bool = True):
         self._rows, self._real = rows, real
@@ -957,7 +958,10 @@ class FilledBatch(pygrain.MapTransform):
             return element
         plan = RowPlan(None, held, self._rows, 0, 1)
         indices = plan.pad(np.arange(held))
-        return {**take_batch(element, indices), VALID_ROWS: ~plan.padding & self._real}
+        valid = ~plan.padding & self._real
+        if VALID_ROWS in element:
+            valid = valid & np.asarray(element[VALID_ROWS], bool)[indices]
+        return {**take_batch(element, indices), VALID_ROWS: valid}
 
 
 def rows_of(batch: Mapping[str, object]) -> int:
@@ -1458,7 +1462,15 @@ class RampedStream(Forwarding):
         stage = self._stage()
         rows = self._partition.rows(stage.batch)
         while self._held is None or rows_of(self._held) < rows:
-            read = next(self._source)
+            read = next(self._source, None)
+            if read is None:
+                if self._held is None or not rows_of(self._held):
+                    raise StopIteration
+                # A finite order that keeps its short last batch (`Loader.tail`): the step holds
+                # what is left, filled out, its own rows real.
+                step, self._held = FilledBatch(rows).map(self._held), None
+                self._records += stage.batch
+                return step
             self._held = (
                 read
                 if self._held is None
