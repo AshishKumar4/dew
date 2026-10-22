@@ -31,7 +31,7 @@ from dew.coordination import (
 )
 from dew.data.dataset import DataPartition
 from dew.inference.rollouts import check_ending
-from dew.nn.inputs import ModelInputs, mesh_of, pad_token_rows
+from dew.nn.inputs import ModelInputs, mesh_of, pad_token_rows, token_id
 from dew.objectives.base import Batch, Variables
 from dew.sampling.text import Generation, Sampling
 from dew.training.state import TrainState
@@ -104,8 +104,8 @@ class Observation:
         if self.reward is not None:
             object.__setattr__(self, "reward", finite_reward(self.reward))
         object.__setattr__(self, "messages", json_objects(self.messages, "an observation's messages"))
-        if any(type(token) is not int or token < 0 for token in self.context):
-            raise ValueError("observation context must contain nonnegative token ids")
+        object.__setattr__(self, "context", tuple(token_id(token, where="an observation's context")
+                                                  for token in self.context))
         if self.status == EpisodeStatus.RUNNING and not self.context:
             raise ValueError("a running environment must supply a model context")
 
@@ -139,8 +139,8 @@ class Action:
         for name, ids in (("context", self.context), ("tokens", self.tokens)):
             if not ids:
                 raise ValueError(f"sampled action {name} must be nonempty")
-            if any(type(token) is not int or token < 0 for token in ids):
-                raise ValueError(f"sampled action {name} must contain nonnegative integer token ids")
+            object.__setattr__(self, name, tuple(token_id(token, where=f"a sampled action's {name}")
+                                                 for token in ids))
         if len(self.tokens) != len(self.behavior_log_probs) or (
                 self.raw_log_probs is not None and len(self.tokens) != len(self.raw_log_probs)):
             raise ValueError("every sampled action token needs its likelihoods")
