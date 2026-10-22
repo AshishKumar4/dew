@@ -97,9 +97,11 @@ class GpuTarget:
     `tensor_rates` the generation's dense tensor-core FLOPs per clock per
     multiprocessor by arithmetic mode ('16bit': fp16 or bf16 operands summed in
     fp32; 'tf32'), which a kernel's cost model reads
-    (`dew.nn.kernels.templates.cost`). This table is the one place a choice is
-    keyed on the hardware generation; any other code reads its facts, a library's
-    support rule the compute capability (`capability`), and a launch config the
+    (`dew.nn.kernels.templates.cost`). `scoped_vmem` is a TPU's scoped VMEM
+    limit, which a Mosaic kernel's blocks are sized to (`scoped_vmem`). This
+    table is the one place a choice is keyed on the hardware generation; any
+    other code reads its facts, a library's support rule the compute capability
+    (`capability`), and a launch config the
     autotuner (`dew.nn.kernels.tuning`), as tools/lint_slop.py's SLOP016 holds.
     """
 
@@ -116,6 +118,7 @@ class GpuTarget:
     memory_bandwidth: float | None = None
     tensor_rates: Mapping[str, int] = dataclasses.field(default_factory=dict)
     load_latency: float | None = None
+    scoped_vmem: int | None = None
     """The generation's global-memory load latency in multiprocessor clocks, as a pointer chase measures
     it (the kernel cost model's waiting term, `dew.nn.kernels.templates.cost`); None where no
     measurement states it."""
@@ -244,7 +247,8 @@ TARGETS = {target.generation: target for target in (
     GpuTarget('v2', 'TPU v2', dense_peaks={'TPU v2': {'bf16': 22.5e12}}),
     GpuTarget('v3', 'TPU v3', dense_peaks={'TPU v3': {'bf16': 61.5e12}}),
     GpuTarget('v4', 'TPU v4', dense_peaks={'TPU v4': {'bf16': 275e12}}),
-    GpuTarget('v5e', 'TPU v5 lite', dense_peaks={'TPU v5 lite': {'bf16': 197e12}}),
+    # Its scoped VMEM limit read from a Mosaic kernel's refusal on a v5e ("limit 16.00M", 2026-10-21).
+    GpuTarget('v5e', 'TPU v5 lite', dense_peaks={'TPU v5 lite': {'bf16': 197e12}}, scoped_vmem=16 * 2 ** 20),
     GpuTarget('v5p', 'TPU v5', dense_peaks={'TPU v5': {'bf16': 459e12}, 'TPU v5p': {'bf16': 459e12}}),
     GpuTarget('v6e', 'TPU v6 lite', dense_peaks={'TPU v6 lite': {'bf16': 918e12}}),
 )}
@@ -374,6 +378,17 @@ def runtime_facts(target: GpuTarget, device) -> GpuTarget:
              **dict(_clocks(device.local_hardware_id))}
     return dataclasses.replace(target, **{name: value for name, value in facts.items() if value is not None},
                                wgmma=capability == '9.0' if capability else target.wgmma)
+
+
+SCOPED_VMEM = 16 * 2 ** 20
+"""The scoped VMEM a TPU kernel may hold where its target states none: v5e's, the least measured, so a
+kernel sized by it fits wherever it runs until its own generation's is measured."""
+
+
+def scoped_vmem(target: GpuTarget) -> int:
+    """The scoped VMEM, in bytes, a Mosaic TPU kernel on `target` may hold at XLA's default limit (a
+    kernel past it refuses to compile): the target's own, else `SCOPED_VMEM`."""
+    return target.scoped_vmem or SCOPED_VMEM
 
 
 SHARED_BUDGET = 99 * 1024
