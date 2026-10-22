@@ -162,8 +162,10 @@ def _depthwise_taps(lhs: jax.Array, rhs: jax.Array, dilation: int, *, materializ
     products = [tap(row, column) for row in range(3) for column in range(3)]
     if not materialized:
         products = jax.lax.optimization_barrier(products)
-    total = products[0]
-    for product in products[1:]:
+    # The materialized sum starts from a positive zero, as cuDNN's accumulator does, so taps that are
+    # all negative zero sum to positive zero; the barriered one from the first product, as YNNPACK's.
+    total = jnp.zeros(lhs.shape, jnp.float32) if materialized else products[0]
+    for product in products if materialized else products[1:]:
         total = total + product
     return (_barrier(total) if materialized else total).astype(lhs.dtype)
 

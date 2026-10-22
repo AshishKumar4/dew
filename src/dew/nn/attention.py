@@ -10,6 +10,7 @@ import contextvars
 import dataclasses
 import functools
 import importlib
+import itertools
 import math
 from collections.abc import Callable
 from typing import Literal, get_args
@@ -1675,9 +1676,11 @@ def attention_case(query, key, *, dtype=None, precision=None, force_fp32_for_sof
         folds=folds(query, key, bias, mask, causal, sliding_window),
         splash=False, shards=sequence_shards())
     # Splash's descriptor reads a concrete mask on the host, so it is built only for a call under a
-    # name that may choose splash which every other requirement of splash's takes (`TPU_SUPPORTS`):
-    # whether splash tiles the call is the one fact left, its lengths and its descriptor.
-    if named in ('auto', 'tpu') and all(need.holds(case) for need in TPU_SUPPORTS if need.code != 'tiles'):
+    # name that may choose splash which every requirement of splash's before its tiling takes
+    # (`TPU_SUPPORTS`, in the order a refusal names them): whether splash tiles the call is then the
+    # fact to form, its lengths and its descriptor, and a later refusal is still reported as itself.
+    earlier = itertools.takewhile(lambda need: need.code != 'tiles', TPU_SUPPORTS)
+    if named in ('auto', 'tpu') and all(need.holds(case) for need in earlier):
         tiled = q_len % SPLASH_LANES == 0 and kv_len % SPLASH_LANES == 0
         case = dataclasses.replace(case, splash=(
             tiled and min(q_len, kv_len) >= SPLASH_MIN_LENGTH
