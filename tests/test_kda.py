@@ -133,10 +133,11 @@ def test_the_recurrent_rule_matches_the_oracle_and_the_chunked_rule():
                     seeds=SEEDS['recurrent oracle'])
 
 
-def layer_and_params(lower_bound):
+def layer_and_params(lower_bound, seed=3):
+    """The layer, its parameters drawn from `seed` and its float32 variables."""
     module = KimiDeltaAttention(emb_features=E, num_heads=H, head_dim=D, conv_kernel=K,
                                 lower_bound=lower_bound, chunk_size=4, norm_eps=1e-5)
-    rng = np.random.RandomState(3)
+    rng = np.random.RandomState(seed)
     def dense(rows, cols):
         return rng.randn(rows, cols) / np.sqrt(rows)
     params = {
@@ -147,17 +148,17 @@ def layer_and_params(lower_bound):
         "b_proj": dense(E, H), "g_a_proj": dense(E, D), "g_b_proj": dense(D, H * D) * 2,
         "o_norm": 1 + rng.randn(D) * 0.2, "o_proj": dense(H * D, E),
     }
-    variables = {"params": {
-        **{name: {"kernel": jnp.asarray(params[name], jnp.float32)}
-           for name in ("q_proj", "k_proj", "v_proj", "f_a_proj", "f_b_proj", "b_proj",
-                        "g_a_proj", "g_b_proj", "o_proj")},
-        **{name: {"weight": jnp.asarray(params[name], jnp.float32)}
-           for name in ("q_conv1d", "k_conv1d", "v_conv1d")},
-        "dt_bias": jnp.asarray(params["dt_bias"], jnp.float32),
-        "A_log": jnp.asarray(params["A_log"], jnp.float32),
-        "o_norm": {"weight": jnp.asarray(params["o_norm"], jnp.float32)},
+    return module, params, variables_of(jax.tree.map(lambda leaf: jnp.asarray(leaf, jnp.float32), params))
+
+
+def variables_of(p: dict) -> dict:
+    """The layer's variables holding `oracle_layer`'s parameters `p`, as they are."""
+    return {"params": {
+        **{name: {"kernel": p[name]} for name in ("q_proj", "k_proj", "v_proj", "f_a_proj", "f_b_proj",
+                                                  "b_proj", "g_a_proj", "g_b_proj", "o_proj")},
+        **{name: {"weight": p[name]} for name in ("q_conv1d", "k_conv1d", "v_conv1d")},
+        "dt_bias": p["dt_bias"], "A_log": p["A_log"], "o_norm": {"weight": p["o_norm"]},
     }}
-    return module, params, variables
 
 
 @pytest.mark.parametrize("lower_bound", [-5.0, None], ids=["safe_gate", "softplus"])
@@ -182,8 +183,8 @@ def test_the_layer_gradients_match_the_oracle():
     """Into the input and every parameter, through the conv, the forget
     gate, the chunked rule across a chunk boundary and the gated norm: on
     par with the transcription's gradients from their float64 evaluation
-    over drawn inputs and cotangents (check 1)."""
-    module, _, variables = layer_and_params(-5.0)
+    over drawn inputs, cotangents and parameters (check 1)."""
+    module, _, _ = layer_and_params(-5.0)
 
     def loss_module(x, variables, cotangent):
         return jnp.sum(module.apply(variables, x) * cotangent)
@@ -193,7 +194,7 @@ def test_the_layer_gradients_match_the_oracle():
 
     @jax.jit
     def ours(x, p, cotangent):
-        grad_x, grad_params = jax.grad(loss_module, argnums=(0, 1))(x, variables, cotangent)
+        grad_x, grad_params = jax.grad(loss_module, argnums=(0, 1))(x, variables_of(p), cotangent)
         return {"x": grad_x, **oracle_params(grad_params)}
 
     @jax.jit
@@ -201,10 +202,10 @@ def test_the_layer_gradients_match_the_oracle():
         grad_x, grad_p = jax.grad(loss_oracle, argnums=(0, 1))(x, p, cotangent)
         return {"x": grad_x, **grad_p}
 
-    params = oracle_params(variables)
-
     def draw(seed):
+        # Each draw's parameters its own: a parameter's gradient is one row of a draw.
         rng = np.random.RandomState(seed)
+        params = oracle_params(layer_and_params(-5.0, seed=1000 + seed)[2])
         return rng.randn(ROWS, S, E).astype(np.float32), params, rng.randn(ROWS, S, E).astype(np.float32)
 
     assert_as_exact(ours, theirs, draw, "layer gradients", seeds=SEEDS['layer gradients'])
