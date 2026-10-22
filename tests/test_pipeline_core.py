@@ -2109,6 +2109,28 @@ def test_a_mixture_of_a_part_cut_after_its_repeat_ends_where_that_part_does():
     assert len(_ids(loader.train(DataPartition()))) == 16
 
 
+def test_a_part_cut_after_its_repeat_comes_round_in_a_mix_read_on_once_its_cut_is_read():
+    """A part repeated for ever and cut to 8 records, mixed at even weights with a corpus of 8 and read
+    on past the mix's end, comes round once its 8 are read: an epoch is the 16 records in which both
+    parts have, and holds the cut part's 8 and every record of the corpus."""
+    cut = mix([_tagged(1, 8), _tagged(2, 4)], weights=(1, 1)).repeat().take(8)
+    loader = compile(mix([cut, _tagged(3, 8)], weights=(1, 1)).repeat().batch(1), loading=READ)
+    assert loader.records == 16
+    read = _ids(loader.train(DataPartition()), loader.records)
+    assert sorted(value for value in read if value < 300) == [*range(100, 104), *range(200, 204)]
+    assert sorted(value for value in read if value >= 300) == list(range(300, 308))
+
+
+def test_a_part_cut_between_two_repeats_comes_round_once_the_cut_its_last_repeat_reads_is_read():
+    """A corpus of 8 repeated, cut to 3 and repeated again comes round, in a mix read on past its end,
+    once the 3 its last repeat reads are: at even weights with a corpus of 3 an epoch is 6 records,
+    holding the cut's 3 and the other corpus's 3."""
+    part = _tagged(1, 8).repeat().take(3).repeat()
+    loader = compile(mix([part, _tagged(2, 3)], weights=(1, 1)).repeat().batch(1), loading=READ)
+    assert loader.records == 6
+    assert sorted(_ids(loader.train(DataPartition()), loader.records)) == [100, 101, 102, 200, 201, 202]
+
+
 def test_a_mixture_of_a_repeated_corpus_and_one_read_once_counts_what_a_run_reads():
     """A mix of a corpus of 8 repeated and one of 4 written without a repeat, at even weights, ends
     where the one read once does, at 8, and a run reads that many records: the order repeats
