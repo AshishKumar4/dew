@@ -162,8 +162,10 @@ def exact_gradient(logits: np.ndarray, cotangent: np.ndarray) -> np.ndarray:
 
 def rows(case: str, count: int):
     """`count` rows of 16 logits and cotangents, float64: logits near 1e4 (weights spanning 1 to 1e-22
-    and below), or standard-normal ones."""
-    streams = jax.random.split(jax.random.key({"extreme": 0, "ordinary": 1}[case]), 2)
+    and below), standard-normal ones, or rows whose largest logit is a tiny one beside -700 (`argument`:
+    the subtraction `-700 - 2^-45` rounds to -700, so the exponential's argument, not its own rounding,
+    carries the error)."""
+    streams = jax.random.split(jax.random.key({"extreme": 0, "ordinary": 1, "argument": 2}[case]), 2)
     with jax.enable_x64(new_val=True):
         logits = np.asarray(jax.random.normal(streams[0], (count, 16), jnp.float64))
         cotangents = np.asarray(jax.random.normal(streams[1], (count, 16), jnp.float64))
@@ -171,22 +173,40 @@ def rows(case: str, count: int):
         logits = logits * 1e4
         # Each row's runner-up 50 below its largest, a weight near 1e-22 beside one near 1.
         logits[:, 1] = logits.max(axis=1) - 50.0 - np.arange(count) / count
+    if case == "argument":
+        logits = np.full((count, 16), -1000.0) - np.arange(count)[:, None]
+        logits[:, 0], logits[:, 1] = 2.0 ** -45 * (1 + np.arange(count)), -700.0
+        cotangents = np.zeros((count, 16))
+        cotangents[:, 1] = 1.0
     return logits, cotangents
 
 
 def anchored_bound(logits: np.ndarray, cotangent: np.ndarray) -> np.ndarray:
-    """The anchored form's float64 rounding bound, entrywise: with `r = g - g_a` its terms are each weight
-    times `|r_i|` and the weights' sum of `|r_j|`, each rounded through at most `n + 4` operations
-    (the weights' exponential and normalization, the subtraction, the sum, the products), so
-    `|error_i| <= 2 gamma_{n+4} p_i (|r_i| + sum_j p_j |r_j|)` (Higham, Accuracy and Stability of
-    Numerical Algorithms, 3.1 and 4.2): the gate's reduction bound in float64 (`reduction_bound`)."""
-    weights = np.exp(logits - logits.max())
+    """The anchored form's float64 rounding bound, entrywise, `u` float64's unit roundoff and
+    `r = g - g_a`. Each exponent `x_i = l_i - l_a` rounds by at most `u |x_i|`, which moves `exp(x_i)` by
+    that relative amount, and the exponential rounds by at most `2u` (`eta_i`, enclosed by `expm1`); the
+    denominator's sum adds `gamma_n` and carries the weights' errors (`tau`), and the division `u`, so each
+    weight is within `delta_i = eta_i + 2 tau + u` relatively. The gradient `p_i (r_i - sum_j p_j r_j)`
+    then errs by at most `p_i (delta_i (|r_i| + S) + sum_j p_j |r_j| delta_j)`, `S = sum_j p_j |r_j|`, plus
+    its own operations' rounding, `n + 4` of them (the subtraction, the products and the sum): the gate's
+    reduction bound in float64 (`reduction_bound`; Higham, Accuracy and Stability of Numerical
+    Algorithms, 3.1 and 4.2)."""
+    unit = np.finfo(np.float64).eps / 2
+    exponents = logits - logits.max()
+    weights = np.exp(exponents)
     weights /= weights.sum()
+    eta = np.expm1(unit * np.abs(exponents)) * (1 + 2 * unit) + 2 * unit
+    steps = logits.size
+    tau = steps * unit / (1 - steps * unit) + np.sum(weights * eta)
+    delta = eta + 2 * tau + unit
     relative = np.abs(cotangent - cotangent[np.argmax(logits)])
-    return reduction_bound(weights * (relative + np.sum(weights * relative)), logits.size + 4, np.float64)
+    spread = np.sum(weights * relative)
+    terms = weights * (relative + spread)
+    carried = weights * (delta * (relative + spread) + np.sum(weights * relative * delta))
+    return carried + reduction_bound(terms, logits.size + 4, np.float64)
 
 
-@pytest.mark.parametrize("case", ["extreme", "ordinary"])
+@pytest.mark.parametrize("case", ["extreme", "ordinary", "argument"])
 def test_the_anchored_truth_is_within_its_bound_and_never_further_than_the_plain_one(case):
     """Each anchored entry is within its float64 rounding bound of exact (`anchored_bound`), and never
     further from exact than the plain form's entry except within that bound; on the extreme rows the

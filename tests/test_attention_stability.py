@@ -32,10 +32,10 @@ TIES = (1610613120.0, 1610612992.0)
 @dataclasses.dataclass(frozen=True)
 class Case:
     """A stability case: queries `[B, Q, H, D]`, keys and values `[B, K, H, D]` and the output cotangent,
-    fp32, the softmax's scale 1/sqrt(D); the keys each query keeps `[B, 1, Q, K]` and the same keys as
-    the template's spans' arguments (`template.spans`); sinks `[H]` or None; whether the default
-    form holds it (`folded`), False only for the fold's documented divergences (`algebra.Forward.base2`),
-    which run in the natural form alone."""
+    held in fp32 and run in `dtype`, the softmax's scale 1/sqrt(D); the keys each query keeps
+    `[B, 1, Q, K]` and the same keys as the template's spans' arguments (`template.spans`); sinks `[H]`
+    or None; whether the default form holds it (`folded`), False only for the fold's documented
+    divergences (`algebra.Forward.base2`), which run in the natural form alone."""
 
     query: np.ndarray
     key: np.ndarray
@@ -45,6 +45,7 @@ class Case:
     spans: dict = dataclasses.field(default_factory=dict)
     sinks: np.ndarray | None = None
     folded: bool = True
+    dtype: str = "float32"
 
 
 def _along(sizes, width: int) -> np.ndarray:
@@ -120,6 +121,19 @@ def _cases() -> dict[str, Case]:
                                                     {"causal": True, "starts": np.asarray([2])})
     ids = np.asarray([[1, 2, 3, 3]], np.int32)
     documents = _causal(4, 4) & (ids[:, None, :, None] == ids[:, None, None, :])
+    for dtype in ("float32", "bfloat16"):
+        # A weight of exp(-87), normal in fp32 and bf16, on a value of 2^126 among 256 keys of which two
+        # are seen: the output, about 1.4, is that product alone, which a weight shifted for the keys'
+        # count before it is narrowed would lose.
+        small = np.zeros((1, 256, 1, 16), np.float32)
+        small[0, 1, 0, 0] = -87.0
+        large = np.zeros((1, 256, 1, 16), np.float32)
+        large[0, 1, 0, 0] = 2.0 ** 126
+        seen = np.zeros((1, 1, 1, 256), bool)
+        seen[..., :2] = True
+        cases[f"a small weight on a large value, {dtype}"] = Case(
+            _along([4.0], 16), small, large, np.ones((1, 1, 1, 16), np.float32), seen,
+            {"lengths": np.asarray([2])}, dtype=dtype)
     cases["documents of one key"] = Case(*_drawn(4, 4, 16, 6), documents,
                                          {"causal": True, "segment_ids": ids})
     return cases
@@ -141,8 +155,13 @@ def _reference(case: Case, dtype, *, anchored: bool = False):
         return [np.asarray(x) for x in (out, *pull(dout))]
 
     arrays = [None if x is None else jnp.asarray(np.asarray(x, dtype))
-              for x in (case.query, case.key, case.value, case.dout, case.sinks)]
+              for x in (*_operands(case), case.sinks)]
     return run(*arrays)
+
+
+def _operands(case: Case) -> list[np.ndarray]:
+    """The case's queries, keys, values and cotangent rounded to its dtype."""
+    return [np.asarray(x, jnp.dtype(case.dtype)) for x in (case.query, case.key, case.value, case.dout)]
 
 
 def _truth(case: Case):
@@ -166,7 +185,7 @@ def _spans(case: Case) -> template.KeySpans:
 def _template(case: Case, form) -> dict[str, list[np.ndarray]]:
     """Each template mainloop's output and gradients."""
     natural = {} if form is None else {"natural": form}
-    query, key, value, dout = (jnp.asarray(x) for x in (case.query, case.key, case.value, case.dout))
+    query, key, value, dout = (jnp.asarray(x) for x in _operands(case))
     spans, hooks = _spans(case), _hooks(case)
     with tuning.pinned(PINS):
         out = attention_triton.forward(query, key, value, spans, hooks, interpret=True, **natural)
@@ -194,7 +213,7 @@ def _held(found, reference, truth, label: str) -> None:
 def test_attention_is_finite_and_as_exact_as_the_reference_at_fp32s_edges(case, form):
     """Each template mainloop's output and query, key and value gradients."""
     case = CASES[case]
-    reference, truth = _reference(case, np.float32), _truth(case)
+    reference, truth = _reference(case, case.dtype), _truth(case)
     for mainloop, found in _template(case, FORMS[form]).items():
         for leaf, *arrays in zip(("output", "dq", "dk", "dv"), found, reference, truth, strict=True):
             _held(*arrays, f"{mainloop} {leaf}")
@@ -217,9 +236,9 @@ def test_decode_is_finite_and_as_exact_as_the_reference_at_fp32s_edges(case, for
     """The decode kernel's output, interpreted, each row's keys the first `K` of its cache."""
     case = CASES[case]
     natural = {} if FORMS[form] is None else {"natural": FORMS[form]}
-    keys = case.key.shape[1]
-    lengths = jnp.full((case.query.shape[0],), keys, jnp.int32)
-    found = decode_attention.attend(jnp.asarray(case.query), _cache(case.key), _cache(case.value), lengths,
+    query, key, value, _ = _operands(case)
+    lengths = jnp.asarray(case.spans.get("lengths", np.full(query.shape[0], key.shape[1])), jnp.int32)
+    found = decode_attention.attend(jnp.asarray(query), _cache(key), _cache(value), lengths,
                                     sinks=None if case.sinks is None else jnp.asarray(case.sinks),
                                     interpret=True, **natural)
-    _held(found, _reference(case, np.float32)[0], _truth(case)[0], "decode output")
+    _held(found, _reference(case, case.dtype)[0], _truth(case)[0], "decode output")

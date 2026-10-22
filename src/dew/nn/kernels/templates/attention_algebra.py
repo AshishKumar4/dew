@@ -142,11 +142,14 @@ def room(state: Partial, alpha: jax.Array, p: jax.Array, value: jax.Array
     each row's shift for the tile (`needed`): the shifted weights, the sums' factor, and the row's new
     shift and reach (the largest value magnitude among the keys it weighs). The weighted values of a row
     can pass fp32's largest only where its values are near it (a sum of up to `total` of them); a shift
-    of `2^-k` on every weight keeps them within it,
-    exactly, as a power of two scales, and leaves every ratio the softmax takes, so the output is the
-    unshifted one. A row whose values are ordinary takes `k = 0`, its bits the unshifted ones; a row
-    that takes one shifts its weights only once its values need it, so a weight it pushes below the
-    narrowed dtype's least subnormal (or fp32's) was below an ulp of the row's sums."""
+    of `2^-k` on every weight keeps them within it, exactly, as a power of two scales, and leaves every
+    ratio the softmax takes, so the output is the unshifted one. A row whose denominator times its reach
+    stays below `2^HEADROOM` takes `k = 0`, its bits the unshifted ones. A row that takes one loses only
+    the weights it pushes below the narrowed dtype's least subnormal, `2^-133` for bf16 (`2^-126` where
+    subnormals flush): since `2^k < 2 total reach 2^-HEADROOM`, such a weight, at most `2^(k - 126)`,
+    moves its row's output in a column whose values reach `M` by under `M reach 2^-251 <= M 2^-123` (a
+    value is at most fp32's largest, `reach < 2^128`), some hundred binades below the reference's own
+    rounding of that column, `2^-24 M` where its largest value counts."""
     # The largest value magnitude of the keys each row weighs, as a key the row does not see (padding, a
     # stale cache slot, another document) would shift it for nothing.
     largest = jnp.max(jnp.abs(value.astype(jnp.float32)), axis=-1)
