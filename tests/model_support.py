@@ -23,6 +23,17 @@ TINY_DECODER = {"emb_features": 32, "num_layers": 2, "num_heads": 4, "mlp_featur
 its own vocabulary and any field its claim turns on."""
 
 
+def model_draw(model, shape: tuple[int, ...], vocab: int):
+    """Check 1's draw for `model` (tests/reference_error.py): a seed's variables and `shape` tokens below
+    `vocab`, the variables initialized compiled."""
+    init = jax.jit(model.init)
+
+    def draw(seed):
+        ids = jax.random.randint(jax.random.fold_in(jax.random.key(1), seed), shape, 0, vocab)
+        return init(jax.random.fold_in(jax.random.key(0), seed), ids), ids
+    return draw
+
+
 def two_documents(rng: np.random.Generator, rows: int, length: int):
     """The `Coordinates` of `rows` packed rows of `length` tokens: two documents a row, the second
     starting at a column `rng` draws for each row, and the last row's final three slots padding."""
