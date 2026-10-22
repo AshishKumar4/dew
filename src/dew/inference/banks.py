@@ -370,15 +370,7 @@ class SafetensorsBanks(LayerBanks):
     def _placed(variables: Variables, placement: Placement) -> Variables:
         from dew.training.host import place_leaf
 
-        def place(leaf, target):
-            if not isinstance(target, Format):
-                return place_leaf(leaf, target)
-            try:
-                return jax.block_until_ready(jax.device_put(leaf.read(), target))
-            finally:
-                leaf.release()
-
-        return jax.tree.map(place, variables, placement)
+        return jax.tree.map(place_leaf, variables, placement)
 
     def bank(self, layers: Sequence[int], placement: Placement, *,
              namespace: tuple[str, ...] = ()) -> Variables:
