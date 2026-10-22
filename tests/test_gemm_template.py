@@ -641,11 +641,13 @@ def test_a_fused_producers_gradients_are_its_own(producer):
     def draw(seed):
         x, w, _, nw, *_ = _draw(seed)
         x = x.at[:4].set(0)  # a ReLU's zero, where its custom derivative differs from max(x, 0)'s
-        return x, w, nw, jnp.asarray(np.random.default_rng(seed + 1000).normal(size=(ROWS, WIDTH)), jnp.float32)
+        cotangent = np.random.default_rng(seed + 1000).normal(size=(ROWS, WIDTH))
+        return x, w, nw, jnp.asarray(cotangent, jnp.float32)
 
     def loss(gemm, transform=lambda value: value):
         def value(x, w, weight):
-            return gemm(producer(x, weight), w).astype(jnp.float32)
+            out = gemm(producer(x, weight), w)
+            return _wide(out)  # fp32, or the truth's float64, as the drawn cotangent is widened
         return with_gradients(transform(value))
 
     def fused_gemm(operand, w):
