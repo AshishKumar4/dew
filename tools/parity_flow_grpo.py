@@ -70,8 +70,9 @@ def author_transition(reference, inputs: dict, dtype) -> dict[str, np.ndarray]:
     scheduler = FlowMatchEulerDiscreteScheduler(shift=1.0)
     scheduler.set_timesteps(sigmas=list(SIGMAS))
     # The schedule as Dew's transition takes it, SIGMAS at float32 and the final zero, in `dtype`: the
-    # scheduler's own round trip through its timesteps moves a sigma by an ulp, a different input.
-    scheduler.sigmas = torch.tensor((*SIGMAS, 0.0), dtype=torch.float32).to(dtype)
+    # scheduler's own round trip through its timesteps moves a sigma by an ulp, a different input. From
+    # NumPy, since the float64 run's `torch.tensor` is widened and would hold SIGMAS unrounded.
+    scheduler.sigmas = torch.from_numpy(np.asarray((*SIGMAS, 0.0), np.float32)).to(dtype)
     timesteps = scheduler.timesteps.repeat(REPEATS)
     v = torch.tensor(inputs["velocity"], dtype=dtype, requires_grad=True)
     _, log_prob, mean, coefficient = reference.sde_step_with_logprob(
