@@ -155,6 +155,23 @@ def _mixed_columns(seed: int, rows: int = 128, small: tuple[float, float] = (5e2
     return _first(np.full((rows, 1), 4.0, np.float32), 16), key, value, None, dout * np.float32(2.0 ** -8)
 
 
+def _subnormal_share(seed: int, rows: int = 64):
+    # One query a row over 256 keys: 255 of logit 0 (their other entries drawn, which the query reads
+    # nothing of) whose values near fp32's largest in the first column overflow its sum, and one of logit
+    # -84 to -88 whose value near 1e38 sits alone in the second column, its weight over the denominator
+    # below fp32's least normal; the cotangent reads the second column alone, so D is that key's share
+    # and dQ's other entries are D times the other keys' weighted rows.
+    key = np.zeros((rows, 256, 1, 16), np.float32)
+    key[:, :255, 0, 1:] = _normal(seed, (rows, 255, 15))[0]
+    key[:, 255, 0, 0] = -_uniform(seed + 1, 84.0, 88.0, (rows,))
+    value = np.zeros((rows, 256, 1, 16), np.float32)
+    value[:, :255, 0, 0] = _uniform(seed + 2, 2.9e38, 3.3e38, (rows, 255))
+    value[:, 255, 0, 1] = _uniform(seed + 3, 5e37, 1e38, (rows,))
+    dout = np.zeros((rows, 1, 1, 16), np.float32)
+    dout[..., 1] = _normal(seed + 4, (rows, 1, 1))[0]
+    return _first(np.full((rows, 1), 4.0, np.float32), 16), key, value, None, dout
+
+
 def _tiny_beside_large(seed: int, rows: int = 128):
     """One query a row over four keys of equal logits, every value's first column drawn near fp32's
     largest (their sum overflows) and the first key's second column a drawn 2^-123 to 2^-120: that
@@ -374,6 +391,12 @@ def _families() -> dict[str, Family]:
             _anchor_relative, np.ones((64, 1, 1, 33), bool), folded=False),
         "a column near fp32's least normal under a large cotangent": Family(
             _least_normal_column, np.ones((64, 1, 1, 3), bool), folded=False),
+        # A share whose normalized weight is subnormal, in either dtype (the normalized pass's small
+        # weights, `algebra.normalized_terms`).
+        "a subnormal share of an overflowing row, float32": Family(
+            _subnormal_share, np.ones((64, 1, 1, 256), bool), folded=False),
+        "a subnormal share of an overflowing row, bfloat16": Family(
+            _subnormal_share, np.ones((64, 1, 1, 256), bool), folded=False, dtype="bfloat16"),
     }
     lengths = np.tile([4, 0], ROWS // 2)
     empty = np.broadcast_to((lengths > 0)[:, None, None, None], (ROWS, 1, 4, 4))

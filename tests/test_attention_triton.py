@@ -92,9 +92,9 @@ def gate_of(queries: int, value_width: int) -> jax.Array:
 
 
 def check(case: dict, names: frozenset, dtype, config: attention_triton.Tiles, *, residuals: bool = False,
-          width: int = 32, value_width: int = 32):
+          width: int = 32, value_width: int = 32, natural: bool = template.NATURAL):
     """`attention_triton.forward` pinned at `config` on par with `template.reference` over `case`'s keys and
-    the hooks `names`, at the site's declared seeds."""
+    the hooks `names`, at the site's declared seeds, its exponent `natural` or the fold."""
     queries, keys = geometry(case)
     spans = template.spans(queries, keys, ROWS, **arguments(case))
     hooks = hooks_for(names, queries, value_width, gate_of(queries, value_width))
@@ -103,7 +103,7 @@ def check(case: dict, names: frozenset, dtype, config: attention_triton.Tiles, *
     def ours(query, key, value):
         with pin:
             out = attention_triton.forward(query, key, value, spans, hooks, residuals=residuals,
-                                           interpret=not ON_GPU)
+                                           natural=natural, interpret=not ON_GPU)
         # The maxima and denominators the reference keeps too; the anchor keys only the backward reads,
         # held to its gradients (`check_backward`).
         return out[:3] if residuals else out
@@ -112,7 +112,8 @@ def check(case: dict, names: frozenset, dtype, config: attention_triton.Tiles, *
         return template.reference(query, key, value, spans, hooks, residuals=residuals)
 
     assert_as_exact(jax.jit(ours), jax.jit(xla), drawing(queries, keys, dtype, width, value_width),
-                    f"triton forward {case} {sorted(names)} {jnp.dtype(dtype).name} {config}",
+                    f"triton forward {case} {sorted(names)} {jnp.dtype(dtype).name} {config} "
+                    f"natural {natural}",
                     seeds=ALL_HOOKS_SEEDS if names == HOOKS["all"] else SEEDS)
 
 
@@ -132,11 +133,13 @@ def test_the_forward_is_on_par_over_the_core_s_other_call_forms(form):
     check(CASES[form], HOOKS["none"], jnp.float32, PINNED[1])
 
 
+@pytest.mark.parametrize("natural", [False, True], ids=["fold", "natural"])
 @pytest.mark.parametrize("dtype", attention_triton.DTYPES, ids=DTYPE_IDS)
 @pytest.mark.parametrize("hooks", HOOKS.values(), ids=HOOKS)
-def test_the_forward_is_on_par_under_every_hook(hooks, dtype):
-    """Each hook over causal packed documents under a window, the residuals too, at one config."""
-    check(CASES["causal-documents-window"], hooks, dtype, PINNED[1], residuals=True)
+def test_the_forward_is_on_par_under_every_hook(hooks, dtype, natural):
+    """Each hook over causal packed documents under a window, the residuals too, at one config, in both
+    forms of the exponent."""
+    check(CASES["causal-documents-window"], hooks, dtype, PINNED[1], residuals=True, natural=natural)
 
 
 @pytest.mark.parametrize("width, value_width", [(64, 64), (80, 48), (128, 128)])
@@ -277,12 +280,12 @@ def joint(config: attention_triton.Tiles, dkv_config: attention_triton.Tiles | N
 
 
 def check_backward(case: dict, names: tuple, dtype, config, dkv_config=None, *, width: int = 32,
-                   value_width: int = 32):
+                   value_width: int = 32, natural: bool = template.NATURAL):
     """`attention_triton.backward` with its dQ launch at `config` and its dK/dV launch at `dkv_config`
     (`config` too by default; its tiles are always the dQ launch's), its every gradient (queries, keys,
     values, each score parameter, the initial state's) on par with `jax.vjp` of the template's XLA
     arithmetic, from float64: the hooks' parameters and initial state are drawn with the operands, so
-    their gradients' truth is float64 too."""
+    their gradients' truth is float64 too; its exponent `natural` or the fold."""
     queries, keys = geometry(case)
     spans = template.spans(queries, keys, ROWS, **arguments(case))
     score_mod, kinds, draw_hooks = score_hooks(names, queries, keys, value_width)
@@ -302,7 +305,7 @@ def check_backward(case: dict, names: tuple, dtype, config, dkv_config=None, *, 
     def ours(query, key, value, dout, params, initial):
         with pins:
             grads = attention_triton.backward(query, key, value, spans, hooked(params, initial), dout,
-                                              interpret=not ON_GPU)
+                                              natural=natural, interpret=not ON_GPU)
         return grads.query, grads.key, grads.value, grads.score_params, grads.initial
 
     def xla(query, key, value, dout, params, initial):
@@ -314,7 +317,7 @@ def check_backward(case: dict, names: tuple, dtype, config, dkv_config=None, *, 
 
     assert_as_exact(jax.jit(ours), jax.jit(xla), draw,
                     f"triton backward {case} {names} {jnp.dtype(dtype).name} {config} {dkv_config} "
-                    f"{width}/{value_width}",
+                    f"{width}/{value_width} natural {natural}",
                     seeds=BACKWARD_SEEDS.get((names, jnp.dtype(dtype).name), SEEDS))
 
 
@@ -334,12 +337,13 @@ def test_the_backward_is_on_par_over_the_core_s_other_call_forms(form):
     check_backward(CASES[form], (), jnp.float32, PINNED[0], attention_triton.Tiles(32, 32, 8, 3))
 
 
+@pytest.mark.parametrize("natural", [False, True], ids=["fold", "natural"])
 @pytest.mark.parametrize("dtype", attention_triton.DTYPES, ids=DTYPE_IDS)
 @pytest.mark.parametrize("hooks", SCORE_HOOKS.values(), ids=SCORE_HOOKS)
-def test_the_backward_is_on_par_under_every_score_hook(hooks, dtype):
+def test_the_backward_is_on_par_under_every_score_hook(hooks, dtype, natural):
     """Each score hook over causal packed documents under a window: the gradients of its parameters and
-    of the initial state too."""
-    check_backward(CASES["causal-documents-window"], hooks, dtype, PINNED[0])
+    of the initial state too, in both forms of the exponent."""
+    check_backward(CASES["causal-documents-window"], hooks, dtype, PINNED[0], natural=natural)
 
 
 def test_a_wide_parameter_computes_as_its_fp32_value_and_its_gradient_returns_wide():
@@ -443,7 +447,10 @@ def test_cotangents_that_cancel_across_a_key_cancel_within_the_sums_bound(dtype)
     equal shares of them, which cancel in float64. A cancellation's zero is no structure: each
     implementation's gradient is its sums' rounding, so Dew's and the reference's are each within the
     fp32 reduction bound of the shares' magnitudes (`assert_fp32_reduction_bound`), and cotangents drawn to
-    cancel the same way hold check 1."""
+    cancel the same way hold check 1. The bound's derivation: every weight is the one fp32 value 1/3
+    rounded, a common factor of a sum that cancels exactly, so its rounding moves nothing; what remains is
+    a length-3 dot product's rounding, within gamma_3 of its products' magnitudes with each product's own
+    rounding included (Higham, Accuracy and Stability, 3.1), which the bound takes twice."""
     spans = template.spans(3, 3, 1)
 
     def ours(value, dout):

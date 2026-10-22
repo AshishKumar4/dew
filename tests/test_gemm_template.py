@@ -1195,15 +1195,14 @@ def test_an_interpreted_fp32_product_at_highest_rounds_its_exact_sum_once(column
         *narrow, (((1,), (0,)), ((), ())), preferred_element_type=jnp.float32)))
 
 
-def test_an_interpreted_fp32_sum_that_cancels_at_mixed_magnitudes_is_a_float64_sum():
-    """2^30 * 2^30, 1 * 1 and -(2^30 * 2^30): each product is exact in float64, and their float64 sum is 1
-    in an order that adds the large ones first and 0 in either other, the 1 rounding into 2^60. The
-    interpreted product is one of float64's sums, not exact."""
-    lhs = jnp.asarray([[2.0 ** 30, 1.0, -(2.0 ** 30)]], jnp.float32)
-    rhs = jnp.asarray([[2.0 ** 30], [1.0], [2.0 ** 30]], jnp.float32)
+def test_an_interpreted_fp32_sum_that_cancels_at_mixed_magnitudes_is_its_float64_sum():
+    """2^24 * 2^24, 1 * 1 and -(2^24 * 2^24): each product is exact in fp32, and their float64 sum is 1 in
+    every order (2^48 + 1 is a float64), where an fp32 accumulation that adds a large one first rounds the
+    1 away, 0. The interpreted product accumulates in float64: 1 exactly."""
+    lhs = jnp.asarray([[2.0 ** 24, 1.0, -(2.0 ** 24)]], jnp.float32)
+    rhs = jnp.asarray([[2.0 ** 24], [1.0], [2.0 ** 24]], jnp.float32)
     declared = product.declared(jnp.float32, jax.lax.Precision.HIGHEST, outputs=(jnp.float32,))
-    found = float(product.interpreted(declared, lhs, rhs, (((1,), (0,)), ((), ())))[0, 0])
-    assert found in (0.0, 1.0)
+    assert float(product.interpreted(declared, lhs, rhs, (((1,), (0,)), ((), ())))[0, 0]) == 1.0
 
 
 HOOKED_RECEIPTS = {
