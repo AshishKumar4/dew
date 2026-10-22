@@ -546,6 +546,24 @@ def test_a_convolution_no_rule_quantizes_computes_as_unwrapped_and_as_qwix_does(
     np.testing.assert_array_equal(jax.jit(served.apply)(served_variables, x), plain[0])
 
 
+def test_a_recorded_kernel_no_rule_matches_multiplies_by_its_own_recipe():
+    """A served kernel stored quantized that reaches a matmul under rules naming none of it, as an unpacked
+    task's member does under a rule naming its packed group, multiplies by the recipe it records: its
+    weight-only logits bit for bit those of the rules that quantized it. Rules that quantize activations
+    refuse it, whose recipe the kernel does not record."""
+    pytest.importorskip("qwix")
+    model, _, variables, ids = quantized_forward(Quantization(weight_only=True, patterns=(".*_proj",)))
+    quantized = Quantization(weight_only=True, patterns=(".*_proj",))
+    served, served_variables = quantize_for_serving(model, variables, quantized, ids)
+    nothing = Quantization(weight_only=True, patterns=("none",))
+    unmatched, _ = quantize_for_serving(model, variables, nothing, ids)
+    np.testing.assert_array_equal(jax.jit(unmatched.apply)(served_variables, ids),
+                                  jax.jit(served.apply)(served_variables, ids))
+    activations, _ = quantize_for_serving(model, variables, Quantization(patterns=("none",)), ids)
+    with pytest.raises(ValueError):
+        activations.apply(served_variables, ids)
+
+
 def test_serving_stores_int8_kernels_and_computes_what_training_quantized():
     """Served weights are int8 values with their scales, and the served
     projections reproduce the quantized-training forward they were trained
