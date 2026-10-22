@@ -1249,7 +1249,10 @@ def reference_attention(query, key, value, *, mask=None, bias=None, sinks=None, 
     if bias is not None:
         logits = logits + bias
     if mask is not None:
-        logits = jnp.where(mask, logits, jnp.finfo(dtype).min)
+        # Beside a sink a masked key is -inf, so it weighs nothing whatever the sink's logit: the sink
+        # keeps every row's denominator finite. Without one the finite floor keeps a row every key
+        # masks a number, as flax's does.
+        logits = jnp.where(mask, logits, -jnp.inf if sinks is not None else jnp.finfo(dtype).min)
     if sinks is not None:
         if sinks.shape != (heads,):
             raise ValueError(f"sinks must have one logit per query head, got {sinks.shape}")
