@@ -171,9 +171,9 @@ def parity_functions(chunk_size: int, roundings: int, platform: str = "tpu"):
     """The kernel's output, final state and all five gradients for `platform` (interpreted off it),
     XLA's, and XLA's independently checked float64 truth: the kernel and the scan, two Dew paths,
     without YNNPACK fusions on the CPU lane (`without_ynn`)."""
-    mine = without_ynn(lambda operands, seeded: evaluated(
+    mine = jax.jit(lambda operands, seeded: evaluated(
         lambda *o: ssd_chunk_scan(*o, chunk_size, platform), operands, seeded))
-    xla = without_ynn(lambda operands, seeded: evaluated(
+    xla = jax.jit(lambda operands, seeded: evaluated(
         lambda *o: xla_chunk_scan(*o, chunk_size), operands, seeded))
     recurrence = jax.jit(lambda operands, seeded: evaluated(stepwise_scan, operands, seeded))
 
