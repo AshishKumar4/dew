@@ -676,8 +676,8 @@ def test_a_nested_last_kernel_does_not_shorten_a_traced_window():
 
 def test_torch_optim_fixture_is_what_the_generator_writes(tmp_path):
     """The stored gradients and initial parameters exactly; torch's schedule
-    values and Adam steps within float32 rounding of a parameter of order 1."""
-    pytest.importorskip("torch")
+    values and Adam steps within float32 rounding of a parameter of order 1. PyTorch, the generator's
+    reference, is the suite's own dependency: a missing one fails here."""
     load("torch_optim_reference").main(["--out", str(tmp_path)])
     committed = FIXTURES / "torch_optim"
     assert_fixture_files(tmp_path, committed, "torch_optim_reference")
