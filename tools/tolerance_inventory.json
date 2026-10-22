@@ -749,10 +749,6 @@
    "comparisons": 1,
    "lane": "Training"
   },
-  "tests/test_text_encoders.py": {
-   "comparisons": 4,
-   "lane": "Models, Serving & RL"
-  },
   "tests/test_text_rollout_contract.py": {
    "comparisons": 14,
    "lane": "Models, Serving & RL"
