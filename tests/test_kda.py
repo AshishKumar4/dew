@@ -203,10 +203,12 @@ def test_the_layer_gradients_match_the_oracle():
         return {"x": grad_x, **grad_p}
 
     def draw(seed):
-        # Each draw's parameters its own: a parameter's gradient is one row of a draw.
+        # Each draw's parameters its own, a parameter's gradient one row of a draw, summed over eight
+        # times a layer draw's rows: the gates' gradients sum terms whose tails few rows leave unresolved.
         rng = np.random.RandomState(seed)
         params = oracle_params(layer_and_params(-5.0, seed=1000 + seed)[2])
-        return rng.randn(ROWS, S, E).astype(np.float32), params, rng.randn(ROWS, S, E).astype(np.float32)
+        x, cotangent = rng.randn(2, 8 * ROWS, S, E).astype(np.float32)
+        return x, params, cotangent
 
     assert_as_exact(ours, theirs, draw, "layer gradients", seeds=SEEDS['layer gradients'])
 
