@@ -505,10 +505,6 @@
    "comparisons": 6,
    "lane": "Kernels"
   },
-  "tests/test_mla.py": {
-   "comparisons": 14,
-   "lane": "Models, Serving & RL"
-  },
   "tests/test_models.py": {
    "comparisons": 10,
    "lane": "Models, Serving & RL"
