@@ -312,29 +312,21 @@ def test_a_server_compiles_its_decoding_step_once_and_each_admission_width_once(
     which every decode-only call then runs without compiling again, and each admission width it
     meets compiles its admitting step at most once, so the widths 1, 2, 4 and 8 cost at most four
     admitting compiles beside the one decoding step, and meeting them again compiles nothing."""
-    compiled = []
+    from dew.telemetry.benchmark import Compiles
 
-    def listener(event, seconds, *, fun_name=None, **_):
-        # JAX names a jitted function's compile `jit(<name>)`; the step programs are `_stepped`'s.
-        if event == "/jax/core/compile/backend_compile_duration" and fun_name == "jit(_stepped)":
-            compiled.append(seconds)
-
-    jax.monitoring.register_event_duration_secs_listener(listener)
-    try:
+    with Compiles("_stepped") as compiled:
         server = Server.from_task(task(), slots=8, capacity=128, admission=8)
-        assert len(compiled) == 1, "building a server compiles its decoding step"
+        assert compiled.count == 1, "building a server compiles its decoding step"
         server([PROMPTS[0]], 12, key=0)
-        assert len(compiled) == 2, "one admission and the decode-only calls after it compile one program"
+        assert compiled.count == 2, "one admission and the decode-only calls after it compile one program"
         widths = (1, 2, 4, 8)
         for width in widths:
             server([PROMPTS[0]] * width, 2, key=0)
-        first = len(compiled)
+        first = compiled.count
         assert first <= 1 + len(widths)
         for width in widths:
             server([PROMPTS[0]] * width, 2, key=0)
-        assert len(compiled) == first, "a width the server has met compiles nothing again"
-    finally:
-        jax.monitoring.unregister_event_duration_listener(listener)
+        assert compiled.count == first, "a width the server has met compiles nothing again"
 
 
 def test_host_task_and_server_preserve_nonzero_lora_branches():
