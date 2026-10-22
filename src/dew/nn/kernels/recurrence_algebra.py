@@ -322,9 +322,7 @@ def solved(keys: Load, gates, lows, betas, columns: int, issue: Issue) -> dict:
     """`(I + A)^-1`'s blocks `{(i, j): [SUB, SUB]}` for `j <= i` of one chunk's `A = tril(beta_s (k_s .
     k_t) exp2(g_s - g_t), -1)`, a decay a head: `keys(i, c)` sub-chunk `i`'s key column block `c` of
     `columns`, `gates`, `lows` and `betas` each sub-chunk's prefix halves and write gates, fp32. Every
-    block of `k k^T` sums its column blocks' products ('intra'); forward substitution inverts each
-    diagonal block (`tril_inverse`), and neighbouring inverses merge as `X_ij = -X_ii sum_m A_im X_mj`
-    ('merge'), nearest the diagonal first."""
+    block of `k k^T` sums its column blocks' products ('intra'), and the blocks invert (`inverted`)."""
     count = len(gates)
     index = jnp.arange(gates[0].shape[0])
     strict = index[:, None] > index[None, :]
@@ -335,7 +333,16 @@ def solved(keys: Load, gates, lows, betas, columns: int, issue: Issue) -> dict:
         product = product * (jnp.where(strict, decay, 0.0) if i == j else decay)
         return product * betas[i][:, None]
 
-    blocks = {(i, j): block(i, j) for i in range(count) for j in range(i + 1)}
+    return inverted({(i, j): block(i, j) for i in range(count) for j in range(i + 1)}, issue)
+
+
+def inverted(blocks: dict, issue: Issue) -> dict:
+    """`(I + A)^-1`'s blocks `{(i, j): [SUB, SUB]}` for `j <= i` from `A`'s strictly lower blocks
+    `blocks` (the diagonal ones strictly lower themselves): forward substitution inverts each diagonal
+    block (`tril_inverse`), and neighbouring inverses merge as `X_ij = -X_ii sum_m A_im X_mj` ('merge'),
+    nearest the diagonal first."""
+    count = max(i for i, _ in blocks) + 1
+    index = jnp.arange(blocks[0, 0].shape[0])
     inverse = {(i, i): tril_inverse(blocks[i, i], index) for i in range(count)}
     for distance in range(1, count):
         for i in range(distance, count):
@@ -347,8 +354,9 @@ def solved(keys: Load, gates, lows, betas, columns: int, issue: Issue) -> dict:
 
 def weighted(name: str, inverse, tile, beta, issue: Issue, decay=None):
     """`inverse (tile beta [decay])`, the scaled operand rounded to `tile`'s dtype before the product:
-    'apply_u' on the values, 'apply_w' on the keys under their decay `exp2(g)`."""
-    scaled = tile * beta[:, None] if decay is None else tile * beta[:, None] * decay[:, None]
+    'apply_u' on the values, 'apply_w' on the keys under their decay `exp2(g)` (`[C, 1]` a head's, `[C,
+    BK]` a key dimension's)."""
+    scaled = tile * beta[:, None] if decay is None else tile * beta[:, None] * decay
     return issue(name, inverse, scaled.astype(tile.dtype))
 
 
@@ -388,3 +396,45 @@ def chunk_output(queries: Load, entered: Load, keys: Load, columns: int, gate, l
     index = jnp.arange(gate.shape[0])
     scores = jnp.where(index[:, None] >= index[None, :], scores, 0.0)
     return out * scale + issue("local", scores.astype(value.dtype), value) * scale
+
+
+def key_decayed_row(query, weighted_key, gate, low, earlier: Load, place, chunk: int, scale: float):
+    """One token's rows of a chunk's scores and keys' products under a decay a key dimension, `[R, C]`
+    each for its `R` value heads, fp32: `Aqk_j = scale sum_k q_k k_jk exp2(g_k - g_jk)` for `j <= place`
+    and `Akk_j = sum_k (beta k)_k k_jk exp2(g_k - g_jk)` for `j < place`, every pair's exponent its own over
+    both prefix halves (`gate`, `low`). `earlier(j)` reads the chunk's `j`-th token's prefix halves and
+    key, fp32."""
+    index = jnp.arange(chunk)
+
+    def column(j, sums):
+        gate_j, low_j, key_j = earlier(j)
+        gated = key_j * jnp.exp2((gate - gate_j) + (low - low_j))
+        here = (index == j)[None, :]
+        return (jnp.where(here, (jnp.sum(query * gated, axis=1) * scale)[:, None], sums[0]),
+                jnp.where(here & (j < place), jnp.sum(weighted_key * gated, axis=1)[:, None], sums[1]))
+
+    empty = jnp.zeros((query.shape[0], chunk), jnp.float32)
+    return jax.lax.fori_loop(0, place + 1, column, (empty, empty))
+
+
+def key_decayed_write(key, gate, low, last, last_low):
+    """A chunk's keys gated to its end under a decay a key dimension, `k exp2(g_last - g)` over both
+    prefix halves, in the keys' arithmetic: the write the memory takes (`carried`)."""
+    return key * jnp.exp2((last - gate) + (last_low - low))
+
+
+def key_decayed_output(queries: Load, gates: Load, entered: Load, columns: int, scores, value, scale: float,
+                       issue: Issue):
+    """A chunk's output `[C, BV]`, fp32, a decay a key dimension: `scale (q exp2(g))_narrow S +
+    tril(Aqk) v`, each key block's gated queries `queries(c) exp2(gates(c))` rounded to their dtype
+    against the memory entered `entered(c)` ('memory'), the scores `scores` (`Aqk`, scaled) rounded to the
+    values' dtype ('local')."""
+    out = jnp.zeros((scores.shape[0], value.shape[-1]), jnp.float32)
+    for c in range(columns):
+        query = queries(c)
+        gated = (query * jnp.exp2(gates(c))).astype(query.dtype)
+        out = out + issue("memory", gated, entered(c).astype(gated.dtype))
+    out = out * scale
+    index = jnp.arange(scores.shape[0])
+    local = jnp.where(index[:, None] >= index[None, :], scores, 0.0).astype(value.dtype)
+    return out + issue("local", local, value)

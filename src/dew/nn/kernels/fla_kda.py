@@ -34,7 +34,7 @@ import jax.numpy as jnp
 from jax.ad_checkpoint import checkpoint_name
 from jax.experimental import pallas as pl
 
-from dew.nn.kernels import fla_gdn, recurrence
+from dew.nn.kernels import fla_gdn, recurrence, recurrence_algebra as algebra
 from dew.nn.kernels.chunked_launch import (
     _CHUNK,
     Sequences,
@@ -55,7 +55,7 @@ from dew.nn.kernels.chunked_launch import (
     sequences,
     write_rows,
 )
-from dew.nn.kernels.fla_gdn import _dot, _tril_inverse, _weighted_values
+from dew.nn.kernels.fla_gdn import _dot, _issuer, _weighted_values
 
 SUB = 16
 """fla's BC: the sub-chunk the intra-chunk kernels build their 16 x 16 blocks over."""
@@ -89,21 +89,14 @@ def _intra_rows_kernel(chunk_ref, q_ref, k_ref, g_ref, gl_ref, beta_ref, aqk_ref
     @pl.when(place < taken)
     def _():
         token = start + place
-        index = jnp.arange(chunk)
         query = q_ref[token].astype(jnp.float32)
         weighted = k_ref[token].astype(jnp.float32) * beta_ref[token].astype(jnp.float32)[:, None]
-        gate, low = _row(g_ref, token), _row(gl_ref, token)
 
-        def column(j, sums):
-            earlier = start + j
-            decay = jnp.exp2((gate - _row(g_ref, earlier)) + (low - _row(gl_ref, earlier)))
-            gated = k_ref[earlier].astype(jnp.float32) * decay
-            here = (index == j)[None, :]
-            return (jnp.where(here, (jnp.sum(query * gated, axis=1) * scale)[:, None], sums[0]),
-                    jnp.where(here & (j < place), jnp.sum(weighted * gated, axis=1)[:, None], sums[1]))
+        def earlier(j):
+            return _row(g_ref, start + j), _row(gl_ref, start + j), k_ref[start + j].astype(jnp.float32)
 
-        empty = jnp.zeros((query.shape[0], chunk), jnp.float32)
-        qk, kk = jax.lax.fori_loop(0, place + 1, column, (empty, empty))
+        qk, kk = algebra.key_decayed_row(query, weighted, _row(g_ref, token), _row(gl_ref, token), earlier,
+                                         place, chunk, scale)
         aqk_ref[token] = qk.astype(aqk_ref.dtype)
         akk_ref[token] = kk
 
@@ -179,7 +172,6 @@ def _intra_solve_kernel(chunk_ref, aqkd_ref, akkd_ref, aqk_ref, akk_ref, *, chun
     @pl.when(taken > 0)
     def _():
         count = chunk // SUB
-        index = jnp.arange(SUB)
         zero = jnp.zeros((SUB, SUB), jnp.float32)
 
         def part(ref, i, j):
@@ -193,17 +185,7 @@ def _intra_solve_kernel(chunk_ref, aqkd_ref, akkd_ref, aqk_ref, akk_ref, *, chun
             for j in range(count):
                 store(aqk_ref, i, j, part(aqkd_ref, i, j) if j <= i else zero)
         kks = {(i, j): part(akkd_ref, i, j) for i in range(count) for j in range(i + 1)}
-        inverse = {(i, i): _tril_inverse(kks[i, i], index) for i in range(count)}
-        for distance in range(1, count):
-            for i in range(distance, count):
-                j = i - distance
-                if distance == 1:
-                    inverse[i, j] = -_dot(_dot(inverse[i, i], kks[i, j], exact=exact, solve=solve),
-                                          inverse[j, j], exact=exact, solve=solve)
-                else:
-                    inner = sum(_dot(kks[i, m], inverse[m, j], exact=exact, solve=solve)
-                                for m in range(j, i))
-                    inverse[i, j] = -_dot(inverse[i, i], inner, exact=exact, solve=solve)
+        inverse = algebra.inverted(kks, _issuer(exact, solve))
         for i in range(count):
             for j in range(count):
                 store(akk_ref, i, j, inverse[i, j] if j <= i else zero)
@@ -283,14 +265,14 @@ def _w_u_kernel(chunk_ref, k_ref, v_ref, beta_ref, a_ref, g_ref, gl_ref, *refs, 
             columns = pl.ds(block * bk, bk)
             key = read(k_ref, columns)
             gate = _gates(g_ref, start, taken, chunk, 0, columns)
-            scaled = (key * beta[:, None]) * jnp.exp2(gate)
             if q_ref is not None and qg_ref is not None:
                 write(qg_ref, columns, read(q_ref, columns) * jnp.exp2(gate))
-            last = _row(g_ref, (start + taken - 1, columns))[None, :]
-            last_low = _row(gl_ref, (start + taken - 1, columns))[None, :]
-            apart = (last - gate) + (last_low - _gates(gl_ref, start, taken, chunk, 0, columns))
-            write(kg_ref, columns, key * jnp.exp2(apart))
-            write(w_ref, columns, _dot(inverse, scaled.astype(key.dtype), exact=exact))
+            write(kg_ref, columns, algebra.key_decayed_write(
+                key, gate, _gates(gl_ref, start, taken, chunk, 0, columns),
+                _row(g_ref, (start + taken - 1, columns))[None, :],
+                _row(gl_ref, (start + taken - 1, columns))[None, :]))
+            write(w_ref, columns,
+                  algebra.weighted("apply_w", inverse, key, beta, _issuer(exact), jnp.exp2(gate)))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -364,17 +346,14 @@ def _o_kernel(chunk_ref, q_ref, v_ref, g_ref, h_ref, a_ref, o_ref, *, chunk: int
         def read(ref, *rest):
             return read_rows(_rows(ref, start, chunk, *rest), taken)
 
-        out = jnp.zeros((chunk, v_ref.shape[-1]), jnp.float32)
-        for block in range(q_ref.shape[-1] // bk):
-            columns = pl.ds(block * bk, bk)
-            query = read(q_ref, columns)
-            gated = (query * jnp.exp2(_gates(g_ref, start, taken, chunk, 0, columns))).astype(query.dtype)
-            out = out + _dot(gated, h_ref[entered, columns, :].astype(gated.dtype), exact=exact, ieee=True)
-        out = out * scale
-        index = jnp.arange(chunk)
-        value = read(v_ref)
-        scores = jnp.where(index[:, None] >= index[None, :], read(a_ref), 0.0).astype(value.dtype)
-        write_rows(_rows(o_ref, start, chunk), taken, out + _dot(scores, value, exact=exact, ieee=True))
+        def columns(c):
+            return pl.ds(c * bk, bk)
+
+        out = algebra.key_decayed_output(lambda c: read(q_ref, columns(c)),
+                                         lambda c: _gates(g_ref, start, taken, chunk, 0, columns(c)),
+                                         lambda c: h_ref[entered, columns(c), :], q_ref.shape[-1] // bk,
+                                         read(a_ref), read(v_ref), scale, _issuer(exact))
+        write_rows(_rows(o_ref, start, chunk), taken, out)
 
 
 @dataclasses.dataclass(frozen=True)

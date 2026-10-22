@@ -90,7 +90,7 @@ def _weighted_program(start, count, k, v, beta, a, g, *, chunk: int, bk: int, bv
                                           beta, ISSUE) for c in range(0, v.shape[-1], bv)], 1)
     decay = jnp.exp2(_gates(g, start, chunk, count))
     w = jnp.concatenate([algebra.weighted("apply_w", inverse, _rows(k[:, c:c + bk], start, chunk, count),
-                                          beta, ISSUE, decay) for c in range(0, k.shape[-1], bk)], 1)
+                                          beta, ISSUE, decay[:, None]) for c in range(0, k.shape[-1], bk)], 1)
     return w, u
 
 

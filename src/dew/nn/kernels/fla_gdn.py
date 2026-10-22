@@ -141,9 +141,6 @@ def _issuer(exact: bool, solve: jnp.dtype | None = None, *, ieee: bool | None = 
     return issue
 
 
-_tril_inverse = algebra.tril_inverse
-
-
 def _kkt_solve_kernel(chunk_ref, k_ref, g_ref, gl_ref, beta_ref, a_ref, *, chunk: int, aligned: bool,
                       sub: int, bk: int, exact: bool):
     """fla's `chunk_gated_delta_rule_fwd_kkt_solve_kernel` (fla/ops/gated_delta_rule/chunk_fwd.py:40-
@@ -251,7 +248,8 @@ def _w_u_kernel(chunk_ref, k_ref, v_ref, beta_ref, a_ref, g_ref, w_ref, u_ref, *
         decay = jnp.exp2(_gates(g_ref, start, taken, chunk))
         for block in range(k_ref.shape[-1] // bk):
             columns = pl.ds(block * bk, bk)
-            product = algebra.weighted("apply_w", inverse, read(k_ref, columns), beta, _issuer(exact), decay)
+            product = algebra.weighted("apply_w", inverse, read(k_ref, columns), beta, _issuer(exact),
+                                       decay[:, None])
             write_rows(_rows(w_ref, start, chunk, columns), taken, product)
 
 
