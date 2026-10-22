@@ -3,6 +3,9 @@ the short conv's kernels at their training shapes, compiles for its GPU within t
 memory, and the port's dots refuse mixed dtypes. None runs a kernel, so the GPU tier, whose kernel tests
 are the verdict, runs none of them: the file carries no `kernel` mark."""
 
+import tempfile
+from pathlib import Path
+
 import fla_gdn_support as support
 import jax
 import jax.numpy as jnp
@@ -26,15 +29,15 @@ def test_the_compiled_shapes_reach_the_widest_keys_and_values_the_port_takes():
 
 
 @pytest.mark.parametrize("target, wide", [("sm80", True), ("sm90", True), ("sm86", False), ("sm89", False),
-                                          ("sm120", False), ("sm100", False), ("cpu", True)])
+                                          ("sm120", False), ("sm100", True), ("sm103", False), ("cpu", True)])
 def test_a_gpu_takes_an_a100s_picks_where_its_block_holds_as_much_shared_memory(target, wide):
     """An A100's picks on every GPU whose block holds as much shared memory, the 99 KB ones elsewhere,
-    on a GPU the targets do not list (sm100) too, and an A100's where a CPU interprets."""
+    on a GPU the targets do not list (sm103) too, and an A100's where a CPU interprets."""
     with generation.assumed(target):
         assert chunked_launch._wide() is wide
 
 
-@pytest.mark.parametrize("target", [*generation.TARGETS, "sm100", "cpu"])
+@pytest.mark.parametrize("target", [*generation.TARGETS, "sm103", "cpu"])
 def test_each_targets_space_holds_its_picks(target):
     """On every target `generation.TARGETS` lists, a GPU it does not and a CPU, every kernel's 16-bit
     space at the target's width holds its unmeasured pick, Kimi delta attention's own kernels' too, and
@@ -195,8 +198,9 @@ def test_the_cooperative_grouped_matmul_compiles_for_hopper_within_its_resources
     def case(tiles):
         def call():
             def gmm(lhs, rhs, sizes):
+                hopper = generation.gpu_target("sm90")
                 return mosaic_gpu.gmm(lhs, rhs, sizes, tiles=tiles, transpose_rhs=False,
-                                      out_dtype=jnp.bfloat16, multiprocessors=132)
+                                      out_dtype=jnp.bfloat16, multiprocessors=hopper.multiprocessors)
 
             return gmm, (jax.ShapeDtypeStruct((1024, 512), jnp.bfloat16),
                          jax.ShapeDtypeStruct((4, 512, 1024), jnp.bfloat16),
@@ -213,13 +217,19 @@ def test_the_cooperative_grouped_matmul_compiles_for_hopper_within_its_resources
 def test_the_resource_gate_refuses_a_spilling_mosaic_kernel():
     """A record the gate reads (`mosaic_failures`): a kernel past its shared memory, its tensor memory or
     spilling fails; within all three, none."""
-    from kernel_compile import TMEM_COLUMNS, mosaic_failures
+    from kernel_compile import mosaic_failures, mosaic_kernels
 
-    within = {"kernel": "k", "shared": 1024, "tmem": 256, "registers": 168, "spilled": 0}
-    record = {"name": "case", "limit": 2048, "kernels": [within]}
+    within = {"kernel": "k", "unread": [], "shared": 1024, "tmem": 256, "registers": 168, "spilled": 0}
+    record = {"name": "case", "limit": 2048, "tmem_limit": 512, "kernels": [within]}
     assert not mosaic_failures([record])
-    for past in ({"shared": 4096}, {"tmem": TMEM_COLUMNS + 1}, {"spilled": 40}):
+    for past in ({"shared": 4096}, {"tmem": 513}, {"spilled": 40}):
         assert mosaic_failures([{**record, "kernels": [{**within, **past}]}])
+    # A report without its ptxas log, or without a field, is read as missing, not as within.
+    with tempfile.TemporaryDirectory() as directory:
+        Path(directory, "k.resources.txt").write_text("smem_scratch_bytes=1024")
+        [kernel] = mosaic_kernels(directory)
+        assert set(kernel["unread"]) == {"tensor memory columns", "registers", "spills"}
+        assert mosaic_failures([{**record, "kernels": [kernel]}])
 
 
 def test_splash_compiles_for_a_v5e_with_libtpu():
