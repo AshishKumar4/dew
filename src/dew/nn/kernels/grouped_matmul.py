@@ -759,9 +759,10 @@ class MosaicTgmm(_Mosaic):
 
     def space(self, ba) -> tuple[mosaic_gpu.Tiles, ...]:
         depth, width = ba.arguments['tokens'].shape[1], ba.arguments['cotangent'].shape[1]
-        # A pair takes two depth tiles of one group.
+        # No pair: the streamed cooperative tile ran 1.06-1.23x faster than the paired tiles' kernel, which
+        # never beat it by more than 2% (OVERLAP-h100, GMMCOOP-h100).
         return tuple(tile for tile in _modelled(ba)
-                     if depth % (tile.block_m * tile.cluster) == 0 and width % tile.block_n == 0)
+                     if tile.cluster == 1 and depth % tile.block_m == 0 and width % tile.block_n == 0)
 
     def fitting(self, ba, target) -> tuple[mosaic_gpu.Tiles, ...]:
         """The tiles that fit `target` (`Template.fitting`), with `exact_sums` those whose two fp32
@@ -786,7 +787,7 @@ class MosaicTgmm(_Mosaic):
         size, out = jnp.dtype(tokens.dtype).itemsize, jnp.dtype(ba.arguments['out_dtype']).itemsize
         blocks = depth // config.block_m, width // config.block_n
         # A group's rows are read once a band of column tiles, its cotangent once for the row tiles in
-        # flight (a pair's multicast saves the L2's reads, not the device's).
+        # flight.
         bands = math.ceil(blocks[1] / config.grid_block_n)
         in_flight = self._in_flight(config, target)
         hooks = ba.arguments['hooks']
