@@ -125,6 +125,38 @@ def with_gradients(fn):
     return run
 
 
+def torch_with_gradients(fn):
+    """`with_gradients` for a torch arm: `fn(*tensors)` as `run(*inputs, cotangent)`, which returns
+    `fn`'s output and the gradients of its inputs under the cotangent passed last, as NumPy arrays. Each
+    floating input enters as a tensor of its own dtype that requires a gradient, and the cotangent
+    (an array, or a tuple or dict of them matching the output) is cast to its output's dtype, as
+    `jax.vjp` casts it. A module's parameters are inputs too, called through
+    `torch.func.functional_call`. An input the output does not reach has a zero gradient."""
+    def run(*arguments):
+        import torch
+
+        def tensor(value):
+            value = torch.from_numpy(np.ascontiguousarray(value))
+            return value.requires_grad_() if value.is_floating_point() else value
+
+        inputs = jax.tree.map(tensor, arguments[:-1])
+        out = fn(*inputs)
+        leaves, cotangents = jax.tree.leaves(out), jax.tree.leaves(arguments[-1])
+        if len(leaves) != len(cotangents):
+            raise ValueError(f"{len(cotangents)} cotangents for {len(leaves)} outputs")
+        wanted = [leaf for leaf in jax.tree.leaves(inputs) if leaf.requires_grad]
+        pulled = torch.autograd.grad(
+            leaves, wanted, grad_outputs=[torch.from_numpy(np.ascontiguousarray(c)).to(leaf.dtype)
+                                          for leaf, c in zip(leaves, cotangents, strict=True)],
+            allow_unused=True)
+        gradients = iter(torch.zeros_like(leaf).numpy() if grad is None else grad.detach().numpy()
+                         for leaf, grad in zip(wanted, pulled, strict=True))
+        found = jax.tree.map(lambda leaf: next(gradients) if leaf.requires_grad else None, inputs)
+        return jax.tree.map(lambda leaf: leaf.detach().numpy(), out), *found
+
+    return run
+
+
 def equations(graph):
     """Every equation of a jaxpr, its sub-jaxprs' (scan, cond, custom rules) in turn."""
     if hasattr(graph, "eqns"):
