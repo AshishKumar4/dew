@@ -1535,3 +1535,39 @@ def test_a_module_rebound_for_every_caller_is_reported_outside_the_suite(tmp_pat
     })
     assert found == [*[("src/sparx/graph.py", line, "SLOP012") for line in (8, 9, 20, 27)],
                      *[("tools/bench.py", line, "SLOP012") for line in (5, 6, 7, 8, 8, 9, 10, 16)]]
+
+
+# ---------------------------------------------------------------------------
+# tools/benchmark_data.py
+# ---------------------------------------------------------------------------
+
+def test_the_data_benchmark_counts_a_grain_packing_and_dews_alike_as_the_objective_counts_them():
+    """The data benchmark counts a batch's tokens as the run's objective counts them (`real_lengths`),
+    whichever packer laid the batch out: Grain's first-fit windows, their documents named by segment
+    ids, and Dew's of the same documents, named by their coordinates, hold the same real tokens."""
+    import grain.experimental as gx
+    import grain.python as grain
+
+    from dew.data.compile import compile
+    from dew.data.dataset import DataPartition, Loading
+    from dew.data.pipeline import Pipeline
+    from dew.data.sources.memory import Memory
+
+    tool = load("benchmark_data")
+    worker = tool.Worker("dew", "text", Path("in"), Path("out"), tool.Measurement(seq_len=8))
+    objective = tool.objective_for(worker)
+    documents = [{"text": np.arange(1, size + 1, dtype=np.int32)} for size in (3, 5, 2, 4, 6)]
+    rows = grain.MapDataset.source(documents).to_iter_dataset()
+    native = list(gx.FirstFitPackIterDataset(rows, length_struct={"text": 9}, num_packing_bins=2,
+                                             shuffle_bins=False))
+    stacked = {name: np.stack([window[name] for window in native]) for name in ("text", "text_segment_ids")}
+    loader = compile(Pipeline(Memory(documents)).pack(9, bins=2).batch(len(native)), read="memory",
+                     loading=Loading(workers=0, threads=1, read_buffer=0))
+    reader = loader.train(DataPartition())
+    try:
+        ours = next(reader)
+    finally:
+        reader.close()
+    expected = int(np.sum(objective.real_lengths(ours)))
+    counted = [tool.batch_counts(batch, objective)["tokens"] for batch in (stacked, ours)]
+    assert counted == [expected, expected]
