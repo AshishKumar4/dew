@@ -17,7 +17,16 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact, declared_seeds, indexed_recording, recording
+import reference_error as _gate
+from reference_error import declared_seeds, indexed_recording, recording
+
+
+def assert_as_exact(dew_fn, reference_fn, draw, label, *, seeds, truth_fn=None):
+    recorded = label.startswith(("p2_", "min_snr_"))
+    count = seeds if recorded else _gate.seeds_for(reference_fn, draw, label, truth_fn=truth_fn)
+    print(f"SIZED {label!r} {count}", flush=True)
+    _gate.assert_as_exact(dew_fn, reference_fn, draw, label, seeds=count, truth_fn=truth_fn)
+    print(f"PASSED {label!r}", flush=True)
 from scipy import stats
 
 import dew.diffusion.schedules as schedulers
