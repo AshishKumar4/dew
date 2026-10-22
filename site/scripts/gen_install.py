@@ -93,10 +93,11 @@ def main() -> None:
         raise SystemExit(f"gen_install: docs/installation.md's extras table lacks "
                          f"{sorted(extras - documented_extras(page))} and names "
                          f"{sorted(documented_extras(page) - extras)}, which pyproject.toml does not declare")
-    shell = [f"python_min={python}", f"package_index={index}", f"pip_least='{pip}'"]
+    shell = [f"python_min={python}", f"package_index={index}", f"pip_least='{pip}'",
+             "cuda_builds='" + " ".join(f"{build}:{driver}:{major}.{minor}"
+                                        for build, driver, (major, minor), _ in builds) + "'"]
     table = ["| Build | CUDA | NVIDIA driver | GPU (SM) |", "|---|---|---|---|"]
     for build, driver, (major, minor), cuda in builds:
-        shell.extend((f"{build}_driver={driver}", f"{build}_sm={major}.{minor}"))
         table.append(f"| `{build}` | {cuda // 1000}.{cuda % 1000 // 10} or later | {driver} or later, or an older "
                      f"one under NVIDIA's cuda-compat | {major}.{minor} or later |")
     least = [f"Dew needs Python {python} or newer."]
