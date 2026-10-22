@@ -34,7 +34,8 @@ from dew.nn.backbones.z_image import ZImageTransformer
 ROOT = Path(__file__).resolve().parents[1]
 CASES = ("padded", "exact", "deep")
 CASE_SEEDS = {"padded": 16, "exact": 16, "deep": 16}
-ROWS = 8
+ROWS = 4
+HEIGHT = 3
 BUDGET = 64
 
 
@@ -101,8 +102,11 @@ def test_the_flow_and_its_gradients_match_the_source(source, arrays, record, nam
     from tools.diffusers_wan_reference import float64
 
     model, params, layouts = load(source, name)
-    # Each draw holds the case's rows ROWS times over, so a parameter's gradient sums over more of
-    # them and one draw's error varies less (a single draw's did not resolve within 512).
+    # Each draw holds the case's rows ROWS times over and its images HEIGHT times as tall, so a
+    # parameter's gradient sums over more of them and one draw's error varies less: the first
+    # layer's norm gradients did not resolve within 512 seeds at the fixture's size. Three times
+    # the height keeps each case's padding: the padded case's 72 patches pad to 96, the exact
+    # case's 96 fill three blocks of 32, and the deep case's 45 pad to 64.
     cased = len(record["cases"][name]["lengths"])
     lengths = tuple(record["cases"][name]["lengths"]) * ROWS
     walk = z_image_walk(model, params, lengths)
@@ -112,11 +116,13 @@ def test_the_flow_and_its_gradients_match_the_source(source, arrays, record, nam
     captions = [f"caption.{row}" for row in range(len(lengths))]
     original = {key: np.concatenate([arrays[f"{name}.{key}"]] * ROWS)
                 for key in ("latents", "times", "probe")}
+    original |= {key: np.tile(original[key], (1, 1, 1, HEIGHT, 1)) for key in ("latents", "probe")}
     original |= {caption: np.array(arrays[f"{name}.caption.{row % cased}"])
                  for row, caption in enumerate(captions)}
 
     def draw(seed):
-        """The fixture's inputs, its rows ROWS times over, at seed 0, else fresh normal draws."""
+        """The fixture's inputs, its rows ROWS times over and its images tiled HEIGHT times down, at
+        seed 0, else fresh normal draws of those shapes."""
         if seed == 0:
             return (original,)
         generator = torch.Generator().manual_seed(31 + seed)
