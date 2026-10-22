@@ -52,11 +52,6 @@
    "lane": "Training",
    "by": "2026-11-20"
   },
-  "tests/test_architectures.py": {
-   "comparisons": 1,
-   "lane": "Models, Serving & RL",
-   "by": "2026-11-13"
-  },
   "tests/test_attention_masked_rows.py": {
    "comparisons": 1,
    "lane": "Kernels",
