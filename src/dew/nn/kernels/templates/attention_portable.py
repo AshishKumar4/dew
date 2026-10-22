@@ -26,6 +26,11 @@ from dew.nn.kernels.templates.attention import (
 )
 
 
+def _small(held: algebra.Room | None, value: jax.Array) -> jax.Array | None:
+    """A guarded tile's small weights' product with its values (`algebra.Room.small`), None unguarded."""
+    return None if held is None else _dot(algebra.narrow(held.small, value.dtype), value)
+
+
 def _dot(a: jax.Array, b: jax.Array) -> jax.Array:
     """`a @ b`, fp32, the template's CPU product (`interpreted_dot`)."""
     return interpreted_dot(a, b)
@@ -110,7 +115,7 @@ def forward(spec: algebra.Forward, query: jax.Array, key: jax.Array, value: jax.
         def plain(j, state: algebra.Partial) -> algebra.Partial:
             _, _, m, factor, weights, held, v_tile = softmax(j, state)
             product = _dot(algebra.narrow(weights, v_tile.dtype), v_tile)
-            return algebra.stepped(state, m, factor, weights, product, held)
+            return algebra.stepped(state, m, factor, weights, product, held, _small(held, v_tile))
 
         def step(j, carry: tuple[algebra.Partial, algebra.Argmax, jax.Array, jax.Array]):
             state, arg, own, others_total = carry
@@ -121,8 +126,8 @@ def forward(spec: algebra.Forward, query: jax.Array, key: jax.Array, value: jax.
                                                     coords.k_pos == anchor.key[:, None])
             acc, own, others_total = algebra.split_accumulate(
                 state.acc, own, others_total, factor, anchor.peak > arg.peak, value[row, arg.key, kv_head],
-                _dot(others, v_tile), others, own_tile, held)
-            stepped = algebra.stepped(state, m, factor, weights, jnp.zeros_like(acc), held)
+                _dot(others, v_tile), others, own_tile, held, small := _small(held, v_tile))
+            stepped = algebra.stepped(state, m, factor, weights, jnp.zeros_like(acc), held, small)
             return stepped._replace(acc=acc), anchor, own, others_total
 
         def begun(live) -> algebra.Partial:
@@ -294,9 +299,10 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
                 columns, seen, params, k_tile, v_tile = tile(j)
                 logits, _ = _logits(score_mod, q, k_tile, seen, q_pos, columns[None, :], params, factor)
                 at_anchor = columns[None, :] == chosen[:, None]
-                exponentials, rest, own = algebra.off_anchor_weights(logits, maxima, at_anchor, v_tile.dtype,
-                                                                     shifts, how)
-                return algebra.off_anchor(state, exponentials, rest, own, _dot(rest, v_tile), shifts)
+                exponentials, rest, own, small = algebra.off_anchor_weights(logits, maxima, at_anchor,
+                                                                            v_tile.dtype, shifts, how)
+                return algebra.off_anchor(state, exponentials, rest, own, _dot(rest, v_tile), shifts, small,
+                                          _dot(small, v_tile))
 
             walked = jax.lax.fori_loop(lo, hi, row_terms, before)
             prior = algebra.power2(walked.total, shifts)

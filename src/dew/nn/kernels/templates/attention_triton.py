@@ -219,7 +219,7 @@ def _forward_kernel(*refs, spec: algebra.Forward, score_kinds: tuple[Kind, ...],
     def step(index, state: algebra.Partial) -> algebra.Partial:
         _, _, _, m, factor, weights, value, held = softmax(index, state)
         product = _dot(algebra.narrow(weights, value.dtype), value, interpret)
-        return algebra.stepped(state, m, factor, weights, product, held)
+        return algebra.stepped(state, m, factor, weights, product, held, _small(held, value, interpret))
 
     def tracked(index, carry: tuple[algebra.Partial, algebra.Argmax, jax.Array, jax.Array]):
         # A training forward's step: the anchor key and the split sums the backward reads
@@ -233,8 +233,8 @@ def _forward_kernel(*refs, spec: algebra.Forward, score_kinds: tuple[Kind, ...],
         product = _dot(others, value, interpret)
         acc, own, others_total = algebra.split_accumulate(state.acc, own, others_total, factor, moved,
                                                           value_ref[arg.key, :], product, others, own_tile,
-                                                          held)
-        stepped = algebra.stepped(state, m, factor, weights, jnp.zeros_like(acc), held)
+                                                          held, small := _small(held, value, interpret))
+        stepped = algebra.stepped(state, m, factor, weights, jnp.zeros_like(acc), held, small)
         return stepped._replace(acc=acc), anchor, own, others_total
 
     def start(live) -> algebra.Partial:
@@ -276,6 +276,11 @@ def _forward_kernel(*refs, spec: algebra.Forward, score_kinds: tuple[Kind, ...],
         # Only a program one of whose rows overflowed walks again: each of those rows shifts as it needs,
         # every other row's bits the plain walk's (`algebra.room`).
         written(walk(live))
+
+
+def _small(held: algebra.Room | None, value: jax.Array, interpret: bool) -> jax.Array | None:
+    """A guarded tile's small weights' product with its values (`algebra.Room.small`), None unguarded."""
+    return None if held is None else _dot(algebra.narrow(held.small, value.dtype), value, interpret)
 
 
 def _weighted(value_ref, carry) -> jax.Array:
@@ -591,9 +596,11 @@ def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tu
         logits, _ = _tile_logits(score_mod, query, key_ref[keys, :], seen, q_pos, k_pos, params,
                                  scale=scale if how.factor is None else 1.0, interpret=interpret)
         value = value_ref[keys, :]
-        exponentials, rest, own = algebra.off_anchor_weights(logits, maximum, k_pos == key_index[:, None],
-                                                             value.dtype, shift, how)
-        return algebra.off_anchor(state, exponentials, rest, own, _dot(rest, value, interpret), shift)
+        exponentials, rest, own, small = algebra.off_anchor_weights(logits, maximum,
+                                                                    k_pos == key_index[:, None], value.dtype,
+                                                                    shift, how)
+        return algebra.off_anchor(state, exponentials, rest, own, _dot(rest, value, interpret), shift, small,
+                                  _dot(small, value, interpret))
 
     # From the softmax's initial state (`gradients`): its maximum, denominator and share of D's numerator.
     key_index = index_ref[...]

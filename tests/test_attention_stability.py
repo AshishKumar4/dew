@@ -111,6 +111,36 @@ def _ties(width: int, cotangent: float) -> Callable[[int], tuple]:
     return draw
 
 
+def _edge_weight(dtype, rows=128) -> Family:
+    # Two keys a row seen of 256: logits 0 and a drawn -80 to -87, so the second's weight is a normal fp32
+    # and bf16 at their exponent's edge, on a value of 2^e, e drawn in [120, 126]: its share of the
+    # output, which a weight shifted before it is narrowed would flush (the headroom's `Room.small`).
+    def draw(seed):
+        key = np.zeros((rows, 256, 1, 16), np.float32)
+        key[:, 1, 0, 0] = -_uniform(seed, 80.0, 87.0, (rows,))
+        value = np.zeros((rows, 256, 1, 16), np.float32)
+        value[:, 1, 0, 0] = 2.0 ** np.floor(_uniform(seed + 1, 120.0, 127.0, (rows,)))
+        value[:, :2, 0, 1:] = _uniform(seed + 3, -1.0, 1.0, (rows, 2, 15))
+        (dout,) = _normal(seed + 2, (rows, 1, 1, 16))
+        query = _first(np.full((rows, 1), 4.0, np.float32), 16)
+        return query, key, value, None, dout * np.float32(2.0 ** -4)
+    seen = np.zeros((rows, 1, 1, 256), bool)
+    seen[..., :2] = True
+    return Family(draw, seen, {"lengths": np.full(rows, 2)}, dtype=dtype)
+
+def _mixed_columns(seed: int, rows: int = 128):
+    # One query a row over four keys of logit 0 whose values near fp32's largest in the first column
+    # overflow its sum, and a fifth of logit -85 whose value 1e30 sits alone in the second column: the
+    # guarded walk shifts the row, and the second column's share, about 1e-7, must survive it.
+    key = np.zeros((rows, 5, 1, 16), np.float32)
+    key[:, 4, 0, 0] = -_uniform(seed, 80.0, 86.0, (rows,))
+    value = np.zeros((rows, 5, 1, 16), np.float32)
+    value[:, :4, 0, 0] = _uniform(seed + 1, 2.5e38, 3.4e38, (rows, 4))
+    value[:, 4, 0, 1] = _uniform(seed + 2, 5e29, 1e30, (rows,))
+    (dout,) = _normal(seed + 3, (rows, 1, 1, 16))
+    return _first(np.full((rows, 1), 4.0, np.float32), 16), key, value, None, dout * np.float32(2.0 ** -8)
+
+
 def _families() -> dict[str, Family]:
     def kept(queries: int, keys: int) -> np.ndarray:
         return np.ones((ROWS, 1, queries, keys), bool)
@@ -221,6 +251,11 @@ def _families() -> dict[str, Family]:
         "a small weight on a large value, float32": dataclasses.replace(small_weight("float32"),
                                                                         folded=False),
         "a small weight on a large value, bfloat16": small_weight("bfloat16"),
+        "a weight at the exponent's edge on a large value, float32": _edge_weight("float32"),
+        "a weight at the exponent's edge on a large value, bfloat16": _edge_weight("bfloat16"),
+        # The headroom is the accurate form's: the fold's sum of those values overflows.
+        "a small column beside an overflowing one": Family(_mixed_columns, np.ones((128, 1, 1, 5), bool),
+                                                           folded=False),
     }
     lengths = np.tile([4, 0], ROWS // 2)
     empty = np.broadcast_to((lengths > 0)[:, None, None, None], (ROWS, 1, 4, 4))

@@ -177,9 +177,11 @@ def _attend(query: jax.Array, span: tuple, read, block: int, spec: algebra.Forwa
             start = algebra.headroomed(start, live)
         return jax.lax.fori_loop(*steps, body, start)
 
+    if not spec.headroom:
+        return walk()
     # A slice's state carries a bound on its values (`algebra.headroomed`), so a merge of slices each
     # finite but whose join overflows shifts as it needs (`algebra.merge`).
-    return algebra.headroomed(algebra.guarded(walk, walk) if spec.headroom else walk())
+    return algebra.headroomed(algebra.guarded(walk, walk))
 
 
 def _slice(span: tuple, block: int, split, splits: int) -> tuple:
@@ -199,9 +201,9 @@ def _write(out_refs, spec: algebra.Forward, state: algebra.Partial):
         out = algebra.finish(spec, state, initial=True)[0]
         out_refs[0][...] = out.astype(out_refs[0].dtype)
     else:
-        # The state's sums, maxima, totals, shifts and bounds; which rows shifted is the merge's own to
-        # find again (`algebra.merge`).
-        for ref, value in zip(out_refs, state[:5], strict=True):
+        # The state's sums, maxima and totals, with its shifts and bounds under headroom; which rows
+        # shifted is the merge's own to find again (`algebra.merge`).
+        for ref, value in zip(out_refs, state[:len(out_refs)], strict=True):
             ref[...] = value
 
 
@@ -253,15 +255,16 @@ def _combined(spec: algebra.Forward, *parts, axis: int):
                           initial=True)[0]
 
 
-def _outputs(shape: tuple[int, ...], dtype, splits: int, at: int, spec, specs):
+def _outputs(shape: tuple[int, ...], dtype, splits: int, at: int, spec, summed, reduced, *, headroom: bool):
     """The launch's outputs and their blocks: the output `shape` in `dtype` for one slice, else the
-    slices' fp32 states (`algebra.Partial`: sums, maxima, totals, shifts and reaches) with a slices axis
-    at `at` (`spec` and `specs` the blocks)."""
+    slices' fp32 states (`algebra.Partial`: sums, maxima and totals, with shifts and reaches under
+    headroom) with a slices axis at `at` (`spec`, `summed` and `reduced` the blocks)."""
     if splits == 1:
         return jax.ShapeDtypeStruct(shape, dtype), spec
     split = (*shape[:at], splits, *shape[at:])
-    rows = jax.ShapeDtypeStruct(split[:-1], jnp.float32)
-    return [jax.ShapeDtypeStruct(split, jnp.float32), rows, rows, rows, rows], specs
+    rows = 4 if headroom else 2
+    reduced_shape = jax.ShapeDtypeStruct(split[:-1], jnp.float32)
+    return [jax.ShapeDtypeStruct(split, jnp.float32), *[reduced_shape] * rows], [summed, *[reduced] * rows]
 
 
 def _space(programs: int, steps: int, processors: int | None) -> set[Split]:
@@ -316,9 +319,9 @@ class DecodeAttention(tuning.KernelOp):
         summed = pl.BlockSpec((None, None, QUERIES, None, width),
                               lambda row, head, split: (row, split, 0, head, 0))
         reduced = pl.BlockSpec((None, None, QUERIES, None), lambda row, head, split: (row, split, 0, head))
-        out_shape, out_specs = _outputs(query.shape, query.dtype, splits, 1, queried,
-                                        [summed, *[reduced] * 4])
         spec = _spec(1 / math.sqrt(width), softcap, natural, value.dtype, key.shape[1], sinks is not None)
+        out_shape, out_specs = _outputs(query.shape, query.dtype, splits, 1, queried, summed, reduced,
+                                        headroom=spec.headroom)
         out = pl.pallas_call(
             lambda *refs: _kernel(*refs, spec=spec, splits=splits, interpret=interpret,
                                   sinks=sinks is not None),
@@ -375,10 +378,10 @@ class PagedDecodeAttention(tuning.KernelOp):
                               lambda row, head, split: (row, head, split, 0, 0))
         reduced = pl.BlockSpec((None, None, None, QUERIES), lambda row, head, split: (row, head, split, 0))
         sunk = [] if sinks is None else [pl.BlockSpec((None, QUERIES), lambda row, head, split: (head, 0))]
-        out_shape, out_specs = _outputs(query.shape, query.dtype, splits, 2, queried,
-                                        [summed, *[reduced] * 4])
         spec = _spec(1 / math.sqrt(width), softcap, natural, value_pages.dtype, table.shape[1] * page_size,
                      sinks is not None)
+        out_shape, out_specs = _outputs(query.shape, query.dtype, splits, 2, queried, summed, reduced,
+                                        headroom=spec.headroom)
         out = pl.pallas_call(
             lambda *refs: _paged_kernel(*refs, pages=pages, spec=spec, splits=splits, interpret=interpret,
                                         sinks=sinks is not None),
