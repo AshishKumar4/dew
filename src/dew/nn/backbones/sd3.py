@@ -53,18 +53,19 @@ def sincos_position(channels: int, grid: int, *, base_size: int):
     The leading half of the channels encodes the column and the trailing half
     the row, each as sines then cosines over 10000^-(2i/half), with both axes
     divided by `grid / base_size`. This only initializes the buffer; a loaded
-    checkpoint brings its stored buffer.
+    checkpoint brings its stored buffer. Diffusers builds it as here: the steps in float32, the
+    frequencies and the sinusoids in float64, rounded once to float32.
     """
-    steps = jnp.arange(grid, dtype=jnp.float32) / (grid / base_size)
-    columns, rows = jnp.meshgrid(steps, steps, indexing="xy")  # width goes first
-    # The reference's `1 / 10000 ** (i / (half / 2))` over half the channels an axis, rounded once
-    # from float64 (an odd half divides by a half-integer, as the reference does).
-    omega = jnp.asarray(inverse_frequencies(10000.0, channels // 2, channels // 4, dtype=np.float32))
+    steps = np.arange(grid, dtype=np.float32) / np.float32(grid / base_size)
+    columns, rows = np.meshgrid(steps, steps, indexing="xy")  # width goes first
+    # `1 / 10000 ** (i / (half / 2))` over half the channels an axis (an odd half divides by a
+    # half-integer, as the reference does).
+    omega = inverse_frequencies(10000.0, channels // 2, channels // 4, dtype=np.float64)
 
     def axis(values):
-        return sinusoids(values.reshape(-1)[:, None] * omega[None, :])
+        return sinusoids(values.reshape(-1).astype(np.float64)[:, None] * omega[None, :], xp=np)
 
-    return jnp.concatenate([axis(columns), axis(rows)], axis=1)[None]
+    return jnp.asarray(np.concatenate([axis(columns), axis(rows)], axis=1)[None].astype(np.float32))
 
 
 @logical_axes({("context_embedder",): (None, "embed"), ("proj_out",): ("embed", None),

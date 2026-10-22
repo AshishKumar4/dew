@@ -25,19 +25,21 @@ curve, or in a zigzag."""
 
 
 def build_2d_sincos_pos_embed(emb_dim: int, H_P: int, W_P: int) -> np.ndarray:
-    """Fixed MAE-style 2D sin-cos positional embedding, row-major [H_P * W_P, emb_dim].
+    """Fixed MAE-style 2D sin-cos positional embedding, row-major [H_P * W_P, emb_dim], in float32.
     Half the channels encode the row, half the column. For another scan order,
     index the result by that order's permutation.
+
+    Each axis is MAE's `get_1d_sincos_pos_embed_from_grid`, which computes in float64: so is it here,
+    rounded once to float32.
     """
     assert emb_dim % 4 == 0, f"emb_dim must be divisible by 4 for 2D sincos, got {emb_dim}"
     quarter = emb_dim // 4
-    # MAE's `1 / 10000 ** (i / quarter)`, rounded once from float64.
-    omega = inverse_frequencies(10000.0, 2 * quarter, quarter, dtype=np.float32)
-    rows = sinusoids(np.arange(H_P, dtype=np.float32)[:, None] * omega, xp=np)
-    cols = sinusoids(np.arange(W_P, dtype=np.float32)[:, None] * omega, xp=np)
+    omega = inverse_frequencies(10000.0, 2 * quarter, quarter, dtype=np.float64)
+    rows = sinusoids(np.arange(H_P, dtype=np.float64)[:, None] * omega, xp=np)
+    cols = sinusoids(np.arange(W_P, dtype=np.float64)[:, None] * omega, xp=np)
     pos = np.concatenate([np.broadcast_to(rows[:, None], (H_P, W_P, 2 * quarter)),
                           np.broadcast_to(cols[None, :], (H_P, W_P, 2 * quarter))], axis=-1)
-    return pos.reshape(H_P * W_P, emb_dim)
+    return pos.reshape(H_P * W_P, emb_dim).astype(np.float32)
 
 
 def _d2xy(n: int, d: int) -> tuple[int, int]:
