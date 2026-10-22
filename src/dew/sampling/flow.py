@@ -105,14 +105,15 @@ def flow_transition(x: ArrayLike, velocity: ArrayLike, sigma: ArrayLike,
     A rectified flow's noise rate is its own physical time, which is what
     `FlowSDE` reads off the schedule and hands over here. x and velocity are
     [batch, ...]; rates are scalars or [batch]. All density arithmetic is
-    float32, or x's and velocity's dtype where it is wider. Variance is
+    float32, or x's dtype where it is wider, a sampler's state carrying one
+    dtype through its walk whatever the velocity's. Variance is
     sigma^2 times the elapsed rate. Invalid rates produce non-finite
     transitions. At zero noise or zero elapsed rate the result is
     deterministic.
     """
     if not math.isfinite(noise_level) or noise_level < 0:
         raise ValueError("noise_level must be finite and non-negative")
-    dtype = at_least_fp32(jnp.result_type(x, velocity))
+    dtype = at_least_fp32(jnp.result_type(x))
     x = jnp.asarray(x, dtype)
     velocity = jnp.asarray(velocity, dtype)
     if x.ndim < 2 or velocity.shape != x.shape:
@@ -194,7 +195,8 @@ class FlowSDE:
         """
         if steps < 2:
             raise ValueError("a trajectory needs at least two time points")
-        x_T = jnp.asarray(x_T, jnp.float32)
+        x_T = jnp.asarray(x_T)
+        x_T = x_T.astype(at_least_fp32(x_T.dtype))
         if jax.tree.leaves(Walk.over(denoise, guidance, steps - 1).init(x_T)):
             raise ValueError("a flow trajectory's transitions are rescored one at a time, so its "
                              "guidance carries nothing between steps; APG's momentum does")
