@@ -18,7 +18,7 @@ import numpy as np
 from dew.data.dataset import Batch, Records
 from dew.data.pipeline import Record, Rejected
 from dew.data.retention import LocalRetention
-from dew.data.sources.base import Read, ShardManifest, Source, _indexed_manifest, _uncounted, url_label
+from dew.data.sources.base import Read, Shard, ShardManifest, Source, _indexed_manifest, _uncounted, url_label
 from dew.data.sources.codec import decode, fingerprint
 from dew.data.sources.index import ArrayIndex
 from dew.data.sources.records import ArrayRecords
@@ -342,12 +342,17 @@ def _source_ids(source: Source, *, streamed: bool = False,
         if shard.rows is not None:
             yield from ((shard.id, index) for index in range(shard.rows))
         else:
-            reader = iter(manifest.reader(shard))
-            try:
-                for index, _ in enumerate(reader):
-                    yield shard.id, index
-            finally:
-                reader.close()
+            yield from (row_id for row_id, _ in _shard_inputs(manifest, shard))
+
+
+def _shard_inputs(manifest: ShardManifest, shard: Shard) -> Iterator[tuple[RowId, Batch | bytes | None]]:
+    """Each row of `shard` as a stream reads it, with the id a streamed fill gives it (`_source_ids`)."""
+    reader = iter(manifest.reader(shard))
+    try:
+        for index, row in enumerate(reader):
+            yield (shard.id, index), row
+    finally:
+        reader.close()
 
 
 @dataclass(frozen=True)
