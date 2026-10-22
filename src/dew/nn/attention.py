@@ -1808,7 +1808,9 @@ def splash_attention(query, key, value, descriptor, *, softcap, sinks, segment_i
     from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_kernel
 
     kernel = splash_attention_kernel.make_splash_mha(
-        descriptor, block_sizes=splash_block_sizes(query.shape[-3], key.shape[-3]),
+        descriptor, block_sizes=splash_block_sizes(query.shape[-3], key.shape[-3], width=query.shape[-1],
+                                                   itemsize=query.dtype.itemsize,
+                                                   softcap=softcap is not None),
         head_shards=1, q_seq_shards=1, attn_logits_soft_cap=softcap, interpret=interpret)
     scale = jnp.asarray(1.0 / math.sqrt(query.shape[-1]), query.dtype)
     segments = (None if segment_ids is None
@@ -1828,7 +1830,22 @@ def splash_attention(query, key, value, descriptor, *, softcap, sinks, segment_i
     return jnp.moveaxis(attended, -3, -2)
 
 
-def splash_block_sizes(q_len: int, kv_len: int):
+def splash_backward_vmem(block_q: int, block_kv: int, width: int, itemsize: int, softcap: bool) -> int:
+    """A bound on the scoped VMEM splash's fused backward kernel plans at XLA's default limit, in bytes:
+    its fp32 logits blocks (two, three with a softcap's derivative), each `block_q` by `block_kv`; its
+    query, output-gradient, key and value blocks, each double-buffered in the operands' dtype; and its
+    key and value gradients' fp32 scratch. On a v5e at the 16 MiB default (2026-10-21, 96 configs of
+    widths 64 to 256, both dtypes, a softcap and batches 1 to 8, Dew's own path, and the TPU tier's
+    refused test) it lies past the limit on every config Mosaic refused (16.2 to 22.3 MiB), and within it
+    on all it compiled but eight, which take the next smaller block: a bf16 softcap at width 256 at
+    batches 1 and 2, an f32 softcap at width 128 (which the tier's test run refused at 18.6 MiB), and
+    f32 at width 256 at batch 1."""
+    logits = 4 * block_q * block_kv * (3 if softcap else 2)
+    blocks = 2 * itemsize * width * 2 * (block_q + block_kv)
+    return logits + blocks + 2 * 4 * width * block_kv
+
+
+def splash_block_sizes(q_len: int, kv_len: int, *, width: int, itemsize: int, softcap: bool):
     """Narrow `SPLASH_BLOCK` to a divisor of each sequence, forward and backward.
 
     The greatest common divisor divides its sequence, as the mask blocking
@@ -1836,14 +1853,23 @@ def splash_block_sizes(q_len: int, kv_len: int):
     requires. The backward runs as one kernel for dq, dk and dv, which reads
     each logits block once where separate dq and dkv kernels read it twice;
     its blocks are set because a kernel built without them raises "Need to
-    specify backward blocks." at its first gradient.
+    specify backward blocks." at its first gradient. They halve together, as
+    measured (half of `SPLASH_BLOCK` compiled on every config), while they stay
+    whole lanes, until its plan fits the target's scoped VMEM
+    (`splash_backward_vmem`, `generation.scoped_vmem`), which a kernel past it
+    fails to compile.
     """
     from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_kernel
 
     block_q, block_kv = math.gcd(SPLASH_BLOCK, q_len), math.gcd(SPLASH_BLOCK, kv_len)
+    budget = generation.scoped_vmem(generation.gpu_target())
+    back_q, back_kv = block_q, block_kv
+    while (splash_backward_vmem(back_q, back_kv, width, itemsize, softcap) > budget
+           and min(back_q, back_kv) > SPLASH_LANES):
+        back_q, back_kv = back_q // 2, back_kv // 2
     return splash_attention_kernel.BlockSizes(
         block_q=block_q, block_kv=block_kv, block_kv_compute=block_kv,
-        block_q_dkv=block_q, block_kv_dkv=block_kv, block_kv_dkv_compute=block_kv,
+        block_q_dkv=back_q, block_kv_dkv=back_kv, block_kv_dkv_compute=back_kv,
         use_fused_bwd_kernel=True)
 
 
