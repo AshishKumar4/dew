@@ -1854,18 +1854,20 @@ def splash_block_sizes(q_len: int, kv_len: int, *, width: int, itemsize: int, so
     requires. The backward runs as one kernel for dq, dk and dv, which reads
     each logits block once where separate dq and dkv kernels read it twice;
     its blocks are set because a kernel built without them raises "Need to
-    specify backward blocks." at its first gradient. They halve together, as
-    measured (half of `SPLASH_BLOCK` compiled on every config), while they stay
-    whole lanes, until its plan fits the target's scoped VMEM
-    (`splash_backward_vmem`, `generation.scoped_vmem`), which a kernel past it
-    fails to compile.
+    specify backward blocks." at its first gradient. On a TPU whose scoped
+    VMEM limit is measured (`GpuTarget.scoped_vmem`), past which a kernel fails
+    to compile, they halve together, as measured (half of `SPLASH_BLOCK`
+    compiled on every config), while they stay whole lanes, until its plan fits
+    it (`splash_backward_vmem`). Splash takes no VMEM limit of its own (its
+    kernels set none), so the limit is the target's default, which a TPU does
+    not report: where it is unmeasured the blocks stay whole.
     """
     from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_kernel
 
     block_q, block_kv = math.gcd(SPLASH_BLOCK, q_len), math.gcd(SPLASH_BLOCK, kv_len)
-    budget = generation.scoped_vmem(generation.gpu_target())
+    budget = generation.gpu_target().scoped_vmem
     back_q, back_kv = block_q, block_kv
-    while (splash_backward_vmem(back_q, back_kv, width, itemsize, softcap) > budget
+    while (budget is not None and splash_backward_vmem(back_q, back_kv, width, itemsize, softcap) > budget
            and min(back_q, back_kv) > SPLASH_LANES):
         back_q, back_kv = back_q // 2, back_kv // 2
     return splash_attention_kernel.BlockSizes(

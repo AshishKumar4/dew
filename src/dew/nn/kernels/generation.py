@@ -121,7 +121,7 @@ class GpuTarget:
     measurement states it."""
     scoped_vmem: int | None = None
     """A TPU's scoped VMEM limit in bytes at XLA's default, past which a Mosaic kernel refuses to compile
-    (`scoped_vmem`); None where no measurement states it."""
+    (`dew.nn.attention.splash_block_sizes`); None where no measurement states it."""
     int8_triton_gemm: bool = False
     """Whether XLA's Triton GEMM fusion computes int8 dots right on this GPU: on none measured, an
     A100 and an RTX PRO 6000 Blackwell, at jaxlib 0.11.2 (openxla/xla#51016;
@@ -378,17 +378,6 @@ def runtime_facts(target: GpuTarget, device) -> GpuTarget:
              **dict(_clocks(device.local_hardware_id))}
     return dataclasses.replace(target, **{name: value for name, value in facts.items() if value is not None},
                                wgmma=capability == '9.0' if capability else target.wgmma)
-
-
-SCOPED_VMEM = 16 * 2 ** 20
-"""The scoped VMEM a TPU kernel may hold where its target states none: v5e's, the one measured, which a
-generation's own measurement replaces."""
-
-
-def scoped_vmem(target: GpuTarget) -> int:
-    """The scoped VMEM, in bytes, a Mosaic TPU kernel on `target` may hold at XLA's default limit (a
-    kernel past it refuses to compile): the target's own, else `SCOPED_VMEM`."""
-    return target.scoped_vmem or SCOPED_VMEM
 
 
 SHARED_BUDGET = 99 * 1024
