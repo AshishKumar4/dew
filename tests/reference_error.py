@@ -127,12 +127,28 @@ its caches), the verdict no longer."""
 
 
 def equal_dots(fn, **jit_options):
-    """`fn` jitted, with EQUAL_DOTS on the CPU: an arm of a check 1 between two Dew paths, such as an
-    interpreted kernel and the XLA program it replaces, whose dots must reach the same code on any
-    host. A program Dew's users run compiles with the fusions, as they do."""
-    if jax.default_backend() == "cpu":
-        jit_options["compiler_options"] = {**EQUAL_DOTS, **jit_options.get("compiler_options", {})}
-    return jax.jit(fn, **jit_options)
+    """`fn` jitted, with EQUAL_DOTS where it compiles for the CPU: an arm of a check 1 between two Dew
+    paths, such as an interpreted kernel and the XLA program it replaces, whose dots must reach the
+    same code on any host. Each call compiles for the CPU when its committed array arguments all live
+    there, or, with none committed, when the default device (`jax.default_device`, else the default
+    backend) is a CPU. A program Dew's users run compiles with the fusions, as they do."""
+    options = jit_options.pop("compiler_options", None) or {}
+    plain = jax.jit(fn, compiler_options=options or None, **jit_options)
+    equal = jax.jit(fn, compiler_options={**EQUAL_DOTS, **options}, **jit_options)
+
+    def chosen(arguments):
+        platforms = {device.platform for leaf in jax.tree.leaves(arguments)
+                     if isinstance(leaf, jax.Array) and leaf.committed for device in leaf.devices()}
+        if not platforms:
+            default = jax.config.jax_default_device
+            platforms = {jax.default_backend() if default is None else getattr(default, "platform", default)}
+        return equal if platforms == {"cpu"} else plain
+
+    def run(*args, **kwargs):
+        return chosen((args, kwargs))(*args, **kwargs)
+
+    run.lower = lambda *args, **kwargs: chosen((args, kwargs)).lower(*args, **kwargs)
+    return run
 
 
 def with_gradients(fn):
