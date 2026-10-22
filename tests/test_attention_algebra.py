@@ -346,6 +346,32 @@ def test_a_logit_past_the_forwards_rounded_maximum_weighs_one_in_the_backward():
         np.testing.assert_array_equal(np.asarray(found.value), 1)
 
 
+@pytest.mark.parametrize("natural", [False, True], ids=["default", "natural"])
+def test_a_resumed_state_carried_far_is_as_exact_as_the_references(natural):
+    """fp32, one query of 87 over one key of 1 (value 0), scale 1, resumed from a state of maximum 0,
+    denominator 1 and weighted values 2^100: the output is the state's share, 2^100 exp(-87) over about
+    1. The factor the state takes to the key's maximum is the reference's `exp(-87)` (`Forward.carry`):
+    each mainloop's output is no further from float64 than the reference's. `exp2(-87 * log2(e))`, the
+    natural form's forward exponential, rounds its argument 2.2e-6 away on a GPU (`natural_exp`)."""
+    spans = template.spans(1, 1, 1)
+    query = jnp.full((1, 1, 1, 1), 87.0, jnp.float32)
+    key = jnp.ones((1, 1, 1, 1), jnp.float32)
+    value = jnp.zeros((1, 1, 1, 1), jnp.float32)
+    state = template.Initial(jnp.zeros((1, 1, 1)), jnp.ones((1, 1, 1)), jnp.full((1, 1, 1, 1), 2.0 ** 100))
+    hooks = template.Hooks(initial=state)
+    reference = float(template.reference(query, key, value, spans, hooks, scale=1.0)[0, 0, 0, 0])
+    truth = 2.0 ** 100 * np.exp(-87.0) / (np.exp(-87.0) + 1.0)
+    tiles = attention_triton.Tiles(32, 32, 4, 2)
+    # Compiled on a GPU, whose exp2 is the hardware's own; XLA's CPU computes exp2 through exp.
+    with tuning.pinned({attention_triton.TritonForward: tiles}):
+        triton = attention_triton.forward(query, key, value, spans, hooks, scale=1.0, natural=natural,
+                                          interpret=jax.default_backend() != "gpu")
+    portable = attention_portable.attend(query, key, value, spans, hooks, block_q=32, block_k=32,
+                                         pad=attention_triton.BLOCK, scale=1.0, natural=natural)
+    for found in (triton, portable):
+        assert abs(float(found[0, 0, 0, 0]) - truth) <= abs(reference - truth)
+
+
 def test_a_large_initial_maximum_gives_the_references_state_gradients():
     """fp32, one query over one key resumed from a state at maximum 1610613120 holding a denominator and
     weighted value of 1, Q 0 and K, V and dO 1, scale 1: the forward's maximum, the state's, rounds
