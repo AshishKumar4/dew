@@ -54,7 +54,7 @@ import math
 import re
 from collections.abc import Callable, Hashable, Mapping, Sequence
 from types import ModuleType
-from typing import TYPE_CHECKING, Any, ClassVar, Literal
+from typing import TYPE_CHECKING, Any, ClassVar, Literal, Protocol, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -67,7 +67,7 @@ from dew.nn.fake_quant import correctly_rounded_divide
 from dew.nn.kernels.generation import backend
 
 if TYPE_CHECKING:
-    from qwix import QuantizationProvider
+    from qwix import QArray, QuantizationProvider
 
     from dew.diffusion.process import Conditioning
     from dew.objectives.base import Variables
@@ -79,9 +79,6 @@ backend lowers it (measured in docs/performance.md)."""
 Rounding = Literal["uniform", "low_bit_uniform"]
 """How a quantized gradient rounds: Qwix's two stochastic modes."""
 
-CALIBRATIONS = ("absmax", "minmax", "rms", "fixed")
-"""The weight calibration methods Qwix parses, before an optional `,args`
-suffix (`qwix/_src/qconfig.py`, `QuantizationRule`)."""
 
 UNQUANTIZED = {
     "dew.nn.ssm.diagonal_recurrence":
@@ -133,10 +130,10 @@ class Quantization:
     wins. `'.*mlp.*'` quantizes the feed-forward blocks and leaves attention
     in fp32; the default quantizes every matmul of the wrapped methods."""
     calibration: str = "absmax"
-    """The weight calibration method, in the form Qwix parses.
-
-    It is a method name, one of `absmax`, `minmax`, `rms` or `fixed`, with an
-    optional `,args` suffix, for example `absmax,0.8`."""
+    """The weight calibration method, in the form Qwix parses (`absmax,0.8`,
+    for example). Dew keeps no copy of its grammar: Qwix refuses a method it
+    does not know where it first quantizes a matched weight, not when this
+    spec is built."""
     tile_size: int | None = None
     """The number of elements per tile for sub-channel scales along the contraction axis.
 
@@ -167,11 +164,6 @@ class Quantization:
                 raise ValueError(
                     f"quantization pattern {pattern!r} does not compile: "
                     f"{error}") from error
-        method = self.calibration.split(",", 1)[0]
-        if method not in CALIBRATIONS:
-            raise ValueError(
-                f"calibration is one of {list(CALIBRATIONS)}, with an optional "
-                f"`,args` suffix, got {self.calibration!r}")
         if self.tile_size is not None and self.tile_size < 1:
             raise ValueError(
                 f"tile_size counts elements per tile, got {self.tile_size}")
@@ -199,8 +191,9 @@ class Quantization:
         each of its `entry_methods` wrapped. Everything
         the registry, the objective and the checkpoint code read from the
         model therefore still works. Invalid settings were already refused
-        when the spec was constructed. Without Qwix installed, the call raises
-        an error that names the extra.
+        when the spec was constructed, all but the calibration method, which
+        Qwix parses where it first quantizes a matched weight. Without Qwix
+        installed, the call raises an error that names the extra.
         """
         return _qwix_wrapped(model, _providers()[0](_rules(self, training=True)), self)
 
@@ -601,15 +594,13 @@ class InputQuantization:
         """`model` computing under this record's frozen FP8 sites, and under
         the input quantization it already computes under, if any: one
         wrapper, so one interceptor, serves both."""
-        from dew.registry import wrapper_layers
+        from dew.registry import rebuilt, wrapper_layers
 
         _, layers = wrapper_layers(type(model))
         held = layers[0]._dew_wrapper() if layers else None
         if not isinstance(held, InputQuantization):
             return self.apply(model)
-        unwrapped = layers[0]._dew_wrapped(**{field.name: getattr(model, field.name)
-                                              for field in dataclasses.fields(model)
-                                              if field.init and field.name not in ("parent", "name")})
+        unwrapped = rebuilt(layers[0]._dew_wrapped, model)
         joined = dataclasses.replace(held, frozen_fp8=self.frozen_fp8, measured_on=self.measured_on)
         return joined.apply(unwrapped)
 
@@ -630,6 +621,8 @@ class InputQuantization:
         is otherwise unchanged, so its dtype, accumulation precision, output
         sharding and the bias placement stay as the model defines them.
         """
+        from dew.registry import rebuilt
+
         base, record = type(model), self
         if any("_dew_input_quantization" in vars(layer) for layer in base.__mro__):
             raise ValueError(f"{base.__name__} already computes under its checkpoint's input quantization")
@@ -693,9 +686,7 @@ class InputQuantization:
                 return output, ({**variables, QUANTIZATION: record.declared()} if record.sites else variables)
 
         InputQuantized.__name__ = InputQuantized.__qualname__ = base.__name__
-        return InputQuantized(**{field.name: getattr(model, field.name)
-                                 for field in dataclasses.fields(model)
-                                 if field.init and field.name not in ("parent", "name")})
+        return rebuilt(InputQuantized, model)
 
 
 def _site_kernel(tree: Variables, site: str) -> jax.typing.ArrayLike:
@@ -1200,6 +1191,71 @@ def _providers() -> tuple[type, type]:
     return QtProvider, PtqProvider
 
 
+@runtime_checkable
+class Annotated(Protocol):
+    """A serving tree's quantized kernel as Qwix's post-training quantization annotates it: the QArray
+    (`array`) with the recipe it was quantized by (`how`), a dataclass of those fields."""
+
+    array: QArray
+    how: object
+
+
+def split_columns(leaf, widths: Sequence[int], *, axis: int = -1) -> list:
+    """`leaf` split into one leaf a member along `axis` by `widths`, a packed projection's kernel
+    taken back into its members' (`dew.inference.projections.unpacked`): a plain array, host or
+    device, as `np.split` or `jnp.split` would; a Qwix QArray with its values split and each scale
+    and zero point split as its own axis is, shared (one entry) kept whole by every member, per
+    channel split at the same columns, per tile at the tiles' (a member that would cut a tile is
+    refused); and the serving tree's wrapper of one (Qwix's annotated array, `array` its field) as
+    the QArray inside it, its recipe kept, where no other field of it holds an array that would need
+    a split of its own. A leaf this process can materialize whole (fully addressable, or replicated
+    with an addressable copy) splits on the host and returns host arrays; any other splits where it
+    lives. The widths are positive and sum to `leaf`'s size along `axis`, or the split is refused."""
+    edges = np.cumsum(widths)[:-1].tolist()
+
+    def checked(size: int):
+        if not widths or min(widths) < 1 or sum(widths) != size:
+            raise ValueError(f"members {list(widths)} do not partition an axis of {size}")
+
+    def arrays(value, ratio: int = 1):
+        if value is None:
+            return [None] * len(widths)
+        if isinstance(value, jax.Array) and not (value.is_fully_addressable or (
+                value.is_fully_replicated and value.sharding.has_addressable_devices)):
+            return jnp.split(value, [edge // ratio for edge in edges], axis=axis)
+        return np.split(np.asarray(value), [edge // ratio for edge in edges], axis=axis)
+
+    if isinstance(leaf, (jax.Array, np.ndarray)):
+        checked(leaf.shape[axis])
+        return arrays(leaf)
+    qwix = _qwix()
+    if isinstance(leaf, qwix.QArray):
+        total = leaf.qvalue.shape[axis]
+        checked(total)
+
+        def scaled(value):
+            if value is None or value.shape[axis] == 1:
+                return [value] * len(widths)
+            tile = total // value.shape[axis]
+            if any(width % tile for width in widths):
+                raise ValueError(f"members {list(widths)} cut the scales' tiles of {tile} columns")
+            return arrays(value, tile)
+
+        parts = zip(arrays(leaf.qvalue), scaled(leaf.scale), scaled(leaf.zero_point), strict=True)
+        return [dataclasses.replace(leaf, qvalue=value, scale=scale, zero_point=zero)
+                for value, scale, zero in parts]
+    if (isinstance(leaf, Annotated) and isinstance(leaf.array, qwix.QArray) and dataclasses.is_dataclass(leaf)
+            and not isinstance(leaf, type)):
+        others = [field.name for field in dataclasses.fields(leaf) if field.name != "array"
+                  and isinstance(getattr(leaf, field.name), (jax.Array, np.ndarray))]
+        if others:
+            raise TypeError(f"a {type(leaf).__name__} holds arrays beside its kernel ({', '.join(others)}), "
+                            "whose split is not this one")
+        return [dataclasses.replace(leaf, array=part)
+                for part in split_columns(leaf.array, widths, axis=axis)]
+    raise TypeError(f"a {type(leaf).__name__} is not a packed kernel this splits")
+
+
 def _rules(spec: Quantization, training: bool) -> list:
     """One Qwix rule per pattern of `spec`, in its order: quantized-training
     rules with the backward fields, or serving rules. A weight-only rule
@@ -1274,4 +1330,4 @@ def quantize_for_serving(model: nn.Module, variables: Variables, spec: Quantizat
     return served, {**variables, "params": parameters}
 
 
-__all__ = ["InputQuantization", "Quantization"]
+__all__ = ["InputQuantization", "Quantization", "split_columns"]

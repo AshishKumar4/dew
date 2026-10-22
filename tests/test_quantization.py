@@ -113,6 +113,15 @@ def test_quantized_and_plain_calls_of_one_shape_keep_their_own_products_in_one_p
     assert not np.array_equal(np.asarray(quantized.apply(variables, then)), plain(then))
 
 
+def test_qwix_refuses_an_unknown_calibration_where_it_first_quantizes_a_weight():
+    """Dew keeps no copy of Qwix's calibration grammar: a spec with a method Qwix does not know builds,
+    and the first forward that quantizes a matched weight raises, Qwix's own refusal."""
+    pytest.importorskip("qwix")
+    _, qmodel, variables, ids = quantized_forward(Quantization(calibration="not_a_method"))
+    with pytest.raises(ValueError):
+        qmodel.apply(variables, ids)
+
+
 def test_a_pattern_that_matches_nothing_quantizes_nothing():
     """A narrowed pattern is selective: a regex no module path matches runs
     the fp32 numerics bitwise. A pattern that matched everything would move
@@ -1288,3 +1297,54 @@ def assert_step_moves_by_the_hosts_gradient():
         with jax.enable_x64(new_val=True):
             truth = flat(jax.tree.map(lambda leaf: np.asarray(leaf, np.float64), gradient(jnp.float64)))
     assert_as_exact_as_the_reference(flat(moved), reference, truth, "an int8 training step's gradient")
+
+
+@pytest.mark.parametrize("tile", [None, 16], ids=["per channel", "tiled"])
+def test_a_quantized_packed_kernel_splits_into_its_members_bit_for_bit(tile):
+    """A served task's packed query, key and value kernel, Qwix's quantized array in its serving wrapper,
+    split by its members' widths (`split_columns`): each member dequantizes to exactly the packed
+    kernel's dequantized columns, with the wrapper's recipe kept, with the input axis's scales per
+    channel or tiled; Qwix's other layouts split as exactly (scales tiled along the split, one shared
+    scale, a zero point, float8, the other axis), as plain host and device arrays do; a split that would
+    cut a tile, or whose widths do not partition the axis, is refused. A leaf this process cannot
+    materialize whole is `projections.unpacked`'s sharded tests' to cover."""
+    import json
+    from pathlib import Path
+
+    import dew
+    from dew.quantization import split_columns
+
+    qwix = pytest.importorskip("qwix")
+    directory = Path(__file__).parent / "fixtures/hf/llama-tiny"
+    served = dew.pipeline(str(directory), dtype="float32").quantized(
+        Quantization(weight_only=True, patterns=(".*_proj",), tile_size=tile))
+    packed = served.variables["params"]["layers_0"]["self_attn"]["qkv_proj"]["kernel"]
+    config = json.loads((directory / "config.json").read_text())
+    width = packed.array.qvalue.shape[-1]
+    heads, kv_heads = config["num_attention_heads"], config["num_key_value_heads"]
+    head = width // (heads + 2 * kv_heads)
+    widths = (heads * head, kv_heads * head, kv_heads * head)
+    members = split_columns(packed, widths)
+    whole = np.asarray(qwix.dequantize(packed.array))
+    edges = np.cumsum((0, *widths))
+    for member, start, stop in zip(members, edges[:-1], edges[1:], strict=True):
+        assert member.how == packed.how
+        np.testing.assert_array_equal(np.asarray(qwix.dequantize(member.array)), whole[..., start:stop])
+    layouts = {"tiled along the split": {"qtype": jnp.int8, "tiled_axes": {1: 16}},
+               "one scale shared": {"qtype": jnp.int8},
+               "a zero point": {"qtype": jnp.int8, "channelwise_axes": (1,), "calibration_method": "minmax"},
+               "float8": {"qtype": jnp.float8_e4m3fn, "channelwise_axes": (1,)}}
+    for name, how in layouts.items():
+        columns = qwix.quantize(jnp.asarray(whole), **how)
+        halves = split_columns(columns, (16, width - 16))
+        joined = np.concatenate([np.asarray(qwix.dequantize(half)) for half in halves], axis=1)
+        np.testing.assert_array_equal(joined, np.asarray(qwix.dequantize(columns)), err_msg=name)
+    rows = split_columns(qwix.quantize(jnp.asarray(whole), jnp.int8, channelwise_axes=(1,)), (16, 48), axis=0)
+    assert [part.qvalue.shape[0] for part in rows] == [16, 48]
+    for plain in (whole, jnp.asarray(whole)):
+        np.testing.assert_array_equal(np.concatenate(split_columns(plain, widths), axis=-1), whole)
+    with pytest.raises(ValueError):
+        split_columns(qwix.quantize(jnp.asarray(whole), jnp.int8, tiled_axes={1: 16}), (8, width - 8))
+    for wrong in ((), (16,), (16, width), (-16, width + 16)):
+        with pytest.raises(ValueError):
+            split_columns(packed, wrong)
