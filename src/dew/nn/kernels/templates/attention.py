@@ -14,14 +14,6 @@ A hook is a plain JAX callable the kernel's body traces, pointwise in the score 
 decay), with each parameter loaded as its kind says (`Param`); the softmax starts from an initial state
 (`Initial`: sinks, a resumed partial); `output_mod(o, *params)` on the normalized output tile. Absent,
 a hook adds no op.
-
-Precision, every implementation's contract: the products of the inputs accumulate in fp32, the logits'
-scale, hooks and softmax run in fp32, and the probabilities round to the values' dtype for each product
-they enter, the output's `P V` and the backward's `P^T dO`, as jax's own attention does
-(`jax.nn.dot_product_attention`'s xla path, jax/_src/nn/functions.py: `probs =
-softmax(...).astype(key.dtype)`) and FlashAttention 2's forward (csrc/flash_attn/src/flash_fwd_kernel.h:
-"Convert acc_s from fp32 to fp16/bf16" before the P V product); the output normalizes in fp32 before it
-rounds to the query's dtype (`reference`).
 """
 
 import dataclasses
@@ -53,22 +45,14 @@ class KeySpans:
     form: str = dataclasses.field(default="spans", metadata={"static": True})
 
 
-def within(keys: jax.Array, start: jax.Array, end: jax.Array,
-           ids: tuple[jax.Array, jax.Array] | None = None) -> jax.Array:
-    """Whether each key index of `keys` lies in its query's interval `start` to `end` and, with `ids`
-    (the queries' and the keys', broadcasting alike), is of its document: the keys a call's spans let a
-    query see, which the reference (`visible`) and every mainloop (`attention_algebra.modify`, the
-    backward's tiles) mask by."""
-    seen = (keys >= start) & (keys < end)
-    return seen if ids is None else seen & (ids[0] == ids[1])
-
-
 def visible(spans: KeySpans, row: jax.Array | int, queries: jax.Array, keys: jax.Array) -> jax.Array:
     """Whether each of `keys` (key indices, broadcasting) is visible to each of `queries` (query
-    indices) in batch row `row` (`within`)."""
-    ids = (None if spans.query_ids is None or spans.key_ids is None
-           else (spans.query_ids[row][queries], spans.key_ids[row][keys]))
-    return within(keys, spans.start[row][queries], spans.end[row][queries], ids)
+    indices) in batch row `row`: inside the query's interval and, with ids, of its document."""
+    start, end = spans.start[row][queries], spans.end[row][queries]
+    seen = (keys >= start) & (keys < end)
+    if spans.query_ids is not None and spans.key_ids is not None:
+        seen &= spans.query_ids[row][queries] == spans.key_ids[row][keys]
+    return seen
 
 
 def dense(spans: KeySpans) -> jax.Array:

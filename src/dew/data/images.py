@@ -6,6 +6,7 @@ from __future__ import annotations
 import copy
 import dataclasses
 import importlib
+import inspect
 import threading
 from collections.abc import Callable, Mapping, Sequence
 from typing import TYPE_CHECKING, ClassVar, Literal, Protocol
@@ -18,7 +19,6 @@ from dew.data.dataset import Batch
 from dew.data.facts import resized, shaped, unshaped
 from dew.data.image_codec import as_rgb, decode_image
 from dew.data.pipeline import DeviceStep, Rejected
-from dew.data.plan import callable_name
 from dew.records import record
 
 if TYPE_CHECKING:
@@ -505,17 +505,13 @@ class Torchvision(grain.RandomMapTransform):
         return {**element, self.field: np.ascontiguousarray(np.asarray(transformed).transpose(1, 2, 0))}
 
 
-CAPTION_COLUMNS = ("caption", "text")
-"""The fields a record's own caption is read from, the first it holds (`Caption`)."""
-
-
 @dataclasses.dataclass(frozen=True)
 class Caption(grain.MapTransform):
     """A record's caption and int32 numeric labels, from columns or a class template."""
 
     template: str | None = None
     classes: tuple[str, ...] = ()
-    columns: tuple[str, ...] = CAPTION_COLUMNS
+    columns: tuple[str, ...] = ("caption", "text")
 
     def declared(self, facts: Mapping[str, object]) -> Mapping[str, object]:
         """A caption, a string of no fixed shape, in place of any the record held, beside the fields
@@ -551,7 +547,7 @@ class RandomCaption(Caption, grain.RandomMapTransform):
 
 def caption(template: str | None = None, *, templates: tuple[str, ...] = (),
             classes: tuple[str, ...] = (),
-            columns: tuple[str, ...] = CAPTION_COLUMNS) -> Caption | RandomCaption:
+            columns: tuple[str, ...] = ("caption", "text")) -> Caption | RandomCaption:
     """A record step that writes "caption": `template` formatted with the
     record's fields ("{label}" is the class name `classes` gives its label),
     or with none, the first of `columns`. With `templates`, a random step
@@ -597,9 +593,11 @@ class EncodeCaptions:
 
     @property
     def identity(self) -> str:
-        if self.reader is None:
+        reader = self.reader
+        if reader is None:
             return "dew.drop-captions@1"
-        return f"dew.encode-captions:{callable_name(self.reader)}"
+        kind = reader if inspect.ismethod(reader) or inspect.isfunction(reader) else type(reader)
+        return f"dew.encode-captions:{kind.__module__}.{kind.__qualname__}"
 
     def __call__(self, batch: Batch) -> Batch:
         held = dict(batch)
@@ -618,7 +616,9 @@ class EncodeFields:
 
     @property
     def identity(self) -> str:
-        return f"dew.encode-fields:{callable_name(self.reader)}"
+        reader = self.reader
+        kind = reader if inspect.ismethod(reader) or inspect.isfunction(reader) else type(reader)
+        return f"dew.encode-fields:{kind.__module__}.{kind.__qualname__}"
 
     def __call__(self, batch: Batch) -> Batch:
         return {**batch, **self.reader(batch)}

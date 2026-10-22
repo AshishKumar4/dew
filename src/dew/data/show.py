@@ -27,7 +27,6 @@ from dew.data.pipeline import (
     Pipeline,
     RandomMap,
     Stage,
-    runs,
 )
 
 
@@ -62,22 +61,28 @@ def _chain_lines(chain: Pipeline, depth: int = 0) -> list[str]:
 def _stage_line(stage: Stage | Batched | Native) -> str:
     """One stage as `show` prints it: the verb that wrote it and the step it runs, or the
     stage's own settings."""
-    ran = runs(stage)
-    if ran is None:
-        return f"batch({stage.size})" if isinstance(stage, BatchStage) else _brief(repr(stage))
-    named = _step_name(ran.step)
     if isinstance(stage, MapBatch):
         where = "device" if isinstance(stage.step, DeviceStep) else "host"
-        return f"map({named}) on the {where}, per batch"
+        return f"map({_step_name(stage.step)}) on the {where}, per batch"
+    if isinstance(stage, Configured):
+        return f"map({_step_name(stage.factory)})"
+    if isinstance(stage, Filter):
+        return f"filter({_step_name(stage.predicate)})"
+    if isinstance(stage, Native):
+        return f"grain({_step_name(stage.function)})"
     if isinstance(stage, Batched):
         verb = "map" if stage.same_rows else "flat_map"
-        return f"{verb}({named}, batched=True, batch_size={stage.size})"
+        return f"{verb}({_step_name(stage.step)}, batched=True, batch_size={stage.size})"
     if isinstance(stage, (Map, RandomMap)):
         drawn = "random_" if isinstance(stage, RandomMap) else ""
-        return f"{drawn}{'filter_map' if stage.rejects else 'map'}({named})"
-    verbs = {Configured: "map", Filter: "filter", Native: "grain", MapWithIndex: "map_with_index",
-             FlatMap: "flat_map"}
-    return f"{verbs[type(stage)]}({named})"
+        verb = drawn + ("filter_map" if stage.rejects else "map")
+        return f"{verb}({_step_name(stage.step)})"
+    if isinstance(stage, (MapWithIndex, FlatMap)):
+        verb = "map_with_index" if isinstance(stage, MapWithIndex) else "flat_map"
+        return f"{verb}({_step_name(stage.step)})"
+    if isinstance(stage, BatchStage):
+        return f"batch({stage.size})"
+    return _brief(repr(stage))
 
 
 def _step_name(step: Hashable) -> str:

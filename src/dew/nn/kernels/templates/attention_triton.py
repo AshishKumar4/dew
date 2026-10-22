@@ -35,7 +35,6 @@ from dew.nn.kernels.templates.attention import (
     kept_dtype,
     kernel_dot,
     padded_call,
-    within,
 )
 from dew.nn.kernels.templates.base import Template, dividing
 
@@ -339,7 +338,7 @@ class TritonForward(Template[Tiles]):
         # The accurate form alone guards its sums (`algebra.Forward.headroom`); the fold walks as ever.
         spec = algebra.Forward(self.form, keys if self.keys is None else self.keys, ids, self.scale,
                                self.score_mod, self.natural,
-                               self.natural and algebra.headroom(value.dtype), initial)
+                               self.natural and algebra.headroom(value.dtype, initial), initial)
         kernel = functools.partial(
             _forward_kernel, spec=spec, score_kinds=self.score_kinds, output_kinds=self.output_kinds,
             initial=initial, residuals=residuals, output_mod=self.output_mod, block_k=block_k,
@@ -531,8 +530,9 @@ def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tu
     def tile(index):
         keys = pl.ds(index * block_k, block_k)
         k_pos = index * block_k + jnp.arange(block_k)[None, :]
-        seen = within(k_pos, start[:, None], end[:, None],
-                      (query_ids[0][:, None], id_refs[1][keys][None, :]) if ids else None)
+        seen = (k_pos >= start[:, None]) & (k_pos < end[:, None])
+        if ids:
+            seen &= query_ids[0][:, None] == id_refs[1][keys][None, :]
         params = [_tile_param(ref, kind, head, q_pos, keys)
                   for ref, kind in zip(score_refs, score_kinds, strict=True)]
         return keys, k_pos, seen, params
@@ -639,8 +639,9 @@ def _dkv_kernel(ranges_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: t
         rows = pl.ds(index * block_q, block_q)
         query, dout = query_ref[rows, :], dout_ref[rows, :]
         q_pos = index * block_q + jnp.arange(block_q)[:, None]
-        seen = within(k_pos, start_ref[rows][:, None], end_ref[rows][:, None],
-                      (id_refs[0][rows][:, None], key_ids[0][None, :]) if ids else None)
+        seen = (k_pos >= start_ref[rows][:, None]) & (k_pos < end_ref[rows][:, None])
+        if ids:
+            seen &= id_refs[0][rows][:, None] == key_ids[0][None, :]
         params = [_key_param(ref, kind, head, rows)
                   for ref, kind in zip(score_refs, score_kinds, strict=True)]
         exponentials, weights, cotangents, slopes = _tile_scores(
@@ -990,6 +991,6 @@ def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
     initial = hooks is not None and hooks.initial is not None
     # A guarded forward's live rows carry normalized split sums (`algebra.split_residuals`), which the first
     # pass cannot recompute without the forward's denominator: D comes from them.
-    split = split or (natural and algebra.headroom(value.dtype))
+    split = split or (natural and algebra.headroom(value.dtype, initial))
     launch = functools.partial(_launch, split=split, natural=natural, initial=initial, interpret=interpret)
     return gradients(launch, query, key, value, spans, hooks, dout, residuals, block=BLOCK, scale=scale)

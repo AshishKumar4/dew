@@ -124,12 +124,12 @@ def _capped(softcap: float, logits, q_pos, k_pos):
 def _spec(scale: float, softcap: float | None, natural: bool, dtype, sinks: bool) -> algebra.Forward:
     """The algebra's facts for a decode launch: each query block's keys its row's span (`spans`), no
     documents, the cap as its score hook, the logits `natural` or not (`algebra.Forward.base2`), and
-    whether a row's sums of `dtype` values need a guard (`algebra.headroom`). A decode
+    whether a row's sums of `dtype` values, with its sinks, need a guard (`algebra.headroom`). A decode
     block's rows are a key head's query heads and positions (`grouped_query`), so the hook takes no query
     positions."""
     return algebra.Forward("spans", 0, ids=False, scale=scale,
                            score_mod=None if softcap is None else functools.partial(_capped, softcap),
-                           natural=natural, headroom=natural and algebra.headroom(dtype),
+                           natural=natural, headroom=natural and algebra.headroom(dtype, sinks),
                            initial=sinks)
 
 

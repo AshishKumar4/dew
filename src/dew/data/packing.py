@@ -61,11 +61,6 @@ def most_documents(starts: np.ndarray, accepted: np.ndarray) -> int:
     return int(np.diff(np.asarray(starts))[np.asarray(accepted)].max(initial=0))
 
 
-_FIELDS = ("documents", "offsets", "sizes", "order", "starts", "targets", "accepted")
-"""The plan arrays that fix which chunks each window holds, which a saved
-position's order fingerprints."""
-
-
 def plan_windows(lengths: np.ndarray, pack: Pack, overlap: int = 0) -> Mapping[str, np.ndarray]:
     """The first-fit plan of documents of `lengths` into `pack.seq_len`-token
     windows, a document longer than a window cut into window-long pieces
@@ -89,8 +84,16 @@ def plan_windows(lengths: np.ndarray, pack: Pack, overlap: int = 0) -> Mapping[s
         np.int64,
     )
     kept = np.flatnonzero(targets > 0)
-    placed = dict(zip(_FIELDS, (documents, offsets, chunk_sizes, order, starts, targets, kept), strict=True))
-    return {**placed, "totals": np.asarray([targets[kept].sum(), np.count_nonzero(targets == 0)], np.int64)}
+    return {
+        "documents": documents,
+        "offsets": offsets,
+        "sizes": chunk_sizes,
+        "order": order,
+        "starts": starts,
+        "targets": targets,
+        "accepted": kept,
+        "totals": np.asarray([targets[kept].sum(), np.count_nonzero(targets == 0)], np.int64),
+    }
 
 
 @dataclasses.dataclass(frozen=True)
@@ -107,6 +110,11 @@ class PackingPlan:
         refuse_overlong(lengths, self.pack, generation.url)
         planned = plan_windows(lengths, self.pack)
         return {plan_name(self.pack, field): value for field, value in planned.items()}
+
+
+_FIELDS = ("documents", "offsets", "sizes", "order", "starts", "targets", "accepted")
+"""The plan arrays that fix which chunks each window holds, which a saved
+position's order fingerprints."""
 
 
 @dataclasses.dataclass(frozen=True)

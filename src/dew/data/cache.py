@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import sqlite3
@@ -20,6 +21,7 @@ from typing import Literal, TypedDict, overload
 
 import grain.python as grain
 import numpy as np
+from array_record.python.array_record_module import ArrayRecordWriter
 
 from dew.data.concurrent import Concurrently
 from dew.data.dataset import _QUIET_STOP_SECONDS
@@ -28,20 +30,20 @@ from dew.data.generation import (
     Generation,
     Outputs,
     RowId,
+    _accepted,
     _checked,
     _decode_outputs,
+    _fact,
     _hash,
     _json,
     _publish,
     _row_key,
-    completion_facts,
-    seal_facts,
+    _rule,
 )
 from dew.data.pipeline import Record, Rejected, Volatile
 from dew.data.retention import LocalRetention
-from dew.data.sinks import write_array_record
 from dew.data.sources.base import Shard, Source
-from dew.data.sources.codec import encode
+from dew.data.sources.codec import encode, fingerprint
 from dew.data.sources.records import ArrayRecords
 from dew.data.storage import PreconditionFailed, Store, _byte_size
 
@@ -200,8 +202,15 @@ class Cache:
         record = json.loads(current.data)
         if record["manifest"] != key.key:
             raise ValueError(f"cache CURRENT manifest differs at {root.url}")
-        # Pinned, then its manifest read once, checked against what CURRENT committed.
-        return Generation.named(root, record, self._mirror_options())
+        _checked(
+            root,
+            {
+                "path": f"generations/{record['generation']}/manifest.json",
+                "bytes": record["bytes"],
+                "sha256": record["sha256"],
+            },
+        )
+        return Generation(root.child(f"generations/{record['generation']}").url, self._mirror_options())
 
     def publish(
         self,
@@ -385,13 +394,30 @@ class _Writer:
             return
         number = len(self.futures)
         path = Path(self.directory.name) / f"{number}.array_record"
-        write_array_record(path, self.pending.values())
+        writer = ArrayRecordWriter(str(path), "group_size:1")
         entries = []
         positions = []
         used = self.pending_bytes
         for offset, (row_id, payload) in enumerate(self.pending.items()):
-            entries.append({**completion_facts(row_id, payload), "record": offset})
+            outputs = _decode_outputs(payload)
+            writer.write(payload)
+            accepted = _accepted(outputs)
+            entries.append(
+                {
+                    "id": row_id,
+                    "fanout": len(accepted),
+                    "record": offset,
+                    "outputs": [[row_id, index] for index in range(len(accepted))],
+                    "sha256": fingerprint(accepted),
+                    "payload_sha256": fingerprint(outputs),
+                    "lengths": [_fact(value, "_dew_length") for value in accepted],
+                    "valid_targets": [_fact(value, "_dew_valid_targets") for value in accepted],
+                    "rules": [_rule(value) for value in accepted],
+                    "rejections": [value.reason for value in outputs if isinstance(value, Rejected)],
+                }
+            )
             positions.append((row_id, number, offset, _hash(payload)))
+        writer.close()
         actual = path.stat().st_size
         if not self._reserve_shard(actual, used, path):
             self.pending.clear()
@@ -482,8 +508,21 @@ class _Writer:
         with self.lock:
             self._flush()
         self.segments = [future.result() for future in self.futures]
-        sealed = seal_facts(self.segments, (_checked(self.root, entry) for entry in self.segments))
-        payload = _json(sealed)
+        chain = b""
+        rows = []
+        for entry in self.segments:
+            payload = _checked(self.root, entry)
+            chain = hashlib.sha256(chain + payload).digest()
+            rows.extend(completion["id"] for completion in json.loads(payload)["completions"])
+        payload = _json(
+            {
+                "count": len(self.segments),
+                "segments": self.segments,
+                "first": rows[0] if rows else None,
+                "last": rows[-1] if rows else None,
+                "sha256": chain.hex(),
+            }
+        )
         if self.closed:
             raise Abandoned(f"cache writer was abandoned before its seal: {self.writer}")
         try:
@@ -540,14 +579,9 @@ class _Writer:
             self.closed = True
             self.pool.shutdown(wait=True, cancel_futures=True)
             self.index.close()
-            self._release()
-
-    def _release(self) -> None:
-        """The writer's local spool and its pin let go, once no upload reads them: the one release
-        every way a writer ends takes, whichever drains or abandons its uploads first."""
-        self.directory.cleanup()
-        if self.pin is not None:
-            self.pin.close()
+            self.directory.cleanup()
+            if self.pin is not None:
+                self.pin.close()
 
     def close(self) -> None:
         with self.lock:
@@ -576,12 +610,16 @@ class _Writer:
                 with self.lock:
                     remaining.discard(future)
                     if not remaining:
-                        self._release()
+                        self.directory.cleanup()
+                        if self.pin is not None:
+                            self.pin.close()
 
             for future in unfinished:
                 future.add_done_callback(released)
         else:
-            self._release()
+            self.directory.cleanup()
+            if self.pin is not None:
+                self.pin.close()
         self._completed()
 
 

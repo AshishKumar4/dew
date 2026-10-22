@@ -23,7 +23,6 @@ from dew.nn.kernels.templates.attention import (
     gradients,
     interpreted_dot,
     padded_call,
-    within,
 )
 
 
@@ -189,7 +188,7 @@ def attend(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, 
     resumes = initial is not None
     spec = algebra.Forward(spans.form, spans.keys, call.query_ids is not None,
                            query.shape[3] ** -0.5 if scale is None else scale, hooks.score_mod, natural,
-                           natural and algebra.headroom(value.dtype), resumes)
+                           natural and algebra.headroom(value.dtype, resumes), resumes)
     out, kept = forward(
         spec, call.query, call.key, call.value, call.start, call.end, call.query_ids, call.key_ids,
         call.score_params, tuple(param.kind for param in hooks.score_params), call.output_params,
@@ -208,9 +207,10 @@ def _seen(spans: tuple[jax.Array, jax.Array, jax.Array | None, jax.Array | None]
           columns: jax.Array) -> jax.Array:
     """The entries `[len(rows), len(columns)]` of batch row `row` its spans let each query see."""
     start, end, query_ids, key_ids = spans
-    ids = (None if query_ids is None or key_ids is None
-           else (query_ids[row, rows][:, None], key_ids[row, columns][None, :]))
-    return within(columns[None, :], start[row, rows][:, None], end[row, rows][:, None], ids)
+    seen = (columns[None, :] >= start[row, rows][:, None]) & (columns[None, :] < end[row, rows][:, None])
+    if query_ids is not None and key_ids is not None:
+        seen &= query_ids[row, rows][:, None] == key_ids[row, columns][None, :]
+    return seen
 
 
 def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_index, anchor_value, shift,
@@ -449,7 +449,7 @@ def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
     initial = hooks is not None and hooks.initial is not None
     # A guarded forward's live rows carry normalized split sums (`algebra.split_residuals`), which the first
     # pass cannot recompute without the forward's denominator: D comes from them.
-    split = split or (natural and algebra.headroom(value.dtype))
+    split = split or (natural and algebra.headroom(value.dtype, initial))
     launch = functools.partial(_launch, block_q=block_q, block_k=block_k, split=split, natural=natural,
                                initial=initial)
     return gradients(launch, query, key, value, spans, hooks, dout, residuals, block=pad, scale=scale)

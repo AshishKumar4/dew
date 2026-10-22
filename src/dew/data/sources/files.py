@@ -29,12 +29,11 @@ from s3fs import S3FileSystem
 
 from dew.data.dataset import Batch, Records
 from dew.data.pipeline import Dataset
-from dew.data.steps.generic import Fields
-from dew.data.storage import Readable, Store, commit_export, content_version, in_memory, local, on_gcs
+from dew.data.storage import Readable, Store, content_version, local
 from dew.records import integer, record
 
 from .base import Read, Shard, ShardManifest, preparing, url_label
-from .index import ArrayIndex, Ranges
+from .index import ArrayIndex
 
 type Format = Literal["jsonl", "text", "csv", "parquet", "arrow", "array_record", "files", "webdataset"]
 
@@ -71,7 +70,8 @@ def _arrow_filesystem(fs: AbstractFileSystem) -> pafs.FileSystem:
     carries every setting `fs` reads with (`_native_s3`, `_native_gcs`), as
     it reads Parquet row groups 1.4x (S3) to 2.1x (GCS) faster than Arrow
     over fsspec does; Arrow over `fs` itself otherwise, which keeps them all."""
-    if local(fs):
+    protocols = (fs.protocol,) if isinstance(fs.protocol, str) else fs.protocol
+    if "file" in protocols:
         return pafs.LocalFileSystem()
     if isinstance(fs, S3FileSystem) and _native_s3(fs):
         endpoint = urlsplit(fs.endpoint_url or fs.client_kwargs.get("endpoint_url") or "")
@@ -410,8 +410,8 @@ class Files(Dataset):
                 return True
             for url in self.paths:
                 fs, _ = Store(url, self.storage_options).resolve()
-                # ArrayRecord's own reader opens a local path or a GCS URL (`ArrayRecords.reader`).
-                if not (local(fs) or on_gcs(fs)):
+                protocols = (fs.protocol,) if isinstance(fs.protocol, str) else fs.protocol
+                if not {"file", "gs", "gcs"}.intersection(protocols):
                     return False
             return True
         if self.where is not None:
@@ -455,9 +455,29 @@ class Files(Dataset):
         preparing(self, sum(fs.size(path) or 0 for fs, path in stores), "an offset index beside each file")
         for url in self.paths:
             fs, path = Store(url, self.storage_options).resolve()
+            offsets = []
             with _open_lines(fs, path) as file:
-                names = _header(file) if self.kind == "csv" else None
-                offsets = [(0, start, size) for _, start, size in _lines(self.kind, file, names)]
+                if self.kind == "csv":
+                    reader = csv.DictReader(_CsvLines(file))
+                    _ = reader.fieldnames
+                    while True:
+                        start = file.tell()
+                        try:
+                            next(reader)
+                        except StopIteration:
+                            break
+                        offsets.append((0, start, file.tell() - start))
+                else:
+                    while True:
+                        start = file.tell()
+                        line = file.readline()
+                        if not line:
+                            break
+                        if self.kind == "jsonl":
+                            if not line.strip():
+                                continue
+                            json.loads(line)
+                        offsets.append((0, start, len(line)))
             encoded = io.BytesIO()
             np.save(
                 encoded,
@@ -503,8 +523,15 @@ class Files(Dataset):
                     "sha256": digest,
                 }
             )
-        commit_export(root, format="array_record", codec=None, rows=sum(entry["rows"] for entry in files),
-                      files=files)
+        manifest = {
+            "schema": 1,
+            "format": "array_record",
+            "codec": None,
+            "rows": sum(entry["rows"] for entry in files),
+            "files": files,
+            "metadata": {},
+        }
+        root.child("_dew_manifest.json").put_if_absent(json.dumps(manifest, sort_keys=True).encode())
         self.__dict__.pop("committed", None)
         self.__dict__.pop("declared", None)
         self.__dict__.pop("_file_facts", None)
@@ -542,12 +569,10 @@ class Files(Dataset):
         return tuple(rows[index] for index in range(len(rows))) if read == "memory" else rows
 
     def _projected(self, rows: Records) -> Records:
-        """`rows` cut to `columns`, which an Arrow source's own reader selects: each row checked to
-        hold them (`_Columns`), then projected to exactly those fields (`Fields`)."""
+        """`rows` cut to `columns`, which an Arrow source's own reader selects."""
         if self.columns is None or self.kind in ("parquet", "arrow"):
             return rows
-        return (grain.MapDataset.source(rows).map(_Columns(self.columns, self.describe()))
-                .map(Fields(self.columns)))
+        return _ProjectedRows(rows, _Projection(self.columns, self.describe()))
 
     @cached_property
     def _arrow_files(self) -> tuple[pafs.FileSystem, tuple[str, ...], Mapping[str, str], str | None]:
@@ -557,8 +582,7 @@ class Files(Dataset):
         read from huggingface_hub's cache where it holds every one, and from the Hub otherwise."""
         stores = [Store(url, self.storage_options) for url in self.paths]
         located = [store.readable() for store in stores]
-        # Some of a Hub dataset's files in huggingface_hub's cache, on this host's disk, and some not.
-        if len({local(place.fs) for place in located}) > 1:
+        if any(place.fs.protocol != located[0].fs.protocol for place in located):
             located = [Readable(*store.resolve(), None) for store in stores]
         filesystem = _arrow_filesystem(located[0].fs)
         paths = tuple(filesystem.normalize_path(place.path) for place in located)
@@ -622,8 +646,7 @@ class Files(Dataset):
         if self.kind in ("parquet", "arrow"):
             return grain.MapDataset.source(_ArrowFragment(self, shard.start)).to_iter_dataset()
         rows = self._shard_rows(shard)
-        return rows if self.columns is None else rows.map(_Columns(self.columns, self.describe())).map(
-            Fields(self.columns))
+        return rows if self.columns is None else rows.map(_Projection(self.columns, self.describe()))
 
     def _shard_rows(self, shard: Shard) -> grain.IterDataset:
         if self.kind == "array_record":
@@ -648,7 +671,8 @@ class Files(Dataset):
         remote = False
         for url in self.paths:
             fs, _ = Store(url, self.storage_options).resolve()
-            remote |= not (local(fs) or in_memory(fs))
+            protocols = (fs.protocol,) if isinstance(fs.protocol, str) else fs.protocol
+            remote |= "file" not in protocols and "memory" not in protocols
         if self.kind in ("parquet", "arrow") and self.where is None:
             return tuple(_fragment_rows(fragment) for fragment in self.fragments), remote
         if self.kind in ("jsonl", "text", "csv") and self.supports("indexed"):
@@ -736,22 +760,35 @@ class Files(Dataset):
 
 
 @dataclass(frozen=True)
-class _Columns:
-    """A row that holds `columns`, as an Arrow reader's projection reads them: a row that is not a
-    mapping, or lacks a column, is refused, naming the store. A missing row (`None`, which a store's
-    records may hold) never reaches it: Grain's maps pass one on as it is."""
+class _Projection:
+    """A mapping row's `columns`, as an Arrow reader's projection selects them: a row that is not
+    a mapping, or lacks a column, is refused."""
 
     columns: tuple[str, ...]
     described: str
 
-    def __call__(self, row: Batch | bytes) -> Batch:
+    def __call__(self, row: Batch | bytes | None) -> Batch | None:
+        if row is None:
+            return None
         if not isinstance(row, Mapping):
             raise ValueError(
                 f"{self.described} reads {type(row).__name__} rows, which have no columns to select")
         missing = [name for name in self.columns if name not in row]
         if missing:
             raise ValueError(f"{self.described} has a row without the columns {missing}")
-        return row
+        return {name: row[name] for name in self.columns}
+
+
+@dataclass(frozen=True)
+class _ProjectedRows:
+    rows: Records
+    projection: _Projection
+
+    def __len__(self) -> int:
+        return len(self.rows)
+
+    def __getitem__(self, index: int) -> Batch | None:
+        return self.projection(self.rows[index])
 
 
 @dataclass(frozen=True)
@@ -799,7 +836,7 @@ class _ArrowFragment:
 class _ArrowRecords:
     def __init__(self, source: Files):
         self.source = source
-        self.ranges = Ranges(tuple(_fragment_rows(fragment) for fragment in source.fragments))
+        self.offsets = np.cumsum([0, *(_fragment_rows(fragment) for fragment in source.fragments)])
 
     @cached_property
     def _group(self):
@@ -813,23 +850,27 @@ class _ArrowRecords:
         return {key: value for key, value in self.__dict__.items() if key != "_group"}
 
     def __len__(self) -> int:
-        return len(self.ranges)
+        return int(self.offsets[-1])
 
     def __getitem__(self, index: int) -> Batch:
-        group, row = self.ranges.locate(index)
-        return self._group(group)[row]
+        if not 0 <= index < len(self):
+            raise IndexError(index)
+        group = bisect.bisect_right(self.offsets, index) - 1
+        return self._group(group)[index - int(self.offsets[group])]
 
 
 class _IndexedLines:
     def __init__(self, source: Files):
         self.source = source
-        self.indexes = source._indexes
+        self.indexes = (
+            (source.index,) if source.index else tuple(source._index_url(url) for url in source.paths)
+        )
         headers = source.__dict__.get("index_headers", {})
         self.index_files = tuple(
             ArrayIndex(url, source.storage_options, headers.get(url)) for url in self.indexes
         )
         self.tables = tuple(index.values for index in self.index_files)
-        self.ranges = Ranges(tuple(len(index) for index in self.tables))
+        self.offsets = np.cumsum([0, *(len(index) for index in self.tables)])
 
     def __getstate__(self) -> Mapping[str, object]:
         return {"source": self.source}
@@ -846,15 +887,17 @@ class _IndexedLines:
         for url in self.source.paths:
             fs, path, _ = Store(url, self.source.storage_options).readable()
             with _open_lines(fs, path) as file:
-                headers.append(_header(file))
+                headers.append(tuple(next(csv.reader(_CsvLines(file)))))
         return tuple(headers)
 
     def __len__(self) -> int:
-        return len(self.ranges)
+        return int(self.offsets[-1])
 
     def __getitem__(self, index: int) -> Batch:
-        group, row = self.ranges.locate(index)
-        entry = self.tables[group][row]
+        if not 0 <= index < len(self):
+            raise IndexError(index)
+        group = bisect.bisect_right(self.offsets, index) - 1
+        entry = self.tables[group][index - int(self.offsets[group])]
         shard = int(entry["shard"]) if self.source.index else group
         fs, path, _ = Store(self.source.paths[shard], self.source.storage_options).readable()
         names = self.fieldnames[shard] if self.source.kind == "csv" else None
@@ -866,49 +909,9 @@ class _IndexedLines:
                 payload = file.read(int(entry["bytes"]))
         else:
             payload = fs.cat_file(path, start=offset, end=offset + int(entry["bytes"]))
-        held = [line for line, _, _ in _lines(self.source.kind, io.BytesIO(payload), names)]
-        if len(held) != 1:
-            raise ValueError(f"{self.source.describe()}'s index names {len(held)} records, not one, at byte "
-                             f"{offset} of {path}: provision it again")
-        return _decoded(self.source.kind, held[0])
-
-
-def _header(file: BinaryIO) -> tuple[str, ...]:
-    """A CSV file's field names, its first row, read from `file`, which is left past it."""
-    return tuple(next(csv.reader(_CsvLines(file)), ()))
-
-
-def _lines(kind: str, file: BinaryIO, names: Sequence[str] | None = None,
-           stop: int | None = None) -> Iterator[tuple[bytes | dict[str, str], int, int]]:
-    """Each record of a `kind` line file from `file`'s position, undecoded (`_decoded`), with where
-    its bytes start and how many they are, until a record would start at `stop`: a CSV row of the
-    fields `names` (its quoted newlines its own, so it is parsed to be found), a JSON line's bytes
-    (blank lines skipped) or a text line's. The offsets an index provisions, an indexed read of one
-    record's bytes and a stream all find records by it; only a read decodes them."""
-    if kind == "csv":
-        reader = csv.DictReader(_CsvLines(file), fieldnames=names)
-        while stop is None or file.tell() < stop:
-            start = file.tell()
-            row = next(reader, None)
-            if row is None:
-                return
-            yield row, start, file.tell() - start
-        return
-    while stop is None or file.tell() < stop:
-        start = file.tell()
-        line = file.readline()
-        if not line:
-            return
-        if kind == "text" or line.strip():
-            yield line, start, len(line)
-
-
-def _decoded(kind: str, line: bytes | dict[str, str]) -> Batch:
-    """The record a line `_lines` found holds: a CSV row as parsed, a JSON line's object or a text
-    line's text."""
-    if isinstance(line, dict):
-        return line
-    return {"text": line.decode()} if kind == "text" else json.loads(line)
+        if names is not None:
+            return next(csv.DictReader(io.StringIO(payload.decode()), fieldnames=names))
+        return json.loads(payload) if self.source.kind == "jsonl" else {"text": payload.decode()}
 
 
 class _CsvLines(Iterator[str]):
@@ -943,16 +946,29 @@ class _LineIterator(grain.DatasetIterator):
         self.compression = infer_compression(self.path.lower())
         self.file = _open_lines(self.fs, self.path)
         self._opened = True
-        self.names = _header(self.file) if source.kind == "csv" else None
-        if self.names is None and shard.start:
+        self.csv = csv.DictReader(_CsvLines(self.file)) if source.kind == "csv" else None
+        if self.csv is not None:
+            _ = self.csv.fieldnames
+        elif shard.start:
             self.file.seek(shard.start - 1)
             if self.file.read(1) != b"\n":
                 self.file.readline()
-        self.records = _lines(source.kind, self.file, self.names, shard.stop)
 
     def __next__(self) -> Batch:
-        line, _, _ = next(self.records)
-        return _decoded(self.source.kind, line)
+        if self.shard.stop is not None and self.file.tell() >= self.shard.stop:
+            raise StopIteration
+        if self.csv is not None:
+            return next(self.csv)
+        while True:
+            line = self.file.readline()
+            if not line:
+                raise StopIteration
+            if self.source.kind == "text":
+                return {"text": line.decode()}
+            if line.strip():
+                return json.loads(line)
+            if self.shard.stop is not None and self.file.tell() >= self.shard.stop:
+                raise StopIteration
 
     def get_state(self) -> dict[str, int]:
         return {"offset": self.file.tell()}
@@ -965,9 +981,9 @@ class _LineIterator(grain.DatasetIterator):
             # Zstandard streams seek forward only; restoration starts from a fresh decoder.
             self.file.close()
             self.file = _open_lines(self.fs, self.path)
+            if self.csv is not None:
+                self.csv = csv.DictReader(_CsvLines(self.file), fieldnames=self.csv.fieldnames)
         _seek_lines(self.file, offset)
-        # The records read on from the restored offset, after a pass that read them all too.
-        self.records = _lines(self.source.kind, self.file, self.names, self.shard.stop)
 
     def close(self) -> None:
         if self._opened:

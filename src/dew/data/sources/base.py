@@ -111,9 +111,9 @@ class ShardManifest:
     a disjoint part of these records with an exact per-part position read
     by the same `reader`. None keeps the physical-shard requirement.
 
-    `index_ordered` states that the shards, one after another, read the
-    records in their index order, as a store read by index streams them
-    (`_indexed_manifest`)."""
+    `index_ordered` states that the shards read the records in their index
+    order, each the range of indices its `start` and `stop` name, as a store
+    read by index streams them (`_indexed_manifest`)."""
 
     shards: tuple[Shard, ...]
     reader: Callable[[Shard], pygrain.IterDataset]

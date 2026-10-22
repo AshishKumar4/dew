@@ -99,21 +99,14 @@ class Concatenate(Dataset):
         return np.concatenate(measured) if len(measured) == len(lengths) else None
 
     @cached_property
-    def _manifests(self) -> tuple[ShardManifest, ...]:
-        return tuple(source.manifest() for source in self.sources)
-
-    @cached_property
     def _shards(self) -> Mapping[str, tuple[ShardManifest, Shard]]:
         return {f"{index}/{shard.id}": (manifest, shard)
-                for index, manifest in enumerate(self._manifests) for shard in manifest.shards}
+                for index, source in enumerate(self.sources)
+                for manifest in (source.manifest(),) for shard in manifest.shards}
 
     def manifest(self) -> ShardManifest:
-        """Each store's shards, one store after another: their index order where each store's is,
-        as `records` joins them."""
-        ordered = all(manifest.index_ordered for manifest in self._manifests)
         return ShardManifest(tuple(dataclasses.replace(shard, id=identifier)
-                                   for identifier, (_, shard) in self._shards.items()), self._reader,
-                             index_ordered=ordered)
+                                   for identifier, (_, shard) in self._shards.items()), self._reader)
 
     def _reader(self, shard: Shard) -> grain.IterDataset:
         manifest, original = self._shards[shard.id]

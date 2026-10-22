@@ -45,7 +45,6 @@ from dew.data.analysis import (
     _name,
     _steps,
     _until,
-    _volatile,
 )
 from dew.data.cache import _Mapped
 from dew.data.concurrent import Concurrently
@@ -67,10 +66,7 @@ from dew.data.mixing import (
     Accepted,
     Chunked,
     CorpusCounts,
-    Members,
     PrimedMix,
-    ProportionalSelection,
-    Proportions,
     TokenDeficit,
     primed_maps,
     rewound,
@@ -101,11 +97,10 @@ from dew.data.pipeline import (
     Shuffle,
     Slice,
     Stage,
-    TokenBudget,
     TokenSplit,
+    Volatile,
     Windows,
     Workers,
-    children,
 )
 from dew.data.plan import Manifest
 from dew.data.readers import _FillShare
@@ -150,10 +145,15 @@ def _dropping(pipeline: Pipeline, lowering: _Lowering) -> bool:
     if lowering.cache is not None and not lowering.one_to_one:
         return True
     if any(_dropping(child, analyzed)
-           for child, analyzed in zip(children(pipeline), lowering.children, strict=True)):
+           for child, analyzed in zip(_corpora(pipeline), lowering.children, strict=True)):
         return True
     batched = _until(pipeline.stages, (BatchStage,))
     return any(_drops(stage) or isinstance(stage, Native) for stage in pipeline.stages[:batched])
+
+
+def _corpora(pipeline: Pipeline) -> tuple[Pipeline, ...]:
+    source = pipeline.source
+    return source.pipelines if isinstance(source, (Mixture, Phases)) else ()
 
 
 def _carried(pipeline: Pipeline, consumed: int, *, marked: bool) -> int:
@@ -509,7 +509,10 @@ class _Prefix:
 
     @property
     def volatile(self) -> bool:
-        return any(_volatile(stage) for stage in self.stages)
+        return any(
+            isinstance(stage, Map) and isinstance(stage.step, Volatile) and stage.step.volatile
+            for stage in self.stages
+        )
 
     def __call__(self, index: int, raw: Record) -> tuple[Record, ...]:
         position = _position(raw)
@@ -1128,25 +1131,24 @@ class _Build:
         if all(isinstance(parent, pygrain.MapDataset) for parent in parents):
             mapped = [parent for parent in parents if isinstance(parent, pygrain.MapDataset)]
             checked = primed_maps(mapped)
-            selection = ProportionalSelection([len(parent) for parent in checked], _weights(source))
-            return pygrain.MapDataset.select_from_datasets(checked, selection)
+            return pygrain.MapDataset.mix(checked, _weights(source))
         streams = [
             Accepted(_as_iter(parent, self.loading), _name(child), _label(child))
             for parent, child in zip(parents, source.pipelines, strict=True)
         ]
         # A streamed mix saves each member's position under its key, so a member that joins starts
         # and one that left is dropped while the others resume (`Plan.check`).
-        members = Members(tuple(source.weights),
-                          tuple(_member_keys(strings(self.lowering.order["members"], "mixture members"))))
+        keys = _member_keys(strings(self.lowering.order["members"], "mixture members"))
         if source.tokens is not None:
             return TokenDeficit(
                 streams,
-                members,
+                source.weights,
                 tokens=source.tokens,
                 names=[_name(child) for child in source.pipelines],
                 labels=[_label(child) for child in source.pipelines],
+                keys=keys,
             )
-        return PrimedMix(streams, members)
+        return PrimedMix(streams, source.weights, keys)
 
     def indexed(
         self, pipeline: Pipeline, source: Source, partition: DataPartition, last: int, *, marked: bool = False
@@ -1584,21 +1586,24 @@ class _Build:
 def _epoch_records(train: Pipeline, build: _Build) -> int | None:
     """The records in one epoch of a global order: each corpus's indexed order
     up to its first repeat, as the lowering builds it, so a slice, a limit and
-    a token split count exactly. A mixture read once counts the records its mix
-    reads before it ends, as the lowering builds it. One read on past its end,
-    by a repeat that never ends, a training order's own (`_Build.batched`), or a
-    mix of parts that never end, reads each part on from where it was, so it
-    counts until every part has come round once (`Proportions.covering`), the
-    parts it mixes counted alike, unless a slice or a limit before its repeat
-    reads a view of the mix, whose pass it counts. An order that ends counts no
-    more than it reads, whatever bounds it after its repeat. A repeat written before a cache counts the
+    a token split count exactly; a mixture, nested or not, reads until its
+    first part would come round. A repeat written before a cache counts the
     inputs a pass reads where the cache keeps one record for each, and none
     otherwise, ahead of reading them; phases are counted by none."""
     if not build.global_order:
         return None
 
-    def passed(pipeline: Pipeline, build: _Build) -> int | None:
-        """The records `pipeline` reads up to its first repeat, as the lowering builds them."""
+    def counted(pipeline: Pipeline, build: _Build) -> int | None:
+        source = pipeline.source
+        if isinstance(source, Mixture):
+            sizes = [counted(child, build.child(index))
+                     for index, child in enumerate(source.pipelines)]
+            known = [size for size in sizes if size is not None]
+            if len(known) != len(sizes):
+                return None
+            weights = _weights(source)
+            shares = zip(known, weights, strict=True)
+            return max(math.ceil(size * sum(weights) / weight) for size, weight in shares)
         at = _until(pipeline.stages, (Repeat,))
         cache = build.lowering.cache
         if cache is not None and cache >= at:
@@ -1613,46 +1618,7 @@ def _epoch_records(train: Pipeline, build: _Build) -> int | None:
                                     DataPartition())) as rows:
             return len(rows) if isinstance(rows, pygrain.MapDataset) else None
 
-    def covered(pipeline: Pipeline, build: _Build) -> int | None:
-        """The records of `pipeline` read on past its end in which every part comes round once."""
-        source = pipeline.source
-        once = pipeline.stages[:_until(pipeline.stages, (Repeat,))]
-        if not isinstance(source, Mixture) or any(isinstance(stage, (Slice, Limit)) for stage in once):
-            return passed(pipeline, build)
-        sizes = [covered(child, build.child(index)) for index, child in enumerate(source.pipelines)]
-        known = [size for size in sizes if size is not None]
-        if len(known) != len(sizes):
-            return None
-        return Proportions.of(_weights(source)).covering(known)
-
-    repeated, batched = _until(train.stages, (Repeat,)), _until(train.stages, (BatchStage, TokenBudget))
-    order = dataclasses.replace(train, stages=train.stages[:batched])
-    # Read on past its end: by a repeat without a count, or as a mix of parts that never end.
-    source = train.source
-    onward = any(isinstance(stage, Repeat) and stage.epochs is None for stage in order.stages) or (
-        isinstance(source, Mixture) and all(_unending(child) for child in source.pipelines))
-    # A training order that repeats nowhere repeats for ever at its root (`_Build.batched`).
-    rooted = build.training and build.lowering.endless and not build.lowering.repeated
-    count = covered(train, build) if onward or rooted else passed(train, build)
-    if count is None or rooted or _unending(order) or (not onward and repeated >= batched):
-        return count
-    # An order that ends holds no more than it reads before its batch, whatever bounds it after its repeat.
-    with _closing(build.records(order, DataPartition())) as rows:
-        return min(count, len(rows)) if isinstance(rows, pygrain.MapDataset) else count
-
-
-def _unending(pipeline: Pipeline) -> bool:
-    """Whether `pipeline`'s order never ends, its stages read in turn: a repeat without a count makes
-    it endless and a limit or a slice with an end ends it again, from a mixture whose parts' orders
-    each never end, whose mix never does, or a source that ends."""
-    source = pipeline.source
-    endless = isinstance(source, Mixture) and all(_unending(child) for child in source.pipelines)
-    for stage in pipeline.stages:
-        if isinstance(stage, Repeat) and stage.epochs is None:
-            endless = True
-        elif isinstance(stage, Limit) or (isinstance(stage, Slice) and stage.selection.stop is not None):
-            endless = False
-    return endless
+    return counted(train, build)
 
 
 def _split_spans(pipeline: Pipeline, build: _Build) -> Iterator[list[tuple[int, int, int]]]:
@@ -1661,8 +1627,9 @@ def _split_spans(pipeline: Pipeline, build: _Build) -> Iterator[list[tuple[int, 
     lowering's own split (`_TokenSplit`) of the indexed order before it, built
     with the analysis of the pipeline it is written in, so they are the
     documents and token offsets a reader of the plan trains on."""
-    for index, child in enumerate(children(pipeline)):
-        yield from _split_spans(child, build.child(index))
+    if isinstance(pipeline.source, (Mixture, Phases)):
+        for index, child in enumerate(pipeline.source.pipelines):
+            yield from _split_spans(child, build.child(index))
     for at, split in enumerate(pipeline.stages):
         if at in build.lowering.splits and isinstance(split, TokenSplit):
             before = dataclasses.replace(pipeline, stages=pipeline.stages[:at])

@@ -1,5 +1,4 @@
-"""Step FLOP measurement, MFU accounting, the persistent compilation cache and the programs a jitted
-function needs (`Compiles`): this module owns Dew's listeners on JAX's events.
+"""Step FLOP measurement, MFU accounting and the persistent compilation cache.
 
 The FLOP count is read off the optimized HLO, not out of XLA's
 `cost_analysis()`. Cost analysis reports only the operations the compiler can
@@ -32,40 +31,6 @@ def _cache_event(event: str, **metadata) -> None:
     if event in _cache_counts:
         with _cache_lock:
             _cache_counts[event] += 1
-
-
-class Compiles:
-    """Counts the programs jitted functions named `name` need while it is open, each compiled or
-    fetched from the persistent compilation cache, as JAX reports them (`jax.monitoring`'s backend
-    compile event, which names a function `jit(<name>)`): what a warm-up costs, or a compile a
-    measured run should not have paid. JAX's events have one listener owner, this module.
-
-        with Compiles("_stepped") as compiles:
-            server.run()
-        assert compiles.count == 0
-    """
-
-    EVENT = "/jax/core/compile/backend_compile_duration"
-
-    def __init__(self, name: str) -> None:
-        self.name = f"jit({name})"
-        self.seconds: list[float] = []
-        """Each program's seconds, in the order they were needed."""
-
-    @property
-    def count(self) -> int:
-        return len(self.seconds)
-
-    def __enter__(self) -> "Compiles":
-        jax.monitoring.register_event_duration_secs_listener(self._heard)
-        return self
-
-    def __exit__(self, *_) -> None:
-        jax.monitoring.unregister_event_duration_listener(self._heard)
-
-    def _heard(self, event: str, duration_secs: float, **metadata: str | int) -> None:
-        if event == self.EVENT and metadata.get("fun_name") == self.name:
-            self.seconds.append(duration_secs)
 
 
 @functools.cache

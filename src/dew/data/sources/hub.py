@@ -7,6 +7,7 @@ from dataclasses import dataclass, replace
 from functools import cached_property
 from pathlib import Path
 
+import grain.python as grain
 import numpy as np
 
 from dew.cache import HubAnswer, hub_answer, recorded_hub_answer
@@ -15,7 +16,8 @@ from dew.data.pipeline import Dataset
 
 from .base import Read, ShardManifest, Source, preparing
 from .files import Files, Format
-from .hf import arrow_rows, class_names
+from .hf import _undecoded, class_names
+from .memory import _record
 
 
 def hold_progress_lock() -> None:
@@ -278,7 +280,7 @@ class Hub(Dataset):
             raise TypeError(f"{self.describe()} did not resolve to one split")
         if self.columns is not None:
             dataset = dataset.select_columns(list(self.columns))
-        return arrow_rows(dataset)
+        return grain.MapDataset.source(_undecoded(dataset)).map(_record)
 
     def manifest(self) -> ShardManifest:
         return self.files.manifest()

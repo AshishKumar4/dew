@@ -36,13 +36,6 @@ if TYPE_CHECKING:
     from dew.data.dataset import Records
     from dew.data.steps.chat import RenderPrompt
 
-PROMPT_LEN = 256
-"""The ids a rendered prompt is laid out in where none is asked for (`RenderPrompt`)."""
-PROMPT_PAD = 0
-"""The id a rendered prompt is left-padded with where none is asked for."""
-PROMPT_LONG: Literal["drop", "truncate"] = "truncate"
-"""What a prompt longer than its ids becomes where none is asked for: its tail."""
-
 PROMPT_KEY = "prompt"
 """Batch key the prompts pipeline left-pads `[B, max_prompt_len]` ids under."""
 
@@ -184,9 +177,8 @@ def _utf8(text: str, width: int) -> np.ndarray:
     return out
 
 
-def encode(tokenizer: str | PreTrainedTokenizerBase, *, max_prompt_len: int = PROMPT_LEN,
-           pad_id: int = PROMPT_PAD, long: Literal["drop", "truncate"] = PROMPT_LONG,
-           thinking: bool | None = None) -> RenderPrompt:
+def encode(tokenizer: str | PreTrainedTokenizerBase, *, max_prompt_len: int = 256, pad_id: int = 0,
+           long: Literal["drop", "truncate"] = "truncate", thinking: bool | None = None) -> RenderPrompt:
     """A record step that renders a prompt row (verl's columns: "prompt",
     "data_source", "ground_truth", ...) to `max_prompt_len` left-padded ids,
     keeping a longer one's tail, or dropping it (`long="drop"`), counted as a

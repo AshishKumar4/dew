@@ -2,15 +2,14 @@
 
 from __future__ import annotations
 
-import bisect
-import itertools
+import hashlib
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from functools import cached_property
 
 import numpy as np
 
-from dew.data.storage import Store, local, matching, object_info
+from dew.data.storage import Store
 
 
 @dataclass(frozen=True)
@@ -26,7 +25,8 @@ class ArrayIndex:
         snapshot = None
         if self.metadata is not None:
             snapshot = {"size": self.metadata.get("bytes", self.metadata.get("size")), **self.metadata}
-        if not local(fs) or self.metadata is not None:
+        protocols = (fs.protocol,) if isinstance(fs.protocol, str) else fs.protocol
+        if "file" not in protocols or self.metadata is not None:
             fs, path = store.cached().resolve()
         opened = fs.open(path, "rb", source_snapshot=snapshot)
         if not isinstance(opened.name, str):
@@ -42,9 +42,14 @@ class ArrayIndex:
         return values
 
     def verify(self, reference: Mapping[str, object]) -> None:
-        """Refuse the pinned index unless it is the size and digest `reference` committed."""
+        self.pin.seek(0, 2)
+        size = self.pin.tell()
+        self.pin.seek(0)
         with open(self.pin.name, "rb") as reader:
-            matching(object_info(reader), reference, self.url)
+            checksum = hashlib.file_digest(reader, "sha256").hexdigest()
+        self.pin.seek(0)
+        if size != reference["bytes"] or checksum != reference["sha256"]:
+            raise OSError(f"committed NumPy index is corrupt: {self.url}")
 
     def close(self) -> None:
         self.__dict__.pop("values", None)
@@ -54,29 +59,3 @@ class ArrayIndex:
 
     def __getstate__(self) -> Mapping[str, object]:
         return {"url": self.url, "storage_options": self.storage_options, "metadata": self.metadata}
-
-
-@dataclass(frozen=True)
-class Ranges:
-    """Consecutive ranges of `counts` items each, as an indexed store's shards hold their records:
-    which range holds an item (`locate`), where a range starts (`start`) and the items of them all.
-    A range of no items holds none, so an item is never located in one."""
-
-    counts: tuple[int, ...]
-
-    @cached_property
-    def ends(self) -> tuple[int, ...]:
-        return tuple(itertools.accumulate(self.counts))
-
-    def __len__(self) -> int:
-        return self.ends[-1] if self.ends else 0
-
-    def start(self, shard: int) -> int:
-        return self.ends[shard - 1] if shard else 0
-
-    def locate(self, position: int) -> tuple[int, int]:
-        """The range that holds the item at `position` of them all, and its place in that range."""
-        if not 0 <= position < len(self):
-            raise IndexError(position)
-        shard = bisect.bisect_right(self.ends, position)
-        return shard, position - self.start(shard)

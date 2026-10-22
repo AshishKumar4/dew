@@ -298,10 +298,6 @@ GRAIN_KILL_SECONDS = 25
 no setting or reading of: 25 s in grain 0.2.18 (process_prefetch.py), the release tested."""
 
 
-WORKER_BUFFER = 2
-"""The batches each worker process reads ahead where none is asked for (`Loading`, `Pipeline.workers`)."""
-
-
 @dataclasses.dataclass(frozen=True)
 class Loading:
     """Read throughput settings, as Grain's four knobs.
@@ -344,7 +340,7 @@ class Loading:
     workers: int | Literal["auto"] = 0
     threads: int = 16
     read_buffer: int = 16
-    worker_buffer: int = WORKER_BUFFER
+    worker_buffer: int = 2
     ram_budget_mb: int | None = None
     max_workers: int | None = None
 
@@ -893,6 +889,18 @@ def describe(source: Indexed | pygrain.MapDataset[Batch]) -> str:
     return repr(source) if described else type(source).__name__
 
 
+def weight_counts(shares: Sequence[float], records: int) -> tuple[int, ...]:
+    """Grain's proportional selection counts over a prefix of an indexed mixture."""
+    scale = 100 / min(shares)
+    proportions = [int(share * scale) for share in shares]
+    counts, remaining, left = [], sum(proportions), records
+    for proportion in proportions:
+        rest = left * (remaining - proportion) // remaining
+        counts.append(left - rest)
+        left, remaining = rest, remaining - proportion
+    return tuple(counts)
+
+
 class FilledBatch(pygrain.MapTransform):
     """A batch of fewer than `rows` records filled out with repeats of its
     own rows (`RowPlan.pad`), and `VALID_ROWS` marking the real ones. Without
@@ -1150,20 +1158,6 @@ class GlobalReader(Protocol):
     def identity(self) -> str: ...
 
 
-def phase_ends(ends: Sequence[int | None], unit: Literal["step", "record"]) -> tuple[int, ...]:
-    """The ends of every phase but the last, which runs on (`None`), each past the one before it and
-    above zero, counted in `unit`s: steps where a run writes its phases (`Phases`), records where it
-    reads them (`PhasedStream`)."""
-    if not ends or ends[-1] is not None:
-        raise ValueError(f"phases need one end per phase, in {unit}s, the last None, which runs on")
-    bounded = tuple(end for end in ends[:-1] if end is not None)
-    rising = all(later > earlier for earlier, later in itertools.pairwise((0, *bounded)))
-    if len(bounded) != len(ends) - 1 or not rising:
-        raise ValueError(f"every phase but the last ends at a {unit}, past the one before it and above "
-                         f"zero, not {list(ends)}")
-    return bounded
-
-
 class PhasedStream:
     """Reads one global order per phase, switching at step boundaries.
 
@@ -1187,8 +1181,14 @@ class PhasedStream:
     endless = True
 
     def __init__(self, phases: Sequence[tuple[Callable[[], GlobalReader], int | None]], stop_seconds: float):
-        self._ends = phase_ends([end for _, end in phases], "record")
+        ends = [end for _, end in phases]
+        bounded = [end for end in ends[:-1] if end is not None]
+        if not phases or ends[-1] is not None or len(bounded) != len(ends) - 1:
+            raise ValueError("every phase but the last ends at a record count; the last runs on")
+        if any(later <= earlier for earlier, later in itertools.pairwise([0, *bounded])):
+            raise ValueError(f"phase ends must increase from above zero, got {bounded}")
         self._streams = [open_stream() for open_stream, _ in phases]
+        self._ends: tuple[int, ...] = tuple(bounded)
         self._records = 0
         self._current: int | None = None
         self.stop_seconds = stop_seconds

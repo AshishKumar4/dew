@@ -19,7 +19,6 @@ import numpy as np
 from dew.data.dataset import Batch
 from dew.data.facts import shaped
 from dew.data.pipeline import Rejected
-from dew.data.sources.av_utils import FPS
 from dew.data.sources.files import Files
 
 if TYPE_CHECKING:
@@ -121,7 +120,7 @@ class DecodeVideo(grain.MapTransform):
 
     frames: int = 16
     _: dataclasses.KW_ONLY
-    fps: float = FPS
+    fps: float = 25.0
     size: int = 256
     min_size: int = 0
     field: str = "mp4"

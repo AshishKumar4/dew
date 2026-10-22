@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import tempfile
 import uuid
 from collections.abc import Iterable, Iterator, Mapping
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import TYPE_CHECKING, Literal, Protocol, runtime_checkable
 
 import grain.python as grain
 import numpy as np
@@ -16,15 +17,20 @@ import pyarrow as pa
 import pyarrow.dataset as ds
 from array_record.python.array_record_module import ArrayRecordWriter
 
-from dew.data.dataset import Batch, Closeable
+from dew.data.dataset import Batch
 from dew.data.sources.base import Source
 from dew.data.sources.codec import encode
 from dew.data.sources.files import _arrow_filesystem
 from dew.data.steps.text import count_rules, stated_rules
-from dew.data.storage import ObjectRef, Store, commit_export
+from dew.data.storage import ObjectRef, Store
 
 if TYPE_CHECKING:
     from dew.data.pipeline import Pipeline
+
+
+@runtime_checkable
+class _Closeable(Protocol):
+    def close(self) -> None: ...
 
 
 def _chunks(values: Iterable[Batch | bytes | None], rows: int) -> Iterator[list[Batch | bytes | None]]:
@@ -99,21 +105,15 @@ def _length_index(root: Store, writer: str, number: int, batch, field: str | Non
     return {"path": path, **root.child(path).verified(encoded.getvalue())}
 
 
-def write_array_record(path: Path, payloads: Iterable[bytes]) -> None:
-    """`payloads` written to a local ArrayRecord file at `path`, one record each in their order, the
-    file closed whether or not they all were: the shard an export and a cache fill each upload."""
-    writer = ArrayRecordWriter(str(path), "group_size:1")
-    try:
-        for payload in payloads:
-            writer.write(payload)
-    finally:
-        writer.close()
-
-
 def _array_shard(root: Store, writer: str, number: int, batch, index: ObjectRef | None):
     with tempfile.TemporaryDirectory(prefix="dew-export-") as temporary:
         path = Path(temporary) / "part.array_record"
-        write_array_record(path, (encode(row) for row in batch))
+        record_writer = ArrayRecordWriter(str(path), "group_size:1")
+        try:
+            for row in batch:
+                record_writer.write(encode(row))
+        finally:
+            record_writer.close()
         relative = f"shards/{writer}/part-{number:06d}.array_record"
         return {
             "path": relative,
@@ -212,12 +212,22 @@ def export(
                 files.append(
                     {"path": relative, "bytes": len(payload), "sha256": hashlib.sha256(payload).hexdigest()}
                 )
-        # The rules other than every target's its rows were counted by, which a pack of them by a
-        # plan of their lengths could not count (`dew.data.analysis._ruled`).
-        return commit_export(root, format=format, codec=1 if format == "array_record" else None, rows=count,
-                             files=files, metadata=metadata,
-                             certified={"count_rules": [list(rule) for rule in sorted(rules, key=repr)],
-                                        "partitioning": None if partitioning is None else list(partitioning)})
+        manifest = {
+            "schema": 1,
+            "format": format,
+            "codec": 1 if format == "array_record" else None,
+            "rows": count,
+            # The rules other than every target's its rows were counted by, which a pack of them
+            # by a plan of their lengths could not count (`dew.data.analysis._ruled`).
+            "count_rules": [list(rule) for rule in sorted(rules, key=repr)],
+            "partitioning": partitioning,
+            "files": files,
+            "metadata": metadata or {},
+        }
+        encoded = json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode()
+        root.child("_dew_manifest.json").put_if_absent(encoded)
+        root.child("_SUCCESS").put_if_absent(hashlib.sha256(encoded).hexdigest().encode())
+        return manifest
     finally:
-        if isinstance(rows, Closeable):
+        if isinstance(rows, _Closeable):
             rows.close()

@@ -31,15 +31,15 @@ from dew.data import (
     video as video_steps,
 )
 from dew.data.pipeline import (
-    PACK_BINS,
-    PACK_POLICY,
     Cached,
     Configured,
     Dataset,
     DeviceStep,
     HostStep,
     Limit,
+    Mixture,
     Pack,
+    Phases,
     Pipeline,
     Prefetch,
     RandomStep,
@@ -49,7 +49,6 @@ from dew.data.pipeline import (
     Windows,
     Workers,
 )
-from dew.data.prompts import PROMPT_LONG, PROMPT_PAD
 from dew.data.sources.base import Source
 from dew.data.text import SavedTokenizer
 
@@ -146,7 +145,7 @@ def _finished(prepared: Dataset, *, batch: int | None, records: int | None, host
 
 def lm(dataset: Dataset, tokenizer: str | SavedTokenizer | None, *, seq_len: int, batch: int | None,
        field: str = "text", eos: bool | None = None,
-       pack: Literal["first-fit", "best-fit", "concat"] | None = PACK_POLICY, bins: int = PACK_BINS,
+       pack: Literal["first-fit", "best-fit", "concat"] | None = "first-fit", bins: int = 32,
        stride: int | None = None, cache: str | Cached | None = None,
        records: int | None = None, host: tuple[HostStep, ...] = ()) -> Pipeline:
     """Documents in `field` tokenized, ended by the tokenizer's EOS where it has one (`eos=True`
@@ -206,7 +205,7 @@ def token_windows(dataset: Dataset, *, seq_len: int, batch: int | None, stride: 
 
 def sft(dataset: Dataset, tokenizer: str | SavedTokenizer, *, seq_len: int, batch: int | None,
         messages: str = "messages", long: Literal["chunk", "truncate", "drop"] = "chunk",
-        pack: Literal["first-fit", "best-fit", "concat"] = PACK_POLICY, bins: int = PACK_BINS,
+        pack: Literal["first-fit", "best-fit", "concat"] = "first-fit", bins: int = 32,
         cache: str | Cached | None = None, records: int | None = None,
         host: tuple[HostStep, ...] = ()) -> Pipeline:
     """Conversations in `messages` rendered through the tokenizer's chat
@@ -228,25 +227,29 @@ def _documented(dataset: Dataset) -> None:
     """Refuse to pack token documents from a store that states no document ends (neither an index
     of them nor an EOS token), wherever it sits in the chain's sources: its tokens would read as
     one document, whose pieces no producer made."""
-    from dew.data.analysis import _leaves
     from dew.data.sources.tokens import TokenFiles
 
-    for source in (store for _, leaf in _leaves(dataset._chain()) for store in _stores(leaf)):
+    for source in _stores(dataset._chain().source):
         if isinstance(source, TokenFiles) and not source.documented:
             raise ValueError(f"packed text needs producer document boundaries or EOS: {source.describe()}")
 
 
-def _stores(source: Source) -> Iterator[Source]:
-    """Every store `source` reads: a concatenation's parts, and the store each holdout selection
-    selects from."""
+def _stores(source: Source | Mixture | Phases) -> Iterator[Source]:
+    """Every store under `source`: a mixture's or phases' corpora's, a concatenation's parts, and
+    the store each holdout selection selects from."""
     from dew.data.holdout import selecting
+    from dew.data.pipeline import Mixture, Phases
     from dew.data.sources.concatenate import Concatenate
 
-    for _, selected in selecting(source):
+    if isinstance(source, (Mixture, Phases)):
+        for child in source.pipelines:
+            yield from _stores(child.source)
+        return
+    for selected in selecting(source):
         if isinstance(selected, Concatenate):
             for part in selected.sources:
                 yield from _stores(part)
-        else:
+        elif not isinstance(selected, (Mixture, Phases)):
             yield selected
 
 
@@ -281,8 +284,7 @@ def _conversation_windows(rendered: Dataset, pack: Pack, *, long: Literal["trunc
 
 
 def prompts(dataset: Dataset, tokenizer: str | SavedTokenizer, *, max_prompt_len: int, batch: int | None,
-            pad_id: int = PROMPT_PAD, long: Literal["drop", "truncate"] = PROMPT_LONG,
-            thinking: bool | None = None,
+            pad_id: int = 0, long: Literal["drop", "truncate"] = "truncate", thinking: bool | None = None,
             reward_bytes: int | None = None, cache: str | Cached | None = None, records: int | None = None,
             host: tuple[HostStep, ...] = ()) -> Pipeline:
     """Prompt rows (verl's columns: "prompt", "data_source", "ground_truth", ...) rendered to
