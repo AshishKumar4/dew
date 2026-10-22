@@ -1589,11 +1589,11 @@ def test_block_shuffle_is_a_complete_bounded_physical_order_and_resumes():
     from dew.data.ordering import BlockShuffle
 
     blocked = BlockShuffle(grain.MapDataset.source(stored.values), stored.physical, 2, 11)
-    order, ends = blocked._epoch(0)
+    order, blocks = blocked._epoch(0)
     assert len(order) == 3
     start = 0
     original_ends = np.cumsum(stored.physical)
-    for end in ends:
+    for end in blocks.ends:
         selected = {int(np.searchsorted(original_ends, blocked.index(index), side="right"))
                     for index in range(start, int(end))}
         assert len(selected) <= 2
