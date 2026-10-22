@@ -23,20 +23,23 @@ SOURCE = f"https://raw.githubusercontent.com/huggingface/transformers/{REVISION}
 RECORDED = Path(__file__).resolve().parents[1] / "tests" / "fixtures" / "kda" / "recorded_rules.npz"
 INPUTS = ("query", "key", "value", "g", "beta", "state")
 RULES = ("chunk", "recurrent")
+ROWS = 16
+"""A draw's rows: a gradient of a few values a row takes many to resolve."""
 
 
 def rule_inputs(seed: int) -> dict[str, np.ndarray]:
-    """A seed's fp32 operands and cotangents, the same on every run: seven tokens of two heads, keys of
-    three and values of four, decays below zero, gates in (0, 1) and a small initial state."""
+    """A seed's fp32 operands and cotangents, the same on every run: ROWS rows of seven tokens of two
+    heads, keys of three and values of four, decays below zero, gates in (0, 1) and a small initial
+    state."""
     rng = np.random.default_rng([713, seed])
     arrays = {name: rng.normal(size=shape).astype(np.float32) for name, shape in (
-        ("query", (1, 7, 2, 3)), ("key", (1, 7, 2, 3)), ("value", (1, 7, 2, 4)),
-        ("g", (1, 7, 2, 3)), ("beta", (1, 7, 2)), ("state", (1, 2, 3, 4)))}
+        ("query", (ROWS, 7, 2, 3)), ("key", (ROWS, 7, 2, 3)), ("value", (ROWS, 7, 2, 4)),
+        ("g", (ROWS, 7, 2, 3)), ("beta", (ROWS, 7, 2)), ("state", (ROWS, 2, 3, 4)))}
     arrays["g"] = -np.abs(arrays["g"]) * np.float32(.7)
     arrays["beta"] = 1 / (1 + np.exp(-arrays["beta"]))
     arrays["state"] *= np.float32(.3)
-    arrays["output_cotangent"] = rng.normal(size=(1, 7, 2, 4)).astype(np.float32)
-    arrays["state_cotangent"] = rng.normal(size=(1, 2, 3, 4)).astype(np.float32)
+    arrays["output_cotangent"] = rng.normal(size=(ROWS, 7, 2, 4)).astype(np.float32)
+    arrays["state_cotangent"] = rng.normal(size=(ROWS, 2, 3, 4)).astype(np.float32)
     return arrays
 
 
