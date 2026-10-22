@@ -430,9 +430,10 @@ def text_copies(files: list[Path], jobs: int) -> int:
 
     if jobs > 1:
         # pylint's parser leaves cycles a worker's collector would trace through everything the fork
-        # inherited, which tripled the stripping's time: a worker collects nothing, and ends after 64 files.
+        # inherited, which tripled the stripping's time: a worker collects nothing, and ends after 16 files,
+        # so what it leaves uncollected stays small.
         forked = multiprocessing.get_context("fork")
-        with forked.Pool(jobs, initializer=gc.disable, maxtasksperchild=8) as pool:
+        with forked.Pool(jobs, initializer=gc.disable, maxtasksperchild=2) as pool:
             read = pool.map(stripped, files, chunksize=8)
     else:
         read = [stripped(file) for file in files]
@@ -517,4 +518,4 @@ def main(arguments: Sequence[str], jobs: int = 1) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main(sys.argv[1:], jobs=os.cpu_count() or 1))
+    sys.exit(main(sys.argv[1:], jobs=len(os.sched_getaffinity(0))))
