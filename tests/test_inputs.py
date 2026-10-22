@@ -131,9 +131,11 @@ def test_every_token_id_parser_reads_ids_by_one_law(parser):
 def test_a_request_refuses_a_bool_row_beside_integer_rows():
     """A request's rows are each read by the one law before they join into an array, so a NumPy row
     of bools beside a list of integers is refused, not promoted into ids 1 and 0."""
+    from collections import UserList
+
     from dew.inference.tasks import prepared_inputs
 
-    for row in (np.array([True, False]), [True, 3]):
+    for row in (np.array([True, False]), [True, 3], UserList([True, 3])):
         with pytest.raises(ValueError):
             prepared_inputs(None, [row, [2, 3]], images=None)
     assert np.asarray(prepared_inputs(None, [np.array([4, 5]), [2, 3]], images=None).tokens).tolist() == [
