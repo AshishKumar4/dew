@@ -397,8 +397,9 @@ def _tgmm_ragged_dot_kernel(
 ):
   *prologue_refs, A_bar_ref = refs
   assert A_bar_ref.shape == (block.k, block.n)
-  pid =  SimpleNamespace(gi=pl.program_id(0), r=pl.program_id(1),
-                         c=pl.program_id(2))
+  # Dew: a group's output tiles launch together, its column tiles fastest, so a wave reads one group's
+  # rows from the L2 rather than each group's same tile (upstream put the group on the fastest axis).
+  pid = SimpleNamespace(c=pl.program_id(0), r=pl.program_id(1), gi=pl.program_id(2))
   size = jax.tree.map(partial(np.array, dtype=np.int32), size)
   group_sz = group_sizes_ref[pid.gi]
   compute_dtype = compute_dtype if compute_dtype is not None else x_ref.dtype
@@ -497,17 +498,17 @@ def tgmm(
 
   group_offsets = jnp.cumsum(group_sizes) - group_sizes
   in_specs = [
-    pl.BlockSpec((size.m, block_k), lambda i, r, c: (0, r)),
-    pl.BlockSpec((size.m, block_n), lambda i, r, c: (0, c)),
-    pl.BlockSpec((size.g,), lambda i, r, c: (0,)),
-    pl.BlockSpec((size.g,), lambda i, r, c: (0,)),
-    *(pl.BlockSpec(side.shape, lambda i, r, c, ndim=side.ndim: (0,) * ndim) for side in prologue_operands),
+    pl.BlockSpec((size.m, block_k), lambda c, r, i: (0, r)),
+    pl.BlockSpec((size.m, block_n), lambda c, r, i: (0, c)),
+    pl.BlockSpec((size.g,), lambda c, r, i: (0,)),
+    pl.BlockSpec((size.g,), lambda c, r, i: (0,)),
+    *(pl.BlockSpec(side.shape, lambda c, r, i, ndim=side.ndim: (0,) * ndim) for side in prologue_operands),
   ]
 
   out_shape = jax.ShapeDtypeStruct(
     (size.g, size.k, size.n), dtype=out_dtype or x.dtype)
-  out_specs = pl.BlockSpec((None, block_k, block_n), lambda i, r, c: (i, r, c))
-  grid = (size.g, pl.cdiv(size.k, block_k), pl.cdiv(size.n, block_n))
+  out_specs = pl.BlockSpec((None, block_k, block_n), lambda c, r, i: (i, r, c))
+  grid = (pl.cdiv(size.n, block_n), pl.cdiv(size.k, block_k), size.g)
 
   block_sizes = BlockSizes(m=block_m, k=block_k, n=block_n)
   dtype_spec = {"compute_dtype": compute_dtype, "acc_dtype": acc_dtype, "prologue": prologue,

@@ -89,11 +89,12 @@ from dew.training.optim import (
     scaled_solver,
     weight_decay_mask,
 )
+from dew.training.profiling import ProfileWindow
 from dew.training.quantization import quantize_trunk
 from dew.training.selection import Best
 from dew.training.state import TrainState
 from dew.training.tracker import LocalTracker, Tracker, Trackers, WandbTracker
-from dew.training.trainer import ProfileWindow, Rollout, Trainer
+from dew.training.trainer import Rollout, Trainer
 
 JsonDict = Annotated[
     Mapping[str, object],
