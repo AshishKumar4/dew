@@ -2,10 +2,14 @@
 
 Each likelihood a generation records, cached and padded, is on par with a
 fresh full forward over its row's unpadded tokens from that forward's float64
-evaluation over drawn prompts and keys (check 1, tests/reference_error.py);
-each draw's steps clear MARGIN at the policy's cutoff, so the float64 forward
-keeps the tokens the policy kept. What is one computation, or a token, is held
-exactly.
+evaluation over drawn prompts and keys (check 1, tests/reference_error.py).
+The raw model's likelihoods are held over every draw. A policy's, which read
+its top-k support, and a comparison of two generations' tokens hold over draws
+whose steps clear MARGIN at the policy's cutoff, so the float64 forward keeps
+the support and the tokens the float32 one kept; the selection at a near tie is
+the sampler's, held by tests/test_decoding_strategies.py's planted ties, and the
+logits it reads are the raw likelihoods'. What is one computation, or a token,
+is held exactly.
 """
 
 from contextlib import contextmanager
@@ -37,16 +41,25 @@ MARGIN = 1e-4
 """The least gap a draw admits between the scores either side of a policy's cutoff, the top-k's last
 and the first outside it, or the two largest under greedy decoding: past it a float64 forward keeps
 the tokens the float32 policy kept."""
-SEEDS = {'attention cache capacity': 32, 'attention cached scores': 16, 'attention perplexity': 16,
-         'attention positions': 8, 'attention rescored generation': 8, 'greedy padded generation': 32,
-         'mla cache capacity': 8, 'mla cached scores': 8, 'mla positions': 8,
-         'mla rescored generation': 16, 'recurrent cache capacity': 32, 'recurrent cached scores': 32,
-         'recurrent perplexity': 64, 'recurrent positions': 64, 'recurrent rescored generation': 16,
-         'sampled padded generation': 16, 'trainer update': 32, 'attention registered scores': 16,
-         'deepseek_v4 registered scores': 16, 'gated_delta_net registered scores': 64,
-         'kimi_delta_attention registered scores': 64, 'kpool_sparse_attention registered scores': 8,
-         'llama4 registered scores': 8, 'mamba registered scores': 8, 'mamba2 registered scores': 8,
-         'mla registered scores': 8, 'mlp registered scores': 16}
+SEEDS = {'attention cache capacity': 32, 'attention cached scores raw': 16,
+         'attention cached scores policy': 16, 'attention perplexity': 16, 'attention positions': 8,
+         'attention rescored generation': 8, 'greedy padded generation': 32, 'mla cache capacity': 8,
+         'mla cached scores raw': 8, 'mla cached scores policy': 8, 'mla positions': 8,
+         'mla rescored generation': 16, 'recurrent cache capacity': 32, 'recurrent cached scores raw': 32,
+         'recurrent cached scores policy': 32, 'recurrent perplexity': 64, 'recurrent positions': 64,
+         'recurrent rescored generation': 16, 'sampled padded generation': 16, 'trainer update': 32,
+         'attention registered scores raw': 16, 'attention registered scores policy': 16,
+         'deepseek_v4 registered scores raw': 16, 'deepseek_v4 registered scores policy': 16,
+         'gated_delta_net registered scores raw': 64, 'gated_delta_net registered scores policy': 64,
+         'kimi_delta_attention registered scores raw': 64,
+         'kimi_delta_attention registered scores policy': 64,
+         'kpool_sparse_attention registered scores raw': 8,
+         'kpool_sparse_attention registered scores policy': 8, 'llama4 registered scores raw': 8,
+         'llama4 registered scores policy': 8, 'mamba registered scores raw': 8,
+         'mamba registered scores policy': 8, 'mamba2 registered scores raw': 8,
+         'mamba2 registered scores policy': 8, 'mla registered scores raw': 8,
+         'mla registered scores policy': 8, 'mlp registered scores raw': 16,
+         'mlp registered scores policy': 16}
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada)."""
 
 
@@ -96,34 +109,40 @@ def policy_scores(model, params, prompt, lengths, tokens, sampling, positions=No
     return {name: jnp.stack(values) for name, values in found.items()}
 
 
-def clears_margin(model, params, prompt, lengths, tokens, sampling, positions=None) -> bool:
-    """Whether every drawn step's scores clear MARGIN at its policy's cutoff, and a greedy policy's
-    tokens are the full forward's largest."""
-    for logits, picked in zip(row_logits(model, params, prompt, lengths, tokens, positions), tokens,
-                              strict=True):
+def cutoff_gaps(model, params, prompt, lengths, tokens, sampling, positions=None) -> np.ndarray:
+    """Each drawn step's gap between the scores either side of its policy's cutoff, `[rows, steps]`."""
+    kept = sampling.top_k if sampling.temperature else 1
+    gaps = []
+    for logits in row_logits(model, params, prompt, lengths, tokens, positions):
         scores = np.sort(np.asarray(logits / (sampling.temperature or 1)), -1)[:, ::-1]
-        kept = sampling.top_k if sampling.temperature else 1
-        if np.min(scores[:, kept - 1] - scores[:, kept]) <= MARGIN:
-            return False
-        if not sampling.temperature:
-            np.testing.assert_array_equal(picked, np.argmax(np.asarray(logits), -1))
-    return True
+        gaps.append(scores[:, kept - 1] - scores[:, kept])
+    return np.stack(gaps)
 
 
-def generation_draw(model, params, sampling, steps: int, **prompt_shape):
-    """Check 1's draw of drawn prompts, a key and the tokens `generate` draws from them, the first of
-    the seed's attempts whose steps clear MARGIN."""
+def clears_margin(model, params, prompt, lengths, tokens, sampling, positions=None) -> bool:
+    """Whether every drawn step's scores clear MARGIN at its policy's cutoff."""
+    return bool(np.min(cutoff_gaps(model, params, prompt, lengths, tokens, sampling, positions)) > MARGIN)
+
+
+def generation_draw(model, params, sampling, steps: int, *, margin: bool, **prompt_shape):
+    """Check 1's draw of drawn prompts, a key and the tokens `generate` draws from them: with `margin`,
+    the first of the seed's attempts whose steps clear MARGIN."""
     def draw(seed):
-        for attempt in range(64):
+        for attempt in range(64 if margin else 1):
             prompt, lengths = drawn_prompts(seed, attempt, int(model.vocab_size), **prompt_shape)
             key = jax.random.key_data(jax.random.fold_in(jax.random.key(seed), attempt))
             result = generate(model, params, prompt_inputs({"prompt": prompt, "prompt_length": lengths}),
                               steps, key=jax.random.wrap_key_data(key), sampling=sampling)
             tokens = np.asarray(result.tokens)[:, prompt.shape[1]:]
-            if clears_margin(model, params, prompt, lengths, tokens, sampling):
+            if not margin or clears_margin(model, params, prompt, lengths, tokens, sampling):
                 return prompt, lengths, np.asarray(key), tokens
         raise AssertionError(f"no draw of seed {seed} clears MARGIN")
     return draw
+
+
+def only(name: str, run):
+    """`run`'s leaf `name` alone."""
+    return lambda *draw: {name: run(*draw)[name]}
 
 
 def generated(model, params, sampling, steps: int):
@@ -134,6 +153,9 @@ def generated(model, params, sampling, steps: int):
         np.testing.assert_array_equal(np.asarray(result.tokens)[:, prompt.shape[1]:], tokens)
         np.testing.assert_array_equal(result.lengths, np.full(len(prompt), steps))
         np.testing.assert_array_equal(result.terminated, np.zeros(len(prompt), bool))
+        if not sampling.temperature:
+            # A greedy policy's choice is certain.
+            np.testing.assert_array_equal(result.behavior_log_probs, 0)
         return {"raw": result.raw_log_probs} | ({"behavior": result.behavior_log_probs}
                                                 if sampling.temperature else {})
     return run
@@ -152,13 +174,17 @@ def scored(model, params, sampling, dtype=None):
 
 def assert_generation_scores_as_full_forwards(model, label: str, steps: int = 3) -> None:
     """Check 1: a left-padded batch drawn through the cache scores each drawn token, under the raw
-    model and under the top-k policy that drew it, on par with a fresh full forward over that row's
-    unpadded tokens, from its float64 evaluation, over drawn prompts and keys."""
+    model over every draw (`{label} raw`) and under the top-k policy that drew it over draws whose
+    steps clear MARGIN (`{label} policy`), on par with a fresh full forward over that row's unpadded
+    tokens, from its float64 evaluation, over drawn prompts and keys."""
     params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
     sampling = Sampling(temperature=0.7, top_k=5)
-    assert_as_exact(generated(model, params, sampling, steps), scored(model, params, sampling),
-                    generation_draw(model, params, sampling, steps), label, seeds=SEEDS[label],
-                    truth_fn=scored(model, params, sampling, "float64"))
+    for leaf, margin in (("raw", False), ("behavior", True)):
+        name = f"{label} {'raw' if leaf == 'raw' else 'policy'}"
+        assert_as_exact(only(leaf, generated(model, params, sampling, steps)),
+                        only(leaf, scored(model, params, sampling)),
+                        generation_draw(model, params, sampling, steps, margin=margin), name,
+                        seeds=SEEDS[name], truth_fn=only(leaf, scored(model, params, sampling, "float64")))
 
 
 @pytest.mark.parametrize("kind", ["attention", "mla", "recurrent"])
@@ -181,13 +207,10 @@ def test_padding_and_cached_likelihoods_match_unpadded_full_forwards(kind):
         padding = prompt.shape[1] - lengths
         return {"raw": objective.per_token_log_probs(params, rows, left_padding=padding)[:, 3:]}
 
-    def recorded(prompt, lengths, key, tokens):
-        return {"raw": generated(model, params, sampling, 3)(prompt, lengths, key, tokens)["raw"]}
-
     label = f"{kind} rescored generation"
-    assert_as_exact(rescored, recorded, generation_draw(model, params, sampling, 3), label,
-                    seeds=SEEDS[label], truth_fn=lambda *draw: {"raw": scored(
-                        model, params, sampling, "float64")(*draw)["raw"]})
+    assert_as_exact(rescored, only("raw", scored(model, params, sampling)),
+                    generation_draw(model, params, sampling, 3, margin=False), label, seeds=SEEDS[label],
+                    truth_fn=only("raw", scored(model, params, sampling, "float64")))
     assert not np.array_equal(result.raw_log_probs, result.behavior_log_probs)
 
 
@@ -205,8 +228,9 @@ def test_every_registered_mixer_draws_padded_rows_as_their_unpadded_full_forward
 @pytest.mark.parametrize("kind", ["attention", "mla", "recurrent"])
 def test_right_padding_and_logical_positions_survive_cached_generation(kind):
     """Right-padded prompts at their own logical positions: the greedy cached generation picks each
-    full forward's largest logit at those positions, and its raw likelihoods are on par with that
-    forward's from its float64 evaluation over drawn tokens and positions (check 1)."""
+    full forward's largest logit at those positions wherever the two largest are MARGIN apart, and
+    its raw likelihoods are on par with that forward's from its float64 evaluation over drawn tokens
+    and positions (check 1)."""
     model = decoder(kind)
     params = model.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
     greedy, steps = Sampling(temperature=0), 3
@@ -229,20 +253,16 @@ def test_right_padding_and_logical_positions_survive_cached_generation(kind):
         return np.concatenate([positions[:, :2], positions[:, 1:2] + np.arange(1, steps)], axis=1)
 
     def draw(seed):
-        for attempt in range(64):
-            tokens, positions = placed(seed, attempt)
-            result = generate(model, params, inputs(tokens, positions), steps, key=jax.random.key(1),
-                              sampling=greedy)
-            drawn = np.asarray(result.tokens)[:, 4:]
-            if clears_margin(model, params, tokens[:, :2], np.full(ROWS, 2), drawn, greedy,
-                             walked(positions)):
-                return tokens, positions, drawn
-        raise AssertionError(f"no draw of seed {seed} clears MARGIN")
+        tokens, positions = placed(seed, 0)
+        result = generate(model, params, inputs(tokens, positions), steps, key=jax.random.key(1),
+                          sampling=greedy)
+        return tokens, positions, np.asarray(result.tokens)[:, 4:]
 
     def cached(tokens, positions, drawn):
         result = generate(model, params, inputs(tokens, positions), steps, key=jax.random.key(1),
                           sampling=greedy)
         np.testing.assert_array_equal(np.asarray(result.tokens)[:, 4:], drawn)
+        np.testing.assert_array_equal(result.behavior_log_probs, 0)
         return {"raw": result.raw_log_probs}
 
     def full(dtype=None):
@@ -257,6 +277,13 @@ def test_right_padding_and_logical_positions_survive_cached_generation(kind):
 
     label = f"{kind} positions"
     assert_as_exact(cached, full(), draw, label, seeds=SEEDS[label], truth_fn=full("float64"))
+    for seed in range(SEEDS[label]):
+        tokens, positions, drawn = draw(seed)
+        prompt, lengths = tokens[:, :2], np.full(ROWS, 2)
+        clear = cutoff_gaps(model, params, prompt, lengths, drawn, greedy, walked(positions)) > MARGIN
+        largest = np.stack([np.argmax(np.asarray(logits), -1) for logits in
+                            row_logits(model, params, prompt, lengths, drawn, walked(positions))])
+        np.testing.assert_array_equal(drawn[clear], largest[clear])
 
 
 @pytest.mark.parametrize("sampling,name", [(Sampling(temperature=0), "greedy"),
@@ -293,6 +320,8 @@ def test_padding_repro_greedy_and_seeded_reproducibility(sampling, name):
         def run(prompt, key, tokens):
             result = generation(prompt, key)
             np.testing.assert_array_equal(np.asarray(result.tokens)[:, -steps:], tokens)
+            if not sampling.temperature:
+                np.testing.assert_array_equal(result.behavior_log_probs, 0)
             return {"raw": result.raw_log_probs} | ({"behavior": result.behavior_log_probs}
                                                     if sampling.temperature else {})
         return run
@@ -412,10 +441,11 @@ def test_real_trainer_update_matches_raw_policy_ratio_with_behavior_recorded():
         return rollout(SimpleNamespace(variables=params, updates=0), batch, rollout_key)
 
     def draw(seed):
+        """A key and the rollout the trainer's first step takes from it, realized once, in float32."""
         key = np.asarray(jax.random.key_data(jax.random.fold_in(jax.random.key(5), seed)))
-        return (key,)
+        return key, rolled_from(jax.random.wrap_key_data(key))
 
-    def trained(key):
+    def trained(key, rolled):
         data = Loader(train=lambda partition: iter([batch]), val=None, records=rows, batch=rows)
         trainer = Trainer(objective, optax.sgd(0.01), key=jax.random.wrap_key_data(key), rollout=rollout)
         state = trainer.fit(data, steps=1, log_every=1, checkpoint_every=None)
@@ -423,8 +453,7 @@ def test_real_trainer_update_matches_raw_policy_ratio_with_behavior_recorded():
         return state.variables
 
     def by_hand(dtype=None):
-        def run(key):
-            rolled = rolled_from(jax.random.wrap_key_data(key))
+        def run(key, rolled):
             if dtype is None:
                 return stepped(objective, params, rolled)
             with jax.enable_x64(new_val=True):
@@ -448,7 +477,7 @@ def test_real_trainer_update_matches_raw_policy_ratio_with_behavior_recorded():
     assert not np.array_equal(rolled["old_log_probs"], rolled["behavior_log_probs"])
     assert_as_exact(trained, by_hand(), draw, "trainer update", seeds=SEEDS['trainer update'],
                     truth_fn=by_hand("float64"))
-    moved = trained(draw(0)[0])
+    moved = trained(*draw(0))
     assert any(not np.array_equal(old, new)
                for old, new in zip(jax.tree.leaves(params), jax.tree.leaves(moved), strict=True))
 
@@ -478,6 +507,7 @@ def test_padding_slots_do_not_consume_cache_capacity(kind):
         inputs = ModelInputs(rows, {"attention_mask": jnp.broadcast_to(mask, rows.shape)})
         result = generate(model, params, inputs, steps, key=jax.random.key(1), sampling=greedy)
         np.testing.assert_array_equal(np.asarray(result.tokens)[:, 8:], tokens)
+        np.testing.assert_array_equal(result.behavior_log_probs, 0)
         return {"raw": result.raw_log_probs}
 
     def unpadded(prompt, tokens):
