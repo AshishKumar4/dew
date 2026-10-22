@@ -264,8 +264,8 @@ class SelectedGeneration:
     generation standing in for its steps under selections written before it, each picking the
     inputs it picks uncached (`dew.data.analysis._in_place`). The selections name the part, as the
     run wrote them; `stored` is read as the fill read it (`_consumed`), numbering its inputs by
-    index where `placing` is "indexed" and by its shards' rows where it is "streamed", as the fill
-    did (`_source_ids`). Ids that name other inputs than the fill's are refused, never read as none."""
+    their place in a memory or indexed read (`placing`), or by its shards' rows in a stream, as the
+    fill did (`_source_ids`). Ids that name other inputs than the fill's are refused, never read as none."""
 
     generation: Generation
     selections: tuple[RecordSlice | HashPart, ...]
@@ -346,9 +346,10 @@ class SelectedGeneration:
                     if current is None:
                         raise ValueError(
                             f"generation {self.generation.url} holds input {entry['id']}, which "
-                            f"{self.stored.describe()} doesn't name here (a stream names its inputs by "
-                            "where it read their shards), so the holdout written before it can't pick its "
-                            "inputs from it; publish it from an indexed read, or read it where it was filled")
+                            f"{self.stored.describe()} doesn't name by its {self.placing} read here (a "
+                            "stream names its inputs by where it read their shards, a memory or indexed read "
+                            "by their place), so the holdout written before it can't pick its inputs from "
+                            "it; publish it from an indexed read, or read it where it was filled")
                 if kept:
                     dense.append(index)
                 index += 1
@@ -366,8 +367,8 @@ class SelectedGeneration:
         the inputs the ones within it admitted (`admits`); only a hash holdout reads the rows."""
         inner = self.selections[::-1]
         hashed = any(isinstance(selection, HashPart) for selection in inner)
-        if self.placing == "indexed":
-            records = self.stored.records("indexed")
+        if self.placing != "streamed":
+            records = self.stored.records(self.placing)
             inputs: Iterator[tuple[RowId, Batch | bytes | None]] = (
                 (index, records[index] if hashed else None) for index in range(len(records)))
         elif hashed:

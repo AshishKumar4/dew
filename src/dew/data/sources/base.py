@@ -109,11 +109,16 @@ class ShardManifest:
     When physical shards cannot fill the readers and workers, `subdivide`
     receives the needed count and returns exactly that many `Shard`s, each
     a disjoint part of these records with an exact per-part position read
-    by the same `reader`. None keeps the physical-shard requirement."""
+    by the same `reader`. None keeps the physical-shard requirement.
+
+    `index_ordered` states that the shards read the records in their index
+    order, each the range of indices its `start` and `stop` name, as a store
+    read by index streams them (`_indexed_manifest`)."""
 
     shards: tuple[Shard, ...]
     reader: Callable[[Shard], pygrain.IterDataset]
     subdivide: Callable[[int], tuple[Shard, ...]] | None = None
+    index_ordered: bool = False
 
 
 @runtime_checkable
@@ -204,6 +209,7 @@ def _indexed_manifest(source: Source, prefix: str, uri: str, rows: int,
             for start in range(0, count, rows)
         ),
         _IndexedSlice(source) if reader is None else reader,
+        index_ordered=True,
     )
 
 

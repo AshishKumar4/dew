@@ -65,7 +65,7 @@ from dew.data.pipeline import (
     _declares_rejects,
 )
 from dew.data.plan import Manifest, StepIdentity, _changed, _semantic, identified
-from dew.data.sources.base import READS, Read, Source, _consumed, _IndexedSlice
+from dew.data.sources.base import READS, Read, Source, _consumed
 from dew.data.sources.concatenate import Concatenate
 from dew.data.sources.memory import Memory
 from dew.records import json_value, record
@@ -242,10 +242,12 @@ def _in_place(generation: Generation, source: Source | Mixture | Phases,
             "before the cache numbers otherwise than the source the generation was published from; cache "
             "the part with a Cache(url), which fills from the part's own records")
     placed = _consumed(stored, read)
-    # The fill numbered its inputs by index where it read them so, else by its stream (`_source_ids`).
-    placing: Read = "indexed" if read != "streamed" and placed.supports("indexed") else "streamed"
+    # The fill numbered its inputs by their place where it read them in memory or by index, else by
+    # its stream (`_source_ids`).
+    placing: Read = ("streamed" if read == "streamed"
+                     else "indexed" if placed.supports("indexed") else "memory")
     if (placing == "streamed" and any(isinstance(selection, RecordSlice) for selection in selections)
-            and not isinstance(placed.manifest().reader, _IndexedSlice)):
+            and not placed.manifest().index_ordered):
         raise ValueError(
             f"a records holdout numbers its inputs by index, and generation {generation.url} numbers them by "
             f"the shards a stream of {placed.describe()} read, in an order of its own; publish it from an "
