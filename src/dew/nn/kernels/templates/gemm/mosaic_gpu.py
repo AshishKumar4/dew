@@ -455,6 +455,15 @@ def _gmm_pingpong(lhs, rhs, lengths, shape: tuple, *, tiles: Tiles, transpose_rh
                 if index == 1:
                     hopper.rendezvous(schedule)  # warpgroup 0's products first
 
+                def staged(counter, _):
+                    matrix_stage = rhs_ring.acquire(counter)
+                    return lhs_ring.acquire(counter), (matrix_stage.transpose((1, 0)) if transpose_rhs
+                                                       else matrix_stage)
+
+                def release(counter):
+                    lhs_ring.release(counter)
+                    rhs_ring.release(counter)
+
                 @plgpu.nd_loop((grid[0] * grid[1],), collective_axes="cluster_grid",
                                init_carry=(jnp.int32(0), jnp.int32(0)))
                 def carried(loop: plgpu.NDLoopInfo, carry):
@@ -480,23 +489,7 @@ def _gmm_pingpong(lhs, rhs, lengths, shape: tuple, *, tiles: Tiles, transpose_rh
 
                         @functools.partial(pl.run_scoped, acc_ref=accumulator)
                         def _(acc_ref):
-                            @pl.loop(0, steps)
-                            def _(step):
-                                rows_stage = lhs_ring.acquire(counter + step)
-                                matrix_stage = rhs_ring.acquire(counter + step)
-                                plgpu.wgmma(acc_ref, rows_stage, matrix_stage.transpose((1, 0))
-                                            if transpose_rhs else matrix_stage)
-                                # One MMA in flight: the step before's stages are read.
-                                plgpu.wgmma_wait(_IN_FLIGHT)
-
-                                @pl.when(step > 0)
-                                def _():
-                                    lhs_ring.release(counter + step - 1)
-                                    rhs_ring.release(counter + step - 1)
-
-                            plgpu.wgmma_wait(0)
-                            lhs_ring.release(counter + steps - 1)
-                            rhs_ring.release(counter + steps - 1)
+                            _summed(acc_ref, staged, release, steps, counter)
                             hopper.rendezvous(schedule)  # the other's products begin
                             finish(acc_ref[...])
 
@@ -986,18 +979,25 @@ def _streamed_gradient(staged, release, steps, first, shape: tuple, exact_sums: 
     def _():
         @functools.partial(pl.run_scoped, acc_ref=plgpu.WGMMAAccumulatorRef(shape))
         def _(acc_ref):
-            @pl.loop(0, steps)
-            def _(step):
-                plgpu.wgmma(acc_ref, *staged(first + step, step))
-                # One MMA in flight: the step before's stages are read.
-                plgpu.wgmma_wait(_IN_FLIGHT)
-                pl.when(step > 0)(lambda: release(first + step - 1))
-
-            plgpu.wgmma_wait(0)
-            release(first + steps - 1)
+            _summed(acc_ref, staged, release, steps, first)
             store(acc_ref[...])
 
     pl.when(steps == 0)(lambda: store(zeros))
+
+
+def _summed(acc_ref, staged, release, steps, first) -> None:
+    """Dew: `steps` steps' products into `acc_ref` as the tensor cores add them, an MMA in flight:
+    `staged(counter, step)` a step's operands at the ring's turn, `release(counter)` its stages back once
+    the products have read them."""
+    @pl.loop(0, steps)
+    def _(step):
+        plgpu.wgmma(acc_ref, *staged(first + step, step))
+        # One MMA in flight: the step before's stages are read.
+        plgpu.wgmma_wait(_IN_FLIGHT)
+        pl.when(step > 0)(lambda: release(first + step - 1))
+
+    plgpu.wgmma_wait(0)
+    release(first + steps - 1)
 
 
 def _tgmm_pipeline(tiles: Tiles, side_axes: tuple, body, context, steps):
