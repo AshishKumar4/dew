@@ -19,6 +19,9 @@ from dew.data.prompts import (
     INFO_KEY,
     LENGTH_KEY,
     PROMPT_KEY,
+    PROMPT_LEN,
+    PROMPT_LONG,
+    PROMPT_PAD,
     SOURCE_KEY,
     TRUTH_KEY,
     PromptRecord,
@@ -97,10 +100,10 @@ def prompt_facts(facts: Mapping[str, object], tokenizer: str, max_prompt_len: in
 @dataclasses.dataclass(frozen=True)
 class RenderPrompt(grain.MapTransform):
     tokenizer: str
-    max_prompt_len: int = 256
-    pad_id: int = 0
+    max_prompt_len: int = PROMPT_LEN
+    pad_id: int = PROMPT_PAD
     reward_bytes: int = 1024
-    long: Literal["drop", "truncate"] = "truncate"
+    long: Literal["drop", "truncate"] = PROMPT_LONG
     thinking: bool | None = None
     rejects = True
 
