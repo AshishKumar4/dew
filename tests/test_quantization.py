@@ -164,7 +164,7 @@ def test_an_int8_trunk_trains_down():
     assert all(later < earlier for earlier, later in itertools.pairwise(losses)), losses
 
 
-CONVOLUTION_SEEDS = 16
+CONVOLUTION_SEEDS = 8
 """The quantized convolutions' declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for`
 on armada."""
 
@@ -247,11 +247,12 @@ def test_a_grouped_convolution_quantizes_each_group_on_its_own_range(group_width
 @pytest.mark.parametrize("groups", [1, 16])
 def test_a_quantized_convolution_keeps_its_calls_result_dtype_whatever_precision_it_pins(groups):
     """A quantized convolution keeps its call's contract, as a quantized matmul does: one that asks
-    for a float32 result from bf16 operands returns float32, the same integer products and scales as
-    the bf16 result's, rounded to bf16 only where the call asks for bf16, where before it returned the
-    bf16 input's dtype; and one pinned at the highest precision, Dew's Conv and lax's alike,
-    quantizes as the same call unpinned does, bit for bit, a quantized product having no precision
-    to honour. Each is not the float convolution: quantization reached it."""
+    for a float32 result from bf16 operands returns float32, where before it returned the bf16
+    input's dtype, on par (check 1) with Qwix's own quantization of the convolution on each group's
+    range (`ungrouped_reference`) from the float64 convolution over drawn inputs and kernels; and one
+    pinned at the highest precision, Dew's Conv and lax's alike, quantizes as the same call unpinned
+    does, bit for bit, a quantized product having no precision to honour. Each is not the float
+    convolution: quantization reached it."""
     from flax import linen as nn
 
     from dew.nn.conv import Conv
@@ -281,10 +282,26 @@ def test_a_quantized_convolution_keeps_its_calls_result_dtype_whatever_precision
         found = quantized(pinned)
         np.testing.assert_array_equal(found, quantized(plain))
         assert not np.array_equal(found, plain.apply(variables, x))
-    wide = quantized(Native(preferred=jnp.float32))
-    assert wide.dtype == jnp.float32
-    np.testing.assert_array_equal(wide.astype(jnp.bfloat16), quantized(Native()))
-    assert not np.array_equal(wide, Native(preferred=jnp.float32).apply(variables, x))
+    wide = Native(preferred=jnp.float32)
+    found = quantized(wide)
+    assert found.dtype == jnp.float32
+    assert not np.array_equal(found, wide.apply(variables, x))
+    qwix = pytest.importorskip("qwix")
+    reference, peaks_of = ungrouped_reference(qwix, {key: value for key, value in settings.items()
+                                                     if key != "feature_group_count"}, 16 // groups)
+    widened = Quantization().apply(wide)
+
+    def draw(seed):
+        x = jax.random.normal(jax.random.key(2 * seed), (2, 8, 8, 16)).astype(jnp.bfloat16)
+        return x, wide.init(jax.random.key(2 * seed + 1), x)["params"]["kernel"].astype(jnp.bfloat16)
+
+    def plain(x, kernel):
+        return jax.lax.conv_general_dilated(x, kernel, (1, 1), "SAME", feature_group_count=groups,
+                                            dimension_numbers=("NHWC", "HWIO", "NHWC"))
+
+    assert_as_exact(jax.jit(lambda x, kernel: widened.apply({"params": {"kernel": kernel}}, x)),
+                    jax.jit(lambda x, kernel: reference(kernel, x, peaks_of(x))), draw,
+                    f"float32 result of {groups} groups", seeds=CONVOLUTION_SEEDS, truth_fn=plain)
 
 
 @pytest.mark.skipif(jax.default_backend() == "gpu",
@@ -696,7 +713,7 @@ def test_quantizing_host_weights_keeps_numpy_storage_and_matches_qwix():
                                   expected(prompt, 3, key=7).host().tokens)
 
 
-PACKED_SEEDS = 16
+PACKED_SEEDS = 256
 """The packed quantized pipeline's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for`
 on armada."""
 
@@ -932,11 +949,11 @@ armada."""
 @pytest.mark.mesh
 def test_a_quantized_pipeline_has_finite_loss_and_gradients():
     """The int8 trunk over two stages on the eight simulated devices: finite
-    loss and gradients, and the loss on par with the plain wrapped loop's
-    (check 1) from the unquantized model's float64 loss, over drawn weights
-    and tokens: the pipeline quantizes its microbatches as the loop
-    quantizes the batch, the way the bf16 pipeline test holds its policy's
-    rounding."""
+    loss and gradients, and the gradients on par with the plain wrapped
+    loop's (check 1) from the unquantized model's float64 gradients, over
+    drawn weights and tokens: the pipeline quantizes its microbatches as the
+    loop quantizes the batch, which every parameter's gradient reads, the way
+    the bf16 pipeline test holds its policy's rounding."""
     pytest.importorskip("qwix")
     model = tiny(num_layers=4)
     qmodel = Quantization().apply(model)
@@ -948,31 +965,30 @@ def test_a_quantized_pipeline_has_finite_loss_and_gradients():
         rows = np.random.default_rng(seed).integers(0, VOCAB, size=(8, SEQ_LEN + 1)).astype(np.int32)
         return variables, rows
 
-    def runner(spec, microbatches=None):
-        mesh = spec.build()
-        objective = LMObjective(qmodel, SEQ_LEN)
-
+    def gradient(objective):
         def loss(params, variables, batch):
             return objective.scalar_loss({**variables, "params": params}, batch, info)
+        return jax.jit(jax.value_and_grad(loss, has_aux=True))
 
-        program = jax.jit(jax.value_and_grad(loss, has_aux=True))
+    def runner(spec, microbatches=None):
+        mesh = spec.build()
+        program = gradient(LMObjective(qmodel, SEQ_LEN))
 
         def run(variables, rows):
             placed = jax.device_put(variables, Layout(min_shard=256).shardings(mesh, variables))
             with jax.set_mesh(mesh), pipeline_microbatches(microbatches):
                 (value, _), grads = program(placed["params"], placed, shard_batch(mesh, {"text": rows}))
-            return {"loss": np.asarray(value)}, jax.tree.map(np.asarray, grads)
+            return np.asarray(value), jax.tree.map(np.asarray, grads)
         return run
 
-    def unquantized(variables, rows):
-        objective = LMObjective(model.clone(dtype=jnp.float64), SEQ_LEN)
-        return {"loss": np.asarray(objective.scalar_loss(variables, {"text": rows}, info)[0])}
-
+    unquantized = gradient(LMObjective(model.clone(dtype=jnp.float64), SEQ_LEN))
     loop, piped = runner(MeshSpec(fsdp=8)), runner(MeshSpec(fsdp=4, stage=2), 2)
-    _, grads = piped(*draw(0))
-    assert all(np.isfinite(leaf).all() for leaf in jax.tree.leaves(grads))
-    assert_as_exact(lambda *inputs: piped(*inputs)[0], lambda *inputs: loop(*inputs)[0], draw,
-                    "quantized pipeline loss", seeds=PIPELINE_SEEDS, truth_fn=unquantized)
+    loss, grads = piped(*draw(0))
+    assert np.isfinite(loss) and all(np.isfinite(leaf).all() for leaf in jax.tree.leaves(grads))
+    assert_as_exact(lambda *inputs: piped(*inputs)[1], lambda *inputs: loop(*inputs)[1], draw,
+                    "quantized pipeline gradients", seeds=PIPELINE_SEEDS,
+                    truth_fn=lambda variables, rows: unquantized(variables["params"], variables,
+                                                                 {"text": rows})[1])
 
 
 def test_stochastic_rounding_draws_from_its_own_stream():
