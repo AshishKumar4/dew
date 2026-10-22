@@ -653,9 +653,8 @@ class Files(Dataset):
             indexed = _IndexedLines(self)
             if self.index is None:
                 return tuple(len(table) for table in indexed.tables), remote
-            # The index's records each name their file's shard, in whichever integer type it wrote.
-            shards = np.asarray(indexed.tables[0]["shard"], dtype=np.intp)
-            counts = np.bincount(shards, minlength=len(self.paths))[: len(self.paths)]
+            # The index's records each name their file's shard, in whichever unsigned type it wrote.
+            counts = np.bincount(indexed.tables[0]["shard"], minlength=len(self.paths))[: len(self.paths)]
             return tuple(int(count) for count in counts), remote
         if self.kind == "array_record" and self.committed is not None:
             return self._declared_rows() or (), remote
