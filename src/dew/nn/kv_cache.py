@@ -377,18 +377,33 @@ class KVStore:
         """`values` `[rows, tokens, heads, ...]` stored at `positions`; -1 drops."""
         if self.layout.page_size is None:
             return write_cache(buffer, values, positions)
-        page_size, groups = self.layout.page_size, self.layout.groups
+        rows = jnp.broadcast_to(jnp.arange(positions.shape[0])[:, None], positions.shape)
+        return self._paged(buffer, values, rows, positions, self.layout.groups)
+
+    def _paged(self, pool: jax.Array, values: jax.Array, rows: jax.Array, positions: jax.Array,
+               groups: int) -> jax.Array:
+        """The paged `pool` `[heads, pages, page_size, ...]` with each token's `values` `[..., heads,
+        ...]` at its row's slot: `rows` and `positions` index the tokens alike, `[rows, tokens]` for a
+        rectangular append or `[tokens]` for a mixed one. A slot at -1, or a row past the table's,
+        drops. The tokens split into `groups` along their first axis, each group scattered into its
+        part of the pool."""
+        size, table = self.layout.page_size, self._get(TABLE)
+        inside = (positions >= 0) & (rows < table.shape[0])
         safe = jnp.maximum(positions, 0)
-        page = jnp.take_along_axis(self._get(TABLE), safe // page_size, axis=1)
-        page = jnp.where(positions >= 0, page, DROPPED)
+        page = jnp.where(inside, table[jnp.where(inside, rows, 0), safe // size], DROPPED)
+        heads = positions.ndim
 
         def stored(pool: jax.Array, page: jax.Array, offset: jax.Array, incoming: jax.Array) -> jax.Array:
-            # [rows, tokens, heads, ...] -> [heads, rows, tokens, ...] for the pool's head-major index.
-            return pool.at[:, page, offset].set(jnp.moveaxis(incoming, 2, 0), mode="drop")
+            # The tokens' heads lead, for the pool's head-major index.
+            return pool.at[:, page, offset].set(jnp.moveaxis(incoming, heads, 0), mode="drop")
 
+        # Mapped over the groups even for one: unmapped, under --xla_gpu_deterministic_ops (jax
+        # 0.11.2) a dropped token's keys landed at another head's kept slot, the implicit-dimension
+        # case openxla/xla#49498 fixes (issue #49380), after the jax pin. A jax bump past that fix
+        # can write a group of one unmapped.
         return jax.vmap(stored, in_axes=(1, 0, 0, 0), out_axes=1)(
-            grouped(buffer, 1, groups), grouped(page, 0, groups), grouped(safe % page_size, 0, groups),
-            grouped(values, 0, groups)).reshape(buffer.shape)
+            grouped(pool, 1, groups), grouped(page, 0, groups), grouped(safe % size, 0, groups),
+            grouped(values.astype(pool.dtype), 0, groups)).reshape(pool.shape)
 
     def read(self) -> tuple[jax.Array, jax.Array]:
         return self._read("cached_key", "key_scale"), self._read("cached_value", "value_scale")
@@ -411,30 +426,10 @@ class KVStore:
         unrotated, and a paged pool must have one group, as the mixed call
         requires.
         """
-        if self.layout.page_size is None:
-            for name, incoming in (("cached_key", key), ("cached_value", value)):
-                self._put(name, write_tokens(self._get(name), incoming, rows, positions))
-            return
-        size = self.layout.page_size
-        table = self._get(TABLE)
-        inside = (positions >= 0) & (rows < table.shape[0])
-        page = table[jnp.where(inside, rows, 0), jnp.maximum(positions, 0) // size]
-        page = jnp.where(inside, page, DROPPED)
-        offset = jnp.maximum(positions, 0) % size
-
-        def stored(pool: jax.Array, page: jax.Array, offset: jax.Array, incoming: jax.Array) -> jax.Array:
-            return pool.at[:, page, offset].set(jnp.moveaxis(incoming, 1, 0), mode="drop")
-
         for name, incoming in (("cached_key", key), ("cached_value", value)):
             pool = self._get(name)
-            # Mapped over a group of one, as `_written` writes: unmapped, under
-            # --xla_gpu_deterministic_ops (jax 0.11.2) a dropped token's keys
-            # landed at another head's kept slot, the implicit-dimension case
-            # openxla/xla#49498 fixes (issue #49380), after the jax pin. A jax
-            # bump past that fix can write unmapped, as `write_tokens` does.
-            written = jax.vmap(stored, in_axes=(1, 0, 0, 0), out_axes=1)(
-                pool[:, None], page[None], offset[None], incoming.astype(pool.dtype)[None])
-            self._put(name, written[:, 0])
+            self._put(name, write_tokens(pool, incoming, rows, positions) if self.layout.page_size is None
+                      else self._paged(pool, incoming, rows, positions, 1))
 
     def read_rows(self, rows: jax.Array) -> tuple[jax.Array, jax.Array]:
         """Return what `read` returns for only `rows`, `[len(rows), capacity, kv_heads, head_dim]`.
