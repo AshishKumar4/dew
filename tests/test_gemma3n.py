@@ -16,7 +16,7 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from interop_support import fixture_arrays
-from reference_error import assert_as_exact, assert_leaves_as_exact
+from reference_error import assert_as_exact
 
 from dew.nn.gemma3n import AltUp, AltUpLayer, LaurelBlock
 from dew.nn.mlp import GatedMLP, gaussian_topk
@@ -153,6 +153,42 @@ def test_altup_trains_past_its_coefficient_clip_as_the_reference_does():
                     truth_fn=lambda *inputs: reference(torch.float64, *inputs))
 
 
+STEP_ROWS, STEP_LENGTH = 4, 32
+"""A training step's draw: rows a device and ids a row, within the checkpoint's 64 positions."""
+STEP_SEEDS = {0.0: 8, 0.1: 8}
+"""Each decay's declared seeds for the training step's check 1, sized by `seeds_for` (on armada)."""
+MARGIN = 1e-5
+"""The least margin a training step's draw admits (`gate_margin`), in its rows' deviations: past it a
+gate's unit sits on one side of the cutoff in float32 and float64 alike."""
+
+
+def gate_margin(model, variables, tokens) -> float:
+    """The smallest distance of a gaussian top-k gate's unit from its cutoff (the row's mean plus the
+    sparsity's normal quantile times its population deviation, as `dew.nn.mlp.gaussian_topk` forms
+    it), over that deviation, over the forward of `tokens`: a unit nearer it may land on either side
+    in float32 and in float64, a step the two compute differently."""
+    from statistics import NormalDist
+
+    from dew.nn.mlp import GatedMLP
+
+    def selecting(module, method):
+        parent = module.parent
+        return (method == "__call__" and isinstance(module, nn.Dense) and module.name == "gate_proj"
+                and isinstance(parent, GatedMLP) and bool(parent.activation_sparsity))
+
+    _, captured = model.apply(variables, jnp.asarray(tokens), capture_intermediates=selecting,
+                              mutable=["intermediates"])
+    margin = np.inf
+    for path, values in jax.tree_util.tree_flatten_with_path(captured["intermediates"])[0]:
+        layer = next(str(part.key) for part in path if str(getattr(part, "key", "")).startswith("layers_"))
+        sparsity = model.activation_sparsity_pattern[int(layer.split("_")[1])]
+        values = np.asarray(values, np.float64)
+        deviation = values.std(-1, keepdims=True)
+        cutoff = values.mean(-1, keepdims=True) + NormalDist().inv_cdf(sparsity) * deviation
+        margin = min(margin, float(np.min(np.abs(values - cutoff) / deviation)))
+    return margin
+
+
 def clipped_gemma3n():
     """The gemma3n-tiny decoder with its AltUp clip at the median prediction
     coefficient, so half of every layer's coefficients start past it, and its
@@ -176,8 +212,9 @@ def test_a_training_step_updates_the_clamped_altup_coefficients_as_the_reference
     the same weights: torch's optimizer over Gemma3nForCausalLM in train mode, whose forward
     clamps the stored prediction weight in place, so its update, weight decay included, applies
     to the clamped weight (a coefficient at 2 under a clip of 1, gradient 1 and SGD at 0.1
-    stores 0.9, not 1.9). Every stored parameter after the step is as exact as the reference's
-    float32 step, row by row, both measured from its float64 step. The steps after it, under
+    stores 0.9, not 1.9). Every stored parameter after the step is on par with the reference's
+    float32 step from its float64 step over drawn rows (check 1), each draw one whose gaussian
+    top-k gates all clear their cutoff by MARGIN (`gate_margin`). The steps after it, under
     SGD or AdamW, read and update the projected weights the same way, bit for bit
     (`test_steps_from_coefficients_past_the_clip_are_the_steps_from_the_clamped_ones`); an
     AdamW step itself is not held to torch's here, since optax forms Adam's bias corrections
@@ -193,18 +230,32 @@ def test_a_training_step_updates_the_clamped_altup_coefficients_as_the_reference
 
     loaded, model, clip = clipped_gemma3n()
     directory = loaded.source
-    ids = np.load(directory / "input_ids.npy").astype(np.int32)
-    rows = ids[np.arange(jax.device_count()) % len(ids)]
+    shape = (STEP_ROWS * jax.device_count(), STEP_LENGTH)
     rate = 0.1
     tx = optax.chain(optax.add_decayed_weights(decay), optax.sgd(rate))
-    trainer = Trainer(LMObjective(model, rows.shape[1] - 1, head_chunks=1, variables=loaded.variables), tx,
+    trainer = Trainer(LMObjective(model, shape[1] - 1, head_chunks=1, variables=loaded.variables), tx,
                       key=jax.random.key(0))
-    state, _, _ = trainer.place()
-    state, *_ = trainer.compile(state, {"text": rows})(state, {"text": rows})
-    trained = loaded.export({**loaded.variables, "params": state.variables["params"]})
-    dew = {name: np.asarray(tensor, np.float32) for name, tensor in trained.items()}
+    initial, _, _ = trainer.place()
+    step = trainer.compile(initial, {"text": np.zeros(shape, np.int32)})
+    names = list(loaded.export(loaded.variables))
 
-    def reference(dtype):
+    def draw(seed):
+        """Rows of ids drawn uniformly from the vocabulary, the first draw of the seed whose gates
+        clear MARGIN at the step's weights."""
+        for attempt in range(64):
+            rows = np.random.default_rng([0x3E, seed, attempt]).integers(
+                0, int(model.vocab_size), shape).astype(np.int32)
+            if gate_margin(model, loaded.variables, rows[:, :-1]) > MARGIN:
+                return (rows,)
+        raise AssertionError(f"no rows of seed {seed} clear the gates' margin {MARGIN}")
+
+    def stepped(rows):
+        # The step donates the state it is given: each draw steps from its own copy.
+        state, *_ = step(jax.tree.map(jnp.copy, initial), {"text": rows})
+        trained = loaded.export({**loaded.variables, "params": state.variables["params"]})
+        return {name: np.asarray(trained[name], np.float32) for name in names}
+
+    def reference(dtype, rows):
         hf_config = AutoConfig.from_pretrained(directory)
         hf_config.altup_coef_clip = clip
         reference = AutoModelForCausalLM.from_pretrained(directory, config=hf_config,
@@ -222,9 +273,11 @@ def test_a_training_step_updates_the_clamped_altup_coefficients_as_the_reference
             reference(input_ids=tokens, labels=tokens).loss.backward()
             solver.step()
         state_dict = reference.state_dict()
-        return {name: state_dict[name].detach().numpy() for name in dew}
+        return {name: state_dict[name].detach().numpy() for name in names}
 
-    assert_leaves_as_exact(dew, reference(torch.float32), reference(torch.float64))
+    label = f"a clamped AltUp training step, decay {decay}"
+    assert_as_exact(stepped, lambda rows: reference(torch.float32, rows), draw, label,
+                    seeds=STEP_SEEDS[decay], truth_fn=lambda rows: reference(torch.float64, rows))
 
 
 @pytest.mark.parametrize("optimizer", ["sgd", "adamw"])
