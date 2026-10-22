@@ -255,11 +255,13 @@ def power2(x: jax.Array, k: jax.Array) -> jax.Array:
     return x * jnp.exp2(half) * jnp.exp2(k - half)
 
 
-def headroom(dtype, initial: bool) -> bool:
+def headroom(dtype) -> bool:
     """Whether a call's weighted values can pass fp32's largest: values of `dtype` two of which reach
-    `2^HEADROOM` (bf16's and fp32's; fp16's would need 2^110 keys), or an initial state, whose sums may
-    be any size. A call that cannot compiles no guard (`guarded`)."""
-    return initial or float(jnp.finfo(dtype).max) * 2 >= 2.0 ** HEADROOM
+    `2^HEADROOM` (bf16's and fp32's). An initial state's sums are finite, and a walk adds to them at most its
+    keys' count times the values' largest, which for fp16's values over any key count a call holds is far
+    below the 2^103 that rounds fp32's largest past it; so an fp16 call compiles no guard (`guarded`),
+    from a state or none."""
+    return float(jnp.finfo(dtype).max) * 2 >= 2.0 ** HEADROOM
 
 
 RAW_SCALES = (2.0 ** -120, 2.0 ** 100)
