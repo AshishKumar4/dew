@@ -307,6 +307,23 @@ class Mixture:
             dtype=dtype, precision=precision)
 
 
+LAYER_SCALAR_COLLECTIONS = {"trainable": "params", "frozen": "constants"}
+"""The collection a block keeps its layer scalar in, by mode (`BlockWiring.layer_scalar`): Google's
+release makes it a parameter, and Transformers a buffer, which Dew keeps as a constant."""
+
+
+def layer_scalar_mode(variables: Mapping[str, object], path: tuple[str, ...]) -> str | None:
+    """The mode whose collection holds the layer scalar at `path` within it, or None where neither does:
+    a tree being written decides, so an export agrees with whichever collection training left it in."""
+    for mode, collection in LAYER_SCALAR_COLLECTIONS.items():
+        node: object = variables.get(collection)
+        for part in path:
+            node = node.get(part) if isinstance(node, Mapping) else None
+        if node is not None:
+            return mode
+    return None
+
+
 @dataclasses.dataclass(frozen=True)
 class BlockWiring:
     """How a block norms its two sublayers, and whether it scales its output.
@@ -668,7 +685,8 @@ class DecoderBlock(nn.Module):
         if self.wiring.ngpt is not None:
             self._ngpt_rates(self.wiring.ngpt)
         if self.wiring.layer_scalar == "frozen":
-            self.output_scalar = self.variable("constants", "layer_scalar", jnp.ones, (1,), jnp.float32).value
+            self.output_scalar = self.variable(LAYER_SCALAR_COLLECTIONS["frozen"], "layer_scalar", jnp.ones,
+                                               (1,), jnp.float32).value
         elif self.wiring.layer_scalar == "trainable":
             self.output_scalar = self.param("layer_scalar", nn.initializers.ones, (1,), jnp.float32)
         if self.per_layer_input_dim:

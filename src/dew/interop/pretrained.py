@@ -63,6 +63,7 @@ from dew.interop.streaming import WeightLayout
 from dew.interop.weights import AUTO, declared_dtype
 from dew.nn.autoencoders import AutoEncoder
 from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.backbones.decoder_block import layer_scalar_mode
 from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.diffusion_gemma import DiffusionGemma
 from dew.nn.multimodal import MultimodalTransformer
@@ -118,43 +119,16 @@ def _wrapper_layouts(tensors, record, variables, language: Sequence[decoder_part
     return tuple(bindings), retained
 
 
-def _scalar_mode(layouts: tuple[WeightLayout, ...], variables: Mapping[str, object]) -> str | None:
-    """Where the tree being written keeps the layer scalars `layouts` read
-    ('trainable' in `params`, 'frozen' in `constants`), or None; the tree
-    decides, as in `diffusion_gemma.scalar_placement`."""
-    for layout in layouts:
-        path = layout.paths[0]
-        if path[-1] == "layer_scalar":
-            node: object = variables.get("params")
-            for part in path[1:]:
-                node = node.get(part) if isinstance(node, Mapping) else None
-            return "frozen" if node is None else "trainable"
-    return None
-
-
 def _share_quantized_aliases(tensors: dict[str, np.ndarray], aliases: tuple[tuple[str, str], ...],
                              quantized: tuple[str, ...]) -> None:
     """Share only aliases verified on original values before codec narrowing.
 
     A component may mix quantized and unquantized copies, or several MTP
-    copies of a tied head. Fold the checked relationships transitively, then
-    reuse the already decoded storage: no second cast or weight copy.
+    copies of a tied head. Each group of spellings the checked pairs join
+    (`alias_groups`) reuses its quantized member's decoded storage: no
+    second cast or weight copy.
     """
-    if not aliases:
-        return
-    links: dict[str, set[str]] = {}
-    for left, right in aliases:
-        links.setdefault(left, set()).add(right)
-        links.setdefault(right, set()).add(left)
-    remaining = set(links)
-    while remaining:
-        first = remaining.pop()
-        group, pending = {first}, [first]
-        while pending:
-            fresh = links[pending.pop()] - group
-            group.update(fresh)
-            remaining.difference_update(fresh)
-            pending.extend(fresh)
+    for group in decoders.alias_groups(aliases):
         representative = next((name for name in quantized if name in group), None)
         if representative is not None:
             value = tensors[representative]
@@ -521,7 +495,9 @@ class Pretrained:
             tensors = self.export_adapter(self.model, values, self.config)
         elif self.weight_layouts:
             # Source names and geometry first; the packed format goes back over them.
-            scalar_mode = _scalar_mode(self.weight_layouts, values)
+            scalars = [layout.paths[0][1:] for layout in self.weight_layouts
+                       if layout.paths[0][-1] == "layer_scalar"]
+            scalar_mode = layer_scalar_mode(values, scalars[0]) if scalars else None
             layouts = {layout.name: layout for layout in self.weight_layouts}
             if quantization is None:
                 return decoder_parts.layout_tensors(layouts, values, scalar_mode, self.retained_tensors)
@@ -926,8 +902,7 @@ def _wrapper_model(config: Mapping[str, object], record: decoder_parts.WrapperFi
         # A text_config that states a null pad id states none, and the
         # wrapper's own field defaults to 0 for exactly that.
         pad_token_id=records.integer(text_config.get("pad_token_id") or 0, "pad_token_id"),
-        extra_placeholder_ids=(tuple(records.integer(config.get(name, default), name) for name, default in
-            (("video_token_id", 258884), ("audio_token_id", 258881))) if family == "gemma4" else ()),
+        extra_placeholder_ids=record["extra_placeholder_ids"],
         audio=None if audio_record is None else towers.from_record(audio_record),
         audio_projection=(None if audio_projector is None
                           else projectors.from_record(audio_projector)),
@@ -1058,14 +1033,16 @@ def _source_config(name_or_dir: str | Path, directory: Path, commit: str | None,
 
 
 def _decoded(tensors: Mapping[str, np.ndarray], config: Mapping[str, object], param_dtype: str, *, media: bool
-             ) -> tuple[Mapping[str, np.ndarray], tuple[str, ...], str | None, dict[str, np.ndarray]]:
+             ) -> tuple[Mapping[str, np.ndarray], tuple[str, ...], str | None, dict[str, np.ndarray],
+                        decoders.Checked]:
     """The tensors with a quantized source's weights decoded, and what `save`
     needs to write them back: the quantized names, the scales' dtype and the
-    integer formats' grid. `media` is whether the loader reads the source as
-    a media wrapper (`_media_wrapper`)."""
+    integer formats' grid; and the spellings checked equal before a narrowing
+    cast, which the readers then take as equal (`decoders.Checked`). `media`
+    is whether the loader reads the source as a media wrapper (`_media_wrapper`)."""
     quantization = source_quantization(config)
     if quantization is None:
-        return tensors, (), None, {}
+        return tensors, (), None, {}, decoders.NOTHING_CHECKED
     quantized_tensors, scale_dtype = quantization.names(tensors), quantization.scale_dtype(tensors)
     grid = {part: tensors[part] for name in quantized_tensors for part in quantization.grid(name)
             if part in tensors}
@@ -1076,7 +1053,7 @@ def _decoded(tensors: Mapping[str, np.ndarray], config: Mapping[str, object], pa
             config, media=media)
     tensors = quantization.dequantize(tensors, param_dtype=param_dtype)
     _share_quantized_aliases(tensors, aliases, quantized_tensors)
-    return tensors, quantized_tensors, scale_dtype, grid
+    return tensors, quantized_tensors, scale_dtype, grid, decoders.checked_groups(aliases)
 
 
 def _input_quantization(model: nn.Module, variables: Variables, layouts: tuple[WeightLayout, ...],
@@ -1138,11 +1115,13 @@ class _Built(NamedTuple):
 
 def _wrapper_source(config: Mapping[str, object], record: decoder_parts.WrapperFields,
                     tensors: Mapping[str, np.ndarray], directory: Path, *, dtype: str, attention_impl: str,
-                    max_seq_len: int | None, param_dtype: str, lazy: bool) -> _Built:
+                    max_seq_len: int | None, param_dtype: str, lazy: bool,
+                    checked: decoders.Checked) -> _Built:
     """A multimodal wrapper, `record` its translated config: the decoder under its text_config and the
-    towers beside it."""
+    towers beside it; `checked` the spellings the load checked equal before decoding."""
     text_fields = _wrapper_text_fields(config, record, max_seq_len)
-    parts, language, media = decoders.read_wrapper(tensors, record, param_dtype=param_dtype, lazy=lazy)
+    parts, language, media = decoders.read_wrapper(tensors, record, param_dtype=param_dtype, lazy=lazy,
+                                                   checked=checked)
     for fields in (text_fields, record['text']):
         decoders.held_depths(fields, parts["language_model"]["params"])
     text = NativeFields(CausalTransformer, {**text_fields, "dtype": dtype, "attention_impl": attention_impl})
@@ -1200,30 +1179,22 @@ def _media_wrapper(config: Mapping[str, object]) -> bool:
             and (family not in decoders.families() or decoders.bundles(config)))
 
 
-def _source_weights(model: CausalTransformer, variables: Mapping[str, object],
-                    config: Mapping[str, object]) -> Mapping[str, np.ndarray]:
-    """Write a loaded decoder through its source family's own encoder, under
-    the `config` it shipped, which `save` writes beside the tensors. A
-    multi-head GPTBigCode derives GPT-2's config and tensors from its fields
-    (`PretrainedDecoder.from_model`), but saved as itself it keeps its own."""
-    return decoders.export_decoder_weights(model, variables, config)
-
-
 def _spelled_source_weights(spelling: Mapping[str, str], model: CausalTransformer,
                             variables: Mapping[str, object], config: Mapping[str, object]
                             ) -> Mapping[str, np.ndarray]:
-    """`_source_weights` under the source's own names: `spelling` maps each name the
-    family's encoder writes to the one the source stored it under
-    (`DecoderFamily.spelling`)."""
-    written = _source_weights(model, variables, config)
+    """`decoders.export_decoder_weights` under the source's own names: `spelling` maps each name the
+    family's encoder writes to the one the source stored it under (`DecoderFamily.spelling`)."""
+    written = decoders.export_decoder_weights(model, variables, config)
     return {spelling.get(name, name): tensor for name, tensor in written.items()}
 
 
 def _decoder_source(config: Mapping[str, object], tensors: Mapping[str, np.ndarray], directory: Path,
                     route: SourceRoute, *, dtype: str, attention_impl: str,
-                    max_seq_len: int | None, param_dtype: str, lazy: bool, quantized: bool) -> _Built:
+                    max_seq_len: int | None, param_dtype: str, lazy: bool, quantized: bool,
+                    checked: decoders.Checked) -> _Built:
     """A decoder of a registered family, or of one it was verified as (tier 2), as `route` read it.
-    `quantized` says the source ships weights in a quantization format."""
+    `quantized` says the source ships weights in a quantization format; `checked` names the
+    spellings the load checked equal before decoding."""
     verified = route.verified
     if verified is None:
         assert route.record is not None
@@ -1236,7 +1207,8 @@ def _decoder_source(config: Mapping[str, object], tensors: Mapping[str, np.ndarr
         family = verified.family
     if max_seq_len is not None:
         record["max_seq_len"] = max_seq_len
-    placed, readings = decoders.read_decoder(tensors, record, family, param_dtype=param_dtype, lazy=lazy)
+    placed, readings = decoders.read_decoder(tensors, record, family, param_dtype=param_dtype, lazy=lazy,
+                                             checked=checked)
     variables = decoders.with_constants(placed, record, directory)
     decoders.held_depths(record, variables["params"])
     built = {**record, "dtype": dtype, "attention_impl": attention_impl}
@@ -1261,7 +1233,7 @@ def _decoder_source(config: Mapping[str, object], tensors: Mapping[str, np.ndarr
         # ModernBERT) binds none, and its encoder undoes that rewrite, under the
         # source's own names, before the format encodes the weights again (`export`).
         if not quantized:
-            export_adapter = _source_weights
+            export_adapter = decoders.export_decoder_weights
         elif not layouts:
             export_adapter = partial(_spelled_source_weights, {
                 entry.spelling(name): name for name in tensors if entry.spelling(name) != name})
@@ -1307,7 +1279,7 @@ def _load_native_source(name_or_dir: str | Path, directory: Path, commit: str | 
         tensors = sources.load_shards(directory)
     if mamba_ssm:
         tensors = mamba2.tensors_from_mamba_ssm(tensors)
-    tensors, quantized_tensors, scale_dtype, grid = _decoded(
+    tensors, quantized_tensors, scale_dtype, grid, checked = _decoded(
         tensors, config, declared_dtype(config, tensors) if param_dtype == AUTO else param_dtype,
         media=route.kind == "wrapper")
     if route.kind == "diffusion_gemma":
@@ -1316,19 +1288,20 @@ def _load_native_source(name_or_dir: str | Path, directory: Path, commit: str | 
         model = diffusion_gemma.build(
             config, dtype=dtype, attention_impl=attention_impl, max_seq_len=max_seq_len
         )
-        variables = diffusion_gemma.translate_weights(tensors, config, param_dtype=param_dtype)
+        variables = diffusion_gemma.translate_weights(tensors, config, param_dtype=param_dtype,
+                                                      checked=checked)
         record, layouts, retained = config, (), {}
         built: Mapping[str, object] = {**config, "dtype": dtype, "attention_impl": attention_impl}
         export_adapter = diffusion_gemma.export_weights
     elif route.wrapper is not None:
         model, variables, record, built, layouts, retained, export_adapter = _wrapper_source(
-            config, route.wrapper, tensors, directory, dtype=dtype,
-            attention_impl=attention_impl, max_seq_len=max_seq_len, param_dtype=param_dtype, lazy=streaming)
+            config, route.wrapper, tensors, directory, dtype=dtype, attention_impl=attention_impl,
+            max_seq_len=max_seq_len, param_dtype=param_dtype, lazy=streaming, checked=checked)
     else:
         model, variables, record, built, layouts, retained, export_adapter = _decoder_source(
             config, tensors, directory, route, dtype=dtype, attention_impl=attention_impl,
             max_seq_len=max_seq_len, param_dtype=param_dtype, lazy=streaming,
-            quantized=source_quantization(config) is not None)
+            quantized=source_quantization(config) is not None, checked=checked)
     model, variables = _input_quantization(model, variables, layouts, config, grid)
     source = str(name_or_dir) if commit is None else f"{name_or_dir}@{directory.name}"
     processor = source_processor(directory, config, record, model, gguf_path, source=source)

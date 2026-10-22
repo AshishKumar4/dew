@@ -16,7 +16,7 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
 from dew import records
-from dew.interop.weights import placed
+from dew.interop.weights import native_layouts, placed
 from dew.nn.attention import RMSNorm
 from dew.nn.backbones.decoder_block import BlockWiring, DecoderBlock
 from dew.nn.dense import Dense
@@ -309,6 +309,41 @@ def gemma4_vision_path(hf_name: str) -> tuple[str, ...] | None:
         else "params"
     )
     return (collection, *path)
+
+
+def gemma4_vision_name(path: tuple[str, ...]) -> str:
+    """The Gemma 4 vision tensor name of the leaf at `path`, its collection then its trunk path:
+    `gemma4_vision_path`'s inverse, for a tower built natively rather than read."""
+    trunk = path[1:]
+    named = next((name for name, known in _GEMMA4_VISION_TENSORS.items() if known == trunk), None)
+    if named is not None:
+        return named
+    layer, *rest = trunk
+    if not layer.startswith("layers_"):
+        raise ValueError(f"unknown vision parameter {path!r}")
+    norms = {native: name for name, native in _GEMMA4_VISION_NORMS.items()}
+    if len(rest) == 2 and rest[0] in norms:
+        rest = [norms[rest[0]], "weight"]
+    elif rest[-1] == "kernel":
+        rest = [*rest[:-1], "linear", "weight"]
+    elif rest[-1] == "scale":
+        rest = [*rest[:-1], "weight"]
+    return ".".join(("encoder.layers", layer.removeprefix("layers_"), *rest))
+
+
+def gemma4_tower_layouts(variables: Variables) -> tuple[WeightLayout, ...]:
+    """The layouts that write a natively built Gemma 4 tower's tensors back from its collections
+    (`gemma4_vision_name`); a read tower's come from its reading (`TOWERS`)."""
+    return native_layouts(variables, gemma4_vision_name, gemma4_vision_path)
+
+
+def gemma4_projector_layouts(params: Variables) -> tuple[WeightLayout, ...]:
+    """The layouts that write a natively built Gemma 4 embedder's projection back from its
+    parameters, rooted at `params`."""
+    names: dict[tuple[str, ...], str] = {("params", *path): name
+                                         for name, path in _PROJECTOR_PATHS["gemma4"].items()}
+    return native_layouts({"params": params}, names.__getitem__,
+                          lambda name: ("params", *projector_weight_path("gemma4", name)))
 
 
 def translate_gemma4_projector_weights(

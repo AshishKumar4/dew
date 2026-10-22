@@ -25,7 +25,7 @@ from dew.interop.safetensors_io import LazyTensors
 from dew.interop.streaming import WeightLayout
 from dew.nn.activations import GatedActivation, Situ
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.nn.backbones.decoder_block import Mixture
+from dew.nn.backbones.decoder_block import LAYER_SCALAR_COLLECTIONS, Mixture
 from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.hyper_connections import HyperConnections
 from dew.nn.mixers import AttentionMixer, MixerBase
@@ -287,7 +287,10 @@ class AudioFields(TypedDict):
 
 class WrapperFields(AudioFields):
     """Describes a multimodal wrapper: its decoder, its tower, its
-    projector, and where each modality's tokens sit."""
+    projector, and where each modality's tokens sit: the image's and the
+    video's placeholders, and the further ids the decoder treats as
+    placeholders whatever its towers read (`MultimodalTransformer.
+    extra_placeholder_ids`)."""
 
     model_type: str
     text_model_type: str
@@ -296,6 +299,8 @@ class WrapperFields(AudioFields):
     projector: Mapping[str, object]
     image_token_id: int
     tokens_per_image: int | None
+    video_token_id: int | None
+    extra_placeholder_ids: tuple[int, ...]
 
 
 def kinds_of(config: DecoderFields) -> dict[str, KindFields]:
@@ -1238,7 +1243,7 @@ def decoder_tensors(family: "DecoderFamily", model: CausalTransformer, variables
     state = tree.get('moe')
     if isinstance(state, Mapping):
         leaves.update({('moe', *path): value for path, value in flatten_dict(dict(state)).items()})
-    constants = tree.get('constants')
+    constants = tree.get(LAYER_SCALAR_COLLECTIONS['frozen'])
     if model.layer_scalar == 'frozen' and isinstance(constants, Mapping):
         leaves.update({('params', *path): value for path, value in flatten_dict(dict(constants)).items()
                        if path[-1] == 'layer_scalar'})

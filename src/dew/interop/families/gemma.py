@@ -41,7 +41,7 @@ from dew.interop.decoder_parts import (
 )
 from dew.interop.safetensors_io import LazyTensors
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.nn.backbones.decoder_block import Mixture
+from dew.nn.backbones.decoder_block import LAYER_SCALAR_COLLECTIONS, Mixture
 from dew.nn.backbones.layer_plan import LayerKind
 from dew.nn.gemma3n import AltUp
 from dew.nn.mixers import AttentionMixer
@@ -526,7 +526,7 @@ def gemma4_export_weights(family: DecoderFamily, model: CausalTransformer, varia
     held, stray = (fixed, trained) if mode == 'frozen' else (trained, fixed)
     if held != scalars or stray:
         raise ValueError(f"layer_scalar={mode} keeps every layer scalar in "
-                         f"{'constants' if mode == 'frozen' else 'params'} alone")
+                         f"{LAYER_SCALAR_COLLECTIONS[mode]} alone")
     return decoder_tensors(family, model, variables, config)
 
 
@@ -553,10 +553,9 @@ def gemma4_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | No
         tail = tuple(parts[3:])
         if tail == ('layer_scalar',):
             mode = config.get("layer_scalar")
-            if mode not in ("frozen", "trainable"):
-                refuse("layer_scalar", "the source scalar requires a frozen or trainable model mode")
-            collection = "constants" if mode == "frozen" else "params"
-            return (collection, f'layers_{parts[2]}', 'layer_scalar')
+            if not isinstance(mode, str) or mode not in LAYER_SCALAR_COLLECTIONS:
+                return refuse("layer_scalar", "the source scalar requires a frozen or trainable model mode")
+            return (LAYER_SCALAR_COLLECTIONS[mode], f'layers_{parts[2]}', 'layer_scalar')
         layer = ('params', f'layers_{parts[2]}')
         if tail in _GEMMA4_MOE:
             return (*layer, *_GEMMA4_MOE[tail])
