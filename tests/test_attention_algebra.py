@@ -518,3 +518,16 @@ def test_the_accurate_form_is_as_exact_as_the_reference_at_its_raw_domains_edges
         return template.reference(query, key, value, spans, scale=scale)
 
     assert_as_exact(jax.jit(ours), jax.jit(reference), draw, f"accurate form at a {edge}", seeds=8)
+
+
+@pytest.mark.parametrize("raw", [True, False], ids=["raw", "scaled"])
+def test_the_accurate_forms_rescale_takes_the_plain_factor_where_its_correction_is_not_finite(raw):
+    """`algebra.carried` compensates a state's factor `exp(m - safe)` for its exponent's rounding and takes
+    the uncompensated factor where that correction is not finite: a state of no key (m = -inf, whose TwoSum
+    error is NaN) and, raw, a difference past what TwoProduct's split holds (4097 times it overflows) both
+    weigh 0, as the reference's exp does; a state at the maximum keeps 1."""
+    spec = algebra.Forward("full", 4, ids=False, scale=0.125, natural=True, initial=not raw)
+    assert spec.raw == raw
+    m = jnp.asarray([-jnp.inf, -1e35, 0.0], jnp.float32)
+    found = np.asarray(algebra.carried(spec, m, jnp.zeros(3, jnp.float32)))
+    np.testing.assert_array_equal(found, np.asarray([0.0, 0.0, 1.0], np.float32))
