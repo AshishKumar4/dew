@@ -72,7 +72,9 @@ BLOCK = max(max(tiles.block_q for tiles in SPACE), max(tiles.block_k for tiles i
 
 PROBE = os.environ.get("DEW_TF_PROBE", "")
 """A measurement branch's switch: '' as the head, 'nogather' without the old anchor's row, 'noargmax'
-without the anchor's tracking, 'plainres' the plain walk writing its sums as residuals."""
+without the anchor's tracking, 'plainres' the plain walk writing its sums as residuals; 'prefetch' the old
+anchor's row loaded unmasked before the tile's products, 'carry' the anchor's row carried and a new one
+loaded where it moved, 'onehot' carried and taken from the tile by a one-hot product."""
 
 
 def _dot(a: jax.Array, b: jax.Array, interpret: bool) -> jax.Array:
@@ -230,7 +232,8 @@ def _forward_kernel(*refs, spec: algebra.Forward, score_kinds: tuple[Kind, ...],
     def tracked(index, carry: tuple[algebra.Partial, algebra.Argmax, jax.Array, jax.Array]):
         # A training forward's step: the anchor key and the split sums the backward reads
         # (`algebra.split_accumulate`); its state's values are `B`, every key's but the anchor's.
-        state, arg, own, others_total = carry
+        state, arg, own, others_total, *kept = carry
+        early = value_ref[arg.key, :] if PROBE == "prefetch" else None
         tile, coords, logits, m, alpha, weights, denominator = softmax(index, state)
         anchor = arg if PROBE == "noargmax" else algebra.argmax(arg, logits, coords.k_pos)
         moved = anchor.peak > arg.peak
@@ -241,11 +244,21 @@ def _forward_kernel(*refs, spec: algebra.Forward, score_kinds: tuple[Kind, ...],
         # The old anchor's value row, read only where the anchor moved: after a row's first tiles it
         # rarely does, and a masked load fetches nothing for the rest.
         skipped = PROBE in ("nogather", "noargmax")
-        old_value = (jnp.zeros((arg.key.shape[0], value_ref.shape[-1]), value_ref.dtype) if skipped
-                     else _masked_rows(value_ref, arg.key, moved, interpret))
+        if PROBE == "prefetch":
+            old_value = early
+        elif PROBE in ("carry", "onehot"):
+            old_value = kept[0]
+        else:
+            old_value = (jnp.zeros((arg.key.shape[0], value_ref.shape[-1]), value_ref.dtype) if skipped
+                         else _masked_rows(value_ref, arg.key, moved, interpret))
         acc, own, others_total = algebra.split_accumulate(state.acc, own, others_total, alpha, moved,
                                                           old_value, product, others, own_tile)
-        return algebra.Partial(acc, m, denominator), anchor, own, others_total
+        if PROBE == "carry":
+            kept = [jnp.where(moved[:, None], _masked_rows(value_ref, anchor.key, moved, interpret), kept[0])]
+        elif PROBE == "onehot":
+            hot = (coords.k_pos == anchor.key[:, None]).astype(value.dtype)
+            kept = [jnp.where(moved[:, None], _dot(hot, value, interpret).astype(value.dtype), kept[0])]
+        return algebra.Partial(acc, m, denominator), anchor, own, others_total, *kept
 
     start = (algebra.resumed(spec, *(ref[...] for ref in initial_refs)) if initial
              else algebra.empty(block_q, value_ref.shape[-1]))
@@ -260,12 +273,15 @@ def _forward_kernel(*refs, spec: algebra.Forward, score_kinds: tuple[Kind, ...],
     elif residuals:
         nothing = jnp.zeros((block_q,), jnp.float32)
         carry = start, algebra.no_argmax(block_q), nothing, nothing
-        split, arg, own, others_total = jax.lax.fori_loop(lo, hi, tracked, carry)
+        if PROBE in ("carry", "onehot"):
+            carry = (*carry, jnp.zeros((block_q, value_ref.shape[-1]), value_ref.dtype))
+        split, arg, own, others_total, *kept = jax.lax.fori_loop(lo, hi, tracked, carry)
         residual_refs[2][...] = arg.key
         residual_refs[3][...] = split.acc
         residual_refs[4][...] = own
         residual_refs[5][...] = others_total
-        state = split._replace(acc=algebra.split_output(split.acc, own, value_ref[arg.key, :]))
+        anchor_value = kept[0] if kept else value_ref[arg.key, :]
+        state = split._replace(acc=algebra.split_output(split.acc, own, anchor_value))
     else:
         state = jax.lax.fori_loop(lo, hi, step, start)
     out, m, denominator = algebra.finish(spec, state, initial=initial, output_mod=output_mod,
