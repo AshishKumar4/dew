@@ -89,10 +89,6 @@
    "comparisons": 1,
    "lane": "Models, Serving & RL"
   },
-  "tests/test_causal_transformer.py": {
-   "comparisons": 41,
-   "lane": "Models, Serving & RL"
-  },
   "tests/test_checkpoint_ranking.py": {
    "comparisons": 4,
    "lane": "Training"
