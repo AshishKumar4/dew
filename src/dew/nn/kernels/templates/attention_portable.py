@@ -26,9 +26,9 @@ from dew.nn.kernels.templates.attention import (
 )
 
 
-def _small(held: algebra.Room | None, value: jax.Array) -> jax.Array | None:
-    """A guarded tile's small weights' product with its values (`algebra.Room.small`), None unguarded."""
-    return None if held is None else _dot(algebra.narrow(held.small, value.dtype), value)
+def _plain(held: algebra.Room | None, value: jax.Array) -> jax.Array | None:
+    """A guarded tile's unshifted weights' product with its values (`algebra.Room.plain`), None unguarded."""
+    return None if held is None else _dot(algebra.narrow(held.plain, value.dtype), value)
 
 
 def _dot(a: jax.Array, b: jax.Array) -> jax.Array:
@@ -115,7 +115,7 @@ def forward(spec: algebra.Forward, query: jax.Array, key: jax.Array, value: jax.
         def plain(j, state: algebra.Partial) -> algebra.Partial:
             _, _, m, factor, weights, held, v_tile = softmax(j, state)
             product = _dot(algebra.narrow(weights, v_tile.dtype), v_tile)
-            return algebra.stepped(state, m, factor, weights, product, held, _small(held, v_tile))
+            return algebra.stepped(state, m, factor, weights, product, held, _plain(held, v_tile))
 
         def step(j, carry: tuple[algebra.Partial, algebra.Argmax, jax.Array, jax.Array]):
             state, arg, own, others_total = carry
@@ -126,8 +126,9 @@ def forward(spec: algebra.Forward, query: jax.Array, key: jax.Array, value: jax.
                                                     coords.k_pos == anchor.key[:, None])
             acc, own, others_total = algebra.split_accumulate(
                 state.acc, own, others_total, factor, anchor.peak > arg.peak, value[row, arg.key, kv_head],
-                _dot(others, v_tile), others, own_tile, held, small := _small(held, v_tile))
-            stepped = algebra.stepped(state, m, factor, weights, jnp.zeros_like(acc), held, small)
+                _dot(others, v_tile), others, own_tile, held)
+            stepped = algebra.stepped(state, m, factor, weights, jnp.zeros_like(acc), held,
+                                      _plain(held, v_tile))
             return stepped._replace(acc=acc), anchor, own, others_total
 
         def begun(live) -> algebra.Partial:
@@ -164,9 +165,11 @@ def forward(spec: algebra.Forward, query: jax.Array, key: jax.Array, value: jax.
         walked = algebra.guarded(walk, walk, weighted) if spec.headroom else walk()
         if residuals:
             split, arg, own, others_total = walked
-            state = split._replace(acc=algebra.split_output(split.acc, own, value[row, arg.key, kv_head]))
-            shift = jnp.zeros_like(own) if split.shift is None else split.shift
-            kept = arg.key, split.acc, own, others_total, shift
+            anchor_value = value[row, arg.key, kv_head]
+            state = split._replace(acc=algebra.split_output(split.acc, own, anchor_value))
+            sums = algebra.split_residuals(spec, split, own, others_total, anchor_value, state,
+                                           initial=initial is not None)
+            kept = (arg.key, *sums)
         else:
             state, kept = walked, ()
         out, m, denominator = algebra.finish(spec, state, initial=initial is not None, output_mod=output_mod,
