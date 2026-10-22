@@ -246,10 +246,16 @@ def _compensated_sum(values: jax.Array, axes: tuple[int, ...]) -> jax.Array:
     wide = values.astype(jnp.promote_types(values.dtype, jnp.float32))
     zero = jnp.zeros((), wide.dtype)
     hi, lo = jax.lax.reduce((wide, jnp.zeros_like(wide)), (zero, zero), compensated_add, axes)
-    # A sum that reaches an infinity is the plain one, +-inf or NaN as `jnp.sum`'s is, where every
-    # residual past the infinity is inf - inf.
-    plain = jnp.sum(wide, axes)
-    return jnp.where(jnp.isfinite(plain), hi + lo, plain).astype(values.dtype)
+    return compensated_total((hi, lo), jnp.sum(wide, axes)).astype(values.dtype)
+
+
+def compensated_total(pair: tuple[jax.Array, jax.Array], plain: jax.Array) -> jax.Array:
+    """A compensated sum's value, its `(hi, lo)` pair rounded once, or the `plain` sum of the same
+    values where that reaches an infinity: +-inf or NaN as `jnp.sum`'s is, where every residual past
+    the infinity is inf - inf. `compensated_add` itself stays arithmetic alone, so a tangent's scan
+    through it stays linear; a running sum that can overflow keeps its plain sum beside the pair
+    and reads its value here."""
+    return jnp.where(jnp.isfinite(plain), pair[0] + pair[1], plain)
 
 
 @_compensated_sum.defjvp
@@ -369,14 +375,21 @@ def head_product(subscripts: str, hidden: jax.Array, head: jax.Array,
     `matmul_precision` "highest", whose head is fp32. `compute`, the model's
     compute dtype where the states arrive in another, decides in their place."""
     if rounds_to_bf16(hidden.dtype if compute is None else compute, precision):
-        states = _algorithm_operand(hidden.astype(jnp.float32))
-        logits = jnp.einsum(subscripts, states, _algorithm_operand(head),
-                            precision=jax.lax.DotAlgorithmPreset.BF16_BF16_F32,
-                            preferred_element_type=jnp.float32)
-        return bf16_logits(logits)
+        return bf16_product(subscripts, hidden, head)
     wide = at_least_fp32(hidden.dtype)
     return jnp.einsum(subscripts, hidden.astype(wide), head,
                       precision=precision, preferred_element_type=wide)
+
+
+def bf16_product(subscripts: str, hidden: jax.Array, head: jax.Array) -> jax.Array:
+    """`jnp.einsum(subscripts, hidden, head)` multiplied as bf16 and its result rounded to bf16, held
+    in fp32: the one product a bf16 head computes (`head_product`) and a tiled head computes over
+    each tile, so the two round each logit alike."""
+    states = _algorithm_operand(hidden.astype(jnp.float32))
+    logits = jnp.einsum(subscripts, states, _algorithm_operand(head.astype(at_least_fp32(head.dtype))),
+                        precision=jax.lax.DotAlgorithmPreset.BF16_BF16_F32,
+                        preferred_element_type=jnp.float32)
+    return bf16_logits(logits)
 
 
 def at_default_precision[Output](fn: Callable[..., Output]) -> Callable[..., Output]:
