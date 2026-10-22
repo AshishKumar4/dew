@@ -42,24 +42,17 @@ from flax.typing import Dtype, PrecisionLike
 from dew.nn.blocks import normal_kernel
 from dew.nn.dense import Dense
 from dew.nn.flops import conv_flops, projection_flops, ssd_flops
-from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of
+from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of, sequence_blocks
 from dew.nn.linear import DepthwiseConv1d, held_scan
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.precision import at_least_fp32, float32_dot_general, float32_products
 from dew.nn.sharding import LayoutRefused, logical_axes, rows_like, sequence_shards
+from dew.nn.ssm import affine_spans
 
 CHUNK_SIZE = 64
 """Tokens per associative scan. Each chunk materialises its `[B, C, D, N]`
 decays and writes, so the chunk bounds the scan's memory; the output does
 not depend on it."""
-
-
-def _combine(left, right):
-    """Two consecutive spans of the recurrence as one, the reference's
-    `combine_fn` (modeling_mamba.py:231-234)."""
-    decay_left, write_left = left
-    decay_right, write_right = right
-    return decay_left * decay_right, decay_right * write_left + write_right
 
 
 def selective_scan(x, dt, A, B, C, D, state=None, starts=None, chunk_size: int = CHUNK_SIZE):
@@ -80,8 +73,7 @@ def selective_scan(x, dt, A, B, C, D, state=None, starts=None, chunk_size: int =
     pad = (chunk_size - length % chunk_size) % chunk_size
 
     def chunks(t):  # [B, S, ...] -> [NC, B, C, ...], chunks leading for the scan
-        t = jnp.pad(t, ((0, 0), (0, pad), *[(0, 0)] * (t.ndim - 2)))
-        return jnp.moveaxis(t.reshape(batch, (length + pad) // chunk_size, chunk_size, *t.shape[2:]), 1, 0)
+        return sequence_blocks(t, chunk_size, leading=True)
 
     # A padded step is dt 0, which neither decays nor writes, and no reset.
     resets = jnp.zeros((batch, length), jnp.bool_) if starts is None else jnp.asarray(starts, jnp.bool_)
@@ -91,7 +83,8 @@ def selective_scan(x, dt, A, B, C, D, state=None, starts=None, chunk_size: int =
         decay = jnp.exp(dt_c[..., None] * A)                # [B, C, D, N]
         decay = jnp.where(reset_c[..., None, None], 0.0, decay)
         write = (dt_c * x_c)[..., None] * B_c[:, :, None, :]
-        decays, writes = jax.lax.associative_scan(_combine, (decay, write), axis=1)
+        # The reference's `combine_fn` (modeling_mamba.py:231-234).
+        decays, writes = jax.lax.associative_scan(affine_spans, (decay, write), axis=1)
         states = decays * h[:, None] + writes
         read = jnp.einsum('bcdn,bcn->bcd', states, C_c, precision=float32_products(states.dtype))
         return states[:, -1], read

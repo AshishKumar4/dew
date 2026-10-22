@@ -76,11 +76,13 @@ from dew.objectives.base import (
     Metric,
     Objective,
     Ratio,
+    Recorded,
     Shown,
     Step,
     TrainingScalar,
     Variables,
     select,
+    taken_record,
 )
 from dew.records import JSON, boolean, json_value, record
 from dew.telemetry import profile as telemetry_profile
@@ -103,6 +105,7 @@ from dew.telemetry.records import (
 from dew.training._lowering import Lowered
 from dew.training.display import TRAINER_SHOWN, TrainingDisplay, goodput
 from dew.training.distributed import (
+    PREFETCH_DEPTH,
     DevicePrefetchIterator,
     Layout,
     MeshSpec,
@@ -159,6 +162,7 @@ from dew.training.narrow import narrowed, narrowed_paths
 from dew.training.observe import Observe
 from dew.training.optim import learning_rate, with_rate_scales
 from dew.training.planning import Candidate, Planned, Timer, plan_step, settled, splits, whole_step
+from dew.training.profiling import ProfileWindow, owned_capture, start_capture, stop_capture
 from dew.training.rungs import keep_rung, plan_flops, recorded_launches, recorded_rung
 from dew.training.runtime import Preempted, PreemptionNotice, ready_process
 from dew.training.selection import Best, HeldBest, rankings
@@ -204,27 +208,9 @@ class Rollout(Protocol):
     def __call__(self, state: TrainState, batch: Batch, key: jax.Array) -> Batch: ...
 
 
-@dataclasses.dataclass(frozen=True)
-class ProfileWindow:
-    """A request for one profiler window per fit.
-
-    It traces `steps` steps into `directory` after `warmup` steps have run, so the
-    trace shows the loop and not the compile.
-
-    `dew.Profiler` is the other way to capture a trace, as a context manager
-    around any code; a fit refuses to schedule a window inside one. The loop
-    reports the window it wrote as the `ProfileWindow` record of
-    `dew.telemetry.records`.
-    """
-    directory: str
-    steps: int
-    warmup: int = 2
-
-
 def _rollout_metrics(rollout: Rollout) -> Mapping[str, float]:
     """The rollout's report of its latest call. A rollout is any callable,
-    and a plain function reports nothing, so the trainer reads `metrics` at
-    this boundary."""
+    and a plain function reports nothing, so the trainer reads `metrics` at this boundary."""
     return getattr(rollout, 'metrics', {})
 
 
@@ -432,6 +418,7 @@ class Trainer(Generic[Loss, Effects]):
         profile: ProfileWindow | None = None,
         lower_for: str | None = None,
         tune_kernels: bool = False,
+        record: bool = False,
     ):
         """Hold everything a run needs, without opening any of it.
 
@@ -453,7 +440,8 @@ class Trainer(Generic[Loss, Effects]):
         the first step for it in place of compiling it (`dew.training._lowering.Lowered`).
         `tune_kernels` measures each Pallas launch of a step that has no config measured on this GPU,
         where the process has the GPU to itself (`dew.nn.kernels.tuning.tune`); without it such a
-        launch runs the nearest measured shape's config or its heuristic.
+        launch runs the nearest measured shape's config or its heuristic. `record` makes each step return in
+        its metrics what each evaluation, replays too, sampled or passed as a boundary (`taken_record`).
         """
         whole = _read_whole(accumulation, split, step, layout, rollout, mesh)
         self.objective = objective
@@ -474,13 +462,16 @@ class Trainer(Generic[Loss, Effects]):
         self.step = step
         self.rollout = rollout
         self.tune_kernels = tune_kernels
+        if record and step is not None:
+            raise ValueError("a custom step builds its own Steps, which Trainer(record=True) cannot reach: "
+                             "build them with Step(record=True)")
+        self.record = record
+        self.records: list[Recorded] = []
         self.profile = profile
         self.lower_for = lower_for
-        # Set by `compile`, for the batch shape it was called with. A ramped
-        # run has one value per stage; `fit` keeps them beside each step. The
-        # program is the step as handed to XLA, before GSPMD partitions it,
-        # and the executable the step as compiled, whose memory analysis a
-        # benchmark reads.
+        # Set by `compile`, for the batch shape it was called with. A ramped run has one value per stage;
+        # `fit` keeps them beside each step. The program is the step as handed to XLA, before GSPMD partitions
+        # it, and the executable the step as compiled, whose memory analysis a benchmark reads.
         self.step_flops: StepFlops | None = None
         self.program: jax.stages.Lowered | None = None
         self.executable: jax.stages.Compiled | None = None
@@ -498,10 +489,9 @@ class Trainer(Generic[Loss, Effects]):
         self._display = TrainingDisplay()
         self._count_work = False
         self._refusal: str | None = None
-        # The fit ladder's rung beyond the objective's own head and remat: a
-        # step that fit only under XLA's default options keeps them for later
-        # compiles. A resumed run starts at its checkpoint's rung, and says so
-        # if its first compile has to climb past it (`_climb_to`).
+        # The fit ladder's rung beyond the objective's own head and remat: a step that fit only under XLA's
+        # default options keeps them for later compiles. A resumed run starts at its checkpoint's rung, and
+        # says so if its first compile has to climb past it (`_climb_to`).
         self._xla_defaults = False
         # Why this run's checkpoints describe no model to load, said once.
         self._unrecorded: str | None = None
@@ -509,10 +499,9 @@ class Trainer(Generic[Loss, Effects]):
         # last trace of `initial_state` saw them (`_boxed_axes`).
         self._boxed: dict[tuple[str, ...], LogicalAxes] | None = None
         self._resumed_rung: JSON = None
-        # The rung each newly met shape starts from, as the first compile found
-        # the objective: its modules, head tile, XLA option choice and record
-        # (`_at_base_rung`); then the rung each shape compiled at, by layout,
-        # and the rungs a resumed checkpoint recorded for its shapes.
+        # The rung each newly met shape starts from, as the first compile found the objective: its modules,
+        # head tile, XLA option choice and record (`_at_base_rung`); then the rung each shape compiled at, by
+        # layout, and the rungs a resumed checkpoint recorded for its shapes.
         self._base_rung: tuple[tuple[nn.Module, ...], tuple[int, int] | None, bool, dict[str, JSON]] | None
         self._base_rung = None
         self._shape_rungs: dict[str, JSON] = {}
@@ -528,6 +517,7 @@ class Trainer(Generic[Loss, Effects]):
         self._stage_starts: frozenset[int] = frozenset()
         # The training batch's device steps, which the compiled step runs (`Loader.device`).
         self._device: tuple[DeviceStep, ...] = ()
+        self._prefetch = PREFETCH_DEPTH
 
     @property
     def optimizer(self) -> optax.GradientTransformation:
@@ -535,8 +525,7 @@ class Trainer(Generic[Loss, Effects]):
             raise ValueError("an OptimConfig is built over the run's length, which only fit(steps=...) gives")
         return self._optimizer
 
-    # ------------------------------------------------------------------
-    # The state
+    # ------------------------------------------------------------------ The state
     # ------------------------------------------------------------------
 
     def initial_state(self, initializer: Initializer | None = None,
@@ -916,8 +905,7 @@ class Trainer(Generic[Loss, Effects]):
         placed = transfer(rest, dataclasses.replace(shardings, variables=None, ema=None))
         return dataclasses.replace(placed, variables=params, ema=ema)
 
-    # ------------------------------------------------------------------
-    # The step
+    # ------------------------------------------------------------------ The step
     # ------------------------------------------------------------------
 
     def _model_batch(self, batch: Batch) -> Batch:
@@ -939,10 +927,9 @@ class Trainer(Generic[Loss, Effects]):
 
     def _loss_shape(self, state: TrainState, batch: Batch):
         batch = self._model_shapes(batch)
-        # Shapes and dtypes only: a resident frozen leaf sits in another
-        # memory space than the moving ones, and the loss the realization
-        # runs reads a snapshot in one space. The step's key is drawn inside
-        # the trace, so an abstract state compiles a step as a placed one does.
+        # Shapes and dtypes only: a resident frozen leaf sits in another memory space than the moving ones,
+        # and the loss the realization runs reads a snapshot in one space. The step's key is drawn inside the
+        # trace, so an abstract state compiles a step as a placed one does.
         params = jax.tree.map(lambda x: jax.ShapeDtypeStruct(x.shape, x.dtype), state.variables)
 
         def loss(params, batch, microstep, key, step, ema):
@@ -1044,7 +1031,7 @@ class Trainer(Generic[Loss, Effects]):
         custom step with no invented commit telemetry, which reads it whole."""
         if self.step is None:
             return Transaction(self.objective, self.optimizer, split * self.accumulation, shapes, copies,
-                               split=split).step()
+                               split=split, record=self.record).step()
         custom = self.step(self.objective, self.optimizer)
 
         def run(current, batch, part, tokens):
@@ -1209,7 +1196,7 @@ class Trainer(Generic[Loss, Effects]):
         last = state.accumulation
         rebuilt = last is not None and not last.replays(prepared.accumulation)
         built = [(prepared.compute, state.compute), (prepared.accumulation, None if rebuilt else last)]
-        held = prefetched_bytes(batch, placement) + placed_bytes(
+        held = prefetched_bytes(batch, placement, self._prefetch) + placed_bytes(
             [field for field, kept in built if kept is None and field is not None])
         jitted = self._jitted(shapes, copies, shardings, placement, replicated, split)
         part = jax.ShapeDtypeStruct((), jnp.int32, sharding=replicated)
@@ -1326,7 +1313,8 @@ class Trainer(Generic[Loss, Effects]):
             prepared = self._initialize_accumulation(state, cpu_batch, shapes, window=self.accumulation,
                                                      shape_only=True)
             placement = self.shardings(prepared)
-            transaction = Transaction(self.objective, self.optimizer, self.accumulation, shapes)
+            transaction = Transaction(self.objective, self.optimizer, self.accumulation, shapes,
+                                      record=self.record)
             body = transaction.step(realize=execution.realize, host=True)
 
         def run(current, batch):
@@ -1343,8 +1331,7 @@ class Trainer(Generic[Loss, Effects]):
                 return transfer(advanced, placement), *stepped
         return run
 
-    # ------------------------------------------------------------------
-    # The loop
+    # ------------------------------------------------------------------ The loop
     # ------------------------------------------------------------------
 
     @ruled
@@ -1367,6 +1354,7 @@ class Trainer(Generic[Loss, Effects]):
         restore_best: bool = False,
         state: TrainState | None = None,
         observe: Observe | None = None,
+        device_prefetch: int = PREFETCH_DEPTH,
     ) -> TrainState:
         """Train until the step or real-token cap is reached, resuming the latest checkpoint.
 
@@ -1412,7 +1400,8 @@ class Trainer(Generic[Loss, Effects]):
 
         Previews are generated only when `preview=True` and a tracker receives them;
         scalar reporting never triggers preview work. `observe` takes values of the
-        state at a cadence of its own while the run trains (`Observe`).
+        state at a cadence of its own while the run trains (`Observe`). `device_prefetch` training
+        batches are placed on the devices ahead of the step, which the step's memory plan holds room for.
 
         The process is readied first (`dew.training.runtime.ready_process`), as
         `prepare_process` readies it: a program that never called that gets Dew's
@@ -1424,7 +1413,7 @@ class Trainer(Generic[Loss, Effects]):
             raise ValueError("tokens= needs an objective that counts real tokens")
         ready_process()
         loader, validation = fitted(dataset, validation, objective=self.objective.data())
-        self._device = loader.device
+        self._device, self._prefetch = loader.device, device_prefetch
         if epochs is not None:
             steps = loader.epoch_steps(epochs, self.accumulation)
         count_compilation_cache()
@@ -1438,7 +1427,7 @@ class Trainer(Generic[Loss, Effects]):
         # A display of this fit's own: one before it may have run other steps.
         self._display = TrainingDisplay()
         profile, checkpoints = self.profile, self.checkpoints
-        profiler = self._own_profile_window()
+        profiler = owned_capture(self.profile)
         # One boundary lookup at setup: the prefetch worker and the step scopes share whichever profiler
         # owns the capture.
         tracer = profiler if profiler is not None else telemetry_profile.active_profile()
@@ -1496,7 +1485,7 @@ class Trainer(Generic[Loss, Effects]):
             state = jax.device_put(initial, shardings)
             position = None
         run.last_checkpoint = time.perf_counter()
-        interval = Interval.resumed(run.stop_control, plan.tokens, last_saved=(
+        interval = Interval.resumed(run.stop_control, last_saved=(
             int(state.step) if checkpoints is not None and checkpoints.latest is not None else None))
         if self._opened(plan, run, interval, state, position,
                         resumed=initial is None and interval.last_saved is not None):
@@ -1510,17 +1499,16 @@ class Trainer(Generic[Loss, Effects]):
             if (profiler is not None and profile is not None
                     and not run.tracing and run.traced == 0
                     and seen >= profile.warmup):
-                self._start_window(profiler)
+                start_capture(profiler)
                 run.tracing = True
             capturing = tracer is not None and tracer.running
             step_scope = (jax.profiler.StepTraceAnnotation("train", step_num=run.current)
                           if capturing else contextlib.nullcontext())
             with step_scope:
                 with region("input.wait"):
-                    # The first read restores the stream's position and opens
-                    # its reader on the prefetch worker, and a stream that may
-                    # run out can on any read: a process whose read failed
-                    # stops its peers before they compile or step without it.
+                    # The first read restores the stream's position and opens its reader on the prefetch
+                    # worker, and a stream that may run out can on any read: a process whose read failed stops
+                    # its peers before they compile or step without it.
                     asked = time.perf_counter()
                     batch = run.read() if seen and run.endless else agreed("training read", run.read)
                     interval.waited += time.perf_counter() - asked
@@ -1688,8 +1676,9 @@ class Trainer(Generic[Loss, Effects]):
                     f"{plan.dataset.batch} records a step of {stream_identity(run.source)}"))
             run.endless = stream_endless(run.source)
             self._marked = marked(partition, self._counted_batch)
-            run.train = DevicePrefetchIterator(run.source, mesh, source_state=position, reads=run.reads,
-                                                prepare=self._marked if self.rollout is None else None)
+            prepare = self._marked if self.rollout is None else None
+            run.train = DevicePrefetchIterator(run.source, mesh, self._prefetch, source_state=position,
+                                               reads=run.reads, prepare=prepare)
             run.source = None  # Lifetime transferred to the prefetch worker.
 
         trained = [entry.module for entry in self.objective.program_key() if entry.trained]
@@ -1732,8 +1721,10 @@ class Trainer(Generic[Loss, Effects]):
         notice stops the run at this step, whose checkpoint is then written."""
         current, checkpoints = run.current, self.checkpoints
         ending = plan.finished(current, interval.real_tokens if plan.tokens is not None else 0)
-        aux = {name: value for name, value in aux.items()
-               if name not in (TRAINING_FLOPS, TOKENS)}
+        record, aux = taken_record(aux)
+        if record is not None:
+            self.records.append(record)
+        aux = {name: value for name, value in aux.items() if name not in (TRAINING_FLOPS, TOKENS)}
         run.training = {'train/loss': loss, **{f'train/{name}': value for name, value in aux.items()}}
         run.stepped = (loss, aux, accepted)
         if current % plan.log_every == 0:
@@ -2049,57 +2040,6 @@ class Trainer(Generic[Loss, Effects]):
                 + "pass metrics to score it, preview=True with a tracker to sample from it, "
                 "or leave eval_every unset")
 
-    def _own_profile_window(self) -> Profiler | None:
-        """Take ownership of the capture a configured window will write.
-
-        A configured window must own the capture. When another profiler
-        already holds it, refuse before the dataset or the mesh do any work,
-        so neither trace is silently dropped or cut short. The window also
-        resolves its optional dependency here, rather than after warmup steps
-        have run.
-
-        Every rank either leaves owning a stopped Profiler or raises
-        together; a rank that proceeded alone would deadlock its peers at the
-        first collective of training.
-        """
-        profile = self.profile
-        if profile is None:
-            return None
-
-        def own_window() -> Profiler:
-            if telemetry_profile.active_profile() is not None:
-                raise ValueError(
-                    "Trainer.profile cannot schedule a window while an explicit "
-                    "dew.Profiler capture is active; drop one or stop the outer "
-                    "profiler before fitting")
-            telemetry_profile.require_profile_support()
-            return telemetry_profile.Profiler(profile.directory)
-
-        return agreed("profiling window setup", own_window)
-
-    def _start_window(self, profiler: Profiler) -> None:
-        """Open the profiler's capture on every rank.
-
-        A peer that failed to start raises here. A capture this rank did
-        start is closed first, so no live trace outlives the aborted run.
-        """
-        capturing = False
-
-        def start() -> None:
-            nonlocal capturing
-            profiler.start()
-            capturing = True
-
-        try:
-            agreed("profiling window start", start)
-        except BaseException as primary:
-            if capturing:
-                try:
-                    profiler.stop()
-                except BaseException as failure:
-                    primary.add_note(f"Profiler stop failed: {failure!r}")
-            raise
-
     def _counted_batch(self, batch: Batch) -> Batch:
         """Prepare host counts before placement, never fetch a device batch to count it.
 
@@ -2351,8 +2291,7 @@ class Trainer(Generic[Loss, Effects]):
 
         agreed(type(value).__name__, send)
 
-    # ------------------------------------------------------------------
-    # Validation
+    # ------------------------------------------------------------------ Validation
     # ------------------------------------------------------------------
 
     def _evaluate(
@@ -2422,37 +2361,15 @@ class Trainer(Generic[Loss, Effects]):
         agreed("evaluation reporting", report)
 
 
-    # ------------------------------------------------------------------
-    # Telemetry
+    # ------------------------------------------------------------------ Telemetry
     # ------------------------------------------------------------------
 
     def _stop_trace(self, run: _FitRun, profile: ProfileWindow, profiler: Profiler) -> None:
-        """Stop the window's owned capture, then report it on process zero.
-
-        The core Profiler drains the backend and exports the native reports
-        on `stop`. The run's last loss is blocked on only to order the
-        primary's failure ahead of the profiler's own drain."""
-        loss, traced = run.loss, run.traced
-
-        def stop() -> None:
-            try:
-                if loss is not None:
-                    loss.block_until_ready()
-            finally:
-                primary = sys.exception()
-                try:
-                    profiler.stop()
-                except BaseException as failure:
-                    if primary is None:
-                        raise
-                    primary.add_note(f"Profiler stop failed: {failure!r}")
-
-        def announce() -> None:
-            self._display.note(f"Wrote profile for {traced} steps to {profile.directory}")
-
-        agreed("profile stop", stop)
-        self._report(ProfileWindowRecord(profile.directory, traced), run.current)
-        agreed("profile announcement", announce)
+        """Stop the window's owned capture (`stop_capture`), then report it on process zero."""
+        stop_capture(profiler, run.loss)
+        self._report(ProfileWindowRecord(profile.directory, run.traced), run.current)
+        agreed("profile announcement", lambda: self._display.note(
+            f"Wrote profile for {run.traced} steps to {profile.directory}"))
 
     def _throughput(self, elapsed: float, steps: int, samples: int, flops: StepFlops | None, *,
                     waited: float = 0.0, compiling: float = 0.0,

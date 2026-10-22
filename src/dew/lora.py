@@ -56,7 +56,13 @@ from dew.interop.safetensors_io import read_file, write_file
 from dew.interop.streaming import WeightLayout
 from dew.nn.backbones.layer_plan import group_layers
 from dew.nn.dense import Dense, DenseGeneral
-from dew.nn.flops import MissingFlopsCount, counted_flops, parameter_flops, projection_flops
+from dew.nn.flops import (
+    MissingFlopsCount,
+    counted_flops,
+    frozen_training_flops,
+    parameter_flops,
+    projection_flops,
+)
 from dew.nn.precision import float32_dot_general
 from dew.nn.protocols import (
     Counted,
@@ -594,7 +600,7 @@ def _counted_adapter(model: nn.Module, branch: _Branch,
             original = unadapted(self)
             forward = counted_flops(original, lengths)
             learned = parameter_flops(original, lengths)
-            return 3 * forward - learned + 3 * self._adapter_forward(lengths)
+            return frozen_training_flops(forward, learned, self._adapter_forward(lengths))
 
     class LogitsAdapter(CountedAdapter):
         @nn.nowrap
@@ -623,7 +629,7 @@ def _counted_adapter(model: nn.Module, branch: _Branch,
             forward = original.prediction_flops(lengths, prediction_lengths=prediction_lengths)
             learned = original.prediction_parameter_flops(lengths, prediction_lengths=prediction_lengths)
             usage = partial(original.prediction_matrix_usage, prediction_lengths=prediction_lengths)
-            return 3 * forward - learned + 3 * self._adapter_forward(lengths, usage=usage)
+            return frozen_training_flops(forward, learned, self._adapter_forward(lengths, usage=usage))
 
         @nn.nowrap
         def logits_flops(self, lengths) -> float:
@@ -637,7 +643,9 @@ def _counted_adapter(model: nn.Module, branch: _Branch,
             original = unadapted(self)
             if not isinstance(original, CountedLogits):
                 raise MissingFlopsCount(f"{type(original).__name__} has no declared vocabulary-head work")
-            return 2 * original.logits_flops(lengths) + 3 * self._adapter_forward(lengths, logits=True)
+            # The vocabulary head is frozen whole: all its forward work takes no weight gradient.
+            head = original.logits_flops(lengths)
+            return frozen_training_flops(head, head, self._adapter_forward(lengths, logits=True))
 
     if isinstance(model, CountedLogits):
         return LogitsAdapter

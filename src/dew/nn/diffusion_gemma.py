@@ -11,7 +11,6 @@ zero signal.
 
 from __future__ import annotations
 
-import functools
 from collections.abc import Mapping
 
 import jax
@@ -21,19 +20,20 @@ from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike, VariableDict
 
 from dew.interop.weights import ParamTree, translate_parameters
-from dew.nn.activations import gated_product
 from dew.nn.attention import RMSNorm
 from dew.nn.backbones.causal_transformer import CausalTransformer
-from dew.nn.dense import Dense
+from dew.nn.mlp import GatedMLP
 from dew.nn.multimodal import VisionConditioner
-from dew.nn.precision import at_least_fp32, float32_dot_general, float32_einsum
+from dew.nn.precision import at_least_fp32, float32_einsum
 from dew.nn.protocols import OutputTable
 from dew.nn.wrapping import DecoderWrapper
 
 
 # The layers follow Transformers' modeling_diffusion_gemma.py:790-823.
 class SelfConditioning(nn.Module):
-    """Folds the previous step's soft embeddings into the canvas embeddings."""
+    """Folds the previous step's soft embeddings into the canvas embeddings: a GeGLU feed-forward
+    (`GatedMLP`, its gate, up and down projections at this module's own scope) of the normed signal,
+    added to the embeddings and normed again."""
 
     hidden_size: int
     intermediate_size: int
@@ -47,16 +47,12 @@ class SelfConditioning(nn.Module):
         self.post_norm = RMSNorm(
             epsilon=self.norm_eps, with_scale=False, dtype=self.dtype,
             name="post_norm")
-        dense = functools.partial(Dense, use_bias=False,
-                                  dtype=self.dtype, precision=self.precision, dot_general=float32_dot_general)
-        self.gate_proj = dense(self.intermediate_size, name="gate_proj")
-        self.up_proj = dense(self.intermediate_size, name="up_proj")
-        self.down_proj = dense(self.hidden_size, name="down_proj")
+        self.feed_forward = GatedMLP(hidden_features=self.intermediate_size, out_features=self.hidden_size,
+                                     activation='geglu', dtype=self.dtype, precision=self.precision)
+        nn.share_scope(self, self.feed_forward)
 
     def __call__(self, inputs_embeds, signal):
-        normed = self.pre_norm(signal)
-        gated = self.down_proj(gated_product('geglu')(self.gate_proj(normed), self.up_proj(normed)))
-        return self.post_norm(inputs_embeds + gated)
+        return self.post_norm(inputs_embeds + self.feed_forward(self.pre_norm(signal)))
 
 
 def soft_embeddings(logits: jax.typing.ArrayLike, embed_weight: jax.typing.ArrayLike,

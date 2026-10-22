@@ -16,6 +16,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from model_support import largest_difference
 from reference_error import assert_as_exact, widened
 from sharded import assert_sharded
 from token_support import token_rows
@@ -370,11 +371,6 @@ def loss_and_grads(objective, spec, variables, batch, devices=None, microbatches
         (value, aux), grads = jax.jit(jax.value_and_grad(loss, has_aux=True))(placed["params"])
     return (float(value), {name: float(number) for name, number in aux.metrics.items()},
             jax.tree.map(np.asarray, grads))
-
-
-def largest_difference(left, right) -> float:
-    return max(jax.tree.leaves(jax.tree.map(
-        lambda a, b: float(np.max(np.abs(a - b))), left, right)))
 
 
 @mesh_lane

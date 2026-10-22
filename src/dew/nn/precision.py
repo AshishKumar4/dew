@@ -20,7 +20,6 @@ from collections.abc import Callable
 import jax
 import jax.numpy as jnp
 from flax.typing import Dtype, PrecisionLike
-from jax.custom_derivatives import linear_call
 from jax.typing import DTypeLike
 
 
@@ -47,36 +46,13 @@ def biased(product: jax.Array, bias: jax.Array) -> jax.Array:
     where torch's addmm sums its in float32: Qwen 2's projection biases, summed over 8192 tokens,
     came out up to 3.75 times further from float64 than torch's own bfloat16 gradients. Broadcast
     at fp32, the gradient sums at fp32 and rounds once into the bias.
-
-    On the CPU that sum is the double-float reduction `compensated_sum` (through `_spread`), not
-    whichever reduction XLA picks for the cotangent's shape: a plain one split over eight devices
-    summed each shard as one sequential chain, where one device's went to YNNPACK (ledger 833).
-    A GPU's reduction is a tree whatever the shard, and the compensated one cost an A100 DiT step
-    35-70% (its variadic reduce leaves the matmul's epilogue), so there the sum is plain.
     """
     dtype, wide = jnp.result_type(product, bias), at_least_fp32(bias.dtype)
     # The bias takes the product's rank before the sum, as flax's layers reshape it, so no rank is
     # promoted implicitly. Broadcast at fp32 and rounded back, it adds as flax adds it (XLA folds
     # the round trip, so the product and bias fuse as before) and its gradient sums at fp32.
     bias = jnp.reshape(bias.astype(wide), (1,) * (product.ndim - bias.ndim) + bias.shape)
-    return product.astype(dtype) + jnp.asarray(_spread(bias, product.shape)).astype(dtype)
-
-
-def _spread(bias: jax.Array, shape: tuple[int, ...]) -> jax.Array:
-    """`bias` broadcast to `shape`, a linear call whose transpose, a bias's gradient (`biased`), sums
-    every position the bias spread over, with `compensated_sum` on the CPU."""
-    spread = tuple(axis for axis, (size, total) in enumerate(zip(bias.shape, shape, strict=True))
-                   if size == 1 and total != 1)
-
-    def broadcast(_, value):
-        return jnp.broadcast_to(value, shape)
-
-    def summed(_, cotangent):
-        total = jax.lax.platform_dependent(cotangent, cpu=lambda value: compensated_sum(value, spread),
-                                           default=lambda value: jnp.sum(value, axis=spread))
-        return jnp.reshape(total, bias.shape)
-
-    return linear_call(broadcast, summed, (), bias)
+    return product.astype(dtype) + jnp.broadcast_to(bias, product.shape).astype(dtype)
 
 
 def precision_names(precision: jax.lax.PrecisionLike) -> frozenset[str]:
@@ -334,10 +310,16 @@ def _compensated_sum(values: jax.Array, axes: tuple[int, ...]) -> jax.Array:
     wide = values.astype(jnp.promote_types(values.dtype, jnp.float32))
     zero = jnp.zeros((), wide.dtype)
     hi, lo = jax.lax.reduce((wide, jnp.zeros_like(wide)), (zero, zero), compensated_add, axes)
-    # A sum that reaches an infinity is the plain one, +-inf or NaN as `jnp.sum`'s is, where every
-    # residual past the infinity is inf - inf.
-    plain = jnp.sum(wide, axes)
-    return jnp.where(jnp.isfinite(plain), hi + lo, plain).astype(values.dtype)
+    return compensated_total((hi, lo), jnp.sum(wide, axes)).astype(values.dtype)
+
+
+def compensated_total(pair: tuple[jax.Array, jax.Array], plain: jax.Array) -> jax.Array:
+    """A compensated sum's value, its `(hi, lo)` pair rounded once, or the `plain` sum of the same
+    values where that reaches an infinity: +-inf or NaN as `jnp.sum`'s is, where every residual past
+    the infinity is inf - inf. `compensated_add` itself stays arithmetic alone, so a tangent's scan
+    through it stays linear; a running sum that can overflow keeps its plain sum beside the pair
+    and reads its value here."""
+    return jnp.where(jnp.isfinite(plain), pair[0] + pair[1], plain)
 
 
 @_compensated_sum.defjvp
@@ -458,14 +440,21 @@ def head_product(subscripts: str, hidden: jax.Array, head: jax.Array,
     `matmul_precision` "highest", whose head is fp32. `compute`, the model's
     compute dtype where the states arrive in another, decides in their place."""
     if rounds_to_bf16(hidden.dtype if compute is None else compute, precision):
-        states = _algorithm_operand(hidden.astype(jnp.float32))
-        logits = jnp.einsum(subscripts, states, _algorithm_operand(head),
-                            precision=jax.lax.DotAlgorithmPreset.BF16_BF16_F32,
-                            preferred_element_type=jnp.float32)
-        return bf16_logits(logits)
+        return bf16_product(subscripts, hidden, head)
     wide = at_least_fp32(hidden.dtype)
     return jnp.einsum(subscripts, hidden.astype(wide), head,
                       precision=float32_products(wide, precision), preferred_element_type=wide)
+
+
+def bf16_product(subscripts: str, hidden: jax.Array, head: jax.Array) -> jax.Array:
+    """`jnp.einsum(subscripts, hidden, head)` multiplied as bf16 and its result rounded to bf16, held
+    in fp32: the one product a bf16 head computes (`head_product`) and a tiled head computes over
+    each tile, so the two round each logit alike."""
+    states = _algorithm_operand(hidden.astype(jnp.float32))
+    logits = jnp.einsum(subscripts, states, _algorithm_operand(head.astype(at_least_fp32(head.dtype))),
+                        precision=jax.lax.DotAlgorithmPreset.BF16_BF16_F32,
+                        preferred_element_type=jnp.float32)
+    return bf16_logits(logits)
 
 
 def at_default_precision[Output](fn: Callable[..., Output]) -> Callable[..., Output]:

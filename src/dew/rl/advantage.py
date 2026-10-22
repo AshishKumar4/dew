@@ -39,6 +39,8 @@ from collections.abc import Callable
 import jax
 import jax.numpy as jnp
 
+from dew.nn.precision import at_least_fp32
+
 MEAN_EPS = 1e-8
 """Added to a masked mean's denominator, as both references add it. Without
 it a fully masked row is a nan that spreads through the batch."""
@@ -90,7 +92,7 @@ def masked_whiten(x: jax.Array, mask: jax.Array,
 
 
 def _grouped(rewards: jax.Array, group: int) -> jax.Array:
-    """`[prompts, group]` float32 rewards.
+    """`[prompts, group]` rewards, at least float32 (a float64 caller's stay float64).
 
     A group of one has no baseline, and the three references answer it three
     ways (verl with the raw reward, Tunix with a nan from ddof 1 or with zeros,
@@ -101,7 +103,7 @@ def _grouped(rewards: jax.Array, group: int) -> jax.Array:
     if rewards.ndim != 1:
         raise ValueError(
             f"rewards are one scalar per completion, [B], got {rewards.shape}")
-    return jnp.asarray(rewards, jnp.float32).reshape(-1, group)
+    return jnp.asarray(rewards, at_least_fp32(jnp.asarray(rewards).dtype)).reshape(-1, group)
 
 
 def group_advantage(rewards: jax.Array, group: int, normalise_by_std: bool = True,
@@ -160,15 +162,16 @@ def gae_advantages(token_rewards: jax.Array, values: jax.Array, mask: jax.Array,
     reaches no real step. Positions outside the mask hold the neighbouring
     step's carry, as in both references, and the loss masks them again.
 
-    The recursion runs in float32 whatever the caller's dtype, the way Tunix's
-    GRPO loss casts its log-probabilities. A caller whitens the advantages
+    The recursion runs in at least float32, the way Tunix's GRPO loss casts
+    its log-probabilities (a float64 caller's, a float64 truth's, in float64). A caller whitens the advantages
     itself (`gae` over its batch, `PPORollout` over every process's), from
     these rather than from returns less values: at values far above the
     advantages, float32 rounds those differences away.
     """
     keep = jnp.asarray(mask) != 0
-    rewards = jnp.where(keep, jnp.asarray(token_rewards, jnp.float32), 0)
-    values = jnp.where(keep, jnp.asarray(values, jnp.float32), 0)
+    wide = at_least_fp32(jnp.result_type(token_rewards, values))
+    rewards = jnp.where(keep, jnp.asarray(token_rewards, wide), 0)
+    values = jnp.where(keep, jnp.asarray(values, wide), 0)
 
     def step(carry, inputs):
         advantage, next_value = carry
@@ -179,7 +182,7 @@ def gae_advantages(token_rewards: jax.Array, values: jax.Array, mask: jax.Array,
         next_value = jnp.where(keep_t, value_t, next_value)
         return (advantage, next_value), advantage
 
-    zeros = jnp.zeros(values.shape[0], jnp.float32)
+    zeros = jnp.zeros(values.shape[0], wide)
     _, transposed = jax.lax.scan(
         step, init=(zeros, zeros),
         xs=(rewards.T, values.T, keep.T), reverse=True)
@@ -194,8 +197,8 @@ def gae(token_rewards: jax.Array, values: jax.Array, mask: jax.Array,
     Returns the whitened advantages and the unwhitened returns, in that order.
     Both references compute `returns = A + V` before whitening. The whitening
     subtracts two nearby numbers, and bf16 rounds the difference away, so it
-    runs in float32 as the recursion does.
+    runs in at least float32 as the recursion does.
     """
     advantages = gae_advantages(token_rewards, values, mask, gamma, lam)
-    returns = advantages + jnp.asarray(values, jnp.float32)
-    return masked_whiten(advantages, jnp.asarray(mask, jnp.float32)), returns
+    returns = advantages + jnp.asarray(values, advantages.dtype)
+    return masked_whiten(advantages, jnp.asarray(mask, advantages.dtype)), returns
