@@ -496,13 +496,17 @@ def test_the_accurate_form_is_as_exact_as_the_reference_at_its_raw_domains_edges
     """The accurate form at scales just outside the raw form's domain (`algebra.RAW_SCALES`), where raw
     products would overflow their difference (2^-126 over keys near ±2^127) or the factor `scale * log2(e)`
     (3e38 over products near fp32's least normal): it scales its logits there and holds check 1."""
-    scale, size = (2.0 ** -126, 2.0 ** 127) if edge == "small scale" else (3e38, 2.0 ** -126)
+    # At the small scale every key's magnitude is drawn in [3/4, 1) of fp32's largest, so each pair's raw
+    # difference overflows while its scaled logits stay finite.
+    largest = float(jnp.finfo(jnp.float32).max)
+    scale, low, high = ((2.0 ** -126, 0.75 * largest, largest) if edge == "small scale"
+                        else (3e38, 2.0 ** -127, 2.0 ** -126))
     spans = template.spans(1, 2, 32)
 
     def draw(seed: int):
         streams = jax.random.split(jax.random.key(seed), 3)
         signs = jnp.asarray([1.0, -1.0], jnp.float32)
-        key = (jax.random.uniform(streams[0], (32, 2), jnp.float32, 0.5, 1.0) * signs * size)[..., None, None]
+        key = (jax.random.uniform(streams[0], (32, 2), jnp.float32, low, high) * signs)[..., None, None]
         value = jax.random.normal(streams[1], (32, 2, 1, 1), jnp.float32)
         return jnp.ones((32, 1, 1, 1), jnp.float32), key, value
 

@@ -154,8 +154,9 @@ class Partial(NamedTuple):
     """A query block's softmax state, unhooked: the weighted values `acc` `[..., bq, Dv]`, the running
     maximum `m` `[..., bq]` (in base 2 where the step's logits are) and the denominator `total`
     `[..., bq]`, fp32; on the guarded path (`guarded`) both sums at each row's `2^-shift` (`room`), a
-    bound on the magnitude of the values the row has weighed, `reach` `[..., bq]`, and whether the row
-    may shift, `live` (one whose plain walk overflowed), all None on the plain path. `rescale`, `merge`
+    bound on the magnitude of the values the row has weighed, `reach` `[..., bq]`, the small weights'
+    sums kept unshifted (`low` `[..., bq, Dv]` and `low_total` `[..., bq]`; `Room.small`), and whether the
+    row may shift, `live` (one whose plain walk overflowed), all None on the plain path. `rescale`, `merge`
     and `finish` take any leading axes, so states a launch wrote per slice merge in XLA after it."""
 
     acc: jax.Array
@@ -163,6 +164,8 @@ class Partial(NamedTuple):
     total: jax.Array
     shift: jax.Array | None = None
     reach: jax.Array | None = None
+    low: jax.Array | None = None
+    low_total: jax.Array | None = None
     live: jax.Array | None = None
 
 
@@ -186,7 +189,8 @@ def headroomed(state: Partial, live: jax.Array | None = None) -> Partial:
     largest = jnp.max(jnp.abs(state.acc), axis=-1)
     reach = jnp.where(rows > 0, largest / jnp.where(rows > 0, rows, 1.0), 0.0)
     live = jnp.zeros(rows.shape, jnp.bool_) if live is None else live
-    return state._replace(shift=jnp.zeros_like(rows), reach=reach, live=live)
+    return state._replace(shift=jnp.zeros_like(rows), reach=reach, low=jnp.zeros_like(state.acc),
+                          low_total=jnp.zeros_like(rows), live=live)
 
 
 def overflowed(acc: jax.Array) -> jax.Array:
@@ -262,7 +266,7 @@ class Room(NamedTuple):
     state's sums take, the row's new shift and value bound, and `beyond`, the shift past its weights', which
     the tile's product and weight sums take (`beyond_weights`), and `small`, the weights that shift would
     push below fp32's least normal, unshifted (zero elsewhere), whose product the mainloop issues apart
-    (`small_terms`)."""
+    (`stepped`), and the factor `alpha` the unshifted sums take."""
 
     weights: jax.Array
     factor: jax.Array
@@ -270,6 +274,7 @@ class Room(NamedTuple):
     reach: jax.Array
     beyond: jax.Array
     small: jax.Array
+    alpha: jax.Array
 
 
 def beyond_weights(x: jax.Array, room: Room | None) -> jax.Array:
@@ -290,28 +295,21 @@ def tile(state: Partial, alpha: jax.Array, p: jax.Array, value: jax.Array
     return held.weights, held.factor, held
 
 
-def small_terms(held: Room, small_product: jax.Array) -> tuple[jax.Array, jax.Array]:
-    """The small weights' share of a guarded tile (`Room.small`), its product with the values `[bq, Dv]` and
-    its weights' sum `[bq]`, taken to the row's shift after the product: unshifted, a weight below
-    `2^(WEIGHT_SHIFT - 126)` times a value below fp32's largest over a tile of keys stays within fp32, and
-    the shift then scales a product, which holds its exponent where the weight alone would flush."""
-    return (power2(small_product, expand(-held.shift, small_product)),
-            power2(held.small.sum(axis=-1), -held.shift))
-
-
 def stepped(state: Partial, m: jax.Array, factor: jax.Array, p: jax.Array, product: jax.Array,
             held: Room | None, small_product: jax.Array | None = None) -> Partial:
     """The state after a tile: its sums taken by `factor` and the tile's `product` of its weights `p` and
     their sum added at the row's shift (`beyond_weights`; `tile`), with the small weights' own product
-    (`small_terms`), the plain walk's arithmetic where `held` is None."""
+    kept unshifted (`Partial.low`), the plain walk's arithmetic where `held` is None."""
     denominator = factor * state.total + beyond_weights(p.sum(axis=-1), held)
     acc = rescale(state.acc, factor) + beyond_weights(product, held)
-    if held is not None:
-        small, small_total = small_terms(held, small_product)
-        acc, denominator = acc + small, denominator + small_total
     if held is None:
         return Partial(acc, m, denominator)
-    return Partial(acc, m, denominator, held.shift, held.reach, state.live)
+    # The small weights' sums, unshifted: a weight below 2^(WEIGHT_SHIFT - 126) times a value below fp32's
+    # largest over a walk of keys stays within fp32, and kept apart from the shift, a product near fp32's
+    # least normal keeps its exponent until the output normalizes it (`finish`).
+    low = rescale(state.low, held.alpha) + small_product
+    low_total = held.alpha * state.low_total + held.small.sum(axis=-1)
+    return Partial(acc, m, denominator, held.shift, held.reach, low, low_total, state.live)
 
 
 def room(state: Partial, alpha: jax.Array, p: jax.Array, value: jax.Array) -> Room:
@@ -325,8 +323,8 @@ def room(state: Partial, alpha: jax.Array, p: jax.Array, value: jax.Array) -> Ro
     values pass `2^128` in some column, so its output there is at least `2^128 / total`, and such a weight
     on a value at most fp32's largest moves its output by under `2^66 / total`, `2^-62` of that. No weight
     is lost to the shift: one it would push below fp32's least normal is `small`, whose product the
-    mainloop issues unshifted and shifts after (`small_terms`), so a small column of a row whose other
-    column overflows keeps the reference's resolution."""
+    mainloop issues apart and the state keeps unshifted until the output (`stepped`, `finish`), so a small
+    column of a row whose other column overflows keeps the reference's resolution."""
     # The largest value magnitude of the keys each row weighs, as a key the row does not see (padding, a
     # stale cache slot, another document) would shift it for nothing.
     largest = jnp.max(jnp.abs(value.astype(jnp.float32)), axis=-1)
@@ -336,7 +334,7 @@ def room(state: Partial, alpha: jax.Array, p: jax.Array, value: jax.Array) -> Ro
     weight = jnp.minimum(shift, WEIGHT_SHIFT)
     small = jnp.where(p < expand(jnp.exp2(weight - 126.0), p), p, 0.0)
     return Room(power2(p - small, expand(-weight, p)), power2(alpha, state.shift - shift), shift, reach,
-                weight - shift, small)
+                weight - shift, small, alpha)
 
 
 def base2_maximum(m: jax.Array) -> jax.Array:
@@ -486,12 +484,10 @@ def split_accumulate(others: jax.Array, own: jax.Array, others_total: jax.Array,
     total = (alpha * (others_total + jnp.where(moved, own, 0.0))
              + beyond_weights(rest.astype(jnp.float32).sum(axis=-1), held))
     own_tile = beyond_weights(own_tile.astype(jnp.float32), held)
+    # The small weights are never the anchor's, which weighs at least 2^-WEIGHT_SHIFT: the state keeps them
+    # apart (`stepped`), and the split sums, the backward's D, go without them, below an ulp of D.
+    del small_product
     product = beyond_weights(product, held)
-    if held is not None:
-        # The small weights are never the anchor's, which weighs at least 2^-WEIGHT_SHIFT: they join the
-        # other keys' sums (`small_terms`).
-        small, small_total = small_terms(held, small_product)
-        product, total = product + small, total + small_total
     return rescale(others + joined, alpha) + product, jnp.where(moved, own_tile, alpha * own), total
 
 
@@ -521,6 +517,10 @@ def merge(spec: Forward, first: Partial, second: Partial) -> Partial:
         acc = expand(a, first.acc) * first.acc + expand(b, second.acc) * second.acc
         return acc, a * first.total + b * second.total
 
+    a, b = carried
+    low = expand(a, first.low) * first.low + expand(b, second.low) * second.low
+    low_total = a * first.low_total + b * second.low_total
+
     # Joined at the larger shift; a row whose join overflows (two finite slices can) shifts as it needs,
     # every other row's bits the plain join's.
     held = jnp.maximum(first.shift, second.shift)
@@ -528,7 +528,7 @@ def merge(spec: Forward, first: Partial, second: Partial) -> Partial:
     live = overflowed(acc) | first.live | second.live
     shift = jnp.where(live, jnp.maximum(held, needed(natural, reach)), held)
     acc, total = joined(shift)
-    return Partial(acc, m, total, shift, reach, live)
+    return Partial(acc, m, total, shift, reach, low, low_total, live)
 
 
 def finish(spec: Forward, state: Partial, *, initial: bool, output_mod: Callable | None = None,
@@ -540,15 +540,23 @@ def finish(spec: Forward, state: Partial, *, initial: bool, output_mod: Callable
     output is the shifted sums' ratio, which the shift leaves."""
     m = state.m if spec.raw else spec.naturalized(state.m)
     denominator = state.total
+    natural = None if state.shift is None else power2(denominator, state.shift) + state.low_total
+    if natural is not None:
+        # The shifted sums over their shifted denominator, and the unshifted small sums over the natural
+        # one, which is within fp32 (`Partial.low`).
+        denominator = power2(natural, -state.shift)
     if spec.guarded or initial:
         out = jnp.where(expand(denominator > 0, state.acc),
                         state.acc / expand(jnp.where(denominator > 0, denominator, 1.0), state.acc), 0.0)
         m = jnp.where(m == -jnp.inf, 0.0, m)
     else:
         out = state.acc / expand(denominator, state.acc)
+    if natural is not None:
+        out = out + jnp.where(expand(natural > 0, out),
+                              state.low / expand(jnp.where(natural > 0, natural, 1.0), out), 0.0)
     if output_mod is not None:
         out = output_mod(out, *output_params)
-    return out, m, denominator if state.shift is None else power2(denominator, state.shift)
+    return out, m, denominator if natural is None else natural
 
 
 # The backward's algebra: what lies between its products (S = Q·Kᵀ, dP = dO·Vᵀ, then dV, dK and dQ),
@@ -676,7 +684,8 @@ def off_anchor(state: OffAnchor, exponentials: jax.Array, rest: jax.Array, own: 
                others: jax.Array, shift: jax.Array, small: jax.Array, small_others: jax.Array) -> OffAnchor:
     """The first pass after a tile (`off_anchor_weights`), `others` the tile's `rest · V`, its sums taken
     from the weights' shift to each row's `shift`, as the forward's (`beyond_weights`), and the small
-    weights and their product `small_others` taken there after the product (`small_terms`)."""
+    weights and their product `small_others` taken there after the product: they feed D alone, whose
+    small terms are below an ulp of it."""
     beyond = jnp.minimum(shift, WEIGHT_SHIFT) - shift
 
     def taken(x, by=beyond):

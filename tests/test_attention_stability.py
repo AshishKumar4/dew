@@ -12,6 +12,7 @@ allows; the fold's documented divergences (`algebra.Forward.base2`; docs/design/
 the exponent's forms) run natural alone."""
 
 import dataclasses
+import functools
 from collections.abc import Callable
 
 import jax
@@ -128,7 +129,7 @@ def _edge_weight(dtype, rows=128) -> Family:
     seen[..., :2] = True
     return Family(draw, seen, {"lengths": np.full(rows, 2)}, dtype=dtype)
 
-def _mixed_columns(seed: int, rows: int = 128):
+def _mixed_columns(seed: int, rows: int = 128, small: tuple[float, float] = (5e29, 1e30)):
     # One query a row over four keys of logit 0 whose values near fp32's largest in the first column
     # overflow its sum, and a fifth of logit -85 whose value 1e30 sits alone in the second column: the
     # guarded walk shifts the row, and the second column's share, about 1e-7, must survive it.
@@ -136,7 +137,7 @@ def _mixed_columns(seed: int, rows: int = 128):
     key[:, 4, 0, 0] = -_uniform(seed, 80.0, 86.0, (rows,))
     value = np.zeros((rows, 5, 1, 16), np.float32)
     value[:, :4, 0, 0] = _uniform(seed + 1, 2.5e38, 3.4e38, (rows, 4))
-    value[:, 4, 0, 1] = _uniform(seed + 2, 5e29, 1e30, (rows,))
+    value[:, 4, 0, 1] = _uniform(seed + 2, *small, (rows,))
     (dout,) = _normal(seed + 3, (rows, 1, 1, 16))
     return _first(np.full((rows, 1), 4.0, np.float32), 16), key, value, None, dout * np.float32(2.0 ** -8)
 
@@ -256,6 +257,10 @@ def _families() -> dict[str, Family]:
         # The headroom is the accurate form's: the fold's sum of those values overflows.
         "a small column beside an overflowing one": Family(_mixed_columns, np.ones((128, 1, 1, 5), bool),
                                                            folded=False),
+        # Its values near 1, so the column's output is near fp32's least normal, a shifted product of
+        # which would flush (`algebra.Partial.low`).
+        "a column near fp32's least normal beside an overflowing one": Family(
+            functools.partial(_mixed_columns, small=(0.5, 1.0)), np.ones((128, 1, 1, 5), bool), folded=False),
     }
     lengths = np.tile([4, 0], ROWS // 2)
     empty = np.broadcast_to((lengths > 0)[:, None, None, None], (ROWS, 1, 4, 4))
