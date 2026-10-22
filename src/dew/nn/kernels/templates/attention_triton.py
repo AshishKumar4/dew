@@ -241,19 +241,11 @@ def _forward_kernel(*refs, spec: algebra.Forward, score_kinds: tuple[Kind, ...],
                                   _plain(held, value, interpret))
         return stepped._replace(acc=acc), anchor, own, others_total
 
-    def start(live) -> algebra.Partial:
-        if initial:
-            return algebra.resumed(spec, *(ref[...] for ref in initial_refs), live=live)
-        empty = algebra.empty(block_q, value_ref.shape[-1])
-        return empty if live is None else algebra.headroomed(empty, live)
-
     def walk(live=None):
         # The plain walk where `live` is None, else the guarded one, those rows shifting.
-        if not residuals:
-            return jax.lax.fori_loop(lo, hi, step, start(live))
-        nothing = jnp.zeros((block_q,), jnp.float32)
-        carry = start(live), algebra.no_argmax(block_q), nothing, nothing
-        return jax.lax.fori_loop(lo, hi, tracked, carry)
+        resumed = (initial_refs[0][...], initial_refs[1][...], initial_refs[2][...]) if initial else None
+        start = algebra.started(spec, resumed, block_q, value_ref.shape[-1], live)
+        return algebra.walked(lo, hi, step, tracked, start, residuals=residuals)
 
     output_params = tuple(_tile_param(ref, kind, head, q_pos, None)
                           for ref, kind in zip(output_refs, output_kinds, strict=True))
@@ -325,7 +317,8 @@ def _normalized_pass(spec, walked, step, *, value_ref, bounds, initial: bool):
     _, maximum, total = algebra.finish(spec, joined, initial=initial)
     nothing = jnp.zeros_like(own)
     walk = functools.partial(step, maximum=maximum, total=total, anchor=arg.key)
-    return jax.lax.fori_loop(*bounds, walk, (jnp.zeros_like(split.acc), nothing, nothing))
+    lo, hi = bounds
+    return jax.lax.fori_loop(lo, hi, walk, (jnp.zeros_like(split.acc), nothing, nothing))
 
 
 def _split_written(walked, *, value_ref, residual_refs, normalized) -> algebra.Partial:

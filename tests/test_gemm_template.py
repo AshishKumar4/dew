@@ -1169,21 +1169,23 @@ def test_a_hook_that_broadcasts_a_side_operand_lowers_for_hopper_through_triton(
 
 
 @pytest.mark.parametrize("columns", [128, 300, 384], ids=lambda n: f"{n}-columns")
-def test_an_interpreted_fp32_product_at_highest_is_within_the_float64_sums_bound(columns):
+def test_an_interpreted_fp32_product_at_highest_rounds_its_exact_sum_once(columns):
     """A promoted fp32 product issued off a GPU (`product.interpreted`) accumulates in float64 and rounds
-    once: within half an fp32 ulp of the float64 sum, at every shape, where XLA's CPU dot takes a less
-    exact fp32 accumulation at a 128-aligned shape than at another. A 16-bit product keeps an fp32 sum."""
-    streams = jax.random.split(jax.random.key(0), 2)
-    lhs = jax.random.normal(streams[0], (128, 128), jnp.float32)
-    rhs = jax.random.normal(streams[1], (128, columns), jnp.float32)
+    once, at every shape, where XLA's CPU dot takes a less exact fp32 accumulation at a 128-aligned shape
+    than at another. The operands are 12-bit integers at scales 2^-4 to 2^4, so every product and partial
+    sum is a multiple of 2^-8 below 2^37, exact in float64 in any order and past fp32's 24 bits: the
+    product is the exact sum rounded once to fp32, to the bit. A 16-bit product keeps an fp32 sum."""
+    generator = np.random.default_rng(0)
+
+    def drawn(shape):
+        scales = 2.0 ** generator.integers(-4, 5, shape)
+        return (generator.integers(-2048, 2048, shape) * scales).astype(np.float32)
+
+    lhs, rhs = jnp.asarray(drawn((128, 128))), jnp.asarray(drawn((128, columns)))
     declared = product.declared(jnp.float32, jax.lax.Precision.HIGHEST, outputs=(jnp.float32,))
     found = jax.jit(lambda a, b: product.interpreted(declared, a, b, (((1,), (0,)), ((), ()))))(lhs, rhs)
-    wide_lhs, wide_rhs = np.asarray(lhs, np.float64), np.asarray(rhs, np.float64)
-    truth = wide_lhs @ wide_rhs
-    terms = np.abs(wide_lhs) @ np.abs(wide_rhs)
-    gamma = 128 * np.finfo(np.float64).eps / (1 - 128 * np.finfo(np.float64).eps)
-    half_ulp = np.spacing(np.abs(truth).astype(np.float32)).astype(np.float64) / 2
-    assert (np.abs(np.asarray(found, np.float64) - truth) <= half_ulp + gamma * terms).all()
+    exact = np.asarray(lhs, np.float64) @ np.asarray(rhs, np.float64)
+    np.testing.assert_array_equal(np.asarray(found), exact.astype(np.float32))
     half = product.declared(jnp.bfloat16, None, outputs=(jnp.float32,))
     narrow = (lhs.astype(jnp.bfloat16), rhs.astype(jnp.bfloat16))
     out = product.interpreted(half, *narrow, (((1,), (0,)), ((), ())))
@@ -1191,17 +1193,15 @@ def test_an_interpreted_fp32_product_at_highest_is_within_the_float64_sums_bound
         *narrow, (((1,), (0,)), ((), ())), preferred_element_type=jnp.float32)))
 
 
-def test_an_interpreted_fp32_sum_that_cancels_at_mixed_magnitudes_is_within_its_bound():
-    """2^30 * 2^30, 1 * 1 and -(2^30 * 2^30): each product is exact in float64, and their float64 sum, 1
-    exactly, may round the 1 away in an order that adds the large ones first. The interpreted product is
-    held to the float64 sum's bound, gamma_3 times the terms' magnitudes, not to exactness."""
+def test_an_interpreted_fp32_sum_that_cancels_at_mixed_magnitudes_is_a_float64_sum():
+    """2^30 * 2^30, 1 * 1 and -(2^30 * 2^30): each product is exact in float64, and their float64 sum is 1
+    in an order that adds the large ones first and 0 in either other, the 1 rounding into 2^60. The
+    interpreted product is one of float64's sums, not exact."""
     lhs = jnp.asarray([[2.0 ** 30, 1.0, -(2.0 ** 30)]], jnp.float32)
     rhs = jnp.asarray([[2.0 ** 30], [1.0], [2.0 ** 30]], jnp.float32)
     declared = product.declared(jnp.float32, jax.lax.Precision.HIGHEST, outputs=(jnp.float32,))
     found = float(product.interpreted(declared, lhs, rhs, (((1,), (0,)), ((), ())))[0, 0])
-    terms = 2.0 ** 61 + 1.0
-    gamma = 3 * np.finfo(np.float64).eps / (1 - 3 * np.finfo(np.float64).eps)
-    assert abs(found - 1.0) <= gamma * terms
+    assert found in (0.0, 1.0)
 
 
 HOOKED_RECEIPTS = {

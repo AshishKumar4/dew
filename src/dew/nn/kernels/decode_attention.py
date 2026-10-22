@@ -176,7 +176,8 @@ def _attend(query: jax.Array, span: tuple, read, block: int, spec: algebra.Forwa
             start = algebra.resumed(spec, sink, real.astype(jnp.float32), start.acc, live=live)
         elif live is not None:
             start = algebra.headroomed(start, live)
-        return jax.lax.fori_loop(*steps, body, start)
+        first, last = steps
+        return jax.lax.fori_loop(first, last, body, start)
 
     if not spec.headroom:
         return walk()

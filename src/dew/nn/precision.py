@@ -221,7 +221,7 @@ def rounded_to(x: jax.Array, dtype: Dtype) -> jax.Array:
     return jax.lax.reduce_precision(x, exponent_bits=bits.nexp, mantissa_bits=bits.nmant)
 
 
-def _two_sum(left, right):
+def two_sum(left, right):
     """`left + right` rounded, and exactly what the rounding dropped (Knuth's TwoSum)."""
     total = left + right
     part = total - left
@@ -277,8 +277,8 @@ def compensated_add(left, right):
     XLA reassociates no float arithmetic unless fast math is on; with it,
     `lo` cancels to zero and the sum is the plain one."""
     (left_hi, left_lo), (right_hi, right_lo) = left, right
-    total, dropped = _two_sum(left_hi, right_hi)
-    return _two_sum(total, dropped + left_lo + right_lo)
+    total, dropped = two_sum(left_hi, right_hi)
+    return two_sum(total, dropped + left_lo + right_lo)
 
 
 def compensated_difference(later, earlier):
