@@ -171,7 +171,9 @@ class ModelInputs:
 
         A `ModelInputs` is validated as it is, and a JAX array is wrapped where
         it sits. Anything else is read on the host as an integer `[B, S]`
-        array, and ids that int32 cannot represent raise ValueError.
+        array, and ids that int32 cannot represent raise ValueError. Rows given
+        as lists or tuples are each read by `token_ids`'s law first, so a bool
+        among their integers is refused rather than promoted into an id.
 
         Distributed algorithms call this inside their agreed validation phase.
         It runs no collectives and no model.
@@ -181,6 +183,9 @@ class ModelInputs:
         elif isinstance(value, jax.Array):
             prepared = cls(value)
         else:
+            if isinstance(value, list | tuple):
+                value = [token_ids(row, where="a token row") if isinstance(row, list | tuple) else row
+                         for row in value]
             prepared = cls(jnp.asarray(host_token_rows(np.asarray(value))))
         prepared.validate()
         return prepared
