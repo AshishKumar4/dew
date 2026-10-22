@@ -587,11 +587,10 @@ def normalized_pass(spec: Forward, carry: Carry, keys_at: Callable[[jax.Array], 
     """A guarded training walk's live rows' split sums, normalized (`split_residuals`): a pass over its key
     tiles `bounds` (`keys_at`) at the walk's own maximum and natural denominator (`normalized_terms`), from
     the `initial` state's share (`normalized_start`, `(m0, acc0)`): the other keys' weighted values, the
-    anchor's weight and the other keys' weights, over the denominator; a weight below fp32's least normal
-    once normalized takes its product unnormalized, over the denominator after it."""
+    anchor's weight and the other keys' weights, over the denominator; a weight below its dtype's least
+    normal once normalized takes its product raised, taken back after it (`small_shift`)."""
     split, arg, _, _ = carry
     _, maximum, total = finish(spec, joined(carry, rows), initial=initial is not None)
-    inverse_total = inverse(total)
 
     def walk(index, sums):
         keys = keys_at(index)
@@ -599,10 +598,10 @@ def normalized_pass(spec: Forward, carry: Carry, keys_at: Callable[[jax.Array], 
         rest, own_tile, small = normalized_terms(keys.logits, maximum, total,
                                                  keys.coords.k_pos == arg.key[:, None], value.dtype,
                                                  recompute(spec))
-        small_product = keys.dot(small, value)
-        product = keys.dot(rest, value) + expand(inverse_total, small_product) * small_product
+        lowered = jnp.float32(-small_shift(value.dtype))
+        product = keys.dot(rest, value) + power2(keys.dot(small, value), lowered)
         others = (rest.astype(jnp.float32).sum(axis=-1)
-                  + inverse_total * small.astype(jnp.float32).sum(axis=-1))
+                  + power2(small.astype(jnp.float32).sum(axis=-1), lowered))
         return sums[0] + product, sums[1] + own_tile, sums[2] + others
 
     nothing = jnp.zeros_like(total)
@@ -656,22 +655,34 @@ def split_accumulate(others: jax.Array, own: jax.Array, others_total: jax.Array,
     return rescale(others + joined, alpha) + product, jnp.where(moved, own_tile, alpha * own), total
 
 
+def small_shift(dtype) -> int:
+    """The power of two `normalized_terms` raises the weights below `dtype`'s least normal by, half that
+    least normal's exponent: 63 for fp32's and bf16's range, 7 for fp16's. A raised weight is then below
+    `2^-k`, so a sum of them on values at the dtype's largest stays finite over any key count a call holds,
+    and normal down to `2^-3k` of the least normal."""
+    return -int(np.log2(float(jnp.finfo(dtype).tiny))) // 2
+
+
 def normalized_terms(logits: jax.Array, maximum: jax.Array, total: jax.Array, at_anchor: jax.Array,
                      dtype, how: Recompute) -> tuple[jax.Array, jax.Array, jax.Array]:
-    """A tile's normalized weights `exp(s - m) / T` at the walk's maximum and natural denominator, the
-    reference's probabilities, narrowed to the values' `dtype`: zero at the anchor key (`at_anchor`) and
-    where below fp32's least normal, the left operand of the other keys' sum; the anchor's own, fp32; and
-    the other keys' weights that normalizing takes below fp32's least normal, unnormalized and narrowed,
-    `small`, whose product the pass takes over `T` after it (`normalized_pass`). Normalized, no sum of them
-    overflows (each is at most the values' largest), and a small weight on a large value keeps its share's
-    resolution, so a column the reference resolves is resolved here, whatever another column's size."""
+    """A tile's normalized weights `exp(s - m) / T` at the walk's maximum and natural denominator (divided,
+    as the reference's softmax divides), the reference's probabilities, narrowed to the values' `dtype`:
+    zero at the anchor key (`at_anchor`) and where below the dtype's least normal, the left operand of the
+    other keys' sum; the anchor's own, fp32; and the other keys' weights that normalizing takes below the
+    least normal, raised by `2^small_shift(dtype)` and narrowed, `small`, whose product the pass takes back
+    after it (`normalized_pass`). Normalized, no sum of them overflows (each is at most the values'
+    largest), and a small weight on a large value keeps its share's resolution, so a column the reference
+    resolves is resolved here, whatever another column's size or the denominator's."""
     exponentials = below(logits, maximum, how)
-    p = exponentials * expand(inverse(total), logits)
-    tiny = (p < float(jnp.finfo(jnp.float32).tiny)) & jnp.logical_not(at_anchor)
+    seen = expand(total > 0, logits)
+    denominator = expand(jnp.where(total > 0, total, 1.0), logits)
+    p = jnp.where(seen, exponentials / denominator, 0.0)
+    tiny = (p < float(jnp.finfo(dtype).tiny)) & jnp.logical_not(at_anchor)
     rounded = p.astype(dtype)
     zero = jnp.zeros_like(rounded)
     rest = jnp.where(at_anchor | tiny, zero, rounded)
-    small = jnp.where(tiny, exponentials, 0.0).astype(dtype)
+    raised = jnp.where(seen, power2(exponentials, jnp.float32(small_shift(dtype))) / denominator, 0.0)
+    small = jnp.where(tiny, raised, 0.0).astype(dtype)
     return rest, jnp.where(at_anchor, rounded, zero).astype(jnp.float32).sum(axis=-1), small
 
 
