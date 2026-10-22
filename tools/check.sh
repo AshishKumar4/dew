@@ -25,27 +25,34 @@ gate() {
     printf '=== %s FAILED\n%s\n' "$name" "$out"
   fi
 }
+# Main still holds copies (ledger 896-1287, 1309), so a checkout is held to adding none to origin/main's
+# (tools/duplicates.py) over these roots; the scan needs that ref and its history, as SLOP020's ratchet does,
+# which a shallow checkout fetches first (tools/base_history.sh).
+duplicate_roots="src/dew tools tests examples site"
+PYTHON="$python" sh tools/base_history.sh
 if [ "${1:-}" = --changed ]; then
-  PYTHON="$python" sh tools/base_history.sh
   since=$(git merge-base origin/main HEAD)
   gate ruff sh -c '. tools/lint_inputs.sh; python_changed "$1" $ruff_inputs | xargs -0r "$2" -m ruff check' \
     _ "$since" "$python"
-  gate slop sh -c '. tools/lint_inputs.sh; python_changed "$1" $("$2" tools/lint_slop.py --print-roots) |
-    JAX_PLATFORMS=cpu xargs -0r "$2" tools/lint_slop.py' _ "$since" "$python"
+  # SLOP020's inventory names files across the tree, and a deleted file can leave its entry behind: a head
+  # that changes the inventory or deletes a Python file has the whole tree read, as the full run reads it.
+  if git diff --quiet "$since" -- tools/tolerance_inventory.json &&
+    [ -z "$(git diff --name-only --diff-filter=D "$since" -- '*.py')" ]; then
+    gate slop sh -c '. tools/lint_inputs.sh; python_changed "$1" $("$2" tools/lint_slop.py --print-roots) |
+      JAX_PLATFORMS=cpu xargs -0r "$2" tools/lint_slop.py' _ "$since" "$python"
+  else
+    gate slop env JAX_PLATFORMS=cpu "$python" tools/lint_slop.py
+  fi
   gate ratchet "$python" tools/lint_slop.py --ratchet --base=origin/main
-  gate duplicates "$python" tools/duplicates.py --structural --base=origin/main \
-    src/dew tools tests examples site
+  gate duplicates "$python" tools/duplicates.py --structural --base=origin/main $duplicate_roots
   [ -z "$failed" ] || { echo "check --changed: FAILED$failed"; exit 1; }
   echo "check --changed: green"
   exit 0
 fi
 # The duplicate-code scan takes as long as several gates together and reads nothing they write, so it
-# runs beside them and reports last. Main still holds copies (ledger 896-1287, 1309), so a checkout is held to
-# adding none to origin/main's (tools/duplicates.py); the scan needs that ref and its history, which a shallow
-# checkout fetches first (tools/base_history.sh).
-PYTHON="$python" sh tools/base_history.sh
+# runs beside them and reports last.
 duplicates=$(mktemp)
-"$python" tools/duplicates.py --base=origin/main src/dew tools tests examples site > "$duplicates" 2>&1 &
+"$python" tools/duplicates.py --base=origin/main $duplicate_roots > "$duplicates" 2>&1 &
 scan=$!
 gate locks sh -c 'sh tools/lock_environment.sh && git diff --exit-code --stat locks/'
 gate flake8 "$python" -m flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics \
