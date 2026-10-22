@@ -19,6 +19,7 @@ import concurrent.futures
 import dataclasses
 import logging
 from collections.abc import Mapping, Sequence
+from typing import ClassVar
 
 import grain.python as pygrain
 import numpy as np
@@ -50,7 +51,7 @@ from dew.data.pipeline import (
     Windows,
 )
 from dew.data.plan import fingerprint
-from dew.data.sources.base import Read, ShardManifest, Source, _uncounted
+from dew.data.sources.base import Read, Rows, ShardManifest, Source, View, _uncounted
 from dew.data.steps.generic import Fields
 from dew.data.steps.text import CountRule, CountTargets, LayoutRule, ValidTargets, targets_changed
 from dew.records import JSON, integer, json_value, record
@@ -59,10 +60,12 @@ _log = logging.getLogger(__name__)
 
 
 @dataclasses.dataclass(frozen=True)
-class _Memory:
-    """Accepted rows and their facts, keeping measured targets through field projections."""
+class _Memory(View[Source]):
+    """Accepted rows and their facts, keeping measured targets through field projections: the rows
+    a memory read of `source` made by running the pipeline's first stages (`ran`) over its rows."""
 
-    original: Source
+    rows: ClassVar[Rows] = "materialized"
+    source: Source
     held: tuple[Batch | bytes, ...]
     measured: np.ndarray | None
     derived: Mapping[str, str]
@@ -71,22 +74,16 @@ class _Memory:
     inputs: int = 0
     ran: tuple[Stage, ...] = ()
     target_counts: tuple[int, ...] | None = None
-    documents: int | None = None
+    segments: int | None = None
     """The most documents a window holds where `ran` packs them, which its
     batches declare (`Coordinates.max_segments`)."""
-
-    def label(self) -> str:
-        return self.original.label()
-
-    def describe(self) -> str:
-        return self.original.describe()
 
     def fingerprint(self) -> Mapping[str, object]:
         """The rows as a memory read made them: the source it read, the
         derived order facts and the steps it ran, by what they compute. The
         manifest records those steps' modules in its environment."""
         return {
-            "materialized": self.original.fingerprint(),
+            "materialized": self.source.fingerprint(),
             "derived": self.derived,
             "steps": [_identity(stage).semantic() for stage in self.ran],
         }
@@ -100,7 +97,7 @@ class _Memory:
     def metadata(self) -> Mapping[str, object]:
         """Its source's facts, the counts only where it ran no stage over the source's rows, then
         the counts it measured."""
-        stated = self.original.metadata()
+        stated = self.source.metadata()
         return {**(_uncounted(stated) if self.ran else stated), **self.facts, "rows": len(self.held),
                 "accepted": len(self.held)}
 
@@ -108,11 +105,11 @@ class _Memory:
         return self.measured
 
     def locality(self) -> tuple[tuple[int, ...], bool]:
-        if not isinstance(self.original, _Locality) or any(
+        if not isinstance(self.source, _Locality) or any(
             len(identifier) != 1 for identifier in self.identifiers
         ):
             raise ValueError("block shuffle needs an unchanged physical shard index")
-        sizes, remote = self.original.locality()
+        sizes, remote = self.source.locality()
         shards = Ranges(tuple(sizes))
         selected = np.bincount([shards.holding(identifier[0]) for identifier in self.identifiers],
                                minlength=len(sizes))
@@ -209,7 +206,7 @@ def _memory_stages(
 ) -> Pipeline:
     derived: dict[str, str] = {}
     targets: Mapping[str, int] | None = None
-    documents = source.documents if isinstance(source, _Memory) else None
+    documents = source.segments if isinstance(source, _Memory) else None
     counted: dict[tuple[int, ...], int] | None = (
         dict(zip(source.identifiers, source.target_counts, strict=True))
         if isinstance(source, _Memory) and source.target_counts is not None

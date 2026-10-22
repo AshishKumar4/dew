@@ -18,7 +18,7 @@ import functools
 import threading
 from collections.abc import Iterator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
-from typing import Literal, Protocol, runtime_checkable
+from typing import ClassVar, Literal, Protocol, runtime_checkable
 
 import grain.python as pygrain
 import numpy as np
@@ -41,7 +41,6 @@ from dew.data.analysis import (
     _name,
     _preferred_read,
     _promoted,
-    _Ran,
     _stated,
     _steps,
     _until,
@@ -103,7 +102,16 @@ from dew.data.pipeline import (
 )
 from dew.data.plan import Plan, StepIdentity, fingerprint, unplaced
 from dew.data.readers import _CanonicalPass, _Host, _PerShare, _Statistics
-from dew.data.sources.base import Read, ShardManifest, Source, _consumed, tokenizer_contract
+from dew.data.sources.base import (
+    Read,
+    Rows,
+    Source,
+    View,
+    _consumed,
+    beneath,
+    materialized,
+    tokenizer_contract,
+)
 from dew.data.steps.generic import Coordinated
 from dew.records import JSON, integer, json_value
 
@@ -122,8 +130,8 @@ def _cache_references(pipeline: Pipeline, read: Read) -> tuple[str, ...]:
     references = []
     for leaf, source in _leaves(pipeline):
         stages, written = _written(source, leaf.stages), source
-        while isinstance(written, _Memory):
-            written = written.original
+        while materialized(written):
+            written = written.source
         references += [stage.cache.reference(_cache_manifest(written, stages[:index], read))
                        for index, stage in enumerate(stages) if isinstance(stage, Artifact)]
     return tuple(references)
@@ -139,7 +147,11 @@ class _PinnedRead:
 
 
 @dataclasses.dataclass(frozen=True)
-class _Facts:
+class _Facts(View[Source]):
+    """`source` as the compile's read of it took it (`_pin_sources`): its name, identity and facts
+    as they were then, and the memory read pinning took, which its memory reads reuse."""
+
+    rows: ClassVar[Rows] = "read"
     source: Source
     read: Read
     stated_snapshot: Mapping[str, object]
@@ -154,9 +166,6 @@ class _Facts:
     def label(self) -> str:
         return self.stated_label
 
-    def describe(self) -> str:
-        return self.source.describe()
-
     def fingerprint(self) -> Mapping[str, object]:
         return self.stated_snapshot
 
@@ -169,9 +178,6 @@ class _Facts:
     def records(self, read: Read) -> Records:
         held = None if self.held is None else self.held.records
         return held if read == "memory" and held is not None else self.source.records(read)
-
-    def manifest(self) -> ShardManifest:
-        return self.source.manifest()
 
     @functools.cached_property
     def _lengths(self) -> np.ndarray | None:
@@ -191,16 +197,12 @@ class _Facts:
 
 def _released(pipelines: Sequence[Pipeline]) -> None:
     """Let go of the memory reads pinning took for `pipelines` (`_PinnedRead`), once every branch
-    of their preparation is materialized: under each source a memory read made (`_Ran`), its
-    preparation's included, down to the pinned one."""
-    for _, source in (leaf for pipeline in pipelines for leaf in _leaves(pipeline)):
-        while isinstance(source, (_Facts, _Ran)):
-            if isinstance(source, _Facts):
-                if source.held is not None:
-                    source.held.records = None
-                source = source.source
-            else:
-                source = source.original
+    of their preparation is materialized: under each source a memory read made (`materialized`),
+    its preparation's included, down to the pinned one."""
+    for _, leaf in (leaf for pipeline in pipelines for leaf in _leaves(pipeline)):
+        for source in beneath(leaf, ("read", "materialized")):
+            if isinstance(source, _Facts) and source.held is not None:
+                source.held.records = None
 
 
 def _pin_sources(pipelines: Sequence[Pipeline], read: Read) -> tuple[Pipeline, ...]:
@@ -328,8 +330,8 @@ def _member_manifests(train: Pipeline, build: _Build, host: Sequence[HostStep]) 
         return {}
 
     def read_of(read: Source) -> Source:
-        while isinstance(read, _Memory):
-            read = read.original
+        while materialized(read):
+            read = read.source
         return read
 
     def steps(identities: Sequence[StepIdentity]) -> JSON:
@@ -681,8 +683,7 @@ def _coordinated(*pipelines: Pipeline) -> tuple[Coordinated, ...]:
             if isinstance(stage, Pack):
                 declare(stage, stage.segments if documents is None else documents)
                 packed = True
-        while isinstance(source, (_Facts, _Ran)):
-            source = source.source if isinstance(source, _Facts) else source.original
+        *_, source = beneath(source, ("read", "materialized"))
         if isinstance(source, PackedSource):
             declare(source.plan.pack, source.plan.most_documents)
             packed = True
@@ -704,7 +705,7 @@ def _held_coordinated(validation: Pipeline, training: tuple[Coordinated, ...]) -
 
 def _packed_documents(source: Source) -> int | None:
     """The most documents a window of a memory read's packed windows holds, None where it packed none."""
-    return source.documents if isinstance(source, _Memory) else None
+    return source.segments if isinstance(source, _Memory) else None
 
 
 def _held_steps(pipeline: Pipeline) -> tuple[HostStep, ...]:
