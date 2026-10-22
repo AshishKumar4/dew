@@ -200,6 +200,18 @@ def test_a_mixture_that_is_not_one_is_refused(count, weights):
         mix(corpora, weights=weights)
 
 
+@pytest.mark.parametrize("weights, keys", [((1.0, 0.0), ("0:a", "0:b")), ((1.0, 2.0), ("0:a", "0:a")),
+                                           ((1.0,), ("0:a", "0:b"))])
+def test_the_members_a_mix_is_read_by_hold_one_positive_weight_and_one_distinct_key_each(weights, keys):
+    """What a lowering reads a mix by holds what a mixture does, and a key for each member that no
+    other member shares, as a mix saves each member's position under it."""
+    from dew.data.mixing import Members
+
+    assert Members((1.0, 2.0), ("0:a", "0:b")).keys == ("0:a", "0:b")
+    with pytest.raises(ValueError):
+        Members(weights, keys)
+
+
 # --------------------------------------------------------------------------
 # Mixtures of stores of rows
 # --------------------------------------------------------------------------
