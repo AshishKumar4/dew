@@ -55,6 +55,7 @@ from dew.nn.inputs import (
 )
 from dew.nn.mla import INDEXER, INDEXER_COLLECTION
 from dew.nn.moe import RouterMoments, global_router_loss, load_balance_update, sequence_router_moments
+from dew.nn.precision import at_least_fp32
 from dew.nn.protocols import (
     AffineHead,
     CountedLogits,
@@ -1299,9 +1300,11 @@ class LMObjective(TokenScorer):
             raise ValueError(
                 "no attention layer sowed an indexer KL, though the model's mla "
                 "mixer carries the indexer")
-        weights = self._query_weights(prepared, jnp.float32)
+        # The KL's own width, at least fp32: a float64 model's KL is summed in float64.
+        width = at_least_fp32(jnp.result_type(*kls))
+        weights = self._query_weights(prepared, width)
         total = jnp.sum(jnp.stack([
-            self.row_mean(kl.astype(jnp.float32) * weights[:, :kl.shape[1]], batch).total for kl in kls]))
+            self.row_mean(kl.astype(width) * weights[:, :kl.shape[1]], batch).total for kl in kls]))
         mass = jax.lax.stop_gradient(self.row_mean(weights, batch).total)
         return total / len(kls), mass
 
