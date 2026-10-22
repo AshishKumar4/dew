@@ -19,7 +19,6 @@ from pathlib import Path
 import numpy as np
 from process_support import serve_mode, worker_parser
 
-from dew.config.data import loader
 from dew.data import Loading
 from dew.data.dataset import Loader
 from dew.telemetry.records import RECORD_TYPES
@@ -335,17 +334,38 @@ def mode_topology(args) -> dict:
     }
 
 
+def token_data(args, *, packed: bool, loading: Loading) -> Loader:
+    """`--tokens` as a run reads it, shuffled and repeated, and `--held-tokens` where given, each cut
+    into windows of `--seq-len` (packed first-fit where `packed`, by the documents' ends the store
+    states) and read in memory in batches of BATCH."""
+    from dew.data import presets
+    from dew.data.compile import compile
+    from dew.data.sources.tokens import TokenFiles
+
+    def held(store):
+        if packed:
+            return store.pipe(presets.lm, None, seq_len=args.seq_len, batch=BATCH)
+        return store.pipe(presets.token_windows, seq_len=args.seq_len, batch=BATCH)
+
+    store = TokenFiles(args.tokens)
+    # Packed in the store's order and ordered after, so the pack is one plan over the whole store
+    # (`PackedSource`) whose windows the processes share; windows read by index are ordered first.
+    train = (store.pipe(presets.lm, None, seq_len=args.seq_len, batch=None).shuffle(0).repeat().batch(BATCH)
+             if packed else store.shuffle(0).repeat().pipe(presets.token_windows, seq_len=args.seq_len,
+                                                            batch=BATCH))
+    validation = None if args.held_tokens is None else held(TokenFiles(args.held_tokens))
+    return compile(train, validation=validation, read="memory", loading=loading)
+
+
 def mode_data(args) -> dict:
     """One pass over the held-out split, which ends by itself."""
     import jax
 
-    from dew.config.data import TextData
     from dew.data.dataset import DataPartition
     from dew.training import MeshSpec
 
-    data = loader(TextData(source=args.tokens, seq_len=args.seq_len), batch=BATCH, read="memory",
-        loading=Loading(workers=args.workers, threads=1,
-                                        read_buffer=8, worker_buffer=1))
+    data = token_data(args, packed=False, loading=Loading(workers=args.workers, threads=1, read_buffer=8,
+                                                          worker_buffer=1))
     partition = DataPartition.of(MeshSpec().build())
     assert data.val is not None
     records, batches = [], 0
@@ -367,13 +387,10 @@ def mode_data(args) -> dict:
 def mode_packed(args) -> dict:
     import jax
 
-    from dew.config.data import TextData
     from dew.data.dataset import DataPartition
     from dew.training import MeshSpec
 
-    data = loader(TextData(source=args.tokens, pack="first-fit", seq_len=args.seq_len), batch=BATCH,
-        read="memory", loading=Loading(workers=args.workers,
-                                        worker_buffer=1))
+    data = token_data(args, packed=True, loading=Loading(workers=args.workers, worker_buffer=1))
     partition = DataPartition.of(MeshSpec().build())
     assert data.val is not None
     documents, windows = set(), 0
@@ -485,13 +502,9 @@ def mode_packed_fit(args) -> dict:
 
     import jax
 
-    from dew.config.data import TextData
-
     trainer = token_trainer(args.name, args.run_dir, args.fsdp_size, args.seq_len)
     restored_step, restored = restored_state(trainer)
-    data = loader(TextData(source=args.tokens, pack="first-fit", seq_len=args.seq_len), batch=BATCH,
-        read="memory", loading=Loading(workers=args.workers,
-                                        worker_buffer=1), validation_records=(0) * (BATCH))
+    data = token_data(args, packed=True, loading=Loading(workers=args.workers, worker_buffer=1))
     seen: list = []
     state = trainer.fit(
         dataclasses.replace(data, train=lambda partition: Recording(data.train(partition), seen)),
@@ -523,14 +536,11 @@ def restored_state(trainer):
 
 
 def mode_token_budget(args) -> dict:
-    from dew.config.data import TextData, loader
-
     trainer = token_trainer(args.name, args.out.parent, fsdp=1, seq_len=4)
     trainer.checkpoints = None
     tracker = LossRecorder()
     trainer.tracker = tracker
-    data = loader(TextData(source=args.tokens, seq_len=4), batch=BATCH,
-                loading=Loading(workers=0, threads=1, read_buffer=1))
+    data = token_data(args, packed=False, loading=Loading(workers=0, threads=1, read_buffer=1))
     state = trainer.fit(data, tokens=80, log_every=1)
     return {"step": int(state.step), "updates": int(state.updates), "logged": len(tracker.losses)}
 
@@ -571,22 +581,6 @@ def mode_steps(args) -> dict:
     }
 
 
-class Batches:
-    """A metric whose pass score is how many batches the pass scored."""
-    name = "batches"
-
-    def __init__(self):
-        from dew.artifacts import Representations
-        self.reads = Representations
-
-    def __call__(self, artifact, batch):
-        return 1.0
-
-    def merge(self, accumulated, contribution):
-        return accumulated + contribution
-
-    def finalize(self, accumulated):
-        return accumulated
 
 
 def fail_local_save(step: int) -> None:
@@ -627,33 +621,12 @@ def mode_fit(args) -> dict:
             loader = BlockUntilKilled(loader, args.block_after, Path(args.marker))
         def open_train(partition):
             return iter(loader)
-    val, available = None, None
-    scored = []
-    evaluate = trainer.objective.evaluate
-    trainer.objective.evaluate = lambda *a: scored.append(1) or evaluate(*a)
-    if args.tokens:
-        # The packed token split, whose documents are strided over the
-        # processes before packing. The objective's evaluation ignores the
-        # batch's contents, so the split only has to shard.
-        from dew.config.data import TextData
-        from dew.data.dataset import DataPartition
-
-        data = loader(TextData(source=args.tokens, pack="first-fit", seq_len=args.seq_len), batch=BATCH,
-            read="memory", loading=Loading(workers=args.workers),
-                validation_records=(args.val_steps) * (BATCH))
-        val = data.val
-        assert val is not None
-        available = sum(1 for _ in val(DataPartition.of(trainer.device_mesh)))
-    from dew.training import Best, Observe
-    counter = Batches()
+    from dew.training import Observe
     # The variables, split over the processes by fsdp, which an observation gathers whole on each.
     observe = None if args.observe_every is None else Observe(args.observe_every,
                                                               lambda state: state.variables)
-    state = trainer.fit(Loader(open_train, val=val, batch=BATCH, records=args.records),
-                        steps=args.steps, log_every=1,
-                        eval_every=args.steps if args.tokens else None,
-                        checkpoint_every=args.save_every, metrics=(counter,) if args.tokens else (),
-                        best=Best(counter, mode='max') if args.tokens else None, observe=observe)
+    state = trainer.fit(Loader(open_train, val=None, batch=BATCH, records=args.records),
+                        steps=args.steps, log_every=1, checkpoint_every=args.save_every, observe=observe)
     dump_params(args.out.with_suffix(".npz"), state.variables)
     if observe is not None:
         # Each observation is already whole on this host: written as it is, gathered by nothing.
@@ -675,8 +648,6 @@ def mode_fit(args) -> dict:
         "local_steps": None if args.local_dir is None else sorted(
             int(step) for step in checkpoints._open_local().all_steps()),
         "dataset_state": final_position,
-        "val_available": available,
-        "val_batches": None if available is None else len(scored),
     }
 
 
@@ -2408,15 +2379,14 @@ def parse_args(argv=None):
     parser.add_argument("--local-dir", help="every process's local checkpoint directory")
     parser.add_argument("--local-every", type=int)
     parser.add_argument("--records", type=int, default=BATCH * 16)
-    parser.add_argument("--val-steps", type=int, default=0,
-                        help="validation batches per pass, over the packed split of --tokens")
     parser.add_argument("--block-after", type=int,
                         help="batches to hand out before waiting to be killed")
     parser.add_argument("--marker", help="file written once the source blocks")
     parser.add_argument("--fail-local-save", type=int,
                         help="this process's local save at this step fails in the background, as "
                              "orbax's tmp directory creation once did (FileExistsError)")
-    parser.add_argument("--tokens", help="directory holding train.bin and val.bin")
+    parser.add_argument("--tokens", help="the committed token store the run trains on")
+    parser.add_argument("--held-tokens", help="the committed token store it validates on")
     parser.add_argument("--seq-len", type=int, default=8)
     parser.add_argument("--part", default="0/1", help="i/n: whole_validation's share of the objectives")
     parser.add_argument("--workers", type=int, default=0)

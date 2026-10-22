@@ -3,6 +3,9 @@ the short conv's kernels at their training shapes, compiles for its GPU within t
 memory, and the port's dots refuse mixed dtypes. None runs a kernel, so the GPU tier, whose kernel tests
 are the verdict, runs none of them: the file carries no `kernel` mark."""
 
+import tempfile
+from pathlib import Path
+
 import fla_gdn_support as support
 import jax
 import jax.numpy as jnp
@@ -26,15 +29,15 @@ def test_the_compiled_shapes_reach_the_widest_keys_and_values_the_port_takes():
 
 
 @pytest.mark.parametrize("target, wide", [("sm80", True), ("sm90", True), ("sm86", False), ("sm89", False),
-                                          ("sm120", False), ("sm100", False), ("cpu", True)])
+                                          ("sm120", False), ("sm100", True), ("sm103", False), ("cpu", True)])
 def test_a_gpu_takes_an_a100s_picks_where_its_block_holds_as_much_shared_memory(target, wide):
     """An A100's picks on every GPU whose block holds as much shared memory, the 99 KB ones elsewhere,
-    on a GPU the targets do not list (sm100) too, and an A100's where a CPU interprets."""
+    on a GPU the targets do not list (sm103) too, and an A100's where a CPU interprets."""
     with generation.assumed(target):
         assert chunked_launch._wide() is wide
 
 
-@pytest.mark.parametrize("target", [*generation.TARGETS, "sm100", "cpu"])
+@pytest.mark.parametrize("target", [*generation.TARGETS, "sm103", "cpu"])
 def test_each_targets_space_holds_its_picks(target):
     """On every target `generation.TARGETS` lists, a GPU it does not and a CPU, every kernel's 16-bit
     space at the target's width holds its unmeasured pick, Kimi delta attention's own kernels' too, and
@@ -182,3 +185,80 @@ def test_every_short_conv_config_compiles_on_tritons_compiler_within_each_gpus_b
     found = compile_kernels(conv_config_cases(), target)
     assert len(found) == len(short_conv.TILES) + len(short_conv.WALKS)
     assert not failures(found), "\n".join(failures(found))
+
+
+def test_the_cooperative_grouped_matmul_compiles_for_hopper_within_its_resources():
+    """The GEMM template's Mosaic GPU grouped matmul, lone and cooperative, compiled by Mosaic for a
+    compile-only H100 on this CPU through ptxas (tests/kernel_compile.py): within the multiprocessor's
+    shared memory, no register spilled. The resource gate every Mosaic GPU mainloop takes."""
+    from kernel_compile import compile_mosaic_kernels, mosaic_failures
+
+    from dew.nn.kernels.templates.gemm import mosaic_gpu
+
+    def case(tiles):
+        def call():
+            def gmm(lhs, rhs, sizes):
+                hopper = generation.gpu_target("sm90")
+                return mosaic_gpu.gmm(lhs, rhs, sizes, tiles=tiles, transpose_rhs=False,
+                                      out_dtype=jnp.bfloat16, multiprocessors=hopper.multiprocessors)
+
+            return gmm, (jax.ShapeDtypeStruct((1024, 512), jnp.bfloat16),
+                         jax.ShapeDtypeStruct((4, 512, 1024), jnp.bfloat16),
+                         jax.ShapeDtypeStruct((4,), jnp.int32))
+
+        return support.KernelCase(f"gmm {tiles}", call)
+
+    found = compile_mosaic_kernels([case(mosaic_gpu.Tiles(128, 128, 64, 3, 1)),
+                                    case(mosaic_gpu.Tiles(128, 256, 64, 3, 1, warpgroups=2))], "sm90")
+    assert len(found) == 2 and all(record.get("kernels") for record in found), found
+    assert not mosaic_failures(found), "\n".join(mosaic_failures(found))
+
+
+def test_the_resource_gate_refuses_a_spilling_mosaic_kernel():
+    """A record the gate reads (`mosaic_failures`): a kernel past its shared memory, its tensor memory or
+    spilling fails; within all three, none."""
+    from kernel_compile import mosaic_failures, mosaic_kernels
+
+    within = {"kernel": "k", "unread": [], "shared": 1024, "tmem": 256, "registers": 168, "spilled": 0}
+    record = {"name": "case", "limit": 2048, "shared": 0, "tmem_limit": 512, "kernels": [within]}
+    assert not mosaic_failures([record])
+    for past in ({"shared": 4096}, {"tmem": 513}, {"spilled": 40}):
+        assert mosaic_failures([{**record, "kernels": [{**within, **past}]}])
+    # The program's own refusal of a block past shared memory fails it whatever its Mosaic kernels say.
+    assert mosaic_failures([{**record, "shared": 4096}])
+    # Either report without the other, or a report without a field, is read as missing, not as within.
+    complete = ("smem_scratch_bytes=1024 tmem_scratch_cols=0, tmem_collective_scratch_cols=0",
+                "Used 168 registers\n0 bytes spill stores, 0 bytes spill loads")
+    with tempfile.TemporaryDirectory() as directory:
+        Path(directory, "a.resources.txt").write_text(complete[0])
+        Path(directory, "a.ptxas").write_text(complete[1])
+        spilling = "Used 255 registers\n40 bytes spill stores, 40 bytes spill loads"
+        Path(directory, "b.ptxas").write_text(spilling)
+        Path(directory, "c.resources.txt").write_text("smem_scratch_bytes=1024")
+        a, b, c = mosaic_kernels(directory)
+        assert not a["unread"]
+        assert set(b["unread"]) == {"shared bytes", "tensor memory columns"}
+        assert set(c["unread"]) == {"tensor memory columns", "registers", "spills"}
+        assert len(mosaic_failures([{**record, "kernels": [a, b, c]}])) == 2
+
+
+def test_splash_compiles_for_a_v5e_with_libtpu():
+    """Dew's splash path, forward and backward, compiled by libtpu for a compile-only v5e on this CPU
+    (tests/kernel_compile.py): within the v5e's scoped VMEM, as the blocks splash takes are sized
+    (`dew.nn.attention.splash_block_sizes`)."""
+    from kernel_compile import compile_tpu_kernels
+
+    from dew.nn.attention import scaled_dot_product_attention
+
+    def call():
+        def step(query, key, value):
+            def loss(q, k, v):
+                return jnp.sum(scaled_dot_product_attention(q, k, v, implementation="tpu", causal=True)
+                               .astype(jnp.float32))
+            return jax.grad(loss, argnums=(0, 1, 2))(query, key, value)
+
+        shape = jax.ShapeDtypeStruct((1, 2048, 4, 128), jnp.float32)
+        return step, (shape, shape, shape)
+
+    found = compile_tpu_kernels([support.KernelCase("splash fp32", call)], "v5e")
+    assert not [record for record in found if "error" in record], found

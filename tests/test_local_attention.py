@@ -16,6 +16,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from jax.experimental.pallas.ops.tpu.splash_attention import splash_attention_mask as splash
+from model_support import model_draw
 from reference_error import assert_as_exact
 
 from dew.nn.attention import scaled_dot_product_attention
@@ -28,8 +29,8 @@ from dew.nn.local_attention import local_attention
 SEEDS = {'window': 8, 'chunk': 8, 'packed': 8, 'given places': 8, 'gradients': 8, 'shared split': 8,
          'decode': 8, 'holey chunk': 8, 'diagnostic chunk': 8, 'holey window': 16, 'diagnostic window': 16,
          'prefill window': 16, 'padded split': 8}
-"""Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada and an A100,
-2026-10-21): the most any of a site's cases took."""
+"""Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada and an A100):
+the most any of a site's cases took."""
 
 
 def on_rows(out, rows):
@@ -57,16 +58,6 @@ def model_of(kind: str, **span):
 
 def chunked_model(chunk: int):
     return model_of("chunked_attention", chunk=chunk)
-
-
-def model_draw(model, shape):
-    """Check 1's draw for `model`: a seed's variables and `shape` tokens."""
-    initialize = jax.jit(model.init)
-
-    def draw(seed):
-        tokens = jax.random.randint(jax.random.fold_in(jax.random.key(1), seed), shape, 0, 64)
-        return initialize(jax.random.fold_in(jax.random.key(0), seed), tokens), tokens
-    return draw
 
 
 def float64_run(model, **call):
@@ -319,7 +310,7 @@ def test_a_chunked_kind_decodes_what_its_whole_sequence_pass_computes(origin, sh
     def whole(model):
         return jax.jit(lambda variables, tokens: model.apply(variables, tokens, positions=positions)[:, 3:])
 
-    assert_as_exact(decoded, whole(model), model_draw(model, shape),
+    assert_as_exact(decoded, whole(model), model_draw(model, shape, 64),
                     f"{layout} {shared} {origin} chunked decode", seeds=SEEDS['decode'],
                     truth_fn=whole(model.clone(dtype=jnp.float64)))
 
@@ -336,7 +327,7 @@ def test_a_chunked_kind_bands_a_row_with_padding_among_its_tokens_by_its_tokens(
         tokens = jnp.zeros((1, 12), jnp.int32).at[:, slots].set(real)
         return model.apply(variables, tokens, attention_mask=valid)[:, slots]
 
-    assert_as_exact(jax.jit(holey), jax.jit(model.apply), model_draw(model, (1, 4)), "holey chunked row",
+    assert_as_exact(jax.jit(holey), jax.jit(model.apply), model_draw(model, (1, 4), 64), "holey chunked row",
                     seeds=SEEDS['holey chunk'], truth_fn=float64_run(model))
 
 
@@ -354,7 +345,7 @@ def test_a_chunked_kind_attends_alike_on_every_path_whatever_places_it_is_given(
                                                              mutable=["qk"])[0])
 
     assert_as_exact(jax.jit(lambda variables, tokens: model.apply(variables, tokens, positions=positions)),
-                    diagnostic(model), model_draw(model, (2, 13)), "chunked whole pass",
+                    diagnostic(model), model_draw(model, (2, 13), 64), "chunked whole pass",
                     seeds=SEEDS['diagnostic chunk'], truth_fn=diagnostic(model.clone(dtype=jnp.float64)))
 
 
@@ -385,7 +376,7 @@ def test_a_windowed_kind_counts_a_rows_tokens_not_its_slots(window):
         return model.apply({**variables, "cache": cache}, spread(real), attention_mask=valid, decode=True,
                            mutable=["cache"])[0][:, slots]
 
-    draw, alone, truth = model_draw(model, (1, 6)), jax.jit(model.apply), float64_run(model)
+    draw, alone, truth = model_draw(model, (1, 6), 64), jax.jit(model.apply), float64_run(model)
     paths = {"holey window": holey, "diagnostic window": diagnostic, "prefill window": prefilled}
     for label, path in paths.items():
         assert_as_exact(jax.jit(path), alone, draw, f"{window} {label}", seeds=SEEDS[label], truth_fn=truth)

@@ -16,15 +16,22 @@ import optax
 import pytest
 from diffusion_stubs import label_table
 from flax import linen as nn
-from reference_error import assert_as_exact_as_the_reference, assert_computes_the_oracle, chain_roundings
+from reference_error import (
+    assert_as_exact,
+    assert_as_exact_as_the_reference,
+    assert_computes_the_oracle,
+    chain_roundings,
+)
 from test_lpips import drawn_weights
 from test_mean_flow import CLASSES
 
 from dew.diffusion import presets
 from dew.eval.lpips import variables_from_torch
 from dew.inputs import Condition, Field, InputSpec, unit_range
+from dew.nn.autoencoders.api import AutoEncoder
 from dew.nn.autoencoders.dc_ae import DCAE, DCAutoencoder
 from dew.nn.autoencoders.kl import AutoencoderKL
+from dew.nn.autoencoders.pretrained import REGISTRATIONS
 from dew.nn.autoencoders.sd_vae import StableDiffusionVAE
 from dew.nn.autoencoders.vae import translate_vae_weights
 from dew.nn.backbones import SimpleDiT
@@ -164,7 +171,7 @@ def test_a_step_moves_the_running_statistics_and_the_task_decodes_with_them():
     for publication, statistics in ((published, after), (later, moved)):
         shift = np.asarray(statistics["mean"])
         scale = 1 / np.sqrt(np.asarray(statistics["var"]))
-        np.testing.assert_allclose(np.asarray(publication.autoencoder.normalization(
+        np.testing.assert_allclose(np.asarray(publication.autoencoder.running_normalization(
             publication.variables["autoencoder"])[1]), scale, rtol=1e-6)
         weights = tuned[TUNED_WEIGHTS]
         expected = task.autoencoder.decode_batch(weights, z / jnp.asarray(scale) + jnp.asarray(shift))
@@ -514,7 +521,7 @@ def test_a_repae_step_moves_the_running_statistics_as_train_repae_does(repae_ste
                                1 / np.sqrt(STEPPED["bn/running_var_f64"]), rtol=4 * np.finfo(np.float64).eps)
     decoder, decoding = task.published_autoencoder({**variables, "params": params, LATENT_STATS: statistics})
     assert isinstance(decoder, TunedAutoEncoder)
-    shift, scale = decoder.normalization(decoding["autoencoder"])
+    shift, scale = decoder.running_normalization(decoding["autoencoder"])
     np.testing.assert_array_equal(np.asarray(shift), np.asarray(statistics["mean"]))
     np.testing.assert_allclose(np.asarray(scale, np.float64),
                                1 / np.sqrt(np.asarray(statistics["var"], np.float64)), rtol=gamma(2), atol=0)
@@ -583,10 +590,10 @@ def test_a_run_config_tunes_its_autoencoder_and_from_run_decodes_with_the_tuned_
     running statistics, and samples exactly as the trained objective's own
     task does."""
     from diffusion_stubs import batch_for
+    from diffusion_support import images_of
 
     from dew.checkpoints import Checkpoints
     from dew.config import ModelConfig, ObjectiveConfig, TrainerConfig
-    from dew.config.data import ImageData
     from dew.objectives.diffusion import DiffusionRunConfig, PretrainedAutoencoder, TextCondition
 
     for name in ("tiny_diffusers", "rae"):
@@ -595,8 +602,7 @@ def test_a_run_config_tunes_its_autoencoder_and_from_run_decodes_with_the_tuned_
     config = DiffusionRunConfig(
         model=ModelConfig("simple_dit", {"patch_size": 1, "emb_features": 16, "num_layers": 2, "num_heads": 2,
                                          "mlp_ratio": 1, "dtype": "float32", "attention_impl": "xla"}),
-        data=ImageData(source="tfds://oxford_flowers102",
-                       image_size=32), preset=presets.Flow(), val_metrics=(),
+        data=images_of("tfds://oxford_flowers102", 32), preset=presets.Flow(), val_metrics=(),
         trainer=TrainerConfig(checkpoint_dir=str(tmp_path)),
         text=TextCondition(encoder="char_table", checkpoint="char_table"),
         autoencoder=PretrainedAutoencoder(modelname=str(tmp_path / "tiny_diffusers/sd/vae"), dtype="float32"),
@@ -631,3 +637,46 @@ def test_a_run_config_tunes_its_autoencoder_and_from_run_decodes_with_the_tuned_
         np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
     expected = task.pipeline(state, ema=False)(["a red bird"], key=9).host().images
     np.testing.assert_array_equal(restored(["a red bird"], key=9).host().images, expected)
+
+
+BUILT_INS = tuple(entry.wrapper for entry in REGISTRATIONS)
+"""Every built-in autoencoder, one per registration (`AutoEncoder.from_json`'s)."""
+
+
+def test_only_the_kl_autoencoders_with_a_posterior_reach_end_to_end_tuning():
+    """End-to-end tuning trains through `moments`; a built-in without one is refused when the objective
+    is built (`_check_end_to_end`), so the start below covers every built-in a run can tune."""
+    exposes = {wrapper for wrapper in BUILT_INS if wrapper.moments is not AutoEncoder.moments}
+    assert exposes == {StableDiffusionVAE}
+
+
+def test_the_running_statistics_start_by_normalizing_as_the_autoencoder_does():
+    """REPA-E's start, `normalized` by `initial_statistics` of the autoencoder's shift and scale with
+    the batch norm's epsilon at zero, normalizes a posterior's latents as `encode` does
+    (`LatentNormalization.normalized`, which `encode` applies to its draw): neither the identity nor
+    twice."""
+    autoencoder = objective(EndToEnd()).autoencoder
+    tuning = EndToEnd(epsilon=0.0)
+    statistics = tuning.initial_statistics(autoencoder.latent_shift, autoencoder.latent_scale,
+                                           autoencoder.latent_channels)
+
+    def draw(seed):
+        return (jax.random.normal(jax.random.key(seed), (8, 4, 4, autoencoder.latent_channels)),)
+
+    def started(latents):
+        return tuning.normalized(latents, jax.tree.map(lambda value: value.astype(latents.dtype), statistics))
+
+    assert_as_exact(jax.jit(started), jax.jit(autoencoder.normalization.normalized), draw,
+                    "end-to-end start", seeds=8)
+
+
+def test_a_tuned_autoencoder_has_no_fixed_normalization_to_read_or_replace():
+    """Its normalization is each call's running statistics: a fixed shift, scale or replacement is
+    refused, not the base's identity."""
+    autoencoder = objective(EndToEnd()).autoencoder
+    tuned = TunedAutoEncoder(autoencoder, {TUNED_WEIGHTS: autoencoder.params})
+    for read in (lambda: tuned.latent_shift, lambda: tuned.latent_scale,
+                 lambda: tuned.with_normalization(autoencoder.normalization)):
+        with pytest.raises(TypeError):
+            read()
+

@@ -9,30 +9,31 @@ from typing import TYPE_CHECKING, Any
 import jax.numpy as jnp
 import pytest
 from affine_run import TimingRegression as Regression, batches
+from diffusion_support import images_of
 from flax import linen as nn
 
 import dew.config
 import dew.nn.backbones
 from dew.config import ModelConfig, OptimConfig, RunConfig, TrainerConfig
-from dew.data.dataset import Loader
+from dew.data.dataset import Loader, Ramp
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.vision import GemmaProjector, SiglipVision
 from dew.objectives.diffusion import DiffusionRunConfig
-from dew.registry import Aliases, datasets, projectors, towers
+from dew.registry import Aliases, projectors, towers
 from dew.training import Checkpoints, Layout, MeshSpec
 
 
-@pytest.mark.parametrize("dataset", ["tfds", "arrayrecord_shards", "arrayrecord_path"])
+@pytest.mark.parametrize("dataset", ["tfds", "arrayrecord_shards"])
 def test_to_dict_and_from_dict_round_trip_a_run(dataset, tmp_path):
-    from dew.config.data import ImageData
-    from dew.data import Files
+    """A run's record holds its data as its chain's record (`dew.data.records`), the preset it calls
+    with its settings, which reads back the chain it was."""
+    from dew.data import Files, presets
+    from dew.data.sources import source
 
     data = {
-        "tfds": ImageData(source="tfds://oxford_flowers102", image_size=64),
-        "arrayrecord_shards": ImageData(
-            source=Files((str(tmp_path / "cc12m" / "*.array_record"),), format="array_record"),
-            image_size=64),
-        "arrayrecord_path": ImageData(source=str(tmp_path), image_size=8),
+        "tfds": source("tfds://oxford_flowers102").pipe(presets.images, 64, batch=32),
+        "arrayrecord_shards": Files((str(tmp_path / "cc12m" / "*.array_record"),),
+                                    format="array_record").pipe(presets.images, 64, batch=32),
     }[dataset]
     config = RunConfig(
         model=ModelConfig("simple_dit", {"patch_size": 4, "emb_features": 64}),
@@ -43,8 +44,37 @@ def test_to_dict_and_from_dict_round_trip_a_run(dataset, tmp_path):
     )
     record = config.to_dict()
     assert record["trainer"]["layout"]["rules"] == [["mlp", "fsdp"]]
-    assert RunConfig.from_dict(json.loads(json.dumps(record))) == config
-    assert record["data"]["class"] == datasets.paths["images"]
+    assert RunConfig.from_dict(json.loads(json.dumps(record))).to_dict() == record
+    assert record["data"]["stages"][-1]["pipe"] == "dew.data.presets:images"
+
+
+def test_a_chain_the_record_cannot_describe_trains_from_python_and_refuses_to_rebuild():
+    """A chain with a step only Python holds (a lambda) is recorded as unrecorded, with the reason,
+    and rebuilding the run from that record is refused by name."""
+    from dew.data import Memory
+
+    data = Memory([{"x": 1.0, "y": 2.0}] * 8).map(lambda record: record).batch(8)
+    record = RunConfig(data=data, trainer=TrainerConfig(steps=1)).to_dict()
+    assert set(record["data"]) == {"unrecorded"}
+    with pytest.raises(ValueError):
+        RunConfig.from_dict(json.loads(json.dumps(record)))
+
+
+def test_named_validation_splits_read_back_in_their_order(tmp_path):
+    """A run's named validation splits are recorded in their order, which a saved run.json keeps: the
+    first is the split a run ranks its checkpoints and calibrates on, so a save must not move another
+    ahead of it."""
+    from dew.data import presets
+    from dew.data.sources.tokens import TokenFiles
+
+    def windows(url):
+        return TokenFiles(url).pipe(presets.token_windows, seq_len=8, batch=2)
+
+    config = RunConfig(data=windows("tokens/train"), trainer=TrainerConfig(steps=1),
+                       validation={"val": windows("tokens/val"), "test": windows("tokens/test")})
+    loaded = RunConfig.load(config.save(str(tmp_path / "run")))
+    assert isinstance(loaded.validation, Mapping) and list(loaded.validation) == ["val", "test"]
+    assert [split.source.url for split in loaded.validation.values()] == ["tokens/val", "tokens/test"]
 
 
 def test_a_record_with_an_unknown_field_or_without_a_required_one_is_refused():
@@ -57,57 +87,28 @@ def test_a_record_with_an_unknown_field_or_without_a_required_one_is_refused():
         RunConfig.from_dict({**record, "data": {"class": "flowers", "fields": {}}})
 
 
-@pytest.mark.parametrize("fields", [
-    {"batch_tokens": 24},
-    {"update_tokens": 96},
-    {"batch_tokens": 24, "update_tokens": 96},
-    {"batch_size": None, "batch_tokens": 0, "update_tokens": 96},
-    {"batch_size": None, "batch_tokens": 24, "update_tokens": 95},
-    {"batch_size": None},
-])
-def test_token_budget_flags_refuse_an_ambiguous_or_fractional_batch(fields):
+def test_a_token_budget_refuses_a_ramp_or_a_budget_under_one_token():
     with pytest.raises(ValueError):
-        TrainerConfig(**fields)
-
-
-def test_token_budgets_determine_the_accumulation_every_reader_sees():
-    """The budgets set the accumulation in the config itself, so RunConfig.train's
-    Trainer commits once a window as a prepared run does; one at odds refuses."""
-    config = RunConfig(trainer=TrainerConfig(batch_size=None, batch_tokens=24576, update_tokens=98304,
-                                             steps=1))
-    assert config.trainer.accumulation == 4
-    loaded = RunConfig.from_dict(json.loads(json.dumps(config.to_dict())))
-    assert loaded.trainer.batch_size is None
-    assert loaded.trainer.batch_tokens == 24576 and loaded.trainer.update_tokens == 98304
-    assert loaded.trainer == config.trainer
+        TrainerConfig(update_tokens=0)
     with pytest.raises(ValueError):
-        dataclasses.replace(config.trainer, accumulation=3)
+        TrainerConfig(update_tokens=96, batch_ramp=Ramp(start=8, increment=8, samples=8))
 
 
-def test_coupled_fields_are_set_together():
-    """A row-batched run switches to token budgets by one set of assignments,
-    in any order, though no one of them is valid alone."""
-    rows = RunConfig(trainer=TrainerConfig(steps=1))
-    for order in (["trainer.batch_size=None", "trainer.batch_tokens=24", "trainer.update_tokens=96"],
-                  ["trainer.update_tokens=96", "trainer.batch_tokens=24", "trainer.batch_size=None"]):
-        budgeted = rows.assigned(order).trainer
-        assert (budgeted.batch_size, budgeted.batch_tokens, budgeted.accumulation) == (None, 24, 4)
-
-
-def test_an_unregistered_member_fails_at_write_not_at_reload(tmp_path):
-    """A spec the registry does not know cannot be written: to_dict raises
-    now, instead of saving a record from_dict can never load back."""
-    from dew.config.data import ImageData
-
-    @dataclasses.dataclass(frozen=True)
-    class Unregistered(ImageData):
-        pass
-
-    config = RunConfig(
-        data=Unregistered(source=str(tmp_path), image_size=8),
-        trainer=TrainerConfig(steps=1))
+def test_a_token_budget_sets_the_accumulation_over_its_datas_token_batches():
+    """The data's batch stage is the run's one batch: a budget of tokens an update sets the
+    accumulation to that many of the data's token batches (`TrainerConfig.accumulating`), and refuses
+    data batched in rows, a budget no whole number of its batches, or an accumulation set otherwise."""
+    trainer = TrainerConfig(update_tokens=98304, steps=1)
+    tokens = Loader(train=lambda partition: iter(()), val=None, records=None, batch=8, batch_tokens=24576)
+    assert trainer.accumulating(tokens).accumulation == 4
+    recorded = json.loads(json.dumps(RunConfig(trainer=trainer).to_dict()))
+    assert RunConfig.from_dict(recorded).trainer == trainer
+    for refused in (dataclasses.replace(tokens, batch_tokens=None),
+                    dataclasses.replace(tokens, batch_tokens=24575)):
+        with pytest.raises(ValueError):
+            trainer.accumulating(refused)
     with pytest.raises(ValueError):
-        config.to_dict()
+        dataclasses.replace(trainer, accumulation=3).accumulating(tokens)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -181,17 +182,16 @@ def test_the_run_length_is_steps_or_epochs():
         TrainerConfig().total_steps(sized)
 
 
-def test_the_cli_parses_the_mesh_the_layout_and_a_dataset_subcommand():
-    config = RunConfig.cli( [
+def test_the_cli_parses_the_mesh_the_layout_and_a_setting_of_the_chain():
+    config = RunConfig.cli([
         "--trainer.mesh.fsdp", "2", "--trainer.layout.min-shard", "8",
         "--trainer.steps", "5", "--model", "uvit", "--model.emb_features", "32",
-        "data:text", "--data.source", "tokens", "--data.seq-len", "8"])
+        "--set", "data.images.size=64"], default=RunConfig(data=images_of("tfds://oxford_flowers102", 32)))
     assert config.trainer.mesh == MeshSpec(fsdp=2)
     assert config.trainer.layout.min_shard == 8
     assert config.model.fields == {"emb_features": 32}
-    assert type(config.data) is datasets["text"]
-    assert config.data.seq_len == 8
-    assert RunConfig.from_dict(config.to_dict()) == config
+    assert config.data is not None and config.data.facts()["fields"]["image"] == [64, 64, 3]
+    assert RunConfig.from_dict(config.to_dict()).to_dict() == config.to_dict()
 
 
 
@@ -290,7 +290,7 @@ def _data(records=48, batch=8):
 
 
 def test_a_run_records_its_token_budget_and_final_checkpoint_policy(tmp_path):
-    config = TrainerConfig(tokens=30, checkpoint_final=False, batch_size=8,
+    config = TrainerConfig(tokens=30, checkpoint_final=False,
                            checkpoint_dir=str(tmp_path), eval_every=None, checkpoint_every=None)
     run = RunConfig(trainer=config)
     assert RunConfig.from_dict(run.to_dict()).trainer == config
@@ -298,7 +298,7 @@ def test_a_run_records_its_token_budget_and_final_checkpoint_policy(tmp_path):
 
 
 def test_a_run_can_disable_final_checkpoint_saving(tmp_path):
-    run = RunConfig(trainer=TrainerConfig(steps=1, checkpoint_final=False, batch_size=8,
+    run = RunConfig(trainer=TrainerConfig(steps=1, checkpoint_final=False,
                     checkpoint_dir=str(tmp_path), eval_every=None, checkpoint_every=None))
     data = Loader(lambda partition: batches(), None, None, 8)
     assert int(run.train(Regression(), data, name="no-final").step) == 1
@@ -310,26 +310,11 @@ def test_publishing_requires_a_final_checkpoint_policy():
         TrainerConfig(publish=True, wandb=dew.config.Wandb(project="test"), checkpoint_final=False)
 
 
-def test_a_dataset_at_another_batch_than_the_run_is_refused(tmp_path):
-    """The batch is one number: the recipes load the data at
-    `trainer.batch_size` and `train` refuses a dataset that reads another,
-    naming both, instead of training at one batch and reporting the other."""
-    run = RunConfig(trainer=TrainerConfig(
-        name="batch", checkpoint_dir=str(tmp_path / "runs"), steps=1, batch_size=8,
-        eval_every=None, checkpoint_every=None))
-
-    with pytest.raises(ValueError):
-        run.train(Regression(), Loader(lambda partition: batches(), None, None, 16), name="batch")
-
-    state = run.train(Regression(), Loader(lambda partition: batches(), None, None, 8), name="batch")
-    assert int(state.step) == 1
-
-
 def test_train_scores_every_named_validation_split(tmp_path):
     """#36 item 5: a held-out split and a test set, scored together at each
     evaluation and logged under their own names."""
     run = RunConfig(trainer=TrainerConfig(
-        name="splits", checkpoint_dir=str(tmp_path / "runs"), steps=2, batch_size=8,
+        name="splits", checkpoint_dir=str(tmp_path / "runs"), steps=2,
         eval_every=1, checkpoint_every=None))
     held = next(batches())
     splits = {"val": lambda partition: iter([held]),
@@ -355,7 +340,7 @@ def test_train_runs_the_trainer_its_config_describes(tmp_path):
 
     trace = tmp_path / "trace"
     config = TrainerConfig(
-        name="built", checkpoint_dir=str(tmp_path / "runs"), steps=3, batch_size=8, accumulation=2,
+        name="built", checkpoint_dir=str(tmp_path / "runs"), steps=3, accumulation=2,
         dynamic_scale=True, mesh=MeshSpec(fsdp=2), layout=Layout(min_shard=1, tolerance=1.0),
         profile=ProfileWindow(str(trace), steps=1, warmup=1), eval_every=None, checkpoint_every=None)
 
@@ -408,7 +393,7 @@ def test_the_run_record_is_written_to_a_bucket(tmp_path, monkeypatch):
     monkeypatch.setattr(dew.config.epath, "Path",
                         lambda uri: _Bucket(uri, tmp_path, seen))
     monkeypatch.setattr(os, "makedirs", refuse)
-    config = RunConfig(trainer=TrainerConfig(batch_size=8, steps=6))
+    config = RunConfig(trainer=TrainerConfig(steps=6))
 
     path = config.save("gs://dew-runs/flowers")
 
@@ -520,7 +505,6 @@ def test_a_learning_rate_schedule_is_a_typed_record_that_round_trips():
     groups included."""
     from dew.training.optim import ParamGroup, Power, PowerTail
     config = RunConfig(
-        data=datasets["images"](source="data/cc12m", image_size=64),
         trainer=TrainerConfig(steps=1),
         optim=OptimConfig(schedule=Power(peak=0.01, warmup_steps=5, a=4.0, c=16.0,
                                          tail=PowerTail(start=8)),
@@ -535,7 +519,6 @@ def test_param_groups_with_schedules_momentum_and_bounds_round_trip():
     from dew.training.optim import Cosine, Exponential, OneCycle, ParamGroup
     momentum = OneCycle(peak=0.85, init=0.95, end=0.95, every=40)
     config = RunConfig(
-        data=datasets["images"](source="data/cc12m", image_size=64),
         trainer=TrainerConfig(steps=1),
         optim=OptimConfig(
             optimizer="adam", schedule=Exponential(init=1e-3, end=1e-5, decay_steps=8, offset=1e-6),
