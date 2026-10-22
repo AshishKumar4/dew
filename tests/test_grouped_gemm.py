@@ -112,6 +112,19 @@ def test_the_kernel_gradient_keeps_a_neighbours_non_finite_rows_out():
                                       "kernel gradient")
 
 
+def test_the_portable_branch_writes_each_gradient_from_the_rounded_operands():
+    """The kernels' portable branch (a CPU's, uninterpreted) differentiates the operands as the projection
+    rounded them: an fp16 master's largest value rounds to bf16's 65536, which fp16 does not hold, and the
+    input gradient through it is finite, each gradient rounded once to its operand's dtype."""
+    x = jnp.ones((1, 1), jnp.float32)
+    kernel = jnp.full((1, 1, 1), 65504, jnp.float16)
+    interpret_on_cpu = False
+    _, pullback = jax.vjp(lambda x, kernel: grouped_matmul.grouped_projection(
+        x, kernel, jnp.ones((1,), jnp.int32), jnp.bfloat16, interpret_on_cpu), x, kernel)
+    d_x, d_kernel = pullback(jnp.full((1, 1), 2.0 ** -16, jnp.bfloat16))
+    np.testing.assert_array_equal(np.asarray(d_x), np.ones((1, 1), np.float32))
+    np.testing.assert_array_equal(np.asarray(d_kernel), np.full((1, 1, 1), 2.0 ** -16, np.float16))
+
 @INTERPRETS
 @pytest.mark.parametrize("generation_name,implementation", [("sm80", "triton"), ("sm90", "mosaic_gpu")])
 def test_an_expert_projection_runs_the_implementation_chosen_for_it_on_the_cpu(generation_name: str,

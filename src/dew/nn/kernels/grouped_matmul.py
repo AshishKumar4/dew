@@ -39,7 +39,7 @@ from jax.custom_derivatives import SymbolicZero
 from jax.experimental.pallas import mosaic_gpu as plgpu, tpu as pltpu
 from jax.extend import core as jax_core
 
-from ..precision import rounded_operand
+from ..precision import at_least_fp32, rounded_operand
 from . import generation
 from .templates import base, cost
 from .templates.gemm import mosaic_gpu, mosaic_tpu
@@ -1271,11 +1271,14 @@ def _backward(inputs, matrix, sizes, cotangent, input_dtype, kernel_dtype, inter
                               promoted=promoted(above=exact, outputs=(kernel_dtype,))))
 
     def fallback(inputs, matrix, sizes, cotangent):
-        # The rounded operands widened back to their own dtypes, exactly, so the portable projection's
-        # derivative writes each gradient in its operand's dtype.
+        # The portable projection's derivative on the rounded operands widened to the work dtype, which
+        # holds them whatever their own dtypes (an fp16 master cannot hold every rounded bf16 value), each
+        # gradient then rounded once to its operand's dtype.
+        work = jnp.result_type(at_least_fp32(input_dtype), at_least_fp32(kernel_dtype))
         _, pullback = jax.vjp(lambda x, kernel: portable_projection(x, kernel, sizes, inputs.dtype, None),
-                              inputs.astype(input_dtype), matrix.astype(kernel_dtype))
-        return pullback(cotangent)
+                              inputs.astype(work), matrix.astype(work))
+        d_inputs, d_matrix = pullback(cotangent)
+        return d_inputs.astype(input_dtype), d_matrix.astype(kernel_dtype)
 
     branches, default = _on_platform(kernel, fallback, interpret_on_cpu)
     return jax.lax.platform_dependent(inputs, matrix, sizes, cotangent, default=default,
