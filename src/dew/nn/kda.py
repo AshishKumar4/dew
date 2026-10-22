@@ -19,10 +19,10 @@ modeling_glm5_next.py:584-733):
   (:416-424).
 
 `chunk_kimi_delta_attention` (:482-578) is the gated delta rule's chunked form
-with a decay per key dimension, `dew.nn.linear.chunk_gated_delta_rule`: on a
+with a decay per key dimension, `dew.nn.kernels.recurrence_chunk.chunk_gated_delta_rule`: on a
 GPU fla's chunked KDA ported to Pallas (`dew.nn.kernels.fla_kda`), elsewhere
 the portable math in fp32; the recurrent form is
-`dew.nn.linear.recurrent_delta_rule` (:428-478). tests/test_kda.py holds the
+`dew.nn.kernels.recurrence_chunk.recurrent_delta_rule` (:428-478). tests/test_kda.py holds the
 math to a float64 oracle of the reference, and tests/test_fla_kda.py the port.
 """
 
@@ -41,15 +41,8 @@ from dew.nn.dense import Dense
 
 from .flops import conv_flops, delta_flops, projection_flops
 from .inputs import PLAIN_CALL, MixerCall, coordinates_of
-from .linear import (
-    CHUNK_SIZE,
-    DepthwiseConv1d,
-    RMSNormGated,
-    chunk_gated_delta_rule,
-    held_scan,
-    on_the_port,
-    recurrent_delta_rule,
-)
+from .kernels.recurrence_chunk import CHUNK_SIZE, chunk_gated_delta_rule, on_the_port, recurrent_delta_rule
+from .linear import DepthwiseConv1d, RMSNormGated, held_scan
 from .mixer_base import DELTA_RULE_RESIDUALS, MixerBase, MixerContext
 from .precision import at_least_fp32, float32_dot_general
 from .sharding import logical_axes

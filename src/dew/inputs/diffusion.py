@@ -555,10 +555,7 @@ class HiddenStatesConditioner(_LanguageText):
         return tokens
 
     def conditioning_flops(self, tokens) -> ConditionWork:
-        lengths = np.sum(np.asarray(tokens["attention_mask"]) != 0, axis=-1, dtype=np.int64)
-        spans = np.full(lengths.shape, np.shape(tokens["input_ids"])[1], np.int64)
-        return ConditionWork(counted_flops(self.tower, lengths), lengths, spans,
-                             self.tower.emb_features * len(self.layers))
+        return ConditionWork.of_tokens(self.tower, tokens, self.tower.emb_features * len(self.layers))
 
     def encode(self, params, tokens) -> DenoisingCondition:
         ids = jnp.asarray(tokens["input_ids"])
@@ -611,11 +608,9 @@ class WanConditioner(_LanguageText):
                 "attention_mask": np.asarray(encoded.attention_mask, np.int32)}
 
     def conditioning_flops(self, tokens) -> ConditionWork:
-        lengths = np.sum(np.asarray(tokens["attention_mask"]) != 0, axis=-1, dtype=np.int64)
         # The encoder masks padding, but Wan reads its zero-filled fixed
         # output budget without a mask; those keys remain in its softmax.
-        output = np.full(lengths.shape, np.shape(tokens["input_ids"])[1], np.int64)
-        return ConditionWork(counted_flops(self.tower, lengths), lengths, output, self.tower.emb_features)
+        return ConditionWork.of_tokens(self.tower, tokens, self.tower.emb_features)
 
     def encode(self, params, tokens) -> DenoisingCondition:
         mask = jnp.asarray(tokens["attention_mask"])
