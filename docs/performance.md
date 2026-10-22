@@ -3368,12 +3368,11 @@ On the RTX 4080 that one-program kernel ran 6x to 12x slower than XLA as Triton 
 
 Interpreted on the CPU, the Pallas SSD kernel and XLA's scan both compile dots, reductions,
 element-wise and layout ops to YNNPACK fusions by default, and YNNPACK picks their microkernels at run
-time by the host's instruction set. `tools/ssd_ynn_probe.py --draws 128`, and the same with `--fused`,
-measure the two arms' pooled ratio per leaf, the statistic check 1 pools (`tests/test_ssd_kernel.py`),
-over 128 draws of each host case, each host's job running both, on armada at commit 57a0f8666 with 4
-usable CPUs (a medium container). A geometry the size of default-chunk moves with the CPU count, its
-fused state ratio by up to 0.41 between 2 and 4 CPUs; one-short and whole-chunk did not between 4 and
-24.
+time by the host's instruction set. The two arms' pooled ratio per leaf, the statistic check 1 pools
+(`tests/test_ssd_kernel.py`), over 128 draws of each host case, with the fusions and without, measured
+on armada at commit 57a0f8666 with 4 usable CPUs (a medium container). A geometry the size of
+default-chunk moves with the CPU count, its fused state ratio by up to 0.41 between 2 and 4 CPUs;
+one-short and whole-chunk did not between 4 and 24.
 
 | host | fusions | one-short state | whole-chunk state | worst leaf over the nine cases |
 |---|---|---|---|---|
