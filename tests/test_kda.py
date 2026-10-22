@@ -129,11 +129,11 @@ def test_the_recurrent_rule_matches_the_oracle_and_the_chunked_rule():
                     seeds=SEEDS['recurrent oracle'])
 
 
-def layer_and_params(lower_bound, seed=3, *, E=E, H=H, D=D):
-    """The layer of width `E`, `H` heads of `D`, its parameters drawn from `seed` and its float32
-    variables."""
+def layer_and_params(lower_bound, seed=3, *, E=E, H=H, D=D, eps=1e-5):
+    """The layer of width `E`, `H` heads of `D` and the gated norm's `eps`, its parameters drawn from
+    `seed` and its float32 variables."""
     module = KimiDeltaAttention(emb_features=E, num_heads=H, head_dim=D, conv_kernel=K,
-                                lower_bound=lower_bound, chunk_size=4, norm_eps=1e-5)
+                                lower_bound=lower_bound, chunk_size=4, norm_eps=eps)
     rng = np.random.RandomState(seed)
     def dense(rows, cols):
         return rng.randn(rows, cols) / np.sqrt(rows)
@@ -181,16 +181,16 @@ def test_the_layer_gradients_match_the_oracle():
     gate, the chunked rule across a chunk boundary and the gated norm: on
     par with the transcription's gradients from their float64 evaluation
     over drawn inputs, cotangents and parameters (check 1)."""
-    # Four heads of eight on a width of sixteen: a gate parameter's gradient is a long sum, whose
-    # error's spread over draws the toy layer's two heads leave unresolved.
-    wide = {"E": 16, "H": 4, "D": 8}
+    # Four heads of eight on a width of sixteen, and a gated norm of eps 1e-2: through a norm of a near
+    # zero row, a gradient's error grows as the row's inverse square, a tail no count of seeds resolves.
+    wide = {"E": 16, "H": 4, "D": 8, "eps": 1e-2}
     module, _, _ = layer_and_params(-5.0, **wide)
 
     def loss_module(x, variables, cotangent):
         return jnp.sum(module.apply(variables, x) * cotangent)
 
     def loss_oracle(x, p, cotangent):
-        return jnp.sum(oracle_layer(x, p, -5.0, 1e-5, partial(oracle_chunk, chunk_size=4)) * cotangent)
+        return jnp.sum(oracle_layer(x, p, -5.0, 1e-2, partial(oracle_chunk, chunk_size=4)) * cotangent)
 
     @jax.jit
     @jax.vmap
