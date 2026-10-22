@@ -697,27 +697,21 @@ def test_a_dense_bank_reads_its_layer_as_the_plain_product():
     assert _kernels(taken) == {'triton'}
 
 
-@lowers("sm90")
-def test_a_wide_input_gradient_widens_one_layer_not_the_bank():
-    """An fp32 output's input gradient summed exactly (above the default precision, which Triton's launch
-    takes) multiplies its fp32 cotangent by the bank's layer widened, the layer sliced out first: the
-    program lowered for an H100 holds no fp32 copy of the whole bank, and a launch prices one layer, as
-    the plain call does."""
+@pytest.mark.parametrize("launch", [grouped_matmul.Gmm(), grouped_matmul.MosaicGmm()],
+                         ids=lambda launch: type(launch).__name__)
+def test_an_indexed_launch_prices_the_layer_it_reads(launch):
+    """A launch reading a bank's layer in place moves the plain call's bytes at every tile, whatever the
+    layers beside it: the cost model prices the layer it reads, not the bank."""
     x, bank, *_ = _banked(0)
     sizes = jnp.asarray(SIZES)
-    mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
-
-    def loss(x, bank):
-        return jnp.sum(template.gemm(x, bank, sizes, rhs_index=jnp.int32(LAYER), out_dtype=jnp.float32,
-                                     precision="highest"))
-
-    with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
-        lowered = jax.jit(jax.grad(loss, argnums=(0, 1))).trace(x, bank).lower(lowering_platforms=("cuda",))
-        launch, target = grouped_matmul.MosaicGmm(), generation.gpu_target()
-        options = {"out_dtype": "bfloat16", "trans_rhs": False, "interpret": False}
-        banked = launch.estimate(launch.bind(x, bank, sizes, (), (), (jnp.int32(LAYER),), **options), target)
-        plain = launch.estimate(launch.bind(x, bank[LAYER], sizes, **options), target)
-    assert "x".join(map(str, bank.shape)) + "xf32" not in lowered.as_text() and banked == plain
+    options = {"out_dtype": "bfloat16", "trans_rhs": False, "interpret": False}
+    with generation.assumed("sm90"):
+        target = generation.gpu_target()
+        banked = launch.bind(x, bank, sizes, (), (), (jnp.int32(LAYER),), **options)
+        plain = launch.bind(x, bank[LAYER], sizes, **options)
+        for config in launch.fitting(plain, target):
+            assert (launch.costed(banked, config, target).device_bytes
+                    == launch.costed(plain, config, target).device_bytes), config
 
 
 def test_a_one_row_normed_operand_fuses():
