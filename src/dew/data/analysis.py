@@ -66,6 +66,7 @@ from dew.data.pipeline import (
     _declares_rejects,
     chains,
     children,
+    record_stage,
     with_children,
 )
 from dew.data.plan import Manifest, StepIdentity, _changed, _semantic, identified
@@ -556,11 +557,7 @@ def _bind(stage: Configured, metadata: Mapping[str, object]) -> Map | RandomMap 
     if stage.one_to_one and (isinstance(resolved, Expansion) or _declares_rejects(resolved)):
         raise ValueError(f"Configured {_identity(stage).name} states one_to_one=True and binds to a step "
                          "that drops or expands records")
-    if isinstance(resolved, Expansion):
-        return FlatMap(resolved, configured=binding)
-    if isinstance(resolved, pygrain.RandomMapTransform):
-        return RandomMap(resolved, rejects=_declares_rejects(resolved), configured=binding)
-    return Map(resolved, rejects=_declares_rejects(resolved), configured=binding)
+    return record_stage(resolved, configured=binding)
 
 
 def _keyed(stage: Stage) -> bool:

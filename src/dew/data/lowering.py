@@ -100,10 +100,10 @@ from dew.data.pipeline import (
     Slice,
     Stage,
     TokenSplit,
-    Volatile,
     Windows,
     Workers,
     children,
+    volatile,
 )
 from dew.data.plan import Manifest
 from dew.data.readers import _FillShare
@@ -507,10 +507,7 @@ class _Prefix:
 
     @property
     def volatile(self) -> bool:
-        return any(
-            isinstance(stage, Map) and isinstance(stage.step, Volatile) and stage.step.volatile
-            for stage in self.stages
-        )
+        return any(volatile(stage) for stage in self.stages)
 
     def __call__(self, index: int, raw: Record) -> tuple[Record, ...]:
         position = _position(raw)

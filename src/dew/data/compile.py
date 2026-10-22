@@ -93,11 +93,11 @@ from dew.data.pipeline import (
     Slice,
     TokenBudget,
     TokenGeometry,
-    Volatile,
     Windows,
     Workers,
-    _declares_rejects,
     children,
+    record_stage,
+    volatile,
     with_children,
     with_stores,
 )
@@ -584,11 +584,8 @@ def _compiled(
         _derived(train, build),
         cache=_cache_references(original, read),
         members=_member_manifests(train, build, host),
-        volatile=any(
-            isinstance(stage.step, Volatile) and stage.step.volatile
-            for stage in (*_steps(original), *(stage for source in sources for stage in _written(source, ())))
-            if isinstance(stage, Map)
-        ),
+        volatile=any(volatile(stage) for stage in
+                     (*_steps(original), *(stage for source in sources for stage in _written(source, ())))),
     )
     tuned = build.tuned(train)
     # The training read's workers move before what drops records (`pooled`); validation reads its own.
@@ -919,19 +916,7 @@ def _objective_records(
     pipeline: Pipeline, steps: Sequence[RecordStep | pygrain.RandomMapTransform | Expansion | Configured]
 ) -> Pipeline:
     """Append objective record steps at the caller's preparation boundary."""
-    for step in steps:
-        if isinstance(step, Expansion):
-            pipeline = pipeline.flat_map(step)
-        elif isinstance(step, Configured):
-            pipeline = pipeline._then(step)
-        elif isinstance(step, pygrain.RandomMapTransform):
-            drops = _declares_rejects(step)
-            pipeline = pipeline.random_filter_map(step) if drops else pipeline.random_map(step)
-        elif _declares_rejects(step):
-            pipeline = pipeline.filter_map(step)
-        else:
-            pipeline = pipeline.map(step)
-    return pipeline
+    return pipeline._then(*(step if isinstance(step, Configured) else record_stage(step) for step in steps))
 
 
 def _objective_branch(pipeline: Pipeline, objective: ObjectiveData, *, train: bool, read: Read) -> Pipeline:

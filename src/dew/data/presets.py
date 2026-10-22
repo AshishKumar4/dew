@@ -31,6 +31,7 @@ from dew.data import (
     video as video_steps,
 )
 from dew.data.pipeline import (
+    PACK_BINS,
     Cached,
     Configured,
     Dataset,
@@ -143,7 +144,7 @@ def _finished(prepared: Dataset, *, batch: int | None, records: int | None, host
 
 def lm(dataset: Dataset, tokenizer: str | SavedTokenizer | None, *, seq_len: int, batch: int | None,
        field: str = "text", eos: bool | None = None,
-       pack: Literal["first-fit", "best-fit", "concat"] | None = "first-fit", bins: int = 32,
+       pack: Literal["first-fit", "best-fit", "concat"] | None = "first-fit", bins: int = PACK_BINS,
        stride: int | None = None, cache: str | Cached | None = None,
        records: int | None = None, host: tuple[HostStep, ...] = ()) -> Pipeline:
     """Documents in `field` tokenized, ended by the tokenizer's EOS where it has one (`eos=True`
@@ -203,7 +204,7 @@ def token_windows(dataset: Dataset, *, seq_len: int, batch: int | None, stride: 
 
 def sft(dataset: Dataset, tokenizer: str | SavedTokenizer, *, seq_len: int, batch: int | None,
         messages: str = "messages", long: Literal["chunk", "truncate", "drop"] = "chunk",
-        pack: Literal["first-fit", "best-fit", "concat"] = "first-fit", bins: int = 32,
+        pack: Literal["first-fit", "best-fit", "concat"] = "first-fit", bins: int = PACK_BINS,
         cache: str | Cached | None = None, records: int | None = None,
         host: tuple[HostStep, ...] = ()) -> Pipeline:
     """Conversations in `messages` rendered through the tokenizer's chat
