@@ -18,7 +18,7 @@ from reference_error import assert_as_exact_as_the_reference, equations
 from dew.nn.kernels import generation, grouped_matmul
 from dew.nn.kernels.templates import cost
 from dew.nn.kernels.templates.gemm import mosaic_gpu
-from dew.nn.moe import expert_projection, grouped_matmul_kernel
+from dew.nn.moe import expert_projection
 from tools import grouped_oracle as oracle
 
 pytestmark = pytest.mark.kernel
@@ -113,14 +113,14 @@ def test_the_kernel_gradient_keeps_a_neighbours_non_finite_rows_out():
 
 
 def test_the_portable_branch_writes_each_gradient_from_the_rounded_operands():
-    """The kernels' portable branch (a CPU's, uninterpreted) differentiates the operands as the projection
-    rounded them: an fp16 master's largest value rounds to bf16's 65536, which fp16 does not hold, and the
-    input gradient through it is finite, each gradient rounded once to its operand's dtype."""
+    """The template's portable branch (a CPU's, uninterpreted) differentiates the operands as the
+    projection rounded them: an fp16 master's largest value rounds to bf16's 65536, which fp16 does not
+    hold, and the input gradient through it is finite, each gradient rounded once to its operand's
+    dtype."""
     x = jnp.ones((1, 1), jnp.float32)
     kernel = jnp.full((1, 1, 1), 65504, jnp.float16)
-    interpret_on_cpu = False
-    _, pullback = jax.vjp(lambda x, kernel: grouped_matmul.grouped_projection(
-        x, kernel, jnp.ones((1,), jnp.int32), jnp.bfloat16, interpret_on_cpu), x, kernel)
+    _, pullback = jax.vjp(lambda x, kernel: expert_projection(
+        x, kernel, jnp.ones((1,), jnp.int32), jnp.bfloat16, "auto", None), x, kernel)
     d_x, d_kernel = pullback(jnp.full((1, 1), 2.0 ** -16, jnp.bfloat16))
     np.testing.assert_array_equal(np.asarray(d_x), np.ones((1, 1), np.float32))
     np.testing.assert_array_equal(np.asarray(d_kernel), np.full((1, 1, 1), 2.0 ** -16, np.float16))
@@ -235,10 +235,12 @@ def test_a_forced_implementation_runs_or_says_why_it_cannot():
     """'xla' named runs XLA's ragged dot whatever the call asked; a kernel named for a product the
     kernels do not compute (fp32 above the default precision) raises with the reason rather than
     running XLA."""
-    with generation.chosen(grouped_matmul="xla"):
-        assert grouped_matmul_kernel("pallas", jnp.bfloat16, (jnp.bfloat16, jnp.float32), None) == "xla"
+    x, w, sizes = jnp.ones((8, 16), jnp.bfloat16), jnp.ones((2, 16, 16), jnp.float32), jnp.asarray([4, 4])
+    with generation.chosen(grouped_matmul="xla"), generation.routes() as taken:
+        expert_projection(x, w, sizes, jnp.bfloat16, "pallas", None)
+    assert {route.kernel for route in taken if route.choice == "grouped_matmul"} == {"xla"}
     with generation.chosen(grouped_matmul="triton"), pytest.raises(ValueError):
-        grouped_matmul_kernel("pallas", jnp.float32, (jnp.float32, jnp.float32), "highest")
+        expert_projection(x.astype(jnp.float32), w, sizes, jnp.float32, "pallas", "highest")
 
 
 @pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))

@@ -36,22 +36,11 @@ from dew.nn.dense import Dense
 from .activations import GatedActivation, gated_product, relu2, swiglu_clamped
 from .blocks import normal_kernel
 from .flops import MissingFlopsCount, counted_flops, projection_flops
-from .kernels.generation import backend, ran_kernel, route, triton_runs
-from .kernels.grouped_matmul import (
-    grouped_projection,
-    kernel_refusal,
-    portable_projection,
-    ragged_dot_refusal,
-)
+from .kernels.generation import ran_kernel, route
+from .kernels.grouped_matmul import portable_projection, ragged_dot_refusal
 from .kernels.selection import forced
-from .precision import (
-    asks_default_precision,
-    at_least_fp32,
-    float32_dot_general,
-    float32_einsum,
-    float32_products,
-    rounded_operand,
-)
+from .kernels.templates.gemm import template
+from .precision import at_least_fp32, float32_dot_general, float32_einsum, float32_products, rounded_operand
 from .protocols import ProjectionGroup, Routes, declared_groups
 from .sharding import (
     EXPERT_AXIS,
@@ -74,7 +63,7 @@ SCORE_FUNCTIONS = ('softmax', 'sigmoid', 'sqrtsoftplus')
 
 # 'pallas' is the kernels, each launch running the implementation its cost model picks or
 # `generation.chosen(grouped_matmul=...)` names ('triton', 'mosaic_gpu'); 'auto' is the kernels where they
-# run the call, else XLA (`grouped_matmul_kernel`).
+# run the call, else XLA (`expert_projection`, through the GEMM template).
 GROUPED_MATMULS = ('auto', 'xla', 'pallas')
 EXPERT_DISPATCHES = ('global', 'exchange')
 
@@ -422,38 +411,6 @@ class Router(nn.Module):
         return flat.reshape(selection.shape)
 
 
-def grouped_matmul_kernel(implementation: str, compute: Dtype, operands: tuple[Dtype, ...],
-                          precision: PrecisionLike) -> str:
-    """The one choice of grouped matmul: 'xla' or 'pallas', the kernels.
-
-    `generation.chosen(grouped_matmul=...)` decides first: 'xla' runs XLA, and a kernel's name
-    ('triton', 'mosaic_gpu') runs the kernels, each launch that implementation, or raises where they
-    cannot take the call. Otherwise 'xla' runs XLA, and 'auto' and 'pallas' the kernels where they run
-    on a GPU of sm80 or later whose generation states the tensor rate their cost model reads (or, for
-    'pallas', interpreted on a CPU) and compute the product exactly (`ragged_dot_refusal`);
-    elsewhere, a TPU's call above all, both run XLA, which `ran_kernel` reports with the reason.
-    XLA's ragged dot runs a product over every expert, 70 to 200 times the
-    kernels' time on an H100 at Qwen3-30B-A3B's and Kimi Linear's experts (GMM-h100-2), so where the
-    kernels run they are the choice. `operands` are the input and kernel dtypes as stored.
-    """
-    if implementation not in GROUPED_MATMULS:
-        raise ValueError(
-            f"implementation must be one of {list(GROUPED_MATMULS)}, got "
-            f"{implementation!r}")
-    named = forced('grouped_matmul')
-    if named == 'xla' or (named is None and implementation == 'xla'):
-        return route('grouped_matmul', kernel='xla').kernel
-    placed = triton_runs() or (implementation == 'pallas' and backend() == 'cpu')
-    refusal = ragged_dot_refusal(compute, operands, precision) or (
-        kernel_refusal(compute) if placed else "the Pallas kernels need a GPU of sm80 or later")
-    if refusal is None:
-        return 'pallas'
-    if named is not None:
-        raise ValueError(f"grouped_matmul's implementation {named!r} is chosen and does not run this call: "
-                         f"{refusal}")
-    return ran_kernel('grouped_matmul', 'xla', refusal)
-
-
 def gather_expert_bias(bias: jax.Array, expert_ids: jax.Array, dtype: Dtype) -> jax.Array:
     """Expert-major biases in compute dtype, with master-precision cotangent sums.
 
@@ -481,22 +438,42 @@ def expert_projection(x: jax.Array, kernel: jax.Array, group_sizes: jax.Array,
     dtype, an input gradient its input's, both accumulating over the widest of
     the compute, input and kernel dtypes, whatever the placement.
 
-    'xla' holds it in every differentiation mode (tangents on
-    `jax.lax.ragged_dot`); 'pallas' in first-order reverse mode
-    (`dew.nn.kernels.grouped_matmul`), and a trace the kernels cannot take
-    (`seen_whole`) runs 'xla'. tests/test_moe_precision.py measures it against
+    'xla' runs `jax.lax.ragged_dot`; 'auto' and 'pallas' the GEMM template
+    (`dew.nn.kernels.templates.gemm.template.gemm`), its launches where they run
+    the call (a GPU of sm80 on that states the tensor rate their cost model
+    reads, and for 'pallas' a CPU, which interprets them) and XLA's program
+    elsewhere, a TPU's above all, which the route reports with the reason; both
+    hold it in every differentiation mode. A product the kernels cannot compute
+    exactly (`ragged_dot_refusal`), or a trace they cannot take (`seen_whole`),
+    runs 'xla'; `generation.chosen(grouped_matmul=...)` decides first, a kernel's
+    name raising where it cannot run the call. XLA's ragged dot runs a product
+    over every expert, 70 to 200 times the kernels' time on an H100 at
+    Qwen3-30B-A3B's and Kimi Linear's experts (GMM-h100-2), so where the kernels
+    run they are the choice. tests/test_moe_precision.py measures it against
     float64 sums and three Adam steps on every expert/fsdp layout.
 
     `layer`, an integer scalar where given, makes `kernel` a bank of layers'
     expert matrices, `[layers, experts, in, out]`, whose layer the kernels read
-    in place (`grouped_projection`), a scanned stack's with no copy a step.
+    in place (`template.gemm`'s `rhs_index`), a scanned stack's with no copy a step.
     """
+    if implementation not in GROUPED_MATMULS:
+        raise ValueError(f"implementation must be one of {list(GROUPED_MATMULS)}, got {implementation!r}")
     compute = canonicalize_dtype(x, kernel, dtype=dtype)
     resolved = float32_products(compute, precision)
-    chosen = grouped_matmul_kernel(implementation, compute, (x.dtype, kernel.dtype), resolved)
-    if chosen == 'pallas' and seen_whole(x) and seen_whole(kernel):
-        return grouped_projection(x, kernel, group_sizes, compute, implementation == 'pallas',
-                                  not asks_default_precision(resolved, configured=True), layer)
+    named = forced('grouped_matmul')
+    refusal = ragged_dot_refusal(compute, (x.dtype, kernel.dtype), resolved)
+    if named == 'xla' or (named is None and implementation == 'xla'):
+        route('grouped_matmul', kernel='xla')
+    elif refusal is not None and named is not None:
+        raise ValueError(f"grouped_matmul's implementation {named!r} is chosen and does not run this call: "
+                         f"{refusal}")
+    elif refusal is not None:
+        ran_kernel('grouped_matmul', 'xla', refusal)
+    elif seen_whole(x) and seen_whole(kernel):
+        # The GEMM template: its launches where they run the call (each reports its route), XLA's
+        # program elsewhere, differentiable at every order.
+        return template.gemm(x, kernel, group_sizes, compute=compute, out_dtype=compute, precision=resolved,
+                             interpret_on_cpu=implementation == 'pallas', rhs_index=layer)
     if layer is not None:
         kernel = jax.lax.dynamic_index_in_dim(kernel, layer, keepdims=False)
     return portable_projection(x, kernel, group_sizes, dtype, resolved)

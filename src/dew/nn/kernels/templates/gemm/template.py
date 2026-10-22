@@ -47,7 +47,8 @@ LAUNCH_AXES = {'prologue': ('rows', 'depth'), 'epilogue': ('rows', 'columns')}
 def gemm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None = None, *, transpose_rhs: bool = False,
          prologue=None, prologue_operands: tuple = (), epilogue=None, epilogue_operands: tuple = (),
          out_dtype, out_dtypes: tuple | None = None, precision: PrecisionLike = None,
-         interpret_on_cpu: bool = False, prologue_vjp=None, rhs_index: jax.Array | None = None):
+         interpret_on_cpu: bool = False, prologue_vjp=None, rhs_index: jax.Array | None = None,
+         compute=None):
     """Each group's rows of `lhs` times its matrix of `rhs`, through the hooks (the module's docstring):
     `[rows, width]` in `out_dtype`, or a tuple in `out_dtypes`. A `precision` above the default
     (explicitly or through `jax_default_matmul_precision`) sums an fp32 output in IEEE fp32, in XLA as in
@@ -58,10 +59,16 @@ def gemm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None = None, *
     where given, makes `rhs` a bank of layers' matrices (a leading axis before the groups', or before the
     matrix's for a dense product) whose layer `rhs_index` the launches read in place, where slicing it out
     would copy it every call (a scanned layer stack's); its derivative is the bank's, zero but at the
-    layer. A bank of another dtype than `lhs`'s is cast a layer at a time."""
+    layer. A bank of another dtype than the products' is cast a layer at a time. `compute`, where given,
+    is the dtype the products take, `lhs` rounded to it as `rhs` is, where `lhs`'s own dtype is what its
+    cotangent takes, summed in fp32 and rounded once to it (an fp32 input's of a bf16 product); no
+    prologue then."""
+    if compute is not None and jnp.dtype(compute) != lhs.dtype and prologue is not None:
+        raise ValueError(f"a prologue's {lhs.dtype} operand is multiplied in its own dtype, not {compute}")
+    compute = jnp.dtype(lhs.dtype if compute is None else compute)
     dense = group_sizes is None
     layers = ()
-    if rhs_index is not None and rhs.dtype != lhs.dtype:
+    if rhs_index is not None and rhs.dtype != compute:
         rhs = jax.lax.dynamic_index_in_dim(rhs, rhs_index, keepdims=False)  # cast one layer, not the bank
     elif rhs_index is not None:
         layers = (jnp.asarray(rhs_index, jnp.int32),)
@@ -74,12 +81,14 @@ def gemm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None = None, *
              'dense': dense}
 
     def value(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays, layers):
-        return _gemm(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, epilogue,
-                     epilogue_arrays, epilogue_axes, dtypes, several=several, layers=layers, **plain)
+        return _gemm(lhs.astype(compute), rhs, group_sizes, prologue, prologue_arrays, prologue_axes,
+                     epilogue, epilogue_arrays, epilogue_axes, dtypes, several=several, layers=layers,
+                     **plain)
 
     def portable(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays, layers):
-        return _portable_gemm(lhs, _layer_of(rhs, layers), group_sizes, prologue, prologue_arrays, epilogue,
-                              epilogue_arrays, dtypes, several, transpose_rhs, precision)
+        return _portable_gemm(lhs.astype(compute), _layer_of(rhs, layers), group_sizes, prologue,
+                              prologue_arrays, epilogue, epilogue_arrays, dtypes, several, transpose_rhs,
+                              precision)
 
     def forward(*operands):
         return value(*operands), ()
@@ -92,35 +101,36 @@ def gemm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None = None, *
         acc_shape = (lhs.shape[0], rhs.shape[1] if transpose_rhs else rhs.shape[2])
         if epilogue is None:
             d_acc, d_epilogue = cotangents[0], ()
-            narrow = jnp.promote_types(cotangents[0].dtype, lhs.dtype) == lhs.dtype
+            narrow = jnp.promote_types(cotangents[0].dtype, compute) == compute
         else:
             if _reads_accumulator(epilogue, acc_shape, epilogue_arrays):
-                acc = _gemm(lhs, bank, group_sizes, prologue, prologue_arrays, prologue_axes, None, (), (),
-                            (jnp.dtype(jnp.float32),), several=False, layers=layers, **plain)
+                acc = _gemm(lhs.astype(compute), bank, group_sizes, prologue, prologue_arrays, prologue_axes,
+                            None, (), (), (jnp.dtype(jnp.float32),), several=False, layers=layers, **plain)
             else:
                 acc = jnp.zeros(acc_shape, jnp.float32)
             outs, pull = jax.vjp(functools.partial(_tupled, epilogue), acc, *epilogue_arrays)
             d_acc, *d_epilogue = pull(tuple(c.astype(out.dtype)
                                             for c, out in zip(cotangents, outs, strict=True)))
-            narrow = _passes_cotangent(epilogue, acc_shape, epilogue_arrays, dtypes, lhs.dtype)
+            narrow = _passes_cotangent(epilogue, acc_shape, epilogue_arrays, dtypes, compute)
         # The accumulator's cotangent meets the forward's rounded operands as the portable program's
-        # derivative has it: in `lhs`'s dtype where that holds it exactly (a cotangent no wider, passed
-        # through), wide otherwise, each product rounding once.
-        work = lhs.dtype if narrow else jnp.promote_types(d_acc.dtype, jnp.float32)
+        # derivative has it: in the products' dtype where that holds it exactly (a cotangent no wider,
+        # passed through), wide otherwise, each product rounding once.
+        work = compute if narrow else jnp.promote_types(d_acc.dtype, jnp.float32)
         d_product = d_acc.astype(work)
-        # A bank is of `lhs`'s dtype (`gemm`), its layer read in place again.
-        matrix = bank.astype(lhs.dtype)
+        # A bank is of the products' dtype (`gemm`), its layer read in place again.
+        matrix = bank.astype(compute)
         # The cotangent of the operand the forward multiplied, `prologue(lhs)` rounded to `lhs`'s dtype.
         d_operand = jnp.asarray(_gemm(d_product, matrix, group_sizes, None, (), (), None, (), (),
                                       (jnp.dtype(lhs.dtype),), several=False, transpose_rhs=not transpose_rhs,
                                       interpret_on_cpu=interpret_on_cpu, precision=precision, dense=dense,
                                       layers=layers))
         if narrow:
-            d_rhs = gemm_t(lhs, d_product, None if dense else group_sizes, prologue=prologue,
+            d_rhs = gemm_t(lhs.astype(compute), d_product, None if dense else group_sizes, prologue=prologue,
                            prologue_operands=tuple(zip(prologue_arrays, prologue_axes, strict=True)),
                            out_dtype=rhs.dtype, precision=precision, interpret_on_cpu=interpret_on_cpu)
         else:
-            operand = lhs if prologue is None else prologue(lhs, *prologue_arrays).astype(lhs.dtype)
+            operand = (lhs.astype(compute) if prologue is None
+                       else prologue(lhs, *prologue_arrays).astype(lhs.dtype))
             d_rhs = gemm_t(operand.astype(work), d_product, None if dense else group_sizes,
                            out_dtype=rhs.dtype, precision=precision, interpret_on_cpu=interpret_on_cpu)
         d_rhs = jnp.swapaxes(d_rhs, 1, 2) if transpose_rhs else d_rhs
