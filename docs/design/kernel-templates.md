@@ -53,7 +53,7 @@ Coordinates and row vectors come from the toolkit, because Mosaic GPU iotas need
 - Functions:
   - `modify(s, coords, params)`: the score hooks plus the partial-block mask;
   - `peak(m, s) -> (m', alpha[, rescale?])`: FA4's lazy rescale is an option of `peak`;
-  - `weights(s, m') -> p`, in base 2 with log2(e) folded into the scale;
+  - `weights(s, m') -> p`, in base 2 with log2(e) folded into the scale by default, or natural (see "The exponent's forms" below); a logit at its row's maximum weighs 1 exactly, however a compiler contracts its scaling into the subtraction;
   - a weights hook between `weights` and `narrow`, for scales along P·V's contraction (a quantized V's per-token scales), which no output or product scale can apply;
   - `narrow(p) -> p16`, or `(p8, scale)` for FP8;
   - `total(l, alpha, p)`;
@@ -62,6 +62,13 @@ Coordinates and row vectors come from the toolkit, because Mosaic GPU iotas need
 - Q and K prologues are hooks: RoPE and QK-norm. MLA's q·W_uk is a declared product, not a hook.
 - **Partial state:** an unhooked `Partial(acc, m, l)`, wide enough for its role (fp32), with an empty identity and an ordered, associative `merge`. Split-KV decode, ring and context parallelism, chunked prefill and resumed state all produce and merge Partials. Sinks and the resumed state enter exactly once (today's `_first_slice_sink` rule). `finish(partial) -> (out, lse)` and the output hooks run once, after the final merge, because a pointwise output hook doesn't distribute over a merge. The Partial has its own residuals and VJP, separate from the finished output.
 - Every function stays valid on value-width slices, for MLA's Dv 512 and d256 split across consumer warpgroups.
+- **Headroom:** the weighted values can pass fp32's largest only where the values are near it. A program walks as ever and checks once, at its end, whether a row's sums overflowed. Only such a program walks again with a per-row power-of-two shift on its weights (`room`), exact and leaving every ratio. Its residual carries the shift to the backward's split sums. A call whose values can't overflow (fp16, no initial state) compiles no check.
+
+**The exponent's forms.** The default folds log2(e) into the scale (exp2 of `s·c − m`), FA2's and jax's mha arithmetic; `natural=` keeps the reference's natural logits (`natural_exp`, exp2 of the difference times log2(e)). Both pass check 1 on drawn inputs and the stability suite (tests/test_attention_stability.py). The fold's divergences, which run natural alone there:
+- logits a ulp apart near 2^30, at scales below 1: the fold rounds each logit at log2(e) times its size, so two the reference keeps apart can tie, and a large cotangent then overflows the backward;
+- logits near 1e30: the backward takes the base-2 maximum back to natural units, which moves the anchor's own weight away from 1.
+
+The fold needs `scale·log2(e) < 1`, so every folded logit is an ulp of fp32's largest below it, and an initial maximum (a sink) past fp32's largest in base 2 saturates exactly (`base2_maximum`).
 
 **Backward.**
 - Products: dP = dO·Vᵀ, dV += Pᵀ·dO, dK += dSᵀ·Q, dQ += dS·K, plus whatever D's form needs.
