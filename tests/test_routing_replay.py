@@ -16,7 +16,14 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact
+import reference_error as _gate
+
+
+def assert_as_exact(dew_fn, reference_fn, draw, label, *, seeds, truth_fn=None):
+    count = _gate.seeds_for(reference_fn, draw, label, truth_fn=truth_fn)
+    print(f"SIZED {label!r} {count}", flush=True)
+    _gate.assert_as_exact(dew_fn, reference_fn, draw, label, seeds=count, truth_fn=truth_fn)
+    print(f"PASSED {label!r}", flush=True)
 
 from dew.inference.banks import HeldBanks
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -177,16 +184,14 @@ def test_the_gate_keeps_its_gradient_under_replay():
         pair = jnp.concatenate([routed, (routed + 1) % EXPERTS], axis=-1)
         return params, tokens_of(2, seed=1000 + seed), pair
 
-    def central(step):
-        # Looped over the kernel's entries: the experts' ragged product has no batching rule past its
-        # first dimension.
-        def differentiate(loss):
-            def run(kernel):
-                basis = step * jnp.eye(kernel.size, dtype=kernel.dtype).reshape(-1, *kernel.shape)
-                return jax.lax.map(lambda nudge: (loss(kernel + nudge) - loss(kernel - nudge)) / (2 * step),
-                                   basis).reshape(kernel.shape)
-            return run
-        return differentiate
+    def forward(loss):
+        # A directional derivative a kernel entry at a time, looped: the experts' ragged product has
+        # no batching rule past its first dimension.
+        def run(kernel):
+            basis = jnp.eye(kernel.size, dtype=kernel.dtype).reshape(-1, *kernel.shape)
+            return jax.lax.map(lambda tangent: jax.jvp(loss, (kernel,), (tangent,))[1], basis).reshape(
+                kernel.shape)
+        return run
 
     def gradient(obj, differentiate):
         def run(params, tokens, routed):
@@ -194,14 +199,14 @@ def test_the_gate_keeps_its_gradient_under_replay():
                 layer = params['params']['layers_1']
                 tree = {**params, 'params': {**params['params'], 'layers_1': {
                     **layer, 'mlp': {**layer['mlp'], 'gate': {'kernel': kernel}}}}}
-                return jnp.sum(replayed_log_probs(obj, tree, tokens, (routed, None)))
+                return -jnp.sum(obj.token_scores(tree, tokens, routes=(routed, None), logits=True).losses)
             return differentiate(loss)(params['params']['layers_1']['mlp']['gate']['kernel'])
         return jax.jit(run)
 
     backward = gradient(obj, jax.grad)
     assert float(jnp.abs(backward(*draw(0))).sum()) > 0
-    assert_as_exact(backward, gradient(obj, central(1e-3)), draw, "gate gradient", seeds=SEEDS['gate'],
-                    truth_fn=gradient(wide, central(1e-6)))
+    assert_as_exact(backward, gradient(obj, forward), draw, "gate gradient", seeds=SEEDS['gate'],
+                    truth_fn=gradient(wide, forward))
 
 
 @pytest.mark.parametrize("parallel", [False, True], ids=["router", "gemma4"])
