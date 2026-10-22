@@ -81,6 +81,10 @@ class RecordSlice:
         """Whether the record at `position` among its source's is in this slice."""
         return self.start <= position and (self.stop is None or position < self.stop)
 
+    def admitted(self, records: int) -> None:
+        """Refuse a slice past the `records` it was offered (`bounds`)."""
+        self.bounds(records)
+
     def bounds(self, records: int) -> tuple[int, int]:
         """The first and the one past the last of `records` it keeps, refusing a slice past them."""
         stop = records if self.stop is None else self.stop
@@ -171,6 +175,9 @@ class HashPart:
     def admits(self, position: int, row: Batch | bytes | None) -> bool:
         """Whether this part holds `row`, wherever it is (`keeps`)."""
         return self.keeps(row)
+
+    def admitted(self, records: int) -> None:
+        """Any number of rows holds a hash part."""
 
     def metadata(self) -> Mapping[str, object]:
         return _uncounted(self.source.metadata())
@@ -348,8 +355,9 @@ class SelectedGeneration:
                             f"generation {self.generation.url} holds input {entry['id']}, which "
                             f"{self.stored.describe()} doesn't name by its {self.placing} read here (a "
                             "stream names its inputs by where it read their shards, a memory or indexed read "
-                            "by their place), so the holdout written before it can't pick its inputs from "
-                            "it; publish it from an indexed read, or read it where it was filled")
+                            "by their place), so the holdout written before it can't pick its inputs "
+                            "from it; read it where it was filled, or publish it again from a "
+                            f"{self.placing} read")
                 if kept:
                     dense.append(index)
                 index += 1
@@ -386,8 +394,7 @@ class SelectedGeneration:
                     break
             yield _row_key(row_id), admitted
         for level, selection in enumerate(inner):
-            if isinstance(selection, RecordSlice):
-                selection.bounds(reached[level])
+            selection.admitted(reached[level])
 
 
 @dataclasses.dataclass(frozen=True)

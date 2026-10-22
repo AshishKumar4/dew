@@ -36,11 +36,11 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   without the cache: the generation stands in for the inputs each part keeps,
   by hash (by a field the cached step drops too) or by records, over missing
   rows and steps that drop or expand them. A records holdout over a
-  generation a stream filled is served where the store streams its records
-  in index order (memory, token, TFDS, Grain, Arrow and generation stores),
-  and refused for files that stream in an order of their own: publish those
-  from an indexed read. A step that reads its record's index there is
-  refused, naming `Cache(url)`. A holdout part is named by
+  generation a stream filled is served where the store states that its stream
+  reads its records in index order (in-memory, token, TFDS, PyTorch, Grain
+  and Arrow datasets, generations), and refused otherwise: publish those from
+  a memory read, or an indexed one (`provision=True`). A step that reads its
+  record's index there is refused, naming `Cache(url)`. A holdout part is named by
   what it selects of its source's identity, so selections stacked on one
   another stay apart; a data position saved over a holdout part before is
   refused as its source changed, and a generation published from one no
