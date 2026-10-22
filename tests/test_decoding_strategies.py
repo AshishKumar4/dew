@@ -9,7 +9,7 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from jax.experimental import checkify
-from model_support import decoder, greedy_walk as walk
+from model_support import greedy_walk as walk, initialized_decoder
 
 from dew.sampling import Beam, Sample, Sampling, decoding, generate
 from dew.sampling.decoding import StepState
@@ -77,8 +77,7 @@ def test_terminal_greedy_still_refuses_an_undefined_processed_distribution(inval
 
 @pytest.fixture(scope="module")
 def model():
-    module = decoder()
-    return module, module.init(jax.random.key(0), jnp.ones((1, 2), jnp.int32))
+    return initialized_decoder()
 
 
 
