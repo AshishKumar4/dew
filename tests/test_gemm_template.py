@@ -17,7 +17,7 @@ from jax.sharding import AbstractDevice, AbstractMesh, AxisType, Mesh
 from reference_error import assert_as_exact
 
 from dew.nn.kernels import generation, grouped_matmul, tuning
-from dew.nn.kernels.templates import product
+from dew.nn.kernels.templates import hopper, product
 from dew.nn.kernels.templates.gemm import fused, mosaic_gpu, template, triton_dense
 
 pytestmark = pytest.mark.kernel
@@ -184,7 +184,7 @@ def test_the_template_holds_check_1_with_its_hooks(generation_name, case):
 
 
 COOPERATIVE = mosaic_gpu.Tiles(128, 128, 64, 3, 1, warpgroups=2)
-"""A tile two consumer warpgroups compute (a cluster the interpreter does not model)."""
+"""A tile two consumer warpgroups compute, on one multiprocessor (the interpreter models no cluster)."""
 
 
 MOSAIC_RAN = {'mosaic_gpu'} if jax.default_backend() == 'cpu' else {'mosaic_gpu', 'triton'}
@@ -1075,12 +1075,14 @@ def test_a_cooperative_tiles_exact_sums_add_as_its_plain_sum_does():
 
 
 def test_a_tile_states_a_schedule_the_kernels_run():
-    """A pair of multiprocessors needs two warpgroups; a warpgroup count or cluster outside one or two is
-    refused where the tile is made; the kernel gradient's schedule is one multiprocessor's, so its space
-    holds no pair and a direct kernel gradient refuses one."""
-    for fields in ({"warpgroups": 1, "cluster": 2}, {"warpgroups": 3}, {"warpgroups": 2, "cluster": 4}):
+    """A pair of multiprocessors needs two warpgroups, which stream at least two stages; a warpgroup count
+    or cluster outside one or two is refused where the tile is made; the kernel gradient's schedule is one
+    multiprocessor's, so its space holds no pair and a direct kernel gradient refuses one."""
+    for fields in ({"warpgroups": 1, "cluster": 2}, {"warpgroups": 3}, {"warpgroups": 2, "cluster": 4},
+                   {"warpgroups": 2, "stages": 1}):
         with pytest.raises(ValueError):
-            mosaic_gpu.Tiles(128, 128, 64, 3, 1, **fields)
+            mosaic_gpu.Tiles(**{"block_m": 128, "block_n": 128, "block_k": 64, "stages": 3, "grid_block_n": 1}
+                             | fields)
     launch = grouped_matmul.MosaicTgmm()
     bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
     with generation.assumed("sm90"):
@@ -1143,7 +1145,7 @@ def test_exact_sums_go_to_fp32_outputs_at_a_precision_above_the_default():
         assert mosaic_gpu.Tiles(128, 128, 64, 3, 1, warpgroups=2) in kept  # 128 registers a thread
         assert mosaic_gpu.Tiles(128, 256, 64, 3, 1, warpgroups=2) not in kept  # 256
         assert kept and all(2 * tile.block_m * tile.block_n // (128 * tile.warpgroups)
-                            < (grouped_matmul.CONSUMER_REGISTERS if tile.warpgroups == 2 else 255)
+                            < (hopper.CONSUMER_REGISTERS if tile.warpgroups == 2 else 255)
                             for tile in kept)
         assert set(kept) < set(launch.fitting(plain, target))
         # Triton's kernel gradient with exact sums takes at most EXACT_STEP rows a step.

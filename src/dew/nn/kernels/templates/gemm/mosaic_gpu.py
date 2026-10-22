@@ -78,6 +78,9 @@ class Tiles:
                              "multiprocessors")
         if self.warpgroups == 2 and (self.block_n % 2 or self.block_m % 2):
             raise ValueError(f"{self}: two warpgroups halve the tile's columns and rows")
+        if self.warpgroups == 2 and self.stages < 2:
+            # A stage is released a step late (an MMA in flight), so one stage would wait on itself.
+            raise ValueError(f"{self}: two warpgroups stream at least two stages")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -405,7 +408,7 @@ def _gmm_pipeline(tiles: Tiles, transpose_rhs: bool, steps: int, side_axes: tupl
     return plgpu.emit_pipeline_warp_specialized(
         body,
         grid=(steps,),
-        memory_registers=40,
+        memory_registers=hopper.PRODUCER_REGISTERS,
         in_specs=[plgpu.BlockSpec((tiles.block_m, tiles.block_k), lambda step: (0, step),
                                   memory_space=plgpu.SMEM, delay_release=_IN_FLIGHT),
                   plgpu.BlockSpec(rhs_block, _rhs_index(transpose_rhs), memory_space=plgpu.SMEM,
@@ -451,7 +454,8 @@ def _finish_half(acc, epilogue, sides: tuple, outs: tuple, place: tuple, wg) -> 
 _IN_FLIGHT = 1
 """The MMAs the cooperative kernels keep in flight while they prepare the next stage. A pipeline's last
 stage is released one step late, past its end, so a persistent kernel's producer would load the next
-tile's first stages over one an MMA still reads: the consumers report each tile drained (`_drain`)."""
+tile's first stages over one an MMA still reads: the consumers report each tile drained (`hopper.drain`;
+a ring's producer waits for each slot's last release, `hopper.Ring.drain`)."""
 
 
 def _split(refs: tuple, prologue: int, epilogue: int) -> tuple:
@@ -549,8 +553,9 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles
                     lhs_smem[...] = prologue(lhs_smem[...], *(side[...] for side in side_smems)).astype(
                         lhs_smem.dtype)
                     plgpu.commit_smem()
-                _zero_neighbours(lhs_smem, rhs_smem, block_idx, group_starts_gmem[g_i],
-                                 group_ends_gmem[g_i], group_num_blocks_gmem[g_i], tiles)
+                _zero_neighbours_of((lhs_smem, rhs_smem), block_idx, group_starts_gmem[g_i],
+                                    group_ends_gmem[g_i], group_num_blocks_gmem[g_i], tiles.block_k)
+                plgpu.commit_smem()
 
             pipeline = functools.partial(
                 plgpu.emit_pipeline, grid=(group_num_blocks_gmem[g_i],),
@@ -675,7 +680,8 @@ def _tgmm_cooperative(operands: tuple, groups: tuple, shape: tuple, *, tiles: Ti
                     g_i, depth, columns, _, steps = tile(loop)
                     start, end = starts_gmem[g_i], ends_gmem[g_i]
                     fixed_views = [side_gmems[i].at[tuple(depth for _ in prologue_axes[i])] for i in fixed]
-                    hopper.load_fixed(fixed_views, fixed_refs, fixed_barriers, wg)
+                    # An empty group's tile reads none (`_streamed_gradient` stores its zeros).
+                    pl.when(steps > 0)(lambda: hopper.load_fixed(fixed_views, fixed_refs, fixed_barriers, wg))
                     _streamed_gradient(
                         lambda counter, step: _staged_halves(
                             [ring.acquire(counter) for ring in streams], (step, start, end, steps, block_k),
@@ -803,22 +809,6 @@ def _tgmm_sides(side_gmems, axes_of, gmem_slice, m_i, tiles: Tiles) -> tuple[lis
     return [spec(axes) for axes in axes_of], views
 
 
-def _zero_neighbours(lhs_smem, rhs_smem, block_idx, start, end, blocks, tiles: Tiles) -> None:
-    """Dew: the first and last blocks of a group may hold a neighbour's rows, which both operands zero by
-    selection, so a neighbour's NaN or infinity stays out."""
-    @pl.when(block_idx == 0)
-    def _():
-        start_index = lax.rem(start, tiles.block_k)
-        _zero_rows(lhs_smem, rhs_smem, lambda rows: rows >= start_index, tiles.block_k, tiles.block_m,
-                   tiles.block_n)
-
-    @pl.when(block_idx == blocks - 1)
-    def _():
-        last_index = lax.rem(end - 1, tiles.block_k)
-        _zero_rows(lhs_smem, rhs_smem, lambda rows: rows <= last_index, tiles.block_k, tiles.block_m,
-                   tiles.block_n)
-
-
 def _summed_gradient(pipeline, operands, staged, tile, nonempty, tiles: Tiles) -> None:
     """Dew: a kernel gradient tile's sum over its group's row steps, each step's product into one
     accumulator by the warpgroup MMA, stored to `tile`; an empty group's zero."""
@@ -890,13 +880,3 @@ def _rows_padded(array: jax.Array, axis: int = 0) -> jax.Array:
 def _side_padded(side: jax.Array, axes: tuple) -> jax.Array:
     """A side operand padded as the rows are along the dimension that follows them, wherever it is."""
     return _rows_padded(side, axes.index('rows')) if 'rows' in axes else side
-
-
-def _zero_rows(lhs_smem, rhs_smem, kept, block_k: int, block_m: int, block_n: int) -> None:
-    """Zero the rows of both staged blocks, `[block_k, block_m]` and `[block_k, block_n]`, that `kept`
-    (of each row's index) turns down, by selection."""
-    for ref, columns in ((lhs_smem, block_m), (rhs_smem, block_n)):
-        values = ref[...]
-        rows = plgpu.layout_cast(lax.broadcasted_iota(jnp.int32, (block_k, columns), 0), plgpu.Layout.WGMMA)
-        ref[...] = jnp.where(kept(rows), values, jnp.zeros_like(values))
-    plgpu.commit_smem()
