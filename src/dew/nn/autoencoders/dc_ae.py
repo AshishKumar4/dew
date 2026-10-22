@@ -25,7 +25,8 @@ import jax.numpy as jnp
 from flax.typing import Dtype
 
 from dew import records
-from dew.interop.components import bind_component, component_source
+from dew.interop.components import bind_component
+from dew.interop.weights import indexed_path
 from dew.nn.dense import Dense
 from dew.objectives.base import Variables
 
@@ -34,7 +35,7 @@ from ..attention import rms_normalized
 from ..conv import Conv
 from ..precision import at_least_fp32, float32_dot_general, float32_products
 from ..scan_orders import pixel_shuffle, pixel_unshuffle
-from .api import ModuleAutoEncoder
+from .api import LatentNormalization, ModuleAutoEncoder, published_source
 
 if TYPE_CHECKING:
     from dew.interop.streaming import WeightLayout
@@ -42,6 +43,10 @@ if TYPE_CHECKING:
 _EPS = 1e-5
 _ATTENTION_EPS = 1e-15
 _ACTIVATIONS = {"relu": nn.relu, "relu6": nn.relu6, "silu": nn.silu}
+
+
+PUBLISHED = ("AutoencoderDC",)
+"""The `_class_name` a published AutoencoderDC's config states."""
 
 
 class _RMSNorm(nn.Module):
@@ -484,12 +489,7 @@ def dc_ae_path(name: str, ndim: int) -> tuple[str, ...] | None:
     ranks = (2, 4) if leaf == "weight" and not norm else (1,)
     if ndim not in ranks:
         raise ValueError(f"{name!r} has {ndim} axes, not {' or '.join(map(str, ranks))}")
-    path: list[str] = []
-    for part in parts:
-        if part.isdigit():
-            path[-1] = f"{path[-1]}_{part}"
-        else:
-            path.append("per_head" if part == "proj_out" else part)
+    path = indexed_path("per_head" if part == "proj_out" else part for part in parts)
     if leaf == "weight":
         leaf = "scale" if norm else "kernel"
     return (*path, leaf)
@@ -499,20 +499,17 @@ class DCAutoencoder(ModuleAutoEncoder[DCAE]):
     """Native DC-AE weights and the pipeline's latent scaling,
     `z * scaling_factor` on the way out and `z / scaling_factor` on the way in."""
 
-    record_name = 'dc_ae'
-    record_module = DCAE
-
     def __init__(self, *, model: DCAE, params: Variables, latent_scale: float, latent_shift: float = 0.0):
         super().__init__(model, params)
-        self.latent_scale = latent_scale
-        self.latent_shift = latent_shift
+        self.normalization = LatentNormalization({'latent_scale': latent_scale, 'latent_shift': latent_shift},
+                                                 latent_shift, latent_scale)
 
     @property
     def stochastic(self) -> bool:
         return False
 
     def record_arguments(self) -> dict:
-        return {'latent_scale': self.latent_scale, 'latent_shift': self.latent_shift}
+        return dict(self.normalization.record)
 
 
 def load_dc_ae(name_or_dir: str | Path, compute=jnp.float32, *, revision: str | None = None,
@@ -528,9 +525,7 @@ def load_dc_ae(name_or_dir: str | Path, compute=jnp.float32, *, revision: str | 
     Supplied `params` are bound unchanged: only the config is read, and no
     source layouts are returned. `lazy` leaves read ones `SourceLeaf`s for a
     placement to read (`dew.interop.weights.record_layouts`)."""
-    directory, config = component_source(name_or_dir, revision, subfolder, weights=params is None)
-    if config.get("_class_name") != "AutoencoderDC":
-        raise ValueError(f"{directory} holds a {config.get('_class_name')}, not an AutoencoderDC")
+    directory, config = published_source(name_or_dir, revision, subfolder, PUBLISHED, weights=params is None)
     model = DCAE(**dc_ae_fields(config), dtype=compute)
     frame = jax.ShapeDtypeStruct((1, model.downscale_factor, model.downscale_factor, model.image_channels),
                                  jnp.float32)
