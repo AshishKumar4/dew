@@ -5,8 +5,8 @@ computes. The kernel is written for TPU (a GPU runs mamba_ssm's own kernels,
 `dew.nn.kernels.mamba_ssd`); a host without one runs it through
 `pallas_call(interpret=True)`, which checks the exact contracts: shapes, dtypes, finiteness, resets and
 state gradients. Its numbers are the TPU's: check 1 holds every geometry, the host's among them, where
-the kernel runs (`test_the_kernel_is_as_exact_as_the_xla_scan`, the TPU tier; 11 passed on a v5e,
-2026-10-21). An interpreted kernel's numbers on a CPU are XLA:CPU's dot lowering, not the kernel's, and
+the kernel runs (`test_the_kernel_is_as_exact_as_the_xla_scan` in this file, on the TPU tier; 11 passed on
+a v5e). An interpreted kernel's numbers on a CPU are XLA:CPU's dot lowering, not the kernel's, and
 follow the host's ISA: the one-short state-gradient RMS ratio was 1.598 (99.9% interval [1.581, 1.617],
 640 seeds) on AMD x86-64-v4 against 0.77 on v3, so no CPU check judges them (ledger row 1322).
 
@@ -260,8 +260,8 @@ SEEDS = {
     ("shape", ((1, 1024, 4, 64, 64, 1), 128)): 64,
     ("shape", ((1, 4096, 4, 64, 64, 1), 128)): 256,
 }
-"""Sized by seeds_for on XLA's output, final state and all five gradients (2026-10-20, armada), and
-resolving at these counts against the TPU's own XLA on a v5e (11 cases, 2026-10-21)."""
+"""Sized by seeds_for on XLA's output, final state and all five gradients (on armada), and resolving at
+these counts against the TPU's own XLA on a v5e (11 cases)."""
 
 
 on_device = pytest.mark.tpu(reason="needs a tpu, the one backend the kernel is chosen on")
