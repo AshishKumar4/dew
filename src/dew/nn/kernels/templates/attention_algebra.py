@@ -58,8 +58,8 @@ class Forward:
         of their difference (`natural_exp`), as the reference's. The fold rounds each logit at log2(e)
         times its size, so logits the reference keeps apart can tie: keys of 2 * 1610613120 and 2 * 1610612992
         under a query of 1 at scale 0.5 weigh 1 and 0 in the reference and 0.5 each folded, and a
-        cotangent of 2**125 then overflows its backward (docs/design/kernel-templates.md, the forms'
-        divergences). On drawn inputs both forms pass check 1."""
+        cotangent of 2**125 then overflows its backward (docs/design/kernel-templates.md, §3, the
+        exponent's forms). On drawn inputs both forms pass check 1."""
         return not self.natural and self.score_mod is None and self.scale * LOG2E < 1.0
 
     @property

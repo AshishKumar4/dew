@@ -8,8 +8,8 @@ check 1 (`reference_error.assert_as_exact`) against the reference written apart 
 (`attention_oracle.anchored_softmax`); a row that sees no key is an exact claim, its output and
 gradients zero. Each family runs with the logits natural and with the default
 (`dew.nn.kernels.templates.attention.NATURAL`), which folds log2(e) into the scale where the scale
-allows; the fold's documented divergences (`algebra.Forward.base2`; docs/design/kernel-templates.md, the
-forms' divergences) run natural alone."""
+allows; the fold's documented divergences (`algebra.Forward.base2`; docs/design/kernel-templates.md, §3,
+the exponent's forms) run natural alone."""
 
 import dataclasses
 from collections.abc import Callable
