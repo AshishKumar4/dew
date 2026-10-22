@@ -69,3 +69,23 @@ def test_fused_attention_refuses_sinks_by_name(implementation):
     with pytest.raises(ValueError):
         scaled_dot_product_attention(heads, heads, heads,
                                      implementation=implementation, sinks=jnp.zeros(2))
+
+
+@pytest.mark.parametrize("heads, kv_heads", [(4, 1), (4, 2)], ids=["shared", "grouped"])
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.float16])
+def test_a_masked_key_weighs_nothing_beside_a_sink_however_low_its_logit(heads, kv_heads, dtype):
+    """Beside a sink a masked key is out of the softmax: a row whose every key is masked attends the
+    sink alone and reads nothing, even where the sink's logit sits at or below the dtype's most
+    negative finite value, where a finite floor let every masked key share the row."""
+    from dew.nn.attention import reference_attention
+
+    query = jax.random.normal(jax.random.key(0), (1, 3, heads, 8), dtype)
+    key, value = (jax.random.normal(jax.random.key(seed), (1, 5, kv_heads, 8), dtype) for seed in (1, 2))
+    mask = jnp.zeros((1, 1, 3, 5), bool).at[..., :2, :].set(True)
+    # At float32's most negative finite logit, or below float16's, where a finite floor ties the sink.
+    sinks = jnp.full((heads,), float(jnp.finfo(dtype).min) * (2 if dtype == jnp.float16 else 1), jnp.float32)
+    out = reference_attention(query, key, value, mask=mask, sinks=sinks)
+    assert out.dtype == dtype
+    np.testing.assert_array_equal(np.asarray(out[:, 2]), 0)
+    assert bool(jnp.all(jnp.isfinite(out)))
+

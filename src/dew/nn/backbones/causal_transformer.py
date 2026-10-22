@@ -1789,10 +1789,11 @@ class CausalTransformer(nn.Module):
         hidden = constrain(x if self.ngpt is not None else self.norm(x), RESIDUAL)
         self._gate_exit(hidden)
         if self.logits_scaling != 1.0:
-            # (h W) / s is (h / s) W: dividing the states in fp32 scores every
-            # head that contracts them, the chunked losses' included, as
-            # lm-engine's logits * (1 / m_width) does.
-            hidden = hidden.astype(jnp.float32) / jnp.float32(self.logits_scaling)
+            # (h W) / s is (h / s) W: dividing the states in at least fp32 scores
+            # every head that contracts them, the chunked losses' included, as
+            # lm-engine's logits * (1 / m_width) does; a float64 model's stay float64.
+            wide = at_least_fp32(hidden.dtype)
+            hidden = hidden.astype(wide) / jnp.asarray(self.logits_scaling, wide)
         # V4's depth input: inference/model.py MTPBlock.forward at b5968e9.
         prediction = hidden if self.mtp_hyper_connections is None else streams
         if (self.mtp_hyper_connections is not None and not self.is_initializing()
