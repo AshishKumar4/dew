@@ -216,13 +216,30 @@ def _staged(closed, *arrays):
     return jax_core.jaxpr_as_fun(closed)(*arrays)[0]
 
 
+VIEWS = frozenset({'broadcast_in_dim', 'reshape', 'squeeze', 'expand_dims', 'convert_element_type'})
+"""The equations that only reshape, broadcast or cast one array: an input viewed through them is the
+stage's to read (a norm's weight broadcast to a row), not a computed value."""
+
+
 def _tile_stage(jaxpr, out, shape: tuple) -> tuple[list, list]:
     """The equations computing `out` element by element, backward from it until a variable is not of its
-    `shape` (a row's or a depth's value, which XLA computes whole) or is an input; and the stage's inputs,
-    the producer's constants aside."""
+    `shape` (a row's or a depth's value, which XLA computes whole) or is an input, an input viewed through
+    reshapes, broadcasts and casts (`VIEWS`) read through to it; and the stage's inputs, the producer's
+    constants aside."""
     producers = {var: eqn for eqn in jaxpr.eqns for var in eqn.outvars}
-    constants = set(jaxpr.constvars)
+    constants, given = set(jaxpr.constvars), set(jaxpr.invars)
     stage, inputs, seen = [], [], set()
+
+    def viewed(var) -> list:
+        """The view equations from an input to `var`, in order, or None where `var` is computed."""
+        chain = []
+        while var not in given:
+            eqn = producers.get(var)
+            if eqn is None or eqn.primitive.name not in VIEWS or not isinstance(eqn.invars[0], jax_core.Var):
+                return None
+            chain.append(eqn)
+            var = eqn.invars[0]
+        return chain[::-1]
 
     def visit(var):
         if not isinstance(var, jax_core.Var) or var in seen or var in constants:
@@ -230,7 +247,12 @@ def _tile_stage(jaxpr, out, shape: tuple) -> tuple[list, list]:
         seen.add(var)
         eqn = producers.get(var)
         if eqn is None or tuple(var.aval.shape) != shape:
-            inputs.append(var)
+            chain = None if eqn is None else viewed(var)
+            if chain:
+                visit(chain[0].invars[0])
+                stage.extend(view for view in chain if view not in stage)
+            else:
+                inputs.append(var)
             return
         for operand in eqn.invars:
             visit(operand)
