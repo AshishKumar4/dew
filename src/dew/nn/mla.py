@@ -52,7 +52,7 @@ from dew.nn.precision import (
     float32_dot_general,
     float32_products,
 )
-from dew.nn.rope import YarnScaling, deinterleaved, rotate, yarn_query_scale, yarn_rope_freqs
+from dew.nn.rope import YarnScaling, deinterleaved, rotary_freqs, rotate, yarn_query_scale
 from dew.nn.sharding import RESIDUAL, LogicalAxes, constrain, down_projection, logical_axes
 from dew.nn.sparse_selection import index_scores, selection_mask, sparse_latent_attention, top_k_selection
 
@@ -488,8 +488,8 @@ class MultiHeadLatentAttention(nn.Module):
         """
         if not self.rotary:
             return q_rot, rot, None, None
-        freqs_cos, freqs_sin = yarn_rope_freqs(
-            positions, self.qk_rope_head_dim, self.rope_theta, self.yarn,
+        freqs_cos, freqs_sin = rotary_freqs(
+            positions, self.qk_rope_head_dim, self.rope_theta, rope_scaling=self.yarn,
             dtype=at_least_fp32(q_rot.dtype))
         return (_rotate(self.rope_interleave, q_rot, freqs_cos, freqs_sin),
                 _rotate(self.rope_interleave, rot[:, :, None, :], freqs_cos, freqs_sin)[:, :, 0, :],

@@ -18,7 +18,7 @@ from dew import records
 from dew.interop import weights
 from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.safetensors_io import read_weights
-from dew.interop.weights import ParamTree, checkpoint_dtype, insert, source_alias
+from dew.interop.weights import ParamTree, checkpoint_dtype, indexed_path, insert, source_alias
 from dew.nn.backbones.flux import FluxTransformer
 from dew.nn.backbones.flux2 import Flux2Transformer
 from dew.nn.backbones.qwen_image import QwenImageTransformer
@@ -874,16 +874,7 @@ def flax_component_parameters(component: str, tensors: Mapping[str, np.ndarray])
             else:
                 parts.pop()
             if component == "unet":
-                combined = []
-                index = 0
-                while index < len(parts):
-                    if index + 1 < len(parts) and parts[index + 1].isdigit():
-                        combined.append(parts[index] + "_" + parts[index + 1])
-                        index += 2
-                    else:
-                        combined.append(parts[index])
-                        index += 1
-                parts = combined
+                parts = list(indexed_path(parts))
             path = (*parts, leaf)
         if path[-1] == "kernel":
             array = array.transpose(2, 3, 1, 0) if array.ndim == 4 else array.T

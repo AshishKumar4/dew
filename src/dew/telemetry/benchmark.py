@@ -1,5 +1,6 @@
 """Wall-clock timing of calls: `samples`, which every benchmark tool in Dew measures with, and
-`benchmark`, which lays out many calls' timings as a table.
+`benchmark`, which lays out many calls' timings as a table; and the process's resident memory as
+the kernel reports it (`resident_memory`), which the memory benchmarks read.
 
 A run is timed from the call to the moment its output is ready on the devices
 (`jax.block_until_ready`), so an asynchronous dispatch is timed as the work it
@@ -76,6 +77,19 @@ class Benchmark[T]:
 
     def __str__(self) -> str:
         return self.table()
+
+
+def resident_memory() -> dict[str, int]:
+    """This process's memory fields of Linux's /proc/self/status (VmRSS, RssAnon, RssFile, VmHWM,
+    ...), each in bytes, under the kernel's names; a benchmark keeps the fields and unit it reports."""
+    fields = {}
+    with open("/proc/self/status") as handle:
+        for line in handle:
+            name, _, value = line.partition(":")
+            match value.split():
+                case [amount, "kB"]:
+                    fields[name] = int(amount) * 1024
+    return fields
 
 
 def largest_difference(left, right) -> float:
