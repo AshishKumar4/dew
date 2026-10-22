@@ -66,7 +66,9 @@ from dew.data.mixing import (
     Accepted,
     Chunked,
     CorpusCounts,
+    Members,
     PrimedMix,
+    ProportionalSelection,
     TokenDeficit,
     primed_maps,
     rewound,
@@ -1131,24 +1133,25 @@ class _Build:
         if all(isinstance(parent, pygrain.MapDataset) for parent in parents):
             mapped = [parent for parent in parents if isinstance(parent, pygrain.MapDataset)]
             checked = primed_maps(mapped)
-            return pygrain.MapDataset.mix(checked, _weights(source))
+            selection = ProportionalSelection([len(parent) for parent in checked], _weights(source))
+            return pygrain.MapDataset.select_from_datasets(checked, selection)
         streams = [
             Accepted(_as_iter(parent, self.loading), _name(child), _label(child))
             for parent, child in zip(parents, source.pipelines, strict=True)
         ]
         # A streamed mix saves each member's position under its key, so a member that joins starts
         # and one that left is dropped while the others resume (`Plan.check`).
-        keys = _member_keys(strings(self.lowering.order["members"], "mixture members"))
+        members = Members(tuple(source.weights),
+                          tuple(_member_keys(strings(self.lowering.order["members"], "mixture members"))))
         if source.tokens is not None:
             return TokenDeficit(
                 streams,
-                source.weights,
+                members,
                 tokens=source.tokens,
                 names=[_name(child) for child in source.pipelines],
                 labels=[_label(child) for child in source.pipelines],
-                keys=keys,
             )
-        return PrimedMix(streams, source.weights, keys)
+        return PrimedMix(streams, members)
 
     def indexed(
         self, pipeline: Pipeline, source: Source, partition: DataPartition, last: int, *, marked: bool = False

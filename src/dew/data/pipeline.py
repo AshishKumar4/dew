@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import dataclasses
+import functools
 import itertools
 import math
 import time
@@ -13,7 +14,7 @@ from typing import TYPE_CHECKING, Concatenate, Literal, Protocol, TypeGuard, run
 import grain.python as pygrain
 import numpy as np
 
-from dew.data.dataset import Batch, Records
+from dew.data.dataset import Batch, Records, phase_ends
 
 if TYPE_CHECKING:
     import jax
@@ -425,12 +426,18 @@ class Mixture:
     tokens: Callable[[Batch], int] | None = None
 
     def __post_init__(self) -> None:
-        if not self.pipelines:
-            raise ValueError("mix needs at least one dataset")
-        if len(self.weights) != len(self.pipelines):
-            raise ValueError(f"mix has {len(self.pipelines)} datasets and {len(self.weights)} weights")
-        if any(not math.isfinite(weight) or weight <= 0 for weight in self.weights):
-            raise ValueError("mix weights must be finite and positive")
+        mix_weights(self.weights, len(self.pipelines))
+
+
+def mix_weights(weights: Sequence[float], members: int) -> None:
+    """Refuse weights that aren't one finite positive share for each of a mix's `members`, at least
+    one: a `Mixture`'s, and the members a lowering reads it by (`dew.data.mixing.Members`)."""
+    if not members:
+        raise ValueError("mix needs at least one dataset")
+    if len(weights) != members:
+        raise ValueError(f"mix has {members} datasets and {len(weights)} weights")
+    if any(not math.isfinite(weight) or weight <= 0 for weight in weights):
+        raise ValueError("mix weights must be finite and positive")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -439,17 +446,37 @@ class Phases:
     until_steps: tuple[int | None, ...]
 
     def __post_init__(self) -> None:
-        if (
-            not self.pipelines
-            or len(self.pipelines) != len(self.until_steps)
-            or self.until_steps[-1] is not None
-        ):
-            raise ValueError("phases need one boundary per pipeline; the last boundary is None")
-        previous = 0
-        for boundary in self.until_steps[:-1]:
-            if boundary is None or boundary <= previous:
-                raise ValueError("phase step boundaries must increase from above zero")
-            previous = boundary
+        if len(self.pipelines) != len(self.until_steps):
+            raise ValueError(f"phases need one end per pipeline: {len(self.pipelines)} pipelines and "
+                             f"{len(self.until_steps)} ends")
+        phase_ends(self.until_steps, "step")
+
+
+def chains(pipeline: Pipeline) -> Iterator[Pipeline]:
+    """Every chain of `pipeline`'s tree, children first: each corpus under its mixtures and phases,
+    then the chain that mixes or phases them, and `pipeline` last."""
+    if isinstance(pipeline.source, (Mixture, Phases)):
+        for child in pipeline.source.pipelines:
+            yield from chains(child)
+    yield pipeline
+
+
+def with_children(pipeline: Pipeline, rewrite: Callable[[Pipeline], Pipeline]) -> Pipeline:
+    """`pipeline` with each chain its mixture or phases read rewritten by `rewrite`; `pipeline` itself
+    where it reads a store."""
+    source = pipeline.source
+    if not isinstance(source, (Mixture, Phases)):
+        return pipeline
+    children = tuple(rewrite(child) for child in source.pipelines)
+    return dataclasses.replace(pipeline, source=dataclasses.replace(source, pipelines=children))
+
+
+def with_stores(pipeline: Pipeline, store: Callable[[Source], Source]) -> Pipeline:
+    """`pipeline` with each store under its mixtures and phases read through `store`, every step as it
+    was."""
+    if isinstance(pipeline.source, (Mixture, Phases)):
+        return with_children(pipeline, functools.partial(with_stores, store=store))
+    return dataclasses.replace(pipeline, source=store(pipeline.source))
 
 
 class Dataset:

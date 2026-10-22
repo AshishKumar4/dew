@@ -13,7 +13,7 @@ import numpy as np
 
 from dew.data.dataset import Batch, Records
 from dew.data.generation import Generation, RowId, _GenerationSource, _row_key, _shard_inputs, _source_ids
-from dew.data.pipeline import Dataset, Mixture, Phases, Pipeline
+from dew.data.pipeline import Dataset, Pipeline, with_stores
 from dew.data.sources.base import (
     Read,
     Shard,
@@ -211,18 +211,6 @@ def _unsized_parts(subdivide: Callable[[int], tuple[Shard, ...]], count: int) ->
     return _unsized(subdivide(count))
 
 
-def _rebased(dataset: Dataset, store: Callable[[Source], Source]) -> Pipeline:
-    """`dataset` with each of its stores read through `store`, its steps unchanged."""
-    chain = dataset._chain()
-    source = chain.source
-    if isinstance(source, (Mixture, Phases)):
-        children = tuple(_rebased(child, store) for child in source.pipelines)
-        source = dataclasses.replace(source, pipelines=children)
-    else:
-        source = store(source)
-    return dataclasses.replace(chain, source=source)
-
-
 def holdout(dataset: Dataset, fraction: float | None = None, *, key: str | None = None,
             records: int | None = None, split: str | tuple[str, ...] | None = None,
             **named: float) -> tuple[Pipeline, ...]:
@@ -233,21 +221,22 @@ def holdout(dataset: Dataset, fraction: float | None = None, *, key: str | None 
         names = (split,) if isinstance(split, str) else split
         if not names or len(set(names)) != len(names):
             raise ValueError(f"holdout split= names one or more distinct splits, not {split!r}")
-        held = (_rebased(dataset, functools.partial(_named_split, name=name)) for name in names)
-        return _rebased(dataset, lambda source: source), *held
+        held = (with_stores(dataset._chain(), functools.partial(_named_split, name=name)) for name in names)
+        return with_stores(dataset._chain(), lambda source: source), *held
     if records is not None:
         if records < 1:
             raise ValueError(f"holdout records= is at least 1, not {records}")
-        return (_rebased(dataset, lambda source: RecordSlice(source, records)),
-                _rebased(dataset, lambda source: RecordSlice(source, 0, records)))
+        return (with_stores(dataset._chain(), lambda source: RecordSlice(source, records)),
+                with_stores(dataset._chain(), lambda source: RecordSlice(source, 0, records)))
     shares = (fraction,) if fraction is not None else tuple(named.values())
     if any(not 0 < share < 1 for share in shares) or sum(shares) >= 1:
         raise ValueError(f"held-out fractions are each in (0, 1) and sum under 1, not {shares}")
     bounds = np.concatenate([[0.0], np.cumsum(shares)]).tolist()
-    trained = _rebased(dataset, lambda source: HashPart(source, 0.0, bounds[-1], held=False, key=key))
+    chain = dataset._chain()
+    trained = with_stores(chain, lambda source: HashPart(source, 0.0, bounds[-1], held=False, key=key))
     held = (functools.partial(HashPart, low=low, high=high, held=True, key=key)
             for low, high in itertools.pairwise(bounds))
-    return (trained, *(_rebased(dataset, part) for part in held))
+    return (trained, *(with_stores(chain, part) for part in held))
 
 
 _SELECTIONS = (HashPart, RecordSlice)

@@ -6,6 +6,7 @@ import dataclasses
 import itertools
 import logging
 import math
+import sys
 import threading
 from collections import Counter
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -16,7 +17,7 @@ import grain.experimental as gx
 import grain.python as pygrain
 
 from dew.data.dataset import Batch
-from dew.data.pipeline import Record, Rejected
+from dew.data.pipeline import Record, Rejected, mix_weights
 from dew.records import boolean, integer, record, text
 
 _log = logging.getLogger(__name__)
@@ -293,38 +294,102 @@ class _DeficitIterator(pygrain.DatasetIterator[Batch]):
             read.close()
 
 
+@dataclasses.dataclass(frozen=True)
+class Members:
+    """A mixture's members as a lowering reads them: one weight and one key each, the weights finite
+    and positive (`mix_weights`), the keys distinct, as a mix saves each member's position and
+    draws under its key (`dew.data.analysis._member_keys`)."""
+
+    weights: tuple[float, ...]
+    keys: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        mix_weights(self.weights, len(self.keys))
+        if len(set(self.keys)) != len(self.keys):
+            raise ValueError(f"a mix needs one distinct key per corpus, not {list(self.keys)}")
+
+
+@dataclasses.dataclass(frozen=True)
+class Proportions:
+    """A weighted mix's selection policy, Grain's (`MapDataset.mix`): the weights scaled so the least
+    is 100 and truncated to whole proportions, and position k of the mix read from the corpus whose
+    count of records a prefix holds grows from k to k + 1. A phase counts its prefix by it
+    (`counts`) as the mix reads by it (`ProportionalSelection`), so the two never disagree."""
+
+    proportions: tuple[int, ...]
+
+    @classmethod
+    def of(cls, weights: Sequence[float]) -> Proportions:
+        scale = 100 / min(weights)
+        return cls(tuple(int(weight * scale) for weight in weights))
+
+    def counts(self, records: int) -> tuple[int, ...]:
+        """How many records of each corpus the first `records` positions of the mix read."""
+        counts, remaining, left = [], sum(self.proportions), records
+        for proportion in self.proportions:
+            rest = left * (remaining - proportion) // remaining
+            counts.append(left - rest)
+            left, remaining = rest, remaining - proportion
+        return tuple(counts)
+
+    def at(self, position: int) -> tuple[int, int]:
+        """The corpus position `position` of the mix reads, and which of that corpus's records."""
+        remaining, here, past = sum(self.proportions), position, position + 1
+        for corpus, proportion in enumerate(self.proportions):
+            here_rest = here * (remaining - proportion) // remaining
+            past_rest = past * (remaining - proportion) // remaining
+            if here - here_rest != past - past_rest:
+                return corpus, past - past_rest - 1
+            remaining -= proportion
+            here, past = here_rest, past_rest
+        raise IndexError(position)
+
+
+class ProportionalSelection(pygrain.DatasetSelectionMap):
+    """Grain's weighted mix of corpora of `lengths` records as a selection map
+    (`MapDataset.select_from_datasets`), by `Proportions`: as long as the mix reads no record of
+    any corpus twice."""
+
+    def __init__(self, lengths: Sequence[int], weights: Sequence[float]):
+        self._proportions = Proportions.of(weights)
+        total = sum(self._proportions.proportions)
+        spans = [length / (proportion / total)
+                 for length, proportion in zip(lengths, self._proportions.proportions, strict=True)]
+        if any(span == 0 for span in spans):
+            raise ValueError("every corpus of a mix needs a record")
+        self._length = min(sys.maxsize, int(min(spans)))
+
+    def __len__(self) -> int:
+        return self._length
+
+    def __getitem__(self, index: int) -> tuple[int, int]:
+        return self._proportions.at(index)
+
+
 class TokenDeficit(pygrain.IterDataset[Batch]):
     """Pick the corpus furthest below its token share, with index-order ties."""
 
     def __init__(
         self,
         parents: Sequence[pygrain.IterDataset[Batch]],
-        weights: Sequence[float],
+        members: Members,
         *,
         tokens: Callable[[Batch], int],
         names: Sequence[str],
         labels: Sequence[str],
-        keys: Sequence[str],
     ):
-        if not parents or len(parents) != len(weights) or len(names) != len(parents):
-            raise ValueError("token deficit mix needs one weight and name per corpus")
-        keys = tuple(keys)
-        if len(keys) != len(parents) or len(set(keys)) != len(keys):
-            raise ValueError("token deficit mix needs one distinct key per corpus")
-        if any(not math.isfinite(weight) or weight <= 0 for weight in weights):
-            raise ValueError("token deficit weights must be finite and positive")
         filtered = tuple(
             Accepted(parent, name, label, tokens=tokens)
-            for parent, name, label in zip(parents, names, labels, strict=True)
+            for parent, name, label, _ in zip(parents, names, labels, members.keys, strict=True)
         )
         super().__init__(filtered)
-        ratios = tuple(Fraction(weight) for weight in weights)
+        ratios = tuple(Fraction(weight) for weight in members.weights)
         scale = math.lcm(*(ratio.denominator for ratio in ratios))
         self._corpora, self._weights, self._tokens, self._keys = (
             filtered,
             tuple(ratio.numerator * (scale // ratio.denominator) for ratio in ratios),
             tokens,
-            keys,
+            members.keys,
         )
 
     def __iter__(self) -> pygrain.DatasetIterator[Batch]:
@@ -467,12 +532,11 @@ class PrimedMix(pygrain.IterDataset[Batch]):
     restores those it finds, so a member that joins starts at its first row and one that left is
     dropped while the others resume where they were."""
 
-    def __init__(self, parents: Sequence[pygrain.IterDataset[Batch]], weights: Sequence[float],
-                 keys: Sequence[str]):
-        if len(keys) != len(parents) or len(set(keys)) != len(keys):
-            raise ValueError("a mix needs one distinct key per corpus")
+    def __init__(self, parents: Sequence[pygrain.IterDataset[Batch]], members: Members):
+        if len(parents) != len(members.keys):
+            raise ValueError(f"a mix of {len(members.keys)} members reads {len(parents)} corpora")
         super().__init__(parents)
-        self._corpora, self._weights, self._keys = tuple(parents), tuple(weights), tuple(keys)
+        self._corpora, self._weights, self._keys = tuple(parents), members.weights, members.keys
 
     def __iter__(self) -> pygrain.DatasetIterator[Batch]:
         group = _PrimeReads([iter(parent) for parent in self._corpora])

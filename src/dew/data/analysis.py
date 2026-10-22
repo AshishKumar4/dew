@@ -21,6 +21,7 @@ which reads they support and which they prefer.
 from __future__ import annotations
 
 import dataclasses
+import functools
 import inspect
 import itertools
 import json
@@ -63,6 +64,8 @@ from dew.data.pipeline import (
     Windows,
     Workers,
     _declares_rejects,
+    chains,
+    with_children,
 )
 from dew.data.plan import Manifest, StepIdentity, _changed, _semantic, identified
 from dew.data.sources.base import READS, Read, Source, _consumed
@@ -292,9 +295,8 @@ def _promoted(pipeline: Pipeline) -> Pipeline:
             return chunks_for(stages[0].step, stages[1])
         return None
 
+    pipeline = with_children(pipeline, _promoted)
     source, stages = pipeline.source, pipeline.stages
-    if isinstance(source, (Mixture, Phases)):
-        source = dataclasses.replace(source, pipelines=tuple(_promoted(child) for child in source.pipelines))
     for index, stage in enumerate(stages):
         if isinstance(stage, Artifact) and isinstance(stage.cache, Generation):
             # The views of the inputs written before the generation read its rows as they read the
@@ -430,19 +432,13 @@ def _until(stages: Sequence[Stage], kinds: type | tuple[type, ...]) -> int:
 
 def _leaves(pipeline: Pipeline) -> Iterator[tuple[Pipeline, Source]]:
     """Each corpus under a pipeline's mixtures and phases, with the source it reads."""
-    source = pipeline.source
-    if isinstance(source, (Mixture, Phases)):
-        for child in source.pipelines:
-            yield from _leaves(child)
-    else:
-        yield pipeline, source
+    return ((chain, chain.source) for chain in chains(pipeline)
+            if not isinstance(chain.source, (Mixture, Phases)))
 
 
 def _steps(pipeline: Pipeline) -> Iterator[Stage]:
-    if isinstance(pipeline.source, (Mixture, Phases)):
-        for child in pipeline.source.pipelines:
-            yield from _steps(child)
-    yield from pipeline.stages
+    """Every stage of a pipeline's tree, each corpus's before the chain that mixes them (`chains`)."""
+    return (stage for chain in chains(pipeline) for stage in chain.stages)
 
 
 def _name(pipeline: Pipeline) -> str:
@@ -527,10 +523,9 @@ def _configured(
     """`pipeline` with its configured steps bound: a source-scoped one to the facts its source
     states, or `stated` (what `_stated` reads of it, measured facts included), a run-scoped one to
     the run's (`shared`)."""
+    pipeline = with_children(pipeline, functools.partial(_configured, shared=shared, read=read, scope=scope))
     source = pipeline.source
     if isinstance(source, (Mixture, Phases)):
-        children = tuple(_configured(child, shared, read, scope) for child in source.pipelines)
-        source = dataclasses.replace(source, pipelines=children)
         local = shared
     else:
         local = source.metadata() if stated is None else stated
