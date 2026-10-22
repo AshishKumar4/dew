@@ -546,6 +546,12 @@ def rms_norm(x, weight, epsilon=1e-6):
     return (wide * jax.lax.rsqrt(mean_square + epsilon) * weight).astype(x.dtype)
 
 
+def _normed_truth(sizes, x, w, weight):
+    """The float64 truth of a normed operand's grouped product."""
+    matrix = w.astype(jnp.bfloat16).astype(x.dtype)
+    return jax.lax.ragged_dot(rms_norm(x, weight), matrix, sizes, preferred_element_type=x.dtype)
+
+
 def dew_rms_norm(x, weight):
     """Dew's own RMS norm (its XLA body, checkpointed), as a model's block calls it."""
     from dew.nn.attention import rms_normalized
@@ -575,13 +581,10 @@ def test_a_normed_operand_runs_in_the_prologue_with_the_programs_value(generatio
     def unfused(x, w, weight):
         return template.gemm(rms_norm(x, weight), w, sizes, out_dtype=jnp.bfloat16)
 
-    def truth(x, w, weight):
-        matrix = w.astype(jnp.bfloat16).astype(x.dtype)
-        return jax.lax.ragged_dot(rms_norm(x, weight), matrix, sizes, preferred_element_type=x.dtype)
 
     with generation.assumed(generation_name), generation.routes() as taken:
         assert_as_exact(jax.jit(fuser.fuse(fusing)), jax.jit(unfused), draw, "normed operand", seeds=SEEDS,
-                        truth_fn=truth)
+                        truth_fn=functools.partial(_normed_truth, sizes))
     assert {route.kernel for route in taken if route.choice == 'gemm_prologue'} == {'fused'}
 
 
@@ -634,13 +637,10 @@ def test_a_one_row_normed_operand_fuses():
     def unfused(x, w, weight):
         return template.gemm(rms_norm(x, weight), w, sizes, out_dtype=jnp.float32)
 
-    def truth(x, w, weight):
-        matrix = w.astype(jnp.bfloat16).astype(x.dtype)
-        return jax.lax.ragged_dot(rms_norm(x, weight), matrix, sizes, preferred_element_type=x.dtype)
 
     with generation.assumed("sm80"), generation.routes() as taken:
         assert_as_exact(jax.jit(fuser.fuse(fusing)), jax.jit(unfused), draw, "one normed row", seeds=SEEDS,
-                        truth_fn=truth)
+                        truth_fn=functools.partial(_normed_truth, sizes))
     assert {route.kernel for route in taken if route.choice == 'gemm_prologue'} == {'fused'}
 
 

@@ -134,13 +134,13 @@ def _split(producer, values):
     if len(shape) != 2 or not isinstance(out, jax_core.Var) or not jaxpr.eqns:
         return generation.Refusal('no_producer', "the operand is an array as given")
     stage, inputs = _tile_stage(jaxpr, out, shape)
-    full = [var for var in inputs if tuple(var.aval.shape) == shape and var in jaxpr.invars]
+    full = [var for var in inputs if _shape(var) == shape and var in jaxpr.invars]
     if not full:
         return generation.Refusal('no_base', "the operand's every element is computed, none loaded")
     base = full[0]
-    if base.aval.dtype != out.aval.dtype:
-        return generation.Refusal('dtype_changes', f"the producer turns its {base.aval.dtype} base into "
-                                                   f"{out.aval.dtype}, which the kernels would multiply in")
+    if _dtype(base) != _dtype(out):
+        return generation.Refusal('dtype_changes', f"the producer turns its {_dtype(base)} base into "
+                                                   f"{_dtype(out)}, which the kernels would multiply in")
     sides = [var for var in inputs if var is not base]
     given = {var: index for index, var in enumerate(jaxpr.invars)}
     read = {given[var] for var in (base, *sides) if var in given}
@@ -211,6 +211,16 @@ def _inlined(closed, *args):
     return [read(var) for var in closed.jaxpr.outvars]
 
 
+def _shape(var) -> tuple:
+    """A jaxpr variable's shape (an abstract array's)."""
+    return tuple(getattr(var.aval, 'shape', ()))
+
+
+def _dtype(var):
+    """A jaxpr variable's dtype (an abstract array's)."""
+    return getattr(var.aval, 'dtype', None)
+
+
 def _staged(closed, *arrays):
     """The producer's kernel stage evaluated on whole arrays or on tiles (under `pull_block_spec`)."""
     return jax_core.jaxpr_as_fun(closed)(*arrays)[0]
@@ -230,7 +240,7 @@ def _tile_stage(jaxpr, out, shape: tuple) -> tuple[list, list]:
     constants, given = set(jaxpr.constvars), set(jaxpr.invars)
     stage, inputs, seen = [], [], set()
 
-    def viewed(var) -> list:
+    def viewed(var) -> list | None:
         """The view equations from an input to `var`, in order, or None where `var` is computed."""
         chain = []
         while var not in given:
@@ -246,7 +256,7 @@ def _tile_stage(jaxpr, out, shape: tuple) -> tuple[list, list]:
             return
         seen.add(var)
         eqn = producers.get(var)
-        if eqn is None or tuple(var.aval.shape) != shape:
+        if eqn is None or _shape(var) != shape:
             chain = None if eqn is None else viewed(var)
             if chain:
                 visit(chain[0].invars[0])
