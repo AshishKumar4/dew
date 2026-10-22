@@ -110,7 +110,7 @@ from dew.data.pipeline import (
 )
 from dew.data.plan import Manifest
 from dew.data.readers import _FillShare
-from dew.data.sources.base import Read, Shard, ShardManifest, Source
+from dew.data.sources.base import Read, Shard, ShardManifest, Source, materialized
 from dew.data.sources.urls import Fetch
 from dew.data.steps.generic import Fields
 from dew.data.steps.text import LayoutRule, ValidTargets, recounted
@@ -132,16 +132,6 @@ class _Locality(Protocol):
     whether they are remote, which a block shuffle reads."""
 
     def locality(self) -> tuple[tuple[int, ...], bool]: ...
-
-
-@runtime_checkable
-class _Materialized(Protocol):
-    """Rows a memory read holds, which state the source position each came
-    from (`dew.data.materialize`), the source it read and the steps it ran over them."""
-
-    identifiers: tuple[tuple[int, ...], ...]
-    original: Source
-    ran: tuple[Stage, ...]
 
 
 def _dropping(pipeline: Pipeline, lowering: _Lowering) -> bool:
@@ -233,7 +223,7 @@ def _cache_inputs(source: Source, records: Records) -> pygrain.MapDataset:
     source position it came from (`_Placed`), where a step among the cached ones that reads its
     record's index (`map_with_index`) reads it, as it does without the cache."""
     stored = pygrain.MapDataset.source(records)
-    if isinstance(source, _Materialized) and source.identifiers:
+    if materialized(source) and source.identifiers:
         return stored.map_with_index(_Placed(identifiers=source.identifiers, rows=len(stored)))
     return stored
 
@@ -251,8 +241,8 @@ def _keyed(source: Source) -> Source:
     over its rows (a compile may materialize a source twice, `_prepared` and `_staged`), the source
     they hold the rows of, as an indexed read and a publication key it; else `source` itself, the
     rows a memory read made of it before the first view of its inputs (`_analyzed`)."""
-    while isinstance(source, _Materialized) and not source.ran:
-        source = source.original
+    while materialized(source) and not source.ran:
+        source = source.source
     return source
 
 
@@ -1164,7 +1154,7 @@ class _Build:
         stored = pygrain.MapDataset.source(records)
         cache = self.lowering.cache
         if cache is None:
-            identifiers = source.identifiers if isinstance(source, _Materialized) else ()
+            identifiers = source.identifiers if materialized(source) else ()
             present = _Present.of(records) if _in_memory(source) else None
             if present is not None:
                 stored = pygrain.MapDataset.source(present)
@@ -1175,7 +1165,7 @@ class _Build:
             rows = stored.map_with_index(placed) if last >= 0 else stored
             return self.shared(rows, pipeline, partition), 0
         keyed = _keyed(source)
-        if isinstance(source, _Materialized) and keyed is not source:
+        if materialized(source) and keyed is not source:
             # A memory read that ran no step before the cache holds the rows of the source it keys,
             # at the places there it states: the cache reads those, its missing inputs skipped.
             records = keyed.records(self.read)
@@ -1192,7 +1182,7 @@ class _Build:
         missing = () if positions is None else np.setdiff1d(np.arange(len(stored)), positions).tolist()
         cached = filled.mapped(stored, manifest, transform=prefix, source=keyed, missing=missing)
         inputs = _Inputs(cached, positions, single=self.lowering.one_to_one)
-        identifiers = source.identifiers if isinstance(source, _Materialized) else ()
+        identifiers = source.identifiers if materialized(source) else ()
         if positions is not None:
             identifiers = tuple((int(position),) for position in positions)
         placed = (inputs.map_with_index(_Placed(identifiers=identifiers, rows=len(inputs)))
