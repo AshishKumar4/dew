@@ -607,10 +607,12 @@ def unresolved_uses(package: griffe.Module, home: dict[str, str], pages: dict[st
     rest = [statement for statement in tree.body
             if not (isinstance(statement, ast.Assign) and len(statement.targets) == 1
                     and isinstance(statement.targets[0], ast.Name) and statement.targets[0].id in built)]
+    # A held name reads "" in these tables, which no import's dotted path is.
     held = {id(node): table for node, table in scopes.scoped(rest, dict.fromkeys(holders, ""), ())}
     # The module scope's names are the next unit's.
     bound.imports = dict(tables[id(tree.body[0])]) if tree.body else bound.imports
-    bound.instances = {name: holders[name] for name in (held[id(rest[0])] if rest else holders)}
+    module = held[id(rest[0])] if rest else dict.fromkeys(holders, "")
+    bound.instances = {name: holders[name] for name, path in module.items() if path == ""}
     called = {id(node.func) for node in ast.walk(tree) if isinstance(node, ast.Call)}
 
     # Only the outermost dotted name counts, so a method and its class are not counted twice.
@@ -623,7 +625,7 @@ def unresolved_uses(package: griffe.Module, home: dict[str, str], pages: dict[st
         path = chain(node)
         if path is None or ".".join(path) in seen:
             continue
-        imported, instance = tables[id(node)].get(path[0]), path[0] in held.get(id(node), {})
+        imported, instance = tables[id(node)].get(path[0]), held.get(id(node), {}).get(path[0]) == ""
         if imported is None and not instance:
             continue
         try:
