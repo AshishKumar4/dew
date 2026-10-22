@@ -269,10 +269,10 @@ def _prologue_axes(whole, arrays: list, shape: tuple) -> tuple | generation.Refu
     or the producer reads its base at other than the tile or its tile's position."""
     probe = (_probe(shape[0]), _probe(shape[1]))
     spec = pl.BlockSpec(probe, lambda row, depth: (row, depth))
-    try:
-        tiled, specs, _ = fuser.pull_block_spec(whole, spec, grid_len=2)(*arrays)
-    except (NotImplementedError, ValueError) as error:  # an equation the fuser cannot tile: XLA's
-        return generation.Refusal('untileable', f"the fuser tiles no block of the producer: {error}"[:200])
+    pulled = _pulled(whole, spec, *arrays)
+    if isinstance(pulled, generation.Refusal):
+        return pulled
+    tiled, specs, _ = pulled
     if not _is_tile(specs[0], probe):
         return generation.Refusal('base_untiled', "the producer reads its base at other than the tile")
     axes = []
@@ -318,8 +318,10 @@ def _axes(consumer, values, acc) -> tuple | generation.Refusal:
     captured array follows no launch axis (a scalar) or its block is not the tile's, or the consumer reads
     the tile's position."""
     probe = (_probe(acc.shape[0]), _probe(acc.shape[1]))
-    tiled, (value_specs, acc_spec), _ = fuser.pull_block_spec(consumer, _specs(consumer, values, acc, probe),
-                                                              grid_len=2)(values, acc)
+    pulled = _pulled(consumer, _specs(consumer, values, acc, probe), values, acc)
+    if isinstance(pulled, generation.Refusal):
+        return pulled
+    tiled, (value_specs, acc_spec), _ = pulled
     if not _is_tile(acc_spec, probe):
         return generation.Refusal('product_untiled',
                                   "the consumer reads the product at other than its tile")
@@ -339,6 +341,16 @@ def _axes(consumer, values, acc) -> tuple | generation.Refusal:
     if _reads_position(tiled, value_specs, values, probe):
         return generation.Refusal('reads_position', "the consumer reads its tile's position")
     return tuple(axes)
+
+
+def _pulled(function, specs, *args):
+    """`function`'s block specs pulled back from `specs` at `args` (`fuser.pull_block_spec`), or the refusal
+    where the fuser has no rule to tile one of its equations (a reduction over the tile's own axes, an
+    unsupported primitive), which it raises as one of these errors: XLA runs it whole, reported."""
+    try:
+        return fuser.pull_block_spec(function, specs, grid_len=2)(*args)
+    except (NotImplementedError, ValueError, AssertionError) as error:
+        return generation.Refusal('untileable', f"the fuser tiles no block of it: {type(error).__name__}")
 
 
 def _specs(consumer, values, acc, block: tuple):
