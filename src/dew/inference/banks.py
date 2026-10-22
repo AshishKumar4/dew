@@ -41,7 +41,7 @@ from jax.typing import DTypeLike
 
 from dew import records
 from dew.nn.backbones.decoder_stack import DecoderBank, stack_layers
-from dew.nn.backbones.layer_plan import group_layers
+from dew.nn.backbones.layer_plan import group_layers, layer_index
 from dew.nn.hyper_connections import Carried
 from dew.objectives.base import Variables, merge
 
@@ -111,14 +111,6 @@ class LayerBanks(Protocol):
                         branch = branch.setdefault(component, {})
                     branch[name] = tree
         return merge(entry_values, bank_store)
-
-
-def layer_index(name: str) -> int | None:
-    """Return the layer index a `layers_N` module name holds, or None."""
-    if not name.startswith("layers_"):
-        return None
-    rest = name[len("layers_"):]
-    return int(rest) if rest.isdigit() else None
 
 
 def one_layer(variables: Variables, index: int, *, namespace: tuple[str, ...] = ()) -> Variables:
@@ -378,15 +370,7 @@ class SafetensorsBanks(LayerBanks):
     def _placed(variables: Variables, placement: Placement) -> Variables:
         from dew.training.host import place_leaf
 
-        def place(leaf, target):
-            if not isinstance(target, Format):
-                return place_leaf(leaf, target)
-            try:
-                return jax.block_until_ready(jax.device_put(leaf.read(), target))
-            finally:
-                leaf.release()
-
-        return jax.tree.map(place, variables, placement)
+        return jax.tree.map(place_leaf, variables, placement)
 
     def bank(self, layers: Sequence[int], placement: Placement, *,
              namespace: tuple[str, ...] = ()) -> Variables:
@@ -563,9 +547,11 @@ def bank_sharding(row: NamedSharding, *, memory_kind: str | None) -> NamedShardi
     return NamedSharding(row.mesh, P(None, *row.spec), memory_kind=memory_kind)
 
 
-def row_sharding(bank: NamedSharding) -> NamedSharding:
-    """One row's sharding out of a bank's (`bank_sharding`), in the bank's memory."""
-    return NamedSharding(bank.mesh, P(*bank.spec[1:]), memory_kind=bank.memory_kind)
+def row_sharding(bank: NamedSharding, *, memory_kind: str | None = None) -> NamedSharding:
+    """One row's sharding out of a bank's (`bank_sharding`): the layer axis dropped, in
+    `memory_kind`, the bank's own memory when None."""
+    return NamedSharding(bank.mesh, P(*bank.spec[1:]),
+                         memory_kind=bank.memory_kind if memory_kind is None else memory_kind)
 
 
 def spread(tree: Mapping, rows=lambda leaf, count: [leaf[offset] for offset in range(count)]) -> dict:
@@ -670,7 +656,7 @@ def _row_placement(placement: Placement) -> Placement:
     def row(target):
         sharding = target.sharding if isinstance(target, Format) else target
         assert isinstance(sharding, NamedSharding)
-        return NamedSharding(sharding.mesh, P(*sharding.spec[1:]), memory_kind="device")
+        return row_sharding(sharding, memory_kind="device")
 
     return jax.tree.map(row, placement)
 

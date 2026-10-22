@@ -128,6 +128,20 @@ def test_every_token_id_parser_reads_ids_by_one_law(parser):
             read([5, refused])
 
 
+def test_a_request_refuses_a_bool_row_beside_integer_rows():
+    """A request's rows are each read by the one law before they join into an array, so a NumPy row
+    of bools beside a list of integers is refused, not promoted into ids 1 and 0."""
+    from collections import UserList
+
+    from dew.inference.tasks import prepared_inputs
+
+    for row in (np.array([True, False]), [True, 3], UserList([True, 3])):
+        with pytest.raises(ValueError):
+            prepared_inputs(None, [row, [2, 3]], images=None)
+    assert np.asarray(prepared_inputs(None, [np.array([4, 5]), [2, 3]], images=None).tokens).tolist() == [
+        [4, 5], [2, 3]]
+
+
 def test_a_packed_request_reads_alike_as_coordinates_and_as_its_fields():
     """The same packed, left-padded rows, as `Coordinates` (a data pipeline's
     packing) or as the validity, segment and position fields (a rollout's), are
@@ -194,3 +208,23 @@ def test_a_request_generates_alike_from_coordinates_and_from_its_fields(placed):
                     for form in forms)
     np.testing.assert_array_equal(np.asarray(laid.tokens), np.asarray(fields.tokens))
     np.testing.assert_array_equal(np.asarray(laid.lengths), np.asarray(fields.lengths))
+
+
+def test_a_feed_forward_reads_blocks_of_its_own_size_from_the_layers_metadata():
+    """The model numbers its block router's blocks once, in its metadata (`AttentionMetadata.blocks`);
+    a feed-forward routing blocks of another size numbers its own from the call's coordinates rather
+    than read blocks of the wrong width."""
+    from dew.nn.inputs import AttentionMetadata, coordinates, numbered_blocks, routing_blocks
+
+    class Routed:
+        def __init__(self, block):
+            self.routing_block = block
+
+    tokens = coordinates((1, 8))
+    metadata = AttentionMetadata(coordinates=tokens, blocks=numbered_blocks(tokens, (1, 8), 4),
+                                 routing_block=4)
+    four = routing_blocks(Routed(4), metadata, (1, 8, 3))["blocks"]
+    two = routing_blocks(Routed(2), metadata, (1, 8, 3))["blocks"]
+    np.testing.assert_array_equal(four, [[0, 0, 0, 0, 1, 1, 1, 1]])
+    np.testing.assert_array_equal(two, [[0, 0, 1, 1, 2, 2, 3, 3]])
+    assert routing_blocks(Routed(None), metadata, (1, 8, 3)) == {}

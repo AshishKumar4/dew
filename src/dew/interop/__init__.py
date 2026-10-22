@@ -17,15 +17,16 @@ if TYPE_CHECKING:
         PretrainedFallback,
         PretrainedMaskedDecoder,
         PretrainedPipeline,
-        Processor,
         split_revision,
     )
+    from .processors import Processor
     from .safetensors_io import load_params, save_hf_layout, save_params
 
 _EXPORTS = {
     **dict.fromkeys(("Pretrained", "PretrainedBlockDecoder", "PretrainedDecoder", "PretrainedFallback",
-                     "PretrainedMaskedDecoder", "PretrainedPipeline", "Processor", "split_revision"),
+                     "PretrainedMaskedDecoder", "PretrainedPipeline", "split_revision"),
                     "pretrained"),
+    "Processor": "processors",
     "translate_config": "hf_decoders",
     "translate_weights": "hf_decoders",
     "load_params": "safetensors_io", "save_hf_layout": "safetensors_io", "save_params": "safetensors_io",

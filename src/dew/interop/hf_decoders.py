@@ -27,6 +27,7 @@ import functools
 import json
 import operator
 import os
+import tempfile
 from collections.abc import Callable, Collection, Mapping
 from dataclasses import asdict
 from pathlib import Path
@@ -37,6 +38,7 @@ import numpy as np
 
 from dew import records
 from dew._model_types import QWEN35_TEXT_TYPES, QWEN35_TYPES
+from dew.files import write_atomically
 from dew.interop.config_records import NativeFields
 from dew.interop.decoder_families import ENTRIES
 from dew.interop.decoder_parts import (
@@ -765,11 +767,19 @@ def save_export_assets(
                          "on a Hugging Face tokenizer")
     os.makedirs(directory, exist_ok=True)
     if writer is not None:
-        writer.save_pretrained(str(directory))
+        # The tokenizer writes its files beside the directory, and each replaces its old one whole at
+        # its own path (a processor's chat_templates/ among them), so an engine reading the directory
+        # never reads one half written.
+        with tempfile.TemporaryDirectory(prefix=".dew-", dir=directory) as staged:
+            writer.save_pretrained(staged)
+            for written in sorted(Path(staged).rglob("*")):
+                if written.is_file():
+                    target = Path(directory) / written.relative_to(staged)
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    os.replace(written, target)
     if byte:
         values['tokenizer_name'] = "byte"
-    with open(os.path.join(directory, GENERATION_CONFIG_FILE), 'w') as handle:
-        json.dump(values, handle, indent=2)
+    write_atomically(os.path.join(directory, GENERATION_CONFIG_FILE), json.dumps(values, indent=2))
 
 
 def export_decoder_weights(model: CausalTransformer, variables: Mapping[str, object],
@@ -825,7 +835,7 @@ def export_config(model) -> Mapping[str, object]:
         'attention_bias': model.attention_bias,
         'tie_word_embeddings': model.tie_embeddings,
         'hidden_act': hf_activation(model.mlp),
-        'use_cache': True,
+        'use_cache': model.causal,
     }
     # A dial only some families' references read cannot ride in another
     # family's config. Qwen2 splits the o_proj bias from the others, and
@@ -835,7 +845,7 @@ def export_config(model) -> Mapping[str, object]:
     # reads the field without passing it on). A checkpoint written under a
     # family that would drop the dial is refused naming it.
     if (model.o_proj_bias is not None and model.o_proj_bias != model.attention_bias
-            and family.export_model_type not in ('qwen2', 'dream', 'gpt_neo')):
+            and family.export_model_type not in ('qwen2', 'dream', 'gpt_neo', 'llada2_moe')):
         raise ValueError(
                 "o_proj_bias differs from attention_bias, which only the qwen2 "
                 "and dream references build, so the model cannot be written as "
@@ -897,7 +907,8 @@ def export_config(model) -> Mapping[str, object]:
     elif ramped:
         config['rope_scaling'] = dataclasses.asdict(next(iter(ramped.values())))
     config.update(exported)
-    written = {key: value for key, value in config.items() if value is not None or key == 'pad_token_id'}
+    written = {key: value for key, value in config.items()
+               if value is not None or key == 'pad_token_id' or key in family.export_nulls}
     refuse_lossy_export(model, written)
     return written
 

@@ -16,11 +16,11 @@ A forward step over one key tile, in a mainloop's order:
 `Partial` is that running state, `merge` joins two of them in order (split keys, ring attention,
 chunked prefill), and `finish` normalizes the last one and applies the output hook.
 
-The functions specialize at trace time on what the call holds (`Forward`): with no score hook the
-logits stay in base 2 (log2(e) folded into the scale) for exp2; a full or causal call's mask comes from
-its coordinates alone, only spans read intervals and ids, and a tile no query's interval cuts takes no
-mask at all (`masked`); and only a call where a query can see nothing (spans, a score hook) guards its
-maxima and denominators against an empty row."""
+The functions specialize at trace time on what the call holds (`Forward`): the logits fold log2(e) into
+the scale for exp2 where the scale allows it, unless the call keeps them natural (`Forward.base2`); a
+full or causal call's mask comes from its coordinates alone, only spans read intervals and ids, and a
+tile no query's interval cuts takes no mask at all (`masked`); and only a call where a query can see
+nothing (spans, a score hook) guards its maxima and denominators against an empty row."""
 
 import dataclasses
 from collections.abc import Callable
@@ -29,32 +29,35 @@ from typing import NamedTuple
 import jax
 import jax.numpy as jnp
 
-from dew.nn.kernels.templates.attention import Kind
-
-LOG2E = 1.4426950408889634
-"""log2(e): a natural exponent times it is a base-2 one."""
+from dew.nn.kernels.templates.attention import LOG2E, NATURAL, Kind, natural_exp
 
 
 @dataclasses.dataclass(frozen=True)
 class Forward:
     """What the forward's functions specialize on, all static: the spans' `form` ('full', 'causal' or
     'spans', `KeySpans.form`), the call's key count `keys`, whether it packs documents (`ids`), the
-    softmax `scale`, and the score hook `score_mod(s, q_pos, k_pos, *params)` on natural logits."""
+    softmax `scale`, the score hook `score_mod(s, q_pos, k_pos, *params)` on natural logits, and whether
+    the call keeps its logits `natural` (`base2`)."""
 
     form: str
     keys: int
     ids: bool
     scale: float
     score_mod: Callable | None = None
+    natural: bool = NATURAL
 
     @property
     def base2(self) -> bool:
-        """Whether the logits stay in base 2 (log2(e) folded into the scale, then exp2, jax's mha's and
-        FlashAttention 2's arithmetic): no hook reads them. Its known limits, where the reference stays
-        finite and apart: a scale of 1/log2(e) (0.69) or more takes a product near fp32's largest past
-        it, and the fold's rounding can tie two logits one ulp apart (1610613120 and 1610612992 at scale
-        1, which the reference weighs 1 and 0)."""
-        return self.score_mod is None
+        """Whether the logits fold log2(e) into the scale for exp2, the fast form and the default
+        (FlashAttention 2's and jax's mha's arithmetic): unless the call keeps them `natural`, where no
+        hook reads them and the scale times log2(e) is at most 1, so the fold takes no logit the
+        reference keeps finite past fp32's largest. Otherwise they stay natural, each exponential taken
+        of their difference (`natural_exp`), as the reference's. The fold rounds each logit at log2(e)
+        times its size, so logits the reference keeps apart can tie: keys of 2 * 1610613120 and 2 * 1610612992
+        under a query of 1 at scale 0.5 weigh 1 and 0 in the reference and 0.5 each folded, and a
+        cotangent of 2**125 then overflows its backward (docs/design/kernel-templates.md, the forms'
+        divergences). On drawn inputs both forms pass check 1."""
+        return not self.natural and self.score_mod is None and self.scale * LOG2E <= 1.0
 
     @property
     def guarded(self) -> bool:
@@ -63,8 +66,26 @@ class Forward:
         return self.keys == 0 or self.form == "spans" or self.score_mod is not None
 
     def power(self, x: jax.Array) -> jax.Array:
-        """The exponential the logits are in: exp2 in base 2, exp otherwise."""
+        """The exponential the logits are in: exp2 folded, `natural_exp` natural."""
+        return jnp.exp2(x) if self.base2 else natural_exp(x)
+
+    def carry(self, x: jax.Array) -> jax.Array:
+        """The factor a softmax state takes from one maximum to another `x` below it: exp2 folded, and
+        natural, `jnp.exp`, the reference's own, whose state (a resumed partial, a sink) may be any size, so
+        `natural_exp`'s extra rounding of `x * log2(e)`, about `|x|` ulps, would reach it."""
         return jnp.exp2(x) if self.base2 else jnp.exp(x)
+
+
+def expand(x: jax.Array, like: jax.Array) -> jax.Array:
+    """A per-row `x` (each query's, `[..., bq]`) broadcast over `like`'s trailing axis, as `x[..., None]`
+    broadcasts, by `lax.broadcast_in_dim`: the one broadcast every mainloop lowers, Mosaic GPU's
+    register layouts included (a row vector of the WGMMA layout to its tile)."""
+    return jax.lax.broadcast_in_dim(x, like.shape, tuple(range(x.ndim)))
+
+
+def across(x: jax.Array, like: jax.Array) -> jax.Array:
+    """A per-key `x` (`[bk]`) broadcast over `like`'s rows `[bq, bk]`, as `x[None, :]` broadcasts."""
+    return jax.lax.broadcast_in_dim(x, like.shape, (like.ndim - 1,))
 
 
 class Coords(NamedTuple):
@@ -111,13 +132,13 @@ def modify(spec: Forward, s: jax.Array, coords: Coords, params: tuple[jax.Array,
     of the block sees whole (a full tile of the block map), which takes no mask."""
     logits = s * (spec.scale * LOG2E if spec.base2 else spec.scale)
     if spec.score_mod is not None:
-        logits = spec.score_mod(logits, coords.q_pos, coords.k_pos, *params)
+        logits = hooked(spec.score_mod, logits, coords.q_pos, coords.k_pos, params)
     if not masked:
         return logits
     seen = None
     if spec.form == "spans":
         start, end = _given(coords.start, coords.end, "its queries' intervals")
-        seen = (coords.k_pos >= start[:, None]) & (coords.k_pos < end[:, None])
+        seen = (coords.k_pos >= expand(start, s)) & (coords.k_pos < expand(end, s))
     elif spec.form == "causal":
         seen = coords.k_pos <= coords.q_pos
     if spec.form != "spans" and spec.keys % s.shape[1]:
@@ -125,7 +146,7 @@ def modify(spec: Forward, s: jax.Array, coords: Coords, params: tuple[jax.Array,
         seen = coords.k_pos < spec.keys if seen is None else seen & (coords.k_pos < spec.keys)
     if spec.ids:
         query_ids, key_ids = _given(coords.query_ids, coords.key_ids, "its queries' and keys' ids")
-        same = query_ids[:, None] == key_ids[None, :]
+        same = expand(query_ids, s) == across(key_ids, s)
         seen = same if seen is None else seen & same
     return logits if seen is None else jnp.where(seen, logits, -jnp.inf)
 
@@ -146,12 +167,12 @@ def peak(spec: Forward, m: jax.Array, s: jax.Array) -> tuple[jax.Array, jax.Arra
     """The running maximum after a tile's logits `s`, and `alpha`, the factor the state before it
     takes to the new maximum."""
     new = jnp.maximum(m, s.max(axis=-1))
-    return new, spec.power(m - _safe(spec, new))
+    return new, spec.carry(m - _safe(spec, new))
 
 
 def weights(spec: Forward, s: jax.Array, m: jax.Array) -> jax.Array:
     """A tile's unnormalized weights `[bq, bk]` under the running maximum `m`, fp32."""
-    return spec.power(s - _safe(spec, m)[..., None])
+    return spec.power(s - expand(_safe(spec, m), s))
 
 
 def narrow(p: jax.Array, dtype) -> jax.Array:
@@ -166,7 +187,7 @@ def total(denominator: jax.Array, alpha: jax.Array, p: jax.Array) -> jax.Array:
 
 def rescale(acc: jax.Array, alpha: jax.Array) -> jax.Array:
     """The weighted values before a tile, taken to the new maximum; `P·V` adds the tile's to them."""
-    return alpha[..., None] * acc
+    return expand(alpha, acc) * acc
 
 
 class Argmax(NamedTuple):
@@ -210,14 +231,15 @@ def split_accumulate(others: jax.Array, own: jax.Array, others_total: jax.Array,
     the sum before the rescale, and the new anchor's weight is the tile's (`own_tile`); the tile's other
     keys add their `product` and their narrowed weights `rest`. So neither is summed with a key's weight
     cancelled out of it."""
-    joined = jnp.where(moved[:, None], own[:, None] * old_value.astype(jnp.float32), 0.0)
+    old = old_value.astype(jnp.float32)
+    joined = jnp.where(expand(moved, old), expand(own, old) * old, 0.0)
     total = alpha * (others_total + jnp.where(moved, own, 0.0)) + rest.astype(jnp.float32).sum(axis=-1)
     return rescale(others + joined, alpha) + product, jnp.where(moved, own_tile, alpha * own), total
 
 
 def split_output(others: jax.Array, own: jax.Array, anchor_value: jax.Array) -> jax.Array:
     """The weighted values of every key, `B` and the anchor's own term (`anchor_value`, its value row)."""
-    return others + own[:, None] * anchor_value.astype(jnp.float32)
+    return others + expand(own, others) * anchor_value.astype(jnp.float32)
 
 
 def merge(spec: Forward, first: Partial, second: Partial) -> Partial:
@@ -226,8 +248,8 @@ def merge(spec: Forward, first: Partial, second: Partial) -> Partial:
     keys), so `empty` is its identity under every spec."""
     m = jnp.maximum(first.m, second.m)
     safe = jnp.where(m == -jnp.inf, 0.0, m)
-    a, b = spec.power(first.m - safe), spec.power(second.m - safe)
-    acc = a[..., None] * first.acc + b[..., None] * second.acc
+    a, b = spec.carry(first.m - safe), spec.carry(second.m - safe)
+    acc = expand(a, first.acc) * first.acc + expand(b, second.acc) * second.acc
     return Partial(acc, m, a * first.total + b * second.total)
 
 
@@ -239,11 +261,11 @@ def finish(spec: Forward, state: Partial, *, initial: bool, output_mod: Callable
     m = state.m / LOG2E if spec.base2 else state.m
     denominator = state.total
     if spec.guarded or initial:
-        out = jnp.where(denominator[..., None] > 0,
-                        state.acc / jnp.where(denominator > 0, denominator, 1.0)[..., None], 0.0)
+        out = jnp.where(expand(denominator > 0, state.acc),
+                        state.acc / expand(jnp.where(denominator > 0, denominator, 1.0), state.acc), 0.0)
         m = jnp.where(m == -jnp.inf, 0.0, m)
     else:
-        out = state.acc / denominator[..., None]
+        out = state.acc / expand(denominator, state.acc)
     if output_mod is not None:
         out = output_mod(out, *output_params)
     return out, m, denominator
@@ -261,6 +283,12 @@ def inverse(total: jax.Array) -> jax.Array:
 def floating_params(params) -> list[int]:
     """The places of a hook's floating parameters, the ones it differentiates along."""
     return [index for index, param in enumerate(params) if jnp.issubdtype(param.dtype, jnp.floating)]
+
+
+def hooked(score_mod: Callable, logits: jax.Array, q_pos, k_pos, params) -> jax.Array:
+    """`score_mod` on a tile; a custom-derivative call in it lowers as its primal function (Dew's JAX
+    build, constraints.txt)."""
+    return score_mod(logits, q_pos, k_pos, *params)
 
 
 def differentiable(score_mod: Callable, q_pos, k_pos, params, floating: list[int]) -> Callable:
@@ -286,7 +314,7 @@ def scored(score_mod, logits, q_pos, k_pos, params, *, slopes: bool):
     if score_mod is None:
         return logits, None
     if not slopes:
-        return score_mod(logits, q_pos, k_pos, *params).astype(jnp.float32), None
+        return hooked(score_mod, logits, q_pos, k_pos, params).astype(jnp.float32), None
     floating = floating_params(params)
     inputs = (logits, *(params[index] for index in floating))
     out, pull = jax.vjp(differentiable(score_mod, q_pos, k_pos, params, floating), *inputs)
@@ -373,9 +401,9 @@ def off_anchor_delta(state: OffAnchor, anchor_value: jax.Array, dout: jax.Array,
     cotangent = dout.astype(jnp.float32)
     anchor_value = anchor_value.astype(jnp.float32)
     anchor = jnp.sum(anchor_value * cotangent, axis=-1)
-    about_zero = (jnp.sum((state.others + state.own[:, None] * anchor_value) * cotangent, axis=-1)
-                  + state_share)
-    about_anchor = (jnp.sum((state.others - state.others_total[:, None] * anchor_value) * cotangent, axis=-1)
+    own, others_total = expand(state.own, anchor_value), expand(state.others_total, anchor_value)
+    about_zero = jnp.sum((state.others + own * anchor_value) * cotangent, axis=-1) + state_share
+    about_anchor = (jnp.sum((state.others - others_total * anchor_value) * cotangent, axis=-1)
                     + state_share - state_total * anchor)
     anchored = jnp.abs(about_anchor) <= jnp.abs(about_zero)
     numerator = jnp.where(anchored, about_anchor, about_zero)
@@ -396,7 +424,7 @@ def split_delta(others: jax.Array, own: jax.Array, others_total: jax.Array, tota
     anchor_value = anchor_value.astype(jnp.float32)
     anchor = jnp.sum(anchor_value * cotangent, axis=-1)
     about_zero = jnp.sum(split_output(others, own, anchor_value) * cotangent, axis=-1)
-    about_anchor = (jnp.sum((others - others_total[:, None] * anchor_value) * cotangent, axis=-1)
+    about_anchor = (jnp.sum((others - expand(others_total, anchor_value) * anchor_value) * cotangent, axis=-1)
                     - state_total * anchor)
     anchored = jnp.abs(about_anchor) <= jnp.abs(about_zero)
     numerator = jnp.where(anchored, about_anchor, about_zero)
@@ -431,7 +459,7 @@ def dq_finish(sums: DqSums, prior: jax.Array, state_total: jax.Array, peak0: jax
     refined = refinement(residual, mass, peak0, shares, peak, total, anchor, delta)
     grads = tuple(grad * ratio - refined * (weighed * over)
                   for grad, weighed in zip(sums.grads, sums.weighed, strict=True))
-    return sums.dq * ratio[:, None], delta + refined, total, mass, grads
+    return sums.dq * expand(ratio, sums.dq), delta + refined, total, mass, grads
 
 
 def below(logits: jax.Array, peak: jax.Array) -> jax.Array:
@@ -439,13 +467,13 @@ def below(logits: jax.Array, peak: jax.Array) -> jax.Array:
     fp32: `m` is every key's maximum, so a logit past it by the rounding the two passes do not share (the
     forward's maximum taken in base 2 and back, or another tile shape's product) is the maximum itself,
     its weight 1, never past it."""
-    return jnp.exp(jnp.minimum(logits - peak[:, None], 0.0))
+    return jnp.exp(jnp.minimum(logits - expand(peak, logits), 0.0))
 
 
 def normalized(logits: jax.Array, peak: jax.Array, total: jax.Array) -> tuple[jax.Array, jax.Array]:
     """A tile's unnormalized weights `exp(s - m)` (`below`) and its weights `p`, fp32."""
     exponentials = below(logits, peak)
-    return exponentials, exponentials * inverse(total)[:, None]
+    return exponentials, exponentials * expand(inverse(total), exponentials)
 
 
 def grad_scores(exponentials: jax.Array, products: jax.Array, anchor: jax.Array, delta: jax.Array,
@@ -456,10 +484,11 @@ def grad_scores(exponentials: jax.Array, products: jax.Array, anchor: jax.Array,
     intermediate lies where the reference's does (a weight below fp32's range keeps its share beside a
     large product, and none overflows that the reference keeps); zero where unseen. The anchor key's
     own `dP - c` is 0 by definition where `at_anchor` names it, whatever its product's rounding."""
-    relative = products - anchor[:, None]
+    relative = products - expand(anchor, products)
     if at_anchor is not None:
         relative = jnp.where(at_anchor, 0.0, relative)
-    return jnp.where(seen, exponentials * ((relative - delta[:, None]) * inverse_total[:, None]), 0.0)
+    centred = (relative - expand(delta, relative)) * expand(inverse_total, relative)
+    return jnp.where(seen, exponentials * centred, 0.0)
 
 
 def refinement(residual: jax.Array, mass: jax.Array, peak0: jax.Array, shares: tuple[jax.Array, jax.Array],
@@ -486,5 +515,5 @@ def value_operands(exponentials: jax.Array, weights: jax.Array, dout: jax.Array,
     subnormal (about 9e-41) is dropped, which only a cotangent past about 1e28 would make count."""
     if dout.dtype == jnp.bfloat16:
         return weights.astype(dout.dtype).T, dout
-    scaled = dout.astype(jnp.float32) * inverse(total)[:, None]
+    scaled = dout.astype(jnp.float32) * expand(inverse(total), dout)
     return exponentials.astype(dout.dtype).astype(jnp.float32).T, scaled

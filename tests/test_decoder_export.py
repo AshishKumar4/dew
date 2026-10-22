@@ -90,7 +90,7 @@ import ml_dtypes
 import numpy as np
 import pytest
 from interop_support import assert_restores, assert_same_stored_tensors
-from model_support import flat_tree
+from model_support import cached_round_trips, flat_tree, streamed_export
 from reference_error import (
     FACTOR,
     ORDERS,
@@ -103,7 +103,7 @@ from reference_error import (
 )
 from residual_orders import orders, permuted, residual_width
 
-from dew.interop import Pretrained
+from dew.interop import Pretrained, PretrainedDecoder
 from dew.interop.safetensors_io import save_hf_layout
 from tools import decoder_export_reference as tool
 
@@ -147,14 +147,7 @@ def trips(workspace):
     the family-specific claims read the same round trip the parameterized
     ones do.
     """
-    cache = {}
-
-    def trip(name: str):
-        if name not in cache:
-            cache[name] = tool.round_trip(CASES[name], workspace)
-        return cache[name]
-
-    return trip
+    return cached_round_trips(tool.round_trip, CASES, workspace)
 
 
 @pytest.fixture(params=list(CASES), ids=list(CASES))
@@ -459,6 +452,27 @@ def test_the_export_carries_the_sources_tokenizer(tmp_path):
     assert again.processor.decode(rows) == source.processor.decode(rows)
 
 
+def test_the_export_assets_rewrite_a_tokenizers_nested_files_in_place(tmp_path):
+    """A tokenizer's files under a directory of their own (a processor's chat_templates/) are
+    published one file at a time like the rest, so a second export into the same directory replaces
+    them, as a weight reload into a serving directory does."""
+    from dew.interop.hf_decoders import save_export_assets
+
+    class Templated:
+        def __init__(self, template):
+            self.template = template
+
+        def save_pretrained(self, directory, /):
+            (Path(directory) / "chat_templates").mkdir()
+            (Path(directory) / "chat_templates" / "brief.jinja").write_text(self.template)
+            (Path(directory) / "tokenizer.json").write_text("{}")
+
+    save_export_assets(tmp_path, tokenizer=Templated("first"))
+    save_export_assets(tmp_path, tokenizer=Templated("second"))
+    assert (tmp_path / "chat_templates" / "brief.jinja").read_text() == "second"
+    assert (tmp_path / "tokenizer.json").read_text() == "{}"
+
+
 def test_an_export_past_its_shard_size_writes_shards_that_transformers_reads(tmp_path):
     """Past `max_shard_size` the weights go out as numbered shards and their
     index, which transformers and Dew both read back to the same logits; a
@@ -516,25 +530,41 @@ def test_a_sharded_export_holds_a_few_shards_on_the_host(tmp_path):
     serialized bytes and one transient tensor, four shards at most
     (measured 0.12-0.13 GB); building the whole export first rises by the
     model (0.32 GB on this checkpoint, 0.57 GB of Qwen3-0.6B's 1.11)."""
-    import os
-    import subprocess
-    import sys
-
-    root = Path(__file__).parents[1]
-    # One device, as a user's process has: the suite's simulated mesh would
-    # place every leaf eight times over.
-    env = {**{name: value for name, value in os.environ.items() if name != "XLA_FLAGS"},
-           "JAX_PLATFORMS": "cpu", "PYTHONPATH": str(root / "src")}
-    written = subprocess.run([sys.executable, "-c", SYNTHETIC_CHECKPOINT, str(FIXTURES / "qwen3-tiny"),
-                              str(tmp_path / "source")], capture_output=True, text=True, env=env)
-    assert written.returncode == 0, written.stderr[-2000:]
-    run = subprocess.run([sys.executable, str(root / "tools" / "benchmark_streaming_export.py"),
-                          str(tmp_path / "source"), "50MB", str(tmp_path / "out")],
-                         capture_output=True, text=True, env=env)
-    assert run.returncode == 0, run.stderr[-2000:]
-    measured = json.loads(run.stdout.splitlines()[-1])
+    measured = streamed_export(SYNTHETIC_CHECKPOINT, FIXTURES / "qwen3-tiny", tmp_path, "50MB")
     assert measured["shards"] > 4
     assert measured["rise_gb"] < 4 * 50e6 / 2**30, measured
+
+
+def test_a_decoder_stating_a_full_width_rotary_exports_and_transformers_reads_it(tmp_path):
+    """A Qwen3 decoder built with `partial_rotary_factor=1.0` rotates its whole head, as with none
+    stated: written from the model and its variables alone (`PretrainedDecoder.from_model`), it
+    saves, reloads to its own logits, and transformers reads the export to logits Dew's are as
+    exact as, both from transformers' in float64."""
+    import jax.numpy as jnp
+    import torch
+    from transformers import AutoModelForCausalLM
+
+    from dew.interop import PretrainedDecoder
+    from tools.diffusers_wan_reference import float64
+
+    loaded = Pretrained.load(FIXTURES / "qwen3-tiny", dtype="float32", attention_impl="reference")
+    model = loaded.model.clone(partial_rotary_factor=1.0)
+    ids = np.load(FIXTURES / "qwen3-tiny" / "input_ids.npy")
+    expected = np.asarray(model.apply(loaded.variables, jnp.asarray(ids)))
+    PretrainedDecoder.from_model(model, loaded.variables).save(tmp_path)
+    restored = Pretrained.load(tmp_path, dtype="float32", attention_impl="reference")
+    np.testing.assert_array_equal(np.asarray(restored.model.apply(restored.variables, jnp.asarray(ids))),
+                                  expected)
+
+    def theirs(dtype):
+        with float64() if dtype == torch.float64 else torch.no_grad():
+            reference = AutoModelForCausalLM.from_pretrained(tmp_path, attn_implementation="eager")
+            with torch.no_grad():
+                logits = reference.to(dtype).eval()(torch.from_numpy(ids).long(), use_cache=False).logits
+        return logits.double().numpy()
+
+    assert_as_exact_as_the_reference(expected.astype(np.float64), theirs(torch.float32),
+                                     theirs(torch.float64), "full-width rotary export logits")
 
 
 def test_a_policy_transformers_cannot_hold_is_refused_not_dropped():
@@ -1188,3 +1218,42 @@ def test_standalone_glm5_export_preserves_native_and_source_computation(variant,
             actual_leaves = flat_tree(restored.variables[collection])
             for name, value in flat_tree(variables[collection]).items():
                 np.testing.assert_array_equal(actual_leaves[name], value)
+
+
+def written_tensors(directory) -> dict:
+    """Every tensor the safetensors shards in `directory` hold."""
+    from safetensors.numpy import load_file
+
+    written = {}
+    for shard in sorted(Path(directory).glob("*.safetensors")):
+        written.update(load_file(str(shard)))
+    return written
+
+
+def assert_same_tensors(written: dict, expected: dict) -> None:
+    assert set(written) == set(expected)
+    for tensor, value in expected.items():
+        value = np.asarray(value)
+        assert written[tensor].dtype == value.dtype and np.array_equal(written[tensor], value), tensor
+
+
+@pytest.mark.parametrize("name", ["qwen3-moe-tiny", "deepseek-v3-tiny"])
+def test_a_moe_decoder_saves_every_tensor_its_source_holds(name, tmp_path):
+    """A causal MoE decoder saved in its source's layout writes every tensor the source checkpoint
+    holds, each expert's projections split from their stacked kernel and DeepSeek V3's balancing
+    bias from the `moe` collection, bit for bit, and its config keeps `use_cache`."""
+    loaded = Pretrained.load(FIXTURES / name, dtype="float32", param_dtype="auto", attention_impl="xla")
+    loaded.save(tmp_path)
+    assert_same_tensors(written_tensors(tmp_path), written_tensors(FIXTURES / name))
+    assert json.loads((tmp_path / "config.json").read_text())["use_cache"] is True
+
+
+def test_a_dense_decoder_written_from_its_model_holds_its_sources_tensors(tmp_path):
+    """A causal decoder written from its model and variables alone (`PretrainedDecoder.from_model`,
+    the encoder every family's derived export shares) writes every tensor its source checkpoint holds,
+    bit for bit, and records `use_cache` as a causal decoder's config does."""
+    loaded = Pretrained.load(FIXTURES / "qwen3-tiny", dtype="float32", param_dtype="auto",
+                             attention_impl="xla")
+    PretrainedDecoder.from_model(loaded.model, loaded.variables).save(tmp_path)
+    assert_same_tensors(written_tensors(tmp_path), written_tensors(FIXTURES / "qwen3-tiny"))
+    assert json.loads((tmp_path / "config.json").read_text())["use_cache"] is True

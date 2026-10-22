@@ -40,6 +40,7 @@ from typing import (
     TypeAliasType,
     TypedDict,
     Union,
+    get_args,
     overload,
     runtime_checkable,
 )
@@ -1045,6 +1046,20 @@ class WrapperClass(Protocol):
     def _dew_wrapper() -> Wrapper: ...
 
 
+def constructor_fields(member: type) -> tuple[dataclasses.Field, ...]:
+    """A dataclass's fields its constructor takes, a Flax module's `parent` and `name` aside: what
+    rebuilding an instance under another class (a wrapper's, `wrapper_layers`) passes on."""
+    return tuple(field for field in dataclasses.fields(member)
+                 if field.init and field.name not in ("parent", "name"))
+
+
+def rebuilt[Built](member: Callable[..., Built], model: DataclassInstance) -> Built:
+    """`model` built again by `member`, its own class or one that wraps it (`wrapper_layers`), from its
+    constructor fields (`constructor_fields`) as it holds them; `rebuilt(dict, model)` is those fields
+    by name. `model` is any dataclass instance, a Flax module among them."""
+    return member(**{field.name: getattr(model, field.name) for field in constructor_fields(type(model))})
+
+
 def wrapper_layers(model_type: type) -> tuple[type, tuple[WrapperClass, ...]]:
     """The class `model_type`'s wrappers wrap and its wrapper classes, the
     outermost first.
@@ -1082,8 +1097,8 @@ def configured(value: object) -> Configured:
 
 
 DtypeName = Literal["float32", "bfloat16", "float16"]
-_DTYPES: dict[DtypeName, DTypeLike] = {
-    "float32": jnp.float32, "bfloat16": jnp.bfloat16, "float16": jnp.float16}
+_DTYPES: dict[DtypeName, DTypeLike] = {name: getattr(jnp, name) for name in get_args(DtypeName)}
+"""Each storage dtype a config names, by its name: `DtypeName`'s, the one declaration."""
 
 
 def resolve_dtype(value: object) -> DTypeLike | None:
@@ -1116,10 +1131,16 @@ def dtype_name(value: DTypeLike | None) -> DtypeName | None:
     A loader takes a dtype, `jnp.bfloat16`, or its name, and records the name."""
     if value is None:
         return None
-    for name, dtype in _DTYPES.items():
-        if jnp.dtype(value) == jnp.dtype(dtype):
-            return name
-    raise ValueError(f"{value!r} is not a dtype a config can name")
+    name = storage_name(value)
+    if name is None:
+        raise ValueError(f"{value!r} is not a dtype a config can name")
+    return name
+
+
+def storage_name(value: DTypeLike) -> DtypeName | None:
+    """The name of the storage dtype `value` is (`DtypeName`), or None for any other dtype: a
+    checkpoint's float64 or integer tensors are not storage a config names."""
+    return next((name for name, dtype in _DTYPES.items() if jnp.dtype(value) == jnp.dtype(dtype)), None)
 
 
 def with_dtype(name: str, fields: Mapping[str, object], dtype: str | None) -> Mapping[str, object]:

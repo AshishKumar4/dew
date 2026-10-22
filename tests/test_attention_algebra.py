@@ -121,8 +121,9 @@ def test_both_mainloops_compute_the_same_gradients_under_every_score_hook(hooks,
 @pytest.mark.parametrize("hooks", ["none", "sinks", "softcap"])
 def test_the_forwards_split_sums_give_the_first_passes_gradients(hooks):
     """The backward from the forward's split sums (`algebra.split_delta`) and from the dQ launch's own
-    first pass over the keys (`algebra.off_anchor_delta`) on par with each other's reference (check 1),
-    over a windowed causal call of packed documents: the training forward's sums are the first pass."""
+    first pass over the keys (`algebra.off_anchor_delta`) on par (check 1, the reference's float64 gradients
+    the truth), over a windowed causal call of packed documents: the training forward's sums are the first
+    pass."""
     queries, keys = geometry(CASES["causal-documents-window"])
     spans = template.spans(queries, keys, ROWS, **arguments(CASES["causal-documents-window"]))
     score_mod, kinds, draw_hooks = score_hooks(SCORE_HOOKS[hooks], queries, keys, 32)
@@ -142,7 +143,17 @@ def test_the_forwards_split_sums_give_the_first_passes_gradients(hooks):
 
         return jax.jit(run)
 
-    assert_as_exact(grads(split=True), grads(split=False), draw, f"split sums {hooks}", seeds=SPLIT_SEEDS)
+    def truth(query, key, value, dout, params, initial):
+        # The reference's own gradients, in the float64 the gate widens to.
+        def attend(query, key, value, params, initial):
+            given = tuple(template.Param(value, kind) for value, kind in zip(params, kinds, strict=True))
+            return template.reference(query, key, value, spans, template.Hooks(score_mod, given, initial))
+
+        pull = jax.vjp(attend, query, key, value, params, initial)[1]
+        return pull(dout)
+
+    assert_as_exact(grads(split=True), grads(split=False), draw, f"split sums {hooks}", seeds=SPLIT_SEEDS,
+                    truth_fn=truth)
 
 
 SPLIT_SEEDS = 8
@@ -183,14 +194,14 @@ def test_two_states_merged_are_on_par_with_one_pass_over_their_keys():
         np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs))
 
 
-def forwards(query, key, value, spans, hooks=None, *, residuals=False):
+def forwards(query, key, value, spans, hooks=None, *, residuals=False, scale=None):
     """The Triton mainloop's forward, interpreted, and the plain-JAX one's, at 32 by 32 tiles."""
     tiles = attention_triton.Tiles(32, 32, 4, 2)
     with tuning.pinned({attention_triton.TritonForward: tiles}):
         triton = attention_triton.forward(query, key, value, spans, hooks, residuals=residuals,
-                                          interpret=True)
+                                          interpret=True, scale=scale)
     portable = attention_portable.attend(query, key, value, spans, hooks, block_q=32, block_k=32,
-                                         pad=attention_triton.BLOCK, residuals=residuals)
+                                         pad=attention_triton.BLOCK, residuals=residuals, scale=scale)
     return triton, portable
 
 
@@ -335,6 +346,47 @@ def test_a_logit_past_the_forwards_rounded_maximum_weighs_one_in_the_backward():
         np.testing.assert_array_equal(np.asarray(found.value), 1)
 
 
+@pytest.mark.parametrize("natural", [False, True], ids=["default", "natural"])
+def test_a_resumed_state_carried_far_is_as_exact_as_the_references(natural):
+    """fp32, one query over one key whose logit is 40 to 87 above a resumed state's maximum (0), the
+    state's weighted values 2^60 to 2^100 times a normal draw and its denominator 1, the key's value a
+    normal draw: the output is the state's share carried over that distance. The factor the state takes
+    to the key's maximum is the reference's `exp` (`Forward.carry`), so each mainloop holds check 1
+    against the reference; `exp2(x * log2(e))`, the natural form's key-weight exponential, rounds its
+    argument about `|x|` ulps away on a GPU (`natural_exp`). The Triton mainloop compiles on a GPU, whose
+    exp2 is the hardware's own; XLA's CPU computes exp2 through exp."""
+    spans = template.spans(1, 1, 4)
+
+    def draw(seed: int):
+        streams = jax.random.split(jax.random.key(seed), 4)
+        distance = jax.random.uniform(streams[0], (4, 1, 1, 1), jnp.float32, 40.0, 87.0)
+        size = jnp.exp2(jnp.round(jax.random.uniform(streams[1], (4, 1, 1), jnp.float32, 60.0, 100.0)))
+        acc = jax.random.normal(streams[2], (4, 1, 1, 8), jnp.float32) * size[..., None]
+        value = jax.random.normal(streams[3], (4, 1, 1, 8), jnp.float32)
+        return distance, value, acc
+
+    def state(acc):
+        return template.Hooks(initial=template.Initial(jnp.zeros((4, 1, 1)), jnp.ones((4, 1, 1)), acc))
+
+    def triton(distance, value, acc):
+        with tuning.pinned({attention_triton.TritonForward: attention_triton.Tiles(32, 32, 4, 2)}):
+            return attention_triton.forward(distance, jnp.ones_like(distance), value, spans, state(acc),
+                                            scale=1.0, natural=natural,
+                                            interpret=jax.default_backend() != "gpu")
+
+    def portable(distance, value, acc):
+        return attention_portable.attend(distance, jnp.ones_like(distance), value, spans, state(acc),
+                                         block_q=32, block_k=32, pad=attention_triton.BLOCK, scale=1.0,
+                                         natural=natural)
+
+    def reference(distance, value, acc):
+        return template.reference(distance, jnp.ones_like(distance), value, spans, state(acc), scale=1.0)
+
+    for name, ours in (("triton", triton), ("portable", portable)):
+        assert_as_exact(jax.jit(ours), jax.jit(reference), draw,
+                        f"{name} resumed state carried far {'natural' if natural else 'default'}", seeds=8)
+
+
 def test_a_large_initial_maximum_gives_the_references_state_gradients():
     """fp32, one query over one key resumed from a state at maximum 1610613120 holding a denominator and
     weighted value of 1, Q 0 and K, V and dO 1, scale 1: the forward's maximum, the state's, rounds
@@ -361,3 +413,31 @@ def test_a_large_initial_maximum_gives_the_references_state_gradients():
         for mine, theirs in zip(jax.tree.leaves(found.initial), jax.tree.leaves(reference), strict=True):
             assert np.isfinite(np.asarray(mine)).all()
             np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs))
+
+
+@pytest.mark.parametrize("keys, query_size, key_sizes, out", [
+    (2, 1.0, (1610613120.0, 1610612992.0), 1.0),
+    (1, 3e38, (1.0,), 1.0),
+], ids=["one ulp apart at 1.6e9", "a logit near fp32's largest"])
+def test_a_logit_the_reference_keeps_stays_finite_and_apart(keys, query_size, key_sizes, out):
+    """fp32, one query of `query_size` over keys of `key_sizes`, the first's value 1 and the rest 0, scale 1
+    the reference weighs the larger logit alone
+    (out 1), keeping logits one ulp apart at 1.6e9 apart and a logit near fp32's largest finite. Both
+    mainloops keep the logits natural, as the reference does, and give its output and finite gradients
+    under an output cotangent of 1."""
+    spans = template.spans(1, keys, 1)
+    query = jnp.full((1, 1, 1, 1), query_size, jnp.float32)
+    key = jnp.asarray(key_sizes, jnp.float32).reshape(1, keys, 1, 1)
+    value = jnp.zeros((1, keys, 1, 1), jnp.float32).at[0, 0].set(1.0)
+    dout = jnp.ones((1, 1, 1, 1), jnp.float32)
+    for found in forwards(query, key, value, spans, scale=1.0):
+        np.testing.assert_array_equal(np.asarray(found), out)
+    pins = {attention_triton.TritonBackward: attention_triton.BackwardTiles(32, 32, 4, 2, 4, 2),
+            attention_triton.TritonForward: attention_triton.Tiles(32, 32, 4, 2)}
+    with tuning.pinned(pins):
+        triton = attention_triton.backward(query, key, value, spans, None, dout, scale=1.0, interpret=True)
+    portable = attention_portable.backward(query, key, value, spans, None, dout, block_q=32, block_k=32,
+                                           pad=attention_triton.BLOCK, scale=1.0)
+    for found in (triton, portable):
+        for leaf in (found.query, found.key, found.value):
+            assert np.isfinite(np.asarray(leaf)).all()

@@ -41,9 +41,10 @@ def assumed(generation: str | None) -> Iterator[None]:
 
 
 CHOICES = frozenset({'attention', 'attention_narrow', 'attention_packed', 'attention_sinks',
-                     'attention_window', 'decode', 'delta_decode', 'delta_gates', 'gate_up',
-                     'gated_delta_rule', 'grouped_matmul', 'local_attention', 'mla', 'narrow_copies',
-                     'paged_decode', 'rms_norm', 'short_conv', 'ssd', 'ssd_decode', 'swiglu'})
+                     'attention_window', 'decode', 'delta_decode', 'delta_gates', 'gate_up', 'gemm_epilogue',
+                     'gemm_prologue', 'gated_delta_rule', 'grouped_matmul', 'local_attention', 'mla',
+                     'narrow_copies', 'paged_decode', 'rms_norm', 'short_conv', 'ssd', 'ssd_decode',
+                     'swiglu'})
 """The choices `measured_kernel` answers, and so the ones `chosen` may name and a dispatch reports
 (`route`). A choice no generation's row names runs its site's own best kernel."""
 
@@ -120,6 +121,9 @@ class GpuTarget:
     """The generation's global-memory load latency in multiprocessor clocks, as a pointer chase measures
     it (the kernel cost model's waiting term, `dew.nn.kernels.templates.cost`); None where no
     measurement states it."""
+    scoped_vmem: int | None = None
+    """A TPU's scoped VMEM limit in bytes at XLA's default, past which a Mosaic kernel refuses to compile
+    (`dew.nn.attention.splash_block_sizes`); None where no measurement states it."""
     int8_triton_gemm: bool = False
     """Whether XLA's Triton GEMM fusion computes int8 dots right on this GPU: on none measured, an
     A100 and an RTX PRO 6000 Blackwell, at jaxlib 0.11.2 (openxla/xla#51016;
@@ -253,7 +257,8 @@ TARGETS = {target.generation: target for target in (
     GpuTarget('v2', 'TPU v2', dense_peaks={'TPU v2': {'bf16': 22.5e12}}),
     GpuTarget('v3', 'TPU v3', dense_peaks={'TPU v3': {'bf16': 61.5e12}}),
     GpuTarget('v4', 'TPU v4', dense_peaks={'TPU v4': {'bf16': 275e12}}),
-    GpuTarget('v5e', 'TPU v5 lite', dense_peaks={'TPU v5 lite': {'bf16': 197e12}}),
+    # Its scoped VMEM limit read from a Mosaic kernel's refusal on a v5e ("limit 16.00M", 2026-10-21).
+    GpuTarget('v5e', 'TPU v5 lite', dense_peaks={'TPU v5 lite': {'bf16': 197e12}}, scoped_vmem=16 * 2 ** 20),
     GpuTarget('v5p', 'TPU v5', dense_peaks={'TPU v5': {'bf16': 459e12}, 'TPU v5p': {'bf16': 459e12}}),
     GpuTarget('v6e', 'TPU v6 lite', dense_peaks={'TPU v6 lite': {'bf16': 918e12}}),
 )}

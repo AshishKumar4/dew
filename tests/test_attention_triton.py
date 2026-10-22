@@ -592,3 +592,35 @@ def test_the_shared_memory_bound_keeps_what_triton_compiles_and_prunes_what_it_r
         assert staged <= budget
     else:
         assert staged >= requested > budget
+
+
+@pytest.mark.parametrize("target", ["sm80", "sm90"])
+def test_a_hook_through_a_custom_vjp_lowers_and_compiles_on_tritons_compiler(target):
+    """The softcap through a `jax.custom_vjp`, whose forward rule calls the hook itself as JAX's
+    documented pattern does, as the score hook of the forward (the output hook too) and the backward,
+    lowered as on the GPU and compiled by XLA's CUDA backend for a compile-only device on this CPU
+    (tests/kernel_compile.py): no Pallas Triton lowering takes a custom-derivative call, which the
+    interpreted suite never lowers, so a hook's call must reach the kernels as its primal."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_kernels, failures
+
+    spans = template.spans(256, 256, 1, causal=True)
+    score = template.Hooks(score_mod=lambda s, q_pos, k_pos: custom_softcap(s))
+    hooks = template.Hooks(score_mod=score.score_mod, output_mod=custom_softcap)
+    shape = jax.ShapeDtypeStruct((1, 256, 2, 64), jnp.float32)
+    pins = {attention_triton.TritonForward: PINNED[0], attention_triton.TritonBackward: joint(PINNED[0])}
+
+    def forward(query, key, value):
+        with tuning.pinned(pins):
+            return attention_triton.forward(query, key, value, spans, hooks, residuals=True)
+
+    def backward(query, key, value, dout):
+        with tuning.pinned(pins):
+            grads = attention_triton.backward(query, key, value, spans, score, dout)
+        return grads.query, grads.key, grads.value
+
+    found = compile_kernels([KernelCase("forward", lambda: (forward, (shape,) * 3)),
+                             KernelCase("backward", lambda: (backward, (shape,) * 4))], target)
+    assert len(found) == 2
+    assert not failures(found), "\n".join(failures(found))
+    assert all(record["shared"] > 0 for record in found), found

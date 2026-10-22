@@ -18,13 +18,13 @@ dependencies = [
     "flax>=0.12.10,<0.13",
     # Dew's JAX build: 0.11.2 with the fixes no release has yet (constraints.txt
     # names them), which only Dew's package index serves, pypi.dewml.dev. The
-    # first build with every fix is post11; a release sorts below it, so an
+    # first build with every fix is post12; a release sorts below it, so an
     # install from PyPI alone stops at resolving jax rather than running on a
     # jax without them (docs/installation.md). The accelerator builds the
     # cuda12, cuda13 and tpu extras name are 0.11.2's. A bump runs the GPU
     # checks docs/installation.md lists under "Bumping JAX" first: CI is
     # CPU-only.
-    "jax>=0.11.2.post11,<0.11.3",
+    "jax>=0.11.2.post12,<0.11.3",
     "optax>=0.2.2",
     "orbax-checkpoint>=0.12.4",
     "numpy",
@@ -126,8 +126,10 @@ test = [
     "scipy",
     # tests/test_reporting.py exercises the WandbTracker adapter.
     "dewml[wandb]",
-    # The committed VAE fixture was generated with this reference release.
-    "diffusers==0.34.0",
+    # The Diffusers references the tests run live (Flux 2's and Z-Image's transformers among them),
+    # and the release the committed VAE fixture records: 0.39.0, the last that ships Diffusers' Flax
+    # modules, which the Flax VAE, UNet and pipeline references read (0.40.0 removed them).
+    "diffusers==0.39.0",
     # tests/test_wan_source.py cleans prompts as Wan's pipelines do (the wan extra).
     "dewml[wan]",
     # tests/test_tools.py imports FlaxDiff's reference, whose hilbert module imports matplotlib.
@@ -137,12 +139,10 @@ test = [
     "dewml[live]",
     # tests/test_notebook_display.py executes a notebook in a Jupyter kernel and reads it back saved.
     "dewml[notebooks]",
-    # Every decoder and MoE parity number is calibrated against this exact
-    # release: the fixtures record it (tests/fixtures/hf/*/meta.json), the
-    # tests cite its line numbers, and a resolve that moved it would compare
-    # dew against a different reference while the tolerances stayed. The
-    # library accepts this release and later; the reference suite pins it.
-    "transformers==5.16.1",
+    # The reference suite runs this exact release: the fixtures that record their release
+    # (tests/fixtures/hf/*/meta.json) were recorded under it, and a resolve that moved it would
+    # compare Dew against a different reference unseen. The library accepts 5.16.1 and later.
+    "transformers==5.17.0",
     # tests/test_reference_helpers.py holds tools/kimi_k3_reference.py's MXFP4
     # encoding, this release's compressor, the one that tool's environment names.
     "compressed-tensors==0.17.1",
@@ -309,6 +309,7 @@ markers = [
     "distributed: tests that need real processes with jax.distributed",
     "mesh(devices=8): tests that need that many devices; tests/conftest.py skips them, naming both device counts, on a run with fewer",
     "gpu(reason): tests only a cuda device runs; tests/conftest.py skips them on any other backend, and a GPU session runs them with -m gpu",
+    "tpu(reason): tests only a tpu runs; tests/conftest.py skips them on any other backend, and the TPU tier (dew-ops' dewops.node.tpu, a Colab TPU at main's tip after each train) runs them with -m tpu",
     "torchax: tests whose code imports torchax, which renames torch's privateuse1 backend process-wide; CI runs these files in tasks of their own (tools/armada/ci.py)",
     "kernel: tests of a GPU kernel's code (Pallas, Triton, fla): the CPU suite lowers and interprets them, and the kernel lab's GPU tier runs every one, with every gpu test, on each target GPU before the kernel lands",
 ]

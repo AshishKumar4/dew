@@ -49,19 +49,11 @@ from dew.nn.inputs import (
 from dew.nn.kernels.selection import select
 from dew.nn.kv_cache import PAGED, PLACES, TABLE, Append, KVCache, KVStore, filled_slots, rotated, write_cache
 from dew.nn.local_attention import local_attention
-from dew.nn.mixer_base import MixerBase, MixerContext
+from dew.nn.mixer_base import QKV_RESIDUALS, MixerBase, MixerContext
 from dew.nn.ngpt import NGPT, gain, unit
-from dew.nn.precision import at_least_fp32, rounded_to, scaled
+from dew.nn.precision import at_least_fp32, float32_dot_general, rounded_to, scaled
 from dew.nn.protocols import ProjectionGroup
-from dew.nn.rope import (
-    LongRopeScaling,
-    axis_halves,
-    axis_tables,
-    mrope_tables,
-    rotary_freqs,
-    rotate,
-    yarn_rope_freqs,
-)
+from dew.nn.rope import LongRopeScaling, axis_halves, axis_tables, mrope_tables, rotary_freqs, rotate
 from dew.nn.sharding import HEADS, KV_HEADS, constrain, logical_axes
 
 
@@ -215,7 +207,7 @@ class CausalSelfAttention(nn.Module):
     """Whether the queries, keys and values project through one kernel,
     `qkv_proj`, at init as from a checkpoint that stores them so (the Qwen 3.5
     and DeepSeek-V4.1 vision towers)."""
-    linear: Callable[..., Dense] = Dense
+    linear: Callable[..., Dense] = functools.partial(Dense, dot_general=float32_dot_general)
     """The projections' module: Gemma 4's vision tower clips their inputs and
     outputs (`dew.nn.vision.gemma4.Gemma4ClippableLinear`)."""
     nope: bool = False
@@ -470,17 +462,13 @@ class CausalSelfAttention(nn.Module):
                 raise ValueError("M-RoPE requires default partial rotary")
             return mrope_tables(rotary_positions, self.mrope_section, self._rot_dim() or self.ctx.head_dim,
                                 self.ctx.rope_theta, dtype=dtype)
-        if self.ctx.yarn is None:
-            return rotary_freqs(
-                rotary_positions, self.ctx.head_dim, self.ctx.rope_theta, rot_dim=self._rot_dim(),
-                partial_rotary_type=self.ctx.partial_rotary_type, rope_scaling=self.ctx.rope_scaling,
-                dtype=dtype, reach=reach)
-        if self.ctx.partial_rotary_factor is not None or self.ctx.rope_scaling is not None:
-            raise ValueError(
-                "yarn rotates whole heads at its own frequencies, so it takes "
-                "neither partial_rotary_factor nor rope_scaling")
-        return yarn_rope_freqs(rotary_positions, self.ctx.head_dim, self.ctx.rope_theta, self.ctx.yarn,
-                               dtype=dtype)
+        if self.ctx.yarn is not None and self.ctx.rope_scaling is not None:
+            raise ValueError("yarn and rope_scaling are two rope scalings; a layer takes one")
+        return rotary_freqs(
+            rotary_positions, self.ctx.head_dim, self.ctx.rope_theta, rot_dim=self._rot_dim(),
+            partial_rotary_type=self.ctx.partial_rotary_type,
+            rope_scaling=self.ctx.rope_scaling if self.ctx.yarn is None else self.ctx.yarn,
+            dtype=dtype, reach=reach)
 
     def _metadata_mask(self, metadata: AttentionMetadata | None, slots, counted,
                        batch: int, length: int, key_length: int, decode: bool):
@@ -555,7 +543,7 @@ class CausalSelfAttention(nn.Module):
         positions, segment_ids = tokens.positions if decode else tokens.places(), tokens.segments
         logical_positions = positions
         # The projections and the kernel's output carry the names a remat
-        # policy saves or offloads (decoder_block.RESIDUALS).
+        # policy saves or offloads (mixer_base.RESIDUALS).
         projected_kv = None
         group = self._group()
         if group is not None and self._packed():
@@ -1142,7 +1130,7 @@ class AttentionMixer(MixerBase):
     (`{"name": "attention", "fields": {"nope": true}}`).
     """
 
-    residuals = ('q_proj', 'k_proj', 'v_proj', 'kv_proj', 'output_gate', 'o_proj', 'context')
+    residuals = (*QKV_RESIDUALS, 'output_gate', 'o_proj', 'context')
 
     bidirectional_images: bool = False
     mrope_section: tuple[int, int, int] | None = None

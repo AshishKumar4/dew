@@ -60,11 +60,11 @@ from dew.nn.attention_sinks import sink_softmax
 from dew.nn.dense import Dense
 from dew.nn.documents import document_mask
 from dew.nn.fake_quant import FakeQuantizing
-from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of
+from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of, valid_order
 from dew.nn.kv_cache import KVCache, write_cache
-from dew.nn.mixer_base import MixerBase, MixerContext
-from dew.nn.precision import at_least_fp32
-from dew.nn.rope import YarnScaling, rotate, yarn_rope_freqs
+from dew.nn.mixer_base import ATTENTION_CONTEXT_RESIDUALS, MixerBase, MixerContext
+from dew.nn.precision import at_least_fp32, float32_dot_general, float32_einsum
+from dew.nn.rope import YarnScaling, rotary_freqs, rotate
 from dew.nn.sharding import RESIDUAL, LogicalAxes, constrain, down_projection, logical_axes
 from dew.nn.sparse_selection import candidate_pool, index_scores, selection_mask, top_k_keys, top_k_selection
 
@@ -87,6 +87,14 @@ untouched (modeling_deepseek_v4.py:326-350). The attention output turns
 back by the negated sine, the conjugate rotation, which undoes it at a YaRN
 amplitude of 1 and scales the slice by its square otherwise, as the
 reference's does."""
+
+
+def gated_sum(kv, gate, axis: int):
+    """A window's entry: `kv` summed over its `axis` of positions, each weighted by the softmax of
+    its `gate` there, taken in at least fp32 and cast to `kv`'s dtype (modeling_deepseek_v4.py's
+    compressor), cached or uncached alike."""
+    weights = jax.nn.softmax(gate.astype(at_least_fp32(gate.dtype)), axis=axis).astype(kv.dtype)
+    return jnp.sum(kv * weights, axis=axis)
 
 
 def pool_windows(kv, gate, position_bias, rate: int, overlap: bool):
@@ -117,8 +125,7 @@ def pool_windows(kv, gate, position_bias, rate: int, overlap: bool):
             [jnp.full_like(gate[:, :1, :, :width], -jnp.inf), gate[:, :-1, :, :width]], axis=1)
         kv = jnp.concatenate([previous_kv, kv[..., width:]], axis=2)
         gate = jnp.concatenate([previous_gate, gate[..., width:]], axis=2)
-    weights = jax.nn.softmax(gate.astype(at_least_fp32(gate.dtype)), axis=2).astype(kv.dtype)
-    return jnp.sum(kv * weights, axis=2)
+    return gated_sum(kv, gate, axis=2)
 
 
 def real_first(x, valid):
@@ -128,7 +135,7 @@ def real_first(x, valid):
     (`Coordinates.places`), never a padding token. Unpadded rows come back as they are."""
     if valid is None:
         return x
-    order = jnp.argsort(~valid, axis=1, stable=True)
+    order, _ = valid_order(valid)
     return jnp.take_along_axis(x, order.reshape(*order.shape, *(1,) * (x.ndim - 2)), axis=1)
 
 
@@ -173,9 +180,7 @@ def append_windows(kv, gate, slots, buffers, previous, rate: int, width: int):
             if old is not None:
                 window_key = jnp.concatenate([old[0], window_key[..., width:]], axis=1)
                 window_gate = jnp.concatenate([old[1], window_gate[..., width:]], axis=1)
-            weights = jax.nn.softmax(window_gate.astype(at_least_fp32(window_gate.dtype)),
-                                     axis=1).astype(window_key.dtype)
-            entry = jnp.sum(window_key * weights, axis=1)
+            entry = gated_sum(window_key, window_gate, axis=1)
             at = jnp.where(closed, count, -1)[:, None]
             values = write_cache(values, entry[:, None], at)
             indices = write_cache(
@@ -212,7 +217,7 @@ class GroupedLinear(nn.Module):
         kernel = self.param('kernel', nn.initializers.lecun_normal(),
                             (self.groups, x.shape[-1], self.features), jnp.float32)
         dtype = x.dtype if self.dtype is None else self.dtype
-        return jnp.einsum('...gi,gio->...go', x.astype(dtype), kernel.astype(dtype),
+        return float32_einsum('...gi,gio->...go', x.astype(dtype), kernel.astype(dtype),
                           precision=self.precision)
 
 
@@ -250,7 +255,8 @@ class CompressedEntries(FakeQuantizing):
     def setup(self):
         series = 2 if self.overlap else 1
         projected = self.pool_dtype if self.gated and self.pool_dtype is not None else self.dtype
-        dense = functools.partial(Dense, use_bias=False, dtype=projected, precision=self.precision)
+        dense = functools.partial(Dense, use_bias=False, dtype=projected, precision=self.precision,
+                                  dot_general=float32_dot_general)
         self.kv_proj = dense(series * self.width, name='kv_proj')
         if self.gated:
             self.gate_proj = dense(series * self.width, name='gate_proj')
@@ -284,8 +290,8 @@ class CompressedEntries(FakeQuantizing):
 
     def rotate(self, latents, windows):
         """Rotate each entry at its window's first position, `window * rate`."""
-        cos, sin = yarn_rope_freqs(windows * self.rate, self.rope_dim, self.rope_theta, self.yarn,
-                                   dtype=at_least_fp32(latents.dtype))
+        cos, sin = rotary_freqs(windows * self.rate, self.rope_dim, self.rope_theta, rope_scaling=self.yarn,
+                                dtype=at_least_fp32(latents.dtype))
         return _rotate_rope(latents, cos, sin)
 
     def entries(self, x, valid=None):
@@ -353,7 +359,7 @@ class IndexScorer(nn.Module):
     @nn.compact
     def __call__(self, query, keys, x):
         weights = Dense(self.n_heads, use_bias=False, dtype=self.dtype,
-                        precision=self.precision, name='weights_proj')(x)
+                        precision=self.precision, name='weights_proj', dot_general=float32_dot_general)(x)
         return index_scores(query, keys, weights, self.precision)
 
 
@@ -374,7 +380,8 @@ class LightningIndexer(CompressedEntries):
                 f"of width {self.width}, so the heads have to be wider")
         super().setup()
         self.q_b_proj = Dense(self.n_heads * self.width, use_bias=False,
-                              dtype=self.dtype, precision=self.precision, name='q_b_proj')
+                              dtype=self.dtype, precision=self.precision, name='q_b_proj',
+                              dot_general=float32_dot_general)
         self.scorer = IndexScorer(n_heads=self.n_heads, dtype=self.dtype, precision=self.precision,
                                   name='scorer')
 
@@ -447,7 +454,8 @@ class Csa2Indexer(FakeQuantizing):
             raise ValueError(
                 f"the indexer rotates a {self.rope_dim}-wide rope slice out of heads "
                 f"of width {self.head_dim}, so the heads have to be wider")
-        dense = functools.partial(Dense, use_bias=False, dtype=self.dtype, precision=self.precision)
+        dense = functools.partial(Dense, use_bias=False, dtype=self.dtype, precision=self.precision,
+                                  dot_general=float32_dot_general)
         self.wq_b = dense(self.n_heads * self.head_dim, name='wq_b')
         self.weights_proj = dense(self.n_heads, name='weights_proj')
         if self.owns_keys:
@@ -585,7 +593,8 @@ class DeepseekV4Attention(FakeQuantizing):
         if self.kv_qat and (self.head_dim % 32 or (self.index_head_dim or 32) % 32):
             raise ValueError("the cache rounds the keys per 32 channels and the index keys "
                              "per 32, so head_dim and index_head_dim are multiples of 32")
-        dense = functools.partial(Dense, use_bias=False, dtype=self.dtype, precision=self.precision)
+        dense = functools.partial(Dense, use_bias=False, dtype=self.dtype, precision=self.precision,
+                                  dot_general=float32_dot_general)
         norm = functools.partial(RMSNorm, epsilon=self.norm_eps, scale_after_cast=True, dtype=self.dtype)
         self.q_a_proj = dense(self.q_lora_rank, name='q_a_proj')
         self.q_a_norm = norm(name='q_a_norm')
@@ -644,17 +653,17 @@ class DeepseekV4Attention(FakeQuantizing):
         elif cache is None:
             entries, latents = self.compress.entries_and_latents(x, valid)
             windows = jnp.arange(latents.shape[1])
-            keys = self.indexer.keys(latents, *yarn_rope_freqs(windows * rate, self.rope_dim,
-                                                               self.rope_theta, self.yarn,
-                                                               dtype=at_least_fp32(latents.dtype)))
+            keys = self.indexer.keys(latents, *rotary_freqs(windows * rate, self.rope_dim,
+                                                            self.rope_theta, rope_scaling=self.yarn,
+                                                            dtype=at_least_fp32(latents.dtype)))
         else:
             slots, capacity, allocated = cache
             entries, latents, windows = self.compress.cached_entries(x, slots, capacity, allocated)
             held = self.variable('cache', 'index_keys', jnp.zeros,
                                  (x.shape[0], capacity // rate, index_head_dim), latents.dtype)
-            fresh = self.indexer.keys(latents, *yarn_rope_freqs(windows * rate, self.rope_dim,
-                                                                self.rope_theta, self.yarn,
-                                                                dtype=at_least_fp32(latents.dtype)))
+            fresh = self.indexer.keys(latents, *rotary_freqs(windows * rate, self.rope_dim,
+                                                             self.rope_theta, rope_scaling=self.yarn,
+                                                             dtype=at_least_fp32(latents.dtype)))
             if allocated:
                 held.value = write_cache(held.value, fresh, windows)
             keys = held.value
@@ -710,19 +719,14 @@ class DeepseekV4Attention(FakeQuantizing):
                 positions = slots
         positions = jnp.arange(length) if positions is None else jnp.asarray(positions)
         rows = jnp.arange(length)
-        cos, sin = yarn_rope_freqs(positions, self.rope_dim, self.rope_theta, self.yarn,
-                                   dtype=at_least_fp32(x.dtype))
+        cos, sin = rotary_freqs(positions, self.rope_dim, self.rope_theta, rope_scaling=self.yarn,
+                                dtype=at_least_fp32(x.dtype))
 
         # The query latent and the shared key head project the residual down,
         # where `down_projection` places them: on each tensor shard's own
         # tokens where the link pays for gathering them back.
         place = down_projection(x, self.q_lora_rank + self.head_dim)
-        q_resid = constrain(self.q_a_norm(self.q_a_proj(constrain(x, place))), place)
-        query = checkpoint_name(self.q_b_proj(constrain(q_resid, RESIDUAL)), 'q_proj').reshape(
-            batch, length, self.num_heads, self.head_dim)
-        if self.query_norm:
-            query = unweighted_rmsnorm(query, self.norm_eps)
-        query = _rotate_rope(query, cos, sin)
+        query, q_resid = self._queries(x, cos, sin, place)
         # V4.1's window cache keeps FP8, RoPE included (v41:700-707)
         keys = self._window_keys(x, cos, sin, place)
 
@@ -759,6 +763,20 @@ class DeepseekV4Attention(FakeQuantizing):
         output = self._attend(query, keys, allowed, cos, sin)
         return output if valid is None else jnp.where(valid[..., None], output, 0)
 
+    def _queries(self, x, cos, sin, place):
+        """The heads' queries of `x` `[B, S, width]`: the residual projected down to the query latent
+        where `place` puts it (`down_projection`), normed, projected up and marked `q_proj` for a
+        remat policy, split into heads, normed without a weight where the release does
+        (`query_norm`), and rotated by `cos` and `sin` on their trailing channels: the ordinary
+        forward's and DSpark's draft step's alike. Returns them with the normed query latent, which
+        a compressor's indexer reads."""
+        q_resid = constrain(self.q_a_norm(self.q_a_proj(constrain(x, place))), place)
+        query = checkpoint_name(self.q_b_proj(constrain(q_resid, RESIDUAL)), 'q_proj').reshape(
+            *x.shape[:2], self.num_heads, self.head_dim)
+        if self.query_norm:
+            query = unweighted_rmsnorm(query, self.norm_eps)
+        return _rotate_rope(query, cos, sin), q_resid
+
     def _window_keys(self, x, cos, sin, place: LogicalAxes):
         """The shared key head, projected where `place` puts it and gathered
         for the query heads the tensor axis splits."""
@@ -772,11 +790,11 @@ class DeepseekV4Attention(FakeQuantizing):
         # sink beside the logits, softmax in fp32 and the sink dropped
         # (:708-736).
         wide = at_least_fp32(query.dtype)
-        logits = jnp.einsum('bshd,btd->bhst', query.astype(wide), keys.astype(wide),
+        logits = float32_einsum('bshd,btd->bhst', query.astype(wide), keys.astype(wide),
                             precision=self.precision) * self.head_dim ** -0.5
         logits = jnp.where(allowed[:, None], logits, -jnp.inf)
         probs = sink_softmax(logits, self.sinks)
-        context = jnp.einsum('bhst,btd->bshd', probs.astype(keys.dtype), keys, precision=self.precision)
+        context = float32_einsum('bhst,btd->bshd', probs.astype(keys.dtype), keys, precision=self.precision)
         # The values are the rotated keys, so the rope slice of the output is
         # turned back at the query's position (:853-859).
         context = _rotate_rope(checkpoint_name(context, 'context'), cos, -sin)
@@ -819,8 +837,8 @@ class DSparkAttention(DeepseekV4Attention):
                 slots, allocated = cache_positions(self, batch, main.shape[1], store.get(DRAFT_VALID))
                 if allocated:
                     cached_key.value = write_cache(cached_key.value, self._window_keys(
-                        main, *yarn_rope_freqs(slots, self.rope_dim, self.rope_theta, self.yarn,
-                                               dtype=at_least_fp32(main.dtype)),
+                        main, *rotary_freqs(slots, self.rope_dim, self.rope_theta, rope_scaling=self.yarn,
+                                            dtype=at_least_fp32(main.dtype)),
                         down_projection(main, self.head_dim)), slots)
             main_keys = cached_key.value
             last = jnp.asarray(self.get_variable('cache', 'cache_index')) - 1
@@ -834,23 +852,19 @@ class DSparkAttention(DeepseekV4Attention):
             real = store.get(DRAFT_VALID)
             places = (jnp.arange(main.shape[1])[None] if real is None
                       else jnp.cumsum(real, axis=1, dtype=jnp.int32) - 1)
-            main_keys = self._window_keys(main, *yarn_rope_freqs(places, self.rope_dim, self.rope_theta,
-                                                                 self.yarn, dtype=at_least_fp32(main.dtype)),
+            main_keys = self._window_keys(main, *rotary_freqs(places, self.rope_dim, self.rope_theta,
+                                                              rope_scaling=self.yarn,
+                                                              dtype=at_least_fp32(main.dtype)),
                                           down_projection(main, self.head_dim))
             last = jnp.broadcast_to(places[:, -1], (batch,))
         length = x.shape[1]
         if length == 0:
             return x
         positions = last[:, None] + 1 + jnp.arange(length)
-        cos, sin = yarn_rope_freqs(positions, self.rope_dim, self.rope_theta, self.yarn,
-                                   dtype=at_least_fp32(x.dtype))
+        cos, sin = rotary_freqs(positions, self.rope_dim, self.rope_theta, rope_scaling=self.yarn,
+                                dtype=at_least_fp32(x.dtype))
         place = down_projection(x, self.q_lora_rank + self.head_dim)
-        q_resid = constrain(self.q_a_norm(self.q_a_proj(constrain(x, place))), place)
-        query = self.q_b_proj(constrain(q_resid, RESIDUAL)).reshape(
-            batch, length, self.num_heads, self.head_dim)
-        if self.query_norm:
-            query = unweighted_rmsnorm(query, self.norm_eps)
-        query = _rotate_rope(query, cos, sin)
+        query, _ = self._queries(x, cos, sin, place)
         window = (places <= last[:, None]) & (places > last[:, None] - self.sliding_window)
         if real is not None:
             window = window & real
@@ -875,7 +889,7 @@ class DeepseekV4Mixer(MixerBase):
     `candidates` the pool's role.
     """
 
-    residuals = ('q_proj', 'k_proj', 'v_proj', 'kv_proj', 'o_proj', 'context')
+    residuals = ATTENTION_CONTEXT_RESIDUALS
 
     q_lora_rank: int = 1024
     o_groups: int = 8

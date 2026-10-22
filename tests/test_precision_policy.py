@@ -1,21 +1,26 @@
 """Models' own dtype and attention fields, and the arithmetic their kernels honor."""
 
+import functools
 from fractions import Fraction
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_fp32_reduction_bound
+from flax import linen as nn
+from reference_error import assert_fp32_reduction_bound, equations
 
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
+from dew.nn.diffusion_gemma import soft_embeddings
 from dew.nn.dsa_kpool import KPoolSparseAttention
 from dew.nn.inputs import AttentionMetadata, MixerCall, coordinates
 from dew.nn.llama4 import Llama4Mixer
 from dew.nn.local_attention import local_attention
 from dew.nn.mixer_base import MixerContext
 from dew.nn.mla import MultiHeadLatentAttention
+from dew.nn.mlp import GatedMLP
+from dew.nn.precision import fp32_result_dot_general
 
 BF16_QKV = (1, 4, 2, 8)  # [B, S, H, D]
 
@@ -291,3 +296,119 @@ def test_quantizer_division_rounds_midpoint_neighbours_as_ieee_division():
     expected = (numerator.astype(np.float64) / denominator.astype(np.float64)).astype(np.float32)
     actual = np.asarray(jax.jit(correctly_rounded_divide)(numerator, denominator))
     np.testing.assert_array_equal(actual.view(np.uint32), expected.view(np.uint32))
+
+
+def dot_precisions(function, *arguments) -> list:
+    """The precision of every dot_general `function` traces over `arguments` under JAX's own default
+    precision (the test lane sets 'highest' for every product that states none), with the dtype its
+    operands promote to, sub-jaxprs included."""
+    with jax.default_matmul_precision(None):
+        graph = jax.make_jaxpr(function)(*arguments)
+    return [(equation.params["precision"],
+             jnp.result_type(*(variable.aval.dtype for variable in equation.invars)))
+            for equation in equations(graph) if equation.primitive.name == "dot_general"]
+
+
+HIGHEST = (jax.lax.Precision.HIGHEST, jax.lax.Precision.HIGHEST)
+
+
+def assert_float32_products(precisions) -> None:
+    """No product of float32 operands at JAX's default precision, which is TF32 on a GPU, and none
+    of narrower ones at HIGHEST. A product stating its own dot algorithm (a bf16 head's) is its own."""
+    assert precisions
+    off = [(precision, dtype) for precision, dtype in precisions
+           if (precision is None and dtype == jnp.float32) or (precision == HIGHEST and dtype != jnp.float32)]
+    assert not off, off
+
+
+@pytest.mark.parametrize("tied", [True, False])
+@pytest.mark.parametrize("stored", ["float32", "bfloat16", "bfloat16 kernels"])
+def test_a_model_with_no_dtype_multiplies_each_product_as_its_operands_compute(stored, tied):
+    """A model with no dtype computes each product in the dtype its operands promote to, as flax's
+    layers do, so float32 products multiply at HIGHEST and bf16 ones at their own precision, product
+    by product: over float32 parameters, bf16 ones, and bf16 kernels beside float32 norm scales,
+    its vocabulary head tied to its embedding or its own. Initializing it multiplies as applying it
+    does. A precision resolved once for the whole model from its parameters pinned HIGHEST on bf16
+    products and missed float32 ones."""
+    model = LAYERS["packed"](tie_embeddings=tied)
+    tokens = jnp.arange(16, dtype=jnp.int32).reshape(1, 16) % 64
+    variables = model.init(jax.random.key(0), tokens)
+    if stored != "float32":
+        kept = stored == "bfloat16 kernels"
+        variables = jax.tree_util.tree_map_with_path(
+            lambda path, leaf: leaf if kept and "kernel" not in jax.tree_util.keystr(path)
+            else leaf.astype(jnp.bfloat16), variables)
+    assert_float32_products(dot_precisions(model.apply, variables, tokens))
+    assert_float32_products(dot_precisions(lambda key: model.init(key, tokens), jax.random.key(0)))
+
+
+def test_a_layer_over_bf16_parameters_fed_float32_multiplies_float32_products():
+    """flax promotes a layer with no dtype over bf16 parameters and a float32 input to float32, so
+    its products multiply at HIGHEST, though its parameters are bf16."""
+    layer = GatedMLP(hidden_features=24, out_features=16)
+    x = jax.random.normal(jax.random.key(0), (2, 16), jnp.float32)
+    variables = jax.tree.map(lambda leaf: leaf.astype(jnp.bfloat16), layer.init(jax.random.key(1), x))
+    precisions = dot_precisions(layer.apply, variables, x)
+    assert precisions and all(dtype == jnp.float32 for _, dtype in precisions)
+    assert_float32_products(precisions)
+
+
+def test_soft_embeddings_over_a_bf16_table_multiply_float32_products():
+    """Soft embeddings mix a bf16-stored table by float32 probabilities, a product jax computes in
+    float32, so it multiplies at HIGHEST as a float32-stored table's does."""
+    logits = jax.random.normal(jax.random.key(0), (2, 3, 32), jnp.float32)
+    for stored in (jnp.float32, jnp.bfloat16):
+        table = jax.random.normal(jax.random.key(1), (32, 16), jnp.float32).astype(stored)
+        precisions = dot_precisions(lambda logits, table: soft_embeddings(logits, table, 1.0), logits, table)
+        assert [precision for precision, _ in precisions] == [HIGHEST]
+
+
+def test_a_projection_factory_keeps_the_contraction_its_caller_gives():
+    """A layer built from a caller's projection factory multiplies as that factory says: a bf16 MLP
+    whose projections return float32 results (`fp32_result_dot_general`) returns float32."""
+    x = jax.random.normal(jax.random.key(0), (2, 16), jnp.bfloat16)
+    layer = GatedMLP(hidden_features=24, out_features=16, dtype=jnp.bfloat16,
+                     linear=functools.partial(nn.Dense, dot_general=fp32_result_dot_general()))
+    assert layer.apply(layer.init(jax.random.key(1), x), x).dtype == jnp.float32
+
+
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
+@pytest.mark.parametrize("precision", [None, jax.lax.Precision.HIGHEST])
+def test_xla_attention_multiplies_float32_products_and_a_stated_precision(dtype, precision):
+    """'xla' attention over float32 queries multiplies float32 products where the caller states no
+    precision, and every product at HIGHEST where it states that, on whichever path computes it;
+    bf16 queries with none stated keep their own."""
+    query, key, value = (part.astype(dtype) for part in
+                         jax.random.normal(jax.random.key(1), (3, *BF16_QKV), jnp.float32))
+    precisions = dot_precisions(lambda q, k, v: scaled_dot_product_attention(
+        q, k, v, implementation="xla", precision=precision), query, key, value)
+    if precision is None:
+        assert_float32_products(precisions)
+    else:
+        assert precisions and all(stated == HIGHEST for stated, _ in precisions)
+
+
+@pytest.mark.parametrize("tied", [True, False])
+def test_a_tiled_head_takes_each_tile_as_the_whole_head_takes_its_logits(tied):
+    """A chunked head multiplies each vocabulary tile by `bf16_product` over the tile's rows
+    (`dew.objectives.lm.chunked`): of a bf16 model those are its forward's logits' columns, bitwise,
+    so the chunked head predicts those logits' argmax wherever a tile cuts; its scores are held to
+    those logits' cross entropy by check 1 (tests/test_chunked_cross_entropy.py)."""
+    from dew.nn.precision import bf16_product
+    from dew.objectives.lm.chunked import chunked_cross_entropy
+
+    model = CausalTransformer(vocab_size=97, emb_features=32, num_layers=2, num_heads=4, mlp_features=64,
+                              max_seq_len=16, tie_embeddings=tied, dtype=jnp.bfloat16)
+    ids = jax.random.randint(jax.random.key(0), (2, 12), 0, 97)
+    targets = jax.random.randint(jax.random.key(1), (2, 12), 0, 97)
+    variables = model.init(jax.random.key(0), ids)
+    logits = np.asarray(model.apply(variables, ids)).reshape(-1, 97)
+    states = model.apply(variables, ids, method="hidden_states")
+    table = model.apply(variables, method="output_table")
+    rows = table.matrix if table.vocab_major else table.matrix.T
+    for first in range(0, 97, 25):
+        tile = np.asarray(bf16_product("td,vd->tv", states.reshape(-1, 32), rows[first:first + 25]))
+        np.testing.assert_array_equal(tile, logits[:, first:first + 25])
+    for chunks in (1, 4):
+        _, predicted, _ = chunked_cross_entropy(states, table, targets, chunks)
+        np.testing.assert_array_equal(np.asarray(predicted).reshape(-1), logits.argmax(-1))

@@ -85,9 +85,10 @@ def pytest_runtest_setup(item):
     if jax.device_count() < needed:
         pytest.skip(f"needs a {needed}-device mesh; this run has "
                     f"{jax.device_count()} {jax.default_backend()} device(s)")
-    marker = item.get_closest_marker("gpu")
-    if marker and jax.default_backend() != "gpu":
-        pytest.skip(marker.kwargs.get("reason", "runs on a cuda device"))
+    for backend, device in (("gpu", "a cuda device"), ("tpu", "a tpu")):
+        marker = item.get_closest_marker(backend)
+        if marker and jax.default_backend() != backend:
+            pytest.skip(marker.kwargs.get("reason", f"runs on {device}"))
 
 
 @pytest.fixture(autouse=True)

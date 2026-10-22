@@ -21,6 +21,7 @@ import numpy as np
 import pytest
 import torch
 from reference_error import assert_as_exact_as_the_reference
+from token_support import byte_level_tokenizer
 from transformers.generation.logits_process import (
     EncoderNoRepeatNGramLogitsProcessor,
     EncoderRepetitionPenaltyLogitsProcessor,
@@ -458,21 +459,6 @@ def test_stop_strings_refuse_a_vocabulary_that_cannot_spell_them(tmp_path):
         decoding.stop_strings(tokenizer, "zzzz", len(tokenizer))
 
 
-def byte_level_tokenizer(tmp_path):
-    """A byte-level BPE over all 256 bytes, so a code point splits in two."""
-    from tokenizers import Tokenizer, decoders, models, pre_tokenizers
-    from transformers import AutoTokenizer, PreTrainedTokenizerFast
-    from transformers.convert_slow_tokenizer import bytes_to_unicode
-
-    alphabet = bytes_to_unicode()
-    backend = Tokenizer(models.BPE({alphabet[byte]: byte for byte in range(256)}, [],
-                                   unk_token=None))
-    backend.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
-    backend.decoder = decoders.ByteLevel()
-    PreTrainedTokenizerFast(tokenizer_object=backend).save_pretrained(tmp_path / "bytes")
-    return AutoTokenizer.from_pretrained(tmp_path / "bytes", local_files_only=True)
-
-
 def test_a_stop_string_split_across_byte_tokens_still_ends_the_row(tmp_path):
     """A byte-level vocabulary spells 'é' as two tokens, neither of which is
     valid text on its own. Reading the vocabulary as text loses them, so the
@@ -482,7 +468,7 @@ def test_a_stop_string_split_across_byte_tokens_still_ends_the_row(tmp_path):
 
     from dew.sampling.vocabulary import matching_mode
 
-    tokenizer = byte_level_tokenizer(tmp_path)
+    tokenizer = byte_level_tokenizer(tmp_path / "bytes")
     assert matching_mode(tokenizer) == "byte_level"
     pair = tokenizer.encode("é")
 

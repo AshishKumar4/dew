@@ -7,11 +7,10 @@ from typing import TYPE_CHECKING
 
 import jax
 import jax.numpy as jnp
-import ml_dtypes
 import numpy as np
 
 from dew import records
-from dew.registry import dtype_name, resolve_dtype
+from dew.registry import dtype_name, resolve_dtype, storage_name
 
 if TYPE_CHECKING:
     from flax import linen as nn
@@ -39,11 +38,10 @@ def declared_dtype(config: Mapping[str, object], tensors: Mapping[str, np.ndarra
         if storage is None:
             raise ValueError(f"dtype={stated!r} names no floating parameter storage")
         return storage
-    storable = {np.dtype(np.float32): "float32", np.dtype(np.float16): "float16",
-                np.dtype(ml_dtypes.bfloat16): "bfloat16"}
     for tensor in tensors.values():
-        if tensor.dtype in storable:
-            return storable[tensor.dtype]
+        name = storage_name(tensor.dtype)
+        if name is not None:
+            return name
     raise ValueError("param_dtype 'auto' found neither a stated dtype nor a float32, bfloat16 or "
                      "float16 tensor in the checkpoint")
 

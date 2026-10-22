@@ -14,11 +14,15 @@ multiprocessor's `resident` programs (`resident`) wait together (Little's law). 
 
     program  = max(program_flops / tensor rate, program_staged / shared-memory rate,
                    program_exponentials / special-function rate)
+             + serial_staged / shared-memory rate + serial_exponentials / special-function rate
     waiting  = steps · load latency / (stages - 1)
     compute  = ceil(programs / (multiprocessors · resident)) · max(resident · program, waiting)
     memory   = device_bytes / memory bandwidth
     seconds  = max(compute, memory)
 
+Work a program does between its matrix instructions, which they wait for, is serial: `serial_staged` bytes
+and `serial_exponentials` exponentials it adds to its service time rather than overlapping (a Mosaic
+mainloop's prologue, rewriting each stage in shared memory before the warpgroup MMA reads it).
 A persistent launch's work items are its programs. Every rate is a fact of the target
 (`dew.nn.kernels.generation.GpuTarget`): its multiprocessors and clock, its memory bandwidth, and its
 generation's dense tensor FLOPs per clock per multiprocessor in the launch's arithmetic mode; the
@@ -68,6 +72,8 @@ class Cost:
     steps: float = 0.0
     stages: int = 2
     resident: int = 1
+    serial_staged: float = 0.0
+    serial_exponentials: float = 0.0
 
 
 def seconds(cost: Cost, target: generation.GpuTarget) -> float:
@@ -81,13 +87,28 @@ def seconds(cost: Cost, target: generation.GpuTarget) -> float:
         raise ValueError(f"{facts.generation} ({facts.device_kind}) states no "
                          f"{', '.join(name for name, value in named if value is None)}, "
                          "which the kernel cost model needs")
-    program = max(cost.program_flops / (rate * clock),
-                  cost.program_staged / (SHARED_BYTES_PER_CLOCK * clock),
-                  cost.program_exponentials / (EXPONENTIALS_PER_CLOCK * clock))
+    program = program_seconds(cost, rate, clock)
     latency = facts.load_latency
-    waiting = 0.0 if latency is None else cost.steps * latency / max(cost.stages - 1, 1) / clock
+    waiting = 0.0 if latency is None else waiting_seconds(cost, latency, clock)
     waves = math.ceil(cost.programs / (multiprocessors * cost.resident))
     return max(waves * max(cost.resident * program, waiting), cost.device_bytes / bandwidth)
+
+
+def program_seconds(cost: Cost, rate: float, clock: float) -> float:
+    """One program's service time on a multiprocessor: its tensor-core, shared-memory or special-function
+    work, whichever takes longest at `rate` tensor FLOPs a clock and `clock` Hz, plus its serial work (the
+    module's docstring)."""
+    return (max(cost.program_flops / (rate * clock),
+                cost.program_staged / (SHARED_BYTES_PER_CLOCK * clock),
+                cost.program_exponentials / (EXPONENTIALS_PER_CLOCK * clock))
+            + cost.serial_staged / (SHARED_BYTES_PER_CLOCK * clock)
+            + cost.serial_exponentials / (EXPONENTIALS_PER_CLOCK * clock))
+
+
+def waiting_seconds(cost: Cost, latency: float, clock: float) -> float:
+    """The seconds a program's steps wait on loads `latency` clocks long, its stages in flight hiding
+    `stages - 1` steps of it (Little's law, the module's docstring)."""
+    return cost.steps * latency / max(cost.stages - 1, 1) / clock
 
 
 def resident(target: generation.GpuTarget, staged: int, threads: int, registers: int) -> int:

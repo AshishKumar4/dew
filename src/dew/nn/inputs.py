@@ -30,8 +30,8 @@ type Media = np.ndarray | Image | Sequence[Media]
 # the arrays a caller assembled them from, and the tuples and records those
 # travel in. A digest reads the structure and each leaf's shape and dtype, so
 # a record's values are leaves to it and are not narrowed here.
-type InputTree = (ModelInputs | jax.Array | np.ndarray | None
-                  | Sequence[InputTree] | Mapping[str, object])
+type InputTree = (ModelInputs | jax.Array | np.ndarray
+                  | Sequence[InputTree] | Mapping[str, object] | None)
 
 # A keyword a model call takes past its tokens: a token field or position
 # array, the conditioning mapping (`ModelInputs.kwargs`), a flag, or None for
@@ -66,11 +66,23 @@ def token_ids(values: object, *, where: str) -> list[int]:
     return [token_id(token, where=where) for token in values]
 
 
+def sequence_blocks(x: jax.Array, block: int, blocks: int | None = None, *,
+                    leading: bool = False) -> jax.Array:
+    """`x` `[B, S, ...]` padded with zeros at the end to `blocks` blocks of `block` positions (as
+    many as `S` needs when None) and cut into them, `[B, blocks, block, ...]`, or with the blocks
+    leading, `[blocks, B, block, ...]`, for a scan or map over them (`leading`)."""
+    blocks = -(-x.shape[1] // block) if blocks is None else blocks
+    x = jnp.pad(x, [(0, 0), (0, blocks * block - x.shape[1])] + [(0, 0)] * (x.ndim - 2))
+    x = x.reshape(x.shape[0], blocks, block, *x.shape[2:])
+    return jnp.moveaxis(x, 1, 0) if leading else x
+
+
 def pad_token_rows(rows: Sequence[Sequence[int]] | np.ndarray, *, pad_id: int = 0,
                    padding_side: Literal["left", "right"] = "left",
-                   fields: Mapping[str, Sequence[Sequence[int]] | np.ndarray] | None = None
-                   ) -> tuple[np.ndarray, dict[str, np.ndarray]]:
-    """Pad ragged token rows and their scalar token fields on the host.
+                   fields: Mapping[str, Sequence[Sequence[int]] | np.ndarray] | None = None,
+                   width: int | None = None) -> tuple[np.ndarray, dict[str, np.ndarray]]:
+    """Pad ragged token rows and their scalar token fields on the host, to `width` when given (a
+    fixed shape, which no row may exceed), else to the longest row.
 
     Filler IDs carry no content; attention_mask alone marks real slots. Rows
     that all fill the width come back without one: absent validity says every
@@ -89,7 +101,11 @@ def pad_token_rows(rows: Sequence[Sequence[int]] | np.ndarray, *, pad_id: int = 
         raise ValueError("each prompt must contain a nonempty integer token row")
     for row in arrays:
         _check_token_ids(row)
-    width = max(row.size for row in arrays)
+    longest = max(row.size for row in arrays)
+    if width is None:
+        width = longest
+    elif longest > width:
+        raise ValueError(f"a token row holds {longest} ids, more than the width {width}")
     tokens = np.full((len(arrays), width), pad_id, np.int32)
     valid = np.zeros(tokens.shape, bool)
     slots = [
@@ -121,6 +137,18 @@ def _check_token_ids(array: np.ndarray) -> None:
     """Refuse an integer array holding an id outside `token_id`'s law: 0 through int32's largest."""
     if np.any((array < 0) | (array > np.iinfo(np.int32).max)):
         raise ValueError("token IDs must be nonnegative int32 values")
+
+
+def _token_row(row: object) -> list[int] | np.ndarray:
+    """One row of token ids by `token_id`'s law, before rows join into one array, where NumPy would
+    promote a bool into an id: a sequence token by token (`token_ids`), an array whole by its dtype,
+    an integer one, whose range `host_token_rows` checks with the rest."""
+    if isinstance(row, Sequence) and not isinstance(row, str | bytes):
+        return token_ids(list(row), where="a token row")
+    array = np.asarray(row)
+    if not np.issubdtype(array.dtype, np.integer):
+        raise ValueError(f"a token row holds integer token ids, got an array of {array.dtype}")
+    return array
 
 
 def host_token_rows(array: np.ndarray) -> np.ndarray:
@@ -155,7 +183,9 @@ class ModelInputs:
 
         A `ModelInputs` is validated as it is, and a JAX array is wrapped where
         it sits. Anything else is read on the host as an integer `[B, S]`
-        array, and ids that int32 cannot represent raise ValueError.
+        array, and ids that int32 cannot represent raise ValueError. Rows given
+        as a sequence are each read by `token_id`'s law first (`_token_row`), so
+        a bool among them is refused rather than promoted into an id.
 
         Distributed algorithms call this inside their agreed validation phase.
         It runs no collectives and no model.
@@ -165,7 +195,9 @@ class ModelInputs:
         elif isinstance(value, jax.Array):
             prepared = cls(value)
         else:
-            prepared = cls(jnp.asarray(host_token_rows(np.asarray(value))))
+            rows = ([_token_row(row) for row in value]
+                    if isinstance(value, Sequence) and not isinstance(value, str | bytes) else value)
+            prepared = cls(jnp.asarray(host_token_rows(np.asarray(rows))))
         prepared.validate()
         return prepared
 
@@ -411,6 +443,23 @@ def counted_places(segments=None, valid=None, positions=None) -> jax.Array | Non
     return jnp.take_along_axis(jnp.broadcast_to(given, shape), slots, axis=1) + count
 
 
+def numbered_blocks(tokens: Coordinates, shape: tuple[int, int], block: int) -> jax.Array:
+    """Each token's block of `block` places, counted over its document's real tokens
+    (`counted_places`), numbered along its row from 0, a padding slot -1 `[B, S]`: the tokens a block
+    router chooses its experts for together (`dew.nn.moe.Router.block_mask`), each row's and each
+    document's own, so a request routes as it does alone and padding votes for none."""
+    counted = counted_places(tokens.segments, tokens.valid, tokens.positions)
+    cut = jnp.broadcast_to(jnp.arange(shape[1]) if counted is None else counted, shape) // block
+    opens = jnp.concatenate([jnp.ones((shape[0], 1), bool), cut[:, 1:] != cut[:, :-1]], axis=1)
+    if tokens.segments is not None:
+        real = jnp.ones(shape, bool) if tokens.valid is None else jnp.broadcast_to(tokens.valid, shape)
+        opens = opens | document_starts(jnp.broadcast_to(jnp.asarray(tokens.segments), shape), real)
+    numbered = jnp.cumsum(opens, axis=1, dtype=jnp.int32) - 1
+    if tokens.valid is None:
+        return numbered
+    return jnp.where(jnp.broadcast_to(tokens.valid, shape), numbered, -1)
+
+
 def document_reach(segments, valid, places) -> jax.Array:
     """Each token's document's furthest place `[B, S]`: `places` at the document's last real token,
     which LongRoPE picks its factors by, as the reference picks them by a sequence's largest position,
@@ -464,7 +513,9 @@ class AttentionMetadata:
     n-gram. `admitted` turns a cached call into a serving step's mixed call
     (`Admitted`). `position_bias` is added to every attention logit,
     `[B or 1, heads, S, keys]`: T5's relative position table, which its
-    encoder computes once for its layers.
+    encoder computes once for its layers. `blocks` `[B, S]` number each row's
+    routing blocks of `routing_block` places for a block router
+    (`numbered_blocks`), which the model computes once for its layers.
 
     `coordinates` are the tokens' documents, validity, positions and cache
     slots (`Coordinates`). Their `right_padded` says each row's real tokens
@@ -486,6 +537,8 @@ class AttentionMetadata:
     media: jax.Array | None = None
     admitted: Admitted | None = None
     position_bias: jax.Array | None = None
+    blocks: jax.Array | None = None
+    routing_block: int | None = struct.field(pytree_node=False, default=None)
 
     @property
     def valid(self) -> jax.Array | None:
@@ -873,6 +926,14 @@ def request_key(key: int | jax.Array | None) -> jax.Array:
     return typed
 
 
+def request_rows(keys: jax.Array) -> jax.Array:
+    """Normalize a vector of JAX keys, one a row (`dew.sampling.solvers.RowKeys`), to typed keys."""
+    typed = jax.random.wrap_key_data(jax.random.key_data(keys), impl=jax.random.key_impl(keys))
+    if typed.ndim != 1:
+        raise ValueError(f"row keys are a vector of JAX PRNG keys, got shape {typed.shape}")
+    return typed
+
+
 def key_seed(key: int | jax.Array | None) -> int | None:
     """The normalized key as an integer for an external sampler's wire seed.
 
@@ -1103,3 +1164,19 @@ class Request:
 
 __all__ = ["RESPONSE_FIELDS", "AttentionMetadata", "FieldExtension", "LayerInputs", "ModelInputs",
            "ModelKwarg", "RowPlan"]
+
+
+def routing_blocks(feedforward, metadata: AttentionMetadata | None, shape: tuple[int, ...]) -> dict:
+    """The blocks a block-routed feed-forward (`dew.nn.moe.SparseMLP`'s `routing_block`) routes its
+    tokens in, over a call of `shape[:2]`: its metadata's where they number blocks of its size,
+    which the model numbers once for its layers, else numbered from the call's coordinates
+    (`numbered_blocks`); nothing for another feed-forward."""
+    from dew.nn.protocols import RoutesBlocks
+
+    block = feedforward.routing_block if isinstance(feedforward, RoutesBlocks) else None
+    if block is None:
+        return {}
+    if metadata is not None and metadata.blocks is not None and metadata.routing_block == block:
+        return {"blocks": metadata.blocks}
+    batch, length = shape[:2]
+    return {"blocks": numbered_blocks(coordinates_of(metadata, batch, length), (batch, length), block)}

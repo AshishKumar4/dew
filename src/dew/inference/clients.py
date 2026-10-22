@@ -21,7 +21,7 @@ import jax
 import numpy as np
 
 from dew.nn.inputs import key_seed, token_id
-from dew.records import JSON
+from dew.records import JSON, record as section
 from dew.sampling.text import Sampling
 
 if TYPE_CHECKING:
@@ -112,12 +112,6 @@ def _invoke[T](call: Callable[..., T], fields: Mapping[str, object]) -> T:
     return call(**fields)
 
 
-def _object(value: object, name: str) -> Mapping[str, object]:
-    if not isinstance(value, Mapping) or any(not isinstance(key, str) for key in value):
-        raise ValueError(f"{name} must be an object")
-    return {key: entry for key, entry in value.items() if isinstance(key, str)}
-
-
 def _count(value: object, name: str) -> int | None:
     if value is None:
         return None
@@ -151,7 +145,7 @@ def _prompts(prompts: str | Sequence[str], budget: int, seed: int | None) -> lis
 def _bound(options: Mapping[str, object], fixed: Mapping[str, object]) -> Mapping[str, object]:
     overlap = options.keys() & fixed.keys()
     if options.get("extra_body") is not None:
-        extensions = _object(options["extra_body"], "extra_body")
+        extensions = dict(section(options["extra_body"], "extra_body"))
         overlap |= extensions.keys() & (fixed.keys() | {"n"})
     if overlap:
         raise ValueError(f"fields {sorted(overlap)} are supplied by the bound task")
@@ -170,7 +164,7 @@ def _ollama_budget(options: object, budget: int, seed: int | None,
     from ollama import Options
 
     supplied = options.model_dump(exclude_none=True) if isinstance(options, Options) else options
-    fields = {} if supplied is None else _object(supplied, "options")
+    fields = {} if supplied is None else dict(section(supplied, "options"))
     request_only = (
         _ollama_request_names("generate") | _ollama_request_names("chat")
     ) - Options.model_fields.keys()
@@ -349,10 +343,11 @@ def _choice_tokens(entry: Mapping[str, object]) -> tuple[tuple[int, ...] | None,
 def listed_ids(entry: Mapping[str, object]) -> tuple[int, ...] | None:
     """A choice's `token_ids` list (SGLang's `return_token_ids`), or None where it has none."""
     listed = entry.get("token_ids")
-    if listed is not None and (not isinstance(listed, list) or any(
-            type(token) is not int or token < 0 for token in listed)):
-        raise ValueError("choice token_ids must be a list of nonnegative ids")
-    return None if listed is None else tuple(listed)
+    if listed is None:
+        return None
+    if not isinstance(listed, list):
+        raise ValueError(f"a choice's token_ids are a list, got {type(listed).__name__}")
+    return tuple(token_id(token, where="a choice's token_ids") for token in listed)
 
 
 def matched_stop(entry: Mapping[str, object]) -> str | int | None:
@@ -370,7 +365,7 @@ def reported_log_probs(entry: Mapping[str, object]) -> tuple[tuple[str, ...], tu
     logprobs = entry.get("logprobs")
     if logprobs is None:
         return None
-    record = _object(logprobs, "choice logprobs")
+    record = dict(section(logprobs, "choice logprobs"))
     rendered, values = record.get("tokens"), record.get("token_logprobs")
     if not isinstance(rendered, list) or not isinstance(values, list) or len(rendered) != len(values):
         raise ValueError("choice logprobs need aligned tokens and token_logprobs lists")
@@ -399,14 +394,14 @@ def _openai_result(raw: JSON, response: object, expected: int) -> Completion:
     from openai.types import Completion as SDKCompletion
     if not isinstance(response, SDKCompletion):
         raise ValueError("a non-streaming completion request returned an incompatible response")
-    fields = _object(raw, "completion response")
+    fields = dict(section(raw, "completion response"))
     choices = fields.get("choices")
     if not isinstance(choices, list) or len(choices) != expected:
         raise ValueError(f"expected {expected} completion choices")
     ordered: dict[int, tuple[str, str | None, tuple[int, ...] | None, tuple[float, ...] | None,
                              np.ndarray | None]] = {}
     for choice in choices:
-        entry = _object(choice, "completion choice")
+        entry = dict(section(choice, "completion choice"))
         index, text = entry.get("index"), entry.get("text")
         if type(index) is not int or index < 0 or index >= expected or index in ordered:
             raise ValueError("choice indices must be a permutation of the expected prompt-choice indices")
@@ -417,7 +412,7 @@ def _openai_result(raw: JSON, response: object, expected: int) -> Completion:
         ordered[index] = (text, _reason(entry.get("finish_reason")), *_choice_tokens(entry), experts)
     usage = None
     if fields.get("usage") is not None:
-        supplied = _object(fields["usage"], "usage")
+        supplied = dict(section(fields["usage"], "usage"))
         usage = Usage(*(_count(supplied.get(name), name) for name in
                         ("prompt_tokens", "completion_tokens", "total_tokens")))
     per_choice = (usage.completion_tokens,) if expected == 1 and usage is not None else (None,) * expected
@@ -541,7 +536,7 @@ class OpenAICompletion:
                                       "repetition_penalty": sampling.repetition_penalty}
         if self.provider != "openai":
             controls.update(_engine_stops(sampling, self.provider))
-        extra = {} if fields.get("extra_body") is None else _object(fields["extra_body"], "extra_body")
+        extra = {} if fields.get("extra_body") is None else dict(section(fields["extra_body"], "extra_body"))
         if self.provider == "openai" and controls.keys() & extra.keys():
             raise ValueError(
                 "top-k, min-p, repetition and EOS-token controls in extra_body require "

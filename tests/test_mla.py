@@ -21,6 +21,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from interop_support import fixture_arrays
 from jax.sharding import PartitionSpec as P
 from recording import RecordingTracker
 
@@ -31,7 +32,7 @@ from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.inputs import MixerCall
 from dew.nn.mla import MultiHeadLatentAttention
-from dew.nn.rope import YarnScaling, yarn_attention_factor, yarn_inv_freq, yarn_query_scale, yarn_rope_freqs
+from dew.nn.rope import YarnScaling, rotary_freqs, yarn_attention_factor, yarn_inv_freq, yarn_query_scale
 from dew.objectives.lm import LMObjective
 from dew.training import Layout, MeshSpec, Trainer
 
@@ -40,8 +41,7 @@ CONFIG = json.loads((FIXTURES / "config.json").read_text())
 
 
 def fixture(name: str) -> dict:
-    with np.load(FIXTURES / f"{name}.npz") as data:
-        return {key: np.asarray(value) for key, value in data.items()}
+    return fixture_arrays(FIXTURES / f"{name}.npz")
 
 
 def yarn_of(settings: dict) -> YarnScaling:
@@ -113,8 +113,8 @@ def test_yarn_matches_the_reference_derivation():
         rtol=1e-6, atol=1e-7)
     assert yarn_attention_factor(yarn) == pytest.approx(
         float(tensors["attention_scaling"]), rel=1e-6)
-    cos, sin = yarn_rope_freqs(
-        jnp.arange(CONFIG["length"]), 8, 10000.0, yarn, dtype=np.float32)
+    cos, sin = rotary_freqs(
+        jnp.arange(CONFIG["length"]), 8, 10000.0, rope_scaling=yarn, dtype=np.float32)
     half = tensors["cos"].shape[-1] // 2
     # The reference batches identical position rows; the first row compares.
     np.testing.assert_allclose(np.asarray(cos), tensors["cos"][0, ..., :half],
@@ -124,6 +124,16 @@ def test_yarn_matches_the_reference_derivation():
     # The expected query scale is the square of 0.1 * ln(40) + 1.
     assert yarn_query_scale(yarn) == pytest.approx(
         (0.1 * math.log(40.0) + 1.0) ** 2, rel=1e-6)
+
+
+def test_yarn_rotates_whole_heads_and_refuses_a_partial_rotary():
+    """YaRN ramps a whole head's frequencies, so the rope refuses a narrower rotated width beside it
+    under either partial convention."""
+    yarn = yarn_of(CONFIG["v3"])
+    for convention in ("proportional", "default"):
+        with pytest.raises(ValueError):
+            rotary_freqs(jnp.arange(4), 8, 10000.0, rot_dim=4, partial_rotary_type=convention,
+                         rope_scaling=yarn, dtype=np.float32)
 
 
 def decode_loop(module, variables, tokens):
