@@ -877,11 +877,6 @@
    "lane": "Training",
    "by": "2026-11-20"
   },
-  "tests/test_routing_replay.py": {
-   "comparisons": 7,
-   "lane": "Models, Serving & RL",
-   "by": "2026-11-13"
-  },
   "tests/test_samplers.py": {
    "comparisons": 9,
    "lane": "Models, Serving & RL",
