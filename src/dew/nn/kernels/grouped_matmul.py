@@ -42,7 +42,7 @@ from jax.extend import core as jax_core
 
 from ..precision import rounded_operand
 from . import generation
-from .templates import base, cost
+from .templates import base, cost, hopper
 from .templates.gemm import mosaic_gpu, mosaic_tpu
 from .templates.product import declared
 
@@ -70,11 +70,6 @@ TILES = tuple(Tile(*shape) for shape in itertools.product((64, 128, 256), (128, 
 Where the cost model ties, the first wins: the deeper step, which synchronizes its pipeline fewer times
 a tile (at 128 x 256 on an H100, a step of 64 took 1.56 ms where 32 took 1.78, GMM-h100-2), and the
 more warps."""
-
-CONSUMER_REGISTERS = 232
-"""The registers a thread of a cooperative tile's consumer warpgroup holds: a producer warpgroup takes 40
-(`mosaic_gpu`'s pipelines' `memory_registers`), and JAX's warp-specialized pipeline gives the consumers
-the rest of the multiprocessor's (`pipeline._compute_registers(40, 2)`)."""
 
 _COOPERATIVE = itertools.product((128,), (256, 128), (64,), (4, 3, 5), (8, 4, 2, 1), (1, 2))
 _ALONE = itertools.product((128, 192, 64), (128, 192, 64), (64,), (4, 5, 2), (8, 4, 2, 1))
@@ -771,10 +766,10 @@ class MosaicTgmm(_Mosaic):
 
     def space(self, ba) -> tuple[mosaic_gpu.Tiles, ...]:
         depth, width = ba.arguments['tokens'].shape[1], ba.arguments['cotangent'].shape[1]
-        # No pair: the streamed cooperative tile ran 1.06-1.23x faster than the paired tiles' kernel, which
-        # never beat it by more than 2% (OVERLAP-h100, GMMCOOP-h100).
-        return tuple(tile for tile in _modelled(ba)
-                     if tile.cluster == 1 and depth % tile.block_m == 0 and width % tile.block_n == 0)
+        # No pair: a tile streaming its stages across tiles outruns the paired tiles' kernel, whose pair
+        # never paid for its multicast here.
+        return base.dividing(tuple(tile for tile in _modelled(ba) if tile.cluster == 1), (depth, width),
+                             lambda tile: (tile.block_m, tile.block_n))
 
     def fitting(self, ba, target) -> tuple[mosaic_gpu.Tiles, ...]:
         """The tiles that fit `target` (`Template.fitting`), with `exact_sums` those whose two fp32
@@ -787,7 +782,7 @@ class MosaicTgmm(_Mosaic):
         # `emit_pipeline_warp_specialized`: 232).
         return tuple(tile for tile in fits
                      if 2 * tile.block_m * tile.block_n // (128 * tile.warpgroups)
-                     < (CONSUMER_REGISTERS if tile.warpgroups == 2 else cost.THREAD_REGISTERS))
+                     < (hopper.CONSUMER_REGISTERS if tile.warpgroups == 2 else cost.THREAD_REGISTERS))
 
     @staticmethod
     def extents(tile: mosaic_gpu.Tiles) -> dict:

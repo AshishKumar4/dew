@@ -19,6 +19,7 @@ a hook adds no op.
 import dataclasses
 import enum
 from collections.abc import Callable
+from typing import NamedTuple
 
 import jax
 import jax.numpy as jnp
@@ -32,13 +33,16 @@ class KeySpans:
     """Each query's visible keys: the interval `[start, end)` `[B, Q]` of key indices, int32, empty
     where `end <= start`, and where the call packs documents, the queries' ids `[B, Q]` and the keys'
     `[B, K]`, 0 as padding, a key visible only to queries of its own id (`visible`). `keys` is the
-    key count, static."""
+    key count, static, and `form` what the spans are, static, so a kernel resolves at trace time what
+    a plain call needs: 'full', every query sees every key; 'causal', query i sees keys 0 to i (top
+    left aligned); 'spans', anything else, which the intervals and ids say."""
 
     start: jax.Array
     end: jax.Array
     query_ids: jax.Array | None
     key_ids: jax.Array | None
     keys: int = dataclasses.field(metadata={"static": True})
+    form: str = dataclasses.field(default="spans", metadata={"static": True})
 
 
 def visible(spans: KeySpans, row: jax.Array | int, queries: jax.Array, keys: jax.Array) -> jax.Array:
@@ -168,7 +172,9 @@ def spans(queries: int, keys: int, batch: int, *, causal: bool = False, sliding_
         end = jnp.minimum(end, lengths.astype(jnp.int32)[:, None])
     if starts is not None:
         start = jnp.maximum(start, starts.astype(jnp.int32)[:, None])
-    return KeySpans(start, end, query_ids, key_ids, keys)
+    narrowed = (sliding_window, chunk, segment_ids, lengths, starts)
+    form = "spans" if any(narrowing is not None for narrowing in narrowed) else "causal" if causal else "full"
+    return KeySpans(start, end, query_ids, key_ids, keys, form)
 
 
 @jax.tree_util.register_dataclass
@@ -389,3 +395,250 @@ def reference(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpan
     out, m, total = jax.vmap(jax.vmap(one, in_axes=(None, 0)), in_axes=(0, None))(rows, jnp.arange(heads))
     out = jnp.swapaxes(out, 1, 2)
     return (out, m, total) if residuals else out
+
+
+LOG2E = 1.4426950408889634
+"""log2(e): a natural exponent times it is a base-2 one."""
+
+
+NATURAL = False
+"""Whether attention keeps its logits natural unless a call says otherwise
+(`attention_algebra.Forward.base2`): False, the base-2 fold, the fast form, until the natural form's cost
+closes; every kernel's default reads it, so the default switches here."""
+
+
+def natural_exp(x: jax.Array) -> jax.Array:
+    """The natural form's forward exponential (`attention_algebra.Forward.power`): `exp(x)` as the
+    hardware's base-2 exponential of `x * log2(e)`, the logits staying natural, a difference of the
+    reference's own logits converted only after it is taken, so no logit the reference keeps finite
+    passes fp32's largest and none it keeps apart ties (the stability invariant). Its conversion rounds
+    once more than `jnp.exp`, about `|x|` fp32 ulps of the result, so the backward's weights and every
+    factor that carries a state (whose size may be any) take `jnp.exp`, as the reference does."""
+    return jnp.exp2(x * LOG2E)
+
+
+def power_of_two(width: int) -> int:
+    """The power of two from 16 that holds `width`: a head width a kernel tiles."""
+    return max(16, 1 << (width - 1).bit_length())
+
+
+def _whole(count: int, block: int) -> int:
+    """`count` rounded up to whole `block`s."""
+    return -(-count // block) * block
+
+
+def _padded(param: Param, queries: int, keys: int, value_width: int) -> jax.Array:
+    """A hook parameter at the padded call's shape, in fp32 as the kernels compute (its gradient returns
+    in its own dtype): zeros past its queries, keys and value width, and a head vector at a power of
+    two."""
+    value = param.value
+    if jnp.issubdtype(value.dtype, jnp.floating):
+        value = value.astype(jnp.float32)
+    match param.kind:
+        case Kind.HEAD:
+            return jnp.pad(value, (0, power_of_two(value.shape[0]) - value.shape[0]))
+        case Kind.QUERY:
+            return jnp.pad(value, ((0, 0), (0, 0), (0, queries - value.shape[2])))
+        case Kind.KEY:
+            return jnp.pad(value, ((0, 0), (0, 0), (0, keys - value.shape[2])))
+        case Kind.TILE:
+            return jnp.pad(value, ((0, 0), (0, 0), (0, queries - value.shape[2]), (0, keys - value.shape[3])))
+        case Kind.OUTPUT:
+            return jnp.pad(value, ((0, 0), (0, queries - value.shape[1]), (0, 0),
+                                   (0, value_width - value.shape[3])))
+
+
+@dataclasses.dataclass(frozen=True)
+class PaddedCall:
+    """A call at the launches' padded shapes (`padded_call`): its queries and keys at whole blocks of
+    a backend's largest tile (at least one, so a call of no keys still has a tile to trace), its head
+    widths at powers of two, its spans' rows and its score and output hooks' parameters alike; the
+    padding is unread and sliced off."""
+
+    query: jax.Array
+    key: jax.Array
+    value: jax.Array
+    start: jax.Array
+    end: jax.Array
+    query_ids: jax.Array | None
+    key_ids: jax.Array | None
+    score_params: tuple[jax.Array, ...]
+    output_params: tuple[jax.Array, ...]
+    queries: int
+    keys: int
+
+    def rows(self, array: jax.Array, fill: float = 0.0) -> jax.Array:
+        """A `[B, H, Q, ...]` row statistic at the padded queries."""
+        pad = [(0, 0), (0, 0), (0, self.query.shape[1] - array.shape[2]), *[(0, 0)] * (array.ndim - 3)]
+        return jnp.pad(array, pad, constant_values=fill)
+
+
+def padded_call(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks,
+                block: int) -> PaddedCall:
+    """A call's one padding for every mainloop of the template (`PaddedCall`): its queries and keys at
+    whole `block`s (a backend's largest tile), its head widths at powers of two."""
+    queries, width = query.shape[1], query.shape[3]
+    keys, value_width = key.shape[1], value.shape[-1]
+    padded_q, padded_k = _whole(max(queries, 1), block), _whole(max(keys, 1), block)
+    padded_d, padded_dv = power_of_two(width), power_of_two(value_width)
+
+    def pad(array, rows, columns):
+        return jnp.pad(array, ((0, 0), (0, rows - array.shape[1]), (0, 0), (0, columns - array.shape[3])))
+
+    def pad_rows(array: jax.Array, rows: int) -> jax.Array:
+        return jnp.pad(array, ((0, 0), (0, rows - array.shape[1])))
+
+    def pad_ids(array: jax.Array | None, rows: int) -> jax.Array | None:
+        return None if array is None else pad_rows(array, rows)
+
+    return PaddedCall(pad(query, padded_q, padded_d), pad(key, padded_k, padded_d),
+                   pad(value, padded_k, padded_dv), pad_rows(spans.start, padded_q),
+                   pad_rows(spans.end, padded_q), pad_ids(spans.query_ids, padded_q),
+                   pad_ids(spans.key_ids, padded_k),
+                   tuple(_padded(param, padded_q, padded_k, padded_dv) for param in hooks.score_params),
+                   tuple(_padded(param, padded_q, padded_k, padded_dv) for param in hooks.output_params),
+                   queries, keys)
+
+
+def kept_dtype(dtype) -> str:
+    """A hook parameter's dtype in the kernels: fp32 for a floating one (`padded_call`), else its own."""
+    return "float32" if jnp.issubdtype(dtype, jnp.floating) else jnp.dtype(dtype).name
+
+
+class Split(NamedTuple):
+    """A training forward's split sums (`attention_algebra.split_accumulate`), residuals the backward
+    reads in place of its first pass: the weighted values of every key but each query's anchor key,
+    with the initial state's, `others` `[B, H, Q, Dv]`, the anchor's own weight `own` and the other
+    keys' weights' sum `others_total` `[B, H, Q]`, fp32, all at the forward's maximum."""
+
+    others: jax.Array
+    own: jax.Array
+    others_total: jax.Array
+
+
+DQ_GRADS = (Kind.HEAD, Kind.QUERY)
+"""The parameter kinds whose gradients the dQ program writes: a head's partial sum over its queries and
+its queries' own."""
+
+DKV_GRADS = (Kind.KEY, Kind.TILE)
+"""The parameter kinds whose gradients the dK/dV program writes, under the refined D: its keys' and its
+tiles' entries."""
+
+
+@jax.tree_util.register_dataclass
+@dataclasses.dataclass(frozen=True)
+class Gradients:
+    """The backward's gradients: of the queries, keys and values, of each score hook parameter (the
+    order `Hooks.score_params` gives them), and of the softmax's initial state where it has one."""
+
+    query: jax.Array
+    key: jax.Array
+    value: jax.Array
+    score_params: tuple[jax.Array, ...]
+    initial: Initial | None
+
+
+def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
+              hooks: Hooks | None, dout: jax.Array,
+              residuals: tuple[jax.Array, jax.Array, jax.Array, Split], *, block: int,
+              scale: float | None = None) -> Gradients:
+    """The template's backward of its forward under the output's cotangent `dout` `[B, Q, H, Dv]`, from the
+    forward's `residuals` (each query's maximum and denominator `[B, H, Q]`, its anchor key, the first
+    holding the keys' maximum, `[B, H, Q]` int32, and its split sums, `Split`), through a mainloop's
+    `launch` (the Triton one, `attention_triton.backward`; the plain-JAX one,
+    `attention_portable.backward`): the call padded to whole `block`s (`padded_call`), `launch(query, key,
+    value, dout, peak0, total0, initial_term, maximum, key_index, anchor_value, others, own, others_total,
+    total, start, end, query_ids, key_ids, score_params, *, score_mod, score_kinds, score_dtypes, scale)`
+    giving dQ, the softmax's rows (`D - c`, `c`, `m`, `T`, the keys' mass), each query's anchor key as it
+    chose it, the dQ program's hook gradients (`DQ_GRADS`), then dK, dV and the dK/dV program's
+    (`DKV_GRADS`); each gradient fp32, then rounded to its input's dtype. D is taken two ways, about 0 and
+    about the anchor key's `v_c · dO`, each query the nearer, from the forward's split sums
+    (`attention_algebra.split_delta`) or a first pass of the dQ launch's own over the keys at the
+    forward's maximum (`off_anchor_delta`): the anchor key's `dP - c` enters as exactly 0; the main pass
+    then refines D once from its own sums for the dK/dV launch and the head, query and initial state's
+    gradients (`attention_algebra.refinement`). The output hook is no part of it: a differentiated call
+    applies `output_mod` past the kernel, where its own derivative runs, and passes `dout` before it.
+    Deterministic: every gradient element is written by one program, a head parameter's partial sums added
+    in a fixed order and a key head's query heads summed in XLA."""
+    hooks = Hooks() if hooks is None else hooks
+    if hooks.output_mod is not None:
+        raise ValueError("the backward takes the output before the output hook (`backward`'s docstring)")
+    batch, queries, heads, width = query.shape
+    keys, kv_heads, value_width = key.shape[1], key.shape[2], value.shape[-1]
+    group = heads // kv_heads
+    scale = width ** -0.5 if scale is None else scale
+    # One cotangent for every part: the output's, in the operands' dtype as the reference takes it.
+    dout = dout.astype(query.dtype)
+    cotangent = jnp.swapaxes(dout.astype(jnp.float32), 1, 2)
+    state = hooks.initial
+    if state is None:
+        nothing = jnp.zeros((batch, heads, queries), jnp.float32)
+        starts = nothing - jnp.inf, nothing, nothing
+    else:
+        # The softmax's initial state: its maximum, denominator and share of D's numerator, in fp32.
+        starts = (state.m.astype(jnp.float32), state.total.astype(jnp.float32),
+                  jnp.sum(state.acc.astype(jnp.float32) * cotangent, axis=-1))
+    call = padded_call(query, key, value, spans, hooks, block)
+    padded_dout = jnp.pad(dout, ((0, 0), (0, call.query.shape[1] - queries), (0, 0),
+                                 (0, call.value.shape[-1] - value_width)))
+    operands = (call.query, call.key, call.value, padded_dout)
+    rows = (call.start, call.end, call.query_ids, call.key_ids, call.score_params)
+    kinds = tuple(param.kind for param in hooks.score_params)
+    dtypes = tuple(kept_dtype(param.value.dtype) for param in hooks.score_params)
+    maxima, totals, anchors, split = residuals
+    key_index = call.rows(anchors.astype(jnp.int32))
+    widened = ((0, 0),) * 3 + ((0, call.value.shape[-1] - value_width),)
+    others = jnp.pad(call.rows(split.others.astype(jnp.float32)), widened)
+    own, others_total = call.rows(split.own), call.rows(split.others_total)
+    # The anchor key's value row for each query, `[B, Qp, H, Dvp]`, a key head's for its query heads.
+    anchor_value = jnp.take_along_axis(jnp.repeat(call.value, group, axis=2),
+                                       jnp.swapaxes(key_index, 1, 2)[..., None], axis=1)
+    maximum = call.rows(maxima.astype(jnp.float32))
+    outputs = launch(*operands, *(call.rows(start) for start in starts), maximum, key_index, anchor_value,
+                     others, own, others_total, call.rows(totals.astype(jnp.float32)), *rows,
+                     score_mod=hooks.score_mod, score_kinds=kinds, score_dtypes=dtypes, scale=scale)
+    dq, softmax = outputs[0], outputs[1:6]
+    grads_out = list(outputs[7:])
+    dq_grads = [grads_out.pop(0) for kind in kinds if kind in DQ_GRADS]
+    dk, dv, *key_grads = grads_out
+    delta, anchor, peak, total, mass = (array[:, :, :queries] for array in softmax)
+    delta = anchor + delta
+    padded_k, padded_d, padded_dv = call.key.shape[1], call.key.shape[-1], call.value.shape[-1]
+    dk = dk.reshape(batch, padded_k, kv_heads, group, padded_d).sum(axis=3)
+    dv = dv.reshape(batch, padded_k, kv_heads, group, padded_dv).sum(axis=3)
+    grads = []
+    for param in hooks.score_params:
+        match param.kind:
+            case Kind.HEAD:
+                grads.append(dq_grads.pop(0).sum(axis=(0, 1))[:param.value.shape[0], 0])
+            case Kind.QUERY:
+                grads.append(dq_grads.pop(0)[:, :, :queries])
+            case Kind.TILE:
+                grads.append(key_grads.pop(0)[:, :, :queries, :keys])
+            case Kind.KEY:
+                grads.append(key_grads.pop(0)[:, :, :keys])
+            case Kind.OUTPUT:
+                raise ValueError("a score hook takes no output parameter")
+    initial = None
+    if state is not None:
+        # The initial state as one more softmax term, its weight exp(m0 - m) / T and value acc0 / total0:
+        # each gradient divides by T first and takes the factor exp(m0 - m) last, so a state that weighs
+        # little beside the keys (a subnormal factor) is rounded once there, as the reference rounds it.
+        # Bounded as the launch's own carried factor is (`attention_algebra.below`): the forward's
+        # maximum is the state's too, whatever its rounding.
+        carried = jnp.exp(jnp.minimum(starts[0] - peak, 0.0))
+        factor = jnp.where((total > 0) & jnp.isfinite(starts[0]), carried, 0.0)
+        inverse = jnp.where(total > 0, 1.0 / jnp.where(total > 0, total, 1.0), 0.0)
+        # Its maximum's cotangent, that term's score cotangent, taken whole as the reference's derivative
+        # takes it; exactly 0 for a query that read only its state, whose output its maximum leaves unmoved.
+        moved = (jnp.sum(state.acc.astype(jnp.float32) * cotangent, axis=-1)
+                 - state.total.astype(jnp.float32) * delta) * inverse
+        initial = Initial(m=jnp.where(mass > 0, moved * factor, 0.0).astype(state.m.dtype),
+                          total=(-(delta * inverse) * factor).astype(state.total.dtype),
+                          acc=((cotangent * inverse[..., None]) * factor[..., None]).astype(state.acc.dtype))
+    return Gradients(dq[:, :queries, :, :width].astype(query.dtype),
+                     dk[:, :keys, :, :width].astype(key.dtype),
+                     dv[:, :keys, :, :value_width].astype(value.dtype),
+                     tuple(grad.astype(param.value.dtype) for grad, param in zip(grads, hooks.score_params,
+                                                                                 strict=True)),
+                     initial)
