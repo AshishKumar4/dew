@@ -58,7 +58,7 @@ def test_registered_lm_objective_computes_next_token_loss():
     step = Step(step=jnp.array(0), key=jax.random.key(1), ema=None)
     actual, _ = registered.scalar_loss(variables, batch, step)
     expected, _ = direct.scalar_loss(variables, batch, step)
-    np.testing.assert_allclose(actual, expected)
+    np.testing.assert_array_equal(actual, expected)
 
 
 def lm_objective(variables=None, **options):
@@ -84,7 +84,7 @@ def test_compiled_scores_follow_substituted_modules_and_head_tiles():
     fresh = lm_objective(ema_decay=None)
     fresh.substitute([replacement])
     expected = fresh.evaluate(variables, batch, step)
-    assert not np.allclose(before.losses, expected.losses)
+    assert not np.array_equal(before.losses, expected.losses)
     np.testing.assert_array_equal(after.losses, expected.losses)
     assert objective._compiled_scores is not compiled
     compiled = objective._compiled_scores
@@ -146,37 +146,53 @@ class SuppliedRule(Objective):
 def test_a_supplied_gradient_is_what_the_trainer_steps_with():
     """The statistics keep their value, the derivative of the reduced loss
     is the supplied rule over the mass, and two microbatches of a window
-    pool their rules by mass, as the trainer pools `jax.grad`'s."""
+    pool their rules by mass, as the trainer pools `jax.grad`'s: to the bit,
+    on rows of eighths, whose sums every order computes exactly."""
     from affine_run import dataset
 
     from dew.training import Layout, Trainer
 
-    rows = [np.random.default_rng(seed).normal(size=(8, 3)).astype(np.float32) for seed in (0, 1)]
+    rows = [(np.round(8 * np.random.default_rng(seed).normal(size=(8, 3))) / 8).astype(np.float32)
+            for seed in (0, 1)]
     objective = SuppliedRule()
     params, step = objective.init(None), Step(jnp.asarray(0), jax.random.key(0), None)
     value, gradient = jax.value_and_grad(
         lambda p: objective.scalar_loss({"params": p}, {"x": rows[0]}, step)[0])(params["params"])
-    np.testing.assert_allclose(value, np.mean(np.square(rows[0] @ np.zeros(3) - 1.0)))
-    np.testing.assert_allclose(gradient["w"], rows[0].sum(0) / 8, rtol=1e-6)
+    assert float(value) == 1.0
+    np.testing.assert_array_equal(gradient["w"], rows[0].sum(0) / 8)
 
     trainer = Trainer(objective, optax.sgd(0.5), key=jax.random.key(0), accumulation=2,
                       layout=Layout(min_shard=1, tolerance=1.0))
     stepped = trainer.fit(dataset(lambda: iter([{"x": x} for x in rows]), batch=8), steps=2).variables
     expected = -0.5 * (rows[0].sum(0) + rows[1].sum(0)) / 16
-    np.testing.assert_allclose(stepped["params"]["w"], expected, rtol=1e-6)
+    np.testing.assert_array_equal(stepped["params"]["w"], expected)
+
+
+ROW_MEAN_SEEDS = 8
+"""Check 1's declared seeds for the row means, sized by `seeds_for` (2026-10-21, on armada)."""
+
+
+def squared_rows(seed: int) -> tuple[np.ndarray]:
+    """64 rows of 6144 squares, a small JEPA loss's count."""
+    return (np.square(np.random.default_rng(seed).normal(1.2, 1.0, size=(64, 6144))).astype(np.float32),)
+
+
+def row_means(squares):
+    ratio = Objective.row_mean(jnp.asarray(squares), {}, axis=1)
+    return ratio.total / ratio.mass
 
 
 def test_a_loss_mean_is_as_exact_as_numpys_float32_mean():
-    """Each of 64 rows' mean over 6144 squares, a small JEPA loss's count, within the float64 gate:
-    one reduction over every element left such a sum a float32 step from the correctly rounded one,
-    and the JEPA loss a float32 ulp from float64 on some weights, several times numpy's distance."""
-    from reference_error import assert_as_exact_as_the_reference
+    """Each of 64 rows' mean over 6144 squares, a small JEPA loss's count, on par with numpy's mean
+    (check 1): one reduction over every element left such a sum a float32 step from the correctly
+    rounded one, and the JEPA loss a float32 ulp from float64 on some weights, several times numpy's
+    distance."""
+    from reference_error import assert_as_exact
 
-    squares = np.square(np.random.default_rng(0).normal(1.2, 1.0, size=(64, 6144))).astype(np.float32)
+    assert_as_exact(jax.jit(row_means), lambda squares: squares.mean(axis=1), squared_rows, "row means",
+                    seeds=ROW_MEAN_SEEDS)
+    (squares,) = squared_rows(0)
     ratio = Objective.row_mean(jnp.asarray(squares), {}, axis=1)
-    rows = np.asarray(ratio.total / ratio.mass)
-    assert_as_exact_as_the_reference(rows, squares.mean(axis=1), squares.astype(np.float64).mean(axis=1),
-                                     "row means")
     # Each row's sum is the correctly rounded one, compiled too, and its derivative is the plain
     # sum's, ones.
     correct = squares.astype(np.float64).sum(axis=1).astype(np.float32)

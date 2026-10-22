@@ -1,6 +1,6 @@
 import { DurableObject } from 'cloudflare:workers';
 import type { SnapshotRecord } from './snapshot-ledger';
-import { health, restore } from './container';
+import { becameReady, health, restore } from './container';
 import type { SnapshotGeneration } from './snapshots';
 
 type Phase = (name: string) => Promise<void>;
@@ -90,17 +90,13 @@ export async function smokeSnapshot(container: Container, snapshot: ContainerSna
 	restore(container, snapshot, 'preparation',
 		{ entrypoint: ['sh', '/opt/live/start-shared.sh'], env: { DEW_SHARED_SECRET: relaySecret } });
 	await container.setInactivityTimeout(15 * 60_000);
-	const deadline = Date.now() + 180_000;
-	while (!(await health(container, 8888))?.ok) {
-		if (Date.now() > deadline || !container.running) {
-			// A container that never came up may not answer an exec either.
-			const logs = await Promise.race([
-				container.exec(['sh', '-c', 'tail -c 6000 /run/dew/model.log /run/dew/gateway.log 2>/dev/null'])
-					.then(async (process) => new TextDecoder().decode((await process.output()).stdout)),
-				scheduler.wait(10_000).then(() => 'its logs did not come within 10 s')]);
-			throw new Error(`offline shared models did not become ready: ${logs}`);
-		}
-		await scheduler.wait(500);
+	if (!(await becameReady(container, async () => (await health(container, 8888))?.ok === true))) {
+		// A container that never came up may not answer an exec either.
+		const logs = await Promise.race([
+			container.exec(['sh', '-c', 'tail -c 6000 /run/dew/model.log /run/dew/gateway.log 2>/dev/null'])
+				.then(async (process) => new TextDecoder().decode((await process.output()).stdout)),
+			scheduler.wait(10_000).then(() => 'its logs did not come within 10 s')]);
+		throw new Error(`offline shared models did not become ready: ${logs}`);
 	}
 	const credential = new ReadableStream<Uint8Array>({ start(controller) {
 		controller.enqueue(new TextEncoder().encode(relaySecret)); controller.close();

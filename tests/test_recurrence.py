@@ -46,6 +46,21 @@ SEEDS = dict(zip(HOOKS, (
 The reference compared with itself resolves the factor in every leaf; the count holds at every config.
 """
 
+FORMED = [
+    recurrence.Hooks(decay='scalar', gates=recurrence.Gates(write='step', limit=(0.0, 0.5)), delta=False,
+                     skip=True),
+    recurrence.Hooks(decay='scalar', gates=recurrence.Gates(limit=(0.0, 0.5))),
+    recurrence.Hooks(decay='scalar', scale=0.25),
+    recurrence.Hooks(decay='vector', l2norm=True, scale=0.25),
+    recurrence.Hooks(decay='scalar', rated=True, delta=False, skip=True, output=NORMS[1]),
+]
+"""The launch's other prologue values: Mamba2's step gates clipped with the skip, the gated delta rule's
+gates with a clipped step, a scale without the l2 norm and one under it, and a rated decay with the
+skip and the norm (`recurrence_chunk.chunk`'s SSD)."""
+
+FORMED_SEEDS = dict(zip(FORMED, (8, 16, 8, 8, 16), strict=True))
+"""The formed sites' seeds, sized independently by `seeds_for` on armada (2026-10-21)."""
+
 BF16_SEEDS = {HOOKS[0]: 8, HOOKS[-1]: 16}
 """The bf16-state sites' seeds, sized by `seeds_for` on armada (2026-10-20), including every output."""
 
@@ -70,8 +85,14 @@ def operands(hooks: recurrence.Hooks, seed: int = 0, state_dtype=jnp.float32) ->
         given |= {'query': normal(ROWS, KEY_HEADS, KEY_WIDTH), 'key': normal(ROWS, KEY_HEADS, KEY_WIDTH) / 4,
                   'value': normal(ROWS, VALUE_HEADS, VALUE_WIDTH)}
     if hooks.gates is not None:
-        given |= {'gate': normal(ROWS, VALUE_HEADS), 'beta': normal(ROWS, VALUE_HEADS),
-                  'log_a': normal(VALUE_HEADS, scale=0.3), 'bias': normal(VALUE_HEADS, scale=0.3)}
+        given['gate'] = normal(ROWS, VALUE_HEADS)
+        if hooks.gates.write == 'sigmoid':
+            given['beta'] = normal(ROWS, VALUE_HEADS)
+        given |= {'log_a': normal(VALUE_HEADS, scale=0.3), 'bias': normal(VALUE_HEADS, scale=0.3)}
+    elif hooks.rated:
+        # Mamba2's: the step through softplus is the write gate, the rate `A = -exp(A_log)` a head's.
+        given |= {'beta': jax.nn.softplus(normal(ROWS, VALUE_HEADS) - 1.0),
+                  'rate': -jnp.exp(normal(VALUE_HEADS, scale=0.5))}
     else:
         if hooks.decay == 'scalar':
             given['log_decay'] = -jnp.abs(normal(ROWS, VALUE_HEADS, scale=0.2))
@@ -143,7 +164,7 @@ def one_tap_draw(dtype, seed: int) -> tuple[recurrence.Step]:
     return (orbit(one_tap_operands(dtype, operand_seed), orbit_seed),)
 
 
-@pytest.mark.parametrize('hooks', HOOKS, ids=str)
+@pytest.mark.parametrize('hooks', HOOKS + FORMED, ids=str)
 def test_every_hook_combination_steps_as_its_float64_form(hooks):
     """A decode token through the launch, at each config of its space, within tests/reference_error.py's
     rule of the XLA form's fp32 run against its float64 run: its output, its state and, under a conv,
@@ -156,7 +177,7 @@ def test_every_hook_combination_steps_as_its_float64_form(hooks):
         with tuning.pinned({recurrence.StepLaunch: config}):
             step = jax.jit(functools.partial(recurrence.step, hooks))
             assert_as_exact(step, reference_fn, functools.partial(draw, hooks), f'{hooks} {config}',
-                            seeds=SEEDS[hooks])
+                            seeds={**SEEDS, **FORMED_SEEDS}[hooks])
             out, history, state = step(given)
         np.testing.assert_array_equal(np.asarray(out)[1], 0.0)
         np.testing.assert_array_equal(np.asarray(state)[1], np.asarray(given.state)[1])

@@ -20,7 +20,7 @@ from dew.data.dataset import Loader
 from dew.diffusion import broadcast_rates, expand, presets
 from dew.inputs import CharTable, Condition, Field, InputSpec, unit_range
 from dew.nn.backbones import SimpleDiT, SimpleMMDiT
-from dew.objectives.base import Step
+from dew.objectives.base import Recorder, Step
 from dew.objectives.diffusion import DiffusionObjective
 from dew.sampling import CFG, Euler
 from dew.training import Trainer
@@ -28,12 +28,12 @@ from dew.training import Trainer
 _DEFAULT_MAKE_OBJECTIVE_GUIDANCE = CFG(2.0)
 
 
-def make_objective(*, guidance: CFG | None = _DEFAULT_MAKE_OBJECTIVE_GUIDANCE):
+def make_objective(*, guidance: CFG | None = _DEFAULT_MAKE_OBJECTIVE_GUIDANCE, **fields):
     model = SimpleDiT(patch_size=4, emb_features=16, num_layers=1, num_heads=2, mlp_ratio=1)
     inputs = InputSpec(Field("image", (RES, RES, 3)),
                        {"textcontext": Condition(StubText.from_pretrained("stub"))})
     return DiffusionObjective(model, presets.EDM(P_mean=-0.4, P_std=1.0), inputs, steps=3, guidance=guidance,
-                              solver=Euler())
+                              solver=Euler(), **fields)
 
 
 def make_batch(count=8):
@@ -42,6 +42,14 @@ def make_batch(count=8):
     encoder = StubText.from_pretrained("stub")
     return {"image": images,
             "text": encoder.tokenize(["a bird", "cat", "", "two dogs", "x", "y", "zz", "w"][:count])}
+
+
+def make_batch_of(count: int):
+    """`count` rows of drawn images and captions, as `make_batch` makes eight."""
+    images = np.random.default_rng(count).integers(0, 256, (count, RES, RES, 3), dtype=np.uint8)
+    captions = ["a bird", "cat", "", "two dogs", "x", "y", "zz", "w"]
+    return {"image": images,
+            "text": StubText.from_pretrained("stub").tokenize([captions[row % 8] for row in range(count)])}
 
 
 def test_the_steps_blank_is_its_own_towers_encoding_of_the_configured_prompt():
@@ -189,21 +197,20 @@ def test_singlestep_solver_generates_through_the_objective(order, steps):
 def test_loss_is_the_weighted_error_of_the_prediction():
     """With a zero output, the Karras parameterization predicts x_0 as
     c_skip x_t, the target is x_0, and the loss is the EDM lambda weighted
-    mean of the l2 error, with t and the noise drawn from the step's key in
-    the objective's order."""
+    mean of the l2 error, at the t and the noise the step reads (`Step.tape`)."""
     process = presets.EDM(regime="pixel")()
     inputs = InputSpec(Field("image", (RES, RES, 3)))
     objective = DiffusionObjective(Zero(), process, inputs)
     params = objective.init(jax.random.PRNGKey(0))
     batch = make_batch()
-    step = Step(step=jnp.asarray(3), key=jax.random.PRNGKey(7), ema=None)
+    x0 = unit_range(batch["image"])
+    time_key, noise_key = jax.random.split(jax.random.PRNGKey(7))
+    t = process.schedule.sample_t(time_key, 8)
+    noise = jax.random.normal(noise_key, x0.shape)
+    step = Step(step=jnp.asarray(3), key=jax.random.PRNGKey(7), ema=None, tape={"times": t, "noise": noise})
 
     loss, aux = objective.scalar_loss(params, batch, step)
 
-    _, _, time_key, noise_key, _ = jax.random.split(step.key, 5)
-    x0 = unit_range(batch["image"])
-    t = process.schedule.sample_t(time_key, 8)
-    noise = jax.random.normal(noise_key, x0.shape)
     rates = broadcast_rates(process.schedule, t, x0)
     x_t = rates[0] * x0 + rates[1] * noise
     predicted = process.prediction.pred_transform(x_t, jnp.zeros_like(x_t), rates, t)
@@ -295,7 +302,10 @@ def test_null_dropout_matches_explicit_tokens_under_current_encoder(conditional_
     conditional = DiffusionObjective(source.model, source.process, source.inputs,
                                      unconditional_prob=0.0, steps=3, solver=Euler(),
                                      variables=variables)
-    mask = jax.random.bernoulli(jax.random.split(step.key, 5)[1], probability, (4,))
+    # The rows the dropped objective's step drops, which the explicit batch blanks itself.
+    recorder = Recorder()
+    dropped.scalar_loss(variables, batch, replace(step, recorder=recorder))
+    (_, mask), = recorder.values["condition dropout"]
     explicit = source.inputs.tokenize([""] * 4)
     explicit = {"image": batch["image"], "text": jax.tree.map(
         lambda blank, given: jnp.where(mask[:, None], blank, given), explicit["text"], batch["text"])}
@@ -336,3 +346,148 @@ def test_guided_samples_use_bound_encoder_not_constructor_weights(conditional_mm
     expected = reconstructed.evaluate(variables, batch, step).images
     actual = objective.evaluate(variables, batch, step).images
     np.testing.assert_array_equal(actual, expected)
+
+
+def test_each_example_draws_its_own_times_noise_and_dropout_on_every_layout():
+    """A step's draws are each example's own (`Step.sample`): the batch whole on one device, its two
+    halves pooled in an accumulation window, and the batch read in two microbatches give every
+    example the same times, noise and dropped condition, and so the same noised input, target and
+    loss weight, bitwise, as the transaction places each microbatch's rows among the update's
+    examples (`example_places`). The model's dropout stays the attempt's (`Step.key`)."""
+    from dew.objectives.base import Recorder, example_stream, stream
+    from dew.training.distributed import microbatch
+    from dew.training.transaction import example_places
+
+    objective = make_objective(unconditional_prob=0.5)
+    params = objective.init(jax.random.PRNGKey(0))
+    batch = make_batch(8)
+    update = jax.random.key(7)
+
+    def taped(parts):
+        """The tape of the update's eight examples when the loss reads `parts`, (slot, split, rows) each."""
+        recorder = Recorder()
+        for slot, split, rows in parts:
+            index = example_places(slot, split, len(jax.tree.leaves(rows)[0]))
+            step = Step(jnp.asarray(0), jax.random.key(slot), None, example_key=update,
+                        example_index=index, recorder=recorder)
+            objective.loss(params, rows, step)
+        return recorder.tape(8)
+
+    halves = [jax.tree.map(lambda value, rows=rows: value[rows], batch)
+              for rows in (slice(0, 4), slice(4, 8))]
+    microbatches = [microbatch(batch, jnp.asarray(part), 2) for part in range(2)]
+    whole = taped([(0, 1, batch)])
+    pooled = taped([(slot, 1, half) for slot, half in enumerate(halves)])
+    split = taped([(part, 2, rows) for part, rows in enumerate(microbatches)])
+    assert set(whole) == {"condition dropout", "times", "noise", "noised input", "target", "loss weights"}
+    for name in whole:
+        for layout in (pooled, split):
+            np.testing.assert_array_equal(np.asarray(layout[name]), np.asarray(whole[name]), err_msg=name)
+    # Both halves of the dropout draw occur: each example's draw is its own, not one for the batch.
+    assert 0 < int(np.sum(np.asarray(whole["condition dropout"]))) < 8
+    assert len({float(np.asarray(whole["times"])[row]) for row in range(8)}) == 8
+    # An example's noise is its documented draw: the update's key folded with the draw's name, then the
+    # example's place.
+    third = jax.random.fold_in(jax.random.fold_in(example_stream(update), stream("noise")), 3)
+    np.testing.assert_array_equal(np.asarray(whole["noise"])[3],
+                                  np.asarray(jax.random.normal(third, (RES, RES, 3), jnp.float32)))
+
+
+POOLED_SEEDS = 16
+"""Check 1's declared seeds for the pooled update, sized by `seeds_for` (2026-10-21, on armada)."""
+
+
+def test_an_accumulated_update_of_a_diffusion_objective_is_its_batch_whole_on_one_device():
+    """Two microbatches pooled by the trainer step as their batch whole does: each example draws its
+    time, noise and dropped condition by its place among the update's examples, which the halves
+    give as the whole gives them, so the pooled update is on par with the whole batch's float32 step
+    over drawn weights (check 1), its float64 twin the truth. The weights are the init's, each leaf
+    moved by a draw, so the DiT's zero-initialized layers take a gradient too. Drawn by the attempt,
+    the halves read other noise than the whole, and the step another update."""
+    import copy
+
+    import optax
+    from reference_error import assert_as_exact, widened
+
+    from dew.training import Trainer
+    from dew.training.transaction import example_fields
+
+    objective = make_objective(unconditional_prob=0.5)
+    rows = 4 * jax.device_count()
+    whole = make_batch_of(2 * rows)
+    halves = [jax.tree.map(lambda value, part=part: value[part * rows:(part + 1) * rows], whole)
+              for part in (0, 1)]
+    trainer = Trainer(objective, optax.sgd(1.0), key=jax.random.PRNGKey(3), accumulation=2)
+    initial = trainer.initial_state()
+    template = jax.tree.map(jnp.copy, initial)
+    run = trainer.compile(initial, halves[0])
+    fields = example_fields(initial, 0, 1, whole)
+    info = Step(jnp.asarray(0), jax.random.fold_in(initial.key, 0), None, **fields)
+    twin = copy.copy(objective)
+    twin.substitute([objective.model.clone(dtype=jnp.float64)])
+
+    def draw(seed):
+        variables = jax.tree.map(np.asarray, template.variables)
+        keys = iter(jax.random.split(jax.random.key(seed), len(jax.tree.leaves(variables["params"]))))
+        def moved_leaf(leaf):
+            return (leaf + 0.02 * np.asarray(jax.random.normal(next(keys), leaf.shape))).astype(leaf.dtype)
+
+        params = jax.tree.map(moved_leaf, variables["params"])
+        return ({**variables, "params": params},)
+
+    def moved(before, after):
+        # sgd(1): the update applied, in float64, is the gradient with the update's float32 rounding.
+        return np.asarray(before, np.float64) - np.asarray(after, np.float64)
+
+    def pooled(variables):
+        # The step donates its state: each draw steps a copy of the untouched template.
+        state = jax.tree.map(jnp.copy, template).replace(variables=jax.tree.map(jnp.asarray, variables))
+        partial, *_ = run(state, halves[0])
+        stepped, *_ = run(partial, halves[1])
+        assert int(stepped.updates) == 1
+        return jax.tree.map(moved, variables["params"], jax.tree.map(np.asarray, stepped.variables["params"]))
+
+    def gradient(objective, variables, batch):
+        def loss(params):
+            return objective.scalar_loss({**variables, "params": params}, batch, info)[0]
+
+        return jax.grad(loss)(variables["params"])
+
+    whole_gradient = jax.jit(lambda variables: gradient(objective, variables, whole))
+
+    def alone(variables):
+        # The whole batch's step, its update applied in float32 as the trainer applies it.
+        grads = jax.tree.map(np.asarray, whole_gradient(variables))
+        return jax.tree.map(lambda before, grad: moved(before, (before - grad).astype(np.float32)),
+                            variables["params"], grads)
+
+    def truth(variables):
+        with jax.enable_x64(new_val=True):
+            return jax.tree.map(np.asarray, gradient(twin, widened(variables), widened(whole)))
+
+    assert_as_exact(pooled, alone, draw, "pooled update", seeds=POOLED_SEEDS, truth_fn=truth)
+
+
+def test_a_host_master_step_draws_each_examples_noise_as_the_resident_step_does():
+    """A step whose variables live on the host runs its loss on the accelerator with the examples'
+    draws the step carries, so it takes the update a resident step takes, to the bit: a host-master
+    run's draws by the attempt would read other times, noise and dropped conditions, and step
+    elsewhere."""
+    import optax
+
+    from dew.training import Layout, Trainer
+
+    objective = make_objective(unconditional_prob=0.5)
+    batch = make_batch_of(4 * jax.device_count())
+
+    def stepped(layout):
+        trainer = Trainer(objective, optax.sgd(0.1), key=jax.random.PRNGKey(3), layout=layout)
+        state, _, _ = trainer.place()
+        state, *_ = trainer.compile(state, batch)(state, batch)
+        return jax.tree.map(np.asarray, state.variables["params"])
+
+    resident = stepped(Layout(min_shard=1, tolerance=1.))
+    host = stepped(Layout(host=("variables",), min_shard=1, tolerance=1.))
+    for (path, got), want in zip(jax.tree_util.tree_leaves_with_path(host), jax.tree.leaves(resident),
+                                 strict=True):
+        np.testing.assert_array_equal(got, want, err_msg=jax.tree_util.keystr(path))

@@ -13,7 +13,8 @@ activations and a gated RMS norm of the output are its prologue and epilogue.
 This module holds the decode token, the chunk of one (`step`): one program a row and value head
 reads the state once and writes it once, with its hooks inlined, which is the decode step and the
 fused decode step it replaces. Its arithmetic is the XLA reference's (`step_reference`), which is
-also its CPU path and, on float64 operands, the float64 truth.
+also its CPU path and, on float64 operands, the float64 truth. Of the chunked form it holds the first
+stage every row of it shares, the decay's prefix within each chunk (`cumulated`).
 """
 
 import dataclasses
@@ -24,7 +25,9 @@ import jax
 import jax.numpy as jnp
 from jax.experimental import pallas as pl
 
-from . import norm_swiglu, short_conv, tuning
+from dew.nn.precision import compensated_add
+
+from . import chunked_launch, norm_swiglu, short_conv, tuning
 from .generation import triton_runs
 
 L2NORM_EPS = 1e-6
@@ -41,9 +44,17 @@ class Conv:
 
 @dataclasses.dataclass(frozen=True)
 class Gates:
-    """The gates from their pre-activations, a head's: the log decay `-exp(log_a) softplus(gate +
-    bias)` (the gated delta rule's and Mamba2's), and beta `sigmoid(beta)`. Without it the step takes
-    the log decay and beta as they are."""
+    """The gates from their pre-activations, a head's: the step `softplus(gate + bias)`, clipped to
+    `limit` where one is given, the log decay `-exp(log_a)` times it (the gated delta rule's and
+    Mamba2's), and the write gate `write`: 'sigmoid' of a raw `beta` (the gated delta rule's), or
+    'step', the step itself (Mamba2's discretized input). Without it the step takes the log decay and
+    beta as they are."""
+    write: str = 'sigmoid'
+    limit: tuple[float, float] | None = None
+
+    def __post_init__(self):
+        if self.write not in ('sigmoid', 'step'):
+            raise ValueError(f"a write gate is 'sigmoid' or 'step', not {self.write!r}")
 
 
 @dataclasses.dataclass(frozen=True)
@@ -57,29 +68,38 @@ class OutputNorm:
 @dataclasses.dataclass(frozen=True)
 class Hooks:
     """A step's static form, which enters its launch's key: the prologue's conv, the queries' and
-    keys' l2 norm (and the queries' `Dk^-1/2` scale), the decay's kind ('none', 'scalar' a head,
-    'vector' a key dimension), the gates, the delta rule, whether a write gate `beta` scales what the
-    token writes (always under the delta rule or the gates; without them, an input gate, else one),
-    a skip `D v`, and the epilogue."""
+    keys' l2 norm, the queries' `scale` (in working precision; under the l2 norm `Dk^-1/2` where None,
+    else none where None), the decay's kind ('none', 'scalar' a head, 'vector' a key dimension), the
+    gates, the delta rule, whether a write gate `beta` scales what the token writes (always under the
+    delta rule or the gates; without them, an input gate, else one), whether a scalar decay is
+    `rated`: the write gate times the head's `rate` (Mamba's discretization, `A dt` with `dt` the
+    write gate), a value kind defined on a contraction, `rate <= 0` and the write gate `>= 0`, which
+    its callers hold and a port may take as given (mamba_ssm's kernels clamp each decay to at most
+    one); a skip `D v`, and the epilogue. The chunked op (`recurrence_chunk.chunk`) takes the same
+    form."""
     conv: Conv | None = None
     l2norm: bool = False
+    scale: float | None = None
     decay: str = 'vector'
     gates: Gates | None = None
     delta: bool = True
     write_gate: bool = False
+    rated: bool = False
     skip: bool = False
     output: OutputNorm | None = None
 
     @property
     def gated_write(self) -> bool:
         """Whether the step reads a write gate `beta`."""
-        return self.delta or self.write_gate or self.gates is not None
+        return self.delta or self.write_gate or self.gates is not None or self.rated
 
     def __post_init__(self):
         if self.decay not in ('none', 'scalar', 'vector'):
             raise ValueError(f"a decay is 'none', 'scalar' or 'vector', not {self.decay!r}")
         if self.gates is not None and self.decay != 'scalar':
             raise ValueError('the gates form one log decay a head: their decay is scalar')
+        if self.rated and (self.decay != 'scalar' or self.gates is not None):
+            raise ValueError('a rated decay is one a head without the gates, which rate their own')
 
 
 def round_to_bf16(state, key, value):
@@ -124,6 +144,18 @@ def _gated_decay(gate, log_a, bias):
     return -jnp.exp(log_a) * jax.nn.softplus(gate + bias)
 
 
+def gated(gates: Gates, gate, log_a, bias, beta):
+    """The log decay and the write gate `gates` forms from its pre-activations, in their dtype: with a
+    sigmoid write gate the gated delta rule's (`_gated_decay`, `sigmoid(beta)`), with the step's
+    Mamba2's (`-exp(log_a)` times the clipped step, and the step)."""
+    if gates.write == 'sigmoid' and gates.limit is None:
+        return _gated_decay(gate, log_a, bias), jax.nn.sigmoid(beta)
+    step = jax.nn.softplus(gate + bias)
+    if gates.limit is not None:
+        step = jnp.clip(step, *gates.limit)
+    return -jnp.exp(log_a) * step, step if gates.write == 'step' else jax.nn.sigmoid(beta)
+
+
 def gated_rms(out, z, weight, norm: OutputNorm):
     """The epilogue over a head's output `[..., Dv]` in fp32 or wider: `rms_norm(o) weight act(z)`,
     the mean a product by the reciprocal, as XLA's."""
@@ -131,9 +163,26 @@ def gated_rms(out, z, weight, norm: OutputNorm):
     return out * inverse * weight * norm_swiglu.activation_and_slope(z, norm.activation)[0]
 
 
+@dataclasses.dataclass(frozen=True, kw_only=True)
+class Gated:
+    """The operands the hooks read beside the queries, keys and values, a decode token's (`Step`) and a
+    chunked sequence's (`recurrence_chunk.Chunk`) alike, each None where its hook is off: the log
+    decay, the gates' pre-activations, the write gate, the skip's `D`, the epilogue's gate and
+    weight, and a rated decay's rate. A value kind the hooks gain is a field here."""
+    log_decay: jax.Array | None = None
+    gate: jax.Array | None = None
+    log_a: jax.Array | None = None
+    bias: jax.Array | None = None
+    beta: jax.Array | None = None
+    skip: jax.Array | None = None
+    z: jax.Array | None = None
+    weight: jax.Array | None = None
+    rate: jax.Array | None = None
+
+
 @jax.tree_util.register_dataclass
 @dataclasses.dataclass(frozen=True)
-class Step:
+class Step(Gated):
     """A decode token's operands, each `[rows, ...]`; a hook's are None where it is off.
 
     Without a conv, `query` and `key` `[rows, Hk, Dk]` and `value` `[rows, Hv, Dv]` (the query scaled
@@ -141,8 +190,9 @@ class Step:
     and `taps` `[C, K]`. `log_decay` is `[rows, Hv]` (scalar) or `[rows, Hv, Dk]` (vector), or with
     the gates `gate` `[rows, Hv]`, `log_a` and `bias` `[Hv]`. `beta` `[rows, Hv]` is the write gate
     (a raw beta with the gates), `skip` `[Hv]` the skip's `D`, `z` `[rows, Hv, Dv]` and `weight`
-    `[Dv]` the epilogue's. `state` is `[rows, Hv, Dk, Dv]`, fp32 or bf16 (rounded by
-    `round_to_bf16`), or wider for the reference. `active` `[rows]` marks the rows that draw. A pytree
+    `[Dv]` the epilogue's, `rate` `[Hv]` a rated decay's, at most zero (`Hooks.rated`). `state` is
+    `[rows, Hv, Dk, Dv]`, fp32 or bf16 (rounded by `round_to_bf16`), or wider for the reference.
+    `active` `[rows]` marks the rows that draw. A pytree
     of its arrays, so it crosses `jit` and a transformation as a token's operands do; the `Hooks` are
     its static form."""
     state: jax.Array
@@ -152,14 +202,6 @@ class Step:
     token: jax.Array | None = None
     held: jax.Array | None = None
     taps: jax.Array | None = None
-    log_decay: jax.Array | None = None
-    gate: jax.Array | None = None
-    log_a: jax.Array | None = None
-    bias: jax.Array | None = None
-    beta: jax.Array | None = None
-    skip: jax.Array | None = None
-    z: jax.Array | None = None
-    weight: jax.Array | None = None
     active: jax.Array | None = None
 
 
@@ -175,25 +217,31 @@ def _pieces(hooks: Hooks, value_heads: int, key_width: int, value_width: int, ch
 
 
 OPERANDS = ('state', 'query', 'key', 'value', 'token', 'held', 'taps', 'log_decay', 'gate', 'beta', 'log_a',
-            'bias', 'skip', 'z', 'weight')
+            'bias', 'skip', 'z', 'weight', 'rate')
 """`StepLaunch`'s array operands after `active`, in its order."""
 
 
 def _names(hooks: Hooks) -> tuple[str, ...]:
     """The `Step` operands a launch reads, in its order, after `active`; `state` last."""
     streams = ('token', 'held', 'taps') if hooks.conv is not None else ('query', 'key', 'value')
-    gates = (('gate', 'beta', 'log_a', 'bias') if hooks.gates is not None
-             else ('log_decay',) * (hooks.decay != 'none') + ('beta',) * hooks.gated_write)
+    if hooks.gates is not None:
+        gates = ('gate', *('beta',) * (hooks.gates.write == 'sigmoid'), 'log_a', 'bias')
+    elif hooks.rated:
+        gates = ('rate', 'beta')
+    else:
+        gates = ('log_decay',) * (hooks.decay != 'none') + ('beta',) * hooks.gated_write
     return (*streams, *gates, *('skip',) * hooks.skip, *('z', 'weight') * (hooks.output is not None), 'state')
 
 
-def _read(hooks: Hooks, operands: Step) -> dict:
-    """The operands `hooks` read (`_names`), by name, each held, else a ValueError naming those it lacks."""
+def read(hooks: Hooks, operands, *, optional: tuple[str, ...] = ()) -> dict:
+    """The operands `hooks` read (`_names`) from a `Step` or a chunked op's operands
+    (`recurrence_chunk.Chunk`), by name, each held but those `optional` leaves out, else a ValueError
+    naming those it lacks."""
     given = {name: getattr(operands, name) for name in _names(hooks)}
-    missing = [name for name, array in given.items() if array is None]
+    missing = [name for name, array in given.items() if array is None and name not in optional]
     if missing:
-        raise ValueError(f"{hooks} reads {', '.join(missing)}, which the step does not hold")
-    return given
+        raise ValueError(f"{hooks} reads {', '.join(missing)}, which its operands do not hold")
+    return {name: array for name, array in given.items() if array is not None}
 
 
 def _prologue(hooks: Hooks, given: dict, work):
@@ -220,20 +268,44 @@ def _prologue(hooks: Hooks, given: dict, work):
     if hooks.l2norm:
         query, key = (x * jax.lax.rsqrt(jnp.sum(x * x, axis=-1, keepdims=True) + L2NORM_EPS)
                       for x in (query, key))
-        query = query * key_width ** -0.5
+        query = query * (key_width ** -0.5 if hooks.scale is None else hooks.scale)
+    elif hooks.scale is not None:
+        query = query * hooks.scale
     group = value_heads // query.shape[1]
     query, key = (jnp.repeat(x, group, axis=1) for x in (query, key))
     return query, key, value, history
 
 
+def log_gates(hooks: Hooks, given: dict, work):
+    """The log decay and the write gate, each in `work`, from the operands `given` by name (`read`): the
+    gates' (`gated`), a rated decay's (the rate times the write gate), or as given; None for a decay
+    or a write gate the hooks have not."""
+    if hooks.gates is not None:
+        beta = given['beta'].astype(work) if hooks.gates.write == 'sigmoid' else None
+        return gated(hooks.gates, given['gate'].astype(work), given['log_a'].astype(work),
+                     given['bias'].astype(work), beta)
+    if hooks.rated:
+        beta = given['beta'].astype(work)
+        return given['rate'].astype(work) * beta, beta
+    return (None if hooks.decay == 'none' else given['log_decay'].astype(work),
+            given['beta'].astype(work) if hooks.gated_write else None)
+
+
+def skipped(hooks: Hooks, out, value, given: dict, work):
+    """An output `[..., Hv, Dv]` in `work` with the skip `D v` added where the hooks have one."""
+    return out + given['skip'].astype(work)[:, None] * value.astype(work) if hooks.skip else out
+
+
+def normed(hooks: Hooks, out, given: dict, work):
+    """An output `[..., Hv, Dv]` in `work` through the epilogue's gated RMS norm where the hooks have one."""
+    if hooks.output is None:
+        return out
+    return gated_rms(out, given['z'].astype(work), given['weight'].astype(work), hooks.output)
+
+
 def _gates(hooks: Hooks, given: dict, work, key_width: int):
     """The reference's decay per key dimension `[rows, Hv, Dk]` and write gate `[rows, Hv]`."""
-    if hooks.gates is not None:
-        g = _gated_decay(*(given[name].astype(work) for name in ('gate', 'log_a', 'bias')))
-        beta = jax.nn.sigmoid(given['beta'].astype(work))
-    else:
-        g = None if hooks.decay == 'none' else given['log_decay'].astype(work)
-        beta = given['beta'].astype(work) if hooks.gated_write else None
+    g, beta = log_gates(hooks, given, work)
     rows, heads = given['state'].shape[:2]
     if g is None:
         decay = jnp.ones((rows, heads, key_width), work)
@@ -249,7 +321,7 @@ def step_reference(hooks: Hooks, operands: Step, *, dtype=None):
     """`(output [rows, Hv, Dv], history' or None, state')` of a decode token, in XLA: each piece of
     arithmetic in at least fp32 (float64 operands in float64), the state held as it came (bf16
     rounded by `round_to_bf16`), the output in `dtype` (the value's or the token's without it)."""
-    given = _read(hooks, operands)
+    given = read(hooks, operands)
     state = given['state']
     operand = given['token' if hooks.conv is not None else 'value'].dtype
     work = jnp.promote_types(jnp.promote_types(operand, state.dtype), jnp.float32)
@@ -257,10 +329,7 @@ def step_reference(hooks: Hooks, operands: Step, *, dtype=None):
     query, key, value, history = _prologue(hooks, given, work)
     decay, write = _gates(hooks, given, work, key_width)
     out, updated = update(state.astype(work), query, key, value, decay, write[..., None], delta=hooks.delta)
-    if hooks.skip:
-        out = out + given['skip'].astype(work)[None, :, None] * value
-    if hooks.output is not None:
-        out = gated_rms(out, given['z'].astype(work), given['weight'].astype(work), hooks.output)
+    out = normed(hooks, skipped(hooks, out, value, given, work), given, work)
     held = _held(updated, key, value, state.dtype)
     if operands.active is not None:
         active = jnp.asarray(operands.active, bool)
@@ -304,12 +373,24 @@ def _kernel(*refs, hooks: Hooks, group: int, key_heads: int, interpret: bool):
         if hooks.l2norm:
             query, key = (x[None] for x in (query, key))
             query = query * short_conv._inverse_norm(query, L2NORM_EPS, interpret=interpret)
-            query = query * key_width ** -0.5
+            query = query * (key_width ** -0.5 if hooks.scale is None else hooks.scale)
             key = key * short_conv._inverse_norm(key, L2NORM_EPS, interpret=interpret)
             query, key = query[0], key[0]
-        if hooks.gates is not None:
+        elif hooks.scale is not None:
+            query = query * hooks.scale
+        if hooks.gates is not None and hooks.gates.write == 'sigmoid' and hooks.gates.limit is None:
             decay = jnp.exp(_gated_decay(scalar('gate'), scalar('log_a'), scalar('bias')))
             write_gate = short_conv._sigmoid(scalar('beta'), interpret=interpret)
+        elif hooks.gates is not None:
+            step = jax.nn.softplus(scalar('gate') + scalar('bias'))
+            if hooks.gates.limit is not None:
+                step = jnp.clip(step, *hooks.gates.limit)
+            decay = jnp.exp(-jnp.exp(scalar('log_a')) * step)
+            write_gate = (step if hooks.gates.write == 'step'
+                          else short_conv._sigmoid(scalar('beta'), interpret=interpret))
+        elif hooks.rated:
+            write_gate = scalar('beta')
+            decay = jnp.exp(scalar('rate') * write_gate)
         else:
             decay = (jnp.ones((1,), jnp.float32) if hooks.decay == 'none'
                      else jnp.exp(inputs['log_decay'][...].astype(jnp.float32)))
@@ -429,13 +510,14 @@ class StepLaunch(tuning.KernelOp):
              value: jax.Array | None, token: jax.Array | None, held: jax.Array | None, taps: jax.Array | None,
              log_decay: jax.Array | None, gate: jax.Array | None, beta: jax.Array | None,
              log_a: jax.Array | None, bias: jax.Array | None, skip: jax.Array | None, z: jax.Array | None,
-             weight: jax.Array | None, *, hooks: Hooks, dtype: str, interpret: bool, config: Launch,
+             weight: jax.Array | None, rate: jax.Array | None, *, hooks: Hooks, dtype: str, interpret: bool,
+             config: Launch,
              return_residuals: bool = False):
         from jax.experimental.pallas import triton as plgpu
 
         arrays = {'state': state, 'query': query, 'key': key, 'value': value, 'token': token, 'held': held,
                   'taps': taps, 'log_decay': log_decay, 'gate': gate, 'beta': beta, 'log_a': log_a,
-                  'bias': bias, 'skip': skip, 'z': z, 'weight': weight}
+                  'bias': bias, 'skip': skip, 'z': z, 'weight': weight, 'rate': rate}
         given = {name: arrays[name] for name in _names(hooks)}
         rows, value_heads, key_width, value_width = state.shape
         key_heads = (_pieces(hooks, value_heads, key_width, value_width, given['token'].shape[-1])
@@ -476,7 +558,7 @@ class StepLaunch(tuning.KernelOp):
             'value': valued, 'z': valued, 'state': lambda array: held_state,
             'gate': functools.partial(one, rows=True), 'beta': functools.partial(one, rows=True),
             'log_a': functools.partial(one, rows=False), 'bias': functools.partial(one, rows=False),
-            'skip': functools.partial(one, rows=False),
+            'skip': functools.partial(one, rows=False), 'rate': functools.partial(one, rows=False),
             'log_decay': keyed_by_value if hooks.decay == 'vector' else functools.partial(one, rows=True),
         }
         flags = pl.BlockSpec((None, 1), lambda r, h, c: (r, 0))
@@ -557,7 +639,7 @@ def step(hooks: Hooks, operands: Step, *, dtype=None):
     where the caller lets it go. A row `active` marks False keeps its history and state, its output
     zeros. A one-tap conv holds no history, so its token is a channel-wise scale: it is taken here
     and the launch steps the queries, keys and values it makes."""
-    given = _read(hooks, operands)
+    given = read(hooks, operands)
     if hooks.conv is not None and given['held'].shape[1] == 0:
         return _one_tap(hooks, hooks.conv, operands, given, dtype)
     rows = given['state'].shape[0]
@@ -566,10 +648,90 @@ def step(hooks: Hooks, operands: Step, *, dtype=None):
     operand = given['token' if hooks.conv is not None else 'value'].dtype
     if 'beta' in given:
         given['beta'] = given['beta'].reshape(rows, -1)
-    if hooks.decay == 'scalar' and hooks.gates is None:
+    if 'log_decay' in given and hooks.decay == 'scalar':
         given['log_decay'] = given['log_decay'].reshape(rows, -1)
     named = jnp.dtype(operand if dtype is None else dtype).name
     # Positional, None where a hook is off: the tuner keys a launch by its positional arrays.
     state, *history, out = StepLaunch()(flags, *(given.get(name) for name in OPERANDS), hooks=hooks,
                                         dtype=named, interpret=not triton_runs())
     return out, history[0] if history else None, state
+
+
+def _cumsum_kernel(chunk_ref, s_ref, o_ref, *, chunk: int, aligned: bool, scale: float | None, reverse: bool):
+    """fla's `chunk_local_cumsum_scalar_kernel` (fla/ops/utils/cumsum.py:33-73) for one chunk of one
+    head, of each column of a gate per key dimension (fla's vector kernel, :90-133) too: forward, fla's
+    inclusive cumulative sum over its tokens in fp32, then `scale`. `reverse`, the decay's gradient,
+    sums from the end compensated, each running sum a `(hi, lo)` pair (`compensated_add`) taken token
+    by token and stored rounded once."""
+    start, count = chunked_launch._chunk_of(chunk_ref, chunk, aligned)
+    if not reverse:
+        @pl.when(count > 0)
+        def _():
+            tokens = chunked_launch.read_rows(chunked_launch._rows(s_ref, start, chunk), count)
+            total = jnp.cumsum(tokens.astype(jnp.float32), axis=0)
+            chunked_launch.write_rows(chunked_launch._rows(o_ref, start, chunk), count,
+                                  total if scale is None else total * scale)
+        return
+
+    def step(i, total):
+        row = start + count - 1 - i
+        token = chunked_launch._rows(s_ref, row, 1)[...].astype(jnp.float32)
+        if scale is not None:
+            token = token * scale
+        total = compensated_add(total, (token, jnp.zeros_like(token)))
+        chunked_launch._rows(o_ref, row, 1)[...] = total[0] + total[1]
+        return total
+
+    zero = jnp.zeros((1, *s_ref.shape[1:]), jnp.float32)
+    jax.lax.fori_loop(0, count, step, (zero, zero))
+
+
+@dataclasses.dataclass(frozen=True)
+class ChunkLocalCumsum(chunked_launch._Launch):
+    """`cumulated`'s launch (tuning.KernelOp), fla's `chunk_local_cumsum`."""
+
+    NAME = "cumulated"
+    KEYS, VALUES = None, None
+    revision: int = 2
+    SPACES = chunked_launch._spaces(chunked_launch._tiles([(0, 0)], (1, 2, 4, 8), (1,)))
+    PICKS = chunked_launch._picks(chunked_launch.Tiles(0, 0, 2, 1))
+
+    def _fwd(self, g: jax.Array, chunk_spans: jax.Array, sequence_spans: jax.Array, *, chunk: int,
+             scale: float | None, reverse: bool, interpret: bool, config: chunked_launch.Tiles,
+             return_residuals: bool = False):
+        from jax.experimental.pallas import triton as plgpu
+
+        spans = chunked_launch.Sequences(chunk_spans, sequence_spans)
+        warps, stages = config.warps, config.stages
+        batch, length, heads, *columns = (int(size) for size in g.shape)
+        aligned = chunked_launch._aligned(spans, batch, length, chunk)
+        # A decay per key dimension in 64-column blocks, fla's vector kernel's BS.
+        blocks = [min(64, width) for width in columns]
+        tiles = [width // block for width, block in zip(columns, blocks, strict=True)]
+        spec = pl.BlockSpec((batch * length, None, *blocks), lambda i_t, h, *i_k: (0, h, *i_k))
+        out = pl.pallas_call(
+            functools.partial(_cumsum_kernel, chunk=chunk, aligned=aligned, scale=scale, reverse=reverse),
+            grid=(spans.chunks.shape[0], heads, *tiles),
+            in_specs=[chunked_launch._CHUNK, spec], out_specs=spec,
+            out_shape=jax.ShapeDtypeStruct((batch * length, heads, *columns), jnp.float32),
+            compiler_params=plgpu.CompilerParams(num_warps=warps, num_stages=stages),
+            interpret=interpret, name="recurrence_cumulated",
+        )(spans.chunks, *chunked_launch._flat(g))
+        return out.reshape(g.shape), None
+
+
+_CHUNK_LOCAL_CUMSUM = ChunkLocalCumsum()
+
+
+def cumulated(g, *, chunk: int = 64, scale: float | None = None, reverse: bool = False,
+              spans: chunked_launch.Sequences | None = None, interpret: bool = False):
+    """The chunked recurrences' first stage, their decay's prefix: `g` `[B, T, H]`, or `[B, T, H, K]`
+    per key dimension, cumulated within each chunk of `chunk` tokens of each sequence (`spans`, the
+    rows where None), fp32: fla's `chunk_local_cumsum`
+    (cumsum.py:262-341), `scale` RCP_LN2 for the forward's base-2 decay, `reverse` for its gradient.
+    Forward is fla's plain prefix, whose difference between two positions every kernel takes as a
+    range's exponent; `reverse` the sums from the end, each rounded once. fla autotunes only
+    `num_warps` over 1, 2, 4 and 8 here."""
+    batch, length = g.shape[:2]
+    spans = chunked_launch.sequences(batch, length, chunk=chunk) if spans is None else spans
+    return _CHUNK_LOCAL_CUMSUM(g, *spans, chunk=chunk, scale=scale, reverse=reverse, interpret=interpret)

@@ -44,11 +44,13 @@ from jax.sharding import PartitionSpec as P
 from dew.nn.kernels.generation import gpu_target
 from dew.nn.precision import (
     at_least_fp32,
+    bf16_product,
     capped_logits,
+    compensated_add,
     compensated_sum,
+    compensated_total,
     head_product,
     rounded_operand,
-    rounded_to,
     rounds_to_bf16,
     scaled_logits,
 )
@@ -178,11 +180,12 @@ class _Columns(NamedTuple):
 def _tile_logits(states, matrix, precision: jax.lax.PrecisionLike):
     """Uncapped `[tokens, features] @ [columns, features].T` in at least fp32,
     over operands already in the dtype the head multiplies in. Under the
-    bf16 algorithm the logits are rounded to bf16 values, as
-    `dew.nn.precision.head_product` rounds the model's."""
-    logits = jnp.einsum('td,vd->tv', states, matrix.astype(states.dtype),
-                        precision=precision, preferred_element_type=at_least_fp32(states.dtype))
-    return rounded_to(logits, jnp.bfloat16) if precision is BF16 else logits
+    bf16 algorithm it is the model's own bf16 product (`bf16_product`, as
+    `dew.nn.precision.head_product` takes it), so each logit rounds alike."""
+    if precision is BF16:
+        return bf16_product('td,vd->tv', states, matrix)
+    return jnp.einsum('td,vd->tv', states, matrix.astype(states.dtype),
+                      precision=precision, preferred_element_type=at_least_fp32(states.dtype))
 
 
 def _rescaled(maximum, total, larger):
@@ -190,6 +193,13 @@ def _rescaled(maximum, total, larger):
     unchanged where they agree, so two sums whose maximum is -inf add rather
     than turn NaN."""
     return jnp.where(maximum == larger, total, total * jnp.exp(maximum - larger))
+
+
+def token_loss(peak: jax.Array, mass: jax.Array, target: jax.Array) -> jax.Array:
+    """A token's cross entropy from its row's maximum `peak`, the sum of exponentials scaled to it
+    `mass`, and its target's logit: log(mass) - (target - peak), as Optax takes it, so neither term is
+    rounded at the logits' magnitude before the subtraction that cancels it does."""
+    return jnp.log(mass) - (target - peak)
 
 
 def _row_terms(logits, predict: bool) -> tuple[
@@ -334,7 +344,8 @@ def _forward(hidden, table, targets, excluded, chunks: int, tile: tuple[int, int
             initial += (jnp.full((size,), -jnp.inf, work), jnp.zeros((size,), jnp.int32))
         target_logit, peak, mass, *rest = _over_tiles(initial, table.shape[0], width, vocabulary)
         total = peak + jnp.log(mass)
-        values = (target_logit if picked else total - target_logit, total, peak, mass, *rest[1:])
+        loss = target_logit if picked else token_loss(peak, mass, target_logit)
+        values = (loss, total, peak, mass, *rest[1:])
         return tuple(jax.lax.dynamic_update_slice_in_dim(out, value, start, axis=0)
                      for out, value in zip(outputs, values, strict=True))
 
@@ -529,7 +540,7 @@ def _whole_head_terms(hidden, table, targets, excluded, softcap, precision, pred
     # and sums the picked logit over shards, so only the owner may add one.
     picked_logits = _target_logits(logits, labels)
     best = None if top is None else top[1].reshape(targets.shape)
-    first = picked_logits if picked else log_z - picked_logits
+    first = picked_logits if picked else token_loss(*normalizer, picked_logits)
     return raw, normalizer, (first.reshape(targets.shape), best, log_z.reshape(targets.shape))
 
 
@@ -569,12 +580,39 @@ def _whole_head_bwd(chunks, precision, predict, temperature, picked, group, resi
         logits, 0, excluded, peaks, masses, targets.reshape(-1), loss_cotangent.reshape(-1),
         partition_cotangent.reshape(-1), picked))
     d_raw = _logits_cotangent(d_raw, precision)
-    d_states = jnp.einsum('tv,vd->td', d_raw, table.astype(operands), precision=precision,
-                          preferred_element_type=work)
+    d_states = _state_product(d_raw, table.astype(operands), precision, work,
+                              None if precision is BF16 else FP32_STATE_BLOCK)
     d_table = jnp.einsum('tv,td->vd', d_raw, hidden.reshape(-1, features).astype(operands),
                          precision=precision, preferred_element_type=work)
     return (d_states.reshape(hidden.shape).astype(hidden.dtype), d_table.astype(table.dtype),
             None, None, d_cap, d_columns)
+
+
+FP32_STATE_BLOCK = 1024
+"""The columns an fp32 whole head's state gradient sums each block of before a compensated sum over
+the blocks (`_state_product`). One product over a whole vocabulary rounds its long sum alone: 131
+tokens over 2053 columns sat 1.60 times as far from float64 as the tiled head on XLA:CPU, 1.11 times
+over 1024-column blocks and 0.90 over 512 (24 seeds), check 1 passing at both. On one A100-40GB,
+Qwen3-0.6B's head (151936 columns, 1024 wide, 4096 tokens) in fp32 took 53.7 ms forward and backward
+at 1024, 64.2 at 512, against 57.1 tiled and 40.0 for one product (node receipts
+TR-head-blocks-float32, 2026-10-21); in bf16, where one product passes check 1, it took 23.9 ms
+against 29.9 tiled and 36.7 at 1024, so a bf16 head keeps one product."""
+
+
+def _state_product(d_raw, table, precision, work, block: int | None) -> jax.Array:
+    """The state gradient `d_raw @ table` over the vocabulary: one product, or with `block` the
+    vocabulary cut into blocks of that many columns (`FP32_STATE_BLOCK`), every block's product taken
+    at once (`[blocks, tokens, features]`) and the blocks summed as a double-float pair
+    (`compensated_sum`)."""
+    if block is None or table.shape[0] <= block:
+        return jnp.einsum('tv,vd->td', d_raw, table, precision=precision, preferred_element_type=work)
+    count = -(-table.shape[0] // block)
+    pad = count * block - table.shape[0]
+    blocks = jnp.pad(d_raw, ((0, 0), (0, pad))).reshape(d_raw.shape[0], count, block)
+    rows = jnp.pad(table, ((0, pad), (0, 0))).reshape(count, block, table.shape[1])
+    parts = jnp.einsum('tnb,nbd->ntd', blocks, rows, precision=precision, preferred_element_type=work)
+    # One reduction whose accumulator is a double-float pair, an overflowed block's infinity kept.
+    return compensated_sum(parts, (0,))
 
 
 _whole_head = jax.custom_vjp(_whole_head_impl, nondiff_argnums=(5, 6, 7, 8, 10, 11))
@@ -747,7 +785,7 @@ def _fused_terms(hidden, table, labels, weights, z_loss: float, cap, columns: _C
         # +inf, as the chunked heads score it, and its gradient moves no logit.
         kept = _without(logits, 0, excluded)
         log_z, top, (peaks, masses) = _row_terms(kept, predict)
-        values = [log_z - _target_logits(kept, targets), log_z]
+        values = [token_loss(peaks, masses, _target_logits(kept, targets)), log_z]
         if predict:
             assert top is not None
             values.append(top[1])
@@ -756,7 +794,13 @@ def _fused_terms(hidden, table, labels, weights, z_loss: float, cap, columns: _C
             cotangent = _softmax_cotangent(logits, 0, excluded, peaks, masses, targets, weight,
                                            2 * z_loss * log_z * weight)
             d_raw, terms = pullback(cotangent)
-            d_columns = jax.tree.map(jnp.add, d_columns, terms)
+            # Each column term's running sum over the token tiles as a double-float pair, rounded once at
+            # the end: summed tile after tile in fp32, 43 tiles of a 128-token f32 head left the scale
+            # and bias gradients 1.5 times as far from float64 as the whole head's. The plain sum beside
+            # it keeps an overflowed term's infinity (`compensated_total`).
+            d_columns = jax.tree.map(lambda held, term: jnp.stack((*compensated_add(
+                (held[0], held[1]), (term.astype(work), jnp.zeros(term.shape, work))),
+                held[2] + term.astype(work))), d_columns, terms)
             d_raw = _logits_cotangent(d_raw, precision)
             values.append(jnp.einsum('tv,vd->td', d_raw, product_matrix, precision=precision,
                                      preferred_element_type=work))
@@ -773,8 +817,11 @@ def _fused_terms(hidden, table, labels, weights, z_loss: float, cap, columns: _C
     if gradients:
         outputs += (jnp.zeros((count, features), work),)
     d_table = jnp.zeros(table.shape, work) if gradients else None
-    d_columns = jax.tree.map(lambda terms: jnp.zeros(terms.shape, work), columns) if gradients else None
-    return _over_tiles((outputs, d_table, d_columns), count, chunk, tokens)
+    d_columns = jax.tree.map(lambda terms: jnp.zeros((3, *terms.shape), work), columns) if gradients else None
+    outputs, d_table, d_columns = _over_tiles((outputs, d_table, d_columns), count, chunk, tokens)
+    summed = None if d_columns is None else jax.tree.map(
+        lambda held: compensated_total((held[0], held[1]), held[2]), d_columns)
+    return outputs, d_table, summed
 
 
 def _fused_total(losses, log_z, weights, z_loss: float):
@@ -930,8 +977,13 @@ def logits_cross_entropy(logits, targets, *, predict: bool = True, temperature: 
     # Not `_row_terms`: its variadic `jax.lax.reduce` has no derivative, which
     # the tiled head's own backward never needs, and these losses are
     # differentiated (a distilled student's prediction, a whole-logit model).
-    log_z = jax.nn.logsumexp(logits, axis=-1)
-    return log_z - _target_logits(logits, targets), jnp.argmax(logits, axis=-1) if predict else None, log_z
+    # A finite shift, as `jax.nn.logsumexp` takes one: an infinite maximum shifts by 0, so a row
+    # holding +inf scores +inf, and an all -inf row's partition is -inf, never inf - inf.
+    largest = jnp.max(logits, axis=-1)
+    peak = jax.lax.stop_gradient(jnp.where(jnp.isfinite(largest), largest, 0))
+    mass = jnp.sum(jnp.exp(logits - peak[..., None]), axis=-1)
+    loss = token_loss(peak, mass, _target_logits(logits, targets))
+    return loss, jnp.argmax(logits, axis=-1) if predict else None, peak + jnp.log(mass)
 
 
 @overload

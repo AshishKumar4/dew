@@ -7,7 +7,10 @@ import threading
 import urllib.parse
 from pathlib import Path
 
-import lane_environment  # configures the backend before JAX reads the environment
+import lane_environment
+
+# The lane's environment, before JAX reads it.
+os.environ.update(lane_environment.configured(os.environ))
 import jax
 import pytest
 import remote_cache
@@ -82,9 +85,10 @@ def pytest_runtest_setup(item):
     if jax.device_count() < needed:
         pytest.skip(f"needs a {needed}-device mesh; this run has "
                     f"{jax.device_count()} {jax.default_backend()} device(s)")
-    marker = item.get_closest_marker("gpu")
-    if marker and jax.default_backend() != "gpu":
-        pytest.skip(marker.kwargs.get("reason", "runs on a cuda device"))
+    for backend, device in (("gpu", "a cuda device"), ("tpu", "a tpu")):
+        marker = item.get_closest_marker(backend)
+        if marker and jax.default_backend() != backend:
+            pytest.skip(marker.kwargs.get("reason", f"runs on {device}"))
 
 
 @pytest.fixture(autouse=True)
@@ -151,9 +155,8 @@ def without_deterministic_ops(monkeypatch):
     variable at the compile above, so taking the flag back out of the
     environment leaves this executable's reductions as they are and lets a
     test reach the cudnn path it is about."""
-    kept = [flag for flag in os.environ.get("XLA_FLAGS", "").split()
-            if not flag.startswith("--xla_gpu_deterministic_ops")]
-    monkeypatch.setenv("XLA_FLAGS", " ".join(kept))
+    flags = os.environ.get("XLA_FLAGS", "")
+    monkeypatch.setenv("XLA_FLAGS", lane_environment.without_deterministic_ops(flags))
 
 
 @pytest.fixture
