@@ -524,11 +524,6 @@ class Gmm(_Triton):
 
 
 @dataclasses.dataclass(frozen=True)
-class GmmTransposed(Gmm):
-    """`Gmm` against each matrix's transpose: the input gradient, tuned apart."""
-
-
-@dataclasses.dataclass(frozen=True)
 class Tgmm(_Triton):
     """Each group's `tokens` rows transposed times its `cotangent` rows: the
     kernel gradient `[groups, in, out]`."""
@@ -753,11 +748,6 @@ class MosaicGmm(_Mosaic):
 
 
 @dataclasses.dataclass(frozen=True)
-class MosaicGmmTransposed(MosaicGmm):
-    """`MosaicGmm` against each matrix's transpose: the input gradient, tuned apart."""
-
-
-@dataclasses.dataclass(frozen=True)
 class MosaicTgmm(_Mosaic):
     """`Tgmm` on Hopper (`mosaic_gpu.tgmm`): `block_m` x `block_n` tiles of each group's gradient, its rows
     `block_k` at a time."""
@@ -963,11 +953,6 @@ class MosaicTpuGmm(_MosaicTpu):
 
 
 @dataclasses.dataclass(frozen=True)
-class MosaicTpuGmmTransposed(MosaicTpuGmm):
-    """`MosaicTpuGmm` against each matrix's transpose: the input gradient, tuned apart."""
-
-
-@dataclasses.dataclass(frozen=True)
 class MosaicTpuTgmm(_MosaicTpu):
     """`Tgmm` on a TPU (`mosaic_tpu.tgmm`): `block_m` x `block_n` blocks of each group's gradient, its rows
     `block_k` at a time."""
@@ -1082,7 +1067,6 @@ def kernel_refusal(compute: Dtype, promoted: bool = False) -> str | None:
 
 
 _GMMS = (MosaicGmm(), MosaicTpuGmm(), Gmm())
-_GMMS_TRANSPOSED = (MosaicGmmTransposed(), MosaicTpuGmmTransposed(), GmmTransposed())
 _TGMMS = (MosaicTgmm(), MosaicTpuTgmm(), Tgmm())
 
 
@@ -1114,7 +1098,7 @@ def _gmm_call(tokens, kernel, sizes, prologue_operands: tuple, epilogue_operands
                  tuple(epilogue_operands))
     options = {'out_dtype': jnp.dtype(out_dtype).name, 'trans_rhs': trans_rhs, 'hooks': hooks,
                'interpret': interpret, 'exact_sums': promoted, 'dense': dense}
-    return _GMMS_TRANSPOSED if trans_rhs else _GMMS, arguments, options
+    return _GMMS, arguments, options
 
 
 def launched_tgmm(tokens, cotangent, sizes, prologue_operands: tuple = (), *, out_dtype,

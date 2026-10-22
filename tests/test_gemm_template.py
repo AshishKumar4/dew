@@ -203,8 +203,7 @@ def test_a_cooperative_tile_holds_check_1_with_its_hooks(case):
     both read and computes half the columns' epilogue, as exact as the plain program from float64 truth;
     the Mosaic kernels ran."""
     spec = CASES[case]
-    pinned = {grouped_matmul.MosaicGmm: COOPERATIVE, grouped_matmul.MosaicGmmTransposed: COOPERATIVE,
-              grouped_matmul.MosaicTgmm: COOPERATIVE}
+    pinned = {grouped_matmul.MosaicGmm: COOPERATIVE, grouped_matmul.MosaicTgmm: COOPERATIVE}
     with (generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic_gpu"), tuning.pinned(pinned),
           generation.routes() as taken):
         dew = jax.jit(_drop(_dew(spec, interpret_on_cpu=True)))
@@ -358,8 +357,9 @@ def test_a_dense_product_whose_extents_no_tile_divides_holds_check_1(transpose_r
         assert_as_exact(jax.jit(dew), jax.jit(plain), draw, "dense 65x40x100", seeds=SEEDS, truth_fn=truth)
         assert_as_exact(jax.jit(loss(dew)), jax.jit(loss(plain)), draw, "dense 65x40x100 gradients",
                         seeds=SEEDS, truth_fn=loss(truth))
-    ran = {(type(launch).__name__, ba.arguments.get('dense')) for launch, ba in launches}
-    assert {('GmmTransposed' if transpose_rhs else 'Gmm', True), ('Tgmm', True)} <= ran
+    ran = {(type(launch).__name__, ba.arguments.get('trans_rhs'), ba.arguments.get('dense'))
+           for launch, ba in launches}
+    assert {('Gmm', transpose_rhs, True), ('Tgmm', None, True)} <= ran
 
 
 def _dense_draw(rows: int, depth: int, width: int):
@@ -788,10 +788,10 @@ def test_the_tpu_launches_gradients_hold_check_1(case):
     assert _kernels(taken) == {'mosaic_tpu'}
 
 @pytest.mark.parametrize("generation_name", ["sm80", "sm90"])
-@pytest.mark.parametrize("launch",
-                         [grouped_matmul.Gmm(), grouped_matmul.GmmTransposed(), grouped_matmul.Tgmm()],
-                         ids=lambda launch: type(launch).__name__)
-def test_the_hooked_dense_launches_lower_for_cuda(launch, generation_name):
+@pytest.mark.parametrize("launch,trans_rhs", [(grouped_matmul.Gmm(), False), (grouped_matmul.Gmm(), True),
+                                              (grouped_matmul.Tgmm(), None)],
+                         ids=["Gmm", "Gmm-transposed", "Tgmm"])
+def test_the_hooked_dense_launches_lower_for_cuda(launch, trans_rhs, generation_name):
     """Each Triton launch of a dense call, with a prologue (and the forward's epilogue) and at the highest
     precision's exact sums, lowers for CUDA on the CPU at a fitting tile of every block shape, through the
     plain tiled kernel (its `pallas_call` named), with rows, depth and width no tile divides."""
@@ -806,7 +806,6 @@ def test_the_hooked_dense_launches_lower_for_cuda(launch, generation_name):
         options = {"out_dtype": "float32", "hooks": hooks, "interpret": False}
         name = "pallas_triton_dense_tdot"
     else:
-        trans_rhs = isinstance(launch, grouped_matmul.GmmTransposed)
         matrix = bf16((1, width, depth) if trans_rhs else (1, depth, width))
         args = (bf16((rows, depth)), matrix, sizes, prologue[1], (f32((width,)),))
         hooks = grouped_matmul.Hooks(prologue[0], prologue[2], biased, (("columns",),),
@@ -917,8 +916,7 @@ def test_a_cooperative_tiles_gradients_hold_check_1(case):
     prologue each consumer applies to its depth half, against JAX's derivative of the plain program
     (eagerly: `test_the_templates_gradients_hold_check_1`)."""
     spec = CASES[case]
-    pinned = {grouped_matmul.MosaicGmm: COOPERATIVE, grouped_matmul.MosaicGmmTransposed: COOPERATIVE,
-              grouped_matmul.MosaicTgmm: COOPERATIVE}
+    pinned = {grouped_matmul.MosaicGmm: COOPERATIVE, grouped_matmul.MosaicTgmm: COOPERATIVE}
     with (generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic_gpu"), tuning.pinned(pinned),
           generation.routes() as taken):
         assert_as_exact(_loss(_dew(spec, interpret_on_cpu=True)), jax.jit(_loss(_plain(spec))), _draw,
@@ -1152,8 +1150,9 @@ def test_a_dense_product_runs_the_plain_tiled_kernel():
     spec = CASES["dense norm and bias"]
     with generation.assumed("sm80"), tuning.seen() as launches:
         jax.jit(_loss(_dew(spec, interpret_on_cpu=True))).trace(x, w, ms, nw, b, u, s, ct).lower()
-    told = {(type(launch).__name__, ba.arguments.get('dense')) for launch, ba in launches}
-    assert {('Gmm', True), ('GmmTransposed', True), ('Tgmm', True)} <= told
+    told = {(type(launch).__name__, ba.arguments.get('trans_rhs'), ba.arguments.get('dense'))
+            for launch, ba in launches}
+    assert {('Gmm', False, True), ('Gmm', True, True), ('Tgmm', None, True)} <= told
 
 
 HIGHEST, DEFAULT = jax.lax.Precision.HIGHEST, jax.lax.Precision.DEFAULT

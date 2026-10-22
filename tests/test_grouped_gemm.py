@@ -19,6 +19,7 @@ from dew.nn.kernels import generation, grouped_matmul
 from dew.nn.kernels.templates import cost
 from dew.nn.kernels.templates.gemm import mosaic_gpu
 from dew.nn.moe import expert_projection, grouped_matmul_kernel
+from tools import grouped_oracle as oracle
 
 pytestmark = pytest.mark.kernel
 
@@ -43,31 +44,13 @@ def operands(sizes, dtype, seed=0):
     return x, w, dy, group
 
 
-def float64_products(x, w, dy, group):
-    """The forward, input gradient and kernel gradient in float64: zero on the unrouted rows and empty
-    groups."""
-    forward, input_gradient = np.zeros((ROWS, WIDTH)), np.zeros((ROWS, DEPTH))
-    kernel_gradient = np.zeros(w.shape)
-    for expert in range(w.shape[0]):
-        rows = group == expert
-        forward[rows] = x[rows] @ w[expert]
-        input_gradient[rows] = dy[rows] @ w[expert].T
-        kernel_gradient[expert] = x[rows].T @ dy[rows]
-    return forward, input_gradient, kernel_gradient
-
-
 def xla_products(x, w, dy, sizes, dtype, kernel_dtype):
-    """XLA's ragged dot over the same operands, each product summed in fp32 and rounded once."""
-    sizes = jnp.asarray(sizes, jnp.int32)
-    x, w, dy = (jnp.asarray(value, dtype) for value in (x, w, dy))
-    forward = grouped_matmul.xla_ragged_dot(x, w, sizes, preferred_element_type=jnp.float32)
-    input_gradient = grouped_matmul.xla_ragged_dot(dy, jnp.swapaxes(w, 1, 2), sizes,
-                                                   preferred_element_type=jnp.float32)
-    _, pullback = jax.vjp(
-        lambda w: grouped_matmul.xla_ragged_dot(x, w, sizes, preferred_element_type=jnp.float32),
-        w.astype(jnp.float32))
-    kernel_gradient = pullback(dy.astype(jnp.float32))[0]
-    return forward.astype(dtype), input_gradient.astype(dtype), kernel_gradient.astype(kernel_dtype)
+    """The portable projection's (`dew.nn.moe.expert_projection` on XLA) forward and gradients over the
+    same operands, `w` the master in `kernel_dtype`: each product summed in fp32 and rounded once."""
+    group_sizes = jnp.asarray(sizes, jnp.int32)
+    output, pullback = jax.vjp(lambda x, w: expert_projection(x, w, group_sizes, dtype, "xla", None),
+                               jnp.asarray(x, dtype), jnp.asarray(w, kernel_dtype))
+    return (output, *pullback(jnp.asarray(dy, dtype)))
 
 
 @INTERPRETS
@@ -79,7 +62,7 @@ def test_the_hopper_grouped_matmuls_sum_each_groups_rows_as_exactly_as_xla(sizes
     the same rounded operands, unrouted rows and empty groups exactly zero."""
     sizes = SIZES[sizes]
     x, w, dy, group = operands(sizes, dtype)
-    truth = float64_products(x, w, dy, group)
+    truth = oracle.products(x, w, dy, sizes)
     reference = xla_products(x, w, dy, sizes, dtype, jnp.float32)
     arrays = [jnp.asarray(value, dtype) for value in (x, w, dy)]
     group_sizes = jnp.asarray(sizes, jnp.int32)
@@ -115,7 +98,7 @@ def test_the_kernel_gradient_keeps_a_neighbours_non_finite_rows_out():
     sums its own rows alone, every one finite and as exact as XLA's over clean rows."""
     sizes = [37, 100, 0, 40]
     x, w, dy, group = operands(sizes, jnp.bfloat16, seed=3)
-    truth = float64_products(x, w, dy, group)[2]
+    truth = oracle.kernel_gradient(x, dy, sizes)
     reference = xla_products(x, w, dy, sizes, jnp.bfloat16, jnp.float32)[2]
     dirty_x, dirty_dy = x.copy(), dy.copy()
     dirty_x[group < 0], dirty_dy[group < 0] = np.inf, np.nan
@@ -138,8 +121,8 @@ def test_an_expert_projection_runs_the_implementation_chosen_for_it_on_the_cpu(g
     gradient in the input's dtype and the kernel gradient in the master's, each launch's route the one
     named."""
     sizes = [0, 70, 1, 100, 0]
-    x, w, dy, group = operands(sizes, jnp.bfloat16, seed=5)
-    forward, input_gradient, kernel_gradient = float64_products(x, w, dy, group)
+    x, w, dy, _ = operands(sizes, jnp.bfloat16, seed=5)
+    forward, input_gradient, kernel_gradient = oracle.products(x, w, dy, sizes)
     reference = xla_products(x, w, dy, sizes, jnp.bfloat16, jnp.float32)
     group_sizes = jnp.asarray(sizes, jnp.int32)
 
@@ -166,9 +149,11 @@ def test_an_expert_projection_runs_the_implementation_chosen_for_it_on_the_cpu(g
 
 
 @lowers("sm90")
-@pytest.mark.parametrize("launch", [grouped_matmul.MosaicGmm(), grouped_matmul.MosaicGmmTransposed(),
-                                    grouped_matmul.MosaicTgmm()], ids=lambda launch: type(launch).__name__)
-def test_every_tile_of_the_hopper_grouped_matmuls_lowers_for_an_h100(launch):
+@pytest.mark.parametrize("launch,trans_rhs", [(grouped_matmul.MosaicGmm(), False),
+                                              (grouped_matmul.MosaicGmm(), True),
+                                              (grouped_matmul.MosaicTgmm(), None)],
+                         ids=["MosaicGmm", "MosaicGmm-transposed", "MosaicTgmm"])
+def test_every_tile_of_the_hopper_grouped_matmuls_lowers_for_an_h100(launch, trans_rhs):
     """The tiles the Mosaic GPU launches may pick at an expert layer's shapes lower for an H100 on the
     CPU, as a GPU session's compile would, over rows no multiple of 8: every block shape and every
     schedule among those that fit an H100's block (`Template.fitting`). The interpreter takes kernels
@@ -180,7 +165,7 @@ def test_every_tile_of_the_hopper_grouped_matmuls_lowers_for_an_h100(launch):
     sizes, matrices = jax.ShapeDtypeStruct((groups,), jnp.int32), bf16((groups, depth, width))
     if isinstance(launch, grouped_matmul.MosaicTgmm):
         args, options = (bf16((rows, depth)), bf16((rows, width)), sizes), {"out_dtype": "float32"}
-    elif isinstance(launch, grouped_matmul.MosaicGmmTransposed):
+    elif trans_rhs:
         args, options = (bf16((rows, width)), matrices, sizes), {"trans_rhs": True}
     else:
         args, options = (bf16((rows, depth)), matrices, sizes), {"trans_rhs": False}
