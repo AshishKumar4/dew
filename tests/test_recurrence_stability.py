@@ -33,7 +33,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact, widened
+from reference_error import assert_as_exact, widened, with_gradients
 from test_recurrence_chunk import CHUNK, KEY_WIDTH, draw, token_by_token
 
 from dew.nn.kernels import recurrence
@@ -284,14 +284,24 @@ def stressed(hooks, regime: str, seed: int) -> tuple[Chunk]:
 
 
 def cotangents(hooks, regime: str, seed: int) -> tuple[Chunk, tuple[jax.Array, jax.Array]]:
-    """Draw `seed`'s operands under `regime` (`stressed`) and fp32 cotangents of their output `[B, S, Hv,
-    Dv]` and final memory `[B, Hv, Dk, Dv]` from the seed's own key, which the float64 truth takes as they
+    """Draw `seed`'s operands under `regime` (`stressed`), their documents' starts taken out (`restarting`
+    puts them back: they are not differentiable), and fp32 cotangents of their output `[B, S, Hv, Dv]`
+    and final memory `[B, Hv, Dk, Dv]` from the seed's own key, which the float64 truth takes as they
     are."""
     (operands,) = stressed(hooks, regime, seed)
     batch, length, heads, width = operands.value.shape
     keys = jax.random.split(jax.random.fold_in(jax.random.key(seed), 101))
-    return operands, (jax.random.normal(keys[0], (batch, length, heads, width)),
-                      jax.random.normal(keys[1], (batch, heads, operands.key.shape[-1], width)))
+    return dataclasses.replace(operands, starts=None), (
+        jax.random.normal(keys[0], (batch, length, heads, width)),
+        jax.random.normal(keys[1], (batch, heads, operands.key.shape[-1], width)))
+
+
+def restarting(fn, regime: str):
+    """`fn` on operands whose documents start as the regime's do, a constant of their shape (`_reset`),
+    which `cotangents` takes out of the draw."""
+    if regime != 'resets on chunk edges':
+        return fn
+    return lambda operands: fn(_reset(operands))
 
 
 def ported(hooks) -> bool:
@@ -337,21 +347,6 @@ def test_the_chunked_op_stays_finite_and_exact_where_chunked_forms_break(name, r
                     seeds=SEEDS[name, regime])
 
 
-def pulled(fn):
-    """`fn`'s gradient with respect to each float operand it reads, through the draw's cotangents on its
-    output and final memory (`cotangents`), taken in the outputs' dtype."""
-    def run(operands, cotangent):
-        outputs, pull = jax.vjp(fn, operands)
-        (grads,) = pull(tuple(c.astype(out.dtype) for c, out in zip(cotangent, outputs, strict=True)))
-        return {field: getattr(grads, field) for field in GRADIENTS
-                if getattr(operands, field) is not None and getattr(operands, field).dtype.kind == 'f'}
-    return run
-
-
-GRADIENTS = ('query', 'key', 'value', 'log_decay', 'gate', 'beta', 'state')
-"""The operands whose gradients a site holds, each where the hooks read it."""
-
-
 @pytest.mark.parametrize('name, regime, arm', CASES)
 def test_the_chunked_ops_gradient_is_as_exact_as_the_recurrences(name, regime, arm):
     """The arm's gradient finite wherever the reference's in float64 is, and on par with the token-by-token
@@ -361,16 +356,18 @@ def test_the_chunked_ops_gradient_is_as_exact_as_the_recurrences(name, regime, a
     if (refused := refusal(hooks, regime, arm)) is not None:
         assert refused.code == 'decay_floor', refused
         return
-    dew = jax.jit(pulled(functools.partial(chunk, hooks, chunk_size=CHUNK, ported=arm == 'port')))
-    reference = jax.jit(pulled(functools.partial(token_by_token, hooks)))
+    dew = jax.jit(with_gradients(restarting(functools.partial(chunk, hooks, chunk_size=CHUNK,
+                                                              ported=arm == 'port'), regime)))
+    reference = jax.jit(with_gradients(restarting(functools.partial(token_by_token, hooks), regime)))
     draws = functools.partial(cotangents, hooks, regime)
     for seed in range(2):
         drawn = draws(seed)
         mine = dew(*drawn)
         with jax.enable_x64(new_val=True):
             truth = reference(*widened(drawn))
-        for field, ours in mine.items():
-            finite = np.isfinite(np.asarray(truth[field]))
-            assert np.all(np.isfinite(np.asarray(ours))[finite]), f'{field}: not finite, seed {seed}'
+        leaves = zip(jax.tree.leaves(mine), jax.tree.leaves(truth), strict=True)
+        for index, (ours, exact) in enumerate(leaves):
+            finite = np.isfinite(np.asarray(exact))
+            assert np.all(np.isfinite(np.asarray(ours))[finite]), f'leaf {index}: not finite, seed {seed}'
     assert_as_exact(dew, reference, draws, f'the {arm} arm\'s gradient, {name} under {regime}',
                     seeds=GRADIENT_SEEDS[name, regime])
