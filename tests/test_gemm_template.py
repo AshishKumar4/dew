@@ -196,12 +196,11 @@ def _kernels(taken) -> set:
 
 
 @runs("sm90")
-@pytest.mark.parametrize("case", ["norm and bias", "cast prologue"])
+@pytest.mark.parametrize("case", ["norm and bias", "gated prologue", "cast prologue"])
 def test_a_cooperative_tile_holds_check_1_with_its_hooks(case):
     """The Hopper launches pinned to a cooperative tile, interpreted: each consumer rewrites half the stage
     both read and computes half the columns' epilogue, as exact as the plain program from float64 truth;
-    the Mosaic kernels ran. (A prologue reading a side operand element by element is Triton's on Hopper,
-    `_Mosaic._rewrites_elementwise`.)"""
+    the Mosaic kernels ran."""
     spec = CASES[case]
     pinned = {grouped_matmul.MosaicGmm: COOPERATIVE, grouped_matmul.MosaicGmmTransposed: COOPERATIVE,
               grouped_matmul.MosaicTgmm: COOPERATIVE}
@@ -1046,17 +1045,16 @@ def test_a_hook_that_broadcasts_a_side_operand_lowers_for_hopper_through_triton(
 
 
 @pytest.mark.parametrize(("case", "chosen"), [("gated", "triton"), ("plain", "mosaic_gpu")])
-def test_hopper_runs_an_elementwise_prologue_through_triton(case, chosen):
-    """A gated prologue reads its up projection element by element, which Mosaic's launches rewrite into
-    each stage in shared memory before the warpgroup MMA reads it: on an H100 the call takes Triton's
-    launch and the plain product Mosaic's (GMMSB-h100-main, Llama-3-8B's SwiGLU then gate_up projection:
-    Mosaic 49.2 ms, Triton 13.2 ms; plain, Mosaic 5.9 ms, Triton 10.2 ms)."""
+def test_hoppers_chooser_prices_a_mosaic_prologue_as_serial_with_its_mmas(case, chosen):
+    """A gated prologue rewrites each stage in shared memory before Mosaic's warpgroup MMA reads it,
+    which the MMAs wait for: on an H100 the chooser takes Triton's launch for it and Mosaic's for the plain
+    product (GMMSB-h100-main, Llama-3-8B's SwiGLU then gate_up projection: Mosaic 49.2 ms, Triton 13.2 ms;
+    plain, Mosaic 5.9 ms, Triton 10.2 ms)."""
     bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
     x, up, w = bf16((16384, 4096)), bf16((16384, 4096)), bf16((4096, 28672))
 
     def product(x, up, w):
-        gating = {"prologue": gated, "prologue_operands": ((up, ("rows", "depth")),)}
-        hooks = gating if case == "gated" else {}
+        hooks = {"prologue": gated, "prologue_operands": ((up, ("rows", "depth")),)} if case == "gated" else {}
         return template.gemm(x, w, None, out_dtype=jnp.bfloat16, **hooks)
 
     with generation.assumed("sm90"), generation.routes() as taken:

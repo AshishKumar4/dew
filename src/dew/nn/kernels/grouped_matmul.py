@@ -587,18 +587,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         interpretable = not ba.arguments['interpret'] or jax.default_backend() == 'cpu'
         return (target.wgmma and first == second and jnp.dtype(first).itemsize == 2 and interpretable
                 and _rated(target, first) and bool(self.space(ba)) and self._hooks_lower(ba, first)
-                and not self._rewrites_elementwise(ba)
                 and (self.EXACT_SUMS or not ba.arguments.get('exact_sums')))
-
-    @staticmethod
-    def _rewrites_elementwise(ba) -> bool:
-        """Whether the prologue reads a side operand element by element (a `('rows', 'depth')` tile: a
-        SwiGLU's up projection beside its gate). Mosaic's launches rewrite each stage of `lhs` in shared
-        memory before the warpgroup MMA reads it, and with such a side operand measure 8.3x their plain
-        product's time where Triton's measure 1.3x (GMMSB-h100-main, Llama-3-8B's SwiGLU then gate_up
-        projection: 49.2 ms against 13.2), past what the cost model's serial rewrite predicts; so they
-        leave it to Triton's until their prologue feeds the MMA from registers."""
-        return any('rows' in axes and 'depth' in axes for axes in ba.arguments['hooks'].prologue_axes)
 
     @staticmethod
     def _hooks_lower(ba, dtype) -> bool:
