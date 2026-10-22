@@ -1035,7 +1035,7 @@ def _read_chain(name: str, written: object) -> Dataset | dict[str, Dataset] | No
     return splits
 
 
-def _overridden(chains: Mapping[str, object], point: Mapping[str, JSON]) -> dict[str, object]:
+def _overridden(chains: Mapping[str, object], point: Mapping[str, JSON]) -> Mapping[str, object]:
     """A run's chain fields `chains` with the settings of their recorded chains in `point` set
     (`dew.data.records.override`): each path is `data.<call>.<setting>`, or
     `validation[.<split>].<call>.<setting>`. A chain's settings are set together on its record and it
