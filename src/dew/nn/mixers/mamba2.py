@@ -14,22 +14,19 @@ chunk the output is the "attention" `(C B^T * L) x` with
 `L[i, j] = exp(sum_{j<k<=i} dt_k A)`, and the chunk's state crosses to the
 next through one decayed rank-N write.
 
-dew computes transformers 5.16.1's `mamba2_chunk_scan`
-(modeling_mamba2.py:254-357) in the same order: `segment_sum` as its masked
-cumulative sum (73-90), the intra-chunk `Y_diag`, the per-chunk states, the
-inter-chunk recurrence (as a scan over the chunks where the reference
-materialises the `[NC+1, NC+1]` decay matrix; the two are the same
-products) and `Y_off`, the `D` skip added in fp32, and the whole scan in
-fp32 as the reference casts its operands. The decode step is `mamba2_selective_state_update`
-(192-251). Both live here beside their gated-delta-rule counterparts'
-shapes so tests/test_mamba2.py can hold them to the reference's numbers.
+dew computes transformers 5.16.1's `mamba2_chunk_scan` (modeling_mamba2.py:254-357)
+as the recurrence template's chunked op (`chunk_ssd`, `recurrence_chunk.chunk`): no
+delta rule, a rated decay `A dt`, the `D` skip added in fp32, and the whole scan
+in at least fp32 as the reference casts its operands. The decode step is
+`mamba2_selective_state_update` (192-251, `recurrent_ssd`). tests/test_mamba2.py
+holds both to the reference's numbers.
 
 On a GPU whose target row names it the chunked scan is mamba_ssm's own
-kernels (`dew.nn.kernels.mamba_ssd`, `ssd_port_refusal` names where not),
+kernels (`dew.nn.kernels.mamba_ssd`, `recurrence_chunk.ssd_port_refusal` names where not),
 which multiply `x`, `B` and `C` in their own dtype into fp32 sums as
-mamba_ssm does; elsewhere the scan over the chunks is `xla_chunk_scan`, the
-oracle, or on a TPU whose tiling covers the geometry `dew.nn.kernels.ssd`'s
-Pallas kernel, chosen at trace time. Decoding stays on the recurrent form
+mamba_ssm does; on a TPU whose tiling covers the geometry `dew.nn.kernels.ssd`'s
+Pallas kernel; elsewhere the template's portable math, chosen at trace time.
+Decoding stays on the recurrent form
 either way. The conv sums in at least fp32 and hands the scan its output in
 the model's compute dtype, as mamba_ssm's `causal_conv1d_fn` hands its scan
 (`mamba_split_conv1d_scan_combined`); the step, the decay and the states
@@ -62,111 +59,30 @@ from flax.typing import Dtype, PrecisionLike
 from jax.ad_checkpoint import checkpoint_name
 from jax.sharding import PartitionSpec as P
 
-from dew.nn.attention import FORWARD_MODE, repeat_kv_heads, unweighted_rmsnorm
+from dew.nn.attention import repeat_kv_heads, unweighted_rmsnorm
 from dew.nn.blocks import normal_kernel
 from dew.nn.dense import Dense
 from dew.nn.flops import conv_flops, projection_flops, ssd_flops
 from dew.nn.inputs import PLAIN_CALL, MixerCall, coordinates_of
-from dew.nn.kernels import mamba_ssd
-from dew.nn.kernels.generation import first_refusal, measured_kernel, ran_kernel, triton_runs
-from dew.nn.kernels.ssd import ssd_chunk_scan, ssd_kernel_platform
+from dew.nn.kernels.generation import measured_kernel
+from dew.nn.kernels.recurrence import Hooks
+from dew.nn.kernels.recurrence_chunk import RESET_DECAY, Chunk, chunk
 from dew.nn.linear import DepthwiseConv1d, causal_conv1d, held_scan
 from dew.nn.mixer_base import MixerBase, MixerContext
 from dew.nn.mixers.mamba import inverse_softplus_step
-from dew.nn.precision import at_least_fp32
+from dew.nn.precision import at_least_fp32, float32_dot_general, float32_products
 from dew.nn.sharding import (
     SEQUENCE_AXIS,
     LayoutRefused,
-    grouped_heads,
     logical_axes,
     logical_spec,
     manual_map,
-    rows_like,
     sequence_shards,
 )
 
 CHUNK_SIZE = 256
 """The reference's default `chunk_size` (configuration_mamba2.py). The
 chunked and the recurrent form agree at any size."""
-
-RESET_DECAY = -1e4
-"""The log decay a document's first token takes in place of `A dt`: the
-state entering it is multiplied by `exp(-1e4)`, which is 0 in fp32. A step's
-own `A dt` is never positive, so every span containing a reset sums to at
-most this and decays to exactly 0, and a span without one never sees it.
-It stays finite because the Pallas kernel forms its segment sums as a
-matmul against a 0/1 triangle, where an infinity times 0 is a NaN; and it
-stays small enough that thousands of resets in one shard's total decay are
-nowhere near fp32's range."""
-
-
-def segment_sum(x):
-    """`segment_sum` (modeling_mamba2.py:73-90): over the last axis of `x`,
-    `out[..., i, j] = sum_{j < k <= i} x[..., k]` on and below the diagonal,
-    `-inf` above, as the reference's masked cumulative sum rather than a
-    difference of cumulative sums, so exp of it is the same numbers."""
-    size = x.shape[-1]
-    strict = jnp.tril(jnp.ones((size, size), jnp.bool_), -1)
-    expanded = jnp.where(strict, jnp.broadcast_to(x[..., :, None], (*x.shape, size)), 0.0)
-    summed = jnp.cumsum(expanded, axis=-2)
-    inclusive = jnp.tril(jnp.ones((size, size), jnp.bool_))
-    return jnp.where(inclusive, summed, -jnp.inf)
-
-
-def _chunk_writes(x_c, B_c, a_c):
-    """Each chunk's own write into the state, decayed to the chunk's end:
-    `sum_j exp(sum_{j<k<C} a_k) x_j B_j^T`, `[NC, B, H, P, N]`.
-
-    The decay from step j to the chunk's end is the suffix sum after j, a
-    reverse cumulative sum shifted by one, where the reference takes the
-    difference `acs_C-1 - acs_j` of two prefix sums. The two are the same
-    number in exact arithmetic; the suffix sum never subtracts, which is
-    what keeps a document reset exact (`RESET_DECAY`): a reset before j sits
-    in both prefix sums, and their difference would lose every digit below
-    its magnitude."""
-    suffix = jax.lax.cumsum(a_c, axis=a_c.ndim - 1, reverse=True)
-    to_end = jnp.exp(jnp.pad(suffix[..., 1:], [(0, 0)] * (a_c.ndim - 1) + [(0, 1)]))
-    return jnp.einsum('nbjhs,nbhj,nbjhp->nbhps', B_c, to_end, x_c)
-
-
-def _carry(previous, step):
-    """One chunk (or one shard) across the state: decay what entered by the
-    span's total log decay and add the span's own write."""
-    writes, log_decay = step
-    return jnp.exp(log_decay)[..., None, None] * previous + writes, previous
-
-
-def xla_chunk_scan(x, B, C, a, carried, chunk_size: int):
-    """The scan over chunks in plain XLA, the oracle and the fallback for
-    `dew.nn.kernels.ssd`, on the operands as `chunk_ssd` hands either: `x`
-    `[B, T, H, P]` already scaled by `dt`, `B` and `C` `[B, T, H, N]` with the
-    groups expanded, `a` `[B, T, H]` the per-step `A dt`, the length whole
-    chunks of `chunk_size`, and `carried` `[B, H, P, N]` the state entering the
-    sequence; returns the output `[B, T, H, P]` and the state leaving it. The
-    chunks lead its own einsums."""
-    batch, total, heads, head_dim = x.shape
-
-    def chunks(t):  # [B, T, ...] -> [NC, B, C, ...]
-        blocked = t.reshape(batch, total // chunk_size, chunk_size, *t.shape[2:])
-        return jnp.moveaxis(blocked, 1, 0)
-
-    x_c, B_c, C_c = chunks(x), chunks(B), chunks(C)         # [NC, B, C, H, ...]
-    a_c = jnp.moveaxis(chunks(a), 3, 2)                     # [NC, B, H, C]
-    a_cumsum = jnp.cumsum(a_c, axis=-1)
-    # 1. The intra-chunk output: L[i, j] = exp(segsum) masks C_i . B_j.
-    L = jnp.exp(segment_sum(a_c))                           # [NC, B, H, C, C]
-    G = jnp.einsum('nbihs,nbjhs->nbhij', C_c, B_c)
-    y_diag = jnp.einsum('nbhij,nbjhp->nbihp', G * L, x_c)
-    # 2. Each chunk's own write into the state, decayed to the chunk's end.
-    states = _chunk_writes(x_c, B_c, a_c)
-    # 3. The state crossing the chunks: the reference's `decay_chunk @ states`
-    # over the padded [NC+1, NC+1] segment sums is this product carried
-    # chunk by chunk.
-    final, previous = jax.lax.scan(_carry, carried, (states, a_cumsum[..., -1]))
-    # 4. The state each chunk reads, decayed to every position of it.
-    y_off = jnp.einsum('nbihs,nbhps,nbhi->nbihp', C_c, previous, jnp.exp(a_cumsum))
-    return jnp.moveaxis(y_diag + y_off, 0, 1).reshape(batch, total, heads, head_dim), final
-
 
 def _entering_state(decay, write, axis: str):
     """The state entering this shard of a sequence the mesh axis `axis`
@@ -195,102 +111,31 @@ def _entering_state(decay, write, axis: str):
 
 
 def chunk_ssd(x, dt, A, B, C, D, state=None, chunk_size: int = CHUNK_SIZE, starts=None):
-    """The chunked SSD scan, `mamba2_chunk_scan` (modeling_mamba2.py:254-357).
+    """The chunked SSD scan, `mamba2_chunk_scan` (modeling_mamba2.py:254-357), as the recurrence
+    template's chunked op (`recurrence_chunk.chunk`): no delta rule, a rated decay `A dt` with `dt`
+    the write gate, `x` the values, `B` the keys, `C` the queries and the skip `D x`.
 
-    `x` `[B, S, H, P]`, `dt` `[B, S, H]` through softplus and the limit, `A`
-    `[H]`, `B` and `C` `[B, S, G, N]`, `D` `[H]`; returns `(output [B, S, H, P],
-    state [B, H, P, N])` in `at_least_fp32` of the operands' common dtype, the
-    output unrounded for what a caller adds to it (the earlier shards' state,
-    `_ssd`). `starts` `[B, S]` marks packed documents' first tokens,
-    whose entering state drops. Where `ssd_port_refusal` takes the call the
-    whole scan is mamba_ssm's kernels (`_ported`), on `x`, `B` and `C` in
-    their common dtype; else the scan runs in `at_least_fp32` of it, the
-    chunk scan on the TPU's Pallas kernel where `ssd_kernel_platform` takes
-    the geometry, else `xla_chunk_scan` (tests/test_ssd_kernel.py).
+    `x` `[B, S, H, P]`, `dt` `[B, S, H]` through softplus and the limit, `A` `[H]`, `B` and `C`
+    `[B, S, G, N]`, `D` `[H]`; returns `(output [B, S, H, P], state [B, H, P, N])` in
+    `at_least_fp32` of the operands' common dtype, the output unrounded for what a caller adds to it
+    (the earlier shards' state, `_ssd`). `starts` `[B, S]` marks packed documents' first tokens,
+    whose entering state drops. The op runs it on mamba_ssm's kernels where their port takes the
+    call (`recurrence_chunk.ssd_port_refusal`), on `x`, `B` and `C` in their common dtype; else in
+    `at_least_fp32` of it, on the TPU's Pallas kernel where it takes the geometry, else the portable
+    math.
     """
     operand = jnp.result_type(x, B, C)
     work = at_least_fp32(operand)
     x, B, C = (jnp.asarray(t, operand) for t in (x, B, C))
     dt, A, D = (jnp.asarray(t, work) for t in (dt, A, D))
-    batch, length, heads, head_dim = x.shape
-    state_size = B.shape[-1]
-    carried = (rows_like(jnp.zeros((batch, heads, head_dim, state_size), work), x) if state is None
-               else jnp.asarray(state, work))
-    refusal = ssd_port_refusal(x, B, chunk_size)
-    if refusal is None:
-        out, final = _ported(x, dt, A, B, C, D, carried, chunk_size, starts)
-        return out.astype(work), final.astype(work)
-    ran_kernel('ssd', 'xla', refusal)
-    x, B, C = (jnp.asarray(t, work) for t in (x, B, C))
-    # The `H // G` heads of one group read the same B and C, the reference's `repeat_interleave`.
-    B, C = repeat_kv_heads(B, heads), repeat_kv_heads(C, heads)
-    pad = (chunk_size - length % chunk_size) % chunk_size
-    x, B, C = (jnp.pad(t, ((0, 0), (0, pad), (0, 0), (0, 0))) for t in (x, B, C))
-    dt = jnp.pad(dt, ((0, 0), (0, pad), (0, 0)))
-    skip = D[None, None, :, None] * x                      # the reference's D_residual
-    x = x * dt[..., None]                                   # discretised input
-    a = A[None, None, :] * dt                               # [B, T, H] log decay per step
-    if starts is not None:
-        a = jnp.where(jnp.pad(starts, ((0, 0), (0, pad)))[..., None], RESET_DECAY, a)
-
-    platform = ssd_kernel_platform(chunk_size, head_dim, state_size, dtype=work)
-    if platform is None:
-        scanned, final = xla_chunk_scan(x, B, C, a, carried, chunk_size)
-    else:
-        def kernel(x, B, C, a, carried):
-            return ssd_chunk_scan(x, B, C, a, carried, chunk_size, platform)
-
-        # The groups are expanded, so any split of the heads divides them.
-        rows, split = grouped_heads(x.shape, heads)
-        four, held = P(rows, None, split, None), P(rows, split, None, None)
-        scanned, final = manual_map(kernel, (four, four, four, P(rows, None, split), held),
-                                    (four, held))(x, B, C, a, carried)
-    return (scanned + skip)[:, :length], final
+    held = None if state is None else jnp.swapaxes(jnp.asarray(state, work), -1, -2)
+    out, final = chunk(SSD, Chunk(C, B, x, beta=dt, rate=A, skip=D, state=held, starts=starts),
+                       chunk_size=chunk_size, dtype=work)
+    return out, jnp.swapaxes(final, -1, -2)
 
 
-def ssd_port_refusal(x, B, chunk_size: int) -> str | None:
-    """Why a chunked scan over these operands runs the XLA scan rather than
-    mamba_ssm's kernels (`mamba_ssd.ssd_scan`), or None where the port takes
-    it: on every GPU whose target row names it (`measured_kernel`), except
-    inside `jax.jvp`'s traces (`FORWARD_MODE`), which the port's custom VJP
-    gives no tangent; inside a caller's `shard_map` that checks varying axes
-    over operands that vary, where a Pallas call, which states no varying
-    type for its results, cannot run; float64 operands, whose scan is the
-    reference math itself; and head widths, state widths or chunks that are
-    not powers of two of at least 16, the smallest block Triton's dot takes."""
-    widths = (x.shape[-1], B.shape[-1], chunk_size)
-    return first_refusal(
-        (measured_kernel('ssd', 'xla') == 'pallas',
-         "the device's target row (generation.TARGETS) does not name the port"),
-        (not FORWARD_MODE.get(), "forward_mode_attention traces for jax.jvp, which the port's custom VJP "
-                                 "gives no tangent"),
-        (not jax.typeof(x).mat.varying,
-         "a shard_map that checks varying axes holds the operands, and a Pallas call states no "
-         "varying type for its results"),
-        (jnp.dtype(x.dtype) != jnp.float64, "float64 operands, whose scan is the reference math itself"),
-        (all(width >= 16 and width & (width - 1) == 0 for width in widths),
-         f"head width {widths[0]}, state {widths[1]} and chunk {widths[2]}; the port takes powers of "
-         "two of at least 16"),
-    )
-
-
-def _ported(x, dt, A, B, C, D, state, chunk_size: int, starts):
-    """The scan on mamba_ssm's kernels, each token's document counted from
-    `starts` (mamba_ssm's `seq_idx`). On a mesh it runs per shard
-    (`manual_map`): rows where the rules split them, and heads with their
-    groups where the head split divides the groups, the time axis whole;
-    off a GPU its kernels interpret, as the CPU suite runs them."""
-    interpret = not triton_runs()
-    seq = None if starts is None else jnp.cumsum(starts, axis=1, dtype=jnp.int32)
-
-    def scan(x, dt, A, B, C, D, state, *seq):
-        return mamba_ssd.ssd_scan(x, dt, A, B, C, D, state, *(seq or (None,)), chunk_size, interpret)
-
-    operands = (x, dt, A, B, C, D, state, *([] if seq is None else [seq]))
-    rows, heads = grouped_heads(x.shape, B.shape[2])
-    four, held = P(rows, None, heads, None), P(rows, heads, None, None)
-    specs = (four, P(rows, None, heads), P(heads), four, four, P(heads), held, P(rows, None))
-    return manual_map(scan, specs[:len(operands)], (four, held))(*operands)
+SSD = Hooks(decay='scalar', rated=True, delta=False, skip=True)
+"""The SSD as the recurrence template's form: a rated decay a head, no delta rule, the skip."""
 
 
 def recurrent_ssd(x, dt, A, B, C, D, state=None, starts=None):
@@ -312,7 +157,8 @@ def recurrent_ssd(x, dt, A, B, C, D, state=None, starts=None):
         x_t, dt_t, B_t, C_t, start = step                   # [B, H, P], [B, H], [B, H, N], [B]
         decay = jnp.where(start[:, None], 0.0, jnp.exp(dt_t * A))
         s = s * decay[..., None, None] + (dt_t[..., None] * x_t)[..., None] * B_t[..., None, :]
-        return s, jnp.einsum('bhps,bhs->bhp', s, C_t) + x_t * D[None, :, None]
+        read = jnp.einsum('bhps,bhs->bhp', s, C_t, precision=float32_products(s.dtype))
+        return s, read + x_t * D[None, :, None]
 
     final, out = jax.lax.scan(
         one_token, jnp.asarray(state, work),
@@ -419,7 +265,8 @@ class Mamba2(nn.Module):
         if self.chunk_size < 1:
             raise ValueError(f"chunk_size counts tokens per chunk, got {self.chunk_size}")
         dense = functools.partial(
-            Dense, use_bias=self.use_bias, dtype=self.dtype, precision=self.precision
+            Dense, use_bias=self.use_bias, dtype=self.dtype, precision=self.precision,
+            dot_general=float32_dot_general
         )
         self.in_proj = dense(
             2 * self.intermediate_size + 2 * self.n_groups * self.state_size + self.num_heads,
@@ -524,7 +371,8 @@ def _ssd(convolved, dt, heads, *, num_heads: int, head_dim: int, n_groups: int,
         entering = entering.reshape(batch, n_groups, num_heads // n_groups, head_dim, state_size)
         decayed = jnp.exp(jnp.cumsum(log_decay, axis=1)).reshape(
             batch, length, n_groups, num_heads // n_groups)
-        carried = jnp.einsum('bsgn,bgkpn,bsgk->bsgkp', C, entering, decayed)
+        carried = jnp.einsum('bsgn,bgkpn,bsgk->bsgkp', C, entering, decayed,
+                             precision=float32_products(C.dtype))
         out = out + carried.reshape(batch, length, num_heads, head_dim)
     return out.reshape(batch, length, intermediate), final
 

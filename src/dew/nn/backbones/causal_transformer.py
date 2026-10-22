@@ -66,15 +66,25 @@ from ..inputs import (
     PredictionPhase,
     coordinates as build_coordinates,
     coordinates_of,
+    numbered_blocks,
 )
 from ..kv_cache import KVCache
+from ..mixer_base import MLP_RESIDUALS, RESIDUALS
 from ..mixers import AttentionMixer, MixerBase, MixerContext
 from ..mixers.mamba2 import Mamba2Mixer
 from ..mixers.mlp import MLPMixer
 from ..mla import MLAMixer
 from ..mlp import GatedMLP
 from ..ngpt import NGPT, gain, unit
-from ..precision import at_least_fp32, capped_logits, head_dot_general, head_product, scaled, scaled_logits
+from ..precision import (
+    at_least_fp32,
+    capped_logits,
+    float32_dot_general,
+    head_dot_general,
+    head_product,
+    scaled,
+    scaled_logits,
+)
 from ..protocols import OutputTable, ProjectionGroup, QuantizesInputs, declared_groups
 from ..rope import LongRopeScaling, RopeScaling, YarnScaling, rope_scaling_from_record
 from ..sharding import (
@@ -88,9 +98,7 @@ from ..sharding import (
 )
 from .decoder_block import (
     DECODER_REMAT,
-    MLP_RESIDUALS,
     NORM_SITES,
-    RESIDUALS,
     BlockWiring,
     DecoderBlock,
     Mixture,
@@ -111,7 +119,7 @@ from .decoder_stack import (
     run_pipeline,
     run_stack,
 )
-from .layer_plan import LayerKind, LayerSpec, ResolvedKind, group_name, scan_groups
+from .layer_plan import LayerKind, LayerSpec, ResolvedKind, group_name, layer_index, scan_groups
 
 _INTERMEDIATES = "intermediates"
 """The collection flax's `capture_intermediates` fills."""
@@ -195,6 +203,10 @@ class CausalTransformer(nn.Module):
     None for `max_seq_len`. The model computes nothing from it: `max_seq_len` is its decode cache's
     capacity, which a loader caps below a long context (`decoder_parts.DEFAULT_MAX_SEQ_LEN`)."""
     position_embedding: Literal['rotary', 'learned', 'alibi'] = 'rotary'
+    """How a layer whose kind names no mixer places its tokens (`layer_mixer`): rotary attention,
+    or unrotated attention after a learned table the embedding adds ('learned') or with ALiBi's
+    biases ('alibi'). A mixer a model or a kind names places its own tokens; the learned table is
+    added whatever the mixers."""
     position_embedding_size: int | None = None
     """The number of rows in the learned position table; None means `max_seq_len`.
     It does not depend on the decode cache's capacity."""
@@ -569,8 +581,8 @@ class CausalTransformer(nn.Module):
 
         `head_dim`, `rope_theta`, `window`, the two rotary ramps, the partial
         rotary and the sinks take the layer kind's resolved values
-        (`kind_of`). Every other field is the
-        model's field of the same name. A kind builds its `DecoderBlock` factory
+        (`kind_of`), and the precision the model's layers take (`products`). Every other field
+        is the model's field of the same name. A kind builds its `DecoderBlock` factory
         from this context and its own record, and `setup` chooses the mixer
         there and nowhere else.
         """
@@ -582,7 +594,8 @@ class CausalTransformer(nn.Module):
             "k_eq_v": self.attention_k_eq_v and kind.window is None,
             "kv_shared": kv_shared, "kv_store_key": layer_type,
             "partial_rotary_factor": kind.partial_rotary_factor, "attention_sinks": kind.sinks,
-            "init_std": self.init_stds[0], "output_init_std": self.init_stds[1]}
+            "init_std": self.init_stds[0], "output_init_std": self.init_stds[1],
+            "precision": self.precision}
         return MixerContext(**resolved, **{field.name: getattr(self, field.name)
                                            for field in dataclasses.fields(MixerContext)
                                            if field.name not in resolved})
@@ -688,10 +701,6 @@ class CausalTransformer(nn.Module):
             raise ValueError('scale_offset describes RMSNorm weights')
         if self.position_embedding not in ('rotary', 'learned', 'alibi'):
             raise ValueError('position_embedding must be rotary, learned or alibi')
-        if self.position_embedding != "rotary" and (
-            self.mixer is not None or any(kind.mixer is not None for kind in (self.kinds or {}).values())
-        ):
-            raise ValueError('learned positions and ALiBi require the default unrotated attention mixer')
         if self.position_embedding_size is not None and (
                 self.position_embedding != 'learned' or self.position_embedding_size < self.max_seq_len):
             raise ValueError('position_embedding_size requires learned positions and covers max_seq_len')
@@ -1097,7 +1106,7 @@ class CausalTransformer(nn.Module):
             self.per_layer_model_projection = Dense(
                 projections['per_layer_model_projection'][1], use_bias=False,
                 dtype=self.dtype, precision=self.precision,
-                name='per_layer_model_projection')
+                name='per_layer_model_projection', dot_general=float32_dot_general)
             self.per_layer_projection_norm = RMSNorm(
                 epsilon=self.norm_eps, scale_offset=self.scale_offset,
                 scale_after_cast=self.scale_after_cast, dtype=self.dtype,
@@ -1132,7 +1141,7 @@ class CausalTransformer(nn.Module):
             # Gemma3nTextModel.altup_projections and altup_unembed_projections).
             projection = functools.partial(
                 Dense, use_bias=False, dtype=self.dtype,
-                precision=self.precision)
+                precision=self.precision, dot_general=float32_dot_general)
             self.altup_projections = [
                 projection(projections[f'altup_projections_{index}'][1], name=f'altup_projections_{index}')
                 for index in range(self.altup.num_inputs - 1)]
@@ -1153,7 +1162,8 @@ class CausalTransformer(nn.Module):
         if self.loop is not None and self.loop.exit_gate:
             self.early_exit_gate = Dense(
                 projections['early_exit_gate'][1], dtype=self.dtype, precision=self.precision,
-                name='early_exit_gate', **normal_kernel(self.initializer_range))
+                name='early_exit_gate', **normal_kernel(self.initializer_range),
+                dot_general=float32_dot_general)
         if not self.tie_embeddings:
             self.lm_head = Dense(
                 features=projections['lm_head'][1], use_bias=False, dtype=at_least_fp32(self.dtype),
@@ -1163,7 +1173,7 @@ class CausalTransformer(nn.Module):
         if self.head_transform is not None:
             self.head_dense = Dense(
                 projections['head_dense'][1], use_bias=False, dtype=self.dtype, precision=self.precision,
-                name='head_dense', **normal_kernel(self.initializer_range))
+                name='head_dense', **normal_kernel(self.initializer_range), dot_general=float32_dot_general)
             self.head_norm = decoder_norm(
                 self.norm_type, epsilon=self.norm_eps, bias=self.norm_bias,
                 scale_offset=self.scale_offset, scale_after_cast=self.scale_after_cast,
@@ -1675,8 +1685,8 @@ class CausalTransformer(nn.Module):
             return final
         kept = collections.get(_INTERMEDIATES, {}).get(f"layers_{layer}")
         if kept is None:
-            held = sorted(int(name[len("layers_"):]) for name in collections.get(_INTERMEDIATES, {})
-                          if name.startswith("layers_") and name[len("layers_"):].isdigit())
+            held = sorted(number for number in map(layer_index, collections.get(_INTERMEDIATES, {}))
+                          if number is not None)
             raise ValueError(f"the model kept no layer {layer}; it kept layers {held}")
         return kept["__call__"][-1]
 
@@ -1817,15 +1827,20 @@ class CausalTransformer(nn.Module):
         engram_ids = (None if self.engram is None else self.engram_hashes(
             tokens, None if coordinates is None else coordinates.valid,
             None if coordinates is None else coordinates.positions, decode, media_mask))
+        # A block router's blocks are numbered once for every routed layer.
+        block = None if self.mixture is None else self.mixture.routing_block
+        blocks = None if block is None else numbered_blocks(
+            coordinates_of(None, *tokens.shape[:2]) if coordinates is None else coordinates, tokens.shape[:2],
+            block)
         if (coordinates is None and image_groups is None and rotary_positions is None
                 and pairwise_mask is None and key_positions is None and not self.hash_layers
-                and engram_ids is None and media_mask is None and admitted is None):
+                and engram_ids is None and media_mask is None and admitted is None and blocks is None):
             return None
         return AttentionMetadata(
             coordinates=coordinates, image_groups=image_groups, rotary_positions=rotary_positions,
             pairwise_mask=pairwise_mask, key_positions=key_positions,
             token_ids=tokens if self.hash_layers else None, engram_ids=engram_ids, media=media_mask,
-            admitted=admitted)
+            admitted=admitted, blocks=blocks, routing_block=block)
 
     def looped(self, x, **stack):
         """Run the layer stack over `x` once, or as `loop` says: the layers before

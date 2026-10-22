@@ -17,12 +17,12 @@ levels, refuses a grid with two equal levels before its last interval.
 """
 
 from .brownian import DPMSolverSDE
-from .common import Solver
+from .common import RowKeys, RowSolver, Solver
 from .dpm import DEIS, Algorithm as Algorithm, DPMSolverMultistep, DPMSolverSinglestep
 from .gaussian import DDIM, DDPM, PNDM, TCD, Consistency
 from .sigma import KDPM2, LMS, RK4, Euler, EulerAncestral, Heun, MultiStepDPM
 from .unipc import UniPC
 
 __all__ = ["DDIM", "DDPM", "DEIS", "KDPM2", "LMS", "PNDM", "RK4", "TCD", "Consistency", "DPMSolverMultistep",
-           "DPMSolverSDE", "DPMSolverSinglestep", "Euler", "EulerAncestral", "Heun", "MultiStepDPM", "Solver",
-           "UniPC"]
+           "DPMSolverSDE", "DPMSolverSinglestep", "Euler", "EulerAncestral", "Heun", "MultiStepDPM",
+           "RowKeys", "RowSolver", "Solver", "UniPC"]

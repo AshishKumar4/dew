@@ -23,10 +23,12 @@ import jax.numpy as jnp
 import numpy as np
 import pytest
 from interop_support import (
-    assert_autoencoder_vjp,
+    assert_coder_vjps,
     assert_layout_tensors,
+    channels_last,
     extract_fixture,
     fixture_arrays,
+    posterior_of,
     scaled_gap,
 )
 
@@ -54,8 +56,7 @@ def loaded(source):
     return load_qwen_image_vae(source, jnp.float32)
 
 
-def channels_last(array):
-    return np.asarray(array).transpose(0, 2, 3, 1)
+
 
 
 def test_a_configs_training_dropout_loads_the_same_autoencoder(source, loaded, tmp_path):
@@ -81,9 +82,8 @@ def test_every_published_tensor_is_mapped_and_exports_bit_identical(source, load
 def posterior(model, params, image):
     """The posterior's mean and standard deviation, split from the encoder's
     moments as `posterior_latent` splits them."""
-    moments = model.apply({"params": params}, image, method=lambda vae, x: vae.quant_conv(vae.encoder(x)))
-    mean, log_variance = jnp.split(moments, 2, axis=-1)
-    return mean, jnp.exp(0.5 * jnp.clip(log_variance, -30.0, 20.0))
+    return posterior_of(model.apply({"params": params}, image,
+                                    method=lambda vae, x: vae.quant_conv(vae.encoder(x))))
 
 
 def test_the_posterior_matches_the_source(loaded, reference):
@@ -123,22 +123,8 @@ def test_the_decode_matches_the_source(loaded, reference):
     assert float(jnp.abs(pixels).max()) <= 1.0
 
 
-def test_encoder_gradients_match_the_source(loaded, reference):
-    autoencoder, params, layouts, _ = loaded
-    assert_autoencoder_vjp(
-        "encode", lambda params, image: posterior(autoencoder.model, params, image), params,
-        channels_last(reference["image"]),
-        [channels_last(reference[f"probe_{name}"]) for name in ("mean", "std")], layouts, reference,
-        channels_last(reference["encode.grad_image"]), GRADIENT)
-
-
-def test_decoder_gradients_match_the_source(loaded, reference):
-    autoencoder, params, layouts, _ = loaded
-    model = autoencoder.model
-    assert_autoencoder_vjp(
-        "decode", lambda params, latent: model.apply({"params": params}, latent, method=model.decode), params,
-        channels_last(reference["latent"]), [channels_last(reference["probe"])], layouts, reference,
-        channels_last(reference["decode.grad_latent"]), GRADIENT)
+def test_the_coder_gradients_match_the_source(loaded, reference):
+    assert_coder_vjps(loaded, reference, "image", posterior, GRADIENT)
 
 
 def test_the_autoencoder_normalizes_as_the_pipeline_does(loaded, reference):

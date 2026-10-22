@@ -22,7 +22,8 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from model_support import TINY_DECODER
-from reference_error import assert_leaves_as_exact, float64_terms
+from reference_error import assert_as_exact
+from residual_orders import orders, permuted, residual_width
 
 from dew.nn import linear
 from dew.nn.attention import alibi_bias
@@ -170,10 +171,10 @@ PADDING = 3
 """Segment-0 slots after the documents, the packer's tail."""
 
 
-def documents_alone(model, tokens):
-    """The logits of each document of `tokens` `[1, sum(DOCUMENTS)]` run alone, concatenated, as a
+def documents_alone(model, tokens, documents=DOCUMENTS):
+    """The logits of each document of `tokens` `[1, sum(documents)]` run alone, concatenated, as a
     function of the variables."""
-    starts = (0, *itertools.accumulate(DOCUMENTS))
+    starts = (0, *itertools.accumulate(documents))
 
     def alone(variables):
         return jnp.concatenate([model.apply(variables, tokens[:, begin:end])
@@ -188,18 +189,18 @@ def pulled(forward, variables, cotangent):
     return logits, pull(cotangent.astype(logits.dtype))[0]
 
 
-def packed_forward(model, tokens, *, segmented=True):
-    """The forward of the documents' `tokens` `[1, sum(DOCUMENTS)]` packed in one row (positions
+def packed_forward(model, tokens, *, documents=DOCUMENTS, segmented=True):
+    """The forward of the documents' `tokens` `[1, sum(documents)]` packed in one row (positions
     restarting per document, then PADDING slots whose logits the loss ignores), their segment ids
     given, or with `segmented` False the same row and positions without them."""
-    total = sum(DOCUMENTS)
+    total = sum(documents)
     assert tokens.shape == (1, total)
-    documents = [jnp.full((1, length), i + 1, jnp.int32) for i, length in enumerate(DOCUMENTS)]
-    segments = jnp.concatenate([*documents, jnp.zeros((1, PADDING), jnp.int32)], axis=1)
-    positions = jnp.concatenate([*(jnp.arange(length)[None] for length in DOCUMENTS),
+    segments = [jnp.full((1, length), i + 1, jnp.int32) for i, length in enumerate(documents)]
+    segments = jnp.concatenate([*segments, jnp.zeros((1, PADDING), jnp.int32)], axis=1)
+    positions = jnp.concatenate([*(jnp.arange(length)[None] for length in documents),
                                  jnp.zeros((1, PADDING), jnp.int32)], axis=1)
     row = jnp.concatenate([tokens, jnp.zeros((1, PADDING), tokens.dtype)], axis=1)
-    tokens_at = (coordinates(segments=segments, positions=positions, max_segments=len(DOCUMENTS) + 1)
+    tokens_at = (coordinates(segments=segments, positions=positions, max_segments=len(documents) + 1)
                  if segmented else coordinates(positions=positions))
 
     def forward(variables):
@@ -219,7 +220,9 @@ def packed_and_alone(model, variables, tokens, cotangent):
 
 KIND_FIELDS = {"mlp": ({"intermediate_size": 64}, {}), "llama4": ({}, {"qk_norm": False}),
                "deepseek_v4": ({"rope_head_dim": 8}, {"kinds": {"full_attention": LayerKind(window=8)}}),
-               "kimi_delta_attention": ({"linear_num_heads": 2, "linear_head_dim": 16}, {}),
+               "kimi_delta_attention": ({"linear_num_heads": 2, "linear_head_dim": 32}, {}),
+               "mamba2": ({"num_heads": 8, "head_dim": 32, "state_size": 32, "n_groups": 4,
+                           "chunk_size": 64}, {}),
                "gated_delta_net": ({"linear_num_key_heads": 2, "linear_num_value_heads": 4,
                                     "linear_key_head_dim": 16, "linear_value_head_dim": 16}, {})}
 """The fields a kind needs beyond its defaults to build in `tiny`: its own, then the model's. The
@@ -229,40 +232,66 @@ per-key pairwise decays alone take 134 MB a chunk in KDA's portable math."""
 REFUSED = {"kpool_sparse_attention"}
 """Kinds that refuse packed rows."""
 
+SEEDS = {"attention": 64, "deepseek_v4": 256, "gated_delta_net": 512, "kimi_delta_attention": 512,
+         "llama4": 128, "mamba": 32, "mamba2": 256, "mla": 64, "mlp": 64}
+"""Each kind's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for`: the fewest for
+which documents run alone compared with themselves resolve PARITY in every logit and parameter
+gradient (2026-10-20, on armada; Kimi delta attention's and Mamba2's 2026-10-21). Mamba2's 8 heads of 32
+over a state of 32 in 64-token chunks (`KIND_FIELDS`) take 256 at 0.04 s a seed, where its defaults (128
+heads of 64 over 128) took 256 at 30 minutes a run. Kimi delta attention's heads are 32 wide
+(`KIND_FIELDS`): at 16 the reference compared with itself did not resolve within 2048 seeds, one seed
+carrying up to 68% of a leaf's summed error, near-collinear keys' erases in fp32; at 32 it carries at
+most 5%. 16 is no path of its own: the portable math this site runs has no width-specific code, and
+the port pads every key width below 64 to 64 (`recurrence_chunk._blocked_rule`), which
+tests/test_fla_gdn.py's any-width site holds at 32. The packed row no longer runs a 16-wide Kimi
+layer or Mamba2's defaults (128 heads of 64 over a state of 128 in 256-token chunks, where these
+documents sit in one chunk); the scan's packed resets within a chunk stay held by tests/test_mamba2.py
+and tests/test_mamba_ssd.py at their own geometries."""
+
 
 @pytest.mark.parametrize("kind", sorted(mixers.paths))
 def test_a_packed_row_computes_what_its_documents_compute_alone(kind):
-    """Every mixer in the registry: a row packing three documents (segment ids, positions restarting),
+    """Every mixer in the registry: a row packing documents (segment ids, positions restarting),
     one across a chunk of the chunked rules, gives each document's logits and the parameters' gradients
     its documents give run one at a time, within the float64 gate, so no layer carries a conv history,
     a recurrent state or attention across a document boundary, nor between the documents and the
-    segment-0 padding after them. The float64 truth is the documents run alone in float64, the fp32
-    runs at IEEE products, as the rule's references take theirs; each leaf's floor is its own float64
-    terms' (`float64_terms`), as a gradient summed over a document's tokens rounds with the partial
-    sums it adds: Kimi delta attention's second layer's A_log, its terms 2.7 times its size, rounds
-    to 6.6e-06 packed under its floor of 7.3e-06, where the documents alone round to 5.6e-07 at their
-    own chunk phase and 6.6e-06 at the packed one."""
+    segment-0 padding after them. Each draw has fresh tokens, parameters and cotangents, with the
+    residual channels consistently permuted (`residual_orders`). Both fp32 runs use IEEE products;
+    the float64 truth runs each document alone under the same order."""
     fields, overrides = KIND_FIELDS.get(kind, ({}, {}))
-    model = tiny(mixer=mixers.build(kind, **fields), max_seq_len=128, **overrides)
-    tokens = jax.random.randint(jax.random.key(3), (1, sum(DOCUMENTS)), 0, VOCAB)
+    documents = DOCUMENTS
+    total = sum(documents)
+    model = tiny(mixer=mixers.build(kind, **fields), max_seq_len=max(128, total + PADDING), **overrides)
+    tokens = jax.random.randint(jax.random.key(3), (1, total), 0, VOCAB)
     variables = model.init(jax.random.key(4), tokens)
-    cotangent = jax.random.normal(jax.random.key(5), (1, sum(DOCUMENTS), VOCAB))
+    cotangent = jax.random.normal(jax.random.key(5), (1, total, VOCAB))
     if kind in REFUSED:
         unsegmented = functools.partial(pulled, packed_forward(model, tokens, segmented=False))
         jax.block_until_ready(jax.jit(unsegmented)(variables, cotangent))
         with pytest.raises(ValueError):
             packed_and_alone(model, variables, tokens, cotangent)
         return
-    with jax.default_matmul_precision("highest"):
-        (packed, packed_grads), (alone, alone_grads) = packed_and_alone(model, variables, tokens, cotangent)
-    with jax.enable_x64(new_val=True):
-        wide = jax.tree.map(lambda x: jnp.asarray(np.asarray(x, np.float64)), variables)
-        alone64 = documents_alone(model.clone(dtype=jnp.float64), tokens)
-        (truth, truth_grads), (terms, terms_grads) = float64_terms(
-            functools.partial(pulled, alone64), wide, jnp.asarray(cotangent, jnp.float64))
-    assert_leaves_as_exact({"logits": packed, "grads": packed_grads}, {"logits": alone, "grads": alone_grads},
-                           {"logits": truth, "grads": truth_grads}, reductions=sum(DOCUMENTS),
-                           terms={"logits": terms, "grads": terms_grads})
+    initialize = jax.jit(model.init)
+    width = residual_width(variables)
+
+    def draw(seed):
+        tokens = jax.random.randint(jax.random.key(3 + 3 * seed), (1, total), 0, VOCAB)
+        variables = initialize(jax.random.key(4 + 3 * seed), tokens)
+        cotangent = jax.random.normal(jax.random.key(5 + 3 * seed), (1, total, VOCAB))
+        order = orders(width, 2, seed)[1]
+        return permuted(variables, order), tokens, cotangent
+
+    def evaluated(model, variables, tokens, cotangent, *, packed):
+        forward = (packed_forward(model, tokens, documents=documents) if packed
+                   else documents_alone(model, tokens, documents))
+        with jax.default_matmul_precision("highest"):
+            logits, grads = pulled(forward, variables, cotangent)
+        return {"logits": logits, "grads": grads}
+
+    dew = jax.jit(functools.partial(evaluated, model, packed=True))
+    reference = jax.jit(functools.partial(evaluated, model, packed=False))
+    truth = jax.jit(functools.partial(evaluated, model.clone(dtype=jnp.float64), packed=False))
+    assert_as_exact(dew, reference, draw, f"packed {kind}", seeds=SEEDS[kind], truth_fn=truth)
 
 
 def embedded(module, tokens):

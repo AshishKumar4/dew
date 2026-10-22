@@ -16,12 +16,24 @@ JSON. The `JSON` alias both directions speak is declared here, once.
 from __future__ import annotations
 
 import datetime
+import functools
 import math
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
+from numbers import Real
 
 type JSON = None | bool | int | float | str | list['JSON'] | dict[str, 'JSON']
 
+
+
+HF_METADATA = frozenset({
+    "architectures", "transformers_version", "torch_dtype", "dtype", "output_hidden_states",
+    "output_attentions", "return_dict", "is_encoder_decoder", "id2label", "label2id", "problem_type",
+    "chunk_size_feed_forward",
+})
+"""The fields every Hugging Face config serializes that describe no computation: its classes and
+release, its output and return flags, its label maps and task. A translator that refuses fields it
+does not read leaves these out, beside its own."""
 
 def duration(value: str) -> datetime.timedelta:
     """A positive recorded duration, in seconds, minutes or hours."""
@@ -64,6 +76,15 @@ def integer(value: object, key: str) -> int:
     return value
 
 
+def finite(value: object, what: str) -> float:
+    """One finite real as a float, NumPy's scalars among them: a reward, a likelihood, a scale.
+    A bool is a flag, not a number; it, every non-number, an infinity and a nan are refused with
+    ValueError naming `what` and the value."""
+    if isinstance(value, bool) or not isinstance(value, Real) or not math.isfinite(value):
+        raise ValueError(f"{what} is a finite number, got {value!r}")
+    return float(value)
+
+
 def number(value: object, key: str) -> float:
     """One real field: an epsilon, a rate, a frequency. An integer is one.
 
@@ -72,11 +93,11 @@ def number(value: object, key: str) -> float:
     the one spelling of an infinity a config carries, and the only one read
     here; a bare non-finite number reached this field from somewhere else.
     """
-    if isinstance(value, Mapping) and "__float__" in value:
+    if isinstance(value, Mapping):
+        if "__float__" not in value:
+            raise ValueError(f"{key}={value!r}: this field is a finite number")
         return float(str(value["__float__"]))
-    if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value):
-        raise ValueError(f"{key}={value!r}: this field is a finite number")
-    return float(value)
+    return finite(value, key)
 
 
 def boolean(value: object, key: str) -> bool:
@@ -100,25 +121,23 @@ def record(value: object, key: str) -> Mapping[str, object]:
     return value
 
 
-def strings(value: object, key: str) -> tuple[str, ...]:
-    """One list of names: a layer pattern, an architecture list."""
-    if isinstance(value, str) or not isinstance(value, (list, tuple)):
-        raise ValueError(f"{key}={value!r}: this field is a list of strings")
-    return tuple(text(entry, key) for entry in value)
-
-
-def integers(value: object, key: str) -> tuple[int, ...]:
-    """One list of integers: layer indices, token ids, per-layer widths."""
+def listed[ItemT](value: object, key: str, *, read: Callable[[JSON, str], ItemT],
+                  what: str) -> tuple[ItemT, ...]:
+    """One list, each entry read by `read(entry, key)`; `what` names what the list holds, as a
+    refusal of anything else says."""
     if not isinstance(value, (list, tuple)):
-        raise ValueError(f"{key}={value!r}: this field is a list of integers")
-    return tuple(integer(entry, key) for entry in value)
+        raise ValueError(f"{key}={value!r}: this field is {what}")
+    return tuple(read(entry, key) for entry in value)
 
 
-def numbers(value: object, key: str) -> tuple[float, ...]:
-    """One list of finite numbers: per-frequency rotary factors."""
-    if not isinstance(value, (list, tuple)):
-        raise ValueError(f"{key}={value!r}: this field is a list of numbers")
-    return tuple(number(entry, key) for entry in value)
+integers = functools.partial(listed, read=integer, what="a list of integers")
+"""One list of integers: layer indices, token ids, per-layer widths (`listed`)."""
+
+numbers = functools.partial(listed, read=number, what="a list of numbers")
+"""One list of finite numbers: per-frequency rotary factors (`listed`)."""
+
+strings = functools.partial(listed, read=text, what="a list of strings")
+"""One list of names: a layer pattern, an architecture list (`listed`)."""
 
 
 def json_value(value: object, key: str) -> JSON:

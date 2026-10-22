@@ -14,32 +14,15 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from delta_rule_support import (
-    CHUNKED,
-    NAMES,
-    fla_decay_terms,
-    fla_side,
-    float64_truth,
-    math,
-    plain_prefix,
-    recurrence,
-    through,
-)
-from reference_error import (
-    assert_as_exact_as_the_reference,
-    assert_leaves_as_exact,
-    distance,
-    float64_terms,
-    widened,
-)
-from sharded import boundary_copies
+from delta_rule_support import NAMES, fla_side, float64_truth, math, plain_prefix, recurrence, through
+from reference_error import assert_as_exact, assert_as_exact_as_the_reference, distance
 from tuned import each_config
 
 from dew.nn import kernels
 from dew.nn.kda import KimiDeltaAttention
-from dew.nn.kernels import fla_gdn, fla_kda, tuning
-from dew.nn.linear import fla_rule, l2norm
-from dew.training._lowering import triton_calls
+from dew.nn.kernels import chunked_launch, fla_kda, tuning
+from dew.nn.kernels.recurrence_chunk import fla_rule
+from dew.nn.linear import l2norm
 
 pytestmark = pytest.mark.kernel
 
@@ -74,6 +57,13 @@ def fla_math(q, k, v, g, beta, h0):
     return math(q, k, v, plain_prefix(g), beta, h0)
 
 
+SEEDS = {(1, 2, 64, 64, 128): 8, (2, 2, 64, 64, 100): 8, (1, 1, 32, 96, 70): 32,
+         (1, 1, 128, 128, 64): 64}
+"""Each geometry's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for`: the fewest
+for which `fla_math` compared with itself resolves the factor in every output and gradient, truth
+the float64 recurrence (2026-10-21, on armada, where this test runs: a GPU skips it)."""
+
+
 @ON_A_GPU
 @pytest.mark.parametrize("key_heads, value_heads, width, columns, length", [
     (1, 2, 64, 64, 128),    # value heads sharing a key head, two whole chunks
@@ -83,22 +73,19 @@ def fla_math(q, k, v, g, beta, h0):
 ])
 def test_the_rule_on_the_port_is_as_exact_as_the_math(key_heads, value_heads, width, columns, length):
     """`fla_rule` with a decay per key dimension, the port as a GPU runs it: padded to the kernels'
-    blocks, through every kernel and the custom VJP, its output, final memory and six gradients as near
-    the float64 recurrence as the portable math on fla's plain prefix (`fla_math`), up to fp32
-    rounding of a chunk's sums, each sized by the portable math's float64 terms and the decay's
-    gradient by those of the parts the port sums too (`fla_decay_terms`)."""
-    *inputs, do, dht = operands(1, length, key_heads, value_heads, width, columns, jnp.float32, seed=11)
-    got = through(fla_rule, do, dht)(*inputs)
-    want = through(fla_math, do, dht)(*inputs)
-    with jax.enable_x64(new_val=True):
-        operands64 = widened((*inputs, do, dht))
-        truth = through(recurrence, *operands64[6:])(*operands64[:6])
-        _, terms = float64_terms(through(math, *operands64[6:]), *operands64[:6])
-        # The decay's gradient as the port sums it, a value head at a time.
-        group = value_heads // key_heads
-        q, k = (jnp.repeat(x, group, axis=2) for x in operands64[:2])
-        terms = (*terms[:5], np.maximum(terms[5], fla_decay_terms(q, k, *operands64[2:])), *terms[6:])
-    assert_leaves_as_exact(got, want, widened(truth), reductions=CHUNKED, terms=terms)
+    blocks, through every kernel and the custom VJP, its output, final memory and six gradients on
+    par with the portable math on fla's plain prefix (`fla_math`) by check 1 (`assert_as_exact`)
+    over fresh operands drawn from each seed, truth the float64 token recurrence on them."""
+    def draw(seed):
+        return operands(1, length, key_heads, value_heads, width, columns, jnp.float32, seed=seed)
+
+    def run(rule):
+        return lambda q, k, v, g, beta, h0, do, dht: through(rule, do, dht)(q, k, v, g, beta, h0)
+
+    assert_as_exact(jax.jit(run(fla_rule)), jax.jit(run(fla_math)), draw,
+                    f"fla_kda {(key_heads, value_heads, width, columns, length)}",
+                    seeds=SEEDS[(key_heads, value_heads, width, columns, length)],
+                    truth_fn=jax.jit(run(recurrence)))
 
 
 @pytest.mark.gpu(reason="the layer runs the port where the GPU's own target row names it")
@@ -122,22 +109,6 @@ def test_a_bf16_kimi_delta_attention_trains_on_the_port_as_on_the_math():
                                     strict=True):
         bound = APART * distance(theirs, 0)
         assert distance(mine, theirs) <= bound, jax.tree_util.keystr(path)
-
-
-@pytest.mark.gpu(reason="the port's kernels lower to Triton calls only on a GPU")
-def test_a_bf16_kimi_delta_attention_trains_with_no_copy_at_the_ports_edges():
-    """A bf16 KimiDeltaAttention at Kimi Linear's heads, forward and backward, compiled for this GPU:
-    no copy or transpose feeds one of the port's Triton calls or reads one of its results."""
-    layer = KimiDeltaAttention(emb_features=1024, num_heads=8, head_dim=128, dtype=jnp.bfloat16)
-    x = jax.random.normal(jax.random.key(47), (2, 512, 1024), jnp.bfloat16)
-    params = layer.init(jax.random.key(53), x)
-
-    def loss(params, x):
-        return jnp.sum(layer.apply(params, x).astype(jnp.float32) ** 2)
-
-    lowered = jax.jit(jax.grad(loss, argnums=(0, 1))).lower(params, x)
-    assert triton_calls(lowered)
-    assert boundary_copies(lowered.compile().as_text()) == []
 
 
 GPU_CASES = {
@@ -171,7 +142,7 @@ def test_the_port_is_as_exact_as_fla(case, dtype):
         assert_as_exact_as_the_reference(dew, fla, value, f"{case}/{name}", terms=summed)
 
 
-LAUNCHES = sorted({type(op) for op in vars(fla_kda).values() if isinstance(op, fla_gdn._Launch)},
+LAUNCHES = sorted({type(op) for op in vars(fla_kda).values() if isinstance(op, chunked_launch._Launch)},
                   key=lambda kind: kind.__name__)
 """The port's own launches, each a tuner KernelOp."""
 

@@ -25,7 +25,7 @@ from dew.coordination import from_every_process
 from dew.data.dataset import rows_of
 from dew.nn.kernels.options import compiler_options
 from dew.nn.sharding import LayoutRefused
-from dew.objectives.base import Batch, Objective
+from dew.objectives.base import RECORD, Batch, Objective
 from dew.records import JSON
 from dew.training.distributed import Placement, batch_divisor
 from dew.training.host import snapshot
@@ -92,7 +92,10 @@ def whole_step(outputs):
     microbatch's; finite and accepted where every microbatch was; and the
     commits summed."""
     losses, metrics, finite, accepted, committed = zip(*outputs, strict=True)
-    return (losses[-1], metrics[-1], jnp.all(jnp.stack(finite)), jnp.all(jnp.stack(accepted)),
+    # A recording step's evaluations are every microbatch's, in the order they ran (`RECORD`).
+    report = {name: jnp.concatenate([part[name] for part in metrics]) if name.startswith(RECORD) else value
+              for name, value in metrics[-1].items()}
+    return (losses[-1], report, jnp.all(jnp.stack(finite)), jnp.all(jnp.stack(accepted)),
             jax.tree.map(lambda *values: sum(values), *committed))
 
 

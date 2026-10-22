@@ -58,8 +58,6 @@ def config_from_hf(hf_config: Mapping[str, object], used: set[str] | None = None
     checks the rest against. The backbone's attention geometry is
     `mixer_decoder`'s; the SSD layer reads its own heads from the mixer value.
     """
-    if hf_config.get("model_type", MODEL_TYPE) != MODEL_TYPE:
-        raise ValueError(f"model_type {hf_config.get('model_type')!r} is not {MODEL_TYPE!r}")
     read = {"model_type", "num_hidden_layers"} if used is None else used
 
     def integer(key: str, default: int) -> int:

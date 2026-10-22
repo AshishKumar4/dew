@@ -41,7 +41,7 @@ from dew.nn.blocks import Modulation, sinusoidal_time
 from dew.nn.conv import Conv
 from dew.nn.dense import Dense
 from dew.nn.flops import MissingFlopsCount, matching_lengths, patch_lengths, projection_flops
-from dew.nn.precision import at_least_fp32
+from dew.nn.precision import at_least_fp32, float32_dot_general
 from dew.nn.rope import axis_tables, rotate
 from dew.nn.sharding import logical_axes
 
@@ -309,7 +309,8 @@ class WanTransformer(nn.Module):
                            (1, 2, self.features), jnp.float32)
         shift, scale = (table.astype(wide)[:, index] + embedded.astype(wide) for index in range(2))
         tokens = modulate(layer_norm(wide, self.eps)(tokens), shift, scale).astype(tokens.dtype)
-        out = Dense(int(np.prod(patch)) * self.out_channels, name="proj_out", **dense)(tokens)
+        out = Dense(int(np.prod(patch)) * self.out_channels, name="proj_out", **dense,
+                    dot_general=float32_dot_general)(tokens)
         return einops.rearrange(out.reshape(x.shape[0], *grid, *patch, self.out_channels),
                                 "b f h w pf ph pw c -> b (f pf) (h ph) (w pw) c")
 

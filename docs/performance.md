@@ -254,7 +254,8 @@ decoder and a 321.8M MoE decoder at 4 x 1024 tokens, SimpleDiT-B and an MM-DiT
 of its size at batch 32, and FLUX.2 and Wan 2.1 at their head width over a few
 blocks; the forward pass of the SigLIP-400M, Qwen3.5 and Gemma 4 vision towers
 and the SD VAE's decoder at their released sizes, with random weights;
-Qwen3-0.6B served at 32 and 128 slots; causal attention forward and backward
+Qwen3-0.6B served at 32 and 128 slots; the warm compiles of a 16-slot server over Dory 1.0 4B as released,
+its construction's decode step and each admission width's prefill (each gated as a compile); causal attention forward and backward
 (cudnn and xla, 2048 tokens, 128-wide heads); the Oxford Flowers input pipeline;
 and the save and restore of lm-dense's training state, and each step's compile time (gated at a
 25% change: compile time is performance). Each tree keeps its programs in a compile cache of its own
@@ -1541,7 +1542,7 @@ Qwen3.5-0.8B's real keys (near-aligned keys, beta near one) the powers grew
 as binomials while the inverse's entries stay under 1, and the cancellation
 left its fifth delta-rule layer 1e24 off in fp32 on a 256-token prompt:
 every later layer, the logits and every served request were NaN.
-`strictly_lower_inverse` now joins diagonal-block inverses, doubling their
+`recurrence_algebra.factor` (then `strictly_lower_inverse`) now joins diagonal-block inverses, doubling their
 size, so each product is the size of its entries. Every layer's chunked rule
 is within 8e-7 of a float64 token-by-token run, and the logits within 3.3e-05
 of transformers' fp32 forward with every argmax equal. It is cheaper too. At
@@ -1637,7 +1638,7 @@ Both kernels are gone (2026-10-12). Dew's port of fla 0.5.2's nine kernels
 target row names it (`'gated_delta_rule': 'fla'` on sm80, sm89, sm90 and
 sm120, where it was measured; the row is what qualification reads), on any
 heads, dtypes, chunk sizes and mesh, with keys up to 256 wide in bf16 or
-fp16 and 128 in fp32 (`dew.nn.linear.fla_rule`). The XLA math stays for
+fp16 and 128 in fp32 (`recurrence_chunk.fla_rule`). The XLA math stays for
 CPUs, TPUs, unmeasured GPUs, forward-mode traces, float64 and wider keys,
 and as the tests' oracle (`port_refusal` names each case).
 On a G4 the port's bf16 forward ran 1.32 and 1.18 ms at the 0.8B's (8 x

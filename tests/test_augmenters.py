@@ -20,12 +20,7 @@ from pathlib import Path
 import cv2
 import numpy as np
 import pytest
-from absl import flags
-
-# grain's worker processes read absl flags; a test that never ran absl.app
-# would trip UnparsedFlagAccessError at any worker_count > 0.
-if not flags.FLAGS.is_parsed():
-    flags.FLAGS.mark_as_parsed()
+from data_support import CAPTION_TEMPLATES, FLIP_JITTER, keep_captions, parse_grain_flags
 
 from dew.config.data import Augment, ImageData, loader
 from dew.data import Loading, Memory, images
@@ -33,11 +28,15 @@ from dew.data.dataset import DataPartition
 from dew.data.images import EncodeCaptions
 from dew.data.sources.codec import pack_dict_of_byte_arrays, unpack_dict_of_byte_arrays
 
+parse_grain_flags()
+
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
 LABELS = ("pink rose", "yellow tulip", "white lily", "blue orchid")
 SCALE = 48
 DRAWS = 32
+
+
 def _write_labels(tmp_path):
     labels = tmp_path / "labels.txt"
     labels.write_text("\n".join(LABELS) + "\n")
@@ -48,10 +47,6 @@ def _synthetic_image(seed=0):
     return np.random.RandomState(seed).randint(0, 256, (37, 53, 3), dtype=np.uint8)
 
 
-CAPTION_TEMPLATES = ("a photo of a {}", "a photo of a {} flower", "This is a photo of a {}")
-"""More than one, so a test can see which the record's rng drew."""
-
-FLIP_JITTER = Augment(flip=True, jitter=True, backend="host")
 
 
 def _element_for(kind, seed=0):
@@ -74,7 +69,7 @@ def _spec(kind, augment=FLIP_JITTER):
 def _read(spec, *, seed=0, batch=8):
     data = loader(spec, batch=batch, read="indexed", seed=seed,
                   loading=Loading(workers=0, threads=1, read_buffer=2),
-                  host=(EncodeCaptions(lambda captions: {"caption": np.asarray(captions)}),))
+                  host=(EncodeCaptions(keep_captions),))
     stream = data.train(DataPartition())
     try:
         return [{name: column[index] for name, column in row.items()}

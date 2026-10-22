@@ -18,9 +18,9 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from absl import flags
+from data_support import parse_grain_flags
 from reader_support import assert_a_rewrite_moves_the_identity
-from token_support import write_token_corpus
+from token_support import export_byte_tokens, write_token_corpus
 
 from dew.config.data import TextData, loader
 from dew.data import ByteTokenizer, Loading
@@ -30,14 +30,12 @@ from dew.nn.backbones import causal_transformer as backbone
 from dew.objectives.base import VALID_ROWS
 from dew.objectives.lm import LMObjective
 from dew.training import Step
+from tools.token_corpus import write_token_meta
+
+parse_grain_flags()
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 
-# grain's worker processes read absl flags; a test that never ran absl.app
-# would trip UnparsedFlagAccessError at any worker_count > 0.
-
-if not flags.FLAGS.is_parsed():
-    flags.FLAGS.mark_as_parsed()
 
 
 def _token_dir(tmp_path, train_tokens, val_tokens=None, dtype=np.uint16,
@@ -947,14 +945,12 @@ def stores(tmp_path):
     boundary has to be joined out of two of them; identical windows then say
     the stream view is the stream, not the chunking.
     """
-    meta = {"tokenizer": "byte", "vocab_size": 256, "dtype": "uint16", "train_tokens": len(CORPUS),
-            "val_tokens": len(CORPUS), "eos_id": PACK_EOS}
     held = {}
     stores = (("bin", None, None), ("records", [4, 3], None), ("packed_records", [2, 9], "ids"))
     for name, sizes, field in stores:
         directory = tmp_path / name
         directory.mkdir()
-        (directory / "meta.json").write_text(json.dumps(meta))
+        write_token_meta(directory, len(CORPUS), len(CORPUS), eos_id=PACK_EOS)
         for split in ("train", "val"):
             if sizes is None:
                 (directory / f"{split}.bin").write_bytes(CORPUS.astype(np.uint16).tobytes())
@@ -1119,14 +1115,8 @@ def test_a_token_mixture_validates_on_the_corpora_that_hold_a_validation_split(t
 def test_a_one_split_token_export_refuses_a_validation_split_it_does_not_hold(tmp_path):
     """A committed token export holds one split, so a validation split it lacks is refused by
     the store's own split selection, where the recipe once validated on the training tokens."""
-    from dew.cli.main import main
     from dew.data.holdout import Split
 
-    documents = tmp_path / "documents.jsonl"
-    documents.write_text("".join(json.dumps({"text": text}) + "\n" for text in ("first", "next")))
-    exported = tmp_path / "tokens"
-    fields = json.dumps({"source": str(documents)})
-    assert main(["data", "export", "records", str(exported), "--fields", fields, "--tokenizer", "byte",
-                 "--eos", "--format", "array_record"]) == 0
+    exported = export_byte_tokens(tmp_path, ("first", "next"), "--format", "array_record")
     with pytest.raises(ValueError):
         TextData(source=str(exported), seq_len=4, validation=Split("val")).pipelines()

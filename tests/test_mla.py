@@ -21,6 +21,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from interop_support import fixture_arrays
 from jax.sharding import PartitionSpec as P
 from recording import RecordingTracker
 
@@ -40,8 +41,7 @@ CONFIG = json.loads((FIXTURES / "config.json").read_text())
 
 
 def fixture(name: str) -> dict:
-    with np.load(FIXTURES / f"{name}.npz") as data:
-        return {key: np.asarray(value) for key, value in data.items()}
+    return fixture_arrays(FIXTURES / f"{name}.npz")
 
 
 def yarn_of(settings: dict) -> YarnScaling:
