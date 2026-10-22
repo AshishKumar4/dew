@@ -77,6 +77,13 @@ def _dot(a: jax.Array, b: jax.Array, interpret: bool) -> jax.Array:
     return plgpu.dot(a, b, precision=jax.lax.Precision.HIGHEST).astype(jnp.float32)
 
 
+def _masked_rows(ref, rows: jax.Array, mask: jax.Array) -> jax.Array:
+    """`ref`'s rows `rows`, each loaded only where `mask` holds and zero elsewhere."""
+    from jax.experimental.pallas import triton as plgpu
+
+    return plgpu.load(ref.at[rows, :], mask=mask[:, None], other=0)
+
+
 def _eligible(ba: tokamax.BoundArguments, target: generation.GpuTarget) -> bool:
     """Whether a launch runs on `target`: a CUDA GPU, one dtype of `DTYPES` on the queries, keys and
     values, and bf16 only from `generation.BF16_GPU` on, where Triton compiles its products."""
@@ -221,7 +228,7 @@ def _forward_kernel(*refs, spec: algebra.Forward, score_kinds: tuple[Kind, ...],
         product = _dot(others, value, interpret)
         # The old anchor's value row, read only where the anchor moved: after a row's first tiles it
         # rarely does, and a masked load fetches nothing for the rest.
-        old_value = plgpu.load(value_ref.at[arg.key, :], mask=moved[:, None], other=0)
+        old_value = _masked_rows(value_ref, arg.key, moved)
         acc, own, others_total = algebra.split_accumulate(state.acc, own, others_total, alpha, moved,
                                                           old_value, product, others, own_tile)
         return algebra.Partial(acc, m, denominator), anchor, own, others_total
