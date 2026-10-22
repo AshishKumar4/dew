@@ -34,7 +34,7 @@ from functools import partial
 from pathlib import Path
 
 import numpy as np
-from reference_source import CACHE, github, package_at
+from reference_source import published
 
 FIXTURES = Path(__file__).resolve().parents[1] / "tests" / "fixtures"
 RECORDED = FIXTURES / "weighting" / "recorded_weights.npz"
@@ -98,8 +98,8 @@ def guided_diffusion(name: str):
     """The repo's own gaussian_diffusion module, imported from its files."""
     repo, commit = REPOS[name]
     files = ("gaussian_diffusion.py", "nn.py", "losses.py")
-    gaussian_diffusion, *_ = package_at(f"guided_diffusion_{name}", {
-        file: github(repo, commit, f"guided_diffusion/{file}") for file in files}, CACHE / repo / commit)
+    gaussian_diffusion, *_ = published(f"guided_diffusion_{name}", repo, commit, files,
+                                       within="guided_diffusion")
     return gaussian_diffusion
 
 

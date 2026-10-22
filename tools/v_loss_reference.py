@@ -28,7 +28,7 @@ from pathlib import Path
 import jax
 import jax.numpy as jnp
 import numpy as np
-from reference_source import CACHE, github, package_at
+import reference_source
 
 jax.config.update("jax_enable_x64", val=True)
 
@@ -40,9 +40,8 @@ SHAPE = (6, 4, 4, 3)
 
 def published() -> object:
     """diffusion_distillation's dpm module, from its own files at the pinned commit."""
-    dpm, _ = package_at("diffusion_distillation", {
-        name: github(REPO, COMMIT, f"diffusion_distillation/diffusion_distillation/{name}")
-        for name in ("dpm.py", "utils.py")}, CACHE / REPO / COMMIT)
+    dpm, _ = reference_source.published("diffusion_distillation", REPO, COMMIT, ("dpm.py", "utils.py"),
+                                        within="diffusion_distillation/diffusion_distillation")
     return dpm
 
 

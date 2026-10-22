@@ -152,11 +152,10 @@ def import_reference():
     from huggingface_hub import hf_hub_download
 
     sys.modules["kernel"] = importlib.import_module("tools.deepseek_v41_kernels")
+    from reference_source import module_at
+
     path = hf_hub_download(REPO, "inference/model.py", revision=DEEPSEEK_V4_0731_REVISION)
-    spec = importlib.util.spec_from_file_location("deepseek_v4_0731_model", path)
-    assert spec is not None and spec.loader is not None
-    module = importlib.util.module_from_spec(spec)
-    spec.loader.exec_module(module)
+    module = module_at("deepseek_v4_0731_model", Path(path))
     v41.set_quantizers(module, enabled=False)
     module.rotate_activation = lambda x: x
     return module

@@ -30,7 +30,7 @@ import tarfile
 import tempfile
 from pathlib import Path
 
-from reference_source import fetched, github, module_at
+from reference_source import published
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / "tests" / "fixtures" / "single_file"
@@ -95,11 +95,10 @@ def tiny_pipeline(kind: str, directory: Path, tokenizer_from: Path) -> None:
     pipe.save_pretrained(directory, safe_serialization=True)
 
 
-def _reverse_script(kind: str, scratch: Path):
-    script = scratch / SCRIPTS[kind]
-    script.write_text(fetched(github("huggingface/diffusers", "v0.34.0", f"scripts/{SCRIPTS[kind]}")))
+def _reverse_script(kind: str):
     argv, sys.argv = sys.argv, ["convert"]
-    convert = module_at("convert", script)
+    [convert] = published("diffusers_scripts", "huggingface/diffusers", "v0.34.0", [SCRIPTS[kind]],
+                          within="scripts")
     sys.argv = argv
     return convert
 
@@ -139,7 +138,7 @@ def tiny(kind: str) -> None:
         archive.extractall(scratch / "committed", filter="data")
     pipeline = scratch / kind
     tiny_pipeline(kind, pipeline, scratch / "committed" / "sd" / "tokenizer")
-    state = _original(kind, pipeline, _reverse_script(kind, scratch))
+    state = _original(kind, pipeline, _reverse_script(kind))
     out = FIXTURE / kind
     shutil.rmtree(out, ignore_errors=True)
     shutil.copytree(pipeline, out / "configs", ignore=shutil.ignore_patterns("*.safetensors"))

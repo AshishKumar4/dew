@@ -27,7 +27,7 @@ from pathlib import Path
 import numpy as np
 import torch
 from beta_schedule_reference import SOURCES
-from reference_source import CACHE, github, package_at
+import reference_source
 
 ROOT = Path(__file__).resolve().parents[1]
 REPO, COMMIT, GAUSSIAN_DIFFUSION = SOURCES["diffusion_lm"]
@@ -37,9 +37,9 @@ SHAPE = (6, 3, 4, 4)
 
 def published():
     """Diffusion-LM's gaussian_diffusion module, from its own files at the pinned commit."""
-    gaussian_diffusion, *_ = package_at("improved_diffusion", {
-        name: github(REPO, COMMIT, f"{Path(GAUSSIAN_DIFFUSION).parent}/{name}")
-        for name in ("gaussian_diffusion.py", "nn.py", "losses.py")}, CACHE / REPO / COMMIT)
+    gaussian_diffusion, *_ = reference_source.published(
+        "improved_diffusion", REPO, COMMIT, ("gaussian_diffusion.py", "nn.py", "losses.py"),
+        within=str(Path(GAUSSIAN_DIFFUSION).parent))
     return gaussian_diffusion
 
 

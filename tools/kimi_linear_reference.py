@@ -2,7 +2,7 @@
 
 The model is `KimiLinearForCausalLM` from moonshotai/Kimi-Linear-48B-A3B-Instruct
 at REVISION: configuration_kimi.py and modeling_kimi.py, fetched at that
-revision into CACHE. Its KDA layers call fla-core's Triton kernels, whose
+revision (reference_source.published). Its KDA layers call fla-core's Triton kernels, whose
 0.4.0 `fused_kda_gate` signature the release calls (0.5 changed it), so this
 runs on a CUDA device, in fp32, with TRITON_F32_DEFAULT=ieee for every dot
 that leaves its precision unset.
@@ -65,7 +65,7 @@ from kimi_k3_reference import (
     scatter,
     sgd_step,
 )
-from reference_source import hub, package_at
+from reference_source import published
 from safetensors.torch import save_file
 
 REPO = "moonshotai/Kimi-Linear-48B-A3B-Instruct"
@@ -162,8 +162,7 @@ def released_modules():
     documented = transformers.utils.auto_docstring
     transformers.utils.auto_docstring = lambda obj=None, **kwargs: obj if obj is not None else (lambda inner: inner)
     try:
-        configuration, modeling = package_at(
-            "kimi_linear_remote", {name: hub(REPO, REVISION, name) for name in REMOTE}, CACHE)
+        configuration, modeling = published("kimi_linear_remote", REPO, REVISION, REMOTE, host="hub")
     finally:
         transformers.utils.auto_docstring = documented
     from fla.ops.kda import wy_fast

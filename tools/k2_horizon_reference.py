@@ -21,7 +21,7 @@ import torch
 from diffusers_wan_reference import float64
 from huggingface_hub import hf_hub_download
 
-from reference_source import hub_package, left_padded
+from reference_source import left_padded, published
 
 from dew.interop.verify import probe_ids, scatter_weights
 
@@ -33,8 +33,8 @@ FIXTURES = Path(__file__).resolve().parents[1] / 'tests' / 'fixtures' / 'hf'
 
 def remote():
     """K2 Horizon's modeling module, imported from the pinned remote code as a package."""
-    return hub_package(REPO, REVISION, 'k2_horizon_remote',
-                       ('configuration_k2_horizon.py', 'modeling_k2_horizon.py'))[-1]
+    files = ('configuration_k2_horizon.py', 'modeling_k2_horizon.py')
+    return published('k2_horizon_remote', REPO, REVISION, files, host='hub')[-1]
 
 
 def logits(model, ids, mask=None, positions=None):

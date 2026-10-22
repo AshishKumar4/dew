@@ -2,7 +2,7 @@
 
 The model is `KimiK3ForConditionalGeneration` from moonshotai/Kimi-K3 at
 REVISION: configuration_kimi_k3.py, modeling_kimi_k3.py and
-modeling_kimi_linear.py, fetched at that revision into CACHE. Their KDA
+modeling_kimi_linear.py, fetched at that revision (reference_source.published). Their KDA
 layers call fla-core's Triton kernels (chunk_kda, fused_recurrent_kda,
 ShortConvolution, FusedRMSNormGated), so this runs on a CUDA device, in fp32,
 with TRITON_F32_DEFAULT=ieee for every dot that leaves its precision unset
@@ -51,7 +51,7 @@ from pathlib import Path
 
 import numpy as np
 import torch
-from reference_source import hub, package_at
+from reference_source import published
 from safetensors.torch import save_file
 
 REPO = "moonshotai/Kimi-K3"
@@ -160,8 +160,7 @@ def released_modules():
     os.environ["TRITON_CACHE_DIR"] = str(CACHE / "triton-ieee")
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
-    configuration, modeling, linear = package_at(
-        "kimi_k3_remote", {name: hub(REPO, REVISION, name) for name in REMOTE}, CACHE)
+    configuration, modeling, linear = published("kimi_k3_remote", REPO, REVISION, REMOTE, host="hub")
     from fla.ops.kda import chunk_intra
     from triton.language import constexpr
 

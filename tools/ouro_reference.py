@@ -28,7 +28,7 @@ import torch
 from diffusers_wan_reference import float64
 from huggingface_hub import hf_hub_download
 
-from reference_source import hub_package, left_padded
+from reference_source import left_padded, published
 
 from dew.interop.verify import probe_ids, scatter_weights
 
@@ -39,7 +39,8 @@ COLUMNS = np.random.RandomState(11).choice(49152, 64, replace=False)
 
 def remote():
     """Ouro's modeling module, imported from the pinned remote code as a package."""
-    return hub_package(REPO, REVISION, 'ouro_remote', ('configuration_ouro.py', 'modeling_ouro.py'))[-1]
+    files = ('configuration_ouro.py', 'modeling_ouro.py')
+    return published('ouro_remote', REPO, REVISION, files, host='hub')[-1]
 
 
 def last_pass(model):
