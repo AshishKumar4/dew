@@ -115,7 +115,7 @@
   },
   "tests/test_dataset_chain.py": {
    "comparisons": 1,
-   "lane": "Training"
+   "lane": "Data"
   },
   "tests/test_dc_ae.py": {
    "comparisons": 4,
@@ -390,7 +390,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_kda.py": {
-   "comparisons": 11,
+   "comparisons": 1,
    "lane": "Models, Serving & RL"
   },
   "tests/test_kernels.py": {
