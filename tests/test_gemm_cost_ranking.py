@@ -1,7 +1,8 @@
 """The grouped launches' cost model against every tile measured on an A100, an A10, an L4 and an H100
 (tests/fixtures/gemm_sweeps: bench_gmm_template.py over seven MoE shapes, each product): the config it
-picks runs within 10% of the measured best, in every case but those whose missing term `MISSES` names,
-which the test does not hold the model to."""
+picks runs within 10% of the measured best, or the case is a known miss whose missing term `MISSES`
+names, each tracked by ledger row 1336. A miss the model comes to rank fails too, so the table only
+shrinks and hides no regression."""
 
 import json
 from pathlib import Path
@@ -22,14 +23,14 @@ SHAPES = {"qwen3-30b-a3b gate_up": (65536, 2048, 1536, 128), "qwen3-30b-a3b down
           "mixtral down": (8192, 14336, 4096, 8)}
 """Rows (tokens x top-k), width in, width out and experts of each swept shape."""
 
-LOADED_LATENCY = "the load latency under load, the waiting term's being unloaded (no measurement gives it)"
-TRANSPOSED_READS = "the kernel gradient's transposed-operand shared-memory reads, which cost 8 warps more"
-L2_REUSE = "the L2's reuse of a few experts' weights, which the device-byte term counts as rereads"
-ACCUMULATOR_REGISTERS = "a warpgroup's accumulator registers at 192 columns, which the model does not charge"
+LOADED_LATENCY = "the load latency under load, the waiting term's being unloaded (row 1336)"
+TRANSPOSED_READS = "the kernel gradient's transposed-operand shared-memory reads at 8 warps (row 1336)"
+L2_REUSE = "the L2's reuse of the operands, which the device-byte term counts as rereads (row 1336)"
+ACCUMULATOR_REGISTERS = "a warpgroup's accumulator registers at 192 columns, uncharged (row 1336)"
 CONSUMER_OVERLAP = ("two consumer warpgroups overlapping each other's MMA issue and epilogue, which the "
-                    "model's one warpgroup's latency term does not credit")
+                    "model's one warpgroup's latency term does not credit (row 1336)")
 BOUND_TIES = ("a tie at the memory bound, which the next wave's loads overlapping this wave's products "
-              "would break, and the model breaks by the space's order")
+              "would break, and the model breaks by the space's order (row 1336)")
 MISSES = {
     ("sm80", "triton", "qwen3-30b-a3b gate_up", "kernel_gradient"): TRANSPOSED_READS,
     ("sm80", "triton", "kimi-linear gate_up", "kernel_gradient"): TRANSPOSED_READS,
@@ -100,24 +101,26 @@ def _config(text: str):
 
 
 def _cases():
-    """Each swept case the model is held to: every one `MISSES` does not name."""
     for generation_name in ("sm80", "sm86", "sm89", "sm90"):
         for record in json.loads((SWEEPS / f"{generation_name}.json").read_text())["records"]:
-            if (generation_name, record["implementation"], record["shape"], record["product"]) in MISSES:
-                continue
             name = f"{generation_name}-{record['implementation']}-{record['shape']}-{record['product']}"
             yield pytest.param(generation_name, record, id=name)
 
 
 @pytest.mark.parametrize("generation_name,record", list(_cases()))
-def test_the_cost_model_picks_within_10_percent_of_the_measured_best(generation_name: str, record: dict):
+def test_the_cost_model_picks_within_10_percent_of_the_measured_best_or_names_its_miss(generation_name: str,
+                                                                                      record: dict):
     """The measured time of the config the launch runs (its heuristic, the cost model's choice among
     every fitting config) over the fastest swept config's: the pick was swept, and runs at most 1.10
-    times the best."""
+    times the best, or the case is in `MISSES` and still past it."""
     launch, args, options = _launch(record)
     configs = {_config(text): ms for text, ms in record["times"].items()}
     with generation.assumed(generation_name):
         pick = launch.bind(*args, **options, interpret=False).heuristics_config
     assert pick in configs, f"the sweep did not time the pick {pick}"
     ratio = configs[pick] / min(configs.values())
-    assert ratio <= 1.10, f"{pick} runs {ratio:.2f}x the best"
+    miss = MISSES.get((generation_name, record["implementation"], record["shape"], record["product"]))
+    if miss is None:
+        assert ratio <= 1.10, f"{pick} runs {ratio:.2f}x the best"
+    else:
+        assert ratio > 1.10, f"ranked within 10% now ({ratio:.2f}x): drop the miss for {miss}"
