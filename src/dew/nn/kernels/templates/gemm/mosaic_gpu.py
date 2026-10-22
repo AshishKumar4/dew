@@ -437,7 +437,8 @@ def _gmm_streamed(lhs, rhs, lengths, shape: tuple, *, tiles: Tiles, transpose_rh
 
             def consumer(wg):
                 @plgpu.nd_loop((grid[0] * grid[1],), collective_axes="cluster_grid", init_carry=jnp.int32(0))
-                def _(loop: plgpu.NDLoopInfo, counter):
+                def _(loop: plgpu.NDLoopInfo, carry):
+                    counter = carry  # the ring's turn: the steps the tiles before took
                     info, ni, active = tile(loop.index[0])
                     column = ni * block_n + wg * half
 
