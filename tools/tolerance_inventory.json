@@ -394,7 +394,7 @@
    "lane": "Models, Serving & RL"
   },
   "tests/test_kda.py": {
-   "comparisons": 11,
+   "comparisons": 1,
    "lane": "Models, Serving & RL"
   },
   "tests/test_kernels.py": {
@@ -504,10 +504,6 @@
   "tests/test_mixers.py": {
    "comparisons": 6,
    "lane": "Kernels"
-  },
-  "tests/test_mla.py": {
-   "comparisons": 14,
-   "lane": "Models, Serving & RL"
   },
   "tests/test_models.py": {
    "comparisons": 10,
