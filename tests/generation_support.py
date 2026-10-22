@@ -27,8 +27,8 @@ def runnable(name: str) -> bool:
     interprets them); a GPU Hopper's warpgroup kernels only if it is that generation (capability 9.0
     alone has the instructions), and any other generation's only if no newer than itself."""
     here = generation.device_generation()
-    if not here.startswith("sm"):
-        return here == "cpu"
+    if not here.startswith("sm") or generation.capability(name) is None:
+        return here == "cpu"  # a TPU's launches a CPU alone interprets
     if generation.gpu_target(name).wgmma:
         return name == here
     return generation.capability(name) <= generation.capability(here)
