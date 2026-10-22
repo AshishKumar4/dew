@@ -23,6 +23,7 @@ import functools
 import hashlib
 import logging
 import math
+import sys
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from typing import TYPE_CHECKING, Protocol, overload, runtime_checkable
 
@@ -69,6 +70,7 @@ from dew.data.mixing import (
     Members,
     PrimedMix,
     ProportionalSelection,
+    Proportions,
     TokenDeficit,
     primed_maps,
     rewound,
@@ -1583,9 +1585,10 @@ def _epoch_records(train: Pipeline, build: _Build) -> int | None:
     """The records in one epoch of a global order: each corpus's indexed order
     up to its first repeat, as the lowering builds it, so a slice, a limit and
     a token split count exactly; a mixture, nested or not, reads until every
-    part has come round once, its slowest at its share. A repeat written before a cache counts the
-    inputs a pass reads where the cache keeps one record for each, and none
-    otherwise, ahead of reading them; phases are counted by none."""
+    repeated part has come round once (`Proportions.covering`), or until a part
+    read once ends. A repeat written before a cache counts the inputs a pass
+    reads where the cache keeps one record for each, and none otherwise,
+    ahead of reading them; phases are counted by none."""
     if not build.global_order:
         return None
 
@@ -1597,9 +1600,14 @@ def _epoch_records(train: Pipeline, build: _Build) -> int | None:
             known = [size for size in sizes if size is not None]
             if len(known) != len(sizes):
                 return None
-            weights = _weights(source)
-            shares = zip(known, weights, strict=True)
-            return max(math.ceil(size * sum(weights) / weight) for size, weight in shares)
+            # The mix reads by `Proportions` (`ProportionalSelection`): repeated corpora until every
+            # one has come round once; where one is read once, until the mix stops at its end.
+            repeats = [any(isinstance(stage, Repeat) for stage in child.stages) for child in source.pipelines]
+            if all(repeats):
+                return Proportions.of(_weights(source)).covering(known)
+            lengths = [sys.maxsize if repeated else size
+                       for size, repeated in zip(known, repeats, strict=True)]
+            return len(ProportionalSelection(lengths, _weights(source)))
         at = _until(pipeline.stages, (Repeat,))
         cache = build.lowering.cache
         if cache is not None and cache >= at:

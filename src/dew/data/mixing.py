@@ -338,6 +338,21 @@ class Proportions:
             left, remaining = rest, remaining - proportion
         return tuple(counts)
 
+    def covering(self, sizes: Sequence[int]) -> int:
+        """The fewest positions of the mix in which every corpus reads `sizes` of its records, its
+        size: the pass in which each repeated corpus has come round once."""
+        def covers(positions: int) -> bool:
+            return all(count >= size for count, size in zip(self.counts(positions), sizes, strict=True))
+
+        high = 1
+        while not covers(high):
+            high *= 2
+        low = high // 2
+        while low < high:
+            middle = (low + high) // 2
+            low, high = (middle + 1, high) if not covers(middle) else (low, middle)
+        return low
+
     def at(self, position: int) -> tuple[int, int]:
         """The corpus position `position` of the mix reads, the one whose count grows with it, and
         which of that corpus's records: the next it hasn't read."""
