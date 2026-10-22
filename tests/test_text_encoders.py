@@ -61,7 +61,7 @@ def image_processor(directory_or_repo):
 
 SEEDS = {'tiny text tower': 8, 'tiny encode': 8, 'tiny text projection': 8, 'tiny image embeddings': 8,
          'quick_gelu image embeddings': 8, 'gelu image embeddings': 8,
-         'gelu_pytorch_tanh image embeddings': 8, 'real text tower': 8, 'real embeddings': 8,
+         'gelu_pytorch_tanh image embeddings': 8, 'real text tower': 16, 'real embeddings': 8,
          'T5 bfloat16 hidden states': 8, 'image transform': 8}
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada)."""
 WORDS = ("a", "red", "bird", "two", "cats", "on", "mat", "painted", "x", "blue", "sky", "of", "the", "dog")
