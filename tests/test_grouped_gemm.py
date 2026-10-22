@@ -113,10 +113,9 @@ def test_the_kernel_gradient_keeps_a_neighbours_non_finite_rows_out():
 
 
 def test_the_portable_branch_writes_each_gradient_from_the_rounded_operands():
-    """The template's portable branch (a CPU's, uninterpreted) differentiates the operands as the
-    projection rounded them: an fp16 master's largest value rounds to bf16's 65536, which fp16 does not
-    hold, and the input gradient through it is finite, each gradient rounded once to its operand's
-    dtype."""
+    """The projection's XLA route (a CPU's, which runs no kernel) differentiates the operands as it rounded
+    them: an fp16 master's largest value rounds to bf16's 65536, which fp16 does not hold, and the input
+    gradient through it is finite, each gradient rounded once to its operand's dtype."""
     x = jnp.ones((1, 1), jnp.float32)
     kernel = jnp.full((1, 1, 1), 65504, jnp.float16)
     _, pullback = jax.vjp(lambda x, kernel: expert_projection(
