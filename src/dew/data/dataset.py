@@ -545,20 +545,30 @@ class Ramp:
         stages.append(Stage(batch=final, records=records))
         return _update_aligned(tuple(stages), window)
 
-    def steps_for(self, records: int, final: int, window: int = 1) -> int:
+    def steps_for(self, records: int, final: int, window: int = 1, tail: Tail = "dropped") -> int:
         """Return the number of steps a run of updates of `window` steps takes to read `records`
-        records under this ramp.
+        records under this ramp, a last step that holds fewer than a batch counted where it is read
+        (`tail`).
 
         Early steps read fewer records, so a pass over a corpus takes more
         steps than it would with the final batch from the start.
         """
+        def whole(count: int, batch: int) -> int:
+            return -(-count // batch) if tail == "read" else count // batch
+
         stages = self.stages(final, window)
         steps = 0
         for stage, next_stage in itertools.pairwise(stages):
             if records < next_stage.records:
-                return steps + (records - stage.records) // stage.batch
+                return steps + whole(records - stage.records, stage.batch)
             steps += (next_stage.records - stage.records) // stage.batch
-        return steps + max(records - stages[-1].records, 0) // final
+        return steps + whole(max(records - stages[-1].records, 0), final)
+
+
+type Tail = Literal["dropped", "read"]
+"""What becomes of the records an epoch leaves short of a whole batch (`Loader.tail`): `read`, where
+an order that reads on carries them into the next epoch's first batch or one that keeps its last
+short batch fills it; `dropped`, where a training order that ends drops them."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -616,14 +626,20 @@ class Loader:
     device: tuple[DeviceStep, ...] = ()
     """The training batch's steps the compiled training step runs, on the
     accelerator, after the reader delivers it (`DeviceStep`)."""
+    tail: Tail = "dropped"
+    """What becomes of the records an epoch leaves short of a whole batch: read, carried into the
+    next epoch by an order that reads on or kept and filled by one that keeps them, so an epoch's
+    steps count their batch; or dropped, so they count none (`Tail`)."""
 
     @property
     def steps_per_epoch(self) -> int | None:
-        if self.records is None:
-            return None
+        return None if self.records is None else self._steps(self.records)
+
+    def _steps(self, records: int, window: int = 1) -> int:
+        """The steps that read `records` records, a last short batch counted where it is read."""
         if self.ramp is None:
-            return self.records // self.batch
-        return self.ramp.steps_for(self.records, self.batch)
+            return -(-records // self.batch) if self.tail == "read" else records // self.batch
+        return self.ramp.steps_for(records, self.batch, window, self.tail)
 
     def epoch_steps(self, epochs: int = 1, window: int = 1) -> int:
         """Return the number of steps that `epochs` passes over the records take, in updates of
@@ -640,8 +656,7 @@ class Loader:
                 "without one, so give the run length in steps"
             )
         records = epochs * self.records
-        steps = (records // self.batch if self.ramp is None
-                 else self.ramp.steps_for(records, self.batch, window))
+        steps = self._steps(records, window)
         if steps == 0:
             raise ValueError(f"{records} records do not fill one batch of {self.batch}, so {epochs} epochs "
                              "are no steps at all: read more data, lower the batch, or count the run in "
