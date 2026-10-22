@@ -313,9 +313,10 @@ def assert_interpreted_parity(operands, seeded, chunk_size: int, *, roundings: i
     """The interpreted kernel's forward and all five gradients finite and by the per-leaf float64 rule
     (`assert_leaves_as_exact`) against the stepwise recurrence in float64, the XLA path's fp32 run the
     reference, the XLA path's arithmetic in float64 first held to the recurrence. This is the rule the
-    host cases held before check 1: there they read the host's dot lowering, which moves check 1's ratio
-    across its factor by the host's ISA (one-short's state gradient 1.598 on x86-64-v4, 0.77 on v3), a
-    finding open against the interpreted kernel; the compiled TPU cases hold check 1."""
+    host cases held before check 1: there the scan's dots reached XLA:CPU's dot fusions, dispatched by
+    the host's ISA, and the interpreter's did not, which moved check 1's ratio across its factor by the
+    host (one-short's state gradient 1.598 on x86-64-v4, 0.77 on v3); both arms now compile with
+    `equal_dots` (ledger row 1349). The compiled TPU cases hold check 1."""
     def xla(*operands):
         return xla_chunk_scan(*operands, chunk_size)
 
@@ -334,8 +335,9 @@ def assert_interpreted_parity(operands, seeded, chunk_size: int, *, roundings: i
         twin, terms = float64_terms(twin_and_gradients, *exact)
         truth = [np.asarray(t) for t in (*truth, *truth_gradients)]
         twin, terms = ([np.asarray(t) for t in values] for values in (twin, terms))
-    theirs = (*jax.jit(xla)(*operands), *jax.jit(lambda *o: jax.vjp(xla, *o)[1](seeded))(*operands))
-    mine = (*jax.jit(kernel)(*operands), *jax.jit(lambda *o: jax.vjp(kernel, *o)[1](seeded))(*operands))
+    # The kernel against XLA's scan, two Dew paths: their dots on the same code (`equal_dots`).
+    theirs = (*equal_dots(xla)(*operands), *equal_dots(lambda *o: jax.vjp(xla, *o)[1](seeded))(*operands))
+    mine = (*equal_dots(kernel)(*operands), *equal_dots(lambda *o: jax.vjp(kernel, *o)[1](seeded))(*operands))
     reductions = chunk_size * max(operands[0].shape[-1], operands[1].shape[-1])
     names = ("output", "final", "x", "B", "C", "A dt", "state")
     for name, ours, xlas, wide, want, summed in zip(names, mine, theirs, twin, truth, terms, strict=True):
