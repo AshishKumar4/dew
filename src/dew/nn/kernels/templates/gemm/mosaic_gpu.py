@@ -621,7 +621,7 @@ def _tgmm_cooperative(operands: tuple, groups: tuple, shape: tuple, *, tiles: Ti
                 @plgpu.nd_loop((g, grid[0] * grid[1]), collective_axes="cluster_grid",
                                init_carry=jnp.int32(0))
                 def loaded(loop: plgpu.NDLoopInfo, carry):
-                    _, depth, columns, first, steps = tile(loop)
+                    depth, columns, first, steps = tile(loop)[1:]
 
                     @pl.loop(0, steps)
                     def _(step):
@@ -645,24 +645,7 @@ def _tgmm_cooperative(operands: tuple, groups: tuple, shape: tuple, *, tiles: Ti
                     mine = pl.ds(columns.start + wg * half, half)
                     plgpu.copy_smem_to_gmem(o_smem.at[wg], o_gmem.at[g_i, depth, mine])
 
-                def staged(counter, step, start, end, steps):
-                    """The step's stages, this warpgroup's halves prepared and the other's awaited: the
-                    rows' (whole) and this warpgroup's columns of the cotangent's."""
-                    rows_stage, cotangent_stage, *side_stages = (ring.acquire(counter) for ring in streams)
-                    if prologue is not None:
-                        tiles_of = dict(zip(stepped, side_stages, strict=True)) | dict(
-                            zip(fixed, fixed_refs, strict=True))
-                        _rewritten(prologue, prologue_axes, rows_stage.at[:, mine_depth], tiles_of, 'depth',
-                                   mine_depth)
-                    boundary = _zero_neighbours_of(
-                        (rows_stage.at[:, mine_depth], cotangent_stage.at[:, mine_columns]), step, start, end,
-                        steps, block_k)
-                    plgpu.commit_smem()
-                    if prologue is not None:
-                        hopper.meet(halves)
-                    else:
-                        pl.when(boundary)(lambda: hopper.meet(halves))
-                    return rows_stage.transpose((1, 0)), cotangent_stage.at[:, mine_columns]
+                hook = None if prologue is None else (prologue, prologue_axes, stepped, fixed, fixed_refs)
 
                 def release(counter):
                     for ring in streams:
@@ -675,9 +658,12 @@ def _tgmm_cooperative(operands: tuple, groups: tuple, shape: tuple, *, tiles: Ti
                     start, end = starts_gmem[g_i], ends_gmem[g_i]
                     fixed_views = [side_gmems[i].at[tuple(depth for _ in prologue_axes[i])] for i in fixed]
                     hopper.load_fixed(fixed_views, fixed_refs, fixed_barriers, wg)
-                    _streamed_gradient(lambda counter, step: staged(counter, step, start, end, steps),
-                                       release, steps, carry, (block_m, half), exact_sums,
-                                       lambda acc: store(acc, g_i, depth, columns))
+                    _streamed_gradient(
+                        lambda counter, step: _staged_halves(
+                            [ring.acquire(counter) for ring in streams], (step, start, end, steps, block_k),
+                            (mine_depth, mine_columns), hook, halves),
+                        release, steps, carry, (block_m, half), exact_sums,
+                        lambda acc: store(acc, g_i, depth, columns))
                     return carry + steps
 
                 plgpu.wait_smem_to_gmem(0, wait_read_only=True)
@@ -688,6 +674,28 @@ def _tgmm_cooperative(operands: tuple, groups: tuple, shape: tuple, *, tiles: Ti
                                 multiprocessors=multiprocessors, interpret=interpret)
     return kernel(*groups, lhs, rhs, *prologue_operands)
 
+
+def _staged_halves(stages: list, group: tuple, mine: tuple, hook, halves) -> tuple:
+    """Dew: a streamed kernel gradient step's operands for one consumer warpgroup, from its `stages` (the
+    rows', the cotangent's, then each side operand's with rows): this warpgroup's depth half of the rows
+    rewritten by the prologue (`hook`: it, its operands' axes, which are stepped and which fixed, and the
+    fixed ones' tiles), the neighbouring groups' rows zeroed in its halves (`group`: the step, the group's
+    first and last row, its steps, the rows a step takes; `mine`: its depth and column halves), and the
+    other's halves awaited at `halves` where it rewrote any: the rows (whole) and its cotangent columns."""
+    rows_stage, cotangent_stage, *side_stages = stages
+    mine_depth, mine_columns = mine
+    if hook is not None:
+        prologue, axes_of, stepped, fixed, fixed_refs = hook
+        tiles_of = dict(zip(stepped, side_stages, strict=True)) | dict(zip(fixed, fixed_refs, strict=True))
+        _rewritten(prologue, axes_of, rows_stage.at[:, mine_depth], tiles_of, 'depth', mine_depth)
+    halves_of = (rows_stage.at[:, mine_depth], cotangent_stage.at[:, mine_columns])
+    boundary = _zero_neighbours_of(halves_of, *group)
+    plgpu.commit_smem()
+    if hook is not None:
+        hopper.meet(halves)
+    else:
+        pl.when(boundary)(lambda: hopper.meet(halves))
+    return rows_stage.transpose((1, 0)), cotangent_stage.at[:, mine_columns]
 
 def _streamed_gradient(staged, release, steps, first, shape: tuple, exact_sums: bool, store) -> None:
     """Dew: a streamed kernel gradient tile's `steps` steps (`staged(counter, step)` their operands at the
