@@ -199,6 +199,7 @@ def dew_points(args):
     from dew.inference.serving import Server
     from dew.nn.kv_cache import KVCache
     from dew.sampling import Sampling
+    from dew.telemetry.benchmark import Compiles
     from dew.training import MeshSpec
 
     began = time.perf_counter()
@@ -235,7 +236,8 @@ def dew_points(args):
         for rows in sorted({min(server.admission, 1 << bit) for bit in range(server.admission.bit_length())}):
             dew_run(server, warm[:rows], args.output)
         print(f"slots {slots}: warm in {time.perf_counter() - began:.2f}s", flush=True)
-        compiled = server._step._cache_size()
+        # The server's step programs, whichever it runs (`dew.inference.serving_kernel._stepped`).
+        compiles = Compiles("_stepped").__enter__()
         repeats = []
         for repeat in range(args.repeats):
             measured, generations = dew_run(server, prompts, args.output)
@@ -247,7 +249,8 @@ def dew_points(args):
                          behavior=np.concatenate([row.behavior_log_probs for row in generations]))
         point = {"slots": slots, "admission": server.admission, "repeats": repeats,
                  "prompt_sha256": hashlib.sha256(prompts.tobytes()).hexdigest(),
-                 "measured_recompiles": server._step._cache_size() - compiled}
+                 "measured_recompiles": compiles.count}
+        compiles.__exit__()
         if args.rate:
             opened = prompts_for(slots, args.requests or 6 * slots, args.prompt, args.vocab_limit)
             point["open_loop"] = [dew_open(server, opened, args.output, rate) for rate in args.rate]
