@@ -59,6 +59,25 @@ class ObjectRef(ObjectInfo):
     path: str
 
 
+def object_info(payload: bytes | io.BufferedReader) -> ObjectInfo:
+    """The size and SHA-256 of `payload`, bytes, or a file read from its start in bounded chunks."""
+    if isinstance(payload, bytes):
+        return {"bytes": len(payload), "sha256": hashlib.sha256(payload).hexdigest()}
+    payload.seek(0)
+    digest = hashlib.file_digest(payload, "sha256")
+    size = payload.tell()
+    payload.seek(0)
+    return {"bytes": size, "sha256": digest.hexdigest()}
+
+
+def matching(found: ObjectInfo, expected: Mapping[str, object], url: str) -> None:
+    """Refuse an object at `url` whose size and digest, `found`, are not what was committed for it."""
+    if found["bytes"] != expected["bytes"] or found["sha256"] != expected["sha256"]:
+        raise OSError(f"committed object is corrupt: {url}; bytes={found['bytes']}, "
+                      f"sha256={found['sha256']}, expected bytes={expected['bytes']}, "
+                      f"sha256={expected['sha256']}")
+
+
 class TransportStats(TypedDict):
     hits: int
     misses: int
@@ -496,12 +515,17 @@ class Store:
         write_atomically(path, payload)
 
     def verified(self, payload: bytes) -> ObjectInfo:
+        """Write `payload` here where nothing is, and read it back as written."""
         self.put_if_absent(payload)
-        found = self.read()
-        digest = hashlib.sha256(payload).hexdigest()
-        if len(found) != len(payload) or hashlib.sha256(found).hexdigest() != digest:
-            raise OSError(f"uploaded object did not verify: {self.url}")
-        return {"bytes": len(payload), "sha256": digest}
+        written = object_info(payload)
+        matching(object_info(self.read()), written, self.url)
+        return written
+
+    def checked(self, committed: Mapping[str, object]) -> bytes:
+        """This object's bytes, refused unless they are the size and digest `committed` states."""
+        payload = self.read()
+        matching(object_info(payload), committed, self.url)
+        return payload
 
     @property
     def remote(self) -> bool:
