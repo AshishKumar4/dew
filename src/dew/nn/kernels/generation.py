@@ -248,7 +248,7 @@ TARGETS = {target.generation: target for target in (
     GpuTarget('v2', 'TPU v2', dense_peaks={'TPU v2': {'bf16': 22.5e12}}),
     GpuTarget('v3', 'TPU v3', dense_peaks={'TPU v3': {'bf16': 61.5e12}}),
     GpuTarget('v4', 'TPU v4', dense_peaks={'TPU v4': {'bf16': 275e12}}),
-    # Its scoped VMEM limit read from a Mosaic kernel's refusal on a v5e ("limit 16.00M", 2026-10-21). One
+    # Its scoped VMEM limit read from a Mosaic kernel's refusal on a v5e ("limit 16.00M"). One
     # TensorCore a chip, of four 128 x 128 MXUs, each 16K multiply-adds a cycle, and 800 GiB/s of HBM
     # (cloud.google.com/tpu/docs/v5e, /tpu/docs/system-architecture-tpu-vm); the clock is 197e12 / 131072,
     # derived from the peak, no stated clock.
