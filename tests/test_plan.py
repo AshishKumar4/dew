@@ -12,11 +12,13 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
+from token_support import write_token_corpus
 
 from dew import cache
 from dew.checkpoints import Checkpoints
-from dew.config.data import TextData, loader
-from dew.data import Loading
+from dew.data import Loading, presets
+from dew.data.compile import compile
+from dew.data.sources.tokens import TokenFiles
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_block import REMAT_POLICIES
 from dew.nn.sharding import LayoutRefused
@@ -337,16 +339,20 @@ def raw(leaf):
 
 
 def token_files(directory):
-    """Token files written once, so a resume reads the files its checkpoint names."""
+    """A token corpus written once, so a resume reads the files its checkpoint names: the same
+    tokens to train and to validate on."""
     tokens = (np.arange(97, dtype=np.uint16) * 7) % 32
-    tokens.tofile(directory / "train.bin")
-    tokens.tofile(directory / "val.bin")
-    return directory
+    return write_token_corpus(directory / "tokens", tokens, tokens, vocab_size=32)
 
 
 def windows(corpus):
-    return loader(TextData(source=str(corpus), seq_len=4, stride=1), batch=8, read="memory", seed=7,
-                  loading=Loading(workers=0, threads=1, read_buffer=1), validation_records=4 * 8)
+    """Windows of four tokens a token apart in a run's order, in batches of eight, validating on the
+    first 32 windows a window apart."""
+    train = TokenFiles(corpus.train).shuffle(7).repeat().pipe(presets.token_windows, seq_len=4, stride=1,
+                                                               batch=8)
+    held = TokenFiles(corpus.val).pipe(presets.token_windows, seq_len=4, batch=8, records=32)
+    return compile(train, validation=held, read="memory", seed=7,
+                   loading=Loading(workers=0, threads=1, read_buffer=1))
 
 
 def windowed(directory, split):

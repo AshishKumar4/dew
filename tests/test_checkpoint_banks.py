@@ -8,8 +8,7 @@ import optax
 from steady_state import steady_state
 
 from dew.checkpoints import Checkpoints
-from dew.config.data import RecordsData, loader
-from dew.data import Loading
+from dew.data import Loading, Memory
 from dew.inference.banks import CheckpointBanks, spread
 from dew.lora import LoRA
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -34,8 +33,8 @@ def trained(directory, objective, layout):
     checkpoints = Checkpoints(str(directory))
     trainer = Trainer(objective, optax.adam(.01), key=jax.random.key(5), layout=layout,
                       checkpoints=checkpoints)
-    data = loader(RecordsData(source=ROWS), batch=jax.device_count(), loading=Loading(workers=0),
-                  read="memory")
+    data = Memory(ROWS).shuffle().repeat().batch(jax.device_count()).read("memory").loading(
+        Loading(workers=0))
     state = trainer.fit(data, steps=1, checkpoint_every=1, log_every=100)
     checkpoints.wait()
     return state

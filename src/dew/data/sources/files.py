@@ -121,6 +121,19 @@ def _native_gcs(fs: GCSFileSystem) -> bool:
             and fs.requests_timeout is None and fs.timeout is None)
 
 
+def export_content(committed: Mapping[str, object]) -> Mapping[str, object]:
+    """A committed export's manifest without where its writer put each file: a writer names its
+    shards by a nonce of its own (`dew.data.sinks.export`), so two exports of the same rows hold the
+    same content under other names, which the manifest's order, sizes and hashes say alike."""
+    files = committed.get("files")
+    if not isinstance(files, list):
+        raise ValueError("export manifest files must be a list")
+    unplaced = [{name: ({key: fact for key, fact in value.items() if key != "path"}
+                        if isinstance(value, Mapping) else value)
+                 for name, value in entry.items() if name != "path"} for entry in files]
+    return {**committed, "files": unplaced}
+
+
 def _mount_root(paths: Sequence[str]) -> str:
     """The directory local `paths` share, a single file's own directory."""
     if not paths:
@@ -164,6 +177,10 @@ class Files(Dataset):
     CSV is parsed by Python's `csv` module under the process's field size
     limit, 128 KiB a field by default; a source with longer fields reads
     once its caller raises `csv.field_size_limit`.
+
+    `suffixes` keeps the files whose names end in one of them, any case, with
+    or without the dot, as the store lists them when it is read: a directory's
+    media, not the lists and notes beside it (`dew.data.video.media`).
     """
 
     url: str | tuple[str, ...]
@@ -176,6 +193,7 @@ class Files(Dataset):
     storage_options: Mapping[str, object] | None = field(default=None, repr=False)
     spark: bool = False
     file_info: Mapping[str, Mapping[str, object]] | None = None
+    suffixes: tuple[str, ...] | None = None
 
     @cached_property
     def declared(self) -> Mapping[str, Mapping[str, object]]:
@@ -225,6 +243,22 @@ class Files(Dataset):
 
     @cached_property
     def paths(self) -> tuple[str, ...]:
+        kept = self._kept(self._listed)
+        if not kept:
+            raise FileNotFoundError(f"source {self.url!r} matched no {self.kind} files")
+        return kept
+
+    def _kept(self, paths: Sequence[str]) -> tuple[str, ...]:
+        """`paths` whose names end in one of `suffixes`, all of them where it names none."""
+        if self.suffixes is None:
+            return tuple(paths)
+        wanted = {"." + suffix.lower().removeprefix(".") for suffix in self.suffixes}
+        return tuple(path for path in paths if PurePosixPath(path).suffix.lower() in wanted)
+
+    @cached_property
+    def _listed(self) -> tuple[str, ...]:
+        """The files the store names, the published facts' or a committed manifest's, else those its
+        URL lists, none where it lists none."""
         if self.file_info is not None:
             urls = (self.url,) if isinstance(self.url, str) else self.url
             missing = [url for url in urls if url not in self.file_info]
@@ -257,8 +291,6 @@ class Files(Dataset):
             else:
                 names = [path]
             found.extend(fs.unstrip_protocol(name) for name in names if fs.isfile(name))
-        if not found:
-            raise FileNotFoundError(f"source {self.url!r} matched no {self.kind} files")
         return tuple(found)
 
     def label(self) -> str:
@@ -285,6 +317,9 @@ class Files(Dataset):
         # Local copies are named by their place under the files' common directory and their
         # content, so hosts that mounted one dataset at different paths name it alike.
         root = _mount_root([path for _, fs, path in resolved if local(fs)])
+        # A committed export's files are named by their place in its manifest, not the writer's names.
+        places = ({} if self.committed is None
+                  else {url: f"#{number}" for number, url in enumerate(self.paths)})
         for url, fs, path in resolved:
             if url in indexed and not self._present(url):
                 continue
@@ -310,7 +345,7 @@ class Files(Dataset):
                 version = fs.ukey(path)
             files.append(
                 (url, {
-                    "uri": posixpath.relpath(path, root) if local(fs) else url,
+                    "uri": places.get(url, posixpath.relpath(path, root)) if local(fs) else url,
                     "bytes": metadata["size"],
                     "version": version,
                 })
@@ -332,7 +367,7 @@ class Files(Dataset):
             "manifest": None
             if self.committed is None
             else hashlib.sha256(
-                json.dumps(self.committed, sort_keys=True, separators=(",", ":")).encode()
+                json.dumps(export_content(self.committed), sort_keys=True, separators=(",", ":")).encode()
             ).hexdigest(),
             "transport": Store(self.paths[0], self.storage_options).describe() if self.paths else {},
         }
@@ -642,6 +677,15 @@ class Files(Dataset):
 
     def metadata(self) -> Mapping[str, object]:
         return self._metadata
+
+    def stated(self) -> Mapping[str, object]:
+        """What its committed manifest says, or a parquet or Arrow store's schema names (class
+        names), no record read; files not here state nothing."""
+        if self.committed is not None:
+            return self._metadata
+        if self.kind in ("parquet", "arrow") and self._kept(self._listed):
+            return {"class_names": self._metadata.get("class_names", {})}
+        return {}
 
     @cached_property
     def _metadata(self) -> Mapping[str, object]:

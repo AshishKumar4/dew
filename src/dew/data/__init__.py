@@ -13,8 +13,7 @@ datasets. The stage libraries (`images`, `video`, `audio`, `text`, `chat`,
 from . import audio, chat, images, preferences, presets, prompts, text, video
 from .chat import Role
 from .dataset import Batch, Loading
-from .load import load
-from .pipeline import Dataset, Rejected, concat, mix
+from .pipeline import Dataset, Rejected, concat, mix, phases
 from .sources import (
     TFDS,
     Concatenate,
@@ -53,8 +52,8 @@ __all__ = [
     "from_iter",
     "from_torch",
     "images",
-    "load",
     "mix",
+    "phases",
     "preferences",
     "presets",
     "prompts",

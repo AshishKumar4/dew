@@ -10,9 +10,10 @@ import numpy as np
 import pytest
 from steady_state import guarded, steady_state
 
-from dew.config.data import Augment, ImageData, loader
-from dew.data import Loading, Memory
+from dew.data import Loading, Memory, images, presets
+from dew.data.compile import compile
 from dew.data.dataset import DataPartition
+from dew.data.images import EncodeCaptions
 
 TORCHVISION = np.load(Path(__file__).resolve().parent / "fixtures" / "colour_jitter" / "torchvision.npz")
 
@@ -20,13 +21,21 @@ TORCHVISION = np.load(Path(__file__).resolve().parent / "fixtures" / "colour_jit
 READ = Loading(workers=0, threads=1, read_buffer=2)
 
 
-def spec(*, backend="device", augment=True, crop_scale=(1.0, 1.0), staging_size=None, jitter=True):
-    rows = [{"image": np.random.default_rng(index).integers(
-        0, 256, (19, 23, 3), dtype=np.uint8), "label": index} for index in range(24)]
-    return ImageData(source=Memory(rows), image_size=12, caption="a flower", staging_size=staging_size,
-                  validation=None,
-                  augment=Augment(flip=True, jitter=jitter, crop_scale=crop_scale,
-                      backend=backend) if augment else None)
+ROWS = [{"image": np.random.default_rng(index).integers(0, 256, (19, 23, 3), dtype=np.uint8), "label": index}
+        for index in range(24)]
+
+
+def loaded(*, batch=4, seed=37, loading=READ, objective=None, augment=True, crop_scale=(1.0, 1.0),
+           staging_size=None, jitter=True):
+    """`ROWS` in a run's order, shuffled by `seed`, resized to 12 pixels (staged at `staging_size`
+    where given) and captioned, the caption dropped before a batch reaches the run; with `augment`,
+    cropped to `crop_scale` of their area, flipped and, with `jitter`, colour-jittered in the compiled
+    step."""
+    device = images.DeviceAugment(12, crop_scale=crop_scale, flip=True, jitter=jitter) if augment else False
+    chain = Memory(ROWS).shuffle(seed).repeat().pipe(
+        presets.images, 12, batch=batch, augment=device, staging_size=staging_size, rejects=False,
+        caption=images.caption("a flower"), host=(EncodeCaptions(),))
+    return compile(chain, read="memory", seed=seed, loading=loading, objective=objective)
 
 
 def augmented(data, batch):
@@ -43,8 +52,7 @@ def test_the_image_pipeline_benchmark_times_the_augmentation_the_loader_leaves_t
     from tool_support import load
 
     benchmark = load("benchmark_image_pipeline")
-    data = loader(spec(backend="device", crop_scale=(0.5, 0.9), staging_size=24), batch=4, read="memory",
-                  seed=37, loading=READ)
+    data = loaded(crop_scale=(0.5, 0.9), staging_size=24)
     stream = data.train(DataPartition())
     try:
         batch = next(stream)
@@ -61,8 +69,7 @@ def test_device_pipeline_reads_host_batches_the_step_augments_and_resumes_exactl
     """The reader delivers host arrays with each record's key; the device steps, which the
     compiled training step runs, make uint8 images of the output size from them, the same after
     a resume."""
-    data = loader(spec(backend="device", crop_scale=(0.5, 0.9)), batch=4, read="memory", seed=37,
-                  loading=READ)
+    data = loaded(crop_scale=(0.5, 0.9))
     assert data.device, "the augmentation runs in the compiled step"
     stream = data.train(DataPartition())
     resumed = data.train(DataPartition())
@@ -102,7 +109,7 @@ def test_the_device_steps_jitter_rows_an_explicit_mesh_axis_types():
     unplaced batch makes, within one uint8 code of a compilation's rounding."""
     from dew.training.distributed import MeshSpec, shard_batch, split_fields
 
-    data = loader(spec(crop_scale=(0.5, 0.9)), batch=8, read="memory", seed=5, loading=READ)
+    data = loaded(batch=8, seed=5, crop_scale=(0.5, 0.9))
     stream = data.train(DataPartition())
     try:
         staged, _ = split_fields(next(stream))
@@ -209,8 +216,8 @@ def test_without_augmentation_each_picture_is_its_record_resized_by_opencvs_area
     size by OpenCV's area interpolation, as `cv2.resize` makes them from the record itself."""
     import cv2
 
-    rows = {int(row["label"]): row["image"] for row in spec(augment=False).source.records("memory")}
-    stream = loader(spec(augment=False), batch=4, read="memory", seed=37, loading=READ).train(DataPartition())
+    rows = {int(row["label"]): row["image"] for row in ROWS}
+    stream = loaded(augment=False).train(DataPartition())
     try:
         batch = next(stream)
     finally:
@@ -223,8 +230,7 @@ def test_without_augmentation_each_picture_is_its_record_resized_by_opencvs_area
 def test_device_pixels_are_not_fetched_back_when_the_trainer_places_them():
     from dew.training.distributed import MeshSpec, shard_batch
 
-    stream = loader(spec(backend="device"), batch=4, read="memory", seed=37,
-        loading=READ).train(DataPartition())
+    stream = loaded().train(DataPartition())
     try:
         batch = next(stream)
         mesh = MeshSpec().build([jax.devices()[0]])
@@ -237,12 +243,10 @@ def test_device_pixels_are_not_fetched_back_when_the_trainer_places_them():
 
 
 def test_device_draws_follow_record_keys_across_threads_and_partitions():
-    original = spec(backend="device", crop_scale=(0.6, 0.9))
     threaded = Loading(workers=0, threads=4, read_buffer=8)
-    whole = loader(original, batch=4, read="memory", seed=37, loading=READ).train(DataPartition())
-    parallel = loader(original, batch=4, read="memory", seed=37, loading=threaded).train(DataPartition())
-    shares = [loader(original, batch=4, read="memory", seed=37, loading=READ).train(DataPartition(index=i,
-        count=2)) for i in range(2)]
+    whole = loaded(crop_scale=(0.6, 0.9)).train(DataPartition())
+    parallel = loaded(crop_scale=(0.6, 0.9), loading=threaded).train(DataPartition())
+    shares = [loaded(crop_scale=(0.6, 0.9)).train(DataPartition(index=i, count=2)) for i in range(2)]
     try:
         for _ in range(3):
             expected = next(whole)
@@ -259,11 +263,10 @@ def test_device_draws_follow_record_keys_across_threads_and_partitions():
 
 
 def test_grain_workers_only_decode_and_keep_the_parent_device_draws():
-    original = spec(backend="device", crop_scale=(0.6, 0.9))
     worker_loading = Loading(workers=1, threads=1, read_buffer=2)
-    data = loader(original, batch=4, read="memory", seed=37, loading=READ)
+    data = loaded(crop_scale=(0.6, 0.9))
     parent = data.train(DataPartition())
-    worker = loader(original, batch=4, read="memory", seed=37, loading=worker_loading).train(DataPartition())
+    worker = loaded(crop_scale=(0.6, 0.9), loading=worker_loading).train(DataPartition())
     try:
         for _ in range(3):
             expected, actual = augmented(data, next(parent)), augmented(data, next(worker))
@@ -292,7 +295,7 @@ def test_a_run_checks_its_inputs_against_what_the_device_steps_make(host):
     objective = DiffusionObjective(SimpleDiT(patch_size=4, emb_features=16, num_layers=1, num_heads=2,
                                              mlp_ratio=1),
                                    Flow(), InputSpec(Field("image", (12, 12, 3))), solver=Euler(), steps=2)
-    data = loader(spec(staging_size=24), batch=8, read="memory", loading=READ, objective=objective.data())
+    data = loaded(batch=8, seed=0, staging_size=24, objective=objective.data())
     assert np.shape(next(iter(data.train(DataPartition())))["image"])[1:] == (24, 24, 3)
     layout = Layout(host=("variables",) if host else (), min_shard=1, tolerance=1.)
     state = Trainer(objective, optax.adam(1e-3), key=0, layout=layout).fit(data, steps=2, log_every=1)
@@ -319,8 +322,7 @@ def test_a_device_steps_rows_keep_their_explicit_axis_where_the_run_reads_them()
     objective = DiffusionObjective(SimpleDiT(patch_size=4, emb_features=16, num_layers=1, num_heads=2,
                                              mlp_ratio=1),
                                    Flow(), InputSpec(Field("image", (12, 12, 3))), solver=Euler(), steps=2)
-    data = loader(spec(staging_size=24, jitter=False), batch=8, read="memory", loading=READ,
-                  objective=objective.data())
+    data = loaded(batch=8, seed=0, staging_size=24, jitter=False, objective=objective.data())
     trainer = Trainer(objective, optax.adam(1e-3), key=0, mesh=MeshSpec(explicit=("data",)),
                       layout=Layout(min_shard=1, tolerance=1.))
     state = trainer.fit(data, steps=2, log_every=1)
