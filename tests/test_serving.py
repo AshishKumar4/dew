@@ -307,6 +307,35 @@ def test_mixed_lengths_and_budgets_submitted_together_draw_what_each_draws_alone
     assert all(ticket.admitted is not None and ticket.finished is not None for ticket in tickets)
 
 
+def test_a_server_compiles_its_decoding_step_once_and_each_admission_width_once():
+    """A server's warm-up is its step programs' compiles: building it compiles the decoding step,
+    which every decode-only call then runs without compiling again, and each admission width it
+    meets compiles its admitting step at most once, so the widths 1, 2, 4 and 8 cost at most four
+    admitting compiles beside the one decoding step, and meeting them again compiles nothing."""
+    compiled = []
+
+    def listener(event, seconds, *, fun_name=None, **_):
+        if event == "/jax/core/compile/backend_compile_duration" and fun_name == "_stepped":
+            compiled.append(seconds)
+
+    jax.monitoring.register_event_duration_secs_listener(listener)
+    try:
+        server = Server.from_task(task(), slots=8, capacity=128, admission=8)
+        assert len(compiled) == 1, "building a server compiles its decoding step"
+        server([PROMPTS[0]], 12, key=0)
+        assert len(compiled) == 2, "one admission and the decode-only calls after it compile one program"
+        widths = (1, 2, 4, 8)
+        for width in widths:
+            server([PROMPTS[0]] * width, 2, key=0)
+        first = len(compiled)
+        assert first <= 1 + len(widths)
+        for width in widths:
+            server([PROMPTS[0]] * width, 2, key=0)
+        assert len(compiled) == first, "a width the server has met compiles nothing again"
+    finally:
+        jax.monitoring.unregister_event_duration_listener(listener)
+
+
 def test_host_task_and_server_preserve_nonzero_lora_branches():
     from dew.lora import LoRA
 
