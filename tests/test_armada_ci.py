@@ -887,8 +887,10 @@ def cached_runs(ci, root: Path, monkeypatch, cache_worker) -> Callable[[], int]:
 def test_a_reused_row_runs_again_only_when_what_its_test_process_runs_or_reads_changes(
         ci, tmp_path, monkeypatch, cache_worker):
     """A file's green row is kept across a change its tests never meet: the plan's own code (ci.py, which
-    runs outside every test process), and a Python file added that its tests neither run nor list; it runs
-    again once what its test process runs or reads changes: a plugin loaded into it, or a fixture."""
+    runs outside every test process), and another test module added, which nothing imports; it runs again
+    once what its test process runs or reads changes: a plugin loaded into it, a fixture, a conftest.py or
+    a package's __init__.py added, which can change what an import finds, or the process group it runs
+    as."""
     (tmp_path / "tests/test_kept.py").write_text(
         "from pathlib import Path\n"
         "def test_kept():\n"
@@ -899,9 +901,11 @@ def test_a_reused_row_runs_again_only_when_what_its_test_process_runs_or_reads_c
         (armada / tool.name).write_text(tool.read_text())
     run = cached_runs(ci, tmp_path, monkeypatch, cache_worker)
     changes = [(None, "", 1), ("tools/armada/ci.py", "# the plan's own code\n", 1),
-               ("src/unrelated.py", "VALUE = 1\n", 1), ("tests/helpers.py", "VALUE = 2\n", 1),
+               ("tests/more/test_added.py", "def test_added():\n    pass\n", 1),
                ("tools/armada/executed.py", "# a plugin loaded into it\n", 2),
-               ("tests/fixtures/data.json", "{}\n", 3)]
+               ("tests/fixtures/data.json", "{}\n", 3), ("tests/conftest.py", "VALUE = 1\n", 4),
+               ("src/package/__init__.py", "", 5),
+               ("tools/armada/child_groups.py", "# its process group\n", 6)]
     for path, text, runs in changes:
         if path:
             (tmp_path / path).parent.mkdir(parents=True, exist_ok=True)

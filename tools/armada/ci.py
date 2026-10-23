@@ -156,13 +156,14 @@ SKIPPED = {"tests/test_gen_api.py", "tests/test_multihost.py"}
 """CI runs the first in the lint job, under the griffe it pins, and the second in the multihost job,
 across the containers of an armada gang."""
 SHARED = ("pyproject.toml", "constraints.txt", ".armada.json", "tools/armada/session.py",
-          "tools/armada/split.py", "tools/armada/executed.py", "tools/armada/followed.py",
-          str(session.DURATIONS))
+          "tools/armada/child_groups.py", "tools/armada/split.py", "tools/armada/executed.py",
+          "tools/armada/followed.py", str(session.DURATIONS))
 """The files every test file's key covers whole, beside tests/ and src/'s data, every lock (a GPU node
 builds its environment from its CUDA lock) and the environment's own inputs, which .armada.json
-names (`environment_files`): what every test process runs or reads, the session it runs in and the
-plugins loaded into it among them. The plan's own code (this file) runs outside the tests, so a change
-to it reruns none of them."""
+names (`environment_files`): what every test process runs or reads, the session it runs in, the
+process group it runs as and the plugins loaded into it among them. The plan's own code (this file)
+runs outside the tests; what of it reaches a task's pytest, its arguments, environment and deadline,
+is keyed as `tested` runs it, so a change to the rest reruns none of them."""
 
 
 def environment_files() -> list[str]:
@@ -186,16 +187,21 @@ CACHE_PREFIX = f"testcache/format-{RECORD_FORMAT}"
 
 
 def shared(python: str) -> str:
-    """The hash of what every test file's run shares: `python`, the `SHARED` files, every lock, and every
-    non-Python file under tests/ and src/ (a fixture, a package's data). A Python file there is an input
-    of the files whose runs executed it, and a directory a test lists is one of that test's (executed.py),
-    so a Python file added or removed reruns only the files that ran or listed it."""
+    """The hash of what every test file's run shares: `python`, the `SHARED` files, every lock, every
+    non-Python file under tests/ and src/ (a fixture, a package's data), and the names of every Python
+    file there, whose arrival can change what an import finds (a conftest.py, a package's __init__.py, a
+    module that shadows another) or what a scanner lists, neither of which a record sees. A test module
+    (tests/**/test_*.py) is the exception: pytest runs it by its name and nothing imports it, so a test
+    added reruns only itself."""
     digest = hashlib.sha256(python.encode())
     for top in ("tests", "src"):
         for path in sorted(Path(top).rglob("*")):
-            if not path.is_file() or "__pycache__" in path.parts or path.suffix == ".py":
+            if not path.is_file() or "__pycache__" in path.parts:
                 continue
-            digest.update(str(path).encode() + hashlib.sha256(path.read_bytes()).digest())
+            if path.suffix != ".py":
+                digest.update(str(path).encode() + hashlib.sha256(path.read_bytes()).digest())
+            elif not (top == "tests" and path.name.startswith("test_")):
+                digest.update(str(path).encode())
     for name in sorted({*SHARED, *map(str, Path("locks").glob("*.txt")), *environment_files()}):
         digest.update(name.encode() + contents(name))
     return digest.hexdigest()
@@ -554,8 +560,13 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
 
 def tested(python: str, tests: list[str], split: str, out: Path, deadline: float, cache: bool, grace: float,
            common: str, environ: Mapping[str, str], coverage: Path | None = None) -> int:
-    """`task` on the inputs `common` hashes, its pytest under `environ` beside this process's."""
+    """`task` on the inputs `common` hashes, its pytest under `environ` beside this process's. What this
+    process gives pytest beyond the session (`environ`, the deadline and grace it runs under, coverage) is
+    keyed with them, so a row recorded under other terms is not reused."""
     began = time.monotonic()
+    terms = json.dumps({"environ": dict(environ), "deadline": deadline, "grace": grace,
+                        "coverage": coverage is not None}, sort_keys=True)
+    common = hashlib.sha256(f"{common}\n{terms}".encode()).hexdigest()
     rows = [found for name in tests if cache and (found := reused(python, name, split, common))]
     tests = [name for name in tests if row(python, name, split) not in {found["name"] for found in rows}]
     if rows:
