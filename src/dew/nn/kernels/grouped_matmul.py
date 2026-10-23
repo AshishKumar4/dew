@@ -642,12 +642,12 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
             ba.arguments['prologue_operands'], hooks.prologue_axes, extents)
         epilogue = _side_tile_bytes(ba.arguments.get('epilogue_operands', ()), hooks.epilogue_axes, extents)
         # One warpgroup stages each output in turn; two hold every output's staging buffer at once, and
-        # each consumer its own copy of an epilogue side tile without columns (`mosaic.staging`; a
+        # each consumer its own copy of an epilogue side tile without rows (`mosaic.staging`; a
         # prologue side's per-consumer copies are within the stages' count of it).
         staged_outs = sum(outs) if config.warpgroups == 2 else max(outs)
         if config.warpgroups == 2:
             epilogue_sides = ba.arguments.get('epilogue_operands', ())
-            epilogue += _side_tile_bytes(*_uncut(epilogue_sides, hooks.epilogue_axes, 'columns'), extents)
+            epilogue += _side_tile_bytes(*_uncut(epilogue_sides, hooks.epilogue_axes), extents)
         return config.stages * step + epilogue + staged_outs * config.block_m * config.block_n
 
     @staticmethod
@@ -666,7 +666,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         lhs = (extents['rows'], extents['depth'])
         # Each step's blocks are written by TMA and read once by the warpgroup's MMA. A prologue reads
         # the stage of `lhs` and its side tiles and writes the stage back before the MMA may read it
-        # (a commit to shared memory, and the consumers' meet): serial with the MMAs, not beside them
+        # (a commit to shared memory): serial with the MMAs, not beside them
         # (GMMSB-h100-main: a gated prologue at 3.7x the Triton launch's time).
         step = 2 * (config.block_m + config.block_n) * config.block_k * size
         rewritten = 0.0
@@ -763,7 +763,7 @@ class MosaicTgmm(_Mosaic):
     def fitting(self, ba, target) -> tuple[mosaic_gpu.Tiles, ...]:
         """The tiles that fit `target` (`Template.fitting`), with `exact_sums` those whose two fp32
         accumulators, the running sum and a step's, stay in each consumer warpgroup's registers (a
-        warpgroup's 128 threads hold its share of the tile's columns)."""
+        warpgroup's 128 threads hold its half of the tile's rows)."""
         fits = super().fitting(ba, target)
         if not ba.arguments.get('exact_sums'):
             return fits
@@ -1022,9 +1022,9 @@ def _side_arrays(sides: tuple, axes_of: tuple) -> tuple:
                   jnp.dtype(side.dtype).itemsize) for side, axes in zip(sides, axes_of, strict=True))
 
 
-def _uncut(sides: tuple, axes_of: tuple, halved: str) -> tuple[tuple, tuple]:
-    """The side operands, and their axes, without the launch axis a cooperative consumer's half cuts."""
-    kept = [(side, axes) for side, axes in zip(sides, axes_of, strict=True) if halved not in axes]
+def _uncut(sides: tuple, axes_of: tuple) -> tuple[tuple, tuple]:
+    """The side operands, and their axes, without the rows a cooperative consumer's half cuts."""
+    kept = [(side, axes) for side, axes in zip(sides, axes_of, strict=True) if 'rows' not in axes]
     return tuple(side for side, _ in kept), tuple(axes for _, axes in kept)
 
 
