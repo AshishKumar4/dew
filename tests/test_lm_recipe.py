@@ -148,6 +148,7 @@ def test_a_token_budget_alone_trains_over_data_with_no_epoch_length(tmp_path):
     config = run_config(tokens, "--trainer.tokens", str(2 * 8 * SEQ), "--trainer.name", "budget",
                         "--trainer.eval-every", "None", "--trainer.checkpoint-every", "None",
                         pack="first-fit", bins=2)
+    config = dataclasses.replace(config, data=config.chain().read("streamed"))
     assert compile(config.chain()).steps_per_epoch is None
     assert int(config.run().step) >= 2
 
