@@ -2,11 +2,9 @@
 
 from __future__ import annotations
 
-import bisect
 import csv
 import hashlib
 import io
-import itertools
 import json
 import posixpath
 import threading
@@ -27,14 +25,14 @@ from fsspec.utils import infer_compression
 from gcsfs import GCSFileSystem
 from s3fs import S3FileSystem
 
-from dew.data.dataset import Batch, Records
+from dew.data.dataset import Batch, Ranges, Records
 from dew.data.pipeline import Dataset
 from dew.data.steps.generic import Fields
 from dew.data.storage import Readable, Store, commit_export, content_version, in_memory, local, on_gcs
 from dew.records import integer, record
 
 from .base import Read, Shard, ShardManifest, preparing, url_label
-from .index import ArrayIndex, Ranges
+from .index import ArrayIndex
 
 type Format = Literal["jsonl", "text", "csv", "parquet", "arrow", "array_record", "files", "webdataset"]
 
@@ -655,9 +653,9 @@ class Files(Dataset):
             indexed = _IndexedLines(self)
             if self.index is None:
                 return tuple(len(table) for table in indexed.tables), remote
-            shards = indexed.tables[0]["shard"]
-            boundaries = [bisect.bisect_left(shards, shard) for shard in range(len(self.paths) + 1)]
-            return tuple(right - left for left, right in itertools.pairwise(boundaries)), remote
+            # The index's records each name their file's shard, in whichever unsigned type it wrote.
+            counts = np.bincount(indexed.tables[0]["shard"], minlength=len(self.paths))[: len(self.paths)]
+            return tuple(int(count) for count in counts), remote
         if self.kind == "array_record" and self.committed is not None:
             return self._declared_rows() or (), remote
         if self.kind == "files":

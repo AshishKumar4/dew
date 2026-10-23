@@ -3,8 +3,7 @@ geometry: the cost every template's `cost` returns (`dew.nn.kernels.templates.ba
 
 A launch runs `programs` programs. Each does `program_flops` tensor-core FLOPs, moves `program_staged`
 bytes through shared memory (its operand tiles written there and read back by its matrix
-instructions), evaluates `program_exponentials` exponentials and issues `program_issued` warp
-instructions from its `warps` warps; the launch as a whole reads and writes
+instructions) and evaluates `program_exponentials` exponentials; the launch as a whole reads and writes
 `device_bytes` of device memory, rereads counted where the launch's order evicts them from the L2
 before they come again (each template's `cost` says which). Programs a multiprocessor holds at once
 share its tensor cores, shared memory and special-function units, so it does their work one after
@@ -14,11 +13,11 @@ before it needs them, so each step waits at least the global load latency over `
 multiprocessor's `resident` programs (`resident`) wait together (Little's law). Per multiprocessor,
 
     program  = max(program_flops / tensor rate, program_staged / shared-memory rate,
-                   program_exponentials / special-function rate, program_issued / issue rate)
+                   program_exponentials / special-function rate)
              + serial_staged / shared-memory rate + serial_exponentials / special-function rate
-    issue rate = min(SCHEDULERS, resident · warps / ISSUE_INTERVAL)
     waiting  = steps · load latency / (stages - 1)
-    compute  = ceil(programs / (multiprocessors · resident)) · max(resident · program, waiting)
+    tile     = program + serial_stored / (memory bandwidth / multiprocessors)
+    compute  = ceil(programs / (multiprocessors · resident)) · max(resident · tile, waiting)
     memory   = device_bytes / memory bandwidth
     l2       = l2_bytes / L2 bandwidth
     seconds  = max(compute, memory, l2) + programs * steps * grid step seconds (TPU's)
@@ -28,15 +27,13 @@ keys and values each query block of attention walks, the operand bands each outp
 reads) is served there, not from device memory, at the L2's rate, so a config of more, smaller programs
 stages more. A template states them; one that states none is ranked without the term.
 
-A multiprocessor's schedulers issue one warp instruction a clock each, a warp at most one every
-`ISSUE_INTERVAL` clocks, so a program few warps run issues its instructions at its warps' pace, and
-`resident` programs share the schedulers: a template that states its instruction count is ranked by it
-where the CUDA cores, not the tensor cores, bound it (a softmax's walk); one that states none is ranked
-without the term.
-
 Work a program does between its matrix instructions, which they wait for, is serial: `serial_staged` bytes
 and `serial_exponentials` exponentials it adds to its service time rather than overlapping (a Mosaic
-mainloop's prologue, rewriting each stage in shared memory before the warpgroup MMA reads it).
+mainloop's prologue, rewriting each stage in shared memory before the warpgroup MMA reads it). So are the
+`serial_stored` bytes a persistent program stores before its next tile's loads go out, at its
+multiprocessor's share of the device's bandwidth: a tile that builds its own pipeline has none of the next
+tile's stages in flight while its store drains, which at a kernel gradient's few steps a tile is most of
+the tile's time (GMMCOOP-h100's sweep), where a streamed tile loads the next one's stages during its own.
 A persistent launch's work items are its programs. Every rate is a fact of the target
 (`dew.nn.kernels.generation.GpuTarget`): its multiprocessors and clock, its memory bandwidth, and its
 generation's dense tensor FLOPs per clock per multiprocessor in the launch's arithmetic mode; the
@@ -58,15 +55,6 @@ kernels run on (CUDA C++ Programming Guide, "Shared Memory", compute capabilitie
 EXPONENTIALS_PER_CLOCK = 16
 """Base-2 exponentials a multiprocessor's special-function units return per clock (CUDA C++ Programming
 Guide, "Arithmetic Instructions" throughput table, compute capabilities 5.x to 12.x)."""
-
-SCHEDULERS = 4
-"""Warp schedulers a multiprocessor has, each issuing one warp instruction a clock, compute capabilities
-7.0 to 12.x (CUDA C++ Programming Guide, "Hardware Implementation" and the compute capability sections)."""
-
-ISSUE_INTERVAL = 4
-"""Clocks between a warp's issued instructions in a kernel bound by its CUDA cores: an H100 running a Triton
-attention forward at two warps a scheduler issued 0.44 to 0.57 instructions a scheduler a clock (ncu
-SchedulerStats, BWNCU-dedicated-h100's tf-stalls), one a warp every four clocks."""
 
 THREAD_REGISTERS = 255
 """32-bit registers one thread may hold, compute capabilities 5.0 to 12.x (CUDA C++ Programming Guide,
@@ -98,8 +86,7 @@ class Cost:
     serial_staged: float = 0.0
     serial_exponentials: float = 0.0
     l2_bytes: float = 0.0
-    program_issued: float = 0.0
-    warps: int = 4
+    serial_stored: float = 0.0
 
 
 def seconds(cost: Cost, target: generation.GpuTarget) -> float:
@@ -113,8 +100,8 @@ def seconds(cost: Cost, target: generation.GpuTarget) -> float:
         raise ValueError(f"{facts.generation} ({facts.device_kind}) states no "
                          f"{', '.join(name for name, value in named if value is None)}, "
                          "which the kernel cost model needs")
-    program = program_seconds(cost, rate, clock)
     latency = facts.load_latency
+    program = program_seconds(cost, rate, clock) + cost.serial_stored * multiprocessors / bandwidth
     waiting = 0.0 if latency is None else waiting_seconds(cost, latency, clock)
     waves = math.ceil(cost.programs / (multiprocessors * cost.resident))
     l2 = 0.0 if facts.l2_bandwidth is None else cost.l2_bytes / facts.l2_bandwidth
@@ -124,15 +111,12 @@ def seconds(cost: Cost, target: generation.GpuTarget) -> float:
 
 
 def program_seconds(cost: Cost, rate: float, clock: float) -> float:
-    """One program's service time on a multiprocessor: its tensor-core, shared-memory, special-function or
-    issue work, whichever takes longest at `rate` tensor FLOPs a clock and `clock` Hz, plus its serial work
-    (the module's docstring)."""
-    # The schedulers the multiprocessor's resident programs share, each warp issuing at its interval.
-    issue = min(SCHEDULERS, cost.resident * cost.warps / ISSUE_INTERVAL)
+    """One program's service time on a multiprocessor: its tensor-core, shared-memory or special-function
+    work, whichever takes longest at `rate` tensor FLOPs a clock and `clock` Hz, plus its serial work (the
+    module's docstring)."""
     return (max(cost.program_flops / (rate * clock),
                 cost.program_staged / (SHARED_BYTES_PER_CLOCK * clock),
-                cost.program_exponentials / (EXPONENTIALS_PER_CLOCK * clock),
-                cost.program_issued / (issue * clock))
+                cost.program_exponentials / (EXPONENTIALS_PER_CLOCK * clock))
             + cost.serial_staged / (SHARED_BYTES_PER_CLOCK * clock)
             + cost.serial_exponentials / (EXPONENTIALS_PER_CLOCK * clock))
 

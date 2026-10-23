@@ -191,7 +191,7 @@ class LoRA:
         _refuse_unadaptable(model)
         if fp8_base is not None:
             model = fp8_base.joined(model)
-        variables = thaw(variables)
+        source, variables = variables, thaw(variables)
         bound = _named(bound_layouts(model, variables, layouts or {}), self.modules)
         scaling = 2.0 * self.rank if self.alpha is None else float(self.alpha)
         targets: dict[Path, Target] = {}
@@ -204,7 +204,7 @@ class LoRA:
             _insert_factors(leaves, factors.module, INIT_A(factor_key, shape_a, FACTOR_DTYPE),
                             INIT_B(factor_key, shape_b, FACTOR_DTYPE))
         bases = {} if base is None else dict.fromkeys(_components(bound) or {""}, base)
-        return Adapter.bound(model, overlay(variables, leaves), targets, self.rslora, self.dropout, bound,
+        return Adapter.bound(model, overlay(source, leaves), targets, self.rslora, self.dropout, bound,
                              bases)
 
     def fp8_base(self, model: nn.Module, variables: Variables, *, tokens: int,
@@ -237,8 +237,7 @@ class LoRA:
         and PEFT features this loader does not support are refused by name.
         """
         _refuse_unadaptable(model)
-        variables = thaw(variables)
-        bound = bound_layouts(model, variables, layouts or {})
+        bound = bound_layouts(model, thaw(variables), layouts or {})
         path = FilePath(path)
         if (path / PEFT_WEIGHTS).is_file():
             where = str(path / PEFT_CONFIG)
@@ -321,12 +320,14 @@ class Adapter:
               bases: Mapping[str, AdapterBase] | None = None) -> Adapter:
         """Adapt `model` to `targets` and split `variables` into factors and frozen weights.
 
-        The factors go under `params` and everything else under `FROZEN`. `bases` are the published
-        models its components were bound to (`Adapter.bases`).
+        The factors go under `params` and everything else under `FROZEN`,
+        but what a split tree already trains, such as a cross-attention
+        block, keeps training (`freeze`). `bases` are the published models its
+        components were bound to (`Adapter.bases`).
         """
         adapted = _adapted(model, _Bound(targets, rslora, dropout, layouts, dict(bases or {})))
         factors = {(*path, factor) for path in targets for factor in FACTORS}
-        return cls(adapted, _fp8_packed(model, freeze(thaw(variables), lambda path: path in factors)))
+        return cls(adapted, _fp8_packed(model, freeze(variables, lambda path: path in factors)))
 
     @classmethod
     def from_run(cls, directory: str | FilePath, *, step: int | str | None = None,
@@ -1142,7 +1143,9 @@ def _entries(components: frozenset[str], tensors: Mapping[str, np.ndarray],
 
 def _place(model: nn.Module, layouts: Mapping[str, WeightLayout], variables: Variables,
            entries: Sequence[_Entry]) -> Adapter:
-    """Build the adapter the entries describe, its factors restored into the model's tree."""
+    """Build the adapter the entries describe, its factors restored into the model's tree, which
+    keeps training what it trained where it came split (`freeze`)."""
+    source, variables = variables, thaw(variables)
     components = _components(layouts)
     settings = {(entry.config.rslora, entry.config.dropout) for entry in entries}
     if len(settings) != 1:
@@ -1180,7 +1183,7 @@ def _place(model: nn.Module, layouts: Mapping[str, WeightLayout], variables: Var
         bound[entry.module] = layout
         _insert_factors(leaves, factors.module, factors.a.restore(entry.a, shape_a),
                         factors.b.restore(entry.b, shape_b))
-    return Adapter.bound(model, overlay(thaw(variables), leaves), targets, rslora, dropout, bound, bases)
+    return Adapter.bound(model, overlay(source, leaves), targets, rslora, dropout, bound, bases)
 
 
 def _diffusers_configs(tensors: Mapping[str, np.ndarray], metadata: str | None,
