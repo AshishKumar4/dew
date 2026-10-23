@@ -1,6 +1,9 @@
 """tools/armada/r2.py, the R2 Worker's one client, against the stand-in Worker (conftest's cache_worker): an
-object round-trips, a miss is None, a listing pages to its end, and a key or a body the Worker's contract
-refuses never reaches it."""
+object round-trips, a miss is None, a listing pages to its end, a key or a body the Worker's contract refuses
+never reaches it, and an answer cut short is no object."""
+
+import http.server
+import threading
 
 import pytest
 from remote_cache import r2
@@ -23,6 +26,32 @@ def test_what_the_contract_refuses_never_reaches_the_worker(cache_worker):
     for key in ("records/../a", "records/a b", "x" * (r2.CONTRACT["max_key_length"] + 1)):
         with pytest.raises(ValueError):
             store.put(key, b"value")
-    with pytest.raises(ValueError):
-        store.put("records/large", bytes(r2.MAX_BYTES + 1))
+    for body in (b"", bytes(r2.MAX_BYTES + 1)):
+        with pytest.raises(ValueError):
+            store.put("records/body", body)
     assert seen == [] and stored == {}
+
+
+def test_an_answer_that_ends_before_its_announced_length_is_unavailable():
+    """A Worker whose answer stops short, the connection closed before the length it announced, gave no
+    object: the read is `Unavailable`, which a caller counts as a failure, never a shorter object."""
+
+    class Short(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            self.send_response(200)
+            self.send_header("Content-Length", "100")
+            self.end_headers()
+            self.wfile.write(b"x" * 10)
+            self.close_connection = True
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Short)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        store = r2.Store(f"http://127.0.0.1:{server.server_address[1]}", "token", "dew-test", timeout=10)
+        with pytest.raises(r2.Unavailable):
+            store.get("records/short")
+    finally:
+        server.shutdown()

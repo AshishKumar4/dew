@@ -184,11 +184,11 @@ def rng():
 def cache_worker():
     """The dew-xla-cache Worker's protocol over a dict: GET, PUT, a listing two keys a page, a 404 on
     a miss, a 401 without the token, Cloudflare's 403 for urllib's own User-Agent, which never
-    reaches the Worker, and the Worker's 413 for a body past its contract's bound
+    reaches the Worker, and the Worker's 413 for a body outside its contract's bounds
     (tools/armada/r2.json). Each request's path is kept."""
     stored, seen = {}, []
     contract = Path(__file__).resolve().parents[1] / "tools" / "armada" / "r2.json"
-    bound = json.loads(contract.read_text())["max_bytes"]
+    bounds = json.loads(contract.read_text())
 
     class Handler(http.server.BaseHTTPRequestHandler):
         def log_message(self, *args):
@@ -229,7 +229,7 @@ def cache_worker():
         def do_PUT(self):
             if not self._authorized():
                 return
-            if int(self.headers["Content-Length"]) > bound:
+            if not bounds["min_bytes"] <= int(self.headers["Content-Length"]) <= bounds["max_bytes"]:
                 self.send_response(413)
                 self.send_header("Connection", "close")
                 self.end_headers()
