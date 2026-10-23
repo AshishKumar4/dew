@@ -60,6 +60,7 @@ from dew.decision.questions import (
     ScoreAnswer,
 )
 from dew.files import write_atomically
+from dew.inference import scoring
 from dew.inference.tasks import shape_bucket
 from dew.interop.processors import Processor
 from dew.nn.inputs import ModelInputs, RowPlan, mesh_of
@@ -120,6 +121,12 @@ class Usage:
     @property
     def truncated(self) -> bool:
         return self.state_kept < self.state_tokens
+
+
+def usage_of(rows: Sequence[Encoded]) -> Usage:
+    """What a request's `rows` cost: their tokens, the state's, and the least of it any row kept."""
+    return Usage(sum(len(row.tokens) for row in rows), max((row.state_tokens for row in rows), default=0),
+                 min((row.state_kept for row in rows), default=0), any(row.trimmed for row in rows))
 
 
 @dataclass(frozen=True)
@@ -317,24 +324,31 @@ class Decide:
                    if row == index]
             answers = {laid.name: self._answer(questions[laid.name], _ordered(laid, scores[slot]))
                        for encoded, scores in own for slot, laid in enumerate(encoded.questions)}
-            usage = Usage(sum(len(encoded.tokens) for encoded, _ in own),
-                          max((encoded.state_tokens for encoded, _ in own), default=0),
-                          min((encoded.state_kept for encoded, _ in own), default=0),
-                          any(encoded.trimmed for encoded, _ in own))
-            answered.append(({name: answers[name] for name in questions}, usage))
+            answered.append(({name: answers[name] for name in questions},
+                             usage_of([encoded for encoded, _ in own])))
         return answered
 
     def _seen(self, state: JSON, questions: Mapping[str, Question],
               images: Sequence[Image.Image]) -> tuple[dict[str, Answer], Usage]:
         """One request's answers and usage, its images laid out in its one row."""
+        return self._looked(questions, *self._shown(state, questions, images))
+
+    def _shown(self, state: JSON, questions: Mapping[str, Question],
+               images: Sequence[Image.Image]) -> tuple[Encoded, Images]:
+        """A request's one row with its images laid out before the state, and the images."""
         if self.processor is None or self.layout.image is None:
             raise ValueError("images need a backbone with a vision encoder, which this task does not have")
         media = Images.of(self.processor, images, self.layout.image)
         rows = self._encoded(state, questions, media.tokens)
         if len(rows) != 1:
             raise ValueError("a request's images go in a layout of one row")
-        [row] = rows
-        scores = np.asarray(self._forward(self.variables, DecisionInputs.collate(rows, self.specials.pad),
+        return rows[0], media
+
+    def _looked(self, questions: Mapping[str, Question], row: Encoded, media: Images
+                ) -> tuple[dict[str, Answer], Usage]:
+        """A request's answers and usage from its one row and images (`_shown`), by a pass of its own."""
+        assert self.processor is not None, "a row of images was laid out with the processor"
+        scores = np.asarray(self._forward(self.variables, DecisionInputs.collate([row], self.specials.pad),
                                           media=media.inputs(self.processor, row)))[0]
         answers = {laid.name: self._answer(questions[laid.name], _ordered(laid, scores[slot]))
                    for slot, laid in enumerate(row.questions)}
@@ -570,8 +584,6 @@ class Decide:
         context length, as a benchmark that forbids truncation requires
         (Decision Index counts such a refusal as unsupported).
         """
-        if strict and details:
-            raise ValueError("strict answers hold Jev's fields alone, so they carry no details")
         if isinstance(request, Mapping):
             [answered] = self._systemone([request], details=details, strict=strict, whole=whole)
             if isinstance(answered, ValueError):
@@ -581,32 +593,32 @@ class Decide:
 
     def _systemone(self, requests: Sequence[Mapping[str, object]], *, details: bool, strict: bool,
                    whole: bool) -> list[dict[str, JSON] | ValueError]:
-        """`systemone` over a list of bodies: each parsed and laid out on its own, so a refusal is its
-        body's alone, and the text bodies' rows scored in one batch."""
+        """`systemone` over a list of bodies, through the scoring task a server would run
+        (`scoring`): each body admitted on its own, so a refusal is its body's alone, and the admitted
+        ones scored in one call."""
+        task, variables = self.scoring(details=details, strict=strict, whole=whole)
         answered: dict[int, dict[str, JSON] | ValueError] = {}
-        asked: dict[int, tuple[JSON, dict[str, Question]]] = {}
-        laid: dict[int, list[Encoded]] = {}
-        seen: dict[int, tuple[dict[str, Answer], Usage]] = {}
+        admitted: dict[int, _Admitted] = {}
         for index, request in enumerate(requests):
             try:
-                state, questions, images = self._read_wire(request, strict=strict)
-                asked[index] = state, questions
-                if images:
-                    seen[index] = self._seen(state, questions, images)
-                else:
-                    laid[index] = self._encoded(state, questions)
+                admitted[index] = task.admit(request).payload
             except ValueError as refused:
                 answered[index] = refused
-        order = sorted(laid)
-        scored = {} if not order else dict(zip(order, self._answered(
-            [laid[index] for index in order], [asked[index][1] for index in order]), strict=True))
-        for index, (answers, usage) in {**scored, **seen}.items():
-            try:
-                answered[index] = self._wire_response(asked[index][1], answers, usage, details=details,
-                                                      whole=whole)
-            except ValueError as refused:
-                answered[index] = refused
+        scored = task.score(variables, list(admitted.values())) if admitted else []
+        answered.update(zip(admitted, scored, strict=True))
         return [answered[index] for index in range(len(requests))]
+
+    def scoring(self, *, details: bool = False, strict: bool = False,
+                whole: bool = False) -> tuple["WireScoring", Variables]:
+        """This task as a scoring task of Jev request bodies (`dew.inference.scoring.Scoring`),
+        answering each as `systemone` does with these options, and the weights it scores with. The
+        scoring task holds none of them: a server holds them resident and hands them to each pass,
+        and swaps both whole on a reload (`ScoringServer.reload`), so an answer always pairs this
+        task's calibration with the weights it was fitted to."""
+        if strict and details:
+            raise ValueError("strict answers hold Jev's fields alone, so they carry no details")
+        held = WireScoring(replace(self, variables={}), details=details, strict=strict, whole=whole)
+        return held, self.variables
 
     def _read_wire(self, request: Mapping[str, object], *, strict: bool
                    ) -> tuple[JSON, dict[str, Question], list[Image.Image]]:
@@ -625,13 +637,8 @@ class Decide:
         return state, questions, [] if strict else decoded_images(request.get("images"))
 
     def _wire_response(self, questions: Mapping[str, Question], answers: Mapping[str, Answer], usage: Usage,
-                       *, details: bool, whole: bool) -> dict[str, JSON]:
-        """A Jev response body of a request's answers and usage, refused where `whole` and the layout
-        cut the request to fit."""
-        if whole and (usage.truncated or usage.trimmed):
-            cut = "state" if usage.truncated else "instructions or options"
-            raise ValueError(f"the request does not fit the maximum context length, max_len="
-                             f"{self.layout.max_len} tokens, without cutting its {cut}")
+                       *, details: bool) -> dict[str, JSON]:
+        """A Jev response body of a request's answers and usage."""
         gated = self.calibration.abstention is not None
         reported: dict[str, JSON] = {"input_tokens": usage.input_tokens, "output_tokens": 0}
         if details:
@@ -645,6 +652,62 @@ class Decide:
 
 EXTENSIONS = ("images",)
 """The request fields `Decide.systemone` reads beyond Jev's, which `strict` drops."""
+
+
+@dataclass(frozen=True)
+class _Admitted:
+    """A Jev body as `WireScoring` admitted it: its questions and its rows, with its images where it
+    has any, laid out in its one row."""
+
+    questions: dict[str, Question]
+    rows: list[Encoded]
+    media: Images | None = None
+
+
+@dataclass(frozen=True)
+class WireScoring(scoring.Scoring[Mapping[str, object], _Admitted, dict[str, JSON]]):
+    """A `Decide` task as a scoring task of Jev request bodies (`dew.inference.scoring.Scoring`),
+    answering each as `Decide.systemone` does under `details`, `strict` and `whole`.
+
+    `admit` parses and lays out a body, refusing what Jev would refuse, a body the layout could
+    answer only by cutting it under `whole` included; `score` answers the admitted bodies of a batch
+    over the weights it is handed: the text bodies' rows scored together within the task's budget
+    (`Decide.batch`), a body with images by a pass of its own in the same call. `decide` holds no
+    weights (`Decide.scoring`)."""
+
+    decide: Decide
+    details: bool = False
+    strict: bool = False
+    whole: bool = False
+
+    def admit(self, request: Mapping[str, object]) -> scoring.Scored[_Admitted]:
+        decide = self.decide
+        state, questions, images = decide._read_wire(request, strict=self.strict)
+        if images:
+            row, media = decide._shown(state, questions, images)
+            admitted = _Admitted(questions, [row], media)
+        else:
+            admitted = _Admitted(questions, decide._encoded(state, questions))
+        rows = admitted.rows
+        usage = usage_of(rows)
+        if self.whole and (usage.truncated or usage.trimmed):
+            cut = "state" if usage.truncated else "instructions or options"
+            raise ValueError(f"the request does not fit the maximum context length, max_len="
+                             f"{decide.layout.max_len} tokens, without cutting its {cut}")
+        return scoring.Scored[_Admitted](usage_of(rows).input_tokens, admitted)
+
+    def score(self, variables: Variables, payloads: Sequence[_Admitted]) -> list[dict[str, JSON]]:
+        decide = replace(self.decide, variables=variables)
+        admitted = list(payloads)
+        text = [index for index, payload in enumerate(admitted) if payload.media is None]
+        answered = dict(zip(text, decide._answered([admitted[index].rows for index in text],
+                                                   [admitted[index].questions for index in text]),
+                            strict=True))
+        for index, payload in enumerate(admitted):
+            if payload.media is not None:
+                answered[index] = decide._looked(payload.questions, payload.rows[0], payload.media)
+        return [decide._wire_response(payload.questions, *answered[index], details=self.details)
+                for index, payload in enumerate(admitted)]
 
 
 def decoded_images(images: object) -> list[Image.Image]:
