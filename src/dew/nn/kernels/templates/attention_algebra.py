@@ -866,6 +866,8 @@ def tile_logits(score_mod, product: jax.Array, seen: jax.Array, q_pos, k_pos, pa
     """A backward tile's logits from its product `Q·Kᵀ` taken by `scale`, under `score_mod`, -inf where
     unseen (`seen`), and with `slopes` its entries' derivatives (`scored`)."""
     logits, derivatives = scored(score_mod, product * scale, q_pos, k_pos, params, slopes=slopes)
+    if seen is True:
+        return logits, derivatives
     return jnp.where(seen, logits, -jnp.inf), derivatives
 
 
@@ -1192,10 +1194,15 @@ def grad_scores(exponentials: jax.Array, products: jax.Array, anchor: jax.Array,
     intermediate lies where the reference's does (a weight below fp32's range keeps its share beside a
     large product, and none overflows that the reference keeps); zero where unseen. The anchor key's
     own `dP - c` is 0 by definition where `at_anchor` names it, whatever its product's rounding."""
+    import os
+    if os.environ.get("DEW_NOANCHOR"):
+        return exponentials * ((products - expand(delta + anchor, products)) * expand(inverse_total, products))
     relative = products - expand(anchor, products)
     if at_anchor is not None:
         relative = jnp.where(at_anchor, 0.0, relative)
     centred = (relative - expand(delta, relative)) * expand(inverse_total, relative)
+    if seen is True:
+        return exponentials * centred
     return jnp.where(seen, exponentials * centred, 0.0)
 
 

@@ -496,6 +496,9 @@ def _key_param(ref, kind: Kind, head, rows):
 
 def _tile_scores(score_mod, query, key, value, dout, peak, total, anchor, delta, seen, q_pos, k_pos, params,
                  *, key_index, scale: float, how: algebra.Recompute, interpret: bool):
+    import os
+    if os.environ.get("DEW_NOMASK"):
+        seen = True
     """A tile's backward through its scores: its unnormalized weights `exp(s - m)` and its weights `p` over
     `total` (zero where masked), the masked score cotangents `p * ((dP - c) - (D - c))`
     (`algebra.grad_scores`), `dP = dO V^T`, `c` each query's `anchor` and `delta` its `D - c`, and the
