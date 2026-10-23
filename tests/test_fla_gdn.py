@@ -14,6 +14,7 @@ import numpy as np
 import pytest
 from delta_rule_support import (
     NAMES,
+    checkpointed,
     fla_decay_terms,
     fla_side,
     float64_truth,
@@ -22,6 +23,7 @@ from delta_rule_support import (
     rule_math,
     through,
 )
+from gdn_cases import CASES
 from jax.core import ShapedArray
 from reference_error import (
     assert_as_exact,
@@ -410,6 +412,31 @@ def test_the_ported_rule_and_its_gradients_follow_the_recurrence(dtype, bound):
     assert relative(final, want_final) < bound
     for name, mine, theirs in zip(("q", "k", "v", "g", "beta", "h0"), grads, want_grads, strict=True):
         assert relative(mine, theirs) < bound, name
+
+
+def test_the_oracle_a_chunk_at_a_time_computes_the_token_recurrence():
+    """The float64 oracle at a model's real shape keeps one memory a chunk on the way back (`checkpointed`):
+    its outputs and gradients within float64 rounding of its own computation of the token recurrence's,
+    at the tiny case of the one case table (`gdn_cases`)."""
+    case = CASES["tiny"]
+    b, t, h, hv, k, v = (case[name] for name in
+                         ("batch", "length", "key_heads", "value_heads", "width", "columns"))
+    keys = jax.random.split(jax.random.key(29), 8)
+    with jax.enable_x64(new_val=True):
+        operands = (l2norm(jax.random.normal(keys[0], (b, t, h, k), jnp.float64)),
+                    l2norm(jax.random.normal(keys[1], (b, t, h, k), jnp.float64)),
+                    jax.random.normal(keys[2], (b, t, hv, v), jnp.float64),
+                    -jnp.exp(jax.random.normal(keys[3], (b, t, hv), jnp.float64) - 3.0),
+                    jax.nn.sigmoid(jax.random.normal(keys[4], (b, t, hv), jnp.float64)),
+                    0.1 * jax.random.normal(keys[5], (b, hv, k, v), jnp.float64),
+                    jax.random.normal(keys[6], (b, t, hv, v), jnp.float64),
+                    0.1 * jax.random.normal(keys[7], (b, hv, k, v), jnp.float64))
+        whole = through(recurrence, *operands[6:])(*operands[:6])
+        run = through(functools.partial(recurrence, rule=checkpointed(case["chunk"])), *operands[6:])
+        roundings = chain_roundings(jax.make_jaxpr(run)(*operands[:6]))
+        chunked = run(*operands[:6])
+    for name, mine, theirs in zip(NAMES, chunked, whole, strict=True):
+        assert_computes_the_oracle(np.asarray(mine), np.asarray(theirs), name, roundings=roundings)
 
 
 @pytest.mark.parametrize("per_key", [False, True])
