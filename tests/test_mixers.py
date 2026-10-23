@@ -22,7 +22,7 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from model_support import TINY_DECODER
-from reference_error import assert_as_exact
+from reference_error import assert_as_exact, with_gradients
 from residual_orders import orders, permuted, residual_width
 
 from dew.nn import linear
@@ -184,9 +184,10 @@ def documents_alone(model, tokens, documents=DOCUMENTS):
 
 
 def pulled(forward, variables, cotangent):
-    """`forward`'s logits and the variables' gradient under `cotangent`."""
-    logits, pull = jax.vjp(forward, variables)
-    return logits, pull(cotangent.astype(logits.dtype))[0]
+    """`forward`'s logits and the variables' gradient under `cotangent`, at the logits' dtype, pulled
+    back through the gate (`reference_error.with_gradients`)."""
+    logits_dtype = jax.eval_shape(forward, variables).dtype
+    return with_gradients(forward)(variables, cotangent.astype(logits_dtype))
 
 
 def packed_forward(model, tokens, *, documents=DOCUMENTS, segmented=True):

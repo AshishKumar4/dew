@@ -32,6 +32,7 @@ from reference_error import (
     equations,
     float64_terms,
     widened,
+    with_gradients,
 )
 from tuned import each_config
 
@@ -49,8 +50,9 @@ def relative(got, want):
 
 
 def evaluated(function, operands, seed):
-    output, backward = jax.vjp(function, *operands)
-    return (output, *backward(seed))
+    """`function`'s output and its operands' gradients under the cotangent `seed`, pulled back through
+    the gate (`reference_error.with_gradients`)."""
+    return with_gradients(function)(*operands, seed)
 
 
 def rounding_report(labels, actual, reference, truth):
@@ -775,11 +777,12 @@ def test_a_fused_kernel_differentiates_at_every_order_through_its_portable_arith
     portable arithmetic's own composition, within the float64 gate of it, while the first level's value
     and, where the composition takes a gradient of the call, its backward run the kernels."""
     def draw(draw):
+        # The score's cotangent, one, held in the draw as the gate takes it.
         operands = fused_operands(name, dtype, draw)
         return (operands[0], jax.random.normal(drawn_key(78, draw), operands[0].shape).astype(dtype),
-                *operands[1:])
+                jnp.float32(1), *operands[1:])
 
-    first, tangent, *rest = draw(0)
+    first, tangent, one, *rest = draw(0)
     operands = (first, *rest)
 
     def composed(implementation):
@@ -789,23 +792,27 @@ def test_a_fused_kernel_differentiates_at_every_order_through_its_portable_arith
             out = fused(first, *rest)
             return sum(jnp.square(leaf.astype(jnp.float32)).sum() for leaf in jax.tree.leaves(out))
 
-        def run(first, tangent, *rest):
+        def gradient(function, one):
+            # The first operand's gradient, through the gate's pullback of the score's one.
+            return lambda first, *rest: with_gradients(function)(first, *rest, one)[1]
+
+        def run(first, tangent, one, *rest):
             if composition == "jvp_grad":
-                return jax.jvp(lambda first: jax.grad(score)(first, *rest), (first,), (tangent,))[1]
+                return jax.jvp(lambda first: gradient(score, one)(first, *rest), (first,), (tangent,))[1]
             if composition == "grad_jvp":
                 def along(first):
                     return jax.jvp(lambda first: score(first, *rest), (first,), (tangent,))[1]
 
-                return jax.grad(along)(first)
+                return gradient(along, one)(first)
             if composition == "jvp_staged":
                 return jax.jvp(jax.jit(lambda first: fused(first, *rest)), (first,), (tangent,))[1]
             # The rows map, a norm's weight is every row's.
-            return jax.vmap(jax.grad(score), in_axes=(0, 0, None)[:1 + len(rest)])(first, *rest)
+            return jax.vmap(gradient(score, one), in_axes=(0, 0, None)[:1 + len(rest)])(first, *rest)
 
         return run
 
     forward = "swiglu_forward" if name in ("swiglu", "packed") else "rms_norm_forward"
-    launched = kernels(composed("pallas"), operands[0], tangent, *operands[1:])
+    launched = kernels(composed("pallas"), operands[0], tangent, one, *operands[1:])
     assert forward in launched
     if composition in ("jvp_grad", "vmap_grad"):
         assert forward.replace("forward", "backward") in launched
