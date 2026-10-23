@@ -216,6 +216,7 @@ def test_the_kernels_forward_mode_keeps_the_projections_law():
     np.testing.assert_array_equal(np.asarray(kernels, np.float32), np.asarray(tangent("xla"), np.float32))
 
 
+@pytest.mark.skipif(jax.default_backend() != "cpu", reason="a GPU of sm80 or later runs the named kernel")
 def test_a_named_kernel_refuses_where_the_kernels_do_not_run():
     """A kernel `generation.chosen` names for a call no kernel runs (a CPU's without 'pallas', which alone
     interprets them) raises with the reason, rather than running XLA."""
