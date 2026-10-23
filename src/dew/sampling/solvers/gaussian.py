@@ -9,6 +9,8 @@ import jax.numpy as jnp
 from flax import struct
 from jax import lax
 
+from dew.diffusion.schedules import divided
+
 from .common import _check_endpoint_domain, _push
 
 
@@ -177,7 +179,9 @@ class PNDM:
             k2 = denoise(_pndm_step(x, eps, rates_t, rates_low), t_eval)[1]
             k3 = denoise(_pndm_step(x, k2, rates_t, rates_eval), t_eval)[1]
             k4 = denoise(_pndm_step(x, k3, rates_t, rates_s), t_next)[1]
-            return _pndm_step(x, eps / 6 + k2 / 3 + k3 / 3 + k4 / 6, rates_t, rates_s)
+            # Each stage weighed as Diffusers' step_prk weighs it, a multiplication by 1/6 or 1/3
+            # summed in stage order: no division.
+            return _pndm_step(x, eps * (1 / 6) + k2 * (1 / 3) + k3 * (1 / 3) + k4 * (1 / 6), rates_t, rates_s)
 
         def predictor_corrector(_):
             eps_next = denoise(_pndm_step(x, eps, rates_t, rates_step), t_next)[1]
@@ -188,7 +192,7 @@ class PNDM:
             if k == 2:
                 combined = (3 * e0 - e1) / 2
             elif k == 3:
-                combined = (23 * e0 - 16 * e1 + 5 * e2) / 12
+                combined = divided(23 * e0 - 16 * e1 + 5 * e2, 12)
             else:
                 combined = (1 / 24) * (55 * e0 - 59 * e1 + 37 * e2 - 9 * e3)
             return _pndm_step(x, combined, rates_t, rates_step)
