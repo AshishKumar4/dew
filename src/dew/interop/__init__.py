@@ -4,13 +4,13 @@ So reading Hub metadata or a safetensors file does not import the decoder
 translators or the diffusion pipeline loader.
 """
 
-from collections.abc import Callable
-from importlib import import_module
 from typing import TYPE_CHECKING
 
-if TYPE_CHECKING:
-    from .hf_decoders import translate_config, translate_weights
-    from .pretrained import (
+from dew._exports import lookup as _lookup
+
+if TYPE_CHECKING:  # written from _EXPORTS (tools/gen_exports.py)
+    from dew.interop.hf_decoders import translate_config, translate_weights
+    from dew.interop.pretrained import (
         Pretrained,
         PretrainedBlockDecoder,
         PretrainedDecoder,
@@ -19,25 +19,22 @@ if TYPE_CHECKING:
         PretrainedPipeline,
         split_revision,
     )
-    from .processors import Processor
-    from .safetensors_io import load_params, save_hf_layout, save_params
+    from dew.interop.processors import Processor
+    from dew.interop.safetensors_io import load_params, save_hf_layout, save_params
 
 _EXPORTS = {
-    **dict.fromkeys(("Pretrained", "PretrainedBlockDecoder", "PretrainedDecoder", "PretrainedFallback",
-                     "PretrainedMaskedDecoder", "PretrainedPipeline", "split_revision"),
-                    "pretrained"),
-    "Processor": "processors",
-    "translate_config": "hf_decoders",
-    "translate_weights": "hf_decoders",
-    "load_params": "safetensors_io", "save_hf_layout": "safetensors_io", "save_params": "safetensors_io",
+    "Pretrained": "dew.interop.pretrained", "PretrainedBlockDecoder": "dew.interop.pretrained",
+    "PretrainedDecoder": "dew.interop.pretrained", "PretrainedFallback": "dew.interop.pretrained",
+    "PretrainedMaskedDecoder": "dew.interop.pretrained", "PretrainedPipeline": "dew.interop.pretrained",
+    "split_revision": "dew.interop.pretrained",
+    "Processor": "dew.interop.processors",
+    "translate_config": "dew.interop.hf_decoders", "translate_weights": "dew.interop.hf_decoders",
+    "load_params": "dew.interop.safetensors_io", "save_hf_layout": "dew.interop.safetensors_io",
+    "save_params": "dew.interop.safetensors_io",
 }
 
 
-def __getattr__(name: str) -> type | Callable:
-    module = _EXPORTS.get(name)
-    if module is None:
-        raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-    return getattr(import_module(f"{__name__}.{module}"), name)
+__getattr__ = _lookup(__name__, _EXPORTS)
 
 
 def __dir__() -> list[str]:
