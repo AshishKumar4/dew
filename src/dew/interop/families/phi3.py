@@ -12,7 +12,6 @@ from dew.interop.decoder_parts import (
     Packed,
     base_config,
     decoder_tensors,
-    dew_path,
     qkv_widths,
     refuse,
     rope_records,
@@ -95,12 +94,6 @@ _PHI3_PACKED = (
     Packed('.mlp.gate_up_proj.weight', ('.mlp.gate_proj.weight', '.mlp.up_proj.weight'), 0))
 
 
-def _phi3_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
-    if name.endswith(tuple(packing.name for packing in _PHI3_PACKED)):
-        return None
-    return dew_path(name, config)
-
-
 def _phi3_export(model: CausalTransformer) -> Mapping[str, object]:
     rope = model.rope_scaling
     return {
@@ -124,6 +117,6 @@ PHI3 = DecoderFamily(
     ('phi3',), _phi3_config,
     lambda fields: isinstance(fields.rope_scaling, LongRopeScaling),
     'phi3', 'Phi3ForCausalLM', _phi3_export,
-    weight_path=_phi3_path, packed=_PHI3_PACKED,
+    packed=_PHI3_PACKED,
     export_weights=decoder_tensors, preserve_source_layout=True,
 )
