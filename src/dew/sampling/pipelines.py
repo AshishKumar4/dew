@@ -232,7 +232,8 @@ class TextToImage:
                  mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
                  dtype: DTypeLike | None = None, param_dtype: DTypeLike | None = None,
                  trust: Sequence[str] = ()) -> TextToImage:
-        """Load the run in `directory`, built from its `run.json` the way the recipe built it.
+        """Load the run in `directory`, built from the inference record its checkpoint holds
+        (`Checkpoints.artifact`) the way the recipe built it; the run's `run.json` is not read.
 
         The weights come from the run's latest checkpoint, or from `step`.
 

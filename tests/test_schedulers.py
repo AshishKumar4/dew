@@ -381,7 +381,8 @@ def test_edm_draws_the_sigmas_of_the_space_it_denoises(rng, fields, mean, std):
 
 
 def test_a_run_config_draws_pixel_sigmas_without_an_autoencoder_and_latent_ones_with(rng):
-    from dew.objectives.diffusion.config import DiffusionRunConfig, PretrainedAutoencoder
+    from dew.config.diffusion import DiffusionRunConfig
+    from dew.nn.autoencoders.pretrained import PretrainedAutoencoder
 
     for config, mean, std in (
         (DiffusionRunConfig(), -1.2, 1.2),
