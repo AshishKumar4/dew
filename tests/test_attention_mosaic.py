@@ -26,8 +26,8 @@ ON_HOPPER = pytest.mark.skipif(generation.device_generation() != "sm90",
 CALLS = {"full": {}, "causal": {"causal": True}}
 """The call forms the mainloop takes."""
 SHAPES = {"interpreted": (1, 160, 2, 1), "compiled": (2, 400, 4, 2)}
-"""Rows, tokens (not whole tiles, so the call pads), query and key heads (grouped), interpreted on the CPU and
-compiled on an H100."""
+"""Rows, tokens (not whole tiles, so the call pads, over more than one key tile past the keys where a program's
+two consumers pad it to 128), query and key heads (grouped), interpreted on the CPU and compiled on an H100."""
 SEEDS = 8
 """Draws a case takes, check 1's fewest (`reference_error.seeds_for`): it bounds the worst row over them
 against the reference's own."""
