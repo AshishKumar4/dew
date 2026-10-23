@@ -30,6 +30,7 @@ import grain.experimental as gx
 import grain.python as pygrain
 import numpy as np
 
+from dew.batch import VALID_ROWS
 from dew.data.analysis import (
     _LOCAL,
     _VIEWS,
@@ -118,7 +119,6 @@ from dew.data.steps.generic import Fields
 from dew.data.steps.text import LayoutRule, ValidTargets, counted_window, recounted
 from dew.data.text import Chunks
 from dew.data.tokens import _WrappingDataset
-from dew.objectives.base import VALID_ROWS
 from dew.records import boolean, integer, integers, record, strings
 
 if TYPE_CHECKING:
