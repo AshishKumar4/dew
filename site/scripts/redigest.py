@@ -16,6 +16,13 @@ API's names (an attribute after `.`, a keyword argument before `=`) may be renam
 where they are used. A variable's name is renamed everywhere it appears, to one
 name the program did not use, so every use still means what it meant. It then
 prints each renaming and writes the new digest. Nothing else in the recording changes.
+
+One other change keeps a recording too: the pinned model (site/live/container/
+text-to-image, which site/scripts/gen_pin.py writes everywhere) moved to a revision
+with the same weights. A string that names the base's pinned revision may name the
+new one when the Hub (HF_ENDPOINT) lists the two revisions with the same files and
+every weight object (each LFS file) the same; the other files that differ, a run's
+record for one, are printed for the reviewer.
 Whether the library's rename keeps what the recording shows (a label, a value it
 prints) is the head's own claim. Its reviewer reads the renamings printed here. A
 change that is not a renaming, or a recording that was already of other code,
@@ -28,9 +35,11 @@ import argparse
 import io
 import json
 import keyword
+import os
 import subprocess
 import sys
 import tokenize
+import urllib.request
 from collections.abc import Callable
 from pathlib import Path
 
@@ -40,6 +49,7 @@ import cells
 SITE = Path(__file__).resolve().parents[1]
 REPO = SITE.parent
 IGNORED = (tokenize.COMMENT, tokenize.NL, tokenize.ENCODING, tokenize.ENDMARKER)
+PIN = "site/live/container/text-to-image"
 
 
 def recordings(read: Callable[[str], str]) -> dict[tuple[str, str], str]:
@@ -79,8 +89,9 @@ def tokens(source: str) -> list[tuple[tokenize.TokenInfo, bool]]:
     return marked
 
 
-def renamings(before: str, after: str) -> dict[str, str]:
-    """The identifiers `after` renames from `before`, old to new; a ValueError, naming the first other
+def renamings(before: str, after: str, moved: tuple[str, str]) -> dict[str, str]:
+    """The identifiers `after` renames from `before`, old to new, and `moved`, the pinned revision's
+    (old, new), where a string names the new one in place of the old; a ValueError, naming the first other
     difference, when it differs otherwise."""
     old, new = tokens(before), tokens(after)
     if len(old) != len(new):
@@ -89,6 +100,10 @@ def renamings(before: str, after: str) -> dict[str, str]:
     variables = {token.string for token, member in old if token.type == tokenize.NAME and not member}
     for (was, member), (now, _) in zip(old, new, strict=True):
         if (was.type, was.string) == (now.type, now.string):
+            continue
+        if was.type == now.type == tokenize.STRING and moved[0] in was.string and \
+                was.string.replace(*moved) == now.string:
+            renamed.setdefault(*moved)
             continue
         if not (was.type == now.type == tokenize.NAME) or any(
                 keyword.iskeyword(name) or keyword.issoftkeyword(name) for name in (was.string, now.string)):
@@ -107,6 +122,29 @@ def renamings(before: str, after: str) -> dict[str, str]:
     return renamed
 
 
+def weights_kept(repository: str, old: str, new: str) -> list[str]:
+    """The files other than weights that differ between `repository`'s revisions `old` and `new`, which hold
+    the same files and the same weight objects; a ValueError where they do not."""
+    def tree(revision: str) -> dict[str, dict]:
+        endpoint = os.environ.get("HF_ENDPOINT", "https://huggingface.co")
+        url = f"{endpoint}/api/models/{repository}/tree/{revision}?recursive=true"
+        with urllib.request.urlopen(url, timeout=60) as answer:
+            return {item["path"]: item for item in json.load(answer) if item["type"] == "file"}
+
+    was, now = tree(old), tree(new)
+    if set(was) != set(now):
+        raise ValueError(f"{repository}@{new[:9]} holds other files than @{old[:9]}: "
+                         f"{sorted(set(was) ^ set(now))[:5]}")
+    weights = [path for path in was if "lfs" in was[path] or "lfs" in now[path]]
+    def oid(item: dict) -> str | None:
+        return (item.get("lfs") or {}).get("oid")
+
+    changed = [path for path in weights if oid(was[path]) != oid(now[path])]
+    if changed:
+        raise ValueError(f"{repository}@{new[:9]} has other weights than @{old[:9]}: {changed[:5]}")
+    return sorted(path for path in was if path not in weights and was[path]["oid"] != now[path]["oid"])
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument("--base", default="origin/main",
@@ -118,6 +156,9 @@ def main() -> int:
                               capture_output=True, text=True).stdout
 
     now, before = recordings(lambda path: (REPO / path).read_text()), recordings(at_base)
+    repository, old = at_base(PIN).strip().split("@")
+    new = (REPO / PIN).read_text().strip().split("@")[1]
+    moved, kept = (old, new), False
     captures = {path: json.loads((REPO / path).read_text()) for path, _ in now}
     digests, refused = {}, []
     for (path, key), program in now.items():
@@ -129,11 +170,16 @@ def main() -> int:
             refused.append(f"{name}: the recording is not of {options.base}'s program either")
             continue
         try:
-            renamed = renamings(before[path, key], program)
+            renamed = renamings(before[path, key], program, moved)
+            if old in renamed and not kept:
+                differing = weights_kept(repository, old, new)
+                print(f"{repository}: @{old[:9]} -> @{new[:9]}, the same weights; other files differing: "
+                      f"{', '.join(differing) or 'none'}")
+                kept = True
         except ValueError as difference:
             refused.append(f"{name}: {difference}")
             continue
-        print(f"{name}: " + ", ".join(f"{old} -> {new}" for old, new in sorted(renamed.items())))
+        print(f"{name}: " + ", ".join(f"{a} -> {b}" for a, b in sorted(renamed.items())))
         digests[path, key] = (recorded, digest)
     if refused:
         print("not a rename, so record again (site/scripts/capture_snippets.py):\n  "
