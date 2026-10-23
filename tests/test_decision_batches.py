@@ -99,6 +99,10 @@ def test_a_batchs_probabilities_are_each_bodys_alone(decide):
         return ([{**cases[index % len(cases)], "state": " ".join(rng.choice(words, 12))}
                  for index in range(4)],)
 
+    from reference_error import seeds_for
+    print("SIZED batched", seeds_for(lambda bodies: scored(decide, bodies, together=False), draw, "batched sizing",
+                                     truth_fn=truth, dew_fn=lambda bodies: scored(decide, bodies, together=True)),
+          flush=True)
     assert_as_exact(lambda bodies: scored(decide, bodies, together=True),
                     lambda bodies: scored(decide, bodies, together=False), draw,
                     "batched probabilities", seeds=BATCH_SEEDS, truth_fn=truth)
