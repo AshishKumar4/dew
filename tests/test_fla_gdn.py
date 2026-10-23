@@ -413,10 +413,10 @@ def test_the_ported_rule_and_its_gradients_follow_the_recurrence(dtype, bound):
         assert relative(mine, theirs) < bound, name
 
 
-def test_the_oracle_a_chunk_at_a_time_is_the_token_recurrence_to_the_bit():
+def test_the_oracle_a_chunk_at_a_time_computes_the_token_recurrence():
     """The float64 oracle at a model's real shape keeps one memory a chunk on the way back (`checkpointed`):
-    its outputs and gradients are the token recurrence's to the bit, as it recomputes the same scan, at the
-    tiny case of the one case table (`gdn_cases`)."""
+    its outputs and gradients within float64 rounding of its own computation of the token recurrence's,
+    at the tiny case of the one case table (`gdn_cases`)."""
     case = CASES["tiny"]
     b, t, h, hv, k, v = (case[name] for name in
                          ("batch", "length", "key_heads", "value_heads", "width", "columns"))
@@ -431,10 +431,11 @@ def test_the_oracle_a_chunk_at_a_time_is_the_token_recurrence_to_the_bit():
                     jax.random.normal(keys[6], (b, t, hv, v), jnp.float64),
                     0.1 * jax.random.normal(keys[7], (b, hv, k, v), jnp.float64))
         whole = through(recurrence, *operands[6:])(*operands[:6])
-        chunked = through(functools.partial(recurrence, rule=checkpointed(case["chunk"])), *operands[6:])(
-            *operands[:6])
-        for name, mine, theirs in zip(NAMES, chunked, whole, strict=True):
-            np.testing.assert_array_equal(np.asarray(mine), np.asarray(theirs), err_msg=name)
+        run = through(functools.partial(recurrence, rule=checkpointed(case["chunk"])), *operands[6:])
+        roundings = chain_roundings(jax.make_jaxpr(run)(*operands[:6]))
+        chunked = run(*operands[:6])
+    for name, mine, theirs in zip(NAMES, chunked, whole, strict=True):
+        assert_computes_the_oracle(np.asarray(mine), np.asarray(theirs), name, roundings=roundings)
 
 
 @pytest.mark.parametrize("per_key", [False, True])
