@@ -76,7 +76,7 @@ FORMS = {
 }
 """Each residual a decoder carries beside the plain stream, which the blocks read and join in its form."""
 
-SEEDS = {"block float32": 64, "block bfloat16": 64, "base": 16, "decode": 16, "scan": 16, "fresh altup": 16,
+SEEDS = {"block float32": 512, "block bfloat16": 64, "base": 16, "decode": 16, "scan": 16, "fresh altup": 16,
          "fresh mhc": 32, "fresh single-pass-mhc": 16, "fresh depth": 16, "fresh ngpt": 8}
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` on armada."""
 
