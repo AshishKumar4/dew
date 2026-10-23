@@ -1088,6 +1088,10 @@ def dq_step(sums: DqSums, weights: jax.Array, cotangents: jax.Array, slopes, see
     grads = tuple(grad + piece if row else grad for grad, row, piece in zip(sums.grads, summed, pieces,
                                                                            strict=True))
     pulled_weights, pieces = pulled(weights, slopes, seen, kinds)
+    import os
+    if os.environ.get("DEW_FA_MATH"):
+        return sums._replace(dq=dq, residual=sums.residual + cotangents.sum(axis=-1),
+                             mass=sums.mass + weights.sum(axis=-1), grads=grads)
     weighed = sums.weighed
     if any(summed):
         weighed = tuple(total + piece if row else total
@@ -1241,8 +1245,9 @@ def cotangent_product(cotangents: jax.Array, operand: jax.Array,
     def oriented(x):
         return x.T if transposed else x
 
-    if operand.dtype == jnp.float32:
-        return dot(oriented(cotangents), operand)
+    import os
+    if operand.dtype == jnp.float32 or os.environ.get("DEW_FA_MATH"):
+        return dot(oriented(cotangents.astype(operand.dtype)), operand)
     if operand.dtype == jnp.bfloat16:
         high = cotangents.astype(jnp.bfloat16)
         rest = cotangents - high.astype(jnp.float32)
