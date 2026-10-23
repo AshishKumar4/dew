@@ -2,6 +2,8 @@
 and rounds once, through every product a layer forms, its gradient's and tangent's included, with x64
 off; 16-bit products and other backends keep their own arithmetic."""
 
+import contextlib
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -76,14 +78,17 @@ def test_a_float32_product_returns_the_dtype_asked():
     assert result.dtype == jnp.float32 and float(result[0, 0]) == 1.0
 
 
-def test_a_trace_for_an_assumed_gpu_target_keeps_its_fp32_sum():
-    """A step traced for an assumed GPU target (`generation.assumed`) on a CPU forms the target's
-    product, summed in fp32, with no float64 in its program: the policy is real CPU execution's."""
+@pytest.mark.parametrize("assumed_first", [True, False])
+def test_the_policy_is_the_executing_platforms_whatever_target_a_trace_assumed(assumed_first):
+    """One jitted product, run on a CPU inside and outside `generation.assumed` in either order,
+    gives the CPU policy's float64 sum each time: a trace's assumed target chooses kernels, never the
+    sum a CPU executes, so no cached trace carries another call's policy."""
     from dew.nn.kernels.generation import assumed
 
+    product = jax.jit(lambda lhs, rhs: float32_dot_general(lhs, rhs, (((1,), (0,)), ((), ()))))
     lhs, rhs = CANCELLING[None], np.ones((3, 1), np.float32)
-    dims = (((1,), (0,)), ((), ()))
-    with assumed("sm80"):
-        text = jax.jit(lambda: float32_dot_general(lhs, rhs, dims)).lower().as_text()
-    assert "f64" not in text
-
+    results = []
+    for inside in (assumed_first, not assumed_first):
+        with assumed("sm80") if inside else contextlib.nullcontext():
+            results.append(float(product(lhs, rhs)[0, 0]))
+    assert results == [1.0, 1.0]
