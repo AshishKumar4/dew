@@ -165,23 +165,22 @@ def test_capture_does_not_retain_donated_arrays(tmp_path, native_reports):
 @pytest.mark.mesh(devices=2)
 @pytest.mark.skipif(jax.default_backend() != "cpu",
                     reason="only the CPU leaves a donated replicated array live with one buffer")
-def test_a_capture_drains_past_an_array_a_donation_consumed(tmp_path, native_reports):
-    """An array still held after a step donated it can list as live with
-    only its first buffer left: XLA counts an array deleted by that buffer,
-    and a host read of a replicated array keeps it from the donation (jax
-    0.11.2 on CPU). The capture's drain waits on the work in flight without
-    waiting on the consumed array."""
+def test_a_capture_drains_past_a_live_array_with_a_deleted_buffer(tmp_path, native_reports):
+    """An array can list as live with one of its buffers deleted, and waiting on it raises: one whose
+    shard's buffer its holder deleted (on jax 0.11.2, too, one a donation consumed but a host read kept
+    listed). The capture's drain waits on the work in flight without waiting on such an array."""
     from jax.sharding import NamedSharding, PartitionSpec as P
 
     mesh = jax.make_mesh((jax.device_count(),), ("data",))
-    consumed = jax.device_put(jnp.asarray(0, jnp.int32), NamedSharding(mesh, P()))
-    assert int(consumed) == 0
-    stepped = jax.jit(lambda value: value + 1, donate_argnums=0)(consumed)
-    assert any(array is consumed for array in jax.live_arrays())
-    assert consumed.addressable_shards[1].data.is_deleted()
+    held = jax.device_put(jnp.asarray(0, jnp.int32), NamedSharding(mesh, P()))
+    held.addressable_shards[1].data.delete()
+    assert any(array is held for array in jax.live_arrays())
+    with pytest.raises(jax.errors.JaxRuntimeError):
+        jax.block_until_ready(held)
+    stepped = jax.jit(lambda value: value + 1)(jnp.asarray(1, jnp.int32))
     with dew.Profiler(tmp_path):
         stepped = stepped + 1
-    assert stepped.is_ready() and int(stepped) == 2
+    assert stepped.is_ready() and int(stepped) == 3
 
 
 def test_native_export_failure_keeps_body_exception_and_trace(tmp_path, native_reports, monkeypatch):
