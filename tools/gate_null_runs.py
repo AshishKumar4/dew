@@ -97,12 +97,37 @@ ORDERS = 4
 """The orders of an orbit class's draws (`orbited`): the draw's own and ORDERS - 1 others."""
 
 
+REORDERED = 1 << 10
+"""The order an orbit class's equally exact pair takes (`paired_runs`), outside every orbit's own."""
+
+
 def orbited(permuting):
-    """An orbit (`assert_as_exact`'s `orbit`) of ORDERS orders, the draw's own first: `permuting(inputs,
-    order)` the inputs at a permutation the order's own stream draws."""
+    """An orbit (`assert_as_exact`'s `orbit`) of ORDERS orders, the draw's own first, `permuting(inputs,
+    order)` the inputs at a permutation the order's own stream draws; and the same computation at the
+    order REORDERED, an implementation as exact as the class's own, summing every sum in another order."""
     def orbit(inputs):
         return [inputs, *(permuting(inputs, order) for order in range(1, ORDERS))]
+    orbit.reordered = lambda reference: lambda *inputs: reference(*permuting(inputs, REORDERED))
     return orbit
+
+
+def paired_runs(reference, draw, label: str, *, seeds: int, runs: int, first: int, truth_fn, orbit,
+                judged_over_orbit: bool) -> list[tuple[str, int]]:
+    """Check 1 run `runs` times on an equally exact pair on the same draws: the class's reference against
+    itself at another order (`orbited`'s reordered), each run on draws no other run takes, its rows
+    judged over the orbit or at the draw's own order alone: the false-red rate of a site that declares
+    an orbit, and of the same site without it."""
+    from reference_error import REDRAW, _drawn, _staged
+
+    verdicts, span = [], (1 + REDRAW) * seeds
+    for run in range(first, first + runs):
+        def drawn(start, stop, base=run * span):
+            return _drawn(orbit.reordered(reference), reference, draw, range(base + start, base + stop),
+                          truth_fn, orbit=orbit if judged_over_orbit else None)
+
+        over, unresolved, stage = _staged(drawn, seeds, label)
+        verdicts.append(("over" if over else "inconclusive" if unresolved else "pass", stage))
+    return verdicts
 
 
 def contraction_terms():
@@ -406,6 +431,8 @@ def main(argv: list[str]) -> int:
                         "from float64 by leaf over this many draws past every run's, for a sizing model")
     parser.add_argument("--chunk", type=int, default=0)
     parser.add_argument("--orbit", action="store_true", help="judge an orbit class's rows over its orbit")
+    parser.add_argument("--paired", action="store_true", help="instead, the equally exact pair on the same "
+                        "draws (`paired_runs`): an orbit class's reference at another order against itself")
     options = parser.parse_args(argv)
     from reference_error import null_runs, seeds_for
 
@@ -427,6 +454,13 @@ def main(argv: list[str]) -> int:
         print(json.dumps({"class": options.name, "chunk": options.chunk, "names": draws.names,
                           "mse": np.asarray(draws.mine).tolist(),
                           "worst": np.asarray(draws.worst[..., 0]).tolist()}), flush=True)
+        return 0
+    if options.paired:
+        verdicts = paired_runs(reference, draw, options.name, seeds=options.seeds, runs=options.runs,
+                               first=OFFSET + options.chunk * options.runs, truth_fn=truth, orbit=orbits[0],
+                               judged_over_orbit=options.orbit)
+        print(json.dumps({"class": options.name, "chunk": options.chunk, "seeds": options.seeds,
+                          "paired": True, "orbit": options.orbit, "verdicts": verdicts}), flush=True)
         return 0
     if options.seeds is None:
         sized = seeds_for(reference, draw, options.name, truth_fn=truth)
