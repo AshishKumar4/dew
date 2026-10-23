@@ -962,6 +962,19 @@ def test_a_pool_scores_a_diffusion_validation_pass(tmp_path):
 
 
 @pytest.mark.distributed
+def test_the_readers_of_one_share_score_and_pack_one_synchronous_rollout(tmp_path):
+    """`tensor` across two processes, both reading the one share, a stochastic reward drawing
+    differently on each: the first reader alone scores, and both hand the step the rows, advantages
+    and likelihoods it packed. Scored on each reader, the replicas trained on different
+    advantages."""
+    first, second = run_pool("replicated_rollout", tmp_path, 2, timeout=120, devices=1)
+    assert first["partition"] == {"count": 1, "readers": 2}
+    assert first["rewarded"][0] > 0 and first["rewarded"][1] == 0
+    for name, rows in first["handed"].items():
+        np.testing.assert_array_equal(rows[1], rows[0], err_msg=name)
+    assert second["handed"] == first["handed"]
+
+
 def test_a_pool_samples_rollouts_with_different_lengths_and_eos(tmp_path):
     """Two ranks own prompts of different lengths and stop at different steps.
 
