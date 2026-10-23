@@ -442,7 +442,7 @@ def plan(target: float, timings: dict) -> list[dict]:
     then on. Files marked `torchax` (`APART`) share tasks only with one another. Each entry carries
     the test cache's policy, DEW_TEST_CACHE here, to its task."""
     cache = "off" if os.environ.get("DEW_TEST_CACHE") == "off" else "on"
-    every = sorted(str(path) for path in Path("tests").glob("test_*.py") if str(path) not in SKIPPED)
+    every = test_files()
     recorded = recorded_tests()
     entries = []
     for python in PYTHONS:
@@ -705,57 +705,105 @@ def listed(prefix: str, token: str) -> list[str]:
     return list(store(token).keys(prefix))
 
 
-def gpu_tier(python: str) -> dict[str, list[str]]:
-    """The test files that take another path on a GPU, each with its evidence: where its tests read
-    the backend and its marks of `session.MARKS`, over every record of its rows,
-    on every class, a split file's under each count of groups it was planned as. A file is out
-    only where every record is of these inputs (`fresh`), a CPU task's (`shared`) or a GPU lane's
-    (`lane_inputs`), and says neither, so a file whose inputs changed since it ran is in as "changed",
-    and one without a record, or with one the Worker did not return, as "unrecorded": a new file, or one
-    no green run of these tools has recorded."""
+def file_records(python: str) -> dict[str, list[tuple[str, str, dict | None]]]:
+    """Every record of each test file under `python`, the last run's on each class and group (`record_key`):
+    (its class, its group, the record, or None where the Worker did not give it)."""
     token = os.environ.get("DEW_XLA_CACHE_TOKEN")
     if not token or "DEW_XLA_CACHE_URL" not in os.environ:
         raise SystemExit("the GPU tier is chosen from the test cache's records, which need its URL and token")
-    inputs = (shared(python), lane_inputs(python))
     prefix = f"{CACHE_PREFIX}/{python}/"
-
-    def evidence_of(key: str) -> tuple[str, list[str]]:
-        _, name, _ = key_parts(key)
-        found = recorded(f"{prefix}{key}", token)
-        if found is None:
-            return name, ["unrecorded"]
-        current = any(fresh(found, name, common) for common in inputs)
-        return name, found["reads"] or ([] if current else ["changed"])
-
     try:
         keys = listed(prefix, token)
     # The tier is chosen from the records: none listed, none is chosen.
     except r2.R2Error as error:
         raise SystemExit(f"the test cache did not list {prefix}: {error}") from error
-    evidence: dict[str, set[str]] = {}
+
+    def read(key: str) -> tuple[str, str, str, dict | None]:
+        held, name, group = key_parts(key)
+        return name, held, group, recorded(f"{prefix}{key}", token)
+
+    records: dict[str, list[tuple[str, str, dict | None]]] = {}
     with concurrent.futures.ThreadPoolExecutor(32) as pool:
-        for name, found in pool.map(evidence_of, keys):
-            evidence.setdefault(name, set()).update(found)
-    every = sorted(str(path) for path in Path("tests").glob("test_*.py") if str(path) not in SKIPPED)
-    unrecorded = {name: ["unrecorded"] for name in every if name not in evidence}
-    return {name: sorted(evidence[name]) for name in every if evidence.get(name)} | unrecorded
+        for name, held, group, found in pool.map(read, keys):
+            records.setdefault(name, []).append((held, group, found))
+    return records
 
 
-def marked(python: str) -> dict[str, int]:
-    """Each test file of this checkout with tests marked one of `session.MARKS`, and how many, as pytest
-    collects it on the CPU: what a batch's GPU run holds, whatever the records say."""
-    every = sorted(str(path) for path in Path("tests").glob("test_*.py") if str(path) not in SKIPPED)
-    done = subprocess.run([f".venv-{python}/bin/python", "-m", "pytest", "--collect-only", "-q",
-                           "-m", " or ".join(session.MARKS), *every],
-                          capture_output=True, text=True, env={**os.environ, "JAX_PLATFORMS": "cpu"})
-    if done.returncode not in (0, 5):
-        raise SystemExit(f"collecting the marked tests exited {done.returncode}\n"
-                         f"{done.stdout[-4000:]}{done.stderr[-2000:]}")
-    counts: dict[str, int] = {}
-    for node in done.stdout.splitlines():
-        if "::" in node:
-            counts[node.split("::")[0]] = counts.get(node.split("::")[0], 0) + 1
-    return counts
+def test_files() -> list[str]:
+    """This checkout's test files that CI's tasks run (`SKIPPED` aside)."""
+    return sorted(str(path) for path in Path("tests").glob("test_*.py") if str(path) not in SKIPPED)
+
+
+def gpu_tier(python: str) -> dict[str, list[str]]:
+    """The test files that take another path on a GPU, each with its evidence: where its tests read
+    the backend and its marks of `session.MARKS`, over every record of its rows (`file_records`),
+    on every class, a split file's under each count of groups it was planned as. A file is out
+    only where every record is of these inputs (`fresh`), a CPU task's (`shared`) or a GPU lane's
+    (`lane_inputs`), and says neither, so a file whose inputs changed since it ran is in as "changed",
+    and one without a record, or with one the Worker did not return, as "unrecorded": a new file, or one
+    no green run of these tools has recorded."""
+    inputs = (shared(python), lane_inputs(python))
+    records = file_records(python)
+    tier = {}
+    for name in test_files():
+        evidence = set()
+        for _, _, found in records.get(name, [(None, None, None)]):
+            current = found is not None and any(fresh(found, name, common) for common in inputs)
+            evidence.update(["unrecorded"] if found is None
+                            else found["reads"] or ([] if current else ["changed"]))
+        if evidence:
+            tier[name] = sorted(evidence)
+    return tier
+
+
+def marked(python: str) -> dict[str, list[str]]:
+    """Each test file of this checkout with tests marked one of `session.MARKS`, with its evidence: what a
+    batch's GPU run holds. The marks are those a CPU task's run recorded (executed.py records each test's
+    marks as it runs, a test skipped on the CPU included), where a fresh record of every group of one run
+    of the file on one class (`fresh`, its whole row or each of its split's) shows them; a file no such run
+    covers is collected here on the CPU, under the marks' selection, and counted."""
+    inputs = (shared(python), lane_inputs(python))
+    records = file_records(python)
+
+    def recorded_marks(name: str) -> set[str] | None:
+        """The marks of a complete, fresh run of `name` on one class, or None where no class holds one."""
+        runs: dict[tuple[str, str], dict] = {
+            (held, group): found for held, group, found in records.get(name, [])
+            if found is not None and any(fresh(found, name, common) for common in inputs)}
+        for held in sorted({held for held, _ in runs}):
+            groups = {group: found for (other, group), found in runs.items() if other == held}
+            counts = {int(group.split("-of-")[1]) for group in groups if "-of-" in group}
+            complete = [[groups["whole"]]] if "whole" in groups else []
+            complete += [[groups[f"{index}-of-{count}"] for index in range(1, count + 1)]
+                         for count in sorted(counts)
+                         if all(f"{index}-of-{count}" in groups for index in range(1, count + 1))]
+            if complete:
+                return {read for found in complete[0] for read in found["reads"] if read.startswith("mark:")}
+        return None
+
+    found: dict[str, list[str]] = {}
+    unknown = []
+    for name in test_files():
+        marks = recorded_marks(name)
+        if marks is None:
+            unknown.append(name)
+        elif marks:
+            found[name] = sorted(marks)
+    if unknown:
+        done = subprocess.run([f".venv-{python}/bin/python", "-m", "pytest", "--collect-only", "-q",
+                               "-m", " or ".join(session.MARKS), *unknown],
+                              capture_output=True, text=True, env={**os.environ, "JAX_PLATFORMS": "cpu"})
+        if done.returncode not in (0, 5):
+            raise SystemExit(f"collecting the marked tests exited {done.returncode}\n"
+                             f"{done.stdout[-4000:]}{done.stderr[-2000:]}")
+        counts: dict[str, int] = {}
+        for node in done.stdout.splitlines():
+            if "::" in node:
+                counts[node.split("::")[0]] = counts.get(node.split("::")[0], 0) + 1
+        found.update({name: [f"{count} marked"] for name, count in counts.items()})
+    print(f"marks of {len(test_files()) - len(unknown)} test files from their records; "
+          f"{len(unknown)} collected", file=sys.stderr)
+    return dict(sorted(found.items()))
 
 
 GPU_HEADROOM = (1.25, 2 ** 30)
@@ -1099,8 +1147,7 @@ def main() -> int:
         print(f"{len(recorded)} tests, {sum(recorded.values()):.0f} s, in {session.DURATIONS}")
         return 0
     if args.operation == "gpu-tier":
-        tier = ({name: [f"{count} marked"] for name, count in marked(PYTHONS[0]).items()} if args.marked
-                else gpu_tier(PYTHONS[0]))
+        tier = marked(PYTHONS[0]) if args.marked else gpu_tier(PYTHONS[0])
         if args.evidence:
             for name, evidence in tier.items():
                 print(name, *evidence, sep="\t")
