@@ -38,7 +38,7 @@ from __future__ import annotations
 
 import dataclasses
 from collections.abc import Mapping, Sequence
-from typing import TYPE_CHECKING, Protocol, Self, runtime_checkable
+from typing import TYPE_CHECKING, Literal, Protocol, Self, runtime_checkable
 
 import jax
 import jax.numpy as jnp
@@ -69,6 +69,7 @@ __all__ = [
     "BlockDrafting",
     "Bounded",
     "CacheCapacity",
+    "Capability",
     "Counted",
     "CountedCondition",
     "CountedConditionLayout",
@@ -94,6 +95,7 @@ __all__ = [
     "Generating",
     "HiddenStates",
     "IntervalModel",
+    "Lacks",
     "LayerScalars",
     "LayerStates",
     "Layered",
@@ -115,6 +117,30 @@ __all__ = [
     "TokenModel",
     "TritonGemm",
 ]
+
+
+type Capability = Literal["logits", "causal", "bidirectional", "packing", "cache", "interval", "guided",
+                          "features", "canvas"]
+"""What a consumer can need of a model past its protocols' presence: its logits (`Logits`, or states
+through a head), causal or bidirectional attention (`TokenModel.causal`), packed rows apart, a token
+by token decode cache (`Decoding`), an interval's duration (`IntervalModel`), a guidance input, block
+outputs a discriminator reads, or a canvas against a committed cache (`BlockDenoiser`)."""
+
+
+class Lacks(TypeError, ValueError):
+    """A consumer's refusal of a model for a capability it lacks, raised where the consumer first
+    reads it: as it admits the model, or in the step that reads it. `capability` names what it
+    lacks, so a caller tells the refusal from any other error by that and not by the message. A
+    TypeError, as a model of the wrong kind, and a ValueError, as one configured otherwise, as numpy's
+    `AxisError` is both of its errors."""
+
+    def __init__(self, capability: Capability, message: str):
+        super().__init__(message)
+        self.capability = capability
+
+    def __reduce__(self):
+        # Rebuilt from its own fields, as a pickle or a process boundary carries it.
+        return type(self), (self.capability, self.args[0])
 
 
 @struct.dataclass
