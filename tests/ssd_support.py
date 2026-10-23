@@ -83,14 +83,10 @@ def mamba2_run(site, arrays):
 
 
 def ssd_value_and_grad(scan, operands, dy, dfinal):
-    """A scan's output, final state and all seven operand gradients under both cotangents, each output
-    at its product's dtype with its cotangent, pulled back through the gate
-    (`reference_error.with_gradients`)."""
-    def promoted(*args):
-        out, final = scan(*args)
-        return out.astype(jnp.result_type(out, dy)), final.astype(jnp.result_type(final, dfinal))
-
-    (out, final), *grads = with_gradients(promoted)(*operands, (dy, dfinal))
+    """A scan's output, final state and all seven operand gradients under both cotangents, each cast to
+    its output's dtype, pulled back through the gate (`reference_error.with_gradients`)."""
+    out, final = jax.eval_shape(scan, *operands)
+    (out, final), *grads = with_gradients(scan)(*operands, (dy.astype(out.dtype), dfinal.astype(final.dtype)))
     return {"y": out, "final": final, **dict(zip(("x", "dt", "A", "B", "C", "D", "h0"),
                                                grads, strict=True))}
 

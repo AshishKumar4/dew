@@ -793,8 +793,12 @@ def test_a_fused_kernel_differentiates_at_every_order_through_its_portable_arith
             return sum(jnp.square(leaf.astype(jnp.float32)).sum() for leaf in jax.tree.leaves(out))
 
         def gradient(function, one):
-            # The first operand's gradient, through the gate's pullback of the score's one.
-            return lambda first, *rest: with_gradients(function)(first, *rest, one)[1]
+            # The first operand's gradient, through the gate's pullback of the score's one at its dtype.
+            def run(first, *rest):
+                score_dtype = jax.eval_shape(function, first, *rest).dtype
+                return with_gradients(function)(first, *rest, jnp.asarray(one, score_dtype))[1]
+
+            return run
 
         def run(first, tangent, one, *rest):
             if composition == "jvp_grad":

@@ -63,15 +63,11 @@ def recurrence(q, k, v, g, beta, h0, cuts=None, rule=rule_math):
 
 
 def through(rule, do, dht):
-    """`rule`'s output, final memory and its operands' gradients under the cotangents `do`, `dht`, the
-    output and memory taken at their cotangents' dtypes, pulled back through the gate
-    (`reference_error.with_gradients`)."""
-    def at_cotangents(*args):
-        out, final = rule(*args)
-        return out.astype(do.dtype), final.astype(dht.dtype)
-
+    """`rule`'s output, final memory and its operands' gradients under the cotangents `do`, `dht`, each
+    cast to its output's dtype, pulled back through the gate (`reference_error.with_gradients`)."""
     def run(*args):
-        (out, final), *grads = with_gradients(at_cotangents)(*args, (do, dht))
+        out, final = jax.eval_shape(rule, *args)
+        (out, final), *grads = with_gradients(rule)(*args, (do.astype(out.dtype), dht.astype(final.dtype)))
         return out, final, *grads
 
     return run
