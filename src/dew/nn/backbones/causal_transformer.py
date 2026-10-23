@@ -1323,12 +1323,14 @@ class CausalTransformer(nn.Module):
 
     def mtp_logits(self, hidden, tokens, train: bool = False, positions=None,
                    segment_ids=None, input_embeddings=None,
-                   attention_mask=None, image_groups=None, rotary_positions=None):
-        """Return the shared language head's logits for each prediction depth's hidden states."""
+                   attention_mask=None, image_groups=None, rotary_positions=None,
+                   conditioning: Mapping[str, jax.Array] | None = None):
+        """Return the shared language head's logits for each prediction depth's hidden states; a
+        call's `conditioning` is the trunk's (`mtp_hidden_states`)."""
         return [self._logits(state) for state in self.mtp_hidden_states(
             hidden, tokens, train=train, positions=positions, segment_ids=segment_ids,
             input_embeddings=input_embeddings, attention_mask=attention_mask, image_groups=image_groups,
-            rotary_positions=rotary_positions)]
+            rotary_positions=rotary_positions, conditioning=conditioning)]
 
     def mtp_step(self, hidden, tokens, *, depth: int = 0, positions=None,
                  input_embeddings=None, attention_mask=None, rotary_positions=None,
@@ -1628,6 +1630,10 @@ class CausalTransformer(nn.Module):
         if context is not None and context.embeddings.shape[0] != tokens.shape[0]:
             raise ValueError(f"a context row per token row, got {context.embeddings.shape[0]} for "
                              f"{tokens.shape[0]}")
+        if context is not None:
+            # The context enters in the dtype a server holds it in (`context_dtype`), so a served and
+            # a standalone call, and a cached and a full one, project the same values.
+            context = context.replace(embeddings=context.embeddings.astype(self.context_dtype))
         # A layer whose mixer reads no pairwise mask refuses one (`MixerCall`).
         if key_positions is not None and pairwise_mask is None:
             raise ValueError("attention_key_positions requires attention_pairwise_mask")
