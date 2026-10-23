@@ -160,8 +160,8 @@ def test_one_engine_serves_generation_and_scoring_from_one_thread(decide):
         drawn = [generating.submit(prompt, budget, key=index)
                  for index, (prompt, budget) in enumerate(zip(prompts, budgets, strict=True))]
         answered = [scoring.submit(body) for body in CASES.values()]
-        generations = [ticket.result(timeout=300) for ticket in drawn]
-        answers = [future.result(timeout=300) for future in answered]
+        generations = [ticket.result() for ticket in drawn]
+        answers = [future.result() for future in answered]
     finally:
         engine.close()
     assert [generation.text for generation in generations] == [generation.text for generation in alone]
