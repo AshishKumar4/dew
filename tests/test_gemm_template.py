@@ -594,6 +594,29 @@ def relu(x, weight):
     return (jax.nn.relu(_wide(x)) * weight).astype(x.dtype)
 
 
+def test_a_fused_producers_launch_keys_its_picks_by_what_its_prologue_computes():
+    """A fused producer's launches store and read back as a step's plan records them (`tuning.tune`'s
+    launches), their prologue keyed by what it computes: the same producer traced twice keys alike, another
+    producer apart."""
+    sizes = jnp.asarray(SIZES, jnp.int32)
+    rng = np.random.default_rng(3)
+    x = jnp.asarray(rng.normal(size=(ROWS, DEPTH)), jnp.bfloat16)
+    w = jnp.asarray(rng.normal(size=(len(SIZES), DEPTH, WIDTH)), jnp.bfloat16)
+    weight = jnp.asarray(rng.normal(size=(DEPTH,)), jnp.float32)
+
+    def keys(producer):
+        def fusing(x, w, weight):
+            return fused.fusible_gemm(producer(x, weight), w, sizes, interpret_on_cpu=True)
+
+        with generation.assumed("sm90"), tuning.seen() as launches:
+            jax.jit(fuser.fuse(fusing)).lower(x, w, weight)
+        text = tuning.dumps_launches([ba for _, ba in launches])
+        assert len(tuning.loads_launches(text)) == len(launches)
+        return text
+
+    assert keys(rms_norm) == keys(rms_norm) != keys(relu)
+
+
 @pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))
 def test_a_normed_operand_runs_in_the_prologue_with_the_programs_value(generation_name):
     """Under `fuser.fuse`, an RMS norm producing the product's left operand runs in the kernels' prologue
