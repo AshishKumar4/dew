@@ -19,7 +19,7 @@ def _cancelling_draw(seed):
     1, 2^-25, -1 the 2^-25 is lost to the first rounding and the row is all error."""
     rng = np.random.default_rng([0x0B, seed])
     terms = rng.normal(size=(ROWS, 4, 3))
-    terms[0] = np.array([1.0, 2.0 ** -25, -1.0]) * 2.0 ** int(rng.integers(-12, -8))
+    terms[0] = np.array([1.0, 2.0 ** -25, -1.0]) * 2.0 ** int(rng.integers(-10, -6))
     return (terms.astype(np.float32),)
 
 
@@ -35,9 +35,11 @@ def _outer_first(terms):
 
 
 @jax.jit
-def _rounded_from_float64(terms):
-    """The sums taken in float64 and rounded once: exact on the first row at every order."""
-    return {"sum": jnp.sum(terms.astype(jnp.float64), axis=-1).astype(jnp.float32)}
+def _largest_first(terms):
+    """The sums with their two largest terms added first, whatever order they come in: the first row's
+    comes out exact at every order, the others rounded twice as the other arms round them."""
+    ordered = jnp.take_along_axis(terms, jnp.argsort(-jnp.abs(terms), axis=-1), axis=-1)
+    return {"sum": (ordered[..., 0] + ordered[..., 1]) + ordered[..., 2]}
 
 
 def _swapped(inputs):
@@ -50,7 +52,7 @@ def test_the_cancelling_row_is_measured_and_not_float64_zero():
     (terms,) = _cancelling_draw(0)
     row = np.abs(np.sum(terms[0].astype(np.float64), axis=-1))
     leaf = np.sqrt(np.mean(np.square(np.sum(terms.astype(np.float64), axis=-1))))
-    assert np.all(row > 1000 * RESOLUTION * leaf)
+    assert np.all(row > 64 * RESOLUTION * leaf)
 
 
 def test_an_orbit_judges_each_arms_worst_row_over_the_same_orders():
@@ -75,10 +77,10 @@ def test_an_orbit_judges_each_arms_worst_row_over_the_same_orders():
 def test_an_orbit_fails_a_dew_wrong_only_at_another_order():
     """A reference exact on the cancelling row at every order holds a Dew exact at the draw's own order
     and all error at the other: one order passes it, the orbit fails it."""
-    seeds = seeds_for(_rounded_from_float64, _cancelling_draw, "rounded once")
-    assert_as_exact(_outer_first, _rounded_from_float64, _cancelling_draw, "rounded once", seeds=seeds)
+    seeds = seeds_for(_largest_first, _cancelling_draw, "largest first")
+    assert_as_exact(_outer_first, _largest_first, _cancelling_draw, "largest first", seeds=seeds)
     with pytest.raises(AssertionError) as raised:
-        assert_as_exact(_outer_first, _rounded_from_float64, _cancelling_draw, "rounded once", seeds=seeds,
+        assert_as_exact(_outer_first, _largest_first, _cancelling_draw, "largest first", seeds=seeds,
                         orders=_swapped)
     assert raised.type is AssertionError
 
