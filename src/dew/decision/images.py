@@ -17,7 +17,7 @@ class Images:
     """A request's images as the backbone's processor prepares them.
 
     That is the tokens it expands them to, which a layout places in the row
-    (`Layout.image`), each of its per-token fields over those tokens, and its
+    (`Layout.images`), each of its per-token fields over those tokens, and its
     pixel fields. The processor runs over the images' texts and a newline,
     and the row's text tokens take 0 in every per-token field.
     """

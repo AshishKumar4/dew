@@ -291,7 +291,7 @@ class Decide:
                  images: Sequence[Image.Image] = (), context: JSON | None = None) -> dict[str, Answer]:
         """Return one answer per question in `questions`, about `state` and any `images`.
 
-        Images need a layout with a place for them (`Layout.image`) and the
+        Images need a layout with a place for them (`Layout.images`) and the
         backbone's processor, as a joint-head release brings. `context` is a
         sequence the decision reads beside the state through the backbone's
         cross-attention (`Example.context`).
@@ -336,9 +336,9 @@ class Decide:
     def _seen(self, state: JSON, questions: Mapping[str, Question], images: Sequence[Image.Image],
               context: JSON | None = None) -> tuple[dict[str, Answer], Usage]:
         """One request's answers and usage, its images laid out in its one row."""
-        if self.processor is None or self.layout.image is None:
+        if self.processor is None or not self.layout.images:
             raise ValueError("images need a backbone with a vision encoder, which this task does not have")
-        media = Images.of(self.processor, images, self.layout.image)
+        media = Images.of(self.processor, images, self.processor.image_text())
         rows = self._encoded(state, questions, media.tokens, context=context)
         if len(rows) != 1:
             raise ValueError("a request's images go in a layout of one row")
