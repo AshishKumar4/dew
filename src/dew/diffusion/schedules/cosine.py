@@ -4,7 +4,7 @@ import math
 
 import numpy as np
 
-from .discrete import DiscreteNoiseScheduler
+from .discrete import BetaTable
 
 
 def cosine_beta_schedule(timesteps, start_angle=0.008, end_angle=0.999):
@@ -25,7 +25,7 @@ def cosine_beta_schedule(timesteps, start_angle=0.008, end_angle=0.999):
                      for i in range(timesteps)], np.float64)
 
 
-class CosineNoiseScheduler(DiscreteNoiseScheduler):
+class CosineNoiseScheduler(BetaTable):
     """The cosine beta table of Nichol and Dhariwal 2021.
 
     `beta_start` is the offset s of `cosine_beta_schedule`, and `beta_end`
@@ -33,10 +33,9 @@ class CosineNoiseScheduler(DiscreteNoiseScheduler):
     of `DiscreteNoiseScheduler`.
     """
 
+    table = staticmethod(cosine_beta_schedule)
+
     def __init__(self, timesteps: int, beta_start: float = 0.008, beta_end: float = 0.999,
                  p2_loss_weight_k: float = 1, p2_loss_weight_gamma: float = 1):
-        super().__init__(cosine_beta_schedule(timesteps, beta_start, beta_end),
-                         p2_loss_weight_k=p2_loss_weight_k,
-                         p2_loss_weight_gamma=p2_loss_weight_gamma)
-        self.timesteps, self.beta_start, self.beta_end = timesteps, beta_start, beta_end
+        super().__init__(timesteps, beta_start, beta_end, p2_loss_weight_k, p2_loss_weight_gamma)
 

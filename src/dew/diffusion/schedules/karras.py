@@ -6,6 +6,13 @@ import jax.numpy as jnp
 from .common import GeneralizedNoiseScheduler
 
 
+def rho_ramp(low_inv, high_inv, ramp, rho):
+    """(high_inv + ramp (low_inv - high_inv))^rho: the rho spacing at `ramp` between sigma extremes
+    given as their 1/rho powers, on a number or an array of either library, the one interpolation
+    the scheduler and the published Karras grids take."""
+    return (high_inv + ramp * (low_inv - high_inv)) ** rho
+
+
 class KarrasVENoiseScheduler(GeneralizedNoiseScheduler):
     """Places sigmas along t with the rho spacing of the EDM paper.
 
@@ -23,7 +30,7 @@ class KarrasVENoiseScheduler(GeneralizedNoiseScheduler):
 
     def sigmas(self, t):
         ramp = jnp.clip(1 - jnp.asarray(t, jnp.float32) / self.T, 0.0, 1.0)
-        return (self.max_inv_rho + ramp * (self.min_inv_rho - self.max_inv_rho)) ** self.rho
+        return rho_ramp(self.min_inv_rho, self.max_inv_rho, ramp, self.rho)
 
     def t_of_sigma(self, sigma):
         inv_rho = jnp.asarray(sigma, jnp.float32) ** (1 / self.rho)
