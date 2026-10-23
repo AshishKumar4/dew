@@ -738,11 +738,14 @@ class _Lowering:
     any does, here or in a corpus it mixes; the plan takes the spans each
     keeps through this tree (`dew.data.lowering._split_spans`). `order` is the
     canonical order a resume must find unchanged. `parts_unending` says whether
-    its source is a mix of parts whose orders never end (`unending`), which
-    never ends; `unending` whether its order, its stages read in turn from
-    there, never ends (`reach`); and `rooted` whether a training read repeats
-    it at its root, as it does where nothing in it repeats or ends it. A
-    training order is `endless` where either holds.
+    its source is a mix of parts whose reads never end (`unending`, or a part a
+    read cut per share repeats at its root), which never ends; `unending`
+    whether its order, its stages read in turn from there, never ends
+    (`reach`); `records_unending` whether its records before its batch never
+    end, and `onward` whether they are read on without end anywhere on the
+    way; and `rooted` whether a training read repeats it at its root, as it
+    does where nothing in it repeats or ends it. A training stream is
+    `endless` where its order or that root repeat never ends.
     """
 
     per_share: bool
@@ -757,6 +760,8 @@ class _Lowering:
     order: Mapping[str, object]
     parts_unending: bool
     unending: bool
+    records_unending: bool
+    onward: bool
     rooted: bool
     one_to_one: bool
     """Whether the cache holds one record for each input (`_indexed_cache`), so a memory or indexed
@@ -781,13 +786,14 @@ def ends(stage: Stage) -> bool:
 def reach(stages: Sequence[Stage], unending: bool) -> tuple[bool, bool]:
     """Whether an order read through `stages` in turn, from one that never ends where `unending`,
     never ends, and whether it reads on without end anywhere on the way: a repeat without a count
-    makes it endless, and a stage that `ends` it ends it again. The one reading of an order's
-    finiteness the analysis, an epoch's count and its steps share."""
+    makes it endless, and a stage that `ends` it ends it again, as a Grain transformation of its own
+    (`Native`) may, which nothing says it doesn't. The analysis's one reading of an order's
+    finiteness, which its lowering states (`_Lowering`)."""
     onward = unending
     for stage in stages:
         if isinstance(stage, Repeat) and stage.epochs is None:
             unending = True
-        elif ends(stage):
+        elif ends(stage) or isinstance(stage, Native):
             unending = False
         onward = onward or unending
     return unending, onward
@@ -830,9 +836,12 @@ def _analyzed(
     lowered = tuple(_cut(child, per_share) for child in lowered)
     steps = (*ancestry, *stages)
     repeats = [stage.epochs for stage in steps if isinstance(stage, Repeat)]
-    # A mix or a run of phases never ends where none of its parts does.
-    parts_unending = bool(lowered) and all(child.unending for child in lowered)
+    # A mix or a run of phases never ends where none of its parts does; a read cut per share repeats
+    # a part that repeats nowhere at its own root (`_Build.streamed`, `_Build.shared`).
+    parts_unending = bool(lowered) and all(child.unending or (per_share and not child.repeated)
+                                           for child in lowered)
     unending, _ = reach(stages, parts_unending)
+    records_unending, onward = reach(stages[:_until(stages, (BatchStage, TokenBudget))], parts_unending)
     written = next(((index, stage) for index, stage in enumerate(stages) if isinstance(stage, Repeat)), None)
     absorbed = (
         written
@@ -880,6 +889,8 @@ def _analyzed(
         order,
         parts_unending,
         unending,
+        records_unending,
+        onward,
         not repeats and not any(ends(stage) for stage in steps),
         cache is not None and _indexed_cache(stages[:cache], read),
     )

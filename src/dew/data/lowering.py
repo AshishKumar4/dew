@@ -47,7 +47,6 @@ from dew.data.analysis import (
     _until,
     _volatile,
     ends,
-    reach,
 )
 from dew.data.cache import _Mapped
 from dew.data.concurrent import Concurrently
@@ -1520,7 +1519,7 @@ class _Build:
             return stream, after
         if self.training and self.lowering.rooted:
             rows = _repeated(rows, None, _name(pipeline), self.loading)
-        elif self.training and not self.lowering.endless and drop:
+        elif self.training and not (self.lowering.records_unending or self.lowering.rooted) and drop:
             rows = rows[: len(rows) // batch_stage.size * batch_stage.size]
         whole = rows
         # The records after a resume's count go to the shares in turn from the first of them on
@@ -1644,7 +1643,7 @@ def _epoch_records(train: Pipeline, build: _Build) -> int | None:
     order = dataclasses.replace(train, stages=train.stages[:batched])
     # Whether its records never end, and whether they are read on past an end on the way: by a repeat
     # without a count, or as a mix of parts that never end.
-    unending, onward = reach(order.stages, build.lowering.parts_unending)
+    unending, onward = build.lowering.records_unending, build.lowering.onward
     # A training order that repeats nowhere repeats for ever at its root (`_Build.batched`).
     rooted = build.training and build.lowering.rooted
     if onward or rooted:
@@ -1665,13 +1664,12 @@ def _epoch_records(train: Pipeline, build: _Build) -> int | None:
 
 def _tail(train: Pipeline, build: _Build) -> Tail:
     """What a training read of `train` does with the records an epoch leaves short of a batch: reads
-    them, where its records never end (`reach`) or the read repeats them at its root
+    them, where its records never end (`_Lowering.records_unending`) or the read repeats them at its root
     (`_Build.batched`), so they lead the next epoch's batch, or where its batch keeps a short one;
     drops them where its order ends and its batch drops it."""
-    batched = _until(train.stages, (BatchStage, TokenBudget))
-    unending, _ = reach(train.stages[:batched], build.lowering.parts_unending)
     drops = next((stage.drop_remainder for stage in train.stages if isinstance(stage, BatchStage)), True)
-    return "read" if unending or (build.training and build.lowering.rooted) or not drops else "dropped"
+    rooted = build.training and build.lowering.rooted
+    return "read" if build.lowering.records_unending or rooted or not drops else "dropped"
 
 
 def _split_spans(pipeline: Pipeline, build: _Build) -> Iterator[list[tuple[int, int, int]]]:
