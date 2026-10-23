@@ -10,6 +10,7 @@ from test_recurrence_chunk import token_by_token
 from dew.nn.kernels import recurrence_algebra as algebra
 from dew.nn.kernels.recurrence_chunk import chunk
 
+ORIGINAL_T = algebra._ranged_transpose
 ORIGINAL = {name: getattr(algebra, name) for name in ("factor", "apply", "intra", "carry", "readout", "decays",
                                                      "remembered", "paired")}
 
@@ -52,13 +53,34 @@ def wide(fn):
     return run
 
 
-@pytest.mark.parametrize("piece", ["none", "factor", "apply", "intra", "carry"])
+@jax.custom_jvp
+def wide_factor(a, issue=algebra.portable):
+    with jax.enable_x64(True):
+        return ORIGINAL["factor"](a.astype(jnp.float64), lambda n, x, y: jnp.matmul(x, y, precision="highest")).astype(a.dtype)
+
+
+@wide_factor.defjvp
+def _wide_factor_jvp(primals, tangents):
+    (a, *_), (da, *_) = primals, tangents
+    x = wide_factor(a)
+    with jax.enable_x64(True):
+        x64 = x.astype(jnp.float64)
+        dx = (x64 @ da.astype(jnp.float64) @ x64).astype(a.dtype)
+    return x, dx
+
+
+@pytest.mark.parametrize("piece", ["factor", "decays"])
 @pytest.mark.parametrize("name", ["scalar delta"])
 def test_piece(name, piece, monkeypatch):
     hooks = st.SITES[name]
     regime = "aligned keys"
-    if piece != "none":
-        monkeypatch.setattr(algebra, piece, wide(ORIGINAL[piece]))
+    if piece == "factor":
+        monkeypatch.setattr(algebra, "factor", lambda a, issue=algebra.portable: wide_factor(a))
+    elif piece == "decays":
+        def wide_ranged_transpose(decay, cotangent):
+            with jax.enable_x64(True):
+                return ORIGINAL_T(decay.astype(jnp.float64), cotangent.astype(jnp.float64)).astype(decay.dtype)
+        monkeypatch.setattr(algebra, "_ranged_transpose", wide_ranged_transpose)
     dew = jax.jit(with_gradients(functools.partial(chunk, hooks, chunk_size=st.CHUNK, ported=False)))
     reference = jax.jit(with_gradients(functools.partial(token_by_token, hooks)))
     try:
