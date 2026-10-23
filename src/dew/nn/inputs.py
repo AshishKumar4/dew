@@ -515,6 +515,17 @@ class CrossContext:
     embeddings: jax.Array
     lengths: jax.Array
 
+    @staticmethod
+    def parted(conditioning: Mapping[str, jax.Array] | None
+               ) -> tuple[dict[str, jax.Array] | None, dict[str, jax.Array] | None]:
+        """`conditioning`'s context entries (`CONTEXT`, `CONTEXT_LENGTHS`), which a decoder reads, and
+        the rest, which a module around the decoder reads itself (a multimodal model's media); each
+        None where it holds nothing."""
+        context = {name: value for name, value in (conditioning or {}).items()
+                   if name in (CONTEXT, CONTEXT_LENGTHS)}
+        rest = {name: value for name, value in (conditioning or {}).items() if name not in context}
+        return context or None, rest or None
+
     @classmethod
     def from_conditioning(cls, conditioning: Mapping[str, jax.Array]) -> CrossContext:
         """The context a call's `conditioning` carries under `CONTEXT` and `CONTEXT_LENGTHS`.

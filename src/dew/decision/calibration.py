@@ -222,7 +222,7 @@ class Abstention:
             if len(group) < bucket_minimum:
                 continue
             tops, correct = _tops(group, temperatures, binning)
-            levels, accepted, right = tied_prefixes(np.round(tops, 4), correct)
+            levels, accepted, right = tied_prefixes(tops, correct)
             errors = accepted - right
             rate = (errors + 1) / (accepted + 1) if conservative else errors / accepted
             met = rate <= target_error

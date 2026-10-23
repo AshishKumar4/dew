@@ -9,6 +9,7 @@ relabeled as a native raw-policy or behavior-policy likelihood.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import inspect
 import io
@@ -295,7 +296,9 @@ class OllamaCompletion:
                     key: int | jax.Array | None = None, **parameters: RequestField) -> Completion:
         requests = self._generations(prompts, max_new_tokens, key, parameters)
         client = self._async()
-        return _ollama_result([await _invoke(client.generate, body) for body in requests])
+        # Every row's request is in flight at once, its answer kept in its row's place.
+        answers = await asyncio.gather(*(_invoke(client.generate, body) for body in requests))
+        return _ollama_result(list(answers))
 
     async def astream(self, prompt: str, max_new_tokens: int, *, key: int | jax.Array | None = None,
                       **parameters: RequestField) -> AsyncIterator[OllamaResponse]:
