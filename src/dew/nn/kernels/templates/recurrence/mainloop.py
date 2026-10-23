@@ -556,16 +556,21 @@ def _states(k, w, u, hi, lo, beta, h0, sequences, call: _Call, tiles: Tiles):
                 gated, decayed = algebra.scalar_write(corrected, ending, FAMILY.rows_of(hi_ref.at[h, span]),
                                                       ending_low, FAMILY.rows_of(lo_ref.at[h, span]))
                 decay = [decayed[:, None]] * slices
-            def key_rows(i):
-                """The chunk's last key's slice `i`, a row's vector: its parts' rows summed, exactly."""
-                views = keys.vectors(k_ref, last, h // keyed * width + i * BLOCK, BLOCK)
-                return functools.reduce(jnp.add, (FAMILY.rows_of(view).astype(jnp.float32) for view in views))
+            separate = None
+            if held.parts > 1:
+                # An fp32 call's last write outside the product (`algebra.carried`), held to the fp32
+                # recurrence; a 16-bit call's is fla's product.
+                def key_rows(i):
+                    """The chunk's last key's slice `i`, a row's vector: its parts' rows summed, exactly."""
+                    views = keys.vectors(k_ref, last, h // keyed * width + i * BLOCK, BLOCK)
+                    return functools.reduce(jnp.add, (FAMILY.rows_of(view).astype(jnp.float32)
+                                                      for view in views))
 
-            ends = FAMILY.iota(gated.shape, 0) == CHUNK - 1
-            value_row = jnp.sum(jnp.where(ends, gated.astype(held.dtype).astype(jnp.float32), 0.0), axis=0)
+                ends = FAMILY.iota(gated.shape, 0) == CHUNK - 1
+                separate = key_rows, jnp.sum(jnp.where(ends, gated, 0.0), axis=0)
             state = algebra.carried(
                 state, lambda i: _tile(slots, "keys", keys, columns=pl.ds(i * BLOCK, BLOCK)), gated, decay,
-                held.dtype, issue, last=(key_rows, value_row))
+                held.dtype, issue, last=separate)
             return state, accumulators
 
         initials = _streamed(**{f"initial{i}": ((BLOCK, bv), initial) for i in range(slices)})
