@@ -1821,7 +1821,8 @@ class CausalTransformer(nn.Module):
                 stages=stages, microbatches=count_microbatches,
                 # What enters the loop is read on every iteration; what the
                 # loop creates (the routers' sowing) comes out per iteration.
-                broadcast=tuple(name for name, tree in self.variables.items() if tree))
+                broadcast=tuple(name for name, tree in self.variables.items() if tree),
+                batch_axis=batch_axis)
         dtype = self.residual_dtype(
             x, train=train, decode=decode, per_layer_input=per_layer_input,
             attention_metadata=attention_metadata)
