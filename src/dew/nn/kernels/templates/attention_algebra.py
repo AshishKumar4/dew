@@ -1037,8 +1037,9 @@ class DqSums(NamedTuple):
     keyed_shift: jax.Array
 
 
-NO_SHIFT = -150.0
-"""The exponent of an empty sum of coefficients (`DqSums.keyed_shift`): below every fp32's, so any tile's
+NO_SHIFT = -1024.0
+"""The exponent of an empty sum of coefficients (`DqSums.keyed_shift`): below every composed coefficient's
+(a weight's, a scale's and an inverse denominator's exponents together reach about -430), so any tile's
 exponent is the larger, and `power2` of a zero mantissa by it stays zero."""
 
 
