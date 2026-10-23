@@ -419,50 +419,29 @@ def system(keys: Load, gates, lows, betas, columns: int, issue: Issue, *,
     return {(i, j): block(i, j) for i in range(count) for j in range(i + 1)}
 
 
-def keyed(product, gate, low, beta, column_gate, column_low, column_beta=None, *, transposed: bool = False):
+def keyed(product, gate, low, beta, column_gate, column_low):
     """One chunk's `A = tril(beta_s (k_s . k_t) exp2(g_s - g_t), -1)` `[C, C]`, a decay a head, from its keys'
-    products `product` (`k k^T`, symmetric) and its prefix halves and write gates as a row's vectors (`gate`,
-    `low`, `beta`) and a column's (`column_gate`, ...), where a mainloop's layouts keep the two apart: `A`, or
-    `A^T` where `transposed`, from the same products."""
+    products `product` (`k k^T`) and its prefix halves and write gates as a row's vectors (`gate`, `low`,
+    `beta`) and the halves as a column's (`column_gate`, `column_low`), where a mainloop's layouts keep the
+    two apart."""
     rows, cols = _grid(product.shape)
-    if transposed:
-        decay = decayed(-gate, -low, -column_gate, -column_low)
-        return jnp.where(rows < cols, product * decay * column_beta[None, :], 0.0)
     return jnp.where(rows > cols, product * decayed(gate, low, column_gate, column_low) * beta[:, None], 0.0)
 
 
-def substituted(columns: Load, shape, block: int = SUB):
-    """`(I - L)^-1`'s diagonal blocks of `block` rows, block-diagonal `[C, C]`, of a strictly lower `L`: each
-    block's forward substitution by columns from its last (`X = I + X L`), every block's at once, `columns(c)`
-    the blocks' column `c` of `L` as one vector along the tile's columns (its entry `j` the column of `j`'s
-    own block). Each step sums along the tile's rows, no row taken out of the tile, so a mainloop whose tile
-    is a warpgroup's 64 rows (Mosaic GPU's) steps within each row's threads."""
-    rows, cols = _grid(shape)
-    eye = jnp.where(rows == cols, 1.0, 0.0)
-    within = rows // block == cols // block
-    inverse = eye
-    for c in reversed(range(block)):
-        column = jnp.sum(inverse * columns(c)[None, :], axis=1)
-        inverse = jnp.where(within & (cols % block == c), eye + column[:, None], inverse)
-    return inverse
-
-
-def doubled(a, issue: Issue, start: tuple | None = None):
+def doubled(a, issue: Issue):
     """`factor`'s doubling on one tile: `(I - A)^-1` `[C, C]` of a strictly lower `a`, every level's blocks
     held in place in the tile, for a mainloop whose products take whole tiles (Mosaic GPU's, a warpgroup's 64
-    rows, which hold no block of their own). From the two-wide blocks `[[1, 0], [a, 1]]`, or `start`'s
-    `(inverse, width)` (its diagonal blocks' inverse, `substituted`), each level joins pairs of `s`-blocks as
-    `X_2s = X_s + (M_s * (X_s A)) X_s` ('merge' twice), `M_s` each pair's lower block: the block-diagonal
-    `X_s` against the whole tile, masked there, is its odd blocks' rows of `A` over the even ones', so the
-    join is `factor`'s `X2 A21 X1` there and zero elsewhere, the same terms, and a mainloop stages `A` once.
-    """
+    rows, which hold no block of their own, and whose element-wise steps take 32 of a tile's entries a
+    thread, so a forward substitution's 16 steps over its 16-row blocks cost a 64-row tile more than the
+    three levels of products they replace). From the two-wide blocks `[[1, 0], [a, 1]]`, each level joins
+    pairs of `s`-blocks as `X_2s = X_s + (M_s * (X_s A)) X_s` ('merge' twice), `M_s` each pair's lower block:
+    the block-diagonal `X_s` against the whole tile, masked there, is its odd blocks' rows of `A` over the
+    even ones', so the join is `factor`'s `X2 A21 X1` there and zero elsewhere, the same terms, and a
+    mainloop stages `A` once."""
     size = a.shape[-1]
     rows, cols = _grid(a.shape)
-    if start is None:
-        inverse = jnp.where(rows == cols, 1.0, 0.0) + jnp.where((rows % 2 == 1) & (cols == rows - 1), a, 0.0)
-        width = 2
-    else:
-        inverse, width = start
+    inverse = jnp.where(rows == cols, 1.0, 0.0) + jnp.where((rows % 2 == 1) & (cols == rows - 1), a, 0.0)
+    width = 2
     while width < size:
         lower = ((rows // width) % 2 == 1) & (cols // width == rows // width - 1)
         inverse = inverse + issue("merge", jnp.where(lower, issue("merge", inverse, a), 0.0), inverse)
