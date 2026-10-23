@@ -868,7 +868,7 @@ class _Cutlass(_GroupedLaunch[mosaic_gpu.Tiles]):
     set up on the device. A vendored kernel the chooser ranks beside the template's launches until they
     beat it. The model has no terms of its own for it: it costs as the Mosaic tile of its geometry
     (`TILE`, the same TMA-fed warpgroup MMAs, producer and two consumers), scaled by its measured rows
-    (`MEASURED`), so it is a candidate only on a generation whose rows were measured."""
+    (`MEASURED`); on a generation and form no rows measured, it runs only by name."""
     name: ClassVar[str] = 'cutlass'
     config_cls: ClassVar[type[mosaic_gpu.Tiles]] = mosaic_gpu.Tiles
     TILE: ClassVar[mosaic_gpu.Tiles]
@@ -887,7 +887,7 @@ class _Cutlass(_GroupedLaunch[mosaic_gpu.Tiles]):
         # need: every extent a multiple of 8 elements.
         extents = {extent for operand in operands for extent in operand.shape[1:]}
         built = generation.effective(target).generation
-        return ((built, bool(ba.arguments.get('dense'))) in self.MEASURED and built in cutlass_architectures()
+        return (built in cutlass_architectures()
                 and all(operand.dtype == jnp.bfloat16 for operand in operands)
                 and jnp.dtype(ba.arguments['out_dtype']) in (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float32))
                 and ba.arguments['sizes'].dtype == jnp.int32 and all(extent % 8 == 0 for extent in extents)
@@ -905,8 +905,11 @@ class _Cutlass(_GroupedLaunch[mosaic_gpu.Tiles]):
         return self.COSTED_AS.costed(ba, config, target)
 
     def cost(self, ba, config: mosaic_gpu.Tiles, target) -> float:
-        measured = self.MEASURED[generation.effective(target).generation, bool(ba.arguments.get('dense'))]
-        return super().cost(ba, config, target) * measured
+        # A call of a generation and form no rows measured: no estimate it could win by, so the launch runs
+        # only by name (`generation.chosen`).
+        form = (generation.effective(target).generation, bool(ba.arguments.get('dense')))
+        measured = self.MEASURED.get(form)
+        return math.inf if measured is None else super().cost(ba, config, target) * measured
 
 
 @dataclasses.dataclass(frozen=True)
@@ -916,8 +919,8 @@ class CutlassGmm(_Cutlass):
     ROWS: ClassVar[tuple[str, ...]] = ('tokens',)
     TILE: ClassVar[mosaic_gpu.Tiles] = mosaic_gpu.Tiles(128, 256, 64, 4, 8, warpgroups=2, cluster=2)
     COSTED_AS: ClassVar[_Mosaic] = MosaicGmm()
-    # ROUTE-2 on an H100: the scoreboard's 14 grouped and 4 dense rows of the forward and input gradient.
-    MEASURED: ClassVar[dict[tuple[str, bool], float]] = {('sm90', False): 0.71, ('sm90', True): 1.06}
+    # ROUTE-4 on an H100: the scoreboard's 14 grouped and 4 dense rows of the forward and input gradient.
+    MEASURED: ClassVar[dict[tuple[str, bool], float]] = {('sm90', False): 0.71, ('sm90', True): 1.0}
 
     def _fwd(self, tokens: jax.Array, kernel: jax.Array, sizes: jax.Array,
              prologue_operands: tuple = (), epilogue_operands: tuple = (), *, out_dtype: str,
@@ -942,8 +945,11 @@ class CutlassTgmm(_Cutlass):
     ROWS: ClassVar[tuple[str, ...]] = ('tokens', 'cotangent')
     TILE: ClassVar[mosaic_gpu.Tiles] = mosaic_gpu.Tiles(128, 256, 64, 4, 8, warpgroups=2)
     COSTED_AS: ClassVar[_Mosaic] = MosaicTgmm()
-    # ROUTE-2 on an H100: the scoreboard's 13 grouped and 4 dense rows of the kernel gradient, bf16 and fp32.
-    MEASURED: ClassVar[dict[tuple[str, bool], float]] = {('sm90', False): 0.84, ('sm90', True): 0.85}
+    # None: on an H100 (ROUTE-4) it ran 0.81 to 1.39 times the template's kernel gradient over the
+    # scoreboard's rows, a write-bound row's DRAM traffic and throughput the template's own (NCU-dw), and no
+    # share of the model's estimate ranks it right at both kimi-linear's fp32 rows (1.22, 1.39) and the
+    # rows it wins (mixtral's, 0.81 to 0.94).
+    MEASURED: ClassVar[dict[tuple[str, bool], float]] = {}
 
     def _fwd(self, tokens: jax.Array, cotangent: jax.Array, sizes: jax.Array,
              prologue_operands: tuple = (), *, out_dtype: str, interpret: bool, hooks: Hooks = NO_HOOKS,
