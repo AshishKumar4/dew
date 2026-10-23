@@ -118,7 +118,6 @@ from dew.data.steps.generic import Fields
 from dew.data.steps.text import LayoutRule, ValidTargets, counted_window, recounted
 from dew.data.text import Chunks
 from dew.data.tokens import _WrappingDataset
-from dew.objectives.base import VALID_ROWS
 from dew.records import boolean, integer, integers, record, strings
 
 if TYPE_CHECKING:
@@ -1548,6 +1547,21 @@ class _Build:
         batches = rows.batch(size, drop_remainder=drop, batch_fn=_Batched(batch_stage.batch_fn))
         if not drop and fill:
             batches = batches.map(FilledBatch(size, real=real))
+        batches = self.placed(batches, pipeline, partition, after)
+        batches = batches[offset // batch_stage.size :]
+        # A count of records that ends inside a batch, as a batch ramp saves, resumes past the
+        # records of that batch the run read, in the order it read its batches: the share's rows
+        # among the batch's first `read`, which the shares hold in turn.
+        read = offset % batch_stage.size
+        if read > share:
+            batches = batches.map_with_index(_Rest(-(-(read - share) // partition.count)))
+        return batches, tuple(at for at in after if isinstance(pipeline.stages[at], _UNPLACED))
+
+    def placed[Item](self, batches: pygrain.MapDataset[Item], pipeline: Pipeline, partition: DataPartition,
+                     after: tuple[int, ...]) -> pygrain.MapDataset[Item]:
+        """A global order's `batches` through the stages after its batch at `after` that hold a
+        place in it (all but `_UNPLACED`), by index: a repeat replaying its first pass, a slice, a
+        limit, a window shuffle. A run's batches and their sizes (`_order_records`) go through it."""
         for at in after:
             stage = pipeline.stages[at]
             if isinstance(stage, _UNPLACED):
@@ -1558,14 +1572,7 @@ class _Build:
                 raise ValueError(f"{type(stage).__name__} after the batch of {_name(pipeline)} has no "
                                  "place in a global order")
             batches = ordered
-        batches = batches[offset // batch_stage.size :]
-        # A count of records that ends inside a batch, as a batch ramp saves, resumes past the
-        # records of that batch the run read, in the order it read its batches: the share's rows
-        # among the batch's first `read`, which the shares hold in turn.
-        read = offset % batch_stage.size
-        if read > share:
-            batches = batches.map_with_index(_Rest(-(-(read - share) // partition.count)))
-        return batches, tuple(at for at in after if isinstance(pipeline.stages[at], _UNPLACED))
+        return batches
 
     def after_batch(
         self, stream: pygrain.IterDataset, after: tuple[int, ...], pipeline: Pipeline,
@@ -1685,22 +1692,25 @@ def _order_length(train: Pipeline, build: _Build) -> int | None:
 
 def _order_records(train: Pipeline, build: _Build) -> int | None:
     """The records a training read of `train`'s global order hands out where it ends, the same on
-    every share (`Loader.order_records`): the rows of every batch its read yields
-    (`_Build.batch_order`), the stages after its batch, a repeat, a slice or a limit, included, a
-    kept short batch inside the order with its filled rows, which it marks, and the order's last
-    batch with its real rows alone, which its marks count; None where it never ends or its read
-    counts none ahead."""
+    every share (`Loader.order_records`): the rows of every batch its read yields, through the
+    stages after its batch, a repeat, a slice or a limit (`_Build.placed`), a kept short batch inside
+    the order with its filled rows, which it marks, and the order's last batch with its real rows
+    alone; None where it never ends or its read counts none ahead. The batches' sizes are what the
+    stages place, so no record is read."""
     stage = next((stage for stage in train.stages if isinstance(stage, BatchStage)), None)
     if not build.global_order or build.lowering.endless or stage is None:
         return None
-    with _closing(build.batch_order(train, DataPartition())[0]) as batches:
-        if not isinstance(batches, pygrain.MapDataset):
-            return None
-        if not len(batches):
-            return 0
-        last = record(batches[len(batches) - 1], "the order's last batch")
-        real = int(np.count_nonzero(np.asarray(last[VALID_ROWS], bool))) if VALID_ROWS in last else stage.size
-        return (len(batches) - 1) * stage.size + real
+    length = _order_length(train, build)
+    if length is None:
+        return None
+    whole, short = divmod(length, stage.size)
+    kept = [short] if short and not stage.drop_remainder else []
+    after = tuple(range(train.stages.index(stage) + 1, len(train.stages)))
+    sizes = pygrain.MapDataset.source([stage.size] * whole + kept)
+    placed = build.placed(sizes, train, DataPartition(), after)
+    if not len(placed):
+        return 0
+    return (len(placed) - 1) * stage.size + integer(placed[len(placed) - 1], "a batch's size")
 
 
 def _tail(train: Pipeline, build: _Build) -> Tail:

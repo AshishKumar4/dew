@@ -1,6 +1,6 @@
 """Dew's rounding error held to the reference's own, both measured from float64.
 
-The gate the suite converts to holds every element over orders (bible §7): a comparison drawn over
+The gate the suite converts to holds every element over orders: a comparison drawn over
 exact symmetries of its computation (`assert_leaves_as_exact_over_orders`), each element against the
 worst admitted member of the reference's ensemble (`assert_elements_as_exact`), and a kernel held where
 it rounds, as a graph of the values it rounds and holds (`assert_graph_as_exact`). The one-draw rules
@@ -63,7 +63,6 @@ rounding of the computation itself (`assert_computes_the_oracle`).
 """
 
 import dataclasses
-import functools
 import hashlib
 import math
 
@@ -154,59 +153,18 @@ def windows(draw, count: int):
     return drawn
 
 
-def over_windows(fn, *, looped: bool = False):
-    """`fn`, an arm of one draw, run over `windows`' stacked arguments, each sliced by window, with its
-    outputs stacked on their leading axis as host arrays.
+def over_windows(fn):
+    """`fn`, an arm of one draw, run over `windows`' stacked arguments window by window, each window's
+    arguments sliced from the stack, with its outputs stacked on their leading axis as host arrays.
 
-    By default it is one compiled program over every window (`jax.vmap`). A batch axis may change the
-    program XLA compiles (its fusions, a kernel's route), so the first call at each signature also runs
-    `jax.jit(fn)` window by window and fails unless every window's output is the same bit for bit. The
-    signature is every argument's `jax.typeof`, their tree, x64's setting and the default matmul
-    precision; a reference and its float64 truth have two. Any other configuration a call changes needs
-    an `over_windows` of its own.
-
-    `looped` runs `fn` window by window instead, for a torch or NumPy reference, for a JAX arm a batch
-    axis changes, and for a `without_ynn` arm, whose compiler options refuse to be nested in the batched
-    program. Pass a JAX arm jitted, `over_windows(jax.jit(fn), looped=True)`, so each window runs the
-    program one draw compiles."""
-    def each(single, *arguments):
-        count = _window_count(arguments)
-        return _stack_host([single(*jax.tree.map(lambda leaf, index=index: leaf[index], arguments))
-                            for index in range(count)])
-
-    if looped:
-        return functools.partial(each, fn)
-    batched, single, checked = jax.jit(jax.vmap(fn)), jax.jit(fn), set()
-
+    Each window runs the program one draw runs, never a batched one: a batch axis changes the program
+    XLA compiles (its fusions, its reductions' order, its dots' batching, a kernel's route), which XLA
+    holds to no common bits with one draw's, so check 1 would judge a program users never run. Pass a
+    JAX arm jitted (`jax.jit(fn)`, `without_ynn(fn)`), so it compiles once a signature and every window
+    calls that program; a torch or NumPy reference as it is."""
     def run(*arguments):
-        # Before the batched program, which would compile a batch of none.
-        _window_count(arguments)
-        found = jax.tree.map(np.asarray, batched(*arguments))
-        signature = (bool(jax.config.jax_enable_x64), str(jax.config.jax_default_matmul_precision),
-                     jax.tree.structure(arguments),
-                     tuple(jax.typeof(leaf) for leaf in jax.tree.leaves(arguments)))
-        if signature not in checked:
-            expected = each(single, *arguments)
-            if jax.tree.structure(found) != jax.tree.structure(expected) or not jax.tree.leaves(found):
-                raise AssertionError("the batched arm over windows returns no output, or another tree")
-            for (path, got), want in zip(jax.tree_util.tree_leaves_with_path(found),
-                                         jax.tree.leaves(expected), strict=True):
-                if got.dtype != want.dtype or got.shape != want.shape or got.tobytes() != want.tobytes():
-                    where = jax.tree_util.keystr(path) or "the output"
-                    differs = ""
-                    if got.shape == want.shape and got.dtype == want.dtype and got.size:
-                        # By bits, so a zero of the other sign names its window too.
-                        moved = [index for index in range(len(got))
-                                 if np.ascontiguousarray(got[index]).tobytes()
-                                 != np.ascontiguousarray(want[index]).tobytes()]
-                        gap = np.max(np.abs(np.asarray(got, np.float64) - np.asarray(want, np.float64)))
-                        differs = f" (from window {moved[0]}, by up to {gap:.3e})"
-                    raise AssertionError(
-                        f"{where}: the batched arm over windows computes otherwise than one draw's "
-                        f"compiled arm does, window by window{differs}. Take "
-                        "`over_windows(jax.jit(fn), looped=True)`.")
-            checked.add(signature)
-        return found
+        return _stack_host([fn(*jax.tree.map(lambda leaf, index=index: leaf[index], arguments))
+                            for index in range(_window_count(arguments))])
     return run
 
 
@@ -228,7 +186,7 @@ def without_ynn(fn, **jit_options):
     the arm the check measures against, so that the two run the same kind of code on any host. A
     program Dew's users run compiles with the fusions, as they do. Call it at top level, since on the
     CPU lane its compiler options refuse to be nested in another jit, differentiated through or
-    batched; `over_windows` takes it with `looped=True`. A caller's own compiler options take
+    batched; `over_windows` runs it window by window. A caller's own compiler options take
     precedence over WITHOUT_YNN's."""
     if jax.default_backend() == "cpu":
         jit_options["compiler_options"] = {**WITHOUT_YNN, **(jit_options.get("compiler_options") or {})}
@@ -408,7 +366,7 @@ def assert_as_exact_as_the_reference(dew, reference, truth, label: str, *, terms
 
 
 PARITY = 1.5
-"""The owner's factor (bible §7): each leaf's RMS error from float64 within 1.5 times the
+"""The gate's on-par factor: each leaf's RMS error from float64 within 1.5 times the
 reference's, on the same inputs, with no floor of any kind. Check 1 (`assert_as_exact`) holds it now;
 the one-draw rule's FACTOR joins it once every site that rule would then fail has moved to check 1."""
 
@@ -770,7 +728,7 @@ def _logged(label: str, stage: int, verdict: str) -> None:
 
 
 def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn=None) -> None:
-    """Check 1 of the owner's gate (bible §7): on par. Each leaf's RMS error from float64,
+    """Check 1 of the gate: on par. Each leaf's RMS error from float64,
     pooled over the site's declared seeds, within PARITY times the reference's, and its worst row over
     those seeds within ROW_FACTOR times the reference's worst; each row of float64 zero (below RESOLUTION
     of its leaf where a live reference does not measure it, `_paired`) no further from it than
@@ -901,8 +859,8 @@ def null_runs(reference_fn, draw, label: str, *, seeds: int, runs: int, first: i
     ratio, interval and rows), or as the procedure before it with `two_stage` false. Run r of
     a call takes draws no other run of any call with the same `first` grid takes: seeds from
     (first + r)·2·(1 + REDRAW)·seeds on, the first half its "Dew"'s and the second its reference's, so
-    the runs are independent repetitions as far as `draw` makes its draws so. The bible-§10 null
-    control of a site's operation class (orders-through-check1.md): its false-red rate, every
+    the runs are independent repetitions as far as `draw` makes its draws so. The null
+    control of a site's operation class: its false-red rate, every
     nonpassing verdict counted, bounds the gate's own on that class. With `dew_fn` a fault of the
     reference (a dropped term, a wrong scale), the runs measure the procedure's power on that class,
     both procedures on the same draws."""
@@ -1571,7 +1529,7 @@ def assert_elements_as_exact(batch, label: str, *, reference: str = REFERENCE, a
 
 
 def assert_graph_as_exact(dew, reference, truth, inputs, orbit, label: str) -> dict:
-    """A computation held where it rounds (bible §7's source-aware gate; tests/reference_graph.py).
+    """A computation held where it rounds (the gate's source-aware check; tests/reference_graph.py).
     `dew`, `reference` and `truth` are `Graph`s (src/dew/nn/kernels/graph.py) of one shape, `truth`
     the reference's in float64;
     `inputs` the case's inputs by name, and `orbit(order)` the case's exact symmetries:
@@ -1757,7 +1715,7 @@ def _batch(draw, stage: int, terms, rows: bool) -> tuple[object, dict, list, lis
 
 ADMISSION_MARGIN = 1.05
 """How much less exact than the reference, in RMS from float64 over a leaf, a member may be and still be
-admitted (`admitted_members`): 5%, the owner's (bible §7). With no margin an equally exact member is
+admitted (`admitted_members`): 5%. With no margin an equally exact member is
 admitted about half the time, by its orders' luck alone."""
 
 ADMISSION_CONFIDENCE = 0.99
