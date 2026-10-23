@@ -11,7 +11,7 @@ import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
-from decision_support import decision_rows
+from decision_support import algebraically_zero, decision_rows
 from recording import RecordingTracker
 from reference_error import assert_as_exact
 
@@ -267,7 +267,8 @@ def assert_rows_decided_alone(objective, wide_modules, seeds: int, held=lambda p
     """Two packed windows of the examples decide each row's questions as the row does alone where its
     window packed it (`rows_alone`), logits and the gradients of the leaves `held` names (by
     `jax.tree_util.keystr`) on par with it (check 1) over drawn parameters, the truth `wide_modules`,
-    the backbone and head in float64, over the rows in windows of their own."""
+    the backbone and head in float64, over the rows in windows of their own, and the algebraic zeros'
+    exactly zero (`decision_support.ALGEBRAIC_ZEROS`): residue there, rounding alike on no two hosts."""
     batch = windows(objective, 2)
     assert max(int(segments.max()) for segments in batch["segments"]) > 1, "no window packed two rows"
     # A sequence kernel runs as many documents as the coordinates bound, and a window's padding as one
@@ -299,8 +300,10 @@ def assert_rows_decided_alone(objective, wide_modules, seeds: int, held=lambda p
                 kept(gradient(wide, variables, rows)))
 
     def truth(variables):
+        # The truth of the algebraic zeros is exactly zero, which each of their rows is held to.
         logits, grads = apart_in_float64(variables)
-        return np.asarray(logits)[rows["options"]], grads
+        return np.asarray(logits)[rows["options"]], {
+            name: leaf * 0 if algebraically_zero(name) else leaf for name, leaf in grads.items()}
 
     assert kept(objective.init(jax.random.key(0))), "no gradient leaf held"
     # A logit sums within its row's window; a parameter's gradient over every window's tokens, in
