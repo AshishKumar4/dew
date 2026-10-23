@@ -128,26 +128,30 @@ def _stacked(trees, *, host: bool):
 
 
 def windows(draw, count: int):
-    """A check-1 draw of `count` windows a seed: seed `s` gives the site's own draws of seeds
-    `s * count` to `s * count + count - 1`, each leaf stacked on a new leading axis. A seed's evidence
-    then pools `count` independent draws, so a leaf whose error spreads far from one draw to the next
-    (a parameter's gradient, a short window's) resolves at fewer seeds, a leaf of one row a draw
-    becoming `count` rows; its arms take the windows through `over_windows`."""
+    """A check-1 draw of `count` windows a seed. Seed `s` gives the site's own draws of seeds
+    `s * count` to `s * count + count - 1`, each of their leaves stacked on a new leading axis, every
+    argument one a window. A seed's evidence then pools `count` draws, as independent as the site's
+    draws of different seeds are, and a leaf of one row a draw (a parameter's gradient) becomes
+    `count` rows; its arms take the windows through `over_windows`."""
+    if count < 1:
+        raise ValueError(f"windows of {count} draws")
+
     def drawn(seed):
         return _stacked([draw(seed * count + index) for index in range(count)], host=False)
     return drawn
 
 
 def over_windows(fn, *, looped: bool = False):
-    """`fn`, an arm of one draw, over `windows`' stacked ones, its outputs stacked on their leading axis:
-    one compiled program over every window (`jax.vmap`) for a JAX arm, or `fn` as given, window by
-    window (`looped`), for one a batch axis changes or one that is not JAX's (a torch or NumPy
-    reference; a JAX arm loops compiled, `over_windows(jax.jit(fn), looped=True)`). A batch axis may
-    change the program XLA compiles (its fusions, a kernel's route), so the first call of a batched
-    arm at each signature (its arguments' shapes and dtypes, and x64's setting, for a reference and
-    its float64 truth are two programs) also runs it window by window, compiled as one draw runs it,
-    and fails unless every window's output is the same bit for bit: then check 1 judges the program
-    its users run."""
+    """`fn`, an arm of one draw, over `windows`' stacked ones, each argument sliced by window and the
+    outputs stacked on their leading axis, as host arrays.
+    - Batched (the default), one compiled program over every window (`jax.vmap`). A batch axis may
+      change the program XLA compiles (its fusions, a kernel's route), so the first call at each
+      signature (every argument's `jax.typeof` and their tree, and x64's setting, for a reference and
+      its float64 truth are two programs) also runs `jax.jit(fn)` window by window and fails unless
+      every window's output is the same bit for bit.
+    - `looped`, `fn` as given, window by window: a torch or NumPy reference, or a JAX arm a batch axis
+      changes, passed jitted (`over_windows(jax.jit(fn), looped=True)`) so each window runs the
+      program one draw compiles."""
     def each(single, *arguments):
         count = len(jax.tree.leaves(arguments)[0])
         return _stacked([single(*jax.tree.map(lambda leaf, index=index: leaf[index], arguments))
@@ -158,7 +162,7 @@ def over_windows(fn, *, looped: bool = False):
     batched, single, checked = jax.jit(jax.vmap(fn)), jax.jit(fn), set()
 
     def run(*arguments):
-        found = batched(*arguments)
+        found = jax.tree.map(np.asarray, batched(*arguments))
         # Every argument's shape, dtype and weak type (`jax.typeof`), their tree, and x64's setting.
         signature = (bool(jax.config.jax_enable_x64), jax.tree.structure(arguments),
                      tuple(jax.typeof(leaf) for leaf in jax.tree.leaves(arguments)))
@@ -168,7 +172,6 @@ def over_windows(fn, *, looped: bool = False):
                 raise AssertionError("the batched arm over windows returns no output, or another tree")
             for (path, got), want in zip(jax.tree_util.tree_leaves_with_path(found),
                                          jax.tree.leaves(expected), strict=True):
-                got = np.asarray(got)
                 if got.dtype != want.dtype or got.shape != want.shape or got.tobytes() != want.tobytes():
                     raise AssertionError(
                         f"{jax.tree_util.keystr(path)}: the batched arm over windows computes otherwise "

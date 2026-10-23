@@ -104,6 +104,14 @@ def test_windows_keep_a_draws_dtypes_and_weak_types_and_a_host_arms_outputs():
     assert reference.dtype == np.float64
 
 
+def test_windows_of_no_draws_are_refused():
+    """A seed of no windows is no draw."""
+    from reference_error import windows
+
+    with pytest.raises(ValueError):
+        windows(lambda seed: (np.zeros(2),), 0)
+
+
 def test_a_batched_arm_that_computes_otherwise_than_one_draws_is_refused():
     """`over_windows` refuses a batched arm whose windows differ, by a bit, from one draw's compiled
     arm window by window: here a batching rule that adds one, where a fusion or a route would move a
