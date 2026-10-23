@@ -685,10 +685,6 @@
    "comparisons": 5,
    "lane": "Training"
   },
-  "tests/test_sparse_attention.py": {
-   "comparisons": 5,
-   "lane": "Kernels"
-  },
   "tests/test_speculative.py": {
    "comparisons": 2,
    "lane": "Training"

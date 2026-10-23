@@ -5,12 +5,18 @@ space. The reference is the attention the V3.2 reference computes: expanded
 keys and values under the selection folded into a `[B, S, T]` mask, which
 `tests/test_mla.py` holds against transformers 5.16.1 (the V3.2 fixture's
 seven tokens exceed its top-k of four, so that parity test runs this path).
+The selection is on par with it from the reference in float64 over drawn
+inputs (check 1, tests/reference_error.py); a call that keeps the masked kernel
+is the masked kernel's call, to the bit.
 """
+
+from functools import partial
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+from reference_error import assert_as_exact, widened, with_gradients
 
 from dew.lora import LoRA
 from dew.nn.attention import scaled_dot_product_attention
@@ -20,6 +26,8 @@ from dew.nn.sparse_selection import selection_mask, sparse_latent_attention, top
 from dew.quantization import QUANTIZATION, InputQuantization
 
 HEADS, RANK, NOPE, ROPE, VALUE = 4, 24, 16, 8, 12
+SEEDS = {'selection': 8, 'packed selection': 8, 'sparse layer': 8}
+"""Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada)."""
 
 
 def pieces(length, batch=2, seed=0):
@@ -52,62 +60,89 @@ def causal_selection(scores, top_k, segments=None):
     return top_k_selection(scores, keep, top_k)
 
 
+def selection_draw(length, top_k, segments=None, cotangent=False):
+    """Check 1's draw of a selection's inputs: a seed's pieces (`pieces`) and the selection their
+    scores make (`causal_selection`, inside `segments` where given), with `cotangent` a readout of the
+    attention drawn apart from them."""
+    def draw(seed):
+        *operands, scores = pieces(length, seed=seed)
+        drawn = (*operands, causal_selection(scores, top_k, segments))
+        if not cotangent:
+            return drawn
+        key = jax.random.fold_in(jax.random.key(9), seed)
+        return *drawn, jax.random.normal(key, (2, length, HEADS, VALUE))
+    return draw
+
+
+def attending(length, **options):
+    """The selection's two arms on a draw's operands and indices (`selection_draw`):
+    `sparse_latent_attention` over the indices, under `options`, and the expanded reference under
+    their mask."""
+    def sparse(*drawn):
+        return sparse_latent_attention(*drawn[:-1], drawn[-1], scale=1 / np.sqrt(NOPE + ROPE), **options)
+
+    def dense(*drawn):
+        return expanded_reference(*drawn[:-1], selection_mask(drawn[-1], length))
+
+    return sparse, dense
+
+
 def test_the_selection_attends_as_the_masked_expanded_reference():
     """Forward and every input gradient at fp32. A query whose causal set is
     smaller than k carries unselected slots, which read nothing. The block
     size of 5 splits 23 queries unevenly, so padding rides the last block."""
     length, top_k = 23, 6
-    q_nope, q_rot, latent, rot, key_weight, value_weight, scores = pieces(length)
-    indices = causal_selection(scores, top_k)
-    mask = selection_mask(indices, length)
-    scale = 1 / np.sqrt(NOPE + ROPE)
-    cotangent = jax.random.normal(jax.random.key(9), (2, length, HEADS, VALUE))
 
-    def sparse(*args):
-        return jnp.sum(sparse_latent_attention(*args, indices, scale=scale, block=5) * cotangent)
+    def pulled(attend):
+        # The operands' gradients under the drawn cotangent, through the gate's pullback.
+        def run(*drawn):
+            *operands, indices, cotangent = drawn
+            return with_gradients(lambda *pieces: attend(*pieces, indices))(*operands, cotangent)
+        return jax.jit(run)
 
-    def dense(*args):
-        return jnp.sum(expanded_reference(*args, mask) * cotangent)
-
-    args = (q_nope, q_rot, latent, rot, key_weight, value_weight)
-    np.testing.assert_allclose(sparse(*args), dense(*args), rtol=1e-5)
-    for actual, expected in zip(jax.grad(sparse, argnums=tuple(range(6)))(*args),
-                                jax.grad(dense, argnums=tuple(range(6)))(*args), strict=True):
-        np.testing.assert_allclose(np.asarray(actual), np.asarray(expected), atol=2e-5, rtol=0)
+    sparse, dense = attending(length, block=5)
+    assert_as_exact(pulled(sparse), pulled(dense), selection_draw(length, top_k, cotangent=True), 'selection',
+                    seeds=SEEDS['selection'])
 
 
 def test_packed_documents_select_inside_their_own_document():
+    """On par (check 1) on the real tokens, the padding's queries defined by neither."""
     length, top_k = 19, 4
-    q_nope, q_rot, latent, rot, key_weight, value_weight, scores = pieces(length, seed=1)
     segments = jnp.asarray(np.repeat([[1, 2, 3, 0]], [6, 7, 4, 2], axis=1).repeat(2, 0))
-    indices = causal_selection(scores, top_k, segments)
-    mask = selection_mask(indices, length)
-    actual = sparse_latent_attention(q_nope, q_rot, latent, rot, key_weight, value_weight,
-                                     indices, scale=1 / np.sqrt(NOPE + ROPE))
-    expected = expanded_reference(q_nope, q_rot, latent, rot, key_weight, value_weight, mask)
-    real = np.asarray(segments) != 0
-    np.testing.assert_allclose(np.asarray(actual)[real], np.asarray(expected)[real], atol=2e-6)
+
+    def on_real(attend):
+        return jax.jit(lambda *drawn: jnp.where((segments != 0)[..., None, None], attend(*drawn), 0))
+
+    sparse, dense = attending(length)
+    assert_as_exact(on_real(sparse), on_real(dense), selection_draw(length, top_k, segments),
+                    'packed selection', seeds=SEEDS['packed selection'])
 
 
 def test_the_layer_runs_the_selection_and_matches_its_masked_kernel():
     """The V3.2 layer past its top-k takes the sparse path; an open `qk`
-    collection sends the same call through the masked dense kernel."""
+    collection sends the same call through the masked dense kernel, on par
+    (check 1), its truth that kernel in float64."""
     layer = MultiHeadLatentAttention(
         emb_features=32, num_heads=HEADS, max_seq_len=64, q_lora_rank=16, kv_lora_rank=RANK,
         qk_nope_head_dim=NOPE, qk_rope_head_dim=ROPE, v_head_dim=VALUE,
         index_topk=5, index_n_heads=2, index_head_dim=16, attention_impl="reference")
-    hidden = jax.random.normal(jax.random.key(2), (2, 21, 32))
-    variables = layer.init(jax.random.key(3), hidden)
-    sparse = layer.apply(variables, hidden)
-    dense, _ = layer.apply(variables, hidden, mutable=["qk"])
-    np.testing.assert_allclose(np.asarray(sparse), np.asarray(dense), atol=2e-5, rtol=0)
+    variables = layer.init(jax.random.key(3), jnp.zeros((2, 21, 32)))
+
+    def masked(variables, hidden):
+        return layer.apply(variables, hidden, mutable=["qk"])[0]
+
+    def draw(seed):
+        return (jax.random.normal(jax.random.fold_in(jax.random.key(2), seed), (2, 21, 32)),)
+
+    assert_as_exact(jax.jit(partial(layer.apply, variables)), jax.jit(partial(masked, variables)), draw,
+                    'sparse layer', seeds=SEEDS['sparse layer'], truth_fn=partial(masked, widened(variables)))
 
 
 def test_an_adapter_dropping_out_kv_b_proj_keeps_the_masked_kernel():
     """LoRA dropout on kv_b_proj draws a mask per token and latent dimension.
     The absorbed path applies kv_b_proj to the identity, where the same draw
     would be one mask for every token, so such a training call runs the
-    masked kernel: it matches the same call with `qk` open, rng for rng."""
+    masked kernel: it is the same call with `qk` open, rng for rng, to the bit."""
     layer = MultiHeadLatentAttention(
         emb_features=32, num_heads=HEADS, max_seq_len=64, q_lora_rank=16, kv_lora_rank=RANK,
         qk_nope_head_dim=NOPE, qk_rope_head_dim=ROPE, v_head_dim=VALUE,
@@ -121,7 +156,7 @@ def test_an_adapter_dropping_out_kv_b_proj_keeps_the_masked_kernel():
     rngs = {"dropout": jax.random.key(5)}
     trained = adapted.apply(variables, hidden, rngs=rngs)
     masked, _ = adapted.apply(variables, hidden, rngs=rngs, mutable=["qk"])
-    np.testing.assert_allclose(np.asarray(trained), np.asarray(masked), atol=2e-5, rtol=0)
+    np.testing.assert_array_equal(np.asarray(trained), np.asarray(masked))
 
 
 @pytest.mark.parametrize("quantized", ["input", "frozen"])
