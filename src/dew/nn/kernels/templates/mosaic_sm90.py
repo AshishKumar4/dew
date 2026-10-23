@@ -41,6 +41,12 @@ class Wgmma(mosaic.RingFamily):
             return jnp.dot(lhs, rhs[...], preferred_element_type=jnp.float32)
         return self.product(lhs, rhs, (lhs.shape[0], rhs.shape[1]))
 
+    def products(self, acc, lhs, rhs, interpret: bool):
+        if interpret:
+            return acc + jnp.dot(lhs[...], rhs[...], preferred_element_type=jnp.float32)
+        plgpu.wgmma(acc, lhs, rhs)
+        return acc
+
     def register_products(self, acc, parts, rhs, interpret: bool):
         mosaic.unscaled(parts)
         for part, _ in parts:
@@ -71,8 +77,8 @@ class Wgmma(mosaic.RingFamily):
         acc[...] = scale(acc[...])
         return self.register_products(acc, parts, rhs, interpret)
 
-    def settled(self) -> None:
-        plgpu.wgmma_wait(0)
+    def settled(self, pending: int = 0) -> None:
+        plgpu.wgmma_wait(pending)
 
     def accumulated[C](self, segments, start: C, shapes: tuple, interpret: bool
                        ) -> tuple[C, tuple[jax.Array, ...]]:
