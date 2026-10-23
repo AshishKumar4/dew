@@ -25,12 +25,12 @@ from dew.cache import enable_compilation_cache, persist_compilations
 from dew.coordination import broadcast_from_process_zero, end_pool_on_failure, pool_size, preemption_service
 from dew.logging import configure as configure_logging
 from dew.pool import (
-    COORDINATOR,
     PREEMPTED_EXIT,
     PROCESS_COUNT,
     PROCESS_ID,
-    detected_cluster,
+    joins_pool,
     local_gpu_count,
+    pool_cluster,
     refuse_idle_gpus,
     runs_on_gpu,
     slurm_tasks_here,
@@ -177,19 +177,14 @@ def _join_process_pool(multi_host: bool | None) -> None:
     """
     # The cluster JAX's detection would take, in its own order: Open MPI's
     # ranks when mpirun started them, then Slurm's tasks.
-    cluster = None if multi_host is False or PROCESS_COUNT in os.environ else detected_cluster()
-    one_task = (multi_host is None and cluster is not None and cluster.name == "slurm"
-                and cluster.count == 1)
+    cluster = pool_cluster(multi_host)
     tasks = slurm_tasks_here()
     if (cluster is not None and cluster.name == "slurm" and cluster.count > 1 and tasks is not None
             and runs_on_gpu(os.environ)):
         # Before joining: a pool whose ranks see GPUs they will not use
         # trains on fewer than it was given, and nothing reports it.
         refuse_idle_gpus(tasks, local_gpu_count(), "this slurm step")
-    if multi_host is False or one_task:
-        return
-    declared = cluster is not None or any(name in os.environ for name in (PROCESS_COUNT, COORDINATOR))
-    if multi_host is None and not declared:
+    if not joins_pool(multi_host, cluster):
         return
     if PROCESS_COUNT in os.environ:
         jax.distributed.initialize(num_processes=int(os.environ[PROCESS_COUNT]),
