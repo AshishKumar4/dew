@@ -1,0 +1,66 @@
+{
+ "lm": [
+  "public/examples/framework/lm/capture.json",
+  "script_sha256"
+ ],
+ "jepa": [
+  "public/examples/framework/jepa/capture.json",
+  "script_sha256"
+ ],
+ "finetune": [
+  "public/examples/framework/finetune/capture.json",
+  "script_sha256"
+ ],
+ "decide": [
+  "public/examples/framework/decide/capture.json",
+  "script_sha256"
+ ],
+ "diffusion": [
+  "public/examples/framework/diffusion/capture.json",
+  "script_sha256"
+ ],
+ "mesh": [
+  "public/examples/framework/mesh/capture.json",
+  "script_sha256"
+ ],
+ "grpo": [
+  "public/examples/framework/grpo/capture.json",
+  "script_sha256"
+ ],
+ "reliability": [
+  "public/examples/framework/reliability/capture.json",
+  "script_sha256"
+ ],
+ "profile": [
+  "public/examples/framework/profile/capture.json",
+  "script_sha256"
+ ],
+ "pretrained": [
+  "public/examples/framework/pretrained/capture.json",
+  "script_sha256"
+ ],
+ "serving": [
+  "public/examples/framework/serving/capture.json",
+  "script_sha256"
+ ],
+ "formats": [
+  "public/examples/framework/formats/capture.json",
+  "script_sha256"
+ ],
+ "hero": [
+  "src/data/capture.json",
+  "meta.cell_sha256"
+ ],
+ "hero.py": [
+  "src/data/capture.json",
+  "meta.script_sha256"
+ ],
+ "text": [
+  "public/examples/text/capture.json",
+  "script_sha256"
+ ],
+ "sampler": [
+  "public/examples/sampler/capture.json",
+  "script_sha256"
+ ]
+}
