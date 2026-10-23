@@ -48,8 +48,11 @@ def llama_config(hf_config, used):
 
 def ministral_config(hf_config, used):
     # MinistralConfig declares layer_types and sliding_window, and its
-    # attention builds no biases.
+    # attention builds no biases. Without layer_types every layer attends the
+    # window where there is one (configuration_ministral.py).
+    windowed = hf_config.get('sliding_window') is not None
     return base_config(hf_config, used, rope=PLAIN_SPELLING,
+                       layer_types=('sliding_attention' if windowed else 'full_attention',),
                        reads=frozenset({'layer_types', 'sliding_window'}))
 
 
@@ -144,7 +147,8 @@ MIXTRAL = DecoderFamily(
     weight_path=partial(renamed_path, MOE_NAMES),
     preserve_source_layout=True,
     # MixtralConfig's defaults (its rope base is its spelling's).
-    defaults={'num_experts_per_tok': 2, 'num_local_experts': 8, 'rms_norm_eps': 1e-5},
+    defaults={'num_experts_per_tok': 2, 'num_local_experts': 8, 'rms_norm_eps': 1e-5,
+              'num_key_value_heads': 8, 'max_position_embeddings': 131072},
 )
 
 
@@ -157,8 +161,8 @@ MISTRAL = DecoderFamily(
     'MistralForCausalLM',
     lambda model: {'layer_types': None, 'sliding_window': model.kind_of('sliding_attention').window},
     preserve_source_layout=False,
-    # MistralConfig attends a 4096-token window unless a config says otherwise, so an export of a
-    # model without one says so with a null.
-    defaults={'sliding_window': 4096},
+    # MistralConfig's defaults: it attends a 4096-token window unless a config says otherwise, so
+    # an export of a model without one says so with a null.
+    defaults={'sliding_window': 4096, 'num_key_value_heads': 8, 'max_position_embeddings': 131072},
     export_nulls=('sliding_window',),
 )
