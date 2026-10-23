@@ -22,6 +22,7 @@ from dew.objectives.base import (
     Recorder,
     Step,
     example_stream,
+    layout_normal,
     stream,
 )
 from dew.objectives.diffusion.few_step import MeanFlowObjective, ShortcutObjective
@@ -64,6 +65,23 @@ def test_each_example_draws_its_own_values_under_any_key_implementation():
         base = jax.random.fold_in(example_stream(key), stream("noise"))
         third = jax.random.normal(jax.random.fold_in(base, 2), (3,))
         np.testing.assert_array_equal(values[2], np.asarray(third))
+
+
+@pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16])
+def test_an_examples_normal_draw_is_its_own_whatever_batch_it_is_drawn_in(dtype):
+    """An example's normal draw is the same bits drawn alone, among 3, 4, 7 or 16 rows, or at a draw
+    shape of a row, a grid or a volume: no lane of a batch's fused program rounds it otherwise
+    (`layout_normal`; XLA:CPU's AVX-512 loop did, after erf_inv, on jax 0.12)."""
+    key = jax.random.key(11)
+    base = jax.random.fold_in(example_stream(key), stream("noise"))
+    for shape in ((3,), (5, 7), (2, 3, 4)):
+        alone = [np.asarray(layout_normal(jax.random.fold_in(base, example), shape, dtype))
+                 for example in range(16)]
+        for rows in (1, 3, 4, 7, 16):
+            step = Step(jnp.asarray(0), key, None)
+            values = np.asarray(step.sample("noise", jax.random.normal, shape, dtype=dtype, rows=rows))
+            for example in range(rows):
+                np.testing.assert_array_equal(values[example], alone[example])
 
 
 def test_a_recorder_and_a_tape_hold_each_example_once_and_whole():
