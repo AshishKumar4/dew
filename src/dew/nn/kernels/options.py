@@ -15,16 +15,24 @@ from dew.telemetry.devices import xla_flag
 if TYPE_CHECKING:
     from flax import linen as nn
 
-    from dew.quantization import Quantization
+
+class QuantizedDtypes(Protocol):
+    """What the options read of a run's quantization (`dew.quantization.Quantization`, above the kernels):
+    the dtypes its forward and backward quantize to."""
+
+    @property
+    def dtype(self) -> str: ...
+
+    @property
+    def bwd_qtype(self) -> str | None: ...
 
 
 @runtime_checkable
 class QuantizedClass(Protocol):
-    """A model class Qwix made for a `Quantization` (`dew.quantization`), which
-    `_dew_quantization` names for the programs that run it (`compiler_options`); a wrapper's class
-    over it inherits it."""
+    """A model class Qwix made for a quantization (`dew.quantization`), which `_dew_quantization`
+    names for the programs that run it (`compiler_options`); a wrapper's class over it inherits it."""
 
-    _dew_quantization: ClassVar[Quantization]
+    _dew_quantization: ClassVar[QuantizedDtypes]
 
 
 def compiler_options(*models: nn.Module) -> dict[str, bool]:
