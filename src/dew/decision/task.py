@@ -65,7 +65,6 @@ from dew.inference.tasks import shape_bucket
 from dew.interop.processors import Processor
 from dew.nn.inputs import ModelInputs, RowPlan, mesh_of
 from dew.nn.kernels.options import compiler_options
-from dew.nn.protocols import CrossAttending
 from dew.objectives.base import Metric, Objective, Variables
 from dew.records import JSON, json_value, record
 
@@ -348,12 +347,8 @@ class Decide:
 
     @property
     def context_length(self) -> int | None:
-        """The most context tokens a request carries: the backbone's cross-attention's
-        (`CrossAttending`), or None for a backbone that reads no context."""
-        backbone = self.model.backbone
-        if not isinstance(backbone, CrossAttending) or backbone.cross_attention is None:
-            return None
-        return backbone.cross_attention.context_length
+        """The most context tokens a request carries (`DecisionModel.context_length`)."""
+        return self.model.context_length
 
     def _encoded(self, state: JSON, questions: Mapping[str, Question],
                  media: Sequence[int] = (), *, context: JSON | None = None) -> list[Encoded]:
