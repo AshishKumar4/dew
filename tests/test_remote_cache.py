@@ -45,7 +45,8 @@ for named in ("AuthenticAMD-25-17", "AuthenticAMD-25-1"):
 """
     path = os.pathsep.join([os.path.dirname(__file__), os.environ.get("PYTHONPATH", "")])
     env = {**os.environ, "JAX_PLATFORMS": "cpu", "PYTHONPATH": path}
-    done = subprocess.run([sys.executable, "-c", script], env=env, capture_output=True, text=True, timeout=300)
+    done = subprocess.run([sys.executable, "-c", script], env=env, capture_output=True, text=True,
+                          timeout=300)
     assert done.returncode == 0, done.stderr[-2000:]
     zen4, zen3 = done.stdout.split()
     assert zen4.endswith("/cpu/AuthenticAMD-25-17") and zen3.endswith("/cpu/AuthenticAMD-25-1")
