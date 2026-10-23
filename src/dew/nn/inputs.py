@@ -1206,8 +1206,8 @@ class Request:
         return replace(padded, token_fields=with_validity(padded.token_fields, valid))
 
 
-__all__ = ["RESPONSE_FIELDS", "AttentionMetadata", "FieldExtension", "LayerInputs", "ModelInputs",
-           "ModelKwarg", "RowPlan"]
+__all__ = ["CONTEXT", "CONTEXT_LENGTHS", "RESPONSE_FIELDS", "AttentionMetadata", "CrossContext",
+           "FieldExtension", "LayerInputs", "ModelInputs", "ModelKwarg", "RowPlan"]
 
 
 def routing_blocks(feedforward, metadata: AttentionMetadata | None, shape: tuple[int, ...]) -> dict:

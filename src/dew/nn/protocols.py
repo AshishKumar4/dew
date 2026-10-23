@@ -469,6 +469,16 @@ class CrossAttending(Protocol):
         """The width of the tokens of a context its cross-attention layers read."""
         ...
 
+    @property
+    def context_dtype(self) -> jnp.dtype:
+        """The dtype a context's tokens enter its cross-attention layers in."""
+        ...
+
+    def cross_flops(self, lengths, context_lengths) -> float:
+        """The cross-attention layers' forward work over rows of `lengths` tokens reading contexts
+        of `context_lengths` tokens."""
+        ...
+
     def with_cross_attention(self, cross: CrossAttention | None) -> Self: ...
 
 

@@ -1279,7 +1279,7 @@ class CausalTransformer(nn.Module):
                 emb_features=self.emb_features, norm_eps=self.norm_eps,
                 dtype=self.dtype, precision=self.precision),
             engram_index=spec.engram,
-            cross=self._cross_layer(index, gated_mlp) if spec.cross else None,
+            cross=self._cross_layer(index) if spec.cross else None,
             prediction_target=spec.prediction_target is not None,
             prediction_site='input' if self.dspark is None else self.dspark.reads,
             attention_norm=spec.attention_norm,
@@ -1305,11 +1305,13 @@ class CausalTransformer(nn.Module):
             name=name)
 
     @nn.nowrap
-    def _cross_layer(self, index: int, gated_mlp) -> Callable[..., GatedCrossAttention]:
-        """Layer `index`'s gated cross-attention factory: the model's norms, none under nGPT, its
-        gated MLP at the block's width, its attention's heads, kernel and dtypes."""
+    def _cross_layer(self, index: int) -> Callable[..., GatedCrossAttention]:
+        """Layer `index`'s gated cross-attention factory: the model's norms, none under nGPT, a
+        gated MLP of the block's own activation at its width, with nGPT's gains under nGPT, and the
+        model's attention heads, kernel, initializers and dtypes."""
         cross = self.cross_attention
         assert cross is not None
+        init_std, output_init_std = self.init_stds
         return functools.partial(
             GatedCrossAttention,
             norm=None if self.ngpt is not None else decoder_norm(
@@ -1317,7 +1319,10 @@ class CausalTransformer(nn.Module):
                 scale_after_cast=self.scale_after_cast, dtype=self.dtype, specs=self.norms),
             ngpt=self.ngpt is not None,
             feedforward=functools.partial(
-                gated_mlp, hidden_features=cross.intermediate_size or self.mlp_widths[index]),
+                GatedMLP, hidden_features=cross.intermediate_size or self.mlp_widths[index],
+                out_features=self.emb_features, activation=cross.activation, ngpt=self.ngpt,
+                init_std=init_std, output_init_std=output_init_std, dtype=self.dtype,
+                precision=self.precision),
             emb_features=self.emb_features,
             context_features=self.context_width,
             context_length=cross.context_length, heads=self.num_heads, kv_heads=self.kv_heads,
@@ -1333,8 +1338,7 @@ class CausalTransformer(nn.Module):
         cross = self.cross_attention
         if cross is None:
             return 0.0
-        gated_mlp = self.feedforward_factories()[0]
-        return sum(self._cross_layer(index, gated_mlp)(parent=None).cross_flops(lengths, context_lengths)
+        return sum(self._cross_layer(index)(parent=None).cross_flops(lengths, context_lengths)
                    for index in cross.layer_ids)
 
     @nn.nowrap
@@ -1534,7 +1538,8 @@ class CausalTransformer(nn.Module):
                           positions=None, segment_ids=None, input_embeddings=None,
                           attention_mask=None,
                           image_groups=None, rotary_positions=None,
-                          coordinates: Coordinates | None = None):
+                          coordinates: Coordinates | None = None,
+                          conditioning: Mapping[str, jax.Array] | None = None):
         """Return one final-normed state array per shifted prediction depth.
 
         Each depth combines the preceding hidden state with the next token's
@@ -1542,8 +1547,11 @@ class CausalTransformer(nn.Module):
         positions. A pair counts only when both of its positions are valid and
         belong to the same packed document, so padded positions in between
         never become keys. A sequence no longer than the number of depths
-        raises `ValueError`.
+        raises `ValueError`. The depths keep no cross-attention: `hidden`, the
+        trunk's states, already read the call's `conditioning`, which they take
+        as the trunk does and leave unread.
         """
+        del conditioning
         if self.mtp and tokens.shape[1] <= len(self.mtp):
             raise ValueError("prediction depths need a sequence longer than their depth count")
         if coordinates is None and (segment_ids is not None or attention_mask is not None
@@ -2402,6 +2410,12 @@ class CausalTransformer(nn.Module):
         if cross is None or cross.context_features is None:
             return self.emb_features
         return cross.context_features
+
+    @property
+    def context_dtype(self) -> jnp.dtype:
+        """The dtype a context's tokens enter in (`CrossAttending`): the decoder's compute dtype, at
+        least float32, as its projections widen what they read."""
+        return at_least_fp32(self.dtype)
 
     @nn.nowrap
     def with_cross_attention(self, cross: CrossAttention | None) -> Self:
