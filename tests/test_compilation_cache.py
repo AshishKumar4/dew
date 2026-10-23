@@ -50,7 +50,8 @@ def test_a_run_caches_its_compilations_under_the_users_cache_directory(tmp_path,
                           timeout=300, cwd=root)
     assert done.returncode == 0, done.stderr[-2000:]
     directory = json.loads(done.stdout.strip().splitlines()[-1])["directory"]
-    expected = tmp_path / "dew" / "xla" / f"python{sys.version_info.major}.{sys.version_info.minor}" / cpu_class()
+    minor = f"python{sys.version_info.major}.{sys.version_info.minor}"
+    expected = tmp_path / "dew" / "xla" / minor / cpu_class()
     if enabled:
         assert directory == str(expected)
         assert any(path.is_file() and "autotune" not in path.parts for path in expected.rglob("*"))
