@@ -488,7 +488,6 @@ class Trainer(Generic[Loss, Effects]):
         self.links: dict[str, Link] = {}
         self._bandwidths: dict[tuple[Mesh, str], float | None] = {}
         self._display = TrainingDisplay()
-        self._count_work = False
         self._refusal: str | None = None
         # The fit ladder's rung beyond the objective's own head and remat: a step that fit only under XLA's
         # default options keeps them for later compiles. A resumed run starts at its checkpoint's rung, and
@@ -1631,9 +1630,6 @@ class Trainer(Generic[Loss, Effects]):
             jax.devices()[0].device_kind, jax.process_count(), dict(mesh.shape),
             split_share(state.variables),
             seed=self.seed, tokens=plan.tokens)
-        # The run counts its batches' work for train/flops, and train/mfu where the device has a known
-        # peak, while they can be counted (`_counted_batch`).
-        self._count_work = True
         self._refusal = None
         self._report(started, current)
         if plan.dataset.held_out:
@@ -2049,7 +2045,7 @@ class Trainer(Generic[Loss, Effects]):
         rollout's caller, and only it writes the reason. A count asked of the
         objective directly stays strict.
         """
-        if self._count_work and self._refusal is None:
+        if self._refusal is None:
             try:
                 return prepare_counts(self.objective, batch, count_model=True)
             except MissingFlopsCount as missing:

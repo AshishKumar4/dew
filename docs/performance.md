@@ -18,9 +18,11 @@ python tools/optimizer_curve.py --dataset <tokens> --optimizer <name> \
 
 ## Model FLOPs, hardware FLOPs and real tokens
 
-`train/flops` is a step's analytical training work, `3 * sum(model_forward_flops)`, logged on
-every device. `train/mfu` is `3 * sum(model_forward_flops) / (non_compile_seconds * aggregate_peak)`,
-logged where the device's bf16 peak is known.
+`train/flops` is the logging interval's summed `Objective.training_flops` over its attempted
+steps, the whole mesh's analytical training work a step, logged on every device: `3 *
+sum(model_forward_flops)` where every counted network trains, the frozen and trainable work
+apart where some do not (an adapter, a frozen encoder). `train/mfu` is that work over
+`non_compile_seconds * aggregate_peak`, logged where the device's bf16 peak is known.
 The forward work is analytical, not inferred from HLO: `Counted.model_flops(lengths)`
 receives the real lengths of independent rows or packed segments. One multiply-add
 counts as two operations. A dense projection contributes `2 * in * out` per real
