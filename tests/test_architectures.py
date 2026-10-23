@@ -26,7 +26,7 @@ from diffusion_stubs import StubText
 from diffusion_support import images_of
 from flax import linen as nn
 from recording import RecordingTracker
-from reference_error import assert_as_exact, with_gradients
+from reference_error import assert_as_exact, assert_computes_the_oracle, chain_roundings, widened
 from residual_orders import permuted, residual_width
 
 from dew.artifacts import ImageGrid, Representations, TokenScores, VideoGrid
@@ -441,8 +441,10 @@ def routes(case: Case) -> bool:
 def selections_forward(name: str):
     """A cell's forward capturing its discontinuous selections (`selection_margin`), compiled once a
     cell: the lightning indexer's scores from its `scores` method, Gemma 3n's gate from its gated MLP's
-    Dense. One compiled forward rather than an op at a time: XLA:CPU's JIT failed to materialize a
-    gather fusion among the many small programs an unjitted capture compiles."""
+    Dense, a Router's selection scores, group scores and group mask from its own methods, and gpt-oss's
+    and Gemma 4's router logits from their Dense. One compiled forward rather than an op at a time:
+    XLA:CPU's JIT failed to materialize a gather fusion among the many small programs an unjitted
+    capture compiles."""
     from dew.nn.gemma4_moe import Gemma4TextRouter
     from dew.nn.gpt_oss import GptOssMLP
     from dew.nn.mla import SparseIndexer
@@ -456,7 +458,7 @@ def selections_forward(name: str):
         if isinstance(module, SparseIndexer):
             return method == "scores"
         if isinstance(module, Router):
-            return method == "logits"
+            return method in ("selection", "group_scores", "group_mask")
         if isinstance(module, nn.Dense) and method == "__call__" and (
                 (isinstance(module.parent, GptOssMLP) and module.name == "router")
                 or (isinstance(module.parent, Gemma4TextRouter) and module.name == "proj")):
@@ -494,70 +496,37 @@ def top_margin(values: np.ndarray, kept: int) -> np.ndarray:
     return np.where(np.isfinite(next_best), (chosen - next_best) / scale, np.inf)
 
 
-def router_margin(mixture: dict, logits: np.ndarray, bias: np.ndarray | None) -> float:
-    """The smallest margin of a mixture's routing over its router's `logits`, as `dew.nn.moe.Router`
-    selects: its scores (`score_function`) plus the balancing bias, the best `groups_per_token` of
-    its expert groups by their two best scores (or their best), then the `top_k` experts among them
-    (`top_margin` of each)."""
-    function = mixture.get("score_function", "softmax")
-    if function == "softmax":
-        scores = np.exp(logits - logits.max(-1, keepdims=True))
-        scores /= scores.sum(-1, keepdims=True)
-    elif function == "sqrtsoftplus":
-        scores = np.sqrt(np.logaddexp(0, logits))
-    else:
-        scores = 1 / (1 + np.exp(-logits))
-    selection = scores + (0 if bias is None else bias)
-    groups = mixture.get("groups", 1)
-    margin = np.inf
-    if groups > 1:
-        grouped = selection.reshape(*selection.shape[:-1], groups, -1)
-        best = -np.sort(-grouped, axis=-1)
-        group_scores = best[..., 0] if mixture.get("group_score", "top2") == "max" else best[..., :2].sum(-1)
-        chosen = mixture.get("groups_per_token", 1)
-        margin = min(margin, float(np.min(top_margin(group_scores, chosen))))
-        kept = np.argsort(-group_scores, axis=-1)[..., :chosen]
-        allowed = np.zeros(group_scores.shape, bool)
-        np.put_along_axis(allowed, kept, values=True, axis=-1)
-        selection = np.where(np.repeat(allowed, grouped.shape[-1], axis=-1), selection, -np.inf)
-    return min(margin, float(np.min(top_margin(selection, mixture.get("top_k", 2)))))
-
-
 def selection_margin(case: Case, variables, tokens) -> float:
     """The smallest margin, over the forward of `variables`, of the model's
     discontinuous selections relative to their scale: the lightning indexer's top-k (the gap between
     the k-th and the next visible key's score, over the query's largest), Gemma 3n's gaussian top-k
     (the gate's distance from its cutoff, the row's mean plus the sparsity's normal quantile times its
     population deviation, over that deviation, as `dew.nn.mlp.gaussian_topk` forms it) and a
-    mixture's routing (`router_margin`; gpt-oss's and Gemma 4's routers, which rank their logits or
-    their softmax by a plain top-k, by `top_margin` of the logits). A query that sees no more keys
-    than its budget, and an exact zero tie of relu'd scores, ordered alike by index in every run,
-    decide nothing."""
+    mixture's routing, read from the router's own operands: a Router's best groups by its group
+    scores and its experts by its selection scores within them (`top_margin` of each), gpt-oss's and
+    Gemma 4's routers, which rank their logits or their softmax by a plain top-k, by their logits'. A
+    query that sees no more keys than its budget, and an exact zero tie of relu'd scores, ordered
+    alike by index in every run, decide nothing."""
     fields = case.config.get("mixer", {}).get("fields", {})
     sparsities = case.config.get("activation_sparsity_pattern", ())
     margin, seen = np.inf, 0
+    mixture = case.config.get("mixture") or {}
     _, captured = selections_forward(case.name)(variables, jnp.asarray(tokens[:, :-1]))
+    routers: dict[tuple[str, ...], dict[str, np.ndarray]] = {}
     for path, values in jax.tree_util.tree_flatten_with_path(captured.get("intermediates", {}))[0]:
         seen += 1
         names = [str(getattr(part, "key", part)) for part in path]
+        if names[-2] in ("selection", "group_scores", "group_mask"):
+            routers.setdefault(tuple(names[:-2]), {})[names[-2]] = np.asarray(values)
+            continue
         values = np.asarray(values, np.float64)
         if "gate_proj" in names:
             layer = int(next(name for name in names if name.startswith("layers_")).split("_")[1])
             margin = min(margin, gate_margin(values, sparsities[layer]))
             continue
-        if "router" in names or "proj" in names:
+        if names[-3] in ("router", "proj") and names[-2] == "__call__":
             # gpt-oss ranks its router's logits, Gemma 4's router their softmax: one order, by logit.
-            kept = case.config["mixture"].get("top_k", 2)
-            margin = min(margin, float(np.min(top_margin(values, kept))))
-            continue
-        if "logits" in names:
-            module = names[:names.index("logits")]
-            bias = variables.get("moe", {})
-            for name in module:
-                bias = bias.get(name, {}) if isinstance(bias, dict) else {}
-            bias = bias.get("e_score_correction_bias") if isinstance(bias, dict) else None
-            margin = min(margin, router_margin(case.config["mixture"], values,
-                                               None if bias is None else np.asarray(bias, np.float64)))
+            margin = min(margin, float(np.min(top_margin(values, mixture.get("top_k", 2)))))
             continue
         budget, (queries, keys) = fields["index_topk"], values.shape[-2:]
         if keys <= budget:
@@ -569,6 +538,14 @@ def selection_margin(case: Case, variables, tokens) -> float:
         scale = np.maximum(np.abs(ranked[..., 0]), np.finfo(np.float32).tiny)
         margin = min(margin, float(np.min(np.where(decided, (kept - rejected) / scale, np.inf))))
     # A model that selects shows its selections here, or the draw would pass unfiltered.
+    for operands in routers.values():
+        # A Router chooses its best groups by their scores, then its experts among the groups kept.
+        selection = np.asarray(operands["selection"], np.float64)
+        if "group_scores" in operands:
+            groups = np.asarray(operands["group_scores"], np.float64)
+            margin = min(margin, float(np.min(top_margin(groups, mixture.get("groups_per_token", 1)))))
+            selection = np.where(operands["group_mask"], selection, -np.inf)
+        margin = min(margin, float(np.min(top_margin(selection, mixture.get("top_k", 2)))))
     assert seen, f"{case.name}: no selection was captured"
     return margin
 
@@ -623,6 +600,29 @@ def drawn_steps(case: Case, tmp_path, fsdp, devices, initial, steps: int, *, exa
     return stepped
 
 
+@pytest.mark.parametrize("case", [case for case in CASES if case.is_lm],
+                         ids=[name for case, name in zip(CASES, IDS, strict=True) if case.is_lm])
+def test_a_residual_order_is_the_same_decoder(case):
+    """The residual orders the layout cells draw (`permuted`) reorder sums only: each language cell's
+    float64 logits under an order other than the identity are the identity's within float64's
+    rounding of their own longest chain (`assert_computes_the_oracle`), so a draw over orders is a
+    draw of roundings and never another model."""
+    model = models.build(case.architecture, **case.config)
+    ids = np.random.default_rng(3).integers(0, LM["vocab_size"], (2, SEQ_LEN)).astype(np.int32)
+    variables = jax.jit(model.init)(jax.random.key(0), ids)
+    width = residual_width(variables)
+    with jax.enable_x64(new_val=True):
+        wide = widened(variables)
+        identity = np.asarray(model.clone(dtype=jnp.float64).apply(wide, ids))
+        for seed in (1, 2):
+            order = np.random.default_rng([0x0BB17, seed]).permutation(width)
+            reordered = model.clone(dtype=jnp.float64).apply(permuted(wide, order), ids)
+            roundings = chain_roundings(jax.make_jaxpr(
+                lambda variables: model.clone(dtype=jnp.float64).apply(variables, ids))(wide))
+            assert_computes_the_oracle(np.asarray(reordered), identity, f"{case.name} order {seed}",
+                                       roundings=roundings)
+
+
 @pytest.mark.parametrize("case", CASES, ids=IDS)
 def test_architecture_trains_on_every_layout_as_on_one_device(case, tmp_path):
     """One device, 8x1 data parallelism (every parameter replicated, the
@@ -635,14 +635,7 @@ def test_architecture_trains_on_every_layout_as_on_one_device(case, tmp_path):
     difference, where a layout that dropped or repeated a row would fail by
     orders of magnitude. The steps check 1 draws are `fit`'s own on the
     run's batch, bit for bit, each compiled once for every draw. Adam's two
-    moments and its count follow the parameters' placement too. A feed-forward
-    that selects by gaussian top-k runs here at no sparsity: its backward and
-    AltUp's router cancel, so a whole step's float32 error has a tail no seed
-    count resolves, and those pieces are held over the same layouts on their
-    own (`test_gemma3n_selecting_pieces_compute_on_every_layout_as_on_one_device`)."""
-    sparsities = case.config.get("activation_sparsity_pattern")
-    if sparsities is not None and any(sparsities):
-        case = replace(case, config={**case.config, "activation_sparsity_pattern": (0.0,) * len(sparsities)})
+    moments and its count follow the parameters' placement too."""
     trainer, encoder = make_trainer(case, tmp_path / "initial", 1, devices=1)
     initial = trainer.initial_state()
 
@@ -774,73 +767,3 @@ def test_a_val_metric_records_its_own_constructors_defaults():
         DiffusionRunConfig.cli(["--val-metrics", '["psnr"]'])
     with pytest.raises(TypeError):
         replace(run, val_metrics=("psnr",))
-
-
-SELECTING_SEEDS = {"8x1 data": 32, "2x4 fsdp": 32}
-"""The selecting pieces' declared seeds for check 1 on each layout, sized by `seeds_for` paired with
-the layout's arm on armada."""
-
-
-class Selecting(nn.Module):
-    """Gemma 3n's first layer's selecting pieces, as the layout cell's gemma3n holds them: AltUp's
-    prediction over three copies of the residual (its modality router), the gaussian top-k
-    feed-forward at sparsity 0.95 on the active copy, and AltUp's correction."""
-
-    @nn.compact
-    def __call__(self, streams):
-        from dew.nn.gemma3n import AltUp, AltUpLayer
-        from dew.nn.mlp import GatedMLP
-
-        altup = AltUpLayer(spec=AltUp(num_inputs=3), emb_features=LM["emb_features"], name="altup")
-        predictions = altup.predict(streams)
-        hidden = GatedMLP(hidden_features=48, out_features=LM["emb_features"], activation="geglu",
-                          activation_sparsity=0.95, name="mlp")(predictions[0])
-        return altup.correct(predictions, hidden)
-
-
-@pytest.mark.parametrize("layout", ["8x1 data", "2x4 fsdp"], ids=["data", "fsdp"])
-def test_gemma3n_selecting_pieces_compute_on_every_layout_as_on_one_device(layout):
-    """AltUp's router and the gaussian top-k feed-forward, whose cancelling backward the gemma3n
-    layout cell leaves out, placed as that cell places them (8x1 data parallelism, 2x4 fsdp over
-    parameters below `TINY_SHARD` and above), compute their output and the gradients into the
-    streams and every parameter as one device does, from the float64 run (check 1), over drawn
-    streams, parameters and cotangents whose gate clears the selection margin (`gate_margin`)."""
-    from jax.sharding import NamedSharding, PartitionSpec
-
-    from dew.nn.sharding import batch_axes
-
-    module = Selecting()
-    streams_shape = (3, BATCH, LONG_SEQ_LEN, LM["emb_features"])
-    init = jax.jit(module.init)
-    gate = jax.jit(lambda variables, streams: module.apply(
-        variables, streams, capture_intermediates=lambda layer, method: layer.name == "gate_proj",
-        mutable=["intermediates"])[1])
-
-    def draw(seed):
-        for attempt in range(64):
-            rng = np.random.default_rng([seed, attempt])
-            streams = rng.standard_normal(streams_shape).astype(np.float32)
-            variables = jax.device_get(init(jax.random.key(seed * 64 + attempt), streams))
-            gates = jax.tree.leaves(gate(variables, streams))
-            if gate_margin(np.asarray(gates[0]), 0.95) > MARGIN:
-                cotangent = rng.standard_normal(streams_shape).astype(np.float32)
-                return variables["params"], streams, cotangent
-        raise AssertionError(f"no draw of seed {seed} clears the selection margin {MARGIN}")
-
-    def run(params, streams, cotangent):
-        return with_gradients(lambda params, streams: module.apply({"params": params}, streams))(
-            params, streams, cotangent)
-
-    one_device = jax.jit(run)
-    mesh = (MeshSpec() if layout == "8x1 data" else MeshSpec(fsdp=4)).build(jax.devices())
-    rows = NamedSharding(mesh, PartitionSpec(None, batch_axes(mesh)))
-    shapes = jax.eval_shape(init, jax.random.key(0), jnp.zeros(streams_shape))["params"]
-    placement = Layout(min_shard=TINY_SHARD).shardings(mesh, shapes)
-    laid = jax.jit(run, in_shardings=(placement, rows, rows))
-
-    def placed(params, streams, cotangent):
-        with jax.set_mesh(mesh):
-            return jax.device_get(laid(params, streams, cotangent))
-
-    assert_as_exact(placed, one_device, draw, f"gemma3n selecting pieces, {layout}",
-                    seeds=SELECTING_SEEDS[layout])
