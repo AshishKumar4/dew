@@ -259,12 +259,14 @@ def _staging(operand: _Operand, *shapes) -> tuple:
 def _kernel(program, call: _Call, *, out_type, grid, grid_names, blocks: dict, stages: int,
             staging: tuple = ()):
     """`program(*refs, streams, staging)` as a kernel over `grid`: its streams of `blocks` (`stages` deep) and
-    its staging tiles scoped."""
+    its staging tiles scoped, named for its launch (`recurrence_solve`, ...)."""
     def entry(*arrays):
         def scoped(streams, staged):
             program(*arrays, streams=FAMILY.opened(streams), staging=staged)
 
         pl.run_scoped(scoped, FAMILY.streams(blocks, stages, 1), staging)
+
+    entry.__name__ = f"recurrence{program.__qualname__.split('.')[0]}"
 
     return FAMILY.kernel(entry, out_type=out_type, grid=grid, grid_names=grid_names, consumers=1,
                          interpret=call.interpret)

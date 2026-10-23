@@ -84,6 +84,8 @@ class MmaSync(mosaic.Family):
             with _interpreted(interpret):
                 entry(*refs)
 
+        traced.__name__ = entry.__name__
+
         return plgpu.kernel(traced, out_type=out_type, grid=grid, grid_names=grid_names,
                             compiler_params=mosaic.compiler_params(),
                             interpret=plgpu.InterpretGPUParams() if interpret else None)
