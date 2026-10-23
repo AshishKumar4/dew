@@ -465,7 +465,8 @@ def assert_trains(objective, batch: Mapping, directory: Path, *, evaluated: Mapp
     checkpoints = Checkpoints(str(directory))
     trainer = Trainer(objective, optax.adam(1e-3), key=0, checkpoints=checkpoints, tracker=tracker,
                       rollout=rollout)
-    initial = trainer.initial_state()
+    # The state fit places, which a run that never stopped starts from too.
+    initial, _, _ = trainer.place()
     started = jax.device_get(initial.variables["params"])
     if data is None:
         data = Loader(replayed(lambda partition: itertools.repeat(batch)), None, batch=ROWS, records=None)
@@ -515,10 +516,8 @@ def assert_resumes(objective, data, directory: Path, rollout) -> None:
                 if getattr(read, name) != getattr(fresh, name)]
     leaves = [path for (path, got), (_, want) in zip(bits(after), bits(uninterrupted), strict=True)
               if got.dtype != want.dtype or not np.array_equal(got, want)]
-    assert not programs and not leaves, {"plans differ": resumed.plan != whole.plan,
-                                         "resumed plan": str(resumed.plan)[:300],
-                                         "the step reads the restored state otherwise": programs,
-                                         "leaves off the run that never stopped": len(leaves)}
+    assert not programs and not leaves, {"the step reads the restored state otherwise": programs,
+                                         "leaves off the run that never stopped": leaves}
 
 
 def token_batch(width: int, seed: int = 0) -> np.ndarray:
