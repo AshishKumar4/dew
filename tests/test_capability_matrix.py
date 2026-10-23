@@ -19,7 +19,8 @@ declarations, never by trying an operation and skipping what raises:
   the trained leaves, the run checkpoints, evaluation runs, and the saved
   run reloads to the same numbers;
 - a refused cell, a family the method reads but whose math it cannot run,
-  fails with an error that names the missing fact.
+  is refused for the missing fact (`dew.nn.protocols.Lacks`, whose
+  `capability` is one the family lacks), not by any other error.
 
 A family Dew registers without a fixture here fails
 `test_every_registered_family_has_a_fixture`, and an objective without a row
@@ -34,7 +35,7 @@ import dataclasses
 import functools
 import gc
 import itertools
-import re
+import pickle
 import shutil
 import tempfile
 from collections.abc import Callable, Mapping
@@ -66,6 +67,7 @@ from dew.inputs import Condition, Field, InputSpec
 from dew.inputs.encoders import CharTable
 from dew.interop import Pretrained
 from dew.lora import Adapter, LoRA
+from dew.nn.protocols import Lacks
 from dew.objectives.base import TEACHER, Step
 from dew.objectives.diffusion import (
     AdversarialDistillationObjective,
@@ -147,20 +149,6 @@ ENCODES = "encodes"
 """Encodes a sample's patches into token states a JEPA predictor reads (`HiddenStates`-like)."""
 CANVAS = "canvas"
 """Refines a canvas of tokens against a cache of committed clean ones (`BlockDenoiser`)."""
-
-REASONS: Mapping[str, str] = {
-    LOGITS: r"logits|sample alone",
-    CAUSAL: r"causal",
-    BIDIRECTIONAL: r"bidirectional|reads the whole|future",
-    PACKING: r"pack|segment",
-    CACHE: r"cache",
-    INTERVAL: r"interval",
-    GUIDED: r"guidance",
-    FEATURES: r"feature",
-    CANVAS: r"canvas|BlockDenoiser|encode",
-}
-"""What the error of a refused cell names, by the fact the family lacks."""
-
 
 # --- families --------------------------------------------------------------
 
@@ -1043,13 +1031,13 @@ def test_a_supported_cell_trains_evaluates_and_reloads(method, family, tmp_path)
     method.run(family, tmp_path / "run")
 
 
-CRASHES = re.compile(r"unexpected keyword argument|missing \d+ required|has no attribute")
-"""Python's own signature and attribute errors: a crash on the way, not a refusal."""
-
-
 @pytest.mark.parametrize("method, family", cells(supported=False))
 def test_a_refused_cell_names_what_the_family_lacks(method, family):
-
-    with pytest.raises((TypeError, ValueError)) as refused:
+    """The method refuses the family for a fact its math needs and the family lacks
+    (`dew.nn.protocols.Lacks`), not for any other error on the way, and the refusal crosses a
+    process boundary whole, its capability with it."""
+    with pytest.raises(Lacks) as refused:
         method.refuse(family)
-    assert not CRASHES.search(str(refused.value)), refused.value
+    assert refused.value.capability in method.needs - family.facts
+    carried = pickle.loads(pickle.dumps(refused.value))
+    assert (carried.capability, carried.args) == (refused.value.capability, refused.value.args)

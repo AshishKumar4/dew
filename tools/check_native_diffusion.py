@@ -218,8 +218,12 @@ def train_and_reload(source, reference, key, given, noise):
 
 
 def check_pipeline(directory, streamed: bool = False):
+    """The saved pipeline's trajectory, update, reload and export against the source. With
+    `streamed`, the pipeline streamed onto a mesh a leaf at a time loads the same tree, placed on the
+    mesh, its trajectory's images are held to the source as the whole load's are, and it is the
+    pipeline the update, reload and export run on (`streamed_parity`)."""
     directory = Path(directory)
-    source = bundle(directory, streamed)
+    source = bundle(directory)
     reference = np.load(directory / "reference.npz")
     meta = json.loads((directory / "reference.json").read_text()) if (directory / "reference.json").exists() else {}
     errors, key = {}, jax.random.PRNGKey(17)
@@ -255,9 +259,35 @@ def check_pipeline(directory, streamed: bool = False):
     # The same walk through the task facade: the same images.
     output = task(prepared, steps=meta.get("steps", 2), guidance=3.0, key=key)
     np.testing.assert_array_equal(output.host().images, images)
+    if streamed:
+        source, given = streamed_parity(errors, directory, source, reference, meta, key)
     training = train_and_reload(source, reference, key, given, jnp.asarray(reference["noise"]))
     errors["reload"] = 0.0
     print(json.dumps({"directory": str(directory), "errors": errors, "training": training}))
+
+
+def streamed_parity(errors, directory, whole, reference, meta, key):
+    """The pipeline streamed onto a mesh a leaf at a time: every leaf the whole load holds, bit for
+    bit, each placed on the mesh, and its trajectory's images as near float64 as the source's
+    (`held`): another program than the whole load's, which XLA need not round alike. The public
+    task call walks to the same images. Returns the streamed pipeline and its walk's conditions,
+    for the update, reload and export to run on."""
+    streamed = bundle(directory, streamed=True)
+    assert jax.tree.structure(streamed.variables) == jax.tree.structure(whole.variables)
+    for path, leaf in jax.tree_util.tree_leaves_with_path(streamed.variables):
+        assert isinstance(leaf.sharding, jax.sharding.NamedSharding), jax.tree_util.keystr(path)
+    for left, right in zip(jax.tree.leaves(streamed.variables), jax.tree.leaves(whole.variables),
+                           strict=True):
+        np.testing.assert_array_equal(np.asarray(left), np.asarray(right))
+    given, null, process, times = selection(streamed, meta)
+    task = streamed.text_to_image()
+    prepared = public_start(task, streamed, reference, meta, key, given, null, process, times)
+    walked, _, given = trajectory(streamed, prepared, given, null, process, times, key)
+    held(errors, directory.name, "streamed_trajectory_images", (np.asarray(walked, np.float64) + 1) / 2,
+         reference["images"], "images")
+    output = task(prepared, steps=meta.get("steps", 2), guidance=3.0, key=key)
+    np.testing.assert_array_equal(output.host().images, walked)
+    return streamed, given
 
 
 def check_grids(directory, grids, case=None):
@@ -281,9 +311,15 @@ def check_grids(directory, grids, case=None):
         latents = np.asarray(output.host().latents, np.float64)
         errors[name] = {"dew": distance(latents, oracle[name + ".latents.fp64"]),
                         "reference": distance(oracle[name + ".latents"], oracle[name + ".latents.fp64"])}
-        assert_as_exact_as_the_reference(latents, oracle[name + ".latents"], oracle[name + ".latents.fp64"],
-                                         f"{name} grid")
+        # Every grid is walked in one process over the one loaded pipeline, and each case's verdict
+        # is its own: a grid off the source is reported by name and the others still run.
+        try:
+            assert_as_exact_as_the_reference(latents, oracle[name + ".latents"],
+                                             oracle[name + ".latents.fp64"], f"{name} grid")
+        except AssertionError as failed:
+            errors[name]["failed"] = str(failed)
     print(json.dumps({"grids": errors}))
+    return not any("failed" in error for error in errors.values())
 
 
 def handoff(directory, source, task, key):
@@ -458,7 +494,7 @@ if __name__ == "__main__":
     if args.model:
         check_model(args.directory)
     elif args.grids:
-        check_grids(args.directory, args.grids, args.case)
+        sys.exit(0 if check_grids(args.directory, args.grids, args.case) else 1)
     elif args.case:
         regress(args.directory, args.case)
     else:
