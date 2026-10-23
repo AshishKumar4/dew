@@ -702,8 +702,11 @@ def chunked_cross_entropy(hidden, head: OutputTable, targets, chunks: int, *,
     The softcap is elementwise, so capping a tile and capping the row agree. `tile` is a `(tokens, columns)`
     block: both passes walk tokens in the first and columns in the second
     or a chunk, whichever is narrower, and the backward holds nothing
-    wider, so it is the only knob on the backward's temporaries. The
-    default is measured; a tile wider than the input is one
+    wider, so it is the only knob on the backward's temporaries. On a CPU
+    the backward's running sums of the state and head gradients keep what
+    each tile's addition drops (`dew.nn.precision.running_sum`), three
+    times their bytes, so they round once as the whole head's products do.
+    The default is measured; a tile wider than the input is one
     tile. A `tile` of None keeps the whole fp32 logits for the backward
     instead of recomputing them, which is faster wherever they fit: on one
     A100, Qwen3-0.6B's head at 4096 tokens took 33.1 ms with the logits
