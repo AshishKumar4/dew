@@ -56,7 +56,12 @@ def test_a_record_draws_alike_however_many_processes_read_its_step():
 
 
 NORMAL_SEEDS = 8
-"""The normal-draw sites' declared draws (`seeds_for`): each draw is the step's key from its seed."""
+"""The normal-draw sites' declared draws (`seeds_for`): each draw is the step's key from its seed.
+Each draws WIDTH values a row of each example: float32's erf_inv is up to 63 ulps from float64 near
+|u| = 1, so a leaf of a few values pools a heavy tail and resolves no ratio."""
+
+WIDTH = 64
+"""The values a check-1 draw adds to each draw shape, as a last axis (`NORMAL_SEEDS`)."""
 
 LOW = float(np.nextafter(np.float32(-1.0), np.float32(0.0)))
 """The least uniform `jax.random.normal` draws: the float32 just above -1."""
@@ -96,17 +101,17 @@ def test_each_example_draws_its_own_bits_under_any_key_implementation(impl):
 
     @jax.jit
     def batched(data):
-        return Step(jnp.asarray(0), keyed(data), None).sample("noise", jax.random.normal, (3,),
+        return Step(jnp.asarray(0), keyed(data), None).sample("noise", jax.random.normal, (3, WIDTH),
                                                                dtype=jnp.float32, rows=4)
 
     @jax.jit
     def alone(data):
         base = jax.random.fold_in(example_stream(keyed(data)), stream("noise"))
-        return jnp.stack([jax.random.normal(jax.random.fold_in(base, example), (3,))
+        return jnp.stack([jax.random.normal(jax.random.fold_in(base, example), (3, WIDTH))
                           for example in range(4)])
 
     def truth(data):
-        return np.stack([normal_truth(bits) for bits in example_bits(keyed(data), range(4), (3,))])
+        return np.stack([normal_truth(bits) for bits in example_bits(keyed(data), range(4), (3, WIDTH))])
 
     assert_as_exact(batched, alone, lambda seed: (jax.random.key_data(jax.random.key(seed, impl=impl)),),
                     f"{impl} normal draws", seeds=NORMAL_SEEDS, truth_fn=truth)
@@ -127,23 +132,25 @@ def test_an_examples_draw_is_its_own_whatever_batch_it_is_drawn_in():
         bits = np.asarray(step.sample("noise", jax.random.bits, shape, rows=rows))
         np.testing.assert_array_equal(bits, np.stack(example_bits(key, range(rows), shape)))
 
+    floats = [(rows, (*shape, WIDTH)) for rows, shape in LAYOUTS]
+
     @jax.jit
     def batched(data):
         step = Step(jnp.asarray(0), jax.random.wrap_key_data(data), None)
         return {f"{rows}x{shape}": step.sample("noise", jax.random.normal, shape, dtype=jnp.float32,
-                                               rows=rows) for rows, shape in LAYOUTS}
+                                               rows=rows) for rows, shape in floats}
 
     @jax.jit
     def alone(data):
         base = jax.random.fold_in(example_stream(jax.random.wrap_key_data(data)), stream("noise"))
         return {f"{rows}x{shape}": jnp.stack([jax.random.normal(jax.random.fold_in(base, example), shape)
-                                               for example in range(rows)]) for rows, shape in LAYOUTS}
+                                               for example in range(rows)]) for rows, shape in floats}
 
     def truth(data):
         drawn = jax.random.wrap_key_data(data)
         return {f"{rows}x{shape}": np.stack([normal_truth(bits)
                                              for bits in example_bits(drawn, range(rows), shape)])
-                for rows, shape in LAYOUTS}
+                for rows, shape in floats}
 
     assert_as_exact(batched, alone, lambda seed: (jax.random.key_data(jax.random.key(seed)),),
                     "normal draws across batches", seeds=NORMAL_SEEDS, truth_fn=truth)
