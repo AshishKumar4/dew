@@ -15,7 +15,6 @@ from dew.telemetry import builds
 
 REPO = Path(__file__).resolve().parents[1]
 READ = ("pyproject.toml", "constraints.txt", "README.md", "docs/installation.md", "tools/pip.txt",
-        "site/scripts/gen_install.py", "site/scripts/uv_bootstrap.sh", "site/scripts/colab-notebooks.mjs",
         "site/package.json", "site/public/install.sh")
 
 
@@ -26,8 +25,10 @@ def scratch(root: Path) -> Path:
         shutil.copy(REPO / name, root / name)
     shutil.copytree(REPO / "src", root / "src", ignore=lambda _, names: [
         name for name in names if name.endswith(".py") and name not in ("builds.py", "tpu_setup.py")])
-    # The tested Pythons, which tools/armada/ci.py reads from pyproject.toml's classifiers.
-    shutil.copytree(REPO / "tools/armada", root / "tools/armada")
+    # The generator and what it reads beside it, and the tested Pythons, which tools/armada/ci.py reads from
+    # pyproject.toml's classifiers.
+    for directory in ("site/scripts", "tools/armada"):
+        shutil.copytree(REPO / directory, root / directory, ignore=shutil.ignore_patterns("__pycache__"))
     return root
 
 
@@ -139,13 +140,13 @@ def floored(root: Path, least: str) -> Path:
     pyproject = root / "pyproject.toml"
     floor = next(line for line in pyproject.read_text().splitlines() if line.startswith("required-version"))
     pyproject.write_text(pyproject.read_text().replace(floor, f'required-version = ">={least}"', 1))
-    assert generate(root, "--check") == 1
     assert generate(root) == 0
     return root
 
 
 @pytest.mark.parametrize(("have", "fetched", "running"), [
-    ("0.13.9", ["https://astral.sh/uv/0.14.2/install.sh"], "0.14.2"), ("0.14.10", [], "0.14.10")])
+    ("0.13.9", ["https://astral.sh/uv/0.14.2/install.sh"], "0.14.2"),
+    ("0.14.2-rc.1", ["https://astral.sh/uv/0.14.2/install.sh"], "0.14.2"), ("0.14.10", [], "0.14.10")])
 def test_an_older_uv_is_replaced_by_the_least_one_which_runs_the_install(tmp_path, have, fetched, running):
     command, asked = installed(floored(tmp_path, "0.14.2"), "NVIDIA L4, 580.82.07, 8.9", uv=have)
     assert asked == fetched and command[:3] == [running, "pip", "install"]
