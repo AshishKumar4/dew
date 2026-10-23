@@ -537,15 +537,24 @@ _IDENTITY = frozenset({"model_type", "architectures", "transformers_version", "d
                        "auto_map", "_name_or_path"})
 
 
-def _class_defaults(name):
-    """The fields of the fixture's transformers config class, at its defaults, that a JSON file can
-    state: each is what the class reads where the file leaves the field out."""
+def _class_fills(name):
+    """For each field of the fixture's transformers config class, what the class fills it with where
+    the fixture's config leaves it out, everything else as stated: a fixed default, or one derived
+    from the other fields (a layer pattern from the layer count). Each is a JSON value a file could
+    state."""
     from transformers import CONFIG_MAPPING
 
-    made = CONFIG_MAPPING[fixture_config(name)["model_type"]]()
-    return {field: value for field, value in made.to_dict().items()
-            if field not in _IDENTITY and not field.startswith("_")
-            and json.loads(json.dumps(value, default=lambda value: None)) == value}
+    config = fixture_config(name)
+    cls = CONFIG_MAPPING[config["model_type"]]
+    stated = {field: value for field, value in config.items() if field not in _IDENTITY}
+    fills = {}
+    for field in cls().to_dict():
+        if field in _IDENTITY or field.startswith("_"):
+            continue
+        filled = cls(**{key: value for key, value in stated.items() if key != field}).to_dict().get(field)
+        if json.loads(json.dumps(filled, default=lambda value: None)) == filled:
+            fills[field] = filled
+    return fills
 
 
 def _translated(config):
@@ -559,7 +568,7 @@ def _translated(config):
 
 @pytest.mark.parametrize("name", CLASS_DEFAULTED)
 def test_a_field_left_out_reads_as_its_config_class_fills_it(name):
-    """Each field of the family's config class, once stated at the class's default and once left
+    """Each field of the family's config class, once stated as the class fills it and once left
     out of the fixture's config: where the field left out translates at all, it translates to the
     decoder the stated default does, because the family fills an omitted field as its class does,
     never at another family's default. A field the family requires is refused when left out, never
@@ -567,9 +576,9 @@ def test_a_field_left_out_reads_as_its_config_class_fills_it(name):
     (`test_a_source_spelled_another_way_computes_the_reference_logits`)."""
     config = fixture_config(name)
     differing = []
-    for field, default in _class_defaults(name).items():
+    for field, filled in _class_fills(name).items():
         left = _translated(_without(field)(config))
-        if left is not None and left != _translated({**config, field: default}):
+        if left is not None and left != _translated({**config, field: filled}):
             differing.append(field)
     assert not differing, f"{name} reads {differing} otherwise than its class where they are left out"
 
