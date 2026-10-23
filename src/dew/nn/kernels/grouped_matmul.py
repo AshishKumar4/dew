@@ -8,7 +8,8 @@ JAX's Pallas Triton kernels (`ragged_dot.py`, vendored), on every CUDA GPU from 
 interprets them; Dew's Pallas Mosaic GPU kernels for Hopper (`templates.gemm.mosaic_gpu`), whose
 warpgroup MMA Triton's lowering does not reach; and CUTLASS's grouped GEMMs (`kernels/cutlass`, the
 dew-cutlass wheel) where it is installed, a vendored kernel ranked by its measured rows until the
-template's beat it. `ragged_dot_refusal` says which products they compute exactly. They run only for
+template's beat it. The grouped selector (`GROUPED`) reads which products they compute exactly (the
+product's declaration, `templates.product.declared`) and which launch takes a call. They run only for
 a CUDA lowering, chosen where the call lowers (`jax.lax.platform_dependent`), so a CPU computation on a
 GPU host lowers to `jax.lax.ragged_dot`; an explicit request interprets them on the CPU, as the CPU
 suite checks them.
@@ -45,17 +46,11 @@ from jax.experimental.pallas import mosaic_gpu as plgpu, tpu as pltpu
 from jax.extend import core as jax_core
 
 from ..precision import rounded_operand
-from . import generation
+from . import generation, selection
+from .generation import INHERENT
 from .templates import base, cost, hopper
 from .templates.gemm import mosaic_gpu, mosaic_tpu
-from .templates.product import declared
-
-
-def ragged_dot_refusal(compute: Dtype, operands: tuple[Dtype, ...],
-                       precision: PrecisionLike) -> str | None:
-    """Why the kernels do not compute the product a caller asked for, or None where they do: the
-    declared product's refusal (`templates.product.declared`)."""
-    return declared(compute, precision, operands=operands).refusal
+from .templates.product import Product
 
 
 @dataclasses.dataclass(frozen=True)
@@ -931,7 +926,7 @@ class _MosaicTpu(_GroupedLaunch[mosaic_tpu.Blocks]):
 
     def eligible(self, ba, target) -> bool:
         # Not for exact sums: the MXUs add within a step, in fp32 by Google's account, IEEE by none
-        # (`kernel_refusal` routes such a product to XLA).
+        # (`GROUPED`'s 'step_sums' routes such a product to XLA).
         first, second = (value.dtype for name, value in ba.arguments.items()
                          if name in ('tokens', 'kernel', 'cotangent'))
         interpretable = not ba.arguments['interpret'] or jax.default_backend() == 'cpu'
@@ -1161,104 +1156,117 @@ def _multiprocessors(target: generation.GpuTarget) -> int:
 
 def _rated(target: generation.GpuTarget, dtype) -> bool:
     """Whether `target` states the tensor rate a launch over `dtype` operands is costed by: a generation
-    that states none runs XLA's grouped matmul, needing no estimate (`kernel_refusal`)."""
+    that states none runs XLA's grouped matmul, needing no estimate (`GROUPED`'s 'rate')."""
     return generation.effective(target).tensor_rate(_mode(dtype)) is not None
 
 
-def kernel_refusal(compute: Dtype, promoted: bool = False) -> str | None:
-    """Why the kernels do not run a product computed in `compute` on this target, or None where one of
-    them does: its generation states no tensor rate for it (an unseen GPU's), or the product adds each
-    step apart (`promoted`) on a TPU, whose launches do not (`_MosaicTpu`)."""
-    target = generation.gpu_target()
-    if not _rated(target, compute):
-        return (f"{target.generation} states no {_mode(compute)} tensor rate, which the kernels' cost model "
-                "reads")
-    if promoted and generation.tpu(target):
-        return f"{target.generation}'s MXUs add within a step, which no measurement states IEEE"
-    return None
+@dataclasses.dataclass(frozen=True)
+class GroupedCase:
+    """A grouped product as the grouped selector reads it (`GROUPED`): whether the kernels run where
+    the call does (`placed`: a GPU's, or a CPU's interpreting them; the template's dispatch runs in the
+    branch its platform places), whether they see its operands whole (`whole`,
+    `dew.nn.sharding.seen_whole`), the `product` it declares, its `rows` and its launches bound to it
+    (`call`)."""
+
+    placed: bool
+    whole: bool
+    product: Product
+    rows: int
+    call: base.Call
+
+
+_Need = selection.Requirement[GroupedCase]
+"""A requirement of a `GroupedCase`."""
+
+SUPPORTS = (
+    _Need('capability', lambda case: case.placed,
+          "the kernels need a GPU of sm80 or later, or a CPU interpreting them where the call asks",
+          row=INHERENT),
+    _Need('placement', lambda case: case.whole,
+          "a mesh axis splits the operands, or a shard_map that checks varying axes holds them, and the "
+          "kernels see whole arrays", row='ledger 1306'),
+    _Need('product', lambda case: case.product.refusal is None, lambda case: case.product.refusal or '',
+          row='ledger 1295'),
+    _Need('rate', lambda case: _rated(case.call.target, case.product.compute),
+          lambda case: f"{case.call.target.generation} states no {_mode(case.product.compute)} tensor rate, "
+                       "which the kernels' cost model reads", row='ledger 1295'),
+    _Need('step_sums', lambda case: not (case.product.promoted and generation.tpu(case.call.target)),
+          lambda case: f"{case.call.target.generation}'s MXUs add within a step, which no measurement states "
+                       "IEEE", row=INHERENT),
+    _Need('rows', lambda case: case.rows > 0, "the call has no rows", row=INHERENT),
+)
+"""What every launch needs of a grouped product: a process that runs it, whole operands, a product the
+kernels compute exactly on the target (its declaration's refusal, the target's tensor rate for its
+dtype, no step-by-step sums on a TPU, whose launches do not add them apart), and rows to launch."""
+
+
+def _launch_kernel(name: str) -> selection.Kernel[GroupedCase]:
+    """`GROUPED`'s kernel for the launches implementation `name` runs: `SUPPORTS`, then its own
+    eligibility for the call (`Template.eligible`), its cost the seconds its fastest fitting config is
+    estimated to take."""
+    return selection.Kernel(name, (*SUPPORTS, _Need(
+        'launch', lambda case: case.call.eligible(name),
+        lambda case: f"the {name} launches take no call of these dtypes, widths, side operands or hooks on "
+                     f"{case.call.target.generation}", row='ledger 1295')),
+        cost=lambda case: case.call.seconds(name))
 
 
 _GMMS = (MosaicGmm(), CutlassGmm(), MosaicTpuGmm(), Gmm())
 _TGMMS = (MosaicTgmm(), CutlassTgmm(), MosaicTpuTgmm(), Tgmm())
 
-
-def launched_gmm(tokens, kernel, sizes, prologue_operands: tuple = (), epilogue_operands: tuple = (), *,
-                 out_dtype, trans_rhs: bool, hooks: Hooks = NO_HOOKS, interpret: bool, promoted: bool = False,
-                 dense: bool = False):
-    """Each group's rows of `tokens` times its matrix of `kernel`, rounded to `tokens`'s dtype, through
-    the launch that runs it (`_launch`), with the template's hooks (`templates.gemm.template.gemm`).
-    `promoted`, the declared product's (`templates.product.Product`), adds each depth step's partial
-    apart (`exact_sums`); `dense`, one group of every row (a dense product), the plain tiled kernel where
-    Triton runs it."""
-    launches, arguments, options = _gmm_call(tokens, kernel, sizes, prologue_operands, epilogue_operands,
-                                             out_dtype=out_dtype, trans_rhs=trans_rhs, hooks=hooks,
-                                             interpret=interpret, promoted=promoted, dense=dense)
-    return _launch(launches, arguments, options)(*arguments, **options)
+GROUPED: selection.Op[GroupedCase] = selection.Op('grouped_matmul', (
+    *(_launch_kernel(launch.name) for launch in _GMMS),
+    selection.Kernel[GroupedCase]('xla', (), generic=True)))
+"""The grouped selector: the launch whose fastest fitting config the cost model estimates fewest seconds
+among those that take the call (the first of Mosaic GPU's, CUTLASS's, the TPU's and Triton's where
+several tie; a measured pick chooses a launch's config, never its implementation), else XLA's
+program. Every implementation shares the template's signature, so each binds the call's own arguments,
+`_GMMS`' for a product, `_TGMMS`' for a kernel gradient."""
 
 
-def gmm_refusal(tokens, kernel, sizes, prologue_operands: tuple = (), epilogue_operands: tuple = (),
-                **options) -> str | None:
-    """Why no launch takes a `launched_gmm` call (`launch_refusal`), or None where one does."""
-    return launch_refusal(*_gmm_call(tokens, kernel, sizes, prologue_operands, epilogue_operands, **options))
+def grouped_case(launches, arguments, options, *, product: Product, whole: bool,
+                 placed: bool = True) -> GroupedCase:
+    """The `GroupedCase` of `launches` called with `arguments` and `options` (`gmm_call`, `tgmm_call`)."""
+    return GroupedCase(placed, whole, product, arguments[0].shape[0],
+                       base.call(launches, *arguments, **options))
 
 
-def _gmm_call(tokens, kernel, sizes, prologue_operands: tuple, epilogue_operands: tuple, *, out_dtype,
-              trans_rhs: bool, hooks: Hooks = NO_HOOKS, interpret: bool, promoted: bool = False,
-              dense: bool = False) -> tuple:
-    """`launched_gmm`'s launches, arguments and options."""
-    arguments = (tokens, kernel.astype(tokens.dtype), sizes, tuple(prologue_operands),
-                 tuple(epilogue_operands))
+def launched(launches, arguments, options, *, product: Product, whole: bool):
+    """The launch of `launches` that runs the call (`arguments`, `options`) as `GROUPED` selects it,
+    ready to call, or None where XLA's program takes it. A GPU process's CPU branch, which never runs,
+    interprets Triton's, the one launch that interprets there (`_Mosaic.eligible`), as the call's own
+    preference: a chosen implementation names the GPU's launch, the branch the call takes."""
+    case = grouped_case(launches, arguments, options, product=product, whole=whole)
+    stand_in = options['interpret'] and jax.default_backend() != 'cpu'
+    route = selection.select(GROUPED, case, 'triton' if stand_in else None, insist=not stand_in)
+    if route.kernel == 'xla':
+        return None
+    return functools.partial(case.call.implementation(route.kernel), *arguments, **options)
+
+
+def gmm_call(tokens, kernel, sizes, prologue_operands: tuple = (), epilogue_operands: tuple = (), *,
+             out_dtype, trans_rhs: bool, hooks: Hooks = NO_HOOKS, interpret: bool, promoted: bool = False,
+             dense: bool = False) -> tuple:
+    """The launches, arguments and options of each group's rows of `tokens` times its matrix of `kernel`,
+    both of one dtype, with the template's hooks (`templates.gemm.template.gemm`). `promoted`,
+    the declared product's (`templates.product.Product`), adds each depth step's partial apart
+    (`exact_sums`); `dense`, one group of every row (a dense product), the plain tiled kernel where Triton
+    runs it."""
+    arguments = (tokens, kernel, sizes, tuple(prologue_operands), tuple(epilogue_operands))
     options = {'out_dtype': jnp.dtype(out_dtype).name, 'trans_rhs': trans_rhs, 'hooks': hooks,
                'interpret': interpret, 'exact_sums': promoted, 'dense': dense}
     return _GMMS, arguments, options
 
 
-def launched_tgmm(tokens, cotangent, sizes, prologue_operands: tuple = (), *, out_dtype,
-                  hooks: Hooks = NO_HOOKS, interpret: bool, promoted: bool = False, dense: bool = False):
-    """Each group's rows of `tokens` transposed times its rows of `cotangent`, rounded to `tokens`'s
-    dtype, through the launch that runs it, with the template's prologue
-    (`templates.gemm.template.gemm_t`); `dense` as `launched_gmm`'s."""
-    launches, arguments, options = _tgmm_call(tokens, cotangent, sizes, prologue_operands,
-                                              out_dtype=out_dtype, hooks=hooks, interpret=interpret,
-                                              promoted=promoted, dense=dense)
-    return _launch(launches, arguments, options)(*arguments, **options)
-
-
-def tgmm_refusal(tokens, cotangent, sizes, prologue_operands: tuple = (), **options) -> str | None:
-    """Why no launch takes a `launched_tgmm` call (`launch_refusal`), or None where one does."""
-    return launch_refusal(*_tgmm_call(tokens, cotangent, sizes, prologue_operands, **options))
-
-
-def _tgmm_call(tokens, cotangent, sizes, prologue_operands: tuple, *, out_dtype, hooks: Hooks = NO_HOOKS,
-               interpret: bool, promoted: bool = False, dense: bool = False) -> tuple:
-    """`launched_tgmm`'s launches, arguments and options."""
-    arguments = (tokens, cotangent.astype(tokens.dtype), sizes, tuple(prologue_operands))
+def tgmm_call(tokens, cotangent, sizes, prologue_operands: tuple = (), *, out_dtype,
+              hooks: Hooks = NO_HOOKS, interpret: bool, promoted: bool = False, dense: bool = False) -> tuple:
+    """The launches, arguments and options of each group's rows of `tokens` transposed times its rows of
+    `cotangent`, both of one dtype, with the template's prologue
+    (`templates.gemm.template.gemm_t`); `promoted` and `dense` as `gmm_call`'s."""
+    arguments = (tokens, cotangent, sizes, tuple(prologue_operands))
     options = {'out_dtype': jnp.dtype(out_dtype).name, 'hooks': hooks, 'interpret': interpret,
                'exact_sums': promoted, 'dense': dense}
     return _TGMMS, arguments, options
-
-
-def launch_refusal(launches, arguments, options) -> str | None:
-    """Why none of `launches` takes the call on this target, or None where one does (`_launch`): on a
-    CUDA GPU, Triton takes every product the kernels compute; a TPU's launches take only the widths their
-    blocks divide, the side operands their blocks lay out and the hooks Mosaic TPU lowers."""
-    if options['interpret'] and jax.default_backend() != 'cpu':
-        return None
-    target = generation.gpu_target()
-    if any(launch.eligible(launch.bind(*arguments, **options), target) for launch in launches):
-        return None
-    return f"no launch of {target.generation} takes this call's widths, side operands or hooks"
-
-
-def _launch(launches, arguments, options):
-    """The launch of `launches` that runs the call: the cost model's (`base.choose`), except in a GPU
-    process's CPU branch, which interprets Triton's, the one launch that interprets there
-    (`_Mosaic.eligible`): a chosen implementation names the GPU's launch, the branch the call takes."""
-    if options['interpret'] and jax.default_backend() != 'cpu':
-        *_, triton = launches
-        generation.route('grouped_matmul', kernel=triton.name)
-        return triton
-    return base.choose('grouped_matmul', launches, *arguments, **options)
 
 
 def _on_platform(kernel, fallback, interpret_on_cpu: bool):

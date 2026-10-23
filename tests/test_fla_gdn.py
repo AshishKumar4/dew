@@ -41,6 +41,7 @@ from dew.nn.kda import KimiDeltaAttention
 from dew.nn.kernels import chunked_launch, fla_gdn, fla_kda, generation, recurrence_chunk, tuning
 from dew.nn.kernels.recurrence import ChunkLocalCumsum, cumulated
 from dew.nn.kernels.recurrence_chunk import fla_rule
+from dew.nn.kernels.selection import KernelRefused
 from dew.nn.linear import GatedDeltaNet
 from dew.nn.precision import l2norm
 from dew.training._lowering import triton_calls
@@ -650,10 +651,11 @@ def test_inside_a_shard_map_that_checks_varying_axes_the_rule_runs_the_portable_
 def test_a_cached_continuation_whose_history_varies_in_a_checked_map_runs_the_portable_math(kind):
     """A layer's cached continuation of more than one token inside a `shard_map` that checks varying
     axes, its input and weights the same on every shard and its conv history each shard's own: the
-    convolved queries, keys and values vary though the projections do not, so the rule runs the
-    portable math there (`port_refusal`'s 'varying'), on the values rounded as the port would take
-    them; its outputs are bitwise those of the same continuation with the row naming XLA, rounded the
-    same way."""
+    convolved queries, keys and values vary though the projections do not, so under an A100's row,
+    which names the port, the rule runs the portable math there (`recurrence_chunk.PORT_SUPPORTS`'
+    'varying'), on the values rounded as the port would take them; its outputs are bitwise those of the
+    same continuation with the row naming XLA, rounded the same way. The port chosen there raises
+    (`selection.KernelRefused`). The row's other kernels run XLA's arithmetic, as this CPU does."""
     from jax.sharding import Mesh, PartitionSpec
 
     from dew.nn.inputs import MixerCall
@@ -676,10 +678,13 @@ def test_a_cached_continuation_whose_history_varies_in_a_checked_map_runs_the_po
 
     mapped = jax.shard_map(continued, mesh=Mesh(np.asarray(jax.devices()[:2]), ("data",)), in_specs=(rows,),
                            out_specs=rows, check_vma=True)
-    with row_names_port():
+    with row_names_port(), pytest.raises(KernelRefused) as refused:
+        jax.jit(mapped)(held)
+    assert "varying" in [refusal.code for refusal in refused.value.refusals]
+    with generation.assumed("sm80"), generation.chosen(rms_norm="xla", short_conv="xla"):
         got = jax.jit(mapped)(held)
-    with row_names_port(port=False):
-        want = jax.jit(mapped)(held)
+        with row_names_port(port=False):
+            want = jax.jit(mapped)(held)
     np.testing.assert_array_equal(np.asarray(got), np.asarray(want))
 
 
@@ -784,14 +789,20 @@ def route_cotangents(mode, operands):
 def test_the_rule_computes_the_route_its_geometry_selects(label):
     """The rule a layer calls (`recurrence_chunk.chunk_gated_delta_rule`), its output, final memory and every
     operand's gradient (its tangents under `jax.jvp`), at each geometry the port takes and each it
-    refuses (`port_refusal`): bit for bit the port's (`fla_rule`) where it takes the rule and the
-    portable math's (`chunk_delta_rule`) where it does not. Each route is held to its reference
-    elsewhere, the port to fla's own runs (`test_where_the_rule_takes_the_port_it_is_as_exact_as_fla`
-    here) and the portable math to `torch_chunk_gated_delta_rule`'s (tests/test_linear_attention.py)."""
+    refuses (`recurrence_chunk.PORT_SUPPORTS`): bit for bit the port's (`fla_rule`) where it takes the
+    rule and the portable math's (`chunk_delta_rule`) where it does not, under an A100's row, which names
+    the port; the port chosen for a geometry it refuses raises (`selection.KernelRefused`). Each route is
+    held to its reference elsewhere, the port to fla's own runs
+    (`test_where_the_rule_takes_the_port_it_is_as_exact_as_fla` here) and the portable math to
+    `torch_chunk_gated_delta_rule`'s (tests/test_linear_attention.py)."""
     dtypes, width, heads, mode, names_port, ported = ROUTES[label]
     operands = routed_operands(dtypes, width, heads)
     cotangents = route_cotangents(mode, operands)
-    with row_names_port(port=names_port):
+    refused = names_port and not ported
+    if refused:
+        with row_names_port(), pytest.raises(KernelRefused):
+            run_rule(recurrence_chunk.chunk_gated_delta_rule, mode, operands, cotangents)
+    with generation.assumed("sm80") if refused else row_names_port(port=names_port):
         found = run_rule(recurrence_chunk.chunk_gated_delta_rule, mode, operands, cotangents)
         want = run_rule(fla_rule if ported else portable, mode, operands, cotangents)
     jax.tree.map(np.testing.assert_array_equal, found, want)
@@ -800,7 +811,7 @@ def test_the_rule_computes_the_route_its_geometry_selects(label):
 @pytest.mark.parametrize("label", sorted(ROUTES))
 def test_both_routes_return_the_operands_common_dtype(label):
     """One contract whichever route a GPU's row picks: the port (`fla_rule`), at every geometry it takes
-    (`recurrence_chunk.port_refusal`'s widths), and the portable math (`chunk_delta_rule`), at every geometry,
+    (`recurrence_chunk.PORT_SUPPORTS`' widths), and the portable math (`chunk_delta_rule`), at every geometry,
     return the output in the queries', keys' and values' common dtype, the final memory in at least
     fp32, and each operand's gradient in its own."""
     dtypes, width, heads, _, _, _ = ROUTES[label]
@@ -833,10 +844,10 @@ def test_where_the_rule_takes_the_port_it_is_as_exact_as_fla(label):
         assert_as_exact_as_the_reference(dew, fla, value, f"{label} {name}", terms=summed)
 
 
-@generation.chosen(gated_delta_rule="fla")
+@generation.assumed("sm80")
 def test_float64_operands_compute_the_recurrence_in_float64():
-    """A float64 rule, which the port refuses, is the portable math in float64: its output, final
-    memory and gradients within float64 rounding of the token recurrence's."""
+    """A float64 rule, which the port an A100's row names refuses, is the portable math in float64: its
+    output, final memory and gradients within float64 rounding of the token recurrence's."""
     with jax.enable_x64(new_val=True):
         operands = widened(routed_operands((jnp.float32,) * 3, 64, (2, 64)))
         cotangents = tuple(np.asarray(jax.random.normal(jax.random.key(index), shape), np.float64)
@@ -944,7 +955,9 @@ def test_a_remat_policy_saves_the_ports_named_residuals_and_changes_no_gradient(
     wide = layer.clone(dtype=jnp.float64)
 
     def truth(params, x):
-        return jax.grad(lambda params: jnp.sum(wide.apply(params, x) ** 2))(params)
+        # The float64 layer's rule is the portable math, which the port chosen above refuses.
+        with generation.chosen(gated_delta_rule="xla"):
+            return jax.grad(lambda params: jnp.sum(wide.apply(params, x) ** 2))(params)
 
     assert_as_exact(remat_grad, reference_grad, draw, "remat policy gradient",
                     seeds=SEEDS[(memories, outputs)], truth_fn=jax.jit(truth))
