@@ -7,7 +7,9 @@ token, one row of the batch left-padded through the attention mask. Dew's block,
 its gradients and its decode are on par with the reference's fp32 from the
 reference run in float64 over drawn inputs (check 1, tests/reference_error.py),
 on the valid rows; a decode step that recomputes what a cached selection
-holds is the same computation, to the bit.
+holds is the same program on the same values, to the bit, and a different
+program for the same result (a reordered batch, a cache that never held a
+selection) on par by check 1.
 
 The indexer's scores are relu'd sums, so two pools tie at exactly zero
 often; the reference's `topk` and `jax.lax.top_k` break such a tie
@@ -20,6 +22,7 @@ difference in the math and not in a tie-break.
 
 import contextlib
 import copy
+from functools import partial
 
 import jax
 import jax.numpy as jnp
@@ -116,7 +119,7 @@ MARGIN = 1e-3
 rounding, so float64 and fp32 select the same pools."""
 
 SEEDS = {'output': 8, 'biased': 8, 'dense': 8, 'gradients': 64, 'parallel': 8, 'decode': 8,
-         'padded decode': 8, 'hole': 8, 'reordered draft': 8}
+         'padded decode': 8, 'hole': 8, 'gated layer': 8, 'ordinary step': 8, 'reordered draft': 8}
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada)."""
 
 
@@ -400,26 +403,30 @@ def test_the_kind_builds_from_the_configs_fields_and_is_nope():
 
 def test_a_gated_layer_gates_its_heads_context_as_latent_attention_does():
     """K-pool attention takes the latent attention's output gate, a layer's
-    `output_gate` as its kind builds it: the gated layer's output is o_proj
-    over the ungated heads' context times sigmoid(g_proj(x)), each projection
-    a plain Dense of the layer's kernels, bitwise. The heads' context is the
-    ungated layer's output through an identity o_proj."""
+    `output_gate` as its kind builds it: the gated layer's output is on par
+    (check 1) with o_proj over the ungated heads' context times
+    sigmoid(g_proj(x)), each projection a plain Dense of the layer's kernels,
+    its truth that composition in float64. The heads' context is the ungated
+    layer's output through an identity o_proj."""
     gated, plain = (KPoolSparseAttentionMixer(**SETTINGS).build(MixerContext(
         emb_features=E, num_heads=H, num_kv_heads=H, head_dim=8, max_seq_len=16, norm_eps=1e-5,
         scale_after_cast=True, output_gate=gate))(name="self_attn") for gate in (True, False))
-    hidden, _ = inputs()
-    params = gated.init(jax.random.key(0), hidden)["params"]
+    params = gated.init(jax.random.key(0), inputs()[0])["params"]
     width = H * SETTINGS["v_head_dim"]
     assert width == E, "an identity o_proj reads the heads' context back"
-    ungated = {name: leaf for name, leaf in params.items() if name != "g_proj"}
-    context = plain.apply({"params": {**ungated, "o_proj": {"kernel": jnp.eye(width)}}}, hidden)
 
     def dense(kernel, x):
         return nn.Dense(kernel.shape[1], use_bias=False).apply({"params": {"kernel": kernel}}, x)
 
-    gate = jax.nn.sigmoid(dense(params["g_proj"]["kernel"], hidden))
-    expected = dense(params["o_proj"]["kernel"], context * gate)
-    np.testing.assert_array_equal(np.asarray(gated.apply({"params": params}, hidden)), np.asarray(expected))
+    def composed(params, hidden):
+        ungated = {name: leaf for name, leaf in params.items() if name != "g_proj"}
+        context = plain.apply({"params": {**ungated, "o_proj": {"kernel": jnp.eye(width)}}}, hidden)
+        gate = jax.nn.sigmoid(dense(params["g_proj"]["kernel"], hidden))
+        return dense(params["o_proj"]["kernel"], context * gate)
+
+    assert_as_exact(jax.jit(partial(gated.apply, {"params": params})), jax.jit(partial(composed, params)),
+                    lambda seed: inputs(1 + seed)[:1], 'gated layer', seeds=SEEDS['gated layer'],
+                    truth_fn=partial(composed, widened(params)))
 
 
 def test_a_budget_the_pool_does_not_divide_is_refused():
@@ -434,36 +441,60 @@ def selection_step(block, variables, cache, x, valid, phase):
         prediction_phase=phase, mutable=["cache"]))(cache, x, valid)
 
 
-def test_prediction_selection_seed_miss_hit_and_fixed_tail():
-    block = module()
-    variables = translated(reference_block())
-    hidden, valid = inputs()
+def drafts(block, variables, hidden, valid):
+    """The caches of a prediction chain on `hidden` and `valid`: allocated, extended over five tokens
+    (the seed), drafted at the sixth with the second row's seed cleared, and drafted again at the
+    seventh."""
     x, active = jnp.asarray(hidden), jnp.asarray(valid)
     _, allocated = block.apply(variables, x[:, :1], MixerCall(decode=True),
                                prediction_phase="extend", mutable=["cache"])
-    np.testing.assert_array_equal(allocated["cache"]["selection_position"], [-1, -1])
     _, extended = selection_step(block, variables, allocated["cache"], x[:, :5], active[:, :5], "extend")
     seed = extended["cache"]
-    np.testing.assert_array_equal(seed["selection_position"], [4, 1])
-    assert 4 in np.asarray(seed["selection_indices"])[0]
     mixed = {**seed, "selection_position": seed["selection_position"].at[1].set(-1)}
     _, drafted = selection_step(block, variables, mixed, x[:, 5:6], active[:, 5:6], "draft")
-    np.testing.assert_array_equal(drafted["cache"]["selection_indices"][0], seed["selection_indices"][0])
-    np.testing.assert_array_equal(drafted["cache"]["selection_position"], [4, 2])
-    assert 2 in np.asarray(drafted["cache"]["selection_indices"])[1]
     _, next_draft = selection_step(block, variables, drafted["cache"], x[:, 6:7], active[:, 6:7], "draft")
-    np.testing.assert_array_equal(
-        next_draft["cache"]["selection_indices"], drafted["cache"]["selection_indices"]
-    )
-    assert 6 not in np.asarray(next_draft["cache"]["selection_indices"])[0]
-    ordinary, cleared = selection_step(
-        block, variables, next_draft["cache"], x[:, 7:8], active[:, 7:8], "ordinary"
-    )
-    canonical = {name: value for name, value in next_draft["cache"].items()
-                 if name not in ("selection_indices", "selection_position")}
-    expected, _ = selection_step(block, variables, canonical, x[:, 7:8], active[:, 7:8], "ordinary")
-    np.testing.assert_array_equal(ordinary, expected)
+    return allocated["cache"], seed, drafted["cache"], next_draft["cache"]
+
+
+def test_prediction_selection_seed_miss_hit_and_fixed_tail():
+    """The seed's selection holds through its drafts and the fixed tail; an ordinary step clears it and
+    is on par (check 1) with the step on a cache that never held one, a program of its own; the truth
+    is that step in float64."""
+    block = module()
+    variables = translated(reference_block())
+    chain = jax.jit(partial(drafts, block, variables))
+    hidden, valid = inputs()
+    allocated, seed, drafted, next_draft = chain(hidden, valid)
+    np.testing.assert_array_equal(allocated["selection_position"], [-1, -1])
+    np.testing.assert_array_equal(seed["selection_position"], [4, 1])
+    assert 4 in np.asarray(seed["selection_indices"])[0]
+    np.testing.assert_array_equal(drafted["selection_indices"][0], seed["selection_indices"][0])
+    np.testing.assert_array_equal(drafted["selection_position"], [4, 2])
+    assert 2 in np.asarray(drafted["selection_indices"])[1]
+    np.testing.assert_array_equal(next_draft["selection_indices"], drafted["selection_indices"])
+    assert 6 not in np.asarray(next_draft["selection_indices"])[0]
+    _, cleared = selection_step(block, variables, next_draft, hidden[:, 7:8], valid[:, 7:8], "ordinary")
     np.testing.assert_array_equal(cleared["cache"]["selection_position"], [-1, -1])
+
+    def ordinary(dtype, *, canonical):
+        kpool = module(dtype=dtype)
+        weights = variables if dtype == jnp.float32 else widened(variables)
+
+        def run(cache, x, active):
+            if canonical:
+                cache = {name: value for name, value in cache.items()
+                         if name not in ("selection_indices", "selection_position")}
+            return selection_step(kpool, weights, cache, jnp.asarray(x, dtype), active, "ordinary")[0]
+
+        return jax.jit(run)
+
+    def draw(seed):
+        hidden, valid = inputs(1 + seed)
+        return chain(hidden, valid)[-1], hidden[:, 7:8], valid[:, 7:8]
+
+    assert_as_exact(ordinary(jnp.float32, canonical=False), ordinary(jnp.float32, canonical=True), draw,
+                    'ordinary step', seeds=SEEDS['ordinary step'],
+                    truth_fn=ordinary(jnp.float64, canonical=True))
 
 
 def test_prediction_selection_empty_seed_inactive_rows_and_reordering():
