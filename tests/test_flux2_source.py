@@ -338,8 +338,9 @@ def test_klein_prompt_encoding_matches_the_source_pipeline(klein, source, record
     assert condition.context.shape == (3, 512, record["pipeline"]["config"]["joint_attention_dim"])
     assert condition.guidance is None
 
-    def draw(seed):
-        rng = np.random.default_rng([11, seed])
+    def prompts_of(seed) -> tuple[str, ...]:
+        """Two prompts of one to eight words drawn from `seed`, and the empty one."""
+        rng = np.random.default_rng([11, int(seed)])
         return (*(" ".join(rng.choice(WORDS, size=rng.integers(1, 9))) for _ in range(2)), "")
 
     def source_encoded(pipe, prompts):
@@ -347,10 +348,11 @@ def test_klein_prompt_encoding_matches_the_source_pipeline(klein, source, record
             return np.concatenate([pipe.encode_prompt(prompt=prompt, device=torch.device("cpu"))[0].numpy()
                                    for prompt in prompts])
 
-    assert_as_exact(lambda *prompts: encoder.encode(params, encoder.tokenize(list(prompts))).context,
-                    lambda *prompts: source_encoded(narrow, prompts), draw, "klein prompts",
-                    seeds=PIPELINE_SEEDS["prompts"],
-                    truth_fn=lambda *prompts: widened(lambda: source_encoded(wide, prompts)))
+    # The arms draw their prompts from the seed, a leaf the gate widens as it is.
+    assert_as_exact(lambda seed: encoder.encode(params, encoder.tokenize(list(prompts_of(seed)))).context,
+                    lambda seed: source_encoded(narrow, prompts_of(seed)), lambda seed: (np.int32(seed),),
+                    "klein prompts", seeds=PIPELINE_SEEDS["prompts"],
+                    truth_fn=lambda seed: widened(lambda: source_encoded(wide, prompts_of(seed))))
     with pytest.raises(ValueError):
         encoder.tokenize(["x" * 513])
 
@@ -427,8 +429,9 @@ def test_a_mistral3_encoder_reads_as_flux2_dev_reads_it(source, record):
         wide = copy.deepcopy(model).double()
     tokenizer = AutoTokenizer.from_pretrained(directory / "tokenizer")
 
-    def draw(seed):
-        rng = np.random.default_rng([13, seed])
+    def prompts_of(seed) -> tuple[str, ...]:
+        """Two prompts of one to eight words drawn from `seed`."""
+        rng = np.random.default_rng([13, int(seed)])
         return tuple(" ".join(rng.choice(WORDS, size=rng.integers(1, 9))) for _ in range(2))
 
     def source_encoded(model, prompts, dtype):
@@ -436,10 +439,12 @@ def test_a_mistral3_encoder_reads_as_flux2_dev_reads_it(source, record):
             return Flux2Pipeline._get_mistral_3_small_prompt_embeds(
                 model, tokenizer, list(prompts), dtype=dtype, device=torch.device("cpu")).numpy()
 
-    assert_as_exact(lambda *prompts: encoder.encode(encoder.params, encoder.tokenize(list(prompts))).context,
-                    lambda *prompts: source_encoded(model, prompts, torch.float32), draw, "mistral3 context",
-                    seeds=PIPELINE_SEEDS["mistral3"],
-                    truth_fn=lambda *prompts: widened(lambda: source_encoded(wide, prompts, torch.float64)))
+    # The arms draw their prompts from the seed, a leaf the gate widens as it is.
+    assert_as_exact(
+        lambda seed: encoder.encode(encoder.params, encoder.tokenize(list(prompts_of(seed)))).context,
+        lambda seed: source_encoded(model, prompts_of(seed), torch.float32), lambda seed: (np.int32(seed),),
+        "mistral3 context", seeds=PIPELINE_SEEDS["mistral3"],
+        truth_fn=lambda seed: widened(lambda: source_encoded(wide, prompts_of(seed), torch.float64)))
     tensors = component_tensors(directory, "text_encoder")
     assert set(flatten_dict(encoder.params)) == {layout.paths[0][2:] for layout in layouts}
     assert {f"text_encoder/{name}" for name in tensors} == {layout.name for layout in layouts} | set(retained)

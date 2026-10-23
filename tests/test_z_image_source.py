@@ -241,9 +241,14 @@ def test_prompt_encoding_matches_the_source_pipeline(pipeline, source, record):
     params = pipeline.variables["encoders"]["conditioning"]
     narrow, wide = source_pipelines(source)
 
-    def draw(seed):
-        rng = np.random.default_rng([7, seed])
+    def prompts_of(seed) -> tuple[str, ...]:
+        """Two prompts of one to eight words drawn from `seed`, and the empty one."""
+        rng = np.random.default_rng([7, int(seed)])
         return (*(" ".join(rng.choice(WORDS, size=rng.integers(1, 9))) for _ in range(2)), "")
+
+    def draw(seed):
+        # The arms draw their prompts from the seed, a leaf the gate widens as it is.
+        return (np.int32(seed),)
 
     def encoded(prompts):
         condition = encoder.encode(params, encoder.tokenize(list(prompts)))
@@ -258,13 +263,15 @@ def test_prompt_encoding_matches_the_source_pipeline(pipeline, source, record):
                 rows[row, :states.shape[0]] = states.numpy()
         return rows
 
-    prompts = draw(0)
+    prompts = prompts_of(0)
     _, mask = encoded(prompts)
     lengths = [np.count_nonzero(np.abs(row).sum(-1)) for row in source_encoded(narrow, prompts)]
     np.testing.assert_array_equal(mask, np.arange(encoder.tokens)[None] < np.asarray(lengths)[:, None])
-    assert_as_exact(lambda *prompts: encoded(prompts)[0], lambda *prompts: source_encoded(narrow, prompts),
-                    draw, "Z-Image prompts", seeds=PIPELINE_SEEDS["prompts"],
-                    truth_fn=lambda *prompts: widened_call(wide, lambda pipe: source_encoded(pipe, prompts)))
+    assert_as_exact(lambda seed: encoded(prompts_of(seed))[0],
+                    lambda seed: source_encoded(narrow, prompts_of(seed)), draw, "Z-Image prompts",
+                    seeds=PIPELINE_SEEDS["prompts"],
+                    truth_fn=lambda seed: widened_call(
+                        wide, lambda pipe: source_encoded(pipe, prompts_of(seed))))
 
 
 @pytest.mark.parametrize("load", ["pipeline", "streamed"])
