@@ -140,3 +140,43 @@ def test_a_request_that_waits_before_closing_is_answered():
     engine.close()
     assert kind.failure is None
     assert kind.answered == ["late"]
+
+
+def test_a_stop_while_a_reload_holds_the_step_runs_no_step_after_it():
+    """A stop asked while a reload holds the engine's step, its thread waiting behind the reload with
+    work in hand, ends the thread at the step it would have taken: no step runs after the stop."""
+    kind = Looked()
+    engine = Engine(kind)
+    held, release, looked = threading.Event(), threading.Event(), threading.Event()
+
+    def holding():
+        held.set()
+        release.wait()
+
+    reloading = threading.Thread(target=engine.reload, args=(holding,))
+    reloading.start()
+    held.wait()
+    kind.hook = looked.set
+    kind.waiting.append("waiting")
+    engine.start()
+    looked.wait()
+    stopping = threading.Thread(target=engine.stop)
+    stopping.start()
+    release.set()
+    reloading.join()
+    stopping.join()
+    assert kind.answered == []
+
+
+def test_an_engine_closed_from_its_own_thread_ends_free_to_start_again():
+    """A close from a request's callback on the serving thread returns at once, and the thread, once
+    it has answered what waits, leaves the engine free: it starts again without an outside close."""
+    kind = Looked()
+    engine = Engine(kind, name="closed-from-its-own-thread")
+    kind.hook = engine.close
+    engine.start()
+    for thread in [thread for thread in threading.enumerate() if thread.name == engine.name]:
+        thread.join()
+    engine.start()
+    engine.close()
+    assert kind.failure is None
