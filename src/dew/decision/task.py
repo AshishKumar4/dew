@@ -416,16 +416,17 @@ class Decide:
         start = 0
         while start < len(order):
             stop = start + 1
-            while (stop < len(order) and stop - start < self.budget.rows
-                   and (shape_bucket(len(rows[order[stop]].tokens), 64) * shape_bucket(stop - start + 1, 1)
-                        <= self.budget.tokens)):
+            while stop < len(order) and self.fits([rows[index] for index in order[start:stop + 1]]):
                 stop += 1
             chosen = order[start:stop]
-            scores = self._pass([rows[index] for index in chosen])
-            found.update({index: scores[row, :len(rows[index].questions)]
-                          for row, index in enumerate(chosen)})
+            found.update(zip(chosen, self.scored([rows[index] for index in chosen]), strict=True))
             start = stop
         return [found[index] for index in range(len(rows))]
+
+    def scored(self, rows: Sequence[Encoded]) -> list[np.ndarray]:
+        """Each of `rows`' raw `[Q, K]` logits from one pass over them all, which `fits` allows."""
+        scores = self._pass(rows)
+        return [scores[index, :len(row.questions)] for index, row in enumerate(rows)]
 
     def _pass(self, rows: Sequence[Encoded]) -> np.ndarray:
         """One forward pass at bucketed shapes, its rows placed on the
@@ -740,9 +741,10 @@ class WireScoring(scoring.Scoring[Mapping[str, object], _Row, _Admitted, np.ndar
                 and all(seen[0].alike(media) for media in seen) and self.decide.fits(encoded))
 
     def forward(self, variables: Variables, rows: Sequence[_Row]) -> list[np.ndarray]:
+        # The server chose these rows as one pass (`fits`), so they run as one.
         decide = replace(self.decide, variables=variables)
         if rows[0].media is None:
-            return decide.logits([row.encoded for row in rows])
+            return decide.scored([row.encoded for row in rows])
         return decide._seen_pass([(row.encoded, row.media) for row in rows if row.media is not None])
 
     def answer(self, payload: _Admitted, outputs: Sequence[np.ndarray]) -> dict[str, JSON]:

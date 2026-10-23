@@ -19,6 +19,7 @@ waits.
 from __future__ import annotations
 
 import contextlib
+import itertools
 import threading
 import time
 from collections import deque
@@ -137,6 +138,12 @@ class ScoringServer[Request, Row, Payload, Output, Answer]:
         # Laid out by the task served now, which scores it with its weights, whatever reloads meanwhile.
         served = self._served
         waiting: _Request[Row, Payload, Output, Answer] = _Request(served[0].admit(request), served)
+        if not waiting.scored.rows:
+            # A request of no rows needs no pass: it is answered as it is admitted.
+            waiting.future.set_running_or_notify_cancel()
+            waiting.future.admitted = waiting.future.finished = time.perf_counter()
+            settled(waiting.future, served[0].answer(waiting.scored.payload, []))
+            return waiting.future
         with self._ingress:
             if self._failed is not None:
                 raise RuntimeError("the server stopped after a step failed") from self._failed
@@ -177,8 +184,9 @@ class ScoringServer[Request, Row, Payload, Output, Answer]:
         cancelled one dropped as it is looked at."""
         chosen: list[tuple[_Request[Row, Payload, Output, Answer], int]] = []
         now = time.perf_counter()
-        for looked, request in enumerate(list(self._queue)):
-            if looked == self.rows or (chosen and request.served is not chosen[0][0].served):
+        # The bounded prefix alone: a turn looks at no more than `rows` requests of the queue.
+        for request in list(itertools.islice(self._queue, self.rows)):
+            if chosen and request.served is not chosen[0][0].served:
                 break
             task = request.served[0]
             while request.taken < len(request.scored.rows):
