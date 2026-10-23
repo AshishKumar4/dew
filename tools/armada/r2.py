@@ -9,7 +9,9 @@ would resend the token wherever the answer points), a body read as it arrives, t
 the Worker announced, and each status as an outcome or a typed error. A 404 and a 304 are answers; a refusal
 (401, 403 or any other status) is `Refused`, an unmet precondition (409, 412) `Conflict`, and a Worker that is
 busy or down (429, 5xx), or a request that did not complete, `Unavailable`. Each caller keeps its own policy:
-what a failure costs it, and whether to retry.
+what a failure costs it, and whether to retry. What sends a request is a `Sender`: the standard library's
+(`urllib_send`) by default, or the caller's own, such as dew-ops' pooled one, which carries the same
+protocol.
 
 The standard library alone: tools/armada/ci.py imports it as its sibling and tests/remote_cache.py loads it by
 its path, both before any environment exists to import Dew from."""
@@ -21,9 +23,10 @@ import re
 import urllib.error
 import urllib.parse
 import urllib.request
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Protocol
 
 CONTRACT = json.loads(Path(__file__).with_name("r2.json").read_text())
 MAX_BYTES: int = CONTRACT["max_bytes"]
@@ -63,20 +66,46 @@ class _Unredirected(urllib.request.HTTPRedirectHandler):
 _OPENER = urllib.request.build_opener(_Unredirected)
 
 
+class Stream(Protocol):
+    """An answer's body as a sender gives it: read in pieces, then closed."""
+
+    def read(self, size: int = -1) -> bytes: ...
+
+    def close(self) -> None: ...
+
+
+Sender = Callable[[str, str, Mapping[str, str], "bytes | None", float], tuple[int, Mapping[str, str], Stream]]
+"""What sends a request, `(method, url, headers, body, timeout)`, and gives its answer whatever its status, as
+`(status, headers, body)`, following no redirect. A request that does not complete, and a body cut short
+while it is read, raise an OSError (or http.client's HTTPException); everything else is the `Store`'s."""
+
+
+def urllib_send(method: str, url: str, headers: Mapping[str, str], body: bytes | None,
+                timeout: float) -> tuple[int, Mapping[str, str], Stream]:
+    """The standard library's sender: a connection a request, which a caller that runs before any
+    environment exists (ci.py, remote_cache) can use."""
+    request = urllib.request.Request(url, data=body, method=method, headers=dict(headers))
+    try:
+        response = _OPENER.open(request, timeout=timeout)
+    except urllib.error.HTTPError as error:  # an answer whose status is no success is still an answer
+        return error.code, dict(error.headers), error
+    return response.status, dict(response.headers), response
+
+
 class Body:
     """An answer's body as it arrives, read at most `limit` bytes in all: past them a ValueError, and an end
     before the length the Worker announced, or a connection cut while reading, `Unavailable`."""
 
-    def __init__(self, response: http.client.HTTPResponse, limit: int, what: str):
-        self.response, self.left, self.what = response, limit, what
-        announced = response.headers.get("Content-Length")
+    def __init__(self, stream: Stream, headers: Mapping[str, str], limit: int, what: str):
+        self.stream, self.left, self.what = stream, limit, what
+        announced = {name.lower(): value for name, value in headers.items()}.get("content-length")
         self.owed = None if announced is None else int(announced)
 
     def read(self, size: int = -1) -> bytes:
         """At most `size` bytes more (all the rest, under -1); b"" at the body's end."""
         wanted = self.left + 1 if size < 0 else min(size, self.left + 1)
         try:
-            data = self.response.read(wanted)
+            data = self.stream.read(wanted)
         except (OSError, http.client.HTTPException) as error:
             raise Unavailable(f"{self.what} was cut short: {error}") from error
         if len(data) > self.left:
@@ -110,12 +139,14 @@ class Reply:
 @dataclass(frozen=True)
 class Store:
     """The Worker at `url`, asked with `token` under the caller's `user_agent`, each request bounded by
-    `timeout` seconds. Immutable, so threads share one."""
+    `timeout` seconds and sent by `send` (`urllib_send`, else a caller's own, such as a pooled one).
+    Immutable, so threads share one."""
 
     url: str
     token: str
     user_agent: str
     timeout: float
+    send: Sender = urllib_send
 
     @contextlib.contextmanager
     def request(self, method: str, key: str = "", *, query: Mapping[str, str] | None = None,
@@ -134,23 +165,20 @@ class Store:
         if query:
             url += "?" + urllib.parse.urlencode(query)
         what = f"{method} {key or url}"
-        request = urllib.request.Request(url, data=body, method=method, headers={
-            "Authorization": f"Bearer {self.token}", "User-Agent": self.user_agent, **(headers or {})})
         try:
-            response = _OPENER.open(request, timeout=self.timeout)
-        except urllib.error.HTTPError as error:
-            if error.code in (304, 404):
-                error.close()
-                yield Reply(error.code, dict(error.headers), None)
-                return
-            raised = (Conflict if error.code in (409, 412) else
-                      Unavailable if error.code == 429 or error.code >= 500 else Refused)
-            raise raised(f"the R2 Worker answered {error.code} to {what}") from error
-        except (OSError, http.client.HTTPException) as error:  # URLError, a timeout, a connection cut short
+            status, given, stream = self.send(method, url, {
+                "Authorization": f"Bearer {self.token}", "User-Agent": self.user_agent, **(headers or {})},
+                body, self.timeout)
+        except (OSError, http.client.HTTPException) as error:  # a request that did not complete
             raise Unavailable(f"{what} did not complete: {error}") from error
-        with response:
-            answer = None if method == "HEAD" else Body(response, limit, f"the answer to {what}")
-            yield Reply(response.status, dict(response.headers), answer)
+        with contextlib.closing(stream):
+            if not 200 <= status < 300 and status not in (304, 404):
+                raised = (Conflict if status in (409, 412) else
+                          Unavailable if status == 429 or status >= 500 else Refused)
+                raise raised(f"the R2 Worker answered {status} to {what}")
+            answer = (None if method == "HEAD" or status in (304, 404) else
+                      Body(stream, given, limit, f"the answer to {what}"))
+            yield Reply(status, dict(given), answer)
 
     def get(self, key: str, limit: int = MAX_BYTES) -> bytes | None:
         """The object at `key`, or None where there is none."""

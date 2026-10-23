@@ -1,10 +1,12 @@
 """Generate the install facts other files repeat from their owners: the CUDA builds' minima
-(dew.telemetry.builds.CUDA_BUILDS), Dew's package index (dew.telemetry.builds.PACKAGE_INDEX),
-Dew's least Python (pyproject.toml's requires-python), the JAX it requires (its dependencies) and the pip
-every pip install takes first (tools/pip.txt), into the standalone installer, constraints.txt, the Colab
-notebooks' install, the site's scripts that install Dew (site/package.json), docs/installation.md's table
-and JAX requirement, and the least Python and the pip the README and docs/installation.md state; and holds
-docs/installation.md's extras table to the extras pyproject.toml declares."""
+(dew.telemetry.builds.CUDA_BUILDS), Dew's package index (dew.telemetry.builds.PACKAGE_INDEX), Dew's least
+Python (pyproject.toml's requires-python), the JAX it requires (its dependencies), the pip every pip install
+takes first (tools/pip.txt) and the least uv (pyproject.toml's [tool.uv] required-version), with the
+bootstrap that installs it (site/scripts/uv_bootstrap.sh), into the standalone installer, armada's setup, dew
+tpu setup's script, constraints.txt, the Colab notebooks' install, the site's scripts that install Dew
+(site/package.json), docs/installation.md's table and JAX requirement, and the least Python and the pip the
+README and docs/installation.md state; and holds docs/installation.md's extras table to the extras
+pyproject.toml declares."""
 
 import argparse
 import ast
@@ -26,6 +28,7 @@ COLAB = ("// BEGIN package index (site/scripts/gen_install.py)", "// END package
 PIP = ("<!-- BEGIN pip (site/scripts/gen_install.py) -->", "<!-- END pip -->")
 JAX = ("<!-- BEGIN JAX requirement (site/scripts/gen_install.py) -->", "<!-- END JAX requirement -->")
 COMMANDS = ("<!-- BEGIN install commands (site/scripts/gen_install.py) -->", "<!-- END install commands -->")
+UV = ("# BEGIN uv bootstrap (site/scripts/gen_install.py)", "# END uv bootstrap")
 EXTRAS = ("<!-- BEGIN extras (site/scripts/gen_install.py checks them against pyproject.toml) -->",
           "<!-- END extras -->")
 
@@ -105,10 +108,14 @@ def main() -> None:
     parser.add_argument("--check", action="store_true", help="Check the generated blocks without writing them.")
     args = parser.parse_args()
     builds, index, python = facts()
-    project = tomllib.loads((REPO / "pyproject.toml").read_text())["project"]
+    pyproject = tomllib.loads((REPO / "pyproject.toml").read_text())
+    project = pyproject["project"]
     pip = next(line for line in (REPO / "tools/pip.txt").read_text().splitlines()
                if line and not line.startswith("#"))
     pip_version = re.search(r"/pip-([\d.]+)-", pip)[1]
+    uv = re.fullmatch(r">=\s*([\d.]+)", pyproject["tool"]["uv"]["required-version"])[1]
+    # The bootstrap each installer runs before any checkout exists to read pyproject.toml from.
+    bootstrap = [f"uv_least={uv}", *(REPO / "site/scripts/uv_bootstrap.sh").read_text().splitlines()]
     jax = next(requirement for requirement in project["dependencies"] if re.match(r"jax\b", requirement))
     page = (REPO / "docs/installation.md").read_text()
     extras = set(project["optional-dependencies"])
@@ -124,13 +131,15 @@ def main() -> None:
         table.append(f"| `{build}` | {cuda // 1000}.{cuda % 1000 // 10} or later | {driver} or later, or an older "
                      f"one under NVIDIA's cuda-compat | {major}.{minor} or later |")
     least = [f"Dew needs Python {python} or newer, and CI tests {' and '.join(PYTHONS)}."]
-    advice = [f"Use pip {pip_version} or newer and uv 0.13.4 or newer: older ones trust the roots of "
+    advice = [f"Use pip {pip_version} or newer and uv {uv} or newer: older ones trust the roots of "
               "eMudhra's compromised certificate authorities (October 2026). Update pip from its wheel by "
               "hash, so the update holds whatever the older pip trusts, and uv through the system's "
               "certificates once they are updated:", "",
               "```bash", f'python -m pip install "{pip}"', "UV_SYSTEM_CERTS=true uv self update", "```"]
     stale = []
-    for path, blocks in ((REPO / "site/public/install.sh", ((SHELL, shell),)),
+    for path, blocks in ((REPO / "site/public/install.sh", ((SHELL, shell), (UV, bootstrap))),
+                         (REPO / "tools/armada/setup.sh", ((UV, bootstrap),)),
+                         (REPO / "src/dew/cli/tpu_setup.py", ((UV, bootstrap),)),
                          (REPO / "constraints.txt", ((CONSTRAINT, [f"--extra-index-url {index}"]),)),
                          (REPO / "site/scripts/colab-notebooks.mjs",
                           ((COLAB, [f"const PACKAGE_INDEX = '{index}';"]),)),
@@ -138,7 +147,8 @@ def main() -> None:
                          (REPO / "docs/installation.md", ((TABLE, table), (LEAST, least), (PIP, advice),
                                                            (JAX, [f"Dew requires `{jax}`."]),
                                                            (COMMANDS, commands(builds, index)))),
-                         (REPO / "README.md", ((LEAST, least), (PIP, advice), (COMMANDS, commands(builds, index))))):
+                         (REPO / "README.md", ((LEAST, least), (PIP, advice),
+                                               (COMMANDS, commands(builds, index))))):
         original = generated = path.read_text()
         for markers, lines in blocks:
             generated = between(generated, markers, lines)
