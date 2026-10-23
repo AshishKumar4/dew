@@ -175,7 +175,7 @@ class Sampling:
         if self.pad_token_id is not None and (type(self.pad_token_id) is not int or self.pad_token_id < 0):
             raise ValueError("pad_token_id must be a non-negative token id")
         if self.eos_token_ids is not None:
-            object.__setattr__(self, "eos_token_ids", decoding.token_ids("eos_token_ids", self.eos_token_ids))
+            object.__setattr__(self, "eos_token_ids", decoding.id_row("eos_token_ids", self.eos_token_ids))
         if isinstance(self.stop, str):
             raise ValueError(f"stop is a tuple of strings; write stop=({self.stop!r},)")
         if any(not isinstance(string, str) or not string for string in self.stop):

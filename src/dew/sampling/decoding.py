@@ -35,7 +35,7 @@ import numpy as np
 from flax import struct
 from jax import lax
 
-from dew.nn.inputs import valid_order
+from dew.nn.inputs import token_ids, valid_order
 from dew.nn.scatter import DROPPED
 from dew.sampling.vocabulary import (
     Referencing,
@@ -158,13 +158,10 @@ def _counts(tokens: jax.Array, valid: jax.Array, vocab: int) -> jax.Array:
     return jnp.zeros((tokens.shape[0], vocab), jnp.float32).at[rows, slots].add(1.0, mode="drop")
 
 
-def token_ids(name: str, value: int | Sequence[int]) -> tuple[int, ...]:
-    if isinstance(value, bool):
-        raise ValueError(f"{name} must hold non-negative token ids")
-    ids = (value,) if isinstance(value, int) else tuple(value)
-    if not ids or any(type(token) is not int or token < 0 for token in ids):
-        raise ValueError(f"{name} must hold non-negative token ids")
-    return ids
+def id_row(name: str, value: int | Sequence[int]) -> tuple[int, ...]:
+    """`value`, one token id or a row of them, as a tuple, read by the one law of token ids
+    (`dew.nn.inputs.token_id`)."""
+    return tuple(token_ids([value] if isinstance(value, int) else value, where=name))
 
 
 def positive(name: str, value: float | int | str | bool | None) -> float:
@@ -653,7 +650,7 @@ def sequence_bias(entries: Sequence[tuple[Sequence[int], float]]) -> SequenceBia
     """A `SequenceBias` table from `(token ids, bias)` pairs."""
     pairs = [(tuple(ids), float(value)) for ids, value in entries]
     for ids, _ in pairs:
-        token_ids("sequence_bias", ids)
+        id_row("sequence_bias", ids)
     width = max((len(ids) for ids, _ in pairs), default=1)
     table = np.zeros((len(pairs), width), np.int32)
     for row, (ids, _) in enumerate(pairs):
@@ -669,7 +666,7 @@ def bad_words(ids: Sequence[Sequence[int]], eos_token_ids: int | Sequence[int] |
     Single-token sequences that name an EOS id are dropped, as the reference
     drops them, so banning bad words cannot ban termination.
     """
-    stops = () if eos_token_ids is None else token_ids("eos_token_ids", eos_token_ids)
+    stops = () if eos_token_ids is None else id_row("eos_token_ids", eos_token_ids)
     kept = [tuple(word) for word in ids if not (len(word) == 1 and word[0] in stops)]
     return sequence_bias([(word, -math.inf) for word in kept])
 
