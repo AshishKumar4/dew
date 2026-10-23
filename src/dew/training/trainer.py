@@ -576,10 +576,13 @@ class Trainer(Generic[Loss, Effects]):
         params = unfreeze(nn.unbox(initialized))
         # A held tree's initializer returns the objective's own arrays (`Objective.held_variables`),
         # which the step's donation would free: the state takes buffers of its own, as a placed one
-        # does (`distributed.placed_held`). Traced, no leaf is a held array, so nothing is copied.
-        held = {id(leaf) for leaf in jax.tree.leaves(self.objective.held_variables())
-                if isinstance(leaf, jax.Array)}
-        params = jax.tree.map(lambda leaf: leaf.copy() if id(leaf) in held else leaf, params)
+        # does (`distributed.placed_held`). Traced, no leaf is a held array, so nothing is copied; a
+        # state held on the host is never donated, and takes the arrays over leaf by leaf as it is
+        # placed (`_placed_host`), so it takes them as they are.
+        if not self.host_master:
+            held = {id(leaf) for leaf in jax.tree.leaves(self.objective.held_variables())
+                    if isinstance(leaf, jax.Array)}
+            params = jax.tree.map(lambda leaf: leaf.copy() if id(leaf) in held else leaf, params)
         if "params" not in params:
             raise ValueError(
                 f"the objective's tree has no params collection, only {sorted(params)}; "
