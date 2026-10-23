@@ -219,8 +219,18 @@ def _hooks_lower(ba, dtype, rules) -> bool:
 
     return (_lowers(hooks.before(), jax.ShapeDtypeStruct((128, 128), dtype),
                     tiles('prologue_operands', hooks.prologue_axes), rules)
-            and _lowers(hooks.after(), jax.ShapeDtypeStruct((128, 128), jnp.float32),
+            and _lowers(_traced_epilogue(ba), jax.ShapeDtypeStruct((128, 128), jnp.float32),
                         tiles('epilogue_operands', hooks.epilogue_axes), rules))
+
+
+def _traced_epilogue(ba):
+    """The launch's epilogue as a function of one accumulator tile, as `_lowers` and `_hook_work` read it:
+    a paired product's reads that tile for both of its accumulators, the same primitives on the same
+    shapes."""
+    epilogue = ba.arguments['hooks'].after()
+    if epilogue is None or ba.arguments.get('paired') is None:
+        return epilogue
+    return lambda acc, *sides: epilogue(acc, acc, *sides)
 
 
 def _hook_work(hook, dtype, sides, axes_of, tile: tuple, extents: dict) -> float:
@@ -488,7 +498,7 @@ class Gmm(_Triton):
                 hooks.before(), tokens.dtype, prologue_sides, hooks.prologue_axes,
                 (config.block_m, config.block_k), extents)
             + tiles / chunks * config.block_m * config.block_n * _hook_work(
-                hooks.after(), jnp.float32, epilogue_sides, hooks.epilogue_axes,
+                _traced_epilogue(ba), jnp.float32, epilogue_sides, hooks.epilogue_axes,
                 (config.block_m, config.block_n), extents))
         return cost.Cost(
             programs=chunks * columns, device_bytes=moved,
@@ -678,8 +688,8 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         prologue_exponentials = steps * math.prod(lhs) * _hook_work(
             hooks.before(), tokens.dtype, prologue_sides, hooks.prologue_axes, lhs, extents)
         epilogue_exponentials = config.block_m * config.block_n * _hook_work(
-            hooks.after(), jnp.float32, epilogue_sides, hooks.epilogue_axes, (config.block_m, config.block_n),
-            extents)
+            _traced_epilogue(ba), jnp.float32, epilogue_sides, hooks.epilogue_axes,
+            (config.block_m, config.block_n), extents)
         return cost.Cost(
             programs=tiles, device_bytes=moved,
             program_flops=2 * steps * config.block_m * config.block_n * config.block_k,

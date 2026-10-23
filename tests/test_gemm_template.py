@@ -218,8 +218,8 @@ def test_a_paired_product_holds_check_1(generation_name):
     generation picks, interpreted on the CPU: its value and every operand's cotangent as exact as the
     unfused program's, two projections then the activation, from float64 truth."""
     def dew(x, gate, up):
-        return template.gemm(x, gate, jnp.asarray(SIZES), paired=up, epilogue=silu_gated, out_dtype=jnp.bfloat16,
-                             interpret_on_cpu=True)
+        return template.gemm(x, gate, jnp.asarray(SIZES), paired=up, epilogue=silu_gated,
+                             out_dtype=jnp.bfloat16, interpret_on_cpu=True)
 
     with generation.assumed(generation_name):
         assert_as_exact(jax.jit(with_gradients(dew)), jax.jit(with_gradients(_paired_plain())), _paired_draw,
