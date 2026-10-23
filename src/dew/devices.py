@@ -79,10 +79,11 @@ def _backend_open() -> bool:
     return bridge is not None and bridge.backends_are_initialized()
 
 
-def _gpu_default(name: str, flag: str) -> None:
-    """Pass XLA's GPU compiler `flag` before the backend opens, unless the run named `name`."""
+def _gpu_default(name: str, assignment: str) -> None:
+    """Pass XLA's GPU compiler `assignment` (`--name=value`) before the backend opens, unless the run
+    named `name`."""
     if not _backend_open() and cuda_plugin() and xla_flag(name) is None:
-        apply_xla_flags(flag)
+        apply_xla_flags(assignment)
 
 
 def unpartition_gpu_pool() -> None:
