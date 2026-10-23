@@ -174,7 +174,7 @@ UPDATE_SEEDS = {0.0: 8, 0.1: 8}
 """Each decay's declared seeds for the update's check 1, sized by `seeds_for` (on armada)."""
 DENSE_ROWS, DENSE_ORDERS, DENSE_SEEDS = 16, 4, 512
 """The dense decoder's gradient draw's rows, the orders of them its rows are judged over (an orbit of
-the mean loss's exact symmetry, `assert_as_exact`'s `orbit`), and check 1's declared seeds, sized by
+the mean loss's exact symmetry, `assert_as_exact`'s `orders`), and check 1's declared seeds, sized by
 `seeds_for` (on armada). At STEP_ROWS AltUp's output scale in its third layer, a leaf of 32 values each
 summed over a draw's tokens, did not resolve within 512 seeds. Over one draw's orders the worst row of
 AltUp's correction gradient in its third layer, a sum that nearly cancels, ranges tenfold for the
@@ -371,7 +371,7 @@ def test_the_dense_decoders_gradient_is_the_references():
 
     assert_as_exact(differentiated, lambda *inputs: reference(torch.float32, *inputs), draw,
                     "the dense decoder's gradient", seeds=DENSE_SEEDS,
-                    truth_fn=lambda *inputs: reference(torch.float64, *inputs), orbit=orders)
+                    truth_fn=lambda *inputs: reference(torch.float64, *inputs), orders=orders)
 
 
 @pytest.mark.parametrize("optimizer", ["sgd", "adamw"])
