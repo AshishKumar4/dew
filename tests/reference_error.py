@@ -245,6 +245,70 @@ def with_gradients(fn):
     return run
 
 
+def _host_tensor(value):
+    """A torch copy of a host array, of its own shape and dtype. NumPy holds bfloat16, the float8
+    formats and the 4-bit integers as ml_dtypes' types: a float of those goes through float32, which
+    holds it exactly, to torch's format of the same name, and an integer enters as int32, which holds
+    its values. A copy, so autograd never writes an array JAX holds."""
+    import torch
+
+    value = np.array(value)
+    if value.dtype.type.__module__.startswith("ml_dtypes"):
+        if jnp.issubdtype(value.dtype, jnp.floating):
+            return torch.as_tensor(value.astype(np.float32)).to(getattr(torch, value.dtype.name))
+        return torch.as_tensor(value.astype(np.int32))
+    return torch.as_tensor(value)
+
+
+def _host_array(value):
+    """A tensor as a host array. A format NumPy lacks, such as bfloat16, comes back as float32, which holds
+    its values exactly."""
+    import torch
+
+    value = value.detach()
+    narrow = value.is_floating_point() and value.dtype not in (torch.float16, torch.float32, torch.float64)
+    return (value.float() if narrow else value).numpy()
+
+
+def torch_with_gradients(fn):
+    """`with_gradients` for a torch arm. `fn(*tensors)` becomes `run(*inputs, cotangent)`, which returns
+    `fn`'s output and the gradients of its inputs under the cotangent passed last, as host arrays.
+    - Each floating input enters as a tensor of its own dtype that requires a gradient; a module's
+      parameters are inputs too, called through `torch.func.functional_call`.
+    - The cotangent has the output's tree (an array, or a tuple or dict of them), as `jax.vjp` requires,
+      each leaf cast to its output's dtype.
+    - An input the output does not reach has a zero gradient, a non-floating one none, and an output no
+      input reaches pulls nothing back.
+    - A narrow float array (bfloat16, the float8 formats) goes in and comes out through the float32 that
+      holds it."""
+    def run(*arguments):
+        import torch
+
+        inputs, cotangent = jax.tree.map(_host_tensor, arguments[:-1]), arguments[-1]
+        for leaf in jax.tree.leaves(inputs):
+            if leaf.is_floating_point():
+                leaf.requires_grad_()
+        out = fn(*inputs)
+        if jax.tree.structure(out) != jax.tree.structure(cotangent):
+            raise ValueError(f"a cotangent of tree {jax.tree.structure(cotangent)} for an output of tree "
+                             f"{jax.tree.structure(out)}")
+        flat, tree = jax.tree.flatten(inputs)
+        wanted = [index for index, leaf in enumerate(flat) if leaf.requires_grad]
+        reached = [(leaf, c) for leaf, c in zip(jax.tree.leaves(out), jax.tree.leaves(cotangent), strict=True)
+                   if leaf.requires_grad]
+        pulled = [None] * len(wanted)
+        if wanted and reached:
+            pulled = torch.autograd.grad([leaf for leaf, _ in reached], [flat[index] for index in wanted],
+                                         grad_outputs=[_host_tensor(c).to(leaf.dtype) for leaf, c in reached],
+                                         allow_unused=True)
+        gradients = [None] * len(flat)
+        for index, grad in zip(wanted, pulled, strict=True):
+            gradients[index] = _host_array(torch.zeros_like(flat[index]) if grad is None else grad)
+        return jax.tree.map(_host_array, out), *jax.tree.unflatten(tree, gradients)
+
+    return run
+
+
 def equations(graph):
     """Every equation of a jaxpr, its sub-jaxprs' (scan, cond, custom rules) in turn."""
     if hasattr(graph, "eqns"):
