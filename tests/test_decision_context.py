@@ -2,6 +2,7 @@
 pretrained backbone: trained as an adapter, counted in its training work, and served, each request's
 answer read from its own context."""
 
+import dataclasses
 import itertools
 from pathlib import Path
 
@@ -13,7 +14,7 @@ import pytest
 from decision_support import decision_rows
 from model_support import flat_tree
 from recording import RecordingTracker
-from reference_error import assert_as_exact
+from reference_error import assert_as_exact, widened
 
 from dew.data.dataset import DataPartition
 from dew.data.text import ByteTokenizer
@@ -24,6 +25,7 @@ from dew.decision.objective import DecisionObjective
 from dew.decision.questions import ChoiceAnswer
 from dew.interop import Pretrained
 from dew.nn.cross_attention import CrossAttention, crossing
+from dew.nn.multimodal import MultimodalTransformer
 from dew.objectives.base import FROZEN, thaw
 from dew.training import Trainer
 
@@ -48,8 +50,9 @@ QUESTION = {"pick": Choice("Which one?", ["a", "b", "c"])}
 
 WORDS = ["one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "note", "first"]
 
-CONTEXT_SEEDS = 16
-"""Check 1's declared seeds for the batched answers with their contexts."""
+CONTEXT_SEEDS = 32
+"""Check 1's declared seeds for the batched answers with their contexts, sized paired (`seeds_for`
+with the batch as `dew_fn`, 2026-10-23 on armada)."""
 
 
 def conditioned(length: int = 16, layers: tuple[int, ...] = (0, 1)) -> DecisionObjective:
@@ -64,6 +67,34 @@ def examples() -> list[Example]:
     return [Example(text, QUESTION, {"pick": label}, context=note) for text, label, note in ROWS]
 
 
+def in_float64(task: Decide) -> Decide:
+    """`task` computing in float64: its backbone, a multimodal one's language model too, and its head,
+    over its weights widened (`reference_error.widened`), for a truth under `jax.enable_x64`."""
+    backbone = task.model.backbone.clone(dtype=jnp.float64)
+    if isinstance(backbone, MultimodalTransformer):
+        backbone = backbone.clone(language_model=backbone.language_model.clone(dtype=jnp.float64))
+    model = DecisionModel(backbone, task.model.head.clone(dtype=jnp.float64))
+    return dataclasses.replace(task, model=model, variables=widened(task.variables))
+
+
+def asked(task: Decide, state: str, context=None, images=()) -> np.ndarray:
+    """`task`'s probabilities over QUESTION's options for `state`."""
+    answer = task(state, QUESTION, context=context, images=images)["pick"]
+    assert isinstance(answer, ChoiceAnswer)
+    return np.asarray(answer.probabilities)
+
+
+def drawn(seed) -> tuple[str, str]:
+    """A seed's state and context, of the fixture's words."""
+    rng = np.random.default_rng([0xC0E8, int(seed)])
+    return " ".join(rng.choice(WORDS, 6)), " ".join(rng.choice(WORDS, int(rng.integers(1, 6))))
+
+
+FRESH_SEEDS = 8
+"""Check 1's declared seeds for the shut gates' answers against the source's, and beside images, sized
+paired (`seeds_for` with the shut gates' answers as `dew_fn`, 2026-10-23 on armada)."""
+
+
 def opened(variables, value: float = 1.0):
     """`variables` with every cross-attention gate at `value`, so the blocks' reading joins the stream."""
     tree = thaw(variables)
@@ -76,8 +107,9 @@ def opened(variables, value: float = 1.0):
 
 def test_a_backbone_with_fresh_context_layers_scores_every_row_as_its_source_does():
     """The cross-attention blocks start from zero gates, so a decision over the backbone with them
-    scores a row, with its context or without, exactly as the backbone alone does; the blocks train
-    and the source's weights are held frozen."""
+    answers a row, with its context or without, as the backbone alone does: on par from float64 (check
+    1), the two being programs of their own. The blocks train and the source's weights are held
+    frozen."""
     source = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference")
     plain = DecisionObjective(source, tokenizer=ByteTokenizer(), specials=SPECIALS)
     crossed = conditioned(8, (0,))
@@ -87,15 +119,25 @@ def test_a_backbone_with_fresh_context_layers_scores_every_row_as_its_source_doe
     assert trained and all(crossing(tuple(entry.key for entry in path)) for path, _ in trained)
     assert FROZEN in crossed.variables
 
-    asked = Decide(plain.model, plain.init(jax.random.key(0)), plain.layout, plain.tokenizer, plain.specials)
+    asked_task = Decide(plain.model, plain.init(jax.random.key(0)), plain.layout, plain.tokenizer,
+                        plain.specials)
     variables = crossed.init(jax.random.key(0))
-    variables = {**variables, "params": {**variables["params"], "head": asked.variables["params"]["head"]}}
+    head = asked_task.variables["params"]["head"]
+    variables = {**variables, "params": {**variables["params"], "head": head}}
     reading = Decide(crossed.model, variables, crossed.layout, crossed.tokenizer, crossed.specials)
-    alone = asked("one two three", QUESTION)["pick"]
-    for context in (None, "a first note"):
-        read = reading("one two three", QUESTION, context=context)["pick"]
-        assert isinstance(read, ChoiceAnswer) and isinstance(alone, ChoiceAnswer)
-        np.testing.assert_array_equal(read.probabilities, alone.probabilities)
+    wide = {}
+
+    def truth(seed):
+        with jax.enable_x64(new_val=True):
+            if "task" not in wide:
+                wide["task"] = in_float64(source_task)
+            return asked(wide["task"], drawn(seed)[0])
+
+    source_task = asked_task
+    for read in (lambda seed: asked(reading, drawn(seed)[0]),
+                 lambda seed: asked(reading, *drawn(seed))):
+        assert_as_exact(read, lambda seed: asked(source_task, drawn(seed)[0]), lambda seed: (np.int64(seed),),
+                        "shut gates against the source", seeds=FRESH_SEEDS, truth_fn=truth)
 
 
 def test_a_conditioned_run_logs_its_training_work_and_serves_with_its_context():
@@ -188,14 +230,10 @@ def test_a_batch_answers_each_request_from_its_own_context():
                                for answer in answers.values()])
 
     def truth(seed):
-        if "task" not in wide:
-            model = objective.model
-            exact = DecisionModel(model.backbone.clone(dtype=jnp.float64),
-                                  model.head.clone(dtype=jnp.float64))
-            widened = jax.tree.map(lambda leaf: np.asarray(leaf, np.float64)
-                                   if np.issubdtype(np.asarray(leaf).dtype, np.floating) else leaf, variables)
-            wide["task"] = Decide(exact, widened, objective.layout, objective.tokenizer, objective.specials)
-        return scored(wide["task"], seed, together=False)
+        with jax.enable_x64(new_val=True):
+            if "task" not in wide:
+                wide["task"] = in_float64(task)
+            return scored(wide["task"], seed, together=False)
 
     def draw(seed):
         # The draw is its seed; the requests are made from it, their text no array the check widens.
@@ -208,8 +246,8 @@ def test_a_batch_answers_each_request_from_its_own_context():
 
 def test_a_request_with_images_reads_its_context_beside_them():
     """Over a backbone that reads images (a `MultimodalTransformer`), the blocks attach to its language
-    model. With their gates shut a request with images and a context is answered exactly as with its
-    images alone; with them open its context moves the answer."""
+    model. With their gates shut a request with images and a context is answered as with its images
+    alone, on par from float64 (check 1); with them open its context moves the answer."""
     from PIL import Image
 
     from dew.data.text import HFTokenizer
@@ -224,13 +262,21 @@ def test_a_request_with_images_reads_its_context_beside_them():
     variables = objective.init(jax.random.key(0))
     images = [Image.fromarray(array) for array in np.load(directory / "images.npy")]
 
-    def read(gates, context):
-        task = Decide(objective.model, gates, layout, tokenizer, objective.specials,
+    def task(gates) -> Decide:
+        return Decide(objective.model, gates, layout, tokenizer, objective.specials,
                       processor=source.processor)
-        answer = task("one two three", QUESTION, images=images, context=context)["pick"]
-        assert isinstance(answer, ChoiceAnswer)
-        return np.asarray(answer.probabilities)
 
-    np.testing.assert_array_equal(read(variables, "a first note"), read(variables, None))
-    widened = opened(variables)
-    assert not np.array_equal(read(widened, "a first note"), read(widened, "ten"))
+    shut, wide = task(variables), {}
+
+    def truth(seed):
+        with jax.enable_x64(new_val=True):
+            if "task" not in wide:
+                wide["task"] = in_float64(shut)
+            return asked(wide["task"], drawn(seed)[0], images=images)
+
+    assert_as_exact(lambda seed: asked(shut, *drawn(seed), images=images),
+                    lambda seed: asked(shut, drawn(seed)[0], images=images), lambda seed: (np.int64(seed),),
+                    "shut gates beside images", seeds=FRESH_SEEDS, truth_fn=truth)
+    reading = task(opened(variables))
+    assert not np.array_equal(asked(reading, "one two three", "a first note", images),
+                              asked(reading, "one two three", "ten", images))
