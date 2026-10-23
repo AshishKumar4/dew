@@ -17,8 +17,9 @@ runs:
         GH_TOKEN: ${{ github.token }}
         WORKFLOW: ${{ inputs.workflow }}
       run: |
-        # A pull request's run tested a merge, not this commit.
+        # A pull request's run tested a merge, not this commit; a base/<producer> promote's (ci/base-*) ran what
+        # its change reaches from the producer's tip and no gangs, which proves the commit for no other run.
         run=$(gh api "repos/$GITHUB_REPOSITORY/actions/workflows/$WORKFLOW/runs?head_sha=$GITHUB_SHA&status=success" \
-          --jq '[.workflow_runs[] | select(.event != "pull_request")][0].id // empty')
+          --jq '[.workflow_runs[] | select(.event != "pull_request" and (.head_branch | startswith("ci/base-") | not))][0].id // empty')
         echo "run=$run" >> "$GITHUB_OUTPUT"
         if [ -n "$run" ]; then echo "passed in $GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$run"; fi
