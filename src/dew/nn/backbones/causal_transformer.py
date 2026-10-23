@@ -73,7 +73,6 @@ from ..inputs import (
 from ..kv_cache import KVCache
 from ..mixer_base import MLP_RESIDUALS, RESIDUALS
 from ..mixers import AttentionMixer, MixerBase, MixerContext
-from ..mixers.mamba2 import Mamba2Mixer
 from ..mixers.mlp import MLPMixer
 from ..mla import MLAMixer
 from ..mlp import GatedMLP
@@ -112,6 +111,7 @@ from .decoder_block import (
     remat_policy,
     remat_record,
 )
+from .decoder_fields import refuse_unbuildable
 from .decoder_stack import (
     WRITTEN,
     DecoderBank,
@@ -653,276 +653,6 @@ class CausalTransformer(nn.Module):
                 f"{sorted(set(types))}")
         return {layer_type: self.kind_of(layer_type) for layer_type in set(types) | prediction_kinds}
 
-    def refuse_unbuildable_mup(self, kinds: Mapping[str, "ResolvedKind"]):
-        """Raise `ValueError` if lm-engine's multipliers or initialisation are set on a model that
-        cannot apply them.
-
-        `embedding_multiplier` and `logits_scaling` act at the root, on the embeddings before the
-        first layer (`scaled_embeddings`) and on the final states, so any stack of blocks takes
-        them; prediction depths and the DSpark drafter embed their own tokens unscaled and score
-        their own states. `residual_multiplier` and `initializer_range` act inside lm-engine's
-        dense and routed blocks."""
-        root = self.embedding_multiplier != 1.0 or self.logits_scaling != 1.0
-        block = self.residual_multiplier != 1.0 or self.initializer_range is not None
-        if (root or block) and (self.num_nextn_predict_layers or self.dspark is not None):
-            raise ValueError(
-                "embedding_multiplier, residual_multiplier, logits_scaling and initializer_range "
-                "are lm-engine's; prediction depths and the DSpark drafter do not carry them")
-        if block and (self.hyper_connections is not None
-                      or (self.mixture is not None and self.mixture.parallel)
-                      or self.mlp == 'swigluoai' or self.laurel_rank is not None
-                      or self.altup is not None or self.per_layer_input_dim):
-            raise ValueError(
-                "residual_multiplier and initializer_range are lm-engine's dense and routed "
-                "blocks; hyper-connection streams, Gemma 4's parallel experts, gpt-oss experts, "
-                "LAuReL, AltUp and per-layer inputs do not carry them")
-        if self.logits_scaling <= 0 or (self.initializer_range is not None
-                                        and self.initializer_range <= 0):
-            raise ValueError("logits_scaling and initializer_range are positive")
-        if self.initializer_range is not None:
-            for layer_type, kind in sorted(kinds.items()):
-                mixer = kind.mixer or self.mixer
-                if mixer is not None and not isinstance(mixer, (AttentionMixer, Mamba2Mixer)):
-                    raise ValueError(
-                        f"initializer_range draws the attention and mamba2 mixers' "
-                        f"projections; {layer_type!r} runs {type(mixer).__name__}, "
-                        f"which keeps its own initializers")
-        elif self.depth_scaled_init:
-            raise ValueError("depth_scaled_init scales initializer_range's std; set it")
-
-    def refuse_unbuildable_dropout(self, kinds: Mapping[str, "ResolvedKind"]) -> None:
-        """Raise `ValueError` for a dropout rate outside [0, 1), or for attention dropout with a mixer that
-        cannot drop probabilities."""
-        for field in ("embedding_dropout_rate", "attention_dropout_rate"):
-            rate = getattr(self, field)
-            if not 0 <= rate < 1:
-                raise ValueError(f"{field} must be within [0, 1), got {rate}")
-        if self.attention_dropout_rate:
-            for kind in kinds.values():
-                if not isinstance(kind.mixer or self.mixer or AttentionMixer(), AttentionMixer):
-                    raise ValueError("attention_dropout_rate requires ordinary attention mixers")
-
-    def refuse_unbuildable_classic_fields(self):
-        """Raise `ValueError` for norm, position and feed-forward combinations that no supported
-        model uses."""
-        if self.norm_type not in ('rms', 'layer'):
-            raise ValueError(f'norm_type must be rms or layer, got {self.norm_type!r}')
-        if self.norm_type == 'rms' and self.norm_bias:
-            raise ValueError('norm_bias requires LayerNorm')
-        if not self.first_attention_norm and not self.pre_norms:
-            raise ValueError('first_attention_norm=False drops a pre-norm, so it requires pre_norms')
-        if self.head_transform not in (None, 'gelu', 'gelu_exact'):
-            raise ValueError("head_transform must be None, 'gelu' or 'gelu_exact'")
-        if self.norm_type == 'layer' and self.scale_offset:
-            raise ValueError('scale_offset describes RMSNorm weights')
-        if self.position_embedding not in ('rotary', 'learned', 'alibi'):
-            raise ValueError('position_embedding must be rotary, learned or alibi')
-        if self.position_embedding_size is not None and (
-                self.position_embedding != 'learned' or self.position_embedding_size < self.max_seq_len):
-            raise ValueError('position_embedding_size requires learned positions and covers max_seq_len')
-        if self.position_embedding_offset < 0 or (self.position_embedding_offset and (
-                self.position_embedding != 'learned' or self.position_embedding_size is None
-                or self.position_embedding_size < self.max_seq_len + self.position_embedding_offset)):
-            raise ValueError('position_embedding_offset requires learned table rows past max_seq_len')
-        if self.position_embedding != "rotary" and (
-            self.partial_rotary_factor is not None or self.rope_scaling is not None or self.yarn is not None
-        ):
-            raise ValueError('rotary scaling requires rotary positions')
-        if self.mixture is not None and (self.mlp_bias or self.mlp in ('gelu', 'gelu_exact', 'relu')):
-            raise ValueError('the routed experts require a bias-free gated MLP')
-        if self.num_nextn_predict_layers and (self.norm_type != 'rms' or self.position_embedding != 'rotary'):
-            raise ValueError('prediction depths require RMSNorm and rotary positions')
-
-    def refuse_unbuildable_kinds(self, kinds: Mapping[str, "ResolvedKind"]):
-        """Raise `ValueError` for a kind with invalid rotary, local-mask or grouped-head geometry."""
-        for layer_type, kind in sorted(kinds.items()):
-            if self.position_embedding == 'rotary' and kind.head_dim % 2:
-                raise ValueError(
-                    "rotary positions rotate pairs, so the head dim of "
-                    f"{layer_type!r} must be even, got {kind.head_dim}")
-            if kind.window is not None and kind.window < 1:
-                raise ValueError(
-                    f"the window of {layer_type!r} must be positive, got {kind.window}")
-            if kind.chunk is not None and kind.chunk < 1:
-                raise ValueError(
-                    f"the chunk of {layer_type!r} must be positive, got {kind.chunk}")
-            if kind.chunk is not None and kind.window is not None:
-                raise ValueError(
-                    f"{layer_type!r} sets a window and a chunk; a local layer "
-                    f"reads one or the other")
-            if kind.chunk is not None and not self.causal:
-                raise ValueError(
-                    f"{layer_type!r} chunks a causal layer's keys, and this model "
-                    f"is not causal")
-            if kind.bidirectional_window and (self.causal or kind.window is None):
-                raise ValueError(
-                    f"{layer_type!r} keeps a window on both sides of a query, which "
-                    f"needs a window and a model that is not causal")
-            if kind.num_kv_heads < 1 or self.num_heads % kind.num_kv_heads:
-                raise ValueError(
-                    f"num_heads ({self.num_heads}) must be a multiple of the key/value "
-                    f"heads of {layer_type!r} ({kind.num_kv_heads})")
-
-    def refuse_unbuildable_ngpt(self, kinds: Mapping[str, "ResolvedKind"]):
-        """Raise `ValueError` for what nGPT's arithmetic does not reach: its gains and unit norms
-        live in the attention and the dense gated feed-forward (an MLP mixer's too), so routed or
-        parallel experts, another mixer, prediction depths and the DSpark drafter, which would
-        compute without them, are refused."""
-        if self.ngpt is None:
-            return
-        if self.mixture is not None or self.num_nextn_predict_layers or self.dspark is not None:
-            raise ValueError("nGPT unit-norms the attention and the dense gated feed-forward; routed or "
-                             "parallel experts (mixture), prediction depths and the DSpark drafter take "
-                             "none of it")
-        for layer_type, kind in sorted(kinds.items()):
-            mixer = kind.mixer or self.mixer
-            dense = isinstance(mixer, MLPMixer) and mixer.mixture is None
-            if mixer is not None and not (isinstance(mixer, AttentionMixer) or dense):
-                raise ValueError(f"nGPT's gains and unit norms are the attention's and the dense gated "
-                                 f"feed-forward's; {layer_type!r} runs {mixer!r}")
-
-    def refuse_unbuildable_fields(self, kinds: Mapping[str, "ResolvedKind"]):
-        """Raise `ValueError` for a field, or a pair of fields, that this model cannot build.
-
-        Each error names the field the caller set and what a model without it
-        looks like, so whoever translated the config can see which entry to fix.
-        """
-        self.refuse_unbuildable_mup(kinds)
-        self.refuse_unbuildable_dropout(kinds)
-        self.refuse_unbuildable_classic_fields()
-        self.refuse_unbuildable_ngpt(kinds)
-        mtp_hc = self.mtp_hyper_connections
-        if mtp_hc is not None:
-            if self.num_nextn_predict_layers != 1:
-                raise ValueError("mtp_hyper_connections requires a single prediction depth")
-            if mtp_hc.head != 'weighted':
-                raise ValueError("mtp_hyper_connections requires the V4 weighted stream-collapse head")
-            if self.hyper_connections is None or mtp_hc.hc_mult != self.hyper_connections.hc_mult:
-                raise ValueError("mtp_hyper_connections must match the trunk's residual stream count")
-        self.refuse_unbuildable_kinds(kinds)
-        carried = [name for name in ("altup", "hyper_connections", "attention_residuals", "dspark")
-                   if getattr(self, name) is not None]
-        if self.loop is not None and carried:
-            raise ValueError(f"a loop norms the one residual between its passes, and {carried} carry "
-                             "others beside it; a model with them runs its stack once (loop=None)")
-        if self.loop is not None and self.loop.layers is not None:
-            if self.loop.layers[1] > self.num_layers:
-                raise ValueError(f"the loop's block {self.loop.layers} ends past layer {self.num_layers}")
-            if self.sharing_layers:
-                raise ValueError("a loop over a block reads its layers' keys and values apart from the rest, "
-                                 "and kv_shared_layers reads them across it; loop the whole stack")
-        if self.num_heads % self.kv_heads:
-            raise ValueError(
-                f"num_heads ({self.num_heads}) must be a multiple of num_kv_heads "
-                f"({self.kv_heads})")
-        if self.partial_rotary_factor is not None and not 0 < self.partial_rotary_factor <= 1:
-            raise ValueError(
-                "partial_rotary_factor must be within (0, 1], "
-                f"got {self.partial_rotary_factor}")
-        if self.partial_rotary_type not in ('proportional', 'default'):
-            raise ValueError(
-                "partial_rotary_type names the convention of a partial rotary, "
-                f"'proportional' or 'default', got {self.partial_rotary_type!r}")
-        sparse = self.sparse_layers
-        outside = sorted(index for index in sparse
-                         if not 0 <= index < self.num_layers)
-        if outside:
-            raise ValueError(
-                f"the mixture's layers {outside} are outside the "
-                f"{self.num_layers} layers of this model")
-        hashed = self.hash_layers
-        if hashed - set(sparse):
-            raise ValueError(
-                f"the mixture's hash_layers {sorted(hashed - set(sparse))} are not "
-                "among its sparse layers, which are the ones with experts to route")
-        sharing = self.kv_sharing
-        if self.use_double_wide_mlp and not sharing:
-            raise ValueError(
-                "use_double_wide_mlp widens the MLP of the layers that share "
-                "their keys and values, so it needs kv_shared_layers set")
-        ple = self.per_layer_input_dim
-        if ple is not None and ple < 1:
-            raise ValueError(
-                f"per_layer_input_dim is the width of a layer's own input, got "
-                f"{ple}; None is a model without them")
-        if self.num_nextn_predict_layers < 0:
-            raise ValueError(
-                f"num_nextn_predict_layers counts prediction depths, got "
-                f"{self.num_nextn_predict_layers}; 0 is a model without them")
-        widths = self.mlp_widths
-        if len(widths) != self.num_layers or min(widths) < 0:
-            raise ValueError(
-                f"mlp_features names one width per layer of {self.num_layers}, "
-                f"0 for a layer without a feed-forward, got {self.mlp_features}")
-        sparsity = self.activation_sparsity_pattern
-        if sparsity is not None and (len(sparsity) != self.num_layers
-                                     or not all(0 <= fraction < 1 for fraction in sparsity)):
-            raise ValueError(
-                f"activation_sparsity_pattern names one fraction within [0, 1) per "
-                f"layer of {self.num_layers}, got {sparsity}")
-        if self.altup is not None and self.num_nextn_predict_layers:
-            raise ValueError(
-                "altup carries a stack of residual copies through the layers and "
-                "the prediction depths read one, so a model has one or the other")
-        if self.altup is not None and self.hyper_connections is not None:
-            raise ValueError(
-                "altup and hyper_connections each carry their own stack of residual "
-                "copies through the layers, so a model has one or the other")
-        self.refuse_unbuildable_stream_fields()
-        self.refuse_unbuildable_cross_attention()
-        if self.swiglu_limit is not None and self.swiglu_limit <= 0:
-            raise ValueError(
-                f"swiglu_limit caps the gate and up projections, so it is positive, "
-                f"got {self.swiglu_limit}; None leaves them unclamped")
-        mask = self.mask_token_id
-        if mask is not None and (isinstance(mask, bool) or not isinstance(mask, int) or mask < 0):
-            raise ValueError(
-                f"mask_token_id names a vocabulary id, got {mask!r}; None is a "
-                "model trained on plain next-token prediction")
-
-    def refuse_unbuildable_cross_attention(self):
-        """Raise `ValueError` where `cross_attention` names a layer this model lacks, or a layer
-        with no feed-forward width to take."""
-        cross = self.cross_attention
-        if cross is None:
-            return
-        outside = sorted(set(cross.layer_ids) - set(range(self.num_layers)))
-        if outside:
-            raise ValueError(f"cross-attention layers {outside} are outside the {self.num_layers} layers")
-        unsized = sorted(index for index in cross.layer_ids if not self.mlp_widths[index])
-        if cross.intermediate_size is None and unsized:
-            raise ValueError(f"layers {unsized} have no feed-forward whose width the cross-attention "
-                             "block takes; name its intermediate_size")
-
-    def refuse_unbuildable_stream_fields(self):
-        """Raise `ValueError` for settings on mHC's residual streams that cannot be
-        built: engram's layers, DSpark's stages and the Single-Pass schedule."""
-        engram, hc = self.engram, self.hyper_connections
-        if engram is not None:
-            if hc is None:
-                raise ValueError("engram gates its lookup into each of mHC's residual streams, "
-                                 "so it needs hyper_connections")
-            outside = sorted(set(engram.layer_ids) - set(range(self.num_layers)))
-            if outside:
-                raise ValueError(f"engram layers {outside} are outside the {self.num_layers} layers")
-        if self.dspark is not None:
-            # The stages are the trunk's mHC blocks, V4.1's Single-Pass ones
-            # (v41:1100-1156) or V4's with a learned head on the last stage
-            # (V4-Flash-0731 model.py:818-874); a drafter for another trunk's
-            # residual is not built here.
-            if hc is None or not (hc.single_pass or hc.head == 'weighted') or self.mixture is None:
-                raise ValueError("the DSpark drafter chains mHC blocks over routed experts and "
-                                 "collapses them by Single-Pass's carried pre (V4.1) or by a "
-                                 "learned head (V4), as the trunk it drafts for does")
-            outside = sorted(set(self.dspark.target_layers) - set(range(self.num_layers)))
-            if outside:
-                raise ValueError(f"DSpark target layers {outside} are outside the {self.num_layers} layers")
-            if self.num_nextn_predict_layers:
-                raise ValueError("a model drafts with DSpark or with MTP depths, not both")
-        if hc is not None and hc.single_pass and self.mtp_hyper_connections:
-            raise ValueError("Single-Pass mHC carries the next sublayer's collapse beside the "
-                             "streams, which no stream prediction depth reads")
-
     def feedforward_factories(self):
         """Build the three feed-forward factories a layer can use.
 
@@ -1106,7 +836,7 @@ class CausalTransformer(nn.Module):
         """
         types = self.per_layer_types
         kinds = self.layer_kinds(types)
-        self.refuse_unbuildable_fields(kinds)
+        refuse_unbuildable(self, kinds)
         projections = self.projections()
         ple = self.per_layer_input_dim
 
@@ -1593,12 +1323,14 @@ class CausalTransformer(nn.Module):
 
     def mtp_logits(self, hidden, tokens, train: bool = False, positions=None,
                    segment_ids=None, input_embeddings=None,
-                   attention_mask=None, image_groups=None, rotary_positions=None):
-        """Return the shared language head's logits for each prediction depth's hidden states."""
+                   attention_mask=None, image_groups=None, rotary_positions=None,
+                   conditioning: Mapping[str, jax.Array] | None = None):
+        """Return the shared language head's logits for each prediction depth's hidden states; a
+        call's `conditioning` is the trunk's (`mtp_hidden_states`)."""
         return [self._logits(state) for state in self.mtp_hidden_states(
             hidden, tokens, train=train, positions=positions, segment_ids=segment_ids,
             input_embeddings=input_embeddings, attention_mask=attention_mask, image_groups=image_groups,
-            rotary_positions=rotary_positions)]
+            rotary_positions=rotary_positions, conditioning=conditioning)]
 
     def mtp_step(self, hidden, tokens, *, depth: int = 0, positions=None,
                  input_embeddings=None, attention_mask=None, rotary_positions=None,
@@ -1898,6 +1630,10 @@ class CausalTransformer(nn.Module):
         if context is not None and context.embeddings.shape[0] != tokens.shape[0]:
             raise ValueError(f"a context row per token row, got {context.embeddings.shape[0]} for "
                              f"{tokens.shape[0]}")
+        if context is not None:
+            # The context enters in the dtype a server holds it in (`context_dtype`), so a served and
+            # a standalone call, and a cached and a full one, project the same values.
+            context = context.replace(embeddings=context.embeddings.astype(self.context_dtype))
         # A layer whose mixer reads no pairwise mask refuses one (`MixerCall`).
         if key_positions is not None and pairwise_mask is None:
             raise ValueError("attention_key_positions requires attention_pairwise_mask")
