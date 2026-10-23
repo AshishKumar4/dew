@@ -68,7 +68,8 @@ PRODUCTS = {
     "inverse_t": "the inverse's transpose against a gradient, `L^T dX` (`weighted_gradient`)",
     "inverse_dx": "a gradient against a weighted operand's transpose, `dw (k b exp(gc))^T`",
     "inverse_l": "the inverse's gradient through the inverse, `L^T dX L^T`",
-    "keys_dl": "the system's gradient against the keys, `dL k`, `dL^T (k b)`, and `k k^T`",
+    "keys_dl": "the system's gradient against the keys, `dL k`, and the keys against themselves, `k k^T`",
+    "keys_dlt": "the system's gradient, its rows scaled by the write gates, transposed against the keys",
     "summed": "a decay's range terms against a triangle or the identity, each token's sum (`summed_back`)",
 }
 """The algebra's products by name. A decay a key dimension weighs each term of `intra`'s and `scores`'
@@ -732,14 +733,15 @@ def weighted_gradient(lower, keys: Load, columns: int, values: Load, blocks: int
     d_x = transposed_inverse(d_x)
     column_gate, column_low = (gate, low) if laid is None else laid
     d_l = jnp.where(strict, -d_x * decayed(gate, low, column_gate, column_low), 0.0).astype(dtype)
+    weighted_l = (d_l.astype(jnp.float32) * beta[:, None]).astype(dtype)
     products, key_grads = 0.0, []
     for c in range(columns):
         key = keys(c)
         products = products + issue("keys_dl", key, key.T)
         d_key = issue("keys_dl", d_l, key)
-        weighted_key = (key.value().astype(jnp.float32) * beta[:, None]).astype(dtype)
+        # `dL^T (k beta)` as `(beta dL)^T k`: one operand in registers, the keys a tile.
         key_grads.append(through_w[c] * (decay * beta)[:, None] + d_key * beta[:, None]
-                         + issue("keys_dl", Transposed(d_l), weighted_key))
+                         + issue("keys_dlt", Transposed(weighted_l), key))
         d_beta = d_beta + jnp.sum(d_key * key.value().astype(jnp.float32), axis=1)
     pairs = d_l.astype(jnp.float32) * (products * beta[:, None])
     return key_grads, value_grads, d_beta, (pairs, d_gate)
