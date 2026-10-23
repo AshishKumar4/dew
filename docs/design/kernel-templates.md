@@ -109,15 +109,16 @@ Measured on an H100 at qwen3-8b and gpt-oss-20b shapes, 4k and 32k tokens, the a
 The update is `S' = T·S·E + W`, with the transitions as values.
 
 **Functions.**
-- `decays(g, resets) -> pairs`: difference-first within a sub-chunk of 16, factored across sub-chunks. The factorization is chosen statically from the decay parameterization's declared range bound, because it is exact only within fp32's exponent range.
+- `decays(g, resets) -> pairs`: the log decay cumulated as a compensated pair (hi, lo), and each pair of positions' decay the exponential of its difference's two halves, each: an exponent rounded to one fp32 loses up to half its ulp, which put the decay's and the write gate's gradients under aligned keys 1.6 to 2.1 times the reference's distance from float64. A kernel takes a base-2 exponent as its fraction's exp2 times its integer's exact power of two (`recurrence_algebra.raised`, `decayed`). The decay from a chunk's start takes both halves too. No factoring across sub-chunks: the KDA port's factored intra backward put the decay gradient at its -5 floor 468 times the reference's.
 - `intra(q, k, beta, pairs, erase=(a, b)) -> (A_kk, A_qk)`, one pass for both the solve and the readout. Untied erase vectors (RWKV7, GDN-2, Comba) are `erase=(a, b)`; tied ones pass k twice. `pairs` carries the value side too, for two-sided decay (GLA value gates), and `carry` and `readout` apply E.
 - `factor(A_kk) -> L`: the triangular factorization (WY/UT). It is statically skipped for identity-inverse families (SSD, GLA, RetNet), which skip only the inverse, not their writes.
 - `normalize(o, groups)`: Mamba2's grouped output norm across heads. It is a cross-head reduction, so it is algebra, not a hook.
 - `apply(L, k, v, beta, g) -> (W, U)`: W = L·(kβ·exp(g)) and U = L·(vβ), as fla_gdn's `_w_u_kernel` computes them. Changing v changes U and not L.
-- `carry(S, W, U) -> (S', v_new)`.
-- `readout(q, S, A_qk, v_new) -> o`.
+- `carry(S, W, U) -> (S', v_new)`, the chunk's last real token's write by the token update itself (the WY write alone put the final memory under aligned keys 1.54 to 1.57 times the reference's distance).
+- `readout(q, S, A_qk, v_new) -> o`, whose gradient in the memory and the corrected values sums the chunk's tokens from its last, the smallest terms first (`remembered`): from the first, the initial memory's gradient sat 1.8 to 1.9 times the reference's.
 - `compose`: a chunk's transition as the factored triple (T, E, W), composed associatively by (T₂T₁, E₁E₂, T₂W₁E₂ + W₂). It serves sequence and context parallelism and parallel state passing at small B·H. Its cost comes from its actual products: T₂T₁, E₁E₂, T₂W₁ and its product with E₂, the write addition, and their bytes. Where transitions or writes are diagonal or low-rank, the factors simplify. Compose is used only where that cost measures below the sequential carry.
-- Each function's backward, with its rounding and order stated: the decay's summed-back gradient, and the GVA sum as an in-program loop.
+- Each function's backward, with its rounding and order stated: the delta rule's is the recurrence's own adjoint a token at a time within every chunk at once (memories checkpointed every 16 tokens, chunks in groups of 16), where differentiating the WY products cancelled independently rounded paths under aligned keys (the decay's gradient 1.9 to 2.9 times the reference's, now 0.99 to 1.07); the GVA sum as an in-program loop.
+- The chunk length: at most twice the keys' width (`held_chunk`), a measured policy (64-token chunks of 16-wide keys lost 1.7 to 1.8 times over a long sequence).
 
 **Transition values:**
 - T in two parts, in a stated order: the diagonal decay kind (none, scalar, per-key, per-value, two-sided, separable) times the erase kind (identity plus low rank, or additive DPLR). It has independent erase, write and read vectors.
@@ -371,7 +372,7 @@ Built in parallel. Each piece lands when it meets its gates: the accuracy gate (
 
 **Then the rungs:**
 - **Toolkit and attention:** sm90 attention reaching Tokamax Mosaic, then FA3; the decode mainloop; the fused ticket backward.
-- **Recurrence:** the one chunk algebra absorbing the four ports, then FlashQLA's fused launch DAG and `compose`.
+- **Recurrence:** one Mosaic GPU mainloop skeleton over the chunk algebra for every variant (GDN, KDA, the delta rule, gated writes, SSD), on the mma.sync and wgmma Family bundles, keeping the ports' optimizations (the fused solve, the launch DAG, chunk sizing); then FlashQLA's fused launch DAG and `compose`. The four ports (`fla_gdn`, `fla_kda`, `mamba_ssd`, the TPU `ssd`) are frozen references until each cell matches or beats them.
 - **GEMM and the choice layer:** the M-split, register-A cooperative mainloop and the reduce pass before norm and SwiGLU fusion, then split-K for dW, then CUTLASS's rungs; the analytic features, the logging and the ranker.
 
 GPU time is reserved daily on an H100 and an A100 for the rungs.
@@ -625,6 +626,8 @@ Each ⚑ in the tables above is closed by the matching item below.
 
 Notation: `S' = T·S·E + W` with S of shape K×V per value head. "Values" are §3's transition values, "hooks" are §4's traced callables, "structure" is §5's, and "DAG" is §6's mainloop parameter (fused/split solve; sequential/parallel carry). A row the design's signatures cannot express is marked **⚠ signature**.
 
+Every family below runs on one Mosaic mainloop skeleton per overlap structure (§6), its Family bundle per architecture, the math only in the chunk algebra. The ports a row names (`fla_gdn`, `fla_kda`, `mamba_ssd`, the TPU `ssd`, `short_conv`) stay production routes and speed references, unmaintained, until the row's cell on each family matches or beats them in time and memory with the gate passing; a deletion below happens in that head. Progress is the coverage matrix (§0): rows these families and consumers, columns sm80, sm90 and TPU.
+
 ### Table 1: families → template
 
 | Family (models) | Transition values | Hooks (kind) | Structure | DAG / mainloop | Signatures it exercises | Status |
@@ -646,7 +649,7 @@ Notation: `S' = T·S·E + W` with S of shape K×V per value head. "Values" are �
 | Decode (T=1, all R rows) | the same transition values | the same hooks, inlined (today's `recurrence.step`) | paused rows (`active`), conv history, bf16 state rounding | decode mainloop: one launch per token | definitional token update | covered (exists) |
 | Sequence/context parallel, chunked prefill | — | — | shard boundaries | `compose` (the design) | compose over (T, E, W) | covered; for the delta rule T is K×K dense — cost measured per §3 |
 
-### Table 2: consumers → op, contracts to keep, deletion enabled
+### Table 2: consumers → op, contracts to keep, deletion enabled (when the row's cells meet the port)
 
 | Consumer (today) | Op it becomes | Contracts it must keep | Deletion it enables |
 |---|---|---|---|
