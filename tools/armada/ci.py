@@ -110,7 +110,8 @@ session = _beside("session")
 r2 = _beside("r2")
 SETTLE = 30.0
 """Seconds a task's process group has, after SIGKILL, to be reaped and gone: inside armada's own timeout
-with the default deadline and grace (1680 + 60 + 30 + the reader's 10 < .armada.json's 1800)."""
+with the default deadline and grace (session.DEADLINE + session.GRACE + 30 + the reader's 10 < .armada.json's
+1800)."""
 
 REPO = Path(__file__).resolve().parents[2]
 _CLASSIFIERS = tomllib.loads((REPO / "pyproject.toml").read_text())["project"]["classifiers"]
@@ -162,8 +163,7 @@ SHARED = ("pyproject.toml", "constraints.txt", ".armada.json", "tools/armada/ses
 builds its environment from its CUDA lock) and the environment's own inputs, which .armada.json
 names (`environment_files`): what every test process runs or reads, the session it runs in, the
 process group it runs as and the plugins loaded into it among them. The plan's own code (this file)
-runs outside the tests; what of it reaches a task's pytest, its arguments, environment and deadline,
-is keyed as `tested` runs it, so a change to the rest reruns none of them."""
+runs outside the tests, so a change to it reruns none of them."""
 
 
 def environment_files() -> list[str]:
@@ -545,7 +545,7 @@ def apportioned(own_seconds: Mapping[str, float], wall: float, rows: int) -> dic
 
 
 def task(python: str, tests: list[str], split: str, out: Path, deadline: float, cache: bool = True,
-         grace: float = 60.0, coverage: Path | None = None) -> int:
+         grace: float = session.GRACE, coverage: Path | None = None) -> int:
     """Run `tests` and write one verdict row a file, interrupting them past `deadline` seconds, killing
     their process group `grace` seconds after that, and giving it `SETTLE` seconds to be gone.
 
@@ -560,13 +560,8 @@ def task(python: str, tests: list[str], split: str, out: Path, deadline: float, 
 
 def tested(python: str, tests: list[str], split: str, out: Path, deadline: float, cache: bool, grace: float,
            common: str, environ: Mapping[str, str], coverage: Path | None = None) -> int:
-    """`task` on the inputs `common` hashes, its pytest under `environ` beside this process's. What this
-    process gives pytest beyond the session (`environ`, the deadline and grace it runs under, coverage) is
-    keyed with them, so a row recorded under other terms is not reused."""
+    """`task` on the inputs `common` hashes, its pytest under `environ` beside this process's."""
     began = time.monotonic()
-    terms = json.dumps({"environ": dict(environ), "deadline": deadline, "grace": grace,
-                        "coverage": coverage is not None}, sort_keys=True)
-    common = hashlib.sha256(f"{common}\n{terms}".encode()).hexdigest()
     rows = [found for name in tests if cache and (found := reused(python, name, split, common))]
     tests = [name for name in tests if row(python, name, split) not in {found["name"] for found in rows}]
     if rows:
@@ -1050,7 +1045,7 @@ def main() -> int:
     running.add_argument(
         "--cache", choices=("on", "off"), required=True,
         help="whether a file that ran green on these inputs is reused (the plan's DEW_TEST_CACHE)")
-    running.add_argument("--deadline", type=float, default=1680.0,
+    running.add_argument("--deadline", type=float, default=session.DEADLINE,
                          help="seconds before armada's own task timeout (.armada.json) to interrupt at")
     running.add_argument("--coverage", type=Path, default=None,
                          help="run the files under coverage.py, its data file in this directory")
