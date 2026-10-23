@@ -258,7 +258,8 @@ def exact_power2(k: jax.Array) -> jax.Array:
     which XLA computes as `exp(k ln 2)`, inexactly, and whose products it fuses into one `exp` of their
     sum (its algebraic simplifier's `exp(a) exp(b) -> exp(a + b)`), past fp32's range where each factor
     is in it."""
-    bits = jax.lax.shift_left(jnp.asarray(k, jnp.float32).astype(jnp.int32) + 127, 23)
+    biased = jnp.asarray(k, jnp.float32).astype(jnp.int32) + jnp.int32(127)
+    bits = jax.lax.shift_left(biased, jnp.full_like(biased, 23))
     return jax.lax.bitcast_convert_type(bits, jnp.float32)
 
 
