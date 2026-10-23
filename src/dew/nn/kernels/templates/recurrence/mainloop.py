@@ -184,12 +184,6 @@ def _diagonal(size: int) -> jax.Array:
     return FAMILY.iota(shape, 0) == FAMILY.iota(shape, 1)
 
 
-def _down(vector: jax.Array) -> jax.Array:
-    """A row's vector laid as a column's: its diagonal's column sums, exactly. Two loads of one view in the
-    two layouts are one load to Mosaic GPU's layout inference, which then finds none for it."""
-    return jnp.sum(jnp.where(_diagonal(vector.shape[0]), vector[:, None], 0.0), axis=0)
-
-
 @dataclasses.dataclass(frozen=True)
 class _Operand:
     """A launch's operand in global memory, `[parts * rows, columns]`: its parts (`_split`) stacked `rows`
@@ -620,7 +614,8 @@ def _output(q, k, h, corrected, hi, lo, taken, call: _Call, tiles: Tiles, *, sca
     width, value_width, bv, gates = call.width, call.value_width, tiles.block_v, call.gates
     held, memories = dataclasses.replace(call.held, rows=call.rows), call.memories
 
-    def program(q_ref, k_ref, h_ref, v_ref, hi_ref, lo_ref, taken_ref, o_ref, *, streams, staging):
+    def program(q_ref, k_ref, h_ref, v_ref, hi_ref, lo_ref, column_hi_ref, column_lo_ref, taken_ref, o_ref, *,
+                streams, staging):
         j, n, h = lax.axis_index("blocks"), lax.axis_index("chunks"), lax.axis_index("heads")
         row, span = n * CHUNK, pl.ds(n * CHUNK, CHUNK)
         (staged,) = staging
@@ -658,7 +653,8 @@ def _output(q, k, h, corrected, hi, lo, taken, call: _Call, tiles: Tiles, *, sca
                 out = algebra.chunk_output(
                     functools.partial(block, "queries", call.given), entered,
                     functools.partial(block, "keys", call.given), width // BLOCK, gate, low, value, scale,
-                    _Issuer({"local": staged}), laid=(_down(gate), _down(low)))
+                    _Issuer({"local": staged}), laid=(FAMILY.columns_of(column_hi_ref.at[h, span]),
+                                                      FAMILY.columns_of(column_lo_ref.at[h, span])))
             o_ref.at[span, pl.ds(h * value_width + j * bv, bv)][...] = out.astype(o_ref.dtype)
             return carry, accumulators
 
@@ -674,10 +670,11 @@ def _output(q, k, h, corrected, hi, lo, taken, call: _Call, tiles: Tiles, *, sca
     blocks = _streamed(queries=((CHUNK, width), call.given), entered=((width, bv), memories),
                        values=((CHUNK, bv), held), **given)
     out_type = jax.ShapeDtypeStruct((call.rows, call.heads * value_width), out_dtype)
+    # The prefix twice, as the solve's.
     return _kernel(program, call, out_type=out_type, grid=(value_width // bv, call.chunks, call.heads),
                    grid_names=("blocks", "chunks", "heads"), blocks=blocks, stages=1,
                    staging=_staging(held, (CHUNK, BLOCK)))(q, k if scores is None else scores, h, corrected,
-                                                           hi, lo, taken)
+                                                           hi, lo, hi, lo, taken)
 
 
 def prefix(g):
