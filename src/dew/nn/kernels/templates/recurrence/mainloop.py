@@ -63,15 +63,14 @@ PARTS = 3
 
 @dataclasses.dataclass(frozen=True)
 class Tiles:
-    """A forward's tiles: the value block the states launch splits the values into (`block_v`), the chunks it
-    has in flight (`stages`), and the output launch's value block (`output_v`)."""
+    """A forward's tiles: the value block the states and output launches split the values into (`block_v`), and
+    the chunks the states launch has in flight (`stages`)."""
 
     block_v: int
     stages: int
-    output_v: int
 
 
-DEFAULT = {1: Tiles(64, 2, 128), PARTS: Tiles(32, 1, 32)}
+DEFAULT = {1: Tiles(64, 2), PARTS: Tiles(32, 1)}
 """The tiles by the parts an operand takes: an fp32 call's three hold one chunk in flight, 32 values wide, so
 the states and output launches' tiles at 128-wide keys fit an A100's block (163 KB of shared memory)."""
 
@@ -583,8 +582,7 @@ def _output(q, k, h, corrected, hi, lo, taken, call: _Call, tiles: Tiles, *, sca
     """Each chunk's output `[R, HV * Dv]` in `out_dtype`: under a decay a head its own pairs' scores
     (`algebra.chunk_output`), under one a key dimension the intra launch's (`scores`, `_intra`;
     `algebra.key_decayed_output`)."""
-    width, value_width, gates = call.width, call.value_width, call.gates
-    bv = min(tiles.output_v, value_width)
+    width, value_width, bv, gates = call.width, call.value_width, tiles.block_v, call.gates
     held, memories = dataclasses.replace(call.held, rows=call.rows), call.memories
 
     def program(q_ref, k_ref, h_ref, v_ref, hi_ref, lo_ref, taken_ref, o_ref, *, streams, staging):
