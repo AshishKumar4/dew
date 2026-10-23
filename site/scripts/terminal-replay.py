@@ -118,7 +118,7 @@ def main() -> None:
                                       "rows": max(len(frame["screen"]) for frame in replay["frames"]),
                                       "source_rows": replay["source_rows"], "viewer_rows": replay["viewer_rows"],
                                       "replay": "/hero/train.json"}}
-    (DATA / "capture.json").write_text(json.dumps(capture, indent="\t") + "\n")
+    (cells.SITE / cells.recordings()["hero"][0]).write_text(json.dumps(capture, indent="\t") + "\n")
     (DATA / "hero.py").write_text(options.script.read_text())
     print(f"prepared {len(replay['frames'])} frames from {replay['seconds']:.1f} s of recording")
 

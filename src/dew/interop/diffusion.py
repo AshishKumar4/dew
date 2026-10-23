@@ -212,15 +212,16 @@ def _unet_path(name: str, rank: int) -> tuple[str, ...]:
             else:
                 raise ValueError(f"Unknown UNet attention tensor {name}")
         elif kind == "ff":
+            # diffusers' GEGLU projection, the up half first, and its output map
+            # (`dew.nn.mlp.geglu_feed_forward`).
             path.append("feed_forward")
-            if parts[:2] == ["net", "0"]:
-                path.append("net_0")
-                parts = parts[2:]
+            if parts == ["net", "0", "proj"]:
+                path.append("gate_up_proj")
             elif parts == ["net", "2"]:
-                path.append("net_2")
-                parts = []
+                path.append("down_proj")
             else:
                 raise ValueError(f"Unknown UNet feed-forward tensor {name}")
+            parts = []
         elif kind in ("norm1", "norm2", "norm3"):
             path.append({"norm1": "self_norm", "norm2": "cross_norm", "norm3": "ff_norm"}[kind])
         else:
