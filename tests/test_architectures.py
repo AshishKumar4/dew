@@ -565,9 +565,6 @@ def test_architecture_trains_on_every_layout_as_on_one_device(case, tmp_path):
     AltUp's router cancel, so a whole step's float32 error has a tail no seed
     count resolves, and those pieces are held over the same layouts on their
     own (`test_gemma3n_selecting_pieces_compute_on_every_layout_as_on_one_device`)."""
-    sparsities = case.config.get("activation_sparsity_pattern")
-    if sparsities is not None and any(sparsities):
-        case = replace(case, config={**case.config, "activation_sparsity_pattern": (0.0,) * len(sparsities)})
     trainer, encoder = make_trainer(case, tmp_path / "initial", 1, devices=1)
     initial = trainer.initial_state()
 
