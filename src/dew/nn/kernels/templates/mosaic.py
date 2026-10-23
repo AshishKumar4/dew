@@ -367,6 +367,12 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
         """Each of `parts` written whole to its view of `views`, through `smem` where the family stores so."""
 
     @abc.abstractmethod
+    def added(self, value: jax.Array, view, interpret: bool, *, smem) -> None:
+        """`value` added into its view (fp32, in global memory) through `smem`, atomically against every
+        other role's adds into it; interpreted, a read and a write of the view, atomic against other
+        programs' alone (the interpreter runs a program's roles at once and a grid's programs in turn)."""
+
+    @abc.abstractmethod
     def held(self, ref: Ref) -> Operand:
         """An operand every step reads (`ref`, in shared memory) where the family keeps it: shared memory,
         or registers."""
@@ -484,7 +490,20 @@ class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
         loaded(copies)
 
     def stored(self, parts, views, *, smem) -> None:
+        # An add still reading `smem` (`added`) done first.
+        plgpu.wait_smem_to_gmem(0, wait_read_only=True)
         stored(parts, views, smem=smem)
+
+    def added(self, value: jax.Array, view, interpret: bool, *, smem) -> None:
+        if interpret:
+            # Mosaic GPU's interpreter (jax 0.11.2) takes no TMA reduction.
+            view[...] = view[...] + value
+            return
+        # A TMA reduce from `smem`, the previous add's reads of it done first; its writes go on.
+        plgpu.wait_smem_to_gmem(0, wait_read_only=True)
+        smem[...] = value
+        plgpu.commit_smem()
+        plgpu.copy_smem_to_gmem(smem, view, reduction_op="add")
 
     def held(self, ref: Ref) -> Operand:
         return ref
