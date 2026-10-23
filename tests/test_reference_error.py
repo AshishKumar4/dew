@@ -886,7 +886,7 @@ def test_the_procedure_before_the_two_stages_draws_again_as_it_did():
         def drawn(start, stop):
             count = stop - start
             return _Draws(["leaf"], np.full((count, 1), dew), np.ones((count, 1)), np.zeros((count, 1, 2)),
-                          np.zeros((count, 1), int), np.full((count, 1), np.isfinite(dew)))
+                          np.zeros((count, 1), int), np.full((count, 1), np.isfinite(dew)), (0,))
         return drawn
 
     with np.errstate(invalid="ignore"):
