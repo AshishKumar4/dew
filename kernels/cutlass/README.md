@@ -4,11 +4,10 @@ CUTLASS's grouped GEMMs for JAX, built for [Dew](https://github.com/AshishKumar4
 (BSD-3) as a library with no Python ABI that registers XLA FFI targets with JAX. Dew's mixture-of-experts layers
 run them on NVIDIA GPUs where the accuracy gate and the timings show them the better route.
 
-There is one wheel for each CUDA major of your jax, for Linux x86_64 and any Python from 3.11, from Dew's
-package index:
+There is one wheel for each CUDA major of your jax, for Linux x86_64 and any Python from 3.11:
 
-    pip install dew-cutlass-cu12 --extra-index-url https://pypi.dewml.dev/simple   # jax with jax-cuda12-plugin
-    pip install dew-cutlass-cu13 --extra-index-url https://pypi.dewml.dev/simple   # jax with jax-cuda13-plugin
+    pip install dew-cutlass-cu12   # jax with jax-cuda12-plugin
+    pip install dew-cutlass-cu13   # jax with jax-cuda13-plugin
 
 The wheel ships no CUDA runtime: it needs a CUDA build of JAX of the same major in the same environment
 (`jax[cuda12]` or `jax[cuda13]`), whose libcudart it loads. It holds code for sm80 (every compute capability
