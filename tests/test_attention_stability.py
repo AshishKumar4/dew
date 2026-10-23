@@ -697,7 +697,7 @@ def _mainloops(family: Family, options: dict) -> dict[str, Callable]:
     """Each template mainloop as `(query, key, value, extra) -> out` at the form `options` names (`ACCURATE`,
     or none for the default), its derivative the mainloop's own backward, the sinks' or resumed state's
     gradient through the softmax's initial state."""
-    forward_options = {name: value for name, value in options.items() if name == "natural"}
+    forward_options = {name: value for name, value in options.items() if name in ("natural", "scale")}
     tiles = {"block_q": 32, "block_k": 32, "pad": attention_triton.BLOCK}
 
     def mainloop(forward: Callable, backward: Callable) -> Callable:
@@ -814,6 +814,30 @@ def test_a_resumed_state_of_large_values_under_the_folds_guard_is_finite():
     for name, found in (("reference", reference(query, key, value, state, dout)),
                         ("default", ours(query, key, value, state, dout))):
         assert all(np.isfinite(np.asarray(leaf, np.float32)).all() for leaf in jax.tree.leaves(found)), name
+
+
+@pytest.mark.parametrize("scale", [-1.0, -2.0, -0.75])
+def test_a_negative_scale_past_the_folds_reach_keeps_a_finite_logit_finite(scale):
+    """fp32, the default form, one query over one key at a negative scale of magnitude at least 1/log2(e), the
+    product such that the reference's logit is a finite -3e38 (-2.25e38 at -0.75), its one weight 1 and its
+    output the value. Folding log2(e) into such a scale takes the logit past fp32's largest to -inf and its
+    weight to NaN, so the fold bounds the factor's magnitude (`algebra.Forward.base2`) and such a call stays
+    natural. Each template mainloop's output is the value and its gradients are finite, as the
+    reference's are."""
+    family = Family(lambda seed: None, np.ones((1, 1, 1, 1), bool))
+
+    def first(fill, *shape):
+        return jnp.zeros(shape, jnp.float32).at[..., 0].set(fill)
+
+    product = 3e38 / abs(scale) if abs(scale) > 1 else 3e38
+    query, key, value, dout = (first(fill, 1, 1, 1, 16) for fill in (product, 1.0, 2.0, 1.0))
+    spans = template.spans(1, 1, 1)
+    _, pull = jax.vjp(lambda q, k, v: template.reference(q, k, v, spans, scale=scale), query, key, value)
+    assert all(np.isfinite(np.asarray(leaf)).all() for leaf in pull(dout)), "the reference's gradients"
+    for name, mainloop in _mainloops(family, {"scale": scale}).items():
+        out, *grads = jax.jit(with_gradients(mainloop))(query, key, value, None, dout)
+        np.testing.assert_array_equal(np.asarray(out), np.asarray(value), err_msg=name)
+        assert all(np.isfinite(np.asarray(leaf)).all() for leaf in grads[:3]), f"{name}'s gradients"
 
 
 DECODED = [(family, form) for family, form in FAMILY_RUNS
