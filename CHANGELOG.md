@@ -6,7 +6,8 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 ## Unreleased
 
 - Dew's fused kernels take their reverse mode through a `jax.experimental.hijax`
-  linear map instead of `linear_call`, which JAX deprecates. Their gradients
+  linear map instead of `linear_call`, which JAX's custom transposition
+  deprecates in favour of hijax (jax-ml/jax#41782). Their gradients
   still run the backward kernels, under a shard_map or a scan too, and an
   interpreted Mosaic kernel's gradient now runs under `jax.jit`.
 - The grouped GEMM's kernel gradient on Hopper streams its operand stages

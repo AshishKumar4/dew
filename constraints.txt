@@ -9,9 +9,7 @@
 # pool across GPUs with and without NVLink needs to keep the persistent
 # compilation cache; a Pallas Triton kernel's key without its source locations
 # (jax-ml/jax#41502, sent as jax-ml/jax#41777), which two checkouts need to
-# share one compiled kernel; and linear_call's batching rule, an all-unmapped
-# call left unmapped, and the JVP of its residuals and constants, which the
-# experts' fused SwiGLU route needs; and the device-to-host transfer guard held
+# share one compiled kernel; and the device-to-host transfer guard held
 # on a CPU array's implicit host read (float, item, np.asarray, its buffer) as
 # on an accelerator's copy, which a steady state's guard needs on the CPU suite
 # (tests/steady_state.py); and Pallas Triton's 16-bit float division and

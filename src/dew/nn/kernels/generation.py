@@ -663,19 +663,18 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable) ->
     return bounded
 
 
-def linear_map(apply: Callable, transpose: Callable, residuals, moving):
-    """`apply(residuals, moving)`, linear in `moving`, whose transpose is `transpose(residuals, cotangent)`
+def linear_map(apply: Callable, pullback: Callable, residuals, moving):
+    """`apply(residuals, moving)`, linear in `moving`, whose transpose is `pullback(residuals, cotangent)`
     (the cotangents of `moving`, a tree like it): one `jax.experimental.hijax.HiPrim`, so reverse mode
-    runs `transpose` whether it reaches the map through a vjp or through a jvp that a shard_map, a scan
+    runs `pullback` whether it reaches the map through a vjp or through a jvp that a shard_map, a scan
     or `jax.linear_transpose` transposes, and under `jax.vmap` too, where the map is one of `apply` and
-    `transpose` mapped over the batch. Its tangent is the map of the moving tangents plus `apply`'s own
-    derivative in `residuals` (a higher order's). What `jax.custom_derivatives.linear_call` did, which
-    JAX deprecates for hijax."""
+    `pullback` mapped over the batch. Its tangent is the map of the moving tangents plus `apply`'s own
+    derivative in `residuals` (a higher order's)."""
     import jax
 
     out_aval = jax.tree.map(jax.typeof, jax.eval_shape(apply, residuals, moving))
     in_avals = jax.tree.map(jax.typeof, (residuals, moving))
-    return _linear_primitive()(apply, transpose, in_avals, out_aval)(residuals, moving)
+    return _linear_primitive()(apply, pullback, in_avals, out_aval)(residuals, moving)
 
 
 @functools.cache
@@ -689,7 +688,7 @@ def _linear_primitive() -> type:
     def zero(leaf) -> bool:
         return isinstance(leaf, hijax.Zero)
 
-    def none_move(tangents) -> bool:
+    def all_zero(tangents) -> bool:
         return all(zero(leaf) for leaf in jax.tree.leaves(tangents, is_leaf=zero))
 
     def instantiated(tangents):
@@ -712,19 +711,21 @@ def _linear_primitive() -> type:
             return self.apply(residuals, moving)
 
         def transpose(self, cotangent, residuals, moving):
-            if none_move(cotangent):
+            if all_zero(cotangent):
                 return
             pulled = self.pullback(residuals, instantiated(cotangent))
-            jax.tree.map(lambda accum, value: isinstance(accum, hijax.GradAccum) and accum.accum(value),
-                         moving, pulled, is_leaf=lambda leaf: isinstance(leaf, hijax.GradAccum))
+            accums = jax.tree.leaves(moving, is_leaf=lambda leaf: isinstance(leaf, hijax.GradAccum))
+            for accum, value in zip(accums, jax.tree.leaves(pulled), strict=True):
+                if isinstance(accum, hijax.GradAccum):
+                    accum.accum(value)
 
         def jvp(self, primals, tangents):
             residuals, moving = primals
             d_residuals, d_moving = tangents
             terms = []
-            if not none_move(d_moving):
+            if not all_zero(d_moving):
                 terms.append(self(residuals, instantiated(d_moving)))
-            if not none_move(d_residuals):
+            if not all_zero(d_residuals):
                 terms.append(jax.jvp(lambda held: self.apply(held, moving), (residuals,),
                                      (instantiated(d_residuals),))[1])
             if not terms:
