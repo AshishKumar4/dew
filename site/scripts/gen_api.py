@@ -21,9 +21,12 @@ from __future__ import annotations
 
 import argparse
 import ast
+import functools
 import json
 import re
+import subprocess
 import sys
+import tempfile
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -708,9 +711,10 @@ def unresolved_chain(start: griffe.Object, path: list[str], home: dict[str, str]
     return None
 
 
-def load() -> griffe.Module:
-    """Load the package with its namespace subpackages, which griffe's finder skips."""
-    root = P.repo / "src"
+def load(root: Path | None = None) -> griffe.Module:
+    """Load the package with its namespace subpackages, which griffe's finder skips, from the source under
+    `root` (the repository's src/, or a commit's)."""
+    root = root or P.repo / "src"
     loader = griffe.GriffeLoader(search_paths=[str(root)])
     package = loader.load(P.package)
     for directory in sorted((root / P.package).rglob("*")):
@@ -826,10 +830,14 @@ def main() -> None:
     # Coverage: every module that declares __all__ has a page, and every exported
     # name and every name the docs import is documented.
     problems = undocumented(package, pages, home)
+    # A file shows the API as it is, or as the commit its install pins holds it (`pinned`).
+    shown = {file: (package, pages, home) if (commit := pinned(path)) is None else at_commit(commit)
+             for file, path in usage_files()}
     for file, module_path, name in usage_imports():
+        shown_package, shown_pages, shown_home = shown[file]
         try:
-            module = (module_of(package, module_path) if module_path == P.package
-                      else module_at(package, module_path))
+            module = (module_of(shown_package, module_path) if module_path == P.package
+                      else module_at(shown_package, module_path))
             member = module.members.get(name)
             if member is None:
                 problems.append(f"{file}: `from {module_path} import {name}`: {module_path} has no {name}")
@@ -839,14 +847,14 @@ def main() -> None:
             problems.append(f"{file}: `from {module_path} import {name}`: {error}")
             continue
         if target.is_module:
-            if name in target.members and target.path + "." + name in home:
+            if name in target.members and target.path + "." + name in shown_home:
                 continue
-            if target.path not in pages:
+            if target.path not in shown_pages:
                 problems.append(f"{file}: imports the module {target.path}, which has no API page")
-        elif target.path not in home:
+        elif target.path not in shown_home:
             problems.append(f"{file}: imports {module_path}.{name} ({target.path}), which no API page documents")
     for file, path in usage_files():
-        problems.extend(f"{file}: {problem}" for problem in unresolved_in(file, path, package, pages, home))
+        problems.extend(f"{file}: {problem}" for problem in unresolved_in(file, path, *shown[file]))
     if problems:
         print("gen_api: the API reference does not cover what is public:", file=sys.stderr)
         for problem in sorted(set(problems)):
@@ -914,6 +922,37 @@ def main() -> None:
     (generated / "api-index.json").write_text(json.dumps(linker.by_path, indent=1, sort_keys=True) + "\n")
     count = sum(1 for path in P.pages for entry in pages[path].entries if home[entry.canonical] == path)
     print(f"gen_api: {len(P.pages)} pages, {count} objects documented")
+
+
+PINNED = re.compile(r"@ git\+\S+@([0-9a-f]{7,40})\b")
+"""An install of the package pinned to a commit: `pip install "dewml @ git+https://...@<commit>"`."""
+
+
+def pinned(path: Path) -> str | None:
+    """The commit a notebook's install pins it to, which the API it shows is that commit's; None for one
+    that installs the package as it is."""
+    if path.suffix != ".ipynb":
+        return None
+    for cell in json.loads(path.read_text())["cells"]:
+        if cell["cell_type"] == "code" and (found := PINNED.search("".join(cell["source"]))):
+            return found[1]
+    return None
+
+
+@functools.cache
+def at_commit(commit: str) -> tuple[griffe.Module, dict[str, Page], dict[str, str]]:
+    """The package's API at `commit`, read from that commit's source as `load` reads the checkout's, each
+    module its own page: a file pinned there may use any name that commit held, whatever pages the API's
+    reference has now."""
+    archive = subprocess.run(["git", "-C", str(P.repo), "archive", commit, "src"], check=True,
+                             capture_output=True).stdout
+    with tempfile.TemporaryDirectory() as root:
+        subprocess.run(["tar", "-x", "-C", root], input=archive, check=True)
+        package = load(Path(root) / "src")
+    modules = list(iter_modules(package))
+    pages = {module.path: Page(module, list(public_entries(module))) for module in modules}
+    home = {entry.canonical: path for path, page in pages.items() for entry in page.entries}
+    return package, pages, home
 
 
 def iter_modules(module: griffe.Module) -> Iterator[griffe.Module]:
