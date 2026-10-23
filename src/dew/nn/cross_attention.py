@@ -56,9 +56,12 @@ from .sharding import HEADS, KV_HEADS, constrain
 NAME = "cross_attention"
 """The module name of a decoder layer's cross-attention block, in every collection."""
 
-CROSS_KEY, CROSS_VALUE, CROSS_LENGTHS = "cross_key", "cross_value", "cross_lengths"
-"""The cache variables of the context a cached call keeps: its keys and values,
-`[rows, context_length, kv_heads, head_dim]`, and each row's real tokens, `[rows]`."""
+CROSS_KEY = "cross_key"
+"""The cache variable of a cached call's context keys, `[rows, context_length, kv_heads, head_dim]`."""
+CROSS_VALUE = "cross_value"
+"""The cache variable of a cached call's context values, shaped as its keys."""
+CROSS_LENGTHS = "cross_lengths"
+"""The cache variable of each row's real context tokens, `[rows]`."""
 CROSS_CACHE = frozenset({CROSS_KEY, CROSS_VALUE, CROSS_LENGTHS})
 
 
@@ -156,7 +159,7 @@ class GatedCrossAttention(nn.Module):
         read = read or (lambda held: held)
         x = read(stream)
         if context is None and self.is_initializing():
-            # Init reaches every parameter, the key and value maps' through a one-token context.
+            # Without a context the key and value maps never run, and init would declare none of theirs.
             context = CrossContext(jnp.zeros((x.shape[0], 1, self.context_features), x.dtype),
                                    jnp.ones(x.shape[:1], jnp.int32))
         if decode:
