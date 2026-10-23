@@ -76,13 +76,22 @@ class DecisionModel:
                                           attention_key_positions=inputs.positions, method="hidden_states",
                                           conditioning=conditioning, rngs=rngs))
 
+    @property
+    def context_length(self) -> int | None:
+        """The most context tokens a row carries: the backbone's cross-attention's (`CrossAttending`),
+        or None for a backbone that reads no context."""
+        if not isinstance(self.backbone, CrossAttending) or self.backbone.cross_attention is None:
+            return None
+        return self.backbone.cross_attention.context_length
+
     def conditioning(self, backbone: Variables, inputs: DecisionInputs) -> dict[str, jax.Array]:
         """The conditioning a backbone's cross-attention reads for rows that carry a context: each
         row's context tokens embedded by the backbone's own table (`token_embeddings`), at the
         width and dtype its blocks take them in (`CrossAttending`), and how many are real."""
-        if not isinstance(self.backbone, CrossAttending) or self.backbone.cross_attention is None:
+        if self.context_length is None:
             raise TypeError(f"rows carry a context, which a {type(self.backbone).__name__} without "
                             "cross-attention layers does not read")
+        assert isinstance(self.backbone, CrossAttending)
         assert inputs.context_lengths is not None, "a row's context comes with its length"
         context = self.backbone.apply(backbone, inputs.context, method="token_embeddings")
         return {CONTEXT: jnp.asarray(context, self.backbone.context_dtype),

@@ -602,12 +602,8 @@ class DecisionObjective(Objective[Ratio]):
 
     @property
     def context_length(self) -> int | None:
-        """The most context tokens a row carries: the backbone's cross-attention's (`CrossAttending`),
-        or None for a backbone that reads no context."""
-        backbone = self.model.backbone
-        if not isinstance(backbone, CrossAttending) or backbone.cross_attention is None:
-            return None
-        return backbone.cross_attention.context_length
+        """The most context tokens a row carries (`DecisionModel.context_length`)."""
+        return self.model.context_length
 
     @functools.cached_property
     def bounds(self) -> Bounds:

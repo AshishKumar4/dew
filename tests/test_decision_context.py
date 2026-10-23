@@ -84,7 +84,7 @@ def test_a_conditioned_run_logs_its_training_work_and_serves_with_its_context():
     context in it (`test_the_context_layers_work_is_counted_in_a_conditioned_batch`), and the run's
     task answers a request with its context."""
     objective = conditioned()
-    data = decision_rows(examples(), 4, objective=objective.data())
+    data = decision_rows(examples(), 8, objective=objective.data())
     counted = [objective.training_flops(None, batch)
                for batch in itertools.islice(data.train(DataPartition()), 2)]
     tracker = RecordingTracker()
