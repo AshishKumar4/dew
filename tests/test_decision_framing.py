@@ -56,7 +56,12 @@ def assert_markup_is_its_own(tokenizer: HFTokenizer) -> None:
     for markup in CHATML:
         if markup not in vocabulary:
             assert markup not in text
-    assert JOINT_SYSTEM in text and text.rstrip().endswith(JOINT_PREFILL)
+    # The row opens with the framing's own tokens and closes with them (a tiny vocabulary reads the
+    # words as unknowns, so the tokens, not the text, are what holds).
+    opening = tokenizer.encode(f"{before}STATE:\n", add_special_tokens=False)
+    closing = tokenizer.encode("\n" + after, add_special_tokens=False)
+    assert list(row.tokens[:len(opening)]) == opening
+    assert list(row.tokens[-len(closing):]) == closing
 
 
 @pytest.mark.parametrize("name", sorted(LOCAL))
