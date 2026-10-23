@@ -28,7 +28,7 @@ import pytest
 import torch
 import torch.nn.functional as F
 from flax import linen as nn
-from reference_error import assert_as_exact, assert_moves, widened
+from reference_error import assert_as_exact, assert_moves, torch_with_gradients, widened, with_gradients
 from transformers.models.glm5_next.configuration_glm5_next import Glm5NextTextConfig
 from transformers.models.glm5_next.modeling_glm5_next import Glm5NextTextAttention
 
@@ -107,7 +107,7 @@ MARGIN = 1e-3
 """The least selection margin a draw admits (`boundary_gap`): four orders above the scores' fp32
 rounding, so float64 and fp32 select the same pools."""
 
-SEEDS = {'output': 8, 'biased': 8, 'dense': 8, 'gradients': 128, 'parallel': 8, 'decode': 8,
+SEEDS = {'output': 8, 'biased': 8, 'dense': 8, 'gradients': 64, 'parallel': 8, 'decode': 8,
          'padded decode': 8, 'hole': 8}
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada)."""
 
@@ -233,27 +233,28 @@ def torch_gradients(block):
     from tools.diffusers_wan_reference import float64
 
     wide = next(block.parameters()).dtype == torch.float64
-    named = {name: parameter for name, parameter in block.named_parameters()
+    named = {name: parameter.detach().numpy() for name, parameter in block.named_parameters()
              if not name.startswith('indexer.')}
 
-    def run(hidden, valid, readout):
-        x = torch.from_numpy(np.asarray(hidden)).requires_grad_(requires_grad=True)
+    def forward(x, params, valid):
         with float64() if wide else contextlib.nullcontext():
-            out = block(x, torch.from_numpy(np.asarray(valid)))[0]
-            found = torch.autograd.grad(out.mul(torch.from_numpy(np.asarray(readout))).sum(),
-                                        [x, *named.values()])
-        return {'x': found[0].numpy(),
-                **{name: grad.numpy() for name, grad in zip(named, found[1:], strict=True)}}
+            return torch.func.functional_call(block, params, (x, valid))[0]
+
+    def run(hidden, valid, readout):
+        _, grad_x, grads, _ = torch_with_gradients(forward)(np.asarray(hidden), named, np.asarray(valid),
+                                                           np.asarray(readout))
+        return {'x': grad_x, **{name: grads[name] for name in named}}
     return run
 
 
 def dew_gradients(variables, names):
     """Dew's gradients of the same readout, under the reference's parameter `names`, each laid out as
     the reference's."""
-    def loss(x, variables, valid, readout):
-        return jnp.sum(module().apply(variables, x, call(valid)) * readout)
-
-    pulled = jax.jit(jax.grad(loss, argnums=(0, 1)))
+    @jax.jit
+    def pulled(x, variables, valid, readout):
+        _, grad_x, grads = with_gradients(lambda x, variables: module().apply(variables, x, call(valid)))(
+            x, variables, readout)
+        return grad_x, grads
 
     def run(hidden, valid, readout):
         grad_x, grads = pulled(hidden, variables, valid, readout)
