@@ -27,8 +27,8 @@ from .activations import (
 from .blocks import normal_kernel
 from .flops import projection_flops
 from .joined import joined_dense, joins
-from .ngpt import NGPT, gain, unit
-from .precision import at_least_fp32, float32_dot_general, sqrt_or_zero
+from .ngpt import NGPT, gain
+from .precision import at_least_fp32, float32_dot_general, l2norm, sqrt_or_zero
 from .protocols import ProjectionGroup
 from .sharding import MLP_HIDDEN, constrain, logical_axes
 
@@ -198,14 +198,15 @@ class GatedMLP(nn.Module):
         return self._down(gated_product(activation, axes=MLP_HIDDEN)(gate, up), train)
 
     def _ngpt_hidden(self, ngpt: NGPT, gate, up, activation):
-        """nGPT's hidden activations: the gate and up projections times their gains in fp32, back
-        in their dtype, their gated product in fp32, unit-normed in the activations' dtype
-        (dory.py:188-194)."""
+        """nGPT's hidden activations: the gate and up projections times their gains in at least fp32,
+        back in their dtype, their gated product in at least fp32, unit-normed in the activations'
+        dtype (dory.py:188-194)."""
         factor = ngpt.hidden(self.out_features)
-        gate = (gate.astype(jnp.float32) * gain(self.suv_gate, factor)).astype(gate.dtype)
-        up = (up.astype(jnp.float32) * gain(self.suv_up, factor)).astype(up.dtype)
-        hidden = gated_product(activation, axes=MLP_HIDDEN)(gate.astype(jnp.float32), up.astype(jnp.float32))
-        return unit(hidden.astype(gate.dtype))
+        wide = at_least_fp32(jnp.result_type(gate, up))
+        gate = (gate.astype(wide) * gain(self.suv_gate, factor)).astype(gate.dtype)
+        up = (up.astype(wide) * gain(self.suv_up, factor)).astype(up.dtype)
+        hidden = gated_product(activation, axes=MLP_HIDDEN)(gate.astype(wide), up.astype(wide))
+        return l2norm(hidden.astype(gate.dtype))
 
     def _down(self, hidden, train: bool):
         hidden = self.dropout(hidden, deterministic=not train)

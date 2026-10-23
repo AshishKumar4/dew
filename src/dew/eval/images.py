@@ -24,14 +24,12 @@ from jax.typing import ArrayLike
 
 from dew.artifacts import ImageGrid, uint8_pixels
 from dew.nn.precision import accumulated
+from dew.nn.text_encoders import DEFAULT_MODEL as CLIP_CHECKPOINT
 from dew.objectives.base import Batch
 
 from .common import ImageMetric, metric_device
 
 _log = logging.getLogger(__name__)
-
-DEFAULT_MODEL = "openai/clip-vit-large-patch14"
-
 
 @functools.cache
 def _get_clip(modelname: str):
@@ -55,7 +53,7 @@ def _equal_counts(images: int, prompts: int) -> None:
                          "equal counts are required")
 
 
-def clip_image_features(images: ArrayLike, *, modelname: str = DEFAULT_MODEL) -> jax.Array:
+def clip_image_features(images: ArrayLike, *, modelname: str = CLIP_CHECKPOINT) -> jax.Array:
     """Return CLIP's image embedding [N, D] of uint8 [N, H, W, 3] images, unnormalized.
 
     The images go through the checkpoint's own processor, so the embeddings are
@@ -67,7 +65,7 @@ def clip_image_features(images: ArrayLike, *, modelname: str = DEFAULT_MODEL) ->
 
 
 def clip_image_text_cosine(images: ArrayLike, input_ids: ArrayLike, attention_mask: ArrayLike, *,
-                           modelname: str = DEFAULT_MODEL) -> jax.Array:
+                           modelname: str = CLIP_CHECKPOINT) -> jax.Array:
     """Return the per-image cosine between uint8 [N, H, W, 3] images and prompts."""
     model, _ = _get_clip(modelname)
     pixels = np.asarray(images)
@@ -103,7 +101,7 @@ class CLIPDistance(ImageMetric):
     report for a new run.
     """
 
-    def __init__(self, modelname: str = DEFAULT_MODEL, field: str = "text"):
+    def __init__(self, modelname: str = CLIP_CHECKPOINT, field: str = "text"):
         def measure(artifact, batch):
             return 1.0 - _artifact_cosine(artifact, batch, field, modelname)
 
@@ -118,7 +116,7 @@ class CLIPScore(ImageMetric):
     checkpoint.
     """
 
-    def __init__(self, modelname: str = DEFAULT_MODEL, field: str = 'text'):
+    def __init__(self, modelname: str = CLIP_CHECKPOINT, field: str = 'text'):
         def measure(artifact, batch):
             return _clip_score(_artifact_cosine(artifact, batch, field, self.modelname))
         super().__init__(name='clip_score', measure=measure)
