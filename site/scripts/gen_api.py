@@ -24,7 +24,7 @@ import ast
 import json
 import re
 import sys
-from collections.abc import Iterator, Mapping
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -555,18 +555,21 @@ INSTANCE = "<instance>"
 path, which no import's dotted path starts with."""
 
 
-def reached(package: griffe.Module, dotted: str) -> griffe.Object | None:
+def reached(package: griffe.Module, dotted: str,
+            follow: Callable[[griffe.Object | griffe.Alias], griffe.Object | None] = resolve
+            ) -> griffe.Object | None:
     """The Dew object an import's dotted path names, or None for another package's name or one Dew
-    does not have; an alias that does not resolve raises `Unresolved`."""
+    does not have, each member read through `follow`: `resolve`, where an alias that does not resolve
+    raises `Unresolved`, or `inside`, where one into another package is None."""
     head, *parts = dotted.split(".")
     if head != P.package:
         return None
-    current: griffe.Object = package
+    current: griffe.Object | None = package
     for part in parts:
         member = current.members.get(part)
-        if member is None:
+        current = None if member is None else follow(member)
+        if current is None:
             return None
-        current = resolve(member)
     return current
 
 
@@ -743,15 +746,12 @@ def load(root: Path | None = None) -> griffe.Module:
 def canonical(package: griffe.Module, dotted: str) -> str | None:
     """Where the package defines the name `dotted` (an import's path and the attributes after it), aliases
     followed (`reached`): an object's own path, or a keyword its owner takes (`Class.name`) under the owner's;
-    None for a name the package does not hold, or another package's, an alias to one included."""
-    try:
-        found = reached(package, dotted)
-        path, _, name = dotted.rpartition(".")
-        owner = reached(package, path) if found is None and path else None
-    except Unresolved:  # an alias whose target is another package's, which this model does not load
-        return None
+    None for a name the package does not hold, or another package's, an alias to one included (`inside`)."""
+    found = reached(package, dotted, inside)
     if found is not None:
         return found.path
+    path, _, name = dotted.rpartition(".")
+    owner = reached(package, path, inside) if path else None
     return f"{owner.path}.{name}" if owner is not None and name in keyword_names(owner) else None
 
 
