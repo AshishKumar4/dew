@@ -404,7 +404,7 @@ LAYOUT_SEEDS: dict[str, int] = {
     "unet": 128, "uvit": 128, "simple_udit": 64, "simple_dit": 64, "simple_mmdit": 64,
     "hierarchical_mmdit": 128, "hybrid_dit": 64, "video_dit": 64, "unet_3d": 128, "jepa_encoder": 128,
     "jepa_video_encoder": 256, "causal_transformer": 64, "causal_transformer+moe": 64,
-    "causal_transformer+gpt_oss": 256, "causal_transformer+deepseek_v2": 64,
+    "causal_transformer+gpt_oss": 256, "causal_transformer+deepseek_v2": 128,
     "causal_transformer+glm4_moe": 256, "causal_transformer+llama4": 32,
     "causal_transformer+gemma4_moe": 128, "causal_transformer+gemma3n": 64,
     "causal_transformer+mla": 64,
