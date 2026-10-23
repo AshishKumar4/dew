@@ -225,9 +225,11 @@ class GatedMLP(nn.Module):
         projection's, or both kernels joined per call where the generation
         measured that faster (`joins`), else None."""
         if self._packed():
-            gate_up = self.gate_up_proj(x).reshape(*x.shape[:-1], 2, self.hidden_features)
-            # The product reads the gate first (`packed_gated_product`).
-            return gate_up if self.packed_order[0] == 'gate_proj' else gate_up[..., ::-1, :]
+            # The product reads the gate first (`packed_gated_product`); an up-first projection is
+            # read apart, as its reference splits it.
+            if self.packed_order[0] != 'gate_proj':
+                return None
+            return self.gate_up_proj(x).reshape(*x.shape[:-1], 2, self.hidden_features)
         if joins('gate_up', (self.gate_proj, self.up_proj)):
             return joined_dense(x, (self.gate_proj, self.up_proj), axis=-2)
         return None
