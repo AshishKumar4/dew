@@ -34,6 +34,7 @@ from .sharding import (
     rows_spec,
     sequence_shards,
 )
+from .visibility import same_chunk, visible
 
 
 def _banded(x, before=None):
@@ -327,17 +328,14 @@ def _local_blocks(kernel, query, key, value, *, window, chunk, places, segment_i
         rows = offset + jnp.arange(blocks * span).reshape(1, blocks, span)
         key_rows = jnp.concatenate([rows - span, rows], axis=-1)
         keep = ((key_rows[..., None, :] >= 0)
-                & (key_rows[..., None, :] <= rows[..., :, None]))
-        if window is not None:
-            keep = keep & (rows[..., :, None] - key_rows[..., None, :] < window)
+                & visible(rows[..., :, None], key_rows[..., None, :], causal=True, window=window))
         keep = jnp.broadcast_to(keep, (batch, blocks, span, 2 * span))
         if chunk is not None and places is None:
-            keep = keep & (rows[..., :, None] // chunk == key_rows[..., None, :] // chunk)
+            keep = keep & same_chunk(rows[..., :, None], key_rows[..., None, :], chunk)
         elif chunk is not None:
-            places = row_blocks(places) // chunk
-            earlier = preceding(2)
-            keep = keep & (places[..., :, None] == _banded(
-                places, None if earlier is None else earlier // chunk)[..., None, :])
+            blocked = row_blocks(places)
+            keep = keep & same_chunk(blocked[..., :, None], _banded(blocked, preceding(2))[..., None, :],
+                                     chunk)
         if segment_ids is not None:
             segments = row_blocks(segment_ids)
             keep = keep & ((segments[..., :, None] == _banded(segments, preceding(3))[..., None, :])
