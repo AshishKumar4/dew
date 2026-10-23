@@ -206,6 +206,8 @@ Rule 0 applies: use Splash's MaskInfo, with its empty/partial/full classes and p
 - **Machine primitives, only where JAX has none:** layout-aware coordinates and row vectors; the promoted, scaled `mma`.
 - **The cost features (§7).**
 
+The Mosaic GPU toolkit is one module every template and family shares (`templates/mosaic.py`: the launch's warpgroup roles and register budgets, `Ring` streams of operand stages, their barriers, staging and stores), and an instruction family adds only its issue and layout facts in a module of its own (`templates/mosaic_sm90.py`: wgmma's products from shared memory or registers, in place into a warpgroup accumulator across a walk, and its accumulator's layouts; mma.sync's and tcgen05's alike). A ring's load is waited for once: a second wait on its barrier takes the next phase, so a slot already waited for is read through `Ring.at`.
+
 **Mainloop, per template per generation.** It is built from the toolkit and the algebra, and its parameters are configuration:
 - consumers;
 - cooperative (split M, so register-A prologues need no duplication) or ping-pong (the epilogue overlaps the next tile);
@@ -358,7 +360,7 @@ Built in parallel. Each piece lands when it meets its gates: the accuracy gate (
 4. The interpret-mode check 1 harness for every mainloop, on today's two forward forms.
 
 **Then the rungs:**
-- **Toolkit and attention:** sm90 attention reaching Tokamax Mosaic, then FA3; the decode mainloop; the fused ticket backward.
+- **Toolkit and attention:** sm90 attention reaching Tokamax Mosaic, then FA3; the decode mainloop; the fused ticket backward. The sm90 mainloop (`attention_mosaic.py`) holds the forward (full and causal calls, 16-bit operands, the fold and fp16's natural form, no hooks yet) and the backward in both forms (bf16, from the Triton training forward's split sums), both on par by check 1, interpreted and on an H100; on an H100 at llama-d128, causal bf16, 2 × 4096, its backward takes 2.63 ms in the fast form and 4.81 in the accurate one, against the Triton mainloop's 2.96 and 5.06 in the same session. It runs on no route yet: its forward's guards, hooks, the remaining call forms and its training forward come next.
 - **Recurrence:** the one chunk algebra absorbing the four ports, then FlashQLA's fused launch DAG and `compose`.
 - **GEMM and the choice layer:** the M-split, register-A cooperative mainloop and the reduce pass before norm and SwiGLU fusion, then split-K for dW, then CUTLASS's rungs; the analytic features, the logging and the ranker.
 
