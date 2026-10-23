@@ -40,7 +40,7 @@ import jax
 import jax.numpy as jnp
 from jax.custom_derivatives import linear_call
 
-from dew.nn.precision import compensated_add, compensated_difference, float32_einsum, float32_matmul
+from dew.nn.precision import compensated_add, float32_einsum, float32_matmul
 
 Issue = Callable[[str, jax.Array, jax.Array], jax.Array]
 """A mainloop's product: `issue(name, left, right)` is `left @ right` over the last two axes, the product
@@ -105,8 +105,10 @@ def decays(g, documents=None):
     The references subtract two fp32 cumulative sums, so every exponent
     carries the rounding of the chunk's whole accumulated magnitude, which
     exp turns into a relative error on every decay. Here the cumulative sum
-    is compensated (`compensated_add`) and the difference takes both
-    halves, so an exponent is as precise as its own range; `grown` takes
+    is compensated (`compensated_add`) and the difference is a `(whole, part)` pair too, exp taken of
+    each, so a decay is as precise as its own exponent: the difference rounded to one fp32 lost up to
+    half its ulp, which put the gradients of the decay and the write gate under aligned keys 1.6 to
+    2.1 times the token-by-token recurrence's distance from float64 on an A100; `grown` takes
     both halves too (`grown_from`), where exp of the rounded sum carried its
     rounding into the memory's decay and put the state's gradient near
     twice the reference's distance from float64. On
@@ -138,13 +140,13 @@ def decays(g, documents=None):
     inclusive = jnp.tril(jnp.ones((chunk_size, chunk_size), jnp.bool_))[..., None]
     if documents is not None:
         inclusive = inclusive & (documents[..., :, None, :] == documents[..., None, :, :])
-    diff = compensated_difference((hi[..., :, None, :], lo[..., :, None, :]),
-                                  (hi[..., None, :, :], lo[..., None, :, :]))
+    whole, part = compensated_add((hi[..., :, None, :], lo[..., :, None, :]),
+                                  (-hi[..., None, :, :], -lo[..., None, :, :]))
     # Masked before exp, as the references do. The unused positive
     # differences can overflow, and an outer where alone leaves 0 * inf in
     # the decay gradient.
-    diff = jnp.where(inclusive, diff, 0.0)
-    return grown_from(hi, lo, jnp.exp), jnp.where(inclusive, jnp.exp(diff), 0.0)
+    whole, part = (jnp.where(inclusive, x, 0.0) for x in (whole, part))
+    return grown_from(hi, lo, jnp.exp), jnp.where(inclusive, jnp.exp(whole) * jnp.exp(part), 0.0)
 
 
 def raised(whole, part):
