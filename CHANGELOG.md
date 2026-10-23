@@ -5,6 +5,8 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- `train/flops`, a step's analytical training work, is logged on every device,
+  CPU and TPU included; `train/mfu` still needs a device with a known peak.
 - `dew.figures` draws SVG figures for notebooks and docs. Their colors follow
   the page's light or dark theme (dewml.dev, Colab, JupyterLab, VS Code, and
   the system setting elsewhere), and their animations are CSS, so they play

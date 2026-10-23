@@ -1631,9 +1631,9 @@ class Trainer(Generic[Loss, Effects]):
             jax.devices()[0].device_kind, jax.process_count(), dict(mesh.shape),
             split_share(state.variables),
             seed=self.seed, tokens=plan.tokens)
-        # On a device with a known peak, the run counts its batches' work
-        # for train/mfu while they can be counted (`_counted_batch`).
-        self._count_work = gpu_target(started.device_kind).bf16_peak is not None
+        # The run counts its batches' work for train/flops, and train/mfu where the device has a known
+        # peak, while they can be counted (`_counted_batch`).
+        self._count_work = True
         self._refusal = None
         self._report(started, current)
         if plan.dataset.held_out:
@@ -2374,9 +2374,10 @@ class Trainer(Generic[Loss, Effects]):
 
         The FLOPs are the ones the compiler measured for each step's own
         shape; `flops` is None when a shape's measurement was unavailable.
-        train/mfu is the objective's analytical training work on real rows,
-        over the whole mesh's peak: 3*forward for full FT, explicit frozen/
-        trainable matrix work for PEFT. train/hfu keeps hardware HLO
+        train/flops is the objective's analytical training work on real rows a
+        step, over the whole mesh, on any device: 3*forward for full FT,
+        explicit frozen/trainable matrix work for PEFT. train/mfu is that work
+        over the whole mesh's peak, where the device's peak is known. train/hfu keeps hardware HLO
         work including remat; train/hlo_flops_util is the former HLO model
         count with recomputation removed (`StepFlops.utilizations`). No HLO
         count substitutes for MFU.
@@ -2404,8 +2405,9 @@ class Trainer(Generic[Loss, Effects]):
             scalars["train/tokens"] = float(tokens) / steps
             scalars["train/tokens_per_s"] = float(tokens) / stepping
         # A batch whose work could not be counted carries NaN (`_counted_batch`),
-        # so an interval holding one, on any process, reports no train/mfu.
+        # so an interval holding one, on any process, reports no train/flops or train/mfu.
         if training_flops is not None and math.isfinite(training_flops):
+            scalars["train/flops"] = float(training_flops) / steps
             per_device = float(training_flops) / self.device_mesh.devices.size
             utilization = model_flops_utilization(per_device / steps, step_time)
             if utilization is not None:
