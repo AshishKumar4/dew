@@ -90,9 +90,6 @@ import sys
 import threading
 import time
 import tomllib
-import urllib.error
-import urllib.parse
-import urllib.request
 import xml.etree.ElementTree as ET
 from collections.abc import Mapping
 from pathlib import Path
@@ -109,6 +106,7 @@ def _beside(name: str):
 
 
 child_groups = _beside("child_groups")
+r2 = _beside("r2")
 SETTLE = 30.0
 """Seconds a task's process group has, after SIGKILL, to be reaped and gone: inside armada's own timeout
 with the default deadline and grace (1680 + 60 + 30 + the reader's 10 < .armada.json's 1800)."""
@@ -253,36 +251,42 @@ def gpu_query(field: str) -> list[str]:
                           check=True).stdout.split("\n")[:-1]
 
 
-def worker() -> str:
-    """The URL of the Worker that holds the records."""
-    return os.environ["DEW_XLA_CACHE_URL"].rstrip("/")
+def store(token: str) -> r2.Store:
+    """The Worker that holds the records."""
+    return r2.Store(os.environ["DEW_XLA_CACHE_URL"], token, "dew-ci-test-cache", timeout=10)
 
 
-def cache_url(python: str, row_name: str, held: str, inputs: str | None = None) -> str:
+def record_key(python: str, row_name: str, held: str, inputs: str | None = None) -> str:
     """Where the record of `row_name` on class `held` (`device_class`) lives: the last run's, or with
     `inputs`, the last of the runs on those shared inputs (`shared`), apart from the last runs' list
     (`listed`). Any run of another commit replaces the last record, so a commit's retry reads its own
     under its inputs first (`reused`). The Worker's key alphabet has no colon or hash."""
     _, name, split = parsed_row(row_name)
     at = f"{CACHE_PREFIX}/{python}" if inputs is None else f"{CACHE_PREFIX}-inputs/{inputs[:16]}/{python}"
-    return f"{worker()}/{at}/{held}/{name}/" + ("-of-".join(split.split("/")) if split else "whole")
+    return f"{at}/{held}/{name}/" + ("-of-".join(split.split("/")) if split else "whole")
 
 
-def cache_request(url: str, token: str, data: bytes | None = None) -> bytes | None:
-    """GET (or with `data`, PUT) `url`: None on a miss, and on a failure, which it reports and which
-    costs only a rerun."""
-    headers = {"Authorization": f"Bearer {token}", "User-Agent": "dew-ci-test-cache"}
-    method = "PUT" if data is not None else "GET"
-    request = urllib.request.Request(url, data=data, method=method, headers=headers)
+def key_parts(key: str) -> tuple[str, str, str]:
+    """A record's key under its Python's prefix (`record_key`'s `<class>/<test file>/<group>`) as its class,
+    its test file and its group (`whole`, or a split's `<index>-of-<count>`)."""
+    held, rest = key.split("/", 1)
+    name, group = rest.rsplit("/", 1)
+    return held, name, group
+
+
+def recorded(key: str, token: str) -> dict | None:
+    """The record at `key`, read (`record_of`), or None where there is none or the Worker did not give it."""
+    found = record_of(key, token)
+    return None if found is None else json.loads(found)
+
+
+def record_of(key: str, token: str) -> bytes | None:
+    """The record at `key`, or None where there is none and where the Worker did not give it, which it
+    reports and which costs only a rerun."""
     try:
-        with urllib.request.urlopen(request, timeout=10) as response:
-            return response.read()
-    except urllib.error.HTTPError as error:
-        if error.code != 404:
-            print(f"the test cache answered {error.code} to {method} {url}", file=sys.stderr)
-        return None
-    except (urllib.error.URLError, TimeoutError, OSError) as error:
-        print(f"the test cache is unreachable ({error}); {method} {url} skipped", file=sys.stderr)
+        return store(token).get(key)
+    except (r2.R2Error, ValueError) as error:
+        print(f"the test cache did not give {key}: {error}", file=sys.stderr)
         return None
 
 
@@ -294,9 +298,8 @@ def reused(python: str, name: str, split: str, common: str) -> dict | None:
     token = os.environ.get("DEW_XLA_CACHE_TOKEN")
     if not token or "DEW_XLA_CACHE_URL" not in os.environ:
         return None
-    record = cache_request(cache_url(python, row(python, name, split), device_class(), common), token)
-    recorded = None if record is None else json.loads(record)
-    return recorded["row"] if recorded is not None and fresh(recorded, name, common) else None
+    found = recorded(record_key(python, row(python, name, split), device_class(), common), token)
+    return found["row"] if found is not None and fresh(found, name, common) else None
 
 
 def fresh(recorded: dict, name: str, common: str) -> bool:
@@ -680,6 +683,9 @@ def tested(python: str, tests: list[str], split: str, out: Path, deadline: float
         # Python's apart.
         ran.append({"name": row(python, name, split), "exitCode": 1 if red else 0, "seconds": seconds,
                      "output": "\n".join(red + ([shown(output)] if red else [])),
+                     # Its first failed test's exception as pytest gave it ("RuntimeError: ..."), which
+                     # `exhausted` reads.
+                     **({"first_failure": failed[0][2].get("message") or ""} if failed else {}),
                      "tests": {node_of(case): float(case.get("time") or 0) for case in own},
                      "timings": {row(python, name, ""): seconds}, **cause})
     out.write_text(json.dumps({"rows": rows + ran}))
@@ -712,34 +718,32 @@ def record(python: str, rows: list[dict], executed_report: Path, common: str) ->
                            "peak": ran["peak"], "shares": ran["shares"], "pools": ran["pools"]}).encode()
         # The record under these inputs, which `reused` reads, and the last run's, which the GPU tier and
         # lane read, only once the first is written, so it is never newer.
-        if written(cache_url(python, row_["name"], held, common), token, body):
-            written(cache_url(python, row_["name"], held), token, body)
+        if written(record_key(python, row_["name"], held, common), token, body):
+            written(record_key(python, row_["name"], held), token, body)
 
 
-def written(url: str, token: str, body: bytes) -> bool:
-    """Whether `body` was PUT at `url`, tried `RECORD_TRIES` times: a record not written leaves the
-    one before it, such as an older green row a red run should have replaced."""
+def written(key: str, token: str, body: bytes) -> bool:
+    """Whether `body` was PUT at `key`, tried `RECORD_TRIES` times while the Worker is unavailable: a
+    record not written leaves the one before it, such as an older green row a red run should have
+    replaced."""
     for attempt in range(RECORD_TRIES):
         if attempt:
             time.sleep(2 ** attempt)
-        if cache_request(url, token, body) is not None:
+        try:
+            store(token).put(key, body)
             return True
+        except r2.Unavailable as error:
+            print(f"the test cache did not take {key}: {error}", file=sys.stderr)
+        except (r2.R2Error, ValueError) as error:
+            print(f"the test cache refused {key}: {error}", file=sys.stderr)
+            return False
     return False
 
 
 def listed(prefix: str, token: str) -> list[str]:
-    """The names of the Worker's records under `prefix`, without it, a page of a thousand at a time."""
-    names, cursor = [], None
-    while True:
-        fields = {"list": prefix} | ({"cursor": cursor} if cursor else {})
-        page = cache_request(f"{worker()}/?{urllib.parse.urlencode(fields)}", token)
-        if page is None:
-            raise SystemExit(f"the test cache did not list {prefix}")
-        listing = json.loads(page)
-        names += listing["keys"]
-        cursor = listing["cursor"]
-        if not cursor:
-            return names
+    """The names of the Worker's records under `prefix`, without it, a page of a thousand at a time; an
+    `r2.R2Error` where the Worker did not list them, its caller's to answer."""
+    return list(store(token).keys(prefix))
 
 
 def gpu_tier(python: str) -> dict[str, list[str]]:
@@ -756,16 +760,20 @@ def gpu_tier(python: str) -> dict[str, list[str]]:
     prefix = f"{CACHE_PREFIX}/{python}/"
 
     def evidence_of(key: str) -> tuple[str, list[str]]:
-        name = key.split("/", 1)[1].rsplit("/", 1)[0]  # <class>/<test file>/<group>
-        record = cache_request(f"{worker()}/{prefix}{key}", token)
-        if record is None:
+        _, name, _ = key_parts(key)
+        found = recorded(f"{prefix}{key}", token)
+        if found is None:
             return name, ["unrecorded"]
-        recorded = json.loads(record)
-        return name, recorded["reads"] or ([] if fresh(recorded, name, common) else ["changed"])
+        return name, found["reads"] or ([] if fresh(found, name, common) else ["changed"])
 
+    try:
+        keys = listed(prefix, token)
+    # The tier is chosen from the records: none listed, none is chosen.
+    except r2.R2Error as error:
+        raise SystemExit(f"the test cache did not list {prefix}: {error}") from error
     evidence: dict[str, set[str]] = {}
     with concurrent.futures.ThreadPoolExecutor(32) as pool:
-        for name, found in pool.map(evidence_of, listed(prefix, token)):
+        for name, found in pool.map(evidence_of, keys):
             evidence.setdefault(name, set()).update(found)
     every = sorted(str(path) for path in Path("tests").glob("test_*.py") if str(path) not in SKIPPED)
     unrecorded = {name: ["unrecorded"] for name in every if name not in evidence}
@@ -812,6 +820,60 @@ def gpu_needs(recorded: dict | None, budget: float) -> tuple[float, float]:
     return share, min(share * (1 + recorded.get("shares", 0)) + recorded.get("pools", 0), budget)
 
 
+EXHAUSTED = re.compile(r"(?:[\w.]+\.)?(?:XlaRuntimeError|JaxRuntimeError|RuntimeError|OutOfMemoryError): "
+                       r"(?:RESOURCE_EXHAUSTED: (?:Out of memory|Failed to allocate)\b"
+                       r"|CUDA_ERROR_OUT_OF_MEMORY\b|CUDA (?:error: )?out of memory)")
+"""An exception that is the GPU's device memory running out, as pytest gives it: XLA's runtime error whose
+status is RESOURCE_EXHAUSTED for an allocation (out of memory, or a failed allocation), or the CUDA driver's
+out-of-memory error, raised as such. A block past the GPU's own resources (XLA's RESOURCE_EXHAUSTED for a
+shared memory size limit, as `dew.nn.kernels.tuning` reads it) is none, as no larger share helps it; nor is an
+assertion, whatever its message says."""
+
+
+def exhausted(failure: str | None) -> bool:
+    """Whether a red row's first failed test raised the GPU's memory running out (`EXHAUSTED`, its exception's
+    start), which a smaller share than the file needs causes, rather than failed on its own."""
+    return failure is not None and EXHAUSTED.match(failure) is not None
+
+
+def borrowed_records(names: list[str], python: str, held: str, token: str) -> dict[str, tuple[str, dict]]:
+    """For each of `names`, test files no run on class `held` measured, the class and last record of
+    the whole file on another class whose run measured its GPU peak, the one that holds the most
+    (`gpu_needs`): what a file has taken on a GPU, which a first lane on a class takes as its share.
+    One no class measured is absent, as every one is where the Worker does not list its records. Its run on
+    `held` records its own, which every later lane reads."""
+    if not names:
+        return {}
+    prefix = f"{CACHE_PREFIX}/{python}/"
+    wanted = set(names)
+    try:
+        every = listed(prefix, token)
+    # The Worker did not list its records: borrowing only packs a lane, so each such file runs alone with the
+    # lane's whole share, as one measured on no class does.
+    except r2.R2Error as error:
+        print(f"the test cache did not list {prefix}: {error}; files unmeasured here run alone",
+              file=sys.stderr)
+        return {}
+    keys = [key for key in every
+            if (parts := key_parts(key))[0] != held and parts[2] == "whole" and parts[1] in wanted]
+
+    def read(key: str) -> tuple[str, str, dict | None]:
+        kind, name, _ = key_parts(key)
+        return name, kind, recorded(f"{prefix}{key}", token)
+
+    def holds(found: dict) -> float:
+        return gpu_needs(found, float("inf"))[1]
+
+    borrowed: dict[str, tuple[str, dict]] = {}
+    with concurrent.futures.ThreadPoolExecutor(32) as pool:
+        for name, kind, found in pool.map(read, keys):
+            if found is None or found.get("depends") is None or found.get("peak") is None:
+                continue
+            if name not in borrowed or holds(found) > holds(borrowed[name][1]):
+                borrowed[name] = (kind, found)
+    return borrowed
+
+
 def gpu_lane(python: str, tests: list[str], out: Path, *, cache: bool, processes: int,
              deadline: float) -> int:
     """Run `tests` on this process's share of the one GPU it sees, each file once, as a task of its
@@ -821,11 +883,16 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: bool, processes
     and files start heaviest first while what they hold with their children (`gpu_needs`) fits
     the share this process was given (`XLA_PYTHON_CLIENT_MEM_FRACTION`, as gpu-run sets it), at
     most `processes` at once. A file that runs out of a measured share is red: it took more than
-    its last run, whose peak its next run is given. A file given the lane's whole share (unmeasured,
-    measured that large, or with a child the lane did not follow, as the fla reference's in another
-    environment's Python) grows its pool as it uses it rather than taking the share at its first GPU
-    op (`XLA_PYTHON_CLIENT_PREALLOCATE`), so such a child has what the file has not yet taken; a file
-    that grows to the whole share still leaves its child none.
+    its last run, whose peak its next run is given. A file no run on this class measured borrows its
+    share from the largest any other GPU class's last run measured (`borrowed`), so a first lane on
+    a class packs its files as a measured one does; one red under a borrowed share whose first failure is
+    its memory running out (`exhausted`) runs once more, alone, with the lane's whole share, as that red is
+    the borrowed share's; one whose first failure is any other is red, run once. A file
+    given the lane's whole share (measured on no class, measured that large, or with a child the lane
+    did not follow, as the fla reference's in another environment's Python) grows its pool as it uses
+    it rather than taking the share at its first GPU op (`XLA_PYTHON_CLIENT_PREALLOCATE`), so such a
+    child has what the file has not yet taken; a file that grows to the whole share still leaves its
+    child none.
 
     First the pinned fixtures the tests read offline are fetched while the Hub is reachable
     (tools/fetched_fixtures.py): a store file already whole is kept, and a pin whose upload is due stops
@@ -836,34 +903,62 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: bool, processes
     budget = float(os.environ["XLA_PYTHON_CLIENT_MEM_FRACTION"]) * total
     held = device_class()
 
-    def needs(name: str) -> tuple[float, float]:
-        record = cache_request(cache_url(python, row(python, name, ""), held), token)
-        return gpu_needs(json.loads(record) if record else None, budget)
+    def needs(name: str) -> dict | None:
+        return recorded(record_key(python, row(python, name, ""), held), token)
 
     with concurrent.futures.ThreadPoolExecutor(32) as pool:
-        needed = dict(zip(tests, pool.map(needs, tests), strict=True))
+        records = dict(zip(tests, pool.map(needs, tests), strict=True))
+    borrowed = borrowed_records([name for name, found in records.items() if found is None], python, held,
+                                token)
+    needed = {name: gpu_needs(records[name] or (borrowed[name][1] if name in borrowed else None), budget)
+              for name in tests}
     shares = {name: share for name, (share, _) in needed.items()}
     holds = {name: held for name, (_, held) in needed.items()}
     # Before any test writes under tests/, the inputs every file's key hashes.
     common = shared(python)
-    waiting = sorted(tests, key=lambda name: -holds[name])
     verdicts = {name: out.with_name(f"{out.name}.{index}") for index, name in enumerate(tests)}
-    running: dict[concurrent.futures.Future, str] = {}
-    with concurrent.futures.ThreadPoolExecutor(processes) as pool:
-        while waiting or running:
-            free = budget - sum(holds[name] for name in running.values())
-            fits = next((name for name in waiting if holds[name] <= free), None)
-            if fits is not None and len(running) < processes:
-                waiting.remove(fits)
-                environ = {"XLA_PYTHON_CLIENT_MEM_FRACTION": str(shares[fits] / total),
-                           **({"XLA_PYTHON_CLIENT_PREALLOCATE": "false"} if shares[fits] >= budget else {})}
-                running[pool.submit(tested, python, [fits], "", verdicts[fits], deadline, cache, 60.0, common,
-                                    environ)] = fits
-                continue
-            done, _ = concurrent.futures.wait(running, return_when=concurrent.futures.FIRST_COMPLETED)
-            for future in done:
-                future.result()
-                del running[future]
+
+    def run(names: list[str]) -> None:
+        waiting = sorted(names, key=lambda name: -holds[name])
+        running: dict[concurrent.futures.Future, str] = {}
+        with concurrent.futures.ThreadPoolExecutor(processes) as pool:
+            while waiting or running:
+                free = budget - sum(holds[name] for name in running.values())
+                fits = next((name for name in waiting if holds[name] <= free), None)
+                if fits is not None and len(running) < processes:
+                    waiting.remove(fits)
+                    environ = {"XLA_PYTHON_CLIENT_MEM_FRACTION": str(shares[fits] / total),
+                               **({"XLA_PYTHON_CLIENT_PREALLOCATE": "false"} if shares[fits] >= budget
+                                  else {})}
+                    running[pool.submit(tested, python, [fits], "", verdicts[fits], deadline, cache, 60.0,
+                                        common, environ)] = fits
+                    continue
+                done, _ = concurrent.futures.wait(running, return_when=concurrent.futures.FIRST_COMPLETED)
+                for future in done:
+                    future.result()
+                    del running[future]
+
+    run(tests)
+    # Red under a share another class measured, its first failure an allocation's (`exhausted`): that red is
+    # the borrowed share's, not the file's, and the file runs again alone with the lane's whole share, its row
+    # saying so with the first failure, as packed work run again alone is interference. Any other first
+    # failure (an assertion, an accuracy miss, an illegal address) is the file's: its red stands, run once.
+    again: dict[str, str] = {}
+    for name in borrowed:
+        failures = [verdict.get("first_failure")
+                    for verdict in json.loads(verdicts[name].read_text())["rows"] if verdict["exitCode"] != 0]
+        # Below the whole budget only: a file that already had it would run again as it ran.
+        if failures and exhausted(failures[0]) and shares[name] < budget:
+            again[name] = (f"red under a share of {shares[name] / 2 ** 30:.1f} GiB borrowed from "
+                           f"{borrowed[name][0]}'s measurement, out of memory ({failures[0]}); run again "
+                           "alone with the lane's whole share")
+    for name in again:
+        shares[name] = holds[name] = budget
+    run(list(again))
+    for name, interference in again.items():
+        rows = json.loads(verdicts[name].read_text())["rows"]
+        verdicts[name].write_text(json.dumps({"rows": [{**verdict, "interference": interference}
+                                                       for verdict in rows]}))
     rows = [verdict for name in tests for verdict in json.loads(verdicts[name].read_text())["rows"]]
     out.write_text(json.dumps({"rows": rows}))
     return 0

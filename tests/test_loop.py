@@ -10,8 +10,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from model_support import TINY_DECODER, decode_steps, model_draw
-from reference_error import assert_as_exact
+from model_support import TINY_DECODER, decode_steps, model_draw, with_logit_cotangent
+from reference_error import assert_as_exact, with_gradients
 
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.backbones.decoder_stack import Loop
@@ -28,7 +28,7 @@ def tokens(rng, length=12, rows=2):
     return jax.random.randint(rng, (rows, length), 0, VOCAB)
 
 
-SEEDS = {'decode': 64, 'scanned': 64, 'checkpointed': 256, 'block decode': 32}
+SEEDS = {'decode': 64, 'scanned': 64, 'checkpointed': 512, 'block decode': 32}
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` (on armada):
 the most any of a site's cases took."""
 
@@ -131,16 +131,18 @@ def test_checkpointed_passes_preserve_logits_and_gradients(backprop_steps, scan_
     checkpointed = plain.clone(loop=dataclasses.replace(loop, remat=True))
 
     def result(model):
-        def run(tree, ids):
-            logits, pull = jax.vjp(lambda tree: model.apply(tree, ids, train=True), tree)
-            return {'logits': logits, 'gradients': pull(logits)[0]}
+        def run(tree, ids, cotangent):
+            pulled = with_gradients(lambda tree: model.apply(tree, ids, train=True))
+            logits, gradients = pulled(tree, cotangent)
+            return {'logits': logits, 'gradients': gradients}
         return jax.jit(run)
 
     # Eight rows of sixteen tokens: a norm's scale sums its gradient over enough of them to resolve.
-    assert_as_exact(result(checkpointed), result(plain), drawn(plain, 16, 8),
+    draw = with_logit_cotangent(drawn(plain, 16, 8), VOCAB, 0x100)
+    assert_as_exact(result(checkpointed), result(plain), draw,
                     f'{scan_layers} {backprop_steps} checkpointed', seeds=SEEDS['checkpointed'],
                     truth_fn=result(plain.clone(dtype=jnp.float64)))
-    gradients = result(checkpointed)(*drawn(plain)(0))['gradients']['params']
+    gradients = result(checkpointed)(*draw(0))['gradients']['params']
     assert bool(jnp.any(gradients['embed_tokens']['embedding'])) == (backprop_steps is None)
     assert bool(jnp.any(gradients['layers_1']['mlp']['down_proj']['kernel']))
 
