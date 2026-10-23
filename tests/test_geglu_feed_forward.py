@@ -65,7 +65,7 @@ def test_a_unets_feed_forward_declares_its_kernels_axes():
         conditioning=DenoisingCondition(jnp.zeros((1, 3, 768)))))["params"]
     declared = declarations(params)
     leaves = [(path, leaf) for path, leaf in jax.tree_util.tree_leaves_with_path(params)
-              if "feed_forward" in parameter_path(path)]
+              if "ff" in parameter_path(path)]
     assert {parameter_path(path)[-2] for path, _ in leaves} == {"gate_up_proj", "down_proj"}
     expected = {"kernel": ("embed", "mlp"), "bias": ("mlp",)}
     for path, leaf in leaves:
