@@ -31,11 +31,11 @@ Usage:
 """
 
 import contextlib
+import dataclasses
 import json
 import os
 import statistics
 import sys
-import dataclasses
 from dataclasses import dataclass
 from typing import Optional
 
