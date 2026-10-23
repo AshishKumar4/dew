@@ -146,6 +146,7 @@ def test_a_token_budget_alone_trains_over_data_with_no_epoch_length(tmp_path):
     tokens alone needs none: it trains until its targets reach the budget."""
     tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
     config = run_config(tokens, "--trainer.tokens", str(2 * 8 * SEQ), "--trainer.name", "budget",
+                        "--trainer.eval-every", "None", "--trainer.checkpoint-every", "None",
                         pack="first-fit", bins=2)
     assert compile(config.chain()).steps_per_epoch is None
     assert int(config.run().step) >= 2
@@ -295,8 +296,8 @@ def test_a_pretrained_runs_record_trains_again(tmp_path, lora):
 
 def test_a_run_resumed_under_its_name_trains_the_model_it_recorded(tmp_path):
     """A run with checkpoints resumes under its name only as the model and objective it recorded: a
-    rope base that keeps every shape is refused before the record is replaced or a weight restored,
-    and the run as recorded trains on."""
+    rope base that keeps every shape, or a quantized forward pass, is refused before the record is
+    replaced or a weight restored, and the run as recorded trains on."""
     from dew.checkpoints import Checkpoints
 
     tokens = write_token_files(tmp_path / "tokens", 40 * SEQ, 8 * SEQ, eos_id=0)
@@ -305,13 +306,22 @@ def test_a_run_resumed_under_its_name_trains_the_model_it_recorded(tmp_path):
     run = tmp_path / "runs" / "kept"
     recorded = (run / "run.json").read_bytes()
 
+    from dew.quantization import Quantization
+
     rotated = run_config(tokens, "--trainer.steps", "2", "--trainer.name", "kept",
                          model=json.dumps({**model, "rope_theta": 500.0}))
-    with pytest.raises(ValueError):
-        rotated.run()
-    assert (run / "run.json").read_bytes() == recorded
-    assert Checkpoints(str(run)).latest == 1
+    same = run_config(tokens, "--trainer.steps", "2", "--trainer.name", "kept", model=json.dumps(model))
+    quantized = dataclasses.replace(same, trainer=dataclasses.replace(same.trainer,
+                                                                      quantization=Quantization()))
+    for other in (rotated, quantized):
+        with pytest.raises(ValueError):
+            other.run()
+        assert (run / "run.json").read_bytes() == recorded
+        assert Checkpoints(str(run)).latest == 1
 
+    # The record may name its class by its import path, as the registry reads it too.
+    record = json.loads((run / "run.json").read_text())
+    (run / "run.json").write_text(json.dumps({**record, "class": "dew.config.lm:LMRunConfig"}))
     run_config(tokens, "--trainer.steps", "2", "--trainer.name", "kept", model=json.dumps(model)).run()
     assert Checkpoints(str(run)).latest == 2
 

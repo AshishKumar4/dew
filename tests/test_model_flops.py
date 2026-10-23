@@ -234,10 +234,12 @@ def test_decision_head_charges_options_and_evidence_not_a_vocabulary():
 
 
 def test_host_row_counts_add_to_objectives_total_without_padding():
+    """Each row commits the targets its loss scores: two documents of two tokens score one each, and
+    one of three scores two, while the FLOP count keeps their inputs."""
     objective = LMObjective(decoder(), seq_len=6, pad_id=0)
     batch = packed_batch()
     counted = prepare_counts(objective, batch, count_model=True)
-    np.testing.assert_array_equal(counted[TOKENS], _TokenCount.words([4, 3]))
+    np.testing.assert_array_equal(counted[TOKENS], _TokenCount.words([2, 2]))
     assert counted[TRAINING_FLOPS].sum() == objective.training_flops(None, batch)
     assert counted["text"] is batch["text"]
     with pytest.raises(ValueError):
@@ -375,7 +377,7 @@ def test_prefetch_counts_on_worker_then_step_reduces_global_rows():
     with DevicePrefetchIterator(iter([batch]), mesh, prepare=prepare) as source:
         placed = next(source)
         measured = jax.jit(step_counts)(placed)
-        assert _TokenCount.host(measured[TOKENS]) == 7
+        assert _TokenCount.host(measured[TOKENS]) == 4
         assert float(measured[TRAINING_FLOPS]) == objective.training_flops(None, batch)
     assert threads == ["dew-prefetch"]
 
