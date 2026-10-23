@@ -1381,7 +1381,7 @@ class RunConfig:
         if named is None:
             raise ValueError('a run record is its class and its fields, {"class": ..., "fields": ...}')
         run_class = registry.runs[named[0]]
-        if not issubclass(run_class, cls):
+        if not (isinstance(run_class, type) and issubclass(run_class, cls)):
             raise ValueError(f"the record names {named[0]}, which is no {cls.__name__}")
         return run_class.from_dict(named[1])
 
