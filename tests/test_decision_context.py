@@ -80,18 +80,20 @@ def test_a_backbone_with_fresh_context_layers_scores_every_row_as_its_source_doe
 
 def test_a_conditioned_run_logs_its_training_work_and_serves_with_its_context():
     """Examples with a context trained through context layers: every logged step reports its
-    training work, the objective's own count of its batch, the cross-attention's work over each row's
-    context in it (`test_the_context_layers_work_is_counted_in_a_conditioned_batch`), and the run's
-    task answers a request with its context."""
+    training work, and beyond what its batch's rows cost without their contexts by the
+    cross-attention's work over them (`test_the_context_layers_work_is_counted_in_a_conditioned_batch`
+    holds the count itself), far past the float32 sum the step logs it by; the run's task answers a
+    request with its context."""
     objective = conditioned()
     data = decision_rows(examples(), 8, objective=objective.data())
-    counted = [objective.training_flops(None, batch)
-               for batch in itertools.islice(data.train(DataPartition()), 2)]
+    batches = list(itertools.islice(data.train(DataPartition()), 2))
+    plain = [objective.training_flops(None, {name: value for name, value in batch.items()
+                                             if name != "context_lengths"}) for batch in batches]
     tracker = RecordingTracker()
     trainer = Trainer(objective, optax.adam(1e-3), key=0, tracker=tracker)
     state = trainer.fit(data, steps=2, log_every=1)
     logged = [scalars["train/flops"] for _, scalars in tracker.scalars if "train/loss" in scalars]
-    assert logged == counted and all(work > 0 for work in counted)
+    assert len(logged) == 2 and all(work > without for work, without in zip(logged, plain, strict=True))
 
     task = objective.pipeline(state)
     assert isinstance(task, Decide)
