@@ -75,8 +75,9 @@ def selection_draw(length, top_k, segments=None, cotangent=False):
         drawn = (*operands, causal_selection(scores, top_k, segments))
         if not cotangent:
             return drawn
-        key = jax.random.fold_in(jax.random.key(9), seed)
-        return *drawn, jax.random.normal(key, (2, length, HEADS, VALUE))
+        # A host stream of the seed's own, apart from every seed's `pieces` keys.
+        rng = np.random.default_rng([0xC07A, seed])
+        return *drawn, rng.standard_normal((2, length, HEADS, VALUE)).astype(np.float32)
     return draw
 
 
@@ -152,12 +153,14 @@ def test_an_adapter_dropping_out_kv_b_proj_keeps_the_masked_kernel():
     The absorbed path applies kv_b_proj to the identity, where the same draw
     would be one mask for every token, so such a training call runs the
     masked kernel: on par (check 1) with the same call with `qk` open, rng for
-    rng, its truth that call in float64 under the same mask."""
+    rng, its truth that call in float64 under the same mask. The rate is a
+    float32, so the mask draws float32 uniforms under x64 too: a float rate
+    would draw float64 ones from other bits, another mask."""
     layer = MultiHeadLatentAttention(
         emb_features=32, num_heads=HEADS, max_seq_len=64, q_lora_rank=16, kv_lora_rank=RANK,
         qk_nope_head_dim=NOPE, qk_rope_head_dim=ROPE, v_head_dim=VALUE,
         index_topk=5, index_n_heads=2, index_head_dim=16, attention_impl="reference")
-    adapter = LoRA(rank=4, modules=("kv_b_proj",), alpha=8.0, dropout=0.5).apply(
+    adapter = LoRA(rank=4, modules=("kv_b_proj",), alpha=8.0, dropout=np.float32(0.5)).apply(
         layer, layer.init(jax.random.key(3), jnp.zeros((2, 21, 32))), key=3)
     adapted, variables = adapter.model, adapter.variables
     factor = variables["params"]["kv_b_proj"]["lora_B"]
