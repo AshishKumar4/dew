@@ -692,15 +692,9 @@ def _linear_primitive() -> type:
     def none_move(tangents) -> bool:
         return all(zero(leaf) for leaf in jax.tree.leaves(tangents, is_leaf=zero))
 
-    def instantiated(tangents, like):
-        """`tangents` with each symbolic zero an array of `like`'s: float0's for an integer leaf."""
-        def one(tangent, primal):
-            if not zero(tangent):
-                return tangent
-            if jnp.issubdtype(primal.dtype, jnp.inexact):
-                return jnp.zeros(primal.shape, primal.dtype)
-            return np.zeros(primal.shape, jax.dtypes.float0)
-        return jax.tree.map(one, tangents, like, is_leaf=zero)
+    def instantiated(tangents):
+        """`tangents` with each symbolic zero an array of its tangent type: float0's for an integer leaf."""
+        return jax.tree.map(hijax.instantiate_zeros, tangents, is_leaf=zero)
 
     def unbatched(cotangent):
         """An unbatched operand's cotangent: its batch's sum."""
@@ -720,7 +714,7 @@ def _linear_primitive() -> type:
         def transpose(self, cotangent, residuals, moving):
             if none_move(cotangent):
                 return
-            pulled = self.pullback(residuals, instantiated(cotangent, self.out_aval))
+            pulled = self.pullback(residuals, instantiated(cotangent))
             jax.tree.map(lambda accum, value: isinstance(accum, hijax.GradAccum) and accum.accum(value),
                          moving, pulled, is_leaf=lambda leaf: isinstance(leaf, hijax.GradAccum))
 
@@ -729,10 +723,10 @@ def _linear_primitive() -> type:
             d_residuals, d_moving = tangents
             terms = []
             if not none_move(d_moving):
-                terms.append(self(residuals, instantiated(d_moving, moving)))
+                terms.append(self(residuals, instantiated(d_moving)))
             if not none_move(d_residuals):
                 terms.append(jax.jvp(lambda held: self.apply(held, moving), (residuals,),
-                                     (instantiated(d_residuals, residuals),))[1])
+                                     (instantiated(d_residuals),))[1])
             if not terms:
                 return self(residuals, moving), jax.tree.map(
                     lambda aval: hijax.Zero(aval.to_tangent_aval()), self.out_aval)
