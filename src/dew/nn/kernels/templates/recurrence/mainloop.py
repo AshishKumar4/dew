@@ -337,37 +337,54 @@ def _walk(streams, views, lo, hi, step, start, call: _Call):
 
 
 def _solve(k, hi, lo, beta, taken, call: _Call):
-    """`(I + A)^-1` of each chunk and value head under a decay a head, `[R, HV * C]` as `call.held`
-    (`algebra.solved`)."""
+    """`(I + A)^-1` of each chunk and value head under a decay a head, `[R, HV * C]` as `call.held`, fla's
+    kkt_solve: the chunk's keys' products once (`algebra.keyed`, `A` and `A^T` both), each 16-row diagonal
+    block's forward substitution in registers (`algebra.substituted`, the four at once, `-A^T`'s rows read
+    back from shared memory as `-A`'s columns), then two levels of merges (`algebra.doubled`)."""
     width, held = call.width, dataclasses.replace(call.held, rows=call.rows)
+    blocks = CHUNK // algebra.SUB
 
-    def program(k_ref, hi_ref, lo_ref, beta_ref, taken_ref, a_ref, *, streams, staging):
+    def program(k_ref, hi_ref, lo_ref, beta_ref, column_hi_ref, column_lo_ref, column_beta_ref, taken_ref,
+                a_ref, *, streams, staging):
         n, h = lax.axis_index("chunks"), lax.axis_index("heads")
         row, span = n * CHUNK, pl.ds(n * CHUNK, CHUNK)
+        *merges, lowered = staging
 
         def views(_):
             return _views(keys=call.given.views(k_ref, row, CHUNK, h // call.group * width, width))
 
         def step(index, slots, carry, accumulators):
             del index
+            keys = [_tile(slots, "keys", call.given, columns=pl.ds(c * BLOCK, BLOCK))
+                    for c in range(width // BLOCK)]
+            product = functools.reduce(jnp.add, (_Issuer()("intra", key, key.T) for key in keys))
+            rows = [FAMILY.rows_of(ref.at[h, span]) for ref in (hi_ref, lo_ref, beta_ref)]
+            columns = [FAMILY.columns_of(ref.at[h, span])
+                       for ref in (column_hi_ref, column_lo_ref, column_beta_ref)]
+            system = algebra.keyed(product, *rows, *columns[:2])
+            blocked = [FAMILY.iota((CHUNK, CHUNK), dimension) // algebra.SUB for dimension in (0, 1)]
+            transposed = algebra.keyed(product, *rows, *columns, transposed=True)
+            FAMILY.stored(lowered, jnp.where(blocked[0] == blocked[1], -transposed, 0.0))
 
-            def keys(i, c):
-                del i
-                return _tile(slots, "keys", call.given, columns=pl.ds(c * BLOCK, BLOCK))
+            def column(c):
+                return functools.reduce(jnp.add, (FAMILY.columns_of(lowered.at[b * algebra.SUB + c])
+                                                  for b in range(blocks)))
 
-            gate, low, betas = (FAMILY.rows_of(ref.at[h, span]) for ref in (hi_ref, lo_ref, beta_ref))
-            block = algebra.system(keys, [gate], [low], [betas], width // BLOCK, _Issuer(),
-                                   laid=([_down(gate)], [_down(low)]))[0, 0]
-            held.store(a_ref, algebra.doubled(-block, _merging(staging, call)), row, CHUNK, h * CHUNK, CHUNK)
+            diagonal = algebra.substituted(column, (CHUNK, CHUNK))
+            inverse = algebra.doubled(-system, _merging(merges, call), start=(diagonal, algebra.SUB))
+            held.store(a_ref, inverse, row, CHUNK, h * CHUNK, CHUNK)
             return carry, accumulators
 
         @pl.when(taken_ref[n] > 0)
         def _():
             _walk(streams, views, 0, 1, step, (), call)
 
+    staging = (*_merges(call), plgpu.SMEM((CHUNK, CHUNK), jnp.float32))
+    # The prefix and the write gates twice, read as a row's vectors and a column's: Mosaic GPU's layout
+    # inference takes two loads of one view as one.
     return _kernel(program, call, out_type=held.shape(call.heads * CHUNK), grid=(call.chunks, call.heads),
                    grid_names=("chunks", "heads"), blocks=_streamed(keys=((CHUNK, width), call.given)),
-                   stages=1, staging=_merges(call))(k, hi, lo, beta, taken)
+                   stages=1, staging=staging)(k, hi, lo, beta, hi, lo, beta, taken)
 
 
 def _intra(q, k, hi, lo, beta, taken, call: _Call, *, scale: float):
