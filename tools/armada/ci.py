@@ -247,7 +247,8 @@ def inputs(name: str, depends: list[str]) -> list[str]:
     directory of each module it executed under src/, whose entries name the modules an import there
     finds: a module added beside one it imported (which shadows it, or which an import it tried now
     finds) changes its key, and one added to a package it never imported does not."""
-    packages = {str(Path(path).parent) for path in depends if path.startswith("src/") and path.endswith(".py")}
+    packages = {str(Path(path).parent) for path in depends
+                if path.startswith("src/") and path.endswith(".py")}
     return sorted({name, *depends, *packages})
 
 
