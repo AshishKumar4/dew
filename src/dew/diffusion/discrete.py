@@ -44,6 +44,7 @@ from dew.nn.inputs import (
     mesh_of,
     prompt_major,
     real_slots,
+    token_layout,
 )
 from dew.nn.kernels.options import compiler_options
 from dew.nn.protocols import Logits, TokenModel
@@ -205,14 +206,24 @@ class DiscreteProcess:
         return replace(generated, rows=plan.rows * n, prompt_width=request.inputs.tokens.shape[1])
 
 
-def aligned(model: nn.Module, scores: jax.Array) -> jax.Array:
+def aligned(model: nn.Module, scores: jax.Array, fields: Mapping[str, object] | None = None) -> jax.Array:
     """`scores` `[B, S, ...]` per position as the model's predictions of each position's token: its
     own for a model whose logits line up with its inputs (LLaDA's, MDLM's), and for one that declares
-    `shifted_logits` (Dream-v0's) the position before's, the first repeated, as its reference
-    shifts them."""
+    `shifted_logits` (Dream-v0's) the position before's, as its reference shifts them. A position
+    that opens its text, the row's first, the first real one after padding and each packed
+    document's first in the token `fields`' layout (`token_layout`), reads its own, as the
+    reference repeats a row's first: no document reads another's."""
     if not getattr(model, "shifted_logits", False):
         return scores
-    return jnp.concatenate([scores[:, :1], scores[:, :-1]], axis=1)
+    before = jnp.concatenate([scores[:, :1], scores[:, :-1]], axis=1)
+    valid, documents = token_layout(fields or {})
+    opens = jnp.zeros(scores.shape[:2], bool).at[:, 0].set(True)
+    if valid is not None:
+        opens |= valid & ~jnp.concatenate([jnp.zeros_like(valid[:, :1]), valid[:, :-1]], axis=1)
+    if documents is not None:
+        changes = documents[:, 1:] != documents[:, :-1]
+        opens |= jnp.concatenate([jnp.ones_like(changes[:, :1]), changes], axis=1)
+    return jnp.where(opens.reshape(opens.shape + (1,) * (scores.ndim - 2)), scores, before)
 
 
 @dataclass(frozen=True)
@@ -250,7 +261,8 @@ class DiscreteDenoiser:
         assert not isinstance(logits, tuple)  # no mutable collections were asked for
         # Normalized in fp32, as `token_log_probs` does: the reveal draws its
         # categorical from these, and a bf16 log partition would quantize it.
-        logits = aligned(self.model, logits).astype(jnp.float32)
+        logits = aligned(self.model, logits, None if self.inputs is None else self.inputs.token_fields)
+        logits = logits.astype(jnp.float32)
         logits = logits.at[..., self.process.mask_id].set(-jnp.inf)
         log_probs = jax.nn.log_softmax(logits, axis=-1)
         masked = self.masked(x_t)

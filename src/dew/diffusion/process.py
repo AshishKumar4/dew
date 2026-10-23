@@ -35,11 +35,13 @@ class DenoisingCondition:
     mask: jax.Array | None = None
 
     def aligned(self, given: DenoisingCondition) -> DenoisingCondition:
-        """Return this blank conditioning with `given`'s fields that belong to the row and not to
-        its caption: the distilled guidance value, and SDXL's `time_ids`, the image's size and crop.
-        A dropped or unconditional caption keeps the guidance scale the checkpoint samples at and
-        the geometry its row was drawn at, so both guidance branches read one crop."""
-        return replace(self, guidance=given.guidance, time_ids=given.time_ids)
+        """Return this conditioning with `given`'s distilled guidance value.
+
+        The guidance value belongs to the row and not to its caption, so a
+        dropped or unconditional caption keeps the guidance scale the
+        checkpoint samples at.
+        """
+        return replace(self, guidance=given.guidance)
 
 
 # One conditioning keyword's value: the record a text encoder produced, or the
