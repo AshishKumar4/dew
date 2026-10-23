@@ -701,6 +701,23 @@ def test_a_ramp_over_an_order_read_once_ends_where_its_records_do(records, keep,
     assert ids == [1000 + index for index in range(sum(real))]
 
 
+@pytest.mark.parametrize("keep", [False, True])
+def test_a_ramp_over_batches_repeated_a_counted_number_of_times_reads_every_pass(keep):
+    """Twelve records in batches of six, the batches repeated twice, under a ramp of four-record
+    steps: the ramp reads both passes, the six steps two epochs count, every record twice."""
+    order = Pipeline(Memory(Indexed(1, 12))).batch(6, drop_remainder=not keep).repeat(2)
+    data = ramped(compile(order, loading=READ), Ramp(start=4, increment=2, samples=100))
+    assert (data.epoch_steps(1), data.epoch_steps(2)) == (3, 6)
+    stream = data.train(DataPartition())
+    try:
+        steps = list(stream)
+    finally:
+        stream.close()
+    assert len(steps) == 6
+    ids = sorted(int(value) for step in steps for value in np.asarray(step["id"]))
+    assert ids == sorted([1000 + index for index in range(12)] * 2)
+
+
 def indexed_data(records: int, batch: int, seed: int = 0) -> Loader:
     """A dataset whose records say which they are, compiled to the global
     order every dataset reads through."""
