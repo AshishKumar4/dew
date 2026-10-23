@@ -113,7 +113,7 @@ def widened(tree):
     """`tree` as float64 host arrays, its integer leaves as they are: the
     inputs of a float64 truth."""
     return jax.tree.map(lambda leaf: np.asarray(
-        leaf, np.float64 if jnp.issubdtype(leaf.dtype, jnp.floating) else leaf.dtype), tree)
+        leaf, np.float64 if _floating(leaf.dtype) else leaf.dtype), tree)
 
 
 def _stack_draws(trees):
@@ -343,7 +343,8 @@ def _floating(dtype) -> bool:
 
 
 def _widened(value):
-    """`value` with a float widened exactly to float64."""
+    """`value` with a float widened exactly to float64: `widened` for one value, kept on the device,
+    since inside a replayed scan body it is a tracer, which a host array cannot hold."""
     dtype = value.dtype if hasattr(value, "dtype") else np.result_type(value)
     return jnp.asarray(value, jnp.float64) if _floating(dtype) else value
 
