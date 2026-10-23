@@ -24,10 +24,10 @@ def _rows_per_device(array: jax.Array) -> dict[int, tuple[int, int]]:
 
 
 @pytest.mark.parametrize(("rules", "spec"), [
-    (None, MeshSpec(data=2, fsdp=2, tensor=2)),
+    (None, MeshSpec(fsdp=2, tensor=2)),
     (None, MeshSpec(expert=2, sequence=2, tensor=2)),
-    ("data axes", MeshSpec(data=2, fsdp=2, tensor=2)),
-    ("own table", MeshSpec(data=2, fsdp=2, tensor=2)),
+    ("data axes", MeshSpec(fsdp=2, tensor=2)),
+    ("own table", MeshSpec(fsdp=2, tensor=2)),
 ])
 def test_the_data_and_the_models_layout_split_a_batchs_rows_over_the_same_axes(rules, spec):
     """A batch the trainer places (`shard_batch`, by the data's shares, `DataPartition.of`) holds
