@@ -69,6 +69,8 @@ Coordinates and row vectors come from the toolkit, because Mosaic GPU iotas need
 - the backward recomputes its weights in the forward's units from its raw maximum (`Recompute`);
 - its sums carry the headroom (above).
 
+The default carries two guards of its own, in the shared algebra (`walked`), so every mainloop composing it walks under them by construction: the headroom (above) wherever its values can overflow the sums (bf16 and fp32), and the fold's reach, a program one of whose rows' maximum passes `FOLD_REACH` (a folded logit of 2^16) walking again in the natural form, its logits scaled (`unfolded`), so the backward recomputes those rows as the fold's. Ordinary inputs take the plain walk alone. With them the default is finite wherever the reference is on every stability family (the owner's ruling, 2026-10-23); the frozen Triton mainloop walks without them.
+
 Both pass check 1 on drawn inputs; the stability suite (tests/test_attention_stability.py) holds the accurate form to check 1 on every family, and the default to finiteness wherever the reference is finite and to its exact-zero claims on all but the fold's divergences at extreme inputs, which it runs in the accurate form alone (the owner's ruling, 2026-10-23; the default's ties there are documented in docs/design/testing.md):
 - logits a ulp apart near 2^30, at scales below 1: the fold rounds each logit at log2(e) times its size, so two the reference keeps apart can tie, and a large cotangent then overflows the backward;
 - logits near fp32's largest: the contracted exponent of the largest logit is its product's rounding, up to an ulp of the logit, so its weight is 0 or infinite (with one key, its weight is 1 within an ulp of that exponent);
