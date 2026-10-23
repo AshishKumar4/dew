@@ -281,9 +281,8 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
     (`starts`, at most `max_segments` a row) each compute as they would alone. A conv runs before the
     op: it takes the conv's output. The operands the hooks read are checked as the decode step's
     (`recurrence.read`), and a rated decay is taken on its declared domain, a contraction. `mainloop`
-    'mosaic' runs a decay a head or none, with or without the delta rule, and one a key dimension under it,
-    on the recurrence template's Mosaic GPU mainloop (`mosaic_rule`), a route no target's row takes yet: only
-    a caller naming it runs it."""
+    'mosaic' runs the rule on the recurrence template's Mosaic GPU mainloop (`mosaic_rule`), every decay with
+    or without the delta rule, a route no target's row takes yet: only a caller naming it runs it."""
     if hooks.conv is not None:
         raise ValueError("the chunked op takes the conv's output: its queries, keys and values")
     given = recurrence.read(hooks, operands, optional=('state',))
@@ -306,9 +305,8 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
     state, starts = operands.state, operands.starts
     epilogue = hooks.skip or hooks.output is not None
     if mainloop is not None:
-        if mainloop != 'mosaic' or (hooks.decay == 'vector' and not hooks.delta):
-            raise ValueError(f"the {mainloop!r} mainloop does not take {hooks}: the 'mosaic' one runs a "
-                             "decay a head or none, and one a key dimension under the delta rule")
+        if mainloop != 'mosaic':
+            raise ValueError(f"no {mainloop!r} mainloop: the recurrence template's is 'mosaic'")
         # Unrounded where an epilogue follows, as on the portable math.
         out, final = mosaic_rule(query, key, value, g, beta, state, starts=starts, max_segments=max_segments,
                                  scale=scale, delta=hooks.delta, wide=epilogue)

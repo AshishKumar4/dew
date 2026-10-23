@@ -100,9 +100,8 @@ def test_the_mosaic_forward_is_as_exact_as_its_reference(case, dtype):
                     f'the mosaic forward, {case} in {jnp.dtype(dtype).name}', seeds=SEEDS, truth_fn=truth)
 
 
-TAKEN = [hooks for hooks in HOOKS + FORMED if hooks.decay != 'vector' or hooks.delta]
-"""The chunked op's hook combinations the mainloop takes: a decay a head or none, and one a key dimension
-under the delta rule."""
+TAKEN = HOOKS + FORMED
+"""The chunked op's hook combinations, every one of which the mainloop takes."""
 
 
 @ON_MMA_SYNC

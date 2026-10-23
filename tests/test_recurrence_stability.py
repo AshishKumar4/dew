@@ -227,9 +227,8 @@ def stressed(hooks, regime: str, seed: int, *, value_heads: int = VALUE_HEADS) -
     return (operands,)
 
 
-TEMPLATED = ('scalar delta', 'vector delta', 'scalar write', 'gated', 'rated')
-"""The sites the recurrence template's Mosaic GPU mainloop takes: a decay a head, with or without the delta
-rule, and one a key dimension under it."""
+TEMPLATED = tuple(SITES)
+"""The sites the recurrence template's Mosaic GPU mainloop takes: every one."""
 
 ON_MMA_SYNC = pytest.mark.skipif(
     generation.family(generation.device_generation()) != 'mma.sync',
