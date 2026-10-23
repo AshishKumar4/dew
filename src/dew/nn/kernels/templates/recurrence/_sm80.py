@@ -3,7 +3,8 @@
 one warpgroup a program, its operand tiles streamed into swizzled shared memory by cp.async (no TMA before
 Hopper), each product a synchronous warp-level MMA of 16-bit operands loaded from shared memory into its
 operand layouts (ldmatrix) and accumulated in registers. A register operand reaches a product through shared
-memory (`stage`): Mosaic GPU's layout inference finds no cast from an accumulator's layout to an operand's."""
+memory (`staged`): Mosaic GPU's layout inference finds no cast from an accumulator's layout to an
+operand's."""
 
 import contextlib
 import contextvars
@@ -39,12 +40,11 @@ def _interpreted(interpret: bool):
 
 
 class _Stream:
-    """One operand's stream: its slots in shared memory, and the views a step copies into them, which the
-    producer's `stream` names and the consumer's `walk` copies (one role does both)."""
+    """One operand's stream: its slots in shared memory, and its view `(ref, block)` each step copies `block`
+    rows of into them (`Family.opened`'s), which the walk copies (one role loads and computes)."""
 
-    def __init__(self, smem):
-        self.smem = smem
-        self.views = None
+    def __init__(self, smem, view):
+        self.smem, self.view = smem, view
 
     @property
     def stages(self) -> int:
@@ -66,13 +66,15 @@ class _Slots:
         del name
 
 
-class MmaSync(mosaic.Family):
+class MmaSync(mosaic.Family[dict, dict, jax.Array]):
     """mma.sync's bundle: a warpgroup's four warps down a 64-row accumulator (Mosaic GPU's `MMA_ACC`),
     operands of 16 bits, loads by cp.async in `stages`-deep rings each walk waits on in turn. Its products are
-    synchronous, so a product's operands are read once it returns."""
+    synchronous, so a product's operands are read once it returns, and its accumulators are register
+    arrays."""
 
     name = "mma.sync"
     rows = 64
+    consumers = 1
     layout = plgpu.Layout.MMA_ACC(jnp.bfloat16)
     row = layout.reduce(1)
     column = layout.reduce(0)
@@ -90,9 +92,12 @@ class MmaSync(mosaic.Family):
                             compiler_params=mosaic.compiler_params(),
                             interpret=plgpu.InterpretGPUParams() if interpret else None)
 
-    def roles(self, wg, consumers: int, consumer, producer) -> None:
-        # One role: the producer names its views, and the consumer's walk copies them.
-        del wg, consumers
+    def scoped(self, body, *allocations, streams) -> None:
+        pl.run_scoped(lambda *refs, **slots: body(*refs, streams=slots), *allocations, **streams)
+
+    def roles(self, consumers: int, consumer, producer) -> None:
+        # One role: the producer's loads are the consumer's walk's.
+        del consumers
         producer()
         consumer(0)
 
@@ -101,28 +106,30 @@ class MmaSync(mosaic.Family):
         return {name: plgpu.SMEM((stages, *shape), dtype, transforms=swizzled(*shape, dtype))
                 for name, (shape, dtype) in blocks.items()}
 
-    def opened(self, allocated: dict) -> dict:
-        return {name: _Stream(smem) for name, smem in allocated.items()}
+    def opened(self, allocated: dict, views: dict | None = None) -> dict:
+        return {name: _Stream(smem, None if views is None else views[name])
+                for name, smem in allocated.items()}
 
-    def stream(self, streams: dict, views, lo, hi) -> None:
-        del lo, hi
-        for stream in streams.values():
-            stream.views = views
+    def stream(self, streams, views: dict, lo, hi) -> None:
+        # The walk copies each step's tiles itself.
+        del streams, views, lo, hi
 
-    def walk[C](self, streams: dict, segments, start: C, shapes: tuple, interpret: bool, *,
-                first: jax.Array | int = 0) -> tuple[C, tuple[jax.Array, ...]]:
-        del interpret
+    def walk[C](self, streams, segments, start: C, shapes: tuple, interpret: bool, *,
+                first: jax.Array | int = 0, in_flight: int = 0) -> tuple[C, tuple[jax.Array, ...]]:
+        # A product is done when it returns: no step's stays in flight past it.
+        del interpret, in_flight
         names = tuple(streams)
         stages = min(stream.stages for stream in streams.values())
         ahead = stages - 1
 
         def copy(index, slot):
-            views = next(iter(streams.values())).views(index)
             for name in names:
+                ref, block = streams[name].view
+                view = ref.at[pl.ds(index * block, block)]
                 if _INTERPRETED.get():
-                    streams[name].smem.at[slot][...] = views[name][...]
+                    streams[name].smem.at[slot][...] = view[...]
                     continue
-                plgpu.copy_gmem_to_smem(views[name], streams[name].smem.at[slot], None,
+                plgpu.copy_gmem_to_smem(view, streams[name].smem.at[slot], None,
                                         oob_mode=plgpu.OOBFillMode.PROMISE_IN_BOUNDS)
 
         both = (start, tuple(self.zeros(shape) for shape in shapes))
@@ -150,10 +157,38 @@ class MmaSync(mosaic.Family):
             both = lax.fori_loop(lo, hi, stepped, both)
         return both
 
-    def passed(self, streams: dict, lo, hi, *, first: jax.Array | int = 0, between=None) -> None:
+    def passed(self, streams, lo, hi, *, first: jax.Array | int = 0, between=None) -> None:
         del streams, first
         if between is not None:
             pl.loop(lo, hi)(lambda _: between())
+
+    def loaded(self, copies) -> None:
+        for view, ref, _ in copies:
+            if _INTERPRETED.get():
+                ref[...] = view[...]
+            else:
+                plgpu.copy_gmem_to_smem(view, ref, None, oob_mode=plgpu.OOBFillMode.PROMISE_IN_BOUNDS)
+        if not _INTERPRETED.get():
+            plgpu.wait_gmem_to_smem(0)
+
+    def stored(self, parts, views, *, smem) -> None:
+        # Registers to global memory directly: no TMA before Hopper.
+        del smem
+        for part, view in zip(parts, views, strict=True):
+            view[...] = part.astype(view.dtype)
+
+    def added(self, value: jax.Array, view, interpret: bool, *, smem) -> None:
+        raise NotImplementedError("mma.sync's bundle adds into global memory by no TMA reduction (sm90's)")
+
+    def held(self, ref):
+        return ref
+
+    def staged(self, value: jax.Array, buffer):
+        """Mosaic GPU brackets a store with the warpgroup's barriers (its automatic barriers), so every warp's
+        reads of `buffer` are done before it and its writes seen after; sm80 has no async proxy to fence
+        (`commit_smem`'s fence.proxy.async does not select there)."""
+        buffer[...] = value.astype(buffer.dtype)
+        return buffer
 
     def operand(self, ref, side: str):
         """A shared-memory tile `ref` (a transposed view too) in the left or right operand's layout."""
@@ -161,68 +196,47 @@ class MmaSync(mosaic.Family):
         return plgpu.load(ref, layout=layout(ref.dtype))
 
     def product(self, lhs, rhs, shape: tuple[int, int], then=None) -> jax.Array:
-        out = self.issue(self.zeros(shape), lhs, rhs)
+        out = self.products(self.zeros(shape), lhs, rhs, _INTERPRETED.get())
         if then is not None:
             then()
         return out
 
-    def issue(self, acc, lhs, rhs, *, transpose_lhs: bool = False, transpose_rhs: bool = False) -> jax.Array:
-        """`acc + lhs @ rhs` of shared-memory tiles, either read transposed (its view's load, ldmatrix's)."""
-        lhs, rhs = lhs.T if transpose_lhs else lhs, rhs.T if transpose_rhs else rhs
+    def summed(self, shape: tuple[int, int], issue, interpret: bool) -> jax.Array:
+        del interpret
+        return issue(self.zeros(shape))
+
+    def products(self, acc, lhs, rhs, interpret: bool) -> jax.Array:
+        # Mosaic GPU's interpreter lowers no mma.sync: the dot it computes.
+        del interpret
         if _INTERPRETED.get():
             return acc + jnp.dot(lhs[...], rhs[...], preferred_element_type=jnp.float32)
         return plgpu.mma(acc, self.operand(lhs, "lhs"), self.operand(rhs, "rhs"))
 
-    def accumulators(self, shapes: tuple) -> tuple:
-        return tuple(self.zeros(shape) for shape in shapes)
-
-    def relayout(self, value, dtype):
-        """An accumulator as an operand in registers: None, Mosaic GPU finds no cast from mma.sync's
-        accumulator layout to its operands' (`stage` takes it through shared memory)."""
-        del value, dtype
-
-    def loaded(self, ref) -> jax.Array:
-        """A shared-memory tile in registers, in the accumulator's layout."""
-        return ref[...] if _INTERPRETED.get() else plgpu.load(ref, layout=self.layout, optimized=False)
-
-    def stored(self, ref, value) -> None:
-        """`value` into `ref` in its dtype."""
-        ref[...] = value.astype(ref.dtype)
-
     def registers_product(self, lhs: jax.Array, rhs, interpret: bool) -> jax.Array:
-        del interpret
-        lhs = plgpu.layout_cast(lhs, plgpu.Layout.MMA_LHS(lhs.dtype))
-        return plgpu.mma(self.zeros((lhs.shape[0], rhs.shape[1])), lhs, self.operand(rhs, "rhs"))
+        acc = self.zeros((lhs.shape[0], rhs.shape[1]))
+        return self.register_products(acc, ((lhs, None),), rhs, interpret)
 
     def register_products(self, acc, parts, rhs, interpret: bool):
         del interpret
-        for part, exponent in parts:
-            if exponent is not None:
-                raise NotImplementedError("a scaled part's product is no in-place accumulation (fp16's)")
+        mosaic.unscaled(parts)
+        for part, _ in parts:
             part = plgpu.layout_cast(part, plgpu.Layout.MMA_LHS(part.dtype))
             acc = plgpu.mma(acc, part, self.operand(rhs, "rhs"))
         return acc
 
     def staged_products(self, acc, parts, rhs, buffers, interpret: bool, *, transposed: bool = False):
-        del interpret
-        for place, (part, exponent) in enumerate(parts):
-            if exponent is not None:
-                raise NotImplementedError("a scaled part's product is no in-place accumulation (fp16's)")
-            lhs = self.stage(part, buffers.at[place])
-            acc = plgpu.mma(acc, self.operand(lhs.T if transposed else lhs, "lhs"), self.operand(rhs, "rhs"))
+        mosaic.unscaled(parts)
+        for place, (part, _) in enumerate(parts):
+            lhs = self.staged(part, buffers.at[place])
+            acc = self.products(acc, lhs.T if transposed else lhs, rhs, interpret)
         return acc
 
-    def stage(self, value, buffer):
-        """`value` in the shared-memory tile `buffer`, in its dtype, for a product to read: a register
-        operand's way to an MMA. Mosaic GPU brackets a store with the warpgroup's barriers (its automatic
-        barriers), so every warp's reads of `buffer` are done before it and its writes seen after; sm80 has no
-        async proxy to fence (`commit_smem`'s fence.proxy.async does not select there)."""
-        self.stored(buffer, value)
-        return buffer
+    def rescaled_products(self, acc, scale, parts, rhs, interpret: bool):
+        return self.register_products(scale(acc), parts, rhs, interpret)
 
-    def settled(self) -> None:
+    def settled(self, pending: int = 0) -> None:
         # The products are synchronous: each has read its operands when it returns.
-        pass
+        del pending
 
     def zeros(self, shape: tuple[int, ...]) -> jax.Array:
         return self.full(shape, 0.0)
@@ -238,9 +252,8 @@ class MmaSync(mosaic.Family):
         return plgpu.load(ref, layout=self.row, optimized=False)
 
     def columns_of(self, ref) -> jax.Array:
-        """A column vector read from `ref` (`[columns]`) in a column's layout. Two loads of one view in a
-        row's and a column's layouts are one load to Mosaic GPU's layout inference, which then finds none for
-        it."""
+        """Two loads of one view in a row's and a column's layouts are one load to Mosaic GPU's layout
+        inference, which then finds none for it."""
         return plgpu.load(ref, layout=self.column, optimized=False)
 
     def as_row(self, vector: jax.Array) -> jax.Array:

@@ -36,6 +36,22 @@ class Wgmma(mosaic.RingFamily):
 
         return pl.run_scoped(scores, plgpu.WGMMAAccumulatorRef(shape, jnp.float32))
 
+    def summed(self, shape: tuple[int, int], issue, interpret: bool) -> jax.Array:
+        if interpret:
+            return issue(self.zeros(shape))
+
+        def run(acc_ref):
+            issue(acc_ref)
+            return acc_ref[...]
+
+        return pl.run_scoped(run, plgpu.WGMMAAccumulatorRef(shape, jnp.float32))
+
+    def staged(self, value: jax.Array, buffer):
+        buffer[...] = value.astype(buffer.dtype)
+        # The warpgroup's writes seen by the MMA's async proxy.
+        plgpu.commit_smem()
+        return buffer
+
     def registers_product(self, lhs: jax.Array, rhs, interpret: bool) -> jax.Array:
         if interpret:
             return jnp.dot(lhs, rhs[...], preferred_element_type=jnp.float32)

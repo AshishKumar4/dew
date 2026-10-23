@@ -1,15 +1,15 @@
 """The recurrence template's Mosaic GPU mainloop (`dew.nn.kernels.templates.recurrence.mainloop`) through the
-chunked op's explicit route (`recurrence_chunk.chunk(..., mainloop='mosaic')`), compiled on a GPU of the
-instruction family its bundle claims (mma.sync): check 1 (`reference_error.assert_as_exact`) of its output and
-final memory against its reference's (the recurrence a token at a time,
+chunked op's explicit route (`recurrence_chunk.chunk(..., mainloop='mosaic')`), compiled on a GPU of an
+instruction family one of its bundles claims (mma.sync, wgmma): check 1 (`reference_error.assert_as_exact`) of
+its output and final memory against its reference's (the recurrence a token at a time,
 `test_recurrence_chunk.token_by_token`, in an fp32 call, the fla port in a 16-bit one), both from float64,
 over one sequence a row and packed documents, value heads over fewer key heads, keys 64 and 128 wide, values
 off a block's width, bf16 and fp32 operands and lengths off the chunks, and every hook combination the
 mainloop takes (a decay a head or none, with and without the delta rule, Mamba2's rated decay, the skip and
 the norm) on the chunked op's own draws (`test_recurrence_chunk`). Off such a GPU the cases run in Mosaic
-GPU's interpreter, whose products are the dots they compute (it lowers no mma.sync): coverage of the
-mainloop's algebra, not proof of its kernels, which the GPU gate is; the stability suite holds the mainloop
-under its regimes there (tests/test_recurrence_stability.py)."""
+GPU's interpreter on the wgmma bundle (`mainloop.INTERPRETED`), whose products are the dots they compute:
+coverage of the mainloop's algebra and its roles' streams, not proof of its kernels, which the GPU gate is;
+the stability suite holds the mainloop under its regimes there (tests/test_recurrence_stability.py)."""
 
 import functools
 
@@ -20,12 +20,13 @@ import pytest
 from reference_error import assert_as_exact
 from test_recurrence_chunk import FORMED, HOOKS, SEEDS as HOOK_SEEDS, draw as hooked_draw, token_by_token
 
-from dew.nn.kernels import generation, recurrence
+from dew.nn.kernels import recurrence
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk
+from dew.nn.kernels.templates.recurrence import mainloop
 
-ON_MMA_SYNC = pytest.mark.skipif(
-    generation.family(generation.device_generation()) != 'mma.sync',
-    reason="the mainloop's mma.sync bundle runs compiled on a GPU of its family (an A100)")
+ON_ITS_FAMILY = pytest.mark.skipif(
+    mainloop.family_of() is None,
+    reason="the mainloop's bundles run compiled on a GPU of the family each claims (an A100's, an H100's)")
 
 pytestmark = pytest.mark.kernel
 
@@ -104,7 +105,7 @@ TAKEN = HOOKS + FORMED
 """The chunked op's hook combinations, every one of which the mainloop takes."""
 
 
-@ON_MMA_SYNC
+@ON_ITS_FAMILY
 @pytest.mark.parametrize('packed', (False, True), ids=['one sequence', 'packed'])
 @pytest.mark.parametrize('hooks', TAKEN, ids=str)
 def test_every_hook_the_mosaic_mainloop_takes_is_as_exact_as_the_recurrence_token_by_token(hooks, packed):

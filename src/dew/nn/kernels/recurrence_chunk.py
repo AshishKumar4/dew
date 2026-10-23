@@ -432,16 +432,17 @@ def mosaic_rule(query, key, value, g, beta, state=None, *, starts=None, max_segm
     """The chunked rule, a decay a head (`g` `[B, S, Hv]`) or a key dimension (`[B, S, Hv, Dk]`), with or
     without the `delta` rule, on the recurrence template's Mosaic GPU mainloop
     (`templates.recurrence.mainloop.forward`, its forward alone): `fla_rule`'s operands and results, the
-    operands in their common dtype and beta with them, the decay and the memory fp32, on one device,
-    interpreted off a GPU of the instruction family its bundle claims (Mosaic GPU's interpreter)."""
+    operands in their common dtype and beta with them, the decay and the memory fp32, on one device, by the
+    bundle of its instruction family (`mainloop.family_of`), interpreted off a GPU of a family a bundle claims
+    (Mosaic GPU's interpreter, `mainloop.INTERPRETED`'s)."""
     from .templates.recurrence import mainloop
 
     dtype = jnp.result_type(query, key, value)
     query, key, value, beta = (x.astype(dtype) for x in (query, key, value, beta))
-    interpret = generation.family(generation.device_generation()) != mainloop.FAMILY.name
+    family = mainloop.family_of()
     return mainloop.forward(query, key, value, g.astype(jnp.float32), beta, state, starts=starts,
                             max_segments=max_segments, scale=scale, delta=delta, wide=wide,
-                            interpret=interpret)
+                            family=family or mainloop.INTERPRETED, interpret=family is None)
 
 
 RECOMPUTED: contextvars.ContextVar[tuple[str, ...]] = contextvars.ContextVar("recomputed", default=())

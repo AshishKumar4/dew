@@ -20,8 +20,8 @@ eighth token between mild ones, whose pairs after it are differences of large, n
 runs the portable math (`recurrence_chunk.chunk`'s `chunk_delta_rule`), held to the recurrence by check 1;
 a decay a key dimension no steeper than the regime's floor (`FLOORS`), Kimi Linear's domain. The recurrence
 template's Mosaic GPU mainloop takes its arm (`template`) at the sites it takes (`TEMPLATED`), compiled on a
-GPU of the instruction family its bundle claims; the suite runs compiled on a GPU as on a CPU, where a CPU's
-interpretation of a kernel judges its host's arithmetic, not the kernel's."""
+GPU of an instruction family one of its bundles claims; the suite runs compiled on a GPU as on a CPU, where a
+CPU's interpretation of a kernel judges its host's arithmetic, not the kernel's."""
 
 import dataclasses
 import functools
@@ -33,8 +33,9 @@ import pytest
 from reference_error import assert_as_exact, widened
 from test_recurrence_chunk import CHUNK, KEY_WIDTH, VALUE_HEADS, draw, token_by_token
 
-from dew.nn.kernels import generation, recurrence
+from dew.nn.kernels import recurrence
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk
+from dew.nn.kernels.templates.recurrence import mainloop
 
 SITES = {'scalar delta': recurrence.Hooks(decay='scalar', scale=KEY_WIDTH ** -0.5),
          'vector delta': recurrence.Hooks(decay='vector', scale=KEY_WIDTH ** -0.5),
@@ -230,12 +231,12 @@ def stressed(hooks, regime: str, seed: int, *, value_heads: int = VALUE_HEADS) -
 TEMPLATED = tuple(SITES)
 """The sites the recurrence template's Mosaic GPU mainloop takes: every one."""
 
-ON_MMA_SYNC = pytest.mark.skipif(
-    generation.family(generation.device_generation()) != 'mma.sync',
-    reason="the template's Mosaic mainloop runs compiled on a GPU of the family its bundle claims (mma.sync)")
+ON_ITS_FAMILY = pytest.mark.skipif(
+    mainloop.family_of() is None,
+    reason="the template's Mosaic mainloop runs compiled on a GPU of the family one of its bundles claims")
 
 CASES = [pytest.param(name, regime, arm, id=f'{name}-{regime}-{arm}',
-                      marks=[ON_MMA_SYNC] * (arm == 'template'))
+                      marks=[ON_ITS_FAMILY] * (arm == 'template'))
          for name in SITES for regime in REGIMES
          for arm in (('portable', 'template') if name in TEMPLATED else ('portable',))]
 

@@ -199,7 +199,8 @@ class Ring:
         return int(self.smem.shape[0])
 
     def slot(self, counter):
-        """The slot step `counter` uses."""
+        """The slot step `counter` (traced, or a static step's) uses."""
+        counter = jnp.asarray(counter, jnp.int32)
         return lax.rem(counter, jnp.asarray(self.stages, counter.dtype))
 
     def load(self, counter, view) -> None:
@@ -320,10 +321,11 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
     mainloop issues that the hardware decides, so a mainloop holds no instruction, layout or barrier of its
     own. Its facts (`name`, the MMA's row unit `rows`), its launch and roles (`kernel`, `roles`), its operand
     streams (`streams`, `opened`, `stream` the producer's, `walk` and `passed` the consumer's), its products
-    (`product` into a fresh accumulator, `register_products` and `staged_products` in place, `settled`), and
-    its accumulator's layouts (`zeros`, `full`, `iota`, `rows_of`, `as_row`). It is generic in its streams'
-    allocations (`Allocated`, `streams`'), its opened streams (`Opened`, `opened`'s) and the accumulator its
-    products issue into in place (`Accumulator`: a warpgroup accumulator ref, or a register array)."""
+    (`product` and `summed` into a fresh accumulator, `products`, `register_products` and `staged_products`
+    in place, a register operand `staged` for one, `settled`), and its accumulator's layouts (`zeros`,
+    `full`, `iota`, `rows_of`, `as_row`). It is generic in its streams' allocations (`Allocated`,
+    `streams`'), its opened streams (`Opened`, `opened`'s) and the accumulator its products issue into in
+    place (`Accumulator`: a warpgroup accumulator ref, or a register array)."""
 
     name: str
     rows: int
@@ -394,9 +396,19 @@ class Family[Allocated, Opened, Accumulator](abc.ABC):
         or registers."""
 
     @abc.abstractmethod
+    def staged(self, value: jax.Array, buffer: Ref) -> Ref:
+        """`value` in the shared-memory tile `buffer`, in its dtype, for a product to read: a register right
+        operand's way to an MMA (`staged_products` stages left ones)."""
+
+    @abc.abstractmethod
     def product(self, lhs, rhs, shape: tuple[int, int], then=None) -> jax.Array:
         """`lhs @ rhs` into a fresh fp32 accumulator of `shape`, its value, with `then` issued while the
         product runs."""
+
+    @abc.abstractmethod
+    def summed(self, shape: tuple[int, int], issue, interpret: bool) -> jax.Array:
+        """`issue(acc) -> acc` issuing products in place (`products`) into a fresh fp32 accumulator of
+        `shape` (zero), its value once they are done."""
 
     @abc.abstractmethod
     def registers_product(self, lhs: jax.Array, rhs, interpret: bool) -> jax.Array:
