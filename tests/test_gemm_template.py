@@ -637,6 +637,21 @@ def test_a_fused_norm_lowers_for_an_h100(producer):
     assert {route.kernel for route in taken if route.choice == 'gemm_prologue'} == {'fused'}
 
 
+def _three_gemms(sizes):
+    """A fused producer's product three ways: under `fuser.fuse`, unfused, and its float64 truth."""
+    def fused_gemm(operand, w):
+        return fused.fusible_gemm(operand, w, sizes, interpret_on_cpu=True)
+
+    def plain_gemm(operand, w):
+        return template.gemm(operand, w, sizes, out_dtype=jnp.float32)
+
+    def truth_gemm(operand, w):
+        matrix = w.astype(jnp.bfloat16).astype(operand.dtype)
+        return jax.lax.ragged_dot(operand, matrix, sizes, preferred_element_type=operand.dtype)
+
+    return fused_gemm, plain_gemm, truth_gemm
+
+
 @pytest.mark.parametrize("producer", [rms_norm, dew_rms_norm, relu], ids=lambda producer: producer.__name__)
 def test_a_fused_producers_gradients_are_its_own(producer):
     """Every input's gradient through a producer fused into the prologue is the unfused program's: the
@@ -657,15 +672,7 @@ def test_a_fused_producers_gradients_are_its_own(producer):
             return _wide(out)  # fp32, or the truth's float64, as the drawn cotangent is widened
         return with_gradients(transform(value))
 
-    def fused_gemm(operand, w):
-        return fused.fusible_gemm(operand, w, sizes, interpret_on_cpu=True)
-
-    def plain_gemm(operand, w):
-        return template.gemm(operand, w, sizes, out_dtype=jnp.float32)
-
-    def truth_gemm(operand, w):
-        matrix = w.astype(jnp.bfloat16).astype(operand.dtype)
-        return jax.lax.ragged_dot(operand, matrix, sizes, preferred_element_type=operand.dtype)
+    fused_gemm, plain_gemm, truth_gemm = _three_gemms(sizes)
 
     with generation.assumed("sm80"), generation.routes() as taken:
         assert_as_exact(jax.jit(loss(fused_gemm, fuser.fuse)), jax.jit(loss(plain_gemm)), draw,
@@ -702,15 +709,7 @@ def test_a_fused_producers_forward_and_higher_derivatives_are_its_own(compositio
             return jax.jvp(lambda x: program(x, w, weight), (x,), along)[1]
         return run
 
-    def fused_gemm(operand, w):
-        return fused.fusible_gemm(operand, w, sizes, interpret_on_cpu=True)
-
-    def plain_gemm(operand, w):
-        return template.gemm(operand, w, sizes, out_dtype=jnp.float32)
-
-    def truth_gemm(operand, w):
-        matrix = w.astype(jnp.bfloat16).astype(operand.dtype)
-        return jax.lax.ragged_dot(operand, matrix, sizes, preferred_element_type=operand.dtype)
+    fused_gemm, plain_gemm, truth_gemm = _three_gemms(sizes)
 
     with generation.assumed("sm80"), generation.routes() as taken:
         assert_as_exact(jax.jit(derivative(fused_gemm, fuser.fuse)), jax.jit(derivative(plain_gemm)), draw,
