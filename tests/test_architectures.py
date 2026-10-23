@@ -122,9 +122,8 @@ PREDICTOR = {"grid": GRID, "emb_features": 32, "predictor_features": 16,
 VOCAB = 64
 SEQ_LEN = 16
 LONG_SEQ_LEN = 128
-"""The rows of a cell whose float32 error is heavy-tailed over draws, four draws in 64 holding most
-of it (Gemma 3n's, where float32 now and then takes the other branch of the AltUp clamp or the
-sparsity cutoff than float64 does, and Qwen 3.5's): longer rows put more such events in each draw,
+"""The rows of a cell whose float32 error is heavy-tailed over draws, a few draws holding most of it
+(Gemma 3n's and Qwen 3.5's): longer rows put more such events in each draw,
 so check 1's pooled ratio resolves over a sized count of draws, where SEQ_LEN's rows left the
 reference compared with itself unresolved within 512. Qwen 3.5's rows are twice as long: at 128 its
 embedding's momentum still did not resolve within 512. Gemma 3n's draws also clear the sparsity
@@ -235,7 +234,7 @@ CASES = [
     # about two, a token whose kept units all sit just above the cutoff gives
     # the feed-forward's post-norm a near-zero input, whose direction float32
     # resolves poorly, and four draws in 320 held 60% of a layer-0 leaf's
-    # pooled error (at 192, under 20%; at 384, 6%).
+    # pooled error (at 192, at most 22%; at 384, 6%).
     Case("causal_transformer", {
         **LM, "num_heads": 4, "num_kv_heads": 2, "head_dim": 8, "mlp": "geglu",
         "mlp_features": (192, 64), "activation_sparsity_pattern": (0.95, 0.0),
@@ -411,7 +410,7 @@ LAYOUT_SEEDS: dict[str, int] = {
     "jepa_video_encoder": 256, "causal_transformer": 64, "causal_transformer+moe": 64,
     "causal_transformer+gpt_oss": 256, "causal_transformer+deepseek_v2": 128,
     "causal_transformer+glm4_moe": 256, "causal_transformer+llama4": 32,
-    "causal_transformer+gemma4_moe": 128, "causal_transformer+gemma3n": 64,
+    "causal_transformer+gemma4_moe": 128, "causal_transformer+gemma3n": 128,
     "causal_transformer+mla": 64,
 }
 """Each cell's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for` on armada, paired
@@ -421,10 +420,12 @@ DEFAULT_LAYOUT_SEEDS = 16
 
 MARGIN = 1e-5
 """The least selection margin a draw admits (`selection_margin`), relative to the scale of what is
-selected: thirty times the fp32 rounding a layout's sums move a selection's inputs by (a K-term fp32
-dot's sqrt(K) 2^-24 of its row, about 3e-7 at these widths), so one device, each layout and the float64
-run select alike. A selection is discontinuous: inputs within rounding of a boundary pick other keys or
-units in other runs, a difference no precision bounds."""
+selected: above the distance float32 rounding moves a selection's inputs from their float64 values,
+so one device, each layout and the float64 run select alike. Gemma 3n's gate, whose inputs carry the
+rounding of the attention and AltUp before it, moved at most 3.7e-6 of its row's deviation over the
+1,200 forwards of 320 draws (median 1.6e-6, a light tail: 99% within 2.6e-6). A selection is
+discontinuous: inputs within rounding of a boundary pick other keys or units in other runs, a
+difference no precision bounds."""
 
 
 def selects(case: Case) -> bool:
