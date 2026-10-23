@@ -53,15 +53,13 @@ MISSES = {
     ("sm90", "mosaic_gpu", "targets-comment", "forward"): LOADED_LATENCY,
     ("sm90", "triton", "targets-comment", "forward"): LOADED_LATENCY,
     ("sm90", "triton", "targets-comment", "input_gradient"): LOADED_LATENCY,
-    ("sm90", "mosaic_gpu", "mixtral up", "forward"): L2_REUSE,
     ("sm90", "triton", "mixtral up", "forward"): L2_REUSE,
     ("sm90", "triton", "mixtral up", "input_gradient"): L2_REUSE,
     ("sm90", "triton", "mixtral down", "forward"): L2_REUSE,
-    ("sm90", "mosaic_gpu", "mixtral down", "input_gradient"): L2_REUSE,
     ("sm90", "triton", "mixtral down", "input_gradient"): L2_REUSE,
 }
 """Each case whose pick runs past 10% of the best, by generation, implementation, shape and product, with
-the term the model lacks: 30 of the 84 swept (2026-10-21; GMMT-a100, GMMCOOP-h100, whose sweep times the
+the term the model lacks: 28 of the 84 swept (GMMT-a100, GMMCOOP-h100, whose sweep times the
 cooperative tiles)."""
 
 

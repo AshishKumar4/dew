@@ -53,7 +53,7 @@ Coordinates and row vectors come from the toolkit, because Mosaic GPU iotas need
 - Functions:
   - `modify(s, coords, params)`: the score hooks plus the partial-block mask;
   - `peak(m, s) -> (m', alpha[, rescale?])`: FA4's lazy rescale is an option of `peak`;
-  - `weights(s, m') -> p`, in base 2 with log2(e) folded into the scale;
+  - `weights(s, m') -> p`, in base 2 with log2(e) folded into the scale by default, or natural (see "The exponent's forms" below); a logit at its row's maximum weighs 1 exactly, however a compiler contracts its scaling into the subtraction;
   - a weights hook between `weights` and `narrow`, for scales along P·V's contraction (a quantized V's per-token scales), which no output or product scale can apply;
   - `narrow(p) -> p16`, or `(p8, scale)` for FP8;
   - `total(l, alpha, p)`;
@@ -62,6 +62,22 @@ Coordinates and row vectors come from the toolkit, because Mosaic GPU iotas need
 - Q and K prologues are hooks: RoPE and QK-norm. MLA's q·W_uk is a declared product, not a hook.
 - **Partial state:** an unhooked `Partial(acc, m, l)`, wide enough for its role (fp32), with an empty identity and an ordered, associative `merge`. Split-KV decode, ring and context parallelism, chunked prefill and resumed state all produce and merge Partials. Sinks and the resumed state enter exactly once (today's `_first_slice_sink` rule). `finish(partial) -> (out, lse)` and the output hooks run once, after the final merge, because a pointwise output hook doesn't distribute over a merge. The Partial has its own residuals and VJP, separate from the finished output.
 - Every function stays valid on value-width slices, for MLA's Dv 512 and d256 split across consumer warpgroups.
+- **Headroom** (the accurate form's): the weighted values can pass fp32's largest only where the values are near it. A program walks as ever and writes which of its rows' sums overflowed; a second launch walks again only the programs with one, those rows alone shifting by a power of two (`room`), exact and leaving every ratio, at most 2^-64 of it on the weights and the rest on the tile's product. Its residual carries the shift to the backward's split sums. A call whose values can't overflow (fp16, no initial state) compiles no check.
+
+**The exponent's forms.** The default folds log2(e) into the scale (exp2 of `s·c − m`, which a compiler contracts to `fma(s, c, −m)`), FA2's and jax's mha arithmetic, and is the fast form; `natural=True` is the accurate form:
+- its logits stay raw products, each exponent their difference scaled after it is taken, `exp2((s − m)·c)` (`Forward.raw`): the largest logit's weight is 1 exactly and no multiply precedes the subtraction to contract into it. Under a score hook or an initial state its logits are scaled, the largest's weight held to 1 by a select;
+- the backward recomputes its weights in the forward's units from its raw maximum (`Recompute`);
+- its sums carry the headroom (above).
+
+Both pass check 1 on drawn inputs; the stability suite (tests/test_attention_stability.py) holds the accurate form to every family and the fold to all but its divergences at extreme inputs, which it runs in the accurate form alone:
+- logits a ulp apart near 2^30, at scales below 1: the fold rounds each logit at log2(e) times its size, so two the reference keeps apart can tie, and a large cotangent then overflows the backward;
+- logits near fp32's largest: the contracted exponent of the largest logit is its product's rounding, up to an ulp of the logit, so its weight is 0 or infinite (with one key, its weight is 1 within an ulp of that exponent);
+- values near fp32's largest: the weighted values' sum overflows where the reference's normalized one does not (the headroom is the accurate form's), and so does a sink near fp32's largest;
+- in fp32, a row whose output one weight carries over values near fp32's largest (a weight of e^-12 to e^-26 on values of 2^120 to 2^126): the fold's extra rounding of that weight's logit is the row's error, 2.04 times the reference's; bf16 hides it in the weight's rounding to 16 bits;
+- a maximum that jumps far within a row (logits 50 above the keys before them): every earlier weight shares the one rounded exponent of the rescale, which doesn't average out over them as the reference's per-key exponents do, 9.8 times the reference's error over 32 keys; the accurate form compensates that exponent (TwoSum, and TwoProduct for the raw scale; `carried`), 0.28 times the reference's;
+- logits near 1e30 and beyond: the backward takes the base-2 maximum back to natural units, which moves the anchor's own weight away from 1.
+
+Measured on an H100 at qwen3-8b and gpt-oss-20b shapes, 4k and 32k tokens, the accurate form's raw arithmetic costs 1–5% of the forward and the headroom guard 2–6%; the training step's backward is within 2%. The fold needs `scale·log2(e) < 1` in fp32, so every folded logit is an ulp of fp32's largest below it, and an initial maximum (a sink) past fp32's largest in base 2 saturates exactly (`base2_maximum`).
 
 **Backward.**
 - Products: dP = dO·Vᵀ, dV += Pᵀ·dO, dK += dSᵀ·Q, dQ += dS·K, plus whatever D's form needs.
@@ -194,20 +210,20 @@ Rule 0 applies: use Splash's MaskInfo, with its empty/partial/full classes and p
 - the epilogue overlap;
 - for recurrence, its launch DAG: a fused or split solve (FlashQLA's fused prologue and fused scan against fla's four launches), and sequential or parallel state passing, chosen by B·H. Its sm90 shape includes a compute-producer warpgroup role, like FA4's correction warpgroup.
 
-**Every accelerator.** The templates target every accelerator Dew runs on, on par with the best framework on each. Each mainloop claims the generations below. A claim holds only with a measured scoreboard row on one GPU of that generation (booked through the GPU lane), in one session against the best kernel there. Until a generation has its measured row, its calls stay on today's routes (the interim selector, §7) or XLA, never on an unmeasured mainloop; a generation the template never claims runs XLA by a fixed capability rule.
+**Every accelerator.** The templates target every accelerator Dew runs on, on par with the best framework on each. A mainloop claims an instruction family, never a list of devices: on any GPU of a family it has a mainloop for, seen or unseen (a B300, sm103, is in sm100's tcgen05 family), the template compiles a kernel tailored to that device's facts and the cost model, and runs it by default. The family is the compute capability's (`generation.family`), and the facts are the device's own attributes, read free at runtime, with its family's (`generation.architecture`: tensor rates, warpgroup MMA, tensor memory, and model values of what only a measurement states, which the opt-in calibration replaces per device kind). Correctness on a new member comes from the hardware-free gates for that exact target: its deviceless compile and resource checks, and the interpret checks. The scoreboard GPUs validate the family and the cost model, one measured row per family. Only a GPU outside every claimed family runs XLA. While the interim selector stands (§7), an external route keeps a family's calls only where its measured row beats the template there, by the owner's deletion rule.
 
-| Mainloop | Backend | Claims | Instructions it relies on | One GPU per claim |
+| Mainloop | Backend | Claims (family) | Instructions it relies on | Scoreboard GPU of the family |
 |---|---|---|---|---|
-| Triton | Pallas Triton | sm80, sm86, sm89, sm120 | mma.sync, cp.async, ldmatrix | A100; A10 or RTX 3090; L4 or RTX 4090; RTX 5090 or RTX PRO 6000 |
-| Hopper | Mosaic GPU | sm90 | wgmma, TMA, warp specialization, clusters | H100 |
-| Blackwell | Mosaic GPU | sm100 | tcgen05, TMEM, 2-CTA | B200 |
+| Triton | Pallas Triton | mma.sync (sm80, sm86, sm89, sm120 and every 8.x/12.x) | mma.sync, cp.async, ldmatrix | A100; A10 or RTX 3090; L4 or RTX 4090; RTX 5090 or RTX PRO 6000 |
+| Hopper | Mosaic GPU | wgmma (9.0) | wgmma, TMA, warp specialization, clusters | H100 |
+| Blackwell | Mosaic GPU | tcgen05 (10.x/11.x: B200, B300, ...) | tcgen05, TMEM, 2-CTA | B200 |
 | TPU | Mosaic TPU | v5e, v6e and later | MXU, DMA pipeline | one chip per generation |
 
 Mosaic GPU takes each of the Triton row's claims when its scoreboard row there meets Triton's (the decision below); until then that row holds them.
 
-- **sm120 (consumer Blackwell: RTX 50, RTX PRO 6000) has no tcgen05 and no TMEM.** Its tensor cores take sm80's mma.sync forms (with FP8/FP4 additions), so it runs the mma.sync mainloop (Triton's until Mosaic's measures at or under it there), not the tcgen05 one.
-- **sm86/sm89/sm120 differ from sm80 in shared memory per SM** (99–100 KB a block against the A100's 163 KB) and in SM count. So their tile spaces and picks are their own TARGETS rows (`generation.shared_budget`), and their scoreboard rows are measured, not inferred from the A100.
-- **sm75 (T4) and older** have no bf16 tensor cores, and Pallas Triton doesn't compile there (`generation.py`, the sm75 row of TARGETS). They run XLA.
+- **sm120 (consumer Blackwell: RTX 50, RTX PRO 6000) has no tcgen05 and no TMEM.** Its tensor cores take sm80's mma.sync forms (with FP8/FP4 additions), so it is in the mma.sync family and runs that family's mainloop (Triton's until Mosaic's measures at or under it there), not the tcgen05 one.
+- **sm86/sm89/sm120 differ from sm80 in shared memory per SM** (99–100 KB a block against the A100's 163 KB) and in SM count. So their tile spaces and picks follow the device's own shared memory and SMs (`generation.shared_budget`, `runtime_facts`), and their family's scoreboard rows are measured, not inferred from the A100.
+- **sm75 (T4) and older** are outside every claimed family: no bf16 tensor cores, and Pallas Triton doesn't compile there (`generation.triton_runs`). They run XLA.
 
 Each mainloop's shape comes from the fastest known kernel on its hardware, built rung by rung against it:
 
@@ -266,7 +282,7 @@ A second copy of the algebra written in triton.language is not an acceptable ans
 **No kernel tables and, in the end, no selector.** The end state is one implementation per operation, the template. What stays is the config chooser inside each template: legality, then a model over device facts that picks tiles and formulations (§3), like any kernel's heuristics, with no per-GPU entries. Measured tuning is opt-in, cached per device kind, and the user's choice. Scoreboards are evidence, never routing data: no runtime table of measured routes is built.
 
 - **Interim:** today's typed selector (`selection`, `generation.route`) keeps serving the hand-kernel and external routes until each is deleted (§9). It isn't extended, and it goes with the last route.
-- **A generation the template doesn't claim** (§6) runs XLA by a fixed capability rule, not a measured choice. Where XLA beats the template on a claimed generation, that's a template defect to fix (§6, "debug where XLA wins"), not a route.
+- **A GPU outside every family the template claims** (§6) runs XLA by a fixed capability rule, not a measured choice. Where XLA beats the template on a claimed family's GPU, that's a template defect to fix (§6, "debug where XLA wins"), not a route.
 - **Legality prunes; predictions rank.** Only hard constraints remove a configuration: it fits shared memory, registers and TMEM, and respects layout and instruction rules. Residency, predicted spills and roofline estimates are predictions, so they rank the legal space and never prune it. Today's analytic model ties all 36 attention configurations and ties the dense pick with the best tile; pruning on it would keep an arbitrary subset.
 - **Rank with complete analytic features**, one schema for all templates:
   - work per pipe and bytes per memory level;
@@ -316,7 +332,7 @@ A second copy of the algebra written in triton.language is not an acceptable ans
   - `fla_gdn.py`, `fla_kda.py`, `mamba_ssd.py`, `ssd.py`, and the portable chunk math as a separate algebra;
   - `ragged_dot.py`, `triton_dense.py`, `norm_swiglu.py` (once its callers outside GEMM move), and the per-template cost formulas;
   - `KeySpans`, when MaskInfo takes over;
-  - each external route when its row is met, and with the last of them the typed selector itself: one implementation per operation remains, the template, with XLA by a fixed capability rule on a generation it doesn't claim (§7).
+  - each external route when its row is met, and with the last of them the typed selector itself: one implementation per operation remains, the template, with XLA by a fixed capability rule on a GPU outside every family it claims (§7).
 
 ## 10. Sharding, remat and compile
 

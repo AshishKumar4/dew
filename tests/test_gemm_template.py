@@ -1360,6 +1360,43 @@ def test_a_hook_that_broadcasts_a_side_operand_lowers_for_hopper_through_triton(
 
 
 
+@pytest.mark.parametrize("columns", [128, 300, 384], ids=lambda n: f"{n}-columns")
+def test_an_interpreted_fp32_product_at_highest_rounds_its_exact_sum_once(columns):
+    """A promoted fp32 product issued off a GPU (`product.interpreted`) accumulates in float64 and rounds
+    once, at every shape, where XLA's CPU dot takes a less exact fp32 accumulation at a 128-aligned shape
+    than at another. The operands are 12-bit integers at scales 2^-4 to 2^4, so every product and partial
+    sum is a multiple of 2^-8 below 2^37, exact in float64 in any order and past fp32's 24 bits: the
+    product is the exact sum rounded once to fp32, to the bit. That is the contract under test, the float64
+    accumulation: an fp32 one would round the partial sums, so equality is no claim that fp32 accumulation
+    is exact here. A 16-bit product keeps an fp32 sum."""
+    generator = np.random.default_rng(0)
+
+    def drawn(shape):
+        scales = 2.0 ** generator.integers(-4, 5, shape)
+        return (generator.integers(-2048, 2048, shape) * scales).astype(np.float32)
+
+    lhs, rhs = jnp.asarray(drawn((128, 128))), jnp.asarray(drawn((128, columns)))
+    declared = product.declared(jnp.float32, jax.lax.Precision.HIGHEST, outputs=(jnp.float32,))
+    found = jax.jit(lambda a, b: product.interpreted(declared, a, b, (((1,), (0,)), ((), ()))))(lhs, rhs)
+    exact = np.asarray(lhs, np.float64) @ np.asarray(rhs, np.float64)
+    np.testing.assert_array_equal(np.asarray(found), exact.astype(np.float32))
+    half = product.declared(jnp.bfloat16, None, outputs=(jnp.float32,))
+    narrow = (lhs.astype(jnp.bfloat16), rhs.astype(jnp.bfloat16))
+    out = product.interpreted(half, *narrow, (((1,), (0,)), ((), ())))
+    np.testing.assert_array_equal(np.asarray(out), np.asarray(jax.lax.dot_general(
+        *narrow, (((1,), (0,)), ((), ())), preferred_element_type=jnp.float32)))
+
+
+def test_an_interpreted_fp32_sum_that_cancels_at_mixed_magnitudes_is_its_float64_sum():
+    """2^24 * 2^24, 1 * 1 and -(2^24 * 2^24): each product is exact in fp32, and their float64 sum is 1 in
+    every order (2^48 + 1 is a float64), where an fp32 accumulation that adds a large one first rounds the
+    1 away, 0. The interpreted product accumulates in float64: 1 exactly."""
+    lhs = jnp.asarray([[2.0 ** 24, 1.0, -(2.0 ** 24)]], jnp.float32)
+    rhs = jnp.asarray([[2.0 ** 24], [1.0], [2.0 ** 24]], jnp.float32)
+    declared = product.declared(jnp.float32, jax.lax.Precision.HIGHEST, outputs=(jnp.float32,))
+    assert float(product.interpreted(declared, lhs, rhs, (((1,), (0,)), ((), ())))[0, 0]) == 1.0
+
+
 HOOKED_RECEIPTS = {
     # (shape, case): (Mosaic ms, Triton ms), GMMSB-h100-main at eb378b58d (an H100's tools/bench_scoreboard).
     ("llama-3-8b gate_up", "plain"): (5.925, 10.191),

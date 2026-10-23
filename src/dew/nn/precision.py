@@ -19,6 +19,7 @@ from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
+import numpy as np
 from flax.typing import Dtype, PrecisionLike
 from jax.typing import DTypeLike
 
@@ -221,7 +222,7 @@ def rounded_to(x: jax.Array, dtype: Dtype) -> jax.Array:
     return jax.lax.reduce_precision(x, exponent_bits=bits.nexp, mantissa_bits=bits.nmant)
 
 
-def _two_sum(left, right):
+def two_sum(left, right):
     """`left + right` rounded, and exactly what the rounding dropped (Knuth's TwoSum)."""
     total = left + right
     part = total - left
@@ -245,6 +246,11 @@ def two_product(left, right, *, bit_split: bool = False, subtract: bool = False,
         return value if rounding is None else rounding(value)
 
     def split(value):
+        if bit_split and isinstance(value, np.generic | np.ndarray):
+            # A constant (a kernel's static factor) splits where it is known, on the host.
+            constant = np.asarray(value, np.float32)
+            high = (constant.view(np.uint32) & np.uint32(0xfffff000)).view(np.float32)
+            return jnp.asarray(high), jnp.asarray(constant - high)
         if bit_split:
             bits = jax.lax.bitcast_convert_type(value, jnp.uint32) & jnp.uint32(0xfffff000)
             high = jax.lax.bitcast_convert_type(bits, jnp.float32)
@@ -277,8 +283,8 @@ def compensated_add(left, right):
     XLA reassociates no float arithmetic unless fast math is on; with it,
     `lo` cancels to zero and the sum is the plain one."""
     (left_hi, left_lo), (right_hi, right_lo) = left, right
-    total, dropped = _two_sum(left_hi, right_hi)
-    return _two_sum(total, dropped + left_lo + right_lo)
+    total, dropped = two_sum(left_hi, right_hi)
+    return two_sum(total, dropped + left_lo + right_lo)
 
 
 def compensated_difference(later, earlier):

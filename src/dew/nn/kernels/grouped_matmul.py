@@ -511,11 +511,17 @@ class Gmm(_Triton):
             + tiles / chunks * config.block_m * config.block_n * _hook_work(
                 _traced_epilogue(ba), jnp.float32, epilogue_sides, hooks.epilogue_axes,
                 (config.block_m, config.block_n), extents))
+        # Every step's operand and prologue side tiles come through the L2, rereads or not, and each output
+        # tile's epilogue side tiles once.
+        loaded = ((self.loaded(config) + (products - 1) * config.block_k * config.block_n) * size
+                  + _side_tile_bytes(prologue_sides, hooks.prologue_axes, extents))
+        epilogued = tiles * columns * _side_tile_bytes(epilogue_sides, hooks.epilogue_axes, extents)
         return cost.Cost(
             programs=chunks * columns, device_bytes=moved,
             program_flops=flops / (chunks * columns), program_staged=staged,
             program_exponentials=exponentials, mode=_mode(tokens.dtype), steps=steps, stages=config.stages,
-            resident=self._resident(ba, config, target))
+            resident=self._resident(ba, config, target),
+            l2_bytes=chunks * columns * steps * loaded + epilogued)
 
     def _fwd(self, tokens: jax.Array, kernel: jax.Array, sizes: jax.Array,
              prologue_operands: tuple = (), epilogue_operands: tuple = (), paired: jax.Array | None = None,
@@ -597,10 +603,13 @@ class Tgmm(_Triton):
         exponentials = steps * config.block_m * config.block_k * _hook_work(
             hooks.before(), tokens.dtype, sides, hooks.prologue_axes, (config.block_m, config.block_k),
             self.extents(config))
+        # Every step's operand and prologue side tiles come through the L2 (`Gmm.costed`).
+        loaded = (self.loaded(config) * size
+                  + _side_tile_bytes(sides, hooks.prologue_axes, self.extents(config)))
         return cost.Cost(
             programs=programs, device_bytes=moved, program_flops=flops, program_staged=staged,
             program_exponentials=exponentials, mode=_mode(tokens.dtype), steps=steps, stages=config.stages,
-            resident=self._resident(ba, config, target))
+            resident=self._resident(ba, config, target), l2_bytes=programs * steps * loaded)
 
     def _fwd(self, tokens: jax.Array, cotangent: jax.Array, sizes: jax.Array,
              prologue_operands: tuple = (), *, out_dtype: str, interpret: bool, hooks: Hooks = NO_HOOKS,
@@ -632,6 +641,8 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
     EXACT_SUMS: ClassVar[bool] = False
     """Whether the kernel adds each depth step's product apart (`exact_sums`); one that does not is not
     eligible where the call asks for it."""
+    CONTRACTED: ClassVar[str]
+    """The launch axis its steps walk."""
 
     def eligible(self, ba, target) -> bool:
         first, second = (value.dtype for name, value in ba.arguments.items()
@@ -702,12 +713,30 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         epilogue_exponentials = config.block_m * config.block_n * _hook_work(
             _traced_epilogue(ba), jnp.float32, epilogue_sides, hooks.epilogue_axes,
             (config.block_m, config.block_n), extents)
+        # Every step's operand tiles come through the L2, rereads or not (a paired product's two matrix
+        # tiles), a pair's multicast matrix tile once for both; so do its prologue side tiles, but a
+        # cooperative tile's sides without the contraction come once a consumer an output tile
+        # (`hopper.load_fixed`), as do its epilogue side tiles, a side with rows cut between the
+        # consumers. Counted so, the H100 sweep's Mixtral forward and input gradient pick within 10% of
+        # their best (they ran 1.17x and 1.15x).
+        cooperative = config.warpgroups == 2
+        loaded = (config.block_m + products * config.block_n / config.cluster) * config.block_k * size
+        fixed = _side_tile_bytes(epilogue_sides, hooks.epilogue_axes, extents)
+        if cooperative:
+            fixed += _side_tile_bytes(*_uncut(epilogue_sides, hooks.epilogue_axes, 'rows'), extents)
+        for side, axes in zip(prologue_sides, hooks.prologue_axes, strict=True):
+            tile = _side_tile_bytes((side,), (axes,), extents)
+            if cooperative and self.CONTRACTED not in axes:
+                fixed += config.warpgroups * tile
+            else:
+                loaded += tile
         return cost.Cost(
             programs=tiles, device_bytes=moved,
             program_flops=2 * steps * config.block_m * config.block_n * config.block_k * products,
             program_staged=steps * step + config.block_m * config.block_n * out,
             program_exponentials=epilogue_exponentials, mode=_mode(tokens.dtype), steps=steps,
-            stages=config.stages, serial_staged=rewritten, serial_exponentials=prologue_exponentials)
+            stages=config.stages, serial_staged=rewritten, serial_exponentials=prologue_exponentials,
+            l2_bytes=tiles * (steps * loaded + fixed))
 
     def _multiprocessors(self, interpret: bool) -> int:
         # The interpreter runs one block (jax/_src/pallas/mosaic_gpu/interpret).
@@ -724,6 +753,7 @@ class MosaicGmm(_Mosaic):
     """`Gmm` on Hopper (`mosaic_gpu.gmm`)."""
 
     ROWS: ClassVar[tuple[str, ...]] = ('tokens',)
+    CONTRACTED: ClassVar[str] = 'depth'
 
     def fitting(self, ba, target) -> tuple[mosaic_gpu.Tiles, ...]:
         """The tiles that fit `target` (`Template.fitting`), a paired product's those whose two fp32
@@ -788,6 +818,7 @@ class MosaicTgmm(_Mosaic):
 
     ROWS: ClassVar[tuple[str, ...]] = ('tokens', 'cotangent')
     EXACT_SUMS: ClassVar[bool] = True
+    CONTRACTED: ClassVar[str] = 'rows'
 
     def space(self, ba) -> tuple[mosaic_gpu.Tiles, ...]:
         depth, width = ba.arguments['tokens'].shape[1], ba.arguments['cotangent'].shape[1]
