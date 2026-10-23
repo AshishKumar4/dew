@@ -8,7 +8,7 @@ ORIGINAL = c.chunk_delta_rule
 
 
 def chunk_adjoint(query, key, value, g, beta, state=None, chunk_size=c.CHUNK_SIZE, *, starts=None,
-                  delta=True, scale=None, dtype=None):
+                  delta=True, scale=None, dtype=None, source_method="scan"):
     b, s, h, dk = key.shape
     dv = value.shape[-1]
     work = jnp.promote_types(jnp.result_type(query, key, value), jnp.float32)
@@ -43,10 +43,14 @@ def chunk_adjoint(query, key, value, g, beta, state=None, chunk_size=c.CHUNK_SIZ
         core = a.readout(steps.query, steps.entering, entered, steps.key, steps.pairs, corrected)
         out = unblock(core).astype(result_dtype), final
         transition, _ = a.transition(steps.key, steps.w, steps.u, steps.grown, steps.last, steps.kept)
-        return out, (steps.query, steps.key, block(value), block(g), block(beta), entered, transition)
+        source_operands = ((steps.query * steps.entering, steps.w,
+                            a.paired("scores", steps.query, steps.key, steps.pairs))
+                           if source_method == "wy" else None)
+        return out, (steps.query, steps.key, block(value), block(g), block(beta), entered, transition,
+                     source_operands)
 
     def backward(residual, cotangent):
-        query, key, value, g, beta, entered, transition = residual
+        query, key, value, g, beta, entered, transition, source_operands = residual
         cot, final_cot = cotangent
         cot = block(cot.astype(work))
         tokens = query, key, value, g, beta, resets
@@ -67,8 +71,14 @@ def chunk_adjoint(query, key, value, g, beta, state=None, chunk_size=c.CHUNK_SIZ
             _, pull = jax.vjp(lambda state: local(state, *token), state)
             return pull((cot, ds))[0], None
 
-        source, _ = jax.lax.scan(source_step, jnp.zeros_like(entered),
-                                 (before, time_axis(cot), *map(time_axis, tokens)), reverse=True)
+        if source_method == "wy":
+            decayed_query, w, scores = source_operands
+            corrected_cot = a._remembered_transpose(scores, cot, a.portable, "local")
+            source = (a._remembered_transpose(decayed_query, cot, a.portable, "memory")
+                      - a.portable("corrected", jnp.swapaxes(w, -1, -2), corrected_cot))
+        else:
+            source, _ = jax.lax.scan(source_step, jnp.zeros_like(entered),
+                                     (before, time_axis(cot), *map(time_axis, tokens)), reverse=True)
 
         def across(ds, inputs):
             transition, source = inputs
@@ -92,3 +102,7 @@ def chunk_adjoint(query, key, value, g, beta, state=None, chunk_size=c.CHUNK_SIZ
 
     run.defvjp(forward, backward)
     return run(query, key, value, g, beta, state)
+
+
+def chunk_adjoint_wy_source(*args, **kwargs):
+    return chunk_adjoint(*args, **kwargs, source_method="wy")

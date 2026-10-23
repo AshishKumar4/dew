@@ -4,7 +4,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew.nn.kernels import recurrence_chunk as c
-from probe_aligned_jvp_nosysquid import stable_jvp
+from probe_aligned_chunk_adjoint_nosysquid import chunk_adjoint
 
 
 def inputs():
@@ -24,13 +24,13 @@ def gradient(fn):
 def test_the_aligned_write_erases_decay_before_its_gradient_is_rounded():
     # In one dimension k=beta=1, each update is S'=v, exactly independent of decay.
     # Summing the WY inverse/readout paths instead leaves roundoff in that zero.
-    found = np.asarray(gradient(stable_jvp))
+    found = np.asarray(gradient(chunk_adjoint))
     np.testing.assert_array_equal(found, np.zeros_like(found))
 
 
 if __name__ == "__main__":
     print("WY fp32", np.asarray(gradient(c.chunk_delta_rule)).ravel())
-    print("chronological fp32", np.asarray(gradient(stable_jvp)).ravel())
+    print("chunk-parallel adjoint fp32", np.asarray(gradient(chunk_adjoint)).ravel())
     with jax.enable_x64(True):
         unit, value, g, beta = (x.astype(jnp.float64) for x in inputs())
         grad64 = jax.jit(jax.grad(lambda g: jnp.sum(c.chunk_delta_rule(

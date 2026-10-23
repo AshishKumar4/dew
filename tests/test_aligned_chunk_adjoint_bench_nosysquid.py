@@ -1,16 +1,25 @@
 """Warm compiled backward timing at the production geometry; run on armada, not locally."""
+import os
 import time
 
 import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from probe_aligned_chunk_adjoint_nosysquid import ORIGINAL, chunk_adjoint
+from probe_aligned_chunk_adjoint_nosysquid import ORIGINAL, chunk_adjoint, chunk_adjoint_wy_source
 
 
-@pytest.mark.parametrize("variant", ["current", "chunk-adjoint"])
+@pytest.mark.parametrize("variant", ["current", "chunk-adjoint", "chunk-adjoint-fast", "comp-core"])
 def test_backward_wall_time(variant):
-    fn = {"current": ORIGINAL, "chunk-adjoint": chunk_adjoint}[variant]
+    if variant == "comp-core":
+        import probe_aligned_dots_nosysquid as dots
+        from probe_aligned_compensated_nosysquid import dot
+        from test_aligned_precision_nosysquid import CORE
+        os.environ["DEW_PROBE_REDUCE"] = "1"
+        dots.wide_dot = dot
+        dots.install(CORE)
+    fn = {"current": ORIGINAL, "chunk-adjoint": chunk_adjoint,
+          "chunk-adjoint-fast": chunk_adjoint_wy_source, "comp-core": ORIGINAL}[variant]
     shape = (2, 4096, 16, 128)
     rng = jax.random.split(jax.random.key(20261023), 7)
     q, k, v = (jax.random.normal(key, shape) for key in rng[:3])
@@ -30,7 +39,7 @@ def test_backward_wall_time(variant):
     jax.block_until_ready(backward(*inputs))
     cold = time.monotonic() - start
     times = []
-    for _ in range(5):
+    for _ in range(3 if variant == "comp-core" else 5):
         start = time.monotonic()
         jax.block_until_ready(backward(*inputs))
         times.append(time.monotonic() - start)

@@ -51,7 +51,10 @@ def run(mode, name, seed):
     ref32 = ref(*drawn)
     with jax.enable_x64(True):
         truth = ref(*widened(drawn))
-    if mode == "chunk-adjoint":
+    if mode == "chunk-adjoint-fast":
+        from probe_aligned_chunk_adjoint_nosysquid import chunk_adjoint_wy_source
+        c.chunk_delta_rule = chunk_adjoint_wy_source
+    elif mode == "chunk-adjoint":
         from probe_aligned_chunk_adjoint_nosysquid import chunk_adjoint
         c.chunk_delta_rule = chunk_adjoint
     elif mode.startswith("comp:"):
