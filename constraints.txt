@@ -21,7 +21,7 @@
 # BEGIN package index (site/scripts/gen_install.py)
 --extra-index-url https://pypi.dewml.dev/simple
 # END package index
-jax @ https://github.com/AshishKumar4/jax/archive/35b362f2e4322a99555e00feb00c476e17da08da.tar.gz
+jax==0.12.0.1.post13
 
 # The CA bundle requests, httpx and the Hub verify TLS with: 2026.10.19 dropped emSign ECC Root CA - G3,
 # whose intermediates' private keys were compromised in October 2026 (tests/test_trust_store.py).
