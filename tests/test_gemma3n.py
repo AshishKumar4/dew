@@ -28,6 +28,18 @@ def assert_as_exact(dew_fn, reference_fn, draw, label, *, seeds, truth_fn=None, 
         return _gate.assert_as_exact(dew_fn, reference_fn, draw, label, seeds=seeds, truth_fn=truth_fn, **options)
     first, last = (int(value) for value in block.split(":"))
     leaf = "model.layers.2.altup.correction_coefs.weight"
+    if os.environ.get("PERMUTED"):
+        rows, one = draw(int(os.environ["PERMUTED"]))
+        with jax.enable_x64(True):
+            truth = np.asarray(truth_fn(*_gate.widened((rows, one)))[leaf], np.float64)
+        size = np.sqrt(np.mean(truth ** 2, axis=-1))
+        for order in range(12):
+            permuted = rows[np.random.default_rng(order).permutation(len(rows))] if order else rows
+            for name, arm in (("ref", reference_fn), ("dew", dew_fn)):
+                error = np.asarray(arm(permuted, one)[leaf], np.float64) - truth
+                worst = np.sqrt(np.mean(error ** 2, axis=-1)) / size
+                print("PERM", order, name, f"{worst.max():.3e}", int(np.argmax(worst)), flush=True)
+        return
     for seed in range(first, last):
         inputs = draw(seed)
         mine, theirs = dew_fn(*inputs)[leaf], reference_fn(*inputs)[leaf]
