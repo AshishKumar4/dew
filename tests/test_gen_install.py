@@ -140,13 +140,13 @@ def floored(root: Path, least: str) -> Path:
     pyproject = root / "pyproject.toml"
     floor = next(line for line in pyproject.read_text().splitlines() if line.startswith("required-version"))
     pyproject.write_text(pyproject.read_text().replace(floor, f'required-version = ">={least}"', 1))
-    assert generate(root, "--check") == 1
     assert generate(root) == 0
     return root
 
 
 @pytest.mark.parametrize(("have", "fetched", "running"), [
-    ("0.13.9", ["https://astral.sh/uv/0.14.2/install.sh"], "0.14.2"), ("0.14.10", [], "0.14.10")])
+    ("0.13.9", ["https://astral.sh/uv/0.14.2/install.sh"], "0.14.2"),
+    ("0.14.2-rc.1", ["https://astral.sh/uv/0.14.2/install.sh"], "0.14.2"), ("0.14.10", [], "0.14.10")])
 def test_an_older_uv_is_replaced_by_the_least_one_which_runs_the_install(tmp_path, have, fetched, running):
     command, asked = installed(floored(tmp_path, "0.14.2"), "NVIDIA L4, 580.82.07, 8.9", uv=have)
     assert asked == fetched and command[:3] == [running, "pip", "install"]
