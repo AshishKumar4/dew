@@ -406,6 +406,9 @@ class Gateway:
             context = await self.start(session, "dew-train")
             started(context)
             try:
+                # A Stop while the context started ends the run before its code reaches the kernel.
+                if stopped():
+                    return {"status": "aborted", "count": None}
                 return await context.execute(code, send)
             finally:
                 await self.stop(context)
@@ -542,7 +545,9 @@ class Gateway:
                                           lambda started: page.training.__setitem__(cell, started))
             else:
                 context = await self.context(page.session, cell)
-                result = await context.execute(message["code"], send)
+                # A Stop while the context started ends the run before its code reaches the kernel.
+                result = ({"status": "aborted", "count": None} if cell in page.stops
+                          else await context.execute(message["code"], send))
             await socket.send(json.dumps({"id": message["id"], "type": "done", **result}))
         except Exception as error:
             if isinstance(error, Stopped) and context is not None and page.cells.get(cell) is context:
