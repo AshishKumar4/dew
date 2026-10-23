@@ -186,6 +186,9 @@ class Mma(mosaic.Family):
             acc = plgpu.mma(acc, plgpu.load(staged, layout=self.lhs), operand)
         return acc
 
+    def rescaled_products(self, acc, scale, parts, rhs, interpret: bool):
+        return self.register_products(scale(acc), parts, rhs, interpret)
+
     def settled(self) -> None:
         pass
 

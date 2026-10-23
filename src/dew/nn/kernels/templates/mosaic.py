@@ -388,6 +388,10 @@ class Family(abc.ABC):
         where `transposed`)."""
 
     @abc.abstractmethod
+    def rescaled_products(self, acc, scale, parts, rhs, interpret: bool) -> object:
+        """`acc` taken by `scale(value)` in place, then `register_products` of `parts` with `rhs` into it."""
+
+    @abc.abstractmethod
     def settled(self) -> None:
         """Every product issued so far done."""
 
