@@ -17,6 +17,7 @@ import ml_dtypes
 import numpy as np
 import pytest
 import safetensors.numpy as safetensors_numpy
+from interop_support import tiny_config
 
 from dew.interop import hf_decoders, sources
 
@@ -152,12 +153,7 @@ np.testing.assert_array_equal(actual,expected)
 def tier_two_config():
     """A tiny config of a model_type no registered family is named for that a registered family's
     convention computes (CWM, Llama's): the verifier checks it against transformers' own class."""
-    from transformers import AutoConfig
-
-    return AutoConfig.for_model(
-        "cwm", hidden_size=64, num_hidden_layers=4, num_attention_heads=4, num_key_value_heads=2, head_dim=16,
-        intermediate_size=128, vocab_size=256, max_position_embeddings=64, sliding_window=4,
-        tie_word_embeddings=False, pad_token_id=0, bos_token_id=1, eos_token_id=2).to_dict()
+    return tiny_config("cwm", sliding_window=4).to_dict()
 
 
 def test_a_source_is_routed_on_its_config_alone_as_the_loader_reads_it():
