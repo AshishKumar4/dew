@@ -335,6 +335,15 @@ def _remembered_transpose(decayed, cotangent, issue: Issue, name: str):
     return issue(name, jnp.swapaxes(jnp.flip(decayed, -2), -1, -2), jnp.flip(cotangent, -2))
 
 
+def readout_entered_gradient(decayed_query, weights, scores, cotangent, issue: Issue = portable):
+    """`readout`'s gradient in the memory a chunk entered: `Q_entered^T do - W^T (scores^T do)`,
+    because its corrected values are `U - W S`. The token reductions run from the last
+    (`_remembered_transpose`), as the memory's adjoint a token at a time does."""
+    corrected = _remembered_transpose(scores, cotangent, issue, "local")
+    memory = _remembered_transpose(decayed_query, cotangent, issue, "memory")
+    return memory - issue("corrected", jnp.swapaxes(weights, -1, -2), corrected)
+
+
 @remembered.defjvp
 def _remembered_tangent(issue, name, primals, tangents):
     """The product's tangent, its `entered` side linear in `entered` with the transpose
