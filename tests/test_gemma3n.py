@@ -353,6 +353,32 @@ def test_a_training_step_updates_the_clamped_altup_coefficients_as_the_reference
                 with float64() if dtype == torch.float64 else torch.no_grad(), torch.no_grad():
                     out = model_(input_ids=tokens, labels=tokens, output_hidden_states=True)
                 hidden[dtype] = [h.double().numpy() for h in out.hidden_states] + [out.logits.double().numpy()]
+            grads = {}
+            for dtype in (torch.float32, torch.float64):
+                model_ = references[dtype]
+                model_.load_state_dict(weights)
+                model_.train()
+                model_.zero_grad(set_to_none=True)
+                hooks = []
+                for name, module in model_.named_modules():
+                    if ".layers." in name and name.count(".") <= 5:
+                        def hook(module, grad_input, grad_output, name=name, dtype=dtype):
+                            first = grad_output[0]
+                            if first is not None:
+                                grads.setdefault(name, {})[dtype] = first.detach().double().numpy()
+                        hooks.append(module.register_full_backward_hook(hook))
+                with float64() if dtype == torch.float64 else torch.enable_grad():
+                    model_(input_ids=tokens, labels=tokens).loss.backward()
+                for handle in hooks:
+                    handle.remove()
+            backward = []
+            for name, pair in grads.items():
+                if len(pair) == 2 and pair[torch.float32].shape == pair[torch.float64].shape:
+                    a, b = pair[torch.float32], pair[torch.float64]
+                    size = np.sqrt(np.mean(b ** 2))
+                    if size > 0:
+                        backward.append((float(np.sqrt(np.mean((a - b) ** 2)) / size), name))
+            print("BACKWARD", seed, [f"{name.split('layers.')[-1]} {value:.1e}" for value, name in sorted(backward)[::-1][:10]], flush=True)
             outputs = {}
             for dtype in (torch.float32, torch.float64):
                 model_ = references[dtype]
