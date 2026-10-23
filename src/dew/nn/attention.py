@@ -1516,17 +1516,33 @@ def forward_differentiable(value, tangent, *arrays, precision: str | None = None
     `precision` is the kernel's own arithmetic, which the reference's products
     take too (`jax.default_matmul_precision`), so a kernel of IEEE fp32 products
     is not differentiated by TF32 ones; None leaves the products at the
-    caller's."""
+    caller's. Only the arrays a derivative moves are the reference's tangents: a known zero stays
+    out of its derivative, where a product's own derivative (`dew.nn.precision.accumulated`'s on a
+    CPU) takes its moving operands alone."""
+    from jax.custom_derivatives import SymbolicZero
+
     @jax.custom_jvp
     def attend(*arrays):
         return value(*arrays)
 
-    @attend.defjvp
     def rule(primals, tangents):
-        with contextlib.nullcontext() if precision is None else jax.default_matmul_precision(precision):
-            differentiated = jax.jvp(tangent, primals, tangents)[1]
-        return attend(*primals), differentiated
+        live = [index for index, direction in enumerate(tangents) if not isinstance(direction, SymbolicZero)]
+        output = attend(*primals)
+        if not live:
+            return output, jax.tree.map(jnp.zeros_like, output)
 
+        def moved(*moving):
+            arrays = list(primals)
+            for index, array in zip(live, moving, strict=True):
+                arrays[index] = array
+            return tangent(*arrays)
+
+        with contextlib.nullcontext() if precision is None else jax.default_matmul_precision(precision):
+            differentiated = jax.jvp(moved, tuple(primals[index] for index in live),
+                                     tuple(tangents[index] for index in live))[1]
+        return output, differentiated
+
+    attend.defjvp(rule, symbolic_zeros=True)
     return attend(*arrays)
 
 
