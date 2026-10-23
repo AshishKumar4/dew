@@ -137,7 +137,7 @@ def jax_arms(name: str, shape: Shape, warmup: int, repeats: int) -> list[dict]:
 
     from dew.nn import linear
     from dew.nn.kernels import generation, mamba_ssd, recurrence
-    from dew.nn.kernels.recurrence_chunk import Chunk, chunk, fla_rule, ssd_port_refusal
+    from dew.nn.kernels.recurrence_chunk import SCAN, Chunk, chunk, fla_rule, scan_case
     from dew.nn.mixers.mamba2 import SSD
     from dew.telemetry.benchmark import samples
 
@@ -165,8 +165,9 @@ def jax_arms(name: str, shape: Shape, warmup: int, repeats: int) -> list[dict]:
                                           not generation.triton_runs())
 
             # What the kernels take, whatever this GPU's row prefers.
-            with generation.chosen(ssd='pallas'):
-                refusals['hand'] = ssd_port_refusal(x, B, shape.chunk)
+            case = scan_case(x, B, shape.chunk)
+            refusals['hand'] = '; '.join(requirement.refusal(case).detail
+                                         for requirement in SCAN.kernel('pallas').failed(case))
             cotangents = (given['dy'], given['dfinal'])
         else:
             hooks = recurrence.Hooks(decay='vector' if shape.kind == 'kda' else 'scalar',
