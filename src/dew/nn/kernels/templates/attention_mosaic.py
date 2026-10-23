@@ -31,6 +31,7 @@ from dew.nn.kernels.templates.attention import (
     Gradients,
     Hooks,
     KeySpans,
+    Rows,
     Split,
     gradients,
     padded_call,
@@ -577,14 +578,15 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
 
 
 def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None,
-             dout: jax.Array, *, residuals: tuple[jax.Array, jax.Array, jax.Array, Split],
+             dout: jax.Array, *, residuals: tuple[jax.Array, jax.Array, jax.Array, Split] | Rows,
              scale: float | None = None, natural: bool = NATURAL, accurate: bool = ACCURATE,
              tiles: Tiles = BACKWARD_DEFAULT, consumers: int | None = None,
              interpret: bool = False) -> Gradients:
-    """The template's backward on this mainloop (`gradients`) from a training forward's `residuals` (its
-    maxima, denominators, anchor keys and split sums): D about each query's anchor from the split sums
-    (`algebra.split_delta`), a dQ launch and a dK/dV launch, and `dq_finish`'s refinement between them, in
-    the form `accurate` names. Full and causal calls of bf16 operands, no hooks."""
+    """The template's backward on this mainloop (`gradients`) from a training forward's `residuals`: the
+    fast form's (`Rows`, FlashAttention's D), or its maxima, denominators, anchor keys and split sums (D
+    about each query's anchor, `algebra.split_delta`); a dQ launch and a dK/dV launch, and `dq_finish`'s
+    refinement between them, in the form `accurate` names. Full and causal calls of bf16 operands, no
+    hooks."""
     if hooks is not None and hooks != Hooks():
         raise NotImplementedError("the sm90 backward takes no hooks yet")
     if spans.form not in ("full", "causal"):
@@ -605,16 +607,22 @@ def _launch_backward(query, key, value, dout, peak0, total0, initial_term, maxim
                      shift, others, own, others_total, forward_total, start, end, query_ids, key_ids,
                      score_params, *, score_mod, score_kinds, score_dtypes, scale: float,
                      how: algebra.Recompute, causal: bool, keys_count: int, accurate: bool, tiles: Tiles,
-                     consumers: int, interpret: bool):
-    """`gradients`' launch on this mainloop: D from the forward's split sums, the dQ program's sums, their
-    finish (`algebra.dq_finish`) and the dK/dV program under its refined D, each query's anchor key as the
-    first pass chose it."""
+                     consumers: int, interpret: bool, delta: jax.Array | None = None):
+    """`gradients`' launch on this mainloop: D given (`delta`, FlashAttention's, about itself) or from the
+    forward's split sums, the dQ program's sums, their finish (`algebra.dq_finish`) and the dK/dV program
+    under its refined D, each query's anchor key as the first pass chose it."""
     del start, end, query_ids, key_ids, score_params, score_mod, score_kinds, score_dtypes
     width, value_width = query.shape[-1], value.shape[-1]
     _, state_total = algebra.off_anchor_start(peak0, total0, maximum, value_width, shift)
-    cotangent = jnp.swapaxes(dout, 1, 2).astype(jnp.float32)
-    anchor, delta, chosen = algebra.split_delta(others, own, others_total, forward_total, state_total,
-                                                jnp.swapaxes(anchor_value, 1, 2), cotangent, key_index, shift)
+    if delta is not None:
+        anchor, delta, chosen = delta, jnp.zeros_like(delta), key_index
+    elif others is None or anchor_value is None:
+        raise ValueError("the sm90 backward takes D given or the forward's split sums (`gradients`)")
+    else:
+        cotangent = jnp.swapaxes(dout, 1, 2).astype(jnp.float32)
+        anchor, delta, chosen = algebra.split_delta(others, own, others_total, forward_total, state_total,
+                                                    jnp.swapaxes(anchor_value, 1, 2), cotangent, key_index,
+                                                    shift)
     # The family's swizzled tiles hold whole rows of `FAMILY.rows` 16-bit entries.
     query, key, value, dout = (jnp.pad(array, ((0, 0),) * 3 + ((0, -array.shape[3] % FAMILY.rows),))
                                for array in (query, key, value, dout))
