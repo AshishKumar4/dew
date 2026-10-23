@@ -143,6 +143,8 @@ MIXTRAL = DecoderFamily(
     lambda model: {},
     weight_path=partial(renamed_path, MOE_NAMES),
     preserve_source_layout=True,
+    # MixtralConfig's defaults (its rope base is its spelling's).
+    defaults={'num_experts_per_tok': 2, 'num_local_experts': 8, 'rms_norm_eps': 1e-5},
 )
 
 
@@ -153,6 +155,10 @@ MISTRAL = DecoderFamily(
     every_layer_windowed,
     'mistral',
     'MistralForCausalLM',
-    lambda model: {'layer_types': None},
+    lambda model: {'layer_types': None, 'sliding_window': model.kind_of('sliding_attention').window},
     preserve_source_layout=False,
+    # MistralConfig attends a 4096-token window unless a config says otherwise, so an export of a
+    # model without one says so with a null.
+    defaults={'sliding_window': 4096},
+    export_nulls=('sliding_window',),
 )
