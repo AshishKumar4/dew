@@ -18,7 +18,8 @@ from reference_error import assert_as_exact_as_the_reference, equations
 from dew.nn.kernels import generation, grouped_matmul
 from dew.nn.kernels.templates import cost
 from dew.nn.kernels.templates.gemm import mosaic_gpu
-from dew.nn.moe import expert_projection, grouped_matmul_kernel
+from dew.nn.moe import expert_projection
+from tools import grouped_oracle as oracle
 
 pytestmark = pytest.mark.kernel
 
@@ -43,31 +44,13 @@ def operands(sizes, dtype, seed=0):
     return x, w, dy, group
 
 
-def float64_products(x, w, dy, group):
-    """The forward, input gradient and kernel gradient in float64: zero on the unrouted rows and empty
-    groups."""
-    forward, input_gradient = np.zeros((ROWS, WIDTH)), np.zeros((ROWS, DEPTH))
-    kernel_gradient = np.zeros(w.shape)
-    for expert in range(w.shape[0]):
-        rows = group == expert
-        forward[rows] = x[rows] @ w[expert]
-        input_gradient[rows] = dy[rows] @ w[expert].T
-        kernel_gradient[expert] = x[rows].T @ dy[rows]
-    return forward, input_gradient, kernel_gradient
-
-
 def xla_products(x, w, dy, sizes, dtype, kernel_dtype):
-    """XLA's ragged dot over the same operands, each product summed in fp32 and rounded once."""
-    sizes = jnp.asarray(sizes, jnp.int32)
-    x, w, dy = (jnp.asarray(value, dtype) for value in (x, w, dy))
-    forward = grouped_matmul.xla_ragged_dot(x, w, sizes, preferred_element_type=jnp.float32)
-    input_gradient = grouped_matmul.xla_ragged_dot(dy, jnp.swapaxes(w, 1, 2), sizes,
-                                                   preferred_element_type=jnp.float32)
-    _, pullback = jax.vjp(
-        lambda w: grouped_matmul.xla_ragged_dot(x, w, sizes, preferred_element_type=jnp.float32),
-        w.astype(jnp.float32))
-    kernel_gradient = pullback(dy.astype(jnp.float32))[0]
-    return forward.astype(dtype), input_gradient.astype(dtype), kernel_gradient.astype(kernel_dtype)
+    """The portable projection's (`dew.nn.moe.expert_projection` on XLA) forward and gradients over the
+    same operands, `w` the master in `kernel_dtype`: each product summed in fp32 and rounded once."""
+    group_sizes = jnp.asarray(sizes, jnp.int32)
+    output, pullback = jax.vjp(lambda x, w: expert_projection(x, w, group_sizes, dtype, "xla", None),
+                               jnp.asarray(x, dtype), jnp.asarray(w, kernel_dtype))
+    return (output, *pullback(jnp.asarray(dy, dtype)))
 
 
 @INTERPRETS
@@ -79,7 +62,7 @@ def test_the_hopper_grouped_matmuls_sum_each_groups_rows_as_exactly_as_xla(sizes
     the same rounded operands, unrouted rows and empty groups exactly zero."""
     sizes = SIZES[sizes]
     x, w, dy, group = operands(sizes, dtype)
-    truth = float64_products(x, w, dy, group)
+    truth = oracle.products(x, w, dy, sizes)
     reference = xla_products(x, w, dy, sizes, dtype, jnp.float32)
     arrays = [jnp.asarray(value, dtype) for value in (x, w, dy)]
     group_sizes = jnp.asarray(sizes, jnp.int32)
@@ -115,7 +98,7 @@ def test_the_kernel_gradient_keeps_a_neighbours_non_finite_rows_out():
     sums its own rows alone, every one finite and as exact as XLA's over clean rows."""
     sizes = [37, 100, 0, 40]
     x, w, dy, group = operands(sizes, jnp.bfloat16, seed=3)
-    truth = float64_products(x, w, dy, group)[2]
+    truth = oracle.kernel_gradient(x, dy, sizes)
     reference = xla_products(x, w, dy, sizes, jnp.bfloat16, jnp.float32)[2]
     dirty_x, dirty_dy = x.copy(), dy.copy()
     dirty_x[group < 0], dirty_dy[group < 0] = np.inf, np.nan
@@ -129,46 +112,12 @@ def test_the_kernel_gradient_keeps_a_neighbours_non_finite_rows_out():
                                       "kernel gradient")
 
 
-@INTERPRETS
-@pytest.mark.parametrize("generation_name,implementation", [("sm80", "triton"), ("sm90", "mosaic_gpu")])
-def test_an_expert_projection_runs_the_implementation_chosen_for_it_on_the_cpu(generation_name: str,
-                                                                               implementation: str):
-    """'pallas' interprets the kernels on a CPU as the named generation runs them, each launch the
-    implementation `generation.chosen` names: its forward and both gradients as exact as XLA's, the input
-    gradient in the input's dtype and the kernel gradient in the master's, each launch's route the one
-    named."""
-    sizes = [0, 70, 1, 100, 0]
-    x, w, dy, group = operands(sizes, jnp.bfloat16, seed=5)
-    forward, input_gradient, kernel_gradient = float64_products(x, w, dy, group)
-    reference = xla_products(x, w, dy, sizes, jnp.bfloat16, jnp.float32)
-    group_sizes = jnp.asarray(sizes, jnp.int32)
-
-    def products(x, w):
-        y, pull = jax.vjp(lambda x, w: expert_projection(x, w, group_sizes, jnp.bfloat16, "pallas", None),
-                          x, w)
-        return (y, *pull(jnp.asarray(dy, jnp.bfloat16)))
-
-    with (generation.assumed(generation_name), generation.chosen(grouped_matmul=implementation),
-          generation.routes() as routes):
-        operands_ = (jnp.asarray(x, jnp.bfloat16), jnp.asarray(w, jnp.float32))
-        # The CPU's lowering is the interpreted kernels', not XLA's ragged dot compared with itself: an
-        # interpreter runs the grid in loops, Mosaic GPU's through host callbacks; XLA's has neither.
-        lowered = jax.jit(products).lower(*operands_).as_text()
-        assert "stablehlo.while" in lowered
-        assert ("callback" in lowered) == (implementation == "mosaic_gpu")
-        y, dx, dw = jax.jit(products)(*operands_)
-    assert {route.kernel for route in routes if route.choice == "grouped_matmul"} == {implementation}
-    assert (y.dtype, dx.dtype, dw.dtype) == (jnp.bfloat16, jnp.bfloat16, jnp.float32)
-    for label, got, theirs, truth in zip(("y", "dx", "dw"), (y, dx, dw), reference,
-                                         (forward, input_gradient, kernel_gradient), strict=True):
-        assert_as_exact_as_the_reference(np.asarray(got, np.float64), np.asarray(theirs, np.float64), truth,
-                                          label)
-
-
 @lowers("sm90")
-@pytest.mark.parametrize("launch", [grouped_matmul.MosaicGmm(), grouped_matmul.MosaicGmmTransposed(),
-                                    grouped_matmul.MosaicTgmm()], ids=lambda launch: type(launch).__name__)
-def test_every_tile_of_the_hopper_grouped_matmuls_lowers_for_an_h100(launch):
+@pytest.mark.parametrize("launch,trans_rhs", [(grouped_matmul.MosaicGmm(), False),
+                                              (grouped_matmul.MosaicGmm(), True),
+                                              (grouped_matmul.MosaicTgmm(), None)],
+                         ids=["MosaicGmm", "MosaicGmm-transposed", "MosaicTgmm"])
+def test_every_tile_of_the_hopper_grouped_matmuls_lowers_for_an_h100(launch, trans_rhs):
     """The tiles the Mosaic GPU launches may pick at an expert layer's shapes lower for an H100 on the
     CPU, as a GPU session's compile would, over rows no multiple of 8: every block shape and every
     schedule among those that fit an H100's block (`Template.fitting`). The interpreter takes kernels
@@ -180,7 +129,7 @@ def test_every_tile_of_the_hopper_grouped_matmuls_lowers_for_an_h100(launch):
     sizes, matrices = jax.ShapeDtypeStruct((groups,), jnp.int32), bf16((groups, depth, width))
     if isinstance(launch, grouped_matmul.MosaicTgmm):
         args, options = (bf16((rows, depth)), bf16((rows, width)), sizes), {"out_dtype": "float32"}
-    elif isinstance(launch, grouped_matmul.MosaicGmmTransposed):
+    elif trans_rhs:
         args, options = (bf16((rows, width)), matrices, sizes), {"trans_rhs": True}
     else:
         args, options = (bf16((rows, depth)), matrices, sizes), {"trans_rhs": False}
@@ -201,14 +150,104 @@ def test_every_tile_of_the_hopper_grouped_matmuls_lowers_for_an_h100(launch):
                 lowering_platforms=("cuda",))
 
 
+def test_the_portable_branch_writes_each_gradient_from_the_rounded_operands():
+    """The projection's XLA route (a CPU's, which runs no kernel) differentiates the operands as it rounded
+    them: an fp16 master's largest value rounds to bf16's 65536, which fp16 does not hold, and the input
+    gradient through it is finite, each gradient rounded once to its operand's dtype."""
+    x = jnp.ones((1, 1), jnp.float32)
+    kernel = jnp.full((1, 1, 1), 65504, jnp.float16)
+    _, pullback = jax.vjp(lambda x, kernel: expert_projection(
+        x, kernel, jnp.ones((1,), jnp.int32), jnp.bfloat16, "auto", None), x, kernel)
+    d_x, d_kernel = pullback(jnp.full((1, 1), 2.0 ** -16, jnp.bfloat16))
+    np.testing.assert_array_equal(np.asarray(d_x), np.ones((1, 1), np.float32))
+    np.testing.assert_array_equal(np.asarray(d_kernel), np.full((1, 1, 1), 2.0 ** -16, np.float16))
+
+@INTERPRETS
+@pytest.mark.parametrize("generation_name,implementation", [("sm80", "triton"), ("sm90", "mosaic_gpu")])
+def test_an_expert_projection_runs_the_implementation_chosen_for_it_on_the_cpu(generation_name: str,
+                                                                               implementation: str):
+    """'pallas' interprets the kernels on a CPU as the named generation runs them, each launch the
+    implementation `generation.chosen` names: its forward and both gradients as exact as XLA's, the input
+    gradient in the input's dtype and the kernel gradient in the master's, each launch's route the one
+    named."""
+    sizes = [0, 70, 1, 100, 0]
+    x, w, dy, _ = operands(sizes, jnp.bfloat16, seed=5)
+    forward, input_gradient, kernel_gradient = oracle.products(x, w, dy, sizes)
+    reference = xla_products(x, w, dy, sizes, jnp.bfloat16, jnp.float32)
+    group_sizes = jnp.asarray(sizes, jnp.int32)
+
+    def products(x, w):
+        y, pull = jax.vjp(lambda x, w: expert_projection(x, w, group_sizes, jnp.bfloat16, "pallas", None),
+                          x, w)
+        return (y, *pull(jnp.asarray(dy, jnp.bfloat16)))
+
+    with (generation.assumed(generation_name), generation.chosen(grouped_matmul=implementation),
+          generation.routes() as routes):
+        operands_ = (jnp.asarray(x, jnp.bfloat16), jnp.asarray(w, jnp.float32))
+        # The CPU runs the interpreted kernels (each launch's route says so), not XLA's ragged dot compared
+        # with itself. Mosaic's interpreter's ordered callbacks run eagerly: a jitted `linear_call` cannot
+        # carry them.
+        y, dx, dw = (products if implementation == "mosaic_gpu" else jax.jit(products))(*operands_)
+    assert {route.kernel for route in routes if route.choice == "grouped_matmul"} == {implementation}
+    assert (y.dtype, dx.dtype, dw.dtype) == (jnp.bfloat16, jnp.bfloat16, jnp.float32)
+    for label, got, theirs, truth in zip(("y", "dx", "dw"), (y, dx, dw), reference,
+                                         (forward, input_gradient, kernel_gradient), strict=True):
+        assert_as_exact_as_the_reference(np.asarray(got, np.float64), np.asarray(theirs, np.float64), truth,
+                                          label)
+
+
+
+def test_the_kernels_forward_mode_keeps_the_projections_law():
+    """An expert projection's tangent through the template (its launches interpreted, as an A100 runs
+    them) is the XLA projection's, bit for bit: `dx @ Q(kernel) + Q(x) @ dkernel` with the tangents
+    unrounded, where a cast's own tangent would round an fp32 input's to bf16 first (two products of an
+    fp32 1 + 2^-8 and 1.5 sum to 3.015625, rounded first 3)."""
+    sizes = jnp.asarray([1, 2], jnp.int32)
+    x, w = jnp.zeros((3, 2), jnp.float32), jnp.full((2, 2, 2), 1.5, jnp.float32)
+    dx, dw = jnp.full((3, 2), 1 + 2.0 ** -8, jnp.float32), jnp.full((2, 2, 2), 2.0 ** -9, jnp.float32)
+
+    def tangent(implementation):
+        return jax.jit(lambda x, w, dx, dw: jax.jvp(lambda x, w: expert_projection(
+            x, w, sizes, jnp.bfloat16, implementation, None), (x, w), (dx, dw))[1])(x, w, dx, dw)
+
+    with generation.assumed("sm80"), generation.routes() as taken:
+        kernels = tangent("pallas")
+    assert {route.kernel for route in taken if route.choice == "grouped_matmul"} == {"triton"}
+    np.testing.assert_array_equal(np.asarray(kernels, np.float32), np.asarray(tangent("xla"), np.float32))
+
+
+@pytest.mark.skipif(jax.default_backend() != "cpu", reason="a GPU of sm80 or later runs the named kernel")
+def test_a_named_kernel_refuses_where_the_kernels_do_not_run():
+    """A kernel `generation.chosen` names for a call no kernel runs (a CPU's without 'pallas', which alone
+    interprets them) raises with the reason, rather than running XLA."""
+    x, w, sizes = jnp.ones((8, 16), jnp.bfloat16), jnp.ones((2, 16, 16), jnp.float32), jnp.asarray([4, 4])
+    with generation.chosen(grouped_matmul="triton"), pytest.raises(ValueError):
+        expert_projection(x, w, sizes, jnp.bfloat16, "auto", None)
+
+
+def test_a_call_of_no_rows_runs_xla_or_refuses_a_named_kernel():
+    """A projection of no rows launches nothing: XLA gives its empty value, the route saying why, and a
+    kernel `generation.chosen` names for it raises rather than running XLA."""
+    x, w = jnp.ones((0, 16), jnp.bfloat16), jnp.ones((2, 16, 16), jnp.float32)
+    sizes = jnp.zeros((2,), jnp.int32)
+    with generation.assumed("sm80"), generation.routes() as taken:
+        y = expert_projection(x, w, sizes, jnp.bfloat16, "pallas", None)
+    assert y.shape == (0, 16)
+    assert {(route.kernel, route.refusal.detail if route.refusal else None) for route in taken
+            if route.choice == "grouped_matmul"} == {("xla", "the call has no rows")}
+    with generation.assumed("sm80"), generation.chosen(grouped_matmul="triton"), pytest.raises(ValueError):
+        expert_projection(x, w, sizes, jnp.bfloat16, "pallas", None)
+
 def test_a_forced_implementation_runs_or_says_why_it_cannot():
     """'xla' named runs XLA's ragged dot whatever the call asked; a kernel named for a product the
     kernels do not compute (fp32 above the default precision) raises with the reason rather than
     running XLA."""
-    with generation.chosen(grouped_matmul="xla"):
-        assert grouped_matmul_kernel("pallas", jnp.bfloat16, (jnp.bfloat16, jnp.float32), None) == "xla"
+    x, w, sizes = jnp.ones((8, 16), jnp.bfloat16), jnp.ones((2, 16, 16), jnp.float32), jnp.asarray([4, 4])
+    with generation.chosen(grouped_matmul="xla"), generation.routes() as taken:
+        expert_projection(x, w, sizes, jnp.bfloat16, "pallas", None)
+    assert {route.kernel for route in taken if route.choice == "grouped_matmul"} == {"xla"}
     with generation.chosen(grouped_matmul="triton"), pytest.raises(ValueError):
-        grouped_matmul_kernel("pallas", jnp.float32, (jnp.float32, jnp.float32), "highest")
+        expert_projection(x.astype(jnp.float32), w, sizes, jnp.float32, "pallas", "highest")
 
 
 @pytest.mark.parametrize("generation_name", generations("sm80", "sm90"))

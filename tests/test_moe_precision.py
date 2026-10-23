@@ -16,7 +16,7 @@ import numpy as np
 import optax
 import pytest
 from jax.sharding import NamedSharding, PartitionSpec as P
-from reference_error import assert_as_exact
+from reference_error import assert_as_exact, with_gradients
 from scipy.special import erfc
 from tuned import each_config
 
@@ -26,6 +26,7 @@ from dew.nn.kernels import grouped_matmul, tuning
 from dew.nn.kernels.generation import chosen as kernel_choices, gpu_target, routes, triton_runs
 from dew.nn.moe import ExpertMLP, expert_dispatch, expert_projection
 from dew.training import MeshSpec
+from tools import grouped_oracle as oracle
 
 pytestmark = pytest.mark.kernel
 
@@ -44,16 +45,8 @@ def rounded(value, dtype=ml_dtypes.bfloat16) -> np.ndarray:
     return np.asarray(value).astype(dtype).astype(np.float64)
 
 
-def grouped(a, b) -> np.ndarray:
-    """`a @ b` per expert for `a` of three rows per expert."""
-    a, b = np.asarray(a, np.float64), np.asarray(b, np.float64)
-    return (a.reshape(8, 3, a.shape[-1]) @ b).reshape(24, -1)
-
-
-def gathered(a, b) -> np.ndarray:
-    """`a.T @ b` per expert, the kernel cotangent."""
-    a, b = np.asarray(a, np.float64), np.asarray(b, np.float64)
-    return a.reshape(8, 3, a.shape[-1]).swapaxes(1, 2) @ b.reshape(8, 3, b.shape[-1])
+THREE_EACH = np.full(8, 3)
+"""Three rows for each of eight experts, the projections' equal routing."""
 
 
 def shardings(mesh, rows: bool):
@@ -118,9 +111,9 @@ def test_a_projection_rounds_whole_contractions_once(case, master, input_dtype, 
     the gradient returned placed or replicated."""
     x, kernel, dy = next(values for name, *values in cases() if name == case)
     sizes = np.full(8, 3, np.int32)
-    forward = rounded(grouped(rounded(x), rounded(kernel)))
-    kernel_oracle = gathered(rounded(x), rounded(dy))
-    input_oracle = rounded(grouped(rounded(dy), rounded(kernel).swapaxes(1, 2)), input_dtype)
+    forward = rounded(oracle.forward(rounded(x), rounded(kernel), THREE_EACH))
+    kernel_oracle = oracle.kernel_gradient(rounded(x), rounded(dy), THREE_EACH)
+    input_oracle = rounded(oracle.input_gradient(rounded(dy), rounded(kernel), THREE_EACH), input_dtype)
 
     def loss(kernel, x, dy, sizes):
         projected = jnp.asarray(expert_projection(x, kernel, sizes, jnp.bfloat16, 'xla', None))
@@ -157,18 +150,9 @@ def test_the_pallas_kernels_hold_the_contract_on_one_device(sizes, input_dtype):
     kernel = rng.normal(size=(8, 16, 16)).astype(np.float32)
     dy = rng.normal(size=(24, 16))
     sizes = sizes.astype(np.int32)
-    ends = np.cumsum(sizes)
-    rows = np.searchsorted(ends, np.arange(24), side='right')
-    routed = np.arange(24) < ends[-1]
     qx, qk = rounded(x), rounded(kernel)
     qy = rounded(dy)
-    forward = np.zeros((24, 16))
-    input_oracle = np.zeros((24, 16))
-    kernel_oracle = np.zeros((8, 16, 16))
-    for row in np.flatnonzero(routed):
-        forward[row] = qx[row] @ qk[rows[row]]
-        input_oracle[row] = qy[row] @ qk[rows[row]].T
-        kernel_oracle[rows[row]] += np.outer(qx[row], qy[row])
+    forward, input_oracle, kernel_oracle = oracle.products(qx, qk, qy, sizes)
 
     def loss(x, kernel):
         projected = jnp.asarray(expert_projection(x, kernel, jnp.asarray(sizes), jnp.bfloat16,
@@ -193,9 +177,8 @@ HOPPER = pytest.mark.skipif(not (triton_runs() and gpu_target().wgmma),
 @pytest.mark.gpu(reason="the tuner's space is a GPU's")
 @pytest.mark.skipif(not triton_runs(), reason="needs a GPU the Pallas kernels compile for")
 @pytest.mark.parametrize("kernel,width,features", [
-    (grouped_matmul.Gmm, 192, 320), (grouped_matmul.GmmTransposed, 192, 320), (grouped_matmul.Tgmm, 192, 320),
+    (grouped_matmul.Gmm, 192, 320), (grouped_matmul.Tgmm, 192, 320),
     pytest.param(grouped_matmul.MosaicGmm, 768, 768, marks=HOPPER),
-    pytest.param(grouped_matmul.MosaicGmmTransposed, 768, 768, marks=HOPPER),
     pytest.param(grouped_matmul.MosaicTgmm, 768, 768, marks=HOPPER)])
 def test_every_tile_of_the_grouped_kernels_holds_the_float64_gate(kernel, width, features):
     """Each tile the tuner may pick for a launch, of the implementation the
@@ -205,14 +188,16 @@ def test_every_tile_of_the_grouped_kernels_holds_the_float64_gate(kernel, width,
     from float64 sums of the same bf16 operands, over the site's draws. The
     space declares only tiles proven here. Triton's widths are ragged
     against its tiles, which mask them; Mosaic's divide by every tile width
-    of its space (64 to 256, and a pair's 256 rows of depth), which it needs,
-    so its cooperative tiles and pairs are among those checked."""
+    of its space (64 to 256, and a pair's 256 rows), which it needs, so its
+    cooperative tiles and the forward's pairs are among those checked."""
     gate = _tile_gate(kernel, width, features)
     with kernel_choices(grouped_matmul=kernel.name):
         configs = each_config(kernel, _tile_gate_arm('pallas'), *gate.draw(0))
     assert len(configs) > 1
     if kernel.name == 'mosaic_gpu':
-        assert {(c.warpgroups, c.cluster) for c in configs} == {(1, 1), (2, 1), (2, 2)}
+        # The kernel gradient's schedule is one multiprocessor's (`MosaicTgmm.space`).
+        paired = set() if kernel is grouped_matmul.MosaicTgmm else {(2, 2)}
+        assert {(c.warpgroups, c.cluster) for c in configs} == {(1, 1), (2, 1)} | paired
     for config in configs:
         gate.check(config)
 
@@ -237,9 +222,9 @@ def _tile_gate_arm(implementation, fault=1.0):
     """A bf16 projection's output and both gradients through `implementation` ('pallas' with the CPU's
     interpreter), its output times `fault`."""
     def run(x, kernel_matrix, dy):
-        y, pull = jax.vjp(lambda x, k: expert_projection(x, k, jnp.asarray(TILE_SIZES), jnp.bfloat16,
-                                                         implementation, None), x, kernel_matrix)
-        return ((y.astype(jnp.float32) * fault).astype(y.dtype), *pull(dy))
+        y, *gradients = with_gradients(lambda x, k: expert_projection(
+            x, k, jnp.asarray(TILE_SIZES), jnp.bfloat16, implementation, None))(x, kernel_matrix, dy)
+        return ((y.astype(jnp.float32) * fault).astype(y.dtype), *gradients)
     return run
 
 
@@ -247,7 +232,7 @@ def _tile_gate(kernel, width, features):
     """The tile gate of `kernel`'s launch at one shape: its draws, and `check(config, fault)`, check 1 of
     the launch at `config` against XLA's ragged dot, which runs under its own choice (its route checked
     once) so the forced kernel never reaches it."""
-    rows, group = int(TILE_SIZES.sum()), np.repeat(np.arange(len(TILE_SIZES)), TILE_SIZES)
+    rows = int(TILE_SIZES.sum())
 
     def draw(seed):
         rng = np.random.default_rng(seed)
@@ -258,10 +243,7 @@ def _tile_gate(kernel, width, features):
 
     def truth(x, kernel_matrix, dy):
         # The products of the operands as the projection rounds them, in float64.
-        x, kernel_matrix, dy = (np.asarray(value, np.float64) for value in (x, rounded(kernel_matrix), dy))
-        return (np.einsum('ri,rio->ro', x, kernel_matrix[group]),
-                np.einsum('ro,rio->ri', dy, kernel_matrix[group]),
-                np.stack([x[group == expert].T @ dy[group == expert] for expert in range(len(TILE_SIZES))]))
+        return oracle.products(x, rounded(kernel_matrix), dy, TILE_SIZES)
 
     xla = jax.jit(_tile_gate_arm('xla'))
     with kernel_choices(grouped_matmul='xla'), routes() as taken:
@@ -302,7 +284,8 @@ def test_a_projection_on_the_cpu_of_a_gpu_host_runs_without_the_triton_kernels(i
     y = project(*jax.device_put((x, kernel, np.full(8, 3, np.int32)), cpu))
 
     assert y.devices() == {cpu}
-    np.testing.assert_allclose(np.asarray(y, np.float64), rounded(grouped(rounded(x), rounded(kernel))),
+    np.testing.assert_allclose(np.asarray(y, np.float64),
+                               rounded(oracle.forward(rounded(x), rounded(kernel), THREE_EACH)),
                                atol=TOLERANCE, rtol=TOLERANCE)
 
 
@@ -321,13 +304,7 @@ def test_a_bf16_projection_at_the_highest_precision_holds_the_contract(sizes):
     dy = rounded(rng.normal(size=(24, 16)))
     sizes = sizes.astype(np.int32)
     # Rows past the routed ones belong to no expert and come back zero.
-    rows = np.searchsorted(np.cumsum(sizes), np.arange(24), side='right')
-    forward, input_oracle = np.zeros((24, 16)), np.zeros((24, 16))
-    kernel_oracle = np.zeros((8, 16, 16))
-    for row in np.flatnonzero(np.arange(24) < sizes.sum()):
-        forward[row] = x[row] @ kernel[rows[row]]
-        input_oracle[row] = dy[row] @ kernel[rows[row]].T
-        kernel_oracle[rows[row]] += np.outer(x[row], dy[row])
+    forward, input_oracle, kernel_oracle = oracle.products(x, kernel, dy, sizes)
 
     def loss(x, kernel):
         projected = expert_projection(x, kernel, jnp.asarray(sizes), jnp.bfloat16, 'xla', 'highest')
@@ -361,11 +338,12 @@ def test_a_projection_differentiates_the_same_law_in_every_direction(
     sizes = jnp.full(8, 3, jnp.int32)
     qx, qk, qc = (rounded(value, compute) for value in (x, kernel, cotangent))
     expected = (
-        rounded(grouped(qx, qk), compute),
-        rounded(grouped(dx, qk) + grouped(qx, dkernel), compute),
-        (rounded(grouped(qc, qk.swapaxes(1, 2)), input_dtype), rounded(gathered(qx, qc), master)),
-        (rounded(grouped(qc, np.asarray(dkernel).swapaxes(1, 2)), input_dtype),
-         rounded(gathered(dx, qc), master)))
+        rounded(oracle.forward(qx, qk, THREE_EACH), compute),
+        rounded(oracle.forward(dx, qk, THREE_EACH) + oracle.forward(qx, dkernel, THREE_EACH), compute),
+        (rounded(oracle.input_gradient(qc, qk, THREE_EACH), input_dtype),
+         rounded(oracle.kernel_gradient(qx, qc, THREE_EACH), master)),
+        (rounded(oracle.input_gradient(qc, dkernel, THREE_EACH), input_dtype),
+         rounded(oracle.kernel_gradient(dx, qc, THREE_EACH), master)))
 
     def evaluate(x, kernel, dx, dkernel, cotangent, sizes):
         def fn(x, kernel):

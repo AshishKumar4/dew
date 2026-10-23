@@ -22,6 +22,7 @@ import pytest
 from attention_oracle import exact_attention
 from reference_error import assert_as_exact, assert_as_exact_as_the_reference, with_gradients
 
+from dew.nn.documents import CrossDocuments
 from dew.nn.kernels import decode_attention, generation, tuning
 from dew.nn.kernels.templates import attention as template, attention_portable, attention_triton
 
@@ -38,8 +39,10 @@ class Family:
     1/sqrt(D); the keys each query keeps `[B, 1, Q, K]` and the same keys as the template's spans'
     arguments (`template.spans`); the rows `[B, Q]` that see no key, whose output and gradients are
     zero (`empty`); whether the default form holds it (`folded`), False only for the fold's documented
-    divergences (`algebra.Forward.base2`), which run natural alone; and the slices the decode kernel cuts
-    each row's keys into (`splits`), whose states it merges. Its declared seeds are `SEEDS`'."""
+    divergences (`algebra.Forward.base2`), which run natural alone; the slices the decode kernel cuts
+    each row's keys into (`splits`), whose states it merges; and whether it is a decode step's alone
+    (`decode_only`), a shape the template's interpreted mainloops would take too long over, which its
+    template twin covers in fewer programs. Its declared seeds are `SEEDS`'."""
 
     draw: Callable[[int], tuple]
     keep: np.ndarray
@@ -48,6 +51,7 @@ class Family:
     folded: bool = True
     dtype: str = "float32"
     splits: int = 1
+    decode_only: bool = False
 
 
 def _normal(seed: int, *shapes) -> list[np.ndarray]:
@@ -77,6 +81,8 @@ SEEDS = {"ties at scale 1": 64, "ties at scale 1, cotangents near 2**125": 64, "
          "a small weight on a large value, float32": 128, "a small weight on a large value, bfloat16": 256,
          "a weight at the exponent's edge on a large value, float32": 64,
          "a weight at the exponent's edge on a large value, bfloat16": 64,
+         "a decode step's weight at the exponent's edge on a large value, float32": 64,
+         "a decode step's weight at the exponent's edge on a large value, bfloat16": 64,
          "a small column beside an overflowing one": 64,
          "a column near fp32's least normal beside an overflowing one": 64,
          "a cotangent on a small column beside an overflowing one": 64,
@@ -90,7 +96,7 @@ SEEDS = {"ties at scale 1": 64, "ties at scale 1, cotangents near 2**125": 64, "
          "two finite slices whose merge overflows": 8, "a resumed state of a large denominator": 64,
          "a resumed state beside an overflowing column": 32,
          "a resumed state of a denominator near fp32's largest beside an overflowing column": 8,
-         "fp16 values near their largest beside a state near fp32's largest": 8,
+         "fp16 values near their largest beside a state near fp32's largest": 32,
          "keys an ulp apart, float32": 32, "keys an ulp apart, bfloat16": 32,
          "keys near fp32's largest at equal logits": 32, "a far maximum in a later key tile": 8,
          "a decode step's sink and one key": 8, "a decode step's sink near fp32's largest and one key": 8,
@@ -134,28 +140,37 @@ def _ties(width: int, cotangent: float) -> Callable[[int], tuple]:
 
 
 def _small_weight(dtype, *, queries: int, logits: tuple[float, float], sizes: tuple[float, float] | None,
-                  rows: int = 128) -> Family:
+                  rows: int = 128, cases: int = 1, decode_only: bool = False) -> Family:
     # `queries` queries a row over 32 keys of which two are seen: a key of logit 0 and one whose logit is a
     # quarter of each query's size (drawn in `sizes`, else 4) times its key's -l, l drawn in `logits`, on a
     # value of 2^e, e drawn in [120, 126]: its share of the output, which a weight shifted for the sums'
     # headroom before it is narrowed would lose. At logits of -80 to -87 the weight is a normal fp32 and
     # bf16 at their exponent's edge, which a weight shifted before it is narrowed would flush
-    # (`Room.small`). One key tile a row, so the family's many rows stay cheap to interpret.
+    # (`Room.small`). One key tile a row, so the family's many rows stay cheap to interpret; `cases`
+    # independent cases a row, each its own document of `queries` queries over its own two keys
+    # (`CrossDocuments`), so a draw holds rows times cases of them in few programs.
+    count = queries * cases
+
     def draw(seed):
-        size = (np.full((rows, queries), 4.0, np.float32) if sizes is None
-                else _uniform(seed + 4, *sizes, (rows, queries)))
+        size = (np.full((rows, count), 4.0, np.float32) if sizes is None
+                else _uniform(seed + 4, *sizes, (rows, count)))
         key = np.zeros((rows, 32, 1, 16), np.float32)
-        key[:, 1, 0, 0] = -_uniform(seed, *logits, (rows,))
+        key[:, 1:2 * cases:2, 0, 0] = -_uniform(seed, *logits, (rows, cases))
         value = np.zeros((rows, 32, 1, 16), np.float32)
-        value[:, 1, 0, 0] = 2.0 ** np.floor(_uniform(seed + 1, 120.0, 127.0, (rows,)))
-        value[:, :2, 0, 1:] = _uniform(seed + 3, -1.0, 1.0, (rows, 2, 15))
+        value[:, 1:2 * cases:2, 0, 0] = 2.0 ** np.floor(_uniform(seed + 1, 120.0, 127.0, (rows, cases)))
+        value[:, :2 * cases, 0, 1:] = _uniform(seed + 3, -1.0, 1.0, (rows, 2 * cases, 15))
         # The cotangent drawn times 2^-4, so its product with a value of 2^126 stays within bf16's and
         # fp32's largest in the reference's backward.
-        (dout,) = _normal(seed + 2, (rows, queries, 1, 16))
+        (dout,) = _normal(seed + 2, (rows, count, 1, 16))
         return _first(size, 16), key, value, None, dout * np.float32(2.0 ** -4)
-    seen = np.zeros((rows, 1, queries, 32), bool)
-    seen[..., :2] = True
-    return Family(draw, seen, {"lengths": np.full(rows, 2)}, dtype=dtype)
+    query_ids = np.repeat(np.arange(1, cases + 1, dtype=np.int32), queries)
+    key_ids = np.zeros(32, np.int32)
+    key_ids[:2 * cases] = np.repeat(np.arange(1, cases + 1, dtype=np.int32), 2)
+    seen = np.broadcast_to((query_ids[:, None] == key_ids[None, :]) & (key_ids[None, :] > 0),
+                           (rows, 1, count, 32)).copy()
+    spans = ({"lengths": np.full(rows, 2)} if cases == 1 else
+             {"segment_ids": CrossDocuments(np.tile(query_ids, (rows, 1)), np.tile(key_ids, (rows, 1)))})
+    return Family(draw, seen, spans, dtype=dtype, decode_only=decode_only)
 
 
 def _mixed_columns(seed: int, rows: int = 128, small: tuple[float, float] = (5e29, 1e30), *,
@@ -438,7 +453,11 @@ def _far_maximum_in_a_later_tile(seed: int, rows: int = 64):
 
 def _families() -> dict[str, Family]:
     small = functools.partial(_small_weight, queries=8, logits=(16.0, 21.0), sizes=(3.0, 5.0))
-    edge = functools.partial(_small_weight, queries=1, logits=(80.0, 87.0), sizes=None, rows=1024)
+    # 1024 cases a draw: 64 rows of 16 for the template, whose interpreted Triton mainloop's time grows with
+    # its programs, and a decode step's 1024 rows of one query, the decode kernel's shape.
+    edge = functools.partial(_small_weight, queries=1, logits=(80.0, 87.0), sizes=None, rows=64, cases=16)
+    edge_step = functools.partial(_small_weight, queries=1, logits=(80.0, 87.0), sizes=None, rows=1024,
+                                  decode_only=True)
     families = {
         "ties at scale 1": Family(_ties(1, 1.0), _kept(1, 2)),
         "ties at scale 1, cotangents near 2**125": Family(_ties(1, 2.0 ** 125), _kept(1, 2)),
@@ -478,6 +497,8 @@ def _families() -> dict[str, Family]:
         "a small weight on a large value, bfloat16": small("bfloat16"),
         "a weight at the exponent's edge on a large value, float32": edge("float32"),
         "a weight at the exponent's edge on a large value, bfloat16": edge("bfloat16"),
+        "a decode step's weight at the exponent's edge on a large value, float32": edge_step("float32"),
+        "a decode step's weight at the exponent's edge on a large value, bfloat16": edge_step("bfloat16"),
         # The headroom is the accurate form's: the fold's sum of those values overflows.
         "a small column beside an overflowing one": Family(_mixed_columns, np.ones((128, 1, 1, 5), bool),
                                                            folded=False),
@@ -553,13 +574,18 @@ def _families() -> dict[str, Family]:
 FAMILIES = _families()
 FORMS = {"default": None, "natural": True}
 """The forms each family runs in: the default (`template.NATURAL`) and natural logits."""
-RUNS = [(family, form) for family in FAMILIES for form in FORMS
-        if form == "natural" or FAMILIES[family].folded]
+FAMILY_RUNS = [(family, form) for family in FAMILIES for form in FORMS
+               if form == "natural" or FAMILIES[family].folded]
+RUNS = [(family, form) for family, form in FAMILY_RUNS if not FAMILIES[family].decode_only]
+"""The template's runs: every family's but a decode step's alone (`Family.decode_only`)."""
 
 
 def _spans(family: Family, query, key) -> template.KeySpans:
-    arguments = {name: jnp.asarray(value) if isinstance(value, np.ndarray) else value
-                 for name, value in family.spans.items()}
+    def placed(value):
+        if isinstance(value, CrossDocuments):
+            return CrossDocuments(jnp.asarray(value.query), jnp.asarray(value.key))
+        return jnp.asarray(value) if isinstance(value, np.ndarray) else value
+    arguments = {name: placed(value) for name, value in family.spans.items()}
     return template.spans(query.shape[1], key.shape[1], query.shape[0], **arguments)
 
 
@@ -707,7 +733,7 @@ def test_attention_is_finite_and_as_exact_as_the_reference_at_fp32s_edges(family
         _held_empty(family, differentiated(*draw(0)), label)
 
 
-DECODED = [(family, form) for family, form in RUNS
+DECODED = [(family, form) for family, form in FAMILY_RUNS
            if FAMILIES[family].draw(0)[0].shape[1] == 1 and FAMILIES[family].draw(0)[0].shape[3] >= 16
            and not isinstance(FAMILIES[family].draw(0)[3], tuple)]
 """The families a decode step is: one query a row, a head width the decode kernel takes (16 to 256),

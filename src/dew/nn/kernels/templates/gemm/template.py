@@ -1,4 +1,5 @@
-"""The grouped GEMM template (bible §6's third): one grouped matmul with a prologue and an epilogue.
+"""The grouped GEMM template (docs/design/kernel-templates.md): one grouped matmul with a prologue and an
+epilogue.
 
 `gemm(lhs, rhs, group_sizes)` multiplies each group's rows of `lhs` `[rows, depth]` by its matrix of
 `rhs` `[groups, depth, width]` (or `[groups, width, depth]` with `transpose_rhs`), a dense product
@@ -19,7 +20,9 @@ with a hook needs a module-level hook (`tuning.encoded`).
 
 Each call runs the launch the cost model picks among the implementations that take it
 (`grouped_matmul`'s Triton and Mosaic GPU launches) where it lowers for CUDA, interpreted on the CPU
-where `interpret_on_cpu` asks, and XLA's ragged dot with the hooks applied around it everywhere else.
+where `interpret_on_cpu` asks (an assumed TPU's, the TPU launches on Megablox's schedule), and XLA's
+ragged dot with the hooks applied around it everywhere else, a TPU's own lowering included until a
+scoreboard row measures its launches.
 `gemm` is differentiable at every order (`generation.linear_tangent`): its reverse mode runs the
 template's own launches with the arithmetic of the portable program's derivative, the products'
 cotangents through `gemm` and `gemm_t` and the hooks' through their VJPs in XLA, recomputing the
@@ -45,14 +48,22 @@ LAUNCH_AXES = {'prologue': ('rows', 'depth'), 'epilogue': ('rows', 'columns')}
 def gemm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None = None, *, transpose_rhs: bool = False,
          prologue=None, prologue_operands: tuple = (), epilogue=None, epilogue_operands: tuple = (),
          out_dtype, out_dtypes: tuple | None = None, precision: PrecisionLike = None,
-         interpret_on_cpu: bool = False, prologue_vjp=None):
+         interpret_on_cpu: bool = False, prologue_vjp=None, compute=None):
     """Each group's rows of `lhs` times its matrix of `rhs`, through the hooks (the module's docstring):
     `[rows, width]` in `out_dtype`, or a tuple in `out_dtypes`. A `precision` above the default
     (explicitly or through `jax_default_matmul_precision`) sums an fp32 output in IEEE fp32, in XLA as in
     the kernels: the product `precision` declares (`templates.product.declared`), which every launch of
     the call and of its derivative keeps. `prologue_vjp(lhs, *side_arrays)`, where given, is the prologue's
     derivative in place of the prologue's own: a function of the multiplied operand's cotangent giving
-    `lhs`'s and each side array's (a fused producer's whole VJP, `fused`)."""
+    `lhs`'s and each side array's (a fused producer's whole VJP, `fused`). `compute`, where given, is the
+    dtype the products take, `lhs` rounded to it as `rhs` is, where `lhs`'s own dtype is what its
+    cotangent takes, summed in fp32 and rounded once to it (an fp32 input's of a bf16 product); the
+    rounding passes tangents through unrounded, the MoE projection's law
+    (`grouped_matmul.portable_projection`), and there is no prologue."""
+    if compute is not None and prologue is not None:
+        raise ValueError("a prologue's operand is multiplied in its own dtype, not a named `compute`")
+    straight = compute is not None
+    compute = jnp.dtype(lhs.dtype if compute is None else compute)
     dense = group_sizes is None
     rhs, group_sizes = _grouped(lhs, rhs, group_sizes)
     prologue_arrays, prologue_axes = _split(prologue_operands, 'prologue')
@@ -63,12 +74,13 @@ def gemm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None = None, *
              'dense': dense}
 
     def value(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays):
-        return _gemm(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, epilogue,
-                     epilogue_arrays, epilogue_axes, dtypes, several=several, **plain)
+        return _gemm(lhs.astype(compute), rhs, group_sizes, prologue, prologue_arrays, prologue_axes,
+                     epilogue, epilogue_arrays, epilogue_axes, dtypes, several=several, **plain)
 
     def portable(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays):
-        return _portable_gemm(lhs, rhs, group_sizes, prologue, prologue_arrays, epilogue, epilogue_arrays,
-                              dtypes, several, transpose_rhs, precision)
+        return _portable_gemm(lhs if straight else lhs.astype(compute), rhs, group_sizes, prologue,
+                              prologue_arrays, epilogue, epilogue_arrays, dtypes, several, transpose_rhs,
+                              precision, compute if straight else None)
 
     def forward(*operands):
         return value(*operands), ()
@@ -80,33 +92,35 @@ def gemm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None = None, *
         acc_shape = (lhs.shape[0], rhs.shape[1] if transpose_rhs else rhs.shape[2])
         if epilogue is None:
             d_acc, d_epilogue = cotangents[0], ()
-            narrow = jnp.promote_types(cotangents[0].dtype, lhs.dtype) == lhs.dtype
+            narrow = jnp.promote_types(cotangents[0].dtype, compute) == compute
         else:
             if _reads_accumulator(epilogue, acc_shape, epilogue_arrays):
-                acc = _gemm(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, None, (), (),
+                acc = _gemm(lhs.astype(compute), rhs, group_sizes, prologue, prologue_arrays, prologue_axes,
+                            None, (), (),
                             (jnp.dtype(jnp.float32),), several=False, **plain)
             else:
                 acc = jnp.zeros(acc_shape, jnp.float32)
             outs, pull = jax.vjp(functools.partial(_tupled, epilogue), acc, *epilogue_arrays)
             d_acc, *d_epilogue = pull(tuple(c.astype(out.dtype)
                                             for c, out in zip(cotangents, outs, strict=True)))
-            narrow = _passes_cotangent(epilogue, acc_shape, epilogue_arrays, dtypes, lhs.dtype)
+            narrow = _passes_cotangent(epilogue, acc_shape, epilogue_arrays, dtypes, compute)
         # The accumulator's cotangent meets the forward's rounded operands as the portable program's
         # derivative has it: in `lhs`'s dtype where that holds it exactly (a cotangent no wider, passed
         # through), wide otherwise, each product rounding once.
-        work = lhs.dtype if narrow else jnp.promote_types(d_acc.dtype, jnp.float32)
+        work = compute if narrow else jnp.promote_types(d_acc.dtype, jnp.float32)
         d_product = d_acc.astype(work)
-        matrix = rhs.astype(lhs.dtype)
+        matrix = rhs.astype(compute)
         # The cotangent of the operand the forward multiplied, `prologue(lhs)` rounded to `lhs`'s dtype.
         d_operand = jnp.asarray(_gemm(d_product, matrix, group_sizes, None, (), (), None, (), (),
                                       (jnp.dtype(lhs.dtype),), several=False, transpose_rhs=not transpose_rhs,
                                       interpret_on_cpu=interpret_on_cpu, precision=precision, dense=dense))
         if narrow:
-            d_rhs = gemm_t(lhs, d_product, None if dense else group_sizes, prologue=prologue,
+            d_rhs = gemm_t(lhs.astype(compute), d_product, None if dense else group_sizes, prologue=prologue,
                            prologue_operands=tuple(zip(prologue_arrays, prologue_axes, strict=True)),
                            out_dtype=rhs.dtype, precision=precision, interpret_on_cpu=interpret_on_cpu)
         else:
-            operand = lhs if prologue is None else prologue(lhs, *prologue_arrays).astype(lhs.dtype)
+            operand = (lhs.astype(compute) if prologue is None
+                       else prologue(lhs, *prologue_arrays).astype(lhs.dtype))
             d_rhs = gemm_t(operand.astype(work), d_product, None if dense else group_sizes,
                            out_dtype=rhs.dtype, precision=precision, interpret_on_cpu=interpret_on_cpu)
         d_rhs = jnp.swapaxes(d_rhs, 1, 2) if transpose_rhs else d_rhs
@@ -136,21 +150,24 @@ def gemm_t(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array | None, *, pro
     def kernel(lhs, rhs, group_sizes, prologue_arrays, *, interpret):
         sides, axes, broadcast = _launchable(prologue_arrays, prologue_axes)
         hooks = grouped_matmul.Hooks(prologue, axes, prologue_broadcast=broadcast)
-        promoted = declared(lhs.dtype, precision, outputs=(out_dtype,)).promoted
-        return grouped_matmul.launched_tgmm(lhs, rhs, group_sizes, sides, out_dtype=out_dtype, hooks=hooks,
-                                            interpret=interpret, promoted=promoted, dense=dense)
+        call = {'out_dtype': out_dtype, 'hooks': hooks, 'interpret': interpret,
+                'promoted': declared(lhs.dtype, precision, outputs=(out_dtype,)).promoted, 'dense': dense}
+        if not _taken(grouped_matmul.tgmm_refusal(lhs, rhs, group_sizes, sides, **call)):
+            return portable(lhs, rhs, group_sizes, prologue_arrays)
+        return grouped_matmul.launched_tgmm(lhs, rhs, group_sizes, sides, **call)
 
     def portable(lhs, rhs, group_sizes, prologue_arrays):
         routed = _routed(group_sizes, lhs.shape[0])
         if prologue is not None:
             lhs = prologue(lhs, *prologue_arrays).astype(lhs.dtype)
         lhs = jnp.where(routed[:, None], lhs, 0)
-        matrix = jnp.zeros((group_sizes.shape[0], lhs.shape[1], rhs.shape[1]), jnp.float32)
+        wide = jnp.promote_types(lhs.dtype, jnp.float32)  # an fp64 product's sum in fp64
+        matrix = jnp.zeros((group_sizes.shape[0], lhs.shape[1], rhs.shape[1]), wide)
         _, pullback = jax.vjp(lambda matrix: grouped_matmul.xla_ragged_dot(
-            lhs, matrix, group_sizes, precision=precision, preferred_element_type=jnp.float32), matrix)
-        return pullback(rhs.astype(lhs.dtype).astype(jnp.float32))[0].astype(out_dtype)
+            lhs, matrix, group_sizes, precision=precision, preferred_element_type=wide), matrix)
+        return pullback(rhs.astype(lhs.dtype).astype(wide))[0].astype(out_dtype)
 
-    if not _kernels_take(lhs.dtype, precision):
+    if not _kernels_take(lhs.dtype, precision, (out_dtype,), (lhs.dtype, rhs.dtype), lhs.shape[0]):
         return portable(lhs, rhs, group_sizes, prologue_arrays)
     return _dispatched(kernel, portable, interpret_on_cpu, lhs, rhs, group_sizes, prologue_arrays)
 
@@ -165,29 +182,39 @@ def _gemm(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, epilo
         hooks = grouped_matmul.Hooks(prologue, before_axes, epilogue, after_axes,
                                      tuple(dtype.name for dtype in dtypes) if several else None,
                                      prologue_broadcast=before_broadcast, epilogue_broadcast=after_broadcast)
-        return grouped_matmul.launched_gmm(lhs, rhs, group_sizes, before_sides, after_sides,
-                                           out_dtype=dtypes[0], trans_rhs=transpose_rhs, hooks=hooks,
-                                           interpret=interpret, promoted=declared(lhs.dtype, precision,
-                                                                                  outputs=dtypes).promoted,
-                                           dense=dense)
+        call = {'out_dtype': dtypes[0], 'trans_rhs': transpose_rhs, 'hooks': hooks, 'interpret': interpret,
+                'promoted': declared(lhs.dtype, precision, outputs=dtypes).promoted, 'dense': dense}
+        # A call no launch takes (a TPU's widths its blocks do not divide) runs XLA's program.
+        if not _taken(grouped_matmul.gmm_refusal(lhs, rhs, group_sizes, before_sides, after_sides, **call)):
+            return portable(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays)
+        return grouped_matmul.launched_gmm(lhs, rhs, group_sizes, before_sides, after_sides, **call)
 
     def portable(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays):
         return _portable_gemm(lhs, rhs, group_sizes, prologue, prologue_arrays, epilogue, epilogue_arrays,
                               dtypes, several, transpose_rhs, precision)
 
-    if not _kernels_take(lhs.dtype, precision):
+    if not _kernels_take(lhs.dtype, precision, dtypes, (lhs.dtype, rhs.dtype), lhs.shape[0]):
         return portable(lhs, rhs, group_sizes, prologue_arrays, epilogue_arrays)
     return _dispatched(kernel, portable, interpret_on_cpu, lhs, rhs, group_sizes, prologue_arrays,
                        epilogue_arrays)
 
 
 def _portable_gemm(lhs, rhs, group_sizes, prologue, prologue_arrays, epilogue, epilogue_arrays, dtypes,
-                   several: bool, transpose_rhs: bool, precision: PrecisionLike):
-    """`gemm`'s arithmetic in XLA: the kernels' products of `lhs`'s dtype summed in fp32, one rounding."""
-    product = lhs if prologue is None else prologue(lhs, *prologue_arrays).astype(lhs.dtype)
-    matrix = (jnp.swapaxes(rhs, 1, 2) if transpose_rhs else rhs).astype(lhs.dtype)
-    summed = grouped_matmul.xla_ragged_dot(product, matrix, group_sizes, precision=precision,
-                                           preferred_element_type=jnp.float32)
+                   several: bool, transpose_rhs: bool, precision: PrecisionLike, compute=None):
+    """`gemm`'s arithmetic in XLA: the kernels' products of `lhs`'s dtype summed in at least fp32 (an fp64
+    product's in fp64, which no kernel takes), one rounding;
+    with `compute`, the products of the operands rounded to it, its tangent the MoE projection's
+    (`grouped_matmul.portable_projection`, whose sum, at least fp32, it reads)."""
+    matrix = jnp.swapaxes(rhs, 1, 2) if transpose_rhs else rhs
+    if compute is not None:
+        # Summed and kept at least fp32 (an fp64 product's in fp64), the accumulator the epilogue reads.
+        wide = jnp.promote_types(compute, jnp.float32)
+        summed = grouped_matmul.portable_projection(lhs, matrix, group_sizes, compute, precision, wide)
+    else:
+        product = lhs if prologue is None else prologue(lhs, *prologue_arrays).astype(lhs.dtype)
+        wide = jnp.promote_types(lhs.dtype, jnp.float32)
+        summed = grouped_matmul.xla_ragged_dot(product, matrix.astype(lhs.dtype), group_sizes,
+                                               precision=precision, preferred_element_type=wide)
     outs = _as_tuple(summed if epilogue is None else epilogue(summed, *epilogue_arrays))
     outs = tuple(out.astype(dtype) for out, dtype in zip(outs, dtypes, strict=True))
     return outs if several else outs[0]
@@ -270,11 +297,21 @@ def _needed(jaxpr, outvars) -> set:
     return needed
 
 
-def _kernels_take(compute, precision: PrecisionLike) -> bool:
-    """Whether the kernels compute the product `precision` declares in `compute`
-    (`templates.product.declared`): one they refuse runs XLA's portable program, reported as the
+def _kernels_take(compute, precision: PrecisionLike, outputs: tuple, operands: tuple, rows: int) -> bool:
+    """Whether the kernels compute the product `precision` declares in `compute` with `outputs`
+    (`templates.product.declared`) of `operands` (their dtypes as stored, `grouped_matmul.ragged_dot_refusal`)
+    on this target (`grouped_matmul.kernel_refusal`: a TPU's launches take 16-bit products not added step by
+    step), and the call has `rows` to launch: one they refuse runs XLA's portable program, reported as the
     dispatch's route with the reason, and a kernel `generation.chosen` names for it raises."""
-    refusal = declared(compute, precision).refusal
+    product = declared(compute, precision, outputs=outputs)
+    return _taken(product.refusal or grouped_matmul.ragged_dot_refusal(compute, operands, precision)
+                  or grouped_matmul.kernel_refusal(compute, product.promoted)
+                  or (None if rows else "the call has no rows"))
+
+
+def _taken(refusal: str | None) -> bool:
+    """Whether the kernels take a call `refusal` does not turn down; one turned down is reported as the
+    dispatch's route to XLA, and a kernel `generation.chosen` names for it raises."""
     if refusal is None:
         return True
     named = forced('grouped_matmul')
