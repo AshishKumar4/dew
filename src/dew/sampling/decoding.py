@@ -172,14 +172,14 @@ def real(name: str, value: object) -> float:
     return float(value)
 
 
-def positive(name: str, value: object) -> float:
+def positive(name: str, value: float) -> float:
     rate = real(name, value)
     if rate <= 0:
         raise ValueError(f"{name} must be a finite positive number")
     return rate
 
 
-def unit_interval(name: str, value: object) -> float:
+def unit_interval(name: str, value: float) -> float:
     rate = real(name, value)
     if not 0 <= rate <= 1:
         raise ValueError(f"{name} must be finite and between zero and one")
