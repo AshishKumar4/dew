@@ -147,15 +147,13 @@ def decays(g, documents=None):
     return grown_from(hi, lo, jnp.exp), jnp.where(inclusive, jnp.exp(diff), 0.0)
 
 
-LN2 = 0.6931471805599453
-"""ln 2: `exp2`'s derivative at zero, the base-2 prefix's unit (`raised`)."""
-
-
 def raised(hi, lo):
-    """`exp2(hi + lo)` of a compensated base-2 exponent, rounded about once (`grown_from`): a decay from a
-    chunk's start, whose exponent's rounded half alone carries its whole sum's rounding (a relative 3e-6
-    at the prefix -43 a single token at -30 a token reaches)."""
-    return grown_from(hi, lo, jnp.exp2, LN2)
+    """`exp2(hi + lo)` of a compensated base-2 exponent as `exp2(hi) exp2(lo)`: a decay from a chunk's start,
+    whose exponent's rounded half alone carries its whole sum's rounding (a relative 3e-6 at the prefix
+    -43 a single token at -30 a token reaches). `exp2(lo)`, near one, keeps `lo` to fp32's resolution
+    there, and a product of the two rounds the same in any program a compiler fuses it into, where a
+    first-order correction's multiply-add may contract to one rounding or not."""
+    return jnp.exp2(hi) * jnp.exp2(lo)
 
 
 def grown_from(hi, lo, exp, unit: float = 1.0):
