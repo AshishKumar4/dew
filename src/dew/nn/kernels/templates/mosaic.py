@@ -309,6 +309,8 @@ class Family(abc.ABC):
 
     name: str
     rows: int
+    consumers: int
+    """The compute roles a program may take (sm90 two warpgroups, sm80 one)."""
 
     @abc.abstractmethod
     def kernel(self, entry, *, out_type, grid: tuple, grid_names: tuple, consumers: int,
@@ -316,25 +318,31 @@ class Family(abc.ABC):
         """`entry` launched over `grid`, `consumers` compute roles a program beside the family's own."""
 
     @abc.abstractmethod
-    def roles(self, wg, consumers: int, consumer, producer) -> None:
+    def scoped(self, body, *allocations, streams) -> None:
+        """`body(*refs, streams=...)` with `allocations` scoped across the program's roles and its streams'
+        (`streams`)."""
+
+    @abc.abstractmethod
+    def roles(self, consumers: int, consumer, producer) -> None:
         """Each role of a program: `consumer(index)` the compute roles', `producer()` the loads' where the
         family streams from a role of its own."""
 
     @abc.abstractmethod
-    def streams(self, blocks: dict, stages: int, consumers: int) -> dict:
+    def streams(self, blocks: dict, stages: int, consumers: int) -> object:
         """The scoped allocations of a stream of each `blocks[name]` `(shape, dtype)` in `stages` slots read
         by `consumers` (`opened` once scoped)."""
 
     @abc.abstractmethod
-    def opened(self, allocated: dict) -> dict:
-        """The streams of `streams`' allocations, scoped, by name."""
+    def opened(self, allocated, views: dict | None = None) -> object:
+        """The streams of `streams`' allocations, scoped, by name; their `views` `(ref, block)` where the
+        family's walk loads them (each step `block` rows of an `[S, D]` operand)."""
 
     @abc.abstractmethod
-    def stream(self, streams: dict, views, lo, hi) -> None:
-        """The producer's loads of steps `lo` to `hi`, `views(step)` each stream's view, by name."""
+    def stream(self, streams, views: dict, lo, hi) -> None:
+        """The producer's loads of steps `lo` to `hi` from `views` (`opened`'s), where the family has one."""
 
     @abc.abstractmethod
-    def walk[C](self, streams: dict, segments, start: C, shapes: tuple, interpret: bool, *,
+    def walk[C](self, streams, segments, start: C, shapes: tuple, interpret: bool, *,
                 first: jax.Array | int = 0) -> tuple[C, tuple[jax.Array, ...]]:
         """A consumer's walk of `segments`, each `(step, lo, hi)`, `step(index, slots, carry, accumulators)
         -> (carry, accumulators)` given each stream's slots (`Slots`, the streams' steps counted from
@@ -342,9 +350,22 @@ class Family(abc.ABC):
         Returns the carry and the accumulators' values."""
 
     @abc.abstractmethod
-    def passed(self, streams: dict, lo, hi, *, first: jax.Array | int = 0, between=None) -> None:
+    def passed(self, streams, lo, hi, *, first: jax.Array | int = 0, between=None) -> None:
         """A consumer's steps `lo` to `hi` it reads none of, each load awaited and released as a reading
         consumer's (counted from `first`); `between()` after each step."""
+
+    @abc.abstractmethod
+    def loaded(self, copies) -> None:
+        """Each `(view, ref, barrier)` copied whole into its shared-memory `ref`."""
+
+    @abc.abstractmethod
+    def stored(self, parts, views, *, smem) -> None:
+        """Each of `parts` written whole to its view of `views`, through `smem` where the family stores so."""
+
+    @abc.abstractmethod
+    def held(self, ref) -> object:
+        """An operand every step reads (`ref`, in shared memory) where the family keeps it: shared memory,
+        or registers."""
 
     @abc.abstractmethod
     def product(self, lhs, rhs, shape: tuple[int, int], then=None) -> jax.Array:
@@ -356,12 +377,13 @@ class Family(abc.ABC):
         """`lhs @ rhs` into a fresh fp32 accumulator, `lhs` in registers (16-bit), its value."""
 
     @abc.abstractmethod
-    def register_products(self, acc, parts, rhs, interpret: bool):
+    def register_products(self, acc, parts, rhs, interpret: bool) -> object:
         """`acc` with `parts`' products with `rhs` issued into it in place, each part's left operand in
         registers."""
 
     @abc.abstractmethod
-    def staged_products(self, acc, parts, rhs, buffers, interpret: bool, *, transposed: bool = False):
+    def staged_products(self, acc, parts, rhs, buffers, interpret: bool, *,
+                        transposed: bool = False) -> object:
         """`register_products` of `parts` each staged in `buffers` first (its transpose the left operand
         where `transposed`)."""
 
@@ -402,21 +424,30 @@ class RingFamily(Family):
                             compiler_params=compiler_params(approx_math=True),
                             interpret=plgpu.InterpretGPUParams() if interpret else None)
 
-    def roles(self, wg, consumers: int, consumer, producer) -> None:
-        roles(wg, consumers, consumer, producer)
+    def scoped(self, body, *allocations, streams) -> None:
+        pl.run_scoped(lambda *refs, **rings: body(*refs, streams=rings), *allocations, **streams,
+                      collective_axes="wg")
 
-    def streams(self, blocks: dict, stages: int, consumers: int) -> dict:
+    def roles(self, consumers: int, consumer, producer) -> None:
+        roles(lax.axis_index("wg"), consumers, consumer, producer)
+
+    def streams(self, blocks: dict, stages: int, consumers: int):
         return {name: ring(shape, dtype, stages, consumers=consumers)
                 for name, (shape, dtype) in blocks.items()}
 
-    def opened(self, allocated: dict) -> dict:
+    def opened(self, allocated, views: dict | None = None):
+        del views
         return {name: Ring(**scoped) for name, scoped in allocated.items()}
 
-    def stream(self, streams: dict, views, lo, hi) -> None:
+    def stream(self, streams, views: dict, lo, hi) -> None:
         names = tuple(streams)
-        streamed(tuple(streams.values()), lambda index: tuple(views(index)[name] for name in names), lo, hi)
 
-    def walk[C](self, streams: dict, segments, start: C, shapes: tuple, interpret: bool, *,
+        def tiles(index):
+            return tuple(views[name][0].at[pl.ds(index * views[name][1], views[name][1])] for name in names)
+
+        streamed(tuple(streams.values()), tiles, lo, hi)
+
+    def walk[C](self, streams, segments, start: C, shapes: tuple, interpret: bool, *,
                 first: jax.Array | int = 0) -> tuple[C, tuple[jax.Array, ...]]:
         def slotted(step):
             def run(index, carry, accumulators):
@@ -438,5 +469,20 @@ class RingFamily(Family):
         """A walk of `segments`, `step(index, carry, accumulators)`, with the family's accumulators of
         `shapes` held across it (`walk`)."""
 
-    def passed(self, streams: dict, lo, hi, *, first: jax.Array | int = 0, between=None) -> None:
+    def passed(self, streams, lo, hi, *, first: jax.Array | int = 0, between=None) -> None:
         passed(tuple(streams.values()), lo, hi, first=first, between=between)
+
+    def loaded(self, copies) -> None:
+        loaded(copies)
+
+    def stored(self, parts, views, *, smem) -> None:
+        stored(parts, views, smem=smem)
+
+    def held(self, ref):
+        return ref
+
+
+def unscaled(parts) -> None:
+    """A product's parts issued in place take no power of two back (bf16's, `cotangent_parts`)."""
+    if any(exponent is not None for _, exponent in parts):
+        raise NotImplementedError("a scaled part's product is no in-place accumulation (fp16's)")
