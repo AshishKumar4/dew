@@ -210,9 +210,35 @@ def attention_keys():
     return reference, draw, None, permuting
 
 
+def heavy_sums(rows: int = 64, terms: int = 256):
+    """Sums of `terms` float32 terms over `rows` rows, each draw's terms scaled by one heavy-tailed factor
+    (a Pareto of index one, plus one), over the orbit of the terms' orders: each arm's error grows with
+    the draw's scale, so across draws it is heavy-tailed (its mean square of index one half), and two
+    orders of one sum share that scale draw by draw. The class of a site whose arms share their
+    upstream rounding: the reference compared with itself on disjoint draws does not resolve, and the
+    pair on the same draws does (`seeds_for`'s `dew_fn`)."""
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+
+    @jax.jit
+    def reference(x):
+        return {"sum": jnp.sum(x, axis=1)}
+
+    def draw(seed):
+        rng = np.random.default_rng([0x4E, seed])
+        return ((rng.pareto(1.0) + 1) * rng.standard_normal((rows, terms))).astype(np.float32),
+
+    def permuting(inputs, order):
+        (x,) = inputs
+        return (x[:, permutation(0x4E, order, x.shape[1])],)
+
+    return reference, draw, None, permuting
+
+
 CLASSES = {"cross-entropy-columns": cross_entropy_columns, "decoder-residual-orders": decoder_residual_orders,
            "contraction-terms": contraction_terms, "mean-loss-rows": mean_loss_rows,
-           "attention-keys": attention_keys}
+           "attention-keys": attention_keys, "heavy-sums": heavy_sums}
 """Each class's reference, draw, truth (None: the reference widened) and, for an orbit class, its
 `permuting(inputs, order)` (`orbited`), else None."""
 
@@ -363,6 +389,13 @@ FAULTS = {
         "scale-2^-20": _faulted(_parameters_scaled(1 + 2.0 ** -20)),
         "bf16-parameters": _faulted(_parameters(_parameters_bfloat16)),
     },
+    "heavy-sums": {
+        "dropped-term": _input_fault(0, _zeroed((slice(None), 0))),
+        "flipped-sign": _input_fault(0, _negated((slice(None), 0))),
+        "float16": _in_float16,
+        "skipped-chunk": _input_fault(0, _zeroed((slice(None), slice(0, 32)))),
+        "scale-2^-22": _scaled_output(1 + 2.0 ** -22),
+    },
     "contraction-terms": {
         "dropped-term": _input_fault(0, _zeroed((slice(None), 0))),
         "flipped-sign": _input_fault(1, _negated(0)),
@@ -491,16 +524,20 @@ def main(argv: list[str]) -> int:
                           "mse": np.asarray(draws.mine).tolist(),
                           "worst": np.asarray(draws.worst[..., 0]).tolist()}), flush=True)
         return 0
+    def twin(*inputs):
+        return reference(*permuting(inputs, REORDERED))
+
     if options.seeds is None:
-        sized = seeds_for(reference, draw, options.name, truth_fn=truth)
-        print(json.dumps({"class": options.name, "seeds": sized}), flush=True)
+        # A paired class sizes as a paired site does: its twin against it on the same draws.
+        sized = seeds_for(reference, draw, options.name, truth_fn=truth,
+                          dew_fn=twin if options.paired else None)
+        print(json.dumps({"class": options.name, "paired": options.paired, "seeds": sized}), flush=True)
         return 0
     other = None
     if options.fault:
         other = FAULTS[options.name][options.fault](reference)
     elif options.paired:
-        def other(*inputs):
-            return reference(*permuting(inputs, REORDERED))
+        other = twin
     verdicts = null_runs(reference, draw, options.name, seeds=options.seeds, runs=options.runs,
                          first=OFFSET + options.chunk * options.runs, truth_fn=truth,
                          two_stage=not options.today, dew_fn=other, paired=options.paired,
