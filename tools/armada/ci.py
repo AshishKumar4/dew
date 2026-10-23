@@ -151,9 +151,9 @@ token is not. Across 34 suite runs no file was red on 3.14 alone."""
 COLLECT = "collect"
 """The split of a task that imports test files without running them."""
 COLLECT_TASKS = 4
-SKIPPED = {"tests/test_gen_api.py", "tests/test_multihost.py"}
-"""CI runs the first in the lint job, under the griffe it pins, and the second in the multihost job,
-across the containers of an armada gang."""
+SKIPPED = {"tests/test_gen_api.py", "tests/test_redigest.py", "tests/test_multihost.py"}
+"""CI runs the first two in the lint job, under the griffe the site's scripts pin, and the third in the
+multihost job, across the containers of an armada gang."""
 DURATIONS = Path("tests/test_durations.json")
 SHARED = ("pyproject.toml", "constraints.txt", ".armada.json", "tools/armada/ci.py",
           "tools/armada/child_groups.py", "tools/armada/split.py", "tools/armada/executed.py",

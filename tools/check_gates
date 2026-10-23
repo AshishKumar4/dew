@@ -14,7 +14,7 @@ public-text	sh tools/base_history.sh && "$PYTHON" tools/public_text.py "$BASE"
 fixtures	"$PYTHON" tools/fetched_fixtures.py check
 complexity	"$PYTHON" tools/complexity.py src/dew tools/lint_slop.py tools/lint_scopes.py examples recipes > complexity.json
 api-pages	uv run --no-project --with-requirements site/scripts/requirements.txt python site/scripts/gen_api.py --check
-api-tests	uv run --no-project --with-requirements site/scripts/requirements.txt --with pytest python -m pytest -q --noconftest tests/test_gen_api.py
+api-tests	uv run --no-project --with-requirements site/scripts/requirements.txt --with pytest python -m pytest -q --noconftest tests/test_gen_api.py tests/test_redigest.py
 install-script	"$PYTHON" site/scripts/gen_install.py --check
 theme	"$PYTHON" site/scripts/gen_theme.py --check
 model-pin	"$PYTHON" site/scripts/gen_pin.py --check

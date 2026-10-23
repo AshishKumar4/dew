@@ -274,9 +274,15 @@ def signature(head: str, params: list[str], returns: str | None = None) -> str:
     return f"{head}(\n{body}){tail}"
 
 
-def class_signature(cls: griffe.Class) -> str:
+def constructor(cls: griffe.Class) -> griffe.Function | None:
+    """The `__init__` a class defines itself, which its signature shows; None for one it does not."""
     init = cls.members.get("__init__")
-    if init is not None and not init.is_alias and init.is_function:
+    return init if init is not None and not init.is_alias and init.is_function else None
+
+
+def class_signature(cls: griffe.Class) -> str:
+    init = constructor(cls)
+    if init is not None:
         return signature(f"class {cls.name}", parameters(init))
     if is_dataclass_like(cls):
         params = []
@@ -708,9 +714,10 @@ def unresolved_chain(start: griffe.Object, path: list[str], home: dict[str, str]
     return None
 
 
-def load() -> griffe.Module:
-    """Load the package with its namespace subpackages, which griffe's finder skips."""
-    root = P.repo / "src"
+def load(root: Path | None = None) -> griffe.Module:
+    """Load the package, with its namespace subpackages, which griffe's finder skips, from the source under
+    `root` (the repository's src/, or a commit's)."""
+    root = root or P.repo / "src"
     loader = griffe.GriffeLoader(search_paths=[str(root)])
     package = loader.load(P.package)
     for directory in sorted((root / P.package).rglob("*")):
@@ -731,6 +738,33 @@ def load() -> griffe.Module:
                 lines_collection=loader.lines_collection, modules_collection=loader.modules_collection))
     loader.resolve_aliases(implicit=False, external=False)
     return package
+
+
+def canonical(package: griffe.Module, dotted: str) -> str | None:
+    """Where the package defines the name `dotted` (an import's path and the attributes after it), aliases
+    followed (`reached`): an object's own path, or a keyword its owner takes (`Class.name`) under the owner's;
+    None for a name the package does not hold, or another package's."""
+    found = reached(package, dotted)
+    if found is not None:
+        return found.path
+    path, _, name = dotted.rpartition(".")
+    owner = reached(package, path) if path else None
+    return f"{owner.path}.{name}" if owner is not None and name in keyword_names(owner) else None
+
+
+def keyword_names(obj: griffe.Object) -> set[str]:
+    """The names a keyword passes `obj` by, as its signature shows them: a function's parameters, a class's
+    own `__init__`'s, or a dataclass's fields."""
+    if obj.is_class:
+        init = constructor(obj)
+        if init is None:
+            return {field.name for field in fields(obj)} if is_dataclass_like(obj) else set()
+        obj = init
+    if not obj.is_function:
+        return set()
+    passed = (griffe.ParameterKind.positional_or_keyword, griffe.ParameterKind.keyword_only)
+    return {parameter.name for parameter in obj.parameters
+            if parameter.name not in ("self", "cls") and parameter.kind in passed}
 
 
 def module_at(package: griffe.Module, path: str) -> griffe.Object | griffe.Alias:
