@@ -702,18 +702,24 @@ def _linear_primitive() -> type:
         return cotangent.sum(0)
 
     class Linear(hijax.HiPrim):
+        apply: Callable
+        pullback: Callable
+        """`linear_map`'s two functions, `params` that `HiPrim` makes attributes."""
+
         def __init__(self, apply, pullback, in_avals, out_aval):
             self.in_avals, self.out_aval = in_avals, out_aval
             self.params = {"apply": apply, "pullback": pullback}
             super().__init__()
 
-        def expand(self, residuals, moving):
+        def expand(self, *args):
+            residuals, moving = args
             return self.apply(residuals, moving)
 
-        def transpose(self, cotangent, residuals, moving):
-            if all_zero(cotangent):
+        def transpose(self, out_ct, *maybe_accums):
+            residuals, moving = maybe_accums
+            if all_zero(out_ct):
                 return
-            pulled = self.pullback(residuals, instantiated(cotangent))
+            pulled = self.pullback(residuals, instantiated(out_ct))
             accums = jax.tree.leaves(moving, is_leaf=lambda leaf: isinstance(leaf, hijax.GradAccum))
             for accum, value in zip(accums, jax.tree.leaves(pulled), strict=True):
                 if isinstance(accum, hijax.GradAccum):
