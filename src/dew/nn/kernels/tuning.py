@@ -803,6 +803,21 @@ def _read(path: str) -> tuple[Keyed, list]:
     return read, foreign
 
 
+def store_calibration(device_kind: str, facts: Mapping[str, float]) -> None:
+    """Merge `facts` (`generation.CALIBRATED`) measured on a GPU of `device_kind` by the opt-in calibration
+    into its calibrated facts (`generation.calibration`), one writer at a time, the file replaced whole
+    (`write_atomically`)."""
+    unknown = set(facts) - generation.CALIBRATED
+    if unknown:
+        raise ValueError(f"a calibration states {sorted(generation.CALIBRATED)}, not {sorted(unknown)}")
+    path = cache.device_facts_path(device_kind)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with filelock.FileLock(path + '.lock'):
+        stored = generation.calibration(device_kind)
+        merged = {**stored, **{name: float(value) for name, value in facts.items()}}
+        write_atomically(path, json.dumps(merged))
+
+
 def _stored_picks(kind: str) -> dict[tuple[tokamax.Op, str], _Picks]:
     """The picks stored for GPUs of `kind` that this checkout reads (`_read`), by op,
     none where the process keeps no picks (`dew.cache.keeps_picks`)."""

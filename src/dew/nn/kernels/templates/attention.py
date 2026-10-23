@@ -14,6 +14,14 @@ A hook is a plain JAX callable the kernel's body traces, pointwise in the score 
 decay), with each parameter loaded as its kind says (`Param`); the softmax starts from an initial state
 (`Initial`: sinks, a resumed partial); `output_mod(o, *params)` on the normalized output tile. Absent,
 a hook adds no op.
+
+Precision, every implementation's contract: the products of the inputs accumulate in fp32, the logits'
+scale, hooks and softmax run in fp32, and the probabilities round to the values' dtype for each product
+they enter, the output's `P V` and the backward's `P^T dO`, as jax's own attention does
+(`jax.nn.dot_product_attention`'s xla path, jax/_src/nn/functions.py: `probs =
+softmax(...).astype(key.dtype)`) and FlashAttention 2's forward (csrc/flash_attn/src/flash_fwd_kernel.h:
+"Convert acc_s from fp32 to fp16/bf16" before the P V product); the output normalizes in fp32 before it
+rounds to the query's dtype (`reference`).
 """
 
 import dataclasses
@@ -45,14 +53,22 @@ class KeySpans:
     form: str = dataclasses.field(default="spans", metadata={"static": True})
 
 
+def within(keys: jax.Array, start: jax.Array, end: jax.Array,
+           ids: tuple[jax.Array, jax.Array] | None = None) -> jax.Array:
+    """Whether each key index of `keys` lies in its query's interval `start` to `end` and, with `ids`
+    (the queries' and the keys', broadcasting alike), is of its document: the keys a call's spans let a
+    query see, which the reference (`visible`) and every mainloop (`attention_algebra.modify`, the
+    backward's tiles) mask by."""
+    seen = (keys >= start) & (keys < end)
+    return seen if ids is None else seen & (ids[0] == ids[1])
+
+
 def visible(spans: KeySpans, row: jax.Array | int, queries: jax.Array, keys: jax.Array) -> jax.Array:
     """Whether each of `keys` (key indices, broadcasting) is visible to each of `queries` (query
-    indices) in batch row `row`: inside the query's interval and, with ids, of its document."""
-    start, end = spans.start[row][queries], spans.end[row][queries]
-    seen = (keys >= start) & (keys < end)
-    if spans.query_ids is not None and spans.key_ids is not None:
-        seen &= spans.query_ids[row][queries] == spans.key_ids[row][keys]
-    return seen
+    indices) in batch row `row` (`within`)."""
+    ids = (None if spans.query_ids is None or spans.key_ids is None
+           else (spans.query_ids[row][queries], spans.key_ids[row][keys]))
+    return within(keys, spans.start[row][queries], spans.end[row][queries], ids)
 
 
 def dense(spans: KeySpans) -> jax.Array:
@@ -406,6 +422,16 @@ NATURAL = False
 (`attention_algebra.Forward.base2`): False, the base-2 fold, the fast form, until the natural form's cost
 closes; every kernel's default reads it, so the default switches here."""
 
+ACCURATE = False
+"""Whether attention's backward takes its accurate products unless a call says otherwise: False, the fast
+form, the template's own D about each query's anchor (`attention_algebra.split_delta`, not
+FlashAttention's rowsum(dO * O)) with each bf16 score cotangent narrowed for one product and dQ at that
+first D, as FlashAttention's arithmetic takes them; True, the cotangents' products to fp32's accuracy and
+dQ at the refined D (`attention_algebra.cotangent_product`, `dq_finish`). The template's accurate form is
+this with natural logits (`natural=True, accurate=True`, a forward and backward of the one form), which the
+stability suite holds to check 1 at extreme inputs, where the default holds to finiteness (the owner's
+ruling, 2026-10-23). Every backward's default reads it."""
+
 
 def natural_exp(x: jax.Array) -> jax.Array:
     """The natural form's forward exponential (`attention_algebra.Forward.power`): `exp(x)` as the
@@ -415,6 +441,30 @@ def natural_exp(x: jax.Array) -> jax.Array:
     once more than `jnp.exp`, about `|x|` fp32 ulps of the result, so the backward's weights and every
     factor that carries a state (whose size may be any) take `jnp.exp`, as the reference does."""
     return jnp.exp2(x * LOG2E)
+
+
+def kernel_dot(a: jax.Array, b: jax.Array, interpret: bool) -> jax.Array:
+    """`a @ b` accumulated in fp32 as a template's Triton kernels issue it: bf16's and fp16's own product,
+    IEEE fp32 for fp32 operands; interpreted, the template's CPU product (`interpreted_dot`)."""
+    if interpret:
+        return interpreted_dot(a, b)
+    from jax.experimental.pallas import triton as plgpu
+
+    return plgpu.dot(a, b, precision=jax.lax.Precision.HIGHEST).astype(jnp.float32)
+
+
+def interpreted_dot(a: jax.Array, b: jax.Array) -> jax.Array:
+    """`a @ b`, fp32, as every CPU arm of the attention template issues it (the plain-JAX mainloop, the
+    interpreted kernels): the product its operands declare at the precision policy's precision
+    (`dew.nn.precision.float32_products`), issued off a GPU by the declaration's owner
+    (`product.interpreted`), so an fp32 product accumulates in float64, within that sum's rounding bound
+    whatever the tile."""
+    from dew.nn.kernels.templates import product
+    from dew.nn.precision import float32_products, products_dtype
+
+    dtype = products_dtype(a, b)
+    declared = product.declared(dtype, float32_products(dtype), outputs=(jnp.float32,))
+    return product.interpreted(declared, a, b, (((a.ndim - 1,), (0,)), ((), ())))
 
 
 def power_of_two(width: int) -> int:
@@ -509,11 +559,13 @@ class Split(NamedTuple):
     """A training forward's split sums (`attention_algebra.split_accumulate`), residuals the backward
     reads in place of its first pass: the weighted values of every key but each query's anchor key,
     with the initial state's, `others` `[B, H, Q, Dv]`, the anchor's own weight `own` and the other
-    keys' weights' sum `others_total` `[B, H, Q]`, fp32, all at the forward's maximum."""
+    keys' weights' sum `others_total` `[B, H, Q]`, fp32, all at the forward's maximum and at each row's
+    `2^-shift` `[B, H, Q]` (`attention_algebra.room`)."""
 
     others: jax.Array
     own: jax.Array
     others_total: jax.Array
+    shift: jax.Array
 
 
 DQ_GRADS = (Kind.HEAD, Kind.QUERY)
@@ -575,9 +627,13 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
         nothing = jnp.zeros((batch, heads, queries), jnp.float32)
         starts = nothing - jnp.inf, nothing, nothing
     else:
-        # The softmax's initial state: its maximum, denominator and share of D's numerator, in fp32.
-        starts = (state.m.astype(jnp.float32), state.total.astype(jnp.float32),
-                  jnp.sum(state.acc.astype(jnp.float32) * cotangent, axis=-1))
+        # The softmax's initial state: its maximum, denominator and its values' mean's product with the
+        # cotangent, in fp32 (`attention_algebra.off_anchor_start`): `acc0 · dO` itself overflows where the
+        # state's sums are near fp32's largest; its mean does not.
+        total0 = state.total.astype(jnp.float32)
+        over = jnp.where(total0 > 0, 1.0 / jnp.where(total0 > 0, total0, 1.0), 0.0)
+        mean0 = state.acc.astype(jnp.float32) * over[..., None]
+        starts = state.m.astype(jnp.float32), total0, jnp.sum(mean0 * cotangent, axis=-1)
     call = padded_call(query, key, value, spans, hooks, block)
     padded_dout = jnp.pad(dout, ((0, 0), (0, call.query.shape[1] - queries), (0, 0),
                                  (0, call.value.shape[-1] - value_width)))
@@ -590,12 +646,13 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
     widened = ((0, 0),) * 3 + ((0, call.value.shape[-1] - value_width),)
     others = jnp.pad(call.rows(split.others.astype(jnp.float32)), widened)
     own, others_total = call.rows(split.own), call.rows(split.others_total)
+    shift = call.rows(split.shift.astype(jnp.float32))
     # The anchor key's value row for each query, `[B, Qp, H, Dvp]`, a key head's for its query heads.
     anchor_value = jnp.take_along_axis(jnp.repeat(call.value, group, axis=2),
                                        jnp.swapaxes(key_index, 1, 2)[..., None], axis=1)
     maximum = call.rows(maxima.astype(jnp.float32))
     outputs = launch(*operands, *(call.rows(start) for start in starts), maximum, key_index, anchor_value,
-                     others, own, others_total, call.rows(totals.astype(jnp.float32)), *rows,
+                     shift, others, own, others_total, call.rows(totals.astype(jnp.float32)), *rows,
                      score_mod=hooks.score_mod, score_kinds=kinds, score_dtypes=dtypes, scale=scale)
     dq, softmax = outputs[0], outputs[1:6]
     grads_out = list(outputs[7:])
@@ -631,9 +688,9 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
         inverse = jnp.where(total > 0, 1.0 / jnp.where(total > 0, total, 1.0), 0.0)
         # Its maximum's cotangent, that term's score cotangent, taken whole as the reference's derivative
         # takes it; exactly 0 for a query that read only its state, whose output its maximum leaves unmoved.
-        moved = (jnp.sum(state.acc.astype(jnp.float32) * cotangent, axis=-1)
-                 - state.total.astype(jnp.float32) * delta) * inverse
-        initial = Initial(m=jnp.where(mass > 0, moved * factor, 0.0).astype(state.m.dtype),
+        # Its weight before any product, as the launch takes it (`attention_algebra.refinement`).
+        moved = (starts[2] - delta) * ((starts[1] * factor) * inverse)
+        initial = Initial(m=jnp.where(mass > 0, moved, 0.0).astype(state.m.dtype),
                           total=(-(delta * inverse) * factor).astype(state.total.dtype),
                           acc=((cotangent * inverse[..., None]) * factor[..., None]).astype(state.acc.dtype))
     return Gradients(dq[:, :queries, :, :width].astype(query.dtype),

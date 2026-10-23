@@ -4,6 +4,8 @@
 form and hook. A mainloop that masked, hooked or normalized on its own would part from the other here.
 The algebra's own `merge` is held to one pass over the keys it joins."""
 
+import functools
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -19,6 +21,7 @@ from test_attention_triton import (
     gate_of,
     geometry,
     hooks_for,
+    joint,
     score_hooks,
 )
 
@@ -40,17 +43,20 @@ RESIDUALS = ("output", "maximum", "denominator", "anchor key", "split sums")
 """The forward's outputs with `residuals`, in order."""
 
 
-def both(case: dict, names: frozenset, dtype, tiles: attention_triton.Tiles):
+def both(case: dict, names: frozenset, dtype, tiles: attention_triton.Tiles,
+         natural: bool = template.NATURAL):
     """The Triton mainloop's and the plain-JAX mainloop's output and residuals over `case` and the hooks
-    `names`, seed 0."""
+    `names`, seed 0, the exponent `natural` or the fold."""
     queries, keys = geometry(case)
     spans = template.spans(queries, keys, ROWS, **arguments(case))
     hooks = hooks_for(names, queries, 32, gate_of(queries, 32))
     query, key, value = drawing(queries, keys, dtype)(0)
     with tuning.pinned({attention_triton.TritonForward: tiles}):
-        triton = attention_triton.forward(query, key, value, spans, hooks, residuals=True, interpret=True)
+        triton = attention_triton.forward(query, key, value, spans, hooks, residuals=True, natural=natural,
+                                          interpret=True)
     portable = attention_portable.attend(query, key, value, spans, hooks, block_q=tiles.block_q,
-                                         block_k=tiles.block_k, pad=attention_triton.BLOCK, residuals=True)
+                                         block_k=tiles.block_k, pad=attention_triton.BLOCK, residuals=True,
+                                         natural=natural)
     return triton, portable
 
 
@@ -63,19 +69,22 @@ def test_both_mainloops_compute_the_same_bits_over_every_call_form(form, tiles):
         assert_same_bits(mine, theirs, f"{form} {name}")
 
 
+@pytest.mark.parametrize("natural", [False, True], ids=["fold", "natural"])
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16], ids=["float32", "bfloat16"])
 @pytest.mark.parametrize("hooks", HOOKS)
-def test_both_mainloops_compute_the_same_bits_under_every_hook(hooks, dtype):
+def test_both_mainloops_compute_the_same_bits_under_every_hook(hooks, dtype, natural):
     """Each hook (softcap, ALiBi, sinks, the output gate, all at once) over a windowed causal call of
-    packed documents, in both dtypes."""
-    triton, portable = both(CASES["causal-documents-window"], HOOKS[hooks], dtype, TILES[1])
+    packed documents, in both dtypes and both forms of the exponent."""
+    triton, portable = both(CASES["causal-documents-window"], HOOKS[hooks], dtype, TILES[1], natural)
     for name, mine, theirs in zip(RESIDUALS, triton, portable, strict=True):
-        assert_same_bits(mine, theirs, f"{hooks} {jnp.dtype(dtype).name} {name}")
+        assert_same_bits(mine, theirs, f"{hooks} {jnp.dtype(dtype).name} natural {natural} {name}")
 
 
-def both_backward(case: dict, names: tuple, dtype, tiles: attention_triton.Tiles):
+def both_backward(case: dict, names: tuple, dtype, tiles: attention_triton.Tiles,
+                  natural: bool = template.NATURAL, accurate: bool = template.ACCURATE):
     """The Triton mainloop's and the plain-JAX mainloop's gradients over `case` and the score hooks
-    `names` at `tiles` (both launches'), seed 0."""
+    `names` at `tiles` (both launches'), seed 0, the exponent `natural` or the fold, the backward
+    `accurate` or the fast form."""
     queries, keys = geometry(case)
     spans = template.spans(queries, keys, ROWS, **arguments(case))
     score_mod, kinds, draw_hooks = score_hooks(names, queries, keys, 32)
@@ -88,9 +97,11 @@ def both_backward(case: dict, names: tuple, dtype, tiles: attention_triton.Tiles
                                             tiles.warps, tiles.stages)
     # Both mainloops' forwards at the same tiles, whose sums the backwards read (`Split`).
     with tuning.pinned({attention_triton.TritonBackward: config, attention_triton.TritonForward: tiles}):
-        triton = attention_triton.backward(query, key, value, spans, hooks, dout, interpret=True)
+        triton = attention_triton.backward(query, key, value, spans, hooks, dout, natural=natural,
+                                           accurate=accurate, interpret=True)
     portable = attention_portable.backward(query, key, value, spans, hooks, dout, block_q=tiles.block_q,
-                                           block_k=tiles.block_k, pad=attention_triton.BLOCK)
+                                           block_k=tiles.block_k, pad=attention_triton.BLOCK, natural=natural,
+                                           accurate=accurate)
     return triton, portable
 
 
@@ -109,13 +120,16 @@ def test_both_mainloops_compute_the_same_gradients_over_every_call_form(form, ti
     assert_same_bits(triton, portable, form)
 
 
+@pytest.mark.parametrize("accurate", [False, True], ids=["default", "accurate"])
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16], ids=["float32", "bfloat16"])
 @pytest.mark.parametrize("hooks", SCORE_HOOKS)
-def test_both_mainloops_compute_the_same_gradients_under_every_score_hook(hooks, dtype):
+def test_both_mainloops_compute_the_same_gradients_under_every_score_hook(hooks, dtype, accurate):
     """Each score hook's gradients (its parameters' and the initial state's too) over a windowed causal
-    call of packed documents, in both dtypes."""
-    triton, portable = both_backward(CASES["causal-documents-window"], SCORE_HOOKS[hooks], dtype, TILES[1])
-    assert_same_bits(triton, portable, f"{hooks} {jnp.dtype(dtype).name}")
+    call of packed documents, in both dtypes and both forms: the default, and the accurate (natural logits
+    and the backward's accurate form)."""
+    triton, portable = both_backward(CASES["causal-documents-window"], SCORE_HOOKS[hooks], dtype, TILES[1],
+                                     natural=accurate, accurate=accurate)
+    assert_same_bits(triton, portable, f"{hooks} {jnp.dtype(dtype).name} accurate {accurate}")
 
 
 @pytest.mark.parametrize("hooks", ["none", "sinks", "softcap"])
@@ -441,3 +455,306 @@ def test_a_logit_the_reference_keeps_stays_finite_and_apart(keys, query_size, ke
     for found in (triton, portable):
         for leaf in (found.query, found.key, found.value):
             assert np.isfinite(np.asarray(leaf)).all()
+
+
+@pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
+def test_an_fp32_cpu_arm_is_as_exact_as_the_reference_at_aligned_tiles(causal):
+    """fp32, width 128, 300 keys walked in 128-key tiles: XLA's CPU dot picks its accumulation by shape,
+    and its 128-aligned path is 1.86 times less exact than the unaligned one the reference's einsum takes,
+    which left every CPU arm 1.6 times the reference (check 1 allows 1.5) where the compiled kernels pass
+    on an A100. The template's CPU products sum fp32 exactly (`template.interpreted_dot`)."""
+    spans = template.spans(200, 300, ROWS, causal=causal)
+
+    def ours(query, key, value):
+        return attention_portable.attend(query, key, value, spans, block_q=128, block_k=128, pad=128)
+
+    def reference(query, key, value):
+        return template.reference(query, key, value, spans)
+
+    draw = drawing(200, 300, jnp.float32, width=128, value_width=128)
+    assert_as_exact(jax.jit(ours), jax.jit(reference), draw,
+                    f"plain mainloop fp32 width 128 {'causal' if causal else 'full'}", seeds=8)
+
+
+def test_the_fold_reads_its_factor_as_the_kernel_rounds_it():
+    """A scale whose product with log2(e) is below 1 but rounds to 1 in fp32 does not fold: the fold's
+    exactness (`algebra.base2_maximum`) needs every folded logit an ulp below fp32's largest, which a
+    factor of 1 does not give."""
+    just_below = (1 - 2.0 ** -40) / algebra.LOG2E
+    assert just_below * algebra.LOG2E < 1
+    assert not algebra.Forward("full", 1, ids=False, scale=just_below).base2
+    assert algebra.Forward("full", 1, ids=False, scale=0.5).base2
+
+
+@pytest.mark.parametrize("causal", [False, True], ids=["full", "causal"])
+def test_the_headroom_guard_leaves_ordinary_inputs_bitwise_unchanged(causal):
+    """The accurate form's walk with its headroom guard (`algebra.guarded`) gives the same bits as the walk
+    without it on drawn inputs, whose sums never overflow: the guard only reads the plain walk's sums."""
+    query, key, value = drawing(200, 300, jnp.float32, width=64, value_width=64)(0)
+    spans = template.spans(200, 300, ROWS, causal=causal)
+    call = template.padded_call(query, key, value, spans, template.Hooks(), attention_triton.BLOCK)
+
+    def walked(*, headroom: bool):
+        spec = algebra.Forward(spans.form, spans.keys, ids=False, scale=64 ** -0.5, natural=True,
+                               headroom=headroom)
+        out, _ = attention_portable.forward(spec, call.query, call.key, call.value, call.start, call.end,
+                                            None, None, (), (), (), (), None, block_q=32, block_k=32,
+                                            output_mod=None, residuals=False)
+        return np.asarray(out)
+
+    np.testing.assert_array_equal(walked(headroom=True), walked(headroom=False))
+
+
+@pytest.mark.parametrize("edge", ["small scale", "large scale"])
+def test_the_accurate_form_is_as_exact_as_the_reference_at_its_raw_domains_edges(edge):
+    """The accurate form at scales just outside the raw form's domain (`algebra.RAW_SCALES`), where raw
+    products would overflow their difference (2^-126 over keys near ±2^127) or the factor `scale * log2(e)`
+    (3e38 over products near fp32's least normal): it scales its logits there and holds check 1."""
+    # At the small scale every key's magnitude is drawn in [3/4, 1) of fp32's largest, so each pair's raw
+    # difference overflows while its scaled logits stay finite.
+    largest = float(jnp.finfo(jnp.float32).max)
+    scale, low, high = ((2.0 ** -126, 0.75 * largest, largest) if edge == "small scale"
+                        else (3e38, 2.0 ** -127, 2.0 ** -126))
+    spans = template.spans(1, 2, 32)
+
+    def draw(seed: int):
+        streams = jax.random.split(jax.random.key(seed), 3)
+        signs = jnp.asarray([1.0, -1.0], jnp.float32)
+        key = (jax.random.uniform(streams[0], (32, 2), jnp.float32, low, high) * signs)[..., None, None]
+        value = jax.random.normal(streams[1], (32, 2, 1, 1), jnp.float32)
+        return jnp.ones((32, 1, 1, 1), jnp.float32), key, value
+
+    def ours(query, key, value):
+        return attention_portable.attend(query, key, value, spans, block_q=32, block_k=32,
+                                         pad=attention_triton.BLOCK, scale=scale, natural=True)
+
+    def reference(query, key, value):
+        return template.reference(query, key, value, spans, scale=scale)
+
+    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, f"accurate form at a {edge}", seeds=8)
+
+
+def test_a_row_that_does_not_overflow_keeps_the_plain_walks_bits_beside_one_that_does():
+    """Two documents a row of one program: two queries over two drawn keys, and four over four equal keys
+    whose values near 1e38 overflow their weighted sum. The guarded walk shifts only the latter rows
+    (`algebra.room`'s `live`): the former's output and residuals are the unguarded walk's to the bit, in
+    the plain-JAX mainloop and the Triton one, which agree on every row."""
+    streams = jax.random.split(jax.random.key(0), 3)
+    query = jnp.zeros((1, 6, 1, 16), jnp.float32).at[:, :2].set(jax.random.normal(streams[0], (1, 2, 1, 16)))
+    key = jnp.zeros((1, 6, 1, 16), jnp.float32).at[:, :2].set(jax.random.normal(streams[1], (1, 2, 1, 16)))
+    value = jax.random.normal(streams[2], (1, 6, 1, 16), jnp.float32).at[:, 2:, :, 0].set(1e38)
+    documents = jnp.asarray([[1, 1, 2, 2, 2, 2]], jnp.int32)
+    spans = template.spans(6, 6, 1, segment_ids=documents)
+    call = template.padded_call(query, key, value, spans, template.Hooks(), attention_triton.BLOCK)
+
+    def portable(*, headroom: bool):
+        spec = algebra.Forward(spans.form, spans.keys, ids=True, scale=16 ** -0.5, natural=True,
+                               headroom=headroom)
+        out, kept = attention_portable.forward(spec, call.query, call.key, call.value, call.start, call.end,
+                                               call.query_ids, call.key_ids, (), (), (), (), None, block_q=32,
+                                               block_k=32, output_mod=None, residuals=True)
+        return [np.asarray(leaf)[..., :6, :, :16] if leaf.ndim == 4 and leaf.shape[1] == call.queries
+                else np.asarray(leaf) for leaf in jax.tree.leaves((out, kept))]
+
+    guarded, plain = portable(headroom=True), portable(headroom=False)
+    assert not np.isfinite(plain[0][0, 2:]).all() and np.isfinite(guarded[0]).all()
+    for leaf, (mine, theirs) in enumerate(zip(guarded, plain, strict=True)):
+        rows = (slice(None), slice(0, 2)) if leaf == 0 else (slice(None), slice(None), slice(0, 2))
+        np.testing.assert_array_equal(mine[rows], theirs[rows], err_msg=f"leaf {leaf}")
+    with tuning.pinned({attention_triton.TritonForward: TILES[1]}):
+        triton = attention_triton.forward(query, key, value, spans, residuals=True, natural=True,
+                                          interpret=True)
+    ported = attention_portable.attend(query, key, value, spans, block_q=TILES[1].block_q,
+                                       block_k=TILES[1].block_k, pad=attention_triton.BLOCK, residuals=True,
+                                       natural=True)
+    assert_same_bits(triton, ported, "an overflowing row beside one that does not")
+
+
+@pytest.mark.parametrize("raw", [True, False], ids=["raw", "scaled"])
+def test_the_accurate_forms_rescale_takes_the_plain_factor_where_its_correction_is_not_finite(raw):
+    """`algebra.carried` compensates a state's factor `exp(m - safe)` for its exponent's rounding and takes
+    the uncompensated factor where that correction is not finite: a state of no key (m = -inf, whose TwoSum
+    error is NaN) and, raw, a difference past what TwoProduct's split holds (4097 times it overflows) both
+    weigh 0, as the reference's exp does; a state at the maximum keeps 1."""
+    spec = algebra.Forward("full", 4, ids=False, scale=0.125, natural=True, initial=not raw)
+    assert spec.raw == raw
+    m = jnp.asarray([-jnp.inf, -1e35, 0.0], jnp.float32)
+    found = np.asarray(algebra.carried(spec, m, jnp.zeros(3, jnp.float32)))
+    np.testing.assert_array_equal(found, np.asarray([0.0, 0.0, 1.0], np.float32))
+
+
+@pytest.mark.parametrize("raw", [True, False], ids=["raw", "scaled"])
+def test_the_accurate_forms_rescale_is_as_exact_as_its_exponent_rounded_once(raw):
+    """`algebra.carried`'s factor `exp((m - safe) * scale)` for maxima drawn either side of 0, whose
+    difference rounds, compensated for that rounding and, raw, for its product with the scale's: check 1
+    against the factor of the rounded exponent (`Forward.carry`), from float64. A compensation of the
+    wrong sign or scale would err past it."""
+    spec = algebra.Forward("full", 4, ids=False, scale=0.125, natural=True, initial=not raw)
+    assert spec.raw == raw
+
+    def draw(seed):
+        streams = jax.random.split(jax.random.key(seed))
+        return (jax.random.uniform(streams[0], (4096,), jnp.float32, -40.0, 0.0),
+                jax.random.uniform(streams[1], (4096,), jnp.float32, 0.0, 40.0))
+
+    def rounded(m, safe):
+        return spec.carry(m - safe)
+
+    assert_as_exact(jax.jit(functools.partial(algebra.carried, spec)), jax.jit(rounded), draw,
+                    f"the accurate form's rescale, {'raw' if raw else 'scaled'}", seeds=8)
+
+
+@pytest.mark.parametrize("scale, slope, size", [(2.0, None, 2e38), (1.0, 2.0, 2e38), (2.0, 1.7e38, 0.25)],
+                         ids=["scale-2", "slope-2", "slope-1.7e38"])
+def test_a_querys_gradient_over_keys_near_fp32s_largest_is_finite_at_any_scale_and_slope(scale, slope, size):
+    """One query of zeros over two equal keys at equal logits (each weighs 1/2) under a scale and a score
+    hook's slope: the query's gradient is the cotangents' difference times the keys, 0, and D's refinement 0,
+    so dQ is exactly 0 in both mainloops (`algebra.DqSums.keyed`): keys near fp32's largest at a scale or a
+    slope of 2, whose sum under coefficients summing to 2 would overflow, and small keys under a score whose
+    derivative, the slope times the scale, is fp32's largest, whose coefficients' magnitudes would (held as
+    mantissas and exponents, `keyed_shift`). A derivative past fp32's largest is no fp32 number: XLA's
+    compiled arithmetic forms it whole in the logits themselves (`template.scores` is NaN there), so no form
+    of the backward is asked of it. The slope is a head's parameter, traced as a learned slope is."""
+    query = jnp.zeros((1, 1, 1, 16), jnp.float32)
+    key = jnp.zeros((1, 2, 1, 16), jnp.float32).at[:, :, :, 0].set(size)
+    # Equal values, so the score cotangents are exactly 0 and dQ's own sum is 0 on any accumulation: the
+    # test holds the weights' correction (`keyed`) alone.
+    value = jnp.zeros((1, 2, 1, 16), jnp.float32).at[..., 0].set(1.0)
+    dout = jnp.zeros((1, 1, 1, 16), jnp.float32).at[..., 0].set(1.0)
+    spans = template.spans(1, 2, 1)
+    hooks = template.Hooks() if slope is None else template.Hooks(
+        score_mod=lambda s, q_pos, k_pos, slope: slope * s,
+        score_params=(template.Param(jnp.full((1,), slope, jnp.float32), template.Kind.HEAD),))
+    tiles = {"block_q": 32, "block_k": 32, "pad": attention_triton.BLOCK}
+    with tuning.pinned({attention_triton.TritonBackward: joint(TILES[1])}):
+        triton = attention_triton.backward(query, key, value, spans, hooks, dout, scale=scale, interpret=True)
+    portable = attention_portable.backward(query, key, value, spans, hooks, dout, scale=scale, **tiles)
+    for name, grads in (("triton", triton), ("portable", portable)):
+        np.testing.assert_array_equal(np.asarray(grads.query), 0.0, err_msg=name)
+
+
+def test_a_querys_gradient_with_a_large_refinement_at_a_small_scale_is_finite():
+    """Three equal keys of 2^100 at a scale of 2^-80, one value of 2^54: equal logits, so the cotangents'
+    rounding leaves D's refinement at -2^29 against keys of 2^100, while the correction it makes,
+    -2^29 · 2^-80 · 2^100 times the weights' mass, is 2^49 (`algebra.dq_finish`: each factor's mantissa and
+    exponent apart). dQ is finite in both mainloops, and the two agree to the bit."""
+    query = jnp.zeros((1, 1, 1, 16), jnp.float32)
+    key = jnp.zeros((1, 3, 1, 16), jnp.float32).at[:, :, :, 0].set(2.0 ** 100)
+    value = jnp.zeros((1, 3, 1, 16), jnp.float32).at[:, 2, :, 0].set(2.0 ** 54)
+    dout = jnp.zeros((1, 1, 1, 16), jnp.float32).at[..., 0].set(1.0)
+    spans = template.spans(1, 3, 1)
+    tiles = {"block_q": 32, "block_k": 32, "pad": attention_triton.BLOCK}
+    with tuning.pinned({attention_triton.TritonBackward: joint(TILES[1])}):
+        triton = attention_triton.backward(query, key, value, spans, None, dout, scale=2.0 ** -80,
+                                           natural=True, interpret=True)
+    portable = attention_portable.backward(query, key, value, spans, None, dout, scale=2.0 ** -80,
+                                           natural=True, **tiles)
+    for name, grads in (("triton", triton), ("portable", portable)):
+        assert np.isfinite(np.asarray(grads.query)).all(), name
+    assert_same_bits(triton.query, portable.query, "a large refinement at a small scale")
+
+
+def test_a_querys_gradient_from_a_state_of_a_small_denominator_at_a_large_scale_is_finite():
+    """One key resumed from a state of denominator 2^-40 at maximum 40, at a scale of 2^100: the key's
+    probability is about 4.7e-6 and dQ about 5.9e24, finite, though the scale over the denominator, 2^140,
+    is not (`algebra.dq_step`: each factor's mantissa and exponent apart). Both mainloops agree to the bit."""
+    query = jnp.zeros((1, 1, 1, 16), jnp.float32)
+    key = jnp.zeros((1, 1, 1, 16), jnp.float32).at[..., 0].set(1.0)
+    value = jnp.zeros((1, 1, 1, 16), jnp.float32).at[..., 0].set(1.0)
+    dout = jnp.zeros((1, 1, 1, 16), jnp.float32).at[..., 0].set(1.0)
+    spans = template.spans(1, 1, 1)
+    state = template.Initial(jnp.full((1, 1, 1), 40.0), jnp.full((1, 1, 1), 2.0 ** -40),
+                             jnp.zeros((1, 1, 1, 16)))
+    hooks = template.Hooks(initial=state)
+    tiles = {"block_q": 32, "block_k": 32, "pad": attention_triton.BLOCK}
+    with tuning.pinned({attention_triton.TritonBackward: joint(TILES[1])}):
+        triton = attention_triton.backward(query, key, value, spans, hooks, dout, scale=2.0 ** 100,
+                                           natural=True, interpret=True)
+    portable = attention_portable.backward(query, key, value, spans, hooks, dout, scale=2.0 ** 100,
+                                           natural=True, **tiles)
+    for name, grads in (("triton", triton), ("portable", portable)):
+        assert np.isfinite(np.asarray(grads.query)).all(), name
+    assert_same_bits(triton.query, portable.query, "a small denominator at a large scale")
+
+
+def test_a_bf16_querys_gradient_over_a_large_key_with_small_cotangents_is_exact():
+    """bf16, one query of zeros over two keys, the first's first entry 2^120: equal logits, so the score
+    cotangents are exactly -2^-4 and 2^-4 at the scale of 1/4, and the query's gradient's first entry is
+    exactly -2^116, in bf16's range. The cotangents' product with the keys keeps bf16's range in both its
+    parts (`algebra.cotangent_product`), in both mainloops, to the bit."""
+    query = jnp.zeros((1, 1, 1, 16), jnp.bfloat16)
+    key = jnp.zeros((1, 2, 1, 16), jnp.bfloat16).at[0, 0, 0, 0].set(2.0 ** 120)
+    value = jnp.zeros((1, 2, 1, 16), jnp.bfloat16).at[0, :, 0, 0].set(jnp.asarray([1.0, 2.0]))
+    dout = jnp.zeros((1, 1, 1, 16), jnp.bfloat16).at[..., 0].set(1.0)
+    spans = template.spans(1, 2, 1)
+    tiles = {"block_q": 32, "block_k": 32, "pad": attention_triton.BLOCK}
+    with tuning.pinned({attention_triton.TritonBackward: joint(TILES[1])}):
+        triton = attention_triton.backward(query, key, value, spans, None, dout, natural=True, interpret=True)
+    portable = attention_portable.backward(query, key, value, spans, None, dout, natural=True, **tiles)
+    for name, grads in (("triton", triton), ("portable", portable)):
+        assert float(grads.query[0, 0, 0, 0]) == -(2.0 ** 116), name
+    assert_same_bits(triton.query, portable.query, "a large bf16 key under small cotangents")
+
+
+@pytest.mark.parametrize("accurate", [False, True], ids=["default", "accurate"])
+def test_an_fp16_querys_gradient_over_equal_large_keys_whose_cotangents_cancel_is_finite(accurate):
+    """fp16, a query of zeros over three equal keys of first entry 65504, values -65504, 16384 and 65504 there
+    and a cotangent of 1: equal logits, so the query's gradient is exactly 0, its score cotangents' sum
+    against the equal keys cancelling, and the reference's is finite. A cotangent product that keeps fewer
+    bits than the cancellation exposes leaves 4 · 65504 / 2 of it, past fp16's largest once the gradient
+    returns in the call's dtype; in both forms the gradient is finite, in both mainloops."""
+    query = jnp.zeros((1, 1, 1, 16), jnp.float16)
+    key = jnp.zeros((1, 3, 1, 16), jnp.float16).at[0, :, 0, 0].set(65504.0)
+    sizes = jnp.asarray([-65504.0, 16384.0, 65504.0])
+    value = jnp.zeros((1, 3, 1, 16), jnp.float16).at[0, :, 0, 0].set(sizes)
+    dout = jnp.zeros((1, 1, 1, 16), jnp.float16).at[..., 0].set(1.0)
+    spans = template.spans(1, 3, 1)
+    tiles = {"block_q": 32, "block_k": 32, "pad": attention_triton.BLOCK}
+    with tuning.pinned({attention_triton.TritonBackward: joint(TILES[1])}):
+        triton = attention_triton.backward(query, key, value, spans, None, dout, accurate=accurate,
+                                           interpret=True)
+    portable = attention_portable.backward(query, key, value, spans, None, dout, accurate=accurate, **tiles)
+    _, pull = jax.vjp(lambda query: template.reference(query, key, value, spans), query)
+    [theirs] = pull(dout)
+    assert np.isfinite(np.asarray(theirs, np.float32)).all()
+    for name, grads in (("triton", triton), ("portable", portable)):
+        assert np.isfinite(np.asarray(grads.query, np.float32)).all(), name
+
+
+def test_a_querys_gradient_from_a_state_near_fp32s_largest_over_a_tiny_weight_at_a_small_scale_is_finite():
+    """One key at logit -83 (a weight near 2^-120) resumed from a state of denominator 2^127 at maximum 0,
+    at a scale of 2^-40: the key's coefficient against its key, weight times scale over the denominator, is
+    near 2^-287, past fp32's range, and its share of dQ is below fp32's least value, so dQ is finite in both
+    mainloops (`algebra.NO_SHIFT` below every composed exponent, so a tile's running mass is never
+    subnormal) and the two agree to the bit."""
+    query = jnp.zeros((1, 1, 1, 16), jnp.float32).at[..., 0].set(1.0)
+    key = jnp.zeros((1, 1, 1, 16), jnp.float32).at[..., 0].set(-83.0 * 2.0 ** 40)
+    value = jnp.zeros((1, 1, 1, 16), jnp.float32).at[..., 0].set(1.0)
+    dout = jnp.ones((1, 1, 1, 16), jnp.float32)
+    spans = template.spans(1, 1, 1)
+    state = template.Initial(jnp.zeros((1, 1, 1)), jnp.full((1, 1, 1), 2.0 ** 127), jnp.zeros((1, 1, 1, 16)))
+    hooks = template.Hooks(initial=state)
+    tiles = {"block_q": 32, "block_k": 32, "pad": attention_triton.BLOCK}
+    with tuning.pinned({attention_triton.TritonBackward: joint(TILES[1])}):
+        triton = attention_triton.backward(query, key, value, spans, hooks, dout, scale=2.0 ** -40,
+                                           natural=True, interpret=True)
+    portable = attention_portable.backward(query, key, value, spans, hooks, dout, scale=2.0 ** -40,
+                                           natural=True, **tiles)
+    for name, grads in (("triton", triton), ("portable", portable)):
+        assert np.isfinite(np.asarray(grads.query)).all(), name
+    assert_same_bits(triton.query, portable.query, "a tiny weight beside a state near fp32's largest")
+
+
+def test_power2_is_exact_under_jit_at_every_exponent():
+    """`algebra.power2` scales by powers of two exactly wherever the result is a normal fp32, compiled
+    (where XLA computes `exp2` as an inexact `exp` and fuses a product of them into one `exp`, past fp32's
+    range), at exponents from -380 to 380 against exact float64 scaling, and zero stays zero."""
+    exponents = jnp.arange(-380.0, 381.0, dtype=jnp.float32)
+    mantissas = jnp.asarray([0.0, 0.5, 0.75, 1.0, -0.6], jnp.float32)
+    found = np.asarray(jax.jit(lambda x, k: algebra.power2(x[:, None], k[None, :]))(mantissas, exponents))
+    exact = np.ldexp(np.asarray(mantissas, np.float64)[:, None], np.asarray(exponents, np.int64)[None, :])
+    normal = (np.abs(exact) >= np.finfo(np.float32).tiny) & (np.abs(exact) <= np.finfo(np.float32).max)
+    np.testing.assert_array_equal(found[normal], exact[normal].astype(np.float32))
+    np.testing.assert_array_equal(found[0], 0.0)
+    assert np.all(np.isinf(found[1:][np.abs(exact[1:]) > np.finfo(np.float32).max]))
+
