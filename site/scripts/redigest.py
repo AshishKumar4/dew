@@ -61,9 +61,11 @@ class Renaming:
     """The renamings between two parsed programs: each variable to its one new name, injectively, and each
     API name where it is used."""
 
-    def __init__(self):
+    def __init__(self, defined: set[str]):
         self.variables: dict[str, str] = {}
         self.members: dict[str, set[str]] = {}
+        self.defined = defined
+        """The functions and classes the program defines, whose calls' keywords name their parameters."""
 
     def name(self, role: str, was: str | None, now: str | None, line: int) -> None:
         if (was is None) != (now is None):
@@ -87,6 +89,16 @@ class Renaming:
                 raise ValueError(f"line {line}: {len(was)} items became {len(now)}")
             for before, after in zip(was, now, strict=True):
                 self.compare(before, after, line)
+        elif isinstance(was, ast.Call) and isinstance(was.func, ast.Name) and was.func.id in self.defined:
+            # A keyword to a function the program defines names its parameter, a variable, which renames
+            # with it.
+            line = was.lineno
+            self.compare([was.func, was.args], [now.func, now.args], line)
+            if len(was.keywords) != len(now.keywords):
+                raise ValueError(f"line {line}: {len(was.keywords)} keywords became {len(now.keywords)}")
+            for one, other in zip(was.keywords, now.keywords, strict=True):
+                self.name(VARIABLE, one.arg, other.arg, line)
+                self.compare(one.value, other.value, line)
         elif isinstance(was, ast.AST):
             line = getattr(was, "lineno", line)
             if isinstance(was, ast.Import):
@@ -135,9 +147,10 @@ class Renaming:
 def renamed(before: str, after: str) -> Renaming:
     """How `after` renames `before`; a ValueError, naming the first other difference, when it differs
     otherwise."""
-    renaming = Renaming()
     try:
         was, now = ast.parse(before), ast.parse(after)
+        renaming = Renaming({node.name for node in ast.walk(was)
+                             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))})
         renaming.compare(was, now)
         renaming.check(after)
     except SyntaxError as error:
