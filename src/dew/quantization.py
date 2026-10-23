@@ -235,7 +235,8 @@ def _quantized(model: nn.Module, provider: QuantizationProvider, spec: Quantizat
     each method tracing what it calls under the key `QUANTIZED_TRACE` gives the provider."""
     quantized = quantize_with(model, provider, methods=entry_methods(model),
                               key=(type(provider).__name__, spec))
-    type(quantized)._dew_quantization = spec
+    layer: Any = type(quantized)
+    layer._dew_quantization = spec
     return quantized
 
 
