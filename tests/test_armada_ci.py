@@ -518,16 +518,25 @@ def test_a_first_gpu_lane_on_a_class_borrows_another_classs_measured_shares(
                  "        raise RuntimeError('RESOURCE_EXHAUSTED: Out of memory allocating 9.0GiB')\n")
     (tmp_path / "tests/test_wrong.py").write_text(
         source + "    assert share == '0.5', 'an accuracy miss, not RESOURCE_EXHAUSTED: out of memory'\n")
+    # A block past the GPU's shared memory is no device memory a larger share gives: red, run once. And one
+    # out of memory whose borrowed measurement already reached the whole share: red, run once, as it ran.
+    (tmp_path / "tests/test_shared.py").write_text(
+        source + "    raise RuntimeError('RESOURCE_EXHAUSTED: Shared memory size limit exceeded: 300000')\n")
+    (tmp_path / "tests/test_whole.py").write_text(
+        source + "    raise RuntimeError('RESOURCE_EXHAUSTED: Out of memory allocating 90.0GiB')\n")
     (tmp_path / "tests/test_new.py").write_text(source)
-    every = [*names, "tests/test_tight.py", "tests/test_wrong.py", "tests/test_new.py"]
+    every = [*names, "tests/test_tight.py", "tests/test_wrong.py", "tests/test_shared.py",
+             "tests/test_whole.py", "tests/test_new.py"]
     interpreter(tmp_path, "3.12")
     fetcher(tmp_path)
     # Another class measured 4 GiB for each file but the new one; a third, smaller peaks for some.
     for other, peak in (("NVIDIA-H100-80GB-HBM3-x86", 4), ("NVIDIA-A10-x86", 2)):
-        for name in [*names, "tests/test_tight.py", "tests/test_wrong.py"]:
+        for name in [*names, "tests/test_tight.py", "tests/test_wrong.py", "tests/test_shared.py",
+                     "tests/test_whole.py"]:
             at = "/" + ci.record_key("3.12", ci.row("3.12", name, ""), other)
+            whole = 64 if name == "tests/test_whole.py" else peak
             stored[at] = json.dumps({"key": None, "depends": [name], "row": {}, "reads": [],
-                                     "peak": peak * 2 ** 30, "shares": 0, "pools": 0}).encode()
+                                     "peak": whole * 2 ** 30, "shares": 0, "pools": 0}).encode()
 
     def ran(stem: str) -> list[list[str]]:
         return lane_runs(tmp_path, stem)
@@ -547,6 +556,11 @@ def test_a_first_gpu_lane_on_a_class_borrows_another_classs_measured_shares(
     wrong = rows["3.12:tests/test_wrong.py"]
     assert wrong["exitCode"] == 1 and "an accuracy miss" in wrong["output"] and "interference" not in wrong
     assert [share for share, *_ in ran("test_wrong")] == [borrowed], "its own failure: red, run once"
+    for stem in ("test_shared", "test_whole"):
+        found = rows[f"3.12:tests/{stem}.py"]
+        assert found["exitCode"] == 1 and len(ran(stem)) == 1, f"{stem}: red, run once"
+        assert "interference" not in found
+    assert ran("test_whole")[0][0] == "0.5", "its borrowed measurement already reached the whole share"
     assert all("interference" not in row for name, row in rows.items() if name != "3.12:tests/test_tight.py")
     # A Worker that does not list its records: nothing is borrowed, and an unmeasured file runs alone.
     (tmp_path / "tests/test_listless.py").write_text(source)
