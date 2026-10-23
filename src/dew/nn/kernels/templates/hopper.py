@@ -98,16 +98,18 @@ def meet(halves) -> None:
         plgpu.barrier_wait(barrier)
 
 
-def finished(run, shape: tuple[int, int], barrier, finish) -> None:
-    """A consumer's output tile: `run` on a scoped warpgroup accumulator of `shape`, its MMAs waited for,
-    the tile reported drained (`barrier`, the producer's cue to reload its stage), then `finish` of its
-    value."""
-    @functools.partial(pl.run_scoped, acc_ref=plgpu.WGMMAAccumulatorRef(shape))
-    def _(acc_ref):
-        run(acc_ref)
+def finished(run, shape: tuple[int, int], barrier, finish, accumulators: int = 1) -> None:
+    """A consumer's output tile: `run` on scoped warpgroup accumulators of `shape` (a tuple of them, one a
+    product a paired product's tile computes), their MMAs waited for, the tile reported drained (`barrier`,
+    the producer's cue to reload its stage), then `finish` of their values."""
+    accs = [plgpu.WGMMAAccumulatorRef(shape) for _ in range(accumulators)]
+
+    @functools.partial(pl.run_scoped, acc_refs=accs)
+    def _(acc_refs):
+        run(tuple(acc_refs))
         plgpu.wgmma_wait(0)
         plgpu.barrier_arrive(barrier)
-        finish(acc_ref[...])
+        finish(*(acc_ref[...] for acc_ref in acc_refs))
 
 
 def staging(name: str, shaped) -> dict:

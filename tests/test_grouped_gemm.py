@@ -82,6 +82,38 @@ def test_the_hopper_grouped_matmuls_sum_each_groups_rows_as_exactly_as_xla(sizes
         check(got, reference[2], truth[2], None, f"kernel gradient {tiles}")
 
 
+@INTERPRETS
+@pytest.mark.parametrize("sizes", ["ragged", "unrouted-tail"])
+def test_a_paired_hopper_product_gates_both_matrices_as_exactly_as_xla(sizes):
+    """A paired product (a gated activation's gate and up, `mosaic_gpu.gmm(paired=)`), interpreted on a CPU,
+    one warpgroup a tile and two, both orientations: the epilogue of its two accumulators as exact as XLA's
+    two ragged dots and the same epilogue from float64 sums of the same rounded operands, unrouted rows
+    zero."""
+    sizes = SIZES[sizes]
+    dtype = jnp.bfloat16
+    x, gate, _, group = operands(sizes, dtype)
+    up = operands(sizes, dtype, seed=1)[1]
+    group_sizes = jnp.asarray(sizes, jnp.int32)
+
+    def gated(gate, up):
+        return jax.nn.silu(gate) * up
+
+    def xla(matrix):
+        return jax.lax.ragged_dot(jnp.asarray(x, dtype), jnp.asarray(matrix, dtype), group_sizes,
+                                  preferred_element_type=jnp.float32)
+
+    reference = gated(xla(gate), xla(up)).astype(dtype)
+    truth_gate, truth_up = oracle.forward(x, gate, sizes), oracle.forward(x, up, sizes)
+    truth = truth_gate / (1 + np.exp(-truth_gate)) * truth_up
+    tiled = (mosaic_gpu.Tiles(64, 64, 64, 2, 1), mosaic_gpu.Tiles(128, 64, 64, 2, 1, warpgroups=2))
+    for tiles, transpose in itertools.product(tiled, (False, True)):
+        first, second = (jnp.asarray(np.swapaxes(m, 1, 2) if transpose else m, dtype) for m in (gate, up))
+        got = mosaic_gpu.gmm(jnp.asarray(x, dtype), first, group_sizes, tiles=tiles, transpose_rhs=transpose,
+                             out_dtype=dtype, multiprocessors=1, interpret=grouped_matmul.INTERPRETED,
+                             epilogue=gated, paired=second)
+        check(got, reference, truth, group, f"paired {tiles} transpose={transpose}")
+
+
 def check(got, reference, truth, group, label):
     got = np.asarray(got, np.float64)
     if group is not None:
