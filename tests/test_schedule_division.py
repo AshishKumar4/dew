@@ -18,7 +18,7 @@ SHAPE = (64, 4, 4, 3)
 """A batch of latents, each row its own rate: enough rows that every draw spans the rates."""
 
 DIVISION_SEEDS = 16
-"""Check 1's declared seeds for each schedule site (to size)."""
+"""Check 1's declared seeds for each schedule site, sized by `seeds_for` on armada."""
 
 
 def draw(seed):
