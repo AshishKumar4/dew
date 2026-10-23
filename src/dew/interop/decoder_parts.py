@@ -401,7 +401,7 @@ def read_rope_theta(entry: Mapping[str, object] | None, field: str) -> float | N
 
 def partial_rope(hf_config: Mapping[str, object], *, default_factor: float, default_theta: float = 10000.0,
                  factor_field: str = 'partial_rotary_factor',
-                 theta_field: str = 'rope_theta') -> tuple[float, float, dict[str, object]]:
+                 theta_field: str = 'rope_theta') -> tuple[float, float, Mapping[str, object]]:
     """(rope_theta, partial_rotary_factor, the rest of the rotary's entry) of a config: the
     `rope_parameters` entry's values, else the flat fields under the family's spellings (GPT-NeoX's
     `rotary_emb_base` and `rotary_pct`), else the defaults. The rest is the entry without its
@@ -835,30 +835,32 @@ NO_AUDIO: AudioFields = {"audio": None, "audio_projector": None,
                           "audio_token_id": None, "audio_soft_tokens": None}
 
 
-def _recorded(record: Mapping[str, object], field: str, default: object, used: set[str] | None) -> object:
-    """`field`'s value in `record`, or `default`; a None default makes it required. `used`, when
-    given, takes the field as read (the set `translate_family_config` checks the rest against)."""
+def _recorded[T](record: Mapping[str, object], field: str, default: T | None, used: set[str] | None,
+                 read: Callable[..., T]) -> T:
+    """`field`'s value in `record`, or `default`, checked by `read` (`dew.records`' readers); a None
+    default makes it required. `used`, when given, takes the field as read (the set
+    `translate_family_config` checks the rest against)."""
     if used is not None:
         used.add(field)
-    return record[field] if default is None else record.get(field, default)
+    return read(record[field] if default is None else record.get(field, default), field)
 
 
 def record_int(record: Mapping[str, object], field: str, default: int | None = None, *,
                used: set[str] | None = None) -> int:
     """Read an int field out of a record by name (`_recorded`)."""
-    return records.integer(_recorded(record, field, default, used), field)
+    return _recorded(record, field, default, used, records.integer)
 
 
 def record_float(record: Mapping[str, object], field: str, default: float | None = None, *,
                  used: set[str] | None = None) -> float:
     """Read a real field out of a record by name (`_recorded`)."""
-    return records.number(_recorded(record, field, default, used), field)
+    return _recorded(record, field, default, used, records.number)
 
 
 def record_bool(record: Mapping[str, object], field: str, default: bool | None = None, *,
                 used: set[str] | None = None) -> bool:
     """Read a boolean field out of a record by name (`_recorded`)."""
-    return records.boolean(_recorded(record, field, default, used), field)
+    return _recorded(record, field, default, used, records.boolean)
 
 
 # Where a layer's norms sit in the two trees: without the sandwich the names
