@@ -22,7 +22,14 @@ import optax
 import pytest
 import torch
 from model_support import TINY_DECODER, Digits, decoder, flat_tree
-from reference_error import assert_as_exact, torch_with_gradients, with_gradients
+from reference_error import (
+    assert_as_exact,
+    assert_computes_the_oracle,
+    chain_roundings,
+    torch_with_gradients,
+    widened,
+    with_gradients,
+)
 from test_serving import assert_same_generation
 
 from dew.checkpoints import Checkpoints
@@ -458,22 +465,27 @@ def test_a_server_refuses_a_context_its_layers_cannot_read():
 
 
 def test_a_zero_gate_leaves_an_ngpt_stream_whatever_its_length():
-    """Under nGPT a zero gate moves the stream by nothing, a tiny one and a zero row included, which
-    a step normed back to the stream's length would shrink or lose; the zero row's gradients stay
-    finite."""
+    """Under nGPT a zero gate moves the stream by nothing, tiny, large and zero rows alike, where a step
+    normed back to the stream's length would shrink a tiny one: in float64 the block is the identity
+    within float64's rounding of its own chain (`assert_computes_the_oracle`), and a zero row comes
+    back bit for bit with finite gradients."""
     block = BLOCK.clone(norm=None, ngpt=True)
     x, context, params, lengths, cotangent = block_draw(2)
     x = x * np.asarray([1e-4, 1.0, 30.0, 0.0], np.float32)[:, None, None]
     shut = {**params, "alpha_cross_attn": np.zeros(1, np.float32), "alpha_dense": np.zeros(1, np.float32)}
 
-    @jax.jit
-    def run(x, params):
-        def block_out(x, params):
-            return block.apply({"params": params}, x, CrossContext(context, lengths))
-        return with_gradients(block_out)(x, params, cotangent)
+    def block_out(x, params, context):
+        return block.apply({"params": params}, x, CrossContext(context, lengths))
 
-    out, into_x, gradients = run(x, shut)
-    np.testing.assert_array_equal(np.asarray(out), x)
+    with jax.enable_x64(new_val=True):
+        wide = widened((x, shut, context))
+        run = functools.partial(block_out, context=wide[2])
+        roundings = chain_roundings(jax.make_jaxpr(run)(*wide[:2]))
+        assert_computes_the_oracle(np.asarray(run(*wide[:2])), wide[0], "a zero nGPT gate",
+                                   roundings=roundings)
+    out, into_x, gradients = jax.jit(with_gradients(functools.partial(block_out, context=context)))(
+        x, shut, cotangent)
+    np.testing.assert_array_equal(np.asarray(out)[3], x[3])
     assert all(np.isfinite(np.asarray(leaf)).all() for leaf in jax.tree.leaves((into_x, gradients)))
 
 
