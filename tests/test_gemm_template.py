@@ -216,13 +216,15 @@ def _paired_plain(*, truth: bool = False):
 def test_a_paired_product_holds_check_1(generation_name):
     """A paired product (`paired=`, a gated activation's gate and up in one launch), through the launch the
     generation picks, interpreted on the CPU: its value and every operand's cotangent as exact as the
-    unfused program's, two projections then the activation, from float64 truth."""
+    unfused program's, two projections then the activation, from float64 truth. The Mosaic interpreters
+    run ordered callbacks, which a jitted `linear_call` cannot carry, so theirs run eagerly."""
     def dew(x, gate, up):
         return template.gemm(x, gate, jnp.asarray(SIZES), paired=up, epilogue=silu_gated,
                              out_dtype=jnp.bfloat16, interpret_on_cpu=True)
 
     with generation.assumed(generation_name):
-        assert_as_exact(jax.jit(with_gradients(dew)), jax.jit(with_gradients(_paired_plain())), _paired_draw,
+        run = jax.jit(with_gradients(dew)) if generation_name == "sm80" else with_gradients(dew)
+        assert_as_exact(run, jax.jit(with_gradients(_paired_plain())), _paired_draw,
                         f"paired on {generation_name}", seeds=SEEDS,
                         truth_fn=with_gradients(_paired_plain(truth=True)))
 
