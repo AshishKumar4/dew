@@ -61,11 +61,12 @@ class Renaming:
     """The renamings between two parsed programs: each variable to its one new name, injectively, and each
     API name where it is used."""
 
-    def __init__(self, defined: set[str]):
+    def __init__(self, defined: dict[str, set[str]]):
         self.variables: dict[str, str] = {}
         self.members: dict[str, set[str]] = {}
         self.defined = defined
-        """The functions and classes the program defines, whose calls' keywords name their parameters."""
+        """The functions and classes the program defines, each with the parameters a keyword binds: a call's
+        keyword names one of them, and any other is a key a **kwargs collects."""
 
     def name(self, role: str, was: str | None, now: str | None, line: int) -> None:
         if (was is None) != (now is None):
@@ -97,7 +98,10 @@ class Renaming:
             if len(was.keywords) != len(now.keywords):
                 raise ValueError(f"line {line}: {len(was.keywords)} keywords became {len(now.keywords)}")
             for one, other in zip(was.keywords, now.keywords, strict=True):
-                self.name(VARIABLE, one.arg, other.arg, line)
+                if one.arg in self.defined[was.func.id]:
+                    self.name(VARIABLE, one.arg, other.arg, line)
+                elif one.arg != other.arg:
+                    raise ValueError(f"line {line}: the key {one.arg!r} a **kwargs collects became {other.arg!r}")
                 self.compare(one.value, other.value, line)
         elif isinstance(was, ast.AST):
             line = getattr(was, "lineno", line)
@@ -144,13 +148,30 @@ class Renaming:
         return ", ".join(sorted(names))
 
 
+def defined(program: ast.Module) -> dict[str, set[str]]:
+    """Each function and class `program` defines, with the parameters a keyword binds: a function's own, but
+    those only by position; a class's __init__'s, but its first; a class with no __init__ of its own, none.
+    A name defined twice keeps the parameters both definitions share."""
+    found: dict[str, set[str]] = {}
+    for node in ast.walk(program):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            named = {arg.arg for arg in (*node.args.args, *node.args.kwonlyargs)}
+        elif isinstance(node, ast.ClassDef):
+            init = next((item for item in node.body if isinstance(item, ast.FunctionDef)
+                         and item.name == "__init__"), None)
+            named = set() if init is None else {arg.arg for arg in (*init.args.args[1:], *init.args.kwonlyargs)}
+        else:
+            continue
+        found[node.name] = found[node.name] & named if node.name in found else named
+    return found
+
+
 def renamed(before: str, after: str) -> Renaming:
     """How `after` renames `before`; a ValueError, naming the first other difference, when it differs
     otherwise."""
     try:
         was, now = ast.parse(before), ast.parse(after)
-        renaming = Renaming({node.name for node in ast.walk(was)
-                             if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))})
+        renaming = Renaming(defined(was))
         renaming.compare(was, now)
         renaming.check(after)
     except SyntaxError as error:
