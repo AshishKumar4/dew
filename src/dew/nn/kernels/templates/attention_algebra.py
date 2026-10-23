@@ -492,16 +492,35 @@ def resumed(spec: Forward, m: jax.Array, total: jax.Array, acc: jax.Array, *,
 
 
 def modify(spec: Forward, s: jax.Array, coords: Coords, params: tuple[jax.Array, ...] = (),
-           masked: bool = True) -> jax.Array:
+           masked: bool | jax.Array = True) -> jax.Array:
     """A tile's logits from its products `s` `[bq, bk]` (fp32): scaled (by log2(e) too in base 2; raw in
     the raw form, `Forward.raw`), then the score hook, then -inf at each key the query does not see.
     `masked` False is a tile every query of the block sees whole (a full tile of the block map), which
-    takes no mask."""
-    logits = s if spec.raw else s * (spec.scale * LOG2E if spec.base2 else spec.scale)
+    takes no mask; a traced `masked` chooses at run time. Without a hook the mask is taken on the products,
+    at the infinity the scale takes to -inf, and the scale after it, so a mainloop's multiply feeds the
+    weights' subtraction whole, which its compiler contracts to one FMA (`weights`), whichever the tile."""
+    factor = 1.0 if spec.raw else spec.scale * LOG2E if spec.base2 else spec.scale
+    if spec.score_mod is None and factor != 0:
+        # The infinity the factor takes to -inf (a zero factor takes none, so it masks after scaling).
+        unseen = -jnp.inf if factor > 0 else jnp.inf
+        products = _chosen(masked, lambda: _masked(spec, s, coords, unseen), lambda: s)
+        return products if spec.raw else products * factor
+    logits = s * factor
     if spec.score_mod is not None:
         logits = hooked(spec.score_mod, logits, coords.q_pos, coords.k_pos, params)
-    if not masked:
-        return logits
+    return _chosen(masked, lambda: _masked(spec, logits, coords, -jnp.inf), lambda: logits)
+
+
+def _chosen(masked: bool | jax.Array, mask: Callable[[], jax.Array], whole: Callable[[], jax.Array]):
+    """`mask()` where `masked`, else `whole()`: at trace time for a Python flag, at run time for a traced
+    one."""
+    if isinstance(masked, bool):
+        return mask() if masked else whole()
+    return jax.lax.cond(masked, mask, whole)
+
+
+def _masked(spec: Forward, s: jax.Array, coords: Coords, unseen: float) -> jax.Array:
+    """`s` `[bq, bk]` at `unseen` at each key the query does not see (`within`)."""
     seen = None
     if coords.spans is not None:
         # The spans' form: its mainloops give each tile its queries' intervals and, with documents, ids.
@@ -513,7 +532,7 @@ def modify(spec: Forward, s: jax.Array, coords: Coords, params: tuple[jax.Array,
     if spec.form != "spans" and spec.keys % s.shape[1]:
         # A tile past the call's last key reads padding.
         seen = coords.k_pos < spec.keys if seen is None else seen & (coords.k_pos < spec.keys)
-    return logits if seen is None else jnp.where(seen, logits, -jnp.inf)
+    return s if seen is None else jnp.where(seen, s, unseen)
 
 
 def _safe(spec: Forward, m: jax.Array) -> jax.Array:
