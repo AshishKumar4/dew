@@ -12,8 +12,6 @@ import capture from '../data/capture.json';
 import programs from '../data/programs.json';
 import cells from '../../snippets/cells.json';
 import { colabUrl } from '../../scripts/colab-notebooks.mjs';
-import samplerCell from '../data/sampler.py?raw';
-import textCell from '../data/text.py?raw';
 import tutorials from '../generated/tutorial-cards.json';
 import { live } from '../live.mjs';
 import '../styles/landing.css';
@@ -110,7 +108,7 @@ const rewardPoints = reward.map((row) => `${40 + (row.step - 1) / Math.max(1, re
 		<section class="band" data-reveal>
 			<h2 class="band-title">Inference</h2>
 			<p class="band-lede">A <code>TextGeneration</code> task holds the model, its weights and the sampling settings. Run the cell to generate on a shared CPU host.</p>
-			<LiveText cell={textCell} recording={textRecording()} />
+			<LiveText cell={programs.text} recording={textRecording()} />
 			<p class="framework-note"><code>Server</code> runs many requests through one task in shared batches, and each request keeps its own random key and KV cache:</p>
 			<LandingCell {...cell('serving')} title="Batched decoding" />
 			<p class="framework-note">Store weights in int8 or fp8:</p>
@@ -128,7 +126,7 @@ const rewardPoints = reward.map((row) => `${40 + (row.step - 1) / Math.max(1, re
 		<section class="band replay" data-replays data-reveal>
 			<h2 class="band-title">Diffusion</h2>
 			<p class="band-lede">The process sets how training adds noise and what the model learns to predict. At generation time a solver runs the process in reverse, and you can switch solvers without retraining.</p>
-			<LiveSampler cell={samplerCell} recording={samplerRecording()} colab={tries.find((entry) => entry.name === 'Colab notebook')!.href} />
+			<LiveSampler cell={programs.sampler} recording={samplerRecording()} colab={tries.find((entry) => entry.name === 'Colab notebook')!.href} />
 			<LandingCell {...cell('diffusion')} title="Define and train a DiT" />
 			<p class="framework-note">A {modelSize}M-parameter text-to-image model at {resolution}, trained with Dew. Weights: <a href="https://huggingface.co/dewml/hybrid-dit-176m">dewml/hybrid-dit-176m</a>.</p>
 			<div class="replay-grid">{replays.map((entry) => <figure class="replay-figure" data-replay={`/hero/replay/${entry.name}/`}>
