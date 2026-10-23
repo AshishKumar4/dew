@@ -1,5 +1,5 @@
 {
- "about": "SLOP020's inventory (tools/lint_slop.py): each file under tests/ and tools/ that still compares floats within a tolerance outside the gate (tests/reference_error.py), its count, its lane (the owner of the modules it imports, PLAN.md). It only shrinks: a file above its count fails; one below it fails until the count comes down; and no commit's inventory may be looser than its parents' (tests/test_tolerance_lint.py). Every accuracy comparison goes through the gate's assertion (bible section 7).",
+ "about": "SLOP020's inventory (tools/lint_slop.py): each file under tests/ and tools/ that still compares floats within a tolerance outside the gate (tests/reference_error.py), its count, its lane (the owner of the modules it imports, PLAN.md). It only shrinks: a file above its count fails; one below it fails until the count comes down; and no commit's inventory may be looser than its parents' (tests/test_tolerance_lint.py). Every accuracy comparison goes through the gate's assertion.",
  "files": {
   "tests/diffusion_support.py": {
    "comparisons": 1,
@@ -680,10 +680,6 @@
   "tests/test_source_schedulers.py": {
    "comparisons": 5,
    "lane": "Training"
-  },
-  "tests/test_sparse_attention.py": {
-   "comparisons": 5,
-   "lane": "Kernels"
   },
   "tests/test_speculative.py": {
    "comparisons": 2,
