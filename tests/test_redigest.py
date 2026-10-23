@@ -45,18 +45,20 @@ def redigest(root: Path, *renames: str) -> subprocess.CompletedProcess:
                           timeout=60)
 
 
-def api_renamed(root: Path, owner: str, old: str, new: str | None) -> str:
+def api_renamed(root: Path, owner: str, old: str, new: str | None, beside: tuple[str, ...] = ()) -> str:
     """Dew's API at the base holds `owner.old`, a constructor's parameter, and the change renames it
-    `owner.new` (None: keeps it), committed: `recorded` the base, `change` the head. The rename to declare."""
+    `owner.new` (None: keeps it), the classes `beside` keeping a parameter `old` of their own; committed:
+    `recorded` the base, `change` the head. The rename to declare."""
     package = root / "src" / "dew"  # the scratch commit's own Dew, which the tool reads at each commit
     package.mkdir(parents=True, exist_ok=True)
     (package / "__init__.py").write_text("")
     api = "class {0}:\n    def __init__(self, {1}):\n        self.{1} = {1}\n"
-    (package / "api.py").write_text(api.format(owner, old))
+    kept = "".join(api.format(other, old) for other in beside)
+    (package / "api.py").write_text(api.format(owner, old) + kept)
     git(root, "add", "src")
     git(root, "commit", "-qm", "Dew's API")
     git(root, "checkout", "-q", "-b", "change")
-    (package / "api.py").write_text(api.format(owner, new or old))
+    (package / "api.py").write_text(api.format(owner, new or old) + kept)
     git(root, "commit", "-qam", "Dew's API renamed", "--allow-empty")
     return f"dew.api.{owner}.{old}=dew.api.{owner}.{new or old}"
 
@@ -140,14 +142,17 @@ def test_a_rename_rewrites_the_digests_of_the_programs_it_reaches_and_keeps_ever
 def test_a_rename_of_dews_api_keeps_a_recording_only_as_declared_and_where_it_holds(site):
     """A keyword to a class Dew defines, renamed as Dew renames it: kept only under that rename's declaration
     (--rename dew.api.Config.steps=dew.api.Config.num_steps), which the two commits' Dew must hold; the same
-    spelling passed to another callable (dict) is not that rename, and keeps no recording."""
-    recorded(site, "from dew.api import Config\nprint(Config(steps=3), dict(steps=3))\n")
-    declared = api_renamed(site, "Config", "steps", "num_steps")
+    spelling passed to another of Dew's classes (Trainer) or to another callable (dict) is not that rename,
+    and keeps no recording."""
+    program = "from dew.api import Config, Trainer\nprint(Config({}=3), Trainer({}=3), dict({}=3))\n"
+    recorded(site, program.format("steps", "steps", "steps"))
+    declared = api_renamed(site, "Config", "steps", "num_steps", beside=("Trainer",))
     before = recordings(site)
-    renamed = "from dew.api import Config\nprint(Config(num_steps=3), dict({}=3))\n"
-    for spelled, declaring, kept in (("steps", (), False), ("num_steps", (declared,), False),
-                                     ("steps", (declared,), True)):
-        (site / TEXT).write_text(renamed.format(spelled))
+    for spelled, declaring, kept in ((("steps", "steps"), (), False),
+                                     (("num_steps", "steps"), (declared,), False),
+                                     (("steps", "num_steps"), (declared,), False),
+                                     (("steps", "steps"), (declared,), True)):
+        (site / TEXT).write_text(program.format("num_steps", *spelled))
         assert redigest(site, *declaring).returncode == (0 if kept else 1), (spelled, declaring)
         assert (recordings(site) != before) == kept
 
