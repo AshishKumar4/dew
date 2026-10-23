@@ -27,8 +27,8 @@ from .activations import (
 from .blocks import normal_kernel
 from .flops import projection_flops
 from .joined import joined_dense, joins
-from .ngpt import NGPT, gain, unit
-from .precision import at_least_fp32, float32_dot_general, sqrt_or_zero
+from .ngpt import NGPT, gain
+from .precision import at_least_fp32, float32_dot_general, l2norm, sqrt_or_zero
 from .protocols import ProjectionGroup
 from .sharding import MLP_HIDDEN, constrain, logical_axes
 
@@ -205,7 +205,7 @@ class GatedMLP(nn.Module):
         gate = (gate.astype(jnp.float32) * gain(self.suv_gate, factor)).astype(gate.dtype)
         up = (up.astype(jnp.float32) * gain(self.suv_up, factor)).astype(up.dtype)
         hidden = gated_product(activation, axes=MLP_HIDDEN)(gate.astype(jnp.float32), up.astype(jnp.float32))
-        return unit(hidden.astype(gate.dtype))
+        return l2norm(hidden.astype(gate.dtype))
 
     def _down(self, hidden, train: bool):
         hidden = self.dropout(hidden, deterministic=not train)

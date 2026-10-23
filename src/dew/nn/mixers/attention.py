@@ -50,8 +50,8 @@ from dew.nn.kernels.selection import select
 from dew.nn.kv_cache import PAGED, PLACES, TABLE, Append, KVCache, KVStore, filled_slots, rotated, write_cache
 from dew.nn.local_attention import local_attention
 from dew.nn.mixer_base import QKV_RESIDUALS, MixerBase, MixerContext
-from dew.nn.ngpt import NGPT, gain, unit
-from dew.nn.precision import at_least_fp32, float32_dot_general, rounded_to, scaled
+from dew.nn.ngpt import NGPT, gain
+from dew.nn.precision import at_least_fp32, float32_dot_general, l2norm, rounded_to, scaled
 from dew.nn.protocols import ProjectionGroup
 from dew.nn.rope import LongRopeScaling, axis_halves, axis_tables, mrope_tables, rotary_freqs, rotate
 from dew.nn.sharding import HEADS, KV_HEADS, constrain, logical_axes
@@ -300,8 +300,8 @@ class CausalSelfAttention(nn.Module):
         learned gain, in fp32 and back to its dtype (dory.py:139-149)."""
         heads = gain(self.sqk, ngpt.query(self.ctx.head_dim))
         heads = heads.reshape(self.ctx.num_heads, self.ctx.head_dim)
-        query = (jnp.square(heads) * unit(query).astype(jnp.float32)).astype(query.dtype)
-        return query, unit(key)
+        query = (jnp.square(heads) * l2norm(query).astype(jnp.float32)).astype(query.dtype)
+        return query, l2norm(key)
 
     @property
     def reads_train(self) -> bool:
@@ -1117,7 +1117,7 @@ class CausalSelfAttention(nn.Module):
         attention = constrain(attention, HEADS)
         joined = attention.reshape(batch, length, self.ctx.num_heads * self.value_dim)
         if self.ctx.ngpt is not None:
-            joined = unit(joined)
+            joined = l2norm(joined)
         return checkpoint_name(self.o_proj(joined), 'o_proj')
 
 
