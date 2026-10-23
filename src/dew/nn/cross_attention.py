@@ -205,10 +205,14 @@ class GatedCrossAttention(nn.Module):
         before a first layer the input embeddings are not unit."""
         wide = stream.astype(at_least_fp32(jnp.result_type(stream, branch, gate)))
         if self.ngpt:
-            start, end = l2norm(wide), l2norm(branch).astype(wide.dtype)
-            length = sqrt_or_zero(jnp.sum(jnp.square(wide), axis=-1, keepdims=True))
+            # The stream over its largest element, whose squares no finite stream overflows: the
+            # move scales back by its length there, then by that element, so a zero move adds zero.
+            peak = jnp.max(jnp.abs(wide), axis=-1, keepdims=True)
+            scaled = wide / jnp.where(peak > 0, peak, 1)
+            length = sqrt_or_zero(jnp.sum(jnp.square(scaled), axis=-1, keepdims=True))
+            start, end = l2norm(scaled), l2norm(branch).astype(wide.dtype)
             move = _moved_on_the_sphere(start, _gated(end - start, gate, self.precision))
-            return (wide + length * move).astype(stream.dtype)
+            return (wide + peak * (length * move)).astype(stream.dtype)
         widened = branch.reshape(branch.shape[:2] + (1,) * (stream.ndim - branch.ndim) + branch.shape[2:])
         return (wide + _gated(widened, gate, self.precision)).astype(stream.dtype)
 
