@@ -17,7 +17,13 @@ from jax.sharding import Mesh
 from reference_error import assert_as_exact
 
 from dew.nn.kernels import generation
-from dew.nn.kernels.templates import attention as template, attention_mosaic, attention_triton
+from dew.nn.kernels.templates import (
+    attention as template,
+    attention_mosaic,
+    attention_triton,
+    mosaic,
+    mosaic_sm90,
+)
 
 pytestmark = pytest.mark.kernel
 
@@ -49,13 +55,20 @@ def _drawn(shape: tuple[int, int, int, int], dtype, width: int = 128, keys: int 
     return draw
 
 
+def _family(interpret: bool) -> mosaic.Family | None:
+    """The bundle a test runs: the wgmma family's interpreted on the CPU, which has no instruction family of
+    its own; the device's compiled (`attention_mosaic.family_of`)."""
+    return mosaic_sm90.WGMMA if interpret else None
+
+
 def _check_forward(call: str, dtype, shape, *, natural: bool, interpret: bool):
     spans = template.spans(shape[1], shape[1], shape[0], **CALLS[call])
     draw = _drawn(shape, dtype)
 
     def ours(query, key, value, dout):
         del dout
-        return attention_mosaic.forward(query, key, value, spans, natural=natural, interpret=interpret)
+        return attention_mosaic.forward(query, key, value, spans, natural=natural, interpret=interpret,
+                                        family=_family(interpret))
 
     def reference(query, key, value, dout):
         del dout
@@ -74,7 +87,7 @@ def _check_backward(call: str, shape, *, accurate: bool, interpret: bool, keys: 
         residuals = attention_triton.forward(query, key, value, spans, residuals=True,
                                              interpret=interpret)[1:]
         grads = attention_mosaic.backward(query, key, value, spans, None, dout, residuals=residuals,
-                                          accurate=accurate, interpret=interpret)
+                                          accurate=accurate, interpret=interpret, family=_family(interpret))
         return grads.query, grads.key, grads.value
 
     def reference(query, key, value, dout):
