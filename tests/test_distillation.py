@@ -13,6 +13,7 @@ refusal of a vocabulary mismatch, and a real trainer run on CPU where the
 teacher never moves and a resumed run lands where the straight one does.
 """
 
+import functools
 import itertools
 import json
 from pathlib import Path
@@ -86,15 +87,20 @@ def teacher_outputs(arrays: dict, variables=None) -> tuple[np.ndarray, np.ndarra
     2.7e-6 off in states of about 8), which, fed to the reference, would leave that rounding in
     Dew's distance from float64 alone. A float64 truth's widened variables run in float32 too:
     the teacher's outputs are the reference's data, not what it computes."""
-    from tools.distillation_reference import dew_outputs
-
-    teacher = models()[1]
-    layers = [layer for layer, _ in META["pairs"]]
     variables = {"params": tree(arrays, "teacher/")["params"]} if variables is None else variables
     variables = jax.tree.map(lambda leaf: np.asarray(leaf, np.float32), variables)
     with jax.enable_x64(new_val=False):
-        logits, states = dew_outputs(teacher, variables, jnp.asarray(arrays["tokens"][:, :-1]), layers)
+        logits, states = teacher_forward()(variables, jnp.asarray(arrays["tokens"][:, :-1]))
         return np.asarray(logits), np.stack([np.asarray(state) for state in states])
+
+
+@functools.cache
+def teacher_forward():
+    """The teacher's float32 forward `teacher_outputs` reads, compiled once for every draw."""
+    from tools.distillation_reference import dew_outputs
+
+    teacher, layers = models()[1], [layer for layer, _ in META["pairs"]]
+    return jax.jit(lambda variables, ids: dew_outputs(teacher, variables, ids, layers))
 
 
 DISTILLATION_SEEDS = {"terms": 64, "gradient": 16}
@@ -115,23 +121,25 @@ def drawn_parameters(params):
     return draw
 
 
-def reference_run(arrays: dict, kind: str, outputs, teacher, dtype: str):
+def reference_run(arrays: dict, kind: str, outputs, teacher, dtype: str, *, cotangents: bool):
     """The reference transcription run in torch at the `dtype` named, on the student's `outputs`,
     its logits and projected features, beside the `teacher`'s (`teacher_outputs`): its loss, its
-    terms, and its cotangents on those outputs."""
+    terms, and, where `cotangents`, its cotangents on those outputs (None otherwise)."""
     import torch
 
     from tools.distillation_reference import distillation_loss
 
     targets = arrays["tokens"][:, 1:]
-    logits, features = (torch.tensor(np.asarray(value), requires_grad=True) for value in outputs)
+    logits, features = (torch.tensor(np.asarray(value), requires_grad=cotangents) for value in outputs)
     teacher_logits, teacher_features = (torch.tensor(value) for value in teacher)
     loss, terms = distillation_loss(
         logits, teacher_logits, torch.tensor(targets, dtype=torch.int64),
         torch.tensor((targets != META["pad_id"]).astype(np.float32)), features, teacher_features,
         META["alpha"], META["temperature"], META["beta"], kind, dtype=getattr(torch, dtype))
-    d_logits, d_features = torch.autograd.grad(loss, (logits, features))
     reported = {name: value.item() for name, value in terms.items()}
+    if not cotangents:
+        return loss.item(), reported, None
+    d_logits, d_features = torch.autograd.grad(loss, (logits, features))
     return loss.item(), reported, (d_logits.numpy(), d_features.numpy())
 
 
@@ -147,10 +155,22 @@ def student_outputs(model, trainable, ids):
                               for index, state in enumerate(states)])
 
 
-def widened_outputs(model, trainable, ids):
-    """The student's outputs run in float64 and their pullback, under `jax.enable_x64`."""
-    return jax.vjp(lambda leaves: student_outputs(model.clone(dtype=jnp.float64), leaves, ids),
-                   widened(trainable))
+@functools.cache
+def student_forward(*, wide: bool):
+    """The student's outputs (`student_outputs`), compiled once for every draw: in float64 where
+    `wide`, over float64 leaves under `jax.enable_x64`."""
+    model = models()[0]
+    model = model.clone(dtype=jnp.float64) if wide else model
+    return jax.jit(lambda trainable, ids: student_outputs(model, trainable, ids))
+
+
+@functools.cache
+def student_pullback(*, wide: bool):
+    """The pullback of the student's outputs (`student_forward`) of `cotangents`, compiled once."""
+    model = models()[0]
+    model = model.clone(dtype=jnp.float64) if wide else model
+    return jax.jit(lambda trainable, ids, cotangents: jax.vjp(
+        lambda leaves: student_outputs(model, leaves, ids), trainable)[1](cotangents)[0])
 
 
 # --------------------------------------------------------------------------
@@ -169,7 +189,6 @@ def test_the_loss_and_its_terms_match_the_maxtext_reference(kind):
     arrays = fixture()
     objective, params = fixture_objective(arrays, feature_loss=kind)
     ids = jnp.asarray(arrays["tokens"][:, :-1])
-    model = objective.student.model
     named = {"loss": "loss", "ce": "hard_loss", "distill/soft_loss": "soft_loss", "distill/kl": "kl_div_at_T",
              "distill/feature": "feature", "distill/teacher_loss": "teacher_loss"}
 
@@ -180,9 +199,10 @@ def test_the_loss_and_its_terms_match_the_maxtext_reference(kind):
 
     def reference(params, dtype="float32"):
         wide = dtype == "float64"
-        outputs = (widened_outputs(model, params["params"], ids)[0] if wide
-                   else student_outputs(model, params["params"], ids))
-        loss, terms, _ = reference_run(arrays, kind, outputs, teacher_outputs(arrays, params[TEACHER]), dtype)
+        trainable = widened(params["params"]) if wide else params["params"]
+        outputs = student_forward(wide=wide)(trainable, ids)
+        loss, terms, _ = reference_run(arrays, kind, outputs, teacher_outputs(arrays, params[TEACHER]), dtype,
+                                       cotangents=False)
         return {metric: np.float64({**terms, "loss": loss}[name]) for metric, name in named.items()}
 
     assert_as_exact(dew, reference, drawn_parameters(params), f"{kind} distillation terms",
@@ -202,7 +222,6 @@ def test_the_student_gradient_matches_the_reference_cotangents(kind):
     objective, params = fixture_objective(arrays, feature_loss=kind)
     batch = fixture_batch(arrays)
     ids = jnp.asarray(arrays["tokens"][:, :-1])
-    model = objective.student.model
 
     @jax.jit
     def dew(params):
@@ -210,22 +229,20 @@ def test_the_student_gradient_matches_the_reference_cotangents(kind):
             {**params, "params": trainable}, batch, step_at())[0])(params["params"])
 
     def pulled(params, dtype="float32"):
-        if dtype == "float64":
-            outputs, pullback = widened_outputs(model, params["params"], ids)
-        else:
-            outputs, pullback = jax.vjp(lambda trainable: student_outputs(model, trainable, ids),
-                                        params["params"])
+        wide = dtype == "float64"
+        trainable = widened(params["params"]) if wide else params["params"]
+        outputs = student_forward(wide=wide)(trainable, ids)
         teacher = teacher_outputs(arrays, params[TEACHER])
-        _, _, cotangents = reference_run(arrays, kind, outputs, teacher, dtype)
-        return pullback(tuple(jnp.asarray(value) for value in cotangents))[0]
+        _, _, cotangents = reference_run(arrays, kind, outputs, teacher, dtype, cotangents=True)
+        return student_pullback(wide=wide)(trainable, ids, tuple(jnp.asarray(value) for value in cotangents))
 
     assert_as_exact(dew, pulled, drawn_parameters(params), f"{kind} student gradient",
                     seeds=DISTILLATION_SEEDS["gradient"], truth_fn=lambda params: pulled(params, "float64"))
     # The fixture's own draw: the student's logits as near its float64 forward as the fixture's,
     # which the reference generator wrote from the same forward.
-    outputs = student_outputs(model, params["params"], ids)
+    outputs = student_forward(wide=False)(params["params"], ids)
     with jax.enable_x64(new_val=True):
-        wide_logits = np.asarray(widened_outputs(model, params["params"], ids)[0][0])
+        wide_logits = np.asarray(student_forward(wide=True)(widened(params["params"]), ids)[0])
     assert_as_exact_as_the_reference(np.asarray(outputs[0]), arrays["student_logits"], wide_logits, "logits")
     truth = pulled(params)
     assert jax.tree.structure(dew(params)) == jax.tree.structure(truth)
