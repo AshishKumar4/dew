@@ -670,3 +670,22 @@ def test_a_querys_gradient_from_a_state_of_a_small_denominator_at_a_large_scale_
         assert np.isfinite(np.asarray(grads.query)).all(), name
     assert_same_bits(triton.query, portable.query, "a small denominator at a large scale")
 
+
+def test_a_bf16_querys_gradient_over_a_large_key_with_small_cotangents_is_exact():
+    """bf16, one query of zeros over two keys, the first's first entry 2^120: equal logits, so the score
+    cotangents are exactly -2^-4 and 2^-4 at the scale of 1/4, and the query's gradient's first entry is
+    exactly -2^116, in bf16's range. The cotangents' product with the keys keeps bf16's range in both its
+    parts (`algebra.cotangent_product`), in both mainloops, to the bit."""
+    query = jnp.zeros((1, 1, 1, 16), jnp.bfloat16)
+    key = jnp.zeros((1, 2, 1, 16), jnp.bfloat16).at[0, 0, 0, 0].set(2.0 ** 120)
+    value = jnp.zeros((1, 2, 1, 16), jnp.bfloat16).at[0, :, 0, 0].set(jnp.asarray([1.0, 2.0]))
+    dout = jnp.zeros((1, 1, 1, 16), jnp.bfloat16).at[..., 0].set(1.0)
+    spans = template.spans(1, 2, 1)
+    tiles = {"block_q": 32, "block_k": 32, "pad": attention_triton.BLOCK}
+    with tuning.pinned({attention_triton.TritonBackward: joint(TILES[1])}):
+        triton = attention_triton.backward(query, key, value, spans, None, dout, natural=True, interpret=True)
+    portable = attention_portable.backward(query, key, value, spans, None, dout, natural=True, **tiles)
+    for name, grads in (("triton", triton), ("portable", portable)):
+        assert float(grads.query[0, 0, 0, 0]) == -(2.0 ** 116), name
+    assert_same_bits(triton.query, portable.query, "a large bf16 key under small cotangents")
+
