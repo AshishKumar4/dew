@@ -267,7 +267,9 @@ def _chunk_delta_backward(chunk_size, delta, scale, dtype, residual, cotangent):
     boundaries. Replay C tokens from each entered memory, derive their terminal cotangents from
     `readout_entered_gradient` and the transitions, then reverse C tokens. Replaying keeps a token's
     erasure beside its decay, rather than cancelling separately rounded WY derivatives afterwards.
-    The per-token memories exist only in this backward, not as residuals of the primal."""
+    Checkpoint every SUB tokens, then replay one span at a time inside the reverse scan: the
+    memories kept are C/SUB checkpoints and one SUB-token span, not a memory for every token.
+    Both replays preserve the token recurrence's arithmetic and order."""
     del chunk_size, dtype
     query, key, value, g, beta, resets, entered, transition, decayed_query, weights, scores = residual
     cotangent, final_cotangent = cotangent
@@ -275,8 +277,14 @@ def _chunk_delta_backward(chunk_size, delta, scale, dtype, residual, cotangent):
     cotangent = _chunk_rows(cotangent.astype(query.dtype), query.shape[3])
     tokens = query, key, value, g, beta, resets
 
-    def time_major(x):
-        return jnp.moveaxis(x, 3, 0)
+    width = query.shape[3]
+    span_width = min(algebra.SUB, width)
+    spans = (width + span_width - 1) // span_width
+
+    def span_major(x):
+        x = jnp.moveaxis(x, 3, 0)
+        x = jnp.pad(x, [(0, spans * span_width - width)] + [(0, 0)] * (x.ndim - 1))
+        return x.reshape(spans, span_width, *x.shape[1:])
 
     def token(state, query, key, value, g, beta, reset):
         state = jnp.where(reset[..., None, None], 0.0, state)
@@ -286,7 +294,12 @@ def _chunk_delta_backward(chunk_size, delta, scale, dtype, residual, cotangent):
         _, final = token(state, *inputs)
         return final, state
 
-    _, before = jax.lax.scan(replay, entered, tuple(map(time_major, tokens)))
+    def checkpoint(state, inputs):
+        final, _ = jax.lax.scan(replay, state, inputs)
+        return final, state
+
+    span_tokens = tuple(map(span_major, tokens))
+    _, checkpoints = jax.lax.scan(checkpoint, entered, span_tokens)
     source = algebra.readout_entered_gradient(decayed_query, weights, scores, cotangent)
 
     def across(state_gradient, inputs):
@@ -305,9 +318,19 @@ def _chunk_delta_backward(chunk_size, delta, scale, dtype, residual, cotangent):
         state_gradient, *gradients = pull((out_gradient, state_gradient))
         return state_gradient, tuple(gradients)
 
+    def reverse_span(state_gradient, inputs):
+        checkpoint, out_gradient, *tokens = inputs
+        _, before = jax.lax.scan(replay, checkpoint, tuple(tokens))
+        return jax.lax.scan(adjoint, state_gradient, (before, out_gradient, *tokens), reverse=True)
+
     initial, gradients = jax.lax.scan(
-        adjoint, terminal, (before, time_major(cotangent), *map(time_major, tokens)), reverse=True)
-    dq, dk, dv, dg, dbeta = (_chunk_sequence(jnp.moveaxis(x, 0, 3), length) for x in gradients)
+        reverse_span, terminal, (checkpoints, span_major(cotangent), *span_tokens), reverse=True)
+
+    def sequence(x):
+        x = x.reshape(spans * span_width, *x.shape[2:])[:width]
+        return _chunk_sequence(jnp.moveaxis(x, 0, 3), length)
+
+    dq, dk, dv, dg, dbeta = map(sequence, gradients)
     return dq * scale, dk, dv, dg, dbeta, initial[:, :, 0], None
 
 

@@ -16,7 +16,8 @@ def unregrouped(*args, **kwargs):
         return recurrence_chunk.chunk_delta_rule(*args, **kwargs)
 
 
-@pytest.mark.parametrize("variant", ["current", "chunk-adjoint", "chunk-adjoint-fast", "comp-core"])
+@pytest.mark.parametrize("variant", ["current", "chunk-adjoint", "chunk-adjoint-fast",
+                                    "chunk-adjoint-uncheckpointed", "comp-core"])
 def test_backward_wall_time(variant):
     if variant == "comp-core":
         import probe_aligned_dots_nosysquid as dots
@@ -26,7 +27,8 @@ def test_backward_wall_time(variant):
         dots.wide_dot = dot
         dots.install(CORE)
     fn = {"current": unregrouped, "chunk-adjoint": chunk_adjoint,
-          "chunk-adjoint-fast": recurrence_chunk.chunk_delta_rule, "comp-core": unregrouped}[variant]
+          "chunk-adjoint-fast": recurrence_chunk.chunk_delta_rule,
+          "chunk-adjoint-uncheckpointed": chunk_adjoint_wy_source, "comp-core": unregrouped}[variant]
     shape = (2, 4096, 16, 128)
     rng = jax.random.split(jax.random.key(20261023), 7)
     q, k, v = (jax.random.normal(key, shape) for key in rng[:3])
@@ -43,12 +45,19 @@ def test_backward_wall_time(variant):
         return pull(cotangent)
 
     start = time.monotonic()
-    jax.block_until_ready(backward(*inputs))
+    compiled = backward.lower(*inputs).compile()
+    memory = compiled.memory_analysis()
+    peak = (memory.argument_size_in_bytes + memory.output_size_in_bytes
+            + memory.temp_size_in_bytes - memory.alias_size_in_bytes)
+    print(f"MEMORY|{variant}|peak={peak}|arguments={memory.argument_size_in_bytes}"
+          f"|outputs={memory.output_size_in_bytes}|temporary={memory.temp_size_in_bytes}"
+          f"|aliases={memory.alias_size_in_bytes}", flush=True)
+    jax.block_until_ready(compiled(*inputs))
     cold = time.monotonic() - start
     times = []
     for _ in range(3 if variant == "comp-core" else 5):
         start = time.monotonic()
-        jax.block_until_ready(backward(*inputs))
+        jax.block_until_ready(compiled(*inputs))
         times.append(time.monotonic() - start)
     print(f"BENCH|{variant}|platform={jax.default_backend()}|shape={shape}|chunk=64"
           f"|seconds={np.median(times):.9g}|samples={times}|cold={cold:.6g}", flush=True)
