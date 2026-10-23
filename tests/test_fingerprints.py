@@ -23,7 +23,7 @@ def test_a_bfloat16_helper_keeps_its_bfloat16_draws_and_derivatives(tmp_path, mo
                                                          "    return x * 2 + jnp.sin(x)\n")
     bf16 = [entry for key, entry in found["bent"].draws.items() if key[1] == "bfloat16"]
     assert len(bf16) == len(fingerprints.SHAPES)
-    assert all(derivative is not None for _, derivative, _, _ in bf16)
+    assert all(derivative is not None for _, derivative, _ in bf16)
 
 
 def test_helpers_computing_alike_group_and_a_delegating_pair_is_left_out(tmp_path, monkeypatch):
@@ -41,7 +41,7 @@ def softplus_again(x):
 
 
 def wrapped(x):
-    return softplus(x)
+    return softplus(jnp.asarray(x))
 
 
 def other(x):
