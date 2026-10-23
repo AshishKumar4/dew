@@ -2395,7 +2395,6 @@ class CausalTransformer(nn.Module):
             return params
         return clamped_predictions(params, self.altup.coef_clip)
 
-    @nn.nowrap
     @property
     def context_width(self) -> int:
         """The width of a context's tokens (`CrossAttending`): the spec's, or the decoder's own."""
@@ -2404,6 +2403,7 @@ class CausalTransformer(nn.Module):
             return self.emb_features
         return cross.context_features
 
+    @nn.nowrap
     def with_cross_attention(self, cross: CrossAttention | None) -> Self:
         """This decoder with `cross` as its cross-attention layers (`CrossAttending`), None for none."""
         return self.clone(cross_attention=cross)
