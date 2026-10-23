@@ -2364,9 +2364,9 @@ def test_a_mixture_of_one_dataset_reads_that_dataset(by, read):
 @pytest.mark.parametrize("read", ["memory", "indexed", "streamed"])
 def test_a_corpus_smaller_than_a_batch_fills_one_by_its_repeats(read):
     """A corpus of two records repeated fills a batch of eight, as Grain's repeat and batch do,
-    and a run counted in steps or in epochs reads it, an epoch's one step holding records of the
-    next. Repeated after the batch, a pass holds no batch to
-    replay, so the read is refused rather than replaying nothing forever, whatever limit
+    and a run counted in steps reads it, as one counted in epochs does where the read counts its
+    records, an epoch's one step holding records of the next. Repeated after the batch, a pass
+    holds no batch to replay, so the read is refused rather than replaying nothing forever, whatever limit
     follows, in every read; eight records make a batch either way."""
     for count, repeated in ((2, "before"), (2, "after"), (8, "after"), (2, "after, then take"),
                             (8, "after, then take")):
@@ -2387,7 +2387,7 @@ def test_a_corpus_smaller_than_a_batch_fills_one_by_its_repeats(read):
                 index % count for index in range(8))
         finally:
             stream.close()
-        if count < 8:
+        if count < 8 and data.records is not None:
             assert data.epoch_steps(1) == 1
 
 
