@@ -50,8 +50,7 @@ from .activations import GatedActivation
 from .attention import projected_heads, projected_output, scaled_dot_product_attention
 from .flops import counted_flops, cross_attention_flops, projection_flops
 from .inputs import CrossContext
-from .ngpt import unit
-from .precision import at_least_fp32, float32_dot_general, sqrt_or_zero
+from .precision import at_least_fp32, float32_dot_general, l2norm, sqrt_or_zero
 from .sharding import HEADS, KV_HEADS, constrain
 
 NAME = "cross_attention"
@@ -204,10 +203,10 @@ class GatedCrossAttention(nn.Module):
         are not unit."""
         wide = stream.astype(at_least_fp32(stream.dtype))
         if self.ngpt:
-            start, end = unit(wide), unit(branch).astype(wide.dtype)
+            start, end = l2norm(wide), l2norm(branch).astype(wide.dtype)
             length = sqrt_or_zero(jnp.sum(jnp.square(wide), axis=-1, keepdims=True))
             # One norm over both points, so a step of a zero gate, the same point, norms as it does.
-            normed = unit(jnp.stack([start, start + _gated(end - start, gate, self.precision)]))
+            normed = l2norm(jnp.stack([start, start + _gated(end - start, gate, self.precision)]))
             return (wide + length * (normed[1] - normed[0])).astype(stream.dtype)
         widened = branch.reshape(branch.shape[:2] + (1,) * (stream.ndim - branch.ndim) + branch.shape[2:])
         return (wide + _gated(widened, gate, self.precision)).astype(stream.dtype)
