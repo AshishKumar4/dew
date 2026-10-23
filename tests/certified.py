@@ -9,7 +9,6 @@ import math
 import ml_dtypes
 import numpy as np
 from op_certificates import (
-    EXP_RANGE,
     FORMATS,
     Format,
     exact_sum,
@@ -158,14 +157,6 @@ def _interval(function):
                 low.flat[index], high.flat[index] = _outward(a, -math.inf), _outward(b, math.inf)
         return low, high
     return enclose
-
-
-def _exp_interval(values, bits):
-    """exp's outward enclosure at each finite value, taken at EXP_RANGE's nearer end beyond it: past
-    either end every exp lies between the same two neighbours of a format no wider than fp32, so the
-    end's enclosure gives the same verdict, and no end is built of an exponent float64 cannot hold
-    (exp(1e30) is 2^(1.4e30))."""
-    return _interval(lambda iv, x: iv.exp(x))(np.clip(values, *EXP_RANGE), bits)
 
 
 def _erfinv_enclosed(values, bits):
@@ -509,7 +500,7 @@ CONTRACTS = {
     "min": _extreme(_signed_min, np.minimum),
     "convert_element_type": _converted,
     "log": _transcendental(_interval(lambda iv, x: iv.log(x)), _log_special),
-    "exp": _transcendental(_exp_interval, _exp_special),
+    "exp": _transcendental(_interval(lambda iv, x: iv.exp(x)), _exp_special),
     "erf_inv": _transcendental(_erfinv_enclosed, _erfinv_special),
     "reduce_sum": _reduced_sum,
     "dot_general": _dot,

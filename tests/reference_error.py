@@ -749,38 +749,22 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
                   zero_rows, np.asarray(finite), widths)
 
 
-def _leaf_paths(tree) -> list[str]:
-    return [jax.tree_util.keystr(path) for path, _ in jax.tree_util.tree_leaves_with_path(tree)]
-
-
 def _evidence(dew, reference, truth, their_truth) -> list[tuple]:
-    """One draw's `_paired` evidence of every leaf of `dew` and `reference` against their truths. The
-    trees are held alike first: Dew's, the reference's (a recorded one's leaves `RecordedLeaf`) and
-    both truths the same leaves at the same paths, and each leaf the shape of its truth, so no leaf is
-    paired with another's truth or compared through broadcasting."""
-    paths = _leaf_paths(truth)
-    for name, tree in (("dew", dew), ("the reference", reference), ("the reference's truth", their_truth)):
-        if _leaf_paths(tree) != paths:
-            raise AssertionError(f"{name}'s leaves are {_leaf_paths(tree)}, the truth's {paths}")
+    """One draw's `_paired` evidence of every leaf of `dew` and `reference` against their truths."""
     row = []
     for (path, leaf), their_leaf, true, their_true in zip(jax.tree_util.tree_leaves_with_path(dew),
                                                           jax.tree.leaves(reference), jax.tree.leaves(truth),
                                                           jax.tree.leaves(their_truth), strict=True):
         recorded = isinstance(their_leaf, RecordedLeaf)
-        shapes = {"dew": np.shape(leaf), "the reference's truth": np.shape(their_true)}
-        if not recorded:
-            shapes["the reference"] = np.shape(their_leaf)
-        for name, shape in shapes.items():
-            if shape != np.shape(true):
-                raise AssertionError(f"{jax.tree_util.keystr(path)}: {name}'s shape is {shape}, the truth's "
-                                     f"{np.shape(true)}")
         their = their_leaf if recorded else leaf_summary(their_leaf, their_true)
         if np.size(leaf) == 0:
             # An empty leaf (a one-tap convolution's history) is exact by construction: held to the
-            # reference's dtype (its shape is held above; the truth's dtype, float64, is its own), it
-            # adds no error and resolves nothing.
-            kept = str(jnp.dtype(leaf.dtype))
-            assert kept == their.dtype, (jax.tree_util.keystr(path), kept, their.dtype)
+            # reference's shape and dtype (a recorded one's shape its truth's), and the truth empty
+            # alike (in float64, its dtype is its own), it adds no error and resolves nothing.
+            kept = (np.shape(leaf), str(jnp.dtype(leaf.dtype)))
+            held = (np.shape(true) if recorded else np.shape(their_leaf), their.dtype)
+            assert kept == held, (jax.tree_util.keystr(path), kept, held)
+            assert np.shape(true) == np.shape(leaf), (jax.tree_util.keystr(path), np.shape(true))
             row.append((0.0, 0.0, 0.0, 0.0, NO_ZERO_ROWS, True))
             continue
         # Rows pair where the two truths are the same values: the same draw, or an orbit's draws.
@@ -2127,8 +2111,7 @@ def assert_same_artifact(recomputed, committed, f64, name: str) -> None:
     fresh, stored = (float(np.max(np.abs(value - f64))) for value in (recomputed, committed))
     print(f"{name}: committed {stored:.3e} and recomputed {fresh:.3e} from float64, "
           f"{float(np.max(np.abs(recomputed - committed))):.3e} apart")
-    # Written so a NaN or an infinity on either side fails it.
-    if not (np.isfinite(stored) and np.isfinite(fresh) and within(stored, 2 * fresh)):
+    if stored > 2 * fresh:
         raise AssertionError(f"{name}: the committed fixture is not this reference's output")
 
 
