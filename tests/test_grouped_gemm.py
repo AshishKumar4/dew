@@ -13,9 +13,9 @@ import numpy as np
 import pytest
 from generation_support import INTERPRETS, generations, lowers
 from jax.sharding import Mesh
-from reference_error import assert_as_exact_as_the_reference, equations
+from reference_error import assert_as_exact, assert_as_exact_as_the_reference, equations, with_gradients
 
-from dew.nn.kernels import generation, grouped_matmul
+from dew.nn.kernels import generation, grouped_matmul, tuning
 from dew.nn.kernels.templates import cost
 from dew.nn.kernels.templates.gemm import mosaic_gpu
 from dew.nn.moe import expert_projection
@@ -26,6 +26,8 @@ pytestmark = pytest.mark.kernel
 SIZES = {"ragged": [0, 70, 1, 100, 0], "one-group": [200], "all-empty": [0, 0, 0], "aligned": [64, 64, 64, 8],
          "unrouted-tail": [3, 0, 120]}
 ROWS, DEPTH, WIDTH = 200, 128, 256
+SEEDS = 8
+"""Each site's declared draws (`reference_error.seeds_for` of the plain program on them)."""
 
 
 def rounded(values, dtype) -> np.ndarray:
@@ -203,6 +205,36 @@ def test_an_expert_projection_runs_the_implementation_chosen_for_it_on_the_cpu(g
         assert_as_exact_as_the_reference(np.asarray(got, np.float64), np.asarray(theirs, np.float64), truth,
                                           label)
 
+
+
+@pytest.mark.gpu(reason="needs a GPU the installed dew-cutlass holds kernels for")
+@pytest.mark.parametrize("sizes", [name for name in SIZES if any(SIZES[name])])
+def test_cutlass_runs_the_projection_as_exactly_as_xla_where_chosen(sizes):
+    """Where the installed dew-cutlass holds this GPU's kernels, the projection's forward and both
+    gradients through CUTLASS's launches, chosen by name, are as exact as XLA's ragged dot from float64,
+    unrouted rows and empty groups included, and the launches that ran them are CUTLASS's."""
+    pytest.importorskip("dew_cutlass")
+    here = generation.effective(generation.gpu_target()).generation
+    if here not in grouped_matmul.cutlass_architectures():
+        pytest.skip(f"the installed dew-cutlass holds no kernels for {here}")
+    group_sizes = jnp.asarray(SIZES[sizes], jnp.int32)
+
+    def draw(seed):
+        x, w, dy, _ = operands(SIZES[sizes], jnp.bfloat16, seed)
+        return tuple(jnp.asarray(value, jnp.bfloat16) for value in (x, w, dy))
+
+    def projection(implementation, dtype=jnp.bfloat16):
+        return lambda x, w: expert_projection(x, w, group_sizes, dtype, implementation, None)
+
+    def through_cutlass(x, w, dy):
+        with generation.chosen(grouped_matmul="cutlass"):
+            return with_gradients(projection("pallas"))(x, w, dy)
+
+    with tuning.seen() as launches:
+        assert_as_exact(jax.jit(through_cutlass), jax.jit(with_gradients(projection("xla"))), draw,
+                        f"cutlass {sizes}", seeds=SEEDS,
+                        truth_fn=with_gradients(projection("xla", jnp.float64)))
+    assert {type(launch).__name__ for launch, _ in launches} == {"CutlassGmm", "CutlassTgmm"}
 
 
 def test_the_kernels_forward_mode_keeps_the_projections_law():

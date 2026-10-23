@@ -286,9 +286,9 @@ Two measures decide whether a mainloop lands and whether it replaces a route: th
 
 ## 7. Choice: the config chooser inside each template
 
-**No kernel tables and, in the end, no selector.** The end state is one implementation per operation, the template. What stays is the config chooser inside each template: legality, then a model over device facts that picks tiles and formulations (§3), like any kernel's heuristics, with no per-GPU entries. Measured tuning is opt-in, cached per device kind, and the user's choice. Scoreboards are evidence, never routing data: no runtime table of measured routes is built.
+**No kernel tables and, in the end, no selector.** The end state is one implementation per operation, the template. What stays is the config chooser inside each template: legality, then a model over device facts that picks tiles and formulations (§3), like any kernel's heuristics, with no per-GPU entries. Measured tuning is opt-in, cached per device kind, and the user's choice. Scoreboards are evidence and calibrate the model's facts (a vendored kernel's measured rows among them, below), never routing data: no runtime table of measured routes is built.
 
-- **Interim:** today's typed selector (`selection`, `generation.route`) keeps serving the hand-kernel and external routes until each is deleted (§9). It isn't extended, and it goes with the last route.
+- **Interim:** today's typed selector (`selection`, `generation.route`) keeps serving the hand-kernel and external routes until each moves to the ranking below or is deleted (§9); its fixed preference order goes with the last.
 - **A GPU outside every family the template claims** (§6) runs XLA by a fixed capability rule, not a measured choice. Where XLA beats the template on a claimed family's GPU, that's a template defect to fix (§6, "debug where XLA wins"), not a route.
 - **Legality prunes; predictions rank.** Only hard constraints remove a configuration: it fits shared memory, registers and TMEM, and respects layout and instruction rules. Residency, predicted spills and roofline estimates are predictions, so they rank the legal space and never prune it. Today's analytic model ties all 36 attention configurations and ties the dense pick with the best tile; pruning on it would keep an arbitrary subset.
 - **Rank with complete analytic features**, one schema for all templates:
@@ -310,7 +310,7 @@ Two measures decide whether a mainloop lands and whether it replaces a route: th
   - outside its training range, the analytic estimate decides alone.
 
   Budget: about 2,000 configurations timed per GPU-hour, shape diversity before configuration count, and active collection where the model is unsure.
-- **External kernels are not configurations.** The template against cuBLAS, FA3 or CUTLASS is scoreboard evidence for deleting a route, never a routing choice. Each template's chooser replaces `templates/base.choose` and the per-template cost formulas.
+- **Vendored kernels are candidates until the template beats them** (owner, 2026-10-23). A vendored kernel (CUTLASS, FlashAttention, cuDNN, the Triton references) declares its legality like any launch and is ranked by the same model: its own cost terms where the model has them, else the model's estimate at its geometry scaled by its measured scoreboard rows, a calibrated fact per generation, so it is a candidate only where its rows were measured. The template's launch replaces it, and the vendored kernel is deleted, where the template matches it on the gate. CUTLASS's grouped GEMMs are the first (`grouped_matmul.CutlassGmm`, `CutlassTgmm`); the fixed preference order of the typed selector's other ops moves to this ranking after them. Each template's chooser replaces `templates/base.choose` and the per-template cost formulas.
 
 ## 8. Determinism, D and the backward
 
