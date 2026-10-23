@@ -20,11 +20,11 @@ from dew import records
 from dew.interop.config_records import native_fields
 from dew.interop.decoder_parts import (
     ACTIVATIONS,
-    DEFAULT_MAX_SEQ_LEN,
     DecoderFamily,
     DecoderFields,
     Packed,
     Renames,
+    context_lengths,
     decoder_kinds,
     hf_activation,
     hf_ungated,
@@ -32,6 +32,7 @@ from dew.interop.decoder_parts import (
     refuse,
     renamed_name,
     renamed_path,
+    specified_layer_types,
     ungated_mlp,
 )
 from dew.nn.backbones.causal_transformer import CausalTransformer
@@ -83,12 +84,8 @@ def _modernbert_config(hf: Mapping[str, object], used: set[str]) -> DecoderField
     if activation not in ACTIVATIONS:
         refuse(f'hidden_activation={activation!r}', f'the GLU supports {sorted(ACTIVATIONS)}')
 
-    if hf.get('layer_types') is not None:
-        layer_types = records.strings(hf['layer_types'], 'layer_types')
-    else:
-        every = records.integer(hf.get('global_attn_every_n_layers', 3), 'global_attn_every_n_layers')
-        layer_types = tuple('sliding_attention' if index % every else 'full_attention'
-                            for index in range(layers))
+    every = records.integer(hf.get('global_attn_every_n_layers', 3), 'global_attn_every_n_layers')
+    layer_types = specified_layer_types(hf, used, ('full_attention',) + ('sliding_attention',) * (every - 1))
     if isinstance(hf.get('rope_parameters'), Mapping):
         ropes = read_rope(hf, used)
         if ropes.scaling is not None or ropes.local_scaling is not None:
@@ -112,8 +109,7 @@ def _modernbert_config(hf: Mapping[str, object], used: set[str]) -> DecoderField
         emb_features=hidden, num_layers=layers, num_heads=heads, num_kv_heads=heads,
         head_dim=hidden // heads, mlp=ACTIVATIONS[activation],
         mlp_features=records.integer(hf['intermediate_size'], 'intermediate_size'),
-        max_seq_len=min(records.integer(hf.get('max_position_embeddings', 8192), 'max_position_embeddings'),
-                        DEFAULT_MAX_SEQ_LEN),
+        max_seq_len=context_lengths(hf, 8192)[0],
         rope_theta=theta, layer_types=layer_types,
         norm_type='layer', norm_bias=bool(hf.get('norm_bias', False)),
         norm_eps=records.number(hf.get('norm_eps', 1e-5), 'norm_eps'),

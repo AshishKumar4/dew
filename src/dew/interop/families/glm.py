@@ -159,8 +159,7 @@ def _glm5_next_config(hf_config: Mapping[str, object], used: set[str]) -> Decode
     than dropped.
     """
     layers = record_int(hf_config, 'num_hidden_layers')
-    types = specified_layer_types(hf_config, used, tuple(
-        'deepseek_sparse_attention' if i % 4 == 3 else 'linear_attention' for i in range(layers)))
+    types = specified_layer_types(hf_config, used, ('linear_attention',) * 3 + ('deepseek_sparse_attention',))
     types = tuple('full_attention' if kind == 'deepseek_sparse_attention' else kind for kind in types)
     if len(types) != layers or set(types) - {'linear_attention', 'full_attention'}:
         refuse('layer_types', 'one linear_attention or deepseek_sparse_attention entry per layer')
@@ -242,10 +241,6 @@ def _glm5_next_export(model: CausalTransformer) -> Mapping[str, object]:
             refuse(f'kinds.{kind_name}.mixer', 'GLM5 requires KDA or k-pool attention respectively')
     mixture = model.mixture
     routed = model.sparse_layers
-    if model.num_nextn_predict_layers and (
-        "full_attention" not in types or model.num_layers - 1 not in routed
-    ):
-        refuse('num_nextn_predict_layers', 'the source NextN depth requires a routed NoPE block')
     fields: dict[str, object] = {
         'layer_types': ['deepseek_sparse_attention' if kind == 'full_attention' else kind for kind in types],
         'mlp_layer_types': ['sparse' if index in routed else 'dense' for index in range(model.num_layers)],

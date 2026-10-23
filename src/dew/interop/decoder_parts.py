@@ -20,6 +20,7 @@ import numpy as np
 from flax.traverse_util import flatten_dict
 
 from dew import records
+from dew._model_types import SANDWICH_NORMS
 from dew.interop.config_records import NativeFields, native_fields
 from dew.interop.safetensors_io import LazyTensors
 from dew.interop.streaming import WeightLayout
@@ -536,16 +537,16 @@ def read_rope(hf_config: Mapping[str, object], used: set, yarn_max_pos: int | No
 
 
 def specified_layer_types(hf_config: Mapping[str, object], used: set[str],
-                           default: tuple[str, ...] | None = None) -> tuple[str, ...]:
+                          pattern: tuple[str, ...] | None = None) -> tuple[str, ...]:
+    """The config's `layer_types`, else `pattern` repeated over its `num_hidden_layers`: a family's
+    cycle (Gemma 2's sliding then full layer), or one kind per layer; every layer full without one."""
     layers = hf_config.get('layer_types')
     if layers is not None:
         used.add('layer_types')
         return records.strings(layers, 'layer_types')
-    return (
-        default
-        if default is not None
-        else ("full_attention",) * records.integer(hf_config["num_hidden_layers"], "num_hidden_layers")
-    )
+    cycle = ("full_attention",) if pattern is None else pattern
+    count = records.integer(hf_config["num_hidden_layers"], "num_hidden_layers")
+    return tuple(cycle[index % len(cycle)] for index in range(count))
 
 
 def decoder_kinds(layer_types: tuple[str, ...], window: int | None,
@@ -663,11 +664,11 @@ def _neutral(hf_config: Mapping[str, object], field: str) -> bool:
     return value is None or value is False
 
 
-def context_lengths(hf_config: Mapping[str, object]) -> tuple[int, int | None]:
+def context_lengths(hf_config: Mapping[str, object], default: int | None = None) -> tuple[int, int | None]:
     """The decode cache's capacity (`CausalTransformer.max_seq_len`), capped at
-    `DEFAULT_MAX_SEQ_LEN`, and the stated context (`max_position_embeddings`, its `context_length`),
-    None where the config states none."""
-    stated = hf_config.get('max_position_embeddings')
+    `DEFAULT_MAX_SEQ_LEN`, and the context (`max_position_embeddings`, its `context_length`): the
+    stated one, else `default`, the source config class's own, None where neither is."""
+    stated = hf_config.get('max_position_embeddings', default)
     context = None if stated is None else records.integer(stated, 'max_position_embeddings')
     return min(context or DEFAULT_MAX_SEQ_LEN, DEFAULT_MAX_SEQ_LEN), context
 
@@ -843,22 +844,11 @@ def record_float(record: Mapping[str, object], field: str, default: float | None
     return records.number(record[field] if default is None else record.get(field, default), field)
 
 
-# Where a layer's norms sit in the two trees. Without the sandwich the names
-# are the same; with it three of the four move, because HF names its norms
-# after the sublayer they follow while dew names them after what they
-# normalize. HF's post_attention_layernorm normalizes the attention output
-# (our attention_output_norm); its pre_feedforward_layernorm is the MLP's
-# pre-norm (our post_attention_layernorm); and its post_feedforward_layernorm
-# normalizes the MLP output (our mlp_output_norm).
+# Where a layer's norms sit in the two trees: without the sandwich the names
+# are the same, and with it they move (`SANDWICH_NORMS`).
 _PRE_NORMS = {
     'input_layernorm': 'input_layernorm',
     'post_attention_layernorm': 'post_attention_layernorm',
-}
-_SANDWICH_NORMS = {
-    'input_layernorm': 'input_layernorm',
-    'post_attention_layernorm': 'attention_output_norm',
-    'pre_feedforward_layernorm': 'post_attention_layernorm',
-    'post_feedforward_layernorm': 'mlp_output_norm',
 }
 # An attention gate_proj is Muse Glimmer's output gate (`CausalSelfAttention.gate_projection`).
 _PROJECTIONS = {'self_attn': ('q_proj', 'k_proj', 'v_proj', 'gate_proj', 'o_proj'),
@@ -917,7 +907,7 @@ _MOE_STATE = ('e_score_correction_bias', 'media_bias', 'tid2eid')
 
 
 def _norm_names(sandwich: bool) -> dict[str, str]:
-    return _SANDWICH_NORMS if sandwich else _PRE_NORMS
+    return SANDWICH_NORMS if sandwich else _PRE_NORMS
 
 
 def dew_path(hf_name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
