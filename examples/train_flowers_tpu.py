@@ -33,16 +33,17 @@ from PIL import Image
 import dew
 from dew.artifacts import uint8_pixels
 from dew.config import MetricConfig, ModelConfig, ObjectiveConfig, OptimConfig, TrainerConfig
+from dew.config.diffusion import DiffusionRunConfig
 from dew.coordination import collective_host
 from dew.data import TFDS, Files, Loading, images, presets
 from dew.data.sources.codec import pack_dict_of_byte_arrays
 from dew.diffusion.presets import EDM
+from dew.inputs import TextCondition
 from dew.nn.backbones import SimpleDiT
-from dew.objectives.diffusion import DiffusionRunConfig, TextCondition
+from dew.optim import Cosine
 from dew.sampling import CFG
 from dew.sampling.solvers import Heun
 from dew.training import LocalTracker, MeshSpec, ProfileWindow, prepare_process
-from dew.training.optim import Cosine
 
 PROMPTS = ("a water lily", "a sunflower", "a red rose", "a purple orchid")
 
@@ -116,7 +117,7 @@ def smoke_config(config: Config, out: Path) -> DiffusionRunConfig:
         text=TextCondition(encoder="clip_text", checkpoint=config.clip_model),
         val_metrics=(MetricConfig("fid", {"weights": config.inception_weights}),
                      MetricConfig("clip_score", {"modelname": config.clip_model})),
-        optim=OptimConfig(learning_rate=1e-3),
+        optim=OptimConfig(rate=1e-3),
         trainer=TrainerConfig(checkpoint_dir=str(out / "checkpoints"), steps=3,
                               log_every=1, eval_every=3, checkpoint_every=3,
                               mesh=MeshSpec(fsdp=1), multi_host=False,
@@ -145,7 +146,7 @@ def slice_config(config: Config) -> DiffusionRunConfig:
         text=TextCondition(encoder="clip_text", checkpoint=config.clip_model),
         val_metrics=(MetricConfig("fid", {"weights": config.inception_weights}),
                      MetricConfig("clip_score", {"modelname": config.clip_model})),
-        optim=OptimConfig(weight_decay=0.01, schedule=Cosine(
+        optim=OptimConfig(weight_decay=0.01, rate=Cosine(
             peak=config.learning_rate, warmup_steps=2000, init=config.learning_rate,
             end=2e-4)),
         trainer=TrainerConfig(checkpoint_dir=str(config.out / "checkpoints"),

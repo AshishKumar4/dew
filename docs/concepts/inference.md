@@ -31,7 +31,7 @@ model = CausalTransformer(vocab_size=tokenizer.vocab_size,
                           emb_features=64, num_layers=2, num_heads=2, mlp_features=256,
                           max_seq_len=128)
 objective = LMObjective(model, seq_len=64)
-state = Trainer(objective, OptimConfig(learning_rate=3e-3), key=jax.random.key(0)).fit(
+state = Trainer(objective, OptimConfig(rate=3e-3), key=jax.random.key(0)).fit(
     data, steps=150, log_every=150)
 
 task = objective.pipeline(state, processor=RunProcessor(tokenizer))
@@ -142,7 +142,7 @@ from dew.sampling import TextToImage
 from dew.quantization import Quantization
 
 pipe = TextToImage.from_pretrained("dewml/hybrid-dit-176m", dtype=jnp.bfloat16,
-                                   revision="9ae074a357738c1634971627608fce3bd7fa3167")
+                                   revision="8d891d967319e51cd0e73d3e5b7c29d68a238b52")
 served = pipe.quantized(Quantization(dtype="int8", patterns=("^(?!.*spatial_fusion).*",)))
 images = served(["a red fox in a snowy forest"], steps=20, key=0).host().images
 ```

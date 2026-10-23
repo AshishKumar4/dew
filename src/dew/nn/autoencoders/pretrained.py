@@ -16,6 +16,7 @@ from jax.typing import DTypeLike
 
 from dew.interop.components import bind_component
 from dew.objectives.base import Variables
+from dew.registry import DtypeName
 
 from . import dc_ae, flux2, qwen_image, rae, wan
 from .api import AutoEncoder, LatentNormalization, published_source
@@ -187,3 +188,29 @@ def load_autoencoder(modelname: str, *, revision: str = "bf16", dtype: DTypeLike
     record = dict(autoencoder.normalization.record)
     record.update(latent_shift=shift, latent_scale=scale)
     return autoencoder.with_normalization(LatentNormalization(record, shift, scale))
+
+
+@dataclasses.dataclass(frozen=True)
+class PretrainedAutoencoder:
+    """A published autoencoder for latent diffusion.
+
+    It is the class the checkpoint's config names, one of
+    `dew.nn.autoencoders.pretrained.LOADERS`, or a Stable Diffusion
+    AutoencoderKL (`dew.nn.autoencoders.pretrained.load_autoencoder`).
+    """
+
+    modelname: str = "pcuenq/sd-vae-ft-mse-flax"
+    revision: str = "bf16"
+    dtype: DtypeName = "bfloat16"
+    latent_shift: float | None = None
+    latent_scale: float | None = None
+    """Per-dataset latent statistics; None keeps the checkpoint's."""
+
+    def build(self, *, params: Variables | None = None) -> AutoEncoder:
+        """Build the autoencoder from its config over supplied params."""
+        return load_autoencoder(self.modelname, revision=self.revision, dtype=jnp.dtype(self.dtype),
+                                latent_shift=self.latent_shift, latent_scale=self.latent_scale,
+                                params=params)
+
+
+__all__ = ["PretrainedAutoencoder"]
