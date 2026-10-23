@@ -8,7 +8,9 @@ Qwen3.5's template with thinking off writes the release's rows exactly
 import json
 from pathlib import Path
 
+import numpy as np
 import pytest
+from PIL import Image
 
 from dew.data.text import ByteTokenizer, HFTokenizer
 from dew.decision import Choice, JointLayout, Noul
@@ -81,24 +83,27 @@ def test_a_tokenizer_without_a_template_frames_a_row_as_plain_text():
     assert Framing(template=False).around(templated) == (before, after)
 
 
-@pytest.mark.parametrize(("name", "written"), [("qwen3.5", "<|vision_start|><|image_pad|><|vision_end|>"),
-                                               ("llama4", "<|image|>")])
-def test_an_image_stands_as_its_processors_own_image_part(name, written):
+@pytest.mark.parametrize("name", sorted(LOCAL))
+def test_an_image_stands_as_its_processors_own_image_part(name):
     """A row's image is the text its processor's own chat template writes for an image part, which
-    the processor expands to the image's tokens: Qwen-VL's vision span, Llama 4's image token."""
+    holds the processor's own image token, and which the processor expands to the image's tokens."""
     from transformers import AutoProcessor
 
     from dew.data.chat import image_text
 
     processor = AutoProcessor.from_pretrained(str(LOCAL[name]), local_files_only=True)
-    assert image_text(processor, where=name) == written
-
+    written = image_text(processor, where=name)
+    assert processor.image_token in written
+    picture = Image.fromarray(np.random.default_rng(0).integers(0, 256, (64, 64, 3), dtype=np.uint8))
+    expanded = processor(text=[written], images=[picture])
+    assert int((np.asarray(expanded["input_ids"]) == processor.image_token_id).sum()) > 1
 
 
 def test_a_framing_reads_a_chat_template_of_its_own_and_its_variables_and_its_record_reloads_them():
     """A framing's own Jinja chat template frames a row in place of the tokenizer's (a base model's,
     which has none, or a templated one's, overridden), its variables reach the template, and the
     layout's record carries both, so a run that reloads its layout frames its rows alike."""
+    from dew.data.chat import CONTENT
     from dew.registry import from_record, to_record
 
     template = ("{% for message in messages %}[{{ message.role }}{{ ' ' + mark if mark else '' }}]"
@@ -106,8 +111,10 @@ def test_a_framing_reads_a_chat_template_of_its_own_and_its_variables_and_its_re
     templated = HFTokenizer(str(LOCAL["qwen3.5"]), local_files_only=True)
     framing = Framing(chat_template=template, options={"mark": "x"})
     before, after = framing.around(templated)
-    assert before.startswith(f"[system x]{JOINT_SYSTEM}[user x]")
-    assert after.endswith(f"[reply]{JOINT_PREFILL}")
+    direct = templated.tokenizer.apply_chat_template(
+        [{"role": "system", "content": JOINT_SYSTEM}, {"role": "user", "content": CONTENT}],
+        chat_template=template, mark="x", tokenize=False, add_generation_prompt=True)
+    assert isinstance(direct, str) and before + CONTENT + after == direct + JOINT_PREFILL
     assert not any(markup in before + after for markup in CHATML)
     layout = JointLayout(framing=framing)
     reloaded = from_record(JointLayout, to_record(layout, JointLayout))
@@ -115,3 +122,23 @@ def test_a_framing_reads_a_chat_template_of_its_own_and_its_variables_and_its_re
     specials = Specials.of(templated)
     rows = [laid.rows(templated, specials, "one two", QUESTIONS) for laid in (reloaded, layout)]
     assert rows[0] == rows[1]
+
+
+
+def test_a_framing_refuses_what_it_would_otherwise_leave_unread():
+    """A template variable that names one of the template call's own controls, a framing's own
+    template over a tokenizer that renders none, and a framing's own template with templates off are
+    each refused, rather than overridden or left unread; a template's variables keep their order."""
+    with pytest.raises(ValueError):
+        Framing(options={"enable_thinking": True})
+    with pytest.raises(ValueError):
+        Framing(options={"chat_template": "{{ messages }}"})
+    with pytest.raises(ValueError):
+        Framing(chat_template="{{ messages }}", template=False)
+    with pytest.raises(ValueError):
+        Framing(chat_template="{{ messages }}").around(ByteTokenizer())
+    walked = ("{% for message in messages %}{{ message.content }}{% endfor %}"
+              "{% for key, value in labels.items() %}<{{ key }}>{% endfor %}")
+    templated = HFTokenizer(str(LOCAL["qwen3.5"]), local_files_only=True)
+    _, after = Framing(chat_template=walked, options={"labels": {"z": 1, "a": 2}}).around(templated)
+    assert after.startswith("<z><a>")
