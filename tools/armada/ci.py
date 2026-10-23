@@ -40,8 +40,9 @@ The test cache reuses a file's row when its inputs are unchanged since it ran gr
 green row records the checkout's Python files its tests executed
 (tools/armada/executed.py) and its key, a hash of those files, the
 directories under src/ that hold them, however deep (so a module added
-beside one, or an __init__.py on the way to one, changes it), the file itself and what every file shares (`shared`: the environment's
-locks, the CI tools, every non-Python file under tests/ and src/, the names
+beside one, or an __init__.py on the way to one, changes it), the file
+itself and what every file shares (`shared`: the environment's locks, the
+CI tools, every non-Python file under tests/ and src/, the names
 of the Python files under tests/ but the test modules, and src/'s entries).
 A test module, or a module in a package a file never imported, is no input
 of that file's: a train that loses a head reruns only the files the head's
