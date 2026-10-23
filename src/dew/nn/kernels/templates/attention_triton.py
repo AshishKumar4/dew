@@ -558,8 +558,7 @@ def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tu
     key_index = index_ref[...]
     peak0, shares = peak, (total, initial_ref[...])
     shift = shift_ref[...]
-    before, state_total, state_share = algebra.off_anchor_start(peak, total, shares[1], maximum,
-                                                                value_ref.shape[-1], shift)
+    before, state_total = algebra.off_anchor_start(peak, total, maximum, value_ref.shape[-1], shift)
     if split:
         # The forward took the first pass (`algebra.split_accumulate`).
         others_ref, own_ref, others_total_ref, forward_total_ref = split_refs
@@ -571,7 +570,7 @@ def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tu
         state = jax.lax.fori_loop(bounds_ref[0], bounds_ref[1], row_terms, before)
         prior = algebra.power2(state.total, shift)
         anchor, delta, key_index = algebra.off_anchor_delta(state, anchor_value_ref[...], dout, state_total,
-                                                            state_share, key_index, shift)
+                                                            shares[1], key_index, shift)
     peak = maximum
     index_out_ref[...] = key_index
     summed = tuple(kind in (Kind.HEAD, Kind.QUERY) for kind in score_kinds)
