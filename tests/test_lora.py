@@ -46,8 +46,8 @@ from dew.nn.sharding import ADAPTER_RANK, declarations, declared_axes, parameter
 from dew.objectives.base import FROZEN, Step, merge, thaw
 from dew.objectives.diffusion import DiffusionObjective
 from dew.objectives.lm import LMObjective
+from dew.optim import OPTIMIZER_MAP, muon_weight_dimension_numbers
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer
-from dew.training.optim import OPTIMIZER_MAP, muon_weight_dimension_numbers
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "tests" / "fixtures" / "lora"
@@ -1132,9 +1132,9 @@ def _recipe_run(tmp_path, image_size, *args):
     TFDS image fixture, with `args` ending in the run's LoRA flags
     (`--lora.rank`, `--lora.modules`) and no subcommand. Returns the parsed
     config and the trained state."""
+    from dew.config.diffusion import DiffusionRunConfig
     from dew.data import images as image_steps, presets
     from dew.data.sources.tfds import TFDS
-    from dew.objectives.diffusion import DiffusionRunConfig
 
     # Each image captioned from its row (`images.caption`), the condition the run's text tower reads.
     images = TFDS("dew_images", path=str(IMAGES), split="all").shuffle(seed=0).repeat().pipe(

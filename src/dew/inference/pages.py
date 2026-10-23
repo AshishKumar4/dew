@@ -9,8 +9,11 @@ share.
 Prefix caching follows vLLM's automatic prefix caching: a full page of
 prompt tokens is identified by a chained hash of every token up to its end,
 so two prompts share a page exactly when they agree on everything before
-and inside it. A request that starts with cached pages takes them into its
-table and prefills only the rest. Only full pages of prompt tokens are
+and inside it. A prompt whose keys depend on more than its tokens (the
+context a cross-attention decoder reads) names that as a salt, which seeds
+the chain, as vLLM's `cache_salt` seeds its first block's hash. A request
+that starts with cached pages takes them into its table and prefills only
+the rest. Only full pages of prompt tokens are
 shared; the page a prompt ends inside, and every page its draws fill, stay
 private to the row, so a shared page is never written again. A cached page
 is reclaimed, least recently released first, when the free list runs dry.
@@ -25,10 +28,10 @@ from collections.abc import Sequence
 import numpy as np
 
 
-def prefix_hashes(tokens: np.ndarray, page_size: int, pages: int) -> list[bytes]:
-    """The chained hash of each of the first `pages` full pages of `tokens`."""
+def prefix_hashes(tokens: np.ndarray, page_size: int, pages: int, salt: bytes = b"") -> list[bytes]:
+    """The chained hash of each of the first `pages` full pages of `tokens`, the chain seeded by `salt`."""
     hashes: list[bytes] = []
-    previous = b""
+    previous = salt
     for index in range(pages):
         block = np.ascontiguousarray(tokens[index * page_size:(index + 1) * page_size], np.int64)
         previous = hashlib.blake2b(previous + block.tobytes(), digest_size=16).digest()
@@ -56,30 +59,30 @@ class Pages:
         """Pages a new request can take: free ones and cached ones no row holds."""
         return len(self._free) + len(self._cached)
 
-    def shared(self, prompt: np.ndarray) -> list[int]:
-        """The cached pages that hold `prompt`'s leading full pages, in order.
+    def shared(self, prompt: np.ndarray, salt: bytes = b"") -> list[int]:
+        """The cached pages that hold `prompt`'s leading full pages under `salt`, in order.
 
         The last prompt token is never covered, since its logits score the
         first draw and have to be computed.
         """
         pages: list[int] = []
         if self.prefix_cache:
-            for digest in prefix_hashes(prompt, self.size, (len(prompt) - 1) // self.size):
+            for digest in prefix_hashes(prompt, self.size, (len(prompt) - 1) // self.size, salt):
                 page = self._by_hash.get(digest)
                 if page is None:
                     break
                 pages.append(page)
         return pages
 
-    def reserve(self, prompt: np.ndarray, total: int) -> tuple[list[int], int] | None:
-        """Pages for a row that will hold `total` tokens of which `prompt` comes first.
+    def reserve(self, prompt: np.ndarray, total: int, salt: bytes = b"") -> tuple[list[int], int] | None:
+        """Pages for a row that will hold `total` tokens of which `prompt`, under `salt`, comes first.
 
         Returns the row's pages and how many leading prompt tokens they
         already hold, or None when the pool cannot cover the row; then
         nothing changes.
         """
         needed = -(-total // self.size)
-        shared = self.shared(prompt)
+        shared = self.shared(prompt, salt)
         reclaimable = len(self._free) + sum(page not in shared for page in self._cached)
         if needed - len(shared) > reclaimable:
             return None
@@ -87,11 +90,11 @@ class Pages:
             self._hold(page)
         return shared + [self._take() for _ in range(needed - len(shared))], len(shared) * self.size
 
-    def publish(self, prompt: np.ndarray, pages: Sequence[int]) -> None:
-        """Name the row's full prompt pages by their prefix hash, once their keys are written."""
+    def publish(self, prompt: np.ndarray, pages: Sequence[int], salt: bytes = b"") -> None:
+        """Name the row's full prompt pages by their prefix hash under `salt`, once their keys are written."""
         if not self.prefix_cache:
             return
-        for digest, page in zip(prefix_hashes(prompt, self.size, len(prompt) // self.size), pages,
+        for digest, page in zip(prefix_hashes(prompt, self.size, len(prompt) // self.size, salt), pages,
                                 strict=False):
             if digest not in self._by_hash and page not in self._hash_of:
                 self._by_hash[digest] = page

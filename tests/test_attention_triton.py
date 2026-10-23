@@ -11,7 +11,12 @@ from test_attention_template import CASES, ROWS, SINKS, SOFTCAP, arguments, geom
 
 from dew.nn.attention import alibi_bias
 from dew.nn.kernels import tuning
-from dew.nn.kernels.templates import attention as template, attention_algebra as algebra, attention_triton
+from dew.nn.kernels.templates import (
+    attention as template,
+    attention_algebra as algebra,
+    attention_portable,
+    attention_triton,
+)
 
 ON_GPU = jax.default_backend() == "gpu"
 SEEDS = 8
@@ -92,9 +97,10 @@ def gate_of(queries: int, value_width: int) -> jax.Array:
 
 
 def check(case: dict, names: frozenset, dtype, config: attention_triton.Tiles, *, residuals: bool = False,
-          width: int = 32, value_width: int = 32, natural: bool = template.NATURAL):
-    """`attention_triton.forward` pinned at `config` on par with `template.reference` over `case`'s keys and
-    the hooks `names`, at the site's declared seeds, its exponent `natural` or the fold."""
+          width: int = 32, value_width: int = 32, natural: bool = template.NATURAL, mainloop: str = "triton"):
+    """`attention_triton.forward` pinned at `config` (or with `mainloop` "portable" the plain-JAX mainloop's
+    `attend` at its tiles) on par with `template.reference` over `case`'s keys and the hooks `names`, at the
+    site's declared seeds, its exponent `natural` or the fold."""
     queries, keys = geometry(case)
     spans = template.spans(queries, keys, ROWS, **arguments(case))
     hooks = hooks_for(names, queries, value_width, gate_of(queries, value_width))
@@ -106,9 +112,14 @@ def check(case: dict, names: frozenset, dtype, config: attention_triton.Tiles, *
                            score_mod=hooks.score_mod, natural=natural, initial=hooks.initial is not None)
 
     def ours(query, key, value):
-        with pin:
-            out = attention_triton.forward(query, key, value, spans, hooks, residuals=residuals,
-                                           natural=natural, interpret=not ON_GPU)
+        if mainloop == "portable":
+            out = attention_portable.attend(query, key, value, spans, hooks, block_q=config.block_q,
+                                            block_k=config.block_k, pad=attention_triton.BLOCK,
+                                            residuals=residuals, natural=natural)
+        else:
+            with pin:
+                out = attention_triton.forward(query, key, value, spans, hooks, residuals=residuals,
+                                               natural=natural, interpret=not ON_GPU)
         # The maxima and denominators the reference keeps too; the anchor keys only the backward reads,
         # held to its gradients (`check_backward`).
         if not residuals:
@@ -119,7 +130,7 @@ def check(case: dict, names: frozenset, dtype, config: attention_triton.Tiles, *
         return template.reference(query, key, value, spans, hooks, residuals=residuals)
 
     assert_as_exact(jax.jit(ours), jax.jit(xla), drawing(queries, keys, dtype, width, value_width),
-                    f"triton forward {case} {sorted(names)} {jnp.dtype(dtype).name} {config} "
+                    f"{mainloop} forward {case} {sorted(names)} {jnp.dtype(dtype).name} {config} "
                     f"natural {natural}",
                     seeds=ALL_HOOKS_SEEDS if names == HOOKS["all"] else SEEDS)
 
@@ -288,9 +299,10 @@ def joint(config: attention_triton.Tiles, dkv_config: attention_triton.Tiles | N
 
 def check_backward(case: dict, names: tuple, dtype, config, dkv_config=None, *, width: int = 32,
                    value_width: int = 32, natural: bool = template.NATURAL,
-                   accurate: bool = template.ACCURATE):
+                   accurate: bool = template.ACCURATE, mainloop: str = "triton"):
     """`attention_triton.backward` with its dQ launch at `config` and its dK/dV launch at `dkv_config`
-    (`config` too by default; its tiles are always the dQ launch's), its every gradient (queries, keys,
+    (`config` too by default; its tiles are always the dQ launch's), or with `mainloop` "portable" the
+    plain-JAX mainloop's `backward` at `config`'s tiles, its every gradient (queries, keys,
     values, each score parameter, the initial state's) on par with `jax.vjp` of the template's XLA
     arithmetic, from float64: the hooks' parameters and initial state are drawn with the operands, so
     their gradients' truth is float64 too; its exponent `natural` or the fold, and its backward `accurate`
@@ -312,9 +324,15 @@ def check_backward(case: dict, names: tuple, dtype, config, dkv_config=None, *, 
     pins = tuning.pinned({attention_triton.TritonBackward: joint(config, dkv_config)})
 
     def ours(query, key, value, dout, params, initial):
-        with pins:
-            grads = attention_triton.backward(query, key, value, spans, hooked(params, initial), dout,
-                                              natural=natural, accurate=accurate, interpret=not ON_GPU)
+        if mainloop == "portable":
+            grads = attention_portable.backward(query, key, value, spans, hooked(params, initial), dout,
+                                                block_q=config.block_q, block_k=config.block_k,
+                                                pad=attention_triton.BLOCK, natural=natural,
+                                                accurate=accurate)
+        else:
+            with pins:
+                grads = attention_triton.backward(query, key, value, spans, hooked(params, initial), dout,
+                                                  natural=natural, accurate=accurate, interpret=not ON_GPU)
         return grads.query, grads.key, grads.value, grads.score_params, grads.initial
 
     def xla(query, key, value, dout, params, initial):
@@ -325,7 +343,7 @@ def check_backward(case: dict, names: tuple, dtype, config, dkv_config=None, *, 
         return pull(dout.astype(query.dtype))
 
     assert_as_exact(jax.jit(ours), jax.jit(xla), draw,
-                    f"triton backward {case} {names} {jnp.dtype(dtype).name} {config} {dkv_config} "
+                    f"{mainloop} backward {case} {names} {jnp.dtype(dtype).name} {config} {dkv_config} "
                     f"{width}/{value_width} natural {natural} accurate {accurate}",
                     seeds=BACKWARD_SEEDS.get((names, jnp.dtype(dtype).name), SEEDS))
 

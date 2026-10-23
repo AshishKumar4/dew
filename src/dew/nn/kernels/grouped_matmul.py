@@ -3,13 +3,15 @@ differentiates (`dew.nn.moe.expert_projection` through it), and XLA's portable p
 
 Three products, in MaxText's megablox shape: the forward `gmm`, the input gradient `gmm` against the
 transposed kernel, and the kernel gradient `tgmm`. Each is a template launch (`templates.base`) with
-two implementations, chosen per call by the cost model (`templates.cost`) among those that run it:
+its implementations chosen per call by the cost model (`templates.cost`) among those that run it:
 JAX's Pallas Triton kernels (`ragged_dot.py`, vendored), on every CUDA GPU from sm80 and on a CPU that
-interprets them, and Dew's Pallas Mosaic GPU kernels for Hopper (`templates.gemm.mosaic_gpu`), whose
-warpgroup MMA Triton's lowering does not reach. `ragged_dot_refusal` says which products they compute
-exactly. They run only for a CUDA lowering, chosen where the call lowers
-(`jax.lax.platform_dependent`), so a CPU computation on a GPU host lowers to `jax.lax.ragged_dot`; an
-explicit request interprets them on the CPU, as the CPU suite checks them.
+interprets them; Dew's Pallas Mosaic GPU kernels for Hopper (`templates.gemm.mosaic_gpu`), whose
+warpgroup MMA Triton's lowering does not reach; and CUTLASS's grouped GEMMs (`kernels/cutlass`, the
+dew-cutlass wheel) where it is installed, a vendored kernel ranked by its measured rows until the
+template's beat it. `ragged_dot_refusal` says which products they compute exactly. They run only for
+a CUDA lowering, chosen where the call lowers (`jax.lax.platform_dependent`), so a CPU computation on a
+GPU host lowers to `jax.lax.ragged_dot`; an explicit request interprets them on the CPU, as the CPU
+suite checks them.
 
 Each launch's config is its cost model's fastest that fits the GPU, the same on every run; a tuning
 run measures its space (`tuning.tune`). JAX's one tile for every shape left a wide expert's products
@@ -20,6 +22,8 @@ tile's, the kernel gradient 18.3 against 8.4).
 import abc
 import dataclasses
 import functools
+import importlib
+import importlib.util
 import itertools
 import math
 from collections.abc import Hashable
@@ -42,7 +46,7 @@ from jax.extend import core as jax_core
 
 from ..precision import rounded_operand
 from . import generation
-from .templates import base, cost, hopper
+from .templates import base, cost, mosaic
 from .templates.gemm import mosaic_gpu, mosaic_tpu
 from .templates.product import declared
 
@@ -642,7 +646,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
             ba.arguments['prologue_operands'], hooks.prologue_axes, extents)
         epilogue = _side_tile_bytes(ba.arguments.get('epilogue_operands', ()), hooks.epilogue_axes, extents)
         # One warpgroup stages each output in turn; two hold every output's staging buffer at once, and
-        # each consumer its own copy of an epilogue side tile without rows (`hopper.staging`; a
+        # each consumer its own copy of an epilogue side tile without rows (`mosaic.staging`; a
         # prologue side's per-consumer copies are within the stages' count of it).
         staged_outs = sum(outs) if config.warpgroups == 2 else max(outs)
         if config.warpgroups == 2:
@@ -771,7 +775,7 @@ class MosaicTgmm(_Mosaic):
         # `emit_pipeline_warp_specialized`: 232).
         return tuple(tile for tile in fits
                      if 2 * tile.block_m * tile.block_n // (128 * tile.warpgroups)
-                     < (hopper.CONSUMER_REGISTERS if tile.warpgroups == 2 else cost.THREAD_REGISTERS))
+                     < (mosaic.CONSUMER_REGISTERS if tile.warpgroups == 2 else cost.THREAD_REGISTERS))
 
     @staticmethod
     def extents(tile: mosaic_gpu.Tiles) -> dict:
@@ -805,6 +809,115 @@ class MosaicTgmm(_Mosaic):
                                prologue_operands=prologue_operands, prologue_axes=hooks.prologue_axes,
                                exact_sums=exact_sums), None
 
+
+@functools.cache
+def cutlass_architectures() -> tuple[str, ...]:
+    """The GPU generations the installed dew_cutlass holds code for, or none where it is not installed."""
+    if importlib.util.find_spec('dew_cutlass') is None:
+        return ()
+    return importlib.import_module('dew_cutlass').ARCHITECTURES
+
+
+@functools.cache
+def _cutlass_registered() -> None:
+    """dew_cutlass's FFI targets, registered with jax once, at the first launch that runs one."""
+    for target, capsule in importlib.import_module('dew_cutlass').targets().items():
+        jax.ffi.register_ffi_target(target, capsule, platform="CUDA")
+
+
+class _Cutlass(_GroupedLaunch[mosaic_gpu.Tiles]):
+    """CUTLASS's grouped GEMMs (`kernels/cutlass`, the dew-cutlass wheel) as XLA FFI calls: on Hopper,
+    CUTLASS 3's pointer-array cooperative kernel, a 128 x 256 x 64 tile on a pair of multiprocessors, its
+    stages the shared memory its epilogue leaves, bf16 operands and bf16 or fp32 out, each group's shape
+    set up on the device. A vendored kernel the chooser ranks beside the template's launches until they
+    beat it. The model has no terms of its own for it: it costs as the Mosaic tile of its geometry
+    (`TILE`, the same TMA-fed warpgroup MMAs, producer and two consumers), scaled by its measured rows
+    (`MEASURED`), so it is a candidate only on a generation whose rows were measured."""
+    name: ClassVar[str] = 'cutlass'
+    config_cls: ClassVar[type[mosaic_gpu.Tiles]] = mosaic_gpu.Tiles
+    TILE: ClassVar[mosaic_gpu.Tiles]
+    COSTED_AS: ClassVar[_Mosaic]
+    MEASURED: ClassVar[dict[tuple[str, bool], float]]
+    """By generation and whether the call is dense (one group, which the template's launch runs without a
+    group's bookkeeping and CUTLASS's does not), the geometric mean over the scoreboard's rows of the
+    launch's measured seconds over the model's at `TILE`, as a share of the same ratio of the template's
+    Mosaic launch at its own pick: its time on the scale of the model's estimates of the template's
+    launches."""
+
+    def eligible(self, ba, target) -> bool:
+        operands = [value for name, value in ba.arguments.items()
+                    if name in ('tokens', 'kernel', 'cotangent')]
+        # 16-byte aligned rows of every operand and output, as its TMA copies and each group's pointers
+        # need: every extent a multiple of 8 elements.
+        extents = {extent for operand in operands for extent in operand.shape[1:]}
+        built = generation.effective(target).generation
+        return ((built, bool(ba.arguments.get('dense'))) in self.MEASURED and built in cutlass_architectures()
+                and all(operand.dtype == jnp.bfloat16 for operand in operands)
+                and jnp.dtype(ba.arguments['out_dtype']) in (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float32))
+                and ba.arguments['sizes'].dtype == jnp.int32 and all(extent % 8 == 0 for extent in extents)
+                and ba.arguments['hooks'] == NO_HOOKS and not ba.arguments.get('exact_sums')
+                and not ba.arguments['interpret'])
+
+    def space(self, ba) -> tuple[mosaic_gpu.Tiles, ...]:
+        return (self.TILE,)
+
+    def fitting(self, ba, target) -> tuple[mosaic_gpu.Tiles, ...]:
+        # CUTLASS's builder fits the stages to the shared memory (`StageCountAutoCarveout`).
+        return self.space(ba)
+
+    def costed(self, ba, config: mosaic_gpu.Tiles, target) -> cost.Cost:
+        return self.COSTED_AS.costed(ba, config, target)
+
+    def cost(self, ba, config: mosaic_gpu.Tiles, target) -> float:
+        measured = self.MEASURED[generation.effective(target).generation, bool(ba.arguments.get('dense'))]
+        return super().cost(ba, config, target) * measured
+
+
+@dataclasses.dataclass(frozen=True)
+class CutlassGmm(_Cutlass):
+    """`Gmm` through CUTLASS (`dew_cutlass_grouped_gemm`)."""
+
+    ROWS: ClassVar[tuple[str, ...]] = ('tokens',)
+    TILE: ClassVar[mosaic_gpu.Tiles] = mosaic_gpu.Tiles(128, 256, 64, 4, 8, warpgroups=2, cluster=2)
+    COSTED_AS: ClassVar[_Mosaic] = MosaicGmm()
+    # ROUTE-2 on an H100: the scoreboard's 14 grouped and 4 dense rows of the forward and input gradient.
+    MEASURED: ClassVar[dict[tuple[str, bool], float]] = {('sm90', False): 0.71, ('sm90', True): 1.06}
+
+    def _fwd(self, tokens: jax.Array, kernel: jax.Array, sizes: jax.Array,
+             prologue_operands: tuple = (), epilogue_operands: tuple = (), *, out_dtype: str,
+             trans_rhs: bool, interpret: bool, hooks: Hooks = NO_HOOKS, exact_sums: bool = False,
+             dense: bool = False, config: mosaic_gpu.Tiles, return_residuals: bool = False):
+        # No hooks, side operands or exact sums: the launch is not eligible for them; a dense call is one
+        # group, as any.
+        del prologue_operands, epilogue_operands, interpret, hooks, exact_sums, dense, config
+        _cutlass_registered()
+        width = kernel.shape[1] if trans_rhs else kernel.shape[2]
+        out = jax.ShapeDtypeStruct((tokens.shape[0], width), jnp.dtype(out_dtype))
+        return jax.ffi.ffi_call('dew_cutlass_grouped_gemm', out)(tokens, kernel, sizes,
+                                                                 transpose_w=trans_rhs), None
+
+
+@dataclasses.dataclass(frozen=True)
+class CutlassTgmm(_Cutlass):
+    """`Tgmm` through CUTLASS (`dew_cutlass_grouped_gemm_k`): each group's gradient a GEMM over its rows,
+    an empty group's zero. Its pair splits the gradient's rows, which the Mosaic tile Tgmm costs as, of
+    no pair, does not model."""
+
+    ROWS: ClassVar[tuple[str, ...]] = ('tokens', 'cotangent')
+    TILE: ClassVar[mosaic_gpu.Tiles] = mosaic_gpu.Tiles(128, 256, 64, 4, 8, warpgroups=2)
+    COSTED_AS: ClassVar[_Mosaic] = MosaicTgmm()
+    # ROUTE-2 on an H100: the scoreboard's 13 grouped and 4 dense rows of the kernel gradient, bf16 and fp32.
+    MEASURED: ClassVar[dict[tuple[str, bool], float]] = {('sm90', False): 0.84, ('sm90', True): 0.85}
+
+    def _fwd(self, tokens: jax.Array, cotangent: jax.Array, sizes: jax.Array,
+             prologue_operands: tuple = (), *, out_dtype: str, interpret: bool, hooks: Hooks = NO_HOOKS,
+             exact_sums: bool = False, dense: bool = False, config: mosaic_gpu.Tiles,
+             return_residuals: bool = False):
+        del prologue_operands, interpret, hooks, exact_sums, dense, config  # as `CutlassGmm._fwd`'s
+        _cutlass_registered()
+        out = jax.ShapeDtypeStruct((sizes.shape[0], tokens.shape[1], cotangent.shape[1]),
+                                   jnp.dtype(out_dtype))
+        return jax.ffi.ffi_call('dew_cutlass_grouped_gemm_k', out)(tokens, cotangent, sizes), None
 
 
 class _MosaicTpu(_GroupedLaunch[mosaic_tpu.Blocks]):
@@ -1065,8 +1178,8 @@ def kernel_refusal(compute: Dtype, promoted: bool = False) -> str | None:
     return None
 
 
-_GMMS = (MosaicGmm(), MosaicTpuGmm(), Gmm())
-_TGMMS = (MosaicTgmm(), MosaicTpuTgmm(), Tgmm())
+_GMMS = (MosaicGmm(), CutlassGmm(), MosaicTpuGmm(), Gmm())
+_TGMMS = (MosaicTgmm(), CutlassTgmm(), MosaicTpuTgmm(), Tgmm())
 
 
 def launched_gmm(tokens, kernel, sizes, prologue_operands: tuple = (), epilogue_operands: tuple = (), *,
