@@ -12,7 +12,7 @@ import jax.numpy as jnp
 
 from dew.artifacts import ImageGrid
 
-from .common import ImageMetric, paired
+from .common import PairedImageMetric
 from .psnr import frame_batch
 
 # Standard SSIM constants for the 11x11/sigma-1.5 gaussian window
@@ -113,7 +113,7 @@ def structural_similarity(
     return scores if per_example else jnp.mean(scores)
 
 
-class SSIM(ImageMetric):
+class SSIM(PairedImageMetric):
     """Measures the mean SSIM between the sampled frames and the batch's; higher is better.
 
     It uses the same [-1, 1] scale as `PSNR`. `reads` names the artifact type
@@ -121,8 +121,4 @@ class SSIM(ImageMetric):
     """
 
     def __init__(self, data_range: float = 2.0, field: str = "image", reads: type = ImageGrid):
-        def measure(artifact, batch):
-            samples, targets = paired(artifact, batch, field)
-            return structural_similarity(samples, targets, data_range, per_example=True)
-
-        super().__init__(name="ssim", measure=measure, reads=reads)
+        super().__init__("ssim", structural_similarity, data_range, field, reads)
