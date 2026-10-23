@@ -1612,3 +1612,17 @@ def test_a_mesh_without_stages_takes_its_one_microbatch_asked_for():
     named, planned = fit(microbatches=1), fit()
     for left, right in zip(jax.tree.leaves(named.variables), jax.tree.leaves(planned.variables), strict=True):
         np.testing.assert_array_equal(np.asarray(left), np.asarray(right))
+
+
+def test_a_state_built_from_a_held_tree_steps_without_freeing_the_tree():
+    """A state the trainer builds eagerly from the objective's held tree (`Trainer.initial_state`),
+    stepped on one device, whose step takes its arguments' shardings and donates them: the objective's
+    held arrays stay alive, since the state holds buffers of its own, as a placed state does
+    (`distributed.placed_held`)."""
+    trainer, objective, _ = held_lm_trainer()
+    trainer.device_mesh = MeshSpec().build(jax.devices()[:1])
+    state = trainer.initial_state()
+    batch = {"text": jnp.arange(1, 6, dtype=jnp.int32)[None]}
+    stepped, *_ = trainer.compile(state, batch)(state, batch)
+    jax.block_until_ready(stepped)
+    assert not any(leaf.is_deleted() for leaf in jax.tree.leaves(objective.variables))
