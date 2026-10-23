@@ -24,7 +24,7 @@ from dew.nn.dense import Dense
 from dew.records import JSON
 
 from .activations import gelu_exact_torch, gelu_tanh
-from .attention import LayerNorm, NormalAttention
+from .attention import LayerNorm, NormalAttention, QKNorm
 from .blocks import FourierEmbedding, TimeProjection, modulation
 from .conv import Conv
 from .flops import MissingFlopsCount, counted_flops, projection_flops, real_lengths
@@ -635,7 +635,7 @@ class ModulatedBlock(nn.Module):
                 precision=self.precision,
                 use_bias=True,
                 qkv_bias=self.qkv_bias,
-                qk_norm=self.qk_norm,
+                qk_norm=QKNorm() if self.qk_norm else None,
                 attention_impl=self.attention_impl,
                 force_fp32_for_softmax=self.force_fp32_for_softmax,
             )
