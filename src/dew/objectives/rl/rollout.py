@@ -10,6 +10,7 @@ import jax.numpy as jnp
 import numpy as np
 
 from dew.coordination import agreed
+from dew.data.dataset import DataPartition
 from dew.data.prompts import INFO_KEY, LENGTH_KEY, PROMPT_KEY, SOURCE_KEY, TRUTH_KEY, PromptRecord
 from dew.inference.rollouts import Draw, InfrastructureError, response
 from dew.nn.inputs import ModelInputs, local_rows, mesh_of, pad_token_rows
@@ -142,14 +143,15 @@ class PolicyCollector:
         return prompts, width, ModelInputs(jnp.asarray(rows), {name: jnp.asarray(value)
                                                                for name, value in fields.items()})
 
-    def collect(self, snapshot: Snapshot, tasks: Sequence[Task], samples: int, *,
-                scored: bool = True) -> list[list[Session]]:
+    def collect(self, snapshot: Snapshot, tasks: Sequence[Task], samples: int) -> list[list[Session]]:
         # Every process of the mesh validates its prompts before generation enters its collectives.
-        prompts, width, inputs = (self._prepared(tasks) if mesh_of(snapshot.variables) is None
+        mesh = mesh_of(snapshot.variables)
+        prompts, width, inputs = (self._prepared(tasks) if mesh is None
                                   else agreed("rollout input preparation", lambda: self._prepared(tasks)))
         generated = self.objective.policy(snapshot.variables, self.sampling)(
             inputs, self.max_new_tokens, key=snapshot.key, n=samples).host()
-        if not scored:
+        if mesh is not None and DataPartition.of(mesh).reader != 0:
+            # A share's later reader drew its part of the program; the first reader scores the share.
             return []
 
         def grouped(values: np.ndarray) -> np.ndarray:

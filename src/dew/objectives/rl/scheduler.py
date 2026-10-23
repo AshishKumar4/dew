@@ -305,14 +305,13 @@ class Synchronous:
         """Every process: the draw is one program every process of the mesh enters."""
         return True
 
-    def open(self, entry: _Entry, samples: int, snapshot: Snapshot, *, scored: bool) -> None:
-        """Collect the entry's groups. A share's later reader (`scored` False) enters the draw, one
-        program for the share, but neither scores nor keeps it: the first reader's rows replace its
-        own (`first_reader_batch`), so a reward runs once a share and its replicas train alike."""
+    def open(self, entry: _Entry, samples: int, snapshot: Snapshot) -> None:
+        """Collect the entry's groups. A share's later reader enters the draw, one program for the
+        share, and its collector returns nothing past it (`sessions.Collector`)."""
         # Every session was submitted when the collection began.
         began = time.perf_counter()
-        collected = self.collector.collect(snapshot, entry.tasks, samples, scored=scored)
-        if not scored:
+        collected = self.collector.collect(snapshot, entry.tasks, samples)
+        if not collected:
             return
         for row, (task, sessions) in enumerate(zip(entry.tasks, collected, strict=True)):
             if len(sessions) != samples:
@@ -444,10 +443,9 @@ class Asynchronous:
         """The share's first reader: independent draws would hand its readers different rows."""
         return partition.reader == 0
 
-    def open(self, entry: _Entry, samples: int, snapshot: Snapshot, *, scored: bool) -> None:
+    def open(self, entry: _Entry, samples: int, snapshot: Snapshot) -> None:
         """Submit the entry's groups, unless an earlier call opened them; the snapshot's weights
-        reach the engines through `begin`. Only a share's first reader opens (`acquires`), so every
-        submission is `scored`."""
+        reach the engines through `begin`."""
         if entry.groups:
             return
         for row, task in enumerate(entry.tasks):
@@ -735,10 +733,9 @@ class RolloutScheduler:
         what the first does and admits nothing: it trains on the first reader's rows."""
         # The wait counts a synchronous collection, which opening its entry runs.
         began = time.perf_counter()
-        first = partition.reader == 0
         for pending in entries:
-            self.acquisition.open(pending, self.groups + self.oversample, snapshot, scored=first)
-        if not first:
+            self.acquisition.open(pending, self.groups + self.oversample, snapshot)
+        if partition.reader != 0:
             return [], [], 0, _Tally(), time.perf_counter() - began
         tally = _Tally()
         admitted = self._admit(entries[0], snapshot.updates, tally)
