@@ -1,6 +1,6 @@
 """Dew's rounding error held to the reference's own, both measured from float64.
 
-The gate the suite converts to holds every element over orders (bible §7): a comparison drawn over
+The gate the suite converts to holds every element over orders: a comparison drawn over
 exact symmetries of its computation (`assert_leaves_as_exact_over_orders`), each element against the
 worst admitted member of the reference's ensemble (`assert_elements_as_exact`), and a kernel held where
 it rounds, as a graph of the values it rounds and holds (`assert_graph_as_exact`). The one-draw rules
@@ -366,7 +366,7 @@ def assert_as_exact_as_the_reference(dew, reference, truth, label: str, *, terms
 
 
 PARITY = 1.5
-"""The owner's factor (bible §7): each leaf's RMS error from float64 within 1.5 times the
+"""The gate's on-par factor: each leaf's RMS error from float64 within 1.5 times the
 reference's, on the same inputs, with no floor of any kind. Check 1 (`assert_as_exact`) holds it now;
 the one-draw rule's FACTOR joins it once every site that rule would then fail has moved to check 1."""
 
@@ -561,11 +561,14 @@ def leaf_summary(reference, truth) -> RecordedLeaf:
                         zero_sizes=own[~sized])
 
 
-def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=None) -> _Draws:
+def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=None, orbit=None) -> _Draws:
     """Every leaf's errors (`_Draws`) over `seeds`: both functions run on `draw(seed)`'s inputs, truth
     `truth_fn` on them (by default `reference_fn` on them widened to float64). With `reference_seeds`,
     the reference runs on those draws instead, each held to its own draw's truth (`null_runs`), and a
-    row of float64 zero is paired only where the two truths are the same values (an orbit's draws)."""
+    row of float64 zero is paired only where the two truths are the same values (an orbit's draws).
+    With `orbit`, each arm also runs on every other order of its own draw (`orbit(inputs)` past its
+    first, the draw itself), held to that draw's one truth, and its worst row is its worst over them
+    all, every value finite at every order; the rest is the draw's own order's."""
     mine, theirs, worst, zero_rows, finite, names = [], [], [], [], [], None
 
     def truth_of(inputs):
@@ -602,6 +605,9 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
             paired = (recorded or their_truth is truth
                       or np.array_equal(np.asarray(true), np.asarray(their_true)))
             row.append(_paired(jax.tree_util.keystr(path), leaf_summary(leaf, true), their, paired=paired))
+        if orbit is not None:
+            row = _over_orders(row, dew_fn, reference_fn, orbit, inputs,
+                               inputs if reference_seeds is None else their_inputs, truth, their_truth)
         mine.append([entry[0] for entry in row])
         theirs.append([entry[1] for entry in row])
         worst.append([(entry[2], entry[3]) for entry in row])
@@ -609,6 +615,35 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
         finite.append([entry[5] for entry in row])
     return _Draws(names, np.asarray(mine), np.asarray(theirs), np.asarray(worst).reshape(len(mine), -1, 2),
                   np.asarray(zero_rows), np.asarray(finite))
+
+
+def _over_orders(row, dew_fn, reference_fn, orbit, inputs, their_inputs, truth, their_truth) -> list:
+    """`row`, one draw's `_paired` evidence a leaf, with each arm's worst row over every order of its draw
+    (`orbit`, its first order the draw itself), each order held to the draw's one truth, and each arm's
+    values finite at every order: Dew's orders are its draw's and the reference's its own. An orbit is an
+    exact symmetry of the result, the same values in exact arithmetic at every order (a batch's rows
+    taken in another order under a mean, a sum's terms in another), so its float64 truth is the draw's;
+    only the order of the rounding moves, and with it which row rounds worst. Both arms run over the same
+    orders, so neither's worst row has more chances than the other's."""
+    orders, their_orders = orbit(inputs), orbit(their_inputs)
+    if len(orders) != len(their_orders) or len(orders) < 2:
+        raise ValueError(f"an orbit of {len(orders)} and {len(their_orders)} orders; an orbit holds the "
+                         f"draw's own first and at least one other")
+    widest = [list(entry) for entry in row]
+    for ordered, their_ordered in zip(orders[1:], their_orders[1:], strict=True):
+        dew, reference = dew_fn(*ordered), reference_fn(*their_ordered)
+        for index, (leaf, their_leaf, true, their_true) in enumerate(zip(
+                jax.tree.leaves(dew), jax.tree.leaves(reference), jax.tree.leaves(truth),
+                jax.tree.leaves(their_truth), strict=True)):
+            if isinstance(their_leaf, RecordedLeaf):
+                raise ValueError("a recorded reference runs on its recorded draws alone, never an orbit's")
+            if np.size(leaf) == 0:
+                continue
+            mine, theirs = leaf_summary(leaf, true), leaf_summary(their_leaf, their_true)
+            widest[index][2] = max(widest[index][2], mine.worst)
+            widest[index][3] = max(widest[index][3], theirs.worst)
+            widest[index][5] = widest[index][5] and mine.finite and theirs.finite
+    return [tuple(entry) for entry in widest]
 
 
 def _paired(name: str, mine: RecordedLeaf, theirs: RecordedLeaf, *, paired: bool = True) -> tuple:
@@ -727,8 +762,9 @@ def _logged(label: str, stage: int, verdict: str) -> None:
                                   "label": label, "stage": stage, "verdict": verdict}) + "\n")
 
 
-def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn=None) -> None:
-    """Check 1 of the owner's gate (bible §7): on par. Each leaf's RMS error from float64,
+def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn=None,
+                    orbit=None) -> None:
+    """Check 1 of the gate: on par. Each leaf's RMS error from float64,
     pooled over the site's declared seeds, within PARITY times the reference's, and its worst row over
     those seeds within ROW_FACTOR times the reference's worst; each row of float64 zero (below RESOLUTION
     of its leaf where a live reference does not measure it, `_paired`) no further from it than
@@ -741,6 +777,11 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
     the seed picks. `seeds` is the site's declared count, sized by `seeds_for` so the reference
     compared with itself resolves PARITY; jit the two functions so every seed reuses one compiled
     program.
+
+    Where a computation has an orbit of summation orders, `orbit(inputs)` returns a draw's inputs at
+    each order, the draw itself first (`_over_orders`): both arms run at every one, and each one's worst
+    row is its worst over them, compared alike, as one order's rounding is no measure of a row that
+    nearly cancels; the pooled ratio, the rows of float64 zero and the sizing stay the draw's own order's.
 
     A leaf passes when its pooled ratio (`_pooled`) is at most PARITY and its seeds resolve it: the
     ratio's bootstrap interval over them (tails LOWER_TAIL and UPPER_TAIL, widened to hold the ratio)
@@ -761,7 +802,8 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
         raise Inconclusive(f"{label}: {seeds} seeds cannot be judged; check 1 takes at least {FEWEST_SEEDS} "
                            f"(`seeds_for`)")
     over, unresolved, stage = _staged(
-        lambda start, stop: _drawn(dew_fn, reference_fn, draw, range(start, stop), truth_fn), seeds, label)
+        lambda start, stop: _drawn(dew_fn, reference_fn, draw, range(start, stop), truth_fn, orbit=orbit),
+        seeds, label)
     _logged(label, stage, "over" if over else "inconclusive" if unresolved else "pass")
     if over:
         raise AssertionError("\n".join(over + unresolved))
@@ -852,18 +894,19 @@ def recording(path) -> dict[str, np.ndarray]:
 
 
 def null_runs(reference_fn, draw, label: str, *, seeds: int, runs: int, first: int = 0,
-              truth_fn=None, two_stage: bool = True, dew_fn=None) -> list[tuple[str, int]]:
+              truth_fn=None, two_stage: bool = True, dew_fn=None, orbit=None) -> list[tuple[str, int]]:
     """Check 1 run `runs` times on an equally exact pair, the reference against itself on disjoint
     draws: each run's verdict, "pass", "over" or "inconclusive", and the stage it reached, a run judged
     as `assert_as_exact` judges a site (`_staged`: its declared `seeds`, its second stage, every leaf's
     ratio, interval and rows), or as the procedure before it with `two_stage` false. Run r of
     a call takes draws no other run of any call with the same `first` grid takes: seeds from
     (first + r)·2·(1 + REDRAW)·seeds on, the first half its "Dew"'s and the second its reference's, so
-    the runs are independent repetitions as far as `draw` makes its draws so. The bible-§10 null
-    control of a site's operation class (orders-through-check1.md): its false-red rate, every
+    the runs are independent repetitions as far as `draw` makes its draws so. The null
+    control of a site's operation class: its false-red rate, every
     nonpassing verdict counted, bounds the gate's own on that class. With `dew_fn` a fault of the
     reference (a dropped term, a wrong scale), the runs measure the procedure's power on that class,
-    both procedures on the same draws."""
+    both procedures on the same draws. With `orbit`, each arm's rows are judged over its own draws'
+    orders, as `assert_as_exact` judges a site that declares one."""
     verdicts = []
     span = (1 + REDRAW) * seeds
     for run in range(first, first + runs):
@@ -871,7 +914,8 @@ def null_runs(reference_fn, draw, label: str, *, seeds: int, runs: int, first: i
 
         def drawn(start, stop, base=base):
             return _drawn(dew_fn or reference_fn, reference_fn, draw, range(base + start, base + stop),
-                          truth_fn, reference_seeds=range(base + span + start, base + span + stop))
+                          truth_fn, reference_seeds=range(base + span + start, base + span + stop),
+                          orbit=orbit)
 
         over, unresolved, stage = _staged(drawn, seeds, label, two_stage=two_stage)
         verdicts.append(("over" if over else "inconclusive" if unresolved else "pass", stage))
@@ -1529,7 +1573,7 @@ def assert_elements_as_exact(batch, label: str, *, reference: str = REFERENCE, a
 
 
 def assert_graph_as_exact(dew, reference, truth, inputs, orbit, label: str) -> dict:
-    """A computation held where it rounds (bible §7's source-aware gate; tests/reference_graph.py).
+    """A computation held where it rounds (the gate's source-aware check; tests/reference_graph.py).
     `dew`, `reference` and `truth` are `Graph`s (src/dew/nn/kernels/graph.py) of one shape, `truth`
     the reference's in float64;
     `inputs` the case's inputs by name, and `orbit(order)` the case's exact symmetries:
@@ -1715,7 +1759,7 @@ def _batch(draw, stage: int, terms, rows: bool) -> tuple[object, dict, list, lis
 
 ADMISSION_MARGIN = 1.05
 """How much less exact than the reference, in RMS from float64 over a leaf, a member may be and still be
-admitted (`admitted_members`): 5%, the owner's (bible §7). With no margin an equally exact member is
+admitted (`admitted_members`): 5%. With no margin an equally exact member is
 admitted about half the time, by its orders' luck alone."""
 
 ADMISSION_CONFIDENCE = 0.99
