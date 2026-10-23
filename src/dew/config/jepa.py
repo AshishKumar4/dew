@@ -14,10 +14,9 @@ from dew.config import JsonDict, ModelConfig, ObjectiveConfig, OptimConfig, Prep
 from dew.data.compile import fitted
 from dew.data.pipeline import ObjectiveData
 from dew.inputs import Field
+from dew.objectives.jepa.masking import MultiBlockMask
+from dew.objectives.jepa.probes import KnnProbe, LinearProbe
 from dew.registry import models
-
-from .masking import MultiBlockMask
-from .probes import KnnProbe, LinearProbe
 
 SHARED_MODEL_KEYS = ("emb_features", "num_heads", "mlp_ratio", "ssm_attention_ratio",
                      "ssm_state_dim", "dropout_rate", "precision")
@@ -80,3 +79,5 @@ class JepaRunConfig(RunConfig):
         return Prepared(self, lambda name: self.train(objective, dataset, name=name, metrics=probes,
                                                       validation=held))
 
+
+__all__ = ["JepaRunConfig"]

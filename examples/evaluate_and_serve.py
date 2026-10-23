@@ -47,7 +47,8 @@ from dew.data.sources import TokenFiles
 from dew.eval import FID, CLIPScore
 from dew.inference import RunProcessor, TextGeneration, TextToImage
 from dew.nn.backbones import CausalTransformer
-from dew.objectives.lm import LMObjective, LMRunConfig, Perplexity
+from dew.objectives.lm import LMObjective, Perplexity
+from dew.config.lm import LMRunConfig
 from dew.sampling import Sampling
 from dew.training import Evaluation
 

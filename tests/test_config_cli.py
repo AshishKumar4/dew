@@ -14,9 +14,9 @@ from dew.config import RunConfig, ScheduleSpec
 from dew.data import Files
 from dew.data.dataset import Loader, record_argument
 from dew.diffusion.presets import Flow
-from dew.objectives.diffusion import DiffusionRunConfig
-from dew.objectives.jepa import JepaRunConfig
-from dew.objectives.lm import LMRunConfig
+from dew.config.diffusion import DiffusionRunConfig
+from dew.config.jepa import JepaRunConfig
+from dew.config.lm import LMRunConfig
 from dew.registry import import_path
 from dew.sampling import Heun
 from dew.training import MeshSpec
@@ -85,7 +85,7 @@ def test_a_point_sets_a_runs_fields_and_its_chains_settings_together():
     """A run's own fields and its chain's settings are one point, built once: audio conditioning and
     clips that carry audio are valid only together, and a point that sets both reads as both."""
     from dew.data import presets
-    from dew.objectives.diffusion import AudioCondition
+    from dew.inputs import AudioCondition
 
     clips = Files("clips", format="files").pipe(presets.clips, 2 / 25, frames=2, fps=25, size=8, batch=8)
     audio = DiffusionRunConfig(text=None, audio=AudioCondition()).to_dict()["audio"]

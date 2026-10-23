@@ -58,7 +58,7 @@ from dew.data.sources.tokens import TokenFiles
 from dew.inference import Completion, OllamaCompletion
 from dew.interop import Pretrained, PretrainedDecoder
 from dew.nn.inputs import ModelInputs
-from dew.objectives.lm import LMRunConfig
+from dew.config.lm import LMRunConfig
 from dew.registry import models
 from dew.sampling.text import Sampling, generate
 

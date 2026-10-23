@@ -36,7 +36,8 @@ from dew.config import ModelConfig, ObjectiveConfig, OptimConfig, TrainerConfig
 from dew.data import ByteTokenizer, Files, HFTokenizer, Hub, Loading, presets, text
 from dew.data.compile import iterate
 from dew.objectives.diffusion.masked import MaskedDiffusionObjective
-from dew.objectives.lm import LMRunConfig, Perplexity
+from dew.objectives.lm import Perplexity
+from dew.config.lm import LMRunConfig
 from dew.optim import Cosine
 from dew.training import Evaluation, MeshSpec
 

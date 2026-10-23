@@ -5,7 +5,7 @@
         --model.num-layers 12 --model.num-heads 8
 
 Oxford flowers with flower captions is the default; docs/recipes.md lists the
-other corpora. The run is `dew.objectives.diffusion.DiffusionRunConfig`, its
+other corpora. The run is `dew.config.diffusion.DiffusionRunConfig`, its
 data a chain (`dew.data.presets.images`) whose settings `--set data.images.<setting>=`
 changes.
 
@@ -17,7 +17,7 @@ trains the model with Flow-GRPO on that reward instead of the denoising loss.
 
 from dew.data import images, presets
 from dew.data.sources import source
-from dew.objectives.diffusion import DiffusionRunConfig
+from dew.config.diffusion import DiffusionRunConfig
 
 TEMPLATES = ("a photo of a {}", "a photo of a {} flower", "This is a photo of a {}",
              "This is a photo of a {} flower", "A photo of a {} flower")

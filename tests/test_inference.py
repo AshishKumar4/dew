@@ -32,7 +32,8 @@ from dew.diffusion.presets import EDM, Flow
 from dew.inference import RunProcessor, TextGeneration
 from dew.inputs import Field, unit_range
 from dew.objectives.base import merge
-from dew.objectives.diffusion import DiffusionRunConfig, TextCondition
+from dew.config.diffusion import DiffusionRunConfig
+from dew.inputs import TextCondition
 from dew.sampling import CFG, DPMSolverSDE, Euler, Heun, TextToImage
 from dew.sampling.pipelines import Images
 from dew.telemetry.instrumentation import Compiles
@@ -642,7 +643,8 @@ def test_a_quantized_runs_record_re_wraps_the_model_it_rebuilds(tmp_path):
     which the fp32 rebuild does not. Observed on CPU: 3e-02 on logits of
     order 1."""
     pytest.importorskip("qwix")
-    from dew.objectives.lm import LMObjective, LMRunConfig
+    from dew.objectives.lm import LMObjective
+    from dew.config.lm import LMRunConfig
     from dew.quantization import Quantization
 
     batch, seq = 8, 8

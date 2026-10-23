@@ -2,7 +2,7 @@
 
 The data is a token store `dew data export` wrote, whose manifest names its
 tokenizer and vocabulary, so the run takes the vocabulary from the data, not
-the command line (`dew.objectives.lm.LMRunConfig`). Its windows are a chain
+the command line (`dew.config.lm.LMRunConfig`). Its windows are a chain
 (`dew.data.presets.token_windows`), whose settings `--set data.<call>.<setting>=`
 changes: the store's as `data.source`, the windows' as `data.token_windows`.
 
@@ -21,7 +21,7 @@ Whole documents packed into the windows are a run file's chain: the store packed
 
 from dew.data import presets
 from dew.data.sources.tokens import TokenFiles
-from dew.objectives.lm import LMRunConfig
+from dew.config.lm import LMRunConfig
 
 # The windows are read by index and ordered by the shuffle and repeat written before them, so a run
 # knows its epoch's length.

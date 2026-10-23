@@ -1279,8 +1279,9 @@ class RunConfig:
         return str(target)
 
     def record(self) -> dict[str, JSON]:
-        """The run's class record: its class's import path and its fields (`to_dict`)."""
-        return {"class": registry.import_path(type(self)), "fields": self.to_dict()}
+        """The run's class record: its class's name, its alias where `dew.registry.runs` holds it, and
+        its fields (`to_dict`)."""
+        return {"class": registry.recorded_name(type(self)), "fields": self.to_dict()}
 
     @classmethod
     def cli(cls, args: Sequence[str] | None = None, *, default: Self | None = None) -> Self:
@@ -1379,8 +1380,8 @@ class RunConfig:
         named = registry.class_record(record)
         if named is None:
             raise ValueError('a run record is its class and its fields, {"class": ..., "fields": ...}')
-        run_class = registry.imported(named[0])
-        if not (isinstance(run_class, type) and issubclass(run_class, cls)):
+        run_class = registry.runs[named[0]]
+        if not issubclass(run_class, cls):
             raise ValueError(f"the record names {named[0]}, which is no {cls.__name__}")
         return run_class.from_dict(named[1])
 

@@ -40,36 +40,34 @@ def with_guidance(conditions: dict, scale: jax.Array) -> dict:
 class GuidanceDistillationObjective(DiffusionObjective):
     """Distills a teacher's classifier-free guidance into this model.
 
-    The teacher is the run in the directory `teacher_run`, rebuilt from its
-    record, or, without one, the model `teacher` (by default this one without
-    its adapter) over this objective's process and inputs. Its whole
-    variables tree is held frozen under `TEACHER`: the starting tree's when it
-    holds one, as a saved student's does, else the one the teacher run
-    published. The teacher reads its own conditioning of the batch, the
-    conditioning its run trained on. Each row draws a scale uniformly from
-    `scales`. The student reads that scale as its conditioning record's
-    `guidance`, and regresses its raw output onto the teacher's guided raw
-    output at that scale, both on the same noised sample, under the process's
-    weighting. The two must share the process's schedule and prediction and
+    The teacher is `teacher`: an objective, as a run config rebuilds the
+    teacher's run from its record (`DiffusionRunConfig.teacher_run`), or a
+    model over this objective's process and inputs, by default this one
+    without its adapter. Its whole variables tree is held frozen under
+    `TEACHER`: the starting tree's when it holds one, as a saved student's
+    does, else `teacher_variables`, the tree the teacher's run published,
+    else the model the starting tree holds. The teacher reads its own
+    conditioning of the batch, the conditioning its run trained on. Each row
+    draws a scale uniformly from `scales`. The student reads that scale as its
+    conditioning record's `guidance`, and regresses its raw output onto the
+    teacher's guided raw output at that scale, both on the same noised sample,
+    under the process's weighting. The two must share the process's schedule and prediction and
     the data's latent geometry, and the student's conditioning must have a
     guidance input, as a guidance-embedded Flux's does. Sampling is unguided.
     """
 
     def __init__(self, model: nn.Module, process: Process | Preset, inputs: InputSpec, *,
-                 teacher: nn.Module | None = None, teacher_run: str | None = None,
-                 scales: tuple[float, float] = (1.0, 8.0), **kwargs):
+                 teacher: nn.Module | DiffusionObjective | None = None,
+                 teacher_variables: Variables | None = None, scales: tuple[float, float] = (1.0, 8.0),
+                 **kwargs):
         _own_loss("guidance distillation", kwargs)
         super().__init__(model, process, inputs, **kwargs)
-        held = teacher_weights(self.variables, teacher_run, whole=True)
-        if teacher_run is None:
+        held = teacher_weights(self.variables, teacher_variables, whole=True)
+        if isinstance(teacher, DiffusionObjective):
+            built = teacher
+        else:
             built = DiffusionObjective(unadapted(self.model) if teacher is None else teacher, self.process,
                                        self.inputs, autoencoder=self.autoencoder, ema_decay=None)
-        elif teacher is not None:
-            raise ValueError("the teacher run names its own model; give the run or the model")
-        else:
-            from .config import DiffusionRunConfig
-
-            built = DiffusionRunConfig.load(teacher_run).build(variables=held)
         if any(to_record(getattr(built.process, part), kind) != to_record(getattr(self.process, part), kind)
                for part, kind in (("schedule", NoiseScheduler), ("prediction", PredictionTransform))):
             raise ValueError("guidance distillation regresses onto the teacher's raw output, so the "

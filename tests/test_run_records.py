@@ -13,9 +13,9 @@ import pytest
 
 from dew.config import ObjectiveConfig, RunConfig
 from dew.decision.config import DecisionRunConfig
-from dew.objectives.diffusion import DiffusionRunConfig
-from dew.objectives.jepa import JepaRunConfig
-from dew.objectives.lm.config import LMRunConfig
+from dew.config.diffusion import DiffusionRunConfig
+from dew.config.jepa import JepaRunConfig
+from dew.config.lm import LMRunConfig
 from dew.quantization import Quantization
 
 ROOT = Path(__file__).resolve().parents[1]
