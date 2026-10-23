@@ -4,8 +4,9 @@
 conditions it is given, keyed by the model's own keyword arguments. A
 `Condition` holds an encoder, the batch field it reads and the raw datum that
 stands for "no condition", which classifier-free guidance and conditioning
-dropout substitute. Nothing here runs a model. The spec only describes the
-inputs, and the objective does the encoding.
+dropout substitute. The spec only describes the inputs; `encode_conditions`
+runs its encoders over their weights, the one encoding a training step and a
+sampling task share.
 
 Image and video batches arrive as uint8 pixels in [0, 255], as the data
 workers write them. `unit_range` is the one conversion to [-1, 1], the range
@@ -124,6 +125,12 @@ class InputSpec:
             for condition in self.conditions.values()
             if condition.encoder.reads_captions
         }
+
+    @property
+    def encoders(self) -> tuple[tuple[str, ConditionEncoder], ...]:
+        """Each condition's encoder by the keyword it is passed under, a hashable value a compiled
+        encoding takes as a static argument (`encode_conditions`)."""
+        return tuple((keyword, condition.encoder) for keyword, condition in self.conditions.items())
 
     def dependencies(self) -> Mapping[str, object]:
         """What `tokenize` and `encode_fields` make of a batch depends on: each condition's field
@@ -287,6 +294,14 @@ class AudioCondition:
                                    "dtype": dtype if self.dtype is None else self.dtype,
                                    "param_dtype": self.param_dtype}, params=params),
             field="audio", unconditional=0.0)
+
+
+def encode_conditions(encoders: Sequence[tuple[str, ConditionEncoder]], weights: Mapping[str, Variables],
+                      tokens: Mapping[str, object]) -> dict:
+    """Each of `encoders` (`InputSpec.encoders`) over the tokens under its keyword, with the weights
+    under its keyword: the conditions a model is passed, by keyword. The one encoding a training
+    step (`DiffusionObjective.encode`) and a sampling task (`TextToImage`) run."""
+    return {keyword: encoder.encode(weights[keyword], tokens[keyword]) for keyword, encoder in encoders}
 
 
 __all__ = [

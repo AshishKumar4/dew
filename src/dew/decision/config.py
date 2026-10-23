@@ -29,12 +29,11 @@ from dew.config import ModelConfig, ObjectiveConfig, OptimConfig, Prepared, RunC
 from dew.data.compile import fitted
 from dew.data.text import HFTokenizer
 from dew.decision.head import DecisionHead, JointSchemaHead
-from dew.decision.laya import LayaCheckpoint
+from dew.decision.laya import LAYA, LayaCheckpoint
 from dew.decision.layout import Layout, default_layout
-from dew.decision.metrics import AURC, ECE, Accuracy
 from dew.decision.model import DecisionModel
 from dew.decision.objective import DecisionObjective
-from dew.decision.scoring import LogLoss
+from dew.decision.scoring import default_metrics
 from dew.decision.task import Decide
 from dew.nn.backbones.decoder_block import remat_policy
 from dew.nn.protocols import RematChoosing
@@ -47,16 +46,16 @@ if TYPE_CHECKING:
 
 @dataclasses.dataclass(frozen=True)
 class JointShape:
-    """The sizes of the joint schema head (`JointSchemaHead`).
+    """The sizes of the joint schema head (`JointSchemaHead`), its own defaults.
 
     Its input width is the backbone's, which the run reads from the model.
     """
 
-    width: int = 1024
-    routing_layers: int = 2
-    layers: int = 4
-    heads: int = 16
-    feedforward: int = 4096
+    width: int = JointSchemaHead.width
+    routing_layers: int = JointSchemaHead.routing_layers
+    layers: int = JointSchemaHead.layers
+    heads: int = JointSchemaHead.heads
+    feedforward: int = JointSchemaHead.feedforward
 
 
 @dataclasses.dataclass(frozen=True)
@@ -69,7 +68,7 @@ class DecisionRunConfig(RunConfig):
     optim: OptimConfig = dataclasses.field(default_factory=lambda: OptimConfig(rate=2.5e-5))
     model: ModelConfig = dataclasses.field(
         default_factory=lambda: ModelConfig("causal_transformer", {"dtype": "bfloat16"}))
-    pretrained: str = "convaiinnovations/laya"
+    pretrained: str = LAYA
     """A Laya-style repository, read whole, or a Hugging Face model, read as the backbone."""
     param_dtype: str = "float32"
     """The loaded checkpoint's parameter storage dtype; bfloat16 halves a frozen base's memory,
@@ -197,7 +196,7 @@ class DecisionRunConfig(RunConfig):
                 calibrated.save(directory)
 
         # The task's own default metrics, asked for where its data holds held-out rows to score.
-        metrics = (Accuracy(), ECE(), AURC(), LogLoss()) if held else ()
+        metrics = tuple(default_metrics()) if held else ()
         after = calibrate if self.calibrate and held else None
         return Prepared(self, lambda name: self.train(objective, dataset, name=name, metrics=metrics,
                                                       summary=summary, after=after, validation=held))

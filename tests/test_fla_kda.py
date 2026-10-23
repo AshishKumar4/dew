@@ -22,7 +22,7 @@ from dew.nn import kernels
 from dew.nn.kda import KimiDeltaAttention
 from dew.nn.kernels import chunked_launch, fla_kda, tuning
 from dew.nn.kernels.recurrence_chunk import fla_rule
-from dew.nn.linear import l2norm
+from dew.nn.precision import l2norm
 
 pytestmark = pytest.mark.kernel
 
