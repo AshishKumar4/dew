@@ -627,7 +627,7 @@ class EpisodeCollector:
             mesh = mesh_of(snapshot.variables)
             if mesh is not None and DataPartition.of(mesh).readers > 1:
                 raise ValueError("native episodes do not support replicated data-share readers")
-            if not all(task.id.isdigit() for task in tasks):
+            if not all(task.id.removeprefix("-").isdigit() for task in tasks):
                 raise ValueError("an episode collection's tasks are integer task ids (`task_ids`)")
             ids = np.asarray([int(task.id) for task in tasks], np.int64)
             policy = self.policy.bind(snapshot.variables)

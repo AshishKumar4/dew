@@ -9,9 +9,10 @@ from collections.abc import Callable, Sequence
 import jax.numpy as jnp
 import numpy as np
 
+from dew.coordination import agreed
 from dew.data.prompts import INFO_KEY, LENGTH_KEY, PROMPT_KEY, SOURCE_KEY, TRUTH_KEY, PromptRecord
 from dew.inference.rollouts import Draw, InfrastructureError, response
-from dew.nn.inputs import ModelInputs, local_rows, pad_token_rows
+from dew.nn.inputs import ModelInputs, local_rows, mesh_of, pad_token_rows
 from dew.objectives.base import Batch
 from dew.sampling.text import Sampling
 
@@ -132,12 +133,19 @@ class PolicyCollector:
     def rows(self, tasks: int, samples: int) -> int:
         return tasks * samples
 
-    def collect(self, snapshot: Snapshot, tasks: Sequence[Task], samples: int) -> list[list[Session]]:
+    def _prepared(self, tasks: Sequence[Task]) -> tuple[list[PromptTask], int, ModelInputs]:
+        """The tasks' prompts, the width they pad to and the inputs the policy is given."""
         prompts = [PromptTask.of(task) for task in tasks]
         width = max(prompt.width for prompt in prompts)
         rows, fields = pad_token_rows([prompt.ids for prompt in prompts], pad_id=self.sampling.pad,
                                       width=width)
-        inputs = ModelInputs(jnp.asarray(rows), {name: jnp.asarray(value) for name, value in fields.items()})
+        return prompts, width, ModelInputs(jnp.asarray(rows), {name: jnp.asarray(value)
+                                                               for name, value in fields.items()})
+
+    def collect(self, snapshot: Snapshot, tasks: Sequence[Task], samples: int) -> list[list[Session]]:
+        # Every process of the mesh validates its prompts before generation enters its collectives.
+        prompts, width, inputs = (self._prepared(tasks) if mesh_of(snapshot.variables) is None
+                                  else agreed("rollout input preparation", lambda: self._prepared(tasks)))
         generated = self.objective.policy(snapshot.variables, self.sampling)(
             inputs, self.max_new_tokens, key=snapshot.key, n=samples).host()
 
@@ -162,5 +170,3 @@ class PolicyCollector:
             collected.append(sessions)
         return collected
 
-
-__all__ = ["PolicyCollector", "PromptTask", "Reward", "prompt_rows", "prompt_tasks", "scored_draw"]
