@@ -101,6 +101,20 @@ def test_a_batched_arm_that_computes_otherwise_than_one_draws_is_refused():
 
     with pytest.raises(AssertionError):
         over_windows(arm)(np.zeros((3, 2), np.float32))
+    # The check runs at each signature: a reference's float32 program and its float64 truth's are two,
+    # and a batching that moves only the float64 one is refused there.
+    @jax.custom_batching.custom_vmap
+    def wide_only(x):
+        return x
+
+    @wide_only.def_vmap
+    def moved(axis_size, in_batched, x):
+        return (x + 1 if x.dtype == jnp.float64 else x), in_batched[0]
+
+    both = over_windows(wide_only)
+    both(np.zeros((3, 2), np.float32))
+    with jax.enable_x64(new_val=True), pytest.raises(AssertionError):
+        both(np.zeros((3, 2), np.float64))
     np.testing.assert_array_equal(over_windows(lambda x: arm(x), looped=True)(np.zeros((3, 2), np.float32)),
                                   np.zeros((3, 2), np.float32))
 
