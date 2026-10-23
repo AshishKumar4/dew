@@ -73,10 +73,14 @@ std::optional<Device> device_of(cudaStream_t stream) {
   return Device{index, 10 * major + minor, multiprocessors};
 }
 
+// Scratch aligned to 128 bytes. XLA's device allocator refuses an alignment past its own 64
+// (tsl::Allocator::kAllocatorAlignment), so each allocation is 64 bytes longer, its start rounded up.
 Allocate allocator(ffi::ScratchAllocator& scratch) {
   return [&scratch](std::size_t bytes) -> void* {
-    std::optional<void*> memory = scratch.Allocate(bytes, 128);
-    return memory.has_value() ? *memory : nullptr;
+    std::optional<void*> memory = scratch.Allocate(bytes + 64, 64);
+    if (!memory.has_value()) return nullptr;
+    const auto address = reinterpret_cast<std::uintptr_t>(*memory);
+    return reinterpret_cast<void*>((address + 127) / 128 * 128);
   };
 }
 
