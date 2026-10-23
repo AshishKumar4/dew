@@ -20,6 +20,13 @@ release's tag is that version with a `v` in front (`v0.1.0`).
   no longer loads. A distillation's teacher run is the run config's
   `--teacher-run`, and the objectives take the loaded teacher
   (`teacher_variables=`, and guidance distillation's `teacher=`).
+- On a CPU, every float32 product a Dew model forms (the dot family, a bias's
+  gradient, attention's reference path, which a CPU's attention now takes in
+  every dtype) sums in float64 and rounds once (`dew.nn.precision.accumulated`),
+  rather than XLA:CPU's float32 sum, whose order its shape and release choose.
+  A CPU forward costs about 1.6 times, a training step 1.4 to 1.9 times;
+  GPU and TPU programs are unchanged, and convolutions keep their float32 sum.
+  `jax.default_matmul_precision("F32_F32_F32")` takes the float32 sum back.
 - A diffusion schedule's division of a state by a rate (`divided`: epsilon from a clean
   prediction, the clean sample from epsilon, a sigma solver's derivative) is IEEE's correctly
   rounded quotient whatever the backend's division flags, through the one correctly rounded
