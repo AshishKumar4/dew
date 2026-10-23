@@ -7,11 +7,12 @@ and imports neither JAX nor Dew; CI runs this beside `gen_api.py --check`.
 """
 
 import ast
+import dataclasses
 import json
 import re
 
 import pytest
-from tool_support import load
+from tool_support import git, load
 
 pytest.importorskip("griffe")
 
@@ -193,3 +194,35 @@ def test_check_rejects_an_unresolvable_or_nondeclaration_reference(
         gen_api.main()
     assert stopped.value.code == 1
     assert not (source.parents[2] / gen_api.P.content).exists()
+
+
+def test_a_notebook_pinned_to_a_commit_is_held_to_that_commits_api(gen_api, reference_package, monkeypatch):
+    """A notebook whose install pins the package to a commit shows that commit's API: a name the commit held
+    resolves there though the package has since renamed it, one it never held does not, and an unpinned
+    notebook is held to the API as it is."""
+    source, overview = reference_package
+    root = overview.parent
+    source.write_text("def old_name(): ...\n")
+    overview.write_text("# Overview\n")
+    git(root, "init", "-q", "-b", "main")
+    git(root, "add", "-A")
+    git(root, "commit", "-qm", "the API with old_name")
+    commit = git(root, "rev-parse", "HEAD").strip()
+    source.write_text("def new_name(): ...\n")
+    install = f'%pip install -q "example @ git+https://example.org/example@{commit}"\n'
+
+    def notebook(name: str, *cells: str) -> None:
+        (root / name).write_text(json.dumps({"cells": [{"cell_type": "code", "source": [cell]}
+                                                       for cell in cells]}))
+
+    monkeypatch.setattr(gen_api, "P", dataclasses.replace(gen_api.P, usage=["*.ipynb"]))
+    monkeypatch.setattr("sys.argv", ["gen_api.py", "--check"])
+    notebook("pinned.ipynb", install, "from example import old_name\nold_name()\n")
+    gen_api.main()
+    for name, cells in (("pinned_absent.ipynb", (install, "import example\nexample.never_held()\n")),
+                        ("current.ipynb", ("from example import old_name\n",))):
+        notebook(name, *cells)
+        with pytest.raises(SystemExit) as stopped:
+            gen_api.main()
+        assert stopped.value.code == 1, name
+        (root / name).unlink()
