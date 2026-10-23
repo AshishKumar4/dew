@@ -19,6 +19,13 @@ def expand(coefficient, x):
     return jnp.reshape(coefficient, (-1,) + (1,) * (x.ndim - 1))
 
 
+def ancestral_variance(sigma, following):
+    """following^2 (sigma^2 - following^2) / sigma^2, the variance of the fresh noise an ancestral
+    step from `sigma` to `following` adds (k-diffusion's `get_ancestral_step` at eta 1, before its
+    root), on a number or an array of either library: each caller takes its own root, cap or clamp."""
+    return following ** 2 * (sigma ** 2 - following ** 2) / sigma ** 2
+
+
 def divided(numerator, rate):
     """`numerator / rate` as a source written in PyTorch divides a state by a rate: IEEE division,
     whatever the backend's own division does. A float32, bfloat16 or float16 quotient is

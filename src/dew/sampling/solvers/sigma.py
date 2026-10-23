@@ -8,6 +8,7 @@ from flax import struct
 from jax import lax
 
 from dew.diffusion.schedules import divided, expand
+from dew.diffusion.schedules.common import ancestral_variance
 
 from .common import _check_gaps, _grid_levels, _history_gaps, _push, _sigma_integrator
 
@@ -46,7 +47,7 @@ def _ancestral(sigma_t, sigma_s):
     the level a deterministic step goes down to and the fresh noise that
     brings the marginal back to sigma_s, sigma_up capped at sigma_s as the
     source caps it."""
-    sigma_up = jnp.minimum(sigma_s, (sigma_s ** 2 * (sigma_t ** 2 - sigma_s ** 2) / sigma_t ** 2) ** 0.5)
+    sigma_up = jnp.minimum(sigma_s, ancestral_variance(sigma_t, sigma_s) ** 0.5)
     return (sigma_s ** 2 - sigma_up ** 2) ** 0.5, sigma_up
 
 @struct.dataclass
