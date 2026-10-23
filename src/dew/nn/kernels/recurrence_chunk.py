@@ -181,19 +181,39 @@ def chunk_delta_rule(query, key, value, g, beta, state=None, chunk_size: int = C
     tokens (the decay's last row is zero for the others), the memory it
     entered passing through only where no document starts in it. A document
     computes as it would alone.
+
+    The reverse rule erases before differentiating a token's decay, within every chunk at once
+    (`_chunk_delta_backward`). Differentiating the WY products instead cancelled independently
+    rounded paths through the inverse, pairwise decays and readout: under aligned keys their RMS
+    magnitudes summed to 16.2 times the resulting decay gradient on one draw. Over 40 draws its
+    fp32 error was 1.883 times the token recurrence's, and 2.941 at 128-wide keys with 64-token
+    chunks; regrouped it is 1.068 and 0.989. The vector decay's is 1.021, and the formed gates'
+    gate, log_a and bias 1.053, 1.038 and 1.023 over 320 draws. All arithmetic remains fp32.
+    Only the chunk boundaries scan sequentially across the sequence; each token scan spans C
+    positions, not the sequence's T. Forward-mode callers keep the primal's tangent, as the port's
+    forward-mode fallback does (`FORWARD_MODE`).
     """
     dtype = jnp.result_type(query, key, value) if dtype is None else jnp.dtype(dtype)
     work = at_least_fp32(jnp.result_type(query, key, value))
-    B, S, H, Dk = key.shape
-    Dv = value.shape[-1]
-    steps = chunked(query, key, value, g, beta, chunk_size, starts=starts, delta=delta, scale=scale)
-    T = S + steps.padding
-
+    B, _, H, Dk = key.shape
     # A zero state like the values: inside a shard_map that checks varying axes the chunk loop's
     # carry varies as the operands it takes in do, and under an Explicit axis its rows are placed as
     # theirs are.
-    state = (rows_like(jnp.zeros_like(value, work, shape=(B, H, Dk, Dv)), value) if state is None
+    state = (rows_like(jnp.zeros_like(value, work, shape=(B, H, Dk, value.shape[-1])), value) if state is None
              else state.astype(work))
+    query, key, value, g, beta = (x.astype(work) for x in (query, key, value, g, beta))
+    scale = Dk ** -0.5 if scale is None else scale
+    rule = (_chunk_delta_rule if FORWARD_MODE.get() or query.shape[1] == 0
+            else _differentiable_chunk_delta_rule)
+    return rule(query, key, value, g, beta, state, chunk_size, starts, delta, scale, dtype)
+
+
+def _chunk_delta_forward(query, key, value, g, beta, state, chunk_size, starts, delta, scale, dtype):
+    """The unchanged chunked primal, and the operands its reverse rule keeps."""
+    B, S, H, _ = key.shape
+    Dv = value.shape[-1]
+    steps = chunked(query, key, value, g, beta, chunk_size, starts=starts, delta=delta, scale=scale)
+    T = S + steps.padding
     # XLA:CPU workaround: under a jitted scan over the layers the chunk
     # loop's zero initial state came back with other values in most
     # processes (GLM-5-Next off by 8.7, 10.1 or NaN, byte-identical modules).
@@ -207,7 +227,92 @@ def chunk_delta_rule(query, key, value, g, beta, state=None, chunk_size: int = C
     core = algebra.readout(steps.query, steps.entering, entered, steps.key, steps.pairs, v_corrected)
     # core: [B, H, NC, C, Dv] -> [B, H, NC*C, Dv] -> [B, S, H, Dv]
     core = jnp.moveaxis(core.reshape(B, H, T, Dv), 1, 2)[:, :S]
-    return core.astype(dtype), state
+    return (core.astype(dtype), state), (steps, entered)
+
+
+def _chunk_delta_rule(query, key, value, g, beta, state, chunk_size, starts, delta, scale, dtype):
+    """The chunked primal with its ordinary tangent, used by forward-mode callers."""
+    return _chunk_delta_forward(query, key, value, g, beta, state, chunk_size, starts, delta, scale, dtype)[0]
+
+
+def _chunk_rows(x, chunk_size: int):
+    """`[B, S, H, ...]` as `[B, H, NC, C, ...]`, padded with exact zero tokens."""
+    B, S, H = x.shape[:3]
+    pad = (chunk_size - S % chunk_size) % chunk_size
+    x = jnp.pad(x, [(0, 0), (0, pad)] + [(0, 0)] * (x.ndim - 2))
+    return jnp.moveaxis(x, 2, 1).reshape(B, H, -1, chunk_size, *x.shape[3:])
+
+
+def _chunk_sequence(x, length: int):
+    """`[B, H, NC, C, ...]` back to `[B, S, H, ...]`, removing the padding."""
+    B, H, chunks, width = x.shape[:4]
+    return jnp.moveaxis(x.reshape(B, H, chunks * width, *x.shape[4:]), 1, 2)[:, :length]
+
+
+def _chunk_delta_residual(query, key, value, g, beta, state, chunk_size, starts, delta, scale, dtype):
+    """Keep chunk boundaries and the readout's memory-gradient operands, not per-token memories."""
+    out, (steps, entered) = _chunk_delta_forward(
+        query, key, value, g, beta, state, chunk_size, starts, delta, scale, dtype)
+    transition, _ = algebra.transition(steps.key, steps.w, steps.u, steps.grown, steps.last, steps.kept)
+    scores = algebra.paired("scores", steps.query, steps.key, steps.pairs)
+    resets = (jnp.zeros(value.shape[:2], bool) if starts is None else jnp.asarray(starts, bool))
+    resets = _chunk_rows(jnp.broadcast_to(resets[..., None], value.shape[:3]), chunk_size)
+    residual = (steps.query, steps.key, *(_chunk_rows(x, chunk_size) for x in (value, g, beta)),
+                resets, entered, transition, steps.query * steps.entering, steps.w, scores)
+    return out, residual
+
+
+def _chunk_delta_backward(chunk_size, delta, scale, dtype, residual, cotangent):
+    """The token adjoint within each chunk, all chunks parallel; only their memory cotangents cross
+    boundaries. Replay C tokens from each entered memory, derive their terminal cotangents from
+    `readout_entered_gradient` and the transitions, then reverse C tokens. Replaying keeps a token's
+    erasure beside its decay, rather than cancelling separately rounded WY derivatives afterwards.
+    The per-token memories exist only in this backward, not as residuals of the primal."""
+    del chunk_size, dtype
+    query, key, value, g, beta, resets, entered, transition, decayed_query, weights, scores = residual
+    cotangent, final_cotangent = cotangent
+    length = cotangent.shape[1]
+    cotangent = _chunk_rows(cotangent.astype(query.dtype), query.shape[3])
+    tokens = query, key, value, g, beta, resets
+
+    def time_major(x):
+        return jnp.moveaxis(x, 3, 0)
+
+    def token(state, query, key, value, g, beta, reset):
+        state = jnp.where(reset[..., None, None], 0.0, state)
+        return recurrence.update(state, query, key, value, jnp.exp(g), beta[..., None], delta=delta)
+
+    def replay(state, inputs):
+        _, final = token(state, *inputs)
+        return final, state
+
+    _, before = jax.lax.scan(replay, entered, tuple(map(time_major, tokens)))
+    source = algebra.readout_entered_gradient(decayed_query, weights, scores, cotangent)
+
+    def across(state_gradient, inputs):
+        transition, source = inputs
+        initial = algebra.portable("compose", jnp.swapaxes(transition, -1, -2), state_gradient) + source
+        return initial, state_gradient
+
+    _, terminal = jax.lax.scan(across, final_cotangent, (jnp.moveaxis(transition, 2, 0),
+                                                        jnp.moveaxis(source, 2, 0)), reverse=True)
+    terminal = jnp.moveaxis(terminal, 0, 2)
+
+    def adjoint(state_gradient, inputs):
+        state, out_gradient, query, key, value, g, beta, reset = inputs
+        _, pull = jax.vjp(lambda state, q, k, v, g, beta: token(state, q, k, v, g, beta, reset),
+                          state, query, key, value, g, beta)
+        state_gradient, *gradients = pull((out_gradient, state_gradient))
+        return state_gradient, tuple(gradients)
+
+    initial, gradients = jax.lax.scan(
+        adjoint, terminal, (before, time_major(cotangent), *map(time_major, tokens)), reverse=True)
+    dq, dk, dv, dg, dbeta = (_chunk_sequence(jnp.moveaxis(x, 0, 3), length) for x in gradients)
+    return dq * scale, dk, dv, dg, dbeta, initial[:, :, 0], None
+
+
+_differentiable_chunk_delta_rule = jax.custom_vjp(_chunk_delta_rule, nondiff_argnums=(6, 8, 9, 10))
+_differentiable_chunk_delta_rule.defvjp(_chunk_delta_residual, _chunk_delta_backward)
 
 
 def chunk_gated_delta_rule(query, key, value, g, beta, state=None, chunk_size: int = CHUNK_SIZE, *,
