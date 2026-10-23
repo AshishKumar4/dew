@@ -1,7 +1,9 @@
 """JSON-compatible episode records for interchange and turn-boundary recovery."""
 
 import functools
+import json
 from collections.abc import Mapping
+from dataclasses import asdict
 
 import numpy as np
 
@@ -13,6 +15,18 @@ from .episodes import Episode, EpisodeId, EpisodeStatus, Observation, Transition
 
 reals = functools.partial(listed, read=finite, what="a list of finite numbers")
 """One list of finite numbers: a row's likelihoods (`listed`)."""
+
+
+def record_json(value: Episode | Draw) -> str:
+    """`value` as JSON, its fields as `asdict` writes them and a draw's routing as nested lists of
+    expert ids: the text `episode_from_record` and `draw_record` read back."""
+    return json.dumps(asdict(value), allow_nan=False, default=_listed)
+
+
+def _listed(value: object) -> object:
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    raise TypeError(f"an episode record holds no {type(value).__name__}")
 
 
 def observation_record(value: Mapping[str, object]) -> Observation:

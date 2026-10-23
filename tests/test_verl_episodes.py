@@ -56,3 +56,26 @@ def test_an_episode_record_reads_back_every_sampling_control():
 
     assert restored == episode
     assert restored.sampling.pad_token_id is None
+
+
+def test_an_episode_record_reads_back_the_engine_records_its_draws_carry():
+    """A draw an engine served with its routing and its sampler's kept ids, as an environment
+    source's episodes keep them, writes to JSON and reads back whole."""
+    import numpy as np
+
+    from dew.objectives.rl.records import episode_from_record, record_json
+
+    trainer, collector = build()
+    episode = collect(collector, trainer.initial_state())[0]
+    turn = episode.transitions[0]
+    draw = turn.action
+    forwarded = len(draw.prompt) + len(draw.tokens) - 1
+    routed = np.arange(forwarded * 2 * 2, dtype=np.int32).reshape(forwarded, 2, 2) % 4
+    support = tuple((token, token + 1) for token in draw.tokens)
+    served = replace(draw, routed_experts=routed, support=support)
+    episode = replace(episode, transitions=(replace(turn, action=served), *episode.transitions[1:]))
+
+    restored = episode_from_record(json.loads(record_json(episode)))
+
+    assert restored == episode
+    np.testing.assert_array_equal(restored.transitions[0].action.routed_experts, routed)
