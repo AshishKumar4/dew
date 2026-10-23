@@ -171,16 +171,32 @@ def _drop(f):
     return lambda x, w, ms, nw, b, u, s, ct: f(x, w, ms, nw, b, u, s)
 
 
+def _loss(run):
+    def loss(x, w, ms, nw, b, u, s, ct):
+        outs = run(x, w, ms, nw, b, u, s)
+        return sum(jnp.sum(_wide(out) * ct.astype(_wide(out).dtype)) for out in outs)
+    return jax.grad(loss, argnums=tuple(range(7)))
+
+
+def _holds_check_1(spec, product: str, name: str):
+    """A program's values ('values', the rows past the routed ones included) or every operand's cotangent
+    through its reverse mode ('gradients'), the template's interpreted and jitted, as exact as the plain
+    program's from float64 truth. The Mosaic interpreters' ordered callbacks run inside the backward
+    kernel's linear map (`generation.linear_map`)."""
+    of = _drop if product == "values" else _loss
+    dew = jax.jit(of(_dew(spec, interpret_on_cpu=True)))
+    assert_as_exact(dew, jax.jit(of(_plain(spec))), _draw, name, seeds=SEEDS,
+                    truth_fn=of(_plain(spec, truth=True)))
+
+
 @pytest.mark.parametrize("generation_name", generations("sm80", "sm90", "v5e"))
-@pytest.mark.parametrize("case", list(CASES))
-def test_the_template_holds_check_1_with_its_hooks(generation_name, case):
-    """Each hook through the launch the generation picks, interpreted on the CPU: as exact as the plain
-    program from float64 truth, the rows past the routed ones included."""
-    spec = CASES[case]
+@pytest.mark.parametrize("case,product", [*((case, "values") for case in CASES),
+                                          *((case, "gradients") for case in GRADIENT_CASES)])
+def test_the_template_holds_check_1_with_its_hooks(generation_name, case, product):
+    """Each hook through the launch the generation picks, interpreted on the CPU: its values and its
+    gradients (`_holds_check_1`)."""
     with generation.assumed(generation_name):
-        dew = jax.jit(_drop(_dew(spec, interpret_on_cpu=True)))
-        assert_as_exact(dew, jax.jit(_drop(_plain(spec))), _draw, f"{case} on {generation_name}",
-                        seeds=SEEDS, truth_fn=_drop(_plain(spec, truth=True)))
+        _holds_check_1(CASES[case], product, f"{case} {product} on {generation_name}")
 
 
 COOPERATIVE = mosaic_gpu.Tiles(128, 128, 64, 3, 1, warpgroups=2)
@@ -197,39 +213,18 @@ def _kernels(taken) -> set:
 
 
 @runs("sm90")
-@pytest.mark.parametrize("case", ["norm and bias", "gated prologue", "cast prologue"])
-def test_a_cooperative_tile_holds_check_1_with_its_hooks(case):
+@pytest.mark.parametrize("case,product", [("norm and bias", "values"), ("gated prologue", "values"),
+                                          ("cast prologue", "values"), ("norm and bias", "gradients")])
+def test_a_cooperative_tile_holds_check_1_with_its_hooks(case, product):
     """The Hopper launches pinned to a cooperative tile, interpreted: each consumer rewrites half the stage
-    both read and computes half the columns' epilogue, as exact as the plain program from float64 truth;
-    the Mosaic kernels ran."""
-    spec = CASES[case]
+    both read and computes half the columns' epilogue, and in reverse mode the input gradient runs the
+    cooperative transposed launch and the kernel gradient the cooperative kernel gradient, each consumer's
+    prologue over its depth half (`_holds_check_1`); the Mosaic kernels ran."""
     pinned = {grouped_matmul.MosaicGmm: COOPERATIVE, grouped_matmul.MosaicTgmm: COOPERATIVE}
     with (generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic_gpu"), tuning.pinned(pinned),
           generation.routes() as taken):
-        dew = jax.jit(_drop(_dew(spec, interpret_on_cpu=True)))
-        assert_as_exact(dew, jax.jit(_drop(_plain(spec))), _draw, f"{case} cooperative",
-                        seeds=SEEDS, truth_fn=_drop(_plain(spec, truth=True)))
+        _holds_check_1(CASES[case], product, f"{case} cooperative {product}")
     assert _kernels(taken) == MOSAIC_RAN
-
-
-def _loss(run):
-    def loss(x, w, ms, nw, b, u, s, ct):
-        outs = run(x, w, ms, nw, b, u, s)
-        return sum(jnp.sum(_wide(out) * ct.astype(_wide(out).dtype)) for out in outs)
-    return jax.grad(loss, argnums=tuple(range(7)))
-
-
-@pytest.mark.parametrize("generation_name", generations("sm80", "sm90", "v5e"))
-@pytest.mark.parametrize("case", GRADIENT_CASES)
-def test_the_templates_gradients_hold_check_1(generation_name, case):
-    """Every operand's cotangent through the template's own reverse mode, against JAX's derivative of
-    the plain program, from float64 truth, jitted: the Mosaic interpreters' ordered callbacks run inside
-    the backward kernel's linear map (`generation.linear_map`)."""
-    spec = CASES[case]
-    with generation.assumed(generation_name):
-        dew = jax.jit(_loss(_dew(spec, interpret_on_cpu=True)))
-        assert_as_exact(dew, jax.jit(_loss(_plain(spec))), _draw, f"{case} gradients on {generation_name}",
-                        seeds=SEEDS, truth_fn=_loss(_plain(spec, truth=True)))
 
 
 
@@ -925,22 +920,6 @@ def test_exact_sums_add_each_steps_product_as_the_plain_sum_does(generation_name
                                                         precision=precision, interpret_on_cpu=True))(
                 x, dy, group_sizes) for precision in ("highest", "default"))
             np.testing.assert_array_equal(np.asarray(exact), np.asarray(default))
-
-
-@runs("sm90")
-@pytest.mark.parametrize("case", ["norm and bias"])
-def test_a_cooperative_tiles_gradients_hold_check_1(case):
-    """`test_a_cooperative_tile_holds_check_1_with_its_hooks`'s reverse mode: the input gradient through the
-    cooperative transposed launch, the kernel gradient through the cooperative kernel gradient with the
-    prologue each consumer applies to its depth half, against JAX's derivative of the plain program."""
-    spec = CASES[case]
-    pinned = {grouped_matmul.MosaicGmm: COOPERATIVE, grouped_matmul.MosaicTgmm: COOPERATIVE}
-    with (generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic_gpu"), tuning.pinned(pinned),
-          generation.routes() as taken):
-        dew = jax.jit(_loss(_dew(spec, interpret_on_cpu=True)))
-        assert_as_exact(dew, jax.jit(_loss(_plain(spec))), _draw, f"{case} cooperative gradients",
-                        seeds=SEEDS, truth_fn=_loss(_plain(spec, truth=True)))
-    assert _kernels(taken) == MOSAIC_RAN
 
 
 @SUMS_IN_IEEE
