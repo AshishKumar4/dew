@@ -33,8 +33,8 @@ from pathlib import Path
 
 import followed
 import pytest
-from ci import MARKS
 from followed import CHILDREN, checkout, reads_backend
+from session import MARKS
 
 TOOL = 3
 """sys.monitoring's tool ids 0-2 and 5 are the debugger's, coverage's, the profiler's and the optimizer's."""

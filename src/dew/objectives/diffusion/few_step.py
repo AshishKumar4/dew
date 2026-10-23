@@ -31,7 +31,7 @@ from dew.diffusion.schedules import FlowMatchingScheduler, expand
 from dew.diffusion.transforms import FlowMatchPredictionTransform, broadcast_rates
 from dew.inputs import InputSpec
 from dew.nn.attention import forward_mode_attention
-from dew.nn.protocols import IntervalModel
+from dew.nn.protocols import IntervalModel, Lacks
 from dew.nn.sharding import explicit_spec, rows_taken
 from dew.objectives.base import Aux, Step, model_rngs
 from dew.sampling.solvers import Euler, Solver
@@ -141,7 +141,7 @@ def _interval_velocity(model: nn.Module, process: Process, method: str, preset: 
         raise ValueError(f"{method} trains an interval model of velocity on the unshifted linear path; "
                          f"build the process with {preset}")
     if not (isinstance(model, IntervalModel) and model.interval):
-        raise TypeError(f"{method} hands its model each interval's duration, and a "
+        raise Lacks("interval", f"{method} hands its model each interval's duration, and a "
                         f"{type(model).__name__} embeds none: train an IntervalModel with interval set, "
                         f"as simple_dit(interval=True)")
 
