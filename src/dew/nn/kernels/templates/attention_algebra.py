@@ -1093,6 +1093,16 @@ def dq_step(sums: DqSums, weights: jax.Array, cotangents: jax.Array, slopes, see
     # weight's exponent plus the scale's and the prior's, its mantissa at most one; the running mass and
     # the tile's are brought to the larger exponent and the mean taken to their sum. One exponent a row,
     # not one an entry: an entry far below its row's largest is far below the correction's rounding.
+    import os
+    probe = os.environ.get("DEW_KEYED", "")
+    if probe == "off":
+        return DqSums(dq, sums.residual + cotangents.sum(axis=-1), sums.mass + weights.sum(axis=-1), grads,
+                      sums.weighed, sums.keyed, sums.keyed_mass, sums.keyed_shift)
+    if probe == "plain":
+        coefficients = pulled_weights * expand(scale * inverse(prior), pulled_weights)
+        keyed = sums.keyed + weights_product(coefficients, key, dot)
+        return DqSums(dq, sums.residual + cotangents.sum(axis=-1), sums.mass + weights.sum(axis=-1), grads,
+                      sums.weighed, keyed, sums.keyed_mass + 1.0, jnp.zeros_like(sums.keyed_shift))
     row_top = jnp.max(jnp.abs(pulled_weights), axis=-1)
     _, top_exponent = _split(row_top)
     scale_mantissa, scale_exponent = _split(jnp.float32(scale))
@@ -1232,6 +1242,9 @@ def cotangent_product(cotangents: jax.Array, operand: jax.Array,
 
     if operand.dtype == jnp.float32:
         return dot(oriented(cotangents), operand)
+    import os
+    if operand.dtype == jnp.bfloat16 and os.environ.get("DEW_CP") == "single":
+        return dot(oriented(cotangents.astype(jnp.bfloat16)), operand)
     if operand.dtype == jnp.bfloat16:
         out, rest = None, cotangents
         for _ in range(3):
