@@ -293,8 +293,9 @@ def conditional_mmdit():
     return objective, variables, batch, step
 
 
-NULL_DROPOUT_SEEDS = {0.5: 16, 1.0: 16}
-"""Check 1's declared seeds for the dropped route at each dropout probability."""
+NULL_DROPOUT_SEEDS = {0.5: 8, 1.0: 8}
+"""Check 1's declared seeds for the dropped route at each dropout probability, sized paired
+(`seeds_for` with the dropped route as `dew_fn`, 2026-10-23 on armada): 8 at each."""
 
 NULL_DROPOUT_ROWS = 32
 """The rows of each null-dropout draw: each weight's gradient sums over all of them."""
@@ -377,6 +378,8 @@ def test_null_dropout_matches_explicit_tokens_under_current_encoder(conditional_
         tokens = explicit(rows, masked(jax.tree.map(lambda leaf: np.asarray(leaf, np.float32)
                                                     if np.issubdtype(np.asarray(leaf).dtype, np.floating)
                                                     else leaf, values), rows, at))
+        # The pixels in float64 too, so the loss's normalization, rates and noising run in float64.
+        tokens = {**tokens, "image": np.asarray(tokens["image"], np.float64)}
         with jax.enable_x64(new_val=True):
             wide = DiffusionObjective(source.model.clone(dtype=jnp.float64), source.process, source.inputs,
                                       unconditional_prob=0.0, steps=3, solver=Euler(),
