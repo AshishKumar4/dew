@@ -102,7 +102,7 @@ def asked(rows):
                      instructions="Which banking request is this?").read("memory")
 
 objective = DecisionObjective(qwen, loss=LogLoss() + 0.5 * Brier())
-state = Trainer(objective, OptimConfig(learning_rate=1e-4), key=0).fit(
+state = Trainer(objective, OptimConfig(rate=1e-4), key=0).fit(
     asked(train).shuffle(0).repeat().batch(32), steps=2_000, eval_every=500,
     validation={"val": asked(val).batch(32)}, metrics=[Accuracy(), ECE()])
 
