@@ -298,7 +298,7 @@ def test_the_scanned_stack_reads_each_layers_own_packed_kernel():
     on the kernels the codes stand for (the adapter's deltas start at zero)."""
     _, fp8 = adapters()
     _, scanned = adapters(decoder(scan_layers=True))
-    exact = jax.jit(decoder(dtype="float64").apply)
+    exact = jax.jit(decoder().clone(dtype=jnp.float64, attention_impl="reference").apply)
     base = fp8.merge(fp8.variables)["params"]
 
     def draw(seed):
