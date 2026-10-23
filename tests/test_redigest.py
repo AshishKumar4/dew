@@ -38,9 +38,24 @@ def site(tmp_path: Path) -> Path:
     return tmp_path
 
 
-def redigest(root: Path) -> subprocess.CompletedProcess:
-    return subprocess.run([sys.executable, str(root / "site/scripts/redigest.py"), "--base", "recorded"],
-                          capture_output=True, text=True, timeout=60)
+def redigest(root: Path, *renames: str) -> subprocess.CompletedProcess:
+    return subprocess.run([sys.executable, str(root / "site/scripts/redigest.py"), "--base", "recorded",
+                           *(f"--rename={rename}" for rename in renames)], capture_output=True, text=True,
+                          timeout=60)
+
+
+def api_renamed(root: Path, owner: str, old: str, new: str | None) -> str:
+    """Dew's API at the base holds `owner.old`, a constructor's parameter, and the change renames it
+    `owner.new` (None: keeps it), committed: `recorded` the base, `change` the head. The rename to declare."""
+    (root / "src/dew").mkdir(parents=True, exist_ok=True)
+    api = "class {0}:\n    def __init__(self, {1}):\n        self.{1} = {1}\n"
+    (root / "src/dew/api.py").write_text(api.format(owner, old))
+    git(root, "add", "src/dew")
+    git(root, "commit", "-qm", "Dew's API")
+    git(root, "checkout", "-q", "-b", "change")
+    (root / "src/dew/api.py").write_text(api.format(owner, new or old))
+    git(root, "commit", "-qam", "Dew's API renamed", "--allow-empty")
+    return f"{owner}.{old}={owner}.{new or old}"
 
 
 def recordings(root: Path) -> dict[str, bytes]:
@@ -110,9 +125,11 @@ def test_a_rename_rewrites_the_digests_of_the_programs_it_reaches_and_keeps_ever
     shown = programs(site)
     shared = sorted({keyword.arg for keyword in passed(shown["lm"])} &
                     {keyword.arg for keyword in passed(shown["hero.py"])})
+    declared = api_renamed(site, "Config", shared[0], f"{shared[0]}_renamed")
     for relative in (FRAMEWORK, HERO):
         renamed_keyword(site, relative, shared[0], f"{shared[0]}_renamed")
-    assert redigest(site).returncode == 0
+    assert redigest(site).returncode == 1 and recordings(site) == before, "a rename not declared"
+    assert redigest(site, declared).returncode == 0
     after = recordings(site)
     changed = {path for path in before if before[path] != after[path]}
     assert {"site/src/data/capture.json", "site/public/examples/framework/lm/capture.json"} <= changed
@@ -125,7 +142,29 @@ def test_a_rename_rewrites_the_digests_of_the_programs_it_reaches_and_keeps_ever
     assert (hero["cell_sha256"], hero["script_sha256"]) == (program_digest(site, "hero"),
                                                             program_digest(site, "hero.py"))
     # Run again, it finds every recording of the program the page shows.
-    assert redigest(site).returncode == 0 and recordings(site) == after
+    assert redigest(site, declared).returncode == 0 and recordings(site) == after
+
+
+def an_operation(source: str) -> tuple[ast.Attribute, str]:
+    """An attribute the program reads, and another the program reads by a name it does not: swapped, the
+    program runs another operation, as np.sin for np.cos."""
+    read = [node for node in ast.walk(ast.parse(source)) if isinstance(node, ast.Attribute)]
+    names = sorted({node.attr for node in read})
+    return read[0], next(name for name in names if name != read[0].attr)
+
+
+def test_a_program_that_runs_another_operation_keeps_no_recording(site):
+    """A recorded program whose call reaches another operation (np.sin for np.cos) prints what its recording
+    does not show: refused, with no --rename, with a --rename naming no API of Dew's, and with one Dew's API
+    holds but the change does not make, and nothing written."""
+    before = recordings(site)
+    unchanged = api_renamed(site, "Config", "steps", None)
+    source = (site / HERO).read_text()
+    node, other = an_operation(source)
+    rewrite(site, HERO, [(node, f"{ast.get_source_segment(source, node.value)}.{other}")])
+    assert programs(site)["hero.py"] != source, "the hero's script is a recorded program"
+    for declared in ((), (f"{node.attr}={other}",), (unchanged,), ("Config.steps=Config.absent",)):
+        assert redigest(site, *declared).returncode == 1 and recordings(site) == before, declared
 
 
 def numbered(source: str) -> ast.keyword:
@@ -233,11 +272,12 @@ def recorded(root: Path, source: str) -> None:
 def test_the_programs_parsed_roles_decide_what_is_a_rename(site, before, after, kept):
     """A rename is read in the parsed program: an import's name and its binding apart, a parameter a
     variable and the keyword a call to its function passes it, an f-string's conversion and literal text
-    what it prints."""
+    what it prints, and an API's name renamed as Dew's rename declares it (Config.steps)."""
     recorded(site, before)
+    declared = api_renamed(site, "Config", "steps", "num_steps")
     was = recordings(site)
     (site / TEXT).write_text(after)
-    assert redigest(site).returncode == (0 if kept else 1)
+    assert redigest(site, declared).returncode == (0 if kept else 1)
     changed = {path for path in was if was[path] != recordings(site)[path]}
     assert changed == ({"site/public/examples/text/capture.json"} if kept else set())
 
