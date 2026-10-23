@@ -34,8 +34,9 @@ from dew.data.prompts import PromptRecord
 from dew.inference import Draw, VLLMGenerateServer
 from dew.objectives.rl.episodes import EpisodeStatus, Observation
 from dew.objectives.rl.records import episode_from_record
+from dew.objectives.rl.rollout import prompt_tasks
 from dew.objectives.rl.sessions import Status, Task, Transcript, pack
-from dew.objectives.rl.sources import EnvironmentSource, PromptSource, prompt_tasks
+from dew.objectives.rl.sources import EnvironmentSource, PromptSource
 from dew.rl.sandbox import ContainerRunner, SandboxFleet
 from dew.sampling import Sampling
 
@@ -96,7 +97,7 @@ class Counter:
             return Observation((), EpisodeStatus.ERROR, "container exited")
         if self.fail == "malformed":
             return {"context": [1, 2]}
-        self.context = action.context + action.tokens + (4,)
+        self.context = action.prompt + action.tokens + (4,)
         reward = None if self.paid is None else self.paid[self.steps - 1]
         if self.steps == self.turns:
             return Observation((), EpisodeStatus.COMPLETED, "tests passed", reward)

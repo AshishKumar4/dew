@@ -14,10 +14,10 @@ import numpy as np
 import optax
 from flax import linen as nn
 
-from dew.inference import TextGeneration
+from dew.inference import Draw, TextGeneration
 from dew.nn.protocols import OutputTable
-from dew.objectives.rl import GRPOObjective
-from dew.objectives.rl.episodes import Action, EpisodeId, EpisodeRollout, EpisodeStatus, Observation
+from dew.objectives.rl import GRPOObjective, RolloutScheduler, Snapshot, Synchronous, Task
+from dew.objectives.rl.episodes import EpisodeCollector, EpisodeId, EpisodeStatus, Observation
 from dew.rl.sandbox import SandboxLimits, SubprocessEnvironment
 from dew.sampling import Sampling
 from dew.training import Trainer
@@ -37,9 +37,9 @@ def environment(mode: str = "ok", *arguments: str, **limits) -> SubprocessEnviro
     return SubprocessEnvironment((sys.executable, str(worker), mode, *arguments), SandboxLimits(**limits))
 
 
-def action(context, *tokens: int) -> Action:
-    return Action(tuple(context), tokens, (-.1,) * len(tokens), (0.,) * len(tokens),
-                  terminated=True, policy_step=0, sampling=SAMPLING)
+def action(context, *tokens: int) -> Draw:
+    draw = Draw(tuple(context), tokens, (-.1,) * len(tokens), "stop", 0, (0.,) * len(tokens))
+    return draw.checked(SAMPLING)
 
 
 def transition_logits():
@@ -117,7 +117,7 @@ class SquareSession:
             self.answer = value * value
             self.harness.calls.append((self.identity, value, self.answer))
             observation = {9: NINE, 16: SIXTEEN}[self.answer]
-            return Observation((*action.context, *action.tokens, observation),
+            return Observation((*action.prompt, *action.tokens, observation),
                                detail=f"square({value}) = {self.answer}",
                                reward=None if paid is None else paid[0])
         answer = {ANSWER_NINE: 9, ANSWER_SIXTEEN: 16, WRONG: 8}[command[0]]
@@ -152,25 +152,40 @@ def verify(episode):
 
 
 def build(harness=None, *, record=None, accumulation=1, **changes):
+    """A trainer and the episode collector its scheduler (`scheduled`) draws through."""
     model = ToolPolicy()
     objective = GRPOObjective(model, PROMPT + RESPONSE - 1, beta=.05)
     trainer = Trainer(objective, optax.sgd(.05), key=jax.random.key(19), accumulation=accumulation)
-    rollout = EpisodeRollout(
+    collector = EpisodeCollector(
         TextGeneration(model, objective.init(jax.random.key(0))),
         harness or Harness(),
         verify,
         PROMPT,
         RESPONSE,
         TURNS,
-        groups=GROUPS,
         sampling=SAMPLING,
         record=record,
     )
-    return trainer, replace(rollout, **changes)
+    return trainer, replace(collector, **changes)
 
 
-def collect(rollout, state, key=23):
-    return rollout.collect(state, {"task_id": np.array([31], np.int32)}, jax.random.key(key))
+def scheduled(collector, **changes) -> RolloutScheduler:
+    """The trainer's rollout over `collector`: `GROUPS` episodes of each task, collected at each call."""
+    return RolloutScheduler(Synchronous(collector), groups=GROUPS, **changes)
+
+
+def snapshot(state, key=23) -> Snapshot:
+    return Snapshot(state.variables, int(state.step), int(state.updates), jax.random.key(key))
+
+
+def trained(collector, state, key=23, tasks=(31,)):
+    """The batch the trainer's scheduler (`scheduled`) packs from one cohort of `tasks`' episodes."""
+    return scheduled(collector)(state, {"task_id": np.asarray(tasks, np.int32)}, jax.random.key(key))
+
+
+def collect(collector, state, key=23, tasks=(31,)):
+    """One cohort of `GROUPS` episodes of each of `tasks` under `state`, as the scheduler collects it."""
+    return collector.episodes(snapshot(state, key), [Task(str(task)) for task in tasks], GROUPS)
 
 
 def per_call(batch, name, episodes):

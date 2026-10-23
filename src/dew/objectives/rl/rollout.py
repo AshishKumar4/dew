@@ -4,14 +4,14 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Sequence
 
 import jax.numpy as jnp
 import numpy as np
 
 from dew.data.prompts import INFO_KEY, LENGTH_KEY, PROMPT_KEY, SOURCE_KEY, TRUTH_KEY, PromptRecord
 from dew.inference.rollouts import Draw, InfrastructureError, response
-from dew.nn.inputs import ModelInputs, local_rows
+from dew.nn.inputs import ModelInputs, local_rows, pad_token_rows
 from dew.objectives.base import Batch
 from dew.sampling.text import Sampling
 
@@ -131,17 +131,11 @@ class PolicyCollector:
     def collect(self, snapshot: Snapshot, tasks: Sequence[Task], samples: int) -> list[list[Session]]:
         prompts = [PromptTask.of(task) for task in tasks]
         width = prompts[0].width
-        rows = np.full((len(prompts), width), self.sampling.pad, np.int32)
-        for row, prompt in enumerate(prompts):
-            rows[row, width - len(prompt.ids):] = prompt.ids
-        lengths = np.asarray([len(prompt.ids) for prompt in prompts])
-        # The lengths are already here on the host, so a batch of whole
-        # prompts states its validity by carrying none.
-        fields: Mapping[str, jnp.ndarray] = ({
-            "attention_mask": jnp.arange(width)[None, :] >= width - jnp.asarray(lengths)[:, None]}
-            if np.any(lengths < width) else {})
+        rows, fields = pad_token_rows([prompt.ids for prompt in prompts], pad_id=self.sampling.pad,
+                                      width=width)
+        inputs = ModelInputs(jnp.asarray(rows), {name: jnp.asarray(value) for name, value in fields.items()})
         generated = self.objective.policy(snapshot.variables, self.sampling)(
-            ModelInputs(jnp.asarray(rows), fields), self.max_new_tokens, key=snapshot.key, n=samples).host()
+            inputs, self.max_new_tokens, key=snapshot.key, n=samples).host()
 
         def grouped(values: np.ndarray) -> np.ndarray:
             return values.reshape(len(prompts), samples, *values.shape[1:])

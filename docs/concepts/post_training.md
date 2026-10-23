@@ -6,8 +6,8 @@ Post-training changes how a trained model behaves. Each method in Dew is an obje
 |---|---|---|---|
 | Supervised fine-tuning (SFT) | Example answers | `presets.sft`, or rows with `text_roles` | `LMObjective(loss_role=Role.ASSISTANT)` |
 | Direct preference optimization (DPO) | A preferred and a rejected answer to one prompt | `presets.preferences` | `DPOObjective` |
-| Group-relative policy optimization (GRPO) | A reward on answers the model samples | `presets.prompts` and `SampledRollout`, or a rollout scheduler | `GRPOObjective` |
-| Proximal policy optimization (PPO) | A reward, plus a learned critic | `EpisodeRollout` and `PPORollout` | `PPOObjective` |
+| Group-relative policy optimization (GRPO) | A reward on answers the model samples | `presets.prompts` and `RolloutScheduler.sampled`, or a scheduler over any session source | `GRPOObjective` |
+| Proximal policy optimization (PPO) | A reward, plus a learned critic | `EpisodeCollector` and `PPORollout` | `PPOObjective` |
 | Flow-GRPO | A reward on samples from a rectified-flow model | `FlowRollout` | `FlowGRPOObjective` |
 
 DPO and GRPO (with `beta > 0`) keep the starting weights as a frozen reference. [Language models](language_models.md) covers next-token training, and [Objectives](objectives.md) how models, objectives and the trainer fit together.
@@ -34,7 +34,7 @@ from dew.data import ByteTokenizer, Memory, presets
 from dew.data.chat import Role
 from dew.nn.backbones import CausalTransformer
 from dew.objectives.lm import LMObjective
-from dew.objectives.rl import DPOObjective, GRPOObjective, SampledRollout
+from dew.objectives.rl import DPOObjective, GRPOObjective, RolloutScheduler
 from dew.sampling import Sampling
 
 tokenizer = ByteTokenizer()
@@ -123,9 +123,9 @@ rl_data = Loader(train=lambda partition: itertools.repeat(prompt_batch), val=Non
                   records=8, batch=8)
 rl_objective = GRPOObjective(model, seq_len=len(story) + 7, beta=0.01,
                              variables=dpo_state.variables)
-rollout = SampledRollout(rl_objective, reward=reward, groups=4, max_new_tokens=8,
-                         sampling=Sampling(temperature=1.0, top_k=40),
-                         decode=tokenizer.decode)
+rollout = RolloutScheduler.sampled(rl_objective, reward, groups=4, max_new_tokens=8,
+                                   sampling=Sampling(temperature=1.0, top_k=40),
+                                   decode=tokenizer.decode)
 rl_state = Trainer(rl_objective, OptimConfig(rate=1e-4), key=jax.random.key(3),
                    rollout=rollout).fit(rl_data, steps=4, log_every=2)
 print(int(rl_state.updates), "GRPO updates")
@@ -140,7 +140,7 @@ Trained 4 steps in 0:00:04: first step after 3.76 s, then 13.0 step/s
 4 GRPO updates
 ```
 
-Each prompt produces four completions, and `SampledRollout.decode` turns each one into the text the reward reads. `seq_len` covers the prompt and the 8 response tokens, less one for the next-token shift. `beta` sets the coefficient of the KL term against the frozen reference. In one Colab run, 20 such steps trained a TinyStories decoder ([Language models](language_models.md)) with a reward of 1 for a completion that mentions a dog. Before training, 3 of 128 sampled completions mentioned a dog; after the 20 steps, all 128 did.
+Each prompt produces four completions, and `decode` turns each one into the text the reward reads. `seq_len` covers the prompt and the 8 response tokens, less one for the next-token shift. `beta` sets the coefficient of the KL term against the frozen reference. In one Colab run, 20 such steps trained a TinyStories decoder ([Language models](language_models.md)) with a reward of 1 for a completion that mentions a dog. Before training, 3 of 128 sampled completions mentioned a dog; after the 20 steps, all 128 did.
 
 [`recipes/chain.py`](../../recipes/chain.py) connects pretraining, SFT, distillation, DPO, GRPO and PPO stages ([Stage chains](#stage-chains)).
 
@@ -256,7 +256,7 @@ from dew.data import Memory, presets
 data = Memory([{"prompt": "dew"}] * 8).repeat().pipe(presets.prompts, "byte", max_prompt_len=8, batch=8)
 ```
 
-The preset produces left-padded `prompt` IDs of shape `[B, P]` and `prompt_length` of shape `[B]`, where `P` is `max_prompt_len`. A prompt that is too long is cut from the front, so its end is kept. The metadata columns are stored as fixed-width UTF-8 byte arrays, and `SampledRollout` turns them back into each row's `PromptRecord` for the reward:
+The preset produces left-padded `prompt` IDs of shape `[B, P]` and `prompt_length` of shape `[B]`, where `P` is `max_prompt_len`. A prompt that is too long is cut from the front, so its end is kept. The metadata columns are stored as fixed-width UTF-8 byte arrays, and `prompt_tasks` turns them back into each row's `PromptRecord` for the reward:
 
 ```text
 reward(completion: str, record: PromptRecord) -> float
@@ -264,9 +264,9 @@ reward(completion: str, record: PromptRecord) -> float
 
 `PromptRecord` (`dew.objectives.rl`) holds the row's `data_source`, its `ground_truth` as the source normalized it, and its `extra_info`, each the empty string where the row has none; a reward reads the fields it needs. A verl `compute_score(data_source, solution_str, ground_truth, extra_info)` enters through `dew.objectives.rl.verl.verl_reward`, and `compute_score(reward)` there hands a Dew reward to verl.
 
-Pick a reward whose score can be checked independently of training; for an exact-answer task, compare the decoded completion with the ground truth under a normalization rule you write down. `SampledRollout.decode` defaults to token IDs separated by spaces, not natural-language text, so a reward that reads text needs the tokenizer's decode function.
+Pick a reward whose score can be checked independently of training; for an exact-answer task, compare the decoded completion with the ground truth under a normalization rule you write down. `decode` defaults to token IDs separated by spaces, not natural-language text, so a reward that reads text needs the tokenizer's decode function.
 
-| `SampledRollout` field | Default | Meaning |
+| `RolloutScheduler.sampled` argument | Default | Meaning |
 |---|---|---|
 | `objective` | required | The `GRPOObjective` whose policy samples. |
 | `reward` | required | The reward callable above. |
@@ -311,17 +311,17 @@ Generation prefills the padded batch once and packs the real tokens into each ro
 
 ## Tool episodes
 
-`dew.objectives.rl.EpisodeRollout` collects multi-turn episodes from an environment you supply and an inference policy that can be bound to a set of weights. It works through the ordinary `Trainer(rollout=...)` hook and `GRPOObjective`. It does not pick an executor for you. Pass `dew.inference.TextGeneration(model, variables)` as its policy. Collection calls `policy.bind(snapshot)` once. Each call after that receives the exact context token IDs, a response budget, a key and `Sampling`, and returns a `Generation` with raw and behavior log-probabilities. Canvas generation is not an autoregressive policy and cannot supply these likelihoods.
+`dew.objectives.rl.EpisodeCollector` collects multi-turn episodes from an environment you supply and an inference policy that can be bound to a set of weights, and `RolloutScheduler.episodes(policy, environment, verifier, ...)` trains on them through the ordinary `Trainer(rollout=...)` hook and `GRPOObjective`. It does not pick an executor for you. Pass `dew.inference.TextGeneration(model, variables)` as its policy. Collection calls `policy.bind(snapshot)` once. Each call after that receives the exact context token IDs, a response budget, a key and `Sampling`, and returns a `Generation` with raw and behavior log-probabilities. Canvas generation is not an autoregressive policy and cannot supply these likelihoods.
 
 The input dataset yields integer `task_id` rows. Your environment factory receives an `EpisodeId` with the task, the attempted step, the sample index and a random seed, and returns an `Environment` to use as a context manager. Its `reset()` returns an `Observation` with the first context. `step(action)` takes a finished model turn and returns either the exact next context or a terminal result. The environment is responsible for decoding, validating tool calls, chat formatting, execution, timeouts and cleaning up resources. Dew itself never executes generated code by default.
 
 `SubprocessEnvironment(command, limits)`, in `dew.rl.sandbox`, is one environment factory you can use. It starts the argv `command` in its own session and temporary directory and exchanges JSON lines with it. A `reset` message holds the episode identity, and a `step` message holds the action's context, tokens, termination flag and policy step. Each reply has `context`, `status` and `detail`, and an optional number `reward`, the step's reward (`Observation.reward`).
 
-`SandboxLimits` sets RLIMIT_CPU and RLIMIT_AS in the worker, and a wall-clock deadline per session and a message size cap in the parent. On exit, Dew kills the worker's process group, and the worker gets SIGKILL if the parent dies. The worker runs with the caller's OS permissions and has no filesystem or network isolation, so untrusted code needs an outer sandbox. `tests/test_sandbox.py` runs a real worker through round trips, a hang, an exceeded memory limit, a crash, malformed output, parent death and a full `EpisodeRollout` cohort.
+`SandboxLimits` sets RLIMIT_CPU and RLIMIT_AS in the worker, and a wall-clock deadline per session and a message size cap in the parent. On exit, Dew kills the worker's process group, and the worker gets SIGKILL if the parent dies. The worker runs with the caller's OS permissions and has no filesystem or network isolation, so untrusted code needs an outer sandbox. `tests/test_sandbox.py` runs a real worker through round trips, a hang, an exceeded memory limit, a crash, malformed output, parent death and a full `EpisodeCollector` cohort.
 
 `Observation.status` tells apart running, completed, truncated, cancelled and error outcomes. Model EOS ends an action, and the environment decides when the episode ends. A response that hits its token limit without EOS is recorded as truncated and is not sent to a tool. A context longer than `max_prompt_tokens` also truncates the episode, without cutting off the input already recorded. `max_turns` limits the number of model calls.
 
-The verifier takes an `Episode` and returns a finite scalar reward. It sees the termination status, the result detail and every `Transition(action, observation)`, so it can score finished and truncated outcomes differently. An environment may also pay a step reward with each observation (`Observation.reward`), which becomes the reward of the call it paid for (`Call.reward`). An episode's return is the verifier's reward plus every step reward its calls earned. Group-relative advantages are computed over episodes of the same task. With `EpisodeRollout(credit="session")`, the default, every action token of an episode shares its episode's advantage. With `credit="turn"`, each turn compares the members' returns from that call on, at the same call index within the task's group, counting only the members that made a call at that turn, and each call's actions take their own advantage. Exceptions, cancellation and verifier failures abort the group before any update. The optional `record` callback receives completed or failed host records. `EpisodeFailure` and `EpisodeCancelled` carry the partial episode.
+The verifier takes an `Episode` and returns a finite scalar reward. It sees the termination status, the result detail and every `Transition(action, observation)`, so it can score finished and truncated outcomes differently. An environment may also pay a step reward with each observation (`Observation.reward`), which becomes the reward of the call it paid for (`Call.reward`). An episode's return is the verifier's reward plus every step reward its calls earned. Group-relative advantages are computed over episodes of the same task. With `RolloutScheduler.episodes(..., credit="session")`, the default, every action token of an episode shares its episode's advantage. With `credit="turn"`, each turn compares the members' returns from that call on, at the same call index within the task's group, counting only the members that made a call at that turn, and each call's actions take their own advantage. Exceptions, cancellation and verifier failures abort the group before any update. The optional `record` callback receives completed or failed host records. `EpisodeFailure` and `EpisodeCancelled` carry the partial episode.
 
 Verification runs while the environment context is still open, so a verifier you write can inspect temporary files or a live sandbox. Resources are released after verification, whether it succeeded or failed. If release fails, the episode is thrown out instead of being scored.
 
@@ -331,13 +331,13 @@ Only sampled actions, EOS included, count toward the loss mass, and observations
 
 Collection binds one snapshot of the variables until it returns. Every rank supplies the same number of task rows and agrees on budgets, sampling and clocks before it opens any environment. All local episode slots are sampled together in each round. Finished slots keep their global row positions with inert prompts whose outputs are thrown away, so episodes with different turn counts do not change the order of collectives or the random draws. Ranks agree on a tool, reset or verifier failure before the next generation, and every rank releases the environments it opened. The committed update clock stays in `policy_step`, and the attempted-work clock in the episode identities. Continuing from a checkpoint restores the Trainer and the input iterator.
 
-Projection accepts records from one collection binding only. Each episode and action has an internal origin identity, so mixing records from policies bound separately fails even when their attempt and update clocks match. You do not set this identity, and it is not a hash of the weights. Project batches you collected separately on their own. The identity does not affect random draws or whether replayed public records compare equal.
+Each episode records an internal origin identity of the collection that drew it, which the journal checks before it resumes a cohort, so records from policies bound separately are never mixed even when their attempt and update clocks match. You do not set this identity, and it is not a hash of the weights. The identity does not affect random draws or whether replayed public records compare equal.
 
 Both asyncio and concurrent-futures cancellations raise `EpisodeCancelled` with `CANCELLED` status. The original cancellation object is kept as its `__cause__`, and the environment exits under that original exception before the wrapper is raised. Cancelled observations that the environment returns itself have no source exception.
 
 `tests/test_tool_episodes.py` trains a small policy that samples a call to a square tool, receives the computed result and samples a final answer. It checks categorical gradients on actions only, raw and behavior probabilities, resource cleanup, failures and cancellation, and that Trainer updates match with and without a checkpoint restore. These tests run offline and check the lifecycle and the numbers. They do not show that a remote sandbox works.
 
-`tests/test_episode_pool.py` runs two real CPU processes with different episode turn counts. Their actions, likelihoods, projected arrays and updated parameters exactly match a single-process run on the same two global devices. It also runs a tool failure on one rank and a mismatched cohort configuration. Both end on all ranks together, without leaking any open environments.
+`tests/test_episode_pool.py` runs two real CPU processes with different episode turn counts. Their actions, likelihoods, packed arrays and updated parameters exactly match a single-process run on the same two global devices. It also runs a tool failure on one rank and a mismatched cohort configuration. Both end on all ranks together, without leaking any open environments.
 
 The lifecycle matches the responsibilities in [verl BaseTool](https://github.com/volcengine/verl/blob/main/verl/tools/base_tool.py): create, execute, calculate reward and release. verl's [multi-turn guide](https://verl.readthedocs.io/en/latest/sglang_multiturn/multiturn.html) describes assistant-only masks and warns about differences caused by retokenization. Dew keeps each actual model call instead of rebuilding sampled tokens from message deltas. A remote sandbox adapter would also have to handle creation, timeout policy and termination, as the [E2B Python SDK](https://github.com/e2b-dev/E2B/blob/main/packages/python-sdk/e2b/sandbox_sync/main.py) does. Dew bundles neither an E2B client nor a verl runtime adapter. `SubprocessEnvironment` covers only the local case with resource limits. For single-shot verification, `SandboxFleet` with `ContainerRunner` runs each program in a network-less container; see [asynchronous RLVR](#asynchronous-rlvr).
 
@@ -349,13 +349,13 @@ The lifecycle matches the responsibilities in [verl BaseTool](https://github.com
 
 A native row keeps its own `min_global_steps` and `max_global_steps`, and Dew writes its own only when a row had none. verl's own `extra_fields` come back in `VerlTrajectory.extras` and are written out unchanged. Rows with media (`multi_modal_data`, `mm_processor_kwargs`, `mm_processor_output`) are refused, because Dew's text trainer would score their placeholder IDs without the images or video. `from_verl(rows, media=True)` imports them for a round trip only. Import also refuses rows without behavior log probabilities, a version or a reward.
 
-Live, imported and journal-restored actions all go through the same validation: a nonempty context, nonnegative integer token ids (booleans excluded), aligned finite likelihoods, and a termination flag that agrees with the configured EOS. Tokens after EOS are refused. Checking the upper bound against the vocabulary is left to the caller, which knows the model.
+Live, imported and journal-restored draws all go through the same validation (`Draw`): a nonempty context, nonnegative integer token ids (booleans excluded), aligned finite likelihoods, and a termination flag that agrees with the configured EOS. Tokens after EOS are refused. Checking the upper bound against the vocabulary is left to the caller, which knows the model.
 
 `tools/verl_interop_reference.py` writes the fixtures `tests/test_verl_interop.py` reads from verl revision `12ebe0cb4d300c58449fb6c675379e8700015c51`, run in an isolated environment: four rows of verl's `gsm8k_tool_agent_loop.py` parquet and two `AgentLoopOutput` dumps with their `as_dict()` tensors. One is a tool loop with routed experts. The other is a video turn whose `mm_processor_output` comes from `build_sglang_video_payload`. The test imports and re-exports verl's rows unchanged, and checks that packing matches verl's tensor mapping. `Prompts` reads the verl parquet's `reward_model.ground_truth`, keeps `tools_kwargs` inside `extra_info`, carries `ability` there too, beside them, for the reward, and reads and drops `agent_name`. Dew does not import torch or verl at runtime.
 
 ### Episode journal
 
-Set `EpisodeRollout(..., journal=EpisodeJournal("run/episodes"))` to save sampled pending actions and completed turns in a SQLite WAL, one per rank. The environment must implement `get_state() -> bytes` and `set_state(state: bytes) -> None`. Those snapshots must hold the tool state and any workspace state that later calls or the verifier need. The subprocess adapter exposes these operations as JSON requests, with base64 state strings and a `{"restored": true}` acknowledgment. Environments without snapshots still work when you do not use a journal.
+Set `EpisodeCollector(..., journal=EpisodeJournal("run/episodes"))`, or `RolloutScheduler.episodes(..., journal=...)`, to save sampled pending actions and completed turns in a SQLite WAL, one per rank. The environment must implement `get_state() -> bytes` and `set_state(state: bytes) -> None`. Those snapshots must hold the tool state and any workspace state that later calls or the verifier need. The subprocess adapter exposes these operations as JSON requests, with base64 state strings and a `{"restored": true}` acknowledgment. Environments without snapshots still work when you do not use a journal.
 
 Recovery restores completed turns with their exact contexts, raw and behavior likelihoods, rewards and environment snapshots. Pending draws are saved before the tool runs and reused after a crash. A completed turn is committed before the next tool call or training update. An external effect that happens between a pending record and its completed commit can run twice, so the environment must use the episode identity and action to make such effects idempotent. The journal does not promise that arbitrary external effects happen exactly once, and it cannot resume in the middle of a tool call.
 
@@ -367,7 +367,7 @@ Reinforcement learning with verifiable rewards (RLVR) scores each completion by 
 
 ### Rollout servers
 
-`dew.inference.RolloutServer` is the interface for a server that samples continuations of token prompts under a versioned policy. `submit(prompt_ids, max_new_tokens, key=...)` returns a future `Draw` with the sampled IDs, their behavior log-probabilities, the raw-policy log-probabilities when the backend has them, whether the draw terminated, and the policy `version` the request was submitted under. A draw terminates on one of the `Sampling`'s EOS IDs or on the ID that completes one of its `stop` strings, and keeps that ID; otherwise its budget, or a criterion that truncates it such as `MaxNewTokens`, cut it. vLLM and SGLang match the stop strings on the text they decode and return the IDs through the completing one, as Dew's own `Server` does; vLLM also keeps a speculative block's IDs past it, so `OpenAIRolloutServer` takes the policy's tokenizer (`decode=`) and cuts the draw at the first ID whose text completes the string. `load(variables, version)` pushes new weights. Generation continues across a push, so a draw's version is that of the oldest weights that may have produced any of its tokens.
+`dew.inference.RolloutServer` is the interface for a server that samples continuations of token prompts under a versioned policy. `submit(prompt_ids, max_new_tokens, key=...)` returns a future `Draw` with the sampled IDs, their behavior log-probabilities, the raw-policy log-probabilities when the backend has them, its `finish_reason` (`stop` where it terminated, `length` where its budget cut it), and the policy `version` the request was submitted under. A draw terminates on one of the `Sampling`'s EOS IDs or on the ID that completes one of its `stop` strings, and keeps that ID; otherwise its budget, or a criterion that truncates it such as `MaxNewTokens`, cut it. vLLM and SGLang match the stop strings on the text they decode and return the IDs through the completing one, as Dew's own `Server` does; vLLM also keeps a speculative block's IDs past it, so `OpenAIRolloutServer` takes the policy's tokenizer (`decode=`) and cuts the draw at the first ID whose text completes the string. `load(variables, version)` pushes new weights. Generation continues across a push, so a draw's version is that of the oldest weights that may have produced any of its tokens.
 
 - `NativeRolloutServer(Server.from_task(task, slots=..., capacity=...))` drives Dew's continuous-batching `Server` on a background thread. `load` copies the trainer's tree onto the served device in place (`Server.reload`) between two steps, casting floating leaves to the served precision, so you can train in float32 and serve in bfloat16. Draws carry both raw and behavior likelihoods.
 - `OpenAIRolloutServer(OpenAICompletion(name, client, provider="vllm" or "sglang"), sampling, weights)` posts token-ID prompts to a vLLM or SGLang completions endpoint. Each request has the `Sampling` controls, a seed, `logprobs=0` and the field that makes the engine return the sampled IDs: `return_tokens_as_token_ids` for vLLM, which puts them in the logprob tokens, and `return_token_ids` for SGLang, which lists them on the choice. So the draw holds the IDs the engine sampled, and no text has to be retokenized.
@@ -414,7 +414,7 @@ Reinforcement learning with verifiable rewards (RLVR) scores each completion by 
 
 ### Rollout scheduler
 
-`RolloutScheduler(objective, source, weights, width=W, rows=N, tasks=..., groups=G, max_lag=1, ahead=1, sync_every=1)` is a trainer `Rollout` for any `SessionSource`. Train on `scheduler.tasks(dataset)` with `Trainer(..., rollout=scheduler)`. `tasks` turns a batch into `Task`s; `task_ids` reads integer `task_id` rows, and `prompt_tasks` reads prompt rows.
+`RolloutScheduler(acquisition, tasks=..., groups=G)` is the trainer's `Rollout` over token sessions, however they are drawn. `Synchronous(collector)` draws each call's sessions at the call from the variables the step trains: `RolloutScheduler.sampled` and `RolloutScheduler.episodes` build it over `PolicyCollector` and `EpisodeCollector`, every process of the trainer's mesh enters the draw, a failed sample abandons its group, and `old_log_probs` are the raw likelihoods the collector drew, which are the proximal policy's. `Asynchronous(source, weights, objective, width=W, rows=N, max_lag=1, ahead=1, sync_every=1, max_attempts=3)` keeps rollouts from any `SessionSource` in flight ahead of the trainer, as the rest of this section describes. Train on `scheduler.tasks(dataset)` with `Trainer(..., rollout=scheduler)`. `tasks` turns a batch into `Task`s; `task_ids` reads integer `task_id` rows, and `prompt_tasks` reads prompt rows.
 
 The wrapped stream registers each batch as the trainer's prefetch reads it. When the trainer gives the scheduler batch `i`, the scheduler submits batches `i + 1` through `i + ahead` under the version `weights` serves at that moment. Batch `i` itself was submitted `ahead` calls earlier and has been running since. The scheduler reads nothing beyond the trainer's prefetch, so the checkpointed data position is still the trainer's. A resumed run re-reads and resubmits whatever was in flight, and reopening the stream cancels the rollouts the old stream left running.
 
@@ -433,7 +433,7 @@ The scheduler pushes weights through `weights.load(params, updates)` whenever th
 
 `pack(sessions, W, rows=N)` packs the admitted groups into fixed `[N, W]` rows with per-rollout advantages. A session whose calls do not extend each other packs as one chain per call, so a complete group is admitted only if its chains fit in `N` rows beside the groups admitted before it. Otherwise the group is cut, counted in the record, and the batch trains without it. Size `N` for the chains a group can split into, because a group that cannot fit its chains in `N` rows on its own raises, whatever order the groups finish in.
 
-`old_log_probs` is always rescored under the trainer's current weights, which serve as the proximal policy ([AReaL](https://arxiv.org/abs/2505.24298)). `behavior_log_probs` keeps what the engine reported, and `GRPOObjective(behavior_importance=...)`, a TIS cap or an IcePop band, weights each token by proximal over behavior. Any schedule that allows lag needs this correction.
+Asynchronously, `old_log_probs` is rescored under the trainer's current weights, which serve as the proximal policy ([AReaL](https://arxiv.org/abs/2505.24298)). `behavior_log_probs` keeps what the engine reported, and `GRPOObjective(behavior_importance=...)`, a TIS cap or an IcePop band, weights each token by proximal over behavior. Any schedule that allows lag needs this correction.
 
 `log` receives a `SchedulerRecord` per call. It has the oldest admitted version and lag, admitted groups, resubmissions by cause, cancellations, abandoned and cut groups, seconds waited, and `session_metrics` over the admitted rollouts and their packed batch, with each rollout's latency from submission to finish.
 
@@ -452,7 +452,7 @@ Two sources run on a `RolloutServer`. `PromptSource(server, reward, decode=..., 
 - `ProcessRunner` starts the program through the `SubprocessEnvironment` launcher: RLIMIT_CPU, RLIMIT_AS, no core dumps, its own session, SIGKILL on parent death and a minimal environment. The process group is killed at the wall deadline, on excess output, and after exit. It keeps your user, filesystem and network, so a program can read and reach whatever you can.
 - `ContainerRunner(image, runtime="docker")` runs each program in a fresh container with no network, a read-only root, the job directory mounted read-only at `/work`, all capabilities dropped, `no-new-privileges`, an unprivileged user, and memory, CPU-share, process-count and CPU-time limits. The container is killed by name at the deadline. Use this runner for untrusted code.
 
-A reward is a `Reward` callable, `(completion, record) -> float`, that the recipe supplies, and it works with both `SampledRollout` and `PromptSource`. `examples/train_rlvr.py` defines `CodeReward(fleet)`, which extracts the last fenced `python` block from a completion and runs it once per test case. The record's ground truth is a JSON list of `{"stdin", "stdout"}` cases, and the reward is the fraction of cases whose stdout matches line by line (`outputs_match`), or all-or-nothing with `all_or_nothing=True`.
+A reward is a `Reward` callable, `(completion, record) -> float`, that the recipe supplies, and it works with both `RolloutScheduler.sampled` and `PromptSource`. `examples/train_rlvr.py` defines `CodeReward(fleet)`, which extracts the last fenced `python` block from a completion and runs it once per test case. The record's ground truth is a JSON list of `{"stdin", "stdout"}` cases, and the reward is the fraction of cases whose stdout matches line by line (`outputs_match`), or all-or-nothing with `all_or_nothing=True`.
 
 `MathReward()` in `dew.rl.sandbox` reads the last `\boxed{}` answer and compares it with the record's reference as an exact rational, so `0.5`, `1/2` and `\frac{1}{2}` agree. `PromptSource` scores each completion on a thread pool as its draw finishes, so verification overlaps generation and the update.
 
@@ -462,7 +462,7 @@ A reward is a `Reward` callable, `(completion, record) -> float`, that the recip
 
 `dew.objectives.rl.sessions` defines the records any recording gateway can supply. A `Call` is the session's `dew.inference.Draw`: the `prompt` IDs the engine read, the `tokens` it drew (EOS included on a natural stop), one engine-reported `behavior_log_probs` entry per sampled ID, a `finish_reason`, the policy `version` served when the request was submitted, and the raw-policy `raw_log_probs` where the engine reports them; a call adds the step `reward` the environment paid and its `transcript`. A `Session` is one harness session, with `task`, `group`, `sample`, `attempt`, its calls in submission order, a `Status` (`COMPLETED`, `TRUNCATED`, `AGENT_ERROR`, `INFRA_ERROR`, `CANCELLED`), the verifier's `reward`, its `components` and a `detail` string. A `SessionSource` turns a `Task(id, data)` into futures of sessions.
 
-`pack(sessions, width, rows=None, estimator="group", truncation="mask", credit="session")` builds one training batch. `credit` assigns advantages per session or per turn, as `EpisodeRollout` does, from each session's return: the reward it trains on plus its calls' rewards. It merges call k + 1 into call k's chain only when call k + 1's prompt IDs start with every ID of the chain so far, sampled IDs included. It never merges on a prompt-only prefix, because that would splice sampled IDs into a context the model did not see. Chains are packed first-fit into `[rows, width]` with `text_segment_ids` and `text_positions`, so attention and rotary positions stay inside each chain. Every column is aligned with `input_ids`: `response_mask`, `behavior_log_probs`, `versions`, `session_index`, `call_index`, `advantages` and `session_weights`.
+`pack(sessions, width, rows=None, estimator="group", truncation="mask", credit="session")` builds one training batch. `credit` assigns advantages per session or per turn, as tool episodes do, from each session's return: the reward it trains on plus its calls' rewards. It merges call k + 1 into call k's chain only when call k + 1's prompt IDs start with every ID of the chain so far, sampled IDs included. It never merges on a prompt-only prefix, because that would splice sampled IDs into a context the model did not see. Chains are packed first-fit into `[rows, width]` with `text_segment_ids` and `text_positions`, so attention and rotary positions stay inside each chain. Every column is aligned with `input_ids`: `response_mask`, `behavior_log_probs`, `versions`, `session_index`, `call_index`, `advantages` and `session_weights`.
 
 Calls that recorded `routed_experts` add a `routed_experts` column, `[rows, width, layers, top_k]` in the engine's dtype, and `routed`, which is true where a record covers the ID. Calls that recorded a `support` add `support_ids` and `support_columns`, both `[rows, support_capacity]`. They hold each row's kept IDs back to back, each tagged with the column of the sampled ID it belongs to, and padded with -1. `support_capacity` is then required (the scheduler takes it too), so that every batch has one shape; size it at top-k times the number of sampled IDs a row holds.
 
@@ -500,7 +500,7 @@ With Qwen3 (`Qwen/Qwen3-0.6B`), only a reasoning turn followed by a tool-role ob
 
 `PPOObjective(model, seq_len, critic=..., value_coefficient=.5, value_clip=.2, beta=...)` trains the policy and critic as two subtrees of one variables tree, with the ordinary optimizer. `ValueHead(backbone)` adds a scalar Dense head on a decoder's hidden states. A custom critic can instead return one scalar per token position from packed token ids with their `segment_ids` and `positions`. The critic is initialized separately from the policy. The unit-decay reference covers only the policy subtree.
 
-`PPORollout(objective, episodes, gamma=1., lam=.95)` wraps an `EpisodeRollout` and adds critic evaluation and GAE. The collector's policy is `objective.policy(variables)`, which selects the policy subtree when it is bound to the Trainer snapshot. GAE runs over the sampled actions of a whole episode in draw order, across tool turns, chains and rows. Each step reward the environment paid goes on the last action of the call it paid for, and the verifier's reward on the episode's last action. Advantages are whitened over the global set of actions before training. A cohort with exactly one trainable action token is refused, because its whitening is undefined. A cohort with none, such as one where every episode truncated, returns zero targets and makes no update. Completed episodes have zero tail bootstrap, following the pinned verl convention, and truncated ones are masked.
+`PPORollout(objective, episodes, groups=2, gamma=1., lam=.95)` collects `groups` episodes of each task through the rollout scheduler over the `EpisodeCollector` `episodes`, and adds critic evaluation and GAE. The collector's policy is `objective.policy(variables)`, which selects the policy subtree when it is bound to the Trainer snapshot. GAE runs over the sampled actions of a whole episode in draw order, across tool turns, chains and rows. GAE reads the packed `token_rewards`: each step reward the environment paid on the last action of the call it paid for, and the verifier's reward on the episode's last action. Advantages are whitened over the global set of actions before training. A cohort with exactly one trainable action token is refused, because its whitening is undefined. A cohort with none, such as one where every episode truncated, returns zero targets and makes no update. Completed episodes have zero tail bootstrap, following the pinned verl convention, and truncated ones are masked.
 
 The prepared batch keeps `old_log_probs`, `behavior_log_probs` and `response_mask`, and adds `old_values`, `advantages` and `returns`, each shaped like the packed `input_ids`. Both losses reduce over the same action-token mass, so PPO keeps token-mean aggregation and refuses sequence masks. `value_coefficient` scales the half-squared critic loss, and `value_clip` clips predictions around the recorded values. Policy clipping, KL strength and the optional behavior-importance cap are the same controls as in GRPO. You can also keep these targets in a dataset and run several PPO updates on them without sampling again.
 
@@ -519,7 +519,7 @@ from flax import linen as nn
 from dew import Trainer
 from dew.data.dataset import Loader
 from dew.nn.protocols import OutputTable
-from dew.objectives.rl import (EpisodeRollout, EpisodeStatus, Observation, PPOObjective,
+from dew.objectives.rl import (EpisodeCollector, EpisodeStatus, Observation, PPOObjective,
                                PPORollout, ValueHead)
 from dew.sampling import Sampling
 
@@ -612,11 +612,10 @@ def verify(episode):
 key = jax.random.key(19)
 objective = PPOObjective(ToolPolicy(), seq_len=10,
                          critic=ValueHead(TokenFeatures()), beta=.03)
-episodes = EpisodeRollout(objective.policy(objective.init(key)), harness, verify,
-                          max_prompt_tokens=8, max_new_tokens=3, max_turns=3,
-                          groups=4, sampling=SAMPLING)
+episodes = EpisodeCollector(objective.policy(objective.init(key)), harness, verify,
+                            max_prompt_tokens=8, max_new_tokens=3, max_turns=3, sampling=SAMPLING)
 trainer = Trainer(objective, optax.sgd(.05), key=key,
-                  rollout=PPORollout(objective, episodes, gamma=.97, lam=.9))
+                  rollout=PPORollout(objective, episodes, groups=4, gamma=.97, lam=.9))
 data = Loader(train=lambda partition: itertools.repeat({
     "task_id": np.arange(jax.device_count(), dtype=np.int32)}),
     val=None, records=None, batch=jax.device_count())
@@ -688,8 +687,8 @@ On several hosts, every rank takes part in generation. Rewards run on rank zero.
 | `"pretrain"` | `presets.lm` | `LMObjective`, every token | none |
 | `"sft"` | `presets.sft` | `LMObjective(loss_role=Role.ASSISTANT)` | none |
 | `"dpo"` | `presets.preferences` | `DPOObjective` | none |
-| `"grpo"` | `presets.prompts` | `GRPOObjective` | `SampledRollout` |
-| `"ppo"` | `batch(n)` over `task_id` rows | `PPOObjective` | `PPORollout` over an `EpisodeRollout` |
+| `"grpo"` | `presets.prompts` | `GRPOObjective` | `RolloutScheduler.sampled` |
+| `"ppo"` | `batch(n)` over `task_id` rows | `PPOObjective` | `PPORollout` over an `EpisodeCollector` |
 
 `Recipe.run` checks each stage's data against its loss by the fields the chain writes, and refuses a mismatch by name.
 
@@ -707,7 +706,7 @@ The [LM recipe](../recipes.md) trains the `lm`, `masked_diffusion` and `block_di
 
 ## Scope and numerical checks
 
-Multi-turn text episodes run through `EpisodeRollout` and environments you supply, including on coordinated JAX process pools and with the local `SubprocessEnvironment`. `EpisodeJournal` restores completed turn boundaries for environments that can snapshot their state. Dew does not bundle remote sandbox adapters for episodes; `SandboxFleet` runs verification programs in local processes or containers.
+Multi-turn text episodes run through `EpisodeCollector` and environments you supply, including on coordinated JAX process pools and with the local `SubprocessEnvironment`. `EpisodeJournal` restores completed turn boundaries for environments that can snapshot their state. Dew does not bundle remote sandbox adapters for episodes; `SandboxFleet` runs verification programs in local processes or containers.
 
 The episode tests cover continuing from a checkpoint both after an optimizer update and in the middle of a two-microbatch accumulation window. They also check that an environment error or a cancellation leaves the previous checkpoint intact. Recovering a turn also needs a journal and complete environment snapshots. Read [checkpoints](../guides/checkpoints.md) and [evaluation](../guides/evaluation.md) before you rely on these paths in a long run.
 

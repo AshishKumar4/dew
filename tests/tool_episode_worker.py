@@ -17,7 +17,7 @@ def main() -> None:
     if processes > 1:
         jax.distributed.initialize(coordinator_address=coordinator, num_processes=processes,
                                    process_id=rank, local_device_ids=[0], initialization_timeout=30)
-    from episode_support import Harness, SquareSession, build
+    from episode_support import Harness, SquareSession, build, scheduled
 
     from dew.coordination import collective_host
     from dew.data.dataset import Loader
@@ -43,9 +43,16 @@ def main() -> None:
         finally:
             harness.closed.append(identity)
 
-    trainer, rollout = build(environment=environment, record=records.append)
+    trainer, collector = build(environment=environment, record=records.append)
     if mode == "mismatch" and rank == 1:
-        rollout = replace(rollout, max_turns=rollout.max_turns + 1)
+        collector = replace(collector, max_turns=collector.max_turns + 1)
+    scheduler, trained = scheduled(collector), []
+
+    def rollout(state, batch, key):
+        """The scheduler's call, keeping the batch it hands the step."""
+        trained.append(scheduler(state, batch, key))
+        return trained[-1]
+
     trainer.rollout = rollout
     width = 2 // processes
     task_ids = np.arange(2, dtype=np.int32)[rank * width:(rank + 1) * width]
@@ -66,15 +73,13 @@ def main() -> None:
         np.savez(output.with_suffix(".npz"), **{
             jax.tree_util.keystr(path): np.asarray(value)
             for path, value in jax.tree_util.tree_flatten_with_path(parameters)[0]})
-        batch = rollout.project(records)
-        arrays = collective_host(shard_batch(trainer.device_mesh, batch), phase="episode pool test batch")
+        arrays = collective_host(shard_batch(trainer.device_mesh, trained[0]),
+                                 phase="episode pool test batch")
         np.savez(output.with_suffix(".batch.npz"), **arrays)
     public, bindings = [], set()
     for episode in records:
         row = asdict(episode)
         bindings.add(row.pop("_binding_id"))
-        for transition in row["transitions"]:
-            bindings.add(transition["action"].pop("_binding_id"))
         public.append(row)
     output.write_text(json.dumps({
         "episodes": public, "bindings": sorted(bindings), "error": failed, "failure": failure,

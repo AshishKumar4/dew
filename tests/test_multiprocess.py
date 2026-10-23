@@ -1056,7 +1056,7 @@ def test_a_pool_agrees_one_validity_schema_when_only_some_ranks_padded(tmp_path)
     Without the agreement this fails in generation with "generation input
     shapes and sampling must agree across processes", which is also how
     test_a_pool_samples_rollouts_with_different_lengths_and_eos fails, since
-    `SampledRollout` omits validity for a rank whose prompts are whole. With
+    `PolicyCollector` omits validity for a rank whose prompts are whole. With
     generation agreed but placement left alone, a rank dies inside the step
     and the coordination service takes the pool down with it.
     """
