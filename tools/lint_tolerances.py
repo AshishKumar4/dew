@@ -1,5 +1,5 @@
 """SLOP020's reading of a file, for tools/lint_slop.py: each place it compares floats within a
-tolerance, which the owner's gate (bible section 7, tests/reference_error.py) holds alone.
+tolerance, which the accuracy gate (tests/reference_error.py) holds alone.
 
 `comparisons` reads a file's tree, given each node's import table (lint_scopes) and its calls'
 definitions (lint_slop's `_Calls`); lint_slop counts what it finds against the inventory. A value's kind
