@@ -1,4 +1,6 @@
 """Minimal, deterministic proof of the WY gradient's aligned-key cancellation."""
+import sys
+
 import jax
 import jax.numpy as jnp
 import numpy as np
@@ -29,6 +31,12 @@ def test_the_aligned_write_erases_decay_before_its_gradient_is_rounded():
 
 
 if __name__ == "__main__":
+    if len(sys.argv) > 1:
+        implementation = {"current": c.chunk_delta_rule, "chunk-adjoint": chunk_adjoint}[sys.argv[1]]
+        found = np.asarray(gradient(implementation))
+        print(sys.argv[1], found.ravel())
+        np.testing.assert_array_equal(found, np.zeros_like(found))
+        raise SystemExit(0)
     print("WY fp32", np.asarray(gradient(c.chunk_delta_rule)).ravel())
     print("chunk-parallel adjoint fp32", np.asarray(gradient(chunk_adjoint)).ravel())
     with jax.enable_x64(True):
