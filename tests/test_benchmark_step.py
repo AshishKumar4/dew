@@ -51,17 +51,30 @@ def test_a_cpu_smoke_case_measures_a_finite_step_through_the_trainer(architectur
     assert row["training_flops"] == counted
 
 
-def test_a_cases_peak_is_its_devices_measured_high_water_at_least_the_bytes_xla_planned(tmp_path):
-    """The tool's peak memory is each device's allocator high-water over the case's steps, read in a
-    process of the case's own that loaded every program from a cache and compiled nothing; it holds at
-    least what XLA planned for the step, which stands beside it. Run as a person runs it, on one CPU
-    device, whose allocator keeps a high-water (the eight simulated ones keep none)."""
+def peak_row(tmp_path, platform: str) -> dict:
+    """The causal_transformer smoke case's row, the tool run as a person runs it on one device of
+    `platform`, its peak measured in a process of the case's own."""
     out = tmp_path / "rows.json"
     environment = {name: value for name, value in os.environ.items() if name != "XLA_FLAGS"}
     subprocess.run([sys.executable, str(REPO_ROOT / "tools/benchmark_step.py"), "--preset", "cpu-smoke",
                     "--architectures", "causal_transformer", "--warmup", "1", "--steps", "2",
                     "--dtype", "float32", "--mesh", "{}", "--json-out", str(out)],
-                   env={**environment, "JAX_PLATFORMS": "cpu"}, check=True, capture_output=True, timeout=900)
+                   env={**environment, "JAX_PLATFORMS": platform}, check=True, capture_output=True, timeout=900)
     (row,) = json.loads(out.read_text())
-    assert row["devices"] == 1 and len(row["peak_bytes_by_device"]) == 1
+    return row
+
+
+def test_a_cases_peak_is_read_in_a_process_of_its_own_one_high_water_a_device(tmp_path):
+    """The tool's peak memory comes from a process of the case's own that loaded every program from a cache
+    and compiled nothing (a compile there refuses the run), one high-water a device; the bytes XLA planned
+    stand beside it."""
+    row = peak_row(tmp_path, "cpu")
+    assert row["devices"] == 1 and len(row["peak_bytes_by_device"]) == 1 and row["planned_device_bytes"] > 0
+
+
+@pytest.mark.gpu(reason="a GPU's allocator keeps the high-water the measured peak reads")
+def test_a_cases_measured_peak_holds_at_least_the_bytes_xla_planned(tmp_path):
+    """On a GPU the measured peak is each device's allocator high-water over the case's run, its native
+    workspaces included: at least what XLA planned for the step."""
+    row = peak_row(tmp_path, "cuda")
     assert row["peak_device_bytes"] == row["peak_bytes_by_device"][0] >= row["planned_device_bytes"] > 0
