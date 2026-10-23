@@ -196,17 +196,20 @@ def _paired_draw(seed):
 
 
 def _paired_plain(dense: bool, *, truth: bool = False):
-    """The program a paired product stands for: each group's rows (a dense product's all, through the
-    second group's matrices) times each of its two matrices rounded to bf16, summed wide, the activation on
-    the two sums, rounded once. As `truth`, on float64 inputs, the matrices rounded alone."""
+    """The unfused program a paired product replaces: each group's rows (a dense product's all, through
+    the second group's matrices) times each of its two matrices rounded to bf16, summed wide and rounded to
+    bf16 (two projections' outputs), the activation, rounded once. As `truth`, on float64 inputs, the
+    matrices rounded alone."""
     def run(x, gate, up):
         def projected(matrix):
             rounded = matrix.astype(jnp.bfloat16).astype(matrix.dtype)
             matrix = matrix + jax.lax.stop_gradient(rounded - matrix) if truth else rounded.astype(x.dtype)
             wide = jnp.promote_types(x.dtype, jnp.float32)
             if dense:
-                return jnp.dot(x, matrix[1], preferred_element_type=wide)
-            return jax.lax.ragged_dot(x, matrix, jnp.asarray(SIZES), preferred_element_type=wide)
+                acc = jnp.dot(x, matrix[1], preferred_element_type=wide)
+            else:
+                acc = jax.lax.ragged_dot(x, matrix, jnp.asarray(SIZES), preferred_element_type=wide)
+            return acc if truth else acc.astype(jnp.bfloat16).astype(jnp.float32)
 
         out = silu_gated(projected(gate), projected(up))
         return out if truth else out.astype(jnp.bfloat16)
@@ -218,8 +221,8 @@ def _paired_plain(dense: bool, *, truth: bool = False):
 def test_a_paired_product_holds_check_1(generation_name, dense):
     """A paired product (`paired=`, a gated activation's gate and up in one launch), grouped and dense,
     through the launch the generation picks, interpreted on the CPU: its value and every operand's
-    cotangent as exact as its program's (two products summed wide, the activation on them) from float64
-    truth. The Mosaic interpreters run ordered callbacks, which a jitted `linear_call` cannot carry, so
+    cotangent as exact as the unfused program's it replaces (two projections, then the activation) from
+    float64 truth. The Mosaic interpreters run ordered callbacks, which a jitted `linear_call` cannot carry, so
     theirs run eagerly."""
     def dew(x, gate, up):
         if dense:
