@@ -26,7 +26,7 @@ import jax.numpy as jnp
 import numpy as np
 from jax.experimental import pallas as pl
 
-from dew.nn.precision import compensated_add
+from dew.nn.precision import compensated_add, two_product
 
 from . import chunked_launch, norm_swiglu, short_conv, tuning
 from .generation import triton_runs
@@ -658,31 +658,16 @@ def step(hooks: Hooks, operands: Step, *, dtype=None):
     return out, history[0] if history else None, state
 
 
-def _split(value):
-    """Veltkamp's split of fp32 `value` into halves of 12 significant bits each, whose products are
-    exact in fp32."""
-    spread = value * 4097.0
-    high = spread - (spread - value)
-    return high, value - high
-
-
 def _scaled(token, scale: float | None):
     """`token * scale` as a `(hi, lo)` pair to fp32's precision squared: `scale` (a Python float, to
     double precision) split into its fp32 rounding and remainder, the product with the rounding
-    error-free (Dekker's two-product, its halves' products exact), the remainder's product added to the
-    error. Without a scale, the token itself."""
+    error-free (`precision.two_product`, its significands split by their bits, which no finite token
+    overflows), the remainder's product added to the error. Without a scale, the token itself."""
     if scale is None:
         return token, jnp.zeros_like(token)
-    scale_hi = float(np.float32(scale))
-    scale_lo = float(np.float32(scale - scale_hi))
-    spread = float(np.float32(scale_hi * 4097.0))
-    scale_high = float(np.float32(spread - float(np.float32(spread - scale_hi))))
-    scale_low = float(np.float32(scale_hi - scale_high))
-    product = token * scale_hi
-    token_high, token_low = _split(token)
-    error = (((token_high * scale_high - product) + token_high * scale_low) + token_low * scale_high
-             + token_low * scale_low)
-    return product, error + token * scale_lo
+    scale_hi = np.float32(scale)
+    product, error = two_product(token, jnp.full_like(token, scale_hi), bit_split=True)
+    return product, error + token * float(np.float32(scale - float(scale_hi)))
 
 
 def _cumsum_kernel(chunk_ref, s_ref, o_ref, *refs, chunk: int, aligned: bool, scale: float | None,
@@ -777,13 +762,14 @@ def cumulated(g, *, chunk: int = 64, scale: float | None = None, reverse: bool =
     """The chunked recurrences' first stage, their decay's prefix: `g` `[B, T, H]`, or `[B, T, H, K]`
     per key dimension, cumulated within each chunk of `chunk` tokens of each sequence (`spans`, the
     rows where None), fp32: fla's `chunk_local_cumsum`
-    (cumsum.py:262-341), `scale` RCP_LN2 for the forward's base-2 decay, `reverse` for its gradient.
+    (cumsum.py:262-341), `scale` log2(e) for the forward's base-2 decay (fla's RCP_LN2, the port's
+    `fla_gdn.LOG2_E`), `reverse` for its gradient.
     Forward is fla's plain prefix, whose difference between two positions every kernel takes as a
     range's exponent; `reverse` the sums from the end, each rounded once. `compensated` (forward)
     returns the prefix as a `(hi, lo)` pair (`compensated_add`), each token scaled exactly (`_scaled`,
     `scale` to double precision), whose difference between two positions, `(hi_s - hi_t) + (lo_s -
     lo_t)`, is as precise as the range itself where the plain prefix's carries the chunk's whole
-    magnitude's rounding (ledger row 1328). fla autotunes only `num_warps` over 1, 2, 4 and 8 here."""
+    magnitude's rounding. fla autotunes only `num_warps` over 1, 2, 4 and 8 here."""
     if compensated and reverse:
         raise ValueError("the compensated prefix is the forward's")
     batch, length = g.shape[:2]

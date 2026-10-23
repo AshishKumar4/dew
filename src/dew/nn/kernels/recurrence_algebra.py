@@ -9,15 +9,16 @@ transitions follow with the families that need them. A token updates and reads, 
 
 (`recurrence.update` is its one-token form). Within a chunk of C tokens:
 
-- `decays(g, documents) -> (gc, pairs)`: the log decay cumulated within the chunk and each pair of positions'
-  decay `exp(gc[s] - gc[t])`, its exponent compensated;
+- `decays(g, documents) -> (grown, pairs)`: the decay from the chunk's start `exp(gc)`, the log decay `gc`
+  cumulated within the chunk, and each pair of positions' decay `exp(gc[s] - gc[t])`, every exponent
+  compensated;
 - `intra(k, kb, pairs) -> A`: the delta rule's strictly lower key-key system, `-(beta k k^T)` weighed by the
   pairs;
 - `factor(A) -> L`: its triangular inverse `(I - A)^-1` (WY/UT), skipped where nothing is corrected;
 - `apply(L, kb, vb, entering) -> (W, U)`: the corrected write's two products, `L (beta k exp(gc))` and
   `L (beta v)`;
 - `carry(S, step) -> (S', (S, v_new))`: one chunk across the memory, the corrected values `v_new = U - W S`
-  and the write `exp(gc[-1]) S + (k exp(gc[-1] - gc))^T v_new`;
+  and the write `grown[-1] S + (k exp(gc[-1] - gc))^T v_new`;
 - `readout(q, entering, entered, k, pairs, v_new) -> o`: the memory entered read through the decayed
   queries, plus the chunk's own pairs;
 - `compose(first, second)`: two spans' transitions `S -> T S + W` as one, associatively, for a scan over
@@ -32,6 +33,7 @@ caller's `issue(name, left, right)`, the mainloop's, by its name in `PRODUCTS`, 
 multiplies; the portable math's issuer is XLA's (`portable`), a kernel's its own dot.
 """
 
+import functools
 from collections.abc import Callable
 
 import jax
@@ -63,7 +65,7 @@ range its decay's bound keeps exact, or as the weighed sum."""
 
 def portable(name: str, left, right):
     """XLA's product, the portable math's issuer: `left @ right`, float32 products in float32 on a GPU,
-    as torch's are, not TF32 (`dew.nn.precision.float32_matmul`, ledger row 1327); the portable math takes
+    as torch's are, not TF32 (`dew.nn.precision.float32_matmul`); the portable math takes
     its operands in at least float32 (`recurrence_chunk.chunked`)."""
     del name
     return float32_matmul(left, right)
@@ -95,7 +97,8 @@ def decays(g, documents=None):
     """Cumulate per-chunk log decays and build the pairwise decay between positions.
 
     `g` is `[..., C, F]`: the C positions of a chunk and F decay channels.
-    Returns the inclusive cumulative sum `gc` over C, `[..., C, F]`, and
+    Returns the decay from the chunk's start `grown = exp(gc)`, `gc` the
+    inclusive cumulative sum over C, `[..., C, F]`, and
     `decay[..., s, t, f] = exp(gc[s, f] - gc[t, f])` for s >= t, zero above
     the diagonal, `[..., C, C, F]`.
 
@@ -103,7 +106,10 @@ def decays(g, documents=None):
     carries the rounding of the chunk's whole accumulated magnitude, which
     exp turns into a relative error on every decay. Here the cumulative sum
     is compensated (`compensated_add`) and the difference takes both
-    halves, so an exponent is as precise as its own range. On
+    halves, so an exponent is as precise as its own range; `grown` takes
+    both halves too (`grown_from`), where exp of the rounded sum carried its
+    rounding into the memory's decay and put the state's gradient near
+    twice the reference's distance from float64. On
     a per-key-decay model's tiny fixture that error dominated the gradient:
     over 16 orderings of the residual stream (an exact symmetry, so only the
     rounding moves) the updated logits sat at an RMS 2.04 times the
@@ -138,7 +144,27 @@ def decays(g, documents=None):
     # differences can overflow, and an outer where alone leaves 0 * inf in
     # the decay gradient.
     diff = jnp.where(inclusive, diff, 0.0)
-    return hi, jnp.where(inclusive, jnp.exp(diff), 0.0)
+    return grown_from(hi, lo, jnp.exp), jnp.where(inclusive, jnp.exp(diff), 0.0)
+
+
+LN2 = 0.6931471805599453
+"""ln 2: `exp2`'s derivative at zero, the base-2 prefix's unit (`raised`)."""
+
+
+def raised(hi, lo):
+    """`exp2(hi + lo)` of a compensated base-2 exponent, rounded about once (`grown_from`): a decay from a
+    chunk's start, whose exponent's rounded half alone carries its whole sum's rounding (a relative 3e-6
+    at the prefix -43 a single token at -30 a token reaches)."""
+    return grown_from(hi, lo, jnp.exp2, LN2)
+
+
+def grown_from(hi, lo, exp, unit: float = 1.0):
+    """`exp(hi + lo)` of a compensated exponent `(hi, lo)`, rounded about once: `exp(hi)` corrected by its
+    first-order term in `lo` (`|lo|` is under half an ulp of `hi`, so the second is far below fp32's
+    rounding), `exp` the base's exponential and `unit` the derivative of its log at one (ln 2 for
+    `exp2`)."""
+    grown = exp(hi)
+    return grown + grown * (lo * unit)
 
 
 def _ranged(decay, dg):
@@ -174,8 +200,9 @@ def _decays_tangent(primals, tangents):
     1.936 against 2.440 s)."""
     g, documents = primals
     dg, _ = tangents
-    gc, decay = decays(g, documents)
-    return (gc, decay), (_cumulated(dg, documents)[0], linear_call(_ranged, _ranged_transpose, decay, dg))
+    grown, decay = decays(g, documents)
+    return (grown, decay), (grown * _cumulated(dg, documents)[0],
+                            linear_call(_ranged, _ranged_transpose, decay, dg))
 
 
 def factor(a, issue: Issue = portable):
@@ -249,21 +276,51 @@ def apply(inverse, keyed, valued, entering, issue: Issue = portable):
 
 
 def carry(state, step, issue: Issue = portable):
-    """One chunk across the memory `state` `[..., Dk, Dv]`: `step` is the chunk's keys, `W`, `U`, `gc`, the
-    decay's last row `last` (`exp(gc[-1] - gc)`, zero for a packed chunk's earlier documents) and `kept`
+    """One chunk across the memory `state` `[..., Dk, Dv]`: `step` is the chunk's keys, `W`, `U`, the decay
+    from its start `grown` (`decays`), the decay's last row `last` (`exp(gc[-1] - gc)`, zero for a packed
+    chunk's earlier documents) and `kept`
     (one where the memory entering passes through, zero where a document starts in the chunk). Returns
     the memory leaving and `(the memory entering, v_new)`."""
-    k_i, w_i, u_i, gc_i, last_i, kept_i = step
+    k_i, w_i, u_i, grown_i, last_i, kept_i = step
     v_corrected = u_i - issue("corrected", w_i, state)
-    return (state * jnp.swapaxes(jnp.exp(gc_i[..., -1:, :]), -1, -2) * kept_i
+    return (state * jnp.swapaxes(grown_i[..., -1:, :], -1, -2) * kept_i
             + issue("write", jnp.swapaxes(k_i * last_i, -1, -2), v_corrected), (state, v_corrected))
 
 
 def readout(query, entering, entered, key, pairs, corrected, issue: Issue = portable):
-    """A chunk's output `[..., C, Dv]`: the memory it entered read through the decayed queries, and the
-    chunk's own pairs over its corrected values (the inclusive lower `pairs` read the token itself)."""
-    return (issue("memory", query * entering, entered)
+    """A chunk's output `[..., C, Dv]`: the memory it entered read through the decayed queries
+    (`remembered`), and the chunk's own pairs over its corrected values (the inclusive lower `pairs` read
+    the token itself)."""
+    return (remembered(query * entering, entered, issue)
             + issue("local", paired("scores", query, key, pairs, issue), corrected))
+
+
+@functools.partial(jax.custom_jvp, nondiff_argnums=(2,))
+def remembered(decayed, entered, issue: Issue = portable):
+    """The memory a chunk entered read through its decayed queries, `decayed @ entered` ('memory'), whose
+    gradient in the memory sums the chunk's tokens from its last (`_remembered_transpose`): `decayed` falls
+    along the chunk with its decay, so the smallest terms add first, as the recurrence a token at a time
+    adds them. Summed from the first, the memory's gradient sat 1.76 to 1.89 times the token-by-token
+    recurrence's distance from float64 under every delta family (the carry widened to float64 changed
+    nothing, this product's sum widened took it to 0.85-1.16); from the last, 0.97-1.22
+    (tests/test_recurrence_stability.py)."""
+    return issue("memory", decayed, entered)
+
+
+def _remembered_transpose(decayed, cotangent, issue: Issue):
+    """`decayed^T @ cotangent`, the chunk's tokens summed from its last."""
+    return issue("memory", jnp.swapaxes(jnp.flip(decayed, -2), -1, -2), jnp.flip(cotangent, -2))
+
+
+@remembered.defjvp
+def _remembered_tangent(issue, primals, tangents):
+    """The product's tangent, its memory side linear in the memory with the transpose
+    `_remembered_transpose`, in forward and reverse mode alike."""
+    decayed, entered = primals
+    d_decayed, d_entered = tangents
+    read = linear_call(lambda decayed, entered: issue("memory", decayed, entered),
+                       functools.partial(_remembered_transpose, issue=issue), decayed, d_entered)
+    return remembered(decayed, entered, issue), issue("memory", d_decayed, entered) + read
 
 
 def compose(first, second, issue: Issue = portable):
@@ -274,15 +331,15 @@ def compose(first, second, issue: Issue = portable):
     return issue("compose", t2, t1), issue("compose", t2, w1) + w2
 
 
-def transition(key, w, u, gc, last, kept, issue: Issue = portable):
+def transition(key, w, u, grown, last, kept, issue: Issue = portable):
     """A chunk's transition `(T, W)` (`compose`): with `carry`'s operands,
-    `T = exp(gc[-1]) kept - (k last)^T W` and `W = (k last)^T U`, so `carry`'s memory leaving is `T S + W`.
+    `T = grown[-1] kept - (k last)^T W` and `W = (k last)^T U`, so `carry`'s memory leaving is `T S + W`.
     Packed documents keep the memory entering only where `kept` because the operands are built so
     (`recurrence_chunk.chunked`): `W` is zero outside the document the memory entering belongs to and
     `last` outside the chunk's last document; `kept` alone gates only the decay's diagonal."""
     decayed = jnp.swapaxes(key * last, -1, -2)
     dk = key.shape[-1]
-    diagonal = jnp.eye(dk, dtype=gc.dtype) * jnp.swapaxes(jnp.exp(gc[..., -1:, :]), -1, -2) * kept
+    diagonal = jnp.eye(dk, dtype=grown.dtype) * jnp.swapaxes(grown[..., -1:, :], -1, -2) * kept
     return diagonal - issue("corrected", decayed, w), issue("write", decayed, u)
 
 
@@ -377,7 +434,7 @@ def scalar_write(corrected_values, last, gate, last_lo, gate_lo):
     """A decay a head's write: the corrected values gated by `exp2(g_last - g)` over both halves, and the
     memory's decay `exp2(g_last)`."""
     gated = corrected_values * jnp.exp2((last - gate) + (last_lo - gate_lo))[:, None]
-    return gated, jnp.exp2(last)
+    return gated, raised(last, last_lo)
 
 
 def chunk_output(queries: Load, entered: Load, keys: Load, columns: int, gate, low, value, scale: float,
@@ -391,7 +448,7 @@ def chunk_output(queries: Load, entered: Load, keys: Load, columns: int, gate, l
         query = queries(c)
         out += issue("memory", query, entered(c))
         scores += issue("scores", query, keys(c).T)
-    out = out * jnp.exp2(gate)[:, None]
+    out = out * raised(gate, low)[:, None]
     scores = scores * jnp.exp2(apart(gate, low, gate, low))
     index = jnp.arange(gate.shape[0])
     scores = jnp.where(index[:, None] >= index[None, :], scores, 0.0)
@@ -426,13 +483,14 @@ def key_decayed_write(key, gate, low, last, last_low):
 def key_decayed_output(queries: Load, gates: Load, entered: Load, columns: int, scores, value, scale: float,
                        issue: Issue):
     """A chunk's output `[C, BV]`, fp32, a decay a key dimension: `scale (q exp2(g))_narrow S +
-    tril(Aqk) v`, each key block's gated queries `queries(c) exp2(gates(c))` rounded to their dtype
+    tril(Aqk) v`, each key block's gated queries `queries(c) exp2(gates(c))` (`gates(c)` the prefix's
+    halves, `raised`) rounded to their dtype
     against the memory entered `entered(c)` ('memory'), the scores `scores` (`Aqk`, scaled) rounded to the
     values' dtype ('local')."""
     out = jnp.zeros((scores.shape[0], value.shape[-1]), jnp.float32)
     for c in range(columns):
         query = queries(c)
-        gated = (query * jnp.exp2(gates(c))).astype(query.dtype)
+        gated = (query * raised(*gates(c))).astype(query.dtype)
         out = out + issue("memory", gated, entered(c).astype(gated.dtype))
     out = out * scale
     index = jnp.arange(scores.shape[0])

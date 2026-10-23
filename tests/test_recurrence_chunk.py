@@ -67,12 +67,14 @@ independently by `seeds_for` on armada (2026-10-21), on the draw with a memory e
 document starting on a chunk's first token."""
 
 
-def draw(hooks: recurrence.Hooks, packed: bool, seed: int, *, length: int = LENGTH) -> tuple[Chunk]:
+def draw(hooks: recurrence.Hooks, packed: bool, seed: int, *, length: int = LENGTH,
+         value_heads: int = VALUE_HEADS) -> tuple[Chunk]:
     """A sequence's operands for `hooks` from `seed`, its keys' and values' dimensions each permuted
     by an order the seed draws (an exact symmetry of every head's recurrence): fresh queries, keys
     and values (`NORMED_WIDTH` wide under the norm), a log decay a head or a key dimension in (-1, 0),
-    a gate in (0, 1), a skip, a memory entering, `length` tokens, and with `packed` documents starting
-    at tokens 0, 23 and 40 of the first row and 9 and 48 of the second, 48 a chunk's first token."""
+    a gate in (0, 1), a skip, a memory entering, `length` tokens over `value_heads` value heads, and with
+    `packed` documents starting at tokens 0, 23 and 40 of the first row and 9 and 48 of the second, 48 a
+    chunk's first token."""
     keys = jax.random.split(jax.random.key(seed), 8)
     rng = np.random.default_rng(seed)
     width = VALUE_WIDTH if hooks.output is None else NORMED_WIDTH
@@ -80,27 +82,27 @@ def draw(hooks: recurrence.Hooks, packed: bool, seed: int, *, length: int = LENG
     query = jax.random.normal(keys[0], (ROWS, length, KEY_HEADS, KEY_WIDTH))
     key = jax.random.normal(keys[1], (ROWS, length, KEY_HEADS, KEY_WIDTH))
     key = key / jnp.linalg.norm(key, axis=-1, keepdims=True)
-    value = jax.random.normal(keys[2], (ROWS, length, VALUE_HEADS, width))
-    shape = (ROWS, length, VALUE_HEADS, KEY_WIDTH) if hooks.decay == 'vector' else (ROWS, length, VALUE_HEADS)
+    value = jax.random.normal(keys[2], (ROWS, length, value_heads, width))
+    shape = (ROWS, length, value_heads, KEY_WIDTH) if hooks.decay == 'vector' else (ROWS, length, value_heads)
     log_decay = -jax.nn.softplus(jax.random.normal(keys[3], shape) - 1.0)
-    beta = jax.nn.sigmoid(jax.random.normal(keys[4], (ROWS, length, VALUE_HEADS)))
-    skip = jax.random.normal(keys[5], (VALUE_HEADS,))
+    beta = jax.nn.sigmoid(jax.random.normal(keys[4], (ROWS, length, value_heads)))
+    skip = jax.random.normal(keys[5], (value_heads,))
     gates = {}
     if hooks.gates is not None:
         # Pre-activations: the gate and beta raw, `log_a` and `bias` a head's.
         heads = jax.random.split(keys[6], 3)
-        gates = {'gate': jax.random.normal(heads[0], (ROWS, length, VALUE_HEADS)),
-                 'log_a': 0.5 * jax.random.normal(heads[1], (VALUE_HEADS,)),
-                 'bias': jax.random.normal(heads[2], (VALUE_HEADS,))}
-        beta = jax.random.normal(keys[4], (ROWS, length, VALUE_HEADS))
+        gates = {'gate': jax.random.normal(heads[0], (ROWS, length, value_heads)),
+                 'log_a': 0.5 * jax.random.normal(heads[1], (value_heads,)),
+                 'bias': jax.random.normal(heads[2], (value_heads,))}
+        beta = jax.random.normal(keys[4], (ROWS, length, value_heads))
     if hooks.rated:
         # The step through softplus is the write gate; the rate is `A = -exp(A_log)`, a head's.
-        beta = jax.nn.softplus(jax.random.normal(keys[4], (ROWS, length, VALUE_HEADS)) - 1.0)
-        gates = {'rate': -jnp.exp(0.5 * jax.random.normal(keys[6], (VALUE_HEADS,)))}
+        beta = jax.nn.softplus(jax.random.normal(keys[4], (ROWS, length, value_heads)) - 1.0)
+        gates = {'rate': -jnp.exp(0.5 * jax.random.normal(keys[6], (value_heads,)))}
     epilogue = {}
     if hooks.output is not None:
         norms = jax.random.split(keys[7], 2)
-        epilogue = {'z': jnp.take(jax.random.normal(norms[0], (ROWS, length, VALUE_HEADS, width)),
+        epilogue = {'z': jnp.take(jax.random.normal(norms[0], (ROWS, length, value_heads, width)),
                                   value_order, axis=-1),
                     'weight': jnp.take(1.0 + 0.1 * jax.random.normal(norms[1], (width,)), value_order)}
     query, key = (jnp.take(x, key_order, axis=-1) for x in (query, key))
@@ -108,7 +110,7 @@ def draw(hooks: recurrence.Hooks, packed: bool, seed: int, *, length: int = LENG
     if hooks.decay == 'vector':
         log_decay = jnp.take(log_decay, key_order, axis=-1)
     state = 0.3 * jax.random.normal(jax.random.fold_in(jax.random.key(seed), 8),
-                                    (ROWS, VALUE_HEADS, KEY_WIDTH, width))
+                                    (ROWS, value_heads, KEY_WIDTH, width))
     state = jnp.take(jnp.take(state, key_order, axis=2), value_order, axis=3)
     starts = None
     if packed:
@@ -262,7 +264,7 @@ def test_composed_chunks_leave_the_memory_the_recurrence_leaves(hooks, packed):
         steps = recurrence_chunk.chunked(query, key, operands.value, g, operands.beta, CHUNK,
                                          starts=operands.starts, delta=hooks.delta)
         t, w = jax.lax.associative_scan(algebra.compose, algebra.transition(
-            steps.key, steps.w, steps.u, steps.gc, steps.last, steps.kept), axis=2)
+            steps.key, steps.w, steps.u, steps.grown, steps.last, steps.kept), axis=2)
         entered = float32_einsum('bhkj,bhjv->bhkv', t[:, :, -1], operands.state.astype(t.dtype))
         return entered + w[:, :, -1]
 

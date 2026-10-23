@@ -1,6 +1,6 @@
-"""The recurrence template's stability (bible §6: accuracy, performance and stability together): the chunked
-op under the inputs that break chunked forms, each held to the same recurrence a token at a time
-(`test_recurrence_chunk.token_by_token`, the decode step's reference) two ways:
+"""The recurrence template's stability (docs/design/kernel-templates.md: accuracy, performance and stability
+together): the chunked op under the inputs that break chunked forms, each held to the same recurrence a
+token at a time (`test_recurrence_chunk.token_by_token`, the decode step's reference) two ways:
 
 - finite wherever the reference in float64 is finite: no NaN or inf of the chunked form's own, an
   exponent's overflow or an underflow's `0 * inf`;
@@ -11,20 +11,20 @@ certified bound of its float64 value keeps apart any two that float64 holds more
 apart, so the suite takes it with the chunk ops' certificates (`tests/op_certificates.py`).
 
 The regimes: decays near one, whose memory accumulates, and over a long sequence; decays near zero, whose
-pairs within a chunk span tens of e-folds; every token at the decay's range bound (Kimi delta
-attention's lower bound, -5 a token); near-collinear keys with the write gate near one, whose WY system
-grows as binomials; documents reset on chunks' first and last tokens; and saturated gates (write gates at
-0 and 1, Mamba's step through softplus at 30), and pre-activations spread over [-20, 20], which keep
-gates near 0 and 1 apart; and a memory fading over a long sequence, whose output falls far below its scale.
-Each runs the portable math, and the port of fla's kernels (`recurrence_chunk.fla_rule`) where the hooks
-take it (the delta rule with a decay), both forward and through their gradient, held to the recurrence's
-gradient by check 1. The port runs where its route takes the regime's declared decay floor (`FLOORS`): a
-decay a key dimension steeper than its domain, -5 a token, it refuses (`fla_kda.DECAY_FLOOR`), which the
-port's arm asserts. The port's prefix difference uncompensated in base 2 failed check 1 under saturated
-write gates, aligned keys, resets on chunk edges and the decay bound, and its 64-token chunks of the
-suite's 16-wide keys over a long sequence; compensated, and its chunk no longer than twice the keys' width
-(`recurrence_chunk.held_chunk`), it passes.
-"""
+pairs within a chunk span tens of e-folds; every token at the decay's range bound (Kimi delta attention's
+lower bound, -5 a token); near-collinear keys with the write gate near one, whose WY system grows as
+binomials; documents reset on chunks' first and last tokens; and saturated gates (write gates at 0 and 1,
+Mamba's step through softplus at 30), and pre-activations spread over [-20, 20], which keep gates near 0 and 1
+apart; a memory fading over a long sequence, whose output falls far below its scale; and a steep decay every
+eighth token between mild ones, whose pairs after it are differences of large, nearly equal prefixes. Each
+runs the portable math, and the port of fla's kernels (`recurrence_chunk.fla_rule`) where the hooks take it
+(the delta rule with a decay), both forward and through their gradient, held to the recurrence's gradient by
+check 1. The port runs where its route takes the regime's declared decay floor (`FLOORS`): a decay a key
+dimension steeper than its domain, -5 a token, it refuses (`fla_kda.DECAY_FLOOR`), which the port's arm
+asserts. The port's prefix difference uncompensated in base 2 failed check 1 under saturated write gates,
+aligned keys, resets on chunk edges and the decay bound, and its 64-token chunks of the suite's 16-wide keys
+over a long sequence; compensated, and its chunk no longer than twice the keys' width
+(`recurrence_chunk.held_chunk`), it passes."""
 
 import dataclasses
 import functools
@@ -33,8 +33,8 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact, widened
-from test_recurrence_chunk import CHUNK, KEY_WIDTH, draw, token_by_token
+from reference_error import assert_as_exact, widened, with_gradients
+from test_recurrence_chunk import CHUNK, KEY_WIDTH, VALUE_HEADS, draw, token_by_token
 
 from dew.nn.kernels import recurrence
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk, port_refusal
@@ -61,7 +61,21 @@ def _decayed(operands: Chunk, hooks, log_decay: float, spread: float, key) -> Ch
     whichever operand the hooks read it from: the log decay itself, the gate's pre-activation (`gated`'s
     `-exp(log_a) softplus(gate + bias)`), or a rated decay's write gate (`rate * dt`)."""
     noise = spread * jax.random.uniform(key, operands.value.shape[:3], minval=-1.0, maxval=1.0)
-    target = jnp.minimum(log_decay + noise, 0.0)
+    return _formed(operands, hooks, jnp.minimum(log_decay + noise, 0.0))
+
+
+def _steep(operands: Chunk, hooks, key) -> Chunk:
+    """Every eighth token's log decay steep, -1000, so the memory passes it all but nothing, and every other
+    token's mild, near -0.02: after a steep token a chunk's prefix is large and each mild pair's decay a
+    difference of two nearly equal prefixes (a decay a key dimension clipped to its floor, `stressed`)."""
+    steep = jnp.arange(operands.value.shape[1]) % 8 == 0
+    mild = -0.02 + 0.01 * jax.random.uniform(key, operands.value.shape[:3], minval=-1.0, maxval=1.0)
+    return _formed(operands, hooks, jnp.where(steep[None, :, None], -1000.0, mild))
+
+
+def _formed(operands: Chunk, hooks, target) -> Chunk:
+    """`operands` with every token's log decay `target` `[B, T, H]`, formed through whichever operand the
+    hooks read it from (`_decayed`)."""
     if hooks.rated:
         # The log decay is `rate * dt`: dt the target over each head's rate.
         return dataclasses.replace(operands, beta=target / operands.rate)
@@ -131,57 +145,64 @@ REGIMES = {
     'spread gates': (lambda operands, hooks, key: _spread(operands, hooks, key), None),
     'a long sequence': (lambda operands, hooks, key: _decayed(operands, hooks, -1e-3, 5e-4, key), LONG),
     'a fading memory': (lambda operands, hooks, key: _decayed(operands, hooks, -0.1, 0.05, key), LONG),
+    'steep then mild': (lambda operands, hooks, key: _steep(operands, hooks, key), None),
 }
 """Each regime's transform of a draw's operands and its tokens (the draw's own where None)."""
 
 GRADIENT_SEEDS = {
-    ('scalar delta', 'decays near zero'): 512,
-    ('vector delta', 'decays near zero'): 512,
-    ('scalar write', 'decays near zero'): 512,
-    ('gated', 'decays near zero'): 512,
-    ('rated', 'decays near zero'): 512,
-    ('scalar delta', 'decays near one'): 32,
-    ('scalar delta', 'the decay bound'): 8,
-    ('scalar delta', 'aligned keys'): 128,
+    ('scalar delta', 'decays near one'): 8,
+    ('scalar delta', 'decays near zero'): 64,
+    ('scalar delta', 'the decay bound'): 16,
+    ('scalar delta', 'aligned keys'): 8,
     ('scalar delta', 'resets on chunk edges'): 8,
-    ('scalar delta', 'saturated gates'): 16,
-    ('scalar delta', 'spread gates'): 16,
+    ('scalar delta', 'saturated gates'): 8,
+    ('scalar delta', 'spread gates'): 8,
     ('scalar delta', 'a long sequence'): 8,
     ('scalar delta', 'a fading memory'): 8,
+    ('scalar delta', 'steep then mild'): 8,
     ('vector delta', 'decays near one'): 8,
-    ('vector delta', 'the decay bound'): 8,
-    ('vector delta', 'aligned keys'): 16,
+    ('vector delta', 'decays near zero'): 64,
+    ('vector delta', 'the decay bound'): 16,
+    ('vector delta', 'aligned keys'): 8,
     ('vector delta', 'resets on chunk edges'): 8,
     ('vector delta', 'saturated gates'): 8,
     ('vector delta', 'spread gates'): 8,
     ('vector delta', 'a long sequence'): 8,
     ('vector delta', 'a fading memory'): 8,
-    ('scalar write', 'decays near one'): 32,
+    ('vector delta', 'steep then mild'): 8,
+    ('scalar write', 'decays near one'): 8,
+    ('scalar write', 'decays near zero'): 64,
     ('scalar write', 'the decay bound'): 8,
-    ('scalar write', 'aligned keys'): 16,
+    ('scalar write', 'aligned keys'): 8,
     ('scalar write', 'resets on chunk edges'): 8,
-    ('scalar write', 'saturated gates'): 16,
-    ('scalar write', 'spread gates'): 16,
-    ('scalar write', 'a long sequence'): 16,
+    ('scalar write', 'saturated gates'): 8,
+    ('scalar write', 'spread gates'): 8,
+    ('scalar write', 'a long sequence'): 8,
     ('scalar write', 'a fading memory'): 8,
+    ('scalar write', 'steep then mild'): 8,
     ('gated', 'decays near one'): 32,
+    ('gated', 'decays near zero'): 512,
     ('gated', 'the decay bound'): 64,
-    ('gated', 'aligned keys'): 256,
-    ('gated', 'resets on chunk edges'): 128,
+    ('gated', 'aligned keys'): 64,
+    ('gated', 'resets on chunk edges'): 64,
     ('gated', 'saturated gates'): 128,
-    ('gated', 'spread gates'): 512,
-    ('gated', 'a long sequence'): 8,
-    ('gated', 'a fading memory'): 8,
-    ('rated', 'decays near one'): 128,
-    ('rated', 'the decay bound'): 128,
-    ('rated', 'aligned keys'): 64,
+    ('gated', 'spread gates'): 128,
+    ('gated', 'a long sequence'): 32,
+    ('gated', 'a fading memory'): 64,
+    ('gated', 'steep then mild'): 64,
+    ('rated', 'decays near one'): 32,
+    ('rated', 'decays near zero'): 0,
+    ('rated', 'the decay bound'): 0,
+    ('rated', 'aligned keys'): 0,
     ('rated', 'resets on chunk edges'): 128,
-    ('rated', 'saturated gates'): 8,
-    ('rated', 'spread gates'): 256,
-    ('rated', 'a long sequence'): 128,
-    ('rated', 'a fading memory'): 128,
+    ('rated', 'saturated gates'): 32,
+    ('rated', 'spread gates'): 512,
+    ('rated', 'a long sequence'): 64,
+    ('rated', 'a fading memory'): 512,
+    ('rated', 'steep then mild'): 0,
 }
-"""Each site's declared seeds for its gradient's check 1, sized by `seeds_for` on armada (2026-10-22)."""
+
+"""Each site's declared seeds for its gradient's check 1, sized by `seeds_for`."""
 
 SEEDS = {
     ('scalar delta', 'decays near one'): 8,
@@ -193,6 +214,7 @@ SEEDS = {
     ('scalar delta', 'a long sequence'): 8,
     ('scalar delta', 'spread gates'): 32,
     ('scalar delta', 'a fading memory'): 8,
+    ('scalar delta', 'steep then mild'): 16,
     ('vector delta', 'decays near one'): 8,
     ('vector delta', 'decays near zero'): 64,
     ('vector delta', 'the decay bound'): 32,
@@ -202,6 +224,7 @@ SEEDS = {
     ('vector delta', 'a long sequence'): 8,
     ('vector delta', 'spread gates'): 32,
     ('vector delta', 'a fading memory'): 8,
+    ('vector delta', 'steep then mild'): 8,
     ('scalar write', 'decays near one'): 8,
     ('scalar write', 'decays near zero'): 64,
     ('scalar write', 'the decay bound'): 32,
@@ -211,6 +234,7 @@ SEEDS = {
     ('scalar write', 'a long sequence'): 8,
     ('scalar write', 'spread gates'): 32,
     ('scalar write', 'a fading memory'): 8,
+    ('scalar write', 'steep then mild'): 8,
     ('gated', 'decays near one'): 8,
     ('gated', 'decays near zero'): 128,
     ('gated', 'the decay bound'): 64,
@@ -220,6 +244,7 @@ SEEDS = {
     ('gated', 'a long sequence'): 8,
     ('gated', 'spread gates'): 128,
     ('gated', 'a fading memory'): 8,
+    ('gated', 'steep then mild'): 8,
     ('rated', 'decays near one'): 16,
     ('rated', 'decays near zero'): 256,
     ('rated', 'the decay bound'): 128,
@@ -229,8 +254,9 @@ SEEDS = {
     ('rated', 'a long sequence'): 8,
     ('rated', 'spread gates'): 64,
     ('rated', 'a fading memory'): 128,
+    ('rated', 'steep then mild'): 128,
 }
-"""Each site's declared seeds for check 1, sized by `seeds_for` on armada (2026-10-22): the fewest for
+"""Each site's declared seeds for check 1, sized by `seeds_for`: the fewest for
 which the token-by-token reference compared with itself resolves the factor in both leaves."""
 
 
@@ -239,22 +265,55 @@ FLOORS = {'decays near one': -1.5e-4, 'decays near zero': -35.0, 'the decay boun
           'a long sequence': -1.5e-3, 'a fading memory': -0.15}
 """Each regime's declared per-token log decay floor, the steepest it draws: its decays' target less their
 spread, or Kimi Linear's bound (-5, `dew.nn.kda`'s `lower_bound`) where the regime keeps the draw's own
-decays, which a decay per key dimension is clipped to (`stressed`)."""
+decays or draws steeper ones (steep then mild's -1000), which a decay per key dimension is clipped to
+(`stressed`)."""
 
 
 def floor(regime: str) -> float:
     return FLOORS.get(regime, -5.0)
 
 
-def stressed(hooks, regime: str, seed: int) -> tuple[Chunk]:
-    """Draw `seed`'s operands for `hooks` under `regime`, a decay per key dimension no steeper than the
-    regime's floor (`FLOORS`)."""
+def stressed(hooks, regime: str, seed: int, *, value_heads: int = VALUE_HEADS) -> tuple[Chunk]:
+    """Draw `seed`'s operands for `hooks` under `regime` over `value_heads` value heads, a decay per key
+    dimension no steeper than the regime's floor (`FLOORS`)."""
     transform, length = REGIMES[regime]
-    (operands,) = draw(hooks, packed=False, seed=seed, **({} if length is None else {'length': length}))
+    (operands,) = draw(hooks, packed=False, seed=seed, value_heads=value_heads,
+                       **({} if length is None else {'length': length}))
     operands = transform(operands, hooks, jax.random.fold_in(jax.random.key(seed), 99))
     if hooks.decay == 'vector':
         operands = dataclasses.replace(operands, log_decay=jnp.maximum(operands.log_decay, floor(regime)))
     return (operands,)
+
+
+def cotangents(hooks, regime: str, seed: int) -> tuple[Chunk, tuple[jax.Array, jax.Array]]:
+    """Draw `seed`'s operands under `regime` (`stressed`), their documents' starts taken out (`restarting`
+    puts them back: they are not differentiable), and fp32 cotangents of their output `[B, S, Hv, Dv]`
+    and final memory `[B, Hv, Dk, Dv]` from the seed's own key, which the float64 truth takes as they
+    are."""
+    (operands,) = stressed(hooks, regime, seed, value_heads=RATED_HEADS if hooks.rated else GRADIENT_HEADS)
+    batch, length, heads, width = operands.value.shape
+    keys = jax.random.split(jax.random.fold_in(jax.random.key(seed), 101))
+    return dataclasses.replace(operands, starts=None), (
+        jax.random.normal(keys[0], (batch, length, heads, width)),
+        jax.random.normal(keys[1], (batch, heads, operands.key.shape[-1], width)))
+
+
+GRADIENT_HEADS = 16
+"""The gradient arms' value heads: a head's own parameters (the gates' `log_a` and `bias`) are a leaf of a
+head each, which two heads do not resolve within 512 seeds."""
+
+RATED_HEADS = 64
+"""A rated decay's gradient arms' value heads: its rate, a head's one factor of every token's decay, did not
+resolve within 512 seeds at 16 heads under aligned keys, decays near zero, the decay bound and steep then
+mild."""
+
+
+def restarting(fn, regime: str):
+    """`fn` on operands whose documents start as the regime's do, a constant of their shape (`_reset`),
+    which `cotangents` takes out of the draw."""
+    if regime != 'resets on chunk edges':
+        return fn
+    return lambda operands: fn(_reset(operands))
 
 
 def ported(hooks) -> bool:
@@ -300,23 +359,6 @@ def test_the_chunked_op_stays_finite_and_exact_where_chunked_forms_break(name, r
                     seeds=SEEDS[name, regime])
 
 
-def pulled(fn):
-    """`fn`'s gradient with respect to each float operand it reads, through a fixed cotangent on its
-    output and final memory (a key no draw's seed reaches)."""
-    def run(operands):
-        outputs, pull = jax.vjp(fn, operands)
-        keys = jax.random.split(jax.random.fold_in(jax.random.key(0), 1 << 20), len(outputs))
-        (grads,) = pull(tuple(jax.random.normal(key, out.shape, out.dtype)
-                              for key, out in zip(keys, outputs, strict=True)))
-        return {field: getattr(grads, field) for field in GRADIENTS
-                if getattr(operands, field) is not None and getattr(operands, field).dtype.kind == 'f'}
-    return run
-
-
-GRADIENTS = ('query', 'key', 'value', 'log_decay', 'gate', 'beta', 'state')
-"""The operands whose gradients a site holds, each where the hooks read it."""
-
-
 @pytest.mark.parametrize('name, regime, arm', CASES)
 def test_the_chunked_ops_gradient_is_as_exact_as_the_recurrences(name, regime, arm):
     """The arm's gradient finite wherever the reference's in float64 is, and on par with the token-by-token
@@ -326,16 +368,18 @@ def test_the_chunked_ops_gradient_is_as_exact_as_the_recurrences(name, regime, a
     if (refused := refusal(hooks, regime, arm)) is not None:
         assert refused.code == 'decay_floor', refused
         return
-    dew = jax.jit(pulled(functools.partial(chunk, hooks, chunk_size=CHUNK, ported=arm == 'port')))
-    reference = jax.jit(pulled(functools.partial(token_by_token, hooks)))
-    draws = functools.partial(stressed, hooks, regime)
+    dew = jax.jit(with_gradients(restarting(functools.partial(chunk, hooks, chunk_size=CHUNK,
+                                                              ported=arm == 'port'), regime)))
+    reference = jax.jit(with_gradients(restarting(functools.partial(token_by_token, hooks), regime)))
+    draws = functools.partial(cotangents, hooks, regime)
     for seed in range(2):
-        operands = draws(seed)
-        mine = dew(*operands)
+        drawn = draws(seed)
+        mine = dew(*drawn)
         with jax.enable_x64(new_val=True):
-            truth = reference(*widened(operands))
-        for field, ours in mine.items():
-            finite = np.isfinite(np.asarray(truth[field]))
-            assert np.all(np.isfinite(np.asarray(ours))[finite]), f'{field}: not finite, seed {seed}'
+            truth = reference(*widened(drawn))
+        leaves = zip(jax.tree.leaves(mine), jax.tree.leaves(truth), strict=True)
+        for index, (ours, exact) in enumerate(leaves):
+            finite = np.isfinite(np.asarray(exact))
+            assert np.all(np.isfinite(np.asarray(ours))[finite]), f'leaf {index}: not finite, seed {seed}'
     assert_as_exact(dew, reference, draws, f'the {arm} arm\'s gradient, {name} under {regime}',
                     seeds=GRADIENT_SEEDS[name, regime])

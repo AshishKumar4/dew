@@ -58,7 +58,10 @@ class _Launch(tuning.KernelOp):
         return self._tiles(ba, self.PICKS[_dtype(ba.arguments[self.KEYS or self.VALUES or "g"]), _wide()])
 
     def _get_autotuning_configs(self, ba) -> set[Tiles]:
-        if _dtype(ba.arguments[self.KEYS or self.VALUES or "g"]) == "float32":
+        # fp32 runs the tests, and a chunk other than 64 (narrow keys, `recurrence_chunk.held_chunk`) is
+        # not one the timed descriptors (`operands`) are drawn at: the heuristic alone.
+        if (_dtype(ba.arguments[self.KEYS or self.VALUES or "g"]) == "float32"
+                or ba.arguments.get("chunk", 64) != 64):
             return {self._get_heuristics_config(ba)}
         return {self._tiles(ba, tiles) for tiles in self.SPACES[_wide()]}
 

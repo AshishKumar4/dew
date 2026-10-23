@@ -83,12 +83,12 @@ def _solve_program(start, count, k, g, gl, beta, *, chunk: int, bk: int):
                             for i in range(count_subs)], 0)
 
 
-def _weighted_program(start, count, k, v, beta, a, g, *, chunk: int, bk: int, bv: int):
+def _weighted_program(start, count, k, v, beta, a, g, gl, *, chunk: int, bk: int, bv: int):
     """`fla_gdn._w_u_kernel`'s program: the chunk's `w` `[C, K]` and `u` `[C, V]`, fp32."""
     beta, inverse = _rows(beta, start, chunk, count), _rows(a, start, chunk, count)
     u = jnp.concatenate([algebra.weighted("apply_u", inverse, _rows(v[:, c:c + bv], start, chunk, count),
                                           beta, ISSUE) for c in range(0, v.shape[-1], bv)], 1)
-    decay = jnp.exp2(_gates(g, start, chunk, count))
+    decay = algebra.raised(_gates(g, start, chunk, count), _gates(gl, start, chunk, count))
     w = jnp.concatenate([algebra.weighted("apply_w", inverse, _rows(k[:, c:c + bk], start, chunk, count),
                                           beta, ISSUE, decay[:, None]) for c in range(0, k.shape[-1], bk)], 1)
     return w, u
@@ -127,9 +127,10 @@ def _state_program(span, k, u, w, g, gl, h0, *, chunk: int, length: int, steps: 
         corrected = algebra.corrected(read(u), lambda i: read(w, i), state, w.dtype, issue)
         final = begin + taken - 1
         if per_key:
-            last = jax.lax.dynamic_index_in_dim(g, final, 0, keepdims=False)
-            decay = [jnp.exp2(last[i * SLICE:(i + 1) * SLICE].astype(jnp.float32))[:, None]
-                     for i in range(slices)]
+            last = jax.lax.dynamic_index_in_dim(g, final, 0, keepdims=False).astype(jnp.float32)
+            last_low = jax.lax.dynamic_index_in_dim(gl, final, 0, keepdims=False).astype(jnp.float32)
+            decay = [algebra.raised(last[i * SLICE:(i + 1) * SLICE],
+                                    last_low[i * SLICE:(i + 1) * SLICE])[:, None] for i in range(slices)]
             leaving = algebra.carried(state, lambda i: read(k, i), corrected, decay, k.dtype, issue)
         else:
             gated, decay = algebra.scalar_write(
@@ -202,9 +203,9 @@ def forward(q, k, v, g, beta, h0, spans: Sequences, *, scale: float, chunk: int,
     weighted = functools.partial(_weighted_program, chunk=chunk, bk=min(tile.bk, width),
                                  bv=min(tile.bv, columns))
     starts, counts = spans.chunks[:, 0], spans.chunks[:, 1]
-    over = jax.vmap(jax.vmap(weighted, in_axes=(0, 0) + (None,) * 5), in_axes=(None, None) + (0,) * 5)
+    over = jax.vmap(jax.vmap(weighted, in_axes=(0, 0) + (None,) * 6), in_axes=(None, None) + (0,) * 6)
     w, u = over(starts, counts, by_head(flat["k"]), by_head(flat["v"]), by_head(flat["beta"]), by_head(a),
-                by_head(hi))
+                by_head(hi), by_head(lo))
     w = jnp.moveaxis(jax.vmap(lambda r: _placed(r, starts, counts, tokens))(w), 0, 1).astype(k.dtype)
     u = jnp.moveaxis(jax.vmap(lambda r: _placed(r, starts, counts, tokens))(u), 0, 1).astype(v.dtype)
     h, corrected, final = _states(flat["k"], u, w, hi, lo, h0, spans, batch=batch, length=length, chunk=chunk,
@@ -273,19 +274,24 @@ def _key_weighted_program(start, count, k, v, beta, a, g, gl, q, *, chunk: int, 
     for c in range(0, k.shape[-1], bk):
         key = _rows(k[:, c:c + bk], start, chunk, count)
         gate = _gates(g[:, c:c + bk], start, chunk, count)
-        qg.append(_rows(q[:, c:c + bk], start, chunk, count) * jnp.exp2(gate))
+        grown = algebra.raised(gate, _gates(gl[:, c:c + bk], start, chunk, count))
+        qg.append(_rows(q[:, c:c + bk], start, chunk, count) * grown)
         kg.append(algebra.key_decayed_write(
             key, gate, _gates(gl[:, c:c + bk], start, chunk, count),
             jax.lax.dynamic_index_in_dim(g[:, c:c + bk], final, 0).astype(jnp.float32),
             jax.lax.dynamic_index_in_dim(gl[:, c:c + bk], final, 0).astype(jnp.float32)))
-        w.append(algebra.weighted("apply_w", inverse, key, beta, ISSUE, jnp.exp2(gate)))
+        w.append(algebra.weighted("apply_w", inverse, key, beta, ISSUE, grown))
     return (jnp.concatenate(w, 1), u, jnp.concatenate(kg, 1), jnp.concatenate(qg, 1))
 
 
-def _key_output_program(start, count, entered, q, v, g, h, aqk, *, chunk: int, bk: int, scale: float):
+def _key_output_program(start, count, entered, q, v, g, gl, h, aqk, *, chunk: int, bk: int, scale: float):
     """`fla_kda._o_kernel`'s program over one value block: the chunk's output `[C, BV]`, fp32."""
-    return algebra.key_decayed_output(lambda c: _rows(q[:, c * bk:(c + 1) * bk], start, chunk, count),
-                                      lambda c: _gates(g[:, c * bk:(c + 1) * bk], start, chunk, count),
+    def columns(x, c):
+        return x[:, c * bk:(c + 1) * bk]
+
+    return algebra.key_decayed_output(lambda c: _rows(columns(q, c), start, chunk, count),
+                                      lambda c: (_gates(columns(g, c), start, chunk, count),
+                                                 _gates(columns(gl, c), start, chunk, count)),
                                       lambda c: h[entered, c * bk:(c + 1) * bk], q.shape[-1] // bk,
                                       _rows(aqk, start, chunk, count), _rows(v, start, chunk, count), scale,
                                       ISSUE)
@@ -346,9 +352,9 @@ def key_forward(q, k, v, g, beta, h0, spans: Sequences, *, scale: float, chunk: 
     tile = tiles["output"]
     bv = min(tile.bv, columns)
     output = functools.partial(_key_output_program, chunk=chunk, bk=min(tile.bk, width), scale=scale)
-    over = jax.vmap(jax.vmap(output, in_axes=(0, 0, 0) + (None,) * 5), in_axes=(None, None, None) + (0,) * 5)
+    over = jax.vmap(jax.vmap(output, in_axes=(0, 0, 0) + (None,) * 6), in_axes=(None, None, None) + (0,) * 6)
     out = jnp.concatenate([_placed_per_head(over(starts, counts, entered, by_head(flat["q"]),
-                                                 by_head(corrected[..., c:c + bv]), by_head(hi),
+                                                 by_head(corrected[..., c:c + bv]), by_head(hi), by_head(lo),
                                                  jnp.moveaxis(h[..., c:c + bv], 1, 0), by_head(aqk)),
                                             spans, tokens) for c in range(0, columns, bv)], -1)
     out = out.astype(jnp.float32 if wide else v.dtype).reshape(v.shape)

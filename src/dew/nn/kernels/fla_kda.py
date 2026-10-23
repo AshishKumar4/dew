@@ -64,7 +64,7 @@ DECAY_FLOOR = -5.0
 """The steepest per-token log decay the port takes, Kimi Linear's bound (`dew.nn.kda`'s `lower_bound`):
 its backward factors each block below a sub-chunk's diagonal through the sub-chunk's first row
 (`_bwd_intra_kernel`), `exp2(+-SUB g log2(e))`, past fp32's range beyond -5.5 a token; at -30 its decay
-gradient sat 5.0e4 times the token-by-token recurrence's error from float64 (ledger row 1328). A
+gradient sat 5.0e4 times the token-by-token recurrence's error from float64. A
 decay with no declared floor at or above it runs the portable math (`recurrence_chunk.port_refusal`)."""
 
 
@@ -265,14 +265,14 @@ def _w_u_kernel(chunk_ref, k_ref, v_ref, beta_ref, a_ref, g_ref, gl_ref, *refs, 
             columns = pl.ds(block * bk, bk)
             key = read(k_ref, columns)
             gate = _gates(g_ref, start, taken, chunk, 0, columns)
+            low = _gates(gl_ref, start, taken, chunk, 0, columns)
+            grown = algebra.raised(gate, low)
             if q_ref is not None and qg_ref is not None:
-                write(qg_ref, columns, read(q_ref, columns) * jnp.exp2(gate))
+                write(qg_ref, columns, read(q_ref, columns) * grown)
             write(kg_ref, columns, algebra.key_decayed_write(
-                key, gate, _gates(gl_ref, start, taken, chunk, 0, columns),
-                _row(g_ref, (start + taken - 1, columns))[None, :],
+                key, gate, low, _row(g_ref, (start + taken - 1, columns))[None, :],
                 _row(gl_ref, (start + taken - 1, columns))[None, :]))
-            write(w_ref, columns,
-                  algebra.weighted("apply_w", inverse, key, beta, _issuer(exact), jnp.exp2(gate)))
+            write(w_ref, columns, algebra.weighted("apply_w", inverse, key, beta, _issuer(exact), grown))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -281,7 +281,7 @@ class RecomputeWU(_Launch):
 
     NAME = "recompute_w_u"
     KEYS, VALUES = "k", "v"
-    revision: int = 2
+    revision: int = 3
     SPACES = _spaces(_tiles([(64, 64)], (2, 4), (2, 3, 4)))
     PICKS = _picks(Tiles(64, 64, 4, 2))
 
@@ -332,7 +332,8 @@ def recompute_w_u(k, v, beta, a, g, q=None, *, chunk: int = 64, spans: Sequences
     return _RECOMPUTE_W_U(k, v, beta, a, *_halves(g), q, *spans, chunk=chunk, interpret=interpret)
 
 
-def _o_kernel(chunk_ref, q_ref, v_ref, g_ref, h_ref, a_ref, o_ref, *, chunk: int, aligned: bool, scale: float,
+def _o_kernel(chunk_ref, q_ref, v_ref, g_ref, gl_ref, h_ref, a_ref, o_ref, *, chunk: int, aligned: bool,
+              scale: float,
               bk: int, exact: bool):
     """fla's `chunk_gla_fwd_kernel_o` (fla/ops/gla/chunk.py:345-432) for one chunk of one head and `BV`
     value columns: `scale (q exp2(g))_narrow h + tril(Aqk) v`, the gated queries rounded to their
@@ -350,7 +351,8 @@ def _o_kernel(chunk_ref, q_ref, v_ref, g_ref, h_ref, a_ref, o_ref, *, chunk: int
             return pl.ds(c * bk, bk)
 
         out = algebra.key_decayed_output(lambda c: read(q_ref, columns(c)),
-                                         lambda c: _gates(g_ref, start, taken, chunk, 0, columns(c)),
+                                         lambda c: (_gates(g_ref, start, taken, chunk, 0, columns(c)),
+                                                    _gates(gl_ref, start, taken, chunk, 0, columns(c))),
                                          lambda c: h_ref[entered, columns(c), :], q_ref.shape[-1] // bk,
                                          read(a_ref), read(v_ref), scale, _issuer(exact))
         write_rows(_rows(o_ref, start, chunk), taken, out)
@@ -362,12 +364,13 @@ class ChunkFwdO(_Launch):
 
     NAME = "chunk_fwd_o"
     KEYS, VALUES = "q", "v"
+    revision: int = 2
     SPACES = _spaces(_tiles([(32, 64), (64, 64), (32, 128), (64, 128)], (2, 4, 8), (2, 3, 4)),
                      _tiles([(32, 64), (64, 64)], (2, 4, 8), (2,)))
     # Measured on an A100-40GB at Kimi Linear's 1 x 4096 x 32 x 128 bf16: 0.25 -> 0.23 ms.
     PICKS = _picks(Tiles(64, 128, 4, 2), small=Tiles(64, 64, 4, 2))
 
-    def _fwd(self, q: jax.Array, v: jax.Array, g: jax.Array, a: jax.Array, h: jax.Array,
+    def _fwd(self, q: jax.Array, v: jax.Array, g: jax.Array, gl: jax.Array, a: jax.Array, h: jax.Array,
              chunk_spans: jax.Array, sequence_spans: jax.Array, *, chunk: int, scale: float, interpret: bool,
              config: Tiles, wide: bool = False, return_residuals: bool = False):
         from jax.experimental.pallas import triton as plgpu
@@ -386,12 +389,13 @@ class ChunkFwdO(_Launch):
             in_specs=[pl.BlockSpec((None, 4), lambda i_v, i_t, i_h: (i_t, 0)),
                       pl.BlockSpec((tokens, None, width), lambda i_v, i_t, i_h: (0, i_h // group, 0)), values,
                       pl.BlockSpec((tokens, None, width), lambda i_v, i_t, i_h: (0, i_h, 0)),
+                      pl.BlockSpec((tokens, None, width), lambda i_v, i_t, i_h: (0, i_h, 0)),
                       pl.BlockSpec((h.shape[0], None, width, bv), lambda i_v, i_t, i_h: (0, i_h, 0, i_v)),
                       pl.BlockSpec((tokens, None, chunk), lambda i_v, i_t, i_h: (0, i_h, 0))],
             out_specs=values, out_shape=jax.ShapeDtypeStruct((tokens, value_heads, columns), dtype),
             compiler_params=plgpu.CompilerParams(num_warps=config.warps, num_stages=config.stages),
             interpret=interpret, name="fla_kda_chunk_fwd_o",
-        )(spans.chunks, *_flat(q, v, g), h, *_flat(a))
+        )(spans.chunks, *_flat(q, v, g, gl), h, *_flat(a))
         return out.reshape(v.shape), None
 
 
@@ -406,7 +410,8 @@ def chunk_fwd_o(q, v, g, a, h, *, scale: float, chunk: int = 64, spans: Sequence
     K]`, `a` `Aqk` `[B, T, HV, BT]`, `h` the memories the chunks enter at their slots
     (`fla_gdn.chunk_fwd_h`'s)."""
     spans = sequences(*q.shape[:2], chunk=chunk) if spans is None else spans
-    return _CHUNK_FWD_O(q, v, g, a, h, *spans, chunk=chunk, scale=scale, interpret=interpret, wide=wide)
+    return _CHUNK_FWD_O(q, v, *_halves(g), a, h, *spans, chunk=chunk, scale=scale, interpret=interpret,
+                        wide=wide)
 
 
 def _dav_kernel(chunk_ref, v_ref, do_ref, a_ref, dv_ref, da_ref, *, chunk: int, aligned: bool, scale: float,
@@ -479,15 +484,19 @@ def bwd_dav(v, do, a, *, scale: float, chunk: int = 64, spans: Sequences | None 
     return _BWD_DAV(v, do, a, *spans, chunk=chunk, scale=scale, interpret=interpret)
 
 
-def _wy_dqkg_kernel(chunk_ref, q_ref, k_ref, v_ref, vn_ref, g_ref, beta_ref, a_ref, h_ref, do_ref, dh_ref,
-                    dv_ref, dq_ref, dk_ref, dv2_ref, dg_ref, db_ref, da_ref, *, chunk: int, aligned: bool,
-                    scale: float, bk: int, bv: int, exact: bool):
+def _wy_dqkg_kernel(chunk_ref, q_ref, k_ref, v_ref, vn_ref, g_ref, gl_ref, beta_ref, a_ref, h_ref, do_ref,
+                    dh_ref, dv_ref, dq_ref, dk_ref, dv2_ref, dg_ref, last_ref, db_ref, da_ref, *, chunk: int,
+                    aligned: bool, scale: float, bk: int, bv: int, exact: bool):
     """fla's `chunk_kda_bwd_kernel_wy_dqkg_fused` (fla/ops/kda/chunk_bwd.py:132-311) for one chunk of
     one head: the queries', keys', decay's and beta's gradients through the output's memory term and
     the WY representation, the values' through `A`, and the gradient of `Akk`, with fla's casts and
-    sums in its order. `A` is read transposed, as fla loads it; fla's first key block's value terms
-    run first, on their own loop. The memory the chunk enters and its gradient where it leaves are
-    read at their slots (`Sequences`)."""
+    sums in its order. The decay's gradient comes in two parts: `dg`, each token's terms through the
+    range from the chunk's start to it (the queries' and the write's decays, and the memory's decay at
+    the chunk's last token), and `last`, each token's term through the range from it to the chunk's
+    last (the keys' write into the memory leaving), which `bwd_intra` sums token by token with the
+    chunk's pairs, where fla takes each cumulated decay's gradient. `A` is read transposed, as fla
+    loads it; fla's first key block's value terms run first, on their own loop. The memory the chunk
+    enters and its gradient where it leaves are read at their slots (`Sequences`)."""
     start, taken = _chunk_of(chunk_ref, chunk, aligned)
     entered, left = chunk_ref[2], chunk_ref[3]
 
@@ -536,24 +545,24 @@ def _wy_dqkg_kernel(chunk_ref, q_ref, k_ref, v_ref, vn_ref, g_ref, beta_ref, a_r
                                                        (empty, empty, empty, jnp.zeros((bk,), jnp.float32)))
             key = read(k_ref, keys)
             gate = _gates(g_ref, start, taken, chunk, 0, keys)
-            final = _row(g_ref, (start + taken - 1, keys))
-            gate_exp = jnp.exp2(gate)
-            decay_grad = decay_grad * jnp.exp2(final)
+            low = _gates(gl_ref, start, taken, chunk, 0, keys)
+            final, final_low = _row(g_ref, (start + taken - 1, keys)), _row(gl_ref, (start + taken - 1, keys))
+            gate_exp = algebra.raised(gate, low)
+            decay_grad = decay_grad * algebra.raised(final, final_low)
             dq = dq * gate_exp * scale
-            dk = dk * jnp.exp2(final[None, :] - gate)
+            dk = dk * jnp.exp2((final[None, :] - gate) + (final_low[None, :] - low))
             gated_key = key * gate_exp
             dw = -dw.astype(transposed.dtype)
             scores = scores + _dot(dw, gated_key.T.astype(transposed.dtype), exact=exact)
             dkgb = _dot(transposed, dw, exact=exact)
             beta_grad = beta_grad + jnp.sum(dkgb * gated_key, axis=1)
-            key_dk = key * dk
-            decay_grad = decay_grad + jnp.sum(key_dk, axis=0)
-            dg = (read(q_ref, keys) * dq - key_dk
+            dg = (read(q_ref, keys) * dq
                   + jnp.where((index == taken - 1)[:, None], decay_grad[None, :], 0.0)
                   + gated_key * dkgb * beta[:, None])
             write(dq_ref, dq, keys)
             write(dk_ref, dk + dkgb * (gate_exp * beta[:, None]), keys)
             write(dg_ref, dg, keys)
+            write(last_ref, key * dk, keys)
             return scores, beta_grad
 
         scores, beta_grad = jax.lax.fori_loop(0, width // bk, key_block, carry)
@@ -570,14 +579,15 @@ class BwdWyDqkg(_Launch):
     """`bwd_wy_dqkg`'s launch (tuning.KernelOp)."""
 
     NAME = "bwd_wy_dqkg"
+    revision: int = 4
     KEYS, VALUES = "k", "v"
     SPACES = _spaces(_tiles([(32, 32), (32, 64)], (2, 4), (1,)), _tiles([(32, 32)], (2, 4), (1,)))
     PICKS = _picks(Tiles(32, 64, 4, 1), small=Tiles(32, 32, 4, 1))
 
     def _fwd(self, q: jax.Array, k: jax.Array, v: jax.Array, corrected: jax.Array, g: jax.Array,
-             beta: jax.Array, a: jax.Array, h: jax.Array, do: jax.Array, dh: jax.Array, dv: jax.Array,
-             chunk_spans: jax.Array, sequence_spans: jax.Array, *, chunk: int, scale: float, interpret: bool,
-             config: Tiles, return_residuals: bool = False):
+             gl: jax.Array, beta: jax.Array, a: jax.Array, h: jax.Array, do: jax.Array, dh: jax.Array,
+             dv: jax.Array, chunk_spans: jax.Array, sequence_spans: jax.Array, *, chunk: int, scale: float,
+             interpret: bool, config: Tiles, return_residuals: bool = False):
         from jax.experimental.pallas import triton as plgpu
 
         spans = Sequences(chunk_spans, sequence_spans)
@@ -591,23 +601,24 @@ class BwdWyDqkg(_Launch):
         gate = pl.BlockSpec((tokens, None), lambda i_t, h: (0, h))
         states = pl.BlockSpec((h.shape[0], None, width, columns), lambda i_t, head: (0, head, 0, 0))
         wide = jax.ShapeDtypeStruct((tokens, value_heads, width), jnp.float32)
-        dq, dk, dv2, dg, db, da = pl.pallas_call(
+        dq, dk, dv2, dg, last, db, da = pl.pallas_call(
             functools.partial(_wy_dqkg_kernel, chunk=chunk, aligned=_aligned(spans, batch, length, chunk),
                               scale=scale, bk=min(config.bk, width), bv=min(config.bv, columns),
                               exact=interpret),
             grid=(spans.chunks.shape[0], value_heads),
-            in_specs=[_CHUNK, keys, keys, headed(columns), headed(columns), headed(width), gate,
-                      headed(chunk), states, headed(columns), states, headed(columns)],
-            out_specs=[headed(width), headed(width), headed(columns), headed(width), gate, headed(chunk)],
-            out_shape=[wide, wide, jax.ShapeDtypeStruct((tokens, value_heads, columns), v.dtype), wide,
+            in_specs=[_CHUNK, keys, keys, headed(columns), headed(columns), headed(width), headed(width),
+                      gate, headed(chunk), states, headed(columns), states, headed(columns)],
+            out_specs=[headed(width), headed(width), headed(columns), headed(width), headed(width), gate,
+                       headed(chunk)],
+            out_shape=[wide, wide, jax.ShapeDtypeStruct((tokens, value_heads, columns), v.dtype), wide, wide,
                        jax.ShapeDtypeStruct((tokens, value_heads), jnp.float32),
                        jax.ShapeDtypeStruct((tokens, value_heads, chunk), jnp.float32)],
             compiler_params=plgpu.CompilerParams(num_warps=config.warps, num_stages=config.stages),
             interpret=interpret, name="fla_kda_bwd_wy_dqkg",
-        )(spans.chunks, *_flat(q, k, v, corrected, g, beta, a), h, *_flat(do), dh, *_flat(dv))
+        )(spans.chunks, *_flat(q, k, v, corrected, g, gl, beta, a), h, *_flat(do), dh, *_flat(dv))
         keyed = (batch, length, value_heads, width)
         return (dq.reshape(keyed), dk.reshape(keyed), dv2.reshape(v.shape), db.reshape(beta.shape),
-                dg.reshape(keyed), da.reshape(batch, length, value_heads, chunk)), None
+                dg.reshape(keyed), last.reshape(keyed), da.reshape(batch, length, value_heads, chunk)), None
 
 
 _BWD_WY_DQKG = BwdWyDqkg()
@@ -615,118 +626,71 @@ _BWD_WY_DQKG = BwdWyDqkg()
 
 def bwd_wy_dqkg(q, k, v, corrected, g, beta, a, h, do, dh, dv, *, scale: float, chunk: int = 64,
                 spans: Sequences | None = None, interpret: bool = False):
-    """`(dq, dk, dv, db, dg, dAkk)`: fla's `chunk_kda_bwd_wy_dqkg_fused` (chunk_bwd.py:367-431), `dq`,
-    `dk`, `dg` `[B, T, HV, K]`, `db` `[B, T, HV]` and `dAkk` `[B, T, HV, BT]` fp32, `dv` in `v`'s dtype.
+    """`(dq, dk, dv, db, dg, last, dAkk)`: fla's `chunk_kda_bwd_wy_dqkg_fused` (chunk_bwd.py:367-431),
+    `dq`, `dk` `[B, T, HV, K]`, the decay's gradient's two parts `dg` and `last` (`_wy_dqkg_kernel`) `[B,
+    T, HV, K]`, `db` `[B, T, HV]` and `dAkk` `[B, T, HV, BT]` fp32, `dv` in `v`'s dtype.
     `h` and `dh` the memories the chunks enter and their gradients at their slots
     (`fla_gdn.chunk_fwd_h`'s and `chunk_bwd_dhu`'s), `dv` the corrected values' full gradient, `a`
     `Akk`'s inverse."""
     spans = sequences(*k.shape[:2], chunk=chunk) if spans is None else spans
-    return _BWD_WY_DQKG(q, k, v, corrected, g, beta, a, h, do, dh, dv, *spans, chunk=chunk, scale=scale,
-                        interpret=interpret)
+    return _BWD_WY_DQKG(q, k, v, corrected, *_halves(g), beta, a, h, do, dh, dv, *spans, chunk=chunk,
+                        scale=scale, interpret=interpret)
 
 
-def _bwd_intra_kernel(chunk_ref, q_ref, k_ref, g_ref, beta_ref, daqk_ref, dakk_ref, dq_ref, dk_ref,
-                      dg_ref, dq2_ref, dk2_ref, db2_ref, dg2_ref, *, chunk: int, aligned: bool, exact: bool):
-    """fla's `chunk_kda_bwd_kernel_intra` (fla/ops/kda/chunk_intra.py:395-679), safe_gate off, for one
-    sub-chunk `i` of a chunk, one head and one block of key columns, as fla's grid runs it. The
-    gradients of `Aqk` and `Akk` reach the sub-chunk's queries and keys from the sub-chunks before
-    (`dq2`, `dk2`, the decay factored at its first row) and after (`dkt`, factored at its last row),
-    fp32 products at the call's solve precision (`fla_gdn._dot`'s `solve`), and from its own tokens
-    one by one in fp32; then beta's
-    and the decay's gradients, added to the ones `bwd_wy_dqkg` gave. Beta's is this key block's share.
-    A chunk's rows past its end read as zeros under its last row's decay, and its own tokens stop
-    there, as fla's varlen loads stop at the sequence's end."""
-    count = chunk // SUB
-    i = pl.program_id(1) % count
+def _bwd_intra_kernel(chunk_ref, q_ref, k_ref, g_ref, gl_ref, beta_ref, daqk_ref, dakk_ref, dq_ref, dk_ref,
+                      last_ref, dq2_ref, dk2_ref, db2_ref, dr_ref, *, chunk: int, aligned: bool):
+    """The intra-chunk terms of fla's `chunk_kda_bwd_kernel_intra` (fla/ops/kda/chunk_intra.py:395-679),
+    safe_gate off, for one chunk, one head and one block of key columns: the gradients of `Aqk` and `Akk`
+    reach the chunk's queries and keys token by token in fp32, each pair's decay its own `exp2(g_s - g_t)`
+    over both halves of the prefix, as the forward's rows take it (`_intra_rows_kernel`), where fla
+    factors the blocks off the diagonal through a sub-chunk's first or last row (`exp2(+-16 g log2(e))`).
+    Beta's gradient is this key block's share. The decay's gradient through every pair `(s, t)`, its range
+    `(t, s]`, is summed token by token over the pairs whose range holds it (`dr`): the chunk's own pairs
+    and the write's pairs to the chunk's last token (`last_ref`, `bwd_wy_dqkg`'s), where fla gives each
+    cumulated decay's gradient and sums them back, which cancelled to 468 times the token-by-token
+    recurrence's error at Kimi Linear's -5 floor. A chunk's rows past its end take no part."""
     start, taken = _chunk_of(chunk_ref, chunk, aligned)
-    first = i * SUB
 
-    @pl.when(first < taken)
+    @pl.when(taken > 0)
     def _():
-        index = jnp.arange(SUB)
-        width = k_ref.shape[-1]
-        own_tokens = SUB if aligned else jnp.minimum(SUB, taken - first)
+        rows = jnp.arange(chunk)
+        live = (rows < taken)[:, None]
 
-        def left(at):
-            """The chunk's rows from `at`: a whole sub-chunk's where every chunk is whole."""
-            return SUB if aligned else taken - at
+        def read(ref):
+            return read_rows(_rows(ref, start, chunk), taken).astype(jnp.float32)
 
-        def tile(ref, at):
-            return read_rows(_rows(ref, start + at, SUB), left(at))
+        gate, low = _gates(g_ref, start, taken, chunk), _gates(gl_ref, start, taken, chunk)
+        query, key = read(q_ref), read(k_ref)
+        beta = read_rows(_rows(beta_ref, start, chunk), taken).astype(jnp.float32)
+        weighted = key * beta[:, None]
+        empty = jnp.zeros(key.shape, jnp.float32)
 
-        def gates(at):
-            return _gates(g_ref, start + at, left(at), SUB)
+        def column(j, carry):
+            """The chunk's token `j` as the column of every row `s >= j`: its pairs' decays, the rows' and
+            the column's gradients, and the ranges `(t, j - 1]` closed before it."""
+            dq2, dk2, dkt, running, behind, dr = carry
+            apart = (gate - _row(g_ref, start + j)[None, :]) + (low - _row(gl_ref, start + j)[None, :])
+            decay = jnp.exp2(apart)
+            decay = jnp.where((rows >= j)[:, None] & live, decay, 0.0)
+            at = pl.ds(j, 1)
+            qk = read_rows(_rows(daqk_ref, start, chunk, at), taken).astype(jnp.float32)
+            kk = read_rows(_rows(dakk_ref, start, chunk, at), taken).astype(jnp.float32)
+            own = k_ref[start + j].astype(jnp.float32)[None, :]
+            here = (rows == j)[:, None]
+            through = (qk * query + kk * weighted) * decay
+            pairs = through * own
+            closed = jnp.sum(jnp.where((rows >= j)[:, None], running, 0.0), axis=0) + behind
+            return (dq2 + qk * own * decay, dk2 + kk * own * decay,
+                    jnp.where(here, jnp.sum(through, axis=0)[None, :], dkt), running + pairs,
+                    behind + last_ref[start + j].astype(jnp.float32),
+                    jnp.where(here, closed[None, :], dr))
 
-        def scores(ref, row, column):
-            return read_rows(_rows(ref, start + row, SUB, pl.ds(column, SUB)), left(row)).astype(jnp.float32)
-
-        def row(ref, at):
-            return ref[start + at].astype(jnp.float32)
-
-        def decayed(at):
-            """The cumulated decay at the chunk's row `at`, `[1, K]`."""
-            return _row(g_ref, start + at)[None, :]
-
-        gate = gates(first)
-        key = tile(k_ref, first).astype(jnp.float32)
-        beta = tile(beta_ref, first).astype(jnp.float32)
-        origin = decayed(first)
-
-        def before(j, sums):
-            decay = jnp.exp2(origin - gates(j * SUB))
-            gated = tile(k_ref, j * SUB).astype(jnp.float32) * decay
-            return (sums[0] + _dot(scores(daqk_ref, first, j * SUB), gated, exact=exact, solve=k_ref.dtype),
-                    sums[1] + _dot(scores(dakk_ref, first, j * SUB), gated, exact=exact, solve=k_ref.dtype))
-
-        empty = jnp.zeros((SUB, width), jnp.float32)
-        dq2, dk2 = jax.lax.fori_loop(0, i, before, (empty, empty))
-        ahead = jnp.exp2(gate - origin)
-        dq2, dk2 = dq2 * ahead, dk2 * ahead
-        def diagonal(j, sums):
-            token = first + j
-            decay = jnp.exp2(gate - decayed(token))
-            causal = (index >= j)[:, None]
-            own = row(k_ref, token)[None, :] * decay
-            column = pl.ds(token, 1)
-            qk = read_rows(_rows(daqk_ref, start + first, SUB, column), left(first))
-            kk = read_rows(_rows(dakk_ref, start + first, SUB, column), left(first))
-            return (sums[0] + jnp.where(causal, qk * own, 0.0), sums[1] + jnp.where(causal, kk * own, 0.0))
-
-        dq2, dk2 = jax.lax.fori_loop(0, own_tokens, diagonal, (dq2, dk2))
-        beta_grad = jnp.sum(dk2 * key, axis=1)
-        dk2 = dk2 * beta[:, None]
-        dg2 = tile(q_ref, first).astype(jnp.float32) * dq2
-        write_rows(_rows(dq2_ref, start + first, SUB), left(first), dq2 + tile(dq_ref, first))
-        closing = decayed(first + own_tokens - 1)
-
-        def after(j, dkt):
-            behind = jnp.exp2(gates(j * SUB) - closing)
-            # k beta in the operands' dtype, as fla's b_kb, then widened by the decay.
-            weighted = (tile(k_ref, j * SUB) * tile(beta_ref, j * SUB)[:, None]).astype(jnp.float32)
-            dkt = dkt + _dot(scores(daqk_ref, j * SUB, first).T,
-                             tile(q_ref, j * SUB).astype(jnp.float32) * behind, exact=exact,
-                             solve=k_ref.dtype)
-            return dkt + _dot(scores(dakk_ref, j * SUB, first).T, weighted * behind, exact=exact,
-                              solve=k_ref.dtype)
-
-        dkt = jax.lax.fori_loop(i + 1, count, after, empty) * jnp.exp2(closing - gate)
-
-        def own(j, dkt):
-            token = first + j
-            query = row(q_ref, token)
-            weighted = row(k_ref, token) * row(beta_ref, token)
-            decay = jnp.exp2(decayed(token) - gate)
-            causal = (index <= j)[:, None]
-            qk = daqk_ref[start + token, pl.ds(first, SUB)]
-            kk = dakk_ref[start + token, pl.ds(first, SUB)]
-            dkt = dkt + jnp.where(causal, qk[:, None] * query[None, :] * decay, 0.0)
-            return dkt + jnp.where(causal, kk[:, None] * weighted[None, :] * decay, 0.0)
-
-        dkt = jax.lax.fori_loop(0, own_tokens, own, dkt)
-        dg2 = dg2 + (dk2 - dkt) * key + tile(dg_ref, first)
-        write_rows(_rows(dk2_ref, start + first, SUB), left(first), dk2 + tile(dk_ref, first) + dkt)
-        write_rows(_rows(dg2_ref, start + first, SUB), left(first), dg2)
-        write_rows(_rows(db2_ref, start + first, SUB), left(first), beta_grad)
+        dq2, dk2, dkt, _, _, dr = jax.lax.fori_loop(
+            0, taken, column, (empty, empty, empty, empty, jnp.zeros(key.shape[-1:], jnp.float32), empty))
+        write_rows(_rows(db2_ref, start, chunk), taken, jnp.sum(dk2 * key, axis=1))
+        write_rows(_rows(dq2_ref, start, chunk), taken, dq2 + read(dq_ref))
+        write_rows(_rows(dk2_ref, start, chunk), taken, dk2 * beta[:, None] + read(dk_ref) + dkt)
+        write_rows(_rows(dr_ref, start, chunk), taken, dr)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -734,13 +698,14 @@ class BwdIntra(_Launch):
     """`bwd_intra`'s launch (tuning.KernelOp)."""
 
     NAME = "bwd_intra"
+    revision: int = 4
     KEYS, VALUES = "k", None
     SPACES = _spaces(_tiles([(32, 0), (64, 0)], (2, 4, 8), (1,)))
     # Measured on an A100-40GB at Kimi Linear's 1 x 4096 x 32 x 128 bf16: 2.49 -> 1.98 ms.
     PICKS = _picks(Tiles(64, 0, 4, 1), small=Tiles(32, 0, 4, 1))
 
-    def _fwd(self, q: jax.Array, k: jax.Array, g: jax.Array, beta: jax.Array,
-             daqk: jax.Array, dakk: jax.Array, dq: jax.Array, dk: jax.Array, db: jax.Array, dg: jax.Array,
+    def _fwd(self, q: jax.Array, k: jax.Array, g: jax.Array, gl: jax.Array, beta: jax.Array,
+             daqk: jax.Array, dakk: jax.Array, dq: jax.Array, dk: jax.Array, db: jax.Array, last: jax.Array,
              chunk_spans: jax.Array, sequence_spans: jax.Array, *, chunk: int, interpret: bool,
              config: Tiles, return_residuals: bool = False):
         from jax.experimental.pallas import triton as plgpu
@@ -748,42 +713,42 @@ class BwdIntra(_Launch):
         spans = Sequences(chunk_spans, sequence_spans)
         batch, length, key_heads, width = k.shape
         value_heads = beta.shape[2]
-        group, tokens, count = value_heads // key_heads, batch * length, chunk // SUB
+        group, tokens = value_heads // key_heads, batch * length
         bk = min(config.bk, width)
         blocks = width // bk
-        keys = pl.BlockSpec((tokens, None, bk), lambda i_k, i_s, h: (0, h // group, i_k))
-        headed = pl.BlockSpec((tokens, None, bk), lambda i_k, i_s, h: (0, h, i_k))
-        gate = pl.BlockSpec((tokens, None), lambda i_k, i_s, h: (0, h))
-        scores = pl.BlockSpec((tokens, None, chunk), lambda i_k, i_s, h: (0, h, 0))
+        keys = pl.BlockSpec((tokens, None, bk), lambda i_k, i_t, h: (0, h // group, i_k))
+        headed = pl.BlockSpec((tokens, None, bk), lambda i_k, i_t, h: (0, h, i_k))
+        gate = pl.BlockSpec((tokens, None), lambda i_k, i_t, h: (0, h))
+        scores = pl.BlockSpec((tokens, None, chunk), lambda i_k, i_t, h: (0, h, 0))
         wide = jax.ShapeDtypeStruct((tokens, value_heads, width), jnp.float32)
-        dq, dk, partial, dg = pl.pallas_call(
-            functools.partial(_bwd_intra_kernel, chunk=chunk, aligned=_aligned(spans, batch, length, chunk),
-                              exact=interpret),
-            grid=(blocks, spans.chunks.shape[0] * count, value_heads),
-            in_specs=[pl.BlockSpec((None, 4), lambda i_k, i_s, h: (i_s // count, 0)), keys, keys, headed,
-                      gate, scores, scores, headed, headed, headed],
-            out_specs=[headed, headed, pl.BlockSpec((None, tokens, None), lambda i_k, i_s, h: (i_k, 0, h)),
+        dq, dk, partial, ranged = pl.pallas_call(
+            functools.partial(_bwd_intra_kernel, chunk=chunk, aligned=_aligned(spans, batch, length, chunk)),
+            grid=(blocks, spans.chunks.shape[0], value_heads),
+            in_specs=[pl.BlockSpec((None, 4), lambda i_k, i_t, h: (i_t, 0)), keys, keys, headed,
+                      headed, gate, scores, scores, headed, headed, headed],
+            out_specs=[headed, headed, pl.BlockSpec((None, tokens, None), lambda i_k, i_t, h: (i_k, 0, h)),
                        headed],
             out_shape=[wide, wide, jax.ShapeDtypeStruct((blocks, tokens, value_heads), jnp.float32), wide],
             compiler_params=plgpu.CompilerParams(num_warps=config.warps, num_stages=config.stages),
             interpret=interpret, name="fla_kda_bwd_intra",
-        )(spans.chunks, *_flat(q, k, g, beta, daqk, dakk, dq, dk, dg))
+        )(spans.chunks, *_flat(q, k, g, gl, beta, daqk, dakk, dq, dk, last))
         keyed = (batch, length, value_heads, width)
         return (dq.reshape(keyed), dk.reshape(keyed), db + jnp.sum(partial, axis=0).reshape(beta.shape),
-                dg.reshape(keyed)), None
+                ranged.reshape(keyed)), None
 
 
 _BWD_INTRA = BwdIntra()
 
 
-def bwd_intra(q, k, g, beta, daqk, dakk, dq, dk, db, dg, *, chunk: int = 64,
+def bwd_intra(q, k, g, beta, daqk, dakk, dq, dk, db, last, *, chunk: int = 64,
               spans: Sequences | None = None, interpret: bool = False):
-    """`(dq, dk, db, dg)` fp32, `bwd_wy_dqkg`'s plus the intra-chunk terms of `dAqk` and `dAkk`: fla's
-    `chunk_kda_bwd_intra` (chunk_intra.py:897-960), its grid over key blocks, sub-chunks and heads,
-    beta's gradient summed over the key blocks after. `dq`, `dk`, `dg` `[B, T, HV, K]`, `db` `[B, T,
-    HV]`."""
+    """`(dq, dk, db, ranged)` fp32: `bwd_wy_dqkg`'s `dq`, `dk` and `db` plus the intra-chunk terms of `dAqk`
+    and `dAkk` (fla's `chunk_kda_bwd_intra`, chunk_intra.py:897-960, over key blocks, chunks and heads,
+    beta's gradient summed over the key blocks after), and the decay's gradient through every pair of
+    tokens, each token's summed over the pairs whose range holds it: the chunk's own and the write's to
+    its last token, `last` (`bwd_wy_dqkg`'s). `dq`, `dk`, `last` `[B, T, HV, K]`, `db` `[B, T, HV]`."""
     spans = sequences(*k.shape[:2], chunk=chunk) if spans is None else spans
-    return _BWD_INTRA(q, k, g, beta, daqk, dakk, dq, dk, db, dg, *spans, chunk=chunk,
+    return _BWD_INTRA(q, k, *_halves(g), beta, daqk, dakk, dq, dk, db, last, *spans, chunk=chunk,
                       interpret=interpret)
 
 
@@ -813,7 +778,7 @@ def cumulated_fwd(q, k, v, g, beta, h0, spans: Sequences, scale: float, chunk: i
     akk = checkpoint_name(akk, 'delta_inverse')
     w, u, kg, qg = recompute_w_u(k, v, beta, akk, g, q if keep else None, **kernels)
     h, corrected, final = fla_gdn.chunk_fwd_h(kg, w, u, g, h0, **kernels)
-    o = chunk_fwd_o(q, corrected, _halves(g)[0], aqk, h, scale=scale, wide=wide, **kernels)
+    o = chunk_fwd_o(q, corrected, g, aqk, h, scale=scale, wide=wide, **kernels)
     memory = checkpoint_name((w, kg, qg, h, corrected), 'delta_memory') if keep else None
     return (o, final), (q, k, v, g, beta, aqk, akk, h0, memory, spans)
 
@@ -840,8 +805,10 @@ def _rule_bwd(scale: float, chunk: int, interpret: bool, keep: bool, wide: bool,
     memory and corrected values the forward kept, or recomputed as fla does, then `dAqk` and the values'
     local gradient, the reverse recurrence
     (`fla_gdn.chunk_bwd_dhu`'s USE_GK branch), the fused WY and memory gradients, the intra-chunk
-    terms, a key head's value heads summed (fla's GVA), and the decay's gradient summed back over
-    each chunk, each sequence's first token's from its memory (`first_decay_grad`). A `wide` output's
+    terms, a key head's value heads summed (fla's GVA), and the decay's gradient: its terms through the
+    range from a chunk's start summed back over the chunk, its pairs' summed over the ranges that hold
+    each token (`bwd_intra`'s), each sequence's first token's from its memory (`first_decay_grad`). A
+    `wide` output's
     cotangent is taken in the values' dtype (`fla_gdn._rule_bwd`)."""
     q, k, v, prefix, beta, aqk, akk, h0, memory, spans = residual
     do, dht = cotangent
@@ -852,17 +819,16 @@ def _rule_bwd(scale: float, chunk: int, interpret: bool, keep: bool, wide: bool,
     else:
         w, u, kg, qg = recompute_w_u(k, v, beta, akk, prefix, q, **kernels)
         h, corrected, _ = fla_gdn.chunk_fwd_h(kg, w, u, prefix, h0, **kernels)
-    g = _halves(prefix)[0]
     daqk, dv = bwd_dav(corrected, do, aqk, scale=scale, **kernels)
-    dh, dh0, dv = fla_gdn.chunk_bwd_dhu(qg, kg, w, g, dht.astype(jnp.float32), do, dv, scale=scale,
+    dh, dh0, dv = fla_gdn.chunk_bwd_dhu(qg, kg, w, prefix, dht.astype(jnp.float32), do, dv, scale=scale,
                                         **kernels)
-    dq, dk, dv, db, dg, dakk = bwd_wy_dqkg(q, k, v, corrected, g, beta, akk, h, do, dh, dv, scale=scale,
-                                           **kernels)
-    dq, dk, db, dg = bwd_intra(q, k, g, beta, daqk, dakk, dq, dk, db, dg, **kernels)
+    dq, dk, dv, db, dg, last, dakk = bwd_wy_dqkg(q, k, v, corrected, prefix, beta, akk, h, do, dh, dv,
+                                                 scale=scale, **kernels)
+    dq, dk, db, ranged = bwd_intra(q, k, prefix, beta, daqk, dakk, dq, dk, db, last, **kernels)
     group = v.shape[2] // k.shape[2]
     if group > 1:
         dq, dk = (x.reshape(*x.shape[:2], k.shape[2], group, x.shape[-1]).sum(axis=3) for x in (dq, dk))
-    dg = first_decay_grad(recurrence.cumulated(dg, reverse=True, **kernels), h0, dh0, spans)
+    dg = first_decay_grad(recurrence.cumulated(dg, reverse=True, **kernels) + ranged, h0, dh0, spans)
     return (dq.astype(q.dtype), dk.astype(k.dtype), dv.astype(v.dtype), dg, db.astype(beta.dtype), dh0, None)
 
 

@@ -125,7 +125,7 @@ def test_the_kernel_cases_lower_each_kernel_on_abstract_operands(target):
         fn, args = case.call()
         geometry = support.COMPILED_SHAPES[name.split("/")[4]]
         assert fn.keywords["interpret"] is False
-        assert args and all(isinstance(arg, jax.ShapeDtypeStruct) for arg in args)
+        assert args and all(isinstance(arg, jax.ShapeDtypeStruct) for arg in jax.tree.leaves(args))
         assert args[0].shape[:2] == (geometry["batch"], geometry["length"])
 
 
