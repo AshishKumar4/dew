@@ -92,6 +92,7 @@ SEEDS = {"ties at scale 1": 64, "ties at scale 1, cotangents near 2**125": 64, "
          "a resumed state of a denominator near fp32's largest beside an overflowing column": 8,
          "fp16 values near their largest beside a state near fp32's largest": 8,
          "keys an ulp apart, float32": 32, "keys an ulp apart, bfloat16": 32,
+         "keys near fp32's largest at equal logits": 8,
          "a decode step's sink and one key": 8, "a decode step's sink near fp32's largest and one key": 8,
          "documents of one key": 8}
 """Each family's declared seeds, the fewest over which the reference compared with itself resolves check
@@ -407,6 +408,16 @@ def _near_keys(dtype: str):
     return draw
 
 
+def _large_keys(seed):
+    # One query a row of zeros over two keys near fp32's largest, so both logits are 0 and the two weigh
+    # alike, their values drawn: the keys' weighted sum overflows fp32 where their weighted mean does not,
+    # and the query's gradient is the cotangents' difference times a key (`algebra.DqSums.keyed`).
+    key = np.zeros((ROWS, 2, 1, 16), np.float32)
+    key[..., 0] = _uniform(seed, 1.7e38, 3.4e38, (ROWS, 2, 1))
+    value, dout = _normal(seed + 1, (ROWS, 2, 1, 16), (ROWS, 1, 1, 16))
+    return np.zeros((ROWS, 1, 1, 16), np.float32), key, value, None, dout
+
+
 def _families() -> dict[str, Family]:
     small = functools.partial(_small_weight, queries=8, logits=(16.0, 21.0), sizes=(3.0, 5.0))
     edge = functools.partial(_small_weight, queries=1, logits=(80.0, 87.0), sizes=None, rows=1024)
@@ -472,6 +483,7 @@ def _families() -> dict[str, Family]:
         "a subnormal share of an overflowing row, bfloat16": Family(
             _subnormal_share, np.ones((64, 1, 1, 256), bool), folded=False, dtype="bfloat16"),
         # Every weight but one 1/255, bf16's worst rounding of a weight, beside the subnormal share.
+        "keys near fp32's largest at equal logits": Family(_large_keys, _kept(1, 2)),
         # A query's gradient that cancels across its keys, in either dtype (`algebra.cotangent_product`).
         "keys an ulp apart, float32": Family(_near_keys("float32"), _kept(1, 2)),
         "keys an ulp apart, bfloat16": Family(_near_keys("bfloat16"), _kept(1, 2), dtype="bfloat16"),
