@@ -619,7 +619,8 @@ def test_dews_fla_rule_runs_packed_documents_as_their_own_sequences(per_key, beg
 def test_inside_a_shard_map_that_checks_varying_axes_the_rule_runs_the_portable_math():
     """A Pallas call cannot run where a caller's `shard_map` checks varying axes over operands that
     vary (its results state no varying type), so there the rule takes the portable math: its outputs
-    and gradients inside such a map are the portable math's, bitwise, where the port would have run."""
+    and gradients inside such a map are the portable math's, bitwise, where the port would have run
+    (an A100's row names it); the port chosen there raises (`selection.KernelRefused`)."""
     from jax.sharding import Mesh, PartitionSpec
 
     keys = jax.random.split(jax.random.key(83), 6)
@@ -638,7 +639,10 @@ def test_inside_a_shard_map_that_checks_varying_axes_the_rule_runs_the_portable_
         return jax.jit(jax.value_and_grad(lambda *operands: jnp.sum(mapped(*operands) * do),
                                           argnums=range(5)))(q, k, v, g, beta)
 
-    with row_names_port():
+    with row_names_port(), pytest.raises(KernelRefused) as refused:
+        run()
+    assert [refusal.code for refusal in refused.value.refusals] == ["varying"]
+    with generation.assumed("sm80"):
         got = run()
     with row_names_port(port=False):
         want = run()
