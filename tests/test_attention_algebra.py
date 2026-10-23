@@ -622,3 +622,24 @@ def test_a_querys_gradient_over_keys_near_fp32s_largest_is_finite_at_any_scale_a
     for name, grads in (("triton", triton), ("portable", portable)):
         np.testing.assert_array_equal(np.asarray(grads.query), 0.0, err_msg=name)
 
+
+def test_a_querys_gradient_with_a_large_refinement_at_a_small_scale_is_finite():
+    """Three equal keys of 2^100 at a scale of 2^-80, one value of 2^54: equal logits, so the cotangents'
+    rounding leaves D's refinement at -2^29 against keys of 2^100, while the correction it makes,
+    -2^29 · 2^-80 · 2^100 times the weights' mass, is 2^49 (`algebra.dq_finish`: each factor's mantissa and
+    exponent apart). dQ is finite in both mainloops, and the two agree to the bit."""
+    query = jnp.zeros((1, 1, 1, 16), jnp.float32)
+    key = jnp.zeros((1, 3, 1, 16), jnp.float32).at[:, :, :, 0].set(2.0 ** 100)
+    value = jnp.zeros((1, 3, 1, 16), jnp.float32).at[:, 2, :, 0].set(2.0 ** 54)
+    dout = jnp.zeros((1, 1, 1, 16), jnp.float32).at[..., 0].set(1.0)
+    spans = template.spans(1, 3, 1)
+    tiles = {"block_q": 32, "block_k": 32, "pad": attention_triton.BLOCK}
+    with tuning.pinned({attention_triton.TritonBackward: joint(TILES[1])}):
+        triton = attention_triton.backward(query, key, value, spans, None, dout, scale=2.0 ** -80,
+                                           natural=True, interpret=True)
+    portable = attention_portable.backward(query, key, value, spans, None, dout, scale=2.0 ** -80,
+                                           natural=True, **tiles)
+    for name, grads in (("triton", triton), ("portable", portable)):
+        assert np.isfinite(np.asarray(grads.query)).all(), name
+    assert_same_bits(triton.query, portable.query, "a large refinement at a small scale")
+
