@@ -1,0 +1,123 @@
+"""Check 1's rows over an orbit of summation orders (tests/reference_error.py, `assert_as_exact`'s
+`orders`): a row that nearly cancels rounds worst at some orders and exactly at others, so both arms are
+judged over the same orders, and a fault at any order still fails."""
+
+import jax
+import jax.numpy as jnp
+import numpy as np
+import pytest
+from reference_error import RESOLUTION, _drawn, assert_as_exact, seeds_for
+
+ROWS = 64
+
+
+def _cancelling_draw(seed):
+    """Sums of three terms, `[ROWS, 4, 3]`, standard normal but for the first row's, which cancel: 1, a
+    quarter of an fp32 unit in the last place of 1 (2^-25), and -1, scaled by a power of two the seed
+    picks, small beside the other rows' errors (the pooled ratio is theirs) and far above float64's
+    resolution of the leaf, so the row is measured. In the order 1, -1, 2^-25 the exact sum survives; in
+    1, 2^-25, -1 the 2^-25 is lost to the first rounding and the row is all error."""
+    rng = np.random.default_rng([0x0B, seed])
+    terms = rng.normal(size=(ROWS, 4, 3))
+    terms[0] = np.array([1.0, 2.0 ** -25, -1.0]) * 2.0 ** int(rng.integers(-12, -8))
+    return (terms.astype(np.float32),)
+
+
+@jax.jit
+def _left_to_right(terms):
+    return {"sum": (terms[..., 0] + terms[..., 1]) + terms[..., 2]}
+
+
+@jax.jit
+def _outer_first(terms):
+    """The same sums with the last two terms swapped: the first row's comes out exact."""
+    return {"sum": (terms[..., 0] + terms[..., 2]) + terms[..., 1]}
+
+
+@jax.jit
+def _rounded_from_float64(terms):
+    """The sums taken in float64 and rounded once: exact on the first row at every order."""
+    return {"sum": jnp.sum(terms.astype(jnp.float64), axis=-1).astype(jnp.float32)}
+
+
+def _swapped(inputs):
+    """The orbit of a sum's last two terms: the draw, and its terms with those two swapped."""
+    (terms,) = inputs
+    return [inputs, (terms[..., [0, 2, 1]],)]
+
+
+def test_the_cancelling_row_is_measured_and_not_float64_zero():
+    (terms,) = _cancelling_draw(0)
+    row = np.abs(np.sum(terms[0].astype(np.float64), axis=-1))
+    leaf = np.sqrt(np.mean(np.square(np.sum(terms.astype(np.float64), axis=-1))))
+    assert np.all(row > 1000 * RESOLUTION * leaf)
+
+
+def test_an_orbit_judges_each_arms_worst_row_over_the_same_orders():
+    """A reference whose own order is the exact one fails an equally exact Dew by the worst row alone.
+    Over the orbit of the two orders both arms run at each, both worst rows are the lost 2^-25, and the
+    site passes; each arm's worst row is its worst at any order, its errors and values the draw's own."""
+    seeds = seeds_for(_outer_first, _cancelling_draw, "cancelling sums")
+    with pytest.raises(AssertionError) as raised:
+        assert_as_exact(_left_to_right, _outer_first, _cancelling_draw, "cancelling sums", seeds=seeds)
+    assert raised.type is AssertionError
+    assert_as_exact(_left_to_right, _outer_first, _cancelling_draw, "cancelling sums", seeds=seeds,
+                    orders=_swapped)
+    over = _drawn(_left_to_right, _outer_first, _cancelling_draw, range(8), orders=_swapped)
+    # Each order alone, its truth the same sums in float64 (exact: three float32 terms).
+    at = [_drawn(_left_to_right, _outer_first, lambda seed, k=k: _swapped(_cancelling_draw(seed))[k],
+                 range(8)) for k in range(2)]
+    np.testing.assert_array_equal(over.worst, np.maximum(at[0].worst, at[1].worst))
+    np.testing.assert_array_equal(over.mine, at[0].mine)
+    np.testing.assert_array_equal(over.theirs, at[0].theirs)
+
+
+def test_an_orbit_fails_a_dew_wrong_only_at_another_order():
+    """A reference exact on the cancelling row at every order holds a Dew exact at the draw's own order
+    and all error at the other: one order passes it, the orbit fails it."""
+    seeds = seeds_for(_rounded_from_float64, _cancelling_draw, "rounded once")
+    assert_as_exact(_outer_first, _rounded_from_float64, _cancelling_draw, "rounded once", seeds=seeds)
+    with pytest.raises(AssertionError) as raised:
+        assert_as_exact(_outer_first, _rounded_from_float64, _cancelling_draw, "rounded once", seeds=seeds,
+                        orders=_swapped)
+    assert raised.type is AssertionError
+
+
+def test_an_orbit_fails_a_value_not_finite_at_another_order():
+    """A Dew that turns NaN only at the other order (where the cancelling row's middle term is its
+    negative one) passes at the draw's own order and fails over the orbit."""
+    @jax.jit
+    def broken_when_swapped(terms):
+        return {"sum": jnp.where(terms[0, 0, 1] < 0, jnp.nan, _outer_first(terms)["sum"])}
+
+    seeds = seeds_for(_outer_first, _cancelling_draw, "cancelling sums")
+    assert_as_exact(broken_when_swapped, _outer_first, _cancelling_draw, "nan", seeds=seeds)
+    with pytest.raises(AssertionError) as raised:
+        assert_as_exact(broken_when_swapped, _outer_first, _cancelling_draw, "nan", seeds=seeds,
+                        orders=_swapped)
+    assert raised.type is AssertionError
+
+
+def test_an_orbit_still_fails_a_sum_that_differs():
+    """A lost term fails over the orbit as at one order: the orbit moves rows' rounding, never a sum."""
+    @jax.jit
+    def lost(terms):
+        return {"sum": terms[..., 0] + terms[..., 1]}
+
+    with pytest.raises(AssertionError) as raised:
+        assert_as_exact(lost, _outer_first, _cancelling_draw, "lost term",
+                        seeds=seeds_for(_outer_first, _cancelling_draw, "cancelling sums"), orders=_swapped)
+    assert raised.type is AssertionError
+
+
+def test_an_orbit_of_a_recorded_reference_or_of_one_order_is_refused():
+    """A recorded reference (`indexed_recording`'s, which it marks `recorded`) holds its recorded draws
+    alone, and an orbit holds the draw's own order and another."""
+    def recorded(terms):
+        return _outer_first(terms)
+    recorded.recorded = True
+
+    with pytest.raises(ValueError):
+        _drawn(_left_to_right, recorded, _cancelling_draw, range(2), orders=_swapped)
+    with pytest.raises(ValueError):
+        _drawn(_left_to_right, _outer_first, _cancelling_draw, range(2), orders=lambda inputs: [inputs])
