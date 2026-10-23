@@ -7,6 +7,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+import torch
 from reference_error import (
     FACTOR,
     REDRAW,
@@ -58,6 +59,301 @@ def test_without_ynn_takes_a_callers_compiler_options_over_its_own():
     dot_fusion = {"xla_cpu_experimental_ynn_fusion_type": "LIBRARY_FUSION_TYPE_DOT"}
     np.testing.assert_array_equal(without_ynn(jnp.dot, compiler_options=dot_fusion)(x, w),
                                   jax.jit(jnp.dot)(x, w))
+
+
+def test_windows_stack_a_sites_own_draws_and_its_arms_take_them_all():
+    """`windows(draw, count)`'s seed `s` is the site's draws of seeds `s * count` on, stacked, and an arm
+    over them, batched or looped, gives each window's own output, stacked, as host arrays."""
+    from reference_error import over_windows, windows
+
+    def draw(seed):
+        rng = np.random.default_rng(seed)
+        return rng.normal(size=(3, 4)).astype(np.float32), np.int32(seed)
+
+    def arm(x, seed):
+        return {"sum": jnp.sum(x, axis=-1) + seed, "x": x}
+
+    stacked = windows(draw, 5)(2)
+    for index in range(5):
+        for got, want in zip(jax.tree.leaves(stacked), jax.tree.leaves(draw(10 + index)), strict=True):
+            np.testing.assert_array_equal(got[index], want)
+    looped = over_windows(lambda x, seed: jax.tree.map(np.asarray, arm(x, seed)), looped=True)
+    for wrapped in (over_windows(arm), looped):
+        found = wrapped(*stacked)
+        assert all(type(leaf) is np.ndarray for leaf in jax.tree.leaves(found))
+        for index in range(5):
+            wanted = jax.tree.leaves(arm(*draw(10 + index)))
+            for got, want in zip(jax.tree.leaves(found), wanted, strict=True):
+                np.testing.assert_array_equal(got[index], np.asarray(want))
+
+
+def test_windows_keep_a_host_draws_dtypes():
+    """A host array of a window keeps its dtype, float16 and int64 alike, as one draw holds it."""
+    from reference_error import windows
+
+    stacked = windows(lambda seed: (np.array([1 / 3], np.float16), np.int64(2**40 + seed)), 2)(0)
+    assert stacked[0].dtype == np.float16 and stacked[1].dtype == np.int64
+    assert stacked[1][1] == 2**40 + 1
+
+
+def test_windows_keep_a_weak_scalars_weak_type():
+    """A weak JAX scalar stays weak, so a float16 arm computes in float16 over windows as over one draw."""
+    from reference_error import over_windows, windows
+
+    draw = windows(lambda seed: (np.array([1 / 3], np.float16), jnp.asarray(1.5)), 2)
+    stacked = draw(0)
+    assert jax.typeof(stacked[1]).weak_type
+    found = over_windows(lambda x, scale: x * scale)(*stacked)
+    assert found.dtype == np.float16
+    np.testing.assert_array_equal(found[0], np.asarray(jnp.asarray(stacked[0][0]) * 1.5))
+
+
+def test_a_looped_host_arm_keeps_its_outputs_dtypes():
+    """A looped NumPy reference's float64 outputs stay float64."""
+    from reference_error import over_windows
+
+    found = over_windows(lambda x: np.asarray(x, np.float64) * 1.1, looped=True)(np.ones((2, 3), np.float16))
+    assert found.dtype == np.float64
+
+
+def test_no_windows_are_refused():
+    """A seed of no windows, or an arm given none, is no draw."""
+    from reference_error import over_windows, windows
+
+    with pytest.raises(ValueError):
+        windows(lambda seed: (np.zeros(2),), 0)
+    for arm in (over_windows(lambda x: x), over_windows(lambda x: x, looped=True)):
+        with pytest.raises(ValueError):
+            arm(np.zeros((0, 2), np.float32))
+
+
+def moved_when(condition):
+    """An identity whose batching rule adds one where `condition(axis_size, x)` holds, as a batch axis
+    that moves a rounding (a fusion, a kernel's route) would."""
+    @jax.custom_batching.custom_vmap
+    def arm(x):
+        return x
+
+    @arm.def_vmap
+    def batched(axis_size, in_batched, x):
+        return (x + 1 if condition(axis_size, x) else x), in_batched[0]
+    return arm
+
+
+def test_a_batched_arm_that_computes_otherwise_than_one_draws_is_refused():
+    """`over_windows` refuses a batched arm whose windows differ, by a bit, from one draw's compiled
+    arm window by window, on every call, and the looped arm takes it."""
+    from reference_error import over_windows
+
+    arm = over_windows(moved_when(lambda size, x: True))
+    for _ in range(2):
+        with pytest.raises(AssertionError):
+            arm(np.zeros((3, 2), np.float32))
+    np.testing.assert_array_equal(over_windows(moved_when(lambda size, x: True), looped=True)(
+        np.zeros((3, 2), np.float32)), np.zeros((3, 2), np.float32))
+
+
+@pytest.mark.parametrize("change", ["x64", "windows", "tree", "format", "precision"])
+def test_the_bit_check_runs_again_at_each_new_signature(change):
+    """A signature the first call did not hold is checked again. The changes are x64's setting at the
+    same float32 avals, another count of windows, another tree of the same leaves, another narrow format
+    of the same width, and another default matmul precision."""
+    from reference_error import over_windows
+
+    x = np.zeros((3, 2), np.float32)
+    if change == "x64":
+        arm = over_windows(moved_when(lambda size, x: jax.config.jax_enable_x64))
+        arm(x)
+        with jax.enable_x64(new_val=True), pytest.raises(AssertionError):
+            arm(x)
+    elif change == "windows":
+        arm = over_windows(moved_when(lambda size, x: size == 5))
+        arm(x)
+        with pytest.raises(AssertionError):
+            arm(np.zeros((5, 2), np.float32))
+    elif change == "tree":
+        rule = moved_when(lambda size, x: True)
+        arm = over_windows(lambda tree: rule(tree["b"]) if "b" in tree else tree["a"])
+        arm({"a": x})
+        with pytest.raises(AssertionError):
+            arm({"b": x})
+    elif change == "format":
+        arm = over_windows(moved_when(lambda size, x: x.dtype == jnp.float8_e4m3fnuz))
+        arm(np.zeros((3, 2), jnp.float8_e4m3fn))
+        with pytest.raises(AssertionError):
+            arm(np.zeros((3, 2), jnp.float8_e4m3fnuz))
+    else:
+        # Both precisions named, whatever the lane's default.
+        tf32 = moved_when(lambda size, x: str(jax.config.jax_default_matmul_precision) == "tensorfloat32")
+        arm = over_windows(tf32)
+        with jax.default_matmul_precision("highest"):
+            arm(x)
+        with jax.default_matmul_precision("tensorfloat32"), pytest.raises(AssertionError):
+            arm(x)
+
+
+def test_a_batched_arm_of_another_dtype_of_the_same_bits_is_refused():
+    """A batched arm whose windows hold one draw's bits under another dtype is refused by its dtype."""
+    from reference_error import over_windows
+
+    @jax.custom_batching.custom_vmap
+    def arm(x):
+        return x
+
+    @arm.def_vmap
+    def batched(axis_size, in_batched, x):
+        return jax.lax.bitcast_convert_type(x, jnp.int32), in_batched[0]
+
+    with pytest.raises(AssertionError):
+        over_windows(arm)(np.ones((3, 2), np.float32))
+
+
+def test_a_without_ynn_arm_takes_the_looped_form():
+    """A `without_ynn` arm's compiler options refuse the batched program on the CPU lane, and it runs
+    looped."""
+    from reference_error import over_windows, without_ynn
+
+    x = np.ones((3, 2), np.float32)
+    if jax.default_backend() == "cpu":
+        with pytest.raises(ValueError):
+            over_windows(without_ynn(lambda x: x * 2))(x)
+    np.testing.assert_array_equal(over_windows(without_ynn(lambda x: x * 2), looped=True)(x), x * 2)
+
+
+def test_a_torch_arm_pulls_back_the_cotangent_it_is_given():
+    """`torch_with_gradients` gives, bit for bit, a torch function's output and the gradients torch's
+    autograd pulls back from the cotangent passed last, cast to the output's dtype, at float32 and at
+    float64; a module's parameters are inputs through `functional_call`; an input the output does not
+    reach has a zero gradient."""
+    from reference_error import torch_with_gradients
+
+    rng = np.random.default_rng(0)
+    for dtype in (torch.float32, torch.float64):
+        layer = torch.nn.Linear(3, 4).to(dtype)
+        x, unused = (rng.normal(size=shape) for shape in ((5, 3), (2,)))
+        params = {name: value.detach().numpy() for name, value in layer.named_parameters()}
+        x, unused = x.astype(params["weight"].dtype), unused.astype(params["weight"].dtype)
+        # A float64 cotangent, cast to the output's dtype.
+        cotangent = rng.normal(size=(5, 4))
+
+        def forward(x, params, unused, layer=layer):
+            return torch.tanh(torch.func.functional_call(layer, params, (x,)))
+
+        out, grad_x, grads, grad_unused = torch_with_gradients(forward)(x, params, unused, cotangent)
+        tensors = [torch.from_numpy(x).requires_grad_(), *(torch.from_numpy(v).requires_grad_()
+                                                           for v in params.values())]
+        expected = torch.tanh(torch.func.functional_call(layer, dict(zip(params, tensors[1:], strict=True)),
+                                                         (tensors[0],)))
+        wanted = torch.autograd.grad(expected, tensors, torch.from_numpy(cotangent).to(dtype))
+        assert out.dtype == grad_x.dtype == params["weight"].dtype
+        np.testing.assert_array_equal(out, expected.detach().numpy())
+        for got, want in zip((grad_x, *(grads[name] for name in params)), wanted, strict=True):
+            np.testing.assert_array_equal(got, want.numpy())
+        np.testing.assert_array_equal(grad_unused, np.zeros_like(unused))
+
+
+def test_a_torch_arm_pulls_a_scalar_loss_back_from_its_scalar_one():
+    """A scalar input takes a scalar gradient, its shape and dtype kept."""
+    from reference_error import torch_with_gradients
+
+    loss, gradient = torch_with_gradients(lambda a: 3 * a * a)(np.float32(2), np.float32(1))
+    assert loss.dtype == gradient.dtype == np.float32 and np.shape(gradient) == ()
+    np.testing.assert_array_equal(loss, np.float32(12))
+    np.testing.assert_array_equal(gradient, np.float32(12))
+
+
+def test_a_torch_arm_pulls_nothing_back_from_a_constant():
+    """A constant output pulls nothing back, alone, or beside a reached one whose own cotangent it then
+    takes, by its place in the tree."""
+    from reference_error import torch_with_gradients
+
+    x = np.array([2.0, 3.0], np.float32)
+    _, gradient = torch_with_gradients(lambda x: torch.ones_like(x))(x, np.ones(2, np.float32))
+    assert gradient.dtype == np.float32
+    np.testing.assert_array_equal(gradient, np.zeros(2, np.float32))
+    _, gradient = torch_with_gradients(lambda x: (torch.ones_like(x), x * 2))(
+        x, (np.full(2, 7, np.float32), np.full(2, 100, np.float32)))
+    np.testing.assert_array_equal(gradient, np.full(2, 200, np.float32))
+
+
+def test_a_torch_arms_integer_input_has_no_gradient():
+    """An integer input takes no gradient, where a float one would."""
+    from reference_error import torch_with_gradients
+
+    _, gradient = torch_with_gradients(lambda i: i.float() * 2)(np.array([1, 2], np.int32),
+                                                                 np.ones(2, np.float32))
+    assert gradient is None
+
+
+def test_a_torch_arm_refuses_a_cotangent_of_another_tree():
+    """A cotangent of another tree than the output's, a dict for a tuple or a list for one, is refused,
+    where pairing by order would pull back the wrong leaf."""
+    from reference_error import torch_with_gradients
+
+    pulled = torch_with_gradients(lambda v: (v * 1, v * 2))
+    x = np.ones(2, np.float32)
+    for cotangent in ({"z": np.ones(2, np.float32), "a": np.ones(2, np.float32)}, [x, x]):
+        with pytest.raises(ValueError):
+            pulled(x, cotangent)
+
+
+def test_a_torch_arm_pairs_each_cotangent_with_its_own_output():
+    """Each cotangent pulls back through its own output, the first through the first."""
+    from reference_error import torch_with_gradients
+
+    _, gradient = torch_with_gradients(lambda v: (v * 1, v * 2))(
+        np.ones(2, np.float32), (np.full(2, 10, np.float32), np.full(2, 100, np.float32)))
+    assert gradient.dtype == np.float32
+    np.testing.assert_array_equal(gradient, np.full(2, 210, np.float32))
+
+
+def test_a_torch_arms_narrow_floats_go_in_through_float32():
+    """A bfloat16 input and cotangent, as JAX holds them on the host, and a float8 input reach the arm
+    in torch's format of their name, through the float32 that holds them exactly, and come out in
+    float32."""
+    from reference_error import torch_with_gradients
+
+    def doubled(x):
+        assert x.dtype == torch.bfloat16
+        return x * 2
+
+    halves = np.array([2.0, 3.0], jnp.bfloat16)
+    out, gradient = torch_with_gradients(doubled)(halves, np.ones(2, jnp.bfloat16))
+    assert out.dtype == gradient.dtype == np.float32
+    np.testing.assert_array_equal(out, np.array([4.0, 6.0], np.float32))
+    np.testing.assert_array_equal(gradient, np.full(2, 2, np.float32))
+    # Torch computes no float8 on the CPU, so a float8 input is widened inside, as a quantized arm's is.
+
+    def widened_inside(x):
+        assert x.dtype == torch.float8_e4m3fn
+        return x.float() * 2
+
+    out, gradient = torch_with_gradients(widened_inside)(np.array([2.0, 3.0], jnp.float8_e4m3fn),
+                                                         np.ones(2, np.float32))
+    assert gradient.dtype == np.float32
+    np.testing.assert_array_equal(gradient, np.full(2, 2, np.float32))
+
+
+def test_a_torch_arms_narrow_integer_input_has_no_gradient():
+    """An int4 input, which NumPy holds as ml_dtypes' too, is no float: it enters as int32, its values
+    kept, and takes no gradient."""
+    from reference_error import torch_with_gradients
+
+    out, gradient = torch_with_gradients(lambda i: i.float() * 2)(np.array([1, -2], jnp.int4),
+                                                                   np.ones(2, np.float32))
+    assert gradient is None
+    np.testing.assert_array_equal(out, np.array([2.0, -4.0], np.float32))
+
+
+def test_a_torch_arms_bfloat16_output_comes_out_through_float32():
+    """A bfloat16 output of float32 inputs comes back as the float32 that holds it, its values exactly."""
+    from reference_error import torch_with_gradients
+
+    x = np.arange(4, dtype=np.float32) / 3
+    out, gradient = torch_with_gradients(lambda x: (x.bfloat16() * 3).bfloat16())(x, np.ones(4, np.float32))
+    assert out.dtype == gradient.dtype == np.float32
+    np.testing.assert_array_equal(out, (torch.from_numpy(x).bfloat16() * 3).float().numpy())
+    np.testing.assert_array_equal(gradient, np.full(4, 3, np.float32))
 
 
 def test_a_small_row_beside_large_ones_is_held_to_its_own_size():
