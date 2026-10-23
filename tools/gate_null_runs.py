@@ -395,9 +395,11 @@ def _scaled_output(factor):
     return fault
 
 
-def _row_scaled(row: int, factor: float):
-    """A fault scaling row `row` of each output leaf by `factor`: on a row of float64 zero, its residue
-    `factor` times Dew's own."""
+def _row_scaled(factor: float, row: int = 0):
+    """A fault scaling one row of each output leaf by `factor`: its `row`-th along the leading axes,
+    a row of each leaf's last axis. Moved by 1 + 2^-14 of itself, a row is tens of times a float32 row's
+    own rounding and too little of the leaf for its RMS ratio to show, so the worst-row rule alone can
+    fail it; on a row of float64 zero, it is that residue `factor` times Dew's own."""
     def fault(reference):
         def run(*arguments):
             import jax
@@ -405,26 +407,8 @@ def _row_scaled(row: int, factor: float):
 
             def moved(leaf):
                 leaf = np.array(leaf)
-                leaf[row] = leaf[row] * factor
-                return leaf
-            return jax.tree.map(moved, reference(*arguments))
-        return run
-    return fault
-
-
-def _one_row(relative):
-    """A fault moving one row of each output leaf, its first along the leading axes, by `relative` of
-    itself: tens of times a float32 row's own rounding, and too little of the leaf for its RMS ratio to
-    show, so the worst-row rule alone can fail it."""
-    def fault(reference):
-        def run(*arguments):
-            import jax
-            import numpy as np
-
-            def moved(leaf):
-                leaf = np.array(leaf)
-                row = (0,) * (leaf.ndim - 1)
-                leaf[row] = leaf[row] * (1 + relative)
+                at = np.unravel_index(row, leaf.shape[:-1])
+                leaf[at] = leaf[at] * factor
                 return leaf
             return jax.tree.map(moved, reference(*arguments))
         return run
@@ -456,7 +440,7 @@ FAULTS = {
         "float16": _in_float16,
         "skipped-chunk": _input_fault(0, _zeroed((slice(None), slice(0, 128)))),
         "scale-2^-22": _scaled_output(1 + 2.0 ** -22),
-        "one-row": _one_row(2.0 ** -14),
+        "one-row": _row_scaled(1 + 2.0 ** -14),
     },
     "mean-loss-rows": {
         "dropped-term": _input_fault(1, _zeroed(0)),
@@ -464,11 +448,11 @@ FAULTS = {
         "float16": _in_float16,
         "skipped-chunk": _input_fault(1, _zeroed(slice(0, 32))),
         "scale-2^-22": _scaled_output(1 + 2.0 ** -22),
-        "one-row": _one_row(2.0 ** -14),
+        "one-row": _row_scaled(1 + 2.0 ** -14),
     },
     "attention-key-bias": {
-        "zero-row-10x": _row_scaled(16, 10.0),
-        "zero-row-2^10": _row_scaled(16, 2.0 ** 10),
+        "zero-row-10x": _row_scaled(10.0, row=16),
+        "zero-row-2^10": _row_scaled(2.0 ** 10, row=16),
         "dropped-term": _input_fault(2, _zeroed((slice(None), 0))),
     },
     "attention-keys": {
@@ -477,8 +461,8 @@ FAULTS = {
         "float16": _in_float16,
         "skipped-chunk": _input_fault(2, _zeroed((slice(None), slice(0, 32)))),
         "scale-2^-22": _scaled_output(1 + 2.0 ** -22),
-        "one-row": _one_row(2.0 ** -14),
-        "one-row-2^-20": _one_row(2.0 ** -20),
+        "one-row": _row_scaled(1 + 2.0 ** -14),
+        "one-row-2^-20": _row_scaled(1 + 2.0 ** -20),
     },
 }
 """Real faults of each class, its own computation changed before it runs, for the procedures' power on
@@ -514,7 +498,7 @@ def controls(law: str, ratio: float, seeds: int, runs: int, chunk: int, two_stag
     whole-field draws: each draw of Dew and of the reference one of the class's own draws, every leaf
     together (512 of them, drawn past every run's seeds)."""
     import numpy as np
-    from reference_error import REDRAW, _drawn, _Draws, _staged
+    from reference_error import NO_ZERO_ROWS, REDRAW, _drawn, _Draws, _staged
 
     # The same draws under either procedure, so their verdicts compare run by run.
     rng = np.random.default_rng([chunk, int(ratio * 1000), seeds])
@@ -536,7 +520,7 @@ def controls(law: str, ratio: float, seeds: int, runs: int, chunk: int, two_stag
         def drawn(start, stop, mine=mine, theirs=theirs, leaves=leaves, names=names):
             count = stop - start
             return _Draws(names, mine[start:stop], theirs[start:stop], np.zeros((count, leaves, 2)),
-                          np.zeros((count, leaves), int), np.ones((count, leaves), bool), (0,) * leaves)
+                          [[NO_ZERO_ROWS] * leaves] * count, np.ones((count, leaves), bool), (0,) * leaves)
 
         over, unresolved, stage = _staged(drawn, seeds, law, two_stage=two_stage)
         verdicts.append(("over" if over else "inconclusive" if unresolved else "pass", stage))
@@ -551,7 +535,7 @@ def row_controls(width: int, rows: int, seeds: int, runs: int, chunk: int) -> tu
     least factor that would have failed it at both stages (`_staged`'s second stage is drawn only where
     the first fails), whose high quantiles calibrate NARROW_FACTORS."""
     import numpy as np
-    from reference_error import REDRAW, _Draws, _staged, _verdict
+    from reference_error import NO_ZERO_ROWS, REDRAW, _Draws, _staged, _verdict
 
     rng = np.random.default_rng([0x5A, width, rows, seeds, chunk])
     span = (1 + REDRAW) * seeds
@@ -564,7 +548,7 @@ def row_controls(width: int, rows: int, seeds: int, runs: int, chunk: int) -> tu
         def drawn(start, stop, worst=worst):
             count = stop - start
             return _Draws(["rows"], np.ones((count, 1)), np.ones((count, 1)), worst[start:stop],
-                          np.zeros((count, 1), int), np.ones((count, 1), bool), (width,))
+                          [[NO_ZERO_ROWS]] * count, np.ones((count, 1), bool), (width,))
 
         over, unresolved, stage = _staged(drawn, seeds, f"rows of {width}")
         verdicts.append((_verdict(over, unresolved), stage))

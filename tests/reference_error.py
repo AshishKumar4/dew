@@ -582,17 +582,19 @@ class _Draws:
 
 def pooled_zero_rows(evidence: list[ZeroRows]) -> list[tuple[int, float, float]]:
     """The rows of float64 zero Dew is further from than ROW_FACTOR times the reference over a run's
-    seeds: each row's errors pooled over the seeds it is zero on, sqrt(sum of Dew's squared errors over
-    the reference's), as (row, Dew's RMS error, the reference's). A row of float64 zero is all residue,
+    seeds, as (row, Dew's RMS error, the reference's): each row's squared errors summed over the seeds
+    it is zero on, Dew's within ROW_FACTOR² of the reference's. A row of float64 zero is all residue,
     float32's rounding of a sum float64 cancels, with no size to judge it at, so it is held to the
-    reference's residue on the same row. One seed's residues are heavy-tailed, their ratio a ratio of
-    two: on attention's packed bias gradients, whose key rows are zero (`tools/gate_null_runs.py`'s
-    attention-key-bias), a per-seed rule failed an equally exact pair on 6.6% of runs of 8 seeds and
-    42% of runs of 64 (120,000 seeds). Pooled, the largest ratio over 15,000 runs of 8 seeds was 2.27
-    (its 0.999 quantile 2.03), and through the gate 0 of 15,000 runs of 8 seeds and 0 of 3,000 of 40
-    failed (at most 4.6e-4 at 99.9%); one zero row ten times its residue pooled to at least 5.3 and
-    failed every run, where pooling the whole leaf instead missed a quarter of them at 8 seeds. Where
-    the reference is exactly the float64 zero on a row over every seed, Dew must be too."""
+    reference's residue on the same row; one seed's residues are heavy-tailed, and their ratio, a
+    ratio of two, failed equally exact pairs seed by seed where the pooled one does not, while one
+    row held ten times further still fails. Where the reference is exactly the float64 zero on a row
+    over every seed, Dew must be too.
+
+    Calibrated on attention's packed bias gradients, whose key rows are zero (`python
+    tools/gate_null_runs.py attention-key-bias --paired --seeds K --runs N --chunk C`, and `--fault
+    zero-row-10x`): 0 of 15,000 runs failed at 8 seeds (a red rate at most 4.6e-4 at 99.9%) and 0 of
+    3,000 at 40 (at most 2.3e-3), and the 10x row failed every run at both. Judged seed by seed, the
+    same pairs failed on 6.6% of runs of 8 seeds and 42% of 64."""
     mine: dict[int, float] = {}
     theirs: dict[int, float] = {}
     seen: dict[int, int] = {}
