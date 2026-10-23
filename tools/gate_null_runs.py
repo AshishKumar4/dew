@@ -18,6 +18,9 @@ verdicts.
 
 Usage, from the checkout: python tools/gate_null_runs.py <class> --seeds K --runs N --chunk C
     [--paired] [--orders K] [--fault NAME]
+or, for the worst-row rule's controls (`row_controls`): python tools/gate_null_runs.py <rows a draw>
+    --rows <values a row> --seeds K --runs N --chunk C, printing its red runs and the site statistic's
+    quantiles
 """
 
 import argparse
@@ -442,11 +445,41 @@ def controls(law: str, ratio: float, seeds: int, runs: int, chunk: int, two_stag
         def drawn(start, stop, mine=mine, theirs=theirs, leaves=leaves, names=names):
             count = stop - start
             return _Draws(names, mine[start:stop], theirs[start:stop], np.zeros((count, leaves, 2)),
-                          np.zeros((count, leaves), int), np.ones((count, leaves), bool))
+                          np.zeros((count, leaves), int), np.ones((count, leaves), bool), (0,) * leaves)
 
         over, unresolved, stage = _staged(drawn, seeds, law, two_stage=two_stage)
         verdicts.append(("over" if over else "inconclusive" if unresolved else "pass", stage))
     return verdicts
+
+
+def row_controls(width: int, rows: int, seeds: int, runs: int, chunk: int) -> tuple[list, list[float]]:
+    """Check 1's verdicts (`_staged`) on its worst-row rule alone for equally exact pairs as sites run it,
+    `runs` runs from `chunk`'s own stream: both arms on one truth, so each row's size is shared; `rows`
+    rows a draw of `width` values, truths and errors standard normal, the arms' errors independent; the
+    pooled ratio exactly one, so only the rows decide. Each run's verdict, and its site statistic, the
+    least factor that would have failed it at both stages (`_staged`'s second stage is drawn only where
+    the first fails), whose high quantiles calibrate NARROW_FACTORS."""
+    import numpy as np
+    from reference_error import REDRAW, _Draws, _staged, _verdict
+
+    rng = np.random.default_rng([0x5A, width, rows, seeds, chunk])
+    span = (1 + REDRAW) * seeds
+    verdicts, statistics = [], []
+    for _ in range(runs):
+        truth = np.sqrt(np.mean(np.square(rng.standard_normal((span, rows, width))), axis=2))
+        worst = np.stack([(np.sqrt(np.mean(np.square(rng.standard_normal((span, rows, width))), axis=2))
+                           / truth).max(axis=1) for _ in range(2)], axis=-1)[:, None, :]
+
+        def drawn(start, stop, worst=worst):
+            count = stop - start
+            return _Draws(["rows"], np.ones((count, 1)), np.ones((count, 1)), worst[start:stop],
+                          np.zeros((count, 1), int), np.ones((count, 1), bool), (width,))
+
+        over, unresolved, stage = _staged(drawn, seeds, f"rows of {width}")
+        verdicts.append((_verdict(over, unresolved), stage))
+        first = worst[:seeds, 0, 0].max() / worst[:seeds, 0, 1].max()
+        statistics.append(float(min(first, worst[:, 0, 0].max() / worst[:, 0, 1].max())))
+    return verdicts, statistics
 
 
 def main(argv: list[str]) -> int:
@@ -457,6 +490,8 @@ def main(argv: list[str]) -> int:
     mode.add_argument("--ratio", type=float, help="run known-ratio controls of this population ratio")
     mode.add_argument("--draws", type=int, help="print the reference's own mean squared error from float64 "
                       "by leaf over this many draws past every run's, for a sizing model")
+    mode.add_argument("--rows", type=int, help="run the worst-row rule's controls (`row_controls`) for rows "
+                      "of this many values, the name the rows a draw; print the verdicts and statistics")
     parser.add_argument("--today", action="store_true", help="the procedure before the two stages")
     parser.add_argument("--fault", help="run the class's reference with this fault of its own (FAULTS) "
                         "as Dew, for power")
@@ -470,6 +505,19 @@ def main(argv: list[str]) -> int:
     options = parser.parse_args(argv)
     from reference_error import _drawn, null_runs, seeds_for
 
+    if options.rows is not None:
+        if options.today or options.paired or options.orders or options.fault or options.seeds is None:
+            parser.error("--rows takes the rows a draw as its name and --seeds, and no other mode's flags")
+        verdicts, statistics = row_controls(options.rows, int(options.name), options.seeds, options.runs,
+                                            options.chunk)
+        import numpy as np
+
+        print(json.dumps({"rows": int(options.name), "width": options.rows, "seeds": options.seeds,
+                          "chunk": options.chunk, "runs": len(verdicts),
+                          "reds": sum(verdict != "pass" for verdict, _ in verdicts),
+                          "quantiles": {str(tail): float(np.quantile(statistics, 1 - tail))
+                                        for tail in (5e-4, 1e-4)}}), flush=True)
+        return 0
     if options.ratio is not None:
         if options.orders or options.paired or options.fault:
             parser.error("--ratio runs synthetic controls; --orders, --paired and --fault do not apply")
