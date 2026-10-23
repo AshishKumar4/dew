@@ -133,10 +133,10 @@ print(int(rl_state.updates), "GRPO updates")
 
 ```text
 Training CausalTransformer from step 0 to 4: 147,904 parameters, on 1 × cpu, batch 8, float32
-step 2/4  loss 2.506e-05  actor/pg_clipfrac 0  actor/pg_clipfrac_lower 0  actor/ppo_kl 1.770e-08  kl 0.002508  mismatch/ess 0.9903  mismatch/k3_kl 0.1754  mismatch/kl 0.6520  pg -2.049e-08  step_time_ms 107.2  samples_per_sec 298.5  rollout_seconds 2.009  accepted 100.0%  reward/mean 0.3438  length/mean 8.000  status/truncated 100.0%
-step 4/4  loss 2.535e-04  actor/pg_clipfrac 0  actor/pg_clipfrac_lower 0  actor/ppo_kl 2.980e-08  kl 0.02535  mismatch/ess 0.9888  mismatch/k3_kl 0.1683  mismatch/kl 0.6362  pg -3.306e-08  step_time_ms 73.57  samples_per_sec 435.0  rollout_seconds 0.1273  accepted 100.0%  reward/mean 0.3789  length/mean 8.000  status/truncated 100.0%
-Trained 4 steps in 0:00:04: first step after 3.76 s, then 13.0 step/s
-5.8% of the wall time in steps, final loss 2.535e-04
+step 2/4  loss 2.411e-05  actor/pg_clipfrac 0  actor/pg_clipfrac_lower 0  actor/ppo_kl -2.724e-08  kl 0.002410  mismatch/ess 0.9915  mismatch/k3_kl 0.1831  mismatch/kl 0.6687  pg 5.122e-09  data_wait_ms 0.02618  grad_norm 2.673  compiles 1.000  cache_hits 34.00  cache_misses 0  step_time_ms 115.3  samples_per_sec 277.4  rollout_seconds 1.198  accepted 100.0%  learning_rate 1.000e-04  groups 8.000  lag 0  lag/max 0  lag/mean 0  latency/max 0.02642  latency/p50 0.02635  latency/p90 0.02641  latency/p99 0.02642  length/mean 8.000  masked/cancelled 0  masked/infra_error 0  merge/calls_per_chain 1.000  pack/fill 100.0%  resubmitted 0  reward/mean 0.2891  reward/observed 0.2891  status/agent_error 0.0%  status/cancelled 0.0%  status/completed 0.0%  status/infra_error 0.0%  status/truncated 100.0%  waited_seconds 0.001096
+step 4/4  loss 2.890e-04  actor/pg_clipfrac 0  actor/pg_clipfrac_lower 0  actor/ppo_kl -9.337e-08  kl 0.02889  mismatch/ess 0.9893  mismatch/k3_kl 0.1685  mismatch/kl 0.6371  pg 8.754e-08  data_wait_ms 0.03642  grad_norm 2.726  compiles 1.000  cache_hits 34.00  cache_misses 0  step_time_ms 42.24  samples_per_sec 757.6  rollout_seconds 0.1208  accepted 100.0%  learning_rate 1.000e-04  groups 8.000  lag 0  lag/max 0  lag/mean 0  latency/max 0.02908  latency/p50 0.02900  latency/p90 0.02906  latency/p99 0.02908  length/mean 8.000  masked/cancelled 0  masked/infra_error 0  merge/calls_per_chain 1.000  pack/fill 100.0%  resubmitted 0  reward/mean 0.3672  reward/observed 0.3672  status/agent_error 0.0%  status/cancelled 0.0%  status/completed 0.0%  status/infra_error 0.0%  status/truncated 100.0%  waited_seconds 0.001105
+Trained 4 steps in 0:00:03: first step after 2.74 s, then 15.9 step/s
+6.4% of the wall time in steps, final loss 2.890e-04
 4 GRPO updates
 ```
 
@@ -624,11 +624,11 @@ print("PPO updates:", int(state.updates))
 ```
 
 ```text
-Training PPOObjective from step 0 to 2: 169 parameters, on 1 × cpu, batch 1, float32
-step 1/2  loss 0.1247  actor/pg_clipfrac 0  actor/pg_clipfrac_lower 0  actor/ppo_kl 0  critic/loss 0.2493  kl 0  mismatch/ess 0.9990  mismatch/k3_kl 5.171e-04  mismatch/kl 0.008742  pg -4.470e-08  step_time_ms 2.660  samples_per_sec 4,511  rollout_seconds 0.9878  accepted 100.0%
-step 2/2  loss 0.1797  actor/pg_clipfrac 0  actor/pg_clipfrac_lower 0  actor/ppo_kl 0  critic/loss 0.3594  kl 3.248e-06  mismatch/ess 0.9990  mismatch/k3_kl 5.201e-04  mismatch/kl 0.01021  pg 8.941e-08  step_time_ms 44.26  samples_per_sec 271.1  rollout_seconds 0.04330  accepted 100.0%
-Trained 2 steps in 0:00:02: first step after 1.52 s, then 22.4 step/s
-2.9% of the wall time in steps, final loss 0.1797
+Training ToolPolicy from step 0 to 2: 169 parameters, on 1 × cpu, batch 1, float32
+step 1/2  loss 0.1247  actor/pg_clipfrac 0  actor/pg_clipfrac_lower 0  actor/ppo_kl 0  critic/loss 0.2493  kl 0  mismatch/ess 0.9990  mismatch/k3_kl 5.171e-04  mismatch/kl 0.008742  pg -6.426e-08  data_wait_ms 0  grad_norm 0.3799  compiles 1.000  cache_hits 169.0  cache_misses 5.000  step_time_ms 6.492  samples_per_sec 1,848  rollout_seconds 0.7623  accepted 100.0%  groups 1.000  lag 0  lag/max 0  lag/mean 0  latency/max 0.5706  latency/p50 0.5706  latency/p90 0.5706  latency/p99 0.5706  length/mean 4.000  masked/cancelled 0  masked/infra_error 0  masked/truncated 0  merge/calls_per_chain 2.000  pack/fill 18.2%  resubmitted 0  reward/mean 0.7500  reward/observed 0.7500  status/agent_error 0.0%  status/cancelled 0.0%  status/completed 100.0%  status/infra_error 0.0%  status/truncated 0.0%  waited_seconds 2.052e-04
+step 2/2  loss 0.1797  actor/pg_clipfrac 0  actor/pg_clipfrac_lower 0  actor/ppo_kl -7.451e-09  critic/loss 0.3594  kl 3.248e-06  mismatch/ess 0.9990  mismatch/k3_kl 5.201e-04  mismatch/kl 0.01021  pg 2.608e-08  data_wait_ms 0.04074  grad_norm 0.4583  compiles 1.000  cache_hits 169.0  cache_misses 5.000  step_time_ms 38.36  samples_per_sec 312.8  rollout_seconds 0.03649  accepted 100.0%  groups 1.000  lag 0  lag/max 0  lag/mean 0  latency/max 0.01154  latency/p50 0.01153  latency/p90 0.01154  latency/p99 0.01154  length/mean 4.000  masked/cancelled 0  masked/infra_error 0  masked/truncated 0  merge/calls_per_chain 2.000  pack/fill 18.2%  resubmitted 0  reward/mean 1.000  reward/observed 1.000  status/agent_error 0.0%  status/cancelled 0.0%  status/completed 100.0%  status/infra_error 0.0%  status/truncated 0.0%  waited_seconds 2.561e-04
+Trained 2 steps in 0:00:02: first step after 1.61 s, then 23.8 step/s
+2.5% of the wall time in steps, final loss 0.1797
 PPO updates: 2
 ```
 
