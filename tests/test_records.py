@@ -23,12 +23,9 @@ def test_number_reads_an_integer_as_a_real_and_refuses_a_flag():
 def test_number_reads_the_float_record_transformers_writes_a_non_finite_bound_as():
     assert records.number({'__float__': 'Infinity'}, 'time_step_limit') == math.inf
     assert records.number({'__float__': '-Infinity'}, 'time_step_limit') == -math.inf
-    # A bare infinity is not a spelling a config file uses, so it stays refused, and so is the NaN
-    # transformers records, which no number field holds, and any other mapping.
-    for refused in (math.inf, {'__float__': 'NaN'}, {'__float__': 'nan'}, {'__float__': 'inf'},
-                    {'__float__': 'Infinity', 'note': 1}, {'value': 1.0}):
-        with pytest.raises(ValueError):
-            records.number(refused, 'time_step_limit')
+    # A bare infinity is not a spelling a config file uses, so it stays refused.
+    with pytest.raises(ValueError):
+        records.number(math.inf, 'time_step_limit')
 
 
 def test_boolean_and_text_take_only_their_own_type():

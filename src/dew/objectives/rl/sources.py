@@ -274,6 +274,13 @@ class _Prompt:
         return cls(ids, record)
 
 
+def _cancelled_with(job: Future[None], rollout: Future[Session]) -> None:
+    """Cancel `rollout` where its reward `job` was cancelled (`PromptSource.close`), and notify its
+    waiters: `concurrent.futures.wait` counts a cancelled future done only once it is notified."""
+    if job.cancelled() and rollout.cancel():
+        rollout.set_running_or_notify_cancel()
+
+
 class PromptSource:
     """Draws one completion per sample of a `prompt_tasks` task and scores its decoded text.
 
@@ -353,9 +360,7 @@ class PromptSource:
             except RuntimeError as closed:
                 settled(scored, closed)
                 return
-            # A close cancels the scorers' queued work (`close`); the rollout its job would have
-            # settled is cancelled with it, so no one waits on it.
-            job.add_done_callback(lambda job: scored.cancel() if job.cancelled() else None)
+            job.add_done_callback(lambda job: _cancelled_with(job, scored))
 
         drawn.add_done_callback(chained)
         return scored
