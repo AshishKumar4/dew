@@ -17,8 +17,10 @@ streams each operand through a `Ring` whose counter runs across tiles, and takes
 (`roles`).
 """
 
+import abc
 import dataclasses
 import math
+from collections.abc import Callable
 
 import jax
 from jax import lax, numpy as jnp
@@ -237,18 +239,6 @@ def ring(block: tuple, dtype, stages: int, *, consumers: int = 1) -> dict:
             'consumed': plgpu.Barrier(num_arrivals=consumers, num_barriers=stages)}
 
 
-@dataclasses.dataclass(frozen=True)
-class Family:
-    """An instruction family's facts a Mosaic mainloop issues by (`generation.family` names it): its
-    accumulator's register `layout` and the rows one compute warpgroup's MMA covers (`rows`). Its issue
-    functions are its module's (mosaic_sm90's wgmma); its operand tiles' shared-memory tiling and swizzle are
-    the warpgroup lowering's inference (`compiler_params`)."""
-
-    name: str
-    layout: plgpu.Layout
-    rows: int
-
-
 PRODUCER_REGISTERS = 40
 """The registers a thread of a cooperative block's producer warpgroup holds: it only issues loads."""
 
@@ -278,3 +268,175 @@ def roles(wg, consumers: int, consumer, producer) -> None:
     def _():
         plgpu.set_max_registers(PRODUCER_REGISTERS, action="decrease")
         producer()
+
+
+class Slots:
+    """A walk step's operand slots (`Family.walk`), by stream name: each acquired when the step first reads
+    it (`slots[name]`) and released at the step's end, once its MMAs are done, unless the step `release`s it
+    sooner (a slot its last product has read)."""
+
+    def __init__(self, rings: dict[str, "Ring"], counter):
+        self._rings, self._counter = rings, counter
+        self._held: dict[str, Ref] = {}
+        self._released: set[str] = set()
+
+    def __getitem__(self, name: str):
+        if name not in self._held:
+            self._held[name] = self._rings[name].acquire(self._counter)
+        return self._held[name]
+
+    def release(self, name: str) -> None:
+        """Stream `name`'s slot given back now, its reads done (acquired first if the step read none)."""
+        self[name]
+        self._rings[name].release(self._counter)
+        self._released.add(name)
+
+    def done(self) -> None:
+        """Every slot the step has not given back given back: each consumer waits on every load (a wait
+        takes its barrier's next phase), so a slot it never read is still acquired before it is released."""
+        for name in self._rings:
+            if name not in self._released:
+                self.release(name)
+
+
+class Family(abc.ABC):
+    """An instruction family's bundle (design §6, one mainloop per overlap structure): everything a Mosaic
+    mainloop issues that the hardware decides, so a mainloop holds no instruction, layout or barrier of its
+    own. Its facts (`name`, the MMA's row unit `rows`), its launch and roles (`kernel`, `roles`), its operand
+    streams (`streams`, `opened`, `stream` the producer's, `walk` and `passed` the consumer's), its products
+    (`product` into a fresh accumulator, `register_products` and `staged_products` in place, `settled`), and
+    its accumulator's layouts (`zeros`, `full`, `iota`, `rows_of`, `as_row`)."""
+
+    name: str
+    rows: int
+
+    @abc.abstractmethod
+    def kernel(self, entry, *, out_type, grid: tuple, grid_names: tuple, consumers: int,
+               interpret: bool) -> Callable:
+        """`entry` launched over `grid`, `consumers` compute roles a program beside the family's own."""
+
+    @abc.abstractmethod
+    def roles(self, wg, consumers: int, consumer, producer) -> None:
+        """Each role of a program: `consumer(index)` the compute roles', `producer()` the loads' where the
+        family streams from a role of its own."""
+
+    @abc.abstractmethod
+    def streams(self, blocks: dict, stages: int, consumers: int) -> dict:
+        """The scoped allocations of a stream of each `blocks[name]` `(shape, dtype)` in `stages` slots read
+        by `consumers` (`opened` once scoped)."""
+
+    @abc.abstractmethod
+    def opened(self, allocated: dict) -> dict:
+        """The streams of `streams`' allocations, scoped, by name."""
+
+    @abc.abstractmethod
+    def stream(self, streams: dict, views, lo, hi) -> None:
+        """The producer's loads of steps `lo` to `hi`, `views(step)` each stream's view, by name."""
+
+    @abc.abstractmethod
+    def walk[C](self, streams: dict, segments, start: C, shapes: tuple, interpret: bool, *,
+                first: jax.Array | int = 0) -> tuple[C, tuple[jax.Array, ...]]:
+        """A consumer's walk of `segments`, each `(step, lo, hi)`, `step(index, slots, carry, accumulators)
+        -> (carry, accumulators)` given each stream's slots (`Slots`, the streams' steps counted from
+        `first`), from `start`, with fp32 accumulators of `shapes` (zero) its products issue into in place.
+        Returns the carry and the accumulators' values."""
+
+    @abc.abstractmethod
+    def passed(self, streams: dict, lo, hi, *, first: jax.Array | int = 0, between=None) -> None:
+        """A consumer's steps `lo` to `hi` it reads none of, each load awaited and released as a reading
+        consumer's (counted from `first`); `between()` after each step."""
+
+    @abc.abstractmethod
+    def product(self, lhs, rhs, shape: tuple[int, int], then=None) -> jax.Array:
+        """`lhs @ rhs` into a fresh fp32 accumulator of `shape`, its value, with `then` issued while the
+        product runs."""
+
+    @abc.abstractmethod
+    def registers_product(self, lhs: jax.Array, rhs, interpret: bool) -> jax.Array:
+        """`lhs @ rhs` into a fresh fp32 accumulator, `lhs` in registers (16-bit), its value."""
+
+    @abc.abstractmethod
+    def register_products(self, acc, parts, rhs, interpret: bool):
+        """`acc` with `parts`' products with `rhs` issued into it in place, each part's left operand in
+        registers."""
+
+    @abc.abstractmethod
+    def staged_products(self, acc, parts, rhs, buffers, interpret: bool, *, transposed: bool = False):
+        """`register_products` of `parts` each staged in `buffers` first (its transpose the left operand
+        where `transposed`)."""
+
+    @abc.abstractmethod
+    def settled(self) -> None:
+        """Every product issued so far done."""
+
+    @abc.abstractmethod
+    def zeros(self, shape: tuple[int, ...]) -> jax.Array:
+        """fp32 zeros in the accumulator's layout (two-dimensional) or a row's (one-dimensional)."""
+
+    @abc.abstractmethod
+    def full(self, shape: tuple[int, ...], value: float) -> jax.Array:
+        """fp32 `value` in the accumulator's layout or a row's (`zeros`)."""
+
+    @abc.abstractmethod
+    def iota(self, shape: tuple[int, int], dimension: int) -> jax.Array:
+        """Indices along `dimension` of a tile in the accumulator's layout."""
+
+    @abc.abstractmethod
+    def rows_of(self, ref) -> jax.Array:
+        """A row vector read from `ref` (`[rows]`) in a row's layout."""
+
+    @abc.abstractmethod
+    def as_row(self, vector: jax.Array) -> jax.Array:
+        """`vector` `[rows]` in a row's layout, whatever its own."""
+
+
+class RingFamily(Family):
+    """A family whose loads a producer warpgroup issues by TMA into `Ring`s, beside one or two consumer
+    warpgroups at `setmaxnreg` budgets (`roles`): sm90's and sm100's. Its walk acquires each step's slots as
+    the step reads them and releases them once its products are done (`Slots`)."""
+
+    def kernel(self, entry, *, out_type, grid: tuple, grid_names: tuple, consumers: int,
+               interpret: bool) -> Callable:
+        return plgpu.kernel(entry, out_type=out_type, grid=grid, grid_names=grid_names,
+                            num_threads=consumers + 1, thread_name="wg",
+                            compiler_params=compiler_params(approx_math=True),
+                            interpret=plgpu.InterpretGPUParams() if interpret else None)
+
+    def roles(self, wg, consumers: int, consumer, producer) -> None:
+        roles(wg, consumers, consumer, producer)
+
+    def streams(self, blocks: dict, stages: int, consumers: int) -> dict:
+        return {name: ring(shape, dtype, stages, consumers=consumers)
+                for name, (shape, dtype) in blocks.items()}
+
+    def opened(self, allocated: dict) -> dict:
+        return {name: Ring(**scoped) for name, scoped in allocated.items()}
+
+    def stream(self, streams: dict, views, lo, hi) -> None:
+        names = tuple(streams)
+        streamed(tuple(streams.values()), lambda index: tuple(views(index)[name] for name in names), lo, hi)
+
+    def walk[C](self, streams: dict, segments, start: C, shapes: tuple, interpret: bool, *,
+                first: jax.Array | int = 0) -> tuple[C, tuple[jax.Array, ...]]:
+        def slotted(step):
+            def run(index, carry, accumulators):
+                slots = Slots(streams, index - first)
+                carry, accumulators = step(index, slots, carry, accumulators)
+                # The step's products done before its slots are given back.
+                self.settled()
+                slots.done()
+                return carry, accumulators
+
+            return run
+
+        return self.accumulated(tuple((slotted(step), lo, hi) for step, lo, hi in segments), start, shapes,
+                                interpret)
+
+    @abc.abstractmethod
+    def accumulated[C](self, segments, start: C, shapes: tuple, interpret: bool
+                       ) -> tuple[C, tuple[jax.Array, ...]]:
+        """A walk of `segments`, `step(index, carry, accumulators)`, with the family's accumulators of
+        `shapes` held across it (`walk`)."""
+
+    def passed(self, streams: dict, lo, hi, *, first: jax.Array | int = 0, between=None) -> None:
+        passed(tuple(streams.values()), lo, hi, first=first, between=between)
