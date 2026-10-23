@@ -46,6 +46,7 @@ from residual_orders import orders
 
 from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.documents import document_mask
+from dew.nn.precision import FP32_SUMS
 
 on_tpu = pytest.mark.tpu(reason="needs a TPU; the interpreter covers the rest here")
 
@@ -301,6 +302,14 @@ ORACLE_CASES = {
 }
 
 
+
+def with_fp32_sums(function):
+    """`function` run with its fp32 products summed in fp32 (`FP32_SUMS`), as an accelerator sums."""
+    def run(*arguments, **keywords):
+        with jax.default_matmul_precision(FP32_SUMS):
+            return function(*arguments, **keywords)
+    return run
+
 @pytest.mark.parametrize("case", ORACLE_CASES)
 def test_splash_is_as_exact_as_the_reference_attention(case):
     """Splash in fp32, forward and every gradient (the sinks' included),
@@ -341,8 +350,11 @@ def test_splash_is_as_exact_as_the_reference_attention(case):
         twin = value_and_grads('reference', *widened, force_fp32_for_softmax=False, **wide)
     names = ("output", "query", "key", "value", "sinks")[:len(splash)]
     truth = exact_value_and_grads(query, key, value, **structure)
-    expected = reference(query, key, value, **structure)
-    expected[1:4] = flash_gradients(query, key, value, **structure)
+    # Splash interprets the TPU kernel on this CPU: its reference sums as the target does (fp32),
+    # not as the CPU's policy does.
+    with jax.default_matmul_precision(FP32_SUMS):
+        expected = reference(query, key, value, **structure)
+        expected[1:4] = flash_gradients(query, key, value, **structure)
     with jax.enable_x64(new_val=True):
         widened = (jnp.asarray(np.asarray(x, np.float64)) for x in (query, key, value))
         twin[1:4] = flash_gradients(*widened, **wide)
@@ -365,6 +377,8 @@ def test_splash_is_as_exact_as_the_reference_attention(case):
         runs = [attention_and_grads('tpu', has_sinks=True, **kwargs),
                 attention_and_grads('reference', has_sinks=True,
                                      precision=jax.lax.Precision.HIGHEST, **kwargs)]
+        # The reference sums as the interpreted TPU kernel's target does (`FP32_SUMS`).
+        runs[1] = with_fp32_sums(runs[1])
         distances = [[], []]
         for k, order in enumerate(orders(query.shape[-1], ORDERS, seed=0)):
             inputs = [jnp.asarray(np.take(np.asarray(x), order, -1)) for x in (query, key, value)]

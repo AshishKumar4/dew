@@ -124,6 +124,15 @@ def products_dtype(*operands) -> jnp.dtype | None:
     return jnp.result_type(*dtypes)
 
 
+_JAX_PRODUCTS = (jax.lax.dot_general, jnp.einsum, jnp.matmul)
+"""JAX's own products, as this module found them."""
+
+
+def _intercepted() -> bool:
+    """Whether a library has swapped one of JAX's products for its own (`_JAX_PRODUCTS`)."""
+    return (jax.lax.dot_general, jnp.einsum, jnp.matmul) != _JAX_PRODUCTS
+
+
 FP32_SUMS = "F32_F32_F32"
 """JAX's dot algorithm of fp32 operands summed in fp32: as a process's or a scope's default matmul
 precision, the statement that its fp32 products sum as an accelerator sums them, which `accumulated`
@@ -154,6 +163,9 @@ def accumulated(product: Callable[..., jax.Array], *operands,
     quantized one, Qwix's `QArray`) leaves the product to its own library, whose dequantized sum
     keeps XLA's accumulation.
 
+    A library that swaps JAX's products for its own while a model runs (Qwix, quantizing) owns them:
+    the product is its, as flax's own layers' would be.
+
     It is real CPU execution's policy alone, chosen by the platform the program is lowered for
     (`platform_dependent`), which keys every compiled program: a step a CPU lowers for a GPU target
     (`dew.training.trainer.Trainer.lower_for`, `lowering_platforms=('cuda',)`) takes the target's
@@ -164,7 +176,7 @@ def accumulated(product: Callable[..., jax.Array], *operands,
     from dew.nn.kernels.generation import linear_tangent
 
     narrow = functools.partial(product, preferred_element_type=preferred_element_type)
-    if (jax.config.jax_default_matmul_precision == FP32_SUMS
+    if (jax.config.jax_default_matmul_precision == FP32_SUMS or _intercepted()
             or not all(isinstance(operand, jax.Array | np.ndarray) for operand in operands)
             or products_dtype(*operands) != jnp.dtype(jnp.float32)):
         return narrow(*operands)
@@ -173,19 +185,26 @@ def accumulated(product: Callable[..., jax.Array], *operands,
     def summed(*operands):
         return float64_sum(product, *operands, dtype=dtype)
 
-    def pulled(saved, operands, cotangent):
-        """The operands' cotangents, each the float64 sum of its products rounded once: JAX
-        transposes a product after its trace, outside the scope that widened it, so the pullback
-        is formed in that scope here."""
+    def pulled(saved, operands, cotangent, live):
+        """The cotangents of the operands at `live`, each the float64 sum of its products rounded
+        once: JAX transposes a product after its trace, outside the scope that widened it, so the
+        pullback is formed in that scope here, for the operands a reverse pass differentiates alone."""
         with jax.enable_x64(new_val=True):
-            _, pullback = jax.vjp(lambda *wide: product(*wide, preferred_element_type=None),
-                                  *(operand.astype(jnp.float64) for operand in operands))
-            return tuple(gradient.astype(operand.dtype)
-                         for gradient, operand in zip(pullback(cotangent.astype(jnp.float64)), operands,
-                                                      strict=True))
+            wide = [operand.astype(jnp.float64) for operand in operands]
+
+            def moving(*chosen):
+                full = list(wide)
+                for index, value in zip(live, chosen, strict=True):
+                    full[index] = value
+                return product(*full, preferred_element_type=None)
+
+            _, pullback = jax.vjp(moving, *(wide[index] for index in live))
+            gradients = pullback(cotangent.astype(jnp.float64))
+            return tuple(gradient.astype(operands[index].dtype)
+                         for gradient, index in zip(gradients, live, strict=True))
 
     # Forward mode differentiates `summed` as it traces, inside its scope; reverse mode runs `pulled`.
-    wide = linear_tangent(lambda *operands: (summed(*operands), ()), pulled, summed)
+    wide = linear_tangent(lambda *operands: (summed(*operands), ()), pulled, summed, live_cotangents=True)
     return jax.lax.platform_dependent(*operands, cpu=wide, default=narrow)
 
 
