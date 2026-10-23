@@ -35,6 +35,17 @@ def model_draw(model, shape: tuple[int, ...], vocab: int):
     return draw
 
 
+def with_logit_cotangent(draw, vocab: int, salt: int):
+    """`draw` (`model_draw`'s) with a cotangent on the logits drawn with each seed's variables and
+    tokens, float32 normals, for a gradient site's `reference_error.with_gradients`; `salt` keeps one
+    site's draws its own."""
+    def drawn(seed):
+        variables, ids = draw(seed)
+        cotangent = np.random.default_rng([salt, seed]).normal(size=(*ids.shape, vocab))
+        return variables, ids, cotangent.astype(np.float32)
+    return drawn
+
+
 @functools.cache
 def decode_steps(model):
     """`model`'s decode cache made for a count of rows, and its decode step from a cache, each one
