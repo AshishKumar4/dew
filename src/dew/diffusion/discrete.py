@@ -205,6 +205,16 @@ class DiscreteProcess:
         return replace(generated, rows=plan.rows * n, prompt_width=request.inputs.tokens.shape[1])
 
 
+def aligned(model: nn.Module, scores: jax.Array) -> jax.Array:
+    """`scores` `[B, S, ...]` per position as the model's predictions of each position's token: its
+    own for a model whose logits line up with its inputs (LLaDA's, MDLM's), and for one that declares
+    `shifted_logits` (Dream-v0's) the position before's, the first repeated, as its reference
+    shifts them."""
+    if not getattr(model, "shifted_logits", False):
+        return scores
+    return jnp.concatenate([scores[:, :1], scores[:, :-1]], axis=1)
+
+
 @dataclass(frozen=True)
 class DiscreteDenoiser:
     """Maps `(x_t, t)` to `(argmax fill, log-probabilities)` for `model` under `params`.
@@ -240,7 +250,8 @@ class DiscreteDenoiser:
         assert not isinstance(logits, tuple)  # no mutable collections were asked for
         # Normalized in fp32, as `token_log_probs` does: the reveal draws its
         # categorical from these, and a bf16 log partition would quantize it.
-        logits = logits.astype(jnp.float32).at[..., self.process.mask_id].set(-jnp.inf)
+        logits = aligned(self.model, logits).astype(jnp.float32)
+        logits = logits.at[..., self.process.mask_id].set(-jnp.inf)
         log_probs = jax.nn.log_softmax(logits, axis=-1)
         masked = self.masked(x_t)
         filled = jnp.where(masked, jnp.argmax(log_probs, axis=-1), x_t)
@@ -416,4 +427,4 @@ def _compiled(rows: jax.sharding.NamedSharding | None, options: tuple[tuple[str,
     )
 
 
-__all__ = ["MDLM", "DiscreteDenoiser", "DiscreteProcess", "LogLinear", "MaskingSchedule", "Unmask"]
+__all__ = ["MDLM", "DiscreteDenoiser", "DiscreteProcess", "LogLinear", "MaskingSchedule", "Unmask", "aligned"]
