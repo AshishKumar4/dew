@@ -84,6 +84,8 @@ ATTENTION = ("cudnn", "xla")
 CHECKPOINT = """
 import json, os, sys, tempfile, time
 if sys.argv[2:] != ["--peak-run"]:
+    # The gate's own helper (its directory, the script's second argument), whatever tools/ the tree holds.
+    sys.path.insert(0, sys.argv[2])
     import peak_memory
     peaks = peak_memory.measured([os.path.abspath(__file__), sys.argv[1], "--peak-run"])
 import jax
@@ -260,7 +262,8 @@ PROBES = [
     Probe((Row("checkpoint lm-dense save", "ms", ""), Row("checkpoint lm-dense restore", "ms", ""),
            Row("peak checkpoint lm-dense save and restore", "GiB", "")),
           lambda _, out: [str(_script(out, CHECKPOINT)),
-                          json.dumps({**STEP_CASES["step lm-dense 4x1024"], "batch_size": 1})],
+                          json.dumps({**STEP_CASES["step lm-dense 4x1024"], "batch_size": 1}),
+                          str(Path(__file__).resolve().parent)],
           lambda printed, _: (lambda record: (record["save_ms"], record["restore_ms"], peak(record)))(
               json.loads(printed.strip().splitlines()[-1]))),
     Probe((Row("reference qwen3.5-0.8b 8x3072 vs torch", "items/s", "reference_runs/qwen35_pair.py",
@@ -350,8 +353,11 @@ def measure(tree: Path, python: Path, args: argparse.Namespace, newer: Path, is_
                     raise RuntimeError(f"{probe.tool} exited {done.returncode}: {done.stderr[-1500:]}")
                 values = probe.read(done.stdout, out)
                 # A later round's compile is a load from the tree's cache, not a compile: not a sample.
+                # A peak the tree's tool did not measure (`peak`) is unmeasured, its row's sample None,
+                # beside the rows it did measure.
                 sample.update({row.name: {**value, "exit_code": done.returncode} if external
-                               else float(value) for row, value in zip(probe.rows, values, strict=True)
+                               else None if value is None else float(value)
+                               for row, value in zip(probe.rows, values, strict=True)
                                if first or not row.first_round})
             except Exception as error:  # a row that cannot run in this tree is reported, not gated
                 failure = ({"error": str(error)[-400:],

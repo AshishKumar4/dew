@@ -38,11 +38,11 @@ def after(command, flag):
     return command[command.index(flag) + 1]
 
 
-def standing_in(gate, monkeypatch, *, passed: bool) -> list:
+def standing_in(gate, monkeypatch, *, passed: bool, peaks: bool = True) -> list:
     """Stand every tool of the battery in with one writing its output format, a measured peak beside each
-    time (`peak_device_bytes`), and return the commands run. The reference either passes its claim or
-    measures a head at 0.72 of it and exits 1."""
-    peak = 3 * 2 ** 30
+    time (`peak_device_bytes`; none where `peaks` is False, as a tool that predates it writes), and return the
+    commands run. The reference either passes its claim or measures a head at 0.72 of it and exits 1."""
+    peak = 3 * 2 ** 30 if peaks else None
     outputs = {
         "benchmark_step.py": lambda command: [{"ms_per_step": 5.0, "compile_seconds": 30.0,
                                                "peak_device_bytes": peak}],
@@ -119,7 +119,8 @@ def test_a_head_reads_every_row_of_the_battery_from_the_tool_it_names(gate, tmp_
 
 
 
-def test_a_faster_head_whose_measured_peak_grows_regresses_and_an_unmeasured_peak_is_never_zero(gate):
+def test_a_faster_head_whose_measured_peak_grows_regresses_and_an_unmeasured_peak_is_never_zero(
+        gate, tmp_path, monkeypatch):
     """Two measures decide (testing.md): a head faster on a step's time whose measured peak grew past its band
     regresses on its peak row, whatever its time did; a base whose tool predates the peak (no
     peak_device_bytes) is not compared on it, never read as zero."""
@@ -130,6 +131,18 @@ def test_a_faster_head_whose_measured_peak_grows_regresses_and_an_unmeasured_pea
     assert gate.verdict(time, [5.0, 5.1, 5.0], [4.0, 4.1, 4.0])[0] == "faster"
     assert gate.peak({"ms_per_step": 5.0}) is None
     assert gate.verdict(row, [None, None, None], [3.0, 3.0, 3.0])[0] == "not compared"
+    # A tree whose tools measure no peak: its peak rows unmeasured, every time row still measured.
+    from types import SimpleNamespace
+
+    standing_in(gate, monkeypatch, passed=True, peaks=False)
+    args = SimpleNamespace(only=[], claim=False, model="unused", flowers="unused", torch_python="torch",
+                           out=tmp_path / "gate.json")
+    sample = gate.measure(ROOT, Path(sys.executable), args, ROOT / "tools", is_head=True)
+    for battery_row in gate.BATTERY:
+        if battery_row.unit == "GiB":
+            assert sample[battery_row.name] is None, battery_row.name
+        elif not battery_row.head_only:
+            assert gate.measured(sample[battery_row.name]), (battery_row.name, sample[battery_row.name])
 
 
 def standing_in_environments(gate, monkeypatch) -> tuple[list, list]:

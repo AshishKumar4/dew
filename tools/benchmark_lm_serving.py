@@ -468,8 +468,9 @@ def main():
             or args.requests < 0 or args.vocab_limit <= 100):
         parser.error("counts must be positive; --requests=0 chooses the default")
     if args.peak_run is not None:
+        # The timed repeats' work alone: no generations written, no open-loop rates, no profile.
         dew_points(argparse.Namespace(**{**vars(args), "slots": [args.slots[args.peak_run]],
-                                         "generations": False, "rate": []}))
+                                         "generations": False, "rate": [], "profile": False}))
         return
     args.out.parent.mkdir(parents=True, exist_ok=True)
     # Dew's: each slot count's measured peak, in a process of its own, before this one opens a backend.
