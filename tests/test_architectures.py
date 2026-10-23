@@ -423,9 +423,9 @@ MARGIN = 1e-5
 selected: above the distance float32 rounding moves a selection's inputs from their float64 values,
 so one device, each layout and the float64 run select alike. Gemma 3n's gate, whose inputs carry the
 rounding of the attention and AltUp before it, moved at most 3.7e-6 of its row's deviation over the
-1,200 forwards of 320 draws (median 1.6e-6, a light tail: 99% within 2.6e-6). A selection is
-discontinuous: inputs within rounding of a boundary pick other keys or units in other runs, a
-difference no precision bounds."""
+1,200 forwards of 320 draws, a light tail: each draw's largest was 1.6e-6 at the median and 2.5e-6
+at the 99th percentile. A selection is discontinuous: inputs within rounding of a boundary pick other
+keys or units in other runs, a difference no precision bounds."""
 
 
 def selects(case: Case) -> bool:
