@@ -601,18 +601,17 @@ def test_the_accurate_forms_rescale_is_as_exact_as_its_exponent_rounded_once(raw
                     f"the accurate form's rescale, {'raw' if raw else 'scaled'}", seeds=8)
 
 
-@pytest.mark.parametrize("scale, slope, size", [(2.0, None, 2e38), (1.0, 2.0, 2e38), (4.0, 1e38, 0.25),
-                                                (4.0, 2e38, 0.25)],
-                         ids=["scale-2", "slope-2", "slope-1e38", "slope-2e38"])
+@pytest.mark.parametrize("scale, slope, size", [(2.0, None, 2e38), (1.0, 2.0, 2e38), (2.0, 1.7e38, 0.25)],
+                         ids=["scale-2", "slope-2", "slope-1.7e38"])
 def test_a_querys_gradient_over_keys_near_fp32s_largest_is_finite_at_any_scale_and_slope(scale, slope, size):
     """One query of zeros over two equal keys at equal logits (each weighs 1/2) under a scale and a score
     hook's slope: the query's gradient is the cotangents' difference times the keys, 0, and D's refinement 0,
     so dQ is exactly 0 in both mainloops (`algebra.DqSums.keyed`): keys near fp32's largest at a scale or a
-    slope of 2, whose sum under coefficients summing to 2 would overflow, and small keys at a slope of 1e38
-    or 2e38, whose coefficients' magnitudes, or at 2e38 each coefficient itself, would (held as mantissas and
-    exponents, `keyed_shift`). The slope is a head's parameter, a traced value as a learned slope is, so no
-    compiler folds it into the scale (a literal slope near fp32's largest times a scale above one is
-    infinite before any cotangent meets it, in the reference's autodiff as in any kernel)."""
+    slope of 2, whose sum under coefficients summing to 2 would overflow, and small keys under a score whose
+    derivative, the slope times the scale, is fp32's largest, whose coefficients' magnitudes would (held as
+    mantissas and exponents, `keyed_shift`). A derivative past fp32's largest is no fp32 number: XLA's
+    compiled arithmetic forms it whole in the logits themselves (`template.scores` is NaN there), so no form
+    of the backward is asked of it. The slope is a head's parameter, traced as a learned slope is."""
     query = jnp.zeros((1, 1, 1, 16), jnp.float32)
     key = jnp.zeros((1, 2, 1, 16), jnp.float32).at[:, :, :, 0].set(size)
     # Equal values, so the score cotangents are exactly 0 and dQ's own sum is 0 on any accumulation: the
