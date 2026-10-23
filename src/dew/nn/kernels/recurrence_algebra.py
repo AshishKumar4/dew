@@ -1,4 +1,4 @@
-"""The recurrence template's algebra (bible §6; the template design's §3): the chunked form of the update
+"""The recurrence template's algebra (docs/design/kernel-templates.md §3): the chunked form of the update
 as named, pure functions on values, which every implementation of the chunked op calls and none
 rewrites. This rung covers `S' = T S + W` with T a diagonal decay times the delta rule's erase, E the
 identity, and a chunk's transition `(T, W)` dense (`transition`); the value-side decay E and the factored

@@ -312,7 +312,7 @@ def test_a_server_compiles_its_decoding_step_once_and_each_admission_width_once(
     which every decode-only call then runs without compiling again, and each admission width it
     meets compiles its admitting step at most once, so the widths 1, 2, 4 and 8 cost at most four
     admitting compiles beside the one decoding step, and meeting them again compiles nothing."""
-    from dew.telemetry.benchmark import Compiles
+    from dew.telemetry.instrumentation import Compiles
 
     with Compiles("_stepped") as compiled:
         server = Server.from_task(task(), slots=8, capacity=128, admission=8)

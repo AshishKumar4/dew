@@ -1161,7 +1161,8 @@ def cumulated_fwd(q, k, v, g, beta, h0, spans: Sequences, scale: float, chunk: i
     """`_rule_fwd` from the decay cumulated in base 2 within each chunk (`recurrence.cumulated`), which is
     all the rest of the rule reads of it: the inverse, `w` and `u`, the memory across chunks, then the
     output, and what the backward saves. The prefix is a value the port rounds and holds, a node of
-    its graph (bible §7's source-aware gate), and this the port's arithmetic on it."""
+    its graph (the accuracy gate's source-aware check, `assert_graph_as_exact`), and this the port's
+    arithmetic on it."""
     kernels = {"chunk": chunk, "spans": spans, "interpret": interpret}
     a = checkpoint_name(kkt_solve(k, g, beta, **kernels), 'delta_inverse')
     w, u = recompute_w_u(k, v, beta, a, g, **kernels)

@@ -15,7 +15,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import float64_terms, widened
+from reference_error import float64_terms, widened, with_gradients
 
 from dew.nn.kernels import fla_gdn, recurrence_algebra, recurrence_chunk
 
@@ -63,13 +63,11 @@ def recurrence(q, k, v, g, beta, h0, cuts=None, rule=rule_math):
 
 
 def through(rule, do, dht):
-    """`rule`'s output, final memory and its operands' gradients under the cotangents `do`, `dht`."""
-    def loss(*args):
-        out, final = rule(*args)
-        return jnp.sum(out.astype(do.dtype) * do) + jnp.sum(final.astype(dht.dtype) * dht), (out, final)
-
+    """`rule`'s output, final memory and its operands' gradients under the cotangents `do`, `dht`, each
+    cast to its output's dtype, pulled back through the gate (`reference_error.with_gradients`)."""
     def run(*args):
-        (_, (out, final)), grads = jax.value_and_grad(loss, argnums=range(len(args)), has_aux=True)(*args)
+        out, final = jax.eval_shape(rule, *args)
+        (out, final), *grads = with_gradients(rule)(*args, (do.astype(out.dtype), dht.astype(final.dtype)))
         return out, final, *grads
 
     return run

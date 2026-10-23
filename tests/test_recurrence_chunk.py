@@ -1,7 +1,7 @@
 """The recurrence template's chunked op (`dew.nn.kernels.recurrence_chunk.chunk`) on its portable math:
 every hook combination it takes, a sequence over several chunks and a ragged last one, packed documents
 too, held to the same recurrence run a token at a time (the decode step's reference,
-`recurrence.step_reference`) under bible §7's gate, both from float64."""
+`recurrence.step_reference`) under the accuracy gate (tests/reference_error.py), both from float64."""
 
 import functools
 import itertools

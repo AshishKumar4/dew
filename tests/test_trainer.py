@@ -346,7 +346,8 @@ def test_a_run_that_fails_after_a_failed_write_raises_its_own_error_and_closes_i
         tmp_path, monkeypatch):
     """RunConfig.train closes the run's tracker and checkpoints however it ends: a run whose step
     after training fails, once its last checkpoint write failed, raises its own error with the
-    write's failure noted on it, and leaves no checkpoint thread behind."""
+    write's failure noted on it, and leaves no checkpoint thread behind. A neighbour's thread that
+    ends meanwhile, as another test's pool does in a shared process, is not the run's."""
     import threading
 
     from dew.config import RunConfig, TrainerConfig
@@ -354,17 +355,27 @@ def test_a_run_that_fails_after_a_failed_write_raises_its_own_error_and_closes_i
     run = RunConfig(trainer=TrainerConfig(steps=2, checkpoint_dir=str(tmp_path),
                                           eval_every=None, checkpoint_every=1))
     run.train(Regression(), dataset(), name="settled")
-    settled = threading.active_count()
+    release = threading.Event()
+    neighbour = threading.Thread(target=release.wait)
+    neighbour.start()
+    settled = set(threading.enumerate())
     primary = ValueError("calibration failed")
 
     def after(state, directory):
         failed_write(monkeypatch)
+        release.set()
+        neighbour.join()
         raise primary
 
-    with pytest.raises(ValueError) as raised:
-        run.train(Regression(), dataset(), name="failed", after=after)
+    try:
+        with pytest.raises(ValueError) as raised:
+            run.train(Regression(), dataset(), name="failed", after=after)
+    finally:
+        # A run that fails before `after` must not leave the neighbour waiting.
+        release.set()
+        neighbour.join()
     assert raised.value is primary and primary.__notes__
-    assert threading.active_count() == settled
+    assert set(threading.enumerate()) <= settled
 
 
 class Keyed(Regression):
@@ -1363,19 +1374,18 @@ def alternating(gen, disc):
         def step(state, batch):
             trainable = state.variables["params"]
 
-            def generator(operand):
-                loss, grads = jax.value_and_grad(objective.generator_loss)(trainable, batch)
-                updates, gen_state = gen.update(grads["gen"], state.opt_state["gen"], trainable["gen"])
-                params = {**trainable, "gen": optax.apply_updates(trainable["gen"], updates)}
-                return params, {**state.opt_state, "gen": gen_state}, loss
+            def player(name, optimizer, loss_of):
+                def turn(operand):
+                    # One player's step: its loss's gradient through its own optimizer, the other held.
+                    loss, grads = jax.value_and_grad(loss_of)(trainable, batch)
+                    updates, moved = optimizer.update(grads[name], state.opt_state[name], trainable[name])
+                    params = {**trainable, name: optax.apply_updates(trainable[name], updates)}
+                    return params, {**state.opt_state, name: moved}, loss
+                return turn
 
-            def discriminator(operand):
-                loss, grads = jax.value_and_grad(objective.discriminator_loss)(trainable, batch)
-                updates, disc_state = disc.update(grads["disc"], state.opt_state["disc"], trainable["disc"])
-                params = {**trainable, "disc": optax.apply_updates(trainable["disc"], updates)}
-                return params, {**state.opt_state, "disc": disc_state}, loss
-
-            params, opt_state, loss = jax.lax.cond(state.microstep % 2 == 0, generator, discriminator, None)
+            params, opt_state, loss = jax.lax.cond(
+                state.microstep % 2 == 0, player("gen", gen, objective.generator_loss),
+                player("disc", disc, objective.discriminator_loss), None)
             new_state = state.replace(
                 microstep=state.microstep + 1,
                 updates=state.updates + 1,
