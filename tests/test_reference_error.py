@@ -1074,7 +1074,7 @@ BIT_PROGRAMS = {
 
 
 def _unpartitioned_bits(key):
-    with jax.threefry_partitionable(False):  # noqa: FBT003 (its one argument, positional)
+    with jax.threefry_partitionable(new_val=False):
         return jax.random.bits(key, (8, 5), jnp.uint32)
 
 
