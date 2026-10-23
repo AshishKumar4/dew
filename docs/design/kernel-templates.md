@@ -178,7 +178,7 @@ Rule 0 applies: use Splash's MaskInfo, with its empty/partial/full classes and p
 
 **Toolkit, per generation, shared by every template.** It reuses JAX's machinery directly, with no wrapper that renames a native API:
 - **Pipelines:**
-  - sm80, sm86, sm89 and sm120: the Pallas Triton loop, `num_stages` and `num_warps`;
+  - sm80, sm86, sm89 and sm120: Mosaic GPU's pipeline, and beside it the Pallas Triton loop (`num_stages` and `num_warps`) while that measures faster (the decision below);
   - sm90/100: Mosaic GPU's `emit_pipeline_warp_specialized`, its rings, barriers, register reallocation, TMA and clusters;
   - TPU: Mosaic TPU's pipeline and DMA.
 - **One tile scheduler:** persistent grid, LPT, rasterization and swizzle, and split-K, stream-K and split-KV work lists.
@@ -203,7 +203,9 @@ Rule 0 applies: use Splash's MaskInfo, with its empty/partial/full classes and p
 | Blackwell | Mosaic GPU | sm100 | tcgen05, TMEM, 2-CTA | B200 |
 | TPU | Mosaic TPU | v5e, v6e and later | MXU, DMA pipeline | one chip per generation |
 
-- **sm120 (consumer Blackwell: RTX 50, RTX PRO 6000) has no tcgen05 and no TMEM.** Its tensor cores take sm80's mma.sync forms (with FP8/FP4 additions), so it runs the Triton mainloop, not the Blackwell one.
+Mosaic GPU takes each of the Triton row's claims when its scoreboard row there meets Triton's (the decision below); until then that row holds them.
+
+- **sm120 (consumer Blackwell: RTX 50, RTX PRO 6000) has no tcgen05 and no TMEM.** Its tensor cores take sm80's mma.sync forms (with FP8/FP4 additions), so it runs the mma.sync mainloop (Triton's until Mosaic's measures at or under it there), not the tcgen05 one.
 - **sm86/sm89/sm120 differ from sm80 in shared memory per SM** (99–100 KB a block against the A100's 163 KB) and in SM count. So their tile spaces and picks are their own TARGETS rows (`generation.shared_budget`), and their scoreboard rows are measured, not inferred from the A100.
 - **sm75 (T4) and older** have no bf16 tensor cores, and Pallas Triton doesn't compile there (`generation.py`, the sm75 row of TARGETS). They run XLA.
 
@@ -240,7 +242,7 @@ Mosaic lowers and compiles in 0.9–2.9 s against Pallas Triton's 0.4–0.8 s. T
 2. One warpgroup a CTA. A two-warpgroup kernel fails because emit_pipeline's SMEM isn't a thread-collective allocation, and pre-Hopper emit_pipeline takes inputs only, so no larger CTA tile shares its B operand.
 3. A GEMM at equal tile and warps runs 1.35× Pallas Triton (128×128×32, 4 warps, 3 stages). The schedule within a K-step (synchronous mma.sync, ldmatrix interleaving, cp.async waits) is the likely cause; unconfirmed without ncu.
 
-**Decision:** every generation's mainloop is Mosaic GPU, sm80 included. A Pallas Triton arm stays beside it only while it measures faster and the pinned jaxlib still runs it: on sm80 that is today, by the table above (the gap is re-measured on jax 0.12.0.1, MGPU80), and each jax bump measures it again.
+**Decision:** every NVIDIA generation's mainloop is Mosaic GPU, sm80 included. A Pallas Triton arm stays beside it only while it measures faster and the pinned jaxlib still runs it: on sm80 that is today, by the table above, and each jax bump measures it again (jax 0.12.0.1 among them).
 
 **Fallbacks, if Pallas Triton's removal forces the move:**
 - Mosaic GPU's layout inference and `emit_pipeline` are Python (`jax/experimental/mosaic/gpu`, `jax/_src/pallas/mosaic_gpu`), so causes 1 and 2 are fixable in Dew's Python-only JAX fork.
