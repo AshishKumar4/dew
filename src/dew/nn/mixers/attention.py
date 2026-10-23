@@ -297,10 +297,10 @@ class CausalSelfAttention(nn.Module):
 
     def _ngpt_rotated(self, ngpt: NGPT, query, key):
         """The rotated query and key heads on the unit sphere, the query times the square of its
-        learned gain, in fp32 and back to its dtype (dory.py:139-149)."""
+        learned gain, in at least fp32 and back to its dtype (dory.py:139-149)."""
         heads = gain(self.sqk, ngpt.query(self.ctx.head_dim))
         heads = heads.reshape(self.ctx.num_heads, self.ctx.head_dim)
-        query = (jnp.square(heads) * l2norm(query).astype(jnp.float32)).astype(query.dtype)
+        query = (jnp.square(heads) * l2norm(query).astype(at_least_fp32(query.dtype))).astype(query.dtype)
         return query, l2norm(key)
 
     @property

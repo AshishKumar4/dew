@@ -5,6 +5,7 @@ tests/fixtures/hf/dory-1.0-4b holds the released config."""
 import dataclasses
 import itertools
 import json
+import math
 from pathlib import Path
 
 import jax
@@ -290,6 +291,34 @@ def test_the_gradient_of_each_tensor_is_the_references(name, loops, backprop_ste
     dew, reference = jax.jit(dew), jax.jit(reference)
     label = f'Dory {name} gradients'
     assert_as_exact(dew, reference, draw, label, seeds=DORY_GRADIENT_SEEDS[name])
+
+
+def test_a_float64_model_computes_in_float64():
+    """A float64 Dory computes its logits and gradients in float64 end to end, its nGPT attention
+    included: each sits within float64's resolution of the torch reference's own float64 run (an
+    independent implementation of the same tensors), below the geometric mean of fp32's and
+    float64's unit roundoffs, sqrt(2**-24 * 2**-53), which one fp32 rounding anywhere on the path
+    exceeds by about 2**14 and float64's own roundings sit about 2**14 under."""
+    bound = math.sqrt(2.0 ** -24 * 2.0 ** -53)
+    with jax.enable_x64(new_val=True):
+        loaded = Pretrained.load(TINY, dtype='float64', param_dtype='float64', attention_impl='xla')
+        tensors = {key: np.array(value, copy=True) for key, value in loaded.export().items()}
+        ids, cotangent = REFERENCE['input_ids'], REFERENCE['cotangent'].astype(np.float64)
+
+        def loss(params):
+            return jnp.sum(loaded.model.apply({**loaded.variables, 'params': params}, ids) * cotangent)
+
+        logits = np.asarray(loaded.model.apply(loaded.variables, ids))
+        written = loaded.export({'params': jax.grad(loss)(loaded.variables['params'])})
+    reference = TOOL.DoryReference(loaded.config, tensors, TOOL.torch.float64)
+    expected = reference.forward(ids)
+    gradients = reference.gradients(np.array(ids), np.array(cotangent), TOOL.GRADIENTS)
+    assert logits.dtype == np.float64
+    for name, mine, theirs in [('logits', logits, expected),
+                               *((tensor, np.asarray(written[tensor]), gradients[tensor])
+                                 for tensor in TOOL.GRADIENTS)]:
+        error = np.sqrt(np.mean((mine - theirs) ** 2)) / np.sqrt(np.mean(theirs ** 2))
+        assert error < bound, f'{name}: {error:.3e} relative RMS from the float64 reference'
 
 
 def test_a_cut_loop_trains_the_layers_before_it_through_the_input_every_pass_reads():
