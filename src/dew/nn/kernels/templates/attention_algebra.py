@@ -89,8 +89,8 @@ class Forward:
     @property
     def factor(self) -> float:
         """The factor the logits are the products times (`modify`): 1 raw, the scale times log2(e) folded,
-        the scale natural."""
-        return 1.0 if self.raw else self.scale * LOG2E if self.base2 else self.scale
+        the scale natural, rounded to fp32 as the kernels multiply by it (a scale below fp32's range is 0)."""
+        return float(np.float32(1.0 if self.raw else self.scale * LOG2E if self.base2 else self.scale))
 
     @property
     def guarded(self) -> bool:

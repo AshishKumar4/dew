@@ -29,6 +29,8 @@ from jax.experimental import pallas as pl
 from jax.experimental.pallas import mosaic_gpu as plgpu
 
 Ref = state_types.AbstractRef | state_types.TransformedRef
+Operand = Ref | jax.Array
+"""A product's operand: a tile in shared memory (a ref) or in registers (an array)."""
 """A scoped allocation a primitive takes: shared memory, transformed (tiled and swizzled) or not, or
 barriers."""
 
@@ -275,7 +277,7 @@ class Slots:
     it (`slots[name]`) and released at the step's end, once its MMAs are done, unless the step `release`s it
     sooner (a slot its last product has read)."""
 
-    def __init__(self, rings: dict[str, "Ring"], counter):
+    def __init__(self, rings: dict[str, Ring], counter):
         self._rings, self._counter = rings, counter
         self._held: dict[str, Ref] = {}
         self._released: set[str] = set()
@@ -299,13 +301,15 @@ class Slots:
                 self.release(name)
 
 
-class Family(abc.ABC):
+class Family[Allocated, Opened, Accumulator](abc.ABC):
     """An instruction family's bundle (design §6, one mainloop per overlap structure): everything a Mosaic
     mainloop issues that the hardware decides, so a mainloop holds no instruction, layout or barrier of its
     own. Its facts (`name`, the MMA's row unit `rows`), its launch and roles (`kernel`, `roles`), its operand
     streams (`streams`, `opened`, `stream` the producer's, `walk` and `passed` the consumer's), its products
     (`product` into a fresh accumulator, `register_products` and `staged_products` in place, `settled`), and
-    its accumulator's layouts (`zeros`, `full`, `iota`, `rows_of`, `as_row`)."""
+    its accumulator's layouts (`zeros`, `full`, `iota`, `rows_of`, `as_row`). It is generic in its streams'
+    allocations (`Allocated`, `streams`'), its opened streams (`Opened`, `opened`'s) and the accumulator its
+    products issue into in place (`Accumulator`: a warpgroup accumulator ref, or a register array)."""
 
     name: str
     rows: int
@@ -328,12 +332,12 @@ class Family(abc.ABC):
         family streams from a role of its own."""
 
     @abc.abstractmethod
-    def streams(self, blocks: dict, stages: int, consumers: int) -> object:
+    def streams(self, blocks: dict, stages: int, consumers: int) -> Allocated:
         """The scoped allocations of a stream of each `blocks[name]` `(shape, dtype)` in `stages` slots read
         by `consumers` (`opened` once scoped)."""
 
     @abc.abstractmethod
-    def opened(self, allocated, views: dict | None = None) -> object:
+    def opened(self, allocated: Allocated, views: dict | None = None) -> Opened:
         """The streams of `streams`' allocations, scoped, by name; their `views` `(ref, block)` where the
         family's walk loads them (each step `block` rows of an `[S, D]` operand)."""
 
@@ -363,7 +367,7 @@ class Family(abc.ABC):
         """Each of `parts` written whole to its view of `views`, through `smem` where the family stores so."""
 
     @abc.abstractmethod
-    def held(self, ref) -> object:
+    def held(self, ref: Ref) -> Operand:
         """An operand every step reads (`ref`, in shared memory) where the family keeps it: shared memory,
         or registers."""
 
@@ -377,18 +381,18 @@ class Family(abc.ABC):
         """`lhs @ rhs` into a fresh fp32 accumulator, `lhs` in registers (16-bit), its value."""
 
     @abc.abstractmethod
-    def register_products(self, acc, parts, rhs, interpret: bool) -> object:
+    def register_products(self, acc: Accumulator, parts, rhs, interpret: bool) -> Accumulator:
         """`acc` with `parts`' products with `rhs` issued into it in place, each part's left operand in
         registers."""
 
     @abc.abstractmethod
-    def staged_products(self, acc, parts, rhs, buffers, interpret: bool, *,
-                        transposed: bool = False) -> object:
+    def staged_products(self, acc: Accumulator, parts, rhs, buffers, interpret: bool, *,
+                        transposed: bool = False) -> Accumulator:
         """`register_products` of `parts` each staged in `buffers` first (its transpose the left operand
         where `transposed`)."""
 
     @abc.abstractmethod
-    def rescaled_products(self, acc, scale, parts, rhs, interpret: bool) -> object:
+    def rescaled_products(self, acc: Accumulator, scale, parts, rhs, interpret: bool) -> Accumulator:
         """`acc` taken by `scale(value)` in place, then `register_products` of `parts` with `rhs` into it."""
 
     @abc.abstractmethod
@@ -416,7 +420,7 @@ class Family(abc.ABC):
         """`vector` `[rows]` in a row's layout, whatever its own."""
 
 
-class RingFamily(Family):
+class RingFamily[Accumulator](Family[dict, dict[str, Ring], Accumulator]):
     """A family whose loads a producer warpgroup issues by TMA into `Ring`s, beside one or two consumer
     warpgroups at `setmaxnreg` budgets (`roles`): sm90's and sm100's. Its walk acquires each step's slots as
     the step reads them and releases them once its products are done (`Slots`)."""
@@ -435,11 +439,11 @@ class RingFamily(Family):
     def roles(self, consumers: int, consumer, producer) -> None:
         roles(lax.axis_index("wg"), consumers, consumer, producer)
 
-    def streams(self, blocks: dict, stages: int, consumers: int):
+    def streams(self, blocks: dict, stages: int, consumers: int) -> dict:
         return {name: ring(shape, dtype, stages, consumers=consumers)
                 for name, (shape, dtype) in blocks.items()}
 
-    def opened(self, allocated, views: dict | None = None):
+    def opened(self, allocated: dict, views: dict | None = None) -> dict[str, Ring]:
         del views
         return {name: Ring(**scoped) for name, scoped in allocated.items()}
 
@@ -482,7 +486,7 @@ class RingFamily(Family):
     def stored(self, parts, views, *, smem) -> None:
         stored(parts, views, smem=smem)
 
-    def held(self, ref):
+    def held(self, ref: Ref) -> Operand:
         return ref
 
 
