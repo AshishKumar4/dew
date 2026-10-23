@@ -37,6 +37,29 @@ def test_a_callers_own_sender_carries_every_request_with_the_workers_protocol(ca
     assert sent == [(method, "Bearer token", "dew-pooled") for method in ("PUT", "GET", "GET", "GET")]
 
 
+def test_an_answer_with_no_success_status_is_refused():
+    """An answer whose final status is neither a success nor a miss (here a 101) is `Refused`, never an
+    empty object."""
+
+    class Switching(http.server.BaseHTTPRequestHandler):
+        def log_message(self, *args):
+            pass
+
+        def do_GET(self):
+            self.send_response(101)
+            self.end_headers()
+            self.close_connection = True
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Switching)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+    try:
+        store = r2.Store(f"http://127.0.0.1:{server.server_address[1]}", "token", "dew-test", timeout=10)
+        with pytest.raises(r2.Refused):
+            store.get("records/switching")
+    finally:
+        server.shutdown()
+
+
 def test_what_the_contract_refuses_never_reaches_the_worker(cache_worker):
     url, stored, seen = cache_worker
     store = r2.Store(url, "token", "dew-test", timeout=10)
