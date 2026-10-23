@@ -1,7 +1,8 @@
 #!/bin/sh
 # Builds dist/dew_cutlass_cu<major>-<version>-py3-none-manylinux_2_28_x86_64.whl with the CUDA toolkit on PATH
 # (nvcc, 12.8 or newer for sm100a), cmake >= 3.24, ninja and a Python with pip, on glibc 2.28 (the release
-# workflow's nvidia/cuda rockylinux8 image). XLA's FFI headers come from the jaxlib PYTHON installs.
+# workflow's nvidia/cuda rockylinux8 image). XLA's FFI headers come from the jaxlib PYTHON installs, the
+# oldest Dew supports.
 set -eu
 CUTLASS=https://github.com/NVIDIA/cutlass
 CUTLASS_COMMIT=2c85f497547eb441f0fe80bfb0fb2e6f9add1719  # v4.8.1
@@ -13,7 +14,9 @@ if [ ! -d "$here/upstream" ]; then
   git -C "$here/upstream" checkout --quiet "$CUTLASS_COMMIT"
 fi
 "$python" -m pip install --quiet -r "$here/../../tools/pip.txt"
-"$python" -m pip install --quiet "jaxlib>=0.11.2"
+# The oldest jaxlib Dew supports: a handler built against newer FFI headers states an API version an older
+# jaxlib refuses to register (0.12's 0.5 against 0.11.2's 0.4), and every newer jaxlib accepts the older.
+"$python" -m pip install --quiet "jaxlib==0.11.2"
 headers=$("$python" -c "import jax.ffi; print(jax.ffi.include_dir())" 2>/dev/null ||
           "$python" -c "import jaxlib, os; print(os.path.join(os.path.dirname(jaxlib.__file__), 'include'))")
 cmake -S "$here" -B "$here/build" -G Ninja -DCMAKE_BUILD_TYPE=Release -DXLA_FFI_INCLUDE="$headers"
