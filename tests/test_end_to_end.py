@@ -176,8 +176,8 @@ def test_a_step_moves_the_running_statistics_and_the_task_decodes_with_them():
         for publication, statistics in ((published, after), (later, moved)):
             shift = np.asarray(statistics["mean"])
             scale = 1 / np.sqrt(np.asarray(statistics["var"]))
-            np.testing.assert_allclose(np.asarray(publication.autoencoder.running_normalization(
-                publication.variables["autoencoder"])[1]), scale, rtol=1e-6)
+            np.testing.assert_allclose(np.asarray(publication.autoencoder.normalization_for(
+                publication.variables["autoencoder"]).factor), scale, rtol=1e-6)
             weights = tuned[TUNED_WEIGHTS]
             expected = task.autoencoder.decode_batch(weights, z / jnp.asarray(scale) + jnp.asarray(shift))
             image = decode(publication.autoencoder, publication.variables["autoencoder"], z)
@@ -526,7 +526,8 @@ def test_a_repae_step_moves_the_running_statistics_as_train_repae_does(repae_ste
                                1 / np.sqrt(STEPPED["bn/running_var_f64"]), rtol=4 * np.finfo(np.float64).eps)
     decoder, decoding = task.published_autoencoder({**variables, "params": params, LATENT_STATS: statistics})
     assert isinstance(decoder, TunedAutoEncoder)
-    shift, scale = decoder.running_normalization(decoding["autoencoder"])
+    held = decoder.normalization_for(decoding["autoencoder"])
+    shift, scale = held.shift, held.factor
     np.testing.assert_array_equal(np.asarray(shift), np.asarray(statistics["mean"]))
     np.testing.assert_allclose(np.asarray(scale, np.float64),
                                1 / np.sqrt(np.asarray(statistics["var"], np.float64)), rtol=gamma(2), atol=0)

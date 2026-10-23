@@ -5,6 +5,14 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- JEPA's target normalization is Flax's `LayerNorm` with no affine and exact
+  variance, `dew.objectives.jepa.TARGET_NORM`, in place of `normalize_targets`;
+  its statistics are float32 whatever the activations' dtype, as I-JEPA's
+  `F.layer_norm`'s are, so a bfloat16 run's targets round once.
+- A latent normalization an autoencoder's variables hold is its
+  `normalization_for(params)`, which `encode` and `decode` apply; a REPA-E
+  `TunedAutoEncoder` returns its running statistics there, in place of
+  `running_normalization`.
 - `OptimConfig.rate` is the learning rate, a number or a schedule's record, in
   place of `learning_rate` and `schedule`; on the command line it is one value,
   `--optim.rate 3e-4` or a schedule's JSON record.

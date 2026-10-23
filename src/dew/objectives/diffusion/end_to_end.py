@@ -31,7 +31,7 @@ import numpy as np
 from flax import linen as nn
 from jax.typing import ArrayLike
 
-from dew.nn.autoencoders import AutoEncoder
+from dew.nn.autoencoders import AutoEncoder, LatentNormalization
 from dew.nn.autoencoders.kl import posterior_moments
 from dew.nn.conv import Conv
 from dew.objectives.base import Batch, Objective, Variables
@@ -59,7 +59,7 @@ class _BatchNorm(nn.Module):
         width = hidden.shape[-1]
         weight = self.param("weight", lambda key, shape: 1 + 0.02 * jax.random.normal(key, shape), (width,))
         bias = self.param("bias", nn.initializers.zeros, (width,))
-        mean, var = _moments(hidden, batch)
+        mean, var = Objective.row_moments(hidden, batch, tuple(range(hidden.ndim - 1)))
         return (hidden - mean) / jnp.sqrt(var + 1e-5) * weight + bias
 
 
@@ -114,44 +114,26 @@ class TunedAutoEncoder(AutoEncoder):
     def latent_shape(self, shape: tuple[int, ...]) -> tuple[int, ...]:
         return self.autoencoder.latent_shape(shape)
 
-    def running_normalization(self, params, dtype=jnp.float32) -> tuple[jax.Array, jax.Array]:
-        """The latent shift and scale the running statistics in `params` give, in `dtype`."""
+    def normalization_for(self, params) -> LatentNormalization:
+        """The latent normalization the running statistics in `params` give: shifted by the mean and
+        scaled by the reciprocal square root of the variance."""
         statistics = params[LATENT_STATS]
-        return jnp.asarray(statistics["mean"], dtype), jnp.asarray(jax.lax.rsqrt(statistics["var"]), dtype)
+        return LatentNormalization({}, statistics["mean"], jax.lax.rsqrt(statistics["var"]))
 
     @property
     def latent_shift(self):
         raise TypeError("a tuned autoencoder's latent shift is its run's running statistics, which each "
-                        "call's variables hold (`running_normalization`)")
+                        "call's variables hold (`normalization_for`)")
 
     @property
     def latent_scale(self):
         raise TypeError("a tuned autoencoder's latent scale is its run's running statistics, which each "
-                        "call's variables hold (`running_normalization`)")
+                        "call's variables hold (`normalization_for`)")
 
     def with_normalization(self, normalization):
         raise TypeError("a tuned autoencoder normalizes by its run's running statistics, which each "
                         "call's variables hold, not by a fixed normalization")
 
-    def encode(self, params, x, key=None, noise=None):
-        latent = (self.encode_video(params, x, key, noise) if x.ndim == 5
-                  else self.encode_batch(params, x, key=key, noise=noise))
-        shift, scale = self.running_normalization(params, latent.dtype)
-        return (latent - shift) * scale
-
-    def decode(self, params, z):
-        shift, scale = self.running_normalization(params, z.dtype)
-        z = z / scale + shift
-        return self.decode_video(params, z) if z.ndim == 5 else self.decode_batch(params, z)
-
-
-def _moments(values: jax.Array, batch: Batch) -> tuple[jax.Array, jax.Array]:
-    """`values`' mean and biased variance over every axis but the channels,
-    over `batch`'s rows (`Objective.row_mean`), as `jnp.mean` and `jnp.var` take them."""
-    axes = tuple(range(values.ndim - 1))
-    mean, _ = Objective.row_mean(values, batch, axes).mean()
-    var, _ = Objective.row_mean(jnp.square(values - mean), batch, axes).mean()
-    return mean, var
 
 
 class PatchDiscriminator(nn.Module):
@@ -291,7 +273,7 @@ class EndToEnd:
         rows (`Objective.row_mean`). This is torch's `BatchNorm2d` in training mode,
         whose running variance is unbiased.
         """
-        mean, var = _moments(latents, batch)
+        mean, var = Objective.row_moments(latents, batch, tuple(range(latents.ndim - 1)))
         count = Objective.row_mean(latents[..., 0], batch).mass
         following = {"mean": (1 - self.momentum) * statistics["mean"] + self.momentum * mean,
                      "var": (1 - self.momentum) * statistics["var"]

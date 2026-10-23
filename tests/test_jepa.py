@@ -16,6 +16,7 @@ from dew.inputs import Field
 from dew.nn.backbones.jepa import JepaPredictor
 from dew.objectives.base import Step, merge, part
 from dew.objectives.jepa import (
+    TARGET_NORM,
     JepaEncoder,
     JepaObjective,
     JepaVideoEncoder,
@@ -23,7 +24,6 @@ from dew.objectives.jepa import (
     LinearProbe,
     MultiBlockMask,
     linear_probe_accuracy,
-    normalize_targets,
     representation_health,
 )
 from dew.training import Layout, MeshSpec, Trainer
@@ -299,7 +299,7 @@ def context_errors(objective, params, ema, data, mask, rng, draws=8):
     """Each pair of consecutive images' mean prediction error from their own contexts and from each
     other's, over `draws` mask draws: two arrays of a value a pair, pairs being independent draws."""
     n, blocks = data.shape[0], mask.num_targets
-    full = normalize_targets(objective.encode(part(ema, "context_encoder"), data))
+    full = TARGET_NORM.apply({}, objective.encode(part(ema, "context_encoder"), data))
 
     def error(ctx, context_idx, target_idx):
         targets = jnp.take_along_axis(full[:, None], target_idx.reshape(n, blocks, -1, 1), axis=-2)

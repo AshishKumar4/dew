@@ -49,8 +49,8 @@ class LatentNormalization:
     as `z / factor + shift`; one that `divides` normalizes as `(z - shift) / factor` and restores as
     `z * factor + shift`, as its source rounds."""
     record: Mapping[str, RecordValue]
-    shift: float | np.ndarray
-    factor: float | np.ndarray
+    shift: float | np.ndarray | jax.Array
+    factor: float | np.ndarray | jax.Array
     divides: bool = False
 
     def __post_init__(self):
@@ -110,7 +110,8 @@ class AutoEncoder(ABC):
     `[B, h, w, c]` and back. `encode` and `decode` here take video
     `[B, T, H, W, C]` frame by frame, unless the subclass encodes time itself
     (`encode_video`, `decode_video`, `latent_shape`), and they apply the
-    latent normalization (`normalization`, `LatentNormalization`). On the way
+    latent normalization (`normalization_for`, by default `normalization`, a
+    `LatentNormalization`). On the way
     out, latents are normalized as (z - latent_shift) * latent_scale, and on
     the way in the normalization is inverted, the SD3 convention.
     `latent_shift` and `latent_scale` are each one number or one per latent
@@ -254,17 +255,23 @@ class AutoEncoder(ABC):
         decoded = self.decode_batch(params, z.reshape(-1, height, width, channels))
         return decoded.reshape(batch_size, seq_len, *decoded.shape[1:])
 
+    def normalization_for(self, params) -> LatentNormalization:
+        """The latent normalization `encode` and `decode` apply with the weights `params`: the
+        autoencoder's own (`normalization`), which a subclass whose variables hold its statistics
+        reads from them."""
+        return self.normalization
+
     def encode(self, params, x: jnp.ndarray, key: jax.Array | None = None,
                noise: jnp.ndarray | None = None) -> jnp.ndarray:
         """Encode images `[B, H, W, C]` or video `[B, T, H, W, C]` to normalized latents, a stochastic
         encoder's sample drawn from `key` or read off `noise` (`encode_batch`)."""
         latent = (self.encode_video(params, x, key, noise) if x.ndim == 5
                   else self.encode_batch(params, x, key=key, noise=noise))
-        return self.normalization.normalized(latent)
+        return self.normalization_for(params).normalized(latent)
 
     def decode(self, params, z: jnp.ndarray) -> jnp.ndarray:
         """Decode normalized latents `[B, h, w, c]` or `[B, t, h, w, c]` back to images or video."""
-        z = self.normalization.restored(z)
+        z = self.normalization_for(params).restored(z)
         return self.decode_video(params, z) if z.ndim == 5 else self.decode_batch(params, z)
 
     def __call__(self, params, x: jnp.ndarray,
