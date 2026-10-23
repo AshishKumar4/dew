@@ -489,3 +489,20 @@ def test_presets_rebuild_from_their_fields(rng):
     assert_follows(jnp.log(draws / (1 - draws)), stats.norm(0.5, 0.7))
     with pytest.raises(ValueError):
         registry.build("flow", shfit=3.0)
+
+
+@pytest.mark.parametrize("schedule", [EDMNoiseScheduler(), KarrasVENoiseScheduler()],
+                         ids=["edm", "karras"])
+def test_a_karras_schedule_keeps_a_float64_runs_times_in_float64(schedule):
+    """A float64 run's times stay float64 through a Karras schedule's sigmas and back
+    (`schedules.common.times`), as every other schedule keeps them: a float64 truth's noise rates,
+    loss weights and conditioning times are then float64's, not float32's widened."""
+    with jax.enable_x64(new_val=True):
+        t = np.linspace(0.05, 0.95, 64) * schedule.T
+        sigma = schedule.sigmas(jnp.asarray(t, jnp.float64))
+        assert sigma.dtype == jnp.float64
+        assert schedule.t_of_sigma(sigma).dtype == jnp.float64
+        # Computed in float64, not in float32 and widened.
+        narrow = schedule.sigmas(jnp.asarray(t, jnp.float32))
+        assert narrow.dtype == jnp.float32
+        assert not np.array_equal(np.asarray(sigma), np.asarray(narrow, np.float64))
