@@ -34,8 +34,9 @@ from dew.data.prompts import PromptRecord
 from dew.inference import Draw, VLLMGenerateServer
 from dew.objectives.rl.episodes import EpisodeStatus, Observation
 from dew.objectives.rl.records import episode_from_record
+from dew.objectives.rl.rollout import prompt_tasks
 from dew.objectives.rl.sessions import Status, Task, Transcript, pack
-from dew.objectives.rl.sources import EnvironmentSource, PromptSource, prompt_tasks
+from dew.objectives.rl.sources import EnvironmentSource, PromptSource
 from dew.rl.sandbox import ContainerRunner, SandboxFleet
 from dew.sampling import Sampling
 
@@ -66,7 +67,8 @@ class Server:
         self.keys.append(words(key))
         future = Future()
         draw = Draw(tuple(prompt), self.tokens, (-.5,) * len(self.tokens),
-                    (-.4,) * len(self.tokens) if self.raw else None, self.tokens[-1] == EOS, self.version)
+                    "stop" if self.tokens[-1] == EOS else "length", self.version,
+                    (-.4,) * len(self.tokens) if self.raw else None)
         if self.hold:
             self.held.append((future, draw))
         else:
@@ -95,7 +97,7 @@ class Counter:
             return Observation((), EpisodeStatus.ERROR, "container exited")
         if self.fail == "malformed":
             return {"context": [1, 2]}
-        self.context = action.context + action.tokens + (4,)
+        self.context = action.prompt + action.tokens + (4,)
         reward = None if self.paid is None else self.paid[self.steps - 1]
         if self.steps == self.turns:
             return Observation((), EpisodeStatus.COMPLETED, "tests passed", reward)
@@ -136,7 +138,7 @@ def test_a_multi_turn_session_keeps_each_calls_version_and_packs_into_one_chain(
     assert [call.version for call in rollout.calls] == [0, 1, 2]
     # Turn t of sample 0 draws under fold_in(fold_in(key, 0), t), the key's own stream.
     assert server.keys == [words(jax.random.fold_in(jax.random.fold_in(KEY, 0), turn)) for turn in range(3)]
-    assert [call.prompt_ids for call in rollout.calls] == [
+    assert [call.prompt for call in rollout.calls] == [
         (1, 2),
         (1, 2, 5, EOS, 4),
         (1, 2, 5, EOS, 4, 5, EOS, 4),
@@ -225,7 +227,7 @@ def test_each_call_lists_the_messages_the_observations_before_it_carried():
                                                             for step in (1, 2))]
     assert [call.transcript for call in rollout.calls] == [
         Transcript((user,)), Transcript((user, tools[0])), Transcript((user, *tools))]
-    assert [call.prompt_ids for call in rollout.calls] == [
+    assert [call.prompt for call in rollout.calls] == [
         (1, 2), (1, 2, 5, EOS, 4), (1, 2, 5, EOS, 4, 5, EOS, 4)]
     (episode,) = recorded
     assert episode_from_record(json.loads(json.dumps(asdict(episode)))) == episode

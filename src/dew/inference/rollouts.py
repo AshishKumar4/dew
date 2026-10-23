@@ -24,11 +24,10 @@ likelihood, which only the trainer's rescoring has.
 
 from __future__ import annotations
 
-import math
 import threading
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, Protocol
 
@@ -39,7 +38,7 @@ import numpy as np
 from dew.coordination import agreed, collective_host, stop_at_exit
 from dew.nn.inputs import key_seed, request_key, token_id
 from dew.objectives.base import Variables, thaw
-from dew.records import JSON
+from dew.records import JSON, finite
 from dew.sampling.decoding import EndOfSequence, StopStrings
 from dew.sampling.text import Generation, Sampling
 
@@ -73,45 +72,104 @@ class InfrastructureError(RuntimeError):
     """
 
 
+FINISH_REASONS = frozenset({"stop", "tool_calls", "length", "abort"})
+"""How a model call ended: on an EOS id or a stop string (`stop`), on a tool call the harness reads
+(`tool_calls`), at its budget or a criterion that truncates it (`length`), or cut off (`abort`)."""
+
+
+def _token_ids(name: str, ids: object) -> tuple[int, ...]:
+    """`ids`, a tuple, each read by `dew.nn.inputs.token_id`'s law."""
+    if not isinstance(ids, tuple):
+        raise ValueError(f"{name} must be a tuple of token ids, got {type(ids).__name__}")
+    return tuple(token_id(token, where=name) for token in ids)
+
+
+def _likelihoods(name: str, values: object, count: int) -> tuple[float, ...]:
+    """`values`, one finite log-probability per sampled id."""
+    if not isinstance(values, tuple) or len(values) != count:
+        raise ValueError(f"a draw needs one {name} log-probability per sampled id")
+    return tuple(finite(value, f"a {name} log-probability") for value in values)
+
+
 @dataclass(frozen=True)
 class Draw:
-    """One sampled continuation of one prompt.
+    """One model call as the engine served it: the one record a server, an environment, a session
+    and the packer read.
 
-    `tokens` are the sampled actions, with the id that ended the draw
-    included when it terminated: an EOS id, or the id completing a stop
-    string (`check_ending`). `behavior_log_probs` is the likelihood of each action
-    under the distribution that drew it. `raw_log_probs` is the unmodified
-    model's likelihood, or None when the backend cannot report it. `version`
-    is the policy version the request was submitted under. When requested,
-    `routed_experts` is the engine's mixture routing for every id it
-    forwarded, and `support` is the ids its sampler kept for each drawn
-    token (see `sessions.Call.routed_experts` and `sessions.Call.support`).
-    Likelihoods that do not match the tokens one to one, or are not finite,
-    raise ValueError.
+    `prompt` are the ids the engine read and `tokens` the ids it sampled,
+    with the id that ended the draw included when it stopped: an EOS id, or
+    the id completing a stop string (`check_ending`). `behavior_log_probs`
+    is each sampled id's likelihood under the distribution that drew it, and
+    `raw_log_probs` the unmodified model's, or None where the backend cannot
+    report it (vLLM, SGLang, a recording gateway). `finish_reason` is one of
+    `FINISH_REASONS`, and the draw `terminated` where it is `stop` or
+    `tool_calls`. `version` is the policy version being served when the
+    request was submitted, the oldest policy that may have produced any of
+    its ids.
+
+    Two engine records are optional. `routed_experts` is the mixture's
+    routing for every id the engine forwarded, as
+    `[len(prompt) + len(tokens) - 1, layers, top_k]` expert ids in the dtype
+    the engine sent; the last sampled id is never forwarded. vLLM calls this
+    record `routed_experts` and SGLang `meta_info.routed_experts`, and the
+    trainer replays it (`dew.nn.protocols.Routes`). `support` holds, for
+    each sampled id, the token ids the sampler's top-k/top-p filters kept
+    (vLLM's `sampling_mask`). With a support, the behavior log-probability
+    is the filtered one, and the trainer renormalizes over the same support.
+    None means no filter. Ids, likelihoods and records that do not match the
+    sampled ids one to one, or are not finite, raise ValueError.
     """
 
     prompt: tuple[int, ...]
     tokens: tuple[int, ...]
     behavior_log_probs: tuple[float, ...]
-    raw_log_probs: tuple[float, ...] | None
-    terminated: bool
+    finish_reason: str
     version: int
-    routed_experts: np.ndarray | None = None
+    raw_log_probs: tuple[float, ...] | None = None
+    routed_experts: np.ndarray | None = field(default=None, compare=False)
     support: tuple[tuple[int, ...], ...] | None = None
 
     def __post_init__(self) -> None:
+        object.__setattr__(self, "prompt", _token_ids("a draw's prompt", self.prompt))
+        object.__setattr__(self, "tokens", _token_ids("a draw's tokens", self.tokens))
         if not self.prompt:
             raise ValueError("a draw continues a nonempty prompt")
-        if len(self.behavior_log_probs) != len(self.tokens) or (
-                self.raw_log_probs is not None and len(self.raw_log_probs) != len(self.tokens)):
-            raise ValueError("every drawn token needs its likelihoods")
-        for probabilities in (self.behavior_log_probs, self.raw_log_probs or ()):
-            if not all(math.isfinite(value) for value in probabilities):
-                raise ValueError("drawn likelihoods must be finite")
-        if self.terminated and not self.tokens:
-            raise ValueError("a terminated draw ends on the id that ended it")
-        if self.support is not None and len(self.support) != len(self.tokens):
-            raise ValueError("a draw's support holds one set of kept ids per drawn token")
+        count = len(self.tokens)
+        object.__setattr__(self, "behavior_log_probs",
+                           _likelihoods("behavior", self.behavior_log_probs, count))
+        if self.raw_log_probs is not None:
+            object.__setattr__(self, "raw_log_probs", _likelihoods("raw", self.raw_log_probs, count))
+        if self.finish_reason not in FINISH_REASONS:
+            raise ValueError(f"finish_reason must be one of {sorted(FINISH_REASONS)}, "
+                             f"got {self.finish_reason!r}")
+        if type(self.version) is not int or self.version < 0:
+            raise ValueError("a draw's policy version is a nonnegative integer")
+        if self.routed_experts is not None:
+            routed = np.array(self.routed_experts)
+            forwarded = len(self.prompt) + count - 1
+            if (routed.ndim != 3 or routed.shape[0] != forwarded
+                    or not np.issubdtype(routed.dtype, np.integer)):
+                raise ValueError(
+                    f"routed_experts is [forwarded ids, layers, top_k] expert ids, "
+                    f"{forwarded} rows for this draw; got {routed.dtype} {routed.shape}")
+            if routed.size and routed.min() < 0:
+                raise ValueError("routed_experts holds expert ids, which are nonnegative")
+            routed.setflags(write=False)
+            object.__setattr__(self, "routed_experts", routed)
+        if self.support is not None:
+            if not isinstance(self.support, tuple) or len(self.support) != count:
+                raise ValueError("support holds one tuple of kept ids per sampled id")
+            object.__setattr__(self, "support",
+                               tuple(_token_ids("each support", kept) for kept in self.support))
+            for kept, token in zip(self.support, self.tokens, strict=True):
+                if token not in kept:
+                    raise ValueError(f"sampled id {token} lies outside its recorded support")
+
+    @property
+    def terminated(self) -> bool:
+        """Whether the draw ended itself, on an EOS id, a stop string or a tool call, rather than being
+        cut at its budget or aborted."""
+        return self.finish_reason in ("stop", "tool_calls")
 
     def checked(self, sampling: Sampling) -> Draw:
         """Return this draw after checking that it ends as `sampling` ends one (`check_ending`)."""
@@ -204,8 +262,8 @@ def _native_draw(prompt: tuple[int, ...], generation: Generation[np.ndarray], ve
     width = len(prompt)
     return Draw(prompt, tuple(int(token) for token in generation.tokens[0, width:width + count]),
                 tuple(float(value) for value in generation.behavior_log_probs[0, :count]),
-                tuple(float(value) for value in generation.raw_log_probs[0, :count]),
-                bool(generation.terminated[0]), version)
+                "stop" if bool(generation.terminated[0]) else "length", version,
+                tuple(float(value) for value in generation.raw_log_probs[0, :count]))
 
 
 class NativeRolloutServer:
@@ -728,8 +786,8 @@ class OpenAIRolloutServer(_RequestServer):
             kept = through_stop(tokens, self._decode, self._sampling.stop)
             tokens, probabilities = tokens[:kept], probabilities[:kept]
             routed = None if routed is None else routed[:len(prompt) + kept - 1]
-        return Draw(prompt, tokens, probabilities, None, terminated, version,
-                    routed if self._routing else None).checked(self._sampling)
+        return Draw(prompt, tuple(tokens), tuple(probabilities), "stop" if terminated else "length", version,
+                    routed_experts=routed if self._routing else None).checked(self._sampling)
 
     def _strings(self) -> dict[str, JSON]:
         """The request field that ends a draw on the policy's stop strings, which the engine matches on
@@ -792,7 +850,7 @@ class OpenAIRolloutServer(_RequestServer):
             tokens, probabilities = tokens[:kept], probabilities[:kept]
         if len(probabilities) != len(tokens):
             raise ValueError(f"SGLang streamed {len(tokens)} ids and {len(probabilities)} log-probabilities")
-        return Draw(prompt, tuple(tokens), tuple(probabilities), None, terminated,
+        return Draw(prompt, tuple(tokens), tuple(probabilities), "stop" if terminated else "length",
                     version).checked(self._sampling)
 
 
@@ -875,6 +933,6 @@ class VLLMGenerateServer(_RequestServer):
         if self._routing and routed is None:
             raise ValueError("vLLM returned no routed_experts; start it with --enable-return-routed-experts")
         terminated = _finished(choice["finish_reason"], matched_stop(choice), tokens, budget, sampling)
-        return Draw(prompt, tokens, probabilities, None, terminated, version,
-                    decode_routed_experts(routed) if self._routing else None,
-                    tuple(tuple(kept) for kept in mask)).checked(sampling)
+        return Draw(prompt, tokens, probabilities, "stop" if terminated else "length", version,
+                    routed_experts=decode_routed_experts(routed) if self._routing else None,
+                    support=tuple(tuple(kept) for kept in mask)).checked(sampling)
