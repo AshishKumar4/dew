@@ -1015,8 +1015,8 @@ class DqSums(NamedTuple):
     """A dQ pass's sums over its keys: dQ `[bq, D]` and the score cotangents' row sums and the HEAD and
     QUERY hook parameters' pullbacks of them (`grads`), each cotangent taken over a `prior` denominator
     (the forward's, or the first pass's; `grad_scores`); and the unnormalized weights' row sums, the hook
-    parameters' pullbacks of them (`weighed`) and their product with the keys as dQ's (`keyed`, `[bq, D]`),
-    fp32."""
+    parameters' pullbacks of them (`weighed`) and their product with the keys as dQ's over the prior
+    denominator too (`keyed`, `[bq, D]`, a weighted mean of the keys, so finite wherever they are), fp32."""
 
     dq: jax.Array
     residual: jax.Array
@@ -1043,7 +1043,7 @@ def dq_finish(sums: DqSums, prior: jax.Array, state_total: jax.Array, peak0: jax
     refined = refinement(residual, mass, peak0, shares, peak, total, anchor, delta)
     grads = tuple(grad * ratio - refined * (weighed * over)
                   for grad, weighed in zip(sums.grads, sums.weighed, strict=True))
-    dq = sums.dq * expand(ratio, sums.dq) - expand(refined * over, sums.keyed) * sums.keyed
+    dq = (sums.dq - expand(refined, sums.keyed) * sums.keyed) * expand(ratio, sums.dq)
     return dq, delta + refined, total, mass, grads
 
 
@@ -1141,6 +1141,16 @@ def cotangent_product(cotangents: jax.Array, operand: jax.Array,
         narrow, operand_exponent = _fp16_scaled(operand.astype(jnp.float32))
     return (power2(dot(oriented(high), operand), high_exponent)
             + power2(dot(oriented(low), narrow), low_exponent + operand_exponent))
+
+
+def weights_product(weights: jax.Array, operand: jax.Array,
+                    dot: Callable[[jax.Array, jax.Array], jax.Array]) -> jax.Array:
+    """Weights `[bq, bk]` (fp32) times the queries or keys `operand` in its dtype, fp32: an fp16 operand's
+    at a power-of-two scale that keeps the weights in its range (`_fp16_scaled`), taken back after."""
+    if operand.dtype == jnp.float16:
+        narrow, exponent = _fp16_scaled(weights)
+        return power2(dot(narrow, operand), exponent)
+    return dot(weights.astype(operand.dtype), operand)
 
 
 def value_operands(exponentials: jax.Array, weights: jax.Array, dout: jax.Array,

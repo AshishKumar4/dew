@@ -293,7 +293,8 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
             grads = tuple(grad + piece if add else grad for grad, add, piece in zip(grads, summed, pieces,
                                                                                    strict=True))
             pulled_weights, pieces = algebra.pulled(weights, slopes, seen, score_kinds)
-            keyed = keyed + interpreted_dot(algebra.narrow(pulled_weights * scale, k_tile.dtype), k_tile)
+            over = algebra.expand(scale * algebra.inverse(prior), pulled_weights)
+            keyed = keyed + algebra.weights_product(pulled_weights * over, k_tile, interpreted_dot)
             if any(summed):
                 weighed = tuple(sums + piece if add else sums
                                 for sums, add, piece in zip(weighed, summed, pieces, strict=True))

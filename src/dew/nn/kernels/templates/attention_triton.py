@@ -592,7 +592,8 @@ def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tu
                                                                                strict=True))
         # The weights' own product with the keys, which takes dQ to the refined D (`algebra.dq_finish`).
         pulled_weights, pieces = algebra.pulled(weights, slopes, seen, score_kinds)
-        keyed = keyed + product(algebra.narrow(pulled_weights * scale, key.dtype), key)
+        over = algebra.expand(scale * algebra.inverse(prior), pulled_weights)
+        keyed = keyed + algebra.weights_product(pulled_weights * over, key, product)
         if any(summed):
             weighed = tuple(sums + piece if row else sums for sums, row, piece in zip(weighed, summed, pieces,
                                                                                     strict=True))
