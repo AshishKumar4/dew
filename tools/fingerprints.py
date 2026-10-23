@@ -14,11 +14,11 @@ equal draws miss what they do not reach (other ranks, dtypes, regimes, arguments
 two forms of one formula that each match a different reference's rounding are separate on purpose. The
 report says what each match covers: forward alone (no float derivative) or forward and derivative, and
 the shapes, dtypes and scales both ran on. It leaves out, and counts, a function that returns an input
-unchanged or the same outputs at every scale, and a pair where one function calls the other, which
-is delegation and not a copy.
+unchanged or the same outputs at every scale, and a pair where one function names the other (a call,
+a dispatch table's entry), which is delegation and not a copy.
 
-Calls run with the Hub offline (HF_HUB_OFFLINE) and each under a CALL_SECONDS alarm, since a helper's
-purity is read from its text alone.
+Calls run with the Hub offline (HF_HUB_OFFLINE), since a helper's purity is read from its text alone;
+the precheck bounds the whole run's time.
 
     python tools/fingerprints.py [--base=REF] [--all]
 
@@ -34,8 +34,8 @@ os.environ.setdefault("JAX_PLATFORMS", "cpu")
 
 import argparse
 import ast
+import collections
 import importlib
-import signal
 import subprocess
 import sys
 from dataclasses import dataclass, field
@@ -65,7 +65,6 @@ linear regime (a saturating activation, an exponential)."""
 STEP = {"float32": 2e-3, "bfloat16": 3e-2}
 """A draw's grid step, relative to its outputs' largest magnitude: coarse enough that two orders of one
 sum land on the same points, fine enough that another epsilon's floor or another constant does not."""
-CALL_SECONDS = 2.0
 MOST_ARGUMENTS = 4
 
 
@@ -74,7 +73,8 @@ class Candidate:
     module: str
     name: str
     arguments: int
-    calls: frozenset[str]
+    names: frozenset[str]
+    """Every name its body reads, a callee's or a table entry's: what delegation is read from."""
     source: str
     draws: dict = field(default_factory=dict)
     """Each draw's key, (shape, dtype, scale), to its outputs' grid (`_grid`), its derivative's (None
@@ -117,19 +117,9 @@ def candidates(root: Path = SOURCE) -> list[Candidate]:
                     or any((ast.unparse(argument.annotation) if argument.annotation else "") not in ARRAYS
                            for argument in required)):
                 continue
-            calls = frozenset(
-                child.func.attr if isinstance(child.func, ast.Attribute) else getattr(child.func, "id", "")
-                for child in ast.walk(node) if isinstance(child, ast.Call))
-            found.append(Candidate(module, node.name, len(required), calls, ast.unparse(node)))
+            read = names | {child.attr for child in ast.walk(node) if isinstance(child, ast.Attribute)}
+            found.append(Candidate(module, node.name, len(required), frozenset(read), ast.unparse(node)))
     return found
-
-
-class _Overdue(BaseException):
-    """A call past CALL_SECONDS: a BaseException, so no helper's own handler swallows it."""
-
-
-def _overdue(*_):
-    raise _Overdue
 
 
 def _draws():
@@ -181,7 +171,6 @@ def fingerprint(candidate: Candidate, draws) -> None:
         if key[0] in candidate.refusals:
             continue
         given, along = arguments[:candidate.arguments], tangents[:candidate.arguments]
-        signal.setitimer(signal.ITIMER_REAL, CALL_SECONDS)
         try:
             returned = function(*given)
             outputs, derivative = _host(returned), None
@@ -192,11 +181,9 @@ def fingerprint(candidate: Candidate, draws) -> None:
                 except (TypeError, ValueError, NotImplementedError) as error:
                     # An integer path or a custom rule without a forward derivative: forward alone.
                     candidate.underived = type(error).__name__
-        except (Exception, _Overdue) as error:
+        except Exception as error:
             candidate.refusals[key[0]] = type(error).__name__
             continue
-        finally:
-            signal.setitimer(signal.ITIMER_REAL, 0)
         if outputs is None:
             candidate.refusals[key[0]] = "no finite numeric output"
             continue
@@ -280,7 +267,7 @@ def groups(found: list[Candidate]) -> tuple[list[tuple[list[str], list[str]]], i
             coverage = match(first, second)
             if coverage is None:
                 continue
-            if first.name in second.calls or second.name in first.calls:
+            if first.name in second.names or second.name in first.names:
                 delegating += 1
                 continue
             parent[root(first.label)] = root(second.label)
@@ -305,13 +292,12 @@ def main(argv=None) -> int:
     # Dew's numerical policy, before JAX opens a backend.
     importlib.import_module("dew")
     found = candidates()
-    signal.signal(signal.SIGALRM, _overdue)
     draws = list(_draws())
     drawn, unimported = [], {}
     for candidate in found:
         try:
             fingerprint(candidate, draws)
-        except (Exception, _Overdue) as error:
+        except Exception as error:
             unimported[candidate.label] = type(error).__name__
             continue
         if candidate.draws and not _trivial(candidate):
@@ -320,10 +306,12 @@ def main(argv=None) -> int:
     fresh = None if arguments.all else changed(drawn, arguments.base)
     shown = [(labels, pairs) for labels, pairs in matched if fresh is None or set(labels) & fresh]
     scope = "every group" if fresh is None else f"groups holding a function changed against {arguments.base}"
-    refused = sum(1 for candidate in found if candidate.refusals and not candidate.draws)
-    print(f"fingerprints: {len(found)} candidates ({len(unimported)} not imported, {refused} running on no "
-          f"draw), {len(drawn)} drawn with a computation of their own, {len(matched)} groups, "
-          f"{delegating} delegating pairs left out; {scope}: {len(shown)}")
+    refused = collections.Counter(next(iter(candidate.refusals.values())) for candidate in found
+                                  if candidate.refusals and not candidate.draws)
+    reasons = ", ".join(f"{count} {name}" for name, count in refused.most_common(4))
+    print(f"fingerprints: {len(found)} candidates ({len(unimported)} not imported, {sum(refused.values())} "
+          f"running on no draw: {reasons}), {len(drawn)} drawn with a computation of their own, "
+          f"{len(matched)} groups, {delegating} delegating pairs left out; {scope}: {len(shown)}")
     for labels, pairs in shown:
         print(f"- {', '.join(labels)}")
         for pair in pairs:
