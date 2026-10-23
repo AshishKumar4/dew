@@ -58,13 +58,14 @@ MODEL = CausalTransformer(**{"vocab_size": VOCAB, **TINY_DECODER, "num_layers": 
 FORMS = {
     "altup": {"altup": AltUp(num_inputs=2)},
     "mhc": {"hyper_connections": HyperConnections(hc_mult=2)},
-    "single-pass mhc": {"hyper_connections": HyperConnections(hc_mult=2, head="carried", single_pass=True)},
+    "single-pass-mhc": {"hyper_connections": HyperConnections(hc_mult=2, head="carried", single_pass=True)},
     "depth": {"attention_residuals": AttentionResiduals(block_size=2)},
-    "ngpt": {"ngpt": NGPT(std=0.02, alpha=0.05), "pre_norms": False},
+    "ngpt": {"ngpt": NGPT(std=0.02, alpha=0.05), "pre_norms": False, "qk_norm": False},
 }
 """Each residual a decoder carries beside the plain stream, which the blocks read and join in its form."""
 
-SEEDS = {"block": 64, "base": 16, "decode": 16, "scan": 16, **{f"fresh {form}": 16 for form in FORMS}}
+SEEDS = {"block": 64, "base": 16, "decode": 16, "scan": 16, "fresh altup": 16, "fresh mhc": 32,
+         "fresh single-pass-mhc": 16, "fresh depth": 16, "fresh ngpt": 16}
 """Check 1's declared seeds for each site of the file, sized by `seeds_for` on armada."""
 
 
