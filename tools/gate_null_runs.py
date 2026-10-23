@@ -18,6 +18,9 @@ verdicts.
 
 Usage, from the checkout: python tools/gate_null_runs.py <class> --seeds K --runs N --chunk C
     [--paired] [--orders K] [--fault NAME]
+or, for the worst-row rule's controls (`row_controls`): python tools/gate_null_runs.py <rows a draw>
+    --rows <values a row> --seeds K --runs N --chunk C, printing its red runs and the site statistic's
+    quantiles
 """
 
 import argparse
@@ -507,9 +510,13 @@ def main(argv: list[str]) -> int:
             parser.error("--rows takes the rows a draw as its name and --seeds, and no other mode's flags")
         verdicts, statistics = row_controls(options.rows, int(options.name), options.seeds, options.runs,
                                             options.chunk)
+        import numpy as np
+
         print(json.dumps({"rows": int(options.name), "width": options.rows, "seeds": options.seeds,
-                          "chunk": options.chunk, "verdicts": verdicts, "statistics": statistics}),
-              flush=True)
+                          "chunk": options.chunk, "runs": len(verdicts),
+                          "reds": sum(verdict != "pass" for verdict, _ in verdicts),
+                          "quantiles": {str(tail): float(np.quantile(statistics, 1 - tail))
+                                        for tail in (5e-4, 1e-4)}}), flush=True)
         return 0
     if options.ratio is not None:
         if options.orders or options.paired or options.fault:

@@ -149,7 +149,7 @@ def test_an_orbit_of_a_recorded_reference_or_of_one_order_is_refused():
         _drawn(_left_to_right, _outer_first, _cancelling_draw, range(2), orders=lambda inputs: [inputs])
 
 
-def test_narrow_rows_take_their_own_factor_and_wider_rows_row_factor():
+def test_narrow_rows_take_their_narrow_factor_and_wider_rows_row_factor():
     """The worst-row rule judged alone (`_judgement` on a leaf whose pooled ratio is one): Dew's worst
     row just inside its width's factor times the reference's passes and just past it fails, at one and
     two values a row (NARROW_FACTORS) and at three and eight (ROW_FACTOR)."""
