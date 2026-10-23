@@ -370,13 +370,15 @@ class Decide:
         """A request's answers and usage from its one row and images (`_shown`), by a pass of its own."""
         return self._replied(questions, [row], self._seen_pass([(row, media)]))
 
-    def _seen_pass(self, rows: Sequence[tuple[Encoded, Images]]) -> list[np.ndarray]:
+    def _seen_pass(self, rows: Sequence[tuple[Encoded, Images]],
+                   variables: Variables | None = None) -> list[np.ndarray]:
         """Each row's raw `[Q, K]` logits from one pass over rows that hold images, alike as
         `Images.joined` takes them (`seen_together`)."""
         assert self.processor is not None, "a row of images was laid out with the processor"
         encoded = [row for row, _ in rows]
         inputs = DecisionInputs.collate(encoded, self.specials.pad, context_length=self.context_length)
-        scores = np.asarray(self._forward(self.variables, inputs, media=Images.joined(self.processor, rows)))
+        held = self.variables if variables is None else variables
+        scores = np.asarray(self._forward(held, inputs, media=Images.joined(self.processor, rows)))
         return [scores[index, :len(row.questions)] for index, row in enumerate(encoded)]
 
     @property
@@ -429,12 +431,13 @@ class Decide:
             start = stop
         return [found[index] for index in range(len(rows))]
 
-    def scored(self, rows: Sequence[Encoded]) -> list[np.ndarray]:
-        """Each of `rows`' raw `[Q, K]` logits from one pass over them all, which `fits` allows."""
-        scores = self._pass(rows)
+    def scored(self, rows: Sequence[Encoded], variables: Variables | None = None) -> list[np.ndarray]:
+        """Each of `rows`' raw `[Q, K]` logits from one pass over them all, which `fits` allows, over
+        `variables` (the task's own by default)."""
+        scores = self._pass(rows, self.variables if variables is None else variables)
         return [scores[index, :len(row.questions)] for index, row in enumerate(rows)]
 
-    def _pass(self, rows: Sequence[Encoded]) -> np.ndarray:
+    def _pass(self, rows: Sequence[Encoded], variables: Variables | None = None) -> np.ndarray:
         """One forward pass at bucketed shapes, its rows placed on the
         weights' mesh (`RowPlan`)."""
         questions = max(len(row.questions) for row in rows)
@@ -450,8 +453,9 @@ class Decide:
             slots=None if inputs.slots is None else _widened(inputs.slots, length))
         count = shape_bucket(len(rows), 1)
         padded = RowPlan(None, len(rows), count, 0, 1).pad(inputs)
-        plan = RowPlan.over(mesh_of(self.variables), count)
-        return plan.host(self._forward(self.variables, plan.place(plan.pad(padded))))[:len(rows)]
+        held = self.variables if variables is None else variables
+        plan = RowPlan.over(mesh_of(held), count)
+        return plan.host(self._forward(held, plan.place(plan.pad(padded))))[:len(rows)]
 
     def _forward(self, variables: Variables, inputs: DecisionInputs, *,
                  media: ModelInputs | None = None) -> jax.Array:
@@ -747,11 +751,12 @@ class WireScoring(scoring.Scoring[Mapping[str, object], _Row, _Admitted, np.ndar
                 and all(seen[0].alike(media) for media in seen) and self.decide.fits(encoded))
 
     def forward(self, variables: Variables, rows: Sequence[_Row]) -> list[np.ndarray]:
-        # The server chose these rows as one pass (`fits`), so they run as one.
-        decide = replace(self.decide, variables=variables)
+        # The server chose these rows as one pass (`fits`), so they run as one, over the weights it
+        # hands the pass; the task's compiled forwards are kept across passes.
         if rows[0].media is None:
-            return decide.scored([row.encoded for row in rows])
-        return decide._seen_pass([(row.encoded, row.media) for row in rows if row.media is not None])
+            return self.decide.scored([row.encoded for row in rows], variables)
+        return self.decide._seen_pass([(row.encoded, row.media) for row in rows if row.media is not None],
+                                      variables)
 
     def answer(self, payload: _Admitted, outputs: Sequence[np.ndarray]) -> dict[str, JSON]:
         return self.decide._wire_response(payload.questions,
