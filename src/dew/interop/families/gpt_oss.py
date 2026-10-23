@@ -86,7 +86,8 @@ GPT_OSS = DecoderFamily(
     # GptOssConfig's defaults: biased attention, its own norm epsilon and expert geometry, a window,
     # and its YaRN record where a config states none.
     defaults={'attention_bias': True, 'rms_norm_eps': 1e-5, 'num_experts_per_tok': 4,
-              'num_local_experts': 128, 'sliding_window': 128,
+              'num_local_experts': 128, 'sliding_window': 128, 'head_dim': 64, 'num_key_value_heads': 8,
+              'max_position_embeddings': 131072,
               'rope_parameters': {'rope_type': 'yarn', 'factor': 32.0, 'beta_fast': 32.0, 'beta_slow': 1.0,
                                   'truncate': False, 'original_max_position_embeddings': 4096}},
 )

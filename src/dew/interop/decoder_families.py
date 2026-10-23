@@ -123,8 +123,8 @@ ENTRIES = (
         "MinistralForCausalLM",
         lambda model: {},
         preserve_source_layout=False,
-        # MinistralConfig's window, which an omitted sliding_window means.
-        defaults={"sliding_window": 4096},
+        # MinistralConfig's defaults for the fields its decoder reads.
+        defaults={"sliding_window": 4096, "num_key_value_heads": 8, "max_position_embeddings": 131072},
     ),
     DecoderFamily(
         ("llama",),

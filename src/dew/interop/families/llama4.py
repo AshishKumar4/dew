@@ -154,7 +154,8 @@ LLAMA4_TEXT = DecoderFamily(
     # Llama4TextConfig's defaults for the fields its decoder reads.
     defaults={'rms_norm_eps': 1e-5, 'num_experts_per_tok': 1, 'use_qk_norm': True,
               'attn_temperature_tuning': True, 'floor_scale': 8192, 'attn_scale': 0.1,
-              'attention_chunk_size': 8192},
+              'attention_chunk_size': 8192, 'num_key_value_heads': 8, 'head_dim': 128,
+              'max_position_embeddings': 131072},
     # A model whose rotated layers attend every key says so, against the class's 8192.
     export_nulls=('attention_chunk_size',),
 )

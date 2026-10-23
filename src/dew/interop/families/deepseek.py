@@ -1161,9 +1161,10 @@ DEEPSEEK_V2 = DecoderFamily(
     weight_path=layer_depth_path,
     preserve_source_layout=True,
     aliases={'num_experts': 'n_routed_experts'},
-    # DeepseekV2Config's defaults for the fields its routing reads.
+    # DeepseekV2Config's defaults for the fields its decoder and routing read.
     defaults={'n_shared_experts': 2, 'n_routed_experts': 64, 'routed_scaling_factor': 1.0,
-              'topk_method': 'greedy', 'norm_topk_prob': False, 'first_k_dense_replace': 0},
+              'topk_method': 'greedy', 'norm_topk_prob': False, 'first_k_dense_replace': 0,
+              'q_lora_rank': 1536, 'max_position_embeddings': 2048},
 )
 
 
@@ -1193,8 +1194,10 @@ DEEPSEEK_V3 = DecoderFamily(
     weight_path=layer_depth_path,
     preserve_source_layout=True,
     aliases={'num_local_experts': 'n_routed_experts', 'num_mtp_layers': 'num_nextn_predict_layers'},
-    # DeepseekV3Config's defaults for the fields its routing reads: its routed weights scale by 2.5.
+    # DeepseekV3Config's defaults for the fields its decoder and routing read: its routed weights
+    # scale by 2.5.
     defaults={'n_shared_experts': 1, 'n_routed_experts': 256, 'num_experts_per_tok': 8,
               'routed_scaling_factor': 2.5, 'n_group': 8, 'topk_group': 4, 'norm_topk_prob': True,
-              'first_k_dense_replace': 3},
+              'first_k_dense_replace': 3, 'num_key_value_heads': 128, 'q_lora_rank': 1536,
+              'max_position_embeddings': 4096, 'num_nextn_predict_layers': 1},
 )
