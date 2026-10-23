@@ -53,6 +53,7 @@ Usage:
 
 import contextlib
 import dataclasses
+import importlib
 import io
 import json
 import os
@@ -68,7 +69,7 @@ import tyro
 from dew.files import write_atomically
 from dew.nn.attention import AttentionImpl
 from dew.nn.flops import MissingFlopsCount
-from dew.pool import COORDINATOR, PROCESS_COUNT, detected_cluster
+from dew.pool import joins_pool, pool_cluster
 from dew.registry import models
 from dew.telemetry.instrumentation import COLLECTIVES, model_flops_utilization
 from dew.telemetry.profile import capture_options
@@ -193,6 +194,10 @@ class BenchmarkConfig:
     json_out: str | None = None
     quiet: bool = True
     """Silence the trainer's own prints, which are per-run noise here."""
+    within: str | None = None
+    """`module:function` (a module beside this tool), whose context manager every case runs inside, in this
+    process and each peak process: a diagnostic's swapped implementation (tools/benchmark_depthwise.py's
+    lax form)."""
     peak_run: bool = False
     """A case run in a process of its own for its measured peak (`measured_peak`), its compiles taken
     from the cache that run names, measuring no peak of its own."""
@@ -333,15 +338,6 @@ def training_work(trainer: Trainer, case: Case, step_time: float) -> tuple[float
     return flops, model_flops_utilization(flops / trainer.device_mesh.devices.size, step_time)
 
 
-def pooled() -> bool:
-    """Whether this process is one of a pool the environment declares (`dew launch`'s, a coordinator's,
-    a cluster's), read before a backend opens: its processes hold one mesh between them, which a
-    process of one case's own cannot build."""
-    cluster = detected_cluster()
-    return (any(name in os.environ for name in (PROCESS_COUNT, COORDINATOR))
-            or (cluster is not None and cluster.count > 1))
-
-
 def measured_peak(case: Case, config: BenchmarkConfig) -> list[int | None]:
     """Each local device's high-water over the case's run, measured (tools/peak_memory.py) in a process of
     the case's own that loads its programs from a cache and compiles nothing. Run before this process
@@ -350,7 +346,11 @@ def measured_peak(case: Case, config: BenchmarkConfig) -> list[int | None]:
         [os.path.abspath(__file__), "--cases", json.dumps([dataclasses.asdict(case)]),
          "--dtype", config.dtype, "--attention-impl", config.attention_impl, "--warmup", str(config.warmup),
          "--steps", str(config.steps), "--fixed-batch" if config.fixed_batch else "--no-fixed-batch",
-         *(["--xla-flags", config.xla_flags] if config.xla_flags else []), "--peak-run"])
+         *(["--xla-flags", config.xla_flags] if config.xla_flags else []),
+         *(["--within", config.within] if config.within else []),
+         # The profiled steps are the case's too; their traces go apart from this process's.
+         *(["--profile-dir", os.path.join(config.profile_dir, "peak-run"), "--profile-steps",
+            str(config.profile_steps)] if config.profile_dir else []), "--peak-run"])
 
 
 def measure(case: Case, config: BenchmarkConfig, peaks: list[int | None] | None) -> Row:
@@ -537,12 +537,20 @@ def run(config: BenchmarkConfig, peaks: list[list[int | None]] | None) -> list[R
     return rows
 
 
+def entered(within: str | None) -> contextlib.AbstractContextManager:
+    """The context `within` (`BenchmarkConfig.within`) names, or none."""
+    if within is None:
+        return contextlib.nullcontext()
+    module, _, function = within.partition(":")
+    return getattr(importlib.import_module(module), function)()
+
+
 def main(config: BenchmarkConfig) -> list[Row]:
     if not config.peak_run:
         # A step's compile seconds are a cold compile's, which no cached executable stands in for.
         jax.config.update("jax_enable_compilation_cache", val=False)
     # Before this process opens a backend, which would hold the device each case's peak process needs.
-    measuring = not (pooled() or config.peak_run)
+    measuring = not (joins_pool(None, pool_cluster(None)) or config.peak_run)
     peaks = [measured_peak(case, config) for case in build_cases(config)] if measuring else None
     # Joins a `dew launch` pool when one launched this process, and applies
     # the flags before the backend opens either way.
@@ -553,7 +561,8 @@ def main(config: BenchmarkConfig) -> list[Row]:
               f"{jax.process_count()} process(es)")
         print(f"dtype {config.dtype}, attention_impl {config.attention_impl}, "
               f"XLA_FLAGS {os.environ.get('XLA_FLAGS', '')!r}")
-    rows = run(config, peaks)
+    with entered(config.within):
+        rows = run(config, peaks)
     if not speaker:
         return rows
     print()
