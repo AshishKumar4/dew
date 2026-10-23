@@ -24,7 +24,13 @@ import pytest
 import torch
 import transformers
 from jax.sharding import PartitionSpec as P
-from reference_error import assert_as_exact, assert_as_exact_as_the_reference, equations
+from reference_error import (
+    assert_as_exact,
+    assert_as_exact_as_the_reference,
+    equations,
+    torch_with_gradients,
+    with_gradients,
+)
 
 from dew.data.dataset import Loader
 from dew.interop import Pretrained
@@ -86,25 +92,31 @@ def objective_loss(objective, variables, tokens, *, scalar: bool = False):
 
 def token_draws(tokens):
     """Check 1's draw of token rows: `tokens` (the fixture's) at seed 0, else rows of their shape
-    drawn uniformly from the vocabulary."""
+    drawn uniformly from the vocabulary; and the loss's cotangent, one, a step's."""
     def draw(seed):
         if seed == 0:
-            return (tokens,)
-        return (np.random.default_rng(seed).integers(0, TINY["vocab_size"], tokens.shape).astype(np.int32),)
+            return tokens, np.float32(1)
+        rows = np.random.default_rng(seed).integers(0, TINY["vocab_size"], tokens.shape).astype(np.int32)
+        return rows, np.float32(1)
 
     return draw
 
 
 def loss_and_gradients(loaded, model, params):
     """A draw's LM loss of the fallback-loaded model and its gradient for each parameter `model`
-    (its torch twin) names, the loss as `[1]`: the function check 1 holds against torch's step."""
+    (its torch twin) names under the draw's cotangent (`with_gradients`), the loss as `[1]`: the
+    function check 1 holds against torch's step."""
     objective = LMObjective(loaded, seq_len=SEQ, ema_decay=None)
-    step = jax.jit(jax.value_and_grad(lambda params, ids: objective_loss(
-        objective, {**loaded.variables, "params": params}, ids, scalar=True)))
+
+    @jax.jit
+    def step(params, ids, cotangent):
+        return with_gradients(lambda params: objective_loss(
+            objective, {**loaded.variables, "params": params}, ids, scalar=True))(params, cotangent)
+
     names = [name for name, _ in model.named_parameters()]
 
-    def dew_fn(ids):
-        value, grads = step(params, ids)
+    def dew_fn(ids, cotangent):
+        value, grads = step(params, ids, cotangent)
         return {"loss": value[None]} | {name: grads[name] for name in names}
 
     return dew_fn
@@ -241,16 +253,23 @@ def head_model(head):
     return model
 
 
-def torch_step(model, tokens, stored=torch.float32) -> dict[str, np.ndarray]:
-    """transformers' own loss over `tokens` and torch autograd's gradient of
-    every parameter, rounded to the `stored` dtype a parameter is kept in,
-    as float64 arrays."""
+def torch_step(model, tokens, cotangent, stored=torch.float32) -> dict[str, np.ndarray]:
+    """transformers' own loss over `tokens` and the gradient of every parameter under the draw's
+    `cotangent` (`torch_with_gradients`), rounded to the `stored` dtype a parameter is kept in, as
+    float64 arrays. Each parameter enters at float32 (float64 in a float64 model) and is cast to its
+    own dtype inside, so a bf16 model's gradients are its own, exactly widened."""
     ids = torch.from_numpy(tokens.astype(np.int64))
-    model.zero_grad()
-    loss = model(ids, labels=ids).loss
-    loss.backward()
-    return {"loss": np.asarray([loss.item()])} | {
-        name: parameter.grad.to(stored).double().numpy() for name, parameter in model.named_parameters()}
+    entry = torch.float64 if next(model.parameters()).dtype == torch.float64 else torch.float32
+    own = {name: parameter.dtype for name, parameter in model.named_parameters()}
+    weights = {name: parameter.detach().to(entry).numpy() for name, parameter in model.named_parameters()}
+
+    def loss(params):
+        typed = {name: value.to(own[name]) for name, value in params.items()}
+        return torch.func.functional_call(model, typed, (ids,), {"labels": ids}).loss
+
+    value, gradients = torch_with_gradients(loss)(weights, cotangent)
+    return {"loss": np.asarray([value], np.float64)} | {
+        name: torch.from_numpy(gradient).to(stored).double().numpy() for name, gradient in gradients.items()}
 
 
 @pytest.mark.parametrize("head", HEADS)
@@ -275,8 +294,8 @@ def test_a_head_trains_as_transformers_does_by_what_it_is(head, tokens, tmp_path
 
     reference_model = copy.deepcopy(model).float()
 
-    def reference_fn(ids):
-        return torch_step(reference_model, ids, getattr(torch, stored))
+    def reference_fn(ids, cotangent):
+        return torch_step(reference_model, ids, cotangent, getattr(torch, stored))
 
     # Truth: the same weights in a model built in float64, its float32 pins
     # (the loss's logits.float(), an RMS norm's upcast) widened and its
@@ -286,11 +305,11 @@ def test_a_head_trains_as_transformers_does_by_what_it_is(head, tokens, tmp_path
                                                                    attn_implementation="eager").eval()
         wide_model.load_state_dict(model.state_dict())
 
-    def truth_fn(ids):
+    def truth_fn(ids, cotangent):
         with float64():
-            return torch_step(wide_model, ids, torch.float64)
+            return torch_step(wide_model, ids, cotangent, torch.float64)
 
-    dew = dew_fn(tokens)
+    dew = dew_fn(tokens, np.float32(1))
     assert_as_exact(dew_fn, reference_fn, token_draws(tokens), f"torchax {head} LM step", seeds=HEAD_SEEDS,
                     truth_fn=truth_fn)
     if head in ("zero bias", "bias"):
@@ -322,17 +341,17 @@ def test_bf16_compute_gradients_are_as_exact_as_torchs_bf16(family, tokens, tmp_
 
     reference_model = copy.deepcopy(model)
 
-    def reference_fn(ids):
-        return torch_step(reference_model, ids, torch.bfloat16)
+    def reference_fn(ids, cotangent):
+        return torch_step(reference_model, ids, cotangent, torch.bfloat16)
 
     with float64():
         wide = transformers.AutoModelForCausalLM.from_config(model.config, dtype=torch.float64,
                                                              attn_implementation="eager").eval()
         wide.load_state_dict(model.state_dict())
 
-    def truth_fn(ids):
+    def truth_fn(ids, cotangent):
         with float64():
-            return torch_step(wide, ids, torch.float64)
+            return torch_step(wide, ids, cotangent, torch.float64)
 
     assert_as_exact(dew_fn, reference_fn, token_draws(tokens), f"torchax bf16 {family} LM step",
                     seeds=BF16_SEEDS, truth_fn=truth_fn)
