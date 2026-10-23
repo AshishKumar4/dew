@@ -7,6 +7,7 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
+import torch
 from reference_error import (
     FACTOR,
     REDRAW,
@@ -217,6 +218,142 @@ def test_a_without_ynn_arm_takes_the_looped_form():
         with pytest.raises(ValueError):
             over_windows(without_ynn(lambda x: x * 2))(x)
     np.testing.assert_array_equal(over_windows(without_ynn(lambda x: x * 2), looped=True)(x), x * 2)
+
+
+def test_a_torch_arm_pulls_back_the_cotangent_it_is_given():
+    """`torch_with_gradients` gives, bit for bit, a torch function's output and the gradients torch's
+    autograd pulls back from the cotangent passed last, cast to the output's dtype, at float32 and at
+    float64; a module's parameters are inputs through `functional_call`; an input the output does not
+    reach has a zero gradient."""
+    from reference_error import torch_with_gradients
+
+    rng = np.random.default_rng(0)
+    for dtype in (torch.float32, torch.float64):
+        layer = torch.nn.Linear(3, 4).to(dtype)
+        x, unused = (rng.normal(size=shape) for shape in ((5, 3), (2,)))
+        params = {name: value.detach().numpy() for name, value in layer.named_parameters()}
+        x, unused = x.astype(params["weight"].dtype), unused.astype(params["weight"].dtype)
+        # A float64 cotangent, cast to the output's dtype.
+        cotangent = rng.normal(size=(5, 4))
+
+        def forward(x, params, unused, layer=layer):
+            return torch.tanh(torch.func.functional_call(layer, params, (x,)))
+
+        out, grad_x, grads, grad_unused = torch_with_gradients(forward)(x, params, unused, cotangent)
+        tensors = [torch.from_numpy(x).requires_grad_(), *(torch.from_numpy(v).requires_grad_()
+                                                           for v in params.values())]
+        expected = torch.tanh(torch.func.functional_call(layer, dict(zip(params, tensors[1:], strict=True)),
+                                                         (tensors[0],)))
+        wanted = torch.autograd.grad(expected, tensors, torch.from_numpy(cotangent).to(dtype))
+        assert out.dtype == grad_x.dtype == params["weight"].dtype
+        np.testing.assert_array_equal(out, expected.detach().numpy())
+        for got, want in zip((grad_x, *(grads[name] for name in params)), wanted, strict=True):
+            np.testing.assert_array_equal(got, want.numpy())
+        np.testing.assert_array_equal(grad_unused, np.zeros_like(unused))
+
+
+def test_a_torch_arm_pulls_a_scalar_loss_back_from_its_scalar_one():
+    """A scalar input takes a scalar gradient, its shape and dtype kept."""
+    from reference_error import torch_with_gradients
+
+    loss, gradient = torch_with_gradients(lambda a: 3 * a * a)(np.float32(2), np.float32(1))
+    assert loss.dtype == gradient.dtype == np.float32 and np.shape(gradient) == ()
+    np.testing.assert_array_equal(loss, np.float32(12))
+    np.testing.assert_array_equal(gradient, np.float32(12))
+
+
+def test_a_torch_arm_pulls_nothing_back_from_a_constant():
+    """A constant output pulls nothing back, alone, or beside a reached one whose own cotangent it then
+    takes, by its place in the tree."""
+    from reference_error import torch_with_gradients
+
+    x = np.array([2.0, 3.0], np.float32)
+    _, gradient = torch_with_gradients(lambda x: torch.ones_like(x))(x, np.ones(2, np.float32))
+    assert gradient.dtype == np.float32
+    np.testing.assert_array_equal(gradient, np.zeros(2, np.float32))
+    _, gradient = torch_with_gradients(lambda x: (torch.ones_like(x), x * 2))(
+        x, (np.full(2, 7, np.float32), np.full(2, 100, np.float32)))
+    np.testing.assert_array_equal(gradient, np.full(2, 200, np.float32))
+
+
+def test_a_torch_arms_integer_input_has_no_gradient():
+    """An integer input takes no gradient, where a float one would."""
+    from reference_error import torch_with_gradients
+
+    _, gradient = torch_with_gradients(lambda i: i.float() * 2)(np.array([1, 2], np.int32),
+                                                                 np.ones(2, np.float32))
+    assert gradient is None
+
+
+def test_a_torch_arm_refuses_a_cotangent_of_another_tree():
+    """A cotangent of another tree than the output's, a dict for a tuple or a list for one, is refused,
+    where pairing by order would pull back the wrong leaf."""
+    from reference_error import torch_with_gradients
+
+    pulled = torch_with_gradients(lambda v: (v * 1, v * 2))
+    x = np.ones(2, np.float32)
+    for cotangent in ({"z": np.ones(2, np.float32), "a": np.ones(2, np.float32)}, [x, x]):
+        with pytest.raises(ValueError):
+            pulled(x, cotangent)
+
+
+def test_a_torch_arm_pairs_each_cotangent_with_its_own_output():
+    """Each cotangent pulls back through its own output, the first through the first."""
+    from reference_error import torch_with_gradients
+
+    _, gradient = torch_with_gradients(lambda v: (v * 1, v * 2))(
+        np.ones(2, np.float32), (np.full(2, 10, np.float32), np.full(2, 100, np.float32)))
+    assert gradient.dtype == np.float32
+    np.testing.assert_array_equal(gradient, np.full(2, 210, np.float32))
+
+
+def test_a_torch_arms_narrow_floats_go_in_through_float32():
+    """A bfloat16 input and cotangent, as JAX holds them on the host, and a float8 input reach the arm
+    in torch's format of their name, through the float32 that holds them exactly, and come out in
+    float32."""
+    from reference_error import torch_with_gradients
+
+    def doubled(x):
+        assert x.dtype == torch.bfloat16
+        return x * 2
+
+    halves = np.array([2.0, 3.0], jnp.bfloat16)
+    out, gradient = torch_with_gradients(doubled)(halves, np.ones(2, jnp.bfloat16))
+    assert out.dtype == gradient.dtype == np.float32
+    np.testing.assert_array_equal(out, np.array([4.0, 6.0], np.float32))
+    np.testing.assert_array_equal(gradient, np.full(2, 2, np.float32))
+    # Torch computes no float8 on the CPU, so a float8 input is widened inside, as a quantized arm's is.
+
+    def widened_inside(x):
+        assert x.dtype == torch.float8_e4m3fn
+        return x.float() * 2
+
+    out, gradient = torch_with_gradients(widened_inside)(np.array([2.0, 3.0], jnp.float8_e4m3fn),
+                                                         np.ones(2, np.float32))
+    assert gradient.dtype == np.float32
+    np.testing.assert_array_equal(gradient, np.full(2, 2, np.float32))
+
+
+def test_a_torch_arms_narrow_integer_input_has_no_gradient():
+    """An int4 input, which NumPy holds as ml_dtypes' too, is no float: it enters as int32, its values
+    kept, and takes no gradient."""
+    from reference_error import torch_with_gradients
+
+    out, gradient = torch_with_gradients(lambda i: i.float() * 2)(np.array([1, -2], jnp.int4),
+                                                                   np.ones(2, np.float32))
+    assert gradient is None
+    np.testing.assert_array_equal(out, np.array([2.0, -4.0], np.float32))
+
+
+def test_a_torch_arms_bfloat16_output_comes_out_through_float32():
+    """A bfloat16 output of float32 inputs comes back as the float32 that holds it, its values exactly."""
+    from reference_error import torch_with_gradients
+
+    x = np.arange(4, dtype=np.float32) / 3
+    out, gradient = torch_with_gradients(lambda x: (x.bfloat16() * 3).bfloat16())(x, np.ones(4, np.float32))
+    assert out.dtype == gradient.dtype == np.float32
+    np.testing.assert_array_equal(out, (torch.from_numpy(x).bfloat16() * 3).float().numpy())
+    np.testing.assert_array_equal(gradient, np.full(4, 3, np.float32))
 
 
 def test_a_small_row_beside_large_ones_is_held_to_its_own_size():
