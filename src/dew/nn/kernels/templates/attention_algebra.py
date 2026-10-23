@@ -24,6 +24,7 @@ nothing (spans, a score hook) guards its maxima and denominators against an empt
 
 import dataclasses
 import functools
+import math
 from collections.abc import Callable
 from typing import NamedTuple
 
@@ -1069,6 +1070,16 @@ def _split(x: jax.Array) -> tuple[jax.Array, jax.Array]:
     return power2(x, -exponent), exponent
 
 
+def _static_split(x: float) -> tuple[np.float32, np.float32]:
+    """`_split` of a static fp32 value, taken in Python, so a kernel holds it as constants (a mainloop's
+    lowering may take no ceil or log2 of its own)."""
+    value = np.float32(x)
+    if value == 0:
+        return value, np.float32(0.0)
+    exponent = math.ceil(math.log2(abs(float(value))))
+    return np.float32(value * np.float32(2.0) ** -exponent), np.float32(exponent)
+
+
 def exponent_product(mantissa: jax.Array, exponent: jax.Array) -> jax.Array:
     """`mantissa * 2^exponent`, zero where the mantissa is, whatever the exponent (`power2` of a zero by an
     exponent past fp32's would multiply it by an infinite factor)."""
@@ -1105,7 +1116,7 @@ def dq_step(sums: DqSums, weights: jax.Array, cotangents: jax.Array, slopes, see
         # which holds every weight at its maximum: the weights over it sum to at most one, so their product
         # with the keys is a mean of them, finite wherever they are, and the scale is the mass's, its
         # mantissa and exponent apart (`dq_finish`). One product, no exponent a row.
-        scale_mantissa, scale_exponent = _split(jnp.float32(scale))
+        scale_mantissa, scale_exponent = _static_split(scale)
         keyed = sums.keyed + weights_product(weights * expand(inverse(prior), weights), key, dot)
         mantissa = jnp.full_like(sums.keyed_mass, scale_mantissa)
         return DqSums(dq, residual, mass, grads, weighed, keyed, mantissa,
@@ -1118,7 +1129,7 @@ def dq_step(sums: DqSums, weights: jax.Array, cotangents: jax.Array, slopes, see
     # not one an entry: an entry far below its row's largest is far below the correction's rounding.
     row_top = jnp.max(jnp.abs(pulled_weights), axis=-1)
     _, top_exponent = _split(row_top)
-    scale_mantissa, scale_exponent = _split(jnp.float32(scale))
+    scale_mantissa, scale_exponent = _static_split(scale)
     prior_mantissa, prior_exponent = _split(inverse(prior))
     tile_shift = jnp.where(row_top > 0, top_exponent + scale_exponent + prior_exponent, NO_SHIFT)
     keyed_shift = jnp.maximum(sums.keyed_shift, tile_shift)
@@ -1238,10 +1249,10 @@ def _fp16_scaled(x: jax.Array) -> tuple[jax.Array, jax.Array]:
 
 
 def cotangent_product(cotangents: jax.Array, operand: jax.Array,
-                      dot: Callable[[jax.Array, jax.Array], jax.Array], *, accurate: bool,
-                      transposed: bool = False) -> jax.Array:
-    """A tile's score cotangents `[bq, bk]` (fp32, scaled) times the call's queries or keys `operand` (its
-    transpose's product where `transposed`: dK's `dSᵀ Q`, else dQ's `dS K`), fp32. An fp32 operand takes the
+                      dot: Callable[[jax.Array, jax.Array], jax.Array], *, accurate: bool) -> jax.Array:
+    """A tile's score cotangents `[bq, bk]` (fp32, scaled) times the call's queries or keys `operand` by the
+    mainloop's `dot` (dQ's `dS K`, `dot(a, b) = a @ b`; dK's `dSᵀ Q`, its transposed product
+    `dot(a, b) = aᵀ @ b`, which a mainloop issues from where the tile lies), fp32. An fp32 operand takes the
     fp32 product. The fast form (`accurate` False) narrows bf16's cotangents to bf16 for one product,
     FlashAttention's. fp16's take the accurate form's two products in both forms: one fp16 product of
     cotangents that cancel against equal keys near fp16's largest leaves a gradient past it once it returns
@@ -1256,24 +1267,21 @@ def cotangent_product(cotangents: jax.Array, operand: jax.Array,
     leaves it (measured on the H100: 28% over one product, where a scaled bf16-and-fp16 pair cost 3x). An
     fp16 one takes two fp16 products at power-of-two scales that keep each part in its range: the
     cotangents' largest at 2^14, and what their rounding lost likewise, 21 bits."""
-    def oriented(x):
-        return x.T if transposed else x
-
     if operand.dtype == jnp.float32:
-        return dot(oriented(cotangents), operand)
+        return dot((cotangents), operand)
     if operand.dtype == jnp.bfloat16 and not accurate:
-        return dot(oriented(cotangents.astype(jnp.bfloat16)), operand)
+        return dot((cotangents.astype(jnp.bfloat16)), operand)
     if operand.dtype == jnp.bfloat16:
         high = cotangents.astype(jnp.bfloat16)
         rest = cotangents - high.astype(jnp.float32)
         middle = rest.astype(jnp.bfloat16)
         low = (rest - middle.astype(jnp.float32)).astype(jnp.bfloat16)
-        return (dot(oriented(high), operand) + dot(oriented(middle), operand)) + dot(oriented(low), operand)
+        return (dot((high), operand) + dot((middle), operand)) + dot((low), operand)
     scaled, high_exponent = _scaled(cotangents)
     high = scaled.astype(operand.dtype)
     low, low_exponent = _fp16_scaled(scaled - high.astype(jnp.float32))
-    return (power2(dot(oriented(high), operand), high_exponent)
-            + power2(dot(oriented(low), operand), low_exponent + high_exponent))
+    return (power2(dot((high), operand), high_exponent)
+            + power2(dot((low), operand), low_exponent + high_exponent))
 
 
 def weights_product(weights: jax.Array, operand: jax.Array,
@@ -1288,7 +1296,8 @@ def weights_product(weights: jax.Array, operand: jax.Array,
 
 def value_operands(exponentials: jax.Array, weights: jax.Array, dout: jax.Array,
                    total: jax.Array) -> tuple[jax.Array, jax.Array]:
-    """The operands `(a, b)` of a tile's share of dV, `aᵀ·b` `[block_k, Dv]` in fp32: the unnormalized
+    """The operands `(a, b)` of a tile's share of dV, `aᵀ·b` `[block_k, Dv]` in fp32 (a mainloop's
+    transposed product, `cotangent_product`'s for dK): the unnormalized
     weights `exp(s - m)` narrowed to the operands' dtype as the reference's forward rounds them, against
     each query's `dout / total` in fp32, the reference's derivative's own order, so no small weight or
     share is lost to normalizing first. bf16 alone takes FlashAttention's form, its normalized weights
@@ -1296,6 +1305,6 @@ def value_operands(exponentials: jax.Array, weights: jax.Array, dout: jax.Array,
     query's cotangents that cancel across a key still cancel, and a normalized weight below bf16's least
     subnormal (about 9e-41) is dropped, which only a cotangent past about 1e28 would make count."""
     if dout.dtype == jnp.bfloat16:
-        return weights.astype(dout.dtype).T, dout
+        return weights.astype(dout.dtype), dout
     scaled = dout.astype(jnp.float32) * expand(inverse(total), dout)
-    return exponentials.astype(dout.dtype).astype(jnp.float32).T, scaled
+    return exponentials.astype(dout.dtype).astype(jnp.float32), scaled
