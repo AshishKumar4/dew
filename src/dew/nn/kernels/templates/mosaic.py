@@ -20,6 +20,7 @@ streams each operand through a `Ring` whose counter runs across tiles, and takes
 import dataclasses
 import math
 
+import jax
 from jax import lax, numpy as jnp
 from jax._src.state import types as state_types
 from jax.experimental import pallas as pl
@@ -107,6 +108,50 @@ def staging(name: str, shaped) -> dict:
     shaped = list(shaped)
     return {f'{name}_smems': [plgpu.SMEM((2, *shape), gmem.dtype) for shape, gmem in shaped],
             f'{name}_barriers': [plgpu.Barrier(num_barriers=2) for _ in shaped]}
+
+
+def streamed(rings: tuple, views, lo, hi) -> None:
+    """A producer's loads of steps `lo` to `hi` into `rings`, each ring's step counted from `lo` and loaded
+    from its view of `views(step)`, then each ring drained."""
+    @pl.loop(lo, hi)
+    def _(index):
+        for ring, view in zip(rings, views(index), strict=True):
+            ring.load(index - lo, view)
+
+    for ring in rings:
+        ring.drain(hi - lo)
+
+
+def passed(rings: tuple, lo, hi, *, first: jax.Array | int = 0, between=None) -> None:
+    """A consumer's steps `lo` to `hi` of `rings` it reads none of (another consumer's), each ring's load
+    awaited and its slot released as a reading consumer's are (counted from `first`): a wait takes its
+    barrier's next phase, so every consumer waits on every load; `between()` after each step."""
+    @pl.loop(lo, hi)
+    def _(index):
+        for ring in rings:
+            ring.acquire(index - first)
+            ring.release(index - first)
+        if between is not None:
+            between()
+
+
+def loaded(copies) -> None:
+    """Each `(view, ref, barrier)` copied whole into shared memory, every copy issued before any is
+    awaited."""
+    for view, ref, barrier in copies:
+        plgpu.copy_gmem_to_smem(view, ref, barrier)
+    for _, _, barrier in copies:
+        plgpu.barrier_wait(barrier)
+
+
+def stored(parts, smem, views) -> None:
+    """Each of `parts` written whole to its view of `views` through the shared buffer `smem`, in turn, the
+    buffer reused once its copy is done."""
+    for part, view in zip(parts, views, strict=True):
+        smem[...] = part.astype(smem.dtype)
+        plgpu.commit_smem()
+        plgpu.copy_smem_to_gmem(smem, view)
+        plgpu.wait_smem_to_gmem(0)
 
 
 def load_fixed(views: list, refs: list, barriers: list, wg) -> None:
