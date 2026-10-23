@@ -67,6 +67,14 @@ def reference_variables(loaded, name):
     return objective(loaded, variables=values).init(jax.random.key(0))
 
 
+def in_float64(model):
+    """`model` computing in float64: its text decoder at float64 with the reference attention, and
+    its vision conditioner, where it has one, at float64."""
+    conditioner = model.conditioner and model.conditioner.clone(dtype=jnp.float64)
+    return model.clone(text=model.text.clone(dtype=jnp.float64, attention_impl="reference"),
+                       conditioner=conditioner)
+
+
 def trainer_update(obj, batch, run_key):
     """The trainer's first SGD update (rate 0.001) of a variables tree's params on one device, and the
     objective's own update under the step's draws (`example_fields`), compiled as one program, for an
@@ -289,8 +297,7 @@ def test_real_trainer_update_and_checkpoint_resume(source, tmp_path):
     # The objective's update is compiled as one program, as the trainer's is: XLA:CPU's compiled
     # gradient of this model sits 1.0 to 5.2 times further from float64 than the same ops run one by
     # one (measured per leaf, 2026-10-21), a gap of the compiler's and not of the trainer.
-    wide = objective(replace(loaded, model=loaded.model.clone(dtype=jnp.float64,
-                                                              attention_impl="reference")))
+    wide = objective(replace(loaded, model=in_float64(loaded.model)))
     assert_updates_as_the_objective(obj, batch, data, run_key, variables, wide)
     trainer = Trainer(obj, optax.sgd(0.001), key=run_key, checkpoints=Checkpoints(str(tmp_path / "run")))
     updated = trainer.fit(data, steps=1, checkpoint_every=1, log_every=1)
@@ -415,8 +422,7 @@ def test_image_sft_trainer_resume_publish_and_generate(image_source, tmp_path):
     stream = grain.MapDataset.source([batch]).repeat().to_iter_dataset()
     data = Loader(train=lambda partition: iter(stream), val=None, records=rows, batch=rows)
     run_key = jax.random.key(2)
-    wide = BlockDiffusionObjective(loaded.model.clone(dtype=jnp.float64, attention_impl="reference"),
-                                   prompt_length=8, variables=loaded.variables)
+    wide = BlockDiffusionObjective(in_float64(loaded.model), prompt_length=8, variables=loaded.variables)
     assert_updates_as_the_objective(obj, batch, data, run_key, variables, wide)
     checkpoints = Checkpoints(str(tmp_path / "run"))
     updated = Trainer(obj, optax.sgd(0.001), key=run_key, checkpoints=checkpoints).fit(
