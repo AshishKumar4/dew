@@ -576,17 +576,29 @@ def training_step(spec: Forward, carry: Carry, keys: Keys, rows: Callable[[jax.A
     """A training walk's carry after a tile `keys`: the anchor key and the split sums the backward reads
     (`split_accumulate`), `rows(key)` each row's value row at its key `[bq]`, the old anchor's where it
     moved."""
-    state, arg, own, others_total = carry
+    import os
+    probe = os.environ.get("DEW_TF", "")
+    state, arg, own, others_total, *kept = carry
     m, factor, p, value, held = _softmax(spec, state, keys)
     anchor = argmax(arg, keys.logits, keys.coords.k_pos)
     moved = anchor.peak > arg.peak
-    others, own_tile = anchor_split(narrow(p, value.dtype), keys.coords.k_pos == anchor.key[:, None])
+    at_anchor = keys.coords.k_pos == anchor.key[:, None]
+    others, own_tile = anchor_split(narrow(p, value.dtype), at_anchor)
     product = keys.dot(others, value)
-    acc, own, others_total = split_accumulate(state.acc, own, others_total, factor, moved, rows(arg.key),
+    if probe == "nogather":
+        old_value = jnp.zeros(state.acc.shape, value.dtype)
+    elif probe == "onehot":
+        old_value = kept[0]
+    else:
+        old_value = rows(arg.key)
+    acc, own, others_total = split_accumulate(state.acc, own, others_total, factor, moved, old_value,
                                               product, others, own_tile, held)
+    if probe == "onehot":
+        picked = keys.dot(at_anchor.astype(value.dtype), value).astype(value.dtype)
+        kept = [jnp.where(expand(moved, picked), picked, kept[0])]
     times = functools.partial(_times, keys.dot, value)
     state = stepped(state, m, factor, p, jnp.zeros_like(acc), held, times)
-    return state._replace(acc=acc), anchor, own, others_total
+    return state._replace(acc=acc), anchor, own, others_total, *kept
 
 
 def plain_walk(spec: Forward, lo, hi, keys_at: Callable[[jax.Array], Keys], start: Partial) -> Partial:
@@ -599,8 +611,13 @@ def training_walk(spec: Forward, lo, hi, keys_at: Callable[[jax.Array], Keys],
     """A training forward's walk (`plain_walk`), its carry also holding the anchor key and the split
     sums, from none (`training_step`)."""
     nothing = jnp.zeros(start.total.shape, jnp.float32)
-    return jax.lax.fori_loop(lo, hi, lambda index, carry: training_step(spec, carry, keys_at(index), rows),
-                             (start, no_argmax(start.total.shape[0]), nothing, nothing))
+    import os
+    extra = ()
+    if os.environ.get("DEW_TF") == "onehot":
+        extra = (jnp.zeros(start.acc.shape, jnp.bfloat16),)
+    carry = jax.lax.fori_loop(lo, hi, lambda index, carry: training_step(spec, carry, keys_at(index), rows),
+                              (start, no_argmax(start.total.shape[0]), nothing, nothing, *extra))
+    return carry[:4]
 
 
 def joined(carry: Carry, rows: Callable[[jax.Array], jax.Array]) -> Partial:
