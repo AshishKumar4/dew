@@ -836,9 +836,14 @@ rate is a leaf's: a site of L narrow leaves may fail an equally exact Dew L time
 The power this gives up is local: a narrow row whose error is between ROW_FACTOR and these factors
 times the reference's worst no longer fails by its row (the pooled ratio and the leaf's other rows still
 judge it), and a narrow false alarm no longer draws the second stage for the site's other leaves, which
-that stage exists to judge on real findings. Until check 2 gates, such an error passes check 1 wherever the
-pooled ratio does not see it; once it gates, each element is within its operation's certified bound
-(tests/op_certificates.py, the target)."""
+that stage exists to judge on real findings. Check 2 (tests/op_certificates.py `assert_certified`) holds
+each element within its own operation's certified bound where a site runs it, which resolves such an
+error at a pointwise step or a short sum: a sum of n terms is held within γ_n Σ|terms|, about n·u
+Σ|terms| for u the unit roundoff, of its exact value, so its reach in units of the sum's own last place grows
+with n and with the sum's cancellation (for standard normal terms, the smallest error it flagged in a
+review's measurement, the median over 200 sums, was 37 units in the sum's last place at 16 terms, 918 at
+128 and 22,966 at 1,024): past a few dozen terms of that kind an error in this window passes both checks
+wherever the pooled ratio does not see it."""
 
 
 PREVIOUS_TAILS = (5e-4, 5e-4)
