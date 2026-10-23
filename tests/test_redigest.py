@@ -218,13 +218,18 @@ def recorded(root: Path, source: str) -> None:
     ("def f(x):\n    return x\nprint(f(x=1))\n", "def f(y):\n    return y\nprint(f(y=1))\n", True),
     ("def f(x):\n    return x\nprint(f(x=1))\n", "def f(y):\n    return y\nprint(f(x=1))\n", False),
     ("def f(x):\n    return x\nprint(f(x=1))\n", "def f(x):\n    return x\nprint(f(y=1))\n", False),
+    ("def f(**options):\n    return options['x']\nprint(f(x=1))\n",
+     "def f(**options):\n    return options['x']\nprint(f(y=1))\n", False),
+    ("class C:\n    def __init__(self, x):\n        self.x = x\nprint(C(x=1).x)\n",
+     "class C:\n    def __init__(self, y):\n        self.x = y\nprint(C(y=1).x)\n", True),
 ], ids=["an alias renamed", "an alias added", "an alias that takes another import's name",
         "an imported name given an alias", "an alias added to a dotted import", "an alias taken from one",
         "two variables swapped",
         "a parameter renamed to another variable's name", "an f-string's conversion", "an f-string's label",
         "a keyword renamed beside a variable of its spelling",
         "a function's parameter and its keyword renamed",
-        "a function's parameter renamed and not its keyword", "a keyword renamed and not its parameter"])
+        "a function's parameter renamed and not its keyword", "a keyword renamed and not its parameter",
+        "a key a **kwargs collects renamed", "a class's parameter and its keyword renamed"])
 def test_the_programs_parsed_roles_decide_what_is_a_rename(site, before, after, kept):
     """A rename is read in the parsed program: an import's name and its binding apart, a parameter a
     variable and the keyword a call to its function passes it, an f-string's conversion and literal text
