@@ -130,6 +130,8 @@ class Engine:
         """Held for each step and each `reload`, which a kind serializes with its steps."""
         self._closed = False
         self._stopped = False
+        self._lifecycle = threading.Lock()
+        """Orders a start with the thread's own end, which clears what the start set."""
         self._thread: threading.Thread | None = None
         self._withdraw: Callable[[], None] | None = None
         self.failure: BaseException | None = None
@@ -137,14 +139,17 @@ class Engine:
             kind.arrived = self._arrived.set
 
     def start(self) -> None:
-        if self._thread is not None:
-            raise RuntimeError("the engine is serving already")
-        self._closed = self._stopped = False
-        self._thread = threading.Thread(target=self._serve, name=self.name, daemon=True)
-        self._thread.start()
-        # A step under way at exit runs to its end inside jaxlib, so exit waits for the thread rather
-        # than finalizing under it.
-        self._withdraw = stop_at_exit(self._thread, self._halt, timeout=None)
+        with self._lifecycle:
+            if self._thread is not None:
+                raise RuntimeError("the engine is serving already")
+            self._closed = self._stopped = False
+            thread = threading.Thread(target=self._serve, name=self.name, daemon=True)
+            # A step under way at exit runs to its end inside jaxlib, so exit waits for the thread rather
+            # than finalizing under it; the hook is in place before the thread runs a callback that
+            # could end it.
+            self._withdraw = stop_at_exit(thread, self._halt, timeout=None)
+            self._thread = thread
+            thread.start()
 
     def close(self) -> None:
         """Stop serving once what waits is answered."""
@@ -167,14 +172,20 @@ class Engine:
 
     def _ended(self) -> None:
         """Wake the thread and wait for it to end, unless this is the thread, whose own callback
-        closed it: it ends once its turn returns."""
+        closed it: it ends once its turn returns, and its end clears what its start set (`_left`)."""
         self._arrived.set()
-        thread, withdraw = self._thread, self._withdraw
-        if thread is None or thread is threading.current_thread() or withdraw is None:
-            return
-        thread.join()
-        withdraw()
-        self._thread = self._withdraw = None
+        with self._lifecycle:
+            thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join()
+
+    def _left(self) -> None:
+        """The thread's last act: the exit hook withdrawn and the engine free to start again, so
+        nothing keeps it or its kinds' weights alive past its end."""
+        with self._lifecycle:
+            withdraw, self._withdraw, self._thread = self._withdraw, None, None
+        if withdraw is not None:
+            withdraw()
 
     def _serve(self) -> None:
         try:
@@ -185,9 +196,10 @@ class Engine:
                 closed = self._closed
                 busy = [kind for kind in self.kinds if kind.busy]
                 for kind in busy:
-                    if self._stopped:
-                        return
                     with self._stepping:
+                        # Read under the lock: a stop while a reload held it ends the turn here.
+                        if self._stopped:
+                            return
                         kind.step()
                 if self._stopped or (closed and not busy):
                     return
@@ -198,3 +210,5 @@ class Engine:
             self.failure = failure
             for kind in self.kinds:
                 kind.fail(failure)
+        finally:
+            self._left()
