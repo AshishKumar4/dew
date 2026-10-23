@@ -311,13 +311,20 @@ def prefix() -> str:
     (jax/_src/cache_key.py), so a release of jax alone that lowers a program differently keys it
     anew, and one that does not (a post-release of Dew's patch stack) keeps every file's programs.
     The Python minor is among them because jax 0.11.2 names 3.14's stdlib zstd codec "zlib" in its
-    key (`dew.cache.default_compilation_cache_dir`)."""
+    key (`dew.cache.default_compilation_cache_dir`); and on the CPU, whose device kind is "cpu" on
+    every host, the host's CPU class (`dew._host.cpu_class`), as XLA:CPU compiles for the features
+    of the host that compiles: armada's hosts span classes, and a program from another class need not
+    link here, after which the process compiles nothing more."""
     import jax
     import jaxlib
 
+    from dew._host import cpu_class
+
     kind = "".join(character if character.isalnum() else "-" for character in jax.devices()[0].device_kind)
-    return f"jaxlib{jaxlib.__version__}/{jax.default_backend()}/" \
-           f"py{sys.version_info.major}.{sys.version_info.minor}/{kind}"
+    backend = jax.default_backend()
+    return f"jaxlib{jaxlib.__version__}/{backend}/" \
+           f"py{sys.version_info.major}.{sys.version_info.minor}/{kind}" + \
+           (f"/{cpu_class()}" if backend == "cpu" else "")
 
 
 def install(url: str, token: str) -> RemoteCache | None:

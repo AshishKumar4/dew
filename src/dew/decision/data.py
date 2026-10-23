@@ -6,14 +6,14 @@ import hashlib
 import json
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Literal
+from typing import ClassVar, Literal
 
 import numpy as np
 
 from dew import records
 from dew.data.lowering import prepared_rows
 from dew.data.pipeline import Configured, Dataset, Pipeline, Stage, mix
-from dew.data.sources.base import Read, ShardManifest, Source, _consumed, stated as store_facts
+from dew.data.sources.base import Read, Rows, Source, View, _consumed, stated as store_facts
 from dew.decision.questions import Choice, Question
 from dew.records import JSON, json_value, record
 
@@ -180,11 +180,12 @@ def _named_by(rows, label: str, names: Sequence[object]) -> bool:
 
 
 @dataclass(frozen=True)
-class _DecisionSource:
+class _DecisionSource(View[Source]):
     """A store's rows read as decisions: `table`'s options and the slots its rows need are inferred
     in a memory read, from the rows as the stages `before` the decisions make them (a rename, a
     relabelling); `mixture` is the facts a decision mixture states of itself (`mixture`)."""
 
+    rows: ClassVar[Rows] = "described"
     source: Source
     slots: Mapping[str, int] | None = None
     table: ParseTable | None = None
@@ -204,17 +205,8 @@ class _DecisionSource:
         consumed._facts.update(self._facts)
         return consumed
 
-    def label(self) -> str:
-        return self.source.label()
-
-    def describe(self) -> str:
-        return self.source.describe()
-
     def fingerprint(self) -> Mapping[str, object]:
         return {**self.source.fingerprint(), **({"descriptor": self.descriptor} if self.descriptor else {})}
-
-    def supports(self, read: Read) -> bool:
-        return self.source.supports(read)
 
     def records(self, read: Read):
         records = self.source.records(read)
@@ -287,11 +279,7 @@ class _DecisionSource:
                         **({"decision_options_by_value": True} if valued else {})}
         return {**stated, "slots": self._facts} if self._facts else stated
 
-    def lengths(self) -> np.ndarray | None:
-        return self.source.lengths()
 
-    def manifest(self) -> ShardManifest:
-        return self.source.manifest()
 
 
 def decisions(dataset: Dataset, *, options: Sequence[str] = (), text: str = "text", label: str = "label",

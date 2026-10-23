@@ -76,7 +76,8 @@ FACTOR = 2.0
 
 ROW_FACTOR = 4.0
 """How far Dew's worst row may sit from float64 against the reference's worst
-row (`rows_over`). An RMS over every entry averages a few wrong rows into a
+row (`rows_over`; check 1's at rows of one or two values is NARROW_FACTORS').
+An RMS over every entry averages a few wrong rows into a
 large tensor, so each comparison also holds Dew's worst row to the
 reference's. The worst of many rows is an extreme value, not an average,
 and parts further by chance: over the suite's 3,660 comparisons whose rows
@@ -555,17 +556,20 @@ class _Draws:
     """Each leaf's errors over a run of seeds: Dew's and the reference's mean squared error from
     float64 (seed by leaf), each seed's worst sized row over its size (Dew's, the reference's), each
     seed's count of rows of float64 zero where Dew is further from it than ROW_FACTOR times the
-    reference, and whether every value of the leaf was finite on every seed."""
+    reference, whether every value of the leaf was finite on every seed, and each leaf's row width (its
+    last axis's length, 0 for a leaf of no rows; NARROW_FACTORS)."""
     names: list[str]
     mine: np.ndarray
     theirs: np.ndarray
     worst: np.ndarray
     zero_rows: np.ndarray
     finite: np.ndarray
+    widths: tuple[int, ...]
 
     def joined(self, other: "_Draws") -> "_Draws":
         return _Draws(self.names, *(np.concatenate([getattr(self, field), getattr(other, field)])
-                                    for field in ("mine", "theirs", "worst", "zero_rows", "finite")))
+                                    for field in ("mine", "theirs", "worst", "zero_rows", "finite")),
+                      self.widths)
 
 
 SKETCH = 32
@@ -669,7 +673,7 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
     its rows of float64 zero are the draw's own order's."""
     if orders is not None and getattr(reference_fn, "recorded", False):
         raise ValueError("a recorded reference holds its recorded draws alone, never another order of them")
-    mine, theirs, worst, zero_rows, finite, names = [], [], [], [], [], None
+    mine, theirs, worst, zero_rows, finite, names, widths = [], [], [], [], [], None, None
 
     def truth_of(inputs):
         with jax.enable_x64(new_val=True):
@@ -694,6 +698,8 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
             dew = dew_fn(*mine_at)
             names = names or [jax.tree_util.keystr(path)
                               for path, _ in jax.tree_util.tree_leaves_with_path(dew)]
+            widths = widths or tuple(int(np.shape(leaf)[-1]) if np.ndim(leaf) >= 2 else 0
+                                     for leaf in jax.tree.leaves(dew))
             evidence = _evidence(dew, reference_fn(*theirs_at), truth, their_truth)
             row = evidence if row is None else [
                 (first[0], first[1], float(np.fmax(first[2], other[2])), float(np.fmax(first[3], other[3])),
@@ -704,7 +710,7 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
         zero_rows.append([entry[4] for entry in row])
         finite.append([entry[5] for entry in row])
     return _Draws(names, np.asarray(mine), np.asarray(theirs), np.asarray(worst).reshape(len(mine), -1, 2),
-                  np.asarray(zero_rows), np.asarray(finite))
+                  np.asarray(zero_rows), np.asarray(finite), widths)
 
 
 def _evidence(dew, reference, truth, their_truth) -> list[tuple]:
@@ -801,13 +807,43 @@ def _judgement(draws: _Draws, label: str, tails: tuple[float, float] = (LOWER_TA
                 over.append(f"{leaf}: dew's RMS error from float64 is {ratio:.3f} times the reference's over "
                             f"{count} seeds, interval [{low:.3f}, {high:.3f}] (allowed {PARITY})")
         my_row, their_row = float(np.max(draws.worst[:, index, 0])), float(np.max(draws.worst[:, index, 1]))
-        if not within(my_row, ROW_FACTOR * their_row):
+        factor = NARROW_FACTORS.get(draws.widths[index], ROW_FACTOR)
+        if not within(my_row, factor * their_row):
             over.append(f"{leaf}: the worst row over {count} seeds is {my_row:.3e} from float64 over its "
-                        f"size, the reference's {their_row:.3e}, allowed {ROW_FACTOR * their_row:.3e}")
+                        f"size, the reference's {their_row:.3e}, allowed {factor * their_row:.3e} ({factor} "
+                        f"times it)")
         if draws.zero_rows[:, index].any():
             over.append(f"{leaf}: {int(draws.zero_rows[:, index].sum())} rows of float64 zero over {count} "
                         f"seeds are further from it than ROW_FACTOR times the reference's own")
     return over, unresolved
+
+
+NARROW_FACTORS = {1: 90.0, 2: 11.0}
+"""The worst-row rule's factor at rows of one or two values, in place of ROW_FACTOR. At either width
+ROW_FACTOR fails an equally exact Dew far more often than LOWER_TAIL as sites run check 1 (1.5e-2 of
+runs at one value a row, 1.5e-3 at two): a row of few values is sized by a few float64 values, which sit
+near zero far more often than a wide row's RMS does, and the worst row over a site's rows and seeds is
+the row whose truth is smallest. Each factor sits above the 1 - 1e-4 quantile of the factor that would
+fail equally exact pairs at both stages, both arms on one truth (`tools/gate_null_runs.py --rows`, its
+`row_controls`, through `_staged` itself), at every layout measured, 16 to 4,096 rows a draw and 8 to 512
+declared seeds: that quantile is 40 to 53 at one value and 7 to 8 at two (10,000 to 600,000 runs a
+layout), so 90 and 11 stand about 1.7 and 1.4 times above it, at measured rates near 2e-5 and at most
+3.3e-5; 28,000 fresh runs at the 16-row and 256-row layouts bound them within LOWER_TAIL at 99.9% (at
+most 4.7e-4). Rows of three values keep ROW_FACTOR at a measured rate of at most 2.9e-4 over 16 to 2,048
+rows, a point rate, bounded within LOWER_TAIL at 256 rows and 8 seeds (80,000 runs) and not at 2,048. The
+rate is a leaf's: a site of L narrow leaves may fail an equally exact Dew L times as often.
+
+The power this gives up is local: a narrow row whose error is between ROW_FACTOR and these factors
+times the reference's worst no longer fails by its row (the pooled ratio and the leaf's other rows still
+judge it), and a narrow false alarm no longer draws the second stage for the site's other leaves, which
+that stage exists to judge on real findings. Check 2 (tests/certified.py `assert_certified`) holds
+each element within its own operation's certified bound where a site runs it, which resolves such an
+error at a pointwise step or a short sum: a sum of n terms is held within γ_n Σ|terms|, about n·u
+Σ|terms| for u the unit roundoff, of its exact value, so its reach in units of the sum's own last place grows
+with n and with the sum's cancellation (for standard normal terms, the smallest error it flagged in a
+review's measurement, the median over 200 sums, was 37 units in the sum's last place at 16 terms, 918 at
+128 and 22,966 at 1,024): past a few dozen terms of that kind an error in this window passes both checks
+wherever the pooled ratio does not see it."""
 
 
 PREVIOUS_TAILS = (5e-4, 5e-4)
@@ -834,11 +870,12 @@ def _staged(drawn, seeds: int, label: str, *, two_stage: bool = True) -> tuple[l
 
 
 STAGES_LOG = "DEW_CHECK1_STAGES"
-"""The environment variable naming a file each check-1 judgement appends its stage and verdict to, one
-JSON line (`_logged`): what a train reads every site's stage-two rate from, every attempt counted."""
+"""The environment variable naming a file each check-1 judgement appends its stage, its verdict and its
+leaves of narrow rows (NARROW_FACTORS) to, one JSON line (`_logged`): what a train reads every site's
+stage-two rate from, every attempt counted, and which sites' local errors rest on check 2."""
 
 
-def _logged(label: str, stage: int, verdict: str) -> None:
+def _logged(label: str, stage: int, verdict: str, narrow_leaves: list[str]) -> None:
     import json
     import os
 
@@ -846,16 +883,18 @@ def _logged(label: str, stage: int, verdict: str) -> None:
     if path:
         with open(path, "a", encoding="utf-8") as log:
             log.write(json.dumps({"site": os.environ.get("PYTEST_CURRENT_TEST", "").rsplit(" (", 1)[0],
-                                  "label": label, "stage": stage, "verdict": verdict}) + "\n")
+                                  "label": label, "stage": stage, "verdict": verdict,
+                                  "narrow_leaves": narrow_leaves}) + "\n")
 
 
 def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn=None,
                     orders=None) -> None:
     """Check 1 of the gate: on par. Each leaf's RMS error from float64,
     pooled over the site's declared seeds, within PARITY times the reference's, and its worst row over
-    those seeds within ROW_FACTOR times the reference's worst; each row of float64 zero (below RESOLUTION
-    of its leaf where a live reference does not measure it, `_paired`) no further from it than
-    ROW_FACTOR times the reference on that row; every value finite.
+    those seeds within ROW_FACTOR times the reference's worst (NARROW_FACTORS' factor at rows of one or
+    two values); each row of float64 zero (below RESOLUTION of its leaf where a live reference does not
+    measure it, `_paired`) no further from it than ROW_FACTOR times the reference on that row; every
+    value finite.
 
     `draw(seed)` returns the inputs of one draw, the same for a seed on every run; `dew_fn(*inputs)`
     and `reference_fn(*inputs)` return the same tree, and truth is `reference_fn` on the inputs
@@ -890,14 +929,20 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
 
     This is an engineering gate, deterministic and reproducible, not a guarantee against every error
     law: "never wrong" is check 2's, each element within its operation's certified bound
-    (tests/op_certificates.py)."""
+    (tests/certified.py)."""
     if seeds < FEWEST_SEEDS:
         raise Inconclusive(f"{label}: {seeds} seeds cannot be judged; check 1 takes at least {FEWEST_SEEDS} "
                            f"(`seeds_for`)")
-    over, unresolved, stage = _staged(
-        lambda start, stop: _drawn(dew_fn, reference_fn, draw, range(start, stop), truth_fn, orders=orders),
-        seeds, label)
-    _logged(label, stage, _verdict(over, unresolved))
+    narrow_leaves: list[str] = []
+
+    def drawn(start, stop):
+        draws = _drawn(dew_fn, reference_fn, draw, range(start, stop), truth_fn, orders=orders)
+        narrow_leaves[:] = [name for name, width in zip(draws.names, draws.widths, strict=True)
+                            if width in NARROW_FACTORS]
+        return draws
+
+    over, unresolved, stage = _staged(drawn, seeds, label)
+    _logged(label, stage, _verdict(over, unresolved), narrow_leaves)
     if over:
         raise AssertionError("\n".join(over + unresolved))
     if unresolved:
