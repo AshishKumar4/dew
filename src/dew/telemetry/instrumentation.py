@@ -35,10 +35,11 @@ def _cache_event(event: str, **metadata) -> None:
 
 
 class Compiles:
-    """Counts the programs jitted functions named `name` need while it is open, each compiled or
-    fetched from the persistent compilation cache, as JAX reports them (`jax.monitoring`'s backend
-    compile event, which names a function `jit(<name>)`): what a warm-up costs, or a compile a
-    measured run should not have paid. JAX's events have one listener owner, this module.
+    """Counts the programs jitted functions named `name` need while it is open (every function's with
+    None), each compiled or fetched from the persistent compilation cache, as JAX reports them
+    (`jax.monitoring`'s backend compile event, which names a function `jit(<name>)`): what a warm-up
+    costs, or a compile a measured run should not have paid. JAX's events have one listener owner,
+    this module.
 
         with Compiles("_stepped") as compiles:
             server.run()
@@ -47,8 +48,8 @@ class Compiles:
 
     EVENT = "/jax/core/compile/backend_compile_duration"
 
-    def __init__(self, name: str) -> None:
-        self.name = f"jit({name})"
+    def __init__(self, name: str | None) -> None:
+        self.name = None if name is None else f"jit({name})"
         self.seconds: list[float] = []
         """Each program's seconds, in the order they were needed."""
 
@@ -64,7 +65,7 @@ class Compiles:
         jax.monitoring.unregister_event_duration_listener(self._heard)
 
     def _heard(self, event: str, duration_secs: float, **metadata: str | int) -> None:
-        if event == self.EVENT and metadata.get("fun_name") == self.name:
+        if event == self.EVENT and self.name in (None, metadata.get("fun_name")):
             self.seconds.append(duration_secs)
 
 

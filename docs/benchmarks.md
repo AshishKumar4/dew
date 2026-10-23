@@ -11,7 +11,8 @@ The FLOP counts come from the optimized HLO of the compiled executable, through 
 | `GFLOP/step` | FLOPs of the compiled step, counted from the optimized HLO. |
 | `util` | Measured FLOPs over step time and device peak (`train/hfu`). |
 | `mfu` | The objective's training FLOPs over step time and the mesh's peak (`train/mfu`); `n/a` where the model has no count or the device no peak. Tables recorded before 2026-10-16 lack it. |
-| `peak GiB` | Peak device memory of the process. |
+| `peak GiB` | Peak device memory, measured: each device's allocator high-water over the case's run, native workspaces included, read in a process of the case's own that loads the step from a compilation cache and compiles nothing; the largest device's. Tables recorded before `plan GiB` was a column read the high-water in the process that compiled the step, so their peak can include the compile's own. |
+| `plan GiB` | The bytes XLA planned for the step: its arguments, outputs and temporaries, without native workspaces. |
 | `compile s` | Time to compile the step. |
 
 ## Small preset on one RTX 4080, 2026-09-02
