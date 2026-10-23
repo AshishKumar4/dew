@@ -163,8 +163,6 @@ def test_capture_does_not_retain_donated_arrays(tmp_path, native_reports):
 
 
 @pytest.mark.mesh(devices=2)
-@pytest.mark.skipif(jax.default_backend() != "cpu",
-                    reason="only the CPU leaves a donated replicated array live with one buffer")
 def test_a_capture_drains_past_a_live_array_with_a_deleted_buffer(tmp_path, native_reports):
     """An array can list as live with one of its buffers deleted, and waiting on it raises: one whose
     shard's buffer its holder deleted (on jax 0.11.2, too, one a donation consumed but a host read kept

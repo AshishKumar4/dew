@@ -116,19 +116,15 @@ def oracle_chunk(query, key, value, g, beta, state, chunk_size=4):
     return jnp.swapaxes(core, 1, 2), s
 
 
-def with_gradients(rule, inputs: dict) -> dict:
+def rule_gradients(rule, inputs: dict) -> dict:
     """`rule`'s output and final state on `inputs`' operands, and the six operands' gradients of their
     sum against `inputs`' cotangents, by name, in JAX at the operands' dtype."""
-    import jax
     import jax.numpy as jnp
+    from reference_error import with_gradients
 
-    def loss(*operands):
-        out, state = rule(*operands)
-        value = jnp.sum(out * inputs["output_cotangent"]) + jnp.sum(state * inputs["state_cotangent"])
-        return value, (out, state)
-
-    (_, (out, state)), gradients = jax.value_and_grad(loss, tuple(range(len(INPUTS))), has_aux=True)(
-        *(jnp.asarray(inputs[name]) for name in INPUTS))
+    (out, state), *gradients = with_gradients(rule)(
+        *(jnp.asarray(inputs[name]) for name in INPUTS),
+        (jnp.asarray(inputs["output_cotangent"]), jnp.asarray(inputs["state_cotangent"])))
     return {"output": out, "state": state} | {f"grad/{name}": grad for name, grad in zip(INPUTS, gradients,
                                                                                          strict=True)}
 
@@ -154,17 +150,22 @@ def torch_rule(reference: dict, rule: str, inputs: dict, dtype) -> dict:
     """The published `rule` on `inputs` in torch at `dtype`: its output, final state and the six
     operand gradients, by name."""
     import torch
+    from reference_error import torch_with_gradients
 
-    operands = [torch.tensor(inputs[name], dtype=dtype, requires_grad=True) for name in INPUTS]
     options = {"chunk_size": 4} if rule == "chunk" else {}
-    out, state = reference[f"{rule}_kimi_delta_attention"](
-        *operands[:5], initial_state=operands[5], output_final_state=True, use_qk_l2norm_in_kernel=True,
-        **options)
-    loss = (out * torch.tensor(inputs["output_cotangent"], dtype=dtype)).sum()
-    loss = loss + (state * torch.tensor(inputs["state_cotangent"], dtype=dtype)).sum()
-    gradients = torch.autograd.grad(loss, operands)
-    return {"output": out.detach().numpy(), "state": state.detach().numpy()} | {
-        f"grad/{name}": grad.numpy() for name, grad in zip(INPUTS, gradients, strict=True)}
+
+    def published(*operands):
+        return reference[f"{rule}_kimi_delta_attention"](
+            *operands[:5], initial_state=operands[5], output_final_state=True, use_qk_l2norm_in_kernel=True,
+            **options)
+
+    # The draw's cotangents, pulled back through the gate's torch twin as the JAX arms pull them back.
+    host = torch.empty(0, dtype=dtype).numpy().dtype
+    (out, state), *gradients = torch_with_gradients(published)(
+        *(np.asarray(inputs[name], host) for name in INPUTS),
+        (inputs["output_cotangent"], inputs["state_cotangent"]))
+    return {"output": out, "state": state} | {
+        f"grad/{name}": grad for name, grad in zip(INPUTS, gradients, strict=True)}
 
 
 def main(destination: Path) -> None:
@@ -185,7 +186,7 @@ def main(destination: Path) -> None:
                 return found, truth
 
             def proxy(inputs, rule=rule):
-                return with_gradients(oracle_rule(rule), inputs)
+                return rule_gradients(oracle_rule(rule), inputs)
 
             recorded.update(record_case(f"{rule} rule", rule_inputs, evaluate, proxy, truth_proxy=proxy,
                                         store_inputs=False, summary=True))
