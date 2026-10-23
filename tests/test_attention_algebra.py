@@ -590,6 +590,21 @@ def test_a_querys_gradient_with_a_large_refinement_at_a_small_scale_is_finite():
         assert np.isfinite(np.asarray(grads.query)).all(), name
 
 
+@pytest.mark.parametrize("scale", [0.0, 2.0 ** -200], ids=["zero", "below fp32's range"])
+def test_a_padded_call_at_a_scale_fp32_takes_to_zero_weighs_its_keys_alike(scale):
+    """fp32, one query over one key padded to a tile (so masked columns), at a scale fp32 holds as 0: every
+    logit is 0, the one key weighs 1 and the output is its value (2), in both template mainloops. The mask is
+    taken where the factor, rounded to fp32 as the kernels multiply by it, is nonzero on the products before
+    the scale (`algebra.logits_of`); masking them at an infinity a zero factor takes to NaN would poison the
+    row."""
+    query = jnp.zeros((1, 1, 1, 16), jnp.float32)
+    key = jnp.ones((1, 1, 1, 16), jnp.float32)
+    value = jnp.full((1, 1, 1, 16), 2.0, jnp.float32)
+    spans = template.spans(1, 1, 1)
+    for found in forwards(query, key, value, spans, scale=scale):
+        np.testing.assert_array_equal(np.asarray(found), 2.0)
+
+
 def test_a_querys_gradient_at_a_subnormal_scale_is_finite():
     """The accurate form at a scale of 2^-128, below fp32's least normal: a query of zeros over two equal keys
     and values of 1 under a cotangent of 1, whose score cotangents, dQ and the reference's are all 0. The
