@@ -80,9 +80,10 @@ keys in two stages, the fastest of 64 or 128 queries over 64 or 128 keys in two 
 def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans, hooks: Hooks | None = None,
             *, scale: float | None = None, natural: bool = NATURAL, tiles: Tiles | None = None,
             family: mosaic.Family | None = None, interpret: bool = False) -> jax.Array:
-    """The template's forward on this mainloop: `query` `[B, Q, H, D]` over `key` and `value` `[B, K, Hk, D]`
-    and the keys `spans` leaves each query under `hooks`, as `dew.nn.kernels.templates.attention.reference`
-    computes it, by `family`'s bundle (the device's, `family_of`) at `tiles` (its default, `DEFAULTS`).
+    """The template's forward on this mainloop: `query` `[B, Q, H, D]` over `key` `[B, K, Hk, D]` and `value`
+    `[B, K, Hk, Dv]`, and the keys `spans` leaves each query under `hooks`, as
+    `dew.nn.kernels.templates.attention.reference` computes it, by `family`'s bundle (the device's,
+    `family_of`) at `tiles` (its default, `DEFAULTS`).
     `natural` keeps the logits natural (`algebra.Forward.base2`); `interpret` runs it on the CPU (Mosaic
     GPU's interpret mode)."""
     family = family_of(query.dtype) if family is None else family
@@ -91,8 +92,6 @@ def forward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans,
     if jnp.dtype(query.dtype) not in (jnp.dtype(jnp.bfloat16), jnp.dtype(jnp.float16)):
         raise NotImplementedError(f"the Mosaic mainloop takes 16-bit operands, not {jnp.dtype(query.dtype)}")
     width, value_width = query.shape[3], value.shape[3]
-    if width != value_width:
-        raise NotImplementedError("the Mosaic mainloop's output reuses the query's stage: equal head widths")
     block = max(family.consumers * tiles.block_q, tiles.block_k)
     call = padded_call(query, key, value, spans, hooks, block)
     spec = algebra.Forward(spans.form, spans.keys, ids=spans.query_ids is not None,
@@ -307,13 +306,13 @@ def _coords(family: mosaic.Family, spans: _Spans | None, row, first, k_first, sh
     return algebra.Coords(q_pos, k_pos, bounds, ids)
 
 
-def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_view, q_smem, q_loaded, streams,
-              turn, streamed: tuple, first, spans: _Spans | None, hooked: _Hooked, place: tuple, *,
-              hooks: Hooks, interpret: bool):
+def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_view, q_smem, q_loaded,
+              out_smem, streams, turn, streamed: tuple, first, spans: _Spans | None, hooked: _Hooked,
+              place: tuple, *, hooks: Hooks, interpret: bool):
     """A consumer's query block (batch row and head `place`): its walk of the key tiles it reads through the
     family's streams (`algebra.plain_step` a step) from the hooks' initial state, the score hook on each
     tile, passing those of the program's `streamed` range its partner alone reads, then its output under the
-    output hook stored through its query stage."""
+    output hook stored through `out_smem`, the query's stage where the widths agree."""
     row, head = place
     family, tiles = program.family, program.tiles
     shape = (tiles.block_q, tiles.block_k)
@@ -321,7 +320,8 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
     family.loaded(((q_view, q_smem, q_loaded),))
     q = family.held(q_smem)
     q_pos, columns = first + family.iota(shape, 0), family.iota(shape, 1)
-    width = q_smem.shape[-1]
+    # The output's sums are as wide as its stage, the values' width whatever the query's.
+    value_width = out_smem.shape[-1]
     # The weighted values' running sums live in the family's accumulator (`Family.walk`), from the initial
     # state's where there is one; the walk carries the maxima and denominators, the state's `acc` an empty
     # place the algebra passes through (`algebra.Keys.accumulate`), a constant no loop may carry.
@@ -368,7 +368,7 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
         state = algebra.plain_step(spec, state, algebra.Keys(coords, logits, load, dot, accumulate, products))
         return (state.m, state.total), tuple(held)
 
-    rows, (acc,) = family.walk(streams, ((step, lo, hi),), rows, ((tiles.block_q, width),), interpret,
+    rows, (acc,) = family.walk(streams, ((step, lo, hi),), rows, ((tiles.block_q, value_width),), interpret,
                                first=streamed[0], initial=initial)
     state = algebra.Partial(acc, *rows)
     # The slots past this block's last tile (a causal block whose diagonal ends first) its partner reads.
@@ -378,7 +378,7 @@ def _consumer(program: _Program, spec: algebra.Forward, consumer, q_view, out_vi
                        for ref, param in zip(hooked.output, hooks.output_params, strict=True))
     out, _, _ = algebra.finish(spec, state, initial=hooked.initial is not None, output_mod=hooks.output_mod,
                                output_params=out_params)
-    family.stored((out,), (out_view,), smem=q_smem)
+    family.stored((out,), (out_view,), smem=out_smem)
 
 
 def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, *, spec: algebra.Forward, hooks: Hooks,
@@ -391,9 +391,17 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, *, spec: a
     steps = keys_count // block_k
     # No more stages than key tiles: a slot past them would load past the keys.
     program = _Program(family, tiles, steps, min(tiles.stages, steps), spec.keys, spec.form == "causal")
+    # The output stores through the query's stage where the two are as wide (its rows are read before the
+    # store). Else it takes a stage of its own, which the block's shared memory holds beside the query's and
+    # the key and value rings. At DEFAULTS and D 128 the query's stage and the key ring take 96 KiB, and each
+    # column of the value takes 768 bytes more (the value ring's two stages and the output's rows of both
+    # consumers), so the widest value a Hopper block's 227 KiB (`generation.shared_budget`) holds is 128
+    # columns (192 KiB). At 256 columns (288 KiB), 64-key tiles (`FORM_TILES`) hold it in 192 KiB.
+    reuse = value.shape[-1] == width
 
     def body(q_ref, k_ref, v_ref, *refs, streams):
-        read, (out_ref, q_smem, q_loaded, schedule) = refs[:len(leaves)], refs[len(leaves):]
+        read, (out_ref, q_smem, q_loaded, schedule, *own) = refs[:len(leaves)], refs[len(leaves):]
+        out_smem = q_smem if reuse else own[0]
         spans_of, hooked_of = treedef.unflatten(read)
         row, head = lax.axis_index("batch"), lax.axis_index("heads")
         views = _views_of({"keys": k_ref, "values": v_ref}, row, lax.div(head, group), block_k)
@@ -413,8 +421,8 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, *, spec: a
             first = pair_first + index * block_q
             rows = (row, pl.ds(first, block_q), head)
             _consumer(program, spec, index, q_ref.at[rows], out_ref.at[rows], q_smem.at[index],
-                      q_loaded.at[index], streams, turn, streamed, first, spans_of, hooked_of, (row, head),
-                      hooks=hooks, interpret=interpret)
+                      q_loaded.at[index], out_smem.at[index], streams, turn, streamed, first, spans_of,
+                      hooked_of, (row, head), hooks=hooks, interpret=interpret)
 
         def producer():
             family.stream(streams, views, *streamed)
@@ -430,6 +438,7 @@ def _launch(query, key, value, spans: _Spans | None, hooked: _Hooked, *, spec: a
             functools.partial(body, *refs),
             plgpu.SMEM((consumers, block_q, width), query.dtype),
             plgpu.Barrier(num_barriers=consumers), plgpu.Barrier(num_arrivals=consumers),
+            *(() if reuse else (plgpu.SMEM((consumers, block_q, value.shape[-1]), query.dtype),)),
             streams=family.streams(blocks, program.stages, consumers))
 
     return family.kernel(entry, out_type=jax.ShapeDtypeStruct((batch, queries, heads, value.shape[-1]),
