@@ -335,8 +335,10 @@ def test_padding_repro_greedy_and_seeded_reproducibility(sampling, name):
                                                     if sampling.temperature else {})
         return run
 
+    wide = scored(model, params, sampling, "float64")
+
     def full(prompt, key, tokens):
-        return scored(model, params, sampling, "float64")(prompt, np.full(ROWS, 2), key, tokens)
+        return wide(prompt, np.full(ROWS, 2), key, tokens)
 
     label = f"{name} padded generation"
     assert_as_exact(recorded(padded), recorded(unpadded), draw, label, seeds=SEEDS[label], truth_fn=full)
@@ -530,8 +532,10 @@ def test_padding_slots_do_not_consume_cache_capacity(kind):
         result = generate(model, params, prompt, steps, key=jax.random.key(1), sampling=greedy)
         return {"raw": result.raw_log_probs}
 
+    wide = scored(model, params, greedy, "float64")
+
     def full(prompt, tokens):
-        return scored(model, params, greedy, "float64")(prompt, np.full(ROWS, 2), None, tokens)
+        return wide(prompt, np.full(ROWS, 2), None, tokens)
 
     label = f"{kind} cache capacity"
     assert_as_exact(behind_padding, unpadded, draw, label, seeds=SEEDS[label], truth_fn=full)
