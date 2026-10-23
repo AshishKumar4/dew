@@ -47,6 +47,7 @@ from dew.nn.attention import scaled_dot_product_attention
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.inputs import MixerCall
 from dew.nn.mla import MultiHeadLatentAttention
+from dew.nn.precision import FP32_SUMS
 from dew.nn.rope import YarnScaling, rotary_freqs, yarn_attention_factor, yarn_inv_freq, yarn_query_scale
 from dew.objectives.lm import LMObjective
 from dew.training import Layout, MeshSpec, Trainer
@@ -395,16 +396,17 @@ def test_the_fused_path_returns_the_value_columns_and_not_the_padding():
         return tuple(jnp.asarray(rng.standard_normal(shape), jnp.float32)
                      for shape in ((2, 7, 4, 16), (2, 7, 4, 16), (2, 7, 4, 8)))
 
-    # In bf16 the fused kernel runs on every backend; a CPU's fp32 call takes the reference path,
-    # whose products sum as the CPU's policy does (`dew.nn.precision`).
+    # A CPU runs the fused kernel where a scope stands for an accelerator (`FP32_SUMS`); otherwise
+    # its calls take the reference path (`dew.nn.precision`).
     query, key, value = (x.astype(jnp.bfloat16) for x in draw(0))
     fused = functools.partial(scaled_dot_product_attention, query, key, implementation="xla", causal=True)
-    narrow = fused(value)
-    assert narrow.shape == (2, 7, 4, 8)
-    assert jnp.array_equal(
-        narrow, fused(jnp.pad(value, ((0, 0), (0, 0), (0, 0), (0, 8))))[..., :8])
-    with pytest.raises(ValueError):
-        fused(jnp.pad(value, ((0, 0), (0, 0), (0, 0), (0, 16))))
+    with jax.default_matmul_precision(FP32_SUMS):
+        narrow = fused(value)
+        assert narrow.shape == (2, 7, 4, 8)
+        assert jnp.array_equal(
+            narrow, fused(jnp.pad(value, ((0, 0), (0, 0), (0, 0), (0, 8))))[..., :8])
+        with pytest.raises(ValueError):
+            fused(jnp.pad(value, ((0, 0), (0, 0), (0, 0), (0, 16))))
     xla = functools.partial(scaled_dot_product_attention, implementation="xla", causal=True)
     assert_as_exact(jax.jit(xla), jax.jit(functools.partial(scaled_dot_product_attention, causal=True)), draw,
                     "narrow value columns", seeds=SEEDS["value columns"])
