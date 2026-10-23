@@ -76,8 +76,9 @@ class Tiles:
         if self.warpgroups not in (1, 2) or self.cluster not in (1, 2) or paired:
             raise ValueError(f"{self}: one warpgroup alone, or two in a cluster of one or two "
                              "multiprocessors")
-        if self.warpgroups == 2 and (self.block_n % 2 or self.block_m % 2):
-            raise ValueError(f"{self}: two warpgroups halve the tile's columns and rows")
+        if self.warpgroups == 2 and (self.block_m % 128 or self.block_n > 256):
+            # Each consumer's half of the rows is one warpgroup MMA's, 64 rows by at most 256 columns.
+            raise ValueError(f"{self}: two warpgroups halve the tile's rows into warpgroup MMAs")
         if self.warpgroups == 2 and self.stages < 2:
             # A stage is released a step late (an MMA in flight), so one stage would wait on itself.
             raise ValueError(f"{self}: two warpgroups stream at least two stages")
@@ -145,7 +146,7 @@ def gmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles,
 
 Dew: `prologue(tile, *side_tiles)` transforms each `[block_m, block_k]` tile of `lhs` (a cooperative
     tile's consumer, half its rows) in its shared memory stage before the warpgroup MMA reads it;
-    `epilogue(acc, *side_tiles)` each fp32 accumulator tile (a cooperative consumer's, half its columns),
+    `epilogue(acc, *side_tiles)` each fp32 accumulator tile (a cooperative consumer's, half its rows),
     returning one output or a tuple of them (`out_dtypes`). A side operand's dimensions follow the launch
     axes its `*_axes` entry names, 'rows' and 'depth' for the prologue's, 'rows' and 'columns' for the
     epilogue's, each brought to shared memory by TMA."""
@@ -263,20 +264,19 @@ def _gmm_alone(lhs, rhs, lengths, shape: tuple, *, tiles: Tiles, transpose_rhs: 
 
 
 def _gmm_cooperative(lhs, rhs, lengths, shape: tuple, *, tiles: Tiles, transpose_rhs: bool, dtypes: tuple,
-                     multiprocessors: int, interpret, hooks: tuple, sides: tuple,
-                     row_split: bool = False) -> tuple:
-    """Dew: `gmm` at a tile two consumer warpgroups compute (half its columns each) beside a producer
-    issuing the loads (as `hopper_matmul_mgpu`); `tiles.cluster` 2 pairs two row tiles of one group, which
-    load each matrix block once, multicast. A prologue's consumers each rewrite half the rows' shared stage,
-    then meet. `lhs` is padded, `lengths` ends with the unrouted rows' group (`gmm`)."""
+                     multiprocessors: int, interpret, hooks: tuple, sides: tuple) -> tuple:
+    """Dew: `gmm` at a tile two consumer warpgroups compute beside a producer issuing the loads (as
+    `hopper_matmul_mgpu`), each half its rows by all its columns, one MMA a step (CUTLASS's cooperative
+    split: it ran every H100 scoreboard row 2-7% faster than halving the columns into two MMAs);
+    `tiles.cluster` 2 pairs two row tiles of one group, which load each matrix block once, multicast. A
+    prologue's consumers each rewrite their own half of the rows' shared stage. `lhs` is padded,
+    `lengths` ends with the unrouted rows' group (`gmm`)."""
     prologue, prologue_axes, epilogue, epilogue_axes = hooks
     prologue_operands, epilogue_operands = sides
     m, n, k, g = shape
     block_m, block_n, block_k, pair = tiles.block_m, tiles.block_n, tiles.block_k, tiles.cluster
-    half, rows_half = block_n // 2, block_m // 2
-    # Each consumer's part of the tile: half its columns, or with `row_split` half its rows (CUTLASS's
-    # cooperative split, one m64n256 MMA a step where the columns' halves take two m64n128s).
-    part = (rows_half, block_n) if row_split else (block_m, half)
+    rows_half = block_m // 2
+    part = (rows_half, block_n)
     staged = min(part[1], _STAGED_COLUMNS)
     side_shapes = [tuple({'rows': part[0], 'columns': part[1]}[axis] for axis in axes)
                    for axes in epilogue_axes]
@@ -306,12 +306,10 @@ def _gmm_cooperative(lhs, rhs, lengths, shape: tuple, *, tiles: Tiles, transpose
             **hopper.staging('side', zip(side_shapes, side_gmems, strict=True)),
             **hopper.staging('fixed', [(tuple(extent[axis] for axis in prologue_axes[i]), prologue_gmems[i])
                                  for i in fixed]),
-            halves=plgpu.Barrier(num_arrivals=2, num_barriers=2),
             drained=hopper.drained(tiles.cluster),
             collective_axes="wg",
         )
-        def scope(allocations, o_smems, side_smems, side_barriers, fixed_smems, fixed_barriers, halves,
-                  drained):
+        def scope(allocations, o_smems, side_smems, side_barriers, fixed_smems, fixed_barriers, drained):
             wg = lax.axis_index("wg")
             cta = lax.axis_index("cluster") if pair == 2 else 0
             mine_rows = pl.ds(wg * rows_half, rows_half)
@@ -324,9 +322,8 @@ def _gmm_cooperative(lhs, rhs, lengths, shape: tuple, *, tiles: Tiles, transpose
                 # This multiprocessor's row tile of the pair and its group's rows there.
                 row_block = group_info.block * pair + cta
                 row_start = row_block * block_m
-                # This consumer's part of the tile: its first row and column, and its group's rows there.
-                part_row = row_start + (wg * rows_half if row_split else 0)
-                column = ni * block_n + (0 if row_split else wg * half)
+                # This consumer's half of the tile: its first row, and its group's rows there.
+                part_row, column = row_start + wg * rows_half, ni * block_n
                 first = jnp.clip(group_info.actual_start - part_row, 0, part[0])
                 stored = jnp.clip(group_info.actual_end - part_row, 0, part[0]) - first
 
@@ -346,21 +343,13 @@ def _gmm_cooperative(lhs, rhs, lengths, shape: tuple, *, tiles: Tiles, transpose
                 def mma(_, lhs_smem, rhs_smem, *rest):
                     *side_smems, acc_ref = rest
                     if prologue is not None:
-                        # This warpgroup's half of the rows, then (where it reads them all) the other's.
+                        # This warpgroup's half of the rows, the only half its MMA reads.
                         tiles_of = dict(zip(stepped, side_smems, strict=True)) | dict(zip(fixed, fixed_refs,
                                                                                           strict=True))
                         _rewritten(prologue, prologue_axes, lhs_smem.at[mine_rows], tiles_of, 'rows',
                                    mine_rows)
-                        if not row_split:
-                            hopper.meet(halves)
-                    if row_split:
-                        rows, matrix = lhs_smem.at[mine_rows], (rhs_smem.transpose((1, 0)) if transpose_rhs
-                                                                else rhs_smem)
-                    else:
-                        columns = pl.ds(wg * half, half)
-                        rows, matrix = lhs_smem, (rhs_smem.at[columns].transpose((1, 0)) if transpose_rhs
-                                                  else rhs_smem.at[:, columns])
-                    plgpu.wgmma(acc_ref, rows, matrix)
+                    matrix = rhs_smem.transpose((1, 0)) if transpose_rhs else rhs_smem
+                    plgpu.wgmma(acc_ref, lhs_smem.at[mine_rows], matrix)
                     # An MMA in flight: the next stage is prepared while this one runs.
                     plgpu.wgmma_wait(_IN_FLIGHT)
                     return acc_ref
@@ -418,8 +407,8 @@ def _gmm_pipeline(tiles: Tiles, transpose_rhs: bool, steps: int, side_axes: tupl
 
 
 def _rewritten(prologue, axes_of: tuple, mine, tiles_of: dict, halved: str, half) -> None:
-    """Dew: `mine`, this warpgroup's half of a stage both consumers read, rewritten by the prologue on its
-    side tiles (`tiles_of`, by operand) cut to the same half along the `halved` launch axis."""
+    """Dew: `mine`, this warpgroup's half of a stage, rewritten by the prologue on its side tiles
+    (`tiles_of`, by operand) cut to the same half along the `halved` launch axis."""
     cut = [tiles_of[i].at[tuple(half if axis == halved else slice(None) for axis in axes)][...]
            for i, axes in enumerate(axes_of)]
     mine[...] = prologue(mine[...], *cut).astype(mine.dtype)
@@ -429,8 +418,8 @@ def _rewritten(prologue, axes_of: tuple, mine, tiles_of: dict, halved: str, half
 def _finish_half(acc, epilogue, sides: tuple, outs: tuple, place: tuple, wg) -> None:
     """Dew: a consumer warpgroup's half tile: the epilogue on its side tiles (`sides`: their views at the
     half tile, staging buffers and barriers), then its group's rows of each output (`outs`: the outputs
-    and their staging buffers) by `hopper.store_rows` (`place`: the tile's first row, the group's first row
-    in it and count, the half's first column, the most rows a rung stores)."""
+    and their staging buffers) by `hopper.store_rows` (`place`: the half's first row, the group's first
+    row in it and count, the tile's first column, the most rows a rung stores)."""
     row_start, first, stored, column, most = place
     tiles_of = []
     for view, smem, barrier in zip(*sides, strict=True):
@@ -451,9 +440,9 @@ def _finish_half(acc, epilogue, sides: tuple, outs: tuple, place: tuple, wg) -> 
 
 
 _STAGED_COLUMNS = 128
-"""The most columns a consumer stages its output in at a time: a row-split part's 256 columns written to
-shared memory as one 512-byte row conflicted on its banks 280 times as often as two 256-byte halves (ncu,
-Qwen3's down projection: 18.3M conflicts against 64.6K, its forward 11% slower than the column split's)."""
+"""The most columns a consumer stages its output in at a time: a consumer's 256 columns written to shared
+memory as one 512-byte row conflicted on its banks 195 times as often as in two 256-byte halves (ncu,
+Qwen3's down projection forward: 18.3M conflicts against 94K, the kernel 16% slower)."""
 
 
 _IN_FLIGHT = 1
@@ -591,23 +580,22 @@ def tgmm(lhs: jax.Array, rhs: jax.Array, group_sizes: jax.Array, *, tiles: Tiles
 
 def _tgmm_cooperative(operands: tuple, groups: tuple, shape: tuple, *, tiles: Tiles, out_dtype,
                       multiprocessors: int, interpret, prologue, prologue_operands: tuple,
-                      prologue_axes: tuple, exact_sums: bool, row_split: bool = False) -> jax.Array:
-    """Dew: `tgmm`'s product at a tile two consumer warpgroups compute, each a half of its columns, beside a
-    producer warpgroup issuing the loads (CUTLASS's cooperative sm90 schedule), the operand stages
-    streaming across the persistent loop's tiles (`hopper.Ring`): the producer loads the next tile's first
-    row blocks while the consumers store this one, which a group's few rows, a tile's few steps, make
-    most of the time. Both warpgroups read the whole stage of the rows: each prepares a depth half of it
-    (the prologue, the neighbouring groups' rows zeroed) and its own column half of the cotangent's, and
-    each waits for the other's half before its MMA. A side operand with rows streams beside the operands;
+                      prologue_axes: tuple, exact_sums: bool) -> jax.Array:
+    """Dew: `tgmm`'s product at a tile two consumer warpgroups compute, each a half of its depth by all its
+    columns, one MMA a step, beside a producer warpgroup issuing the loads (CUTLASS's cooperative sm90
+    schedule), the operand stages streaming across the persistent loop's tiles (`hopper.Ring`): the
+    producer loads the next tile's first row blocks while the consumers store this one, which a group's
+    few rows, a tile's few steps, make most of the time. Each warpgroup reads its depth half of the rows'
+    stage, which it prepares (the prologue, the neighbouring groups' rows zeroed), and the whole
+    cotangent's, a column half of which each zeroes, waiting for the other's where a group boundary falls
+    in the step. A side operand with rows streams beside the operands;
     one without is loaded once a tile. One multiprocessor a tile. `operands` are padded and `groups` is
     `_group_blocks`' with the sizes first (`tgmm`)."""
     lhs, rhs = operands
     _, m, n, g = shape
     block_m, block_n, block_k = tiles.block_m, tiles.block_n, tiles.block_k
     half, depth_half = block_n // 2, block_m // 2
-    # Each consumer's part of the tile: half its columns, or with `row_split` half its depth (one m64n256
-    # MMA a step where the columns' halves take two m64n128s).
-    part = (depth_half, block_n) if row_split else (block_m, half)
+    part = (depth_half, block_n)
     grid = (m // block_m, n // block_n)
     stepped = tuple(i for i, axes in enumerate(prologue_axes) if 'rows' in axes)
     fixed = tuple(i for i, axes in enumerate(prologue_axes) if 'rows' not in axes)
@@ -673,11 +661,8 @@ def _tgmm_cooperative(operands: tuple, groups: tuple, shape: tuple, *, tiles: Ti
                     plgpu.wait_smem_to_gmem(0, wait_read_only=True)
                     o_smem[wg] = acc.astype(o_smem.dtype)
                     plgpu.commit_smem()
-                    if row_split:
-                        mine = (pl.ds(depth.start + wg * depth_half, depth_half), columns)
-                    else:
-                        mine = (depth, pl.ds(columns.start + wg * half, half))
-                    plgpu.copy_smem_to_gmem(o_smem.at[wg], o_gmem.at[(g_i, *mine)])
+                    mine = pl.ds(depth.start + wg * depth_half, depth_half)
+                    plgpu.copy_smem_to_gmem(o_smem.at[wg], o_gmem.at[g_i, mine, columns])
 
                 hook = None if prologue is None else (prologue, prologue_axes, stepped, fixed, fixed_refs)
 
@@ -696,7 +681,7 @@ def _tgmm_cooperative(operands: tuple, groups: tuple, shape: tuple, *, tiles: Ti
                     _streamed_gradient(
                         lambda counter, step: _staged_halves(
                             [ring.acquire(counter) for ring in streams], (step, start, end, steps, block_k),
-                            (mine_depth, mine_columns), hook, halves, row_split),
+                            (mine_depth, mine_columns), hook, halves),
                         release, steps, carry, part, exact_sums,
                         lambda acc: store(acc, g_i, depth, columns))
                     return carry + steps
@@ -710,16 +695,13 @@ def _tgmm_cooperative(operands: tuple, groups: tuple, shape: tuple, *, tiles: Ti
     return kernel(*groups, lhs, rhs, *prologue_operands)
 
 
-def _staged_halves(stages: list, group: tuple, mine: tuple, hook, halves,
-                   row_split: bool = False) -> tuple:
+def _staged_halves(stages: list, group: tuple, mine: tuple, hook, halves) -> tuple:
     """Dew: a streamed kernel gradient step's operands for one consumer warpgroup, from its `stages` (the
-    rows', the cotangent's, then each side operand's with rows): this warpgroup's depth half of the rows
-    rewritten by the prologue (`hook`: it, its operands' axes, which are stepped and which fixed, and the
-    fixed ones' tiles), the neighbouring groups' rows zeroed in its halves (`group`: the step, the group's
-    first and last row, its steps, the rows a step takes; `mine`: its depth and column halves), and the
-    other's halves awaited at `halves` where it rewrote any: the rows (whole) and its cotangent columns,
-    or with `row_split` its depth half of the rows and the whole cotangent (whose other half it awaits
-    only where it zeroed any)."""
+    rows', the cotangent's, then each side operand's with rows): its depth half of the rows, rewritten by
+    the prologue (`hook`: it, its operands' axes, which are stepped and which fixed, and the fixed ones'
+    tiles), and the whole cotangent, the neighbouring groups' rows zeroed in its halves of both (`group`:
+    the step, the group's first and last row, its steps, the rows a step takes; `mine`: its depth and
+    column halves), the other's cotangent half awaited at `halves` where it zeroed any."""
     rows_stage, cotangent_stage, *side_stages = stages
     mine_depth, mine_columns = mine
     if hook is not None:
@@ -729,13 +711,8 @@ def _staged_halves(stages: list, group: tuple, mine: tuple, hook, halves,
     halves_of = (rows_stage.at[:, mine_depth], cotangent_stage.at[:, mine_columns])
     boundary = _zero_neighbours_of(halves_of, *group)
     plgpu.commit_smem()
-    if hook is not None and not row_split:
-        hopper.meet(halves)
-    else:
-        pl.when(boundary)(lambda: hopper.meet(halves))
-    if row_split:
-        return rows_stage.at[:, mine_depth].transpose((1, 0)), cotangent_stage
-    return rows_stage.transpose((1, 0)), cotangent_stage.at[:, mine_columns]
+    pl.when(boundary)(lambda: hopper.meet(halves))
+    return rows_stage.at[:, mine_depth].transpose((1, 0)), cotangent_stage
 
 def _streamed_gradient(staged, release, steps, first, shape: tuple, exact_sums: bool, store) -> None:
     """Dew: a streamed kernel gradient tile's `steps` steps (`staged(counter, step)` their operands at the

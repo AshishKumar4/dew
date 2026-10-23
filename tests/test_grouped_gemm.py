@@ -69,7 +69,7 @@ def test_the_hopper_grouped_matmuls_sum_each_groups_rows_as_exactly_as_xla(sizes
     # One warpgroup a tile at two row blocks, and two (CUTLASS's cooperative schedule; a pair of
     # multiprocessors the interpreter does not model, the GPU's tile gate runs).
     tiled = [mosaic_gpu.Tiles(64, 64, 64, 2, 1), mosaic_gpu.Tiles(128, 64, 64, 2, 1),
-             mosaic_gpu.Tiles(64, 128, 64, 2, 1, warpgroups=2)]
+             mosaic_gpu.Tiles(128, 64, 64, 2, 1, warpgroups=2)]
     for tiles, transpose in itertools.product(tiled, (False, True)):
         matrix = jnp.swapaxes(arrays[1], 1, 2) if transpose else arrays[1]
         got = mosaic_gpu.gmm(arrays[0], matrix, group_sizes, tiles=tiles, transpose_rhs=transpose,
