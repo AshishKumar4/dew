@@ -549,37 +549,44 @@ def test_perplexity_is_exp_of_the_mean_cross_entropy_not_the_mean_of_exps():
 
 def test_the_validation_pass_scores_perplexity_per_token_and_logs_it():
     """Objective artifacts through the trainer's loop and into the metric:
-    two batches of different padding weigh by their counted targets. Each
-    draw is one run of a trainer, a step and a validation pass over the
-    draw's batches, whose logged perplexity is on par with exp of the
-    counted targets' mean cross entropy over the run's own state (check 1):
-    the run computes Dew's value, so the draw carries it. Every run starts
-    from the trainer's one initial state and trains the same step, so the
-    draws vary the batches the pass reads."""
-    wide = make_objective(model=tiny_decoder().clone(dtype=jnp.float64), pad_id=0)
-    tracker = RecordingTracker()
-    trainer = make_trainer(pad_id=0, tracker=tracker)
+    two batches of different padding weigh by their counted targets. The
+    loop logs the validation pass's own perplexity (`Evaluation.run`, which
+    the loop calls), exactly, and that pass's perplexity over drawn batches
+    on the run's state is on par with exp of the counted targets' mean cross
+    entropy (check 1)."""
+    from dew.training.evaluation import Evaluation
 
-    def draw(seed):
+    def batches_of(seed):
         padded = {TEXT_KEY: jnp.asarray(np.where(np.arange(SEQ + 1) < 9,
                                                  token_batch(BATCH, seed=2 * seed)[TEXT_KEY], 0))}
-        batches = [token_batch(BATCH, seed=2 * seed + 1), padded]
-        state = trainer.fit(dataset(cycle_batches, val=lambda: iter(batches)), steps=1, log_every=1,
-                            eval_every=1, metrics=(Perplexity(),))
-        logged = [scalars["val/perplexity"] for _, scalars in tracker.scalars if "val/perplexity" in scalars]
-        return np.float32(logged[-1]), jax.device_get(state.variables), batches
+        return [token_batch(BATCH, seed=2 * seed + 1), padded]
 
-    def expected(logged, variables, batches):
+    tracker = RecordingTracker()
+    trainer = make_trainer(pad_id=0, tracker=tracker)
+    batches = batches_of(0)
+    state = trainer.fit(dataset(cycle_batches, val=lambda: iter(batches)), steps=1, log_every=1,
+                        eval_every=1, metrics=(Perplexity(),))
+    logged = [scalars["val/perplexity"] for _, scalars in tracker.scalars if "val/perplexity" in scalars]
+
+    def passed(variables, batches):
+        return Evaluation.run(trainer.objective, variables, lambda partition: iter(batches), key=state.key,
+                              metrics=(Perplexity(),), step=state.step, mesh=trainer.device_mesh).scores[
+                                  "val/perplexity"]
+
+    assert logged == [passed(state.variables, batches)]
+
+    wide = make_objective(model=tiny_decoder().clone(dtype=jnp.float64), pad_id=0)
+    variables = jax.device_get(state.variables)
+
+    def expected(variables, batches):
         scoring = wide if np.dtype(jax.tree.leaves(variables)[0].dtype) == np.float64 else trainer.objective
         scores = [scoring.evaluate(variables, batch, step_at()) for batch in batches]
         # The pass scores the weights the step left, so it matches them.
         assert 0 < sum(float(jnp.sum(score.weights)) for score in scores) < 2 * BATCH * SEQ
         return perplexity_of(*((np.asarray(score.losses), np.asarray(score.weights)) for score in scores))
 
-    draw(0)
-    assert len([scalars for _, scalars in tracker.scalars if "val/perplexity" in scalars]) == 1, (
-        "a run logs one validation pass")
-    assert_as_exact(lambda logged, variables, batches: logged, expected, draw, "validation perplexity",
+    assert_as_exact(lambda variables, batches: np.float32(passed(state.variables, batches)), expected,
+                    lambda seed: (variables, batches_of(seed)), "validation perplexity",
                     seeds=LM_SEEDS["validation perplexity"])
 
 
