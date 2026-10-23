@@ -107,12 +107,12 @@ class _Program:
         return jnp.minimum(pl.cdiv(first + self.tiles.block_q, self.tiles.block_k), self.steps)
 
     def whole(self, first, walked):
-        """The tiles every query of the block from `first` sees whole: below its diagonal, before padding."""
-        if not self.causal and not self.keys % self.tiles.block_k:
-            return walked
-        whole = jnp.minimum(lax.div(first, self.tiles.block_k),
-                            self.steps - bool(self.keys % self.tiles.block_k))
-        return jnp.maximum(whole if self.causal else jnp.int32(self.steps - 1), 0)
+        """The tiles every query of the block from `first` sees whole: those wholly within the call's keys
+        (the padded call's last tiles may all be past them), and below its diagonal."""
+        whole = jnp.int32(self.keys // self.tiles.block_k)
+        if self.causal:
+            whole = jnp.minimum(lax.div(first, self.tiles.block_k), whole)
+        return jnp.minimum(jnp.maximum(whole, 0), walked)
 
 
 def _consumer(program: _Program, spec: algebra.Forward, wg, q_view, out_view, q_smem, q_loaded, keys, values,
