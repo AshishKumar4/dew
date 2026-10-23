@@ -9,7 +9,6 @@ import sys
 
 import pytest
 
-
 RUN = """
 import json
 import sys
