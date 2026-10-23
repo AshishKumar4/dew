@@ -6,7 +6,7 @@ import json
 import sqlite3
 from collections.abc import Iterator
 from contextlib import contextmanager
-from dataclasses import asdict, dataclass
+from dataclasses import dataclass
 from pathlib import Path
 
 import jax
@@ -16,7 +16,7 @@ from dew.inference.rollouts import Draw
 from dew.objectives.base import Variables
 
 from .episodes import Episode, EpisodeId
-from .records import draw_record, episode_from_record
+from .records import draw_record, episode_from_record, record_json
 
 
 def policy_digest(variables: Variables) -> str:
@@ -115,8 +115,8 @@ class JournalRun:
         """Commit one sample's episode, its pending draw and the environment snapshot."""
         if episode._binding_id != self.binding:
             raise ValueError("journal cannot mix collection bindings")
-        encoded = json.dumps(asdict(episode), allow_nan=False)
-        action = None if pending is None else json.dumps(asdict(pending), allow_nan=False)
+        encoded = record_json(episode)
+        action = None if pending is None else record_json(pending)
         with self.connection:
             self.connection.execute("INSERT OR REPLACE INTO turns VALUES (?, ?, ?, ?, ?)",
                                     (self.cohort, episode.identity.sample, encoded, action, snapshot))
