@@ -60,7 +60,26 @@ def reversed_readout(query, entering, entered, key, pairs, corrected, issue=alge
             + issue("local", algebra.paired("scores", query, key, pairs, issue), corrected))
 
 
-VARIANTS = {"reversed readout": {"readout": reversed_readout},"portable": {}, "wide readout": {"readout": wide_readout}, "wide carry": {"carry": wide_carry},
+@jax.custom_vjp
+def flipped_product(decayed, entered):
+    return decayed @ entered
+
+
+def _flipped_bwd(residual, out_grad):
+    decayed, entered = residual
+    total = jnp.swapaxes(jnp.flip(decayed, -2), -1, -2) @ jnp.flip(out_grad, -2)
+    return out_grad @ jnp.swapaxes(entered, -1, -2), total
+
+
+flipped_product.defvjp(_memory_fwd, _flipped_bwd)
+
+
+def flipped_readout(query, entering, entered, key, pairs, corrected, issue=algebra.portable):
+    return (flipped_product(query * entering, entered)
+            + issue("local", algebra.paired("scores", query, key, pairs, issue), corrected))
+
+
+VARIANTS = {"reversed readout": {"readout": reversed_readout}, "flipped readout": {"readout": flipped_readout},"portable": {}, "wide readout": {"readout": wide_readout}, "wide carry": {"carry": wide_carry},
             "wide readout+carry": {"readout": wide_readout, "carry": wide_carry},
             "wide products": {"portable": wide_issue}}
 
