@@ -36,10 +36,10 @@ from dew.config import OptimConfig
 from dew.data.compile import compile
 from dew.data.dataset import DataPartition, Loader, replayed
 from dew.objectives.base import Aux, EMASpec, Objective, merge, under
+from dew.optim import Cosine, Power
 from dew.training import Checkpoints, Layout, MeshSpec, Trainer, TrainState, ema_update
 from dew.training.evaluation import WARM_BATCHES
 from dew.training.model_flops import _TokenCount
-from dew.training.optim import Cosine, Power
 from dew.training.runtime import Preempted
 from dew.training.state import CHECKPOINTED
 
@@ -97,7 +97,7 @@ def test_a_token_budget_and_step_cap_stop_at_the_first_reached():
 @pytest.mark.parametrize("schedule", [None, Power(peak=.1, warmup_steps=2, a=.1, b=0),
                                        Cosine(peak=.1, warmup_steps=1, decay_steps=8)])
 def test_a_token_only_run_uses_the_schedules_own_horizon(schedule):
-    config = OptimConfig(schedule=schedule)
+    config = OptimConfig() if schedule is None else OptimConfig(rate=schedule)
     state = make_trainer(objective=TokenRegression(), optimizer=config).fit(dataset(), tokens=30)
     assert int(state.step) == 3
 
@@ -281,8 +281,13 @@ def test_typed_root_key_round_trips_and_resumes_bit_exactly(tmp_path):
 def test_closed_checkpoints_leave_no_writer_running_across_trials(tmp_path):
     """Trials in one process each close their checkpoints, as RunConfig.train does, so Orbax's
     managers and metadata stores leave no thread behind: two more trials run no more threads than
-    the first left, and a closed Checkpoints reopens to read what it wrote."""
+    the first left, and a closed Checkpoints reopens to read what it wrote. A neighbour's thread that
+    ends meanwhile, as another test's pool does in a shared process, is not a trial's."""
     import threading
+
+    release = threading.Event()
+    neighbour = threading.Thread(target=release.wait)
+    neighbour.start()
 
     def trial(index):
         with Checkpoints(str(tmp_path / str(index))) as checkpoints:
@@ -290,11 +295,17 @@ def test_closed_checkpoints_leave_no_writer_running_across_trials(tmp_path):
                 dataset(), steps=2, checkpoint_every=1, log_every=1)
         return checkpoints
 
-    trial(0)
-    settled = threading.active_count()
-    for index in (1, 2):
-        reopened = trial(index)
-        assert threading.active_count() == settled
+    try:
+        trial(0)
+        settled = set(threading.enumerate())
+        release.set()
+        neighbour.join()
+        for index in (1, 2):
+            reopened = trial(index)
+            assert set(threading.enumerate()) <= settled
+    finally:
+        release.set()
+        neighbour.join()
     assert reopened.latest == 2
 
 
@@ -811,7 +822,7 @@ from dew.cache import enable_compilation_cache
 from dew.config import OptimConfig
 from dew.telemetry.instrumentation import compilation_cache_counts
 from dew.training import Checkpoints, Layout, Trainer
-from dew.training.optim import Cosine, ParamGroup
+from dew.optim import Cosine, ParamGroup
 
 root, grouped = sys.argv[1], sys.argv[2] == "grouped"
 enable_compilation_cache(root + "/cache")
@@ -819,7 +830,7 @@ enable_compilation_cache(root + "/cache")
 
 def fit(peak, steps, path):
     groups = (ParamGroup("kernel", ("*kernel",), learning_rate_multiplier=0.5), ParamGroup("rest", ("*",)))
-    config = OptimConfig(schedule=Cosine(peak=peak, warmup_steps=1, decay_steps=8),
+    config = OptimConfig(rate=Cosine(peak=peak, warmup_steps=1, decay_steps=8),
                          param_groups=groups if grouped else ())
     sink = RecordingTracker()
     trainer = Trainer(Regression(), config, key=jax.random.key(0), layout=Layout(min_shard=1, tolerance=1.0),
@@ -1601,3 +1612,17 @@ def test_a_mesh_without_stages_takes_its_one_microbatch_asked_for():
     named, planned = fit(microbatches=1), fit()
     for left, right in zip(jax.tree.leaves(named.variables), jax.tree.leaves(planned.variables), strict=True):
         np.testing.assert_array_equal(np.asarray(left), np.asarray(right))
+
+
+def test_a_state_built_from_a_held_tree_steps_without_freeing_the_tree():
+    """A state the trainer builds eagerly from the objective's held tree (`Trainer.initial_state`),
+    stepped on one device, whose step takes its arguments' shardings and donates them: the objective's
+    held arrays stay alive, since the state holds buffers of its own, as a placed state does
+    (`distributed.placed_held`)."""
+    trainer, objective, _ = held_lm_trainer()
+    trainer.device_mesh = MeshSpec().build(jax.devices()[:1])
+    state = trainer.initial_state()
+    batch = {"text": jnp.arange(1, 6, dtype=jnp.int32)[None]}
+    stepped, *_ = trainer.compile(state, batch)(state, batch)
+    jax.block_until_ready(stepped)
+    assert not any(leaf.is_deleted() for leaf in jax.tree.leaves(objective.variables))

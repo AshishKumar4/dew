@@ -183,7 +183,7 @@ class RK4:
         k2 = derivative(x + 0.5 * k1 * dt, sigma_t + 0.5 * dt)
         k3 = derivative(x + 0.5 * k2 * dt, sigma_t + 0.5 * dt)
         k4 = derivative(x + k3 * dt, sigma_t + dt)
-        return x + (k1 + 2 * k2 + 2 * k3 + k4) * dt / 6, state
+        return x + divided((k1 + 2 * k2 + 2 * k3 + k4) * dt, 6), state
 
 
 @struct.dataclass
@@ -264,7 +264,7 @@ class MultiStepDPM:
             dx_2 = (eps - last_eps) / (sigma_t - last_sigma)
             dx_2_last = (last_eps - older_eps) / (last_sigma - older_sigma)
             dx_3 = (dx_2 - dx_2_last) / (0.5 * ((sigma_t + last_sigma) - (last_sigma + older_sigma)))
-            return x + eps * dt + 0.5 * dx_2 * dt ** 2 + dx_3 * dt ** 3 / 6
+            return x + eps * dt + 0.5 * dx_2 * dt ** 2 + divided(dx_3 * dt ** 3, 6)
 
         next_x = lax.switch(jnp.minimum(count, 2), [first, second, third], None)
         return next_x, (eps, sigma_t, last_eps, last_sigma, count + 1)
