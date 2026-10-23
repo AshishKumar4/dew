@@ -1037,6 +1037,20 @@ NO_SHIFT = -150.0
 exponent is the larger, and `power2` of a zero mantissa by it stays zero."""
 
 
+def _split(x: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """Each entry of `x` as a mantissa of magnitude in (1/2, 1] and its power of two's exponent (0 for a
+    zero), so a product of several taken mantissa by mantissa and exponent by exponent neither overflows
+    nor flushes where the product itself is in range (`exponent_product`)."""
+    exponent = jnp.where(x != 0, jnp.ceil(jnp.log2(jnp.where(x != 0, jnp.abs(x), 1.0))), 0.0)
+    return power2(x, -exponent), exponent
+
+
+def exponent_product(mantissa: jax.Array, exponent: jax.Array) -> jax.Array:
+    """`mantissa * 2^exponent`, zero where the mantissa is, whatever the exponent (`power2` of a zero by an
+    exponent past fp32's would multiply it by an infinite factor)."""
+    return jnp.where(mantissa == 0, 0.0, power2(mantissa, exponent))
+
+
 def _shifted(x: jax.Array) -> tuple[jax.Array, jax.Array]:
     """`x` (`[bq, ...]`) taken by each row's power of two to magnitudes at most one, and that power's
     exponent `[bq]`, `NO_SHIFT` for a row of zeros."""
@@ -1094,8 +1108,13 @@ def dq_finish(sums: DqSums, prior: jax.Array, state_total: jax.Array, peak0: jax
     refined = refinement(residual, mass, peak0, shares, peak, total, anchor, delta)
     grads = tuple(grad * ratio - refined * (weighed * over)
                   for grad, weighed in zip(sums.grads, sums.weighed, strict=True))
-    correction = power2(expand(refined * sums.keyed_mass, sums.keyed) * sums.keyed,
-                        expand(sums.keyed_shift, sums.keyed))
+    # refined · mass · 2^shift · keyed, each factor's mantissa and exponent apart (`_split`), so no partial
+    # product overflows or flushes where the correction is in range.
+    refined_mantissa, refined_exponent = _split(refined)
+    keyed_mantissa, keyed_exponent = _split(sums.keyed)
+    correction = exponent_product(
+        expand(refined_mantissa * sums.keyed_mass, sums.keyed) * keyed_mantissa,
+        expand(refined_exponent + sums.keyed_shift, sums.keyed) + keyed_exponent)
     dq = (sums.dq - correction) * expand(ratio, sums.dq)
     return dq, delta + refined, total, mass, grads
 
