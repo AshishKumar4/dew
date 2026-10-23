@@ -27,6 +27,79 @@ from reference_error import (
 )
 
 
+@pytest.mark.skipif(jax.default_backend() != "cpu", reason="WITHOUT_YNN is XLA:CPU's")
+def test_without_ynn_computes_what_xla_cpu_computes_with_every_ynnpack_fusion_off(tmp_path):
+    """Each of tests/ynn_programs.py's programs under `without_ynn` gives, bit for bit, what the same
+    program gives jitted in a process whose XLA:CPU runs with every YNNPACK fusion off."""
+    import os
+    import subprocess
+    import sys
+    from pathlib import Path
+
+    import ynn_programs
+    from reference_error import without_ynn
+
+    out = tmp_path / "theirs.npz"
+    flags = os.environ.get("XLA_FLAGS", "") + " --xla_cpu_experimental_ynn_fusion_type="
+    subprocess.run([sys.executable, str(Path(ynn_programs.__file__)), str(out)], check=True,
+                   env={**os.environ, "XLA_FLAGS": flags})
+    with np.load(out) as theirs:
+        for name, value in ynn_programs.outputs(without_ynn).items():
+            np.testing.assert_array_equal(np.asarray(value), theirs[name], err_msg=name)
+
+
+@pytest.mark.skipif(jax.default_backend() != "cpu", reason="WITHOUT_YNN is XLA:CPU's")
+def test_without_ynn_takes_a_callers_compiler_options_over_its_own():
+    """A caller who asks for YNNPACK's dot fusion gets the dot the default XLA:CPU computes, bit for
+    bit."""
+    from reference_error import without_ynn
+    from ynn_programs import w, x
+
+    dot_fusion = {"xla_cpu_experimental_ynn_fusion_type": "LIBRARY_FUSION_TYPE_DOT"}
+    np.testing.assert_array_equal(without_ynn(jnp.dot, compiler_options=dot_fusion)(x, w),
+                                  jax.jit(jnp.dot)(x, w))
+
+def test_a_torch_arm_pulls_back_the_cotangent_it_is_given():
+    """`torch_with_gradients` gives, bit for bit, a torch function's output and the gradients torch's
+    autograd pulls back from the cotangent passed last, cast to the output's dtype, at float32 and at
+    float64; a module's parameters are inputs through `functional_call`; an input the output does not
+    reach has a zero gradient."""
+    torch = pytest.importorskip("torch")
+    from reference_error import torch_with_gradients
+
+    rng = np.random.default_rng(0)
+    for dtype in (torch.float32, torch.float64):
+        layer = torch.nn.Linear(3, 4).to(dtype)
+        x, unused = (rng.normal(size=shape) for shape in ((5, 3), (2,)))
+        params = {name: value.detach().numpy() for name, value in layer.named_parameters()}
+        x, unused = x.astype(params["weight"].dtype), unused.astype(params["weight"].dtype)
+        cotangent = rng.normal(size=(5, 4))  # float64, cast to the output's dtype as jax.vjp casts
+
+        def forward(x, params, unused, layer=layer):
+            return torch.tanh(torch.func.functional_call(layer, params, (x,)))
+
+        out, grad_x, grads, grad_unused = torch_with_gradients(forward)(x, params, unused, cotangent)
+        tensors = [torch.from_numpy(x).requires_grad_(), *(torch.from_numpy(v).requires_grad_()
+                                                           for v in params.values())]
+        expected = torch.tanh(torch.func.functional_call(layer, dict(zip(params, tensors[1:], strict=True)),
+                                                         (tensors[0],)))
+        wanted = torch.autograd.grad(expected, tensors, torch.from_numpy(cotangent).to(dtype))
+        np.testing.assert_array_equal(out, expected.detach().numpy())
+        for got, want in zip((grad_x, *(grads[name] for name in params)), wanted, strict=True):
+            np.testing.assert_array_equal(got, want.numpy())
+        np.testing.assert_array_equal(grad_unused, np.zeros_like(unused))
+    # A scalar loss pulls back its scalar one, and a scalar input takes a scalar gradient.
+    loss, gradient = torch_with_gradients(lambda a: 3 * a * a)(np.float32(2), np.float32(1))
+    np.testing.assert_array_equal(loss, np.float32(12))
+    np.testing.assert_array_equal(gradient, np.float32(12))
+    assert np.shape(gradient) == ()
+    # A bfloat16 output, of float32 inputs cast inside, comes back in float32, its values exactly.
+    x = np.arange(4, dtype=np.float32) / 3
+    out, grad = torch_with_gradients(lambda x: (x.bfloat16() * 3).bfloat16())(x, np.ones(4, np.float32))
+    np.testing.assert_array_equal(out, (torch.from_numpy(x).bfloat16() * 3).float().numpy())
+    np.testing.assert_array_equal(grad, np.full(4, 3, np.float32))
+
+
 def test_a_small_row_beside_large_ones_is_held_to_its_own_size():
     """Dew doubles a row of 5s beside rows of 1e8 that the reference rounds by 8. Every
     tensor-wide distance passes it: its RMS error, 3.5, sits under twice the reference's, 5.7.
