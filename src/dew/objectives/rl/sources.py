@@ -274,6 +274,13 @@ class _Prompt:
         return cls(ids, record)
 
 
+def _cancelled_with(job: Future[None], rollout: Future[Session]) -> None:
+    """Cancel `rollout` where its reward `job` was cancelled (`PromptSource.close`), and notify its
+    waiters: `concurrent.futures.wait` counts a cancelled future done only once it is notified."""
+    if job.cancelled() and rollout.cancel():
+        rollout.set_running_or_notify_cancel()
+
+
 class PromptSource:
     """Draws one completion per sample of a `prompt_tasks` task and scores its decoded text.
 
@@ -315,7 +322,8 @@ class PromptSource:
             future.cancel()
 
     def close(self) -> None:
-        """Stop the reward threads. The caller closes the server; this method does not."""
+        """Stop the reward threads: a reward running finishes, and a rollout whose reward has not
+        started is cancelled. The caller closes the server; this method does not."""
         self._scorers.shutdown(wait=True, cancel_futures=True)
 
     def _rollout(self, task: Task, prompt: _Prompt, version: int, drawn: Future[Draw]) -> Session:
@@ -348,9 +356,11 @@ class PromptSource:
 
         def chained(_: Future[Draw]) -> None:
             try:
-                self._scorers.submit(score)
+                job = self._scorers.submit(score)
             except RuntimeError as closed:
                 settled(scored, closed)
+                return
+            job.add_done_callback(lambda job: _cancelled_with(job, scored))
 
         drawn.add_done_callback(chained)
         return scored

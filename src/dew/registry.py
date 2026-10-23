@@ -1024,15 +1024,19 @@ def record_fields(value: DataclassInstance, owner: type) -> dict[str, JSON]:
 
     A field still holding its declared callable default, such as a Flax
     layer's initializer closure, is left out: no record can name a closure,
-    and the class supplies the same default again when the record is read."""
+    and the class supplies the same default again when the record is read.
+    A Flax module's `parent` is its binding, never recorded, and its `name`
+    is recorded where it was given one: a parent that keeps its submodules'
+    own names (`preserve_adopted_names`) finds its weights under them."""
     from flax import linen as nn
 
     fields = {}
     with recording():
         for field in dataclasses.fields(value):
             held = getattr(value, field.name)
-            if (_recorded(field) and not (isinstance(value, nn.Module) and field.name in ('parent', 'name'))
-                    and not (callable(held) and held is field.default)):
+            binding = isinstance(value, nn.Module) and (field.name == 'parent' or (field.name == 'name'
+                                                                                    and held is None))
+            if _recorded(field) and not binding and not (callable(held) and held is field.default):
                 fields[field.name] = to_record(held, declared_type(owner, field.name))
     return fields
 

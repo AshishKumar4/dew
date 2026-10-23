@@ -29,6 +29,7 @@ from dew.interop import pickles
 from dew.interop.safetensors_io import (
     LazyTensors,
     header_specs,
+    own,
     read_file,
     read_weights,
     stored_spec,
@@ -275,6 +276,7 @@ class StoredWeights:
         from huggingface_hub import constants
 
         held: dict[str, tuple[str, jax.ShapeDtypeStruct]] = {}
+        owner: dict[str, str] = {}
         for file in self.files(folder):
             question = ("safetensors header", self.name_or_dir, self.directory.name, file)
             if (self.directory / file).is_file():
@@ -286,6 +288,7 @@ class StoredWeights:
                 header = hub_answer(question, functools.partial(_hub_header, self.name_or_dir,
                                                                 self.directory.name, file)).value
                 specs = {name: stored_spec(name, shape, tag, file) for name, (shape, tag) in header.items()}
+            own(owner, specs, file, self.directory / folder)
             held.update({name: (file, spec) for name, spec in specs.items()})
         return held
 

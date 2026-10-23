@@ -17,6 +17,7 @@ from dew.decision import (
     Abstention,
     Binning,
     Budget,
+    Calibration,
     Choice,
     Decide,
     EntropyConfidence,
@@ -210,16 +211,33 @@ def test_a_temperature_fit_does_not_depend_on_a_common_logit_shift():
             assert _temperature(held) == pytest.approx(1.0, rel=1e-6)
 
 
-def test_abstention_keeps_the_accepted_answers_within_the_target_error():
+def served(calibration, question, scored):
+    """The answers `calibration` serves rather than abstains on."""
+    return [held for held in scored
+            if not calibration.abstains(question, calibration.probabilities(question, held.logits))]
+
+
+def test_abstention_keeps_the_answers_it_serves_within_the_target_error():
     scored = synthetic(1.0, 2000, 4, seed=2)
     temperatures = Temperatures.fit(scored, bucket_minimum=100)
-    gate = Abstention.fit(scored, temperatures, target_error=0.1)
-    threshold = gate.threshold("choice", 4)
-    assert threshold is not None
-    tops = [round(float(softmax(held.logits, temperatures.of("choice", 4)).max()), 4) for held in scored]
-    accepted = [held for held, top in zip(scored, tops, strict=True) if top >= threshold]
+    calibration = Calibration(temperatures, abstention=Abstention.fit(scored, temperatures, target_error=0.1))
+    accepted = served(calibration, Choice("pick", [f"o{index}" for index in range(4)]), scored)
+    assert accepted
     errors = sum(int(np.argmax(held.logits)) != held.label for held in accepted)
     assert (errors + 1) / (len(accepted) + 1) <= 0.1
+
+
+def test_abstention_serves_every_answer_its_fit_accepted():
+    """Ninety-nine right answers at a confidence of 0.89997 and one wrong at 0.90002: the fit accepts
+    all hundred within a 10% target, and serving accepts the same hundred, not the wrong one alone."""
+    question = Choice("pick", ["a", "b"])
+
+    def answered(top, right):
+        return Scored(question.kind, np.asarray([np.log(top / (1 - top)), 0.0]), np.eye(2)[0 if right else 1])
+
+    scored = [answered(0.89997, right=True)] * 99 + [answered(0.90002, right=False)]
+    calibration = Calibration(abstention=Abstention.fit(scored, Temperatures(), target_error=0.1))
+    assert len(served(calibration, question, scored)) == 100
 
 
 def test_binning_maps_each_bin_to_its_accuracy():
