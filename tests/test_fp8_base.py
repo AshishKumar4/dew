@@ -22,7 +22,7 @@ import optax
 import pytest
 from affine_run import Replaying
 from flax import linen as nn
-from flax.traverse_util import flatten_dict
+from flax.traverse_util import flatten_dict, unflatten_dict
 from jax.sharding import NamedSharding, PartitionSpec
 from model_support import TINY_DECODER
 from process_support import READ_ONLY, fresh, keeping_picks
@@ -299,7 +299,14 @@ def test_the_scanned_stack_reads_each_layers_own_packed_kernel():
     _, fp8 = adapters()
     _, scanned = adapters(decoder(scan_layers=True))
     exact = jax.jit(decoder().clone(dtype=jnp.float64, attention_impl="reference").apply)
-    base = fp8.merge(fp8.variables)["params"]
+    # The merged tree's layout, each packed site's kernel the one its forward codes stand for in float64
+    # (`exactly`), not the float32 decode `merge` stores.
+    base = flatten_dict(fp8.merge(fp8.variables)["params"])
+    packed = flatten_dict(fp8.variables[QUANTIZATION])
+    for path, codes in packed.items():
+        if path[-1] == FROZEN_FP8[0]:
+            base[(*path[:-1], "kernel")] = exactly(codes, packed[(*path[:-1], FROZEN_FP8[1])]).T
+    base = unflatten_dict(base)
 
     def draw(seed):
         return (jnp.asarray(np.random.default_rng([0xF8, seed]).integers(0, VOCAB, (BATCH, SEQ)), jnp.int32),)
