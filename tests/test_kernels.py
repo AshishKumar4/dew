@@ -26,6 +26,7 @@ from dew.nn import kernels
 from dew.nn.attention import NormalAttention, scaled_dot_product_attention, weighted_values
 from dew.nn.kernels import bf16_dot_runs
 from dew.nn.kernels.selection import KernelRefused
+from dew.nn.precision import float32_einsum
 
 pytestmark = pytest.mark.kernel
 
@@ -856,7 +857,7 @@ def test_a_layer_that_builds_its_mask_sums_its_cpu_fp32_values_in_blocks_too():
 def test_the_reference_path_is_flax_attention_op_for_op(dtype, forced, dropout_rate):
     """Without sinks the reference path (`reference_attention`) is flax's
     `dot_product_attention` handed the key heads repeated over their group and
-    Dew's value product (`weighted_values`), bitwise: in each compute dtype,
+    Dew's two products (`float32_einsum`, `weighted_values`), bitwise: in each compute dtype,
     the softmax forced to fp32 or not, an fp32 bias wider than half-precision
     logits, a causal mask and a probability draw from the same key."""
     keys = jax.random.split(jax.random.key(0), 5)
@@ -869,7 +870,7 @@ def test_the_reference_path_is_flax_attention_op_for_op(dtype, forced, dropout_r
     theirs = nn.dot_product_attention(
         query, jnp.repeat(key, 2, axis=2), jnp.repeat(value, 2, axis=2), bias=bias,
         mask=jnp.tril(jnp.ones((6, 6), bool))[None, None], broadcast_dropout=False,
-        force_fp32_for_softmax=forced, qk_attn_weights_einsum=jnp.einsum,
+        force_fp32_for_softmax=forced, qk_attn_weights_einsum=float32_einsum,
         attn_weights_value_einsum=weighted_values, **drop)
     np.testing.assert_array_equal(np.asarray(ours), np.asarray(theirs))
 

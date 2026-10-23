@@ -395,7 +395,9 @@ def test_the_fused_path_returns_the_value_columns_and_not_the_padding():
         return tuple(jnp.asarray(rng.standard_normal(shape), jnp.float32)
                      for shape in ((2, 7, 4, 16), (2, 7, 4, 16), (2, 7, 4, 8)))
 
-    query, key, value = draw(0)
+    # In bf16 the fused kernel runs on every backend; a CPU's fp32 call takes the reference path,
+    # whose products sum as the CPU's policy does (`dew.nn.precision`).
+    query, key, value = (x.astype(jnp.bfloat16) for x in draw(0))
     fused = functools.partial(scaled_dot_product_attention, query, key, implementation="xla", causal=True)
     narrow = fused(value)
     assert narrow.shape == (2, 7, 4, 8)
