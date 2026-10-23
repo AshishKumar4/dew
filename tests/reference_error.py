@@ -131,7 +131,8 @@ def torch_with_gradients(fn):
     floating input enters as a tensor of its own dtype that requires a gradient, and the cotangent
     (an array, or a tuple or dict of them matching the output) is cast to its output's dtype, as
     `jax.vjp` casts it. A module's parameters are inputs too, called through
-    `torch.func.functional_call`. An input the output does not reach has a zero gradient."""
+    `torch.func.functional_call`. An input the output does not reach has a zero gradient, and a
+    bfloat16 output comes back as the float32 array that holds it."""
     def run(*arguments):
         import torch
 
@@ -149,10 +150,15 @@ def torch_with_gradients(fn):
             leaves, wanted, grad_outputs=[torch.from_numpy(np.ascontiguousarray(c)).to(leaf.dtype)
                                           for leaf, c in zip(leaves, cotangents, strict=True)],
             allow_unused=True)
-        gradients = iter(torch.zeros_like(leaf).numpy() if grad is None else grad.detach().numpy()
+        def array(value):
+            # NumPy holds no bfloat16, and float32 holds its every value exactly.
+            value = value.detach()
+            return (value.float() if value.dtype == torch.bfloat16 else value).numpy()
+
+        gradients = iter(torch.zeros_like(leaf).numpy() if grad is None else array(grad)
                          for leaf, grad in zip(wanted, pulled, strict=True))
         found = jax.tree.map(lambda leaf: next(gradients) if leaf.requires_grad else None, inputs)
-        return jax.tree.map(lambda leaf: leaf.detach().numpy(), out), *found
+        return jax.tree.map(array, out), *found
 
     return run
 
