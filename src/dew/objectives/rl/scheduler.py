@@ -307,15 +307,18 @@ class Synchronous:
         return True
 
     def open(self, entry: _Entry, samples: int) -> None:
-        snapshot = self._snapshot
-        assert snapshot is not None, "begin binds the call's snapshot before any entry opens"
+        # The call's one entry consumes its snapshot, so no tree outlives the call it was bound for.
+        snapshot, self._snapshot = self._snapshot, None
+        assert snapshot is not None, "begin binds the call's snapshot before its entry opens"
+        # Every session was submitted when the collection began.
+        began = time.perf_counter()
         collected = self.collector.collect(snapshot, entry.tasks, samples)
         for row, (task, sessions) in enumerate(zip(entry.tasks, collected, strict=True)):
             if len(sessions) != samples:
                 raise ValueError(f"the collector drew {len(sessions)} sessions of task {task.id}, "
                                  f"not {samples}")
             entry.groups.append(_Group(task, f"{entry.serial}/{row}", [
-                _Sample(index, 0, snapshot.updates, _done(session))
+                _Sample(index, 0, snapshot.updates, _done(session), began)
                 for index, session in enumerate(sessions)]))
 
     def redrawn(self, group: _Group, sample: _Sample, cause: str) -> None:
