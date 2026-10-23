@@ -26,7 +26,7 @@ from flax.traverse_util import flatten_dict
 from jax.sharding import NamedSharding, PartitionSpec
 from model_support import TINY_DECODER
 from process_support import READ_ONLY, fresh, keeping_picks
-from reference_error import assert_as_exact
+from reference_error import assert_as_exact, widened, with_gradients
 
 from dew.data.dataset import Loader
 from dew.interop.codecs import fp8_block_cast, quantize_fp8_blocks
@@ -108,6 +108,8 @@ def calls(model, variables, inputs):
 
 
 PRODUCT_SEEDS = 16
+SCANNED_SEEDS = 8
+"""The scanned stack's declared draws, sized by `seeds_for` (on armada)."""
 """The frozen product's declared draws (check 1, `assert_as_exact`), sized by `seeds_for`: the fewest for
 which the float32 reference compared with itself resolves the factor."""
 
@@ -123,9 +125,9 @@ def product_case(seed=1):
 
 
 def fp8_products(x, forward, forward_scale, dgrad, dgrad_scale, cotangent):
-    """Dew's frozen product and the input gradient it takes under `cotangent`."""
-    output, pullback = jax.vjp(frozen_fp8_product, x, forward, forward_scale, dgrad, dgrad_scale)
-    return output, pullback(cotangent)[0]
+    """Dew's frozen product and the input gradient it takes under `cotangent` (`with_gradients`)."""
+    product = with_gradients(lambda x: frozen_fp8_product(x, forward, forward_scale, dgrad, dgrad_scale))
+    return product(x, cotangent)
 
 
 def dequantized_products(x, forward, forward_scale, dgrad, dgrad_scale, cotangent):
@@ -275,7 +277,7 @@ def test_a_merged_fp8_base_computes_the_kernels_its_training_moved():
     expected = np.asarray(model.apply({"params": merged["params"]}, ids()), np.float32)
     np.testing.assert_array_equal(np.asarray(unadapted(fp8.model).apply(merged, ids()), np.float32), expected)
     base = fp8.merge(fp8.variables)["params"]
-    assert np.abs(expected - np.asarray(model.apply({"params": base}, ids()), np.float32)).max() > 1e-3
+    assert not np.array_equal(expected, np.asarray(model.apply({"params": base}, ids()), np.float32))
 
 
 def test_a_resumed_fp8_base_run_trains_what_an_uninterrupted_one_does(tmp_path):
@@ -291,12 +293,24 @@ def test_the_scanned_stack_reads_each_layers_own_packed_kernel():
     """The scanned stack computes the looped one's output from the same
     variables, both jitted with the variables as arguments, as a step passes
     its state: closed over, the packed codes fold into a float32 GEMM where a
-    scan's traced ones take the FP8 one, which rounds its sums otherwise."""
+    scan's traced ones take the FP8 one, which rounds its sums otherwise. The
+    two on par over drawn tokens (check 1), from the plain decoder in float64
+    on the kernels the codes stand for (the adapter's deltas start at zero)."""
     _, fp8 = adapters()
     _, scanned = adapters(decoder(scan_layers=True))
-    looped = np.asarray(jax.jit(fp8.model.apply)(fp8.variables, ids()), np.float32)
-    np.testing.assert_allclose(np.asarray(jax.jit(scanned.model.apply)(fp8.variables, ids()), np.float32),
-                               looped, rtol=1e-6, atol=1e-6)
+    exact = jax.jit(decoder(dtype="float64").apply)
+    base = fp8.merge(fp8.variables)["params"]
+
+    def draw(seed):
+        return (jnp.asarray(np.random.default_rng([0xF8, seed]).integers(0, VOCAB, (BATCH, SEQ)), jnp.int32),)
+
+    def truth(tokens):
+        with jax.enable_x64(new_val=True):
+            return exact({"params": widened(base)}, tokens)
+
+    assert_as_exact(lambda tokens: jax.jit(scanned.model.apply)(fp8.variables, tokens),
+                    lambda tokens: jax.jit(fp8.model.apply)(fp8.variables, tokens), draw, "scanned FP8 stack",
+                    seeds=SCANNED_SEEDS, truth_fn=truth)
 
 
 def test_a_checkpoints_input_quantization_and_an_fp8_base_share_one_wrapper():
