@@ -316,13 +316,13 @@ class _GroupedLaunch[Config: Hashable](base.Template[Config]):
     # tokamax serializes a launch's arguments into the program by their types.
     HOOKS: ClassVar[tuple[str, ...]] = ('hooks',)
 
-    def traced(self, name: str, value) -> str | None:
+    def traced(self, name: str, value: object) -> str | None:
         """The launch's `Hooks` as its picks key them (`tuning.KernelOp.traced`): each hook by what it
         computes (`tuning.program`) as a kernel traces it (`Hooks.before`, `Hooks.after`), at a
         `TRACED_TILE` square tile and each side tile as its axes lay it out there, in the dtypes the hooks
         state, beside their axes, squeezed positions and output dtypes; an already traced key as it is."""
-        if isinstance(value, str):
-            return value
+        if not isinstance(value, Hooks):
+            return value if isinstance(value, str) else None
 
         def program(hook, axes_of: tuple, dtypes: tuple) -> str | None:
             if hook is None:
