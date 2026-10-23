@@ -50,8 +50,9 @@ QUESTION = {"pick": Choice("Which one?", ["a", "b", "c"])}
 
 WORDS = ["one", "two", "three", "four", "five", "six", "seven", "eight", "nine", "ten", "note", "first"]
 
-CONTEXT_SEEDS = 16
-"""Check 1's declared seeds for the batched answers with their contexts."""
+CONTEXT_SEEDS = 32
+"""Check 1's declared seeds for the batched answers with their contexts, sized paired (`seeds_for`
+with the batch as `dew_fn`, 2026-10-23 on armada)."""
 
 
 def conditioned(length: int = 16, layers: tuple[int, ...] = (0, 1)) -> DecisionObjective:
@@ -89,8 +90,9 @@ def drawn(seed) -> tuple[str, str]:
     return " ".join(rng.choice(WORDS, 6)), " ".join(rng.choice(WORDS, int(rng.integers(1, 6))))
 
 
-FRESH_SEEDS = 16
-"""Check 1's declared seeds for the shut gates' answers against the source's."""
+FRESH_SEEDS = 8
+"""Check 1's declared seeds for the shut gates' answers against the source's, and beside images, sized
+paired (`seeds_for` with the shut gates' answers as `dew_fn`, 2026-10-23 on armada)."""
 
 
 def opened(variables, value: float = 1.0):
