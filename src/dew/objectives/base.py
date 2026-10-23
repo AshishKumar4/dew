@@ -614,9 +614,9 @@ def freeze(variables: Variables, trainable: PathFilter) -> Variables:
 
 
 def training(variables: Variables) -> frozenset[Path]:
-    """The full paths of the `params` leaves a split tree trains (`freeze`), or none for a tree
-    with no `FROZEN` collection, which was never split. An adapter attached over a split tree
-    keeps these training beside its own leaves."""
+    """The full paths of the `params` leaves a split tree trains (`freeze`). An unsplit tree, with
+    no `FROZEN` collection, trains every leaf, and this is empty for it: an adapter attached over
+    it freezes them all afresh, where over a split tree it keeps these training beside its own."""
     if FROZEN not in variables:
         return frozenset()
     return frozenset(("params", *(entry.key for entry in path))

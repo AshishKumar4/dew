@@ -22,6 +22,18 @@ feed-forward for a token that attends to no image; here the block is absent
 for such a row, as it is for a call with no context at all. A cached call
 that carries the context keeps its keys and values in the cache, so later
 decode steps attend over them without it.
+
+The block reads and joins whatever residual its decoder carries: the plain
+stream (AltUp's active copy among them), mHC's streams, whose mean it reads
+and each of which its outputs join, Kimi K3's depth state, whose mixture it
+reads and whose partial block its outputs join, and nGPT's unit stream,
+which it reads unnormed and which each output joins as a step of its gate
+along the sphere, as nGPT's own sublayers do.
+
+A gate multiplies its branch as an outer product, so the gate's gradient,
+the sum of the branch times its cotangent over every token, is a dot:
+XLA:CPU reduces a broadcast's transpose four times further from float64
+than torch's cascade sum over 640 terms, and its dot as close as torch's.
 """
 
 from __future__ import annotations
@@ -37,6 +49,8 @@ from flax.typing import Dtype, PrecisionLike
 from .attention import projected_heads, projected_output, scaled_dot_product_attention
 from .flops import counted_flops, cross_attention_flops, projection_flops
 from .inputs import CrossContext
+from .ngpt import unit
+from .precision import float32_dot_general
 from .sharding import HEADS, KV_HEADS, constrain
 
 NAME = "cross_attention"
@@ -83,16 +97,18 @@ class CrossAttention:
 
 
 class GatedCrossAttention(nn.Module):
-    """One layer's gated block: the residual `x` `[B, S, emb_features]` plus its
-    gated attention over a `CrossContext` and its gated feed-forward.
+    """One layer's gated block: a residual with its gated attention over a
+    `CrossContext` and its gated feed-forward joined in.
 
-    `norm` and `feedforward` are the decoder's factories, which take a name. The
-    projections are stored flat, `[inputs, heads * head_dim]`, as the decoder's
-    own attention stores them. `attention_impl` and `force_fp32_for_softmax` are
-    the decoder's.
+    `norm` and `feedforward` are the decoder's factories, which take a name;
+    `ngpt` reads the stream unnormed and joins each output as nGPT's step
+    (the module docstring), and `norm` is then None. The projections are
+    stored flat, `[inputs, heads * head_dim]`, as the decoder's own attention
+    stores them. `attention_impl` and `force_fp32_for_softmax` are the
+    decoder's.
     """
 
-    norm: Callable[..., nn.Module]
+    norm: Callable[..., nn.Module] | None
     feedforward: Callable[..., nn.Module]
     emb_features: int
     context_features: int
@@ -100,6 +116,7 @@ class GatedCrossAttention(nn.Module):
     heads: int
     kv_heads: int
     head_dim: int
+    ngpt: bool = False
     dropout_rate: float = 0.0
     attention_impl: str = "auto"
     force_fp32_for_softmax: bool = True
@@ -126,8 +143,14 @@ class GatedCrossAttention(nn.Module):
                 + counted_flops(self.feedforward(parent=None), lengths))
 
     @nn.compact
-    def __call__(self, x: jax.Array, context: CrossContext | None, *, decode: bool = False,
+    def __call__(self, stream: jax.Array, context: CrossContext | None, *,
+                 read: Callable[[jax.Array], jax.Array] | None = None, decode: bool = False,
                  train: bool = False) -> jax.Array:
+        """`stream` after the block. `stream` is the residual as the decoder
+        carries it, its rows first, and `read` gives the `[B, S, emb_features]`
+        states a sublayer reads from it; None reads the stream itself."""
+        read = read or (lambda held: held)
+        x = read(stream)
         if context is None and self.is_initializing():
             # Init reaches every parameter, the key and value maps' through a one-token context.
             context = CrossContext(jnp.zeros((x.shape[0], 1, self.context_features), x.dtype),
@@ -135,11 +158,11 @@ class GatedCrossAttention(nn.Module):
         if decode:
             key, value, lengths = self._cached(x, context)
         elif context is None:
-            return x
+            return stream
         else:
             key, value = self._keys_values(context.embeddings)
             lengths = context.lengths
-        query = constrain(projected_heads(self.norm(name="input_layernorm")(x), "q_proj", self.heads,
+        query = constrain(projected_heads(self._normed("input_layernorm", x), "q_proj", self.heads,
                                           self.head_dim, flat=True, bias=False, dtype=self.dtype,
                                           precision=self.precision), HEADS)
         # A row without context reads its first slot, so its softmax stays finite: one over no keys
@@ -150,17 +173,30 @@ class GatedCrossAttention(nn.Module):
             key_value_seq_lengths=jnp.maximum(lengths, 1))
         output = projected_output(constrain(attended, HEADS), "o_proj", self.emb_features, flat=True,
                                   bias=False, dtype=self.dtype, precision=self.precision)
-        present = (lengths > 0)[:, None, None]
+        present = (lengths > 0).reshape((-1,) + (1,) * (stream.ndim - 1))
         dropout = nn.Dropout(rate=self.dropout_rate)
 
-        def gated(name: str, branch: jax.Array) -> jax.Array:
-            gate = self.param(name, nn.initializers.zeros, (1,), jnp.float32)
+        def joined(stream: jax.Array, name: str, branch: jax.Array) -> jax.Array:
+            gate = jnp.tanh(self.param(name, nn.initializers.zeros, (1,), jnp.float32))
             branch = dropout(branch, deterministic=not train)
-            return jnp.where(present, jnp.tanh(gate).astype(branch.dtype) * branch, 0).astype(x.dtype)
+            return jnp.where(present, self._join(stream, branch, gate), stream)
 
-        x = x + gated("alpha_cross_attn", output)
-        hidden = self.feedforward(name="mlp")(self.norm(name="post_attention_layernorm")(x))
-        return x + gated("alpha_dense", hidden)
+        stream = joined(stream, "alpha_cross_attn", output)
+        hidden = self.feedforward(name="mlp")(self._normed("post_attention_layernorm", read(stream)))
+        return joined(stream, "alpha_dense", hidden)
+
+    def _normed(self, name: str, x: jax.Array) -> jax.Array:
+        return x if self.norm is None else self.norm(name=name)(x)
+
+    def _join(self, stream: jax.Array, branch: jax.Array, gate: jax.Array) -> jax.Array:
+        """`stream` with `branch` joined through `gate`: added, broadcast over any
+        axis the stream has beside the states', or under nGPT a step of `gate`
+        from the unit stream toward the unit branch, unit-normed back."""
+        if self.ngpt:
+            start, end = unit(stream).astype(jnp.float32), unit(branch).astype(jnp.float32)
+            return unit(start + _gated(end - start, gate, self.precision)).astype(stream.dtype)
+        widened = branch.reshape(branch.shape[:2] + (1,) * (stream.ndim - branch.ndim) + branch.shape[2:])
+        return stream + _gated(widened, gate, self.precision).astype(stream.dtype)
 
     def _keys_values(self, embeddings: jax.Array) -> tuple[jax.Array, jax.Array]:
         """The context's keys and values, `[B, C, kv_heads, head_dim]` each."""
@@ -200,6 +236,14 @@ class GatedCrossAttention(nn.Module):
             values.value = jnp.pad(value.astype(dtype), padding)
             lengths.value = context.lengths
         return key, value, context.lengths
+
+
+def _gated(branch: jax.Array, gate: jax.Array, precision: PrecisionLike) -> jax.Array:
+    """`branch` times the one-element `gate`, as their outer product, whose
+    transpose gives the gate a dot (the module docstring)."""
+    product = float32_dot_general(branch, gate.astype(branch.dtype), (((), ()), ((), ())),
+                                  precision=precision)
+    return product[..., 0]
 
 
 __all__ = ["CROSS_KEY", "CROSS_LENGTHS", "CROSS_VALUE", "NAME", "CrossAttention", "GatedCrossAttention",
