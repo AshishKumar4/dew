@@ -561,11 +561,17 @@ def leaf_summary(reference, truth) -> RecordedLeaf:
                         zero_sizes=own[~sized])
 
 
-def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=None) -> _Draws:
+def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=None, orders=None) -> _Draws:
     """Every leaf's errors (`_Draws`) over `seeds`: both functions run on `draw(seed)`'s inputs, truth
     `truth_fn` on them (by default `reference_fn` on them widened to float64). With `reference_seeds`,
     the reference runs on those draws instead, each held to its own draw's truth (`null_runs`), and a
-    row of float64 zero is paired only where the two truths are the same values (an orbit's draws)."""
+    row of float64 zero is paired only where the two truths are the same values (an orbit's draws).
+    With `orders`, each arm also runs at every other order of its own draw (`orders(inputs)` past its
+    first, the draw itself), held to that draw's one truth: each arm's worst row is its worst over the
+    orders, measured rows of float64 zero included, and its values finite at every one; its errors and
+    its rows of float64 zero are the draw's own order's."""
+    if orders is not None and getattr(reference_fn, "recorded", False):
+        raise ValueError("a recorded reference holds its recorded draws alone, never another order of them")
     mine, theirs, worst, zero_rows, finite, names = [], [], [], [], [], None
 
     def truth_of(inputs):
@@ -574,34 +580,27 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
 
     for at, seed in enumerate(seeds):
         inputs = draw(seed)
-        dew, truth = dew_fn(*inputs), truth_of(inputs)
+        truth = truth_of(inputs)
         if reference_seeds is None:
-            reference, their_truth = reference_fn(*inputs), truth
+            their_inputs, their_truth = inputs, truth
         else:
             their_inputs = draw(reference_seeds[at])
-            reference, their_truth = reference_fn(*their_inputs), truth_of(their_inputs)
-        paths = jax.tree_util.tree_leaves_with_path(dew)
-        names = names or [jax.tree_util.keystr(path) for path, _ in paths]
-        row = []
-        for (path, leaf), their_leaf, true, their_true in zip(paths, jax.tree.leaves(reference),
-                                                              jax.tree.leaves(truth),
-                                                              jax.tree.leaves(their_truth), strict=True):
-            recorded = isinstance(their_leaf, RecordedLeaf)
-            their = their_leaf if recorded else leaf_summary(their_leaf, their_true)
-            if np.size(leaf) == 0:
-                # An empty leaf (a one-tap convolution's history) is exact by construction: held to the
-                # reference's shape and dtype (a recorded one's shape its truth's), and the truth empty
-                # alike (in float64, its dtype is its own), it adds no error and resolves nothing.
-                kept = (np.shape(leaf), str(jnp.dtype(leaf.dtype)))
-                held = (np.shape(true) if recorded else np.shape(their_leaf), their.dtype)
-                assert kept == held, (jax.tree_util.keystr(path), kept, held)
-                assert np.shape(true) == np.shape(leaf), (jax.tree_util.keystr(path), np.shape(true))
-                row.append((0.0, 0.0, 0.0, 0.0, 0, True))
-                continue
-            # Rows pair where the two truths are the same values: the same draw, or an orbit's draws.
-            paired = (recorded or their_truth is truth
-                      or np.array_equal(np.asarray(true), np.asarray(their_true)))
-            row.append(_paired(jax.tree_util.keystr(path), leaf_summary(leaf, true), their, paired=paired))
+            their_truth = truth_of(their_inputs)
+        if orders is None:
+            ordered = [(inputs, their_inputs)]
+        else:
+            ordered = list(zip(orders(inputs), orders(their_inputs), strict=True))
+            if len(ordered) < 2:
+                raise ValueError(f"orders of {len(ordered)}; an orbit holds the draw's own and another")
+        row = None
+        for mine_at, theirs_at in ordered:
+            dew = dew_fn(*mine_at)
+            names = names or [jax.tree_util.keystr(path)
+                              for path, _ in jax.tree_util.tree_leaves_with_path(dew)]
+            evidence = _evidence(dew, reference_fn(*theirs_at), truth, their_truth)
+            row = evidence if row is None else [
+                (first[0], first[1], float(np.fmax(first[2], other[2])), float(np.fmax(first[3], other[3])),
+                 first[4], first[5] and other[5]) for first, other in zip(row, evidence, strict=True)]
         mine.append([entry[0] for entry in row])
         theirs.append([entry[1] for entry in row])
         worst.append([(entry[2], entry[3]) for entry in row])
@@ -609,6 +608,31 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
         finite.append([entry[5] for entry in row])
     return _Draws(names, np.asarray(mine), np.asarray(theirs), np.asarray(worst).reshape(len(mine), -1, 2),
                   np.asarray(zero_rows), np.asarray(finite))
+
+
+def _evidence(dew, reference, truth, their_truth) -> list[tuple]:
+    """One draw's `_paired` evidence of every leaf of `dew` and `reference` against their truths."""
+    row = []
+    for (path, leaf), their_leaf, true, their_true in zip(jax.tree_util.tree_leaves_with_path(dew),
+                                                          jax.tree.leaves(reference), jax.tree.leaves(truth),
+                                                          jax.tree.leaves(their_truth), strict=True):
+        recorded = isinstance(their_leaf, RecordedLeaf)
+        their = their_leaf if recorded else leaf_summary(their_leaf, their_true)
+        if np.size(leaf) == 0:
+            # An empty leaf (a one-tap convolution's history) is exact by construction: held to the
+            # reference's shape and dtype (a recorded one's shape its truth's), and the truth empty
+            # alike (in float64, its dtype is its own), it adds no error and resolves nothing.
+            kept = (np.shape(leaf), str(jnp.dtype(leaf.dtype)))
+            held = (np.shape(true) if recorded else np.shape(their_leaf), their.dtype)
+            assert kept == held, (jax.tree_util.keystr(path), kept, held)
+            assert np.shape(true) == np.shape(leaf), (jax.tree_util.keystr(path), np.shape(true))
+            row.append((0.0, 0.0, 0.0, 0.0, 0, True))
+            continue
+        # Rows pair where the two truths are the same values: the same draw, or an orbit's draws.
+        paired = (recorded or their_truth is truth
+                  or np.array_equal(np.asarray(true), np.asarray(their_true)))
+        row.append(_paired(jax.tree_util.keystr(path), leaf_summary(leaf, true), their, paired=paired))
+    return row
 
 
 def _paired(name: str, mine: RecordedLeaf, theirs: RecordedLeaf, *, paired: bool = True) -> tuple:
@@ -666,18 +690,19 @@ def _judgement(draws: _Draws, label: str, tails: tuple[float, float] = (LOWER_TA
             over.append(f"{leaf}: a value is not finite on {nonfinite} of {count} seeds")
             continue
         if np.sum(b) == 0:
+            # No ratio to judge, but rows over an orbit's other orders still are.
             if np.sum(a) > 0:
                 over.append(f"{leaf}: the reference equals float64 on every seed and dew does not")
-            continue
-        ratio, low, high = _judged(draws, index, tails)
-        status = _status(ratio, low, high, contained=contained)
-        if status == "inconclusive":
-            unresolved.append(f"{leaf}: inconclusive: the pooled ratio {ratio:.3f}'s interval over {count} "
-                              f"seeds is [{low:.3f}, {high:.3f}], wider than {PARITY}; give the site larger "
-                              f"inputs or more seeds (`seeds_for`)")
-        elif status == "over":
-            over.append(f"{leaf}: dew's RMS error from float64 is {ratio:.3f} times the reference's over "
-                        f"{count} seeds, interval [{low:.3f}, {high:.3f}] (allowed {PARITY})")
+        else:
+            ratio, low, high = _judged(draws, index, tails)
+            status = _status(ratio, low, high, contained=contained)
+            if status == "inconclusive":
+                unresolved.append(f"{leaf}: inconclusive: the pooled ratio {ratio:.3f}'s interval over "
+                                  f"{count} seeds is [{low:.3f}, {high:.3f}], wider than {PARITY}; give the "
+                                  f"site larger inputs or more seeds (`seeds_for`)")
+            elif status == "over":
+                over.append(f"{leaf}: dew's RMS error from float64 is {ratio:.3f} times the reference's over "
+                            f"{count} seeds, interval [{low:.3f}, {high:.3f}] (allowed {PARITY})")
         my_row, their_row = float(np.max(draws.worst[:, index, 0])), float(np.max(draws.worst[:, index, 1]))
         if not within(my_row, ROW_FACTOR * their_row):
             over.append(f"{leaf}: the worst row over {count} seeds is {my_row:.3e} from float64 over its "
@@ -727,7 +752,8 @@ def _logged(label: str, stage: int, verdict: str) -> None:
                                   "label": label, "stage": stage, "verdict": verdict}) + "\n")
 
 
-def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn=None) -> None:
+def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn=None,
+                    orders=None) -> None:
     """Check 1 of the gate: on par. Each leaf's RMS error from float64,
     pooled over the site's declared seeds, within PARITY times the reference's, and its worst row over
     those seeds within ROW_FACTOR times the reference's worst; each row of float64 zero (below RESOLUTION
@@ -741,6 +767,17 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
     the seed picks. `seeds` is the site's declared count, sized by `seeds_for` so the reference
     compared with itself resolves PARITY; jit the two functions so every seed reuses one compiled
     program.
+
+    Where a computation has an orbit of summation orders, `orders(inputs)` lists a draw's inputs at K
+    of them, the draw itself first: an exact symmetry of the result (a batch's rows in another order
+    under a mean, a sum's terms in another), so one truth holds at every order. Both arms run at every
+    one (`_drawn`), and each one's worst row is its worst over them, compared alike; the pooled ratio,
+    the rows of float64 zero and the sizing stay the draw's own order's. A row that nearly cancels
+    rounds worst at some orders and well at others, so one order's worst row is no measure of it, and
+    the reference's luckiest order would fail an equally exact Dew; over the orbit Dew's worst is held
+    within ROW_FACTOR of the reference's worst at any of the same orders, which is as strict as the
+    reference is spread over them: a Dew worse than the reference at every order still fails, and one
+    the reference is exact against at every order fails at any order it is not.
 
     A leaf passes when its pooled ratio (`_pooled`) is at most PARITY and its seeds resolve it: the
     ratio's bootstrap interval over them (tails LOWER_TAIL and UPPER_TAIL, widened to hold the ratio)
@@ -761,8 +798,9 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
         raise Inconclusive(f"{label}: {seeds} seeds cannot be judged; check 1 takes at least {FEWEST_SEEDS} "
                            f"(`seeds_for`)")
     over, unresolved, stage = _staged(
-        lambda start, stop: _drawn(dew_fn, reference_fn, draw, range(start, stop), truth_fn), seeds, label)
-    _logged(label, stage, "over" if over else "inconclusive" if unresolved else "pass")
+        lambda start, stop: _drawn(dew_fn, reference_fn, draw, range(start, stop), truth_fn, orders=orders),
+        seeds, label)
+    _logged(label, stage, _verdict(over, unresolved))
     if over:
         raise AssertionError("\n".join(over + unresolved))
     if unresolved:
@@ -852,18 +890,23 @@ def recording(path) -> dict[str, np.ndarray]:
 
 
 def null_runs(reference_fn, draw, label: str, *, seeds: int, runs: int, first: int = 0,
-              truth_fn=None, two_stage: bool = True, dew_fn=None) -> list[tuple[str, int]]:
+              truth_fn=None, two_stage: bool = True, dew_fn=None, orders=None,
+              paired: bool = False) -> list[tuple[str, int, list[str]]]:
     """Check 1 run `runs` times on an equally exact pair, the reference against itself on disjoint
-    draws: each run's verdict, "pass", "over" or "inconclusive", and the stage it reached, a run judged
-    as `assert_as_exact` judges a site (`_staged`: its declared `seeds`, its second stage, every leaf's
-    ratio, interval and rows), or as the procedure before it with `two_stage` false. Run r of
-    a call takes draws no other run of any call with the same `first` grid takes: seeds from
-    (first + r)·2·(1 + REDRAW)·seeds on, the first half its "Dew"'s and the second its reference's, so
-    the runs are independent repetitions as far as `draw` makes its draws so. The null
-    control of a site's operation class: its false-red rate, every
+    draws: each run's verdict, "pass", "over" or "inconclusive", the stage it reached and its findings
+    (`_judgement`'s, each naming its leaf and rule), a run judged as `assert_as_exact` judges a site
+    (`_staged`: its declared `seeds`, its second stage, every leaf's ratio, interval and rows), or as the
+    procedure before it with `two_stage` false. Run r of a call takes draws no other run of any call
+    with the same `first` grid takes: seeds from (first + r)·2·(1 + REDRAW)·seeds on, the first half its
+    "Dew"'s and the second its reference's, so the runs are independent repetitions as far as `draw`
+    makes its draws so. The null control of a site's operation class: its false-red rate, every
     nonpassing verdict counted, bounds the gate's own on that class. With `dew_fn` a fault of the
     reference (a dropped term, a wrong scale), the runs measure the procedure's power on that class,
-    both procedures on the same draws."""
+    both procedures on the same draws. `paired` runs both arms on the same draws, as a site does, `dew_fn`
+    then the other implementation (an equally exact one, or a fault); `orders` judges rows over each
+    draw's orbit, as a site that declares one."""
+    if paired and dew_fn is None:
+        raise ValueError("a paired null run takes its other implementation, `dew_fn`")
     verdicts = []
     span = (1 + REDRAW) * seeds
     for run in range(first, first + runs):
@@ -871,11 +914,18 @@ def null_runs(reference_fn, draw, label: str, *, seeds: int, runs: int, first: i
 
         def drawn(start, stop, base=base):
             return _drawn(dew_fn or reference_fn, reference_fn, draw, range(base + start, base + stop),
-                          truth_fn, reference_seeds=range(base + span + start, base + span + stop))
+                          truth_fn, orders=orders,
+                          reference_seeds=None if paired else range(base + span + start, base + span + stop))
 
         over, unresolved, stage = _staged(drawn, seeds, label, two_stage=two_stage)
-        verdicts.append(("over" if over else "inconclusive" if unresolved else "pass", stage))
+        verdicts.append((_verdict(over, unresolved), stage, over + unresolved))
     return verdicts
+
+
+def _verdict(over: list[str], unresolved: list[str]) -> str:
+    """A judgement's verdict: "over" where any leaf failed, else "inconclusive" where any is unresolved,
+    else "pass"."""
+    return "over" if over else "inconclusive" if unresolved else "pass"
 
 
 def null_rate_bound(reds: int, runs: int, confidence: float = CONFIDENCE) -> float:
@@ -972,8 +1022,13 @@ def indexed_recording(stored, site: str, seeds: int, *, inputs_of=None, truth_fn
         return np.int32(seed), drawn
 
     def lookup(values):
-        return jax.jit(lambda index, inputs: {name: jnp.asarray(value)[index]
-                                            for name, value in values.items()})
+        looked = jax.jit(lambda index, inputs: {name: jnp.asarray(value)[index]
+                                              for name, value in values.items()})
+
+        def recorded(index, inputs):
+            return looked(index, inputs)
+        recorded.recorded = True
+        return recorded
 
     return draw, lookup(reference), lookup(truth)
 
@@ -1018,6 +1073,8 @@ def _summarized(stored, site: str, seeds: int, inputs_of, truth_fn):
                                 finite=bool(finite[name][index]), dtype=str(dtypes[name]))
 
         return {name: leaf(name) for name in mse}
+
+    reference.recorded = True
 
     def truth(index, inputs):
         index = int(index)
