@@ -20,6 +20,10 @@ GEOMETRIES = [pytest.param(width, size, id=f"w{width}-c{size}")
 @pytest.mark.parametrize("name,seeds", [pytest.param("scalar delta", 40, id="scalar"),
                                        pytest.param("gated", 320, id="gated")])
 def test_structural(width, size, name, seeds, monkeypatch):
+    measure(width, size, name, seeds, monkeypatch)
+
+
+def measure(width, size, name, seeds, monkeypatch):
     monkeypatch.setattr(token, "KEY_WIDTH", width)
     monkeypatch.setattr(c, "held_chunk", lambda size, width: size)
     hooks = st.SITES[name]

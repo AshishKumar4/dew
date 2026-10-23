@@ -30,8 +30,12 @@ def split_value(left, right):
 def reduced_value(left, right):
     if left.dtype != jnp.float32:
         return raw(left, right)
-    products = two_product(left[..., :, :, None], right[..., None, :, :],
-                           rounding=jax.lax.optimization_barrier)
+    lhs, rhs = left[..., :, :, None], right[..., None, :, :]
+    if os.environ.get("DEW_PROBE_NO_PRODUCT_RESIDUAL"):
+        product = lhs * rhs
+        products = product, jnp.zeros_like(product)
+    else:
+        products = two_product(lhs, rhs, rounding=jax.lax.optimization_barrier)
     zero = jnp.zeros((), left.dtype)
     hi, lo = jax.lax.reduce(products, (zero, zero), compensated_add, (left.ndim - 1,))
     return hi + lo

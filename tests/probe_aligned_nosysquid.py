@@ -1,5 +1,7 @@
 """Single-draw aligned-key precision localization; CPU only, not a product test."""
 import functools
+import dataclasses
+import os
 import sys
 import time
 
@@ -33,6 +35,14 @@ def rms(x):
 
 def run(mode, name, seed):
     start = time.monotonic()
+    if "DEW_PROBE_WIDTH" in os.environ:
+        import test_recurrence_chunk as token
+        token.KEY_WIDTH = int(os.environ["DEW_PROBE_WIDTH"])
+        st.SITES["scalar delta"] = dataclasses.replace(st.SITES["scalar delta"],
+                                                       scale=token.KEY_WIDTH**-.5)
+    if "DEW_PROBE_CHUNK" in os.environ:
+        st.CHUNK = int(os.environ["DEW_PROBE_CHUNK"])
+        c.held_chunk = lambda size, width: size
     with jax.enable_x64(False):
         drawn = st.cotangents(st.SITES[name], "aligned keys", seed)
     jax.config.update("jax_enable_x64", True)
@@ -41,7 +51,10 @@ def run(mode, name, seed):
     ref32 = ref(*drawn)
     with jax.enable_x64(True):
         truth = ref(*widened(drawn))
-    if mode.startswith("comp:"):
+    if mode == "chunk-adjoint":
+        from probe_aligned_chunk_adjoint_nosysquid import chunk_adjoint
+        c.chunk_delta_rule = chunk_adjoint
+    elif mode.startswith("comp:"):
         import probe_aligned_dots_nosysquid as dots
         from probe_aligned_compensated_nosysquid import dot
         dots.wide_dot = dot

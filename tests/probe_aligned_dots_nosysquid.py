@@ -18,7 +18,7 @@ def install(selected):
     if "all" in selected:
         selected = {f"{name}.{side}" for name in ("merge", "intra", "scores", "local", "apply_w",
                                                   "apply_u", "corrected", "memory", "write")
-                    for side in ("p", "l", "r", "e")}
+                    for side in ("p", "l", "r", "e", "d")}
     original = a.portable
     original_factor = a.factor
     original_paired = a.paired
