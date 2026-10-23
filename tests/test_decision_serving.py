@@ -15,7 +15,7 @@ from tool_support import load
 
 from dew.decision import Decide
 from dew.decision.calibration import Temperatures
-from dew.inference.scoring import ScoringServer
+from dew.inference import ScoringServer
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURES = ROOT / "tests" / "fixtures" / "laya"

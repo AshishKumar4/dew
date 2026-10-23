@@ -10,8 +10,7 @@ from dataclasses import dataclass
 import jax.numpy as jnp
 import pytest
 
-from dew.inference.engine import Engine
-from dew.inference.scoring import Scored, ScoringServer
+from dew.inference import Engine, Scored, ScoringServer
 
 
 @dataclass(frozen=True)

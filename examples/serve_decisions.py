@@ -61,8 +61,7 @@ from starlette.routing import Route
 
 from dew.decision import Decide
 from dew.decision.task import WireScoring
-from dew.inference.engine import Engine
-from dew.inference.scoring import ScoringServer
+from dew.inference import Engine, ScoringServer
 
 
 def served(decide: Decide, *, details: bool = False, strict: bool = False, whole: bool = False,

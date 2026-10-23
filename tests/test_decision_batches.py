@@ -1,15 +1,19 @@
 """`Decide.systemone` over a list of request bodies: each answered as it is alone, its rows scored with
 the others', a refusal its own body's."""
 
+import dataclasses
 import json
 from pathlib import Path
 
+import jax
+import jax.numpy as jnp
 import numpy as np
 import pytest
 from PIL import Image
-from reference_error import assert_as_exact
+from reference_error import assert_as_exact, widened
 
 from dew.decision import Decide
+from dew.decision.model import DecisionModel
 from dew.decision.questions import ChoiceAnswer, Question
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -95,10 +99,15 @@ def test_a_batchs_probabilities_are_each_bodys_alone(decide):
                                for answer in answers.values()])
 
     def truth(seed):
-        if "task" not in wide:
-            wide["task"] = Decide.from_pretrained(LAYA, attention_impl="reference", dtype="float64",
-                                                  param_dtype="float64")
-        return scored(wide["task"], seed, together=False)
+        with jax.enable_x64(new_val=True):
+            if "task" not in wide:
+                # The release in float64: its backbone and head computing in it, over its weights widened.
+                model = decide.model
+                wide["task"] = dataclasses.replace(
+                    decide, model=DecisionModel(model.backbone.clone(dtype=jnp.float64),
+                                                model.head.clone(dtype=jnp.float64)),
+                    variables=widened(decide.variables))
+            return scored(wide["task"], seed, together=False)
 
     def draw(seed):
         # The draw is its seed; the bodies are made from it, their text no array the check widens.
@@ -144,9 +153,7 @@ def test_one_engine_serves_generation_and_scoring_from_one_thread(decide):
     and each scoring answer is its lone answer, the two kinds stepped in turn."""
     from model_support import serving_task
 
-    from dew.inference.engine import Engine
-    from dew.inference.scoring import ScoringServer
-    from dew.inference.serving import Server
+    from dew.inference import Engine, ScoringServer, Server
 
     bound = serving_task()
     prompts, budgets = ["12", "5", "1234567"], [3, 5, 2]
