@@ -213,6 +213,39 @@ def attention_keys():
     return reference, draw, None, permuting
 
 
+def attention_key_bias(heads: int = 16, queries: int = 64, keys: int = 128, width: int = 32):
+    """Softmax attention's three bias gradients, packed as one leaf of query, key and value rows,
+    `heads` of each, over the orbit of its keys' orders. The key bias's gradient is zero in exact
+    arithmetic (each row of softmax's dS sums to zero), so float64 holds its rows at its own residue,
+    rows of float64 zero beside the query's and value's sized rows: the class of a site whose leaf
+    packs a structural zero (`pooled_zero_rows`)."""
+    import jax
+    import jax.numpy as jnp
+    import numpy as np
+
+    @jax.jit
+    def reference(q, k, v, bq, bk, bv, cotangent):
+        def attend(bq, bk, bv):
+            logits = jnp.einsum("hqd,hkd->hqk", q + bq[:, None], k + bk[:, None], precision="highest")
+            weights = jax.nn.softmax(logits / np.sqrt(width), -1)
+            return jnp.einsum("hqk,hkd->hqd", weights, v + bv[:, None], precision="highest")
+        _, pull = jax.vjp(attend, bq, bk, bv)
+        return {"bias": jnp.concatenate(pull(cotangent), axis=0)}
+
+    def draw(seed):
+        rng = np.random.default_rng([0xB1A5, seed])
+        shapes = ((heads, queries, width), (heads, keys, width), (heads, keys, width), (heads, width),
+                  (heads, width), (heads, width), (heads, queries, width))
+        return tuple(rng.standard_normal(shape).astype(np.float32) for shape in shapes)
+
+    def permuting(inputs, order):
+        q, k, v, *rest = inputs
+        at = permutation(0x0B, order, k.shape[1])
+        return (q, k[:, at], v[:, at], *rest)
+
+    return reference, draw, None, permuting
+
+
 def heavy_sums(rows: int = 64, terms: int = 256):
     """Sums of `terms` float32 terms over `rows` rows, each draw's terms scaled by one heavy-tailed factor
     (a Pareto of index one, plus one), over the orbit of the terms' orders: each arm's error grows with
@@ -241,7 +274,8 @@ def heavy_sums(rows: int = 64, terms: int = 256):
 
 CLASSES = {"cross-entropy-columns": cross_entropy_columns, "decoder-residual-orders": decoder_residual_orders,
            "contraction-terms": contraction_terms, "mean-loss-rows": mean_loss_rows,
-           "attention-keys": attention_keys, "heavy-sums": heavy_sums}
+           "attention-keys": attention_keys, "attention-key-bias": attention_key_bias,
+           "heavy-sums": heavy_sums}
 """Each class's reference, draw, truth (None: the reference widened) and, for an orbit class, its
 `permuting(inputs, order)` (`orbited`), else None."""
 
@@ -361,6 +395,23 @@ def _scaled_output(factor):
     return fault
 
 
+def _row_scaled(row: int, factor: float):
+    """A fault scaling row `row` of each output leaf by `factor`: on a row of float64 zero, its residue
+    `factor` times Dew's own."""
+    def fault(reference):
+        def run(*arguments):
+            import jax
+            import numpy as np
+
+            def moved(leaf):
+                leaf = np.array(leaf)
+                leaf[row] = leaf[row] * factor
+                return leaf
+            return jax.tree.map(moved, reference(*arguments))
+        return run
+    return fault
+
+
 def _one_row(relative):
     """A fault moving one row of each output leaf, its first along the leading axes, by `relative` of
     itself: tens of times a float32 row's own rounding, and too little of the leaf for its RMS ratio to
@@ -415,6 +466,11 @@ FAULTS = {
         "scale-2^-22": _scaled_output(1 + 2.0 ** -22),
         "one-row": _one_row(2.0 ** -14),
     },
+    "attention-key-bias": {
+        "zero-row-10x": _row_scaled(16, 10.0),
+        "zero-row-2^10": _row_scaled(16, 2.0 ** 10),
+        "dropped-term": _input_fault(2, _zeroed((slice(None), 0))),
+    },
     "attention-keys": {
         "dropped-term": _input_fault(2, _zeroed((slice(None), 0))),
         "flipped-sign": _input_fault(2, _negated((slice(None), 0))),
@@ -431,7 +487,9 @@ its column scale rounded to bfloat16 where float32 is claimed, a column of its v
 decoder's parameters scaled, or rounded to bfloat16; for each orbit class a term dropped, a term's sign
 flipped, its arithmetic in float16, a chunk of its terms skipped, its outputs scaled by 1 + 2^-22, and one
 row of each output moved by 2^-14 of itself; and attention's one row by 2^-20, sixteen float32 units in
-its last place, which the worst-row rule alone resolves among its 512 rows."""
+its last place, which the worst-row rule alone resolves among its 512 rows; for the packed attention
+biases its first key row, a row of float64 zero, ten and 1,024 times its own residue, and a value term
+dropped."""
 
 
 def _law(name: str, rng, size: int):
