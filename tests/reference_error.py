@@ -149,51 +149,59 @@ def with_gradients(fn):
     return run
 
 
+def _host_tensor(value):
+    """A torch copy of a host array, its own shape and dtype, bfloat16 through the float32 that holds it
+    exactly (NumPy holds it as ml_dtypes'). A copy, so autograd never writes an array JAX holds."""
+    import torch
+
+    value = np.array(value)
+    if value.dtype.name == "bfloat16":
+        return torch.as_tensor(value.astype(np.float32)).bfloat16()
+    return torch.as_tensor(value)
+
+
+def _host_array(value):
+    """A tensor as a host array, bfloat16 as the float32 that holds it exactly."""
+    import torch
+
+    value = value.detach()
+    return (value.float() if value.dtype == torch.bfloat16 else value).numpy()
+
+
 def torch_with_gradients(fn):
-    """`with_gradients` for a torch arm: `fn(*tensors)` as `run(*inputs, cotangent)`, which returns
-    `fn`'s output and the gradients of its inputs under the cotangent passed last, as NumPy arrays. Each
-    floating input enters as a tensor of its own dtype that requires a gradient, and the cotangent
-    (an array, or a tuple or dict of them matching the output) is cast to its output's dtype, as
-    `jax.vjp` casts it. A module's parameters are inputs too, called through
-    `torch.func.functional_call`. An input the output does not reach has a zero gradient, and a
-    non-floating one none; a bfloat16 array, which NumPy holds as ml_dtypes' and float32 holds exactly,
-    goes in and comes out through float32."""
+    """`with_gradients` for a torch arm. `fn(*tensors)` becomes `run(*inputs, cotangent)`, which returns
+    `fn`'s output and the gradients of its inputs under the cotangent passed last, as host arrays.
+    - Each floating input enters as a tensor of its own dtype that requires a gradient; a module's
+      parameters are inputs too, called through `torch.func.functional_call`.
+    - The cotangent has the output's tree (an array, or a tuple or dict of them), as `jax.vjp` requires,
+      each leaf cast to its output's dtype.
+    - An input the output does not reach has a zero gradient, a non-floating one none, and an output no
+      input reaches pulls nothing back.
+    - A bfloat16 array goes in and comes out through the float32 that holds it."""
     def run(*arguments):
         import torch
 
-        def host(value):
-            # A copy of the array's own shape (`ascontiguousarray` lifts a 0-d array to 1-d), bfloat16
-            # through the float32 that holds it.
-            value = np.array(value)
-            if value.dtype.name == "bfloat16":
-                return torch.as_tensor(value.astype(np.float32)).bfloat16()
-            return torch.as_tensor(value)
-
-        def tensor(value):
-            value = host(value)
-            return value.requires_grad_() if value.is_floating_point() else value
-
-        def array(value):
-            value = value.detach()
-            return (value.float() if value.dtype == torch.bfloat16 else value).numpy()
-
-        inputs = jax.tree.map(tensor, arguments[:-1])
+        inputs, cotangent = jax.tree.map(_host_tensor, arguments[:-1]), arguments[-1]
+        for leaf in jax.tree.leaves(inputs):
+            if leaf.is_floating_point():
+                leaf.requires_grad_()
         out = fn(*inputs)
-        leaves, cotangents = jax.tree.leaves(out), jax.tree.leaves(arguments[-1])
-        if len(leaves) != len(cotangents):
-            raise ValueError(f"{len(cotangents)} cotangents for {len(leaves)} outputs")
-        wanted = [leaf for leaf in jax.tree.leaves(inputs) if leaf.requires_grad]
-        # An output no input reaches, a constant, pulls nothing back.
-        reached = [(leaf, c) for leaf, c in zip(leaves, cotangents, strict=True) if leaf.requires_grad]
+        if jax.tree.structure(out) != jax.tree.structure(cotangent):
+            raise ValueError(f"a cotangent of tree {jax.tree.structure(cotangent)} for an output of tree "
+                             f"{jax.tree.structure(out)}")
+        flat, tree = jax.tree.flatten(inputs)
+        wanted = [index for index, leaf in enumerate(flat) if leaf.requires_grad]
+        reached = [(leaf, c) for leaf, c in zip(jax.tree.leaves(out), jax.tree.leaves(cotangent), strict=True)
+                   if leaf.requires_grad]
         pulled = [None] * len(wanted)
         if wanted and reached:
-            pulled = torch.autograd.grad([leaf for leaf, _ in reached], wanted,
-                                         grad_outputs=[host(c).to(leaf.dtype) for leaf, c in reached],
+            pulled = torch.autograd.grad([leaf for leaf, _ in reached], [flat[index] for index in wanted],
+                                         grad_outputs=[_host_tensor(c).to(leaf.dtype) for leaf, c in reached],
                                          allow_unused=True)
-        gradients = iter(array(torch.zeros_like(leaf) if grad is None else grad)
-                         for leaf, grad in zip(wanted, pulled, strict=True))
-        found = jax.tree.map(lambda leaf: next(gradients) if leaf.requires_grad else None, inputs)
-        return jax.tree.map(array, out), *found
+        gradients = [None] * len(flat)
+        for index, grad in zip(wanted, pulled, strict=True):
+            gradients[index] = _host_array(torch.zeros_like(flat[index]) if grad is None else grad)
+        return jax.tree.map(_host_array, out), *jax.tree.unflatten(tree, gradients)
 
     return run
 
