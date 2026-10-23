@@ -58,7 +58,8 @@ everywhere: set[str] = set()
 readers: list[set[str]] = []
 """Where a read is kept. conftest.py's reads are every test's, so they are left out."""
 collected: dict[str, int] = {}
-"""Each test file's tests as collection found them, before any hook chose among them; a module of none is 0."""
+"""Each test file's tests as collection found them, before any hook chose among them; a module of none
+is 0."""
 deselected: dict[str, int] = {}
 """Each test file's tests the selection set aside, as pytest reports it (`pytest_deselected`)."""
 starts: dict[str, int] = {}
