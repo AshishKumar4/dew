@@ -57,7 +57,7 @@ def gpu_driver(root: Path, monkeypatch) -> None:
 
 
 def main_ran(ci, root: Path, monkeypatch, tests: dict[str, float], ranges: dict | None = None) -> None:
-    """The verdict of main's last green run as CI's suite step fetches it (`ci.TIMES`): a 3.12 row a file,
+    """The verdict of main's last green run as CI's suite step fetches it (DEW_TEST_TIMES): a 3.12 row a file,
     holding its tests' times, or with `ranges` a row a group (`row name: range`), each with its tests."""
     rows: dict[str, dict] = {}
     for name, bounds in (ranges or {}).items():
@@ -69,7 +69,7 @@ def main_ran(ci, root: Path, monkeypatch, tests: dict[str, float], ranges: dict 
         name = held[0] if held else f"3.12:{file}"
         rows.setdefault(name, {"name": name, "exitCode": 0, "tests": {}})["tests"][node] = seconds
     (root / "times.json").write_text(json.dumps({"rows": list(rows.values())}))
-    monkeypatch.setenv(ci.TIMES, str(root / "times.json"))
+    monkeypatch.setenv("DEW_TEST_TIMES", str(root / "times.json"))  # as CI's suite step exports it
 
 
 def in_range(node: str, bounds: str | None) -> bool:
@@ -694,7 +694,7 @@ def test_a_split_files_groups_run_every_test_once(ci, tmp_path, monkeypatch):
     assert len(ranged) >= 2 and all(entry["bounds"] for entry in ranged)
     assert sorted(node for nodes in ran_by(ci, tmp_path, monkeypatch, ranged) for node in nodes) == every
     # A plan with no verdict of main's (one run in a container) knows the file by armada's median alone.
-    monkeypatch.delenv(ci.TIMES)
+    monkeypatch.delenv("DEW_TEST_TIMES")
     counted = split_entries(ci, 4.0, {"files": {"3.12:tests/test_split.py": 10.0}})
     assert len(counted) >= 2 and not any(entry["bounds"] for entry in counted)
     assert sorted(node for nodes in ran_by(ci, tmp_path, monkeypatch, counted) for node in nodes) == every
