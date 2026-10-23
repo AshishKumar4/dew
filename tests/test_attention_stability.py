@@ -133,24 +133,25 @@ def _ties(width: int, cotangent: float) -> Callable[[int], tuple]:
 
 def _small_weight(dtype, *, queries: int, logits: tuple[float, float], sizes: tuple[float, float] | None,
                   rows: int = 128) -> Family:
-    # `queries` queries a row over 256 keys of which two are seen: a key of logit 0 and one whose logit is a
+    # `queries` queries a row over 32 keys of which two are seen: a key of logit 0 and one whose logit is a
     # quarter of each query's size (drawn in `sizes`, else 4) times its key's -l, l drawn in `logits`, on a
-    # value of 2^e, e drawn in [120, 126]: its share of the output, a weight shifted for the keys' count
-    # before it is narrowed would lose. At logits of -80 to -87 the weight is a normal fp32 and bf16 at
-    # their exponent's edge, which a weight shifted before it is narrowed would flush (`Room.small`).
+    # value of 2^e, e drawn in [120, 126]: its share of the output, which a weight shifted for the sums'
+    # headroom before it is narrowed would lose. At logits of -80 to -87 the weight is a normal fp32 and
+    # bf16 at their exponent's edge, which a weight shifted before it is narrowed would flush
+    # (`Room.small`). One key tile a row, so the family's many rows stay cheap to interpret.
     def draw(seed):
         size = (np.full((rows, queries), 4.0, np.float32) if sizes is None
                 else _uniform(seed + 4, *sizes, (rows, queries)))
-        key = np.zeros((rows, 256, 1, 16), np.float32)
+        key = np.zeros((rows, 32, 1, 16), np.float32)
         key[:, 1, 0, 0] = -_uniform(seed, *logits, (rows,))
-        value = np.zeros((rows, 256, 1, 16), np.float32)
+        value = np.zeros((rows, 32, 1, 16), np.float32)
         value[:, 1, 0, 0] = 2.0 ** np.floor(_uniform(seed + 1, 120.0, 127.0, (rows,)))
         value[:, :2, 0, 1:] = _uniform(seed + 3, -1.0, 1.0, (rows, 2, 15))
         # The cotangent drawn times 2^-4, so its product with a value of 2^126 stays within bf16's and
         # fp32's largest in the reference's backward.
         (dout,) = _normal(seed + 2, (rows, queries, 1, 16))
         return _first(size, 16), key, value, None, dout * np.float32(2.0 ** -4)
-    seen = np.zeros((rows, 1, queries, 256), bool)
+    seen = np.zeros((rows, 1, queries, 32), bool)
     seen[..., :2] = True
     return Family(draw, seen, {"lengths": np.full(rows, 2)}, dtype=dtype)
 
@@ -487,8 +488,9 @@ def _families() -> dict[str, Family]:
     for low, high, label in ((-3.0, 3.0, ""), (1e38, 3e38, " near fp32's largest")):
         # One query a row, so the decode kernel takes the family too.
         name = f"a decode step's sink{label} and one key"
-        families[name] = Family(_with_sinks(_drawn(1, 1, rows=128, heads=16), low, high),
-                                np.ones((128, 1, 1, 1), bool), folded=low < 0)
+        # Thirty-two heads a row of 32, so each draw holds 32 sinks' gradients over few rows.
+        families[name] = Family(_with_sinks(_drawn(1, 1, rows=32, heads=32), low, high),
+                                np.ones((32, 1, 1, 1), bool), folded=low < 0)
     ids = np.tile(np.asarray([[1, 2, 3, 3]], np.int32), (ROWS, 1))
     families["documents of one key"] = Family(_drawn(4, 4), _causal(4, 4, ROWS) & (ids[:, None, :, None] ==
                                                                                   ids[:, None, None, :]),
