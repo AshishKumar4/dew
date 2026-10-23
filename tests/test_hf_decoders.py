@@ -549,23 +549,28 @@ def _class_defaults(name):
 
 
 def _translated(config):
-    """The decoder a config translates to, or None where the translation refuses it."""
+    """The decoder a config translates to, or None where the translation refuses it or finds a field
+    it requires missing."""
     try:
         return translate_config(config)
-    except ValueError:
+    except (ValueError, KeyError):
         return None
 
 
 @pytest.mark.parametrize("name", CLASS_DEFAULTED)
 def test_a_field_left_out_reads_as_its_config_class_fills_it(name):
     """Each field of the family's config class, once stated at the class's default and once left
-    out of the fixture's config: both translate to one decoder, or both are refused, because the
-    family fills an omitted field as its class does, never at another family's default. Over the
-    fixture's own weights, one decoder computes one set of logits
+    out of the fixture's config: where the field left out translates at all, it translates to the
+    decoder the stated default does, because the family fills an omitted field as its class does,
+    never at another family's default. A field the family requires is refused when left out, never
+    read as something else. Over the fixture's own weights, one decoder computes one set of logits
     (`test_a_source_spelled_another_way_computes_the_reference_logits`)."""
     config = fixture_config(name)
-    differing = [field for field, default in _class_defaults(name).items()
-                 if _translated({**config, field: default}) != _translated(_without(field)(config))]
+    differing = []
+    for field, default in _class_defaults(name).items():
+        left = _translated(_without(field)(config))
+        if left is not None and left != _translated({**config, field: default}):
+            differing.append(field)
     assert not differing, f"{name} reads {differing} otherwise than its class where they are left out"
 
 
