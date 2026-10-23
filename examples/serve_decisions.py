@@ -39,10 +39,11 @@ Decision Index requires of an engine:
 
 The task is served by Dew's serving engine (`dew.inference.engine.Engine`)
 as a scoring server (`dew.inference.scoring.ScoringServer`): concurrent
-requests are answered together, those waiting when a batch starts, up to
-`--batch-rows` of them and `--batch-tokens` of their rows' tokens, each as it
-would be alone; a request Jev would refuse gets its own 422 and the others
-their answers. `GET /health` answers once the model is loaded.
+requests are answered together, one forward pass a turn over the rows waiting,
+up to `--batch-rows` rows and `--batch-tokens` of their padded tokens a pass
+(the task's `Budget`), each as it would be alone; a request Jev would refuse
+gets its own 422 and the others their answers. `GET /health` answers once the
+model is loaded.
 """
 
 import asyncio
@@ -60,16 +61,16 @@ from starlette.responses import JSONResponse
 from starlette.routing import Route
 
 from dew.decision import Decide
-from dew.decision.task import WireScoring
+from dew.decision.task import Budget, WireScoring
 from dew.inference import Engine, ScoringServer
 
 
 def served(decide: Decide, *, details: bool = False, strict: bool = False, whole: bool = False,
            tokens: int = 8192, rows: int = 64) -> ScoringServer:
-    """A scoring server over `decide`'s wire answers (`Decide.scoring`), concurrent requests answered
-    together, at most `rows` of them and `tokens` of their rows' tokens a batch."""
-    return ScoringServer.from_task(*decide.scoring(details=details, strict=strict, whole=whole),
-                                   tokens=tokens, rows=rows)
+    """A scoring server over `decide`'s wire answers (`Decide.scoring`), concurrent requests' rows
+    answered together, at most `rows` of them and `tokens` of their padded tokens a pass."""
+    task = replace(decide, budget=Budget(tokens=tokens, rows=rows))
+    return ScoringServer.from_task(*task.scoring(details=details, strict=strict, whole=whole))
 
 
 def app(server: ScoringServer, *, api_key: str | None = None) -> Starlette:
@@ -130,9 +131,9 @@ class Options:
     option_tokens: int | None = None
     """For a layout of one row per question: the most tokens one option keeps."""
     batch_tokens: int = 8192
-    """The most tokens of their rows the requests one batch answers hold."""
+    """The most padded tokens one pass holds."""
     batch_rows: int = 64
-    """The most requests one batch answers."""
+    """The most rows one pass holds."""
 
 
 def main(options: Options) -> None:

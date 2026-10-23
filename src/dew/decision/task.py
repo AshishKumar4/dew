@@ -326,17 +326,22 @@ class Decide:
         """Each request's answers and usage, from the rows it encodes to (`_encoded`) and its
         questions, every request's rows scored together within the budget."""
         requests = list(zip(encoded, asked, strict=True))
-        rows = [(index, row) for index, (own, _) in enumerate(requests) for row in own]
-        logits = self.logits([encoded for _, encoded in rows])
-        answered: list[tuple[dict[str, Answer], Usage]] = []
-        for index, (_, questions) in enumerate(requests):
-            own = [(encoded, scores) for (row, encoded), scores in zip(rows, logits, strict=True)
-                   if row == index]
-            answers = {laid.name: self._answer(questions[laid.name], _ordered(laid, scores[slot]))
-                       for encoded, scores in own for slot, laid in enumerate(encoded.questions)}
-            answered.append(({name: answers[name] for name in questions},
-                             usage_of([encoded for encoded, _ in own])))
-        return answered
+        logits = iter(self.logits([row for own, _ in requests for row in own]))
+        return [self._replied(questions, own, [next(logits) for _ in own]) for own, questions in requests]
+
+    def _replied(self, questions: Mapping[str, Question], rows: Sequence[Encoded],
+                 scores: Sequence[np.ndarray]) -> tuple[dict[str, Answer], Usage]:
+        """A request's answers and usage from its rows and each row's raw `[Q, K]` logits (`logits`)."""
+        answers = {laid.name: self._answer(questions[laid.name], _ordered(laid, own[slot]))
+                   for row, own in zip(rows, scores, strict=True) for slot, laid in enumerate(row.questions)}
+        return {name: answers[name] for name in questions}, usage_of(rows)
+
+    def fits(self, rows: Sequence[Encoded]) -> bool:
+        """Whether `rows` are one of `logits`' passes: within the budget's rows, and its tokens at the
+        pass's bucketed shape (`shape_bucket`)."""
+        longest = max(len(row.tokens) for row in rows)
+        return (len(rows) <= self.budget.rows
+                and shape_bucket(longest, 64) * shape_bucket(len(rows), 1) <= self.budget.tokens)
 
     def _seen(self, state: JSON, questions: Mapping[str, Question], images: Sequence[Image.Image],
               context: JSON | None = None) -> tuple[dict[str, Answer], Usage]:
@@ -357,14 +362,16 @@ class Decide:
     def _looked(self, questions: Mapping[str, Question], row: Encoded, media: Images
                 ) -> tuple[dict[str, Answer], Usage]:
         """A request's answers and usage from its one row and images (`_shown`), by a pass of its own."""
+        return self._replied(questions, [row], self._seen_pass([(row, media)]))
+
+    def _seen_pass(self, rows: Sequence[tuple[Encoded, Images]]) -> list[np.ndarray]:
+        """Each row's raw `[Q, K]` logits from one pass over rows that hold images, alike as
+        `Images.joined` takes them (`seen_together`)."""
         assert self.processor is not None, "a row of images was laid out with the processor"
-        inputs = DecisionInputs.collate([row], self.specials.pad, context_length=self.context_length)
-        scores = np.asarray(self._forward(self.variables, inputs,
-                                          media=media.inputs(self.processor, row)))[0]
-        answers = {laid.name: self._answer(questions[laid.name], _ordered(laid, scores[slot]))
-                   for slot, laid in enumerate(row.questions)}
-        return ({name: answers[name] for name in questions},
-                Usage(len(row.tokens), row.state_tokens, row.state_kept, row.trimmed))
+        encoded = [row for row, _ in rows]
+        inputs = DecisionInputs.collate(encoded, self.specials.pad, context_length=self.context_length)
+        scores = np.asarray(self._forward(self.variables, inputs, media=Images.joined(self.processor, rows)))
+        return [scores[index, :len(row.questions)] for index, row in enumerate(encoded)]
 
     @property
     def context_length(self) -> int | None:
@@ -616,19 +623,19 @@ class Decide:
 
     def _systemone(self, requests: Sequence[Mapping[str, object]], *, details: bool, strict: bool,
                    whole: bool) -> list[dict[str, JSON] | ValueError]:
-        """`systemone` over a list of bodies, through the scoring task a server would run
-        (`scoring`): each body admitted on its own, so a refusal is its body's alone, and the admitted
-        ones scored in one call."""
-        task, variables = self.scoring(details=details, strict=strict, whole=whole)
+        """`systemone` over a list of bodies, served as a server serves them (`scoring`,
+        `dew.inference.scoring.ScoringServer`): each body admitted on its own, so a refusal is its
+        body's alone, and the admitted ones' rows scored together, a pass at a time."""
+        server = scoring.ScoringServer.from_task(*self.scoring(details=details, strict=strict, whole=whole))
         answered: dict[int, dict[str, JSON] | ValueError] = {}
-        admitted: dict[int, _Admitted] = {}
+        futures = {}
         for index, request in enumerate(requests):
             try:
-                admitted[index] = task.admit(request).payload
+                futures[index] = server.submit(request)
             except ValueError as refused:
                 answered[index] = refused
-        scored = task.score(variables, list(admitted.values())) if admitted else []
-        answered.update(zip(admitted, scored, strict=True))
+        server.run()
+        answered.update({index: future.result() for index, future in futures.items()})
         return [answered[index] for index in range(len(requests))]
 
     def scoring(self, *, details: bool = False, strict: bool = False,
@@ -679,58 +686,69 @@ EXTENSIONS = ("images",)
 
 @dataclass(frozen=True)
 class _Admitted:
-    """A Jev body as `WireScoring` admitted it: its questions and its rows, with its images where it
-    has any, laid out in its one row."""
+    """A Jev body as `WireScoring` admitted it: its questions and its rows, laid out by the task."""
 
     questions: dict[str, Question]
-    rows: list[Encoded]
+    rows: tuple[Encoded, ...]
+
+
+@dataclass(frozen=True)
+class _Row:
+    """One row of an admitted body, a pass's unit: its layout, and its images where it holds any."""
+
+    encoded: Encoded
     media: Images | None = None
 
 
 @dataclass(frozen=True)
-class WireScoring(scoring.Scoring[Mapping[str, object], _Admitted, dict[str, JSON]]):
+class WireScoring(scoring.Scoring[Mapping[str, object], _Row, _Admitted, np.ndarray, dict[str, JSON]]):
     """A `Decide` task as a scoring task of Jev request bodies (`dew.inference.scoring.Scoring`),
     answering each as `Decide.systemone` does under `details`, `strict` and `whole`.
 
     `admit` parses and lays out a body, refusing what Jev would refuse, a body the layout could
-    answer only by cutting it under `whole` included; `score` answers the admitted bodies of a batch
-    over the weights it is handed: the text bodies' rows scored together within the task's budget
-    (`Decide.batch`), a body with images by a pass of its own in the same call. `decide` holds no
-    weights (`Decide.scoring`)."""
+    answer only by cutting it under `whole` included. A pass is `Decide.logits`' one pass within the
+    task's budget (`Decide.fits`) over text rows, or one over rows of images as long as each other and
+    of alike images (`Images.joined`); `forward` runs it over the weights it is handed, and `answer`
+    reads a body's answers off its rows' logits. `decide` holds no weights (`Decide.scoring`)."""
 
     decide: Decide
     details: bool = False
     strict: bool = False
     whole: bool = False
 
-    def admit(self, request: Mapping[str, object]) -> scoring.Scored[_Admitted]:
+    def admit(self, request: Mapping[str, object]) -> scoring.Scored[_Row, _Admitted]:
         decide = self.decide
         state, questions, images = decide._read_wire(request, strict=self.strict)
         if images:
             row, media = decide._shown(state, questions, images)
-            admitted = _Admitted(questions, [row], media)
+            rows = (_Row(row, media),)
         else:
-            admitted = _Admitted(questions, decide._encoded(state, questions))
-        rows = admitted.rows
-        usage = usage_of(rows)
+            rows = tuple(_Row(row) for row in decide._encoded(state, questions))
+        usage = usage_of([row.encoded for row in rows])
         if self.whole and (usage.truncated or usage.trimmed):
             cut = "state" if usage.truncated else "instructions or options"
             raise ValueError(f"the request does not fit the maximum context length, max_len="
                              f"{decide.layout.max_len} tokens, without cutting its {cut}")
-        return scoring.Scored[_Admitted](usage_of(rows).input_tokens, admitted)
+        return scoring.Scored(rows, _Admitted(questions, tuple(row.encoded for row in rows)))
 
-    def score(self, variables: Variables, payloads: Sequence[_Admitted]) -> list[dict[str, JSON]]:
+    def fits(self, rows: Sequence[_Row]) -> bool:
+        seen = [row.media for row in rows if row.media is not None]
+        if not seen:
+            return self.decide.fits([row.encoded for row in rows])
+        encoded = [row.encoded for row in rows]
+        return (len(seen) == len(rows) and len({len(row.tokens) for row in encoded}) == 1
+                and all(seen[0].alike(media) for media in seen) and self.decide.fits(encoded))
+
+    def forward(self, variables: Variables, rows: Sequence[_Row]) -> list[np.ndarray]:
         decide = replace(self.decide, variables=variables)
-        admitted = list(payloads)
-        text = [index for index, payload in enumerate(admitted) if payload.media is None]
-        answered = dict(zip(text, decide._answered([admitted[index].rows for index in text],
-                                                   [admitted[index].questions for index in text]),
-                            strict=True))
-        for index, payload in enumerate(admitted):
-            if payload.media is not None:
-                answered[index] = decide._looked(payload.questions, payload.rows[0], payload.media)
-        return [decide._wire_response(payload.questions, *answered[index], details=self.details)
-                for index, payload in enumerate(admitted)]
+        if rows[0].media is None:
+            return decide.logits([row.encoded for row in rows])
+        return decide._seen_pass([(row.encoded, row.media) for row in rows if row.media is not None])
+
+    def answer(self, payload: _Admitted, outputs: Sequence[np.ndarray]) -> dict[str, JSON]:
+        return self.decide._wire_response(payload.questions,
+                                          *self.decide._replied(payload.questions, payload.rows, outputs),
+                                          details=self.details)
 
 
 def decoded_images(images: object) -> list[Image.Image]:

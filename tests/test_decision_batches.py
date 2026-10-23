@@ -174,3 +174,34 @@ def test_one_engine_serves_generation_and_scoring_from_one_thread(decide):
     assert [generation.text for generation in generations] == [generation.text for generation in alone]
     for body, answer in zip(CASES.values(), answers, strict=True):
         assert discrete(answer) == discrete(decide.systemone(body))
+
+
+def test_a_long_scoring_backlog_does_not_hold_generation_back(decide):
+    """One engine serving generation and scoring, a pass a scoring turn: with a scoring backlog of
+    one row a pass, a generation submitted beside it finishes while the backlog still has passes to
+    run, since each turn steps each kind once, a scoring turn one pass, however much scoring waits."""
+    from model_support import serving_task
+
+    from dew.decision.task import Budget
+    from dew.inference import Engine, ScoringServer, Server
+
+    bound = serving_task()
+    generating = Server.from_task(bound, slots=1, capacity=64, admission=1)
+    scoring = ScoringServer.from_task(*dataclasses.replace(decide, budget=Budget(rows=1)).scoring())
+    finished: list[str] = []
+    engine = Engine(generating, scoring)
+    bodies = [*CASES.values()] * 3
+    answered = [scoring.submit(body) for body in bodies]
+    for future in answered:
+        future.add_done_callback(lambda _: finished.append("scoring"))
+    drawn = generating.submit("12", 3, key=0)
+    drawn.add_done_callback(lambda _: finished.append("generation"))
+    engine.start()
+    try:
+        drawn.result()
+        for future in answered:
+            future.result()
+    finally:
+        engine.close()
+    assert finished.index("generation") < len(bodies) - 1
+    assert drawn.result().text == bound("12", 3, key=0).text

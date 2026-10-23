@@ -1,7 +1,8 @@
 """The serving engine (`dew.inference.engine.Engine`) and the scoring kind (`dew.inference.scoring`):
-a request is scored by the task and weights that admitted it, a step settles its whole batch or fails
-it whole, a turn's bound counts what it drains, a request's callback may reload from its own step, and
-a request that waits once closing is seen is answered."""
+a request is scored by the task and weights that admitted it, a step is one pass and a request's rows
+carry across steps, a step settles its pass or fails it whole, a turn's bound counts what it drains,
+a request's callback may reload from its own step, and a request that waits once closing is seen is
+answered."""
 
 import threading
 from collections.abc import Callable
@@ -15,19 +16,26 @@ from dew.inference import Engine, Scored, ScoringServer
 
 @dataclass(frozen=True)
 class Named:
-    """A scoring task whose answer names it, the task that laid the request out, the request, and the
-    weight it scored with; `short` answers that many requests too few."""
+    """A scoring task over strings, a row a character, `width` rows a pass: a request's answer names the
+    task answering it, the task that laid it out, the request, and the weight its rows scored with;
+    `short` gives each pass that many outputs too few."""
 
     name: str
     short: int = 0
+    width: int = 64
 
-    def admit(self, request: str) -> Scored[tuple[str, str]]:
-        return Scored(tokens=1, payload=(self.name, request))
+    def admit(self, request: str) -> Scored[str, str]:
+        return Scored(tuple(request), self.name)
 
-    def score(self, variables, payloads):
+    def fits(self, rows) -> bool:
+        return len(rows) <= self.width
+
+    def forward(self, variables, rows):
         weight = float(variables["w"])
-        answers = [(self.name, laid, request, weight) for laid, request in payloads]
-        return answers[:len(answers) - self.short]
+        return [(row, weight) for row in rows][:len(rows) - self.short]
+
+    def answer(self, payload: str, outputs):
+        return self.name, payload, "".join(row for row, _ in outputs), outputs[0][1]
 
 
 def weights(value: float):
@@ -36,7 +44,7 @@ def weights(value: float):
 
 def test_a_request_admitted_before_a_reload_is_scored_by_the_task_that_laid_it_out():
     """A reload serves the new pair to what is submitted after it; what was admitted before is scored
-    by its own task and weights, in batches of its own."""
+    by its own task and weights, in passes of its own."""
     server = ScoringServer.from_task(Named("a"), weights(1.0))
     before = server.submit("x")
     server.reload(Named("b"), weights(2.0))
@@ -46,9 +54,23 @@ def test_a_request_admitted_before_a_reload_is_scored_by_the_task_that_laid_it_o
     assert after.result() == ("b", "b", "y", 2.0)
 
 
-def test_an_answer_too_few_fails_the_whole_batch():
-    """A task that answers fewer requests than it was given fails every request of the batch, and the
-    step raises, so no request waits for an answer that never comes."""
+def test_a_request_whose_rows_outrun_a_pass_carries_them_to_the_next_step():
+    """A step is one pass: a request of five rows, two a pass, is answered at its third step, each
+    step scoring the next of its rows, and the request behind it waits its turn."""
+    server = ScoringServer.from_task(Named("a", width=2), weights(1.0))
+    long, behind = server.submit("abcde"), server.submit("f")
+    for _ in range(2):
+        server.step()
+        assert not long.done() and server.queued == 2
+    server.step()
+    assert long.result() == ("a", "a", "abcde", 1.0) and not behind.done()
+    server.step()
+    assert behind.result() == ("a", "a", "f", 1.0)
+
+
+def test_an_output_too_few_fails_the_whole_pass():
+    """A task that answers fewer rows than its pass was given fails every request of the pass, and
+    the step raises, so no request waits for an answer that never comes."""
     server = ScoringServer.from_task(Named("a", short=1), weights(1.0))
     futures = [server.submit(request) for request in "xy"]
     with pytest.raises(ValueError):
@@ -59,8 +81,8 @@ def test_an_answer_too_few_fails_the_whole_batch():
 
 
 def test_a_turn_counts_the_cancelled_requests_it_drains():
-    """A step takes at most `rows` requests off the queue, cancelled ones among them, so a queue of
-    cancelled requests never holds one turn for its whole length."""
+    """A step looks at most `rows` requests, cancelled ones among them, so a queue of cancelled
+    requests never holds one turn for its whole length."""
     server = ScoringServer.from_task(Named("a"), weights(1.0), rows=2)
     futures = [server.submit(request) for request in "vwxyz"]
     for future in futures:
