@@ -34,8 +34,9 @@ import json
 import numpy as np
 import pytest
 import torch
+from interop_support import tiny_config
 from safetensors.numpy import load_file
-from transformers import AutoConfig, AutoModelForCausalLM
+from transformers import AutoModelForCausalLM
 
 from dew.interop import Pretrained
 from dew.interop.verify import VerifiedMappingWarning, probe_ids, reference_logits, scatter_weights
@@ -43,17 +44,11 @@ from dew.interop.verify import VerifiedMappingWarning, probe_ids, reference_logi
 # CI runs this file in tasks of its own: torchax renames torch's privateuse1 backend process-wide.
 pytestmark = pytest.mark.torchax
 
-TINY = {"hidden_size": 64, "num_hidden_layers": 4, "num_attention_heads": 4, "num_key_value_heads": 2,
-        "head_dim": 16, "intermediate_size": 128, "vocab_size": 256, "max_position_embeddings": 64,
-        "tie_word_embeddings": False, "pad_token_id": 0, "bos_token_id": 1, "eos_token_id": 2}
 
 def write_tiny(directory, model_type, **fields):
-    """Save a random tiny checkpoint of transformers' class for `model_type`; return its logits.
-
-    A field given as None is left out of the config, as a released config
-    that does not state it."""
-    stated = {key: value for key, value in {**TINY, **fields}.items() if value is not None}
-    config = AutoConfig.for_model(model_type, **stated)
+    """Save a random tiny checkpoint of transformers' class for `model_type` (`tiny_config`); return
+    its logits."""
+    config = tiny_config(model_type, **fields)
     model = AutoModelForCausalLM.from_config(config, dtype=torch.float32)
     scatter_weights(model)
     model.save_pretrained(directory)

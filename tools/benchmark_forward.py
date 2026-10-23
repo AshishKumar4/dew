@@ -6,7 +6,9 @@ forward: a vision tower over a batch of images and the Stable Diffusion
 VAE's decoder over a batch of latents. The weights are random, since the cost
 depends only on the shapes, so no row downloads anything. Each case compiles
 once, runs `--warmup` calls, then reports the median of `--repeats` calls,
-each synchronized on its output.
+each synchronized on its output. Its measured peak device memory is a process of
+its own's (tools/peak_memory.py), run before this one opens a backend: a row
+is `{"ms", "peak_device_bytes"}`.
 
 Usage:
     python tools/benchmark_forward.py
@@ -26,6 +28,7 @@ import numpy as np
 from dew.telemetry.benchmark import samples
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import peak_memory
 from benchmark_cases import FORWARD
 
 
@@ -44,11 +47,20 @@ def main() -> None:
     parser.add_argument("--warmup", type=int, default=3)
     parser.add_argument("--repeats", type=int, default=20)
     parser.add_argument("--json-out")
+    parser.add_argument("--peak-run", type=int,
+                        help="run case N of --cases alone, for its measured peak (tools/peak_memory.py)")
     args = parser.parse_args()
+    if args.peak_run is not None:
+        measure(args.cases[args.peak_run], args.warmup, args.repeats)
+        return
+    # Before this process opens a backend, which would hold the device each case's peak process needs.
+    peaks = [peak_memory.measured([os.path.abspath(__file__), *sys.argv[1:], "--peak-run", str(index)])
+             for index in range(len(args.cases))]
     results = {}
-    for name in args.cases:
-        results[name] = measure(name, args.warmup, args.repeats)
-        print(f"{name}: {results[name]:.2f} ms", flush=True)
+    for name, peak in zip(args.cases, peaks, strict=True):
+        results[name] = {"ms": measure(name, args.warmup, args.repeats),
+                         "peak_device_bytes": None if None in peak else max(peak)}
+        print(f"{name}: {results[name]['ms']:.2f} ms", flush=True)
     if args.json_out:
         with open(args.json_out, "w") as handle:
             json.dump(results, handle, indent=2)

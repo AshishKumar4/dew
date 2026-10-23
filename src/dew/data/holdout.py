@@ -16,10 +16,11 @@ from dew.data.generation import Generation, RowId, _GenerationSource, _row_key, 
 from dew.data.pipeline import Dataset, Pipeline, with_stores
 from dew.data.sources.base import (
     Read,
+    Rows,
     Shard,
     ShardManifest,
     Source,
-    _consumed,
+    View,
     _indexed_manifest,
     _uncounted,
     stated,
@@ -46,30 +47,22 @@ def _named_split(source: Source, name: str) -> Source:
 
 
 @dataclasses.dataclass(frozen=True)
-class RecordSlice:
+class RecordSlice(View[Source]):
     """The records [`start`, `stop`) of `source`, by index (`holdout(records=)`): the first `start`
     held out of the part a run trains on, or those a run scores. A run's record names it."""
 
+    rows: ClassVar[Rows] = "selected"
     reads: ClassVar[tuple[Read, ...]] = _INDEXED_READS
     refusal: ClassVar[str] = f"a records= holdout {_BY_INDEX}"
     source: Source
     start: int
     stop: int | None = None
 
-    def consumed(self, read: Read) -> RecordSlice:
-        return dataclasses.replace(self, source=_consumed(self.source, read))
-
-    def label(self) -> str:
-        return self.source.label()
-
     def describe(self) -> str:
         return f"{self.source.describe()}[{self.start}:{self.stop}]"
 
     def fingerprint(self) -> Mapping[str, object]:
         return _selected(self.source, "slice", {"slice": [self.start, self.stop]})
-
-    def supports(self, read: Read) -> bool:
-        return read in self.reads and self.source.supports(read)
 
     def records(self, read: Read):
         from dew.data.dataset import SourceSlice
@@ -93,10 +86,7 @@ class RecordSlice:
         return self.start, stop
 
     def metadata(self) -> Mapping[str, object]:
-        return {**_uncounted(self.source.metadata()), **({"held_out": self.start} if self.start else {})}
-
-    def stated(self) -> Mapping[str, object]:
-        return _uncounted(stated(self.source))
+        return {**super().metadata(), **({"held_out": self.start} if self.start else {})}
 
     def lengths(self) -> np.ndarray | None:
         lengths = self.source.lengths()
@@ -128,12 +118,13 @@ class _SelectedRow:
 
 
 @dataclasses.dataclass(frozen=True)
-class HashPart:
+class HashPart(View[Source]):
     """The rows of `source` whose identity (its `key` field, or its content)
     hashes into [`low`, `high`) of the unit interval (`held`), or the rows
     that do not: a row is in exactly one part, the same in every run, read,
     machine and resume (`holdout(fraction)`). A run's record names it."""
 
+    rows: ClassVar[Rows] = "selected"
     reads: ClassVar[tuple[Read, ...]] = ("memory", "streamed")
     refusal: ClassVar[str] = ("a hash holdout reads every row to place it, under read='memory' or "
                               "'streamed'; an indexed read holds out records=")
@@ -143,12 +134,6 @@ class HashPart:
     held: bool
     key: str | None = None
 
-    def consumed(self, read: Read) -> HashPart:
-        return dataclasses.replace(self, source=_consumed(self.source, read))
-
-    def label(self) -> str:
-        return self.source.label()
-
     def describe(self) -> str:
         part = f"[{self.low},{self.high}),held={self.held},key={self.key}"
         return f"{self.source.describe()} hash holdout={part}"
@@ -157,9 +142,6 @@ class HashPart:
         part = {"holdout": [self.low, self.high], "held": self.held, "key": self.key,
                 "content_hash": "sha256:sorted-mappings-v1"}
         return _selected(self.source, "hash", part)
-
-    def supports(self, read: Read) -> bool:
-        return read in self.reads and self.source.supports(read)
 
     def records(self, read: Read):
         import grain.python as grain
@@ -178,12 +160,6 @@ class HashPart:
 
     def admitted(self, records: int) -> None:
         """Any number of rows holds a hash part."""
-
-    def metadata(self) -> Mapping[str, object]:
-        return _uncounted(self.source.metadata())
-
-    def stated(self) -> Mapping[str, object]:
-        return _uncounted(stated(self.source))
 
     def lengths(self) -> np.ndarray | None:
         return None
@@ -260,18 +236,19 @@ def _selected(source: Source, kind: str, selection: Mapping[str, object]) -> Map
 
 
 @dataclasses.dataclass(frozen=True)
-class SelectedGeneration:
-    """The rows `generation` holds for the inputs of `stored`, the source it was published from, that
-    the holdout `selections` keep (outermost first, `stored` below the last), in their order: the
+class SelectedGeneration(View[Source]):
+    """The rows `generation` holds for the inputs of `source`, the source it was published from, that
+    the holdout `selections` keep (outermost first, `source` below the last), in their order: the
     generation standing in for its steps under selections written before it, each picking the
     inputs it picks uncached (`dew.data.analysis._in_place`). The selections name the part, as the
-    run wrote them; `stored` is read as the fill read it (`_consumed`), numbering its inputs by
+    run wrote them; `source` is read as the fill read it (`_consumed`), numbering its inputs by
     their place in a memory or indexed read (`placing`), or by its shards' rows in a stream, as the
     fill did (`_source_ids`). Ids that name other inputs than the fill's are refused, never read as none."""
 
+    rows: ClassVar[Rows] = "derived"
     generation: Generation
     selections: tuple[RecordSlice | HashPart, ...]
-    stored: Source
+    source: Source
     placing: Read
 
     def label(self) -> str:
@@ -284,21 +261,21 @@ class SelectedGeneration:
         generation = _GenerationSource(self.generation).fingerprint()
         return {**generation, "selected": self.selections[0].fingerprint()}
 
-    # Every read reads the generation's rows; placing them reads `stored` by `placing` whatever the run reads.
+    # Every read reads the generation's rows; placing them reads `source` by `placing` whatever the run reads.
     def supports(self, read: Read) -> bool:
-        return self.stored.supports(self.placing)
+        return self.source.supports(self.placing)
 
     def can_provision(self, read: Read) -> bool:
         from dew.data.analysis import _provisioner
 
-        return _provisioner(self.stored, self.placing) is not None
+        return _provisioner(self.source, self.placing) is not None
 
     def provision(self) -> SelectedGeneration:
         from dew.data.analysis import _provisioner
 
-        preparer = _provisioner(self.stored, self.placing)
+        preparer = _provisioner(self.source, self.placing)
         if preparer is None:
-            raise ValueError(f"{self.stored.describe()} can't prepare the {self.placing} read that places "
+            raise ValueError(f"{self.source.describe()} can't prepare the {self.placing} read that places "
                              "its inputs")
         preparer.provision()
         return self
@@ -320,7 +297,14 @@ class SelectedGeneration:
                 **({"count_rules": rules["count_rules"]} if "count_rules" in rules else {})}
 
     def stated(self) -> Mapping[str, object]:
-        return _uncounted(stated(self.stored))
+        return _uncounted(stated(self.source))
+
+    @functools.cached_property
+    def whole(self) -> Source:
+        """The generation's rows for every input: the whole store this part's measured facts are
+        measured over (`dew.data.analysis._stated`), as uncached they are over the store below its
+        selections."""
+        return self.generation.source()
 
     def order_fingerprints(self) -> Mapping[str, str]:
         """Which of the generation's rows this part reads, in their order."""
@@ -348,7 +332,7 @@ class SelectedGeneration:
                     if current is None:
                         raise ValueError(
                             f"generation {self.generation.url} holds input {entry['id']}, which "
-                            f"{self.stored.describe()} doesn't name by its {self.placing} read here (a "
+                            f"{self.source.describe()} doesn't name by its {self.placing} read here (a "
                             "stream names its inputs by where it read their shards, a memory or indexed read "
                             "by their place), so the holdout written before it can't pick its inputs "
                             "from it; read it where it was filled, or publish it again from a "
@@ -360,25 +344,25 @@ class SelectedGeneration:
         filled = self.generation.manifest["inputs"]
         if inputs != filled:
             raise ValueError(f"generation {self.generation.url} was filled from {filled} inputs, and "
-                             f"{self.stored.describe()} holds {inputs} here, so the holdout written before "
+                             f"{self.source.describe()} holds {inputs} here, so the holdout written before "
                              "it can't pick its inputs from it")
         return np.asarray(dense, np.int64)
 
     def _admitted(self) -> Iterator[tuple[str, bool]]:
-        """Each input of `stored`, by the key the fill gave it (`_row_key`), and whether the selections
+        """Each input of `source`, by the key the fill gave it (`_row_key`), and whether the selections
         keep it: they apply innermost first as the inputs stream past, each at its own position among
         the inputs the ones within it admitted (`admits`); only a hash holdout reads the rows."""
         inner = self.selections[::-1]
         hashed = any(isinstance(selection, HashPart) for selection in inner)
         if self.placing != "streamed":
-            records = self.stored.records(self.placing)
+            records = self.source.records(self.placing)
             inputs: Iterator[tuple[RowId, Batch | bytes | None]] = (
                 (index, records[index] if hashed else None) for index in range(len(records)))
         elif hashed:
-            manifest = self.stored.manifest()
+            manifest = self.source.manifest()
             inputs = (pair for shard in manifest.shards for pair in _shard_inputs(manifest, shard))
         else:
-            inputs = ((row_id, None) for row_id in _source_ids(self.stored, streamed=True))
+            inputs = ((row_id, None) for row_id in _source_ids(self.source, streamed=True))
         reached = [0] * len(inner)
         for row_id, row in inputs:
             admitted = True

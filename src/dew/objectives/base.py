@@ -573,6 +573,10 @@ leaves that `freeze` keeps in `params` are the ones that train. The frozen
 leaves stay in this collection as part of the state, and `thaw` merges the
 two before the model reads them."""
 
+PARAMETER_ROOTS = (("params",), (FROZEN,))
+"""The collections of a variables tree that hold a model's parameters, which a run's loaders read
+and a storage dtype casts: the trained ones and the frozen."""
+
 
 VALID_ROWS = "valid_rows"
 
@@ -595,17 +599,28 @@ batches never have it.
 def freeze(variables: Variables, trainable: PathFilter) -> Variables:
     """Move the `params` leaves that `trainable` rejects into the `FROZEN` collection.
 
-    `trainable` sees full leaf paths, `("params", ...)`. Raises `ValueError`
-    when it keeps every leaf or none, since then there is nothing to split.
+    `trainable` sees full leaf paths, `("params", ...)`. A tree already split
+    keeps training the leaves its `params` hold, beside those `trainable`
+    takes from either collection, and keeps the rest frozen: an adapter
+    attached over another keeps both training. Raises `ValueError` when the
+    split keeps every leaf or none, since then there is nothing to split.
     """
+    training = (frozenset() if FROZEN not in variables else frozenset(
+        ("params", *(entry.key for entry in path))
+        for path, _ in jax.tree_util.tree_leaves_with_path(variables["params"])))
+    variables = thaw(variables)
+
+    def trains(path: Path) -> bool:
+        return path in training or trainable(path)
+
     leaves = jax.tree_util.tree_leaves_with_path(variables["params"])
-    kept = sum(trainable(("params", *(entry.key for entry in path))) for path, _ in leaves)
+    kept = sum(trains(("params", *(entry.key for entry in path))) for path, _ in leaves)
     if kept in (0, len(leaves)):
         raise ValueError(
             f"trainable keeps {kept} of {len(leaves)} parameter leaves, which "
             f"{'freezes' if kept else 'trains'} nothing")
-    moving = select(variables, lambda path: path[0] == "params" and trainable(path))
-    frozen = select(variables, lambda path: path[0] == "params" and not trainable(path))
+    moving = select(variables, lambda path: path[0] == "params" and trains(path))
+    frozen = select(variables, lambda path: path[0] == "params" and not trains(path))
     return {**variables, "params": moving["params"], FROZEN: frozen["params"]}
 
 
@@ -1387,7 +1402,7 @@ class Objective(ABC, Generic[Loss, Effects]):
     def _saved_variables(cls, directory: str, *, step: int | str | None, ema: bool | None,
                          mesh: MeshSpec | Mesh | None = None, layout: Layout | None = None,
                          param_dtype: DTypeLike | None = None,
-                         parameter_roots: tuple[tuple[str, ...], ...] = (("params",), (FROZEN,))
+                         parameter_roots: tuple[tuple[str, ...], ...] = PARAMETER_ROOTS
                          ) -> Variables:
         """Return the model's variables from a run of this objective, as every run loader reads them.
 

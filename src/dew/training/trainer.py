@@ -37,6 +37,7 @@ from jax.sharding import AbstractMesh, Mesh, NamedSharding, PartitionSpec as P
 from typing_extensions import TypeVar as DefaultTypeVar
 
 from dew.checkpoints import Checkpoints, Ranking
+from dew.cleanup import attempted
 from dew.coordination import agree_process_phase, agreed, agreed_same, broadcast_from_process_zero
 from dew.data.compile import fitted
 from dew.data.dataset import (
@@ -206,6 +207,27 @@ class Rollout(Protocol):
     """
 
     def __call__(self, state: TrainState, batch: Batch, key: jax.Array) -> Batch: ...
+
+
+def run_length(steps: int | None, epochs: int | None, tokens: int | None, *, required: bool = True) -> None:
+    """Refuse a run whose length is named twice, as both `steps` and `epochs`, or, where `required`,
+    not at all; `tokens` caps either or bounds a run alone."""
+    if None not in (steps, epochs):
+        raise ValueError("steps and epochs both name the run length; set one")
+    if required and steps is epochs is tokens is None:
+        raise ValueError("the run length is steps or epochs, or tokens, which also caps either")
+
+
+def run_steps(loader: Loader, steps: int | None, epochs: int | None, tokens: int | None,
+              accumulation: int) -> int | None:
+    """The microsteps a run takes over `loader`, the one policy for a fit's and a config's run length:
+    `steps`, or `epochs` of it, whose ramp stages begin where updates do, as the stream cuts them, or None
+    where `tokens` alone bounds it. Refuses a run with no length or two, and epochs of a stream with no
+    record count."""
+    run_length(steps, epochs, tokens)
+    if epochs is None:
+        return steps
+    return loader.epoch_steps(epochs, accumulation)
 
 
 def _rollout_metrics(rollout: Rollout) -> Mapping[str, float]:
@@ -487,7 +509,6 @@ class Trainer(Generic[Loss, Effects]):
         self.links: dict[str, Link] = {}
         self._bandwidths: dict[tuple[Mesh, str], float | None] = {}
         self._display = TrainingDisplay()
-        self._count_work = False
         self._refusal: str | None = None
         # The fit ladder's rung beyond the objective's own head and remat: a step that fit only under XLA's
         # default options keeps them for later compiles. A resumed run starts at its checkpoint's rung, and
@@ -553,6 +574,15 @@ class Trainer(Generic[Loss, Effects]):
         # The state holds its trees as dicts, whichever Flax container (a FrozenDict) the objective's
         # tree came in, so its placement, its updates and its restores share one structure.
         params = unfreeze(nn.unbox(initialized))
+        # A held tree's initializer returns the objective's own arrays (`Objective.held_variables`),
+        # which the step's donation would free: the state takes buffers of its own, as a placed one
+        # does (`distributed.placed_held`). Traced, no leaf is a held array, so nothing is copied; a
+        # state held on the host is never donated, and takes the arrays over leaf by leaf as it is
+        # placed (`_placed_host`), so it takes them as they are.
+        if not self.host_master:
+            held = {id(leaf) for leaf in jax.tree.leaves(self.objective.held_variables())
+                    if isinstance(leaf, jax.Array)}
+            params = jax.tree.map(lambda leaf: leaf.copy() if id(leaf) in held else leaf, params)
         if "params" not in params:
             raise ValueError(
                 f"the objective's tree has no params collection, only {sorted(params)}; "
@@ -1407,15 +1437,13 @@ class Trainer(Generic[Loss, Effects]):
         `prepare_process` readies it: a program that never called that gets Dew's
         log handler, and one whose JAX opened on the CPU beside an NVIDIA GPU stops.
         """
-        if steps is epochs is tokens is None or None not in (steps, epochs):
-            raise ValueError("fit's run length is steps= or epochs=, or tokens=, which also caps either")
+        run_length(steps, epochs, tokens)
         if tokens is not None and not self.objective.counts_tokens:
             raise ValueError("tokens= needs an objective that counts real tokens")
         ready_process()
         loader, validation = fitted(dataset, validation, objective=self.objective.data())
         self._device, self._prefetch = loader.device, device_prefetch
-        if epochs is not None:
-            steps = loader.epoch_steps(epochs, self.accumulation)
+        steps = run_steps(loader, steps, epochs, tokens, self.accumulation)
         count_compilation_cache()
         self._schedule(None if steps is None else steps // self.accumulation)
         suites = _suites(loader, validation, metrics, eval_every)
@@ -1599,23 +1627,18 @@ class Trainer(Generic[Loss, Effects]):
         # A failed run's peers may be gone: its last log is read only where no read waits on them.
         unread = (None if run.taken is None or not run.taken.ready()
                   else functools.partial(self._read_taken, run, agree=False))
-        for label, cleanup in (
-            ("Training log", unread), ("Training iterator", close), ("Profiler", stop_trace),
-            ("Checkpoint wait", None if checkpoints is None else checkpoints.wait),
-            ("Display", self._display.close),
-        ):
-            if cleanup is None:
-                continue
-            try:
-                cleanup()
-            except BaseException as failure:
-                if error is None:
-                    error = failure
-                else:
-                    error.add_note(f"{label} cleanup failed: {failure!r}")
+        cleanups = (("Training log", unread), ("Training iterator", close), ("Profiler", stop_trace),
+                    ("Checkpoint wait", None if checkpoints is None else checkpoints.wait),
+                    ("Display", self._display.close))
+        try:
+            attempted([(f"{label} cleanup", cleanup) for label, cleanup in cleanups if cleanup is not None],
+                      primary=error)
+        except BaseException as failure:
+            # The first cleanup to fail, where the run itself did not, is the run's outcome.
+            error = failure
         # The traceback of a failed run holds fit's frame and this one, and what these names point at.
         run.source, run.train, run.taken = None, None, None
-        close = stop_trace = cleanup = unread = None
+        close = stop_trace = cleanups = unread = None
         run.other += time.perf_counter() - paused
         return self._reported_outcome(error, run)
 
@@ -1635,9 +1658,6 @@ class Trainer(Generic[Loss, Effects]):
             jax.devices()[0].device_kind, jax.process_count(), dict(mesh.shape),
             split_share(state.variables),
             seed=self.seed, tokens=plan.tokens)
-        # On a device with a known peak, the run counts its batches' work
-        # for train/mfu while they can be counted (`_counted_batch`).
-        self._count_work = gpu_target(started.device_kind).bf16_peak is not None
         self._refusal = None
         self._report(started, current)
         if plan.dataset.held_out:
@@ -2053,7 +2073,7 @@ class Trainer(Generic[Loss, Effects]):
         rollout's caller, and only it writes the reason. A count asked of the
         objective directly stays strict.
         """
-        if self._count_work and self._refusal is None:
+        if self._refusal is None:
             try:
                 return prepare_counts(self.objective, batch, count_model=True)
             except MissingFlopsCount as missing:
@@ -2378,9 +2398,10 @@ class Trainer(Generic[Loss, Effects]):
 
         The FLOPs are the ones the compiler measured for each step's own
         shape; `flops` is None when a shape's measurement was unavailable.
-        train/mfu is the objective's analytical training work on real rows,
-        over the whole mesh's peak: 3*forward for full FT, explicit frozen/
-        trainable matrix work for PEFT. train/hfu keeps hardware HLO
+        train/flops is the objective's analytical training work on real rows a
+        step, over the whole mesh, on any device: 3*forward for full FT,
+        explicit frozen/trainable matrix work for PEFT. train/mfu is that work
+        over the whole mesh's peak, where the device's peak is known. train/hfu keeps hardware HLO
         work including remat; train/hlo_flops_util is the former HLO model
         count with recomputation removed (`StepFlops.utilizations`). No HLO
         count substitutes for MFU.
@@ -2408,8 +2429,9 @@ class Trainer(Generic[Loss, Effects]):
             scalars["train/tokens"] = float(tokens) / steps
             scalars["train/tokens_per_s"] = float(tokens) / stepping
         # A batch whose work could not be counted carries NaN (`_counted_batch`),
-        # so an interval holding one, on any process, reports no train/mfu.
+        # so an interval holding one, on any process, reports no train/flops or train/mfu.
         if training_flops is not None and math.isfinite(training_flops):
+            scalars["train/flops"] = float(training_flops) / steps
             per_device = float(training_flops) / self.device_mesh.devices.size
             utilization = model_flops_utilization(per_device / steps, step_time)
             if utilization is not None:
