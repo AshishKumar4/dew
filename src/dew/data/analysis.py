@@ -152,8 +152,11 @@ def _stated(source: Source, read: Read, measuring: Sequence[Measuring] = (),
             whole: Callable[[Source], Records] | None = None) -> tuple[Records | None, Mapping[str, object]]:
     """The records a memory read of `source` holds, then its metadata, with each fact `measuring`
     measures in place of any the store states, in a memory read: over the whole store's records,
-    below any holdout, so each part of it binds alike, as the stages before the measuring step make
-    them (`dew.data.lowering.prepared_rows`). `whole` reads the store once for every part of it."""
+    below any holdout (a generation's part's over the generation's rows for every input,
+    `SelectedGeneration.whole`), so each part of it binds alike, as the stages before the measuring
+    step make them (`dew.data.lowering.prepared_rows`). `whole` reads the store once for every part
+    of it."""
+    from dew.data.holdout import SelectedGeneration
     from dew.data.lowering import prepared_rows
 
     held = source.records(read) if read == "memory" else None
@@ -161,6 +164,8 @@ def _stated(source: Source, read: Read, measuring: Sequence[Measuring] = (),
     if held is None or not measuring:
         return held, metadata
     store = _store(source)
+    if isinstance(store, SelectedGeneration):
+        store = store.whole
     # A records holdout reads its part of the whole store's records, which it keeps.
     rows = (held if store is source else held.source if isinstance(held, SourceSlice)
             else whole(store) if whole is not None else store.records(read))
