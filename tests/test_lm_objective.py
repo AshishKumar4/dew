@@ -221,7 +221,7 @@ def test_the_validity_the_decoder_reads_decides_which_targets_count(given):
                 else {TEXT_KEY: ids, "text_coordinates": coordinates(valid=valid)})
 
     def expected(forward, params, batch):
-        ids = np.asarray(batch[TEXT_KEY].ids if given == "attention_mask" else batch[TEXT_KEY])
+        ids = np.asarray(batch[TEXT_KEY].tokens if given == "attention_mask" else batch[TEXT_KEY])
         return reference_cross_entropy(forward(params, jnp.asarray(ids[:, :1])), ids[:, 1:2])
 
     assert_objective_as_exact(objective, f"validity {given}", batch_of, expected)
