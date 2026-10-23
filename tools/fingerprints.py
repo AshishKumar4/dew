@@ -138,10 +138,12 @@ def _draws():
 def _host(tree) -> list[np.ndarray] | None:
     """`tree`'s leaves as float64 host arrays, or None where one is not a finite number."""
     import jax
+    import jax.numpy as jnp
 
     leaves = []
     for leaf in jax.tree.leaves(tree):
-        if not hasattr(leaf, "dtype") or not (np.issubdtype(leaf.dtype, np.number) or leaf.dtype == bool):
+        # JAX's dtype lattice, which holds bfloat16 a number where NumPy's does not.
+        if not hasattr(leaf, "dtype") or not (jnp.issubdtype(leaf.dtype, jnp.number) or leaf.dtype == bool):
             return None
         array = np.asarray(leaf, np.float64)
         if not np.all(np.isfinite(array)):
