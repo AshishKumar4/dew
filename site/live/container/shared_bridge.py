@@ -326,13 +326,17 @@ class Gateway:
     async def first(self, session):
         """`session`'s first context, made ready before the page names a cell: the one creation the gateway
         owns for the session (`creating`), which a close cancels, `start` then deleting the kernel it made."""
+        mine = asyncio.current_task()
         try:
             self.contexts[session][None] = await self.start(session)
         except BaseException:
-            self.contexts.pop(session, None)
+            # A close took the session already, and a later create may have begun it again: that one is not this.
+            if self.creating.get(session) is mine:
+                self.contexts.pop(session, None)
             raise
         finally:
-            del self.creating[session]
+            if self.creating.get(session) is mine:
+                del self.creating[session]
 
     async def create(self, session):
         """`session`'s contexts, its first made ready if it has none (`first`), which every create of the
@@ -363,9 +367,10 @@ class Gateway:
     async def close(self, session):
         """End `session`: its first context's creation, if one runs, cancelled to its end (`start` deletes
         the kernel it made), then every context it holds."""
-        if task := self.creating.get(session):
+        # The creation is cancelled, not awaited: `start` deletes the kernel it made once the gateway has made it
+        # (`settle`), which this close need not wait for.
+        if task := self.creating.pop(session, None):
             task.cancel()
-            await asyncio.wait({task})
         for context in self.contexts.pop(session, {}).values():
             await self.stop(context)
 
