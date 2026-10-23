@@ -29,7 +29,7 @@ A model is a plain Flax module. An objective defines variables, loss and validat
 
 ## Layering
 
-Packages import downward only. `dew.batch` and `dew.mesh` are the foundation every package reads: they import no other Dew package, and nothing below them owns a batch or a mesh axis of its own. Above them the order is `telemetry.devices < nn < data, inputs < diffusion, sampling < interop < inference, lora, quantization < objectives < checkpoints < training < config < cli, decision`, which the import contracts in `pyproject.toml` (`[tool.importlinter]`) hold as they land.
+Packages import downward only. `dew.batch` and `dew.mesh` are the foundation every package reads: they import no other Dew package, and nothing below them owns a batch or a mesh axis of its own. Above them the order is `telemetry.devices < nn < data, inputs < diffusion, sampling < interop < inference, lora, quantization < objectives < checkpoints < training < config < cli, decision`.
 
 ## Interfaces stay shared
 
