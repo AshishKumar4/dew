@@ -55,7 +55,7 @@ A GPU-touching change lands by its row:
 
 | Destination | Change | Before it lands |
 |---|---|---|
-| `base/kernels` | kernel and template pieces | the hardware-free gates: interpret-mode check 1 and the stability suite, the bitwise boundary test, the deviceless compile with its resource gate |
+| `base/kernels` | kernel and template pieces | the hardware-free gates: interpret-mode check 1 of every mainloop and the stability suite, the deviceless compile with its resource gate |
 | `main`, from `base/kernels` | the composed kernel base | the GPU gate green on `base/kernels`' tip on every gating type (A100, H100, A10, L4, TPU v5e), with its tiers and scoreboards |
 | `main` | a dependency or environment change (JAX, locks) | once, natively on an A100, every file that can take another path on a GPU (below); and the marked native tier on every other gating type |
 | `main` | a Hopper-only path | its real H100 run |
