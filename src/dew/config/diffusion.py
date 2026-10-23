@@ -12,7 +12,7 @@ from __future__ import annotations
 import dataclasses
 import os
 from collections.abc import Mapping
-from typing import TYPE_CHECKING, Annotated, ClassVar
+from typing import TYPE_CHECKING, Annotated, ClassVar, TypedDict
 
 import jax
 import numpy as np
@@ -113,6 +113,15 @@ class FlowRolloutConfig:
 
         return FlowRollout(objective, reward, groups=self.groups, steps=self.steps,
                            train_steps=self.train_steps)
+
+
+class TeacherArguments(TypedDict, total=False):
+    """What a distillation objective takes of its teacher's run (`DiffusionRunConfig.teacher_run`)."""
+
+    teacher_variables: Variables
+    """The tree the teacher's run published, where the starting tree holds no teacher."""
+    teacher: DiffusionObjective
+    """Guidance distillation's teacher, its objective rebuilt from the run's record."""
 
 
 @dataclasses.dataclass(frozen=True)
@@ -348,7 +357,7 @@ class DiffusionRunConfig(RunConfig):
         assert isinstance(objective, DiffusionObjective)
         return objective
 
-    def _teacher(self, variables: Variables | None) -> dict[str, object]:
+    def _teacher(self, variables: Variables | None) -> TeacherArguments:
         """The teacher a distillation reads from `teacher_run`: the tree its run published, unless the
         starting tree holds the teacher (`TEACHER`), and for guidance distillation the teacher's
         objective rebuilt from the run's record over the tree the student holds frozen
@@ -365,7 +374,7 @@ class DiffusionRunConfig(RunConfig):
             with Checkpoints(self.teacher_run) as checkpoints:
                 published = checkpoints.variables(ema=None, step=None, mesh=None, layout=None,
                                                   param_dtype=None)
-        given: dict[str, object] = {} if published is None else {"teacher_variables": published}
+        given: TeacherArguments = {} if published is None else {"teacher_variables": published}
         if issubclass(kind, GuidanceDistillationObjective):
             held = teacher_weights(variables, published, whole=True)
             given["teacher"] = DiffusionRunConfig.load(self.teacher_run).build(variables=held)
