@@ -25,7 +25,7 @@ def gen_api():
 @pytest.fixture(scope="module")
 def documented(gen_api):
     package = gen_api.load()
-    return (package, *gen_api.documented(package))
+    return (package, *gen_api.documented(package, gen_api.P.pages))
 
 
 def test_a_name_bound_in_one_cell_is_resolved_in_the_next(gen_api, documented, tmp_path):
@@ -197,32 +197,56 @@ def test_check_rejects_an_unresolvable_or_nondeclaration_reference(
 
 
 def test_a_notebook_pinned_to_a_commit_is_held_to_that_commits_api(gen_api, reference_package, monkeypatch):
-    """A notebook whose install pins the package to a commit shows that commit's API: a name the commit held
-    resolves there though the package has since renamed it, one it never held does not, and an unpinned
-    notebook is held to the API as it is."""
+    """A notebook whose install pins the package to a commit shows the API that commit documented: a name it
+    documented resolves there though the package has since renamed it, one it never held does not, and an
+    unpinned notebook is held to the API as it is."""
     source, overview = reference_package
     root = overview.parent
     source.write_text("def old_name(): ...\n")
     overview.write_text("# Overview\n")
+    (root / "reference.json").write_text(json.dumps({"groups": [["API", ["example"]]]}))
     git(root, "init", "-q", "-b", "main")
     git(root, "add", "-A")
     git(root, "commit", "-qm", "the API with old_name")
     commit = git(root, "rev-parse", "HEAD").strip()
     source.write_text("def new_name(): ...\n")
-    install = f'%pip install -q "example @ git+https://example.org/example@{commit}"\n'
-
-    def notebook(name: str, *cells: str) -> None:
-        (root / name).write_text(json.dumps({"cells": [{"cell_type": "code", "source": [cell]}
-                                                       for cell in cells]}))
-
-    monkeypatch.setattr(gen_api, "P", dataclasses.replace(gen_api.P, usage=["*.ipynb"]))
+    install = f'%pip install -q "example[extra] @ git+https://example.org@{commit}"\n'
+    reference = dataclasses.replace(gen_api.P, usage=["*.ipynb"], declared="reference.json")
+    monkeypatch.setattr(gen_api, "P", reference)
     monkeypatch.setattr("sys.argv", ["gen_api.py", "--check"])
-    notebook("pinned.ipynb", install, "from example import old_name\nold_name()\n")
+    notebook(root / "pinned.ipynb", install, "from example import old_name\nold_name()\n")
     gen_api.main()
     for name, cells in (("pinned_absent.ipynb", (install, "import example\nexample.never_held()\n")),
                         ("current.ipynb", ("from example import old_name\n",))):
-        notebook(name, *cells)
+        notebook(root / name, *cells)
         with pytest.raises(SystemExit) as stopped:
             gen_api.main()
         assert stopped.value.code == 1, name
         (root / name).unlink()
+
+
+def notebook(path, *cells: str) -> None:
+    path.write_text(json.dumps({"cells": [{"cell_type": "code", "source": [cell]} for cell in cells]}))
+
+
+@pytest.mark.parametrize(("cells", "pin"), [
+    (['%pip install -q "example @ git+https://example.org@1234abc"\n'], "1234abc"),
+    (["!pip install example@git+https://example.org@1234abc\n"], "1234abc"),
+    (['# %pip install "example @ git+https://example.org@1234abc"\n'], None),
+    (['%pip install "example @ git+https://example.org@1234abc-feature"\n'], None),
+    (['%pip install "other @ git+https://other.org/other@1234abc"\n'], None),
+    (['%pip install "example @ git+https://example.org@1234abc"\n',
+      '%pip install "example @ git+https://example.org@1234abc"\n'], "1234abc"),
+], ids=["a quoted requirement", "a compact one", "a commented install", "a branch", "another repository",
+        "the same commit twice"])
+def test_a_notebooks_pin_is_the_commit_an_install_of_the_package_names(gen_api, reference_package, tmp_path,
+                                                                       cells, pin):
+    notebook(tmp_path / "notes.ipynb", *cells)
+    assert gen_api.pinned(tmp_path / "notes.ipynb") == pin
+
+
+def test_a_notebook_that_installs_two_revisions_is_refused(gen_api, reference_package, tmp_path):
+    notebook(tmp_path / "notes.ipynb", '%pip install "example @ git+https://example.org@1234abc"\n',
+             '%pip install "example @ git+https://example.org@5678def"\n')
+    with pytest.raises(gen_api.Unresolved):
+        gen_api.pinned(tmp_path / "notes.ipynb")
