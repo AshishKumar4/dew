@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
+import numbers
 from collections.abc import Callable, Sequence
 from typing import NamedTuple, Protocol, runtime_checkable
 
@@ -164,32 +165,31 @@ def id_row(name: str, value: int | Sequence[int]) -> tuple[int, ...]:
     return tuple(token_ids([value] if isinstance(value, int) else value, where=name))
 
 
-def positive(name: str, value: float | int | str | bool | None) -> float:
-    if (
-        isinstance(value, bool)
-        or not isinstance(value, (int, float))
-        or not math.isfinite(value)
-        or value <= 0
-    ):
+def real(name: str, value: object) -> float:
+    """`value`, a finite real number of Python's or NumPy's, as a float; a flag is no number here."""
+    if isinstance(value, bool | np.bool_) or not isinstance(value, numbers.Real) or not math.isfinite(value):
+        raise ValueError(f"{name} must be a finite number")
+    return float(value)
+
+
+def positive(name: str, value: object) -> float:
+    rate = real(name, value)
+    if rate <= 0:
         raise ValueError(f"{name} must be a finite positive number")
-    return float(value)
+    return rate
 
 
-def unit_interval(name: str, value: float | int | str | bool | None) -> float:
-    if (
-        isinstance(value, bool)
-        or not isinstance(value, (int, float))
-        or not math.isfinite(value)
-        or not 0 <= value <= 1
-    ):
+def unit_interval(name: str, value: object) -> float:
+    rate = real(name, value)
+    if not 0 <= rate <= 1:
         raise ValueError(f"{name} must be finite and between zero and one")
-    return float(value)
+    return rate
 
 
-def positive_size(name: str, value: int) -> int:
-    if type(value) is not int or value < 1:
+def positive_size(name: str, value: object) -> int:
+    if isinstance(value, bool | np.bool_) or not isinstance(value, numbers.Integral) or value < 1:
         raise ValueError(f"{name} must be a positive integer")
-    return value
+    return int(value)
 
 
 @runtime_checkable

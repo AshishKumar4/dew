@@ -226,15 +226,24 @@ def test_a_call_policy_takes_the_tasks_eos_and_pad_ids(task):
     assert named.lengths.tolist() == [4] and not named.terminated.any()
 
 
-@pytest.mark.parametrize("changed", [{"temperature": True}, {"top_p": np.float32(0.9)},
-                                     {"repetition_penalty": np.float32(1.1)}, {"eos_token_ids": True}])
-def test_a_policy_refuses_as_it_is_built_a_value_its_controls_refuse(changed):
-    """A policy checks its settings with the controls' own rules, so a value the control it builds
-    would refuse at generation, or a flag where a rate goes, is refused when the policy is built."""
-    valid = {"temperature": 0.7, "top_p": 0.9, "repetition_penalty": 1.1, "eos_token_ids": 3}
+@pytest.mark.parametrize("changed", [{"temperature": True}, {"top_p": np.True_}, {"top_k": True},
+                                     {"repetition_penalty": "1.1"}, {"eos_token_ids": True}])
+def test_a_policy_refuses_as_it_is_built_a_flag_or_a_non_number_where_a_setting_goes(changed):
+    """A policy checks its settings by the controls' own rules, so a flag where a rate or a count
+    goes, or a value that is no number, is refused when the policy is built, not run at a rate
+    nobody asked for."""
+    valid = {"temperature": 0.7, "top_p": 0.9, "top_k": 5, "repetition_penalty": 1.1, "eos_token_ids": 3}
     Sampling(**valid)
     with pytest.raises(ValueError):
         Sampling(**{**valid, **changed})
+
+
+def test_a_policy_built_from_numpy_numbers_is_the_policy_of_the_numbers_they_hold():
+    """A config's or a sweep's NumPy scalars are ordinary settings: the policy holds the numbers
+    they hold, as Python's, so it records and compares as one built from those."""
+    given = {"temperature": np.float32(0.7), "top_p": np.float64(0.9), "min_p": np.float32(0.05),
+             "top_k": np.int64(5), "repetition_penalty": np.float32(1.1), "presence_penalty": np.int32(1)}
+    assert Sampling(**given) == Sampling(**{name: value.item() for name, value in given.items()})
 
 
 def test_source_total_length_and_explicit_continuation_budget_have_defined_precedence(task):
