@@ -536,19 +536,28 @@ def _chosen(masked: bool | jax.Array, mask: Callable[[], jax.Array], whole: Call
 
 
 def _masked(spec: Forward, s: jax.Array, coords: Coords, unseen: float) -> jax.Array:
-    """`s` `[bq, bk]` at `unseen` at each key the query does not see (`within`)."""
-    seen = None
+    """`s` `[bq, bk]` at `unseen` at each key the query does not see (`seen`)."""
+    visible = seen(spec, coords, s)
+    return s if visible is None else jnp.where(visible, s, unseen)
+
+
+def seen(spec: Forward, coords: Coords, like: jax.Array) -> jax.Array | None:
+    """Whether each query of a tile `like` `[bq, bk]` sees each key (`within`), every mainloop's one
+    predicate, forward and backward; None where each sees every key. A spans call's intervals and, with
+    documents, ids (its mainloops give each tile its queries' intervals and both blocks' ids); a causal
+    call's diagonal; and the call's keys, where a tile reaches past them: no walk visits a tile wholly past
+    them, so a call whose keys are whole tiles reads no padding."""
+    visible = None
     if coords.spans is not None:
-        # The spans' form: its mainloops give each tile its queries' intervals and, with documents, ids.
         start, end = coords.spans
-        ids = None if coords.ids is None else (expand(coords.ids[0], s), across(coords.ids[1], s))
-        seen = within(coords.k_pos, expand(start, s), expand(end, s), ids)
+        ids = None if coords.ids is None else (expand(coords.ids[0], like), across(coords.ids[1], like))
+        visible = within(coords.k_pos, expand(start, like), expand(end, like), ids)
     elif spec.form == "causal":
-        seen = coords.k_pos <= coords.q_pos
-    if spec.form != "spans" and spec.keys % s.shape[1]:
+        visible = coords.k_pos <= coords.q_pos
+    if spec.form != "spans" and spec.keys % like.shape[1]:
         # A tile past the call's last key reads padding.
-        seen = coords.k_pos < spec.keys if seen is None else seen & (coords.k_pos < spec.keys)
-    return s if seen is None else jnp.where(seen, s, unseen)
+        visible = coords.k_pos < spec.keys if visible is None else visible & (coords.k_pos < spec.keys)
+    return visible
 
 
 def _safe(spec: Forward, m: jax.Array) -> jax.Array:

@@ -82,23 +82,40 @@ def _check_forward(call: str, dtype, shape, *, natural: bool, interpret: bool):
                     f"mosaic forward {call} {jnp.dtype(dtype).name} natural {natural}", seeds=SEEDS)
 
 
-def _check_call_form(form: str, *, interpret: bool):
-    """The forward over the template core's call form `form` (`test_attention_template.CASES`), bf16, two
-    query heads a key head, at `FORM_TILES`."""
-    queries, keys = core_geometry(CASES[form])
-    spans = template.spans(queries, keys, ROWS, **arguments(CASES[form]))
-    draw = _drawn((ROWS, queries, 4, 2), jnp.bfloat16, width=64, keys=keys)
+def _check_spans(label: str, spans: template.KeySpans, shape, *, interpret: bool, backward: bool = False,
+                 accurate: bool = False):
+    """The forward, or the backward in the form `accurate` names, over `spans` at `FORM_TILES`, bf16 draws of
+    `shape` (rows, queries, query and key heads) over the spans' keys."""
+    draw = _drawn(shape, jnp.bfloat16, width=64, keys=spans.keys)
 
     def ours(query, key, value, dout):
-        del dout
-        return attention_mosaic.forward(query, key, value, spans, tiles=FORM_TILES, interpret=interpret,
-                                        family=_family(interpret))
+        if not backward:
+            return attention_mosaic.forward(query, key, value, spans, tiles=FORM_TILES, interpret=interpret,
+                                            family=_family(interpret))
+        residuals = attention_triton.forward(query, key, value, spans, residuals=True,
+                                             interpret=interpret)[1:]
+        grads = attention_mosaic.backward(query, key, value, spans, None, dout, residuals=residuals,
+                                          accurate=accurate, tiles=FORM_TILES, interpret=interpret,
+                                          family=_family(interpret))
+        return grads.query, grads.key, grads.value
 
     def reference(query, key, value, dout):
-        del dout
-        return template.reference(query, key, value, spans)
+        if not backward:
+            return template.reference(query, key, value, spans)
+        _, pull = jax.vjp(lambda q, k, v: template.reference(q, k, v, spans), query, key, value)
+        return pull(dout)
 
-    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, f"mosaic forward {form}", seeds=SEEDS)
+    name = f"mosaic {'backward' if backward else 'forward'} {label}{' accurate' if accurate else ''}"
+    assert_as_exact(jax.jit(ours), jax.jit(reference), draw, name, seeds=SEEDS)
+
+
+def _check_call_form(form: str, *, interpret: bool, backward: bool = False, accurate: bool = False):
+    """`_check_spans` over the template core's call form `form` (`test_attention_template.CASES`), two
+    query heads a key head."""
+    queries, keys = core_geometry(CASES[form])
+    spans = template.spans(queries, keys, ROWS, **arguments(CASES[form]))
+    _check_spans(form, spans, (ROWS, queries, 4, 2), interpret=interpret, backward=backward,
+                 accurate=accurate)
 
 
 def _check_backward(call: str, shape, *, accurate: bool, interpret: bool, keys: int | None = None):
@@ -146,6 +163,25 @@ def test_the_forward_is_on_par_over_every_call_form_interpreted(form):
 
 @INTERPRETS
 @pytest.mark.parametrize("accurate", [False, True], ids=["default", "accurate"])
+@pytest.mark.parametrize("form", CASES)
+def test_the_backward_is_on_par_over_every_call_form_interpreted(form, accurate):
+    """The backward in both forms over each of the template core's call forms under the interpreter."""
+    _check_call_form(form, interpret=True, backward=True, accurate=accurate)
+
+
+@INTERPRETS
+@pytest.mark.parametrize("backward", [False, True], ids=["forward", "backward"])
+@pytest.mark.parametrize("call", CALLS)
+def test_a_call_of_whole_key_tiles_reads_no_padding_interpreted(call, backward):
+    """64 keys under 128 queries at 64-key tiles: the call pads its keys to a pair's 128, a tile wholly past
+    them, which a causal query past them reaches too; the keys are whole tiles, so no tile the walk reads
+    takes the keys' bound (`algebra.seen`): the walk reads none wholly past them."""
+    spans = template.spans(128, 64, 1, **CALLS[call])
+    _check_spans(f"{call} of whole key tiles", spans, (1, 128, 2, 1), interpret=True, backward=backward)
+
+
+@INTERPRETS
+@pytest.mark.parametrize("accurate", [False, True], ids=["default", "accurate"])
 @pytest.mark.parametrize("call", CALLS)
 def test_the_backward_is_on_par_interpreted(call, accurate):
     """The backward in both forms under the interpreter."""
@@ -161,10 +197,16 @@ def test_a_causal_backward_of_more_keys_than_queries_is_on_par_interpreted():
 
 
 @pytest.mark.parametrize("accurate", [False, True], ids=["default", "accurate"])
-def test_the_launches_lower_for_an_h100(accurate):
-    """The forward and the backward's launches lower for an H100 on any host, as the GPU gate runs them."""
-    rows, tokens, heads, kv_heads = SHAPES["compiled"]
-    spans = template.spans(tokens, tokens, rows, causal=True)
+@pytest.mark.parametrize("call", ["causal", "causal-documents-window"])
+def test_the_launches_lower_for_an_h100(call, accurate):
+    """The forward and the backward's launches lower for an H100 on any host, as the GPU gate runs them: a
+    causal call, and a spans one of documents, whose programs read its block map and ids."""
+    if call == "causal":
+        rows, tokens, heads, kv_heads = SHAPES["compiled"]
+        spans = template.spans(tokens, tokens, rows, causal=True)
+    else:
+        (tokens, _), rows, heads, kv_heads = core_geometry(CASES[call]), ROWS, 4, 2
+        spans = template.spans(tokens, tokens, rows, **arguments(CASES[call]))
     q = jax.ShapeDtypeStruct((rows, tokens, heads, 128), jnp.bfloat16)
     kv = jax.ShapeDtypeStruct((rows, tokens, kv_heads, 128), jnp.bfloat16)
     rows_shape = jax.ShapeDtypeStruct((rows, heads, tokens), jnp.float32)
@@ -203,6 +245,15 @@ def test_the_natural_forward_is_on_par_on_an_h100(call):
 def test_the_forward_is_on_par_over_every_call_form_on_an_h100(form):
     """The forward over each of the template core's call forms compiled on an H100."""
     _check_call_form(form, interpret=False)
+
+
+@ON_HOPPER
+@pytest.mark.gpu(reason="runs the sm90 mainloop compiled, on an H100")
+@pytest.mark.parametrize("accurate", [False, True], ids=["default", "accurate"])
+@pytest.mark.parametrize("form", CASES)
+def test_the_backward_is_on_par_over_every_call_form_on_an_h100(form, accurate):
+    """The backward in both forms over each of the template core's call forms compiled on an H100."""
+    _check_call_form(form, interpret=False, backward=True, accurate=accurate)
 
 
 @ON_HOPPER
