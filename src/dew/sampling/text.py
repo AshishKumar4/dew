@@ -18,7 +18,6 @@ from __future__ import annotations
 import dataclasses
 import functools
 import hashlib
-import math
 import types
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
@@ -156,18 +155,20 @@ class Sampling:
     stop: tuple[str, ...] = ()
 
     def __post_init__(self) -> None:
-        # Zero is greedy decoding, so the temperature is the one rate the controls' checks do not cover.
-        if isinstance(self.temperature, bool) or not math.isfinite(self.temperature) or self.temperature < 0:
+        # A rate is any real number, Python's or NumPy's (a config's or a sweep's), held as a float; zero
+        # is greedy decoding, so the temperature is the one rate the controls' own checks do not cover.
+        rates = {name: decoding.unit_interval(name, getattr(self, name))
+                 for name in ("top_p", "min_p", "typical_p")}
+        rates["temperature"] = decoding.real("temperature", self.temperature)
+        if rates["temperature"] < 0:
             raise ValueError("temperature must be finite and non-negative")
+        rates["repetition_penalty"] = decoding.positive("repetition_penalty", self.repetition_penalty)
+        for name in ("presence_penalty", "frequency_penalty"):
+            rates[name] = decoding.real(name, getattr(self, name))
         if self.top_k is not None:
-            decoding.positive_size("top_k", self.top_k)
-        for name, value in (("top_p", self.top_p), ("min_p", self.min_p), ("typical_p", self.typical_p)):
-            decoding.unit_interval(name, value)
-        decoding.positive("repetition_penalty", self.repetition_penalty)
-        for name, value in (("presence_penalty", self.presence_penalty),
-                            ("frequency_penalty", self.frequency_penalty)):
-            if isinstance(value, bool) or not math.isfinite(value):
-                raise ValueError(f"{name} must be finite")
+            object.__setattr__(self, "top_k", decoding.positive_size("top_k", self.top_k))
+        for name, rate in rates.items():
+            object.__setattr__(self, name, rate)
         for name, value in (("no_repeat_ngram_size", self.no_repeat_ngram_size),
                             ("min_new_tokens", self.min_new_tokens)):
             if type(value) is not int or value < 0:
