@@ -551,25 +551,56 @@ def _status(ratio: float, low: float, high: float, *, contained: bool = True) ->
     return "inconclusive"
 
 
+ZeroRows = tuple[np.ndarray, np.ndarray, np.ndarray]
+"""One seed's rows of float64 zero of a leaf that check 1 judges by the reference's error on them
+(`_paired`): their indices, Dew's RMS errors on them and the reference's."""
+
+NO_ZERO_ROWS: ZeroRows = (np.zeros(0, np.int64), np.zeros(0), np.zeros(0))
+
+
 @dataclasses.dataclass
 class _Draws:
     """Each leaf's errors over a run of seeds: Dew's and the reference's mean squared error from
     float64 (seed by leaf), each seed's worst sized row over its size (Dew's, the reference's), each
-    seed's count of rows of float64 zero where Dew is further from it than ROW_FACTOR times the
-    reference, whether every value of the leaf was finite on every seed, and each leaf's row width (its
-    last axis's length, 0 for a leaf of no rows; NARROW_FACTORS)."""
+    seed's rows of float64 zero with Dew's and the reference's errors on them (`ZeroRows`, seed by leaf;
+    `pooled_zero_rows`), whether every value of the leaf was finite on every seed, and each leaf's row
+    width (its last axis's length, 0 for a leaf of no rows; NARROW_FACTORS)."""
     names: list[str]
     mine: np.ndarray
     theirs: np.ndarray
     worst: np.ndarray
-    zero_rows: np.ndarray
+    zero_rows: list[list[ZeroRows]]
     finite: np.ndarray
     widths: tuple[int, ...]
 
     def joined(self, other: "_Draws") -> "_Draws":
         return _Draws(self.names, *(np.concatenate([getattr(self, field), getattr(other, field)])
-                                    for field in ("mine", "theirs", "worst", "zero_rows", "finite")),
+                                    for field in ("mine", "theirs", "worst")),
+                      self.zero_rows + other.zero_rows, np.concatenate([self.finite, other.finite]),
                       self.widths)
+
+
+def pooled_zero_rows(evidence: list[ZeroRows]) -> list[tuple[int, float, float]]:
+    """The rows of float64 zero Dew is further from than ROW_FACTOR times the reference over a run's
+    seeds: each row's errors pooled over the seeds it is zero on, sqrt(sum of Dew's squared errors over
+    the reference's), as (row, Dew's RMS error, the reference's). A row of float64 zero is all residue,
+    float32's rounding of a sum float64 cancels, with no size to judge it at, so it is held to the
+    reference's residue on the same row; one seed's residues are heavy-tailed, their ratio a ratio of
+    two, which a per-seed rule fails an equally exact Dew on a sixth to two fifths of runs of 8 to 64
+    seeds, where the pooled one fails none (`tools/zero_rows.py`), and still fails a row Dew holds ten
+    times further every time. Where the reference is exactly the float64 zero on a row over every seed,
+    Dew must be too."""
+    mine: dict[int, float] = {}
+    theirs: dict[int, float] = {}
+    seen: dict[int, int] = {}
+    for rows, my_errors, their_errors in evidence:
+        for row, my_error, their_error in zip(rows.tolist(), my_errors.tolist(), their_errors.tolist(),
+                                              strict=True):
+            mine[row] = mine.get(row, 0.0) + my_error ** 2
+            theirs[row] = theirs.get(row, 0.0) + their_error ** 2
+            seen[row] = seen.get(row, 0) + 1
+    return [(row, float(np.sqrt(mine[row] / seen[row])), float(np.sqrt(theirs[row] / seen[row])))
+            for row in sorted(mine) if not mine[row] <= ROW_FACTOR ** 2 * theirs[row]]
 
 
 SKETCH = 32
@@ -710,7 +741,7 @@ def _drawn(dew_fn, reference_fn, draw, seeds, truth_fn=None, reference_seeds=Non
         zero_rows.append([entry[4] for entry in row])
         finite.append([entry[5] for entry in row])
     return _Draws(names, np.asarray(mine), np.asarray(theirs), np.asarray(worst).reshape(len(mine), -1, 2),
-                  np.asarray(zero_rows), np.asarray(finite), widths)
+                  zero_rows, np.asarray(finite), widths)
 
 
 def _evidence(dew, reference, truth, their_truth) -> list[tuple]:
@@ -729,7 +760,7 @@ def _evidence(dew, reference, truth, their_truth) -> list[tuple]:
             held = (np.shape(true) if recorded else np.shape(their_leaf), their.dtype)
             assert kept == held, (jax.tree_util.keystr(path), kept, held)
             assert np.shape(true) == np.shape(leaf), (jax.tree_util.keystr(path), np.shape(true))
-            row.append((0.0, 0.0, 0.0, 0.0, 0, True))
+            row.append((0.0, 0.0, 0.0, 0.0, NO_ZERO_ROWS, True))
             continue
         # Rows pair where the two truths are the same values: the same draw, or an orbit's draws.
         paired = (recorded or their_truth is truth
@@ -740,9 +771,9 @@ def _evidence(dew, reference, truth, their_truth) -> list[tuple]:
 
 def _paired(name: str, mine: RecordedLeaf, theirs: RecordedLeaf, *, paired: bool = True) -> tuple:
     """One seed's evidence of a leaf for check 1 (`_Draws`), Dew's and the reference's alike from
-    `leaf_summary`: their mean squared errors, their worst sized rows, how many rows of float64 zero Dew
-    is further from than ROW_FACTOR times the reference is on that same row (`rows_over`'s rule for
-    them), and whether every value was finite. A row the truth sizes zero (below RESOLUTION of its leaf)
+    `leaf_summary`: their mean squared errors, their worst sized rows, the rows of float64 zero with
+    both arms' errors on them (`ZeroRows`, pooled over the run's seeds by `pooled_zero_rows`), and
+    whether every value was finite. A row the truth sizes zero (below RESOLUTION of its leaf)
     is one of float64 zero unless a live reference measures it: its error there below the row's own
     float64 RMS, so it carries the row better than zero would. That is an engineering definition of a
     measured row, not a proof of float64's accuracy on it; a sum that cancels to float64's residue is
@@ -755,7 +786,7 @@ def _paired(name: str, mine: RecordedLeaf, theirs: RecordedLeaf, *, paired: bool
     in Dew's truth the reference's lacks (a recorded truth recomputed otherwise) is refused. Not
     `paired`, the two held to truths of their own draws (`null_runs`), no row is paired."""
     if not paired:
-        return mine.mse, theirs.mse, mine.worst, theirs.worst, 0, mine.finite and theirs.finite
+        return mine.mse, theirs.mse, mine.worst, theirs.worst, NO_ZERO_ROWS, mine.finite and theirs.finite
     at_zero = dict(zip(theirs.zero_rows.tolist(), theirs.zero_errors.tolist(), strict=True))
     unrecorded = [at for at in mine.zero_rows.tolist() if at not in at_zero]
     if unrecorded:
@@ -763,14 +794,17 @@ def _paired(name: str, mine: RecordedLeaf, theirs: RecordedLeaf, *, paired: bool
                              f"{unrecorded[:4]}")
     sizes = (dict(zip(theirs.zero_rows.tolist(), theirs.zero_sizes.tolist(), strict=True))
              if theirs.zero_sizes is not None else {})
-    worst, their_worst, zero = mine.worst, theirs.worst, 0
+    worst, their_worst, zero = mine.worst, theirs.worst, []
     for at, error in zip(mine.zero_rows.tolist(), mine.zero_errors.tolist(), strict=True):
         size = sizes.get(at, 0.0)
         if at_zero[at] < size:
             worst, their_worst = max(worst, error / size), max(their_worst, at_zero[at] / size)
-        elif not error <= ROW_FACTOR * at_zero[at]:
-            zero += 1
-    return mine.mse, theirs.mse, worst, their_worst, zero, mine.finite and theirs.finite
+        else:
+            zero.append((at, error, at_zero[at]))
+    rows, errors, their_errors = (np.asarray(column, dtype) for column, dtype in zip(
+        zip(*zero, strict=True) if zero else ((), (), ()), (np.int64, np.float64, np.float64), strict=True))
+    return (mine.mse, theirs.mse, worst, their_worst, (rows, errors, their_errors),
+            mine.finite and theirs.finite)
 
 
 def _judged(draws: _Draws, index: int, tails: tuple[float, float] = (LOWER_TAIL, UPPER_TAIL)
@@ -812,9 +846,12 @@ def _judgement(draws: _Draws, label: str, tails: tuple[float, float] = (LOWER_TA
             over.append(f"{leaf}: the worst row over {count} seeds is {my_row:.3e} from float64 over its "
                         f"size, the reference's {their_row:.3e}, allowed {factor * their_row:.3e} ({factor} "
                         f"times it)")
-        if draws.zero_rows[:, index].any():
-            over.append(f"{leaf}: {int(draws.zero_rows[:, index].sum())} rows of float64 zero over {count} "
-                        f"seeds are further from it than ROW_FACTOR times the reference's own")
+        zero = pooled_zero_rows([seed[index] for seed in draws.zero_rows])
+        if zero:
+            at, my_error, their_error = zero[0]
+            over.append(f"{leaf}: {len(zero)} rows of float64 zero are further from it over {count} seeds "
+                        f"than ROW_FACTOR times the reference's own, row {at} by {my_error:.3e} against "
+                        f"{their_error:.3e} (`pooled_zero_rows`)")
     return over, unresolved
 
 
