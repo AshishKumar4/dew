@@ -372,16 +372,31 @@ def run_stack(layers: Sequence[DecoderBlock], block: Block, specs: Sequence[Laye
     return x
 
 
+def _enclosing_capture() -> bool | Callable[[nn.Module, str], bool]:
+    """The `capture_intermediates` filter of the `apply` this layer runs inside, False outside one.
+
+    Flax keeps it on its module context, and an `apply` pushes its own there;
+    a layer applied in a scope of its own (`_applied`) is handed the enclosing
+    one, so it keeps what the scope that called it keeps: a reader of layer
+    states (`CausalTransformer.capture_layers`) reads a fetched stack's layers
+    as it reads a resident one's.
+    """
+    from flax.linen.module import _context
+
+    return _context.capture_stack[-1] if _context.capture_stack else False
+
+
 def _applied[Hidden](run: DecoderBlock, opened: list[str], store, read, state, cache, hidden: Hidden,
                      per_layer_slice, *, train: bool, decode: bool,
                      attention_metadata) -> tuple[Hidden, dict]:
     """One layer of `run` applied in a scope of its own: `read` its read-only variables, `state`
-    the caller's held collections and `cache` its cache slice, writing the `opened` collections.
+    the caller's held collections and `cache` its cache slice, writing the `opened` collections
+    and capturing what the enclosing `apply` captures (`_enclosing_capture`).
     The hidden state comes out as it went in, a residual stream or `Carried` streams."""
     variables = {**read, **state} if cache is None else {**read, **state, 'cache': cache}
     hidden, changed = run.apply(
-        variables, hidden, mutable=opened, train=train, decode=decode, kv_store=store,
-        per_layer_input=per_layer_slice, attention_metadata=attention_metadata)
+        variables, hidden, mutable=opened, capture_intermediates=_enclosing_capture(), train=train,
+        decode=decode, kv_store=store, per_layer_input=per_layer_slice, attention_metadata=attention_metadata)
     return hidden, dict(changed)
 
 
@@ -389,7 +404,7 @@ def _opened(run: DecoderBlock, spec: LayerSpec, probed: list[tuple[LayerSpec, li
             cache, hidden, per_layer_slice, *, store, train: bool, decode: bool,
             attention_metadata) -> list[str]:
     """The collections a run applied in a scope of its own opens: those its caller
-    opened that a layer of it writes, DSpark's `prediction_inputs` among them,
+    opened that a layer of it writes or captures into, DSpark's `prediction_inputs` among them,
     which a layer reads to choose what it records, and the ones the caller holds
     (`state`), which it reads as it writes them; the loop carries them back out.
 
@@ -403,8 +418,8 @@ def _opened(run: DecoderBlock, spec: LayerSpec, probed: list[tuple[LayerSpec, li
         # A provider writes its keys and values into the store it is given: the
         # abstract run writes into a copy, so nothing it traces leaves it.
         _, changed = jax.eval_shape(lambda variables: run.apply(
-            variables, hidden, mutable=True, train=train, decode=decode,
-            kv_store=None if store is None else dict(store), per_layer_input=per_layer_slice,
+            variables, hidden, mutable=True, capture_intermediates=_enclosing_capture(), train=train,
+            decode=decode, kv_store=None if store is None else dict(store), per_layer_input=per_layer_slice,
             attention_metadata=attention_metadata), variables)
         written = list(changed)
         probed.append((spec, written))
@@ -512,13 +527,19 @@ class StackView:
     layer's slice at a time, for a save or an export. Inside a pipeline, a
     collection that entered it has `[stage, ...]` leaves, and one the loop
     created has `[iteration, stage, microbatch, ...]` leaves; a stage's real
-    iterations are its microbatches, in order.
+    iterations are its microbatches, in order, and a leaf that holds rows
+    takes them back in the batch's order (`_whole`). `batch_axis` is where
+    the stack's residual holds its rows, after AltUp's copies: the pipeline
+    cuts the residual into microbatches there (`run_pipeline`), and a
+    layer's own output (what `capture_intermediates` keeps of its
+    `__call__`) holds them there too; what its sublayers sow holds them first.
     """
     groups: tuple[tuple[int, int], ...]
     stages: int = 1
     microbatches: int = 1
     broadcast: tuple[str, ...] = ()
     banked: tuple[str, ...] = ()
+    batch_axis: int = 0
 
     @property
     def per_stage(self) -> int:
@@ -615,7 +636,7 @@ class StackView:
                 view = stages.pop(name)
                 for stage, names in enumerate(self._outside_names(first, count)):
                     for offset, layer in enumerate(names):
-                        tree[layer] = jax.tree.map(
+                        tree[layer] = jax.tree_util.tree_map_with_path(
                             functools.partial(self._leaf, stage, offset if count > 1 else None,
                                               collection in self.broadcast), view)
             if self.stages > 1 and stages:
@@ -623,9 +644,9 @@ class StackView:
             outside[collection] = tree
         return outside
 
-    def _leaf(self, stage: int, offset: int | None, broadcast: bool, leaf):
-        """One layer's leaf out of a run's stacked one, taken with `index_in_dim`:
-        an index array would be a gather, which over a host-resident bank needs
+    def _leaf(self, stage: int, offset: int | None, broadcast: bool, path, leaf):
+        """One layer's leaf, at `path` below its run, out of a run's stacked one, taken with
+        `index_in_dim`: an index array would be a gather, which over a host-resident bank needs
         host-memory indices a save or export does not hold.
         """
         if self.stages == 1:
@@ -637,7 +658,11 @@ class StackView:
         real = leaf[stage:stage + self.microbatches, stage]
         if offset is not None:
             real = real[:, offset]
-        return real.reshape((-1, *real.shape[2:]))
+        # A count a layer sows once a microbatch stays one per microbatch.
+        if real.ndim == 1:
+            return real
+        output = path[:1] == (jax.tree_util.DictKey("__call__"),)
+        return _whole(real, self.batch_axis if output else 0)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -696,9 +721,8 @@ def run_pipeline(model: nn.Module, view: StackView, x, *, train: bool, per_layer
     `model` is the decoder whose `_stacked` calls this; its `block` and
     `specs` build the stages.
     """
-    stages, count = view.stages, view.microbatches
+    stages, count, batch_axis = view.stages, view.microbatches, view.batch_axis
     per_stage = view.per_stage
-    batch_axis = 1 if model.altup is not None else 0
     micro = functools.partial(microbatched, count=count)
     x = micro(x, batch_axis)
     inputs = (
