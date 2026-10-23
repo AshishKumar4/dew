@@ -78,11 +78,11 @@ def spread(value: jax.Array, shape: tuple[int, ...]) -> jax.Array:
     kept = tuple(axis for axis in range(len(shape)) if axis not in axes)
 
     def outer(value: jax.Array) -> jax.Array:
-        ones = jnp.ones((int(np.prod([shape[axis] for axis in axes])),), value.dtype)
+        # Only the size-one axes are dropped, so a sharded kept axis keeps its own sharding.
+        ones = jnp.ones(tuple(shape[axis] for axis in axes), value.dtype)
         product = accumulated(functools.partial(jax.lax.dot_general, dimension_numbers=(((), ()), ((), ()))),
-                              ones, jnp.reshape(value, (-1,)))
-        laid = jnp.reshape(product, tuple(shape[axis] for axis in (*axes, *kept)))
-        return jnp.transpose(laid, tuple(np.argsort((*axes, *kept))))
+                              ones, jnp.squeeze(value, axes))
+        return jnp.transpose(product, tuple(np.argsort((*axes, *kept))))
 
     return jax.lax.platform_dependent(value, cpu=outer, default=lambda value: jnp.broadcast_to(value, shape))
 
@@ -147,21 +147,12 @@ def products_dtype(*operands) -> jnp.dtype | None:
     return jnp.result_type(*dtypes)
 
 
-def _jax_products() -> tuple:
-    """JAX's products as they stand, each with its code object where it is a Python function: a
-    library may swap one by its module attribute or by its code (Qwix does both)."""
-    return tuple((product, getattr(product, "__code__", None))
-                 for product in (jax.lax.dot_general, jnp.einsum, jnp.matmul))
-
-
-_JAX_PRODUCTS = _jax_products()
-"""JAX's own products, as this module found them."""
-
-
 def _intercepted() -> bool:
-    """Whether a library has swapped one of JAX's products for its own (`_JAX_PRODUCTS`)."""
-    return any(now is not was or code is not original
-               for (now, code), (was, original) in zip(_jax_products(), _JAX_PRODUCTS, strict=True))
+    """Whether this thread traces a quantized model's method, whose products Qwix owns
+    (`dew.cache.QUANTIZED_TRACE`, which jit's cache keys on)."""
+    from dew.cache import QUANTIZED_TRACE
+
+    return QUANTIZED_TRACE.value is not None
 
 
 FP32_SUMS = "F32_F32_F32"
@@ -172,7 +163,7 @@ honors on a CPU."""
 
 def _sums_in_float64(*operands) -> bool:
     """Whether a CPU sums these operands' products in float64 (`accumulated`): float32 arrays, in no
-    scope that states fp32 sums (`FP32_SUMS`), with JAX's products JAX's own (`_intercepted`)."""
+    scope that states fp32 sums (`FP32_SUMS`), outside a quantized model's trace (`_intercepted`)."""
     return (jax.config.jax_default_matmul_precision != FP32_SUMS and not _intercepted()
             and all(isinstance(operand, jax.Array | np.ndarray) for operand in operands)
             and products_dtype(*operands) == jnp.dtype(jnp.float32))
@@ -181,10 +172,18 @@ def _sums_in_float64(*operands) -> bool:
 def float64_sum(product: Callable[..., jax.Array], *operands, dtype: DTypeLike) -> jax.Array:
     """`product(*operands)`, a sum of products, taken in float64 from its operands widened exactly and
     rounded once to `dtype`, under `jax.enable_x64` for its own trace: the sum `accumulated` takes on a
-    CPU, with no platform of its own to choose."""
+    CPU, with no platform of its own to choose. Its products run at HIGHEST precision, whatever fp32
+    algorithm the caller bound, which would narrow float64 operands back to float32."""
     with jax.enable_x64(new_val=True):
-        wide = product(*(operand.astype(jnp.float64) for operand in operands), preferred_element_type=None)
+        wide = product(*_widened(operands), precision=jax.lax.Precision.HIGHEST, preferred_element_type=None)
         return wide.astype(dtype)
+
+
+def _widened(operands) -> list[jax.Array]:
+    """`operands` as the float64 operands of their float32 product: each converted to the dtype they
+    multiply in (`products_dtype`), as the product converts them, then widened exactly."""
+    dtype = products_dtype(*operands)
+    return [operand.astype(dtype).astype(jnp.float64) for operand in operands]
 
 
 def accumulated(product: Callable[..., jax.Array], *operands,
@@ -227,14 +226,15 @@ def accumulated(product: Callable[..., jax.Array], *operands,
         once: JAX transposes a product after its trace, outside the scope that widened it, so the
         pullback is formed in that scope here, for the operands a reverse pass differentiates alone."""
         with jax.enable_x64(new_val=True):
-            wide = [operand.astype(jnp.float64) for operand in operands]
+            wide = _widened(operands)
             wide_cotangent = cotangent.astype(jnp.float64)
 
             def transposed(index):
                 # The product is linear in each operand alone, so its transpose there forms the
                 # cotangent's products and nothing of the forward.
                 def alone(operand):
-                    return product(*wide[:index], operand, *wide[index + 1:], preferred_element_type=None)
+                    return product(*wide[:index], operand, *wide[index + 1:],
+                                   precision=jax.lax.Precision.HIGHEST, preferred_element_type=None)
 
                 (gradient,) = jax.linear_transpose(alone, wide[index])(wide_cotangent)
                 return gradient.astype(operands[index].dtype)

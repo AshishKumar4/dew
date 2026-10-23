@@ -125,3 +125,86 @@ def test_a_scope_that_states_fp32_sums_gets_them(stated_first):
             results[stated] = float(product(lhs, rhs)[0, 0])
     assert results == {True: 0.0, False: 1.0}
 
+
+
+def test_a_bias_spread_over_a_sharded_axis_keeps_its_sharding():
+    """A batched bias, `[2, 1, 4]` spread to `[2, 3, 4]`, its last axis split over an Explicit mesh,
+    adds itself to every position and takes the cancelling cotangents' float64 sum, 1, under jit:
+    the spread drops only its size-one axis, never merging a split one into another."""
+    from jax.sharding import AxisType, NamedSharding, PartitionSpec
+
+    from dew.nn.precision import spread
+
+    mesh = jax.make_mesh((2,), ("model",), axis_types=(AxisType.Explicit,), devices=jax.devices()[:2])
+    with jax.set_mesh(mesh):
+        value = jax.device_put(np.full((2, 1, 4), 0.5, np.float32),
+                               NamedSharding(mesh, PartitionSpec(None, None, "model")))
+        cotangent = np.broadcast_to(CANCELLING[None, :, None], (2, 3, 4)).copy()
+        out, gradient = jax.jit(with_gradients(lambda value: spread(value, (2, 3, 4))))(value, cotangent)
+    assert np.asarray(out).tolist() == np.full((2, 3, 4), 0.5).tolist()
+    assert np.asarray(gradient).tolist() == np.ones((2, 1, 4)).tolist()
+
+
+def test_another_threads_quantized_trace_leaves_this_threads_products_dews():
+    """While one thread traces a quantized model's method (`QUANTIZED_TRACE`, whose products Qwix
+    owns), a product another thread compiles, and the same program after that trace ends, sum in
+    float64: the ownership is the tracing thread's alone."""
+    import threading
+
+    from dew.cache import QUANTIZED_TRACE
+
+    product = jax.jit(lambda lhs, rhs: float32_einsum("ik,kj->ij", lhs, rhs))
+    lhs, rhs = CANCELLING[None], np.ones((3, 1), np.float32)
+    inside, done, results = threading.Event(), threading.Event(), []
+
+    def quantized():
+        with QUANTIZED_TRACE("int8"):
+            inside.set()
+            done.wait()
+
+    held = threading.Thread(target=quantized)
+    held.start()
+    inside.wait()
+    results.append(float(product(lhs, rhs)[0, 0]))
+    done.set()
+    held.join()
+    results.append(float(product(lhs, rhs)[0, 0]))
+    assert results == [1.0, 1.0]
+
+
+@pytest.mark.parametrize("precision", ["F32_F32_F32", jax.lax.DotAlgorithmPreset.F32_F32_F32,
+                                       jax.lax.Precision.DEFAULT], ids=["preset-name", "preset", "default"])
+def test_a_product_that_names_its_precision_still_sums_in_float64(precision):
+    """A product bound to an fp32 algorithm or precision of its own, outside a scope that states fp32
+    sums, sums in float64 on a CPU, forward and gradient: the float64 products run at the precision
+    that keeps them float64."""
+    lhs, rhs = CANCELLING[None], np.ones((3, 1), np.float32)
+    product = jax.jit(with_gradients(
+        lambda lhs, rhs: float32_einsum("ik,kj->ij", lhs, rhs, precision=precision)))
+    out, _, into_rhs = product(lhs, rhs, np.ones((1, 1), np.float32))
+    assert np.asarray(out).tolist() == [[1.0]]
+    assert np.asarray(into_rhs).tolist() == CANCELLING[:, None].tolist()
+
+
+def test_a_mixed_product_converts_its_operands_as_the_product_does():
+    """An int32 operand multiplies a float32 one as float32, as JAX converts it: 2**24 + 1 becomes
+    2**24, so the terms cancel to 0 exactly, which the float64 sum keeps; the float operand's gradient
+    is the converted integers, the integer held fixed."""
+    ints = np.asarray([2 ** 24 + 1, -(2 ** 24)], np.int32)
+    floats = np.ones(2, np.float32)
+    assert float(jax.jit(lambda ints, floats: float32_einsum("i,i->", ints, floats))(ints, floats)) == 0.0
+    gradient = jax.jit(jax.grad(lambda floats: float32_einsum("i,i->", ints, floats)))(floats)
+    assert np.asarray(gradient).tolist() == [2.0 ** 24, -(2.0 ** 24)]
+
+
+def test_a_portable_recurrence_product_sums_in_float64():
+    """The recurrence's portable products (`recurrence_algebra.portable` and the weighed `paired`)
+    are real CPU execution's, and sum in float64: 1 exactly over the cancelling terms."""
+    from dew.nn.kernels.recurrence_algebra import paired, portable
+
+    lhs, rhs = CANCELLING[None], np.ones((3, 1), np.float32)
+    assert np.asarray(jax.jit(lambda lhs, rhs: portable("product", lhs, rhs))(lhs, rhs)).tolist() == [[1.0]]
+    left, right = CANCELLING[None, :], np.ones((1, 3), np.float32)
+    decay = np.ones((1, 1, 3), np.float32)
+    weighed = jax.jit(lambda *operands: paired("product", *operands))(left, right, decay)
+    assert np.asarray(weighed).tolist() == [[1.0]]
