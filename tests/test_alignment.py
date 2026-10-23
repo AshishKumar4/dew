@@ -277,7 +277,7 @@ def test_a_published_pipeline_aligns_beside_its_own_tree(tmp_path):
     from test_diffusion_run_sources import batch_for, precision
 
     from dew.config import ObjectiveConfig
-    from dew.objectives.diffusion import DiffusionRunConfig
+    from dew.config.diffusion import DiffusionRunConfig
     from dew.training import Trainer
 
     for name in ("flux_source", "rae"):

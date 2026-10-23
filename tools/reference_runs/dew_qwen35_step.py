@@ -36,8 +36,8 @@ from dew.interop import Pretrained
 from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.multimodal import MultimodalTransformer
 from dew.objectives.base import Objective
+from dew.optim import Cosine
 from dew.training import Trainer
-from dew.training.optim import Cosine
 from dew.training.runtime import prepare_process
 
 
@@ -131,7 +131,7 @@ def compile_step(args, model, variables):
     work.write(args.work)
     solver = OptimConfig(optimizer="adamw", b1=0.9, b2=0.999, optimizer_opts={"eps": 1e-8},
                           weight_decay=1e-4, clip_grads=0.0, state_dtype="float32",
-                          schedule=Cosine(init=0.0, peak=2.5e-5, warmup_steps=10, end=0.0)).build(220)
+                          rate=Cosine(init=0.0, peak=2.5e-5, warmup_steps=10, end=0.0)).build(220)
     trainer = Trainer(objective, solver, key=jax.random.key(args.seed), checkpoints=None, tracker=None)
     state, _, _ = trainer.place()
     placed = jax.device_put({"tokens": rows})
