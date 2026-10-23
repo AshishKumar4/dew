@@ -1000,6 +1000,8 @@ def off_anchor_delta(state: OffAnchor, anchor_value: jax.Array, dout: jax.Array,
     about_zero = jnp.sum((others + own * anchor_value) * cotangent, axis=-1) + state_weight * mean0
     about_anchor = (jnp.sum((others - others_total * anchor_value) * cotangent, axis=-1)
                     + state_weight * (mean0 - anchor))
+    jax.debug.print("D {w}: total {t} others0 {o} own {ow} others_total {ot} anchor {a} zero {z} anch {an}",
+                    w="start", t=state.total[0], o=others[0, :2], ow=own[0, 0], ot=others_total[0, 0], a=anchor[0], z=about_zero[0], an=about_anchor[0])
     anchored = jnp.abs(about_anchor) <= jnp.abs(about_zero)
     return (jnp.where(anchored, anchor, 0.0), jnp.where(anchored, about_anchor, about_zero),
             jnp.where(anchored, key_index, -1))
@@ -1028,6 +1030,8 @@ def split_delta(others: jax.Array, own: jax.Array, others_total: jax.Array, tota
     about_zero = jnp.sum(split_output(others, own, anchor_value) * cotangent, axis=-1)
     about_anchor = (jnp.sum((others - expand(others_total, anchor_value) * anchor_value) * cotangent, axis=-1)
                     - state_weight * anchor)
+    jax.debug.print("D {w}: total {t} others0 {o} own {ow} others_total {ot} anchor {a} zero {z} anch {an}",
+                    w="split", t=total[0], o=others[0, :2], ow=own[0], ot=others_total[0], a=anchor[0], z=about_zero[0], an=about_anchor[0])
     anchored = jnp.abs(about_anchor) <= jnp.abs(about_zero)
     return (jnp.where(anchored, anchor, 0.0), jnp.where(anchored, about_anchor, about_zero),
             jnp.where(anchored, key_index, -1))
