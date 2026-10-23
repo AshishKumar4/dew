@@ -783,7 +783,8 @@ def _dqkwg_kernel(chunk_ref, q_ref, k_ref, v_ref, g_ref, gl_ref, h_ref, do_ref, 
             # The queries' reads of the memory the chunk enters, and that memory's own decay to its end.
             after = (jnp.sum(dq * queries.astype(jnp.float32), axis=1)
                      + jnp.where(last_row, dg_last * algebra.raised(last, last_low), 0.0))
-            write_rows(_rows(dg_ref, start, chunk, head), taken, _summed_back(index, pairs, after))
+            write_rows(_rows(dg_ref, start, chunk, head), taken,
+                       _summed_back(index, pairs, after, exact=exact))
             ds = ds.astype(keys.dtype)
             dq += _dot(ds, keys, exact=exact)
             dk += _dot(ds.T, queries, exact=exact)
@@ -801,7 +802,7 @@ class ChunkBwdDqkwg(_Launch):
 
     NAME = "chunk_bwd_dqkwg"
     KEYS, VALUES = 'k', 'v'
-    revision: int = 3
+    revision: int = 4
     SPACES = _spaces(_tiles([(64, 64), (64, 128), (128, 64), (128, 128)], (2, 4, 8), (1, 2)),
                      _tiles([(64, 64), (64, 128), (128, 64), (128, 128)], (2, 4, 8), (1,)))
     # One stage elsewhere: its loop over a key head's value heads holds every block of a head, and a
@@ -866,7 +867,7 @@ def chunk_bwd_dqkwg(q, k, v, w, g, h, dv, do, dh, *, scale: float, chunk: int = 
                             interpret=interpret)
 
 
-def _summed_back(index, pairs, after):
+def _summed_back(index, pairs, after, *, exact: bool):
     """The gradient of each of a chunk's per-token decays, `d/dg_t`, from the gradients of terms through
     ranges of its cumulated decay: `pairs` `[C, C]`, each `(i, j)` a term through the range `(j, i]`
     (strictly lower), and `after` `[C]`, each `s` a term through the range from the chunk's start to
@@ -875,9 +876,12 @@ def _summed_back(index, pairs, after):
     those back, adding and taking back every term whose range misses the token: fp32's residue where
     the gradient is exactly zero (keys of zero before a token, 1.7e-10 in
     test_a_range_late_in_a_long_decayed_chunk_is_as_exact_as_fla), and the cancellation of terms
-    many times the gradient where it is not. Each row's pairs before `t` are its running sum less
-    its `t`th, exactly zero where no pair before `t` is nonzero."""
-    through = jnp.cumsum(pairs, axis=1) - pairs
+    many times the gradient where it is not. Each row's pairs before `t` are summed as a product with
+    the strictly upper ones at IEEE fp32, so no pair is added and taken back: a row's running sum less
+    its `t`th lost every smaller pair before it to the `t`th's rounding, where the decays fall steeply
+    (decays near zero: the gradient 9 times the token-by-token recurrence's error from float64)."""
+    before = (index[:, None] < index[None, :]).astype(jnp.float32)
+    through = _dot(pairs, before, exact=exact, ieee=True)
     return jnp.sum(jnp.where(index[:, None] >= index[None, :], through + after[:, None], 0.0), axis=0)
 
 
@@ -968,7 +972,7 @@ def _wy_bwd_kernel(chunk_ref, k_ref, v_ref, beta_ref, g_ref, gl_ref, a_ref, dw_r
                                              (jnp.zeros((chunk, chunk), jnp.float32), d_beta))
         write_rows(_rows(db_ref, start, chunk), taken, d_beta)
         weighted = d_l.astype(jnp.float32) * (products * beta[:, None])
-        write_rows(_rows(dg_ref, start, chunk), taken, _summed_back(index, weighted, d_gate))
+        write_rows(_rows(dg_ref, start, chunk), taken, _summed_back(index, weighted, d_gate, exact=exact))
 
 
 @dataclasses.dataclass(frozen=True)
@@ -977,7 +981,7 @@ class PrepareWyReprBwd(_Launch):
 
     NAME = "prepare_wy_repr_bwd"
     KEYS, VALUES = 'k', 'v'
-    revision: int = 3
+    revision: int = 4
     SPACES = _spaces(_tiles([(32, 32), (64, 64)], (2, 4, 8), (1, 2, 3)))
     # Eight warps for fp32 on every GPU: at TF32x3 four took ptxas 40 s on sm80 and 66 s on sm89, eight
     # 17 s; one stage on a 99 KB block, whose looped blocks stage the next one, 102,400 bytes at two
