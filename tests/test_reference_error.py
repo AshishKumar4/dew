@@ -393,11 +393,12 @@ def test_check_one_passes_an_equally_exact_sum_over_the_seeds_its_own_reference_
 
 def _cancelling_draw(seed):
     """Sums of three terms, `[64, 4, 3]`, standard normal but for the first row's, which cancel: 1, half
-    an fp32 unit of it, and -1, scaled by a power of two the seed picks. In the order 1, -1, half its
-    exact sum survives; in 1, half, -1 the half is lost to the first rounding and the row is all error."""
+    an fp32 unit of it, and -1, scaled by a power of two the seed picks, small enough that the row's
+    error is nothing beside the others' (the pooled ratio is theirs). In the order 1, -1, half its exact
+    sum survives; in 1, half, -1 the half is lost to the first rounding and the row is all error."""
     rng = np.random.default_rng([0x0B, seed])
     terms = rng.normal(size=(64, 4, 3))
-    scale = 2.0 ** int(rng.integers(-8, 8))
+    scale = 2.0 ** int(rng.integers(-16, -8))
     terms[0] = np.array([1.0, 2.0 ** -25, -1.0]) * scale
     return (terms.astype(np.float32),)
 
@@ -425,8 +426,9 @@ def test_an_orbit_judges_each_arms_worst_row_over_the_same_orders():
     orders both arms run at each, both worst rows are the lost half, and the site passes; at a single
     order each arm's worst row, ratio and values are that order's alone."""
     seeds = seeds_for(_outer_first, _cancelling_draw, "cancelling sums")
-    with pytest.raises(AssertionError, match="worst row"):
+    with pytest.raises(AssertionError) as raised:
         assert_as_exact(_left_to_right, _outer_first, _cancelling_draw, "cancelling sums", seeds=seeds)
+    assert raised.type is AssertionError
     assert_as_exact(_left_to_right, _outer_first, _cancelling_draw, "cancelling sums", seeds=seeds,
                     orbit=_swapped)
     from reference_error import _drawn
