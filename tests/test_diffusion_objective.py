@@ -387,6 +387,9 @@ def test_null_dropout_matches_explicit_tokens_under_current_encoder(conditional_
                                       variables=widened(variables))
             return trained(through(wide, widened(values), tokens, at))
 
+    from reference_error import seeds_for
+    print("SIZED", probability, seeds_for(reference, draw, f"null dropout at {probability}", truth_fn=truth,
+                                          dew_fn=dew), flush=True)
     assert_as_exact(dew, reference, draw, f"null dropout at {probability}",
                     seeds=NULL_DROPOUT_SEEDS[probability], truth_fn=truth)
 
