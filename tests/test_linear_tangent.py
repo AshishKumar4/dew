@@ -51,27 +51,40 @@ def reversed_through(staging):
             return jax.linear_transpose(linear, x)(jnp.ones_like(x))[0]
 
         return transposed
-    return lambda x, index: jax.vmap(jax.grad(summed))(x.reshape(2, -1), index.reshape(2, -1)).reshape(-1)
+    if staging == "vmap of a gradient":
+        return lambda x, index: jax.vmap(jax.grad(summed))(x.reshape(2, -1), index.reshape(2, -1)).reshape(-1)
+    if staging == "gradient of a vmap":
+        return jax.grad(lambda x, index: jax.vmap(tripled)(x.reshape(2, -1), index.reshape(2, -1)).sum())
+    # An operand two rows share: its cotangent sums the rows'.
+    def shared(x, index):
+        return jax.vmap(tripled, in_axes=(None, 0))(x, jnp.stack([index, index])).sum() / 2
+
+    return jax.jit(jax.grad(shared))
 
 
-@pytest.mark.parametrize("staging", ["vjp", "jit", "shard_map", "scan", "remat", "linearize", "vmap"])
+@pytest.mark.parametrize("staging", ["vjp", "jit", "shard_map", "scan", "remat", "linearize",
+                                     "vmap of a gradient", "gradient of a vmap", "shared across a vmap"])
 def test_reverse_mode_runs_the_backward_kernel_however_the_call_is_staged(staging):
-    """A vjp, or a jvp that a shard_map, a scan or `jax.linear_transpose` then transposes: each runs the
-    backward kernel (`generation.linear_map`)."""
+    """A vjp, or a jvp that a shard_map, a scan or `jax.linear_transpose` then transposes, of the call or of
+    a batch of it: each runs the backward kernel (`generation.linear_map`)."""
     x = jnp.arange(8.0 * jax.device_count())
     index = jnp.arange(x.size)
     np.testing.assert_array_equal(np.asarray(reversed_through(staging)(x, index)), np.full(x.shape, 4.0))
 
 
-@pytest.mark.parametrize("staging", ["jvp", "jit", "linearize"])
+@pytest.mark.parametrize("staging", ["jvp", "jit", "linearize", "vmap"])
 def test_forward_mode_takes_the_portable_tangent_however_the_call_is_staged(staging):
-    """`jax.jvp` and `jax.linearize`, staged by a jit or not, evaluate the portable arithmetic's tangent."""
+    """`jax.jvp` and `jax.linearize`, of the call or of a batch of it, staged by a jit or not, evaluate the
+    portable arithmetic's tangent."""
     x, index = jnp.arange(8.0), jnp.arange(8)
     direction = jnp.ones_like(x)
 
     def tangent(x):
         if staging == "linearize":
             return jax.linearize(lambda x: tripled(x, index), x)[1](direction)
+        if staging == "vmap":
+            return jax.jvp(lambda x: jax.vmap(tripled)(x.reshape(2, -1), index.reshape(2, -1)), (x,),
+                           (direction,))[1].reshape(-1)
         return jax.jvp(lambda x: tripled(x, index), (x,), (direction,))[1]
 
     run = jax.jit(tangent) if staging == "jit" else tangent
