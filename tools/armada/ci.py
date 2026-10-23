@@ -738,11 +738,9 @@ def written(key: str, token: str, body: bytes) -> bool:
 
 
 def listed(prefix: str, token: str) -> list[str]:
-    """The names of the Worker's records under `prefix`, without it, a page of a thousand at a time."""
-    try:
-        return list(store(token).keys(prefix))
-    except r2.R2Error as error:
-        raise SystemExit(f"the test cache did not list {prefix}: {error}") from error
+    """The names of the Worker's records under `prefix`, without it, a page of a thousand at a time; an
+    `r2.R2Error` where the Worker did not list them, its caller's to answer."""
+    return list(store(token).keys(prefix))
 
 
 def gpu_tier(python: str) -> dict[str, list[str]]:
@@ -765,9 +763,14 @@ def gpu_tier(python: str) -> dict[str, list[str]]:
             return name, ["unrecorded"]
         return name, found["reads"] or ([] if fresh(found, name, common) else ["changed"])
 
+    try:
+        keys = listed(prefix, token)
+    # The tier is chosen from the records: none listed, none is chosen.
+    except r2.R2Error as error:
+        raise SystemExit(f"the test cache did not list {prefix}: {error}") from error
     evidence: dict[str, set[str]] = {}
     with concurrent.futures.ThreadPoolExecutor(32) as pool:
-        for name, found in pool.map(evidence_of, listed(prefix, token)):
+        for name, found in pool.map(evidence_of, keys):
             evidence.setdefault(name, set()).update(found)
     every = sorted(str(path) for path in Path("tests").glob("test_*.py") if str(path) not in SKIPPED)
     unrecorded = {name: ["unrecorded"] for name in every if name not in evidence}
@@ -825,7 +828,7 @@ def borrowed_records(names: list[str], python: str, held: str, token: str) -> di
     prefix = f"{CACHE_PREFIX}/{python}/"
     wanted = set(names)
     try:
-        every = list(store(token).keys(prefix))
+        every = listed(prefix, token)
     # The Worker did not list its records: borrowing only packs a lane, so each such file runs alone with the
     # lane's whole share, as one measured on no class does.
     except r2.R2Error as error:
@@ -833,7 +836,7 @@ def borrowed_records(names: list[str], python: str, held: str, token: str) -> di
               file=sys.stderr)
         return {}
     keys = [key for key in every
-            if key_parts(key)[0] != held and key_parts(key)[2] == "whole" and key_parts(key)[1] in wanted]
+            if (parts := key_parts(key))[0] != held and parts[2] == "whole" and parts[1] in wanted]
 
     def read(key: str) -> tuple[str, str, dict | None]:
         kind, name, _ = key_parts(key)
