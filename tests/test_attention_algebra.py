@@ -610,7 +610,9 @@ def test_a_querys_gradient_over_keys_near_fp32s_largest_is_finite_at_any_scale_a
     so dQ is exactly 0 in both mainloops (`algebra.DqSums.keyed`): keys near fp32's largest at a scale or a
     slope of 2, whose sum under coefficients summing to 2 would overflow, and small keys at a slope of 1e38
     or 2e38, whose coefficients' magnitudes, or at 2e38 each coefficient itself, would (held as mantissas and
-    exponents, `keyed_shift`)."""
+    exponents, `keyed_shift`). The slope is a head's parameter, a traced value as a learned slope is, so no
+    compiler folds it into the scale (a literal slope near fp32's largest times a scale above one is
+    infinite before any cotangent meets it, in the reference's autodiff as in any kernel)."""
     query = jnp.zeros((1, 1, 1, 16), jnp.float32)
     key = jnp.zeros((1, 2, 1, 16), jnp.float32).at[:, :, :, 0].set(size)
     # Equal values, so the score cotangents are exactly 0 and dQ's own sum is 0 on any accumulation: the
@@ -618,7 +620,9 @@ def test_a_querys_gradient_over_keys_near_fp32s_largest_is_finite_at_any_scale_a
     value = jnp.zeros((1, 2, 1, 16), jnp.float32).at[..., 0].set(1.0)
     dout = jnp.zeros((1, 1, 1, 16), jnp.float32).at[..., 0].set(1.0)
     spans = template.spans(1, 2, 1)
-    hooks = template.Hooks(score_mod=None if slope is None else (lambda s, q_pos, k_pos: slope * s))
+    hooks = template.Hooks() if slope is None else template.Hooks(
+        score_mod=lambda s, q_pos, k_pos, slope: slope * s,
+        score_params=(template.Param(jnp.full((1,), slope, jnp.float32), template.Kind.HEAD),))
     tiles = {"block_q": 32, "block_k": 32, "pad": attention_triton.BLOCK}
     with tuning.pinned({attention_triton.TritonBackward: joint(TILES[1])}):
         triton = attention_triton.backward(query, key, value, spans, hooks, dout, scale=scale, interpret=True)
