@@ -25,13 +25,15 @@ SUMS_IN_IEEE = pytest.mark.skipif(
 def runnable(name: str) -> bool:
     """Whether this process runs the kernels `generation.assumed(name)` routes to: a CPU any (it
     interprets them); a GPU Hopper's warpgroup kernels only if it is that generation (capability 9.0
-    alone has the instructions), and any other generation's only if no newer than itself."""
+    alone has the instructions), and any other generation's only if no newer than itself and its block
+    holds as much shared memory (an A10's 101376 bytes refuse an A100's tiles)."""
     here = generation.device_generation()
     if not here.startswith("sm") or generation.capability(name) is None:
         return here == "cpu"  # a TPU's launches a CPU alone interprets
     if generation.gpu_target(name).wgmma:
         return name == here
-    return generation.capability(name) <= generation.capability(here)
+    return (generation.capability(name) <= generation.capability(here)
+            and generation.gpu_target(name).shared_limit <= generation.gpu_target(here).shared_limit)
 
 
 def runs(name: str):
