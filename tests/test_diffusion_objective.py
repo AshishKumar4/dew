@@ -296,75 +296,92 @@ def conditional_mmdit():
 NULL_DROPOUT_SEEDS = {0.5: 16, 1.0: 16}
 """Check 1's declared seeds for the dropped route at each dropout probability."""
 
+NULL_DROPOUT_ROWS = 32
+"""The rows of each null-dropout draw: each weight's gradient sums over all of them."""
+
 
 @pytest.mark.parametrize("probability", [0.5, 1.0])
 def test_null_dropout_matches_explicit_tokens_under_current_encoder(conditional_mmdit, probability):
     """An objective that drops a row's condition, which its step records, trains as one given that
     row's tokens blanked explicitly: it drops every row at probability one and some at a half, the
-    explicit route's tower takes a gradient, and the loss and every trained
-    weight's gradient of the dropped route are on par from float64 with the explicit route's (check
-    1), each step's key drawing its times, noise and dropped rows. The two routes are two programs,
-    which round otherwise."""
+    explicit route's tower takes a gradient, and the loss and every trained weight's gradient of the
+    dropped route are on par from float64 with the explicit route's (check 1). Each draw is its own
+    rows, images and prompts, its weights moved from the fixture's, and its step's key, which draws
+    the times, the noise and the dropped rows. The two routes are two programs, which round
+    otherwise."""
     from reference_error import assert_as_exact, widened
 
-    source, variables, batch, step = conditional_mmdit
+    source, variables, _, step = conditional_mmdit
     dropped = DiffusionObjective(source.model, source.process, source.inputs,
                                  unconditional_prob=probability, steps=3, solver=Euler(),
                                  variables=variables)
     conditional = DiffusionObjective(source.model, source.process, source.inputs,
                                      unconditional_prob=0.0, steps=3, solver=Euler(),
                                      variables=variables)
-    blank = source.inputs.tokenize([""] * 4)
-
-    def masked(step):
-        """The rows the dropped objective's step drops."""
-        recorder = Recorder()
-        dropped.scalar_loss(variables, batch, replace(step, recorder=recorder))
-        (_, mask), = recorder.values["condition dropout"]
-        return np.asarray(mask)
-
-    def explicit(mask):
-        """The batch with the dropped rows' tokens blanked, which the explicit route reads."""
-        return {"image": batch["image"], "text": jax.tree.map(
-            lambda empty, given: jnp.where(mask[:, None], empty, given), blank["text"], batch["text"])}
+    blank = source.inputs.tokenize([""] * NULL_DROPOUT_ROWS)
+    host = jax.tree.map(np.asarray, variables)
 
     def stepped(seed):
         return replace(step, key=jax.random.key(int(seed)))
 
+    def masked(values, rows, at):
+        """The rows the dropped objective's step drops."""
+        recorder = Recorder()
+        dropped.scalar_loss(values, rows, replace(at, recorder=recorder))
+        (_, mask), = recorder.values["condition dropout"]
+        return np.asarray(mask)
+
+    def explicit(rows, mask):
+        """`rows` with the dropped rows' tokens blanked, which the explicit route reads."""
+        return {"image": rows["image"], "text": jax.tree.map(
+            lambda empty, given: np.where(mask[:, None], empty, given), blank["text"], rows["text"])}
+
+    def draw(seed):
+        """A seed's weights, each trained leaf moved by a draw so every layer takes a gradient, its rows'
+        images and prompts, and the seed, its step's key."""
+        rng = np.random.default_rng([0xD20, seed])
+        params = jax.tree.map(lambda leaf: (leaf + 0.02 * rng.standard_normal(leaf.shape)).astype(leaf.dtype),
+                              host["params"])
+        prompts = ["".join(rng.choice(list("abcdefgh"), 2)) for _ in range(NULL_DROPOUT_ROWS)]
+        rows = {"image": rng.integers(0, 256, (NULL_DROPOUT_ROWS, 4, 4, 1), dtype=np.uint8),
+                **jax.tree.map(np.asarray, source.inputs.tokenize(prompts))}
+        return {**host, "params": params}, rows, np.int64(seed)
+
     # Over the seeds, every row is dropped at probability one, and at a half some are and some not.
-    masks = np.stack([masked(stepped(seed)) for seed in range(NULL_DROPOUT_SEEDS[probability])])
+    masks = np.stack([masked(*draw(seed)[:2], stepped(seed)) for seed in range(4)])
     assert masks.all() if probability == 1.0 else (masks.any() and not masks.all())
-    tokens = explicit(masked(step))
-    given = jax.jit(jax.grad(lambda values: conditional.scalar_loss(values, tokens, step)[0]))
-    assert float(jnp.linalg.norm(given(variables)["encoders"]["textcontext"]["table"])) > 1e-6
+    values, rows, _ = draw(0)
+    tokens = explicit(rows, masked(values, rows, stepped(0)))
+    given = jax.jit(jax.grad(lambda values: conditional.scalar_loss(values, tokens, stepped(0))[0]))
+    assert float(jnp.linalg.norm(given(values)["encoders"]["textcontext"]["table"])) > 1e-6
 
     def trained(loss_and_grads):
         loss, grads = loss_and_grads
         return np.asarray(loss), jax.tree.map(np.asarray, grads["params"])
 
-    def through(objective, values, tokens, at):
-        return jax.value_and_grad(lambda values: objective.scalar_loss(values, tokens, at)[0])(values)
+    def through(objective, values, rows, at):
+        return jax.value_and_grad(lambda values: objective.scalar_loss(values, rows, at)[0])(values)
 
-    through_dropped = jax.jit(lambda values, at: through(dropped, values, batch, at))
-    through_explicit = jax.jit(lambda values, tokens, at: through(conditional, values, tokens, at))
+    through_dropped = jax.jit(lambda values, rows, at: through(dropped, values, rows, at))
+    through_explicit = jax.jit(lambda values, rows, at: through(conditional, values, rows, at))
 
-    def dew(seed):
-        return trained(through_dropped(variables, stepped(seed)))
+    def dew(values, rows, seed):
+        return trained(through_dropped(values, rows, stepped(seed)))
 
-    def reference(seed):
-        return trained(through_explicit(variables, explicit(masked(stepped(seed))), stepped(seed)))
+    def reference(values, rows, seed):
+        at = stepped(seed)
+        return trained(through_explicit(values, explicit(rows, masked(values, rows, at)), at))
 
-    def truth(seed):
-        tokens = explicit(masked(stepped(seed)))
+    def truth(values, rows, seed):
+        at = stepped(seed)
+        tokens = explicit(rows, masked(jax.tree.map(lambda leaf: np.asarray(leaf, np.float32)
+                                                    if np.issubdtype(np.asarray(leaf).dtype, np.floating)
+                                                    else leaf, values), rows, at))
         with jax.enable_x64(new_val=True):
             wide = DiffusionObjective(source.model.clone(dtype=jnp.float64), source.process, source.inputs,
                                       unconditional_prob=0.0, steps=3, solver=Euler(),
                                       variables=widened(variables))
-            return trained(through(wide, widened(variables), widened(tokens), stepped(seed)))
-
-    def draw(seed):
-        # The draw is its seed, the step's key, which draws the times, the noise and the dropped rows.
-        return (np.int64(seed),)
+            return trained(through(wide, widened(values), tokens, at))
 
     assert_as_exact(dew, reference, draw, f"null dropout at {probability}",
                     seeds=NULL_DROPOUT_SEEDS[probability], truth_fn=truth)
