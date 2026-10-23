@@ -584,13 +584,15 @@ def training_step(spec: Forward, carry: Carry, keys: Keys, rows: Rows) -> Carry:
     (`split_accumulate`), `rows(key, where)` each row's value row at its key `[bq]`, the old anchor's
     read only where it moved (`where`)."""
     state, arg, own, others_total = carry
+    # The old anchor's row first, its load in flight under the tile's products.
+    old_value = rows(arg.key)
     m, factor, p, value, held = _softmax(spec, state, keys)
     anchor = argmax(arg, keys.logits, keys.coords.k_pos)
     moved = anchor.peak > arg.peak
     others, own_tile = anchor_split(narrow(p, value.dtype), keys.coords.k_pos == anchor.key[:, None])
     product = keys.dot(others, value)
-    acc, own, others_total = split_accumulate(state.acc, own, others_total, factor, moved,
-                                              rows(arg.key, moved), product, others, own_tile, held)
+    acc, own, others_total = split_accumulate(state.acc, own, others_total, factor, moved, old_value,
+                                              product, others, own_tile, held)
     times = functools.partial(_times, keys.dot, value)
     state = stepped(state, m, factor, p, jnp.zeros_like(acc), held, times)
     return state._replace(acc=acc), anchor, own, others_total
