@@ -525,6 +525,7 @@ def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tu
     q_pos = pl.program_id(0) * block_q + jnp.arange(block_q)[:, None]
     query, dout = query_ref[...], dout_ref[...]
     peak, total = peak_ref[...], total_ref[...]
+    product = functools.partial(kernel_dot, interpret=interpret)
     start, end = start_ref[...], end_ref[...]
     query_ids = [ref[...] for ref in id_refs[:1]]
 
@@ -578,28 +579,30 @@ def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tu
     def step(index, carry):
         # Each cotangent over the prior denominator, in the reference's order, and taken to the pass's
         # own at the end (`algebra.dq_finish`); the weights' sums unnormalized.
-        dq, residual, mass, grads, weighed = carry
+        dq, residual, mass, grads, weighed, keyed = carry
         keys, k_pos, seen, params = tile(index)
         key, value = key_ref[keys, :], value_ref[keys, :]
         weights, _, cotangents, slopes = _tile_scores(score_mod, query, key, value, dout, peak, prior, anchor,
                                                    delta, seen, q_pos, k_pos, params, key_index=key_index,
                                                    scale=scale, how=how, interpret=interpret)
         logits, pieces = algebra.pulled(cotangents, slopes, seen, score_kinds)
-        # Scaled before it narrows to the operands' dtype and meets the keys, as the reference's is.
-        dq = dq + kernel_dot((logits * scale).astype(key.dtype), key, interpret)
+        # Scaled before it meets the keys, as the reference's is, to fp32's accuracy (`cotangent_product`).
+        dq = dq + algebra.cotangent_product(logits * scale, key, product)
         grads = tuple(grad + piece if row else grad for grad, row, piece in zip(grads, summed, pieces,
                                                                                strict=True))
+        # The weights' own product with the keys, which takes dQ to the refined D (`algebra.dq_finish`).
+        pulled_weights, pieces = algebra.pulled(weights, slopes, seen, score_kinds)
+        keyed = keyed + product(algebra.narrow(pulled_weights * scale, key.dtype), key)
         if any(summed):
-            _, pieces = algebra.pulled(weights, slopes, seen, score_kinds)
             weighed = tuple(sums + piece if row else sums for sums, row, piece in zip(weighed, summed, pieces,
                                                                                     strict=True))
-        return (dq, residual + cotangents.sum(axis=-1), mass + weights.sum(axis=-1), grads, weighed)
+        return (dq, residual + cotangents.sum(axis=-1), mass + weights.sum(axis=-1), grads, weighed, keyed)
 
     nothing = jnp.zeros((block_q,), jnp.float32)
     rows = tuple(nothing for _ in score_kinds)
+    zeros = jnp.zeros(query.shape, jnp.float32)
     sums = algebra.DqSums(*jax.lax.fori_loop(bounds_ref[0], bounds_ref[1], step,
-                                             (jnp.zeros(query.shape, jnp.float32), nothing, nothing, rows,
-                                              rows)))
+                                             (zeros, nothing, nothing, rows, rows, zeros)))
     dq, delta, total, mass, grads = algebra.dq_finish(sums, prior, state_total, peak0, shares, peak, anchor,
                                                       delta)
     dq_ref[...] = dq
@@ -633,6 +636,7 @@ def _dkv_kernel(ranges_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: t
     k_pos = pl.program_id(0) * block_k + jnp.arange(block_k)[None, :]
     key, value = key_ref[...], value_ref[...]
     key_ids = [ref[...] for ref in id_refs[1:]]
+    product = functools.partial(kernel_dot, interpret=interpret)
 
     def step(index, carry):
         dk, dv, *grads = carry
@@ -649,8 +653,8 @@ def _dkv_kernel(ranges_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: t
             interpret=interpret)
         logits, pieces = algebra.pulled(cotangents, slopes, seen, score_kinds)
         dv = dv + kernel_dot(*algebra.value_operands(exponentials, weights, dout, total_ref[rows]), interpret)
-        # Scaled before it narrows to the operands' dtype, so fp16 holds what fp32 does.
-        dk = dk + kernel_dot((logits * scale).astype(query.dtype).T, query, interpret)
+        # Scaled before it meets the queries, to fp32's accuracy (`algebra.cotangent_product`).
+        dk = dk + algebra.cotangent_product(logits * scale, query, product, transposed=True)
         for place, (kind, piece) in enumerate(zip(score_kinds, pieces, strict=True)):
             if kind == Kind.TILE:
                 # A tile parameter's entries, under the refined D (`algebra.refinement`).

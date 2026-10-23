@@ -91,7 +91,8 @@ SEEDS = {"ties at scale 1": 64, "ties at scale 1, cotangents near 2**125": 64, "
          "a resumed state beside an overflowing column": 32,
          "a resumed state of a denominator near fp32's largest beside an overflowing column": 8,
          "fp16 values near their largest beside a state near fp32's largest": 8,
-         "a decode step's sink and one key": 32, "a decode step's sink near fp32's largest and one key": 8,
+         "keys an ulp apart, float32": 8, "keys an ulp apart, bfloat16": 8,
+         "a decode step's sink and one key": 8, "a decode step's sink near fp32's largest and one key": 8,
          "documents of one key": 8}
 """Each family's declared seeds, the fewest over which the reference compared with itself resolves check
 1's parity (`reference_error.seeds_for`), sized for every family at the suite's own draws and reference."""
@@ -390,6 +391,22 @@ def _fp16_beside_a_large_state(seed):
     return np.zeros((RESUMED, 1, 1, 16), np.float32), key, value, state, dout
 
 
+def _near_keys(dtype: str):
+    # One query a row over two keys an ulp of the dtype apart in every entry, `k` and `k (1 + 2^-t)`, t its
+    # mantissa's bits: their logits differ by a drawn few, so neither weighs nothing, and their values are
+    # drawn apart and large, so each key's score cotangent is large and the two cancel, `dS_1 = -dS_0`: the
+    # query's gradient `dS_0 k_0 + dS_1 k_1` is their difference's share alone, an ulp of either term, which
+    # a cotangent rounded to the dtype before its product with the keys loses (`cotangent_product`).
+    bits = 7 if dtype == "bfloat16" else 23
+
+    def draw(seed):
+        query, key, value, dout = _normal(seed, (ROWS, 1, 1, 16), (ROWS, 1, 1, 16), (ROWS, 2, 1, 16),
+                                          (ROWS, 1, 1, 16))
+        key = np.concatenate([key, key * np.float32(1.0 + 2.0 ** -bits)], axis=1)
+        return query * np.float32(4.0), key, value * np.float32(1e4), None, dout
+    return draw
+
+
 def _families() -> dict[str, Family]:
     small = functools.partial(_small_weight, queries=8, logits=(16.0, 21.0), sizes=(3.0, 5.0))
     edge = functools.partial(_small_weight, queries=1, logits=(80.0, 87.0), sizes=None, rows=1024)
@@ -455,6 +472,9 @@ def _families() -> dict[str, Family]:
         "a subnormal share of an overflowing row, bfloat16": Family(
             _subnormal_share, np.ones((64, 1, 1, 256), bool), folded=False, dtype="bfloat16"),
         # Every weight but one 1/255, bf16's worst rounding of a weight, beside the subnormal share.
+        # A query's gradient that cancels across its keys, in either dtype (`algebra.cotangent_product`).
+        "keys an ulp apart, float32": Family(_near_keys("float32"), _kept(1, 2)),
+        "keys an ulp apart, bfloat16": Family(_near_keys("bfloat16"), _kept(1, 2), dtype="bfloat16"),
         "a subnormal share beside 255 equal weights, bfloat16": Family(
             functools.partial(_subnormal_share, equal=True), np.ones((64, 1, 1, 256), bool), folded=False,
             dtype="bfloat16"),
