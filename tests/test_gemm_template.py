@@ -183,6 +183,50 @@ def test_the_template_holds_check_1_with_its_hooks(generation_name, case):
                         seeds=SEEDS, truth_fn=_drop(_plain(spec, truth=True)))
 
 
+def silu_gated(gate, up):
+    """SwiGLU of a paired product's two accumulators, unrounded, the experts' activation."""
+    return jax.nn.silu(gate) * up
+
+
+def _paired_draw(seed):
+    """Rows, the gate's and the up projection's fp32 masters, and an output cotangent."""
+    x, gate, *_, cotangent = _draw(seed)
+    up = jnp.asarray(np.random.default_rng(seed + 1).normal(size=gate.shape) / np.sqrt(DEPTH), jnp.float32)
+    return x, gate, up, cotangent.astype(jnp.bfloat16)
+
+
+def _paired_plain(*, truth: bool = False):
+    """The unfused program a paired product stands for: each group's rows times each of its two matrices
+    rounded to bf16, summed wide and rounded to bf16 (two projections' outputs), the activation, rounded
+    once. As `truth`, on float64 inputs, the matrices rounded alone."""
+    def run(x, gate, up):
+        def projected(matrix):
+            rounded = matrix.astype(jnp.bfloat16).astype(matrix.dtype)
+            matrix = matrix + jax.lax.stop_gradient(rounded - matrix) if truth else rounded.astype(x.dtype)
+            acc = jax.lax.ragged_dot(x, matrix, jnp.asarray(SIZES),
+                                     preferred_element_type=jnp.promote_types(x.dtype, jnp.float32))
+            return acc if truth else acc.astype(jnp.bfloat16).astype(jnp.float32)
+
+        out = silu_gated(projected(gate), projected(up))
+        return out if truth else out.astype(jnp.bfloat16)
+    return run
+
+
+@pytest.mark.parametrize("generation_name", generations("sm80", "sm90", "v5e"))
+def test_a_paired_product_holds_check_1(generation_name):
+    """A paired product (`paired=`, a gated activation's gate and up in one launch), through the launch the
+    generation picks, interpreted on the CPU: its value and every operand's cotangent as exact as the
+    unfused program's, two projections then the activation, from float64 truth."""
+    def dew(x, gate, up):
+        return template.gemm(x, gate, jnp.asarray(SIZES), paired=up, epilogue=silu_gated, out_dtype=jnp.bfloat16,
+                             interpret_on_cpu=True)
+
+    with generation.assumed(generation_name):
+        assert_as_exact(jax.jit(with_gradients(dew)), jax.jit(with_gradients(_paired_plain())), _paired_draw,
+                        f"paired on {generation_name}", seeds=SEEDS,
+                        truth_fn=with_gradients(_paired_plain(truth=True)))
+
+
 COOPERATIVE = mosaic_gpu.Tiles(128, 128, 64, 3, 1, warpgroups=2)
 """A tile two consumer warpgroups compute, on one multiprocessor (the interpreter models no cluster)."""
 
