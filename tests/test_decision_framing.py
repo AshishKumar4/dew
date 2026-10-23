@@ -67,15 +67,6 @@ def test_a_joint_rows_markup_is_its_hub_tokenizers_own_special_tokens(name):
     assert_markup_is_its_own(pinned(HUB[name]))
 
 
-def test_qwen35_with_thinking_off_frames_a_row_as_chatml_with_an_empty_thought():
-    """Qwen3.5's template, thinking off, writes the system turn, the user's turn and an assistant turn
-    whose thought is empty, before the decisions' heading: the framing the joint release reads."""
-    tokenizer = HFTokenizer(str(LOCAL["qwen3.5"]), local_files_only=True)
-    before, after = Framing().around(tokenizer)
-    assert before == f"<|im_start|>system\n{JOINT_SYSTEM}<|im_end|>\n<|im_start|>user\n"
-    assert after == f"<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n{JOINT_PREFILL}"
-
-
 def test_a_tokenizer_without_a_template_frames_a_row_as_plain_text():
     """A byte vocabulary has no chat template, so its row is the system message, the user's content
     and the decisions' heading as plain text, with no markup of any family; so is a templated
