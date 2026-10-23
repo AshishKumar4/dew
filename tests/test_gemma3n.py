@@ -7,6 +7,7 @@ random weights. Everything runs at fp32 on CPU, and each parity test states
 its tolerance and the largest difference observed.
 """
 
+import contextlib
 from pathlib import Path
 from statistics import NormalDist
 
@@ -16,7 +17,6 @@ import numpy as np
 import pytest
 from flax import linen as nn
 from interop_support import fixture_arrays
-from model_support import gate_margin
 from reference_error import assert_as_exact, torch_with_gradients, with_gradients
 
 from dew.nn.gemma3n import AltUp, AltUpLayer, LaurelBlock
@@ -170,11 +170,10 @@ def test_altup_trains_past_its_coefficient_clip_as_the_reference_does():
 
 STEP_ROWS, STEP_LENGTH = 4, 32
 """A training step's draw: rows a device and ids a row, within the checkpoint's 64 positions."""
-STEP_SEEDS = {0.0: 64, 0.1: 64}
-"""Each decay's declared seeds for the training step's check 1, sized by `seeds_for` (on armada)."""
-MARGIN = 1e-5
-"""The least margin a training step's draw admits (`model_support.gate_margin`), in its rows'
-deviations: past it a gate's unit sits on one side of the cutoff in float32 and float64 alike."""
+UPDATE_SEEDS = {0.0: 8, 0.1: 8}
+"""Each decay's declared seeds for the update's check 1, sized by `seeds_for` (on armada)."""
+DENSE_SEEDS = 8
+"""The dense decoder's gradient check 1's declared seeds, sized by `seeds_for` (on armada)."""
 
 
 def clipped_gemma3n():
@@ -193,99 +192,171 @@ def clipped_gemma3n():
     return loaded, loaded.model.clone(altup=dataclasses.replace(loaded.model.altup, coef_clip=clip)), clip
 
 
-@pytest.mark.parametrize("decay", [0.0, 0.1])
-def test_a_training_step_updates_the_clamped_altup_coefficients_as_the_reference_does(decay):
-    """A training step of the gemma3n-tiny decoder through the Trainer, with half of every
-    layer's AltUp prediction coefficients past `coef_clip`, against the reference's step from
-    the same weights: torch's optimizer over Gemma3nForCausalLM in train mode, whose forward
-    clamps the stored prediction weight in place, so its update, weight decay included, applies
-    to the clamped weight (a coefficient at 2 under a clip of 1, gradient 1 and SGD at 0.1
-    stores 0.9, not 1.9). Every stored parameter after the step is on par with the reference's
-    float32 step from its float64 step over drawn rows (check 1), each draw one whose gaussian
-    top-k gates all clear their cutoff by MARGIN (`model_support.gate_margin`); the gate at units
-    nearer it is held where it lives, by the sparse MLP's check 1 over rows drawn with no margin
-    (`test_the_sparse_mlp_is_as_exact_as_the_reference_at_each_sparsity`). The steps after it, under
-    SGD or AdamW, read and update the projected weights the same way, bit for bit
-    (`test_steps_from_coefficients_past_the_clip_are_the_steps_from_the_clamped_ones`); an
-    AdamW step itself is not held to torch's here, since optax forms Adam's bias corrections
-    in float32 (`1 - 0.999 ** t`), 6.4e-6 off at the first step, where torch forms them in
-    float64."""
-    import optax
+def reference_decoder(directory, clip, dtype, sparsity=None):
+    """The source's Gemma3nForCausalLM with its AltUp clip at `clip`, in `dtype` (float64 built under
+    `float64`, the norm's and the router's float32 pins widened), its gaussian top-k at `sparsity` where
+    given, and the checkpoint's weights."""
     import torch
     from transformers import AutoConfig, AutoModelForCausalLM
 
-    from dew.objectives.lm import LMObjective
-    from dew.training import Trainer
+    from tools.diffusers_wan_reference import float64
+
+    config = AutoConfig.from_pretrained(directory)
+    config.altup_coef_clip = clip
+    if sparsity is not None:
+        config.activation_sparsity_pattern = list(sparsity)
+    loaded = AutoModelForCausalLM.from_pretrained(directory, config=config,
+                                                  attn_implementation="eager").float()
+    if dtype == torch.float32:
+        return loaded.train()
+    with float64():
+        wide = AutoModelForCausalLM.from_config(config, dtype=torch.float64, attn_implementation="eager")
+    wide.load_state_dict(loaded.state_dict())
+    return wide.train()
+
+
+@pytest.mark.parametrize("decay", [0.0, 0.1])
+def test_a_training_step_updates_the_clamped_altup_coefficients_as_the_reference_does(decay):
+    """A training step's update of the gemma3n-tiny decoder, with half of every layer's AltUp
+    prediction coefficients past `coef_clip`, against the reference's: torch's SGD over
+    Gemma3nForCausalLM, whose training forward clamps the stored prediction weight in place, so its
+    update, weight decay included, applies to the clamped weight (a coefficient at 2 under a clip of 1,
+    gradient 1 and SGD at 0.1 stores 0.9, not 1.9). Both take one drawn gradient (the draw's, in Dew's
+    layout and exported to the source's), so the update's own arithmetic is what check 1 holds: every
+    stored parameter after it on par with the reference's float32 step from its float64 step.
+
+    The step's gradient is held apart, where it resolves. In this decoder it does not: over 1024 drawn
+    rows the reference's own float32 gradient, against its float64 one, carries a heavy tail in every
+    leaf (a few rows' errors 1e5 times the median), which no seed count or pooling resolves; layer 1's
+    backward amplifies it by cancellation at the gaussian top-k (its 0.95 sparsity) and at AltUp's
+    modality router. So the composed gradient is held by check 1 on this decoder without the gaussian
+    top-k (`test_the_dense_decoders_gradient_is_the_references`), and the cancelling pieces at their
+    own sizes, sparsities included, by AltUp's step past its clip
+    (`test_altup_trains_past_its_coefficient_clip_as_the_reference_does`) and the sparse MLP's
+    (`test_the_sparse_mlp_trains_on_padded_rows_as_the_reference_does`,
+    `test_the_sparse_mlp_is_as_exact_as_the_reference_at_each_sparsity`). The Trainer's step is this
+    update of the clamped coefficients, under SGD and AdamW, bit for bit
+    (`test_steps_from_coefficients_past_the_clip_are_the_steps_from_the_clamped_ones`); an AdamW
+    step itself is not held to torch's here, since optax forms Adam's bias corrections in float32
+    (`1 - 0.999 ** t`), 6.4e-6 off at the first step, where torch forms them in float64."""
+    import optax
+    import torch
+
     from tools.diffusers_wan_reference import float64
 
     loaded, model, clip = clipped_gemma3n()
-    directory = loaded.source
-    shape = (STEP_ROWS * jax.device_count(), STEP_LENGTH)
+    params = loaded.variables["params"]
     rate = 0.1
     tx = optax.chain(optax.add_decayed_weights(decay), optax.sgd(rate))
-    trainer = Trainer(LMObjective(model, shape[1] - 1, head_chunks=1, variables=loaded.variables), tx,
-                      key=jax.random.key(0))
-    initial, _, _ = trainer.place()
-    step = trainer.compile(initial, {"text": np.zeros(shape, np.int32)})
     names = list(loaded.export(loaded.variables))
+    # The layouts export a gradient as they export the parameters: by position alone, no offset.
+    doubled = loaded.export({**loaded.variables, "params": jax.tree.map(lambda leaf: 2 * leaf, params)})
+    for name, value in loaded.export(loaded.variables).items():
+        np.testing.assert_array_equal(doubled[name], 2 * value)
 
     def draw(seed):
-        """Rows of ids drawn uniformly from the vocabulary, the first draw of the seed whose gates
-        clear MARGIN at the step's weights, and the loss's cotangent, one, which the reference's
-        pullback takes (the Trainer's is its own)."""
-        for attempt in range(64):
-            rows = np.random.default_rng([0x3E, seed, attempt]).integers(
-                0, int(model.vocab_size), shape).astype(np.int32)
-            if gate_margin(model, loaded.variables, rows[:, :-1], train=True) > MARGIN:
-                return rows, np.float32(1)
-        raise AssertionError(f"no rows of seed {seed} clear the gates' margin {MARGIN}")
+        """Rows of ids, which the reference's training forward reads to clamp its coefficients, and a
+        gradient for every parameter, standard normal at its leaf's scale."""
+        rng = np.random.default_rng([0x3E, seed])
+        rows = rng.integers(0, int(model.vocab_size), (STEP_ROWS, STEP_LENGTH)).astype(np.int32)
+        gradient = jax.tree.map(lambda leaf: (np.sqrt(np.mean(np.square(np.asarray(leaf, np.float64))))
+                                              * rng.standard_normal(leaf.shape)).astype(np.float32), params)
+        return rows, gradient
 
-    def stepped(rows, one):
-        # The step donates the state it is given: each draw steps from its own copy.
-        state, *_ = step(jax.tree.map(jnp.copy, initial), {"text": rows})
-        trained = loaded.export({**loaded.variables, "params": state.variables["params"]})
+    @jax.jit
+    def updated(rows, gradient):
+        # The transaction's update (`Objective.projected` before and after the optimizer's).
+        stored = model.projected(params, updated=False)
+        update, _ = tx.update(gradient, tx.init(stored), stored)
+        return model.projected(optax.apply_updates(stored, update), updated=True)
+
+    def stepped(rows, gradient):
+        trained = loaded.export({**loaded.variables, "params": updated(rows, gradient)})
         return {name: np.asarray(trained[name], np.float32) for name in names}
 
-    hf_config = AutoConfig.from_pretrained(directory)
-    hf_config.altup_coef_clip = clip
-    loaded_reference = AutoModelForCausalLM.from_pretrained(directory, config=hf_config,
-                                                            attn_implementation="eager").float()
-    with float64():
-        wide = AutoModelForCausalLM.from_config(hf_config, dtype=torch.float64, attn_implementation="eager")
-    references = {torch.float32: loaded_reference, torch.float64: wide}
-    weights = {key: value.clone() for key, value in loaded_reference.state_dict().items()}
+    references = {dtype: reference_decoder(loaded.source, clip, dtype)
+                  for dtype in (torch.float32, torch.float64)}
+    weights = {key: value.clone() for key, value in references[torch.float32].state_dict().items()}
 
-    def reference(dtype, rows, one):
-        # Each draw steps from the checkpoint's weights, loaded once a precision.
+    def reference(dtype, rows, gradient):
+        # Each draw steps from the checkpoint's weights; its training forward clamps them in place.
         reference = references[dtype]
         reference.load_state_dict(weights)
-        reference.train()
-        # Reloading the weights leaves the last draw's gradients in place: each draw's are its own.
-        reference.zero_grad(set_to_none=True)
-        solver = torch.optim.SGD(reference.parameters(), lr=rate, weight_decay=decay)
-        tokens = torch.from_numpy(rows).long()
-        held = dict(reference.named_parameters())
-
-        def loss(stored):
-            return torch.func.functional_call(reference, stored, (),
-                                              {"input_ids": tokens, "labels": tokens}).loss
-
-        with float64() if dtype == torch.float64 else torch.enable_grad():
-            # A training forward clamps the stored prediction weights in place, so the step updates
-            # the clamped ones; the loss's one is pulled back through the gate's torch twin.
-            with torch.no_grad():
-                reference(input_ids=tokens)
-            stored = {name: leaf.detach().numpy() for name, leaf in held.items()}
-            _, gradients = torch_with_gradients(loss)(stored, one)
-            for name, leaf in held.items():
-                leaf.grad = torch.from_numpy(gradients[name])
-            solver.step()
+        tokens = torch.from_numpy(np.asarray(rows)).long()
+        exported = loaded.export({**loaded.variables, "params": gradient})
+        with float64() if dtype == torch.float64 else contextlib.nullcontext(), torch.no_grad():
+            reference(input_ids=tokens)
+            for name, leaf in reference.named_parameters():
+                leaf.grad = torch.as_tensor(np.asarray(exported[name]), dtype=dtype)
+            torch.optim.SGD(reference.parameters(), lr=rate, weight_decay=decay).step()
         state_dict = reference.state_dict()
         return {name: state_dict[name].detach().numpy() for name in names}
 
-    label = f"a clamped AltUp training step, decay {decay}"
+    label = f"a clamped AltUp update, decay {decay}"
     assert_as_exact(stepped, lambda *inputs: reference(torch.float32, *inputs), draw, label,
-                    seeds=STEP_SEEDS[decay], truth_fn=lambda *inputs: reference(torch.float64, *inputs))
+                    seeds=UPDATE_SEEDS[decay], truth_fn=lambda *inputs: reference(torch.float64, *inputs))
+
+
+def test_the_dense_decoders_gradient_is_the_references():
+    """The gemma3n-tiny decoder's loss gradient, its AltUp coefficients past the clip and its MLPs
+    without the gaussian top-k (sparsity 0 in every layer), on par with the reference's from its
+    float64 one over drawn rows (check 1): the composition of every layer's backward, AltUp's and the
+    per-layer inputs' included, where the reference's own float32 gradient resolves. With the 0.95
+    top-k it does not (`test_a_training_step_updates_the_clamped_altup_coefficients_as_the_reference_does`
+    says why), and the top-k's backward is held by the sparse MLP's sites."""
+    import optax
+    import torch
+
+    from tools.diffusers_wan_reference import float64
+
+    loaded, model, clip = clipped_gemma3n()
+    dense = model.clone(activation_sparsity_pattern=(0.0,) * len(model.activation_sparsity_pattern))
+    names = list(loaded.export(loaded.variables))
+    stored = dense.projected(loaded.variables["params"], updated=False)
+
+    def draw(seed):
+        """Rows of ids drawn uniformly from the vocabulary, and the loss's cotangent, one."""
+        rows = np.random.default_rng([0xDE, seed]).integers(
+            0, int(dense.vocab_size), (STEP_ROWS, STEP_LENGTH)).astype(np.int32)
+        return rows, np.float32(1)
+
+    def loss(params, rows):
+        # The source's loss: the mean cross entropy of each next id.
+        logits = dense.apply({**loaded.variables, "params": params}, rows[:, :-1], train=True)
+        return optax.softmax_cross_entropy_with_integer_labels(logits, rows[:, 1:]).mean()
+
+    @jax.jit
+    def gradient_of(rows, one):
+        _, gradient = with_gradients(lambda params: loss(params, rows))(stored, one)
+        return gradient
+
+    def differentiated(rows, one):
+        exported = loaded.export({**loaded.variables, "params": gradient_of(rows, one)})
+        return {name: np.asarray(exported[name], np.float32) for name in names}
+
+    sparsity = (0.0,) * len(model.activation_sparsity_pattern)
+    references = {dtype: reference_decoder(loaded.source, clip, dtype, sparsity)
+                  for dtype in (torch.float32, torch.float64)}
+
+    def reference(dtype, rows, one):
+        reference = references[dtype]
+        tokens = torch.from_numpy(np.asarray(rows)).long()
+        with float64() if dtype == torch.float64 else contextlib.nullcontext():
+            # Its training forward clamps the stored coefficients in place, as Dew's projection does.
+            with torch.no_grad():
+                reference(input_ids=tokens)
+            held = {name: leaf.detach().numpy() for name, leaf in reference.named_parameters()}
+
+            def run(weights):
+                return torch.func.functional_call(reference, weights, (),
+                                                  {"input_ids": tokens, "labels": tokens}).loss
+
+            _, gradients = torch_with_gradients(run)(held, one)
+        return {name: gradients[name] for name in names}
+
+    assert_as_exact(differentiated, lambda *inputs: reference(torch.float32, *inputs), draw,
+                    "the dense decoder's gradient", seeds=DENSE_SEEDS,
+                    truth_fn=lambda *inputs: reference(torch.float64, *inputs))
 
 
 @pytest.mark.parametrize("optimizer", ["sgd", "adamw"])
