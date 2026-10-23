@@ -69,7 +69,7 @@ Coordinates and row vectors come from the toolkit, because Mosaic GPU iotas need
 - the backward recomputes its weights in the forward's units from its raw maximum (`Recompute`);
 - its sums carry the headroom (above).
 
-Both pass check 1 on drawn inputs; the stability suite (tests/test_attention_stability.py) holds the accurate form to every family and the fold to all but its divergences at extreme inputs, which it runs in the accurate form alone:
+Both pass check 1 on drawn inputs; the stability suite (tests/test_attention_stability.py) holds the accurate form to check 1 on every family, and the default to finiteness wherever the reference is finite and to its exact-zero claims on all but the fold's divergences at extreme inputs, which it runs in the accurate form alone (the owner's ruling, 2026-10-23; the default's ties there are documented in docs/design/testing.md):
 - logits a ulp apart near 2^30, at scales below 1: the fold rounds each logit at log2(e) times its size, so two the reference keeps apart can tie, and a large cotangent then overflows the backward;
 - logits near fp32's largest: the contracted exponent of the largest logit is its product's rounding, up to an ulp of the logit, so its weight is 0 or infinite (with one key, its weight is 1 within an ulp of that exponent);
 - values near fp32's largest: the weighted values' sum overflows where the reference's normalized one does not (the headroom is the accurate form's), and so does a sink near fp32's largest;
@@ -81,6 +81,9 @@ Measured on an H100 at qwen3-8b and gpt-oss-20b shapes, 4k and 32k tokens, the a
 
 **Backward.**
 - Products: dP = dO·Vᵀ, dV += Pᵀ·dO, dK += dSᵀ·Q, dQ += dS·K, plus whatever D's form needs.
+- Two forms (`ACCURATE`; the owner's ruling, 2026-10-23). Both take D about each query's anchor key from the forward's split sums (`split_delta`), not FlashAttention's rowsum(dO·O), and give dK/dV, the hook parameters' gradients and the initial state's at that D refined once from the dQ scan's own sums (`refinement`).
+  - The default, the fast form: FlashAttention's arithmetic for dQ and dK, each score cotangent narrowed to the operands' 16-bit dtype for one product (fp16's at a power-of-two scale that keeps it in range), and dQ at the first D. It holds check 1 on drawn inputs, and the stability suite holds it to finiteness, its ties at extreme inputs documented.
+  - The accurate form, one option away (`accurate=True`): the cotangents' products to fp32's accuracy (bf16's three bf16 products, fp16's two scaled ones) and dQ at the refined D, less the refinement times the weights' product with the keys (`keyed`). It holds check 1 on drawn inputs and on every stability family. On an H100 at llama-d128, causal bf16, 2 × 4096, its pieces cost 2.24 ms of a 5.15 ms backward against the fast form's 2.91 (dQ's refinement 0.64, dQ's product 0.57, dK's 0.75).
 - Functions:
   - `delta`, in the form §8 chooses;
   - `grad_scores(p, dp, D) -> ds`, through the hook's VJP;

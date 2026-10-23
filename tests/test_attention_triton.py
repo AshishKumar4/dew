@@ -287,12 +287,14 @@ def joint(config: attention_triton.Tiles, dkv_config: attention_triton.Tiles | N
 
 
 def check_backward(case: dict, names: tuple, dtype, config, dkv_config=None, *, width: int = 32,
-                   value_width: int = 32, natural: bool = template.NATURAL):
+                   value_width: int = 32, natural: bool = template.NATURAL,
+                   accurate: bool = template.ACCURATE):
     """`attention_triton.backward` with its dQ launch at `config` and its dK/dV launch at `dkv_config`
     (`config` too by default; its tiles are always the dQ launch's), its every gradient (queries, keys,
     values, each score parameter, the initial state's) on par with `jax.vjp` of the template's XLA
     arithmetic, from float64: the hooks' parameters and initial state are drawn with the operands, so
-    their gradients' truth is float64 too; its exponent `natural` or the fold."""
+    their gradients' truth is float64 too; its exponent `natural` or the fold, and its backward `accurate`
+    or the fast form."""
     queries, keys = geometry(case)
     spans = template.spans(queries, keys, ROWS, **arguments(case))
     score_mod, kinds, draw_hooks = score_hooks(names, queries, keys, value_width)
@@ -312,7 +314,7 @@ def check_backward(case: dict, names: tuple, dtype, config, dkv_config=None, *, 
     def ours(query, key, value, dout, params, initial):
         with pins:
             grads = attention_triton.backward(query, key, value, spans, hooked(params, initial), dout,
-                                              natural=natural, interpret=not ON_GPU)
+                                              natural=natural, accurate=accurate, interpret=not ON_GPU)
         return grads.query, grads.key, grads.value, grads.score_params, grads.initial
 
     def xla(query, key, value, dout, params, initial):
@@ -324,18 +326,24 @@ def check_backward(case: dict, names: tuple, dtype, config, dkv_config=None, *, 
 
     assert_as_exact(jax.jit(ours), jax.jit(xla), draw,
                     f"triton backward {case} {names} {jnp.dtype(dtype).name} {config} {dkv_config} "
-                    f"{width}/{value_width} natural {natural}",
+                    f"{width}/{value_width} natural {natural} accurate {accurate}",
                     seeds=BACKWARD_SEEDS.get((names, jnp.dtype(dtype).name), SEEDS))
 
 
 BACKWARD_FORMS = ("full", "causal-window", "documents", "cross-causal-lengths-starts", "two-sided-window")
 
 
+TEMPLATE_FORMS = {"default": {}, "accurate": {"natural": True, "accurate": True}}
+"""The template's two forms an ordinary draw holds to check 1: the default (the base-2 fold and the
+backward's fast form) and the accurate one (natural logits and the backward's accurate form)."""
+
+
+@pytest.mark.parametrize("options", TEMPLATE_FORMS.values(), ids=TEMPLATE_FORMS)
 @pytest.mark.parametrize("config", PINNED[:3], ids=str)
 @pytest.mark.parametrize("form", BACKWARD_FORMS)
-def test_the_backward_is_on_par_over_every_call_form(form, config):
-    """Each call form's keys, fp32, no hooks, at pinned dQ and dK/dV configs."""
-    check_backward(CASES[form], (), jnp.float32, config)
+def test_the_backward_is_on_par_over_every_call_form(form, config, options):
+    """Each call form's keys, fp32, no hooks, at pinned dQ and dK/dV configs, in both forms."""
+    check_backward(CASES[form], (), jnp.float32, config, **options)
 
 
 @pytest.mark.parametrize("form", [form for form in CASES if form not in BACKWARD_FORMS])
@@ -344,13 +352,13 @@ def test_the_backward_is_on_par_over_the_core_s_other_call_forms(form):
     check_backward(CASES[form], (), jnp.float32, PINNED[0], attention_triton.Tiles(32, 32, 8, 3))
 
 
-@pytest.mark.parametrize("natural", [False, True], ids=["fold", "natural"])
+@pytest.mark.parametrize("options", TEMPLATE_FORMS.values(), ids=TEMPLATE_FORMS)
 @pytest.mark.parametrize("dtype", attention_triton.DTYPES, ids=DTYPE_IDS)
 @pytest.mark.parametrize("hooks", SCORE_HOOKS.values(), ids=SCORE_HOOKS)
-def test_the_backward_is_on_par_under_every_score_hook(hooks, dtype, natural):
+def test_the_backward_is_on_par_under_every_score_hook(hooks, dtype, options):
     """Each score hook over causal packed documents under a window: the gradients of its parameters and
-    of the initial state too, in both forms of the exponent."""
-    check_backward(CASES["causal-documents-window"], hooks, dtype, PINNED[0], natural=natural)
+    of the initial state too, in both forms."""
+    check_backward(CASES["causal-documents-window"], hooks, dtype, PINNED[0], **options)
 
 
 def test_a_wide_parameter_computes_as_its_fp32_value_and_its_gradient_returns_wide():
