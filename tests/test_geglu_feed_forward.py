@@ -52,12 +52,12 @@ def test_a_unets_feed_forward_declares_its_kernels_axes():
         jax.random.key(0), jnp.zeros((1, 8, 8, 4)), jnp.ones((1,)),
         conditioning=DenoisingCondition(jnp.zeros((1, 3, 768)))))["params"]
     declared = declarations(params)
-    leaves = {parameter_path(path): leaf for path, leaf in jax.tree_util.tree_leaves_with_path(params)
-              if "feed_forward" in parameter_path(path)}
-    assert {names[-2] for names in leaves} == {"gate_up_proj", "down_proj"}
-    for names, leaf in leaves.items():
-        axes = declared_axes(names, len(leaf.shape), declared)
-        assert axes is not None and "mlp" in axes, names
+    leaves = [(path, leaf) for path, leaf in jax.tree_util.tree_leaves_with_path(params)
+              if "feed_forward" in parameter_path(path)]
+    assert {parameter_path(path)[-2] for path, _ in leaves} == {"gate_up_proj", "down_proj"}
+    for path, leaf in leaves:
+        axes = declared_axes(path, len(leaf.shape), declared)
+        assert axes is not None and "mlp" in axes, parameter_path(path)
 
 
 def test_a_packed_order_names_the_gate_and_up_projections():
