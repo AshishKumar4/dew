@@ -583,7 +583,7 @@ jaraco-functools==4.6.0
     # via
     #   cheroot
     #   keyring
-jax @ https://github.com/AshishKumar4/jax/archive/35b362f2e4322a99555e00feb00c476e17da08da.tar.gz
+jax==0.12.0.1.post13
     # via
     #   -c constraints.txt
     #   dewml (pyproject.toml)
