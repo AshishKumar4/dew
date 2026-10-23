@@ -793,6 +793,29 @@ def test_the_frozen_triton_mainloops_default_is_finite_where_the_reference_is_at
     _default_is_finite(family, "triton")
 
 
+def test_a_resumed_state_of_large_values_under_the_folds_guard_is_finite():
+    """fp32, the default form: one query over one key of logit m0 = 24576.005859375 (folded below the fold's
+    reach, `algebra.FOLD_REACH`, and naturalized back below m0), resumed from a state of maximum m0,
+    denominator 1 and values 1023 * 2^118, the key's value the same: the plain walk's weighted values
+    overflow, so the guarded walk's live row takes its split sums from the normalized pass, whose share of
+    the state is taken at the walk's own maximum, at most 1 (`algebra.normalized_pass`); at the naturalized
+    one it passed 1 and overflowed the share. The plain-JAX mainloop's output and gradients are finite, as
+    the reference's are (`_resumed_attention`)."""
+    m0, size = 24576.005859375, 1023.0 * 2.0 ** 118
+
+    def first(fill, *shape):
+        return jnp.zeros(shape, jnp.float32).at[..., 0].set(fill)
+
+    query, key, value, dout = (first(fill, 1, 1, 1, 16) for fill in (4.0, m0, size, 2.0 ** -8))
+    state = (jnp.full((1, 1, 1), m0, jnp.float32), jnp.ones((1, 1, 1), jnp.float32), first(size, 1, 1, 1, 16))
+    family = Family(lambda seed: (query, key, value, state, dout), np.ones((1, 1, 1, 1), bool))
+    reference = with_gradients(lambda *args: _resumed_attention(*args, family.keep))
+    ours = jax.jit(with_gradients(_mainloops(family, {})["portable"]))
+    for name, found in (("reference", reference(query, key, value, state, dout)),
+                        ("default", ours(query, key, value, state, dout))):
+        assert all(np.isfinite(np.asarray(leaf, np.float32)).all() for leaf in jax.tree.leaves(found)), name
+
+
 DECODED = [(family, form) for family, form in FAMILY_RUNS
            if FAMILIES[family].draw(0)[0].shape[1] == 1 and FAMILIES[family].draw(0)[0].shape[3] >= 16
            and not isinstance(FAMILIES[family].draw(0)[3], tuple)]
