@@ -256,6 +256,16 @@ CASES = [
             "linear_value_head_dim": 8, "linear_conv_kernel_dim": 4}}}},
         "max_seq_len": 2 * LONG_SEQ_LEN}, seq_len=2 * LONG_SEQ_LEN, label="qwen35"),
 ]
+import dataclasses as _dataclasses
+import os as _os
+_DROP = {k.split("=")[0]: k.split("=")[1] if "=" in k else None for k in _os.environ.get("G3N_DROP", "").split(",") if k}
+if _DROP:
+    _gemma = next(c for c in CASES if c.label == "gemma3n")
+    _config = {k: v for k, v in _gemma.config.items() if k not in _DROP or _DROP[k] is not None}
+    for _k, _v in _DROP.items():
+        if _v is not None:
+            _config[_k] = eval(_v)
+    CASES = [_dataclasses.replace(c, config=_config) if c is _gemma else c for c in CASES]
 
 IDS = [case.name for case in CASES]
 
