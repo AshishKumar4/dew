@@ -309,6 +309,97 @@ def torch_with_gradients(fn):
     return run
 
 
+REPLAYED = frozenset({
+    "add", "sub", "mul", "div", "neg", "max", "min", "sqrt", "exp", "expm1", "log", "erf", "erf_inv",
+    "broadcast_in_dim", "convert_element_type", "gather", "iota", "reshape", "slice", "squeeze",
+    "stack", "stop_gradient",
+})
+"""The float operations `float64_replay` evaluates in float64: those an initializer's parameters
+depend on (the parallelism matrix's models', surveyed). Any other operation on a float refuses."""
+FORMATTED = frozenset({"bitcast_convert_type", "nextafter", "reduce_precision"})
+"""Operations whose meaning is a float format's: `float64_replay` runs them at the traced dtypes
+and widens a float they return."""
+
+
+def float64_replay(fn):
+    """`fn` as its float64 truth: its program, as traced, with every operation on a float run in
+    float64 from operands widened exactly, so no float result is rounded but where the program
+    names a format. Operations on integers, bits and keys run as traced, so a draw's random bits
+    and the uniform built from them are the program's own (`FORMATTED`); a float literal or constant
+    is the program's value widened. The program's calls (`jit`), custom derivatives' calls and
+    scans are replayed inside; a float operation outside `REPLAYED` refuses by name. Returns a
+    function of `fn`'s arguments whose float results are float64, for check 1's `truth_fn` where a
+    float64 run of `fn` would be another program (a float64 draw reads 64-bit random bits)."""
+    def run(*arguments):
+        graph, shapes = jax.make_jaxpr(fn, return_shape=True)(*arguments)
+        with jax.enable_x64(new_val=True):
+            outputs = _replayed(graph.jaxpr, graph.consts, jax.tree.leaves(arguments))
+        return jax.tree.unflatten(jax.tree.structure(shapes), outputs)
+    return run
+
+
+def _floating(dtype) -> bool:
+    return jnp.issubdtype(dtype, jnp.floating)
+
+
+def _widened(value):
+    """`value` with a float widened exactly to float64."""
+    return jnp.asarray(value, jnp.float64) if _floating(np.result_type(value)) else value
+
+
+def _replayed(graph, consts, arguments):
+    held = {variable: _widened(value) for variable, value in
+            zip((*graph.constvars, *graph.invars), (*consts, *arguments), strict=True)}
+
+    def read(variable):
+        return _widened(variable.val) if hasattr(variable, "val") else held[variable]
+
+    for equation in graph.eqns:
+        outputs = _replayed_equation(equation, [read(variable) for variable in equation.invars])
+        held.update(zip(equation.outvars, outputs, strict=True))
+    return [read(variable) for variable in graph.outvars]
+
+
+def _replayed_equation(equation, values):
+    name, params = equation.primitive.name, equation.params
+    avals = [variable.aval for variable in (*equation.invars, *equation.outvars)]
+    if name == "jit":
+        return _replayed(params["jaxpr"].jaxpr, params["jaxpr"].consts, values)
+    if name == "custom_vjp_call":
+        return _replayed(params["call_jaxpr"].jaxpr, params["call_jaxpr"].consts, values)
+    if name == "scan":
+        return _replayed_scan(params, values)
+    if name in FORMATTED or not any(_floating(aval.dtype) for aval in avals if hasattr(aval, "dtype")):
+        traced = [jnp.asarray(value).astype(variable.aval.dtype) if hasattr(variable.aval, "dtype")
+                  and _floating(variable.aval.dtype) else value
+                  for value, variable in zip(values, equation.invars, strict=True)]
+        outputs = equation.primitive.bind(*traced, **params)
+        outputs = outputs if equation.primitive.multiple_results else [outputs]
+        return [_widened(output) if _floating(output.dtype) else output for output in outputs]
+    if name not in REPLAYED:
+        raise NotImplementedError(f"float64_replay has no float64 rule for {name}")
+    widened = {key: jnp.float64 if key in ("dtype", "new_dtype") and value is not None
+               and _floating(value) else value for key, value in params.items()}
+    outputs = equation.primitive.bind(*values, **widened)
+    return outputs if equation.primitive.multiple_results else [outputs]
+
+
+def _replayed_scan(params, values):
+    """A scan's body replayed step by step, its carry and stacked outputs in float64."""
+    body, constants, carried = params["jaxpr"], params["num_consts"], params["num_carry"]
+    consts, carry, sequences = values[:constants], values[constants:constants + carried], \
+        values[constants + carried:]
+    steps = range(params["length"])
+    stacked = []
+    for step in reversed(steps) if params["reverse"] else steps:
+        outputs = _replayed(body.jaxpr, body.consts, [*consts, *carry, *(xs[step] for xs in sequences)])
+        carry, ys = outputs[:carried], outputs[carried:]
+        stacked.append(ys)
+    if params["reverse"]:
+        stacked.reverse()
+    return [*carry, *(jnp.stack(column) for column in zip(*stacked, strict=True))]
+
+
 def equations(graph):
     """Every equation of a jaxpr, its sub-jaxprs' (scan, cond, custom rules) in turn."""
     if hasattr(graph, "eqns"):
