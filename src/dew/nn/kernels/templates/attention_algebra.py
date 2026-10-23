@@ -1074,14 +1074,6 @@ def exponent_product(mantissa: jax.Array, exponent: jax.Array) -> jax.Array:
     return jnp.where(mantissa == 0, 0.0, power2(mantissa, exponent))
 
 
-def _shifted(mantissa: jax.Array, exponent: jax.Array) -> tuple[jax.Array, jax.Array]:
-    """Entries `mantissa · 2^exponent` (`[bq, bk]`, `_split`'s form) taken by each row's power of two to
-    magnitudes at most one, never formed whole, and that power's exponent `[bq]`, the row's largest entry's,
-    `NO_SHIFT` for a row of zeros."""
-    shift = jnp.where(mantissa != 0, exponent, NO_SHIFT).max(axis=-1)
-    return exponent_product(mantissa, exponent - expand(shift, exponent)), shift
-
-
 def dq_step(sums: DqSums, weights: jax.Array, cotangents: jax.Array, slopes, seen: jax.Array, key: jax.Array,
             prior: jax.Array, *, scale: float, kinds: tuple, summed: tuple,
             dot: Callable[[jax.Array, jax.Array], jax.Array]) -> DqSums:
@@ -1095,21 +1087,21 @@ def dq_step(sums: DqSums, weights: jax.Array, cotangents: jax.Array, slopes, see
     grads = tuple(grad + piece if row else grad for grad, row, piece in zip(sums.grads, summed, pieces,
                                                                            strict=True))
     pulled_weights, pieces = pulled(weights, slopes, seen, kinds)
-    # The tile's coefficients against the keys joined into the running mean, as a softmax's sums are joined
-    # under a running maximum: each taken by a power of two to magnitudes at most one (`_shifted`), the
-    # running mass and the tile's brought to the larger exponent, the mean taken to their sum.
-    # Each coefficient `pulled weight · scale / prior` as its factors' mantissas and exponents, so none is
-    # formed whole where it would overflow (a hook's slope near fp32's largest).
-    weight_mantissa, weight_exponent = _split(pulled_weights)
+    # The tile's coefficients against the keys, `pulled weight · scale / prior`, joined into the running
+    # mean as a softmax's sums are joined under a running maximum. Each is held at its row's power of two,
+    # never formed whole where it would overflow (a hook's slope near fp32's largest): the row's largest
+    # weight's exponent plus the scale's and the prior's, its mantissa at most one; the running mass and
+    # the tile's are brought to the larger exponent and the mean taken to their sum. One exponent a row,
+    # not one an entry: an entry far below its row's largest is far below the correction's rounding.
+    row_top = jnp.max(jnp.abs(pulled_weights), axis=-1)
+    _, top_exponent = _split(row_top)
     scale_mantissa, scale_exponent = _split(jnp.float32(scale))
     prior_mantissa, prior_exponent = _split(inverse(prior))
-    factor_mantissa = scale_mantissa * prior_mantissa
-    factor_exponent = scale_exponent + prior_exponent
-    coefficients, tile_shift = _shifted(weight_mantissa * expand(factor_mantissa, weight_mantissa),
-                                        weight_exponent + expand(factor_exponent, weight_exponent))
+    tile_shift = jnp.where(row_top > 0, top_exponent + scale_exponent + prior_exponent, NO_SHIFT)
     keyed_shift = jnp.maximum(sums.keyed_shift, tile_shift)
     before = power2(sums.keyed_mass, sums.keyed_shift - keyed_shift)
-    coefficients = power2(coefficients, expand(tile_shift - keyed_shift, coefficients))
+    taken = expand(scale_exponent + prior_exponent - keyed_shift, pulled_weights)
+    coefficients = power2(pulled_weights, taken) * expand(scale_mantissa * prior_mantissa, pulled_weights)
     keyed_mass = before + jnp.abs(coefficients).sum(axis=-1)
     over = inverse(keyed_mass)
     keyed = (expand(before * over, sums.keyed) * sums.keyed
@@ -1215,15 +1207,6 @@ def _scaled(x: jax.Array) -> tuple[jax.Array, jax.Array]:
     return power2(x, 14.0 - exponent), exponent - 14.0
 
 
-def _below_bf16(x: jax.Array) -> tuple[jax.Array, jax.Array]:
-    """`x` (fp32) taken down by the power of two that puts its largest at 2^126 where it is larger, so it
-    rounds to bf16 within bf16's largest, unscaled elsewhere, and that power's exponent."""
-    top = jnp.max(jnp.abs(x))
-    largest = jnp.where(top > 0, jnp.ceil(jnp.log2(jnp.where(top > 0, top, 1.0))), 0.0)
-    exponent = jnp.maximum(largest - 126.0, 0.0)
-    return power2(x, -exponent), exponent
-
-
 def _fp16_scaled(x: jax.Array) -> tuple[jax.Array, jax.Array]:
     """`_scaled`'s `x` in fp16 and its exponent: within fp16's range whatever `x`'s, an entry far below the
     largest losing only what is far below the product's own rounding."""
@@ -1236,29 +1219,32 @@ def cotangent_product(cotangents: jax.Array, operand: jax.Array,
                       transposed: bool = False) -> jax.Array:
     """A tile's score cotangents `[bq, bk]` (fp32, scaled) times the call's queries or keys `operand` (its
     transpose's product where `transposed`: dK's `dSᵀ Q`, else dQ's `dS K`), in fp32 to fp32's accuracy, as
-    the reference differentiates (its score cotangents are fp32). An fp32 operand takes the fp32 product.
-    A 16-bit one takes two 16-bit products: the cotangents rounded to the operand's dtype, at a power of
-    two that keeps them in its range (fp16's: their largest at 2^14; bf16's, fp32's own: taken down only
-    where their largest would round past bf16's), and what that rounding lost, at its own scale in fp16
-    against the operand in fp16 likewise: 7 and 10 bits more, so a key's or a query's gradient whose
+    the reference differentiates (its score cotangents are fp32), so a key's or a query's gradient whose
     cotangents cancel across the other axis loses no more than the reference's fp32 product does, where one
-    16-bit product loses every bit the cancellation exposes. No part's product leaves fp32's range where
-    the gradient is in it: the high part is never raised against an operand of bf16's full range."""
+    16-bit product loses every bit the cancellation exposes. An fp32 operand takes the fp32 product. A bf16
+    one takes three bf16 products, the cotangents split exactly into three bf16 parts (each what the parts
+    before it lost, rounded), 24 bits in all, with no scaling: bf16 holds fp32's range, so no part leaves it
+    (measured on the H100: 28% over one product, where a scaled bf16-and-fp16 pair cost 3x). An fp16 one
+    takes two fp16 products at power-of-two scales that keep each part in its range: the cotangents' largest
+    at 2^14, and what their rounding lost likewise, 21 bits."""
     def oriented(x):
         return x.T if transposed else x
 
     if operand.dtype == jnp.float32:
         return dot(oriented(cotangents), operand)
-    scaled, high_exponent = _scaled(cotangents) if operand.dtype == jnp.float16 else _below_bf16(cotangents)
+    if operand.dtype == jnp.bfloat16:
+        out, rest = None, cotangents
+        for _ in range(3):
+            piece = rest.astype(jnp.bfloat16)
+            rest = rest - piece.astype(jnp.float32)
+            term = dot(oriented(piece), operand)
+            out = term if out is None else out + term
+        return out
+    scaled, high_exponent = _scaled(cotangents)
     high = scaled.astype(operand.dtype)
     low, low_exponent = _fp16_scaled(scaled - high.astype(jnp.float32))
-    low_exponent = low_exponent + high_exponent
-    if operand.dtype == jnp.float16:
-        narrow, operand_exponent = operand, jnp.zeros((), jnp.float32)
-    else:
-        narrow, operand_exponent = _fp16_scaled(operand.astype(jnp.float32))
     return (power2(dot(oriented(high), operand), high_exponent)
-            + power2(dot(oriented(low), narrow), low_exponent + operand_exponent))
+            + power2(dot(oriented(low), operand), low_exponent + high_exponent))
 
 
 def weights_product(weights: jax.Array, operand: jax.Array,
