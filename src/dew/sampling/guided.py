@@ -139,11 +139,10 @@ def context_free_pieces(source: Vocabulary, special: set[int]) -> tuple[list[str
     decoder spells every piece but `special` alike at the start of a text. Refuses one that spells
     some piece otherwise there: the decoded row would then not be the text the automaton held to
     the pattern."""
-    pieces, ids = vocabulary_pieces(source, matching_mode(source))
     probe = source("abcdef", add_special_tokens=False)["input_ids"]
     before = [source.convert_ids_to_tokens(token) for token in probe]
     opening = source.convert_tokens_to_string(before)
-    for token, index in zip(source.get_vocab(), ids, strict=True):
+    for token, index in source.get_vocab().items():
         if index in special:
             continue
         alone = source.convert_tokens_to_string([token])
@@ -154,7 +153,7 @@ def context_free_pieces(source: Vocabulary, special: set[int]) -> tuple[list[str
                 f"{type(source).__name__}'s decoder spells {token!r} as {alone!r} at the start of a text: "
                 "a constrained row could decode to text outside the pattern. Guide a byte-level BPE "
                 "tokenizer's model (GPT-2, Llama 3, Qwen)")
-    return pieces, ids
+    return vocabulary_pieces(source, matching_mode(source))
 
 
 def json_schema(tokenizer: Vocabulary | Referencing | Tokenizing, schema: str | Mapping[str, JSON],
