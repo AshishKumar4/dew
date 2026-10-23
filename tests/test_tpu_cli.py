@@ -386,7 +386,7 @@ def test_a_fresh_worker_installs_the_least_uv_first_and_dew_with_it(tmp_path):
     (tmp_path / "uv.template").write_text(uv)
     (binaries / "curl").write_text(
         f'#!/bin/sh\nfor url; do :; done; echo "curl $url" >> {calls}; release=${{url#*/uv/}}\n'
-        f'release=${{release%/install.sh}}; printf \'mkdir -p "$HOME/.local/bin"; sed "s/@RELEASE@/%s/" '
+        f'release=${{release%/install.sh}}; printf \'mkdir -p "$HOME/.local/bin"; sed "s/@RELEASE@/%s/g" '
         f'{tmp_path}/uv.template > "$HOME/.local/bin/uv"; chmod +x "$HOME/.local/bin/uv"\\n\' "$release"\n')
     for path in binaries.iterdir():
         path.chmod(0o755)
