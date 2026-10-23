@@ -96,7 +96,10 @@ def test_byte_string_prompts_load_as_the_native_tokenizers_ids(prompt):
     np.testing.assert_array_equal(batch[LENGTH_KEY], np.full(8, len(ids), np.int32))
 
 
-def test_string_prompts_keep_the_hf_sources_special_tokens_out(tmp_path):
+def test_a_string_prompt_opens_as_training_text_does_and_never_closes(tmp_path):
+    """A prompt is a sequence the model reads opens: a tokenizer that starts every encoding with a BOS
+    (Llama 3's, Gemma's) opens a prompt with it, as `Tokenize` opens training text, and the EOS its
+    encoding ends with is left off, since the completion follows the prompt."""
     from tokenizers import Tokenizer, models, processors
     from transformers import PreTrainedTokenizerFast
 
@@ -116,8 +119,9 @@ def test_string_prompts_keep_the_hf_sources_special_tokens_out(tmp_path):
         batch = next(stream)
     finally:
         stream.close()
-    np.testing.assert_array_equal(batch[PROMPT_KEY][0, WINDOW - len(ids):], ids)
-    np.testing.assert_array_equal(batch[PROMPT_KEY][0, :WINDOW - len(ids)], 0)
+    opened = [1, *ids]
+    np.testing.assert_array_equal(batch[PROMPT_KEY][0, WINDOW - len(opened):], opened)
+    np.testing.assert_array_equal(batch[PROMPT_KEY][0, :WINDOW - len(opened)], 0)
     assert int(batch[LENGTH_KEY][0]) == len(ids)
 
 
