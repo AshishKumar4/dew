@@ -25,7 +25,7 @@ import numpy as np
 from dew.artifacts import Artifact, Decisions
 from dew.decision.metrics import Answered
 from dew.nn.precision import at_least_fp32
-from dew.objectives.base import Batch, Shown, mean_of_totals, merge_totals
+from dew.objectives.base import Batch, Metric, Shown, mean_of_totals, merge_totals
 
 
 class ScoringRule(ABC):
@@ -162,7 +162,7 @@ class Combined(ScoringRule):
     __rmul__ = __mul__
 
 
-def default_metrics() -> list:
+def default_metrics() -> list[Metric]:
     """The held-out suite a decision run scores by default, fresh: accuracy, calibration error,
     the risk-coverage area and the log loss, in that order."""
     from dew.decision.metrics import AURC, ECE, Accuracy

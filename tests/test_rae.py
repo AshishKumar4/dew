@@ -63,7 +63,9 @@ def test_every_computed_tensor_is_mapped_and_exports_bit_identical(variant):
 def test_the_latent_matches_the_source(variant):
     """The normalized latent: the encoder's patch tokens as a grid, less the
     checkpoint's mean and over its deviation, per position where it gives
-    one per position."""
+    one per position. The DINOv2 and MAE checkpoints omit encoder_norm_mean
+    and encoder_norm_std, so their latents hold the encoder input's default
+    ImageNet statistics (`dew.nn.blocks.IMAGENET_MEAN`) to the source's."""
     _, (autoencoder, params, _, config), reference = variant
     image = channels_last(reference["image"])
     latent = autoencoder.encode(params, 2 * image - 1)
@@ -179,13 +181,3 @@ def test_the_published_dinov2_matches_transformers(monkeypatch):
     print(f"published DINOv2 gap {gap:.3g}, bound {bound:.3g}")
     assert gap < bound
 
-
-def test_the_imagenet_statistics_are_transformers_own():
-    """The per-channel ImageNet mean and deviation every encoder input reads (`dew.nn.blocks`) are the
-    ones transformers publishes, value for value."""
-    from transformers.utils.constants import IMAGENET_DEFAULT_MEAN, IMAGENET_DEFAULT_STD
-
-    from dew.nn.blocks import IMAGENET_MEAN, IMAGENET_STD
-
-    assert list(IMAGENET_MEAN) == list(IMAGENET_DEFAULT_MEAN)
-    assert list(IMAGENET_STD) == list(IMAGENET_DEFAULT_STD)

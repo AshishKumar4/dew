@@ -1,6 +1,6 @@
 """The tabulated variance-preserving schedule every beta table shares."""
 
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 
 import jax
 import jax.numpy as jnp
@@ -71,7 +71,8 @@ class BetaTable(DiscreteNoiseScheduler):
     """A schedule whose betas a named table makes from the step count and two endpoints (`table`),
     the three kept as the schedule's record. The P2 weight arguments are `DiscreteNoiseScheduler`'s."""
 
-    table: staticmethod
+    table: Callable[[int, float, float], np.ndarray]
+    """The betas of `timesteps` steps between the two endpoints, a static method of each table's class."""
 
     def __init__(self, timesteps: int, beta_start: float, beta_end: float,
                  p2_loss_weight_k: float = 1, p2_loss_weight_gamma: float = 1):

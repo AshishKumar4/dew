@@ -227,9 +227,6 @@ def run_steps(loader: Loader, steps: int | None, epochs: int | None, tokens: int
     run_length(steps, epochs, tokens)
     if epochs is None:
         return steps
-    if loader.records is None:
-        raise ValueError("epochs need a dataset with a record count; this one streams without one, so "
-                         "give the run length as steps")
     return loader.epoch_steps(epochs, accumulation)
 
 
