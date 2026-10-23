@@ -5,6 +5,11 @@ release's tag is that version with a `v` in front (`v0.1.0`).
 
 ## Unreleased
 
+- A diffusion schedule's division of a state by a rate (`divided`: epsilon from a clean
+  prediction, the clean sample from epsilon, a sigma solver's derivative) is IEEE's correctly
+  rounded quotient on every backend (`dew.nn.precision.correctly_rounded_divide`, moved from
+  `dew.nn.fake_quant`). XLA:GPU's fp32 division was off IEEE on 30 to 50% of quotients, so
+  diffusion on a GPU moves by at most 2 ulps per division, toward PyTorch.
 - `dew.figures` draws SVG figures for notebooks and docs. Their colors follow
   the page's light or dark theme (dewml.dev, Colab, JupyterLab, VS Code, and
   the system setting elsewhere), and their animations are CSS, so they play
