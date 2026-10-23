@@ -324,8 +324,9 @@ def test_the_dense_decoders_gradient_is_the_references():
 
     def draw(seed):
         """Rows of ids drawn uniformly from the vocabulary, and the loss's cotangent, one."""
+        import os
         rows = np.random.default_rng([0xDE, seed]).integers(
-            0, int(dense.vocab_size), (STEP_ROWS, STEP_LENGTH)).astype(np.int32)
+            0, int(dense.vocab_size), (int(os.environ.get("DENSE_ROWS", STEP_ROWS)), STEP_LENGTH)).astype(np.int32)
         return rows, np.float32(1)
 
     def loss(params, rows):
