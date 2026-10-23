@@ -37,7 +37,8 @@ def _gates(g, start, size: int, count, offset: int = 0):
     """A chunk's prefix rows, fp32, those past `count` holding the last real row's."""
     rows = jax.lax.dynamic_slice_in_dim(g, start + offset, size, 0).astype(jnp.float32)
     last = jax.lax.dynamic_index_in_dim(g, start + count - 1, 0, keepdims=False).astype(jnp.float32)
-    return jnp.where(jnp.arange(size) < count - offset, rows, last)
+    kept = (jnp.arange(size) < count - offset).reshape((size,) + (1,) * (rows.ndim - 1))
+    return jnp.where(kept, rows, last)
 
 
 def _padded(x, chunk: int):
