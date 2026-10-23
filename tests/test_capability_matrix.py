@@ -516,7 +516,8 @@ def assert_resumes(objective, data, directory: Path, rollout) -> None:
     leaves = [path for (path, got), (_, want) in zip(bits(after), bits(uninterrupted), strict=True)
               if got.dtype != want.dtype or not np.array_equal(got, want)]
     assert not programs and not leaves, {"the step reads the restored state otherwise": programs,
-                                         "leaves off the run that never stopped": leaves}
+                                         "leaves off the run that never stopped": leaves,
+                                         "plans": (resumed.plan, whole.plan)}
 
 
 def token_batch(width: int, seed: int = 0) -> np.ndarray:
