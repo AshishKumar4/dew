@@ -1,6 +1,5 @@
 """The convolutional and embedding pieces the UNets and the DiT sandwich share."""
 
-import math
 from collections.abc import Callable
 from functools import partial
 
@@ -17,6 +16,7 @@ from .attention import GroupNorm, RMSNorm
 from .conv import Conv
 from .flops import projection_flops
 from .precision import at_least_fp32, float32_dot_general
+from .rope import sinusoid_frequencies, sinusoids
 from .sharding import constrain, explicit_spec, rows_taken, whole_spec
 
 
@@ -174,8 +174,7 @@ class FourierEmbedding(nn.Module):
         # into whatever scalar the caller scaled `x` by (EDM's 1/4) and the
         # sin/cos arguments round differently.
         angular = jax.lax.optimization_barrier(2 * jnp.pi * self.frequencies.value)
-        emb = x[:, None] * angular[None, :]
-        return jnp.concatenate([jnp.sin(emb), jnp.cos(emb)], axis=-1)
+        return sinusoids(x[:, None] * angular[None, :])
 
 
 def sinusoidal_time(time, features: int, *, dtype: DTypeLike, shift: float = 0, cosine_first: bool = True):
@@ -189,15 +188,8 @@ def sinusoidal_time(time, features: int, *, dtype: DTypeLike, shift: float = 0, 
     half = features // 2
     if features % 2 or half <= shift:
         raise ValueError("Time embedding width must be even and exceed twice the frequency shift")
-    # Scale the whole exponent before dividing, as the published models do;
-    # the other order moves a sine by 1e-5 near timestep 1000. Take exp on
-    # the host in float64 so the table does not vary with the backend.
-    width = np.dtype(dtype).type
-    exponent = np.arange(half, dtype=width) * width(-math.log(10000.0)) / width(half - shift)
-    frequencies = jnp.asarray(np.exp(exponent.astype(np.float64)).astype(width))
-    phase = jnp.asarray(time, width).reshape(-1, 1) * frequencies[None]
-    first, second = (jnp.cos(phase), jnp.sin(phase)) if cosine_first else (jnp.sin(phase), jnp.cos(phase))
-    return jnp.concatenate([first, second], axis=-1)
+    frequencies = jnp.asarray(sinusoid_frequencies(half, half - shift, dtype=dtype, exponential=True))
+    return sinusoids(jnp.asarray(time, dtype).reshape(-1, 1) * frequencies[None], cosine_first=cosine_first)
 
 
 class TimeProjection(nn.Module):
