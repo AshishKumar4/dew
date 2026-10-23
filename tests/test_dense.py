@@ -1,7 +1,9 @@
 """Dew's dense and convolution layers: flax's, with the bias's gradient summed at fp32.
 
 Every configuration a layer takes initializes and computes what flax's own
-layer does, bit for bit. The gradient of a bias, summed over the positions it
+layer does, bit for bit, where its fp32 sums are XLA's (`FP32_SUMS`): a CPU's own
+are Dew's product policy's (`dew.nn.precision.accumulated`, tests/test_cpu_accumulation.py).
+The gradient of a bias, summed over the positions it
 is broadcast over, is the fp32 sum torch's addmm and convolution take, and a
 biased bf16 projection's output is as close to float64 as torch's.
 """
@@ -15,7 +17,7 @@ from reference_error import assert_as_exact_as_the_reference
 
 from dew.nn.conv import Conv
 from dew.nn.dense import Dense, DenseGeneral
-from dew.nn.precision import fp32_result_dot_general
+from dew.nn.precision import FP32_SUMS, fp32_result_dot_general
 from dew.quantization import Quantization, quantize_for_serving
 
 PARTITIONED = nn.with_partitioning(nn.initializers.lecun_normal(), (None, None))
@@ -69,15 +71,17 @@ CASES = ([(name, Dense, nn.Dense, *case) for name, case in LAYERS.items()]
 @pytest.mark.parametrize(("ours", "flaxs", "build", "dtype", "shape"), [case[1:] for case in CASES],
                          ids=[case[0] for case in CASES])
 def test_a_layer_initializes_and_computes_what_flaxs_does(ours, flaxs, build, dtype, shape):
-    """Flax's parameters bit for bit, and with them, its biases zero, flax's output."""
+    """Flax's parameters bit for bit, and with them, its biases zero, flax's output where both sum
+    their fp32 products as XLA does (`FP32_SUMS`)."""
     x = jnp.asarray(np.random.default_rng(0).standard_normal(shape), dtype)
     mine, theirs = build(ours), build(flaxs)
     variables = theirs.init(jax.random.key(0), x)
     jax.tree.map(np.testing.assert_array_equal, mine.init(jax.random.key(0), x), variables)
     if dtype == jnp.bfloat16:  # variables restored at a dtype other than the one declared
         variables = jax.tree.map(lambda leaf: leaf.astype(jnp.bfloat16), nn.unbox(variables))
-    expected = theirs.apply(variables, x)
-    got = mine.apply(variables, x)
+    with jax.default_matmul_precision(FP32_SUMS):
+        expected = theirs.apply(variables, x)
+        got = mine.apply(variables, x)
     assert got.dtype == expected.dtype
     np.testing.assert_array_equal(np.asarray(got, np.float32), np.asarray(expected, np.float32))
 
