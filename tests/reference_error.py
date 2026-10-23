@@ -766,11 +766,12 @@ def _staged(drawn, seeds: int, label: str, *, two_stage: bool = True) -> tuple[l
 
 
 STAGES_LOG = "DEW_CHECK1_STAGES"
-"""The environment variable naming a file each check-1 judgement appends its stage and verdict to, one
-JSON line (`_logged`): what a train reads every site's stage-two rate from, every attempt counted."""
+"""The environment variable naming a file each check-1 judgement appends its stage, its verdict and its
+leaves of NARROW_WIDTHS rows to, one JSON line (`_logged`): what a train reads every site's stage-two rate
+from, every attempt counted, and which sites' local errors rest on check 2."""
 
 
-def _logged(label: str, stage: int, verdict: str) -> None:
+def _logged(label: str, stage: int, verdict: str, narrow: tuple[str, ...] = ()) -> None:
     import json
     import os
 
@@ -778,7 +779,8 @@ def _logged(label: str, stage: int, verdict: str) -> None:
     if path:
         with open(path, "a", encoding="utf-8") as log:
             log.write(json.dumps({"site": os.environ.get("PYTEST_CURRENT_TEST", "").rsplit(" (", 1)[0],
-                                  "label": label, "stage": stage, "verdict": verdict}) + "\n")
+                                  "label": label, "stage": stage, "verdict": verdict,
+                                  "narrow": list(narrow)}) + "\n")
 
 
 def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth_fn=None,
@@ -826,10 +828,16 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
     if seeds < FEWEST_SEEDS:
         raise Inconclusive(f"{label}: {seeds} seeds cannot be judged; check 1 takes at least {FEWEST_SEEDS} "
                            f"(`seeds_for`)")
-    over, unresolved, stage = _staged(
-        lambda start, stop: _drawn(dew_fn, reference_fn, draw, range(start, stop), truth_fn, orders=orders),
-        seeds, label)
-    _logged(label, stage, _verdict(over, unresolved))
+    narrow: list[str] = []
+
+    def drawn(start, stop):
+        draws = _drawn(dew_fn, reference_fn, draw, range(start, stop), truth_fn, orders=orders)
+        narrow[:] = [name for name, width in zip(draws.names, draws.widths, strict=True)
+                     if width in NARROW_WIDTHS]
+        return draws
+
+    over, unresolved, stage = _staged(drawn, seeds, label)
+    _logged(label, stage, _verdict(over, unresolved), tuple(narrow))
     if over:
         raise AssertionError("\n".join(over + unresolved))
     if unresolved:
