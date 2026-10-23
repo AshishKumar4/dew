@@ -19,6 +19,8 @@ against and are counted apart. The shares are of downloads, over all types
 and over the most downloaded 200 and 50. Writes coverage.json.
 """
 
+from __future__ import annotations
+
 import json
 import sys
 from collections import defaultdict
