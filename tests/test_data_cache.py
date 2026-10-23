@@ -1232,6 +1232,19 @@ def test_a_warm_cache_read_by_worker_processes_refuses_a_manifest_rewritten_sinc
         reader.close()
 
 
+@pytest.mark.parametrize("read", ["memory", "indexed"])
+def test_a_cached_chain_cut_before_its_repeat_counts_its_cut_as_uncached(tmp_path, read):
+    """A chain cut to its first 3 records, repeated, and cached after a step counts the 3 its repeat
+    reads an epoch, as the same chain uncached does."""
+    from dew.data.compile import compile
+    from dew.data.dataset import Loading
+
+    chain = Memory([{"id": index} for index in range(8)]).take(3).repeat().map(Offset(1))
+    loading = Loading(workers=0, threads=1, read_buffer=0)
+    cached = compile(chain.cache(str(tmp_path / "cache")).batch(1), read=read, loading=loading)
+    assert cached.records == compile(chain.batch(1), read=read, loading=loading).records == 3
+
+
 def test_an_empty_stream_publishes_an_empty_generation():
     """A stream with no records publishes a generation of none, its shards read to their end."""
     from dew.data.compile import publish
