@@ -612,9 +612,9 @@ GEMMA3_TEXT = DecoderFamily(
     _gemma3_export,
     sandwich_norms=True,
     preserve_source_layout=False,
-    # Gemma3TextConfig's window, which an omitted sliding_window means.
+    # Gemma3TextConfig's defaults for the fields its decoder reads.
     defaults={'hidden_activation': 'gelu_pytorch_tanh', 'query_pre_attn_scalar': 256,
-              'sliding_window': 4096},
+              'sliding_window': 4096, 'head_dim': 256, 'max_position_embeddings': 131072},
 )
 
 GEMMA2 = DecoderFamily(
