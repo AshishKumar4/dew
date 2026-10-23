@@ -647,7 +647,8 @@ def test_a_run_on_a_device_without_a_known_peak_still_reports_its_training_flops
     work = objective.training_flops(None, batch)
     assert 0 < work < 2**21
     trainer = Trainer(objective, optax.sgd(0.01), key=0, tracker=tracker)
-    trainer.fit(Loader(lambda partition: iter([batch, batch]), None, batch=8, records=16), steps=2, log_every=1)
+    trainer.fit(Loader(lambda partition: iter([batch, batch]), None, batch=8, records=16), steps=2,
+                log_every=1)
     logged = [scalars for _, scalars in tracker.scalars if "train/loss" in scalars]
     assert [scalars["train/flops"] for scalars in logged] == [work, work]
     assert not any("train/mfu" in scalars for scalars in logged)
