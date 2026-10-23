@@ -35,6 +35,7 @@ from dew.nn.attention import l2_normalized
 from dew.nn.blocks import sinusoidal_time
 from dew.nn.dit import TextContext, masked_mean
 from dew.nn.precision import accumulated
+from dew.nn.protocols import Lacks
 from dew.nn.sharding import rows_taken
 from dew.objectives.base import TEACHER, Aux, Batch, Objective, Step, Variables
 
@@ -258,7 +259,7 @@ class AdversarialDistillationObjective(FlowDistillationObjective):
         kept = dict(captured).get("intermediates", {})
         missing = [name for name in self.feature_layers if name not in kept]
         if missing:
-            raise ValueError(f"the teacher has no layers {missing} to read features after")
+            raise Lacks("features", f"the teacher has no layers {missing} to read features after")
         grids = []
         for name in self.feature_layers:
             tokens = jnp.asarray(kept[name]["__call__"][0])

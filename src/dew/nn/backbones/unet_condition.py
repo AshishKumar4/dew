@@ -9,11 +9,12 @@ import numpy as np
 from flax import linen as nn
 from flax.typing import Dtype, PrecisionLike
 
-from dew.nn.attention import FlaxFeedForward, GroupNorm, LayerNorm, NormalAttention
+from dew.nn.attention import GroupNorm, LayerNorm, NormalAttention
 from dew.nn.blocks import ResidualBlock, sinusoidal_time
 from dew.nn.conv import Conv
 from dew.nn.dense import Dense
 from dew.nn.flops import MissingFlopsCount, projection_flops
+from dew.nn.mlp import geglu_feed_forward
 from dew.nn.precision import at_least_fp32, float32_dot_general
 
 from .spatial import SpatialCount, SpatialForward, SpatialShape
@@ -88,9 +89,9 @@ class _Transformer(nn.Module):
 
         x = x + attention("self_attention", norm("self_norm")(x), context if self.stage.cross_only else None)
         x = x + attention("cross_attention", norm("cross_norm")(x), context)
-        x = x + FlaxFeedForward(self.stage.features, dtype=self.dtype, precision=self.precision,
-                               dropout=self.dropout, approximate_gelu=self.approximate_gelu,
-                               name="feed_forward")(norm("ff_norm")(x), train=train)
+        x = x + geglu_feed_forward(self.stage.features, approximate=self.approximate_gelu, dtype=self.dtype,
+                                   precision=self.precision, dropout_rate=self.dropout,
+                                   name="feed_forward")(norm("ff_norm")(x), train=train)
         return nn.Dropout(self.dropout)(x, deterministic=not train) if self.dropout else x
 
 
@@ -119,7 +120,7 @@ class _SpatialAttention(nn.Module):
         attention = NormalAttention(width, self.stage.heads, width // self.stage.heads, parent=None)
         crossed = attention.cross_flops(lengths, context_lengths, text_features)
         first = crossed if self.stage.cross_only else attention.model_flops(lengths)
-        feedforward = FlaxFeedForward(width, parent=None).model_flops(lengths)
+        feedforward = geglu_feed_forward(width, parent=None).model_flops(lengths)
         return (2 * projection_flops(lengths, width, width)
                 + self.stage.depth * (first + crossed + feedforward))
 
