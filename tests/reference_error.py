@@ -724,14 +724,20 @@ NARROW_FACTORS = {1: 90.0, 2: 11.0}
 ROW_FACTOR fails an equally exact Dew far more often than LOWER_TAIL as sites run check 1 (1.5e-2 of
 runs at one value a row, 1.5e-3 at two): a row of few values is sized by a few float64 values, which sit
 near zero far more often than a wide row's RMS does, and the worst row over a site's rows and seeds is
-the row whose truth is smallest. Each factor is the 1 - 1e-4 quantile of the factor that would fail
-equally exact pairs at both stages, both arms on one truth (`tools/gate_null_runs.py --rows`, its
-`row_controls`), the largest over 16, 256 and 2048 rows a draw and 8 and 64 declared seeds (20,000 runs
-each: 88 at one value, 10.5 at two), rounded up, so that 28,000 fresh runs at the layout it came from
-certify its rate within LOWER_TAIL at 99.9%. At three values a row ROW_FACTOR's measured rate is within
-LOWER_TAIL (at most 2.9e-4 over those layouts), not certified. A local error a row of a value or two
-hides is check 2's to catch once it gates, each element within its operation's certified bound
-(tests/op_certificates.py, the target)."""
+the row whose truth is smallest. Each factor is at least the 1 - 1e-4 quantile, at every layout measured,
+of the factor that would fail equally exact pairs at both stages, both arms on one truth
+(`tools/gate_null_runs.py --rows`, its `row_controls`, through `_staged` itself): the largest empirical
+quantile over 16, 256 and 2048 rows a draw and 8 and 64 declared seeds at 20,000 runs each, rounded up;
+larger runs put the quantile at 40 to 53 at one value up to 4,096 rows and 512 seeds. 28,000 fresh runs
+at the layouts the largest quantiles came from certify the rate within LOWER_TAIL at 99.9% (at most
+4.7e-4). Rows of three values keep ROW_FACTOR at a measured rate of at most 2.9e-4 over those layouts,
+not certified; of four and more, none in 20,000.
+
+The power this gives up is local: a narrow row whose error is between ROW_FACTOR and these factors
+times the reference's worst no longer fails by its row (the pooled ratio and the leaf's other rows still
+judge it), and a narrow false alarm no longer draws the second stage for the site's other leaves, which
+that stage exists to judge on real findings. An error local to a value or two is check 2's to catch once
+it gates, each element within its operation's certified bound (tests/op_certificates.py, the target)."""
 
 
 PREVIOUS_TAILS = (5e-4, 5e-4)

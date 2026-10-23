@@ -455,7 +455,7 @@ def row_controls(width: int, rows: int, seeds: int, runs: int, chunk: int) -> tu
     rows a draw of `width` values, truths and errors standard normal, the arms' errors independent; the
     pooled ratio exactly one, so only the rows decide. Each run's verdict, and its site statistic, the
     least factor that would have failed it at both stages (`_staged`'s second stage is drawn only where
-    the first fails), whose 1 - LOWER_TAIL quantile calibrates NARROW_FACTORS."""
+    the first fails), whose high quantiles calibrate NARROW_FACTORS."""
     import numpy as np
     from reference_error import REDRAW, _Draws, _staged, _verdict
 
@@ -503,6 +503,8 @@ def main(argv: list[str]) -> int:
     from reference_error import _drawn, null_runs, seeds_for
 
     if options.rows is not None:
+        if options.today or options.paired or options.orders or options.fault or options.seeds is None:
+            parser.error("--rows takes the rows a draw as its name and --seeds, and no other mode's flags")
         verdicts, statistics = row_controls(options.rows, int(options.name), options.seeds, options.runs,
                                             options.chunk)
         print(json.dumps({"rows": int(options.name), "width": options.rows, "seeds": options.seeds,
