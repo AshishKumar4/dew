@@ -147,6 +147,17 @@ def decays(g, documents=None):
     return grown_from(hi, lo, jnp.exp), jnp.where(inclusive, jnp.exp(diff), 0.0)
 
 
+LN2 = 0.6931471805599453
+"""ln 2: `exp2`'s derivative at zero, the base-2 prefix's unit (`raised`)."""
+
+
+def raised(hi, lo):
+    """`exp2(hi + lo)` of a compensated base-2 exponent, rounded about once (`grown_from`): a decay from a
+    chunk's start, whose exponent's rounded half alone carries its whole sum's rounding (a relative 3e-6
+    at the prefix -43 a single token at -30 a token reaches)."""
+    return grown_from(hi, lo, jnp.exp2, LN2)
+
+
 def grown_from(hi, lo, exp, unit: float = 1.0):
     """`exp(hi + lo)` of a compensated exponent `(hi, lo)`, rounded about once: `exp(hi)` corrected by its
     first-order term in `lo` (`|lo|` is under half an ulp of `hi`, so the second is far below fp32's
@@ -423,7 +434,7 @@ def scalar_write(corrected_values, last, gate, last_lo, gate_lo):
     """A decay a head's write: the corrected values gated by `exp2(g_last - g)` over both halves, and the
     memory's decay `exp2(g_last)`."""
     gated = corrected_values * jnp.exp2((last - gate) + (last_lo - gate_lo))[:, None]
-    return gated, jnp.exp2(last)
+    return gated, raised(last, last_lo)
 
 
 def chunk_output(queries: Load, entered: Load, keys: Load, columns: int, gate, low, value, scale: float,
@@ -437,7 +448,7 @@ def chunk_output(queries: Load, entered: Load, keys: Load, columns: int, gate, l
         query = queries(c)
         out += issue("memory", query, entered(c))
         scores += issue("scores", query, keys(c).T)
-    out = out * jnp.exp2(gate)[:, None]
+    out = out * raised(gate, low)[:, None]
     scores = scores * jnp.exp2(apart(gate, low, gate, low))
     index = jnp.arange(gate.shape[0])
     scores = jnp.where(index[:, None] >= index[None, :], scores, 0.0)
