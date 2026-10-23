@@ -1080,23 +1080,26 @@ def dq_step(sums: DqSums, weights: jax.Array, cotangents: jax.Array, slopes, see
             dot: Callable[[jax.Array, jax.Array], jax.Array], accurate: bool) -> DqSums:
     """A dQ pass's sums after a key tile (`DqSums`): its score cotangents pulled through the score hook
     (`pulled`) and scaled, times the keys (`cotangent_product`, in the form `accurate` names); the HEAD and
-    QUERY parameters' pullbacks of them (`summed` marks which `kinds` sum per row); the weights' sums
-    unnormalized; and in the accurate form the weights' own pullbacks and their product with the keys over
-    the prior denominator, which take dQ to the refined D (`dq_finish`). The fast form leaves dQ and the
-    hook parameters' gradients at the first pass's D (the forward's anchored one, `split_delta`, or the
-    dQ launch's own, `off_anchor_delta`), its `keyed` and `weighed` sums untouched."""
+    QUERY parameters' pullbacks of them (`summed` marks which `kinds` sum per row) and of the weights,
+    which take those gradients to the refined D (`dq_finish`); the weights' sums unnormalized; and in the
+    accurate form the weights' product with the keys over the prior denominator, which takes dQ there too.
+    The fast form leaves dQ at the first pass's D (the forward's anchored one, `split_delta`, or the dQ
+    launch's own, `off_anchor_delta`), FlashAttention's arithmetic, its `keyed` sums untouched: a
+    parameter's gradient sums its cotangents over every key and query, a position's or a scale's times
+    each, so the first pass's D error enters it multiplied (ALiBi's slope 2.3 to 6.7 times the reference's
+    error at its first D), where dQ's per query is FlashAttention's."""
     pulled_cotangents, pieces = pulled(cotangents, slopes, seen, kinds)
     dq = sums.dq + cotangent_product(pulled_cotangents * scale, key, dot, accurate=accurate)
     grads = tuple(grad + piece if row else grad for grad, row, piece in zip(sums.grads, summed, pieces,
                                                                            strict=True))
-    residual, mass = sums.residual + cotangents.sum(axis=-1), sums.mass + weights.sum(axis=-1)
-    if not accurate:
-        return sums._replace(dq=dq, residual=residual, mass=mass, grads=grads)
     pulled_weights, pieces = pulled(weights, slopes, seen, kinds)
     weighed = sums.weighed
     if any(summed):
         weighed = tuple(total + piece if row else total
                         for total, row, piece in zip(sums.weighed, summed, pieces, strict=True))
+    residual, mass = sums.residual + cotangents.sum(axis=-1), sums.mass + weights.sum(axis=-1)
+    if not accurate:
+        return sums._replace(dq=dq, residual=residual, mass=mass, grads=grads, weighed=weighed)
     if slopes is None:
         # Without a score hook each coefficient is the scale times a weight over the prior denominator,
         # which holds every weight at its maximum: the weights over it sum to at most one, so their product
@@ -1136,21 +1139,21 @@ def dq_finish(sums: DqSums, prior: jax.Array, state_total: jax.Array, peak0: jax
     `state_total` and its keys' weights, so the weights it differentiates sum to one over its own logits
     whichever pass gave D: the cotangents' sums from the prior by their ratio (one division, about 1),
     the weights' over it. D is then refined once from its own sums (`refinement`), the D the dK/dV launch
-    takes. In the accurate form dQ and the HEAD and QUERY gradients take it too, each less the refinement
-    times its weights' own product (`keyed`, `weighed`): a query's dQ cancels across its keys exactly as
-    its cotangents sum to 0, so the D it takes must be the one whose cotangents do, not the first pass's;
-    the fast form leaves them at the first pass's (`dq_step`). Returns dQ, the refined `D - c`, the
-    denominator, the keys' share of the weights, and the hook gradients."""
+    takes, and the HEAD and QUERY gradients take it, each less the refinement times its weights' own sum
+    (`weighed`). In the accurate form dQ takes it too, less the refinement times its weights' product with
+    the keys (`keyed`): a query's dQ cancels across its keys exactly as its cotangents sum to 0, so the D it
+    takes must be the one whose cotangents do, not the first pass's; the fast form leaves dQ at the first
+    pass's (`dq_step`). Returns dQ, the refined `D - c`, the denominator, the keys' share of the weights,
+    and the hook gradients."""
     total = state_total + sums.mass
     ratio = jnp.where(total > 0, prior / jnp.where(total > 0, total, 1.0), 0.0)
     over = inverse(total)
     mass, residual = sums.mass * over, sums.residual * ratio
     refined = refinement(residual, mass, peak0, shares, peak, total, anchor, delta)
-    if not accurate:
-        return (sums.dq * expand(ratio, sums.dq), delta + refined, total, mass,
-                tuple(grad * ratio for grad in sums.grads))
     grads = tuple(grad * ratio - refined * (weighed * over)
                   for grad, weighed in zip(sums.grads, sums.weighed, strict=True))
+    if not accurate:
+        return sums.dq * expand(ratio, sums.dq), delta + refined, total, mass, grads
     # refined · mass · 2^shift · keyed, each factor's mantissa and exponent apart (`_split`), so no partial
     # product overflows or flushes where the correction is in range.
     refined_mantissa, refined_exponent = _split(refined)
