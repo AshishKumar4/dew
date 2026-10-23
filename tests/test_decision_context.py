@@ -6,6 +6,7 @@ import itertools
 from pathlib import Path
 
 import jax
+import jax.numpy as jnp
 import numpy as np
 import optax
 import pytest
@@ -18,6 +19,7 @@ from dew.data.dataset import DataPartition
 from dew.data.text import ByteTokenizer
 from dew.decision import Choice, Decide, Example
 from dew.decision.layout import Specials
+from dew.decision.model import DecisionModel
 from dew.decision.objective import DecisionObjective
 from dew.decision.questions import ChoiceAnswer
 from dew.interop import Pretrained
@@ -50,11 +52,10 @@ CONTEXT_SEEDS = 16
 """Check 1's declared seeds for the batched answers with their contexts."""
 
 
-def conditioned(length: int = 16, layers: tuple[int, ...] = (0, 1),
-                dtype: str = "float32") -> DecisionObjective:
+def conditioned(length: int = 16, layers: tuple[int, ...] = (0, 1)) -> DecisionObjective:
     """A decision over the tiny Llama with fresh cross-attention before `layers`, its context up to
-    `length` tokens, its rows laid out by bytes, computed and held in `dtype`."""
-    source = Pretrained.load(LLAMA, dtype=dtype, param_dtype=dtype, attention_impl="reference")
+    `length` tokens, its rows laid out by bytes."""
+    source = Pretrained.load(LLAMA, dtype="float32", attention_impl="reference")
     return DecisionObjective(source.with_cross_attention(CrossAttention(layers, length), key=0),
                              tokenizer=ByteTokenizer(), specials=SPECIALS)
 
@@ -188,10 +189,12 @@ def test_a_batch_answers_each_request_from_its_own_context():
 
     def truth(seed):
         if "task" not in wide:
-            exact = conditioned(16, (0, 1), "float64")
+            model = objective.model
+            exact = DecisionModel(model.backbone.clone(dtype=jnp.float64),
+                                  model.head.clone(dtype=jnp.float64))
             widened = jax.tree.map(lambda leaf: np.asarray(leaf, np.float64)
                                    if np.issubdtype(np.asarray(leaf).dtype, np.floating) else leaf, variables)
-            wide["task"] = Decide(exact.model, widened, exact.layout, exact.tokenizer, exact.specials)
+            wide["task"] = Decide(exact, widened, objective.layout, objective.tokenizer, objective.specials)
         return scored(wide["task"], seed, together=False)
 
     def draw(seed):
