@@ -85,7 +85,8 @@ class Architecture:
     MMA, Blackwell's tensor memory columns (PTX ISA, tcgen05.alloc), and the model values of what only a
     measurement states, which the opt-in calibration replaces on a device (`GpuTarget.calibration`): the
     global-memory load latency in multiprocessor clocks and the bytes the L2 serves a multiprocessor a
-    clock; on a TPU the scoped VMEM limit at XLA's default and a grid step's fixed seconds."""
+    clock; on a TPU the scoped VMEM limit at XLA's default, the VMEM a kernel may raise its limit to
+    (`vmem_bytes`), and a grid step's fixed seconds."""
 
     family: str
     tensor_rates: Mapping[str, int] = dataclasses.field(default_factory=dict)
@@ -94,6 +95,7 @@ class Architecture:
     load_latency: float | None = None
     l2_bytes_per_clock: float | None = None
     scoped_vmem: int | None = None
+    vmem_bytes: int | None = None
     grid_step_seconds: float | None = None
 
 
@@ -129,8 +131,11 @@ _BLACKWELL_CONSUMER = Architecture('mma.sync', {'16bit': 1024, 'tf32': 512, 'fp3
 # small DMA (GEMMTPU-GRIDSTEP: v5e 0.1785 us, v6e 0.2835 us). v6e: two 256x256 MXUs, 918 TF over its
 # clock -> 524288. T4: 65 TF fp16 summed in fp32 and 8.1 TF fp32
 # over 40 SMs at 1590 MHz -> 1024 and 128.
-_TPUS = {'v5e': Architecture('tpu', {'16bit': 131072}, scoped_vmem=16 * 2 ** 20, grid_step_seconds=1.785e-7),
-         'v6e': Architecture('tpu', {'16bit': 524288}, grid_step_seconds=2.835e-7)}
+# VMEM capacity: v6e 128 MiB from an allocation refusal ("would exceed memory (size=134217728)",
+# GEMMTPU-GRIDSTEP@v6e1); v5e 128 MiB by Google's specification, pending GEMMTPU-VMEM@v5e1's refusal.
+_TPUS = {'v5e': Architecture('tpu', {'16bit': 131072}, scoped_vmem=16 * 2 ** 20, vmem_bytes=128 * 2 ** 20,
+                             grid_step_seconds=1.785e-7),
+         'v6e': Architecture('tpu', {'16bit': 524288}, vmem_bytes=128 * 2 ** 20, grid_step_seconds=2.835e-7)}
 
 
 def architecture(generation: str) -> Architecture | None:
@@ -235,6 +240,12 @@ class GpuTarget:
         """A TPU's scoped VMEM limit in bytes at XLA's default, past which a Mosaic kernel refuses to
         compile (`dew.nn.attention.splash_block_sizes`); None where no rule states it."""
         return self.architecture.scoped_vmem
+
+    @property
+    def vmem_bytes(self) -> int | None:
+        """A TPU's VMEM capacity in bytes, the most a Mosaic kernel may raise its scoped limit to
+        (`vmem_limit_bytes`); None on GPUs and where no rule states it."""
+        return self.architecture.vmem_bytes
 
     @property
     def grid_step_seconds(self) -> float | None:
