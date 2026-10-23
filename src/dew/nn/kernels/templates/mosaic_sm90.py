@@ -76,18 +76,24 @@ def staged_products(acc, parts, rhs, buffers, interpret: bool, *, transposed: bo
     return acc
 
 
-def walked_products[C](step, start: C, lo, hi, shapes: tuple[tuple[int, int], ...], interpret: bool
+def walked_products[C](segments, start: C, shapes: tuple[tuple[int, int], ...], interpret: bool
                        ) -> tuple[C, tuple[jax.Array, ...]]:
-    """A walk of steps `lo` to `hi`, `step(index, carry, accumulators) -> (carry, accumulators)`, from
-    `start`, with fp32 accumulators of `shapes` (zero) its products issue into in place (`register_products`,
-    `staged_products`): warpgroup accumulators scoped across the walk, read once its MMAs are waited for;
-    interpreted, arrays the walk carries. Returns the carry and the accumulators' values."""
+    """A walk of `segments`, each `(step, lo, hi)` its steps `lo` to `hi` in order,
+    `step(index, carry, accumulators) -> (carry, accumulators)`, from `start`, with fp32 accumulators of
+    `shapes` (zero) its products issue into in place (`register_products`, `staged_products`): warpgroup
+    accumulators scoped across the walk, read once its MMAs are waited for; interpreted, arrays the walk
+    carries. Returns the carry and the accumulators' values."""
     if interpret:
-        return lax.fori_loop(lo, hi, lambda index, both: step(index, *both),
-                             (start, tuple(zeros(shape) for shape in shapes)))
+        both = (start, tuple(zeros(shape) for shape in shapes))
+        for step, lo, hi in segments:
+            both = lax.fori_loop(lo, hi, lambda index, both, step=step: step(index, *both), both)
+        return both
 
     def run(*accumulators):
-        carry = lax.fori_loop(lo, hi, lambda index, carry: step(index, carry, accumulators)[0], start)
+        carry = start
+        for step, lo, hi in segments:
+            carry = lax.fori_loop(lo, hi, lambda index, carry, step=step: step(index, carry, accumulators)[0],
+                                  carry)
         plgpu.wgmma_wait(0)
         return carry, tuple(acc[...] for acc in accumulators)
 
