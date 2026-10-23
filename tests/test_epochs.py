@@ -204,11 +204,11 @@ def _not_201(row):
 def test_a_part_repeated_at_its_root_and_then_cut_ends_the_mix_that_reads_it(shares):
     """A read cut per share repeats a part written without a repeat at its own root, and the part's
     own limit then ends it: a mix of a repeated part and one cut to three and filtered runs out on
-    every share, and its stream says so."""
+    every share, and its stream says so; its batch of two splits over two shares."""
     from dew.data.dataset import stream_endless
 
     chain = mix([_tagged(1, 8).repeat(), _tagged(2, 8).take(3).filter(_not_201)], weights=(1, 1))
-    loader = compile(chain.batch(1), read="indexed", loading=READ)
+    loader = compile(chain.batch(2), read="indexed", loading=READ)
     for index in range(shares):
         reader = loader.train(DataPartition(index, shares))
         said = stream_endless(reader)
