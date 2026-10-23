@@ -301,8 +301,14 @@ def correctly_rounded_divide(numerator: jax.typing.ArrayLike, denominator: jax.t
     NumPy's IEEE divide without enabling x64. Dense keeps its own precision.
     A zero or non-finite quotient (a zero divisor, an overflow, a signed
     zero) is the division's, which leaves no residual to correct. Its
-    derivative is the division's, as JAX differentiates `a / b`.
+    derivative is the division's, as JAX differentiates `a / b`. A negative
+    divisor divides the negated numerator by its own negation, an exact
+    rewrite, so the neighbours' half-spacings compare with the residual
+    in the divisor's own sign.
     """
+    flip = denominator < 0
+    numerator = jnp.where(flip, -numerator, numerator)
+    denominator = jnp.where(flip, -denominator, denominator)
     quotient = numerator / denominator
     special = (quotient == 0) | ~jnp.isfinite(quotient)
     plain = quotient

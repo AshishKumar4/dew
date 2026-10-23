@@ -33,11 +33,13 @@ def draw(seed):
 
 
 def test_a_schedules_division_keeps_zeros_infinities_and_mixed_operands():
-    """A signed zero, a zero divisor and an overflowing quotient are IEEE's, bit for bit, as is a
-    float32 state over a float16 rate or a Python float; a float64 state over a broadcast rate is
-    float64's correctly rounded quotient, which XLA:CPU's reciprocal would round twice."""
-    numerator = np.asarray([-0.0, 0.0, 1.0, 2.0 ** 127, 3.0, -2.0, np.inf], np.float32)
-    rate = np.asarray([1.0, -1.0, 0.0, 0.25, np.inf, 0.0, 2.0], np.float32)
+    """A signed zero, a zero divisor of either sign, an overflowing quotient and exact quotients by
+    negative divisors are IEEE's, bit for bit, as is a float32 state over a float16 rate or a Python
+    float; a float64 state over a broadcast rate is float64's correctly rounded quotient, which
+    XLA:CPU's reciprocal would round twice."""
+    numerator = np.asarray([-0.0, 0.0, 1.0, 2.0 ** 127, 3.0, -2.0, np.inf, 1.0, -1.0, 6.0, -1.0, 7.0],
+                           np.float32)
+    rate = np.asarray([1.0, -1.0, 0.0, 0.25, np.inf, 0.0, 2.0, -1.0, -1.0, -3.0, 3.0, -0.0], np.float32)
     got = np.asarray(jax.jit(divided)(numerator, rate))
     with np.errstate(divide="ignore", over="ignore"):
         np.testing.assert_array_equal(got.view(np.uint32), (numerator / rate).view(np.uint32))
@@ -52,13 +54,27 @@ def test_a_schedules_division_keeps_zeros_infinities_and_mixed_operands():
         np.testing.assert_array_equal(np.asarray(jax.jit(divided)(wide, by)), wide / by)
 
 
+def signed_draw(seed):
+    """`draw`'s latents and first rate with a random sign on each row's rate, and a quarter of the
+    latents an exact quotient's numerator: the rate times a power of two of either sign, so
+    their quotients are exact (1, -1, 4, -0.5, ...) and their residuals zero."""
+    numerator, _, _, rate, _ = draw(seed)
+    rng = np.random.default_rng([29, seed])
+    rate = (rate * rng.choice([-1, 1], rate.shape)).astype(np.float32)
+    exact = rng.random(SHAPE) < 0.25
+    multiple = rng.choice([1.0, -1.0, 4.0, -0.5, 2.0 ** -20], SHAPE).astype(np.float32)
+    numerator = np.where(exact, np.broadcast_to(rate, SHAPE) * multiple, numerator).astype(np.float32)
+    return numerator, rate
+
+
 @pytest.mark.parametrize("dtype", [jnp.float32, jnp.bfloat16, jnp.float16])
 @pytest.mark.parametrize("broadcast", [True, False], ids=["per-row", "full"])
 def test_a_schedules_division_is_ieee_division(broadcast, dtype):
     """The quotient of every element, a per-row rate broadcast over a state's or a full-shape
     divisor, compiled, is IEEE's correctly rounded fp32 quotient, bit for bit; a bfloat16 or float16
-    one that quotient of the widened operands rounded to its dtype, as PyTorch's opmath divides."""
-    numerator, _, _, rate, _ = draw(0)
+    one that quotient of the widened operands rounded to its dtype, as PyTorch's opmath divides.
+    The rates take either sign and a quarter of the quotients are exact (`signed_draw`)."""
+    numerator, rate = signed_draw(0)
     if not broadcast:
         rate = np.broadcast_to(rate, SHAPE).copy()
     numerator, rate = (np.asarray(array.astype(dtype)) for array in (numerator, rate))
