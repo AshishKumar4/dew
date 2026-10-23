@@ -124,6 +124,12 @@ def products_dtype(*operands) -> jnp.dtype | None:
     return jnp.result_type(*dtypes)
 
 
+FP32_SUMS = "F32_F32_F32"
+"""JAX's dot algorithm of fp32 operands summed in fp32: as a process's or a scope's default matmul
+precision, the statement that its fp32 products sum as an accelerator sums them, which `accumulated`
+honors on a CPU."""
+
+
 def float64_sum(product: Callable[..., jax.Array], *operands, dtype: DTypeLike) -> jax.Array:
     """`product(*operands)`, a sum of products, taken in float64 from its operands widened exactly and
     rounded once to `dtype`, under `jax.enable_x64` for its own trace: the sum `accumulated` takes on a
@@ -152,11 +158,14 @@ def accumulated(product: Callable[..., jax.Array], *operands,
     (`platform_dependent`), which keys every compiled program: a step a CPU lowers for a GPU target
     (`dew.training.trainer.Trainer.lower_for`, `lowering_platforms=('cuda',)`) takes the target's
     fp32 sum, and a Pallas kernel's body, interpreted on a CPU to stand in for a GPU, never forms its
-    products here."""
+    products here. A computation that stands for such a target, a reference for a kernel interpreted
+    on a CPU, states its fp32 sums with JAX's dot algorithm for them, `with
+    jax.default_matmul_precision(FP32_SUMS)`, which jit's cache keys as it keys every precision."""
     from dew.nn.kernels.generation import linear_tangent
 
     narrow = functools.partial(product, preferred_element_type=preferred_element_type)
-    if (not all(isinstance(operand, jax.Array | np.ndarray) for operand in operands)
+    if (jax.config.jax_default_matmul_precision == FP32_SUMS
+            or not all(isinstance(operand, jax.Array | np.ndarray) for operand in operands)
             or products_dtype(*operands) != jnp.dtype(jnp.float32)):
         return narrow(*operands)
     dtype = jax.eval_shape(narrow, *operands).dtype

@@ -11,7 +11,7 @@ import pytest
 from reference_error import with_gradients
 
 from dew.nn.dense import Dense
-from dew.nn.precision import float32_dot_general, float32_einsum, float32_matmul
+from dew.nn.precision import FP32_SUMS, float32_dot_general, float32_einsum, float32_matmul
 
 pytestmark = pytest.mark.skipif(jax.default_backend() != "cpu", reason="the policy is the CPU's")
 
@@ -92,3 +92,18 @@ def test_the_policy_is_the_executing_platforms_whatever_target_a_trace_assumed(a
         with assumed("sm80") if inside else contextlib.nullcontext():
             results.append(float(product(lhs, rhs)[0, 0]))
     assert results == [1.0, 1.0]
+
+
+@pytest.mark.parametrize("stated_first", [True, False])
+def test_a_scope_that_states_fp32_sums_gets_them(stated_first):
+    """One jitted product, run on a CPU with fp32 sums stated (`FP32_SUMS`) and without, in either
+    order, sums the cancelling terms in fp32 in the stated scope (to zero, the 1 lost to 2**24) and in
+    float64 outside it (to 1): the statement keys the compiled program, as a precision does."""
+    product = jax.jit(lambda lhs, rhs: float32_dot_general(lhs, rhs, (((1,), (0,)), ((), ()))))
+    lhs, rhs = CANCELLING[None], np.ones((3, 1), np.float32)
+    results = {}
+    for stated in (stated_first, not stated_first):
+        with jax.default_matmul_precision(FP32_SUMS) if stated else contextlib.nullcontext():
+            results[stated] = float(product(lhs, rhs)[0, 0])
+    assert results == {True: 0.0, False: 1.0}
+
