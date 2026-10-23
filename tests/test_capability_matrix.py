@@ -35,6 +35,7 @@ import dataclasses
 import functools
 import gc
 import itertools
+import pickle
 import shutil
 import tempfile
 from collections.abc import Callable, Mapping
@@ -1033,7 +1034,10 @@ def test_a_supported_cell_trains_evaluates_and_reloads(method, family, tmp_path)
 @pytest.mark.parametrize("method, family", cells(supported=False))
 def test_a_refused_cell_names_what_the_family_lacks(method, family):
     """The method refuses the family for a fact its math needs and the family lacks
-    (`dew.nn.protocols.Lacks`), not for any other error on the way."""
+    (`dew.nn.protocols.Lacks`), not for any other error on the way, and the refusal crosses a
+    process boundary whole, its capability with it."""
     with pytest.raises(Lacks) as refused:
         method.refuse(family)
     assert refused.value.capability in method.needs - family.facts
+    carried = pickle.loads(pickle.dumps(refused.value))
+    assert (carried.capability, carried.args) == (refused.value.capability, refused.value.args)

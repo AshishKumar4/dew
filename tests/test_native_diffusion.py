@@ -24,7 +24,8 @@ def saved_pipelines(tmp_path_factory):
                            tmp_path_factory.mktemp("saved-diffusion"))
 
 
-def run_check(*arguments) -> str:
+def run_check(*arguments, failing: bool = False) -> str:
+    """The checker's output; it must exit 0, or, where `failing` admits a reported failure, 1."""
     result = subprocess.run(
         [sys.executable, str(ROOT / "tools/check_native_diffusion.py"), *map(str, arguments)],
         cwd=ROOT,
@@ -40,7 +41,7 @@ def run_check(*arguments) -> str:
             "OPENBLAS_NUM_THREADS": "1",
         },
     )
-    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.returncode in ((0, 1) if failing else (0,)), result.stdout + result.stderr
     return result.stdout
 
 
@@ -70,7 +71,7 @@ def grid_cases() -> list[str]:
 def walked_grids(saved_pipelines) -> dict:
     """Every source grid walked by the saved SD pipeline, loaded once in one process, each case's
     errors and, where it is off the source, its failure (`check_grids`)."""
-    printed = run_check(saved_pipelines / "sd", "--grids", SCHEDULER_GRIDS)
+    printed = run_check(saved_pipelines / "sd", "--grids", SCHEDULER_GRIDS, failing=True)
     return json.loads(printed.strip().splitlines()[-1])["grids"]
 
 

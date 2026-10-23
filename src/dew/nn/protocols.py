@@ -137,6 +137,10 @@ class Lacks(TypeError, ValueError):
         super().__init__(message)
         self.capability = capability
 
+    def __reduce__(self):
+        # Rebuilt from its own fields, as a pickle or a process boundary carries it.
+        return type(self), (self.capability, self.args[0])
+
 
 @struct.dataclass
 class OutputTable:
