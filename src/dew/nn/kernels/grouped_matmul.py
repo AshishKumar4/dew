@@ -873,12 +873,15 @@ class _Cutlass(_GroupedLaunch[mosaic_gpu.Tiles]):
     config_cls: ClassVar[type[mosaic_gpu.Tiles]] = mosaic_gpu.Tiles
     TILE: ClassVar[mosaic_gpu.Tiles]
     COSTED_AS: ClassVar[_Mosaic]
-    MEASURED: ClassVar[dict[tuple[str, bool], float]]
-    """By generation and whether the call is dense (one group, which the template's launch runs without a
-    group's bookkeeping and CUTLASS's does not), the geometric mean over the scoreboard's rows of the
-    launch's measured seconds over the model's at `TILE`, as a share of the same ratio of the template's
-    Mosaic launch at its own pick: its time on the scale of the model's estimates of the template's
-    launches."""
+    MEASURED: ClassVar[dict[tuple[str, bool, str], float]]
+    """By generation, whether the call is dense (one group, which the template's launch runs without a
+    group's bookkeeping and CUTLASS's does not) and its output's dtype (a kernel the wheel builds apart),
+    the share of the model's estimate at `TILE` CUTLASS's measured time is, on the scale of the model's
+    estimates of the template's Mosaic launch: fitted over the scoreboard's rows to CUTLASS's measured
+    seconds over the template's (each at its pick) times the template's estimate."""
+    SCALES_BYTES: ClassVar[bool]
+    """Whether the share scales the launch's bytes as well as its mainloop's work: whether CUTLASS moves its
+    bytes faster than the template's tile does as well."""
 
     def eligible(self, ba, target) -> bool:
         operands = [value for name, value in ba.arguments.items()
@@ -907,9 +910,16 @@ class _Cutlass(_GroupedLaunch[mosaic_gpu.Tiles]):
     def cost(self, ba, config: mosaic_gpu.Tiles, target) -> float:
         # A call of a generation and form no rows measured: no estimate it could win by, so the launch runs
         # only by name (`generation.chosen`).
-        form = (generation.effective(target).generation, bool(ba.arguments.get('dense')))
-        measured = self.MEASURED.get(form)
-        return math.inf if measured is None else super().cost(ba, config, target) * measured
+        form = (generation.effective(target).generation, bool(ba.arguments.get('dense')),
+                jnp.dtype(ba.arguments['out_dtype']).name)
+        share = self.MEASURED.get(form)
+        if share is None:
+            return math.inf
+        costed = self.costed(ba, config, target)
+        scaled = ('program_flops', 'program_staged', 'program_exponentials', 'serial_staged',
+                  'serial_exponentials', *(('device_bytes', 'l2_bytes') if self.SCALES_BYTES else ()))
+        return cost.seconds(dataclasses.replace(costed, **{name: share * getattr(costed, name)
+                                                           for name in scaled}), target)
 
 
 @dataclasses.dataclass(frozen=True)
@@ -919,8 +929,12 @@ class CutlassGmm(_Cutlass):
     ROWS: ClassVar[tuple[str, ...]] = ('tokens',)
     TILE: ClassVar[mosaic_gpu.Tiles] = mosaic_gpu.Tiles(128, 256, 64, 4, 8, warpgroups=2, cluster=2)
     COSTED_AS: ClassVar[_Mosaic] = MosaicGmm()
-    # ROUTE-4 on an H100: the scoreboard's 14 grouped and 4 dense rows of the forward and input gradient.
-    MEASURED: ClassVar[dict[tuple[str, bool], float]] = {('sm90', False): 0.71, ('sm90', True): 1.0}
+    # ROUTE-4 on an H100: the scoreboard's 14 grouped and 4 dense rows of the forward and input gradient,
+    # bf16 out. Its pair's multicast streams the matrices faster than the template's tile: kimi-linear's
+    # forward, its 2.4 GB of weights the model's bound, ran 0.86 of the template's.
+    MEASURED: ClassVar[dict[tuple[str, bool, str], float]] = {('sm90', False, 'bfloat16'): 0.71,
+                                                              ('sm90', True, 'bfloat16'): 1.0}
+    SCALES_BYTES: ClassVar[bool] = True
 
     def _fwd(self, tokens: jax.Array, kernel: jax.Array, sizes: jax.Array,
              prologue_operands: tuple = (), epilogue_operands: tuple = (), *, out_dtype: str,
@@ -945,11 +959,14 @@ class CutlassTgmm(_Cutlass):
     ROWS: ClassVar[tuple[str, ...]] = ('tokens', 'cotangent')
     TILE: ClassVar[mosaic_gpu.Tiles] = mosaic_gpu.Tiles(128, 256, 64, 4, 8, warpgroups=2)
     COSTED_AS: ClassVar[_Mosaic] = MosaicTgmm()
-    # None: on an H100 (ROUTE-4) it ran 0.81 to 1.39 times the template's kernel gradient over the
-    # scoreboard's rows, a write-bound row's DRAM traffic and throughput the template's own (NCU-dw), and no
-    # share of the model's estimate ranks it right at both kimi-linear's fp32 rows (1.22, 1.39) and the
-    # rows it wins (mixtral's, 0.81 to 0.94).
-    MEASURED: ClassVar[dict[tuple[str, bool], float]] = {}
+    # ROUTE-5 on an H100: the scoreboard's 7 grouped rows of the bf16 gradient (rms log error 0.06). Its
+    # mainloop's work alone: at a gradient its stores bound, its DRAM traffic and throughput are the
+    # template's cooperative tile's (NCU-dw, kimi-linear gate_up), so the two tie and the template's runs.
+    # No share ranks its fp32 gradient right at both kimi-linear's rows (1.22 and 1.37 the template's) and
+    # mixtral's (0.81 to 0.86), nor its dense one at both widths (0.80 at a gate_up's, 1.08 at a down's):
+    # those run it only by name.
+    MEASURED: ClassVar[dict[tuple[str, bool, str], float]] = {('sm90', False, 'bfloat16'): 0.94}
+    SCALES_BYTES: ClassVar[bool] = False
 
     def _fwd(self, tokens: jax.Array, cotangent: jax.Array, sizes: jax.Array,
              prologue_operands: tuple = (), *, out_dtype: str, interpret: bool, hooks: Hooks = NO_HOOKS,
