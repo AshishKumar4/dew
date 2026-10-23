@@ -76,10 +76,9 @@ class Tiles:
         if self.warpgroups not in (1, 2) or self.cluster not in (1, 2) or paired:
             raise ValueError(f"{self}: one warpgroup alone, or two in a cluster of one or two "
                              "multiprocessors")
-        if self.warpgroups == 2 and (self.block_m % 128 or self.block_n > 256
-                                     or self.block_n % min(self.block_n, _STAGED_COLUMNS)):
-            # Each consumer's half of the rows is one warpgroup MMA's, 64 rows by at most 256 columns,
-            # staged for its store in equal chunks (`_STAGED_COLUMNS`).
+        if self.warpgroups == 2 and (self.block_m % 128 or self.block_n > 256):
+            # Each consumer's half of the rows is warpgroup MMAs', a multiple of 64 rows by at most 256
+            # columns.
             raise ValueError(f"{self}: two warpgroups halve the tile's rows into warpgroup MMAs")
         if self.warpgroups == 2 and self.stages < 2:
             # A stage is released a step late (an MMA in flight), so one stage would wait on itself.
@@ -279,7 +278,7 @@ def _gmm_cooperative(lhs, rhs, lengths, shape: tuple, *, tiles: Tiles, transpose
     block_m, block_n, block_k, pair = tiles.block_m, tiles.block_n, tiles.block_k, tiles.cluster
     rows_half = block_m // 2
     part = (rows_half, block_n)
-    staged = min(part[1], _STAGED_COLUMNS)
+    staged = _staged_columns(block_n, dtypes)
     side_shapes = [tuple({'rows': part[0], 'columns': part[1]}[axis] for axis in axes)
                    for axes in epilogue_axes]
     # A pipeline's operands each follow its steps: a prologue side operand without depth is loaded once a
@@ -441,10 +440,20 @@ def _finish_half(acc, epilogue, sides: tuple, outs: tuple, place: tuple, wg) -> 
                               most)
 
 
-_STAGED_COLUMNS = 128
-"""The most columns a consumer stages its output in at a time: a consumer's 256 columns written to shared
-memory as one 512-byte row conflicted on its banks 195 times as often as in two 256-byte halves (ncu,
-Qwen3's down projection forward: 18.3M conflicts against 94K, the kernel 16% slower)."""
+_STAGED_BYTES = 256
+"""The widest row, in bytes, a consumer stages its output in at a time: a consumer's 256 bf16 columns
+written to shared memory as one 512-byte row conflicted on its banks 195 times as often as in two
+256-byte halves (ncu, Qwen3's down projection forward: 18.3M conflicts against 94K, the kernel 16%
+slower)."""
+
+
+def _staged_columns(block_n: int, dtypes) -> int:
+    """The columns of each chunk a consumer stages its output tile in: `_STAGED_BYTES` of the widest
+    output, or the whole tile where that is narrower; the tile must divide into them."""
+    columns = min(block_n, _STAGED_BYTES // max(jnp.dtype(dtype).itemsize for dtype in dtypes))
+    if block_n % columns:
+        raise ValueError(f"a cooperative tile of {block_n} columns does not stage in chunks of {columns}")
+    return columns
 
 
 _IN_FLIGHT = 1
@@ -598,6 +607,7 @@ def _tgmm_cooperative(operands: tuple, groups: tuple, shape: tuple, *, tiles: Ti
     block_m, block_n, block_k = tiles.block_m, tiles.block_n, tiles.block_k
     half, depth_half = block_n // 2, block_m // 2
     part = (depth_half, block_n)
+    staged = _staged_columns(block_n, (out_dtype,))
     grid = (m // block_m, n // block_n)
     stepped = tuple(i for i, axes in enumerate(prologue_axes) if 'rows' in axes)
     fixed = tuple(i for i, axes in enumerate(prologue_axes) if 'rows' not in axes)
@@ -628,7 +638,7 @@ def _tgmm_cooperative(operands: tuple, groups: tuple, shape: tuple, *, tiles: Ti
 
         @functools.partial(
             pl.run_scoped,
-            o_smem=plgpu.SMEM((2, *part), out_dtype),
+            o_smem=plgpu.SMEM((2, block_n // staged, depth_half, staged), out_dtype),
             **hopper.staging('fixed', [(tuple(extent[axis] for axis in prologue_axes[i]), side_gmems[i])
                                  for i in fixed]),
             halves=plgpu.Barrier(num_arrivals=2, num_barriers=2),
@@ -660,11 +670,15 @@ def _tgmm_cooperative(operands: tuple, groups: tuple, shape: tuple, *, tiles: Ti
                 fixed_refs = [smem.at[wg] for smem in fixed_smems]
 
                 def store(acc, g_i, depth, columns):
+                    # In `_staged_columns` chunks, as `_finish_half` stores.
                     plgpu.wait_smem_to_gmem(0, wait_read_only=True)
-                    o_smem[wg] = acc.astype(o_smem.dtype)
+                    for chunk in range(block_n // staged):
+                        o_smem[wg, chunk] = acc[:, chunk * staged:(chunk + 1) * staged].astype(o_smem.dtype)
                     plgpu.commit_smem()
                     mine = pl.ds(depth.start + wg * depth_half, depth_half)
-                    plgpu.copy_smem_to_gmem(o_smem.at[wg], o_gmem.at[g_i, mine, columns])
+                    for chunk in range(block_n // staged):
+                        chunk_columns = pl.ds(columns.start + chunk * staged, staged)
+                        plgpu.copy_smem_to_gmem(o_smem.at[wg, chunk], o_gmem.at[g_i, mine, chunk_columns])
 
                 hook = None if prologue is None else (prologue, prologue_axes, stepped, fixed, fixed_refs)
 
@@ -703,7 +717,9 @@ def _staged_halves(stages: list, group: tuple, mine: tuple, hook, halves) -> tup
     the prologue (`hook`: it, its operands' axes, which are stepped and which fixed, and the fixed ones'
     tiles), and the whole cotangent, the neighbouring groups' rows zeroed in its halves of both (`group`:
     the step, the group's first and last row, its steps, the rows a step takes; `mine`: its depth and
-    column halves), the other's cotangent half awaited at `halves` where it zeroed any."""
+    column halves), the other's cotangent half awaited at `halves` where it zeroed any. Both consumers'
+    MMAs read the whole cotangent stage, so each zeroes half of it and they meet where a group boundary
+    falls in the step, the kernel's one exchange between them."""
     rows_stage, cotangent_stage, *side_stages = stages
     mine_depth, mine_columns = mine
     if hook is not None:
@@ -715,6 +731,7 @@ def _staged_halves(stages: list, group: tuple, mine: tuple, hook, halves) -> tup
     plgpu.commit_smem()
     pl.when(boundary)(lambda: hopper.meet(halves))
     return rows_stage.at[:, mine_depth].transpose((1, 0)), cotangent_stage
+
 
 def _streamed_gradient(staged, release, steps, first, shape: tuple, exact_sums: bool, store) -> None:
     """Dew: a streamed kernel gradient tile's `steps` steps (`staged(counter, step)` their operands at the
