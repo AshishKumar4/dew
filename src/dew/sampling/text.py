@@ -22,7 +22,7 @@ import math
 import types
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import Generic
+from typing import Generic, get_args
 
 import jax
 import jax.numpy as jnp
@@ -97,7 +97,7 @@ type Identity = str | int | tuple[Identity, ...]
 # function, a bound method, a library builtin. Anything else is named by its
 # class, which is one of these.
 type SelfNaming = type | types.FunctionType | types.MethodType | types.BuiltinFunctionType
-SELF_NAMING = (type, types.FunctionType, types.MethodType, types.BuiltinFunctionType)
+SELF_NAMING: tuple[type[SelfNaming], ...] = get_args(SelfNaming.__value__)
 
 
 # Transformers' `_get_logits_processor` order, by its own control names: the
