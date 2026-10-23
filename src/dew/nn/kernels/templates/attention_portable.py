@@ -287,7 +287,7 @@ def _dq_launch(query, key, value, dout, peak, total, initial_term, maximum, key_
             cotangents = algebra.grad_scores(weights, interpreted_dot(do, v_tile.T), anchor, delta, seen,
                                              columns[None, :] == chosen[:, None], algebra.inverse(prior))
             return algebra.dq_step(carry, weights, cotangents, slopes, seen, k_tile, prior, scale=scale,
-                                   kinds=score_kinds, summed=summed, dot=interpreted_dot)
+                                   kinds=score_kinds, summed=summed, dot=interpreted_dot, accurate=how.exact)
 
         nothing = jnp.zeros((block_q,), jnp.float32)
         rows_sums = tuple(nothing for _ in score_kinds)
@@ -367,7 +367,8 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
                                              algebra.inverse(denominator))
             pulled, pieces = algebra.pulled(cotangents, slopes, seen, score_kinds)
             dv = dv + interpreted_dot(*algebra.value_operands(exponentials, weights, do, denominator))
-            dk = dk + algebra.cotangent_product(pulled * scale, q, interpreted_dot, transposed=True)
+            dk = dk + algebra.cotangent_product(pulled * scale, q, interpreted_dot, transposed=True,
+                                                accurate=how.exact)
             tiled = tuple(jax.lax.dynamic_update_slice_in_dim(entries, piece, i * block_q, axis=0)
                           for entries, piece in zip(tiled, (piece for kind, piece in zip(score_kinds, pieces,
                                                                                        strict=True)

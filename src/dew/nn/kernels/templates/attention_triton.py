@@ -584,7 +584,7 @@ def _dq_kernel(bounds_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: tu
                                                    delta, seen, q_pos, k_pos, params, key_index=key_index,
                                                    scale=scale, how=how, interpret=interpret)
         return algebra.dq_step(carry, weights, cotangents, slopes, seen, key, prior, scale=scale,
-                               kinds=score_kinds, summed=summed, dot=product)
+                               kinds=score_kinds, summed=summed, dot=product, accurate=how.exact)
 
     nothing = jnp.zeros((block_q,), jnp.float32)
     rows = tuple(nothing for _ in score_kinds)
@@ -643,7 +643,8 @@ def _dkv_kernel(ranges_ref, start_ref, end_ref, *refs, ids: bool, score_kinds: t
         logits, pieces = algebra.pulled(cotangents, slopes, seen, score_kinds)
         dv = dv + kernel_dot(*algebra.value_operands(exponentials, weights, dout, total_ref[rows]), interpret)
         # Scaled before it meets the queries, to fp32's accuracy (`algebra.cotangent_product`).
-        dk = dk + algebra.cotangent_product(logits * scale, query, product, transposed=True)
+        dk = dk + algebra.cotangent_product(logits * scale, query, product, transposed=True,
+                                            accurate=how.exact)
         for place, (kind, piece) in enumerate(zip(score_kinds, pieces, strict=True)):
             if kind == Kind.TILE:
                 # A tile parameter's entries, under the refined D (`algebra.refinement`).

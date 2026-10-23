@@ -1076,17 +1076,25 @@ def exponent_product(mantissa: jax.Array, exponent: jax.Array) -> jax.Array:
 
 def dq_step(sums: DqSums, weights: jax.Array, cotangents: jax.Array, slopes, seen: jax.Array, key: jax.Array,
             prior: jax.Array, *, scale: float, kinds: tuple, summed: tuple,
-            dot: Callable[[jax.Array, jax.Array], jax.Array]) -> DqSums:
+            dot: Callable[[jax.Array, jax.Array], jax.Array], accurate: bool = False) -> DqSums:
     """A dQ pass's sums after a key tile (`DqSums`): its score cotangents pulled through the score hook
-    (`pulled`) and scaled, times the keys to fp32's accuracy (`cotangent_product`); the HEAD and QUERY
-    parameters' pullbacks of them (`summed` marks which `kinds` sum per row); and the weights' own
-    pullbacks and their product with the keys over the prior denominator, which take dQ to the refined D
-    (`dq_finish`), the weights' sums unnormalized."""
+    (`pulled`) and scaled, times the keys (`cotangent_product`, to fp32's accuracy in the `accurate` form);
+    the HEAD and QUERY parameters' pullbacks of them (`summed` marks which `kinds` sum per row); and, in the
+    accurate form, the weights' own pullbacks and their product with the keys over the prior denominator,
+    which take dQ to the refined D (`dq_finish`), the weights' sums unnormalized."""
     pulled_cotangents, pieces = pulled(cotangents, slopes, seen, kinds)
-    dq = sums.dq + cotangent_product(pulled_cotangents * scale, key, dot)
+    dq = sums.dq + cotangent_product(pulled_cotangents * scale, key, dot, accurate=accurate)
     grads = tuple(grad + piece if row else grad for grad, row, piece in zip(sums.grads, summed, pieces,
                                                                            strict=True))
     pulled_weights, pieces = pulled(weights, slopes, seen, kinds)
+    if not accurate:
+        # The default form's dQ takes the first pass's D, as FlashAttention's: no correction to carry.
+        weighed = sums.weighed
+        if any(summed):
+            weighed = tuple(total + piece if row else total
+                            for total, row, piece in zip(sums.weighed, summed, pieces, strict=True))
+        return sums._replace(dq=dq, residual=sums.residual + cotangents.sum(axis=-1),
+                             mass=sums.mass + weights.sum(axis=-1), grads=grads, weighed=weighed)
     # The tile's coefficients against the keys, `pulled weight · scale / prior`, joined into the running
     # mean as a softmax's sums are joined under a running maximum. Each is held at its row's power of two,
     # never formed whole where it would overflow (a hook's slope near fp32's largest): the row's largest
@@ -1216,10 +1224,12 @@ def _fp16_scaled(x: jax.Array) -> tuple[jax.Array, jax.Array]:
 
 def cotangent_product(cotangents: jax.Array, operand: jax.Array,
                       dot: Callable[[jax.Array, jax.Array], jax.Array], *,
-                      transposed: bool = False) -> jax.Array:
+                      transposed: bool = False, accurate: bool = False) -> jax.Array:
     """A tile's score cotangents `[bq, bk]` (fp32, scaled) times the call's queries or keys `operand` (its
-    transpose's product where `transposed`: dK's `dSᵀ Q`, else dQ's `dS K`), in fp32 to fp32's accuracy, as
-    the reference differentiates (its score cotangents are fp32), so a key's or a query's gradient whose
+    transpose's product where `transposed`: dK's `dSᵀ Q`, else dQ's `dS K`). The default form rounds the
+    cotangents to the operand's dtype for one product, as FlashAttention does. The accurate form
+    (`accurate`, `Forward.natural`) takes it to fp32's accuracy, as the reference differentiates (its score
+    cotangents are fp32), so a key's or a query's gradient whose
     cotangents cancel across the other axis loses no more than the reference's fp32 product does, where one
     16-bit product loses every bit the cancellation exposes. An fp32 operand takes the fp32 product. A bf16
     one takes three bf16 products, the cotangents split exactly into three bf16 parts (each what the parts
@@ -1230,8 +1240,8 @@ def cotangent_product(cotangents: jax.Array, operand: jax.Array,
     def oriented(x):
         return x.T if transposed else x
 
-    if operand.dtype == jnp.float32:
-        return dot(oriented(cotangents), operand)
+    if operand.dtype == jnp.float32 or not accurate:
+        return dot(oriented(cotangents.astype(operand.dtype)), operand)
     if operand.dtype == jnp.bfloat16:
         out, rest = None, cotangents
         for _ in range(3):
