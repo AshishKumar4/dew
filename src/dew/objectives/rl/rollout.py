@@ -77,8 +77,9 @@ def prompt_tasks(batch: Batch) -> list[Task]:
 
 @dataclasses.dataclass(frozen=True)
 class PromptTask:
-    """What `prompt_tasks` puts in a task: the prompt ids, the `PromptRecord` its reward reads and
-    its batch's prompt width."""
+    """What a single-turn prompt task holds (`prompt_tasks`): its prompt ids under `prompt`, the
+    `PromptRecord` its reward reads under `record`, and under `width` the width its batch padded
+    it to, which a task built outside a batch need not state: its own length is its width."""
 
     ids: tuple[int, ...]
     record: PromptRecord
@@ -86,10 +87,13 @@ class PromptTask:
 
     @classmethod
     def of(cls, task: Task) -> PromptTask:
-        ids, record, width = task.data.get("prompt"), task.data.get("record"), task.data.get("width")
-        if not (isinstance(ids, tuple) and isinstance(record, PromptRecord) and type(width) is int):
-            raise TypeError(f"task {task.id!r} is not a prompt_tasks task: it needs prompt ids, "
-                            "a PromptRecord and its batch's width")
+        ids, record = task.data.get("prompt"), task.data.get("record")
+        if not (isinstance(ids, tuple) and isinstance(record, PromptRecord)):
+            raise TypeError(f"task {task.id!r} is not a prompt task: it needs prompt ids and a PromptRecord")
+        width = task.data.get("width", len(ids))
+        if type(width) is not int or width < len(ids):
+            raise TypeError(f"task {task.id!r} states a width of {width!r}, which must hold its {len(ids)} "
+                            "prompt ids")
         return cls(ids, record, width)
 
 
@@ -130,7 +134,7 @@ class PolicyCollector:
 
     def collect(self, snapshot: Snapshot, tasks: Sequence[Task], samples: int) -> list[list[Session]]:
         prompts = [PromptTask.of(task) for task in tasks]
-        width = prompts[0].width
+        width = max(prompt.width for prompt in prompts)
         rows, fields = pad_token_rows([prompt.ids for prompt in prompts], pad_id=self.sampling.pad,
                                       width=width)
         inputs = ModelInputs(jnp.asarray(rows), {name: jnp.asarray(value) for name, value in fields.items()})
