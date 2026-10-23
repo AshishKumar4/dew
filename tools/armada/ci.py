@@ -818,12 +818,21 @@ def borrowed_records(names: list[str], python: str, held: str, token: str) -> di
     """For each of `names`, test files no run on class `held` measured, the class and last record of
     the whole file on another class whose run measured its GPU peak, the one that holds the most
     (`gpu_needs`): what a file has taken on a GPU, which a first lane on a class takes as its share.
-    One no class measured is absent. Its run on `held` records its own, which every later lane reads."""
+    One no class measured is absent, as every one is where the Worker does not list its records. Its run on
+    `held` records its own, which every later lane reads."""
     if not names:
         return {}
     prefix = f"{CACHE_PREFIX}/{python}/"
     wanted = set(names)
-    keys = [key for key in listed(prefix, token)
+    try:
+        every = list(store(token).keys(prefix))
+    # The Worker did not list its records: borrowing only packs a lane, so each such file runs alone with the
+    # lane's whole share, as one measured on no class does.
+    except r2.R2Error as error:
+        print(f"the test cache did not list {prefix}: {error}; files unmeasured here run alone",
+              file=sys.stderr)
+        return {}
+    keys = [key for key in every
             if key_parts(key)[0] != held and key_parts(key)[2] == "whole" and key_parts(key)[1] in wanted]
 
     def read(key: str) -> tuple[str, str, dict | None]:
