@@ -1099,8 +1099,9 @@ def dq_step(sums: DqSums, weights: jax.Array, cotangents: jax.Array, slopes, see
         # mantissa and exponent apart (`dq_finish`). One product, no exponent a row.
         scale_mantissa, scale_exponent = _split(jnp.float32(scale))
         keyed = sums.keyed + weights_product(weights * expand(inverse(prior), weights), key, dot)
-        return DqSums(dq, residual, mass, grads, weighed, keyed,
-                      jnp.full_like(sums.keyed_mass, scale_mantissa), jnp.full_like(sums.keyed_shift, scale_exponent))
+        mantissa = jnp.full_like(sums.keyed_mass, scale_mantissa)
+        return DqSums(dq, residual, mass, grads, weighed, keyed, mantissa,
+                      jnp.full_like(sums.keyed_shift, scale_exponent))
     # The tile's coefficients against the keys, `pulled weight · scale / prior`, joined into the running
     # mean as a softmax's sums are joined under a running maximum. Each is held at its row's power of two,
     # never formed whole where it would overflow (a hook's slope near fp32's largest): the row's largest
