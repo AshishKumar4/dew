@@ -267,9 +267,9 @@ def _chunk_delta_backward(chunk_size, delta, scale, dtype, residual, cotangent):
     boundaries. Replay C tokens from each entered memory, derive their terminal cotangents from
     `readout_entered_gradient` and the transitions, then reverse C tokens. Replaying keeps a token's
     erasure beside its decay, rather than cancelling separately rounded WY derivatives afterwards.
-    Checkpoint every SUB tokens, then replay one span at a time inside the reverse scan: the
-    memories kept are C/SUB checkpoints and one SUB-token span, not a memory for every token.
-    Both replays preserve the token recurrence's arithmetic and order."""
+    Checkpoint every SUB tokens, then bisect each span's replay: retain its midpoint, reverse the
+    right half, then the left. The memories kept are C/SUB checkpoints and log2(SUB) midpoints,
+    not a memory for every token. Replays and adjoints preserve the token recurrence's order."""
     del chunk_size, dtype
     query, key, value, g, beta, resets, entered, transition, decayed_query, weights, scores = residual
     cotangent, final_cotangent = cotangent
@@ -318,10 +318,22 @@ def _chunk_delta_backward(chunk_size, delta, scale, dtype, residual, cotangent):
         state_gradient, *gradients = pull((out_gradient, state_gradient))
         return state_gradient, tuple(gradients)
 
+    def reverse_interval(state_gradient, checkpoint, out_gradient, tokens):
+        count = out_gradient.shape[0]
+        if count == 1:
+            initial, gradients = adjoint(
+                state_gradient, (checkpoint, out_gradient[0], *(x[0] for x in tokens)))
+            return initial, tuple(x[None] for x in gradients)
+        middle = count // 2
+        first, second = (tuple(x[:middle] for x in tokens), tuple(x[middle:] for x in tokens))
+        midpoint, _ = jax.lax.scan(replay, checkpoint, first)
+        gradient, right = reverse_interval(state_gradient, midpoint, out_gradient[middle:], second)
+        initial, left = reverse_interval(gradient, checkpoint, out_gradient[:middle], first)
+        return initial, tuple(jnp.concatenate((x, y), axis=0) for x, y in zip(left, right, strict=True))
+
     def reverse_span(state_gradient, inputs):
         checkpoint, out_gradient, *tokens = inputs
-        _, before = jax.lax.scan(replay, checkpoint, tuple(tokens))
-        return jax.lax.scan(adjoint, state_gradient, (before, out_gradient, *tokens), reverse=True)
+        return reverse_interval(state_gradient, checkpoint, out_gradient, tuple(tokens))
 
     initial, gradients = jax.lax.scan(
         reverse_span, terminal, (checkpoints, span_major(cotangent), *span_tokens), reverse=True)
