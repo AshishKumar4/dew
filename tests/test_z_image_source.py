@@ -196,8 +196,9 @@ def streamed(source):
     return Pretrained.load(str(source / "pipeline"), dtype="float32", attention_impl="xla", mesh=MeshSpec())
 
 
-PIPELINE_SEEDS = {"prompts": 16, "walk": 16}
-"""Check 1's declared seeds for the pipeline's prompt encoding and its walk (to size)."""
+PIPELINE_SEEDS = {"prompts": 8, "walk": 8}
+"""Check 1's declared seeds for the pipeline's prompt encoding and its walk, sized by `seeds_for` on
+armada."""
 WORDS = ("a", "red", "cat", "on", "mat", "tiny", "photo", "of", "the", "blue", "sea", "under", "light")
 
 

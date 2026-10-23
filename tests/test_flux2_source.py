@@ -159,6 +159,7 @@ def test_the_forward_and_every_gradient_match_the_source(source, arrays, record,
 
 
 def nhwc(array):
+    """A host array, channels first, channels last."""
     return np.asarray(array).transpose(0, 2, 3, 1)
 
 
@@ -198,12 +199,15 @@ def autoencoder_check(autoencoder, params, narrow, wide, draw, label, seeds):
     `draw`'s images, codes and cotangents, its float64 walk the truth (check 1)."""
     from tools.diffusers_wan_reference import float64
 
+    def traced_nhwc(array):
+        return jnp.transpose(array, (0, 2, 3, 1))
+
     @jax.jit
     def native(image, probe_latent, code, probe):
         latent, grad_image = with_gradients(lambda image: autoencoder.encode(params, image))(
-            nhwc(image), nhwc(probe_latent))
+            traced_nhwc(image), traced_nhwc(probe_latent))
         pixels, grad_code = with_gradients(lambda code: autoencoder.decode(params, code))(
-            nhwc(code), nhwc(probe))
+            traced_nhwc(code), traced_nhwc(probe))
         return {"latent": latent, "grad_image": grad_image, "pixels": pixels, "grad_code": grad_code}
 
     def channels_last(walk):
@@ -294,9 +298,9 @@ def klein(source):
     return Pretrained.load(str(source / "pipeline"), dtype="float32", attention_impl="xla")
 
 
-PIPELINE_SEEDS = {"prompts": 16, "walk": 16, "mistral3": 16}
+PIPELINE_SEEDS = {"prompts": 8, "walk": 8, "mistral3": 8}
 """Check 1's declared seeds for the pipeline's prompt encoding, its walk and FLUX.2 [dev]'s Mistral-3
-encoding (to size)."""
+encoding, sized by `seeds_for` on armada."""
 WORDS = ("a", "red", "cat", "on", "mat", "tiny", "photo", "of", "the", "blue", "sea", "under", "light")
 
 
