@@ -26,7 +26,7 @@ from diffusion_stubs import StubText
 from diffusion_support import images_of
 from flax import linen as nn
 from recording import RecordingTracker
-from reference_error import assert_as_exact
+from reference_error import assert_as_exact, with_gradients
 from residual_orders import permuted, residual_width
 
 from dew.artifacts import ImageGrid, Representations, TokenScores, VideoGrid
@@ -449,6 +449,21 @@ def selections_forward(name: str):
         variables, tokens, capture_intermediates=selecting, mutable=["intermediates"]))
 
 
+def gate_margin(values: np.ndarray, sparsity: float) -> float:
+    """The smallest margin of Gemma 3n's gaussian top-k over gate rows `values`: each unit's distance
+    from its row's cutoff, the mean plus the sparsity's normal quantile times the population
+    deviation, as `dew.nn.mlp.gaussian_topk` forms it, over that deviation; the least kept unit's
+    height over the cutoff and the cutoff's over the greatest dropped one."""
+    from statistics import NormalDist
+
+    values = np.asarray(values, np.float64)
+    deviation = values.std(-1, keepdims=True)
+    cutoff = values.mean(-1, keepdims=True) + NormalDist().inv_cdf(sparsity) * deviation
+    kept = np.min(np.where(values > cutoff, values, np.inf), axis=-1, keepdims=True)
+    dropped = np.max(np.where(values > cutoff, -np.inf, values), axis=-1, keepdims=True)
+    return float(np.min(np.minimum(kept - cutoff, cutoff - dropped) / deviation))
+
+
 def selection_margin(case: Case, variables, tokens) -> float:
     """The smallest margin, over the forward of `variables`, of the model's
     discontinuous selections relative to their scale: the lightning indexer's top-k (the gap between
@@ -457,8 +472,6 @@ def selection_margin(case: Case, variables, tokens) -> float:
     population deviation, over that deviation, as `dew.nn.mlp.gaussian_topk` forms it). A query that
     sees no more keys than its budget, and an exact zero tie of relu'd scores, ordered alike by index
     in every run, decide nothing."""
-    from statistics import NormalDist
-
     fields = case.config.get("mixer", {}).get("fields", {})
     sparsities = case.config.get("activation_sparsity_pattern", ())
     margin, seen = np.inf, 0
@@ -469,14 +482,7 @@ def selection_margin(case: Case, variables, tokens) -> float:
         values = np.asarray(values, np.float64)
         if "gate_proj" in names:
             layer = int(next(name for name in names if name.startswith("layers_")).split("_")[1])
-            quantile = NormalDist().inv_cdf(sparsities[layer])
-            deviation = values.std(-1, keepdims=True)
-            cutoff = values.mean(-1, keepdims=True) + quantile * deviation
-            # As the indexer's: the least kept unit's height over the cutoff, and the cutoff's over
-            # the greatest dropped one, in the row's deviations.
-            kept = np.min(np.where(values > cutoff, values, np.inf), axis=-1, keepdims=True)
-            dropped = np.max(np.where(values > cutoff, -np.inf, values), axis=-1, keepdims=True)
-            margin = min(margin, float(np.min(np.minimum(kept - cutoff, cutoff - dropped) / deviation)))
+            margin = min(margin, gate_margin(values, sparsities[layer]))
             continue
         budget, (queries, keys) = fields["index_topk"], values.shape[-2:]
         if keys <= budget:
@@ -554,7 +560,14 @@ def test_architecture_trains_on_every_layout_as_on_one_device(case, tmp_path):
     difference, where a layout that dropped or repeated a row would fail by
     orders of magnitude. The steps check 1 draws are `fit`'s own on the
     run's batch, bit for bit, each compiled once for every draw. Adam's two
-    moments and its count follow the parameters' placement too."""
+    moments and its count follow the parameters' placement too. A feed-forward
+    that selects by gaussian top-k runs here at no sparsity: its backward and
+    AltUp's router cancel, so a whole step's float32 error has a tail no seed
+    count resolves, and those pieces are held over the same layouts on their
+    own (`test_gemma3n_selecting_pieces_compute_on_every_layout_as_on_one_device`)."""
+    sparsities = case.config.get("activation_sparsity_pattern")
+    if sparsities is not None and any(sparsities):
+        case = replace(case, config={**case.config, "activation_sparsity_pattern": (0.0,) * len(sparsities)})
     trainer, encoder = make_trainer(case, tmp_path / "initial", 1, devices=1)
     initial = trainer.initial_state()
 
@@ -684,3 +697,72 @@ def test_a_val_metric_records_its_own_constructors_defaults():
         DiffusionRunConfig.cli(["--val-metrics", '["psnr"]'])
     with pytest.raises(TypeError):
         replace(run, val_metrics=("psnr",))
+
+
+SELECTING_SEEDS = {"8x1 data": 16, "2x4 fsdp": 16}
+"""The selecting pieces' declared seeds for check 1 on each layout (to size)."""
+
+
+class Selecting(nn.Module):
+    """Gemma 3n's first layer's selecting pieces, as the layout cell's gemma3n holds them: AltUp's
+    prediction over three copies of the residual (its modality router), the gaussian top-k
+    feed-forward at sparsity 0.95 on the active copy, and AltUp's correction."""
+
+    @nn.compact
+    def __call__(self, streams):
+        from dew.nn.gemma3n import AltUp, AltUpLayer
+        from dew.nn.mlp import GatedMLP
+
+        altup = AltUpLayer(spec=AltUp(num_inputs=3), emb_features=LM["emb_features"], name="altup")
+        predictions = altup.predict(streams)
+        hidden = GatedMLP(hidden_features=48, out_features=LM["emb_features"], activation="geglu",
+                          activation_sparsity=0.95, name="mlp")(predictions[0])
+        return altup.correct(predictions, hidden)
+
+
+@pytest.mark.parametrize("layout", ["8x1 data", "2x4 fsdp"])
+def test_gemma3n_selecting_pieces_compute_on_every_layout_as_on_one_device(layout):
+    """AltUp's router and the gaussian top-k feed-forward, whose cancelling backward the gemma3n
+    layout cell leaves out, placed as that cell places them (8x1 data parallelism, 2x4 fsdp over
+    parameters below `TINY_SHARD` and above), compute their output and the gradients into the
+    streams and every parameter as one device does, from the float64 run (check 1), over drawn
+    streams, parameters and cotangents whose gate clears the selection margin (`gate_margin`)."""
+    from jax.sharding import NamedSharding, PartitionSpec
+
+    from dew.nn.sharding import batch_axes
+
+    module = Selecting()
+    streams_shape = (3, BATCH, LONG_SEQ_LEN, LM["emb_features"])
+    init = jax.jit(module.init)
+    gate = jax.jit(lambda variables, streams: module.apply(
+        variables, streams, capture_intermediates=lambda layer, method: layer.name == "gate_proj",
+        mutable=["intermediates"])[1])
+
+    def draw(seed):
+        for attempt in range(64):
+            rng = np.random.default_rng([seed, attempt])
+            streams = rng.standard_normal(streams_shape).astype(np.float32)
+            variables = jax.device_get(init(jax.random.key(seed * 64 + attempt), streams))
+            gates = jax.tree.leaves(gate(variables, streams))
+            if gate_margin(np.asarray(gates[0]), 0.95) > MARGIN:
+                cotangent = rng.standard_normal(streams_shape).astype(np.float32)
+                return variables["params"], streams, cotangent
+        raise AssertionError(f"no draw of seed {seed} clears the selection margin {MARGIN}")
+
+    def run(params, streams, cotangent):
+        return with_gradients(lambda params, streams: module.apply({"params": params}, streams))(
+            params, streams, cotangent)
+
+    one_device = jax.jit(run)
+    mesh = (MeshSpec() if layout == "8x1 data" else MeshSpec(fsdp=4)).build(jax.devices())
+    rows = NamedSharding(mesh, PartitionSpec(None, batch_axes(mesh)))
+    shapes = jax.eval_shape(init, jax.random.key(0), jnp.zeros(streams_shape))["params"]
+    placement = Layout(min_shard=TINY_SHARD).shardings(mesh, shapes)
+    laid = jax.jit(run, in_shardings=(placement, rows, rows))
+
+    def placed(params, streams, cotangent):
+        with jax.set_mesh(mesh):
+            return jax.device_get(laid(params, streams, cotangent))
+
+    assert_as_exact(placed, one_device, draw, f"gemma3n selecting pieces, {layout}",
+                    seeds=SELECTING_SEEDS[layout])
