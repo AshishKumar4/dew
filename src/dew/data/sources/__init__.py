@@ -8,12 +8,12 @@ from os import PathLike, fspath
 from .base import Read, Shard, ShardManifest, Source
 from .concatenate import Concatenate
 from .files import Files, Format, _inferred
-from .grain import Grain, from_grain
-from .hf import HF, from_hf
+from .grain import from_grain
+from .hf import from_hf
 from .hub import Hub
-from .iterator import Iterated, from_iter
+from .iterator import from_iter
 from .memory import DataFrame, Memory
-from .pytorch import Torch, from_torch
+from .pytorch import from_torch
 from .tfds import TFDS
 from .tokens import _SPLIT as _ONE_SPLIT, TokenFiles
 
@@ -59,20 +59,16 @@ def source(
 
 
 __all__ = [
-    "HF",
     "TFDS",
     "Concatenate",
     "Files",
-    "Grain",
     "Hub",
-    "Iterated",
     "Memory",
     "Read",
     "Shard",
     "ShardManifest",
     "Source",
     "TokenFiles",
-    "Torch",
     "from_grain",
     "from_hf",
     "from_iter",

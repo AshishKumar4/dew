@@ -35,22 +35,13 @@ from flax import linen as nn
 from flax.linen.dtypes import promote_dtype
 from flax.typing import Dtype, PrecisionLike
 
-from dew.nn.dense import Dense
-
-from .attention import (
-    LayerNorm,
-    cached_validity,
-    causal_attention_mask,
-    kernel_for_materialized_mask,
-    max_attention_logits,
-    scaled_dot_product_attention,
-)
+from .attention import LayerNorm, causal_attention_mask, kernel_for_materialized_mask
 from .inputs import PLAIN_CALL, MixerCall, PredictionPhase, coordinates_of, valid_order
 from .mixer_base import ATTENTION_CONTEXT_RESIDUALS, MixerBase, MixerContext
-from .mla import INDEXER, MultiHeadLatentAttention, latent_refusals, open_mla_cache
-from .precision import at_least_fp32, float32_dot_general, float32_einsum
+from .mla import INDEXER, IndexerFront, MultiHeadLatentAttention, latent_refusals, open_latent_cache
+from .precision import at_least_fp32, float32_einsum
 from .sharding import down_projection
-from .sparse_selection import index_scores, selection_mask, top_k_selection
+from .sparse_selection import selection_mask, top_k_selection
 
 
 def _real_slots(valid, count: int):
@@ -68,7 +59,7 @@ def _real_slots(valid, count: int):
 # wq_b, wk, k_norm and weights_proj carry the V3.2 indexer's declarations
 # under the same names; the pool compression's two tables have no side worth
 # naming and take the shape heuristic.
-class KPoolIndexer(nn.Module):
+class KPoolIndexer(IndexerFront, nn.Module):
     """The k-pool indexer: which keys each query attends, by pools
     (`Glm5NextTextIndexer`, modeling_glm5_next.py:736-1024).
 
@@ -98,13 +89,10 @@ class KPoolIndexer(nn.Module):
             raise ValueError(
                 f"the pool budget is index_topk // index_kpool whole pools, so index_topk "
                 f"({self.top_k}) must be divisible by index_kpool ({self.kpool})")
-        dense = functools.partial(Dense, use_bias=False, dtype=self.dtype, precision=self.precision,
-                                  dot_general=float32_dot_general)
-        self.wq_b = dense(self.n_heads * self.head_dim, name='wq_b')
+        dense = self.declare_front()
         self.wk = dense(self.head_dim, name='wk')
         # A LayerNorm with weight and bias at a hardcoded 1e-6 (modeling_glm5_next.py:763).
         self.k_norm = LayerNorm(epsilon=1e-6, dtype=self.dtype, name='k_norm')
-        self.weights_proj = dense(self.n_heads, name='weights_proj')
         self.index_kpool_compress_ape = self.param(
             'index_kpool_compress_ape', nn.initializers.zeros, (self.kpool, self.head_dim), jnp.float32)
         self.index_kpool_compress_gate = self.param(
@@ -185,9 +173,8 @@ class KPoolIndexer(nn.Module):
         batch, length, _ = x.shape
         total = packed.shape[1]
         valid = packed[..., -1] > 0
-        query = self.wq_b(q_resid).reshape(batch, length, self.n_heads, self.head_dim)
         pool_keys, pool_indices, pool_valid = self._pools(packed)
-        scores = index_scores(query, pool_keys, self.weights_proj(x), self.precision)
+        scores = self.scored(self.queries(q_resid), pool_keys, x)
         # A pool is a candidate iff the query sees its last token
         # (modeling_glm5_next.py:832-839); its indices are clamped only so
         # the gather is legal, the validity test excludes it on its own.
@@ -288,14 +275,13 @@ class KPoolSparseAttention(MultiHeadLatentAttention):
         if decode:
             allocated = self.has_variable("cache", "cache_index")
             committed = self.get_variable("cache", "cache_index")
-            slots, append = open_mla_cache(self, ("cached_key", "cached_value"), key, value, packed,
-                                           self.max_seq_len, valid=valid)
+            slots, append = open_latent_cache(self, key, self.v_head_dim, packed, self.max_seq_len,
+                                              valid=valid)
             key, value, packed = append(key, value, packed)
             # The reference's static cache: keys at every slot, causality
             # by slot against the query's, validity from the cache
             # (`get_visible_tokens`, modeling_glm5_next.py:879-897).
-            visible = causal_attention_mask(
-                slots, key.shape[1], key_valid=cached_validity(self, key.shape[1]))[:, 0]
+            visible = self._visible(slots, key.shape[1])[:, 0]
             # SGLang 97c6978 index_topk_share.py:22-28,48-64 carries the complete
             # token list; draft hits must not append the new query's tail.
             if prediction_phase != "ordinary" or self.has_variable("cache", "selection_position"):
@@ -345,23 +331,13 @@ class KPoolSparseAttention(MultiHeadLatentAttention):
         selected = selection_mask(indices, key.shape[1])
         # An invalid query selects nothing (modeling_glm5_next.py:875).
         mask = jnp.logical_and(selected, row_valid[:, :, None])[:, None]
-        # The per-head maxima the QK-Clip reads, over the selected keys,
-        # with the nope width the clip splits the latent projections by.
-        if self._qk_open():
-            self.sow("qk", "max_logits", max_attention_logits(query, key, mask=mask))
-            self.sow("qk", "qk_nope", jnp.asarray(self.qk_nope_head_dim))
-        attention = scaled_dot_product_attention(
-            query, key, value, dtype=self.dtype, precision=self.precision,
-            force_fp32_for_softmax=self.force_fp32_for_softmax,
-            implementation=implementation, mask=mask)
         # A valid query that selects no pool, one of the first tokens before
         # a pool completes where no tail is always selected, reads every key
         # alike in the reference, whose masked logits are all equal there;
         # attention itself reads nothing for a row that sees no key.
         unselected = jnp.logical_and(row_valid, ~jnp.any(selected, -1))[:, :, None, None]
-        uniform = jnp.mean(value.astype(jnp.float32), axis=1, keepdims=True).astype(attention.dtype)
-        attention = jnp.where(unselected, uniform, attention)
-        return self._output(attention, x)
+        return self._attend(query, key, value, x, mask, implementation, unselected=unselected,
+                            force_fp32_for_softmax=self.force_fp32_for_softmax)
 
 
 @dataclasses.dataclass(frozen=True)

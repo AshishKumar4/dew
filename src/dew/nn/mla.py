@@ -28,11 +28,11 @@ from jax.ad_checkpoint import checkpoint_name
 from dew.nn.attention import (
     LayerNorm,
     RMSNorm,
-    cache_positions,
     cached_validity,
     causal_attention_mask,
     kernel_for_materialized_mask,
     max_attention_logits,
+    open_kv_cache,
     scaled_dot_product_attention,
 )
 from dew.nn.dense import Dense
@@ -57,37 +57,22 @@ from dew.nn.sharding import RESIDUAL, LogicalAxes, constrain, down_projection, l
 from dew.nn.sparse_selection import index_scores, selection_mask, sparse_latent_attention, top_k_selection
 
 
-def open_mla_cache(module: nn.Module, names: tuple[str, str], first, second, index_keys,
-                   max_seq_len: int, *, valid=None):
-    """Open a compact per-row decode cache of two tensors, `first` and `second`
-    under `names`, and of the sparse indexer's keys when `index_keys` is given.
+def open_latent_cache(module: nn.Module, key, value_dim: int, index_keys, max_seq_len: int, *, valid=None):
+    """Open a sparse latent attention's decode cache: its expanded keys and values, as DeepSeek V3.2
+    stores them, through the attention cache (`open_kv_cache`), and the sparse indexer's keys beside
+    them where `index_keys` is given (None on a layer that owns no indexer and reads another layer's
+    selection). Returns the [B, S] slots and an `append` that writes the new rows and returns the
+    whole cache, the index keys last or None."""
+    positions, written = open_kv_cache(module, key, max_seq_len, valid=valid, value_dim=value_dim)
+    cached_index = None if index_keys is None else module.variable(
+        "cache", "cached_index", jnp.zeros, (key.shape[0], max_seq_len, index_keys.shape[-1]),
+        index_keys.dtype)
 
-    Dense MLA caches its latent and the latent's rotary part; the sparse
-    variants cache the expanded keys and values, as DeepSeek V3.2 stores
-    them. `index_keys` is None on a layer that owns no indexer and reads
-    another layer's selection. Returns the [B, S] slots and an `append` that
-    writes the new rows and returns the whole cache, the index keys last or
-    None.
-    """
-    batch, length = first.shape[:2]
-    if valid is None and length > max_seq_len:
-        raise ValueError(f"{length} tokens do not fit a cache of {max_seq_len}.")
-    cached = [module.variable("cache", name, jnp.zeros, (batch, max_seq_len, *array.shape[2:]), array.dtype)
-              for name, array in zip(names, (first, second), strict=True)]
-    cached_index = None
-    if index_keys is not None:
-        cached_index = module.variable("cache", "cached_index", jnp.zeros,
-                                       (batch, max_seq_len, index_keys.shape[-1]), index_keys.dtype)
-    positions, allocated = cache_positions(module, batch, length, valid)
-
-    def append(new_first, new_second, new_index_keys):
-        if allocated:
-            for variable, rows in zip(cached, (new_first, new_second), strict=True):
-                variable.value = write_cache(variable.value, rows, positions)
-            if cached_index is not None:
-                cached_index.value = write_cache(cached_index.value, new_index_keys, positions)
-        full_index = None if cached_index is None else cached_index.value
-        return cached[0].value, cached[1].value, full_index
+    def append(new_key, new_value, new_index_keys):
+        full_key, full_value = written(new_key, new_value)
+        if cached_index is not None and written.allocated:
+            cached_index.value = write_cache(cached_index.value, new_index_keys, written.positions)
+        return full_key, full_value, None if cached_index is None else cached_index.value
 
     return positions, append
 
@@ -154,6 +139,41 @@ def _rotate(interleave: bool, part, freqs_cos, freqs_sin):
     return rotate(deinterleaved(part) if interleave else part, freqs_cos, freqs_sin)
 
 
+class IndexerFront:
+    """The lightning indexers' shared front end, mixed into each (V3.2's `SparseIndexer`, GLM's
+    k-pool, DeepSeek V4's CSA2): the query residual projected by `wq_b` into `n_heads` heads of
+    `head_dim`, the hidden state by `weights_proj` into a weight a head, and the queries scored
+    against keys by `index_scores`, at least in fp32 and under the indexer's `precision`, the inputs
+    detached as the references detach them. Each indexer declares its own keys (`wk` and its
+    `k_norm`) beside these, turns its queries as its reference does, and selects as it does."""
+
+    # The fields of the module this mixes into, which declares them; a mixin's annotations are no
+    # dataclass fields of their own.
+    n_heads: int
+    head_dim: int
+    dtype: Dtype | None
+    precision: PrecisionLike
+
+    def declare_front(self) -> Callable[..., Dense]:
+        """Declare `wq_b` and `weights_proj`, from the indexer's `setup`, and return the bias-free
+        projection at its `dtype` and `precision` they are, for the indexer's own keys."""
+        dense = functools.partial(Dense, use_bias=False, dtype=self.dtype, precision=self.precision,
+                                  dot_general=float32_dot_general)
+        self.wq_b = dense(self.n_heads * self.head_dim, name='wq_b')
+        self.weights_proj = dense(self.n_heads, name='weights_proj')
+        return dense
+
+    def queries(self, q_resid):
+        """The indexer's queries `[B, S, n_heads, head_dim]` of the detached query residual."""
+        batch, length = q_resid.shape[:2]
+        return self.wq_b(jax.lax.stop_gradient(q_resid)).reshape(batch, length, self.n_heads, self.head_dim)
+
+    def scored(self, query, keys, hidden):
+        """`query`'s scores against `keys` `[B, S, T]`, its heads weighted by `weights_proj` of the
+        detached `hidden` (`index_scores`)."""
+        return index_scores(query, keys, self.weights_proj(jax.lax.stop_gradient(hidden)), self.precision)
+
+
 @logical_axes({
     ("wq_b",): ("qlora", "index"),
     ("wk",): ("embed", "index"),
@@ -162,7 +182,7 @@ def _rotate(interleave: bool, part, freqs_cos, freqs_sin):
     # Maps the hidden states onto one weight per indexer head.
     ("weights_proj",): ("embed", "index"),
 })
-class SparseIndexer(nn.Module):
+class SparseIndexer(IndexerFront, nn.Module):
     """DeepSeek sparse attention's lightning indexer: a score per query and key.
 
     `modeling_deepseek_v32.DeepseekV32Indexer`: `wq_b` reads the query residual,
@@ -188,15 +208,11 @@ class SparseIndexer(nn.Module):
                 f"the indexer rotates a {self.rope_head_dim}-wide rope slice "
                 f"out of heads of width {self.head_dim}, so the heads have "
                 "to be wider")
-        dense = functools.partial(
-            Dense, use_bias=False, dtype=self.dtype, precision=self.precision,
-            dot_general=float32_dot_general)
-        self.wq_b = dense(self.n_heads * self.head_dim, name='wq_b')
+        dense = self.declare_front()
         self.wk = dense(self.head_dim, name='wk')
         # A LayerNorm with weight and bias at a hardcoded 1e-6: the reference
         # names no config for it (modeling_deepseek_v32.py, DeepseekV32Indexer).
         self.k_norm = LayerNorm(epsilon=1e-6, dtype=self.dtype, name='k_norm')
-        self.weights_proj = dense(self.n_heads, name='weights_proj')
 
     def keys(self, hidden):
         """The indexer's keys for these hidden states: `[B, S, head_dim]`."""
@@ -221,15 +237,10 @@ class SparseIndexer(nn.Module):
         fp32: the head weighting multiplies by `n_heads ** -0.5` in fp32 in
         the reference, and the relu keeps only the positive agreements.
         """
-        hidden = jax.lax.stop_gradient(hidden)
-        q_resid = jax.lax.stop_gradient(q_resid)
-        batch, length, _ = hidden.shape
-        query = self.wq_b(q_resid).reshape(
-            batch, length, self.n_heads, self.head_dim)
-        q_rot, q_pass = jnp.split(query, [self.rope_head_dim], axis=-1)
+        q_rot, q_pass = jnp.split(self.queries(q_resid), [self.rope_head_dim], axis=-1)
         query = jnp.concatenate(
             [_rotate(self.rope_interleave, q_rot, freqs_cos, freqs_sin), q_pass], axis=-1)
-        return index_scores(query, keys, self.weights_proj(hidden), self.precision)
+        return self.scored(query, keys, hidden)
 
     def select(self, scores, keep):
         """The top-k keys of each query among those `keep` allows, as
@@ -592,18 +603,7 @@ class MultiHeadLatentAttention(nn.Module):
                 implementation, query, key, dtype=self.dtype, precision=self.precision)
         if objective is not None:
             self._sow_indexer_kl(*objective, query, key)
-        # The per-head maxima the QK-Clip reads, with the nope width the
-        # clip needs to split the latent projections: computed only when a
-        # caller opened the collection. Under the sparse indexer the mask
-        # holds the selected keys, so the maximum is over those.
-        if self._qk_open():
-            self.sow("qk", "max_logits", max_attention_logits(
-                query, key, causal=causal, mask=mask))
-            self.sow("qk", "qk_nope", jnp.asarray(self.qk_nope_head_dim))
-        attention = scaled_dot_product_attention(
-            query, key, value, dtype=self.dtype, precision=self.precision,
-            implementation=implementation, causal=causal, mask=mask)
-        return self._output(attention, x)
+        return self._attend(query, key, value, x, mask, implementation, causal=causal)
 
     def _decode_step(self, x, q_rot, rot, latent, q_resid, logical_positions, valid, kv_store):
         """One decode step's rotated query heads, its keys and values with the
@@ -617,11 +617,10 @@ class MultiHeadLatentAttention(nn.Module):
         if self.sparse:
             # The cache is shaped by the expansion; its values are
             # recomputed after rotation below, so only shapes flow here.
-            shape_key, shape_value = self._expand(latent, rot)
+            shape_key, _ = self._expand(latent, rot)
             index_keys = self.indexer.keys(x) if self.indexed else None
-            positions, append = open_mla_cache(
-                self, ("cached_key", "cached_value"), shape_key, shape_value, index_keys,
-                self.max_seq_len, valid=valid)
+            positions, append = open_latent_cache(self, shape_key, self.v_head_dim, index_keys,
+                                                  self.max_seq_len, valid=valid)
             q_rot, rot, freqs_cos, freqs_sin = self._rotated(
                 q_rot, rot,
                 positions if logical_positions is None else logical_positions)
@@ -634,23 +633,50 @@ class MultiHeadLatentAttention(nn.Module):
                 assert q_resid is not None
                 index_scores = self.indexer.scores(
                     x, q_resid, index_full, freqs_cos, freqs_sin)
-            keep = causal_attention_mask(
-                positions, key.shape[1],
-                key_valid=cached_validity(self, key.shape[1]))[:, 0]
+            keep = self._visible(positions, key.shape[1])[:, 0]
             mask = selection_mask(self._select(index_scores, keep, kv_store),
                                   key.shape[1])[:, None]
         else:
-            positions, append = open_mla_cache(
-                self, ("cached_latent", "cached_rot"), latent, rot, None,
-                self.max_seq_len, valid=valid)
+            # The latent and its rotary part, one head each, as the attention cache's keys and values.
+            positions, append = open_kv_cache(self, latent[:, :, None], self.max_seq_len, valid=valid,
+                                              value_dim=self.qk_rope_head_dim)
             q_rot, rot, _, _ = self._rotated(
                 q_rot, rot,
                 positions if logical_positions is None else logical_positions)
-            latent, rot, _ = append(latent, rot, None)
+            latent, rot = (part[:, :, 0] for part in append(latent[:, :, None], rot[:, :, None]))
             key, value = self._expand(latent, rot)
-            mask = causal_attention_mask(
-                positions, key.shape[-3], key_valid=cached_validity(self, key.shape[-3]))
+            mask = self._visible(positions, key.shape[1])
         return q_rot, key, value, mask
+
+    def _visible(self, slots, total: int):
+        """`[B, 1, T, total]`: which of the cache's `total` slots each query at `slots` sees, those up
+        to its own slot that hold a token."""
+        return causal_attention_mask(slots, total, key_valid=cached_validity(self, total))
+
+    def _attend(self, query, key, value, x, mask, implementation, *, causal: bool = False,
+                unselected=None, force_fp32_for_softmax: bool = True):
+        """The attention over `key` and `value` and its output projection, sowing the per-head
+        maxima QK-Clip reads where a caller opened the collection. A query `unselected` marks reads
+        every key alike, the mean of the values, as a selection that chose nothing does in the
+        reference, and `force_fp32_for_softmax` is a k-pool attention's own policy; a latent
+        attention's kind refuses any but the default (`latent_refusals`)."""
+        # The per-head maxima the QK-Clip reads, with the nope width the
+        # clip needs to split the latent projections: computed only when a
+        # caller opened the collection. Under a sparse selection the mask
+        # holds the selected keys, so the maximum is over those.
+        if self._qk_open():
+            self.sow("qk", "max_logits", max_attention_logits(
+                query, key, causal=causal, mask=mask))
+            self.sow("qk", "qk_nope", jnp.asarray(self.qk_nope_head_dim))
+        attention = scaled_dot_product_attention(
+            query, key, value, dtype=self.dtype, precision=self.precision,
+            force_fp32_for_softmax=force_fp32_for_softmax,
+            implementation=implementation, causal=causal, mask=mask)
+        if unselected is not None:
+            wide = value.astype(at_least_fp32(value.dtype))
+            uniform = jnp.mean(wide, axis=1, keepdims=True).astype(attention.dtype)
+            attention = jnp.where(unselected, uniform, attention)
+        return self._output(attention, x)
 
     def _qk_open(self) -> bool:
         return not self.is_initializing() and self.is_mutable_collection("qk")
