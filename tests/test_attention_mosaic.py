@@ -130,9 +130,9 @@ def test_a_causal_backward_of_more_keys_than_queries_is_on_par_interpreted():
     _check_backward("causal", (1, 64, 2, 1), accurate=False, interpret=True, keys=256)
 
 
-@pytest.mark.parametrize("accurate", [False, True], ids=["default", "accurate"])
-def test_the_launches_lower_for_an_h100(accurate):
-    """The forward and the backward's launches lower for an H100 on any host, as the GPU gate runs them."""
+def _lowered_for_an_h100(accurate: bool) -> tuple[str, str]:
+    """The forward's and the backward's StableHLO lowered for an H100 on any host, as the GPU gate runs
+    them, a causal call at the compiled shape."""
     rows, tokens, heads, kv_heads = SHAPES["compiled"]
     spans = template.spans(tokens, tokens, rows, causal=True)
     q = jax.ShapeDtypeStruct((rows, tokens, heads, 128), jnp.bfloat16)
@@ -143,11 +143,26 @@ def test_the_launches_lower_for_an_h100(accurate):
     residuals = (rows_shape, rows_shape, jax.ShapeDtypeStruct((rows, heads, tokens), jnp.int32), split)
     mesh = generation.gpu_mesh(Mesh(np.array(jax.devices()[:1]), ("data",)), "sm90")
     with generation.assumed("sm90"), jax.sharding.use_abstract_mesh(mesh):
-        jax.jit(functools.partial(attention_mosaic.forward, spans=spans)).trace(q, kv, kv).lower(
+        forward = jax.jit(functools.partial(attention_mosaic.forward, spans=spans)).trace(q, kv, kv).lower(
             lowering_platforms=("cuda",))
-        jax.jit(lambda q, k, v, dout, residuals: attention_mosaic.backward(
+        backward = jax.jit(lambda q, k, v, dout, residuals: attention_mosaic.backward(
             q, k, v, spans, None, dout, residuals=residuals, accurate=accurate)).trace(
             q, kv, kv, q, residuals).lower(lowering_platforms=("cuda",))
+    return forward.as_text(), backward.as_text()
+
+
+@pytest.mark.parametrize("accurate", [False, True], ids=["default", "accurate"])
+def test_the_launches_lower_for_an_h100(accurate):
+    """The forward and the backward's launches lower for an H100 on any host."""
+    _lowered_for_an_h100(accurate)
+
+
+@pytest.mark.parametrize(("accurate", "launches"), [(False, 1), (True, 2)], ids=["default", "accurate"])
+def test_the_fast_backward_is_one_launch(accurate, launches):
+    """The fast form's backward is one Mosaic GPU launch, its dK/dV program adding each tile's dQ; the
+    accurate form's is two, a dQ program and a dK/dV program under the D it refines between them."""
+    _, backward = _lowered_for_an_h100(accurate)
+    assert backward.count("@mosaic_gpu_v2(") == launches, backward.count("@mosaic_gpu_v2(")
 
 
 @ON_HOPPER
