@@ -727,10 +727,10 @@ does, and the worst row over a site's rows and seeds is the row whose truth is s
 LOWER_TAIL quantile of the factor that would fail equally exact pairs at both stages, both arms on one
 truth (`tools/gate_null_runs.py --rows`, its `row_controls`), the largest over 16, 256 and 2048 rows a
 draw and 8 and 64 declared seeds (20,000 runs each: 20.1 at one value, 6.0 at two), rounded up; its rate
-certified by the same controls at the layout that quantile came from. At ROW_FACTOR the controls fail such pairs 1.5e-2 of runs
-at one value a row and 1.5e-3 at two, and 7e-5 at three (bound 4.0e-4 at 99.9%) and none at four in
-28,000 runs. A local error a row of a value or two hides is check 2's to catch once it gates, each
-element within its operation's certified bound (tests/op_certificates.py, the target)."""
+certified by the same controls at the layout that quantile came from. At ROW_FACTOR the controls fail such
+pairs 1.5e-2 of runs at one value a row and 1.5e-3 at two, and 7e-5 at three (bound 4.0e-4 at 99.9%) and
+none at four in 28,000 runs. A local error a row of a value or two hides is check 2's to catch once it
+gates, each element within its operation's certified bound (tests/op_certificates.py, the target)."""
 
 
 PREVIOUS_TAILS = (5e-4, 5e-4)
@@ -778,9 +778,10 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
                     orders=None) -> None:
     """Check 1 of the gate: on par. Each leaf's RMS error from float64,
     pooled over the site's declared seeds, within PARITY times the reference's, and its worst row over
-    those seeds within ROW_FACTOR times the reference's worst; each row of float64 zero (below RESOLUTION
-    of its leaf where a live reference does not measure it, `_paired`) no further from it than
-    ROW_FACTOR times the reference on that row; every value finite.
+    those seeds within ROW_FACTOR times the reference's worst (NARROW_FACTORS' factor at rows of one or
+    two values); each row of float64 zero (below RESOLUTION of its leaf where a live reference does not
+    measure it, `_paired`) no further from it than ROW_FACTOR times the reference on that row; every
+    value finite.
 
     `draw(seed)` returns the inputs of one draw, the same for a seed on every run; `dew_fn(*inputs)`
     and `reference_fn(*inputs)` return the same tree, and truth is `reference_fn` on the inputs
