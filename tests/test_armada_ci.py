@@ -865,6 +865,42 @@ def test_a_task_reuses_a_green_row_only_on_the_cpu_class_and_inputs_it_ran_on(ci
 
 
 
+def test_a_reused_row_runs_again_only_when_what_its_test_process_runs_or_reads_changes(
+        ci, tmp_path, monkeypatch, cache_worker):
+    """A file's green row is kept across a change its tests never meet: the plan's own code (ci.py, which
+    runs outside every test process), and a Python file added that its tests neither run nor list; it runs
+    again once what its test process runs or reads changes: a plugin loaded into it, or a fixture."""
+    (tmp_path / "tests/test_kept.py").write_text(
+        "from pathlib import Path\n"
+        "def test_kept():\n"
+        "    with Path('runs').open('a') as runs: runs.write('x')\n")
+    interpreter(tmp_path, "3.12")
+    url, _, _ = cache_worker
+    monkeypatch.setattr(ci, "cpu_class", lambda: "GenuineIntel-6-143")
+    cached(monkeypatch, url)
+    (tmp_path / ".verdict").mkdir()
+    out = tmp_path / ".verdict/verdict.json"
+    armada = tmp_path / "tools/armada"
+    armada.mkdir(parents=True)
+    for tool in (ROOT / "tools/armada").glob("*.py"):
+        (armada / tool.name).write_text(tool.read_text())
+
+    def run():
+        assert armada_task(ci, monkeypatch, out)["exitCode"] == 0
+        return len((tmp_path / "runs").read_text())
+
+    changes = [(None, "", 1), ("tools/armada/ci.py", "# the plan's own code\n", 1),
+               ("src/unrelated.py", "VALUE = 1\n", 1), ("tests/helpers.py", "VALUE = 2\n", 1),
+               ("tools/armada/executed.py", "# a plugin loaded into it\n", 2),
+               ("tests/fixtures/data.json", "{}\n", 3)]
+    for path, text, runs in changes:
+        if path:
+            (tmp_path / path).parent.mkdir(parents=True, exist_ok=True)
+            with (tmp_path / path).open("a") as file:
+                file.write(text)
+        assert run() == runs, path
+
+
 def test_a_reused_row_runs_again_when_a_page_its_tests_read_or_a_directory_they_list_changes(
         ci, tmp_path, monkeypatch, cache_worker):
     """A test's inputs outside tests/ and src/ are its file's inputs too (executed.py): a documentation
