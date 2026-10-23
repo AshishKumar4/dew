@@ -174,11 +174,11 @@ VAE_SEEDS = {"vae": 8, "small_decoder": 16, "published": 16}
 download a network test's)."""
 
 
-def source_autoencoder_walk(model):
+def source_autoencoder_walk(model, device=None):
     """The source's walk of its autoencoder as `Flux2Pipeline` walks it, in the draw's dtype: its
     folded, normalized latent of an image and that latent's gradient under a cotangent, and its
     decode of a latent code (the inverse normalization, the unfold, `vae.decode`) and the code's
-    gradient under a cotangent (`torch_with_gradients`), channels first."""
+    gradient under a cotangent (`torch_with_gradients`, on `device`, the model's), channels first."""
     import torch
     from diffusers import Flux2Pipeline
 
@@ -195,8 +195,8 @@ def source_autoencoder_walk(model):
         return model.decode(Flux2Pipeline._unpatchify_latents(code * scale + mean)).sample
 
     def walk(image, probe_latent, code, probe):
-        latent, grad_image = torch_with_gradients(encode)(image, probe_latent)
-        pixels, grad_code = torch_with_gradients(decode)(code, probe)
+        latent, grad_image = torch_with_gradients(encode, device=device)(image, probe_latent)
+        pixels, grad_code = torch_with_gradients(decode, device=device)(code, probe)
         return {"latent": latent, "grad_image": grad_image, "pixels": pixels, "grad_code": grad_code}
     return walk
 
@@ -269,9 +269,11 @@ def test_the_published_autoencoder_matches_the_source(monkeypatch):
     float64: over drawn noisy versions of a smooth 128x192 image, codes and
     cotangents, the pipeline's folded, normalized latent, its whole decode and
     both their input gradients on par with the source's float32 (check 1,
-    `autoencoder_check`)."""
+    `autoencoder_check`). The source runs on a CUDA device where there is one,
+    its float32 in IEEE float32 (no TF32), its float64 truth in float64."""
     import copy
 
+    import torch
     from diffusers import AutoencoderKLFlux2
 
     from tools.diffusers_wan_reference import float64
@@ -280,7 +282,10 @@ def test_the_published_autoencoder_matches_the_source(monkeypatch):
     tool = tool_support.load("diffusers_flux2_reference")
     repo, revision = tool.PUBLISHED_VAE
     autoencoder, params, _, _ = load_flux2_vae(repo, revision=revision)
-    model = AutoencoderKLFlux2.from_pretrained(repo, subfolder="vae", revision=revision).eval()
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    monkeypatch.setattr(torch.backends.cuda.matmul, "allow_tf32", False)
+    monkeypatch.setattr(torch.backends.cudnn, "allow_tf32", False)
+    model = AutoencoderKLFlux2.from_pretrained(repo, subfolder="vae", revision=revision).eval().to(device)
     with float64():
         wide = copy.deepcopy(model).double()
     smooth = tool.smooth_image()
@@ -294,7 +299,7 @@ def test_the_published_autoencoder_matches_the_source(monkeypatch):
         return (image, *(rng.standard_normal(shape).astype(np.float32)
                          for shape in (folded, folded, smooth.shape)))
 
-    walks = (source_autoencoder_walk(model), source_autoencoder_walk(wide))
+    walks = (source_autoencoder_walk(model, device), source_autoencoder_walk(wide, device))
     autoencoder_check(autoencoder, params, *walks, draw,
                       "published autoencoder", VAE_SEEDS["published"])
 
