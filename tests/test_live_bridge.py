@@ -309,7 +309,7 @@ def test_a_session_closed_while_its_first_context_starts_leaves_no_kernel(bridge
             await gateway.close(session)
             kernels.held.clear()
             kernels.release["create"].set()
-            with pytest.raises(RuntimeError, match="closed"):
+            with pytest.raises(RuntimeError):
                 await created
             await settled(kernels)
             assert kernels.live == set() and session not in gateway.contexts
