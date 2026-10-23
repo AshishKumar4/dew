@@ -689,3 +689,27 @@ def test_a_bf16_querys_gradient_over_a_large_key_with_small_cotangents_is_exact(
         assert float(grads.query[0, 0, 0, 0]) == -(2.0 ** 116), name
     assert_same_bits(triton.query, portable.query, "a large bf16 key under small cotangents")
 
+
+def test_a_querys_gradient_from_a_state_near_fp32s_largest_over_a_tiny_weight_at_a_small_scale_is_finite():
+    """One key at logit -83 (a weight near 2^-120) resumed from a state of denominator 2^127 at maximum 0,
+    at a scale of 2^-40: the key's coefficient against its key, weight times scale over the denominator, is
+    near 2^-287, past fp32's range, and its share of dQ is below fp32's least value, so dQ is finite in both
+    mainloops (`algebra.NO_SHIFT` below every composed exponent, so a tile's running mass is never
+    subnormal) and the two agree to the bit."""
+    query = jnp.zeros((1, 1, 1, 16), jnp.float32).at[..., 0].set(1.0)
+    key = jnp.zeros((1, 1, 1, 16), jnp.float32).at[..., 0].set(-83.0 * 2.0 ** 40)
+    value = jnp.zeros((1, 1, 1, 16), jnp.float32).at[..., 0].set(1.0)
+    dout = jnp.ones((1, 1, 1, 16), jnp.float32)
+    spans = template.spans(1, 1, 1)
+    state = template.Initial(jnp.zeros((1, 1, 1)), jnp.full((1, 1, 1), 2.0 ** 127), jnp.zeros((1, 1, 1, 16)))
+    hooks = template.Hooks(initial=state)
+    tiles = {"block_q": 32, "block_k": 32, "pad": attention_triton.BLOCK}
+    with tuning.pinned({attention_triton.TritonBackward: joint(TILES[1])}):
+        triton = attention_triton.backward(query, key, value, spans, hooks, dout, scale=2.0 ** -40,
+                                           natural=True, interpret=True)
+    portable = attention_portable.backward(query, key, value, spans, hooks, dout, scale=2.0 ** -40,
+                                           natural=True, **tiles)
+    for name, grads in (("triton", triton), ("portable", portable)):
+        assert np.isfinite(np.asarray(grads.query)).all(), name
+    assert_same_bits(triton.query, portable.query, "a tiny weight beside a state near fp32's largest")
+
