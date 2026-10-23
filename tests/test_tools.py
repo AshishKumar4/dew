@@ -1576,9 +1576,10 @@ def test_a_module_rebound_for_every_caller_is_reported_outside_the_suite(tmp_pat
 # ---------------------------------------------------------------------------
 
 def test_the_data_benchmark_counts_a_grain_packing_and_dews_alike_as_the_objective_counts_them():
-    """The data benchmark counts a batch's tokens as the run's objective counts them (`real_lengths`),
-    whichever packer laid the batch out: Grain's first-fit windows, their documents named by segment
-    ids, and Dew's of the same documents, named by their coordinates, hold the same real tokens."""
+    """The data benchmark counts a batch's tokens and work as the run's objective counts them
+    (`real_lengths`, `training_flops`), whichever packer laid the batch out: Grain's first-fit
+    windows, laid out as Dew's read lays its own (`Coordinated`), hold the same real tokens as Dew's
+    windows of the same documents. An image's rows count, and its objective declares no work."""
     import grain.experimental as gx
     import grain.python as grain
 
@@ -1586,6 +1587,7 @@ def test_the_data_benchmark_counts_a_grain_packing_and_dews_alike_as_the_objecti
     from dew.data.dataset import DataPartition, Loading
     from dew.data.pipeline import Pipeline
     from dew.data.sources.memory import Memory
+    from dew.data.steps.generic import Coordinated
 
     tool = load("benchmark_data")
     worker = tool.Worker("dew", "text", Path("in"), Path("out"), tool.Measurement(seq_len=8))
@@ -1594,7 +1596,8 @@ def test_the_data_benchmark_counts_a_grain_packing_and_dews_alike_as_the_objecti
     rows = grain.MapDataset.source(documents).to_iter_dataset()
     native = list(gx.FirstFitPackIterDataset(rows, length_struct={"text": 9}, num_packing_bins=2,
                                              shuffle_bins=False))
-    stacked = {name: np.stack([window[name] for window in native]) for name in ("text", "text_segment_ids")}
+    stacked = {name: np.stack([window[name] for window in native]) for name in native[0]}
+    laid = Coordinated(("text",), None).map(stacked)
     loader = compile(Pipeline(Memory(documents)).pack(9, bins=2).batch(len(native)), read="memory",
                      loading=Loading(workers=0, threads=1, read_buffer=0))
     reader = loader.train(DataPartition())
@@ -1603,5 +1606,13 @@ def test_the_data_benchmark_counts_a_grain_packing_and_dews_alike_as_the_objecti
     finally:
         reader.close()
     expected = int(np.sum(objective.real_lengths(ours)))
-    counted = [tool.batch_counts(batch, objective)["tokens"] for batch in (stacked, ours)]
+    counted = [tool.batch_counts(batch, objective)["tokens"] for batch in (laid, ours)]
     assert counted == [expected, expected]
+    work = tool.Counted(iter([laid]), objective)
+    next(work)
+    assert work.counts.get()["model_flops"] == objective.training_flops(None, ours) > 0
+    image = tool.objective_for(tool.Worker("dew", "image", Path("in"), Path("out"), tool.Measurement()))
+    pictures = tool.Counted(iter([{"image": np.zeros((2, 8, 8, 3), np.uint8)}]), image)
+    next(pictures)
+    assert {key: value for key, value in pictures.counts.get().items() if key != "padded_tokens"} == {
+        "rows": 2, "tokens": 2, "model_flops": None}

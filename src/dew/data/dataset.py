@@ -663,6 +663,10 @@ class Loader:
     """What becomes of the records an epoch leaves short of a whole batch: read, carried into the
     next epoch by an order that reads on or kept and filled by one that keeps them, so an epoch's
     steps count their batch; or dropped, so they count none (`Tail`)."""
+    order_records: int | None = None
+    """The records a training read of a global order that ends hands out over all its passes, the
+    same on every share, by which a batch ramp ends its last step (`RampedStream`); None where the
+    order never ends or its read counts none ahead."""
 
     @property
     def steps_per_epoch(self) -> int | None:
@@ -1420,6 +1424,19 @@ def _global_position(state: Position) -> bytes:
     return state
 
 
+def _joined(kept: Batch, new: Batch) -> Batch:
+    """The rows of `kept` then `new`, a ramp's buffer as a read adds to it: a batch that marks its
+    real rows (`VALID_ROWS`), a kept short one, beside one that does not, all of whose rows are."""
+    if (VALID_ROWS in kept) != (VALID_ROWS in new):
+        kept, new = (batch if VALID_ROWS in batch else {**batch, VALID_ROWS: np.ones(rows_of(batch), bool)}
+                     for batch in (kept, new))
+
+    def join(held: list | np.ndarray, read: list | np.ndarray) -> list | np.ndarray:
+        return held + read if isinstance(held, list) else np.concatenate([held, read])
+
+    return jax.tree.map(join, kept, new, is_leaf=lambda column: isinstance(column, list))
+
+
 class RampedStream(Forwarding):
     """Grows a training stream's step over the run's first records.
 
@@ -1438,9 +1455,14 @@ class RampedStream(Forwarding):
 
     # MaxText reference: common/data_loader.py:122-176.
 
-    def __init__(self, source: Resumable, stages: Sequence[Stage], partition: DataPartition):
+    def __init__(self, source: Resumable, stages: Sequence[Stage], partition: DataPartition, *,
+                 tail: Tail = "dropped", order_records: int | None = None):
         self._source = source
         self._stages = tuple(stages)
+        # Where a global order ends, every share ends its last step at the same record: whole where
+        # its short last step is dropped, holding the order's last records, the rest filled, where
+        # it is read (`Loader.tail`).
+        self._tail, self._order_records = tail, order_records
         # The stages that end, the final batch running on after them.
         self._ramp = Ranges.ending(tuple(stage.records for stage in stages[1:]))
         self._partition = partition
@@ -1467,23 +1489,26 @@ class RampedStream(Forwarding):
     def __next__(self) -> Batch:
         stage = self._stage()
         rows = self._partition.rows(stage.batch)
+        left = None if self._order_records is None else self._order_records - self._records
+        if left is not None and (left <= 0 or (left < stage.batch and self._tail == "dropped")):
+            raise StopIteration
         while self._held is None or rows_of(self._held) < rows:
             read = next(self._source, None)
             if read is None:
-                if self._held is None or not rows_of(self._held):
-                    raise StopIteration
-                # A finite order that keeps its short last batch (`Loader.tail`): the step holds
-                # what is left, filled out, its own rows real.
-                step, self._held = FilledBatch(rows).map(self._held), None
-                self._records += stage.batch
-                return step
-            self._held = (
-                read
-                if self._held is None
-                else jax.tree.map(lambda kept, new: kept + new if isinstance(kept, list)
-                                  else np.concatenate([kept, new]), self._held, read,
-                                  is_leaf=lambda column: isinstance(column, list))
-            )
+                break
+            self._held = read if self._held is None else _joined(self._held, read)
+        if self._held is None or not rows_of(self._held):
+            raise StopIteration
+        if left is not None and left < stage.batch:
+            # The order's last step: its records the first `left` of the step, which this share's
+            # rows hold every count-th of from its own place on, the rest repeats.
+            step = FilledBatch(rows).map(take_batch(self._held, slice(min(rows, rows_of(self._held)))))
+            real = np.arange(rows) * self._partition.count + self._partition.index < left
+            self._held, self._records = None, self._records + stage.batch
+            return {**step, VALID_ROWS: np.asarray(step.get(VALID_ROWS, real), bool) & real}
+        if rows_of(self._held) < rows:
+            # The source ended short of a whole step, in an order whose end no read counted ahead.
+            raise StopIteration
         step = take_batch(self._held, slice(rows))
         self._held = take_batch(self._held, slice(rows, None))
         self._records += stage.batch
@@ -1537,7 +1562,8 @@ def ramped(dataset: Loader, ramp: Ramp) -> Loader:
         if isinstance(stream, Resumable):
             state = stream.get_state()
             if isinstance(state, bytes) and position.translates(state):
-                return RampedStream(stream, ramp.stages(dataset.batch, partition.window), partition)
+                return RampedStream(stream, ramp.stages(dataset.batch, partition.window), partition,
+                                    tail=dataset.tail, order_records=dataset.order_records)
         if isinstance(stream, Closeable):
             stream.close()
         raise TypeError(
