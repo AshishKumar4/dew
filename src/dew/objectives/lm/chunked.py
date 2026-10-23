@@ -49,6 +49,7 @@ from dew.nn.precision import (
     compensated_add,
     compensated_sum,
     compensated_total,
+    float32_einsum,
     float32_products,
     head_product,
     rounded_operand,
@@ -185,7 +186,7 @@ def _tile_logits(states, matrix, precision: jax.lax.PrecisionLike):
     `dew.nn.precision.head_product` takes it), so each logit rounds alike."""
     if precision is BF16:
         return bf16_product('td,vd->tv', states, matrix)
-    return jnp.einsum('td,vd->tv', states, matrix.astype(states.dtype),
+    return float32_einsum('td,vd->tv', states, matrix.astype(states.dtype),
                       precision=precision, preferred_element_type=at_least_fp32(states.dtype))
 
 
@@ -459,9 +460,9 @@ def _bounded_head_bwd(chunks, tile, precision, predict, temperature, picked, gro
             # cotangents stay fp32; only the product's two backward operands round.
             d_tile = jax.tree.map(jnp.add, d_tile, terms_tile)
             d_raw = _logits_cotangent(d_raw, precision)
-            states_tile = jnp.einsum('tv,vd->td', d_raw, product_matrix, precision=precision,
+            states_tile = float32_einsum('tv,vd->td', d_raw, product_matrix, precision=precision,
                                      preferred_element_type=work)
-            matrix_tile = jnp.einsum(
+            matrix_tile = float32_einsum(
                 'tv,td->vd', d_raw,
                 jax.lax.dynamic_slice_in_dim(flat, start, size).astype(operands), precision=precision,
                 preferred_element_type=work)
@@ -583,7 +584,7 @@ def _whole_head_bwd(chunks, precision, predict, temperature, picked, group, resi
     d_raw = _logits_cotangent(d_raw, precision)
     d_states = _state_product(d_raw, table.astype(operands), precision, work,
                               None if precision is BF16 else FP32_STATE_BLOCK)
-    d_table = jnp.einsum('tv,td->vd', d_raw, hidden.reshape(-1, features).astype(operands),
+    d_table = float32_einsum('tv,td->vd', d_raw, hidden.reshape(-1, features).astype(operands),
                          precision=precision, preferred_element_type=work)
     return (d_states.reshape(hidden.shape).astype(hidden.dtype), d_table.astype(table.dtype),
             None, None, d_cap, d_columns)
@@ -606,12 +607,12 @@ def _state_product(d_raw, table, precision, work, block: int | None) -> jax.Arra
     at once (`[blocks, tokens, features]`) and the blocks summed as a double-float pair
     (`compensated_sum`)."""
     if block is None or table.shape[0] <= block:
-        return jnp.einsum('tv,vd->td', d_raw, table, precision=precision, preferred_element_type=work)
+        return float32_einsum('tv,vd->td', d_raw, table, precision=precision, preferred_element_type=work)
     count = -(-table.shape[0] // block)
     pad = count * block - table.shape[0]
     blocks = jnp.pad(d_raw, ((0, 0), (0, pad))).reshape(d_raw.shape[0], count, block)
     rows = jnp.pad(table, ((0, pad), (0, 0))).reshape(count, block, table.shape[1])
-    parts = jnp.einsum('tnb,nbd->ntd', blocks, rows, precision=precision, preferred_element_type=work)
+    parts = float32_einsum('tnb,nbd->ntd', blocks, rows, precision=precision, preferred_element_type=work)
     # One reduction whose accumulator is a double-float pair, an overflowed block's infinity kept.
     return compensated_sum(parts, (0,))
 
@@ -803,10 +804,10 @@ def _fused_terms(hidden, table, labels, weights, z_loss: float, cap, columns: _C
                 (held[0], held[1]), (term.astype(work), jnp.zeros(term.shape, work))),
                 held[2] + term.astype(work))), d_columns, terms)
             d_raw = _logits_cotangent(d_raw, precision)
-            values.append(jnp.einsum('tv,vd->td', d_raw, product_matrix, precision=precision,
+            values.append(float32_einsum('tv,vd->td', d_raw, product_matrix, precision=precision,
                                      preferred_element_type=work))
             operand = jax.lax.dynamic_slice_in_dim(hidden, start, size).astype(operands)
-            d_table = d_table + jnp.einsum('tv,td->vd', d_raw, operand, precision=precision,
+            d_table = d_table + float32_einsum('tv,td->vd', d_raw, operand, precision=precision,
                                            preferred_element_type=work)
         outputs = tuple(jax.lax.dynamic_update_slice_in_dim(out, value, start, axis=0)
                         for out, value in zip(outputs, values, strict=True))

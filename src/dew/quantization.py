@@ -65,6 +65,7 @@ from flax.traverse_util import flatten_dict, unflatten_dict
 from dew.cache import QUANTIZED_TRACE
 from dew.nn.fake_quant import correctly_rounded_divide
 from dew.nn.kernels.generation import backend
+from dew.nn.precision import accumulated
 
 if TYPE_CHECKING:
     from qwix import QArray, QuantizationProvider
@@ -198,6 +199,15 @@ class Quantization:
         return _qwix_wrapped(model, _providers()[0](_rules(self, training=True)), self)
 
 
+@runtime_checkable
+class QuantizedClass(Protocol):
+    """A model class Qwix made for a `Quantization` (`_quantized`), which `_dew_quantization` names for the
+    programs that run it (`dew.nn.kernels.options.compiler_options` reads its dtypes,
+    `dew.inference.projections` its rules); a wrapper's class over it inherits it."""
+
+    _dew_quantization: ClassVar[Quantization]
+
+
 def _qwix_wrapped(model: nn.Module, provider: QuantizationProvider, wrapper: Quantization) -> nn.Module:
     """`model` with the matmuls of its `entry_methods` under Qwix's `provider`, in
     the class Qwix makes for the call, which names `wrapper` and the class it
@@ -221,7 +231,7 @@ def _qwix_wrapped(model: nn.Module, provider: QuantizationProvider, wrapper: Qua
 
 def _quantized(model: nn.Module, provider: QuantizationProvider, spec: Quantization) -> nn.Module:
     """`model` with the matmuls of its `entry_methods` under Qwix's `provider`, in the class Qwix
-    makes for the call, a `QuantizedClass` of `spec` (`dew.nn.kernels.options.compiler_options`),
+    makes for the call, a `QuantizedClass` of `spec`,
     each method tracing what it calls under the key `QUANTIZED_TRACE` gives the provider."""
     methods = entry_methods(model)
     quantized = _qwix().quantize_model(model, provider, methods=methods)
@@ -315,8 +325,9 @@ def _fp8_rows(values: jax.Array, rows: jax.Array, row_scales: jax.Array) -> jax.
     from dew.interop.codecs import fp8_block_cast
 
     codes, scales = fp8_block_cast(values, (1, values.shape[1]))
-    product = jax.lax.dot_general(codes.astype(jnp.float32), rows.astype(jnp.float32),
-                                  (((1,), (1,)), ((), ())), preferred_element_type=jnp.float32)
+    product = accumulated(functools.partial(jax.lax.dot_general, dimension_numbers=(((1,), (1,)), ((), ()))),
+                          codes.astype(jnp.float32), rows.astype(jnp.float32),
+                          preferred_element_type=jnp.float32)
     return product * scales * row_scales.T
 
 

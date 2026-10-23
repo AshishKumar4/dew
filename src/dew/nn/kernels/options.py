@@ -15,16 +15,24 @@ from dew.telemetry.devices import xla_flag
 if TYPE_CHECKING:
     from flax import linen as nn
 
-    from dew.quantization import Quantization
+
+class QuantizedDtypes(Protocol):
+    """What the options read of a run's quantization (`dew.quantization.Quantization`, above the kernels):
+    the dtypes its forward and backward quantize to."""
+
+    @property
+    def dtype(self) -> str: ...
+
+    @property
+    def bwd_qtype(self) -> str | None: ...
 
 
 @runtime_checkable
-class QuantizedClass(Protocol):
-    """A model class Qwix made for a `Quantization` (`dew.quantization`), which
-    `_dew_quantization` names for the programs that run it (`compiler_options`); a wrapper's class
-    over it inherits it."""
+class Quantized(Protocol):
+    """A model class that carries a run's quantization (`dew.quantization.QuantizedClass`), as the options
+    read it: its two dtypes."""
 
-    _dew_quantization: ClassVar[Quantization]
+    _dew_quantization: ClassVar[QuantizedDtypes]
 
 
 def compiler_options(*models: nn.Module) -> dict[str, bool]:
@@ -41,7 +49,7 @@ def compiler_options(*models: nn.Module) -> dict[str, bool]:
     and then the program does not compile rather than compute wrong. A run that sets
     `xla_gpu_enable_triton_gemm` in XLA_FLAGS keeps its own setting.
     """
-    specs = [layer._dew_quantization for layer in map(type, models) if isinstance(layer, QuantizedClass)]
+    specs = [layer._dew_quantization for layer in map(type, models) if isinstance(layer, Quantized)]
     int8 = any("int8" in (spec.dtype, spec.bwd_qtype) for spec in specs)
     if (not int8 or backend() != "gpu" or gpu_target().int8_triton_gemm
             or xla_flag("xla_gpu_enable_triton_gemm") is not None):

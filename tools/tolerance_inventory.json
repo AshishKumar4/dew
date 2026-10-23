@@ -265,10 +265,6 @@
    "comparisons": 5,
    "lane": "Models, Serving & RL"
   },
-  "tests/test_fp8_base.py": {
-   "comparisons": 2,
-   "lane": "Kernels"
-  },
   "tests/test_gemma3n.py": {
    "comparisons": 9,
    "lane": "Models, Serving & RL"
@@ -684,10 +680,6 @@
   "tests/test_source_schedulers.py": {
    "comparisons": 5,
    "lane": "Training"
-  },
-  "tests/test_sparse_attention.py": {
-   "comparisons": 5,
-   "lane": "Kernels"
   },
   "tests/test_speculative.py": {
    "comparisons": 2,

@@ -25,7 +25,8 @@ from dew import records
 from dew.interop.weights import ParamTree, placed
 from dew.nn.dense import Dense
 from dew.nn.inputs import sequence_blocks
-from dew.nn.precision import float32_dot_general, float32_products, products_dtype
+from dew.nn.precision import accumulated, float32_dot_general, float32_products, products_dtype
+from dew.nn.rope import sinusoid_frequencies, sinusoids
 from dew.registry import from_record
 
 from .activations import activation
@@ -249,9 +250,9 @@ def _block_context(x, chunk: int, left: int, right: int):
 def _position_signal(width: int, positions, dtype):
     """Embed each relative position as `width` sinusoids, sines then cosines."""
     half = width // 2
-    inv = jnp.exp(jnp.arange(half, dtype=jnp.float32) * (-math.log(10000.0) / max(half - 1, 1)))
-    angles = positions.astype(jnp.float32)[:, None] * inv[None, :]
-    return jnp.concatenate((jnp.sin(angles), jnp.cos(angles)), axis=-1).astype(dtype)
+    # `exp(-ln(10000) i / (half - 1))`, which is `10000 ** (-i / (half - 1))`, rounded once from float64.
+    inv = jnp.asarray(sinusoid_frequencies(half, max(half - 1, 1), dtype=np.float32))
+    return sinusoids(positions.astype(jnp.float32)[:, None] * inv[None, :]).astype(dtype)
 
 
 def _relative_logits(query, key, positional, precision: PrecisionLike = None):
@@ -268,9 +269,10 @@ def _relative_logits(query, key, positional, precision: PrecisionLike = None):
     context = key.shape[2]
     q = query.transpose(0, 3, 1, 2, 4)
     products = float32_products(products_dtype(q, key, positional), precision)
-    content = jnp.matmul(q, key.transpose(0, 3, 1, 4, 2), precision=products)
+    matmul = functools.partial(accumulated, functools.partial(jnp.matmul, precision=products))
+    content = matmul(q, key.transpose(0, 3, 1, 4, 2))
     positions = positional.reshape(-1, heads, dim).transpose(1, 2, 0)
-    relative = jnp.matmul(q.reshape(batch, heads, blocks * chunk, dim), positions, precision=products)
+    relative = matmul(q.reshape(batch, heads, blocks * chunk, dim), positions)
     relative = relative.reshape(batch, heads, blocks, chunk, -1)
     relative = jnp.pad(relative, ((0, 0),) * 4 + ((0, context + 1 - relative.shape[-1]),))
     relative = relative.reshape(batch, heads, blocks, chunk * (context + 1))
@@ -301,8 +303,8 @@ def _chunked_attention(query, key, value, positional, valid, chunk: int, left: i
     allowed = _block_context(valid, chunk, left, right)[:, None, :, None, :] & window(distance)
     logits = jnp.where(allowed, logits, fill)
     probabilities = jax.nn.softmax(logits.astype(jnp.float32), axis=-1).astype(value.dtype)
-    out = jnp.matmul(probabilities, value.transpose(0, 3, 1, 2, 4),
-                     precision=float32_products(value.dtype, precision))
+    out = accumulated(functools.partial(jnp.matmul, precision=float32_products(value.dtype, precision)),
+                      probabilities, value.transpose(0, 3, 1, 2, 4))
     return out.transpose(0, 2, 3, 1, 4).reshape(batch, -1, heads * dim)[:, :length]
 
 
