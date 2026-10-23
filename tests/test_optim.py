@@ -489,7 +489,7 @@ def test_a_gated_query_clips_its_query_half_and_bounds_the_logits():
 def test_a_biased_projection_clips_its_bias_with_its_kernel_and_bounds_the_logits():
     """With `attention_bias`, a query is `x W + b`, so the clip scales the bias with the kernel. Here
     the kernels are zero and the learned biases large, so the logits are the biases' alone: read
-    again on the same tokens after the clip, the firing group's maxima fall and the other group's
+    again on the same tokens after the clip, the firing group's maxima shrink and the other group's
     hold, as the kernels' clip moves an unbiased layer's."""
     model = tiny_decoder(attention_bias=True, num_layers=1)
     variables = model.init(jax.random.key(0), jnp.ones((1, 8), jnp.int32))
@@ -511,9 +511,9 @@ def test_a_biased_projection_clips_its_bias_with_its_kernel_and_bounds_the_logit
     firing = (before.reshape(2, 2).max(axis=1) > tau).repeat(2)
     assert 0 < np.sum(firing) < 4
     after = np.max(np.asarray(resown["qk"]["layers_0"]["self_attn"]["max_logits"][0]), axis=0)
-    # The firing group's logits fall, the clip having reached the biases they come from; the
-    # other group's weights, and so its logits, stay as they were, bit for bit.
-    assert np.all(after[firing] < before[firing])
+    # The firing group's logits shrink toward zero, the clip having reached the biases they come
+    # from; the other group's weights, and so its logits, stay as they were, bit for bit.
+    assert np.all(np.abs(after[firing]) < np.abs(before[firing]))
     np.testing.assert_array_equal(after[~firing], before[~firing])
 
 
