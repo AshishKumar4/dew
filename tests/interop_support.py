@@ -14,6 +14,22 @@ import jax.numpy as jnp
 import numpy as np
 from reference_error import widened
 
+TINY_DECODER_FIELDS = {"hidden_size": 64, "num_hidden_layers": 4, "num_attention_heads": 4,
+                       "num_key_value_heads": 2, "head_dim": 16, "intermediate_size": 128, "vocab_size": 256,
+                       "max_position_embeddings": 64, "tie_word_embeddings": False, "pad_token_id": 0,
+                       "bos_token_id": 1, "eos_token_id": 2}
+"""A tiny decoder's config fields transformers' classes take, for a tier-2 source made of
+transformers' own class (`tiny_config`)."""
+
+
+def tiny_config(model_type: str, **fields):
+    """transformers' config of `model_type` at `TINY_DECODER_FIELDS`, `fields` over them; a field given
+    as None is left out, as a released config that does not state it."""
+    from transformers import AutoConfig
+
+    stated = {key: value for key, value in {**TINY_DECODER_FIELDS, **fields}.items() if value is not None}
+    return AutoConfig.for_model(model_type, **stated)
+
 
 def drawn_ids(vocab_size: int, seed: int) -> dict[str, np.ndarray]:
     """A seed's token grid for a decoder's logits (dew.interop.verify's BATCH x LENGTH), check 1's draw

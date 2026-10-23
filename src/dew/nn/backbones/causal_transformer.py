@@ -400,8 +400,6 @@ class CausalTransformer(nn.Module):
     layout either way."""
 
     def __post_init__(self):
-        if self.layer_scalar not in (None, "frozen", "trainable"):
-            raise ValueError("layer_scalar must be None, frozen or trainable")
         if self.layer_types is not None:
             object.__setattr__(self, "layer_types", tuple(self.layer_types))
         object.__setattr__(self, "embedding_zero_ids", tuple(self.embedding_zero_ids))
@@ -443,7 +441,18 @@ class CausalTransformer(nn.Module):
             raise ValueError(
                 f"mixer is a mixer value, its record, or None, not {self.mixer!r}")
         object.__setattr__(self, "remat", remat_policy(self.remat))
+        # The wiring checks its own combinations (`BlockWiring.__post_init__`) as the model is made.
+        _ = self.wiring
         super().__post_init__()
+
+    @property
+    def wiring(self) -> BlockWiring:
+        """How every block wires its two sublayers (`BlockWiring`), from the model's own dials, each a
+        field of its own (docs/design/api.md): the one value the stack's blocks, the prediction depths,
+        DSpark's stages and the FLOP count build with."""
+        return BlockWiring(pre_norms=self.pre_norms, output_norms=self.sandwich_norms,
+                           layer_scalar=self.layer_scalar, parallel_residual=self.parallel_residual,
+                           shared_parallel_norm=self.shared_parallel_norm, ngpt=self.ngpt)
 
     @property
     def init_stds(self) -> tuple[float | None, float | None]:
@@ -980,7 +989,7 @@ class CausalTransformer(nn.Module):
             self.loop.layers)
         total = 0.0
         for index in range(self.num_layers):
-            block = self._block(specs, mixer, factories, BlockWiring(), index, f'layers_{index}')
+            block = self._block(specs, mixer, factories, self.wiring, index, f'layers_{index}')
             passes = self.loop.steps if self.loop is not None and loop_start <= index < loop_end else 1
             total += passes * counter(block, lengths)
         if self.per_layer_input_dim:
@@ -1021,7 +1030,7 @@ class CausalTransformer(nn.Module):
         types, factories = self.per_layer_types, self.feedforward_factories()
         kinds = self.layer_kinds(types)
         blocks = self._prediction_depths(types, kinds, self.layer_mixer, factories[0], factories[1],
-                                         BlockWiring())
+                                         self.wiring)
         count = 0.0
         rows = self._prediction_rows(lengths, prediction_lengths)
         for block, (inputs, outputs) in zip(blocks, rows, strict=True):
@@ -1117,9 +1126,7 @@ class CausalTransformer(nn.Module):
         # context.
         mixer_spec = self.layer_mixer
         specs = self._layer_specs(types, kinds, mixer_spec)
-        wiring = BlockWiring(pre_norms=self.pre_norms, output_norms=self.sandwich_norms,
-                             layer_scalar=self.layer_scalar, parallel_residual=self.parallel_residual,
-                             shared_parallel_norm=self.shared_parallel_norm, ngpt=self.ngpt)
+        wiring = self.wiring
 
         block = functools.partial(self._block, specs, mixer_spec, (gated_mlp, routed, parallel), wiring)
 
