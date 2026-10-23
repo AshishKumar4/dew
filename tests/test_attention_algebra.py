@@ -613,7 +613,9 @@ def test_a_querys_gradient_over_keys_near_fp32s_largest_is_finite_at_any_scale_a
     exponents, `keyed_shift`)."""
     query = jnp.zeros((1, 1, 1, 16), jnp.float32)
     key = jnp.zeros((1, 2, 1, 16), jnp.float32).at[:, :, :, 0].set(size)
-    value = jnp.zeros((1, 2, 1, 16), jnp.float32).at[..., 0].set(jnp.asarray([1.0, 2.0]).reshape(1, 2, 1))
+    # Equal values, so the score cotangents are exactly 0 and dQ's own sum is 0 on any accumulation: the
+    # test holds the weights' correction (`keyed`) alone.
+    value = jnp.zeros((1, 2, 1, 16), jnp.float32).at[..., 0].set(1.0)
     dout = jnp.zeros((1, 1, 1, 16), jnp.float32).at[..., 0].set(1.0)
     spans = template.spans(1, 2, 1)
     hooks = template.Hooks(score_mod=None if slope is None else (lambda s, q_pos, k_pos: slope * s))
@@ -644,4 +646,27 @@ def test_a_querys_gradient_with_a_large_refinement_at_a_small_scale_is_finite():
     for name, grads in (("triton", triton), ("portable", portable)):
         assert np.isfinite(np.asarray(grads.query)).all(), name
     assert_same_bits(triton.query, portable.query, "a large refinement at a small scale")
+
+
+def test_a_querys_gradient_from_a_state_of_a_small_denominator_at_a_large_scale_is_finite():
+    """One key resumed from a state of denominator 2^-40 at maximum 40, at a scale of 2^100: the key's
+    probability is about 4.7e-6 and dQ about 5.9e24, finite, though the scale over the denominator, 2^140,
+    is not (`algebra.dq_step`: each factor's mantissa and exponent apart). Both mainloops agree to the bit."""
+    query = jnp.zeros((1, 1, 1, 16), jnp.float32)
+    key = jnp.zeros((1, 1, 1, 16), jnp.float32).at[..., 0].set(1.0)
+    value = jnp.zeros((1, 1, 1, 16), jnp.float32).at[..., 0].set(1.0)
+    dout = jnp.zeros((1, 1, 1, 16), jnp.float32).at[..., 0].set(1.0)
+    spans = template.spans(1, 1, 1)
+    state = template.Initial(jnp.full((1, 1, 1), 40.0), jnp.full((1, 1, 1), 2.0 ** -40),
+                             jnp.zeros((1, 1, 1, 16)))
+    hooks = template.Hooks(initial=state)
+    tiles = {"block_q": 32, "block_k": 32, "pad": attention_triton.BLOCK}
+    with tuning.pinned({attention_triton.TritonBackward: joint(TILES[1])}):
+        triton = attention_triton.backward(query, key, value, spans, hooks, dout, scale=2.0 ** 100,
+                                           natural=True, interpret=True)
+    portable = attention_portable.backward(query, key, value, spans, hooks, dout, scale=2.0 ** 100,
+                                           natural=True, **tiles)
+    for name, grads in (("triton", triton), ("portable", portable)):
+        assert np.isfinite(np.asarray(grads.query)).all(), name
+    assert_same_bits(triton.query, portable.query, "a small denominator at a large scale")
 

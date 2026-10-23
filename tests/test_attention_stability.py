@@ -92,7 +92,7 @@ SEEDS = {"ties at scale 1": 64, "ties at scale 1, cotangents near 2**125": 64, "
          "a resumed state of a denominator near fp32's largest beside an overflowing column": 8,
          "fp16 values near their largest beside a state near fp32's largest": 8,
          "keys an ulp apart, float32": 32, "keys an ulp apart, bfloat16": 32,
-         "keys near fp32's largest at equal logits": 32,
+         "keys near fp32's largest at equal logits": 32, "a far maximum in a later key tile": 8,
          "a decode step's sink and one key": 8, "a decode step's sink near fp32's largest and one key": 8,
          "documents of one key": 8}
 """Each family's declared seeds, the fewest over which the reference compared with itself resolves check
@@ -394,10 +394,11 @@ def _fp16_beside_a_large_state(seed):
 
 def _near_keys(dtype: str):
     # One query a row over two keys an ulp of the dtype apart in every entry, `k` and `k (1 + 2^-t)`, t its
-    # mantissa's bits: their logits differ by a drawn few, so neither weighs nothing, and their values are
-    # drawn apart and large, so each key's score cotangent is large and the two cancel, `dS_1 = -dS_0`: the
-    # query's gradient `dS_0 k_0 + dS_1 k_1` is their difference's share alone, an ulp of either term, which
-    # a cotangent rounded to the dtype before its product with the keys loses (`cotangent_product`).
+    # mantissa's bits: their logits differ by about an ulp of their size, so the two weigh alike, and their
+    # values are drawn apart and large, so each key's score cotangent is large and the two cancel, `dS_1 =
+    # -dS_0`: the query's gradient `dS_0 k_0 + dS_1 k_1` is their difference's share alone, an ulp of either
+    # term, which a cotangent rounded to the dtype before its product with the keys loses
+    # (`cotangent_product`).
     bits = 7 if dtype == "bfloat16" else 23
 
     def draw(seed):
@@ -417,6 +418,20 @@ def _large_keys(seed):
     key[..., 0] = _uniform(seed, 1.7e38, 3.4e38, (ROWS, 8, 1))
     value, dout = _normal(seed + 1, (ROWS, 8, 1, 16), (ROWS, 1, 1, 16))
     return np.zeros((ROWS, 1, 1, 16), np.float32), key, value, None, dout
+
+
+def _far_maximum_in_a_later_tile(seed: int, rows: int = 64):
+    # One query a row over 64 keys in two tiles of 32: the first tile's keys 88 to 92 nats below the second
+    # tile's, which hold the row's maximum, so the first tile's weights are subnormal beside the maximum
+    # the backward walks at: a dQ pass's running sums over its first tile (`algebra.DqSums`) take only
+    # those, and must stay finite and exact when the maximum's tile joins them.
+    query = np.zeros((rows, 1, 1, 16), np.float32)
+    query[..., 0] = 4.0
+    key = np.zeros((rows, 64, 1, 16), np.float32)
+    key[:, :32, 0, 0] = -_uniform(seed, 88.0, 92.0, (rows, 32))
+    key[:, 32:, 0, 1:] = _normal(seed + 1, (rows, 32, 15))[0]
+    value, dout = _normal(seed + 2, (rows, 64, 1, 16), (rows, 1, 1, 16))
+    return query, key, value, None, dout
 
 
 def _families() -> dict[str, Family]:
@@ -485,6 +500,8 @@ def _families() -> dict[str, Family]:
             _subnormal_share, np.ones((64, 1, 1, 256), bool), folded=False, dtype="bfloat16"),
         # Every weight but one 1/255, bf16's worst rounding of a weight, beside the subnormal share.
         "keys near fp32's largest at equal logits": Family(_large_keys, _kept(1, 8)),
+        "a far maximum in a later key tile": Family(_far_maximum_in_a_later_tile,
+                                                    np.ones((64, 1, 1, 64), bool)),
         # A query's gradient that cancels across its keys, in either dtype (`algebra.cotangent_product`).
         "keys an ulp apart, float32": Family(_near_keys("float32"), _kept(1, 2)),
         "keys an ulp apart, bfloat16": Family(_near_keys("bfloat16"), _kept(1, 2), dtype="bfloat16"),
