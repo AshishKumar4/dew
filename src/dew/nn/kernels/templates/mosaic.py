@@ -30,9 +30,11 @@ Ref = state_types.AbstractRef | state_types.TransformedRef
 barriers."""
 
 
-def compiler_params() -> plgpu.CompilerParams:
-    """A mainloop's compiler parameters: Mosaic GPU's warpgroup lowering, whose arrays are a warpgroup's."""
-    return plgpu.CompilerParams(lowering_semantics=plgpu.LoweringSemantics.Warpgroup)
+def compiler_params(*, approx_math: bool = False) -> plgpu.CompilerParams:
+    """A mainloop's compiler parameters: Mosaic GPU's warpgroup lowering, whose arrays are a warpgroup's,
+    and with `approx_math` the hardware's approximate exponential and reciprocal (ex2.approx, as Triton's
+    exp2 and FlashAttention's are)."""
+    return plgpu.CompilerParams(lowering_semantics=plgpu.LoweringSemantics.Warpgroup, approx_math=approx_math)
 
 
 def cooperative(body, out_type, *, consumers: int, cluster: int, multiprocessors: int, interpret):
@@ -182,11 +184,10 @@ class Ring:
             pl.when(step >= 0)(lambda step=step: plgpu.barrier_wait(self.consumed.at[self.slot(step)]))
 
 
-def ring(block: tuple, dtype, stages: int, *, consumers: int = 1, transforms: tuple = ()) -> dict:
-    """A `Ring`'s allocations for `pl.run_scoped`: `stages` slots of `block` in `dtype` (laid out by an
-    instruction family's `transforms` where its MMAs read them, `Family.transforms`), a load barrier each,
-    and a release barrier each that `consumers` arrive at. `Ring(**allocated)` once scoped."""
-    return {'smem': plgpu.SMEM((stages, *block), dtype, transforms=transforms),
+def ring(block: tuple, dtype, stages: int, *, consumers: int = 1) -> dict:
+    """A `Ring`'s allocations for `pl.run_scoped`: `stages` slots of `block` in `dtype`, a load barrier
+    each, and a release barrier each that `consumers` arrive at. `Ring(**allocated)` once scoped."""
+    return {'smem': plgpu.SMEM((stages, *block), dtype),
             'full': plgpu.Barrier(num_barriers=stages),
             'consumed': plgpu.Barrier(num_arrivals=consumers, num_barriers=stages)}
 
@@ -194,16 +195,13 @@ def ring(block: tuple, dtype, stages: int, *, consumers: int = 1, transforms: tu
 @dataclasses.dataclass(frozen=True)
 class Family:
     """An instruction family's facts a Mosaic mainloop issues by (`generation.family` names it): its
-    accumulator's register `layout` and a row's and a column's vectors in it, the rows one compute
-    warpgroup's MMA covers (`rows`), and its operand tiles' shared-memory layout (`transforms`, of a
-    16-bit dtype's tiles). Its issue functions are its module's (mosaic_sm90's wgmma)."""
+    accumulator's register `layout` and the rows one compute warpgroup's MMA covers (`rows`). Its issue
+    functions are its module's (mosaic_sm90's wgmma); its operand tiles' shared-memory tiling and swizzle are
+    the warpgroup lowering's inference (`compiler_params`)."""
 
     name: str
     layout: plgpu.Layout
-    row: plgpu.Layout
-    column: plgpu.Layout
     rows: int
-    transforms: tuple
 
 
 CONSUMER_REGISTERS, PRODUCER_REGISTERS = 232, 40
