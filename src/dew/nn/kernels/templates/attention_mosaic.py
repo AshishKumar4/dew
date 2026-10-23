@@ -453,8 +453,9 @@ def _dkv_launch(query, key, value, dout, peak, total, anchor, delta, key_index, 
     shape = (block_q, block_k)
 
     def first_tile(k_first):
-        # The first query tile that sees a key block from `k_first`: every one, or those from its diagonal.
-        return lax.div(k_first, block_q) if causal else jnp.int32(0)
+        # The first query tile that sees a key block from `k_first`: every one, or those from its diagonal,
+        # at most the last (a causal call of more keys than queries leaves its last keys unseen).
+        return jnp.minimum(lax.div(k_first, block_q), q_steps) if causal else jnp.int32(0)
 
     def body(q_ref, k_ref, v_ref, do_ref, peak_ref, total_ref, anchor_ref, delta_ref, index_ref, dk_ref,
              dv_ref, k_smem, v_smem, staged, out_smem, k_loaded, v_loaded, query_ring, dout_ring):
@@ -585,6 +586,9 @@ def backward(query: jax.Array, key: jax.Array, value: jax.Array, spans: KeySpans
         raise NotImplementedError(f"the sm90 backward takes full and causal calls, not {spans.form!r} ones")
     if jnp.dtype(query.dtype) != jnp.dtype(jnp.bfloat16):
         raise NotImplementedError(f"the sm90 backward takes bf16 operands, not {jnp.dtype(query.dtype)}")
+    if query.shape[3] != value.shape[3]:
+        raise NotImplementedError("the sm90 backward stages dK and dV through one buffer: equal head widths, "
+                                  "as the forward takes")
     count = BACKWARD_CONSUMERS[accurate] if consumers is None else consumers
     factor = query.shape[3] ** -0.5 if scale is None else scale
     how = algebra.recompute(algebra.Forward("full", 0, ids=False, scale=factor, natural=natural))

@@ -34,13 +34,15 @@ SEEDS = 8
 against the reference's own."""
 
 
-def _drawn(shape: tuple[int, int, int, int], dtype, width: int = 128):
-    """A draw `(query, key, value, dout)` of unit Gaussians at `shape` in `dtype`, by seed."""
+def _drawn(shape: tuple[int, int, int, int], dtype, width: int = 128, keys: int | None = None):
+    """A draw `(query, key, value, dout)` of unit Gaussians at `shape` (its keys `keys`, else its tokens) in
+    `dtype`, by seed."""
     rows, tokens, heads, kv_heads = shape
+    keys = tokens if keys is None else keys
 
     def draw(seed):
         streams = jax.random.split(jax.random.key(seed), 4)
-        dims = ((heads, tokens), (kv_heads, tokens), (kv_heads, tokens), (heads, tokens))
+        dims = ((heads, tokens), (kv_heads, keys), (kv_heads, keys), (heads, tokens))
         return tuple(jax.random.normal(stream, (rows, count, heads_, width), jnp.float32).astype(dtype)
                      for stream, (heads_, count) in zip(streams, dims, strict=True))
 
@@ -63,9 +65,10 @@ def _check_forward(call: str, dtype, shape, *, natural: bool, interpret: bool):
                     f"mosaic forward {call} {jnp.dtype(dtype).name} natural {natural}", seeds=SEEDS)
 
 
-def _check_backward(call: str, shape, *, accurate: bool, interpret: bool):
-    spans = template.spans(shape[1], shape[1], shape[0], **CALLS[call])
-    draw = _drawn(shape, jnp.bfloat16)
+def _check_backward(call: str, shape, *, accurate: bool, interpret: bool, keys: int | None = None):
+    keys = shape[1] if keys is None else keys
+    spans = template.spans(shape[1], keys, shape[0], **CALLS[call])
+    draw = _drawn(shape, jnp.bfloat16, keys=keys)
 
     def ours(query, key, value, dout):
         residuals = attention_triton.forward(query, key, value, spans, residuals=True,
@@ -106,6 +109,14 @@ def test_the_backward_is_on_par_interpreted(call, accurate):
     _check_backward(call, SHAPES["interpreted"], accurate=accurate, interpret=True)
 
 
+@INTERPRETS
+def test_a_causal_backward_of_more_keys_than_queries_is_on_par_interpreted():
+    """A causal call of 64 queries over 256 keys, whose last key tiles no query sees: the fast form's two
+    consumers each take a key block, one wholly past the queries' diagonal, and walk no query tile, the
+    producer loading none for them."""
+    _check_backward("causal", (1, 64, 2, 1), accurate=False, interpret=True, keys=256)
+
+
 @pytest.mark.parametrize("accurate", [False, True], ids=["default", "accurate"])
 def test_the_launches_lower_for_an_h100(accurate):
     """The forward and the backward's launches lower for an H100 on any host, as the GPU gate runs them."""
@@ -141,6 +152,14 @@ def test_the_forward_is_on_par_on_an_h100(call, dtype):
 def test_the_natural_forward_is_on_par_on_an_h100(call):
     """The forward with natural logits, fp16's, compiled on an H100."""
     _check_forward(call, jnp.float16, SHAPES["compiled"], natural=True, interpret=False)
+
+
+@ON_HOPPER
+@pytest.mark.gpu(reason="runs the sm90 mainloop compiled, on an H100")
+def test_a_causal_backward_of_more_keys_than_queries_is_on_par_on_an_h100():
+    """A causal call of 64 queries over 256 keys compiled on an H100, where a consumer waiting for a load
+    the producer never issues hangs (the interpreted test's case)."""
+    _check_backward("causal", (2, 64, 4, 2), accurate=False, interpret=False, keys=256)
 
 
 @ON_HOPPER
