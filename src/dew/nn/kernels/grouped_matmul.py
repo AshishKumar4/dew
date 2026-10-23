@@ -71,18 +71,17 @@ Where the cost model ties, the first wins: the deeper step, which synchronizes i
 a tile (at 128 x 256 on an H100, a step of 64 took 1.56 ms where 32 took 1.78, GMM-h100-2), and the
 more warps."""
 
-_COOPERATIVE = itertools.product((128,), (256, 128), (64,), (4, 3, 5), (8, 4, 2, 1), (1, 2))
+_COOPERATIVE = itertools.product((128,), (256, 128), (64,), (4, 3, 5), (8, 4, 2, 1))
 _ALONE = itertools.product((128, 192, 64), (128, 192, 64), (64,), (4, 5, 2), (8, 4, 2, 1))
 MOSAIC_TILES = (tuple(mosaic_gpu.Tiles(*shape) for shape in _ALONE)
-                + tuple(mosaic_gpu.Tiles(*shape, warpgroups=2, cluster=pair)
-                        for *shape, pair in _COOPERATIVE))
+                + tuple(mosaic_gpu.Tiles(*shape, warpgroups=2) for shape in _COOPERATIVE))
 """Every tile the Mosaic GPU launches may take: the sweep JAX ships with its one-warpgroup kernels
 (`ragged_dot_mgpu.main`), where an H100's fastest lay (GMM-h100-3), then tiles two consumer warpgroups
-compute, CUTLASS's cooperative sm90 schedule (128 x 256, a pair of multiprocessors sharing the blocks of
-one operand). The cost model prices no term the cooperative schedule or a pair changes yet (its MMA
-issue, the second consumer's reads of the shared stage, the pair's multicast), so where it ties, the
-first wins: a one-warpgroup tile, then a cooperative tile alone (shared memory staging's barriers, a few
-hundred bytes, are not counted against the block either)."""
+compute, CUTLASS's cooperative sm90 schedule (128 x 256). No pair of multiprocessors: the bundle's rings
+stream to one (`mosaic_gpu.FAMILY`), and the cost model picked no pair at any scoreboard row. The cost
+model prices no term the cooperative schedule changes yet (its MMA issue, the second consumer's reads of
+the shared stage), so where it ties, the first wins: a one-warpgroup tile, then a cooperative tile
+(shared memory staging's barriers, a few hundred bytes, are not counted against the block either)."""
 
 TPU_BLOCKS = tuple(mosaic_tpu.Blocks(*shape) for shape in itertools.product((128, 256, 512), repeat=3))
 """Every block the TPU launches may take: multiples of the MXU's 128 (Megablox's default is 128 cubed),
@@ -704,7 +703,7 @@ class MosaicGmm(_Mosaic):
     def space(self, ba) -> tuple[mosaic_gpu.Tiles, ...]:
         kernel = ba.arguments['kernel']
         depth, width = (kernel.shape[2], kernel.shape[1]) if ba.arguments['trans_rhs'] else kernel.shape[1:]
-        return tuple(tile for tile in _modelled(ba)
+        return tuple(tile for tile in MOSAIC_TILES
                      if depth % tile.block_k == 0 and width % tile.block_n == 0)
 
     @staticmethod
@@ -755,10 +754,7 @@ class MosaicTgmm(_Mosaic):
 
     def space(self, ba) -> tuple[mosaic_gpu.Tiles, ...]:
         depth, width = ba.arguments['tokens'].shape[1], ba.arguments['cotangent'].shape[1]
-        # No pair: a tile streaming its stages across tiles outruns the paired tiles' kernel, whose pair
-        # never paid for its multicast here.
-        return base.dividing(tuple(tile for tile in _modelled(ba) if tile.cluster == 1), (depth, width),
-                             lambda tile: (tile.block_m, tile.block_n))
+        return base.dividing(MOSAIC_TILES, (depth, width), lambda tile: (tile.block_m, tile.block_n))
 
     def fitting(self, ba, target) -> tuple[mosaic_gpu.Tiles, ...]:
         """The tiles that fit `target` (`Template.fitting`), with `exact_sums` those whose two fp32
@@ -1026,12 +1022,6 @@ def _uncut(sides: tuple, axes_of: tuple) -> tuple[tuple, tuple]:
     """The side operands, and their axes, without the rows a cooperative consumer's half cuts."""
     kept = [(side, axes) for side, axes in zip(sides, axes_of, strict=True) if 'rows' not in axes]
     return tuple(side for side, _ in kept), tuple(axes for _, axes in kept)
-
-
-def _modelled(ba) -> tuple[mosaic_gpu.Tiles, ...]:
-    """The Mosaic GPU tiles a launch may take: interpreted, none of a pair of multiprocessors, which the
-    interpreter's one block does not model."""
-    return tuple(tile for tile in MOSAIC_TILES if not (ba.arguments['interpret'] and tile.cluster == 2))
 
 
 def _facts(target: generation.GpuTarget) -> generation.GpuTarget:

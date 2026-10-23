@@ -1002,22 +1002,20 @@ def test_a_tile_states_a_schedule_the_kernels_run():
                         out_dtype=jnp.float32, multiprocessors=2)
 
 
-def test_an_interpreted_launch_takes_no_pair():
-    """The interpreter runs one block, which no cluster fits: an interpreted launch's space has no pair,
-    and a pair pinned on one multiprocessor is refused rather than launched over no blocks."""
+def test_a_launch_takes_no_pair():
+    """The bundle's rings stream to one multiprocessor: no launch's space holds a pair, and a pair pinned on
+    the forward is refused rather than launched."""
     bf16 = functools.partial(jax.ShapeDtypeStruct, dtype=jnp.bfloat16)
     args = (bf16((ROWS, DEPTH)), bf16((3, DEPTH, WIDTH)), jax.ShapeDtypeStruct((3,), jnp.int32))
     launch = grouped_matmul.MosaicGmm()
     with generation.assumed("sm90"):
-        interpreted = launch.space(launch.bind(*args, out_dtype="bfloat16", trans_rhs=False, interpret=True))
         compiled = launch.space(launch.bind(*args, out_dtype="bfloat16", trans_rhs=False, interpret=False))
-    assert interpreted and not any(tile.cluster == 2 for tile in interpreted)
-    assert any(tile.cluster == 2 for tile in compiled)
+    assert compiled and not any(tile.cluster == 2 for tile in compiled)
     with pytest.raises(ValueError):
         mosaic_gpu.gmm(jnp.zeros((ROWS, DEPTH), jnp.bfloat16), jnp.zeros((3, DEPTH, WIDTH), jnp.bfloat16),
                        jnp.asarray([100, 100, 107]), tiles=mosaic_gpu.Tiles(128, 128, 64, 3, 1, warpgroups=2,
                                                                              cluster=2),
-                       transpose_rhs=False, out_dtype=jnp.bfloat16, multiprocessors=1,
+                       transpose_rhs=False, out_dtype=jnp.bfloat16, multiprocessors=2,
                        interpret=grouped_matmul.INTERPRETED)
 
 
