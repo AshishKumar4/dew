@@ -382,6 +382,15 @@ def test_residual_orders_preserve_a_decoder_whose_heads_are_the_residual_width()
                                            float(reordered.sum()), float(truth.sum()))
 
 
+def test_a_nonfinite_order_fails_the_invariance_check():
+    """A residual order whose function or loss is not finite fails the check, as a NaN compares
+    with nothing."""
+    tool = load('layout_parity')
+    for logits, loss in ((np.array([np.nan, 1.0]), 1.0), (np.array([1.0, 2.0]), np.nan)):
+        with pytest.raises(ValueError):
+            tool.order_invariance({'logits': logits}, {'logits': np.array([1.0, 2.0])}, loss, 1.0)
+
+
 def test_residual_orders_preserve_a_looped_ngpt():
     """A residual order is an exact symmetry of Dory's looped nGPT decoder: its per-feature step rates
     (`attn_alpha`, `mlp_alpha`) live on the residual stream and are reordered with it, as its norms'
