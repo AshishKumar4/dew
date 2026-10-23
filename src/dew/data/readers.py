@@ -236,8 +236,5 @@ class _FillShare:
     batch: int
 
     def __call__(self, batch: Batch) -> Batch:
-        mine = take_batch(batch, slice(self.partition.index, None, self.partition.count))
-        empty = rows_of(mine) == 0
-        if empty:
-            mine = take_batch(batch, slice(1))
-        return FilledBatch(self.partition.rows(self.batch), real=not empty).map(mine)
+        held, real = self.partition.held(rows_of(batch))
+        return FilledBatch(self.partition.rows(self.batch), real=real).map(take_batch(batch, held))
