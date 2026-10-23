@@ -935,8 +935,9 @@ def assert_as_exact(dew_fn, reference_fn, draw, label: str, *, seeds: int, truth
     pooled over the site's declared seeds, within PARITY times the reference's, and its worst row over
     those seeds within ROW_FACTOR times the reference's worst (NARROW_FACTORS' factor at rows of one or
     two values); each row of float64 zero (below RESOLUTION of its leaf where a live reference does not
-    measure it, `_paired`) no further from it than ROW_FACTOR times the reference on that row; every
-    value finite.
+    measure it, `_paired`) no further from it than ROW_FACTOR times the reference on that row, pooled
+    over the seeds on which the row is so classified (`pooled_zero_rows`: the root of the sum of
+    squared errors, not seed by seed); every value finite.
 
     `draw(seed)` returns the inputs of one draw, the same for a seed on every run; `dew_fn(*inputs)`
     and `reference_fn(*inputs)` return the same tree, and truth is `reference_fn` on the inputs
