@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import dataclasses
 import hashlib
+import threading
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -219,30 +220,25 @@ class BlockUntilKilled:
     A preemption has to land mid-epoch, between two checkpoints. The loop
     spends its waiting time asking the source for a batch, so stopping there
     leaves the process in the state a preempted run dies in, and makes the step
-    it dies on the same on every machine. The wait is bounded so a test that
-    never kills anything fails on the timeout.
+    it dies on the same on every machine. The wait is one blocking wait, bounded
+    so a test that never kills anything fails on the timeout.
     """
 
-    def __init__(self, loader, limit: int, marker: Path, timeout: float = 300.0):
+    def __init__(self, loader, limit: int, timeout: float = 300.0):
         self._iterator = iter(loader)
         self._limit = limit
-        self._marker = marker
         self._timeout = timeout
-        self._handed = 0
+        self.handed = 0
 
     def __iter__(self):
         return self
 
     def __next__(self):
-        if self._handed >= self._limit:
-            self._marker.write_text(str(self._handed))
-            deadline = time.monotonic() + self._timeout
-            while time.monotonic() < deadline:
-                time.sleep(0.02)
-            raise RuntimeError(
-                f"alive {self._timeout}s after handing out {self._handed} batches")
+        if self.handed >= self._limit:
+            threading.Event().wait(self._timeout)
+            raise RuntimeError(f"alive {self._timeout}s after handing out {self.handed} batches")
         batch = next(self._iterator)
-        self._handed += 1
+        self.handed += 1
         return batch
 
     def get_state(self):
@@ -250,6 +246,19 @@ class BlockUntilKilled:
 
     def set_state(self, state):
         self._iterator.set_state(state)
+
+
+def blocked(checkpoints, source: BlockUntilKilled, step: int, channel: Path):
+    """An observer's call that, at `step`, the one whose batch is the source's last, waits for the
+    run's checkpoint writes to land and then tells the parent through `channel` (a FIFO it reads)
+    how many batches the source handed out: the moment the run is blocked mid-epoch with its
+    checkpoints on disk, for the parent to kill it at, with no file to poll."""
+    def call(state):
+        if int(as_numpy(state.step)) == step:
+            checkpoints.wait()
+            with open(channel, "w") as told:
+                told.write(str(source.handed))
+    return call
 
 
 def sharding_facts(params) -> dict:
@@ -618,13 +627,17 @@ def mode_fit(args) -> dict:
     else:
         loader = indexed_loader(args.records, rows)
         if args.block_after:
-            loader = BlockUntilKilled(loader, args.block_after, Path(args.marker))
+            loader = BlockUntilKilled(loader, args.block_after)
         def open_train(partition):
             return iter(loader)
     from dew.training import Observe
     # The variables, split over the processes by fsdp, which an observation gathers whole on each.
     observe = None if args.observe_every is None else Observe(args.observe_every,
                                                               lambda state: state.variables)
+    if args.block_after:
+        # The source's last batch trains the step `block_after` past where the run restored.
+        observe = Observe(1, blocked(checkpoints, loader, (restored_step or 0) + args.block_after,
+                                     Path(args.notify)))
     state = trainer.fit(Loader(open_train, val=None, batch=BATCH, records=args.records),
                         steps=args.steps, log_every=1, checkpoint_every=args.save_every, observe=observe)
     dump_params(args.out.with_suffix(".npz"), state.variables)
@@ -2381,7 +2394,7 @@ def parse_args(argv=None):
     parser.add_argument("--records", type=int, default=BATCH * 16)
     parser.add_argument("--block-after", type=int,
                         help="batches to hand out before waiting to be killed")
-    parser.add_argument("--marker", help="file written once the source blocks")
+    parser.add_argument("--notify", help="the FIFO told once the source blocks with its checkpoints landed")
     parser.add_argument("--fail-local-save", type=int,
                         help="this process's local save at this step fails in the background, as "
                              "orbax's tmp directory creation once did (FileExistsError)")
