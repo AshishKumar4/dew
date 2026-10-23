@@ -223,12 +223,11 @@ def _loss(run):
 @pytest.mark.parametrize("case", GRADIENT_CASES)
 def test_the_templates_gradients_hold_check_1(generation_name, case):
     """Every operand's cotangent through the template's own reverse mode, against JAX's derivative of
-    the plain program, from float64 truth. The Mosaic interpreters run ordered callbacks, which a jitted
-    `linear_call` cannot carry, so their gradients run eagerly."""
+    the plain program, from float64 truth, jitted: the Mosaic interpreters' ordered callbacks run inside
+    the backward kernel's linear map (`generation.linear_map`)."""
     spec = CASES[case]
     with generation.assumed(generation_name):
-        dew = _loss(_dew(spec, interpret_on_cpu=True))
-        dew = jax.jit(dew) if generation_name == "sm80" else dew
+        dew = jax.jit(_loss(_dew(spec, interpret_on_cpu=True)))
         assert_as_exact(dew, jax.jit(_loss(_plain(spec))), _draw, f"{case} gradients on {generation_name}",
                         seeds=SEEDS, truth_fn=_loss(_plain(spec, truth=True)))
 
@@ -933,15 +932,14 @@ def test_exact_sums_add_each_steps_product_as_the_plain_sum_does(generation_name
 def test_a_cooperative_tiles_gradients_hold_check_1(case):
     """`test_a_cooperative_tile_holds_check_1_with_its_hooks`'s reverse mode: the input gradient through the
     cooperative transposed launch, the kernel gradient through the cooperative kernel gradient with the
-    prologue each consumer applies to its depth half, against JAX's derivative of the plain program
-    (eagerly: `test_the_templates_gradients_hold_check_1`)."""
+    prologue each consumer applies to its depth half, against JAX's derivative of the plain program."""
     spec = CASES[case]
     pinned = {grouped_matmul.MosaicGmm: COOPERATIVE, grouped_matmul.MosaicTgmm: COOPERATIVE}
     with (generation.assumed("sm90"), generation.chosen(grouped_matmul="mosaic_gpu"), tuning.pinned(pinned),
           generation.routes() as taken):
-        assert_as_exact(_loss(_dew(spec, interpret_on_cpu=True)), jax.jit(_loss(_plain(spec))), _draw,
-                        f"{case} cooperative gradients", seeds=SEEDS,
-                        truth_fn=_loss(_plain(spec, truth=True)))
+        dew = jax.jit(_loss(_dew(spec, interpret_on_cpu=True)))
+        assert_as_exact(dew, jax.jit(_loss(_plain(spec))), _draw, f"{case} cooperative gradients",
+                        seeds=SEEDS, truth_fn=_loss(_plain(spec, truth=True)))
     assert _kernels(taken) == MOSAIC_RAN
 
 

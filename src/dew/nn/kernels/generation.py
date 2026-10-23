@@ -634,7 +634,7 @@ def linear_tangent(forward: Callable, backward: Callable, portable: Callable) ->
 
     def bounded_jvp(primals, tangents):
         output, saved = produced(*primals)
-        # Only the perturbed operands are the linear call's: its transpose takes no known zero.
+        # Only the perturbed operands are the linear map's: its transpose takes no known zero.
         directions, tree = jax.tree.flatten(tangents, is_leaf=lambda leaf: isinstance(leaf, SymbolicZero))
         live = [index for index, direction in enumerate(directions)
                 if not isinstance(direction, SymbolicZero)]
