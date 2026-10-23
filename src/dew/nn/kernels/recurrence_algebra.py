@@ -466,15 +466,17 @@ def inverted(blocks: dict, issue: Issue) -> dict:
     return inverse
 
 
-def weighted(name: str, inverse, tile, beta, issue: Issue, decay=None):
-    """`inverse (tile beta [decay])`, the scaled operand rounded to `tile`'s dtype before the product:
-    'apply_u' on the values, 'apply_w' on the keys under their decay `exp2(g)` (`[C, 1]` a head's, `[C, BK]` a
-    key dimension's). Without the delta rule (`inverse` None) nothing is corrected and there is no product:
-    the gated tile, fp32 (`apply`'s)."""
+def weighted(name: str, lower, tile, beta, issue: Issue, decay=None):
+    """`(I + L) (tile beta [decay])` of the inverse's strictly lower part `lower` (`L`, the inverse less its
+    unit diagonal), the scaled operand rounded to `tile`'s dtype for the product and kept fp32 on the
+    diagonal: 'apply_u' on the values, 'apply_w' on the keys under their decay `exp2(g)` (`[C, 1]` a head's,
+    `[C, BK]` a key dimension's). The diagonal outside the product leaves it the off-diagonal terms alone,
+    where a tensor core's truncating sum (mma.sync's) loses no more than their last bit. Without the delta
+    rule (`lower` None) nothing is corrected and there is no product: the gated tile, fp32 (`apply`'s)."""
     scaled = tile * beta[:, None] if decay is None else tile * beta[:, None] * decay
-    if inverse is None:
+    if lower is None:
         return scaled.astype(jnp.float32)
-    return issue(name, inverse, scaled.astype(tile.dtype))
+    return scaled.astype(jnp.float32) + issue(name, lower, scaled.astype(tile.dtype))
 
 
 def corrected(values, weights: Load | None, state, dtype, issue: Issue):
@@ -487,10 +489,21 @@ def corrected(values, weights: Load | None, state, dtype, issue: Issue):
     return values.astype(jnp.float32) - predicted
 
 
-def carried(state, keys: Load, values, decay, dtype, issue: Issue) -> list:
+def carried(state, keys: Load, values, decay, dtype, issue: Issue, last: tuple | None = None) -> list:
     """The memory leaving a chunk, slice by key slice: `state[i] decay[i] + keys(i)^T values` ('write'), the
-    values cast to the keys' `dtype`; `decay[i]` scales each slice's rows `[K_i, 1]` or the whole."""
-    return [part * decay[i] + issue("write", keys(i).T, values.astype(dtype)) for i, part in enumerate(state)]
+    values cast to the keys' `dtype`; `decay[i]` scales each slice's rows `[K_i, 1]` or the whole. `last`,
+    `(key_rows, value_row)`, takes the chunk's last token's write out of the product, its key slice
+    `key_rows(i)` as a row's vector and its values `value_row` as a column's: the write that weighs most
+    under steep decays, added on its own where a tensor core's truncating sum (mma.sync's) would lose its
+    last bit."""
+    values = values.astype(dtype)
+    if last is None:
+        return [part * decay[i] + issue("write", keys(i).T, values) for i, part in enumerate(state)]
+    key_rows, value_row = last
+    rows, _ = _grid(values.shape)
+    earlier = jnp.where(rows < values.shape[0] - 1, values, jnp.zeros((), values.dtype))
+    return [part * decay[i] + (issue("write", keys(i).T, earlier) + key_rows(i)[:, None] * value_row[None, :])
+            for i, part in enumerate(state)]
 
 
 def scalar_write(corrected_values, last, gate, last_lo, gate_lo):

@@ -357,7 +357,9 @@ def _solve(k, hi, lo, beta, taken, call: _Call):
             rows = [FAMILY.rows_of(ref.at[h, span]) for ref in (hi_ref, lo_ref, beta_ref)]
             columns = [FAMILY.columns_of(ref.at[h, span]) for ref in (column_hi_ref, column_lo_ref)]
             system = algebra.keyed(product, *rows, *columns)
-            held.store(a_ref, algebra.doubled(-system, _merging(staging)), row, CHUNK, h * CHUNK, CHUNK)
+            # The inverse less its unit diagonal, which `algebra.weighted` adds outside its product.
+            inverse = algebra.doubled(-system, _merging(staging)) - jnp.where(_diagonal(CHUNK), 1.0, 0.0)
+            held.store(a_ref, inverse, row, CHUNK, h * CHUNK, CHUNK)
             return carry, accumulators
 
         @pl.when(taken_ref[n] > 0)
@@ -409,7 +411,7 @@ def _intra(q, k, hi, lo, beta, taken, call: _Call, *, scale: float):
             rows, cols = (FAMILY.iota((CHUNK, CHUNK), dimension) for dimension in (0, 1))
             if call.delta:
                 inverse = algebra.doubled(-jnp.where(rows > cols, system, 0.0), _merging(staging))
-                held.store(outs[0], inverse, row, CHUNK, h * CHUNK, CHUNK)
+                held.store(outs[0], inverse - jnp.where(rows == cols, 1.0, 0.0), row, CHUNK, h * CHUNK, CHUNK)
             held.store(outs[-1], jnp.where(rows >= cols, scores, 0.0), row, CHUNK, h * CHUNK, CHUNK)
             return carry, accumulators
 
@@ -560,9 +562,16 @@ def _states(k, w, u, hi, lo, beta, h0, sequences, call: _Call, tiles: Tiles):
                 gated, decayed = algebra.scalar_write(corrected, ending, FAMILY.rows_of(hi_ref.at[h, span]),
                                                       ending_low, FAMILY.rows_of(lo_ref.at[h, span]))
                 decay = [decayed[:, None]] * slices
+            def key_rows(i):
+                """The chunk's last key's slice `i`, a row's vector: its parts' rows summed, exactly."""
+                views = keys.vectors(k_ref, last, h // keyed * width + i * BLOCK, BLOCK)
+                return functools.reduce(jnp.add, (FAMILY.rows_of(view).astype(jnp.float32) for view in views))
+
+            ends = FAMILY.iota(gated.shape, 0) == CHUNK - 1
+            value_row = jnp.sum(jnp.where(ends, gated.astype(held.dtype).astype(jnp.float32), 0.0), axis=0)
             state = algebra.carried(
                 state, lambda i: _tile(slots, "keys", keys, columns=pl.ds(i * BLOCK, BLOCK)), gated, decay,
-                held.dtype, issue)
+                held.dtype, issue, last=(key_rows, value_row))
             return state, accumulators
 
         initials = _streamed(**{f"initial{i}": ((BLOCK, bv), initial) for i in range(slices)})
