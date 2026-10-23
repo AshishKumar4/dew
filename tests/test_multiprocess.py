@@ -690,14 +690,18 @@ def told(pool: list[tuple[subprocess.Popen, Path]], timeout: float = 600) -> lis
     deadline = time.monotonic() + timeout
     try:
         while waiting:
-            ready, _, _ = select.select([*waiting, *exits], [], [], max(deadline - time.monotonic(), 0))
+            left = deadline - time.monotonic()
+            # A worker that told is no longer waited on: its exit, once killed, is not a failure.
+            unheard = [handle for handle, index in exits.items() if index not in heard]
+            # The channels come first, so a worker's word is read before its exit in one wake.
+            ready = select.select([*waiting, *unheard], [], [], left)[0] if left > 0 else []
             if not ready:
                 pytest.fail(stuck([process for process, _ in pool],
                                   f"blocking with its checkpoints landed within {timeout}s"))
             for handle in ready:
                 if handle in waiting:
                     heard[waiting.pop(handle)] = int(os.read(handle, 64))
-                elif handle in exits and exits[handle] not in heard:
+                elif exits[handle] not in heard:
                     process = pool[exits[handle]][0]
                     pytest.fail(f"a run ended before it blocked\n{process.communicate()[0]}")
     finally:

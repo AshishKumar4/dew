@@ -228,37 +228,7 @@ def check_pipeline(directory, streamed: bool = False):
     meta = json.loads((directory / "reference.json").read_text()) if (directory / "reference.json").exists() else {}
     errors, key = {}, jax.random.PRNGKey(17)
     given, null, process, times = selection(source, meta)
-    # The start the public `prepare` makes from what the reference pipeline was handed.
-    task = source.text_to_image()
-    prepared = public_start(task, source, reference, meta, key, given, null, process, times)
-    images, latents, given = trajectory(source, prepared, given, null, process, times, key)
-    if "hidden" in reference:
-        held(errors, directory.name, "hidden", given["conditioning"].context, reference["hidden"], "hidden")
-    if "pooled" in reference:
-        held(errors, directory.name, "pooled", given["conditioning"].pooled, reference["pooled"], "pooled")
-    if "encoded" in reference:
-        pixels = unit_range(jnp.asarray(reference["pixels"][None]))
-        held(errors, directory.name, "encode", source.autoencoder.encode(source.variables["autoencoder"], pixels, key),
-             reference["encoded"], "encoded")
-        held(errors, directory.name, "decode", source.autoencoder.decode(source.variables["autoencoder"],
-                                                               jnp.asarray(reference["noise"])),
-             reference["decoded"], "decoded")
-    if "final_latents" in reference:
-        held(errors, directory.name, "latents", latents, reference["final_latents"], "final_latents")
-    held(errors, directory.name, "trajectory_images", (np.asarray(images, np.float64) + 1) / 2, reference["images"], "images")
-    if source.finish is not None:
-        raw = np.rint(reference["images"] * 255).astype(np.uint8)
-        pixels = source.finish.transform(raw)
-        held(errors, directory.name, "checker_pixels", pixels, reference["checker_pixels"], "checker_pixels")
-        # The tower on the source's own pixels, each stage held on the input the source gave it:
-        # Dew's pixels carry their own float32 rounding, held above, which the tower amplifies.
-        features = source.finish.model.apply({"params": source.variables["encoders"]["safety"]},
-                                             jnp.asarray(reference["checker_pixels"]),
-                                             method=source.finish.model.features)
-        held(errors, directory.name, "checker_features", features, reference["checker_embeddings"], "checker_embeddings")
-    # The same walk through the task facade: the same images.
-    output = task(prepared, steps=meta.get("steps", 2), guidance=3.0, key=key)
-    np.testing.assert_array_equal(output.host().images, images)
+    _, given = qualified(errors, directory.name, source, reference, meta, key, given, null, process, times)
     if streamed:
         source, given = streamed_parity(errors, directory, source, reference, meta, key)
     training = train_and_reload(source, reference, key, given, jnp.asarray(reference["noise"]))
@@ -266,12 +236,54 @@ def check_pipeline(directory, streamed: bool = False):
     print(json.dumps({"directory": str(directory), "errors": errors, "training": training}))
 
 
+def qualified(errors, name, source, reference, meta, key, given, null, process, times, label=""):
+    """`source`'s components and walk held to the source, as one load or the other loads them: the
+    conditioning (hidden, pooled), the autoencoder's encode and decode, the final latents, the
+    trajectory's images, the safety checker's pixels and features, and the public task call walking
+    to the same images. `label` prefixes each measurement's name, so two loads report apart.
+    Returns the images and the walk's conditions."""
+    # The start the public `prepare` makes from what the reference pipeline was handed.
+    task = source.text_to_image()
+    prepared = public_start(task, source, reference, meta, key, given, null, process, times)
+    images, latents, given = trajectory(source, prepared, given, null, process, times, key)
+    if "hidden" in reference:
+        held(errors, name, f"{label}hidden", given["conditioning"].context, reference["hidden"], "hidden")
+    if "pooled" in reference:
+        held(errors, name, f"{label}pooled", given["conditioning"].pooled, reference["pooled"], "pooled")
+    if "encoded" in reference:
+        pixels = unit_range(jnp.asarray(reference["pixels"][None]))
+        encoded = source.autoencoder.encode(source.variables["autoencoder"], pixels, key)
+        held(errors, name, f"{label}encode", encoded, reference["encoded"], "encoded")
+        held(errors, name, f"{label}decode",
+             source.autoencoder.decode(source.variables["autoencoder"], jnp.asarray(reference["noise"])),
+             reference["decoded"], "decoded")
+    if "final_latents" in reference:
+        held(errors, name, f"{label}latents", latents, reference["final_latents"], "final_latents")
+    shown = (np.asarray(images, np.float64) + 1) / 2
+    held(errors, name, f"{label}trajectory_images", shown, reference["images"], "images")
+    if source.finish is not None:
+        raw = np.rint(reference["images"] * 255).astype(np.uint8)
+        pixels = source.finish.transform(raw)
+        held(errors, name, f"{label}checker_pixels", pixels, reference["checker_pixels"], "checker_pixels")
+        # The tower on the source's own pixels, each stage held on the input the source gave it:
+        # Dew's pixels carry their own float32 rounding, held above, which the tower amplifies.
+        features = source.finish.model.apply({"params": source.variables["encoders"]["safety"]},
+                                             jnp.asarray(reference["checker_pixels"]),
+                                             method=source.finish.model.features)
+        held(errors, name, f"{label}checker_features", features, reference["checker_embeddings"],
+             "checker_embeddings")
+    # The same walk through the task facade: the same images.
+    output = task(prepared, steps=meta.get("steps", 2), guidance=3.0, key=key)
+    np.testing.assert_array_equal(output.host().images, images)
+    return images, given
+
+
 def streamed_parity(errors, directory, whole, reference, meta, key):
     """The pipeline streamed onto a mesh a leaf at a time: every leaf the whole load holds, bit for
-    bit, each placed on the mesh, and its trajectory's images as near float64 as the source's
-    (`held`): another program than the whole load's, which XLA need not round alike. The public
-    task call walks to the same images. Returns the streamed pipeline and its walk's conditions,
-    for the update, reload and export to run on."""
+    bit, each placed on the mesh, and every component and its walk held to the source as the whole
+    load's are (`qualified`): another program than the whole load's, which XLA need not round alike.
+    Returns the streamed pipeline and its walk's conditions, for the update, reload and export to
+    run on."""
     streamed = bundle(directory, streamed=True)
     assert jax.tree.structure(streamed.variables) == jax.tree.structure(whole.variables)
     for path, leaf in jax.tree_util.tree_leaves_with_path(streamed.variables):
@@ -280,13 +292,8 @@ def streamed_parity(errors, directory, whole, reference, meta, key):
                            strict=True):
         np.testing.assert_array_equal(np.asarray(left), np.asarray(right))
     given, null, process, times = selection(streamed, meta)
-    task = streamed.text_to_image()
-    prepared = public_start(task, streamed, reference, meta, key, given, null, process, times)
-    walked, _, given = trajectory(streamed, prepared, given, null, process, times, key)
-    held(errors, directory.name, "streamed_trajectory_images", (np.asarray(walked, np.float64) + 1) / 2,
-         reference["images"], "images")
-    output = task(prepared, steps=meta.get("steps", 2), guidance=3.0, key=key)
-    np.testing.assert_array_equal(output.host().images, walked)
+    _, given = qualified(errors, directory.name, streamed, reference, meta, key, given, null, process, times,
+                         label="streamed_")
     return streamed, given
 
 
