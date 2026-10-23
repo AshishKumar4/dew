@@ -168,10 +168,12 @@ CASES = [
     }, seq_len=SEQ_LEN, label="gpt_oss"),
     # DeepSeek V3.2's stack at toy width: the mla mixer with its sparse
     # indexer on every layer, and the routed layer with the balancing bias,
-    # the group limit and a shared expert.
+    # the group limit and a shared expert. The low ranks are 32 wide, so the
+    # latent norms' scales, whose rounding over a draw varies most, hold
+    # enough values a draw for the layout cell to resolve.
     Case("causal_transformer", {
         **LM, "head_dim": 16,
-        "mixer": {"class": "mla", "fields": {"q_lora_rank": 8, "kv_lora_rank": 8,
+        "mixer": {"class": "mla", "fields": {"q_lora_rank": 32, "kv_lora_rank": 32,
                   "qk_nope_head_dim": 8, "qk_rope_head_dim": 8, "v_head_dim": 8,
                   "index_topk": 4, "index_n_heads": 2, "index_head_dim": 16}},
         "mixture": {"experts": 8, "top_k": 2, "layers": (1,), "score_function": "sigmoid",
@@ -404,7 +406,7 @@ LAYOUT_SEEDS: dict[str, int] = {
     "jepa_video_encoder": 256, "causal_transformer": 64, "causal_transformer+moe": 64,
     "causal_transformer+gpt_oss": 256, "causal_transformer+deepseek_v2": 64,
     "causal_transformer+glm4_moe": 256, "causal_transformer+llama4": 32,
-    "causal_transformer+gemma4_moe": 128, "causal_transformer+gemma3n": 64, "causal_transformer+mla": 2048,
+    "causal_transformer+gemma4_moe": 128, "causal_transformer+gemma3n": 64,
 }
 """Each cell's declared seeds for check 1 (`assert_as_exact`), sized by `seeds_for` on armada, paired
 with the layout's arm where the cell's arms share their upstream rounding (the language cells): the
