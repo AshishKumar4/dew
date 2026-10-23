@@ -63,9 +63,8 @@ from flax import core, linen as nn
 from flax.traverse_util import flatten_dict, unflatten_dict
 
 from dew.cache import QUANTIZED_TRACE
-from dew.nn.fake_quant import correctly_rounded_divide
 from dew.nn.kernels.generation import backend
-from dew.nn.precision import accumulated
+from dew.nn.precision import accumulated, correctly_rounded_divide
 
 if TYPE_CHECKING:
     from qwix import QArray, QuantizationProvider

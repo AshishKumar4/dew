@@ -1,15 +1,21 @@
-"""Per-operation certificates (a prototype, not a gate the suite uses): each value a kernel rounds is
-checked on its own native parents against a contract for that one operation.
+"""Check 2 of the gate: every element within a certified roundoff bound for its own operation.
 
-A node of a kernel's graph (`dew.nn.kernels.graph`) is one value the kernel rounds and holds. Given
-the node's parents as the kernel computed them, its contract says what the native value may be:
+A site's computation runs one primitive at a time, each executed alone and natively, and each equation
+is held on the operands that execution gave it to its primitive's contract (tests/certified.py's
+`certified` and CONTRACTS, from this module's exact oracles):
 
-- an IEEE operation (add, sub, mul, fma, a correctly rounded divide or square root, a cast) must be
-  the round to nearest even of its exact result in its own format, subnormal cells included
-  (`Exact`);
-- an approximate or library primitive must be within its vendor-specified error of the true value
-  (`Ulps`);
-- a sum of n terms must be within the bound of the algorithm that sums it (`Sum`, `Dot`).
+- an IEEE operation (add, sub, mul, a correctly rounded divide or square root, a cast) must be the
+  round to nearest even of its exact result in its own format, read as the lane computes
+  (tests/certified.py's `FLUSHES`);
+- a library primitive, a transcendental included, must be faithful: one of the two values of its
+  format around the exact value, whatever its vendor documents;
+- a sum of n terms, a dot product's included, must be within γ_n of its terms' magnitudes of their
+  exact sum, in any order;
+- a comparison, a selection, a move of data or an integer operation must be its result bit for bit.
+
+A primitive no contract covers fails the site (tests/certified.py's `assert_certified`). This
+certifies the program run one operation at a time; a fused program's internals are check 1's
+(tests/reference_error.py).
 
 The exact results come from exact arithmetic, not from float64 rounding: a product of two fp32 or
 bf16 values is exact in float64, a sum or a fused multiply-add is carried as a double-double by

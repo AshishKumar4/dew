@@ -48,6 +48,7 @@ from dew.nn.backbones.causal_transformer import CausalTransformer
 from dew.nn.inputs import MixerCall
 from dew.nn.kernels import generation
 from dew.nn.mla import MultiHeadLatentAttention
+from dew.nn.precision import FP32_SUMS
 from dew.nn.rope import YarnScaling, rotary_freqs, yarn_attention_factor, yarn_inv_freq, yarn_query_scale
 from dew.objectives.lm import LMObjective
 from dew.training import Layout, MeshSpec, Trainer
@@ -407,9 +408,16 @@ def test_the_fused_path_returns_the_value_columns_and_not_the_padding():
             narrow, fused(jnp.pad(value, ((0, 0), (0, 0), (0, 0), (0, 8))))[..., :8])
         with pytest.raises(ValueError):
             fused(jnp.pad(value, ((0, 0), (0, 0), (0, 0), (0, 16))))
-    xla = functools.partial(scaled_dot_product_attention, implementation="xla", causal=True)
-    assert_as_exact(jax.jit(xla), jax.jit(functools.partial(scaled_dot_product_attention, causal=True)), draw,
-                    "narrow value columns", seeds=SEEDS["value columns"])
+        xla, reference = (functools.partial(scaled_dot_product_attention, implementation=name, causal=True)
+                          for name in ("xla", "reference"))
+
+        def summed(*arrays):
+            # The fused kernel's products sum as an A100's do, so the reference states those sums.
+            with jax.default_matmul_precision(FP32_SUMS):
+                return reference(*arrays)
+
+        assert_as_exact(jax.jit(xla), jax.jit(summed), draw, "narrow value columns",
+                        seeds=SEEDS["value columns"])
 
 
 def mla_record(settings: dict) -> dict:
