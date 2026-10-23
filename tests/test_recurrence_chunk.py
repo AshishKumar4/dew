@@ -126,7 +126,7 @@ def draw(hooks: recurrence.Hooks, packed: bool, seed: int, *, length: int = LENG
 def token_by_token(hooks: recurrence.Hooks, operands: Chunk):
     """The sequence a token at a time through the decode step's reference, a packed document's first
     token starting from a zero memory: `(output, final memory)`, the output in the operands' dtype."""
-    group = VALUE_HEADS // KEY_HEADS
+    group = operands.value.shape[2] // operands.query.shape[2]
     query, key = (jnp.repeat(x, group, axis=2) for x in (operands.query, operands.key))
     work = jnp.promote_types(operands.value.dtype, jnp.float32)
     state = operands.state.astype(work)

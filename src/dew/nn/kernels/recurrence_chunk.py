@@ -262,7 +262,8 @@ class Chunk(recurrence.Gated):
 
 
 def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_SIZE,
-          ported: bool | None = None, max_segments: int | None = None, dtype=None):
+          ported: bool | None = None, max_segments: int | None = None, dtype=None,
+          mainloop: str | None = None):
     """`(output [B, S, Hv, Dv], final memory [B, Hv, Dk, Dv])` of a sequence through the recurrence of
     `hooks` (`recurrence.Hooks`, the decode step's form), the output in `dtype` (the queries', keys'
     and values' common dtype where None) and the memory in at least fp32.
@@ -279,7 +280,9 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
     port's need not match). Packed documents
     (`starts`, at most `max_segments` a row) each compute as they would alone. A conv runs before the
     op: it takes the conv's output. The operands the hooks read are checked as the decode step's
-    (`recurrence.read`), and a rated decay is taken on its declared domain, a contraction."""
+    (`recurrence.read`), and a rated decay is taken on its declared domain, a contraction. `mainloop`
+    'mosaic' runs the delta rule with a decay a head on the recurrence template's Mosaic GPU mainloop
+    (`mosaic_rule`), a route no target's row takes yet: only a caller naming it runs it."""
     if hooks.conv is not None:
         raise ValueError("the chunked op takes the conv's output: its queries, keys and values")
     given = recurrence.read(hooks, operands, optional=('state',))
@@ -306,8 +309,14 @@ def chunk(hooks: recurrence.Hooks, operands: Chunk, *, chunk_size: int = CHUNK_S
         out, final = _rated_scan(hooks, query, key, value, g, beta, given, state, starts, chunk_size, work,
                                  kernels=ported is not False)
     else:
-        if hooks.delta and hooks.decay != 'none' and (on_the_port(query, key, value) if ported is None
-                                                      else ported):
+        if mainloop is not None:
+            if mainloop != 'mosaic' or not hooks.delta or hooks.decay != 'scalar':
+                raise ValueError(f"the {mainloop!r} mainloop does not take {hooks}: the 'mosaic' one runs "
+                                 "the delta rule with a decay a head")
+            out, final = mosaic_rule(query, key, value, g, beta, state, starts=starts,
+                                     max_segments=max_segments, scale=scale, wide=epilogue)
+        elif hooks.delta and hooks.decay != 'none' and (on_the_port(query, key, value) if ported is None
+                                                        else ported):
             # Unrounded where an epilogue follows, as on the portable math.
             out, final = fla_rule(query, key, value, g, beta, state, starts=starts, max_segments=max_segments,
                                   scale=scale, wide=epilogue)
@@ -415,6 +424,20 @@ def fla_rule(query, key, value, g, beta, state=None, *, starts=None, max_segment
     return manual_map(functools.partial(_blocked_rule, documents=documents, scale=scale, wide=wide),
                       (four, four, four, P(*four[:g.ndim]), three, memory, P(rows, None)),
                       (four, memory))(query, key, value, g, beta, state, starts)
+
+
+def mosaic_rule(query, key, value, g, beta, state=None, *, starts=None, max_segments: int | None = None,
+                scale: float | None = None, wide: bool = False):
+    """The delta rule with a decay a head on the recurrence template's Mosaic GPU mainloop
+    (`templates.recurrence.mainloop.forward`, its forward alone): `fla_rule`'s operands and results, the
+    operands in their common dtype and beta with them, the decay and the memory fp32, on one device, the
+    values its launches pass kept fp32 (the mainloop's `exact`)."""
+    from .templates.recurrence import mainloop
+
+    dtype = jnp.result_type(query, key, value)
+    query, key, value, beta = (x.astype(dtype) for x in (query, key, value, beta))
+    return mainloop.forward(query, key, value, g.astype(jnp.float32), beta, state, starts=starts,
+                            max_segments=max_segments, scale=scale, wide=wide)
 
 
 RECOMPUTED: contextvars.ContextVar[tuple[str, ...]] = contextvars.ContextVar("recomputed", default=())

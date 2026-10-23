@@ -19,12 +19,11 @@ first, a chunk's rows past its tokens zero and its prefix past them held at its 
 loads), so a program's loads and stores are whole tiles; an aligned call's chunks are its rows as they are.
 The decay's prefix is compensated, a `(hi, lo)` pair in base 2 within each chunk (`prefix`).
 
-The tensor cores take 16-bit operands alone (mma.sync's), so an fp32 operand is three bf16 parts summing to it
-exactly (`_split`) and its product the six of the parts' whose orders sum under three, an fp32 product's
-accuracy. `exact` keeps every value between the launches and every product's operand the algebra rounds to
-fp32 (the inverse, `w`, `u`, the memories, the corrected values and the scores), as the token-by-token
-recurrence computes them; without it a 16-bit call rounds them to its own dtype, as fla does
-(`fla_gdn.chunk_gated_delta_rule`'s numbers)."""
+A 16-bit call's numbers are fla's (`fla_gdn.chunk_gated_delta_rule`'s): the values the launches pass (the
+inverse, `w`, `u`, the memories and the corrected values) and the operands the algebra rounds are in its
+dtype, the memory fp32 across chunks. An fp32 call keeps them fp32; as the tensor cores take 16-bit operands
+alone (mma.sync's), an fp32 operand is three bf16 parts summing to it exactly (`_split`) and its product the
+six of the parts' whose orders sum under three, an fp32 product's accuracy."""
 
 import dataclasses
 import functools
@@ -541,7 +540,7 @@ def _layout(batch: int, length: int, starts, max_segments: int | None):
 
 
 def forward(q, k, v, g, beta, h0=None, *, starts=None, max_segments: int | None = None,
-            scale: float | None = None, exact: bool = True, tiles: Tiles | None = None, wide: bool = False,
+            scale: float | None = None, tiles: Tiles | None = None, wide: bool = False,
             interpret: bool = False):
     """The gated delta rule's forward on this mainloop, a decay a head: `(o [B, T, HV, Dv], final [B, HV, Dk,
     Dv])` for `q`, `k` `[B, T, H, Dk]`, `v` `[B, T, HV, Dv]`, the natural log decay `g` `[B, T, HV]`, the
@@ -550,9 +549,8 @@ def forward(q, k, v, g, beta, h0=None, *, starts=None, max_segments: int | None 
     `max_segments` a row (the row's length where None, which the chunks' layout is sized by), each a sequence
     of its own from a zero memory but a row's first, which takes `h0` unless its first token begins a
     document; the queries scaled by `scale` (`Dk^-1/2` where None); the output in the operands' common dtype,
-    fp32 where `wide`, the final memory fp32. `exact` keeps the values the launches pass and the algebra's
-    rounded operands fp32 (module docstring). Keys and values at most `WIDEST` wide, padded to whole blocks.
-    """
+    fp32 where `wide`, the final memory fp32. Keys and values at most `WIDEST` wide, padded to whole
+    blocks."""
     batch, length, _, key_width = k.shape
     heads, value_width = v.shape[2:]
     dtype = jnp.result_type(q, k, v)
@@ -572,8 +570,7 @@ def forward(q, k, v, g, beta, h0=None, *, starts=None, max_segments: int | None 
         h0 = jnp.where(starts[:, 0, None, None, None], 0.0, h0)
     chunks, taken, sequences, laid, unlaid = _layout(batch, length, starts, max_segments)
     rows = chunks * CHUNK
-    inner = jnp.dtype(jnp.float32) if exact else dtype
-    given, held = _Operand(rows, _parts(dtype), dtype), _Operand(rows, _parts(inner), inner)
+    given = held = _Operand(rows, _parts(dtype), dtype)
     call = _Call(heads, heads // k.shape[2], width, columns, rows, given, held, interpret)
     hi, lo = prefix(laid(g.astype(jnp.float32)).reshape(chunks, CHUNK, heads))
     hi, lo, beta = (x.reshape(rows, heads).T for x in (hi, lo, laid(beta)))

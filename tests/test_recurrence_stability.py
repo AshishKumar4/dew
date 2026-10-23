@@ -18,10 +18,10 @@ Mamba's step through softplus at 30), and pre-activations spread over [-20, 20],
 apart; a memory fading over a long sequence, whose output falls far below its scale; and a steep decay every
 eighth token between mild ones, whose pairs after it are differences of large, nearly equal prefixes. Each
 runs the portable math (`recurrence_chunk.chunk`'s `chunk_delta_rule`), held to the recurrence by check 1;
-a decay a key dimension no steeper than the regime's floor (`FLOORS`), Kimi Linear's domain. A
-GPU's kernels take their arms here when the recurrence template's GPU mainloops land; the suite runs
-compiled on a GPU as on a CPU, where a CPU's interpretation of a kernel judges its host's arithmetic, not
-the kernel's."""
+a decay a key dimension no steeper than the regime's floor (`FLOORS`), Kimi Linear's domain. The recurrence
+template's Mosaic GPU mainloop takes its arm (`template`) at the sites it takes (`TEMPLATED`), compiled on a
+GPU of the instruction family its bundle claims; the suite runs compiled on a GPU as on a CPU, where a CPU's
+interpretation of a kernel judges its host's arithmetic, not the kernel's."""
 
 import dataclasses
 import functools
@@ -33,7 +33,7 @@ import pytest
 from reference_error import assert_as_exact, widened
 from test_recurrence_chunk import CHUNK, KEY_WIDTH, VALUE_HEADS, draw, token_by_token
 
-from dew.nn.kernels import recurrence
+from dew.nn.kernels import generation, recurrence
 from dew.nn.kernels.recurrence_chunk import Chunk, chunk
 
 SITES = {'scalar delta': recurrence.Hooks(decay='scalar', scale=KEY_WIDTH ** -0.5),
@@ -227,15 +227,27 @@ def stressed(hooks, regime: str, seed: int, *, value_heads: int = VALUE_HEADS) -
     return (operands,)
 
 
-CASES = [pytest.param(name, regime, id=f'{name}-{regime}') for name in SITES for regime in REGIMES]
+TEMPLATED = ('scalar delta', 'gated')
+"""The sites the recurrence template's Mosaic GPU mainloop takes: the delta rule with a decay a head."""
+
+ON_MMA_SYNC = pytest.mark.skipif(
+    generation.family(generation.device_generation()) != 'mma.sync',
+    reason="the template's Mosaic mainloop runs compiled on a GPU of the family its bundle claims (mma.sync)")
+
+CASES = [pytest.param(name, regime, arm, id=f'{name}-{regime}-{arm}',
+                      marks=[ON_MMA_SYNC] * (arm == 'template'))
+         for name in SITES for regime in REGIMES
+         for arm in (('portable', 'template') if name in TEMPLATED else ('portable',))]
 
 
-@pytest.mark.parametrize('name, regime', CASES)
-def test_the_chunked_op_stays_finite_and_exact_where_chunked_forms_break(name, regime):
-    """The portable math's output and final memory finite wherever the float64 reference's are on every
+@pytest.mark.parametrize('name, regime, arm', CASES)
+def test_the_chunked_op_stays_finite_and_exact_where_chunked_forms_break(name, regime, arm):
+    """The portable math's output and final memory, and the template's Mosaic GPU mainloop's where it takes
+    the site (`TEMPLATED`, on a GPU of its family), finite wherever the float64 reference's are on every
     declared seed, and on par with the reference's from float64 (module docstring)."""
     hooks = SITES[name]
-    dew = jax.jit(functools.partial(chunk, hooks, chunk_size=CHUNK, ported=False))
+    route = {'ported': False} if arm == 'portable' else {'mainloop': 'mosaic'}
+    dew = jax.jit(functools.partial(chunk, hooks, chunk_size=CHUNK, **route))
     reference = jax.jit(functools.partial(token_by_token, hooks))
     draws = functools.partial(stressed, hooks, regime)
     for seed in range(SEEDS[name, regime]):
@@ -247,5 +259,5 @@ def test_the_chunked_op_stays_finite_and_exact_where_chunked_forms_break(name, r
             finite = np.isfinite(np.asarray(exact))
             assert np.all(np.isfinite(np.asarray(ours))[finite]), (
                 f'{leaf}: not finite where float64 is, seed {seed}')
-    assert_as_exact(dew, reference, draws, f'the portable math, {name} under {regime}',
-                    seeds=SEEDS[name, regime])
+    label = 'the portable math' if arm == 'portable' else "the template's Mosaic mainloop"
+    assert_as_exact(dew, reference, draws, f'{label}, {name} under {regime}', seeds=SEEDS[name, regime])
