@@ -1,6 +1,7 @@
 """The float64 accuracy rule (tests/reference_error.py) on comparisons whose answer is known: what it
 must refuse, and the rounding it must admit."""
 
+import contextlib
 import math
 
 import jax
@@ -1055,12 +1056,51 @@ def test_a_float32_draws_replay_is_its_bits_transform_in_float64(name):
         np.testing.assert_array_equal(replayed.view(np.uint64), direct.view(np.uint64))
 
 
-def test_a_program_of_bits_replays_to_itself():
-    """A program with no float in it replays to its own result, bit for bit."""
+def _integer_jvp():
+    @jax.custom_jvp
+    def shifted(bits):
+        return bits >> np.uint32(3)
+
+    shifted.defjvp(lambda primals, tangents: (shifted(*primals), tangents[0]))
+    return shifted
+
+
+BIT_PROGRAMS = {
+    "draw": lambda key: jax.random.bits(jax.random.fold_in(key, 3), (8, 5), jnp.uint32) >> np.uint32(3),
+    # Traced under its own Threefry setting, which the replay restores for each equation.
+    "unpartitioned": lambda key: _unpartitioned_bits(key),
+    "custom_jvp": lambda key: _integer_jvp()(jax.random.bits(key, (8, 5), jnp.uint32)),
+}
+
+
+def _unpartitioned_bits(key):
+    with jax.threefry_partitionable(False):  # noqa: FBT003 (its one argument, positional)
+        return jax.random.bits(key, (8, 5), jnp.uint32)
+
+
+@pytest.mark.parametrize("name", sorted(BIT_PROGRAMS))
+def test_a_program_of_bits_replays_to_itself(name):
+    """A program with no float in it, a custom derivative's integer call or a draw under its own
+    Threefry setting among them, replays to its own result, bit for bit."""
     key = jax.random.key(5)
-    def drawn(key):
-        return jax.random.bits(jax.random.fold_in(key, 3), (8, 5), jnp.uint32) >> np.uint32(3)
-    np.testing.assert_array_equal(float64_replay(drawn)(key), drawn(key))
+    np.testing.assert_array_equal(float64_replay(BIT_PROGRAMS[name])(key), BIT_PROGRAMS[name](key))
+
+
+def test_a_replay_reads_the_float32_program_whatever_its_callers_mode():
+    """Check 1 hands its truth widened arguments under x64; the replay still reads the float32
+    program the caller runs, its arguments rounded to their traced dtypes, so its truth is the same
+    bit for bit as called plainly."""
+    x = np.random.default_rng(1).uniform(0.5, 2.0, (6, 7)).astype(np.float32)
+    plain = np.asarray(float64_replay(_arithmetic)(x))
+    with jax.enable_x64(new_val=True):
+        widened_call = np.asarray(float64_replay(_arithmetic)(x.astype(np.float64)))
+        drawn = np.asarray(float64_replay(DRAWS["normal"])(jax.random.key(2)))
+    np.testing.assert_array_equal(widened_call.view(np.uint64), plain.view(np.uint64))
+    direct = np.asarray(_widened_draw("normal", jax.random.key(2), (4, 97)))
+    np.testing.assert_array_equal(drawn.view(np.uint64), direct.view(np.uint64))
+    assert_as_exact(lambda key: DRAWS["normal"](key), lambda key: DRAWS["normal"](key),
+                    lambda seed: (jax.random.key(seed),), "normal draw", seeds=8,
+                    truth_fn=float64_replay(DRAWS["normal"]))
 
 
 def _arithmetic(x):
@@ -1088,15 +1128,26 @@ def test_a_float32_program_replays_to_itself_run_in_float64(name):
     replays to that program run in float64, bit for bit, each run an operation at a time (a
     compiled program may contract a product and a sum into one rounding)."""
     x = np.random.default_rng(0).uniform(0.5, 2.0, (6, 7)).astype(np.float32)
-    with jax.enable_x64(new_val=True):
-        replayed = np.asarray(float64_replay(PROGRAMS[name])(x))
-        with jax.disable_jit():
-            direct = np.asarray(PROGRAMS[name](jnp.asarray(x, jnp.float64)))
+    replayed = np.asarray(float64_replay(PROGRAMS[name])(x))
+    # A scan's body compiles in both; every other program runs an operation at a time in both.
+    with jax.enable_x64(new_val=True), contextlib.nullcontext() if name == "scan" else jax.disable_jit():
+        direct = np.asarray(PROGRAMS[name](jnp.asarray(x, jnp.float64)))
     np.testing.assert_array_equal(replayed.view(np.uint64), direct.view(np.uint64))
 
 
-def test_a_float_operation_without_a_float64_rule_refuses():
-    """A float operation the replay has no rule for refuses, never runs as traced."""
+REFUSED = {
+    "float": lambda x: jnp.cos(x),
+    "complex": lambda x: jnp.cos(x.astype(jnp.complex64)).real,
+    # A call whose integer boundary hides float arithmetic inside.
+    "hidden": lambda x: jax.lax.cond(x[0] > 0, lambda x: jnp.cos(x).astype(jnp.int32),
+                                     lambda x: x.astype(jnp.int32), x),
+}
+
+
+@pytest.mark.parametrize("name", sorted(REFUSED))
+def test_a_float_operation_without_a_float64_rule_refuses(name):
+    """A float operation the replay has no rule for refuses, never runs as traced: a complex one,
+    and one inside a call it does not open, too."""
     with pytest.raises(NotImplementedError):
-        float64_replay(jnp.cos)(np.ones(3, np.float32))
+        float64_replay(REFUSED[name])(np.ones(3, np.float32))
 
