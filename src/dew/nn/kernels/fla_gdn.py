@@ -110,8 +110,8 @@ def _dot(a, b, *, exact: bool, ieee: bool = False, solve: jnp.dtype | None = Non
         raise TypeError(f"Pallas dot operands must have the same dtype, got {a.dtype} and {b.dtype}")
     wide = jnp.dtype(a.dtype) == jnp.float32
     if exact:
-        a, b = a.astype(jnp.float32), b.astype(jnp.float32)
-        precision = jax.lax.Precision.HIGHEST if ieee and wide else None
+        with jax.enable_x64(True):
+            return jnp.dot(a.astype(jnp.float64), b.astype(jnp.float64)).astype(jnp.float32)
     elif wide:
         narrow_call = solve is not None and jnp.dtype(solve).itemsize < 4
         precision = (jax.lax.Precision.HIGHEST if ieee else jax.lax.Precision.DEFAULT if narrow_call
