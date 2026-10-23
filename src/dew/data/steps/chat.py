@@ -25,13 +25,11 @@ from dew.data.prompts import (
     SOURCE_KEY,
     TRUTH_KEY,
     PromptRecord,
-    _extra_info,
-    _ground_truth,
     _prompt_ids,
     _utf8,
 )
 from dew.data.text import ByteTokenizer, HFTokenizer, tokenizer_for
-from dew.records import integer, json_value, record
+from dew.records import integer, record
 
 
 @dataclasses.dataclass(frozen=True)
@@ -133,9 +131,7 @@ class RenderPrompt(grain.MapTransform):
             ids = ids[-self.max_prompt_len :]
         prompt = np.full(self.max_prompt_len, self.pad_id, np.int32)
         prompt[-len(ids) :] = ids
-        row = PromptRecord.of(json_value(element.get("data_source"), "prompt data_source"),
-                              _ground_truth(element, "prompt"), _extra_info(element))
-        context = {SOURCE_KEY: row.data_source, TRUTH_KEY: row.ground_truth, INFO_KEY: row.extra_info}
+        context = PromptRecord.from_row(element).columns()
         for name, value in context.items():
             if len(value.encode("utf-8")) > self.reward_bytes:
                 raise ValueError(f"prompt {name} exceeds reward_bytes={self.reward_bytes}")
