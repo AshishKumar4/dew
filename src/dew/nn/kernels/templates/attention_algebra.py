@@ -1099,6 +1099,45 @@ def refinement(residual: jax.Array, mass: jax.Array, peak0: jax.Array, shares: t
     return jnp.where(whole_mass > 0, whole_residual / jnp.where(whole_mass > 0, whole_mass, 1.0), 0.0)
 
 
+def _fp16_scaled(x: jax.Array) -> tuple[jax.Array, jax.Array]:
+    """`x` (fp32) times the power of two that puts its largest magnitude at 2^14, in fp16, and that power's
+    negated exponent, which takes a product of it back: within fp16's range whatever `x`'s, an entry far
+    below the largest losing only what is far below the product's own rounding."""
+    top = jnp.max(jnp.abs(x))
+    exponent = jnp.where(top > 0, jnp.ceil(jnp.log2(jnp.where(top > 0, top, 1.0))), 0.0)
+    return power2(x, 14.0 - exponent).astype(jnp.float16), exponent - 14.0
+
+
+def cotangent_product(cotangents: jax.Array, operand: jax.Array,
+                      dot: Callable[[jax.Array, jax.Array], jax.Array], *,
+                      transposed: bool = False) -> jax.Array:
+    """A tile's score cotangents `[bq, bk]` (fp32, scaled) times the call's queries or keys `operand` (its
+    transpose's product where `transposed`: dK's `dSᵀ Q`, else dQ's `dS K`), in fp32 to fp32's accuracy, as
+    the reference differentiates (its score cotangents are fp32). An fp32 operand takes the fp32 product.
+    A 16-bit one takes two 16-bit products: the cotangents rounded to the operand's dtype (bf16 as they
+    are, fp16 at a power-of-two scale that keeps them in its range), and what that rounding lost, at its
+    own power-of-two scale in fp16 against the operand in fp16 likewise: 7 and 10 bits more, so a key's
+    or a query's gradient whose cotangents cancel across the other axis loses no more than the
+    reference's fp32 product does, where one 16-bit product loses every bit the cancellation exposes."""
+    def oriented(x):
+        return x.T if transposed else x
+
+    if operand.dtype == jnp.float32:
+        return dot(oriented(cotangents), operand)
+    if operand.dtype == jnp.float16:
+        high, high_exponent = _fp16_scaled(cotangents)
+    else:
+        high, high_exponent = cotangents.astype(operand.dtype), jnp.zeros((), jnp.float32)
+    lost = cotangents - power2(high.astype(jnp.float32), high_exponent)
+    low, low_exponent = _fp16_scaled(lost)
+    if operand.dtype == jnp.float16:
+        narrow, operand_exponent = operand, jnp.zeros((), jnp.float32)
+    else:
+        narrow, operand_exponent = _fp16_scaled(operand.astype(jnp.float32))
+    return (power2(dot(oriented(high), operand), high_exponent)
+            + power2(dot(oriented(low), narrow), low_exponent + operand_exponent))
+
+
 def value_operands(exponentials: jax.Array, weights: jax.Array, dout: jax.Array,
                    total: jax.Array) -> tuple[jax.Array, jax.Array]:
     """The operands `(a, b)` of a tile's share of dV, `aᵀ·b` `[block_k, Dv]` in fp32: the unnormalized
