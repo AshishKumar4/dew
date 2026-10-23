@@ -470,35 +470,43 @@ def _coupled_decay(solver: optax.GradientTransformation, weight_decay: float,
     return optax.chain(optax.add_decayed_weights(weight_decay, mask), solver)
 
 
+def _adam_chain(moments: optax.GradientTransformation, learning_rate, weight_decay, mask, *,
+                coupled: bool) -> optax.GradientTransformation:
+    """An Adam variant over `moments` (`scale_by_adam`'s, or `bf16_moments`' stored in bf16): optax.adamw's
+    chain, its decay decoupled, or optax.adam's with torch's coupled weight decay (`_coupled_decay`)."""
+    if coupled:
+        return _coupled_decay(optax.chain(moments, optax.scale_by_learning_rate(learning_rate)), weight_decay,
+                              mask)
+    return optax.chain(moments, optax.add_decayed_weights(weight_decay, mask),
+                       optax.scale_by_learning_rate(learning_rate))
+
+
 def _adam(learning_rate, b1=0.9, b2=0.999, eps=1e-8, eps_root=0.0, mu_dtype=None, weight_decay=0.0,
           mask=None, *, nesterov: bool = False):
-    """optax.adam's chain over `scale_by_adam`, with torch's coupled weight decay (`_coupled_decay`)."""
-    adam = optax.chain(scale_by_adam(b1, b2, eps, eps_root, mu_dtype, nesterov=nesterov),
-                       optax.scale_by_learning_rate(learning_rate))
-    return _coupled_decay(adam, weight_decay, mask)
+    """optax.adam over `scale_by_adam`, with torch's coupled weight decay."""
+    return _adam_chain(scale_by_adam(b1, b2, eps, eps_root, mu_dtype, nesterov=nesterov), learning_rate,
+                       weight_decay, mask, coupled=True)
 
 
 def _adamw(learning_rate, b1=0.9, b2=0.999, eps=1e-8, eps_root=0.0, mu_dtype=None, weight_decay=1e-4,
            mask=None, *, nesterov: bool = False):
-    """optax.adamw's chain over `scale_by_adam`."""
-    return optax.chain(scale_by_adam(b1, b2, eps, eps_root, mu_dtype, nesterov=nesterov),
-                       optax.add_decayed_weights(weight_decay, mask),
-                       optax.scale_by_learning_rate(learning_rate))
+    """optax.adamw over `scale_by_adam`."""
+    return _adam_chain(scale_by_adam(b1, b2, eps, eps_root, mu_dtype, nesterov=nesterov), learning_rate,
+                       weight_decay, mask, coupled=False)
 
 
 def _bf16_adam(learning_rate, b1=0.9, b2=0.999, eps=1e-8, eps_root=0.0, weight_decay=0.0, mask=None, *,
                nesterov: bool = False):
-    """optax.adam's chain over bf16 moments, with torch's coupled weight decay (`_coupled_decay`)."""
-    return _coupled_decay(optax.chain(bf16_moments(b1, b2, eps, eps_root, nesterov),
-                                     optax.scale_by_learning_rate(learning_rate)), weight_decay, mask)
+    """optax.adam over bf16 moments, with torch's coupled weight decay."""
+    return _adam_chain(bf16_moments(b1, b2, eps, eps_root, nesterov), learning_rate, weight_decay, mask,
+                       coupled=True)
 
 
 def _bf16_adamw(learning_rate, b1=0.9, b2=0.999, eps=1e-8, eps_root=0.0,
                 weight_decay=1e-4, mask=None, *, nesterov: bool = False):
-    """optax.adamw's chain over bf16 moments."""
-    return optax.chain(bf16_moments(b1, b2, eps, eps_root, nesterov),
-                       optax.add_decayed_weights(weight_decay, mask),
-                       optax.scale_by_learning_rate(learning_rate))
+    """optax.adamw over bf16 moments."""
+    return _adam_chain(bf16_moments(b1, b2, eps, eps_root, nesterov), learning_rate, weight_decay, mask,
+                       coupled=False)
 
 
 class PowerProfilesState(NamedTuple):

@@ -23,13 +23,15 @@ import numpy as np
 from jax.typing import ArrayLike
 
 from dew.artifacts import ImageGrid, uint8_pixels
+from dew.nn.text_encoders import DEFAULT_MODEL as CLIP_CHECKPOINT
 from dew.objectives.base import Batch
 
 from .common import ImageMetric, metric_device
 
 _log = logging.getLogger(__name__)
 
-DEFAULT_MODEL = "openai/clip-vit-large-patch14"
+DEFAULT_MODEL = CLIP_CHECKPOINT
+"""The CLIP checkpoint image metrics read by default: the native CLIP port's own."""
 
 
 @functools.cache
