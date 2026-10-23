@@ -647,7 +647,7 @@ class _Mosaic(_GroupedLaunch[mosaic_gpu.Tiles]):
         staged_outs = sum(outs) if config.warpgroups == 2 else max(outs)
         if config.warpgroups == 2:
             epilogue_sides = ba.arguments.get('epilogue_operands', ())
-            epilogue += _side_tile_bytes(*_uncut(epilogue_sides, hooks.epilogue_axes, 'rows'), extents)
+            epilogue += _side_tile_bytes(*_uncut(epilogue_sides, hooks.epilogue_axes), extents)
         return config.stages * step + epilogue + staged_outs * config.block_m * config.block_n
 
     @staticmethod
@@ -1022,9 +1022,9 @@ def _side_arrays(sides: tuple, axes_of: tuple) -> tuple:
                   jnp.dtype(side.dtype).itemsize) for side, axes in zip(sides, axes_of, strict=True))
 
 
-def _uncut(sides: tuple, axes_of: tuple, halved: str) -> tuple[tuple, tuple]:
-    """The side operands, and their axes, without the launch axis a cooperative consumer's half cuts."""
-    kept = [(side, axes) for side, axes in zip(sides, axes_of, strict=True) if halved not in axes]
+def _uncut(sides: tuple, axes_of: tuple) -> tuple[tuple, tuple]:
+    """The side operands, and their axes, without the rows a cooperative consumer's half cuts."""
+    kept = [(side, axes) for side, axes in zip(sides, axes_of, strict=True) if 'rows' not in axes]
     return tuple(side for side, _ in kept), tuple(axes for _, axes in kept)
 
 
