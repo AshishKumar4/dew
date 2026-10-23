@@ -85,8 +85,8 @@ def representation_health(z) -> dict[str, jax.Array]:
 
 def normalize_targets(x: jax.Array, epsilon: float = 1e-6) -> jax.Array:
     """Layer-normalize `x` over its feature axis, with no learned affine, through Flax's `LayerNorm`
-    at exact variance, whose statistics are float32 whatever `x`'s dtype, as I-JEPA's
-    `F.layer_norm` takes them.
+    at exact variance. Its statistics are at least float32, as I-JEPA's `F.layer_norm` takes them,
+    and the result keeps `x`'s dtype.
 
     The objective applies it to the target encoder's output, so the
     prediction problem keeps a fixed scale as the encoder drifts, and
