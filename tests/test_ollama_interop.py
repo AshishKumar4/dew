@@ -53,12 +53,12 @@ import numpy as np
 import pytest
 from token_support import write_token_corpus
 
+from dew.config.lm import LMRunConfig
 from dew.data import HFTokenizer, Loading, presets
 from dew.data.sources.tokens import TokenFiles
 from dew.inference import Completion, OllamaCompletion
 from dew.interop import Pretrained, PretrainedDecoder
 from dew.nn.inputs import ModelInputs
-from dew.config.lm import LMRunConfig
 from dew.registry import models
 from dew.sampling.text import Sampling, generate
 

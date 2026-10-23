@@ -152,8 +152,8 @@ def test_a_latent_run_trains_behind_the_dc_ae_and_leaves_it_frozen(source):
     from diffusion_support import images_of
 
     from dew.config import ModelConfig, ObjectiveConfig, TrainerConfig
-    from dew.data.dataset import Loader
     from dew.config.diffusion import DiffusionRunConfig
+    from dew.data.dataset import Loader
     from dew.inputs import TextCondition
     from dew.nn.autoencoders.pretrained import PretrainedAutoencoder
     from dew.sampling import Euler

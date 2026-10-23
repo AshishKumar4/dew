@@ -19,9 +19,9 @@ Whole documents packed into the windows are a run file's chain: the store packed
 (docs/recipes.md).
 """
 
+from dew.config.lm import LMRunConfig
 from dew.data import presets
 from dew.data.sources.tokens import TokenFiles
-from dew.config.lm import LMRunConfig
 
 # The windows are read by index and ordered by the shuffle and repeat written before them, so a run
 # knows its epoch's length.

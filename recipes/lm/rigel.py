@@ -35,10 +35,10 @@ from collections.abc import Mapping
 import tyro
 
 from dew.config import ModelConfig, ObjectiveConfig, OptimConfig, TrainerConfig
+from dew.config.lm import LMRunConfig
 from dew.data import mix, phases, presets
 from dew.data.pipeline import Pipeline
 from dew.data.sources.tokens import TokenFiles
-from dew.config.lm import LMRunConfig
 from dew.optim import ParamGroup, Power, PowerTail
 
 LAYERS = 40

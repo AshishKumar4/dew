@@ -11,9 +11,9 @@ changes. The encoder is --model, the predictor takes the encoder's width and hea
 (`dew.config.jepa.JepaRunConfig`).
 """
 
+from dew.config.jepa import JepaRunConfig
 from dew.data import presets
 from dew.data.sources import source
-from dew.config.jepa import JepaRunConfig
 
 TRAIN, HELD = source("tfds://oxford_flowers102").holdout(split="validation")
 FLOWERS = TRAIN.shuffle(seed=0).repeat().pipe(presets.images, 224, batch=64)
