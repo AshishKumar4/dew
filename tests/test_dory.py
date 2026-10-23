@@ -5,7 +5,6 @@ tests/fixtures/hf/dory-1.0-4b holds the released config."""
 import dataclasses
 import itertools
 import json
-import math
 from pathlib import Path
 
 import jax
@@ -18,6 +17,7 @@ from interop_support import assert_reloads, assert_same_stored_tensors
 from reference_error import (
     assert_as_exact,
     assert_as_exact_as_the_reference,
+    assert_computes_the_oracle,
     assert_rounds_where_the_reference_does,
 )
 from tool_support import load as load_tool
@@ -295,11 +295,9 @@ def test_the_gradient_of_each_tensor_is_the_references(name, loops, backprop_ste
 
 def test_a_float64_model_computes_in_float64():
     """A float64 Dory computes its logits and gradients in float64 end to end, its nGPT attention
-    included: each sits within float64's resolution of the torch reference's own float64 run (an
-    independent implementation of the same tensors), below the geometric mean of fp32's and
-    float64's unit roundoffs, sqrt(2**-24 * 2**-53), which one fp32 rounding anywhere on the path
-    exceeds by about 2**14 and float64's own roundings sit about 2**14 under."""
-    bound = math.sqrt(2.0 ** -24 * 2.0 ** -53)
+    included: each within float64's rounding of the torch reference's own float64 run, an
+    independent implementation of the same tensors (`assert_computes_the_oracle`), where one fp32
+    rounding point on the path would sit many orders further."""
     with jax.enable_x64(new_val=True):
         loaded = Pretrained.load(TINY, dtype='float64', param_dtype='float64', attention_impl='xla')
         tensors = {key: np.array(value, copy=True) for key, value in loaded.export().items()}
@@ -314,11 +312,18 @@ def test_a_float64_model_computes_in_float64():
     expected = reference.forward(ids)
     gradients = reference.gradients(np.array(ids), np.array(cotangent), TOOL.GRADIENTS)
     assert logits.dtype == np.float64
-    for name, mine, theirs in [('logits', logits, expected),
-                               *((tensor, np.asarray(written[tensor]), gradients[tensor])
-                                 for tensor in TOOL.GRADIENTS)]:
-        error = np.sqrt(np.mean((mine - theirs) ** 2)) / np.sqrt(np.mean(theirs ** 2))
-        assert error < bound, f'{name}: {error:.3e} relative RMS from the float64 reference'
+    # Each layer pass reduces over the width (the projections), a head (the logits), the keys (the
+    # weights) and the heads' and the feed-forward's widths; the backward runs every pass again.
+    config = loaded.config
+    passes = (config['n_input_layers'] + config['n_recurrent_loops'] * config['n_recurrent_layers']
+              + config['n_output_layers'])
+    layer = (3 * config['hidden_size'] + config['head_dim'] + ids.shape[1]
+             + config['num_attention_heads'] * config['head_dim'] + config['intermediate_size'])
+    roundings = 2 * (passes * layer + config['hidden_size'])
+    assert_computes_the_oracle(logits, expected, 'float64 logits', roundings=roundings)
+    for tensor in TOOL.GRADIENTS:
+        assert_computes_the_oracle(np.asarray(written[tensor]), gradients[tensor], f'float64 {tensor}',
+                                   roundings=roundings)
 
 
 def test_a_cut_loop_trains_the_layers_before_it_through_the_input_every_pass_reads():
