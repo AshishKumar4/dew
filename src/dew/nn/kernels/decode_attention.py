@@ -53,7 +53,7 @@ from . import tuning
 from .generation import INHERENT, gpu_target, triton_runs
 from .selection import Requirement
 from .templates import attention_algebra as algebra
-from .templates.attention import NATURAL
+from .templates.attention import NATURAL, kernel_dot
 
 if TYPE_CHECKING:
     # Named in quotes: tokamax reads its ops' `_fwd` annotations as types, which postponed ones are not.
@@ -115,33 +115,22 @@ over an `AttentionCase`): a GPU Dew's Triton kernels run on, at most `QUERIES` p
 power-of-two width from 16 to 256, a capacity of whole blocks and one of its dtypes on both sides."""
 
 
-FULL = jax.lax.Precision.HIGHEST
-"""Each product's precision: IEEE fp32 for fp32 operands, and bf16's or fp16's own product for those."""
-
-
-def _dot(a: jax.Array, b: jax.Array, interpret: bool) -> jax.Array:
-    """`a @ b` in fp32 at `FULL` precision; interpreted, the CPU's own fp32 product."""
-    if interpret:
-        return jnp.dot(a, b, preferred_element_type=jnp.float32)
-    from jax.experimental.pallas import triton as plgpu
-
-    return plgpu.dot(a, b, precision=FULL).astype(jnp.float32)
-
-
 def _capped(softcap: float, logits, q_pos, k_pos):
     """Gemma 2's logit cap, `softcap · tanh(logit / softcap)`, the decode kernel's one score hook."""
     del q_pos, k_pos
     return softcap * jnp.tanh(logits / softcap)
 
 
-def _spec(scale: float, softcap: float | None, natural: bool) -> algebra.Forward:
+def _spec(scale: float, softcap: float | None, natural: bool, dtype, sinks: bool) -> algebra.Forward:
     """The algebra's facts for a decode launch: each query block's keys its row's span (`spans`), no
-    documents, the cap as its score hook, the logits `natural` or not (`algebra.Forward.base2`). A
-    decode block's rows are a key head's query heads and positions (`grouped_query`), so the hook takes
-    no query positions."""
+    documents, the cap as its score hook, the logits `natural` or not (`algebra.Forward.base2`), and
+    whether a row's sums of `dtype` values, with its sinks, need a guard (`algebra.headroom`). A decode
+    block's rows are a key head's query heads and positions (`grouped_query`), so the hook takes no query
+    positions."""
     return algebra.Forward("spans", 0, ids=False, scale=scale,
                            score_mod=None if softcap is None else functools.partial(_capped, softcap),
-                           natural=natural)
+                           natural=natural, headroom=natural and algebra.headroom(dtype, sinks),
+                           initial=sinks)
 
 
 def _attend(query: jax.Array, span: tuple, read, block: int, spec: algebra.Forward, steps,
@@ -153,24 +142,31 @@ def _attend(query: jax.Array, span: tuple, read, block: int, spec: algebra.Forwa
     its first term."""
     first_key, length = span
     rows = jnp.arange(QUERIES)
-    narrowing = {"start": jnp.full((QUERIES,), first_key), "end": jnp.full((QUERIES,), length)}
+    spans = jnp.full((QUERIES,), first_key), jnp.full((QUERIES,), length)
 
     def body(step, state):
         key, value = read(step)
-        coords = algebra.Coords(rows[:, None], step * block + jnp.arange(block)[None, :], **narrowing)
-        logits = algebra.modify(spec, _dot(query, key.T, interpret), coords)
-        m, alpha = algebra.peak(spec, state.m, logits)
-        weights = algebra.weights(spec, logits, m)
-        denominator = algebra.total(state.total, alpha, weights)
-        acc = algebra.rescale(state.acc, alpha) + _dot(algebra.narrow(weights, value.dtype), value, interpret)
-        return algebra.Partial(acc, m, denominator)
+        coords = algebra.Coords(rows[:, None], step * block + jnp.arange(block)[None, :], spans)
+        logits = algebra.modify(spec, kernel_dot(query, key.T, interpret), coords)
+        keys = algebra.Keys(coords, logits, lambda: value, functools.partial(kernel_dot, interpret=interpret))
+        return algebra.plain_step(spec, state, keys)
 
-    start = algebra.empty(QUERIES, query.shape[-1])
-    if sink is not None:
-        real = sink > -jnp.inf
-        start = algebra.resumed(spec, sink, real.astype(jnp.float32), start.acc)
-    first, last = steps
-    return jax.lax.fori_loop(first, last, body, start)
+    def walk(live=None) -> algebra.Partial:
+        # The plain walk where `live` is None, else the guarded one, those rows shifting.
+        start = algebra.empty(QUERIES, query.shape[-1])
+        if sink is not None:
+            real = sink > -jnp.inf
+            start = algebra.resumed(spec, sink, real.astype(jnp.float32), start.acc, live=live)
+        elif live is not None:
+            start = algebra.headroomed(start, live)
+        first, last = steps
+        return jax.lax.fori_loop(first, last, body, start)
+
+    if not spec.headroom:
+        return walk()
+    # A slice's state carries a bound on its values (`algebra.headroomed`), so a merge of slices each
+    # finite but whose join overflows shifts as it needs (`algebra.merge`).
+    return algebra.headroomed(algebra.guarded(walk, walk))
 
 
 def _slice(span: tuple, block: int, split, splits: int) -> tuple:
@@ -190,7 +186,9 @@ def _write(out_refs, spec: algebra.Forward, state: algebra.Partial):
         out = algebra.finish(spec, state, initial=True)[0]
         out_refs[0][...] = out.astype(out_refs[0].dtype)
     else:
-        for ref, value in zip(out_refs, state, strict=True):
+        # The state's sums, maxima and totals, with its shifts, bounds and small sums under headroom;
+        # which rows shifted is the merge's own to find again (`algebra.merge`).
+        for ref, value in zip(out_refs, algebra.exported(state), strict=True):
             ref[...] = value
 
 
@@ -232,24 +230,27 @@ def _paged_kernel(spans_ref, table_ref, query_ref, key_ref, value_ref, *refs, pa
                                    _first_slice_sink(sinks_ref)))
 
 
-def _combined(spec: algebra.Forward, sums, peaks, totals, axis: int):
-    """The slices' states (`[..., splits, ..., QUERIES, D]` sums along `axis`, their maxima and totals)
-    merged in slice order (`algebra.merge`), as the normalized output in fp32: an empty slice's state
-    (a maximum of -inf) merges as nothing."""
-    states = [algebra.Partial(*(jnp.take(part, split, axis=axis) for part in (sums, peaks, totals)))
-              for split in range(sums.shape[axis])]
+def _combined(spec: algebra.Forward, *parts, axis: int):
+    """The slices' states (`[..., splits, ..., QUERIES, D]` sums along `axis`, their maxima, totals,
+    shifts and reaches) merged in slice order (`algebra.merge`), as the normalized output in fp32: an
+    empty slice's state (a maximum of -inf) merges as nothing."""
+    states = [algebra.imported(tuple(jnp.take(part, split, axis=axis) for part in parts))
+              for split in range(parts[0].shape[axis])]
     return algebra.finish(spec, functools.reduce(functools.partial(algebra.merge, spec), states),
                           initial=True)[0]
 
 
-def _outputs(shape: tuple[int, ...], dtype, splits: int, at: int, spec, specs):
+def _outputs(shape: tuple[int, ...], dtype, splits: int, at: int, spec, summed, reduced, *, headroom: bool):
     """The launch's outputs and their blocks: the output `shape` in `dtype` for one slice, else the
-    slices' fp32 sums, maxima and totals with a slices axis at `at` (`spec` and `specs` the blocks)."""
+    slices' fp32 states (`algebra.Partial`: sums, maxima and totals, with shifts, reaches and the small
+    weights' sums under headroom) with a slices axis at `at` (`spec`, `summed` and `reduced` the blocks)."""
     if splits == 1:
         return jax.ShapeDtypeStruct(shape, dtype), spec
     split = (*shape[:at], splits, *shape[at:])
-    return ([jax.ShapeDtypeStruct(split, jnp.float32), jax.ShapeDtypeStruct(split[:-1], jnp.float32),
-             jax.ShapeDtypeStruct(split[:-1], jnp.float32)], specs)
+    sums, rows = jax.ShapeDtypeStruct(split, jnp.float32), jax.ShapeDtypeStruct(split[:-1], jnp.float32)
+    if not headroom:
+        return [sums, rows, rows], [summed, reduced, reduced]
+    return [sums, rows, rows, rows, rows, sums, rows], [summed, *[reduced] * 4, summed, reduced]
 
 
 def _space(programs: int, steps: int, processors: int | None) -> set[Split]:
@@ -304,9 +305,9 @@ class DecodeAttention(tuning.KernelOp):
         summed = pl.BlockSpec((None, None, QUERIES, None, width),
                               lambda row, head, split: (row, split, 0, head, 0))
         reduced = pl.BlockSpec((None, None, QUERIES, None), lambda row, head, split: (row, split, 0, head))
-        out_shape, out_specs = _outputs(query.shape, query.dtype, splits, 1, queried,
-                                        [summed, reduced, reduced])
-        spec = _spec(1 / math.sqrt(width), softcap, natural)
+        spec = _spec(1 / math.sqrt(width), softcap, natural, value.dtype, sinks is not None)
+        out_shape, out_specs = _outputs(query.shape, query.dtype, splits, 1, queried, summed, reduced,
+                                        headroom=spec.headroom)
         out = pl.pallas_call(
             lambda *refs: _kernel(*refs, spec=spec, splits=splits, interpret=interpret,
                                   sinks=sinks is not None),
@@ -363,9 +364,9 @@ class PagedDecodeAttention(tuning.KernelOp):
                               lambda row, head, split: (row, head, split, 0, 0))
         reduced = pl.BlockSpec((None, None, None, QUERIES), lambda row, head, split: (row, head, split, 0))
         sunk = [] if sinks is None else [pl.BlockSpec((None, QUERIES), lambda row, head, split: (head, 0))]
-        out_shape, out_specs = _outputs(query.shape, query.dtype, splits, 2, queried,
-                                        [summed, reduced, reduced])
-        spec = _spec(1 / math.sqrt(width), softcap, natural)
+        spec = _spec(1 / math.sqrt(width), softcap, natural, value_pages.dtype, sinks is not None)
+        out_shape, out_specs = _outputs(query.shape, query.dtype, splits, 2, queried, summed, reduced,
+                                        headroom=spec.headroom)
         out = pl.pallas_call(
             lambda *refs: _paged_kernel(*refs, pages=pages, spec=spec, splits=splits, interpret=interpret,
                                         sinks=sinks is not None),

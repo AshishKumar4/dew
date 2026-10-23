@@ -53,7 +53,7 @@ Coordinates and row vectors come from the toolkit, because Mosaic GPU iotas need
 - Functions:
   - `modify(s, coords, params)`: the score hooks plus the partial-block mask;
   - `peak(m, s) -> (m', alpha[, rescale?])`: FA4's lazy rescale is an option of `peak`;
-  - `weights(s, m') -> p`, in base 2 with log2(e) folded into the scale;
+  - `weights(s, m') -> p`, in base 2 with log2(e) folded into the scale by default, or natural (see "The exponent's forms" below); a logit at its row's maximum weighs 1 exactly, however a compiler contracts its scaling into the subtraction;
   - a weights hook between `weights` and `narrow`, for scales along P·V's contraction (a quantized V's per-token scales), which no output or product scale can apply;
   - `narrow(p) -> p16`, or `(p8, scale)` for FP8;
   - `total(l, alpha, p)`;
@@ -62,6 +62,22 @@ Coordinates and row vectors come from the toolkit, because Mosaic GPU iotas need
 - Q and K prologues are hooks: RoPE and QK-norm. MLA's q·W_uk is a declared product, not a hook.
 - **Partial state:** an unhooked `Partial(acc, m, l)`, wide enough for its role (fp32), with an empty identity and an ordered, associative `merge`. Split-KV decode, ring and context parallelism, chunked prefill and resumed state all produce and merge Partials. Sinks and the resumed state enter exactly once (today's `_first_slice_sink` rule). `finish(partial) -> (out, lse)` and the output hooks run once, after the final merge, because a pointwise output hook doesn't distribute over a merge. The Partial has its own residuals and VJP, separate from the finished output.
 - Every function stays valid on value-width slices, for MLA's Dv 512 and d256 split across consumer warpgroups.
+- **Headroom** (the accurate form's): the weighted values can pass fp32's largest only where the values are near it. A program walks as ever and writes which of its rows' sums overflowed; a second launch walks again only the programs with one, those rows alone shifting by a power of two (`room`), exact and leaving every ratio, at most 2^-64 of it on the weights and the rest on the tile's product. Its residual carries the shift to the backward's split sums. A call whose values can't overflow (fp16, no initial state) compiles no check.
+
+**The exponent's forms.** The default folds log2(e) into the scale (exp2 of `s·c − m`, which a compiler contracts to `fma(s, c, −m)`), FA2's and jax's mha arithmetic, and is the fast form; `natural=True` is the accurate form:
+- its logits stay raw products, each exponent their difference scaled after it is taken, `exp2((s − m)·c)` (`Forward.raw`): the largest logit's weight is 1 exactly and no multiply precedes the subtraction to contract into it. Under a score hook or an initial state its logits are scaled, the largest's weight held to 1 by a select;
+- the backward recomputes its weights in the forward's units from its raw maximum (`Recompute`);
+- its sums carry the headroom (above).
+
+Both pass check 1 on drawn inputs; the stability suite (tests/test_attention_stability.py) holds the accurate form to every family and the fold to all but its divergences at extreme inputs, which it runs in the accurate form alone:
+- logits a ulp apart near 2^30, at scales below 1: the fold rounds each logit at log2(e) times its size, so two the reference keeps apart can tie, and a large cotangent then overflows the backward;
+- logits near fp32's largest: the contracted exponent of the largest logit is its product's rounding, up to an ulp of the logit, so its weight is 0 or infinite (with one key, its weight is 1 within an ulp of that exponent);
+- values near fp32's largest: the weighted values' sum overflows where the reference's normalized one does not (the headroom is the accurate form's), and so does a sink near fp32's largest;
+- in fp32, a row whose output one weight carries over values near fp32's largest (a weight of e^-12 to e^-26 on values of 2^120 to 2^126): the fold's extra rounding of that weight's logit is the row's error, 2.04 times the reference's; bf16 hides it in the weight's rounding to 16 bits;
+- a maximum that jumps far within a row (logits 50 above the keys before them): every earlier weight shares the one rounded exponent of the rescale, which doesn't average out over them as the reference's per-key exponents do, 9.8 times the reference's error over 32 keys; the accurate form compensates that exponent (TwoSum, and TwoProduct for the raw scale; `carried`), 0.28 times the reference's;
+- logits near 1e30 and beyond: the backward takes the base-2 maximum back to natural units, which moves the anchor's own weight away from 1.
+
+Measured on an H100 at qwen3-8b and gpt-oss-20b shapes, 4k and 32k tokens, the accurate form's raw arithmetic costs 1–5% of the forward and the headroom guard 2–6%; the training step's backward is within 2%. The fold needs `scale·log2(e) < 1` in fp32, so every folded logit is an ulp of fp32's largest below it, and an initial maximum (a sink) past fp32's largest in base 2 saturates exactly (`base2_maximum`).
 
 **Backward.**
 - Products: dP = dO·Vᵀ, dV += Pᵀ·dO, dK += dSᵀ·Q, dQ += dS·K, plus whatever D's form needs.

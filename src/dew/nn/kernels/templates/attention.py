@@ -417,6 +417,30 @@ def natural_exp(x: jax.Array) -> jax.Array:
     return jnp.exp2(x * LOG2E)
 
 
+def kernel_dot(a: jax.Array, b: jax.Array, interpret: bool) -> jax.Array:
+    """`a @ b` accumulated in fp32 as a template's Triton kernels issue it: bf16's and fp16's own product,
+    IEEE fp32 for fp32 operands; interpreted, the template's CPU product (`interpreted_dot`)."""
+    if interpret:
+        return interpreted_dot(a, b)
+    from jax.experimental.pallas import triton as plgpu
+
+    return plgpu.dot(a, b, precision=jax.lax.Precision.HIGHEST).astype(jnp.float32)
+
+
+def interpreted_dot(a: jax.Array, b: jax.Array) -> jax.Array:
+    """`a @ b`, fp32, as every CPU arm of the attention template issues it (the plain-JAX mainloop, the
+    interpreted kernels): the product its operands declare at the precision policy's precision
+    (`dew.nn.precision.float32_products`), issued off a GPU by the declaration's owner
+    (`product.interpreted`), so an fp32 product accumulates in float64, within that sum's rounding bound
+    whatever the tile."""
+    from dew.nn.kernels.templates import product
+    from dew.nn.precision import float32_products, products_dtype
+
+    dtype = products_dtype(a, b)
+    declared = product.declared(dtype, float32_products(dtype), outputs=(jnp.float32,))
+    return product.interpreted(declared, a, b, (((a.ndim - 1,), (0,)), ((), ())))
+
+
 def power_of_two(width: int) -> int:
     """The power of two from 16 that holds `width`: a head width a kernel tiles."""
     return max(16, 1 << (width - 1).bit_length())
@@ -509,11 +533,13 @@ class Split(NamedTuple):
     """A training forward's split sums (`attention_algebra.split_accumulate`), residuals the backward
     reads in place of its first pass: the weighted values of every key but each query's anchor key,
     with the initial state's, `others` `[B, H, Q, Dv]`, the anchor's own weight `own` and the other
-    keys' weights' sum `others_total` `[B, H, Q]`, fp32, all at the forward's maximum."""
+    keys' weights' sum `others_total` `[B, H, Q]`, fp32, all at the forward's maximum and at each row's
+    `2^-shift` `[B, H, Q]` (`attention_algebra.room`)."""
 
     others: jax.Array
     own: jax.Array
     others_total: jax.Array
+    shift: jax.Array
 
 
 DQ_GRADS = (Kind.HEAD, Kind.QUERY)
@@ -590,12 +616,13 @@ def gradients(launch: Callable, query: jax.Array, key: jax.Array, value: jax.Arr
     widened = ((0, 0),) * 3 + ((0, call.value.shape[-1] - value_width),)
     others = jnp.pad(call.rows(split.others.astype(jnp.float32)), widened)
     own, others_total = call.rows(split.own), call.rows(split.others_total)
+    shift = call.rows(split.shift.astype(jnp.float32))
     # The anchor key's value row for each query, `[B, Qp, H, Dvp]`, a key head's for its query heads.
     anchor_value = jnp.take_along_axis(jnp.repeat(call.value, group, axis=2),
                                        jnp.swapaxes(key_index, 1, 2)[..., None], axis=1)
     maximum = call.rows(maxima.astype(jnp.float32))
     outputs = launch(*operands, *(call.rows(start) for start in starts), maximum, key_index, anchor_value,
-                     others, own, others_total, call.rows(totals.astype(jnp.float32)), *rows,
+                     shift, others, own, others_total, call.rows(totals.astype(jnp.float32)), *rows,
                      score_mod=hooks.score_mod, score_kinds=kinds, score_dtypes=dtypes, scale=scale)
     dq, softmax = outputs[0], outputs[1:6]
     grads_out = list(outputs[7:])
