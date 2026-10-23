@@ -6,12 +6,12 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 import pytest
-from reference_error import assert_as_exact
+from reference_error import assert_as_exact, assert_fp32_reduction_bound
 from test_attention_template import CASES, ROWS, SINKS, SOFTCAP, arguments, geometry as core_geometry
 
 from dew.nn.attention import alibi_bias
 from dew.nn.kernels import tuning
-from dew.nn.kernels.templates import attention as template, attention_triton
+from dew.nn.kernels.templates import attention as template, attention_algebra as algebra, attention_triton
 
 ON_GPU = jax.default_backend() == "gpu"
 SEEDS = 8
@@ -92,27 +92,35 @@ def gate_of(queries: int, value_width: int) -> jax.Array:
 
 
 def check(case: dict, names: frozenset, dtype, config: attention_triton.Tiles, *, residuals: bool = False,
-          width: int = 32, value_width: int = 32):
+          width: int = 32, value_width: int = 32, natural: bool = template.NATURAL):
     """`attention_triton.forward` pinned at `config` on par with `template.reference` over `case`'s keys and
-    the hooks `names`, at the site's declared seeds."""
+    the hooks `names`, at the site's declared seeds, its exponent `natural` or the fold."""
     queries, keys = geometry(case)
     spans = template.spans(queries, keys, ROWS, **arguments(case))
     hooks = hooks_for(names, queries, value_width, gate_of(queries, value_width))
     pin = tuning.pinned({attention_triton.TritonForward: config})
 
+    # The maxima are in the logits' own units, raw products in the raw form (`algebra.Forward.raw`), taken
+    # to the reference's natural ones as the algebra takes them (`algebra.Forward.naturalized`).
+    spec = algebra.Forward(spans.form, keys, ids=spans.query_ids is not None, scale=width ** -0.5,
+                           score_mod=hooks.score_mod, natural=natural, initial=hooks.initial is not None)
+
     def ours(query, key, value):
         with pin:
             out = attention_triton.forward(query, key, value, spans, hooks, residuals=residuals,
-                                           interpret=not ON_GPU)
+                                           natural=natural, interpret=not ON_GPU)
         # The maxima and denominators the reference keeps too; the anchor keys only the backward reads,
         # held to its gradients (`check_backward`).
-        return out[:3] if residuals else out
+        if not residuals:
+            return out
+        return out[0], spec.naturalized(out[1]) if spec.raw else out[1], out[2]
 
     def xla(query, key, value):
         return template.reference(query, key, value, spans, hooks, residuals=residuals)
 
     assert_as_exact(jax.jit(ours), jax.jit(xla), drawing(queries, keys, dtype, width, value_width),
-                    f"triton forward {case} {sorted(names)} {jnp.dtype(dtype).name} {config}",
+                    f"triton forward {case} {sorted(names)} {jnp.dtype(dtype).name} {config} "
+                    f"natural {natural}",
                     seeds=ALL_HOOKS_SEEDS if names == HOOKS["all"] else SEEDS)
 
 
@@ -132,11 +140,13 @@ def test_the_forward_is_on_par_over_the_core_s_other_call_forms(form):
     check(CASES[form], HOOKS["none"], jnp.float32, PINNED[1])
 
 
+@pytest.mark.parametrize("natural", [False, True], ids=["fold", "natural"])
 @pytest.mark.parametrize("dtype", attention_triton.DTYPES, ids=DTYPE_IDS)
 @pytest.mark.parametrize("hooks", HOOKS.values(), ids=HOOKS)
-def test_the_forward_is_on_par_under_every_hook(hooks, dtype):
-    """Each hook over causal packed documents under a window, the residuals too, at one config."""
-    check(CASES["causal-documents-window"], hooks, dtype, PINNED[1], residuals=True)
+def test_the_forward_is_on_par_under_every_hook(hooks, dtype, natural):
+    """Each hook over causal packed documents under a window, the residuals too, at one config, in both
+    forms of the exponent."""
+    check(CASES["causal-documents-window"], hooks, dtype, PINNED[1], residuals=True, natural=natural)
 
 
 @pytest.mark.parametrize("width, value_width", [(64, 64), (80, 48), (128, 128)])
@@ -277,12 +287,12 @@ def joint(config: attention_triton.Tiles, dkv_config: attention_triton.Tiles | N
 
 
 def check_backward(case: dict, names: tuple, dtype, config, dkv_config=None, *, width: int = 32,
-                   value_width: int = 32):
+                   value_width: int = 32, natural: bool = template.NATURAL):
     """`attention_triton.backward` with its dQ launch at `config` and its dK/dV launch at `dkv_config`
     (`config` too by default; its tiles are always the dQ launch's), its every gradient (queries, keys,
     values, each score parameter, the initial state's) on par with `jax.vjp` of the template's XLA
     arithmetic, from float64: the hooks' parameters and initial state are drawn with the operands, so
-    their gradients' truth is float64 too."""
+    their gradients' truth is float64 too; its exponent `natural` or the fold."""
     queries, keys = geometry(case)
     spans = template.spans(queries, keys, ROWS, **arguments(case))
     score_mod, kinds, draw_hooks = score_hooks(names, queries, keys, value_width)
@@ -302,7 +312,7 @@ def check_backward(case: dict, names: tuple, dtype, config, dkv_config=None, *, 
     def ours(query, key, value, dout, params, initial):
         with pins:
             grads = attention_triton.backward(query, key, value, spans, hooked(params, initial), dout,
-                                              interpret=not ON_GPU)
+                                              natural=natural, interpret=not ON_GPU)
         return grads.query, grads.key, grads.value, grads.score_params, grads.initial
 
     def xla(query, key, value, dout, params, initial):
@@ -314,7 +324,7 @@ def check_backward(case: dict, names: tuple, dtype, config, dkv_config=None, *, 
 
     assert_as_exact(jax.jit(ours), jax.jit(xla), draw,
                     f"triton backward {case} {names} {jnp.dtype(dtype).name} {config} {dkv_config} "
-                    f"{width}/{value_width}",
+                    f"{width}/{value_width} natural {natural}",
                     seeds=BACKWARD_SEEDS.get((names, jnp.dtype(dtype).name), SEEDS))
 
 
@@ -334,12 +344,13 @@ def test_the_backward_is_on_par_over_the_core_s_other_call_forms(form):
     check_backward(CASES[form], (), jnp.float32, PINNED[0], attention_triton.Tiles(32, 32, 8, 3))
 
 
+@pytest.mark.parametrize("natural", [False, True], ids=["fold", "natural"])
 @pytest.mark.parametrize("dtype", attention_triton.DTYPES, ids=DTYPE_IDS)
 @pytest.mark.parametrize("hooks", SCORE_HOOKS.values(), ids=SCORE_HOOKS)
-def test_the_backward_is_on_par_under_every_score_hook(hooks, dtype):
+def test_the_backward_is_on_par_under_every_score_hook(hooks, dtype, natural):
     """Each score hook over causal packed documents under a window: the gradients of its parameters and
-    of the initial state too."""
-    check_backward(CASES["causal-documents-window"], hooks, dtype, PINNED[0])
+    of the initial state too, in both forms of the exponent."""
+    check_backward(CASES["causal-documents-window"], hooks, dtype, PINNED[0], natural=natural)
 
 
 def test_a_wide_parameter_computes_as_its_fp32_value_and_its_gradient_returns_wide():
@@ -438,19 +449,44 @@ def test_many_fp16_cotangents_too_small_once_normalized_still_sum_into_dv():
 
 
 @pytest.mark.parametrize("dtype", attention_triton.DTYPES, ids=DTYPE_IDS)
-def test_cotangents_that_cancel_across_a_key_still_cancel_in_dv(dtype):
+def test_cotangents_that_cancel_across_a_key_cancel_within_the_sums_bound(dtype):
     """Three queries over three equal keys, cotangents 1, 2 and -3: each key's gradient is the queries'
-    equal shares of them, which cancel, 0, as the reference's derivative gives."""
+    equal shares of them, which cancel in float64. A cancellation's zero is no structure: each
+    implementation's gradient is its sums' rounding, so Dew's and the reference's are each within the
+    fp32 reduction bound of the shares' magnitudes (`assert_fp32_reduction_bound`), and cotangents drawn to
+    cancel the same way hold check 1. The bound's derivation: every weight is the one fp32 value 1/3
+    rounded, a common factor of a sum that cancels exactly, so its rounding moves nothing; what remains is
+    a length-3 dot product's rounding, within gamma_3 of its products' magnitudes with each product's own
+    rounding included (Higham, Accuracy and Stability, 3.1), which the bound takes twice."""
     spans = template.spans(3, 3, 1)
+
+    def ours(value, dout):
+        zeros = jnp.zeros((1, 3, 1, 1), value.dtype)
+        with tuning.pinned({attention_triton.TritonBackward: joint(PINNED[0])}):
+            return attention_triton.backward(zeros, zeros, value, spans, None, dout, scale=1.0,
+                                             interpret=not ON_GPU).value
+
+    def theirs(value, dout):
+        def attend(value):
+            zeros = jnp.zeros((1, 3, 1, 1), value.dtype)
+            return template.reference(zeros, zeros, value, spans, scale=1.0)
+
+        return jax.vjp(attend, value)[1](dout)[0]
+
     zeros = jnp.zeros((1, 3, 1, 1), dtype)
     dout = jnp.asarray([1.0, 2.0, -3.0], dtype).reshape(1, 3, 1, 1)
-    with tuning.pinned({attention_triton.TritonBackward: joint(PINNED[0])}):
-        ours = attention_triton.backward(zeros, zeros, zeros, spans, None, dout, scale=1.0,
-                                         interpret=not ON_GPU).value
-    _, pull = jax.vjp(lambda value: template.reference(zeros, zeros, value, spans, scale=1.0), zeros)
-    [theirs] = pull(dout)
-    np.testing.assert_array_equal(np.asarray(theirs, np.float32), 0)
-    np.testing.assert_array_equal(np.asarray(ours, np.float32), 0)
+    shares = np.full((1, 3, 1, 1), np.abs(np.asarray(dout, np.float64)).sum() / 3)
+    for found in (ours(zeros, dout), theirs(zeros, dout)):
+        assert_fp32_reduction_bound(np.zeros((1, 3, 1, 1)), np.asarray(found, np.float64), shares, terms=3)
+
+    def draw(seed: int):
+        # Two cotangents drawn a channel, the third their negated sum: equal keys share them alike.
+        drawn = jax.random.normal(jax.random.key(seed), (1, 2, 1, 8), jnp.float32)
+        cancelling = jnp.concatenate([drawn, -drawn.sum(axis=1, keepdims=True)], axis=1).astype(dtype)
+        return jnp.zeros((1, 3, 1, 8), dtype), cancelling
+
+    assert_as_exact(jax.jit(ours), jax.jit(theirs), draw, f"cancelling cotangents {jnp.dtype(dtype).name}",
+                    seeds=8)
 
 
 def test_an_fp32_weight_that_normalizing_would_lose_still_reaches_dv():
@@ -624,3 +660,36 @@ def test_a_hook_through_a_custom_vjp_lowers_and_compiles_on_tritons_compiler(tar
     assert len(found) == 2
     assert not failures(found), "\n".join(failures(found))
     assert all(record["shared"] > 0 for record in found), found
+
+
+@pytest.mark.parametrize("sinks", [False, True], ids=["raw", "sinks"])
+@pytest.mark.parametrize("target", ["sm80", "sm90"])
+def test_the_accurate_form_lowers_and_compiles_on_tritons_compiler(target, sinks):
+    """The accurate form (`natural`), raw (no initial state, `algebra.Forward.raw`) and from sinks: its
+    forward with residuals (the plain launch that flags overflowing rows, the one that walks them again,
+    the normalized pass) and its backward, lowered as on the GPU and compiled by XLA's CUDA backend for a
+    compile-only device on this CPU (tests/kernel_compile.py): the interpreted suite lowers none of them,
+    and the raw form's constant scale the algebra splits must reach no bitcast Pallas Triton cannot lower
+    (`algebra.carried`, `precision.two_product`)."""
+    from fla_gdn_support import KernelCase
+    from kernel_compile import compile_kernels, failures
+
+    spans = template.spans(256, 256, 1, causal=True)
+    initial = template.sinks(jnp.asarray([0.5, -1.0], jnp.float32), 1, 256, 64) if sinks else None
+    hooks = template.Hooks(initial=initial)
+    shape = jax.ShapeDtypeStruct((1, 256, 2, 64), jnp.bfloat16)
+    pins = {attention_triton.TritonForward: PINNED[0], attention_triton.TritonBackward: joint(PINNED[0])}
+
+    def forward(query, key, value):
+        with tuning.pinned(pins):
+            return attention_triton.forward(query, key, value, spans, hooks, residuals=True, natural=True)
+
+    def backward(query, key, value, dout):
+        with tuning.pinned(pins):
+            grads = attention_triton.backward(query, key, value, spans, hooks, dout, natural=True)
+        return grads.query, grads.key, grads.value
+
+    found = compile_kernels([KernelCase("forward", lambda: (forward, (shape,) * 3)),
+                             KernelCase("backward", lambda: (backward, (shape,) * 4))], target)
+    assert len(found) >= 2
+    assert not failures(found), "\n".join(failures(found))

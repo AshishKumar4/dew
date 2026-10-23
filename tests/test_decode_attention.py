@@ -157,17 +157,19 @@ def grouped_case(dtype):
     return query, key, value, lengths
 
 
+@pytest.mark.parametrize("natural", [False, True], ids=["fold", "natural"])
 @pytest.mark.parametrize("hooks", [{"sinks": True}, {"softcap": True}, {"sinks": True, "softcap": True}],
                          ids=["sinks", "softcap", "both"])
 @pytest.mark.parametrize("dtype", [jnp.bfloat16, jnp.float32])
-def test_the_decode_kernel_applies_sinks_and_a_softcap_at_every_config(dtype, hooks):
+def test_the_decode_kernel_applies_sinks_and_a_softcap_at_every_config(dtype, hooks, natural):
     """Sinks (one value-free logit a query head in each row's softmax) and a logit softcap
     (`cap · tanh(logit / cap)`) inside the decode kernel, over query heads grouped on their key heads:
     each row read to its length at each config of its space, the sink carried by the first slice alone
     so the combine counts it once, within tests/reference_error.py's rule of the reference path's
     attention over the same keys, against float64 (`exact_attention`). The idle row of one key keeps
     its sink's share. The dispatch takes such a call to the decode kernel where it runs (`decodes`),
-    and the tuner times its launch on the sinks too (`timed`)."""
+    and the tuner times its launch on the sinks too (`timed`). In both forms of the exponent, the fold
+    and the accurate one (`natural`)."""
     from tuned import each_config, launches, timed
 
     from dew.nn.attention import reference_attention
@@ -192,7 +194,7 @@ def test_the_decode_kernel_applies_sinks_and_a_softcap_at_every_config(dtype, ho
 
     def attend(query, key, value, lengths):
         return decode_attention.attend(query, key, value, lengths, softcap=softcap, sinks=sinks,
-                                       interpret=not ON_GPU)
+                                       natural=natural, interpret=not ON_GPU)
 
     with on_the_gpu():
         found = each_config(decode_attention.DecodeAttention, attend, *arrays)
@@ -206,7 +208,7 @@ def test_the_decode_kernel_applies_sinks_and_a_softcap_at_every_config(dtype, ho
             out = jax.jit(attend)(*arrays)
         assert out.shape == plain.shape and out.dtype == plain.dtype
         assert_as_exact_as_the_reference(np.asarray(out, np.float32), np.asarray(plain, np.float32), truth,
-                                         f"decode kernel with {sorted(hooks)}, {config}")
+                                         f"decode kernel with {sorted(hooks)}, natural {natural}, {config}")
 
 
 @pytest.mark.parametrize("softcap", [None, SOFTCAP], ids=["plain", "softcap"])
@@ -770,13 +772,16 @@ def paged_case(page_size, windowed=False):
     return arrays, (key, value, starts, truth)
 
 
+@pytest.mark.parametrize("natural", [False, True], ids=["fold", "natural"])
 @pytest.mark.parametrize("windowed", [False, True], ids=["prefix", "window"])
 @pytest.mark.parametrize("page_size", [16, 32])
-def test_the_paged_decode_kernel_reads_each_row_through_its_table_at_every_config(page_size, windowed):
+def test_the_paged_decode_kernel_reads_each_row_through_its_table_at_every_config(page_size, windowed,
+                                                                                  natural):
     """`decode_attention.attend_paged` reads a row's pages through its table to the row's length, from
     its start where a window gives one, in each config of its space, and is within
     tests/reference_error.py's rule of jax.nn's xla attention over the gathered rows under the same
-    keys' mask against float64, compiled on a GPU and interpreted elsewhere."""
+    keys' mask against float64, compiled on a GPU and interpreted elsewhere, in both forms of the
+    exponent (`natural`)."""
     from tuned import each_config
 
     from dew.nn.kernels import decode_attention, tuning
@@ -792,7 +797,7 @@ def test_the_paged_decode_kernel_reads_each_row_through_its_table_at_every_confi
         assert PAGED.kernel("triton").failed(case) == []
 
     def attend(*arrays):
-        return decode_attention.attend_paged(*arrays, interpret=not ON_GPU)
+        return decode_attention.attend_paged(*arrays, natural=natural, interpret=not ON_GPU)
 
     plain = jax.nn.dot_product_attention(query[:, None], key, value,
                                          mask=jnp.asarray(spanned(starts, lengths, key.shape[1])),
@@ -807,7 +812,7 @@ def test_the_paged_decode_kernel_reads_each_row_through_its_table_at_every_confi
             out = jax.jit(attend)(*arrays)
         assert out.shape == plain.shape and out.dtype == plain.dtype
         assert_as_exact_as_the_reference(np.asarray(out, np.float32), np.asarray(plain, np.float32), truth,
-                                         f"paged decode kernel, {config}")
+                                         f"paged decode kernel, natural {natural}, {config}")
 
 
 @pytest.mark.parametrize("target", ["sm80", "sm90", "sm120"])
@@ -817,8 +822,9 @@ def test_the_decode_kernels_compile_on_tritons_compiler_within_each_gpus_block(t
     paged kernel at Qwen3-0.6B's (16 query heads over 8 of 128) with pages of 16 and 32 keys over 1024
     keys a row, each at every slice count (`tuning.pinned`), which their 8 rows' 32 steps take on
     every GPU here, lowered for each GPU on this CPU and compiled by Triton
-    within its block's shared memory. A first filter: the A100 runs them; the H100 and the RTX PRO
-    6000 have this check alone."""
+    within its block's shared memory; and the dense kernel in the accurate form (`natural`), raw without
+    sinks and scaled with them, which the interpreted suite lowers for no GPU. A first filter: the A100
+    runs them; the H100 and the RTX PRO 6000 have this check alone."""
     from fla_gdn_support import KernelCase
     from kernel_compile import compile_kernels, failures
 
@@ -845,6 +851,16 @@ def test_the_decode_kernels_compile_on_tritons_compiler_within_each_gpus_block(t
             return jax.value_and_grad(loss, argnums=(0, 1, 2))(query, key, value)
         return step, (query, cache, cache, lengths)
 
+    def natural(sinks: bool):
+        lengths = jax.ShapeDtypeStruct((8,), jnp.int32)
+        query = jax.ShapeDtypeStruct((8, 4, 2, 256), jnp.bfloat16)
+        cache = jax.ShapeDtypeStruct((8, 1024, 2, 256), jnp.bfloat16)
+        held = jnp.asarray(SINKS[:2], jnp.float32) if sinks else None
+
+        def attend(query, key, value, lengths):
+            return decode_attention.attend(query, key, value, lengths, sinks=held, natural=True)
+        return attend, (query, cache, cache, lengths)
+
     def paged(page_size):
         per_row = 1024 // page_size
         pages = jax.ShapeDtypeStruct((8, 8 * per_row + 3, page_size, 128), jnp.bfloat16)
@@ -857,6 +873,10 @@ def test_the_decode_kernels_compile_on_tritons_compiler_within_each_gpus_block(t
                         lambda dtype=dtype, splits=splits: pinned(lambda: dense(dtype),
                                                                   decode_attention.DecodeAttention, splits))
              for dtype in (jnp.bfloat16, jnp.float32) for splits in decode_attention.SPLITS]
+    cases += [KernelCase(f"natural/{'sinks' if sinks else 'raw'}/{splits}",
+                         lambda sinks=sinks, splits=splits: pinned(lambda: natural(sinks),
+                                                                   decode_attention.DecodeAttention, splits))
+              for sinks in (False, True) for splits in decode_attention.SPLITS]
     paged_op = decode_attention.PagedDecodeAttention
     cases += [KernelCase(f"paged/{size}/{splits}",
                          lambda size=size, splits=splits: pinned(lambda: paged(size), paged_op, splits))
