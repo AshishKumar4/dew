@@ -542,6 +542,7 @@ def _class_fills(name):
     the fixture's config leaves it out, everything else as stated: a fixed default, or one derived
     from the other fields (a layer pattern from the layer count). Each is a JSON value a file could
     state."""
+    from huggingface_hub.errors import StrictDataclassClassValidationError
     from transformers import CONFIG_MAPPING
 
     config = fixture_config(name)
@@ -551,7 +552,10 @@ def _class_fills(name):
     for field in cls().to_dict():
         if field in _IDENTITY or field.startswith("_"):
             continue
-        filled = cls(**{key: value for key, value in stated.items() if key != field}).to_dict().get(field)
+        try:
+            filled = cls(**{key: value for key, value in stated.items() if key != field}).to_dict().get(field)
+        except (ValueError, StrictDataclassClassValidationError):
+            continue  # the class refuses the config without it: there is no fill to read
         if json.loads(json.dumps(filled, default=lambda value: None)) == filled:
             fills[field] = filled
     return fills
