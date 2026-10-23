@@ -29,7 +29,9 @@ cotangents through `gemm` and `gemm_t` and the hooks' through their VJPs in XLA,
 accumulator only where the epilogue's VJP reads it.
 """
 
+import dataclasses
 import functools
+from collections.abc import Callable
 
 import jax
 import jax.numpy as jnp
@@ -213,12 +215,9 @@ def _paired(lhs, rhs, paired, group_sizes, *, epilogue, dtypes: tuple, several: 
         lhs, rhs, paired, group_sizes = operands
         cotangents = cotangent if several else (cotangent,)
 
-        def pulled(acc, paired_acc, *cotangents):
-            outs, pull = jax.vjp(lambda *accs: _tupled(epilogue, *accs), acc, paired_acc)
-            return pull(tuple(c.astype(out.dtype) for c, out in zip(cotangents, outs, strict=True)))
-
         work = jnp.promote_types(compute, jnp.float32)
-        d_accs = _gemm(lhs.astype(compute), rhs, group_sizes, None, (), (), pulled, cotangents,
+        d_accs = _gemm(lhs.astype(compute), rhs, group_sizes, None, (), (), _PairedPullback(epilogue),
+                       cotangents,
                        (('rows', 'columns'),) * len(cotangents), (compute, compute), several=True,
                        paired=paired, **plain)
         matrices = (rhs, paired)
@@ -239,6 +238,18 @@ def _paired(lhs, rhs, paired, group_sizes, *, epilogue, dtypes: tuple, several: 
 
     differentiable = generation.linear_tangent(forward, backward, portable)
     return differentiable(lhs, rhs, paired, group_sizes)
+
+@dataclasses.dataclass(frozen=True)
+class _PairedPullback:
+    """A paired product's backward epilogue: `epilogue`'s VJP at the two accumulators of the outputs'
+    cotangents (side tiles), each accumulator's cotangent. A value, so a launch's stored picks name it
+    (`tuning`), as they name `epilogue`."""
+    epilogue: Callable
+
+    def __call__(self, acc, paired_acc, *cotangents):
+        outs, pull = jax.vjp(lambda *accs: _tupled(self.epilogue, *accs), acc, paired_acc)
+        return pull(tuple(c.astype(out.dtype) for c, out in zip(cotangents, outs, strict=True)))
+
 
 def _gemm(lhs, rhs, group_sizes, prologue, prologue_arrays, prologue_axes, epilogue, epilogue_arrays,
           epilogue_axes, dtypes, *, several: bool, transpose_rhs: bool, interpret_on_cpu: bool,

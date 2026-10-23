@@ -222,8 +222,8 @@ def test_a_paired_product_holds_check_1(generation_name, dense):
     """A paired product (`paired=`, a gated activation's gate and up in one launch), grouped and dense,
     through the launch the generation picks, interpreted on the CPU: its value and every operand's
     cotangent as exact as the unfused program's it replaces (two projections, then the activation) from
-    float64 truth. The Mosaic interpreters run ordered callbacks, which a jitted `linear_call` cannot carry, so
-    theirs run eagerly."""
+    float64 truth. The Mosaic interpreters run ordered callbacks, which a jitted `linear_call` cannot
+    carry, so theirs run eagerly."""
     def dew(x, gate, up):
         if dense:
             return template.gemm(x, gate[1], paired=up[1], epilogue=silu_gated, out_dtype=jnp.bfloat16,
