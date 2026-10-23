@@ -282,8 +282,9 @@ def reference_dv_local(q, k, g, do, *, scale: float, chunk: int = 64):
 
 def reference_dqkwg(q, k, v, w, g, h, dv, do, dh, *, scale: float, chunk: int = 64):
     """`chunk_bwd_dqkwg`'s math in XLA, per chunk, with the same casts, products widened, and a key
-    head's value heads summed in fp32 before `dq` and `dk` round. The decay's gradient is each
-    token's, its terms summed over the ranges through it (`fla_gdn._summed_back`)."""
+    head's value heads summed in fp32 before `dq` and `dk` round. The decay's gradient is its terms,
+    the pairs `[B, T, HV, BT]` and each token's from its chunk's start `[B, T, HV]`, as the kernel
+    leaves them for the WY backward to sum (`fla_gdn._dqkwg_kernel`)."""
     key_heads = q.shape[2]
     group = v.shape[2] // key_heads
     q_dtype, k_dtype = q.dtype, k.dtype
@@ -317,14 +318,14 @@ def reference_dqkwg(q, k, v, w, g, h, dv, do, dh, *, scale: float, chunk: int = 
     pairs = pairs.at[..., -1, :].add(jnp.where(index < chunk - 1, leaving, 0.0))
     after = jnp.moveaxis(jnp.einsum('bnshk,bnshk->bnsh', dq, qc.astype(f32)), 3, 2)
     after = after.at[..., -1].add(dg_last)
-    through = jnp.cumsum(pairs, axis=-1) - pairs
-    dg = jnp.moveaxis(jnp.sum(jnp.where(causal, through + after[..., :, None], 0.0), axis=-2), 2, 3)
     ds = ds.astype(k_dtype).astype(f32)
     dq = dq + jnp.einsum('bnhst,bnthk->bnshk', ds, kc.astype(f32), precision=exact)
     dk = dk + jnp.einsum('bnhst,bnshk->bnthk', ds, qc.astype(f32), precision=exact)
     shape = (batch, length, key_heads, group, q.shape[-1])
     dq, dk = dq.reshape(shape).sum(3).astype(q_dtype), dk.reshape(shape).sum(3).astype(k_dtype)
-    return dq, dk, dw.reshape(w.shape).astype(w.dtype), dg.reshape(batch, length, heads)
+    terms = (jnp.moveaxis(pairs, 2, 3).reshape(batch, length, heads, chunk),
+             jnp.moveaxis(after, 2, 3).reshape(batch, length, heads))
+    return dq, dk, dw.reshape(w.shape).astype(w.dtype), terms
 
 
 KDA_TRAINING = (1, 4096, 32, 128)
