@@ -1024,30 +1024,27 @@ def where_seen(seen: jax.Array | None, entries: jax.Array, unseen: float) -> jax
 
 
 def scored(score_mod, logits, q_pos, k_pos, params, *, slopes: bool):
-    """`score_mod` on the scaled logits, in fp32, and with `slopes` each entry's derivative of it along
-    the logits and along each parameter, a tile apiece: `score_mod` being pointwise in the entries, they
-    are the whole of its pullback (`pulled`). They are its reverse-mode pullback's transpose applied to
-    each input's ones, on the hook's own tile and layouts, so a hook through a `jax.custom_vjp`
-    differentiates as the reference's does and a hook reads its arguments at the ranks it is called
-    with. An integer parameter has no derivative: its slopes are zeros. Without a hook, the logits and
-    no slopes."""
+    """`score_mod` on the scaled logits, in fp32, and with `slopes` each entry's derivative of it along the
+    logits and along each parameter, a tile apiece: `score_mod` being pointwise in the entries, they are the
+    whole of its pullback (`pulled`). A floating parameter is taken at the tile's shape first, so each entry's
+    derivative is that entry's own, and the pullback of ones gives every input's at once: no transpose, whose
+    `add_any` sums Mosaic GPU's lowering takes no primitive of. A hook through a `jax.custom_vjp`
+    differentiates as the reference's does. Pointwise, the hook is the same function at the tile's shape as at
+    the ranks the forward reads its parameters at. An integer parameter has no derivative: its slopes are
+    zeros. Without a hook, the logits and no slopes."""
     if score_mod is None:
         return logits, None
     if not slopes:
         return hooked(score_mod, logits, q_pos, k_pos, params).astype(jnp.float32), None
     floating = floating_params(params)
-    inputs = (logits, *(params[index] for index in floating))
+    inputs = (logits, *(jnp.broadcast_to(params[index], logits.shape) for index in floating))
     out, pull = jax.vjp(differentiable(score_mod, q_pos, k_pos, params, floating), *inputs)
-    along = jax.linear_transpose(pull, out)
-
-    def slope(index):
-        [entries] = along(tuple(jnp.ones_like(x) if place == index else jnp.zeros_like(x)
-                                for place, x in enumerate(inputs)))
-        return entries.astype(jnp.float32)
-
-    differentiated = {index: slope(place + 1) for place, index in enumerate(floating)}
-    return out.astype(jnp.float32), (slope(0), *(differentiated.get(index, jnp.zeros_like(logits))
-                                                  for index in range(len(params))))
+    derivatives = pull(jnp.ones_like(out))
+    differentiated = {index: derivatives[place + 1].astype(jnp.float32)
+                      for place, index in enumerate(floating)}
+    return out.astype(jnp.float32), (derivatives[0].astype(jnp.float32),
+                                     *(differentiated.get(index, jnp.zeros_like(logits))
+                                       for index in range(len(params))))
 
 
 def pulled(cotangents, slopes, seen, kinds: tuple[Kind, ...]):
@@ -1228,11 +1225,21 @@ NO_SHIFT = -1024.0
 exponent is the larger, and `power2` of a zero mantissa by it stays zero."""
 
 
+def _ceil(x: jax.Array) -> jax.Array:
+    """`jnp.ceil` of an fp32 entry from a truncation and a comparison, for the lowerings that take no `ceil`
+    (Mosaic GPU's). Exact: an entry of magnitude below 2^23 truncates to an int32 exactly, and one beyond it
+    is already integral, infinite or NaN, and passes through."""
+    small = jnp.abs(x) < 2.0 ** 23
+    whole = jnp.where(small, x, 0.0)
+    truncated = whole.astype(jnp.int32).astype(x.dtype)
+    return jnp.where(small, truncated + (whole > truncated).astype(x.dtype), x)
+
+
 def _split(x: jax.Array) -> tuple[jax.Array, jax.Array]:
     """Each entry of `x` as a mantissa of magnitude in (1/2, 1] and its power of two's exponent (0 for a
     zero), so a product of several taken mantissa by mantissa and exponent by exponent neither overflows
     nor flushes where the product itself is in range (`exponent_product`)."""
-    exponent = jnp.where(x != 0, jnp.ceil(jnp.log2(jnp.where(x != 0, jnp.abs(x), 1.0))), 0.0)
+    exponent = jnp.where(x != 0, _ceil(jnp.log2(jnp.where(x != 0, jnp.abs(x), 1.0))), 0.0)
     return power2(x, -exponent), exponent
 
 
@@ -1454,7 +1461,7 @@ def _scaled(x: jax.Array) -> tuple[jax.Array, jax.Array]:
     """`x` (fp32) times the power of two that puts its largest magnitude at 2^14, fp32, and that power's
     negated exponent, which takes a product of it back (`_fp16_scaled` before its rounding)."""
     top = jnp.max(jnp.abs(x))
-    exponent = jnp.where(top > 0, jnp.ceil(jnp.log2(jnp.where(top > 0, top, 1.0))), 0.0)
+    exponent = jnp.where(top > 0, _ceil(jnp.log2(jnp.where(top > 0, top, 1.0))), 0.0)
     return power2(x, 14.0 - exponent), exponent - 14.0
 
 
