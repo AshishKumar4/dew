@@ -70,8 +70,9 @@ class Tiles:
     stages: int
 
 
-DEFAULT = {1: Tiles(64, 2), PARTS: Tiles(64, 1)}
-"""The tiles by the parts of the states launch's widest operand (three hold one chunk in flight)."""
+DEFAULT = {1: Tiles(64, 2), PARTS: Tiles(32, 1)}
+"""The tiles by the parts an operand takes: an fp32 call's three hold one chunk in flight, 32 values wide, so
+the states and output launches' tiles at 128-wide keys fit an A100's block (163 KB of shared memory)."""
 
 
 def _split(x) -> tuple:
