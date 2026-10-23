@@ -190,21 +190,26 @@ def shared(python: str) -> str:
     """The hash of what every test file's run shares: `python`, the `SHARED` files, every lock, every
     non-Python file under tests/ and src/ (a fixture, a package's data), and the names of every Python
     file there, whose arrival can change what an import finds (a conftest.py, a package's __init__.py, a
-    module that shadows another) or what a scanner lists, neither of which a record sees. A test module
-    (tests/**/test_*.py) is the exception: pytest runs it by its name and nothing imports it, so a test
-    added reruns only itself."""
+    module that shadows another, a test module among them) or what a scanner lists, neither of which a
+    record sees."""
     digest = hashlib.sha256(python.encode())
     for top in ("tests", "src"):
         for path in sorted(Path(top).rglob("*")):
             if not path.is_file() or "__pycache__" in path.parts:
                 continue
+            digest.update(str(path).encode())
             if path.suffix != ".py":
-                digest.update(str(path).encode() + hashlib.sha256(path.read_bytes()).digest())
-            elif not (top == "tests" and path.name.startswith("test_")):
-                digest.update(str(path).encode())
+                digest.update(hashlib.sha256(path.read_bytes()).digest())
     for name in sorted({*SHARED, *map(str, Path("locks").glob("*.txt")), *environment_files()}):
         digest.update(name.encode() + contents(name))
     return digest.hexdigest()
+
+
+def lane_inputs(python: str) -> str:
+    """The hash of what a GPU lane's file shares (`gpu_lane`): what every test file's run shares (`shared`),
+    and this file, which sets the environment, share and deadline each file runs under on a GPU, where a
+    CPU task's are the session's."""
+    return hashlib.sha256((shared(python) + contents(__file__).hex()).encode()).hexdigest()
 
 
 def contents(name: str) -> bytes:
@@ -737,13 +742,14 @@ def gpu_tier(python: str) -> dict[str, list[str]]:
     """The test files that take another path on a GPU, each with its evidence: where its tests read
     the backend and its marks of `session.MARKS`, over every record of its rows,
     on every class, a split file's under each count of groups it was planned as. A file is out
-    only where every record is of these inputs (`fresh`) and says neither, so a file whose inputs
-    changed since it ran is in as "changed", and one without a record, or with one the Worker did not
-    return, as "unrecorded": a new file, or one no green run of these tools has recorded."""
+    only where every record is of these inputs (`fresh`), a CPU task's (`shared`) or a GPU lane's
+    (`lane_inputs`), and says neither, so a file whose inputs changed since it ran is in as "changed",
+    and one without a record, or with one the Worker did not return, as "unrecorded": a new file, or one
+    no green run of these tools has recorded."""
     token = os.environ.get("DEW_XLA_CACHE_TOKEN")
     if not token or "DEW_XLA_CACHE_URL" not in os.environ:
         raise SystemExit("the GPU tier is chosen from the test cache's records, which need its URL and token")
-    common = shared(python)
+    inputs = (shared(python), lane_inputs(python))
     prefix = f"{CACHE_PREFIX}/{python}/"
 
     def evidence_of(key: str) -> tuple[str, list[str]]:
@@ -751,7 +757,8 @@ def gpu_tier(python: str) -> dict[str, list[str]]:
         found = recorded(f"{prefix}{key}", token)
         if found is None:
             return name, ["unrecorded"]
-        return name, found["reads"] or ([] if fresh(found, name, common) else ["changed"])
+        current = any(fresh(found, name, common) for common in inputs)
+        return name, found["reads"] or ([] if current else ["changed"])
 
     try:
         keys = listed(prefix, token)
@@ -898,7 +905,7 @@ def gpu_lane(python: str, tests: list[str], out: Path, *, cache: str, processes:
     shares = {name: share for name, (share, _) in needed.items()}
     holds = {name: held for name, (_, held) in needed.items()}
     # Before any test writes under tests/, the inputs every file's key hashes.
-    common = shared(python)
+    common = lane_inputs(python)
     verdicts = {name: out.with_name(f"{out.name}.{index}") for index, name in enumerate(tests)}
 
     def run(names: list[str]) -> None:
