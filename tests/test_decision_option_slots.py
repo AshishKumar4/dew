@@ -118,17 +118,20 @@ move with either (their float64 values are residue)."""
 
 
 def ragged(seed: int = 0) -> list[Example]:
-    """Ragged rows: one question of a hundred options, seventeen of three and one of twenty-four,
-    their states and answers drawn from `seed` at fixed lengths, so every draw packs alike."""
+    """Ragged rows: one question of forty options, six of three and one of twenty-four, their states
+    and answers drawn from `seed` at fixed lengths, so every draw packs alike. A window's grid is its
+    bound's questions times forty slots, of which a row holds 40, 18 or 24 real options; compacted, a
+    window keeps 128 slots (`OPTION_TILE`), fewer than its grid holds, the dropped ones options no row
+    has."""
     rng = np.random.default_rng(seed)
 
     def state(prefix):
         return prefix + " " + "".join(rng.choice(list("abcdefghij"), 12))
 
-    clauses = Choice("Which clause?", [f"c{index}" for index in range(100)])
-    hypotheses = {f"h{index}": Choice(f"Hypothesis {index}?", ["yes", "no", "unsaid"]) for index in range(17)}
+    clauses = Choice("Which clause?", [f"c{index}" for index in range(40)])
+    hypotheses = {f"h{index}": Choice(f"Hypothesis {index}?", ["yes", "no", "unsaid"]) for index in range(6)}
     intents = Choice("Which intent?", [f"i{index}" for index in range(24)])
-    return [Example(state("a clause on"), {"clause": clauses}, {"clause": f"c{rng.integers(100)}"}),
+    return [Example(state("a clause on"), {"clause": clauses}, {"clause": f"c{rng.integers(40)}"}),
             Example(state("a contract"), hypotheses,
                     {name: str(rng.choice(["yes", "no", "unsaid"])) for name in hypotheses}),
             Example(state("book a flight"), {"intent": intents}, {"intent": f"i{rng.integers(24)}"})]
@@ -234,23 +237,26 @@ def zeroed(tree):
 
 
 def test_a_ragged_batch_trains_on_compacted_options_as_on_the_grid():
-    """The ragged rows' packing compacts its real options into the slots its bounds allow, and the loss
-    and every parameter's gradient, backbone's and head's, over them are on par with the grid's from
-    float64 (check 1, over draws of the objective's initialization): the compaction only reorders the
-    sums over the grid's option slots. The loss reads only the real options."""
+    """The ragged rows' packing compacts its real options into the slots its bounds allow, fewer than
+    its grid's, and each real option's logit, the loss and every parameter's gradient, backbone's and
+    head's, over them are on par with the grid's from float64 (check 1, over draws of the rows and of a
+    cotangent on each real option): the compaction only reorders the sums over the grid's option
+    slots. The loss reads only the real options."""
     objective = ragged_objective()
     slotted, _ = ragged_batches(objective)
     options = np.asarray(slotted["options"])
     bounds = objective.bounds
-    assert options.shape[1:] == (bounds.questions, 100)
+    assert options.shape[1:] == (bounds.questions, 40)
     starts = np.asarray(slotted["spans"])[..., 0]
     owners = np.where(slotted["questions"], np.take_along_axis(slotted["segments"], starts, axis=1), 0)
     totals = [int(options[window][owners[window] == row].sum()) for window in range(len(options))
               for row in range(1, int(np.max(slotted["segments"][window])) + 1)]
-    assert sorted(totals) == [24, 51, 100]
-    # A window's real options compact into the slots its bounds allow, a multiple of 128.
+    assert sorted(totals) == [18, 24, 40]
+    # A window's real options compact into the slots its bounds allow, a multiple of 128, fewer than its
+    # grid's.
     capacity = -(-bounds.options // 128) * 128
     assert laid_out(slotted, bounds.segments).option_slots.shape == (len(options), capacity)
+    assert capacity < bounds.questions * 40
 
     variables = objective.init(jax.random.key(0))
     features = scorer_inputs(objective)
