@@ -293,33 +293,101 @@ def conditional_mmdit():
     return objective, variables, batch, step
 
 
+NULL_DROPOUT_SEEDS = {0.5: 8, 1.0: 8}
+"""Check 1's declared seeds for the dropped route at each dropout probability, sized paired
+(`seeds_for` with the dropped route as `dew_fn`, 2026-10-23 on armada): 8 at each."""
+
+NULL_DROPOUT_ROWS = 32
+"""The rows of each null-dropout draw: each weight's gradient sums over all of them."""
+
+
 @pytest.mark.parametrize("probability", [0.5, 1.0])
 def test_null_dropout_matches_explicit_tokens_under_current_encoder(conditional_mmdit, probability):
-    source, variables, batch, step = conditional_mmdit
+    """An objective that drops a row's condition, which its step records, trains as one given that
+    row's tokens blanked explicitly: it drops every row at probability one and some at a half, the
+    explicit route's tower takes a gradient, and the loss and every trained weight's gradient of the
+    dropped route are on par from float64 with the explicit route's (check 1). Each draw is its own
+    rows, images and prompts, its weights moved from the fixture's, and its step's key, which draws
+    the times, the noise and the dropped rows. The two routes are two programs, which round
+    otherwise."""
+    from reference_error import assert_as_exact, widened
+
+    source, variables, _, step = conditional_mmdit
     dropped = DiffusionObjective(source.model, source.process, source.inputs,
                                  unconditional_prob=probability, steps=3, solver=Euler(),
                                  variables=variables)
     conditional = DiffusionObjective(source.model, source.process, source.inputs,
                                      unconditional_prob=0.0, steps=3, solver=Euler(),
                                      variables=variables)
-    # The rows the dropped objective's step drops, which the explicit batch blanks itself.
-    recorder = Recorder()
-    dropped.scalar_loss(variables, batch, replace(step, recorder=recorder))
-    (_, mask), = recorder.values["condition dropout"]
-    explicit = source.inputs.tokenize([""] * 4)
-    explicit = {"image": batch["image"], "text": jax.tree.map(
-        lambda blank, given: jnp.where(mask[:, None], blank, given), explicit["text"], batch["text"])}
-    expected = jax.jit(jax.value_and_grad(
-        lambda values: conditional.scalar_loss(values, explicit, step)[0]))(variables)
-    actual = jax.jit(jax.value_and_grad(
-        lambda values: dropped.scalar_loss(values, batch, step)[0]))(variables)
-    assert float(jnp.linalg.norm(expected[1]["encoders"]["textcontext"]["table"])) > 1e-6
-    # The trained weights, on the loss the two routes agree on. Both encode the blank with the step's
-    # frozen tower; nothing applies a gradient to it.
-    np.testing.assert_allclose(actual[0], expected[0], atol=1e-6, rtol=1e-6)
-    for left, right in zip(jax.tree.leaves(actual[1]["params"]),
-                           jax.tree.leaves(expected[1]["params"]), strict=True):
-        np.testing.assert_array_equal(left, right)
+    blank = source.inputs.tokenize([""] * NULL_DROPOUT_ROWS)
+    host = jax.tree.map(np.asarray, variables)
+
+    def stepped(seed):
+        return replace(step, key=jax.random.key(int(seed)))
+
+    def masked(values, rows, at):
+        """The rows the dropped objective's step drops."""
+        recorder = Recorder()
+        dropped.scalar_loss(values, rows, replace(at, recorder=recorder))
+        (_, mask), = recorder.values["condition dropout"]
+        return np.asarray(mask)
+
+    def explicit(rows, mask):
+        """`rows` with the dropped rows' tokens blanked, which the explicit route reads."""
+        return {"image": rows["image"], "text": jax.tree.map(
+            lambda empty, given: np.where(mask[:, None], empty, given), blank["text"], rows["text"])}
+
+    def draw(seed):
+        """A seed's weights, each trained leaf moved by a draw so every layer takes a gradient, its rows'
+        images and prompts, and the seed, its step's key."""
+        rng = np.random.default_rng([0xD20, seed])
+        params = jax.tree.map(lambda leaf: (leaf + 0.02 * rng.standard_normal(leaf.shape)).astype(leaf.dtype),
+                              host["params"])
+        prompts = ["".join(rng.choice(list("abcdefgh"), 2)) for _ in range(NULL_DROPOUT_ROWS)]
+        rows = {"image": rng.integers(0, 256, (NULL_DROPOUT_ROWS, 4, 4, 1), dtype=np.uint8),
+                **jax.tree.map(np.asarray, source.inputs.tokenize(prompts))}
+        return {**host, "params": params}, rows, np.int64(seed)
+
+    # Over the seeds, every row is dropped at probability one, and at a half some are and some not.
+    masks = np.stack([masked(*draw(seed)[:2], stepped(seed)) for seed in range(4)])
+    assert masks.all() if probability == 1.0 else (masks.any() and not masks.all())
+    values, rows, _ = draw(0)
+    tokens = explicit(rows, masked(values, rows, stepped(0)))
+    given = jax.jit(jax.grad(lambda values: conditional.scalar_loss(values, tokens, stepped(0))[0]))
+    assert float(jnp.linalg.norm(given(values)["encoders"]["textcontext"]["table"])) > 1e-6
+
+    def trained(loss_and_grads):
+        loss, grads = loss_and_grads
+        return np.asarray(loss), jax.tree.map(np.asarray, grads["params"])
+
+    def through(objective, values, rows, at):
+        return jax.value_and_grad(lambda values: objective.scalar_loss(values, rows, at)[0])(values)
+
+    through_dropped = jax.jit(lambda values, rows, at: through(dropped, values, rows, at))
+    through_explicit = jax.jit(lambda values, rows, at: through(conditional, values, rows, at))
+
+    def dew(values, rows, seed):
+        return trained(through_dropped(values, rows, stepped(seed)))
+
+    def reference(values, rows, seed):
+        at = stepped(seed)
+        return trained(through_explicit(values, explicit(rows, masked(values, rows, at)), at))
+
+    def truth(values, rows, seed):
+        at = stepped(seed)
+        tokens = explicit(rows, masked(jax.tree.map(lambda leaf: np.asarray(leaf, np.float32)
+                                                    if np.issubdtype(np.asarray(leaf).dtype, np.floating)
+                                                    else leaf, values), rows, at))
+        # The pixels in float64 too, so the loss's normalization, rates and noising run in float64.
+        tokens = {**tokens, "image": np.asarray(tokens["image"], np.float64)}
+        with jax.enable_x64(new_val=True):
+            wide = DiffusionObjective(source.model.clone(dtype=jnp.float64), source.process, source.inputs,
+                                      unconditional_prob=0.0, steps=3, solver=Euler(),
+                                      variables=widened(variables))
+            return trained(through(wide, widened(values), tokens, at))
+
+    assert_as_exact(dew, reference, draw, f"null dropout at {probability}",
+                    seeds=NULL_DROPOUT_SEEDS[probability], truth_fn=truth)
 
 
 def test_a_dropped_row_is_conditioned_on_the_steps_own_towers(conditional_mmdit):
