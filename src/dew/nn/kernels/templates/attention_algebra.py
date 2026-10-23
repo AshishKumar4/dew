@@ -1122,6 +1122,18 @@ def cotangent_product(cotangents: jax.Array, operand: jax.Array,
     def oriented(x):
         return x.T if transposed else x
 
+    import os
+    form = os.environ.get("DEW_CP", "")
+    if operand.dtype != jnp.float32 and form == "single":
+        return dot(oriented(cotangents.astype(operand.dtype)), operand)
+    if operand.dtype != jnp.float32 and form in ("x2", "x3"):
+        out, rest = None, cotangents
+        for _ in range(2 if form == "x2" else 3):
+            piece = rest.astype(operand.dtype)
+            rest = rest - piece.astype(jnp.float32)
+            term = dot(oriented(piece), operand)
+            out = term if out is None else out + term
+        return out
     if operand.dtype == jnp.float32:
         return dot(oriented(cotangents), operand)
     if operand.dtype == jnp.float16:
