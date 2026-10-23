@@ -182,10 +182,12 @@ def test_the_bit_check_runs_again_at_each_new_signature(change):
         with pytest.raises(AssertionError):
             arm(np.zeros((3, 2), jnp.float8_e4m3fnuz))
     else:
-        highest = moved_when(lambda size, x: str(jax.config.jax_default_matmul_precision) == "highest")
-        arm = over_windows(highest)
-        arm(x)
-        with jax.default_matmul_precision("highest"), pytest.raises(AssertionError):
+        # Both precisions named, whatever the lane's default.
+        tf32 = moved_when(lambda size, x: str(jax.config.jax_default_matmul_precision) == "tensorfloat32")
+        arm = over_windows(tf32)
+        with jax.default_matmul_precision("highest"):
+            arm(x)
+        with jax.default_matmul_precision("tensorfloat32"), pytest.raises(AssertionError):
             arm(x)
 
 
