@@ -696,6 +696,30 @@ def test_a_bf16_querys_gradient_over_a_large_key_with_small_cotangents_is_exact(
     assert_same_bits(triton.query, portable.query, "a large bf16 key under small cotangents")
 
 
+@pytest.mark.parametrize("accurate", [False, True], ids=["default", "accurate"])
+def test_an_fp16_querys_gradient_over_equal_large_keys_whose_cotangents_cancel_is_finite(accurate):
+    """fp16, a query of zeros over three equal keys of first entry 65504, values -65504, 16384 and 65504 there
+    and a cotangent of 1: equal logits, so the query's gradient is exactly 0, its score cotangents' sum
+    against the equal keys cancelling, and the reference's is finite. A cotangent product that keeps fewer
+    bits than the cancellation exposes leaves 4 · 65504 / 2 of it, past fp16's largest once the gradient
+    returns in the call's dtype; in both forms the gradient is finite, in both mainloops."""
+    query = jnp.zeros((1, 1, 1, 16), jnp.float16)
+    key = jnp.zeros((1, 3, 1, 16), jnp.float16).at[0, :, 0, 0].set(65504.0)
+    value = jnp.zeros((1, 3, 1, 16), jnp.float16).at[0, :, 0, 0].set(jnp.asarray([-65504.0, 16384.0, 65504.0]))
+    dout = jnp.zeros((1, 1, 1, 16), jnp.float16).at[..., 0].set(1.0)
+    spans = template.spans(1, 3, 1)
+    tiles = {"block_q": 32, "block_k": 32, "pad": attention_triton.BLOCK}
+    with tuning.pinned({attention_triton.TritonBackward: joint(TILES[1])}):
+        triton = attention_triton.backward(query, key, value, spans, None, dout, accurate=accurate,
+                                           interpret=True)
+    portable = attention_portable.backward(query, key, value, spans, None, dout, accurate=accurate, **tiles)
+    _, pull = jax.vjp(lambda query: template.reference(query, key, value, spans), query)
+    [theirs] = pull(dout)
+    assert np.isfinite(np.asarray(theirs, np.float32)).all()
+    for name, grads in (("triton", triton), ("portable", portable)):
+        assert np.isfinite(np.asarray(grads.query, np.float32)).all(), name
+
+
 def test_a_querys_gradient_from_a_state_near_fp32s_largest_over_a_tiny_weight_at_a_small_scale_is_finite():
     """One key at logit -83 (a weight near 2^-120) resumed from a state of denominator 2^127 at maximum 0,
     at a scale of 2^-40: the key's coefficient against its key, weight times scale over the denominator, is
