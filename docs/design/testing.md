@@ -55,7 +55,19 @@ The GPU tier uses real checkpoints and representative shapes on each target a ch
 
 ## Numerical accuracy
 
-`tests/reference_error.py` owns the acceptance rule and states it: every comparison of Dew's outputs and gradients with float64 truth goes through its assertion, and nothing here restates the rule. A failure is a defect in Dew, the reference arm or the rule's derivation. Find which one. Never widen a tolerance, change the reference to one Dew already matches, drop failing positions or gradients, or compare only argmax when logits disagree.
+Dew's outputs and gradients are measured from float64 truth: the same computation run in float64 on the same inputs. One gate, `tests/reference_error.py`, holds them by two checks and nothing else. Tests carry no per-operation knowledge; the gate holds it.
+
+**Check 1, on par** (`assert_as_exact`; enforced at every converted site). Over a site's declared seeds of drawn inputs, each leaf's RMS error from float64, pooled over the seeds, is within 1.5 times the reference's on the same inputs (`PARITY`), and its worst row within 4 times the reference's worst row (`ROW_FACTOR`), with no floor of any kind. A row whose truth is zero is held within 4 times the reference's own error on that row, a leaf the reference holds exactly Dew must hold exactly, and every value is finite: a NaN or an infinity fails. The verdict is a bootstrap interval over the seeds in two pre-declared stages. A pass certifies the ratio at most 1.5² and a failure certifies it above one, each at a nominal 5e-4; an interval too wide to decide is inconclusive, never a pass. A site declares its seeds, sized by `seeds_for` so that the reference compared with itself resolves the factor.
+
+- The draw holds everything the claim varies: the inputs, the cotangents (gradients come through `with_gradients` and `torch_with_gradients`, which pull back the draw's cotangent), and a stated margin wherever a selection (a top-k cutoff, routing, an argmax) could flip between float32 and float64. Where a computation has exact symmetries, such as summation orders, a draw may range over that orbit.
+- Integer results (random bits, masks, tokens) and values held without arithmetic are compared bit for bit. A float that two different programs compute (another layout, sharding or batch shape, a padded call against the unpadded one, a kernel against the composition it replaces) is held by check 1, never bit for bit: XLA promises no common bits across programs.
+- On the CPU, both arms of a check between two Dew paths compile without YNNPACK's fusions (`without_ynn`), whose microkernels are picked by the host's instruction set, so a verdict holds on any host.
+
+**Check 2, never wrong** (the target; `tests/op_certificates.py` is a prototype the suite does not run yet). Every element lies within a certified roundoff bound for its own operation, on the native inputs the kernel itself computed: the correctly rounded result for an IEEE operation (add, multiply, fused multiply-add, divide, square root, cast), the vendor's stated error for a library primitive, and a bound from numerical analysis for each sum and dot product; an opaque kernel is probed natively. The exact results come from exact arithmetic, not from a float64 run. Check 2 never compares one element's error with another implementation's.
+
+The module's older assertions hold the comparisons not yet converted to check 1, and go once their last site moves.
+
+A failure is a defect in Dew, the reference arm or the gate's derivation. Find which one. Never widen a tolerance, change the reference to one Dew already matches, drop failing positions or gradients, or compare only argmax when logits disagree.
 
 The committed generator uses the reference's public interface. Kernel qualification records forward, backward and forward-mode behavior where the consuming objective needs it.
 
