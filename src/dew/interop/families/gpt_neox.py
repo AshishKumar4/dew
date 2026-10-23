@@ -7,6 +7,7 @@ import numpy as np
 
 from dew import records
 from dew.interop.decoder_parts import (
+    MEGATRON_MLP,
     DecoderFamily,
     DecoderFields,
     Renames,
@@ -78,13 +79,12 @@ def _gpt_neox_buffers(tensors: Mapping[str, np.ndarray],
 _GPT_NEOX_NAMES: Renames = (
     ('embed_out', 'lm_head'), ('gpt_neox.embed_in', 'model.embed_tokens'),
     ('gpt_neox.final_layer_norm', 'model.norm'), ('gpt_neox.layers', 'model.layers'),
-    ('attention.dense', 'self_attn.o_proj'), ('mlp.dense_h_to_4h', 'mlp.up_proj'),
-    ('mlp.dense_4h_to_h', 'mlp.down_proj'))
+    ('attention.dense', 'self_attn.o_proj'), *MEGATRON_MLP)
 
 
 def _gpt_neox_path(name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
-    if '.attention.query_key_value.' in name or name.endswith((
-            '.attention.bias', '.attention.masked_bias', '.attention.rotary_emb.inv_freq')):
+    # Alias inspection sees raw names before preparation, which validates and drops the buffers.
+    if name.endswith(('.attention.bias', '.attention.masked_bias', '.attention.rotary_emb.inv_freq')):
         return None
     return renamed_path(_GPT_NEOX_NAMES, name, config)
 

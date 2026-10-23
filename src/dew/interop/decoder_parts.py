@@ -964,6 +964,24 @@ pairs of dotted fragments: a load respells left to right, an export right to
 left, so one table holds both directions."""
 
 
+MOE_NAMES: Renames = (('block_sparse_moe', 'mlp'), ('w1', 'gate_proj'), ('w2', 'down_proj'),
+                      ('w3', 'up_proj'))
+"""Mixtral's MoE block and its experts' projections, which Kimi and MiniMax keep, onto the shared names."""
+GPT_TRUNK: Renames = (
+    ('transformer.wte', 'model.embed_tokens'), ('transformer.wpe', 'model.embed_positions'),
+    ('transformer.ln_f', 'model.norm'), ('transformer.h', 'model.layers'),
+    ('ln_1', 'input_layernorm'), ('ln_2', 'post_attention_layernorm'))
+"""GPT-2's embeddings, final norm, layers and block norms, which GPT-Neo, GPT-J and GPTBigCode keep."""
+GPT_MLP: Renames = (('mlp.c_fc', 'mlp.up_proj'), ('mlp.c_proj', 'mlp.down_proj'))
+"""GPT-2's MLP, which GPT-Neo, GPTBigCode and StarCoder2 keep."""
+MEGATRON_MLP: Renames = (('mlp.dense_h_to_4h', 'mlp.up_proj'), ('mlp.dense_4h_to_h', 'mlp.down_proj'))
+"""Megatron's MLP, as BLOOM, Falcon and GPT-NeoX name it."""
+MEGATRON_NAMES: Renames = (
+    ('transformer.word_embeddings', 'model.embed_tokens'), ('transformer.ln_f', 'model.norm'),
+    ('transformer.h', 'model.layers'), ('self_attention.dense', 'self_attn.o_proj'), *MEGATRON_MLP)
+"""Megatron's trunk, attention output and MLP, as BLOOM and Falcon keep them."""
+
+
 def renamed(name: str, renames: Renames, *, export: bool = False) -> str:
     """Respell `name` through `renames` in one pass over its dotted parts.
 
@@ -1675,6 +1693,11 @@ class DecoderFamily:
     def packing(self, name: str) -> Packed | None:
         """The `packed` entry the source tensor `name` is, if any."""
         return next((packing for packing in self.packed if name.endswith(packing.name)), None)
+
+    def stored_path(self, name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
+        """The leaf a tensor fills as the checkpoint stores it, before `readings` splits it: None
+        for a `packed` one, whose parts fill several leaves."""
+        return None if self.packing(name) is not None else self.weight_path(name, config)
 
     def source_path(self, name: str, config: Mapping[str, object]) -> tuple[str, ...] | None:
         """The leaf the source tensor `name` fills: its own (`weight_path`), or

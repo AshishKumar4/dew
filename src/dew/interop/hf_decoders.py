@@ -438,7 +438,7 @@ def _tied_names(family: "DecoderFamily", config, names: Collection[str]) -> tupl
     target = family.weight_path(embedding_name, config)
     if target is None:
         raise ValueError(f"{embedding_name} has no embedding parameter to tie")
-    found = next((name for name in names if family.weight_path(name, config) == target), None)
+    found = next((name for name in names if family.stored_path(name, config) == target), None)
     return head_name, embedding_name if found is None else found
 
 
