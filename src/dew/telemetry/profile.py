@@ -84,10 +84,10 @@ def active_profile() -> Profiler | None:
 def _drain() -> None:
     """Wait for the work in flight: every live array, then the effects.
 
-    An array some code still holds after a step donated it can list as live
-    with only its first buffer left, since XLA counts an array deleted by
-    that buffer (jax 0.11.2), and waiting on it raises. Its work is done,
-    and the step's outputs are the arrays to wait on, so it is passed over."""
+    An array can list as live with one of its buffers deleted, one whose
+    shard's buffer its holder deleted, and waiting on it raises. No work is
+    in flight on a deleted buffer, and the step's outputs are the arrays to
+    wait on, so it is passed over."""
     jax.block_until_ready([array for array in jax.live_arrays()
                            if not any(shard.data.is_deleted() for shard in array.addressable_shards)])
     jax.effects_barrier()
