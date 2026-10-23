@@ -132,10 +132,24 @@ def accumulated(product: Callable[..., jax.Array], *operands,
         return narrow(*operands)
     dtype = jax.eval_shape(narrow, *operands).dtype
 
-    def wide(*operands):
+    def summed(*terms):
+        """The float64 sum of the products of each of `terms`' operand lists, rounded once."""
         with jax.enable_x64(new_val=True):
-            return product(*(operand.astype(jnp.float64) for operand in operands),
-                           preferred_element_type=None).astype(dtype)
+            wide = [product(*(operand.astype(jnp.float64) for operand in term), preferred_element_type=None)
+                    for term in terms]
+            return functools.reduce(jnp.add, wide).astype(dtype)
+
+    # The tangent is the products of each operand's tangent with the others, summed in float64 too.
+    # A rule of its own keeps it there: JAX differentiates a platform's branch after tracing it,
+    # outside the scope that widened its operands.
+    @jax.custom_jvp
+    def wide(*operands):
+        return summed(operands)
+
+    @wide.defjvp
+    def _(primals, tangents):
+        return wide(*primals), summed(*((*primals[:index], tangent, *primals[index + 1:])
+                                        for index, tangent in enumerate(tangents)))
 
     return jax.lax.platform_dependent(*operands, cpu=wide, default=narrow)
 
