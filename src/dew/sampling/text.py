@@ -22,7 +22,7 @@ import math
 import types
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from typing import Generic
+from typing import Generic, get_args
 
 import jax
 import jax.numpy as jnp
@@ -55,6 +55,7 @@ from dew.nn.protocols import (
     Decoding,
     Exposing,
     Generating,
+    Lacks,
     Layered,
     Predicting,
     ProjectionGroup,
@@ -97,7 +98,7 @@ type Identity = str | int | tuple[Identity, ...]
 # function, a bound method, a library builtin. Anything else is named by its
 # class, which is one of these.
 type SelfNaming = type | types.FunctionType | types.MethodType | types.BuiltinFunctionType
-SELF_NAMING = (type, types.FunctionType, types.MethodType, types.BuiltinFunctionType)
+SELF_NAMING: tuple[type[SelfNaming], ...] = get_args(SelfNaming.__value__)
 
 
 # Transformers' `_get_logits_processor` order, by its own control names: the
@@ -645,11 +646,11 @@ def check_inputs(model: nn.Module, ids: np.ndarray, fields: dict[str, np.ndarray
     `max_seq_len` where None.
     """
     if isinstance(model, BlockDenoiser):
-        raise TypeError(f"{type(model).__name__}'s cache commits whole canvases (BlockDenoiser), not a "
-                        "token at a time; generate with BlockGeneration")
+        raise Lacks("cache", f"{type(model).__name__}'s cache commits whole canvases (BlockDenoiser), not "
+                             "a token at a time; generate with BlockGeneration")
     if not isinstance(model, Decoding):
-        raise TypeError(f"{type(model).__name__} opens no decode cache (Decoding.init_cache), so it cannot "
-                        "continue a prompt token by token")
+        raise Lacks("cache", f"{type(model).__name__} opens no decode cache (Decoding.init_cache), so it "
+                             "cannot continue a prompt token by token")
     if ids.ndim != 2 or min(ids.shape) < 1 or not np.issubdtype(ids.dtype, np.integer):
         raise ValueError("inputs must contain non-empty [B, P] integer token ids")
     if type(max_new_tokens) is not int or max_new_tokens < 0:
