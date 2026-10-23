@@ -714,10 +714,10 @@ def test_a_ramp_over_an_order_read_once_ends_where_its_records_do(records, keep,
 @pytest.mark.parametrize("keep", [False, True])
 def test_a_ramp_over_batches_repeated_a_counted_number_of_times_reads_every_pass(keep):
     """Twelve records in batches of six, the batches repeated twice, under a ramp of four-record
-    steps: the ramp reads both passes, six steps, every record twice, as the epoch's count says."""
+    steps: the ramp reads both passes, the six steps two epochs count, every record twice."""
     order = Pipeline(Memory(Indexed(1, 12))).batch(6, drop_remainder=not keep).repeat(2)
     data = ramped(compile(order, loading=READ), Ramp(start=4, increment=2, samples=100))
-    assert data.epoch_steps(1) == 6
+    assert (data.epoch_steps(1), data.epoch_steps(2)) == (3, 6)
     stream = data.train(DataPartition())
     try:
         steps = list(stream)
